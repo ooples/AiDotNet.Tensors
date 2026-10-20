@@ -50,6 +50,9 @@ public class MaxPoolRecomputeBackwardTests
     [InlineData(1, 1, 3, 3, 3, 1)]    // one window covering the whole plane
     [InlineData(2, 3, 6, 34, 2, 2)]   // 17 windows per row: two 8-window vector blocks plus a scalar tail
     [InlineData(1, 2, 5, 35, 2, 2)]   // vector blocks with an uncovered last row and column
+    [InlineData(2, 3, 4, 14, 2, 2)]   // 7 windows (the parity CNN's second pool): 4-wide steps, the last overlapping
+    [InlineData(2, 2, 6, 12, 2, 2)]   // 6 windows: a 4-wide step and an overlapping one
+    [InlineData(2, 2, 4, 18, 2, 2)]   // 9 windows: an 8-wide step and an overlapping one
     public void MatchesSavedIndexBackward(int n, int c, int h, int w, int pool, int stride)
     {
         var engine = new CpuEngine();
@@ -88,6 +91,8 @@ public class MaxPoolRecomputeBackwardTests
     [InlineData(2, 3, 6, 34)]   // 17 windows per row: two vector blocks plus a scalar tail
     [InlineData(1, 2, 5, 35)]   // odd height and width: the last row and column are not covered
     [InlineData(64, 16, 28, 28)] // the parity CNN's pool (parallel path)
+    [InlineData(2, 3, 14, 14)]   // 7 windows: 4-wide steps, the last overlapping
+    [InlineData(2, 2, 4, 18)]    // 9 windows: an 8-wide step and an overlapping one
     public void ForwardMatchesScalarRule(int n, int c, int h, int w)
     {
         var engine = new CpuEngine();

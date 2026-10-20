@@ -8,7 +8,13 @@ Writes into <workdir>:
                   order: the exact bytes the Tensors side loads, so both start identical. A linear
                   weight is [in, out]; a conv weight is [out, in, kH, kW], PyTorch's own layout.
     data.bin      input batch [batch, *input] then target [batch, lastOut], float32
-    torch.json    timings (median and spread per phase), loss curve, environment
+    torch.json    timings (median and spread per phase), loss curve, environment, and PyTorch at its best:
+                  every execution mode it offers (eager, channels_last, whole-step CUDA graph, torch.compile in
+                  each mode, and on the CPU every thread count), each checked against the eager loss curve. The
+                  fastest mode that agrees is "best", and it is what the Tensors side is gated against.
+
+Exits 3 (DEFERRED) when torch is missing, CUDA is asked for and absent, or no torch.compile mode can run: without
+it PyTorch's best is not measured, and a comparison against less than its best must not read as green.
 
 Spec layers (a layer without "type" is linear):
     {"type": "linear", "out": N, "activation": "relu"|"none"}
@@ -35,13 +41,21 @@ so the Tensors side reads bytes rather than reproducing an initialisation scheme
 from __future__ import annotations
 
 import argparse
+import copy
 import json
+import math
 import os
 import platform
 import statistics
 import sys
 import time
 from pathlib import Path
+
+
+# Bumped whenever what a result means changes; HeadToHeadNetworkHarness refuses another protocol's numbers.
+#   1  eager only, synchronised at every phase boundary
+#   2  PyTorch at its best: the fastest of every execution mode, whole steps, one synchronisation per step
+PROTOCOL = 2
 
 
 def _stats(samples_ms: list[float]) -> dict:
@@ -232,21 +246,32 @@ def main() -> int:
     # matmul already defaults to fp32 since torch 1.12; it is pinned too so a changed default cannot creep in.
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cuda.matmul.allow_tf32 = False
-    model = torch.nn.Sequential(*modules).to(device)
+    # cuDNN's autotuner picks the fastest algorithm per shape; PyTorch at its best runs with it on.
+    torch.backends.cudnn.benchmark = True
+    base_model = torch.nn.Sequential(*modules).to(device)
     x = torch.from_numpy(x_np).to(device)
     y = torch.from_numpy(y_np).to(device)
-    optimizer = torch.optim.SGD(model.parameters(), lr=spec["optimizer"]["lr"])
+    lr = spec["optimizer"]["lr"]
     loss_fn = torch.nn.MSELoss()
+    warmup_ms = float(spec.get("warmupMs", 1000))
+    loss_steps = spec["lossAgreementSteps"]
 
     def sync() -> None:
         if device.type == "cuda":
             torch.cuda.synchronize()
 
-    losses: list[float] = []
+    def fresh():
+        model = copy.deepcopy(base_model)
+        return model, torch.optim.SGD(model.parameters(), lr=lr, foreach=True)
+
+    # 1. The phase breakdown: eager, synchronised at every phase boundary so each phase's time includes its kernels.
+    #    Its loss curve is the reference every mode below must reproduce. It is reported, not gated: the boundary
+    #    synchronisations cost time PyTorch at its best does not pay.
+    model, optimizer = fresh()
+    reference: list[float] = []
     phases = {"forward": [], "backward": [], "optimizer": [], "step": []}
     # The warmup lasts warmupSteps steps AND at least warmupMs milliseconds (default 1000), as on the Tensors side
     # (HeadToHeadNetworkHarness.WarmupMilliseconds): a step count alone times an idle GPU still raising its clocks.
-    warmup_ms = float(spec.get("warmupMs", 1000))
     warm_start = time.perf_counter()
     measured = 0
     step = -1
@@ -265,20 +290,208 @@ def main() -> int:
         optimizer.zero_grad(set_to_none=True)
         sync()
         t3 = time.perf_counter()
-        if step < spec["lossAgreementSteps"]:
-            losses.append(float(loss.item()))
+        if step < loss_steps:
+            reference.append(float(loss.item()))
         if measuring:
             measured += 1
             phases["forward"].append((t1 - t0) * 1e3)
             phases["backward"].append((t2 - t1) * 1e3)
             phases["optimizer"].append((t3 - t2) * 1e3)
             phases["step"].append((t3 - t0) * 1e3)
+    del model, optimizer
+
+    # 2. PyTorch at its best: every execution mode it offers for a training step, each from the same initial
+    #    weights, timed as whole steps with one synchronisation per step (as the Tensors side is). A mode counts only
+    #    when it reproduces the reference loss curve; the fastest one that does is the comparison.
+    has_conv = any(isinstance(m, torch.nn.Conv2d) for m in base_model.modules())
+    channels_last_ok = has_conv and x.dim() == 4
+
+    def plain_step(model, optimizer, xs, mark=None):
+        def step_fn():
+            if mark is not None:
+                mark()
+            optimizer.zero_grad(set_to_none=True)
+            loss = loss_fn(model(xs), y)
+            loss.backward()
+            optimizer.step()
+            return loss.detach()
+        return step_fn
+
+    def make_eager(channels_last):
+        def make(model, optimizer):
+            xs = x
+            if channels_last:
+                model.to(memory_format=torch.channels_last)
+                xs = x.contiguous(memory_format=torch.channels_last)
+            return plain_step(model, optimizer, xs)
+        return make
+
+    def make_compiled(mode, channels_last):
+        def make(model, optimizer):
+            xs = x
+            if channels_last:
+                model.to(memory_format=torch.channels_last)
+                xs = x.contiguous(memory_format=torch.channels_last)
+            compiled = torch.compile(model, mode=mode)
+            compiled_update = torch.compile(optimizer.step)
+            # CUDA-graph trees (reduce-overhead, max-autotune on CUDA) need each training iteration marked.
+            mark = torch.compiler.cudagraph_mark_step_begin if device.type == "cuda" and mode != "default" else None
+
+            def step_fn():
+                if mark is not None:
+                    mark()
+                optimizer.zero_grad(set_to_none=True)
+                loss = loss_fn(compiled(xs), y)
+                loss.backward()
+                compiled_update()
+                return loss.detach()
+
+            for _ in range(3):   # compilation (and graph recording) happens here, outside the timing
+                step_fn()
+            sync()
+            return step_fn
+        return make
+
+    def make_graph(channels_last):
+        # Whole-step CUDA graph capture (forward, backward and the SGD update), PyTorch's documented pattern.
+        def make(model, optimizer):
+            xs = x
+            if channels_last:
+                model.to(memory_format=torch.channels_last)
+                xs = x.contiguous(memory_format=torch.channels_last)
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                for _ in range(3):
+                    optimizer.zero_grad(set_to_none=True)
+                    loss_fn(model(xs), y).backward()
+                    optimizer.step()
+            torch.cuda.current_stream().wait_stream(side)
+            graph = torch.cuda.CUDAGraph()
+            optimizer.zero_grad(set_to_none=True)
+            with torch.cuda.graph(graph):
+                static_loss = loss_fn(model(xs), y)
+                static_loss.backward()
+                optimizer.step()
+
+            def step_fn():
+                graph.replay()
+                return static_loss
+            return step_fn
+        return make
+
+    plans = [("eager", make_eager(False))]
+    if channels_last_ok:
+        plans.append(("eager+channels_last", make_eager(True)))
+    if device.type == "cuda":
+        plans.append(("cuda_graph", make_graph(False)))
+        if channels_last_ok:
+            plans.append(("cuda_graph+channels_last", make_graph(True)))
+    compile_modes = ["default", "max-autotune-no-cudagraphs"] if device.type == "cpu" else ["default", "reduce-overhead", "max-autotune"]
+    for mode in compile_modes:
+        plans.append((f"compile:{mode}", make_compiled(mode, False)))
+        if channels_last_ok:
+            plans.append((f"compile:{mode}+channels_last", make_compiled(mode, True)))
+
+    # On the CPU, torch's default thread count is the physical cores; all logical cores is tried as well.
+    thread_counts = [torch.get_num_threads()]
+    if device.type == "cpu" and (os.cpu_count() or 0) > thread_counts[0]:
+        thread_counts.append(os.cpu_count())
+
+    def agree(losses: list[float]) -> str | None:
+        # Every reference step must be matched (a shorter curve is only partly verified), and a non-finite loss is
+        # refused outright: a NaN difference compares false against any tolerance. Same rule as the Tensors side.
+        n = len(reference)
+        if n == 0 or not losses:
+            return "no loss was recorded"
+        if len(losses) < n:
+            return f"{len(losses)} losses were recorded; the reference has {n}"
+        for i in range(n):
+            # Same bounds as the Tensors side: the first step differs only in reduction order.
+            tolerance = 1e-4 if i == 0 else 1e-3
+            if not math.isfinite(losses[i]) or abs(losses[i] - reference[i]) > tolerance * max(1.0, abs(reference[i])):
+                return f"loss at step {i} is {losses[i]:.9g}, eager gives {reference[i]:.9g}"
+        return None
+
+    # A mode that runs extremely slowly (a max-autotune mode on a small GPU) must not hold up the others and the
+    # DEFERRED decision until the workflow times out: past this budget its measuring loop gives up and the mode is
+    # reported as failed.
+    mode_budget_s = float(spec.get("modeBudgetSeconds", 600))
+
+    class ModeBudgetExceeded(RuntimeError):
+        pass
+
+    def run_mode(make) -> tuple[list[float], list[float]]:
+        model, optimizer = fresh()
+        initial = [p.detach().clone() for p in model.parameters()]
+        step_fn = make(model, optimizer)
+        # Setting up a mode (warming, compiling, capturing) trains a few steps; start the measured curve from the
+        # same weights as the reference. In-place, so captured graphs and compiled code keep their addresses.
+        with torch.no_grad():
+            for p, p0 in zip(model.parameters(), initial, strict=True):
+                p.copy_(p0)
+        sync()
+        losses: list[float] = []
+        samples: list[float] = []
+        start = time.perf_counter()
+        step = -1
+        while len(samples) < spec["measuredSteps"]:
+            if time.perf_counter() - start > mode_budget_s:
+                raise ModeBudgetExceeded(
+                    f"measured {len(samples)} of {spec['measuredSteps']} steps within the {mode_budget_s:g} s budget")
+            step += 1
+            measuring = step >= spec["warmupSteps"] and (time.perf_counter() - start) * 1e3 >= warmup_ms
+            sync()
+            t0 = time.perf_counter()
+            loss = step_fn()
+            sync()
+            t1 = time.perf_counter()
+            if step < loss_steps:
+                losses.append(float(loss.item()))
+            if measuring:
+                samples.append((t1 - t0) * 1e3)
+        return losses, samples
+
+    default_threads = torch.get_num_threads()
+    modes = []
+    try:
+        for threads in thread_counts:
+            torch.set_num_threads(threads)
+            for name, make in plans:
+                label = name if threads == default_threads else f"{name}@{threads}threads"
+                entry = {"name": label, "threads": threads if device.type == "cpu" else None}
+                try:
+                    losses, samples = run_mode(make)
+                except Exception as error:  # noqa: BLE001 - a mode PyTorch cannot run is reported, not fatal
+                    first = (str(error).strip().splitlines() or [""])[0]
+                    entry.update(status="failed", reason=f"{type(error).__name__}: {first[:300]}")
+                    print(f"mode {label} failed: {entry['reason']}", file=sys.stderr)
+                else:
+                    mismatch = agree(losses)
+                    entry.update(status="ok" if mismatch is None else "rejected", step=_stats(samples), losses=losses)
+                    if mismatch is not None:
+                        entry["reason"] = mismatch
+                modes.append(entry)
+                torch.compiler.reset()
+    finally:
+        # Restored even when an interrupt escapes a mode.
+        torch.set_num_threads(default_threads)
+
+    usable = [m for m in modes if m["status"] == "ok"]
+    if not any(m["name"].startswith("compile:") for m in usable):
+        failures = "; ".join(f"{m['name']}: {m.get('reason', m['status'])}" for m in modes if m["name"].startswith("compile:"))
+        print("DEFERRED: no torch.compile mode ran, so PyTorch at its best was not measured "
+              f"({failures}). torch.compile needs a C++ compiler (MSVC 2022 with a Windows 11 SDK on Windows, run "
+              "under vcvars64.bat) and, on CUDA, Triton (triton-windows on Windows).", file=sys.stderr)
+        return 3
+    best = min(usable, key=lambda m: m["step"]["minMs"])
 
     result = {
         "framework": "torch",
         "frameworkVersion": torch.__version__,
+        "protocol": PROTOCOL,
         "device": args.device,
-        "threads": torch.get_num_threads(),
+        "threads": default_threads,
         "tf32": {"cudnn": torch.backends.cudnn.allow_tf32, "matmul": torch.backends.cuda.matmul.allow_tf32},
         "machine": {
             "os": platform.system(),
@@ -289,10 +502,12 @@ def main() -> int:
         },
         "network": spec["name"],
         "phases": {name: _stats(samples) for name, samples in phases.items()},
-        "losses": losses,
+        "losses": reference,
+        "modes": modes,
+        "best": {"mode": best["name"], "step": best["step"]},
     }
     (work / "torch.json").write_text(json.dumps(result, indent=1) + "\n", encoding="utf-8")
-    print(json.dumps({"stepMedianMs": result["phases"]["step"]["medianMs"], "firstLoss": losses[0] if losses else None}))
+    print(json.dumps({"bestMode": best["name"], "bestStepMinMs": best["step"]["minMs"], "firstLoss": reference[0] if reference else None}))
     return 0
 
 

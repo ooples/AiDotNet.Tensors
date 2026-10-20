@@ -56,8 +56,14 @@ internal static partial class SimdGemm
         int cores = allowParallel ? Math.Max(1, CpuParallelSettings.MaxDegreeOfParallelism) : 1;
         int chunks = CapDirectChunksByWork(cores, (long)m * k * n);
 
+        // Full 32-column strips run the 512-bit tile where the host accelerates it (same bits as two 16-column tiles).
+#if NET9_0_OR_GREATER
+        int strip = UseVector512Direct ? Nr512 : Nr;
+#else
+        const int strip = Nr;
+#endif
         int rowBlocks = (m + Mr - 1) / Mr;    // the last block may be a partial (masked) one
-        int colStrips = (n + Nr - 1) / Nr;    // likewise the last strip
+        int colStrips = (n + strip - 1) / strip; // likewise the last strip
         int colChunks = Math.Max(1, Math.Min(chunks, colStrips));
         int rowChunks = Math.Min(rowBlocks, Math.Max(1, chunks / colChunks));
         int items = colChunks * rowChunks;
@@ -66,7 +72,7 @@ internal static partial class SimdGemm
         {
             IntPtr ipA = (IntPtr)pAroot, ipB = (IntPtr)pBroot, ipC = (IntPtr)pCroot;
             int mCap = m, kCap = k, nCap = n, ldaCap = lda, ldbCap = ldb;
-            int colChunksCap = colChunks, rowChunksCap = rowChunks, rowBlocksCap = rowBlocks, colStripsCap = colStrips;
+            int colChunksCap = colChunks, rowChunksCap = rowChunks, rowBlocksCap = rowBlocks, colStripsCap = colStrips, stripCap = strip;
 
             Action<int> body = item =>
             {
@@ -84,13 +90,24 @@ internal static partial class SimdGemm
                     float* pCRow = pC + (long)i * nCap;
                     for (int cs = cs0; cs < cs1; cs++)
                     {
-                        int j = cs * Nr;
-                        int nc = Math.Min(Nr, nCap - j);
-                        if (mc == Mr && nc == Nr)
-                            DirectKernel6x16Store(pARow, ldaCap, pB + j, ldbCap, pCRow + j, nCap, kCap);
-                        else
-                            DirectKernelMxNMaskedStore(pARow, ldaCap, pB + j, ldbCap, pCRow + j, nCap,
-                                kCap, mcActual: mc, ncActual: nc);
+                        int stripStart = cs * stripCap;
+                        int stripEnd = Math.Min(nCap, stripStart + stripCap);
+#if NET9_0_OR_GREATER
+                        if (mc == Mr && stripCap == Nr512 && stripEnd - stripStart == Nr512)
+                        {
+                            DirectKernel6x32Store(pARow, ldaCap, pB + stripStart, ldbCap, pCRow + stripStart, nCap, kCap);
+                            continue;
+                        }
+#endif
+                        for (int j = stripStart; j < stripEnd; j += Nr)
+                        {
+                            int nc = Math.Min(Nr, stripEnd - j);
+                            if (mc == Mr && nc == Nr)
+                                DirectKernel6x16Store(pARow, ldaCap, pB + j, ldbCap, pCRow + j, nCap, kCap);
+                            else
+                                DirectKernelMxNMaskedStore(pARow, ldaCap, pB + j, ldbCap, pCRow + j, nCap,
+                                    kCap, mcActual: mc, ncActual: nc);
+                        }
                     }
                 }
             };

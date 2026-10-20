@@ -6753,6 +6753,14 @@ internal static class BackwardFunctions<T>
                 // Fast path: use the pre-activation captured during forward.
                 preActivation = cached;
             }
+            else if (activation == FusedActivationType.ReLU)
+            {
+                // ReLU's mask is pre-activation > 0, which is exactly output > 0, so the output stands in for it (as on
+                // the taped forward path). A compiled graph's FusedLinear node saves no pre-activation, and recomputing
+                // it re-ran the layer's GEMM and bias add every step: on the parity MLP's CUDA step, two extra GEMMs
+                // (~80 us) on top of the ~300 us PyTorch's whole step takes.
+                preActivation = output;
+            }
             else
             {
                 // Legacy path (backward-compat for tapes recorded by an older

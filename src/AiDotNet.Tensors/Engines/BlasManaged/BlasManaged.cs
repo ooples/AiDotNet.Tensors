@@ -120,6 +120,8 @@ public static partial class BlasManaged
     private const int ThinMDirectMaxN = 512;    // above this B re-stream dominates
     private const int ThinMDirectTransBMaxN = 1024; // NT kernel: Bᵀ rows read once per row chunk
     private const int ThinMDirectMaxK = 1024;   // tested winning range
+    private const int ThinMDirectPackedMinK = 512; // past this the no-transpose thin-M GEMM runs packed (TryThinMDirect)...
+    private const int ThinMDirectPackedMinM = 128; // ...from this many rows
     // Tiny GEMMs (e.g. 72×72×48 ≈ 0.25M) gain nothing from the parallel direct kernel
     // and should stay on the strategy/autotune path (which learns + caches a winner for
     // repeated small shapes). The validated wins are at the MLP-layer scale (L1 ≈ 8.4M,
@@ -181,6 +183,26 @@ public static partial class BlasManaged
                 Simd.SimdGemm.DgemmDirectParallelMIntoTransB(
                     MemoryMarshal.Cast<T, double>(a), MemoryMarshal.Cast<T, double>(b),
                     MemoryMarshal.Cast<T, double>(c), m, k, n);
+        }
+        else if (isFloat && k > ThinMDirectPackedMinK && m >= ThinMDirectPackedMinM && (n & 15) == 0
+            && (long)m * n * k >= GotoGemmFp32.ParallelMinWork && GotoGemmFp32.IsAvailable)
+        {
+            // Deep K: the packed GotoBLAS kernel (machine-code microkernel on L2-resident panels) beats the unpacked
+            // direct kernel, which streams B at row stride for every 6-row block. The parity MLP's first layer
+            // [128,784]x[784,512] on a Ryzen 7 4800H: 0.52-0.57 against 0.67-0.71 ms on 2 threads, 0.29 against 0.33 on
+            // 8, even on 16; with B evicted first (a training step's weights) 0.76 against 0.93 on 2, level on 8, 0.66
+            // against 0.80 on 16. At K = 512, or 64 rows with B evicted, the direct kernel still wins on 8-16 threads, so
+            // it keeps those. With n a multiple of
+            // 16 no column falls in GotoGemm's scalar N-tail, so every element is the same FMA chain (K blocked by kc)
+            // however its thread-count-dependent tile width splits the columns: the result is the same at every count.
+            var (gmc, gnc, gkc) = GotoGemmFp32.ChooseParallelBlocks(m, n);
+            unsafe
+            {
+                fixed (float* pa = MemoryMarshal.Cast<T, float>(a))
+                fixed (float* pb = MemoryMarshal.Cast<T, float>(b))
+                fixed (float* pc = MemoryMarshal.Cast<T, float>(c))
+                    GotoGemmFp32.RunParallel(pa, lda, pb, ldb, pc, ldc, m, n, k, gmc, gnc, gkc);
+            }
         }
         else if (isFloat && Simd.SimdGemm.UseDirectParallel2D
             && m <= Simd.SimdGemm.DirectParallel2DMaxM && k <= Simd.SimdGemm.DirectParallel2DMaxK

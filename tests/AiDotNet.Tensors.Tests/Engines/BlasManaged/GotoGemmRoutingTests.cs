@@ -52,10 +52,82 @@ public sealed class GotoGemmRoutingTests
         Assert.False(GotoGemmFp32.PackBothUnderOccupies(m, threadBudget));
     }
 
+    // A thin-M no-transpose GEMM with deep K (and at least 128 rows) runs packed (GotoGemm). Its tile width depends on the
+    // thread count, so the result may not: with n a multiple of 16 every element is the same K-blocked FMA chain at every
+    // count. (N stays above 128, out of the JIT generator's box, which takes small shapes only on one thread.)
+    [SkippableTheory]
+    [InlineData(128, 784, 512)]   // the parity MLP's first layer
+    [InlineData(130, 600, 160)]   // a 4-row M-tail, K not a multiple of the 256 K-block
+    public void ThinMDeepK_MatchesADoubleReference_AtEveryThreadCount(int m, int k, int n)
+    {
+        // Without the machine-code microkernel the packed route is never taken and this would pass through another
+        // kernel, covering nothing it claims to.
+        Skip.IfNot(GotoGemmFp32.IsAvailable, "The packed GotoGemm route is unavailable on this CPU/OS/runtime.");
+        int before = CpuParallelSettings.MaxDegreeOfParallelism;
+        var rng = RandomHelper.CreateSeededRandom(1055);
+        var a = new float[m * k];
+        var b = new float[k * n];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() - 0.5);
+        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() - 0.5);
+        float[]? first = null;
+        try
+        {
+            foreach (int threads in new[] { 1, 3, 7, 16 })
+            {
+                CpuParallelSettings.MaxDegreeOfParallelism = threads;
+                var c = new float[m * n];
+                for (int i = 0; i < c.Length; i++) c[i] = float.NaN;
+                AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(a, k, false, b, n, false, c, n, m, n, k);
+                if (first is null)
+                {
+                    first = c;
+                    double worst = 0;
+                    for (int i = 0; i < m; i++)
+                        for (int j = 0; j < n; j++)
+                        {
+                            double e = 0;
+                            for (int p = 0; p < k; p++) e += (double)a[i * k + p] * b[p * n + j];
+                            worst = Math.Max(worst, Math.Abs(e - c[i * n + j]));
+                        }
+                    Assert.True(worst < 1e-4, $"max |C - C_ref| = {worst:E3}");
+                }
+                else
+                {
+                    for (int i = 0; i < c.Length; i++)
+                        Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(first[i]) == TestHelpers.MathCompat.SingleToInt32Bits(c[i]),
+                            $"C[{i / n},{i % n}] at {threads} threads: {c[i]:G9}, at 1 thread {first[i]:G9}");
+                }
+            }
+        }
+        finally
+        {
+            CpuParallelSettings.MaxDegreeOfParallelism = before;
+        }
+    }
+    // M from 64: a 77-token cross-attention context's K/V projection (M77 K1024 N2304) left PackBoth on 2 threads.
+    // Thin-M very-wide-N with M a multiple of the 6-row microkernel stays on PackBoth's N-axis path.
+    [Theory]
+    [InlineData(77, 2304, 1024)]
+    [InlineData(64, 1152, 1152)]
+    [InlineData(256, 3456, 1152)]
+    public void BeatsPackBoth_ClaimsShortMShapes(int m, int n, int k)
+    {
+        Assert.True(GotoGemmFp32.BeatsPackBoth(m, n, k));
+    }
+
+    [Theory]
+    [InlineData(63, 2304, 1024)]
+    [InlineData(96, 4096, 1024)]
+    public void BeatsPackBoth_CedesTinyMAndSixAlignedVeryWideN(int m, int n, int k)
+    {
+        Assert.False(GotoGemmFp32.BeatsPackBoth(m, n, k));
+    }
+
     [Theory]
     [InlineData(256, 768, 768)]
     [InlineData(256, 768, 3072)]
     [InlineData(250, 768, 520)]
+    [InlineData(77, 1024, 2304)]
     public void TransformerShapes_OnTheNewRoute_MatchADoubleReference(int m, int k, int n)
     {
         int before = CpuParallelSettings.MaxDegreeOfParallelism;
@@ -105,6 +177,7 @@ public sealed class GotoGemmRoutingTests
     [InlineData(256, 768, 768)]
     [InlineData(250, 768, 520)]
     [InlineData(256, 3072, 768)]
+    [InlineData(77, 1024, 2304)]
     public void RoutedPath_OverwritesAGarbageDestination(int m, int k, int n)
     {
         int before = CpuParallelSettings.MaxDegreeOfParallelism;

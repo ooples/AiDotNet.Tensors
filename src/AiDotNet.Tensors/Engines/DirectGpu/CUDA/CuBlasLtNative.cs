@@ -24,6 +24,10 @@ public static class CuBlasLtNative
     [DllImport(CuBlasLtLibrary, EntryPoint = "cublasLtDestroy")]
     public static extern CublasStatus cublasLtDestroy(IntPtr handle);
 
+    /// <summary>The loaded cuBLASLt's version (major * 10000 + minor * 100 + patch).</summary>
+    [DllImport(CuBlasLtLibrary, EntryPoint = "cublasLtGetVersion")]
+    internal static extern UIntPtr cublasLtGetVersion();
+
     [DllImport(CuBlasLtLibrary, EntryPoint = "cublasLtMatmul")]
     public static extern CublasStatus cublasLtMatmul(
         IntPtr handle,

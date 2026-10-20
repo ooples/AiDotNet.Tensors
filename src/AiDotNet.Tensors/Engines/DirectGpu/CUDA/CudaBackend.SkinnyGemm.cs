@@ -11,6 +11,12 @@ public sealed partial class CudaBackend : IGemmBiasActivationBackend, IWeightBia
     private static readonly bool SkinnyGemmEnabled =
         Environment.GetEnvironmentVariable("AIDOTNET_SKINNY_GEMM") != "0";
 
+    /// <summary>
+    /// Whether this backend serves skinny and small GEMM shapes with its generated kernels (default: AIDOTNET_SKINNY_GEMM).
+    /// Off, every such shape takes the general path: cuBLAS, or the generated fallback GEMM without it.
+    /// </summary>
+    internal bool SmallGemmRoutesEnabled { get; set; } = SkinnyGemmEnabled;
+
     private const int SkinnyTileRows = 32, SkinnyTileColumns = 64, SkinnyBlockThreads = 64;
     // skinny_gemm: four 64-thread groups per block (SG_GROUPS * SG_THREADS).
     private const int SkinnyGemmBlockThreads = 4 * SkinnyBlockThreads;
@@ -35,7 +41,7 @@ public sealed partial class CudaBackend : IGemmBiasActivationBackend, IWeightBia
     {
         if (forceTileRows != 0 && forceTileRows != 32 && forceTileRows != 16 && forceTileRows != 8) return false;
         if (bias is not null && (bias.Size < N || (bias.Handle.ToInt64() & 15) != 0)) return false;
-        if (!SkinnyGemmEnabled || M < 256 || M > 65535 * SkinnyTileRows || N > SkinnyMaxNarrow || K > SkinnyMaxNarrow
+        if (!SmallGemmRoutesEnabled || M < 256 || M > 65535 * SkinnyTileRows || N > SkinnyMaxNarrow || K > SkinnyMaxNarrow
             || (N & 3) != 0 || (K & 3) != 0 || !SkinnyAligned(A, B, C)
             || !_kernelCache.TryGetValue("skinny_gemm", out var kernel))
             return false;
@@ -75,7 +81,7 @@ public sealed partial class CudaBackend : IGemmBiasActivationBackend, IWeightBia
     internal unsafe bool TryWgradTile(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha, float beta,
         IGpuBuffer? bias = null, float biasBeta = 0f)
     {
-        if (!SkinnyGemmEnabled || K < WgradTileMinReduce || K >= SkinnyTnMinReduce || M <= 0 || N <= 0
+        if (!SmallGemmRoutesEnabled || K < WgradTileMinReduce || K >= SkinnyTnMinReduce || M <= 0 || N <= 0
             || M > SkinnyMaxNarrow || N > SkinnyMaxNarrow || (M & 3) != 0 || (N & 3) != 0 || !SkinnyAligned(A, B, C)
             || (bias is not null && (bias.Size < N || bias.Handle == C.Handle || bias.Handle == B.Handle || bias.Handle == A.Handle))
             || !_kernelCache.TryGetValue("wgrad_tile_tn", out var wgradKernel))
@@ -109,7 +115,7 @@ public sealed partial class CudaBackend : IGemmBiasActivationBackend, IWeightBia
         float alpha, float beta)
     {
         if (K < SkinnyTnMinReduce) return TryWgradTile(A, B, C, M, N, K, alpha, beta);
-        if (!SkinnyGemmEnabled || K < SkinnyTnMinReduce || M > SkinnyMaxNarrow || N > SkinnyMaxNarrow
+        if (!SmallGemmRoutesEnabled || K < SkinnyTnMinReduce || M > SkinnyMaxNarrow || N > SkinnyMaxNarrow
             || (M & 3) != 0 || (N & 3) != 0 || !SkinnyAligned(A, B, C)
             || !_kernelCache.TryGetValue("skinny_gemm_tn", out var kernel))
             return false;
@@ -166,7 +172,7 @@ public sealed partial class CudaBackend : IGemmBiasActivationBackend, IWeightBia
     internal unsafe bool TrySmallGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, bool transA, bool transB,
         float alpha, float beta, IGpuBuffer? bias = null, bool relu = false)
     {
-        if (!SkinnyGemmEnabled || M <= 0 || N <= 0 || K <= 0 || (bias is not null && bias.Size < N)) return false;
+        if (!SmallGemmRoutesEnabled || M <= 0 || N <= 0 || K <= 0 || (bias is not null && bias.Size < N)) return false;
         bool rowReduce = M <= SmallGemmMaxRows && N <= SmallGemmMaxColumns && (long)M * N <= SmallGemmMaxOutputs
             && K >= SmallGemmMinReduce;
         bool tinyK = !rowReduce && ((K <= SmallGemmMaxTinyReduce && (long)M * N <= SmallGemmMaxTinyOutputs)

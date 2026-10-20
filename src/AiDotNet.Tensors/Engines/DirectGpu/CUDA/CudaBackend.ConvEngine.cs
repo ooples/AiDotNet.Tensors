@@ -28,8 +28,14 @@ public sealed partial class CudaBackend
         _ => "",
     };
 
-    /// <summary>mma.sync TF32 needs compute capability 8.0+.</summary>
-    internal bool ConvTensorCoresAvailable => _ccMajor >= 8;
+    /// <summary>
+    /// mma.sync TF32 needs compute capability 8.0+. AIDOTNET_CONV_TENSOR_CORES=0 keeps the tensor-core mainloops out of
+    /// every slot and fallback chain: the before/after switch for #1335's ResNet-18 head-to-head.
+    /// </summary>
+    internal bool ConvTensorCoresAvailable => _ccMajor >= 8 && s_convTensorCores;
+
+    private static readonly bool s_convTensorCores =
+        Environment.GetEnvironmentVariable("AIDOTNET_CONV_TENSOR_CORES") != "0";
 
     private int? _convEngineMainloopOverride;
 
