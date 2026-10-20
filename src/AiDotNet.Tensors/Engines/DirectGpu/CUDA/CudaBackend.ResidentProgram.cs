@@ -4,61 +4,6 @@ using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
-/// <summary>A stage of a resident program (<see cref="CudaResidentProgramKernels"/>).</summary>
-internal enum ResidentOp
-{
-    /// <summary><c>out[r,c] = max(0, a[r,c] * b[c] + c[c])</c>: a per-column scale and bias, then ReLU.</summary>
-    AffineRelu = 0,
-
-    /// <summary><c>out[r,c] = a[r,c] * b[c] + c[c]</c>.</summary>
-    Affine = 1,
-
-    /// <summary><c>out[r,:] = softmax(a[r,:])</c>, one row per block.</summary>
-    RowSoftmax = 2,
-
-    /// <summary><c>out = a + b</c>, elementwise.</summary>
-    Add = 3,
-}
-
-/// <summary>One declared stage: the op and its operands over a [rows, cols] tensor (unused operands may be null).</summary>
-internal readonly struct ResidentStage
-{
-    public ResidentStage(ResidentOp op, int rows, int cols, IGpuBuffer a, IGpuBuffer? b, IGpuBuffer? c, IGpuBuffer output)
-    {
-        if (rows <= 0 || cols <= 0) throw new ArgumentOutOfRangeException(nameof(rows), "A stage needs a non-empty [rows, cols] shape.");
-        if ((long)rows * cols > int.MaxValue) throw new ArgumentOutOfRangeException(nameof(rows), "A stage is limited to int.MaxValue elements.");
-        bool needsB = op != ResidentOp.RowSoftmax;
-        bool needsC = op == ResidentOp.Affine || op == ResidentOp.AffineRelu;
-        if (a is null) throw new ArgumentNullException(nameof(a));
-        if (output is null) throw new ArgumentNullException(nameof(output));
-        if (needsB && b is null) throw new ArgumentNullException(nameof(b), $"{op} reads a second operand.");
-        if (needsC && c is null) throw new ArgumentNullException(nameof(c), $"{op} reads a bias operand.");
-        // A short buffer would make the kernel read or write past it: CUDA error 700, which poisons the context --
-        // and the backend runs on the device's SHARED primary context, so one bad stage would break every engine in
-        // the process. Refused here as an ordinary exception instead.
-        long elements = (long)rows * cols;
-        RequireSize(a, elements, op, "input", nameof(a));
-        RequireSize(output, elements, op, "output", nameof(output));
-        if (needsB && b is not null) RequireSize(b, op == ResidentOp.Add ? elements : cols, op, "second operand", nameof(b));
-        if (needsC && c is not null) RequireSize(c, cols, op, "bias", nameof(c));
-        Op = op; Rows = rows; Cols = cols; A = a; B = b; C = c; Output = output;
-    }
-
-    private static void RequireSize(IGpuBuffer buffer, long needed, ResidentOp op, string role, string parameter)
-    {
-        if (buffer.Size < needed)
-            throw new ArgumentException($"{op}: the {role} holds {buffer.Size} elements; the stage needs {needed}.", parameter);
-    }
-
-    public ResidentOp Op { get; }
-    public int Rows { get; }
-    public int Cols { get; }
-    public IGpuBuffer A { get; }
-    public IGpuBuffer? B { get; }
-    public IGpuBuffer? C { get; }
-    public IGpuBuffer Output { get; }
-}
-
 [StructLayout(LayoutKind.Sequential)]
 internal struct ResidentStageArgs
 {
