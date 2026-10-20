@@ -37,20 +37,37 @@ internal static class WinogradF23KernelTemplate
     internal const string GradOutputTiles = "wino_f32w_dy";
     internal const string InputTilesTileMajor = "wino_f32w_input";
     internal const string FilterGradient = "wino_f32w_output";
+    internal const string FusedFilterGradient = "wino_f32w_fused";
+    internal const string FusedFilterGradientDirect = "wino_f32w_fused_direct";
+    internal const string FusedFilterGradientFinish = "wino_f32w_fused_finish";
 
-    /// <summary>One kernel: its buffers in binding order (the second written, every other one read) and its int
-    /// parameters.</summary>
+    /// <summary>The fused weight gradient's block: 32 output x 32 input channels per group of 256.</summary>
+    internal const int FusedTile = 32;
+
+    /// <summary>The fused weight gradient's tiles per shared-memory chunk; splits are a multiple of it.</summary>
+    internal const int FusedChunk = 4;
+
+    /// <summary>The fused weight gradient's work-group size, fixed: its thread roles assume exactly 256.</summary>
+    internal const int FusedGroupSize = 256;
+
+    /// <summary>
+    /// One kernel: its buffers in binding order (the second written, every other one read), its int parameters, and
+    /// the floats of work-group shared memory it declares (zero for the elementwise kernels). A shared-memory kernel
+    /// sees <c>lid</c> (its index in the 256-wide group) and <c>grp</c> (the group's index in the 1-D grid), and writes
+    /// <c>BARRIER();</c> and <c>FMA(a, b, c)</c>, which each dialect spells its own way.
+    /// </summary>
     internal sealed class Spec
     {
-        internal Spec(string name, string[] buffers, string[] ints, string body)
+        internal Spec(string name, string[] buffers, string[] ints, string body, int sharedFloats = 0)
         {
-            Name = name; Buffers = buffers; Ints = ints; Body = body;
+            Name = name; Buffers = buffers; Ints = ints; Body = body; SharedFloats = sharedFloats;
         }
 
         internal string Name { get; }
         internal string[] Buffers { get; }
         internal string[] Ints { get; }
         internal string Body { get; }
+        internal int SharedFloats { get; }
     }
 
     // G g G^T for the 3x3 filter already in g[9] (row-major), stored to the sixteen planes of u at idx.
@@ -109,8 +126,206 @@ internal static class WinogradF23KernelTemplate
     }
 ";
 
+    // The fused weight gradient (CUDA's wino_f32w_fused, CUDA/Kernels/CudaConvWinogradKernels.cs, restated for 16 KB of
+    // shared memory, WebGPU's guaranteed minimum). Group grp owns input channels c0 .. c0 + 31, output channels
+    // k0 .. k0 + 31 and the tiles [bz * tilesPerSplit, ...) (grp = (bz * gy + by) * gx + bx). Per chunk of 4 tiles,
+    // threads 0..127 transform dY (U = A g A^T) and threads 128..255 transform x (V = B^T d B) into sm (U at 0, V at
+    // 2048, each [16 x][4 tiles][32 channels] with the channel column XOR-swizzled by 8 * tile, so a warp's 8 rows x 4
+    // tiles of stores hit 32 banks and each thread's 4-channel quad stays contiguous). Thread (tx, tk, tc) then
+    // accumulates M[x][k][c] += U[x][p][k] V[x][p][c] for components 4tx .. 4tx + 3, channels 4tk .., 4tc ..: 64
+    // accumulators, one fma chain per (x, k, c) in ascending tile order, as CUDA's.
+    private const string FusedMain = @"
+    int tid = lid;
+    int gx = (C + 31) / 32, gy = (K + 31) / 32;
+    int bz = grp / (gx * gy);
+    int rem = grp - bz * (gx * gy);
+    int by = rem / gx, bx = rem - by * gx;
+    int c0 = bx * 32, k0 = by * 32;
+    int TT = tilesH * tilesW, P = N * TT;
+    int pBegin = bz * tilesPerSplit, pEnd = min(P, pBegin + tilesPerSplit);
+    int tc = tid & 7, tk = (tid >> 3) & 7, tx = tid >> 6;
+    int tj = tid & 3, tr = (tid >> 2) & 31, role = tid >> 7;
+    int col = tj * 32 + (tr ^ (tj * 8));
+    float acc[64];
+    for (int i = 0; i < 64; i++) acc[i] = 0.0f;
+    for (int pc = pBegin; pc < pEnd; pc += 4)
+    {
+        int p = pc + tj;
+        bool pin = p < pEnd;
+        int n = 0, th = 0, tw = 0;
+        if (pin) { n = p / TT; int tt = p - n * TT; th = tt / tilesW; tw = tt - th * tilesW; }
+        if (role == 0)
+        {
+            int k = k0 + tr;
+            float g00 = 0.0f, g01 = 0.0f, g10 = 0.0f, g11 = 0.0f;
+            if (pin && k < K)
+            {
+                int h = th * 2, w2 = tw * 2;
+                int src = (n * K + k) * outH * outW + h * outW + w2;
+                g00 = dy[src];
+                if (w2 + 1 < outW) g01 = dy[src + 1];
+                if (h + 1 < outH)
+                {
+                    g10 = dy[src + outW];
+                    if (w2 + 1 < outW) g11 = dy[src + outW + 1];
+                }
+            }
+            float ra[4];
+            float rb[4];
+            ra[0] = g00; ra[1] = g00 + g10; ra[2] = g00 - g10; ra[3] = -g10;
+            rb[0] = g01; rb[1] = g01 + g11; rb[2] = g01 - g11; rb[3] = -g11;
+            for (int i = 0; i < 4; i++)
+            {
+                sm[(i * 4 + 0) * 128 + col] = ra[i];
+                sm[(i * 4 + 1) * 128 + col] = ra[i] + rb[i];
+                sm[(i * 4 + 2) * 128 + col] = ra[i] - rb[i];
+                sm[(i * 4 + 3) * 128 + col] = -rb[i];
+            }
+        }
+        else
+        {
+            int c = c0 + tr;
+            bool cin = pin && c < C;
+            int h0 = th * 2 - pad, w0 = tw * 2 - pad;
+            int src = (n * C + (cin ? c : 0)) * H * W;
+            float d[16];
+            for (int i = 0; i < 4; i++)
+            {
+                int hh = h0 + i;
+                for (int j = 0; j < 4; j++)
+                {
+                    int ww = w0 + j;
+                    d[i * 4 + j] = 0.0f;
+                    if (cin && hh >= 0 && hh < H && ww >= 0 && ww < W) d[i * 4 + j] = x[src + hh * W + ww];
+                }
+            }
+            float s[16];
+            for (int j = 0; j < 4; j++)
+            {
+                s[j] = d[j] - d[8 + j];
+                s[4 + j] = d[4 + j] + d[8 + j];
+                s[8 + j] = d[8 + j] - d[4 + j];
+                s[12 + j] = d[4 + j] - d[12 + j];
+            }
+            for (int i = 0; i < 4; i++)
+            {
+                sm[2048 + (i * 4 + 0) * 128 + col] = s[i * 4] - s[i * 4 + 2];
+                sm[2048 + (i * 4 + 1) * 128 + col] = s[i * 4 + 1] + s[i * 4 + 2];
+                sm[2048 + (i * 4 + 2) * 128 + col] = s[i * 4 + 2] - s[i * 4 + 1];
+                sm[2048 + (i * 4 + 3) * 128 + col] = s[i * 4 + 1] - s[i * 4 + 3];
+            }
+        }
+        BARRIER();
+        for (int j = 0; j < 4; j++)
+        {
+            for (int xi = 0; xi < 4; xi++)
+            {
+                int row = (tx * 4 + xi) * 128 + j * 32;
+                int uo = row + ((tk * 4) ^ (j * 8)), vo = 2048 + row + ((tc * 4) ^ (j * 8));
+                float u0 = sm[uo], u1 = sm[uo + 1], u2 = sm[uo + 2], u3 = sm[uo + 3];
+                float v0 = sm[vo], v1 = sm[vo + 1], v2 = sm[vo + 2], v3 = sm[vo + 3];
+                int a0 = xi * 16;
+                acc[a0 + 0] = FMA(u0, v0, acc[a0 + 0]); acc[a0 + 1] = FMA(u0, v1, acc[a0 + 1]);
+                acc[a0 + 2] = FMA(u0, v2, acc[a0 + 2]); acc[a0 + 3] = FMA(u0, v3, acc[a0 + 3]);
+                acc[a0 + 4] = FMA(u1, v0, acc[a0 + 4]); acc[a0 + 5] = FMA(u1, v1, acc[a0 + 5]);
+                acc[a0 + 6] = FMA(u1, v2, acc[a0 + 6]); acc[a0 + 7] = FMA(u1, v3, acc[a0 + 7]);
+                acc[a0 + 8] = FMA(u2, v0, acc[a0 + 8]); acc[a0 + 9] = FMA(u2, v1, acc[a0 + 9]);
+                acc[a0 + 10] = FMA(u2, v2, acc[a0 + 10]); acc[a0 + 11] = FMA(u2, v3, acc[a0 + 11]);
+                acc[a0 + 12] = FMA(u3, v0, acc[a0 + 12]); acc[a0 + 13] = FMA(u3, v1, acc[a0 + 13]);
+                acc[a0 + 14] = FMA(u3, v2, acc[a0 + 14]); acc[a0 + 15] = FMA(u3, v3, acc[a0 + 15]);
+            }
+        }
+        BARRIER();
+    }
+";
+
+    // The epilogue, in eighths of the group's k rows (eighth e is the rows its tk == e threads hold): they gather each
+    // (k, c)'s 16 components into Ms = sm[0 ..][16 x][4 k][33] (row stride 33: conflict-free), and threads 0..127 take
+    // one (k, c) each and apply G^T M G (3x3).
+    private const string FusedEpilogueHead = @"
+    for (int e = 0; e < 8; e++)
+    {
+        if (tk == e)
+        {
+            for (int xi = 0; xi < 4; xi++)
+                for (int a = 0; a < 4; a++)
+                    for (int b = 0; b < 4; b++)
+                        sm[(tx * 4 + xi) * 132 + a * 33 + tc * 4 + b] = acc[xi * 16 + a * 4 + b];
+        }
+        BARRIER();
+        int kl = tid >> 5, cl = tid & 31;
+        float r9[9];
+        if (tid < 128)
+        {
+            float m[16];
+            for (int q = 0; q < 16; q++) m[q] = sm[q * 132 + kl * 33 + cl];
+            float t[12];
+            for (int j = 0; j < 4; j++)
+            {
+                float m0 = m[j], m1 = m[4 + j], m2 = m[8 + j], m3 = m[12 + j];
+                t[j] = m0 + 0.5f * (m1 + m2);
+                t[4 + j] = 0.5f * (m1 - m2);
+                t[8 + j] = 0.5f * (m1 + m2) + m3;
+            }
+            for (int i = 0; i < 3; i++)
+            {
+                float a = t[i * 4], b = t[i * 4 + 1], cc = t[i * 4 + 2], dd = t[i * 4 + 3];
+                r9[i * 3 + 0] = a + 0.5f * (b + cc);
+                r9[i * 3 + 1] = 0.5f * (b - cc);
+                r9[i * 3 + 2] = 0.5f * (b + cc) + dd;
+            }
+        }
+";
+
+    // Unsplit: stage the 4 rows' dW spans (dW[k][c0 .. c0 + 31][3][3], contiguous) in sm[2112 ..] and copy them out.
+    private const string FusedEpilogueDirect = FusedEpilogueHead + @"
+        if (tid < 128)
+            for (int q = 0; q < 9; q++) sm[2112 + kl * 288 + cl * 9 + q] = r9[q];
+        BARRIER();
+        int span = min(32, C - c0) * 9;
+        for (int i = tid; i < 4 * 288; i += 256)
+        {
+            int rowk = i / 288, r = i - rowk * 288;
+            int k = k0 + e * 4 + rowk;
+            if (k < K && r < span) res[(k * C + c0) * 9 + r] = sm[2112 + i];
+        }
+        BARRIER();
+    }
+";
+
+    // Split: component-major partials res[bz][q][k][c] (q = 3i + j), summed by wino_f32w_fused_finish.
+    private const string FusedEpilogueSplit = FusedEpilogueHead + @"
+        int k = k0 + e * 4 + kl, c = c0 + cl;
+        if (tid < 128 && k < K && c < C)
+        {
+            int plane = K * C;
+            int dst = bz * 9 * plane + k * C + c;
+            for (int q = 0; q < 9; q++) res[dst + q * plane] = r9[q];
+        }
+        BARRIER();
+    }
+";
+
+    private static readonly string[] FusedInts =
+        { "N", "C", "H", "W", "K", "outH", "outW", "pad", "tilesH", "tilesW", "tilesPerSplit" };
+
     internal static readonly Spec[] Kernels =
     {
+        // Weight gradient, one launch per split of the tiles: x, the written dW (or partials), dY. Groups of 256, a 1-D
+        // grid of ceil(C/32) * ceil(K/32) * splits groups.
+        new Spec(FusedFilterGradientDirect, new[] { "x", "res", "dy" }, FusedInts, FusedMain + FusedEpilogueDirect, 4096),
+        new Spec(FusedFilterGradient, new[] { "x", "res", "dy" }, FusedInts, FusedMain + FusedEpilogueSplit, 4096),
+
+        // dW[k][c][q] = sum over the splits of partials[z][q][k][c], in split order; idx = (k*C + c)*9 + q.
+        new Spec(FusedFilterGradientFinish, new[] { "partials", "dw" }, new[] { "KC", "splits" }, @"
+    int idx = gid;
+    if (idx >= KC * 9) return;
+    int kc = idx / 9, q = idx - kc * 9;
+    float sum = 0.0f;
+    for (int z = 0; z < splits; z++) sum += partials[(z * 9 + q) * KC + kc];
+    dw[idx] = sum;
+"),
+
         // U[x][k][c] = (G g G^T)[x], G = [[1,0,0],[1/2,1/2,1/2],[1/2,-1/2,1/2],[0,0,1]]; idx = k*C + c.
         new Spec(Filter, new[] { "w", "u" }, new[] { "K", "C" }, @"
     int idx = gid;
@@ -299,7 +514,15 @@ internal static class WinogradF23KernelTemplate
                     WinogradKernelDialect.Metal => "constant int& " + spec.Ints[i] + " [[buffer(" + (spec.Buffers.Length + i) + ")]]",
                     _ => "int " + spec.Ints[i],
                 });
-            if (dialect == WinogradKernelDialect.Metal) parameters.Add("uint gidU [[thread_position_in_grid]]");
+            if (dialect == WinogradKernelDialect.Metal)
+            {
+                parameters.Add("uint gidU [[thread_position_in_grid]]");
+                if (spec.SharedFloats > 0)
+                {
+                    parameters.Add("uint lidU [[thread_index_in_threadgroup]]");
+                    parameters.Add("uint grpU [[threadgroup_position_in_grid]]");
+                }
+            }
             sb.Append(string.Join(", ", parameters)).Append(")\n{\n");
             sb.Append(dialect switch
             {
@@ -307,10 +530,30 @@ internal static class WinogradF23KernelTemplate
                 WinogradKernelDialect.Metal => "    int gid = (int)gidU;\n",
                 _ => "    int gid = (int)(blockIdx.x * blockDim.x + threadIdx.x);\n",
             });
-            sb.Append(spec.Body).Append("}\n");
+            if (spec.SharedFloats > 0)
+                sb.Append(dialect switch
+                {
+                    WinogradKernelDialect.OpenCl => $"    __local float sm[{spec.SharedFloats}];\n"
+                        + "    int lid = (int)get_local_id(0), grp = (int)get_group_id(0);\n",
+                    WinogradKernelDialect.Metal => $"    threadgroup float sm[{spec.SharedFloats}];\n"
+                        + "    int lid = (int)lidU, grp = (int)grpU;\n",
+                    _ => $"    __shared__ float sm[{spec.SharedFloats}];\n"
+                        + "    int lid = (int)threadIdx.x, grp = (int)blockIdx.x;\n",
+                });
+            sb.Append(Spell(spec.Body, dialect)).Append("}\n");
         }
         return sb.ToString();
     }
+
+    // The shared-memory kernels' barrier and fused multiply-add, per dialect.
+    private static string Spell(string body, WinogradKernelDialect dialect)
+        => body.Replace("BARRIER();", dialect switch
+        {
+            WinogradKernelDialect.OpenCl => "barrier(CLK_LOCAL_MEM_FENCE);",
+            WinogradKernelDialect.Metal => "threadgroup_barrier(mem_flags::mem_threadgroup);",
+            WinogradKernelDialect.Glsl => "memoryBarrierShared(); barrier();",
+            _ => "__syncthreads();",
+        }).Replace("FMA(", dialect == WinogradKernelDialect.Hip ? "fmaf(" : "fma(");
 
     /// <summary>
     /// One kernel as a Vulkan compute shader: the buffers at bindings 0 and 1 and the int parameters as push constants,
@@ -325,7 +568,12 @@ internal static class WinogradF23KernelTemplate
                 .Append(spec.Buffers[i]).Append("[]; };\n");
         sb.Append("layout(push_constant) uniform PC { ");
         foreach (var p in spec.Ints) sb.Append("int ").Append(p).Append("; ");
-        sb.Append("};\nvoid main()\n{\n    int gid = int(gl_GlobalInvocationID.x);\n").Append(spec.Body).Append("}\n");
+        sb.Append("};\n");
+        if (spec.SharedFloats > 0) sb.Append("shared float sm[").Append(spec.SharedFloats).Append("];\n");
+        sb.Append("void main()\n{\n    int gid = int(gl_GlobalInvocationID.x);\n");
+        if (spec.SharedFloats > 0)
+            sb.Append("    int lid = int(gl_LocalInvocationID.x), grp = int(gl_WorkGroupID.x);\n");
+        sb.Append(Spell(spec.Body, WinogradKernelDialect.Glsl)).Append("}\n");
         return sb.ToString();
     }
 }

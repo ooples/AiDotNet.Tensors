@@ -257,6 +257,245 @@ fn wino_f32w_output(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 ";
 
+    // The fused weight gradient (WinogradF23KernelTemplate's FusedMain and epilogues), restated: x at binding 0, the
+    // written dW or partials at 1, dY at 2, the ints at 3. Group wid.x = (bz * gy + by) * gx + bx; 16 KB of workgroup
+    // storage, WebGPU's guaranteed minimum. Every barrier sits in uniform control flow (the loop bounds come from the
+    // workgroup id and the uniforms), which WGSL's uniformity analysis requires.
+    private const string FusedMain = @"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> res: array<f32>;
+@group(0) @binding(2) var<storage, read> dy: array<f32>;
+struct Params { N: i32, C: i32, H: i32, W: i32, K: i32, outH: i32, outW: i32, pd: i32, tilesH: i32, tilesW: i32, tilesPerSplit: i32, pad0: i32, }
+@group(0) @binding(3) var<uniform> pm: Params;
+var<workgroup> sm: array<f32, 4096>;
+var<private> acc: array<f32, 64>;
+var<private> r9: array<f32, 9>;
+
+fn fused_accumulate(tid: i32, grp: i32) {
+    let gx = (pm.C + 31) / 32;
+    let gy = (pm.K + 31) / 32;
+    let bz = grp / (gx * gy);
+    let rem = grp - bz * (gx * gy);
+    let by = rem / gx;
+    let bx = rem - by * gx;
+    let c0 = bx * 32;
+    let k0 = by * 32;
+    let TT = pm.tilesH * pm.tilesW;
+    let P = pm.N * TT;
+    let pBegin = bz * pm.tilesPerSplit;
+    let pEnd = min(P, pBegin + pm.tilesPerSplit);
+    let tc = tid & 7;
+    let tk = (tid >> 3u) & 7;
+    let tx = tid >> 6u;
+    let tj = tid & 3;
+    let tr = (tid >> 2u) & 31;
+    let role = tid >> 7u;
+    let col = tj * 32 + (tr ^ (tj * 8));
+    for (var i = 0; i < 64; i = i + 1) { acc[i] = 0.0; }
+    for (var pc = pBegin; pc < pEnd; pc = pc + 4) {
+        let p = pc + tj;
+        let pin = p < pEnd;
+        var n = 0;
+        var th = 0;
+        var tw = 0;
+        if (pin) { n = p / TT; let tt = p - n * TT; th = tt / pm.tilesW; tw = tt - th * pm.tilesW; }
+        if (role == 0) {
+            let k = k0 + tr;
+            var g00 = 0.0;
+            var g01 = 0.0;
+            var g10 = 0.0;
+            var g11 = 0.0;
+            if (pin && k < pm.K) {
+                let h = th * 2;
+                let w2 = tw * 2;
+                let src = (n * pm.K + k) * pm.outH * pm.outW + h * pm.outW + w2;
+                g00 = dy[src];
+                if (w2 + 1 < pm.outW) { g01 = dy[src + 1]; }
+                if (h + 1 < pm.outH) {
+                    g10 = dy[src + pm.outW];
+                    if (w2 + 1 < pm.outW) { g11 = dy[src + pm.outW + 1]; }
+                }
+            }
+            var ra: array<f32, 4>;
+            var rb: array<f32, 4>;
+            ra[0] = g00; ra[1] = g00 + g10; ra[2] = g00 - g10; ra[3] = -g10;
+            rb[0] = g01; rb[1] = g01 + g11; rb[2] = g01 - g11; rb[3] = -g11;
+            for (var i = 0; i < 4; i = i + 1) {
+                sm[(i * 4 + 0) * 128 + col] = ra[i];
+                sm[(i * 4 + 1) * 128 + col] = ra[i] + rb[i];
+                sm[(i * 4 + 2) * 128 + col] = ra[i] - rb[i];
+                sm[(i * 4 + 3) * 128 + col] = -rb[i];
+            }
+        } else {
+            let c = c0 + tr;
+            let cin = pin && c < pm.C;
+            let h0 = th * 2 - pm.pd;
+            let w0 = tw * 2 - pm.pd;
+            var cs = 0;
+            if (cin) { cs = c; }
+            let src = (n * pm.C + cs) * pm.H * pm.W;
+            var d: array<f32, 16>;
+            for (var i = 0; i < 4; i = i + 1) {
+                let hh = h0 + i;
+                for (var j = 0; j < 4; j = j + 1) {
+                    let ww = w0 + j;
+                    d[i * 4 + j] = 0.0;
+                    if (cin && hh >= 0 && hh < pm.H && ww >= 0 && ww < pm.W) { d[i * 4 + j] = x[src + hh * pm.W + ww]; }
+                }
+            }
+            var s: array<f32, 16>;
+            for (var j = 0; j < 4; j = j + 1) {
+                s[j] = d[j] - d[8 + j];
+                s[4 + j] = d[4 + j] + d[8 + j];
+                s[8 + j] = d[8 + j] - d[4 + j];
+                s[12 + j] = d[4 + j] - d[12 + j];
+            }
+            for (var i = 0; i < 4; i = i + 1) {
+                sm[2048 + (i * 4 + 0) * 128 + col] = s[i * 4] - s[i * 4 + 2];
+                sm[2048 + (i * 4 + 1) * 128 + col] = s[i * 4 + 1] + s[i * 4 + 2];
+                sm[2048 + (i * 4 + 2) * 128 + col] = s[i * 4 + 2] - s[i * 4 + 1];
+                sm[2048 + (i * 4 + 3) * 128 + col] = s[i * 4 + 1] - s[i * 4 + 3];
+            }
+        }
+        workgroupBarrier();
+        for (var j = 0; j < 4; j = j + 1) {
+            for (var xi = 0; xi < 4; xi = xi + 1) {
+                let row = (tx * 4 + xi) * 128 + j * 32;
+                let uo = row + ((tk * 4) ^ (j * 8));
+                let vo = 2048 + row + ((tc * 4) ^ (j * 8));
+                var uu: array<f32, 4>;
+                var vv: array<f32, 4>;
+                for (var q = 0; q < 4; q = q + 1) { uu[q] = sm[uo + q]; vv[q] = sm[vo + q]; }
+                for (var a = 0; a < 4; a = a + 1) {
+                    for (var b = 0; b < 4; b = b + 1) {
+                        let ai = xi * 16 + a * 4 + b;
+                        acc[ai] = fma(uu[a], vv[b], acc[ai]);
+                    }
+                }
+            }
+        }
+        workgroupBarrier();
+    }
+}
+
+// Eighth e of the epilogue: the tk == e threads gather their (k, c) components into sm[x][4 k][33].
+fn fused_gather(tid: i32, e: i32) {
+    let tc = tid & 7;
+    let tk = (tid >> 3u) & 7;
+    let tx = tid >> 6u;
+    if (tk == e) {
+        for (var xi = 0; xi < 4; xi = xi + 1) {
+            for (var a = 0; a < 4; a = a + 1) {
+                for (var b = 0; b < 4; b = b + 1) {
+                    sm[(tx * 4 + xi) * 132 + a * 33 + tc * 4 + b] = acc[xi * 16 + a * 4 + b];
+                }
+            }
+        }
+    }
+}
+
+// One (k, c) of the gathered eighth (threads 0..127): G^T M G into r9.
+fn fused_transform(tid: i32) {
+    let kl = tid >> 5u;
+    let cl = tid & 31;
+    var m: array<f32, 16>;
+    for (var q = 0; q < 16; q = q + 1) { m[q] = sm[q * 132 + kl * 33 + cl]; }
+    var t: array<f32, 12>;
+    for (var j = 0; j < 4; j = j + 1) {
+        let m0 = m[j]; let m1 = m[4 + j]; let m2 = m[8 + j]; let m3 = m[12 + j];
+        t[j] = m0 + 0.5 * (m1 + m2);
+        t[4 + j] = 0.5 * (m1 - m2);
+        t[8 + j] = 0.5 * (m1 + m2) + m3;
+    }
+    for (var i = 0; i < 3; i = i + 1) {
+        let a = t[i * 4]; let b = t[i * 4 + 1]; let cc = t[i * 4 + 2]; let dd = t[i * 4 + 3];
+        r9[i * 3 + 0] = a + 0.5 * (b + cc);
+        r9[i * 3 + 1] = 0.5 * (b - cc);
+        r9[i * 3 + 2] = 0.5 * (b + cc) + dd;
+    }
+}
+";
+
+    public const string FusedFilterGradientDirect = FusedMain + @"
+@compute @workgroup_size(256)
+fn wino_f32w_fused_direct(@builtin(local_invocation_index) lidx: u32, @builtin(workgroup_id) wid: vec3<u32>) {
+    let tid = i32(lidx);
+    let grp = i32(wid.x);
+    fused_accumulate(tid, grp);
+    let gx = (pm.C + 31) / 32;
+    let gy = (pm.K + 31) / 32;
+    let rem = grp - (grp / (gx * gy)) * (gx * gy);
+    let by = rem / gx;
+    let c0 = (rem - by * gx) * 32;
+    let k0 = by * 32;
+    let span = min(32, pm.C - c0) * 9;
+    for (var e = 0; e < 8; e = e + 1) {
+        fused_gather(tid, e);
+        workgroupBarrier();
+        if (tid < 128) {
+            fused_transform(tid);
+            let kl = tid >> 5u;
+            let cl = tid & 31;
+            for (var q = 0; q < 9; q = q + 1) { sm[2112 + kl * 288 + cl * 9 + q] = r9[q]; }
+        }
+        workgroupBarrier();
+        for (var i = tid; i < 4 * 288; i = i + 256) {
+            let rowk = i / 288;
+            let r = i - rowk * 288;
+            let k = k0 + e * 4 + rowk;
+            if (k < pm.K && r < span) { res[(k * pm.C + c0) * 9 + r] = sm[2112 + i]; }
+        }
+        workgroupBarrier();
+    }
+}
+";
+
+    public const string FusedFilterGradient = FusedMain + @"
+@compute @workgroup_size(256)
+fn wino_f32w_fused(@builtin(local_invocation_index) lidx: u32, @builtin(workgroup_id) wid: vec3<u32>) {
+    let tid = i32(lidx);
+    let grp = i32(wid.x);
+    fused_accumulate(tid, grp);
+    let gx = (pm.C + 31) / 32;
+    let gy = (pm.K + 31) / 32;
+    let bz = grp / (gx * gy);
+    let rem = grp - bz * (gx * gy);
+    let by = rem / gx;
+    let c0 = (rem - by * gx) * 32;
+    let k0 = by * 32;
+    let plane = pm.K * pm.C;
+    for (var e = 0; e < 8; e = e + 1) {
+        fused_gather(tid, e);
+        workgroupBarrier();
+        let k = k0 + e * 4 + (tid >> 5u);
+        let c = c0 + (tid & 31);
+        if (tid < 128 && k < pm.K && c < pm.C) {
+            fused_transform(tid);
+            let dst = bz * 9 * plane + k * pm.C + c;
+            for (var q = 0; q < 9; q = q + 1) { res[dst + q * plane] = r9[q]; }
+        }
+        workgroupBarrier();
+    }
+}
+";
+
+    public const string FusedFilterGradientFinish = @"
+@group(0) @binding(0) var<storage, read> partials: array<f32>;
+@group(0) @binding(1) var<storage, read_write> dw: array<f32>;
+struct Params { KC: i32, splits: i32, pad0: i32, pad1: i32, }
+@group(0) @binding(2) var<uniform> pm: Params;
+@compute @workgroup_size(256)
+fn wino_f32w_fused_finish(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = i32(gid.x);
+    if (idx >= pm.KC * 9) { return; }
+    let kc = idx / 9;
+    let q = idx - kc * 9;
+    var sum = 0.0;
+    for (var z = 0; z < pm.splits; z = z + 1) { sum = sum + partials[(z * 9 + q) * pm.KC + kc]; }
+    dw[idx] = sum;
+}
+";
+
     /// <summary>The module source for a <see cref="WinogradF23KernelTemplate"/> kernel name.</summary>
     internal static string SourceFor(string name) => name switch
     {
@@ -267,6 +506,9 @@ fn wino_f32w_output(@builtin(global_invocation_id) gid: vec3<u32>) {
         WinogradF23KernelTemplate.Output => Output,
         WinogradF23KernelTemplate.GradOutputTiles => GradOutputTiles,
         WinogradF23KernelTemplate.FilterGradient => FilterGradient,
+        WinogradF23KernelTemplate.FusedFilterGradient => FusedFilterGradient,
+        WinogradF23KernelTemplate.FusedFilterGradientDirect => FusedFilterGradientDirect,
+        WinogradF23KernelTemplate.FusedFilterGradientFinish => FusedFilterGradientFinish,
         _ => throw new System.ArgumentException($"No WGSL Winograd kernel named '{name}'.", nameof(name)),
     };
 }

@@ -8,7 +8,7 @@ using AiDotNet.Tensors.Helpers.Autotune.TunedKernels;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 
-public sealed partial class HipBackend : IWinogradF23Transforms
+public sealed partial class HipBackend : IWinogradF23Transforms, IWinogradFusedFilterGradient
 {
     private IntPtr _winogradModule;
     private TunedKernelSlot<TunedConv2DBackwardArgs>? _conv2DBackwardDataSlot, _conv2DBackwardFilterSlot;
@@ -61,6 +61,9 @@ public sealed partial class HipBackend : IWinogradF23Transforms
                         new DelegateTunedKernelCandidate<TunedConv2DBackwardArgs>("hip.conv2d_dw.winograd_f32", TunedKernelOrigin.Builtin,
                             true, shape => WinogradF23Pipeline.AdmitsShape(shape) && WinogradKernelsReady,
                             (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardFilterWinograd(a)) LaunchDwDirect(a); }),
+                        new DelegateTunedKernelCandidate<TunedConv2DBackwardArgs>("hip.conv2d_dw.winograd_fused", TunedKernelOrigin.Builtin,
+                            true, shape => WinogradF23Pipeline.AdmitsShape(shape) && WinogradKernelsReady,
+                            (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardFilterWinogradFused(a)) LaunchDwDirect(a); }),
                     });
                 return _conv2DBackwardFilterSlot;
             }
@@ -109,6 +112,30 @@ public sealed partial class HipBackend : IWinogradF23Transforms
     private void LaunchDxDirect(in TunedConv2DBackwardArgs a) => LaunchBackwardDirect("conv2d_backward_input", a, false);
 
     private void LaunchDwDirect(in TunedConv2DBackwardArgs a) => LaunchBackwardDirect("conv2d_backward_kernel", a, true);
+
+    // The fused weight gradient: one launch of 256-wide blocks (plus the finish when the tiles split).
+    internal bool TryConv2DBackwardFilterWinogradFused(in TunedConv2DBackwardArgs a, int splits = 0)
+        => WinogradKernelsReady && WinogradF23Pipeline.TryBackwardFilterFused(this, this, a, splits);
+
+    int IWinogradFusedFilterGradient.FusedFilterGradientGroupTarget => ComputeUnits;
+
+    unsafe void IWinogradFusedFilterGradient.FusedFilterGradient(bool direct, IGpuBuffer x, IGpuBuffer res, IGpuBuffer dy,
+        int groups, int[] ints)
+    {
+        IntPtr xPtr = x.Handle, resPtr = res.Handle, dyPtr = dy.Handle;
+        int* fusedInts = stackalloc int[ints.Length];
+        void** fusedArgs = stackalloc void*[3 + ints.Length];
+        fusedArgs[0] = &xPtr; fusedArgs[1] = &resPtr; fusedArgs[2] = &dyPtr;
+        for (int i = 0; i < ints.Length; i++) { fusedInts[i] = ints[i]; fusedArgs[3 + i] = &fusedInts[i]; }
+        LaunchKernel(TunedKernel(direct ? WinogradF23KernelTemplate.FusedFilterGradientDirect
+            : WinogradF23KernelTemplate.FusedFilterGradient), (uint)groups, (uint)WinogradF23KernelTemplate.FusedGroupSize, fusedArgs);
+    }
+
+    unsafe void IWinogradFusedFilterGradient.FusedFilterGradientFinish(IGpuBuffer partials, IGpuBuffer dw, int kc, int splits)
+    {
+        int* finishInts = stackalloc int[] { kc, splits };
+        LaunchWinograd(WinogradF23KernelTemplate.FusedFilterGradientFinish, 9L * kc, partials, dw, finishInts, 2);
+    }
 
     private unsafe void LaunchWinograd(string name, long threads, IGpuBuffer read, IGpuBuffer write, int* ints, int count)
     {

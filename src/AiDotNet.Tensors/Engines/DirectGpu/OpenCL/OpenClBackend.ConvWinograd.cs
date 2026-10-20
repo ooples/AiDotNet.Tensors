@@ -7,7 +7,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     // shared WinogradF23Pipeline: the transforms below (emitted from WinogradF23KernelTemplate) around BatchedGemm.
     // Backward convolution gets a tuned slot here for the first time, with the direct kernels it always ran as the
     // reference, so Winograd is served only on the shape classes where it measures faster.
-    public sealed partial class OpenClBackend : IWinogradF23Transforms
+    public sealed partial class OpenClBackend : IWinogradF23Transforms, IWinogradFusedFilterGradient
     {
         private TunedKernelSlot<TunedConv2DBackwardArgs>? _conv2DBackwardDataSlot, _conv2DBackwardFilterSlot;
 
@@ -49,6 +49,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                             new DelegateTunedKernelCandidate<TunedConv2DBackwardArgs>("opencl.conv2d_dw.winograd_f32", TunedKernelOrigin.Builtin,
                                 true, shape => WinogradF23Pipeline.AdmitsShape(shape) && WinogradKernelsReady,
                                 (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardFilterWinograd(a)) LaunchDwDirect(a); }),
+                            new DelegateTunedKernelCandidate<TunedConv2DBackwardArgs>("opencl.conv2d_dw.winograd_fused", TunedKernelOrigin.Builtin,
+                                true, shape => WinogradF23Pipeline.AdmitsShape(shape) && WinogradKernelsReady,
+                                (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardFilterWinogradFused(a)) LaunchDwDirect(a); }),
                         });
                     return _conv2DBackwardFilterSlot;
                 }
@@ -222,6 +225,29 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         internal bool TryConv2DBackwardFilterWinograd(in TunedConv2DBackwardArgs a)
             => WinogradKernelsReady && WinogradF23Pipeline.TryBackwardFilter(this, this, a);
+
+        // The fused weight gradient: one launch of 256-wide groups (plus the finish when the tiles split).
+        internal bool TryConv2DBackwardFilterWinogradFused(in TunedConv2DBackwardArgs a, int splits = 0)
+            => WinogradKernelsReady && WinogradF23Pipeline.TryBackwardFilterFused(this, this, a, splits);
+
+        int IWinogradFusedFilterGradient.FusedFilterGradientGroupTarget => ComputeUnits;
+
+        void IWinogradFusedFilterGradient.FusedFilterGradient(bool direct, IGpuBuffer x, IGpuBuffer res, IGpuBuffer dy,
+            int groups, int[] ints)
+        {
+            var fused = WinogradKernel(direct ? WinogradF23KernelTemplate.FusedFilterGradientDirect
+                : WinogradF23KernelTemplate.FusedFilterGradient, x, res);
+            fused.SetArg(2, BufferHandle(dy));
+            for (int i = 0; i < ints.Length; i++) fused.SetArg((uint)(3 + i), ints[i]);
+            fused.Execute1D(groups * WinogradF23KernelTemplate.FusedGroupSize, WinogradF23KernelTemplate.FusedGroupSize);
+        }
+
+        void IWinogradFusedFilterGradient.FusedFilterGradientFinish(IGpuBuffer partials, IGpuBuffer dw, int kc, int splits)
+        {
+            var finish = WinogradKernel(WinogradF23KernelTemplate.FusedFilterGradientFinish, partials, dw);
+            finish.SetArg(2, kc); finish.SetArg(3, splits);
+            RunWinograd(finish, 9L * kc);
+        }
 
         private DirectOpenClKernel WinogradKernel(string name, IGpuBuffer read, IGpuBuffer write)
         {

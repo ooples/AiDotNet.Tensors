@@ -360,8 +360,8 @@ extern ""C"" __global__ void wino_f23_output(const float* __restrict__ mm, float
 // epilogue gathers each (k, c)'s 16 components through shared memory and writes G^T M G (3x3): to dW when the tiles are
 // not split (DIRECT: staged through shared memory so the stores are contiguous dW rows), else component-major to
 // out[z][q][k][c] for conv2d_wgrad_winograd_finish.
-// Both entries are CUDA-only: HIP (#1471), OpenCL (#1472), Vulkan (#1473), Metal (#1474) and WebGPU (#1475) still
-// compute this gradient through the unfused WinogradF23Pipeline (correct, but four launches with U/V planes in DRAM).
+// HIP, OpenCL, Vulkan, Metal and WebGPU run the same algorithm from WinogradF23KernelTemplate (FusedFilterGradient*,
+// restated for 16 KB of shared memory) through WinogradF23Pipeline.TryBackwardFilterFused.
 #define WF_TK 32
 #define WF_TC 32
 #define WF_PC 8
