@@ -265,6 +265,82 @@ public class DeclaredProgramRouteTests
                     $"output {o}[{i}]: {runs[0][o][i]} then {runs[1][o][i]}");
     }
 
+    /// <summary>
+    /// Declared stages as ONE cooperative launch (#890 phase 4 on #1430): LayerNorm, then softmax on its output, then
+    /// softmax backward, composed into one resident kernel. Every buffer is bit-identical to the same stages
+    /// launched separately (each virtual block does exactly its stage's work), and the result matches fp64.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(64, 1024)]
+    [InlineData(256, 64)]
+    public void DeclaredStagesRunAsOneResidentLaunchBitIdenticalToSeparateLaunches(int rows, int cols)
+    {
+        using var backend = OpenBackendOrSkip();
+        Skip.IfNot(backend.DeclaredKernelsEnabled && backend.SupportsResidentProgram,
+            "A declared resident program needs the sm_75+ conveyor and a cooperative launch.");
+        var rng = new Random(rows * 7 + cols);
+        float[] R(int n)
+        {
+            var v = new float[n];
+            for (int i = 0; i < n; i++) v[i] = (float)(rng.NextDouble() * 2 - 1);
+            return v;
+        }
+        float[] x = R(rows * cols), gamma = R(cols), beta = R(cols), dy = R(rows * cols);
+        using var barrier = backend.AllocateResidentBarrier();
+        var results = new float[2][][];
+        for (int mode = 0; mode < 2; mode++)
+        {
+            using var bx = backend.AllocateBuffer(x);
+            using var bg = backend.AllocateBuffer(gamma);
+            using var bb = backend.AllocateBuffer(beta);
+            using var bdy = backend.AllocateBuffer(dy);
+            using var y = backend.AllocateBuffer(rows * cols);
+            using var mean = backend.AllocateBuffer(rows);
+            using var rstd = backend.AllocateBuffer(rows);
+            using var soft = backend.AllocateBuffer(rows * cols);
+            using var dx = backend.AllocateBuffer(rows * cols);
+            var stages = new[]
+            {
+                CudaBackend.LayerNormStage(bx, y, bg, bb, mean, rstd, rows, cols, Epsilon),
+                CudaBackend.SoftmaxStage(y, soft, rows, cols),
+                CudaBackend.SoftmaxBackwardStage(bdy, soft, dx, rows, cols),
+            };
+            if (mode == 0) backend.RunDeclaredStagesSeparately(stages);
+            else Assert.True(backend.RunDeclaredResidentProgram(stages, barrier) >= 1);
+            backend.Synchronize();
+            results[mode] = new[]
+            {
+                backend.DownloadBuffer(y), backend.DownloadBuffer(mean), backend.DownloadBuffer(rstd),
+                backend.DownloadBuffer(soft), backend.DownloadBuffer(dx),
+            };
+        }
+        for (int o = 0; o < results[0].Length; o++)
+            for (int i = 0; i < results[0][o].Length; i++)
+                Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(results[0][o][i]) == TestHelpers.MathCompat.SingleToInt32Bits(results[1][o][i]),
+                    $"buffer {o}[{i}]: separate {results[0][o][i]} resident {results[1][o][i]}");
+
+        // fp64 reference of the chain's last output.
+        for (int r = 0; r < rows; r++)
+        {
+            double m = 0, sq = 0;
+            for (int c = 0; c < cols; c++) m += x[r * cols + c];
+            m /= cols;
+            for (int c = 0; c < cols; c++) { double d = x[r * cols + c] - m; sq += d * d; }
+            double s = 1.0 / Math.Sqrt(sq / cols + Epsilon);
+            var yRow = new double[cols];
+            double max = double.NegativeInfinity, sum = 0, dot = 0;
+            for (int c = 0; c < cols; c++) { yRow[c] = (x[r * cols + c] - m) * s * gamma[c] + beta[c]; max = Math.Max(max, yRow[c]); }
+            for (int c = 0; c < cols; c++) sum += Math.Exp(yRow[c] - max);
+            for (int c = 0; c < cols; c++) dot += dy[r * cols + c] * Math.Exp(yRow[c] - max) / sum;
+            for (int c = 0; c < cols; c++)
+            {
+                double p = Math.Exp(yRow[c] - max) / sum, expected = p * (dy[r * cols + c] - dot);
+                Assert.True(Math.Abs(results[1][4][r * cols + c] - expected) <= 1e-5 * Math.Max(1.0, Math.Abs(expected)),
+                    $"dx[{r},{c}] {results[1][4][r * cols + c]} vs {expected}");
+            }
+        }
+    }
+
     private const float Epsilon = 1e-5f;
 
     private static (float[] Y, float[] Mean, float[] Rstd, bool Routed) RunLayerNorm(

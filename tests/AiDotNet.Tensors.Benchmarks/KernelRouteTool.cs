@@ -87,6 +87,7 @@ internal static class KernelRouteTool
             RunCase(backend, route, failures);
         }
         if (only is null || only.Equals("capture", StringComparison.OrdinalIgnoreCase)) CaptureCheck(backend, failures);
+        if (only is null || only.Equals("resident", StringComparison.OrdinalIgnoreCase)) ResidentChains(backend, failures);
 
         if (failures.Count != 0)
             throw new InvalidOperationException("Route failures: " + string.Join("; ", failures));
@@ -431,6 +432,134 @@ internal static class KernelRouteTool
             for (int c = 0; c < cols; c++) y[r * cols + c] = Math.Exp(x[r * cols + c] - max) / sum;
         }
         return y;
+    }
+
+    // ---- resident chains ------------------------------------------------------------------------------------------
+
+    // Declared stages as ONE cooperative launch (#890 phase 4 on #1430): bit-identical to the same stages launched
+    // separately, within the fp32 bound of an fp64 reference, and timed both ways.
+    private static void ResidentChains(CudaBackend backend, List<string> failures)
+    {
+        if (!backend.SupportsResidentProgram)
+        {
+            Console.WriteLine("resident: this device has no cooperative launch");
+            return;
+        }
+        Console.WriteLine();
+        Console.WriteLine("RESIDENT - declared stages as one cooperative launch vs the same stages launched separately");
+        Console.WriteLine("chain                                   grid  bit-identical   error vs fp64     separate us  resident us   ratio");
+        using var barrier = backend.AllocateResidentBarrier();
+        const float Eps = 1e-5f;
+
+        foreach (var (r, c) in new[] { (64, 1024), (16, 256), (256, 64) })
+        {
+            var x = Fill(r * c, 31, 0.0);
+            var g = Fill(c, 32, 1.0);
+            var b = Fill(c, 33, 0.0);
+            var (yRef, _, _) = NormRef(x, g, b, r, c, Eps, rms: false);
+            var softRef = SoftmaxRef(ToFloat(yRef), r, c);
+            RunChain(backend, barrier, failures, "LayerNorm -> Softmax " + r + "x" + c,
+                new[] { x, g, b }, new[] { r * c, r, r, r * c },
+                a => new[]
+                {
+                    CudaBackend.LayerNormStage(a[0], a[3], a[1], a[2], a[4], a[5], r, c, Eps),
+                    CudaBackend.SoftmaxStage(a[3], a[6], r, c),
+                },
+                (6, softRef), MaxAbs(x) * 4, c);
+        }
+
+        foreach (var (r, c) in new[] { (8192, 64), (512, 256) })
+        {
+            var x = Fill(r * c, 34, 0.0);
+            var g = Fill(c, 35, 1.0);
+            var b = Fill(c, 36, 0.0);
+            var dy = Fill(r * c, 37, 0.0);
+            var (_, meanD, rstdD) = NormRef(x, g, b, r, c, Eps, rms: false);
+            var (dxRef, _, _) = RowNormBackwardRef(dy, x, g, ToFloat(meanD), ToFloat(rstdD), r, c, rms: false);
+            RunChain(backend, barrier, failures, "LayerNorm -> LayerNormBackward " + r + "x" + c,
+                new[] { x, g, b, dy }, new[] { r * c, r, r, r * c, c, c },
+                a => new[]
+                {
+                    CudaBackend.LayerNormStage(a[0], a[4], a[1], a[2], a[5], a[6], r, c, Eps),
+                    CudaBackend.LayerNormBackwardStage(a[3], a[0], a[1], a[5], a[6], a[7], a[8], a[9], r, c),
+                },
+                (7, dxRef), MaxAbs(x) * Max(rstdD) * Math.Max(1, MaxAbs(g)) * Math.Sqrt(r), Math.Max(r, c));
+        }
+
+        {
+            const int r = 128, c = 512;
+            var x = Fill(r * c, 38, 0.0);
+            var g = Fill(c, 39, 1.0);
+            var dy = Fill(r * c, 40, 0.0);
+            var (yRef, _, _) = NormRef(x, g, null, r, c, Eps, rms: true);
+            var sRef = SoftmaxRef(ToFloat(yRef), r, c);
+            var dxRef = new double[r * c];
+            for (int row = 0; row < r; row++)
+            {
+                double dot = 0;
+                for (int j = 0; j < c; j++) dot += dy[row * c + j] * sRef[row * c + j];
+                for (int j = 0; j < c; j++) dxRef[row * c + j] = sRef[row * c + j] * (dy[row * c + j] - dot);
+            }
+            RunChain(backend, barrier, failures, "RmsNorm -> Softmax -> SoftmaxBackward " + r + "x" + c,
+                new[] { x, g, dy }, new[] { r * c, r, r * c, r * c },
+                a => new[]
+                {
+                    CudaBackend.RmsNormStage(a[0], a[3], a[1], a[4], r, c, Eps),
+                    CudaBackend.SoftmaxStage(a[3], a[5], r, c),
+                    CudaBackend.SoftmaxBackwardStage(a[2], a[5], a[6], r, c),
+                },
+                (6, dxRef), MaxAbs(x) * 4, c);
+        }
+    }
+
+    private static void RunChain(CudaBackend backend, IGpuBuffer barrier, List<string> failures, string name,
+        float[][] inputs, int[] outputSizes, Func<IGpuBuffer[], DeclaredResidentStage[]> stagesOf,
+        (int Buffer, double[] Reference) check, double scale, int reduction)
+    {
+        var results = new float[2][][];
+        var times = new double[2];
+        int grid = 0;
+        for (int mode = 0; mode < 2; mode++)   // 0: separate, 1: resident
+        {
+            var buffers = new IGpuBuffer[inputs.Length + outputSizes.Length];
+            try
+            {
+                for (int i = 0; i < inputs.Length; i++) buffers[i] = backend.AllocateBuffer(inputs[i]);
+                for (int o = 0; o < outputSizes.Length; o++) buffers[inputs.Length + o] = backend.AllocateBuffer(new float[outputSizes[o]]);
+                var stages = stagesOf(buffers);
+                void Separate() => backend.RunDeclaredStagesSeparately(stages);
+                void Resident() => grid = backend.RunDeclaredResidentProgram(stages, barrier);
+                Action call = mode == 0 ? Separate : Resident;
+                call();
+                backend.Synchronize();
+                results[mode] = new float[buffers.Length][];
+                for (int i = 0; i < buffers.Length; i++) results[mode][i] = backend.DownloadBuffer(buffers[i]);
+                times[mode] = Time(call, backend.Synchronize);
+            }
+            catch (NotSupportedException ex)
+            {
+                failures.Add(name + ": " + ex.Message);
+                Console.WriteLine(name.PadRight(40) + "  not composed: " + ex.Message);
+                return;
+            }
+            finally
+            {
+                foreach (var buffer in buffers) buffer?.Dispose();
+            }
+        }
+        bool identical = true;
+        for (int i = 0; i < results[0].Length && identical; i++)
+            for (int j = 0; j < results[0][i].Length; j++)
+                if (BitConverter.SingleToInt32Bits(results[0][i][j]) != BitConverter.SingleToInt32Bits(results[1][i][j])) { identical = false; break; }
+        double error = MaxDev(results[1][check.Buffer], check.Reference);
+        double bound = Unit * (16 + Math.Log(Math.Max(2, reduction), 2)) * Math.Max(1.0, scale);
+        bool ok = identical && error <= bound;
+        if (!ok) failures.Add(name + (identical ? ": error " + E(error) + " over " + E(bound) : ": not bit-identical"));
+        Console.WriteLine(name.PadRight(40) + grid.ToString(CultureInfo.InvariantCulture).PadLeft(5) +
+            (identical ? "yes" : "NO").PadLeft(15) + E(error).PadLeft(16) +
+            times[0].ToString("F1", CultureInfo.InvariantCulture).PadLeft(16) +
+            times[1].ToString("F1", CultureInfo.InvariantCulture).PadLeft(13) +
+            (times[0] / times[1]).ToString("F2", CultureInfo.InvariantCulture).PadLeft(8) + "x" + (ok ? "" : "  FAIL"));
     }
 
     // ---- capture ------------------------------------------------------------------------------------------------
