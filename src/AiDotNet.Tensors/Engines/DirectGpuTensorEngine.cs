@@ -7068,7 +7068,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // upload+compute+download path below when not on the resident step or not last-axis.
         if (TrySoftmaxResidentInto(destination, input, axis)) return;
         // Try GPU softmax: upload input, compute on GPU, download to destination
-        if (TryGetBackend(out var gpuBackend))
+        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
         {
             try
             {
@@ -7107,7 +7107,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.LogSoftmaxInto<T>(Tensor<T> destination, Tensor<T> input, int axis)
     {
-        if (TryGetBackend(out var gpuBackend))
+        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
         {
             try
             {
@@ -7132,7 +7132,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     return;
                 }
             }
-            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TrySoftmaxResidentInto", capabilityGap);
+            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("LogSoftmaxInto", capabilityGap);
                 // Fall through to CPU
             }
         }
@@ -7143,7 +7143,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (TryUnaryResidentInto(dest, input, static (be, i, o, n) => be.Swish(i, o, n), "Swish")) return;
         // GPU: use Sigmoid + Multiply kernels
-        if (TryGetBackend(out var gpuBackend))
+        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
         {
             try
             {
@@ -7170,7 +7170,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
                 return;
             }
-            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TrySoftmaxResidentInto", capabilityGap);
+            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("SwishInto", capabilityGap);
                 // Fall through to CPU
             }
         }
@@ -7180,7 +7180,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     void IEngine.GELUInto<T>(Tensor<T> dest, Tensor<T> input)
     {
         if (TryUnaryResidentInto(dest, input, static (be, i, o, n) => be.Gelu(i, o, n), "GELU")) return;
-        if (TryGetBackend(out var gpuBackend))
+        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
         {
             try
             {
@@ -7204,7 +7204,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
                 return;
             }
-            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TrySoftmaxResidentInto", capabilityGap);
+            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("GELUInto", capabilityGap);
                 // Fall through to CPU
             }
         }
@@ -7214,7 +7214,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     void IEngine.TanhInto<T>(Tensor<T> dest, Tensor<T> input)
     {
         if (TryUnaryResidentInto(dest, input, static (be, i, o, n) => be.Tanh(i, o, n), "Tanh")) return;
-        if (TryGetBackend(out var gpuBackend))
+        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
         {
             try
             {
@@ -7238,7 +7238,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
                 return;
             }
-            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TrySoftmaxResidentInto", capabilityGap);
+            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TanhInto", capabilityGap);
                 // Fall through to CPU
             }
         }
@@ -7248,7 +7248,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     void IEngine.MishInto<T>(Tensor<T> dest, Tensor<T> input)
     {
         if (TryUnaryResidentInto(dest, input, static (be, i, o, n) => be.Mish(i, o, n), "Mish")) return;
-        if (TryGetBackend(out var gpuBackend))
+        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
         {
             try
             {
@@ -7262,7 +7262,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 DownloadIntoTensor(gpuBackend, gpuOut, floatDest);
                 return;
             }
-            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TrySoftmaxResidentInto", capabilityGap);
+            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MishInto", capabilityGap);
                 // Fall through to CPU
             }
         }
@@ -7274,7 +7274,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         float alphaF = alpha is float f ? f : Convert.ToSingle(alpha);
         if (TryUnaryResidentInto(dest, input,
                 (be, i, o, n) => be.LeakyRelu(i, o, alphaF, n), "LeakyReLU")) return;
-        if (TryGetBackend(out var gpuBackend))
+        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
         {
             try
             {
@@ -7288,7 +7288,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 DownloadIntoTensor(gpuBackend, gpuOut, floatDest);
                 return;
             }
-            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TrySoftmaxResidentInto", capabilityGap);
+            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("LeakyReLUInto", capabilityGap);
                 // Fall through to CPU
             }
         }
@@ -7326,7 +7326,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 DownloadIntoTensor(gpuBackend, gpuOut, dstF);
                 return;
             }
-            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TrySoftmaxResidentInto", capabilityGap);
+            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("ConcatInto", capabilityGap);
                 // Fall through to CPU — axis-aware concat is complex
             }
         }
@@ -7351,7 +7351,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 DownloadIntoTensor(gpuBackend, gpuOut, floatDest);
                 return;
             }
-            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TrySoftmaxResidentInto", capabilityGap);
+            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TransposeInto", capabilityGap);
                 // Fall through to CPU for higher-rank transposes
             }
         }
@@ -7363,7 +7363,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // #1650/#638: resident GPU path for the capture step (no host round-trip). Falls through to the
         // legacy upload/compute/download GPU path (then CPU) when not in a resident step.
         if (TryGroupNormSwishResidentInto(output, input, numGroups, gamma, beta, epsilon)) return;
-        if (TryGetBackend(out var gpuBackend))
+        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
         {
             try
             {
@@ -7401,7 +7401,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 DownloadIntoTensor(gpuBackend, gpuOut, floatOutput);
                 return;
             }
-            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TrySoftmaxResidentInto", capabilityGap);
+            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("GroupNormSwishInto", capabilityGap);
                 // Fall through to CPU
             }
         }
@@ -7410,7 +7410,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.AddGroupNormInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon)
     {
-        if (TryGetBackend(out var gpuBackend) && ShapesMatch(a.Shape._dims, b.Shape._dims))
+        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend) && ShapesMatch(a.Shape._dims, b.Shape._dims))
         {
             try
             {
@@ -7449,7 +7449,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 DownloadIntoTensor(gpuBackend, gpuOut, floatOutput);
                 return;
             }
-            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TrySoftmaxResidentInto", capabilityGap);
+            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("AddGroupNormInto", capabilityGap);
                 // Fall through to CPU
             }
         }
