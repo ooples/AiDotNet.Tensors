@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 // Fusing a row-wise program -- softmax, LayerNorm, RMSNorm, GroupNorm -- into ONE kernel.
 //
 // As separate passes each statistic re-reads the whole input: LayerNorm at 8192x1024 is three
@@ -77,6 +77,35 @@ public sealed class CodegenRowBinding
     public IReadOnlyList<long> ColumnStrides { get; }
 }
 
+/// <summary>
+/// The thread layout of one row kernel: Threads per row, each access Vector wide, one STEP
+/// (Threads x Vector columns) at a time, Chunks steps per row. HELD rows keep every step in
+/// registers; streamed rows sweep. A RAGGED layout's last step overhangs the row, and its
+/// out-of-row lanes are predicated off.
+/// </summary>
+public readonly struct CodegenRowGeometry
+{
+    public CodegenRowGeometry(int threads, int vector, int step, int chunks, bool held, bool ragged)
+    {
+        Threads = threads;
+        Vector = vector;
+        Step = step;
+        Chunks = chunks;
+        Held = held;
+        Ragged = ragged;
+    }
+
+    public int Threads { get; }
+    public int Vector { get; }
+    public int Step { get; }
+    public int Chunks { get; }
+    public bool Held { get; }
+    public bool Ragged { get; }
+
+    /// <summary>Elements each thread holds (0 when streamed).</summary>
+    public int PerThread => Held ? Chunks * Vector : 0;
+}
+
 /// <summary>A program accepted for single-kernel row fusion.</summary>
 public sealed class CodegenRowFusionPlan
 {
@@ -133,7 +162,7 @@ public sealed class CodegenRowFusionPlan
     public IReadOnlyDictionary<string, CodegenRowOperandKind> Kinds { get; }
 
     /// <summary>Elements each thread holds, at the scalar geometry (0 when streamed).</summary>
-    public int PerLane => Geometry(1) is { } g ? g.PerThread : 0;
+    public int PerLane => Layout(1)?.PerThread ?? 0;
 
     /// <summary>
     /// Passes over the ROW axes only -- per-row arithmetic on statistics, such as BatchNorm's
@@ -198,8 +227,66 @@ public sealed class CodegenRowFusionPlan
         return best;
     }
 
+    /// <summary>
+    /// The RAGGED geometry, for a row no step divides -- LayerNorm over 100 or 1000 features,
+    /// softmax over a 50257-word vocabulary. It needs ONE column axis (so a step is a contiguous
+    /// run and only the last one overhangs), a vector that divides the width (so a vector is
+    /// wholly inside the row or wholly outside it), and vector-aligned rows in every streamed
+    /// binding. Held when some power-of-two thread count holds the row at most
+    /// <see cref="CodegenRowFusion.MaxPerThread"/> elements per thread; streamed by a full block
+    /// otherwise. Null when the row has several column axes.
+    /// </summary>
+    public CodegenRowGeometry? RaggedGeometry(int maxVector)
+    {
+        if (ColumnExtents.Count != 1) return null;
+        for (int vector = maxVector; vector >= 1; vector /= 2)
+        {
+            if (vector != 1 && vector != 2 && vector != 4) continue;
+            if (Width % vector != 0 || !VectorAligned(vector)) continue;
+            for (int threads = CodegenWarpReduction.Lanes; threads <= CodegenRowFusion.MaxRowThreads; threads *= 2)
+            {
+                int step = threads * vector;
+                int chunks = (Width + step - 1) / step;
+                if ((long)chunks * vector <= CodegenRowFusion.MaxPerThread)
+                    return new CodegenRowGeometry(threads, vector, step, chunks, held: true, ragged: true);
+            }
+            int blockStep = CodegenRowFusion.RaggedStreamThreads * vector;
+            return new CodegenRowGeometry(CodegenRowFusion.RaggedStreamThreads, vector, blockStep,
+                (Width + blockStep - 1) / blockStep, held: false, ragged: true);
+        }
+        return null;
+    }
+
+    // Every streamed binding's row starts (and fixed offset) on a vector boundary.
+    private bool VectorAligned(int vector)
+    {
+        foreach (var binding in Bindings.Values)
+        {
+            if (binding.Kind != CodegenRowOperandKind.Matrix) continue;
+            if (binding.ConstantOffset % vector != 0) return false;
+            foreach (long stride in binding.RowStrides)
+                if (stride % vector != 0) return false;
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// The layout the emitter uses: a row held exactly, else held raggedly, else streamed
+    /// exactly, else streamed raggedly. Null when none fits.
+    /// </summary>
+    public CodegenRowGeometry? Layout(int maxVector)
+    {
+        if (Geometry(maxVector) is { } h)
+            return new CodegenRowGeometry(h.Threads, h.Vector, h.Step, h.PerThread / h.Vector, held: true, ragged: false);
+        var ragged = RaggedGeometry(maxVector);
+        if (ragged is { Held: true } r) return r;
+        if (StreamGeometry(maxVector) is { } s)
+            return new CodegenRowGeometry(s.Threads, s.Vector, s.Step, s.Chunks, held: false, ragged: false);
+        return ragged;
+    }
+
     /// <summary>True when the row is held in registers; false when it is streamed in sweeps.</summary>
-    public bool Holds(int maxVector) => Geometry(maxVector) is not null;
+    public bool Holds(int maxVector) => Layout(maxVector) is { Held: true };
 }
 
 /// <summary>Decides whether a program can run as one row-per-warp-or-block kernel.</summary>
@@ -210,6 +297,12 @@ public static class CodegenRowFusion
 
     /// <summary>Most threads cooperating on one row: one full block.</summary>
     public const int MaxRowThreads = 1024;
+
+    /// <summary>
+    /// Threads of a ragged streamed row. A 1024-thread block caps ptxas at 64 registers, and an
+    /// unrolled sweep of 4-wide loads spilled 72 bytes a thread at that cap (LayerNorm 64x50000).
+    /// </summary>
+    public const int RaggedStreamThreads = 256;
 
     /// <summary>
     /// Widest row HELD in registers: every thread of a full block holding its maximum. Wider
@@ -349,9 +442,9 @@ public static class CodegenRowFusion
         {
             RowPasses = rowPasses,
         };
-        if (plan.Geometry(1) is null && plan.StreamGeometry(1) is null)
+        if (plan.Layout(1) is null)
         {
-            reason = "no thread geometry divides the innermost column run of a " + plan.Width + "-wide row";
+            reason = "no thread geometry fits a " + plan.Width + "-wide row over several column axes";
             return null;
         }
         return plan;

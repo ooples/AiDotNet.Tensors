@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 // Row fusion (#890 phase 4a): a row-shaped program runs as ONE warp-per-row kernel that reads
 // its sources once. These pin which programs are accepted, and the property fusion exists
 // for -- every source element is loaded once, however many passes read it.
@@ -42,13 +42,78 @@ public class CodegenRowFusionTests
     [Fact]
     public void ProgramsTheRowKernelCannotFitAreRefused()
     {
-        // A width no warp divides, held or streamed.
-        Assert.Null(CodegenRowFusion.TryPlan(CodegenFusedStatistics.LayerNorm(16, 56), out _));
+        // A row over two column axes that no step divides: (cg, s) = (2, 7). A ragged step
+        // would straddle a channel boundary, so only the single-axis case is ragged.
+        Assert.Null(CodegenRowFusion.TryPlan(CodegenFusedStatistics.GroupNorm(2, 8, 4, 7), out _));
         // The multi-pass softmax over different extents per pass is not one row shape.
         var mixed = new CodegenProgram(
             new[] { CodegenFusedStatistics.Softmax(16, 128).Passes[0], CodegenFusedStatistics.Softmax(16, 256).Passes[2] },
             new long[] { 16, 16 * 256 }, "mixed");
         Assert.Null(CodegenRowFusion.TryPlan(mixed, out _));
+    }
+
+    /// <summary>
+    /// A width no step divides (LayerNorm over 100 features) is HELD raggedly: one 32-lane
+    /// step of four, the last 28 lanes predicated off. Each source is still loaded once, each
+    /// reduction term past the row is replaced by the identity, and y is stored only in-row.
+    /// </summary>
+    [Fact]
+    public void ARaggedRowIsHeldWithAGuardedLastStep()
+    {
+        var plan = Plan(CodegenFusedStatistics.LayerNorm(16, 100));
+        var layout = plan.Layout(4) ?? throw new InvalidOperationException("no layout");
+        Assert.True(layout.Held);
+        Assert.True(layout.Ragged);
+        Assert.Equal(32, layout.Threads);
+        Assert.Equal(4, layout.Vector);
+        Assert.Equal(1, layout.Chunks);
+
+        var emitter = new PtxAffineEmitter();
+        string ptx = emitter.EmitRowProgram(plan, "rowfused_ragged", 7, 5);
+        Assert.Contains("ragged", ptx, StringComparison.Ordinal);
+        Assert.Contains(".maxntid 256, 1, 1", ptx, StringComparison.Ordinal);
+        Assert.Contains("setp.lt.u32", ptx, StringComparison.Ordinal);
+        // x, gamma and beta: one predicated 128-bit load each.
+        Assert.Equal(3, emitter.EmittedLoads);
+        Assert.Equal(3, CountPredicated(ptx, "ld.global.nc.v4.f32"));
+        // Two statistics of four terms each, every term guarded.
+        Assert.Equal(8, CountOccurrences(ptx, "selp.f32"));
+        // y: one predicated 128-bit store.
+        Assert.Equal(1, CountPredicated(ptx, "st.global.v4.f32"));
+    }
+
+    /// <summary>
+    /// A ragged step is a whole vector inside the row or a whole vector outside it, so the
+    /// access narrows to the widest vector that divides the width: 102 is 2-wide, 50001 scalar.
+    /// </summary>
+    [Fact]
+    public void ARaggedRowUsesAVectorThatDividesTheWidth()
+    {
+        Assert.Equal(2, (Plan(CodegenFusedStatistics.LayerNorm(16, 102)).Layout(4) ?? throw new InvalidOperationException()).Vector);
+        Assert.Equal(1, (Plan(CodegenFusedStatistics.LayerNorm(16, 50001)).Layout(4) ?? throw new InvalidOperationException()).Vector);
+    }
+
+    /// <summary>
+    /// A ragged row too wide to hold streams in 256-thread blocks with every step guarded,
+    /// and -- one column axis -- without the per-step div/rem that, beside predicated loads,
+    /// made ptxas spill 2.7 KB a thread at 16x50001.
+    /// </summary>
+    [Fact]
+    public void AWideRaggedRowStreamsWithoutPerStepDivision()
+    {
+        var plan = Plan(CodegenFusedStatistics.LayerNorm(16, 50001));
+        var layout = plan.Layout(4) ?? throw new InvalidOperationException("no layout");
+        Assert.False(layout.Held);
+        Assert.True(layout.Ragged);
+        Assert.Equal(CodegenRowFusion.RaggedStreamThreads, layout.Threads);
+        Assert.Equal((50001 + 255) / 256, layout.Chunks);
+
+        string ptx = new PtxAffineEmitter().EmitRowProgram(plan, "rowfused_ragged_wide", 7, 5);
+        Assert.Contains("SWEEP0:", ptx, StringComparison.Ordinal);
+        Assert.Contains(".maxntid 256, 1, 1", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("div.u32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("rem.u32", ptx, StringComparison.Ordinal);
+        Assert.Contains("selp.f32", ptx, StringComparison.Ordinal);
     }
 
     /// <summary>A row wider than the registers hold is STREAMED rather than refused.</summary>
@@ -218,6 +283,10 @@ public class CodegenRowFusionTests
         var off = new PtxAffineEmitter { EnableStreamingRows = false };
         Assert.DoesNotContain("ld.global.nc.v4.f32", off.Emit(Flat(8192, "other"), 8, 6), StringComparison.Ordinal);
     }
+
+    // Occurrences of `token` behind a guard predicate ("@%pN token").
+    private static int CountPredicated(string text, string token) =>
+        System.Text.RegularExpressions.Regex.Matches(text, @"@%p\d+ " + System.Text.RegularExpressions.Regex.Escape(token)).Count;
 
     private static int CountOccurrences(string text, string token)
     {

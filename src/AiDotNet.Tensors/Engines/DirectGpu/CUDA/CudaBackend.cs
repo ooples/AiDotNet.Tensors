@@ -8913,6 +8913,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     public unsafe void LayerNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, int batchSize, int normalizedSize, float epsilon)
     {
+        // The declared program first (#890 phase 4a); the hand-written kernels below serve any shape it declines.
+        if (TryDeclaredLayerNorm(input, output, gamma, beta, saveMean, saveInvVar, batchSize, normalizedSize, epsilon))
+            return;
         if (normalizedSize == PtxRowNormalizationD64Kernel.Dimension &&
             TryDirectPtxLayerNormD64(
                 input, output, gamma, beta, saveMean, saveInvVar, batchSize, epsilon))

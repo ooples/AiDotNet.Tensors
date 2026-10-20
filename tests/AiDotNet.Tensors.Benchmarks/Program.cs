@@ -555,6 +555,12 @@ class Program
             return;
         }
 
+        if (args.Length > 0 && args[0] == "--kernel-routes")
+        {
+            KernelRouteTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--kernel-incumbent")
         {
             KernelConveyorTool.Run("incumbent", args.Skip(1).ToArray());
