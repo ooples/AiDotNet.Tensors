@@ -27,6 +27,41 @@ def time_region(fn):
     return (time.perf_counter() - t) * 1e6 / CHAINS
 
 
+# --device dml: the same chain on torch-directml (AMD/Intel GPUs on Windows), the PyTorch build for the devices the
+# OpenCL, Vulkan and WebGPU backends run on (#1448-#1452). DirectML has no synchronize, so a region ends by reading one
+# element back (a few microseconds over 50 chains, charged to PyTorch). There is no graph replay on DirectML.
+def time_region_dml(fn):
+    fn().view(-1)[0].item()
+    t = time.perf_counter()
+    out = None
+    for _ in range(CHAINS):
+        out = fn()
+    out.view(-1)[0].item()
+    return (time.perf_counter() - t) * 1e6 / CHAINS
+
+
+def main_dml():
+    import torch_directml
+    dev = torch_directml.device()
+    torch.manual_seed(890)
+    print(f"torch {torch.__version__} on DirectML: {torch_directml.device_name(0)}")
+    print("shape        run    eager us   P95/med eager")
+    for rows, cols in SHAPES:
+        x = (torch.rand(rows, cols) * 2 - 1).to(dev)
+        scale = (torch.rand(cols) * 2 - 1).to(dev)
+        bias = (torch.rand(cols) * 2 - 1).to(dev)
+        residual = (torch.rand(rows, cols) * 2 - 1).to(dev)
+        eager = lambda: chain(x, scale, bias, residual)
+        for _ in range(WARMUP):
+            eager()
+        for run in range(1, RUNS + 1):
+            e = sorted(time_region_dml(eager) for _ in range(SAMPLES))
+            med = e[len(e) // 2]
+            p95 = e[min(len(e) - 1, int(0.95 * len(e) + 0.999) - 1)]
+            print(f"{rows}x{cols:<8} {run:3d}  {med:9.2f}   {p95 / med:12.2f}")
+    return 0
+
+
 def main():
     if not torch.cuda.is_available():
         print("needs a CUDA build of torch", file=sys.stderr)
@@ -73,4 +108,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main_dml() if sys.argv[1:3] == ["--device", "dml"] else main())

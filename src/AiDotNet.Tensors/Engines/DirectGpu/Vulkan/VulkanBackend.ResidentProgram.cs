@@ -61,7 +61,8 @@ public sealed unsafe partial class VulkanBackend
                 // The open command buffer is submitted first, so the chain has one to itself; every stage is then
                 // recorded into the next one (a compute memory barrier before each dispatch), submitted once,
                 // without waiting, like any other unwaited dispatch. The compute lock keeps other threads' dispatches
-                // out of it, and the chain is shorter than the coalescing limit.
+                // out of it. A chain (at most 8 stages) fits the default coalescing limit of 16; a test that lowers
+                // VulkanDevice.CoalescedDispatchLimit below the chain's length splits it into more submissions.
                 _device.SubmitOpenCommands();
                 foreach (var stage in stages) DispatchResidentStage(stage);
                 _device.SubmitOpenCommands();
@@ -81,8 +82,12 @@ public sealed unsafe partial class VulkanBackend
         return stages.Length;
     }
 
-    /// <summary>The same stages, each its own submission (what a resident program is measured against).</summary>
-    internal void RunStagesSeparately(ReadOnlySpan<ResidentStage> stages)
+    /// <summary>
+    /// The same stages, each its own submission (what a resident program is measured against). With
+    /// <paramref name="submitEachStage"/> false the stages go through the ordinary dispatch path, which coalesces
+    /// unwaited dispatches into the open command buffer (the benchmark's third column).
+    /// </summary>
+    internal void RunStagesSeparately(ReadOnlySpan<ResidentStage> stages, bool submitEachStage = true)
     {
         ResidentProgramKernelTemplate.RequireChain(stages);
         RequireResidentProgram();
@@ -90,7 +95,7 @@ public sealed unsafe partial class VulkanBackend
         {
             DispatchResidentStage(stage);
             // An unwaited dispatch would otherwise wait in the open command buffer for the next ones.
-            _device.SubmitOpenCommands();
+            if (submitEachStage) _device.SubmitOpenCommands();
         }
     }
 

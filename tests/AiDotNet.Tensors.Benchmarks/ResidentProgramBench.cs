@@ -10,6 +10,10 @@
 // and take the median of the per-sample ratios (median(A)/median(B) let clock drift into the ratio); three runs, P95
 // reported beside the median.
 //
+// OpenCL and Vulkan also time the stages through the backend's ordinary submission ("default"), where the flush policy
+// or the coalesced command buffer may already batch them: the gain over that, not over one submission per stage, is
+// what a caller sees.
+//
 // Usage: --resident-program [cuda|hip|opencl|vulkan|metal|webgpu] (default cuda). WebGPU runs on Dawn and needs
 // AIDOTNET_WEBGPU_NODE_DIR (a directory whose node_modules holds "webgpu").
 
@@ -54,6 +58,10 @@ internal static class ResidentProgramBench
         public Func<ResidentStage[], IDisposable?> PerShape { get; }
         public Action<ResidentStage[]> Resident { get; set; }
         public Action<ResidentStage[]> Separate { get; }
+
+        /// <summary>The stages through the backend's ordinary submission (OpenCL's flush policy, Vulkan's coalesced
+        /// command buffer), where that differs from one submission per stage; null elsewhere.</summary>
+        public Action<ResidentStage[]>? Default { get; init; }
         public void Dispose() => _release();
     }
 
@@ -69,7 +77,7 @@ internal static class ResidentProgramBench
 
         Console.WriteLine($"resident program vs the same stages run separately on {target.Description} (per chain, end to end)");
         Console.WriteLine("chain: affine+ReLU -> row softmax -> residual add, fp32");
-        Console.WriteLine("shape        run  resident us   separate us   ratio (median of paired)   P95/med resident");
+        Console.WriteLine("shape        run  resident us   separate us   ratio (median of paired)   P95/med resident   default us   default/resident");
         var backend = target.Backend;
         foreach (var (rows, cols) in new[] { (64, 256), (128, 512), (256, 1024), (1024, 1024) })
         {
@@ -98,6 +106,8 @@ internal static class ResidentProgramBench
                 var resident = new List<double>();
                 var separate = new List<double>();
                 var ratios = new List<double>();
+                var defaults = new List<double>();
+                var defaultRatios = new List<double>();
                 for (int s = 0; s < Samples; s++)
                 {
                     // Alternate which side goes first so neither always follows the other.
@@ -105,11 +115,18 @@ internal static class ResidentProgramBench
                     if ((s & 1) == 0) { r = Time(backend, target.Resident, stages); p = Time(backend, target.Separate, stages); }
                     else { p = Time(backend, target.Separate, stages); r = Time(backend, target.Resident, stages); }
                     resident.Add(r); separate.Add(p); ratios.Add(p / r);
+                    if (target.Default is { } ordinary)
+                    {
+                        double d = Time(backend, ordinary, stages);
+                        defaults.Add(d); defaultRatios.Add(d / r);
+                    }
                 }
                 Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
-                    "{0,-12} {1,3}  {2,11:F2}   {3,11:F2}   {4,24:F3}x   {5,16:F2}",
+                    "{0,-12} {1,3}  {2,11:F2}   {3,11:F2}   {4,24:F3}x   {5,16:F2}   {6,10}   {7,16}",
                     $"{rows}x{cols}", run, Median(resident), Median(separate), Median(ratios),
-                    Percentile(resident, 0.95) / Median(resident)));
+                    Percentile(resident, 0.95) / Median(resident),
+                    defaults.Count > 0 ? Median(defaults).ToString("F2", CultureInfo.InvariantCulture) : "-",
+                    defaultRatios.Count > 0 ? Median(defaultRatios).ToString("F3", CultureInfo.InvariantCulture) + "x" : "-"));
             }
         }
         return 0;
@@ -139,7 +156,8 @@ internal static class ResidentProgramBench
                 var b = new OpenClBackend();
                 if (!b.IsAvailable || !b.SupportsResidentProgram) { b.Dispose(); unavailable = "needs OpenCL."; return null; }
                 return new Target("OpenCL (one flush vs one per stage)", b, _ => null,
-                    st => b.RunResidentProgram(st), st => b.RunStagesSeparately(st), b.Dispose);
+                    st => b.RunResidentProgram(st), st => b.RunStagesSeparately(st), b.Dispose)
+                { Default = st => b.RunStagesSeparately(st, flushEachStage: false) };
             }
             case "vulkan":
             {
@@ -151,7 +169,8 @@ internal static class ResidentProgramBench
                 }
                 // The backend is a process-wide singleton: not disposed here.
                 return new Target("Vulkan (one submission vs one per stage)", b, _ => null,
-                    st => b.RunResidentProgram(st), st => b.RunStagesSeparately(st), () => { });
+                    st => b.RunResidentProgram(st), st => b.RunStagesSeparately(st), () => { })
+                { Default = st => b.RunStagesSeparately(st, submitEachStage: false) };
             }
             case "metal":
             {

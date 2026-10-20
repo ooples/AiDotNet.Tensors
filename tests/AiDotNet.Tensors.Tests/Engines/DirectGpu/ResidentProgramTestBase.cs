@@ -72,11 +72,14 @@ public abstract class ResidentProgramTestBase<TBackend> where TBackend : class, 
 
         public float[] Download() { _b.Synchronize(); return _b.DownloadBuffer(DOut); }
 
-        /// <summary>NaN in every intermediate and the output.</summary>
+        private float[]? _nan;
+
+        /// <summary>NaN in every intermediate and the output, uploaded from the host so the poison does not depend on
+        /// a backend's fill kernel (WebGPU's dispatches at most 65535 workgroups, too few for the largest case).</summary>
         public void Poison()
         {
-            int n = Rows * Cols;
-            _b.Fill(DHidden, float.NaN, n); _b.Fill(DProbs, float.NaN, n); _b.Fill(DOut, float.NaN, n);
+            var nan = _nan ??= Enumerable.Repeat(float.NaN, Rows * Cols).ToArray();
+            _b.UploadBufferInPlace(nan, DHidden); _b.UploadBufferInPlace(nan, DProbs); _b.UploadBufferInPlace(nan, DOut);
         }
 
         public void Dispose()
@@ -105,6 +108,7 @@ public abstract class ResidentProgramTestBase<TBackend> where TBackend : class, 
     [InlineData(1, 4096)]     // one long row: a single group reduces it
     [InlineData(5000, 32)]    // more rows than a cooperative grid holds: groups stride over the rows
     [InlineData(70000, 2)]    // more softmax rows than one launch's group cap: groups stride over the rows
+    [InlineData(4097, 4096)]  // more elements than 65535 groups of 256 cover: the elementwise stages grid-stride too
     public void MatchesAReference_AndTheSameStagesRunSeparately(int rows, int cols)
     {
         var backend = RequireBackend();

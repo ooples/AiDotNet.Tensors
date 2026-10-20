@@ -62,6 +62,7 @@ public sealed class HipResidentProgramTests : ResidentProgramTestBase<HipBackend
     [InlineData(64, 256)]
     [InlineData(300, 77)]
     [InlineData(70000, 2)]
+    [InlineData(4097, 4096)]
     public void StagesRunSeparately_MatchAReference(int rows, int cols)
     {
         var backend = _fixture.Backend;

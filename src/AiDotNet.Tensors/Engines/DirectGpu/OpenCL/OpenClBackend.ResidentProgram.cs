@@ -38,16 +38,19 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             return stages.Length;
         }
 
-        /// <summary>The same stages, each enqueued and flushed on its own (what a resident program is measured
-        /// against).</summary>
-        internal void RunStagesSeparately(ReadOnlySpan<ResidentStage> stages)
+        /// <summary>
+        /// The same stages, each enqueued and flushed on its own (what a resident program is measured against). With
+        /// <paramref name="flushEachStage"/> false the stages are only enqueued and the flush policy decides, which is
+        /// what the backend does for ordinary ops (the benchmark's third column).
+        /// </summary>
+        internal void RunStagesSeparately(ReadOnlySpan<ResidentStage> stages, bool flushEachStage = true)
         {
             ResidentProgramKernelTemplate.RequireChain(stages);
             var kernel = ResidentStageKernel();
             foreach (var stage in stages)
             {
                 EnqueueResidentStage(kernel, stage);
-                FlushQueue();
+                if (flushEachStage) FlushQueue();
             }
         }
 
@@ -90,6 +93,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 try
                 {
                     if (_context is null) throw new GpuCapabilityUnavailableException("Context not available");
+                    // The kernel requires a 256-wide work-group (a softmax row is reduced by one group of that size).
+                    if (_context.MaxWorkGroupSize < (ulong)ResidentProgramKernelTemplate.GroupThreads)
+                        throw new GpuCapabilityUnavailableException(
+                            $"the device's largest work-group is {_context.MaxWorkGroupSize}; the stage kernel needs {ResidentProgramKernelTemplate.GroupThreads}.");
                     // Strict math: the softmax's exp and division must round like the other backends' instances.
                     var program = CompileOrLoadCached(ResidentProgramKernelTemplate.GetModuleSource(ResidentKernelDialect.OpenCl),
                         OpenClBuildOptions.SafeMathFlags, "resident program kernel");
