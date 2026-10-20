@@ -77,8 +77,8 @@ public sealed partial class WebGpuBackend
         {
             // Each distinct buffer is bound once, read-write (the shader indexes them by slot): no buffer appears in
             // two bindings, so WebGpuBindGroup takes no snapshot and nothing aliases a writable binding.
-            int rowsPipe = await GetOrCreatePipelineAsync(ResidentRowModuleKey + plan.Buffers.Length,
-                ResidentProgramKernelTemplate.GetRowProgramShader(ResidentKernelDialect.Wgsl, plan.Buffers.Length), "main");
+            int rowsPipe = await GetOrCreatePipelineAsync(ResidentRowModuleKey + plan.Buffers.Length + ":" + string.Join(",", plan.StageWords),
+                ResidentProgramKernelTemplate.GetRowProgramShader(ResidentKernelDialect.Wgsl, plan), "main");
             var bound = new WebGpuBuffer[plan.Buffers.Length];
             for (int i = 0; i < bound.Length; i++) bound[i] = AsWgpu(plan.Buffers[i]);
             using var uniforms = new WebGpuBuffer(UniformInts(plan.Parameters()), WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);

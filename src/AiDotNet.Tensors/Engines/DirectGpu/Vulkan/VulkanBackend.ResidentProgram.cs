@@ -52,7 +52,7 @@ public sealed unsafe partial class VulkanBackend
         RequireResidentProgram();
         if (ResidentProgramKernelTemplate.TryPlanRowProgram(stages, out var plan) && plan is not null)
         {
-            string shader = ResidentProgramKernelTemplate.GetRowProgramShader(ResidentKernelDialect.Glsl, plan.Buffers.Length);
+            string shader = ResidentProgramKernelTemplate.GetRowProgramShader(ResidentKernelDialect.Glsl, plan);
             if (GetOrCreateGlslPipeline(shader, plan.Buffers.Length, ResidentRowPushBytes) is not null)
             {
                 var p = plan.Parameters();

@@ -45,20 +45,38 @@ def main_dml():
     dev = torch_directml.device()
     torch.manual_seed(890)
     print(f"torch {torch.__version__} on DirectML: {torch_directml.device_name(0)}")
-    print("shape        run    eager us   P95/med eager")
+    # Two formulations, interleaved sample by sample: the plain chain (five kernels: mul, add, relu, softmax, add) and
+    # the fewest-kernel one PyTorch offers (addcmul, in-place relu, softmax, in-place add). DirectML has neither
+    # torch.compile nor graph replay, so the faster of the two is PyTorch's best on this device.
+    print("shape        run    plain us   fused-api us   best us   P95/med best")
+
+    def fused_api(x, scale, bias, residual):
+        return torch.softmax(torch.addcmul(bias, x, scale).relu_(), dim=-1).add_(residual)
+
     for rows, cols in SHAPES:
         x = (torch.rand(rows, cols) * 2 - 1).to(dev)
         scale = (torch.rand(cols) * 2 - 1).to(dev)
         bias = (torch.rand(cols) * 2 - 1).to(dev)
         residual = (torch.rand(rows, cols) * 2 - 1).to(dev)
-        eager = lambda: chain(x, scale, bias, residual)
+        plain = lambda: chain(x, scale, bias, residual)
+        fused = lambda: fused_api(x, scale, bias, residual)
+        assert torch.allclose(plain().cpu(), fused().cpu(), atol=1e-6)
         for _ in range(WARMUP):
-            eager()
+            plain()
+            fused()
         for run in range(1, RUNS + 1):
-            e = sorted(time_region_dml(eager) for _ in range(SAMPLES))
-            med = e[len(e) // 2]
-            p95 = e[min(len(e) - 1, int(0.95 * len(e) + 0.999) - 1)]
-            print(f"{rows}x{cols:<8} {run:3d}  {med:9.2f}   {p95 / med:12.2f}")
+            p, f = [], []
+            for s in range(SAMPLES):
+                if s % 2 == 0:
+                    p.append(time_region_dml(plain)); f.append(time_region_dml(fused))
+                else:
+                    f.append(time_region_dml(fused)); p.append(time_region_dml(plain))
+            p.sort(); f.sort()
+            med_p, med_f = p[len(p) // 2], f[len(f) // 2]
+            best = p if med_p <= med_f else f
+            med_b = min(med_p, med_f)
+            p95 = best[min(len(best) - 1, int(0.95 * len(best) + 0.999) - 1)]
+            print(f"{rows}x{cols:<8} {run:3d}  {med_p:9.2f}   {med_f:12.2f}   {med_b:7.2f}   {p95 / med_b:12.2f}")
     return 0
 
 

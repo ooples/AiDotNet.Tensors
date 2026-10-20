@@ -289,38 +289,35 @@ extern ""C"" __global__ void __launch_bounds__(RES_THREADS) resident_rows(float*
         }
     }
 
-    private static readonly string[] s_glslRowSources = new string[MaxRowProgramBuffers + 1];
-    private static readonly string[] s_wgslRowSources = new string[MaxRowProgramBuffers + 1];
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> s_rowShaders = new();
 
     /// <summary>
-    /// The row program for Vulkan or WebGPU over exactly <paramref name="bufferCount"/> storage buffers (bindings
-    /// 0..n-1; WebGPU's parameters are a uniform at binding n, Vulkan's are push constants). Each buffer is bound once,
-    /// read-write: WebGPU refuses a writable buffer bound twice.
+    /// The row program for Vulkan (GLSL) or WebGPU (WGSL), written for <paramref name="plan"/>'s chain: each stage's
+    /// op and buffers are spelled out, so the shader neither branches on the op nor selects a buffer at run time (a
+    /// generic shader that did both through a switch per element measured 0.80-0.90x the backend's ordinary dispatch
+    /// on Vulkan). Bindings 0..n-1 are the plan's buffers, each bound once, read-write (WebGPU refuses a writable
+    /// buffer bound twice); rows and cols come from <see cref="RowProgramPlan.Parameters"/>, as push constants on
+    /// Vulkan and a uniform at binding n on WebGPU. Cached per dialect, buffer count and stage words.
     /// </summary>
-    internal static string GetRowProgramShader(ResidentKernelDialect dialect, int bufferCount)
+    internal static string GetRowProgramShader(ResidentKernelDialect dialect, RowProgramPlan plan)
     {
-        if (bufferCount < 1 || bufferCount > MaxRowProgramBuffers) throw new ArgumentOutOfRangeException(nameof(bufferCount));
-        var cache = dialect == ResidentKernelDialect.Glsl ? s_glslRowSources
-            : dialect == ResidentKernelDialect.Wgsl ? s_wgslRowSources
-            : throw new ArgumentException("Only GLSL and WGSL have a per-buffer-count row shader.", nameof(dialect));
-        return cache[bufferCount] ??= dialect == ResidentKernelDialect.Glsl ? BuildGlslRows(bufferCount) : BuildWgslRows(bufferCount);
+        if (dialect != ResidentKernelDialect.Glsl && dialect != ResidentKernelDialect.Wgsl)
+            throw new ArgumentException("Only GLSL and WGSL have a per-chain row shader.", nameof(dialect));
+        string key = dialect + ":" + plan.Buffers.Length + ":" + string.Join(",", plan.StageWords);
+        return s_rowShaders.GetOrAdd(key, _ => dialect == ResidentKernelDialect.Glsl ? BuildGlslRows(plan) : BuildWgslRows(plan));
     }
 
-    private static string BuildGlslRows(int n)
+    private static string BuildGlslRows(RowProgramPlan plan)
     {
+        int n = plan.Buffers.Length;
         var sb = new StringBuilder("#version 450\nlayout(local_size_x = " + GroupThreads + ") in;\n");
         // coherent, with a buffer barrier between stages: a guard for an op that would read another invocation's
         // element of the row (the four ops here read back only their own; see RowBody).
         for (int i = 0; i < n; i++)
             sb.Append("layout(set=0, binding=").Append(i).Append(") coherent buffer B").Append(i).Append(" { float d[]; } b").Append(i).Append(";\n");
         sb.Append("layout(push_constant) uniform PC { int rows; int cols; int count; int unused; int w[8]; };\n");
-        sb.Append("const uint RES_THREADS = ").Append(GroupThreads).Append("u;\nshared float scratch[RES_THREADS];\n");
-        sb.Append("float ld(int s, uint i)\n{\n    switch (s) {\n");
-        for (int i = 0; i < n; i++) sb.Append("    case ").Append(i).Append(": return b").Append(i).Append(".d[i];\n");
-        sb.Append("    }\n    return 0.0;\n}\nvoid st(int s, uint i, float v)\n{\n    switch (s) {\n");
-        for (int i = 0; i < n; i++) sb.Append("    case ").Append(i).Append(": b").Append(i).Append(".d[i] = v; break;\n");
-        sb.Append(@"    }
-}
+        sb.Append("const uint RES_THREADS = ").Append(GroupThreads).Append(@"u;
+shared float scratch[RES_THREADS];
 
 float res_reduce(float v, bool isMax, uint lid)
 {
@@ -344,60 +341,46 @@ void main()
     uint ucols = uint(cols);
     for (uint r = grp; r < uint(rows); r += ngrp) {
         uint base0 = r * ucols;
-        for (int k = 0; k < count; k++) {
-            int wd = w[k];
-            int op = wd & 3;
-            int a = (wd >> 2) & 7, b = (wd >> 5) & 7, c = (wd >> 8) & 7, o = (wd >> 11) & 7;
-            if (op == 2) {
-                float m = uintBitsToFloat(0xff800000u);
-                for (uint j = lid; j < ucols; j += RES_THREADS) m = max(m, ld(a, base0 + j));
-                m = res_reduce(m, true, lid);
-                float sum = 0.0;
-                for (uint j = lid; j < ucols; j += RES_THREADS) sum += exp(ld(a, base0 + j) - m);
-                sum = res_reduce(sum, false, lid);
-                float inv = 1.0 / sum;
-                for (uint j = lid; j < ucols; j += RES_THREADS) st(o, base0 + j, exp(ld(a, base0 + j) - m) * inv);
-            } else {
-                for (uint j = lid; j < ucols; j += RES_THREADS) {
-                    uint i = base0 + j;
-                    float v;
-                    if (op == 3) {
-                        v = ld(a, i) + ld(b, i);
-                    } else {
-                        v = fma(ld(a, i), ld(b, j), ld(c, j));
-                        if (op == 0) v = max(v, 0.0);
-                    }
-                    st(o, i, v);
-                }
-            }
-            memoryBarrierBuffer(); barrier();
-        }
-    }
-}
 ");
+        foreach (int word in plan.StageWords)
+        {
+            DecodeWord(word, out var op, out int a, out int b, out int c, out int o);
+            string A = "b" + a + ".d", B = "b" + b + ".d", C = "b" + c + ".d", O = "b" + o + ".d";
+            if (op == ResidentOp.RowSoftmax)
+            {
+                sb.Append("        {\n            float m = uintBitsToFloat(0xff800000u);\n")
+                  .Append("            for (uint j = lid; j < ucols; j += RES_THREADS) m = max(m, ").Append(A).Append("[base0 + j]);\n")
+                  .Append("            m = res_reduce(m, true, lid);\n            float sum = 0.0;\n")
+                  .Append("            for (uint j = lid; j < ucols; j += RES_THREADS) sum += exp(").Append(A).Append("[base0 + j] - m);\n")
+                  .Append("            sum = res_reduce(sum, false, lid);\n            float inv = 1.0 / sum;\n")
+                  .Append("            for (uint j = lid; j < ucols; j += RES_THREADS) ").Append(O).Append("[base0 + j] = exp(")
+                  .Append(A).Append("[base0 + j] - m) * inv;\n        }\n");
+            }
+            else
+            {
+                string value = op == ResidentOp.Add
+                    ? A + "[i] + " + B + "[i]"
+                    : op == ResidentOp.AffineRelu
+                        ? "max(fma(" + A + "[i], " + B + "[j], " + C + "[j]), 0.0)"
+                        : "fma(" + A + "[i], " + B + "[j], " + C + "[j])";
+                sb.Append("        for (uint j = lid; j < ucols; j += RES_THREADS) { uint i = base0 + j; ")
+                  .Append(O).Append("[i] = ").Append(value).Append("; }\n");
+            }
+            sb.Append("        memoryBarrierBuffer(); barrier();\n");
+        }
+        sb.Append("    }\n}\n");
         return sb.ToString();
     }
 
-    private static string BuildWgslRows(int n)
+    private static string BuildWgslRows(RowProgramPlan plan)
     {
+        int n = plan.Buffers.Length;
         var sb = new StringBuilder();
         for (int i = 0; i < n; i++)
             sb.Append("@group(0) @binding(").Append(i).Append(") var<storage, read_write> b").Append(i).Append(" : array<f32>;\n");
         sb.Append("struct Params { rows : i32, cols : i32, count : i32, unused : i32, w0 : vec4<i32>, w1 : vec4<i32> };\n");
         sb.Append("@group(0) @binding(").Append(n).Append(") var<uniform> p : Params;\n");
-        sb.Append("const RES_THREADS : u32 = ").Append(GroupThreads).Append("u;\nvar<workgroup> scratch : array<f32, ").Append(GroupThreads).Append(">;\n");
-        sb.Append("fn ld(s : i32, i : u32) -> f32 {\n    switch s {\n");
-        for (int i = 0; i < n; i++) sb.Append("        case ").Append(i).Append(": { return b").Append(i).Append("[i]; }\n");
-        sb.Append("        default: { return 0.0; }\n    }\n}\nfn st(s : i32, i : u32, v : f32) {\n    switch s {\n");
-        for (int i = 0; i < n; i++) sb.Append("        case ").Append(i).Append(": { b").Append(i).Append("[i] = v; }\n");
-        sb.Append(@"        default: { }
-    }
-}
-
-fn word(k : i32) -> i32 {
-    if (k < 4) { return p.w0[k]; }
-    return p.w1[k - 4];
-}
+        sb.Append("const RES_THREADS : u32 = ").Append(GroupThreads).Append("u;\nvar<workgroup> scratch : array<f32, ").Append(GroupThreads).Append(@">;
 
 fn res_reduce(v : f32, isMax : bool, lid : u32) -> f32 {
     scratch[lid] = v;
@@ -424,44 +407,43 @@ fn main(@builtin(local_invocation_id) l : vec3<u32>, @builtin(workgroup_id) wg :
     let ucols = u32(p.cols);
     for (var r : u32 = wg.x; r < u32(p.rows); r = r + nw.x) {
         let base0 = r * ucols;
-        for (var k : i32 = 0; k < p.count; k = k + 1) {
-            let wd = word(k);
-            let op = wd & 3;
-            let a = (wd >> 2u) & 7;
-            let b = (wd >> 5u) & 7;
-            let c = (wd >> 8u) & 7;
-            let o = (wd >> 11u) & 7;
-            if (op == 2) {
+");
+        foreach (int word in plan.StageWords)
+        {
+            DecodeWord(word, out var op, out int a, out int b, out int c, out int o);
+            string A = "b" + a, B = "b" + b, C = "b" + c, O = "b" + o;
+            if (op == ResidentOp.RowSoftmax)
+            {
                 // WGSL may not hold -inf even as a constant: the lowest finite f32 is the same start.
-                var m : f32 = -0x1.fffffep+127f;
-                for (var j : u32 = lid; j < ucols; j = j + RES_THREADS) { m = max(m, ld(a, base0 + j)); }
-                m = res_reduce(m, true, lid);
-                var sum : f32 = 0.0;
-                for (var j : u32 = lid; j < ucols; j = j + RES_THREADS) { sum = sum + exp(ld(a, base0 + j) - m); }
-                sum = res_reduce(sum, false, lid);
-                let inv = 1.0 / sum;
-                for (var j : u32 = lid; j < ucols; j = j + RES_THREADS) { st(o, base0 + j, exp(ld(a, base0 + j) - m) * inv); }
-            } else {
-                for (var j : u32 = lid; j < ucols; j = j + RES_THREADS) {
-                    let i = base0 + j;
-                    var v : f32;
-                    if (op == 3) {
-                        v = ld(a, i) + ld(b, i);
-                    } else {
-                        v = fma(ld(a, i), ld(b, j), ld(c, j));
-                        if (op == 0) { v = max(v, 0.0); }
-                    }
-                    st(o, i, v);
-                }
+                sb.Append("        {\n            var m : f32 = -0x1.fffffep+127f;\n")
+                  .Append("            for (var j : u32 = lid; j < ucols; j = j + RES_THREADS) { m = max(m, ").Append(A).Append("[base0 + j]); }\n")
+                  .Append("            m = res_reduce(m, true, lid);\n            var sum : f32 = 0.0;\n")
+                  .Append("            for (var j : u32 = lid; j < ucols; j = j + RES_THREADS) { sum = sum + exp(").Append(A).Append("[base0 + j] - m); }\n")
+                  .Append("            sum = res_reduce(sum, false, lid);\n            let inv = 1.0 / sum;\n")
+                  .Append("            for (var j : u32 = lid; j < ucols; j = j + RES_THREADS) { ").Append(O).Append("[base0 + j] = exp(")
+                  .Append(A).Append("[base0 + j] - m) * inv; }\n        }\n");
+            }
+            else
+            {
+                string value = op == ResidentOp.Add
+                    ? A + "[i] + " + B + "[i]"
+                    : op == ResidentOp.AffineRelu
+                        ? "max(fma(" + A + "[i], " + B + "[j], " + C + "[j]), 0.0)"
+                        : "fma(" + A + "[i], " + B + "[j], " + C + "[j])";
+                sb.Append("        for (var j : u32 = lid; j < ucols; j = j + RES_THREADS) { let i = base0 + j; ")
+                  .Append(O).Append("[i] = ").Append(value).Append("; }\n");
             }
             // A guard for an op that would read another invocation's element of the row (see RowBody).
-            storageBarrier();
-            workgroupBarrier();
+            sb.Append("        storageBarrier();\n        workgroupBarrier();\n");
         }
-    }
-}
-");
+        sb.Append("    }\n}\n");
         return sb.ToString();
+    }
+
+    private static void DecodeWord(int word, out ResidentOp op, out int a, out int b, out int c, out int o)
+    {
+        op = (ResidentOp)(word & 3);
+        a = (word >> 2) & 7; b = (word >> 5) & 7; c = (word >> 8) & 7; o = (word >> 11) & 7;
     }
 
     /// <summary>Validates a chain's length; every backend refuses an empty or over-long chain the same way.</summary>
