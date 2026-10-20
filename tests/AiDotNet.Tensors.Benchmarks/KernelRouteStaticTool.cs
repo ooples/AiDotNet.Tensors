@@ -1,12 +1,15 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 // --kernel-routes --static: the static-metric half of the #890 phase-4 gate. For each routed family, at its bench
 // shape, the declared program as the backend lowers it (PtxProgramLowering, compiled by ptxas) against the reference
 // hand-written kernels it replaces (their CUDA C, compiled by NVRTC with the backend's own source preparation and
 // options): registers, local bytes (spills), static SASS instructions, global loads and stores and how many of each
-// are 128-bit. Every metric where the declared side is worse is flagged.
+// are 128-bit.
 //
-// Static counts are code, not work: an unrolled row kernel has more instructions than a loop over the same row, and
-// a fused program is one kernel standing in for several. Both sides are reported in full so a flag can be judged.
+// THE RULE (decided on #1437, 2026-10-20): the declared side FAILS on a spill (any local bytes) or on fewer 128-bit
+// loads than the hand-written kernel. Registers and static instructions are REPORTED, not gated: a held row keeps
+// its elements in registers so x is read once -- 52-88 registers against 14-48, and the reason the declared kernels
+// are 1.3-4.9x faster -- and static counts are code, not work (an unrolled row has more instructions than a loop
+// over it; a fused program is one kernel standing in for several). The paired wall-clock gate is --kernel-routes.
 //
 // Options: --arch 75|86 (default 75), --cuda-bin <dir> (ptxas, nvdisasm, cuobjdump), --out <dir>.
 
@@ -90,19 +93,24 @@ internal static class KernelRouteStaticTool
             foreach (var m in theirs) Print("theirs", m);
             var a = Total(ours, "declared");
             var b = Total(theirs, "hand-written");
-            var worse = new List<string>();
-            if (a.Registers > b.Registers) worse.Add("registers " + a.Registers + " > " + b.Registers);
-            if (a.LocalBytes > b.LocalBytes) worse.Add("local bytes " + a.LocalBytes + " > " + b.LocalBytes);
-            if (a.Instructions > b.Instructions) worse.Add("instructions " + a.Instructions + " > " + b.Instructions);
-            if (a.WideLoads < b.WideLoads) worse.Add("128-bit loads " + a.WideLoads + " < " + b.WideLoads);
+            var failed = new List<string>();
+            if (a.LocalBytes > 0) failed.Add("spills: " + a.LocalBytes + " local bytes");
+            if (a.WideLoads < b.WideLoads) failed.Add("128-bit loads " + a.WideLoads + " < " + b.WideLoads);
+            var reported = new List<string>();
+            if (a.Registers > b.Registers) reported.Add("registers " + a.Registers + " > " + b.Registers);
+            if (a.Instructions > b.Instructions) reported.Add("instructions " + a.Instructions + " > " + b.Instructions);
             Console.WriteLine("  totals: ours " + ours.Count + " kernel(s), max " + a.Registers + " regs, " + a.Instructions +
                 " instrs, " + a.Loads + " LDG (" + a.WideLoads + " wide); hand-written " + theirs.Count + " kernel(s), max " +
                 b.Registers + " regs, " + b.Instructions + " instrs, " + b.Loads + " LDG (" + b.WideLoads + " wide)");
-            Console.WriteLine(worse.Count == 0 ? "  no metric worse" : "  WORSE: " + string.Join("; ", worse));
-            if (worse.Count != 0) flagged++;
+            if (reported.Count != 0) Console.WriteLine("  higher (reported, not gated): " + string.Join("; ", reported));
+            Console.WriteLine(failed.Count == 0 ? "  PASS" : "  FAIL: " + string.Join("; ", failed));
+            if (failed.Count != 0) flagged++;
         }
         Console.WriteLine();
-        Console.WriteLine(flagged + " of " + families.Length + " families have a metric worse than the hand-written reference.");
+        Console.WriteLine(flagged == 0
+            ? "All " + families.Length + " families pass: no spills, no fewer 128-bit loads than the hand-written kernels."
+            : flagged + " of " + families.Length + " families fail the static rule.");
+        if (flagged != 0) throw new InvalidOperationException(flagged + " families fail the static rule.");
     }
 
     private static void Print(string side, Metrics m) =>
