@@ -249,6 +249,10 @@ public static class CuDnnNative
     [DllImport(CudnnLibrary, EntryPoint = "cudnnGetVersion")]
     public static extern ulong cudnnGetVersion();
 
+    /// <summary>The CUDA runtime version cuDNN was built against (12080 for 12.8); names the cuBLASLt it loads.</summary>
+    [DllImport(CudnnLibrary, EntryPoint = "cudnnGetCudartVersion")]
+    internal static extern UIntPtr cudnnGetCudartVersion();
+
     /// <summary>Gets error string for status code.</summary>
     [DllImport(CudnnLibrary, EntryPoint = "cudnnGetErrorString")]
     public static extern IntPtr cudnnGetErrorString(CudnnStatus status);
@@ -1146,6 +1150,22 @@ public sealed class CuDnnContext : IDisposable
                     $"cuDNN 9 at {dir ?? "(unknown directory)"} is missing {name}; cuDNN is reported unavailable instead of letting it terminate the process.");
                 return false;
             }
+        // cuDNN's engines call cuBLASLt for the CUDA it was built against (cublasLt64_12.dll for a CUDA 12 build), loaded
+        // by the same bare name: a NuGet layout ships it beside the shim, off the search path, and a machine with only
+        // the CUDA 13 toolkit has no cublasLt64_12 at all. Either way cuDNN printed "Could not locate cublasLt64_12.dll"
+        // and terminated the process at the first convolution whose engine needed it. The sub-libraries are loaded, so
+        // asking cuDNN its CUDA version is safe here.
+        ulong cudart = (ulong)CuDnnNative.cudnnGetCudartVersion();
+        if (cudart >= 1000)
+        {
+            string cublasLt = "cublasLt64_" + (cudart / 1000).ToString(System.Globalization.CultureInfo.InvariantCulture) + ".dll";
+            if (!LoadBeside(dir, cublasLt, assembly))
+            {
+                System.Diagnostics.Trace.TraceWarning(
+                    $"cuDNN 9 at {dir ?? "(unknown directory)"} needs {cublasLt}, which is neither beside it nor on the search path; cuDNN is reported unavailable instead of letting it terminate the process.");
+                return false;
+            }
+        }
         // The optional ones are large and loaded by cuDNN only when an API needs them; preload them only where cuDNN's own
         // bare-name load would miss them, i.e. when the shim's directory is neither the application's nor on PATH.
         if (dir is not null && !OnLoaderSearchPath(dir))

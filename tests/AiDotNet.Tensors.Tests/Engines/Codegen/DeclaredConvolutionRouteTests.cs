@@ -155,6 +155,35 @@ public class DeclaredConvolutionRouteTests
             $"{(weights ? "dW" : "dX")} shape {shape} m{tileM}n{tileN} split {split}");
     }
 
+    /// <summary>
+    /// The data gradient split by output parity (CodegenParitySplit), whose passes each write a strided slice of dX:
+    /// every element written once, by the pass that owns its class (dX starts filled, so a missed one shows).
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(0, 64)]
+    [InlineData(0, 128)]
+    [InlineData(4, 64)]
+    public void TheParityDataGradientMatchesADirectConvolution(int shape, int tileM)
+    {
+        using var backend = OpenBackendOrSkip();
+        Skip.IfNot(backend.DeclaredKernelsEnabled, "The declared route needs the sm_75+ codegen conveyor.");
+        var g = shape == 4 ? new Geometry(2, 8, 16, 15, 14, 3, 2, 1, 1) : Shape(shape);
+        float[] w = Fill(g.K * g.C * g.Kernel * g.Kernel, 2), dy = Fill(g.N * g.K * g.OutH * g.OutW, 4);
+        var expected = new double[g.N * g.C * g.H * g.W];
+        ForEachTap(g, (xi, yi, wi, n, k, c, kh, kw) => expected[xi] += (double)dy[yi] * w[wi]);
+        using var bdy = backend.AllocateBuffer(dy);
+        using var bw = backend.AllocateBuffer(w);
+        using var bdx = backend.AllocateBuffer(Fill(expected.Length, 5));
+        var args = new TunedConv2DBackwardArgs(bdy, bw, bdx, false, g.N, g.C, g.H, g.W, g.K, g.OutH, g.OutW,
+            g.Kernel, g.Kernel, g.Stride, g.Stride, g.Pad, g.Pad, g.Dilation, g.Dilation);
+        var schedule = new DeclaredConvSchedule(tileM, 64, 0, Parity: true);
+        Assert.True(backend.TryDeclaredConv2DBackward(args, schedule), "declined: " + backend.DeclaredConvDeclineReason(
+            new DeclaredConvKey(DeclaredConvPass.BackwardData, g.N, g.C, g.K, g.H, g.W, g.Kernel, g.Stride, g.Pad,
+                g.Dilation, false, schedule)));
+        backend.Synchronize();
+        AssertClose(expected, backend.DownloadBuffer(bdx), $"parity dX shape {shape} m{tileM}");
+    }
+
 #if NET5_0_OR_GREATER
     /// <summary>Once a key's program is built, a call allocates nothing: the geometry check, the key and the
     /// bindings are values (a small convolution is launch-bound, so host time is its time).</summary>

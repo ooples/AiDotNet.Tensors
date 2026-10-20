@@ -25,13 +25,15 @@ internal enum DeclaredConvPass : byte
 }
 
 /// <summary>
-/// An implicit-GEMM schedule: the output tile (M rows -- what only the first operand reads -- by N columns) and,
-/// above 1, the factor a reduction axis is split by into a partial pass and a combine.
+/// An implicit-GEMM schedule: the output tile (M rows -- what only the first operand reads -- by N columns); above 1,
+/// the factor a reduction axis is split by into a partial pass and a combine; and whether a strided data gradient is
+/// split by output parity first (CodegenParitySplit), so no pass visits a tap its exact-division window lacks.
 /// </summary>
-internal readonly record struct DeclaredConvSchedule(int TileM, int TileN, int SplitFactor)
+internal readonly record struct DeclaredConvSchedule(int TileM, int TileN, int SplitFactor, bool Parity = false)
 {
-    /// <summary>The candidate-name suffix: "m128n64" or "split4.m128n64".</summary>
-    internal string Suffix => (SplitFactor > 1 ? "split" + SplitFactor + "." : "") + "m" + TileM + "n" + TileN;
+    /// <summary>The candidate-name suffix: "m128n64", "split4.m128n64" or "parity.m64n64".</summary>
+    internal string Suffix => (Parity ? "parity." : "") + (SplitFactor > 1 ? "split" + SplitFactor + "." : "") +
+        "m" + TileM + "n" + TileN;
 }
 
 /// <summary>A declared convolution program: one square-window geometry, the fused bias + ReLU or not, a schedule.</summary>
@@ -41,17 +43,34 @@ internal readonly record struct DeclaredConvKey(
 
 public sealed partial class CudaBackend
 {
-    // The schedules registered per slot. Forward and data gradients are large-output GEMMs, where a split only adds
-    // the combine's traffic; the weight gradient's output is filters-sized and its reduction runs over every
-    // position, which is what the split is for (sm_75: the stride-2 weight gradient 962 -> 682 us with split 4).
+    // The schedules registered per slot, each the fastest declared one for some measured shape (sm_75,
+    // --kernel-routes --family conv): every candidate costs online tuning time, so one that never wins is not
+    // registered. Forward and data gradients are large-output GEMMs, where a split only adds the combine's traffic;
+    // the weight gradient's output is filters-sized and its reduction runs over every position, which is what the
+    // split is for -- the deeper the smaller the output (1x1, 64 -> 64 channels: unsplit 1406 us, split 14 173 us).
     private static readonly DeclaredConvSchedule[] s_declaredConvLargeOutputSchedules =
     {
         new(64, 64, 0), new(128, 64, 0),
     };
 
+    // A strided data gradient also tries the parity split: at stride 2 three quarters of a 3x3 window's taps are
+    // absent for any one input position, and the unsplit GEMM gathers zeros for them.
+    private static readonly DeclaredConvSchedule[] s_declaredConvDataSchedules =
+    {
+        new(64, 64, 0), new(128, 64, 0), new(64, 64, 0, Parity: true),
+    };
+
     private static readonly DeclaredConvSchedule[] s_declaredConvWeightSchedules =
     {
-        new(64, 64, 0), new(128, 64, 0), new(128, 64, 2), new(128, 64, 4),
+        new(128, 64, 4), new(64, 64, 4), new(64, 64, 7), new(64, 64, 14),
+    };
+
+    /// <summary>The schedules registered as candidates for a pass (the route tooling times each).</summary>
+    internal static IReadOnlyList<DeclaredConvSchedule> DeclaredConvSchedules(DeclaredConvPass pass) => pass switch
+    {
+        DeclaredConvPass.Forward => s_declaredConvLargeOutputSchedules,
+        DeclaredConvPass.BackwardData => s_declaredConvDataSchedules,
+        _ => s_declaredConvWeightSchedules,
     };
 
     private static readonly string[] s_convForwardNames = { "input", "weights", "output" };
@@ -109,6 +128,12 @@ public sealed partial class CudaBackend
         var spec = DeclaredConvSpec(pass, s[0], s[1], s[4], s[2], s[3], s[5], s[6], s[7], s[8], s[9], s[10], s[11],
             s[12], s[13], s[14], biasRelu: false);
         if (spec is null || PtxAffineEmitter.PlanImplicitGemm(spec, out _) is null) return false;
+        if (schedule.Parity)
+        {
+            if (CodegenParitySplit.TrySplit(spec, out _) is not { } parity) return false;
+            foreach (var parityPass in parity.Passes)
+                if (PtxAffineEmitter.PlanImplicitGemm(parityPass, out _) is null) return false;
+        }
         if (schedule.SplitFactor <= 1) return true;
         return CodegenSplitReduction.TryPlanChunkedForTiles(spec, schedule.SplitFactor) is { } split &&
             PtxAffineEmitter.PlanImplicitGemm(split.Partial, out _) is not null;
@@ -177,7 +202,14 @@ public sealed partial class CudaBackend
             return null;
         }
         var schedule = key.Schedule;
-        var source = new CodegenProgram(new[] { spec }, Array.Empty<long>(), spec.Name);
+        CodegenProgram source;
+        if (!schedule.Parity) source = new CodegenProgram(new[] { spec }, Array.Empty<long>(), spec.Name);
+        else if (CodegenParitySplit.TrySplit(spec, out string reason) is { } parity) source = parity;
+        else
+        {
+            _declaredConvDeclines[key] = reason;
+            return null;
+        }
         var program = BuildDeclaredProgram(source, key.ToString(), names,
             pass => LowerDeclaredConv(pass, schedule, minBlocks: 2), out string? decline);
         // The two-blocks-a-SM bound caps registers at 128; a ragged shape's guards can need more, and the JIT then
@@ -263,7 +295,7 @@ public sealed partial class CudaBackend
         if (!s_declaredKernels) return;
         var pass = weightGradient ? DeclaredConvPass.BackwardWeights : DeclaredConvPass.BackwardData;
         string prefix = weightGradient ? "ptx.conv2d_dw.implicit_gemm." : "ptx.conv2d_dx.implicit_gemm.";
-        foreach (var schedule in weightGradient ? s_declaredConvWeightSchedules : s_declaredConvLargeOutputSchedules)
+        foreach (var schedule in weightGradient ? s_declaredConvWeightSchedules : s_declaredConvDataSchedules)
         {
             var sc = schedule;
             candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>(prefix + sc.Suffix,

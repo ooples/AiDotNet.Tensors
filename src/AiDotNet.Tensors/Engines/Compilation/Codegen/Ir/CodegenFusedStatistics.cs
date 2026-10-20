@@ -33,6 +33,12 @@ public sealed record CodegenProgram(
     IReadOnlyList<long> TempElements,
     string Description)
 {
+    /// <summary>
+    /// Whether several passes write disjoint slices of one output (a parity split, CodegenParitySplit): the output is
+    /// then written once per element across them, rather than once per tensor. Off, a second writer is an error.
+    /// </summary>
+    public bool PassesWriteDisjointSlices { get; init; }
+
     // Passes are chained BY NAME: an input named like an earlier pass's output reads that
     // intermediate, and any other input is a program source shared by every pass that
     // names it. Positional chaining (input i = output of pass i-1) worked for softmax by
@@ -64,6 +70,11 @@ public sealed record CodegenProgram(
                 }
                 seen.Add(input.Name, input);
                 sources.Add(input);
+            }
+            if (PassesWriteDisjointSlices && produced.TryGetValue(pass.Output.Name, out var earlier))
+            {
+                RequireSameStorage(earlier, pass.Output);
+                continue;
             }
             if (produced.ContainsKey(pass.Output.Name) || seen.ContainsKey(pass.Output.Name))
                 throw new InvalidOperationException(
@@ -99,6 +110,12 @@ public sealed record CodegenProgram(
             var operands = new double[pass.Inputs.Count][];
             for (int i = 0; i < operands.Length; i++) operands[i] = values[pass.Inputs[i].Name];
             double[] result = pass.Interpret(operands);
+            // Disjoint slices: each pass's result is zero outside its slice, so adding them assembles the output.
+            if (PassesWriteDisjointSlices && outputs.TryGetValue(pass.Output.Name, out var assembled))
+            {
+                for (long e = 0; e < result.LongLength; e++) assembled[e] += result[e];
+                continue;
+            }
             values[pass.Output.Name] = result;
             outputs[pass.Output.Name] = result;
         }

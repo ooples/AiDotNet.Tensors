@@ -88,6 +88,7 @@ internal static class KernelRouteTool
         }
         if (only is null || only.Equals("capture", StringComparison.OrdinalIgnoreCase)) CaptureCheck(backend, failures);
         if (only is null || only.Equals("resident", StringComparison.OrdinalIgnoreCase)) ResidentChains(backend, failures);
+        if (only is null || only.Equals("conv", StringComparison.OrdinalIgnoreCase)) ConvRoutes(backend, failures);
 
         if (failures.Count != 0)
             throw new InvalidOperationException("Route failures: " + string.Join("; ", failures));
@@ -660,6 +661,170 @@ internal static class KernelRouteTool
     }
 
     // Managed bytes this thread allocates per call, over 1000 calls (deterministic, unlike time).
+    // ---- convolutions ---------------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// Each declared convolution schedule (the slots' Generated candidates) against the backend's own convolution with
+    /// the declared route off -- whatever its tuned slot serves -- both against an fp64 direct convolution, timed in the
+    /// same process.
+    /// </summary>
+    private static void ConvRoutes(CudaBackend backend, List<string> failures)
+    {
+        Console.WriteLine();
+        Console.WriteLine("CONV - declared schedules vs the backend's own route (declared off), each against fp64");
+        Console.WriteLine("case                                       schedule          err        incumbent err    us      incumbent us  ratio");
+        var shapes = new[]
+        {
+            ("s2 8x64->128 56", 8, 64, 128, 56, 56, 3, 2, 1, 1),
+            ("3x3 8x32->64 28", 8, 32, 64, 28, 28, 3, 1, 1, 1),
+            ("1x1 16x64->64 28", 16, 64, 64, 28, 28, 1, 1, 0, 1),
+            ("d2 8x32->32 28", 8, 32, 32, 28, 28, 3, 1, 2, 2),
+        };
+        foreach (var (label, n, c, k, h, w, kernel, stride, pad, dilation) in shapes)
+        {
+            int oh = (h + 2 * pad - dilation * (kernel - 1) - 1) / stride + 1;
+            int ow = (w + 2 * pad - dilation * (kernel - 1) - 1) / stride + 1;
+            float[] x = Fill(n * c * h * w, 1, 0), wt = Fill(k * c * kernel * kernel, 2, 0), dy = Fill(n * k * oh * ow, 3, 0);
+            var (y, dx, dw) = ConvRef(x, wt, dy, n, c, k, h, w, kernel, stride, pad, dilation, oh, ow);
+            foreach (DeclaredConvPass pass in new[] { DeclaredConvPass.Forward, DeclaredConvPass.BackwardData, DeclaredConvPass.BackwardWeights })
+            {
+                double[] reference = pass == DeclaredConvPass.Forward ? y : pass == DeclaredConvPass.BackwardData ? dx : dw;
+                using var first = backend.AllocateBuffer(pass == DeclaredConvPass.BackwardData ? dy : x);
+                using var second = backend.AllocateBuffer(pass == DeclaredConvPass.Forward || pass == DeclaredConvPass.BackwardData ? wt : dy);
+                using var output = backend.AllocateBuffer(reference.Length);
+                void Incumbent()
+                {
+                    if (pass == DeclaredConvPass.Forward)
+                        backend.Conv2D(first, second, output, n, c, h, w, k, oh, ow, kernel, kernel, stride, stride, pad, pad, dilation, dilation);
+                    else if (pass == DeclaredConvPass.BackwardData)
+                        backend.Conv2DBackwardInput(first, second, output, n, c, h, w, k, oh, ow, kernel, kernel, stride, stride, pad, pad, dilation, dilation);
+                    else
+                        backend.Conv2DBackwardKernel(first, second, output, n, c, h, w, k, oh, ow, kernel, kernel, stride, stride, pad, pad, dilation, dilation);
+                }
+                double incumbentUs, incumbentErr;
+                backend.DeclaredKernelsSwitch = false;
+                try
+                {
+                    Incumbent();
+                    backend.Synchronize();
+                    incumbentErr = MaxDev(backend.DownloadBuffer(output), reference);
+                    incumbentUs = Time(Incumbent, backend.Synchronize);
+                }
+                finally { backend.DeclaredKernelsSwitch = null; }
+
+                double scale = Math.Max(1.0, Max(Abs(reference)));
+                foreach (var schedule in CudaBackend.DeclaredConvSchedules(pass))
+                {
+                    var forwardArgs = new CudaConv2DArgs(first, second, output, n, c, h, w, k, oh, ow, kernel, kernel,
+                        stride, stride, pad, pad, dilation, dilation);
+                    var backwardArgs = new TunedConv2DBackwardArgs(first, second, output, pass == DeclaredConvPass.BackwardWeights,
+                        n, c, h, w, k, oh, ow, kernel, kernel, stride, stride, pad, pad, dilation, dilation);
+                    bool Declared() => pass == DeclaredConvPass.Forward
+                        ? backend.TryDeclaredConv2DForward(forwardArgs, schedule)
+                        : backend.TryDeclaredConv2DBackward(backwardArgs, schedule);
+                    string name = (label + " " + pass).PadRight(43) + schedule.Suffix.PadRight(16);
+                    if (!Declared())
+                    {
+                        Console.WriteLine(name + "declined: " + backend.DeclaredConvDeclineReason(new DeclaredConvKey(pass,
+                            n, c, k, h, w, kernel, stride, pad, dilation, false, schedule)));
+                        continue;
+                    }
+                    backend.Synchronize();
+                    double err = MaxDev(backend.DownloadBuffer(output), reference);
+                    double us = Time(() => Declared(), backend.Synchronize);
+                    bool ok = err <= Math.Max(2 * incumbentErr, 1e-5 * scale);
+                    if (!ok) failures.Add(label + " " + pass + " " + schedule.Suffix + ": error " + E(err));
+                    Console.WriteLine(name + E(err).PadLeft(10) + E(incumbentErr).PadLeft(14) +
+                        us.ToString("F1", CultureInfo.InvariantCulture).PadLeft(10) +
+                        incumbentUs.ToString("F1", CultureInfo.InvariantCulture).PadLeft(14) +
+                        (incumbentUs / us).ToString("F2", CultureInfo.InvariantCulture).PadLeft(8) + "x" + (ok ? "" : "  FAIL"));
+                }
+            }
+        }
+    }
+
+    private static double[] Abs(double[] v)
+    {
+        var r = new double[v.Length];
+        for (int i = 0; i < v.Length; i++) r[i] = Math.Abs(v[i]);
+        return r;
+    }
+
+    // y = conv(x, w), dx = conv^T(dy, w), dw = correlation of dy with x, in fp64, by direct loops.
+    private static (double[] Y, double[] Dx, double[] Dw) ConvRef(float[] x, float[] w, float[] dy, int n, int c, int k,
+        int h, int wd, int kernel, int stride, int pad, int dilation, int oh, int ow)
+    {
+        var y = new double[n * k * oh * ow];
+        var dx = new double[x.Length];
+        var dw = new double[w.Length];
+        System.Threading.Tasks.Parallel.For(0, n * k, nk =>
+        {
+            int b = nk / k, o = nk % k;
+            for (int p = 0; p < oh; p++)
+            for (int q = 0; q < ow; q++)
+            {
+                double sum = 0;
+                for (int ci = 0; ci < c; ci++)
+                for (int r = 0; r < kernel; r++)
+                {
+                    int ih = p * stride - pad + r * dilation;
+                    if (ih < 0 || ih >= h) continue;
+                    for (int s = 0; s < kernel; s++)
+                    {
+                        int iw = q * stride - pad + s * dilation;
+                        if (iw < 0 || iw >= wd) continue;
+                        sum += (double)x[((b * c + ci) * h + ih) * wd + iw] * w[((o * c + ci) * kernel + r) * kernel + s];
+                    }
+                }
+                y[((b * k + o) * oh + p) * ow + q] = sum;
+            }
+        });
+        // dx and dw are scatters; partitioning by the written index keeps each thread's writes its own.
+        System.Threading.Tasks.Parallel.For(0, n * c, nc =>
+        {
+            int b = nc / c, ci = nc % c;
+            for (int o = 0; o < k; o++)
+            for (int p = 0; p < oh; p++)
+            for (int q = 0; q < ow; q++)
+            {
+                double g = dy[((b * k + o) * oh + p) * ow + q];
+                for (int r = 0; r < kernel; r++)
+                {
+                    int ih = p * stride - pad + r * dilation;
+                    if (ih < 0 || ih >= h) continue;
+                    for (int s = 0; s < kernel; s++)
+                    {
+                        int iw = q * stride - pad + s * dilation;
+                        if (iw < 0 || iw >= wd) continue;
+                        dx[((b * c + ci) * h + ih) * wd + iw] += g * w[((o * c + ci) * kernel + r) * kernel + s];
+                    }
+                }
+            }
+        });
+        System.Threading.Tasks.Parallel.For(0, k * c, kc =>
+        {
+            int o = kc / c, ci = kc % c;
+            for (int b = 0; b < n; b++)
+            for (int p = 0; p < oh; p++)
+            for (int q = 0; q < ow; q++)
+            {
+                double g = dy[((b * k + o) * oh + p) * ow + q];
+                for (int r = 0; r < kernel; r++)
+                {
+                    int ih = p * stride - pad + r * dilation;
+                    if (ih < 0 || ih >= h) continue;
+                    for (int s = 0; s < kernel; s++)
+                    {
+                        int iw = q * stride - pad + s * dilation;
+                        if (iw < 0 || iw >= wd) continue;
+                        dw[((o * c + ci) * kernel + r) * kernel + s] += g * x[((b * c + ci) * h + ih) * wd + iw];
+                    }
+                }
+            }
+        });
+        return (y, dx, dw);
+    }
+
     private static double AllocatedPerCall(Action call, Action sync)
     {
         call();
