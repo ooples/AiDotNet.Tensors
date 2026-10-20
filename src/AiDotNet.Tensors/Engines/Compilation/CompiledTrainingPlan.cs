@@ -627,9 +627,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     // Per step-I/O input: the staging slot the last replay that copied it read (what its device buffer holds), or -1.
     // A later replay whose host contents match that slot byte for byte skips the copy.
     private int[]? _stepIoCopiedSlot;
+    // Per step-I/O input: its storage version when its device buffer last matched it (copied or compared equal);
+    // int.MinValue before the first copy.
+    private int[]? _stepIoCopiedVersion;
 
     /// <summary>Step-I/O input copies replays have skipped because the input was unchanged (tests).</summary>
     internal long StepIoInputCopiesSkipped { get; private set; }
+
+    /// <summary>Of those, the device-resident inputs skipped on an unchanged storage version alone (tests).</summary>
+    internal long StepIoResidentCopiesSkipped { get; private set; }
     private bool _stepIoLossCaptured;   // the epilogue publishes the loss
     // The loss-gradient reseed (seed -> destination) the graph being captured makes in its step I/O prologue instead of
     // a copy node: the buffers handed to IGraphStepIo.TrySetPrologueCopy, or null.
@@ -723,6 +729,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         _stepIoBuffers = buffers.ToArray();
         _stepIoLaunched = 0;
         _stepIoCopiedSlot = Enumerable.Repeat(-1, leaves.Count).ToArray();
+        _stepIoCopiedVersion = Enumerable.Repeat(int.MinValue, leaves.Count).ToArray();
         return io;
     }
 
@@ -745,6 +752,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// host span advances neither the storage's GPU-cache epoch nor its device-valid flag.) The comparison reads what
     /// the copy into the staging would have; the device buffers are written only by these copies, or by uploads of the
     /// same host contents.
+    /// <para>A device-resident input whose storage version has not moved since its buffer last matched it skips the
+    /// comparison as well: its graph buffer is its own storage, and every write that changes a resident tensor bumps
+    /// the version (SetInputs bumps it after its unmarked copy). That makes the common parity loop - a batch uploaded
+    /// once - cost one integer compare per input instead of a host read of the whole batch.</para>
     /// </summary>
     private unsafe void LaunchStepGraphWithStepIo(Engines.DirectGpu.IGpuGraphCapture cb, IntPtr exec)
     {
@@ -753,11 +764,21 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         if (replay >= 2) io.WaitForReplays(replay - 1);   // slot replay % 2 was last read by replay - 2
         var leaves = _stepIoLeaves!;
         var copiedSlot = _stepIoCopiedSlot!;
+        var copiedVersion = _stepIoCopiedVersion!;
         int slot = (int)(replay & 1);
         uint copyMask = 0;
         for (int i = 0; i < leaves.Length; i++)
         {
             var leaf = leaves[i];
+            int version = leaf.GpuCacheVersion;
+            if (leaf.IsGpuResident && copiedSlot[i] >= 0 && copiedVersion[i] == version)
+            {
+                StepIoInputCopiesSkipped++;
+                StepIoResidentCopiesSkipped++;
+                leaf._gpuBufferVersion = version;
+                continue;
+            }
+            copiedVersion[i] = version;
             using var lease = leaf.LeaseArray();
             var data = new ReadOnlySpan<float>((float[])(object)lease.Array, 0, io.InputLength(i));
             int last = copiedSlot[i];
@@ -1829,6 +1850,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         using var srcKeep1 = new KeepAliveScope(src);
         using var dstKeep1 = new KeepAliveScope(dst);
         src.AsSpanUnmarked().CopyTo(dst.AsWritableSpanUnmarked());
+        // The unmarked span does not advance the version, and the step I/O skips re-staging a device-resident input whose
+        // version it has already matched - so without this bump a replay after a new SetInputs trains on the previous input.
+        dst.IncrementVersion();
     }
 
     internal void SetInput(Tensor<T> input)
@@ -1846,6 +1870,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         using var inputKeep1 = new KeepAliveScope(input);
         using var dstKeep2 = new KeepAliveScope(dst);
         input.AsSpanUnmarked().CopyTo(dst.AsWritableSpanUnmarked());
+        dst.IncrementVersion();   // see SetInputs: the step I/O skips a resident input whose version has not moved
     }
 
     private static void ValidateShapesMatch(Tensor<T> expected, Tensor<T> actual, string paramName)
