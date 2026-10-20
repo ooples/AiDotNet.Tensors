@@ -23,28 +23,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         [ThreadStatic] private static int t_unflushed;
         [ThreadStatic] private static int t_interval;
-        [ThreadStatic] private static int t_held;
 
         /// <summary>
         /// Counts one command submitted on this thread; true when the queue should be flushed now. The ramp advances
-        /// only on <see cref="OnFlushed"/>, so a flush that failed is due again at the next command. Never true while
-        /// <see cref="Hold"/> is in force.
+        /// only on <see cref="OnFlushed"/>, so a flush that failed is due again at the next command.
         /// </summary>
-        internal static bool OnSubmitted() => ++t_unflushed >= Math.Max(1, t_interval) && t_held == 0;
-
-        /// <summary>
-        /// Defers this thread's flushes until the matching <see cref="Release"/>, so commands enqueued in between
-        /// reach the device in one flush the caller makes (a resident program's chain). Nests.
-        /// </summary>
-        internal static void Hold() => t_held++;
-
-        /// <summary>Ends a <see cref="Hold"/>. A command enqueued while held is still counted: the next one after
-        /// the release flushes on the usual schedule unless the caller flushed.</summary>
-        internal static void Release()
-        {
-            if (t_held == 0) throw new InvalidOperationException("Release without a matching Hold.");
-            t_held--;
-        }
+        internal static bool OnSubmitted() => ++t_unflushed >= Math.Max(1, t_interval);
 
         /// <summary>The queue was flushed: the count restarts and the interval doubles, up to the cap.</summary>
         internal static void OnFlushed()

@@ -50,28 +50,6 @@ public class DirectOpenClFlushPolicyTests
         Assert.Equal(new[] { 2, 6 }, FlushPoints(6));
     }
 
-    // A resident program holds the policy while it enqueues its chain, then flushes once itself (#1449).
-    [Fact]
-    public void A_hold_defers_every_flush_until_it_is_released()
-    {
-        DirectOpenClFlushPolicy.OnHostWaited();
-        DirectOpenClFlushPolicy.Hold();
-        DirectOpenClFlushPolicy.Hold();   // holds nest
-        try
-        {
-            Assert.Empty(FlushPoints(40));
-            DirectOpenClFlushPolicy.Release();
-            Assert.False(DirectOpenClFlushPolicy.OnSubmitted());
-        }
-        finally
-        {
-            DirectOpenClFlushPolicy.Release();
-        }
-        // The held commands still counted: the first one after the release is past due.
-        Assert.True(DirectOpenClFlushPolicy.OnSubmitted());
-        Assert.Throws<System.InvalidOperationException>(() => DirectOpenClFlushPolicy.Release());
-    }
-
     [Fact]
     public void A_thread_that_never_waited_flushes_its_first_command()
     {

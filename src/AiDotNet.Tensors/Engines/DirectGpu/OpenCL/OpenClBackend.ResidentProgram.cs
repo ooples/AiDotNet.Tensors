@@ -4,10 +4,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 {
     // #1449: the resident program on OpenCL. OpenCL has no cooperative launch and no forward-progress guarantee across
     // work-groups, so a persistent kernel spinning on a grid barrier can deadlock when not every work-group is
-    // resident, and no OpenCL query proves they are. The chain is instead every stage enqueued on the in-order queue
-    // and handed to the device in ONE flush (the flush policy held meanwhile); the queue's order is the barrier.
-    // Separately, each stage is enqueued and flushed on its own. Both use ResidentProgramKernelTemplate's stage kernel,
-    // so the two give bit-identical results.
+    // resident, and no OpenCL query proves they are. A row-local chain is instead ONE kernel in which each work-group
+    // takes a row through every stage, with only work-group barriers (resident_rows); any other chain is its stages as
+    // ordinary commands on the in-order queue. Flushing every chain at once measured slower than leaving it to the
+    // flush policy (0.41-0.95x on an RX 5500 XT), so neither path forces a flush. Separately, each stage is enqueued
+    // and flushed on its own. The kernels share res_run_stage's per-element arithmetic, so all give bit-identical
+    // results.
     public sealed partial class OpenClBackend
     {
         private readonly object _residentProgramLock = new();
@@ -18,23 +20,26 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         internal bool SupportsResidentProgram => IsAvailable && EnsureResidentProgramKernel();
 
         /// <summary>
-        /// Runs <paramref name="stages"/> in order as one submission: every stage enqueued, then one flush. Returns
-        /// the number of stage dispatches enqueued (one per stage).
+        /// Runs <paramref name="stages"/> in order. A row-local chain (<see cref="ResidentProgramKernelTemplate.TryPlanRowProgram"/>)
+        /// is ONE kernel, each work-group taking a row through every stage; any other chain is its stages enqueued as
+        /// ordinary commands. Either way the flush policy decides when the queue is flushed, as for any op. Returns the
+        /// number of kernels enqueued.
         /// </summary>
         internal int RunResidentProgram(ReadOnlySpan<ResidentStage> stages)
         {
             ResidentProgramKernelTemplate.RequireChain(stages);
             var kernel = ResidentStageKernel();
-            DirectOpenClFlushPolicy.Hold();
-            try
+            if (ResidentProgramKernelTemplate.TryPlanRowProgram(stages, out var plan) && plan is not null)
             {
-                foreach (var stage in stages) EnqueueResidentStage(kernel, stage);
+                var rows = _kernelCache[ResidentProgramKernelTemplate.RowProgramKernel];
+                for (int i = 0; i < ResidentProgramKernelTemplate.MaxRowProgramBuffers; i++)
+                    rows.SetArg((uint)i, BufferHandle(i < plan.Buffers.Length ? plan.Buffers[i] : plan.Buffers[0]));
+                var p = plan.Parameters();
+                for (int i = 0; i < p.Length; i++) rows.SetArg((uint)(ResidentProgramKernelTemplate.MaxRowProgramBuffers + i), p[i]);
+                rows.Execute1D(plan.Groups * ResidentProgramKernelTemplate.GroupThreads, ResidentProgramKernelTemplate.GroupThreads);
+                return 1;
             }
-            finally
-            {
-                DirectOpenClFlushPolicy.Release();
-            }
-            FlushQueue();
+            foreach (var stage in stages) EnqueueResidentStage(kernel, stage);
             return stages.Length;
         }
 

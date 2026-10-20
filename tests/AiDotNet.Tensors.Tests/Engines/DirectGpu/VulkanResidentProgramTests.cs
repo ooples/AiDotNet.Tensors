@@ -16,7 +16,7 @@ public sealed class VulkanResidentProgramTests : ResidentProgramTestBase<VulkanB
         return backend;
     }
 
-    private protected override void RunResident(VulkanBackend backend, ResidentStage[] stages) => backend.RunResidentProgram(stages);
+    private protected override int RunResident(VulkanBackend backend, ResidentStage[] stages) => backend.RunResidentProgram(stages);
 
     private protected override void RunSeparately(VulkanBackend backend, ResidentStage[] stages) => backend.RunStagesSeparately(stages);
 

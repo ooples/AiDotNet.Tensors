@@ -3,9 +3,10 @@ using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 
-// #1448: the resident program on HIP, a port of CUDA's (CudaBackend.ResidentProgram.cs): a chain of declared stages
-// run by ONE persistent cooperative launch, every block walking the stage list with a grid barrier between stages.
-// HIP's cooperative launch guarantees the co-residency the spin-wait barrier needs. The kernels come from
+// #1448: the resident program on HIP. A row-local chain is ONE launch of resident_rows, each block taking a row through
+// every stage with only block barriers, so it needs no cooperative launch. Any other chain is a port of CUDA's
+// persistent kernel (CudaBackend.ResidentProgram.cs): every block walks the stage list with a grid barrier between
+// stages, which HIP's cooperative launch makes safe by guaranteeing co-residency. The kernels come from
 // ResidentProgramKernelTemplate; the parameter block is CUDA's ResidentProgramArgs, since the HIP kernel declares the
 // same struct.
 public sealed partial class HipBackend
@@ -16,8 +17,12 @@ public sealed partial class HipBackend
     private int _residentProgramBlocksPerCu;
     private readonly object _residentProgramLock = new object();
 
-    /// <summary>Whether this device can run a resident program (it needs a cooperative launch).</summary>
-    internal bool SupportsResidentProgram => IsAvailable && _supportsCooperativeLaunch;
+    /// <summary>Whether this device can run a resident program. A row-local chain needs nothing more than HIP; any other
+    /// chain uses the persistent kernel when <see cref="SupportsCooperativeResidentProgram"/>, else ordinary launches.</summary>
+    internal bool SupportsResidentProgram => IsAvailable;
+
+    /// <summary>Whether a chain that is not row-local can run as one persistent cooperative launch.</summary>
+    internal bool SupportsCooperativeResidentProgram => IsAvailable && _supportsCooperativeLaunch;
 
     /// <summary>
     /// Allocates the two-word grid barrier a resident program synchronizes on, zeroed; it stays valid across launches
@@ -26,13 +31,26 @@ public sealed partial class HipBackend
     internal IGpuBuffer AllocateResidentBarrier() => AllocateBuffer(2);
 
     /// <summary>
-    /// Runs <paramref name="stages"/> in order as ONE persistent cooperative launch, a grid barrier between stages.
-    /// Returns the grid it used.
+    /// Runs <paramref name="stages"/> in order as ONE launch: a row-local chain
+    /// (<see cref="ResidentProgramKernelTemplate.TryPlanRowProgram"/>) as resident_rows, each block taking a row
+    /// through every stage; any other chain as the persistent cooperative kernel, a grid barrier between stages, on
+    /// <paramref name="barrier"/>. Without a cooperative launch such a chain runs as one launch per stage. Returns the
+    /// number of launches.
     /// </summary>
     internal unsafe int RunResidentProgram(ReadOnlySpan<ResidentStage> stages, IGpuBuffer barrier)
     {
         ResidentProgramKernelTemplate.RequireChain(stages);
-        if (!SupportsResidentProgram) throw new NotSupportedException("A resident program needs a cooperative launch, which this device does not support.");
+        if (!SupportsResidentProgram) throw new GpuCapabilityUnavailableException("HIP is not available.");
+        if (ResidentProgramKernelTemplate.TryPlanRowProgram(stages, out var plan) && plan is not null)
+        {
+            LaunchRowProgram(plan);
+            return 1;
+        }
+        if (!SupportsCooperativeResidentProgram)
+        {
+            RunStagesSeparately(stages);
+            return stages.Length;
+        }
         if (barrier is null || barrier.Size < 2)
             throw new ArgumentException("The barrier must be the two-word buffer from AllocateResidentBarrier.", nameof(barrier));
         IntPtr kernel = ResidentKernel(ResidentProgramKernelTemplate.HipProgramKernel);
@@ -58,7 +76,22 @@ public sealed partial class HipBackend
         void** argv = stackalloc void*[1];
         argv[0] = &args;
         LaunchCooperativeKernel(kernel, (uint)grid, ResidentProgramKernelTemplate.GroupThreads, 0, argv);
-        return grid;
+        return 1;
+    }
+
+    private unsafe void LaunchRowProgram(ResidentProgramKernelTemplate.RowProgramPlan plan)
+    {
+        IntPtr kernel = ResidentKernel(ResidentProgramKernelTemplate.RowProgramKernel);
+        const int slots = ResidentProgramKernelTemplate.MaxRowProgramBuffers;
+        IntPtr* buffers = stackalloc IntPtr[slots];
+        for (int i = 0; i < slots; i++) buffers[i] = (i < plan.Buffers.Length ? plan.Buffers[i] : plan.Buffers[0]).Handle;
+        int* p = stackalloc int[4 + ResidentProgramKernelTemplate.MaxStages];
+        var parameters = plan.Parameters();
+        for (int i = 0; i < parameters.Length; i++) p[i] = parameters[i];
+        void** argv = stackalloc void*[slots + 4 + ResidentProgramKernelTemplate.MaxStages];
+        for (int i = 0; i < slots; i++) argv[i] = &buffers[i];
+        for (int i = 0; i < parameters.Length; i++) argv[slots + i] = &p[i];
+        LaunchKernel(kernel, (uint)plan.Groups, ResidentProgramKernelTemplate.GroupThreads, argv);
     }
 
     /// <summary>The same stages, one ordinary launch each (the comparison a resident program is measured against).</summary>

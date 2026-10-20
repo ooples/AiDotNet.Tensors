@@ -4,14 +4,16 @@ using System.Collections.Generic;
 namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
 // #1452: the resident program on WebGPU. WebGPU has no cooperative launch, no cross-workgroup barrier and no
-// forward-progress guarantee, so the chain is every stage dispatch in ONE compute pass of one command encoder,
-// submitted once (dispatchComputeChainWithUniforms): WebGPU orders a pass's dispatches with implicit storage barriers.
+// forward-progress guarantee. A row-local chain is ONE dispatch of resident_rows, each workgroup taking a row through
+// every stage with workgroup barriers; any other chain is every stage dispatch in ONE compute pass of one command
+// encoder, submitted once (dispatchComputeChainWithUniforms): WebGPU orders a pass's dispatches.
 // Separately, each stage is its own pass and submission (the backend's usual dispatch). Both run
 // ResidentProgramKernelTemplate's stage shader, so the two give bit-identical results. Like the backend's other
 // synchronous capabilities, both wait for their submissions.
 public sealed partial class WebGpuBackend
 {
     private const string ResidentProgramModuleKey = "ResidentProgram:stage";
+    private const string ResidentRowModuleKey = "ResidentProgram:rows:";
     private static readonly string ResidentStageShader = ResidentProgramKernelTemplate.GetModuleSource(ResidentKernelDialect.Wgsl);
     private bool? _residentProgramReady;
     private string? _residentProgramError;
@@ -49,8 +51,8 @@ public sealed partial class WebGpuBackend
     }
 
     /// <summary>
-    /// Runs <paramref name="stages"/> in order as one compute pass and one submission, which this call waits for.
-    /// Returns the number of stage dispatches encoded.
+    /// Runs <paramref name="stages"/> in order as one submission, which this call waits for: one dispatch for a
+    /// row-local chain, one per stage in one compute pass otherwise. Returns the number of dispatches.
     /// </summary>
     internal int RunResidentProgram(ReadOnlySpan<ResidentStage> stages)
     {
@@ -58,7 +60,7 @@ public sealed partial class WebGpuBackend
         RequireResidentProgram();
         var copy = stages.ToArray();
         RunResidentProgramAsync(copy).GetAwaiter().GetResult();
-        return copy.Length;
+        return ResidentProgramKernelTemplate.TryPlanRowProgram(copy, out _) ? 1 : copy.Length;
     }
 
     /// <summary>The same stages, each its own pass and submission (what a resident program is measured against).</summary>
@@ -71,6 +73,20 @@ public sealed partial class WebGpuBackend
 
     private async Task RunResidentProgramAsync(ResidentStage[] stages)
     {
+        if (ResidentProgramKernelTemplate.TryPlanRowProgram(stages, out var plan) && plan is not null)
+        {
+            // Each distinct buffer is bound once, read-write (the shader indexes them by slot): no buffer appears in
+            // two bindings, so WebGpuBindGroup takes no snapshot and nothing aliases a writable binding.
+            int rowsPipe = await GetOrCreatePipelineAsync(ResidentRowModuleKey + plan.Buffers.Length,
+                ResidentProgramKernelTemplate.GetRowProgramShader(ResidentKernelDialect.Wgsl, plan.Buffers.Length), "main");
+            var bound = new WebGpuBuffer[plan.Buffers.Length];
+            for (int i = 0; i < bound.Length; i++) bound[i] = AsWgpu(plan.Buffers[i]);
+            using var uniforms = new WebGpuBuffer(UniformInts(plan.Parameters()), WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+            using var bind = new WebGpuBindGroup(rowsPipe, bound);
+            await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(rowsPipe, bind.BindGroupId, uniforms.BufferId, plan.Groups, 1, 1);
+            await WebGpuNativeBindings.SubmitAndWaitAsync();
+            return;
+        }
         int pipe = await ResidentStagePipelineAsync();
         var held = new List<IDisposable>(2 * stages.Length);
         try
@@ -81,7 +97,7 @@ public sealed partial class WebGpuBackend
             var workgroups = new int[stages.Length];
             for (int i = 0; i < stages.Length; i++)
             {
-                var (bind, u) = BindResidentStage(pipe, stages[i]);
+                var (bind, u) = BindResidentStage(pipe, stages[i], stages.AsSpan(0, i));
                 held.Add(bind); held.Add(u);
                 pipelines[i] = pipe; groups[i] = bind.BindGroupId; uniforms[i] = u.BufferId;
                 workgroups[i] = ResidentProgramKernelTemplate.GroupsFor(stages[i]);
@@ -100,7 +116,8 @@ public sealed partial class WebGpuBackend
         int pipe = await ResidentStagePipelineAsync();
         foreach (var stage in stages)
         {
-            var (bind, u) = BindResidentStage(pipe, stage);
+            // Each group is created just before its own dispatch, after the stages before it ran: nothing is stale.
+            var (bind, u) = BindResidentStage(pipe, stage, ReadOnlySpan<ResidentStage>.Empty);
             using (bind)
             using (u)
             {
@@ -133,19 +150,26 @@ public sealed partial class WebGpuBackend
         }
     }
 
-    private (WebGpuBindGroup Bind, WebGpuBuffer Uniforms) BindResidentStage(int pipe, in ResidentStage s)
+    private (WebGpuBindGroup Bind, WebGpuBuffer Uniforms) BindResidentStage(int pipe, in ResidentStage s,
+        ReadOnlySpan<ResidentStage> runBefore)
     {
-        // Every bind group of a chain is created before its first dispatch runs, so a buffer bound twice would be
-        // read through a stale snapshot (above); and a dispatch may not bind one buffer as both a read and a writable
-        // storage binding. Both are refused.
+        // A dispatch may not bind one buffer as both a read and a writable storage binding, so an output that is also
+        // an input is refused. A read operand bound twice is replaced by a snapshot when the group is created (above);
+        // in a one-pass chain every group exists before the first dispatch, so that is refused only when a stage in
+        // runBefore writes the buffer (the snapshot would hold its value from before the chain).
         var a = AsWgpu(s.A);
         var b = s.B is null ? ResidentUnusedOperand : AsWgpu(s.B);
         var c = s.C is null ? AsWgpu(SharedDummyBuffer) : AsWgpu(s.C);
         var o = AsWgpu(s.Output);
         if (SameBinding(o, a) || SameBinding(o, b) || SameBinding(o, c))
             throw new ArgumentException($"{s.Op}: on WebGPU a stage's output must be a different buffer from its inputs.");
-        if (SameBinding(a, b) || SameBinding(a, c) || SameBinding(b, c))
-            throw new ArgumentException($"{s.Op}: on WebGPU a stage's operands must be different buffers.");
+        foreach (var (x, y) in new[] { (a, b), (a, c), (b, c) })
+        {
+            if (!SameBinding(x, y)) continue;
+            foreach (var earlier in runBefore)
+                if (SameBinding(AsWgpu(earlier.Output), x))
+                    throw new ArgumentException($"{s.Op}: on WebGPU a stage may not repeat an operand that an earlier stage of the chain writes.");
+        }
         var uniforms = new WebGpuBuffer(UniformInts((int)s.Op, s.Rows, s.Cols, 0), WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
         try
         {

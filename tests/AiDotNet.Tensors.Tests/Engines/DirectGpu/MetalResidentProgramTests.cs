@@ -22,7 +22,7 @@ public sealed class MetalResidentProgramTests : ResidentProgramTestBase<MetalBac
         return backend;
     }
 
-    private protected override void RunResident(MetalBackend backend, ResidentStage[] stages) => backend.RunResidentProgram(stages);
+    private protected override int RunResident(MetalBackend backend, ResidentStage[] stages) => backend.RunResidentProgram(stages);
 
     private protected override void RunSeparately(MetalBackend backend, ResidentStage[] stages) => backend.RunStagesSeparately(stages);
 }

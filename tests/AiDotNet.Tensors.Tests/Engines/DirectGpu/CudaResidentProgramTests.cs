@@ -28,10 +28,13 @@ public sealed class CudaResidentProgramTests : ResidentProgramTestBase<CudaBacke
         return backend;
     }
 
-    private protected override void RunResident(CudaBackend backend, ResidentStage[] stages)
+    private protected override int RunResident(CudaBackend backend, ResidentStage[] stages)
         => backend.RunResidentProgram(stages, _barrier ?? throw new InvalidOperationException("No barrier allocated."));
 
     private protected override void RunSeparately(CudaBackend backend, ResidentStage[] stages) => backend.RunStagesSeparately(stages);
+
+    // CUDA keeps its persistent grid-barrier program for every chain (and returns its grid, not a launch count).
+    private protected override bool HasRowProgram => false;
 
     private protected override void ReleaseBackend(CudaBackend backend)
     {

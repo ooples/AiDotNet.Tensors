@@ -19,7 +19,7 @@ public sealed class OpenClResidentProgramTests : ResidentProgramTestBase<OpenClB
         return backend;
     }
 
-    private protected override void RunResident(OpenClBackend backend, ResidentStage[] stages) => backend.RunResidentProgram(stages);
+    private protected override int RunResident(OpenClBackend backend, ResidentStage[] stages) => backend.RunResidentProgram(stages);
 
     private protected override void RunSeparately(OpenClBackend backend, ResidentStage[] stages) => backend.RunStagesSeparately(stages);
 }

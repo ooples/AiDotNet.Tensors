@@ -67,9 +67,9 @@ jobs:
           # optimizer storage) run nowhere else in CI: the coverage job has no GPU. This shard runs them on POCL and
           # uploads their coverage, so codecov measures them instead of reporting them as missed.
           - { name: resident-training, coverage: true, filter: "FullyQualifiedName~ResidentCompiledStepTests|FullyQualifiedName~GradientClippingStorageContractTests|FullyQualifiedName~CompiledOptimizerParameterViewTests|FullyQualifiedName~Fp16FullyResidentTrainingTests|FullyQualifiedName~FullParamResidentTrainingReproTests|FullyQualifiedName~GpuOptimizerStorageEpochTests|FullyQualifiedName~ConfigureOptimizerParamUpdateTests|FullyQualifiedName~ResidentWeightInvalidationDeviceStateTests|FullyQualifiedName~GpuReductionResidencyTests|FullyQualifiedName~AMSGradPaperModeTests|FullyQualifiedName~AMSGradDecoupledWeightDecayTests|FullyQualifiedName~GpuReshapeAliasAndLinearBackwardTests" }
-          # The resident program on OpenCL (#1449): every stage enqueued and flushed once, against a double-precision
+          # The resident program on OpenCL (#1449): a row-local chain as one kernel, any other as ordinary enqueues, against a double-precision
           # reference. Metal's runs on metal.yml; Vulkan, WebGPU (Dawn) and HIP have no CI device.
-          - { name: resident-program, coverage: true, filter: "FullyQualifiedName~OpenClResidentProgramTests|FullyQualifiedName~DirectOpenClFlushPolicyTests" }
+          - { name: resident-program, coverage: true, filter: "FullyQualifiedName~OpenClResidentProgramTests" }
           - { name: op-forward-1, filter: "FullyQualifiedName~Engines.OpParity.OpParityTests", shard: "1/6" }
           - { name: op-forward-2, filter: "FullyQualifiedName~Engines.OpParity.OpParityTests", shard: "2/6" }
           - { name: op-forward-3, filter: "FullyQualifiedName~Engines.OpParity.OpParityTests", shard: "3/6" }

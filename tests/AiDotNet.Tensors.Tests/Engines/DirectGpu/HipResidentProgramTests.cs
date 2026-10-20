@@ -23,12 +23,12 @@ public sealed class HipResidentProgramTests : ResidentProgramTestBase<HipBackend
     private protected override HipBackend RequireBackend()
     {
         var backend = _fixture.Backend;
-        Skip.IfNot(backend.IsAvailable && backend.SupportsResidentProgram, "HIP with cooperative launch is not available.");
+        Skip.IfNot(backend.IsAvailable && backend.SupportsResidentProgram, "HIP is not available.");
         _barrier = backend.AllocateResidentBarrier();
         return backend;
     }
 
-    private protected override void RunResident(HipBackend backend, ResidentStage[] stages)
+    private protected override int RunResident(HipBackend backend, ResidentStage[] stages)
         => backend.RunResidentProgram(stages, _barrier ?? throw new InvalidOperationException("No barrier allocated."));
 
     private protected override void RunSeparately(HipBackend backend, ResidentStage[] stages) => backend.RunStagesSeparately(stages);
@@ -40,14 +40,16 @@ public sealed class HipResidentProgramTests : ResidentProgramTestBase<HipBackend
         _barrier = null;
     }
 
+    // Only a chain that is not row-local takes the cooperative grid-barrier program.
     [SkippableFact]
     public void OneBarrier_ReturnsToZeroAcrossManyLaunches()
     {
         var backend = RequireBackend();
         try
         {
+            Skip.IfNot(backend.SupportsCooperativeResidentProgram, "HIP cooperative launch is not available.");
             using var chain = new Chain(backend, 128, 512, 11);
-            for (int i = 0; i < 300; i++) { chain.Poison(); RunResident(backend, chain.Stages); }
+            for (int i = 0; i < 300; i++) { chain.Poison(); Assert.Equal(1, RunResident(backend, chain.StagesNotRowLocal)); }
             chain.Download();
             var counts = backend.DownloadBuffer(_barrier ?? throw new InvalidOperationException("No barrier allocated."));
             Assert.Equal(0f, counts[0]);   // the arrival count (read as float bits: zero is zero)
