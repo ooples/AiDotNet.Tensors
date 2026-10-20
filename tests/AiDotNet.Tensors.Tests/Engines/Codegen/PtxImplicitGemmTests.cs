@@ -109,6 +109,99 @@ public class PtxImplicitGemmTests
         Assert.Equal((uint)(2 * ((8 * 28 * 28 + 127) / 128)), emitter.LaunchBlocks);
     }
 
+    /// <summary>
+    /// The affine planner declines a split once the output alone fills the device at one thread per
+    /// output; the tiled planner still splits, on the largest reduction axis the factor divides
+    /// (c = 64 here, not the taps), and the partial is an implicit GEMM with that chunk as a batch slice.
+    /// </summary>
+    [Fact]
+    public void ATiledSplitExistsWhereTheAffinePlannerDeclines()
+    {
+        var spec = CodegenKernelCatalog.Conv2D(8, 64, 128, 56, 56, 3, 2, 1, 1, 1, epilogue: true);
+        Assert.Null(CodegenSplitReduction.TryPlanChunked(spec, 4));
+
+        var plan = CodegenSplitReduction.TryPlanChunkedForTiles(spec, 4);
+        Assert.NotNull(plan);
+        Assert.Equal(new[] { 4 }, plan!.PromotedAxes);   // n, k, oh, ow, then c
+        Assert.Equal(spec.Output.ElementCount * 4, plan.TempElements);
+        var roles = PtxAffineEmitter.PlanImplicitGemm(plan.Partial, out string reason);
+        Assert.True(roles.HasValue, reason);
+        Assert.Single(roles!.Value.Batch);
+
+        Assert.Null(CodegenSplitReduction.TryPlanChunkedForTiles(spec, 7));   // divides neither 64 nor 3
+        Assert.Null(CodegenSplitReduction.TryPlanChunkedForTiles(spec, 1));
+    }
+
+    /// <summary>The implicit-GEMM partial and the affine combine reproduce the unsplit result on device,
+    /// with ragged tiles and the epilogue moved into the combine.</summary>
+    [SkippableTheory]
+    [InlineData(0, 2, 64, 0)]
+    [InlineData(0, 2, 64, 128)]
+    [InlineData(4, 2, 64, 0)]
+    [InlineData(4, 2, 64, 128)]
+    public unsafe void AnImplicitGemmSplitMatchesTheInterpreterOnDevice(int shape, int factor, int tile, int tileM)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Direct PTX runtime is unavailable.");
+        var spec = Shape(shape);
+        double[][] inputs = CreateInputs(spec, out var host);
+        double[] expected = spec.Interpret(inputs);
+        var plan = CodegenSplitReduction.TryPlanChunkedForTiles(spec, factor);
+        Assert.NotNull(plan);
+
+        using var runtime = new DirectPtxRuntime();
+        var partial = new PtxAffineEmitter { ImplicitGemm = true, ImplicitGemmTile = tile, ImplicitGemmTileM = tileM };
+        string partialPtx = partial.Emit(plan!.Partial, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+        Assert.StartsWith("implicit-gemm", partial.TileDescription, StringComparison.Ordinal);
+        var combine = new PtxAffineEmitter();
+        string combinePtx = combine.Emit(plan.Combine, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+        using var partialModule = runtime.LoadModule(partialPtx, allowExperimentalJitFallback: true);
+        using var combineModule = runtime.LoadModule(combinePtx, allowExperimentalJitFallback: true);
+
+        var buffers = new DirectPtxBuffer[host.Length];
+        try
+        {
+            for (int i = 0; i < host.Length; i++)
+            {
+                buffers[i] = runtime.AllocateBytes((nuint)(host[i].Length * sizeof(float)));
+                buffers[i].Upload<float>(host[i]);
+            }
+            using var temporary = runtime.AllocateBytes((nuint)(plan.TempElements * sizeof(float)));
+            using var output = runtime.AllocateBytes((nuint)(expected.Length * sizeof(float)));
+            int[] partialSources = CodegenSplitReduction.PartialOperandSources(spec);
+            Assert.Equal(2, partialSources.Length);
+            LaunchThree(partialModule, partialModule.GetFunction(plan.Partial.Name, out _),
+                buffers[partialSources[0]].Pointer, buffers[partialSources[1]].Pointer, temporary.Pointer,
+                partial.LaunchBlocks, checked((uint)partial.LaunchBlockThreads), 1);
+            int[] combineSources = CodegenSplitReduction.CombineOperandSources(spec);
+            IntPtr combineFunction = combineModule.GetFunction(plan.Combine.Name, out _);
+            uint blocks = combine.LaunchBlocks, blockX = checked((uint)combine.LaunchBlockX),
+                blockY = checked((uint)combine.LaunchBlockY);
+            if (combineSources.Length == 0)
+            {
+                IntPtr p0 = temporary.Pointer, p1 = output.Pointer;
+                void** arguments = stackalloc void*[2];
+                arguments[0] = &p0;
+                arguments[1] = &p1;
+                combineModule.Launch(combineFunction, blocks, 1, 1, blockX, blockY, 1, 0, arguments);
+            }
+            else
+            {
+                Assert.Single(combineSources);   // the bias
+                LaunchThree(combineModule, combineFunction, temporary.Pointer, buffers[combineSources[0]].Pointer,
+                    output.Pointer, blocks, blockX, blockY);
+            }
+            runtime.Synchronize();
+            var actual = new float[expected.Length];
+            output.Download<float>(actual);
+            AssertClose(expected, actual, 1e-5, partial.TileDescription + " split " + factor + " on shape " + shape,
+                relative: true);
+        }
+        finally
+        {
+            foreach (var buffer in buffers) buffer?.Dispose();
+        }
+    }
+
     public static TheoryData<int, int, int> TileShapes => new()
     {
         // (shape, ImplicitGemmTile, ImplicitGemmTileM)
