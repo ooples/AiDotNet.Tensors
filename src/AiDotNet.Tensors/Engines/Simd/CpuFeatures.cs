@@ -23,7 +23,6 @@ internal static class CpuFeatures
     private static bool _isAMD;
     private static bool _hasAVX2;
     private static bool _hasFMA;
-    private static bool _hasFastGather;
     private static bool _hasAVX512F;
     private static bool _hasAVX512BW;
     private static bool _hasAVX512DQ;
@@ -31,14 +30,11 @@ internal static class CpuFeatures
     private static bool _hasAMXTile;
 #pragma warning restore CS0649 // Intel: yes, AMD Zen 1-4: no
 
-    /// <summary>True if CPU is Intel (fast gather, moderate divide).</summary>
+    /// <summary>True if CPU is Intel (moderate divide).</summary>
     internal static bool IsIntel { get { EnsureDetected(); return _isIntel; } }
 
-    /// <summary>True if CPU is AMD (slow gather, prefer polynomial paths).</summary>
+    /// <summary>True if CPU is AMD (slow divide).</summary>
     internal static bool IsAMD { get { EnsureDetected(); return _isAMD; } }
-
-    /// <summary>True if vpgatherdd is fast (&lt;8 cycles). Intel: yes, AMD Zen: no.</summary>
-    internal static bool HasFastGather { get { EnsureDetected(); return _hasFastGather; } }
 
     /// <summary>True if AVX2 is supported.</summary>
     internal static bool HasAVX2 { get { EnsureDetected(); return _hasAVX2; } }
@@ -127,7 +123,6 @@ internal static class CpuFeatures
                 || cpuInfo.Contains("GenuineIntel", StringComparison.OrdinalIgnoreCase))
             {
                 _isIntel = true;
-                _hasFastGather = true;
             }
             else if (cpuInfo.Contains("AMD", StringComparison.OrdinalIgnoreCase)
                   || cpuInfo.Contains("AuthenticAMD", StringComparison.OrdinalIgnoreCase)
@@ -135,17 +130,11 @@ internal static class CpuFeatures
                   || cpuInfo.Contains("EPYC", StringComparison.OrdinalIgnoreCase))
             {
                 _isAMD = true;
-                _hasFastGather = false; // Zen 1-4 all have slow gather
-            }
-            else
-            {
-                // Unknown — assume conservative (no fast gather)
-                _hasFastGather = false;
             }
         }
         catch
         {
-            _hasFastGather = false;
+            // Vendor unknown: no kernel depends on it.
         }
 #endif
         _detected = true;
