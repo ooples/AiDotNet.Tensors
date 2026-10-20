@@ -51,6 +51,11 @@ public sealed partial class CudaBackend
         if (stages.Length > CudaResidentProgramKernels.MaxStages)
             throw new ArgumentException($"A resident program holds at most {CudaResidentProgramKernels.MaxStages} stages.", nameof(stages));
         if (!SupportsResidentProgram) throw new NotSupportedException("A resident program needs a cooperative launch, which this device does not support.");
+        // A row-local chain is ONE launch of resident_rows, each block taking a row through every stage with only
+        // block barriers: no grid barrier, and nothing to wait for between rows. A chain that is not row-local, or a
+        // device whose NVRTC rejects that module, takes the persistent kernel below.
+        if (ResidentProgramKernelTemplate.TryPlanRowProgram(stages, out var plan) && plan is not null && TryLaunchRowProgram(plan))
+            return 1;
         if (barrier is null || barrier.Size < 2)
             throw new ArgumentException("The barrier must be the two-word buffer from AllocateResidentBarrier.", nameof(barrier));
         IntPtr kernel = ResidentKernel(CudaResidentProgramKernels.ProgramKernel);
@@ -93,6 +98,49 @@ public sealed partial class CudaBackend
             a = ToArgs(stage);
             LaunchKernelWithSharedMem(kernel, (uint)BlocksFor(stage), CudaResidentProgramKernels.BlockThreads, 0, argv);
         }
+    }
+
+    private IntPtr _residentRowsModule;
+    private bool _residentRowsTried;
+
+    // resident_rows from ResidentProgramKernelTemplate (its HIP form is valid CUDA C++), in a module of its own so
+    // its names cannot meet CudaResidentProgramKernels'. False, with nothing launched, when the module does not
+    // compile; the caller then runs the persistent kernel.
+    private unsafe bool TryLaunchRowProgram(ResidentProgramKernelTemplate.RowProgramPlan plan)
+    {
+        IntPtr kernel;
+        lock (_residentProgramLock)
+        {
+            if (!_residentRowsTried)
+            {
+                _residentRowsTried = true;
+                try
+                {
+                    using var ctx = PushContext();
+                    _residentRowsModule = CompileKernelModule(_cuDevice,
+                        ResidentProgramKernelTemplate.GetModuleSource(ResidentKernelDialect.Hip, rowKernelOnly: true),
+                        "resident_rows", new[] { ResidentProgramKernelTemplate.RowProgramKernel }, useFastMath: false);
+                }
+                catch (Exception ex) when (ex is not OutOfMemoryException)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"CUDA resident_rows unavailable, using the persistent kernel: {ex.Message}");
+                }
+            }
+            if (_residentRowsModule == IntPtr.Zero || !_kernelCache.TryGetValue(ResidentProgramKernelTemplate.RowProgramKernel, out kernel))
+                return false;
+        }
+        const int slots = ResidentProgramKernelTemplate.MaxRowProgramBuffers;
+        IntPtr* buffers = stackalloc IntPtr[slots];
+        for (int i = 0; i < slots; i++) buffers[i] = (i < plan.Buffers.Length ? plan.Buffers[i] : plan.Buffers[0]).Handle;
+        var parameters = plan.Parameters();
+        int* p = stackalloc int[parameters.Length];
+        for (int i = 0; i < parameters.Length; i++) p[i] = parameters[i];
+        void** argv = stackalloc void*[slots + parameters.Length];
+        for (int i = 0; i < slots; i++) argv[i] = &buffers[i];
+        for (int i = 0; i < parameters.Length; i++) argv[slots + i] = &p[i];
+        using var _ = PushContext();
+        LaunchKernelWithSharedMem(kernel, (uint)plan.Groups, (uint)ResidentProgramKernelTemplate.GroupThreads, 0, argv);
+        return true;
     }
 
     private static int BlocksFor(in ResidentStage s)

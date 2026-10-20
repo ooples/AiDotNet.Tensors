@@ -459,7 +459,10 @@ fn main(@builtin(local_invocation_id) l : vec3<u32>, @builtin(workgroup_id) wg :
     /// Parameters: buffers <c>a, b, c, o</c> then ints <c>op, rows, cols</c>; Metal binds them at indices 0-3 and
     /// 4-6.
     /// </summary>
-    internal static string GetModuleSource(ResidentKernelDialect dialect)
+    /// <para>With <paramref name="rowKernelOnly"/> the module defines only <see cref="RowProgramKernel"/> (its HIP form is
+    /// also valid CUDA C++): CUDA compiles it beside its own stage and program kernels, which share their names with
+    /// HIP's.</para>
+    internal static string GetModuleSource(ResidentKernelDialect dialect, bool rowKernelOnly = false)
     {
         if (dialect == ResidentKernelDialect.Glsl) return GlslSource;
         if (dialect == ResidentKernelDialect.Wgsl) return WgslSource;
@@ -534,7 +537,7 @@ fn main(@builtin(local_invocation_id) l : vec3<u32>, @builtin(workgroup_id) wg :
     }
 }
 ");
-        switch (dialect)
+        if (!rowKernelOnly) switch (dialect)
         {
             case ResidentKernelDialect.OpenCl:
                 sb.Append(@"

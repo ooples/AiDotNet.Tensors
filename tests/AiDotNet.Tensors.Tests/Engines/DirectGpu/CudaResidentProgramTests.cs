@@ -7,8 +7,8 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 /// <summary>
-/// #890 phase 3: the resident program (<see cref="CudaBackend.RunResidentProgram"/>) runs a declared chain as one
-/// persistent cooperative launch with a grid barrier between stages (<see cref="ResidentProgramTestBase{TBackend}"/>
+/// #890 phase 3: the resident program (<see cref="CudaBackend.RunResidentProgram"/>) runs a row-local chain as one launch
+/// of resident_rows and any other chain as one persistent cooperative launch with a grid barrier between stages (<see cref="ResidentProgramTestBase{TBackend}"/>
 /// holds the shared tests). Here also: one barrier stays correct launch after launch, since it resets itself.
 /// </summary>
 [Collection("DirectGpuSerial")]
@@ -33,9 +33,6 @@ public sealed class CudaResidentProgramTests : ResidentProgramTestBase<CudaBacke
 
     private protected override void RunSeparately(CudaBackend backend, ResidentStage[] stages) => backend.RunStagesSeparately(stages);
 
-    // CUDA keeps its persistent grid-barrier program for every chain (and returns its grid, not a launch count).
-    private protected override bool HasRowProgram => false;
-
     private protected override void ReleaseBackend(CudaBackend backend)
     {
         _barrier?.Dispose();
@@ -52,7 +49,8 @@ public sealed class CudaResidentProgramTests : ResidentProgramTestBase<CudaBacke
         try
         {
             using var chain = new Chain(backend, 128, 512, 11);
-            for (int i = 0; i < 300; i++) { chain.Poison(); RunResident(backend, chain.Stages); }
+            // Only a chain that is not row-local takes the persistent grid-barrier program.
+            for (int i = 0; i < 300; i++) { chain.Poison(); RunResident(backend, chain.StagesNotRowLocal); }
             chain.Download();
             var counts = backend.DownloadBuffer(_barrier ?? throw new InvalidOperationException("No barrier allocated."));
             Assert.Equal(0f, counts[0]);   // the arrival count (read as float bits: zero is zero)

@@ -18580,6 +18580,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             }
         }
 
+        if (_residentRowsModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_residentRowsModule);
+            _residentRowsModule = IntPtr.Zero;
+        }
         if (_residentProgramModule != IntPtr.Zero)
         {
             CudaNativeBindings.cuModuleUnload(_residentProgramModule);
