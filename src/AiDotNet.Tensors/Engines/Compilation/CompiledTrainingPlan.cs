@@ -444,6 +444,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// <summary>Test hook: the next capture attempt runs the pre-pass and then fails, like a capture-unsafe op.</summary>
     internal bool FailNextCaptureForTesting { get; set; }
 
+    /// <summary>
+    /// Test hook: runs once per step-I/O replay after its copy mask is submitted and before the graph launches, with the
+    /// staging slot the replay reads and the mask. Writing a clear-bit input's staging here cannot change what the replay
+    /// trains on unless the prologue copies inputs the mask left out.
+    /// </summary>
+    internal Action<Engines.DirectGpu.IGraphStepIo, int, uint>? AfterStepIoMaskForTesting { get; set; }
+
     /// <summary>Test hook: the next capture fails from INSIDE the captured body, after its forward and backward ran.</summary>
     internal bool FailInsideNextCaptureForTesting { get; set; }
 
@@ -764,6 +771,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             leaf._gpuBufferVersion = leaf.GpuCacheVersion;
         }
         io.SetInputsToCopy(replay, copyMask);
+        AfterStepIoMaskForTesting?.Invoke(io, slot, copyMask);
         if (_capturedOptimizer is { } optimizer)
         {
             // The device's applied count when this replay runs is between what the last completed replay published

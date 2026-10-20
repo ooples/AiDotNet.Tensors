@@ -68,9 +68,15 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     /// </summary>
     private static void FeedBatch(Tensor<float> x, Tensor<float> y, int step)
     {
-        Rand(x.Shape.ToArray(), 100 + step, 1f).AsSpan().CopyTo(x.AsWritableSpan());
-        Rand(y.Shape.ToArray(), 200 + step, 1f).AsSpan().CopyTo(y.AsWritableSpan());
+        FeedInput(x, step);
+        FeedTarget(y, step);
     }
+
+    private static void FeedInput(Tensor<float> x, int step) =>
+        Rand(x.Shape.ToArray(), 100 + step, 1f).AsSpan().CopyTo(x.AsWritableSpan());
+
+    private static void FeedTarget(Tensor<float> y, int step) =>
+        Rand(y.Shape.ToArray(), 200 + step, 1f).AsSpan().CopyTo(y.AsWritableSpan());
 
     private sealed class Run
     {
@@ -90,11 +96,12 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         public int CheckpointStep;   // the step count an optimizer checkpoint (export / save) records
         public bool ReplayedParityGraphs;   // two step graphs alternated (the ping-pong SGD update)
         public float[][] WeightsAfterDispose = Array.Empty<float[]>();
-        public bool PoisonedStaging;   // the step I/O staging of every input was overwritten with NaN mid-run
+        public int PoisonedSkippedCopies;   // clear-mask inputs whose replay staging was overwritten with NaN after the mask was submitted
+        public int MixedMaskReplays;   // replays whose copy mask held some inputs but not all
         public long InputCopiesSkipped;   // replays' skipped input copies (unchanged inputs)
     }
 
-    private static Run Train(DirectGpuTensorEngine gpu, bool capture, bool failCapture = false, bool composedMse = false, bool failInsideCapture = false, bool releasedInputBinding = false, bool retireGraphBeforeLastRead = false, bool droppedTargetBinding = false, int nonFiniteStep = -1, double maxGradNorm = 0, int clipOffFromStep = int.MaxValue, LrSchedule? schedule = null, OptimizerType optimizer = OptimizerType.Adam, int clipOnFromStep = int.MaxValue, bool pingPong = true, int feedEvery = 1, int poisonStagingFromStep = int.MaxValue)
+    private static Run Train(DirectGpuTensorEngine gpu, bool capture, bool failCapture = false, bool composedMse = false, bool failInsideCapture = false, bool releasedInputBinding = false, bool retireGraphBeforeLastRead = false, bool droppedTargetBinding = false, int nonFiniteStep = -1, double maxGradNorm = 0, int clipOffFromStep = int.MaxValue, LrSchedule? schedule = null, OptimizerType optimizer = OptimizerType.Adam, int clipOnFromStep = int.MaxValue, bool pingPong = true, int feedEvery = 1, int feedTargetEvery = 0, bool poisonSkippedStaging = false)
     {
         var x = Rand([Batch, Inputs], 1, 1f);
         var y = Rand([Batch, Outputs], 2, 1f);
@@ -138,21 +145,25 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             float[][] lastGradients = Array.Empty<float[]>();
             var states = new string[Steps];
             var run = new Run();
+            // After the mask is submitted the replay's slot is free (the replay that last read it has completed) and the
+            // host writes no more of it: NaN in a clear-bit input's staging reaches training only if the prologue copies it.
+            concrete.AfterStepIoMaskForTesting = (io, slot, mask) =>
+            {
+                uint all = io.InputCount >= 32 ? uint.MaxValue : (1u << io.InputCount) - 1;
+                if (mask != 0 && mask != all) run.MixedMaskReplays++;
+                if (!poisonSkippedStaging) return;
+                for (int i = 0; i < io.InputCount; i++)
+                {
+                    if ((mask & (1u << i)) != 0) continue;
+                    unsafe { new Span<float>((void*)io.InputStaging(i, slot), io.InputLength(i)).Fill(float.NaN); }
+                    run.PoisonedSkippedCopies++;
+                }
+            };
+            int targetEvery = feedTargetEvery > 0 ? feedTargetEvery : feedEvery;
             for (int s = 0; s < Steps; s++)
             {
-                if (s % feedEvery == 0) FeedBatch(x, y, s);
-                if (s >= poisonStagingFromStep && typeof(CompiledTrainingPlan<float>)
-                        .GetField("_stepIo", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(concrete)
-                        is AiDotNet.Tensors.Engines.DirectGpu.IGraphStepIo io)
-                {
-                    // Garbage in every staging slot of every input once the replays that copied them are done: a replay
-                    // must copy only inputs the host changed, or the NaNs reach the loss.
-                    gpu.SynchronizeStream();
-                    for (int i = 0; i < io.InputCount; i++)
-                        for (int slot = 0; slot < 2; slot++)
-                            unsafe { new Span<float>((void*)io.InputStaging(i, slot), io.InputLength(i)).Fill(float.NaN); }
-                    run.PoisonedStaging = true;
-                }
+                if (s % feedEvery == 0) FeedInput(x, s);
+                if (s % targetEvery == 0) FeedTarget(y, s);
                 if (s == clipOffFromStep) plan.SetMaxGradNorm(0);
                 if (s == clipOnFromStep)
                 {
@@ -397,13 +408,15 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
 
     /// <summary>
     /// A replay copies only the inputs the host changed since the replay that last copied them (the step I/O prologue's
-    /// copy mask): fed every third step, a captured plan must train exactly like the eager one, both through the steps
-    /// that skip the copy and the ones that make it.
+    /// copy mask): fed every third step, once, or one input every step and the other once, a captured plan must train
+    /// exactly like the eager one, through the replays that skip every copy, make every copy, or make exactly one.
     /// </summary>
     [SkippableTheory]
-    [InlineData(3)]
-    [InlineData(1000)]
-    public void A_replay_copies_only_the_inputs_that_changed(int feedEvery)
+    [InlineData(3, 3)]
+    [InlineData(1000, 1000)]
+    [InlineData(1, 1000)]
+    [InlineData(1000, 1)]
+    public void A_replay_copies_only_the_inputs_that_changed(int feedEvery, int feedTargetEvery)
     {
         Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
         using (gpu)
@@ -414,17 +427,20 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
                 "Graph capture is disabled for this process.");
 
-            var eager = Train(gpu, capture: false, feedEvery: feedEvery);
-            // With the batch fixed after step 0, the staging is poisoned from step 6: only a skipped copy keeps it out.
-            var captured = Train(gpu, capture: true, feedEvery: feedEvery,
-                poisonStagingFromStep: feedEvery >= Steps ? 6 : int.MaxValue);
+            var eager = Train(gpu, capture: false, feedEvery: feedEvery, feedTargetEvery: feedTargetEvery);
+            // Every clear-bit input's replay staging is poisoned after the mask is submitted: only a skipped copy keeps it out.
+            var captured = Train(gpu, capture: true, feedEvery: feedEvery, feedTargetEvery: feedTargetEvery,
+                poisonSkippedStaging: true);
             _output.WriteLine("eager    " + string.Join(" ", eager.Losses.Select(l => l.ToString("G6"))));
             _output.WriteLine("captured " + string.Join(" ", captured.Losses.Select(l => l.ToString("G6"))));
             Assert.True(captured.ReplayedAGraph, "the captured plan is not replaying a graph after warm-up");
             Assert.True(captured.UpdateCapturedInGraph, "the replayed graph does not run the optimizer update (step I/O)");
-            // Fed every third step, two of every three replays skip both inputs; fed once, every replay after the first.
+            // Fed every third step, two of every three replays skip both inputs; fed once, every replay after the first; fed
+            // one input every step and the other once, every replay after the first copies exactly one.
             Assert.True(captured.InputCopiesSkipped > 0, "no replay skipped an unchanged input's copy");
-            if (feedEvery >= Steps) Assert.True(captured.PoisonedStaging, "the step I/O staging was not reachable");
+            Assert.True(captured.PoisonedSkippedCopies > 0, "no replay with a clear mask bit had its staging poisoned");
+            if (feedEvery != feedTargetEvery)
+                Assert.True(captured.MixedMaskReplays > 0, "no replay copied one input and skipped the other");
             for (int s = 0; s < Steps; s++)
                 Assert.True(Math.Abs(eager.Losses[s] - captured.Losses[s]) <= 1e-5 * Math.Max(1, Math.Abs(eager.Losses[s])),
                     $"step {s}: captured loss {captured.Losses[s]:G6} != eager {eager.Losses[s]:G6}");
