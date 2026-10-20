@@ -465,6 +465,29 @@ public sealed class MetalTunedKernelTests
                 backend.Synchronize();
                 AssertClose(expected, backend.DownloadBuffer(yb), expected.Length, $"{cand.Id} conv {bt}x{c}x{h}x{w} k{k} s{s} p{p} d{d}", termScale: 1.0);
             }
+            // The same candidates with the convolution's epilogue (ConvEpilogue): each adds the bias and applies ReLU in its
+            // output kernel or as passes after it, and must equal the convolution, then the bias add, then the ReLU.
+            float[] bias = Values(o, o * 3 + k, 1f);
+            using var bb = backend.AllocateBuffer(bias);
+            foreach (var (withBias, relu) in new[] { (true, false), (true, true), (false, true) })
+            {
+                var epilogued = new float[expected.Length];
+                for (int i = 0; i < epilogued.Length; i++)
+                {
+                    float v = withBias ? expected[i] + bias[(i / (oh * ow)) % o] : expected[i];
+                    epilogued[i] = relu && v < 0f ? 0f : v;
+                }
+                var epiArgs = new TunedConv2DArgs(xb, wb, yb, bt, c, h, w, o, oh, ow, k, k, s, s, p, p, d, d,
+                    withBias ? bb : null,
+                    relu ? AiDotNet.Tensors.Engines.FusedActivationType.ReLU : AiDotNet.Tensors.Engines.FusedActivationType.None);
+                foreach (var cand in Applicable(backend.Conv2DForwardSlot, epiArgs.Shape()))
+                {
+                    cand.Execute(epiArgs);
+                    backend.Synchronize();
+                    AssertClose(epilogued, backend.DownloadBuffer(yb), expected.Length,
+                        $"{cand.Id} conv {bt}x{c}x{h}x{w} k{k} s{s} p{p} d{d} bias={withBias} relu={relu}", termScale: 1.0);
+                }
+            }
             // Direct and im2col apply to every shape here, Winograd exactly to the 3x3 / stride 1 / dilation 1 ones it
             // admits, so a variant that silently dropped out (a library that failed to build on the device) fails here.
             // (This asserted that every candidate applies to every shape, which stopped holding when Winograd joined.)

@@ -314,8 +314,9 @@ extern ""C"" __global__ void wino_f32w_output(const float* __restrict__ mm, floa
 }
 
 // Y = A^T m A for tile p of output channel k, A^T = [[1,1,1,0],[0,1,-1,-1]]; writes the in-bounds 2x2 outputs.
+// The convolution's epilogue: epi bit 0 adds bias[k], bit 1 applies ReLU (v < 0 is false for NaN, which passes).
 extern ""C"" __global__ void wino_f23_output(const float* __restrict__ mm, float* __restrict__ y,
-    int N, int K, int outH, int outW, int tilesH, int tilesW)
+    const float* __restrict__ bias, int N, int K, int outH, int outW, int tilesH, int tilesW, int epi)
 {
     int P = N * tilesH * tilesW;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -336,12 +337,16 @@ extern ""C"" __global__ void wino_f23_output(const float* __restrict__ mm, float
     }
     float* dst = y + ((long long)n * K + k) * outH * outW;
     int h = th * 2, w = tw * 2;
+    float bk = (epi & 1) ? bias[k] : 0.0f;
+    bool relu = (epi & 2) != 0;
     #pragma unroll
     for (int i = 0; i < 2; i++)
     {
         if (h + i >= outH) break;
-        float o0 = s[i][0] + s[i][1] + s[i][2];
-        float o1 = s[i][1] - s[i][2] - s[i][3];
+        float o0 = s[i][0] + s[i][1] + s[i][2] + bk;
+        float o1 = s[i][1] - s[i][2] - s[i][3] + bk;
+        if (relu && o0 < 0.0f) o0 = 0.0f;
+        if (relu && o1 < 0.0f) o1 = 0.0f;
         dst[(h + i) * outW + w] = o0;
         if (w + 1 < outW) dst[(h + i) * outW + w + 1] = o1;
     }

@@ -97,8 +97,16 @@ __kernel void wino_f43_input(__global const float* restrict x, __global float* r
 
 // Y = A^T m A, A^T = [[1,1,1,1,1,0],[0,1,-1,2,-2,0],[0,1,1,4,4,0],[0,1,-1,8,-8,1]]; writes the in-bounds 4x4 outputs
 // of tile p of channel k; idx = k*P + p.
+// A convolution's epilogue: epi bit 0 adds bias[channel], bit 1 applies ReLU (NaN passes through, as the relu kernel).
+// The same arithmetic as the conv2d_bias_add and relu passes it replaces.
+float conv_epilogue(float v, __global const float* bias, int channel, int epi)
+{
+    if (epi & 1) v += bias[channel];
+    if (epi & 2) v = isnan(v) ? v : fmax(0.0f, v);
+    return v;
+}
 __kernel void wino_f43_output(__global const float* restrict mm, __global float* restrict y, const int N, const int K,
-    const int outH, const int outW, const int tilesH, const int tilesW)
+    const int outH, const int outW, const int tilesH, const int tilesW, __global const float* bias, const int epi)
 {
     int P = N * tilesH * tilesW;
     int idx = (int)get_global_id(0);
@@ -131,7 +139,7 @@ __kernel void wino_f43_output(__global const float* restrict mm, __global float*
         o[3] = z1 - z2 + 8.0f * z3 - 8.0f * z4 + z5;
         int row = dst + (h + i) * outW;
         for (int j = 0; j < 4; j++)
-            if (w4 + j < outW) y[row + w4 + j] = o[j];
+            if (w4 + j < outW) y[row + w4 + j] = conv_epilogue(o[j], bias, k, epi);
     }
 }
 ";

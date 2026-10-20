@@ -6854,9 +6854,14 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // Note: dilationW is tArgs[17] but the kernel reads it from the parameter list
             // The tiled kernel uses the same 17 params as conv2d_direct (minus dilationW which
             // is passed as the 18th)
-            void** tArgs2 = stackalloc void*[18];
+            // Then the epilogue's bias (the output stands in: no bias) and flags (none).
+            IntPtr noBias = outputPtr;
+            int noEpilogue = 0;
+            void** tArgs2 = stackalloc void*[20];
             for (int i = 0; i < 17; i++) tArgs2[i] = tArgs[i];
             tArgs2[17] = &dilationW;
+            tArgs2[18] = &noBias;
+            tArgs2[19] = &noEpilogue;
 
             LaunchKernel3D(tiledKernel, gx, gy, gz, TILE_OUT, TILE_OUT, 1, tArgs2, sharedMem);
             return;
@@ -6872,7 +6877,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             uint dgy = (uint)((outHeight + BLOCK - 1) / BLOCK);
             uint dgz = (uint)(batch * outChannels);
 
-            void** dArgs = stackalloc void*[18];
+            IntPtr noBias = outputPtr;
+            int noEpilogue = 0;
+            void** dArgs = stackalloc void*[20];
             dArgs[0] = &inputPtr;
             dArgs[1] = &kernelPtr;
             dArgs[2] = &outputPtr;
@@ -6891,6 +6898,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             dArgs[15] = &padW;
             dArgs[16] = &dilationH;
             dArgs[17] = &dilationW;
+            dArgs[18] = &noBias;
+            dArgs[19] = &noEpilogue;
             LaunchKernel3D(cudaKernel, dgx, dgy, dgz, (uint)BLOCK, (uint)BLOCK, 1, dArgs, 0);
         }
     }

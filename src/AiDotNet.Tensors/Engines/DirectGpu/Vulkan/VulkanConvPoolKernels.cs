@@ -443,14 +443,16 @@ void main() {
 }";
 
     // ---- Conv2D (forward, gather): one thread per output element ----
+    // The convolution's epilogue: epi bit 0 adds bias[oc], bit 1 applies ReLU (r < 0 is false for NaN, which passes).
     public const string Conv2D = Header + @"
 layout(set=0, binding=0) buffer B0 { float inp[]; };
 layout(set=0, binding=1) buffer B1 { float wgt[]; };
 layout(set=0, binding=2) buffer B2 { float outp[]; };
+layout(set=0, binding=3) buffer B3 { float bias[]; };
 layout(push_constant) uniform PC {
     int batch; int inChannels; int inHeight; int inWidth;
     int outChannels; int outHeight; int outWidth; int kernelH; int kernelW;
-    int strideH; int strideW; int padH; int padW; int dilationH; int dilationW;
+    int strideH; int strideW; int padH; int padW; int dilationH; int dilationW; int epi;
 };
 void main() {
     uint gid = gl_GlobalInvocationID.x;
@@ -470,7 +472,10 @@ void main() {
                     sum += inp[((b * inChannels + ic) * inHeight + ih) * inWidth + iw]
                          * wgt[((oc * inChannels + ic) * kernelH + kh) * kernelW + kw];
             }
-    outp[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = sum;
+    float r = sum;
+    if ((epi & 1) != 0) r += bias[oc];
+    if ((epi & 2) != 0 && r < 0.0) r = 0.0;
+    outp[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = r;
 }";
 
     // ---- Conv2D backward input (gather per input element) ----

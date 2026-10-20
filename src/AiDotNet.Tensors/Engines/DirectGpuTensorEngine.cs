@@ -9071,6 +9071,37 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             object? weightKey = Autodiff.GradientTape<T>.Current is null && !ResidentStepActive && kernel._gpuBuffer is null
                 ? kernel.GetBackingArrayForCacheLookupUnsafe()
                 : null;
+            // A backend that adds the bias and applies the activation in the convolution's own output kernel saves the
+            // two passes below (conv2d_bias_add and the activation) over the whole output.
+            if ((bias is not null || activation == FusedActivationType.ReLU)
+                && (activation == FusedActivationType.None || activation == FusedActivationType.ReLU)
+                && backend is IConvBiasActivationBackend fusedConv)
+            {
+                using var fusedBiasBuffer = bias is null
+                    ? default
+                    : GetWeightBufferPreferResident(backend, bias, PersistentTensorRole.Biases);
+                bool fused;
+                using (AiDotNet.Tensors.Engines.DirectGpu.ConvWeightIdentity.Enter(weightKey, kernel.GpuCacheVersion))
+                {
+                    fused = fusedConv.TryConv2DBiasActivation(inputBuffer.Buffer, kernelBuffer.Buffer,
+                        bias is null ? null : fusedBiasBuffer.Buffer, outputBuffer.Buffer,
+                        batch, inChannels, inHeight, inWidth,
+                        outChannels, outHeight, outWidth,
+                        kernelH, kernelW,
+                        strideH, strideW, padH, padW,
+                        dilationH, dilationW, activation);
+                }
+                if (fused)
+                {
+                    var fusedResult = DeferTensorResult<T>(backend, outputBuffer.Buffer,
+                        batch * outChannels * outHeight * outWidth,
+                        new[] { batch, outChannels, outHeight, outWidth });
+                    outputHandedOff = true;
+                    if (ResidentStepActive && typeof(T) == typeof(float))
+                        BindResidentBuffer(fusedResult, outputBuffer.Buffer, backend);
+                    return fusedResult;
+                }
+            }
             using (AiDotNet.Tensors.Engines.DirectGpu.ConvWeightIdentity.Enter(weightKey, kernel.GpuCacheVersion))
             {
                 backend.Conv2D(inputBuffer.Buffer, kernelBuffer.Buffer, outputBuffer.Buffer,

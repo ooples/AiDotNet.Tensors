@@ -22,8 +22,12 @@ internal interface IWinogradF23Transforms
     /// <summary>V[16][C][P] = B^T d B for the 4x4 input patch of each 2x2 output tile p (zero outside the image).</summary>
     void Input(IGpuBuffer x, IGpuBuffer v, int n, int c, int h, int w, int pad, int tilesH, int tilesW);
 
-    /// <summary>Y = A^T m A per tile of M[16][K][P], writing only the outputs inside outH x outW.</summary>
-    void Output(IGpuBuffer m, IGpuBuffer y, int n, int k, int outH, int outW, int tilesH, int tilesW);
+    /// <summary>
+    /// Y = A^T m A per tile of M[16][K][P], writing only the outputs inside outH x outW, with the convolution's epilogue:
+    /// <paramref name="epilogue"/> bit 0 adds <paramref name="bias"/>[k] (null when the bit is clear), bit 1 applies ReLU.
+    /// </summary>
+    void Output(IGpuBuffer m, IGpuBuffer y, int n, int k, int outH, int outW, int tilesH, int tilesW, IGpuBuffer? bias,
+        int epilogue);
 
     /// <summary>Weight gradient, F(3x3, 2x2): U[16][K][P] = A g A^T of each 2x2 dY tile (zero past the edge).</summary>
     void GradOutputTiles(IGpuBuffer dy, IGpuBuffer u, int n, int k, int outH, int outW, int tilesH, int tilesW);
@@ -75,7 +79,8 @@ internal static class WinogradF23Pipeline
         if (transforms is null) throw new ArgumentNullException(nameof(transforms));
         if (!Admits(a)) return false;
         return Run(backend, transforms, a.Input, a.Batch, a.InChannels, a.InHeight, a.InWidth, a.PadH, flip: false,
-            a.Kernel, a.OutChannels, a.InChannels, a.Output, a.OutChannels, a.OutHeight, a.OutWidth);
+            a.Kernel, a.OutChannels, a.InChannels, a.Output, a.OutChannels, a.OutHeight, a.OutWidth, a.Bias,
+            ConvEpilogue.Flags(a));
     }
 
     /// <summary>
@@ -89,7 +94,7 @@ internal static class WinogradF23Pipeline
         if (transforms is null) throw new ArgumentNullException(nameof(transforms));
         if (a.WeightGradient || !AdmitsBackward(a)) return false;
         return Run(backend, transforms, a.First, a.Batch, a.OutChannels, a.OutHeight, a.OutWidth, 2 - a.PadH, flip: true,
-            a.Second, a.OutChannels, a.InChannels, a.Output, a.InChannels, a.InHeight, a.InWidth);
+            a.Second, a.OutChannels, a.InChannels, a.Output, a.InChannels, a.InHeight, a.InWidth, bias: null, epilogue: 0);
     }
 
     /// <summary>
@@ -127,7 +132,8 @@ internal static class WinogradF23Pipeline
     // [fwdK][fwdC][3][3], flipped for the input gradient) into U[16][outC][inC], the input transform, the sixteen GEMMs
     // and the output transform.
     private static bool Run(IDirectGpuBackend backend, IWinogradF23Transforms transforms, IGpuBuffer x, int n, int inC,
-        int h, int w, int pad, bool flip, IGpuBuffer weights, int fwdK, int fwdC, IGpuBuffer y, int outC, int outH, int outW)
+        int h, int w, int pad, bool flip, IGpuBuffer weights, int fwdK, int fwdC, IGpuBuffer y, int outC, int outH, int outW,
+        IGpuBuffer? bias, int epilogue)
     {
         int tilesH = (outH + 1) / 2, tilesW = (outW + 1) / 2;
         long p = (long)n * tilesH * tilesW;
@@ -141,7 +147,7 @@ internal static class WinogradF23Pipeline
         transforms.Input(x, v, n, inC, h, w, pad, tilesH, tilesW);
         // M[x] (outC x P) = U[x] (outC x inC) * V[x] (inC x P), one GEMM per Winograd point.
         backend.BatchedGemm(u, v, m, outC, pi, inC, WinogradPoints);
-        transforms.Output(m, y, n, outC, outH, outW, tilesH, tilesW);
+        transforms.Output(m, y, n, outC, outH, outW, tilesH, tilesW, bias, epilogue);
         return true;
     }
 }

@@ -206,7 +206,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public static int Finish(IntPtr commandQueue)
         {
             int result = FinishNative(commandQueue);
-            if ((OpenClNative.ClError)result == OpenClNative.ClError.Success) GpuLaunchProbe.OnSynchronize(GpuBackendType.OpenCl);
+            if ((OpenClNative.ClError)result == OpenClNative.ClError.Success) { GpuLaunchProbe.OnSynchronize(GpuBackendType.OpenCl); DirectOpenClFlushPolicy.OnHostWaited(); }
             return result;
         }
 
@@ -226,7 +226,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public static int WaitForEvents(uint numEvents, IntPtr[] eventList)
         {
             int result = WaitForEventsNative(numEvents, eventList);
-            if ((OpenClNative.ClError)result == OpenClNative.ClError.Success) GpuLaunchProbe.OnSynchronize(GpuBackendType.OpenCl);
+            if ((OpenClNative.ClError)result == OpenClNative.ClError.Success) { GpuLaunchProbe.OnSynchronize(GpuBackendType.OpenCl); DirectOpenClFlushPolicy.OnHostWaited(); }
             return result;
         }
 
