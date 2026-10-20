@@ -201,7 +201,8 @@ internal static class KernelConveyorTool
                 // conveyor verifies, benches and releases.
                 bool overridden = args.Contains("--no-coarsen", StringComparer.Ordinal)
                     || ValueOf(args, "--coarsen") is not null
-                    || ValueOf(args, "--max-lanes") is not null;
+                    || ValueOf(args, "--max-lanes") is not null
+                    || ValueOf(args, "--winner") is not null;
 
                 TunedProgram program;
                 if (overridden)
@@ -212,6 +213,8 @@ internal static class KernelConveyorTool
                         emitter.Coarsening = int.Parse(cz, CultureInfo.InvariantCulture);
                     if (ValueOf(args, "--max-lanes") is string mz)
                         emitter.MaxTileLanes = int.Parse(mz, CultureInfo.InvariantCulture);
+                    // --winner: profile a named candidate (implicit-gemm, ...) rather than the recorded winner.
+                    ApplyTuned(emitter, entry.Name, ValueOf(args, "--winner"));
                     string ptx = emitter.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
                     program = new TunedProgram(spec,
                         new[]
