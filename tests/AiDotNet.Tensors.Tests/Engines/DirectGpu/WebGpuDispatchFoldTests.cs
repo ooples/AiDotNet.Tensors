@@ -38,6 +38,28 @@ public sealed class WebGpuDispatchFoldTests
             if (filled[i] != 3.5f) Assert.Fail($"fill[{i}]: expected 3.5, got {filled[i]}");
     }
 
+    // More rows than one dimension holds take the workgroup-per-row kernel (it used to fall back to one thread per
+    // row). Small integers keep every sum exact, whatever the reduction order.
+    [SkippableFact]
+    public void SumAxis_PastTheWorkgroupLimit_SumsEveryRow()
+    {
+        var backend = DawnHostedWebGpu.BackendOrSkip();
+        const int rows = 70001, cols = WebGpuBackend.SumAxisRowsMinReduce;
+        var a = new float[rows * cols];
+        for (int i = 0; i < a.Length; i++) a[i] = i % 7 - 3;
+        using var da = backend.AllocateBuffer(a);
+        using var db = backend.AllocateBuffer(rows);
+        backend.Fill(db, float.NaN, rows);
+        backend.SumAxis(da, db, rows, cols);
+        float[] sums = backend.DownloadBuffer(db);
+        for (int r = 0; r < rows; r++)
+        {
+            float expected = 0;
+            for (int c = 0; c < cols; c++) expected += a[r * cols + c];
+            if (sums[r] != expected) Assert.Fail($"row {r}: expected {expected}, got {sums[r]}");
+        }
+    }
+
     // One workgroup per output, as the row kernels index them: workgroup_id, num_workgroups, a workgroup barrier and
     // global_invocation_id must all read as they would in one (groups, 1, 1) dispatch, and the grid's surplus workgroup
     // must not run (it would write the two sentinel words past the last group's).
