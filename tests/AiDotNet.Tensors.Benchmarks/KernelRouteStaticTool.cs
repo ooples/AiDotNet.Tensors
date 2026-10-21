@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // --kernel-routes --static: the static-metric half of the #890 phase-4 gate. For each routed family, at its bench
 // shape, the declared program as the backend lowers it (PtxProgramLowering, compiled by ptxas) against the reference
 // hand-written kernels it replaces (their CUDA C, compiled by NVRTC with the backend's own source preparation and
@@ -258,7 +258,11 @@ internal static class KernelRouteStaticTool
         var result = new Dictionary<string, Metrics>(StringComparer.Ordinal);
         foreach (var pair in counts)
         {
-            var (regs, local) = resources.TryGetValue(pair.Key, out var r) ? r : (0, 0);
+            // The spill rule is a blocking gate on local bytes, so a (0, 0) default would pass every
+            // function whose resource row the cuobjdump regex missed - the opposite of the gate's purpose.
+            if (!resources.TryGetValue(pair.Key, out var r))
+                throw new InvalidOperationException("cuobjdump reported no resource usage for " + pair.Key + " in " + cubin + ".");
+            var (regs, local) = r;
             result[pair.Key] = new Metrics(pair.Key, regs, local, pair.Value[0], pair.Value[1], pair.Value[2], pair.Value[3], pair.Value[4]);
         }
         return result;

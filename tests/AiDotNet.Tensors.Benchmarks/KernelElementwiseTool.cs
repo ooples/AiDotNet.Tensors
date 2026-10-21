@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // --kernel-elementwise: the pointwise family on declared kernels (#890 phase 4a), against the hand-written kernels.
 //
 //   --derive      every module's derived library functions, and why each other elementwise kernel is not derivable
@@ -267,7 +267,13 @@ DONE:
                         if (!backend.TryDeclaredElementwise(kernel, inputs, output, scalars, n))
                             throw new InvalidOperationException(kernel + " was not declared: " + backend.LastElementwiseDecline);
                     }
-                    void Hand() => backend.LaunchHandWrittenElementwise(kernel, inputs, output, scalars, n);
+                    void Hand()
+                    {
+                        // Compare() throws on a missing hand-written module; timing it silently would
+                        // measure an empty call and print a near-zero ratio as if it were a result.
+                        if (!backend.LaunchHandWrittenElementwise(kernel, inputs, output, scalars, n))
+                            throw new InvalidOperationException(kernel + ": the hand-written kernel is not loaded.");
+                    }
                     double d = Median(Declared, backend), h = Median(Hand, backend);
                     Console.WriteLine(kernel.PadRight(28) + n.ToString(CultureInfo.InvariantCulture).PadLeft(9) +
                         d.ToString("F1", CultureInfo.InvariantCulture).PadLeft(14) + h.ToString("F1", CultureInfo.InvariantCulture).PadLeft(17) +

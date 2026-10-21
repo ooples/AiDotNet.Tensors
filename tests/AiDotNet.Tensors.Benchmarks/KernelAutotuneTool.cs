@@ -1235,12 +1235,19 @@ internal static class KernelAutotuneTool
             for (int i = resources.Count - 1; i >= 0; i--) resources[i].Dispose();
             return null;
         }
-        catch (InvalidOperationException ex) when (implicitTile is not null)
+        // Only the driver's rejection means "not a candidate"; the same filter as the single-kernel path at
+        // CreateSingle. Catching every InvalidOperationException here would also swallow binding bugs,
+        // CandidateProgram lifecycle errors and allocation failures, and drop the schedule as if it had been
+        // measured and declined.
+        catch (InvalidOperationException ex) when (implicitTile is not null &&
+            ex.Message.Contains("was rejected", StringComparison.Ordinal))
         {
             // The driver rejected the implicit-GEMM partial (a register spill at the two-blocks-a-SM bound, which
             // the direct-kernel contract forbids): this schedule is not a candidate for the shape, the others are.
             for (int i = resources.Count - 1; i >= 0; i--) resources[i].Dispose();
-            Console.WriteLine("    candidate ig-chunked-split:x" + chunkFactor.ToString(CultureInfo.InvariantCulture) +
+            // The same name the winner would be recorded under, so the decline matches the search record.
+            Console.WriteLine("    candidate ig-chunked-split:" + string.Join("+", plan.PromotedAxes) + "x" +
+                chunkFactor.ToString(CultureInfo.InvariantCulture) +
                 ":" + implicitTile + " rejected: " + ex.Message);
             return null;
         }

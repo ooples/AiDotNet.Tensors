@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // The conveyor: three stages every kernel passes through, in the same order, with
 // the same gates, driven by a loop over CodegenKernelCatalog rather than by
 // per-kernel code.
@@ -448,6 +448,9 @@ internal static class KernelConveyorTool
             case not null when winner.StartsWith("split:", StringComparison.Ordinal):
             case not null when winner.StartsWith("tiled-split:", StringComparison.Ordinal):
             case not null when winner.StartsWith("tiled-chunked-split:", StringComparison.Ordinal):
+            // ig-chunked-split is a split program too (TryBuildTunedProgram treats it as one at
+            // "implicitSplit"), so it belongs with the other prefixes rather than in the default arm.
+            case not null when winner.StartsWith("ig-chunked-split:", StringComparison.Ordinal):
                 Console.WriteLine("    note: " + kernelName + " measured fastest as " + winner +
                                   ", a two-kernel split this stage cannot launch; " +
                                   "running the single-kernel lowering instead");
@@ -1259,6 +1262,9 @@ internal static class KernelConveyorTool
         Console.WriteLine();
         Console.WriteLine("program                       ours us   incumbent us   ratio (round spread)");
 
+        // A gate that prints ERROR and exits 0 is not a gate: a program that fails to lower,
+        // compile or launch has to fail the lane, as VerifyPrograms and BenchPrograms do.
+        var failures = new List<string>();
         foreach (var entry in entries)
         {
             Action? incumbent = null;
@@ -1381,6 +1387,7 @@ internal static class KernelConveyorTool
             }
             catch (Exception ex)
             {
+                failures.Add(entry.Name + ": " + ex.Message.Split('\n')[0]);
                 Console.WriteLine(entry.Name.PadRight(28) + "  ERROR " + ex.Message.Split('\n')[0]);
             }
             finally
@@ -1389,6 +1396,10 @@ internal static class KernelConveyorTool
             }
         }
         GpuBenchmarkEnvironment.RequireNoForeignCompute("kernel-incumbent-end", afterSuite: true);
+        if (failures.Count != 0)
+            throw new InvalidOperationException(
+                failures.Count.ToString(CultureInfo.InvariantCulture) +
+                " incumbent comparison(s) failed. " + string.Join("; ", failures));
     }
 
     private static string Describe(int loopedAxes) =>
