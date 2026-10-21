@@ -327,4 +327,84 @@ public sealed class ConvDgradS2Tests
             _out.WriteLine($"[{inC}->{outC} 1x1 s2 at {size}x{size}] s2k1 {Stat(times[0])} us, engine {Stat(times[1])} us");
         }
     }
+
+    // The shortcut pair (conv2d_dgrad_s2k3sc_g*): the 3x3 stride-2 input gradient plus the 1x1 projection's, one launch.
+    // batch, C, K (3x3), K2 (projection), input size.
+    public static IEnumerable<object[]> PairShapes() => new[]
+    {
+        new object[] { 8, 64, 128, 128, 32 },   // ResNet-18 downsampling blocks
+        new object[] { 8, 128, 256, 256, 16 },
+        new object[] { 8, 256, 512, 512, 8 },
+        new object[] { 3, 40, 24, 16, 16 },     // K2 < K: the shortcut's reduction ends first; a partial channel tile
+        new object[] { 2, 12, 8, 36, 8 },       // K2 > K, off the eight-channel step; output width 4
+    };
+
+    public static IEnumerable<object[]> PairShapesGrids() =>
+        PairShapes().SelectMany(s => new[] { (0, 0), (1, 1), (2, 1), (4, 1), (1, 3), (4, 2) }
+            .Select(g => s.Concat(new object[] { g.Item1, g.Item2 }).ToArray()));
+
+    [SkippableTheory]
+    [MemberData(nameof(PairShapesGrids))]
+    public void ShortcutPair_MatchesFloat64ReferenceAndIsBitReproducible(int batch, int inC, int outC, int shortcutC, int size,
+        int groups, int splits)
+    {
+        Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA is not available.");
+        using var backend = CudaBackend.CreateOrThrow();
+        Skip.IfNot(backend.EnsureDgradS2Module(), "Stride-2 input-gradient kernels did not compile.");
+        int o = size / 2;
+        var rng = new Random(8380 + batch * 7 + inC * 3 + outC + shortcutC);
+        var gy = Rand(batch * outC * o * o, rng);
+        var wt = Rand(outC * inC * 9, rng);
+        var gy2 = Rand(batch * shortcutC * o * o, rng);
+        var wt2 = Rand(shortcutC * inC, rng);
+        using var dy = backend.AllocateBuffer(gy);
+        using var w = backend.AllocateBuffer(wt);
+        using var dy2 = backend.AllocateBuffer(gy2);
+        using var w2 = backend.AllocateBuffer(wt2);
+        var poison = Enumerable.Repeat(float.NaN, batch * inC * size * size).ToArray();
+        using var x1 = backend.AllocateBuffer(poison);
+        using var x2 = backend.AllocateBuffer(poison);
+        foreach (var x in new[] { x1, x2 })
+            Assert.True(backend.TryConv2DBackwardInputS2K3Pair(new TunedConv2DBackwardArgs(dy, w, x, false, batch, inC, size, size,
+                outC, o, o, 3, 3, 2, 2, 1, 1, 1, 1), dy2, w2, shortcutC, groups, splits), "the shortcut pair refused an admitted shape");
+        backend.Synchronize();
+        float[] got = backend.DownloadBuffer(x1), again = backend.DownloadBuffer(x2);
+        double worst = 0;
+        for (int b = 0; b < batch; b++)
+            for (int c = 0; c < inC; c++)
+                for (int ih = 0; ih < size; ih++)
+                    for (int iw = 0; iw < size; iw++)
+                    {
+                        double s = 0, m = 0;
+                        for (int kh = 0; kh < 3; kh++)
+                        {
+                            int th = ih + 1 - kh;
+                            if (th < 0 || (th & 1) != 0 || th / 2 >= o) continue;
+                            for (int kw = 0; kw < 3; kw++)
+                            {
+                                int tw = iw + 1 - kw;
+                                if (tw < 0 || (tw & 1) != 0 || tw / 2 >= o) continue;
+                                for (int k = 0; k < outC; k++)
+                                {
+                                    double t = (double)gy[((b * outC + k) * o + th / 2) * o + tw / 2] * wt[((k * inC + c) * 3 + kh) * 3 + kw];
+                                    s += t; m += Math.Abs(t);
+                                }
+                            }
+                        }
+                        if ((ih & 1) == 0 && (iw & 1) == 0)
+                            for (int k = 0; k < shortcutC; k++)
+                            {
+                                double t = (double)gy2[((b * shortcutC + k) * o + ih / 2) * o + iw / 2] * wt2[k * inC + c];
+                                s += t; m += Math.Abs(t);
+                            }
+                        int idx = ((b * inC + c) * size + ih) * size + iw;
+                        Assert.False(float.IsNaN(got[idx]), $"dX[{idx}] was never written");
+                        Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(got[idx]) == TestHelpers.MathCompat.SingleToInt32Bits(again[idx]),
+                            $"dX[{idx}] differs between two identical runs");
+                        double rel = Math.Abs(got[idx] - s) / Math.Max(1.0, m);
+                        worst = Math.Max(worst, rel);
+                        Assert.True(rel <= 1e-5, $"dX[{b},{c},{ih},{iw}] = {got[idx]} vs {s} (|terms| {m})");
+                    }
+        _out.WriteLine($"pair g{groups} s{splits}: max err / sum|terms| = {worst:E2}");
+    }
 }
