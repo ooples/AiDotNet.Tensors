@@ -81,18 +81,22 @@ public sealed partial class CudaBackend
             if (partials is null) return false;
             destination = partials;
         }
+        // Split: the kernel reduces the splits itself (last block per tile), unless the tickets are unavailable.
+        var tickets = splits > 1 ? TrySplitKTickets(tiles) : null;
+        IntPtr fixDst = tickets is null ? IntPtr.Zero : a.Output.Handle, fixTickets = tickets?.Handle ?? IntPtr.Zero;
         IntPtr x = a.First.Handle, dy = a.Second.Handle, o = destination.Handle;
         int batch = a.Batch, inC = a.InChannels, h = a.InHeight, w = a.InWidth, outC = a.OutChannels, outH = a.OutHeight,
             outW = a.OutWidth, kh = a.KernelH, kw = a.KernelW, sh = a.StrideH, sw = a.StrideW, ph = a.PadH, pw = a.PadW,
             dh = a.DilationH, dw = a.DilationW, kps = kPerSplit;
-        void** args = stackalloc void*[19];
+        void** args = stackalloc void*[21];
         args[0] = &x; args[1] = &dy; args[2] = &o;
         args[3] = &batch; args[4] = &inC; args[5] = &h; args[6] = &w;
         args[7] = &outC; args[8] = &outH; args[9] = &outW;
         args[10] = &kh; args[11] = &kw; args[12] = &sh; args[13] = &sw;
         args[14] = &ph; args[15] = &pw; args[16] = &dh; args[17] = &dw; args[18] = &kps;
+        args[19] = &fixDst; args[20] = &fixTickets;
         LaunchKernel3D(gemm, (uint)tilesN, (uint)tilesM, (uint)splits, (uint)threads, 1, 1, args, 0);
-        if (splits > 1) LaunchSplitKReduce(reduce, destination, a.Output, (int)outputs, splits);
+        if (splits > 1 && tickets is null) LaunchSplitKReduce(reduce, destination, a.Output, (int)outputs, splits);
         return true;
     }
 }

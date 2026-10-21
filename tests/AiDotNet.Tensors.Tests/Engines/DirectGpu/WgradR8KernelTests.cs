@@ -149,6 +149,21 @@ public sealed class WgradR8KernelTests : IClassFixture<DirectGpuTensorEngineTest
                 double maxErr = 0;
                 for (int i = 0; i < expected.Length; i++) maxErr = Math.Max(maxErr, Math.Abs(expected[i] - actual[i]) / scale);
                 Assert.True(maxErr < 1e-5, $"r8 {tm}x{tn} splits {splits} [{inC}->{outC} {h}x{w} k{k} s{s} p{p} d{d}]: max err {maxErr:E2}");
+                if (splits <= 1) continue;
+                // The in-kernel split reduction (the last block per tile sums the slices) against the separate reduce
+                // launch: the same additions in the same order, so the same bits.
+                bool prior = CudaBackend.SplitKInKernel;
+                try
+                {
+                    CudaBackend.SplitKInKernel = false;
+                    cuda.Fill(dw, float.NaN, dw.Size);
+                    Assert.True(cuda.TryConv2DBackwardKernelR8(args, tm, tn, splits, vectorDy), $"r8 {tm}x{tn} refused");
+                    Assert.Equal(cuda.DownloadBuffer(dw), actual);
+                }
+                finally
+                {
+                    CudaBackend.SplitKInKernel = prior;
+                }
             }
     }
 }

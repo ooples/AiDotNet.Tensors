@@ -51,6 +51,7 @@ public sealed partial class CudaBackend
         Release(ref _convEngineDgradPartials);
         Release(ref _convEngineDgradWeights);
         Release(ref _convEngineWgradPartials);
+        Release(ref _splitKTickets);
         Release(ref _convFpropPartials);
         Release(ref _convWeightPartials);
         Release(ref _convWgradPartials);

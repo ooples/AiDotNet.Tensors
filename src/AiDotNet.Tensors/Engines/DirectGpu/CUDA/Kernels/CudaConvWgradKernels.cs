@@ -36,11 +36,16 @@ internal static class CudaConvWgradKernels
 struct WrCol { int off; int khd; int kwd; int valid; };
 
 // VECA: dY's K tile read as float4s (the r8v kernels; the host's condition: outH * outW a multiple of WR_BK).
+// dst / tickets (split-K only, else null): the in-kernel reduction. Each split block writes its partial tile to its slice
+// of out, then the last of the gridDim.z blocks of a tile to finish (an atomic ticket per tile) sums every slice's
+// values for that tile in split order into dst -- conv2d_wgrad_splitk_reduce's arithmetic, so the result is the same to
+// the bit -- and resets the ticket, leaving the buffer zeroed for the next launch (or graph replay).
 template <int BM, int BN, int WR_BK, bool VECA = false>
 __device__ __forceinline__ void conv2d_wgrad_r8_body(
     const float* __restrict__ input, const float* __restrict__ gradOutput, float* __restrict__ out,
     int batch, int inC, int H, int W, int outC, int outH, int outW,
-    int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit)
+    int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit,
+    float* __restrict__ dst, unsigned int* __restrict__ tickets)
 {
     constexpr int THREADS = (BM / 8) * (BN / 8);
     constexpr int GROUPS = THREADS / WR_BK;          // loader lanes per K position
@@ -212,6 +217,37 @@ __device__ __forceinline__ void conv2d_wgrad_r8_body(
             }
         }
     }
+    if (tickets == nullptr) return;
+    __shared__ int isLast;
+    __threadfence();   // this block's partial is visible device-wide before its ticket says so
+    __syncthreads();
+    const int tile = blockIdx.y * gridDim.x + blockIdx.x;
+    if (tid == 0) isLast = atomicAdd(tickets + tile, 1u) == gridDim.z - 1u;
+    __syncthreads();
+    if (!isLast) return;
+    __threadfence();
+    const long long plane = (long long)outC * P;
+    #pragma unroll
+    for (int i = 0; i < 8; i++)
+    {
+        int m = m0 + (i >> 2) * (BM / 2) + ty * 4 + (i & 3);
+        if (m >= outC) continue;
+        #pragma unroll
+        for (int h = 0; h < 2; h++)
+        {
+            #pragma unroll
+            for (int j = 0; j < 4; j++)
+            {
+                int n = n0 + h * (BN / 2) + tx * 4 + j;
+                if (n >= P) continue;
+                long long e = (long long)m * P + n;
+                float sum = 0.0f;
+                for (int z = 0; z < (int)gridDim.z; z++) sum += __ldcg(out + z * plane + e);
+                dst[e] = sum;
+            }
+        }
+    }
+    if (tid == 0) tickets[tile] = 0u;
 }
 
 #define WR_KERNEL(NAME, BM, BN, BK) WR_KERNEL_V(NAME, BM, BN, BK, false)
@@ -219,10 +255,11 @@ __device__ __forceinline__ void conv2d_wgrad_r8_body(
 extern ""C"" __global__ __launch_bounds__((BM / 8) * (BN / 8)) void NAME( \
     const float* __restrict__ input, const float* __restrict__ gradOutput, float* __restrict__ out, \
     int batch, int inC, int H, int W, int outC, int outH, int outW, \
-    int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit) \
+    int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit, \
+    float* __restrict__ dst, unsigned int* __restrict__ tickets) \
 { \
     conv2d_wgrad_r8_body<BM, BN, BK, VECA>(input, gradOutput, out, batch, inC, H, W, outC, outH, outW, \
-        kH, kW, sH, sW, pH, pW, dH, dW, kPerSplit); \
+        kH, kW, sH, sW, pH, pW, dH, dW, kPerSplit, dst, tickets); \
 }
 " + string.Concat(TileShapes.Select(t => $"WR_KERNEL({KernelName(t.M, t.N)}, {t.M}, {t.N}, {KTile})\n"))
      + string.Concat(TileShapes.Select(t => $"WR_KERNEL_V({KernelName(t.M, t.N, vectorDy: true)}, {t.M}, {t.N}, {KTile}, true)\n"));
