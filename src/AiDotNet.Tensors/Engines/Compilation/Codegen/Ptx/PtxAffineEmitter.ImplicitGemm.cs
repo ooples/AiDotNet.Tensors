@@ -504,7 +504,9 @@ public sealed partial class PtxAffineEmitter
     /// Whether an operand is staged four floats at a time: its staged-fastest role is a single axis that runs along the
     /// operand's unit-stride dimension and spans it (<see cref="IsUnitStrideIn"/>), that extent and every other stride are
     /// multiples of 4 -- so every vector starts 16-byte aligned in a 16-byte-aligned buffer and lies wholly inside or
-    /// outside the operand -- and the tile is a multiple of 64, so each thread stages whole vectors.
+    /// outside the operand -- every other dimension is indexed in range by construction (non-negative axis terms, no
+    /// constant or divisor, at most the dimension's extent: a vector load cannot carry a guard), and the tile is a
+    /// multiple of 64, so each thread stages whole vectors.
     /// </summary>
     private bool StagesVectors(CodegenKernelSpec spec, CodegenTensorBinding binding, int[] own, int[] reduction,
         bool reductionFastest, int tile)
@@ -516,8 +518,21 @@ public sealed partial class PtxAffineEmitter
         if (fast.Length != 1 || !IsUnitStrideIn(binding, fast[0], spec.Space.Axes) ||
             spec.Space.Axes[fast[0]].Extent % VectorWidth != 0)
             return false;
+        var axes = spec.Space.Axes;
         for (int d = 0; d < binding.Map.Count - 1; d++)
+        {
             if (binding.Stride(d) % VectorWidth != 0) return false;
+            var expr = binding.Map[d];
+            if (binding.Indirect[d] is not null || expr.Divisor != 1 || expr.RequiresExactDivision || expr.Constant != 0)
+                return false;
+            long highest = 0;
+            foreach (var term in expr.Terms)
+            {
+                if (term.Coefficient < 0) return false;
+                highest += (long)term.Coefficient * (axes[term.Axis].Extent - 1);
+            }
+            if (highest >= binding.Shape[d]) return false;
+        }
         return true;
     }
 

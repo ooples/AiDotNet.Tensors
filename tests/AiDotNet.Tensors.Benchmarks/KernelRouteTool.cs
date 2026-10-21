@@ -91,6 +91,7 @@ internal static class KernelRouteTool
         if (only is null || only.Equals("resident", StringComparison.OrdinalIgnoreCase)) ResidentChains(backend, failures);
         if (only is null || only.Equals("conv", StringComparison.OrdinalIgnoreCase)) ConvRoutes(backend, failures);
         if (only is null || only.Equals("gemm", StringComparison.OrdinalIgnoreCase)) GemmSchedules(backend, failures);
+        if (only is null || only.Equals("flash", StringComparison.OrdinalIgnoreCase)) FlashProbe(backend);
 
         if (failures.Count != 0)
             throw new InvalidOperationException("Route failures: " + string.Join("; ", failures));
@@ -111,6 +112,8 @@ internal static class KernelRouteTool
                 for (int i = 0; i < route.Inputs.Length; i++) buffers[i] = backend.AllocateBuffer(route.Inputs[i]);
                 for (int o = 0; o < route.OutputSizes.Length; o++)
                     buffers[route.Inputs.Length + o] = backend.AllocateBuffer(new float[route.OutputSizes[o]]);
+                // A family that compiles a shape only once it recurs (attention) routes from the second call.
+                if (declared) route.Call(backend, buffers);
                 long before = backend.DeclaredProgramLaunches;
                 route.Call(backend, buffers);
                 backend.Synchronize();
@@ -177,9 +180,172 @@ internal static class KernelRouteTool
                 yield return LinearForward(b, i, o, activation);
                 yield return LinearBackward(b, i, o, activation);
             }
+        foreach (var (b, h, kvh, sq, sk, d, mask, causal, store) in new[]
+        {
+            (2, 8, 8, 128, 128, 64, CodegenAttentionMask.None, false, true),
+            (2, 8, 8, 128, 128, 64, CodegenAttentionMask.None, true, true),
+            (2, 8, 2, 128, 128, 64, CodegenAttentionMask.Shared, false, true),
+            (1, 4, 4, 64, 96, 32, CodegenAttentionMask.Full, true, false),
+            // The hand-written kernel costs seqK * headDim^2 a row, seconds a call past this size: timing it is the limit.
+            (1, 4, 4, 256, 256, 32, CodegenAttentionMask.None, true, false),
+            (1, 2, 2, 9, 4, 16, CodegenAttentionMask.None, true, true),
+            (1, 2, 2, 5, 7, 8, CodegenAttentionMask.Shared, false, true),
+        })
+            yield return Attention(b, h, kvh, sq, sk, d, mask, causal, store);
+        foreach (var (b, h, sq, sk, d) in new[] { (2, 8, 128, 128, 32), (8, 8, 64, 64, 32), (1, 2, 16, 24, 16), (1, 1, 5, 7, 6) })
+            yield return AttentionBackward(b, h, sq, sk, d);
+    }
+
+    // ScaledDotProductAttentionBackward from stored weights (every 5th key masked: zero weight) against fp64 gradients.
+    private static RouteCase AttentionBackward(int batch, int heads, int seqQ, int seqK, int headDim)
+    {
+        float[] q = Fill(batch * heads * seqQ * headDim, 41, 0), k = Fill(batch * heads * seqK * headDim, 42, 0);
+        float[] v = Fill(batch * heads * seqK * headDim, 43, 0), dout = Fill(batch * heads * seqQ * headDim, 44, 0);
+        float scale = (float)(1.0 / Math.Sqrt(headDim));
+        var p = new float[batch * heads * seqQ * seqK];
+        for (int row = 0; row < batch * heads * seqQ; row++)
+        {
+            double sum = 0;
+            for (int ki = 0; ki < seqK; ki++) sum += ki % 5 == 0 ? 0 : 1 + (row * 7 + ki) % 13;
+            for (int ki = 0; ki < seqK; ki++) p[row * seqK + ki] = (float)((ki % 5 == 0 ? 0 : 1 + (row * 7 + ki) % 13) / sum);
+        }
+        var dq = new double[q.Length];
+        var dk = new double[k.Length];
+        var dv = new double[v.Length];
+        System.Threading.Tasks.Parallel.For(0, batch * heads, bh =>
+        {
+            for (int qi = 0; qi < seqQ; qi++)
+            {
+                int row = bh * seqQ + qi;
+                var dp = new double[seqK];
+                double dot = 0;
+                for (int ki = 0; ki < seqK; ki++)
+                {
+                    for (int e = 0; e < headDim; e++) dp[ki] += (double)dout[row * headDim + e] * v[(bh * seqK + ki) * headDim + e];
+                    dot += p[row * seqK + ki] * dp[ki];
+                }
+                for (int ki = 0; ki < seqK; ki++)
+                {
+                    double pk = p[row * seqK + ki], ds = scale * pk * (dp[ki] - dot);
+                    for (int e = 0; e < headDim; e++)
+                    {
+                        dv[(bh * seqK + ki) * headDim + e] += pk * dout[row * headDim + e];
+                        dq[row * headDim + e] += ds * k[(bh * seqK + ki) * headDim + e];
+                        dk[(bh * seqK + ki) * headDim + e] += ds * q[row * headDim + e];
+                    }
+                }
+            }
+        });
+        return new RouteCase("AttentionBackward " + batch + "x" + heads + "x" + seqQ + "x" + seqK + "x" + headDim,
+            CudaBackend.AttentionBackwardKey(batch, heads, seqQ, seqK, headDim, scale),
+            new[] { dout, q, k, v, p }, new[] { dq.Length, dk.Length, dv.Length },
+            (backend, a) => backend.ScaledDotProductAttentionBackward(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
+                batch, heads, seqQ, seqK, headDim, scale, isCausal: false),
+            new[] { ("dq", 5, dq), ("dk", 6, dk), ("dv", 7, dv) }, Math.Max(1, Max(Abs(dk))), seqQ + headDim);
+    }
+
+    // ScaledDotProductAttention against an fp64 reference of the hand-written kernel's contract: a zero mask element
+    // or a key past q + seqK - seqQ (causal) is excluded; a row with no key left has zero weights and output.
+    private static RouteCase Attention(int batch, int heads, int kvHeads, int seqQ, int seqK, int headDim,
+        CodegenAttentionMask mask, bool causal, bool storeWeights)
+    {
+        float[] q = Fill(batch * heads * seqQ * headDim, 31, 0), k = Fill(batch * kvHeads * seqK * headDim, 32, 0);
+        float[] v = Fill(batch * kvHeads * seqK * headDim, 33, 0);
+        int maskSize = mask == CodegenAttentionMask.Full ? batch * heads * seqQ * seqK : seqQ * seqK;
+        var m = new float[mask == CodegenAttentionMask.None ? 0 : maskSize];
+        // Every 5th key masked, and query row 3's keys all masked (a row with nothing to attend to).
+        for (int i = 0; i < m.Length; i++) m[i] = i % 5 == 0 || (i / seqK) % seqQ == 3 ? 0f : 1f;
+        float scale = (float)(1.0 / Math.Sqrt(headDim));
+        int group = heads / kvHeads;
+        var weights = new double[batch * heads * seqQ * seqK];
+        var output = new double[batch * heads * seqQ * headDim];
+        System.Threading.Tasks.Parallel.For(0, batch * heads * seqQ, row =>
+        {
+            int qi = row % seqQ, bh = row / seqQ, b = bh / heads, h = bh % heads, kvh = b * kvHeads + h / group;
+            var logit = new double[seqK];
+            var keep = new bool[seqK];
+            double max = double.NegativeInfinity;
+            for (int ki = 0; ki < seqK; ki++)
+            {
+                int mi = (mask == CodegenAttentionMask.Full ? bh * seqQ * seqK : 0) + qi * seqK + ki;
+                keep[ki] = !(causal && ki > qi + seqK - seqQ) && (mask == CodegenAttentionMask.None || m[mi] != 0f);
+                if (!keep[ki]) continue;
+                double s = 0;
+                for (int e = 0; e < headDim; e++) s += (double)q[row * headDim + e] * k[(kvh * seqK + ki) * headDim + e];
+                logit[ki] = s * scale;
+                max = Math.Max(max, logit[ki]);
+            }
+            double sum = 0;
+            for (int ki = 0; ki < seqK; ki++) if (keep[ki]) sum += Math.Exp(logit[ki] - max);
+            for (int ki = 0; ki < seqK; ki++)
+                weights[row * seqK + ki] = keep[ki] && sum > 0 ? Math.Exp(logit[ki] - max) / sum : 0;
+            for (int e = 0; e < headDim; e++)
+            {
+                double acc = 0;
+                for (int ki = 0; ki < seqK; ki++) acc += weights[row * seqK + ki] * v[(kvh * seqK + ki) * headDim + e];
+                output[row * headDim + e] = acc;
+            }
+        });
+        var inputs = mask == CodegenAttentionMask.None ? new[] { q, k, v } : new[] { q, k, v, m };
+        int outBuffer = inputs.Length, weightBuffer = inputs.Length + 1;
+        var outputs = storeWeights ? new[] { output.Length, weights.Length } : new[] { output.Length };
+        var checks = storeWeights
+            ? new[] { ("out", outBuffer, output), ("weights", weightBuffer, weights) }
+            : new[] { ("out", outBuffer, output) };
+        string name = "Attention " + batch + "x" + heads + (kvHeads != heads ? "/" + kvHeads : "") + "x" + seqQ + "x" + seqK +
+            "x" + headDim + (causal ? " causal" : "") + (mask == CodegenAttentionMask.None ? "" : " " + mask.ToString().ToLowerInvariant()) +
+            (storeWeights ? " +w" : "");
+        return new RouteCase(name,
+            CudaBackend.AttentionKey(batch, heads, kvHeads, seqQ, seqK, headDim, scale, mask, causal, storeWeights),
+            inputs, outputs,
+            (backend, a) => backend.ScaledDotProductAttention(a[0], a[1], a[2], a[outBuffer],
+                storeWeights ? a[weightBuffer] : null, mask == CodegenAttentionMask.None ? null : a[3],
+                batch, heads, seqQ, seqK, headDim, scale, causal, numKVHeads: kvHeads),
+            checks, Math.Max(1, MaxAbs(v)), headDim + seqK);
     }
 
     // ---- linear layers (#890 phase 4c) ------------------------------------------------------------------------
+
+    // ---- flash attention probe ------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// FlashAttention (the fused flash_attention_v2 kernel, no mask) against the declared attention program on the same
+    /// call (ScaledDotProductAttention, weights not kept): with seqQ == seqK the two compute the same output. Times only
+    /// -- whether a declared flash route can win before it is built.
+    /// </summary>
+    private static void FlashProbe(CudaBackend backend)
+    {
+        Console.WriteLine();
+        Console.WriteLine("FLASH PROBE - flash_attention_v2 vs the declared attention program, same call (us)");
+        foreach (var (b, h, s, d, causal) in new[]
+        {
+            (2, 8, 128, 64, false), (2, 8, 128, 64, true), (4, 8, 256, 64, true), (8, 12, 512, 64, true),
+            (1, 8, 1024, 64, true), (16, 8, 64, 32, false), (1, 2, 16, 16, false),
+        })
+        {
+            using var q = backend.AllocateBuffer(Fill(b * h * s * d, 51, 0));
+            using var k = backend.AllocateBuffer(Fill(b * h * s * d, 52, 0));
+            using var v = backend.AllocateBuffer(Fill(b * h * s * d, 53, 0));
+            using var o = backend.AllocateBuffer(b * h * s * d);
+            float scale = (float)(1.0 / Math.Sqrt(d));
+            double flash = Time(() => backend.FlashAttention(q, k, v, o, null, b, h, s, d, scale, causal), backend.Synchronize);
+            backend.DeclaredKernelsSwitch = true;
+            double declared;
+            try
+            {
+                declared = Time(() => backend.ScaledDotProductAttention(q, k, v, o, null, null, b, h, s, s, d, scale, causal),
+                    backend.Synchronize);
+            }
+            finally
+            {
+                backend.DeclaredKernelsSwitch = null;
+            }
+            Console.WriteLine(("flash " + b + "x" + h + "x" + s + "x" + d + (causal ? " causal" : "")).PadRight(34) +
+                flash.ToString("F1", CultureInfo.InvariantCulture).PadLeft(12) +
+                declared.ToString("F1", CultureInfo.InvariantCulture).PadLeft(12) +
+                (flash / declared).ToString("F2", CultureInfo.InvariantCulture).PadLeft(8) + "x");
+        }
+    }
 
     // ---- plain GEMMs ----------------------------------------------------------------------------------------------
 

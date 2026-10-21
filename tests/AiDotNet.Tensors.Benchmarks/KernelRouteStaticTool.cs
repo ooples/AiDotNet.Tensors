@@ -53,6 +53,7 @@ internal static class KernelRouteStaticTool
             ["activation"] = HandWritten("activation_kernels", CudaActivationKernels.GetSource(), major, minor, work, Tool),
             ["neuralnet"] = HandWritten("neuralnet_kernels", CudaNeuralNetKernels.GetSource(), major, minor, work, Tool),
             ["skinny"] = HandWritten("skinny_gemm_kernels", CudaSkinnyGemmKernels.GetSource(), major, minor, work, Tool),
+            ["attention"] = HandWritten("attention_kernels", CudaAttentionKernels.GetSource(), major, minor, work, Tool),
         };
 
         // A GEMM schedule's lowering, as CudaBackend.BuildUnderGemmSchedule builds it (implicit-GEMM tiles, optionally
@@ -101,6 +102,17 @@ internal static class KernelRouteStaticTool
                 "skinny", new[] { "small_gemm_tinyk" }, ImplicitGemm(128, 64, 0)),
             new Family("GemmTA 128x128x2048 implicit-gemm.split8v.m64n64", CodegenBackendPrograms.Gemm(1, 128, 128, 2048, true, false),
                 "skinny", new[] { "skinny_gemm_tn" }, ImplicitGemm(64, 64, 8)),
+            // Attention: the two contractions as implicit GEMMs (CudaBackend.LowerAttentionPass), the rows by the planner.
+            new Family("Attention 2x8x128x128x64", CodegenBackendPrograms.ScaledDotProductAttention(2, 8, 8, 128, 128, 64,
+                0.125, CodegenAttentionMask.None, false, null), "attention", new[] { "scaled_dot_product_attention" },
+                pass => pass.Name is "attention_scores" or "attention_output" ? ImplicitGemm(64, 64, 0)(pass) : null),
+            new Family("Attention 2x8x128x128x64 flash", CodegenBackendPrograms.ScaledDotProductAttention(2, 8, 8, 128, 128, 64,
+                0.125, CodegenAttentionMask.None, true, null), "attention", new[] { "flash_attention_v2" },
+                pass => pass.Name is "attention_scores" or "attention_output" ? ImplicitGemm(64, 64, 0)(pass) : null),
+            new Family("AttentionBackward 2x8x128x128x32", CodegenBackendPrograms.ScaledDotProductAttentionBackward(2, 8, 128, 128, 32,
+                0.17), "neuralnet", new[] { "batched_transpose", "softmax_backward" },
+                pass => pass.Name is "attention_dv" or "attention_dp" or "attention_dq" or "attention_dk"
+                    ? ImplicitGemm(64, 64, 0)(pass) : null),
             new Family("GemmTA 16x10x4096 planner", CodegenBackendPrograms.Gemm(1, 16, 10, 4096, true, false),
                 "skinny", new[] { "small_gemm_rowreduce" }),
         };

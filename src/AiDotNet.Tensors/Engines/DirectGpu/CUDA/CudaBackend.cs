@@ -9632,6 +9632,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new ArgumentException("The attention-weights buffer is too small.", nameof(attentionWeights));
         if (mask is not null && mask.Size < seqQ * seqK)
             throw new ArgumentException("The attention mask must contain at least seqQ * seqK elements.", nameof(mask));
+        int maskMode = mask is null ? 0 : mask.Size >= weightsSize ? 2 : 1;
+        // #890 phase 4d: the declared program (two implicit GEMMs around a row softmax) unless the logits are soft-capped.
+        if (TryDeclaredAttention(query, key, value, output, attentionWeights, mask, batch, numHeads, kvHeads, seqQ, seqK,
+                headDim, scale, isCausal, maskMode, softcap))
+            return;
 
         IntPtr queryPtr = query.Handle;
         IntPtr keyPtr = key.Handle;
@@ -9640,7 +9645,6 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         IntPtr weightsPtr = attentionWeights?.Handle ?? IntPtr.Zero;
         IntPtr maskPtr = mask?.Handle ?? IntPtr.Zero;
         int causalFlag = isCausal ? 1 : 0;
-        int maskMode = mask is null ? 0 : mask.Size >= weightsSize ? 2 : 1;
         int storeWeights = attentionWeights is null ? 0 : 1;
         void** args = stackalloc void*[17];
         args[0] = &queryPtr;
@@ -9773,6 +9777,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             gradQuery, gradKey, gradValue,
             batch, numHeads, numHeads, seqQ, seqK, headDim, scale))
             return;
+        // #890 phase 4d: the six products and the softmax gradient as one declared program, no transposed copies.
+        if (TryDeclaredAttentionBackward(gradOutput, query, key, value, attentionWeights, gradQuery, gradKey, gradValue,
+                batch, numHeads, seqQ, seqK, headDim, scale))
+            return;
         int batchHeads = checked(batch * numHeads);
         int qkSize = checked(seqQ * seqK);
 
@@ -9835,6 +9843,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
     {
         using var _ = PushContext();
+        // #890 phase 4d: the declared attention program (materialised scores, 1.4-9.8x the fused kernel on a GTX
+        // 1660 Ti), with the row log-sum-exp as softmaxStats. Not with a bias, nor causal across unequal lengths: the
+        // flash kernel's causal rule (key <= query) has no offset, the declared one aligns the last query and key.
+        if (attentionBias is null && (!isCausal || seqQ == seqK) &&
+            TryDeclaredAttention(query, key, value, output, null, null, batch, numHeads, numHeads, seqQ, seqK, headDim,
+                scale, isCausal, maskMode: 0, softcap: 0f, stats: softmaxStats))
+            return;
         var kernel = _kernelCache["flash_attention_v2"];
         uint gridX = (uint)((seqQ + 31) / 32);
         uint gridY = (uint)(batch * numHeads);

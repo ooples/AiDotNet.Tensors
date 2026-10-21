@@ -40,14 +40,19 @@ internal enum DeclaredFamily
     Gemm,
     GemmTransposedA,
     GemmTransposedB,
+    ScaledDotProductAttention,
+    ScaledDotProductAttentionBackward,
 }
 
 /// <summary>One declared program: its family and shape (unused dimensions are 0).</summary>
 internal readonly struct DeclaredKey : IEquatable<DeclaredKey>
 {
-    internal DeclaredKey(DeclaredFamily family, int d0, int d1, int d2, int d3, float epsilon, float momentum, string? name = null)
+    internal DeclaredKey(DeclaredFamily family, int d0, int d1, int d2, int d3, float epsilon, float momentum, string? name = null,
+        int d4 = 0, int d5 = 0)
     {
         Name = name;
+        D4 = d4;
+        D5 = d5;
         Family = family;
         D0 = d0;
         D1 = d1;
@@ -62,6 +67,8 @@ internal readonly struct DeclaredKey : IEquatable<DeclaredKey>
     internal int D1 { get; }
     internal int D2 { get; }
     internal int D3 { get; }
+    internal int D4 { get; }
+    internal int D5 { get; }
     internal float Epsilon { get; }
     internal float Momentum { get; }
 
@@ -70,7 +77,7 @@ internal readonly struct DeclaredKey : IEquatable<DeclaredKey>
 
     public bool Equals(DeclaredKey other) =>
         Family == other.Family && D0 == other.D0 && D1 == other.D1 && D2 == other.D2 && D3 == other.D3 &&
-        Epsilon.Equals(other.Epsilon) && Momentum.Equals(other.Momentum) && string.Equals(Name, other.Name, StringComparison.Ordinal);
+        D4 == other.D4 && D5 == other.D5 && Epsilon.Equals(other.Epsilon) && Momentum.Equals(other.Momentum) && string.Equals(Name, other.Name, StringComparison.Ordinal);
 
     public override bool Equals(object? obj) => obj is DeclaredKey other && Equals(other);
 
@@ -83,6 +90,8 @@ internal readonly struct DeclaredKey : IEquatable<DeclaredKey>
             h = h * 31 + D1;
             h = h * 31 + D2;
             h = h * 31 + D3;
+            h = h * 31 + D4;
+            h = h * 31 + D5;
             h = h * 31 + Epsilon.GetHashCode();
             h = h * 31 + (Name is null ? 0 : StringComparer.Ordinal.GetHashCode(Name));
             return h * 31 + Momentum.GetHashCode();
@@ -93,7 +102,7 @@ internal readonly struct DeclaredKey : IEquatable<DeclaredKey>
     public override string ToString()
     {
         var sb = new System.Text.StringBuilder(Family.ToString().ToLowerInvariant());
-        foreach (int d in new[] { D0, D1, D2, D3 })
+        foreach (int d in new[] { D0, D1, D2, D3, D4, D5 })
             if (d != 0) sb.Append(sb.Length > Family.ToString().Length ? "x" : ":").Append(d.ToString(CultureInfo.InvariantCulture));
         if (Epsilon != 0) sb.Append(":e").Append(Epsilon.ToString("R", CultureInfo.InvariantCulture));
         if (Momentum != 0) sb.Append(":m").Append(Momentum.ToString("R", CultureInfo.InvariantCulture));
@@ -411,6 +420,7 @@ public sealed partial class CudaBackend
         DisposeDeclaredResidents();
         DisposeDeclaredElementwise();
         DisposeDeclaredConvolutions();
+        DisposeCausalBiases();
 
         foreach (var program in _declaredPrograms.Values) program?.Dispose();
         _declaredPrograms.Clear();
