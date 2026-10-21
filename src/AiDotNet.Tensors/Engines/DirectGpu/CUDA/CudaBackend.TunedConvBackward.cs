@@ -155,6 +155,12 @@ public sealed partial class CudaBackend
                         candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("nvrtc.conv2d_dx.s2k3",
                             TunedKernelOrigin.Builtin, true, shape => DgradS2AdmitsShape(shape) && EnsureDgradS2Module(),
                             (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardInputS2K3(a)) LaunchDxDirect(a); }));
+                    // 1x1 stride-2 input gradient as one GEMM written straight into dX with its zero phases
+                    // (CudaConvDgradS2Kernels), in place of the phase kernel's three tapless phase layers and reduce.
+                    if (candidates.Count > 0 && s_convS2K1DgradEnv)
+                        candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("nvrtc.conv2d_dx.s2k1",
+                            TunedKernelOrigin.Builtin, true, shape => DgradS2K1AdmitsShape(shape) && EnsureDgradS2Module(),
+                            (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardInputS2K1(a)) LaunchDxDirect(a); }));
                     // Winograd F(4x4,3x3): registered ONLY under the explicit reduced-precision opt-in (owner decision,
                     // #1335): ~20x the fp32 rounding error of F(2x2). Unregistered otherwise, so the persisted-decision key
                     // differs between the two settings.

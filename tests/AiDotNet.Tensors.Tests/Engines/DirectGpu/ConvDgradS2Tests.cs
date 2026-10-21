@@ -202,4 +202,209 @@ public sealed class ConvDgradS2Tests
             _out.WriteLine($"[{inC}->{outC} s2 at {size}x{size}] s2k3 {Stat(times[0])} us, engine {Stat(times[1])} us");
         }
     }
+
+    // The 1x1 stride-2 input gradient (conv2d_dgrad_s2k1_g*): batch, C, K, input size.
+    public static IEnumerable<object[]> ShapesK1() => new[]
+    {
+        new object[] { 8, 64, 128, 32 },    // ResNet-18 shortcuts
+        new object[] { 8, 128, 256, 16 },
+        new object[] { 8, 256, 512, 8 },    // deep: the grid choice splits the channels
+        new object[] { 3, 40, 24, 24 },     // a partial 32-channel tile; output width 12: blocks straddle rows
+        new object[] { 2, 12, 20, 8 },      // output width 4; K off the eight-channel step
+        new object[] { 1, 8, 16, 128 },     // output width 64: a block is half a row
+    };
+
+    public static IEnumerable<object[]> ShapesK1Grids() =>
+        ShapesK1().SelectMany(s => new[] { (0, 0), (1, 1), (2, 1), (4, 1), (1, 3), (4, 2) }
+            .Select(g => s.Concat(new object[] { g.Item1, g.Item2 }).ToArray()));
+
+    [SkippableTheory]
+    [MemberData(nameof(ShapesK1Grids))]
+    public void InputGradient1x1_MatchesFloat64ReferenceAndIsBitReproducible(int batch, int inC, int outC, int size, int groups, int splits)
+    {
+        Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA is not available.");
+        using var backend = CudaBackend.CreateOrThrow();
+        Skip.IfNot(backend.EnsureDgradS2Module(), "Stride-2 input-gradient kernels did not compile.");
+        int o = size / 2;
+        var rng = new Random(6160 + batch * 7 + inC * 3 + outC);
+        var gy = Rand(batch * outC * o * o, rng);
+        var wt = Rand(outC * inC, rng);
+        using var dy = backend.AllocateBuffer(gy);
+        using var w = backend.AllocateBuffer(wt);
+        var poison = Enumerable.Repeat(float.NaN, batch * inC * size * size).ToArray();
+        using var x1 = backend.AllocateBuffer(poison);
+        using var x2 = backend.AllocateBuffer(poison);
+        foreach (var x in new[] { x1, x2 })
+            Assert.True(backend.TryConv2DBackwardInputS2K1(new TunedConv2DBackwardArgs(dy, w, x, false, batch, inC, size, size, outC, o, o,
+                1, 1, 2, 2, 0, 0, 1, 1), groups, splits), "the 1x1 stride-2 input gradient refused an admitted shape");
+        backend.Synchronize();
+        float[] got = backend.DownloadBuffer(x1), again = backend.DownloadBuffer(x2);
+        double worst = 0;
+        for (int b = 0; b < batch; b++)
+            for (int c = 0; c < inC; c++)
+                for (int ih = 0; ih < size; ih++)
+                    for (int iw = 0; iw < size; iw++)
+                    {
+                        double s = 0, m = 0;
+                        if ((ih & 1) == 0 && (iw & 1) == 0)
+                            for (int k = 0; k < outC; k++)
+                            {
+                                double t = (double)gy[((b * outC + k) * o + ih / 2) * o + iw / 2] * wt[k * inC + c];
+                                s += t; m += Math.Abs(t);
+                            }
+                        int idx = ((b * inC + c) * size + ih) * size + iw;
+                        Assert.False(float.IsNaN(got[idx]), $"dX[{idx}] was never written");
+                        Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(got[idx]) == TestHelpers.MathCompat.SingleToInt32Bits(again[idx]),
+                            $"dX[{idx}] differs between two identical runs");
+                        double rel = Math.Abs(got[idx] - s) / Math.Max(1.0, m);
+                        worst = Math.Max(worst, rel);
+                        Assert.True(rel <= 1e-5, $"dX[{b},{c},{ih},{iw}] = {got[idx]} vs {s} (|terms| {m})");
+                    }
+        _out.WriteLine($"1x1 g{groups} s{splits}: max err / sum|terms| = {worst:E2}");
+    }
+
+    [SkippableFact]
+    public void Shapes_the_1x1_kernel_does_not_compute_are_refused()
+    {
+        Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA is not available.");
+        using var backend = CudaBackend.CreateOrThrow();
+        using var dy = backend.AllocateBuffer(8 * 64 * 32 * 32);
+        using var w = backend.AllocateBuffer(64 * 64 * 9);
+        using var dx = backend.AllocateBuffer(8 * 64 * 64 * 64);
+        TunedConv2DBackwardArgs A(int inC, int h, int outH, int k, int s, int p) =>
+            new(dy, w, dx, false, 2, inC, h, h, 8, outH, outH, k, k, s, s, p, p, 1, 1);
+        Assert.False(backend.TryConv2DBackwardInputS2K1(A(16, 32, 16, 3, 2, 1)), "3x3");
+        Assert.False(backend.TryConv2DBackwardInputS2K1(A(16, 32, 32, 1, 1, 0)), "stride 1");
+        Assert.False(backend.TryConv2DBackwardInputS2K1(A(18, 32, 16, 1, 2, 0)), "channels off a multiple of four");
+        Assert.False(backend.TryConv2DBackwardInputS2K1(A(16, 31, 16, 1, 2, 0)), "odd input");
+        Assert.False(backend.TryConv2DBackwardInputS2K1(A(16, 20, 10, 1, 2, 0)), "output width off a multiple of four");
+    }
+
+    [SkippableFact]
+    public void The_input_gradient_slot_registers_the_1x1_candidate()
+    {
+        Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA is not available.");
+        Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CONV_S2K1_DGRAD") == "0", "The candidate is switched off.");
+        using var backend = CudaBackend.CreateOrThrow();
+        var ids = backend.Conv2DBackwardDataSlot.CandidateIds;
+        Assert.Contains("nvrtc.conv2d_dx.s2k1", ids);
+        Assert.NotEqual("nvrtc.conv2d_dx.s2k1", ids[0]);
+    }
+
+    /// <summary>
+    /// ResNet-18's 1x1 shortcut layers at batch 8, interleaved round by round (min / median us per call): this kernel with
+    /// its grid choice against the engine's phase kernel (with its reduce). Gated on AIDOTNET_PERF_RUNNER=1.
+    /// </summary>
+    [SkippableFact]
+    public void Bench_S2K1VsEngine()
+    {
+        Skip.IfNot(Environment.GetEnvironmentVariable("AIDOTNET_PERF_RUNNER") == "1", "Set AIDOTNET_PERF_RUNNER=1 on a quiet GPU machine.");
+        Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA is not available.");
+        using var backend = CudaBackend.CreateOrThrow();
+        Skip.IfNot(backend.EnsureDgradS2Module(), "Stride-2 input-gradient kernels did not compile.");
+        const int rounds = 41, burst = 10;
+        var rng = new Random(31);
+        foreach (var (inC, size, outC) in new[] { (64, 32, 128), (128, 16, 256), (256, 8, 512) })
+        {
+            int o = size / 2;
+            using var dy = backend.AllocateBuffer(Rand(8 * outC * o * o, rng));
+            using var w = backend.AllocateBuffer(Rand(outC * inC, rng));
+            using var dx = backend.AllocateBuffer(8 * inC * size * size);
+            var a = new TunedConv2DBackwardArgs(dy, w, dx, false, 8, inC, size, size, outC, o, o, 1, 1, 2, 2, 0, 0, 1, 1);
+            Func<bool>[] routes = { () => backend.TryConv2DBackwardInputS2K1(a), () => backend.Conv2DBackwardInputViaEngine(a) };
+            var times = routes.Select(_ => new List<double>()).ToArray();
+            for (int r = 0; r < rounds; r++)
+                for (int i = 0; i < routes.Length; i++)
+                {
+                    for (int j = 0; j < 3; j++) Assert.True(routes[i]());
+                    backend.Synchronize();
+                    var sw = Stopwatch.StartNew();
+                    for (int j = 0; j < burst; j++) routes[i]();
+                    backend.Synchronize();
+                    times[i].Add(sw.Elapsed.TotalMilliseconds * 1000 / burst);
+                }
+            string Stat(List<double> t) { var s = t.OrderBy(v => v).ToArray(); return $"{s[0]:F1} / {s[s.Length / 2]:F1}"; }
+            _out.WriteLine($"[{inC}->{outC} 1x1 s2 at {size}x{size}] s2k1 {Stat(times[0])} us, engine {Stat(times[1])} us");
+        }
+    }
+
+    // The shortcut pair (conv2d_dgrad_s2k3sc_g*): the 3x3 stride-2 input gradient plus the 1x1 projection's, one launch.
+    // batch, C, K (3x3), K2 (projection), input size.
+    public static IEnumerable<object[]> PairShapes() => new[]
+    {
+        new object[] { 8, 64, 128, 128, 32 },   // ResNet-18 downsampling blocks
+        new object[] { 8, 128, 256, 256, 16 },
+        new object[] { 8, 256, 512, 512, 8 },
+        new object[] { 3, 40, 24, 16, 16 },     // K2 < K: the shortcut's reduction ends first; a partial channel tile
+        new object[] { 2, 12, 8, 36, 8 },       // K2 > K, off the eight-channel step; output width 4
+    };
+
+    public static IEnumerable<object[]> PairShapesGrids() =>
+        PairShapes().SelectMany(s => new[] { (0, 0), (1, 1), (2, 1), (4, 1), (1, 3), (4, 2) }
+            .Select(g => s.Concat(new object[] { g.Item1, g.Item2 }).ToArray()));
+
+    [SkippableTheory]
+    [MemberData(nameof(PairShapesGrids))]
+    public void ShortcutPair_MatchesFloat64ReferenceAndIsBitReproducible(int batch, int inC, int outC, int shortcutC, int size,
+        int groups, int splits)
+    {
+        Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA is not available.");
+        using var backend = CudaBackend.CreateOrThrow();
+        Skip.IfNot(backend.EnsureDgradS2Module(), "Stride-2 input-gradient kernels did not compile.");
+        int o = size / 2;
+        var rng = new Random(8380 + batch * 7 + inC * 3 + outC + shortcutC);
+        var gy = Rand(batch * outC * o * o, rng);
+        var wt = Rand(outC * inC * 9, rng);
+        var gy2 = Rand(batch * shortcutC * o * o, rng);
+        var wt2 = Rand(shortcutC * inC, rng);
+        using var dy = backend.AllocateBuffer(gy);
+        using var w = backend.AllocateBuffer(wt);
+        using var dy2 = backend.AllocateBuffer(gy2);
+        using var w2 = backend.AllocateBuffer(wt2);
+        var poison = Enumerable.Repeat(float.NaN, batch * inC * size * size).ToArray();
+        using var x1 = backend.AllocateBuffer(poison);
+        using var x2 = backend.AllocateBuffer(poison);
+        foreach (var x in new[] { x1, x2 })
+            Assert.True(backend.TryConv2DBackwardInputS2K3Pair(new TunedConv2DBackwardArgs(dy, w, x, false, batch, inC, size, size,
+                outC, o, o, 3, 3, 2, 2, 1, 1, 1, 1), dy2, w2, shortcutC, groups, splits), "the shortcut pair refused an admitted shape");
+        backend.Synchronize();
+        float[] got = backend.DownloadBuffer(x1), again = backend.DownloadBuffer(x2);
+        double worst = 0;
+        for (int b = 0; b < batch; b++)
+            for (int c = 0; c < inC; c++)
+                for (int ih = 0; ih < size; ih++)
+                    for (int iw = 0; iw < size; iw++)
+                    {
+                        double s = 0, m = 0;
+                        for (int kh = 0; kh < 3; kh++)
+                        {
+                            int th = ih + 1 - kh;
+                            if (th < 0 || (th & 1) != 0 || th / 2 >= o) continue;
+                            for (int kw = 0; kw < 3; kw++)
+                            {
+                                int tw = iw + 1 - kw;
+                                if (tw < 0 || (tw & 1) != 0 || tw / 2 >= o) continue;
+                                for (int k = 0; k < outC; k++)
+                                {
+                                    double t = (double)gy[((b * outC + k) * o + th / 2) * o + tw / 2] * wt[((k * inC + c) * 3 + kh) * 3 + kw];
+                                    s += t; m += Math.Abs(t);
+                                }
+                            }
+                        }
+                        if ((ih & 1) == 0 && (iw & 1) == 0)
+                            for (int k = 0; k < shortcutC; k++)
+                            {
+                                double t = (double)gy2[((b * shortcutC + k) * o + ih / 2) * o + iw / 2] * wt2[k * inC + c];
+                                s += t; m += Math.Abs(t);
+                            }
+                        int idx = ((b * inC + c) * size + ih) * size + iw;
+                        Assert.False(float.IsNaN(got[idx]), $"dX[{idx}] was never written");
+                        Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(got[idx]) == TestHelpers.MathCompat.SingleToInt32Bits(again[idx]),
+                            $"dX[{idx}] differs between two identical runs");
+                        double rel = Math.Abs(got[idx] - s) / Math.Max(1.0, m);
+                        worst = Math.Max(worst, rel);
+                        Assert.True(rel <= 1e-5, $"dX[{b},{c},{ih},{iw}] = {got[idx]} vs {s} (|terms| {m})");
+                    }
+        _out.WriteLine($"pair g{groups} s{splits}: max err / sum|terms| = {worst:E2}");
+    }
 }
