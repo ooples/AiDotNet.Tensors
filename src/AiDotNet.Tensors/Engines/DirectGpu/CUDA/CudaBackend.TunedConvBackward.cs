@@ -147,6 +147,14 @@ public sealed partial class CudaBackend
                         candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("nvrtc.conv2d_dx.winograd_f23_fused",
                             TunedKernelOrigin.Builtin, true, shape => WinogradF23AdmitsShape(shape) && EnsureWinogradFusedModule(),
                             (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardDataWinogradF23Fused(a)) LaunchDxDirect(a); }));
+                    // Stride-2 3x3 input gradient with all four sub-pixel phases in one block (CudaConvDgradS2Kernels):
+                    // equal work per block and no phase reduce. Per call on an RTX 3080, batch 8, vs the engine's phase
+                    // kernel (with its weight relayout and reduce): 64->128 48.9 -> 27.5 us, 128->256 56.0 -> 31.2,
+                    // 256->512 51.9 -> 35.1.
+                    if (candidates.Count > 0 && s_convS2K3DgradEnv)
+                        candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("nvrtc.conv2d_dx.s2k3",
+                            TunedKernelOrigin.Builtin, true, shape => DgradS2AdmitsShape(shape) && EnsureDgradS2Module(),
+                            (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardInputS2K3(a)) LaunchDxDirect(a); }));
                     // Winograd F(4x4,3x3): registered ONLY under the explicit reduced-precision opt-in (owner decision,
                     // #1335): ~20x the fp32 rounding error of F(2x2). Unregistered otherwise, so the persisted-decision key
                     // differs between the two settings.
