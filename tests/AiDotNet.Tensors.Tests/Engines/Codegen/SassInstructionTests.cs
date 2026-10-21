@@ -261,6 +261,48 @@ public class SassInstructionTests
         Assert.True(scheduled[0].Control.Stall >= 6, "IMAD.X issued " + scheduled[0].Control.Stall + " cycles after its carry.");
     }
 
+    /// <summary>
+    /// Renaming rewrites every field naming a register (and nothing else), and refuses a map that would split or
+    /// misalign a multi-register operand.
+    /// </summary>
+    [Fact]
+    public void RenamingMovesEveryOperandAndKeepsGroupsWhole()
+    {
+        var map = Enumerable.Range(0, 128).ToArray();
+        (map[16], map[20]) = (map[20], map[16]);
+        var renamed = SassRegisterRenamer.Rename(new[] { IaddCarryOut, IaddUniform }, map)
+            ?? throw new InvalidOperationException(SassRegisterRenamer.LastDecline);
+        Assert.Equal(20, renamed[0].Register(SassInstruction.RdField));    // IADD3 R16, P6, R16, 0x20, RZ -> R20, R20
+        Assert.Equal(20, renamed[0].Register(SassInstruction.RaField));
+        Assert.Equal(IaddCarryOut.Bits(32, 32), renamed[0].Bits(32, 32));   // the immediate is untouched
+        Assert.Equal(IaddCarryOut.Control, renamed[0].Control);
+        Assert.Equal(IaddUniform, renamed[1]);                              // R15, R68 and UR7 are not in the swap
+        Assert.Equal(7, renamed[1].UniformRegister(SassInstruction.RbField));
+
+        // LDS.U.128 R48, [R76] writes R48..R51: moving the group whole is fine, moving R48 alone is not.
+        var whole = Enumerable.Range(0, 128).ToArray();
+        for (int k = 0; k < 4; k++) (whole[48 + k], whole[52 + k]) = (whole[52 + k], whole[48 + k]);
+        Assert.Equal(52, SassRegisterRenamer.Rename(new[] { Lds128 }, whole)?[0].Register(SassInstruction.RdField));
+        var split = Enumerable.Range(0, 128).ToArray();
+        (split[48], split[52]) = (split[52], split[48]);
+        Assert.Null(SassRegisterRenamer.Rename(new[] { Lds128 }, split));
+        Assert.Contains("splits", SassRegisterRenamer.LastDecline);
+    }
+
+    /// <summary>
+    /// The scheduler is per architecture: sm_86's barrier holds its successor 6 cycles, and an architecture without
+    /// timings is declined rather than scheduled with another's.
+    /// </summary>
+    [Fact]
+    public void TimingsArePerArchitecture()
+    {
+        var sm86 = SassScheduler.RecomputeControl(new[] { BarSync, Lds128, Exit }, 86)
+            ?? throw new InvalidOperationException(SassScheduler.LastDecline);
+        Assert.True(sm86[0].Control.Stall >= 6);
+        Assert.Null(SassScheduler.RecomputeControl(new[] { BarSync, Lds128, Exit }, 90));
+        Assert.Contains("sm_90", SassScheduler.LastDecline);
+    }
+
     /// <summary>A barrier holds its successor 5 cycles: an LDS issued 1 cycle after BAR.SYNC read a stale tile.</summary>
     [Fact]
     public void ABarrierHoldsItsSuccessorFiveCycles()

@@ -17,6 +17,11 @@
 // fixed latency; S2UR and R2UR (vector A at 24 -> uniform) are variable-latency, like S2R. A uniform operation's guard
 // names a uniform predicate (nvdisasm prints @UP0): the uniform datapath has no per-thread state to test.
 //
+// sm_80+ (learned on sm_86): LDGSTS (cp.async) reads a shared address at bits 16 and a global address pair at 24 and
+// holds them under a read scoreboard; LDGDEPBAR commits the outstanding copies to a write scoreboard; DEPBAR.LE
+// SBn, k waits until scoreboard n (bits 44-46) holds at most k groups. CALL.REL.NOINC is a branch (ptxas leaves a
+// loop through it), its target at bits 32 like BRA's.
+//
 // and where predicates live: a compare's outputs at bits 81 and 84, a predicate source at 87 (negation at 90) -- the
 // carry-in of the .X forms of IADD3, LEA and IMAD among them (an IMAD.X issued 5 cycles after the IADD3 whose carry it
 // reads computed a wrong address high word, and its load faulted). Loads
@@ -117,7 +122,7 @@ public static class SassOpcodeTable
     private sealed record Spec(string Mnemonic, SassLatency Latency, bool WritesD, int DWidth, Sources Sources,
         int[] PredicateWrites, int[] PredicateReads, bool Memory = false, bool Store = false, int AddressWidth = 1,
         bool ReadsAllPredicates = false, bool WideC = false, int FixedLatency = AluLatency, bool Uniform = false,
-        bool SizedD = false, bool VectorSources = false);
+        bool SizedD = false, bool VectorSources = false, bool AsyncCopy = false);
 
     private static readonly Dictionary<int, Spec> s_specs = new()
     {
@@ -142,9 +147,11 @@ public static class SassOpcodeTable
         [0x025] = new("IMAD.WIDE", SassLatency.Fixed, true, 2, Sources.ABC, [], [87], WideC: true, FixedLatency: 8),
         [0x027] = new("IMAD.HI", SassLatency.Fixed, true, 1, Sources.ABC, [], [87]),
         [0x082] = new("UMOV", SassLatency.Fixed, true, 1, Sources.BOnly, [], [], Uniform: true),
+        [0x087] = new("USEL", SassLatency.Fixed, true, 1, Sources.AB, [], [87], Uniform: true),
         [0x08c] = new("UISETP", SassLatency.Fixed, false, 0, Sources.AB, [81, 84], [87], Uniform: true),
         [0x090] = new("UIADD3", SassLatency.Fixed, true, 1, Sources.ABC, [81, 84], [87, 77], Uniform: true),
         [0x091] = new("ULEA", SassLatency.Fixed, true, 1, Sources.ABC, [81], [87], Uniform: true),
+        [0x092] = new("ULOP3", SassLatency.Fixed, true, 1, Sources.ABC, [81], [87], Uniform: true),
         [0x099] = new("USHF", SassLatency.Fixed, true, 1, Sources.ABC, [], [], Uniform: true),
         [0x0a4] = new("UIMAD", SassLatency.Fixed, true, 1, Sources.ABC, [], [87], Uniform: true),
         [0x0a5] = new("UIMAD.WIDE", SassLatency.Fixed, true, 2, Sources.ABC, [], [87], WideC: true, Uniform: true),
@@ -159,9 +166,13 @@ public static class SassOpcodeTable
         [0x184] = new("LDS", SassLatency.Variable, true, 1, Sources.None, [], [], Memory: true),
         [0x186] = new("STG", SassLatency.Variable, false, 0, Sources.None, [], [], Memory: true, Store: true, AddressWidth: 2),
         [0x188] = new("STS", SassLatency.Variable, false, 0, Sources.None, [], [], Memory: true, Store: true),
+        [0x1ae] = new("LDGSTS", SassLatency.Variable, false, 0, Sources.None, [], [87], AsyncCopy: true),
+        [0x1af] = new("LDGDEPBAR", SassLatency.Variable, false, 0, Sources.None, [], []),
         [0x118] = new("NOP", SassLatency.Control, false, 0, Sources.None, [], []),
+        [0x11a] = new("DEPBAR", SassLatency.Control, false, 0, Sources.None, [], []),
         [0x11d] = new("BAR", SassLatency.Control, false, 0, Sources.None, [], []),
         [0x141] = new("BSYNC", SassLatency.Control, false, 0, Sources.None, [], []),
+        [0x144] = new("CALL", SassLatency.Control, false, 0, Sources.None, [], []),
         [0x145] = new("BSSY", SassLatency.Control, false, 0, Sources.None, [], []),
         [0x147] = new("BRA", SassLatency.Control, false, 0, Sources.None, [], []),
         [0x14d] = new("EXIT", SassLatency.Control, false, 0, Sources.None, [], []),
@@ -179,7 +190,14 @@ public static class SassOpcodeTable
         bool uniformD = spec.Uniform, uniformSources = spec.Uniform && !spec.VectorSources;
         var writes = new List<SassRegisterOperand>();
         var reads = new List<SassRegisterOperand>();
-        if (spec.Memory)
+        if (spec.AsyncCopy)
+        {
+            // LDGSTS [Rs+offset], [Rg.64]: the shared address sits in the destination field (read, not written), the
+            // global address pair at A; the copied data never passes through registers.
+            reads.Add(new SassRegisterOperand(D, 1));
+            reads.Add(new SassRegisterOperand(A, 2));
+        }
+        else if (spec.Memory)
         {
             // Access width in registers from the size field: 4 = 32 bits, 5 = 64, 6 = 128.
             int size = (int)instruction.Bits(73, 3);

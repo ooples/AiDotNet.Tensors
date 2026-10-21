@@ -82,6 +82,32 @@ internal static class SassLearnTool
         ReportVariantBits(lines);
         ReportScoreboards(lines);
         ReportTableConsistency(lines);
+        ReportScheduling(work, major * 10 + minor);
+    }
+
+    // The scheduler over every kernel compiled above, offline (no device needed, so sm_86 is covered from an sm_75
+    // machine): how many it schedules and why it declines the rest.
+    private static void ReportScheduling(string work, int architecture)
+    {
+        int scheduled = 0;
+        var declines = new SortedDictionary<string, int>(StringComparer.Ordinal);
+        foreach (string path in Directory.GetFiles(work, "*.cubin"))
+        {
+            var cubin = new AiDotNet.Tensors.Engines.Compilation.Codegen.Sass.SassCubin(File.ReadAllBytes(path));
+            foreach (string kernel in cubin.Kernels)
+            {
+                if (AiDotNet.Tensors.Engines.Compilation.Codegen.Sass.SassScheduler.RecomputeControl(cubin.Instructions(kernel), architecture) is not null)
+                {
+                    scheduled++;
+                    continue;
+                }
+                string reason = Regex.Replace(AiDotNet.Tensors.Engines.Compilation.Codegen.Sass.SassScheduler.LastDecline ?? "?", @"\d+", "N");
+                declines[reason] = declines.TryGetValue(reason, out int n) ? n + 1 : 1;
+            }
+        }
+        Console.WriteLine();
+        Console.WriteLine("SCHEDULING sm_" + architecture + " - " + scheduled + " kernels scheduled, " + declines.Values.Sum() + " declined");
+        foreach (var pair in declines) Console.WriteLine("  declined x" + pair.Value + ": " + pair.Key);
     }
 
     // SassOpcodeTable against ptxas's own schedule. Walking each kernel's straight-line code: a variable-latency
@@ -93,7 +119,7 @@ internal static class SassLearnTool
     // and its first dependent reader, per producer opcode.
     private static void ReportTableConsistency(List<SassLine> lines)
     {
-        int unknown = 0, missedWaits = 0, checkedReads = 0, checkedPredicates = 0, missedPredicates = 0;
+        int unknown = 0, missedWaits = 0, checkedReads = 0, checkedPredicates = 0, missedPredicates = 0, checkedOperands = 0, missedOperands = 0;
         var unknownOps = new SortedDictionary<string, int>(StringComparer.Ordinal);
         var minimumLatency = new SortedDictionary<string, int>(StringComparer.Ordinal);
         var misses = new SortedDictionary<string, int>(StringComparer.Ordinal);
@@ -183,6 +209,26 @@ internal static class SassLearnTool
                     }
                 foreach (int pw in effects.PredicateWrites.Select(f => (int)instruction.Bits(f, 3)).Where(p => p != 7).Select(p => predicateBase + p))
                     predicateReady[pw] = cycle;
+                // Register renaming (SassRegisterRenamer) needs the table to name every vector register field: each
+                // register nvdisasm prints must be a decoded field's base, and each decoded field's register must be
+                // printed (a field the table invents would have non-register bits rewritten).
+                var printed = new HashSet<int>(line.Operands.SelectMany(o =>
+                    Regex.Matches(o, @"(?<![A-Z_])R(\d+)").Select(x => int.Parse(x.Groups[1].Value, CultureInfo.InvariantCulture))));
+                var decoded = new HashSet<int>(effects.Reads.Concat(effects.Writes).Where(o => !o.Uniform)
+                    .Select(o => instruction.Register(o.Field)).Where(r => r != 255));
+                checkedOperands += printed.Count;
+                foreach (int r in printed.Where(r => !decoded.Contains(r)))
+                {
+                    missedOperands++;
+                    string key = line.Opcode + " 0x" + Field(line, 0, 12).ToString("x3") + " (R" + r + " printed, not decoded)";
+                    misses[key] = misses.TryGetValue(key, out int mo) ? mo + 1 : 1;
+                }
+                foreach (int r in decoded.Where(r => !printed.Contains(r)))
+                {
+                    missedOperands++;
+                    string key = line.Opcode + " 0x" + Field(line, 0, 12).ToString("x3") + " (R" + r + " decoded, not printed)";
+                    misses[key] = misses.TryGetValue(key, out int mo) ? mo + 1 : 1;
+                }
                 // Every predicate the listing names as an operand must be one the table reads or writes: ptxas keeps
                 // no scoreboard for predicates, so a missing one (IMAD.X's carry-in) is invisible to the wait check.
                 var covered = new HashSet<int>(effects.PredicateReads.Concat(effects.PredicateWrites)
@@ -217,7 +263,8 @@ internal static class SassLearnTool
         Console.WriteLine();
         Console.WriteLine("TABLE CONSISTENCY - " + unknown + " instructions of unknown opcodes; " + checkedReads +
             " register reads checked; " + missedWaits + " dependencies ptxas did not wait on (table errors); " +
-            checkedPredicates + " predicate operands checked, " + missedPredicates + " not in the table (table errors)");
+            checkedPredicates + " predicate operands checked, " + missedPredicates + " not in the table (table errors); " +
+            checkedOperands + " register operands checked, " + missedOperands + " decoded and printed sets disagree (table errors)");
         foreach (var pair in unknownOps) Console.WriteLine("  unknown " + pair.Key + " x" + pair.Value);
         foreach (var pair in misses) Console.WriteLine("  missed wait at " + pair.Key + " x" + pair.Value);
         foreach (var g in lines.GroupBy(l => Base(l.Opcode)))

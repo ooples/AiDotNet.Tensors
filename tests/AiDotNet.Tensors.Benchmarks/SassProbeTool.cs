@@ -9,6 +9,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Linq;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Sass;
@@ -23,6 +24,11 @@ internal static class SassProbeTool
         if (Array.IndexOf(args, "--gemm") >= 0)
         {
             RunGemm(args);
+            return;
+        }
+        if (Array.IndexOf(args, "--bank") >= 0)
+        {
+            RunBank(args);
             return;
         }
         using var runtime = new DirectPtxRuntime();
@@ -59,7 +65,7 @@ internal static class SassProbeTool
                 byte[] Rewrite(byte[] image)
                 {
                     if (Array.IndexOf(args, "--save") is int sv && sv >= 0) System.IO.File.WriteAllBytes(args[sv + 1], image);
-                    return ApplyPass(image, pass, upto, Array.IndexOf(args, "--dump") >= 0 && dumped++ == 0, out registers, out decline);
+                    return ApplyPass(image, major * 10 + minor, pass, upto, Array.IndexOf(args, "--dump") >= 0 && dumped++ == 0, out registers, out decline);
                 }
                 using var ptxModule = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
                 // maxnreg:N -- the PTX path capped at N registers by ptxas itself: what occupancy alone buys.
@@ -86,7 +92,7 @@ internal static class SassProbeTool
 
     // Rewrites every kernel of a cubin under one pass. The default is the scheduler's control words; the others mix
     // them with ptxas's per instruction, to bisect a fault or a mismatch to the rule that causes it.
-    private static byte[] ApplyPass(byte[] image, string pass, int upto, bool dump, out int registers, out string? decline)
+    private static byte[] ApplyPass(byte[] image, int architecture, string pass, int upto, bool dump, out int registers, out string? decline)
     {
         var cubin = new SassCubin(image);
         registers = 0;
@@ -95,7 +101,7 @@ internal static class SassProbeTool
             registers = Math.Max(registers, cubin.RegisterCount(kernel));
         foreach (string kernel in cubin.Kernels)
         {
-            var code = pass == "none" ? cubin.Instructions(kernel) : SassScheduler.RecomputeControl(cubin.Instructions(kernel));
+            var code = pass == "none" ? cubin.Instructions(kernel) : SassScheduler.RecomputeControl(cubin.Instructions(kernel), architecture);
             if (code is null)
             {
                 decline = "declined: " + SassScheduler.LastDecline;
@@ -140,6 +146,168 @@ internal static class SassProbeTool
         return cubin.ToArray();
     }
 
+    // --bank: what a register bank conflict costs. An FFMA-bound kernel (an 8 x 4 outer product into 32 accumulators,
+    // looped) is renamed (SassRegisterRenamer; renaming changes no arithmetic, so outputs must be bit-identical) to the
+    // fewest and to the most FFMA source pairs sharing a bank, by hill-climbing swaps of single (non-grouped)
+    // registers; the three versions are timed paired. --banks N sets the bank model (register mod N, default 2).
+    private static unsafe void RunBank(string[] args)
+    {
+        using var runtime = new DirectPtxRuntime();
+        int major = runtime.ComputeCapabilityMajor, minor = runtime.ComputeCapabilityMinor;
+        int banks = Array.IndexOf(args, "--banks") is int bk && bk >= 0 ? int.Parse(args[bk + 1], CultureInfo.InvariantCulture) : 2;
+        const int Threads = 256, Blocks = 24 * 16, Iterations = 4096;
+        string ptx = BankProbePtx(major, minor);
+        int[]? lowMap = null, highMap = null;
+        int original = 0, low = 0, high = 0;
+        byte[] Variant(byte[] image, bool maximize)
+        {
+            var cubin = new SassCubin(image);
+            string kernel = cubin.Kernels[0];
+            var code = cubin.Instructions(kernel);
+            int count = cubin.RegisterCount(kernel);
+            var singles = SingleRegisters(code, count);
+            var map = new int[count];
+            for (int r = 0; r < count; r++) map[r] = r;
+            int Score(int[] m) => FfmaBankConflicts(SassRegisterRenamer.Rename(code, m) ?? throw new InvalidOperationException(SassRegisterRenamer.LastDecline), banks);
+            original = Score(map);
+            int best = original;
+            var random = new Random(1442);
+            for (int step = 0; step < 4000 && singles.Count > 1; step++)
+            {
+                int a = singles[random.Next(singles.Count)], b = singles[random.Next(singles.Count)];
+                if (a == b) continue;
+                (map[a], map[b]) = (map[b], map[a]);
+                int score = Score(map);
+                if (maximize ? score >= best : score <= best) best = score;
+                else (map[a], map[b]) = (map[b], map[a]);
+            }
+            if (maximize) { high = best; highMap = map; } else { low = best; lowMap = map; }
+            cubin.SetInstructions(kernel, SassRegisterRenamer.Rename(code, map) ?? throw new InvalidOperationException(SassRegisterRenamer.LastDecline));
+            return cubin.ToArray();
+        }
+        using var ptxModule = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
+        using var lowModule = runtime.LoadRewrittenModule(ptx, image => Variant(image, false), "sass-bank-low");
+        using var highModule = runtime.LoadRewrittenModule(ptx, image => Variant(image, true), "sass-bank-high");
+        Console.WriteLine("SASS BANK sm_" + major + minor + ", bank = register mod " + banks + ": FFMA source pairs sharing a bank -- ptxas " +
+            original + ", fewest " + low + ", most " + high);
+
+        var outputs = new DirectPtxBuffer[3];
+        try
+        {
+            for (int k = 0; k < 3; k++) outputs[k] = runtime.AllocateBytes((nuint)(Threads * Blocks * sizeof(float)));
+            var modules = new[] { ptxModule, lowModule, highModule };
+            var functions = new IntPtr[3];
+            for (int k = 0; k < 3; k++) functions[k] = modules[k].GetFunction("bank_probe");
+            void Launch(int k)
+            {
+                ulong pointer = (ulong)outputs[k].Pointer;
+                uint iterations = Iterations;
+                void** argv = stackalloc void*[2];
+                argv[0] = &pointer;
+                argv[1] = &iterations;
+                modules[k].Launch(functions[k], Blocks, 1, 1, Threads, 1, 1, 0, argv);
+            }
+            for (int k = 0; k < 3; k++) Launch(k);
+            runtime.Synchronize();
+            var results = new float[3][];
+            for (int k = 0; k < 3; k++)
+            {
+                results[k] = new float[Threads * Blocks];
+                outputs[k].Download<float>(results[k]);
+            }
+            for (int k = 1; k < 3; k++)
+                for (int i = 0; i < results[0].Length; i++)
+                    if (BitConverter.SingleToInt32Bits(results[0][i]) != BitConverter.SingleToInt32Bits(results[k][i]))
+                        throw new InvalidOperationException("The renamed kernel " + (k == 1 ? "(fewest)" : "(most)") + " differs at " + i + ".");
+            var samples = new[] { new List<double>(), new List<double>(), new List<double>() };
+            for (int round = 0; round < 15; round++)
+                for (int k = 0; k < 3; k++)
+                    samples[k].Add(runtime.MeasureKernelMilliseconds(() => Launch(k), 1, 3) * 1000);
+            foreach (var s in samples) s.Sort();
+            double flops = 2.0 * 32 * Iterations * Threads * Blocks;
+            string[] names = { "ptxas", "fewest conflicts", "most conflicts" };
+            for (int k = 0; k < 3; k++)
+                Console.WriteLine(names[k].PadRight(18) + samples[k][7].ToString("F1", CultureInfo.InvariantCulture).PadLeft(9) + " us  " +
+                    (flops / (samples[k][7] * 1e6)).ToString("F2", CultureInfo.InvariantCulture) + " TFLOPS  (" +
+                    (samples[0][7] / samples[k][7]).ToString("F3", CultureInfo.InvariantCulture) + "x ptxas)");
+            Console.WriteLine("outputs bit-identical across the three");
+        }
+        finally
+        {
+            foreach (var buffer in outputs) buffer?.Dispose();
+        }
+    }
+
+    // Registers the kernel names only as single-register operands: swapping two of them is always a valid renaming.
+    private static List<int> SingleRegisters(IReadOnlyList<SassInstruction> code, int registerCount)
+    {
+        var used = new HashSet<int>();
+        var grouped = new HashSet<int>();
+        foreach (var instruction in code)
+        {
+            var effects = SassOpcodeTable.Decode(instruction) ?? throw new InvalidOperationException("Unknown opcode.");
+            foreach (var operand in effects.Reads.Concat(effects.Writes))
+            {
+                if (operand.Uniform) continue;
+                int r = instruction.Register(operand.Field);
+                if (r == SassInstruction.ZeroRegister) continue;
+                for (int k = 0; k < operand.Width; k++)
+                {
+                    used.Add(r + k);
+                    if (operand.Width > 1) grouped.Add(r + k);
+                }
+            }
+        }
+        // R1 is the stack pointer ptxas initialises from the constant bank; leave it where the ABI expects it.
+        return used.Where(r => r < registerCount && r != 1 && !grouped.Contains(r)).OrderBy(r => r).ToList();
+    }
+
+    // FFMA (register form) source pairs that share a bank and are both read from the register file: an operand comes
+    // from the reuse cache instead when the previous instruction set that slot's reuse bit for the same register.
+    private static int FfmaBankConflicts(IReadOnlyList<SassInstruction> code, int banks)
+    {
+        int[] fields = { SassInstruction.RaField, SassInstruction.RbField, SassInstruction.RcField };
+        int conflicts = 0;
+        for (int i = 0; i < code.Count; i++)
+        {
+            if (code[i].Opcode != 0x223) continue;
+            var fromFile = new List<int>();
+            for (int slot = 0; slot < 3; slot++)
+            {
+                int r = code[i].Register(fields[slot]);
+                if (r == SassInstruction.ZeroRegister) continue;
+                bool cached = i > 0 && (code[i - 1].Control.Reuse >> slot & 1) != 0 && code[i - 1].Register(fields[slot]) == r;
+                if (!cached && !fromFile.Contains(r)) fromFile.Add(r);
+            }
+            for (int x = 0; x < fromFile.Count; x++)
+                for (int y = x + 1; y < fromFile.Count; y++)
+                    if (fromFile[x] % banks == fromFile[y] % banks) conflicts++;
+        }
+        return conflicts;
+    }
+
+    private static string BankProbePtx(int major, int minor)
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.Append(".version 7.0\n.target sm_").Append(major).Append(minor).Append("\n.address_size 64\n")
+          .Append(".visible .entry bank_probe(.param .u64 p0, .param .u32 p1)\n{\n")
+          .Append("    .reg .b32 %r<8>;\n    .reg .b64 %rd<4>;\n    .reg .f32 %x<8>;\n    .reg .f32 %y<4>;\n    .reg .f32 %c<32>;\n    .reg .f32 %s;\n    .reg .pred %p;\n")
+          .Append("    mov.u32 %r0, %tid.x;\n    mov.u32 %r1, %ctaid.x;\n    mov.u32 %r2, %ntid.x;\n    mad.lo.s32 %r3, %r1, %r2, %r0;\n")
+          .Append("    cvt.rn.f32.s32 %s, %r3;\n    mul.rn.f32 %s, %s, 0f33800000;\n");
+        for (int i = 0; i < 8; i++) sb.Append("    add.rn.f32 %x").Append(i).Append(", %s, 0f").Append(BitConverter.SingleToInt32Bits(1f + i / 64f).ToString("X8", CultureInfo.InvariantCulture)).Append(";\n");
+        for (int j = 0; j < 4; j++) sb.Append("    sub.rn.f32 %y").Append(j).Append(", 0f").Append(BitConverter.SingleToInt32Bits(1f - j / 128f).ToString("X8", CultureInfo.InvariantCulture)).Append(", %s;\n");
+        for (int k = 0; k < 32; k++) sb.Append("    mov.f32 %c").Append(k).Append(", 0f00000000;\n");
+        sb.Append("    ld.param.u32 %r4, [p1];\nLOOP:\n");
+        for (int i = 0; i < 8; i++)
+            for (int j = 0; j < 4; j++)
+                sb.Append("    fma.rn.f32 %c").Append(i * 4 + j).Append(", %x").Append(i).Append(", %y").Append(j).Append(", %c").Append(i * 4 + j).Append(";\n");
+        sb.Append("    sub.s32 %r4, %r4, 1;\n    setp.ne.s32 %p, %r4, 0;\n    @%p bra LOOP;\n    mov.f32 %s, %c0;\n");
+        for (int k = 1; k < 32; k++) sb.Append("    add.rn.f32 %s, %s, %c").Append(k).Append(";\n");
+        sb.Append("    ld.param.u64 %rd0, [p0];\n    cvta.to.global.u64 %rd1, %rd0;\n    mul.wide.u32 %rd2, %r3, 4;\n    add.s64 %rd3, %rd1, %rd2;\n")
+          .Append("    st.global.f32 [%rd3], %s;\n    ret;\n}\n");
+        return sb.ToString();
+    }
+
     // --gemm: the register-blocked FP32 GEMM (PtxSgemmGenerator), the compute-bound kernel the backend's gate is measured
     // on. Each seed configuration runs a square problem through the PTX path's module and the rewritten one; outputs
     // must be bit-identical, and the times are paired (alternating launches, median of 15).
@@ -182,7 +350,7 @@ internal static class SassProbeTool
                 byte[] Rewrite(byte[] image)
                 {
                     if (Array.IndexOf(args, "--save") is int sv && sv >= 0) System.IO.File.WriteAllBytes(args[sv + 1], image);
-                    return ApplyPass(image, pass, upto, Array.IndexOf(args, "--dump") >= 0, out registers, out decline);
+                    return ApplyPass(image, major * 10 + minor, pass, upto, Array.IndexOf(args, "--dump") >= 0, out registers, out decline);
                 }
                 using var ptxModule = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
                 using var sassModule = runtime.LoadRewrittenModule(ptx, Rewrite, "sass-gemm");

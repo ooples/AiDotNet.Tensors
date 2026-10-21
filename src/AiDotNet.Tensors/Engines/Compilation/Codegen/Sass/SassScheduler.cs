@@ -26,6 +26,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 
 namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Sass;
 
@@ -35,7 +36,8 @@ public static class SassScheduler
     // ptxas never encodes a stall above 12 (12 only after a compare); a variable-latency instruction stalling 12 or
     // more faulted on sm_75 where 11 ran. So stalls stay within 12 (11 on variable-latency instructions), and a longer
     // delay is spread over the instructions issued since its producer.
-    private const int MaxStall = 12, MaxVariableStall = 11;
+    // (sm_86: ptxas encodes up to 13, after a compare whose predicate guards a branch 13 cycles later.)
+    private const int MaxVariableStall = 11;
     private const int AllScoreboards = 0x3f;
 
     /// <summary>Why the last RecomputeControl call returned null (diagnostics).</summary>
@@ -55,22 +57,34 @@ public static class SassScheduler
     // BMOV (a convergence-barrier register move) completes on a fixed delay nothing else tracks: ptxas gives it up to
     // 11 cycles, and a tiled convolution whose BMOV issued its successor after 1 corrupted its output about one run in
     // three (10 of 10 clean with ptxas's stall kept on it alone).
-    private const int BmovStall = 11;
+    //
+    // BAR.SYNC likewise: on sm_75 ptxas gives all of them exactly 5 cycles, and a register-blocked GEMM whose BAR issued
+    // its successor (an LDS of the tile the barrier publishes) after 1 read a stale tile -- its output mismatched in 3
+    // of 9 configurations, and keeping ptxas's stall on BAR alone made all 9 bit-identical.
+    //
+    // These delays and the guard latency are per architecture. sm_75's were measured on the device. sm_86's are the
+    // largest ptxas leaves over the catalog and GEMM kernels compiled for it (--sass-learn --arch 86: BAR 6, DEPBAR 4,
+    // LDGDEPBAR 4, a guard read 13 cycles after its compare at the closest) and are floors, not yet run on an sm_86
+    // device. Any other architecture is declined.
+    private sealed record Timing(int GuardPredicateLatency, int MaxStall, IReadOnlyDictionary<string, int> IssueStalls);
 
-    // BAR.SYNC likewise: ptxas gives all of them exactly 5 cycles, and a register-blocked GEMM whose BAR issued its
-    // successor (an LDS of the tile the barrier publishes) after 1 read a stale tile -- its output mismatched in 3 of 9
-    // configurations, and keeping ptxas's stall on BAR alone made all 9 bit-identical.
-    private const int BarStall = 5;
-    private const int GuardPredicateLatency = 12;
+    private static readonly Dictionary<int, Timing> s_timings = new()
+    {
+        [75] = new(12, 12, new Dictionary<string, int> { ["BMOV"] = 11, ["BAR"] = 5 }),
+        [86] = new(13, 13, new Dictionary<string, int> { ["BMOV"] = 11, ["BAR"] = 6, ["DEPBAR"] = 4, ["LDGDEPBAR"] = 4 }),
+    };
 
-    /// <summary>The branch targets (instruction indices) of BRA and BSSY instructions in <paramref name="code"/>.</summary>
+    /// <summary>The SM versions (major * 10 + minor) whose timings the scheduler has.</summary>
+    public static IReadOnlyCollection<int> SupportedArchitectures => s_timings.Keys;
+
+    /// <summary>The branch targets (instruction indices) of BRA, BSSY and CALL instructions in <paramref name="code"/>.</summary>
     public static HashSet<int> BranchTargets(IReadOnlyList<SassInstruction> code)
     {
         var targets = new HashSet<int>();
         for (int i = 0; i < code.Count; i++)
         {
             int op = code[i].Opcode & 0x1ff;
-            if (op != 0x147 && op != 0x145) continue;   // BRA, BSSY
+            if (op != 0x147 && op != 0x145 && op != 0x144) continue;   // BRA, BSSY, CALL.REL.NOINC
             // The byte offset from the next instruction: bits 32-81, signed.
             long offset = (long)code[i].Bits(32, 50);
             if ((offset & (1L << 49)) != 0) offset -= 1L << 50;
@@ -84,11 +98,18 @@ public static class SassScheduler
 
     /// <summary>
     /// <paramref name="code"/> with every control word recomputed, or null when an instruction's opcode is unknown or
-    /// a required delay exceeds what the stall counts can express.
+    /// a required delay exceeds what the stall counts can express, or <paramref name="architecture"/> (SM version,
+    /// major * 10 + minor) is not one the scheduler has timings for.
     /// </summary>
-    public static SassInstruction[]? RecomputeControl(IReadOnlyList<SassInstruction> code)
+    public static SassInstruction[]? RecomputeControl(IReadOnlyList<SassInstruction> code, int architecture = 75)
     {
         if (code is null) throw new ArgumentNullException(nameof(code));
+        if (!s_timings.TryGetValue(architecture, out var timing))
+        {
+            LastDecline = "no timings for sm_" + architecture;
+            return null;
+        }
+        int guardLatency = timing.GuardPredicateLatency;
         var effects = new SassEffects[code.Count];
         for (int i = 0; i < code.Count; i++)
             if (SassOpcodeTable.Decode(code[i]) is { } e) effects[i] = e;
@@ -98,6 +119,8 @@ public static class SassScheduler
                 return null;
             }
         var targets = BranchTargets(code);
+        if (AsyncScoreboard(code, effects) is not int asyncBoard) return null;
+        int asyncMask = asyncBoard >= 0 ? 1 << asyncBoard : 0;
         var result = new SassInstruction[code.Count];
         var pendingWrite = new Dictionary<int, int>();   // register -> write scoreboard covering it
         var pendingRead = new Dictionary<int, int>();    // register -> read scoreboard covering it
@@ -127,7 +150,7 @@ public static class SassScheduler
             int wait = 0;
             if (boundary)
             {
-                wait = AllScoreboards;
+                wait = AllScoreboards & ~asyncMask;
             }
             else
             {
@@ -144,12 +167,12 @@ public static class SassScheduler
             {
                 if (writes.Count != 0)
                 {
-                    writeBoard = nextWrite++ % WriteScoreboards;
+                    writeBoard = NextBoard(ref nextWrite, 0, WriteScoreboards, asyncBoard);
                     if (outstanding[writeBoard] >= ScoreboardDepth) wait |= 1 << writeBoard;
                 }
                 if (reads.Count != 0)
                 {
-                    readBoard = ReadScoreboardBase + nextRead++ % (6 - ReadScoreboardBase);
+                    readBoard = NextBoard(ref nextRead, ReadScoreboardBase, 6 - ReadScoreboardBase, asyncBoard);
                     if (outstanding[readBoard] >= ScoreboardDepth) wait |= 1 << readBoard;
                 }
             }
@@ -175,7 +198,7 @@ public static class SassScheduler
             if (boundary)
             {
                 foreach (var at in readyAt.Values) Need(at.Ready, at.Produced);
-                foreach (long at in predicateWrittenAt.Values) Need(at + GuardPredicateLatency, at);
+                foreach (long at in predicateWrittenAt.Values) Need(at + guardLatency, at);
             }
             else
             {
@@ -183,7 +206,7 @@ public static class SassScheduler
                 foreach (int r in writes) if (readyAt.TryGetValue(r, out var at)) Need(at.Ready, at.Produced);
                 foreach (int p in predicateReads) if (readyAt.TryGetValue(p, out var at)) Need(at.Ready, at.Produced);
                 if (guard >= 0 && predicateWrittenAt.TryGetValue(guard, out long written))
-                    Need(written + GuardPredicateLatency, written);
+                    Need(written + guardLatency, written);
                 foreach (int p in predicateWrites) if (readyAt.TryGetValue(p, out var at)) Need(at.Ready, at.Produced);
                 if (e.ReadsAllPredicates)
                     foreach (var pair in readyAt) if (pair.Key >= PredicateKey && pair.Key < UniformPredicateKey) Need(pair.Value.Ready, pair.Value.Produced);
@@ -195,7 +218,7 @@ public static class SassScheduler
                 for (int k = i - 1; k >= 0 && missing > 0 && issueCycle[k] >= produced; k--)
                 {
                     var control = result[k].Control;
-                    int cap = effects[k].Latency == SassLatency.Variable ? MaxVariableStall : MaxStall;
+                    int cap = effects[k].Latency == SassLatency.Variable ? MaxVariableStall : timing.MaxStall;
                     int add = (int)Math.Min(missing, cap - control.Stall);
                     if (add <= 0) continue;
                     result[k].Control = control with { Stall = control.Stall + add };
@@ -216,7 +239,13 @@ public static class SassScheduler
             }
 
             // This instruction's own scoreboards.
-            if (e.Latency == SassLatency.Variable)
+            if (e.Mnemonic == "LDGDEPBAR")
+            {
+                // Commits the outstanding copies to the scoreboard the DEPBARs count; only they wait on it.
+                writeBoard = asyncBoard;
+                scoreboardSetAt[asyncBoard] = cycle;
+            }
+            else if (e.Latency == SassLatency.Variable)
             {
                 if (writeBoard != SassInstruction.NoScoreboard)
                 {
@@ -243,7 +272,7 @@ public static class SassScheduler
 
             var original = instruction.Control;
             var updated = instruction;
-            int baseStall = e.Mnemonic switch { "BMOV" => BmovStall, "BAR" => BarStall, _ => 1 };
+            int baseStall = timing.IssueStalls.TryGetValue(e.Mnemonic, out int fixedStall) ? fixedStall : 1;
             updated.Control = new SassControl(baseStall, original.Yield, writeBoard, readBoard, wait, original.Reuse);
             result[i] = updated;
             originalStall[i] = original.Stall;
@@ -261,6 +290,34 @@ public static class SassScheduler
     // Predicates, uniform predicates and uniform registers live in the same readiness map as vector registers, each
     // offset past the one before.
     private const int PredicateKey = 1000, UniformPredicateKey = 1008, UniformRegisterKey = 2000;
+
+    // cp.async (sm_80+): LDGDEPBAR commits copies to a scoreboard and DEPBAR.LE SBn, k waits on that scoreboard by
+    // number (bits 44-46), so the number is part of the code, not the scheduler's to choose. It is reserved for them:
+    // no other instruction is given it and a block boundary does not wait on it (that would drain the copy pipeline
+    // the DEPBARs deliberately keep k groups deep). -1 when the kernel has neither; null (declined) when they do not
+    // name exactly one scoreboard between them.
+    private static int? AsyncScoreboard(IReadOnlyList<SassInstruction> code, SassEffects[] effects)
+    {
+        var boards = new HashSet<int>();
+        bool commits = false;
+        for (int i = 0; i < code.Count; i++)
+        {
+            if (effects[i].Mnemonic == "DEPBAR") boards.Add((int)code[i].Bits(44, 3));
+            commits |= effects[i].Mnemonic == "LDGDEPBAR";
+        }
+        if (boards.Count == 0 && !commits) return -1;
+        if (boards.Count == 1 && commits) return boards.First();
+        LastDecline = "cp.async: DEPBARs name " + boards.Count + " scoreboards" + (commits ? "" : " and nothing commits to them");
+        return null;
+    }
+
+    // Round-robin over count scoreboards from first, skipping the reserved one.
+    private static int NextBoard(ref int next, int first, int count, int reserved)
+    {
+        int board = first + next++ % count;
+        if (board == reserved) board = first + next++ % count;
+        return board;
+    }
 
     private static List<int> Registers(in SassInstruction instruction, IReadOnlyList<SassRegisterOperand> operands)
     {
