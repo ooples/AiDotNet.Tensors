@@ -2331,7 +2331,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             guard = _finitenessSumSquares;
         }
         _finitenessGuard = guard;
-        if (deferToDeviceGuard && cuda is Engines.DirectGpu.IDeviceReadbackFactory factory)
+        // Only where the guarded update reads the guard on the device. Elsewhere it reads it on the host anyway, so
+        // deferring would add a second device-to-host copy per step and save none: resolve finiteness here instead.
+        if (deferToDeviceGuard && cuda is Engines.DirectGpu.IMultiTensorGpuOptimizerBackend { GuardsFiniteOnDevice: true }
+            && cuda is Engines.DirectGpu.IDeviceReadbackFactory factory)
         {
             // The update kernel reads the sum itself and writes nothing when it is not finite; the host learns the
             // outcome from a readback it waits on only at the next step (or when asked), so this step never blocks.
