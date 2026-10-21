@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 // What each Volta-family SASS opcode reads and writes, for the own SASS backend's register allocation and scheduling
 // (#1442). An instruction's bits 0-8 name the operation and bits 9-11 its operand form; --sass-learn measured, on the
 // catalog's kernels compiled for sm_75, where each form keeps its register sources:
@@ -79,7 +79,10 @@ public static class SassOpcodeTable
     private const int A = SassInstruction.RaField, B = SassInstruction.RbField, C = SassInstruction.RcField;
     private const int D = SassInstruction.RdField;
 
-    // ALU results on Turing and Ampere are readable 4-6 cycles after issue; 6 is safe for all listed ALU opcodes.
+    // Fixed latencies. The fewest cycles ptxas leaves between a producer and its first reader over the catalog's
+    // kernels on sm_75 (--sass-learn) are 4 for the ALU, but that is a minimum over particular pairs, not a latency:
+    // scheduling every ALU result at 4 faulted the first kernel. 6 ran every catalog kernel bit-identically; the wide
+    // multiply-add (8, its second result register), P2R (14) and CS2R (8) take ptxas's measured minimum.
     private const int AluLatency = 6;
 
     private enum Sources
@@ -93,13 +96,13 @@ public static class SassOpcodeTable
 
     private sealed record Spec(string Mnemonic, SassLatency Latency, bool WritesD, int DWidth, Sources Sources,
         int[] PredicateWrites, int[] PredicateReads, bool Memory = false, bool Store = false, int AddressWidth = 1,
-        bool ReadsAllPredicates = false, bool WideC = false);
+        bool ReadsAllPredicates = false, bool WideC = false, int FixedLatency = AluLatency);
 
     private static readonly Dictionary<int, Spec> s_specs = new()
     {
         [0x002] = new("MOV", SassLatency.Fixed, true, 1, Sources.BOnly, [], []),
-        [0x003] = new("P2R", SassLatency.Fixed, true, 1, Sources.A, [], [], ReadsAllPredicates: true),
-        [0x005] = new("CS2R", SassLatency.Fixed, true, 2, Sources.None, [], []),
+        [0x003] = new("P2R", SassLatency.Fixed, true, 1, Sources.A, [], [], ReadsAllPredicates: true, FixedLatency: 14),
+        [0x005] = new("CS2R", SassLatency.Fixed, true, 2, Sources.None, [], [], FixedLatency: 8),
         [0x007] = new("SEL", SassLatency.Fixed, true, 1, Sources.AB, [], [87]),
         [0x009] = new("FMNMX", SassLatency.Fixed, true, 1, Sources.AB, [], [87]),
         [0x00c] = new("ISETP", SassLatency.Fixed, false, 0, Sources.AB, [81, 84], [87]),
@@ -113,7 +116,7 @@ public static class SassOpcodeTable
         [0x021] = new("FADD", SassLatency.Fixed, true, 1, Sources.AB, [], []),
         [0x023] = new("FFMA", SassLatency.Fixed, true, 1, Sources.ABC, [], []),
         [0x024] = new("IMAD", SassLatency.Fixed, true, 1, Sources.ABC, [], []),
-        [0x025] = new("IMAD.WIDE", SassLatency.Fixed, true, 2, Sources.ABC, [], [], WideC: true),
+        [0x025] = new("IMAD.WIDE", SassLatency.Fixed, true, 2, Sources.ABC, [], [], WideC: true, FixedLatency: 8),
         [0x027] = new("IMAD.HI", SassLatency.Fixed, true, 1, Sources.ABC, [], []),
         [0x105] = new("F2I", SassLatency.Variable, true, 1, Sources.BOnly, [], []),
         [0x106] = new("I2F", SassLatency.Variable, true, 1, Sources.BOnly, [], []),
@@ -187,6 +190,6 @@ public static class SassOpcodeTable
             }
         }
         return new SassEffects(spec.Mnemonic, spec.Latency, writes, reads, spec.PredicateWrites, spec.PredicateReads,
-            spec.ReadsAllPredicates, spec.Latency == SassLatency.Fixed ? AluLatency : 0);
+            spec.ReadsAllPredicates, spec.Latency == SassLatency.Fixed ? spec.FixedLatency : 0);
     }
 }

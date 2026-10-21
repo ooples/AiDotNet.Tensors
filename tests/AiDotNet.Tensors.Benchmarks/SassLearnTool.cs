@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 // --sass-learn: empirical SASS field layouts for the own SASS backend (#1442). Every catalog spec is emitted as PTX,
 // compiled by ptxas for the target arch and disassembled by nvdisasm -hex; each instruction's text is matched against
 // its 128-bit encoding to find, per opcode and operand slot, which bit field holds a register (an 8-bit R field), a
@@ -90,6 +90,8 @@ internal static class SassLearnTool
             var pendingWrite = new Dictionary<int, int>();   // register -> scoreboard
             var pendingRead = new Dictionary<int, int>();
             var fixedReady = new Dictionary<int, (long Cycle, string Op)>();   // register -> cycle written, producer
+            var predicateReady = new Dictionary<int, long>();
+            var lastReader = new Dictionary<int, (long Cycle, string Op)>();   // register -> latest fixed reader
             long cycle = 0;
             foreach (var line in kernel)
             {
@@ -127,6 +129,16 @@ internal static class SassLearnTool
                 }
                 foreach (int r in writes)
                     if (pendingRead.ContainsKey(r)) { missedWaits++; misses[line.Opcode + " (WAR)"] = misses.TryGetValue(line.Opcode + " (WAR)", out int m2) ? m2 + 1 : 1; pendingRead.Remove(r); }
+                foreach (int r in writes)
+                    if (lastReader.TryGetValue(r, out var reader))
+                    {
+                        string key = "WAR " + reader.Op;
+                        int distance = (int)(cycle - reader.Cycle);
+                        minimumLatency[key] = minimumLatency.TryGetValue(key, out int d1) ? Math.Min(d1, distance) : distance;
+                        lastReader.Remove(r);
+                    }
+                if (effects.Latency == AiDotNet.Tensors.Engines.Compilation.Codegen.Sass.SassLatency.Fixed)
+                    foreach (int r in reads) lastReader[r] = (cycle, line.Opcode);
                 foreach (int r in reads)
                 {
                     checkedReads++;
@@ -137,9 +149,21 @@ internal static class SassLearnTool
                         fixedReady.Remove(r);
                     }
                 }
+                var predicateReads = effects.PredicateReads.Select(f => (int)instruction.Bits(f, 3)).Where(p => p != 7).ToList();
+                if (instruction.GuardPredicate != 7) predicateReads.Add(instruction.GuardPredicate);
+                foreach (int pr in predicateReads)
+                    if (predicateReady.TryGetValue(pr, out long written))
+                    {
+                        string key = "pred->" + (effects.Latency == AiDotNet.Tensors.Engines.Compilation.Codegen.Sass.SassLatency.Control ? "control" : "other");
+                        int distance = (int)(cycle - written);
+                        minimumLatency[key] = minimumLatency.TryGetValue(key, out int d0) ? Math.Min(d0, distance) : distance;
+                        predicateReady.Remove(pr);
+                    }
+                foreach (int pw in effects.PredicateWrites.Select(f => (int)instruction.Bits(f, 3)).Where(p => p != 7))
+                    predicateReady[pw] = cycle;
                 if (effects.Latency == AiDotNet.Tensors.Engines.Compilation.Codegen.Sass.SassLatency.Control)
                 {
-                    pendingWrite.Clear(); pendingRead.Clear(); fixedReady.Clear();
+                    pendingWrite.Clear(); pendingRead.Clear(); fixedReady.Clear(); predicateReady.Clear(); lastReader.Clear();
                 }
                 else if (effects.Latency == AiDotNet.Tensors.Engines.Compilation.Codegen.Sass.SassLatency.Variable)
                 {
@@ -149,7 +173,7 @@ internal static class SassLearnTool
                 }
                 else
                 {
-                    foreach (int r in writes) fixedReady[r] = (cycle, Base(line.Opcode));
+                    foreach (int r in writes) fixedReady[r] = (cycle, line.Opcode);
                 }
                 cycle += Math.Max(1, control.Stall);
             }
@@ -159,6 +183,9 @@ internal static class SassLearnTool
             " register reads checked; " + missedWaits + " dependencies ptxas did not wait on (table errors)");
         foreach (var pair in unknownOps) Console.WriteLine("  unknown " + pair.Key + " x" + pair.Value);
         foreach (var pair in misses) Console.WriteLine("  missed wait at " + pair.Key + " x" + pair.Value);
+        foreach (var g in lines.GroupBy(l => Base(l.Opcode)))
+            Console.Write(g.Key + ":" + g.Max(l => (int)Field(l, 105, 4)) + " ");
+        Console.WriteLine();
         Console.WriteLine("  fewest stall cycles between a fixed-latency producer and its first reader: " +
             string.Join(", ", minimumLatency.Select(p => p.Key + " " + p.Value)));
     }

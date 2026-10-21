@@ -4,6 +4,7 @@
 // compiled by ptxas 13.1 for sm_75. Its instructions (nvdisasm -hex) are quoted where a test reads them.
 
 using System;
+using System.Linq;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Sass;
 using Xunit;
 
@@ -144,5 +145,64 @@ public class SassInstructionTests
         Assert.Equal(2, changed);   // one byte in the section header, one in the attribute
         Assert.Throws<ArgumentException>(() => cubin.SetInstructions("k1", new SassInstruction[15]));
         Assert.Throws<ArgumentException>(() => cubin.Instructions("missing"));
+    }
+
+    /// <summary>
+    /// SassOpcodeTable on k1's instructions: what each reads and writes. (The table is checked against ptxas's own
+    /// scoreboard waits over the whole catalog by --sass-learn; this pins a few by hand.)
+    /// </summary>
+    [Fact]
+    public void TheOpcodeTableDecodesK1()
+    {
+        var ffma = SassOpcodeTable.Decode(Ffma) ?? throw new InvalidOperationException("FFMA unknown");
+        Assert.Equal("FFMA", ffma.Mnemonic);
+        Assert.Equal(SassLatency.Fixed, ffma.Latency);
+        Assert.Equal(new[] { SassInstruction.RaField, SassInstruction.RbField, SassInstruction.RcField },
+            ffma.Reads.Select(r => r.Field));
+        var s2r = SassOpcodeTable.Decode(S2R) ?? throw new InvalidOperationException("S2R unknown");
+        Assert.Equal(SassLatency.Variable, s2r.Latency);
+        Assert.Empty(s2r.Reads);
+        var exit = SassOpcodeTable.Decode(GuardedExit) ?? throw new InvalidOperationException("EXIT unknown");
+        Assert.Equal(SassLatency.Control, exit.Latency);
+        Assert.Null(SassOpcodeTable.Decode(new SassInstruction(0x0000000000000fffUL, 0)));
+    }
+
+    /// <summary>
+    /// The scheduler's own control words for k1: every variable-latency result is waited on by its reader, the guarded
+    /// EXIT issues 12 cycles after the compare that sets its predicate, no stall exceeds 12, and an unknown opcode
+    /// declines the kernel.
+    /// </summary>
+    [Fact]
+    public void TheSchedulerRecomputesK1sControlWords()
+    {
+        var code = new SassCubin(K1Cubin()).Instructions("k1");
+        var scheduled = SassScheduler.RecomputeControl(code) ?? throw new InvalidOperationException(SassScheduler.LastDecline);
+        Assert.Equal(code.Length, scheduled.Length);
+        for (int i = 0; i < code.Length; i++)
+        {
+            // Only the control word changes.
+            Assert.Equal(code[i].Low, scheduled[i].Low);
+            Assert.Equal(code[i].High & ((1UL << 41) - 1), scheduled[i].High & ((1UL << 41) - 1));
+            Assert.InRange(scheduled[i].Control.Stall, 1, 12);
+        }
+        int lea = Array.IndexOf(code, Lea), ffma = Array.IndexOf(code, Ffma), exit = Array.IndexOf(code, GuardedExit);
+        // LEA reads both S2R results: it waits on the scoreboard(s) they set.
+        int s2rBoards = 0;
+        for (int i = 0; i < lea; i++)
+            if (SassOpcodeTable.Decode(scheduled[i])?.Mnemonic == "S2R") s2rBoards |= 1 << scheduled[i].Control.WriteScoreboard;
+        Assert.Equal(s2rBoards, scheduled[lea].Control.WaitMask & s2rBoards);
+        // FFMA reads both loads' results.
+        int loadBoards = 0;
+        for (int i = 0; i < ffma; i++)
+            if (SassOpcodeTable.Decode(scheduled[i])?.Mnemonic == "LDG") loadBoards |= 1 << scheduled[i].Control.WriteScoreboard;
+        Assert.NotEqual(0, loadBoards);
+        Assert.Equal(loadBoards, scheduled[ffma].Control.WaitMask & loadBoards);
+        // The compare is the instruction before the guarded EXIT: its stall carries the 12-cycle guard latency.
+        Assert.True(scheduled[exit - 1].Control.Stall >= 12);
+
+        var unknown = (SassInstruction[])code.Clone();
+        unknown[3] = new SassInstruction(0x0000000000000fffUL, unknown[3].High);
+        Assert.Null(SassScheduler.RecomputeControl(unknown));
+        Assert.Contains("unknown opcode", SassScheduler.LastDecline);
     }
 }
