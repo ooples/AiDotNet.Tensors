@@ -43,6 +43,7 @@ internal enum DeclaredFamily
     ScaledDotProductAttention,
     ScaledDotProductAttentionBackward,
     Embedding,
+    FlashAttentionBackward,
 }
 
 /// <summary>One declared program: its family and shape (unused dimensions are 0).</summary>

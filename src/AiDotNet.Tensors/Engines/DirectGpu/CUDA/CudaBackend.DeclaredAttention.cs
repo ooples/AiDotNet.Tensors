@@ -80,6 +80,47 @@ public sealed partial class CudaBackend
             : null;
 
     private static readonly string[] s_attentionBackwardNames = { "dout", "q", "k", "v", "weights", "dq", "dk", "dv" };
+    private static readonly string[] s_flashBackwardNames =
+        { "dout", "q", "k", "v", "out", "stats", "causal", "dq", "dk", "dv" };
+
+    private static readonly Func<DeclaredKey, CodegenProgram> s_buildFlashBackward = key =>
+        CodegenBackendPrograms.FlashAttentionBackward(key.D0, key.D1, key.D2, key.D3, key.D5 & 0xFFFFF, key.Epsilon,
+            (key.D5 & AttentionCausalBit) != 0);
+
+    /// <summary>
+    /// FlashAttentionBackward through its declared program: the weights recomputed from softmaxStats, then the
+    /// attention backward's products. Not with a bias, nor causal across unequal lengths (the forward's routing rule).
+    /// </summary>
+    private bool TryDeclaredFlashAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key,
+        IGpuBuffer value, IGpuBuffer output, IGpuBuffer softmaxStats, IGpuBuffer gradQuery, IGpuBuffer gradKey,
+        IGpuBuffer gradValue, int batch, int heads, int seqQ, int seqK, int headDim, float scale, bool causal)
+    {
+        if (!DeclaredKernelsEnabled || batch <= 0 || heads <= 0 || seqQ <= 0 || seqK <= 0 || headDim <= 0 ||
+            headDim >= 1 << AttentionMaskShift || (causal && seqQ != seqK) ||
+            (long)batch * heads * seqQ * seqK > AttentionMaxScoreElements)
+            return false;
+        var declaredKey = new DeclaredKey(DeclaredFamily.FlashAttentionBackward, batch, heads, seqQ, seqK, scale, 0, null,
+            0, headDim | (causal ? AttentionCausalBit : 0));
+        IGpuBuffer? causalBias = null;
+        DeclaredProgram? program;
+        lock (_directPtxLock)
+        {
+            if (!_declaredPrograms.TryGetValue(declaredKey, out program))
+            {
+                if (IsStreamCapturing() || !AttentionShapeRecurs(declaredKey)) return false;
+                program = BuildAttentionProgram(declaredKey, s_buildFlashBackward, s_flashBackwardNames);
+                _declaredPrograms[declaredKey] = program;
+            }
+            if (program is not null && causal && (causalBias = CausalBiasBuffer(seqQ, seqK)) is null) return false;
+        }
+        if (program is null) return false;
+        var bound = new DeclaredBindings(gradOutput, query, key, value, output, softmaxStats, causalBias, gradQuery,
+            gradKey, gradValue);
+        if (!AlignedFor(program, s_flashBackwardNames, bound)) return false;
+        if (TryLaunchDeclaredResidentChecked(declaredKey, program, s_flashBackwardNames, bound)) return true;
+        RunDeclaredProgram(program, s_flashBackwardNames, bound);
+        return true;
+    }
 
     private static readonly Func<DeclaredKey, CodegenProgram> s_buildAttentionBackward = key =>
         CodegenBackendPrograms.ScaledDotProductAttentionBackward(key.D0, key.D1, key.D2, key.D3, key.D5, key.Epsilon);

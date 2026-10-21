@@ -9926,6 +9926,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             batch, numHeads, seqQ, seqK, headDim, scale, isCausal,
             attentionBias, biasBatchStride))
             return;
+        // #890 phase 4d: the declared backward (weights recomputed from softmaxStats) where the forward was declared.
+        if (attentionBias is null &&
+            TryDeclaredFlashAttentionBackward(gradOutput, query, key, value, output, softmaxStats, gradQuery, gradKey,
+                gradValue, batch, numHeads, seqQ, seqK, headDim, scale, isCausal))
+            return;
             FlashAttentionBackwardLaunch(
                 gradOutput, query, key, value,
                 output, softmaxStats, gradQuery, gradKey,

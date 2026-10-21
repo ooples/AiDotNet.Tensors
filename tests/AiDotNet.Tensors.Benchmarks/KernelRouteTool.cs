@@ -501,7 +501,9 @@ internal static class KernelRouteTool
             using var v = backend.AllocateBuffer(Fill(b * h * s * d, 53, 0));
             using var o = backend.AllocateBuffer(b * h * s * d);
             float scale = (float)(1.0 / Math.Sqrt(d));
+            backend.DeclaredKernelsSwitch = false;
             double flash = Time(() => backend.FlashAttention(q, k, v, o, null, b, h, s, d, scale, causal), backend.Synchronize);
+            backend.DeclaredKernelsSwitch = null;
             backend.DeclaredKernelsSwitch = true;
             double declared;
             try
@@ -513,10 +515,33 @@ internal static class KernelRouteTool
             {
                 backend.DeclaredKernelsSwitch = null;
             }
+            // The backward from the same forward: hand-written (declared off) against the declared program.
+            using var stats = backend.AllocateBuffer(b * h * s);
+            using var dout = backend.AllocateBuffer(Fill(b * h * s * d, 54, 0));
+            using var dq = backend.AllocateBuffer(b * h * s * d);
+            using var dk = backend.AllocateBuffer(b * h * s * d);
+            using var dv = backend.AllocateBuffer(b * h * s * d);
+            backend.DeclaredKernelsSwitch = false;
+            backend.FlashAttentionV2(q, k, v, o, stats, b, h, s, s, d, scale, causal);
+            void Backward() => backend.FlashAttentionBackward(dout, q, k, v, o, stats, dq, dk, dv, b, h, s, s, d, scale, causal);
+            double handBwd = Time(Backward, backend.Synchronize);
+            backend.DeclaredKernelsSwitch = true;
+            double declaredBwd;
+            try
+            {
+                Backward(); Backward();
+                declaredBwd = Time(Backward, backend.Synchronize);
+            }
+            finally
+            {
+                backend.DeclaredKernelsSwitch = null;
+            }
             Console.WriteLine(("flash " + b + "x" + h + "x" + s + "x" + d + (causal ? " causal" : "")).PadRight(34) +
                 flash.ToString("F1", CultureInfo.InvariantCulture).PadLeft(12) +
                 declared.ToString("F1", CultureInfo.InvariantCulture).PadLeft(12) +
-                (flash / declared).ToString("F2", CultureInfo.InvariantCulture).PadLeft(8) + "x");
+                (flash / declared).ToString("F2", CultureInfo.InvariantCulture).PadLeft(8) + "x   bwd " +
+                handBwd.ToString("F1", CultureInfo.InvariantCulture) + " -> " + declaredBwd.ToString("F1", CultureInfo.InvariantCulture) +
+                " = " + (handBwd / declaredBwd).ToString("F2", CultureInfo.InvariantCulture) + "x");
         }
     }
 

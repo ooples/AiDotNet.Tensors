@@ -353,6 +353,54 @@ public static class CodegenBackendPrograms
     {
         if (batch <= 0 || heads <= 0 || seqQ <= 0 || seqK <= 0 || headDim <= 0)
             throw new ArgumentOutOfRangeException(nameof(batch), "Attention extents must be positive.");
+        var passes = AttentionBackwardPasses(batch, heads, seqQ, seqK, headDim, scale, "weights", rowdotFromOutput: false);
+        long p = (long)batch * heads * seqQ * seqK;
+        return new CodegenProgram(passes, new[] { p, (long)batch * heads * seqQ, p },
+            "scaled dot-product attention backward (backend contract)");
+    }
+
+    /// <summary>
+    /// FlashAttentionBackward in its contract: the weights recomputed from the forward's row log-sum-exp
+    /// (<c>P = exp(scale * q.k + causal - stats)</c>, the causal bias "causal" [seqQ, seqK] bound by the backend), the
+    /// row term <c>D = sum_e dout * out</c> from the forward's output, then the same products as
+    /// <see cref="ScaledDotProductAttentionBackward"/>.
+    /// </summary>
+    public static CodegenProgram FlashAttentionBackward(int batch, int heads, int seqQ, int seqK, int headDim, double scale,
+        bool causal)
+    {
+        if (batch <= 0 || heads <= 0 || seqQ <= 0 || seqK <= 0 || headDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "Attention extents must be positive.");
+        int[] pShape = { batch, heads, seqQ, seqK };
+        int rows = checked(batch * heads * seqQ);
+        var passes = new List<CodegenKernelSpec>();
+        var scoreSpace = new CodegenIterationSpace(CodegenAxis.Parallel("b", batch), CodegenAxis.Parallel("h", heads),
+            CodegenAxis.Parallel("q", seqQ), CodegenAxis.Parallel("k", seqK), CodegenAxis.Reduce("d", headDim));
+        var scoreInputs = new List<CodegenTensorBinding>
+        {
+            new(0, "q", new[] { batch, heads, seqQ, headDim }, new[] { A(0), A(1), A(2), A(4) }),
+            new(1, "k", new[] { batch, heads, seqK, headDim }, new[] { A(0), A(1), A(3), A(4) }),
+        };
+        if (causal) scoreInputs.Add(new CodegenTensorBinding(2, "causal", new[] { seqQ, seqK }, new[] { A(2), A(3) }));
+        passes.Add(new CodegenKernelSpec("attention_scores", scoreSpace, scoreInputs.ToArray(),
+            new CodegenTensorBinding(scoreInputs.Count, "logits", pShape, new[] { A(0), A(1), A(2), A(3) }, isOutput: true),
+            new[] { 0, 1 }, CodegenReduceKind.Sum, biasInput: causal ? 2 : null, reduceScale: scale));
+        int[] vector = { rows }, matrix = { rows, seqK };
+        passes.Add(RowPass("attention_negstats", vector, new[] { "stats" }, "negstats", CodegenExpr.Negate(Op(0))));
+        passes.Add(new CodegenKernelSpec("attention_recompute",
+            new CodegenIterationSpace(CodegenAxis.Parallel("i", rows), CodegenAxis.Parallel("j", seqK)),
+            new[] { Bind(0, "logits", matrix), Bind(1, "negstats", vector) }, Bind(2, "p", matrix, isOutput: true),
+            new[] { 0 }, CodegenReduceKind.None, preReduce: CodegenPreReduceOp.Exp, preBiasInput: 1));
+        passes.AddRange(AttentionBackwardPasses(batch, heads, seqQ, seqK, headDim, scale, "p", rowdotFromOutput: true));
+        long pElements = (long)batch * heads * seqQ * seqK;
+        return new CodegenProgram(passes, new[] { pElements, rows, pElements, pElements, rows, pElements },
+            "flash attention backward (backend contract)");
+    }
+
+    // The backward's products from the weights tensor `weights`: dv, dP, the row term (sum_k P dP, or sum_e dout out),
+    // dS, dq, dk.
+    private static List<CodegenKernelSpec> AttentionBackwardPasses(int batch, int heads, int seqQ, int seqK, int headDim,
+        double scale, string weights, bool rowdotFromOutput)
+    {
         int[] qShape = { batch, heads, seqQ, headDim }, kShape = { batch, heads, seqK, headDim };
         int[] pShape = { batch, heads, seqQ, seqK };
         CodegenTensorBinding T(int parameter, string name, int[] shape, int a0, int a1, int a2, int a3, bool output = false) =>
@@ -364,7 +412,7 @@ public static class CodegenBackendPrograms
 
         // dv[b,h,k,e] = sum_q P[b,h,q,k] dout[b,h,q,e]
         passes.Add(new CodegenKernelSpec("attention_dv", Space("k", seqK, "e", headDim, "q", seqQ),
-            new[] { T(0, "weights", pShape, 0, 1, 4, 2), T(1, "dout", qShape, 0, 1, 4, 3) },
+            new[] { T(0, weights, pShape, 0, 1, 4, 2), T(1, "dout", qShape, 0, 1, 4, 3) },
             T(2, "dv", kShape, 0, 1, 2, 3, output: true), new[] { 0, 1 }, CodegenReduceKind.Sum));
         // dP[b,h,q,k] = sum_e dout[b,h,q,e] v[b,h,k,e]
         passes.Add(new CodegenKernelSpec("attention_dp", Space("q", seqQ, "k", seqK, "e", headDim),
@@ -372,9 +420,11 @@ public static class CodegenBackendPrograms
             T(2, "dp", pShape, 0, 1, 2, 3, output: true), new[] { 0, 1 }, CodegenReduceKind.Sum));
         // dot[b,h,q] = sum_k P dP
         var dotSpace = new CodegenIterationSpace(CodegenAxis.Parallel("b", batch), CodegenAxis.Parallel("h", heads),
-            CodegenAxis.Parallel("q", seqQ), CodegenAxis.Reduce("k", seqK));
+            CodegenAxis.Parallel("q", seqQ), CodegenAxis.Reduce("k", rowdotFromOutput ? headDim : seqK));
         passes.Add(new CodegenKernelSpec("attention_rowdot", dotSpace,
-            new[] { T(0, "weights", pShape, 0, 1, 2, 3), T(1, "dp", pShape, 0, 1, 2, 3) },
+            rowdotFromOutput
+                ? new[] { T(0, "dout", qShape, 0, 1, 2, 3), T(1, "out", qShape, 0, 1, 2, 3) }
+                : new[] { T(0, weights, pShape, 0, 1, 2, 3), T(1, "dp", pShape, 0, 1, 2, 3) },
             new CodegenTensorBinding(2, "rowdot", new[] { batch, heads, seqQ }, new[] { A(0), A(1), A(2) }, isOutput: true),
             new[] { 0, 1 }, CodegenReduceKind.Sum));
         // dS = scale * P * (dP - dot)
@@ -385,7 +435,7 @@ public static class CodegenBackendPrograms
         passes.Add(new CodegenKernelSpec("attention_ds", dsSpace,
             new[]
             {
-                T(0, "weights", pShape, 0, 1, 2, 3), T(1, "dp", pShape, 0, 1, 2, 3),
+                T(0, weights, pShape, 0, 1, 2, 3), T(1, "dp", pShape, 0, 1, 2, 3),
                 new CodegenTensorBinding(2, "rowdot", new[] { batch, heads, seqQ }, new[] { A(0), A(1), A(2) }),
             },
             T(3, "ds", pShape, 0, 1, 2, 3, output: true), dsBody.Operands(), CodegenReduceKind.None, body: dsBody));
@@ -397,9 +447,7 @@ public static class CodegenBackendPrograms
         passes.Add(new CodegenKernelSpec("attention_dk", Space("k", seqK, "d", headDim, "q", seqQ),
             new[] { T(0, "ds", pShape, 0, 1, 4, 2), T(1, "q", qShape, 0, 1, 4, 3) },
             T(2, "dk", kShape, 0, 1, 2, 3, output: true), new[] { 0, 1 }, CodegenReduceKind.Sum));
-        long p = (long)batch * heads * seqQ * seqK;
-        return new CodegenProgram(passes, new[] { p, (long)batch * heads * seqQ, p },
-            "scaled dot-product attention backward (backend contract)");
+        return passes;
     }
 
     private static CodegenAffineExpr A(int axis) => CodegenAffineExpr.Axis(axis);

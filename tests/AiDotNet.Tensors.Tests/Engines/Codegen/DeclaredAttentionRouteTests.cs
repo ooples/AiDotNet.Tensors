@@ -320,6 +320,60 @@ public class DeclaredAttentionRouteTests
         }
     }
 
+    /// <summary>
+    /// FlashAttentionBackward through its declared program (weights recomputed from softmaxStats) gives the hand-written
+    /// kernel's gradients to 2e-5 from the same forward, causal and not.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(1, 2, 32, 32, false)]
+    [InlineData(2, 2, 40, 16, true)]
+    [InlineData(1, 1, 7, 6, true)]
+    public void FlashAttentionBackwardTakesTheDeclaredProgram(int batch, int heads, int seq, int headDim, bool causal)
+    {
+        using var backend = OpenBackendOrSkip();
+        float scale = (float)(1.0 / Math.Sqrt(headDim));
+        int n = batch * heads * seq * headDim, rows = batch * heads * seq;
+        using var bq = backend.AllocateBuffer(Fill(n, 1));
+        using var bk = backend.AllocateBuffer(Fill(n, 2));
+        using var bv = backend.AllocateBuffer(Fill(n, 3));
+        using var bdout = backend.AllocateBuffer(Fill(n, 4));
+        using var bo = backend.AllocateBuffer(n);
+        using var stats = backend.AllocateBuffer(rows);
+        backend.DeclaredKernelsSwitch = false;   // one forward for both backwards
+        backend.FlashAttentionV2(bq, bk, bv, bo, stats, batch, heads, seq, seq, headDim, scale, causal);
+        backend.DeclaredKernelsSwitch = null;
+        var results = new float[2][][];
+        foreach (bool declared in new[] { false, true })
+        {
+            backend.DeclaredKernelsSwitch = declared;
+            try
+            {
+                using var dq = backend.AllocateBuffer(Fill(n, 5));
+                using var dk = backend.AllocateBuffer(Fill(n, 6));
+                using var dv = backend.AllocateBuffer(Fill(n, 7));
+                void Call() => backend.FlashAttentionBackward(bdout, bq, bk, bv, bo, stats, dq, dk, dv, batch, heads, seq,
+                    seq, headDim, scale, causal);
+                Call();   // compiled once the shape recurs
+                long before = backend.DeclaredProgramLaunches;
+                Call();
+                backend.Synchronize();
+                Assert.Equal(declared ? 1 : 0, backend.DeclaredProgramLaunches - before);
+                results[declared ? 1 : 0] = new[] { backend.DownloadBuffer(dq), backend.DownloadBuffer(dk), backend.DownloadBuffer(dv) };
+            }
+            finally
+            {
+                backend.DeclaredKernelsSwitch = null;
+            }
+        }
+        string[] what = { "dq", "dk", "dv" };
+        for (int o = 0; o < 3; o++)
+        {
+            var reference = new double[results[0][o].Length];
+            for (int i = 0; i < reference.Length; i++) reference[i] = results[0][o][i];
+            Assert.True(MaxError(reference, results[1][o]) <= 2e-5, what[o] + ": declared vs hand-written");
+        }
+    }
+
     /// <summary>A soft-capped call keeps the hand-written kernel (its bias would have to follow the tanh cap).</summary>
     [SkippableFact]
     public void ASoftCappedCallKeepsTheHandWrittenKernel()
