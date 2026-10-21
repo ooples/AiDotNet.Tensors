@@ -20,9 +20,16 @@ internal static class PortableBatchNorm
 
     private static int[] Ints(int batch, int channels, int spatial, float epsilon, long count, int mode) => new[]
     {
-        batch, channels, spatial, BitConverter.SingleToInt32Bits(epsilon),
-        BitConverter.SingleToInt32Bits((float)(1.0 / count)), mode,
+        batch, channels, spatial, SingleToInt32BitsCompat(epsilon),
+        SingleToInt32BitsCompat((float)(1.0 / count)), mode,
     };
+
+#if !NETCOREAPP
+    // BitConverter.SingleToInt32Bits is unavailable on net471; reinterpret the bits via a pointer there.
+    private static unsafe int SingleToInt32BitsCompat(float value) => *(int*)&value;
+#else
+    private static int SingleToInt32BitsCompat(float value) => BitConverter.SingleToInt32Bits(value);
+#endif
 
     /// <summary>As <see cref="IBatchNormVarianceBackend.TryBatchNormTrainingWithVariance"/>.</summary>
     internal static bool TryForward(IDirectGpuBackend backend, Launcher launch, IGpuBuffer input, IGpuBuffer output,
