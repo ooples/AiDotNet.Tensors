@@ -330,6 +330,7 @@ public sealed partial class CudaBackend
         private void ArmFusedSgd(int parity)
         {
             _backend._fusedSgdCapture = null;
+            _backend._sgdSideForked = false;   // a capture that failed after forking left nothing to join in this one
             _fusedCapture = null;
             _fusedCaptureDirection = -1;
             if (_pingPongFusable is not { } fusable || _fusedPartials is null || _pingPong[parity & 1] is not { } table) return;
@@ -358,6 +359,7 @@ public sealed partial class CudaBackend
             _backend._fusedSgdCapture = null;
             _fusedCapture = null;
             _fusedCaptureDirection = -1;
+            _backend.JoinOverlappedSgd();   // the overlapped per-tensor updates finish before the skipping update runs
             var (skip, fusedCount) = capture?.Snapshot() ?? default;
             FusedTensorCounts[direction & 1] = capture?.ClaimedCount ?? 0;
             // The update and the gradients' sum of squares in one pass; the same launch undoes a non-finite step.

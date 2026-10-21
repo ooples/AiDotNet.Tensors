@@ -135,6 +135,68 @@ public sealed partial class CudaBackend
     {
         args = default;
         var capture = _fusedSgdCapture;
-        return capture is not null && IsStreamCapturing() && capture.TryClaim(output, count, blocks, out args);
+        return capture is not null && FusedSgdEpilogues && IsStreamCapturing() && capture.TryClaim(output, count, blocks, out args);
+    }
+
+    /// <summary>The fused-epilogue variant (measured slower on ResNet-18); off unless AIDOTNET_FUSED_SGD_EPILOGUE=1.</summary>
+    internal static bool FusedSgdEpilogues { get; set; } =
+        Environment.GetEnvironmentVariable("AIDOTNET_FUSED_SGD_EPILOGUE") == "1";
+
+    /// <summary>Runs each claimed tensor's update on a side branch of the step graph (AIDOTNET_SGD_OVERLAP=0 disables).</summary>
+    internal static bool SgdOverlap { get; set; } = Environment.GetEnvironmentVariable("AIDOTNET_SGD_OVERLAP") != "0";
+
+    /// <summary>Blocks of one overlapped update: few, so it trickles beside the backward kernels instead of displacing them.</summary>
+    internal static int SgdOverlapBlocks { get; set; } =
+        int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_SGD_OVERLAP_BLOCKS"), out int b) && b > 0 ? b : 32;
+
+    private IntPtr _sgdSideStream, _sgdForkEvent, _sgdJoinEvent;
+    // True once the step graph being captured has forked an update onto the side stream (CaptureSgdPingPongUpdate joins it).
+    private bool _sgdSideForked;
+
+    /// <summary>
+    /// After a weight-gradient op wrote <paramref name="gradient"/> (<paramref name="count"/> floats) in a step graph whose
+    /// ping-pong update it feeds: forks that tensor's update onto a side stream (sgd_tensor_update), where it overlaps the
+    /// rest of the backward; sgd_pingpong_update then skips it. Nothing happens outside such a capture.
+    /// </summary>
+    private unsafe void TryOverlapSgd(IGpuBuffer gradient, long count)
+    {
+        var capture = _fusedSgdCapture;
+        if (capture is null || !SgdOverlap || count <= 0 || count > int.MaxValue || !IsStreamCapturing()) return;
+        if (!_kernelCache.TryGetValue("sgd_tensor_update", out var kernel)) return;
+        int n = (int)count;
+        int blocks = (int)Math.Max(1, Math.Min(SgdOverlapBlocks, (count + 1023) / 1024));
+        if (!capture.TryClaim(gradient, n, blocks, out var update)) return;
+        using var _ = PushContext();
+        if (_sgdSideStream == IntPtr.Zero)
+        {
+            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamCreate(out _sgdSideStream, 1), "cuStreamCreate(sgd side)");
+            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventCreate(out _sgdForkEvent, CuEventDisableTiming), "cuEventCreate(sgd fork)");
+            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventCreate(out _sgdJoinEvent, CuEventDisableTiming), "cuEventCreate(sgd join)");
+        }
+        // The side stream joins the capture behind the gradient's writer.
+        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventRecord(_sgdForkEvent, _stream), "cuEventRecord(sgd fork)");
+        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamWaitEvent(_sgdSideStream, _sgdForkEvent, 0), "cuStreamWaitEvent(sgd fork)");
+        ulong src = update.Src, dst = update.Dst, dyn = update.Dyn, partials = update.Partials;
+        IntPtr grad = gradient.Handle;
+        float wd = update.WeightDecay;
+        int slot = update.Slot;
+        void** args = stackalloc void*[8];
+        args[0] = &src; args[1] = &dst; args[2] = &grad; args[3] = &n; args[4] = &dyn; args[5] = &wd; args[6] = &partials; args[7] = &slot;
+        lock (GpuDispatchLock)
+        {
+            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuLaunchKernel(kernel, (uint)blocks, 1, 1, 256, 1, 1, 0,
+                _sgdSideStream, (IntPtr)args, IntPtr.Zero), "cuLaunchKernel(sgd_tensor_update)");
+        }
+        _sgdSideForked = true;
+    }
+
+    /// <summary>Joins the side stream's overlapped updates back into the capture stream (before sgd_pingpong_update).</summary>
+    private void JoinOverlappedSgd()
+    {
+        if (!_sgdSideForked) return;
+        _sgdSideForked = false;
+        using var _ = PushContext();
+        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventRecord(_sgdJoinEvent, _sgdSideStream), "cuEventRecord(sgd join)");
+        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamWaitEvent(_stream, _sgdJoinEvent, 0), "cuStreamWaitEvent(sgd join)");
     }
 }

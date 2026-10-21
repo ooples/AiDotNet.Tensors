@@ -7158,6 +7158,17 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW)
     {
+        Conv2DBackwardKernelCore(input, gradOutput, gradKernel, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
+            outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+        // In a ping-pong step graph, this weight's update overlaps the rest of the backward (FusedSgd).
+        if (_fusedSgdCapture is not null)
+            TryOverlapSgd(gradKernel, (long)outChannels * inChannels * kernelH * kernelW);
+    }
+
+    private void Conv2DBackwardKernelCore(IGpuBuffer input, IGpuBuffer gradOutput, IGpuBuffer gradKernel,
+        int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
+    {
         // #1325: per-shape route through the tuned-kernel slot; the fixed chain below when the slot has none.
         if (batch > 0 && outHeight > 0 && outWidth > 0)
         {

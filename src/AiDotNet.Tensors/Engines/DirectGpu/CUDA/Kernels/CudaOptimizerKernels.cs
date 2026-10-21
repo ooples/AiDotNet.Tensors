@@ -1274,6 +1274,46 @@ extern ""C"" __global__ __launch_bounds__(256) void multi_tensor_scale_by_device
 // Elements per ping-pong chunk (CudaBackend.PingPongChunk must match): one 16-byte load of each operand per thread.
 #define PP_CHUNK 1024
 
+// One tensor's ping-pong SGD step, run on a side branch of the step graph as soon as the backward has written its
+// gradient (CudaBackend.FusedSgd overlap): dst = pp_sgd_step(src, g) over a small grid that strides the tensor, and each
+// block's sum of g^2 in partials[slot + blockIdx.x] (sgd_pingpong_update then skips the tensor and adds the sums).
+extern ""C"" __global__ __launch_bounds__(256) void sgd_tensor_update(
+    const float* __restrict__ src, float* __restrict__ dst, const float* __restrict__ gradient, int n,
+    const float* __restrict__ dyn, float weightDecay, double* __restrict__ partials, int slot)
+{
+    __shared__ double warpSums[8];
+    const float learningRate = dyn[0];
+    double v = 0.0;
+    const int stride = gridDim.x * blockDim.x;
+    int start = 0;
+    if (((reinterpret_cast<unsigned long long>(src) | reinterpret_cast<unsigned long long>(dst)
+          | reinterpret_cast<unsigned long long>(gradient)) & 15ULL) == 0)
+    {
+        const int quads = n >> 2;
+        for (int q = blockIdx.x * blockDim.x + threadIdx.x; q < quads; q += stride)
+        {
+            float4 g = reinterpret_cast<const float4*>(gradient)[q];
+            float4 w = reinterpret_cast<const float4*>(src)[q];
+            v += (double)g.x * (double)g.x + (double)g.y * (double)g.y + (double)g.z * (double)g.z + (double)g.w * (double)g.w;
+            w.x = pp_sgd_step(w.x, g.x, learningRate, weightDecay);
+            w.y = pp_sgd_step(w.y, g.y, learningRate, weightDecay);
+            w.z = pp_sgd_step(w.z, g.z, learningRate, weightDecay);
+            w.w = pp_sgd_step(w.w, g.w, learningRate, weightDecay);
+            reinterpret_cast<float4*>(dst)[q] = w;
+        }
+        start = quads << 2;
+    }
+    for (int i = start + blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride)
+    {
+        const float g = gradient[i];
+        v += (double)g * (double)g;
+        dst[i] = pp_sgd_step(src[i], g, learningRate, weightDecay);
+    }
+    v = pp_block_sum(v, warpSums);
+    if (threadIdx.x == 0) partials[slot + blockIdx.x] = v;
+}
+
+
 // dst = src - lr * (g + wd * src) (sgd_multi_tensor_update's arithmetic, so the weights match it bit for bit), and the
 // gradients' sum of squares (multi_tensor_sum_squares' arithmetic) onto *guard, for a grid that strides over the
 // PP_CHUNK-element chunks (the host bounds it at a few blocks per SM). Each thread issues each of its 16-byte quads' two
@@ -1408,6 +1448,7 @@ extern ""C"" __global__ __launch_bounds__(256) void sgd_pingpong_update(
             "clip_scale_from_sum_squares",
             "multi_tensor_scale_by_device_scalar",
             "sgd_pingpong_update",
+            "sgd_tensor_update",
             "adam_bf16_update",
             "adamw_bf16_update",
             "rmsprop_update",
