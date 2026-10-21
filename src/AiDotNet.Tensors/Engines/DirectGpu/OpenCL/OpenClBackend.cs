@@ -1236,8 +1236,19 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     WinogradF23KernelTemplate.GetModuleSource(WinogradKernelDialect.OpenCl, group),
                     OpenClBuildOptions.SafeMathFlags, label);
                 var built = new System.Collections.Generic.List<(string, DirectOpenClKernel)>();
-                foreach (var name in WinogradF23KernelTemplate.GetKernelNames(group))
-                    built.Add((name, new DirectOpenClKernel(context, program, name)));
+                try
+                {
+                    foreach (var name in WinogradF23KernelTemplate.GetKernelNames(group))
+                        built.Add((name, new DirectOpenClKernel(context, program, name)));
+                }
+                catch
+                {
+                    // Nothing is in _kernelCache or _programs yet, so Dispose could not reach these. Release what
+                    // this call staged before letting the catch below log the failure.
+                    foreach (var (_, kernel) in built) kernel.Dispose();
+                    program.Dispose();
+                    throw;
+                }
                 _programs.Add(program);
                 foreach (var (name, kernel) in built) _kernelCache[name] = kernel;
             }

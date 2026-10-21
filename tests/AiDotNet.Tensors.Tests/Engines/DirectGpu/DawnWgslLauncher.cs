@@ -28,6 +28,7 @@ Object.assign(globalThis, globals);
 const gpu = create([]);
 const adapter = await gpu.requestAdapter();
 const device = await adapter.requestDevice();
+console.log(JSON.stringify({ ready: true }));
 const pipelines = new Map();
 const rl = readline.createInterface({ input: process.stdin });
 for await (const line of rl) {
@@ -81,6 +82,11 @@ for await (const line of rl) {
     // A launch longer than this is a hung shader or a stuck mapAsync, not a slow one.
     private static readonly TimeSpan ReplyTimeout = TimeSpan.FromMinutes(5);
 
+    // The one line the server prints once its GPU device exists, and how long to wait for it. Adapter and device
+    // creation is the slow part of a start; a minute without it means the server is not coming up.
+    private const string ReadyLine = @"{""ready"":true}";
+    private static readonly TimeSpan ReadyTimeout = TimeSpan.FromMinutes(1);
+
     // dawn.node (webgpu 0.6.x on Windows) dies with an access violation (0xC0000005) a few hundred launches into one
     // server, whatever the server does with its buffers or the collector, so the launcher starts a fresh server every
     // this many launches. Each launch is self-contained (its buffers go in and come back with it), so nothing is lost but
@@ -130,6 +136,18 @@ for await (const line of rl) {
         var stderr = new System.Text.StringBuilder();
         node.ErrorDataReceived += (_, e) => { if (e.Data is not null) lock (stderr) stderr.AppendLine(e.Data); };
         node.BeginErrorReadLine();
+        // Process.Start returning says nothing about the GPU: requestAdapter and requestDevice run after it, and a
+        // server that dies in there would otherwise be handed back as a working one - which on a recycle would see
+        // the healthy server stopped in favour of a dead replacement. The server prints one readiness line once the
+        // device exists, consumed here, so what this returns has a live device behind it.
+        var ready = node.StandardOutput.ReadLineAsync();
+        if (!ready.Wait(ReadyTimeout) || ready.Result != ReadyLine)
+        {
+            try { if (!node.HasExited) node.Kill(entireProcessTree: true); }
+            catch (InvalidOperationException) { }
+            node.Dispose();
+            return null;
+        }
         return (node, stderr);
     }
 

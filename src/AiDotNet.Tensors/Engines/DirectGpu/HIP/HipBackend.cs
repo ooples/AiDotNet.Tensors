@@ -1027,6 +1027,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
         // Load all kernel functions
         int loadedKernelCount = 0;
+        var resolved = new List<(string Name, IntPtr Function)>(kernelNames.Length);
         HipError lastLookupError = HipError.Success;
         foreach (var kernelName in kernelNames)
         {
@@ -1036,6 +1037,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             {
                 loadedKernelCount++;
                 _kernelCache[kernelName] = func;
+                resolved.Add((kernelName, func));
                 // Lets the native-launch choke point journal this kernel BY NAME (Issue #996).
                 // INSIDE the guard: registering on a failed lookup would map IntPtr.Zero to this
                 // name and misattribute a later fault to a kernel that never resolved.
@@ -1049,6 +1051,21 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
         if (loadedKernelCount != kernelNames.Length)
         {
+            // A module whose lookups did not all resolve is not usable, and leaving the ones that did in
+            // _kernelCache would hand out functions from a module that never finished initialising - a caller
+            // gating on HasTunedKernel(oneName) would then launch into it. Undo the partial load: unregister the
+            // diagnostics names, drop the cache entries this call added, and unload the module instead of leaving
+            // it resident until Dispose.
+            foreach (var (name, function) in resolved)
+            {
+                GpuKernelDiagnostics.UnregisterKernelName(function);
+                if (_kernelCache.TryGetValue(name, out var cached) && cached == function) _kernelCache.Remove(name);
+            }
+            if (module != IntPtr.Zero)
+            {
+                HipNativeBindings.hipModuleUnload(module);
+                module = IntPtr.Zero;
+            }
             return RecordKernelCompilationFailure(new HipKernelCompilationException(
                 moduleName,
                 HipKernelCompilationStage.FunctionLookup,
