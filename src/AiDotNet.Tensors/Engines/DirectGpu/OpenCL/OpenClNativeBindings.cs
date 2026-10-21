@@ -98,6 +98,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public const uint CL_DEVICE_MAX_COMPUTE_UNITS = 0x1002;
         public const uint CL_DEVICE_GLOBAL_MEM_SIZE = 0x101F;
         public const uint CL_DEVICE_MAX_MEM_ALLOC_SIZE = 0x1010;
+        public const uint CL_DEVICE_MEM_BASE_ADDR_ALIGN = 0x1019;
         public const uint CL_DEVICE_LOCAL_MEM_SIZE = 0x1023;
         public const uint CL_DEVICE_MAX_WORK_GROUP_SIZE = 0x1004;
         public const uint CL_DEVICE_MAX_WORK_ITEM_DIMENSIONS = 0x1003;
@@ -331,12 +332,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             IntPtr eventWaitList,
             out IntPtr eventOut);
 
-        // clCreateSubBuffer — creates a buffer object from a region of an existing buffer
-        public static IntPtr CreateSubBuffer(IntPtr buffer, int byteOffset, int byteSize)
+        // clCreateSubBuffer - creates a buffer object from a region of an existing buffer. The error code reaches the
+        // caller: a region the device refuses (CL_MISALIGNED_SUB_BUFFER_OFFSET most often) is indistinguishable from
+        // any other failure once the handle is null, and the offset the device would accept is not derivable from it.
+        public static IntPtr CreateSubBuffer(IntPtr buffer, int byteOffset, int byteSize, out int err)
         {
             // CL_BUFFER_CREATE_TYPE_REGION = 0x1220
             var region = new BufferRegion { Origin = (UIntPtr)byteOffset, Size = (UIntPtr)byteSize };
-            int err;
             IntPtr subBuf = clCreateSubBuffer(buffer, (uint)CL_MEM_READ_WRITE, 0x1220, ref region, out err);
             return err == 0 ? subBuf : IntPtr.Zero;
         }
