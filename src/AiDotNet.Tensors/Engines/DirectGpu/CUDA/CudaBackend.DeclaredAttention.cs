@@ -170,6 +170,14 @@ public sealed partial class CudaBackend
         float scale, bool causal, int maskMode, float softcap, IGpuBuffer? stats = null)
     {
         if (stats is not null && (weights is not null || mask is not null)) return false;
+        // The same extent and grouping guards the two backward routes already carry. Without them a
+        // malformed call reaches CodegenBackendPrograms.ScaledDotProductAttention on its second sighting,
+        // which throws ArgumentOutOfRangeException or ArgumentException; BuildAttentionProgram catches only
+        // NotSupportedException, so that would escape from inside _directPtxLock instead of declining the
+        // route and letting the hand-written kernel serve the call.
+        if (batch <= 0 || heads <= 0 || kvHeads <= 0 || seqQ <= 0 || seqK <= 0 || headDim <= 0 ||
+            heads % kvHeads != 0 || (maskMode != 0 && mask is null))
+            return false;
         if (softcap > 0f || !DeclaredKernelsEnabled || headDim >= 1 << AttentionMaskShift ||
             (long)batch * heads * seqQ * seqK > AttentionMaxScoreElements)
             return false;

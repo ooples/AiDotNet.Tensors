@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Globalization;
@@ -757,6 +757,19 @@ internal sealed class DirectPtxModule : IDisposable
     /// </summary>
     internal bool AllowsLocalMemory { get; init; }
 
+    /// <summary>
+    /// The ceiling on local bytes/thread while <see cref="AllowsLocalMemory"/> is set, in the spirit of a
+    /// blueprint's MaxLocalBytesPerThread. The flag applies to the whole linked module, library routines and the
+    /// emitted entry alike, so without a bound GetFunction would never reject a linked declared kernel and a
+    /// spilling emitted body would run with no diagnostic. This is headroom for the library's call stack and
+    /// argument-reduction arrays, not a measured ceiling: the rejection prints the observed value, and
+    /// <see cref="LocalBytesObserved"/> carries it for the kernels that stay under the budget.
+    /// </summary>
+    internal int LocalMemoryBudgetBytes { get; init; } = 512;
+
+    /// <summary>The largest local bytes/thread seen in this module, 0 when no function spilled.</summary>
+    internal int LocalBytesObserved { get; private set; }
+
     private const uint DefaultDynamicSharedMemoryLimitBytes = 48 * 1024;
     private readonly DirectPtxRuntime _runtime;
     private readonly object _dynamicSharedMemoryLock = new();
@@ -822,6 +835,13 @@ internal sealed class DirectPtxModule : IDisposable
                     $"Direct PTX kernel '{name}' was rejected: CUDA JIT allocated " +
                     $"{info.LocalBytesPerThread} local bytes/thread (register spill or local stack). " +
                     "The direct-kernel contract requires zero local memory.");
+            if (info.LocalBytesPerThread > LocalBytesObserved) LocalBytesObserved = info.LocalBytesPerThread;
+            if (info.LocalBytesPerThread > LocalMemoryBudgetBytes)
+                throw new InvalidOperationException(
+                    $"Direct PTX kernel '{name}' was rejected: CUDA JIT allocated " +
+                    $"{info.LocalBytesPerThread} local bytes/thread, over the {LocalMemoryBudgetBytes}-byte budget a " +
+                    "module linked with the math library is allowed for the library's own call stack. The excess is a " +
+                    "register spill in the kernel's own code, which the direct-kernel contract forbids.");
             if (_registeredFunctions.Add(function))
                 GpuKernelDiagnostics.RegisterKernelName(function, name);
             return function;

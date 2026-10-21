@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // Lowers a CodegenKernelSpec to SM86 PTX.
 //
 // This is the generated-code half of the C#-vs-Rust bake-off. It replaces
@@ -1918,6 +1918,26 @@ public sealed partial class PtxAffineEmitter
                         L($"ex2.approx.f32 {transformed}, {scaledT};");
                     }
                     product = transformed;
+                }
+
+                // The oracle (CodegenKernelSpec.Interpret) gives an out-of-range tap the identity
+                // OF THE REDUCTION and skips the pre-bias and the pre-reduce for that term
+                // entirely. The emitter can leave the select out only where the guarded load's
+                // fill reaches the accumulator unchanged -- a bare product of operands, where
+                // 0 * x == 0 under Sum (a Max over more than one operand is refused above). An
+                // expression body maps the fill to anything (a - b yields -b), the pre-bias adds
+                // to it, and the pre-reduce transforms it (exp(0) == 1), so each of those has to
+                // put the identity back. Today's declared bodies bind in range, which is why this
+                // is a latent public-spec defect rather than a wrong gradient in the attention,
+                // normalisation or convolution routes.
+                if (productPred is not null &&
+                    (spec.Body is not null || spec.PreBiasInput.HasValue ||
+                     spec.PreReduce != CodegenPreReduceOp.None))
+                {
+                    string identity = NextF(), kept = NextF();
+                    L($"mov.f32 {identity}, {_outOfRangeFill};");
+                    L($"selp.f32 {kept}, {product!}, {identity}, {productPred};");
+                    product = kept;
                 }
 
                 // An out-of-range tap contributes the additive identity; the guarded

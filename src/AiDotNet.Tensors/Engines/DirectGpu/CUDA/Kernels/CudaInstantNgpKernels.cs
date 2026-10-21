@@ -384,6 +384,11 @@ extern ""C"" __global__ __launch_bounds__(256) void resident_index_select(
     int j = (gid / innerSize) % indexAxis;
     int outer = (gid / innerSize) / indexAxis;
     int sourceIndex = indices[j];
+    // The declared route (TryDeclaredIndexSelect, for outputs of 16384 elements or more) binds the
+    // source through an indirect index whose policy is Skip, so an index outside [0, sourceAxis)
+    // yields a zero row. Without the same bound here the two routes disagree for the same call and
+    // this one reads outside the source buffer.
+    if (sourceIndex < 0 || sourceIndex >= sourceAxis) { output[gid] = 0.0f; return; }
     output[gid] = source[(outer * sourceAxis + sourceIndex) * innerSize + inner];
 }
 

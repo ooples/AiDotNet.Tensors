@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // The declared normalisation programs in the EXACT contract of the hand-written backend kernels they replace
 // (#890 phase 4a), so a backend can route an existing call to them with no change to its callers.
 //
@@ -202,7 +202,7 @@ public static class CodegenBackendPrograms
     /// <summary>
     /// <c>out[o, j, i] = source[o, indices[j], i]</c>: indices int32 [indexAxis], source [outer, sourceAxis, inner],
     /// out [outer, indexAxis, inner] -- CudaBackend.IndexSelect's contract. An index outside [0, sourceAxis) yields
-    /// zeros (the hand-written kernel read outside the source).
+    /// zeros, which resident_index_select now bounds to as well.
     /// </summary>
     public static CodegenProgram IndexSelect(int outer, int sourceAxis, int indexAxis, int inner)
     {
