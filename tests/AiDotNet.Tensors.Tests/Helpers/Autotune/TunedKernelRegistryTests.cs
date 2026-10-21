@@ -234,12 +234,13 @@ public sealed class TunedKernelRegistryTests : IDisposable
     [Fact]
     public void TwoLostPairs_InEveryMeasurement_LeaveTheDecisionInconclusive_AndUnpersisted()
     {
-        // Faster by median but two stalled pairs in the first measurement (candidate calls 3, 7 of 2..10) and in the
-        // retry (calls 13, 17 of 12..20): the slot cannot tell, so it serves the reference and does not persist that.
+        // Faster by median but two stalled pairs in every measurement: the first (candidate calls 3, 7 of 2..10), its
+        // re-measure (13, 17 of 11..19), the slot's retry (23, 27 of 21..29) and its re-measure (32, 36 of 30..38): the
+        // slot cannot tell, so it serves the reference and does not persist that.
         var reference = new Fake("ref", 1f, 1.0);
         var fast = new Fake("fast", 1f, 0.7);
         var harness = new Harness();
-        foreach (int call in new[] { 3, 7, 13, 17 }) harness.Stalls[("fast", call)] = 10.0;
+        foreach (int call in new[] { 3, 7, 13, 17, 23, 27, 32, 36 }) harness.Stalls[("fast", call)] = 10.0;
         var slot = Slot(harness, false, reference, fast);
 
         Assert.Same(reference, slot.Resolve(Shape(), NewArgs()));
@@ -265,6 +266,26 @@ public sealed class TunedKernelRegistryTests : IDisposable
     }
 
     [Fact]
+    public void A_fastest_candidate_refused_for_two_lost_pairs_is_remeasured_before_a_slower_winner_takes_the_shape()
+    {
+        // "mid" passes cleanly at 1.25x; "fast" is 1.67x but two of its first nine pairs stall (calls 3 and 7 of 2..10).
+        // Without a re-measure "mid" won and was persisted; the clean re-measure (calls 11..19) promotes "fast".
+        var reference = new Fake("ref", 1f, 1.0);
+        var mid = new Fake("mid", 1f, 0.8);
+        var fast = new Fake("fast", 1f, 0.6);
+        var harness = new Harness();
+        harness.Stalls[("fast", 3)] = 10.0;
+        harness.Stalls[("fast", 7)] = 10.0;
+        var slot = Slot(harness, false, reference, mid, fast);
+
+        Assert.Same(fast, slot.Resolve(Shape(), NewArgs()));
+        var decision = Assert.Single(slot.CachedDecisions);
+        Assert.Equal(TunedKernelDecisionReason.Tuned, decision.Reason);
+        Assert.Contains(decision.Rejected, r => r.StartsWith("fast: re-measured", StringComparison.Ordinal));
+        Assert.Contains(decision.Rejected, r => r.StartsWith("mid: passed", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void An_inconclusive_verdict_is_not_persisted_but_a_clean_loss_is()
     {
         string dir = Path.Combine(Path.GetTempPath(), "tuned-inconclusive-" + Guid.NewGuid().ToString("N"));
@@ -280,7 +301,7 @@ public sealed class TunedKernelRegistryTests : IDisposable
         try
         {
             var noisy = new Harness();
-            foreach (int call in new[] { 3, 7, 13, 17 }) noisy.Stalls[("fast", call)] = 10.0;
+            foreach (int call in new[] { 3, 7, 13, 17, 23, 27, 32, 36 }) noisy.Stalls[("fast", call)] = 10.0;
             Slot(noisy, false, new Fake("ref", 1f, 1.0), new Fake("fast", 1f, 0.7)).Resolve(Shape(4, 8), NewArgs());
             Assert.Equal(0, Persisted());
 
