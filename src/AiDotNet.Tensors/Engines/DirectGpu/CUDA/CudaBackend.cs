@@ -13862,6 +13862,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         float learningRate, float weightDecay)
         => SgdMultiTensorImpl(parameters, gradients, sizes, learningRate, weightDecay, IntPtr.Zero, IntPtr.Zero);
 
+    /// <summary>The guarded updates below read the guard in their kernels (<c>sgd_multi_tensor_update</c> and the
+    /// Adam kernels take it as an argument), so nothing is read back before a launch.</summary>
+    public bool GuardsFiniteOnDevice => true;
+
     /// <summary>
     /// <see cref="SgdMultiTensorUpdate"/> whose kernel reads <paramref name="finiteGuard"/> (a double) on the device and
     /// writes nothing when it is not finite: no host read before the launch, so the step never waits on the device.
