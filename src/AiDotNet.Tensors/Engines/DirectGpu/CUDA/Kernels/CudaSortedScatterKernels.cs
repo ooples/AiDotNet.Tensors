@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 // Deterministic scatter-add without floating-point atomics (#890 phase 4e): a stable sort of the indices, then each
 // destination sums its own contributions in increasing source order.
 
@@ -117,18 +117,32 @@ extern ""C"" __global__ __launch_bounds__(256) void sorted_scatter_starts(
 }
 
 // out[d, f] = (accumulate ? out[d, f] : 0) + the sum of source rows sorted into run d, in increasing source order.
+// Item i reads source row rows[i] (or i when rows is null), scaled by weights[i] when weights is not null;
+// counts[d] (when not null) gets the run's length.
 extern ""C"" __global__ __launch_bounds__(256) void sorted_scatter_sum(
     const float* __restrict__ source, const int* __restrict__ order, const int* __restrict__ starts,
-    float* __restrict__ output, int destinations, int features, int accumulate)
+    float* __restrict__ output, int destinations, int features, int accumulate,
+    const int* __restrict__ rows, const float* __restrict__ weights, int* __restrict__ counts)
 {
     // The output is one buffer, so it holds fewer than 2^31 elements: 32-bit index arithmetic throughout.
     int cell = blockIdx.x * blockDim.x + threadIdx.x;
     if (cell >= destinations * features) return;
     int d = cell / features, f = cell - d * features;
     float sum = 0.0f;
-    for (int p = starts[d], end = starts[d + 1]; p < end; p++) sum += source[(long long)order[p] * features + f];
+    int begin = starts[d], end = starts[d + 1];
+    for (int p = begin; p < end; p++)
+    {
+        int item = order[p];
+        int row = rows ? rows[item] : item;
+        float value = source[(long long)row * features + f];
+        // scatter_add_edges_deterministic's `value *= w; sum += value` is contracted by NVRTC into one fused
+        // multiply-add; the explicit fmaf keeps this kernel's arithmetic identical to it whatever this compiler does.
+        if (weights) sum = fmaf(value, weights[item], sum);
+        else sum += value;
+    }
     if (accumulate) output[cell] += sum;
     else output[cell] = sum;
+    if (counts && f == 0) counts[d] = end - begin;
 }
 ";
         }

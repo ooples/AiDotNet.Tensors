@@ -152,6 +152,62 @@ public class DeclaredGatherRouteTests
     }
 
     /// <summary>
+    /// The graph edge scatter (target-keyed, reading each edge's source row, optionally weighted) and ScatterMean (sums
+    /// and per-row counts, then the divide) through the sorted kernels are bit-identical to the scanning kernels.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(20000, 3000, 32, true)]
+    [InlineData(20000, 3000, 32, false)]
+    [InlineData(6000, 40, 128, true)]
+    public void TheSortedEdgeScatterAndScatterMeanAreBitIdenticalToTheScanningKernels(int edges, int nodes, int features,
+        bool weighted)
+    {
+        using var backend = OpenBackendOrSkip();
+        bool previous = AiDotNetEngine.DeterministicMode;
+        AiDotNetEngine.SetDeterministicMode(true);
+        try
+        {
+            int[] targets = Ids(edges, nodes);
+            var sources = new int[edges];
+            for (int e = 0; e < edges; e++) sources[e] = (int)((e * 40503L + 7) % nodes);
+            float[] input = Fill(nodes * features, 7), edgeValues = Fill(edges, 8), rows = Fill(edges * features, 9);
+            var results = new float[2][][];
+            foreach (bool sorted in new[] { false, true })
+            {
+                backend.SortedScatterSwitch = sorted;
+                try
+                {
+                    using var bsrc = backend.AllocateIntBuffer(sources);
+                    using var btgt = backend.AllocateIntBuffer(targets);
+                    using var binput = backend.AllocateBuffer(input);
+                    using var bweights = backend.AllocateBuffer(edgeValues);
+                    using var bout = backend.AllocateBuffer(Fill(nodes * features, 10));
+                    using var brows = backend.AllocateBuffer(rows);
+                    using var bmean = backend.AllocateBuffer(nodes * features);
+                    using var bcounts = backend.AllocateBuffer(nodes);
+                    long before = backend.SortedScatterLaunches;
+                    backend.ScatterAddEdges(binput, bsrc, btgt, weighted ? bweights : null, bout, nodes, edges, features);
+                    backend.ScatterMean(brows, btgt, bmean, bcounts, edges * features, nodes, features);
+                    backend.Synchronize();
+                    Assert.Equal(sorted ? before + 2 : before, backend.SortedScatterLaunches);
+                    results[sorted ? 1 : 0] = new[] { backend.DownloadBuffer(bout), backend.DownloadBuffer(bmean), backend.DownloadBuffer(bcounts) };
+                }
+                finally
+                {
+                    backend.SortedScatterSwitch = null;
+                }
+            }
+            AssertBitIdentical(results[0][0], results[1][0], "edge scatter");
+            AssertBitIdentical(results[0][1], results[1][1], "scatter mean");
+            AssertBitIdentical(results[0][2], results[1][2], "scatter mean counts");
+        }
+        finally
+        {
+            AiDotNetEngine.SetDeterministicMode(previous);
+        }
+    }
+
+    /// <summary>
     /// The sorted scatter captures into a graph once its scratch exists, and a replay is bit-identical to the eager
     /// call; first met inside a capture (no scratch yet), it leaves the call to the scanning kernel.
     /// </summary>

@@ -5061,6 +5061,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         if (GpuDeterminism.IsActive)
         {
+            // #890 phase 4e: the same fixed-order sums through a stable sort of the targets (output is zeroed above).
+            if (TrySortedScatterAdd(input, targetIndices, output, numEdges, numNodes, features, accumulate: true,
+                    rows: sourceIndices, weights: edgeValues))
+                return;
             // Issue #382: per-target-node thread scans edges in fixed order.
             if (!_kernelCache.TryGetValue("scatter_add_edges_deterministic", out var krnlD))
                 throw new GpuCapabilityUnavailableException("CUDA kernel not found: scatter_add_edges_deterministic");
@@ -11214,7 +11218,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         Fill(counts, 0f, outputSize);
         IntPtr sPtr = source.Handle, idxPtr = indices.Handle, oPtr = output.Handle, cPtr = counts.Handle;
 
-        if (GpuDeterminism.IsActive)
+        if (GpuDeterminism.IsActive && featureSize > 0 &&
+            TrySortedScatterAdd(source, indices, output, sourceSize / featureSize, outputSize, featureSize,
+                accumulate: false, counts: counts))
+        {
+            // #890 phase 4e: scatter_mean_activation_deterministic's sums and counts, through a stable sort.
+        }
+        else if (GpuDeterminism.IsActive)
         {
             // Issue #382: route to atomic-free variant — per (dstRow, col) output cell.
             if (!_kernelCache.TryGetValue("scatter_mean_activation_deterministic", out var kernelD))

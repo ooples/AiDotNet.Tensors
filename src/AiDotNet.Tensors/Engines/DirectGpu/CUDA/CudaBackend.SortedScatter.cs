@@ -31,11 +31,14 @@ public sealed partial class CudaBackend
     /// <c>output[d, f] = (accumulate ? output[d, f] : 0) + sum of source[i, f] over every i with indices[i] == d</c>,
     /// summed in increasing i, for d in [0, destinations): an index outside that range contributes nowhere. The same
     /// result, bit for bit, as embedding_backward_deterministic (accumulate false) and
-    /// scatter_add_accumulate_deterministic (accumulate true, one feature). False -- nothing launched -- when switched
+    /// scatter_add_accumulate_deterministic (accumulate true, one feature), and -- item i reading source row rows[i],
+    /// scaled by weights[i], counts[d] taking run d's length -- scatter_add_edges_deterministic and
+    /// scatter_mean_activation_deterministic. False -- nothing launched -- when switched
     /// off, the kernels are missing, or the scratch would have to grow inside a stream capture.
     /// </summary>
     internal unsafe bool TrySortedScatterAdd(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, int count,
-        int destinations, int features, bool accumulate)
+        int destinations, int features, bool accumulate, IGpuBuffer? rows = null, IGpuBuffer? weights = null,
+        IGpuBuffer? counts = null)
     {
         if (!(SortedScatterSwitch ?? s_sortedScatter) || count <= 0 || destinations <= 0 || features <= 0 ||
             destinations == int.MaxValue)
@@ -97,9 +100,11 @@ public sealed partial class CudaBackend
             startArgs[0] = &sortedKeys; startArgs[1] = &st; startArgs[2] = &n; startArgs[3] = &dest;
             LaunchKernel(startsKernel, (uint)((count + 1 + 255) / 256), 256, startArgs);
 
-            void** sumArgs = stackalloc void*[7];
+            IntPtr rowPtr = rows?.Handle ?? IntPtr.Zero, weightPtr = weights?.Handle ?? IntPtr.Zero;
+            IntPtr countPtr = counts?.Handle ?? IntPtr.Zero;
+            void** sumArgs = stackalloc void*[10];
             sumArgs[0] = &src; sumArgs[1] = &sortedValues; sumArgs[2] = &st; sumArgs[3] = &outp; sumArgs[4] = &dest;
-            sumArgs[5] = &feat; sumArgs[6] = &acc;
+            sumArgs[5] = &feat; sumArgs[6] = &acc; sumArgs[7] = &rowPtr; sumArgs[8] = &weightPtr; sumArgs[9] = &countPtr;
             LaunchKernel(sumKernel, checked((uint)((cells + 255) / 256)), 256, sumArgs);
         }
         System.Threading.Interlocked.Increment(ref _sortedScatterLaunches);

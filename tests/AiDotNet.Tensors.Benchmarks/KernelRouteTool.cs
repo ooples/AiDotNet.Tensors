@@ -394,6 +394,52 @@ internal static class KernelRouteTool
                 Console.WriteLine((n + " tok, vocab " + v + ", dim " + d).PadRight(30) + " fwd " + R(fwd[0], fwd[1]) + " " + f +
                     "  bwd " + R(bwd[0], bwd[1]) + " " + b + "  scatter " + R(sc[0], sc[1]) + " " + s);
             }
+            // Graph message passing: a weighted edge scatter and a scatter-mean over the same targets.
+            foreach (var (edges, nodes, features) in new[] { (200000, 20000, 64), (20000, 3000, 32), (500, 100, 16) })
+            {
+                var targets = new int[edges];
+                var sources = new int[edges];
+                for (int e = 0; e < edges; e++) { targets[e] = (int)((e * 2654435761L) % nodes); sources[e] = (int)((e * 40503L + 7) % nodes); }
+                using var bt = backend.AllocateIntBuffer(targets);
+                using var bs = backend.AllocateIntBuffer(sources);
+                using var input = backend.AllocateBuffer(Fill(nodes * features, 64, 0));
+                using var weights = backend.AllocateBuffer(Fill(edges, 65, 0));
+                using var rows = backend.AllocateBuffer(Fill(edges * features, 66, 0));
+                using var outp = backend.AllocateBuffer(nodes * features);
+                using var mean = backend.AllocateBuffer(nodes * features);
+                using var counts = backend.AllocateBuffer(nodes);
+                var edge = new double[2]; var meanT = new double[2];
+                var outs = new float[2][][];
+                for (int route = 0; route < 2; route++)
+                {
+                    backend.SortedScatterSwitch = route == 1;
+                    try
+                    {
+                        void Edges() => backend.ScatterAddEdges(input, bs, bt, weights, outp, nodes, edges, features);
+                        void Mean() => backend.ScatterMean(rows, bt, mean, counts, edges * features, nodes, features);
+                        Edges(); Mean(); backend.Synchronize();
+                        var sw = Stopwatch.StartNew(); Edges(); backend.Synchronize();
+                        edge[route] = sw.Elapsed.TotalMilliseconds * 1000 > 50_000 ? sw.Elapsed.TotalMilliseconds * 1000 : Time(Edges, backend.Synchronize);
+                        sw.Restart(); Mean(); backend.Synchronize();
+                        meanT[route] = sw.Elapsed.TotalMilliseconds * 1000 > 50_000 ? sw.Elapsed.TotalMilliseconds * 1000 : Time(Mean, backend.Synchronize);
+                        outs[route] = new[] { backend.DownloadBuffer(outp), backend.DownloadBuffer(mean) };
+                    }
+                    finally
+                    {
+                        backend.SortedScatterSwitch = null;
+                    }
+                }
+                bool same = true;
+                for (int o = 0; o < 2; o++)
+                    for (int i = 0; i < outs[0][o].Length; i++)
+                        same &= BitConverter.SingleToInt32Bits(outs[0][o][i]) == BitConverter.SingleToInt32Bits(outs[1][o][i]);
+                if (!same) failures.Add("edges " + edges + "x" + nodes + "x" + features + ": not bit-identical");
+                Console.WriteLine((edges + " edges, " + nodes + " nodes, dim " + features).PadRight(30) +
+                    " edges " + edge[0].ToString("F1", CultureInfo.InvariantCulture) + " -> " + edge[1].ToString("F1", CultureInfo.InvariantCulture) +
+                    " = " + (edge[0] / edge[1]).ToString("F2", CultureInfo.InvariantCulture) + "x  mean " +
+                    meanT[0].ToString("F1", CultureInfo.InvariantCulture) + " -> " + meanT[1].ToString("F1", CultureInfo.InvariantCulture) +
+                    " = " + (meanT[0] / meanT[1]).ToString("F2", CultureInfo.InvariantCulture) + "x  " + (same ? "same" : "DIFF"));
+            }
         }
         finally
         {
