@@ -807,7 +807,16 @@ public sealed class CodegenKernelSpec
                     $"{indirect.IndexInput}, but the spec has only {_inputs.Length} inputs.");
 
             var source = _inputs[indirect.IndexInput];
-            if (!source.IsIndexTensor)
+            if (indirect.FloatIndices)
+            {
+                // Declared float indices: the tensor must really be float32 (an int32 one read as float would
+                // compute with a reinterpreted bit pattern too).
+                if (source.ElementType != CodegenElementType.Float32)
+                    throw new ArgumentException(
+                        $"The {role} binding '{binding.Name}' declares float indices for dimension {d}, but input " +
+                        $"'{source.Name}' is {source.ElementType} rather than Float32.");
+            }
+            else if (!source.IsIndexTensor)
                 throw new ArgumentException(
                     $"The {role} binding '{binding.Name}' takes dimension {d} from input " +
                     $"'{source.Name}', which is {source.ElementType} rather than Int32. " +

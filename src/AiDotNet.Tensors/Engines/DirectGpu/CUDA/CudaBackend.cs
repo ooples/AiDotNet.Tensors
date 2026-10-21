@@ -13238,6 +13238,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     }
     public unsafe void TakeAlongDim(IGpuBuffer input, IGpuBuffer indices, IGpuBuffer output, int outerSize, int axisOut, int innerSize, int axisIn)
     {
+        if (TryDeclaredTakeAlongDim(input, indices, output, outerSize, axisOut, innerSize, axisIn)) return;
         var kernel = ResolveParity210Kernel("parity210_take_along_dim_f");
         using var _ = PushContext();
         int __total = outerSize*axisOut*innerSize; if (__total <= 0) return;

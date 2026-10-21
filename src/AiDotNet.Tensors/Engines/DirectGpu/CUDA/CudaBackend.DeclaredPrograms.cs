@@ -47,6 +47,8 @@ internal enum DeclaredFamily
 
     /// <summary>A convolution pass (dense, grouped or a transposed one's adjoint); the key's Name is its DeclaredConvKey.</summary>
     Convolution,
+    IndexSelect,
+    TakeAlongDim,
 }
 
 /// <summary>One declared program: its family and shape (unused dimensions are 0).</summary>

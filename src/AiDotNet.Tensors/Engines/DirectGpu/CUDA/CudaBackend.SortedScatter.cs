@@ -136,6 +136,65 @@ public sealed partial class CudaBackend
             new DeclaredBindings(indices, table, output));
     }
 
+    private static readonly string[] s_indexSelectNames = { "indices", "source", "out" };
+
+    private static readonly Func<DeclaredKey, CodegenProgram> s_buildIndexSelect =
+        key => CodegenBackendPrograms.IndexSelect(key.D0, key.D1, key.D2, key.D3);
+
+    internal static DeclaredKey IndexSelectKey(int outer, int sourceAxis, int indexAxis, int inner) =>
+        new(DeclaredFamily.IndexSelect, outer, sourceAxis, indexAxis, inner, 0, 0);
+
+    /// <summary>
+    /// IndexSelect through the declared gather (CodegenBackendPrograms.IndexSelect); below the same size as Embedding's
+    /// it keeps the hand-written kernel. False -- nothing launched -- when the route is off or the shape declines.
+    /// </summary>
+    internal bool TryDeclaredIndexSelect(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, int outer,
+        int sourceAxis, int indexAxis, int inner)
+    {
+        if (outer <= 0 || sourceAxis <= 0 || indexAxis <= 0 || inner <= 0 ||
+            (long)outer * indexAxis * inner < 16384 || indices.Size < indexAxis ||
+            (long)source.Size < (long)outer * sourceAxis * inner)
+            return false;
+        return TryRunDeclaredProgram(IndexSelectKey(outer, sourceAxis, indexAxis, inner), s_buildIndexSelect,
+            s_indexSelectNames, new DeclaredBindings(indices, source, output));
+    }
+
+    /// <summary>IndexSelect as a resident-program stage, in IndexSelect's contract.</summary>
+    internal DeclaredResidentStage IndexSelectStage(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, int outer,
+        int sourceAxis, int indexAxis, int inner) =>
+        new(IndexSelectKey(outer, sourceAxis, indexAxis, inner), s_buildIndexSelect, s_indexSelectNames,
+            new DeclaredBindings(indices, source, output));
+
+    private static readonly string[] s_takeAlongDimNames = { "indices", "input", "out" };
+
+    private static readonly Func<DeclaredKey, CodegenProgram> s_buildTakeAlongDim =
+        key => CodegenBackendPrograms.TakeAlongDim(key.D0, key.D1, key.D2, key.D3);
+
+    internal static DeclaredKey TakeAlongDimKey(int outer, int axisOut, int inner, int axisIn) =>
+        new(DeclaredFamily.TakeAlongDim, outer, axisOut, inner, axisIn, 0, 0);
+
+    /// <summary>
+    /// TakeAlongDim through the declared gather (CodegenBackendPrograms.TakeAlongDim, float indices truncated as the
+    /// hand-written kernel's (int)); below the same size as Embedding's it keeps the hand-written kernel. False --
+    /// nothing launched -- when the route is off or the shape declines.
+    /// </summary>
+    internal bool TryDeclaredTakeAlongDim(IGpuBuffer input, IGpuBuffer indices, IGpuBuffer output, int outer,
+        int axisOut, int inner, int axisIn)
+    {
+        long count = (long)outer * axisOut * inner;
+        if (outer <= 0 || axisOut <= 0 || inner <= 0 || axisIn <= 0 || count < 16384 || indices.Size < count ||
+            (long)input.Size < (long)outer * axisIn * inner)
+            return false;
+        return TryRunDeclaredProgram(TakeAlongDimKey(outer, axisOut, inner, axisIn), s_buildTakeAlongDim,
+            s_takeAlongDimNames, new DeclaredBindings(indices, input, output));
+    }
+
+    /// <summary>TakeAlongDim as a resident-program stage, in TakeAlongDim's contract.</summary>
+    internal DeclaredResidentStage TakeAlongDimStage(IGpuBuffer input, IGpuBuffer indices, IGpuBuffer output, int outer,
+        int axisOut, int inner, int axisIn) =>
+        new(TakeAlongDimKey(outer, axisOut, inner, axisIn), s_buildTakeAlongDim, s_takeAlongDimNames,
+            new DeclaredBindings(indices, input, output));
+
     /// <summary>The embedding lookup as a resident-program stage, in Embedding's contract.</summary>
     internal DeclaredResidentStage EmbeddingStage(IGpuBuffer indices, IGpuBuffer table, IGpuBuffer output, int tokens, int width) =>
         new(EmbeddingKey(tokens, table.Size / width, width), s_buildEmbedding, s_embeddingNames,

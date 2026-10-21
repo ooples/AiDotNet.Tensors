@@ -90,6 +90,7 @@ internal static class KernelRouteTool
         if (only is null || only.Equals("capture", StringComparison.OrdinalIgnoreCase)) CaptureCheck(backend, failures);
         if (only is null || only.Equals("resident", StringComparison.OrdinalIgnoreCase)) ResidentChains(backend, failures);
         if (only is null || only.Equals("conv", StringComparison.OrdinalIgnoreCase)) ConvRoutes(backend, failures);
+        if (only is null || only.Equals("conv-variants", StringComparison.OrdinalIgnoreCase)) ConvVariantRoutes(backend, failures);
         if (only is not null && only.Equals("conv-vendor", StringComparison.OrdinalIgnoreCase)) ConvVendor(backend, failures);
         if (only is null || only.Equals("gemm", StringComparison.OrdinalIgnoreCase)) GemmSchedules(backend, failures);
         if (only is null || only.Equals("flash", StringComparison.OrdinalIgnoreCase)) FlashProbe(backend);
@@ -1356,6 +1357,138 @@ internal static class KernelRouteTool
                     double us = Time(() => Declared(), backend.Synchronize);
                     bool ok = err <= Math.Max(2 * incumbentErr, 1e-5 * scale);
                     if (!ok) failures.Add(label + " " + pass + " " + schedule.Suffix + ": error " + E(err));
+                    Console.WriteLine(name + E(err).PadLeft(10) + E(incumbentErr).PadLeft(14) +
+                        us.ToString("F1", CultureInfo.InvariantCulture).PadLeft(10) +
+                        incumbentUs.ToString("F1", CultureInfo.InvariantCulture).PadLeft(14) +
+                        (incumbentUs / us).ToString("F2", CultureInfo.InvariantCulture).PadLeft(8) + "x" + (ok ? "" : "  FAIL"));
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Depthwise and transposed convolutions (#890 phase 4b): every declared schedule of the six operators against the
+    /// hand-written kernel their entry points ran before (declared route off), each against a direct fp64 convolution.
+    /// </summary>
+    private static void ConvVariantRoutes(CudaBackend backend, List<string> failures)
+    {
+        Console.WriteLine();
+        Console.WriteLine("CONV VARIANTS - declared schedules vs the hand-written kernels (declared off), each against fp64");
+        Console.WriteLine("case                                            schedule          err        incumbent err    us      incumbent us  ratio");
+        // (label, depthwise, N, Ci, Co, H, W, kernel, stride, pad, outputPad)
+        var shapes = new[]
+        {
+            ("dw 8x144 56 s1", true, 8, 144, 0, 56, 56, 3, 1, 1, 0),
+            ("dw 8x96 112 s2", true, 8, 96, 0, 112, 112, 3, 2, 1, 0),
+            ("dw 8x384 14 s1", true, 8, 384, 0, 14, 14, 3, 1, 1, 0),
+            ("tconv 8x128->64 28 k3s2 op1", false, 8, 128, 64, 28, 28, 3, 2, 1, 1),
+            ("tconv 8x64->32 56 k4s2", false, 8, 64, 32, 56, 56, 4, 2, 1, 0),
+        };
+        foreach (var (label, depthwise, n, ci, coIn, h, w, kernel, stride, pad, outputPad) in shapes)
+        {
+            int co = depthwise ? ci : coIn;
+            int oh = depthwise ? (h + 2 * pad - kernel) / stride + 1 : (h - 1) * stride - 2 * pad + kernel + outputPad;
+            int ow = depthwise ? (w + 2 * pad - kernel) / stride + 1 : (w - 1) * stride - 2 * pad + kernel + outputPad;
+            int weightCount = depthwise ? ci * kernel * kernel : ci * co * kernel * kernel;
+            float[] x = Fill(n * ci * h * w, 1, 0), wt = Fill(weightCount, 2, 0), dy = Fill(n * co * oh * ow, 3, 0);
+            var y = new double[dy.Length];
+            var dx = new double[x.Length];
+            var dw = new double[wt.Length];
+            for (int b = 0; b < n; b++)
+            for (int c = 0; c < ci; c++)
+            for (int ih = 0; ih < h; ih++)
+            for (int iw = 0; iw < w; iw++)
+            for (int o = 0; o < (depthwise ? 1 : co); o++)
+            for (int kh = 0; kh < kernel; kh++)
+            for (int kw = 0; kw < kernel; kw++)
+            {
+                // Depthwise reads x at oh*s - p + kh; a transposed convolution writes y there from x[ih].
+                int xi = ((b * ci + c) * h + ih) * w + iw, yi, wi;
+                if (depthwise)
+                {
+                    int ohNum = ih + pad - kh, owNum = iw + pad - kw;
+                    if (ohNum < 0 || owNum < 0 || ohNum % stride != 0 || owNum % stride != 0) continue;
+                    int py = ohNum / stride, px = owNum / stride;
+                    if (py >= oh || px >= ow) continue;
+                    yi = ((b * co + c) * oh + py) * ow + px;
+                    wi = (c * kernel + kh) * kernel + kw;
+                }
+                else
+                {
+                    int py = ih * stride - pad + kh, px = iw * stride - pad + kw;
+                    if (py < 0 || py >= oh || px < 0 || px >= ow) continue;
+                    yi = ((b * co + o) * oh + py) * ow + px;
+                    wi = ((c * co + o) * kernel + kh) * kernel + kw;
+                }
+                y[yi] += (double)x[xi] * wt[wi];
+                dx[xi] += (double)dy[yi] * wt[wi];
+                dw[wi] += (double)x[xi] * dy[yi];
+            }
+
+            var variants = depthwise
+                ? new[] { DeclaredConvVariant.DepthwiseForward, DeclaredConvVariant.DepthwiseBackwardData, DeclaredConvVariant.DepthwiseBackwardWeights }
+                : new[] { DeclaredConvVariant.TransposeForward, DeclaredConvVariant.TransposeBackwardData, DeclaredConvVariant.TransposeBackwardWeights };
+            foreach (var variant in variants)
+            {
+                bool forward = variant is DeclaredConvVariant.DepthwiseForward or DeclaredConvVariant.TransposeForward;
+                bool weights = variant is DeclaredConvVariant.DepthwiseBackwardWeights or DeclaredConvVariant.TransposeBackwardWeights;
+                double[] reference = forward ? y : weights ? dw : dx;
+                // The entry points' operand order: depthwise weight gradient (dOut, input), transposed (input, dOut).
+                float[] a = forward ? x : weights ? (depthwise ? dy : x) : dy;
+                float[] bOperand = forward || !weights ? wt : (depthwise ? x : dy);
+                using var ba = backend.AllocateBuffer(a);
+                using var bb = backend.AllocateBuffer(bOperand);
+                using var output = backend.AllocateBuffer(reference.Length);
+                var args = new CudaConvVariantArgs(variant, ba, bb, output, n, ci, h, w, co, oh, ow, kernel, kernel,
+                    stride, stride, pad, pad, outputPad, outputPad, 1);
+                void Incumbent()
+                {
+                    switch (variant)
+                    {
+                        case DeclaredConvVariant.DepthwiseForward:
+                            backend.DepthwiseConv2D(ba, bb, output, n, ci, h, w, oh, ow, kernel, kernel, stride, stride, pad, pad); break;
+                        case DeclaredConvVariant.DepthwiseBackwardData:
+                            backend.DepthwiseConv2DBackwardInput(ba, bb, output, n, ci, h, w, 1, oh, ow, kernel, kernel, stride, stride, pad, pad); break;
+                        case DeclaredConvVariant.DepthwiseBackwardWeights:
+                            backend.DepthwiseConv2DBackwardKernel(ba, bb, output, n, ci, h, w, 1, oh, ow, kernel, kernel, stride, stride, pad, pad); break;
+                        case DeclaredConvVariant.TransposeForward:
+                            backend.ConvTranspose2D(ba, bb, output, n, ci, h, w, co, oh, ow, kernel, kernel, stride, stride, pad, pad, outputPad, outputPad); break;
+                        case DeclaredConvVariant.TransposeBackwardData:
+                            backend.ConvTranspose2DBackwardInput(ba, bb, output, n, ci, h, w, co, oh, ow, kernel, kernel, stride, stride, pad, pad, outputPad, outputPad); break;
+                        default:
+                            backend.ConvTranspose2DBackwardKernel(ba, bb, output, n, ci, h, w, co, oh, ow, kernel, kernel, stride, stride, pad, pad, outputPad, outputPad); break;
+                    }
+                }
+                double incumbentUs, incumbentErr;
+                backend.DeclaredKernelsSwitch = false;
+                try
+                {
+                    Incumbent();
+                    backend.Synchronize();
+                    incumbentErr = MaxDev(backend.DownloadBuffer(output), reference);
+                    incumbentUs = Time(Incumbent, backend.Synchronize);
+                }
+                finally { backend.DeclaredKernelsSwitch = null; }
+
+                double scale = Math.Max(1.0, Max(Abs(reference)));
+                foreach (var schedule in CudaBackend.DeclaredConvVariantSchedules(variant))
+                {
+                    string name = (label + " " + variant).PadRight(48) + schedule.Suffix.PadRight(16);
+                    if (!backend.DeclaredConvVariantAdmits(variant, args.Shape(), schedule))
+                    {
+                        Console.WriteLine(name + "not admitted");
+                        continue;
+                    }
+                    if (!backend.TryDeclaredConvVariant(args, schedule))
+                    {
+                        Console.WriteLine(name + "declined");
+                        continue;
+                    }
+                    backend.Synchronize();
+                    double err = MaxDev(backend.DownloadBuffer(output), reference);
+                    double us = Time(() => backend.TryDeclaredConvVariant(args, schedule), backend.Synchronize);
+                    bool ok = err <= Math.Max(2 * incumbentErr, 1e-5 * scale);
+                    if (!ok) failures.Add(label + " " + variant + " " + schedule.Suffix + ": error " + E(err));
                     Console.WriteLine(name + E(err).PadLeft(10) + E(incumbentErr).PadLeft(14) +
                         us.ToString("F1", CultureInfo.InvariantCulture).PadLeft(10) +
                         incumbentUs.ToString("F1", CultureInfo.InvariantCulture).PadLeft(14) +

@@ -2582,7 +2582,24 @@ public sealed partial class PtxAffineEmitter
         L($"mul.wide.s32 {posBytes}, {position}, 4;");
         L($"add.u64 {posAddr}, {_basePointers![indexBinding.ParameterIndex]}, {posBytes};");
 
-        if (positionPredicate is null)
+        if (indirect.FloatIndices)
+        {
+            // A declared float index: loaded as f32 and truncated toward zero (cvt.rzi.s32.f32, what C's (int)
+            // compiles to: NaN to 0, saturating), so the value -- never the bit pattern -- is the index.
+            string asFloat = NextF();
+            if (positionPredicate is null)
+            {
+                L($"ld.global.nc.f32 {asFloat}, [{posAddr}];");
+                L($"cvt.rzi.s32.f32 {raw}, {asFloat};");
+            }
+            else
+            {
+                L($"mov.u32 {raw}, 0xFFFFFFFF;");
+                L($"@{positionPredicate} ld.global.nc.f32 {asFloat}, [{posAddr}];");
+                L($"@{positionPredicate} cvt.rzi.s32.f32 {raw}, {asFloat};");
+            }
+        }
+        else if (positionPredicate is null)
         {
             L($"ld.global.nc.u32 {raw}, [{posAddr}];");
         }

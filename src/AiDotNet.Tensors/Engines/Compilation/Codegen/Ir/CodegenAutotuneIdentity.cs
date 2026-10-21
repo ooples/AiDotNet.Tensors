@@ -448,6 +448,8 @@ public sealed record CodegenAutotuneIdentity(
                     .Append(indirect.IndexInput.ToString(CultureInfo.InvariantCulture)).Append(',')
                     .Append(indirect.Bound.ToString(CultureInfo.InvariantCulture)).Append(',')
                     .Append(indirect.OutOfRange).Append(',');
+                // Only when set, so every int32-indexed identity (and its persisted decision) is unchanged.
+                if (indirect.FloatIndices) text.Append("f32,");
                 AppendExpr(text, indirect.Position);
             }
             text.Append(';');

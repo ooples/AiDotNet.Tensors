@@ -99,37 +99,24 @@ internal readonly record struct DeclaredConvEquivalent(DeclaredConvPass Pass, in
 
 public sealed partial class CudaBackend
 {
-    // The variants' schedules: the dense passes' implicit-GEMM tiles, plus the affine emitter's own lowering (alone or
-    // split along the reduction) for depthwise, whose kh*kw-long reduction leaves no GEMM worth tiling.
-    private static readonly DeclaredConvSchedule[] s_depthwiseSchedules =
-    {
-        new(0, 0, 0), new(64, 64, 0),
-    };
+    // The variants' schedules: only those that were fastest for some measured shape (`--kernel-routes --family
+    // conv-variants`, GTX 1660 Ti), since every registered candidate costs online tuning time. Depthwise takes the
+    // affine emitter's own lowering -- its kh*kw-long reduction leaves no GEMM worth tiling (the implicit-GEMM tiles ran
+    // 0.07-0.26x of the hand-written kernels; the affine lowering 1.01-3.65x) -- split for the weight gradient's long
+    // reduction (8x144 at 56: 1818 against 2494 us unsplit). The transposed passes take the implicit-GEMM tiles alone:
+    // the parity split and the reduction splits never beat them (forward 6472 us at m128n64 against 8195 parity).
+    private static readonly DeclaredConvSchedule[] s_depthwiseSchedules = { new(0, 0, 0) };
 
-    private static readonly DeclaredConvSchedule[] s_depthwiseWeightSchedules =
-    {
-        new(0, 0, 0), new(0, 0, 4), new(0, 0, 16), new(64, 64, 4),
-    };
+    private static readonly DeclaredConvSchedule[] s_depthwiseWeightSchedules = { new(0, 0, 0), new(0, 0, 4) };
 
-    // A transposed weight gradient's reduction runs over the (small) transposed input's positions, which no split may
-    // divide: the unsplit tiles keep every shape lowerable, the dense weight gradient's splits serve the long ones.
-    private static readonly DeclaredConvSchedule[] s_transposeWeightSchedules = BuildTransposeWeightSchedules();
-
-    private static DeclaredConvSchedule[] BuildTransposeWeightSchedules()
-    {
-        var schedules = new List<DeclaredConvSchedule> { new(64, 64, 0), new(128, 64, 0) };
-        schedules.AddRange(s_declaredConvWeightSchedules);
-        return schedules.ToArray();
-    }
+    private static readonly DeclaredConvSchedule[] s_transposeSchedules = { new(64, 64, 0), new(128, 64, 0) };
 
     internal static IReadOnlyList<DeclaredConvSchedule> DeclaredConvVariantSchedules(DeclaredConvVariant variant) =>
         variant switch
         {
             DeclaredConvVariant.DepthwiseForward or DeclaredConvVariant.DepthwiseBackwardData => s_depthwiseSchedules,
             DeclaredConvVariant.DepthwiseBackwardWeights => s_depthwiseWeightSchedules,
-            DeclaredConvVariant.TransposeForward => s_declaredConvDataSchedules,
-            DeclaredConvVariant.TransposeBackwardData => s_declaredConvLargeOutputSchedules,
-            _ => s_transposeWeightSchedules,
+            _ => s_transposeSchedules,
         };
 
     private static string VariantName(DeclaredConvVariant variant) => variant switch

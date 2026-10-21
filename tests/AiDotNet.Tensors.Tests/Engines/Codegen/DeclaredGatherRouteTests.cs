@@ -84,6 +84,145 @@ public class DeclaredGatherRouteTests
     }
 
     /// <summary>
+    /// IndexSelect through the declared gather: every row equals the source row the index names -- bit for bit what the
+    /// hand-written kernel copies (declared route off) -- and an out-of-range index yields zeros. Below the size where
+    /// the declared call pays, the hand-written kernel still serves it.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(4, 300, 512, 32, true)]
+    [InlineData(1, 50, 4096, 8, true)]
+    [InlineData(2, 10, 6, 5, false)]
+    public void TheDeclaredIndexSelectCopiesTheIndexedRows(int outer, int sourceAxis, int indexAxis, int inner,
+        bool declared)
+    {
+        using var backend = OpenBackendOrSkip();
+        int[] indices = Ids(indexAxis, sourceAxis);
+        // Below the declared size the hand-written kernel serves the call, and it reads outside the source for an
+        // out-of-range index: only in-range indices have a defined result there.
+        if (!declared)
+            for (int j = 0; j < indices.Length; j++) indices[j] = ((indices[j] % sourceAxis) + sourceAxis) % sourceAxis;
+        float[] source = Fill(outer * sourceAxis * inner, 3);
+        using var bindices = backend.AllocateIntBuffer(indices);
+        using var bsource = backend.AllocateBuffer(source);
+        using var bout = backend.AllocateBuffer(Fill(outer * indexAxis * inner, 4));
+        long before = backend.DeclaredProgramLaunches;
+        backend.IndexSelect(bsource, bindices, bout, outer, sourceAxis, indexAxis, inner);
+        backend.Synchronize();
+        Assert.Equal(before + (declared ? 1 : 0), backend.DeclaredProgramLaunches);
+        float[] got = backend.DownloadBuffer(bout);
+
+        // The hand-written kernel on the in-range indices (it reads outside the source for the others).
+        var inRange = (int[])indices.Clone();
+        for (int j = 0; j < inRange.Length; j++) if (inRange[j] < 0 || inRange[j] >= sourceAxis) inRange[j] = 0;
+        using var bInRange = backend.AllocateIntBuffer(inRange);
+        using var bHand = backend.AllocateBuffer(outer * indexAxis * inner);
+        backend.DeclaredKernelsSwitch = false;
+        try
+        {
+            backend.IndexSelect(bsource, bInRange, bHand, outer, sourceAxis, indexAxis, inner);
+            backend.Synchronize();
+        }
+        finally { backend.DeclaredKernelsSwitch = null; }
+        float[] hand = backend.DownloadBuffer(bHand);
+
+        for (int o = 0; o < outer; o++)
+            for (int j = 0; j < indexAxis; j++)
+            {
+                bool valid = indices[j] >= 0 && indices[j] < sourceAxis;
+                for (int i = 0; i < inner; i++)
+                {
+                    int at = (o * indexAxis + j) * inner + i;
+                    float expected = valid ? source[(o * sourceAxis + indices[j]) * inner + i] : 0f;
+                    Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(expected) ==
+                        TestHelpers.MathCompat.SingleToInt32Bits(got[at]), $"[{o},{j},{i}]: {expected} vs {got[at]}");
+                    if (valid)
+                        Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(hand[at]) ==
+                            TestHelpers.MathCompat.SingleToInt32Bits(got[at]), $"hand-written [{o},{j},{i}]: {hand[at]} vs {got[at]}");
+                }
+            }
+    }
+
+    /// <summary>
+    /// TakeAlongDim through the declared gather, whose float indices are converted as the hand-written kernel's
+    /// <c>(int)</c>: bit-identical to that kernel for every index -- fractional (truncated toward zero, so -0.5 is 0),
+    /// negative, past the axis, and NaN (0) -- and to a reference written out here.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(8, 64, 64, 50, true)]
+    [InlineData(2, 3000, 4, 700, true)]
+    [InlineData(3, 4, 5, 6, false)]
+    public void TheDeclaredTakeAlongDimMatchesTheHandWrittenKernel(int outer, int axisOut, int inner, int axisIn,
+        bool declared)
+    {
+        using var backend = OpenBackendOrSkip();
+        int count = outer * axisOut * inner;
+        var indices = new float[count];
+        for (int i = 0; i < count; i++) indices[i] = (float)((i * 2654435761L) % (axisIn + 4) - 2) + (i % 3) * 0.5f;
+        indices[0] = float.NaN;
+        indices[1] = -0.5f;
+        indices[2] = axisIn - 0.25f;
+        float[] input = Fill(outer * axisIn * inner, 5);
+        using var bindices = backend.AllocateBuffer(indices);
+        using var binput = backend.AllocateBuffer(input);
+        using var bout = backend.AllocateBuffer(Fill(count, 6));
+        using var bhand = backend.AllocateBuffer(count);
+        long before = backend.DeclaredProgramLaunches;
+        backend.TakeAlongDim(binput, bindices, bout, outer, axisOut, inner, axisIn);
+        backend.Synchronize();
+        Assert.Equal(before + (declared ? 1 : 0), backend.DeclaredProgramLaunches);
+        backend.DeclaredKernelsSwitch = false;
+        try
+        {
+            backend.TakeAlongDim(binput, bindices, bhand, outer, axisOut, inner, axisIn);
+            backend.Synchronize();
+        }
+        finally { backend.DeclaredKernelsSwitch = null; }
+        float[] got = backend.DownloadBuffer(bout), hand = backend.DownloadBuffer(bhand);
+        AssertBitIdentical(hand, got, "take_along_dim vs the hand-written kernel");
+        for (int at = 0; at < count; at++)
+        {
+            int o = at / (axisOut * inner), i = at % inner;
+            int j = float.IsNaN(indices[at]) ? 0 : (int)indices[at];
+            float expected = j >= 0 && j < axisIn ? input[(o * axisIn + j) * inner + i] : 0f;
+            Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(expected) == TestHelpers.MathCompat.SingleToInt32Bits(got[at]),
+                $"[{at}] index {indices[at]}: {expected} vs {got[at]}");
+        }
+    }
+
+    /// <summary>
+    /// The float-index rule in the IR itself (no GPU): the spec interprets as the device converts, and an index tensor
+    /// whose element type contradicts the declaration is refused rather than read as a reinterpreted bit pattern.
+    /// </summary>
+    [Fact]
+    public void FloatIndicesAreDeclaredAndConvertedAsTheDeviceDoes()
+    {
+        var spec = AiDotNet.Tensors.Engines.Compilation.Codegen.Ir.CodegenBackendPrograms.TakeAlongDim(1, 5, 1, 4).Passes[0];
+        var result = spec.Interpret(new[]
+        {
+            new[] { double.NaN, -0.5, 3.75, 4.0, -1.0 },
+            new[] { 10.0, 20.0, 30.0, 40.0 },
+        });
+        Assert.Equal(new[] { 10.0, 10.0, 40.0, 0.0, 0.0 }, result);
+
+        var position = AiDotNet.Tensors.Engines.Compilation.Codegen.Ir.CodegenAffineExpr.Axis(0);
+        var intIndices = new AiDotNet.Tensors.Engines.Compilation.Codegen.Ir.CodegenTensorBinding(0, "indices", new[] { 3 },
+            new[] { position }, elementType: AiDotNet.Tensors.Engines.Compilation.Codegen.Ir.CodegenElementType.Int32);
+        var table = new AiDotNet.Tensors.Engines.Compilation.Codegen.Ir.CodegenTensorBinding(1, "table", new[] { 4 },
+            new[] { AiDotNet.Tensors.Engines.Compilation.Codegen.Ir.CodegenAffineExpr.Const(0) },
+            indirect: new AiDotNet.Tensors.Engines.Compilation.Codegen.Ir.CodegenIndirectIndex?[]
+            {
+                new AiDotNet.Tensors.Engines.Compilation.Codegen.Ir.CodegenIndirectIndex(0, position, 4, floatIndices: true),
+            });
+        var output = new AiDotNet.Tensors.Engines.Compilation.Codegen.Ir.CodegenTensorBinding(2, "out", new[] { 3 },
+            new[] { position }, isOutput: true);
+        Assert.Throws<ArgumentException>(() => new AiDotNet.Tensors.Engines.Compilation.Codegen.Ir.CodegenKernelSpec("bad",
+            new AiDotNet.Tensors.Engines.Compilation.Codegen.Ir.CodegenIterationSpace(
+                AiDotNet.Tensors.Engines.Compilation.Codegen.Ir.CodegenAxis.Parallel("t", 3)),
+            new[] { intIndices, table }, output, new[] { 1 },
+            AiDotNet.Tensors.Engines.Compilation.Codegen.Ir.CodegenReduceKind.None));
+    }
+
+    /// <summary>
     /// The deterministic EmbeddingBackward (overwrite) and ScatterAdd (accumulate onto a seed) through the sorted
     /// kernels are bit-identical to the scanning kernels and to a reference summing in increasing token order -- with
     /// repeated and out-of-range ids, and vocabularies needing 1 to 4 radix passes.
@@ -304,7 +443,7 @@ public class DeclaredGatherRouteTests
         }
     }
 
-    /// <summary>An embedding lookup then a second lookup of its rows, as one resident launch, bit-identical.</summary>
+    /// <summary>An embedding lookup, a second lookup of its rows, then an IndexSelect of those, as one resident launch, bit-identical.</summary>
     [SkippableFact]
     public void EmbeddingStagesRunAsOneResidentLaunchBitIdenticalToSeparateLaunches()
     {
@@ -319,20 +458,24 @@ public class DeclaredGatherRouteTests
             using var table = backend.AllocateBuffer(Fill(vocabulary * width, 1));
             using var first = backend.AllocateBuffer(tokens * width);
             using var second = backend.AllocateBuffer(tokens * width);
+            using var third = backend.AllocateBuffer(64 * width);
             var stages = new[]
             {
                 backend.EmbeddingStage(bids, table, first, tokens, width),
                 // The first lookup's output as a table of `tokens` rows, read by the same ids (those past it give zero rows).
                 backend.EmbeddingStage(bids, first, second, tokens, width),
+                // IndexSelect of the rows the first 64 ids name, reading the second lookup's output as [1, tokens, width].
+                backend.IndexSelectStage(second, bids, third, 1, tokens, 64, width),
             };
             long before = backend.DeclaredProgramLaunches;
             if (mode == 0) backend.RunDeclaredStagesSeparately(stages);
             else Assert.True(backend.RunDeclaredResidentProgram(stages, barrier) >= 1);
             backend.Synchronize();
-            Assert.Equal(mode == 0 ? 2 : 1, backend.DeclaredProgramLaunches - before);
-            results[mode] = new[] { backend.DownloadBuffer(first), backend.DownloadBuffer(second) };
+            Assert.Equal(mode == 0 ? 3 : 1, backend.DeclaredProgramLaunches - before);
+            results[mode] = new[] { backend.DownloadBuffer(first), backend.DownloadBuffer(second), backend.DownloadBuffer(third) };
         }
         AssertBitIdentical(results[0][0], results[1][0], "first");
         AssertBitIdentical(results[0][1], results[1][1], "second");
+        AssertBitIdentical(results[0][2], results[1][2], "index-selected");
     }
 }

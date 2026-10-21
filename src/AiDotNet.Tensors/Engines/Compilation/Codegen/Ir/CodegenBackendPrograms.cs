@@ -199,6 +199,59 @@ public static class CodegenBackendPrograms
         return new CodegenProgram(new[] { pass }, Array.Empty<long>(), "embedding (backend contract)");
     }
 
+    /// <summary>
+    /// <c>out[o, j, i] = source[o, indices[j], i]</c>: indices int32 [indexAxis], source [outer, sourceAxis, inner],
+    /// out [outer, indexAxis, inner] -- CudaBackend.IndexSelect's contract. An index outside [0, sourceAxis) yields
+    /// zeros (the hand-written kernel read outside the source).
+    /// </summary>
+    public static CodegenProgram IndexSelect(int outer, int sourceAxis, int indexAxis, int inner)
+    {
+        if (outer <= 0 || sourceAxis <= 0 || indexAxis <= 0 || inner <= 0)
+            throw new ArgumentOutOfRangeException(nameof(outer), "IndexSelect extents must be positive.");
+        var space = new CodegenIterationSpace(CodegenAxis.Parallel("o", outer), CodegenAxis.Parallel("j", indexAxis),
+            CodegenAxis.Parallel("i", inner));
+        var indices = new CodegenTensorBinding(0, "indices", new[] { indexAxis }, new[] { A(1) },
+            elementType: CodegenElementType.Int32);
+        var source = new CodegenTensorBinding(1, "source", new[] { outer, sourceAxis, inner },
+            new[] { A(0), CodegenAffineExpr.Const(0), A(2) },
+            indirect: new CodegenIndirectIndex?[] { null, new CodegenIndirectIndex(0, A(1), sourceAxis), null });
+        var output = new CodegenTensorBinding(2, "out", new[] { outer, indexAxis, inner }, new[] { A(0), A(1), A(2) },
+            isOutput: true);
+        var pass = new CodegenKernelSpec("index_select", space, new[] { indices, source }, output, new[] { 1 },
+            CodegenReduceKind.None);
+        return new CodegenProgram(new[] { pass }, Array.Empty<long>(), "index_select (backend contract)");
+    }
+
+    /// <summary>
+    /// <c>out[o, j, i] = input[o, (int)indices[o, j, i], i]</c>: indices float32 [outer, axisOut, inner] (truncated
+    /// toward zero, as the hand-written kernel's <c>(int)</c>), input [outer, axisIn, inner], out [outer, axisOut,
+    /// inner] -- CudaBackend.TakeAlongDim's contract. An index outside [0, axisIn) yields 0, as there.
+    /// </summary>
+    public static CodegenProgram TakeAlongDim(int outer, int axisOut, int inner, int axisIn)
+    {
+        if (outer <= 0 || axisOut <= 0 || inner <= 0 || axisIn <= 0)
+            throw new ArgumentOutOfRangeException(nameof(outer), "TakeAlongDim extents must be positive.");
+        var space = new CodegenIterationSpace(CodegenAxis.Parallel("o", outer), CodegenAxis.Parallel("j", axisOut),
+            CodegenAxis.Parallel("i", inner));
+        var indices = new CodegenTensorBinding(0, "indices", new[] { outer, axisOut, inner }, new[] { A(0), A(1), A(2) });
+        // The position of an index within the flat indices tensor: (o * axisOut + j) * inner + i.
+        var position = new CodegenAffineExpr(new[]
+        {
+            new CodegenAffineTerm(0, axisOut * inner), new CodegenAffineTerm(1, inner), new CodegenAffineTerm(2, 1),
+        }, 0);
+        var input = new CodegenTensorBinding(1, "input", new[] { outer, axisIn, inner },
+            new[] { A(0), CodegenAffineExpr.Const(0), A(2) },
+            indirect: new CodegenIndirectIndex?[]
+            {
+                null, new CodegenIndirectIndex(0, position, axisIn, floatIndices: true), null,
+            });
+        var output = new CodegenTensorBinding(2, "out", new[] { outer, axisOut, inner }, new[] { A(0), A(1), A(2) },
+            isOutput: true);
+        var pass = new CodegenKernelSpec("take_along_dim", space, new[] { indices, input }, output, new[] { 1 },
+            CodegenReduceKind.None);
+        return new CodegenProgram(new[] { pass }, Array.Empty<long>(), "take_along_dim (backend contract)");
+    }
+
     // ---- attention (#890 phase 4d), in CudaBackend.ScaledDotProductAttention's contract ----------------------------
 
     /// <summary>The logit a masked key gets: its exponential underflows to exactly 0 against any unmasked logit.</summary>
