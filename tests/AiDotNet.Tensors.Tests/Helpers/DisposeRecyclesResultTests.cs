@@ -30,6 +30,24 @@ public sealed class DisposeRecyclesResultTests
 
     private static float[] ArrayOf(Tensor<float> t) => t.GetDataArrayUnmarked();
 
+    /// <summary>
+    /// Every test here reasons about one array reaching the next result, which needs that result to come from the thread
+    /// cache. Four pieces of process or thread state ahead of it can place the array somewhere else instead - a disabled
+    /// pool, ForceFreshAllocations (#318), an active arena (allocation tier 0), and the cache's own limits of four
+    /// buffers per size and 64 MB per thread. All four outlive the test that set them, which is why
+    /// <see cref="DisposedResult_ArrayGoesToTheNextResult_WithoutACollection"/> passed alone and failed 15 minutes into
+    /// the suite (#1477) on nothing but array identity, naming no cause. The cache is this class's to reset - it is per
+    /// thread and per element type, and xUnit builds the class on the thread that runs the test - and the other three
+    /// are asserted so a recurrence says which one took the allocation.
+    /// </summary>
+    public DisposeRecyclesResultTests()
+    {
+        Assert.True(TensorPool.Enabled, "the tensor pool is disabled, so no result is pooled");
+        Assert.False(TensorPool.ForceFreshAllocations, "ForceFreshAllocations is set, so every result is a fresh array");
+        Assert.Null(TensorArena.Current);
+        ThreadLocalTensorCache<float>.Clear();
+    }
+
     [Fact]
     public void DisposedResult_ArrayGoesToTheNextResult_WithoutACollection()
     {
@@ -40,6 +58,10 @@ public sealed class DisposeRecyclesResultTests
         int gen0 = GC.CollectionCount(0);
 
         first.Dispose();
+        // Which half failed, if this ever fails again: the cache takes the disposed array, or the reuse below cannot
+        // happen at all. Asserting it here separates "the cache declined" from "the array was not handed on".
+        Assert.True(ThreadLocalTensorCache<float>.RetainedBytes >= (long)firstArray.Length * sizeof(float),
+            $"the thread cache did not take the disposed result (retains {ThreadLocalTensorCache<float>.RetainedBytes} bytes)");
         var second = Engine.TensorAdd(b, b);
 
         Assert.Equal(gen0, GC.CollectionCount(0));
