@@ -874,6 +874,11 @@ internal sealed class DirectPtxModule : IDisposable
                 (IntPtr)arguments,
                 IntPtr.Zero),
             "cuLaunchKernel(PTX)");
+        // GPU-DISPATCH INSTRUMENTATION (see GpuLaunchProbe): this is the choke point of every direct-PTX kernel and
+        // every declared program. Uncounted, an op served by one looked like a CPU fallback to the residency probe:
+        // once #890's declared programs took over the norms and elementwise ops, eight tape-residency tests reported
+        // "launched no GPU kernel" for work that ran on the device.
+        GpuLaunchProbe.OnLaunch();
     }
 
     internal void SetMaxDynamicSharedMemory(IntPtr function, int bytes)

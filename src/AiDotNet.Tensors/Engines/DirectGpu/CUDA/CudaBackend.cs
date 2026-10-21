@@ -7455,7 +7455,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         LaunchKernel2D(cudaKernel, gridX, gridY, gridZ, (uint)blockSize, (uint)blockSize, args);
     }
 
-    public unsafe void DepthwiseConv2D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
+    private unsafe void DepthwiseConv2DIncumbent(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
         int batch, int channels, int inHeight, int inWidth,
         int outHeight, int outWidth,
         int kernelH, int kernelW,
@@ -7500,7 +7500,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         LaunchKernel3D(cudaKernel, gx, gy, gz, blockDimXY, blockDimXY, 1, args);
     }
 
-    public unsafe void ConvTranspose2D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
+    private unsafe void ConvTranspose2DIncumbent(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
         int batch, int inChannels, int inHeight, int inWidth,
         int outChannels, int outHeight, int outWidth,
         int kernelH, int kernelW,
@@ -7541,7 +7541,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         LaunchKernel3D(cudaKernel, gx, gy, gz, blockDimXY, blockDimXY, 1, args);
     }
 
-    public unsafe void ConvTranspose2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
+    private unsafe void ConvTranspose2DBackwardInputIncumbent(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
         int batch, int inChannels, int inHeight, int inWidth,
         int outChannels, int outHeight, int outWidth,
         int kernelH, int kernelW,
@@ -7592,7 +7592,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         LaunchKernel(cudaKernel, gridX, DefaultBlockSize, args);
     }
 
-    public unsafe void ConvTranspose2DBackwardKernel(IGpuBuffer input, IGpuBuffer gradOutput, IGpuBuffer gradKernel,
+    private unsafe void ConvTranspose2DBackwardKernelIncumbent(IGpuBuffer input, IGpuBuffer gradOutput, IGpuBuffer gradKernel,
         int batch, int inChannels, int inHeight, int inWidth,
         int outChannels, int outHeight, int outWidth,
         int kernelH, int kernelW,

@@ -25,7 +25,9 @@ internal enum DeclaredConvPass : byte
 }
 
 /// <summary>
-/// An implicit-GEMM schedule: the output tile (M rows -- what only the first operand reads -- by N columns); above 1,
+/// A convolution schedule: the implicit GEMM's output tile (M rows -- what only the first operand reads -- by N
+/// columns), or tile 0 for the affine emitter's own lowering (a depthwise convolution's kh*kw-long reduction has no
+/// GEMM worth tiling); above 1,
 /// the factor a reduction axis is split by into a partial pass and a combine; and whether a strided data gradient is
 /// split by output parity first (CodegenParitySplit), so no pass visits a tap its exact-division window lacks.
 /// </summary>
@@ -33,13 +35,16 @@ internal readonly record struct DeclaredConvSchedule(int TileM, int TileN, int S
 {
     /// <summary>The candidate-name suffix: "m128n64", "split4.m128n64" or "parity.m64n64".</summary>
     internal string Suffix => (Parity ? "parity." : "") + (SplitFactor > 1 ? "split" + SplitFactor + "." : "") +
-        "m" + TileM + "n" + TileN;
+        (TileM == 0 ? "affine" : "m" + TileM + "n" + TileN);
 }
 
-/// <summary>A declared convolution program: one square-window geometry, the fused bias + ReLU or not, a schedule.</summary>
+/// <summary>
+/// A declared convolution program: one square-window geometry and channel grouping (Groups = InChannels is a depthwise
+/// convolution), the fused bias + ReLU or not, a schedule.
+/// </summary>
 internal readonly record struct DeclaredConvKey(
     DeclaredConvPass Pass, int Batch, int InChannels, int OutChannels, int Height, int Width,
-    int Kernel, int Stride, int Pad, int Dilation, bool BiasRelu, DeclaredConvSchedule Schedule);
+    int Kernel, int Stride, int Pad, int Dilation, bool BiasRelu, DeclaredConvSchedule Schedule, int Groups = 1);
 
 public sealed partial class CudaBackend
 {
@@ -88,13 +93,14 @@ public sealed partial class CudaBackend
     /// </summary>
     internal static CodegenKernelSpec? DeclaredConvSpec(DeclaredConvPass pass, int batch, int inChannels,
         int outChannels, int height, int width, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW,
-        int dilationH, int dilationW, int outHeight, int outWidth, bool biasRelu)
+        int dilationH, int dilationW, int outHeight, int outWidth, bool biasRelu, int groups = 1)
     {
+        if (groups < 1 || inChannels % groups != 0 || outChannels % groups != 0) return null;
         if (!DeclaredConvGeometryFits(batch, inChannels, outChannels, height, width, kernelH, kernelW, strideH, strideW,
                 padH, padW, dilationH, dilationW, outHeight, outWidth))
             return null;
         var forward = CodegenKernelCatalog.Conv2D(batch, inChannels, outChannels, height, width, kernelH, strideH, padH,
-            dilationH, groups: 1, epilogue: pass == DeclaredConvPass.Forward && biasRelu);
+            dilationH, groups, epilogue: pass == DeclaredConvPass.Forward && biasRelu);
         return pass switch
         {
             DeclaredConvPass.Forward => forward,
@@ -127,16 +133,7 @@ public sealed partial class CudaBackend
         if (!DeclaredKernelsEnabled) return false;
         var spec = DeclaredConvSpec(pass, s[0], s[1], s[4], s[2], s[3], s[5], s[6], s[7], s[8], s[9], s[10], s[11],
             s[12], s[13], s[14], biasRelu: false);
-        if (spec is null || PtxAffineEmitter.PlanImplicitGemm(spec, out _) is null) return false;
-        if (schedule.Parity)
-        {
-            if (CodegenParitySplit.TrySplit(spec, out _) is not { } parity) return false;
-            foreach (var parityPass in parity.Passes)
-                if (PtxAffineEmitter.PlanImplicitGemm(parityPass, out _) is null) return false;
-        }
-        if (schedule.SplitFactor <= 1) return true;
-        return CodegenSplitReduction.TryPlanChunkedForTiles(spec, schedule.SplitFactor) is { } split &&
-            PtxAffineEmitter.PlanImplicitGemm(split.Partial, out _) is not null;
+        return spec is not null && DeclaredConvSpecAdmits(spec, schedule);
     }
 
     /// <summary>Runs a forward convolution as a declared program; false when the shape declines.</summary>
@@ -189,27 +186,34 @@ public sealed partial class CudaBackend
         return true;
     }
 
-    private DeclaredProgram? BuildDeclaredConv(DeclaredConvKey key, string[] names)
+    // The program a key lowers: the pass's spec, or its parity split; null with the reason when there is none.
+    private static CodegenProgram? DeclaredConvSource(in DeclaredConvKey key, out string? reason)
     {
         int outH = (key.Height + 2 * key.Pad - key.Dilation * (key.Kernel - 1) - 1) / key.Stride + 1;
         int outW = (key.Width + 2 * key.Pad - key.Dilation * (key.Kernel - 1) - 1) / key.Stride + 1;
         var spec = DeclaredConvSpec(key.Pass, key.Batch, key.InChannels, key.OutChannels, key.Height, key.Width,
             key.Kernel, key.Kernel, key.Stride, key.Stride, key.Pad, key.Pad, key.Dilation, key.Dilation, outH, outW,
-            key.BiasRelu);
+            key.BiasRelu, key.Groups);
+        reason = null;
         if (spec is null)
         {
-            _declaredConvDeclines[key] = "the geometry is outside the declared convolution builder";
+            reason = "the geometry is outside the declared convolution builder";
+            return null;
+        }
+        if (!key.Schedule.Parity) return new CodegenProgram(new[] { spec }, Array.Empty<long>(), spec.Name);
+        var parity = CodegenParitySplit.TrySplit(spec, out string splitReason);
+        if (parity is null) reason = splitReason;
+        return parity;
+    }
+
+    private DeclaredProgram? BuildDeclaredConv(DeclaredConvKey key, string[] names)
+    {
+        if (DeclaredConvSource(key, out string? reason) is not { } source)
+        {
+            _declaredConvDeclines[key] = reason ?? "no program";
             return null;
         }
         var schedule = key.Schedule;
-        CodegenProgram source;
-        if (!schedule.Parity) source = new CodegenProgram(new[] { spec }, Array.Empty<long>(), spec.Name);
-        else if (CodegenParitySplit.TrySplit(spec, out string reason) is { } parity) source = parity;
-        else
-        {
-            _declaredConvDeclines[key] = reason;
-            return null;
-        }
         var program = BuildDeclaredProgram(source, key.ToString(), names,
             pass => LowerDeclaredConv(pass, schedule, minBlocks: 2), out string? decline);
         // The two-blocks-a-SM bound caps registers at 128; a ragged shape's guards can need more, and the JIT then
@@ -225,19 +229,44 @@ public sealed partial class CudaBackend
     private PtxPassLowering LowerDeclaredConv(CodegenKernelSpec pass, DeclaredConvSchedule schedule, int minBlocks,
         bool vectorCombine = false)
     {
-        string label = "implicit-gemm " + schedule.Suffix;
+        string label = (schedule.TileM == 0 ? "affine " : "implicit-gemm ") + schedule.Suffix;
         if (schedule.SplitFactor <= 1)
-            return new PtxPassLowering(new[] { EmitImplicitGemmKernel(pass, schedule, minBlocks) }, null, label);
+            return new PtxPassLowering(new[] { EmitConvKernel(pass, schedule, minBlocks) }, null, label);
         var split = CodegenSplitReduction.TryPlanChunkedForTiles(pass, schedule.SplitFactor)
             ?? throw new NotSupportedException(pass.Name + " has no reduction axis " + schedule.SplitFactor + " divides.");
         var combine = new PtxAffineEmitter { VectorTileReductions = vectorCombine };
         string combinePtx = combine.Emit(split.Combine, _ccMajor, _ccMinor);
         return new PtxPassLowering(new[]
         {
-            EmitImplicitGemmKernel(split.Partial, schedule, minBlocks),
+            EmitConvKernel(split.Partial, schedule, minBlocks),
             new PtxPassKernel(combinePtx, split.Combine.Name, combine.LaunchBlocks, (uint)combine.LaunchBlockX,
                 (uint)combine.LaunchBlockY),
         }, split, label);
+    }
+
+    // The schedule's kernel for one pass: the affine emitter's own lowering at tile 0, else the implicit GEMM.
+    private PtxPassKernel EmitConvKernel(CodegenKernelSpec spec, DeclaredConvSchedule schedule, int minBlocks)
+    {
+        if (schedule.TileM != 0) return EmitImplicitGemmKernel(spec, schedule, minBlocks);
+        var emitter = new PtxAffineEmitter();
+        string ptx = emitter.Emit(spec, _ccMajor, _ccMinor);
+        return new PtxPassKernel(ptx, spec.Name, emitter.LaunchBlocks, (uint)emitter.LaunchBlockX,
+            (uint)emitter.LaunchBlockY);
+    }
+
+    // Whether a schedule can lower a convolution pass's spec (decided without compiling anything).
+    private static bool DeclaredConvSpecAdmits(CodegenKernelSpec spec, DeclaredConvSchedule schedule)
+    {
+        bool Plans(CodegenKernelSpec s) => schedule.TileM == 0 || PtxAffineEmitter.PlanImplicitGemm(s, out _) is not null;
+        if (!Plans(spec)) return false;
+        if (schedule.Parity)
+        {
+            if (CodegenParitySplit.TrySplit(spec, out _) is not { } parity) return false;
+            foreach (var parityPass in parity.Passes)
+                if (!Plans(parityPass)) return false;
+        }
+        if (schedule.SplitFactor <= 1) return true;
+        return CodegenSplitReduction.TryPlanChunkedForTiles(spec, schedule.SplitFactor) is { } split && Plans(split.Partial);
     }
 
     private PtxPassKernel EmitImplicitGemmKernel(CodegenKernelSpec spec, DeclaredConvSchedule schedule, int minBlocks)
@@ -254,6 +283,41 @@ public sealed partial class CudaBackend
             throw new NotSupportedException(spec.Name + " has no implicit-GEMM lowering.");
         return new PtxPassKernel(ptx, spec.Name, emitter.LaunchBlocks, (uint)emitter.LaunchBlockX,
             (uint)emitter.LaunchBlockY);
+    }
+
+    /// <summary>
+    /// A convolution pass as a resident-program stage: the program and kernels the routed call runs for
+    /// <paramref name="key"/>, bound to <paramref name="first"/>, <paramref name="second"/> and
+    /// <paramref name="output"/> in the pass's roles (forward: input, weights, output; data gradient: dOut, weights,
+    /// dInput; weight gradient: dOut, input, dWeights).
+    /// </summary>
+    internal DeclaredResidentStage ConvStage(DeclaredConvKey key, IGpuBuffer first, IGpuBuffer second, IGpuBuffer output)
+    {
+        if (key.BiasRelu) throw new ArgumentException("A bias + ReLU stage takes four buffers.", nameof(key));
+        var source = DeclaredConvSource(key, out string? reason)
+            ?? throw new NotSupportedException("Convolution " + key + " has no declared program: " + reason);
+        string[] names = key.Pass switch
+        {
+            DeclaredConvPass.Forward => s_convForwardNames,
+            DeclaredConvPass.BackwardData => s_convBackwardDataNames,
+            _ => s_convBackwardWeightNames,
+        };
+        var schedule = key.Schedule;
+        // The dimensions are for diagnostics; the Name (the whole convolution key) is what makes it unique.
+        var declaredKey = new DeclaredKey(DeclaredFamily.Convolution, key.Batch, key.InChannels, key.OutChannels,
+            key.Height, 0, 0, key.ToString(), key.Width, key.Kernel);
+        return new DeclaredResidentStage(declaredKey, _ => source, names, new DeclaredBindings(first, second, output),
+            pass => LowerDeclaredConv(pass, schedule, minBlocks: 2));
+    }
+
+    /// <summary>A depthwise or transposed convolution as a resident stage, in its entry point's buffer order.</summary>
+    internal DeclaredResidentStage ConvVariantStage(in CudaConvVariantArgs a, DeclaredConvSchedule schedule)
+    {
+        var e = ConvVariantEquivalent(a.Variant, a.Shape())
+            ?? throw new NotSupportedException(a.Variant + " needs a square window, stride and padding.");
+        var key = new DeclaredConvKey(e.Pass, e.Batch, e.InChannels, e.OutChannels, e.Height, e.Width, e.Kernel,
+            e.Stride, e.Pad, 1, BiasRelu: false, schedule, e.Groups);
+        return ConvStage(key, a.A, a.B, a.Output);
     }
 
     /// <summary>Why a declared convolution key declined, or null when it lowered (or was never asked for).</summary>

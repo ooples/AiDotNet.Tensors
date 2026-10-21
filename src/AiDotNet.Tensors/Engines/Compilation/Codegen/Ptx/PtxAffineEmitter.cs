@@ -1793,7 +1793,13 @@ public sealed partial class PtxAffineEmitter
                         // lane-unaware: weights[k, c] is unit-stride in c, so it took
                         // this path, and once k was also tiled every lane received lane
                         // zero's k. Keying it like every other load fixes that.
-                        int group = reductionValues[innermost] / vectorGroup;
+                        // The group is numbered by TRIP, not by the innermost axis alone: the
+                        // cache outlives a trip, and with further unrolled reduction axes the
+                        // innermost axis restarts at 0 for each of their values. Keyed by its
+                        // own value, every (n, oh) of a depthwise weight gradient reused the
+                        // first one's dOut vector. The innermost axis varies fastest and its
+                        // extent is a multiple of the width, so trip / width names one group.
+                        long group = t / vectorGroup;
                         string key = LoadKey(inputIdx, binding, tileAxes, laneOffsets[l], -1) +
                                      "#g" + group.ToString(CultureInfo.InvariantCulture);
                         if (!reductionVectorCache.TryGetValue(key, out string[]? rvec))
