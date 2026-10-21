@@ -64,6 +64,6 @@ public sealed partial class WebGpuBackend : IBatchNormVarianceBackend
         IGpuBuffer? gradResidual, IGpuBuffer? beta, IGpuBuffer? gradOutput2)
         => BatchNormRegisterReady && PortableBatchNorm.TryBackward(this, LaunchBatchNormRegister, gradOutput, input, gamma,
             saveMean, saveVariance, gradInput, gradGamma, gradBeta, batch, channels, spatial, epsilon, reluOutput,
-            gradResidual, beta, gradOutput2);
+            gradResidual, beta, gradOutput2, canRebuildMask: false);   // WGSL's fma need not round once: read the mask
 }
 #endif

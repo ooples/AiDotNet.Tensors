@@ -52,7 +52,7 @@ internal static class PortableBatchNorm
     internal static bool TryBackward(IDirectGpuBackend backend, Launcher launch, IGpuBuffer gradOutput, IGpuBuffer input,
         IGpuBuffer gamma, IGpuBuffer saveMean, IGpuBuffer saveVariance, IGpuBuffer gradInput, IGpuBuffer gradGamma,
         IGpuBuffer gradBeta, int batch, int channels, int spatial, float epsilon, IGpuBuffer? reluOutput,
-        IGpuBuffer? gradResidual, IGpuBuffer? beta, IGpuBuffer? gradOutput2)
+        IGpuBuffer? gradResidual, IGpuBuffer? beta, IGpuBuffer? gradOutput2, bool canRebuildMask = true)
     {
         long count = (long)batch * spatial, n = count * channels;
         int k = BatchNormRegisterKernelTemplate.VariantFor(count);
@@ -63,8 +63,9 @@ internal static class PortableBatchNorm
             || (gradResidual is not null && (reluOutput is null || gradResidual.Size < n))
             || (gradOutput2 is not null && gradOutput2.Size < n) || (beta is not null && beta.Size < channels))
             return false;
-        // The mask is rebuilt from x (one activation read fewer) when beta is supplied for a ReLU without a residual.
-        bool rebuildMask = beta is not null && reluOutput is not null && gradResidual is null;
+        // The mask is rebuilt from x (one activation read fewer) when beta is supplied for a ReLU without a residual, on a
+        // backend whose fma rounds once (canRebuildMask; see BatchNormRegisterKernelTemplate), else the ReLU output is read.
+        bool rebuildMask = canRebuildMask && beta is not null && reluOutput is not null && gradResidual is null;
         using var prm = backend.AllocateBuffer(4 * channels);
         using var dprm = backend.AllocateBuffer(2 * channels);
         using var noResidual = gradResidual is null ? backend.AllocateBuffer(1) : null;

@@ -622,6 +622,7 @@ internal static class WinogradF23KernelTemplate
             WinogradKernelDialect.Hip => "fmaxf(",
             _ => "fmax(",
         })
+        .Replace("PRECISE ", dialect == WinogradKernelDialect.Glsl ? "precise " : "")
         .Replace("IBITS(", dialect switch
         {
             WinogradKernelDialect.OpenCl => "as_float(",

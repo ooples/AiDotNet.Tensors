@@ -16,6 +16,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// residual's gradient, bit 2 the mask rebuilt from x instead of read (the forward's own value, same fma), bit 3 a second
 /// output gradient summed into dY as it loads (gradOutput + gradOutput2).</item>
 /// </list>
+/// The mask rebuild (backward bit 2) is exact only where the forward and the backward round z = fma(gamma, x-hat, beta)
+/// the same: OpenCL, Metal and HIP define fma as one correctly rounded operation, GLSL does under <c>precise</c> (which the
+/// GLSL emission puts on both), and WGSL does not promise it, so WebGPU keeps reading the mask (see PortableBatchNorm).
 /// The per-channel parameters ride in packed buffers (see <see cref="PortableBatchNorm"/>) so the backward binds eight
 /// storage buffers, WebGPU's guaranteed limit; epsilon and 1/count ride in the int list as float bits.
 /// </summary>
@@ -99,7 +102,7 @@ internal static class BatchNormRegisterKernelTemplate
         {
             int b = e / spatial;
             int idx = (b * channels + c) * spatial + (e - b * spatial);
-            float y = FMA(g, (v[k] - mean) * inv, bt);
+            PRECISE float y = FMA(g, (v[k] - mean) * inv, bt);
             if ((mode & 2) != 0) y += res[idx];
             if ((mode & 1) != 0) y = FMAX(y, 0.0f);
             yout[idx] = y;
@@ -125,7 +128,11 @@ internal static class BatchNormRegisterKernelTemplate
             float x = xin[idx];
             float d = dyin[idx];
             if ((mode & 8) != 0) d = d + dy2[idx];
-            if ((mode & 4) != 0) { if (!(FMA(g, (x - mean) * inv, bt) > 0.0f)) d = 0.0f; }
+            if ((mode & 4) != 0)
+            {
+                PRECISE float z = FMA(g, (x - mean) * inv, bt);   // the forward's y before its ReLU, rounded the same
+                if (!(z > 0.0f)) d = 0.0f;
+            }
             else if ((mode & 1) != 0) { if (!(msk[idx] > 0.0f)) d = 0.0f; }
             if ((mode & 2) != 0) dres[idx] = d;
             xv[k] = x;
