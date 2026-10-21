@@ -279,6 +279,20 @@ public sealed class WinogradF23ConvTests : IClassFixture<DirectGpuTensorEngineTe
             maxErr = Math.Max(maxErr, Math.Abs(expected[i] - actual[i]) / Math.Max(1.0, scale));
         _output.WriteLine($"[fused dW N{batch} C{inC}->K{outC} {size}x{size} pad{pad}] max err / max|dW| vs im2col {maxErr:E2}");
         Assert.True(maxErr < 1e-5, $"fused Winograd weight gradient disagrees: max err / max|dW| {maxErr:E2}");
+
+        // The split shapes' in-kernel finish (the last block per tile) against the separate finish launch: same bits.
+        bool prior = CudaBackend.SplitKInKernel;
+        try
+        {
+            CudaBackend.SplitKInKernel = false;
+            cuda.Fill(dwFused, float.NaN, dwFused.Size);
+            Assert.True(cuda.TryConv2DBackwardFilterWinogradFused(fusedArgs), "the fused Winograd refused an admitted weight-gradient shape");
+            Assert.Equal(cuda.DownloadBuffer(dwFused), actual);
+        }
+        finally
+        {
+            CudaBackend.SplitKInKernel = prior;
+        }
     }
 
     // Input gradient through the flipped-filter Winograd pipeline against the fixed col2im route, timed against the

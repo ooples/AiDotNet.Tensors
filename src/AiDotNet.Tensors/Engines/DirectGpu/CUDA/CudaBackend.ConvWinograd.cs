@@ -187,27 +187,44 @@ public sealed partial class CudaBackend : IWinogradF23Transforms, IWinogradFused
 
         using var _ = PushContext();
         IWinogradFusedFilterGradient fused = this;
-        fused.FusedFilterGradient(splits == 1, a.First, partials ?? a.Output, a.Second, gx * gy * splits,
-            new[] { n, c, h, w, k, outH, outW, pad, tilesH, tilesW, tilesPerSplit });
+        var ints = new[] { n, c, h, w, k, outH, outW, pad, tilesH, tilesW, tilesPerSplit };
+        // Split: the kernel's last block per (k, c) tile does the finish itself, unless the tickets are unavailable.
+        var tickets = partials is not null ? TrySplitKTickets((long)gx * gy) : null;
+        if (tickets is not null)
+        {
+            LaunchWinogradFused(false, a.First, partials!, a.Second, gx, gy, splits, ints, a.Output, tickets);
+            return true;
+        }
+        fused.FusedFilterGradient(splits == 1, a.First, partials ?? a.Output, a.Second, gx * gy * splits, ints);
         if (partials is not null) fused.FusedFilterGradientFinish(partials, a.Output, (int)kc, splits);
         return true;
+    }
+
+    // The fused kernels' launch: the split entry also takes dW and the tickets of its in-kernel finish (null: the
+    // separate conv2d_wgrad_winograd_finish runs).
+    private unsafe void LaunchWinogradFused(bool direct, IGpuBuffer x, IGpuBuffer res, IGpuBuffer dy, int gx, int gy,
+        int splits, int[] ints, IGpuBuffer? dw, IGpuBuffer? tickets)
+    {
+        IntPtr xPtr = x.Handle, dyPtr = dy.Handle, resPtr = res.Handle;
+        IntPtr dwPtr = dw?.Handle ?? IntPtr.Zero, ticketPtr = tickets?.Handle ?? IntPtr.Zero;
+        int* fusedInts = stackalloc int[ints.Length];
+        void** fusedArgs = stackalloc void*[5 + ints.Length];
+        fusedArgs[0] = &xPtr; fusedArgs[1] = &dyPtr; fusedArgs[2] = &resPtr;
+        for (int i = 0; i < ints.Length; i++) { fusedInts[i] = ints[i]; fusedArgs[3 + i] = &fusedInts[i]; }
+        fusedArgs[3 + ints.Length] = &dwPtr; fusedArgs[4 + ints.Length] = &ticketPtr;   // ignored by the direct entry
+        LaunchKernel3D(_kernelCache[direct ? "wino_f32w_fused_direct" : "wino_f32w_fused"], (uint)gx, (uint)gy,
+            (uint)splits, (uint)DefaultBlockSize, 1, 1, fusedArgs, 0);
     }
 
     int IWinogradFusedFilterGradient.FusedFilterGradientGroupTarget => _multiProcessorCount;
 
     // CUDA's own fused kernels (CudaConvWinogradKernels): a (ceil(C/32), ceil(K/32), splits) grid of 256-thread blocks,
     // arguments (x, dy, out, ints), where the template's kernels take a 1-D grid and (x, res, dy, ints).
-    unsafe void IWinogradFusedFilterGradient.FusedFilterGradient(bool direct, IGpuBuffer x, IGpuBuffer res, IGpuBuffer dy,
+    void IWinogradFusedFilterGradient.FusedFilterGradient(bool direct, IGpuBuffer x, IGpuBuffer res, IGpuBuffer dy,
         int groups, int[] ints)
     {
         int gx = (ints[1] + WinogradFusedTile - 1) / WinogradFusedTile, gy = (ints[4] + WinogradFusedTile - 1) / WinogradFusedTile;
-        IntPtr xPtr = x.Handle, dyPtr = dy.Handle, resPtr = res.Handle;
-        int* fusedInts = stackalloc int[ints.Length];
-        void** fusedArgs = stackalloc void*[3 + ints.Length];
-        fusedArgs[0] = &xPtr; fusedArgs[1] = &dyPtr; fusedArgs[2] = &resPtr;
-        for (int i = 0; i < ints.Length; i++) { fusedInts[i] = ints[i]; fusedArgs[3 + i] = &fusedInts[i]; }
-        LaunchKernel3D(_kernelCache[direct ? "wino_f32w_fused_direct" : "wino_f32w_fused"], (uint)gx, (uint)gy,
-            (uint)(groups / (gx * gy)), (uint)DefaultBlockSize, 1, 1, fusedArgs, 0);
+        LaunchWinogradFused(direct, x, res, dy, gx, gy, groups / (gx * gy), ints, null, null);
     }
 
     unsafe void IWinogradFusedFilterGradient.FusedFilterGradientFinish(IGpuBuffer partials, IGpuBuffer dw, int kc, int splits)

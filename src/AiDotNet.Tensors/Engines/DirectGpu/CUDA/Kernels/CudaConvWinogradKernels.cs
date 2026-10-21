@@ -366,10 +366,14 @@ extern ""C"" __global__ void wino_f23_output(const float* __restrict__ mm, float
 #define WF_TC 32
 #define WF_PC 8
 #define WF_LD 36   // padded row: a warp's 8 tiles x 4 channels of transform stores hit 32 distinct banks
+// dw / tickets (split entry only, else null): the in-kernel finish. The last of a (k, c) tile's gridDim.z split blocks to
+// write its partials (an atomic ticket per tile) sums every split's components for the tile in split order into dW --
+// conv2d_wgrad_winograd_finish's arithmetic, the same bits -- and resets the ticket.
 template <bool DIRECT>
 __device__ __forceinline__ void wino_f32w_fused_body(
     const float* __restrict__ x, const float* __restrict__ dy, float* __restrict__ out,
-    int N, int C, int H, int W, int K, int outH, int outW, int pad, int tilesH, int tilesW, int tilesPerSplit)
+    int N, int C, int H, int W, int K, int outH, int outW, int pad, int tilesH, int tilesW, int tilesPerSplit,
+    float* __restrict__ dw = nullptr, unsigned int* __restrict__ tickets = nullptr)
 {
     __shared__ __align__(16) float smem[2 * 16 * WF_PC * WF_LD];
     float (*Us)[WF_PC][WF_LD] = reinterpret_cast<float (*)[WF_PC][WF_LD]>(smem);
@@ -588,6 +592,32 @@ __device__ __forceinline__ void wino_f32w_fused_body(
         }
         __syncthreads();
     }
+    if (tickets != nullptr)
+    {
+        __shared__ int isLast;
+        __threadfence();   // this block's partials are visible device-wide before its ticket says so
+        __syncthreads();
+        const int tile = blockIdx.y * gridDim.x + blockIdx.x;
+        if (tid == 0) isLast = atomicAdd(tickets + tile, 1u) == gridDim.z - 1u;
+        __syncthreads();
+        if (isLast)
+        {
+            __threadfence();
+            // The tile's dW rows: k0 .. k0 + 31, each 32 c x 9 contiguous floats (only cw columns of a ragged tile).
+            const int cw = min(WF_TC, C - c0);
+            for (int i = tid; i < WF_TK * WF_TC * 9; i += 256)
+            {
+                const int kl = i / (WF_TC * 9), r = i - kl * (WF_TC * 9);
+                const int k = k0 + kl, cl = r / 9, q = r - cl * 9;
+                if (k >= K || cl >= cw) continue;
+                const long long kc = (long long)k * C + c0 + cl;
+                float sum = 0.0f;
+                for (int z = 0; z < (int)gridDim.z; z++) sum += __ldcg(out + ((long long)z * 9 + q) * plane + kc);
+                dw[kc * 9 + q] = sum;
+            }
+            if (tid == 0) tickets[tile] = 0u;
+        }
+    }
     }
 }
 
@@ -602,9 +632,10 @@ extern ""C"" __global__ __launch_bounds__(256) void wino_f32w_fused_direct(
 // Split tiles: component-major partials for conv2d_wgrad_winograd_finish.
 extern ""C"" __global__ __launch_bounds__(256) void wino_f32w_fused(
     const float* __restrict__ x, const float* __restrict__ dy, float* __restrict__ out,
-    int N, int C, int H, int W, int K, int outH, int outW, int pad, int tilesH, int tilesW, int tilesPerSplit)
+    int N, int C, int H, int W, int K, int outH, int outW, int pad, int tilesH, int tilesW, int tilesPerSplit,
+    float* __restrict__ dw, unsigned int* __restrict__ tickets)
 {
-    wino_f32w_fused_body<false>(x, dy, out, N, C, H, W, K, outH, outW, pad, tilesH, tilesW, tilesPerSplit);
+    wino_f32w_fused_body<false>(x, dy, out, N, C, H, W, K, outH, outW, pad, tilesH, tilesW, tilesPerSplit, dw, tickets);
 }
 
 // dW[k][c][3][3] = sum over the splits of partials[z][q][k][c] (q = 3i + j), in split order.
