@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // Routes backend calls to DECLARED programs (#890 phase 4): a normalisation call is served by the program lowered from
 // its spec (PtxProgramLowering) instead of a hand-written kernel, in the hand-written kernel's own contract
 // (CodegenBackendPrograms). A program is lowered once per shape and its modules and scratch are cached; a shape the
@@ -162,6 +162,63 @@ public sealed partial class CudaBackend
     private readonly Dictionary<DeclaredKey, string> _declaredDeclines = new();
 
     private long _declaredProgramLaunches;
+
+    // Device memory the cached programs' scratch holds (attention's [batch, heads, seqQ, seqK] logits, the weights
+    // when the caller does not keep them, the backward's dP and dS, a split's partials, and the causal biases),
+    // against an admission budget.
+    //
+    // The second-sighting rule stops autoregressive decoding from compiling a program per token; it does NOT bound
+    // the number of RECURRING shapes. Training with dynamic padding or bucketed sequence lengths, or a varying last
+    // batch, makes many keys recur, and each one pinned its scratch for as long as the backend lived -- up to
+    // AttentionMaxScoreElements (256 MiB) per buffer -- so device memory grew until an allocation failed.
+    //
+    // Admission rather than eviction: a program is reached through _directPtxLock but LAUNCHED after the lock is
+    // released, so evicting one thread's program is a use-after-free for another, and a captured graph has the
+    // scratch's addresses baked into it. Declining instead is the route's existing failure mode - the same one a
+    // soft-cap, an oversized score tensor or a first sighting under capture already takes - so the shape keeps the
+    // hand-written kernel, which needs no scratch at all. The decline is memoised like any other, which is accurate
+    // because a cached program's scratch is only released when the backend is disposed.
+    private long _declaredScratchBytes;
+    private long _declaredScratchBudget;
+
+    /// <summary>Device bytes the cached declared programs' scratch holds, and the budget it is admitted against.</summary>
+    internal long DeclaredScratchBytes { get { lock (_directPtxLock) return _declaredScratchBytes; } }
+
+    internal long DeclaredScratchBudgetBytes { get { lock (_directPtxLock) return DeclaredScratchBudgetUnlocked(); } }
+
+    // An eighth of the device, at least 256 MiB, or AIDOTNET_DECLARED_SCRATCH_BUDGET_MB when it parses. Resolved once
+    // per backend, since the device's capacity does not change. The caller holds _directPtxLock.
+    private long DeclaredScratchBudgetUnlocked()
+    {
+        if (_declaredScratchBudget != 0) return _declaredScratchBudget;
+        const long floor = 256L * 1024 * 1024;
+        string? configured = Environment.GetEnvironmentVariable("AIDOTNET_DECLARED_SCRATCH_BUDGET_MB");
+        if (configured is not null &&
+            long.TryParse(configured, System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out long megabytes) && megabytes > 0)
+            return _declaredScratchBudget = megabytes * 1024 * 1024;
+        _declaredScratchBudget = TryGetDeviceMemory(out _, out ulong total) && total != 0
+            ? Math.Max(floor, (long)(total / 8))
+            : floor;
+        return _declaredScratchBudget;
+    }
+
+    // Whether this many scratch bytes fit, and the decline when they do not. The caller holds _directPtxLock.
+    private bool DeclaredScratchFits(long bytes, out string? decline)
+    {
+        long budget = DeclaredScratchBudgetUnlocked();
+        if (bytes <= 0 || _declaredScratchBytes + bytes <= budget)
+        {
+            decline = null;
+            return true;
+        }
+        decline = "the program needs " + (bytes >> 20).ToString(System.Globalization.CultureInfo.InvariantCulture) +
+            " MiB of scratch and the declared route already holds " +
+            (_declaredScratchBytes >> 20).ToString(System.Globalization.CultureInfo.InvariantCulture) + " MiB of its " +
+            (budget >> 20).ToString(System.Globalization.CultureInfo.InvariantCulture) +
+            " MiB budget (AIDOTNET_DECLARED_SCRATCH_BUDGET_MB); the hand-written kernel, which needs none, serves this shape.";
+        return false;
+    }
 
     /// <summary>
     /// Overrides the process switch for this backend: the route-equivalence tooling runs the same call with the
@@ -354,6 +411,16 @@ public sealed partial class CudaBackend
         for (int k = 0; k < names.Length; k++)
             if (lowering.Buffers.TryGetValue(names[k], out long elements)) boundElements[k] = elements;
 
+        // The scratch this program would pin for the backend's lifetime, decided BEFORE any of it is allocated.
+        long scratchBytes = 0;
+        foreach (var pair in lowering.Buffers)
+            if (!slotOf.ContainsKey(pair.Key)) scratchBytes = checked(scratchBytes + pair.Value * sizeof(float));
+        if (!DeclaredScratchFits(scratchBytes, out string? overBudget))
+        {
+            decline = overBudget;
+            return null;
+        }
+
         _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
         var kernels = new List<(DirectPtxModule, IntPtr)>();
         var scratch = new List<IGpuBuffer>();
@@ -383,6 +450,8 @@ public sealed partial class CudaBackend
                     slots[a] = slotOf.TryGetValue(step.Arguments[a], out int k) ? k : -1 - scratchOf[step.Arguments[a]];
                 argumentSlots[s] = slots;
             }
+            // Charged only once the program is certain to be returned: both catch arms below dispose the scratch.
+            _declaredScratchBytes = checked(_declaredScratchBytes + scratchBytes);
             return new DeclaredProgram(lowering, kernels, scratch.ToArray(), argumentSlots, boundElements);
         }
         catch (InvalidOperationException ex)

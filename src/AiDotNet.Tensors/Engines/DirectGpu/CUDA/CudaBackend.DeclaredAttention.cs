@@ -38,8 +38,20 @@ public sealed partial class CudaBackend
     // shape new -- keeps the hand-written kernel instead of compiling a program per token.
     private readonly HashSet<DeclaredKey> _attentionSeenOnce = new();
 
+    // Decoding gives this set one new key per token, so it needs a bound of its own: the programs are bounded by the
+    // scratch budget, but a key that never recurs costs nothing but a set entry and would still grow without end.
+    // At the cap the memo is dropped rather than closed, so a shape that starts recurring afterwards can still be
+    // routed - it just needs two more sightings - while the set cannot exceed the cap.
+    private const int AttentionSeenOnceCapacity = 4096;
+
     // Whether a key's program may be built now: true from its second sighting. The caller holds _directPtxLock.
-    private bool AttentionShapeRecurs(DeclaredKey key) => !_attentionSeenOnce.Add(key);
+    private bool AttentionShapeRecurs(DeclaredKey key)
+    {
+        if (_attentionSeenOnce.Contains(key)) return true;
+        if (_attentionSeenOnce.Count >= AttentionSeenOnceCapacity) _attentionSeenOnce.Clear();
+        _attentionSeenOnce.Add(key);
+        return false;
+    }
 
     // The causal bias of each (seqQ, seqK): 0 for a key at or before q + seqK - seqQ, AttentionMaskedLogit after.
     private readonly Dictionary<long, IGpuBuffer> _causalBiases = new();
@@ -216,8 +228,13 @@ public sealed partial class CudaBackend
         long cacheKey = ((long)seqQ << 32) | (uint)seqK;
         if (_causalBiases.TryGetValue(cacheKey, out var buffer)) return buffer;
         if (IsStreamCapturing()) return null;
+        // One bias per (seqQ, seqK), held for the backend's lifetime like a program's scratch, so it is admitted
+        // against the same budget. Null declines the route and the hand-written kernel serves the call.
+        long bytes = checked((long)seqQ * seqK * sizeof(float));
+        if (!DeclaredScratchFits(bytes, out _)) return null;
         buffer = AllocateBuffer(CausalBias(seqQ, seqK));
         _causalBiases[cacheKey] = buffer;
+        _declaredScratchBytes = checked(_declaredScratchBytes + bytes);
         return buffer;
     }
 
