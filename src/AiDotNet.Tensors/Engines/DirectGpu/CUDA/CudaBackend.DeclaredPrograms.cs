@@ -229,7 +229,7 @@ public sealed partial class CudaBackend
     /// <summary>Whether the declared-program route is on for this backend (switch and architecture).</summary>
     internal bool DeclaredKernelsEnabled =>
         (DeclaredKernelsSwitch ?? s_declaredKernels) && IsAvailable &&
-        DirectPtxArchitecture.HasCodegenConveyor(_ccMajor, _ccMinor);
+        DirectPtxArchitecture.HasReleasedCodegenKernels(_ccMajor, _ccMinor);
 
     /// <summary>Number of calls served by declared programs, for routing tests and diagnostics.</summary>
     internal long DeclaredProgramLaunches => System.Threading.Interlocked.Read(ref _declaredProgramLaunches);
