@@ -5,8 +5,10 @@
 // options): registers, local bytes (spills), static SASS instructions, global loads and stores and how many of each
 // are 128-bit.
 //
-// THE RULE (decided on #1437, 2026-10-20): the declared side FAILS on a spill (any local bytes) or on fewer 128-bit
-// loads than the hand-written kernel. Registers and static instructions are REPORTED, not gated: a held row keeps
+// THE RULE (decided on #1437, 2026-10-20; refined for #1439 the same day): the declared side FAILS on a spill (any
+// local bytes) or on a smaller SHARE of its global loads being 128-bit than the hand-written kernel's. (It was the
+// count; skinny_gemm, unrolled further, has more 128-bit loads than a declared GEMM whose every load is one.)
+// Registers and static instructions are REPORTED, not gated: a held row keeps
 // its elements in registers so x is read once -- 52-88 registers against 14-48, and the reason the declared kernels
 // are 1.3-4.9x faster -- and static counts are code, not work (an unrolled row has more instructions than a loop
 // over it; a fused program is one kernel standing in for several). The paired wall-clock gate is --kernel-routes.
@@ -32,7 +34,8 @@ internal static class KernelRouteStaticTool
     private sealed record Metrics(string Kernel, int Registers, int LocalBytes, int Instructions,
         int Loads, int WideLoads, int Stores, int WideStores);
 
-    private sealed record Family(string Name, CodegenProgram Declared, string Module, string[] Kernels);
+    private sealed record Family(string Name, CodegenProgram Declared, string Module, string[] Kernels,
+        Func<CodegenKernelSpec, PtxPassLowering?>? LowerPass = null);
 
     internal static void Run(string[] args)
     {
@@ -49,6 +52,30 @@ internal static class KernelRouteStaticTool
             ["normalization"] = HandWritten("normalization_kernels", CudaNormalizationKernels.GetSource(), major, minor, work, Tool),
             ["activation"] = HandWritten("activation_kernels", CudaActivationKernels.GetSource(), major, minor, work, Tool),
             ["neuralnet"] = HandWritten("neuralnet_kernels", CudaNeuralNetKernels.GetSource(), major, minor, work, Tool),
+            ["skinny"] = HandWritten("skinny_gemm_kernels", CudaSkinnyGemmKernels.GetSource(), major, minor, work, Tool),
+        };
+
+        // A GEMM schedule's lowering, as CudaBackend.BuildUnderGemmSchedule builds it (implicit-GEMM tiles, optionally
+        // split along the reduction with the planner's combine).
+        Func<CodegenKernelSpec, PtxPassLowering?> ImplicitGemm(int tileM, int tileN, int split) => pass =>
+        {
+            PtxPassKernel Emit(CodegenKernelSpec spec)
+            {
+                var emitter = new PtxAffineEmitter { ImplicitGemm = true, ImplicitGemmTile = tileN, ImplicitGemmTileM = tileM };
+                string text = emitter.Emit(spec, major, minor);
+                return new PtxPassKernel(text, spec.Name, emitter.LaunchBlocks, (uint)emitter.LaunchBlockX, (uint)emitter.LaunchBlockY);
+            }
+            if (split <= 1) return new PtxPassLowering(new[] { Emit(pass) }, null, "implicit-gemm");
+            var plan = CodegenSplitReduction.TryPlanChunkedForTiles(pass, split)
+                ?? throw new NotSupportedException(pass.Name + " has no " + split + "-way split.");
+            var combine = new PtxAffineEmitter { VectorTileReductions = true };
+            string combineText = combine.Emit(plan.Combine, major, minor);
+            return new PtxPassLowering(new[]
+            {
+                Emit(plan.Partial),
+                new PtxPassKernel(combineText, plan.Combine.Name, combine.LaunchBlocks, (uint)combine.LaunchBlockX,
+                    (uint)combine.LaunchBlockY),
+            }, plan, "implicit-gemm split");
         };
 
         var families = new[]
@@ -65,13 +92,24 @@ internal static class KernelRouteStaticTool
                 new[] { "batchnorm_backward" }),
             new Family("Softmax 8192x1024", CodegenFusedStatistics.Softmax(8192, 1024), "activation", new[] { "softmax" }),
             new Family("SoftmaxBackward 8192x1024", CodegenFusedStatistics.SoftmaxBackward(8192, 1024), "neuralnet", new[] { "softmax_backward" }),
+            // The GEMM slot's declared schedules at shapes where they won, against the narrow kernel the entry ran there.
+            new Family("Gemm 8192x128x256 implicit-gemm.m128n64", CodegenBackendPrograms.Gemm(1, 8192, 128, 256, false, false),
+                "skinny", new[] { "skinny_gemm" }, ImplicitGemm(128, 64, 0)),
+            new Family("GemmTB 4096x64x64 implicit-gemm.m64n64", CodegenBackendPrograms.Gemm(1, 4096, 64, 64, false, true),
+                "skinny", new[] { "skinny_gemm" }, ImplicitGemm(64, 64, 0)),
+            new Family("Gemm 512x512x16 implicit-gemm.m128n64", CodegenBackendPrograms.Gemm(1, 512, 512, 16, false, false),
+                "skinny", new[] { "small_gemm_tinyk" }, ImplicitGemm(128, 64, 0)),
+            new Family("GemmTA 128x128x2048 implicit-gemm.split8v.m64n64", CodegenBackendPrograms.Gemm(1, 128, 128, 2048, true, false),
+                "skinny", new[] { "skinny_gemm_tn" }, ImplicitGemm(64, 64, 8)),
+            new Family("GemmTA 16x10x4096 planner", CodegenBackendPrograms.Gemm(1, 16, 10, 4096, true, false),
+                "skinny", new[] { "small_gemm_rowreduce" }),
         };
 
         Console.WriteLine("STATIC METRICS - declared program (ptxas) vs hand-written reference (NVRTC), sm_" + arch);
         int flagged = 0;
         foreach (var family in families)
         {
-            var lowering = PtxProgramLowering.Create(family.Declared, "audit", major, minor);
+            var lowering = PtxProgramLowering.Create(family.Declared, "audit", major, minor, family.LowerPass);
             var ours = new List<Metrics>();
             for (int s = 0; s < lowering.Steps.Count; s++)
             {
@@ -95,7 +133,12 @@ internal static class KernelRouteStaticTool
             var b = Total(theirs, "hand-written");
             var failed = new List<string>();
             if (a.LocalBytes > 0) failed.Add("spills: " + a.LocalBytes + " local bytes");
-            if (a.WideLoads < b.WideLoads) failed.Add("128-bit loads " + a.WideLoads + " < " + b.WideLoads);
+            // The share of global loads that are 128-bit, not their count (user decision 2026-10-20): a hand-written
+            // kernel unrolled further has more load instructions of either width, which is code, not vectorisation.
+            double ShareWide(Metrics m) => m.Loads == 0 ? 1.0 : (double)m.WideLoads / m.Loads;
+            if (ShareWide(a) < ShareWide(b))
+                failed.Add("128-bit share of loads " + ShareWide(a).ToString("P0", CultureInfo.InvariantCulture) + " < " +
+                    ShareWide(b).ToString("P0", CultureInfo.InvariantCulture));
             var reported = new List<string>();
             if (a.Registers > b.Registers) reported.Add("registers " + a.Registers + " > " + b.Registers);
             if (a.Instructions > b.Instructions) reported.Add("instructions " + a.Instructions + " > " + b.Instructions);
@@ -108,7 +151,7 @@ internal static class KernelRouteStaticTool
         }
         Console.WriteLine();
         Console.WriteLine(flagged == 0
-            ? "All " + families.Length + " families pass: no spills, no fewer 128-bit loads than the hand-written kernels."
+            ? "All " + families.Length + " families pass: no spills, no smaller share of 128-bit loads than the hand-written kernels."
             : flagged + " of " + families.Length + " families fail the static rule.");
         if (flagged != 0) throw new InvalidOperationException(flagged + " families fail the static rule.");
     }

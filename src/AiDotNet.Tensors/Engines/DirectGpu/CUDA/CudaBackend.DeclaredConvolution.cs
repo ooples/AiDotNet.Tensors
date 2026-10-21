@@ -184,7 +184,7 @@ public sealed partial class CudaBackend
                 _declaredConvPrograms[key] = program;
             }
         }
-        if (program is null) return false;
+        if (program is null || !AlignedFor(program, names, bound)) return false;
         RunDeclaredProgram(program, names, bound);
         return true;
     }
@@ -222,14 +222,15 @@ public sealed partial class CudaBackend
     }
 
     // The schedule's lowering of the convolution pass; NotSupportedException declines the key.
-    private PtxPassLowering LowerDeclaredConv(CodegenKernelSpec pass, DeclaredConvSchedule schedule, int minBlocks)
+    private PtxPassLowering LowerDeclaredConv(CodegenKernelSpec pass, DeclaredConvSchedule schedule, int minBlocks,
+        bool vectorCombine = false)
     {
         string label = "implicit-gemm " + schedule.Suffix;
         if (schedule.SplitFactor <= 1)
             return new PtxPassLowering(new[] { EmitImplicitGemmKernel(pass, schedule, minBlocks) }, null, label);
         var split = CodegenSplitReduction.TryPlanChunkedForTiles(pass, schedule.SplitFactor)
             ?? throw new NotSupportedException(pass.Name + " has no reduction axis " + schedule.SplitFactor + " divides.");
-        var combine = new PtxAffineEmitter();
+        var combine = new PtxAffineEmitter { VectorTileReductions = vectorCombine };
         string combinePtx = combine.Emit(split.Combine, _ccMajor, _ccMinor);
         return new PtxPassLowering(new[]
         {

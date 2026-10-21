@@ -110,6 +110,36 @@ public class PtxImplicitGemmTests
     }
 
     /// <summary>
+    /// A plain matrix operand -- unit-stride along its staged-fastest axis, a multiple of 4 -- is gathered with one
+    /// 128-bit load per four floats; anything else keeps one float per load.
+    /// </summary>
+    [Fact]
+    public void APlainMatrixOperandIsGatheredFourFloatsAtATime()
+    {
+        // A GEMM's A runs along K and B along N, both unit-stride and multiples of 4: one ld.global.v4 per four floats.
+        var gemm = CodegenBackendPrograms.Gemm(1, 100, 68, 36, transA: false, transB: false).Passes[0];
+        var emitter = new PtxAffineEmitter { ImplicitGemm = true };
+        string ptx = emitter.Emit(gemm, 7, 5);
+        Assert.Contains("v4 gathers AB", emitter.TileDescription, StringComparison.Ordinal);
+        Assert.Contains("ld.global.v4.f32", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("ld.global.nc.f32", ptx, StringComparison.Ordinal);
+        Assert.Contains("st.shared.v4.f32", ptx, StringComparison.Ordinal);   // B's four positions of one row
+
+        // A K that is not a multiple of 4 keeps A scalar (a vector could straddle the end); B still vectorises.
+        var ragged = CodegenBackendPrograms.Gemm(1, 100, 68, 37, transA: false, transB: false).Passes[0];
+        var second = new PtxAffineEmitter { ImplicitGemm = true };
+        second.Emit(ragged, 7, 5);
+        Assert.Contains("v4 gathers B", second.TileDescription, StringComparison.Ordinal);
+
+        // Off with vector loads off; and a convolution's gathered windows never qualify.
+        var off = new PtxAffineEmitter { ImplicitGemm = true, EnableVectorLoads = false };
+        Assert.DoesNotContain("ld.global.v4", off.Emit(gemm, 7, 5), StringComparison.Ordinal);
+        var conv = new PtxAffineEmitter { ImplicitGemm = true };
+        conv.Emit(Shape(0), 7, 5);
+        Assert.DoesNotContain("v4 gathers", conv.TileDescription, StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// The affine planner declines a split once the output alone fills the device at one thread per
     /// output; the tiled planner still splits, on the largest reduction axis the factor divides
     /// (c = 64 here, not the taps), and the partial is an implicit GEMM with that chunk as a batch slice.

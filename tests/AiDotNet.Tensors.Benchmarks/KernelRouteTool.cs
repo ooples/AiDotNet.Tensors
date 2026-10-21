@@ -20,6 +20,7 @@ using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
+using AiDotNet.Tensors.Helpers.Autotune.TunedKernels;
 
 namespace AiDotNet.Tensors.Benchmarks;
 
@@ -89,6 +90,7 @@ internal static class KernelRouteTool
         if (only is null || only.Equals("capture", StringComparison.OrdinalIgnoreCase)) CaptureCheck(backend, failures);
         if (only is null || only.Equals("resident", StringComparison.OrdinalIgnoreCase)) ResidentChains(backend, failures);
         if (only is null || only.Equals("conv", StringComparison.OrdinalIgnoreCase)) ConvRoutes(backend, failures);
+        if (only is null || only.Equals("gemm", StringComparison.OrdinalIgnoreCase)) GemmSchedules(backend, failures);
 
         if (failures.Count != 0)
             throw new InvalidOperationException("Route failures: " + string.Join("; ", failures));
@@ -178,6 +180,164 @@ internal static class KernelRouteTool
     }
 
     // ---- linear layers (#890 phase 4c) ------------------------------------------------------------------------
+
+    // ---- plain GEMMs ----------------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// Every declared GEMM schedule against the backend's own entry point with the declared route off (the tuned
+    /// route, the narrow kernels skinny_gemm / small_gemm_* / wgrad_tile_tn / skinny_gemm_tn, or cuBLAS), each against
+    /// fp64, on the narrow kernels' shapes and on general and batched ones.
+    /// </summary>
+    private static void GemmSchedules(CudaBackend backend, List<string> failures)
+    {
+        Console.WriteLine();
+        Console.WriteLine("GEMM SCHEDULES - each declared schedule vs the entry point's incumbent (declared off)");
+        // Every shape is tuned in this one process; the default budget (2 s) is sized for a training run's first steps.
+        TunedKernelPolicy.BudgetMilliseconds = 600_000;
+        var shapes = new List<(DeclaredFamily Family, int Batch, int M, int N, int K)>();
+        foreach (var (m, n, k) in new[] { (4096, 64, 64), (8192, 128, 256), (2048, 256, 128), (16, 10, 4096), (512, 512, 16),
+                                          (32, 10, 64), (256, 512, 512), (512, 768, 768), (1024, 1024, 1024), (5, 33, 17) })
+            shapes.Add((DeclaredFamily.Gemm, 1, m, n, k));
+        foreach (var (m, n, k) in new[] { (4096, 64, 64), (8192, 128, 256), (32, 10, 64), (512, 768, 768) })
+            shapes.Add((DeclaredFamily.GemmTransposedB, 1, m, n, k));
+        foreach (var (m, n, k) in new[] { (64, 64, 256), (128, 128, 2048), (256, 256, 8192), (16, 10, 4096), (768, 768, 512) })
+            shapes.Add((DeclaredFamily.GemmTransposedA, 1, m, n, k));
+        foreach (var (g, m, n, k) in new[] { (96, 128, 128, 64), (96, 128, 64, 128), (64, 256, 256, 64), (8, 512, 512, 512) })
+            shapes.Add((DeclaredFamily.Gemm, g, m, n, k));
+        var schedules = CudaBackend.DeclaredGemmSchedules;
+        foreach (var (family, batch, m, n, k) in shapes)
+        {
+            bool transA = family == DeclaredFamily.GemmTransposedA, transB = family == DeclaredFamily.GemmTransposedB;
+            float[] a = Fill(batch * m * k, 21, 0.003), b = Fill(batch * k * n, 22, -0.002);
+            for (int i = 0; i < a.Length; i++) a[i] *= 1.0f + 1e-3f * (i % 7);
+            var c = new double[(long)batch * m * n];
+            System.Threading.Tasks.Parallel.For(0, batch * m, row =>
+            {
+                int g = row / m, i = row % m;
+                for (int j = 0; j < n; j++)
+                {
+                    double sum = 0;
+                    for (int r = 0; r < k; r++)
+                        sum += (double)a[g * m * k + (transA ? r * m + i : i * k + r)] * b[g * k * n + (transB ? j * k + r : r * n + j)];
+                    c[(long)g * m * n + i * n + j] = sum;
+                }
+            });
+            double bound = Unit * (16 + Math.Log(Math.Max(2, k), 2)) * Math.Max(1.0, Max(Abs(c)));
+            string name = (family == DeclaredFamily.Gemm ? batch > 1 ? "BatchedGemm" : "Gemm" : transA ? "GemmTA" : "GemmTB") +
+                " " + (batch > 1 ? batch + "x" : "") + m + "x" + n + "x" + k;
+            using var aBuf = backend.AllocateBuffer(a);
+            using var bBuf = backend.AllocateBuffer(b);
+            using var cBuf = backend.AllocateBuffer(new float[batch * m * n]);
+
+            void Incumbent()
+            {
+                if (batch > 1) backend.BatchedGemm(aBuf, bBuf, cBuf, m, n, k, batch);
+                else if (transA) backend.MatMulTransposedA(aBuf, bBuf, cBuf, m, n, k);
+                else if (transB) backend.MatMulTransposed(aBuf, bBuf, cBuf, m, n, k);
+                else backend.Gemm(aBuf, bBuf, cBuf, m, n, k);
+            }
+
+            backend.DeclaredKernelsSwitch = false;
+            double incumbentError, incumbentUs;
+            CudaGemmDispatchPath path;
+            try
+            {
+                Incumbent();
+                backend.Synchronize();
+                path = backend.LastGemmDispatchPath;
+                incumbentError = MaxDev(backend.DownloadBuffer(cBuf), c);
+                incumbentUs = Time(Incumbent, backend.Synchronize);
+            }
+            finally
+            {
+                backend.DeclaredKernelsSwitch = null;
+            }
+
+            backend.DeclaredKernelsSwitch = true;
+            try
+            {
+                double bestUs = double.PositiveInfinity;
+                string best = "none";
+                var row = new System.Text.StringBuilder();
+                for (int s = 0; s < schedules.Count; s++)
+                {
+                    int schedule = s;
+                    backend.Fill(cBuf, float.NaN, batch * m * n);
+                    if (!backend.TryDeclaredGemmSchedule(family, aBuf, bBuf, cBuf, batch, m, n, k, schedule)) continue;
+                    backend.Synchronize();
+                    double error = MaxDev(backend.DownloadBuffer(cBuf), c);
+                    if (double.IsNaN(error) || error > bound && error > 2 * incumbentError)
+                    {
+                        failures.Add(name + " " + schedules[s].Name + ": error " + E(error) + " over bound " + E(bound));
+                        row.Append("  " + schedules[s].Name + "=FAIL(" + E(error) + ")");
+                        continue;
+                    }
+                    double us = Time(() => backend.TryDeclaredGemmSchedule(family, aBuf, bBuf, cBuf, batch, m, n, k, schedule),
+                        backend.Synchronize);
+                    row.Append("  " + schedules[s].Name + "=" + us.ToString("F1", CultureInfo.InvariantCulture));
+                    if (us < bestUs) { bestUs = us; best = schedules[s].Name; }
+                }
+                Console.WriteLine(name.PadRight(28) + " incumbent " + (family == DeclaredFamily.Gemm && batch == 1 ? path.ToString() : "entry") + " " +
+                    incumbentUs.ToString("F1", CultureInfo.InvariantCulture) + " us; best " + best + " " +
+                    bestUs.ToString("F1", CultureInfo.InvariantCulture) + " us = " +
+                    (incumbentUs / bestUs).ToString("F2", CultureInfo.InvariantCulture) + "x");
+                Console.WriteLine("   " + row);
+
+                // End to end: the entry point with the route on, whose first call puts the shape through the GEMM
+                // slot's evidence gate; it must match fp64 and be no slower than the incumbent beyond timing noise.
+                backend.Fill(cBuf, float.NaN, batch * m * n);
+                double spentBefore = TunedKernelPolicy.SpentMilliseconds;
+                var gateClock = Stopwatch.StartNew();
+                Incumbent();
+                backend.Synchronize();
+                double gateMs = gateClock.Elapsed.TotalMilliseconds, chargedMs = TunedKernelPolicy.SpentMilliseconds - spentBefore;
+                double routedError = MaxDev(backend.DownloadBuffer(cBuf), c);
+                double routedUs = Time(Incumbent, backend.Synchronize);
+                TunedKernelDecision? decision = null;
+                foreach (var d in backend.GemmSlot.CachedDecisions)
+                    if (d.Shape[0] == (transA ? 1 : transB ? 2 : 0) && d.Shape[1] == batch && d.Shape[2] == m &&
+                        d.Shape[3] == n && d.Shape[4] == k)
+                        decision = d;
+                bool ok = !double.IsNaN(routedError) && (routedError <= bound || routedError <= 2 * incumbentError);
+                if (!ok) failures.Add(name + " entry: error " + E(routedError) + " over bound " + E(bound));
+                Console.WriteLine("   entry with the route on: " + (decision is null
+                        ? "no decision"
+                        : decision.CandidateId + " (" + decision.Reason + ", gate " +
+                          decision.MedianSpeedup.ToString("F2", CultureInfo.InvariantCulture) + "x)") + ", " +
+                    routedUs.ToString("F1", CultureInfo.InvariantCulture) + " us = " +
+                    (incumbentUs / routedUs).ToString("F2", CultureInfo.InvariantCulture) + "x the incumbent, error " +
+                    E(routedError) + (ok ? "" : "  FAIL") + "; first call " +
+                    gateMs.ToString("F0", CultureInfo.InvariantCulture) + " ms, budget charged " +
+                    chargedMs.ToString("F0", CultureInfo.InvariantCulture) + " ms");
+
+                // Where the incumbent kept the shape, the slot's dispatch is pure host overhead: off and on alternate
+                // five times (median of each), with the managed bytes a routed call allocates.
+                if (decision is { Reason: TunedKernelDecisionReason.ReferenceWon })
+                {
+                    var off = new double[5];
+                    var on = new double[5];
+                    for (int round = 0; round < 5; round++)
+                    {
+                        backend.DeclaredKernelsSwitch = false;
+                        off[round] = Time(Incumbent, backend.Synchronize);
+                        backend.DeclaredKernelsSwitch = true;
+                        on[round] = Time(Incumbent, backend.Synchronize);
+                    }
+                    Array.Sort(off);
+                    Array.Sort(on);
+                    Console.WriteLine("   slot overhead on the incumbent: off " +
+                        off[2].ToString("F2", CultureInfo.InvariantCulture) + " us, on " +
+                        on[2].ToString("F2", CultureInfo.InvariantCulture) + " us, host bytes/call " +
+                        AllocatedPerCall(Incumbent, backend.Synchronize).ToString("F0", CultureInfo.InvariantCulture));
+                }
+            }
+            finally
+            {
+                backend.DeclaredKernelsSwitch = null;
+            }
+        }
+    }
+
 
     private const double GeluInner = 0.7978845608, GeluCubic = 0.044715;
 

@@ -37,6 +37,9 @@ internal enum DeclaredFamily
     Elementwise,
     FusedLinear,
     FusedLinearBackward,
+    Gemm,
+    GemmTransposedA,
+    GemmTransposedB,
 }
 
 /// <summary>One declared program: its family and shape (unused dimensions are 0).</summary>
@@ -163,6 +166,8 @@ public sealed partial class CudaBackend
         internal DeclaredProgram(PtxProgramLowering lowering, List<(DirectPtxModule Module, IntPtr Function)> kernels,
             IGpuBuffer[] scratch, int[][] argumentSlots, long[] boundElements)
         {
+            foreach (var step in lowering.Steps)
+                VectorAccess |= s_vectorGlobalAccess.IsMatch(step.Ptx);
             Lowering = lowering;
             Kernels = kernels;
             Scratch = scratch;
@@ -180,11 +185,28 @@ public sealed partial class CudaBackend
         /// <summary>Elements the program needs in each caller slot (0 for a slot it does not name).</summary>
         internal long[] BoundElements { get; }
 
+        /// <summary>Whether a kernel reads or writes global memory with vector instructions, which need every bound
+        /// buffer 16-byte aligned (<see cref="AlignedFor"/>).</summary>
+        internal bool VectorAccess { get; }
+
         public void Dispose()
         {
             foreach (var (module, _) in Kernels) module.Dispose();
             foreach (var buffer in Scratch) buffer.Dispose();
         }
+    }
+
+    private static readonly System.Text.RegularExpressions.Regex s_vectorGlobalAccess = new(
+        @"\b(ld|st)\.global(\.nc)?\.v[24]\.", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    // Whether the caller's buffers suit the program: a program with vector global access needs each buffer it names
+    // 16-byte aligned (a view into a larger allocation need not be), or a vector instruction faults the context.
+    private static bool AlignedFor(DeclaredProgram program, string[] names, in DeclaredBindings bound)
+    {
+        if (!program.VectorAccess) return true;
+        for (int k = 0; k < names.Length; k++)
+            if (program.BoundElements[k] != 0 && ((long)bound[k].Handle & 15) != 0) return false;
+        return true;
     }
 
     /// <summary>
@@ -210,7 +232,7 @@ public sealed partial class CudaBackend
                 _declaredPrograms[key] = program;
             }
         }
-        if (program is null) return false;
+        if (program is null || !AlignedFor(program, names, bound)) return false;
         if (residentWhenSmall && TryLaunchDeclaredResidentChecked(key, program, names, bound)) return true;
         RunDeclaredProgram(program, names, bound);
         return true;

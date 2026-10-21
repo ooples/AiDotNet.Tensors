@@ -30,7 +30,7 @@ public class PtxResidentComposerTests
     }
 
     /// <summary>
-    /// LayerNorm then softmax: one entry, each stage's labels and shared memory under its own prefix, a grid barrier
+    /// LayerNorm then softmax: one entry, each stage's labels under its own prefix, a grid barrier
     /// between the stages and none after the last, and the arguments every stage's then the barrier.
     /// </summary>
     [Fact]
@@ -89,6 +89,40 @@ public class PtxResidentComposerTests
         Assert.Contains("s1_NEXTBLOCK:", composed.Ptx, StringComparison.Ordinal);
         // Every call of both stages survives (a held row calls once per element it holds).
         Assert.Equal(2 * Count(steps[0].Ptx, "call.uni"), Count(composed.Ptx, "call.uni"));
+    }
+
+    /// <summary>
+    /// Three implicit-GEMM stages, each staging its tiles through 18.5 KB of shared memory: their arrays are overlaid on
+    /// one buffer the size of one stage's (summed, the chain was refused at 55.5 KB), and every stage addresses it.
+    /// </summary>
+    [Fact]
+    public void StagesOverlayTheirSharedMemory()
+    {
+        static PtxPassLowering? Lower(CodegenKernelSpec pass)
+        {
+            var emitter = new PtxAffineEmitter { ImplicitGemm = true };
+            string ptx = emitter.Emit(pass, 7, 5);
+            return new PtxPassLowering(new[]
+            {
+                new PtxPassKernel(ptx, pass.Name, emitter.LaunchBlocks, (uint)emitter.LaunchBlockX, (uint)emitter.LaunchBlockY),
+            }, null, "implicit-gemm");
+        }
+
+        var steps = new List<PtxProgramStep>();
+        for (int i = 0; i < 3; i++)
+            steps.AddRange(PtxProgramLowering.Create(CodegenBackendPrograms.Gemm(1, 64, 96, 80, false, false), "g" + i, 7, 5,
+                Lower).Steps);
+        var declaration = System.Text.RegularExpressions.Regex.Match(steps[0].Ptx, @"\.shared\s+\.align\s+\d+\s+\.b8\s+\w+\[(\d+)\]");
+        Assert.True(declaration.Success, "an implicit-GEMM stage stages through shared memory");
+        int stageBytes = int.Parse(declaration.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture);
+        Assert.True(3 * stageBytes > 48 * 1024, "summed, the three stages would not fit");
+
+        var composed = PtxResidentComposer.Compose(steps, "resident_gemms", 7, 5);
+        Assert.Equal(stageBytes, composed.SharedBytes);
+        Assert.Equal(1, Count(composed.Ptx, ".shared "));
+        foreach (string prefix in new[] { "s0_", "s1_", "s2_" })
+            Assert.Contains(prefix + "BLOCK:", composed.Ptx, StringComparison.Ordinal);
+        Assert.True(Count(composed.Ptx, "resident_shared") >= 4, "the declaration and every stage's use");
     }
 
     /// <summary>Stages that do not share a block size, or that use a 2-D block, are refused.</summary>

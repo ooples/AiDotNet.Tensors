@@ -9,7 +9,11 @@
 //                   virtual block does exactly the work that block did in the stage's own launch -- the arithmetic,
 //                   and so the result, is bit-identical to launching the stages separately.
 //   ret             ends the virtual block, not the kernel.
-//   labels, shared  take a per-stage prefix; parameters are renamed per stage and concatenated.
+//   labels          take a per-stage prefix; parameters are renamed per stage and concatenated.
+//   shared          each stage's first array is overlaid on one buffer (resident_shared) sized for the largest; any
+//                   further array of a stage keeps its own, prefixed. Stages are separated by the grid barrier, which
+//                   opens and closes with bar.sync, so no thread touches one stage's shared data once the next has
+//                   begun.
 //   ld.global.nc    becomes ld.global: the read-only path is undefined for data written during the kernel, and a
 //                   later stage reads what an earlier one wrote. The barrier's membar.gl orders it.
 //
@@ -18,7 +22,7 @@
 // It is safe only because a cooperative launch keeps every block co-resident.
 //
 // Declined (NotSupportedException): a stage with a 2-D block, dynamic shared memory, a block size other than the
-// others', or shared memory past 48 KB in total.
+// others', or shared memory past 48 KB (the overlaid buffer plus the stages' further arrays).
 
 using System;
 using System.Collections.Generic;
@@ -56,7 +60,7 @@ public sealed class PtxResidentComposition
     /// <summary>The most blocks any stage launched on its own: a grid larger than this would idle.</summary>
     public uint MaxStageBlocks { get; }
 
-    /// <summary>Static shared memory, summed over the stages.</summary>
+    /// <summary>Static shared memory: the overlaid buffer (the largest stage's first array) plus further arrays.</summary>
     public int SharedBytes { get; }
 
     /// <summary>Math-library functions any stage calls: the composed module is linked with their libraries.</summary>
@@ -70,6 +74,9 @@ public static class PtxResidentComposer
     public const string BarrierArgument = "#resident_barrier";
 
     private const int MaxStaticShared = 48 * 1024;
+
+    // The buffer every stage's first shared array is overlaid on.
+    private const string OverlaidShared = "resident_shared";
 
     /// <summary>Composes <paramref name="steps"/>, in order, as one entry named <paramref name="entryPoint"/>.</summary>
     public static PtxResidentComposition Compose(IReadOnlyList<PtxProgramStep> steps, string entryPoint,
@@ -86,7 +93,7 @@ public static class PtxResidentComposer
         var body = new StringBuilder();
         var externs = new List<string>();
         var calls = new List<CodegenLibraryFunction>();
-        int maxP = 0, maxR = 0, maxRd = 0, maxF = 0, sharedBytes = 0;
+        int maxP = 0, maxR = 0, maxRd = 0, maxF = 0, sharedBytes = 0, overlaidBytes = 0, overlaidAlign = 0;
         uint maxBlocks = 0;
 
         for (int k = 0; k < steps.Count; k++)
@@ -106,9 +113,18 @@ public static class PtxResidentComposer
             maxP = Math.Max(maxP, stage.P); maxR = Math.Max(maxR, stage.R); maxRd = Math.Max(maxRd, stage.Rd); maxF = Math.Max(maxF, stage.F);
             foreach (string parameter in stage.Parameters) parameters.Add(prefix + parameter);
             arguments.AddRange(step.Arguments);
-            foreach (var (name, declaration, bytes) in stage.Shared)
+            for (int s = 0; s < stage.Shared.Count; s++)
             {
-                shared.Append(declaration).Append('\n');
+                var (_, align, bytes) = stage.Shared[s];
+                if (s == 0)
+                {
+                    overlaidBytes = Math.Max(overlaidBytes, bytes);
+                    overlaidAlign = Math.Max(overlaidAlign, align);
+                    continue;
+                }
+                shared.Append("    .shared .align ").Append(align.ToString(CultureInfo.InvariantCulture)).Append(" .b8 ")
+                    .Append(prefix).Append(stage.Shared[s].Name).Append('[')
+                    .Append(bytes.ToString(CultureInfo.InvariantCulture)).Append("];\n");
                 sharedBytes += bytes;
             }
 
@@ -124,6 +140,10 @@ public static class PtxResidentComposer
                 .Append(done).Append(":\n");
             if (k < steps.Count - 1) AppendGridBarrier(body, prefix);
         }
+        if (overlaidBytes > 0)
+            shared.Insert(0, "    .shared .align " + overlaidAlign.ToString(CultureInfo.InvariantCulture) + " .b8 " + OverlaidShared +
+                "[" + overlaidBytes.ToString(CultureInfo.InvariantCulture) + "];\n");
+        sharedBytes += overlaidBytes;
         if (sharedBytes > MaxStaticShared)
             throw new NotSupportedException("The stages' shared memory totals " + sharedBytes + " bytes, past 48 KB.");
         parameters.Add("resident_barrier");
@@ -188,7 +208,7 @@ public static class PtxResidentComposer
     {
         internal List<string> Parameters { get; } = new();
         internal List<string> Externs { get; } = new();
-        internal List<(string Name, string Declaration, int Bytes)> Shared { get; } = new();
+        internal List<(string Name, int Align, int Bytes)> Shared { get; } = new();
         internal int P, R, Rd, F;
         internal string Body = "";
     }
@@ -247,8 +267,7 @@ public static class PtxResidentComposer
             var shared = SharedDecl.Match(line);
             if (shared.Success)
             {
-                string name = shared.Groups[2].Value;
-                stage.Shared.Add((name, "    .shared .align " + shared.Groups[1].Value + " .b8 " + prefix + name + "[" + shared.Groups[3].Value + "];",
+                stage.Shared.Add((shared.Groups[2].Value, int.Parse(shared.Groups[1].Value, CultureInfo.InvariantCulture),
                     int.Parse(shared.Groups[3].Value, CultureInfo.InvariantCulture)));
                 continue;
             }
@@ -283,8 +302,9 @@ public static class PtxResidentComposer
                 m => labels.Contains(m.Groups[2].Value) ? "bra" + m.Groups[1].Value + " " + prefix + m.Groups[2].Value + ";" : m.Value);
             foreach (string parameter in stage.Parameters)
                 line = line.Replace("[" + parameter + "]", "[" + prefix + parameter + "]");
-            foreach (var (name, _, _) in stage.Shared)
-                line = Regex.Replace(line, @"\b" + Regex.Escape(name) + @"\b", prefix + name);
+            for (int s = 0; s < stage.Shared.Count; s++)
+                line = Regex.Replace(line, @"\b" + Regex.Escape(stage.Shared[s].Name) + @"\b",
+                    s == 0 ? OverlaidShared : prefix + stage.Shared[s].Name);
             sb.Append(line).Append('\n');
         }
         stage.Body = sb.ToString();

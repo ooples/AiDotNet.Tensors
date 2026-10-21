@@ -209,6 +209,8 @@ public sealed partial class CudaBackend
                     throw new ArgumentException("Stage " + i + ": '" + names[k] + "' holds " + stages[i].Bound[k].Size +
                         " elements; the program needs " + needed + ".");
             }
+            if (!AlignedFor(programs[i], names, stages[i].Bound))
+                throw new ArgumentException("Stage " + i + " reads with vector instructions; its buffers must be 16-byte aligned.");
         }
 
         using var _ = PushContext();

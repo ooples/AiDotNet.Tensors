@@ -22,6 +22,9 @@ public sealed class DirectPtxGemmRoutingTests
 
     public DirectPtxGemmRoutingTests(ITestOutputHelper output) => _output = output;
 
+    // These pin the #1265 route against cuBLAS and the narrow kernels. The declared GEMM slot (#890 phase 4c) sits
+    // between that route and the narrow kernels and may take a shape on its own measured verdict, so it is off here;
+    // DeclaredGemmRouteTests covers it.
     private static CudaBackend RequireAmpereBackend()
     {
         var backend = new CudaBackend();
@@ -30,6 +33,7 @@ public sealed class DirectPtxGemmRoutingTests
             backend.Dispose();
             Skip.If(true, "Needs a CUDA device of compute capability 8.0 or newer.");
         }
+        backend.DeclaredKernelsSwitch = false;
         return backend;
     }
 
@@ -151,7 +155,7 @@ public sealed class DirectPtxGemmRoutingTests
             Assert.Equal(decision.UsesDirectPtx ? CudaGemmDispatchPath.DirectPtxSgemm : untuned, backend.LastGemmDispatchPath);
 
             // A new backend (a later process) activates the verdict on the shape's first GEMM, with no explicit call.
-            using (var fresh = new CudaBackend())
+            using (var fresh = new CudaBackend { DeclaredKernelsSwitch = false })
             {
                 using var fa = fresh.AllocateBuffer(Values(m * k, 1));
                 using var fb = fresh.AllocateBuffer(Values(k * n, 2));

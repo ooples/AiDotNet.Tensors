@@ -2397,6 +2397,14 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // #1265: a shape tuned and measured faster than cuBLAS in the current math mode runs its generated kernel. A
         // measured verdict comes before the narrow kernels' shape heuristics, which otherwise took the shape first.
         if (TryRoutedGemm(A, B, C, M, N, K, alpha, beta)) return;
+        if (TryDeclaredGemm(DeclaredFamily.Gemm, A, B, C, 1, M, N, K, alpha, beta)) return;
+        GemmIncumbent(A, B, C, M, N, K, alpha, beta);
+    }
+
+    // Gemm after the declared GEMM slot: the narrow kernels, then cuBLAS. The slot's reference for this layout.
+    private void GemmIncumbent(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha, float beta)
+    {
+        using var _ = PushContext();
         if (TrySkinnyGemm(A, B, C, M, N, K, transB: false, alpha, beta)
             || TrySmallGemm(A, B, C, M, N, K, transA: false, transB: false, alpha, beta))
         {
@@ -2441,6 +2449,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             TryDirectPtxGemmTiled(
                 A, B, C, M, K, N, DirectPtxLinearWeightLayout.OutputMajor))
             return;
+        if (TryDeclaredGemm(DeclaredFamily.GemmTransposedB, A, B, C, 1, M, N, K, alpha, beta)) return;
+        MatMulTransposedIncumbent(A, B, C, M, N, K, alpha, beta);
+    }
+
+    // MatMulTransposed after the declared GEMM slot: the narrow kernels, then cuBLAS. The slot's reference for this layout.
+    private void MatMulTransposedIncumbent(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha, float beta)
+    {
         if (TrySkinnyGemm(A, B, C, M, N, K, transB: true, alpha, beta)) return;
         if (TrySmallGemm(A, B, C, M, N, K, transA: false, transB: true, alpha, beta)) return;
 
@@ -2486,6 +2501,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         ValidateGemmArgs(A, B, C, M, N, K);
+        if (TryDeclaredGemm(DeclaredFamily.GemmTransposedA, A, B, C, 1, M, N, K, alpha, beta)) return;
+        MatMulTransposedAIncumbent(A, B, C, M, N, K, alpha, beta);
+    }
+
+    // MatMulTransposedA after the declared GEMM slot: the narrow kernels, then cuBLAS. The slot's reference for this layout.
+    private void MatMulTransposedAIncumbent(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha, float beta)
+    {
         if (TrySkinnyGemmTransposedA(A, B, C, M, N, K, alpha, beta)) return;
         if (TrySmallGemm(A, B, C, M, N, K, transA: true, transB: false, alpha, beta)) return;
 
@@ -2547,7 +2569,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 A, B, C, M, K, N, DirectPtxLinearWeightLayout.InputMajor,
                 batchCount))
             return;
+        if (TryDeclaredGemm(DeclaredFamily.Gemm, A, B, C, batchCount, M, N, K, alpha, beta)) return;
+        BatchedGemmIncumbent(A, B, C, M, N, K, batchCount, alpha, beta);
+    }
 
+    // BatchedGemm after the declared GEMM slot: cuBLAS strided-batched. The slot's reference for batched products.
+    private void BatchedGemmIncumbent(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, int batchCount, float alpha, float beta)
+    {
         using var _ = PushContext();
         ApplyDeterministicGemmMathMode();
         float alphaVal = alpha;

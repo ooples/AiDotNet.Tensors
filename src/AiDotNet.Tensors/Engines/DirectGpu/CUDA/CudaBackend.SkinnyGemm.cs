@@ -143,14 +143,19 @@ public sealed partial class CudaBackend : IGemmBiasActivationBackend, IWeightBia
     /// <summary>
     /// A linear layer's forward in one kernel: <c>C = act(A[M,K] · W[K,N] + bias)</c> with act ReLU or none, the bias and
     /// activation applied in skinny_gemm's epilogue (the GEMM, a bias-add pass and an activation pass otherwise). Equal
-    /// bit for bit to the GEMM followed by BiasAdd and Relu. False -- nothing launched -- for another activation or a
-    /// shape skinny_gemm does not take.
+    /// bit for bit to the GEMM followed by BiasAdd and Relu. Where the GEMM slot serves the shape with a declared schedule, the
+    /// same schedule's fused-linear program runs instead (TryDeclaredGemmBiasActivation), which keeps that equality.
+    /// False -- nothing launched -- for another activation or a shape neither takes.
     /// </summary>
     bool IGemmBiasActivationBackend.TryGemmBiasActivation(IGpuBuffer A, IGpuBuffer W, IGpuBuffer bias, IGpuBuffer C,
         int M, int N, int K, FusedActivationType activation)
-        => (activation == FusedActivationType.None || activation == FusedActivationType.ReLU)
-            && (TrySkinnyGemm(A, W, C, M, N, K, transB: false, 1f, 0f, bias, activation == FusedActivationType.ReLU)
-                || TrySmallGemm(A, W, C, M, N, K, transA: false, transB: false, 1f, 0f, bias, activation == FusedActivationType.ReLU));
+    {
+        if (activation != FusedActivationType.None && activation != FusedActivationType.ReLU) return false;
+        bool relu = activation == FusedActivationType.ReLU;
+        if (TryDeclaredGemmBiasActivation(A, W, bias, C, M, N, K, relu) is { } declared) return declared;
+        return TrySkinnyGemm(A, W, C, M, N, K, transB: false, 1f, 0f, bias, relu)
+            || TrySmallGemm(A, W, C, M, N, K, transA: false, transB: false, 1f, 0f, bias, relu);
+    }
 
     // small_gemm_rowreduce takes at most this many output rows, columns and outputs, and at least this long a
     // reduction. A 64x64 weight gradient over 256 rows measured 13.2 us there against ~6 us on cuBLASLt: the kernel is

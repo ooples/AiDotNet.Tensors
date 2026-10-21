@@ -133,6 +133,41 @@ public static class CodegenBackendPrograms
             "fused linear backward (backend contract)");
     }
 
+    /// <summary>
+    /// <c>C[m, n] = sum_k op(A)[m, k] op(B)[k, n]</c>, row-major, in CudaBackend.Gemm's contract (alpha 1, beta 0):
+    /// op(A) is <c>A[M, K]</c>, or <c>A[K, M]</c> transposed when <paramref name="transA"/>; op(B) is <c>B[K, N]</c>, or
+    /// <c>B[N, K]</c> transposed when <paramref name="transB"/>. A <paramref name="batch"/> above 1 adds a leading
+    /// batch axis to all three tensors (CudaBackend.BatchedGemm's packed strides).
+    /// </summary>
+    public static CodegenProgram Gemm(int batch, int m, int n, int k, bool transA, bool transB)
+    {
+        if (batch <= 0 || m <= 0 || n <= 0 || k <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "GEMM extents must be positive.");
+        bool batched = batch > 1;
+        int lead = batched ? 1 : 0;
+        var axes = new List<CodegenAxis>();
+        if (batched) axes.Add(CodegenAxis.Parallel("g", batch));
+        axes.Add(CodegenAxis.Parallel("m", m));
+        axes.Add(CodegenAxis.Parallel("n", n));
+        axes.Add(CodegenAxis.Reduce("k", k));
+        int M = lead, N = lead + 1, K = lead + 2;
+
+        CodegenTensorBinding Matrix(int parameter, string name, int rows, int columns, int rowAxis, int columnAxis,
+            bool isOutput = false)
+        {
+            var shape = batched ? new[] { batch, rows, columns } : new[] { rows, columns };
+            var map = batched ? new[] { A(0), A(rowAxis), A(columnAxis) } : new[] { A(rowAxis), A(columnAxis) };
+            return new CodegenTensorBinding(parameter, name, shape, map, isOutput);
+        }
+
+        var a = transA ? Matrix(0, "a", k, m, K, M) : Matrix(0, "a", m, k, M, K);
+        var b = transB ? Matrix(1, "b", n, k, N, K) : Matrix(1, "b", k, n, K, N);
+        var c = Matrix(2, "c", m, n, M, N, isOutput: true);
+        var pass = new CodegenKernelSpec(batched ? "batched_gemm" : "gemm", new CodegenIterationSpace(axes.ToArray()),
+            new[] { a, b }, c, new[] { 0, 1 }, CodegenReduceKind.Sum);
+        return new CodegenProgram(new[] { pass }, Array.Empty<long>(), "gemm (backend contract)");
+    }
+
     private static CodegenAffineExpr A(int axis) => CodegenAffineExpr.Axis(axis);
 
     public static CodegenProgram LayerNorm(int rows, int columns, double epsilon) =>

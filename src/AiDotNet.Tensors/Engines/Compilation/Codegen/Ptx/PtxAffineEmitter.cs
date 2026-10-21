@@ -987,6 +987,13 @@ public sealed partial class PtxAffineEmitter
     public bool EnableVectorLoads { get; set; } = true;
 
     /// <summary>
+    /// Tiles a reduction that has no operand reuse four outputs wide along its contiguous output axis, so each term is
+    /// read with one vector load for four outputs (a split's combine: each output sums 8-16 partials). Off by default:
+    /// the same forcing on pure streaming kernels measured slower (see the note where the tile is chosen).
+    /// </summary>
+    public bool VectorTileReductions { get; set; }
+
+    /// <summary>
     /// True when <paramref name="axis"/> indexes the binding's unit-stride dimension
     /// directly and covers all of it -- the condition under which four consecutive
     /// values of that axis are four consecutive, in-range, aligned floats.
@@ -1155,6 +1162,14 @@ public sealed partial class PtxAffineEmitter
         // worth of the interleaved axis, and the shuffle assumes one lane per thread.
         if (Coarsening > 1 && parallel.Length > 0 && warpLaneAxis < 0)
             SelectTile(spec, axes, parallel, Coarsening, MaxTileLanes, tileAxes, tileFactors);
+        // Opt-in (see VectorTileReductions): a reduction with no reuse to tile for still reads four contiguous outputs'
+        // terms with one vector load each.
+        if (VectorTileReductions && tileAxes.Count == 0 && reduction.Length > 0 && parallel.Length > 0 &&
+            warpLaneAxis < 0 && axes[parallel[parallel.Length - 1]].Extent % VectorWidth == 0)
+        {
+            tileAxes.Add(parallel[parallel.Length - 1]);
+            tileFactors.Add(VectorWidth);
+        }
 
         // NOT COARSENED FOR STREAMING, AND THAT IS A MEASURED DECISION. SelectTile
         // minimises loads-per-MAC, so a kernel with no reduction has no reuse to find and it

@@ -17,6 +17,10 @@
 // and exact-division guards included, through the same EmitLoad every lowering uses -- and each
 // thread accumulates a register block of (TM/16) x (TN/16) outputs. Staging is synchronous, so
 // it runs on Turing and later.
+//
+// An operand whose staged-fastest role is one axis running along its unit-stride dimension (a plain
+// matrix: a GEMM's A along K or B along N) is gathered four floats at a time with ld.global.v4 --
+// the bound buffers must then be 16-byte aligned, which the backend checks before every launch.
 
 using System;
 using System.Collections.Generic;
@@ -102,6 +106,8 @@ public sealed partial class PtxAffineEmitter
         int perM = tileM / ImplicitGemmSide, perN = tileN / ImplicitGemmSide;
         bool aReductionFastest = StagesReductionFastest(spec, spec.Inputs[roles.A], roles.M, roles.R, tileM);
         bool bReductionFastest = StagesReductionFastest(spec, spec.Inputs[roles.B], roles.N, roles.R, tileN);
+        bool aVector = StagesVectors(spec, spec.Inputs[roles.A], roles.M, roles.R, aReductionFastest, tileM);
+        bool bVector = StagesVectors(spec, spec.Inputs[roles.B], roles.N, roles.R, bReductionFastest, tileN);
         int rowFloatsA = tileM + StagingPad(aReductionFastest), rowFloatsB = tileN + StagingPad(bReductionFastest);
         int bufferBytesA = ImplicitGemmChunk * rowFloatsA * sizeof(float);   // one operand's chunk
         int bufferBytesB = ImplicitGemmChunk * rowFloatsB * sizeof(float);
@@ -123,7 +129,8 @@ public sealed partial class PtxAffineEmitter
         LaunchBlockX = ImplicitGemmThreads; LaunchBlockY = 1; LaunchBlockThreads = ImplicitGemmThreads;
         LaunchBlocks = (uint)blocks;
         TileDescription = "implicit-gemm " + tileM + "x" + tileN + "x" + ImplicitGemmChunk + " double-buffered, staged " +
-            (aReductionFastest ? "r" : "m") + (bReductionFastest ? "r" : "n") + "-fastest";
+            (aReductionFastest ? "r" : "m") + (bReductionFastest ? "r" : "n") + "-fastest" +
+            (aVector || bVector ? ", v4 gathers " + (aVector ? "A" : "") + (bVector ? "B" : "") : "");
         _sb.Append(".version ").Append(PtxIsaVersionFor(computeMajor, computeMinor)).Append('\n')
            .Append(".target sm_").Append(I(computeMajor)).Append(I(computeMinor)).Append('\n')
            .Append(".address_size 64\n\n")
@@ -191,15 +198,32 @@ public sealed partial class PtxAffineEmitter
         // Everything that depends only on the thread -- its slots, its own-axis coordinates -- is
         // decomposed once here; a step decomposes only the reduction index.
         ImplicitGemmStage Plan(int input, int[] own, long ownTotal, string origin, int operandOffset, bool reductionFastest,
-            int tile, int rowFloats)
+            int tile, int rowFloats, bool vector)
         {
-            int perThread = ImplicitGemmChunk * tile / ImplicitGemmThreads;
-            var plan = new ImplicitGemmStage(input, own, reductionFastest, operandOffset, perThread);
+            // Scalar: one float per slot. Vector: four consecutive floats of the fastest role per slot, so a thread
+            // stages a quarter as many slots (tile is a multiple of 64, so the count is whole).
+            int perThread = ImplicitGemmChunk * tile / ImplicitGemmThreads / (vector ? VectorWidth : 1);
+            var plan = new ImplicitGemmStage(input, own, reductionFastest, operandOffset, perThread, vector);
             for (int e = 0; e < perThread; e++)
             {
                 string lin = NextR(), kk = NextR(), pos = NextR();
                 L($"add.u32 {lin}, {tid}, {I(e * ImplicitGemmThreads)};");
-                if (reductionFastest)
+                if (vector && reductionFastest)
+                {
+                    // Four threads cover a position's 16 reduction terms, four each: kk = 4 (t % 4), pos = t / 4 + 64 e.
+                    L($"rem.u32 {kk}, {tid}, {I(ImplicitGemmChunk / VectorWidth)};");
+                    L($"shl.b32 {kk}, {kk}, 2;");
+                    L($"div.u32 {pos}, {lin}, {I(ImplicitGemmChunk / VectorWidth)};");
+                }
+                else if (vector)
+                {
+                    // Sixteen threads cover a reduction row, four positions each: kk = t / 16, pos = 4 (t % 16) + 64 e.
+                    L($"rem.u32 {pos}, {tid}, {I(PositionLanes)};");
+                    L($"shl.b32 {pos}, {pos}, 2;");
+                    if (e > 0) L($"add.u32 {pos}, {pos}, {I(e * PositionLanes * VectorWidth)};");
+                    L($"div.u32 {kk}, {tid}, {I(PositionLanes)};");
+                }
+                else if (reductionFastest)
                 {
                     L($"rem.u32 {kk}, {lin}, {I(ImplicitGemmChunk)};");
                     L($"div.u32 {pos}, {lin}, {I(ImplicitGemmChunk)};");
@@ -217,12 +241,13 @@ public sealed partial class PtxAffineEmitter
                 string gc = g;
                 if (ownTotal % tile != 0)
                 {
-                    // Clamp so the gathered address stays inside the operand; the value is zeroed below.
+                    // Clamp so the gathered address stays inside the operand; the value is zeroed below. A vector of
+                    // positions starts on a multiple of 4 of an extent that is one, so it is wholly in or out.
                     string inG = NextP();
                     L($"setp.lt.u32 {inG}, {g}, {I(ownTotal)};");
                     plan.OwnInRange[e] = inG;
                     gc = NextR();
-                    L($"min.u32 {gc}, {g}, {I(ownTotal - 1)};");
+                    L($"min.u32 {gc}, {g}, {I(ownTotal - (vector && !reductionFastest ? VectorWidth : 1))};");
                 }
                 Decompose(own, gc);
                 var ownAxes = new string[own.Length];
@@ -236,14 +261,16 @@ public sealed partial class PtxAffineEmitter
             }
             return plan;
         }
-        var stageA = Plan(roles.A, roles.M, mTotal, m0, 0, aReductionFastest, tileM, rowFloatsA);
-        var stageB = Plan(roles.B, roles.N, nTotal, n0, bufferBytesA, bReductionFastest, tileN, rowFloatsB);
-        // Gathers one chunk starting at reduction index r0 into registers.
+        var stageA = Plan(roles.A, roles.M, mTotal, m0, 0, aReductionFastest, tileM, rowFloatsA, aVector);
+        var stageB = Plan(roles.B, roles.N, nTotal, n0, bufferBytesA, bReductionFastest, tileN, rowFloatsB, bVector);
+        // Gathers one chunk starting at reduction index r0 into registers: a slot's one float, or a vector slot's four.
         string[] Gather(ImplicitGemmStage plan, string r0)
         {
             var binding = spec.Inputs[plan.Input];
-            int perThread = plan.Slot.Length;
-            var values = new string[perThread];
+            int perThread = plan.Slot.Length, width = plan.Vector ? VectorWidth : 1;
+            var values = new string[perThread * width];
+            // A vector of reduction terms starts on a multiple of 4 of an extent that is one: wholly in or out.
+            long lastStart = rTotal - (plan.Vector && plan.ReductionFastest ? VectorWidth : 1);
             // Both staging orders give every element of a thread the same reduction index (the thread count is
             // a multiple of the chunk), so it is decomposed once.
             const bool sharedChunk = ImplicitGemmThreads % ImplicitGemmChunk == 0;
@@ -261,26 +288,36 @@ public sealed partial class PtxAffineEmitter
                         inR = NextP();
                         L($"setp.lt.u32 {inR}, {r}, {I(rTotal)};");
                         rc = NextR();
-                        L($"min.u32 {rc}, {r}, {I(rTotal - 1)};");
+                        L($"min.u32 {rc}, {r}, {I(lastStart)};");
                     }
                     Decompose(roles.R, rc);
                 }
                 for (int k = 0; k < plan.Own.Length; k++) axisReg[plan.Own[k]] = plan.OwnAxes[e][k];
-                string value = EmitLoad(binding, basePtr[binding.ParameterIndex], axisReg,
-                    Array.Empty<int>(), Array.Empty<int>(), out _);
+                string[] loaded = plan.Vector
+                    ? EmitVectorLoad(binding, basePtr[binding.ParameterIndex], axisReg, Array.Empty<int>(), Array.Empty<int>(),
+                        VectorWidth)
+                    : new[]
+                    {
+                        EmitLoad(binding, basePtr[binding.ParameterIndex], axisReg, Array.Empty<int>(), Array.Empty<int>(),
+                            out _),
+                    };
                 string? ok = plan.OwnInRange[e];
                 if (inR is not null)
                 {
                     if (ok is null) ok = inR;
                     else { string both = NextP(); L($"and.pred {both}, {ok}, {inR};"); ok = both; }
                 }
-                if (ok is not null)
+                for (int j = 0; j < width; j++)
                 {
-                    string kept = NextF();
-                    L($"selp.f32 {kept}, {value}, 0f00000000, {ok};");
-                    value = kept;
+                    string value = loaded[j];
+                    if (ok is not null)
+                    {
+                        string kept = NextF();
+                        L($"selp.f32 {kept}, {value}, 0f00000000, {ok};");
+                        value = kept;
+                    }
+                    values[e * width + j] = value;
                 }
-                values[e] = value;
             }
             return values;
         }
@@ -289,12 +326,21 @@ public sealed partial class PtxAffineEmitter
             string operandBase = NextRd();
             L($"add.u64 {operandBase}, {sharedBase}, {bufferOffset};");
             if (plan.OperandOffset != 0) L($"add.u64 {operandBase}, {operandBase}, {I(plan.OperandOffset)};");
+            int rowBytes = (plan.Input == roles.A ? rowFloatsA : rowFloatsB) * sizeof(float);
             for (int e = 0; e < plan.Slot.Length; e++)
             {
                 string slotBytes = NextRd(), at = NextRd();
                 L($"cvt.u64.u32 {slotBytes}, {plan.Slot[e]};");
                 L($"add.u64 {at}, {operandBase}, {slotBytes};");
-                L($"st.shared.f32 [{at}], {values[e]};");
+                if (!plan.Vector) L($"st.shared.f32 [{at}], {values[e]};");
+                else if (plan.ReductionFastest)
+                    // Four reduction terms of one position: one float in each of four consecutive rows.
+                    for (int j = 0; j < VectorWidth; j++)
+                        L($"st.shared.f32 [{at}+{I(j * rowBytes)}], {values[e * VectorWidth + j]};");
+                else
+                    // Four positions of one reduction row: adjacent, and 16-byte aligned (rows and starts are multiples of 4).
+                    L($"st.shared.v4.f32 [{at}], {{{values[e * VectorWidth]}, {values[e * VectorWidth + 1]}, " +
+                      $"{values[e * VectorWidth + 2]}, {values[e * VectorWidth + 3]}}};");
             }
         }
         string r0 = NextR();
@@ -454,19 +500,42 @@ public sealed partial class PtxAffineEmitter
         return Sectors(reductionFastest: true) < Sectors(reductionFastest: false);
     }
 
-    /// <summary>What one thread stages of one implicit-GEMM operand: per element, its shared slot (bytes),
-    /// its reduction offset within the chunk, its own-axis coordinates and whether they are in range.</summary>
+    /// <summary>
+    /// Whether an operand is staged four floats at a time: its staged-fastest role is a single axis that runs along the
+    /// operand's unit-stride dimension and spans it (<see cref="IsUnitStrideIn"/>), that extent and every other stride are
+    /// multiples of 4 -- so every vector starts 16-byte aligned in a 16-byte-aligned buffer and lies wholly inside or
+    /// outside the operand -- and the tile is a multiple of 64, so each thread stages whole vectors.
+    /// </summary>
+    private bool StagesVectors(CodegenKernelSpec spec, CodegenTensorBinding binding, int[] own, int[] reduction,
+        bool reductionFastest, int tile)
+    {
+        if (!EnableVectorLoads || binding.NeedsConversion || binding.ElementType != CodegenElementType.Float32 ||
+            tile % (PositionLanes * VectorWidth) != 0)
+            return false;
+        int[] fast = reductionFastest ? reduction : own;
+        if (fast.Length != 1 || !IsUnitStrideIn(binding, fast[0], spec.Space.Axes) ||
+            spec.Space.Axes[fast[0]].Extent % VectorWidth != 0)
+            return false;
+        for (int d = 0; d < binding.Map.Count - 1; d++)
+            if (binding.Stride(d) % VectorWidth != 0) return false;
+        return true;
+    }
+
+    /// <summary>What one thread stages of one implicit-GEMM operand: per slot, its shared offset (bytes), its
+    /// reduction offset within the chunk, its own-axis coordinates and whether they are in range. A vector slot holds
+    /// four consecutive floats of the staged-fastest role.</summary>
     private sealed class ImplicitGemmStage
     {
-        public ImplicitGemmStage(int input, int[] own, bool reductionFastest, int operandOffset, int count)
+        public ImplicitGemmStage(int input, int[] own, bool reductionFastest, int operandOffset, int count, bool vector)
         {
-            Input = input; Own = own; ReductionFastest = reductionFastest; OperandOffset = operandOffset;
+            Input = input; Own = own; ReductionFastest = reductionFastest; OperandOffset = operandOffset; Vector = vector;
             Slot = new string[count]; Chunk = new string[count];
             OwnAxes = new string[count][]; OwnInRange = new string?[count];
         }
         public int Input { get; }
         public int[] Own { get; }
         public bool ReductionFastest { get; }
+        public bool Vector { get; }
         public int OperandOffset { get; }
         public string[] Slot { get; }
         public string[] Chunk { get; }
