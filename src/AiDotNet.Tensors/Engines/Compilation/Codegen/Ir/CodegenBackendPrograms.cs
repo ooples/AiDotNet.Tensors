@@ -179,6 +179,26 @@ public static class CodegenBackendPrograms
         return new CodegenProgram(new[] { pass }, Array.Empty<long>(), "gemm (backend contract)");
     }
 
+    // ---- gather (#890 phase 4e), in CudaBackend.Embedding's contract -----------------------------------------------
+
+    /// <summary>
+    /// <c>out[t, e] = table[ids[t], e]</c>: ids int32 [tokens], table [vocabulary, width]. An id outside
+    /// [0, vocabulary) yields a zero row (the hand-written kernel read outside the table).
+    /// </summary>
+    public static CodegenProgram Embedding(int tokens, int vocabulary, int width)
+    {
+        if (tokens <= 0 || vocabulary <= 0 || width <= 0)
+            throw new ArgumentOutOfRangeException(nameof(tokens), "Embedding extents must be positive.");
+        var space = new CodegenIterationSpace(CodegenAxis.Parallel("t", tokens), CodegenAxis.Parallel("e", width));
+        var ids = new CodegenTensorBinding(0, "ids", new[] { tokens }, new[] { A(0) }, elementType: CodegenElementType.Int32);
+        var table = new CodegenTensorBinding(1, "table", new[] { vocabulary, width },
+            new[] { CodegenAffineExpr.Const(0), A(1) },
+            indirect: new CodegenIndirectIndex?[] { new CodegenIndirectIndex(0, A(0), vocabulary), null });
+        var output = new CodegenTensorBinding(2, "out", new[] { tokens, width }, new[] { A(0), A(1) }, isOutput: true);
+        var pass = new CodegenKernelSpec("embedding", space, new[] { ids, table }, output, new[] { 1 }, CodegenReduceKind.None);
+        return new CodegenProgram(new[] { pass }, Array.Empty<long>(), "embedding (backend contract)");
+    }
+
     // ---- attention (#890 phase 4d), in CudaBackend.ScaledDotProductAttention's contract ----------------------------
 
     /// <summary>The logit a masked key gets: its exponential underflows to exactly 0 against any unmasked logit.</summary>

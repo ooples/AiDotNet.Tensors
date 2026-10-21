@@ -92,6 +92,7 @@ internal static class KernelRouteTool
         if (only is null || only.Equals("conv", StringComparison.OrdinalIgnoreCase)) ConvRoutes(backend, failures);
         if (only is null || only.Equals("gemm", StringComparison.OrdinalIgnoreCase)) GemmSchedules(backend, failures);
         if (only is null || only.Equals("flash", StringComparison.OrdinalIgnoreCase)) FlashProbe(backend);
+        if (only is null || only.Equals("gather", StringComparison.OrdinalIgnoreCase)) GatherProbe(backend, failures);
 
         if (failures.Count != 0)
             throw new InvalidOperationException("Route failures: " + string.Join("; ", failures));
@@ -305,6 +306,100 @@ internal static class KernelRouteTool
     }
 
     // ---- linear layers (#890 phase 4c) ------------------------------------------------------------------------
+
+    // ---- gather / scatter incumbents --------------------------------------------------------------------------------
+
+    /// <summary>
+    /// Gather/scatter A/B at language-model shapes: Embedding with the declared lookup on and off (the outputs must
+    /// match bit for bit -- a gather copies), and the deterministic EmbeddingBackward and ScatterAdd with the sorted
+    /// kernels on and off (bit for bit too: the same additions in the same order). Times in us; a scanning call that
+    /// takes seconds is timed once.
+    /// </summary>
+    private static void GatherProbe(CudaBackend backend, List<string> failures)
+    {
+        Console.WriteLine();
+        Console.WriteLine("GATHER - declared/sorted vs incumbent, us (bit-identical required)");
+        bool previous = AiDotNet.Tensors.Engines.AiDotNetEngine.DeterministicMode;
+        AiDotNet.Tensors.Engines.AiDotNetEngine.SetDeterministicMode(true);
+        try
+        {
+            foreach (var (n, v, d) in new[] { (4096, 32000, 512), (4096, 1000, 512), (512, 32000, 768), (16384, 50257, 64),
+                                              (300, 7, 5), (1, 3, 4) })
+            {
+                var ids = new int[n];
+                // Repeats (the hashed ids collide) and two out-of-range ids, which every route must skip.
+                for (int i = 0; i < n; i++) ids[i] = (int)((i * 2654435761L) % v);
+                if (n > 4) { ids[1] = -1; ids[3] = v; }
+                using var bids = backend.AllocateIntBuffer(ids);
+                using var table = backend.AllocateBuffer(Fill(v * d, 61, 0));
+                using var grad = backend.AllocateBuffer(Fill(n * d, 62, 0));
+                using var outp = backend.AllocateBuffer(n * d);
+                using var gtable = backend.AllocateBuffer(v * d);
+                using var seeded = backend.AllocateBuffer(v);
+                float[] seed = Fill(v, 63, 0);
+
+                double Once(Action call)
+                {
+                    var sw = Stopwatch.StartNew();
+                    call();
+                    backend.Synchronize();
+                    return sw.Elapsed.TotalMilliseconds * 1000;
+                }
+                // The first call compiles a declared program: warm, then time (once more only, if it takes seconds).
+                double Measure(Action call) { Once(call); double once = Once(call); return once > 50_000 ? once : Time(call, backend.Synchronize); }
+
+                var fwd = new double[2]; var bwd = new double[2]; var sc = new double[2];
+                var fwdOut = new float[2][]; var bwdOut = new float[2][]; var scOut = new float[2][];
+                for (int route = 0; route < 2; route++)
+                {
+                    backend.DeclaredKernelsSwitch = route == 1;
+                    backend.SortedScatterSwitch = route == 1;
+                    try
+                    {
+                        fwd[route] = Measure(() => backend.Embedding(bids, table, outp, n, d));
+                        fwdOut[route] = backend.DownloadBuffer(outp);
+                        bwd[route] = Measure(() => backend.EmbeddingBackward(grad, bids, gtable, n, d, v));
+                        bwdOut[route] = backend.DownloadBuffer(gtable);
+                        backend.UploadBufferInPlace(seed, seeded);
+                        backend.ScatterAdd(grad, bids, seeded, n, v);
+                        backend.Synchronize();
+                        scOut[route] = backend.DownloadBuffer(seeded);
+                        sc[route] = Measure(() => backend.ScatterAdd(grad, bids, seeded, n, v));
+                    }
+                    finally
+                    {
+                        backend.DeclaredKernelsSwitch = null;
+                        backend.SortedScatterSwitch = null;
+                    }
+                }
+                string Same(float[] a, float[] b)
+                {
+                    for (int i = 0; i < a.Length; i++)
+                        if (BitConverter.SingleToInt32Bits(a[i]) != BitConverter.SingleToInt32Bits(b[i])) return "DIFF@" + i;
+                    return "same";
+                }
+                // The incumbent embedding_forward reads out-of-range ids outside the table; compare the in-range rows.
+                var inRange = new List<float>[2] { new(), new() };
+                for (int r = 0; r < 2; r++)
+                    for (int i = 0; i < n; i++)
+                        if (ids[i] >= 0 && ids[i] < v)
+                            for (int e = 0; e < d; e++) inRange[r].Add(fwdOut[r][i * d + e]);
+                string f = Same(inRange[0].ToArray(), inRange[1].ToArray()), b = Same(bwdOut[0], bwdOut[1]),
+                    s = Same(scOut[0], scOut[1]);
+                if (f != "same" || b != "same" || s != "same")
+                    failures.Add("gather " + n + "x" + v + "x" + d + ": " + f + "/" + b + "/" + s);
+                string R(double inc, double ours) => (inc.ToString("F1", CultureInfo.InvariantCulture) + " -> " +
+                    ours.ToString("F1", CultureInfo.InvariantCulture) + " = " +
+                    (inc / ours).ToString("F2", CultureInfo.InvariantCulture) + "x").PadLeft(30);
+                Console.WriteLine((n + " tok, vocab " + v + ", dim " + d).PadRight(30) + " fwd " + R(fwd[0], fwd[1]) + " " + f +
+                    "  bwd " + R(bwd[0], bwd[1]) + " " + b + "  scatter " + R(sc[0], sc[1]) + " " + s);
+            }
+        }
+        finally
+        {
+            AiDotNet.Tensors.Engines.AiDotNetEngine.SetDeterministicMode(previous);
+        }
+    }
 
     // ---- flash attention probe ------------------------------------------------------------------------------------
 

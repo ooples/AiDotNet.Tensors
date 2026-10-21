@@ -1027,7 +1027,10 @@ public sealed partial class PtxAffineEmitter
                 I(width) + ".");
 
         string offset = EmitOffset(binding, axisReg, reductionValues, reductionAxes, out string? pred);
-        if (pred != null)
+        // The vector runs along the unit-stride dimension, which the caller proved in range, so a guard can only come
+        // from a data-dependent index on another dimension (an embedding row): it is the same for all four lanes, and
+        // the whole vector is predicated on it, keeping the out-of-range fill when it fails.
+        if (pred != null && (!binding.HasIndirection || binding.NeedsConversion))
             throw new InvalidOperationException(
                 "A vectorised binding must be provably in range; " + binding.Name + " produced a guard.");
 
@@ -1065,6 +1068,11 @@ public sealed partial class PtxAffineEmitter
             string hiHigh = NextR();
             L($"shr.b32 {hiHigh}, {hi}, 16;");
             EmitWiden(binding.ElementType, hiHigh, regs[3]);
+        }
+        else if (pred != null)
+        {
+            foreach (string reg in regs) L($"mov.f32 {reg}, {_outOfRangeFill};");
+            L($"@{pred} ld.global.v4.f32 {{{regs[0]}, {regs[1]}, {regs[2]}, {regs[3]}}}, [{address}];");
         }
         else
         {

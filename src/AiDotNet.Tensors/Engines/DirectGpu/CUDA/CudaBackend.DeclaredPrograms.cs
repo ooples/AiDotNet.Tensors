@@ -42,6 +42,7 @@ internal enum DeclaredFamily
     GemmTransposedB,
     ScaledDotProductAttention,
     ScaledDotProductAttentionBackward,
+    Embedding,
 }
 
 /// <summary>One declared program: its family and shape (unused dimensions are 0).</summary>

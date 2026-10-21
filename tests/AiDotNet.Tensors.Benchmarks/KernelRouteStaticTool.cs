@@ -113,6 +113,8 @@ internal static class KernelRouteStaticTool
                 0.17), "neuralnet", new[] { "batched_transpose", "softmax_backward" },
                 pass => pass.Name is "attention_dv" or "attention_dp" or "attention_dq" or "attention_dk"
                     ? ImplicitGemm(64, 64, 0)(pass) : null),
+            new Family("Embedding 4096x32000x512", CodegenBackendPrograms.Embedding(4096, 32000, 512), "neuralnet",
+                new[] { "embedding_forward" }),
             new Family("GemmTA 16x10x4096 planner", CodegenBackendPrograms.Gemm(1, 16, 10, 4096, true, false),
                 "skinny", new[] { "small_gemm_rowreduce" }),
         };

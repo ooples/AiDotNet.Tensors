@@ -1291,6 +1291,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // Narrow row-major GEMMs (TrySkinnyGemm / TrySkinnyGemmTransposedA), tried before cuBLAS.
         _skinnyGemmModule = CompileKernelModule(device, Kernels.CudaSkinnyGemmKernels.GetSource(), "skinny_gemm_kernels",
             Kernels.CudaSkinnyGemmKernels.GetKernelNames());
+        // The deterministic scatter-add as a stable sort and an ordered segment sum (TrySortedScatterAdd).
+        _sortedScatterModule = CompileKernelModule(device, Kernels.CudaSortedScatterKernels.GetSource(),
+            "sorted_scatter_kernels", Kernels.CudaSortedScatterKernels.GetKernelNames());
         // Narrow convolutions as an implicit GEMM (TryConv2DImplicitGemm), a candidate of the forward tuned-kernel slot.
         _implicitConvModule = CompileKernelModule(device, Kernels.CudaImplicitConvKernels.GetSource(), "implicit_conv_kernels",
             Kernels.CudaImplicitConvKernels.GetKernelNames());
@@ -9484,6 +9487,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public unsafe void Embedding(IGpuBuffer indices, IGpuBuffer embeddingTable, IGpuBuffer output, int numIndices, int embeddingDim)
     {
+        if (TryDeclaredEmbedding(indices, embeddingTable, output, numIndices, embeddingDim)) return;
         if (!_kernelCache.TryGetValue("embedding_forward", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: embedding_forward");
 
@@ -9510,6 +9514,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         if (GpuDeterminism.IsActive)
         {
+            // #890 phase 4e: the same sums in the same order through a stable sort -- O(tokens) instead of
+            // O(vocabulary x tokens) (429 ms -> see TrySortedScatterAdd for a 4096-token, 32000-row embedding).
+            if (TrySortedScatterAdd(gradOutput, indices, gradEmbedding, numIndices, vocabSize, embeddingDim,
+                    accumulate: false))
+                return;
             // Issue #382: atomicAdd in embedding_backward is FP-non-deterministic
             // across runs. Route to the atomic-free deterministic variant — one
             // thread per (v, d) output cell scans numIndices in fixed order.
@@ -13064,6 +13073,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         if (GpuDeterminism.IsActive)
         {
+            // #890 phase 4e: the same fixed-order sums through a stable sort, O(sources) instead of O(dest x sources).
+            if (TrySortedScatterAdd(source, indices, destination, sourceSize, destSize, 1, accumulate: true)) return;
             if (!_kernelCache.TryGetValue("scatter_add_accumulate_deterministic", out var kernelDet))
                 throw new GpuCapabilityUnavailableException("CUDA kernel not found: scatter_add_accumulate_deterministic");
             // One thread PER DESTINATION CELL (not per source element): each thread solely owns its
@@ -13121,6 +13132,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (TryDirectPtxGather(source, indices, output, numIndices, featureSize))
             return;
 #endif
+        if (TryDeclaredEmbedding(indices, source, output, numIndices, featureSize)) return;
         if (!_kernelCache.TryGetValue("embedding_forward", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: embedding_forward");
 
@@ -18916,6 +18928,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             CudaNativeBindings.cuModuleUnload(_skinnyGemmModule);
             _skinnyGemmModule = IntPtr.Zero;
         }
+        DisposeSortedScatter();
 
         if (_implicitConvModule != IntPtr.Zero)
         {

@@ -1,0 +1,179 @@
+﻿// Copyright (c) AiDotNet. All rights reserved.
+// The deterministic scatter-add as a stable sort and an ordered segment sum (CudaSortedScatterKernels): bit-identical
+// to the scanning deterministic kernels, which cost O(destinations x sources).
+
+using System;
+using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
+
+namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
+
+public sealed partial class CudaBackend
+{
+    // AIDOTNET_SORTED_SCATTER=0: the deterministic scatters take the scanning kernels again.
+    private static readonly bool s_sortedScatter = Environment.GetEnvironmentVariable("AIDOTNET_SORTED_SCATTER") != "0";
+
+    /// <summary>Overrides AIDOTNET_SORTED_SCATTER for this backend (tooling and tests); null follows it.</summary>
+    internal bool? SortedScatterSwitch { get; set; }
+
+    /// <summary>Number of deterministic scatters served by the sorted kernels, for tests and diagnostics.</summary>
+    internal long SortedScatterLaunches => System.Threading.Interlocked.Read(ref _sortedScatterLaunches);
+    private long _sortedScatterLaunches;
+
+    private IntPtr _sortedScatterModule;
+    private readonly object _sortedScatterLock = new();
+
+    // Scratch, grown to the largest call and reused: two key/value pairs (the passes ping-pong), the per-tile digit
+    // counts and the run starts.
+    private IGpuBuffer? _sortKeysA, _sortValuesA, _sortKeysB, _sortValuesB, _sortTileCounts, _sortStarts;
+
+    /// <summary>
+    /// <c>output[d, f] = (accumulate ? output[d, f] : 0) + sum of source[i, f] over every i with indices[i] == d</c>,
+    /// summed in increasing i, for d in [0, destinations): an index outside that range contributes nowhere. The same
+    /// result, bit for bit, as embedding_backward_deterministic (accumulate false) and
+    /// scatter_add_accumulate_deterministic (accumulate true, one feature). False -- nothing launched -- when switched
+    /// off, the kernels are missing, or the scratch would have to grow inside a stream capture.
+    /// </summary>
+    internal unsafe bool TrySortedScatterAdd(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, int count,
+        int destinations, int features, bool accumulate)
+    {
+        if (!(SortedScatterSwitch ?? s_sortedScatter) || count <= 0 || destinations <= 0 || features <= 0 ||
+            destinations == int.MaxValue)
+            return false;
+        // The sort costs ~50 us of launches whatever the size; the scanning kernels cost destinations x features x count
+        // additions at ~24 a microsecond per thread, ~1.5e5 a microsecond in all once the device is full (GTX 1660 Ti).
+        // Below ~150 us of scanning they win (300 tokens into 7 rows: 29 us against 51).
+        long cells = (long)destinations * features;
+        double scanMicroseconds = (double)cells * count / Math.Min(1.5e5, 24.0 * cells);
+        if (scanMicroseconds < 150 || cells > int.MaxValue) return false;
+        if (!_kernelCache.TryGetValue("sorted_scatter_init", out var init) ||
+            !_kernelCache.TryGetValue("sorted_scatter_histogram", out var histogram) ||
+            !_kernelCache.TryGetValue("sorted_scatter_scan", out var scan) ||
+            !_kernelCache.TryGetValue("sorted_scatter_place", out var place) ||
+            !_kernelCache.TryGetValue("sorted_scatter_starts", out var startsKernel) ||
+            !_kernelCache.TryGetValue("sorted_scatter_sum", out var sumKernel))
+            return false;
+        int tiles = (count + CudaSortedScatterKernels.Tile - 1) / CudaSortedScatterKernels.Tile;
+        int countSlots = checked(tiles * CudaSortedScatterKernels.Buckets);
+        // Keys run to `destinations` (the out-of-range sentinel), so the sort covers its bit length.
+        int bits = 32 - LeadingZeros((uint)destinations);
+        int passes = (bits + 3) / 4;
+
+        lock (_sortedScatterLock)
+        {
+            if (!EnsureSortScratch(count, countSlots, destinations + 1) ||
+                _sortKeysA is not { } keysA || _sortValuesA is not { } valuesA || _sortKeysB is not { } keysB ||
+                _sortValuesB is not { } valuesB || _sortTileCounts is not { } tileCounts || _sortStarts is not { } starts)
+                return false;
+            using var _ = PushContext();
+            uint itemBlocks = (uint)tiles;
+            IntPtr idx = indices.Handle, ka = keysA.Handle, va = valuesA.Handle, kb = keysB.Handle, vb = valuesB.Handle;
+            IntPtr tc = tileCounts.Handle, st = starts.Handle, src = source.Handle, outp = output.Handle;
+            int n = count, dest = destinations, feat = features, acc = accumulate ? 1 : 0, t = tiles, slots = countSlots;
+
+            void** initArgs = stackalloc void*[5];
+            initArgs[0] = &idx; initArgs[1] = &ka; initArgs[2] = &va; initArgs[3] = &n; initArgs[4] = &dest;
+            LaunchKernel(init, itemBlocks, CudaSortedScatterKernels.Tile, initArgs);
+
+            void** histArgs = stackalloc void*[5];
+            void** scanArgs = stackalloc void*[2];
+            void** placeArgs = stackalloc void*[8];
+            for (int pass = 0; pass < passes; pass++)
+            {
+                int shift = pass * 4;
+                IntPtr keysIn = pass % 2 == 0 ? ka : kb, valuesIn = pass % 2 == 0 ? va : vb;
+                IntPtr keysOut = pass % 2 == 0 ? kb : ka, valuesOut = pass % 2 == 0 ? vb : va;
+                histArgs[0] = &keysIn; histArgs[1] = &tc; histArgs[2] = &n; histArgs[3] = &shift; histArgs[4] = &t;
+                LaunchKernel(histogram, itemBlocks, CudaSortedScatterKernels.Tile, histArgs);
+                scanArgs[0] = &tc; scanArgs[1] = &slots;
+                LaunchKernel(scan, 1, 1024, scanArgs);
+                placeArgs[0] = &keysIn; placeArgs[1] = &valuesIn; placeArgs[2] = &keysOut; placeArgs[3] = &valuesOut;
+                placeArgs[4] = &tc; placeArgs[5] = &n; placeArgs[6] = &shift; placeArgs[7] = &t;
+                LaunchKernel(place, itemBlocks, CudaSortedScatterKernels.Tile, placeArgs);
+            }
+            IntPtr sortedKeys = passes % 2 == 0 ? ka : kb, sortedValues = passes % 2 == 0 ? va : vb;
+
+            void** startArgs = stackalloc void*[4];
+            startArgs[0] = &sortedKeys; startArgs[1] = &st; startArgs[2] = &n; startArgs[3] = &dest;
+            LaunchKernel(startsKernel, (uint)((count + 1 + 255) / 256), 256, startArgs);
+
+            void** sumArgs = stackalloc void*[7];
+            sumArgs[0] = &src; sumArgs[1] = &sortedValues; sumArgs[2] = &st; sumArgs[3] = &outp; sumArgs[4] = &dest;
+            sumArgs[5] = &feat; sumArgs[6] = &acc;
+            LaunchKernel(sumKernel, checked((uint)((cells + 255) / 256)), 256, sumArgs);
+        }
+        System.Threading.Interlocked.Increment(ref _sortedScatterLaunches);
+        return true;
+    }
+
+    private static readonly string[] s_embeddingNames = { "ids", "table", "out" };
+
+    private static readonly Func<DeclaredKey, CodegenProgram> s_buildEmbedding =
+        key => CodegenBackendPrograms.Embedding(key.D0, key.D1, key.D2);
+
+    /// <summary>The key of an embedding lookup: tokens, vocabulary (the table's rows), width.</summary>
+    internal static DeclaredKey EmbeddingKey(int tokens, int vocabulary, int width) =>
+        new(DeclaredFamily.Embedding, tokens, vocabulary, width, 0, 0, 0);
+
+    /// <summary>
+    /// Embedding / Gather through the declared lookup (CodegenBackendPrograms.Embedding): one thread per output
+    /// element, so a warp reads a row contiguously where the hand-written kernel gave each thread a whole row. The
+    /// vocabulary is the table's row count. False -- nothing launched -- when the route is off or the shape declines.
+    /// </summary>
+    private bool TryDeclaredEmbedding(IGpuBuffer indices, IGpuBuffer table, IGpuBuffer output, int tokens, int width)
+    {
+        // A lookup of a few thousand elements is one launch either way, and the declared call's bookkeeping measured
+        // ~0.4 us more (300 x 5: 9.1 against 8.8 us), so it keeps the hand-written kernel.
+        if (tokens <= 0 || width <= 0 || (long)tokens * width < 16384 || table.Size < width || indices.Size < tokens)
+            return false;
+        int vocabulary = table.Size / width;
+        return TryRunDeclaredProgram(EmbeddingKey(tokens, vocabulary, width), s_buildEmbedding, s_embeddingNames,
+            new DeclaredBindings(indices, table, output));
+    }
+
+    /// <summary>The embedding lookup as a resident-program stage, in Embedding's contract.</summary>
+    internal DeclaredResidentStage EmbeddingStage(IGpuBuffer indices, IGpuBuffer table, IGpuBuffer output, int tokens, int width) =>
+        new(EmbeddingKey(tokens, table.Size / width, width), s_buildEmbedding, s_embeddingNames,
+            new DeclaredBindings(indices, table, output));
+
+    private static int LeadingZeros(uint value)
+    {
+        int zeros = 0;
+        for (uint bit = 0x80000000u; bit != 0 && (value & bit) == 0; bit >>= 1) zeros++;
+        return zeros;
+    }
+
+    // Grows the scratch to hold this call (doubling, so a growing batch reallocates rarely); false under a capture,
+    // which cannot allocate.
+    private bool EnsureSortScratch(int count, int countSlots, int startSlots)
+    {
+        bool Fits(IGpuBuffer? buffer, int size) => buffer is not null && buffer.Size >= size;
+        if (Fits(_sortKeysA, count) && Fits(_sortTileCounts, countSlots) && Fits(_sortStarts, startSlots)) return true;
+        if (IsStreamCapturing()) return false;
+        IGpuBuffer Grow(IGpuBuffer? old, int size)
+        {
+            if (Fits(old, size) && old is not null) return old;
+            old?.Dispose();
+            return AllocateIntBuffer(Math.Max(size, old is null ? size : (int)Math.Min(int.MaxValue, 2L * old.Size)));
+        }
+        _sortKeysA = Grow(_sortKeysA, count);
+        _sortValuesA = Grow(_sortValuesA, count);
+        _sortKeysB = Grow(_sortKeysB, count);
+        _sortValuesB = Grow(_sortValuesB, count);
+        _sortTileCounts = Grow(_sortTileCounts, countSlots);
+        _sortStarts = Grow(_sortStarts, startSlots);
+        return true;
+    }
+
+    private void DisposeSortedScatter()
+    {
+        foreach (var buffer in new[] { _sortKeysA, _sortValuesA, _sortKeysB, _sortValuesB, _sortTileCounts, _sortStarts })
+            buffer?.Dispose();
+        _sortKeysA = _sortValuesA = _sortKeysB = _sortValuesB = _sortTileCounts = _sortStarts = null;
+        if (_sortedScatterModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_sortedScatterModule);
+            _sortedScatterModule = IntPtr.Zero;
+        }
+    }
+}
