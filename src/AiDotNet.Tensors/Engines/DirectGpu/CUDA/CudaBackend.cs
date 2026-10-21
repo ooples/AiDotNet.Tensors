@@ -8722,6 +8722,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             uint gridGZ = (uint)batch;
             LaunchKernel2D(krnlGrid, gridGX, gridGY, gridGZ, (uint)blockSize, (uint)blockSize, argsG);
 
+            // #890 phase 4e: the input gradient through the sorted scatter, bit-identical to the scanning kernel.
+            if (TrySortedGridSampleGradInput(gradOutput, grid, gradInput, batch, channels, inHeight, inWidth, outHeight,
+                    outWidth, paddingMode, alignCorners))
+                return;
             if (!_kernelCache.TryGetValue("grid_sample_backward_grad_input_deterministic", out var krnlIn))
                 throw new GpuCapabilityUnavailableException("CUDA kernel not found: grid_sample_backward_grad_input_deterministic");
 

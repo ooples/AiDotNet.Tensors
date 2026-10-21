@@ -144,6 +144,80 @@ extern ""C"" __global__ __launch_bounds__(256) void sorted_scatter_sum(
     else output[cell] = sum;
     if (counts && f == 0) counts[d] = end - begin;
 }
+
+// grid_sample's input gradient as sorted-scatter items: output position (b, y, x) gives items 4 * position + corner
+// for its corners (00, 01, 10, 11), in grid_sample_backward_grad_input_deterministic's order. An item's key is the
+// input cell it adds to ((b * inH + h) * inW + w; batch * inH * inW when it adds nowhere), its row the channels'
+// gradOutput times the corner's y weight, its weight the x weight -- so the sorted sum's fmaf(row, weight, sum) is the
+// scanning kernel's `sum += go * wy * wx`, which NVRTC contracts the same way.
+__device__ __forceinline__ bool gs_item_point_usable(float ix, float iy)
+{
+    const float lim = 2147483520.0f;
+    return ix > -lim && ix < lim && iy > -lim && iy < lim;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void grid_sample_scatter_items(
+    const float* __restrict__ gradOutput, const float* __restrict__ grid, int* __restrict__ keys,
+    float* __restrict__ rows, float* __restrict__ weights, int batch, int channels, int inHeight, int inWidth,
+    int outHeight, int outWidth, int paddingMode, int alignCorners)
+{
+    int position = blockIdx.x * blockDim.x + threadIdx.x;
+    int positions = batch * outHeight * outWidth;
+    if (position >= positions) return;
+    int x = position % outWidth, y = (position / outWidth) % outHeight, b = position / (outWidth * outHeight);
+    float gx = grid[position * 2], gy = grid[position * 2 + 1];
+    float ix, iy;
+    if (alignCorners) {
+        ix = (gx + 1.0f) * 0.5f * (inWidth - 1);
+        iy = (gy + 1.0f) * 0.5f * (inHeight - 1);
+    } else {
+        ix = ((gx + 1.0f) * inWidth - 1.0f) * 0.5f;
+        iy = ((gy + 1.0f) * inHeight - 1.0f) * 0.5f;
+    }
+    int nowhere = batch * inHeight * inWidth;
+    bool usable = gs_item_point_usable(ix, iy);
+    int ix0 = 0, iy0 = 0, ix1 = 0, iy1 = 0;
+    float wx1 = 0.0f, wy1 = 0.0f, wx0 = 0.0f, wy0 = 0.0f;
+    if (usable) {
+        ix0 = (int)floorf(ix);
+        iy0 = (int)floorf(iy);
+        ix1 = ix0 + 1;
+        iy1 = iy0 + 1;
+        wx1 = ix - ix0;
+        wy1 = iy - iy0;
+        wx0 = 1.0f - wx1;
+        wy0 = 1.0f - wy1;
+        if (paddingMode == 1) {
+            ix0 = max(0, min(ix0, inWidth - 1));
+            ix1 = max(0, min(ix1, inWidth - 1));
+            iy0 = max(0, min(iy0, inHeight - 1));
+            iy1 = max(0, min(iy1, inHeight - 1));
+        }
+    }
+    for (int corner = 0; corner < 4; corner++) {
+        int cx = (corner & 1) ? ix1 : ix0, cy = (corner & 2) ? iy1 : iy0;
+        float wy = (corner & 2) ? wy1 : wy0, wx = (corner & 1) ? wx1 : wx0;
+        bool inside = usable && cx >= 0 && cx < inWidth && cy >= 0 && cy < inHeight;
+        int item = position * 4 + corner;
+        keys[item] = inside ? (b * inHeight + cy) * inWidth + cx : nowhere;
+        weights[item] = wx;
+        for (int c = 0; c < channels; c++)
+            rows[(long long)item * channels + c] =
+                gradOutput[((b * channels + c) * outHeight + y) * outWidth + x] * wy;
+    }
+}
+
+// gradInput[b, c, h, w] += sums[(b * inH + h) * inW + w, c]: the sorted sums back into the NCHW gradient.
+extern ""C"" __global__ __launch_bounds__(256) void grid_sample_scatter_finish(
+    const float* __restrict__ sums, float* __restrict__ gradInput, int batch, int channels, int inHeight, int inWidth)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * channels * inHeight * inWidth;
+    if (i >= total) return;
+    int w = i % inWidth, h = (i / inWidth) % inHeight, c = (i / (inWidth * inHeight)) % channels;
+    int b = i / (inWidth * inHeight * channels);
+    gradInput[i] += sums[((b * inHeight + h) * inWidth + w) * channels + c];
+}
 ";
         }
 
@@ -157,6 +231,8 @@ extern ""C"" __global__ __launch_bounds__(256) void sorted_scatter_sum(
                 "sorted_scatter_place",
                 "sorted_scatter_starts",
                 "sorted_scatter_sum",
+                "grid_sample_scatter_items",
+                "grid_sample_scatter_finish",
             };
         }
     }

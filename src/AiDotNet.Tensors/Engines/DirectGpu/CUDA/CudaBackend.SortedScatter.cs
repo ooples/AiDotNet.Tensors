@@ -141,6 +141,69 @@ public sealed partial class CudaBackend
         new(EmbeddingKey(tokens, table.Size / width, width), s_buildEmbedding, s_embeddingNames,
             new DeclaredBindings(indices, table, output));
 
+    // grid_sample's items, rows, weights and per-cell sums, grown and reused like the sort scratch.
+    private IGpuBuffer? _gridItemKeys, _gridItemRows, _gridItemWeights, _gridCellSums;
+
+    /// <summary>
+    /// grid_sample's deterministic input gradient through the sorted scatter: each output position's four corners are
+    /// items keyed by the input cell they add to, summed in the scanning kernel's order -- output position, then corner
+    /// -- with its arithmetic, so the result is bit-identical to grid_sample_backward_grad_input_deterministic, which
+    /// scanned every output position for every input cell. False -- nothing launched -- as TrySortedScatterAdd.
+    /// </summary>
+    internal unsafe bool TrySortedGridSampleGradInput(IGpuBuffer gradOutput, IGpuBuffer grid, IGpuBuffer gradInput,
+        int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth, int paddingMode, bool alignCorners)
+    {
+        if (!(SortedScatterSwitch ?? s_sortedScatter) || batch <= 0 || channels <= 0 || inHeight <= 0 || inWidth <= 0 ||
+            outHeight <= 0 || outWidth <= 0 ||
+            !_kernelCache.TryGetValue("grid_sample_scatter_items", out var itemsKernel) ||
+            !_kernelCache.TryGetValue("grid_sample_scatter_finish", out var finishKernel))
+            return false;
+        long positions = (long)batch * outHeight * outWidth, items = 4 * positions;
+        long cells = (long)batch * inHeight * inWidth;
+        if (items > int.MaxValue || items * channels > int.MaxValue || cells * channels > int.MaxValue) return false;
+        lock (_sortedScatterLock)
+        {
+            if (!EnsureGridScratch((int)items, (int)(items * channels), (int)(cells * channels)) ||
+                _gridItemKeys is not { } keys || _gridItemRows is not { } rows || _gridItemWeights is not { } weights ||
+                _gridCellSums is not { } sums)
+                return false;
+            using var _ = PushContext();
+            IntPtr go = gradOutput.Handle, gr = grid.Handle, k = keys.Handle, r = rows.Handle, wt = weights.Handle;
+            int b = batch, c = channels, ih = inHeight, iw = inWidth, oh = outHeight, ow = outWidth, pad = paddingMode;
+            int align = alignCorners ? 1 : 0;
+            void** itemArgs = stackalloc void*[13];
+            itemArgs[0] = &go; itemArgs[1] = &gr; itemArgs[2] = &k; itemArgs[3] = &r; itemArgs[4] = &wt; itemArgs[5] = &b;
+            itemArgs[6] = &c; itemArgs[7] = &ih; itemArgs[8] = &iw; itemArgs[9] = &oh; itemArgs[10] = &ow;
+            itemArgs[11] = &pad; itemArgs[12] = &align;
+            LaunchKernel(itemsKernel, (uint)((positions + 255) / 256), 256, itemArgs);
+            // The sort takes the same (re-entrant) lock; its threshold may decline a small case, which then takes the
+            // scanning kernel -- the items computed here are simply unused.
+            if (!TrySortedScatterAdd(rows, keys, sums, (int)items, (int)cells, channels, accumulate: false,
+                    weights: weights))
+                return false;
+            IntPtr s = sums.Handle, gi = gradInput.Handle;
+            void** finishArgs = stackalloc void*[6];
+            finishArgs[0] = &s; finishArgs[1] = &gi; finishArgs[2] = &b; finishArgs[3] = &c; finishArgs[4] = &ih;
+            finishArgs[5] = &iw;
+            LaunchKernel(finishKernel, (uint)((cells * channels + 255) / 256), 256, finishArgs);
+        }
+        return true;
+    }
+
+    private bool EnsureGridScratch(int items, int rowFloats, int cellFloats)
+    {
+        bool Fits(IGpuBuffer? buffer, int size) => buffer is not null && buffer.Size >= size;
+        if (Fits(_gridItemKeys, items) && Fits(_gridItemRows, rowFloats) && Fits(_gridItemWeights, items) &&
+            Fits(_gridCellSums, cellFloats))
+            return true;
+        if (IsStreamCapturing()) return false;
+        if (!Fits(_gridItemKeys, items)) { _gridItemKeys?.Dispose(); _gridItemKeys = AllocateIntBuffer(items); }
+        if (!Fits(_gridItemRows, rowFloats)) { _gridItemRows?.Dispose(); _gridItemRows = AllocateBuffer(rowFloats); }
+        if (!Fits(_gridItemWeights, items)) { _gridItemWeights?.Dispose(); _gridItemWeights = AllocateBuffer(items); }
+        if (!Fits(_gridCellSums, cellFloats)) { _gridCellSums?.Dispose(); _gridCellSums = AllocateBuffer(cellFloats); }
+        return true;
+    }
+
     private static int LeadingZeros(uint value)
     {
         int zeros = 0;
@@ -172,8 +235,10 @@ public sealed partial class CudaBackend
 
     private void DisposeSortedScatter()
     {
-        foreach (var buffer in new[] { _sortKeysA, _sortValuesA, _sortKeysB, _sortValuesB, _sortTileCounts, _sortStarts })
+        foreach (var buffer in new[] { _sortKeysA, _sortValuesA, _sortKeysB, _sortValuesB, _sortTileCounts, _sortStarts,
+                     _gridItemKeys, _gridItemRows, _gridItemWeights, _gridCellSums })
             buffer?.Dispose();
+        _gridItemKeys = _gridItemRows = _gridItemWeights = _gridCellSums = null;
         _sortKeysA = _sortValuesA = _sortKeysB = _sortValuesB = _sortTileCounts = _sortStarts = null;
         if (_sortedScatterModule != IntPtr.Zero)
         {

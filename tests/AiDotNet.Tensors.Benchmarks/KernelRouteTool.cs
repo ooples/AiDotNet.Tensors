@@ -394,6 +394,37 @@ internal static class KernelRouteTool
                 Console.WriteLine((n + " tok, vocab " + v + ", dim " + d).PadRight(30) + " fwd " + R(fwd[0], fwd[1]) + " " + f +
                     "  bwd " + R(bwd[0], bwd[1]) + " " + b + "  scatter " + R(sc[0], sc[1]) + " " + s);
             }
+            // grid_sample's input gradient (a spatial transformer): every output position scatters to four input cells.
+            foreach (var (b, ch, size) in new[] { (8, 32, 64), (4, 16, 28) })
+            {
+                var grid = new float[b * size * size * 2];
+                for (int i = 0; i < grid.Length; i++) grid[i] = (float)(((i * 7919L) % 1000) / 1000.0 * 2.2 - 1.1);
+                using var go = backend.AllocateBuffer(Fill(b * ch * size * size, 67, 0));
+                using var inp = backend.AllocateBuffer(Fill(b * ch * size * size, 68, 0));
+                using var bgrid = backend.AllocateBuffer(grid);
+                using var gi = backend.AllocateBuffer(b * ch * size * size);
+                using var gg = backend.AllocateBuffer(grid.Length);
+                var times = new double[2];
+                for (int route = 0; route < 2; route++)
+                {
+                    backend.SortedScatterSwitch = route == 1;
+                    try
+                    {
+                        void Call() => backend.GridSampleBackward(go, inp, bgrid, gi, gg, b, ch, size, size, size, size, 0, false);
+                        Call(); backend.Synchronize();
+                        var sw = Stopwatch.StartNew(); Call(); backend.Synchronize();
+                        double once = sw.Elapsed.TotalMilliseconds * 1000;
+                        times[route] = once > 50_000 ? once : Time(Call, backend.Synchronize);
+                    }
+                    finally
+                    {
+                        backend.SortedScatterSwitch = null;
+                    }
+                }
+                Console.WriteLine(("grid_sample bwd " + b + "x" + ch + "x" + size + "x" + size).PadRight(30) + " " +
+                    times[0].ToString("F1", CultureInfo.InvariantCulture) + " -> " + times[1].ToString("F1", CultureInfo.InvariantCulture) +
+                    " = " + (times[0] / times[1]).ToString("F2", CultureInfo.InvariantCulture) + "x");
+            }
             // Graph message passing: a weighted edge scatter and a scatter-mean over the same targets.
             foreach (var (edges, nodes, features) in new[] { (200000, 20000, 64), (20000, 3000, 32), (500, 100, 16) })
             {

@@ -208,6 +208,57 @@ public class DeclaredGatherRouteTests
     }
 
     /// <summary>
+    /// grid_sample's deterministic input gradient through the sorted scatter is bit-identical to the scanning kernel,
+    /// with zero and border padding, both corner alignments, and a grid that samples outside the image.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(2, 3, 40, 48, 36, 44, 0, false)]
+    [InlineData(2, 3, 40, 48, 36, 44, 1, true)]
+    [InlineData(1, 8, 32, 32, 40, 40, 1, false)]
+    public void TheSortedGridSampleGradientIsBitIdenticalToTheScanningKernel(int batch, int channels, int inHeight,
+        int inWidth, int outHeight, int outWidth, int paddingMode, bool alignCorners)
+    {
+        using var backend = OpenBackendOrSkip();
+        bool previous = AiDotNetEngine.DeterministicMode;
+        AiDotNetEngine.SetDeterministicMode(true);
+        try
+        {
+            var grid = new float[batch * outHeight * outWidth * 2];
+            // Coordinates in [-1.2, 1.2): some samples fall outside the image.
+            for (int i = 0; i < grid.Length; i++) grid[i] = (float)(((i * 7919L) % 1000) / 1000.0 * 2.4 - 1.2);
+            float[] gradOut = Fill(batch * channels * outHeight * outWidth, 11), input = Fill(batch * channels * inHeight * inWidth, 12);
+            var results = new float[2][];
+            foreach (bool sorted in new[] { false, true })
+            {
+                backend.SortedScatterSwitch = sorted;
+                try
+                {
+                    using var bgo = backend.AllocateBuffer(gradOut);
+                    using var binput = backend.AllocateBuffer(input);
+                    using var bgrid = backend.AllocateBuffer(grid);
+                    using var bgi = backend.AllocateBuffer(Fill(input.Length, 13));
+                    using var bgg = backend.AllocateBuffer(grid.Length);
+                    long before = backend.SortedScatterLaunches;
+                    backend.GridSampleBackward(bgo, binput, bgrid, bgi, bgg, batch, channels, inHeight, inWidth, outHeight,
+                        outWidth, paddingMode, alignCorners);
+                    backend.Synchronize();
+                    Assert.Equal(sorted ? before + 1 : before, backend.SortedScatterLaunches);
+                    results[sorted ? 1 : 0] = backend.DownloadBuffer(bgi);
+                }
+                finally
+                {
+                    backend.SortedScatterSwitch = null;
+                }
+            }
+            AssertBitIdentical(results[0], results[1], "grid sample input gradient");
+        }
+        finally
+        {
+            AiDotNetEngine.SetDeterministicMode(previous);
+        }
+    }
+
+    /// <summary>
     /// The sorted scatter captures into a graph once its scratch exists, and a replay is bit-identical to the eager
     /// call; first met inside a capture (no scratch yet), it leaves the call to the scanning kernel.
     /// </summary>
