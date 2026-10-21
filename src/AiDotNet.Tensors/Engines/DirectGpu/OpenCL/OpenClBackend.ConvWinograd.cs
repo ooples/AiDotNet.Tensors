@@ -13,6 +13,42 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         private bool WinogradKernelsReady => HasTunedKernel(WinogradF23KernelTemplate.Filter);
 
+        // 0 not yet asked, 1 ready, 2 declined.
+        private int _fusedFilterGradientReady;
+
+        /// <summary>
+        /// Whether the fused weight gradient can run here. Its own module has to have built, and both accumulation
+        /// kernels have to accept the 256-wide group the launch always asks for: OpenCL reports
+        /// CL_KERNEL_WORK_GROUP_SIZE per kernel, and a kernel below 256 would fail the launch with
+        /// CL_INVALID_WORK_GROUP_SIZE rather than fall through to the direct route.
+        /// </summary>
+        private bool FusedFilterGradientReady
+        {
+            get
+            {
+                int cached = System.Threading.Volatile.Read(ref _fusedFilterGradientReady);
+                if (cached != 0) return cached == 1;
+                bool ready = FusedGroupFits(WinogradF23KernelTemplate.FusedFilterGradient)
+                    && FusedGroupFits(WinogradF23KernelTemplate.FusedFilterGradientDirect)
+                    && HasTunedKernel(WinogradF23KernelTemplate.FusedFilterGradientFinish);
+                if (!ready)
+                    System.Diagnostics.Trace.TraceWarning(
+                        "OpenCL fused Winograd weight gradient unavailable: a kernel is missing or cannot run "
+                        + $"{WinogradF23KernelTemplate.FusedGroupSize} work-items.");
+                System.Threading.Volatile.Write(ref _fusedFilterGradientReady, ready ? 1 : 2);
+                return ready;
+            }
+        }
+
+        // A zero means the driver did not report a per-kernel limit; the device limit is then all there is to go on,
+        // as in ClampLocalSizeForKernel.
+        private bool FusedGroupFits(string name)
+        {
+            if (!HasTunedKernel(name)) return false;
+            int limit = KernelWorkGroupSize(name);
+            return limit == 0 || limit >= WinogradF23KernelTemplate.FusedGroupSize;
+        }
+
         internal TunedKernelSlot<TunedConv2DBackwardArgs> Conv2DBackwardDataSlot
         {
             get
@@ -50,7 +86,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                                 true, shape => WinogradF23Pipeline.AdmitsShape(shape) && WinogradKernelsReady,
                                 (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardFilterWinograd(a)) LaunchDwDirect(a); }),
                             new DelegateTunedKernelCandidate<TunedConv2DBackwardArgs>("opencl.conv2d_dw.winograd_fused", TunedKernelOrigin.Builtin,
-                                true, shape => WinogradF23Pipeline.AdmitsShape(shape) && WinogradKernelsReady,
+                                true, shape => WinogradF23Pipeline.AdmitsShape(shape) && FusedFilterGradientReady,
                                 (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardFilterWinogradFused(a)) LaunchDwDirect(a); }),
                         });
                     return _conv2DBackwardFilterSlot;
@@ -228,7 +264,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         // The fused weight gradient: one launch of 256-wide groups (plus the finish when the tiles split).
         internal bool TryConv2DBackwardFilterWinogradFused(in TunedConv2DBackwardArgs a, int splits = 0)
-            => WinogradKernelsReady && WinogradF23Pipeline.TryBackwardFilterFused(this, this, a, splits);
+            => FusedFilterGradientReady && WinogradF23Pipeline.TryBackwardFilterFused(this, this, a, splits);
 
         int IWinogradFusedFilterGradient.FusedFilterGradientGroupTarget => ComputeUnits;
 

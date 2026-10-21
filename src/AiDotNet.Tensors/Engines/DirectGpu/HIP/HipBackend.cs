@@ -1018,6 +1018,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
         if (hipResult != HipError.Success)
         {
+            // HIP writes the handle only on success; clear it anyway so a failed load never leaves a value here that
+            // Dispose would go on to unload.
+            module = IntPtr.Zero;
             return RecordKernelCompilationFailure(new HipKernelCompilationException(
                 moduleName,
                 HipKernelCompilationStage.ModuleLoad,
@@ -1027,6 +1030,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
         // Load all kernel functions
         int loadedKernelCount = 0;
+        var resolved = new List<(string Name, IntPtr Function)>(kernelNames.Length);
         HipError lastLookupError = HipError.Success;
         foreach (var kernelName in kernelNames)
         {
@@ -1036,6 +1040,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             {
                 loadedKernelCount++;
                 _kernelCache[kernelName] = func;
+                resolved.Add((kernelName, func));
                 // Lets the native-launch choke point journal this kernel BY NAME (Issue #996).
                 // INSIDE the guard: registering on a failed lookup would map IntPtr.Zero to this
                 // name and misattribute a later fault to a kernel that never resolved.
@@ -1049,6 +1054,23 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
         if (loadedKernelCount != kernelNames.Length)
         {
+            // A module whose lookups did not all resolve is not usable, and leaving the ones that did in
+            // _kernelCache would hand out functions from a module that never finished initialising - a caller
+            // gating on HasTunedKernel(oneName) would then launch into it. Undo the partial load: unregister the
+            // diagnostics names, drop the cache entries this call added, and unload the module instead of leaving
+            // it resident until Dispose.
+            foreach (var (name, function) in resolved)
+            {
+                GpuKernelDiagnostics.UnregisterKernelName(function);
+                if (_kernelCache.TryGetValue(name, out var cached) && cached == function) _kernelCache.Remove(name);
+            }
+            if (module != IntPtr.Zero)
+            {
+                var unload = HipNativeBindings.hipModuleUnload(module);
+                if (unload != HipError.Success)
+                    System.Diagnostics.Debug.WriteLine($"HIP module {moduleName}: hipModuleUnload after a partial load returned {unload}.");
+                module = IntPtr.Zero;
+            }
             return RecordKernelCompilationFailure(new HipKernelCompilationException(
                 moduleName,
                 HipKernelCompilationStage.FunctionLookup,
@@ -11554,12 +11576,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         }
 
         // Unload all additional kernel modules
-        foreach (var modField in new[] { _dotProductModule, _reductionModule2, _broadcastModule, _gatedModule, _shapeModule, _lossModule, _softmaxVarModule, _tunedRowModule, _winogradModule, _fusedLinearModule, _fusedAdvancedModule, _iouModule, _complexModule, _residentProgramModule })
+        foreach (var modField in new[] { _dotProductModule, _reductionModule2, _broadcastModule, _gatedModule, _shapeModule, _lossModule, _softmaxVarModule, _tunedRowModule, _winogradModule, _winogradFusedModule, _fusedLinearModule, _fusedAdvancedModule, _iouModule, _complexModule, _residentProgramModule })
         {
             if (modField != IntPtr.Zero)
                 HipNativeBindings.hipModuleUnload(modField);
         }
-        _dotProductModule = _reductionModule2 = _broadcastModule = _gatedModule = _shapeModule = _lossModule = _softmaxVarModule = _tunedRowModule = _winogradModule = _fusedLinearModule = _fusedAdvancedModule = _iouModule = _complexModule = _residentProgramModule = IntPtr.Zero;
+        _dotProductModule = _reductionModule2 = _broadcastModule = _gatedModule = _shapeModule = _lossModule = _softmaxVarModule = _tunedRowModule = _winogradModule = _winogradFusedModule = _fusedLinearModule = _fusedAdvancedModule = _iouModule = _complexModule = _residentProgramModule = IntPtr.Zero;
 
         // Settle first (ruling the load out if it never ran, or waiting out one in flight), so no handle appears after this.
         SettleHipBlas(load: false);
