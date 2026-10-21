@@ -5152,6 +5152,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     internal FirstWriteRedirectTable? FirstWriteRedirects { get; set; }
 
+    /// <summary>
+    /// The compiled plan's deferred gradient contributions while its GPU step body runs (see
+    /// <see cref="Autodiff.GradientDeferral"/>); null outside it, where every contribution is added as it arrives.
+    /// </summary>
+    internal Autodiff.GradientDeferral? DeferredGradients { get; set; }
+
     /// <summary>Offers <paramref name="contribution"/>'s pooled slot for redirection into <paramref name="accumulator"/>,
     /// which it just first-wrote by copy (see <see cref="FirstWriteRedirectTable"/>).</summary>
     internal void RecordFirstWriteRedirect(IGpuBuffer contribution, IGpuBuffer accumulator, int length)
@@ -16076,16 +16082,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// BatchNormBackward.
     /// </summary>
     internal Tensor<T>? TryBatchNormReluBackward<T>(Tensor<T> gradOutput, Tensor<T> reluOutput, Tensor<T> input,
-        Tensor<T> gamma, Tensor<T> mean, Tensor<T> variance, double epsilon, out Tensor<T>? gradGamma, out Tensor<T>? gradBeta)
+        Tensor<T> gamma, Tensor<T> mean, Tensor<T> variance, double epsilon, out Tensor<T>? gradGamma, out Tensor<T>? gradBeta,
+        Tensor<T>? beta = null, Tensor<T>? gradOutput2 = null)
         => TryBatchNormReluBackward(gradOutput, reluOutput, input, gamma, mean, variance, epsilon, false,
-            out gradGamma, out gradBeta, out _);
+            out gradGamma, out gradBeta, out _, beta, gradOutput2);
 
     /// <summary>As <see cref="TryBatchNormReluBackward{T}(Tensor{T}, Tensor{T}, Tensor{T}, Tensor{T}, Tensor{T}, Tensor{T}, double, out Tensor{T}?, out Tensor{T}?)"/>;
     /// with <paramref name="withResidual"/> the forward added a residual before the ReLU, and
     /// <paramref name="gradResidual"/> receives its gradient (the masked output gradient).</summary>
     internal Tensor<T>? TryBatchNormReluBackward<T>(Tensor<T> gradOutput, Tensor<T> reluOutput, Tensor<T> input,
         Tensor<T> gamma, Tensor<T> mean, Tensor<T> variance, double epsilon, bool withResidual,
-        out Tensor<T>? gradGamma, out Tensor<T>? gradBeta, out Tensor<T>? gradResidual)
+        out Tensor<T>? gradGamma, out Tensor<T>? gradBeta, out Tensor<T>? gradResidual, Tensor<T>? beta = null,
+        Tensor<T>? gradOutput2 = null)
     {
         gradGamma = null;
         gradBeta = null;
@@ -16100,13 +16108,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var bufGamma = GetOrAllocateBuffer(backend, gamma);
         using var bufMean = GetOrAllocateBuffer(backend, mean);
         using var bufVar = GetOrAllocateBuffer(backend, variance);
+        // beta lets the backend rebuild the ReLU mask from the input rather than read the ReLU output (no residual only).
+        using var bufBeta = beta is not null && !withResidual ? GetOrAllocateBuffer(backend, beta) : default;
+        if (gradOutput2 is not null && (gradOutput2.Length != input.Length || !gradOutput2.IsContiguous)) return null;
+        using var bufDy2 = gradOutput2 is not null ? GetOrAllocateBuffer(backend, gradOutput2) : default;
         var bufDx = AllocateFullyWrittenOutputBuffer(backend, input.Length);
         var bufDg = AllocateFullyWrittenOutputBuffer(backend, channels);
         var bufDb = AllocateFullyWrittenOutputBuffer(backend, channels);
         var bufDr = withResidual ? AllocateFullyWrittenOutputBuffer(backend, input.Length) : default;
         if (!varianceBackend.TryBatchNormBackwardFromVariance(bufDy.Buffer, bufIn.Buffer, bufGamma.Buffer, bufMean.Buffer,
                 bufVar.Buffer, bufDx.Buffer, bufDg.Buffer, bufDb.Buffer, batch, channels, spatial, (float)epsilon,
-                reluOutput: bufOut.Buffer, gradResidual: withResidual ? bufDr.Buffer : null))
+                reluOutput: bufOut.Buffer, gradResidual: withResidual ? bufDr.Buffer : null,
+                beta: beta is not null && !withResidual ? bufBeta.Buffer : null,
+                gradOutput2: gradOutput2 is not null ? bufDy2.Buffer : null))
         {
             bufDx.Dispose(); bufDg.Dispose(); bufDb.Dispose();
             if (withResidual) bufDr.Dispose();

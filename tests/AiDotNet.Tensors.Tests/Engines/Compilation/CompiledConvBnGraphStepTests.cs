@@ -106,6 +106,126 @@ public class CompiledConvBnGraphStepTests : IDisposable
         }
     }
 
+    // Two residual blocks: the first block's fused BatchNorm+add+ReLU output is read by the second block's convolution
+    // and its residual add, so its gradient has two contributions.
+    private static (double[] Losses, float[][] Weights) TrainTwoBlocks(IEngine engine)
+    {
+        AiDotNetEngine.Current = engine;
+        var x = Rand([Batch, Channels, Size, Size], 1, 1f);
+        var y = Rand([Batch, Channels], 2, 1f);
+        float wScale = 1f / MathF.Sqrt(Channels * 9);
+        var ps = new System.Collections.Generic.List<Tensor<float>>();
+        for (int i = 0; i < 4; i++) { ps.Add(Rand([Channels, Channels, 3, 3], 3 + i, wScale)); ps.Add(Fill([Channels], 1f)); ps.Add(new Tensor<float>([Channels])); }
+        var parameters = ps.ToArray();
+        foreach (var p in parameters) p.Gpu();
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.EnableTraining(parameters))
+        {
+            var h = x;
+            for (int blk = 0; blk < 2; blk++)
+            {
+                var w1 = parameters[6 * blk]; var g1 = parameters[6 * blk + 1]; var b1 = parameters[6 * blk + 2];
+                var w2 = parameters[6 * blk + 3]; var g2 = parameters[6 * blk + 4]; var b2 = parameters[6 * blk + 5];
+                var t = engine.FusedConv2D(h, w1, null, 1, 1, 1, 1, 1, 1, FusedActivationType.None);
+                t = engine.ReLU(engine.BatchNorm(t, g1, b1, 1e-5, out _, out _));
+                t = engine.FusedConv2D(t, w2, null, 1, 1, 1, 1, 1, 1, FusedActivationType.None);
+                h = engine.ReLU(engine.TensorAdd(engine.BatchNorm(t, g2, b2, 1e-5, out _, out _), h));
+            }
+            engine.TensorMSELoss(engine.ReduceMean(h, new[] { 2, 3 }, keepDims: false), y);
+            plan = scope.CompileTraining(parameters);
+        }
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.05f);
+            var losses = new double[Steps];
+            for (int s = 0; s < Steps; s++)
+            {
+                Rand(x.Shape.ToArray(), 100 + s, 1f).AsSpan().CopyTo(x.AsWritableSpan());
+                Rand(y.Shape.ToArray(), 200 + s, 1f).AsSpan().CopyTo(y.AsWritableSpan());
+                losses[s] = plan.Step().ToArray()[0];
+            }
+            return (losses, parameters.Select(p => p.ToArray()).ToArray());
+        }
+    }
+
+    /// <summary>
+    /// A residual block's input gradient has two contributions; the plan parks the second (GradientDeferral) and the
+    /// fused BatchNorm+ReLU backward sums it as it loads, instead of an add pass: training is bit for bit the same.
+    /// </summary>
+    [SkippableFact]
+    public void Deferring_the_second_gradient_contribution_trains_bit_for_bit_like_adding_it()
+    {
+        DirectGpuTensorEngine? gpu = null;
+        try
+        {
+            var candidate = new DirectGpuTensorEngine();
+            if (candidate.IsGpuAvailable) gpu = candidate; else candidate.Dispose();
+        }
+        catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
+        Skip.If(gpu is null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            Skip.IfNot(gpu!.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend, "The dual-gradient kernel is CUDA-only.");
+            bool prior = AiDotNet.Tensors.Engines.Autodiff.GradientDeferral.Enabled;
+            try
+            {
+                AiDotNet.Tensors.Engines.Autodiff.GradientDeferral.Enabled = false;
+                var added = TrainTwoBlocks(gpu);
+                AiDotNet.Tensors.Engines.Autodiff.GradientDeferral.Enabled = true;
+                long before = System.Threading.Interlocked.Read(ref AiDotNet.Tensors.Engines.Autodiff.GradientDeferral.ParkedCount);
+                var deferred = TrainTwoBlocks(gpu);
+                long parked = System.Threading.Interlocked.Read(ref AiDotNet.Tensors.Engines.Autodiff.GradientDeferral.ParkedCount) - before;
+                Assert.True(parked > 0, "no gradient contribution was deferred");
+                Assert.Equal(added.Losses, deferred.Losses);
+                for (int p = 0; p < added.Weights.Length; p++) Assert.Equal(added.Weights[p], deferred.Weights[p]);
+            }
+            finally
+            {
+                AiDotNet.Tensors.Engines.Autodiff.GradientDeferral.Enabled = prior;
+            }
+        }
+    }
+
+    /// <summary>
+    /// The fused BatchNorm+ReLU backward rebuilds the ReLU mask from the input (batchnorm_bwd_relumask) instead of reading
+    /// the ReLU output: training must be bit for bit the same as reading it, with the rebuilt mask actually used.
+    /// </summary>
+    [SkippableFact]
+    public void Rebuilding_the_relu_mask_from_the_input_trains_bit_for_bit_like_reading_it()
+    {
+        DirectGpuTensorEngine? gpu = null;
+        try
+        {
+            var candidate = new DirectGpuTensorEngine();
+            if (candidate.IsGpuAvailable) gpu = candidate; else candidate.Dispose();
+        }
+        catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
+        Skip.If(gpu is null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            Skip.IfNot(gpu!.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend, "The mask kernel is CUDA-only.");
+            bool prior = AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.s_batchNormMaskFromInput;
+            try
+            {
+                AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.s_batchNormMaskFromInput = false;
+                var read = Train(gpu, onDevice: true);
+                AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.s_batchNormMaskFromInput = true;
+                long before = System.Threading.Interlocked.Read(
+                    ref AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.BatchNormMaskFromInputLaunches);
+                var rebuilt = Train(gpu, onDevice: true);
+                long launches = System.Threading.Interlocked.Read(
+                    ref AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.BatchNormMaskFromInputLaunches) - before;
+                Assert.True(launches > 0, "the fused BatchNorm+ReLU backward never rebuilt the mask from the input");
+                Assert.Equal(read.Losses, rebuilt.Losses);
+                for (int p = 0; p < read.FinalWeights.Length; p++) Assert.Equal(read.FinalWeights[p], rebuilt.FinalWeights[p]);
+            }
+            finally
+            {
+                AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.s_batchNormMaskFromInput = prior;
+            }
+        }
+    }
+
     [SkippableFact]
     public void A_captured_conv_batchnorm_step_trains_like_the_cpu_plan_without_dead_fills_or_copies()
     {

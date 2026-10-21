@@ -136,6 +136,10 @@ internal static class BatchNormFusionMatch
         for (int s = 0; s < statistics.Count; s++)
             statisticOutputs[s] = (statistics[s].Output, statistics[s].OpName == "BatchNormBatchMean" ? mean : variance);
         var inputs = residual is null ? new[] { x, gamma, beta } : new[] { x, gamma, beta, residual };
+        // Whether the last forward ran the register-resident kernel: only then may the backward rebuild the ReLU mask
+        // from x (BackwardFunctions.MaskFromInput), since the composed fallback rounds the normalized value its own way.
+        // A one-element bool[] rather than a box: SavedStateSerializer writes bool[] (training-plan save).
+        var forwardUsedKernel = new bool[1];
         return new LazyNode<float>(LazyNodeType.Custom, opName, inputs, output,
             (eng, result) =>
             {
@@ -143,6 +147,7 @@ internal static class BatchNormFusionMatch
                 Tensor<float>? kernelOutput = null, kernelMean = null, kernelVar = null;
                 if (eng is DirectGpuTensorEngine gpu)
                     kernelOutput = gpu.TryBatchNormReluForward(x, gamma, beta, epsilon, out kernelMean, out kernelVar, residual);
+                forwardUsedKernel[0] = kernelOutput is not null && kernelMean is not null && kernelVar is not null;
                 if (kernelOutput is not null && kernelMean is not null && kernelVar is not null)
                 {
                     fusedOutput = kernelOutput;
@@ -176,7 +181,7 @@ internal static class BatchNormFusionMatch
                     Helpers.TensorAllocator.Return(freshVar);
                 }
             },
-            backward, new object[] { mean, variance, epsilon })
+            backward, new object[] { mean, variance, epsilon, forwardUsedKernel })
         {
             RecordingEngine = bn.RecordingEngine,
         };

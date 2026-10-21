@@ -196,6 +196,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// <see cref="Engines.DirectGpuTensorEngine.FirstWriteRedirects"/>). Dropped by the eager step.</summary>
     private readonly Engines.FirstWriteRedirectTable _firstWriteRedirects = new();
 
+    // The gradients whose second contribution the GPU step body parks for the consuming fused BatchNorm+ReLU backward
+    // (Autodiff.GradientDeferral), or null when the plan has none.
+    private Autodiff.GradientDeferral? _gradientDeferral;
+
     /// <summary>Host-engine eager step: per gradient buffer, true when every writer is a generic backward step, so
     /// the buffer is not zeroed and its first contribution of the step is copied in (GradWriteGeneration). Null when
     /// the backward is all-specialized, pooled, or has no such buffer. Entries are cleared by
@@ -3874,9 +3878,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         bool completed = false;
         _firstWriteRedirects.BeginRun();
         if (redirectEngine is not null) redirectEngine.FirstWriteRedirects = _firstWriteRedirects;
+        _gradientDeferral?.Reset();
+        if (redirectEngine is not null) redirectEngine.DeferredGradients = _gradientDeferral;
         try { RunGpuStepBodyForCaptureCore(backend); completed = true; }
         finally
         {
+            if (redirectEngine is not null) redirectEngine.DeferredGradients = null;
             if (redirectEngine is not null) redirectEngine.FirstWriteRedirects = null;
             // Only a whole executed run is evidence; a capture records, and a body that threw left its pairing unknown.
             _firstWriteRedirects.EndRun(executed && completed);
@@ -9176,6 +9183,14 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             plan._aliasedGradViews = aliasedGradViews?.ToArray();
             plan._eagerFirstWriteCandidates = eagerFirstWriteCandidates;
             plan._backwardStepKinds = backwardStepNames.ToArray();
+            // A fused BatchNorm+ReLU output read by exactly two steps (a residual block's input: the next block's first
+            // convolution and its shortcut): its backward sums both contributions as it loads them.
+            var deferrable = new List<object>();
+            foreach (var fs in forwardSteps)
+                if ((fs.OpName == "BatchNormReLU" || fs.OpName == "BatchNormAddReLU")
+                    && consumerCount.TryGetValue(fs.OutputBuffer, out int outputUses) && outputUses == 2)
+                    deferrable.Add(fs.OutputBuffer);
+            if (deferrable.Count > 0 && engine is DirectGpuTensorEngine) plan._gradientDeferral = new Autodiff.GradientDeferral(deferrable);
             scope.ReleaseStorageLeases();
             return plan;
         }
