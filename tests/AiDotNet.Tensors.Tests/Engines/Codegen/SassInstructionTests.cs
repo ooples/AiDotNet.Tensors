@@ -205,4 +205,69 @@ public class SassInstructionTests
         Assert.Null(SassScheduler.RecomputeControl(unknown));
         Assert.Contains("unknown opcode", SassScheduler.LastDecline);
     }
+
+    // Instructions from ptxas's sm_75 register-blocked GEMM (PtxSgemmGenerator b128x128x8-t8x8-v1-p4-db), with their
+    // nvdisasm text.
+    private static readonly SassInstruction IaddCarryOut = new(0x0000002010107810UL, 0x000fe20007fde0ffUL);   // IADD3 R16, P6, R16, 0x20, RZ
+    private static readonly SassInstruction ImadCarryIn = new(0x000000ffff117224UL, 0x000fe200030e0611UL);    // IMAD.X R17, RZ, RZ, R17, P6
+    private static readonly SassInstruction IaddUniform = new(0x00000007440f7c10UL, 0x000fc6000fffe0ffUL);    // IADD3 R15, R68, UR7, RZ
+    private static readonly SassInstruction BarSync = new(0x0000000000007b1dUL, 0x000fea0000000000UL);        // BAR.SYNC 0x0
+    private static readonly SassInstruction S2ur = new(0x00000000000b79c3UL, 0x000ea20000002600UL);           // S2UR UR11, SR_CTAID.Y
+    private static readonly SassInstruction Uimad = new(0x000000090c0972a4UL, 0x000fe2000f8e0205UL);          // UIMAD UR9, UR12, UR9, UR5
+    private static readonly SassInstruction Uldc64 = new(0x0000660000087ab9UL, 0x000fe20000000a00UL);         // ULDC.64 UR8, c[0x0][0x198]
+    private static readonly SassInstruction Lds128 = new(0x000000004c307984UL, 0x000ff00000001c00UL);         // LDS.U.128 R48, [R76]
+
+    /// <summary>
+    /// Uniform registers are a separate file: a vector instruction's form-6 operand and every uniform instruction's
+    /// fields decode as uniform, with URZ (63) and the constant/immediate forms contributing no register.
+    /// </summary>
+    [Fact]
+    public void UniformOperandsDecodeIntoTheirOwnFile()
+    {
+        var iadd = SassOpcodeTable.Decode(IaddUniform) ?? throw new InvalidOperationException("IADD3 form 6 unknown");
+        Assert.Contains(iadd.Reads, o => o.Field == SassInstruction.RaField && !o.Uniform && IaddUniform.Register(o.Field) == 68);
+        Assert.Contains(iadd.Reads, o => o.Field == SassInstruction.RbField && o.Uniform && IaddUniform.UniformRegister(o.Field) == 7);
+        Assert.Contains(iadd.Writes, o => !o.Uniform && IaddUniform.Register(o.Field) == 15);
+
+        var uimad = SassOpcodeTable.Decode(Uimad) ?? throw new InvalidOperationException("UIMAD unknown");
+        Assert.All(uimad.Reads.Concat(uimad.Writes), o => Assert.True(o.Uniform));
+        Assert.Equal(new[] { 12, 9, 5 }, uimad.Reads.Select(o => Uimad.UniformRegister(o.Field)).ToArray());
+        Assert.Equal(9, Uimad.UniformRegister(uimad.Writes.Single().Field));
+
+        var uldc = SassOpcodeTable.Decode(Uldc64) ?? throw new InvalidOperationException("ULDC unknown");
+        Assert.Equal(SassLatency.Fixed, uldc.Latency);
+        Assert.Empty(uldc.Reads);
+        Assert.Equal(new SassRegisterOperand(SassInstruction.RdField, 2, true), uldc.Writes.Single());
+
+        var s2ur = SassOpcodeTable.Decode(S2ur) ?? throw new InvalidOperationException("S2UR unknown");
+        Assert.Equal(SassLatency.Variable, s2ur.Latency);
+        Assert.Equal(11, S2ur.UniformRegister(s2ur.Writes.Single().Field));
+    }
+
+    /// <summary>
+    /// IMAD.X reads the carry an IADD3 wrote: the scheduler holds it the ALU latency after the IADD3. Missing this
+    /// read computed a wrong address high word on device and the GEMM's next load faulted.
+    /// </summary>
+    [Fact]
+    public void ACarryInIsADependency()
+    {
+        var imad = SassOpcodeTable.Decode(ImadCarryIn) ?? throw new InvalidOperationException("IMAD.X unknown");
+        Assert.Contains(imad.PredicateReads, field => ImadCarryIn.Bits(field, 3) == 6);
+        var iadd = SassOpcodeTable.Decode(IaddCarryOut) ?? throw new InvalidOperationException("IADD3 unknown");
+        Assert.Contains(iadd.PredicateWrites, field => IaddCarryOut.Bits(field, 3) == 6);
+
+        var scheduled = SassScheduler.RecomputeControl(new[] { IaddCarryOut, ImadCarryIn, Exit })
+            ?? throw new InvalidOperationException(SassScheduler.LastDecline);
+        Assert.True(scheduled[0].Control.Stall >= 6, "IMAD.X issued " + scheduled[0].Control.Stall + " cycles after its carry.");
+    }
+
+    /// <summary>A barrier holds its successor 5 cycles: an LDS issued 1 cycle after BAR.SYNC read a stale tile.</summary>
+    [Fact]
+    public void ABarrierHoldsItsSuccessorFiveCycles()
+    {
+        var scheduled = SassScheduler.RecomputeControl(new[] { BarSync, Lds128, Exit })
+            ?? throw new InvalidOperationException(SassScheduler.LastDecline);
+        Assert.True(scheduled[0].Control.Stall >= 5);
+        Assert.Equal(4, SassOpcodeTable.Decode(Lds128)?.Writes.Single().Width);
+    }
 }

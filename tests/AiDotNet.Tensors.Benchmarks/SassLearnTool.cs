@@ -93,7 +93,7 @@ internal static class SassLearnTool
     // and its first dependent reader, per producer opcode.
     private static void ReportTableConsistency(List<SassLine> lines)
     {
-        int unknown = 0, missedWaits = 0, checkedReads = 0;
+        int unknown = 0, missedWaits = 0, checkedReads = 0, checkedPredicates = 0, missedPredicates = 0;
         var unknownOps = new SortedDictionary<string, int>(StringComparer.Ordinal);
         var minimumLatency = new SortedDictionary<string, int>(StringComparer.Ordinal);
         var misses = new SortedDictionary<string, int>(StringComparer.Ordinal);
@@ -183,6 +183,20 @@ internal static class SassLearnTool
                     }
                 foreach (int pw in effects.PredicateWrites.Select(f => (int)instruction.Bits(f, 3)).Where(p => p != 7).Select(p => predicateBase + p))
                     predicateReady[pw] = cycle;
+                // Every predicate the listing names as an operand must be one the table reads or writes: ptxas keeps
+                // no scoreboard for predicates, so a missing one (IMAD.X's carry-in) is invisible to the wait check.
+                var covered = new HashSet<int>(effects.PredicateReads.Concat(effects.PredicateWrites)
+                    .Select(f => (int)instruction.Bits(f, 3)));
+                foreach (string operand in line.Operands)
+                {
+                    var pm = Regex.Match(operand, @"^!?U?P([0-6])$");
+                    if (!pm.Success) continue;
+                    checkedPredicates++;
+                    if (covered.Contains(int.Parse(pm.Groups[1].Value, CultureInfo.InvariantCulture))) continue;
+                    missedPredicates++;
+                    string key = line.Opcode + " (predicate " + operand + ")";
+                    misses[key] = misses.TryGetValue(key, out int mp) ? mp + 1 : 1;
+                }
                 if (effects.Latency == AiDotNet.Tensors.Engines.Compilation.Codegen.Sass.SassLatency.Control)
                 {
                     pendingWrite.Clear(); pendingRead.Clear(); fixedReady.Clear(); predicateReady.Clear(); lastReader.Clear();
@@ -202,7 +216,8 @@ internal static class SassLearnTool
         }
         Console.WriteLine();
         Console.WriteLine("TABLE CONSISTENCY - " + unknown + " instructions of unknown opcodes; " + checkedReads +
-            " register reads checked; " + missedWaits + " dependencies ptxas did not wait on (table errors)");
+            " register reads checked; " + missedWaits + " dependencies ptxas did not wait on (table errors); " +
+            checkedPredicates + " predicate operands checked, " + missedPredicates + " not in the table (table errors)");
         foreach (var pair in unknownOps) Console.WriteLine("  unknown " + pair.Key + " x" + pair.Value);
         foreach (var pair in misses) Console.WriteLine("  missed wait at " + pair.Key + " x" + pair.Value);
         foreach (var g in lines.GroupBy(l => Base(l.Opcode)))

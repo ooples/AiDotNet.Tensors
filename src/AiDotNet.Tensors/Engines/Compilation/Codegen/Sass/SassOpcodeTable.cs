@@ -17,7 +17,9 @@
 // fixed latency; S2UR and R2UR (vector A at 24 -> uniform) are variable-latency, like S2R. A uniform operation's guard
 // names a uniform predicate (nvdisasm prints @UP0): the uniform datapath has no per-thread state to test.
 //
-// and where predicates live: a compare's outputs at bits 81 and 84, a predicate source at 87 (negation at 90). Loads
+// and where predicates live: a compare's outputs at bits 81 and 84, a predicate source at 87 (negation at 90) -- the
+// carry-in of the .X forms of IADD3, LEA and IMAD among them (an IMAD.X issued 5 cycles after the IADD3 whose carry it
+// reads computed a wrong address high word, and its load faulted). Loads
 // and stores keep their access width in bits 73-75 (4 = 32 bits, 5 = 64, 6 = 128). Variable-latency operations (the
 // ones ptxas gives a scoreboard: loads, S2R, MUFU, I2F/F2I) are marked so the scheduler waits on them rather than
 // counting cycles. An opcode not listed is unknown: a kernel containing one is left exactly as ptxas wrote it.
@@ -136,16 +138,16 @@ public static class SassOpcodeTable
         [0x020] = new("FMUL", SassLatency.Fixed, true, 1, Sources.AB, [], []),
         [0x021] = new("FADD", SassLatency.Fixed, true, 1, Sources.AB, [], []),
         [0x023] = new("FFMA", SassLatency.Fixed, true, 1, Sources.ABC, [], []),
-        [0x024] = new("IMAD", SassLatency.Fixed, true, 1, Sources.ABC, [], []),
-        [0x025] = new("IMAD.WIDE", SassLatency.Fixed, true, 2, Sources.ABC, [], [], WideC: true, FixedLatency: 8),
-        [0x027] = new("IMAD.HI", SassLatency.Fixed, true, 1, Sources.ABC, [], []),
+        [0x024] = new("IMAD", SassLatency.Fixed, true, 1, Sources.ABC, [], [87]),
+        [0x025] = new("IMAD.WIDE", SassLatency.Fixed, true, 2, Sources.ABC, [], [87], WideC: true, FixedLatency: 8),
+        [0x027] = new("IMAD.HI", SassLatency.Fixed, true, 1, Sources.ABC, [], [87]),
         [0x082] = new("UMOV", SassLatency.Fixed, true, 1, Sources.BOnly, [], [], Uniform: true),
         [0x08c] = new("UISETP", SassLatency.Fixed, false, 0, Sources.AB, [81, 84], [87], Uniform: true),
         [0x090] = new("UIADD3", SassLatency.Fixed, true, 1, Sources.ABC, [81, 84], [87, 77], Uniform: true),
         [0x091] = new("ULEA", SassLatency.Fixed, true, 1, Sources.ABC, [81], [87], Uniform: true),
         [0x099] = new("USHF", SassLatency.Fixed, true, 1, Sources.ABC, [], [], Uniform: true),
-        [0x0a4] = new("UIMAD", SassLatency.Fixed, true, 1, Sources.ABC, [], [], Uniform: true),
-        [0x0a5] = new("UIMAD.WIDE", SassLatency.Fixed, true, 2, Sources.ABC, [], [], WideC: true, Uniform: true),
+        [0x0a4] = new("UIMAD", SassLatency.Fixed, true, 1, Sources.ABC, [], [87], Uniform: true),
+        [0x0a5] = new("UIMAD.WIDE", SassLatency.Fixed, true, 2, Sources.ABC, [], [87], WideC: true, Uniform: true),
         [0x0b9] = new("ULDC", SassLatency.Fixed, true, 1, Sources.None, [], [], Uniform: true, SizedD: true),
         [0x1c2] = new("R2UR", SassLatency.Variable, true, 1, Sources.A, [], [], Uniform: true, VectorSources: true),
         [0x1c3] = new("S2UR", SassLatency.Variable, true, 1, Sources.None, [], [], Uniform: true),
