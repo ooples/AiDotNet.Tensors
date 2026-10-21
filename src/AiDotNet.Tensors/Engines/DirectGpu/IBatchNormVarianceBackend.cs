@@ -21,8 +21,13 @@ internal interface IBatchNormVarianceBackend
     /// <summary>Backward from the saved mean and biased variance: every element of the three gradients is written. With
     /// <paramref name="reluOutput"/> (the output of a BatchNorm followed by a ReLU), <paramref name="gradOutput"/> is the
     /// ReLU's output gradient and is masked where that output is not positive. With <paramref name="gradResidual"/> (the
-    /// forward added a residual before the ReLU) the masked gradient -- the residual's gradient -- is written there too.</summary>
+    /// forward added a residual before the ReLU) the masked gradient -- the residual's gradient -- is written there too.
+    /// With <paramref name="beta"/> and <paramref name="reluOutput"/> but no residual, the backend may rebuild the mask from
+    /// the input instead of reading <paramref name="reluOutput"/>, valid only when the forward ran this backend's
+    /// <see cref="TryBatchNormTrainingWithVariance"/>. <paramref name="gradOutput2"/>, when given, is a second contribution
+    /// to the output gradient, summed as gradOutput + gradOutput2 before anything else.</summary>
     bool TryBatchNormBackwardFromVariance(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer saveMean,
         IGpuBuffer saveVariance, IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
-        int batch, int channels, int spatial, float epsilon, IGpuBuffer? reluOutput = null, IGpuBuffer? gradResidual = null);
+        int batch, int channels, int spatial, float epsilon, IGpuBuffer? reluOutput = null, IGpuBuffer? gradResidual = null,
+        IGpuBuffer? beta = null, IGpuBuffer? gradOutput2 = null);
 }

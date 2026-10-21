@@ -114,7 +114,10 @@ public class CompiledPackedAttentionTests : IDisposable
             _output.WriteLine("cpu  : " + string.Join(" ", reference.Losses.Select(l => l.ToString("G7"))));
             _output.WriteLine("gpu  : " + string.Join(" ", device.Losses.Select(l => l.ToString("G7"))));
 
-            if (fuses)
+            // The packed node views the three blocks per launch, so a backend whose views are not free device-pointer
+            // offsets keeps the split: the case says the graph is coverable, the engine says the backend covers it.
+            // Where it does not, this case asserts the split the uncovered fourth-block case asserts.
+            if (fuses && gpu!.SupportsPackedAttentionFusion)
             {
                 Assert.Contains("MultiHeadAttentionPacked", device.StepNames);
                 Assert.DoesNotContain("Narrow", device.StepNames);

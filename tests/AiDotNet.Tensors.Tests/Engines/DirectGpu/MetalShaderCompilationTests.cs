@@ -73,8 +73,17 @@ public sealed class MetalShaderCompilationTests
         yield return ("Categorical", () => MetalCategoricalKernels.Source, true);
         yield return ("BatchExecution",() => MetalBatchExecutionKernels.Source, true);
         yield return ("TorchParityF32", () => MetalBatchExecutionKernels.TorchParitySource, true);
-        yield return ("Winograd", () => WinogradF23KernelTemplate.GetModuleSource(WinogradKernelDialect.Metal), true);
+        // Two libraries, matching what MetalBackend compiles: the fused weight gradient is emitted apart from
+        // the transforms so a driver that rejects it drops only the fused candidate.
+        yield return ("Winograd", () => WinogradF23KernelTemplate.GetModuleSource(WinogradKernelDialect.Metal,
+            WinogradKernelGroup.Base), true);
+        yield return ("WinogradFused", () => WinogradF23KernelTemplate.GetModuleSource(WinogradKernelDialect.Metal,
+            WinogradKernelGroup.Fused), true);
         yield return ("ResidentProgram", () => ResidentProgramKernelTemplate.GetModuleSource(ResidentKernelDialect.Metal), true);
+        // Strict: false, as MetalBackend.BatchNormRegister compiles it (CompileLibrary's two-argument overload). The
+        // mask the backward rebuilds rounds the same as the forward because both go through one explicit fma, not
+        // because the compiler was asked to keep the operators apart.
+        yield return ("BatchNormRegister", () => BatchNormRegisterKernelTemplate.GetModuleSource(WinogradKernelDialect.Metal), false);
     }
 
     internal static string? FindCompiler()
@@ -197,10 +206,29 @@ public sealed class MetalShaderCompilationTests
         var files = Directory.GetFiles(metal, "*.cs").ToDictionary(Path.GetFileName, File.ReadAllText, StringComparer.Ordinal);
         var catalog = Catalog().ToDictionary(e => e.Name, e => e.Source, StringComparer.Ordinal);
 
+        // The library name is a string literal at some call sites and a string constant at others (the Winograd
+        // libraries are named by WinogradLibraryName and WinogradFusedLibraryName). Matching only literals silently
+        // dropped every lookup against those libraries, which is the blind spot this test exists to close, so the
+        // constants are resolved here the way TheCatalog_CoversEveryLibraryTheBackendCompiles resolves them.
+        var libraryConstants = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (string text in files.Values)
+            foreach (Match m in Regex.Matches(text, @"const\s+string\s+(\w+)\s*=\s*""(\w+)""\s*;", RegexOptions.None, timeout))
+                libraryConstants[m.Groups[1].Value] = m.Groups[2].Value;
+
         var fieldToLibrary = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (string text in files.Values)
-            foreach (Match m in Regex.Matches(text, @"(_\w+Library)\s*=\s*_shaderLibrary\.CompileLibrary\(\s*""(\w+)""", RegexOptions.None, timeout))
-                fieldToLibrary[m.Groups[1].Value] = m.Groups[2].Value;
+            foreach (Match m in Regex.Matches(text, @"(_\w+Library)\s*=\s*_shaderLibrary\.CompileLibrary\(\s*(?:""(\w+)""|(\w+))", RegexOptions.None, timeout))
+            {
+                if (m.Groups[2].Success) fieldToLibrary[m.Groups[1].Value] = m.Groups[2].Value;
+                else if (libraryConstants.TryGetValue(m.Groups[3].Value, out string? named))
+                    fieldToLibrary[m.Groups[1].Value] = named;
+            }
+
+        // The control for the resolution above: both Winograd libraries are named by a constant, so a regression to
+        // literal-only matching drops them from this map and silently stops checking their kernel lookups - which is
+        // what it did until the fused library was split out and the omission became visible.
+        Assert.Contains("Winograd", fieldToLibrary.Values);
+        Assert.Contains("WinogradFused", fieldToLibrary.Values);
 
         var definedCache = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
         HashSet<string> Defined(string library)

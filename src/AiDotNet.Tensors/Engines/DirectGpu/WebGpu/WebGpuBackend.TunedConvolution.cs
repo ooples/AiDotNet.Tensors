@@ -162,9 +162,7 @@ fn conv2d_epilogue(@builtin(global_invocation_id) gid: vec3<u32>) {
     private void Conv2DIm2ColGemm(in TunedConv2DArgs a)
     {
         int l = a.OutHeight * a.OutWidth, p = a.InChannels * a.KernelH * a.KernelW;
-        long workgroups = ((long)a.Batch * l + 255) / 256;
-        if (workgroups > WebGpuTunedRowKernels.MaxWorkgroups)
-            throw new GpuCapabilityUnavailableException("The im2col dispatch exceeds WebGPU's workgroup-count limit.");
+        long workgroups = ((long)a.Batch * l + 255) / 256;   // past 65535 the dispatch folds (WebGpuDispatchFold)
         using var col = AllocateBuffer(checked(a.Batch * p * l));
         var uniforms = new int[]
         {

@@ -306,9 +306,8 @@ public sealed partial class CudaBackend
         {
             var table = _pingPong[direction & 1]
                 ?? throw new InvalidOperationException("PrepareSgdPingPong was not called before the capture.");
-            // The update and the gradients' sum of squares in one pass, then the undo of a non-finite step.
+            // The update and the gradients' sum of squares in one pass; the same launch undoes a non-finite step.
             _backend.SgdPingPongUpdate(table, weightDecay, _dynamicScalars!.Handle, _pingPongPartials!, _pingPongDone!, _guard!.Handle);
-            _backend.SgdPingPongRevert(table, _guard.Handle);
         }
 
         public bool CapturedGraphReads(IntPtr graphExec, IReadOnlyList<IGpuBuffer> buffers)

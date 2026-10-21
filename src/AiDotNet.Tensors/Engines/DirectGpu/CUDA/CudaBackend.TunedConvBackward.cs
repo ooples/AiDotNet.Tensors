@@ -83,6 +83,13 @@ public sealed partial class CudaBackend
                         candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("nvrtc.conv2d_dw.winograd_f32",
                             TunedKernelOrigin.Builtin, true, shape => WinogradF23AdmitsShape(shape) && EnsureWinogradModule(),
                             (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardFilterWinogradF32(a)) LaunchDwDirect(a); }));
+                    // The same Winograd weight gradient fused into one launch (transforms and output transform in the
+                    // GEMM's block, no U/V/M planes in memory). Faster than the four-launch pipeline on every ResNet-18
+                    // 3x3 layer measured, and than r8v on the 64-channel 32x32 layers.
+                    if (candidates.Count > 0)
+                        candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("nvrtc.conv2d_dw.winograd_fused",
+                            TunedKernelOrigin.Builtin, true, shape => WinogradF23AdmitsShape(shape) && EnsureWinogradModule(),
+                            (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardFilterWinogradFused(a)) LaunchDwDirect(a); }));
                     // Winograd F(3x3,4x4): opt-in only (owner decision, #1335), like the F(4x4) input gradient.
                     if (candidates.Count > 0 && CudaDispatchPolicy.ConvWinogradF4)
                         candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("nvrtc.conv2d_dw.winograd_f34",
@@ -143,6 +150,20 @@ public sealed partial class CudaBackend
                         candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("nvrtc.conv2d_dx.winograd_f23_fused",
                             TunedKernelOrigin.Builtin, true, shape => WinogradF23AdmitsShape(shape) && EnsureWinogradFusedModule(),
                             (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardDataWinogradF23Fused(a)) LaunchDxDirect(a); }));
+                    // Stride-2 3x3 input gradient with all four sub-pixel phases in one block (CudaConvDgradS2Kernels):
+                    // equal work per block and no phase reduce. Per call on an RTX 3080, batch 8, vs the engine's phase
+                    // kernel (with its weight relayout and reduce): 64->128 48.9 -> 27.5 us, 128->256 56.0 -> 31.2,
+                    // 256->512 51.9 -> 35.1.
+                    if (candidates.Count > 0 && s_convS2K3DgradEnv)
+                        candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("nvrtc.conv2d_dx.s2k3",
+                            TunedKernelOrigin.Builtin, true, shape => DgradS2AdmitsShape(shape) && EnsureDgradS2Module(),
+                            (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardInputS2K3(a)) LaunchDxDirect(a); }));
+                    // 1x1 stride-2 input gradient as one GEMM written straight into dX with its zero phases
+                    // (CudaConvDgradS2Kernels), in place of the phase kernel's three tapless phase layers and reduce.
+                    if (candidates.Count > 0 && s_convS2K1DgradEnv)
+                        candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("nvrtc.conv2d_dx.s2k1",
+                            TunedKernelOrigin.Builtin, true, shape => DgradS2K1AdmitsShape(shape) && EnsureDgradS2Module(),
+                            (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardInputS2K1(a)) LaunchDxDirect(a); }));
                     // Winograd F(4x4,3x3): registered ONLY under the explicit reduced-precision opt-in (owner decision,
                     // #1335): ~20x the fp32 rounding error of F(2x2). Unregistered otherwise, so the persisted-decision key
                     // differs between the two settings.

@@ -951,20 +951,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
                 // Winograd F(2x2,3x3) / F(3x3,2x2) tile transforms for the convolution slots (#1370). Optional like the
                 // module above, but a failure is logged: it silently drops three tuned candidates for every 3x3 conv.
-                try
-                {
-                    var winogradProgram = CompileOrLoadCached(WinogradF23KernelTemplate.GetModuleSource(WinogradKernelDialect.OpenCl),
-                        OpenClBuildOptions.SafeMathFlags, "Winograd kernels");
-                    var built = new System.Collections.Generic.List<(string, DirectOpenClKernel)>();
-                    foreach (var name in WinogradF23KernelTemplate.GetKernelNames())
-                        built.Add((name, new DirectOpenClKernel(_context, winogradProgram, name)));
-                    _programs.Add(winogradProgram);
-                    foreach (var (name, kernel) in built) _kernelCache[name] = kernel;
-                }
-                catch (Exception ex)
-                {
-                    System.Diagnostics.Trace.TraceWarning($"OpenCL Winograd kernels unavailable: {ex.Message}");
-                }
+                CompileWinogradModule(WinogradKernelGroup.Base, "Winograd kernels");
+
+                // The fused weight gradient is a separate module, for the same reason F(4x4,3x3) below is: its kernels
+                // are the only ones here that declare shared memory and a fixed 256-wide group, so a driver that
+                // rejects them must drop only the fused candidate and leave the transforms above serving.
+                CompileWinogradModule(WinogradKernelGroup.Fused, "Winograd fused weight-gradient kernels");
+                CompileBatchNormRegisterModule();
 
                 // Winograd F(4x4, 3x3) forward transforms: a separate module so a driver that rejects it drops only this
                 // candidate.
@@ -1232,6 +1225,51 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         /// </summary>
         /// <param name="globalSize">The global size</param>
         /// <returns>Optimal local size that respects GPU limits</returns>
+        // One Winograd kernel group as its own program, so one group's build failure cannot drop the other's
+        // candidates. A failure leaves the group's names absent from _kernelCache, which is what readiness reads.
+        private void CompileWinogradModule(WinogradKernelGroup group, string label)
+        {
+            var context = _context;
+            if (context is null) return;
+            try
+            {
+                var program = CompileOrLoadCached(
+                    WinogradF23KernelTemplate.GetModuleSource(WinogradKernelDialect.OpenCl, group),
+                    OpenClBuildOptions.SafeMathFlags, label);
+                var built = new System.Collections.Generic.List<(string, DirectOpenClKernel)>();
+                try
+                {
+                    foreach (var name in WinogradF23KernelTemplate.GetKernelNames(group))
+                        built.Add((name, new DirectOpenClKernel(context, program, name)));
+                }
+                catch
+                {
+                    // Nothing is in _kernelCache or _programs yet, so Dispose could not reach these. Release what
+                    // this call staged before letting the catch below log the failure.
+                    foreach (var (_, kernel) in built) kernel.Dispose();
+                    program.Dispose();
+                    throw;
+                }
+                _programs.Add(program);
+                foreach (var (name, kernel) in built) _kernelCache[name] = kernel;
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Trace.TraceWarning($"OpenCL {label} unavailable: {ex.Message}");
+            }
+        }
+
+        // The largest work-group CL_KERNEL_WORK_GROUP_SIZE allows for one kernel, or zero when the driver does not
+        // answer. Register pressure and the local allocation push this below CL_DEVICE_MAX_WORK_GROUP_SIZE per kernel.
+        internal int KernelWorkGroupSize(string name)
+        {
+            var context = _context;
+            if (context is null || !_kernelCache.TryGetValue(name, out var kernel)) return 0;
+            var reported = OpenClNativeBindings.GetKernelWorkGroupInfoSizeT(kernel.Handle, context.Device,
+                OpenClNativeBindings.CL_KERNEL_WORK_GROUP_SIZE);
+            return reported == UIntPtr.Zero ? 0 : (int)Math.Min(reported.ToUInt64(), (ulong)int.MaxValue);
+        }
+
         private int CalculateOptimalWorkGroupSize1D(int globalSize)
         {
             // Start with ideal size (256 is common)

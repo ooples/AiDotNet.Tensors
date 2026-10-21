@@ -80,10 +80,32 @@ public class CompiledTrainingMultiTensorSgdTests : IDisposable
 
                 long readbacksBefore = GpuLaunchProbe.Readbacks;
                 const int Steps = 5;
-                for (int s = 0; s < Steps; s++) plan.Step();
-                long readbacks = GpuLaunchProbe.Readbacks - readbacksBefore;
+                // Capture the sites, so a failure names the call that waits instead of only counting the waits.
+                bool priorCapture = GpuLaunchProbe.CaptureReadbackSites;
+                GpuLaunchProbe.CaptureReadbackSites = true;
+                string[] sites;
+                long readbacks;
+                try
+                {
+                    for (int s = 0; s < Steps; s++) plan.Step();
+                    readbacks = GpuLaunchProbe.Readbacks - readbacksBefore;
+                    sites = GpuLaunchProbe.ReadbackSites;
+                }
+                finally
+                {
+                    GpuLaunchProbe.CaptureReadbackSites = priorCapture;
+                }
                 _output.WriteLine($"blocking readbacks over {Steps} SGD steps: {readbacks}");
-                Assert.True(readbacks == 0, $"{readbacks} blocking readbacks over {Steps} steps; the SGD step should not wait on the device");
+                foreach (var site in sites) _output.WriteLine("  site: " + site);
+                // A backend whose guarded update reads the guard in its kernel needs no download at all. Where the
+                // guard is read on the host the step still cannot be free, because that backend's reduce-to-scalar
+                // returns the loss to the host: one per step. Either way the optimizer must add none of its own -
+                // nothing per parameter tensor (the per-tensor guard read this replaced) and no second wait for a
+                // verdict already being read.
+                long allowed = gpu!.GetBackend() is IMultiTensorGpuOptimizerBackend { GuardsFiniteOnDevice: true } ? 0 : Steps;
+                Assert.True(readbacks <= allowed,
+                    $"{readbacks} blocking readbacks over {Steps} steps, more than the {allowed} this backend's loss needs; the SGD step waits on the device for something else"
+                    + (sites.Length == 0 ? string.Empty : Environment.NewLine + string.Join(Environment.NewLine, sites)));
                 Assert.Equal(0, plan.NonFiniteStepsSkipped);
 
                 // A non-finite batch: every gradient is NaN, so the step must leave the weights exactly as they were.

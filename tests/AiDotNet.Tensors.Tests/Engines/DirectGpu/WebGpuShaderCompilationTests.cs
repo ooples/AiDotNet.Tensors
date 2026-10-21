@@ -25,6 +25,8 @@ public sealed class WebGpuShaderCompilationTests
         "WebGpuBatchExecutionKernels.Main",   // the shared main() prologue every batch-execution shader appends to
         "WebGpuKernels.RnnCellSource",        // concatenated after the common header that defines fast_tanh
         "WebGpuTunedRowKernels.RowPrologue",  // the row kernels' shared main() prologue, closed by each family's body
+        "WebGpuBatchNormRegisterKernels.Forward",    // templates: SourceFor fills in the name and the values per thread
+        "WebGpuBatchNormRegisterKernels.Backward",
     };
 
     private const string Validator = @"
@@ -44,7 +46,9 @@ for (const f of fs.readdirSync(dir).filter(f => f.endsWith('.wgsl')).sort()) {
   const m = device.createShaderModule({ code });
   const info = await m.getCompilationInfo();
   const errs = info.messages.filter(x => x.type === 'error').map(x => `${x.lineNum}:${x.linePos} ${x.message}`);
-  const eps = [...code.matchAll(/@compute(?:\s*@\w+(?:\([^)]*\))?)*\s*fn\s+(\w+)/g)].map(x => x[1]);
+  // A folded copy (name.fold-entry.wgsl) builds only the entry point it folds.
+  const fold = f.match(/\.fold-(\w+)\.wgsl$/);
+  const eps = fold ? [fold[1]] : [...code.matchAll(/@compute(?:\s*@\w+(?:\([^)]*\))?)*\s*fn\s+(\w+)/g)].map(x => x[1]);
   for (const ep of (eps.length ? eps : ['main'])) {
     try { device.createComputePipeline({ layout: 'auto', compute: { module: m, entryPoint: ep } }); }
     catch (e) { errs.push(ep + ': ' + e.message.split('\n')[0]); }
@@ -70,7 +74,26 @@ process.exit(0);
         Directory.CreateDirectory(shaders);
         try
         {
-            int count = 0;
+            int count = 0, folded = 0;
+            var unfoldable = new List<string>();
+            // Each source as the backend compiles it, and the folded copy of each of its entry points.
+            void Emit(string name, string source)
+            {
+                string prepared = WebGpuShaderPrelude.Prepare(source);
+                File.WriteAllText(Path.Combine(shaders, name + ".wgsl"), prepared);
+                count++;
+                foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(prepared,
+                    @"@compute(?:\s*@\w+(?:\([^)]*\))?)*\s*fn\s+(\w+)", System.Text.RegularExpressions.RegexOptions.None, TimeSpan.FromSeconds(5)))
+                {
+                    string entry = m.Groups[1].Value;
+                    if (WebGpuDispatchFold.FoldSource(prepared, entry) is { } fold)
+                    {
+                        File.WriteAllText(Path.Combine(shaders, name + ".fold-" + entry + ".wgsl"), fold);
+                        folded++;
+                    }
+                    else unfoldable.Add(name + ":" + entry);
+                }
+            }
             const BindingFlags F = BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
             foreach (var type in typeof(WebGpuBatchExecutionKernels).Assembly.GetTypes()
                 .Where(t => t.Namespace == typeof(WebGpuBatchExecutionKernels).Namespace))
@@ -93,15 +116,16 @@ process.exit(0);
                         continue;   // a runtime getter (JS interop, device state), not a shader source
                     }
                     if (value is not string source || !source.Contains("@compute")) continue;
-                    File.WriteAllText(Path.Combine(shaders, type.Name + "." + member.Name + ".wgsl"), WebGpuShaderPrelude.Prepare(source));
-                    count++;
+                    Emit(type.Name + "." + member.Name, source);
                 }
             }
+            // The register-resident BatchNorm, one module per kernel and per-thread variant (generated, not fields).
+            foreach (var name in AiDotNet.Tensors.Engines.DirectGpu.BatchNormRegisterKernelTemplate.GetKernelNames())
+                Emit("BatchNormRegister." + name, WebGpuBatchNormRegisterKernels.SourceFor(name));
             // The FP32 PyTorch-parity kernels, one translated module per kernel (#1125, #1128).
             foreach (var module in CudaDialectToWgsl.Translate(AiDotNet.Tensors.Engines.DirectGpu.TorchParityF32Kernels.GetSource()))
             {
-                File.WriteAllText(Path.Combine(shaders, "TorchParityF32." + module.Key + ".wgsl"), WebGpuShaderPrelude.Prepare(module.Value));
-                count++;
+                Emit("TorchParityF32." + module.Key, module.Value);
             }
             // The tuned-kernel variants are generated per lane count (methods, not fields), so the reflection above never
             // sees them. Every row variant runs 256 invocations; a column variant runs 32 * R, so only the ones within the
@@ -114,19 +138,19 @@ process.exit(0);
                     ("LayerNorm", WebGpuTunedRowKernels.LayerNorm(lanes)), ("LayerNormBackward", WebGpuTunedRowKernels.LayerNormBackward(lanes)),
                 })
                 {
-                    File.WriteAllText(Path.Combine(shaders, $"Tuned.{name}.lanes{lanes}.wgsl"), WebGpuShaderPrelude.Prepare(source));
-                    count++;
+                    Emit($"Tuned.{name}.lanes{lanes}", source);
                 }
             }
             foreach (int rows in WebGpuTunedRowKernels.ColumnRowLanes)
             {
                 if (32 * rows > 256) continue;
-                File.WriteAllText(Path.Combine(shaders, $"Tuned.LayerNormGradParams.rows{rows}.wgsl"),
-                    WebGpuShaderPrelude.Prepare(WebGpuTunedRowKernels.LayerNormGradParams(rows)));
-                File.WriteAllText(Path.Combine(shaders, $"Tuned.RmsNormGradGamma.rows{rows}.wgsl"),
-                    WebGpuShaderPrelude.Prepare(WebGpuTunedRowKernels.RmsNormGradGamma(rows)));
-                count += 2;
-            }            Assert.True(count > 100, $"only {count} WGSL sources found");
+                Emit($"Tuned.LayerNormGradParams.rows{rows}", WebGpuTunedRowKernels.LayerNormGradParams(rows));
+                Emit($"Tuned.RmsNormGradGamma.rows{rows}", WebGpuTunedRowKernels.RmsNormGradGamma(rows));
+            }
+            Assert.True(count > 100, $"only {count} WGSL sources found");
+            // Every entry point must fold: a dispatch past 65,535 workgroups runs the folded copy (WebGpuDispatchFold).
+            Assert.True(unfoldable.Count == 0, $"{unfoldable.Count} entry points cannot be folded: " + string.Join(", ", unfoldable));
+            Assert.True(folded > 600, $"only {folded} entry points folded");
 
             // The script must sit beside node_modules for the 'webgpu' import to resolve.
             string script = Path.Combine(node, "aidotnet-wgsl-validate.mjs");

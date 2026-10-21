@@ -19,7 +19,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 [Collection("DirectGpuSerial")]
 public class CompiledFusedLinearMseLossTests : IDisposable
 {
-    private const int Steps = 12;
+    private const int Steps = 12, HiddenUnits = 24;
     private readonly IEngine _prior = AiDotNetEngine.Current;
     private readonly ITestOutputHelper _output;
 
@@ -63,7 +63,7 @@ public class CompiledFusedLinearMseLossTests : IDisposable
         bool learnableTarget, bool keepDims)
     {
         AiDotNetEngine.Current = engine;
-        int headInputs = hidden ? 24 : inputs;
+        int headInputs = hidden ? HiddenUnits : inputs;
         // Inputs scaled by sqrt(16 / K) past 16 features, so one learning rate trains every shape.
         float xScale = MathF.Min(1f, MathF.Sqrt(16f / inputs));
         var x = Rand([batch, inputs], 1, xScale);
@@ -142,7 +142,10 @@ public class CompiledFusedLinearMseLossTests : IDisposable
             _output.WriteLine("cpu      : " + string.Join(" ", reference.Losses.Select(l => l.ToString("G7"))));
             _output.WriteLine("gpu fused: " + string.Join(" ", fused.Losses.Select(l => l.ToString("G7"))));
 
-            bool fits = outputs <= 16 && inputs <= 128;
+            // Whether the head fuses is the engine's answer about its backend's kernels, not the shapes alone: the
+            // kernels are one backend's, and where they are absent the plan keeps the composed nodes - which the
+            // branch below asserts in full, exactly as it does for a head past the kernels' shapes.
+            bool fits = gpu!.SupportsFusedLinearMseLoss(batch, hidden ? HiddenUnits : inputs, outputs);
             Assert.DoesNotContain("ReduceMean", fused.StepNames);
             Assert.DoesNotContain("FusedLinearMseLoss", reference.StepNames);   // the CPU plan keeps the composed ops
             if (fits)

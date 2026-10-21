@@ -8,7 +8,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 // WinogradF23Pipeline: the tile transforms below (GLSL emitted from WinogradF23KernelTemplate) around BatchedGemm.
 // Backward convolution gets tuned slots here for the first time, with the direct shaders it always ran as the
 // references, so Winograd is served only on the shape classes where it measures faster.
-public sealed unsafe partial class VulkanBackend : IWinogradF23Transforms
+public sealed unsafe partial class VulkanBackend : IWinogradF23Transforms, IWinogradFusedFilterGradient
 {
     private TunedKernelSlot<TunedConv2DBackwardArgs>? _conv2DBackwardDataSlot, _conv2DBackwardFilterSlot;
 
@@ -23,40 +23,50 @@ public sealed unsafe partial class VulkanBackend : IWinogradF23Transforms
         return shaders;
     }
 
-    private bool? _winogradReady;
+    private bool? _winogradReady, _winogradFusedReady;
 
     // Every Winograd pipeline, built once. A shader the driver rejects would otherwise throw from inside a tuned slot
     // on the first 3x3 convolution; this turns it into a candidate that is not offered, and says why.
-    private bool WinogradKernelsReady
+    private bool WinogradKernelsReady => WinogradGroupReady(WinogradKernelGroup.Base, ref _winogradReady,
+        "Vulkan Winograd kernels");
+
+    // The fused weight gradient's shaders are checked on their own: they are the only ones here that declare shared
+    // memory and a fixed 256-wide group, so a driver that rejects one of them must drop only the fused candidate and
+    // leave the forward, input-gradient and unfused weight-gradient routes offered.
+    private bool FusedFilterGradientReady => WinogradKernelsReady
+        && WinogradGroupReady(WinogradKernelGroup.Fused, ref _winogradFusedReady,
+            "Vulkan fused Winograd weight-gradient kernels");
+
+    private bool WinogradGroupReady(WinogradKernelGroup group, ref bool? cached, string label)
     {
-        get
+        if (cached is { } ready) return ready;
+        lock (_tunedSlotsLock)
         {
-            if (_winogradReady is { } ready) return ready;
-            lock (_tunedSlotsLock)
+            if (cached is null)
             {
-                if (_winogradReady is null)
+                bool ok = true;
+                try
                 {
-                    bool ok = true;
-                    try
+                    foreach (var name in WinogradF23KernelTemplate.GetKernelNames(group))
                     {
-                        foreach (var spec in WinogradF23KernelTemplate.Kernels)
-                            if (GetOrCreateGlslPipeline(s_winogradShaders[spec.Name], spec.Buffers.Length,
-                                    (uint)(spec.Ints.Length * sizeof(uint))) is null)
-                            {
-                                System.Diagnostics.Trace.TraceWarning($"Vulkan Winograd kernels unavailable: '{spec.Name}' did not build.");
-                                ok = false;
-                                break;
-                            }
+                        var spec = WinogradF23KernelTemplate.Get(name);
+                        if (GetOrCreateGlslPipeline(s_winogradShaders[name], spec.Buffers.Length,
+                                (uint)(spec.Ints.Length * sizeof(uint))) is null)
+                        {
+                            System.Diagnostics.Trace.TraceWarning($"{label} unavailable: '{name}' did not build.");
+                            ok = false;
+                            break;
+                        }
                     }
-                    catch (Exception ex)
-                    {
-                        System.Diagnostics.Trace.TraceWarning($"Vulkan Winograd kernels unavailable: {ex.Message}");
-                        ok = false;
-                    }
-                    _winogradReady = ok;
                 }
-                return _winogradReady.Value;
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"{label} unavailable: {ex.Message}");
+                    ok = false;
+                }
+                cached = ok;
             }
+            return cached.Value;
         }
     }
 
@@ -96,6 +106,9 @@ public sealed unsafe partial class VulkanBackend : IWinogradF23Transforms
                         new DelegateTunedKernelCandidate<TunedConv2DBackwardArgs>("vulkan.conv2d_dw.winograd_f32", TunedKernelOrigin.Builtin,
                             true, shape => WinogradF23Pipeline.AdmitsShape(shape) && WinogradKernelsReady,
                             (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardFilterWinograd(a)) LaunchDwDirect(a); }),
+                        new DelegateTunedKernelCandidate<TunedConv2DBackwardArgs>("vulkan.conv2d_dw.winograd_fused", TunedKernelOrigin.Builtin,
+                            true, shape => WinogradF23Pipeline.AdmitsShape(shape) && FusedFilterGradientReady,
+                            (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardFilterWinogradFused(a)) LaunchDwDirect(a); }),
                     });
                 return _conv2DBackwardFilterSlot;
             }
@@ -118,6 +131,28 @@ public sealed unsafe partial class VulkanBackend : IWinogradF23Transforms
 
     internal bool TryConv2DBackwardFilterWinograd(in TunedConv2DBackwardArgs a)
         => WinogradKernelsReady && WinogradF23Pipeline.TryBackwardFilter(this, this, a);
+
+    // The fused weight gradient: one dispatch of 256-wide groups (plus the finish when the tiles split).
+    internal bool TryConv2DBackwardFilterWinogradFused(in TunedConv2DBackwardArgs a, int splits = 0)
+        => FusedFilterGradientReady && WinogradF23Pipeline.TryBackwardFilterFused(this, this, a, splits);
+
+    // Core Vulkan reports no multiprocessor count (ComputeUnits here is the work-group invocation limit), so the splits
+    // aim at 64 groups, a mid-range discrete GPU's SM / CU count; the tuned slot still measures the result.
+    private const int FusedFilterGradientGroups = 64;
+
+    int IWinogradFusedFilterGradient.FusedFilterGradientGroupTarget => FusedFilterGradientGroups;
+
+    void IWinogradFusedFilterGradient.FusedFilterGradient(bool direct, IGpuBuffer x, IGpuBuffer res, IGpuBuffer dy,
+        int groups, int[] ints)
+    {
+        var fusedPush = new uint[ints.Length];
+        for (int i = 0; i < ints.Length; i++) fusedPush[i] = (uint)ints[i];
+        string name = direct ? WinogradF23KernelTemplate.FusedFilterGradientDirect : WinogradF23KernelTemplate.FusedFilterGradient;
+        TryDispatchConvPoolGlsl(s_winogradShaders[name], fusedPush, groups * WinogradF23KernelTemplate.FusedGroupSize, x, res, dy);
+    }
+
+    void IWinogradFusedFilterGradient.FusedFilterGradientFinish(IGpuBuffer partials, IGpuBuffer dw, int kc, int splits)
+        => RunWinograd(WinogradF23KernelTemplate.FusedFilterGradientFinish, 9L * kc, partials, dw, kc, splits);
 
     private static uint[] BackwardPush(in TunedConv2DBackwardArgs a) => new uint[]
     {

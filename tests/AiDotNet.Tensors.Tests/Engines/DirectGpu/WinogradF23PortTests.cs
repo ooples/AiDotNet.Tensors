@@ -84,6 +84,131 @@ public class WinogradF23PortTests
     }
 #endif
 
+    // The fused weight gradient's shapes add channel counts past one 32-wide block, ragged in both, and ResNet-18's four
+    // 3x3 stride-1 layers at batch 8, to the ones above.
+    public static readonly TheoryData<int, int, int, int, int> FusedShapes = new()
+    {
+        { 2, 5, 7, 9, 1 },
+        { 2, 16, 24, 11, 0 },
+        { 3, 8, 6, 6, 2 },
+        { 1, 3, 4, 1, 1 },
+        { 4, 32, 32, 16, 1 },
+        { 2, 40, 70, 10, 1 },
+        { 8, 64, 64, 32, 1 },
+        { 8, 128, 128, 16, 1 },
+        { 8, 256, 256, 8, 1 },
+        { 8, 512, 512, 4, 1 },
+    };
+
+    [SkippableTheory]
+    [MemberData(nameof(FusedShapes))]
+    public void OpenCl_fused_winograd_weight_gradient_matches_the_cpu_convolution(int batch, int inC, int outC, int size, int pad)
+    {
+        Skip.IfNot(DirectOpenClContext.IsAvailable && DirectOpenClContext.GetDeviceCount() > 0, "No OpenCL device.");
+        using var backend = new OpenClBackend(deviceIndex: 0);
+        Skip.IfNot(backend.IsAvailable, "OpenCL backend did not initialize.");
+        CheckFused(backend, batch, inC, outC, size, pad, (a, s) => backend.TryConv2DBackwardFilterWinogradFused(a, s));
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(FusedShapes))]
+    public void Vulkan_fused_winograd_weight_gradient_matches_the_cpu_convolution(int batch, int inC, int outC, int size, int pad)
+    {
+        var backend = VulkanBackend.Instance;
+        Skip.IfNot(backend.Initialize() && backend.IsGlslCompilerAvailable, "Vulkan with a GLSL compiler is not available.");
+        CheckFused(backend, batch, inC, outC, size, pad, (a, s) => backend.TryConv2DBackwardFilterWinogradFused(a, s));
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(FusedShapes))]
+    public void Metal_fused_winograd_weight_gradient_matches_the_cpu_convolution(int batch, int inC, int outC, int size, int pad)
+    {
+        Skip.IfNot(System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.OSX),
+            "Metal is only available on macOS.");
+        using var backend = new MetalBackend();
+        Skip.IfNot(backend.IsAvailable, "Metal is not available.");
+        CheckFused(backend, batch, inC, outC, size, pad, (a, s) => backend.TryConv2DBackwardFilterWinogradFused(a, s));
+    }
+
+#if NET7_0_OR_GREATER
+    [SkippableTheory]
+    [MemberData(nameof(FusedShapes))]
+    public void WebGpu_fused_winograd_weight_gradient_matches_the_cpu_convolution(int batch, int inC, int outC, int size, int pad)
+    {
+        var backend = DawnHostedWebGpu.BackendOrSkip();
+        CheckFused(backend, batch, inC, outC, size, pad, (a, s) => backend.TryConv2DBackwardFilterWinogradFused(a, s));
+    }
+#endif
+
+    /// <summary>
+    /// The fused weight gradient is emitted apart from the transforms, so a device compiler that rejects it cannot
+    /// take the forward, input-gradient and unfused weight-gradient routes with it. Checked on the source rather
+    /// than on a backend because every backend reads these two groups.
+    /// </summary>
+    [Fact]
+    public void Winograd_kernel_groups_partition_the_template()
+    {
+        var all = WinogradF23KernelTemplate.GetKernelNames();
+        var baseNames = WinogradF23KernelTemplate.GetKernelNames(WinogradKernelGroup.Base);
+        var fused = WinogradF23KernelTemplate.GetKernelNames(WinogradKernelGroup.Fused);
+
+        Assert.Equal(new[]
+        {
+            WinogradF23KernelTemplate.FusedFilterGradientDirect,
+            WinogradF23KernelTemplate.FusedFilterGradient,
+            WinogradF23KernelTemplate.FusedFilterGradientFinish,
+        }, fused);
+        Assert.Equal(all.Length, baseNames.Length + fused.Length);
+        foreach (var name in all)
+            Assert.True(System.Array.IndexOf(baseNames, name) >= 0 ^ System.Array.IndexOf(fused, name) >= 0,
+                $"'{name}' belongs to neither group or to both.");
+
+        // Each group's module declares its own kernels and nothing of the other's, which is what makes one group's
+        // build failure survivable.
+        string baseSource = WinogradF23KernelTemplate.GetModuleSource(WinogradKernelDialect.OpenCl, WinogradKernelGroup.Base);
+        string fusedSource = WinogradF23KernelTemplate.GetModuleSource(WinogradKernelDialect.OpenCl, WinogradKernelGroup.Fused);
+        foreach (var name in baseNames)
+        {
+            Assert.Contains("void " + name + "(", baseSource);
+            Assert.DoesNotContain("void " + name + "(", fusedSource);
+        }
+        foreach (var name in fused)
+        {
+            Assert.Contains("void " + name + "(", fusedSource);
+            Assert.DoesNotContain("void " + name + "(", baseSource);
+        }
+
+        // Shared memory and the fixed 256-wide group are the constructs a driver declines; both are confined to the
+        // fused module now, so the transforms' module cannot fail on their account.
+        Assert.Contains("__local float sm[", fusedSource);
+        Assert.DoesNotContain("__local float sm[", baseSource);
+    }
+
+    /// <summary>
+    /// The positive control for the split on real hardware: each group builds as a program on its own and resolves
+    /// every one of its kernels, and neither program carries the other group's kernels.
+    /// </summary>
+    [SkippableFact]
+    public void OpenCl_winograd_kernel_groups_build_as_independent_modules()
+    {
+        Skip.IfNot(DirectOpenClContext.IsAvailable && DirectOpenClContext.GetDeviceCount() > 0, "No OpenCL device.");
+        using var context = new DirectOpenClContext(deviceIndex: 0);
+        foreach (var group in new[] { WinogradKernelGroup.Base, WinogradKernelGroup.Fused })
+        {
+            var other = group == WinogradKernelGroup.Base ? WinogradKernelGroup.Fused : WinogradKernelGroup.Base;
+            using var program = new DirectOpenClProgram(context,
+                WinogradF23KernelTemplate.GetModuleSource(WinogradKernelDialect.OpenCl, group));
+            program.Build(OpenClBuildOptions.SafeMathFlags);
+            foreach (var name in WinogradF23KernelTemplate.GetKernelNames(group))
+            {
+                using var kernel = new DirectOpenClKernel(context, program, name);
+                Assert.NotEqual(IntPtr.Zero, kernel.Handle);
+            }
+            foreach (var name in WinogradF23KernelTemplate.GetKernelNames(other))
+                Assert.Throws<InvalidOperationException>(() => new DirectOpenClKernel(context, program, name));
+        }
+    }
+
     /// <summary>
     /// The HIP instance cannot run here without an AMD GPU, but its dialect is CUDA C++ with nothing HIP-specific, so
     /// NVRTC compiles it: a syntax or type error in the template's HIP emission fails on any CUDA machine, not only on
@@ -170,6 +295,30 @@ public class WinogradF23PortTests
         Compare("Conv2D " + label, Forward(x, w, batch, inC, outC, size, pad), backend.DownloadBuffer(by));
         Compare("Conv2DBackwardInput " + label, BackwardData(dy, w, batch, inC, outC, size, pad), backend.DownloadBuffer(bdx));
         Compare("Conv2DBackwardKernel " + label, BackwardFilter(x, dy, batch, inC, outC, size, pad), backend.DownloadBuffer(bdw));
+    }
+
+    // The fused weight gradient through each of its paths: one split (the kernel writes dW itself), and several (per-split
+    // partials summed by the finish kernel), then the device-sized default. dW is poisoned with NaN before each run, so
+    // every element must be written by that run.
+    private void CheckFused(IDirectGpuBackend backend, int batch, int inC, int outC, int size, int pad,
+        Func<TunedConv2DBackwardArgs, int, bool> fused)
+    {
+        int outSize = size + 2 * pad - 2;
+        var x = Random(batch * inC * size * size, 1);
+        var dy = Random(batch * outC * outSize * outSize, 3);
+        using var bx = backend.AllocateBuffer(x);
+        using var bdy = backend.AllocateBuffer(dy);
+        using var bdw = backend.AllocateBuffer(outC * inC * 9);
+        var expected = BackwardFilter(x, dy, batch, inC, outC, size, pad);
+        string label = $"N{batch} C{inC} K{outC} {size}x{size} pad{pad}";
+        foreach (int splits in new[] { 1, 3, 0 })
+        {
+            backend.Fill(bdw, float.NaN, outC * inC * 9);
+            Assert.True(fused(new TunedConv2DBackwardArgs(bx, bdy, bdw, true, batch, inC, size, size, outC, outSize, outSize,
+                3, 3, 1, 1, pad, pad, 1, 1), splits), "the fused Winograd weight gradient refused an admitted shape");
+            backend.Synchronize();
+            Compare($"fused dW splits {splits} " + label, expected, backend.DownloadBuffer(bdw));
+        }
     }
 
     // fp32 Winograd against a double-accumulated sum: the error is the fp32 rounding of transforms whose coefficients

@@ -5152,6 +5152,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     internal FirstWriteRedirectTable? FirstWriteRedirects { get; set; }
 
+    /// <summary>
+    /// The compiled plan's deferred gradient contributions while its GPU step body runs (see
+    /// <see cref="Autodiff.GradientDeferral"/>); null outside it, where every contribution is added as it arrives.
+    /// The state belongs to the thread running that step body, not to the engine, which every plan compiled on it
+    /// shares - see <see cref="Autodiff.GradientDeferral.Current"/>.
+    /// </summary>
+    internal Autodiff.GradientDeferral? DeferredGradients
+    {
+        get => Autodiff.GradientDeferral.Current;
+        set => Autodiff.GradientDeferral.Current = value;
+    }
+
     /// <summary>Offers <paramref name="contribution"/>'s pooled slot for redirection into <paramref name="accumulator"/>,
     /// which it just first-wrote by copy (see <see cref="FirstWriteRedirectTable"/>).</summary>
     internal void RecordFirstWriteRedirect(IGpuBuffer contribution, IGpuBuffer accumulator, int length)
@@ -7068,7 +7080,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // upload+compute+download path below when not on the resident step or not last-axis.
         if (TrySoftmaxResidentInto(destination, input, axis)) return;
         // Try GPU softmax: upload input, compute on GPU, download to destination
-        if (TryGetBackend(out var gpuBackend))
+        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
         {
             try
             {
@@ -7107,7 +7119,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.LogSoftmaxInto<T>(Tensor<T> destination, Tensor<T> input, int axis)
     {
-        if (TryGetBackend(out var gpuBackend))
+        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
         {
             try
             {
@@ -7132,7 +7144,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     return;
                 }
             }
-            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TrySoftmaxResidentInto", capabilityGap);
+            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("LogSoftmaxInto", capabilityGap);
                 // Fall through to CPU
             }
         }
@@ -7143,7 +7155,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (TryUnaryResidentInto(dest, input, static (be, i, o, n) => be.Swish(i, o, n), "Swish")) return;
         // GPU: use Sigmoid + Multiply kernels
-        if (TryGetBackend(out var gpuBackend))
+        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
         {
             try
             {
@@ -7170,7 +7182,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
                 return;
             }
-            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TrySoftmaxResidentInto", capabilityGap);
+            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("SwishInto", capabilityGap);
                 // Fall through to CPU
             }
         }
@@ -7180,7 +7192,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     void IEngine.GELUInto<T>(Tensor<T> dest, Tensor<T> input)
     {
         if (TryUnaryResidentInto(dest, input, static (be, i, o, n) => be.Gelu(i, o, n), "GELU")) return;
-        if (TryGetBackend(out var gpuBackend))
+        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
         {
             try
             {
@@ -7204,7 +7216,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
                 return;
             }
-            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TrySoftmaxResidentInto", capabilityGap);
+            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("GELUInto", capabilityGap);
                 // Fall through to CPU
             }
         }
@@ -7214,7 +7226,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     void IEngine.TanhInto<T>(Tensor<T> dest, Tensor<T> input)
     {
         if (TryUnaryResidentInto(dest, input, static (be, i, o, n) => be.Tanh(i, o, n), "Tanh")) return;
-        if (TryGetBackend(out var gpuBackend))
+        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
         {
             try
             {
@@ -7238,7 +7250,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
                 return;
             }
-            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TrySoftmaxResidentInto", capabilityGap);
+            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TanhInto", capabilityGap);
                 // Fall through to CPU
             }
         }
@@ -7248,7 +7260,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     void IEngine.MishInto<T>(Tensor<T> dest, Tensor<T> input)
     {
         if (TryUnaryResidentInto(dest, input, static (be, i, o, n) => be.Mish(i, o, n), "Mish")) return;
-        if (TryGetBackend(out var gpuBackend))
+        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
         {
             try
             {
@@ -7262,7 +7274,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 DownloadIntoTensor(gpuBackend, gpuOut, floatDest);
                 return;
             }
-            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TrySoftmaxResidentInto", capabilityGap);
+            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MishInto", capabilityGap);
                 // Fall through to CPU
             }
         }
@@ -7274,7 +7286,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         float alphaF = alpha is float f ? f : Convert.ToSingle(alpha);
         if (TryUnaryResidentInto(dest, input,
                 (be, i, o, n) => be.LeakyRelu(i, o, alphaF, n), "LeakyReLU")) return;
-        if (TryGetBackend(out var gpuBackend))
+        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
         {
             try
             {
@@ -7288,7 +7300,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 DownloadIntoTensor(gpuBackend, gpuOut, floatDest);
                 return;
             }
-            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TrySoftmaxResidentInto", capabilityGap);
+            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("LeakyReLUInto", capabilityGap);
                 // Fall through to CPU
             }
         }
@@ -7326,7 +7338,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 DownloadIntoTensor(gpuBackend, gpuOut, dstF);
                 return;
             }
-            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TrySoftmaxResidentInto", capabilityGap);
+            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("ConcatInto", capabilityGap);
                 // Fall through to CPU — axis-aware concat is complex
             }
         }
@@ -7351,7 +7363,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 DownloadIntoTensor(gpuBackend, gpuOut, floatDest);
                 return;
             }
-            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TrySoftmaxResidentInto", capabilityGap);
+            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TransposeInto", capabilityGap);
                 // Fall through to CPU for higher-rank transposes
             }
         }
@@ -7363,7 +7375,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // #1650/#638: resident GPU path for the capture step (no host round-trip). Falls through to the
         // legacy upload/compute/download GPU path (then CPU) when not in a resident step.
         if (TryGroupNormSwishResidentInto(output, input, numGroups, gamma, beta, epsilon)) return;
-        if (TryGetBackend(out var gpuBackend))
+        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
         {
             try
             {
@@ -7401,7 +7413,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 DownloadIntoTensor(gpuBackend, gpuOut, floatOutput);
                 return;
             }
-            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TrySoftmaxResidentInto", capabilityGap);
+            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("GroupNormSwishInto", capabilityGap);
                 // Fall through to CPU
             }
         }
@@ -7410,7 +7422,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.AddGroupNormInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon)
     {
-        if (TryGetBackend(out var gpuBackend) && ShapesMatch(a.Shape._dims, b.Shape._dims))
+        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend) && ShapesMatch(a.Shape._dims, b.Shape._dims))
         {
             try
             {
@@ -7449,7 +7461,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 DownloadIntoTensor(gpuBackend, gpuOut, floatOutput);
                 return;
             }
-            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TrySoftmaxResidentInto", capabilityGap);
+            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("AddGroupNormInto", capabilityGap);
                 // Fall through to CPU
             }
         }
@@ -16076,16 +16088,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// BatchNormBackward.
     /// </summary>
     internal Tensor<T>? TryBatchNormReluBackward<T>(Tensor<T> gradOutput, Tensor<T> reluOutput, Tensor<T> input,
-        Tensor<T> gamma, Tensor<T> mean, Tensor<T> variance, double epsilon, out Tensor<T>? gradGamma, out Tensor<T>? gradBeta)
+        Tensor<T> gamma, Tensor<T> mean, Tensor<T> variance, double epsilon, out Tensor<T>? gradGamma, out Tensor<T>? gradBeta,
+        Tensor<T>? beta = null, Tensor<T>? gradOutput2 = null)
         => TryBatchNormReluBackward(gradOutput, reluOutput, input, gamma, mean, variance, epsilon, false,
-            out gradGamma, out gradBeta, out _);
+            out gradGamma, out gradBeta, out _, beta, gradOutput2);
 
     /// <summary>As <see cref="TryBatchNormReluBackward{T}(Tensor{T}, Tensor{T}, Tensor{T}, Tensor{T}, Tensor{T}, Tensor{T}, double, out Tensor{T}?, out Tensor{T}?)"/>;
     /// with <paramref name="withResidual"/> the forward added a residual before the ReLU, and
     /// <paramref name="gradResidual"/> receives its gradient (the masked output gradient).</summary>
     internal Tensor<T>? TryBatchNormReluBackward<T>(Tensor<T> gradOutput, Tensor<T> reluOutput, Tensor<T> input,
         Tensor<T> gamma, Tensor<T> mean, Tensor<T> variance, double epsilon, bool withResidual,
-        out Tensor<T>? gradGamma, out Tensor<T>? gradBeta, out Tensor<T>? gradResidual)
+        out Tensor<T>? gradGamma, out Tensor<T>? gradBeta, out Tensor<T>? gradResidual, Tensor<T>? beta = null,
+        Tensor<T>? gradOutput2 = null)
     {
         gradGamma = null;
         gradBeta = null;
@@ -16100,13 +16114,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var bufGamma = GetOrAllocateBuffer(backend, gamma);
         using var bufMean = GetOrAllocateBuffer(backend, mean);
         using var bufVar = GetOrAllocateBuffer(backend, variance);
+        // beta lets the backend rebuild the ReLU mask from the input rather than read the ReLU output (no residual only).
+        using var bufBeta = beta is not null && !withResidual ? GetOrAllocateBuffer(backend, beta) : default;
+        if (gradOutput2 is not null && (gradOutput2.Length != input.Length || !gradOutput2.IsContiguous)) return null;
+        using var bufDy2 = gradOutput2 is not null ? GetOrAllocateBuffer(backend, gradOutput2) : default;
         var bufDx = AllocateFullyWrittenOutputBuffer(backend, input.Length);
         var bufDg = AllocateFullyWrittenOutputBuffer(backend, channels);
         var bufDb = AllocateFullyWrittenOutputBuffer(backend, channels);
         var bufDr = withResidual ? AllocateFullyWrittenOutputBuffer(backend, input.Length) : default;
         if (!varianceBackend.TryBatchNormBackwardFromVariance(bufDy.Buffer, bufIn.Buffer, bufGamma.Buffer, bufMean.Buffer,
                 bufVar.Buffer, bufDx.Buffer, bufDg.Buffer, bufDb.Buffer, batch, channels, spatial, (float)epsilon,
-                reluOutput: bufOut.Buffer, gradResidual: withResidual ? bufDr.Buffer : null))
+                reluOutput: bufOut.Buffer, gradResidual: withResidual ? bufDr.Buffer : null,
+                beta: beta is not null && !withResidual ? bufBeta.Buffer : null,
+                gradOutput2: gradOutput2 is not null ? bufDy2.Buffer : null))
         {
             bufDx.Dispose(); bufDg.Dispose(); bufDb.Dispose();
             if (withResidual) bufDr.Dispose();

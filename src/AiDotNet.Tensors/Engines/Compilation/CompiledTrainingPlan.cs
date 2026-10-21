@@ -26,7 +26,7 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 ///
 /// This REPLACES the GradientTape for compiled workloads.
 /// </summary>
-internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompiledTrainingPlanIntrospection<T>, IPingPongOwner
+internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompiledTrainingPlanIntrospection<T>, IPingPongOwner
 {
     // Phase G.4: mutable so EnableFrozenWeightOptimizations() can swap in
     // a rebuilt forward-action array using allowCachedB=true.
@@ -195,6 +195,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// <summary>This plan's first-write redirects, lent to the engine while the captured step body runs (see
     /// <see cref="Engines.DirectGpuTensorEngine.FirstWriteRedirects"/>). Dropped by the eager step.</summary>
     private readonly Engines.FirstWriteRedirectTable _firstWriteRedirects = new();
+
+    // The gradients whose second contribution the GPU step body parks for the consuming fused BatchNorm+ReLU backward
+    // (Autodiff.GradientDeferral), or null when the plan has none.
+    private Autodiff.GradientDeferral? _gradientDeferral;
 
     /// <summary>Host-engine eager step: per gradient buffer, true when every writer is a generic backward step, so
     /// the buffer is not zeroed and its first contribution of the step is copied in (GradWriteGeneration). Null when
@@ -2331,7 +2335,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             guard = _finitenessSumSquares;
         }
         _finitenessGuard = guard;
-        if (deferToDeviceGuard && cuda is Engines.DirectGpu.IDeviceReadbackFactory factory)
+        // Only where the guarded update reads the guard on the device. Elsewhere it reads it on the host anyway, so
+        // deferring would add a second device-to-host copy per step and save none: resolve finiteness here instead.
+        if (deferToDeviceGuard && cuda is Engines.DirectGpu.IMultiTensorGpuOptimizerBackend { GuardsFiniteOnDevice: true }
+            && cuda is Engines.DirectGpu.IDeviceReadbackFactory factory)
         {
             // The update kernel reads the sum itself and writes nothing when it is not finite; the host learns the
             // outcome from a readback it waits on only at the next step (or when asked), so this step never blocks.
@@ -3874,9 +3881,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         bool completed = false;
         _firstWriteRedirects.BeginRun();
         if (redirectEngine is not null) redirectEngine.FirstWriteRedirects = _firstWriteRedirects;
+        _gradientDeferral?.Reset();
+        // Restored rather than cleared: this body can run nested inside another plan's on this thread, and clearing
+        // would lose what the outer one parked.
+        var outerDeferral = redirectEngine?.DeferredGradients;
+        if (redirectEngine is not null) redirectEngine.DeferredGradients = _gradientDeferral;
         try { RunGpuStepBodyForCaptureCore(backend); completed = true; }
         finally
         {
+            if (redirectEngine is not null) redirectEngine.DeferredGradients = outerDeferral;
             if (redirectEngine is not null) redirectEngine.FirstWriteRedirects = null;
             // Only a whole executed run is evidence; a capture records, and a body that threw left its pairing unknown.
             _firstWriteRedirects.EndRun(executed && completed);
@@ -8725,9 +8738,41 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // would be missed).
         HashSet<Tensor<T>>? gradRequired =
             parameters.Length > 0 && !useGradPool && fp16HeteroOrder is null ? requiresGradTensors : null;
+
+        // ResNet's downsampling pairs (a 3x3 stride-2 convolution and its 1x1 projection shortcut reading the same
+        // input): one GPU-dispatched action writes the input's gradient once (CompiledTrainingPlan.ShortcutPair.cs).
+        var shortcutPairs = new Dictionary<int, (int Main, int Shortcut)>();
+        var consumedByShortcutPair = new HashSet<int>();
+        if (typeof(T) == typeof(float) && preferGenericForGpu && !useGradPool && fp16HeteroOrder is null
+            && engine is IConvShortcutPairEngine shortcutEngine
+            && Environment.GetEnvironmentVariable("AIDOTNET_CONV_SHORTCUT_FUSION") != "0")
+        {
+            var excluded = new HashSet<int>(fusedStepIndices);
+            excluded.UnionWith(consumedByConvEpilogue);
+            excluded.UnionWith(convEpilogueBackwardSpecs.Keys);
+            excluded.UnionWith(analyticBackwardSpecs.Keys);
+            DetectShortcutConvPairs(forwardSteps, requiresGradTensors, excluded, shortcutEngine, shortcutPairs,
+                consumedByShortcutPair);
+        }
+
         for (int i = forwardSteps.Count - 1; i >= 0; i--)
         {
             if (fusedStepIndices.Contains(i)) continue;
+            if (consumedByShortcutPair.Contains(i)) continue;
+            if (shortcutPairs.TryGetValue(i, out var shortcutPair))
+            {
+                var mainStep = forwardSteps[shortcutPair.Main];
+                var shortcutStep = forwardSteps[shortcutPair.Shortcut];
+                backwardActions.Add(BuildShortcutPairBackward(mainStep, shortcutStep, shortcutPair.Shortcut > shortcutPair.Main,
+                    gradMap, gradRequired, requiresGradTensors));
+                backwardStepNames.Add("generic:Conv2D+ShortcutPair");
+                // GPU-dispatched like the generic accumulator (graph-capturable), and it accumulates into both steps'
+                // inputs as their generic backwards would.
+                genericBackwardCount++;
+                genericBackwardSteps.Add(mainStep);
+                genericBackwardSteps.Add(shortcutStep);
+                continue;
+            }
             var step = forwardSteps[i];
             if (step.BackwardFn == null) continue;
             // No parameter upstream of this step's output: its backward only produces gradients nothing reads.
@@ -9144,6 +9189,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             plan._aliasedGradViews = aliasedGradViews?.ToArray();
             plan._eagerFirstWriteCandidates = eagerFirstWriteCandidates;
             plan._backwardStepKinds = backwardStepNames.ToArray();
+            // A fused BatchNorm+ReLU output read by exactly two steps (a residual block's input: the next block's first
+            // convolution and its shortcut): its backward sums both contributions as it loads them.
+            var deferrable = new List<object>();
+            foreach (var fs in forwardSteps)
+                if ((fs.OpName == "BatchNormReLU" || fs.OpName == "BatchNormAddReLU")
+                    && consumerCount.TryGetValue(fs.OutputBuffer, out int outputUses) && outputUses == 2)
+                    deferrable.Add(fs.OutputBuffer);
+            if (deferrable.Count > 0 && engine is DirectGpuTensorEngine) plan._gradientDeferral = new Autodiff.GradientDeferral(deferrable);
             scope.ReleaseStorageLeases();
             return plan;
         }

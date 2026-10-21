@@ -327,9 +327,11 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
             }
 
             KernelTuningPairedEvidence evidence;
+            bool remeasured = false;
+        measure:
             try
             {
-                _harness.MeasureMilliseconds(c, args, reps); // warm caches, module loads and workspaces
+                if (!remeasured) _harness.MeasureMilliseconds(c, args, reps); // warm caches, module loads and workspaces
                 var pairs = new List<KernelTuningPairedSample>(CandidatePairs);
                 for (int i = 0; i < CandidatePairs; i++)
                 {
@@ -356,6 +358,16 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
 
             double secondLowest = SecondLowestSpeedup(evidence);
             bool wins = evidence.MedianSpeedup >= Math.Max(MinimumSpeedup, noise) && secondLowest > 1.0;
+            // Faster by a median that clears the bar but refused for two lost pairs: a burst of device noise during its
+            // nine pairs. Measure it once more before refusing it, or a slower candidate that happened to measure
+            // cleanly wins and is persisted (ResNet-18's 512@4 weight gradient tuned r8 at 1.25x over the 1.6x
+            // Winograd route about one run in four, 28 us a step).
+            if (!wins && !remeasured && evidence.MedianSpeedup >= Math.Max(MinimumSpeedup, noise))
+            {
+                remeasured = true;
+                rejected.Add($"{c.Id}: re-measured after {secondLowest:F3}x second-lowest pair at {evidence.MedianSpeedup:F3}x median");
+                goto measure;
+            }
             if (!wins)
             {
                 // Faster by median, refused only for consistency or for the noise floor: undecided, not a loss.

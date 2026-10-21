@@ -94,7 +94,9 @@ public sealed partial class CudaBackend
         void** ca = stackalloc void*[14];
         ca[0] = &xPtr; ca[1] = &wPtr; ca[2] = &tPtr; ca[3] = &n; ca[4] = &inC; ca[5] = &h; ca[6] = &w; ca[7] = &outC;
         ca[8] = &outH; ca[9] = &outW; ca[10] = &pad; ca[11] = &tilesH; ca[12] = &tilesW; ca[13] = &rPerSplit;
-        LaunchKernel3D(_kernelCache[flipped ? "wfz_conv_wf" : "wfz_conv_w"], (uint)((p + 31) / 32), (uint)((outC + 31) / 32),
+        // Even tile rows: the pair loader (a 4 x 6 window per two neighbouring tiles), bit-identical to the one-tile loader.
+        bool pair = tilesW % 2 == 0;
+        LaunchKernel3D(_kernelCache[(flipped ? "wfz_conv_wf" : "wfz_conv_w") + (pair ? "_pair" : "")], (uint)((p + 31) / 32), (uint)((outC + 31) / 32),
             (uint)splits, 512, 1, 1, ca, 0);
         if (splits > 1) LaunchSplitKReduce(reduce, target, y, (int)outputs, splits);
         return true;

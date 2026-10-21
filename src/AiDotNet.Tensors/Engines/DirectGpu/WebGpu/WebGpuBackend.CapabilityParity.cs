@@ -19,6 +19,12 @@ public sealed partial class WebGpuBackend : IFftBackend, IGenericFftBackend, IMe
     /// the undefined-contents contract.
     /// </summary>
     public IGpuBuffer AllocateBufferUninitialized(int size) => AllocateBuffer(size);
+    /// <summary>
+    /// The guarded updates read the guard on the host (<see cref="PerTensorMultiTensorOptimizer"/>): this backend's
+    /// Adam/AdamW/SGD kernels take no guard argument, so the verdict is downloaded before the launch.
+    /// </summary>
+    public bool GuardsFiniteOnDevice => false;
+
     public void AdamMultiTensorUpdate(
         IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
         IReadOnlyList<IGpuBuffer> firstMoments, IReadOnlyList<IGpuBuffer> secondMoments,

@@ -1656,6 +1656,23 @@ internal static class BackwardFunctions<T>
     /// the incoming gradient exactly as the ReLU's input would (ReLU(z) &gt; 0 exactly when z &gt; 0); then the BatchNorm
     /// backward. One launch on a backend with the register-resident kernel, else ReluBackward and BatchNormBackward.
     /// </summary>
+    // The fused BatchNorm+ReLU node's fourth saved slot says whether its last forward ran the register-resident kernel,
+    // the only forward whose ReLU mask the backward kernel can rebuild bit for bit from the input.
+    // The second gradient contribution a compiled GPU step parked for this output (GradientDeferral), or null.
+    private static Tensor<T>? TakeParkedGradient(IEngine engine, Tensor<T> output)
+        => engine is DirectGpuTensorEngine { DeferredGradients: { } deferral } ? deferral.Take(output) : null;
+
+    // The fallback of a backward that could not sum the parked contribution in its kernel: gradOutput + parked, as the
+    // accumulation would have added it.
+    private static Tensor<T> AddParked(IEngine engine, Tensor<T> gradOutput, Tensor<T> parked)
+    {
+        using (new NoGradScope<T>()) engine.TensorAddInPlace(gradOutput, parked);
+        return gradOutput;
+    }
+
+    private static bool MaskFromInput(object[] savedState)
+        => savedState.Length > 3 && savedState[3] is bool[] { Length: 1 } usedKernel && usedKernel[0];
+
     internal static void BatchNormReluBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
@@ -1664,9 +1681,10 @@ internal static class BackwardFunctions<T>
         var variance = (Tensor<T>)savedState[1];
         var epsilon = (double)savedState[2];
         Tensor<T> gradInput, gradGamma, gradBeta;
+        var parked = TakeParkedGradient(engine, output);
         if (engine is DirectGpuTensorEngine gpu
             && gpu.TryBatchNormReluBackward(gradOutput, output, inputs[0], inputs[1], mean, variance, epsilon,
-                out var fusedGamma, out var fusedBeta) is { } fusedInput)
+                out var fusedGamma, out var fusedBeta, MaskFromInput(savedState) ? inputs[2] : null, parked) is { } fusedInput)
         {
             gradInput = fusedInput;
             gradGamma = fusedGamma!;
@@ -1674,6 +1692,7 @@ internal static class BackwardFunctions<T>
         }
         else
         {
+            if (parked is not null) gradOutput = AddParked(engine, gradOutput, parked);
             var masked = engine.ReluBackward(gradOutput, output);
             gradInput = engine.BatchNormBackward(masked, inputs[0], inputs[1], mean, variance, epsilon,
                 out gradGamma, out gradBeta);
@@ -1697,9 +1716,10 @@ internal static class BackwardFunctions<T>
         var variance = (Tensor<T>)savedState[1];
         var epsilon = (double)savedState[2];
         Tensor<T> gradInput, gradGamma, gradBeta, gradResidual;
+        var parked = TakeParkedGradient(engine, output);
         if (engine is DirectGpuTensorEngine gpu
             && gpu.TryBatchNormReluBackward(gradOutput, output, inputs[0], inputs[1], mean, variance, epsilon, true,
-                out var fusedGamma, out var fusedBeta, out var fusedResidual) is { } fusedInput)
+                out var fusedGamma, out var fusedBeta, out var fusedResidual, gradOutput2: parked) is { } fusedInput)
         {
             gradInput = fusedInput;
             gradGamma = fusedGamma!;
@@ -1708,6 +1728,7 @@ internal static class BackwardFunctions<T>
         }
         else
         {
+            if (parked is not null) gradOutput = AddParked(engine, gradOutput, parked);
             gradResidual = engine.ReluBackward(gradOutput, output);
             gradInput = engine.BatchNormBackward(gradResidual, inputs[0], inputs[1], mean, variance, epsilon,
                 out gradGamma, out gradBeta);

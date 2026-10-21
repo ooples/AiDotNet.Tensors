@@ -622,24 +622,18 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>
-        /// Pointer-based Exp with 2-tier dispatch:
-        /// 1. HerumiExp256 (256-entry table + short poly, Intel CPUs with fast gather)
-        /// 2. Estrin polynomial (FastExp256, AMD CPUs and fallback)
+        /// Pointer-based Exp: the Estrin polynomial (FastExp256) on every CPU.
         /// </summary>
+        /// <remarks>
+        /// One kernel for every vendor. Intel CPUs used to take the 256-entry HerumiExp256 table exp (fast gather)
+        /// while AMD took this polynomial. Both are accurate, but they round differently, and Adam amplifies that into
+        /// a different training trajectory: SegNeXt's train/test-gap invariant failed only on Intel runners with AVX-512
+        /// (8573C, 8370C) and passed with the table path forced off, as RepViTSAM did over the table sigmoid (#1069).
+        /// A model's result must not depend on who made the CPU.
+        /// </remarks>
         [MethodImpl(HotInline)]
         public static unsafe void ExpUnsafe(float* input, float* output, int length)
         {
-#if NET5_0_OR_GREATER
-            // CPU-adaptive dispatch:
-            // Intel (fast gather): 256-entry herumi table exp (fewer ops, table fits L1)
-            // AMD (slow gather): Estrin polynomial exp (no gather instruction)
-            if (CpuFeatures.HasFastGather && Avx2.IsSupported && Fma.IsSupported && length >= 8)
-            {
-                HerumiExp256.ExpArray(input, output, length);
-                return;
-            }
-#endif
-
             int i = 0;
 #if NET5_0_OR_GREATER
             if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
@@ -6923,16 +6917,8 @@ namespace AiDotNet.Tensors.Engines.Simd
             for (; i < length; i++)
                 if (input[i] > maxVal) maxVal = input[i];
 
-            // Pass 2: Fused exp + store + sum (SIMD 4x unrolled)
-            // CPU-adaptive exp kernel — two paths:
-            //   HasFastGather (Intel + AMD Zen 4+): HerumiExp256 table exp
-            //     (~2× faster than polynomial — 256-entry table in L1,
-            //     single gather per vector, 2nd-order polynomial remainder).
-            //   No fast-gather (AMD Zen 1-3): FastExp256ForSoftmax (4-term
-            //     Horner polynomial) — avoids the slow vpgatherdd on
-            //     these CPUs.
-            // Both produce float32-ULP-accurate results suitable for
-            // softmax's subsequent normalisation.
+            // Pass 2: Fused exp + store + sum (SIMD 4x unrolled). One exp kernel per width on every vendor (see
+            // ExpUnsafe): an Intel-only table exp here made softmax round differently by CPU maker.
             float sumExp = 0f;
             i = 0;
 #if NET5_0_OR_GREATER
@@ -6940,8 +6926,9 @@ namespace AiDotNet.Tensors.Engines.Simd
             // AVX-512 path: 16-wide Vector512 doubles throughput vs the
             // AVX2 8-wide path. Requires CpuFeatures.HasAVX512F (Intel
             // Ice Lake+, Sapphire Rapids, AMD Zen 5). 2×-unroll for
-            // pipelined 16-wide FMAs gives ~2× speedup over the AVX2
-            // Herumi table path, ~4× over the AVX2 polynomial path.
+            // pipelined 16-wide FMAs improves throughput over the AVX2
+            // polynomial path, with the same bits (same polynomial, same
+            // reduction order).
             if (CpuFeatures.HasAVX512F && length >= 32)
             {
                 var vmaxBcast = Vector512.Create(maxVal);
@@ -6976,48 +6963,24 @@ namespace AiDotNet.Tensors.Engines.Simd
                 var vsum2 = Vector256<float>.Zero;
                 var vsum3 = Vector256<float>.Zero;
                 int simdLen = length & ~31;
-                if (CpuFeatures.HasFastGather)
+                for (; i < simdLen; i += 32)
                 {
-                    // Pin the 256-entry exp table once per call — the gather
-                    // ops inside the 32-wide loop use this pointer.
-                    fixed (float* tablePtr = HerumiExp256._table)
-                    {
-                        for (; i < simdLen; i += 32)
-                        {
-                            var e0 = HerumiExp256.Exp8(Avx.Subtract(Avx.LoadVector256(input + i),      vmaxBcast), tablePtr);
-                            var e1 = HerumiExp256.Exp8(Avx.Subtract(Avx.LoadVector256(input + i + 8),  vmaxBcast), tablePtr);
-                            var e2 = HerumiExp256.Exp8(Avx.Subtract(Avx.LoadVector256(input + i + 16), vmaxBcast), tablePtr);
-                            var e3 = HerumiExp256.Exp8(Avx.Subtract(Avx.LoadVector256(input + i + 24), vmaxBcast), tablePtr);
-                            Avx.Store(output + i, e0);
-                            Avx.Store(output + i + 8, e1);
-                            Avx.Store(output + i + 16, e2);
-                            Avx.Store(output + i + 24, e3);
-                            vsum0 = Avx.Add(vsum0, e0);
-                            vsum1 = Avx.Add(vsum1, e1);
-                            vsum2 = Avx.Add(vsum2, e2);
-                            vsum3 = Avx.Add(vsum3, e3);
-                        }
-                    }
+                    var e0 = FastExp256ForSoftmax(Avx.Subtract(Avx.LoadVector256(input + i),      vmaxBcast));
+                    var e1 = FastExp256ForSoftmax(Avx.Subtract(Avx.LoadVector256(input + i + 8),  vmaxBcast));
+                    var e2 = FastExp256ForSoftmax(Avx.Subtract(Avx.LoadVector256(input + i + 16), vmaxBcast));
+                    var e3 = FastExp256ForSoftmax(Avx.Subtract(Avx.LoadVector256(input + i + 24), vmaxBcast));
+                    Avx.Store(output + i, e0);
+                    Avx.Store(output + i + 8, e1);
+                    Avx.Store(output + i + 16, e2);
+                    Avx.Store(output + i + 24, e3);
+                    vsum0 = Avx.Add(vsum0, e0);
+                    vsum1 = Avx.Add(vsum1, e1);
+                    vsum2 = Avx.Add(vsum2, e2);
+                    vsum3 = Avx.Add(vsum3, e3);
                 }
-                else
-                {
-                    for (; i < simdLen; i += 32)
-                    {
-                        var e0 = FastExp256ForSoftmax(Avx.Subtract(Avx.LoadVector256(input + i),      vmaxBcast));
-                        var e1 = FastExp256ForSoftmax(Avx.Subtract(Avx.LoadVector256(input + i + 8),  vmaxBcast));
-                        var e2 = FastExp256ForSoftmax(Avx.Subtract(Avx.LoadVector256(input + i + 16), vmaxBcast));
-                        var e3 = FastExp256ForSoftmax(Avx.Subtract(Avx.LoadVector256(input + i + 24), vmaxBcast));
-                        Avx.Store(output + i, e0);
-                        Avx.Store(output + i + 8, e1);
-                        Avx.Store(output + i + 16, e2);
-                        Avx.Store(output + i + 24, e3);
-                        vsum0 = Avx.Add(vsum0, e0);
-                        vsum1 = Avx.Add(vsum1, e1);
-                        vsum2 = Avx.Add(vsum2, e2);
-                        vsum3 = Avx.Add(vsum3, e3);
-                    }
-                }
-                vsum0 = Avx.Add(Avx.Add(vsum0, vsum1), Avx.Add(vsum2, vsum3));
+                // The AVX-512 path's grouping: its two accumulators pair group 0 with 2 and 1 with 3, so the two
+                // paths give the same bits.
+                vsum0 = Avx.Add(Avx.Add(vsum0, vsum2), Avx.Add(vsum1, vsum3));
                 sumExp = HorizontalSum(vsum0);
             }
 #endif

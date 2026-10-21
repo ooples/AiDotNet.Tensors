@@ -14056,6 +14056,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         float learningRate, float weightDecay)
         => SgdMultiTensorImpl(parameters, gradients, sizes, learningRate, weightDecay, IntPtr.Zero, IntPtr.Zero);
 
+    /// <summary>The guarded updates below read the guard in their kernels (<c>sgd_multi_tensor_update</c> and the
+    /// Adam kernels take it as an argument), so nothing is read back before a launch.</summary>
+    public bool GuardsFiniteOnDevice => true;
+
     /// <summary>
     /// <see cref="SgdMultiTensorUpdate"/> whose kernel reads <paramref name="finiteGuard"/> (a double) on the device and
     /// writes nothing when it is not finite: no host read before the launch, so the step never waits on the device.
@@ -14267,7 +14271,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     /// <summary>
     /// The table of one ping-pong SGD direction (sgd_pingpong_update): each tensor's source weights, destination
-    /// weights and gradient, in <see cref="GradientTableChunk"/>-element chunks. The caller owns it.
+    /// weights and gradient, in <see cref="PingPongChunk"/>-element chunks. The caller owns it.
     /// </summary>
     private MultiTensorTable BuildPingPongTable(IReadOnlyList<IGpuBuffer> sources, IReadOnlyList<IGpuBuffer> destinations,
         IReadOnlyList<IGpuBuffer> gradients, IReadOnlyList<int> sizes)
@@ -14289,7 +14293,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             handles[n + t] = destinations[t].Handle;
             handles[2 * n + t] = gradients[t].Handle;
             sizeArray[t] = size;
-            totalChunks += (size + GradientTableChunk - 1) / GradientTableChunk;
+            totalChunks += (size + PingPongChunk - 1) / PingPongChunk;
         }
         for (int i = 0; i < handles.Length; i++)
             WriteAddress(addresses, i, handles[i]);
@@ -14298,8 +14302,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         int c = 0;
         for (int t = 0; t < n; t++)
         {
-            int chunks = (sizeArray[t] + GradientTableChunk - 1) / GradientTableChunk;
-            for (int k = 0; k < chunks; k++) { chunkTensor[c] = t; chunkStart[c] = k * GradientTableChunk; c++; }
+            int chunks = (sizeArray[t] + PingPongChunk - 1) / PingPongChunk;
+            for (int k = 0; k < chunks; k++) { chunkTensor[c] = t; chunkStart[c] = k * PingPongChunk; c++; }
         }
         var table = new MultiTensorTable { Handles = handles, Sizes = sizeArray, TotalChunks = totalChunks };
         try
@@ -14321,10 +14325,16 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         return table;
     }
 
+    // Elements per ping-pong chunk (PP_CHUNK); the update kernel's grid strides over the chunks with at most this many
+    // blocks per SM, which bounds its partials and its tickets on one counter.
+    private const int PingPongChunk = 1024;
+    private const int PingPongBlocksPerSm = 4;
+
     /// <summary>
     /// One ping-pong SGD step over <paramref name="table"/> (see sgd_pingpong_update): the updated weights to the
-    /// destinations, the gradients' sum of squares onto <paramref name="guard"/> (a double). <paramref name="partials"/>
-    /// holds a double per chunk; <paramref name="done"/> is a zeroed counter the kernel leaves zeroed.
+    /// destinations, the gradients' sum of squares onto <paramref name="guard"/> (a double), and the undo of a step whose
+    /// guard is then not finite. <paramref name="partials"/> holds a double per block (at least one per chunk is
+    /// allocated); <paramref name="done"/> is a zeroed counter the kernel leaves zeroed.
     /// </summary>
     private unsafe void SgdPingPongUpdate(MultiTensorTable table, float weightDecay, IntPtr dynamicScalars,
         IGpuBuffer partials, IGpuBuffer done, IntPtr guard)
@@ -14340,22 +14350,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         void** args = stackalloc void*[11];
         args[0] = &pH; args[1] = &sH; args[2] = &ctH; args[3] = &csH; args[4] = &n; args[5] = &totalChunks;
         args[6] = &weightDecay; args[7] = &dynamicScalars; args[8] = &partialsH; args[9] = &doneH; args[10] = &guard;
-        LaunchKernel(kernel, (uint)totalChunks, MultiTensorChunk, args);
-    }
-
-    /// <summary>Copies every source over its destination in <paramref name="table"/> when *<paramref name="guard"/> is not finite.</summary>
-    private unsafe void SgdPingPongRevert(MultiTensorTable table, IntPtr guard)
-    {
-        if (table.TotalChunks == 0) return;
-        if (!_kernelCache.TryGetValue("sgd_pingpong_revert", out var kernel))
-            throw new GpuCapabilityUnavailableException("CUDA kernel not found: sgd_pingpong_revert");
-        using var _ = PushContext();
-        IntPtr pH = table.Pointers!.Handle, sH = table.SizesBuffer!.Handle, ctH = table.ChunkTensor!.Handle, csH = table.ChunkStart!.Handle;
-        int n = table.Sizes.Length, totalChunks = table.TotalChunks;
-        void** args = stackalloc void*[7];
-        args[0] = &pH; args[1] = &sH; args[2] = &ctH; args[3] = &csH; args[4] = &n; args[5] = &totalChunks; args[6] = &guard;
-        // Every block returns at once on a finite step: a small grid keeps that cheap.
-        uint blocks = (uint)Math.Min(totalChunks, 2 * Math.Max(1, _multiProcessorCount));
+        uint blocks = (uint)Math.Min(totalChunks, PingPongBlocksPerSm * Math.Max(1, _multiProcessorCount));
         LaunchKernel(kernel, blocks, MultiTensorChunk, args);
     }
 
@@ -18696,6 +18691,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             _streamOrderEvent = IntPtr.Zero;
         }
         DisposeTunedKernelResources();
+        // The convolution scratch slots hold device buffers for the process's life once a shape has used them; they
+        // have to go back before the pool they came from does.
+        DisposeConvScratch();
         _pinnedPool.Dispose();
         _bufferPool.Dispose();
 

@@ -159,6 +159,14 @@ public partial class DirectGpuTensorEngine
     /// zeroed full-width tensor plus a slice copy, then added the three (three memsets, three copies, two adds).
     /// Null when the recorded node is not one this can replace.
     /// </summary>
+    /// <summary>
+    /// True when this engine's backend runs the packed node <see cref="BuildPackedAttentionNode"/> builds. The blocks
+    /// are viewed per launch at offsets of W floats: only where views are free device-pointer offsets (CUDA, HIP).
+    /// Elsewhere a view can be refused for its offset's alignment or allocate, and those keep the split.
+    /// </summary>
+    internal bool SupportsPackedAttentionFusion
+        => PlacementBackend is IGpuBufferViews { ViewsAreFreeAtAnyOffset: true } and IFusedAttentionBackend;
+
     internal static LazyNode<float>? BuildPackedAttentionNode(LazyNode<float> attention, Tensor<float> packed,
         int qStart, int kStart, int vStart)
     {
@@ -166,8 +174,7 @@ public partial class DirectGpuTensorEngine
             || !recorded.Interleaved || attention.RecordingEngine is not DirectGpuTensorEngine engine || packed.Rank != 2
             // The blocks are viewed per launch at offsets of W floats: only where views are free device-pointer offsets
             // (CUDA, HIP). Elsewhere a view can be refused for its offset's alignment or allocate; those keep the split.
-            || engine.PlacementBackend is not IGpuBufferViews { ViewsAreFreeAtAnyOffset: true }
-            || engine.PlacementBackend is not IFusedAttentionBackend)
+            || !engine.SupportsPackedAttentionFusion)
             return null;
         var p0 = recorded.Params;
         int headDim = recorded.HeadDim, width = p0.H * headDim, rowWidth = packed._shape[1];

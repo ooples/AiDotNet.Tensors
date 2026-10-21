@@ -43,6 +43,26 @@ internal interface IWinogradF23Transforms
 }
 
 /// <summary>
+/// The fused Winograd weight gradient's two launches (<see cref="WinogradF23Pipeline.TryBackwardFilterFused"/>), for a
+/// backend that runs <see cref="WinogradF23KernelTemplate"/>'s shared-memory kernels in groups of exactly 256.
+/// </summary>
+internal interface IWinogradFusedFilterGradient
+{
+    /// <summary>About how many 256-wide groups fill the device once (its compute units); sizes the tile splits.</summary>
+    int FusedFilterGradientGroupTarget { get; }
+
+    /// <summary>
+    /// <see cref="WinogradF23KernelTemplate.FusedFilterGradientDirect"/> (<paramref name="direct"/>) or
+    /// <see cref="WinogradF23KernelTemplate.FusedFilterGradient"/> over <paramref name="groups"/> groups of 256, buffers
+    /// (x, res, dy) and the ints in the spec's order.
+    /// </summary>
+    void FusedFilterGradient(bool direct, IGpuBuffer x, IGpuBuffer res, IGpuBuffer dy, int groups, int[] ints);
+
+    /// <summary>dW = the split partials summed (<see cref="WinogradF23KernelTemplate.FusedFilterGradientFinish"/>).</summary>
+    void FusedFilterGradientFinish(IGpuBuffer partials, IGpuBuffer dw, int kc, int splits);
+}
+
+/// <summary>
 /// Winograd F(2x2, 3x3) forward and input gradient, and F(3x3, 2x2) weight gradient (Lavin and Gray, "Fast Algorithms
 /// for Convolutional Neural Networks", CVPR 2016), for 3x3 stride-1 dilation-1 convolutions with equal padding up to 2,
 /// on any backend that supplies <see cref="IWinogradF23Transforms"/>. Each call is three transforms and one batched
@@ -120,6 +140,48 @@ internal static class WinogradF23Pipeline
         // M[x] (K x C) = U[x] (K x P) * V[x] (P x C), one GEMM per Winograd point.
         backend.BatchedGemm(u, v, m, k, c, pi, WinogradPoints);
         transforms.FilterGradient(m, a.Output, k, c, splits: 1);
+        return true;
+    }
+
+    /// <summary>
+    /// dW[K][C][3][3] through F(3x3, 2x2) in one fused launch (<see cref="WinogradF23KernelTemplate.FusedFilterGradient"/>):
+    /// each group of 256 transforms its own dY and x tiles in shared memory and accumulates a 32 x 32 block of M, with
+    /// no U, V or M in global memory. The tiles split so the grid fills the device about once; one split writes dW
+    /// directly, more write per-split partials that a finish kernel sums in split order. Overwrites the gradient.
+    /// </summary>
+    /// <param name="requestedSplits">The tile splits to use (tests pin both paths with it); 0 sizes them to the device.</param>
+    internal static bool TryBackwardFilterFused(IDirectGpuBackend backend, IWinogradFusedFilterGradient kernels,
+        in TunedConv2DBackwardArgs a, int requestedSplits = 0)
+    {
+        if (backend is null) throw new ArgumentNullException(nameof(backend));
+        if (kernels is null) throw new ArgumentNullException(nameof(kernels));
+        if (!a.WeightGradient || !AdmitsBackward(a)) return false;
+        int n = a.Batch, c = a.InChannels, k = a.OutChannels, h = a.InHeight, w = a.InWidth, outH = a.OutHeight,
+            outW = a.OutWidth, pad = a.PadH;
+        int tilesH = (outH + 1) / 2, tilesW = (outW + 1) / 2;
+        long p = (long)n * tilesH * tilesW;
+        if (p > int.MaxValue || (long)n * c * h * w > int.MaxValue || (long)n * k * outH * outW > int.MaxValue) return false;
+        int pi = (int)p;
+        const int tile = WinogradF23KernelTemplate.FusedTile, chunk = WinogradF23KernelTemplate.FusedChunk;
+        long blocks = (long)((c + tile - 1) / tile) * ((k + tile - 1) / tile);
+        int target = Math.Max(1, kernels.FusedFilterGradientGroupTarget);
+        int splits = requestedSplits > 0
+            ? Math.Min(requestedSplits, (pi + chunk - 1) / chunk)
+            : (int)Math.Max(1, Math.Min(Math.Round((double)target / blocks), pi / chunk));
+        int tilesPerSplit = ((pi + splits - 1) / splits + chunk - 1) / chunk * chunk;
+        splits = (pi + tilesPerSplit - 1) / tilesPerSplit;
+        long groups = blocks * splits, kc = (long)k * c;
+        // 65535 groups is every API's guaranteed 1-D grid; past it the route declines (the GEMM pipeline still runs).
+        if (groups > 65535 || 9L * splits * kc > int.MaxValue) return false;
+        int[] ints = { n, c, h, w, k, outH, outW, pad, tilesH, tilesW, tilesPerSplit };
+        if (splits == 1)
+        {
+            kernels.FusedFilterGradient(direct: true, a.First, a.Output, a.Second, (int)groups, ints);
+            return true;
+        }
+        using var partials = backend.AllocateBuffer((int)(9L * splits * kc));
+        kernels.FusedFilterGradient(direct: false, a.First, partials, a.Second, (int)groups, ints);
+        kernels.FusedFilterGradientFinish(partials, a.Output, (int)kc, splits);
         return true;
     }
 

@@ -877,7 +877,9 @@ public sealed partial class WebGpuBackend
     {
         if (outerSize <= 0 || reduceSize <= 0)
             throw new ArgumentException("outerSize and reduceSize must be positive.");
-        int maxGroups = _device?.MaxWorkgroupsPerDimension ?? 65535;
+        // A 1-D dispatch past the per-dimension limit folds onto a 2-D grid (WebGpuDispatchFold), so the bound on a
+        // workgroup-per-row dispatch is its thread count (groups x 256) as an int.
+        const int maxGroups = int.MaxValue / 256;
 
         // #1157 (the CUDA #1150 split): few long rows -- a full reduction is one -- are split into chunks whose
         // partials are reduced again with this same method. WebGPU does not report its compute-unit count, so the

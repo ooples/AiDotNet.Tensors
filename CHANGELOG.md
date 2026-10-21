@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.141.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.140.0...v0.141.0) (2026-10-21)
+
+
+### ⚠ BREAKING CHANGES
+
+* **simd:** float exp and softmax results on Intel CPUs change by float32 rounding (they now match AMD's).
+
+### Bug Fixes
+
+* **gpu:** fall back to the cpu for non-float element types in the gpu into-ops ([#1478](https://github.com/ooples/AiDotNet.Tensors/issues/1478)) ([0374212](https://github.com/ooples/AiDotNet.Tensors/commit/0374212ce6e016386768ebb4ab1c3ea75ff29860))
+* **opencl:** diagnose a refused buffer view, and state the dispose-recycle preconditions ([#1486](https://github.com/ooples/AiDotNet.Tensors/issues/1486)) ([61ffe09](https://github.com/ooples/AiDotNet.Tensors/commit/61ffe0921e4f106b3ad737b3932def6a3a161895))
+* **simd:** one exp kernel on every CPU vendor ([#1458](https://github.com/ooples/AiDotNet.Tensors/issues/1458)) ([f06c41c](https://github.com/ooples/AiDotNet.Tensors/commit/f06c41c32a2e9a0b7d1588324d381fb896be058b))
+* **winograd:** compile and gate the fused weight gradient apart from the transforms ([#1484](https://github.com/ooples/AiDotNet.Tensors/issues/1484)) ([3edf831](https://github.com/ooples/AiDotNet.Tensors/commit/3edf8318fb3416fdc821a541c4fd4b7f2e84c819))
+
+
+### Performance
+
+* **compiled-gpu:** fuse a linear head into the MSE loss - one launch forward, one backward (LSTM step 63.8 -&gt; 61.1 us) ([#1447](https://github.com/ooples/AiDotNet.Tensors/issues/1447)) ([1565669](https://github.com/ooples/AiDotNet.Tensors/commit/1565669054b7711445a7d7598de58e9ef3bd93d9))
+* **cuda-conv:** 8x8-micro-tile implicit-GEMM forward for the stride-2 3x3 layers (20-23% faster per layer, ResNet-18 step -31 us) ([#1461](https://github.com/ooples/AiDotNet.Tensors/issues/1461)) ([eb28289](https://github.com/ooples/AiDotNet.Tensors/commit/eb282891ad4fb6819c7d9af0c4d14ba9ee90780b))
+* **cuda-conv:** fused Winograd dW writes dW directly when unsplit (ResNet-18 512@4 53 -&gt; 41 us, step 2.361 -&gt; 2.313 ms) ([#1468](https://github.com/ooples/AiDotNet.Tensors/issues/1468)) ([cc2d70e](https://github.com/ooples/AiDotNet.Tensors/commit/cc2d70ef0b4ae983b89f7b30f0923e42f5c74626))
+* **cuda-conv:** fused Winograd F(3x3,2x2) weight gradient - one launch plus a split finish ([#1465](https://github.com/ooples/AiDotNet.Tensors/issues/1465)) ([9e9347e](https://github.com/ooples/AiDotNet.Tensors/commit/9e9347ed4ed62fce20907defc4950d07491b19c8))
+* **cuda-lstm:** backward GEMMs - bias from the first column tile, one-wave row splits with an in-kernel reduce (10.2 -&gt; 8.6 us) ([#1434](https://github.com/ooples/AiDotNet.Tensors/issues/1434)) ([8352dc2](https://github.com/ooples/AiDotNet.Tensors/commit/8352dc239569679ecff3c307c3975a4c18727e56))
+* **cuda-optimizer:** ping-pong SGD update for small models - bounded grid, loads before stores, one-warp tail, undo folded in (LSTM 7.3 -&gt; 3.4 us per step) ([#1463](https://github.com/ooples/AiDotNet.Tensors/issues/1463)) ([78ddc30](https://github.com/ooples/AiDotNet.Tensors/commit/78ddc302e4a4f0350ef7f1272cb0e399358c49f6))
+* **cuda-step-io:** copy only changed step inputs (LSTM -3.6, MLP -22, Transformer -3.3 us) ([#1456](https://github.com/ooples/AiDotNet.Tensors/issues/1456)) ([a3238ab](https://github.com/ooples/AiDotNet.Tensors/commit/a3238ab09439e20a756bf660a93ece77a31d1d5b))
+* **cuda-step-io:** one system fence in the epilogue; the loss-gradient reseed rides in the prologue ([#1454](https://github.com/ooples/AiDotNet.Tensors/issues/1454)) ([ce606dc](https://github.com/ooples/AiDotNet.Tensors/commit/ce606dc0107d9bbd35e46c6669e6feb399f41b75))
+* **cuda:** fused winograd conv loads a 4x6 window per two neighbouring tiles ([#1470](https://github.com/ooples/AiDotNet.Tensors/issues/1470)) ([8509a4e](https://github.com/ooples/AiDotNet.Tensors/commit/8509a4e6ae4c8371e46322ebbb7cab578c897f93))
+* **cuda:** stride-2 3x3 input gradient - all four sub-pixel phases in one kernel (ResNet step -60 us) ([#1477](https://github.com/ooples/AiDotNet.Tensors/issues/1477)) ([71e82c9](https://github.com/ooples/AiDotNet.Tensors/commit/71e82c9ceb388cf245d328fe2706db1e4e60279a))
+* **gpu:** overlap host and device on opencl and fuse convolution bias and relu on every backend ([#1435](https://github.com/ooples/AiDotNet.Tensors/issues/1435)) ([dfa37a6](https://github.com/ooples/AiDotNet.Tensors/commit/dfa37a6cefd8b5b265a3150f67e47eade6104435))
+* **lstm:** take the backward recurrence's coefficients off the per-step chain ([#1444](https://github.com/ooples/AiDotNet.Tensors/issues/1444)) ([7106951](https://github.com/ooples/AiDotNet.Tensors/commit/7106951c983b4f21abe235ef0a29836791796f1c))
+* PyTorch parity at its best ([#1055](https://github.com/ooples/AiDotNet.Tensors/issues/1055)), conv data path ([#1335](https://github.com/ooples/AiDotNet.Tensors/issues/1335)), CPU saturation ([#653](https://github.com/ooples/AiDotNet.Tensors/issues/653)), resident programs ([#890](https://github.com/ooples/AiDotNet.Tensors/issues/890)) ([#1430](https://github.com/ooples/AiDotNet.Tensors/issues/1430)) ([d3edb84](https://github.com/ooples/AiDotNet.Tensors/commit/d3edb84444709f3da44841260610ce312208927c))
+* webgpu dispatches past 65535 workgroups fold onto a 2-d grid; conv passes are one fma chain ([#1466](https://github.com/ooples/AiDotNet.Tensors/issues/1466)) ([6a827a3](https://github.com/ooples/AiDotNet.Tensors/commit/6a827a342132f6e9b902098454248a36909504b2))
+
 ## [0.140.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.139.2...v0.140.0) (2026-10-19)
 
 

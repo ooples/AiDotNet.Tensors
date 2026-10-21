@@ -32,12 +32,15 @@ internal interface IDeviceReadbackFactory
 }
 
 /// <summary>
-/// The readback for a backend without an asynchronous device-to-host copy: <see cref="Enqueue"/> downloads at once
-/// (the download waits for the submitted work, so the value is the same), and <see cref="Read"/> returns it.
+/// The readback for a backend without an asynchronous device-to-host copy: <see cref="Enqueue"/> fixes the value on the
+/// device and <see cref="Read"/> downloads it, so a step that never reads pays no wait at all - the point of the
+/// interface. The download is the host's only wait, and it waits for work the device has usually long finished by then.
 /// <para>The source is a float buffer (a training step's loss). Its prefix is copied on the device into this
 /// readback's own float buffer, which is downloaded: a backend's byte download accepts only its byte buffers (OpenCL
 /// threw "Buffer must be a DirectOpenClGpuByteBuffer", failing every compiled GPU training step off CUDA), and its
-/// float download reads a whole buffer, where the loss sits in a larger pooled one.</para>
+/// float download reads a whole buffer, where the loss sits in a larger pooled one. The copy must happen at the
+/// enqueue, not the read: the source is a pooled buffer the steps after it reuse, so only the copy pins which values
+/// this readback returns.</para>
 /// </summary>
 internal sealed class SynchronousDeviceReadback : IDeviceReadback
 {
@@ -45,6 +48,8 @@ internal sealed class SynchronousDeviceReadback : IDeviceReadback
     private readonly int _capacity;
     private byte[] _bytes = Array.Empty<byte>();
     private IGpuBuffer? _staging;
+    private int _queuedBytes;
+    private bool _downloaded;
     private bool _queued;
     private bool _disposed;
 
@@ -67,12 +72,12 @@ internal sealed class SynchronousDeviceReadback : IDeviceReadback
         if (source.Size < floats)
             throw new ArgumentOutOfRangeException(nameof(byteCount), $"The buffer holds {source.Size} floats, fewer than {byteCount} bytes.");
         // A backend's float download reads a whole buffer, and the source is usually a larger pooled one: copy the
-        // requested prefix into this readback's own buffer on the device and download only that.
+        // requested prefix into this readback's own buffer on the device and download only that. The copy is queued
+        // behind the work already submitted and does not wait; the download is left to Read.
         var staging = _staging ??= _backend.AllocateBuffer((_capacity + sizeof(float) - 1) / sizeof(float));
         _backend.Copy(source, 0, staging, 0, floats);
-        var values = _backend.DownloadBuffer(staging);
-        if (_bytes.Length != byteCount) _bytes = new byte[byteCount];
-        Buffer.BlockCopy(values, 0, _bytes, 0, byteCount);
+        _queuedBytes = byteCount;
+        _downloaded = false;
         _queued = true;
         HasUnreadValue = true;
     }
@@ -81,6 +86,22 @@ internal sealed class SynchronousDeviceReadback : IDeviceReadback
     {
         if (_disposed) throw new ObjectDisposedException(nameof(SynchronousDeviceReadback));
         if (!_queued) throw new InvalidOperationException("Nothing was queued for readback.");
+        if (!_downloaded)
+        {
+            // The one wait, taken where the value is wanted rather than where it was queued. The staging copy already
+            // decided which values these are, so waiting later cannot change them.
+            var staging = _staging ?? throw new InvalidOperationException("The queued readback has no staging buffer.");
+            // The download is the only part that needs the backend alive. An owner resolves a pending value before it
+            // tears the backend down (CompiledTrainingPlan materializes the loss host array first); past that there is
+            // nothing to download, and the InvalidOperationException is what those owners already handle.
+            if (!_backend.IsAvailable)
+                throw new InvalidOperationException("The backend is gone, so the queued readback cannot be downloaded.");
+            var values = _backend.DownloadBuffer(staging);
+            if (_bytes.Length != _queuedBytes) _bytes = new byte[_queuedBytes];
+            Buffer.BlockCopy(values, 0, _bytes, 0, _queuedBytes);
+            _downloaded = true;
+        }
+
         HasUnreadValue = false;
         return _bytes;
     }

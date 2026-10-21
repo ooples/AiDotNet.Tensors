@@ -23,6 +23,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 public interface IMultiTensorGpuOptimizerBackend : IDirectGpuBackend
 {
     /// <summary>
+    /// True when the guarded updates below read <c>finiteGuard</c> in their kernels, so the launch needs no host read
+    /// of the gradients' finiteness and the step does not wait on the device. False where the guard is read on the host
+    /// before launching (<see cref="PerTensorMultiTensorOptimizer"/>'s guarded entry points): a caller that also
+    /// deferred a finiteness readback of its own would then wait twice for one verdict, so it resolves finiteness on
+    /// the host and launches the unguarded update instead.
+    /// </summary>
+    bool GuardsFiniteOnDevice { get; }
+
+    /// <summary>
     /// Adam update over a list of fp32 parameter tensors in one launch. The four buffer lists
     /// are parallel: index <c>i</c> gives the param / gradient / first-moment / second-moment
     /// buffers for tensor <c>i</c>, and <paramref name="sizes"/>[i] its element count. Every

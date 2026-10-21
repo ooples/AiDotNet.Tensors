@@ -169,6 +169,39 @@ public sealed class FusedAttentionBackendParityTests
     }
 
     /// <summary>
+    /// The smallest element offset <paramref name="views"/> will create a view at: 1 where views are free device-pointer
+    /// offsets (CUDA, HIP), otherwise the device's sub-buffer origin alignment in floats, found by asking for the
+    /// smallest view it accepts. <see cref="IGpuBufferViews"/> reports that requirement only by refusing a view, so a
+    /// probe is the only way to hold the packed layout below to offsets the device can actually take: an OpenCL device
+    /// aligns sub-buffer origins to CL_DEVICE_MEM_BASE_ADDR_ALIGN, which is 256 bytes on this project's AMD card.
+    /// </summary>
+    private static int ViewOffsetStride(IDirectGpuBackend backend, IGpuBufferViews views)
+    {
+        if (views.ViewsAreFreeAtAnyOffset) return 1;
+        const int probeFloats = 8192;
+        using var probe = backend.AllocateBuffer(new float[probeFloats]);
+        for (int stride = 1; stride <= probeFloats / 2; stride *= 2)
+        {
+            var view = views.TryCreateView(probe, stride, probeFloats - stride);
+            if (view is null) continue;
+            view.Dispose();
+            return stride;
+        }
+
+        throw new InvalidOperationException(
+            $"{backend.GetType().Name} refused a buffer view at every offset up to {probeFloats / 2} floats.");
+    }
+
+    /// <summary>
+    /// The smallest multiple of <paramref name="headCount"/> whose packed block width is a whole number of
+    /// <paramref name="offsetStride"/> elements, so that the K and V blocks start where a view is allowed.
+    /// </summary>
+    private static int HeadsAligned(int headCount, int headDim, int offsetStride)
+        => headCount * (offsetStride / Gcd(offsetStride, headCount * headDim));
+
+    private static int Gcd(int a, int b) => b == 0 ? a : Gcd(b, a % b);
+
+    /// <summary>
     /// The packed layout MultiHeadAttentionPacked runs: q, k and v as views at column offsets 0, W and 2W of one row-major
     /// [B * S, 3W] projection (row stride 3W), and dQ, dK, dV as views of a second such buffer (dQSpan) pre-filled with a
     /// pattern. Every element of that gradient buffer must come out equal to the dense interleaved run's gradients, which
@@ -178,9 +211,13 @@ public sealed class FusedAttentionBackendParityTests
     {
         var fused = Assert.IsAssignableFrom<IFusedAttentionBackend>(backend);
         var views = Assert.IsAssignableFrom<IGpuBufferViews>(backend);
-        foreach (var (b, h, s, d, causal) in new[] { (2, 2, 9, 16, false), (1, 3, 6, 32, true) })
+        int offsetStride = ViewOffsetStride(backend, views);
+        foreach (var (b, headCount, s, d, causal) in new[] { (2, 2, 9, 16, false), (1, 3, 6, 32, true) })
         {
             Assert.True(fused.SupportsFusedAttention(d));
+            // Widen the head count until the K and V block offsets land on a stride the device will view at. The layout,
+            // the launches and every assertion below stay exactly what the dense run is held to.
+            int h = HeadsAligned(headCount, d, offsetStride);
             int w = h * d, rowWidth = 3 * w, rows = b * s;
             float[] x = Random(rows * rowWidth, 21 + d), dO = Random(rows * w, 22 + d);
             float[] q = new float[rows * w], k = new float[rows * w], v = new float[rows * w];
@@ -218,8 +255,11 @@ public sealed class FusedAttentionBackendParityTests
             using var gBuf = backend.AllocateBuffer(Filled(rows * rowWidth));
             using var oPacked = backend.AllocateBuffer(Filled(rows * w));
             using var lsePacked = backend.AllocateBuffer(Filled(b * h * s));
+            // The control for the stride above: a refused view here means the widening did not put the block on an
+            // offset the device takes, and the packed layout goes unchecked unless this says so.
             IGpuBuffer View(IGpuBuffer whole, int start) => views.TryCreateView(whole, start, whole.Size - start)
-                ?? throw new InvalidOperationException("view refused");
+                ?? throw new InvalidOperationException(
+                    $"view refused at element offset {start} (stride {offsetStride}, H {h}, D {d})");
             using var qv = View(xBuf, 0);
             using var kv = View(xBuf, w);
             using var vv = View(xBuf, 2 * w);

@@ -351,10 +351,278 @@ extern ""C"" __global__ void wino_f23_output(const float* __restrict__ mm, float
         if (w + 1 < outW) dst[(h + i) * outW + w + 1] = o1;
     }
 }
+// Fused Winograd F(3x3, 2x2) weight gradient: one launch (plus conv2d_wgrad_winograd_finish when the tiles are split),
+// in place of wino_f32w_dy + wino_f32w_input + wino_gemm + wino_f32w_output (whose 16-plane U and V scratch alone were
+// 4 MB each at ResNet-18's 128-channel layers, mostly DRAM traffic). Block (blockIdx.x, blockIdx.y, blockIdx.z) owns input channels
+// c0 .. c0 + 31, output channels k0 .. k0 + 31 and the dY tiles [z * tilesPerSplit, ...). Per chunk of WF_PC tiles it
+// transforms dY (U = A g A^T) and x (V = B^T d B) into shared memory, then thread (tx, tk, tc) accumulates
+// M[x][k][c] += U[x][p][k] V[x][p][c] for components 4tx .. 4tx + 3, channels 4tk .., 4tc .. (64 accumulators). The
+// epilogue gathers each (k, c)'s 16 components through shared memory and writes G^T M G (3x3): to dW when the tiles are
+// not split (DIRECT: staged through shared memory so the stores are contiguous dW rows), else component-major to
+// out[z][q][k][c] for conv2d_wgrad_winograd_finish.
+// HIP, OpenCL, Vulkan, Metal and WebGPU run the same algorithm from WinogradF23KernelTemplate (FusedFilterGradient*,
+// restated for 16 KB of shared memory) through WinogradF23Pipeline.TryBackwardFilterFused.
+#define WF_TK 32
+#define WF_TC 32
+#define WF_PC 8
+#define WF_LD 36   // padded row: a warp's 8 tiles x 4 channels of transform stores hit 32 distinct banks
+template <bool DIRECT>
+__device__ __forceinline__ void wino_f32w_fused_body(
+    const float* __restrict__ x, const float* __restrict__ dy, float* __restrict__ out,
+    int N, int C, int H, int W, int K, int outH, int outW, int pad, int tilesH, int tilesW, int tilesPerSplit)
+{
+    __shared__ __align__(16) float smem[2 * 16 * WF_PC * WF_LD];
+    float (*Us)[WF_PC][WF_LD] = reinterpret_cast<float (*)[WF_PC][WF_LD]>(smem);
+    float (*Vs)[WF_PC][WF_LD] = reinterpret_cast<float (*)[WF_PC][WF_LD]>(smem + 16 * WF_PC * WF_LD);
+    const int tid = threadIdx.x;
+    const int c0 = blockIdx.x * WF_TC, k0 = blockIdx.y * WF_TK;
+    const int TT = tilesH * tilesW, P = N * TT;
+    const int pBegin = blockIdx.z * tilesPerSplit, pEnd = min(P, pBegin + tilesPerSplit);
+    const int tc = tid & 7, tk = (tid >> 3) & 7, tx = tid >> 6;
+    // Transform role: tile j (fastest, so a warp's loads walk along image rows) of the chunk, channel row r.
+    const int tj = tid & (WF_PC - 1), tr = tid / WF_PC;
+
+    float acc[4][4][4];
+    #pragma unroll
+    for (int a = 0; a < 4; a++)
+        #pragma unroll
+        for (int b = 0; b < 4; b++)
+            #pragma unroll
+            for (int e = 0; e < 4; e++) acc[a][b][e] = 0.0f;
+
+    for (int pc = pBegin; pc < pEnd; pc += WF_PC)
+    {
+        const int p = pc + tj;
+        const bool pin = p < pEnd;
+        int n = 0, th = 0, tw = 0;
+        if (pin) { n = p / TT; int t = p - n * TT; th = t / tilesW; tw = t - th * tilesW; }
+        {
+            const int k = k0 + tr;
+            float g00 = 0.0f, g01 = 0.0f, g10 = 0.0f, g11 = 0.0f;
+            if (pin && k < K)
+            {
+                const float* src = dy + ((long long)n * K + k) * outH * outW;
+                const int h = th * 2, w = tw * 2;
+                g00 = __ldg(src + h * outW + w);
+                g01 = w + 1 < outW ? __ldg(src + h * outW + w + 1) : 0.0f;
+                g10 = h + 1 < outH ? __ldg(src + (h + 1) * outW + w) : 0.0f;
+                g11 = (h + 1 < outH && w + 1 < outW) ? __ldg(src + (h + 1) * outW + w + 1) : 0.0f;
+            }
+            const float ra[4] = { g00, g00 + g10, g00 - g10, -g10 };
+            const float rb[4] = { g01, g01 + g11, g01 - g11, -g11 };
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+            {
+                Us[i * 4 + 0][tj][tr] = ra[i];
+                Us[i * 4 + 1][tj][tr] = ra[i] + rb[i];
+                Us[i * 4 + 2][tj][tr] = ra[i] - rb[i];
+                Us[i * 4 + 3][tj][tr] = -rb[i];
+            }
+        }
+        {
+            const int c = c0 + tr;
+            const int h0 = th * 2 - pad, w0 = tw * 2 - pad;
+            const float* src = x + ((long long)n * C + (c < C ? c : 0)) * H * W;
+            const bool cin = pin && c < C;
+            float d[4][4];
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+            {
+                const int hh = h0 + i;
+                #pragma unroll
+                for (int j = 0; j < 4; j++)
+                {
+                    const int ww = w0 + j;
+                    d[i][j] = (cin && (unsigned)hh < (unsigned)H && (unsigned)ww < (unsigned)W) ? __ldg(src + hh * W + ww) : 0.0f;
+                }
+            }
+            float s[4][4];
+            #pragma unroll
+            for (int j = 0; j < 4; j++)
+            {
+                s[0][j] = d[0][j] - d[2][j];
+                s[1][j] = d[1][j] + d[2][j];
+                s[2][j] = d[2][j] - d[1][j];
+                s[3][j] = d[1][j] - d[3][j];
+            }
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+            {
+                Vs[i * 4 + 0][tj][tr] = s[i][0] - s[i][2];
+                Vs[i * 4 + 1][tj][tr] = s[i][1] + s[i][2];
+                Vs[i * 4 + 2][tj][tr] = s[i][2] - s[i][1];
+                Vs[i * 4 + 3][tj][tr] = s[i][1] - s[i][3];
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int j = 0; j < WF_PC; j++)
+        {
+            #pragma unroll
+            for (int xi = 0; xi < 4; xi++)
+            {
+                const int xx = tx * 4 + xi;
+                const float4 u = *reinterpret_cast<const float4*>(&Us[xx][j][tk * 4]);
+                const float4 v = *reinterpret_cast<const float4*>(&Vs[xx][j][tc * 4]);
+                const float uu[4] = { u.x, u.y, u.z, u.w }, vv[4] = { v.x, v.y, v.z, v.w };
+                #pragma unroll
+                for (int a = 0; a < 4; a++)
+                    #pragma unroll
+                    for (int b = 0; b < 4; b++) acc[xi][a][b] = fmaf(uu[a], vv[b], acc[xi][a][b]);
+            }
+        }
+        __syncthreads();
+    }
+
+    if constexpr (DIRECT)
+    {
+    // Epilogue, in quarters of the block's k rows. Ms[x][8 k][33] gathers each (k, c)'s 16 components (row stride 33: the
+    // writers' 4 k rows x 8 column quads hit 32 distinct banks); each (k, c)'s G^T M G goes to Os[8 k][32 c * 9], whose
+    // rows are the contiguous dW[k][c0 .. c0 + 31][3][3] spans, copied out coalesced. The host launches this entry
+    // (wino_f32w_fused_direct) with one split only, so out is dW itself; blockIdx.z's dW-sized offset would address a
+    // separate per-split dW slice. The split path is the component-major one below (conv2d_wgrad_winograd_finish).
+    float* Ms = smem;                      // [16][8][33]
+    float* Os = smem + 16 * 8 * 33;        // [8][32 * 9]
+    float* dst = out + (long long)blockIdx.z * K * C * 9;
+    const int cw = min(WF_TC, C - c0);     // this block's columns (ragged last tile)
+    #pragma unroll
+    for (int quarter = 0; quarter < 4; quarter++)
+    {
+        if ((tk >> 1) == quarter)
+        {
+            #pragma unroll
+            for (int xi = 0; xi < 4; xi++)
+                #pragma unroll
+                for (int a = 0; a < 4; a++)
+                    #pragma unroll
+                    for (int b = 0; b < 4; b++)
+                        Ms[(tx * 4 + xi) * 264 + ((tk & 1) * 4 + a) * 33 + tc * 4 + b] = acc[xi][a][b];
+        }
+        __syncthreads();
+        {
+            const int pair = tid, kl = pair >> 5, cl = pair & 31;   // 256 pairs: 8 k x 32 c
+            float m[16];
+            #pragma unroll
+            for (int q = 0; q < 16; q++) m[q] = Ms[q * 264 + kl * 33 + cl];
+            float t[3][4];
+            #pragma unroll
+            for (int j = 0; j < 4; j++)
+            {
+                const float m0 = m[j], m1 = m[4 + j], m2 = m[8 + j], m3 = m[12 + j];
+                t[0][j] = m0 + 0.5f * (m1 + m2);
+                t[1][j] = 0.5f * (m1 - m2);
+                t[2][j] = 0.5f * (m1 + m2) + m3;
+            }
+            float* o = Os + kl * 288 + cl * 9;
+            #pragma unroll
+            for (int i = 0; i < 3; i++)
+            {
+                const float a = t[i][0], b = t[i][1], cc = t[i][2], dd = t[i][3];
+                o[i * 3 + 0] = a + 0.5f * (b + cc);
+                o[i * 3 + 1] = 0.5f * (b - cc);
+                o[i * 3 + 2] = 0.5f * (b + cc) + dd;
+            }
+        }
+        __syncthreads();
+        // Copy the 8 rows of cw * 9 contiguous floats out.
+        for (int i = tid; i < 8 * 288; i += 256)
+        {
+            const int kl = i / 288, r = i - kl * 288;
+            const int k = k0 + quarter * 8 + kl;
+            if (k < K && r < cw * 9) dst[((long long)k * C + c0) * 9 + r] = Os[i];
+        }
+        __syncthreads();
+    }
+    }
+    else
+    {
+    // Epilogue, in two halves of the k rows: Ms[x][16 k][33] gathers each (k, c)'s 16 components (row stride 33: the
+    // writers' 4 k rows x 8 column quads hit 32 distinct banks). Each (k, c)'s G^T M G goes out component-major,
+    // out[z][q][k][c] (q = 3i + j), so a warp's stores are contiguous; conv2d_wgrad_winograd_finish sums the splits and
+    // writes dW[k][c][3][3].
+    float* Ms = smem;
+    const long long plane = (long long)K * C;
+    float* dst = out + (long long)blockIdx.z * 9 * plane;
+    #pragma unroll
+    for (int half = 0; half < 2; half++)
+    {
+        if ((tk >> 2) == half)
+        {
+            #pragma unroll
+            for (int xi = 0; xi < 4; xi++)
+                #pragma unroll
+                for (int a = 0; a < 4; a++)
+                    #pragma unroll
+                    for (int b = 0; b < 4; b++)
+                        Ms[(tx * 4 + xi) * 528 + ((tk & 3) * 4 + a) * 33 + tc * 4 + b] = acc[xi][a][b];
+        }
+        __syncthreads();
+        for (int pair = tid; pair < 512; pair += 256)
+        {
+            const int kl = pair >> 5, cl = pair & 31;
+            const int k = k0 + half * 16 + kl, c = c0 + cl;
+            if (k < K && c < C)
+            {
+                float m[16];
+                #pragma unroll
+                for (int q = 0; q < 16; q++) m[q] = Ms[q * 528 + kl * 33 + cl];
+                float t[3][4];
+                #pragma unroll
+                for (int j = 0; j < 4; j++)
+                {
+                    const float m0 = m[j], m1 = m[4 + j], m2 = m[8 + j], m3 = m[12 + j];
+                    t[0][j] = m0 + 0.5f * (m1 + m2);
+                    t[1][j] = 0.5f * (m1 - m2);
+                    t[2][j] = 0.5f * (m1 + m2) + m3;
+                }
+                float* o = dst + (long long)k * C + c;
+                #pragma unroll
+                for (int i = 0; i < 3; i++)
+                {
+                    const float a = t[i][0], b = t[i][1], cc = t[i][2], dd = t[i][3];
+                    o[(i * 3 + 0) * plane] = a + 0.5f * (b + cc);
+                    o[(i * 3 + 1) * plane] = 0.5f * (b - cc);
+                    o[(i * 3 + 2) * plane] = 0.5f * (b + cc) + dd;
+                }
+            }
+        }
+        __syncthreads();
+    }
+    }
+}
+
+// One split of the tiles: writes dW directly.
+extern ""C"" __global__ __launch_bounds__(256) void wino_f32w_fused_direct(
+    const float* __restrict__ x, const float* __restrict__ dy, float* __restrict__ out,
+    int N, int C, int H, int W, int K, int outH, int outW, int pad, int tilesH, int tilesW, int tilesPerSplit)
+{
+    wino_f32w_fused_body<true>(x, dy, out, N, C, H, W, K, outH, outW, pad, tilesH, tilesW, tilesPerSplit);
+}
+
+// Split tiles: component-major partials for conv2d_wgrad_winograd_finish.
+extern ""C"" __global__ __launch_bounds__(256) void wino_f32w_fused(
+    const float* __restrict__ x, const float* __restrict__ dy, float* __restrict__ out,
+    int N, int C, int H, int W, int K, int outH, int outW, int pad, int tilesH, int tilesW, int tilesPerSplit)
+{
+    wino_f32w_fused_body<false>(x, dy, out, N, C, H, W, K, outH, outW, pad, tilesH, tilesW, tilesPerSplit);
+}
+
+// dW[k][c][3][3] = sum over the splits of partials[z][q][k][c] (q = 3i + j), in split order.
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_wgrad_winograd_finish(
+    const float* __restrict__ partials, float* __restrict__ dw, int KC, int splits)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;   // i = (k * C + c) * 9 + q, the dW element
+    if (i >= KC * 9) return;
+    const int kc = i / 9, q = i - kc * 9;
+    float sum = 0.0f;
+    for (int z = 0; z < splits; z++) sum += partials[((long long)z * 9 + q) * KC + kc];
+    dw[i] = sum;
+}
 ";
 
     public static string[] GetKernelNames() => new[]
     {
         "wino_f23_filter", "wino_f23_filter_flip", "wino_f23_input", "wino_gemm128", "wino_gemm64", "wino_f23_output", "wino_f32w_dy", "wino_f32w_input", "wino_f32w_output",
+        "wino_f32w_fused", "wino_f32w_fused_direct", "conv2d_wgrad_winograd_finish",
     };
 }

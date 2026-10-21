@@ -302,6 +302,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public ulong MaxMemAllocSize { get; private set; }
 
         /// <summary>
+        /// Byte alignment this device requires of a sub-buffer origin (<c>CL_DEVICE_MEM_BASE_ADDR_ALIGN</c>, which the
+        /// device reports in bits). An origin off this alignment fails clCreateSubBuffer with
+        /// <c>CL_MISALIGNED_SUB_BUFFER_OFFSET (-13)</c>, so a view caller can rule the offset out, and say what the
+        /// device wanted, without paying a failed call. Zero when the query failed, which leaves the check to the driver.
+        /// </summary>
+        public uint SubBufferAlignmentBytes { get; private set; }
+
+        /// <summary>
         /// GPU memory bandwidth in bytes/second (approximate).
         /// </summary>
         public ulong MemoryBandwidth { get; private set; }
@@ -490,6 +498,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             // hot allocation path (DirectOpenClBuffer ctor) can guard against
             // CL_INVALID_BUFFER_SIZE (-61) without a syscall per allocation.
             MaxMemAllocSize = OpenClNativeBindings.GetDeviceInfoULong(_device, OpenClNativeBindings.CL_DEVICE_MAX_MEM_ALLOC_SIZE);
+            // Sub-buffer origin alignment (issue: refused buffer views). Reported in bits, so divide once here rather
+            // than per view.
+            SubBufferAlignmentBytes =
+                OpenClNativeBindings.GetDeviceInfoUInt(_device, OpenClNativeBindings.CL_DEVICE_MEM_BASE_ADDR_ALIGN) / 8;
 
             // Get work group capabilities
             MaxWorkGroupSize = (ulong)OpenClNativeBindings.GetDeviceInfoSizeT(_device, OpenClNativeBindings.CL_DEVICE_MAX_WORK_GROUP_SIZE);
