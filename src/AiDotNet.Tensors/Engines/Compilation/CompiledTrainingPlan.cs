@@ -26,7 +26,7 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 ///
 /// This REPLACES the GradientTape for compiled workloads.
 /// </summary>
-internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompiledTrainingPlanIntrospection<T>, IPingPongOwner
+internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompiledTrainingPlanIntrospection<T>, IPingPongOwner
 {
     // Phase G.4: mutable so EnableFrozenWeightOptimizations() can swap in
     // a rebuilt forward-action array using allowCachedB=true.
@@ -8725,9 +8725,41 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // would be missed).
         HashSet<Tensor<T>>? gradRequired =
             parameters.Length > 0 && !useGradPool && fp16HeteroOrder is null ? requiresGradTensors : null;
+
+        // ResNet's downsampling pairs (a 3x3 stride-2 convolution and its 1x1 projection shortcut reading the same
+        // input): one GPU-dispatched action writes the input's gradient once (CompiledTrainingPlan.ShortcutPair.cs).
+        var shortcutPairs = new Dictionary<int, (int Main, int Shortcut)>();
+        var consumedByShortcutPair = new HashSet<int>();
+        if (typeof(T) == typeof(float) && preferGenericForGpu && !useGradPool && fp16HeteroOrder is null
+            && engine is DirectGpuTensorEngine shortcutEngine
+            && Environment.GetEnvironmentVariable("AIDOTNET_CONV_SHORTCUT_FUSION") != "0")
+        {
+            var excluded = new HashSet<int>(fusedStepIndices);
+            excluded.UnionWith(consumedByConvEpilogue);
+            excluded.UnionWith(convEpilogueBackwardSpecs.Keys);
+            excluded.UnionWith(analyticBackwardSpecs.Keys);
+            DetectShortcutConvPairs(forwardSteps, requiresGradTensors, excluded, shortcutEngine, shortcutPairs,
+                consumedByShortcutPair);
+        }
+
         for (int i = forwardSteps.Count - 1; i >= 0; i--)
         {
             if (fusedStepIndices.Contains(i)) continue;
+            if (consumedByShortcutPair.Contains(i)) continue;
+            if (shortcutPairs.TryGetValue(i, out var shortcutPair))
+            {
+                var mainStep = forwardSteps[shortcutPair.Main];
+                var shortcutStep = forwardSteps[shortcutPair.Shortcut];
+                backwardActions.Add(BuildShortcutPairBackward(mainStep, shortcutStep, shortcutPair.Shortcut > shortcutPair.Main,
+                    gradMap, gradRequired, requiresGradTensors));
+                backwardStepNames.Add("generic:Conv2D+ShortcutPair");
+                // GPU-dispatched like the generic accumulator (graph-capturable), and it accumulates into both steps'
+                // inputs as their generic backwards would.
+                genericBackwardCount++;
+                genericBackwardSteps.Add(mainStep);
+                genericBackwardSteps.Add(shortcutStep);
+                continue;
+            }
             var step = forwardSteps[i];
             if (step.BackwardFn == null) continue;
             // No parameter upstream of this step's output: its backward only produces gradients nothing reads.
