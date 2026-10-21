@@ -154,6 +154,7 @@ public sealed partial class CudaBackend : IConvBiasActivationBackend
                         true, _ => HasTunedKernel("conv2d_direct"), (in CudaConv2DArgs a) => LaunchConv2DDirect(a)));
                     // #890 phase 4b: the declared implicit-GEMM programs, last, so never the reference.
                     AddDeclaredConvForwardCandidates(candidates);
+                    _conv2DForwardCandidateList = candidates.ToArray();
                     _conv2DForwardSlot = new TunedKernelSlot<CudaConv2DArgs>(TunedKernelOp.Conv2DForward,
                         TunedDeviceKey,
                         new CudaTunedKernelHarness<CudaConv2DArgs>(this, ConvolutionTolerance,
@@ -302,14 +303,13 @@ public sealed partial class CudaBackend : IConvBiasActivationBackend
             outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, bias, activation);
         // cuDNN, when the policy routes convolutions there, then the passes; otherwise the tuned routes (each applies the
         // epilogue, in its output kernel or as passes after it), else the generic dispatch and the passes.
-        if (CudaDispatchPolicy.UseCudnnForConv || !Conv2DForwardSlot.TryExecute(args.Shape(), args))
+        // With cuDNN on, the vendor slot (cuDNN's default the reference, every cuDNN algorithm and backend route a
+        // candidate); every candidate applies the epilogue itself.
+        var slot = CudaDispatchPolicy.UseCudnnForConv ? Conv2DForwardVendorSlot : Conv2DForwardSlot;
+        if (!slot.TryExecute(args.Shape(), args))
         {
-            if (CudaDispatchPolicy.UseCudnnForConv)
-                Conv2D(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
-                    kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
-            else
-                LaunchConv2DGeneric(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
-                    outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+            LaunchConv2DGeneric(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
+                outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
             RunConvEpiloguePasses(args);
         }
         return true;

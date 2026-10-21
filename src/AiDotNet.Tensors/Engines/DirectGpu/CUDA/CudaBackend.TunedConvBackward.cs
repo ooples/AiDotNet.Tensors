@@ -93,6 +93,7 @@ public sealed partial class CudaBackend
                             true, _ => HasTunedKernel("conv2d_backward_kernel"), (in TunedConv2DBackwardArgs a) => LaunchDwDirect(a)));
                     // #890 phase 4b: the declared implicit-GEMM programs, last, so never the reference.
                     AddDeclaredConvBackwardCandidates(candidates, weightGradient: true);
+                    _conv2DBackwardFilterCandidateList = candidates.ToArray();
                     _conv2DBackwardFilterSlot = new TunedKernelSlot<TunedConv2DBackwardArgs>(TunedKernelOp.Conv2DBackwardFilter,
                         TunedDeviceKey, BackwardHarness(), () => GpuDeterminism.IsActive, candidates.ToArray());
                 }
@@ -153,6 +154,7 @@ public sealed partial class CudaBackend
                         candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("nvrtc.conv2d_dx.direct", TunedKernelOrigin.Builtin,
                             true, _ => HasTunedKernel("conv2d_backward_input"), (in TunedConv2DBackwardArgs a) => LaunchDxDirect(a)));
                     AddDeclaredConvBackwardCandidates(candidates, weightGradient: false);
+                    _conv2DBackwardDataCandidateList = candidates.ToArray();
                     _conv2DBackwardDataSlot = new TunedKernelSlot<TunedConv2DBackwardArgs>(TunedKernelOp.Conv2DBackwardData,
                         TunedDeviceKey, BackwardHarness(), () => GpuDeterminism.IsActive, candidates.ToArray());
                 }

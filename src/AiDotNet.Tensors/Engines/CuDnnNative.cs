@@ -1838,7 +1838,8 @@ public sealed class CuDnnConvolution : IDisposable
         int padH = 0, int padW = 0,
         int strideH = 1, int strideW = 1,
         int dilationH = 1, int dilationW = 1,
-        CuDnnNative.CudnnDataType dataType = CuDnnNative.CudnnDataType.Float)
+        CuDnnNative.CudnnDataType dataType = CuDnnNative.CudnnDataType.Float,
+        int algorithm = -1, CuDnnNative.CudnnMathType mathType = CuDnnNative.CudnnMathType.TensorOp)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(CuDnnConvolution));
 
@@ -1853,7 +1854,7 @@ public sealed class CuDnnConvolution : IDisposable
         // accuracy-preserving mixed-precision setting. For fp32 data, compute
         // is also fp32 (TF32 on Ampere+ is governed orthogonally by cuBLAS's
         // math mode — see CudaDispatchPolicy.AllowTF32).
-        convDesc.Set2D(padH, padW, strideH, strideW, dilationH, dilationW, CuDnnNative.CudnnDataType.Float);
+        SetConvolution(convDesc, padH, padW, strideH, strideW, dilationH, dilationW, mathType);
 
         // Verify output shape agrees with cuDNN's internal shape calc.
         // Mismatch would mean the caller pre-allocated the wrong-size
@@ -1876,11 +1877,15 @@ public sealed class CuDnnConvolution : IDisposable
         // cudnnGetConvolutionForwardAlgorithm_v7, caches it in
         // AutotuneCache, and reuses. Tracked separately; this hot path
         // is correct today with the default algorithm.
-        var algo = CuDnnNative.CudnnConvolutionFwdAlgo.ImplicitPrecompGemm;
+        var algo = algorithm >= 0
+            ? (CuDnnNative.CudnnConvolutionFwdAlgo)algorithm
+            : CuDnnNative.CudnnConvolutionFwdAlgo.ImplicitPrecompGemm;
         ulong workspaceSize;
         status = CuDnnNative.cudnnGetConvolutionForwardWorkspaceSize(
             _context.Handle, inputDesc.Handle, filterDesc.Handle,
             convDesc.Handle, outputDesc.Handle, algo, out workspaceSize);
+        if (status != CuDnnNative.CudnnStatus.Success && algorithm >= 0)
+            throw new NotSupportedException("cuDNN forward algorithm " + algo + " does not support this convolution: " + status);
         if (status != CuDnnNative.CudnnStatus.Success)
         {
             algo = CuDnnNative.CudnnConvolutionFwdAlgo.Gemm;
@@ -1939,7 +1944,8 @@ public sealed class CuDnnConvolution : IDisposable
         int padH = 0, int padW = 0,
         int strideH = 1, int strideW = 1,
         int dilationH = 1, int dilationW = 1,
-        CuDnnNative.CudnnDataType dataType = CuDnnNative.CudnnDataType.Float)
+        CuDnnNative.CudnnDataType dataType = CuDnnNative.CudnnDataType.Float,
+        int algorithm = -1, CuDnnNative.CudnnMathType mathType = CuDnnNative.CudnnMathType.TensorOp)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(CuDnnConvolution));
 
@@ -1951,16 +1957,20 @@ public sealed class CuDnnConvolution : IDisposable
         filterDesc.Set4D(dataType, k, c, filterH, filterW);
         gradOutputDesc.Set4D(dataType, n, k, outputHeight, outputWidth);
         gradInputDesc.Set4D(dataType, n, c, h, w);
-        convDesc.Set2D(padH, padW, strideH, strideW, dilationH, dilationW, CuDnnNative.CudnnDataType.Float);
+        SetConvolution(convDesc, padH, padW, strideH, strideW, dilationH, dilationW, mathType);
 
         // Algo0 is the safe default — supported for every shape across cuDNN
         // versions. Algo1 (precomp-GEMM) is faster but its workspace query
         // can return NotSupported for irregular shapes; fall back on failure.
-        var algo = CuDnnNative.CudnnConvolutionBwdDataAlgo.Algo1;
+        var algo = algorithm >= 0
+            ? (CuDnnNative.CudnnConvolutionBwdDataAlgo)algorithm
+            : CuDnnNative.CudnnConvolutionBwdDataAlgo.Algo1;
         ulong workspaceSize;
         var status = CuDnnNative.cudnnGetConvolutionBackwardDataWorkspaceSize(
             _context.Handle, filterDesc.Handle, gradOutputDesc.Handle,
             convDesc.Handle, gradInputDesc.Handle, algo, out workspaceSize);
+        if (status != CuDnnNative.CudnnStatus.Success && algorithm >= 0)
+            throw new NotSupportedException("cuDNN backward-data algorithm " + algo + " does not support this convolution: " + status);
         if (status != CuDnnNative.CudnnStatus.Success)
         {
             algo = CuDnnNative.CudnnConvolutionBwdDataAlgo.Algo0;
@@ -2013,7 +2023,8 @@ public sealed class CuDnnConvolution : IDisposable
         int padH = 0, int padW = 0,
         int strideH = 1, int strideW = 1,
         int dilationH = 1, int dilationW = 1,
-        CuDnnNative.CudnnDataType dataType = CuDnnNative.CudnnDataType.Float)
+        CuDnnNative.CudnnDataType dataType = CuDnnNative.CudnnDataType.Float,
+        int algorithm = -1, CuDnnNative.CudnnMathType mathType = CuDnnNative.CudnnMathType.TensorOp)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(CuDnnConvolution));
 
@@ -2025,13 +2036,17 @@ public sealed class CuDnnConvolution : IDisposable
         inputDesc.Set4D(dataType, n, c, h, w);
         gradOutputDesc.Set4D(dataType, n, k, outputHeight, outputWidth);
         gradFilterDesc.Set4D(dataType, k, c, filterH, filterW);
-        convDesc.Set2D(padH, padW, strideH, strideW, dilationH, dilationW, CuDnnNative.CudnnDataType.Float);
+        SetConvolution(convDesc, padH, padW, strideH, strideW, dilationH, dilationW, mathType);
 
-        var algo = CuDnnNative.CudnnConvolutionBwdFilterAlgo.Algo1;
+        var algo = algorithm >= 0
+            ? (CuDnnNative.CudnnConvolutionBwdFilterAlgo)algorithm
+            : CuDnnNative.CudnnConvolutionBwdFilterAlgo.Algo1;
         ulong workspaceSize;
         var status = CuDnnNative.cudnnGetConvolutionBackwardFilterWorkspaceSize(
             _context.Handle, inputDesc.Handle, gradOutputDesc.Handle,
             convDesc.Handle, gradFilterDesc.Handle, algo, out workspaceSize);
+        if (status != CuDnnNative.CudnnStatus.Success && algorithm >= 0)
+            throw new NotSupportedException("cuDNN backward-filter algorithm " + algo + " does not support this convolution: " + status);
         if (status != CuDnnNative.CudnnStatus.Success)
         {
             algo = CuDnnNative.CudnnConvolutionBwdFilterAlgo.Algo0;
@@ -2071,6 +2086,51 @@ public sealed class CuDnnConvolution : IDisposable
     /// that invariant is how we serialize resize-vs-in-flight-kernel across
     /// concurrent convolution calls.
     /// </summary>
+    // TensorOp is the descriptor's long-standing default (tensor cores where the hardware has them); Fma forces strict
+    // fp32 arithmetic, as the backend's precision policy wants for fp32 data outside the explicit TF32 opt-in.
+    private static void SetConvolution(CuDnnConvolutionDescriptor convDesc, int padH, int padW, int strideH, int strideW,
+        int dilationH, int dilationW, CuDnnNative.CudnnMathType mathType)
+    {
+        convDesc.Set2D(padH, padW, strideH, strideW, dilationH, dilationW, CuDnnNative.CudnnDataType.Float,
+            useTensorCores: mathType == CuDnnNative.CudnnMathType.TensorOp);
+        if (mathType != CuDnnNative.CudnnMathType.TensorOp)
+            CuDnnContext.CheckStatus(CuDnnNative.cudnnSetConvolutionMathType(convDesc.Handle, mathType),
+                "SetConvolutionMathType");
+    }
+
+    /// <summary>
+    /// The workspace one algorithm needs for a convolution pass (0 forward, 1 backward data, 2 backward filter), or
+    /// null when the algorithm does not support it. Builds the descriptors and asks; launches nothing.
+    /// </summary>
+    public ulong? AlgorithmWorkspace(int pass, int algorithm, int n, int c, int h, int w, int k, int filterH,
+        int filterW, int outputHeight, int outputWidth, int padH, int padW, int strideH, int strideW, int dilationH,
+        int dilationW, CuDnnNative.CudnnMathType mathType)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CuDnnConvolution));
+        using var inputDesc = new CuDnnTensorDescriptor();
+        using var filterDesc = new CuDnnFilterDescriptor();
+        using var convDesc = new CuDnnConvolutionDescriptor();
+        using var outputDesc = new CuDnnTensorDescriptor();
+        var dataType = CuDnnNative.CudnnDataType.Float;
+        inputDesc.Set4D(dataType, n, c, h, w);
+        filterDesc.Set4D(dataType, k, c, filterH, filterW);
+        outputDesc.Set4D(dataType, n, k, outputHeight, outputWidth);
+        SetConvolution(convDesc, padH, padW, strideH, strideW, dilationH, dilationW, mathType);
+        ulong size;
+        var status = pass switch
+        {
+            0 => CuDnnNative.cudnnGetConvolutionForwardWorkspaceSize(_context.Handle, inputDesc.Handle, filterDesc.Handle,
+                convDesc.Handle, outputDesc.Handle, (CuDnnNative.CudnnConvolutionFwdAlgo)algorithm, out size),
+            1 => CuDnnNative.cudnnGetConvolutionBackwardDataWorkspaceSize(_context.Handle, filterDesc.Handle,
+                outputDesc.Handle, convDesc.Handle, inputDesc.Handle, (CuDnnNative.CudnnConvolutionBwdDataAlgo)algorithm,
+                out size),
+            _ => CuDnnNative.cudnnGetConvolutionBackwardFilterWorkspaceSize(_context.Handle, inputDesc.Handle,
+                outputDesc.Handle, convDesc.Handle, filterDesc.Handle, (CuDnnNative.CudnnConvolutionBwdFilterAlgo)algorithm,
+                out size),
+        };
+        return status == CuDnnNative.CudnnStatus.Success ? size : null;
+    }
+
     private void EnsureWorkspaceUnlocked(ulong requiredSize)
     {
         if (_workspaceSize >= requiredSize) return;

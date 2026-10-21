@@ -6824,6 +6824,14 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (CudaDispatchPolicy.UseCudnnForConv)
         {
             using var _profileCudnn = CudaDispatchPolicy.Scope("Conv2D", useVendor: true);
+            // The vendor slot: cuDNN's default algorithm unless a measured route (another cuDNN algorithm, or the
+            // backend's own) is faster for the shape.
+            if (batch > 0 && outHeight > 0 && outWidth > 0)
+            {
+                var vendorArgs = new CudaConv2DArgs(input, kernel, output, batch, inChannels, inHeight, inWidth,
+                    outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+                if (Conv2DForwardVendorSlot.TryExecute(vendorArgs.Shape(), vendorArgs)) return;
+            }
             using var _ctxCudnn = PushContext();
             EnsureCudnnConv();
             // Stream affinity: cuDNN kernels launch onto this backend's
@@ -7181,7 +7189,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         {
             var tuned = new TunedConv2DBackwardArgs(gradOutput, kernel, gradInput, false, batch, inChannels, inHeight, inWidth,
                 outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
-            if (Conv2DBackwardDataSlot.TryExecute(tuned.Shape(), tuned)) return;
+            var slot = CudaDispatchPolicy.UseCudnnForConv ? Conv2DBackwardVendorSlot(weightGradient: false)
+                : Conv2DBackwardDataSlot;
+            if (slot.TryExecute(tuned.Shape(), tuned)) return;
         }
         if (TryConv2DBackwardInputGemm(gradOutput, kernel, gradInput, batch, inChannels, inHeight, inWidth,
                 outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW))
@@ -7240,7 +7250,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         {
             var tuned = new TunedConv2DBackwardArgs(input, gradOutput, gradKernel, true, batch, inChannels, inHeight, inWidth,
                 outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
-            if (Conv2DBackwardFilterSlot.TryExecute(tuned.Shape(), tuned)) return;
+            var slot = CudaDispatchPolicy.UseCudnnForConv ? Conv2DBackwardVendorSlot(weightGradient: true)
+                : Conv2DBackwardFilterSlot;
+            if (slot.TryExecute(tuned.Shape(), tuned)) return;
         }
         if (TryConv2DBackwardKernelGemm(input, gradOutput, gradKernel, batch, inChannels, inHeight, inWidth,
                 outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW))

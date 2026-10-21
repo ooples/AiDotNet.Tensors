@@ -90,6 +90,7 @@ internal static class KernelRouteTool
         if (only is null || only.Equals("capture", StringComparison.OrdinalIgnoreCase)) CaptureCheck(backend, failures);
         if (only is null || only.Equals("resident", StringComparison.OrdinalIgnoreCase)) ResidentChains(backend, failures);
         if (only is null || only.Equals("conv", StringComparison.OrdinalIgnoreCase)) ConvRoutes(backend, failures);
+        if (only is not null && only.Equals("conv-vendor", StringComparison.OrdinalIgnoreCase)) ConvVendor(backend, failures);
         if (only is null || only.Equals("gemm", StringComparison.OrdinalIgnoreCase)) GemmSchedules(backend, failures);
         if (only is null || only.Equals("flash", StringComparison.OrdinalIgnoreCase)) FlashProbe(backend);
         if (only is null || only.Equals("gather", StringComparison.OrdinalIgnoreCase)) GatherProbe(backend, failures);
@@ -1335,6 +1336,87 @@ internal static class KernelRouteTool
                         incumbentUs.ToString("F1", CultureInfo.InvariantCulture).PadLeft(14) +
                         (incumbentUs / us).ToString("F2", CultureInfo.InvariantCulture).PadLeft(8) + "x" + (ok ? "" : "  FAIL"));
                 }
+            }
+        }
+    }
+
+    /// <summary>
+    /// The convolution entry points with cuDNN on, before and after the vendor slots: before, the forward ran cuDNN's
+    /// default algorithm and the gradients the backend's own slot; after, each runs whatever its vendor slot measured
+    /// fastest (any cuDNN algorithm or backend route). Both against fp64; the slot's choice is printed.
+    /// </summary>
+    private static void ConvVendor(CudaBackend backend, List<string> failures)
+    {
+        Console.WriteLine();
+        Console.WriteLine("CONV VENDOR - entry with cuDNN: before (cuDNN default fwd / own-slot grads) vs the vendor slot, us");
+        TunedKernelPolicy.BudgetMilliseconds = 600_000;
+        TunedKernelPolicy.PersistDecisions = false;
+        var shapes = new[]
+        {
+            ("s2 8x64->128 56", 8, 64, 128, 56, 56, 3, 2, 1, 1),
+            ("3x3 8x32->64 28", 8, 32, 64, 28, 28, 3, 1, 1, 1),
+            ("3x3 16x64->64 56", 16, 64, 64, 56, 56, 3, 1, 1, 1),
+            ("3x3 16x256->256 14", 16, 256, 256, 14, 14, 3, 1, 1, 1),
+            ("1x1 16x64->64 28", 16, 64, 64, 28, 28, 1, 1, 0, 1),
+            ("1x1 16x256->64 56", 16, 256, 64, 56, 56, 1, 1, 0, 1),
+            ("d2 8x32->32 28", 8, 32, 32, 28, 28, 3, 1, 2, 2),
+            ("7x7s2 16x3->64 224", 16, 3, 64, 224, 224, 7, 2, 3, 1),
+        };
+        foreach (var (label, n, c, k, h, w, kernel, stride, pad, dilation) in shapes)
+        {
+            int oh = (h + 2 * pad - dilation * (kernel - 1) - 1) / stride + 1;
+            int ow = (w + 2 * pad - dilation * (kernel - 1) - 1) / stride + 1;
+            float[] x = Fill(n * c * h * w, 1, 0), wt = Fill(k * c * kernel * kernel, 2, 0), dy = Fill(n * k * oh * ow, 3, 0);
+            var (y, dx, dw) = ConvRef(x, wt, dy, n, c, k, h, w, kernel, stride, pad, dilation, oh, ow);
+            foreach (DeclaredConvPass pass in new[] { DeclaredConvPass.Forward, DeclaredConvPass.BackwardData, DeclaredConvPass.BackwardWeights })
+            {
+                double[] reference = pass == DeclaredConvPass.Forward ? y : pass == DeclaredConvPass.BackwardData ? dx : dw;
+                using var first = backend.AllocateBuffer(pass == DeclaredConvPass.BackwardData ? dy : x);
+                using var second = backend.AllocateBuffer(pass == DeclaredConvPass.Forward || pass == DeclaredConvPass.BackwardData ? wt : dy);
+                using var output = backend.AllocateBuffer(reference.Length);
+                var forwardArgs = new CudaConv2DArgs(first, second, output, n, c, h, w, k, oh, ow, kernel, kernel,
+                    stride, stride, pad, pad, dilation, dilation);
+                var backwardArgs = new TunedConv2DBackwardArgs(first, second, output, pass == DeclaredConvPass.BackwardWeights,
+                    n, c, h, w, k, oh, ow, kernel, kernel, stride, stride, pad, pad, dilation, dilation);
+                void Before()
+                {
+                    if (pass == DeclaredConvPass.Forward)
+                        (backend.Conv2DForwardVendorSlot.Candidate("cudnn.conv2d.default")
+                            ?? throw new InvalidOperationException("no cuDNN default")).Execute(forwardArgs);
+                    else
+                    {
+                        var slot = pass == DeclaredConvPass.BackwardData ? backend.Conv2DBackwardDataSlot : backend.Conv2DBackwardFilterSlot;
+                        if (!slot.TryExecute(backwardArgs.Shape(), backwardArgs)) throw new InvalidOperationException("own slot declined");
+                    }
+                }
+                void After()
+                {
+                    if (pass == DeclaredConvPass.Forward)
+                        backend.Conv2D(first, second, output, n, c, h, w, k, oh, ow, kernel, kernel, stride, stride, pad, pad, dilation, dilation);
+                    else if (pass == DeclaredConvPass.BackwardData)
+                        backend.Conv2DBackwardInput(first, second, output, n, c, h, w, k, oh, ow, kernel, kernel, stride, stride, pad, pad, dilation, dilation);
+                    else
+                        backend.Conv2DBackwardKernel(first, second, output, n, c, h, w, k, oh, ow, kernel, kernel, stride, stride, pad, pad, dilation, dilation);
+                }
+                Before(); backend.Synchronize();
+                double beforeErr = MaxDev(backend.DownloadBuffer(output), reference);
+                double beforeUs = Time(Before, backend.Synchronize);
+                After(); backend.Synchronize();   // tunes the shape
+                double afterErr = MaxDev(backend.DownloadBuffer(output), reference);
+                double afterUs = Time(After, backend.Synchronize);
+                TunedKernelDecision? decision = null;
+                var vendor = pass == DeclaredConvPass.Forward ? (ITunedKernelSlotInfo)backend.Conv2DForwardVendorSlot
+                    : backend.Conv2DBackwardVendorSlot(pass == DeclaredConvPass.BackwardWeights);
+                var shape = pass == DeclaredConvPass.Forward ? forwardArgs.Shape() : backwardArgs.Shape();
+                foreach (var d in vendor.CachedDecisions) if (d.Shape.Equals(shape)) decision = d;
+                double scale = Math.Max(1.0, Max(Abs(reference)));
+                bool ok = afterErr <= Math.Max(2 * beforeErr, 1e-5 * scale);
+                if (!ok) failures.Add(label + " " + pass + ": vendor error " + E(afterErr));
+                Console.WriteLine((label + " " + pass).PadRight(36) + beforeUs.ToString("F1", CultureInfo.InvariantCulture).PadLeft(10) +
+                    afterUs.ToString("F1", CultureInfo.InvariantCulture).PadLeft(10) +
+                    (beforeUs / afterUs).ToString("F2", CultureInfo.InvariantCulture).PadLeft(8) + "x  " +
+                    (decision is null ? "?" : decision.CandidateId + " (" + decision.Reason + ")") +
+                    "  err " + E(afterErr) + (ok ? "" : "  FAIL"));
             }
         }
     }
