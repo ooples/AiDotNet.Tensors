@@ -16,8 +16,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 /// <summary>One declared call as a resident stage: the program for <see cref="Key"/> and the caller's buffers.</summary>
 internal readonly struct DeclaredResidentStage
 {
-    internal DeclaredResidentStage(DeclaredKey key, Func<DeclaredKey, CodegenProgram> build, string[] names, DeclaredBindings bound)
+    internal DeclaredResidentStage(DeclaredKey key, Func<DeclaredKey, CodegenProgram> build, string[] names, DeclaredBindings bound,
+        Func<CodegenKernelSpec, PtxPassLowering?>? lowerPass = null)
     {
+        LowerPass = lowerPass;
         Key = key;
         Build = build ?? throw new ArgumentNullException(nameof(build));
         Names = names ?? throw new ArgumentNullException(nameof(names));
@@ -28,6 +30,9 @@ internal readonly struct DeclaredResidentStage
     internal Func<DeclaredKey, CodegenProgram> Build { get; }
     internal string[] Names { get; }
     internal DeclaredBindings Bound { get; }
+
+    /// <summary>The family's own pass lowering, as its routed call uses it: one key is one program however it is first built.</summary>
+    internal Func<CodegenKernelSpec, PtxPassLowering?>? LowerPass { get; }
 }
 
 public sealed partial class CudaBackend
@@ -177,7 +182,7 @@ public sealed partial class CudaBackend
                 if (!_declaredPrograms.TryGetValue(stage.Key, out var program))
                 {
                     if (IsStreamCapturing()) throw new NotSupportedException("A declared resident program is built outside capture.");
-                    program = BuildDeclaredProgram(stage.Key, stage.Build, stage.Names);
+                    program = BuildDeclaredProgram(stage.Key, stage.Build, stage.Names, stage.LowerPass);
                     _declaredPrograms[stage.Key] = program;
                 }
                 programs[i] = program ?? throw new NotSupportedException(
@@ -227,7 +232,7 @@ public sealed partial class CudaBackend
     internal void RunDeclaredStagesSeparately(ReadOnlySpan<DeclaredResidentStage> stages)
     {
         foreach (var stage in stages)
-            if (!TryRunDeclaredProgram(stage.Key, stage.Build, stage.Names, stage.Bound))
+            if (!TryRunDeclaredProgram(stage.Key, stage.Build, stage.Names, stage.Bound, stage.LowerPass))
                 throw new NotSupportedException("Stage " + stage.Key + " did not run through its declared program.");
     }
 
@@ -304,5 +309,62 @@ public sealed partial class CudaBackend
     {
         foreach (var resident in _declaredResidents.Values) resident?.Dispose();
         _declaredResidents.Clear();
+        foreach (var resident in _keyResidents.Values) resident?.Dispose();
+        _keyResidents.Clear();
+        _keyResidentBarrier?.Dispose();
+        _keyResidentBarrier = null;
+    }
+
+    // ---- one program as one launch ---------------------------------------------------------------------------------
+
+    // A program's composition as one cooperative kernel, by key; null records a key that does not compose.
+    private readonly Dictionary<DeclaredKey, DeclaredResident?> _keyResidents = new();
+
+    // The grid barrier the per-key residents share: launches on the backend's stream run one after another, and the
+    // barrier is reusable launch after launch once zeroed.
+    private IGpuBuffer? _keyResidentBarrier;
+
+    /// <summary>
+    /// Runs a built multi-step program as ONE cooperative launch -- its steps composed, a grid barrier between them --
+    /// when every step is at most a wave of blocks: such a program is launch-bound, and residency replaces its launches
+    /// with barriers (the results are the same kernels', so bit-identical). False, nothing launched, when it does not
+    /// apply or does not compose. A call allocates nothing once the key's composition is built.
+    /// </summary>
+    private unsafe bool TryLaunchDeclaredResident(DeclaredKey key, DeclaredProgram program, in DeclaredBindings bound)
+    {
+        var steps = program.Lowering.Steps;
+        if (steps.Count < 2 || !SupportsResidentProgram) return false;
+        int wave = Math.Max(1, _multiProcessorCount);
+        for (int s = 0; s < steps.Count; s++)
+            if (steps[s].Blocks > (uint)wave) return false;
+
+        DeclaredResident? resident;
+        IGpuBuffer? barrier;
+        lock (_directPtxLock)
+        {
+            if (!_keyResidents.TryGetValue(key, out resident))
+            {
+                if (IsStreamCapturing()) return false;
+                resident = BuildDeclaredResident(key.ToString(), new[] { program });
+                _keyResidents[key] = resident;
+                if (resident is not null) _keyResidentBarrier ??= AllocateResidentBarrier();
+            }
+            barrier = _keyResidentBarrier;
+        }
+        if (resident is null || barrier is null) return false;
+
+        using var _ = PushContext();
+        var sources = resident.ArgumentSources;
+        IntPtr* handles = stackalloc IntPtr[sources.Length];
+        void** argv = stackalloc void*[sources.Length];
+        for (int a = 0; a < sources.Length; a++)
+        {
+            var (stage, slot) = sources[a];
+            handles[a] = stage < 0 ? barrier.Handle : slot >= 0 ? bound[slot].Handle : program.Scratch[-1 - slot].Handle;
+            argv[a] = &handles[a];
+        }
+        lock (resident) LaunchCooperativeKernel(resident.Function, (uint)resident.Grid, resident.Composition.BlockX, 0, argv);
+        System.Threading.Interlocked.Increment(ref _declaredProgramLaunches);
+        return true;
     }
 }

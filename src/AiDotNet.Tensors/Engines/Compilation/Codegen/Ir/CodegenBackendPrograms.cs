@@ -72,6 +72,69 @@ public static class CodegenBackendPrograms
     /// <summary>
     /// CudaBackend.LayerNorm: sources x, gamma, beta; outputs y, mean (saveMean), rstd (saveInvVar).
     /// </summary>
+    // ---- linear layers (#890 phase 4c), in CudaBackend.FusedLinear*'s contract: x [batch, in], W [in, out] -------
+
+    /// <summary><c>y[b, j] = act(sum_k x[b, k] W[k, j] + bias[j])</c>: one contraction with a bias and activation epilogue.</summary>
+    public static CodegenProgram FusedLinear(int batch, int inFeatures, int outFeatures, CodegenActivationKind activation)
+    {
+        var space = new CodegenIterationSpace(
+            CodegenAxis.Parallel("b", batch), CodegenAxis.Parallel("j", outFeatures), CodegenAxis.Reduce("k", inFeatures));
+        const int B = 0, J = 1, K = 2;
+        var x = new CodegenTensorBinding(0, "x", new[] { batch, inFeatures }, new[] { A(B), A(K) });
+        var w = new CodegenTensorBinding(1, "w", new[] { inFeatures, outFeatures }, new[] { A(K), A(J) });
+        var bias = new CodegenTensorBinding(2, "bias", new[] { outFeatures }, new[] { A(J) });
+        var y = new CodegenTensorBinding(3, "y", new[] { batch, outFeatures }, new[] { A(B), A(J) }, isOutput: true);
+        var pass = new CodegenKernelSpec("fused_linear", space, new[] { x, w, bias }, y, new[] { 0, 1 },
+            CodegenReduceKind.Sum, biasInput: 2, activation: activation);
+        return new CodegenProgram(new[] { pass }, Array.Empty<long>(), "fused linear (backend contract)");
+    }
+
+    /// <summary>
+    /// The backward of <see cref="FusedLinear"/>: <c>dpre = derivative(dy, saved)</c> -- the activation's backward,
+    /// <paramref name="derivative"/> called with the gradient and the saved pre-activation or output -- then
+    /// <c>dx = dpre W^T</c>, <c>dW = x^T dpre</c> and <c>dbias = sum_b dpre</c>, each overwriting its gradient.
+    /// </summary>
+    public static CodegenProgram FusedLinearBackward(int batch, int inFeatures, int outFeatures,
+        CodegenLibraryFunction derivative)
+    {
+        if (derivative is null) throw new ArgumentNullException(nameof(derivative));
+        var activationGrad = RowPass("fused_linear_dpre", new[] { batch, outFeatures }, new[] { "dy", "saved" }, "dpre",
+            CodegenExpr.Call(derivative, Op(0), Op(1)));
+
+        var dxSpace = new CodegenIterationSpace(
+            CodegenAxis.Parallel("b", batch), CodegenAxis.Parallel("i", inFeatures), CodegenAxis.Reduce("j", outFeatures));
+        var dx = new CodegenKernelSpec("fused_linear_dx", dxSpace,
+            new[]
+            {
+                new CodegenTensorBinding(0, "dpre", new[] { batch, outFeatures }, new[] { A(0), A(2) }),
+                new CodegenTensorBinding(1, "w", new[] { inFeatures, outFeatures }, new[] { A(1), A(2) }),
+            },
+            new CodegenTensorBinding(2, "dx", new[] { batch, inFeatures }, new[] { A(0), A(1) }, isOutput: true),
+            new[] { 0, 1 }, CodegenReduceKind.Sum);
+
+        var dwSpace = new CodegenIterationSpace(
+            CodegenAxis.Parallel("i", inFeatures), CodegenAxis.Parallel("j", outFeatures), CodegenAxis.Reduce("b", batch));
+        var dw = new CodegenKernelSpec("fused_linear_dw", dwSpace,
+            new[]
+            {
+                new CodegenTensorBinding(0, "x", new[] { batch, inFeatures }, new[] { A(2), A(0) }),
+                new CodegenTensorBinding(1, "dpre", new[] { batch, outFeatures }, new[] { A(2), A(1) }),
+            },
+            new CodegenTensorBinding(2, "dw", new[] { inFeatures, outFeatures }, new[] { A(0), A(1) }, isOutput: true),
+            new[] { 0, 1 }, CodegenReduceKind.Sum);
+
+        var dbSpace = new CodegenIterationSpace(CodegenAxis.Parallel("j", outFeatures), CodegenAxis.Reduce("b", batch));
+        var db = new CodegenKernelSpec("fused_linear_db", dbSpace,
+            new[] { new CodegenTensorBinding(0, "dpre", new[] { batch, outFeatures }, new[] { A(1), A(0) }) },
+            new CodegenTensorBinding(1, "dbias", new[] { outFeatures }, new[] { A(0) }, isOutput: true),
+            new[] { 0 }, CodegenReduceKind.Sum);
+
+        return new CodegenProgram(new[] { activationGrad, dx, dw, db }, new long[] { (long)batch * outFeatures },
+            "fused linear backward (backend contract)");
+    }
+
+    private static CodegenAffineExpr A(int axis) => CodegenAffineExpr.Axis(axis);
+
     public static CodegenProgram LayerNorm(int rows, int columns, double epsilon) =>
         Append(CodegenFusedStatistics.LayerNorm(rows, columns, epsilon),
             RowPass("layernorm_save_mean", new[] { rows }, new[] { "negmean" }, "mean", CodegenExpr.Negate(Op(0))));

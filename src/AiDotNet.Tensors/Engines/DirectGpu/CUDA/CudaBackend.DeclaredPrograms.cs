@@ -35,6 +35,8 @@ internal enum DeclaredFamily
 
     /// <summary>A derived elementwise kernel at a fixed length (a resident stage); the key's Name says which.</summary>
     Elementwise,
+    FusedLinear,
+    FusedLinearBackward,
 }
 
 /// <summary>One declared program: its family and shape (unused dimensions are 0).</summary>
@@ -192,7 +194,8 @@ public sealed partial class CudaBackend
     /// off or the program cannot be lowered for this shape.
     /// </summary>
     internal bool TryRunDeclaredProgram(DeclaredKey key, Func<DeclaredKey, CodegenProgram> build,
-        string[] names, in DeclaredBindings bound)
+        string[] names, in DeclaredBindings bound, Func<CodegenKernelSpec, PtxPassLowering?>? lowerPass = null,
+        bool residentWhenSmall = false)
     {
         if (!DeclaredKernelsEnabled) return false;
         DeclaredProgram? program;
@@ -203,13 +206,28 @@ public sealed partial class CudaBackend
                 // Building loads modules and allocates scratch, which CUDA graph capture forbids: a program first
                 // met under capture is served by the hand-written kernel, and is built on the first call outside.
                 if (IsStreamCapturing()) return false;
-                program = BuildDeclaredProgram(key, build, names);
+                program = BuildDeclaredProgram(key, build, names, lowerPass);
                 _declaredPrograms[key] = program;
             }
         }
         if (program is null) return false;
+        if (residentWhenSmall && TryLaunchDeclaredResidentChecked(key, program, names, bound)) return true;
         RunDeclaredProgram(program, names, bound);
         return true;
+    }
+
+    // The bound-size check of RunDeclaredProgram, then the one-launch path.
+    private bool TryLaunchDeclaredResidentChecked(DeclaredKey key, DeclaredProgram program, string[] names,
+        in DeclaredBindings bound)
+    {
+        for (int k = 0; k < names.Length; k++)
+        {
+            long needed = program.BoundElements[k];
+            if (needed != 0 && bound[k].Size < needed)
+                throw new ArgumentException(
+                    "'" + names[k] + "' holds " + bound[k].Size + " elements; the program needs " + needed + ".");
+        }
+        return TryLaunchDeclaredResident(key, program, bound);
     }
 
     // Checks the bound buffers against the program's sizes, then launches its steps on the main stream.
@@ -255,9 +273,20 @@ public sealed partial class CudaBackend
         }
     }
 
-    private DeclaredProgram? BuildDeclaredProgram(DeclaredKey key, Func<DeclaredKey, CodegenProgram> build, string[] names)
+    private DeclaredProgram? BuildDeclaredProgram(DeclaredKey key, Func<DeclaredKey, CodegenProgram> build, string[] names,
+        Func<CodegenKernelSpec, PtxPassLowering?>? lowerPass = null)
     {
-        var program = BuildDeclaredProgram(build(key), key.ToString(), names, lowerPass: null, out string? decline);
+        CodegenProgram source;
+        try
+        {
+            source = build(key);
+        }
+        catch (NotSupportedException ex)
+        {
+            _declaredDeclines[key] = ex.Message;   // the family cannot express this key (a builder's own refusal)
+            return null;
+        }
+        var program = BuildDeclaredProgram(source, key.ToString(), names, lowerPass, out string? decline);
         if (decline is not null) _declaredDeclines[key] = decline;
         return program;
     }

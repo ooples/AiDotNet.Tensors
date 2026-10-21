@@ -169,6 +169,104 @@ internal static class KernelRouteTool
             yield return Softmax(r, c);
         foreach (var (r, c) in new[] { (8192, 1024), (8192, 64), (100, 100), (64, 50257), (512, 7) })
             yield return SoftmaxBackward(r, c);
+        foreach (var (b, i, o) in new[] { (64, 128, 96), (5, 33, 17), (256, 512, 512), (512, 768, 768) })
+            foreach (var activation in new[] { CodegenActivationKind.ReLU, CodegenActivationKind.Gelu })
+            {
+                yield return LinearForward(b, i, o, activation);
+                yield return LinearBackward(b, i, o, activation);
+            }
+    }
+
+    // ---- linear layers (#890 phase 4c) ------------------------------------------------------------------------
+
+    private const double GeluInner = 0.7978845608, GeluCubic = 0.044715;
+
+    private static double Activate(CodegenActivationKind activation, double x) => activation == CodegenActivationKind.ReLU
+        ? Math.Max(0.0, x)
+        : 0.5 * x * (1.0 + Math.Tanh(GeluInner * (x + GeluCubic * x * x * x)));
+
+    private static double ActivationGrad(CodegenActivationKind activation, double dy, double pre)
+    {
+        if (activation == CodegenActivationKind.ReLU) return pre > 0 ? dy : 0.0;
+        double t = Math.Tanh(GeluInner * (pre + GeluCubic * pre * pre * pre));
+        double dt = GeluInner * (1.0 + 3.0 * GeluCubic * pre * pre) * (1.0 - t * t);
+        return dy * (0.5 * (1.0 + t) + 0.5 * pre * dt);
+    }
+
+    private static double[] LinearPre(float[] x, float[] w, float[] bias, int batch, int inFeatures, int outFeatures)
+    {
+        var pre = new double[batch * outFeatures];
+        System.Threading.Tasks.Parallel.For(0, batch, r =>
+        {
+            for (int j = 0; j < outFeatures; j++)
+            {
+                double sum = bias[j];
+                for (int k = 0; k < inFeatures; k++) sum += (double)x[r * inFeatures + k] * w[k * outFeatures + j];
+                pre[r * outFeatures + j] = sum;
+            }
+        });
+        return pre;
+    }
+
+    private static RouteCase LinearForward(int batch, int inFeatures, int outFeatures, CodegenActivationKind activation)
+    {
+        float[] x = Fill(batch * inFeatures, 11, 0), w = Fill(inFeatures * outFeatures, 12, 0), bias = Fill(outFeatures, 13, 0);
+        double[] pre = LinearPre(x, w, bias, batch, inFeatures, outFeatures);
+        var y = new double[pre.Length];
+        for (int i = 0; i < y.Length; i++) y[i] = Activate(activation, pre[i]);
+        bool relu = activation == CodegenActivationKind.ReLU;
+        return new RouteCase("FusedLinear" + (relu ? "ReLU " : "GELU ") + batch + "x" + inFeatures + "x" + outFeatures,
+            CudaBackend.FusedLinearKey(batch, inFeatures, outFeatures, activation),
+            new[] { x, w, bias }, new[] { batch * outFeatures },
+            (k, a) =>
+            {
+                if (relu) k.FusedLinearReLU(a[0], a[1], a[2], a[3], batch, inFeatures, outFeatures);
+                else k.FusedLinearGELU(a[0], a[1], a[2], a[3], batch, inFeatures, outFeatures);
+            },
+            new[] { ("y", 3, y) }, Math.Max(1, Max(Abs(pre))), inFeatures);
+    }
+
+    private static RouteCase LinearBackward(int batch, int inFeatures, int outFeatures, CodegenActivationKind activation)
+    {
+        float[] x = Fill(batch * inFeatures, 14, 0), w = Fill(inFeatures * outFeatures, 15, 0), bias = Fill(outFeatures, 16, 0);
+        float[] dy = Fill(batch * outFeatures, 17, 0);
+        float[] pre = ToFloat(LinearPre(x, w, bias, batch, inFeatures, outFeatures));
+        var dpre = new double[pre.Length];
+        for (int i = 0; i < dpre.Length; i++) dpre[i] = ActivationGrad(activation, dy[i], pre[i]);
+        var dx = new double[x.Length];
+        var dw = new double[w.Length];
+        var db = new double[outFeatures];
+        System.Threading.Tasks.Parallel.For(0, batch, r =>
+        {
+            for (int k = 0; k < inFeatures; k++)
+            {
+                double sum = 0;
+                for (int j = 0; j < outFeatures; j++) sum += dpre[r * outFeatures + j] * w[k * outFeatures + j];
+                dx[r * inFeatures + k] = sum;
+            }
+        });
+        System.Threading.Tasks.Parallel.For(0, inFeatures, k =>
+        {
+            for (int j = 0; j < outFeatures; j++)
+            {
+                double sum = 0;
+                for (int r = 0; r < batch; r++) sum += x[r * inFeatures + k] * dpre[r * outFeatures + j];
+                dw[k * outFeatures + j] = sum;
+            }
+        });
+        for (int r = 0; r < batch; r++)
+            for (int j = 0; j < outFeatures; j++) db[j] += dpre[r * outFeatures + j];
+        bool relu = activation == CodegenActivationKind.ReLU;
+        return new RouteCase("FusedLinear" + (relu ? "ReLU" : "GELU") + "Backward " + batch + "x" + inFeatures + "x" + outFeatures,
+            CudaBackend.FusedLinearBackwardKey(batch, inFeatures, outFeatures, activation),
+            new[] { dy, x, w, pre }, new[] { x.Length, w.Length, outFeatures },
+            (k, a) =>
+            {
+                if (relu) k.FusedLinearReLUBackward(a[0], a[1], a[2], a[3], a[4], a[5], a[6], batch, inFeatures, outFeatures);
+                else k.FusedLinearGELUBackward(a[0], a[1], a[2], a[3], a[4], a[5], a[6], batch, inFeatures, outFeatures);
+            },
+            new[] { ("dx", 4, dx), ("dw", 5, dw), ("dbias", 6, db) },
+            Math.Max(1, Math.Max(Max(Abs(dx)), Math.Max(Max(Abs(dw)), Max(Abs(db))))), Math.Max(batch, outFeatures));
     }
 
     private static RouteCase LayerNorm(int rows, int cols, float eps)
