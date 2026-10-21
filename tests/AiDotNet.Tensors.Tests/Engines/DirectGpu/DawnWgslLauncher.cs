@@ -27,6 +27,7 @@ import readline from 'readline';
 Object.assign(globalThis, globals);
 const gpu = create([]);
 const adapter = await gpu.requestAdapter();
+if (!adapter) { console.log(JSON.stringify({ ready: false, reason: 'no-adapter' })); process.exit(0); }
 const device = await adapter.requestDevice();
 console.log(JSON.stringify({ ready: true }));
 const pipelines = new Map();
@@ -85,6 +86,8 @@ for await (const line of rl) {
     // The one line the server prints once its GPU device exists, and how long to wait for it. Adapter and device
     // creation is the slow part of a start; a minute without it means the server is not coming up.
     private const string ReadyLine = @"{""ready"":true}";
+    // What the server prints instead when Dawn has no adapter: the one start failure that means "no WebGPU here".
+    private const string NoAdapterLine = @"{""ready"":false,""reason"":""no-adapter""}";
     private static readonly TimeSpan ReadyTimeout = TimeSpan.FromMinutes(1);
 
     // dawn.node (webgpu 0.6.x on Windows) dies with an access violation (0xC0000005) a few hundred launches into one
@@ -108,7 +111,10 @@ for await (const line of rl) {
         _modules = modules;
     }
 
-    /// <summary>A launcher, or null when AIDOTNET_WEBGPU_NODE_DIR is not set up.</summary>
+    /// <summary>
+    /// A launcher, or null when AIDOTNET_WEBGPU_NODE_DIR is not set up or Dawn finds no adapter. Any other start
+    /// failure of a configured server throws, so a broken Dawn setup fails its tests instead of skipping them.
+    /// </summary>
     /// <param name="modules">Kernel name to WGSL module; null runs the batch-execution ports.</param>
     public static DawnWgslLauncher? TryCreate(IReadOnlyDictionary<string, string>? modules = null)
     {
@@ -130,8 +136,8 @@ for await (const line of rl) {
             RedirectStandardError = true,
             UseShellExecute = false,
         };
-        var node = Process.Start(start);
-        if (node is null) return null;
+        var node = Process.Start(start)
+            ?? throw new InvalidOperationException("node did not start for the Dawn server.");
         // Drain stderr as it arrives: a full stderr pipe would block node, and then the reply read below.
         var stderr = new System.Text.StringBuilder();
         node.ErrorDataReceived += (_, e) => { if (e.Data is not null) lock (stderr) stderr.AppendLine(e.Data); };
@@ -141,14 +147,16 @@ for await (const line of rl) {
         // the healthy server stopped in favour of a dead replacement. The server prints one readiness line once the
         // device exists, consumed here, so what this returns has a live device behind it.
         var ready = node.StandardOutput.ReadLineAsync();
-        if (!ready.Wait(ReadyTimeout) || ready.Result != ReadyLine)
-        {
-            try { if (!node.HasExited) node.Kill(entireProcessTree: true); }
-            catch (InvalidOperationException) { }
-            node.Dispose();
-            return null;
-        }
-        return (node, stderr);
+        bool answered = ready.Wait(ReadyTimeout);
+        if (answered && ready.Result == ReadyLine) return (node, stderr);
+        try { if (!node.HasExited) node.Kill(entireProcessTree: true); }
+        catch (InvalidOperationException) { }
+        node.Dispose();
+        if (answered && ready.Result == NoAdapterLine) return null;
+        string why = answered ? (ready.Result is null ? "exited" : "printed " + ready.Result) : $"was not ready within {ReadyTimeout.TotalSeconds} s";
+        string err;
+        lock (stderr) err = stderr.ToString().Trim();
+        throw new InvalidOperationException($"The Dawn server {why} before its device was ready: {err}");
     }
 
     // Replaces the server once it has served LaunchesPerServer launches (see there).
@@ -159,7 +167,7 @@ for await (const line of rl) {
         // would leave _node pointing at a disposed process, which Dispose would go on to use. The old server is
         // healthy here - it has only reached its launch budget - so the two overlap for one Process.Start.
         var started = StartServer(_script)
-            ?? throw new InvalidOperationException("The Dawn server did not restart.");
+            ?? throw new InvalidOperationException("The Dawn server found no adapter on restart.");
         StopServer();
         _node = started.Node;
         _stderr = started.Stderr;

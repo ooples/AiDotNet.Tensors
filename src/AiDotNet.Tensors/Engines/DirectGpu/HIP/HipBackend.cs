@@ -1018,6 +1018,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
         if (hipResult != HipError.Success)
         {
+            // HIP writes the handle only on success; clear it anyway so a failed load never leaves a value here that
+            // Dispose would go on to unload.
+            module = IntPtr.Zero;
             return RecordKernelCompilationFailure(new HipKernelCompilationException(
                 moduleName,
                 HipKernelCompilationStage.ModuleLoad,
@@ -1063,7 +1066,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             }
             if (module != IntPtr.Zero)
             {
-                HipNativeBindings.hipModuleUnload(module);
+                var unload = HipNativeBindings.hipModuleUnload(module);
+                if (unload != HipError.Success)
+                    System.Diagnostics.Debug.WriteLine($"HIP module {moduleName}: hipModuleUnload after a partial load returned {unload}.");
                 module = IntPtr.Zero;
             }
             return RecordKernelCompilationFailure(new HipKernelCompilationException(
