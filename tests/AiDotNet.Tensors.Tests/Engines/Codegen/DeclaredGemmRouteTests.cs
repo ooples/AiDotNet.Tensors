@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // The declared GEMM route (#890 phase 4c): Gemm, MatMulTransposed, MatMulTransposedA and BatchedGemm at alpha 1,
 // beta 0 offer declared schedules to the GEMM tuned slot, whose reference is each entry point's own path. Every
 // schedule is checked against an fp64 reference written out here, the entry points with the route on and off, the
@@ -196,6 +196,11 @@ public class DeclaredGemmRouteTests
     /// </summary>
     [SkippableTheory]
     [InlineData("implicit-gemm.m64n64", 2048, 64, 64, true)]
+    // A split schedule too: there the bias and the ReLU are the COMBINE pass's epilogue
+    // (CodegenSplitReduction keeps only the product operands on the partial), so the bit-identity claim rests on a
+    // different placement than the unsplit cases above and was not covered. The shape is the one
+    // ADeclaredGemmCapturesAndReplaysBitIdentically already lowers under this schedule.
+    [InlineData("implicit-gemm.split8v.m64n64", 64, 48, 2048, true)]
     [InlineData("implicit-gemm.m128n64", 300, 4, 8, true)]
     [InlineData("implicit-gemm.m128n64", 512, 512, 16, false)]
     public void TheFusedBiasActivationStaysBitIdenticalUnderADeclaredSchedule(string scheduleName, int m, int n, int k,
