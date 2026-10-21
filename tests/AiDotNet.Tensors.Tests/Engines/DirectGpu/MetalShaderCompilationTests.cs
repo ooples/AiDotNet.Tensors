@@ -80,6 +80,10 @@ public sealed class MetalShaderCompilationTests
         yield return ("WinogradFused", () => WinogradF23KernelTemplate.GetModuleSource(WinogradKernelDialect.Metal,
             WinogradKernelGroup.Fused), true);
         yield return ("ResidentProgram", () => ResidentProgramKernelTemplate.GetModuleSource(ResidentKernelDialect.Metal), true);
+        // Strict: false, as MetalBackend.BatchNormRegister compiles it (CompileLibrary's two-argument overload). The
+        // mask the backward rebuilds rounds the same as the forward because both go through one explicit fma, not
+        // because the compiler was asked to keep the operators apart.
+        yield return ("BatchNormRegister", () => BatchNormRegisterKernelTemplate.GetModuleSource(WinogradKernelDialect.Metal), false);
     }
 
     internal static string? FindCompiler()

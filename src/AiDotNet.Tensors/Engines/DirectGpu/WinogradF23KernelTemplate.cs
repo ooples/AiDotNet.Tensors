@@ -76,9 +76,10 @@ internal static class WinogradF23KernelTemplate
     /// </summary>
     internal sealed class Spec
     {
-        internal Spec(string name, string[] buffers, string[] ints, string body, int sharedFloats = 0)
+        internal Spec(string name, string[] buffers, string[] ints, string body, int sharedFloats = 0, int[]? written = null)
         {
             Name = name; Buffers = buffers; Ints = ints; Body = body; SharedFloats = sharedFloats;
+            Written = written ?? new[] { 1 };
         }
 
         internal string Name { get; }
@@ -86,6 +87,9 @@ internal static class WinogradF23KernelTemplate
         internal string[] Ints { get; }
         internal string Body { get; }
         internal int SharedFloats { get; }
+
+        /// <summary>The buffers the kernel writes, by binding index; every other one is read only.</summary>
+        internal int[] Written { get; }
     }
 
     // G g G^T for the 3x3 filter already in g[9] (row-major), stored to the sixteen planes of u at idx.
@@ -521,13 +525,24 @@ internal static class WinogradF23KernelTemplate
     internal static string GetModuleSource(WinogradKernelDialect dialect,
         WinogradKernelGroup group = WinogradKernelGroup.All)
     {
+        var specs = new List<Spec>();
+        foreach (var spec in Kernels)
+            if (InGroup(spec, group)) specs.Add(spec);
+        return EmitModule(specs, dialect);
+    }
+
+    /// <summary>
+    /// <paramref name="specs"/> in one OpenCL C, HIP C++ or Metal Shading Language module (any kernel family written in
+    /// this template's body conventions; see <see cref="Spec"/>).
+    /// </summary>
+    internal static string EmitModule(IEnumerable<Spec> specs, WinogradKernelDialect dialect)
+    {
         if (dialect == WinogradKernelDialect.Glsl)
             throw new ArgumentException("GLSL has one kernel per shader; use GetGlslSource.", nameof(dialect));
         var sb = new StringBuilder();
         if (dialect == WinogradKernelDialect.Metal) sb.Append("#include <metal_stdlib>\nusing namespace metal;\n");
-        foreach (var spec in Kernels)
+        foreach (var spec in specs)
         {
-            if (!InGroup(spec, group)) continue;
             sb.Append('\n');
             sb.Append(dialect switch
             {
@@ -539,7 +554,7 @@ internal static class WinogradF23KernelTemplate
             var parameters = new List<string>();
             for (int i = 0; i < spec.Buffers.Length; i++)
             {
-                bool read = i != 1;
+                bool read = Array.IndexOf(spec.Written, i) < 0;
                 parameters.Add(dialect switch
                 {
                     WinogradKernelDialect.OpenCl => (read ? "__global const float* restrict " : "__global float* restrict ") + spec.Buffers[i],
@@ -585,7 +600,8 @@ internal static class WinogradF23KernelTemplate
         return sb.ToString();
     }
 
-    // The shared-memory kernels' barrier and fused multiply-add, per dialect.
+    // The bodies' dialect-neutral spellings: the work-group barrier, fused multiply-add, reciprocal square root, float
+    // maximum, and an int parameter's bits read as a float (float parameters ride in the int list).
     private static string Spell(string body, WinogradKernelDialect dialect)
         => body.Replace("BARRIER();", dialect switch
         {
@@ -593,15 +609,38 @@ internal static class WinogradF23KernelTemplate
             WinogradKernelDialect.Metal => "threadgroup_barrier(mem_flags::mem_threadgroup);",
             WinogradKernelDialect.Glsl => "memoryBarrierShared(); barrier();",
             _ => "__syncthreads();",
-        }).Replace("FMA(", dialect == WinogradKernelDialect.Hip ? "fmaf(" : "fma(");
+        }).Replace("FMA(", dialect == WinogradKernelDialect.Hip ? "fmaf(" : "fma(")
+        .Replace("RSQRT(", dialect switch
+        {
+            WinogradKernelDialect.Glsl => "inversesqrt(",
+            WinogradKernelDialect.Hip => "rsqrtf(",
+            _ => "rsqrt(",
+        })
+        .Replace("FMAX(", dialect switch
+        {
+            WinogradKernelDialect.Glsl => "max(",
+            WinogradKernelDialect.Hip => "fmaxf(",
+            _ => "fmax(",
+        })
+        .Replace("PRECISE ", dialect == WinogradKernelDialect.Glsl ? "precise " : "")
+        .Replace("IBITS(", dialect switch
+        {
+            WinogradKernelDialect.OpenCl => "as_float(",
+            WinogradKernelDialect.Glsl => "intBitsToFloat(",
+            WinogradKernelDialect.Metal => "as_type<float>(",
+            _ => "__int_as_float(",
+        });
 
     /// <summary>
     /// One kernel as a Vulkan compute shader: the buffers at bindings 0 and 1 and the int parameters as push constants,
     /// in <see cref="Spec.Ints"/> order, over a 1-D grid of 256-wide groups.
     /// </summary>
-    internal static string GetGlslSource(string name)
+    internal static string GetGlslSource(string name) => EmitGlsl(Get(name));
+
+    /// <summary>One kernel of any family in this template's conventions as a Vulkan compute shader (see
+    /// <see cref="GetGlslSource"/>).</summary>
+    internal static string EmitGlsl(Spec spec)
     {
-        var spec = Get(name);
         var sb = new StringBuilder("#version 450\nlayout(local_size_x = 256) in;\n");
         for (int i = 0; i < spec.Buffers.Length; i++)
             sb.Append("layout(set=0, binding=").Append(i).Append(") buffer B").Append(i).Append(" { float ")
