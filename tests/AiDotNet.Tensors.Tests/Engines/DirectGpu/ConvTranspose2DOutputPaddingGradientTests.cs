@@ -17,12 +17,16 @@ public class ConvTranspose2DOutputPaddingGradientTests
 {
     private static CudaBackend OpenBackendOrSkip()
     {
-        Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver is unavailable.");
+        // Both prerequisites, not the driver alone: CudaBackend sets IsAvailable false without NVRTC as well
+        // (CudaBackend.cs, "if (!CudaNativeBindings.IsAvailable || !NvrtcNativeBindings.IsAvailable)"), and
+        // IsCudaAvailable is that same pair. Gating on the driver alone would turn a machine that merely lacks the
+        // runtime compiler into a failure where the whole suite means it to skip.
+        Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA driver or NVRTC is unavailable.");
         var backend = new CudaBackend();
         if (!backend.IsAvailable)
         {
             backend.Dispose();
-            throw new InvalidOperationException("CUDA driver was detected, but the CUDA backend failed to initialize.");
+            throw new InvalidOperationException("CUDA and NVRTC were detected, but the CUDA backend failed to initialize.");
         }
         return backend;
     }
