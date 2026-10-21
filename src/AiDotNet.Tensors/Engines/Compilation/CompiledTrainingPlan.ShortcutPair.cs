@@ -11,7 +11,7 @@ internal sealed partial class CompiledTrainingPlan<T>
     /// <summary>
     /// Finds ResNet's downsampling pairs: two Conv2D steps reading the same input <c>h</c>, a 3 x 3 stride-2
     /// padding-1 convolution and a 1 x 1 stride-2 padding-0 projection shortcut, whose input gradient the GPU engine
-    /// computes in one launch (<see cref="DirectGpuTensorEngine.TryConv2DBackwardInputShortcutPair"/>). Each pair is
+    /// computes in one call (<see cref="IConvShortcutPairEngine"/>). Each pair is
     /// keyed by its earlier step's index, where the reverse backward reaches both output gradients complete; the later
     /// step's index goes to <paramref name="consumed"/>. Steps in <paramref name="excluded"/> (another fusion's) are
     /// left alone.
@@ -20,7 +20,7 @@ internal sealed partial class CompiledTrainingPlan<T>
         List<CompiledStep<T>> steps,
         HashSet<Tensor<T>> requiresGrad,
         HashSet<int> excluded,
-        DirectGpuTensorEngine gpu,
+        IConvShortcutPairEngine gpu,
         Dictionary<int, (int Main, int Shortcut)> pairs,
         HashSet<int> consumed)
     {
@@ -102,7 +102,7 @@ internal sealed partial class CompiledTrainingPlan<T>
             bool hasMain = gradMap.TryGetValue(main.OutputBuffer, out var gradMain);
             bool hasShortcut = gradMap.TryGetValue(shortcut.OutputBuffer, out var gradShortcut);
             Tensor<float>? gradH = null;
-            if (hasMain && hasShortcut && eng is DirectGpuTensorEngine gpu && (relevance ?? requiresGrad).Contains(h))
+            if (hasMain && hasShortcut && eng is IConvShortcutPairEngine gpu && (relevance ?? requiresGrad).Contains(h))
                 gradH = gpu.TryConv2DBackwardInputShortcutPair((Tensor<float>)(object)gradMain!, (Tensor<float>)(object)main.Inputs[1],
                     (Tensor<float>)(object)gradShortcut!, (Tensor<float>)(object)shortcut.Inputs[1], h._shape);
             if (gradH is null)

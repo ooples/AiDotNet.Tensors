@@ -5,7 +5,7 @@ using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines;
 
-public partial class DirectGpuTensorEngine
+public partial class DirectGpuTensorEngine : IConvShortcutPairEngine
 {
     // Pair launches dispatched, process-wide: the tests read it to prove a compiled plan took the pair (the plan's
     // backward step names are published only under the step-profiling switch).
@@ -64,4 +64,12 @@ public partial class DirectGpuTensorEngine
             return null;
         }
     }
+
+    bool IConvShortcutPairEngine.SupportsConv2DBackwardInputShortcutPair(int[] inputShape, int[] kernel3, int[] kernel1,
+        int outH, int outW)
+        => SupportsConv2DBackwardInputShortcutPair(inputShape, kernel3, kernel1, outH, outW);
+
+    Tensor<float>? IConvShortcutPairEngine.TryConv2DBackwardInputShortcutPair(Tensor<float> gradOutput3,
+        Tensor<float> kernel3, Tensor<float> gradOutput1, Tensor<float> kernel1, int[] inputShape)
+        => TryConv2DBackwardInputShortcutPair(gradOutput3, kernel3, gradOutput1, kernel1, inputShape);
 }
