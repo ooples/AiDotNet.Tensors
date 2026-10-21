@@ -56,6 +56,11 @@ public static class SassScheduler
     // 11 cycles, and a tiled convolution whose BMOV issued its successor after 1 corrupted its output about one run in
     // three (10 of 10 clean with ptxas's stall kept on it alone).
     private const int BmovStall = 11;
+
+    // BAR.SYNC likewise: ptxas gives all of them exactly 5 cycles, and a register-blocked GEMM whose BAR issued its
+    // successor (an LDS of the tile the barrier publishes) after 1 read a stale tile -- its output mismatched in 3 of 9
+    // configurations, and keeping ptxas's stall on BAR alone made all 9 bit-identical.
+    private const int BarStall = 5;
     private const int GuardPredicateLatency = 12;
 
     /// <summary>The branch targets (instruction indices) of BRA and BSSY instructions in <paramref name="code"/>.</summary>
@@ -112,10 +117,10 @@ public static class SassScheduler
             var e = effects[i];
             var reads = Registers(instruction, e.Reads);
             var writes = Registers(instruction, e.Writes);
-            var predicateReads = Predicates(instruction, e.PredicateReads, guard: false);
+            var predicateReads = Predicates(instruction, e.PredicateReads, e.UniformPredicates);
             int guard = instruction.GuardPredicate == SassInstruction.TruePredicate ? -1
-                : PredicateKey + instruction.GuardPredicate;
-            var predicateWrites = Predicates(instruction, e.PredicateWrites, guard: false);
+                : (e.UniformPredicates ? UniformPredicateKey : PredicateKey) + instruction.GuardPredicate;
+            var predicateWrites = Predicates(instruction, e.PredicateWrites, e.UniformPredicates);
             bool boundary = targets.Contains(i) || e.Latency == SassLatency.Control;
 
             // Waits.
@@ -181,7 +186,7 @@ public static class SassScheduler
                     Need(written + GuardPredicateLatency, written);
                 foreach (int p in predicateWrites) if (readyAt.TryGetValue(p, out var at)) Need(at.Ready, at.Produced);
                 if (e.ReadsAllPredicates)
-                    foreach (var pair in readyAt) if (pair.Key >= PredicateKey) Need(pair.Value.Ready, pair.Value.Produced);
+                    foreach (var pair in readyAt) if (pair.Key >= PredicateKey && pair.Key < UniformPredicateKey) Need(pair.Value.Ready, pair.Value.Produced);
             }
             if (ready > cycle)
             {
@@ -238,7 +243,7 @@ public static class SassScheduler
 
             var original = instruction.Control;
             var updated = instruction;
-            int baseStall = e.Mnemonic == "BMOV" ? BmovStall : 1;
+            int baseStall = e.Mnemonic switch { "BMOV" => BmovStall, "BAR" => BarStall, _ => 1 };
             updated.Control = new SassControl(baseStall, original.Yield, writeBoard, readBoard, wait, original.Reuse);
             result[i] = updated;
             originalStall[i] = original.Stall;
@@ -253,14 +258,22 @@ public static class SassScheduler
         return result;
     }
 
-    // Predicates live in the same readiness map as registers, offset past the register file.
-    private const int PredicateKey = 1000;
+    // Predicates, uniform predicates and uniform registers live in the same readiness map as vector registers, each
+    // offset past the one before.
+    private const int PredicateKey = 1000, UniformPredicateKey = 1008, UniformRegisterKey = 2000;
 
     private static List<int> Registers(in SassInstruction instruction, IReadOnlyList<SassRegisterOperand> operands)
     {
         var registers = new List<int>();
         foreach (var operand in operands)
         {
+            if (operand.Uniform)
+            {
+                int u = instruction.UniformRegister(operand.Field);
+                if (u == SassInstruction.ZeroUniformRegister) continue;
+                for (int k = 0; k < operand.Width; k++) registers.Add(UniformRegisterKey + u + k);
+                continue;
+            }
             int r = instruction.Register(operand.Field);
             if (r == SassInstruction.ZeroRegister) continue;
             for (int k = 0; k < operand.Width; k++) registers.Add(r + k);
@@ -268,15 +281,13 @@ public static class SassScheduler
         return registers;
     }
 
-    private static List<int> Predicates(in SassInstruction instruction, IReadOnlyList<int> fields, bool guard)
+    private static List<int> Predicates(in SassInstruction instruction, IReadOnlyList<int> fields, bool uniform)
     {
         var predicates = new List<int>();
-        if (guard && instruction.GuardPredicate != SassInstruction.TruePredicate)
-            predicates.Add(PredicateKey + instruction.GuardPredicate);
         foreach (int field in fields)
         {
             int p = (int)instruction.Bits(field, 3);
-            if (p != SassInstruction.TruePredicate) predicates.Add(PredicateKey + p);
+            if (p != SassInstruction.TruePredicate) predicates.Add((uniform ? UniformPredicateKey : PredicateKey) + p);
         }
         return predicates;
     }

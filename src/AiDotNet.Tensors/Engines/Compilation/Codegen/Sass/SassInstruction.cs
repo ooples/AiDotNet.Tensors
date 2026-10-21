@@ -29,7 +29,10 @@ public struct SassInstruction : IEquatable<SassInstruction>
     /// <summary>The register number meaning RZ (reads zero, discards writes).</summary>
     public const int ZeroRegister = 255;
 
-    /// <summary>The predicate index meaning PT (always true).</summary>
+    /// <summary>The uniform register number meaning URZ (the uniform datapath's 6-bit register fields).</summary>
+    public const int ZeroUniformRegister = 63;
+
+    /// <summary>The predicate index meaning PT (always true); UPT likewise for uniform predicates.</summary>
     public const int TruePredicate = 7;
 
     /// <summary>The scoreboard index meaning none.</summary>
@@ -109,6 +112,9 @@ public struct SassInstruction : IEquatable<SassInstruction>
 
     /// <summary>The 8-bit register field at <paramref name="field"/> (one of the *Field constants).</summary>
     public readonly int Register(int field) => (int)Bits(field, 8);
+
+    /// <summary>The 6-bit uniform register field at <paramref name="field"/>.</summary>
+    public readonly int UniformRegister(int field) => (int)Bits(field, 6);
 
     /// <summary>Writes the 8-bit register field at <paramref name="field"/>.</summary>
     public void SetRegister(int field, int register)

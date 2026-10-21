@@ -8,6 +8,14 @@
 //   form 3 (0x6..)  A at 24, B at 64;  the third operand a constant-bank word
 //   form 4 (0x8..)  A at 24, C at 64;  B an immediate (bits 32-63)
 //   form 5 (0xa..)  A at 24, C at 64;  B a constant-bank word
+//   form 6 (0xc..)  A at 24, C at 64;  B a uniform register at 32
+//   form 7 (0xe..)  A at 24, B at 64;  C a uniform register at 32
+//
+// The uniform datapath (sm_75+; one value per warp) has its own registers UR0-UR62 (6-bit fields, URZ = 63) and
+// predicates UP0-UP6. Its ALU operations are the vector opcode plus 0x80 (UIADD3 0x090, UIMAD 0x0a4, ULEA 0x091,
+// ...), with every register field uniform; ULDC loads a constant-bank word (or pair, by the size in bits 73-75) on a
+// fixed latency; S2UR and R2UR (vector A at 24 -> uniform) are variable-latency, like S2R. A uniform operation's guard
+// names a uniform predicate (nvdisasm prints @UP0): the uniform datapath has no per-thread state to test.
 //
 // and where predicates live: a compare's outputs at bits 81 and 84, a predicate source at 87 (negation at 90). Loads
 // and stores keep their access width in bits 73-75 (4 = 32 bits, 5 = 64, 6 = 128). Variable-latency operations (the
@@ -31,16 +39,20 @@ public enum SassLatency
     Control,
 }
 
-/// <summary>The register operands of one instruction: field position and width in registers.</summary>
-public readonly record struct SassRegisterOperand(int Field, int Width);
+/// <summary>
+/// The register operands of one instruction: field position, width in registers, and whether the field names a uniform
+/// register (UR0-UR62, a separate register file) rather than a vector one.
+/// </summary>
+public readonly record struct SassRegisterOperand(int Field, int Width, bool Uniform = false);
 
 /// <summary>What one decoded instruction reads and writes.</summary>
 public sealed class SassEffects
 {
     internal SassEffects(string mnemonic, SassLatency latency, IReadOnlyList<SassRegisterOperand> writes,
         IReadOnlyList<SassRegisterOperand> reads, IReadOnlyList<int> predicateWrites, IReadOnlyList<int> predicateReads,
-        bool readsAllPredicates, int fixedLatency)
+        bool readsAllPredicates, int fixedLatency, bool uniformPredicates = false)
     {
+        UniformPredicates = uniformPredicates;
         Mnemonic = mnemonic;
         Latency = latency;
         Writes = writes;
@@ -71,6 +83,12 @@ public sealed class SassEffects
 
     /// <summary>Cycles before a fixed-latency result may be read (0 for the other kinds).</summary>
     public int FixedLatency { get; }
+
+    /// <summary>
+    /// The predicate fields and the guard name uniform predicates (UP0-UP6), a file separate from P0-P6: the
+    /// uniform datapath's compares, carries and guards.
+    /// </summary>
+    public bool UniformPredicates { get; }
 }
 
 /// <summary>The opcode table of the Volta-family encoding (sm_70 through sm_89 share it).</summary>
@@ -96,7 +114,8 @@ public static class SassOpcodeTable
 
     private sealed record Spec(string Mnemonic, SassLatency Latency, bool WritesD, int DWidth, Sources Sources,
         int[] PredicateWrites, int[] PredicateReads, bool Memory = false, bool Store = false, int AddressWidth = 1,
-        bool ReadsAllPredicates = false, bool WideC = false, int FixedLatency = AluLatency);
+        bool ReadsAllPredicates = false, bool WideC = false, int FixedLatency = AluLatency, bool Uniform = false,
+        bool SizedD = false, bool VectorSources = false);
 
     private static readonly Dictionary<int, Spec> s_specs = new()
     {
@@ -105,11 +124,13 @@ public static class SassOpcodeTable
         [0x005] = new("CS2R", SassLatency.Fixed, true, 2, Sources.None, [], [], FixedLatency: 8),
         [0x007] = new("SEL", SassLatency.Fixed, true, 1, Sources.AB, [], [87]),
         [0x009] = new("FMNMX", SassLatency.Fixed, true, 1, Sources.AB, [], [87]),
+        [0x00b] = new("FSETP", SassLatency.Fixed, false, 0, Sources.AB, [81, 84], [87]),
         [0x00c] = new("ISETP", SassLatency.Fixed, false, 0, Sources.AB, [81, 84], [87]),
         [0x010] = new("IADD3", SassLatency.Fixed, true, 1, Sources.ABC, [81, 84], [87, 77]),
         [0x011] = new("LEA", SassLatency.Fixed, true, 1, Sources.ABC, [81], [87]),
         [0x012] = new("LOP3", SassLatency.Fixed, true, 1, Sources.ABC, [81], [87]),
         [0x013] = new("IABS", SassLatency.Fixed, true, 1, Sources.BOnly, [], []),
+        [0x017] = new("IMNMX", SassLatency.Fixed, true, 1, Sources.AB, [], [87]),
         [0x019] = new("SHF", SassLatency.Fixed, true, 1, Sources.ABC, [], []),
         [0x01c] = new("PLOP3", SassLatency.Fixed, false, 0, Sources.None, [81, 84], [87, 77, 68]),
         [0x020] = new("FMUL", SassLatency.Fixed, true, 1, Sources.AB, [], []),
@@ -118,6 +139,16 @@ public static class SassOpcodeTable
         [0x024] = new("IMAD", SassLatency.Fixed, true, 1, Sources.ABC, [], []),
         [0x025] = new("IMAD.WIDE", SassLatency.Fixed, true, 2, Sources.ABC, [], [], WideC: true, FixedLatency: 8),
         [0x027] = new("IMAD.HI", SassLatency.Fixed, true, 1, Sources.ABC, [], []),
+        [0x082] = new("UMOV", SassLatency.Fixed, true, 1, Sources.BOnly, [], [], Uniform: true),
+        [0x08c] = new("UISETP", SassLatency.Fixed, false, 0, Sources.AB, [81, 84], [87], Uniform: true),
+        [0x090] = new("UIADD3", SassLatency.Fixed, true, 1, Sources.ABC, [81, 84], [87, 77], Uniform: true),
+        [0x091] = new("ULEA", SassLatency.Fixed, true, 1, Sources.ABC, [81], [87], Uniform: true),
+        [0x099] = new("USHF", SassLatency.Fixed, true, 1, Sources.ABC, [], [], Uniform: true),
+        [0x0a4] = new("UIMAD", SassLatency.Fixed, true, 1, Sources.ABC, [], [], Uniform: true),
+        [0x0a5] = new("UIMAD.WIDE", SassLatency.Fixed, true, 2, Sources.ABC, [], [], WideC: true, Uniform: true),
+        [0x0b9] = new("ULDC", SassLatency.Fixed, true, 1, Sources.None, [], [], Uniform: true, SizedD: true),
+        [0x1c2] = new("R2UR", SassLatency.Variable, true, 1, Sources.A, [], [], Uniform: true, VectorSources: true),
+        [0x1c3] = new("S2UR", SassLatency.Variable, true, 1, Sources.None, [], [], Uniform: true),
         [0x105] = new("F2I", SassLatency.Variable, true, 1, Sources.BOnly, [], []),
         [0x106] = new("I2F", SassLatency.Variable, true, 1, Sources.BOnly, [], []),
         [0x108] = new("MUFU", SassLatency.Variable, true, 1, Sources.BOnly, [], []),
@@ -141,6 +172,9 @@ public static class SassOpcodeTable
         int op = instruction.Opcode & 0x1ff, form = instruction.Opcode >> 9;
         if (!s_specs.TryGetValue(op, out var spec)) return null;
 
+        // Uniform operations name uniform registers in every field (R2UR reads a vector one); a vector operation
+        // names a uniform register only in the field its form gives one (forms 6 and 7, bits 32).
+        bool uniformD = spec.Uniform, uniformSources = spec.Uniform && !spec.VectorSources;
         var writes = new List<SassRegisterOperand>();
         var reads = new List<SassRegisterOperand>();
         if (spec.Memory)
@@ -154,34 +188,45 @@ public static class SassOpcodeTable
         }
         else
         {
-            if (spec.WritesD) writes.Add(new SassRegisterOperand(D, spec.DWidth));
+            int dWidth = spec.SizedD ? (instruction.Bits(73, 3) == 5 ? 2 : 1) : spec.DWidth;
+            if (spec.WritesD) writes.Add(new SassRegisterOperand(D, dWidth, uniformD));
             switch (spec.Sources)
             {
                 case Sources.BOnly:
                     // A register-form single source sits in B; an immediate or constant form has no register source.
-                    if (form == 1) reads.Add(new SassRegisterOperand(B, 1));
+                    if (form == 1) reads.Add(new SassRegisterOperand(B, 1, uniformSources));
+                    else if (form == 6) reads.Add(new SassRegisterOperand(B, 1, true));
                     break;
                 case Sources.A:
-                    reads.Add(new SassRegisterOperand(A, 1));
+                    reads.Add(new SassRegisterOperand(A, 1, uniformSources));
                     break;
                 case Sources.AB:
                 case Sources.ABC:
-                    reads.Add(new SassRegisterOperand(A, 1));
+                    reads.Add(new SassRegisterOperand(A, 1, uniformSources));
                     int cWidth = spec.WideC ? 2 : 1;
                     switch (form)
                     {
                         case 1:
-                            reads.Add(new SassRegisterOperand(B, 1));
-                            if (spec.Sources == Sources.ABC) reads.Add(new SassRegisterOperand(C, cWidth));
+                            reads.Add(new SassRegisterOperand(B, 1, uniformSources));
+                            if (spec.Sources == Sources.ABC) reads.Add(new SassRegisterOperand(C, cWidth, uniformSources));
                             break;
                         case 2:
                         case 3:
                             // The second register source moves to bits 64; the third operand is immediate/constant.
-                            reads.Add(new SassRegisterOperand(C, 1));
+                            reads.Add(new SassRegisterOperand(C, 1, uniformSources));
                             break;
                         case 4:
                         case 5:
+                            if (spec.Sources == Sources.ABC) reads.Add(new SassRegisterOperand(C, cWidth, uniformSources));
+                            break;
+                        case 6 when !spec.Uniform:
+                            reads.Add(new SassRegisterOperand(B, 1, true));
                             if (spec.Sources == Sources.ABC) reads.Add(new SassRegisterOperand(C, cWidth));
+                            break;
+                        case 7 when !spec.Uniform:
+                            // The second source (a vector register) moves to bits 64, the third (uniform) to 32.
+                            reads.Add(new SassRegisterOperand(C, 1));
+                            reads.Add(new SassRegisterOperand(B, spec.Sources == Sources.ABC ? cWidth : 1, true));
                             break;
                         default:
                             return null;
@@ -190,6 +235,6 @@ public static class SassOpcodeTable
             }
         }
         return new SassEffects(spec.Mnemonic, spec.Latency, writes, reads, spec.PredicateWrites, spec.PredicateReads,
-            spec.ReadsAllPredicates, spec.Latency == SassLatency.Fixed ? spec.FixedLatency : 0);
+            spec.ReadsAllPredicates, spec.Latency == SassLatency.Fixed ? spec.FixedLatency : 0, spec.Uniform);
     }
 }

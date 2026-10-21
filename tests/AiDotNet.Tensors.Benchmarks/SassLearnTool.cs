@@ -60,10 +60,22 @@ internal static class SassLearnTool
                 lines.AddRange(Disassemble(ptx, entry.Name + "_" + tag, arch, bin, work));
             }
         }
+        // The register-blocked GEMM (the backend's compute-bound gate kernel): every seed configuration, both layouts
+        // of A, as the probe's --gemm mode runs them.
+        foreach (bool transposeA in new[] { false, true })
+        {
+            var layout = new AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx.PtxGemmLayout(transposeA, false);
+            foreach (var config in AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx.PtxGemmEvolution.Seeds(layout, 2048, 2048, 2048, ccMajor: major))
+            {
+                string ptx = AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx.PtxSgemmGenerator.Emit(config, layout, major, minor);
+                lines.AddRange(Disassemble(ptx, "sgemm_" + config.Name.Replace('-', '_') + "_" + layout.Name, arch, bin, work));
+            }
+        }
         Console.WriteLine("SASS LEARN sm_" + arch + ": " + lines.Count + " instructions from " +
             lines.Select(l => l.Kernel).Distinct().Count() + " kernels");
         ReportGuard(lines);
         ReportRegisterFields(lines);
+        ReportUniformFields(lines);
         ReportControl(lines);
         ReportOpcodes(lines);
         ReportPredicateFields(lines);
@@ -105,13 +117,22 @@ internal static class SassLearnTool
                 if (effects is null)
                 {
                     unknown++;
-                    unknownOps[line.Opcode] = unknownOps.TryGetValue(line.Opcode, out int u) ? u + 1 : 1;
+                    string unknownKey = line.Opcode + " 0x" + (line.Low & 0xfff).ToString("x3", CultureInfo.InvariantCulture) + " e.g. " + string.Join(", ", line.Operands);
+                    if (!unknownOps.Keys.Any(k => k.StartsWith(line.Opcode + " 0x" + (line.Low & 0xfff).ToString("x3", CultureInfo.InvariantCulture), StringComparison.Ordinal)))
+                        unknownOps[unknownKey] = 0;
+                    string existing = unknownOps.Keys.First(k => k.StartsWith(line.Opcode + " 0x" + (line.Low & 0xfff).ToString("x3", CultureInfo.InvariantCulture), StringComparison.Ordinal));
+                    unknownOps[existing]++;
                     pendingWrite.Clear(); pendingRead.Clear(); fixedReady.Clear();
                     continue;
                 }
                 IEnumerable<int> Registers(IEnumerable<AiDotNet.Tensors.Engines.Compilation.Codegen.Sass.SassRegisterOperand> ops) =>
                     ops.SelectMany(o =>
                     {
+                        if (o.Uniform)
+                        {
+                            int u = instruction.UniformRegister(o.Field);
+                            return u == 63 ? Enumerable.Empty<int>() : Enumerable.Range(1000 + u, o.Width);
+                        }
                         int r = instruction.Register(o.Field);
                         return r == 255 ? Enumerable.Empty<int>() : Enumerable.Range(r, o.Width);
                     });
@@ -149,8 +170,9 @@ internal static class SassLearnTool
                         fixedReady.Remove(r);
                     }
                 }
-                var predicateReads = effects.PredicateReads.Select(f => (int)instruction.Bits(f, 3)).Where(p => p != 7).ToList();
-                if (instruction.GuardPredicate != 7) predicateReads.Add(instruction.GuardPredicate);
+                int predicateBase = effects.UniformPredicates ? 8 : 0;
+                var predicateReads = effects.PredicateReads.Select(f => (int)instruction.Bits(f, 3)).Where(p => p != 7).Select(p => predicateBase + p).ToList();
+                if (instruction.GuardPredicate != 7) predicateReads.Add(predicateBase + instruction.GuardPredicate);
                 foreach (int pr in predicateReads)
                     if (predicateReady.TryGetValue(pr, out long written))
                     {
@@ -159,7 +181,7 @@ internal static class SassLearnTool
                         minimumLatency[key] = minimumLatency.TryGetValue(key, out int d0) ? Math.Min(d0, distance) : distance;
                         predicateReady.Remove(pr);
                     }
-                foreach (int pw in effects.PredicateWrites.Select(f => (int)instruction.Bits(f, 3)).Where(p => p != 7))
+                foreach (int pw in effects.PredicateWrites.Select(f => (int)instruction.Bits(f, 3)).Where(p => p != 7).Select(p => predicateBase + p))
                     predicateReady[pw] = cycle;
                 if (effects.Latency == AiDotNet.Tensors.Engines.Compilation.Codegen.Sass.SassLatency.Control)
                 {
@@ -349,6 +371,46 @@ internal static class SassLearnTool
                 parts.Add(slot + "->" + (fits.Count == 0 ? "?" : string.Join("|", fits)) + " (" + sightings.Count + ")");
             }
             Console.WriteLine(("  " + group.Key.Item1 + "/" + group.Key.Item2).PadRight(18) + string.Join("  ", parts));
+        }
+    }
+
+    private static readonly Regex UniformRegister = new(@"^-?\|?UR(\d+|Z)\|?$", RegexOptions.Compiled);
+    private static readonly Regex UniformPredicate = new(@"^!?(UP[0-6]|UPT)$", RegexOptions.Compiled);
+
+    // The uniform datapath (sm_75+) has its own register file (UR0-UR62, URZ = 63) and predicates (UP0-UP6, UPT = 7).
+    // For each opcode and operand slot holding one: the bit positions that equal its number in every sighting.
+    private static void ReportUniformFields(List<SassLine> lines)
+    {
+        Console.WriteLine();
+        Console.WriteLine("UNIFORM FIELDS - opcode/operand count: slot -> bit position (sightings)");
+        var groups = lines.GroupBy(l => (Base(l.Opcode) + "@" + Field(l, 0, 12).ToString("x3"), l.Operands.Length));
+        foreach (var group in groups.OrderBy(g => g.Key.Item1, StringComparer.Ordinal))
+        {
+            var parts = new List<string>();
+            for (int slot = 0; slot < group.Key.Item2; slot++)
+            {
+                var registers = group.Where(l => UniformRegister.IsMatch(l.Operands[slot])).ToList();
+                if (registers.Count != 0)
+                {
+                    var fits = Enumerable.Range(12, 100).Where(p => registers.All(l =>
+                    {
+                        var g = UniformRegister.Match(l.Operands[slot]).Groups[1].Value;
+                        return Field(l, p, 6) == (g == "Z" ? 63UL : ulong.Parse(g, CultureInfo.InvariantCulture));
+                    })).ToList();
+                    parts.Add(slot + "->UR@" + (fits.Count == 0 ? "?" : string.Join("|", fits)) + " (" + registers.Count + ")");
+                }
+                var predicates = group.Where(l => UniformPredicate.IsMatch(l.Operands[slot])).ToList();
+                if (predicates.Count != 0)
+                {
+                    var fits = Enumerable.Range(12, 100).Where(p => predicates.All(l =>
+                    {
+                        var g = UniformPredicate.Match(l.Operands[slot]).Groups[1].Value;
+                        return Field(l, p, 3) == (g == "UPT" ? 7UL : ulong.Parse(g.Substring(2), CultureInfo.InvariantCulture));
+                    })).ToList();
+                    parts.Add(slot + "->UP@" + (fits.Count == 0 ? "?" : string.Join("|", fits)) + " (" + predicates.Count + ")");
+                }
+            }
+            if (parts.Count != 0) Console.WriteLine(("  " + group.Key.Item1 + "/" + group.Key.Item2).PadRight(24) + string.Join("  ", parts));
         }
     }
 
