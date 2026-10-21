@@ -8731,7 +8731,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var shortcutPairs = new Dictionary<int, (int Main, int Shortcut)>();
         var consumedByShortcutPair = new HashSet<int>();
         if (typeof(T) == typeof(float) && preferGenericForGpu && !useGradPool && fp16HeteroOrder is null
-            && engine is DirectGpuTensorEngine shortcutEngine
+            && engine is IConvShortcutPairEngine shortcutEngine
             && Environment.GetEnvironmentVariable("AIDOTNET_CONV_SHORTCUT_FUSION") != "0")
         {
             var excluded = new HashSet<int>(fusedStepIndices);
