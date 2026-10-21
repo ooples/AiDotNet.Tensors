@@ -671,6 +671,9 @@ internal static class DirectPtxCubinArtifactCache
                 "Direct-PTX compiled artifact is not a CUDA ELF cubin: " + source);
     }
 
+    /// <summary>The image hash an artifact records (lowercase hex SHA-256).</summary>
+    internal static string ComputeImageSha256(byte[] image) => Sha256(image);
+
     private static string Sha256(byte[] bytes)
     {
         using SHA256 sha = SHA256.Create();

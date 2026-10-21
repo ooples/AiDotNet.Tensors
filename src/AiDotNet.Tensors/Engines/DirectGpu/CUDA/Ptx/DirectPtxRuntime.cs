@@ -245,6 +245,34 @@ internal sealed class DirectPtxRuntime : IDisposable
         }
     }
 
+    /// <summary>
+    /// Compiles <paramref name="ptx"/> to the driver linker's cubin, passes the image through
+    /// <paramref name="rewrite"/> (the own SASS backend's passes, #1442), and loads the result. The artifact keeps the
+    /// rewritten image, so validation disassembles exactly what runs.
+    /// </summary>
+    internal DirectPtxModule LoadRewrittenModule(string ptx, Func<byte[], byte[]> rewrite, string rewriteLabel)
+    {
+        if (string.IsNullOrWhiteSpace(ptx)) throw new ArgumentException("PTX cannot be empty.", nameof(ptx));
+        PtxCompat.ThrowIfNull(rewrite, nameof(rewrite));
+        using var _ = Enter();
+        var compiled = DirectPtxCubinArtifactCache.Resolve(this, ptx);
+        byte[] image = rewrite(compiled.Image);
+        var artifact = new DirectPtxCubinArtifact(image, compiled.SourceKey + "+" + rewriteLabel,
+            DirectPtxCubinArtifactCache.ComputeImageSha256(image), DirectPtxModuleImageKind.DriverLinkedCubin, null,
+            compiled.CompilerLog);
+        IntPtr native = Marshal.AllocHGlobal(image.Length);
+        try
+        {
+            Marshal.Copy(image, 0, native, image.Length);
+            Check(CudaNativeBindings.cuModuleLoadData(out IntPtr module, native), "cuModuleLoadData(rewritten SASS cubin)");
+            return new DirectPtxModule(this, module, artifact);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(native);
+        }
+    }
+
     private unsafe DirectPtxModule LoadJitModule(string ptx)
     {
         IntPtr text = Marshal.StringToHGlobalAnsi(ptx);

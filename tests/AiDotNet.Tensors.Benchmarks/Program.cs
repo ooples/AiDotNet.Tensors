@@ -567,6 +567,11 @@ class Program
             return;
         }
 
+        if (args.Length > 0 && args[0] == "--sass-learn")
+        {
+            SassLearnTool.Run(args.Skip(1).ToArray());
+            return;
+        }
         if (args.Length > 0 && args[0] == "--kernel-dump")
         {
             KernelConveyorTool.Run("dump", args.Skip(1).ToArray());

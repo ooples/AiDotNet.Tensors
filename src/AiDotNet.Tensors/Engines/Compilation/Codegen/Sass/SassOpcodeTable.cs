@@ -1,0 +1,192 @@
+// Copyright (c) AiDotNet. All rights reserved.
+// What each Volta-family SASS opcode reads and writes, for the own SASS backend's register allocation and scheduling
+// (#1442). An instruction's bits 0-8 name the operation and bits 9-11 its operand form; --sass-learn measured, on the
+// catalog's kernels compiled for sm_75, where each form keeps its register sources:
+//
+//   form 1 (0x2..)  A at bits 24, B at 32, C at 64      (all registers)
+//   form 2 (0x4..)  A at 24, B at 64;  the third operand an immediate
+//   form 3 (0x6..)  A at 24, B at 64;  the third operand a constant-bank word
+//   form 4 (0x8..)  A at 24, C at 64;  B an immediate (bits 32-63)
+//   form 5 (0xa..)  A at 24, C at 64;  B a constant-bank word
+//
+// and where predicates live: a compare's outputs at bits 81 and 84, a predicate source at 87 (negation at 90). Loads
+// and stores keep their access width in bits 73-75 (4 = 32 bits, 5 = 64, 6 = 128). Variable-latency operations (the
+// ones ptxas gives a scoreboard: loads, S2R, MUFU, I2F/F2I) are marked so the scheduler waits on them rather than
+// counting cycles. An opcode not listed is unknown: a kernel containing one is left exactly as ptxas wrote it.
+
+using System.Collections.Generic;
+
+namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Sass;
+
+/// <summary>How an instruction's result arrives.</summary>
+public enum SassLatency
+{
+    /// <summary>A fixed pipeline latency: later readers are delayed by stall counts.</summary>
+    Fixed,
+
+    /// <summary>A variable latency (memory, special functions): readers wait on a scoreboard.</summary>
+    Variable,
+
+    /// <summary>Control flow, barriers and other instructions the backend never moves or rewrites.</summary>
+    Control,
+}
+
+/// <summary>The register operands of one instruction: field position and width in registers.</summary>
+public readonly record struct SassRegisterOperand(int Field, int Width);
+
+/// <summary>What one decoded instruction reads and writes.</summary>
+public sealed class SassEffects
+{
+    internal SassEffects(string mnemonic, SassLatency latency, IReadOnlyList<SassRegisterOperand> writes,
+        IReadOnlyList<SassRegisterOperand> reads, IReadOnlyList<int> predicateWrites, IReadOnlyList<int> predicateReads,
+        bool readsAllPredicates, int fixedLatency)
+    {
+        Mnemonic = mnemonic;
+        Latency = latency;
+        Writes = writes;
+        Reads = reads;
+        PredicateWrites = predicateWrites;
+        PredicateReads = predicateReads;
+        ReadsAllPredicates = readsAllPredicates;
+        FixedLatency = fixedLatency;
+    }
+
+    public string Mnemonic { get; }
+    public SassLatency Latency { get; }
+
+    /// <summary>Destination register fields (RZ, 255, means none).</summary>
+    public IReadOnlyList<SassRegisterOperand> Writes { get; }
+
+    /// <summary>Source register fields (RZ means none).</summary>
+    public IReadOnlyList<SassRegisterOperand> Reads { get; }
+
+    /// <summary>Bit positions of 3-bit predicate destinations (7, PT, means none).</summary>
+    public IReadOnlyList<int> PredicateWrites { get; }
+
+    /// <summary>Bit positions of 3-bit predicate sources, besides the guard (7, PT, means none).</summary>
+    public IReadOnlyList<int> PredicateReads { get; }
+
+    /// <summary>The instruction reads the whole predicate file (P2R).</summary>
+    public bool ReadsAllPredicates { get; }
+
+    /// <summary>Cycles before a fixed-latency result may be read (0 for the other kinds).</summary>
+    public int FixedLatency { get; }
+}
+
+/// <summary>The opcode table of the Volta-family encoding (sm_70 through sm_89 share it).</summary>
+public static class SassOpcodeTable
+{
+    private const int A = SassInstruction.RaField, B = SassInstruction.RbField, C = SassInstruction.RcField;
+    private const int D = SassInstruction.RdField;
+
+    // ALU results on Turing and Ampere are readable 4-6 cycles after issue; 6 is safe for all listed ALU opcodes.
+    private const int AluLatency = 6;
+
+    private enum Sources
+    {
+        None,
+        BOnly,      // single-source operations keep it in the B slot (MOV, MUFU, I2F, F2I, IABS)
+        A,
+        AB,
+        ABC,
+    }
+
+    private sealed record Spec(string Mnemonic, SassLatency Latency, bool WritesD, int DWidth, Sources Sources,
+        int[] PredicateWrites, int[] PredicateReads, bool Memory = false, bool Store = false, int AddressWidth = 1,
+        bool ReadsAllPredicates = false, bool WideC = false);
+
+    private static readonly Dictionary<int, Spec> s_specs = new()
+    {
+        [0x002] = new("MOV", SassLatency.Fixed, true, 1, Sources.BOnly, [], []),
+        [0x003] = new("P2R", SassLatency.Fixed, true, 1, Sources.A, [], [], ReadsAllPredicates: true),
+        [0x005] = new("CS2R", SassLatency.Fixed, true, 2, Sources.None, [], []),
+        [0x007] = new("SEL", SassLatency.Fixed, true, 1, Sources.AB, [], [87]),
+        [0x009] = new("FMNMX", SassLatency.Fixed, true, 1, Sources.AB, [], [87]),
+        [0x00c] = new("ISETP", SassLatency.Fixed, false, 0, Sources.AB, [81, 84], [87]),
+        [0x010] = new("IADD3", SassLatency.Fixed, true, 1, Sources.ABC, [81, 84], [87, 77]),
+        [0x011] = new("LEA", SassLatency.Fixed, true, 1, Sources.ABC, [81], [87]),
+        [0x012] = new("LOP3", SassLatency.Fixed, true, 1, Sources.ABC, [81], [87]),
+        [0x013] = new("IABS", SassLatency.Fixed, true, 1, Sources.BOnly, [], []),
+        [0x019] = new("SHF", SassLatency.Fixed, true, 1, Sources.ABC, [], []),
+        [0x01c] = new("PLOP3", SassLatency.Fixed, false, 0, Sources.None, [81, 84], [87, 77, 68]),
+        [0x020] = new("FMUL", SassLatency.Fixed, true, 1, Sources.AB, [], []),
+        [0x021] = new("FADD", SassLatency.Fixed, true, 1, Sources.AB, [], []),
+        [0x023] = new("FFMA", SassLatency.Fixed, true, 1, Sources.ABC, [], []),
+        [0x024] = new("IMAD", SassLatency.Fixed, true, 1, Sources.ABC, [], []),
+        [0x025] = new("IMAD.WIDE", SassLatency.Fixed, true, 2, Sources.ABC, [], [], WideC: true),
+        [0x027] = new("IMAD.HI", SassLatency.Fixed, true, 1, Sources.ABC, [], []),
+        [0x105] = new("F2I", SassLatency.Variable, true, 1, Sources.BOnly, [], []),
+        [0x106] = new("I2F", SassLatency.Variable, true, 1, Sources.BOnly, [], []),
+        [0x108] = new("MUFU", SassLatency.Variable, true, 1, Sources.BOnly, [], []),
+        [0x119] = new("S2R", SassLatency.Variable, true, 1, Sources.None, [], []),
+        [0x181] = new("LDG", SassLatency.Variable, true, 1, Sources.None, [], [], Memory: true, AddressWidth: 2),
+        [0x184] = new("LDS", SassLatency.Variable, true, 1, Sources.None, [], [], Memory: true),
+        [0x186] = new("STG", SassLatency.Variable, false, 0, Sources.None, [], [], Memory: true, Store: true, AddressWidth: 2),
+        [0x188] = new("STS", SassLatency.Variable, false, 0, Sources.None, [], [], Memory: true, Store: true),
+        [0x118] = new("NOP", SassLatency.Control, false, 0, Sources.None, [], []),
+        [0x11d] = new("BAR", SassLatency.Control, false, 0, Sources.None, [], []),
+        [0x141] = new("BSYNC", SassLatency.Control, false, 0, Sources.None, [], []),
+        [0x145] = new("BSSY", SassLatency.Control, false, 0, Sources.None, [], []),
+        [0x147] = new("BRA", SassLatency.Control, false, 0, Sources.None, [], []),
+        [0x14d] = new("EXIT", SassLatency.Control, false, 0, Sources.None, [], []),
+        [0x155] = new("BMOV", SassLatency.Control, false, 0, Sources.None, [], []),
+    };
+
+    /// <summary>The effects of <paramref name="instruction"/>, or null for an opcode the table does not know.</summary>
+    public static SassEffects? Decode(in SassInstruction instruction)
+    {
+        int op = instruction.Opcode & 0x1ff, form = instruction.Opcode >> 9;
+        if (!s_specs.TryGetValue(op, out var spec)) return null;
+
+        var writes = new List<SassRegisterOperand>();
+        var reads = new List<SassRegisterOperand>();
+        if (spec.Memory)
+        {
+            // Access width in registers from the size field: 4 = 32 bits, 5 = 64, 6 = 128.
+            int size = (int)instruction.Bits(73, 3);
+            int width = size switch { 5 => 2, 6 => 4, _ => 1 };
+            reads.Add(new SassRegisterOperand(A, spec.AddressWidth));
+            if (spec.Store) reads.Add(new SassRegisterOperand(B, width));
+            else writes.Add(new SassRegisterOperand(D, width));
+        }
+        else
+        {
+            if (spec.WritesD) writes.Add(new SassRegisterOperand(D, spec.DWidth));
+            switch (spec.Sources)
+            {
+                case Sources.BOnly:
+                    // A register-form single source sits in B; an immediate or constant form has no register source.
+                    if (form == 1) reads.Add(new SassRegisterOperand(B, 1));
+                    break;
+                case Sources.A:
+                    reads.Add(new SassRegisterOperand(A, 1));
+                    break;
+                case Sources.AB:
+                case Sources.ABC:
+                    reads.Add(new SassRegisterOperand(A, 1));
+                    int cWidth = spec.WideC ? 2 : 1;
+                    switch (form)
+                    {
+                        case 1:
+                            reads.Add(new SassRegisterOperand(B, 1));
+                            if (spec.Sources == Sources.ABC) reads.Add(new SassRegisterOperand(C, cWidth));
+                            break;
+                        case 2:
+                        case 3:
+                            // The second register source moves to bits 64; the third operand is immediate/constant.
+                            reads.Add(new SassRegisterOperand(C, 1));
+                            break;
+                        case 4:
+                        case 5:
+                            if (spec.Sources == Sources.ABC) reads.Add(new SassRegisterOperand(C, cWidth));
+                            break;
+                        default:
+                            return null;
+                    }
+                    break;
+            }
+        }
+        return new SassEffects(spec.Mnemonic, spec.Latency, writes, reads, spec.PredicateWrites, spec.PredicateReads,
+            spec.ReadsAllPredicates, spec.Latency == SassLatency.Fixed ? AluLatency : 0);
+    }
+}
