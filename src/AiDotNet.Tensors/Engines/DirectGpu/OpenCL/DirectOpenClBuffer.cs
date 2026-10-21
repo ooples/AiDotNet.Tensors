@@ -133,9 +133,25 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         /// </summary>
         internal static DirectOpenClBuffer? TryCreateView(DirectOpenClBuffer parent, int elementOffset, int elementCount)
         {
-            IntPtr view = OpenClNativeBindings.CreateSubBuffer(parent.Handle, checked(elementOffset * sizeof(float)),
-                checked(elementCount * sizeof(float)));
-            return view == IntPtr.Zero ? null : new DirectOpenClBuffer(parent._context, view, elementCount);
+            int byteOffset = checked(elementOffset * sizeof(float));
+            uint alignment = parent._context.SubBufferAlignmentBytes;
+            if (alignment > 0 && byteOffset % alignment != 0)
+            {
+                System.Diagnostics.Trace.TraceWarning(
+                    $"OpenCL will not view a buffer at byte offset {byteOffset}: this device aligns sub-buffer origins to {alignment} bytes.");
+                return null;
+            }
+
+            IntPtr view = OpenClNativeBindings.CreateSubBuffer(parent.Handle, byteOffset,
+                checked(elementCount * sizeof(float)), out int err);
+            if (view == IntPtr.Zero)
+            {
+                System.Diagnostics.Trace.TraceWarning(
+                    $"OpenCL refused a view of {elementCount} floats at byte offset {byteOffset}: {err}.");
+                return null;
+            }
+
+            return new DirectOpenClBuffer(parent._context, view, elementCount);
         }
 
         public DirectOpenClBuffer(DirectOpenClContext context, int size)
