@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // The pointwise family on declared kernels (#890 phase 4a): every elementwise launch -- unary, binary, scalar-parameter,
 // fused add + activation, bias broadcast -- runs a kernel emitted from a declared body (PtxAffineEmitter.EmitElementwise)
 // whose scalar math calls the function CudaMathLibrary derived from the hand-written kernel it replaces, linked from
@@ -72,6 +72,10 @@ public sealed partial class CudaBackend
 
     // The NVRTC log of each library that did not compile.
     private readonly Dictionary<string, string> _mathLibraryLogs = new(StringComparer.Ordinal);
+
+    // The cache file each in-memory library image was READ from, so a link failure can discard a corrupt one. Only
+    // images that came off disk are listed; a freshly compiled image cannot be the cache's fault.
+    private readonly Dictionary<string, string> _mathLibraryCacheFiles = new(StringComparer.Ordinal);
 
     /// <summary>Why <paramref name="moduleName"/>'s math library did not compile, or null.</summary>
     internal string? MathLibraryLog(string moduleName)
@@ -195,40 +199,46 @@ public sealed partial class CudaBackend
             if (_declaredElementwise.TryGetValue(key, out var known)) return known;
             // Building compiles and links, which graph capture forbids: decline now, build on a call outside capture.
             if (IsStreamCapturing()) return null;
-            DeclaredElementwise? built = null;
-            try
+            // Twice at most: a link failure against a library image that came off disk discards the cached cubin and
+            // recompiles, so a truncated cache file costs one rebuild instead of the route for every later process.
+            for (int attempt = 0; ; attempt++)
             {
-                var spec = build();
-                var emitter = new PtxAffineEmitter();
-                string entry = "declared_" + SafeName(spec.Name);
-                string ptx = emitter.EmitElementwise(spec, entry, _ccMajor, _ccMinor);
-                var objects = new List<byte[]>();
-                foreach (var called in emitter.CalledFunctions)
-                {
-                    var library = MathLibrary(called.Library)
-                        ?? throw new NotSupportedException("The " + called.Library + " library did not compile.");
-                    if (!objects.Contains(library)) objects.Add(library);
-                }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
-                var module = objects.Count == 0
-                    ? _directPtxRuntime.LoadModule(ptx, allowExperimentalJitFallback: true)
-                    : _directPtxRuntime.LoadLinkedModule(ptx, objects);
+                DeclaredElementwise? built = null;
                 try
                 {
-                    built = new DeclaredElementwise(module, module.GetFunction(entry, out _), spec);
+                    var spec = build();
+                    var emitter = new PtxAffineEmitter();
+                    string entry = "declared_" + SafeName(spec.Name);
+                    string ptx = emitter.EmitElementwise(spec, entry, _ccMajor, _ccMinor);
+                    var objects = new List<byte[]>();
+                    foreach (var called in emitter.CalledFunctions)
+                    {
+                        var library = MathLibrary(called.Library)
+                            ?? throw new NotSupportedException("The " + called.Library + " library did not compile.");
+                        if (!objects.Contains(library)) objects.Add(library);
+                    }
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
+                    var module = objects.Count == 0
+                        ? _directPtxRuntime.LoadModule(ptx, allowExperimentalJitFallback: true)
+                        : _directPtxRuntime.LoadLinkedModule(ptx, objects);
+                    try
+                    {
+                        built = new DeclaredElementwise(module, module.GetFunction(entry, out _), spec);
+                    }
+                    catch
+                    {
+                        module.Dispose();
+                        throw;
+                    }
                 }
-                catch
+                catch (Exception ex) when (ex is NotSupportedException or InvalidOperationException or ArgumentException)
                 {
-                    module.Dispose();
-                    throw;
+                    LastElementwiseDecline = key + ": " + ex.Message;
+                    if (attempt == 0 && DiscardCachedMathLibraries()) continue;
                 }
+                _declaredElementwise[key] = built;
+                return built;
             }
-            catch (Exception ex) when (ex is NotSupportedException or InvalidOperationException or ArgumentException)
-            {
-                LastElementwiseDecline = key + ": " + ex.Message;
-            }
-            _declaredElementwise[key] = built;
-            return built;
         }
     }
 
@@ -249,7 +259,11 @@ public sealed partial class CudaBackend
             string? cacheDir = GetKernelCacheDirectory();
             string key = ComputeCacheKey(source, string.Join(" ", options) + " " + NvrtcNativeBindings.VersionTag, module.FastMath);
             string? cacheFile = cacheDir is null ? null : Path.Combine(cacheDir, "mathlib_" + moduleName + "_" + key + ".cubin");
-            if (cacheFile is not null && File.Exists(cacheFile)) image = File.ReadAllBytes(cacheFile);
+            if (cacheFile is not null && TryReadCachedImage(cacheFile, out byte[]? cached))
+            {
+                image = cached;
+                _mathLibraryCacheFiles[moduleName] = cacheFile;
+            }
             else
             {
                 image = CompileRelocatable(source, "mathlib_" + moduleName, options.ToArray(), out string log);
@@ -260,12 +274,65 @@ public sealed partial class CudaBackend
                 }
                 else if (cacheFile is not null)
                 {
-                    try { File.WriteAllBytes(cacheFile, image); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+                    WriteCachedImage(cacheFile, image);
                 }
             }
         }
         _mathLibraries[moduleName] = image;
         return image;
+    }
+
+    // A cached image that cannot be read is a cache MISS, not a failure: the library is recompiled and rewritten.
+    private static bool TryReadCachedImage(string cacheFile, out byte[]? image)
+    {
+        image = null;
+        try
+        {
+            if (!File.Exists(cacheFile)) return false;
+            image = File.ReadAllBytes(cacheFile);
+        }
+        catch (IOException) { return false; }
+        catch (UnauthorizedAccessException) { return false; }
+        // A zero-length file is a write that was interrupted before any bytes landed.
+        return image is { Length: > 0 };
+    }
+
+    // Written through a temporary and moved into place: File.WriteAllBytes writes IN PLACE, so two processes
+    // compiling the same library at once - or one killed mid-write - could leave a truncated cubin that every later
+    // process would then trust, losing the declared elementwise route and the routes that link the library.
+    private static void WriteCachedImage(string cacheFile, byte[] image)
+    {
+        string temp = cacheFile + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try
+        {
+            File.WriteAllBytes(temp, image);
+            // Another process may have finished first; its image is the same content-addressed library.
+            if (!File.Exists(cacheFile)) File.Move(temp, cacheFile);
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+        finally
+        {
+            try { if (File.Exists(temp)) File.Delete(temp); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+    }
+
+    // Discards every library image that came off disk, file and all, so the next build recompiles instead of linking
+    // the same bad image again. Returns whether anything was discarded. The caller holds _directPtxLock.
+    private bool DiscardCachedMathLibraries()
+    {
+        if (_mathLibraryCacheFiles.Count == 0) return false;
+        foreach (var pair in _mathLibraryCacheFiles)
+        {
+            try { File.Delete(pair.Value); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+            _mathLibraries.Remove(pair.Key);
+        }
+        _mathLibraryCacheFiles.Clear();
+        return true;
     }
 
     private static byte[]? CompileRelocatable(string source, string name, string[] options, out string log)

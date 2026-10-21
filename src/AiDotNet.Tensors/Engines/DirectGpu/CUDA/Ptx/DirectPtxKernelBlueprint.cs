@@ -73,8 +73,12 @@ internal static class DirectPtxArchitecture
 
     private static HashSet<int>? ParseReleasedArchitectures(string? configured)
     {
-        if (string.IsNullOrWhiteSpace(configured)) return null;
-        if (string.Equals(configured.Trim(), "all", StringComparison.OrdinalIgnoreCase)) return new HashSet<int>();
+        // Not string.IsNullOrWhiteSpace: net471's overload carries no NotNullWhen annotation, so the flow analysis
+        // does not learn that configured is non-null afterwards.
+        if (configured is null) return null;
+        string trimmed = configured.Trim();
+        if (trimmed.Length == 0) return null;
+        if (string.Equals(trimmed, "all", StringComparison.OrdinalIgnoreCase)) return new HashSet<int>();
         var set = new HashSet<int>();
         foreach (string part in configured.Split(','))
             if (int.TryParse(part.Trim(), System.Globalization.NumberStyles.Integer,
