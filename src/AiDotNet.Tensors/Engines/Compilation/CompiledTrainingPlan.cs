@@ -3879,11 +3879,14 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _firstWriteRedirects.BeginRun();
         if (redirectEngine is not null) redirectEngine.FirstWriteRedirects = _firstWriteRedirects;
         _gradientDeferral?.Reset();
+        // Restored rather than cleared: this body can run nested inside another plan's on this thread, and clearing
+        // would lose what the outer one parked.
+        var outerDeferral = redirectEngine?.DeferredGradients;
         if (redirectEngine is not null) redirectEngine.DeferredGradients = _gradientDeferral;
         try { RunGpuStepBodyForCaptureCore(backend); completed = true; }
         finally
         {
-            if (redirectEngine is not null) redirectEngine.DeferredGradients = null;
+            if (redirectEngine is not null) redirectEngine.DeferredGradients = outerDeferral;
             if (redirectEngine is not null) redirectEngine.FirstWriteRedirects = null;
             // Only a whole executed run is evidence; a capture records, and a body that threw left its pairing unknown.
             _firstWriteRedirects.EndRun(executed && completed);

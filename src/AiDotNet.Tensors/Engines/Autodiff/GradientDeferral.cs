@@ -29,6 +29,24 @@ internal sealed class GradientDeferral
     /// <summary>Contributions parked so far in this process (tests).</summary>
     internal static long ParkedCount;
 
+    /// <summary>
+    /// The deferral of the compiled GPU step body running on this thread, or null where there is none and every
+    /// contribution is added as it arrives. Thread-static, not engine state: one engine serves every plan compiled on
+    /// it while <c>CompiledTrainingPlan._stepSync</c> serialises one plan only, so held on the engine a second plan's
+    /// step would overwrite this deferral and its finally would clear it - and a contribution parked before that whose
+    /// consuming backward then takes nothing is dropped, which is a wrong gradient rather than a slower step. A step
+    /// body parks and takes on the single thread that runs it (Step takes the lock, StepCore stays on the thread, and
+    /// the backward walk is sequential over nodes), so the thread is the scope that isolates concurrent plans.
+    /// </summary>
+    internal static GradientDeferral? Current
+    {
+        get => s_current;
+        set => s_current = value;
+    }
+
+    [ThreadStatic]
+    private static GradientDeferral? s_current;
+
     internal int DeferrableCount => _deferrable.Count;
 
     internal bool Accepts(object tensor) => _deferrable.Contains(tensor);

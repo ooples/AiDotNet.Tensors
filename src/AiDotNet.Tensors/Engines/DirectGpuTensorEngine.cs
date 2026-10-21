@@ -5155,8 +5155,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <summary>
     /// The compiled plan's deferred gradient contributions while its GPU step body runs (see
     /// <see cref="Autodiff.GradientDeferral"/>); null outside it, where every contribution is added as it arrives.
+    /// The state belongs to the thread running that step body, not to the engine, which every plan compiled on it
+    /// shares - see <see cref="Autodiff.GradientDeferral.Current"/>.
     /// </summary>
-    internal Autodiff.GradientDeferral? DeferredGradients { get; set; }
+    internal Autodiff.GradientDeferral? DeferredGradients
+    {
+        get => Autodiff.GradientDeferral.Current;
+        set => Autodiff.GradientDeferral.Current = value;
+    }
 
     /// <summary>Offers <paramref name="contribution"/>'s pooled slot for redirection into <paramref name="accumulator"/>,
     /// which it just first-wrote by copy (see <see cref="FirstWriteRedirectTable"/>).</summary>
