@@ -8,6 +8,7 @@
 using System;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
+using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -31,6 +32,18 @@ public class ConvTranspose2DOutputPaddingGradientTests
         return backend;
     }
 
+    private static OpenClBackend OpenOpenClOrSkip()
+    {
+        Skip.IfNot(DirectOpenClContext.IsAvailable && DirectOpenClContext.GetDeviceCount() > 0, "No OpenCL device.");
+        var backend = new OpenClBackend(deviceIndex: 0);
+        if (!backend.IsAvailable)
+        {
+            backend.Dispose();
+            throw new InvalidOperationException("An OpenCL device was detected, but the OpenCL backend failed to initialize.");
+        }
+        return backend;
+    }
+
     private static float[] Fill(int count, int salt)
     {
         var values = new float[count];
@@ -50,7 +63,7 @@ public class ConvTranspose2DOutputPaddingGradientTests
 
     /// <summary>
     /// Forward, data gradient and weight gradient against a direct fp64 transposed convolution, at output padding 0
-    /// and 1 (stride 2: a 3x3 tap reaches the padding row and column).
+    /// and 1 (stride 2: a 3x3 tap reaches the padding row and column). CUDA, where the bug was found.
     /// </summary>
     [SkippableTheory]
     [InlineData(0)]
@@ -58,6 +71,25 @@ public class ConvTranspose2DOutputPaddingGradientTests
     public void TheGradientsCoverTheOutputPadding(int outputPad)
     {
         using var backend = OpenBackendOrSkip();
+        AssertTheGradientsCoverTheOutputPadding(backend, outputPad);
+    }
+
+    /// <summary>
+    /// The same three comparisons on OpenCL, whose kernels carried the same clamp. The body is the backend contract,
+    /// not one vendor's: it is the only arm that runs on a host with a non-NVIDIA GPU, and the CUDA arm above skips
+    /// there, so without it this fix would ship unexecuted everywhere the suite actually runs.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(0)]
+    [InlineData(1)]
+    public void TheGradientsCoverTheOutputPaddingOnOpenCl(int outputPad)
+    {
+        using var backend = OpenOpenClOrSkip();
+        AssertTheGradientsCoverTheOutputPadding(backend, outputPad);
+    }
+
+    private static void AssertTheGradientsCoverTheOutputPadding(IDirectGpuBackend backend, int outputPad)
+    {
         const int N = 2, Ci = 3, Co = 4, H = 5, W = 4, K = 3, S = 2, P = 1;
         int outH = (H - 1) * S - 2 * P + K + outputPad, outW = (W - 1) * S - 2 * P + K + outputPad;
         float[] x = Fill(N * Ci * H * W, 1), w = Fill(Ci * Co * K * K, 2), dy = Fill(N * Co * outH * outW, 3);
