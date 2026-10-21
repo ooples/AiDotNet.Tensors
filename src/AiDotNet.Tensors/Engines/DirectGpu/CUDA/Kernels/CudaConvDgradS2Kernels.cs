@@ -248,12 +248,160 @@ extern ""C"" __global__ __launch_bounds__(S2_GT * G) void conv2d_dgrad_s2k3_g##G
 S2_ENTRY(1)
 S2_ENTRY(2)
 S2_ENTRY(4)
+
+// The 1 x 1, stride-2, padding-0 input gradient (ResNet's downsampling shortcuts): dX[c][2a][2b] = sum over co of
+// dY[co][a][b] w[co][c], the other three sub-pixel phases zero. A GEMM over the dY cells, written straight into dX's
+// layout with its zero phases (the phase kernel ran three tapless phase layers and, on the deep layers, a phase
+// reduce). A block owns 32 consecutive dY cells (the host admits output widths that are multiples of four, so a
+// thread's four cells share a row) x 32 channels; per co a thread reads its four cells' dY and its four channels'
+// weights (one 16-byte shared load each) for 16 FMAs. Groups and split slices as in conv2d_dgrad_s2k3.
+template <int G>
+__device__ __forceinline__ void conv2d_dgrad_s2k1_body(
+    const float* __restrict__ dy, const float* __restrict__ w, float* __restrict__ dx,
+    int N, int C, int K, int OH, int OW, int coPerSplit)
+{
+    constexpr int NT = S2_GT * G, SL = (S2_CO * S2_CELLS / 4 + NT - 1) / NT;   // float4s per chunk, per operand: 64
+    static_assert(S2_C == S2_CELLS, ""the two operands share one array shape"");
+    __shared__ __align__(16) float s2k1[2][2][S2_CO][S2_CELLS];   // [dY | weights][buffer][co][cell | channel]
+    float (*Ys)[S2_CO][S2_CELLS] = s2k1[0];
+    float (*Ws)[S2_CO][S2_C] = s2k1[1];
+    const int tid = threadIdx.x, g = tid >> S2_GT_LOG2, ct = tid & (S2_GT - 1);
+    const int HW = OH * OW, M = N * HW, H = 2 * OH, W = 2 * OW;
+    const int m0 = blockIdx.x * S2_CELLS, c0 = blockIdx.y * S2_C;
+    const int coBegin = blockIdx.z * coPerSplit, coEnd = min(K, coBegin + coPerSplit);
+    dx += (long long)blockIdx.z * N * C * H * W;
+
+    // Compute role: cells m0 + cg * 4 .. + 3 (one dY row), channels c0 + chg * 4 ...
+    const int cg = ct & 7, chg = ct >> 3;
+
+    // Staging roles, fixed for the whole reduction: float4 f = tid + NT i (i < SL) of a chunk's S2_CO x 8 per operand.
+    // dY: co f >> 3, cells m0 + 4 (f & 7) .. (four consecutive cells of one row: contiguous in dY); weights: co f >> 3,
+    // channels c0 + 4 (f & 7) .. (w[co][c], contiguous in c; C % 4 == 0).
+    int yOff[SL];
+    bool yOk[SL], wOk[SL];
+    #pragma unroll
+    for (int i = 0; i < SL; i++)
+    {
+        const int f = tid + NT * i, m = m0 + 4 * (f & 7);
+        yOk[i] = f < S2_CO * 8 && m < M;
+        const int n = m / HW, rem = m - n * HW;
+        yOff[i] = yOk[i] ? (n * K + (f >> 3)) * HW + rem : 0;
+        wOk[i] = f < S2_CO * 8 && c0 + 4 * (f & 7) < C;
+    }
+
+    float4 py[SL], pw[SL];
+    auto load = [&](int co0)
+    {
+        #pragma unroll
+        for (int i = 0; i < SL; i++)
+        {
+            const int f = tid + NT * i, co = co0 + (f >> 3);
+            const bool live = co < coEnd;
+            py[i] = (yOk[i] && live) ? __ldg(reinterpret_cast<const float4*>(dy + yOff[i] + (long long)co0 * HW))
+                                     : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            pw[i] = (wOk[i] && live) ? __ldg(reinterpret_cast<const float4*>(w + (long long)co * C + c0 + 4 * (f & 7)))
+                                     : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+    };
+    auto store = [&](int buf)
+    {
+        #pragma unroll
+        for (int i = 0; i < SL; i++)
+        {
+            const int f = tid + NT * i;
+            if (f >= S2_CO * 8) break;
+            *reinterpret_cast<float4*>(&Ys[buf][f >> 3][4 * (f & 7)]) = py[i];
+            *reinterpret_cast<float4*>(&Ws[buf][f >> 3][4 * (f & 7)]) = pw[i];
+        }
+    };
+
+    float acc[4][4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++)
+        #pragma unroll
+        for (int q = 0; q < 4; q++) acc[j][q] = 0.0f;
+
+    int buf = 0;
+    if (coBegin < coEnd) { load(coBegin); store(0); }
+    __syncthreads();
+    for (int co0 = coBegin; co0 < coEnd; co0 += S2_CO)
+    {
+        const bool more = co0 + S2_CO < coEnd;
+        if (more) load(co0 + S2_CO);
+        #pragma unroll
+        for (int kk = 0; kk < S2_CO / G; kk++)
+        {
+            const int k = g + G * kk;
+            const float4 y4 = *reinterpret_cast<const float4*>(&Ys[buf][k][cg * 4]);
+            const float4 w4 = *reinterpret_cast<const float4*>(&Ws[buf][k][chg * 4]);
+            const float y[4] = { y4.x, y4.y, y4.z, y4.w }, wq[4] = { w4.x, w4.y, w4.z, w4.w };
+            #pragma unroll
+            for (int j = 0; j < 4; j++)
+                #pragma unroll
+                for (int q = 0; q < 4; q++) acc[j][q] = fmaf(y[j], wq[q], acc[j][q]);
+        }
+        if (more) store(buf ^ 1);
+        __syncthreads();
+        buf ^= 1;
+    }
+
+    if (G > 1)
+    {
+        float* red = &s2k1[0][0][0][0];   // 16 x S2_GT floats: all four staging buffers, idle now
+        #pragma unroll
+        for (int gg = 1; gg < G; gg++)
+        {
+            if (g == gg)
+            {
+                #pragma unroll
+                for (int v = 0; v < 16; v++) red[v * S2_GT + ct] = acc[v >> 2][v & 3];
+            }
+            __syncthreads();
+            if (g == 0)
+            {
+                #pragma unroll
+                for (int v = 0; v < 16; v++) acc[v >> 2][v & 3] += red[v * S2_GT + ct];
+            }
+            __syncthreads();
+        }
+        if (g != 0) return;
+    }
+    const int m = m0 + cg * 4;
+    if (m >= M) return;
+    const int n = m / HW, rem = m - n * HW, a = rem / OW, b0 = rem - a * OW;
+    const float4 z = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    #pragma unroll
+    for (int q = 0; q < 4; q++)
+    {
+        const int c = c0 + chg * 4 + q;
+        if (c >= C) break;
+        float* row0 = dx + (((long long)n * C + c) * H + 2 * a) * W + 2 * b0;
+        float* row1 = row0 + W;
+        *reinterpret_cast<float4*>(row0) = make_float4(acc[0][q], 0.0f, acc[1][q], 0.0f);
+        *reinterpret_cast<float4*>(row0 + 4) = make_float4(acc[2][q], 0.0f, acc[3][q], 0.0f);
+        *reinterpret_cast<float4*>(row1) = z;
+        *reinterpret_cast<float4*>(row1 + 4) = z;
+    }
+}
+
+#define S2K1_ENTRY(G) \
+extern ""C"" __global__ __launch_bounds__(S2_GT * G) void conv2d_dgrad_s2k1_g##G( \
+    const float* __restrict__ dy, const float* __restrict__ w, float* __restrict__ dx, \
+    int N, int C, int K, int OH, int OW, int coPerSplit) \
+{ conv2d_dgrad_s2k1_body<G>(dy, w, dx, N, C, K, OH, OW, coPerSplit); }
+S2K1_ENTRY(1)
+S2K1_ENTRY(2)
+S2K1_ENTRY(4)
 ";
 
     /// <summary>The in-block output-channel group counts compiled.</summary>
     internal static readonly int[] Groups = { 1, 2, 4 };
 
-    public static string[] GetKernelNames() => System.Array.ConvertAll(Groups, KernelName);
+    public static string[] GetKernelNames() =>
+        System.Linq.Enumerable.ToArray(System.Linq.Enumerable.Concat(System.Array.ConvertAll(Groups, KernelName),
+            System.Array.ConvertAll(Groups, KernelNameK1)));
 
     internal static string KernelName(int groups) => $"conv2d_dgrad_s2k3_g{groups}";
+
+    internal static string KernelNameK1(int groups) => $"conv2d_dgrad_s2k1_g{groups}";
 }
