@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // Depthwise and transposed convolutions on declared programs (#890 phase 4b): each of the six operators as a grouped
 // or adjoint reading of the dense convolution's spec, under every schedule its slot registers, and each public entry
 // point end to end through its tuned slot (whose reference is the hand-written kernel). The bar is a direct fp64
@@ -324,6 +324,11 @@ public class DeclaredConvVariantRouteTests
     [InlineData(1, 1)]
     [InlineData(2, 2)]
     [InlineData(3, 0)]
+    // DEPENDS ON #1508. Transposed backward-data at Transposed(0), whose output padding is 1: the incumbent
+    // conv_transpose2d_backward_input clamps its bounds to outHeight - outputPadH, so it excludes the padded row and
+    // column that ForEachTap's reference includes. #1508 removes that clamp (callers already pass the final extent
+    // with the output padding applied). Until it is on main, this case is expected to fail on a CUDA device - and
+    // only there, since GPU tests do not run in CI, so a green CI run does not clear it.
     [InlineData(4, 0)]
     [InlineData(5, 1)]
     public void TheEntryPointMatchesADirectConvolution(int variantIndex, int shape)
