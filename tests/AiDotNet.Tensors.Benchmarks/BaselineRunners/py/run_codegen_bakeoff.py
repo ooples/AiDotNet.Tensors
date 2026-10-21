@@ -292,9 +292,17 @@ def main():
         emit_both("layernorm_d64", lambda: F.layer_norm(x64, (64,), g64, b64, 1e-5))
     if selected("rmsnorm"):
         emit_both("rmsnorm", lambda: F.rms_norm(xr, (1024,), gr, 1e-6))
+    # Dedicated running statistics for the timed training-mode row. Cloning rmean/rvar per call
+    # would put two copy kernels inside every measurement - in the eager lane and in the captured
+    # graph - so the competitor's time would include work that is not batch normalisation and our
+    # ratio would read better than it is. Training mode updates these in place, which is what the
+    # op does in training anyway; the pristine rmean/rvar stay for the inference row above and the
+    # backward row below.
+    rmean_bn = torch.zeros(64, device=dev)
+    rvar_bn = torch.ones(64, device=dev)
     if selected("batchnorm2d"):
         emit_both("batchnorm2d",
-                  lambda: F.batch_norm(xbn, rmean.clone(), rvar.clone(), gbn, bbn, True, 0.1, 1e-5),
+                  lambda: F.batch_norm(xbn, rmean_bn, rvar_bn, gbn, bbn, True, 0.1, 1e-5),
                   "training-mode cuDNN batch_norm")
     # ---- BACKWARD, against PyTorch's own fused backward kernels (not autograd, which
     # would re-run the forward). Each returns dx; the op computes every gradient regardless.
