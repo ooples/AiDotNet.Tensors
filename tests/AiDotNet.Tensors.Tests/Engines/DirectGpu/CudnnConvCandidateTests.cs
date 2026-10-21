@@ -17,12 +17,15 @@ public class CudnnConvCandidateTests
 {
     private static CudaBackend RequireCudnnBackend()
     {
-        Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver is unavailable.");
+        // Both prerequisites, not the driver alone: CudaBackend sets IsAvailable false without NVRTC as well, so a host
+        // that merely lacks the runtime compiler would reach the throw below instead of skipping. IsCudaAvailable is
+        // that same pair.
+        Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA driver or NVRTC is unavailable.");
         var backend = new CudaBackend();
         if (!backend.IsAvailable)
         {
             backend.Dispose();
-            throw new InvalidOperationException("CUDA driver was detected, but the CUDA backend failed to initialize.");
+            throw new InvalidOperationException("CUDA and NVRTC were detected, but the CUDA backend failed to initialize.");
         }
         if (!CuDnnConvolution.IsAvailable)
         {
@@ -63,6 +66,42 @@ public class CudnnConvCandidateTests
         return y;
     }
 
+    // The two gradients of the same fp64 convolution. The vendor slots choose among cuDNN algorithms and backend
+    // routes for these passes too, so a winner that writes a wrong gradient has to fail the test rather than leave
+    // the cached decision looking healthy.
+    private static (double[] GradInput, double[] GradKernel) Backward(float[] x, float[] w, float[] dy, int n, int c,
+        int k, int h, int wd, int r, int stride, int pad, int oh, int ow)
+    {
+        var dx = new double[n * c * h * wd];
+        var dw = new double[k * c * r * r];
+        for (int b = 0; b < n; b++)
+            for (int o = 0; o < k; o++)
+                for (int i = 0; i < oh; i++)
+                    for (int j = 0; j < ow; j++)
+                    {
+                        double g = dy[((b * k + o) * oh + i) * ow + j];
+                        for (int ch = 0; ch < c; ch++)
+                            for (int u = 0; u < r; u++)
+                                for (int v = 0; v < r; v++)
+                                {
+                                    int hi = i * stride - pad + u, wi = j * stride - pad + v;
+                                    if (hi < 0 || hi >= h || wi < 0 || wi >= wd) continue;
+                                    int xIndex = ((b * c + ch) * h + hi) * wd + wi;
+                                    int wIndex = ((o * c + ch) * r + u) * r + v;
+                                    dx[xIndex] += g * w[wIndex];
+                                    dw[wIndex] += g * x[xIndex];
+                                }
+                    }
+        return (dx, dw);
+    }
+
+    private static void AssertAgrees(double[] expected, float[] got, string what)
+    {
+        double largest = expected.Max(Math.Abs), worst = 0;
+        for (int i = 0; i < got.Length; i++) worst = Math.Max(worst, Math.Abs(got[i] - expected[i]));
+        Assert.True(worst <= 1e-4 * Math.Max(1, largest), $"{what} error {worst:E3} of {largest:E3}");
+    }
+
     /// <summary>
     /// With cuDNN on, Conv2D, Conv2DBackwardInput and Conv2DBackwardKernel each put the shape through their vendor slot
     /// (a decision is recorded), the forward agrees with fp64, and under determinism the slot never picks an
@@ -98,11 +137,10 @@ public class CudnnConvCandidateTests
             backend.Conv2DBackwardKernel(bx, bdy, bdw, n, c, h, h, k, oh, ow, r, r, stride, stride, pad, pad, 1, 1);
             backend.Synchronize();
 
-            double[] expected = Forward(x, w, n, c, k, h, h, r, stride, pad, oh, ow);
-            float[] got = backend.DownloadBuffer(by);
-            double largest = expected.Max(Math.Abs), worst = 0;
-            for (int i = 0; i < got.Length; i++) worst = Math.Max(worst, Math.Abs(got[i] - expected[i]));
-            Assert.True(worst <= 1e-4 * Math.Max(1, largest), $"forward error {worst:E3} of {largest:E3}");
+            AssertAgrees(Forward(x, w, n, c, k, h, h, r, stride, pad, oh, ow), backend.DownloadBuffer(by), "forward");
+            var (gradInput, gradKernel) = Backward(x, w, dy, n, c, k, h, h, r, stride, pad, oh, ow);
+            AssertAgrees(gradInput, backend.DownloadBuffer(bdx), "dX");
+            AssertAgrees(gradKernel, backend.DownloadBuffer(bdw), "dW");
 
             var slots = new ITunedKernelSlotInfo[]
             {
