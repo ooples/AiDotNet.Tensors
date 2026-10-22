@@ -44,12 +44,15 @@ public static class SassScheduler
     [ThreadStatic] public static string? LastDecline;
     private const int InstructionBytes = 16;
 
-    // The six scoreboards (less the one cp.async reserves) split into three write scoreboards and the rest for reads,
-    // each class used round-robin. Sharing a scoreboard is always safe (it is a counter: waiting on it waits for every
-    // instruction that set it), only sometimes slower -- so global loads get a write scoreboard of their own: a shared
-    // load's reader waiting on a scoreboard a prefetching LDG also set waits out the global latency, which cost the
-    // register-blocked GEMM 5% on the RTX 3080.
-    private const int WriteScoreboards = 3;
+    // The six scoreboards (less the one cp.async reserves) form one pool for write and read scoreboards alike. Sharing
+    // one is always safe (it is a counter: waiting on it waits for every instruction that set it), only sometimes
+    // slower, so each operation goes where it adds the least waiting (ChooseBoard). Round-robin cost the register-
+    // blocked GEMM 5% and a dense 3x3 convolution 14% on the RTX 3080: a shared load's reader waited out a global
+    // load's latency, and a fragment's loads waited for the next fragment's.
+    //
+    // Expected completion, in cycles after issue, for that choice only (correctness never depends on it): a write
+    // scoreboard releases when the result arrives, a read scoreboard when the sources have been read.
+    private const int GlobalLoadCycles = 300, SharedLoadCycles = 30, OtherVariableCycles = 20, SourceReadCycles = 20;
     private const int ScoreboardSetDelay = 2;
 
     // A scoreboard is a small counter: an instruction that would raise one past this many outstanding operations
@@ -189,11 +192,10 @@ public static class SassScheduler
         var pendingRead = new Dictionary<int, int>();    // register -> read scoreboard covering it
         var readyAt = new Dictionary<int, (long Ready, long Produced)>();   // register or predicate key -> readable at
         var earlyAt = new Dictionary<int, (long Ready, string Class)>();     // register -> readable at, by its own class
-        var pendingUse = new long[6];   // per scoreboard: the earliest first use among the operations it covers
+        var pendingUse = new long[6];        // per scoreboard: the earliest first use among the operations it covers
+        var pendingComplete = new long[6];   // per scoreboard: the latest expected completion among them
         for (int s = 0; s < pendingUse.Length; s++) pendingUse[s] = long.MaxValue;
         var boards = Enumerable.Range(0, 6).Where(b => b != asyncBoard).ToArray();
-        int longBoard = boards[0];
-        int[] shortBoards = boards.Skip(1).Take(WriteScoreboards - 1).ToArray(), readBoards = boards.Skip(WriteScoreboards).ToArray();
         var outstanding = new int[6];
         long cycle = 0;   // issue cycle of the current instruction
         var scoreboardSetAt = new long[6];
@@ -238,14 +240,19 @@ public static class SassScheduler
             {
                 if (writes.Count != 0)
                 {
-                    writeBoard = e.Mnemonic == "LDG" ? longBoard : ChooseBoard(shortBoards, outstanding, pendingUse, firstUse[i]);
+                    long complete = cycle + (e.Mnemonic == "LDG" ? GlobalLoadCycles : e.Mnemonic == "LDS" ? SharedLoadCycles : OtherVariableCycles);
+                    writeBoard = ChooseBoard(boards, outstanding, pendingUse, pendingComplete, firstUse[i], complete);
                     pendingUse[writeBoard] = Math.Min(pendingUse[writeBoard], firstUse[i]);
+                    pendingComplete[writeBoard] = Math.Max(pendingComplete[writeBoard], complete);
                     if (outstanding[writeBoard] >= ScoreboardDepth) wait |= 1 << writeBoard;
                 }
                 if (reads.Count != 0 && overwritten[i])
                 {
-                    readBoard = ChooseBoard(readBoards, outstanding, pendingUse, firstOverwrite[i]);
+                    long released = cycle + SourceReadCycles;
+                    readBoard = ChooseBoard(boards.Where(b => b != writeBoard).ToArray(), outstanding, pendingUse, pendingComplete,
+                        firstOverwrite[i], released);
                     pendingUse[readBoard] = Math.Min(pendingUse[readBoard], firstOverwrite[i]);
+                    pendingComplete[readBoard] = Math.Max(pendingComplete[readBoard], released);
                     if (outstanding[readBoard] >= ScoreboardDepth) wait |= 1 << readBoard;
                 }
             }
@@ -258,6 +265,7 @@ public static class SassScheduler
                     {
                         outstanding[s] = 0;
                         pendingUse[s] = long.MaxValue;
+                        pendingComplete[s] = 0;
                     }
             }
 
@@ -415,18 +423,32 @@ public static class SassScheduler
         return null;
     }
 
-    // The scoreboard for an operation first needed at instruction `use`. A wait on a scoreboard waits for everything it
-    // covers, so adding an operation to one whose earliest pending use comes sooner makes that earlier wait also wait
-    // for it. In order of preference: an idle scoreboard; one whose pending uses all come at or after `use` (the
-    // tightest such); otherwise the one whose earliest pending use is latest (the least extra waiting).
-    private static int ChooseBoard(int[] candidates, int[] outstanding, long[] pendingUse, long use)
+    // The scoreboard for an operation first needed at instruction `use` and expected to complete at cycle `complete`.
+    // The next wait on a scoreboard comes at the earliest use among the operations it covers and lasts until all of them
+    // complete, so adding this operation costs that wait max(pending completion, complete) minus the completion of
+    // what it actually needs (this operation if its use comes first, else the pending ones). The cheapest wins; ties
+    // go to the scoreboard holding fewer operations. (Uses are instruction indices, compared only with each other.)
+    private static int ChooseBoard(int[] candidates, int[] outstanding, long[] pendingUse, long[] pendingComplete,
+        long use, long complete)
     {
         int best = -1;
-        foreach (int b in candidates) if (outstanding[b] == 0) return b;
+        long bestCost = long.MaxValue;
         foreach (int b in candidates)
-            if (pendingUse[b] >= use && (best < 0 || pendingUse[b] < pendingUse[best])) best = b;
-        if (best >= 0) return best;
-        foreach (int b in candidates) if (best < 0 || pendingUse[b] > pendingUse[best]) best = b;
+        {
+            long cost;
+            if (outstanding[b] == 0) cost = 0;
+            else
+            {
+                long end = Math.Max(pendingComplete[b], complete);
+                long needed = pendingUse[b] < use ? pendingComplete[b] : use < pendingUse[b] ? complete : Math.Max(pendingComplete[b], complete);
+                cost = end - needed;
+            }
+            if (cost < bestCost || (cost == bestCost && outstanding[b] < outstanding[best]))
+            {
+                best = b;
+                bestCost = cost;
+            }
+        }
         return best;
     }
 
