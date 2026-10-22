@@ -27,8 +27,13 @@ public class DeclaredGemmRouteTests
             backend.Dispose();
             throw new InvalidOperationException("CUDA and NVRTC were detected, but the CUDA backend failed to initialize.");
         }
-        Skip.IfNot(backend.DeclaredKernelsEnabled,
-            "The declared route is not released on this architecture (see AIDOTNET_DECLARED_KERNELS_ARCH).");
+        // Disposed before the skip: Skip throws, and the caller's `using` only takes ownership once this returns, so
+        // skipping here would leak the retained primary context and the main stream for the rest of the run.
+        if (!backend.DeclaredKernelsEnabled)
+        {
+            backend.Dispose();
+            Skip.If(true, "The declared route is not released on this architecture (see AIDOTNET_DECLARED_KERNELS_ARCH).");
+        }
         return backend;
     }
 
