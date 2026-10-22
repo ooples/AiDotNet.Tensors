@@ -430,6 +430,8 @@ struct IndexSelectP { outerSize: i32, sourceAxis: i32, indexAxis: i32, innerSize
     let j = (gid / p.innerSize) % p.indexAxis;
     let outer = (gid / p.innerSize) / p.indexAxis;
     let sourceIndex = indices[j];
+    // An index outside the source axis yields zeros (as the declared gather does) instead of a read outside it.
+    if (sourceIndex < 0 || sourceIndex >= p.sourceAxis) { output_[gid] = 0.0; return; }
     output_[gid] = source[(outer * p.sourceAxis + sourceIndex) * p.innerSize + inner];
 }
 ";

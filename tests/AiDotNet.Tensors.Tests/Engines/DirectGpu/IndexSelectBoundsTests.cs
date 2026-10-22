@@ -2,13 +2,15 @@
 // resident_index_select used an index without checking it, so a negative or past-the-axis index read another row of
 // the source, or memory outside it. An index outside the source axis now yields zeros -- the contract #890's declared
 // gather (CodegenBackendPrograms.IndexSelect) has, so the call's result does not depend on which kernel serves it.
-// One arm per backend whose kernel source was changed: the bound is written three times (CUDA, Metal, OpenCL), so one
-// arm proves only the backend it runs on, and OpenCL is the one that runs on a non-NVIDIA host.
+// One arm per backend whose kernel source was changed: the bound is written once per backend, so one arm proves only
+// the backend it runs on, and OpenCL and Vulkan are the ones that run on a non-NVIDIA host. Metal needs Apple
+// hardware and WebGPU needs the Dawn node host (AIDOTNET_WEBGPU_NODE_DIR), so neither has an arm here.
 
 using System;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
+using AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -50,6 +52,19 @@ public class IndexSelectBoundsTests
             Skip.If(true, "OpenCL is unavailable: " + (initializationException?.GetType().Name ?? "no device"));
         }
         using (backend) AssertZerosOutsideTheAxis(backend, backend.IndexSelect);
+    }
+
+    /// <summary>
+    /// The same contract through the Vulkan GLSL shader, which carries its own copy of the bound.
+    /// </summary>
+    [SkippableFact]
+    public void OutOfRangeIndicesSelectZerosOnVulkan()
+    {
+        // The singleton: it is not disposed here, unlike the per-test OpenCL backend above.
+        var backend = VulkanBackend.Instance;
+        Skip.IfNot(backend.Initialize() && backend.IsGlslCompilerAvailable,
+            "Vulkan with a GLSL compiler is not available.");
+        AssertZerosOutsideTheAxis(backend, backend.IndexSelect);
     }
 
     private static void AssertZerosOutsideTheAxis(IDirectGpuBackend backend, IndexSelectLaunch indexSelect)
