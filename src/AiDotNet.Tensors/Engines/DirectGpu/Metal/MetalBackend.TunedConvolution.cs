@@ -36,6 +36,10 @@ public sealed partial class MetalBackend : IConvBiasActivationBackend
                         new DelegateTunedKernelCandidate<TunedConv2DArgs>("metal.conv2d.winograd_f43_gemm", TunedKernelOrigin.Builtin, true,
                             shape => WinogradF23Pipeline.AdmitsShape(shape) && WinogradF43KernelsReady,
                             (in TunedConv2DArgs a) => { if (!TryConv2DForwardWinogradF43(a)) Conv2DDirect(a); }),
+                        // #1432: fused F(2x2, 3x3): transforms, per-point products and output transform in one launch.
+                        new DelegateTunedKernelCandidate<TunedConv2DArgs>("metal.conv2d.winograd_fused", TunedKernelOrigin.Builtin, true,
+                            shape => WinogradF23Pipeline.AdmitsShape(shape) && WinogradFusedForwardReady,
+                            (in TunedConv2DArgs a) => { if (!TryConv2DForwardWinogradFused(a)) Conv2DDirect(a); }),
                     };
                     _conv2DForwardSlot = new TunedKernelSlot<TunedConv2DArgs>(TunedKernelOp.Conv2DForward, TunedDeviceKey,
                         new BackendTunedKernelHarness<TunedConv2DArgs>(this, ConvolutionTolerance, () => IsAvailable,

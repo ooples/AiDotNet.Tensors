@@ -88,6 +88,9 @@ public sealed class MetalShaderCompilationTests
         yield return ("ConvDgradS2", () => ConvDgradS2KernelTemplate.GetModuleSource(WinogradKernelDialect.Metal), false);
         // Strict: false, as MetalBackend.ConvWinogradF43 compiles it (the two-argument overload).
         yield return ("WinogradF43", () => WinogradF43KernelTemplate.GetModuleSource(WinogradKernelDialect.Metal), false);
+        // Strict: false, as MetalBackend.ConvWinogradFused compiles it (the two-argument overload).
+        yield return ("WinogradFusedForward", () => WinogradF23KernelTemplate.EmitModule(
+            new[] { WinogradFusedForwardTemplate.Spec(8, 16) }, WinogradKernelDialect.Metal), false);
     }
 
     internal static string? FindCompiler()

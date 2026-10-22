@@ -559,9 +559,9 @@ public sealed class VulkanTunedKernelTests
                         $"{cand.Id} conv {bt}x{c}x{h}x{w} k{k} s{s} p{p} d{d} bias={withBias} relu={relu}", termScale: 1.0);
                 }
             }
-            // Every candidate applies to these small shapes except Winograd F(2x2,3x3) (#1371) and F(4x4,3x3) (#1432), which take only 3x3
+            // Every candidate applies to these small shapes except Winograd F(2x2,3x3) (#1371) F(4x4,3x3) and the fused F(2x2,3x3) (#1432), which take only 3x3
             // stride-1 undilated convolutions, so a variant that silently dropped out fails here.
-            int notAdmitted = (k > 7 ? 1 : 0) + (AiDotNet.Tensors.Engines.DirectGpu.WinogradF23Pipeline.AdmitsShape(args.Shape()) ? 0 : 2);
+            int notAdmitted = (k > 7 ? 1 : 0) + (AiDotNet.Tensors.Engines.DirectGpu.WinogradF23Pipeline.AdmitsShape(args.Shape()) ? 0 : 3);
             Assert.Equal(backend.Conv2DForwardSlot.CandidateIds.Count, Applicable(backend.Conv2DForwardSlot, args.Shape()).Count
                 + notAdmitted);
         }
