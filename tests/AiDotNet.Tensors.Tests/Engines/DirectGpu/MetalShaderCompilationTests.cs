@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -86,6 +86,8 @@ public sealed class MetalShaderCompilationTests
         yield return ("BatchNormRegister", () => BatchNormRegisterKernelTemplate.GetModuleSource(WinogradKernelDialect.Metal), false);
         // Strict: false, as MetalBackend.ConvDgradS2 compiles it (the two-argument overload).
         yield return ("ConvDgradS2", () => ConvDgradS2KernelTemplate.GetModuleSource(WinogradKernelDialect.Metal), false);
+        // Strict: false, as MetalBackend.ConvWinogradF43 compiles it (the two-argument overload).
+        yield return ("WinogradF43", () => WinogradF43KernelTemplate.GetModuleSource(WinogradKernelDialect.Metal), false);
     }
 
     internal static string? FindCompiler()

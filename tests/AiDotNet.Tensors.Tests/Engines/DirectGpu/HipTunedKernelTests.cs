@@ -1,4 +1,4 @@
-#if !NET462
+﻿#if !NET462
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -433,7 +433,7 @@ public sealed class HipTunedKernelTests
             bool winograd = k == 3 && s == 1 && d == 1;
             bool winogradPipeline = AiDotNet.Tensors.Engines.DirectGpu.WinogradF23Pipeline.AdmitsShape(args.Shape());
             Assert.Equal(backend.Conv2DForwardSlot.CandidateIds.Count, Applicable(backend.Conv2DForwardSlot, args.Shape()).Count
-                + (winograd ? 0 : 1) + (winogradPipeline ? 0 : 1));
+                + (winograd ? 0 : 1) + (winogradPipeline ? 0 : 2));   // F(2x2) and F(4x4) pipelines (#1432)
         }
     }
 

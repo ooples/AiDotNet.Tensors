@@ -32,6 +32,7 @@ public sealed partial class HipBackend : IWinogradF23Transforms, IWinogradFusedF
         CompileWinogradModule(WinogradKernelGroup.Base, "winograd", ref _winogradModule, "Winograd kernels");
         CompileWinogradModule(WinogradKernelGroup.Fused, "winograd_fused", ref _winogradFusedModule,
             "Winograd fused weight-gradient kernels");
+        CompileWinogradF43Kernels();
     }
 
     private void CompileWinogradModule(WinogradKernelGroup group, string moduleName, ref IntPtr module, string label)

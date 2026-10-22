@@ -137,8 +137,11 @@ public sealed partial class CudaBackend
         ga[0] = &uPtr; ga[1] = &vPtr; ga[2] = &mPtr; ga[3] = &outC; ga[4] = &pi; ga[5] = &inC; ga[6] = &oneSplit; ga[7] = &wholeK;
         LaunchKernel3D(_kernelCache[tile == 128 ? "wino4_gemm128" : "wino4_gemm64"], (uint)gx, (uint)gy, 36, block, 1, 1, ga, 0);
 
-        void** oa = stackalloc void*[8];
+        IntPtr noBias = IntPtr.Zero;
+        int noEpilogue = 0;
+        void** oa = stackalloc void*[10];
         oa[0] = &mPtr; oa[1] = &yPtr; oa[2] = &n; oa[3] = &outC; oa[4] = &outH; oa[5] = &outW; oa[6] = &tilesH; oa[7] = &tilesW;
+        oa[8] = &noBias; oa[9] = &noEpilogue;
         LaunchKernel(_kernelCache["wino_f43_output"], (uint)((outC * p + block - 1) / block), block, oa);
         return true;
     }
