@@ -8,8 +8,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
 public sealed partial class WebGpuBackend : IFftBackend, IGenericFftBackend, IMeshgridBackend, ISeededGumbelSoftmaxBackend, IUninitializedGpuAllocation, IMultiTensorGpuOptimizerBackend, IDeviceReadbackFactory
 {
-    // No asynchronous device-to-host copy is wired on this backend: the readback downloads when it is queued.
-    IDeviceReadback IDeviceReadbackFactory.CreateReadback(int byteCapacity) => new SynchronousDeviceReadback(this, byteCapacity);
+    // A copy and mapping started without waiting; the host waits for them only on Read (#1522).
+    IDeviceReadback IDeviceReadbackFactory.CreateReadback(int byteCapacity) => new WebGpuDeviceReadback(this, byteCapacity);
 
     /// <remarks>WebGPU keeps its power-of-two FFT kernel.</remarks>
     bool IGenericFftBackend.PrefersGenericFftForPowerOfTwo => false;
@@ -20,10 +20,10 @@ public sealed partial class WebGpuBackend : IFftBackend, IGenericFftBackend, IMe
     /// </summary>
     public IGpuBuffer AllocateBufferUninitialized(int size) => AllocateBuffer(size);
     /// <summary>
-    /// The guarded updates read the guard on the host (<see cref="PerTensorMultiTensorOptimizer"/>): this backend's
-    /// Adam/AdamW/SGD kernels take no guard argument, so the verdict is downloaded before the launch.
+    /// The guarded updates read the guard on the device and write nothing when it is not finite
+    /// (WebGpuFiniteGuardKernels, #1522).
     /// </summary>
-    public bool GuardsFiniteOnDevice => false;
+    public bool GuardsFiniteOnDevice => true;
 
     public void AdamMultiTensorUpdate(
         IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
@@ -46,8 +46,8 @@ public sealed partial class WebGpuBackend : IFftBackend, IGenericFftBackend, IMe
         IReadOnlyList<IGpuBuffer> firstMoments, IReadOnlyList<IGpuBuffer> secondMoments,
         IReadOnlyList<int> sizes, float learningRate, float beta1, float beta2, float epsilon,
         float weightDecay, int step, IGpuBuffer finiteGuard)
-        => PerTensorMultiTensorOptimizer.UpdateGuarded(this, decoupledWeightDecay, parameters, gradients, firstMoments,
-            secondMoments, sizes, learningRate, beta1, beta2, epsilon, weightDecay, step, finiteGuard);
+        => AdamGuardedOnDevice(decoupledWeightDecay, parameters, gradients, firstMoments, secondMoments, sizes,
+            learningRate, beta1, beta2, epsilon, weightDecay, step, finiteGuard);
 
     public void SgdMultiTensorUpdate(
         IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients, IReadOnlyList<int> sizes,
@@ -57,7 +57,7 @@ public sealed partial class WebGpuBackend : IFftBackend, IGenericFftBackend, IMe
     public void SgdMultiTensorUpdateGuarded(
         IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients, IReadOnlyList<int> sizes,
         float learningRate, float weightDecay, IGpuBuffer finiteGuard)
-        => PerTensorMultiTensorOptimizer.SgdGuarded(this, parameters, gradients, sizes, learningRate, weightDecay, finiteGuard);
+        => SgdGuardedOnDevice(parameters, gradients, sizes, learningRate, weightDecay, finiteGuard);
 
     public void Meshgrid2DPair(IGpuBuffer source0, IGpuBuffer source1, IGpuBuffer output0, IGpuBuffer output1,
         int n0, int n1, bool xy)

@@ -465,6 +465,59 @@ export async function readBufferBase64(bufferId, sizeBytes, offsetBytes) {
     return bytesToBase64(result);
 }
 
+// Readbacks started by beginReadback and not yet finished: token -> { staging, alignedSize, sizeBytes, mapped }.
+const pendingReadbacks = new Map();
+let nextReadbackToken = 1;
+
+/**
+ * Starts a device-to-host copy without waiting for it: the copy is submitted behind the work already queued and the
+ * staging buffer's mapAsync is started, so finishReadbackBase64 waits only for this copy, not for work queued after it.
+ * @param {number} bufferId - Source buffer ID.
+ * @param {number} sizeBytes - Bytes to read.
+ * @param {number} offsetBytes - Offset in bytes.
+ * @returns {number} A token for finishReadbackBase64, or 0 when nothing was started.
+ */
+export function beginReadback(bufferId, sizeBytes, offsetBytes) {
+    if (!device) return 0;
+    const buffer = buffers.get(bufferId);
+    if (!buffer) {
+        console.error(`Buffer ${bufferId} not found`);
+        return 0;
+    }
+    const alignedSize = (sizeBytes + 3) & ~3;
+    // Its own staging buffer: a pooled one could be handed to another read while this one is still mapping.
+    const staging = device.createBuffer({
+        size: alignedSize,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+        mappedAtCreation: false
+    });
+    const commandEncoder = device.createCommandEncoder();
+    commandEncoder.copyBufferToBuffer(buffer, offsetBytes, staging, 0, alignedSize);
+    queue.submit([commandEncoder.finish()]);
+    const token = nextReadbackToken++;
+    pendingReadbacks.set(token, { staging, alignedSize, sizeBytes, mapped: staging.mapAsync(GPUMapMode.READ, 0, alignedSize) });
+    return token;
+}
+
+/**
+ * Waits for a readback beginReadback started and returns its bytes, base64 encoded; the token is then spent.
+ * @param {number} token - The token beginReadback returned.
+ * @returns {Promise<string>} The bytes, base64 encoded ('' for an unknown token).
+ */
+export async function finishReadbackBase64(token) {
+    const pending = pendingReadbacks.get(token);
+    if (!pending) return '';
+    pendingReadbacks.delete(token);
+    try {
+        await pending.mapped;
+        const result = new Uint8Array(pending.staging.getMappedRange(0, pending.alignedSize).slice(0, pending.sizeBytes));
+        pending.staging.unmap();
+        return bytesToBase64(result);
+    } finally {
+        pending.staging.destroy();
+    }
+}
+
 /**
  * Copies data between GPU buffers.
  * @param {number} srcBufferId - Source buffer ID.

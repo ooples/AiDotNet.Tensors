@@ -211,6 +211,29 @@ public static partial class WebGpuNativeBindings
     }
 
     /// <summary>
+    /// Submits a copy of <paramref name="sizeBytes"/> bytes to a staging buffer and starts mapping it, without waiting;
+    /// returns the token <see cref="FinishReadbackAsync"/> takes (0 when nothing was started).
+    /// </summary>
+    internal static int BeginReadback(int bufferId, int sizeBytes, int offsetBytes)
+        => Host is { } host ? HostValue<int>(host.Invoke("beginReadback", Args(bufferId, sizeBytes, offsetBytes)))
+            : JsBeginReadback(bufferId, sizeBytes, offsetBytes);
+
+    [JSImport("beginReadback", ModuleName)]
+    private static partial int JsBeginReadback(int bufferId, int sizeBytes, int offsetBytes);
+
+    /// <summary>Waits for the copy <see cref="BeginReadback"/> started and returns its bytes.</summary>
+    internal static async Task<byte[]> FinishReadbackAsync(int token)
+    {
+        string base64 = Host is { } host ? HostValue<string>(host.Invoke("finishReadbackBase64", Args(token)))
+            : await JsFinishReadbackBase64Async(token);
+        return string.IsNullOrEmpty(base64) ? Array.Empty<byte>() : Convert.FromBase64String(base64);
+    }
+
+    [JSImport("finishReadbackBase64", ModuleName)]
+    [return: JSMarshalAs<JSType.Promise<JSType.String>>]
+    private static partial Task<string> JsFinishReadbackBase64Async(int token);
+
+    /// <summary>
     /// Copies data between GPU buffers.
     /// </summary>
     public static void CopyBufferToBuffer(int srcBufferId, int srcOffset, int dstBufferId, int dstOffset, int sizeBytes)
