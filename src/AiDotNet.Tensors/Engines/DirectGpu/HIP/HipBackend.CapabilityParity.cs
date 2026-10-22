@@ -7,17 +7,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 
 public sealed partial class HipBackend : IFftBackend, IGenericFftBackend, IMeshgridBackend, ISeededGumbelSoftmaxBackend, IUninitializedGpuAllocation, IMultiTensorGpuOptimizerBackend, IDeviceReadbackFactory
 {
-    // No asynchronous device-to-host copy is wired on this backend: the readback downloads when it is queued.
-    IDeviceReadback IDeviceReadbackFactory.CreateReadback(int byteCapacity) => new SynchronousDeviceReadback(this, byteCapacity);
+    // A hipMemcpyAsync into pinned memory plus an event; the host waits for it only on Read (#1519).
+    IDeviceReadback IDeviceReadbackFactory.CreateReadback(int byteCapacity) => new HipDeviceReadback(this, byteCapacity);
 
     /// <remarks>HIP keeps its power-of-two FFT kernel.</remarks>
     bool IGenericFftBackend.PrefersGenericFftForPowerOfTwo => false;
 
     /// <summary>
-    /// The guarded updates read the guard on the host (<see cref="PerTensorMultiTensorOptimizer"/>): this backend's
-    /// Adam/AdamW/SGD kernels take no guard argument, so the verdict is downloaded before the launch.
+    /// The guarded updates read the guard on the device and write nothing when it is not finite (#1519); without the
+    /// guarded kernels they read it on the host.
     /// </summary>
-    public bool GuardsFiniteOnDevice => false;
+    public bool GuardsFiniteOnDevice => DeviceGuardReady;
 
     public void AdamMultiTensorUpdate(
         IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
@@ -40,8 +40,14 @@ public sealed partial class HipBackend : IFftBackend, IGenericFftBackend, IMeshg
         IReadOnlyList<IGpuBuffer> firstMoments, IReadOnlyList<IGpuBuffer> secondMoments,
         IReadOnlyList<int> sizes, float learningRate, float beta1, float beta2, float epsilon,
         float weightDecay, int step, IGpuBuffer finiteGuard)
-        => PerTensorMultiTensorOptimizer.UpdateGuarded(this, decoupledWeightDecay, parameters, gradients, firstMoments,
-            secondMoments, sizes, learningRate, beta1, beta2, epsilon, weightDecay, step, finiteGuard);
+    {
+        if (DeviceGuardReady)
+            AdamGuardedOnDevice(decoupledWeightDecay, parameters, gradients, firstMoments, secondMoments, sizes,
+                learningRate, beta1, beta2, epsilon, weightDecay, step, finiteGuard);
+        else
+            PerTensorMultiTensorOptimizer.UpdateGuarded(this, decoupledWeightDecay, parameters, gradients, firstMoments,
+                secondMoments, sizes, learningRate, beta1, beta2, epsilon, weightDecay, step, finiteGuard);
+    }
 
     public void SgdMultiTensorUpdate(
         IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients, IReadOnlyList<int> sizes,
@@ -51,7 +57,10 @@ public sealed partial class HipBackend : IFftBackend, IGenericFftBackend, IMeshg
     public void SgdMultiTensorUpdateGuarded(
         IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients, IReadOnlyList<int> sizes,
         float learningRate, float weightDecay, IGpuBuffer finiteGuard)
-        => PerTensorMultiTensorOptimizer.SgdGuarded(this, parameters, gradients, sizes, learningRate, weightDecay, finiteGuard);
+    {
+        if (DeviceGuardReady) SgdGuardedOnDevice(parameters, gradients, sizes, learningRate, weightDecay, finiteGuard);
+        else PerTensorMultiTensorOptimizer.SgdGuarded(this, parameters, gradients, sizes, learningRate, weightDecay, finiteGuard);
+    }
 
     public void Meshgrid2DPair(IGpuBuffer source0, IGpuBuffer source1, IGpuBuffer output0, IGpuBuffer output1,
         int n0, int n1, bool xy)

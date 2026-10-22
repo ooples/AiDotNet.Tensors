@@ -60,13 +60,9 @@ extern ""C"" __global__ __launch_bounds__(256) void sgd_momentum_update(
 // ---------------------------------------------------------------------------
 // Vanilla SGD update (no momentum)
 // ---------------------------------------------------------------------------
-extern ""C"" __global__ __launch_bounds__(256) void sgd_update(
-    float* param, const float* gradient,
-    float learningRate, float weightDecay, int size)
+__device__ __forceinline__ void sgd_body(float* param, const float* gradient, float learningRate, float weightDecay,
+    int idx)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= size) return;
-
     float grad = gradient[idx];
     if (weightDecay > 0.0f) {
         grad += weightDecay * param[idx];
@@ -75,17 +71,38 @@ extern ""C"" __global__ __launch_bounds__(256) void sgd_update(
     param[idx] -= learningRate * grad;
 }
 
-// ---------------------------------------------------------------------------
-// Adam optimizer update
-// ---------------------------------------------------------------------------
-extern ""C"" __global__ __launch_bounds__(256) void adam_update(
-    float* param, const float* gradient, float* m, float* v,
-    float learningRate, float beta1, float beta2, float epsilon,
-    float weightDecay, int step, int size)
+// The device-side finiteness guard (#1519): a double in the guard buffer's first eight bytes (the multi-tensor sum of
+// squares, NaN when any gradient is not finite), read as its high word's exponent bits so the test survives fast math.
+__device__ __forceinline__ bool guard_not_finite(const unsigned int* guard)
+{
+    return (guard[1] & 0x7ff00000u) == 0x7ff00000u;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void sgd_update(
+    float* param, const float* gradient,
+    float learningRate, float weightDecay, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
+    sgd_body(param, gradient, learningRate, weightDecay, idx);
+}
 
+// sgd_update that writes nothing when the guard is not finite (IMultiTensorGpuOptimizerBackend's guarded update).
+extern ""C"" __global__ __launch_bounds__(256) void sgd_update_guarded(
+    float* param, const float* gradient,
+    float learningRate, float weightDecay, int size, const unsigned int* guard)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size || guard_not_finite(guard)) return;
+    sgd_body(param, gradient, learningRate, weightDecay, idx);
+}
+
+// ---------------------------------------------------------------------------
+// Adam optimizer update
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void adam_body(float* param, const float* gradient, float* m, float* v,
+    float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int idx)
+{
     float grad = gradient[idx];
     if (weightDecay > 0.0f) {
         grad += weightDecay * param[idx];
@@ -102,17 +119,32 @@ extern ""C"" __global__ __launch_bounds__(256) void adam_update(
     param[idx] -= learningRate * mHat / (sqrtf(vHat) + epsilon);
 }
 
-// ---------------------------------------------------------------------------
-// AdamW optimizer update (decoupled weight decay)
-// ---------------------------------------------------------------------------
-extern ""C"" __global__ __launch_bounds__(256) void adamw_update(
+extern ""C"" __global__ __launch_bounds__(256) void adam_update(
     float* param, const float* gradient, float* m, float* v,
     float learningRate, float beta1, float beta2, float epsilon,
     float weightDecay, int step, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
+    adam_body(param, gradient, m, v, learningRate, beta1, beta2, epsilon, weightDecay, step, idx);
+}
 
+extern ""C"" __global__ __launch_bounds__(256) void adam_update_guarded(
+    float* param, const float* gradient, float* m, float* v,
+    float learningRate, float beta1, float beta2, float epsilon,
+    float weightDecay, int step, int size, const unsigned int* guard)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size || guard_not_finite(guard)) return;
+    adam_body(param, gradient, m, v, learningRate, beta1, beta2, epsilon, weightDecay, step, idx);
+}
+
+// ---------------------------------------------------------------------------
+// AdamW optimizer update (decoupled weight decay)
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void adamw_body(float* param, const float* gradient, float* m, float* v,
+    float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int idx)
+{
     float grad = gradient[idx];
 
     // Decoupled weight decay
@@ -129,6 +161,26 @@ extern ""C"" __global__ __launch_bounds__(256) void adamw_update(
     float vHat = vVal / (1.0f - powf(beta2, (float)step));
 
     param[idx] -= learningRate * mHat / (sqrtf(vHat) + epsilon);
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void adamw_update(
+    float* param, const float* gradient, float* m, float* v,
+    float learningRate, float beta1, float beta2, float epsilon,
+    float weightDecay, int step, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    adamw_body(param, gradient, m, v, learningRate, beta1, beta2, epsilon, weightDecay, step, idx);
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void adamw_update_guarded(
+    float* param, const float* gradient, float* m, float* v,
+    float learningRate, float beta1, float beta2, float epsilon,
+    float weightDecay, int step, int size, const unsigned int* guard)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size || guard_not_finite(guard)) return;
+    adamw_body(param, gradient, m, v, learningRate, beta1, beta2, epsilon, weightDecay, step, idx);
 }
 
 // ---------------------------------------------------------------------------
@@ -841,6 +893,9 @@ extern ""C"" __global__ __launch_bounds__(256) void sparse_proximal_l1_update(
             "sgd_update",
             "adam_update",
             "adamw_update",
+            "sgd_update_guarded",
+            "adam_update_guarded",
+            "adamw_update_guarded",
             "adam_bf16_update",
             "adamw_bf16_update",
             "adam8bit_update",
