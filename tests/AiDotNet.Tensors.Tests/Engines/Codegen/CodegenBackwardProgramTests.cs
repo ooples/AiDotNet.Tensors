@@ -251,6 +251,59 @@ public class CodegenBackwardProgramTests
     }
 
     /// <summary>
+    /// The backend-contract GroupNorm backward (#890 phase 4a): the declared forward saves the MEAN and
+    /// 1/sqrt(var + eps), so the backward program has to negate the mean itself. Held to finite differences of the
+    /// backend-contract forward, and to the raw spec fed the negated mean, so the prepended pass cannot be the thing
+    /// that agrees with the reference.
+    /// </summary>
+    [Theory]
+    [InlineData(2, 4, 2, 3)]
+    [InlineData(2, 6, 6, 4)]   // groups == channels: InstanceNorm
+    public void BackendGroupNormBackward_NegatesTheSavedMeanAndMatchesFiniteDifferences(
+        int batch, int channels, int groups, int spatial)
+    {
+        const double Epsilon = 1e-5;
+        long count = (long)batch * channels * spatial;
+        double[] x = Fill(count, 2.0, 21), dy = Fill(count, 1.0, 22);
+        double[] g = Fill(channels, 0.7, 23), b = Fill(channels, 0.3, 24);
+        Dictionary<string, double[]> Sources(double[] xv, double[] gv, double[] bv) => new()
+            { ["x"] = xv, ["gamma"] = gv, ["beta"] = bv };
+        double[] Forward(double[] xv, double[] gv, double[] bv) =>
+            CodegenBackendPrograms.GroupNorm(batch, channels, groups, spatial, Epsilon).Interpret(Sources(xv, gv, bv))["y"];
+
+        var saved = CodegenBackendPrograms.GroupNorm(batch, channels, groups, spatial, Epsilon)
+            .Interpret(Sources(x, g, b));
+        var grads = CodegenBackendPrograms.GroupNormBackward(batch, channels, groups, spatial)
+            .Interpret(new Dictionary<string, double[]>
+            {
+                ["dy"] = dy, ["x"] = x, ["gamma"] = g, ["mean"] = saved["mean"], ["rstd"] = saved["rstd"],
+            });
+        CheckAgainstFiniteDifferences(Forward, x, dy, g, b, grads);
+
+        // The saved mean is the negated one the spec wants, so the wrapper's only job is that negation.
+        var negated = new double[saved["mean"].Length];
+        for (int i = 0; i < negated.Length; i++) negated[i] = -saved["mean"][i];
+        var raw = CodegenFusedStatistics.GroupNormBackward(batch, channels, groups, spatial)
+            .Interpret(new Dictionary<string, double[]>
+            {
+                ["dy"] = dy, ["x"] = x, ["gamma"] = g, ["negmean"] = negated, ["rstd"] = saved["rstd"],
+            });
+        foreach (string output in new[] { "dx", "dgamma", "dbeta" })
+            for (int i = 0; i < raw[output].Length; i++)
+                Assert.Equal(raw[output][i], grads[output][i], 12);
+    }
+
+    /// <summary>The contract program's sources are the backend's buffers, with no intermediate among them.</summary>
+    [Fact]
+    public void BackendGroupNormBackward_TakesTheBackendsBuffers()
+    {
+        var names = new List<string>();
+        foreach (var source in CodegenBackendPrograms.GroupNormBackward(2, 8, 4, 16).Sources()) names.Add(source.Name);
+        names.Sort();
+        Assert.Equal(new[] { "dy", "gamma", "mean", "rstd", "x" }, names);
+    }
+
+    /// <summary>
     /// BatchNorm backward against differences of the training forward. The forward's shift is a
     /// sample of x, but the result does not depend on it, so it contributes no gradient.
     /// </summary>
