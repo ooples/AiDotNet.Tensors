@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 // --sass-probe: the own SASS backend's passes on the device (#1442). For every catalog kernel the affine emitter
 // lowers (data-dependent indexing excepted), the PTX path's module and the module rewritten by the backend run on
 // the same inputs; their outputs must be bit-identical (the passes keep every instruction's arithmetic), and their
@@ -132,6 +132,12 @@ internal static class SassProbeTool
                     _ when pass.StartsWith("keep:", StringComparison.Ordinal) => SassOpcodeTable.Decode(ptxasCode[i])?.Mnemonic == pass.Substring(5) ? n with { Stall = Math.Max(n.Stall, o.Stall) } : n,
                     "keepcontrol" => SassOpcodeTable.Decode(ptxasCode[i])?.Latency == SassLatency.Control ? n with { Stall = Math.Max(n.Stall, o.Stall) } : n,
                     "upto" => i < upto ? n : n with { Stall = Math.Max(n.Stall, o.Stall) },
+                    // mix:<fields>: ours, with ptxas's S(tall) and/or U (reuse flags); the scoreboards stay ours
+                    _ when pass.StartsWith("mix:", StringComparison.Ordinal) => n with
+                    {
+                        Stall = pass.IndexOf('S', 4) >= 0 ? o.Stall : n.Stall,
+                        Reuse = pass.IndexOf('U', 4) >= 0 ? o.Reuse : n.Reuse,
+                    },
                     _ => n,
                 };
             }
@@ -141,9 +147,13 @@ internal static class SassProbeTool
                 for (int i = 0; i < original.Length; i++)
                 {
                     var o = original[i].Control; var n = code[i].Control;
+                    int op = original[i].Opcode & 0x1ff;
+                    long offset = (long)original[i].Bits(32, 50);
+                    if ((offset & (1L << 49)) != 0) offset -= 1L << 50;
+                    string to = op is 0x147 or 0x144 or 0x145 ? "   -> " + (i + 1 + offset / 16) : "";
                     Console.WriteLine(i.ToString("D3") + " " + (SassOpcodeTable.Decode(original[i])?.Mnemonic ?? "?").PadRight(10) +
                         " ptxas s" + o.Stall + " w" + o.WriteScoreboard + " r" + o.ReadScoreboard + " wait" + o.WaitMask.ToString("x2") + " y" + (o.Yield ? 1 : 0) + " u" + o.Reuse +
-                        "   ours s" + n.Stall + " w" + n.WriteScoreboard + " r" + n.ReadScoreboard + " wait" + n.WaitMask.ToString("x2") + " u" + n.Reuse);
+                        "   ours s" + n.Stall + " w" + n.WriteScoreboard + " r" + n.ReadScoreboard + " wait" + n.WaitMask.ToString("x2") + " u" + n.Reuse + to);
                 }
             }
             cubin.SetInstructions(kernel, code);

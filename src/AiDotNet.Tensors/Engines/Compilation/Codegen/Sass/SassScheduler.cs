@@ -19,12 +19,16 @@
 // Control flow: a branch target or a control instruction issues only after every fixed-latency result is ready, so no
 // fixed-latency state crosses a block boundary. Scoreboards do cross branches: a branch target starts from the union of
 // what every edge into it leaves pending (loop heads iterated to a fixpoint), so a loop keeps its prefetched global
-// loads in flight across the back edge as ptxas does -- waiting on every scoreboard there cost a 3x3 convolution's
-// data gradient 12% on the RTX 3080. The other control instructions (barriers, EXIT, convergence, DEPBAR, CALL) still
-// wait on every scoreboard. The yield bits stay as they were. An operand reuse flag survives only where the instruction's stall is no longer than ptxas's: the reuse
-// cache is valid only when the next instruction follows closely enough that the scheduler cannot have issued another
-// warp in between -- lengthening the stall of an instruction that keeps its reuse flags faulted on sm_75 (ptxas's own
-// schedule with four extra stall cycles on its memory instructions read stale operands).
+// loads in flight across the back edge as ptxas does -- waiting on every scoreboard there cost a 3x3 convolution's data
+// gradient 12% on the RTX 3080 (CALL.REL.NOINC, a loop exit, counts as a branch). The other control instructions
+// (barriers, EXIT, convergence, DEPBAR) still wait on every scoreboard. BSSY must: letting global loads stay pending
+// across a BSSY region made a dilated 3x3 convolution's output wrong on the RTX 3080, every run, with every register
+// dependency waited for (a wait at the BSSY or the divergent BRA fixed it, one at the region's first instruction did not;
+// ptxas keeps them pending there, so some rule is still unknown). The yield bits stay as they were. An operand
+// reuse flag survives only where the instruction's stall is no longer than ptxas's: the reuse cache is valid only when
+// the next instruction follows closely enough that the scheduler cannot have issued another warp in between --
+// lengthening the stall of an instruction that keeps its reuse flags faulted on sm_75 (ptxas's own schedule with four
+// extra stall cycles on its memory instructions read stale operands).
 // A kernel with an opcode the table does not know is left alone (null).
 
 using System;
@@ -240,10 +244,12 @@ public static class SassScheduler
                     : (e.UniformPredicates ? UniformPredicateKey : PredicateKey) + instruction.GuardPredicate;
                 var predicateWrites = Predicates(instruction, e.PredicateWrites, e.UniformPredicates);
                 bool target = targets.Contains(i);
-                // Fixed-latency state never crosses a block boundary; scoreboards cross branches (BRA) and branch targets
-                // but every other control instruction (barriers, EXIT, convergence, DEPBAR, CALL) waits on them all.
+                // Fixed-latency state never crosses a block boundary; scoreboards cross branches (BRA, and CALL.REL.NOINC,
+                // which ptxas leaves a loop through) and branch targets, but every other control instruction (barriers,
+                // EXIT, convergence, DEPBAR) waits on them all.
                 bool boundary = target || e.Latency == SassLatency.Control;
-                bool drain = (e.Latency == SassLatency.Control && e.Mnemonic != "BRA") || (target && drainTargets.Contains(i));
+                bool branch = e.Mnemonic is "BRA" or "CALL";
+                bool drain = (e.Latency == SassLatency.Control && !branch) || (target && drainTargets.Contains(i));
                 if (target && !drain)
                 {
                     if (forwardEntry.TryGetValue(i, out var forward)) Merge(forward, clampSetAt: false);
@@ -429,7 +435,7 @@ public static class SassScheduler
                 cycle += baseStall;
 
                 // A branch hands what is pending to its target.
-                if (e.Mnemonic == "BRA")
+                if (branch)
                 {
                     int to = BranchTarget(code, i);
                     var state = new ScoreState(pendingWrite, pendingRead, outstanding, scoreboardSetAt);
@@ -526,7 +532,7 @@ public static class SassScheduler
         }
     }
 
-    // The instruction index a BRA at `at` jumps to.
+    // The instruction index a BRA or CALL.REL.NOINC at `at` jumps to.
     private static int BranchTarget(IReadOnlyList<SassInstruction> code, int at)
     {
         long offset = (long)code[at].Bits(32, 50);
