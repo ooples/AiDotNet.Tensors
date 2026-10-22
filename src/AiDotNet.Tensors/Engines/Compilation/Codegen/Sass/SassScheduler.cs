@@ -53,6 +53,13 @@ public static class SassScheduler
     // Expected completion, in cycles after issue, for that choice only (correctness never depends on it): a write
     // scoreboard releases when the result arrives, a read scoreboard when the sources have been read.
     private const int GlobalLoadCycles = 300, SharedLoadCycles = 30, OtherVariableCycles = 20, SourceReadCycles = 20;
+
+    // The choice is greedy, and an empty scoreboard always costs nothing, so a run of global loads would take every
+    // scoreboard and leave each later short operation (an address register's read release, a shared load) to share one
+    // with a 300-cycle load. Global loads therefore stop opening new scoreboards once only ShortBoards are free of them,
+    // as ptxas keeps two for short operations. A depthwise 3x3 weight gradient (20 gathered loads an iteration, each
+    // address overwritten soon after) ran 0.79x ptxas on the RTX 3080 without this.
+    private const int ShortBoards = 2;
     private const int ScoreboardSetDelay = 2;
 
     // A scoreboard is a small counter: an instruction that would raise one past this many outstanding operations
@@ -197,6 +204,7 @@ public static class SassScheduler
         for (int s = 0; s < pendingUse.Length; s++) pendingUse[s] = long.MaxValue;
         var boards = Enumerable.Range(0, 6).Where(b => b != asyncBoard).ToArray();
         var outstanding = new int[6];
+        var holdsGlobal = new bool[6];   // per scoreboard: covers a global load not yet waited on
         long cycle = 0;   // issue cycle of the current instruction
         var scoreboardSetAt = new long[6];
         for (int s = 0; s < scoreboardSetAt.Length; s++) scoreboardSetAt[s] = long.MinValue / 2;
@@ -236,23 +244,25 @@ public static class SassScheduler
             }
             // The scoreboards this instruction will set, chosen now so a full one is waited on first.
             int writeBoard = SassInstruction.NoScoreboard, readBoard = SassInstruction.NoScoreboard;
+            long writeComplete = 0, readReleased = 0;
+            bool global = e.Mnemonic == "LDG";
             if (e.Latency == SassLatency.Variable)
             {
                 if (writes.Count != 0)
                 {
-                    long complete = cycle + (e.Mnemonic == "LDG" ? GlobalLoadCycles : e.Mnemonic == "LDS" ? SharedLoadCycles : OtherVariableCycles);
-                    writeBoard = ChooseBoard(boards, outstanding, pendingUse, pendingComplete, firstUse[i], complete);
-                    pendingUse[writeBoard] = Math.Min(pendingUse[writeBoard], firstUse[i]);
-                    pendingComplete[writeBoard] = Math.Max(pendingComplete[writeBoard], complete);
+                    long complete = cycle + (global ? GlobalLoadCycles : e.Mnemonic == "LDS" ? SharedLoadCycles : OtherVariableCycles);
+                    var candidates = boards;
+                    if (global && boards.Count(b => holdsGlobal[b]) is int holding && holding > 0 && holding >= boards.Length - ShortBoards)
+                        candidates = boards.Where(b => holdsGlobal[b]).ToArray();
+                    writeBoard = ChooseBoard(candidates, outstanding, pendingUse, pendingComplete, firstUse[i], complete, conserve: global);
+                    writeComplete = complete;
                     if (outstanding[writeBoard] >= ScoreboardDepth) wait |= 1 << writeBoard;
                 }
                 if (reads.Count != 0 && overwritten[i])
                 {
-                    long released = cycle + SourceReadCycles;
+                    readReleased = cycle + SourceReadCycles;
                     readBoard = ChooseBoard(boards.Where(b => b != writeBoard).ToArray(), outstanding, pendingUse, pendingComplete,
-                        firstOverwrite[i], released);
-                    pendingUse[readBoard] = Math.Min(pendingUse[readBoard], firstOverwrite[i]);
-                    pendingComplete[readBoard] = Math.Max(pendingComplete[readBoard], released);
+                        firstOverwrite[i], readReleased);
                     if (outstanding[readBoard] >= ScoreboardDepth) wait |= 1 << readBoard;
                 }
             }
@@ -264,6 +274,7 @@ public static class SassScheduler
                     if ((wait >> s & 1) != 0)
                     {
                         outstanding[s] = 0;
+                        holdsGlobal[s] = false;
                         pendingUse[s] = long.MaxValue;
                         pendingComplete[s] = 0;
                     }
@@ -354,12 +365,17 @@ public static class SassScheduler
                 if (writeBoard != SassInstruction.NoScoreboard)
                 {
                     outstanding[writeBoard]++;
+                    holdsGlobal[writeBoard] |= global;
+                    pendingUse[writeBoard] = Math.Min(pendingUse[writeBoard], firstUse[i]);
+                    pendingComplete[writeBoard] = Math.Max(pendingComplete[writeBoard], writeComplete);
                     scoreboardSetAt[writeBoard] = cycle;
                     foreach (int r in writes) { pendingWrite[r] = writeBoard; readyAt.Remove(r); earlyAt.Remove(r); }
                 }
                 if (readBoard != SassInstruction.NoScoreboard)
                 {
                     outstanding[readBoard]++;
+                    pendingUse[readBoard] = Math.Min(pendingUse[readBoard], firstOverwrite[i]);
+                    pendingComplete[readBoard] = Math.Max(pendingComplete[readBoard], readReleased);
                     scoreboardSetAt[readBoard] = cycle;
                     foreach (int r in reads) pendingRead[r] = readBoard;
                 }
@@ -427,9 +443,12 @@ public static class SassScheduler
     // The next wait on a scoreboard comes at the earliest use among the operations it covers and lasts until all of them
     // complete, so adding this operation costs that wait max(pending completion, complete) minus the completion of
     // what it actually needs (this operation if its use comes first, else the pending ones). The cheapest wins; ties
-    // go to the scoreboard holding fewer operations. (Uses are instruction indices, compared only with each other.)
+    // go to the scoreboard holding fewer operations -- except for a global load (`conserve`), which joins a scoreboard
+    // already holding loads its consumer waits for anyway rather than open an empty one: global loads may only hold
+    // all but ShortBoards scoreboards, and the first few each taking its own left the later groups (consumed later)
+    // sharing one with each other. (Uses are instruction indices, compared only with each other.)
     private static int ChooseBoard(int[] candidates, int[] outstanding, long[] pendingUse, long[] pendingComplete,
-        long use, long complete)
+        long use, long complete, bool conserve = false)
     {
         int best = -1;
         long bestCost = long.MaxValue;
@@ -443,7 +462,9 @@ public static class SassScheduler
                 long needed = pendingUse[b] < use ? pendingComplete[b] : use < pendingUse[b] ? complete : Math.Max(pendingComplete[b], complete);
                 cost = end - needed;
             }
-            if (cost < bestCost || (cost == bestCost && outstanding[b] < outstanding[best]))
+            if (cost < bestCost || (cost == bestCost && (conserve
+                    ? outstanding[b] > 0 && outstanding[best] == 0
+                    : outstanding[b] < outstanding[best])))
             {
                 best = b;
                 bestCost = cost;
