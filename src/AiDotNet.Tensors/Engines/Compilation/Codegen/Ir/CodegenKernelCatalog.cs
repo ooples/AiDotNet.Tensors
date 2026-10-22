@@ -168,6 +168,11 @@ public static class CodegenKernelCatalog
             CodegenFusedStatistics.BatchNorm2DBackward(2, 8, 6, 6),
             CodegenFusedStatistics.BatchNorm2DBackward(32, 64, 56, 56)),
 
+        new("paged_attention_decode",
+            "paged attention decode: scores and the value product through a block table, with a row softmax between",
+            CodegenBackendPrograms.PagedAttentionDecode(4, 4, 8, 4, 3, 7, 0.125),
+            CodegenBackendPrograms.PagedAttentionDecode(32, 8, 128, 16, 64, 4096, 0.08838834764831845)),
+
         new("groupnorm",
             "GroupNorm: statistics per (sample, group), per-channel affine",
             CodegenFusedStatistics.GroupNorm(2, 8, 4, 36),
@@ -351,6 +356,11 @@ public static class CodegenKernelCatalog
             "relu(x * scale[c] + shift[c]): inference BatchNorm folded to a channel affine",
             ChannelAffine(2, 8, 6, 6, CodegenActivationKind.ReLU),
             ChannelAffine(32, 64, 56, 56, CodegenActivationKind.ReLU)),
+
+        new("scatter_add_deterministic",
+            "deterministic scatter-add: each destination reduces over the sources that target it, no atomic",
+            CodegenBackendPrograms.ScatterAddDeterministic(96, 16, 4).Passes[0],
+            CodegenBackendPrograms.ScatterAddDeterministic(4096, 256, 64).Passes[0]),
     ];
 
     /// <summary>

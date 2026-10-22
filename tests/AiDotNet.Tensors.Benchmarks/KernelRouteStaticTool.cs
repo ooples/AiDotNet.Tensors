@@ -93,6 +93,12 @@ internal static class KernelRouteStaticTool
                 new[] { "batchnorm_backward" }),
             new Family("GroupNormBackward 32x64/8x1024", CodegenBackendPrograms.GroupNormBackward(32, 64, 8, 1024), "normalization",
                 new[] { "groupnorm_backward", "groupnorm_backward_sums" }),
+            new Family("PagedAttentionDecode 32h/8kv x128 blk16 x64",
+                CodegenBackendPrograms.PagedAttentionDecode(32, 8, 128, 16, 64, 4096, 0.08838834764831845), "attention",
+                new[] { "paged_attention_decode", "paged_attention_decode_gqa" }),
+            new Family("ScatterAddDeterministic 4096x256x64",
+                CodegenBackendPrograms.ScatterAddDeterministic(4096, 256, 64), "neuralnet",
+                new[] { "scatter_add_accumulate_deterministic", "embedding_backward_deterministic" }),
             new Family("Softmax 8192x1024", CodegenFusedStatistics.Softmax(8192, 1024), "activation", new[] { "softmax" }),
             new Family("SoftmaxBackward 8192x1024", CodegenFusedStatistics.SoftmaxBackward(8192, 1024), "neuralnet", new[] { "softmax_backward" }),
             // The GEMM slot's declared schedules at shapes where they won, against the narrow kernel the entry ran there.
