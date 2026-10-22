@@ -384,6 +384,8 @@ extern ""C"" __global__ __launch_bounds__(256) void resident_index_select(
     int j = (gid / innerSize) % indexAxis;
     int outer = (gid / innerSize) / indexAxis;
     int sourceIndex = indices[j];
+    // An index outside the source axis yields zeros (as the declared gather does) instead of a read outside it.
+    if (sourceIndex < 0 || sourceIndex >= sourceAxis) { output[gid] = 0.0f; return; }
     output[gid] = source[(outer * sourceAxis + sourceIndex) * innerSize + inner];
 }
 
