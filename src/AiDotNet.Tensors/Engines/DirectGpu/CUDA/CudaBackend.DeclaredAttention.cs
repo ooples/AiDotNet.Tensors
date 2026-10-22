@@ -248,7 +248,25 @@ public sealed partial class CudaBackend
         // against the same budget. Null declines the route and the hand-written kernel serves the call.
         long bytes = checked((long)seqQ * seqK * sizeof(float));
         if (!DeclaredScratchFits(bytes, out decline)) return null;
-        buffer = AllocateBuffer(CausalBias(seqQ, seqK));
+        try
+        {
+            buffer = AllocateBuffer(CausalBias(seqQ, seqK));
+        }
+        catch (InvalidOperationException ex)
+        {
+            // The budget above is an eighth of the device's TOTAL memory, so a bias that fits it can still exceed the
+            // free VRAM (an OOM) or the per-allocation cap (GpuBufferTooLargeException, an InvalidOperationException
+            // too). Both mean this shape cannot be served here, and every caller of the two routes reads a false as
+            // "the hand-written kernel serves this call": letting the throw out skips that fallback entirely.
+            System.Diagnostics.Trace.TraceWarning(
+                "[CudaBackend] the causal attention bias for " + seqQ.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                "x" + seqK.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                " could not be allocated; the declared route declines this shape: " + ex);
+            decline = "the causal attention bias (" +
+                (bytes >> 20).ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                " MiB) could not be allocated, so the hand-written kernel, which needs none, serves this shape.";
+            return null;
+        }
         _causalBiases[cacheKey] = buffer;
         _declaredScratchBytes = checked(_declaredScratchBytes + bytes);
         return buffer;
