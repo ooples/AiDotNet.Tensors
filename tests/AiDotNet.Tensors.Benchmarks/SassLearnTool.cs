@@ -197,7 +197,8 @@ internal static class SassLearnTool
                     }
                 }
                 int predicateBase = effects.UniformPredicates ? 8 : 0;
-                var predicateReads = effects.PredicateReads.Select(f => (int)instruction.Bits(f, 3)).Where(p => p != 7).Select(p => predicateBase + p).ToList();
+                var predicateReads = effects.PredicateReads.Select(f => (int)instruction.Bits(f, 3)).Where(p => p != 7).Select(p => predicateBase + p)
+                    .Concat(effects.UniformPredicateReads.Select(f => (int)instruction.Bits(f, 3)).Where(p => p != 7).Select(p => 8 + p)).ToList();
                 if (instruction.GuardPredicate != 7) predicateReads.Add(predicateBase + instruction.GuardPredicate);
                 foreach (int pr in predicateReads)
                     if (predicateReady.TryGetValue(pr, out long written))
@@ -231,14 +232,18 @@ internal static class SassLearnTool
                 }
                 // Every predicate the listing names as an operand must be one the table reads or writes: ptxas keeps
                 // no scoreboard for predicates, so a missing one (IMAD.X's carry-in) is invisible to the wait check.
+                // Keyed by file (UPn as 8 + n), so a uniform predicate the table decodes as a vector one (PLOP3's third
+                // source) is a miss.
                 var covered = new HashSet<int>(effects.PredicateReads.Concat(effects.PredicateWrites)
-                    .Select(f => (int)instruction.Bits(f, 3)));
+                    .Select(f => predicateBase + (int)instruction.Bits(f, 3))
+                    .Concat(effects.UniformPredicateReads.Select(f => 8 + (int)instruction.Bits(f, 3))));
                 foreach (string operand in line.Operands)
                 {
-                    var pm = Regex.Match(operand, @"^!?U?P([0-6])$");
+                    var pm = Regex.Match(operand, @"^!?(U?)P([0-6])$");
                     if (!pm.Success) continue;
                     checkedPredicates++;
-                    if (covered.Contains(int.Parse(pm.Groups[1].Value, CultureInfo.InvariantCulture))) continue;
+                    int printedKey = (pm.Groups[1].Value.Length != 0 ? 8 : 0) + int.Parse(pm.Groups[2].Value, CultureInfo.InvariantCulture);
+                    if (covered.Contains(printedKey)) continue;
                     missedPredicates++;
                     string key = line.Opcode + " (predicate " + operand + ")";
                     misses[key] = misses.TryGetValue(key, out int mp) ? mp + 1 : 1;

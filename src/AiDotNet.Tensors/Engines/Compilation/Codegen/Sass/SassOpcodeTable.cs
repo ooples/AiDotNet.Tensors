@@ -30,6 +30,7 @@
 // counting cycles. An opcode not listed is unknown: a kernel containing one is left exactly as ptxas wrote it.
 
 using System.Collections.Generic;
+using System.Linq;
 
 namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Sass;
 
@@ -57,9 +58,10 @@ public sealed class SassEffects
 {
     internal SassEffects(string mnemonic, SassLatency latency, IReadOnlyList<SassRegisterOperand> writes,
         IReadOnlyList<SassRegisterOperand> reads, IReadOnlyList<int> predicateWrites, IReadOnlyList<int> predicateReads,
-        bool readsAllPredicates, int fixedLatency, bool uniformPredicates = false)
+        bool readsAllPredicates, int fixedLatency, bool uniformPredicates = false, IReadOnlyList<int>? uniformPredicateReads = null)
     {
         UniformPredicates = uniformPredicates;
+        UniformPredicateReads = uniformPredicateReads ?? [];
         Mnemonic = mnemonic;
         Latency = latency;
         Writes = writes;
@@ -84,6 +86,12 @@ public sealed class SassEffects
 
     /// <summary>Bit positions of 3-bit predicate sources, besides the guard (7, PT, means none).</summary>
     public IReadOnlyList<int> PredicateReads { get; }
+
+    /// <summary>
+    /// Bit positions of 3-bit uniform predicate sources (UP0-UP6) of a vector instruction: PLOP3 reads its third
+    /// source from the uniform file when bit 67 is set.
+    /// </summary>
+    public IReadOnlyList<int> UniformPredicateReads { get; }
 
     /// <summary>The instruction reads the whole predicate file (P2R).</summary>
     public bool ReadsAllPredicates { get; }
@@ -122,7 +130,7 @@ public static class SassOpcodeTable
     private sealed record Spec(string Mnemonic, SassLatency Latency, bool WritesD, int DWidth, Sources Sources,
         int[] PredicateWrites, int[] PredicateReads, bool Memory = false, bool Store = false, int AddressWidth = 1,
         bool ReadsAllPredicates = false, bool WideC = false, int FixedLatency = AluLatency, bool Uniform = false,
-        bool SizedD = false, bool VectorSources = false, bool AsyncCopy = false);
+        bool SizedD = false, bool VectorSources = false, bool AsyncCopy = false, int UniformThirdPredicateFlag = -1);
 
     private static readonly Dictionary<int, Spec> s_specs = new()
     {
@@ -140,7 +148,7 @@ public static class SassOpcodeTable
         [0x013] = new("IABS", SassLatency.Fixed, true, 1, Sources.BOnly, [], []),
         [0x017] = new("IMNMX", SassLatency.Fixed, true, 1, Sources.AB, [], [87]),
         [0x019] = new("SHF", SassLatency.Fixed, true, 1, Sources.ABC, [], []),
-        [0x01c] = new("PLOP3", SassLatency.Fixed, false, 0, Sources.None, [81, 84], [87, 77, 68]),
+        [0x01c] = new("PLOP3", SassLatency.Fixed, false, 0, Sources.None, [81, 84], [87, 77, 68], UniformThirdPredicateFlag: 67),
         [0x020] = new("FMUL", SassLatency.Fixed, true, 1, Sources.AB, [], []),
         [0x021] = new("FADD", SassLatency.Fixed, true, 1, Sources.AB, [], []),
         [0x023] = new("FFMA", SassLatency.Fixed, true, 1, Sources.ABC, [], []),
@@ -233,8 +241,9 @@ public static class SassOpcodeTable
                             break;
                         case 2:
                         case 3:
-                            // The second register source moves to bits 64; the third operand is immediate/constant.
-                            reads.Add(new SassRegisterOperand(C, 1, uniformSources));
+                            // The second register source moves to bits 64; the third operand is immediate/constant. A
+                            // two-source operation in these forms (FADD R, R, imm: 0x421) has only A in registers.
+                            if (spec.Sources == Sources.ABC) reads.Add(new SassRegisterOperand(C, 1, uniformSources));
                             break;
                         case 4:
                         case 5:
@@ -255,7 +264,16 @@ public static class SassOpcodeTable
                     break;
             }
         }
-        return new SassEffects(spec.Mnemonic, spec.Latency, writes, reads, spec.PredicateWrites, spec.PredicateReads,
-            spec.ReadsAllPredicates, spec.Latency == SassLatency.Fixed ? spec.FixedLatency : 0, spec.Uniform);
+        // PLOP3 P0, PT, PT, PT, UP0 (a uniform compare's result moved to a vector predicate): bit 67 makes the third
+        // source, bits 68-70, a uniform predicate. Missing it scheduled the PLOP3 1 cycle after the UISETP writing UP0
+        // (ptxas leaves 6), and two catalog convolutions computed wrong results on the RTX 3080.
+        IReadOnlyList<int> predicateReads = spec.PredicateReads, uniformPredicateReads = [];
+        if (spec.UniformThirdPredicateFlag >= 0 && instruction.Bits(spec.UniformThirdPredicateFlag, 1) != 0)
+        {
+            predicateReads = [.. spec.PredicateReads.Where(f => f != 68)];
+            uniformPredicateReads = [68];
+        }
+        return new SassEffects(spec.Mnemonic, spec.Latency, writes, reads, spec.PredicateWrites, predicateReads,
+            spec.ReadsAllPredicates, spec.Latency == SassLatency.Fixed ? spec.FixedLatency : 0, spec.Uniform, uniformPredicateReads);
     }
 }

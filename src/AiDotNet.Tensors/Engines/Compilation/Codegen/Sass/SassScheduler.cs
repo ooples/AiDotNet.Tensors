@@ -179,6 +179,7 @@ public static class SassScheduler
             var reads = Registers(instruction, e.Reads);
             var writes = Registers(instruction, e.Writes);
             var predicateReads = Predicates(instruction, e.PredicateReads, e.UniformPredicates);
+            predicateReads.AddRange(Predicates(instruction, e.UniformPredicateReads, uniform: true));
             int guard = instruction.GuardPredicate == SassInstruction.TruePredicate ? -1
                 : (e.UniformPredicates ? UniformPredicateKey : PredicateKey) + instruction.GuardPredicate;
             var predicateWrites = Predicates(instruction, e.PredicateWrites, e.UniformPredicates);
