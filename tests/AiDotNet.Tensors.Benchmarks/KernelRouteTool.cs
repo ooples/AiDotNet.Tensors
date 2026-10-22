@@ -116,7 +116,13 @@ internal static class KernelRouteTool
                 for (int o = 0; o < route.OutputSizes.Length; o++)
                     buffers[route.Inputs.Length + o] = backend.AllocateBuffer(new float[route.OutputSizes[o]]);
                 // A family that compiles a shape only once it recurs (attention) routes from the second call.
-                if (declared) route.Call(backend, buffers);
+                if (declared)
+                {
+                    route.Call(backend, buffers);
+                    // The warm call may update an input in place (BatchNorm's running statistics): restore every input
+                    // so the checked call starts from the state the reference assumes, as the incumbent's single call does.
+                    for (int i = 0; i < route.Inputs.Length; i++) backend.UploadBufferInPlace(route.Inputs[i], buffers[i]);
+                }
                 long before = backend.DeclaredProgramLaunches;
                 route.Call(backend, buffers);
                 backend.Synchronize();
@@ -490,7 +496,7 @@ internal static class KernelRouteTool
     private static void FlashProbe(CudaBackend backend)
     {
         Console.WriteLine();
-        Console.WriteLine("FLASH PROBE - flash_attention_v2 vs the declared attention program, same call (us)");
+        Console.WriteLine("FLASH PROBE - flash_attention_v2 vs the declared attention program, same call, and what the entry point serves by default (us)");
         foreach (var (b, h, s, d, causal) in new[]
         {
             (2, 8, 128, 64, false), (2, 8, 128, 64, true), (4, 8, 256, 64, true), (8, 12, 512, 64, true),
@@ -509,13 +515,20 @@ internal static class KernelRouteTool
             double declared;
             try
             {
-                declared = Time(() => backend.ScaledDotProductAttention(q, k, v, o, null, null, b, h, s, s, d, scale, causal),
-                    backend.Synchronize);
+                // Built on the second call (attention compiles a shape once it recurs): warm it first, or the timing
+                // includes the compile (516 ms for 8x12x512x64 on a cold cache, 0.8 ms warm).
+                void Declared() => backend.ScaledDotProductAttention(q, k, v, o, null, null, b, h, s, s, d, scale, causal);
+                Declared(); Declared();
+                declared = Time(Declared, backend.Synchronize);
             }
             finally
             {
                 backend.DeclaredKernelsSwitch = null;
             }
+            // What production serves: the switch unset, so the backend's own routing (and any tuned slot) decides.
+            Action entry = () => backend.ScaledDotProductAttention(q, k, v, o, null, null, b, h, s, s, d, scale, causal);
+            entry(); entry();
+            double served = Time(entry, backend.Synchronize);
             // The backward from the same forward: hand-written (declared off) against the declared program.
             using var stats = backend.AllocateBuffer(b * h * s);
             using var dout = backend.AllocateBuffer(Fill(b * h * s * d, 54, 0));
@@ -540,7 +553,8 @@ internal static class KernelRouteTool
             Console.WriteLine(("flash " + b + "x" + h + "x" + s + "x" + d + (causal ? " causal" : "")).PadRight(34) +
                 flash.ToString("F1", CultureInfo.InvariantCulture).PadLeft(12) +
                 declared.ToString("F1", CultureInfo.InvariantCulture).PadLeft(12) +
-                (flash / declared).ToString("F2", CultureInfo.InvariantCulture).PadLeft(8) + "x   bwd " +
+                (flash / declared).ToString("F2", CultureInfo.InvariantCulture).PadLeft(8) + "x   served " +
+                served.ToString("F1", CultureInfo.InvariantCulture) + "   bwd " +
                 handBwd.ToString("F1", CultureInfo.InvariantCulture) + " -> " + declaredBwd.ToString("F1", CultureInfo.InvariantCulture) +
                 " = " + (handBwd / declaredBwd).ToString("F2", CultureInfo.InvariantCulture) + "x");
         }
