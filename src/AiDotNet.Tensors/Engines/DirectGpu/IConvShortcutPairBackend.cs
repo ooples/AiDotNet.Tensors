@@ -7,10 +7,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// reads the strided convolution's centre-tap input, so its gradient adds to one sub-pixel phase of the same output;
 /// the compiled training plan runs the pair as one backward action, so the input's gradient is written once instead of
 /// two launches and an accumulation add. False - nothing launched - when the shapes are outside the kernel; the caller
-/// then runs the two input gradients separately.
+/// then runs the two input gradients separately. Every backend implements it: CUDA through
+/// <c>CudaConvDgradS2Kernels</c>, the other five through <see cref="PortableConvDgradS2"/>.
 /// </summary>
-[BackendSpecificRoute("CUDA one-launch input gradient of a strided 3x3 convolution and its 1x1 projection shortcut for the compiled plan's shortcut pair; every backend composes the two input gradients and an add",
-    nameof(IDirectGpuBackend.Conv2DBackwardInput), nameof(IDirectGpuBackend.Add))]
 internal interface IConvShortcutPairBackend
 {
     /// <summary>True when the kernel takes the pair: <paramref name="outChannels"/> output channels for the 3 x 3
