@@ -76,22 +76,49 @@ public sealed class CodegenIndirectIndex
     /// </summary>
     public bool FloatIndices { get; }
 
+    /// <summary>
+    /// Subtracted from the loaded index before the range test, or null for no shift.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is what makes a DETERMINISTIC scatter expressible. A scatter written the obvious way -- iterate the
+    /// sources, write through <c>indices[i]</c> -- cannot prove two iterations miss each other, so the emitter has
+    /// to accumulate with <c>red.global.add.f32</c>, and an atomic float add returns a different sum per run. #890
+    /// records that as the determinism gap.
+    /// </para>
+    /// <para>
+    /// With a shift the same operator inverts: iterate the DESTINATIONS in parallel, reduce over the sources, and
+    /// let each source contribute only to its own destination. Shifting by the destination axis and testing against
+    /// <see cref="Bound"/> 1 is exactly <c>indices[i] == d</c> -- in range for the one destination that matches,
+    /// <see cref="CodegenIndexOutOfRange.Skip"/> (the reduction's identity) for every other. The reduction then runs
+    /// in reduce-axis order, which is fixed, so the result is bit-identical run to run with no atomic anywhere.
+    /// </para>
+    /// </remarks>
+    public CodegenAffineExpr? Offset { get; }
+
     /// <summary>Creates a data-dependent index.</summary>
     public CodegenIndirectIndex(
         int indexInput,
         CodegenAffineExpr position,
         int bound,
         CodegenIndexOutOfRange outOfRange = CodegenIndexOutOfRange.Skip,
-        bool floatIndices = false)
+        bool floatIndices = false,
+        CodegenAffineExpr? offset = null)
     {
         if (indexInput < 0) throw new ArgumentOutOfRangeException(nameof(indexInput));
         if (bound <= 0) throw new ArgumentOutOfRangeException(nameof(bound));
+        if (offset is not null && outOfRange == CodegenIndexOutOfRange.Clamp)
+            throw new ArgumentException(
+                "A shifted index cannot clamp: clamping a miss into [0, bound) would make every source contribute " +
+                "to a destination it does not belong to. Use Skip, which contributes the reduction's identity.",
+                nameof(outOfRange));
 
         IndexInput = indexInput;
         Position = position ?? throw new ArgumentNullException(nameof(position));
         Bound = bound;
         OutOfRange = outOfRange;
         FloatIndices = floatIndices;
+        Offset = offset;
     }
 
     // cvt.rzi.s32.f32 (and so C's (int) on the device): truncation toward zero, NaN to 0, saturation outside the range.
@@ -126,6 +153,13 @@ public sealed class CodegenIndirectIndex
         // load the emitter performs.
         // A float index is first rounded to float32, as the device holds it, then converted as cvt.rzi does.
         int index = FloatIndices ? TruncateLikeTheDevice((float)indexTensor[position]) : (int)indexTensor[position];
+
+        if (Offset is not null)
+        {
+            int shift = Offset.Evaluate(axisValues, out bool shiftValid);
+            if (!shiftValid) { active = false; return 0; }
+            index -= shift;
+        }
 
         if (index >= 0 && index < Bound) { active = true; return index; }
 

@@ -2632,6 +2632,19 @@ public sealed partial class PtxAffineEmitter
         }
         IndirectIndexLoads++;
 
+        if (indirect.Offset is { } shift)
+        {
+            // The deterministic-scatter shift: the range test below then accepts exactly the one destination whose
+            // axis value equals the loaded index, and Skip hands every other the reduction's identity.
+            string? shiftPredicate = null;
+            string shifted = EmitAffineIndex(shift, axisReg, reductionValues, reductionSet, int.MaxValue,
+                ref shiftPredicate);
+            string difference = NextR();
+            L($"sub.s32 {difference}, {raw}, {shifted};");
+            raw = difference;
+            if (shiftPredicate is not null) predicate = AndPred(predicate, shiftPredicate);
+        }
+
         if (indirect.OutOfRange == CodegenIndexOutOfRange.Skip)
         {
             string lo = NextP(), hi = NextP(), both = NextP();

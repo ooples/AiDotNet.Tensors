@@ -200,6 +200,54 @@ public static class CodegenBackendPrograms
     }
 
     /// <summary>
+    /// The deterministic scatter-add (#890 phase 4e), in CudaBackend's deterministic-scatter contract:
+    /// <c>out[d, f] = sum of source[i, f] over every i with indices[i] == d</c>, summed in increasing i, for d in
+    /// [0, destinations). An index outside that range contributes nowhere, which is what a -1 sentinel means.
+    /// </summary>
+    /// <remarks>
+    /// Written as a GATHER over destinations rather than a scatter over sources, which is what makes it
+    /// deterministic: a scatter has to accumulate through <c>red.global.add.f32</c>, and an atomic float add sums in
+    /// whatever order the warps arrive, so it returns a different answer per run. Here each destination reduces over
+    /// the sources in reduce-axis order and source i contributes only where
+    /// <c>indices[i] - d</c> lands in [0, 1) -- see <see cref="CodegenIndirectIndex.Offset"/>. No atomic is emitted
+    /// and the result is bit-identical run to run. The cost is destinations x count, as the repo's own scanning
+    /// deterministic kernels already pay; the sorted path remains the faster one for a large destination count.
+    /// </remarks>
+    public static CodegenProgram ScatterAddDeterministic(int count, int destinations, int features)
+    {
+        if (count <= 0 || destinations <= 0 || features <= 0)
+            throw new ArgumentOutOfRangeException(nameof(count), "Scatter extents must be positive.");
+        var space = new CodegenIterationSpace(
+            CodegenAxis.Parallel("d", destinations), CodegenAxis.Parallel("f", features),
+            CodegenAxis.Reduce("i", count));
+        var indices = new CodegenTensorBinding(0, "indices", new[] { count }, new[] { A(2) },
+            elementType: CodegenElementType.Int32);
+        // The leading extent-1 dimension exists only to carry the test: its index is indices[i] - d, in range for
+        // the one destination that matches and skipped for the rest.
+        var source = new CodegenTensorBinding(1, "source", new[] { 1, count, features },
+            new[] { CodegenAffineExpr.Const(0), A(2), A(1) },
+            indirect: new CodegenIndirectIndex?[]
+            {
+                new CodegenIndirectIndex(0, A(2), 1, CodegenIndexOutOfRange.Skip, floatIndices: false, offset: A(0)),
+                null, null,
+            });
+        var output = new CodegenTensorBinding(2, "out", new[] { destinations, features }, new[] { A(0), A(1) },
+            isOutput: true);
+        var pass = new CodegenKernelSpec("scatter_add_deterministic", space, new[] { indices, source }, output,
+            new[] { 1 }, CodegenReduceKind.Sum);
+        return new CodegenProgram(new[] { pass }, Array.Empty<long>(), "deterministic scatter-add (backend contract)");
+    }
+
+    /// <summary>
+    /// The deterministic segment sum (#890 phase 4e): <c>out[s, f] = sum of source[i, f] over every i whose segment
+    /// id is s</c>, in increasing i. The same inversion as <see cref="ScatterAddDeterministic"/> -- a segment sum IS
+    /// a scatter-add whose indices are segment ids -- so it is deterministic for the same reason, and it accepts
+    /// unsorted ids, which an offsets-based segment kernel cannot.
+    /// </summary>
+    public static CodegenProgram SegmentSum(int count, int segments, int features) =>
+        ScatterAddDeterministic(count, segments, features);
+
+    /// <summary>
     /// <c>out[o, j, i] = source[o, indices[j], i]</c>: indices int32 [indexAxis], source [outer, sourceAxis, inner],
     /// out [outer, indexAxis, inner] -- CudaBackend.IndexSelect's contract. An index outside [0, sourceAxis) yields
     /// zeros, which resident_index_select now bounds to as well.
