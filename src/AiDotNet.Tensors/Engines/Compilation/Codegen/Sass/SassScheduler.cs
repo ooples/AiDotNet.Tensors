@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 // The own SASS backend's scheduler (#1442): it owns the control word ptxas would otherwise choose. Given a kernel's
 // instructions in issue order, it recomputes every stall count, scoreboard assignment and wait mask from
 // SassOpcodeTable's view of what each instruction reads and writes:
@@ -214,8 +214,16 @@ public static class SassScheduler
         // does not settle within MaxPasses waits on every scoreboard instead (the conservative schedule).
         var backEntry = new Dictionary<int, ScoreState>();
         var drainTargets = new HashSet<int>();
+        // Stalls a previous pass had to spread back PAST the instruction before the one that needed them. Such a stall
+        // delays every instruction in between, so that pass's issue cycles -- and the readiness, predicate, pipe,
+        // uniform-read and scoreboard state recorded at them -- are stale from that point on, and a later reader
+        // computed from them could issue before its producer's result is ready. Rather than patch every entry, the
+        // next pass starts from these stalls and computes every cycle with them already in place.
+        var minimumStall = new int[code.Count];
+        int spreadPasses = 0;
         for (int pass = 0; ; pass++)
         {
+            bool spreadPastPrevious = false;
             var forwardEntry = new Dictionary<int, ScoreState>();
             var backOut = new Dictionary<int, ScoreState>();
             var result = new SassInstruction[code.Count];
@@ -259,8 +267,8 @@ public static class SassScheduler
                 bool drain = (e.Latency == SassLatency.Control && !branch) || (target && drainTargets.Contains(i));
                 if (target && !drain)
                 {
-                    if (forwardEntry.TryGetValue(i, out var forward)) Merge(forward, clampSetAt: false);
-                    if (backEntry.TryGetValue(i, out var back)) Merge(back, clampSetAt: true);
+                    if (forwardEntry.TryGetValue(i, out var forward)) Merge(forward, clampSetAt: false, at: i);
+                    if (backEntry.TryGetValue(i, out var back)) Merge(back, clampSetAt: true, at: i);
                 }
 
                 // Waits.
@@ -383,6 +391,7 @@ public static class SassScheduler
                         int add = (int)Math.Min(missing, cap - control.Stall);
                         if (add <= 0) continue;
                         result[k].Control = control with { Stall = control.Stall + add };
+                        if (k < i - 1) spreadPastPrevious = true;
                         missing -= add;
                     }
                     if (missing > 0)
@@ -457,7 +466,8 @@ public static class SassScheduler
 
                 var original = instruction.Control;
                 var updated = instruction;
-                int baseStall = timing.IssueStalls.TryGetValue(e.Mnemonic, out int fixedStall) ? fixedStall : 1;
+                int baseStall = Math.Max(minimumStall[i],
+                    timing.IssueStalls.TryGetValue(e.Mnemonic, out int fixedStall) ? fixedStall : 1);
                 updated.Control = new SassControl(baseStall, original.Yield, writeBoard, readBoard, wait, original.Reuse);
                 result[i] = updated;
                 originalStall[i] = original.Stall;
@@ -478,6 +488,20 @@ public static class SassScheduler
             {
                 var control = result[i].Control;
                 if (control.Reuse != 0 && control.Stall > originalStall[i]) result[i].Control = control with { Reuse = 0 };
+            }
+            if (spreadPastPrevious)
+            {
+                // Re-run with this pass's stalls as the floor, so every cycle is computed with them in place. Stalls
+                // only grow and are capped, so this settles; a kernel that does not is declined rather than given a
+                // schedule whose later waits were computed from cycles that no longer hold.
+                if (spreadPasses++ >= MaxPasses)
+                {
+                    LastDecline = "the stalls spread back past the preceding instruction did not settle";
+                    return null;
+                }
+                for (int k = 0; k < result.Length; k++) minimumStall[k] = result[k].Control.Stall;
+                pass--;   // a re-run is not one of the scoreboard fixpoint's passes
+                continue;
             }
             if (backOut.All(edge => backEntry.TryGetValue(edge.Key, out var assumed) && assumed.Covers(edge.Value))) return result;
             if (pass >= MaxPasses)
@@ -506,7 +530,7 @@ public static class SassScheduler
             // Adds a predecessor's pending scoreboards to the current state. A back edge's set cycles belong to the
             // previous trip and are taken as at least ScoreboardSetDelay ago; the choice model treats its boards as
             // holding a global load needed now.
-            void Merge(ScoreState state, bool clampSetAt)
+            void Merge(ScoreState state, bool clampSetAt, int at)
             {
                 foreach (var pair in state.Write) pendingWrite[pair.Key] = (pendingWrite.TryGetValue(pair.Key, out int m) ? m : 0) | pair.Value;
                 foreach (var pair in state.Read) pendingRead[pair.Key] = (pendingRead.TryGetValue(pair.Key, out int m) ? m : 0) | pair.Value;
@@ -517,7 +541,10 @@ public static class SassScheduler
                     shortOps[b] |= state.Short[b];
                     long setAt = clampSetAt ? Math.Min(state.SetAt[b], cycle - ScoreboardSetDelay) : state.SetAt[b];
                     scoreboardSetAt[b] = Math.Max(scoreboardSetAt[b], setAt);
-                    pendingUse[b] = Math.Min(pendingUse[b], cycle);
+                    // A use is an INSTRUCTION INDEX (ChooseBoard compares it with firstUse / firstOverwrite), not a
+                    // cycle: storing the cycle here made a merged board look needed far in the future, so ChooseBoard
+                    // would pile short operations onto the board carrying a global load.
+                    pendingUse[b] = Math.Min(pendingUse[b], at);
                     pendingComplete[b] = Math.Max(pendingComplete[b], cycle + GlobalLoadCycles);
                 }
             }
