@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Globalization;
@@ -256,9 +256,16 @@ internal sealed class DirectPtxRuntime : IDisposable
         PtxCompat.ThrowIfNull(rewrite, nameof(rewrite));
         using var _ = Enter();
         var compiled = DirectPtxCubinArtifactCache.Resolve(this, ptx);
-        byte[] image = rewrite(compiled.Image);
+        // The rewrite is a caller's delegate: check what it returned before hashing and loading it, as every other
+        // image path does. Without this, null faults inside the hash without naming the delegate, and an empty or
+        // non-ELF array reaches cuModuleLoadData as an opaque driver status.
+        byte[] image = rewrite(compiled.Image)
+            ?? throw new InvalidDataException("The " + rewriteLabel + " rewrite of the direct-PTX cubin returned null.");
+        DirectPtxCubinArtifactCache.ValidateCubin(image, rewriteLabel + " rewrite of " + compiled.SourceKey);
+        // Not DriverLinkedCubin: an audit records the image kind, and this image is the rewrite's output, not the
+        // linker's.
         var artifact = new DirectPtxCubinArtifact(image, compiled.SourceKey + "+" + rewriteLabel,
-            DirectPtxCubinArtifactCache.ComputeImageSha256(image), DirectPtxModuleImageKind.DriverLinkedCubin, null,
+            DirectPtxCubinArtifactCache.ComputeImageSha256(image), DirectPtxModuleImageKind.RewrittenCubin, null,
             compiled.CompilerLog);
         IntPtr native = Marshal.AllocHGlobal(image.Length);
         try

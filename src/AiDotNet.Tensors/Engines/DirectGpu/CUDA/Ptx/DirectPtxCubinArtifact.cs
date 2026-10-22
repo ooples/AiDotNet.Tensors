@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -16,7 +16,13 @@ internal enum DirectPtxModuleImageKind
     EmbeddedCubin,
     DiskCacheCubin,
     DriverLinkedCubin,
-    DriverJitPtx
+    DriverJitPtx,
+
+    /// <summary>
+    /// The driver linker's cubin after one of the own SASS backend's passes rewrote it (#1442). Distinct from
+    /// <see cref="DriverLinkedCubin"/>, which an audit reads as "exactly what the linker returned".
+    /// </summary>
+    RewrittenCubin
 }
 
 /// <summary>
@@ -663,7 +669,8 @@ internal static class DirectPtxCubinArtifactCache
         }
     }
 
-    private static void ValidateCubin(byte[] image, string source)
+    /// <summary>Throws unless <paramref name="image"/> looks like a CUDA ELF cubin, naming <paramref name="source"/>.</summary>
+    internal static void ValidateCubin(byte[] image, string source)
     {
         if (image.Length < 64 || image[0] != 0x7f || image[1] != (byte)'E' ||
             image[2] != (byte)'L' || image[3] != (byte)'F')

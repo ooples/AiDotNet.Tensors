@@ -10,6 +10,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using System.Text.RegularExpressions;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Sass;
@@ -19,6 +20,48 @@ namespace AiDotNet.Tensors.Benchmarks;
 
 internal static class SassProbeTool
 {
+    // An option's value, or null when the option is absent. Reading args[at + 1] directly threw
+    // IndexOutOfRangeException when an option came last, so the tool died before saying which option was incomplete.
+    private static string? Value(string[] args, string option)
+    {
+        int at = Array.IndexOf(args, option);
+        if (at < 0) return null;
+        if (at + 1 >= args.Length) throw new ArgumentException(option + " needs a value.", nameof(args));
+        return args[at + 1];
+    }
+
+    private static int Value(string[] args, string option, int fallback)
+    {
+        if (Value(args, option) is not { } text) return fallback;
+        if (!int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out int value))
+            throw new ArgumentException(option + " needs an integer, not '" + text + "'.", nameof(args));
+        return value;
+    }
+
+    // var<NN>[MNEMONIC]: hold every variable-latency instruction (or only that mnemonic) at NN stall cycles.
+    private static readonly Regex VarPass = new(@"^var(\d{2})([A-Z0-9_.]*)$", RegexOptions.None, TimeSpan.FromSeconds(1));
+
+    /// <summary>
+    /// Rejects a --pass name ApplyPass does not know. An unknown name used to fall through to the default pass, so a
+    /// misspelling such as --pass stal printed a table that looked valid under the wrong pass's name; and var or var1
+    /// reached Substring(3, 2) inside the rewrite and threw on the first variable-latency instruction.
+    /// </summary>
+    private static void ValidatePass(string pass)
+    {
+        if (pass is null) throw new ArgumentNullException(nameof(pass));
+        bool known = pass is "control" or "stall" or "sb" or "max" or "noreuse" or "ptxasreuse" or "plus" or "plusalu"
+                or "plusvar" or "pluscontrol" or "plus1" or "keepcontrol" or "upto"
+            || (pass.StartsWith("keep:", StringComparison.Ordinal) && pass.Length > 5)
+            || pass.StartsWith("mix:", StringComparison.Ordinal)
+            || (pass.StartsWith("maxnreg:", StringComparison.Ordinal)
+                && int.TryParse(pass.Substring(8), NumberStyles.Integer, CultureInfo.InvariantCulture, out int cap) && cap > 0)
+            || VarPass.IsMatch(pass);
+        if (!known)
+            throw new ArgumentException("--pass " + pass + " is not a pass this tool knows: control, stall, sb, max, " +
+                "noreuse, ptxasreuse, plus, plusalu, plusvar, pluscontrol, plus1, keepcontrol, upto, keep:<MNEMONIC>, " +
+                "mix:[S][U], maxnreg:<N>, or var<NN>[MNEMONIC].", nameof(pass));
+    }
+
     internal static void Run(string[] args)
     {
         if (Array.IndexOf(args, "--tc") >= 0)
@@ -37,15 +80,16 @@ internal static class SassProbeTool
             return;
         }
         using var runtime = new DirectPtxRuntime();
-        string pass = Array.IndexOf(args, "--pass") is int at && at >= 0 && at + 1 < args.Length ? args[at + 1] : "control";
+        string pass = Value(args, "--pass") ?? "control";
+        ValidatePass(pass);
         int major = runtime.ComputeCapabilityMajor, minor = runtime.ComputeCapabilityMinor;
         Console.WriteLine("SASS PROBE sm_" + major + minor + " - PTX path vs rewritten cubin (control words recomputed)");
         Console.WriteLine("kernel                                   size     identical   ptx us   sass us   ratio");
         var failures = new List<string>();
         int dumped = 0;
-        int upto = Array.IndexOf(args, "--upto") is int u && u >= 0 ? int.Parse(args[u + 1], CultureInfo.InvariantCulture) : int.MaxValue;
-        string? only = Array.IndexOf(args, "--only") is int on && on >= 0 ? args[on + 1] : null;
-        string onlyTag = Array.IndexOf(args, "--tag") is int tg && tg >= 0 ? args[tg + 1] : "verify";
+        int upto = Value(args, "--upto", int.MaxValue);
+        string? only = Value(args, "--only");
+        string onlyTag = Value(args, "--tag") ?? "verify";
         foreach (var entry in CodegenKernelCatalog.All)
         {
             if (only is not null && entry.Name != only) continue;
@@ -69,7 +113,7 @@ internal static class SassProbeTool
                 int registers = 0;
                 byte[] Rewrite(byte[] image)
                 {
-                    if (Array.IndexOf(args, "--save") is int sv && sv >= 0) System.IO.File.WriteAllBytes(args[sv + 1], image);
+                    if (Value(args, "--save") is { } savePath) System.IO.File.WriteAllBytes(savePath, image);
                     return ApplyPass(image, major * 10 + minor, pass, upto, Array.IndexOf(args, "--dump") >= 0 && dumped++ == 0, out registers, out decline);
                 }
                 using var ptxModule = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
@@ -133,7 +177,9 @@ internal static class SassProbeTool
                     "plusvar" => i < upto && SassOpcodeTable.Decode(ptxasCode[i])?.Latency == SassLatency.Variable ? o with { Stall = Math.Min(15, o.Stall + 4) } : o,
                     "pluscontrol" => SassOpcodeTable.Decode(ptxasCode[i])?.Latency == SassLatency.Control ? o with { Stall = Math.Min(15, o.Stall + 4) } : o,
                     "plus1" => o with { Stall = Math.Min(15, o.Stall + 1) },
-                    _ when pass.StartsWith("var", StringComparison.Ordinal) => SassOpcodeTable.Decode(ptxasCode[i]) is { Latency: SassLatency.Variable } ve && (pass.Length < 5 || ve.Mnemonic == pass.Substring(5)) ? o with { Stall = int.Parse(pass.Substring(3, 2), CultureInfo.InvariantCulture) } : o,
+                    _ when VarPass.Match(pass) is { Success: true } v => SassOpcodeTable.Decode(ptxasCode[i]) is { Latency: SassLatency.Variable } ve
+                        && (v.Groups[2].Value.Length == 0 || ve.Mnemonic == v.Groups[2].Value)
+                        ? o with { Stall = int.Parse(v.Groups[1].Value, CultureInfo.InvariantCulture) } : o,
                     _ when pass.StartsWith("keep:", StringComparison.Ordinal) => SassOpcodeTable.Decode(ptxasCode[i])?.Mnemonic == pass.Substring(5) ? n with { Stall = Math.Max(n.Stall, o.Stall) } : n,
                     "keepcontrol" => SassOpcodeTable.Decode(ptxasCode[i])?.Latency == SassLatency.Control ? n with { Stall = Math.Max(n.Stall, o.Stall) } : n,
                     "upto" => i < upto ? n : n with { Stall = Math.Max(n.Stall, o.Stall) },
@@ -174,7 +220,7 @@ internal static class SassProbeTool
     {
         using var runtime = new DirectPtxRuntime();
         int major = runtime.ComputeCapabilityMajor, minor = runtime.ComputeCapabilityMinor;
-        int banks = Array.IndexOf(args, "--banks") is int bk && bk >= 0 ? int.Parse(args[bk + 1], CultureInfo.InvariantCulture) : 2;
+        int banks = Value(args, "--banks", 2);
         const int Threads = 256, Blocks = 24 * 16, Iterations = 4096;
         string ptx = BankProbePtx(major, minor);
         int[]? lowMap = null, highMap = null;
@@ -191,7 +237,7 @@ internal static class SassProbeTool
             int Score(int[] m) => FfmaBankConflicts(SassRegisterRenamer.Rename(code, m) ?? throw new InvalidOperationException(SassRegisterRenamer.LastDecline), banks);
             original = Score(map);
             int best = original;
-            var random = new Random(1442);
+            var random = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(1442);
             for (int step = 0; step < 4000 && singles.Count > 1; step++)
             {
                 int a = singles[random.Next(singles.Count)], b = singles[random.Next(singles.Count)];
@@ -335,17 +381,18 @@ internal static class SassProbeTool
     {
         using var runtime = new DirectPtxRuntime();
         int major = runtime.ComputeCapabilityMajor, minor = runtime.ComputeCapabilityMinor;
-        int size = Array.IndexOf(args, "--size") is int sz && sz >= 0 ? int.Parse(args[sz + 1], CultureInfo.InvariantCulture) : 4096;
-        string pass = Array.IndexOf(args, "--pass") is int at && at >= 0 && at + 1 < args.Length ? args[at + 1] : "control";
-        int upto = Array.IndexOf(args, "--upto") is int u && u >= 0 ? int.Parse(args[u + 1], CultureInfo.InvariantCulture) : int.MaxValue;
-        string? only = Array.IndexOf(args, "--only") is int on && on >= 0 ? args[on + 1] : null;
+        int size = Value(args, "--size", 4096);
+        string pass = Value(args, "--pass") ?? "control";
+        ValidatePass(pass);
+        int upto = Value(args, "--upto", int.MaxValue);
+        string? only = Value(args, "--only");
         var precision = Array.IndexOf(args, "--fp16") >= 0 ? PtxTensorCorePrecision.Fp16 : PtxTensorCorePrecision.Tf32;
         int elementBytes = precision == PtxTensorCorePrecision.Fp16 ? 2 : 4;
         var layout = new PtxGemmLayout(false, false);
         Console.WriteLine("SASS TENSOR-CORE GEMM sm_" + major + minor + " " + precision + " M=N=K=" + size + " (nn)");
         Console.WriteLine("configuration                              regs  identical   ptx us   sass us   ratio  ptx TFLOPS");
         var failures = new List<string>();
-        var random = new Random(1442);
+        var random = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(1442);
         long elements = (long)size * size;
         var buffers = new List<DirectPtxBuffer>();
         try
@@ -381,7 +428,7 @@ internal static class SassProbeTool
                 int registers = 0;
                 byte[] Rewrite(byte[] image)
                 {
-                    if (Array.IndexOf(args, "--save") is int sv && sv >= 0) System.IO.File.WriteAllBytes(args[sv + 1], image);
+                    if (Value(args, "--save") is { } savePath) System.IO.File.WriteAllBytes(savePath, image);
                     return ApplyPass(image, major * 10 + minor, pass, upto, Array.IndexOf(args, "--dump") >= 0, out registers, out decline);
                 }
                 using var ptxModule = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
@@ -461,15 +508,16 @@ internal static class SassProbeTool
     {
         using var runtime = new DirectPtxRuntime();
         int major = runtime.ComputeCapabilityMajor, minor = runtime.ComputeCapabilityMinor;
-        int size = Array.IndexOf(args, "--size") is int sz && sz >= 0 ? int.Parse(args[sz + 1], CultureInfo.InvariantCulture) : 2048;
-        string pass = Array.IndexOf(args, "--pass") is int at && at >= 0 && at + 1 < args.Length ? args[at + 1] : "control";
-        int upto = Array.IndexOf(args, "--upto") is int u && u >= 0 ? int.Parse(args[u + 1], CultureInfo.InvariantCulture) : int.MaxValue;
-        string? only = Array.IndexOf(args, "--only") is int on && on >= 0 ? args[on + 1] : null;
+        int size = Value(args, "--size", 2048);
+        string pass = Value(args, "--pass") ?? "control";
+        ValidatePass(pass);
+        int upto = Value(args, "--upto", int.MaxValue);
+        string? only = Value(args, "--only");
         var layout = new PtxGemmLayout(false, false);
         Console.WriteLine("SASS GEMM sm_" + major + minor + " M=N=K=" + size + " (nn)");
         Console.WriteLine("configuration                              regs  identical   ptx us   sass us   ratio  ptx TFLOPS");
         var failures = new List<string>();
-        var random = new Random(1442);
+        var random = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(1442);
         var host = new float[(long)size * size];
         var buffers = new List<DirectPtxBuffer>();
         try
@@ -495,7 +543,7 @@ internal static class SassProbeTool
                 int registers = 0;
                 byte[] Rewrite(byte[] image)
                 {
-                    if (Array.IndexOf(args, "--save") is int sv && sv >= 0) System.IO.File.WriteAllBytes(args[sv + 1], image);
+                    if (Value(args, "--save") is { } savePath) System.IO.File.WriteAllBytes(savePath, image);
                     return ApplyPass(image, major * 10 + minor, pass, upto, Array.IndexOf(args, "--dump") >= 0, out registers, out decline);
                 }
                 using var ptxModule = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
@@ -573,7 +621,7 @@ internal static class SassProbeTool
         {
             var pointers = new IntPtr[spec.ParameterCount];
             long outputBytes = spec.Output.ElementCount * spec.Output.ElementBytes;
-            var random = new Random(1442);
+            var random = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(1442);
             foreach (var binding in spec.Inputs)
             {
                 var data = new float[binding.ElementCount];

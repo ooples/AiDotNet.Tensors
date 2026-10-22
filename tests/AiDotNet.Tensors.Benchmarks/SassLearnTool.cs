@@ -44,6 +44,9 @@ internal static class SassLearnTool
         int major = int.Parse(arch, CultureInfo.InvariantCulture) / 10, minor = int.Parse(arch, CultureInfo.InvariantCulture) % 10;
 
         var lines = new List<SassLine>();
+        // The cubins THIS run compiled. The work directory is shared and kept, so an sm_86 run leaves tc_* cubins an
+        // sm_75 run would otherwise schedule with sm_75 timings and count, and a stale catalog's kernels linger too.
+        var compiled = new List<string>();
         foreach (var entry in CodegenKernelCatalog.All)
         {
             foreach (var (tag, spec) in new[] { ("verify", entry.Verify), ("bench", entry.Bench) })
@@ -57,7 +60,7 @@ internal static class SassLearnTool
                 {
                     continue;
                 }
-                lines.AddRange(Disassemble(ptx, entry.Name + "_" + tag, arch, bin, work));
+                lines.AddRange(Disassemble(ptx, entry.Name + "_" + tag, arch, bin, work, compiled));
             }
         }
         // The register-blocked GEMM (the backend's compute-bound gate kernel): every seed configuration, both layouts
@@ -68,7 +71,7 @@ internal static class SassLearnTool
             foreach (var config in AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx.PtxGemmEvolution.Seeds(layout, 2048, 2048, 2048, ccMajor: major))
             {
                 string ptx = AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx.PtxSgemmGenerator.Emit(config, layout, major, minor);
-                lines.AddRange(Disassemble(ptx, "sgemm_" + config.Name.Replace('-', '_') + "_" + layout.Name, arch, bin, work));
+                lines.AddRange(Disassemble(ptx, "sgemm_" + config.Name.Replace('-', '_') + "_" + layout.Name, arch, bin, work, compiled));
             }
         }
         // The Tensor-Core GEMM (--sass-probe --tc): every seed configuration, TF32 and FP16 (sm_80+: mma.sync, cp.async).
@@ -80,11 +83,11 @@ internal static class SassLearnTool
                 foreach (var config in AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx.PtxTensorCoreGemmEvolution.Seeds(layout, 4096, 4096, 4096, precision))
                 {
                     string ptx = AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx.PtxTensorCoreGemmGenerator.Emit(config, layout, major, minor, precision);
-                    lines.AddRange(Disassemble(ptx, "tc_" + precision.ToString().ToLowerInvariant() + "_" + config.Name.Replace('-', '_'), arch, bin, work));
+                    lines.AddRange(Disassemble(ptx, "tc_" + precision.ToString().ToLowerInvariant() + "_" + config.Name.Replace('-', '_'), arch, bin, work, compiled));
                 }
             }
         // The bank probe's FFMA-bound kernel (--sass-probe --bank): on sm_80+ its int-to-float conversion is I2FP.
-        lines.AddRange(Disassemble(SassProbeTool.BankProbePtx(major, minor), "bank_probe", arch, bin, work));
+        lines.AddRange(Disassemble(SassProbeTool.BankProbePtx(major, minor), "bank_probe", arch, bin, work, compiled));
         Console.WriteLine("SASS LEARN sm_" + arch + ": " + lines.Count + " instructions from " +
             lines.Select(l => l.Kernel).Distinct().Count() + " kernels");
         ReportGuard(lines);
@@ -96,16 +99,16 @@ internal static class SassLearnTool
         ReportVariantBits(lines);
         ReportScoreboards(lines);
         ReportTableConsistency(lines);
-        ReportScheduling(work, major * 10 + minor);
+        ReportScheduling(compiled, major * 10 + minor);
     }
 
     // The scheduler over every kernel compiled above, offline (no device needed, so sm_86 is covered from an sm_75
     // machine): how many it schedules and why it declines the rest.
-    private static void ReportScheduling(string work, int architecture)
+    private static void ReportScheduling(IReadOnlyCollection<string> cubins, int architecture)
     {
         int scheduled = 0;
         var declines = new SortedDictionary<string, int>(StringComparer.Ordinal);
-        foreach (string path in Directory.GetFiles(work, "*.cubin"))
+        foreach (string path in cubins)
         {
             var cubin = new AiDotNet.Tensors.Engines.Compilation.Codegen.Sass.SassCubin(File.ReadAllBytes(path));
             foreach (string kernel in cubin.Kernels)
@@ -370,11 +373,16 @@ internal static class SassLearnTool
         }
     }
 
-    /// <summary>Compiles PTX for the arch and returns its instructions with their encodings.</summary>
-    internal static List<SassLine> Disassemble(string ptx, string name, string arch, string bin, string work)
+    /// <summary>
+    /// Compiles PTX for the arch and returns its instructions with their encodings, adding the cubin it wrote to
+    /// <paramref name="written"/> when one is given.
+    /// </summary>
+    internal static List<SassLine> Disassemble(string ptx, string name, string arch, string bin, string work,
+        ICollection<string>? written = null)
     {
         string ptxPath = Path.Combine(work, name + ".ptx"), cubin = Path.ChangeExtension(ptxPath, ".cubin");
         File.WriteAllText(ptxPath, ptx);
+        written?.Add(cubin);
         Require(Run(Tool(bin, "ptxas"), $"-arch=sm_{arch} \"{ptxPath}\" -o \"{cubin}\""), "ptxas " + name);
         var dis = Run(Tool(bin, "nvdisasm"), $"-hex \"{cubin}\"");
         Require(dis, "nvdisasm " + name);
