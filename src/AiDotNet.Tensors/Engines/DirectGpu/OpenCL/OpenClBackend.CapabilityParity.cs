@@ -47,7 +47,7 @@ public sealed partial class OpenClBackend : IFftBackend, IGenericFftBackend, IMe
         IReadOnlyList<int> sizes, float learningRate, float beta1, float beta2, float epsilon,
         float weightDecay, int step, IGpuBuffer finiteGuard)
     {
-        if (finiteGuard is null) throw new ArgumentNullException(nameof(finiteGuard));
+        PerTensorMultiTensorOptimizer.ValidateGuard(finiteGuard);
         PerTensorMultiTensorOptimizer.ValidateAdam(parameters, gradients, firstMoments, secondMoments, sizes, epsilon, step);
         var k = _kernelCache[decoupledWeightDecay ? "adamw_update_guarded" : "adam_update_guarded"];
         var guard = ((DirectOpenClGpuBuffer)finiteGuard).Buffer.Handle;
@@ -79,7 +79,7 @@ public sealed partial class OpenClBackend : IFftBackend, IGenericFftBackend, IMe
         IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients, IReadOnlyList<int> sizes,
         float learningRate, float weightDecay, IGpuBuffer finiteGuard)
     {
-        if (finiteGuard is null) throw new ArgumentNullException(nameof(finiteGuard));
+        PerTensorMultiTensorOptimizer.ValidateGuard(finiteGuard);
         PerTensorMultiTensorOptimizer.ValidateSgd(parameters, gradients, sizes);
         var k = _kernelCache["sgd_update_guarded"];
         var guard = ((DirectOpenClGpuBuffer)finiteGuard).Buffer.Handle;

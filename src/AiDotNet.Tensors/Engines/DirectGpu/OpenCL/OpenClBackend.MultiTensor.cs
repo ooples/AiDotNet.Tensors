@@ -22,8 +22,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 kernel.SetArg(2, acc);
                 kernel.Execute1D(MultiTensorArgs.ReductionGroupSize, MultiTensorArgs.ReductionGroupSize);
             }
+            FinishSumOfSquaresDouble(sumOfSquares);
+        }
+
+        // Turns the float sum and non-finite mark in the buffer's two slots into the double they stand for.
+        internal void FinishSumOfSquaresDouble(IGpuBuffer accumulator)
+        {
             var finish = _kernelCache["sum_squares_finish_double"];
-            finish.SetArg(0, acc);
+            finish.SetArg(0, ((DirectOpenClGpuBuffer)accumulator).Buffer.Handle);
             finish.Execute1D(1, 1);
         }
 

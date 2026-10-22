@@ -45,7 +45,22 @@ internal static class PerTensorMultiTensorOptimizer
         if (step < 1) throw new ArgumentOutOfRangeException(nameof(step), "Step must be at least 1.");
         if (epsilon <= 0) throw new ArgumentOutOfRangeException(nameof(epsilon), "Epsilon must be positive.");
         for (int t = 0; t < n; t++)
+        {
+            if (parameters[t] is null || gradients[t] is null || firstMoments[t] is null || secondMoments[t] is null)
+                throw new ArgumentNullException(nameof(parameters), "Every Adam buffer is required.");
             if (sizes[t] <= 0) throw new ArgumentOutOfRangeException(nameof(sizes), "Every tensor size must be positive.");
+            if (parameters[t].Size < sizes[t] || gradients[t].Size < sizes[t]
+                || firstMoments[t].Size < sizes[t] || secondMoments[t].Size < sizes[t])
+                throw new ArgumentException("An Adam buffer is smaller than its size.", nameof(sizes));
+        }
+    }
+
+    /// <summary>The guard is a double in the first two float slots.</summary>
+    public static void ValidateGuard(IGpuBuffer finiteGuard)
+    {
+        if (finiteGuard is null) throw new ArgumentNullException(nameof(finiteGuard));
+        if (finiteGuard.Size < 2)
+            throw new ArgumentException("The finite guard needs two float slots.", nameof(finiteGuard));
     }
 
     /// <summary>

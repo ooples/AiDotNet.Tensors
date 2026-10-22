@@ -44,9 +44,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 if (_backend._context is null || _backend._defaultStream is not { } stream)
                     throw new InvalidOperationException("The OpenCL backend has no command queue.");
 
-                // The previous copy into the same bytes is ordered ahead of this one on the in-order queue; its event
-                // is released, not waited on.
-                ReleaseEvent();
                 var memories = DirectOpenClSubmission.GetDirectSubmissionMemories(buffer.Buffer);
                 try
                 {
@@ -63,6 +60,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     }
                     if (err != OpenClNativeBindings.CL_SUCCESS)
                         throw new InvalidOperationException($"clEnqueueReadBuffer(readback) failed: {err}");
+                    // The previous copy into the same bytes is ordered ahead of this one on the in-order queue; its
+                    // event is released, not waited on, and only once the new copy is queued.
+                    ReleaseEvent();
                     _event = transferEvent;
                     // A driver may hold enqueued commands until a flush: without one, Read would be the first push.
                     OpenClNativeBindings.Flush(stream.Handle);
@@ -82,10 +82,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 if (!_queued) throw new InvalidOperationException("Nothing was queued for readback.");
                 if (_event != IntPtr.Zero)
                 {
+                    // A failed wait keeps the event, so a retry or Dispose still waits before trusting the bytes.
                     int err = OpenClNativeBindings.WaitForEvents(1, new[] { _event });
-                    ReleaseEvent();
                     if (err != OpenClNativeBindings.CL_SUCCESS)
                         throw new InvalidOperationException($"clWaitForEvents(readback) failed: {err}");
+                    ReleaseEvent();
                 }
                 _unread = false;
                 return new ReadOnlySpan<byte>(_host, 0, _bytes);

@@ -68,9 +68,40 @@ public sealed class OpenClDeviceFiniteGuardTests
         double got = SumOfSquares(backend, tensors);
         Assert.True(Math.Abs(got - expected) <= 1e-5 * expected, $"{got} vs {expected}");
         Assert.Equal(0.0, SumOfSquares(backend, new float[16]));
-        // A subnormal float sum converts exactly.
-        float tiny = 1e-23f;
-        Assert.Equal((double)(tiny * tiny), SumOfSquares(backend, new[] { tiny }));
+    }
+
+    [SkippableTheory]
+    [InlineData(0x00000001u)]   // the smallest subnormal float
+    [InlineData(0x0000b2c5u)]   // a subnormal with a mid-word leading bit
+    [InlineData(0x007fffffu)]   // the largest subnormal float
+    [InlineData(0x00800000u)]   // the smallest normal float
+    [InlineData(0x3f9e0419u)]   // a normal float
+    [InlineData(0x00000000u)]   // zero
+    public void The_finish_converts_every_float_sum_exactly(uint bits)
+    {
+        // Seeded bits, not a device multiply: a device that flushes subnormal products to zero would never reach the
+        // subnormal branch through the sum itself.
+        using var backend = BackendOrSkip();
+        var seed = new float[2];
+        Buffer.BlockCopy(new[] { bits, 0u }, 0, seed, 0, sizeof(ulong));
+        using var acc = backend.AllocateBuffer(seed);
+        backend.FinishSumOfSquaresDouble(acc);
+        backend.Synchronize();
+        float expected = BitConverter.ToSingle(BitConverter.GetBytes(bits), 0);
+        Assert.Equal((double)expected, ReadDouble(backend, acc));
+    }
+
+    [SkippableFact]
+    public void The_finish_turns_a_float_overflow_into_the_largest_double_and_a_mark_into_nan()
+    {
+        using var backend = BackendOrSkip();
+        using var overflow = backend.AllocateBuffer(new[] { float.PositiveInfinity, 0f });
+        using var marked = backend.AllocateBuffer(new[] { 1f, BitConverter.ToSingle(BitConverter.GetBytes(1u), 0) });
+        backend.FinishSumOfSquaresDouble(overflow);
+        backend.FinishSumOfSquaresDouble(marked);
+        backend.Synchronize();
+        Assert.Equal(double.MaxValue, ReadDouble(backend, overflow));
+        Assert.True(double.IsNaN(ReadDouble(backend, marked)));
     }
 
     [SkippableFact]
