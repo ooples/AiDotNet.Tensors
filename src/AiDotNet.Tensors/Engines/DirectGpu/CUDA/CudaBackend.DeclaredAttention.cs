@@ -231,6 +231,52 @@ public sealed partial class CudaBackend
         return true;
     }
 
+    // ---- paged attention (#890 phase 4d) --------------------------------------------------------------------------
+
+    private static readonly string[] s_pagedDecodeNames =
+        { "block_table", "q", "kcache", "vcache", "key_bias", "out" };
+
+    private static readonly Func<DeclaredKey, CodegenProgram> s_buildPagedDecode =
+        key => CodegenBackendPrograms.PagedAttentionDecode(key.D0, key.D1, key.D2, key.D3, key.D4, key.D5, key.Epsilon);
+
+    /// <summary>
+    /// The key of a paged decode: heads, kvHeads, headDim, blockSize, pages, the cache's block count, and the scale.
+    /// </summary>
+    internal static DeclaredKey PagedAttentionDecodeKey(int heads, int kvHeads, int headDim, int blockSize, int pages,
+        int blocks, float scale) =>
+        new(DeclaredFamily.PagedAttentionDecode, heads, kvHeads, headDim, blockSize, scale, 0, name: null,
+            d4: pages, d5: blocks);
+
+    /// <summary>
+    /// Paged attention's decode step through its declared program, in CudaBackend.PagedAttentionDecode's contract.
+    /// <paramref name="keyBias"/> is [pages * blockSize]: 0 for a key inside the sequence and the masked logit for
+    /// one in the last page's unused tail, which the backend builds because comparing a key against seqLen is
+    /// outside the IR. False -- nothing launched -- when the route is off or the shape declines.
+    /// </summary>
+    internal bool TryDeclaredPagedAttentionDecode(IGpuBuffer blockTable, IGpuBuffer query, IGpuBuffer keyCache,
+        IGpuBuffer valueCache, IGpuBuffer keyBias, IGpuBuffer output, int heads, int kvHeads, int headDim,
+        int blockSize, int pages, int blocks, float scale)
+    {
+        if (heads <= 0 || kvHeads <= 0 || headDim <= 0 || blockSize <= 0 || pages <= 0 || blocks <= 0) return false;
+        if (heads % kvHeads != 0) return false;
+        long cacheElements = (long)blocks * blockSize * kvHeads * headDim;
+        if (blockTable.Size < pages || (long)query.Size < (long)heads * headDim ||
+            keyCache.Size < cacheElements || valueCache.Size < cacheElements ||
+            (long)keyBias.Size < (long)pages * blockSize || (long)output.Size < (long)heads * headDim)
+            return false;
+        return TryRunDeclaredProgram(
+            PagedAttentionDecodeKey(heads, kvHeads, headDim, blockSize, pages, blocks, scale), s_buildPagedDecode,
+            s_pagedDecodeNames,
+            new DeclaredBindings(blockTable, query, keyCache, valueCache, keyBias, output));
+    }
+
+    /// <summary>Paged attention's decode step as a resident-program stage, in the same contract.</summary>
+    internal DeclaredResidentStage PagedAttentionDecodeStage(IGpuBuffer blockTable, IGpuBuffer query,
+        IGpuBuffer keyCache, IGpuBuffer valueCache, IGpuBuffer keyBias, IGpuBuffer output, int heads, int kvHeads,
+        int headDim, int blockSize, int pages, int blocks, float scale) =>
+        new(PagedAttentionDecodeKey(heads, kvHeads, headDim, blockSize, pages, blocks, scale), s_buildPagedDecode,
+            s_pagedDecodeNames, new DeclaredBindings(blockTable, query, keyCache, valueCache, keyBias, output));
+
     // The cached causal bias for (seqQ, seqK), created on first use; null when first needed under a capture or when
     // it does not fit the scratch budget, with the reason in decline so the caller can record it. The caller holds
     // _directPtxLock.

@@ -50,6 +50,12 @@ internal enum DeclaredFamily
     Convolution,
     IndexSelect,
     TakeAlongDim,
+
+    /// <summary>Paged attention's decode step: the KV cache reached through a block table (#890 phase 4d).</summary>
+    PagedAttentionDecode,
+
+    /// <summary>The deterministic scatter-add, and the segment sum that is the same operator (#890 phase 4e).</summary>
+    ScatterAddDeterministic,
 }
 
 /// <summary>One declared program: its family and shape (unused dimensions are 0).</summary>
