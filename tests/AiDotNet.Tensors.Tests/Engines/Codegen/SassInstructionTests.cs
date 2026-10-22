@@ -381,4 +381,134 @@ public class SassInstructionTests
         Assert.True(scheduled[0].Control.Stall >= 5);
         Assert.Equal(4, SassOpcodeTable.Decode(Lds128)?.Writes.Single().Width);
     }
+
+
+    // BRA to instruction `target` placed at index `at` (the offset counts from the next instruction).
+    private static SassInstruction Branch(int at, int target)
+    {
+        var bra = new SassInstruction(0x0000000000007947UL, 0x000fea0003800000UL);
+        bra.SetBits(32, 50, (ulong)((target - (at + 1)) * 16L) & ((1UL << 50) - 1));
+        return bra;
+    }
+
+    private static SassInstruction WithRd(SassInstruction instruction, int rd)
+    {
+        instruction.SetRegister(SassInstruction.RdField, rd);
+        return instruction;
+    }
+
+    // FFMA Rd, Ra, Rb, Rc (register form).
+    private static SassInstruction FfmaOf(int d, int a, int b, int c)
+    {
+        var ffma = Ffma;
+        ffma.SetRegister(SassInstruction.RdField, d);
+        ffma.SetRegister(SassInstruction.RaField, a);
+        ffma.SetRegister(SassInstruction.RbField, b);
+        ffma.SetRegister(SassInstruction.RcField, c);
+        return ffma;
+    }
+
+    /// <summary>
+    /// A variable-latency instruction gets a read scoreboard only when something can overwrite its sources: a later
+    /// writer, or an earlier one inside a loop around it. The overwrite waits on that scoreboard.
+    /// </summary>
+    [Fact]
+    public void AReadScoreboardGuardsOnlySourcesThatAreOverwritten()
+    {
+        var leaR76 = WithRd(Lea, 76);   // overwrites LDS.U.128 R48, [R76]'s address
+        var alone = SassScheduler.RecomputeControl(new[] { Lds128, Exit })
+            ?? throw new InvalidOperationException(SassScheduler.LastDecline);
+        Assert.Equal(SassInstruction.NoScoreboard, alone[0].Control.ReadScoreboard);
+
+        var later = SassScheduler.RecomputeControl(new[] { Lds128, leaR76, Exit })
+            ?? throw new InvalidOperationException(SassScheduler.LastDecline);
+        int board = later[0].Control.ReadScoreboard;
+        Assert.NotEqual(SassInstruction.NoScoreboard, board);
+        Assert.NotEqual(0, later[1].Control.WaitMask & (1 << board));
+
+        // LEA R76 at 0, the LDS at 1, a branch back to 0: the next iteration's LEA overwrites the address.
+        var loop = SassScheduler.RecomputeControl(new[] { leaR76, Lds128, Branch(2, 0), Exit })
+            ?? throw new InvalidOperationException(SassScheduler.LastDecline);
+        Assert.NotEqual(SassInstruction.NoScoreboard, loop[1].Control.ReadScoreboard);
+        var straight = SassScheduler.RecomputeControl(new[] { leaR76, Lds128, Branch(2, 3), Exit })
+            ?? throw new InvalidOperationException(SassScheduler.LastDecline);
+        Assert.Equal(SassInstruction.NoScoreboard, straight[1].Control.ReadScoreboard);
+    }
+
+    /// <summary>
+    /// No scoreboard counts more than its depth (16) of outstanding operations: 120 independent S2Rs fill all six
+    /// boards, and each further one first waits on its board.
+    /// </summary>
+    [Fact]
+    public void NoScoreboardHoldsMoreThanItsDepth()
+    {
+        var code = Enumerable.Range(0, 120).Select(r => WithRd(S2R, r)).Append(Exit).ToArray();
+        var scheduled = SassScheduler.RecomputeControl(code) ?? throw new InvalidOperationException(SassScheduler.LastDecline);
+        var outstanding = new int[6];
+        foreach (var instruction in scheduled)
+        {
+            var control = instruction.Control;
+            for (int s = 0; s < 6; s++) if ((control.WaitMask >> s & 1) != 0) outstanding[s] = 0;
+            if (control.WriteScoreboard != SassInstruction.NoScoreboard)
+                Assert.True(++outstanding[control.WriteScoreboard] <= 16, "scoreboard " + control.WriteScoreboard + " overfilled");
+        }
+        Assert.Contains(scheduled.Take(120), i => i.Control.WaitMask != 0);
+    }
+
+    /// <summary>
+    /// cp.async: the scoreboard DEPBAR.LE names is the copies' alone. LDGDEPBAR commits to it, nothing else sets it,
+    /// and a block boundary does not wait on it. DEPBARs naming two scoreboards are declined.
+    /// </summary>
+    [Fact]
+    public void TheCopyScoreboardIsReserved()
+    {
+        var ldgsts = new SassInstruction(0x0000000002047fae, 0x000fe2000b800000UL);   // LDGSTS [R4], [R2.64]
+        var commit = new SassInstruction(0x00000000000079afUL, 0x000fe20000000000UL);   // LDGDEPBAR
+        var depbar = new SassInstruction(0x000000000000791aUL, 0x000fe20000000000UL);   // DEPBAR.LE SB1, 0x0
+        depbar.SetBits(44, 3, 1);
+        var code = new[] { ldgsts, commit }.Concat(Enumerable.Range(10, 8).Select(r => WithRd(S2R, r)))
+            .Concat(new[] { depbar, Exit }).ToArray();
+        var scheduled = SassScheduler.RecomputeControl(code, 86) ?? throw new InvalidOperationException(SassScheduler.LastDecline);
+        Assert.Equal(1, scheduled[1].Control.WriteScoreboard);
+        for (int i = 0; i < scheduled.Length; i++)
+        {
+            if (i != 1) Assert.NotEqual(1, scheduled[i].Control.WriteScoreboard);
+            Assert.NotEqual(1, scheduled[i].Control.ReadScoreboard);
+            Assert.Equal(0, scheduled[i].Control.WaitMask & 0b10);
+        }
+
+        var other = depbar;
+        other.SetBits(44, 3, 2);
+        Assert.Null(SassScheduler.RecomputeControl(code.Append(other).ToArray(), 86));
+        Assert.Contains("cp.async", SassScheduler.LastDecline);
+    }
+
+    /// <summary>
+    /// The FFMA reorder moves a run of independent FFMAs (here the bank-conflicted first one later) but never across a
+    /// branch target: a loop entering mid-run would skip or repeat different FFMAs.
+    /// </summary>
+    [Fact]
+    public void TheFfmaReorderKeepsBranchTargetsInPlace()
+    {
+        var run = new[] { FfmaOf(9, 2, 4, 6), FfmaOf(11, 3, 4, 11), FfmaOf(13, 3, 6, 13), FfmaOf(15, 5, 8, 15) };
+        var free = SassFfmaReorder.Reorder(run.Append(Exit).ToArray());
+        Assert.NotEqual(run[0].Low, free[0].Low);
+        Assert.Equal(run.Select(i => i.Low).OrderBy(x => x), free.Take(4).Select(i => i.Low).OrderBy(x => x));
+
+        var entered = run.Concat(new[] { Branch(4, 2), Exit }).ToArray();
+        var kept = SassFfmaReorder.Reorder(entered);
+        Assert.Equal(entered.Select(i => i.Low), kept.Select(i => i.Low));
+    }
+
+    /// <summary>A malformed image is refused with ArgumentException, not an index fault.</summary>
+    [Fact]
+    public void AMalformedCubinIsRefused()
+    {
+        var image = K1Cubin();
+        var badNames = (byte[])image.Clone();
+        badNames[0x3e] = 0xff;
+        badNames[0x3f] = 0x7f;   // section-name table index past the section count
+        Assert.Throws<ArgumentException>(() => new SassCubin(badNames));
+        Assert.Throws<ArgumentException>(() => new SassCubin(image.Take(image.Length / 2).ToArray()));
+    }
 }

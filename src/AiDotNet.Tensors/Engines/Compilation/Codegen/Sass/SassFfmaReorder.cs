@@ -27,7 +27,7 @@ public static class SassFfmaReorder
 
     /// <summary>
     /// <paramref name="code"/> with each run of at least <paramref name="minimumRun"/> consecutive, unguarded,
-    /// independent register-form FFMAs reordered and its reuse flags recomputed; other instructions are untouched. The
+    /// independent register-form FFMAs that no branch enters mid-run reordered and its reuse flags recomputed; other instructions are untouched. The
     /// control words' stalls inside a run are set to 1 (the scheduler recomputes them).
     /// </summary>
     public static SassInstruction[] Reorder(IReadOnlyList<SassInstruction> code, int banks = 2, int minimumRun = 4)
@@ -35,11 +35,13 @@ public static class SassFfmaReorder
         if (code is null) throw new ArgumentNullException(nameof(code));
         var result = new SassInstruction[code.Count];
         for (int i = 0; i < code.Count; i++) result[i] = code[i];
+        // A branch target splits a run: control entering mid-run must find the same instructions after it.
+        var targets = SassScheduler.BranchTargets(code);
         int start = 0;
         while (start < code.Count)
         {
             int end = start;
-            while (end < code.Count && IsCandidate(code[end])) end++;
+            while (end < code.Count && IsCandidate(code[end]) && (end == start || !targets.Contains(end))) end++;
             if (end - start >= minimumRun && Independent(code, start, end))
             {
                 ReorderRun(result, start, end, banks);

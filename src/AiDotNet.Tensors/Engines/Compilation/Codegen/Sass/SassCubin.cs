@@ -35,11 +35,15 @@ public sealed class SassCubin
         int entrySize = ReadU16(0x3a), count = ReadU16(0x3c), names = ReadU16(0x3e);
         if (sectionHeaders <= 0 || entrySize < 64 || sectionHeaders + (long)entrySize * count > _image.Length)
             throw new ArgumentException("The section header table lies outside the image.", nameof(image));
+        if (names >= count) throw new ArgumentException("The section-name table index is out of range.", nameof(image));
         long nameTable = (long)ReadU64(sectionHeaders + (long)names * entrySize + 0x18);
         for (int i = 0; i < count; i++)
         {
             long header = sectionHeaders + (long)i * entrySize;
-            string name = ReadString(nameTable + ReadU32(header));
+            long nameAt = nameTable + ReadU32(header);
+            if (nameTable < 0 || nameAt >= _image.Length)
+                throw new ArgumentException("Section " + i + "'s name lies outside the image.", nameof(image));
+            string name = ReadString(nameAt);
             _sections.Add(new Section(name, ReadU32(header + 4), header + 0x2c, (long)ReadU64(header + 0x18),
                 (long)ReadU64(header + 0x20), ReadU32(header + 0x2c)));
         }
@@ -108,13 +112,16 @@ public sealed class SassCubin
         foreach (var section in _sections)
         {
             if (section.Name != ".nv.info") continue;
+            if (section.Offset < 0 || section.Size < 0 || section.Offset + section.Size > _image.Length)
+                throw new InvalidOperationException("Malformed .nv.info section.");
             // Attributes: format byte, attribute byte, then for EIFMT_SVAL a 16-bit size and the payload
             // (symbol index, value) for REGCOUNT.
             for (long at = section.Offset; at + 4 <= section.Offset + section.Size;)
             {
                 byte format = _image[at], attribute = _image[at + 1];
                 int size = format == EifmtSval ? ReadU16(at + 2) : 0;
-                if (format == EifmtSval && attribute == EiattrRegCount && size >= 8 && ReadU32(at + 4) == symbol)
+                if (format == EifmtSval && attribute == EiattrRegCount && size >= 8 &&
+                    at + 4 + size <= section.Offset + section.Size && ReadU32(at + 4) == symbol)
                 {
                     WriteU32(at + 8, (uint)registers);
                     found = true;
@@ -131,7 +138,8 @@ public sealed class SassCubin
         foreach (var section in _sections)
             if (section.Name == ".text." + kernel)
             {
-                if (section.Size % InstructionBytes != 0 || section.Offset + section.Size > _image.Length)
+                if (section.Size % InstructionBytes != 0 || section.Offset < 0 || section.Size < 0 ||
+                    section.Offset + section.Size > _image.Length)
                     throw new InvalidOperationException("Malformed code section for " + kernel + ".");
                 return section;
             }

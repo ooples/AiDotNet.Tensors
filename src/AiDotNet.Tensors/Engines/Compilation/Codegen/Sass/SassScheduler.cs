@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // The own SASS backend's scheduler (#1442): it owns the control word ptxas would otherwise choose. Given a kernel's
 // instructions in issue order, it recomputes every stall count, scoreboard assignment and wait mask from
 // SassOpcodeTable's view of what each instruction reads and writes:
@@ -70,8 +70,8 @@ public static class SassScheduler
     //
     // These delays and the guard latency are per architecture. sm_75's were measured on the device. sm_86's are the
     // largest ptxas leaves over the catalog and GEMM kernels compiled for it (--sass-learn --arch 86: BAR 6, DEPBAR 4,
-    // LDGDEPBAR 4, a guard read 13 cycles after its compare at the closest) and are floors, not yet run on an sm_86
-    // device. Any other architecture is declined.
+    // LDGDEPBAR 4, a guard read 13 cycles after its compare at the closest) and are floors; with the rules below they
+    // ran the catalog and GEMM kernels bit-identically on an RTX 3080. Any other architecture is declined.
     //
     // Pipe issue spacing (sm_86): a warp's instruction occupies its execution pipe for several cycles (a 16-lane pipe
     // takes two for 32 threads), and the next instruction on the same pipe must issue after it. ptxas never leaves
