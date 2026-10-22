@@ -2914,6 +2914,35 @@ public partial class DirectGpuTensorEngine
             using var gammaBuffer = GetOrAllocateBuffer(backend, gamma);
             using var meanBuffer = GetOrAllocateBuffer(backend, mean);
             using var varianceBuffer = GetOrAllocateBuffer(backend, variance);
+            // #890 phase 4a: the declared program at ANY shape, before the shape-locked unit64 cell and before the
+            // ~30 elementwise launches below. It takes rstd, which the declared forward writes, where this contract
+            // carries the true variance, so epsilon folds in here over batch*groups values.
+            if (backend is IDirectPtxBackend declaredBackend)
+            {
+                using var declaredRstd = backend.AllocateBuffer(groupCount);
+                backend.AddScalar(varianceBuffer.Buffer, declaredRstd, (float)epsilon, groupCount);
+                backend.Sqrt(declaredRstd, declaredRstd, groupCount);
+                backend.Reciprocal(declaredRstd, declaredRstd, groupCount);
+                using var declaredGradInput = AllocateOutputBuffer(backend, input.Length);
+                using var declaredGradGamma = AllocateOutputBuffer(backend, channels);
+                using var declaredGradBeta = AllocateOutputBuffer(backend, channels);
+                if (declaredBackend.TryDeclaredGroupNormBackward(
+                        gradient.Buffer, inputBuffer.Buffer, gammaBuffer.Buffer, meanBuffer.Buffer, declaredRstd,
+                        declaredGradInput.Buffer, declaredGradGamma.Buffer, declaredGradBeta.Buffer,
+                        batch, numGroups, channels, spatial))
+                {
+                    gradGamma = DeferTensorResult<T>(
+                        backend, declaredGradGamma.Buffer, channels, gamma.Shape.ToArray());
+                    declaredGradGamma.RelinquishOwnership();
+                    gradBeta = DeferTensorResult<T>(
+                        backend, declaredGradBeta.Buffer, channels, gamma.Shape.ToArray());
+                    declaredGradBeta.RelinquishOwnership();
+                    var declaredInput = DeferTensorResult<T>(
+                        backend, declaredGradInput.Buffer, input.Length, input.Shape.ToArray());
+                    declaredGradInput.RelinquishOwnership();
+                    return declaredInput;
+                }
+            }
             if (backend is IDirectPtxBackend cudaBackend &&
                 batch == Engines.DirectGpu.CUDA.Ptx.PtxChannelNormalizationD64Kernel.GroupNormBatch &&
                 numGroups == Engines.DirectGpu.CUDA.Ptx.PtxChannelNormalizationD64Kernel.GroupNormGroups &&

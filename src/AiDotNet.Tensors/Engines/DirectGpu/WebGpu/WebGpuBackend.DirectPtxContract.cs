@@ -33,5 +33,8 @@ public sealed partial class WebGpuBackend : IDirectPtxBackend
 
     bool IDirectPtxBackend.TryDirectPtxGroupNormBackwardUnit64(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer mean, IGpuBuffer variance, IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta, int batch, int groups, int channels, int spatialSize, float epsilon)
         => false;
+
+    bool IDirectPtxBackend.TryDeclaredGroupNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer mean, IGpuBuffer rstd, IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta, int batch, int groups, int channels, int spatialSize)
+        => false;
 }
 #endif

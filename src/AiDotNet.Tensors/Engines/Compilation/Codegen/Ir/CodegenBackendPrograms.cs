@@ -562,6 +562,15 @@ public static class CodegenBackendPrograms
         Prepend(CodegenFusedStatistics.RmsNormBackward(rows, columns),
             RowPass("rmsnorm_bwd_rstd", new[] { rows }, new[] { "rms" }, "rstd", Op(0), CodegenActivationKind.Reciprocal));
 
+    /// <summary>
+    /// CudaBackend's GroupNorm backward over [batch, channels, spatial]: sources dy, x, gamma, mean, rstd (each
+    /// statistic [batch, groups], rstd = 1/sqrt(var + eps) as the forward saves it); outputs dx, dgamma, dbeta.
+    /// </summary>
+    public static CodegenProgram GroupNormBackward(int batch, int channels, int groups, int spatial) =>
+        Prepend(CodegenFusedStatistics.GroupNormBackward(batch, channels, groups, spatial),
+            RowPass("groupnorm_bwd_negmean", new[] { batch, groups }, new[] { "mean" }, "negmean",
+                CodegenExpr.Negate(Op(0))));
+
     /// <summary>CudaBackend.BatchNormBackward: sources dy, x, gamma, mean, rstd; outputs dx, dgamma, dbeta.</summary>
     public static CodegenProgram BatchNorm2DBackward(int batch, int channels, int height, int width) =>
         Prepend(CodegenFusedStatistics.BatchNorm2DBackward(batch, channels, height, width),

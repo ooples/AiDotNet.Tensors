@@ -37,6 +37,13 @@ internal interface IDirectPtxBackend : IFp16ActivationBackend
     /// <summary>The direct-PTX TryDirectPtxAddGroupNormUnit64 route.</summary>
     bool TryDirectPtxAddGroupNormUnit64(IGpuBuffer left, IGpuBuffer right, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta, int batch, int groups, int channels, int spatialSize, float epsilon);
 
+    /// <summary>
+    /// GroupNorm backward through its declared program (#890 phase 4a), at any shape. <c>rstd</c> is
+    /// 1/sqrt(var + eps), the slot the declared forward writes, not the variance. False declines, and the caller
+    /// composes the gradient from elementwise kernels.
+    /// </summary>
+    bool TryDeclaredGroupNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer mean, IGpuBuffer rstd, IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta, int batch, int groups, int channels, int spatialSize);
+
     /// <summary>The direct-PTX TryDirectPtxGroupNormBackwardUnit64 route.</summary>
     bool TryDirectPtxGroupNormBackwardUnit64(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer mean, IGpuBuffer variance, IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta, int batch, int groups, int channels, int spatialSize, float epsilon);
 }

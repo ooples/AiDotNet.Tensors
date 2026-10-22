@@ -30,6 +30,7 @@ internal enum DeclaredFamily
     LayerNormBackward,
     RmsNormBackward,
     BatchNormBackward,
+    GroupNormBackward,
     Softmax,
     SoftmaxBackward,
 
@@ -621,6 +622,27 @@ public sealed partial class CudaBackend
         return TryRunDeclaredProgram(BatchNormBackwardKey(batch, channels, spatialSize), s_buildBatchNormBackward,
             s_normBackwardNames, new DeclaredBindings(gradOutput, input, gamma, saveMean, saveInvVar, gradInput,
                 gradGamma, gradBeta));
+    }
+
+    private static readonly Func<DeclaredKey, CodegenProgram> s_buildGroupNormBackward =
+        key => CodegenBackendPrograms.GroupNormBackward(key.D0, key.D1, key.D2, key.D3);
+
+    internal static DeclaredKey GroupNormBackwardKey(int batch, int channels, int numGroups, int spatialSize) =>
+        new(DeclaredFamily.GroupNormBackward, batch, channels, numGroups, spatialSize, 0, 0);
+
+    /// <summary>
+    /// GroupNorm backward through its declared program. <paramref name="saveInvVar"/> is the forward's slot,
+    /// 1/sqrt(var + eps), not the variance: the program folds epsilon in nowhere else. False declines the shape, and
+    /// the caller composes the gradient from elementwise kernels as it did before this route existed.
+    /// </summary>
+    internal bool TryDeclaredGroupNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
+        IGpuBuffer saveMean, IGpuBuffer saveInvVar, IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
+        int batch, int numGroups, int channels, int spatialSize)
+    {
+        if (batch <= 0 || numGroups <= 0 || channels <= 0 || spatialSize <= 0 || channels % numGroups != 0) return false;
+        return TryRunDeclaredProgram(GroupNormBackwardKey(batch, channels, numGroups, spatialSize),
+            s_buildGroupNormBackward, s_normBackwardNames, new DeclaredBindings(gradOutput, input, gamma, saveMean,
+                saveInvVar, gradInput, gradGamma, gradBeta));
     }
 
     private static readonly string[] s_rmsNormBackwardNames = { "dy", "x", "gamma", "rms", "dx", "dgamma" };

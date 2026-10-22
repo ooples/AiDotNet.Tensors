@@ -91,6 +91,8 @@ internal static class KernelRouteStaticTool
                 new[] { "rmsnorm_backward", "rmsnorm_grad_gamma" }),
             new Family("BatchNormBackward 32x64x3136", CodegenBackendPrograms.BatchNorm2DBackward(32, 64, 3136, 1), "normalization",
                 new[] { "batchnorm_backward" }),
+            new Family("GroupNormBackward 32x64/8x1024", CodegenBackendPrograms.GroupNormBackward(32, 64, 8, 1024), "normalization",
+                new[] { "groupnorm_backward", "groupnorm_backward_sums" }),
             new Family("Softmax 8192x1024", CodegenFusedStatistics.Softmax(8192, 1024), "activation", new[] { "softmax" }),
             new Family("SoftmaxBackward 8192x1024", CodegenFusedStatistics.SoftmaxBackward(8192, 1024), "neuralnet", new[] { "softmax_backward" }),
             // The GEMM slot's declared schedules at shapes where they won, against the narrow kernel the entry ran there.
