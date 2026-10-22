@@ -9966,9 +9966,19 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         IntPtr gvPtr = gradValue.Handle;
 
         // #1528: the tiled backward (atomic-free, so deterministic too) wherever its tile fits the head dimension.
+        // Each tile's kernels are asked for by their literal names, one branch per tile emitted by
+        // CudaAttentionKernels.TiledBackwardSource. A composed name ("..._t" + tile) is invisible to the kernel-lookup
+        // integrity guard (#775) -- it reads the literal after TryGetValue -- so a tile this file accepted but the
+        // source never emitted would miss here and only show up as a silent fallback on a CUDA device.
         int tile = Kernels.CudaAttentionKernels.TiledBackwardTile(headDim);
-        if (tile > 0 && _kernelCache.TryGetValue("flash_attention_backward_kv_t" + tile, out var tiledKv)
-            && _kernelCache.TryGetValue("flash_attention_backward_q_t" + tile, out var tiledQ))
+        IntPtr tiledKv = IntPtr.Zero, tiledQ = IntPtr.Zero;
+        bool tiled = tile == 32
+            ? _kernelCache.TryGetValue("flash_attention_backward_kv_t32", out tiledKv)
+              && _kernelCache.TryGetValue("flash_attention_backward_q_t32", out tiledQ)
+            : tile == 16
+              && _kernelCache.TryGetValue("flash_attention_backward_kv_t16", out tiledKv)
+              && _kernelCache.TryGetValue("flash_attention_backward_q_t16", out tiledQ);
+        if (tiled)
         {
             uint shared = (uint)Kernels.CudaAttentionKernels.TiledBackwardSharedBytes(tile, headDim);
             uint bhCount = (uint)(batch * numHeads);
