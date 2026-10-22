@@ -123,17 +123,19 @@ public class CodegenRatchetTests
     [Fact]
     public void StaticMetrics_MatchTheCheckedInBaseline()
     {
+        // Program passes are ratcheted too: a normalisation is three kernels, and a register
+        // or load regression in its affine pass is as real as one in a convolution.
         var actual = new Dictionary<string, Metrics>(StringComparer.Ordinal);
-        foreach (var entry in CodegenKernelCatalog.All)
-            actual[entry.Name] = Measure(entry.Bench);
+        foreach (var (name, spec) in CodegenKernelCatalog.RatchetedKernels())
+            actual[name] = Measure(spec);
 
         string path = BaselinePath();
         if (!File.Exists(path))
         {
             var seed = new StringBuilder();
             seed.AppendLine("kernel\tptx_lines\tloads\tvector_loads\telided_guards\tlooped_axes");
-            foreach (var entry in CodegenKernelCatalog.All)
-                seed.AppendLine(actual[entry.Name].ToRow(entry.Name));
+            foreach (var (name, _) in CodegenKernelCatalog.RatchetedKernels())
+                seed.AppendLine(actual[name].ToRow(name));
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
             File.WriteAllText(path, seed.ToString());
             Assert.Fail("No baseline existed; one was written to " + path +
@@ -183,17 +185,17 @@ public class CodegenRatchetTests
     [Fact]
     public void Emission_IsByteIdenticalAcrossRunsAndInstances()
     {
-        foreach (var entry in CodegenKernelCatalog.All)
+        foreach (var (name, spec) in CodegenKernelCatalog.RatchetedKernels())
         {
             var shared = new PtxAffineEmitter();
-            string first = shared.Emit(entry.Bench, Major, Minor);
-            string second = shared.Emit(entry.Bench, Major, Minor);
+            string first = shared.Emit(spec, Major, Minor);
+            string second = shared.Emit(spec, Major, Minor);
             Assert.True(string.Equals(first, second, StringComparison.Ordinal),
-                entry.Name + ": re-emitting from the same instance changed the PTX.");
+                name + ": re-emitting from the same instance changed the PTX.");
 
-            string fromFresh = new PtxAffineEmitter().Emit(entry.Bench, Major, Minor);
+            string fromFresh = new PtxAffineEmitter().Emit(spec, Major, Minor);
             Assert.True(string.Equals(first, fromFresh, StringComparison.Ordinal),
-                entry.Name + ": a fresh emitter produced different PTX.");
+                name + ": a fresh emitter produced different PTX.");
         }
     }
 

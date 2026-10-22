@@ -55,31 +55,94 @@ internal static class KernelConveyorTool
     /// </remarks>
     private static bool _forceInputStaging;
 
+    /// <summary>
+    /// Runs row-shaped programs as their separate passes instead of one fused kernel, for
+    /// a paired comparison of the two lowerings.
+    /// </summary>
+    private static bool _noRowFusion;
+
+    /// <summary>
+    /// Added to every value of a program's "x" source (--x-offset). Data far from zero is what
+    /// exposes cancellation in a statistic, which data centred on zero never does.
+    /// </summary>
+    private static double _xOffset;
+
     internal static void Run(string stage, string[] args)
     {
         _forceInputStaging = args.Contains("--input-staging", StringComparer.Ordinal);
+        _noRowFusion = args.Contains("--no-row-fusion", StringComparer.Ordinal);
+        _xOffset = ValueOf(args, "--x-offset") is string xo
+            ? double.Parse(xo, CultureInfo.InvariantCulture) : 0.0;
         string selector = KernelToolArgs.Selector(args);
+        if (stage == "static-rows")
+        {
+            StaticRows();
+            return;
+        }
         var entries = Select(selector);
-        if (entries.Count == 0)
+        var programs = SelectPrograms(selector);
+        // Program entries are carried by verify and bench; the other stages are per-kernel.
+        bool programStage = stage is "verify" or "bench" or "incumbent";
+        if (entries.Count == 0 && (!programStage || programs.Count == 0))
         {
             Console.WriteLine("No catalog entry matches '" + selector + "'. Known kernels:");
             foreach (var e in CodegenKernelCatalog.All)
                 Console.WriteLine("  " + e.Name.PadRight(32) + e.Summary);
+            foreach (var e in CodegenKernelCatalog.Programs)
+                Console.WriteLine("  " + e.Name.PadRight(32) + e.Summary + " (program)");
             KernelToolArgs.RequireNonEmptySelection(
                 selector, entries.Count, "kernel-" + stage);
         }
 
         switch (stage)
         {
-            case "verify": Verify(entries); break;
+            case "verify":
+                if (entries.Count != 0) Verify(entries);
+                if (programs.Count != 0) VerifyPrograms(programs);
+                break;
             case "release": Release(entries, args); break;
-            case "bench": Bench(entries, args); break;
+            case "bench":
+                if (entries.Count != 0) Bench(entries, args);
+                if (programs.Count != 0) BenchPrograms(programs);
+                break;
+            case "incumbent":
+                Incumbent(programs);
+                break;
             case "vector-ab": VectorAb(entries); break;
             case "dump": Dump(entries, args); break;
             case "coarsen-ab": CoarsenAb(entries); break;
             case "once": Once(entries, args); break;
             case "predict": Predict(entries, args); break;
             default: Console.WriteLine("Unknown conveyor stage '" + stage + "'."); break;
+        }
+    }
+
+    private static IReadOnlyList<CodegenCatalogProgramEntry> SelectPrograms(string selector)
+    {
+        if (string.Equals(selector, "all", StringComparison.OrdinalIgnoreCase))
+            return CodegenKernelCatalog.Programs;
+        var one = CodegenKernelCatalog.FindProgram(selector);
+        return one is null ? Array.Empty<CodegenCatalogProgramEntry>() : new[] { one };
+    }
+
+    /// <summary>
+    /// Prints the static-ratchet rows (codegen-static-baseline.tsv) for every ratcheted
+    /// kernel, computed exactly as CodegenRatchetTests computes them, so a baseline change
+    /// can be produced without running the test suite.
+    /// </summary>
+    private static void StaticRows()
+    {
+        Console.WriteLine("kernel\tptx_lines\tloads\tvector_loads\telided_guards\tlooped_axes");
+        foreach (var (name, spec) in CodegenKernelCatalog.RatchetedKernels())
+        {
+            var emitter = new PtxAffineEmitter();
+            string ptx = emitter.Emit(spec, 8, 6);
+            Console.WriteLine(string.Join("\t", name,
+                ptx.Split('\n').Length.ToString(CultureInfo.InvariantCulture),
+                emitter.EmittedLoads.ToString(CultureInfo.InvariantCulture),
+                emitter.VectorisedLoads.ToString(CultureInfo.InvariantCulture),
+                emitter.ElidedGuards.ToString(CultureInfo.InvariantCulture),
+                emitter.LoopedAxes.ToString(CultureInfo.InvariantCulture)));
         }
     }
 
@@ -99,7 +162,12 @@ internal static class KernelConveyorTool
         foreach (var entry in entries)
         {
             var emitter = new PtxAffineEmitter();
-            string ptx = emitter.Emit(entry.Bench, 8, 6);
+            // --winner applies a tuned configuration, so a candidate's PTX can be inspected
+            // (and its emission failures reproduced) without a device; --arch 75 targets Turing.
+            ApplyTuned(emitter, entry.Name, ValueOf(args, "--winner"));
+            int major = ValueOf(args, "--arch") is string arch ? int.Parse(arch, CultureInfo.InvariantCulture) / 10 : 8;
+            int minor = ValueOf(args, "--arch") is string arch2 ? int.Parse(arch2, CultureInfo.InvariantCulture) % 10 : 6;
+            string ptx = emitter.Emit(entry.Bench, major, minor);
             string path = Path.Combine(dir, entry.Name + ".ptx");
             File.WriteAllText(path, ptx);
             File.WriteAllText(Path.Combine(dir, entry.Name + ".spec.txt"), entry.Bench.Describe());
@@ -133,7 +201,8 @@ internal static class KernelConveyorTool
                 // conveyor verifies, benches and releases.
                 bool overridden = args.Contains("--no-coarsen", StringComparer.Ordinal)
                     || ValueOf(args, "--coarsen") is not null
-                    || ValueOf(args, "--max-lanes") is not null;
+                    || ValueOf(args, "--max-lanes") is not null
+                    || ValueOf(args, "--winner") is not null;
 
                 TunedProgram program;
                 if (overridden)
@@ -144,6 +213,8 @@ internal static class KernelConveyorTool
                         emitter.Coarsening = int.Parse(cz, CultureInfo.InvariantCulture);
                     if (ValueOf(args, "--max-lanes") is string mz)
                         emitter.MaxTileLanes = int.Parse(mz, CultureInfo.InvariantCulture);
+                    // --winner: profile a named candidate (implicit-gemm, ...) rather than the recorded winner.
+                    ApplyTuned(emitter, entry.Name, ValueOf(args, "--winner"));
                     string ptx = emitter.Emit(spec, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
                     program = new TunedProgram(spec,
                         new[]
@@ -337,6 +408,22 @@ internal static class KernelConveyorTool
     /// looking up by the spec name silently found nothing, so those kernels ran the
     /// modelled lowering while the cache said they had been tuned.
     /// </param>
+    /// <summary>Implicit-GEMM tile tokens of the split winners ("m128n64"): no 'x', which the chunk factor uses.</summary>
+    internal static readonly string[] ImplicitSplitTiles = { "m64n64", "m96n64", "m128n64" };
+
+    /// <summary>Configures an emitter for an implicit-GEMM tile token such as "m128n64".</summary>
+    internal static void ApplyImplicitTile(PtxAffineEmitter emitter, string token)
+    {
+        int n = token.IndexOf('n');
+        if (!token.StartsWith("m", StringComparison.Ordinal) || n < 2 ||
+            !int.TryParse(token.Substring(1, n - 1), NumberStyles.None, CultureInfo.InvariantCulture, out int m) ||
+            !int.TryParse(token.Substring(n + 1), NumberStyles.None, CultureInfo.InvariantCulture, out int nEdge))
+            throw new ArgumentException("Not an implicit-GEMM tile token: '" + token + "'.", nameof(token));
+        emitter.ImplicitGemm = true;
+        emitter.ImplicitGemmTile = nEdge;
+        emitter.ImplicitGemmTileM = m;
+    }
+
     internal static void ApplyTuned(
         PtxAffineEmitter emitter, string kernelName, string? winner)
     {
@@ -348,6 +435,11 @@ internal static class KernelConveyorTool
             case "no-staging": emitter.EnableSharedStaging = false; break;
             case "no-vector": emitter.EnableVectorLoads = false; break;
             case "input-staging": emitter.EnableInputStaging = true; break;
+            case "implicit-gemm": emitter.ImplicitGemm = true; break;
+            case "implicit-gemm-32": emitter.ImplicitGemm = true; emitter.ImplicitGemmTile = 32; break;
+            case "implicit-gemm-128x64": emitter.ImplicitGemm = true; emitter.ImplicitGemmTileM = 128; break;
+            case "implicit-gemm-96x64": emitter.ImplicitGemm = true; emitter.ImplicitGemmTileM = 96; break;
+            case "implicit-gemm-64x128": emitter.ImplicitGemm = true; emitter.ImplicitGemmTile = 128; emitter.ImplicitGemmTileM = 64; break;
 
             // A split winner is not a knob -- it is a different PROGRAM, two kernels and a
             // temporary, which this single-kernel path cannot launch. Saying so is the
@@ -356,6 +448,9 @@ internal static class KernelConveyorTool
             case not null when winner.StartsWith("split:", StringComparison.Ordinal):
             case not null when winner.StartsWith("tiled-split:", StringComparison.Ordinal):
             case not null when winner.StartsWith("tiled-chunked-split:", StringComparison.Ordinal):
+            // ig-chunked-split is a split program too (TryBuildTunedProgram treats it as one at
+            // "implicitSplit"), so it belongs with the other prefixes rather than in the default arm.
+            case not null when winner.StartsWith("ig-chunked-split:", StringComparison.Ordinal):
                 Console.WriteLine("    note: " + kernelName + " measured fastest as " + winner +
                                   ", a two-kernel split this stage cannot launch; " +
                                   "running the single-kernel lowering instead");
@@ -615,16 +710,22 @@ internal static class KernelConveyorTool
 
         bool tiledSplit = winner is not null &&
             winner.StartsWith("tiled-split:", StringComparison.Ordinal);
+        bool implicitSplit = winner is not null &&
+            winner.StartsWith("ig-chunked-split:", StringComparison.Ordinal);
         bool tiledChunkedSplit = winner is not null &&
             winner.StartsWith("tiled-chunked-split:", StringComparison.Ordinal);
         if (winner is not null &&
             (winner.StartsWith("split:", StringComparison.Ordinal) || tiledSplit ||
-             tiledChunkedSplit))
+             tiledChunkedSplit || implicitSplit))
         {
             CodegenSplitPlan? plan = null;
             try
             {
-                if (tiledChunkedSplit)
+                if (implicitSplit)
+                    plan = TryParseChunkFactor(winner, out int implicitFactor)
+                        ? CodegenSplitReduction.TryPlanChunkedForTiles(spec, implicitFactor)
+                        : null;
+                else if (tiledChunkedSplit)
                     plan = TryParseChunkFactor(winner, out int chunkFactor)
                         ? CodegenSplitReduction.TryPlanChunked(spec, chunkFactor)
                         : null;
@@ -657,6 +758,8 @@ internal static class KernelConveyorTool
                 else
                 {
                     var partial = new PtxAffineEmitter();
+                    // ig-chunked-split winners lower the partial pass as an implicit GEMM; the tile is the last field.
+                    if (implicitSplit) ApplyImplicitTile(partial, winner.Substring(winner.LastIndexOf(':') + 1));
                     try
                     {
                         string text = partial.Emit(plan.Partial,
@@ -774,16 +877,16 @@ internal static class KernelConveyorTool
                     // epilogue moved to the combine; binding by position would feed the
                     // partial pass the bias.
                     var partialArgs = new IntPtr[plan.Partial.ParameterCount];
-                    for (int i = 0; i < spec.ProductInputs.Count; i++)
-                        partialArgs[i] = uploaded[spec.ProductInputs[i]];
+                    int[] partialSources = CodegenSplitReduction.PartialOperandSources(spec);
+                    for (int i = 0; i < partialSources.Length; i++)
+                        partialArgs[i] = uploaded[partialSources[i]];
                     partialArgs[partialArgs.Length - 1] = temp.Pointer;
 
                     var combineArgs = new IntPtr[plan.Combine.ParameterCount];
                     combineArgs[0] = temp.Pointer;
-                    if (plan.Combine.BiasInput is { } bias)
-                        combineArgs[bias] = uploaded[spec.BiasInput!.Value];
-                    if (plan.Combine.ScaleInput is { } scaleAt)
-                        combineArgs[scaleAt] = uploaded[spec.ScaleInput!.Value];
+                    int[] combineSources = CodegenSplitReduction.CombineOperandSources(spec);
+                    for (int i = 0; i < combineSources.Length; i++)
+                        combineArgs[1 + i] = uploaded[combineSources[i]];
                     combineArgs[combineArgs.Length - 1] = it._output.Pointer;
 
                     it.Add(runtime, program.Kernels[0], partialArgs);
@@ -845,6 +948,458 @@ internal static class KernelConveyorTool
             foreach (var b in _buffers) b.Dispose();
             foreach (var m in _modules) m.Dispose();
         }
+    }
+
+    /// <summary>
+    /// A whole multi-pass program on the device: one buffer per NAME (sources, then every
+    /// pass output), each pass lowered the way the tuner chose for it, and the chain captured
+    /// as one CUDA graph so it is timed the way the competitor lane is.
+    /// </summary>
+    private sealed class ProgramLaunchable : IDisposable
+    {
+        private readonly List<DirectPtxModule> _modules = new();
+        private readonly Dictionary<string, DirectPtxBuffer> _named = new(StringComparer.Ordinal);
+        private readonly List<DirectPtxBuffer> _temporaries = new();
+        // Every lowering buffer by name, temporaries ("#tempN") included.
+        private readonly Dictionary<string, DirectPtxBuffer> _scratch = new(StringComparer.Ordinal);
+        private readonly List<(DirectPtxModule Module, IntPtr Fn, IntPtr[] Args,
+            uint Blocks, uint X, uint Y, uint DynamicSharedMemoryBytes)> _steps = new();
+        private DirectPtxGraph? _graph;
+
+        /// <summary>The fp64 value of every source, as uploaded.</summary>
+        internal Dictionary<string, double[]> HostSources { get; } = new(StringComparer.Ordinal);
+
+        /// <summary>Highest register count across every kernel of every pass.</summary>
+        internal int RegistersPerThread { get; private set; }
+
+        /// <summary>Kernels launched per program run, after each pass's lowering.</summary>
+        internal int KernelCount => _steps.Count;
+
+        /// <summary>Lowering label per pass, for the report.</summary>
+        internal List<string> Lowerings { get; } = new();
+
+        internal static ProgramLaunchable Create(
+            DirectPtxRuntime runtime, CodegenProgram program, string catalogName)
+        {
+            var it = new ProgramLaunchable();
+            try
+            {
+                int salt = 0;
+                foreach (var source in program.Sources())
+                {
+                    long count = source.ElementCount;
+                    var single = new float[count];
+                    var wide = new double[count];
+                    // Parameters (gamma, beta, bias) sit near one rather than near zero, so a
+                    // dropped post-scale or post-bias moves the output instead of hiding in it.
+                    double offset = source.Name == "x" ? _xOffset : 1.0;
+                    for (long e = 0; e < count; e++)
+                    {
+                        float v = (float)((((e * 37 + salt * 101) % 97) - 48) / 64.0 + offset);
+                        single[e] = v;
+                        wide[e] = v;
+                    }
+                    salt++;
+                    var buffer = runtime.AllocateBytes((nuint)(count * sizeof(float)));
+                    buffer.Upload<float>(single);
+                    it._named.Add(source.Name, buffer);
+                    it.HostSources.Add(source.Name, wide);
+                }
+
+                // THE PRODUCTION LOWERING (PtxProgramLowering): what is verified and timed here is what a
+                // backend launches -- row fusion, the planner's splits, scratch by name -- with the
+                // tuner's recorded winner for each pass that is not fused.
+                PtxPassLowering? Tuned(CodegenKernelSpec pass)
+                {
+                    var tuned = ResolveTuned(runtime, pass, catalogName + "/" + pass.Name);
+                    // NO RECORDED WINNER means the modelled choice, and for a program that is what
+                    // the backend does: it splits whenever the planner says one kernel would leave
+                    // the device idle. A BatchNorm's per-channel statistics are 64 threads unsplit.
+                    if (tuned.Winner is null && !tuned.IsSplit && CodegenSplitReduction.TryPlan(pass) is not null)
+                        return null;
+                    var kernels = new List<PtxPassKernel>();
+                    foreach (var k in tuned.Kernels)
+                        kernels.Add(new PtxPassKernel(k.Ptx, k.Spec.Name, k.Blocks, k.BlockX, k.BlockY,
+                            k.DynamicSharedMemoryBytes));
+                    return new PtxPassLowering(kernels, tuned.Split, tuned.Label());
+                }
+
+                var lowering = PtxProgramLowering.Create(program, catalogName, runtime.ComputeCapabilityMajor,
+                    runtime.ComputeCapabilityMinor, Tuned, rowFusion: !_noRowFusion);
+                it.Lowerings.AddRange(lowering.PassLowerings);
+                foreach (var pair in lowering.Buffers)
+                {
+                    if (it._named.ContainsKey(pair.Key)) continue;
+                    var buffer = runtime.AllocateBytes((nuint)(pair.Value * sizeof(float)));
+                    if (pair.Key.StartsWith("#", StringComparison.Ordinal)) it._temporaries.Add(buffer);
+                    else it._named.Add(pair.Key, buffer);
+                    it._scratch.Add(pair.Key, buffer);
+                }
+                foreach (var step in lowering.Steps)
+                {
+                    var args = new IntPtr[step.Arguments.Count];
+                    for (int i = 0; i < args.Length; i++)
+                        args[i] = (it._named.TryGetValue(step.Arguments[i], out var named) ? named : it._scratch[step.Arguments[i]]).Pointer;
+                    var module = runtime.LoadModule(step.Ptx, allowExperimentalJitFallback: true);
+                    it._modules.Add(module);
+                    IntPtr fn = module.GetFunction(step.EntryPoint, out DirectPtxFunctionInfo info);
+                    if (step.DynamicSharedMemoryBytes != 0)
+                        module.SetMaxDynamicSharedMemory(fn, checked((int)step.DynamicSharedMemoryBytes));
+                    it.RegistersPerThread = Math.Max(it.RegistersPerThread, info.RegistersPerThread);
+                    it._steps.Add((module, fn, args, step.Blocks, step.BlockX, step.BlockY, step.DynamicSharedMemoryBytes));
+                }
+
+                it._graph = runtime.CaptureGraph(it.LaunchDirect);
+                return it;
+            }
+            catch
+            {
+                it.Dispose();
+                throw;
+            }
+        }
+
+        private void LaunchDirect()
+        {
+            foreach (var (module, fn, args, blocks, x, y, dynamicSharedMemoryBytes) in _steps)
+                LaunchSpec(module, fn, args, blocks, x, y, dynamicSharedMemoryBytes);
+        }
+
+        internal void Launch()
+        {
+            if (_graph is not null) _graph.Launch();
+            else LaunchDirect();
+        }
+
+        internal float[] Download(string name, long count)
+        {
+            var values = new float[count];
+            _named[name].Download<float>(values);
+            return values;
+        }
+
+        public void Dispose()
+        {
+            _graph?.Dispose();
+            foreach (var b in _named.Values) b.Dispose();
+            foreach (var b in _temporaries) b.Dispose();
+            foreach (var m in _modules) m.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Verifies each program at its bench shape -- the shape it is released at, for the same
+    /// reason the single kernels are -- against the fp64 chain. EVERY intermediate is
+    /// compared, not just the final output: a wrong statistic that the affine pass happens to
+    /// mask on this data would otherwise ship.
+    /// </summary>
+    private static void VerifyPrograms(IReadOnlyList<CodegenCatalogProgramEntry> entries)
+    {
+        using var runtime = OpenRuntime();
+        if (runtime is null) return;
+
+        int passed = 0, failed = 0;
+        Console.WriteLine();
+        Console.WriteLine("CONVEYOR STAGE 1 (programs) - every pass output against the fp64 chain");
+        Console.WriteLine("tolerance " + Tolerance.ToString("E0", CultureInfo.InvariantCulture));
+        Console.WriteLine();
+        Console.WriteLine("program / output                    regs  kernels  lowering             max abs dev   result");
+        // Every program runs TWICE: on data centred on zero, and on the same data offset by
+        // 1000. A statistic that cancels catastrophically passes the first and fails the second
+        // -- BatchNorm's running-mean shift did exactly that (NaN at an offset of 1000) while
+        // the zero-centred check passed. An explicit --x-offset runs that offset alone.
+        double[] offsets = _xOffset != 0.0 ? new[] { _xOffset } : new[] { 0.0, 1000.0 };
+        double savedOffset = _xOffset;
+        foreach (var entry in entries)
+        foreach (double offset in offsets)
+        {
+            _xOffset = offset;
+            try
+            {
+                var program = entry.Bench;
+                using var launchable = ProgramLaunchable.Create(runtime, program, entry.Name);
+                launchable.Launch();
+                runtime.Synchronize();
+                var expected = program.Interpret(launchable.HostSources);
+
+                bool all = true;
+                for (int p = 0; p < program.Passes.Count; p++)
+                {
+                    var pass = program.Passes[p];
+                    long count = pass.Output.ElementCount;
+                    float[] actual = launchable.Download(pass.Output.Name, count);
+                    double[] want = expected[pass.Output.Name];
+                    double worst = 0;
+                    for (long e = 0; e < count; e++)
+                    {
+                        double diff = Math.Abs(actual[e] - want[e]);
+                        worst = Math.Max(worst, diff / Math.Max(1.0, Math.Abs(want[e])));
+                        if (double.IsNaN(actual[e])) worst = double.NaN;
+                        if (double.IsNaN(worst)) break;
+                    }
+                    bool ok = worst <= Tolerance && !double.IsNaN(worst);
+                    all &= ok;
+                    string label = entry.Name + " / " + pass.Output.Name +
+                        (offset == 0.0 ? "" : " @+" + offset.ToString("0", CultureInfo.InvariantCulture));
+                    Console.WriteLine(label.PadRight(36) +
+                        launchable.RegistersPerThread.ToString(CultureInfo.InvariantCulture).PadLeft(4) +
+                        launchable.KernelCount.ToString(CultureInfo.InvariantCulture).PadLeft(9) + "  " +
+                        launchable.Lowerings[p].PadRight(18) +
+                        worst.ToString("E3", CultureInfo.InvariantCulture).PadLeft(14) +
+                        (ok ? "PASS" : "FAIL").PadLeft(9));
+                }
+                if (all) passed++; else failed++;
+            }
+            catch (Exception ex)
+            {
+                failed++;
+                Console.WriteLine(entry.Name.PadRight(36) + "   -        -  -                  -     ERROR");
+                Console.WriteLine("    " + ex.GetType().Name + ": " + ex.Message.Split('\n')[0]);
+            }
+        }
+
+        _xOffset = savedOffset;
+        Console.WriteLine();
+        Console.WriteLine("verify (programs): " + passed.ToString(CultureInfo.InvariantCulture) + " passed, " +
+                          failed.ToString(CultureInfo.InvariantCulture) + " failed");
+        if (failed != 0 || passed != entries.Count * offsets.Length)
+            throw new InvalidOperationException(
+                "Program verification failed closed: " +
+                passed.ToString(CultureInfo.InvariantCulture) + " of " +
+                (entries.Count * offsets.Length).ToString(CultureInfo.InvariantCulture) +
+                " selected program runs passed.");
+    }
+
+    /// <summary>Times each whole program as one graph replay, under the stage-3 protocol.</summary>
+    private static void BenchPrograms(IReadOnlyList<CodegenCatalogProgramEntry> entries)
+    {
+        GpuBenchmarkEnvironment.RequireIdleGpu("kernel-bench-programs-start");
+        using var runtime = OpenRuntime();
+        if (runtime is null) return;
+        var failures = new List<string>();
+
+        Console.WriteLine();
+        Console.WriteLine("CONVEYOR STAGE 3 (programs) - whole program per graph replay");
+        Console.WriteLine();
+        Console.WriteLine("program                           kernels    us/launch    p95/med   run spread   SM clock");
+        foreach (var entry in entries)
+        {
+            try
+            {
+                using var launchable = ProgramLaunchable.Create(runtime, entry.Bench, entry.Name);
+                var medians = new List<double>(Runs);
+                var tails = new List<double>(Runs);
+                int clockBefore = 0, clockAfter = 0;
+                bool converged = false;
+                for (int attempt = 0; attempt < StabilityAttempts; attempt++)
+                {
+                    clockBefore = GpuBenchmarkEnvironment.SampleSmClockMhz();
+                    Dist d = Measure(runtime.Synchronize, launchable.Launch);
+                    clockAfter = GpuBenchmarkEnvironment.SampleSmClockMhz();
+                    medians.Add(d.Median);
+                    tails.Add(d.Median > 0 ? d.P95 / d.Median : double.NaN);
+                    if (medians.Count > Runs)
+                    {
+                        medians.RemoveAt(0);
+                        tails.RemoveAt(0);
+                    }
+                    double spreadNow = medians.Min() > 0 ? medians.Max() / medians.Min() - 1.0 : double.MaxValue;
+                    double drift = clockBefore > 0
+                        ? Math.Abs(clockAfter - clockBefore) / (double)clockBefore
+                        : double.MaxValue;
+                    if (medians.Count == Runs && spreadNow <= StableTimer.StableSpread && drift <= 0.02)
+                    {
+                        converged = true;
+                        break;
+                    }
+                }
+                double reported = medians.OrderBy(value => value).ElementAt(medians.Count / 2);
+                if (!converged)
+                    failures.Add(entry.Name + ": timing did not converge within " +
+                                 StabilityAttempts.ToString(CultureInfo.InvariantCulture) + " attempts");
+                Console.WriteLine(entry.Name.PadRight(34) +
+                    launchable.KernelCount.ToString(CultureInfo.InvariantCulture).PadLeft(7) +
+                    (converged ? (reported * 1000.0).ToString("F1", CultureInfo.InvariantCulture) : "UNSTABLE").PadLeft(13) +
+                    tails.Max().ToString("F2", CultureInfo.InvariantCulture).PadLeft(11) +
+                    ((medians.Max() / medians.Min() - 1.0) * 100).ToString("F1", CultureInfo.InvariantCulture).PadLeft(10) + "%   " +
+                    GpuBenchmarkEnvironment.DescribeClockDrift(clockBefore, clockAfter));
+            }
+            catch (Exception ex)
+            {
+                failures.Add(entry.Name + ": " + ex.Message.Split('\n')[0]);
+                Console.WriteLine(entry.Name.PadRight(34) + "  ERROR  " + ex.Message.Split('\n')[0]);
+            }
+        }
+
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("kernel-bench-programs-end", afterSuite: true);
+        if (failures.Count != 0)
+            throw new InvalidOperationException(
+                failures.Count.ToString(CultureInfo.InvariantCulture) +
+                " selected program(s) produced no stable benchmark row. " + string.Join("; ", failures));
+    }
+
+    /// <summary>
+    /// The phase-4 gate: each declared program against the HAND-WRITTEN backend kernel it
+    /// replaces, in one process, at the catalog's bench shape. Rounds alternate the two
+    /// sides so drift and preemption land on both, and the ratio is taken per round; the
+    /// median of the rounds is reported (incumbent / ours, above one means the declared
+    /// program is faster). The incumbent is launched eagerly, as the engine launches it;
+    /// with 50 launches per timed region its launch cost is amortised, not removed.
+    /// </summary>
+    private static void Incumbent(IReadOnlyList<CodegenCatalogProgramEntry> entries)
+    {
+        GpuBenchmarkEnvironment.RequireIdleGpu("kernel-incumbent-start");
+        using var runtime = OpenRuntime();
+        if (runtime is null) return;
+        using var engine = new AiDotNet.Tensors.Engines.DirectGpu.DirectGpuEngine();
+        var backend = engine.Backend ??
+            throw new InvalidOperationException("No direct GPU backend is available for the incumbent lane.");        // The backend now routes these calls to the declared programs themselves; the incumbent is the
+        // hand-written kernel, so the route is switched off for this lane.
+        if (backend is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cuda) cuda.DeclaredKernelsSwitch = false;
+
+        Console.WriteLine();
+        Console.WriteLine("INCUMBENT - declared program vs the hand-written " + engine.BackendName + " kernel, paired rounds");
+        Console.WriteLine();
+        Console.WriteLine("program                       ours us   incumbent us   ratio (round spread)");
+
+        // A gate that prints ERROR and exits 0 is not a gate: a program that fails to lower,
+        // compile or launch has to fail the lane, as VerifyPrograms and BenchPrograms do.
+        var failures = new List<string>();
+        foreach (var entry in entries)
+        {
+            Action? incumbent = null;
+            var buffers = new List<IDisposable>();
+            try
+            {
+                var program = entry.Bench;
+                var shapes = new Dictionary<string, IReadOnlyList<int>>(StringComparer.Ordinal);
+                foreach (var source in program.Sources()) shapes[source.Name] = source.Shape;
+                AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer Buffer(long count)
+                {
+                    var data = new float[count];
+                    for (long i = 0; i < count; i++) data[i] = (float)((((i * 37) % 97) - 48) / 64.0 + 1.0);
+                    var b = backend.AllocateBuffer(data);
+                    buffers.Add(b);
+                    return b;
+                }
+
+                switch (entry.Name)
+                {
+                    case "softmax_rows":
+                    {
+                        int r = shapes["x"][0], c = shapes["x"][1];
+                        var a = Buffer((long)r * c); var o = Buffer((long)r * c);
+                        incumbent = () => backend.Softmax(a, o, r, c);
+                        break;
+                    }
+                    case "layernorm":
+                    case "layernorm_d64":
+                    {
+                        int r = shapes["x"][0], c = shapes["x"][1];
+                        var x = Buffer((long)r * c); var y = Buffer((long)r * c);
+                        var g = Buffer(c); var b = Buffer(c); var m = Buffer(r); var v = Buffer(r);
+                        incumbent = () => backend.LayerNorm(x, y, g, b, m, v, r, c, 1e-5f);
+                        break;
+                    }
+                    case "rmsnorm":
+                    {
+                        int r = shapes["x"][0], c = shapes["x"][1];
+                        var x = Buffer((long)r * c); var y = Buffer((long)r * c);
+                        var g = Buffer(c); var s = Buffer(r);
+                        incumbent = () => backend.RmsNorm(x, y, g, s, r, c, 1e-6f);
+                        break;
+                    }
+                    case "batchnorm2d":
+                    {
+                        // Statistics bind x as [n, c, h*w].
+                        int n = shapes["x"][0], c = shapes["x"][1], s = shapes["x"][2];
+                        var x = Buffer((long)n * c * s); var y = Buffer((long)n * c * s);
+                        var g = Buffer(c); var b = Buffer(c); var rm = Buffer(c); var rv = Buffer(c);
+                        var sm = Buffer(c); var sv = Buffer(c);
+                        incumbent = () => backend.BatchNorm(x, y, g, b, rm, rv, sm, sv, n, c, s, 1e-5f, 0.1f, true);
+                        break;
+                    }
+                    case "groupnorm":
+                    {
+                        var xs = shapes["x"];   // [n, groups, channels/groups, spatial]
+                        int n = xs[0], groups = xs[1], c = xs[1] * xs[2], s = xs[3];
+                        var x = Buffer((long)n * c * s); var y = Buffer((long)n * c * s);
+                        var g = Buffer(c); var b = Buffer(c); var m = Buffer((long)n * groups); var v = Buffer((long)n * groups);
+                        incumbent = () => backend.GroupNorm(x, y, g, b, m, v, n, groups, c, s, 1e-5f);
+                        break;
+                    }
+                    case "layernorm_backward":
+                    {
+                        int r = shapes["x"][0], c = shapes["x"][1];
+                        var dy = Buffer((long)r * c); var x = Buffer((long)r * c); var dx = Buffer((long)r * c);
+                        var g = Buffer(c); var m = Buffer(r); var v = Buffer(r); var dg = Buffer(c); var db = Buffer(c);
+                        incumbent = () => backend.LayerNormBackward(dy, x, g, m, v, dx, dg, db, r, c, 1e-5f);
+                        break;
+                    }
+                    case "rmsnorm_backward":
+                    {
+                        int r = shapes["x"][0], c = shapes["x"][1];
+                        var dy = Buffer((long)r * c); var x = Buffer((long)r * c); var dx = Buffer((long)r * c);
+                        var g = Buffer(c); var s = Buffer(r); var dg = Buffer(c);
+                        incumbent = () => backend.RmsNormBackward(dy, x, g, s, dx, dg, r, c, 1e-6f);
+                        break;
+                    }
+                    case "batchnorm2d_backward":
+                    {
+                        int n = shapes["dy"][0], c = shapes["dy"][1], s = shapes["dy"][2];
+                        var dy = Buffer((long)n * c * s); var x = Buffer((long)n * c * s); var dx = Buffer((long)n * c * s);
+                        var g = Buffer(c); var m = Buffer(c); var v = Buffer(c); var dg = Buffer(c); var db = Buffer(c);
+                        incumbent = () => backend.BatchNormBackward(dy, x, g, m, v, dx, dg, db, n, c, s, 1e-5f);
+                        break;
+                    }
+                    case "softmax_backward":
+                    {
+                        int r = shapes["y"][0], c = shapes["y"][1];
+                        var dy = Buffer((long)r * c); var y = Buffer((long)r * c); var dx = Buffer((long)r * c);
+                        incumbent = () => backend.SoftmaxBackward(dy, y, dx, r, c);
+                        break;
+                    }
+                    default:
+                        Console.WriteLine(entry.Name.PadRight(28) + "  no hand-written incumbent declared");
+                        continue;
+                }
+
+                using var ours = ProgramLaunchable.Create(runtime, program, entry.Name);
+                var oursUs = new List<double>();
+                var theirsUs = new List<double>();
+                var ratios = new List<double>();
+                for (int round = 0; round < Runs; round++)
+                {
+                    double a = Measure(runtime.Synchronize, ours.Launch).Median * 1000.0;
+                    double b = Measure(backend.Synchronize, incumbent).Median * 1000.0;
+                    oursUs.Add(a);
+                    theirsUs.Add(b);
+                    ratios.Add(b / a);
+                }
+                ratios.Sort();
+                double median = ratios[ratios.Count / 2];
+                double spread = ratios[0] > 0 ? (ratios[ratios.Count - 1] / ratios[0] - 1) * 100 : double.NaN;
+                Console.WriteLine(entry.Name.PadRight(28) +
+                    oursUs.OrderBy(v => v).ElementAt(oursUs.Count / 2).ToString("F1", CultureInfo.InvariantCulture).PadLeft(9) +
+                    theirsUs.OrderBy(v => v).ElementAt(theirsUs.Count / 2).ToString("F1", CultureInfo.InvariantCulture).PadLeft(15) +
+                    (median.ToString("F2", CultureInfo.InvariantCulture) + "x").PadLeft(9) +
+                    (" (" + spread.ToString("F1", CultureInfo.InvariantCulture) + "%)"));
+            }
+            catch (Exception ex)
+            {
+                failures.Add(entry.Name + ": " + ex.Message.Split('\n')[0]);
+                Console.WriteLine(entry.Name.PadRight(28) + "  ERROR " + ex.Message.Split('\n')[0]);
+            }
+            finally
+            {
+                foreach (var b in buffers) b.Dispose();
+            }
+        }
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("kernel-incumbent-end", afterSuite: true);
+        if (failures.Count != 0)
+            throw new InvalidOperationException(
+                failures.Count.ToString(CultureInfo.InvariantCulture) +
+                " incumbent comparison(s) failed. " + string.Join("; ", failures));
     }
 
     private static string Describe(int loopedAxes) =>
@@ -1148,7 +1703,7 @@ internal static class KernelConveyorTool
                               Runs + " stability window");
             Console.WriteLine("harness noise floor measured at 1.05%; differences under ~3% are not claimable");
             Console.WriteLine("protocol " + CodegenMeasurementProtocol.Stamp(
-                "RTX 3080, clocks " + GpuBenchmarkEnvironment.SampleSmClockMhz().ToString(CultureInfo.InvariantCulture) + " MHz"));
+                runtime.DeviceName + ", clocks " + GpuBenchmarkEnvironment.SampleSmClockMhz().ToString(CultureInfo.InvariantCulture) + " MHz"));
             Console.WriteLine();
             Console.WriteLine("kernel                              blocks    us/launch    p95/med   run spread   SM clock");
 
@@ -1493,10 +2048,10 @@ internal static class KernelConveyorTool
     private static DirectPtxRuntime? OpenRuntime()
     {
         var runtime = new DirectPtxRuntime();
-        if (DirectPtxArchitecture.HasExperimentalConvolution(
+        if (DirectPtxArchitecture.HasCodegenConveyor(
                 runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             return runtime;
-        Console.WriteLine("The conveyor requires the experimental SM86 device.");
+        Console.WriteLine("The conveyor requires an SM75 (Turing) or newer device.");
         runtime.Dispose();
         return null;
     }

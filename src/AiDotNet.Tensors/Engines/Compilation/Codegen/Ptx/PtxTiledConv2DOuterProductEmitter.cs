@@ -10,6 +10,8 @@ namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
 /// <summary>Emits a double-buffered FP32 dense 3x3 weight-gradient partial.</summary>
 public sealed class PtxTiledConv2DOuterProductEmitter
 {
+    private bool _async = true;
+
     // PTX ISA 7.5 introduced the ignore-source predicate used by the window cp.async.
     private const string PredicatedAsyncCopyPtxIsaVersion = "7.5";
     private const int ValuesPerCopy = 4;
@@ -27,9 +29,8 @@ public sealed class PtxTiledConv2DOuterProductEmitter
 
     public string Emit(CodegenKernelSpec spec, int computeMajor, int computeMinor)
     {
-        if (computeMajor < 8)
-            throw new NotSupportedException(
-                "The double-buffered dense weight tile requires cp.async on sm_80+.");
+        // sm_80+ stages tiles with cp.async; Turing (sm_75) with a synchronous register round trip.
+        _async = PtxSharedCopy.HasAsyncCopy(computeMajor);
         if (!CodegenTiledConv2DOuterProductPlan.TryCreate(
                 spec, out var possible, out string reason))
             throw new NotSupportedException(
@@ -79,8 +80,8 @@ public sealed class PtxTiledConv2DOuterProductEmitter
         L("mov.u32 %r14, 0;");
         L("mov.u32 %r15, 0;");
         EmitAsyncStage(plan, "%r14", "%r15");
-        L("cp.async.commit_group;");
-        L("cp.async.wait_group 0;");
+        PtxSharedCopy.Commit(_async, L);
+        PtxSharedCopy.Wait(_async, L);
         L("bar.sync 0;");
         L("TILED_DW_REDUCE:");
         L("add.u32 %r16, %r14, 1;");
@@ -88,11 +89,11 @@ public sealed class PtxTiledConv2DOuterProductEmitter
         L($"xor.b32 %r17, %r15, {I(plan.StageBytes)};");
         L("@!%p0 bra TILED_DW_COMPUTE;");
         EmitAsyncStage(plan, "%r16", "%r17");
-        L("cp.async.commit_group;");
+        PtxSharedCopy.Commit(_async, L);
         L("TILED_DW_COMPUTE:");
         EmitCompute(plan, "%r15", accumulators);
         L("@!%p0 bra TILED_DW_DONE;");
-        L("cp.async.wait_group 0;");
+        PtxSharedCopy.Wait(_async, L);
         L("bar.sync 0;");
         L("mov.u32 %r14, %r16;");
         L("mov.u32 %r15, %r17;");
@@ -168,8 +169,7 @@ public sealed class PtxTiledConv2DOuterProductEmitter
             L($"add.u64 {destination}, %rd3, {sharedBytes};");
             L($"cvt.u64.u32 {sharedBytes}, {bufferBase};");
             L($"add.u64 {destination}, {destination}, {sharedBytes};");
-            L($"@{valid} cp.async.ca.shared.global " +
-              $"[{destination}], [{source}], {I(BytesPerCopy)};");
+            PtxSharedCopy.Emit(_async, L, NextF, NextP, destination, source, BytesPerCopy, valid);
         }
     }
 
@@ -214,8 +214,7 @@ public sealed class PtxTiledConv2DOuterProductEmitter
             L($"add.u64 {destination}, %rd3, {sharedBytes};");
             L($"cvt.u64.u32 {sharedBytes}, {bufferBase};");
             L($"add.u64 {destination}, {destination}, {sharedBytes};");
-            L($"@{valid} cp.async.ca.shared.global " +
-              $"[{destination}+{I(sharedBase)}], [{source}], {I(BytesPerCopy)}, {ignore};");
+            PtxSharedCopy.Emit(_async, L, NextF, NextP, $"{destination}+{I(sharedBase)}", source, BytesPerCopy, valid, ignore);
         }
     }
 

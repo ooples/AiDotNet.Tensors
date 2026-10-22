@@ -61,13 +61,13 @@ public sealed partial class CudaBackend : ITrilinearInterpolationKernels, IConvT
         LaunchKernel(kernel, gridDim, DefaultBlockSize, args);
     }
 
-    public void DepthwiseConv2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
+    private void DepthwiseConv2DBackwardInputIncumbent(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
         int n, int inC, int h, int w, int m, int outH, int outW, int kH, int kW,
         int strideH, int strideW, int padH, int padW) =>
         LaunchDepthwise2DGrid("depthwise_conv2d_backward_input", checked(n * inC * h * w),
             gradOutput, kernel, gradInput, n, inC, h, w, m, outH, outW, kH, kW, strideH, strideW, padH, padW);
 
-    public void DepthwiseConv2DBackwardKernel(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradKernel,
+    private void DepthwiseConv2DBackwardKernelIncumbent(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradKernel,
         int n, int inC, int h, int w, int m, int outH, int outW, int kH, int kW,
         int strideH, int strideW, int padH, int padW) =>
         LaunchDepthwise2DGrid("depthwise_conv2d_backward_weights", checked(inC * m * kH * kW),

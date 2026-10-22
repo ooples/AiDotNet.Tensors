@@ -153,15 +153,16 @@ internal static class KernelSplitTool
             // The partial pass takes only the PRODUCT operands -- any epilogue moved to
             // the combine -- so it is bound through ProductInputs, not by position.
             var partialArgs = new IntPtr[partial.ParameterCount];
-            for (int i = 0; i < spec.ProductInputs.Count; i++)
-                partialArgs[i] = inputPointers[spec.ProductInputs[i]];
+            int[] partialSources = CodegenSplitReduction.PartialOperandSources(spec);
+            for (int i = 0; i < partialSources.Length; i++)
+                partialArgs[i] = inputPointers[partialSources[i]];
             partialArgs[partialArgs.Length - 1] = temp.Pointer;
 
             var combineArgs = new IntPtr[combine.ParameterCount];
             combineArgs[0] = temp.Pointer;
-            if (combine.BiasInput is { } bias) combineArgs[bias] = inputPointers[spec.BiasInput!.Value];
-            if (combine.ScaleInput is { } scaleParam)
-                combineArgs[scaleParam] = inputPointers[spec.ScaleInput!.Value];
+            int[] combineSources = CodegenSplitReduction.CombineOperandSources(spec);
+            for (int i = 0; i < combineSources.Length; i++)
+                combineArgs[1 + i] = inputPointers[combineSources[i]];
             combineArgs[combineArgs.Length - 1] = splitOut.Pointer;
 
             void LaunchDirect() => Launch(directModule, directFn, directArgs,

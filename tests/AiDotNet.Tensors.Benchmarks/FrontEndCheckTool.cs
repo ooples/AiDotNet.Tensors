@@ -678,17 +678,19 @@ internal static class FrontEndCheckTool
             var plan = split.Plan;
             long count = want.Length;
 
-            // The partial pass takes only the PRODUCT operands; the epilogue operands
-            // moved to the combine, so binding by position would feed it the bias.
-            var partialArgs = new IntPtr[plan.Partial.ParameterCount];
-            for (int i = 0; i < spec.ProductInputs.Count; i++)
+            // The partial pass takes the product operands and the pre-bias; the epilogue
+            // operands moved to the combine, so binding by position would feed it the bias.
+            IntPtr Upload(int source)
             {
-                int source = spec.ProductInputs[i];
                 var buffer = runtime.AllocateBytes((nuint)(host[source].Length * sizeof(float)));
                 buffer.Upload<float>(host[source]);
                 buffers.Add(buffer);
-                partialArgs[i] = buffer.Pointer;
+                return buffer.Pointer;
             }
+
+            var partialArgs = new IntPtr[plan.Partial.ParameterCount];
+            int[] partialSources = CodegenSplitReduction.PartialOperandSources(spec);
+            for (int i = 0; i < partialSources.Length; i++) partialArgs[i] = Upload(partialSources[i]);
 
             var temp = runtime.AllocateBytes((nuint)(split.TempElements * sizeof(float)));
             buffers.Add(temp);
@@ -696,22 +698,8 @@ internal static class FrontEndCheckTool
 
             var combineArgs = new IntPtr[plan.Combine.ParameterCount];
             combineArgs[0] = temp.Pointer;
-            if (plan.Combine.BiasInput is { } bias)
-            {
-                int source = spec.BiasInput!.Value;
-                var buffer = runtime.AllocateBytes((nuint)(host[source].Length * sizeof(float)));
-                buffer.Upload<float>(host[source]);
-                buffers.Add(buffer);
-                combineArgs[bias] = buffer.Pointer;
-            }
-            if (plan.Combine.ScaleInput is { } scale)
-            {
-                int source = spec.ScaleInput!.Value;
-                var buffer = runtime.AllocateBytes((nuint)(host[source].Length * sizeof(float)));
-                buffer.Upload<float>(host[source]);
-                buffers.Add(buffer);
-                combineArgs[scale] = buffer.Pointer;
-            }
+            int[] combineSources = CodegenSplitReduction.CombineOperandSources(spec);
+            for (int i = 0; i < combineSources.Length; i++) combineArgs[1 + i] = Upload(combineSources[i]);
 
             var outBuffer = runtime.AllocateBytes((nuint)(count * sizeof(float)));
             buffers.Add(outBuffer);

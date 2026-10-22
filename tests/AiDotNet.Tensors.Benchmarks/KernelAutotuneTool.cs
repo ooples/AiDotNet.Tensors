@@ -185,16 +185,26 @@ internal static class KernelAutotuneTool
         // it adds two barriers per strip-mine step, and staging the wrong operand cost
         // conv_transpose 104 -> 131.4 us.
         new("input-staging", e => e.EnableInputStaging = true),
+        // The tiled implicit GEMM, which gathers both operands through their maps: the lowering
+        // for strided, dilated and exact-division (data-gradient) windows the specialised tiles
+        // refuse. Two tile edges, since a 32-channel layer wastes half a 64 tile.
+        new("implicit-gemm", e => e.ImplicitGemm = true),
+        new("implicit-gemm-32", e => { e.ImplicitGemm = true; e.ImplicitGemmTile = 32; }),
+        new("implicit-gemm-128x64", e => { e.ImplicitGemm = true; e.ImplicitGemmTileM = 128; }),
+        new("implicit-gemm-96x64", e => { e.ImplicitGemm = true; e.ImplicitGemmTileM = 96; }),
+        new("implicit-gemm-64x128", e => { e.ImplicitGemm = true; e.ImplicitGemmTile = 128; e.ImplicitGemmTileM = 64; }),
     };
 
     internal static void Run(string[] args)
     {
         GpuBenchmarkEnvironment.RequireIdleGpu("autotune-start");
         using var runtime = new DirectPtxRuntime();
-        if (!DirectPtxArchitecture.HasExperimentalConvolution(
+        // Turing and later: the tiled candidates stage with cp.async on sm_80+ and with a synchronous register round
+        // trip on sm_75 (PtxSharedCopy). Winners are keyed by the device fingerprint, so each device's are its own.
+        if (!DirectPtxArchitecture.HasCodegenConveyor(
                 runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
         {
-            Console.WriteLine("Autotuning requires the experimental SM86 device.");
+            Console.WriteLine("Autotuning requires an SM75 (Turing) or newer device.");
             return;
         }
 
@@ -440,6 +450,13 @@ internal static class KernelAutotuneTool
             CandidateProgram? program = null;
             try { program = CreateSingle(runtime, spec, Candidates[i]); }
             catch (NotSupportedException) { continue; }
+            catch (InvalidOperationException ex) when (ex.Message.Contains("was rejected", StringComparison.Ordinal))
+            {
+                // The driver refused the kernel (local memory, which the direct-kernel contract forbids): this
+                // configuration is not a candidate for the shape; the rest of the search goes on.
+                Console.WriteLine("    candidate '" + Candidates[i].Name + "' rejected: " + ex.Message);
+                continue;
+            }
             using (program)
             {
                 program.Launch();
@@ -664,6 +681,30 @@ internal static class KernelAutotuneTool
             }
         }
 
+        // Split reductions whose partial pass is an implicit GEMM: the promoted reduction axis becomes a batch
+        // slice, which adds blocks where the output alone leaves the last wave mostly empty.
+        foreach (string implicitTile in KernelConveyorTool.ImplicitSplitTiles)
+        {
+            foreach (int chunkFactor in CodegenAutotuneIdentity.ChunkedSplitFactors)
+            {
+                using CandidateProgram? split = TryCreateSplit(
+                    runtime, spec, tiledPartial: false, chunkFactor: chunkFactor, implicitTile: implicitTile);
+                if (split is null || !CandidateEnabled(candidateSelector, split.Name)) continue;
+
+                split.Launch();
+                runtime.Synchronize();
+                if (!Agrees(split.ReadOutput(), reference, out double deviation))
+                {
+                    Console.WriteLine("    candidate '" + split.Name + "' disagrees by " +
+                                      deviation.ToString("E3", CultureInfo.InvariantCulture) +
+                                      " relative; rejected");
+                    continue;
+                }
+
+                Consider(runtime, modelled, split, workUnits, state);
+            }
+        }
+
         foreach (int chunkFactor in CodegenAutotuneIdentity.ChunkedSplitFactors)
         {
             foreach (CodegenTiledOuterProductSchedule outerSchedule in
@@ -723,7 +764,8 @@ internal static class KernelAutotuneTool
             string.Equals(selector, "library-bwd-input-direct", StringComparison.OrdinalIgnoreCase) ||
             selector.StartsWith("split:", StringComparison.OrdinalIgnoreCase) ||
             selector.StartsWith("tiled-split:", StringComparison.OrdinalIgnoreCase) ||
-            selector.StartsWith("tiled-chunked-split:", StringComparison.OrdinalIgnoreCase))
+            selector.StartsWith("tiled-chunked-split:", StringComparison.OrdinalIgnoreCase) ||
+            selector.StartsWith("ig-chunked-split:", StringComparison.OrdinalIgnoreCase))
             return;
 
         throw new ArgumentException("Unknown autotune candidate '" + selector + "'.");
@@ -1004,16 +1046,16 @@ internal static class KernelAutotuneTool
             resources.Add(output);
 
             var partialArgs = new IntPtr[plan.Partial.ParameterCount];
-            for (int i = 0; i < spec.ProductInputs.Count; i++)
-                partialArgs[i] = uploaded[spec.ProductInputs[i]];
+            int[] partialSources = CodegenSplitReduction.PartialOperandSources(spec);
+            for (int i = 0; i < partialSources.Length; i++)
+                partialArgs[i] = uploaded[partialSources[i]];
             partialArgs[^1] = temporary.Pointer;
 
             var combineArgs = new IntPtr[plan.Combine.ParameterCount];
             combineArgs[0] = temporary.Pointer;
-            if (plan.Combine.BiasInput is { } bias)
-                combineArgs[bias] = uploaded[spec.BiasInput!.Value];
-            if (plan.Combine.ScaleInput is { } scale)
-                combineArgs[scale] = uploaded[spec.ScaleInput!.Value];
+            int[] combineSources = CodegenSplitReduction.CombineOperandSources(spec);
+            for (int i = 0; i < combineSources.Length; i++)
+                combineArgs[1 + i] = uploaded[combineSources[i]];
             combineArgs[^1] = output.Pointer;
 
             void LaunchPartial() => LaunchOne(
@@ -1063,12 +1105,14 @@ internal static class KernelAutotuneTool
     private static CandidateProgram? TryCreateSplit(
         DirectPtxRuntime runtime, CodegenKernelSpec spec,
         bool tiledPartial = false, int chunkFactor = 0,
-        CodegenTiledOuterProductSchedule? outerSchedule = null)
+        CodegenTiledOuterProductSchedule? outerSchedule = null, string? implicitTile = null)
     {
         CodegenSplitPlan? plan;
         try
         {
-            plan = chunkFactor > 0
+            plan = implicitTile is not null
+                ? CodegenSplitReduction.TryPlanChunkedForTiles(spec, chunkFactor)
+                : chunkFactor > 0
                 ? CodegenSplitReduction.TryPlanChunked(spec, chunkFactor)
                 : CodegenSplitReduction.TryPlan(spec);
         }
@@ -1096,8 +1140,14 @@ internal static class KernelAutotuneTool
             else
             {
                 var partialEmitter = new PtxAffineEmitter();
+                if (implicitTile is not null) KernelConveyorTool.ApplyImplicitTile(partialEmitter, implicitTile);
                 partialPtx = partialEmitter.Emit(
                     plan.Partial, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                // The emitter falls back to its affine lowering when the implicit GEMM does not apply; that
+                // program is already a plain split candidate, so it is not a new one.
+                if (implicitTile is not null &&
+                    !partialEmitter.TileDescription.StartsWith("implicit-gemm", StringComparison.Ordinal))
+                    return null;
                 partialBlocks = partialEmitter.LaunchBlocks;
                 partialBlockX = checked((uint)partialEmitter.LaunchBlockX);
                 partialBlockY = checked((uint)partialEmitter.LaunchBlockY);
@@ -1131,16 +1181,16 @@ internal static class KernelAutotuneTool
             resources.Add(output);
 
             var partialArgs = new IntPtr[plan.Partial.ParameterCount];
-            for (int i = 0; i < spec.ProductInputs.Count; i++)
-                partialArgs[i] = uploaded[spec.ProductInputs[i]];
+            int[] partialSources = CodegenSplitReduction.PartialOperandSources(spec);
+            for (int i = 0; i < partialSources.Length; i++)
+                partialArgs[i] = uploaded[partialSources[i]];
             partialArgs[partialArgs.Length - 1] = temporary.Pointer;
 
             var combineArgs = new IntPtr[plan.Combine.ParameterCount];
             combineArgs[0] = temporary.Pointer;
-            if (plan.Combine.BiasInput is { } bias)
-                combineArgs[bias] = uploaded[spec.BiasInput!.Value];
-            if (plan.Combine.ScaleInput is { } scale)
-                combineArgs[scale] = uploaded[spec.ScaleInput!.Value];
+            int[] combineSources = CodegenSplitReduction.CombineOperandSources(spec);
+            for (int i = 0; i < combineSources.Length; i++)
+                combineArgs[1 + i] = uploaded[combineSources[i]];
             combineArgs[combineArgs.Length - 1] = output.Pointer;
 
             void LaunchPartial()
@@ -1164,7 +1214,10 @@ internal static class KernelAutotuneTool
             string scheduleSuffix = outerSchedule is { IsDefault: false }
                 ? ":" + outerSchedule.Suffix
                 : string.Empty;
-            string name = chunkFactor > 0
+            string name = implicitTile is not null
+                ? "ig-chunked-split:" + string.Join("+", plan.PromotedAxes) + "x" +
+                    chunkFactor.ToString(CultureInfo.InvariantCulture) + ":" + implicitTile
+                : chunkFactor > 0
                 ? "tiled-chunked-split:" + string.Join("+", plan.PromotedAxes) +
                     "x" + chunkFactor.ToString(CultureInfo.InvariantCulture) + scheduleSuffix
                 : (tiledPartial ? "tiled-split:" : "split:") +
@@ -1180,6 +1233,22 @@ internal static class KernelAutotuneTool
         catch (NotSupportedException)
         {
             for (int i = resources.Count - 1; i >= 0; i--) resources[i].Dispose();
+            return null;
+        }
+        // Only the driver's rejection means "not a candidate"; the same filter as the single-kernel path at
+        // CreateSingle. Catching every InvalidOperationException here would also swallow binding bugs,
+        // CandidateProgram lifecycle errors and allocation failures, and drop the schedule as if it had been
+        // measured and declined.
+        catch (InvalidOperationException ex) when (implicitTile is not null &&
+            ex.Message.Contains("was rejected", StringComparison.Ordinal))
+        {
+            // The driver rejected the implicit-GEMM partial (a register spill at the two-blocks-a-SM bound, which
+            // the direct-kernel contract forbids): this schedule is not a candidate for the shape, the others are.
+            for (int i = resources.Count - 1; i >= 0; i--) resources[i].Dispose();
+            // The same name the winner would be recorded under, so the decline matches the search record.
+            Console.WriteLine("    candidate ig-chunked-split:" + string.Join("+", plan.PromotedAxes) + "x" +
+                chunkFactor.ToString(CultureInfo.InvariantCulture) +
+                ":" + implicitTile + " rejected: " + ex.Message);
             return null;
         }
         catch

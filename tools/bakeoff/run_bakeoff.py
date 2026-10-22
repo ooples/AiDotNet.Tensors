@@ -76,6 +76,37 @@ WORK = {
                                          16 * 64 * 28 * 28 * 64 * 2),
     "conv2d_3x3_bwd_weights":           ((8 * 32 * 28 * 28 + 8 * 64 * 28 * 28) * 4,
                                          8 * 64 * 28 * 28 * 32 * 9 * 2),
+    # General convolution (#890 phase 4b): bytes are input + output, FLOPs 2*MACs.
+    "conv2d_3x3_stride2":              ((8 * 64 * 56 * 56 + 8 * 128 * 28 * 28) * 4, 8 * 128 * 28 * 28 * 64 * 9 * 2),
+    "conv2d_3x3_stride2_bwd_data":     ((8 * 64 * 56 * 56 + 8 * 128 * 28 * 28) * 4, 8 * 128 * 28 * 28 * 64 * 9 * 2),
+    "conv2d_3x3_stride2_bwd_weights":  ((8 * 64 * 56 * 56 + 8 * 128 * 28 * 28) * 4, 8 * 128 * 28 * 28 * 64 * 9 * 2),
+    "conv2d_3x3_dilation2":            (2 * 8 * 32 * 28 * 28 * 4, 8 * 32 * 28 * 28 * 32 * 9 * 2),
+    "conv2d_3x3_dilation2_bwd_data":   (2 * 8 * 32 * 28 * 28 * 4, 8 * 32 * 28 * 28 * 32 * 9 * 2),
+    "conv2d_3x3_grouped":              (2 * 8 * 64 * 28 * 28 * 4, 8 * 64 * 28 * 28 * 8 * 9 * 2),
+    "conv2d_3x3_grouped_bwd_data":     (2 * 8 * 64 * 28 * 28 * 4, 8 * 64 * 28 * 28 * 8 * 9 * 2),
+    "conv2d_3x3_grouped_bwd_weights":  (2 * 8 * 64 * 28 * 28 * 4, 8 * 64 * 28 * 28 * 8 * 9 * 2),
+    # Pointwise and normalisation (#890 phase 4a). Bytes are the MINIMUM an operator must
+    # move -- read the input once, write the output once -- not what our passes move, so
+    # %bw shows the cost of running a normalisation as several passes instead of one.
+    "bias_gelu":                       (2 * 8192 * 1024 * 4, 8192 * 1024 * 12),
+    "bias_swish":                      (2 * 8192 * 1024 * 4, 8192 * 1024 * 6),
+    "residual_add_relu":               (3 * 8192 * 1024 * 4, 8192 * 1024 * 2),
+    "multiply":                        (3 * 8192 * 1024 * 4, 8192 * 1024),
+    "sigmoid":                         (2 * 8192 * 1024 * 4, 8192 * 1024 * 4),
+    "tanh":                            (2 * 8192 * 1024 * 4, 8192 * 1024 * 4),
+    "batchnorm_inference_relu":        (2 * 32 * 64 * 56 * 56 * 4, 32 * 64 * 56 * 56 * 3),
+    "softmax_rows":                    (2 * 8192 * 1024 * 4, 0),
+    "layernorm":                       (2 * 8192 * 1024 * 4, 0),
+    "layernorm_d64":                   (2 * 8192 * 64 * 4, 0),
+    "rmsnorm":                         (2 * 8192 * 1024 * 4, 0),
+    "batchnorm2d":                     (2 * 32 * 64 * 56 * 56 * 4, 0),
+    "groupnorm":                       (2 * 32 * 64 * 1024 * 4, 0),
+    # Backward: read x and dy, write dx (the parameter gradients are [width], negligible).
+    "layernorm_backward":              (3 * 8192 * 1024 * 4, 0),
+    "rmsnorm_backward":                (3 * 8192 * 1024 * 4, 0),
+    "softmax_backward":                (3 * 8192 * 1024 * 4, 0),
+    "groupnorm_backward":              (3 * 32 * 64 * 1024 * 4, 0),
+    "batchnorm2d_backward":            (3 * 32 * 64 * 56 * 56 * 4, 0),
 }
 
 
@@ -95,8 +126,11 @@ def run_ours_once(dll, selector):
     """Runs one generated-lane selector with contamination retries."""
     command = ["dotnet", dll, "--kernel-bench"]
     command.append(selector)
+    # The bench refuses to measure beside any Python process; this script is its launcher, waiting on it, so it
+    # names itself (GpuBenchmarkEnvironment exempts the launcher from the Python check only).
+    env = dict(os.environ, AIDOTNET_BENCHMARK_LAUNCHER_PID=str(os.getpid()))
     for attempt in range(1, GENERATED_LANE_ATTEMPTS + 1):
-        completed = subprocess.run(command, capture_output=True, text=True)
+        completed = subprocess.run(command, capture_output=True, text=True, env=env)
         got = {}
         for line in completed.stdout.splitlines():
             m = re.match(r"^(\S+)\s+([\d,]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)%", line)
