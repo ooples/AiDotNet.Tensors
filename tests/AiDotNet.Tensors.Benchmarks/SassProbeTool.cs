@@ -671,17 +671,27 @@ internal static class SassProbeTool
                     }
                 Console.WriteLine("  mismatches " + count + " of " + a0.Length + ": " + string.Join(" ", shown));
                 // Which PTX output plane (by a 784-element stride guess) each SASS plane matches, if any.
-                int plane = int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_SASS_PLANE"), out int pl) ? pl : 784;
-                for (int c = 0; c * plane < a1.Length && c < 16; c++)
+                // A plane the environment sets: 0 or less never advances d * plane, so the scan would not terminate,
+                // and a partial final plane would read past the end of either array and replace the mismatch report
+                // with an IndexOutOfRangeException. Only whole planes are compared, and the setting is reported.
+                int plane = int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_SASS_PLANE"),
+                    NumberStyles.Integer, CultureInfo.InvariantCulture, out int pl) ? pl : 784;
+                if (plane <= 0)
+                    Console.WriteLine("  (AIDOTNET_SASS_PLANE=" + plane + " is not a usable plane size; no plane scan)");
+                else
                 {
-                    var matches = new List<int>();
-                    for (int d = 0; d * plane < a0.Length; d++)
+                    int sassPlanes = a1.Length / plane, ptxPlanes = a0.Length / plane;
+                    for (int c = 0; c < sassPlanes && c < 16; c++)
                     {
-                        bool same = true;
-                        for (int j = 0; j < plane && same; j++) same = a1[c * plane + j] == a0[d * plane + j];
-                        if (same) matches.Add(d);
+                        var matches = new List<int>();
+                        for (int d = 0; d < ptxPlanes; d++)
+                        {
+                            bool same = true;
+                            for (int j = 0; j < plane && same; j++) same = a1[c * plane + j] == a0[d * plane + j];
+                            if (same) matches.Add(d);
+                        }
+                        Console.WriteLine("  sass plane " + c + " = ptx planes [" + string.Join(",", matches.Take(8)) + "]");
                     }
-                    Console.WriteLine("  sass plane " + c + " = ptx planes [" + string.Join(",", matches.Take(8)) + "]");
                 }
             }
 

@@ -632,4 +632,31 @@ public class SassInstructionTests
         var sm75 = SassScheduler.RecomputeControl(BssyRegion(), 75) ?? throw new InvalidOperationException(SassScheduler.LastDecline);
         Assert.Equal(0x3f, sm75[2].Control.WaitMask);
     }
+
+    /// <summary>
+    /// An inner BSSY region that reconverges before the outer one must not take the outer region's frozen scoreboards
+    /// with it: the outer BSYNC would then wait for a global load nothing reads until after the outer region, which is
+    /// the overlap the sm_86 path exists to keep. What is frozen at any point is the union of the open regions.
+    /// </summary>
+    [Fact]
+    public void NestedBssyRegionsEachKeepTheirOwnFrozenScoreboards()
+    {
+        var ldg = LdgR34;
+        ldg.GuardPredicate = SassInstruction.TruePredicate;
+        var outer = Bssy;
+        outer.SetBits(32, 50, (7 - 3) * 16);   // BSSY B0, -> 7 (its BSYNC)
+        var inner = Bssy;
+        inner.SetBits(32, 50, (5 - 4) * 16);   // BSSY B1, -> 5, closing first
+        var code = new[]
+        {
+            ldg, Lds128, outer, inner, FfmaOf(9, 2, 5, 2), Bsync, FfmaOf(12, 2, 5, 12), Bsync,
+            FfmaOf(10, 34, 4, 10), Exit,
+        };
+        var scheduled = SassScheduler.RecomputeControl(code, 86) ?? throw new InvalidOperationException(SassScheduler.LastDecline);
+        int load = scheduled[0].Control.WriteScoreboard;
+        Assert.Equal(0, scheduled[3].Control.WaitMask & (1 << load));   // the inner BSSY leaves it in flight
+        Assert.Equal(0, scheduled[5].Control.WaitMask & (1 << load));   // the inner BSYNC too
+        Assert.Equal(0, scheduled[7].Control.WaitMask & (1 << load));   // and the OUTER BSYNC, which is the point
+        Assert.NotEqual(0, scheduled[8].Control.WaitMask & (1 << load));   // its first reader waits
+    }
 }

@@ -236,7 +236,12 @@ public static class SassScheduler
             for (int s = 0; s < pendingUse.Length; s++) pendingUse[s] = long.MaxValue;
             var outstanding = new int[6];
             var shortOps = new bool[6];   // per scoreboard: holds something other than a global load's result
-            int frozen = 0, frozenUntil = -1;   // scoreboards a BSSY region keeps in flight, and where the region ends
+            // Per OPEN BSSY region: the scoreboards it keeps in flight and the instruction its reconvergence ends at.
+            // One pair would not do: an inner region that reconverges first would replace the outer region's set, and
+            // the outer BSYNC would then wait for a global load nothing needs until after the outer region - exactly
+            // the overlap this path exists to keep.
+            var frozenRegions = new List<(int Mask, int Until)>();
+            int frozen = 0;
             long cycle = 0;   // issue cycle of the current instruction
             var scoreboardSetAt = new long[6];
             for (int s = 0; s < scoreboardSetAt.Length; s++) scoreboardSetAt[s] = long.MinValue / 2;
@@ -258,7 +263,10 @@ public static class SassScheduler
                     : (e.UniformPredicates ? UniformPredicateKey : PredicateKey) + instruction.GuardPredicate;
                 var predicateWrites = Predicates(instruction, e.PredicateWrites, e.UniformPredicates);
                 bool target = targets.Contains(i);
-                if (i >= frozenUntil) frozen = 0;
+                // Regions close in any order; what is frozen here is the union of those still open.
+                frozenRegions.RemoveAll(region => i >= region.Until);
+                frozen = 0;
+                foreach (var region in frozenRegions) frozen |= region.Mask;
                 // Fixed-latency state never crosses a block boundary; scoreboards cross branches (BRA, and CALL.REL.NOINC,
                 // which ptxas leaves a loop through) and branch targets, but every other control instruction (barriers,
                 // EXIT, convergence, DEPBAR) waits on them all.
@@ -281,9 +289,10 @@ public static class SassScheduler
                     for (int b = 0; b < 6; b++) if (shortOps[b]) wait |= 1 << b;
                     int end = BranchTarget(code, i);
                     wait &= ~asyncMask;
-                    frozen = 0;
-                    for (int b = 0; b < 6; b++) if (outstanding[b] != 0 && (wait >> b & 1) == 0) frozen |= 1 << b;
-                    frozenUntil = end + 1;   // through the reconvergence target
+                    int keep = 0;
+                    for (int b = 0; b < 6; b++) if (outstanding[b] != 0 && (wait >> b & 1) == 0) keep |= 1 << b;
+                    frozenRegions.Add((keep, end + 1));   // through the reconvergence target
+                    frozen |= keep;
                 }
                 else if (drain)
                 {
