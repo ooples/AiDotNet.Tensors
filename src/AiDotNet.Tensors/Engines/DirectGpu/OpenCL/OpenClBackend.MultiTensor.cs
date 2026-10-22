@@ -3,7 +3,9 @@ using System.Collections.Generic;
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 {
     // The global-norm clip as one work-group reduction per tensor (no device address tables on OpenCL), the OpenCL
-    // port of CudaBackend's IMultiTensorKernels. acc[0] holds the float sum of squares.
+    // port of CudaBackend's IMultiTensorKernels. The per-tensor launches accumulate a float sum and a non-finite mark;
+    // a last launch finishes them as the double CUDA writes (NaN when any element was not finite), so the same buffer
+    // also serves IDeviceScalarOps and the device-guarded optimizer updates (#1502).
     public sealed partial class OpenClBackend : IMultiTensorKernels
     {
         public void MultiTensorSumOfSquares(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer sumOfSquares)
@@ -20,6 +22,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 kernel.SetArg(2, acc);
                 kernel.Execute1D(MultiTensorArgs.ReductionGroupSize, MultiTensorArgs.ReductionGroupSize);
             }
+            var finish = _kernelCache["sum_squares_finish_double"];
+            finish.SetArg(0, acc);
+            finish.Execute1D(1, 1);
         }
 
         public void ClipScaleFromSumOfSquares(IGpuBuffer sumOfSquares, float maxNorm, IGpuBuffer scale)

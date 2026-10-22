@@ -15,9 +15,12 @@ public sealed partial class OpenClBackend : IDeviceScalarOps
         BroadcastMultiplyFirstAxis(buffer, scalar, buffer, 1, size);
     }
 
-    /// <remarks>No fused multi-tensor launch here; the reduction below is host-staged.</remarks>
-    bool IDeviceScalarOps.SupportsMultiTensorSumOfSquares => false;
+    /// <remarks>
+    /// The global-norm clip's reduction (<see cref="IMultiTensorKernels.MultiTensorSumOfSquares"/>): one work-group per
+    /// tensor and a finish, all on the device, writing the double this interface promises (#1502).
+    /// </remarks>
+    bool IDeviceScalarOps.SupportsMultiTensorSumOfSquares => IsAvailable;
 
     void IDeviceScalarOps.MultiTensorSumOfSquares(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer sumOfSquares)
-        => PortableDeviceScalarOps.MultiTensorSumOfSquares(this, tensors, sizes, sumOfSquares);
+        => ((IMultiTensorKernels)this).MultiTensorSumOfSquares(tensors, sizes, sumOfSquares);
 }

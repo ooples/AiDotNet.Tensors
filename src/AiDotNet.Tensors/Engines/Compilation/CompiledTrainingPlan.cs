@@ -2352,7 +2352,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             _finitenessDeferred = true;
             return true;
         }
-        double sumSquares = BitConverter.ToDouble(cuda.DownloadByteBuffer(guard, sizeof(double)), 0);
+        // The double from the guard's first two float slots: OpenCL's byte download accepts only its byte buffers.
+        float[] slots = cuda.DownloadBuffer(guard);
+        var bits = new byte[sizeof(double)];
+        Buffer.BlockCopy(slots, 0, bits, 0, sizeof(double));
+        double sumSquares = BitConverter.ToDouble(bits, 0);
         allFinite = !double.IsNaN(sumSquares) && !double.IsInfinity(sumSquares);
         return true;
     }

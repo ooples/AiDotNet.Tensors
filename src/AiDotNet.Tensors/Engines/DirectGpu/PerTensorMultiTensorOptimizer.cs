@@ -16,6 +16,24 @@ internal static class PerTensorMultiTensorOptimizer
         IReadOnlyList<int> sizes, float learningRate, float beta1, float beta2, float epsilon,
         float weightDecay, int step)
     {
+        ValidateAdam(parameters, gradients, firstMoments, secondMoments, sizes, epsilon, step);
+        int n = parameters.Count;
+        for (int t = 0; t < n; t++)
+        {
+            if (decoupledWeightDecay)
+                backend.AdamWUpdate(parameters[t], gradients[t], firstMoments[t], secondMoments[t],
+                    learningRate, beta1, beta2, epsilon, weightDecay, step, sizes[t]);
+            else
+                backend.AdamUpdate(parameters[t], gradients[t], firstMoments[t], secondMoments[t],
+                    learningRate, beta1, beta2, epsilon, weightDecay, step, sizes[t]);
+        }
+    }
+
+    /// <summary>The argument checks every Adam/AdamW <c>MultiTensorUpdate</c> runs before launching anything.</summary>
+    public static void ValidateAdam(IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
+        IReadOnlyList<IGpuBuffer> firstMoments, IReadOnlyList<IGpuBuffer> secondMoments, IReadOnlyList<int> sizes,
+        float epsilon, int step)
+    {
         if (parameters is null) throw new ArgumentNullException(nameof(parameters));
         if (gradients is null) throw new ArgumentNullException(nameof(gradients));
         if (firstMoments is null) throw new ArgumentNullException(nameof(firstMoments));
@@ -28,16 +46,6 @@ internal static class PerTensorMultiTensorOptimizer
         if (epsilon <= 0) throw new ArgumentOutOfRangeException(nameof(epsilon), "Epsilon must be positive.");
         for (int t = 0; t < n; t++)
             if (sizes[t] <= 0) throw new ArgumentOutOfRangeException(nameof(sizes), "Every tensor size must be positive.");
-
-        for (int t = 0; t < n; t++)
-        {
-            if (decoupledWeightDecay)
-                backend.AdamWUpdate(parameters[t], gradients[t], firstMoments[t], secondMoments[t],
-                    learningRate, beta1, beta2, epsilon, weightDecay, step, sizes[t]);
-            else
-                backend.AdamUpdate(parameters[t], gradients[t], firstMoments[t], secondMoments[t],
-                    learningRate, beta1, beta2, epsilon, weightDecay, step, sizes[t]);
-        }
     }
 
     /// <summary>
