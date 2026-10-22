@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // The declared convolution route (#890 phase 4b): CudaBackend runs a convolution, its data gradient or its weight
 // gradient as an implicit-GEMM program (optionally split), in the tuned slots' argument contract. The bar is a direct
 // fp64 convolution written out here, independent of the spec and its interpreter, so the slots' operand roles
@@ -87,7 +87,8 @@ public class DeclaredConvolutionRouteTests
     public void TheForwardRouteMatchesADirectConvolution(int shape, int tileM, int tileN, int epilogue)
     {
         using var backend = OpenBackendOrSkip();
-        Skip.IfNot(backend.DeclaredKernelsEnabled, "The declared route needs the sm_75+ codegen conveyor.");
+        Skip.IfNot(backend.DeclaredKernelsEnabled,
+            "The declared route is not released on this architecture (see AIDOTNET_DECLARED_KERNELS_ARCH).");
         var g = Shape(shape);
         float[] x = Fill(g.N * g.C * g.H * g.W, 1), w = Fill(g.K * g.C * g.Kernel * g.Kernel, 2), b = Fill(g.K, 3);
         var expected = new double[g.N * g.K * g.OutH * g.OutW];
@@ -130,7 +131,8 @@ public class DeclaredConvolutionRouteTests
     public void TheBackwardRoutesMatchADirectConvolution(int shape, bool weights, int tileM, int tileN, int split)
     {
         using var backend = OpenBackendOrSkip();
-        Skip.IfNot(backend.DeclaredKernelsEnabled, "The declared route needs the sm_75+ codegen conveyor.");
+        Skip.IfNot(backend.DeclaredKernelsEnabled,
+            "The declared route is not released on this architecture (see AIDOTNET_DECLARED_KERNELS_ARCH).");
         var g = Shape(shape);
         float[] x = Fill(g.N * g.C * g.H * g.W, 1), w = Fill(g.K * g.C * g.Kernel * g.Kernel, 2);
         float[] dy = Fill(g.N * g.K * g.OutH * g.OutW, 4);
@@ -166,7 +168,8 @@ public class DeclaredConvolutionRouteTests
     public void TheParityDataGradientMatchesADirectConvolution(int shape, int tileM)
     {
         using var backend = OpenBackendOrSkip();
-        Skip.IfNot(backend.DeclaredKernelsEnabled, "The declared route needs the sm_75+ codegen conveyor.");
+        Skip.IfNot(backend.DeclaredKernelsEnabled,
+            "The declared route is not released on this architecture (see AIDOTNET_DECLARED_KERNELS_ARCH).");
         var g = shape == 4 ? new Geometry(2, 8, 16, 15, 14, 3, 2, 1, 1) : Shape(shape);
         float[] w = Fill(g.K * g.C * g.Kernel * g.Kernel, 2), dy = Fill(g.N * g.K * g.OutH * g.OutW, 4);
         var expected = new double[g.N * g.C * g.H * g.W];
@@ -191,7 +194,8 @@ public class DeclaredConvolutionRouteTests
     public void ARepeatedCallAllocatesNothing()
     {
         using var backend = OpenBackendOrSkip();
-        Skip.IfNot(backend.DeclaredKernelsEnabled, "The declared route needs the sm_75+ codegen conveyor.");
+        Skip.IfNot(backend.DeclaredKernelsEnabled,
+            "The declared route is not released on this architecture (see AIDOTNET_DECLARED_KERNELS_ARCH).");
         var g = Shape(0);
         using var bx = backend.AllocateBuffer(Fill(g.N * g.C * g.H * g.W, 1));
         using var bw = backend.AllocateBuffer(Fill(g.K * g.C * 9, 2));
@@ -218,7 +222,8 @@ public class DeclaredConvolutionRouteTests
     public void UnsupportedCallsDecline()
     {
         using var backend = OpenBackendOrSkip();
-        Skip.IfNot(backend.DeclaredKernelsEnabled, "The declared route needs the sm_75+ codegen conveyor.");
+        Skip.IfNot(backend.DeclaredKernelsEnabled,
+            "The declared route is not released on this architecture (see AIDOTNET_DECLARED_KERNELS_ARCH).");
         using var x = backend.AllocateBuffer(2 * 4 * 9 * 9);
         using var w = backend.AllocateBuffer(8 * 4 * 3 * 1);
         using var y = backend.AllocateBuffer(2 * 8 * 7 * 9);

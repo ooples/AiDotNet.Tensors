@@ -18,14 +18,17 @@ public class DeclaredGemmRouteTests
 {
     private static CudaBackend OpenBackendOrSkip()
     {
-        Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver is unavailable.");
+        // IsCudaAvailable, not CudaNativeBindings.IsAvailable: the backend also reports unavailable when NVRTC is
+        // missing, and guarding on the driver alone turns that host into a throw instead of a skip.
+        Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA driver or NVRTC is unavailable.");
         var backend = new CudaBackend();
         if (!backend.IsAvailable)
         {
             backend.Dispose();
-            throw new InvalidOperationException("CUDA driver was detected, but the CUDA backend failed to initialize.");
+            throw new InvalidOperationException("CUDA and NVRTC were detected, but the CUDA backend failed to initialize.");
         }
-        Skip.IfNot(backend.DeclaredKernelsEnabled, "The declared route needs the sm_75+ codegen conveyor.");
+        Skip.IfNot(backend.DeclaredKernelsEnabled,
+            "The declared route is not released on this architecture (see AIDOTNET_DECLARED_KERNELS_ARCH).");
         return backend;
     }
 

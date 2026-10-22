@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // Gather and deterministic scatter (#890 phase 4e): Embedding / Gather run the declared lookup
 // (CodegenBackendPrograms.Embedding), and the deterministic EmbeddingBackward and ScatterAdd run the sorted kernels
 // (CudaSortedScatterKernels). A gather copies and the sorted scatter makes the same additions in the same order, so
@@ -24,7 +24,8 @@ public class DeclaredGatherRouteTests
             backend.Dispose();
             throw new InvalidOperationException("CUDA driver was detected, but the CUDA backend failed to initialize.");
         }
-        Skip.IfNot(backend.DeclaredKernelsEnabled, "The declared route needs the sm_75+ codegen conveyor.");
+        Skip.IfNot(backend.DeclaredKernelsEnabled,
+            "The declared route is not released on this architecture (see AIDOTNET_DECLARED_KERNELS_ARCH).");
         return backend;
     }
 

@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // The declared linear-layer route (#890 phase 4c): CudaBackend.FusedLinear{ReLU,Sigmoid,Tanh,GELU,Swish} and their
 // backwards are served by declared programs in the hand-written kernels' contract. Both routes -- declared, and the
 // hand-written kernels with the switch off -- are checked against an fp64 reference written out here.
@@ -123,7 +123,8 @@ public class DeclaredLinearRouteTests
     public void TheDeclaredLinearMatchesTheReference(string activation, int batch, int inFeatures, int outFeatures)
     {
         using var backend = OpenBackendOrSkip();
-        Skip.IfNot(backend.DeclaredKernelsEnabled, "The declared route needs the sm_75+ codegen conveyor.");
+        Skip.IfNot(backend.DeclaredKernelsEnabled,
+            "The declared route is not released on this architecture (see AIDOTNET_DECLARED_KERNELS_ARCH).");
         float[] x = Fill(batch * inFeatures, 1), w = Fill(inFeatures * outFeatures, 2), b = Fill(outFeatures, 3);
         float[] dy = Fill(batch * outFeatures, 4);
         var pre = new double[batch * outFeatures];

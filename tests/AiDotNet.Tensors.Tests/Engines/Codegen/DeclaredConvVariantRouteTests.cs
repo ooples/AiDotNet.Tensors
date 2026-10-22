@@ -18,12 +18,14 @@ public class DeclaredConvVariantRouteTests
 {
     private static CudaBackend OpenBackendOrSkip()
     {
-        Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver is unavailable.");
+        // IsCudaAvailable, not CudaNativeBindings.IsAvailable: the backend also reports unavailable when NVRTC is
+        // missing, and guarding on the driver alone turns that host into a throw instead of a skip.
+        Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA driver or NVRTC is unavailable.");
         var backend = new CudaBackend();
         if (!backend.IsAvailable)
         {
             backend.Dispose();
-            throw new InvalidOperationException("CUDA driver was detected, but the CUDA backend failed to initialize.");
+            throw new InvalidOperationException("CUDA and NVRTC were detected, but the CUDA backend failed to initialize.");
         }
         return backend;
     }
@@ -162,7 +164,8 @@ public class DeclaredConvVariantRouteTests
     {
         var variant = (DeclaredConvVariant)variantIndex;
         using var backend = OpenBackendOrSkip();
-        Skip.IfNot(backend.DeclaredKernelsEnabled, "The declared route needs the sm_75+ codegen conveyor.");
+        Skip.IfNot(backend.DeclaredKernelsEnabled,
+            "The declared route is not released on this architecture (see AIDOTNET_DECLARED_KERNELS_ARCH).");
         var g = variant <= DeclaredConvVariant.DepthwiseBackwardWeights ? Depthwise(shape) : Transposed(shape);
         var sc = CudaBackend.DeclaredConvVariantSchedules(variant)[schedule];
         var (a, b, expected) = Problem(variant, g);
@@ -297,7 +300,8 @@ public class DeclaredConvVariantRouteTests
     public void EveryOperatorHasADeclaredScheduleForEveryShape()
     {
         using var backend = OpenBackendOrSkip();
-        Skip.IfNot(backend.DeclaredKernelsEnabled, "The declared route needs the sm_75+ codegen conveyor.");
+        Skip.IfNot(backend.DeclaredKernelsEnabled,
+            "The declared route is not released on this architecture (see AIDOTNET_DECLARED_KERNELS_ARCH).");
         foreach (DeclaredConvVariant v in Enum.GetValues(typeof(DeclaredConvVariant)))
         {
             bool depthwise = v <= DeclaredConvVariant.DepthwiseBackwardWeights;

@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // The declared-program route (#890 phase 4): CudaBackend.LayerNorm is served by the program
 // lowered from its spec, in the hand-written kernel's contract (y, the saved mean and rstd).
 //
@@ -45,7 +45,8 @@ public class DeclaredProgramRouteTests
     public void LayerNormTakesTheDeclaredProgramWithinTheConditioningBound(int rows, int cols)
     {
         using var backend = OpenBackendOrSkip();
-        Skip.IfNot(backend.DeclaredKernelsEnabled, "The declared route needs the sm_75+ codegen conveyor.");
+        Skip.IfNot(backend.DeclaredKernelsEnabled,
+            "The declared route is not released on this architecture (see AIDOTNET_DECLARED_KERNELS_ARCH).");
 
         var (y, mean, rstd, routed) = RunLayerNorm(backend, rows, cols, declared: true);
         Assert.True(routed, "the call fell through to the hand-written kernel: " +
@@ -71,7 +72,8 @@ public class DeclaredProgramRouteTests
     public void AProgramIsBuiltOutsideCaptureAndReplaysInsideIt()
     {
         using var backend = OpenBackendOrSkip();
-        Skip.IfNot(backend.DeclaredKernelsEnabled, "The declared route needs the sm_75+ codegen conveyor.");
+        Skip.IfNot(backend.DeclaredKernelsEnabled,
+            "The declared route is not released on this architecture (see AIDOTNET_DECLARED_KERNELS_ARCH).");
         const int rows = 48, cols = 200;
         var (x, gamma, beta) = Inputs(rows, cols);
         using var bx = backend.AllocateBuffer(x);
@@ -119,7 +121,8 @@ public class DeclaredProgramRouteTests
     public void EveryRoutedFamilyFiresAndAgreesWithTheIncumbent(string family)
     {
         using var backend = OpenBackendOrSkip();
-        Skip.IfNot(backend.DeclaredKernelsEnabled, "The declared route needs the sm_75+ codegen conveyor.");
+        Skip.IfNot(backend.DeclaredKernelsEnabled,
+            "The declared route is not released on this architecture (see AIDOTNET_DECLARED_KERNELS_ARCH).");
         foreach (var (inputs, outputSizes, call) in FamilyCases(family))
         {
             var results = new float[2][][];
@@ -233,7 +236,8 @@ public class DeclaredProgramRouteTests
     public void ColumnFusedLayerNormBackwardIsBitIdenticalRunToRun(int rows, int cols)
     {
         using var backend = OpenBackendOrSkip();
-        Skip.IfNot(backend.DeclaredKernelsEnabled, "The declared route needs the sm_75+ codegen conveyor.");
+        Skip.IfNot(backend.DeclaredKernelsEnabled,
+            "The declared route is not released on this architecture (see AIDOTNET_DECLARED_KERNELS_ARCH).");
         var rng = new Random(rows + cols);
         float[] R(int n, double offset)
         {
