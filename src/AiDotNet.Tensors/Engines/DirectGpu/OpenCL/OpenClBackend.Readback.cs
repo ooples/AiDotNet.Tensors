@@ -56,16 +56,35 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                             UIntPtr.Zero, (UIntPtr)byteCount, _pin.AddrOfPinnedObject(), waits.Count, waits.Pointer,
                             out transferEvent);
                         if (err == OpenClNativeBindings.CL_SUCCESS)
-                            DirectOpenClSubmission.CommitLocked(stream.Handle, memories);
+                        {
+                            // The copy is queued: its event is kept before CommitLocked, which may flush and throw, so
+                            // Dispose still waits for it before unpinning. The previous copy into the same bytes is
+                            // ordered ahead of this one on the in-order queue; its event is released, not waited on.
+                            ReleaseEvent();
+                            _event = transferEvent;
+                            try
+                            {
+                                DirectOpenClSubmission.CommitLocked(stream.Handle, memories);
+                            }
+                            catch
+                            {
+                                // The bytes are being overwritten, so there is no value to read until the next Enqueue.
+                                _queued = false;
+                                _unread = false;
+                                throw;
+                            }
+                        }
                     }
                     if (err != OpenClNativeBindings.CL_SUCCESS)
                         throw new InvalidOperationException($"clEnqueueReadBuffer(readback) failed: {err}");
-                    // The previous copy into the same bytes is ordered ahead of this one on the in-order queue; its
-                    // event is released, not waited on, and only once the new copy is queued.
-                    ReleaseEvent();
-                    _event = transferEvent;
                     // A driver may hold enqueued commands until a flush: without one, Read would be the first push.
-                    OpenClNativeBindings.Flush(stream.Handle);
+                    int flushError = OpenClNativeBindings.Flush(stream.Handle);
+                    if (flushError != OpenClNativeBindings.CL_SUCCESS)
+                    {
+                        _queued = false;
+                        _unread = false;
+                        throw new InvalidOperationException($"clFlush(readback) failed: {flushError}");
+                    }
                 }
                 finally
                 {
