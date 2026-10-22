@@ -33,9 +33,9 @@ public sealed partial class CudaBackend
     // many elements (256 MiB, the convolution im2col route's bound) the call keeps the hand-written path.
     private const long AttentionMaxScoreElements = 64L * 1024 * 1024;
 
-    // Keys seen once. A program is compiled per shape, so a shape is routed from its SECOND call: one that recurs
-    // (training, a fixed batch) pays one compile, while autoregressive decoding -- seqK one longer every token, every
-    // shape new -- keeps the hand-written kernel instead of compiling a program per token.
+    // Keys seen once whose geometry had already appeared with another key length (see AttentionShapeRecurs): such a
+    // key is routed from its SECOND call, so autoregressive decoding -- seqK one longer every token, every shape new --
+    // keeps the hand-written kernel instead of compiling a program per token.
     private readonly HashSet<DeclaredKey> _attentionSeenOnce = new();
 
     // Decoding gives this set one new key per token, so it needs a bound of its own: the programs are bounded by the
@@ -44,10 +44,25 @@ public sealed partial class CudaBackend
     // routed - it just needs two more sightings - while the set cannot exceed the cap.
     private const int AttentionSeenOnceCapacity = 4096;
 
-    // Whether a key's program may be built now: true from its second sighting. The caller holds _directPtxLock.
+    // The last key length seen for each geometry (the key with seqK cleared). A decode loop shows the same geometry
+    // with a new seqK call after call; anything else (training, a fixed batch, one-off shapes) shows it once per length.
+    // Bounded like the seen-once set, and dropped rather than closed at the cap for the same reason.
+    private readonly Dictionary<DeclaredKey, int> _attentionLastSeqK = new();
+
+    // Whether a key's program may be built now (#1529). A geometry's first length is built at once, so the first call of
+    // a shape and every later one take the same route: building only from the second sighting made two identical calls
+    // differ in their last bits (the first ran the hand-written kernel, the second the program). Once the geometry has
+    // come back with another length (decoding: seqK one longer every token), a length is built only from its second
+    // sighting, so decoding still compiles nothing per token. The caller holds _directPtxLock.
     private bool AttentionShapeRecurs(DeclaredKey key)
     {
         if (_attentionSeenOnce.Contains(key)) return true;
+        var geometry = new DeclaredKey(key.Family, key.D0, key.D1, key.D2, 0, key.Epsilon, key.Momentum, key.Name,
+            key.D4, key.D5);
+        bool lengthChanged = _attentionLastSeqK.TryGetValue(geometry, out int lastSeqK) && lastSeqK != key.D3;
+        if (_attentionLastSeqK.Count >= AttentionSeenOnceCapacity) _attentionLastSeqK.Clear();
+        _attentionLastSeqK[geometry] = key.D3;
+        if (!lengthChanged) return true;
         if (_attentionSeenOnce.Count >= AttentionSeenOnceCapacity) _attentionSeenOnce.Clear();
         _attentionSeenOnce.Add(key);
         return false;
@@ -195,7 +210,7 @@ public sealed partial class CudaBackend
     {
         if (stats is not null && (weights is not null || mask is not null)) return false;
         // The same extent and grouping guards the two backward routes already carry. Without them a
-        // malformed call reaches CodegenBackendPrograms.ScaledDotProductAttention on its second sighting,
+        // malformed call reaches CodegenBackendPrograms.ScaledDotProductAttention when its program is built,
         // which throws ArgumentOutOfRangeException or ArgumentException; BuildAttentionProgram catches only
         // NotSupportedException, so that would escape from inside _directPtxLock instead of declining the
         // route and letting the hand-written kernel serve the call.

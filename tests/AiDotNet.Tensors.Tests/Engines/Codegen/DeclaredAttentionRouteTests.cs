@@ -139,7 +139,7 @@ public class DeclaredAttentionRouteTests
                 using var bweights = storeWeights ? backend.AllocateBuffer(Fill(expectedWeights.Length, 5)) : null;
                 void Call() => backend.ScaledDotProductAttention(bq, bk, bv, bout, bweights, bmask, batch, heads, seqQ, seqK,
                     headDim, scale, causal, numKVHeads: kvHeads);
-                Call();   // a shape is compiled once it recurs, so the declared route serves it from the second call
+                Call();   // the first call builds the program (and compiles it)
                 long before = backend.DeclaredProgramLaunches;
                 Call();
                 backend.Synchronize();
@@ -241,11 +241,12 @@ public class DeclaredAttentionRouteTests
     }
 
     /// <summary>
-    /// A shape is compiled only once it recurs: decoding, whose seqK grows every token, keeps the hand-written kernel at
-    /// every step instead of compiling a program per token; a repeated shape is served declared from its second call.
+    /// Decoding, whose seqK grows every token, compiles a program for its first length only and keeps the hand-written
+    /// kernel at the new lengths after it, instead of compiling a program per token; a length that recurs is served
+    /// declared from its second call (#1529).
     /// </summary>
     [SkippableFact]
-    public void AShapeIsCompiledOnlyOnceItRecurs()
+    public void ADecodeLoopCompilesOnlyItsFirstLengthAndALengthThatRecurs()
     {
         using var backend = OpenBackendOrSkip();
         const int heads = 2, dim = 16, capacity = 12;
@@ -254,13 +255,42 @@ public class DeclaredAttentionRouteTests
         using var v = backend.AllocateBuffer(Fill(heads * capacity * dim, 3));
         using var o = backend.AllocateBuffer(heads * dim);
         long before = backend.DeclaredProgramLaunches;
+        // The geometry's first length is built at once (#1529); every later length is new, so none is built.
         for (int seqK = 1; seqK <= 8; seqK++)
             backend.ScaledDotProductAttention(q, k, v, o, null, null, 1, heads, 1, seqK, dim, 0.25f, true);
         backend.Synchronize();
-        Assert.Equal(before, backend.DeclaredProgramLaunches);
+        Assert.Equal(before + 1, backend.DeclaredProgramLaunches);
         backend.ScaledDotProductAttention(q, k, v, o, null, null, 1, heads, 1, 8, dim, 0.25f, true);
         backend.Synchronize();
+        Assert.Equal(before + 2, backend.DeclaredProgramLaunches);
+    }
+
+    /// <summary>
+    /// #1529: a shape is declared from its first call, so two identical calls take the same route and agree bit for
+    /// bit. Built only from the second sighting, the first ran the hand-written kernel and the second the program.
+    /// </summary>
+    [SkippableFact]
+    public void ANewShapeIsDeclaredFromItsFirstCall_SoIdenticalCallsAgreeBitForBit()
+    {
+        using var backend = OpenBackendOrSkip();
+        const int batch = 1, heads = 2, seq = 24, dim = 16;
+        using var q = backend.AllocateBuffer(Fill(batch * heads * seq * dim, 1));
+        using var k = backend.AllocateBuffer(Fill(batch * heads * seq * dim, 2));
+        using var v = backend.AllocateBuffer(Fill(batch * heads * seq * dim, 3));
+        using var o = backend.AllocateBuffer(batch * heads * seq * dim);
+        float[] Call()
+        {
+            backend.ScaledDotProductAttention(q, k, v, o, null, null, batch, heads, seq, seq, dim, 0.25f, true);
+            backend.Synchronize();
+            return backend.DownloadBuffer(o);
+        }
+        long before = backend.DeclaredProgramLaunches;
+        float[] first = Call();
         Assert.Equal(before + 1, backend.DeclaredProgramLaunches);
+        float[] second = Call();
+        Assert.Equal(before + 2, backend.DeclaredProgramLaunches);
+        for (int i = 0; i < first.Length; i++)
+            Assert.Equal(TestHelpers.MathCompat.SingleToInt32Bits(first[i]), TestHelpers.MathCompat.SingleToInt32Bits(second[i]));
     }
 
     /// <summary>
@@ -398,7 +428,7 @@ public class DeclaredAttentionRouteTests
         for (int i = 0; i < 2; i++)
             backend.ScaledDotProductAttention(q, k, v, o, null, null, 1, heads, seq, seq, dim, 0.35f, false);
         backend.Synchronize();
-        Assert.Equal(before + 1, backend.DeclaredProgramLaunches);   // the second, uncapped call
+        Assert.Equal(before + 2, backend.DeclaredProgramLaunches);   // both uncapped calls (#1529: built at first sighting)
     }
 
     /// <summary>
