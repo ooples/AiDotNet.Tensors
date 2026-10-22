@@ -416,6 +416,8 @@ void main() {
     int j = (gid / innerSize) % indexAxis;
     int outer = (gid / innerSize) / indexAxis;
     int sourceIndex = indices[j];
+    // An index outside the source axis yields zeros (as the declared gather does) instead of a read outside it.
+    if (sourceIndex < 0 || sourceIndex >= sourceAxis) { output_[gid] = 0.0; return; }
     output_[gid] = source[(outer * sourceAxis + sourceIndex) * innerSize + inner];
 }
 ";

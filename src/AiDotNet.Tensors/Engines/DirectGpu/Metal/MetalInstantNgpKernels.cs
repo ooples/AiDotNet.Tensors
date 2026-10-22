@@ -397,6 +397,8 @@ kernel void resident_index_select(
     int j = (int(gid) / innerSize) % indexAxis;
     int outer = (int(gid) / innerSize) / indexAxis;
     int sourceIndex = indices[j];
+    // An index outside the source axis yields zeros (as the declared gather does) instead of a read outside it.
+    if (sourceIndex < 0 || sourceIndex >= sourceAxis) { output[gid] = 0.0f; return; }
     output[gid] = source[(outer * sourceAxis + sourceIndex) * innerSize + inner];
 }
 
