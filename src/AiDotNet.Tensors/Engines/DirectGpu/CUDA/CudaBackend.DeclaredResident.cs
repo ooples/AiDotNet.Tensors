@@ -110,6 +110,16 @@ public sealed partial class CudaBackend
             new DeclaredBindings(gradOutput, input, gamma, saveMean, saveInvVar, gradInput, gradGamma, gradBeta));
 
     /// <summary>
+    /// GroupNorm backward as a resident stage. <paramref name="saveInvVar"/> is the forward's slot, 1/sqrt(var + eps).
+    /// </summary>
+    internal static DeclaredResidentStage GroupNormBackwardStage(IGpuBuffer gradOutput, IGpuBuffer input,
+        IGpuBuffer gamma, IGpuBuffer saveMean, IGpuBuffer saveInvVar, IGpuBuffer gradInput, IGpuBuffer gradGamma,
+        IGpuBuffer gradBeta, int batch, int numGroups, int channels, int spatialSize) =>
+        new(GroupNormBackwardKey(batch, channels, numGroups, spatialSize), s_buildGroupNormBackward,
+            s_normBackwardNames, new DeclaredBindings(gradOutput, input, gamma, saveMean, saveInvVar, gradInput,
+                gradGamma, gradBeta));
+
+    /// <summary>
     /// A derived elementwise kernel (relu, gelu, sinf, leaky_relu, ...) as a resident stage over <paramref name="length"/>
     /// elements: the same library function the routed call applies, with any scalars fixed for the stage.
     /// </summary>
