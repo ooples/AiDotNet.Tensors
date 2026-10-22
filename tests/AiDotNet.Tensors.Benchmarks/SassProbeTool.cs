@@ -21,6 +21,11 @@ internal static class SassProbeTool
 {
     internal static void Run(string[] args)
     {
+        if (Array.IndexOf(args, "--tc") >= 0)
+        {
+            RunTensorCore(args);
+            return;
+        }
         if (Array.IndexOf(args, "--gemm") >= 0)
         {
             RunGemm(args);
@@ -321,6 +326,132 @@ internal static class SassProbeTool
         sb.Append("    ld.param.u64 %rd0, [p0];\n    cvta.to.global.u64 %rd1, %rd0;\n    mul.wide.u32 %rd2, %r3, 4;\n    add.s64 %rd3, %rd1, %rd2;\n")
           .Append("    st.global.f32 [%rd3], %s;\n    ret;\n}\n");
         return sb.ToString();
+    }
+
+    // --tc: the Tensor-Core GEMM (PtxTensorCoreGemmGenerator: mma.sync m16n8k8 TF32, or m16n8k16 FP16 with --fp16,
+    // through a cp.async pipeline), the gate's other compute-bound kernel. Each seed configuration runs a square problem
+    // through the PTX path's module and the rewritten one; outputs must be bit-identical, times are paired (median of 15).
+    private static unsafe void RunTensorCore(string[] args)
+    {
+        using var runtime = new DirectPtxRuntime();
+        int major = runtime.ComputeCapabilityMajor, minor = runtime.ComputeCapabilityMinor;
+        int size = Array.IndexOf(args, "--size") is int sz && sz >= 0 ? int.Parse(args[sz + 1], CultureInfo.InvariantCulture) : 4096;
+        string pass = Array.IndexOf(args, "--pass") is int at && at >= 0 && at + 1 < args.Length ? args[at + 1] : "control";
+        int upto = Array.IndexOf(args, "--upto") is int u && u >= 0 ? int.Parse(args[u + 1], CultureInfo.InvariantCulture) : int.MaxValue;
+        string? only = Array.IndexOf(args, "--only") is int on && on >= 0 ? args[on + 1] : null;
+        var precision = Array.IndexOf(args, "--fp16") >= 0 ? PtxTensorCorePrecision.Fp16 : PtxTensorCorePrecision.Tf32;
+        int elementBytes = precision == PtxTensorCorePrecision.Fp16 ? 2 : 4;
+        var layout = new PtxGemmLayout(false, false);
+        Console.WriteLine("SASS TENSOR-CORE GEMM sm_" + major + minor + " " + precision + " M=N=K=" + size + " (nn)");
+        Console.WriteLine("configuration                              regs  identical   ptx us   sass us   ratio  ptx TFLOPS");
+        var failures = new List<string>();
+        var random = new Random(1442);
+        long elements = (long)size * size;
+        var buffers = new List<DirectPtxBuffer>();
+        try
+        {
+            IntPtr Upload()
+            {
+                var buffer = runtime.AllocateBytes((nuint)(elements * elementBytes));
+                if (precision == PtxTensorCorePrecision.Fp16)
+                {
+                    var half = new Half[elements];
+                    for (long i = 0; i < elements; i++) half[i] = (Half)(random.NextDouble() * 2 - 1);
+                    buffer.Upload<Half>(half);
+                }
+                else
+                {
+                    var single = new float[elements];
+                    for (long i = 0; i < elements; i++) single[i] = (float)(random.NextDouble() * 2 - 1);
+                    buffer.Upload<float>(single);
+                }
+                buffers.Add(buffer);
+                return buffer.Pointer;
+            }
+            IntPtr a = Upload(), b = Upload();
+            var c0 = runtime.AllocateBytes((nuint)(elements * sizeof(float)));
+            buffers.Add(c0);
+            var c1 = runtime.AllocateBytes((nuint)(elements * sizeof(float)));
+            buffers.Add(c1);
+            foreach (var config in PtxTensorCoreGemmEvolution.Seeds(layout, size, size, size, precision))
+            {
+                if (only is not null && config.Name != only) continue;
+                string ptx = PtxTensorCoreGemmGenerator.Emit(config, layout, major, minor, precision);
+                string? decline = null;
+                int registers = 0;
+                byte[] Rewrite(byte[] image)
+                {
+                    if (Array.IndexOf(args, "--save") is int sv && sv >= 0) System.IO.File.WriteAllBytes(args[sv + 1], image);
+                    return ApplyPass(image, major * 10 + minor, pass, upto, Array.IndexOf(args, "--dump") >= 0, out registers, out decline);
+                }
+                using var ptxModule = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
+                using var sassModule = runtime.LoadRewrittenModule(ptx, Rewrite, "sass-tc");
+                string name = config.Name.PadRight(42);
+                if (decline is not null)
+                {
+                    Console.WriteLine(name + decline);
+                    continue;
+                }
+                int shared = config.SharedBytes(layout, precision);
+                IntPtr ptxFunction, sassFunction;
+                try
+                {
+                    ptxFunction = ptxModule.GetFunction(PtxTensorCoreGemmGenerator.EntryPoint);
+                    sassFunction = sassModule.GetFunction(PtxTensorCoreGemmGenerator.EntryPoint);
+                }
+                catch (InvalidOperationException e) when (e.Message.Contains("local"))
+                {
+                    Console.WriteLine(name + "skipped: spills (the direct-kernel contract rejects local memory)");
+                    continue;
+                }
+                ptxModule.SetMaxDynamicSharedMemory(ptxFunction, shared);
+                sassModule.SetMaxDynamicSharedMemory(sassFunction, shared);
+                void Launch(DirectPtxModule module, IntPtr function, IntPtr c)
+                {
+                    ulong ap = (ulong)a, bp = (ulong)b, cp = (ulong)c, stride = 0;
+                    uint dim = (uint)size;
+                    float alpha = 1, beta = 0;
+                    void** argv = stackalloc void*[14];
+                    argv[0] = &ap; argv[1] = &bp; argv[2] = &cp;
+                    argv[3] = &dim; argv[4] = &dim; argv[5] = &dim; argv[6] = &dim; argv[7] = &dim; argv[8] = &dim;
+                    argv[9] = &alpha; argv[10] = &beta; argv[11] = &stride; argv[12] = &stride; argv[13] = &stride;
+                    module.Launch(function, (uint)((size + config.BlockN - 1) / config.BlockN),
+                        (uint)((size + config.BlockM - 1) / config.BlockM), 1, (uint)config.Threads, 1, 1, (uint)shared, argv);
+                }
+                Launch(ptxModule, ptxFunction, c0.Pointer);
+                Launch(sassModule, sassFunction, c1.Pointer);
+                runtime.Synchronize();
+                var r0 = new float[elements];
+                var r1 = new float[elements];
+                c0.Download<float>(r0);
+                c1.Download<float>(r1);
+                bool identical = true;
+                for (long i = 0; i < r0.Length && identical; i++)
+                    identical = BitConverter.SingleToInt32Bits(r0[i]) == BitConverter.SingleToInt32Bits(r1[i]);
+                if (!identical) failures.Add(config.Name);
+                var ptxSamples = new List<double>();
+                var sassSamples = new List<double>();
+                for (int round = 0; round < 15; round++)
+                {
+                    ptxSamples.Add(runtime.MeasureKernelMilliseconds(() => Launch(ptxModule, ptxFunction, c0.Pointer), 1, 3) * 1000);
+                    sassSamples.Add(runtime.MeasureKernelMilliseconds(() => Launch(sassModule, sassFunction, c1.Pointer), 1, 3) * 1000);
+                }
+                ptxSamples.Sort();
+                sassSamples.Sort();
+                double flops = 2.0 * size * size * size;
+                Console.WriteLine(name + registers.ToString(CultureInfo.InvariantCulture).PadLeft(5) +
+                    (identical ? "yes" : "NO").PadLeft(11) +
+                    ptxSamples[7].ToString("F1", CultureInfo.InvariantCulture).PadLeft(9) +
+                    sassSamples[7].ToString("F1", CultureInfo.InvariantCulture).PadLeft(10) +
+                    (ptxSamples[7] / sassSamples[7]).ToString("F2", CultureInfo.InvariantCulture).PadLeft(8) + "x" +
+                    (flops / (ptxSamples[7] * 1e6)).ToString("F2", CultureInfo.InvariantCulture).PadLeft(12));
+            }
+        }
+        finally
+        {
+            foreach (var buffer in buffers) buffer.Dispose();
+        }
+        if (failures.Count != 0) throw new InvalidOperationException("Not bit-identical: " + string.Join(", ", failures));
     }
 
     // --gemm: the register-blocked FP32 GEMM (PtxSgemmGenerator), the compute-bound kernel the backend's gate is measured

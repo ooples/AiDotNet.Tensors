@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // What each Volta-family SASS opcode reads and writes, for the own SASS backend's register allocation and scheduling
 // (#1442). An instruction's bits 0-8 name the operation and bits 9-11 its operand form; --sass-learn measured, on the
 // catalog's kernels compiled for sm_75, where each form keeps its register sources:
@@ -130,7 +130,8 @@ public static class SassOpcodeTable
     private sealed record Spec(string Mnemonic, SassLatency Latency, bool WritesD, int DWidth, Sources Sources,
         int[] PredicateWrites, int[] PredicateReads, bool Memory = false, bool Store = false, int AddressWidth = 1,
         bool ReadsAllPredicates = false, bool WideC = false, int FixedLatency = AluLatency, bool Uniform = false,
-        bool SizedD = false, bool VectorSources = false, bool AsyncCopy = false, int UniformThirdPredicateFlag = -1);
+        bool SizedD = false, bool VectorSources = false, bool AsyncCopy = false, int UniformThirdPredicateFlag = -1,
+        bool Mma = false, bool MatrixLoad = false);
 
     private static readonly Dictionary<int, Spec> s_specs = new()
     {
@@ -177,6 +178,15 @@ public static class SassOpcodeTable
         [0x184] = new("LDS", SassLatency.Variable, true, 1, Sources.None, [], [], Memory: true),
         [0x186] = new("STG", SassLatency.Variable, false, 0, Sources.None, [], [], Memory: true, Store: true, AddressWidth: 2),
         [0x188] = new("STS", SassLatency.Variable, false, 0, Sources.None, [], [], Memory: true, Store: true),
+        // Local memory (register spills): [R1 + offset], the access width in bits 73-75 as for the other loads/stores.
+        [0x183] = new("LDL", SassLatency.Variable, true, 1, Sources.None, [], [], Memory: true),
+        [0x187] = new("STL", SassLatency.Variable, false, 0, Sources.None, [], [], Memory: true, Store: true),
+        // sm_75+: ldmatrix. LDSM.16.M88.{1,2,4} loads 1 << bits 72-73 registers from the shared address at A.
+        [0x03b] = new("LDSM", SassLatency.Variable, true, 1, Sources.None, [], [], MatrixLoad: true),
+        // sm_80+: mma.sync m16n8k8 TF32 (HMMA.1688.F32.TF32) and m16n8k16 FP16 (HMMA.16816.F32), FP32 accumulate:
+        // D (4 registers) = A (4) x B (2) + C (4), on the tensor pipe's fixed latency (ptxas sets no scoreboard; it never
+        // reads a result sooner than 56 cycles on, over the TF32 and FP16 GEMM seeds on sm_86).
+        [0x03c] = new("HMMA", SassLatency.Fixed, true, 4, Sources.ABC, [], [], Mma: true, FixedLatency: 56),
         [0x1ae] = new("LDGSTS", SassLatency.Variable, false, 0, Sources.None, [], [87], AsyncCopy: true),
         [0x1af] = new("LDGDEPBAR", SassLatency.Variable, false, 0, Sources.None, [], []),
         [0x118] = new("NOP", SassLatency.Control, false, 0, Sources.None, [], []),
@@ -201,7 +211,25 @@ public static class SassOpcodeTable
         bool uniformD = spec.Uniform, uniformSources = spec.Uniform && !spec.VectorSources;
         var writes = new List<SassRegisterOperand>();
         var reads = new List<SassRegisterOperand>();
-        if (spec.AsyncCopy)
+        if (spec.Mma)
+        {
+            // Only the register form (0x23c) and the FP32-accumulating shapes --sass-learn has seen (bits 75 and 83:
+            // 01 = 1688.F32.TF32, 10 = 16816.F32); another variant may size its operands differently.
+            int shape = (int)instruction.Bits(75, 1) | (int)instruction.Bits(83, 1) << 1;
+            if (form != 1 || shape is not (1 or 2)) return null;
+            writes.Add(new SassRegisterOperand(D, 4));
+            reads.Add(new SassRegisterOperand(A, 4));
+            reads.Add(new SassRegisterOperand(B, 2));
+            reads.Add(new SassRegisterOperand(C, 4));
+        }
+        else if (spec.MatrixLoad)
+        {
+            int count = (int)instruction.Bits(72, 2);
+            if (form != 4 || count == 3) return null;
+            reads.Add(new SassRegisterOperand(A, 1));
+            writes.Add(new SassRegisterOperand(D, 1 << count));
+        }
+        else if (spec.AsyncCopy)
         {
             // LDGSTS [Rs+offset], [Rg.64]: the shared address sits in the destination field (read, not written), the
             // global address pair at A; the copied data never passes through registers.

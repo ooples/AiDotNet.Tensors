@@ -540,4 +540,42 @@ public class SassInstructionTests
         Assert.NotEqual(SassInstruction.NoScoreboard, board);
         Assert.NotEqual(0, scheduled[1].Control.WaitMask & (1 << board));
     }
+
+    // The sm_86 Tensor-Core GEMM's instructions (driver cubins, RTX 3080), with their nvdisasm text.
+    private static readonly SassInstruction Hmma1688 = new(0x000000d64020723cUL, 0x040fee0000081020UL);   // HMMA.1688.F32.TF32 R32, R64.reuse, R214, R32
+    private static readonly SassInstruction LdsmT2 = new(0x000000003c36783bUL, 0x000fe40000004100UL);     // LDSM.16.MT88.2 R54, [R60]
+    private static readonly SassInstruction Ldsm4 = new(0x000000002c28783bUL, 0x002e680000000200UL);      // LDSM.16.M88.4 R40, [R44]
+    private static readonly SassInstruction IsetpP5 = new(0x000000ffca00720cUL, 0x000fda0002fa4070UL);    // ISETP.GT.U32.AND P5, PT, R202, RZ, P5
+    private static readonly SassInstruction LdgstsP5 = new(0x0600000024d17faeUL, 0x0003e2000a901c46UL);   // LDGSTS.E.BYPASS.128 [R209+0x6000], [R36.64], P5
+
+    /// <summary>
+    /// HMMA reads A (4 registers), B (2) and C (4) and writes D (4) on a fixed latency; LDSM loads 1, 2 or 4 registers
+    /// (bits 72-73) from the shared address at A.
+    /// </summary>
+    [Fact]
+    public void TensorCoreOperandsDecode()
+    {
+        var hmma = SassOpcodeTable.Decode(Hmma1688) ?? throw new InvalidOperationException("HMMA unknown");
+        Assert.Equal(SassLatency.Fixed, hmma.Latency);
+        Assert.Equal(new[] { (SassInstruction.RdField, 4) }, hmma.Writes.Select(o => (o.Field, o.Width)));
+        Assert.Equal(new[] { (SassInstruction.RaField, 4), (SassInstruction.RbField, 2), (SassInstruction.RcField, 4) },
+            hmma.Reads.Select(o => (o.Field, o.Width)));
+        Assert.Equal(2, (SassOpcodeTable.Decode(LdsmT2) ?? throw new InvalidOperationException("LDSM unknown")).Writes.Single().Width);
+        var ldsm = SassOpcodeTable.Decode(Ldsm4) ?? throw new InvalidOperationException("LDSM unknown");
+        Assert.Equal(4, ldsm.Writes.Single().Width);
+        Assert.Equal(SassLatency.Variable, ldsm.Latency);
+        Assert.Equal(new[] { SassInstruction.RaField }, ldsm.Reads.Select(o => o.Field));
+    }
+
+    /// <summary>
+    /// cp.async's zero-fill predicate is read as early as a guard: an LDGSTS issued 5 cycles after the ISETP writing its
+    /// predicate made the TF32 Tensor-Core GEMM's results wrong on the RTX 3080 (ptxas leaves 13).
+    /// </summary>
+    [Fact]
+    public void ACopysPredicateOperandWaitsTheGuardLatency()
+    {
+        var scheduled = SassScheduler.RecomputeControl(new[] { IsetpP5, LdgstsP5, Exit }, 86)
+            ?? throw new InvalidOperationException(SassScheduler.LastDecline);
+        Assert.True(scheduled[0].Control.Stall >= 13, "LDGSTS issued " + scheduled[0].Control.Stall + " cycles after the ISETP.");
+    }
 }

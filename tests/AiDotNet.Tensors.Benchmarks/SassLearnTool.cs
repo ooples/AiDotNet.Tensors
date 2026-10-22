@@ -71,6 +71,18 @@ internal static class SassLearnTool
                 lines.AddRange(Disassemble(ptx, "sgemm_" + config.Name.Replace('-', '_') + "_" + layout.Name, arch, bin, work));
             }
         }
+        // The Tensor-Core GEMM (--sass-probe --tc): every seed configuration, TF32 and FP16 (sm_80+: mma.sync, cp.async).
+        if (major >= 8)
+            foreach (var precision in new[] { AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx.PtxTensorCorePrecision.Tf32,
+                         AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx.PtxTensorCorePrecision.Fp16 })
+            {
+                var layout = new AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx.PtxGemmLayout(false, false);
+                foreach (var config in AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx.PtxTensorCoreGemmEvolution.Seeds(layout, 4096, 4096, 4096, precision))
+                {
+                    string ptx = AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx.PtxTensorCoreGemmGenerator.Emit(config, layout, major, minor, precision);
+                    lines.AddRange(Disassemble(ptx, "tc_" + precision.ToString().ToLowerInvariant() + "_" + config.Name.Replace('-', '_'), arch, bin, work));
+                }
+            }
         // The bank probe's FFMA-bound kernel (--sass-probe --bank): on sm_80+ its int-to-float conversion is I2FP.
         lines.AddRange(Disassemble(SassProbeTool.BankProbePtx(major, minor), "bank_probe", arch, bin, work));
         Console.WriteLine("SASS LEARN sm_" + arch + ": " + lines.Count + " instructions from " +

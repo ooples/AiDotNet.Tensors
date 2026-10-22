@@ -279,7 +279,7 @@ public static class SassScheduler
                 {
                     if (writes.Count != 0)
                     {
-                        long complete = cycle + (global ? GlobalLoadCycles : e.Mnemonic == "LDS" ? SharedLoadCycles : OtherVariableCycles);
+                        long complete = cycle + (global ? GlobalLoadCycles : e.Mnemonic is "LDS" or "LDSM" ? SharedLoadCycles : OtherVariableCycles);
                         writeBoard = ChooseBoard(global ? longBoards : boards, outstanding, pendingUse, pendingComplete, firstUse[i], complete, conserve: global);
                         writeComplete = complete;
                         if (outstanding[writeBoard] >= ScoreboardDepth) wait |= 1 << writeBoard;
@@ -336,6 +336,11 @@ public static class SassScheduler
                             Need(consumerClass is not null && earlyAt.TryGetValue(r, out var early) && early.Class == consumerClass ? early.Ready : at.Ready, at.Produced);
                     foreach (int r in writes) if (readyAt.TryGetValue(r, out var at)) Need(at.Ready, at.Produced);
                     foreach (int p in predicateReads) if (readyAt.TryGetValue(p, out var at)) Need(at.Ready, at.Produced);
+                    // A variable-latency instruction reads a predicate operand as early as a guard: cp.async's zero-fill predicate
+                    // (LDGSTS ..., P5) issued 5 cycles after the ISETP writing it made the TF32 Tensor-Core GEMM's results wrong on
+                    // the RTX 3080; ptxas leaves the guard latency.
+                    if (e.Latency == SassLatency.Variable)
+                        foreach (int p in predicateReads) if (predicateWrittenAt.TryGetValue(p, out long setAt)) Need(setAt + guardLatency, setAt);
                     if (guard >= 0 && predicateWrittenAt.TryGetValue(guard, out long written))
                         Need(written + guardLatency, written);
                     foreach (int p in predicateWrites) if (readyAt.TryGetValue(p, out var at)) Need(at.Ready, at.Produced);
