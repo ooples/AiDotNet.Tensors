@@ -69,8 +69,11 @@ public class CodegenPagedAttentionTests
         double[] kcache = Fill((long)Blocks * blockSize * kvHeads * headDim, 1.0, 5);
         double[] vcache = Fill((long)Blocks * blockSize * kvHeads * headDim, 1.0, 7);
 
+        // The backend's own builder, not a copy of its rule: the route is only correct if the buffer CudaBackend
+        // hands the program masks exactly the positions the program treats as outside the sequence.
+        float[] built = AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.PagedKeyBias(seqK, seqLen);
         var keyBias = new double[seqK];
-        for (int k = 0; k < seqK; k++) keyBias[k] = k < seqLen ? 0.0 : CodegenBackendPrograms.AttentionMaskedLogit;
+        for (int k = 0; k < seqK; k++) keyBias[k] = built[k];
         var table = new double[pages];
         for (int i = 0; i < pages; i++) table[i] = blockTable[i];
 
@@ -101,5 +104,114 @@ public class CodegenPagedAttentionTests
     public void PagedDecode_RefusesAHeadCountThatIsNotAMultipleOfTheKvHeads()
     {
         Assert.Throws<ArgumentException>(() => CodegenBackendPrograms.PagedAttentionDecode(6, 4, 8, 4, 2, 4, 0.125));
+    }
+
+    /// <summary>
+    /// paged_attention_prefill's loop: one thread per (query, head), the same online softmax as decode but stopping
+    /// at the query's own logical position, which is what makes the pass causal.
+    /// </summary>
+    private static double[] PrefillReference(double[] q, double[] kcache, double[] vcache, int[] blockTable,
+        int heads, int kvHeads, int headDim, int blockSize, int numQueries, int startPos, double scale)
+    {
+        int group = heads / kvHeads;
+        var outbuf = new double[(long)numQueries * heads * headDim];
+        for (int qi = 0; qi < numQueries; qi++)
+            for (int h = 0; h < heads; h++)
+            {
+                var acc = new double[headDim];
+                double m = double.NegativeInfinity, l = 0.0;
+                long qAt = ((long)qi * heads + h) * headDim;
+                for (int t = 0; t <= startPos + qi; t++)
+                {
+                    int blk = blockTable[t / blockSize], pos = t % blockSize;
+                    long at = (((long)blk * blockSize + pos) * kvHeads + h / group) * headDim;
+                    double dot = 0.0;
+                    for (int d = 0; d < headDim; d++) dot += q[qAt + d] * kcache[at + d];
+                    double logit = dot * scale;
+                    double next = Math.Max(m, logit);
+                    double correction = Math.Exp(m - next), p = Math.Exp(logit - next);
+                    l = l * correction + p;
+                    for (int d = 0; d < headDim; d++) acc[d] = acc[d] * correction + p * vcache[at + d];
+                    m = next;
+                }
+                double inverse = l > 0.0 ? 1.0 / l : 0.0;
+                for (int d = 0; d < headDim; d++) outbuf[qAt + d] = acc[d] * inverse;
+            }
+        return outbuf;
+    }
+
+    /// <summary>
+    /// The declared prefill against that loop. Every row has a different key count -- that is the causal rule the
+    /// bias carries -- and the block table is out of order again, so neither the causality nor the indirection can
+    /// be satisfied by reading the cache straight through.
+    /// </summary>
+    [Theory]
+    [InlineData(4, 4, 8, 4, 3, 0)]     // 3 queries from position 0: rows see 1, 2 and 3 keys
+    [InlineData(6, 2, 4, 2, 2, 5)]     // grouped-query, resuming at position 5 mid-page
+    [InlineData(2, 1, 16, 8, 4, 3)]    // one kv head, a wide head dim, the last page part used
+    public void PagedPrefill_MatchesTheKernelsCausalOnlineSoftmax(int heads, int kvHeads, int headDim, int blockSize,
+        int numQueries, int startPos)
+    {
+        const double Scale = 0.125;
+        const int Blocks = 7;
+        int seqLen = startPos + numQueries;
+        int pages = (seqLen + blockSize - 1) / blockSize;
+        int[] blockTable = new int[pages];
+        for (int i = 0; i < pages; i++) blockTable[i] = (Blocks - 1) - i * 2 >= 0 ? (Blocks - 1) - i * 2 : i;
+        int length = pages * blockSize;
+        double[] q = Fill((long)numQueries * heads * headDim, 1.0, 11);
+        double[] kcache = Fill((long)Blocks * blockSize * kvHeads * headDim, 1.0, 5);
+        double[] vcache = Fill((long)Blocks * blockSize * kvHeads * headDim, 1.0, 7);
+
+        // Again the backend's builder, so the causal rule under test is the one the route actually uploads.
+        float[] built = AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.PagedCausalBias(numQueries, length, startPos);
+        var bias = new double[(long)numQueries * length];
+        for (int i = 0; i < bias.Length; i++) bias[i] = built[i];
+        var table = new double[pages];
+        for (int i = 0; i < pages; i++) table[i] = blockTable[i];
+
+        var outputs = CodegenBackendPrograms
+            .PagedAttentionPrefill(heads, kvHeads, headDim, blockSize, pages, Blocks, numQueries, Scale)
+            .Interpret(new Dictionary<string, double[]>
+            {
+                ["block_table"] = table, ["q"] = q, ["kcache"] = kcache, ["vcache"] = vcache, ["causal_bias"] = bias,
+            });
+
+        double[] expected = PrefillReference(q, kcache, vcache, blockTable, heads, kvHeads, headDim, blockSize,
+            numQueries, startPos, Scale);
+        for (int i = 0; i < expected.Length; i++) Assert.Equal(expected[i], outputs["out"][i], 9);
+
+        // The control for the mask itself: the same program with an all-zero bias attends to every page position, so
+        // it must NOT match the causal reference. Without this, a program that dropped the bias input would pass the
+        // comparison above whenever causality happened to be vacuous.
+        var unmasked = CodegenBackendPrograms
+            .PagedAttentionPrefill(heads, kvHeads, headDim, blockSize, pages, Blocks, numQueries, Scale)
+            .Interpret(new Dictionary<string, double[]>
+            {
+                ["block_table"] = table, ["q"] = q, ["kcache"] = kcache, ["vcache"] = vcache,
+                ["causal_bias"] = new double[(long)numQueries * length],
+            });
+        bool differs = false;
+        for (int i = 0; i < expected.Length && !differs; i++)
+            differs = Math.Abs(expected[i] - unmasked["out"][i]) > 1e-9;
+        Assert.True(differs, "an unmasked prefill must differ from the causal one: the bias is the causal rule");
+    }
+
+    /// <summary>The bias the backend builds is the one the program reads: same shape, same rule.</summary>
+    [Fact]
+    public void PagedPrefill_TakesTheBackendsBuffers()
+    {
+        var names = new List<string>();
+        foreach (var source in CodegenBackendPrograms.PagedAttentionPrefill(4, 4, 8, 4, 3, 7, 3, 0.125).Sources())
+            names.Add(source.Name);
+        names.Sort();
+        Assert.Equal(new[] { "block_table", "causal_bias", "kcache", "q", "vcache" }, names);
+    }
+
+    [Fact]
+    public void PagedPrefill_RefusesAHeadCountThatIsNotAMultipleOfTheKvHeads()
+    {
+        Assert.Throws<ArgumentException>(() =>
+            CodegenBackendPrograms.PagedAttentionPrefill(6, 4, 8, 4, 2, 4, 2, 0.125));
     }
 }

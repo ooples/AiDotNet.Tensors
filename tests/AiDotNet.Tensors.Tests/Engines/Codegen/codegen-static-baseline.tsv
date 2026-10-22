@@ -71,3 +71,11 @@ paged_attention_decode/paged_attention_output	547	32	0	82	1
 groupnorm/groupnorm_negmean	358	32	0	130	1
 groupnorm/groupnorm_rstd	587	64	0	194	1
 groupnorm/groupnorm_affine	238	12	8	0	0
+scatter_add_accumulate_deterministic	302	17	0	68	1
+segment_max	187	1	0	36	1
+segment_min	267	1	0	36	1
+paged_attention_prefill/paged_prefill_scores	163	5	0	17	1
+paged_attention_prefill/paged_prefill_negmax	284	32	0	65	0
+paged_attention_prefill/paged_prefill_recipsum	479	64	0	97	0
+paged_attention_prefill/paged_prefill_normalise	218	10	8	0	0
+paged_attention_prefill/paged_prefill_output	976	48	0	134	1

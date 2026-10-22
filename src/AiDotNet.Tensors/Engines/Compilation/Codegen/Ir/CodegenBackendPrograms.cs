@@ -215,22 +215,9 @@ public static class CodegenBackendPrograms
     /// </remarks>
     public static CodegenProgram ScatterAddDeterministic(int count, int destinations, int features)
     {
-        if (count <= 0 || destinations <= 0 || features <= 0)
-            throw new ArgumentOutOfRangeException(nameof(count), "Scatter extents must be positive.");
-        var space = new CodegenIterationSpace(
-            CodegenAxis.Parallel("d", destinations), CodegenAxis.Parallel("f", features),
-            CodegenAxis.Reduce("i", count));
-        var indices = new CodegenTensorBinding(0, "indices", new[] { count }, new[] { A(2) },
-            elementType: CodegenElementType.Int32);
-        // The leading extent-1 dimension exists only to carry the test: its index is indices[i] - d, in range for
-        // the one destination that matches and skipped for the rest.
-        var source = new CodegenTensorBinding(1, "source", new[] { 1, count, features },
-            new[] { CodegenAffineExpr.Const(0), A(2), A(1) },
-            indirect: new CodegenIndirectIndex?[]
-            {
-                new CodegenIndirectIndex(0, A(2), 1, CodegenIndexOutOfRange.Skip, floatIndices: false, offset: A(0)),
-                null, null,
-            });
+        // The source's leading extent-1 dimension exists only to carry the test: its index is indices[i] - d, in
+        // range for the one destination that matches and skipped for the rest.
+        var (space, indices, source) = ScatterInversion(count, destinations, features);
         var output = new CodegenTensorBinding(2, "out", new[] { destinations, features }, new[] { A(0), A(1) },
             isOutput: true);
         var pass = new CodegenKernelSpec("scatter_add_deterministic", space, new[] { indices, source }, output,
@@ -246,6 +233,81 @@ public static class CodegenBackendPrograms
     /// </summary>
     public static CodegenProgram SegmentSum(int count, int segments, int features) =>
         ScatterAddDeterministic(count, segments, features);
+
+    // The three scatter programs share one shape: destinations x features in parallel, the sources reduced, and
+    // source i admitted only where indices[i] - d lands in [0, 1).
+    private static (CodegenIterationSpace Space, CodegenTensorBinding Indices, CodegenTensorBinding Source)
+        ScatterInversion(int count, int destinations, int features)
+    {
+        if (count <= 0 || destinations <= 0 || features <= 0)
+            throw new ArgumentOutOfRangeException(nameof(count), "Scatter extents must be positive.");
+        var space = new CodegenIterationSpace(
+            CodegenAxis.Parallel("d", destinations), CodegenAxis.Parallel("f", features),
+            CodegenAxis.Reduce("i", count));
+        var indices = new CodegenTensorBinding(0, "indices", new[] { count }, new[] { A(2) },
+            elementType: CodegenElementType.Int32);
+        var source = new CodegenTensorBinding(1, "source", new[] { 1, count, features },
+            new[] { CodegenAffineExpr.Const(0), A(2), A(1) },
+            indirect: new CodegenIndirectIndex?[]
+            {
+                new CodegenIndirectIndex(0, A(2), 1, CodegenIndexOutOfRange.Skip, floatIndices: false, offset: A(0)),
+                null, null,
+            });
+        return (space, indices, source);
+    }
+
+    /// <summary>
+    /// The deterministic scatter-add onto a seed (#890 phase 4e), in CudaBackend's
+    /// scatter_add_accumulate_deterministic contract: <c>out[d, f] = seed[d, f] + sum of source[i, f] over every i
+    /// with indices[i] == d</c>, in increasing i. The caller binds <c>seed</c> and <c>out</c> to the same buffer,
+    /// which is what accumulating in place means; each output cell is owned by one thread, which reads that cell
+    /// before it writes it, exactly as the scanning kernel does.
+    /// </summary>
+    public static CodegenProgram ScatterAddAccumulateDeterministic(int count, int destinations, int features)
+    {
+        var (space, indices, source) = ScatterInversion(count, destinations, features);
+        int[] cells = { destinations, features };
+        var seed = new CodegenTensorBinding(2, "seed", cells, new[] { A(0), A(1) });
+        var output = new CodegenTensorBinding(3, "out", cells, new[] { A(0), A(1) }, isOutput: true);
+        var pass = new CodegenKernelSpec("scatter_add_accumulate_deterministic", space,
+            new[] { indices, source, seed }, output, new[] { 1 }, CodegenReduceKind.Sum, biasInput: 2);
+        return new CodegenProgram(new[] { pass }, Array.Empty<long>(),
+            "deterministic scatter-add onto a seed (backend contract)");
+    }
+
+    /// <summary>
+    /// The deterministic segment maximum (#890 phase 4e): <c>out[s, f] = max of source[i, f] over every i whose
+    /// segment id is s</c>. The same inversion as <see cref="ScatterAddDeterministic"/>, so it is deterministic for
+    /// the same reason and accepts unsorted ids; a segment with no member reduces to the maximum's identity,
+    /// -infinity. With features = 1 and the segment ids a sparse matrix's row indices this is the CSR segmented
+    /// maximum over that matrix's rows.
+    /// </summary>
+    public static CodegenProgram SegmentMax(int count, int segments, int features)
+    {
+        var (space, indices, source) = ScatterInversion(count, segments, features);
+        var output = new CodegenTensorBinding(2, "out", new[] { segments, features }, new[] { A(0), A(1) },
+            isOutput: true);
+        var pass = new CodegenKernelSpec("segment_max", space, new[] { indices, source }, output,
+            new[] { 1 }, CodegenReduceKind.Max);
+        return new CodegenProgram(new[] { pass }, Array.Empty<long>(), "deterministic segment max (backend contract)");
+    }
+
+    /// <summary>
+    /// The deterministic segment minimum (#890 phase 4e): <see cref="SegmentMax"/> over the negated sources, negated
+    /// again. The IR reduces with a sum or a maximum, and <c>min(x) = -max(-x)</c> is exact in floating point -- a
+    /// negation only flips the sign bit -- so this is the minimum, not an approximation of it. A segment with no
+    /// member reduces to +infinity, the minimum's identity.
+    /// </summary>
+    public static CodegenProgram SegmentMin(int count, int segments, int features)
+    {
+        var (space, indices, source) = ScatterInversion(count, segments, features);
+        var output = new CodegenTensorBinding(2, "out", new[] { segments, features }, new[] { A(0), A(1) },
+            isOutput: true);
+        var body = CodegenExpr.Negate(Op(1));
+        var pass = new CodegenKernelSpec("segment_min", space, new[] { indices, source }, output,
+            body.Operands(), CodegenReduceKind.Max, reduceScale: -1.0, body: body);
+        return new CodegenProgram(new[] { pass }, Array.Empty<long>(), "deterministic segment min (backend contract)");
+    }
 
     /// <summary>
     /// <c>out[o, j, i] = source[o, indices[j], i]</c>: indices int32 [indexAxis], source [outer, sourceAxis, inner],
@@ -527,6 +589,101 @@ public static class CodegenBackendPrograms
             new CodegenTensorBinding(3, "out", new[] { heads, headDim }, new[] { A(0), A(1) }, isOutput: true),
             new[] { 1, 2 }, CodegenReduceKind.Sum));
         return new CodegenProgram(passes, temps, "paged attention decode (backend contract)");
+    }
+
+    /// <summary>
+    /// Paged attention's prefill step (#890 phase 4d), in CudaBackend.PagedAttentionPrefill's contract:
+    /// <paramref name="numQueries"/> queries per head against a KV cache held in pages, causal in the logical
+    /// position. The cache is addressed exactly as in <see cref="PagedAttentionDecode"/>. <c>causal_bias</c> is
+    /// [numQueries, pages * blockSize]: 0 where query qi may see key k and <see cref="AttentionMaskedLogit"/>
+    /// otherwise, so it carries both the causal rule (<c>k &lt;= startPos + qi</c>) and the last page's unused tail.
+    /// The backend supplies it because neither comparison is a quasi-affine index; startPos therefore does not enter
+    /// the program, only the bias it builds. Every row keeps key 0, so no row can lose every key.
+    /// </summary>
+    public static CodegenProgram PagedAttentionPrefill(int heads, int kvHeads, int headDim, int blockSize, int pages,
+        int blocks, int numQueries, double scale)
+    {
+        if (heads <= 0 || kvHeads <= 0 || headDim <= 0 || blockSize <= 0 || pages <= 0 || blocks <= 0 ||
+            numQueries <= 0)
+            throw new ArgumentOutOfRangeException(nameof(heads), "Paged attention extents must be positive.");
+        if (heads % kvHeads != 0) throw new ArgumentException("heads must be a multiple of kvHeads.", nameof(kvHeads));
+        int group = heads / kvHeads;
+        // The kv head of query head h (axis 1 here, where decode has it on axis 0).
+        CodegenAffineExpr KvHead() => group == 1
+            ? A(1)
+            : new CodegenAffineExpr(new[] { new CodegenAffineTerm(1, 1) }, 0, group);
+        CodegenAffineExpr Key(int pageAxis, int posAxis) => new(new[]
+            { new CodegenAffineTerm(pageAxis, blockSize), new CodegenAffineTerm(posAxis, 1) });
+        // The logits are [numQueries * heads, seqK] so the row softmax below is the same three passes decode runs;
+        // row (qi, h) is qi * heads + h, which is what the [numQueries, heads, seqK] layout already puts there.
+        CodegenAffineExpr Row(int queryAxis, int headAxis) => new(new[]
+            { new CodegenAffineTerm(queryAxis, heads), new CodegenAffineTerm(headAxis, 1) });
+
+        int seqK = checked(pages * blockSize);
+        int rows = checked(numQueries * heads);
+        int[] matrix = { rows, seqK };
+        int[] vector = { rows };
+        int[] cache = { blocks, blockSize, kvHeads, headDim };
+        var passes = new List<CodegenKernelSpec>();
+        var temps = new List<long>();
+
+        // ---- logits[qi*heads+h, k] = scale * sum_d q[qi,h,d] * kcache[table[page], pos, h/g, d] + bias[qi, k]
+        var scoreSpace = new CodegenIterationSpace(
+            CodegenAxis.Parallel("qi", numQueries), CodegenAxis.Parallel("h", heads),
+            CodegenAxis.Parallel("page", pages), CodegenAxis.Parallel("pos", blockSize),
+            CodegenAxis.Reduce("d", headDim));
+        var scoreInputs = new[]
+        {
+            new CodegenTensorBinding(0, "block_table", new[] { pages }, new[] { A(2) },
+                elementType: CodegenElementType.Int32),
+            new CodegenTensorBinding(1, "q", new[] { numQueries, heads, headDim }, new[] { A(0), A(1), A(4) }),
+            new CodegenTensorBinding(2, "kcache", cache,
+                new[] { CodegenAffineExpr.Const(0), A(3), KvHead(), A(4) },
+                indirect: new CodegenIndirectIndex?[] { new CodegenIndirectIndex(0, A(2), blocks), null, null, null }),
+            new CodegenTensorBinding(3, "causal_bias", new[] { numQueries, seqK }, new[] { A(0), Key(2, 3) }),
+        };
+        passes.Add(new CodegenKernelSpec("paged_prefill_scores", scoreSpace, scoreInputs,
+            new CodegenTensorBinding(4, "logits", matrix, new[] { Row(0, 1), Key(2, 3) }, isOutput: true),
+            new[] { 1, 2 }, CodegenReduceKind.Sum, biasInput: 3, reduceScale: scale));
+        temps.Add((long)rows * seqK);
+
+        // ---- the row softmax over k, as decode's, on the logits as [numQueries * heads, seqK].
+        var reduceSpace = new CodegenIterationSpace(CodegenAxis.Parallel("i", rows), CodegenAxis.Reduce("j", seqK));
+        passes.Add(new CodegenKernelSpec("paged_prefill_negmax", reduceSpace,
+            new[] { Bind(0, "logits", matrix) }, Bind(1, "negmax", vector, isOutput: true), new[] { 0 },
+            CodegenReduceKind.Max, reduceScale: -1.0));
+        passes.Add(new CodegenKernelSpec("paged_prefill_recipsum", reduceSpace,
+            new[] { Bind(0, "logits", matrix), Bind(1, "negmax", vector) },
+            Bind(2, "recipsum", vector, isOutput: true), new[] { 0 }, CodegenReduceKind.Sum,
+            activation: CodegenActivationKind.Reciprocal, preReduce: CodegenPreReduceOp.Exp, preBiasInput: 1));
+        temps.Add(rows);
+        temps.Add(rows);
+        var weightSpace = new CodegenIterationSpace(CodegenAxis.Parallel("i", rows), CodegenAxis.Parallel("j", seqK));
+        passes.Add(new CodegenKernelSpec("paged_prefill_normalise", weightSpace,
+            new[] { Bind(0, "logits", matrix), Bind(1, "negmax", vector), Bind(2, "recipsum", vector) },
+            Bind(3, "weights", matrix, isOutput: true), new[] { 0 }, CodegenReduceKind.None, scaleInput: 2,
+            preReduce: CodegenPreReduceOp.Exp, preBiasInput: 1));
+        temps.Add((long)rows * seqK);
+
+        // ---- out[qi,h,e] = sum_k weights[qi*heads+h, k] * vcache[table[page], pos, h/g, e]
+        var valueSpace = new CodegenIterationSpace(
+            CodegenAxis.Parallel("qi", numQueries), CodegenAxis.Parallel("h", heads),
+            CodegenAxis.Parallel("e", headDim),
+            CodegenAxis.Reduce("page", pages), CodegenAxis.Reduce("pos", blockSize));
+        passes.Add(new CodegenKernelSpec("paged_prefill_output", valueSpace,
+            new[]
+            {
+                new CodegenTensorBinding(0, "block_table", new[] { pages }, new[] { A(3) },
+                    elementType: CodegenElementType.Int32),
+                new CodegenTensorBinding(1, "weights", matrix, new[] { Row(0, 1), Key(3, 4) }),
+                new CodegenTensorBinding(2, "vcache", cache,
+                    new[] { CodegenAffineExpr.Const(0), A(4), KvHead(), A(2) },
+                    indirect: new CodegenIndirectIndex?[] { new CodegenIndirectIndex(0, A(3), blocks), null, null, null }),
+            },
+            new CodegenTensorBinding(3, "out", new[] { numQueries, heads, headDim }, new[] { A(0), A(1), A(2) },
+                isOutput: true),
+            new[] { 1, 2 }, CodegenReduceKind.Sum));
+        return new CodegenProgram(passes, temps, "paged attention prefill (backend contract)");
     }
 
     /// <summary>

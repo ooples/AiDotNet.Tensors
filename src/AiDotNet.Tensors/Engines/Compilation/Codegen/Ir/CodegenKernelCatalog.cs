@@ -173,6 +173,11 @@ public static class CodegenKernelCatalog
             CodegenBackendPrograms.PagedAttentionDecode(4, 4, 8, 4, 3, 7, 0.125),
             CodegenBackendPrograms.PagedAttentionDecode(32, 8, 128, 16, 64, 4096, 0.08838834764831845)),
 
+        new("paged_attention_prefill",
+            "paged attention prefill: the same cache through a block table, causal over the query's own position",
+            CodegenBackendPrograms.PagedAttentionPrefill(4, 4, 8, 4, 3, 7, 3, 0.125),
+            CodegenBackendPrograms.PagedAttentionPrefill(32, 8, 128, 16, 64, 4096, 64, 0.08838834764831845)),
+
         new("groupnorm",
             "GroupNorm: statistics per (sample, group), per-channel affine",
             CodegenFusedStatistics.GroupNorm(2, 8, 4, 36),
@@ -361,6 +366,21 @@ public static class CodegenKernelCatalog
             "deterministic scatter-add: each destination reduces over the sources that target it, no atomic",
             CodegenBackendPrograms.ScatterAddDeterministic(96, 16, 4).Passes[0],
             CodegenBackendPrograms.ScatterAddDeterministic(4096, 256, 64).Passes[0]),
+
+        new("scatter_add_accumulate_deterministic",
+            "the same inversion onto the destination's existing value, which the caller binds as the seed",
+            CodegenBackendPrograms.ScatterAddAccumulateDeterministic(96, 16, 4).Passes[0],
+            CodegenBackendPrograms.ScatterAddAccumulateDeterministic(4096, 256, 64).Passes[0]),
+
+        new("segment_max",
+            "deterministic segment max over unsorted ids; a sparse matrix's row indices make it the CSR one",
+            CodegenBackendPrograms.SegmentMax(96, 16, 4).Passes[0],
+            CodegenBackendPrograms.SegmentMax(4096, 256, 64).Passes[0]),
+
+        new("segment_min",
+            "deterministic segment min: the maximum over negated terms, negated again",
+            CodegenBackendPrograms.SegmentMin(96, 16, 4).Passes[0],
+            CodegenBackendPrograms.SegmentMin(4096, 256, 64).Passes[0]),
     ];
 
     /// <summary>

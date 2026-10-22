@@ -3563,6 +3563,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 q, kcache, vcache, blockTable, output,
                 heads, heads, blockSize, seqLen, scale))
             return output;
+        // #890 phase 4d: the declared program, for the head dimensions the fused d64 kernel above does not serve.
+        if (TryDeclaredPagedDecodeRouted(q, kcache, vcache, blockTable, output, heads, heads, headDim, blockSize,
+                seqLen, scale))
+            return output;
         if (!_kernelCache.TryGetValue("paged_attention_decode", out var kernel))
         {
             output.Dispose();
@@ -3593,6 +3597,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             TryDirectPtxPagedPrefillD64(
                 q, kcache, vcache, blockTable, output,
                 heads, heads, numQueries, startPos, blockSize, scale))
+            return output;
+        // #890 phase 4d: the declared program, for the head dimensions the fused d64 kernel above does not serve.
+        if (TryDeclaredPagedPrefillRouted(q, kcache, vcache, blockTable, output, heads, heads, headDim, blockSize,
+                numQueries, startPos, scale))
             return output;
         if (!_kernelCache.TryGetValue("paged_attention_prefill", out var kernel))
         {
@@ -3625,6 +3633,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 q, kcache, vcache, blockTable, output,
                 heads, kvHeads, blockSize, seqLen, scale))
             return output;
+        // #890 phase 4d: the declared program, for the head dimensions the fused d64 kernel above does not serve.
+        if (TryDeclaredPagedDecodeRouted(q, kcache, vcache, blockTable, output, heads, kvHeads, headDim, blockSize,
+                seqLen, scale))
+            return output;
         if (!_kernelCache.TryGetValue("paged_attention_decode_gqa", out var kernel))
         {
             output.Dispose();
@@ -3654,6 +3666,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             TryDirectPtxPagedPrefillD64(
                 q, kcache, vcache, blockTable, output,
                 heads, kvHeads, numQueries, startPos, blockSize, scale))
+            return output;
+        // #890 phase 4d: the declared program, for the head dimensions the fused d64 kernel above does not serve.
+        if (TryDeclaredPagedPrefillRouted(q, kcache, vcache, blockTable, output, heads, kvHeads, headDim, blockSize,
+                numQueries, startPos, scale))
             return output;
         if (!_kernelCache.TryGetValue("paged_attention_prefill_gqa", out var kernel))
         {
@@ -9534,6 +9550,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         if (GpuDeterminism.IsActive)
         {
+            // #890 phase 4e: the declared program below the crossover (it pays vocabulary x tokens, as the scanning
+            // kernel does, so it only takes the small shapes the sort's fixed ~50 us of launches would lose).
+            if (TryDeclaredScatterAddDeterministic(gradOutput, indices, gradEmbedding, numIndices, vocabSize,
+                    embeddingDim))
+                return;
             // #890 phase 4e: the same sums in the same order through a stable sort -- O(tokens) instead of
             // O(vocabulary x tokens) (429 ms -> see TrySortedScatterAdd for a 4096-token, 32000-row embedding).
             if (TrySortedScatterAdd(gradOutput, indices, gradEmbedding, numIndices, vocabSize, embeddingDim,
@@ -13104,6 +13125,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         if (GpuDeterminism.IsActive)
         {
+            // #890 phase 4e: the declared program below the crossover; it reads the destination as its seed, which is
+            // what this entry point's accumulate means.
+            if (TryDeclaredScatterAddAccumulate(source, indices, destination, sourceSize, destSize, 1)) return;
             // #890 phase 4e: the same fixed-order sums through a stable sort, O(sources) instead of O(dest x sources).
             if (TrySortedScatterAdd(source, indices, destination, sourceSize, destSize, 1, accumulate: true)) return;
             if (!_kernelCache.TryGetValue("scatter_add_accumulate_deterministic", out var kernelDet))

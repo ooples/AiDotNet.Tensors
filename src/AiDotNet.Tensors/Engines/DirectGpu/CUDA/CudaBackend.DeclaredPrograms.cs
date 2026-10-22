@@ -54,8 +54,20 @@ internal enum DeclaredFamily
     /// <summary>Paged attention's decode step: the KV cache reached through a block table (#890 phase 4d).</summary>
     PagedAttentionDecode,
 
+    /// <summary>Paged attention's causal prefill step over the same cache (#890 phase 4d).</summary>
+    PagedAttentionPrefill,
+
     /// <summary>The deterministic scatter-add, and the segment sum that is the same operator (#890 phase 4e).</summary>
     ScatterAddDeterministic,
+
+    /// <summary>The deterministic scatter-add onto the destination's existing value (#890 phase 4e).</summary>
+    ScatterAddAccumulateDeterministic,
+
+    /// <summary>The deterministic segment maximum, which a sparse matrix's row indices make a CSR one (#890 phase 4e).</summary>
+    SegmentMax,
+
+    /// <summary>The deterministic segment minimum (#890 phase 4e).</summary>
+    SegmentMin,
 }
 
 /// <summary>One declared program: its family and shape (unused dimensions are 0).</summary>
