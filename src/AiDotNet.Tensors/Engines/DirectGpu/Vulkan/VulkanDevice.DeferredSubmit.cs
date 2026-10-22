@@ -287,6 +287,103 @@ public sealed unsafe partial class VulkanDevice
     }
 
     /// <summary>
+    /// Records a copy of <paramref name="bytes"/> from <paramref name="source"/> into the host-visible
+    /// <paramref name="destination"/> behind everything recorded so far, submits it without waiting, and returns the
+    /// serial <see cref="WaitForSubmission"/> waits for. The barriers order the copy after earlier shader writes and
+    /// later shader writes after the copy's read, and make its write visible to the host.
+    /// </summary>
+    internal long SubmitCopyToHost(VulkanBuffer source, VulkanBuffer destination, ulong bytes)
+    {
+        long serial;
+        lock (DispatchLock)
+        {
+            var commandBuffer = OpenCommandBuffer();
+            var before = new VkBufferMemoryBarrier
+            {
+                sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                pNext = null,
+                srcAccessMask = VkAccessFlags.VK_ACCESS_SHADER_WRITE_BIT,
+                dstAccessMask = VkAccessFlags.VK_ACCESS_TRANSFER_READ_BIT,
+                srcQueueFamilyIndex = VulkanNativeBindings.VK_QUEUE_FAMILY_IGNORED,
+                dstQueueFamilyIndex = VulkanNativeBindings.VK_QUEUE_FAMILY_IGNORED,
+                buffer = source.Handle,
+                offset = 0,
+                size = VulkanNativeBindings.VK_WHOLE_SIZE
+            };
+            VulkanNativeBindings.vkCmdPipelineBarrier(commandBuffer,
+                VkPipelineStageFlags.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VkPipelineStageFlags.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, 0, IntPtr.Zero, 1, &before, 0, IntPtr.Zero);
+            var region = new VkBufferCopy { srcOffset = source.Offset, dstOffset = destination.Offset, size = bytes };
+            VulkanNativeBindings.vkCmdCopyBuffer(commandBuffer, source.Handle, destination.Handle, 1, &region);
+            var after = stackalloc VkBufferMemoryBarrier[2];
+            after[0] = new VkBufferMemoryBarrier
+            {
+                sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                pNext = null,
+                srcAccessMask = VkAccessFlags.VK_ACCESS_TRANSFER_WRITE_BIT,
+                dstAccessMask = VkAccessFlags.VK_ACCESS_HOST_READ_BIT,
+                srcQueueFamilyIndex = VulkanNativeBindings.VK_QUEUE_FAMILY_IGNORED,
+                dstQueueFamilyIndex = VulkanNativeBindings.VK_QUEUE_FAMILY_IGNORED,
+                buffer = destination.Handle,
+                offset = 0,
+                size = VulkanNativeBindings.VK_WHOLE_SIZE
+            };
+            VulkanNativeBindings.vkCmdPipelineBarrier(commandBuffer,
+                VkPipelineStageFlags.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VkPipelineStageFlags.VK_PIPELINE_STAGE_HOST_BIT,
+                0, 0, IntPtr.Zero, 1, after, 0, IntPtr.Zero);
+            after[1] = new VkBufferMemoryBarrier
+            {
+                sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                pNext = null,
+                srcAccessMask = VkAccessFlags.VK_ACCESS_TRANSFER_READ_BIT,
+                dstAccessMask = VkAccessFlags.VK_ACCESS_SHADER_WRITE_BIT,
+                srcQueueFamilyIndex = VulkanNativeBindings.VK_QUEUE_FAMILY_IGNORED,
+                dstQueueFamilyIndex = VulkanNativeBindings.VK_QUEUE_FAMILY_IGNORED,
+                buffer = source.Handle,
+                offset = 0,
+                size = VulkanNativeBindings.VK_WHOLE_SIZE
+            };
+            VulkanNativeBindings.vkCmdPipelineBarrier(commandBuffer,
+                VkPipelineStageFlags.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VkPipelineStageFlags.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 0, IntPtr.Zero, 1, after + 1, 0, IntPtr.Zero);
+            lock (_pendingLock)
+            {
+                serial = _openSerial;
+                source.MarkUsedBySubmission(serial);
+                destination.MarkUsedBySubmission(serial);
+            }
+        }
+        // Submitted now, not when sixteen dispatches have gathered: the host may wait for it before then.
+        SubmitOpenCommands();
+        return serial;
+    }
+
+    /// <summary>
+    /// Waits until the submission with <paramref name="serial"/> has executed (and every one before it: the queue
+    /// runs them in order), without submitting or waiting for anything recorded or submitted after it.
+    /// </summary>
+    internal void WaitForSubmission(long serial)
+    {
+        if (_device == IntPtr.Zero) return;
+        List<Action>? releases = null;
+        try
+        {
+            lock (_pendingLock)
+            {
+                while (_completedSerial < serial && _pending.Count > 0)
+                    CompleteOldestLocked(ref releases);
+            }
+        }
+        finally
+        {
+            RunReleases(releases);
+        }
+    }
+
+    /// <summary>
     /// Waits until every submission made without waiting has executed, then hands back their resources and runs
     /// the buffer releases that were waiting on them. Every host read of device memory goes through here first.
     /// </summary>
