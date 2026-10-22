@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 // --kernel-routes --static: the static-metric half of the #890 phase-4 gate. For each routed family, at its bench
 // shape, the declared program as the backend lowers it (PtxProgramLowering, compiled by ptxas) against the reference
 // hand-written kernels it replaces (their CUDA C, compiled by NVRTC with the backend's own source preparation and
@@ -54,6 +54,7 @@ internal static class KernelRouteStaticTool
             ["neuralnet"] = HandWritten("neuralnet_kernels", CudaNeuralNetKernels.GetSource(), major, minor, work, Tool),
             ["skinny"] = HandWritten("skinny_gemm_kernels", CudaSkinnyGemmKernels.GetSource(), major, minor, work, Tool),
             ["attention"] = HandWritten("attention_kernels", CudaAttentionKernels.GetSource(), major, minor, work, Tool),
+            ["paged-attention"] = HandWritten("paged_attention_kernels", CudaPagedAttentionKernels.GetSource(), major, minor, work, Tool),
         };
 
         // A GEMM schedule's lowering, as CudaBackend.BuildUnderGemmSchedule builds it (implicit-GEMM tiles, optionally
@@ -91,10 +92,10 @@ internal static class KernelRouteStaticTool
                 new[] { "rmsnorm_backward", "rmsnorm_grad_gamma" }),
             new Family("BatchNormBackward 32x64x3136", CodegenBackendPrograms.BatchNorm2DBackward(32, 64, 3136, 1), "normalization",
                 new[] { "batchnorm_backward" }),
-            new Family("GroupNormBackward 32x64/8x1024", CodegenBackendPrograms.GroupNormBackward(32, 64, 8, 1024), "normalization",
+            new Family("GroupNormBackward 32x64/8x1024", CodegenBackendPrograms.GroupNormBackward(32, 64, 8, 1024), "neuralnet",
                 new[] { "groupnorm_backward", "groupnorm_backward_sums" }),
             new Family("PagedAttentionDecode 32h/8kv x128 blk16 x64",
-                CodegenBackendPrograms.PagedAttentionDecode(32, 8, 128, 16, 64, 4096, 0.08838834764831845), "attention",
+                CodegenBackendPrograms.PagedAttentionDecode(32, 8, 128, 16, 64, 4096, 0.08838834764831845), "paged-attention",
                 new[] { "paged_attention_decode", "paged_attention_decode_gqa" }),
             new Family("PagedAttentionPrefill 32h/8kv x128 blk16 x64q",
                 CodegenBackendPrograms.PagedAttentionPrefill(32, 8, 128, 16, 64, 4096, 64, 0.08838834764831845), "attention",

@@ -9687,6 +9687,19 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (TryDeclaredAttention(query, key, value, output, attentionWeights, mask, batch, numHeads, kvHeads, seqQ, seqK,
                 headDim, scale, isCausal, maskMode, softcap))
             return;
+        // The declared route declined: a shape's first sighting, or its scratch budget already spent by other programs
+        // for the backend's lifetime. Where the call keeps no weights and has no mask, soft-cap or grouped K/V, the flash
+        // kernel computes the same attention; the kernel below loops over every key per query row on one thread
+        // (8x12x512x64 causal: 514 ms against the flash kernel's 7 ms on an RTX 3080). Causal only at equal lengths,
+        // where the two kernels' causal rules agree; not under capture, which the statistics allocation would break.
+        if (attentionWeights is null && mask is null && softcap == 0f && kvHeads == numHeads &&
+            headDim <= FlashAttentionMaxHeadDim && (!isCausal || seqQ == seqK) && !IsStreamCapturing())
+        {
+            using var softmaxStats = AllocateBuffer(checked(batch * numHeads * seqQ));
+            LaunchFlashAttentionV2Kernel(query, key, value, output, softmaxStats, batch, numHeads, seqQ, seqK, headDim,
+                scale, isCausal, null, 0);
+            return;
+        }
 
         IntPtr queryPtr = query.Handle;
         IntPtr keyPtr = key.Handle;
@@ -9900,6 +9913,18 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             TryDeclaredAttention(query, key, value, output, null, null, batch, numHeads, numHeads, seqQ, seqK, headDim,
                 scale, isCausal, maskMode: 0, softcap: 0f, stats: softmaxStats))
             return;
+        LaunchFlashAttentionV2Kernel(query, key, value, output, softmaxStats, batch, numHeads, seqQ, seqK, headDim, scale,
+            isCausal, attentionBias, biasBatchStride);
+    }
+
+    // flash_attention_v2's MAX_HEAD_DIM (CudaAttentionKernels): past it the kernel returns without writing.
+    private const int FlashAttentionMaxHeadDim = 128;
+
+    // The hand-written flash forward itself, without FlashAttentionV2's declared route in front of it.
+    private unsafe void LaunchFlashAttentionV2Kernel(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
+        IGpuBuffer output, IGpuBuffer softmaxStats, int batch, int numHeads, int seqQ, int seqK, int headDim, float scale,
+        bool isCausal, IGpuBuffer? attentionBias, int biasBatchStride)
+    {
         var kernel = _kernelCache["flash_attention_v2"];
         uint gridX = (uint)((seqQ + 31) / 32);
         uint gridY = (uint)(batch * numHeads);

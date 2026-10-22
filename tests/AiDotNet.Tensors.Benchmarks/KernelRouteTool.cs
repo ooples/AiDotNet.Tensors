@@ -28,6 +28,42 @@ internal static class KernelRouteTool
 {
     private const double Unit = 1.0 / (1 << 24);   // fp32 unit roundoff
 
+    /// <summary>
+    /// The tuning budget this process started with, before any probe raised it: the env override, or the policy's own
+    /// 2 s default. A probe that measures what production serves re-opens exactly this allowance.
+    /// </summary>
+    private static readonly double s_startupTuningBudget = TunedKernelPolicy.BudgetMilliseconds;
+
+    /// <summary>
+    /// A tuning policy a probe sets for itself and gives back on exit, so no later measurement inherits it. Entering
+    /// and leaving also clear the spent budget: the budget is a per-process allowance that is never otherwise reset,
+    /// so without this a probe that tunes every shape it visits would leave every probe after it unable to tune at
+    /// all, whatever the budget then says.
+    /// </summary>
+    private sealed class TuningPolicyScope : IDisposable
+    {
+        private readonly double _budget;
+        private readonly bool _persist;
+
+        /// <param name="budgetMilliseconds">The online tuning budget to allow inside the scope.</param>
+        /// <param name="persist">Whether decisions are read from and written to the on-disk cache inside it.</param>
+        internal TuningPolicyScope(double budgetMilliseconds, bool? persist = null)
+        {
+            _budget = TunedKernelPolicy.BudgetMilliseconds;
+            _persist = TunedKernelPolicy.PersistDecisions;
+            TunedKernelPolicy.BudgetMilliseconds = budgetMilliseconds;
+            if (persist.HasValue) TunedKernelPolicy.PersistDecisions = persist.Value;
+            TunedKernelPolicy.ResetBudget();
+        }
+
+        public void Dispose()
+        {
+            TunedKernelPolicy.BudgetMilliseconds = _budget;
+            TunedKernelPolicy.PersistDecisions = _persist;
+            TunedKernelPolicy.ResetBudget();
+        }
+    }
+
     /// <summary>One routed call: its buffers (inputs first), the call, and what is checked against what.</summary>
     private sealed class RouteCase
     {
@@ -116,7 +152,13 @@ internal static class KernelRouteTool
                 for (int o = 0; o < route.OutputSizes.Length; o++)
                     buffers[route.Inputs.Length + o] = backend.AllocateBuffer(new float[route.OutputSizes[o]]);
                 // A family that compiles a shape only once it recurs (attention) routes from the second call.
-                if (declared) route.Call(backend, buffers);
+                if (declared)
+                {
+                    route.Call(backend, buffers);
+                    // The warm call may update an input in place (BatchNorm's running statistics): restore every input
+                    // so the checked call starts from the state the reference assumes, as the incumbent's single call does.
+                    for (int i = 0; i < route.Inputs.Length; i++) backend.UploadBufferInPlace(route.Inputs[i], buffers[i]);
+                }
                 long before = backend.DeclaredProgramLaunches;
                 route.Call(backend, buffers);
                 backend.Synchronize();
@@ -490,7 +532,7 @@ internal static class KernelRouteTool
     private static void FlashProbe(CudaBackend backend)
     {
         Console.WriteLine();
-        Console.WriteLine("FLASH PROBE - flash_attention_v2 vs the declared attention program, same call (us)");
+        Console.WriteLine("FLASH PROBE - flash_attention_v2 vs the declared attention program, same call, and what the entry point serves by default (us)");
         foreach (var (b, h, s, d, causal) in new[]
         {
             (2, 8, 128, 64, false), (2, 8, 128, 64, true), (4, 8, 256, 64, true), (8, 12, 512, 64, true),
@@ -509,12 +551,26 @@ internal static class KernelRouteTool
             double declared;
             try
             {
-                declared = Time(() => backend.ScaledDotProductAttention(q, k, v, o, null, null, b, h, s, s, d, scale, causal),
-                    backend.Synchronize);
+                // Built on the second call (attention compiles a shape once it recurs): warm it first, or the timing
+                // includes the compile (516 ms for 8x12x512x64 on a cold cache, 0.8 ms warm).
+                void Declared() => backend.ScaledDotProductAttention(q, k, v, o, null, null, b, h, s, s, d, scale, causal);
+                Declared(); Declared();
+                declared = Time(Declared, backend.Synchronize);
             }
             finally
             {
                 backend.DeclaredKernelsSwitch = null;
+            }
+            // What production serves: the switch unset, so the backend's own routing (and any tuned slot) decides.
+            // Under the startup budget, not whatever the probes above left: the GEMM probe raises the budget to 600 s
+            // and every probe spends from one per-process allowance, so without this the slot that decides here would
+            // tune under a budget no production process has.
+            Action entry = () => backend.ScaledDotProductAttention(q, k, v, o, null, null, b, h, s, s, d, scale, causal);
+            double served;
+            using (new TuningPolicyScope(s_startupTuningBudget))
+            {
+                entry(); entry();
+                served = Time(entry, backend.Synchronize);
             }
             // The backward from the same forward: hand-written (declared off) against the declared program.
             using var stats = backend.AllocateBuffer(b * h * s);
@@ -540,7 +596,8 @@ internal static class KernelRouteTool
             Console.WriteLine(("flash " + b + "x" + h + "x" + s + "x" + d + (causal ? " causal" : "")).PadRight(34) +
                 flash.ToString("F1", CultureInfo.InvariantCulture).PadLeft(12) +
                 declared.ToString("F1", CultureInfo.InvariantCulture).PadLeft(12) +
-                (flash / declared).ToString("F2", CultureInfo.InvariantCulture).PadLeft(8) + "x   bwd " +
+                (flash / declared).ToString("F2", CultureInfo.InvariantCulture).PadLeft(8) + "x   served " +
+                served.ToString("F1", CultureInfo.InvariantCulture) + "   bwd " +
                 handBwd.ToString("F1", CultureInfo.InvariantCulture) + " -> " + declaredBwd.ToString("F1", CultureInfo.InvariantCulture) +
                 " = " + (handBwd / declaredBwd).ToString("F2", CultureInfo.InvariantCulture) + "x");
         }
@@ -557,8 +614,9 @@ internal static class KernelRouteTool
     {
         Console.WriteLine();
         Console.WriteLine("GEMM SCHEDULES - each declared schedule vs the entry point's incumbent (declared off)");
-        // Every shape is tuned in this one process; the default budget (2 s) is sized for a training run's first steps.
-        TunedKernelPolicy.BudgetMilliseconds = 600_000;
+        // Every shape is tuned in this one process; the default budget (2 s) is sized for a training run's first
+        // steps. The scope gives it back, so a later probe still measures what production would serve.
+        using var tuning = new TuningPolicyScope(600_000);
         var shapes = new List<(DeclaredFamily Family, int Batch, int M, int N, int K)>();
         foreach (var (m, n, k) in new[] { (4096, 64, 64), (8192, 128, 256), (2048, 256, 128), (16, 10, 4096), (512, 512, 16),
                                           (32, 10, 64), (256, 512, 512), (512, 768, 768), (1024, 1024, 1024), (5, 33, 17) })
@@ -1507,8 +1565,8 @@ internal static class KernelRouteTool
     {
         Console.WriteLine();
         Console.WriteLine("CONV VENDOR - entry with cuDNN: before (cuDNN default fwd / own-slot grads) vs the vendor slot, us");
-        TunedKernelPolicy.BudgetMilliseconds = 600_000;
-        TunedKernelPolicy.PersistDecisions = false;
+        // Measured here, not read back or written: every slot is re-measured in this process, under its own budget.
+        using var tuning = new TuningPolicyScope(600_000, persist: false);
         var shapes = new[]
         {
             ("s2 8x64->128 56", 8, 64, 128, 56, 56, 3, 2, 1, 1),
