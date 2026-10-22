@@ -23,6 +23,9 @@ public class SassInstructionTests
     // FFMA R9, R2, R5, R2 ;
     private static readonly SassInstruction Ffma = new(0x0000000502097223UL, 0x004fd00000000002UL);
 
+    /// <summary>The same ptxas cubin, for the allocator's tests.</summary>
+    internal static byte[] K1CubinImage() => K1Cubin();
+
     private static byte[] K1Cubin() => Convert.FromBase64String(
         "f0VMRgIBAUEIAAAAAAAAAAIAvgABAAAAAAAAAAAAAAAACwAAAAAAAIAHAAAAAAAABEsABkAAOAADAEAADgABAAAuc2hzdHJ0YWIA" +
         "LnN0cnRhYgAuc3ltdGFiAC5zeW10YWJfc2huZHgALm5vdGUubnYudGtpbmZvAC5ub3RlLm52LmN1aW5mbwAubnYuaW5mbwAudGV4" +
