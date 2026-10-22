@@ -835,7 +835,10 @@ internal sealed class DirectPtxModule : IDisposable
                     $"Direct PTX kernel '{name}' was rejected: CUDA JIT allocated " +
                     $"{info.LocalBytesPerThread} local bytes/thread (register spill or local stack). " +
                     "The direct-kernel contract requires zero local memory.");
+            // Recorded for every function, not only the ones that exceed the budget: the rejection message prints
+            // the offending figure, but calibrating the budget needs the largest value that was ACCEPTED.
             if (info.LocalBytesPerThread > LocalBytesObserved) LocalBytesObserved = info.LocalBytesPerThread;
+            GpuKernelDiagnostics.RecordLocalBytesPerThread(info.LocalBytesPerThread);
             if (info.LocalBytesPerThread > LocalMemoryBudgetBytes)
                 throw new InvalidOperationException(
                     $"Direct PTX kernel '{name}' was rejected: CUDA JIT allocated " +
