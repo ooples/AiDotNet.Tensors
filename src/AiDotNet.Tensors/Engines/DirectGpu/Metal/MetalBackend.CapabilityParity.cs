@@ -7,8 +7,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
 public sealed partial class MetalBackend : IGenericFftBackend, IMeshgridBackend, ISeededGumbelSoftmaxBackend, IUninitializedGpuAllocation, IMultiTensorGpuOptimizerBackend, IDeviceReadbackFactory
 {
-    // No asynchronous device-to-host copy is wired on this backend: the readback downloads when it is queued.
-    IDeviceReadback IDeviceReadbackFactory.CreateReadback(int byteCapacity) => new SynchronousDeviceReadback(this, byteCapacity);
+    // A blit committed without waiting; the host waits for its command buffer only on Read (#1520).
+    IDeviceReadback IDeviceReadbackFactory.CreateReadback(int byteCapacity) => new MetalDeviceReadback(this, byteCapacity);
 
     /// <remarks>Metal keeps its power-of-two FFT kernel.</remarks>
     bool IGenericFftBackend.PrefersGenericFftForPowerOfTwo => false;
@@ -19,10 +19,10 @@ public sealed partial class MetalBackend : IGenericFftBackend, IMeshgridBackend,
     /// </summary>
     public IGpuBuffer AllocateBufferUninitialized(int size) => AllocateBuffer(size);
     /// <summary>
-    /// The guarded updates read the guard on the host (<see cref="PerTensorMultiTensorOptimizer"/>): this backend's
-    /// Adam/AdamW/SGD kernels take no guard argument, so the verdict is downloaded before the launch.
+    /// The guarded updates read the guard on the device (optimizer_update_guarded) and write nothing when it is not
+    /// finite (#1520); without the resident library they read it on the host.
     /// </summary>
-    public bool GuardsFiniteOnDevice => false;
+    public bool GuardsFiniteOnDevice => _residentLibrary != IntPtr.Zero;
 
     public void AdamMultiTensorUpdate(
         IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
@@ -45,8 +45,21 @@ public sealed partial class MetalBackend : IGenericFftBackend, IMeshgridBackend,
         IReadOnlyList<IGpuBuffer> firstMoments, IReadOnlyList<IGpuBuffer> secondMoments,
         IReadOnlyList<int> sizes, float learningRate, float beta1, float beta2, float epsilon,
         float weightDecay, int step, IGpuBuffer finiteGuard)
-        => PerTensorMultiTensorOptimizer.UpdateGuarded(this, decoupledWeightDecay, parameters, gradients, firstMoments,
-            secondMoments, sizes, learningRate, beta1, beta2, epsilon, weightDecay, step, finiteGuard);
+    {
+        if (!GuardsFiniteOnDevice)
+        {
+            PerTensorMultiTensorOptimizer.UpdateGuarded(this, decoupledWeightDecay, parameters, gradients, firstMoments,
+                secondMoments, sizes, learningRate, beta1, beta2, epsilon, weightDecay, step, finiteGuard);
+            return;
+        }
+        ThrowIfDisposed();
+        PerTensorMultiTensorOptimizer.ValidateGuard(finiteGuard);
+        PerTensorMultiTensorOptimizer.ValidateAdam(parameters, gradients, firstMoments, secondMoments, sizes, epsilon, step);
+        // AdamUpdate's / AdamWUpdate's operation codes (2 / 3) and arguments.
+        for (int t = 0; t < parameters.Count; t++)
+            DispatchOptimizerMetalGuarded(decoupledWeightDecay ? 3u : 2u, parameters[t], gradients[t], firstMoments[t],
+                secondMoments[t], finiteGuard, sizes[t], step, learningRate, beta1, beta2, epsilon, weightDecay);
+    }
 
     public void SgdMultiTensorUpdate(
         IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients, IReadOnlyList<int> sizes,
@@ -56,7 +69,20 @@ public sealed partial class MetalBackend : IGenericFftBackend, IMeshgridBackend,
     public void SgdMultiTensorUpdateGuarded(
         IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients, IReadOnlyList<int> sizes,
         float learningRate, float weightDecay, IGpuBuffer finiteGuard)
-        => PerTensorMultiTensorOptimizer.SgdGuarded(this, parameters, gradients, sizes, learningRate, weightDecay, finiteGuard);
+    {
+        if (!GuardsFiniteOnDevice)
+        {
+            PerTensorMultiTensorOptimizer.SgdGuarded(this, parameters, gradients, sizes, learningRate, weightDecay, finiteGuard);
+            return;
+        }
+        ThrowIfDisposed();
+        PerTensorMultiTensorOptimizer.ValidateGuard(finiteGuard);
+        PerTensorMultiTensorOptimizer.ValidateSgd(parameters, gradients, sizes);
+        // SgdUpdate's operation code (0) and arguments.
+        for (int t = 0; t < parameters.Count; t++)
+            DispatchOptimizerMetalGuarded(0u, parameters[t], gradients[t], null, null, finiteGuard, sizes[t], 0,
+                learningRate, weightDecay);
+    }
 
     public void Meshgrid2DPair(IGpuBuffer source0, IGpuBuffer source1, IGpuBuffer output0, IGpuBuffer output1,
         int n0, int n1, bool xy)

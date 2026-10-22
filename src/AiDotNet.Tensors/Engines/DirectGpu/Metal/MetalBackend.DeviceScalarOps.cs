@@ -15,9 +15,13 @@ public sealed partial class MetalBackend : IDeviceScalarOps
         BroadcastMultiplyFirstAxis(buffer, scalar, buffer, 1, size);
     }
 
-    /// <remarks>No fused multi-tensor launch here; the reduction below is host-staged.</remarks>
-    bool IDeviceScalarOps.SupportsMultiTensorSumOfSquares => false;
+    /// <remarks>Reduced on the device by the resident kernels, so the compiled plan's finiteness check needs no host
+    /// read (#1520); host-staged when that library did not build.</remarks>
+    bool IDeviceScalarOps.SupportsMultiTensorSumOfSquares => IsAvailable && _residentLibrary != IntPtr.Zero;
 
     void IDeviceScalarOps.MultiTensorSumOfSquares(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer sumOfSquares)
-        => PortableDeviceScalarOps.MultiTensorSumOfSquares(this, tensors, sizes, sumOfSquares);
+    {
+        if (_residentLibrary != IntPtr.Zero) MultiTensorSumOfSquares(tensors, sizes, sumOfSquares);
+        else PortableDeviceScalarOps.MultiTensorSumOfSquares(this, tensors, sizes, sumOfSquares);
+    }
 }

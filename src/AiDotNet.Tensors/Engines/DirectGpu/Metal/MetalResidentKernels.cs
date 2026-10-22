@@ -222,7 +222,9 @@ kernel void rect_slice_nd(
     else slice[gid] = full[offset];
 }
 // Global-norm clip, one threadgroup reduction per tensor (no address tables): only threadgroup 0 runs, whatever size
-// the pipeline picked; thread 0 adds the partials in order, and dispatches on one queue run in order, so no atomics.
+// the pipeline picked; thread 0 adds the partials in order to acc[0] and marks acc[1] (as bits) when any element was not
+// finite, and dispatches on one queue run in order, so no atomics. Finiteness is read from the exponent bits: Metal
+// compiles with fast math, which may fold isfinite() to true.
 kernel void tensor_sum_squares_accumulate(
     device const float* x [[buffer(0)]],
     device float* acc [[buffer(1)]],
@@ -234,30 +236,75 @@ kernel void tensor_sum_squares_accumulate(
     // 1024 is Metal's per-threadgroup thread ceiling (maxTotalThreadsPerThreadgroup), so lid < 1024 always; the host
     // dispatches MultiTensorArgs.ReductionGroupSize (256).
     threadgroup float partial[1024];
+    threadgroup uint flags[1024];
     if (group != 0) return;
     float v = 0.0f;
-    for (uint i = lid; i < n; i += groupSize) { float e = x[i]; v += e * e; }
+    uint bad = 0u;
+    for (uint i = lid; i < n; i += groupSize)
+    {
+        float e = x[i];
+        v += e * e;
+        bad |= (as_type<uint>(e) & 0x7f800000u) == 0x7f800000u ? 1u : 0u;
+    }
     partial[lid] = v;
+    flags[lid] = bad;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lid == 0)
     {
         float s = 0.0f;
-        for (uint j = 0; j < groupSize; ++j) s += partial[j];
+        uint f = 0u;
+        for (uint j = 0; j < groupSize; ++j) { s += partial[j]; f |= flags[j]; }
         acc[0] += s;
+        if (f != 0u) reinterpret_cast<device uint*>(acc)[1] = 1u;
     }
 }
 
-// min(1, maxNorm / (norm + 1e-6)); a non-finite norm leaves the gradients unscaled. Tested on the exponent bits:
-// Metal compiles with fast math, which may fold isfinite() to true.
+// #1520: the accumulated (float sum, non-finite mark) as the double IDeviceScalarOps and the guarded updates read: NaN
+// when any element was not finite, DBL_MAX when only the float sum overflowed, else the float sum exactly. Built from
+// bits: Metal has no double.
+kernel void sum_squares_finish_double(
+    device uint* acc [[buffer(0)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid != 0) return;
+    uint u = acc[0];
+    uint e = (u >> 23) & 0xffu, mant = u & 0x7fffffu;
+    uint hi, lo;
+    if (acc[1] != 0u) { hi = 0x7ff80000u; lo = 0u; }
+    else if (e == 0xffu) { hi = 0x7fefffffu; lo = 0xffffffffu; }
+    else if (e == 0u && mant == 0u) { hi = 0u; lo = 0u; }
+    else if (e == 0u)
+    {
+        // A subnormal float: normalise its mantissa into the double's.
+        int shift = int(clz(mant)) - 8;
+        uint m = (mant << shift) & 0x7fffffu;
+        hi = (uint(1 - shift - 127 + 1023) << 20) | (m >> 3);
+        lo = m << 29;
+    }
+    else { hi = ((e + 896u) << 20) | (mant >> 3); lo = mant << 29; }
+    acc[0] = lo;
+    acc[1] = hi;
+}
+
+// min(1, maxNorm / (norm + 1e-6)) from the double sum_squares_finish_double wrote (narrowed back to a float: it came
+// from one); a non-finite norm, or a sum past the float range, leaves the gradients unscaled. Tested on the exponent
+// bits: Metal compiles with fast math, which may fold isfinite() to true.
 kernel void clip_scale_from_sum_squares(
-    device const float* acc [[buffer(0)]],
+    device const uint* acc [[buffer(0)]],
     device float* scale [[buffer(1)]],
     constant uint& maxNormBits [[buffer(2)]],
     uint gid [[thread_position_in_grid]])
 {
     if (gid != 0) return;
-    float norm = sqrt(acc[0]);
-    float c = (as_type<uint>(norm) & 0x7f800000u) != 0x7f800000u ? as_type<float>(maxNormBits) / (norm + 1e-6f) : 1.0f;
+    uint lo = acc[0], hi = acc[1];
+    int e = int((hi >> 20) & 0x7ffu) - 1023;
+    float c = 1.0f;
+    if (e <= 127)
+    {
+        float sum = e < -126 ? 0.0f : as_type<float>((uint(e + 127) << 23) | ((hi & 0xfffffu) << 3) | (lo >> 29));
+        float norm = sqrt(sum);
+        if ((as_type<uint>(norm) & 0x7f800000u) != 0x7f800000u) c = as_type<float>(maxNormBits) / (norm + 1e-6f);
+    }
     scale[0] = c < 1.0f ? c : 1.0f;
 }
 
@@ -892,13 +939,11 @@ kernel void update_traces(
     traces[gid] = trace;
 }
 
-kernel void optimizer_update(
-    device float* parameter [[buffer(0)]], device const float* gradient [[buffer(1)]],
-    device float* state1 [[buffer(2)]], device float* state2 [[buffer(3)]], device float* state3 [[buffer(4)]],
-    constant uint& count [[buffer(5)]], constant uint& operation [[buffer(6)]], constant uint& step [[buffer(7)]],
-    constant uint& learningRateBits [[buffer(8)]], constant uint& aBits [[buffer(9)]], constant uint& bBits [[buffer(10)]],
-    constant uint& cBits [[buffer(11)]], constant uint& dBits [[buffer(12)]],
-    uint gid [[thread_position_in_grid]])
+// The optimizer_update arithmetic, shared by the plain and the guarded kernel.
+inline void optimizer_step(
+    device float* parameter, device const float* gradient,
+    device float* state1, device float* state2, device float* state3,
+    uint count, uint operation, uint step, uint learningRateBits, uint aBits, uint bBits, uint cBits, uint dBits, uint gid)
 {
     if (gid >= count) return;
     float learningRate = as_type<float>(learningRateBits), a = as_type<float>(aBits), b = as_type<float>(bBits);
@@ -955,6 +1000,34 @@ kernel void optimizer_update(
     }
     float updated = value - learningRate * g, threshold = learningRate * a;
     parameter[gid] = updated > threshold ? updated - threshold : (updated < -threshold ? updated + threshold : 0.0f);
+}
+
+kernel void optimizer_update(
+    device float* parameter [[buffer(0)]], device const float* gradient [[buffer(1)]],
+    device float* state1 [[buffer(2)]], device float* state2 [[buffer(3)]], device float* state3 [[buffer(4)]],
+    constant uint& count [[buffer(5)]], constant uint& operation [[buffer(6)]], constant uint& step [[buffer(7)]],
+    constant uint& learningRateBits [[buffer(8)]], constant uint& aBits [[buffer(9)]], constant uint& bBits [[buffer(10)]],
+    constant uint& cBits [[buffer(11)]], constant uint& dBits [[buffer(12)]],
+    uint gid [[thread_position_in_grid]])
+{
+    optimizer_step(parameter, gradient, state1, state2, state3, count, operation, step, learningRateBits, aBits, bBits,
+        cBits, dBits, gid);
+}
+
+// #1520: optimizer_update that writes nothing when the guard is not finite. The guard is a double (a multi-tensor sum
+// of squares, NaN when any gradient was not finite) read as its high word's exponent bits.
+kernel void optimizer_update_guarded(
+    device float* parameter [[buffer(0)]], device const float* gradient [[buffer(1)]],
+    device float* state1 [[buffer(2)]], device float* state2 [[buffer(3)]], device float* state3 [[buffer(4)]],
+    device const uint* guard [[buffer(5)]],
+    constant uint& count [[buffer(6)]], constant uint& operation [[buffer(7)]], constant uint& step [[buffer(8)]],
+    constant uint& learningRateBits [[buffer(9)]], constant uint& aBits [[buffer(10)]], constant uint& bBits [[buffer(11)]],
+    constant uint& cBits [[buffer(12)]], constant uint& dBits [[buffer(13)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if ((guard[1] & 0x7ff00000u) == 0x7ff00000u) return;
+    optimizer_step(parameter, gradient, state1, state2, state3, count, operation, step, learningRateBits, aBits, bBits,
+        cBits, dBits, gid);
 }
 
 kernel void lars_update_serial(
