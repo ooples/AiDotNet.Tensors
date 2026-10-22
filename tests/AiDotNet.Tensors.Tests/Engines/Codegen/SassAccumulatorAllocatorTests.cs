@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 // The own SASS backend's accumulator allocator (#1442). No device and no toolkit: the instructions are built with the
 // measured bit model, and what is checked is what the allocator promises -- that re-pairing is the only renaming that
 // can move a mod-2 bank conflict at all, that the map it emits keeps every accumulator zeroed, and that the strict
@@ -17,8 +17,12 @@ public class SassAccumulatorAllocatorTests
     private const int Cs2r = 0x005;      // CS2R Rd, SRZ
     private const int Lds128 = 0x384;    // LDS.128
 
+    private const int Srz = 255;         // the special register CS2R reads to write a constant zero
+    private const int SrClockLo = 0x50;  // ... and one it reads that is not constant at all
+
     private static SassInstruction Make(int opcode, int rd, int ra = SassInstruction.ZeroRegister,
-        int rb = SassInstruction.ZeroRegister, int rc = SassInstruction.ZeroRegister, int size = 4)
+        int rb = SassInstruction.ZeroRegister, int rc = SassInstruction.ZeroRegister, int size = 4,
+        int specialRegister = Srz)
     {
         var instruction = new SassInstruction(0, 0);
         instruction.SetBits(0, 12, (ulong)opcode);
@@ -28,6 +32,8 @@ public class SassAccumulatorAllocatorTests
         instruction.SetRegister(SassInstruction.RbField, rb);
         instruction.SetRegister(SassInstruction.RcField, rc);
         instruction.SetBits(73, 3, (ulong)size);
+        // CS2R and S2R name their source in bits 72-79, where the measured S2R carries SR_TID.X.
+        if ((opcode & 0x1ff) == Cs2r) instruction.SetBits(72, 8, (ulong)specialRegister);
         instruction.Control = SassControl.Fixed(1);
         return instruction;
     }
@@ -61,6 +67,45 @@ public class SassAccumulatorAllocatorTests
         Assert.Equal(new[] { 8, 9, 10, 11 }, SassAccumulatorAllocator.Accumulators(FfmaBody()).ToArray());
         // An odd CS2R destination is not a pair, so it is not offered for re-pairing.
         Assert.Empty(SassAccumulatorAllocator.Accumulators(new[] { Make(Cs2r, 9) }));
+    }
+
+    /// <summary>
+    /// Only a CS2R that reads SRZ writes a constant. CS2R R8, SR_CLOCKLO leaves a timestamp in R8..R9, whose halves
+    /// are not interchangeable: a swap of them would send a reader of the low word to the high word.
+    /// </summary>
+    [Fact]
+    public void OnlyACs2rThatReadsSrzZeroesAnAccumulatorPair()
+    {
+        Assert.Equal(new[] { 8, 9 }, SassAccumulatorAllocator.Accumulators(new[] { Make(Cs2r, 8) }).ToArray());
+        Assert.Empty(SassAccumulatorAllocator.Accumulators(new[] { Make(Cs2r, 8, specialRegister: SrClockLo) }));
+    }
+
+    /// <summary>
+    /// A swap BETWEEN two pairs is only sound where the zeroing is a prologue. Here the first pair is already
+    /// accumulating before the second is zeroed, so R8 &lt;-&gt; R10 would read R10 before anything zeroed it and then
+    /// lose what it accumulated to the second CS2R. The allocator must offer only the swaps inside each pair.
+    /// </summary>
+    [Fact]
+    public void SwapsBetweenPairsAreRefusedWhenTheZeroingIsNotAPrologue()
+    {
+        var interleaved = new[]
+        {
+            Make(Cs2r, 8),
+            Make(Lds128, 16, ra: 4, size: 6),
+            Make(Ffma, 8, ra: 16, rb: 18, rc: 8),
+            Make(Cs2r, 10),
+            Make(Ffma, 10, ra: 16, rb: 18, rc: 10),
+        };
+        var restricted = SassAccumulatorAllocator.Allocate(interleaved)
+            ?? throw new InvalidOperationException(SassAccumulatorAllocator.LastDecline);
+        Assert.False(restricted.AcrossPairs);
+        foreach (int register in new[] { 8, 9, 10, 11 })
+            Assert.Equal(register & ~1, restricted.Map[register] & ~1);   // never leaves its own pair
+
+        // The same body with both CS2Rs in front does allow them, which is what makes the restriction a restriction.
+        var free = SassAccumulatorAllocator.Allocate(FfmaBody())
+            ?? throw new InvalidOperationException(SassAccumulatorAllocator.LastDecline);
+        Assert.True(free.AcrossPairs);
     }
 
     /// <summary>

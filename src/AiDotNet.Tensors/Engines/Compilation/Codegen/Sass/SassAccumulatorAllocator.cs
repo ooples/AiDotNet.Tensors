@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 // The accumulator allocator of the own SASS backend (#1442): it chooses the register map that SassRegisterRenamer
 // applies, for the one allocation decision the GEMM's inner loop actually leaves open.
 //
@@ -30,6 +30,11 @@ public static class SassAccumulatorAllocator
     private const int Cs2r = 0x005;        // CS2R Rd, SRZ: a constant zero into a 64-bit destination pair
     private const int Nop = 0x118;
 
+    // The special-register index CS2R and S2R read, bits 72-79. Pinned by the measured S2R in SassInstructionTests
+    // (high word 0x000e280000002100 -> 0x21 there, which nvdisasm prints as SR_TID.X); SRZ is 0xff.
+    private const int SpecialRegisterField = 72;
+    private const int ZeroSpecialRegister = 255;
+
     /// <summary>Why the last <see cref="Allocate"/> returned null (diagnostics).</summary>
     [ThreadStatic] public static string? LastDecline;
 
@@ -38,7 +43,27 @@ public static class SassAccumulatorAllocator
     /// <param name="Before">Same-bank FFMA file reads as ptxas left them.</param>
     /// <param name="After">Same-bank FFMA file reads under <paramref name="Map"/>.</param>
     /// <param name="Accumulators">How many accumulator registers were re-pairable.</param>
-    public readonly record struct SassAllocation(int[] Map, int Before, int After, int Accumulators);
+    /// <param name="AcrossPairs">
+    /// Whether swaps BETWEEN two CS2R pairs were sound here (the zeroing is a prologue). False restricts the search to
+    /// swaps inside each pair, which need no ordering argument at all.
+    /// </param>
+    public readonly record struct SassAllocation(int[] Map, int Before, int After, int Accumulators, bool AcrossPairs);
+
+    /// <summary>
+    /// Whether <paramref name="instruction"/> zeroes a 64-bit register pair, which is what makes its destinations
+    /// interchangeable. CS2R also reads special registers that are NOT constant -- SR_CLOCKLO is the one a kernel is
+    /// likely to contain -- and a clock pair in the zeroed set would let a swap send a reader of its low word to its
+    /// high word, so the source must be SRZ and not merely a CS2R.
+    /// </summary>
+    private static bool ZeroesAPair(in SassInstruction instruction, out int destination)
+    {
+        destination = instruction.Register(SassInstruction.RdField);
+        return (instruction.Opcode & 0x1ff) == Cs2r
+            && (int)instruction.Bits(SpecialRegisterField, 8) == ZeroSpecialRegister
+            // An odd or RZ destination is not a pair this may re-pair; leave it out and it stays where it is.
+            && destination != SassInstruction.ZeroRegister && destination % 2 == 0
+            && destination + 1 < SassInstruction.ZeroRegister;
+    }
 
     /// <summary>
     /// The registers covered by CS2R destination pairs: the accumulator slots, interchangeable because what CS2R
@@ -50,16 +75,60 @@ public static class SassAccumulatorAllocator
         var accumulators = new SortedSet<int>();
         for (int i = 0; i < code.Count; i++)
         {
-            if ((code[i].Opcode & 0x1ff) != Cs2r) continue;
-            int destination = code[i].Register(SassInstruction.RdField);
-            // An odd or RZ destination is not a pair this may re-pair; leave it out and it stays where it is.
-            if (destination == SassInstruction.ZeroRegister || destination % 2 != 0 ||
-                destination + 1 >= SassInstruction.ZeroRegister)
-                continue;
+            if (!ZeroesAPair(code[i], out int destination)) continue;
             accumulators.Add(destination);
             accumulators.Add(destination + 1);
         }
         return accumulators;
+    }
+
+    /// <summary>
+    /// Whether the zeroing CS2Rs form a PROLOGUE: all of them run before anything else touches an accumulator, and
+    /// none of them can run a second time or be skipped.
+    /// </summary>
+    /// <remarks>
+    /// This is what separates a swap between two different pairs from a swap inside one. Inside a pair the swap is
+    /// always sound, because the one CS2R zeroes both halves at the same instant. Between pairs the exemption that
+    /// leaves the CS2Rs where ptxas put them means the two zeroes happen at two different points, so
+    /// <c>CS2R R8; FFMA R8, .., R8; CS2R R10; FFMA R10, .., R10</c> renamed by R8&lt;-&gt;R10 reads R10 before anything
+    /// zeroed it and then has its accumulated value overwritten by the second CS2R. A branch target at or before the
+    /// last zeroing CS2R would allow the same thing by re-entry, and an accumulator used as a temporary before the
+    /// prologue ends would lose that value.
+    /// </remarks>
+    private static bool ZeroingIsAPrologue(IReadOnlyList<SassInstruction> code, SortedSet<int> accumulators)
+    {
+        int last = -1;
+        for (int i = 0; i < code.Count; i++)
+            if (ZeroesAPair(code[i], out _)) last = i;
+        if (last < 0) return false;
+        foreach (int target in SassScheduler.BranchTargets(code))
+            if (target <= last) return false;
+        for (int i = 0; i < last; i++)
+            if (!ZeroesAPair(code[i], out _) && Touches(code[i], accumulators))
+                return false;
+        return true;
+    }
+
+    // Whether an instruction names any register of `registers`, counting the implicit members of a multi-register
+    // operand. An unknown opcode counts as touching them: the renamer refuses such a kernel anyway.
+    private static bool Touches(in SassInstruction instruction, SortedSet<int> registers)
+    {
+        if (SassOpcodeTable.Decode(instruction) is not { } effects) return true;
+        foreach (var operand in effects.Writes)
+            if (Covers(instruction, operand, registers)) return true;
+        foreach (var operand in effects.Reads)
+            if (Covers(instruction, operand, registers)) return true;
+        return false;
+    }
+
+    private static bool Covers(in SassInstruction instruction, SassRegisterOperand operand, SortedSet<int> registers)
+    {
+        if (operand.Uniform) return false;
+        int r = instruction.Register(operand.Field);
+        if (r == SassInstruction.ZeroRegister) return false;
+        for (int k = 0; k < operand.Width; k++)
+            if (registers.Contains(r + k)) return true;
+        return false;
     }
 
     /// <summary>
@@ -93,11 +162,7 @@ public static class SassAccumulatorAllocator
         for (int i = 0; i < code.Count; i++)
         {
             masked[i] = code[i];
-            if ((code[i].Opcode & 0x1ff) != Cs2r) continue;
-            int destination = code[i].Register(SassInstruction.RdField);
-            if (destination == SassInstruction.ZeroRegister || destination % 2 != 0 ||
-                destination + 1 >= SassInstruction.ZeroRegister)
-                continue;
+            if (!ZeroesAPair(code[i], out _)) continue;
             var placeholder = new SassInstruction(0, 0);
             placeholder.SetBits(0, 12, Nop);
             masked[i] = placeholder;
@@ -114,11 +179,15 @@ public static class SassAccumulatorAllocator
     }
 
     /// <summary>
-    /// A map that lowers <paramref name="code"/>'s same-bank FFMA file reads, found by accepting any swap of two
+    /// A map that lowers <paramref name="code"/>'s same-bank FFMA file reads, found by accepting any sound swap of two
     /// accumulators that strictly lowers <see cref="SassFfmaReorder.BankConflicts"/> until none does. The swaps are
     /// tried in register order, so the same kernel always yields the same map. Null when the kernel has fewer than
     /// two re-pairable accumulators, or when the rename is refused (an unknown opcode).
     /// </summary>
+    /// <remarks>
+    /// Sound means: inside one CS2R pair always, and between two pairs only where the zeroing is a prologue (see
+    /// <see cref="ZeroingIsAPrologue"/>). Where it is not, the search still runs, over the within-pair swaps alone.
+    /// </remarks>
     public static SassAllocation? Allocate(IReadOnlyList<SassInstruction> code, int banks = 2)
     {
         if (code is null) throw new ArgumentNullException(nameof(code));
@@ -131,6 +200,14 @@ public static class SassAccumulatorAllocator
             return null;
         }
         var slots = new List<int>(accumulators);
+        bool acrossPairs = ZeroingIsAPrologue(code, accumulators);
+        // The swaps this kernel allows, in register order so the search is deterministic. Two registers are in one
+        // pair when they differ only in the low bit -- the one CS2R zeroed both of them together.
+        var swaps = new List<(int A, int B)>();
+        for (int a = 0; a < slots.Count; a++)
+            for (int b = a + 1; b < slots.Count; b++)
+                if (acrossPairs || (slots[a] ^ 1) == slots[b])
+                    swaps.Add((slots[a], slots[b]));
         var map = new int[SassInstruction.ZeroRegister];
         for (int r = 0; r < map.Length; r++) map[r] = r;
 
@@ -142,16 +219,16 @@ public static class SassAccumulatorAllocator
         while (improved)
         {
             improved = false;
-            for (int a = 0; a < slots.Count && !improved; a++)
-                for (int b = a + 1; b < slots.Count && !improved; b++)
-                {
-                    (map[slots[a]], map[slots[b]]) = (map[slots[b]], map[slots[a]]);
-                    var candidate = RenameRepairingAccumulators(code, map);
-                    int score = candidate is null ? int.MaxValue : SassFfmaReorder.BankConflicts(candidate, banks);
-                    if (score < best) { best = score; improved = true; }
-                    else (map[slots[a]], map[slots[b]]) = (map[slots[b]], map[slots[a]]);
-                }
+            for (int s = 0; s < swaps.Count && !improved; s++)
+            {
+                var (x, y) = swaps[s];
+                (map[x], map[y]) = (map[y], map[x]);
+                var candidate = RenameRepairingAccumulators(code, map);
+                int score = candidate is null ? int.MaxValue : SassFfmaReorder.BankConflicts(candidate, banks);
+                if (score < best) { best = score; improved = true; }
+                else (map[x], map[y]) = (map[y], map[x]);
+            }
         }
-        return new SassAllocation(map, before, best, accumulators.Count);
+        return new SassAllocation(map, before, best, accumulators.Count, acrossPairs);
     }
 }
