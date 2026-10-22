@@ -130,6 +130,7 @@ public static class SassOpcodeTable
         [0x003] = new("P2R", SassLatency.Fixed, true, 1, Sources.A, [], [], ReadsAllPredicates: true, FixedLatency: 14),
         [0x005] = new("CS2R", SassLatency.Fixed, true, 2, Sources.None, [], [], FixedLatency: 8),
         [0x007] = new("SEL", SassLatency.Fixed, true, 1, Sources.AB, [], [87]),
+        [0x008] = new("FSEL", SassLatency.Fixed, true, 1, Sources.AB, [], [87]),
         [0x009] = new("FMNMX", SassLatency.Fixed, true, 1, Sources.AB, [], [87]),
         [0x00b] = new("FSETP", SassLatency.Fixed, false, 0, Sources.AB, [81, 84], [87]),
         [0x00c] = new("ISETP", SassLatency.Fixed, false, 0, Sources.AB, [81, 84], [87]),

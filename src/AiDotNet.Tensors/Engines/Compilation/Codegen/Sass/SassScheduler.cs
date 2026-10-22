@@ -66,13 +66,49 @@ public static class SassScheduler
     // largest ptxas leaves over the catalog and GEMM kernels compiled for it (--sass-learn --arch 86: BAR 6, DEPBAR 4,
     // LDGDEPBAR 4, a guard read 13 cycles after its compare at the closest) and are floors, not yet run on an sm_86
     // device. Any other architecture is declined.
-    private sealed record Timing(int GuardPredicateLatency, int MaxStall, IReadOnlyDictionary<string, int> IssueStalls);
+    //
+    // Pipe issue spacing (sm_86): a warp's instruction occupies its execution pipe for several cycles (a 16-lane pipe
+    // takes two for 32 threads), and the next instruction on the same pipe must issue after it. ptxas never leaves
+    // less over the catalog and GEMM kernels (--sass-learn --arch 86 reports the fewest cycles per pipe): the integer
+    // ALU, IMAD and the uniform ALU 2 cycles (IMAD.WIDE and IMAD.HI 4), the conversion/special-function unit 8. The
+    // uniform pipe is not interlocked: a register-blocked GEMM whose UMOV issued 1 cycle after a UIMAD faulted on the
+    // RTX 3080 (illegal address).
+    //
+    // Uniform operand reads (sm_86): a uniform-pipe instruction reads its uniform registers late, while UMOV and ULDC
+    // write theirs early (2 cycles; the other uniform operations 4). So UMOV or ULDC overwriting a register that an
+    // earlier uniform instruction reads must issue UniformEarlyWriteAfterRead cycles after it: ptxas never leaves fewer
+    // than 3 (UIMAD, ULEA, USEL and USHF readers alike), the vector instructions that read a uniform register take 1,
+    // and the GEMM above, given the pipe spacing, still faulted with a UMOV 2 cycles after the UIMAD reading its
+    // register and ran with 3.
+    private sealed record Timing(int GuardPredicateLatency, int MaxStall, IReadOnlyDictionary<string, int> IssueStalls,
+        IReadOnlyDictionary<string, (string Pipe, int Cycles)> Pipes, int UniformEarlyWriteAfterRead = 0);
+
+    private static readonly Dictionary<string, (string Pipe, int Cycles)> s_noPipes = new();
+
+    private static readonly Dictionary<string, (string Pipe, int Cycles)> s_ampere = new()
+    {
+        ["IADD3"] = ("alu", 2), ["LEA"] = ("alu", 2), ["LOP3"] = ("alu", 2), ["ISETP"] = ("alu", 2), ["MOV"] = ("alu", 2),
+        ["SEL"] = ("alu", 2), ["SHF"] = ("alu", 2), ["IABS"] = ("alu", 2), ["IMNMX"] = ("alu", 4), ["PLOP3"] = ("alu", 2),
+        ["P2R"] = ("alu", 2), ["FSEL"] = ("alu", 2), ["FSETP"] = ("alu", 2), ["FMNMX"] = ("alu", 2),
+        ["IMAD"] = ("imad", 2), ["IMAD.WIDE"] = ("imad", 4), ["IMAD.HI"] = ("imad", 4),
+        ["UMOV"] = ("uniform", 2), ["USEL"] = ("uniform", 2), ["UISETP"] = ("uniform", 2), ["UIADD3"] = ("uniform", 2),
+        ["ULEA"] = ("uniform", 2), ["ULOP3"] = ("uniform", 2), ["USHF"] = ("uniform", 2), ["UIMAD"] = ("uniform", 2),
+        ["UIMAD.WIDE"] = ("uniform", 2), ["ULDC"] = ("uniform", 2),
+        ["MUFU"] = ("xu", 8), ["I2F"] = ("xu", 8), ["F2I"] = ("xu", 8),
+    };
 
     private static readonly Dictionary<int, Timing> s_timings = new()
     {
-        [75] = new(12, 12, new Dictionary<string, int> { ["BMOV"] = 11, ["BAR"] = 5 }),
-        [86] = new(13, 13, new Dictionary<string, int> { ["BMOV"] = 11, ["BAR"] = 6, ["DEPBAR"] = 4, ["LDGDEPBAR"] = 4 }),
+        [75] = new(12, 12, new Dictionary<string, int> { ["BMOV"] = 11, ["BAR"] = 5 }, s_noPipes),
+        [86] = new(13, 13, new Dictionary<string, int> { ["BMOV"] = 11, ["BAR"] = 6, ["DEPBAR"] = 4, ["LDGDEPBAR"] = 4 }, s_ampere, 3),
     };
+
+    /// <summary>
+    /// The pipe <paramref name="mnemonic"/> issues to on <paramref name="architecture"/> and the fewest cycles before
+    /// the next instruction on that pipe may issue, or null when the scheduler does not space it.
+    /// </summary>
+    public static (string Pipe, int Cycles)? PipeIssue(string mnemonic, int architecture) =>
+        s_timings.TryGetValue(architecture, out var t) && t.Pipes.TryGetValue(mnemonic, out var p) ? p : null;
 
     /// <summary>The SM versions (major * 10 + minor) whose timings the scheduler has.</summary>
     public static IReadOnlyCollection<int> SupportedArchitectures => s_timings.Keys;
@@ -131,6 +167,8 @@ public static class SassScheduler
         var scoreboardSetAt = new long[6];
         for (int s = 0; s < scoreboardSetAt.Length; s++) scoreboardSetAt[s] = long.MinValue / 2;
         var predicateWrittenAt = new Dictionary<int, long>();   // predicate key -> cycle of the compare
+        var pipeFreeAt = new Dictionary<string, (long Ready, long Produced)>();   // pipe -> next issue cycle allowed
+        var uniformReadAt = new Dictionary<int, long>();   // uniform register key -> latest uniform-pipe reader's cycle
         var originalStall = new int[code.Count];
         var issueCycle = new long[code.Count];
 
@@ -195,10 +233,13 @@ public static class SassScheduler
             }
             for (int s = 0; s < scoreboardSetAt.Length; s++)
                 if ((wait >> s & 1) != 0) Need(scoreboardSetAt[s] + ScoreboardSetDelay, scoreboardSetAt[s]);
+            timing.Pipes.TryGetValue(e.Mnemonic, out var pipe);
             if (boundary)
             {
                 foreach (var at in readyAt.Values) Need(at.Ready, at.Produced);
                 foreach (long at in predicateWrittenAt.Values) Need(at + guardLatency, at);
+                foreach (var at in pipeFreeAt.Values) Need(at.Ready, at.Produced);
+                foreach (long at in uniformReadAt.Values) Need(at + timing.UniformEarlyWriteAfterRead, at);
             }
             else
             {
@@ -210,6 +251,9 @@ public static class SassScheduler
                 foreach (int p in predicateWrites) if (readyAt.TryGetValue(p, out var at)) Need(at.Ready, at.Produced);
                 if (e.ReadsAllPredicates)
                     foreach (var pair in readyAt) if (pair.Key >= PredicateKey && pair.Key < UniformPredicateKey) Need(pair.Value.Ready, pair.Value.Produced);
+                if (pipe.Pipe is not null && pipeFreeAt.TryGetValue(pipe.Pipe, out var free)) Need(free.Ready, free.Produced);
+                if (e.Mnemonic is "UMOV" or "ULDC")
+                    foreach (int r in writes) if (uniformReadAt.TryGetValue(r, out long read)) Need(read + timing.UniformEarlyWriteAfterRead, read);
             }
             if (ready > cycle)
             {
@@ -236,7 +280,12 @@ public static class SassScheduler
             {
                 readyAt.Clear();
                 predicateWrittenAt.Clear();
+                pipeFreeAt.Clear();
+                uniformReadAt.Clear();
             }
+            if (pipe.Pipe is not null) pipeFreeAt[pipe.Pipe] = (cycle + pipe.Cycles, cycle);
+            if (timing.UniformEarlyWriteAfterRead > 0 && pipe.Pipe == "uniform")
+                foreach (int r in reads) if (r >= UniformRegisterKey) uniformReadAt[r] = cycle;
 
             // This instruction's own scoreboards.
             if (e.Mnemonic == "LDGDEPBAR")

@@ -289,7 +289,7 @@ internal static class SassProbeTool
     private static string BankProbePtx(int major, int minor)
     {
         var sb = new System.Text.StringBuilder();
-        sb.Append(".version 7.0\n.target sm_").Append(major).Append(minor).Append("\n.address_size 64\n")
+        sb.Append(".version ").Append(PtxAffineEmitter.PtxIsaVersionFor(major, minor)).Append("\n.target sm_").Append(major).Append(minor).Append("\n.address_size 64\n")
           .Append(".visible .entry bank_probe(.param .u64 p0, .param .u32 p1)\n{\n")
           .Append("    .reg .b32 %r<8>;\n    .reg .b64 %rd<4>;\n    .reg .f32 %x<8>;\n    .reg .f32 %y<4>;\n    .reg .f32 %c<32>;\n    .reg .f32 %s;\n    .reg .pred %p;\n")
           .Append("    mov.u32 %r0, %tid.x;\n    mov.u32 %r1, %ctaid.x;\n    mov.u32 %r2, %ntid.x;\n    mad.lo.s32 %r3, %r1, %r2, %r0;\n")
