@@ -395,6 +395,93 @@ public static class CodegenBackendPrograms
     }
 
     /// <summary>
+    /// Paged attention's decode step (#890 phase 4d), in CudaBackend.PagedAttentionDecode's contract: one query per
+    /// head against a KV cache held in pages. <c>block_table</c> is int32 [pages] and maps a logical page to its
+    /// physical block, so the cache is [blocks, blockSize, kvHeads, headDim] and key <c>k = page * blockSize + pos</c>
+    /// lives at block_table[page], pos. <c>key_bias</c> is [pages * blockSize], 0 for a key inside the sequence and
+    /// <see cref="AttentionMaskedLogit"/> for one in the last page's unused tail -- the backend supplies it, as it
+    /// already supplies the causal bias, because comparing k against a run-time seqLen is outside the IR. The caller
+    /// guarantees at least one unmasked key, which decode always has.
+    /// </summary>
+    public static CodegenProgram PagedAttentionDecode(int heads, int kvHeads, int headDim, int blockSize, int pages,
+        int blocks, double scale)
+    {
+        if (heads <= 0 || kvHeads <= 0 || headDim <= 0 || blockSize <= 0 || pages <= 0 || blocks <= 0)
+            throw new ArgumentOutOfRangeException(nameof(heads), "Paged attention extents must be positive.");
+        if (heads % kvHeads != 0) throw new ArgumentException("heads must be a multiple of kvHeads.", nameof(kvHeads));
+        int group = heads / kvHeads;
+        // The kv head of query head h, as the grouped-query kernels compute it.
+        CodegenAffineExpr KvHead() => group == 1
+            ? A(0)
+            : new CodegenAffineExpr(new[] { new CodegenAffineTerm(0, 1) }, 0, group);
+        // k = page * blockSize + pos, affine in the two axes the cache is addressed by.
+        CodegenAffineExpr Key(int pageAxis, int posAxis) => new(new[]
+            { new CodegenAffineTerm(pageAxis, blockSize), new CodegenAffineTerm(posAxis, 1) });
+
+        int seqK = checked(pages * blockSize);
+        int[] matrix = { heads, seqK };
+        int[] vector = { heads };
+        int[] cache = { blocks, blockSize, kvHeads, headDim };
+        var passes = new List<CodegenKernelSpec>();
+        var temps = new List<long>();
+
+        // ---- logits[h, k] = scale * sum_d q[h, d] * kcache[table[page], pos, h/g, d] + key_bias[k]
+        var scoreSpace = new CodegenIterationSpace(
+            CodegenAxis.Parallel("h", heads), CodegenAxis.Parallel("page", pages),
+            CodegenAxis.Parallel("pos", blockSize), CodegenAxis.Reduce("d", headDim));
+        var scoreInputs = new[]
+        {
+            new CodegenTensorBinding(0, "block_table", new[] { pages }, new[] { A(1) },
+                elementType: CodegenElementType.Int32),
+            new CodegenTensorBinding(1, "q", new[] { heads, headDim }, new[] { A(0), A(3) }),
+            new CodegenTensorBinding(2, "kcache", cache,
+                new[] { CodegenAffineExpr.Const(0), A(2), KvHead(), A(3) },
+                indirect: new CodegenIndirectIndex?[] { new CodegenIndirectIndex(0, A(1), blocks), null, null, null }),
+            new CodegenTensorBinding(3, "key_bias", new[] { seqK }, new[] { Key(1, 2) }),
+        };
+        passes.Add(new CodegenKernelSpec("paged_attention_scores", scoreSpace, scoreInputs,
+            new CodegenTensorBinding(4, "logits", matrix, new[] { A(0), Key(1, 2) }, isOutput: true),
+            new[] { 1, 2 }, CodegenReduceKind.Sum, biasInput: 3, reduceScale: scale));
+        temps.Add((long)heads * seqK);
+
+        // ---- the row softmax over k, as ScaledDotProductAttention's, on the logits as [heads, seqK].
+        var reduceSpace = new CodegenIterationSpace(CodegenAxis.Parallel("i", heads), CodegenAxis.Reduce("j", seqK));
+        passes.Add(new CodegenKernelSpec("paged_attention_negmax", reduceSpace,
+            new[] { Bind(0, "logits", matrix) }, Bind(1, "negmax", vector, isOutput: true), new[] { 0 },
+            CodegenReduceKind.Max, reduceScale: -1.0));
+        passes.Add(new CodegenKernelSpec("paged_attention_recipsum", reduceSpace,
+            new[] { Bind(0, "logits", matrix), Bind(1, "negmax", vector) },
+            Bind(2, "recipsum", vector, isOutput: true), new[] { 0 }, CodegenReduceKind.Sum,
+            activation: CodegenActivationKind.Reciprocal, preReduce: CodegenPreReduceOp.Exp, preBiasInput: 1));
+        temps.Add(heads);
+        temps.Add(heads);
+        var weightSpace = new CodegenIterationSpace(CodegenAxis.Parallel("i", heads), CodegenAxis.Parallel("j", seqK));
+        passes.Add(new CodegenKernelSpec("paged_attention_normalise", weightSpace,
+            new[] { Bind(0, "logits", matrix), Bind(1, "negmax", vector), Bind(2, "recipsum", vector) },
+            Bind(3, "weights", matrix, isOutput: true), new[] { 0 }, CodegenReduceKind.None, scaleInput: 2,
+            preReduce: CodegenPreReduceOp.Exp, preBiasInput: 1));
+        temps.Add((long)heads * seqK);
+
+        // ---- out[h, e] = sum_k weights[h, k] * vcache[table[page], pos, h/g, e]
+        var valueSpace = new CodegenIterationSpace(
+            CodegenAxis.Parallel("h", heads), CodegenAxis.Parallel("e", headDim),
+            CodegenAxis.Reduce("page", pages), CodegenAxis.Reduce("pos", blockSize));
+        passes.Add(new CodegenKernelSpec("paged_attention_output", valueSpace,
+            new[]
+            {
+                new CodegenTensorBinding(0, "block_table", new[] { pages }, new[] { A(2) },
+                    elementType: CodegenElementType.Int32),
+                new CodegenTensorBinding(1, "weights", matrix, new[] { A(0), Key(2, 3) }),
+                new CodegenTensorBinding(2, "vcache", cache,
+                    new[] { CodegenAffineExpr.Const(0), A(3), KvHead(), A(1) },
+                    indirect: new CodegenIndirectIndex?[] { new CodegenIndirectIndex(0, A(2), blocks), null, null, null }),
+            },
+            new CodegenTensorBinding(3, "out", new[] { heads, headDim }, new[] { A(0), A(1) }, isOutput: true),
+            new[] { 1, 2 }, CodegenReduceKind.Sum));
+        return new CodegenProgram(passes, temps, "paged attention decode (backend contract)");
+    }
+
+    /// <summary>
     /// The backward of <see cref="ScaledDotProductAttention"/> (heads == kvHeads), in
     /// CudaBackend.ScaledDotProductAttentionBackward's contract: from the output gradient dout and the forward's stored
     /// weights P, <c>dv = P^T dout</c>, <c>dP = dout v^T</c>, <c>dS = scale * P * (dP - rowsum(P * dP))</c>,
