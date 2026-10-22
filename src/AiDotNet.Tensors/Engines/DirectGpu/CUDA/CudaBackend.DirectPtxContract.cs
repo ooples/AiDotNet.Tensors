@@ -30,6 +30,9 @@ public sealed partial class CudaBackend : IDirectPtxBackend
     bool IDirectPtxBackend.TryDirectPtxAddGroupNormUnit64(IGpuBuffer left, IGpuBuffer right, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta, int batch, int groups, int channels, int spatialSize, float epsilon)
         => TryDirectPtxAddGroupNormUnit64(left, right, output, gamma, beta, batch, groups, channels, spatialSize, epsilon);
 
+    bool IDirectPtxBackend.TryDeclaredGroupNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer mean, IGpuBuffer rstd, IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta, int batch, int groups, int channels, int spatialSize)
+        => TryDeclaredGroupNormBackward(gradOutput, input, gamma, mean, rstd, gradInput, gradGamma, gradBeta, batch, groups, channels, spatialSize);
+
     bool IDirectPtxBackend.TryDirectPtxGroupNormBackwardUnit64(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer mean, IGpuBuffer variance, IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta, int batch, int groups, int channels, int spatialSize, float epsilon)
         => TryDirectPtxGroupNormBackwardUnit64(gradOutput, input, gamma, mean, variance, gradInput, gradGamma, gradBeta, batch, groups, channels, spatialSize, epsilon);
 }

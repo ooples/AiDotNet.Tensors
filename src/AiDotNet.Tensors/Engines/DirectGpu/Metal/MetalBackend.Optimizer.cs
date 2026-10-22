@@ -23,6 +23,26 @@ public sealed partial class MetalBackend
             unchecked((uint)SingleToInt32BitsCompat(d)));
     }
 
+    // DispatchOptimizerMetal through optimizer_update_guarded: the same arithmetic, skipped when the guard (a double in
+    // the first two float slots) is not finite (#1520).
+    private void DispatchOptimizerMetalGuarded(uint operation, IGpuBuffer parameter, IGpuBuffer gradient,
+        IGpuBuffer? state1, IGpuBuffer? state2, IGpuBuffer guard, int size, int step,
+        float learningRate, float a = 0f, float b = 0f, float c = 0f, float d = 0f)
+    {
+        if (size <= 0) return;
+        using var dummy1 = state1 is null ? AllocateBuffer(1) : null;
+        using var dummy2 = state2 is null ? AllocateBuffer(1) : null;
+        using var dummy3 = AllocateBuffer(1);
+        DispatchResidentMetal("optimizer_update_guarded", size,
+            new[] { parameter, gradient, state1 ?? dummy1!, state2 ?? dummy2!, dummy3, guard },
+            (uint)size, operation, (uint)step,
+            unchecked((uint)SingleToInt32BitsCompat(learningRate)),
+            unchecked((uint)SingleToInt32BitsCompat(a)),
+            unchecked((uint)SingleToInt32BitsCompat(b)),
+            unchecked((uint)SingleToInt32BitsCompat(c)),
+            unchecked((uint)SingleToInt32BitsCompat(d)));
+    }
+
     #region Optimizer Operations
 
     /// <summary>

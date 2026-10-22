@@ -27,6 +27,7 @@ multiply	126	16	16	0	0
 sigmoid	242	8	8	0	0
 tanh	370	8	8	0	0
 batchnorm_inference_relu	70	3	0	10	0
+scatter_add_deterministic	203	1	0	36	1
 softmax_rows/softmax_negmax	284	32	0	65	0
 softmax_rows/softmax_recipsum	479	64	0	97	0
 softmax_rows/softmax_normalise	218	10	8	0	0
@@ -62,6 +63,11 @@ groupnorm_backward/groupnorm_bwd_dbeta	357	32	0	130	1
 batchnorm2d_backward/batchnorm_bwd_dbeta	80	1	0	4	2
 batchnorm2d_backward/batchnorm_bwd_dgamma	107	4	0	9	2
 batchnorm2d_backward/batchnorm_bwd_dx	405	19	14	0	0
+paged_attention_decode/paged_attention_scores	109	3	0	8	1
+paged_attention_decode/paged_attention_negmax	284	32	0	65	0
+paged_attention_decode/paged_attention_recipsum	479	64	0	97	0
+paged_attention_decode/paged_attention_normalise	218	10	8	0	0
+paged_attention_decode/paged_attention_output	547	32	0	82	1
 groupnorm/groupnorm_negmean	358	32	0	130	1
 groupnorm/groupnorm_rstd	587	64	0	194	1
 groupnorm/groupnorm_affine	238	12	8	0	0

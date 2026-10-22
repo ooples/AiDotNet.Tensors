@@ -640,11 +640,14 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
 
             if (numWorkgroups == 1)
             {
+                // A host read like DownloadBuffer: counted, so the readback probe sees reductions too.
+                GpuLaunchProbe.OnReadback((long)newPartialResults.Size * sizeof(float), GpuBackendType.WebGpu);
                 var result = await newPartialResults.DownloadAsync();
                 return result[0];
             }
         }
 
+        GpuLaunchProbe.OnReadback((long)partialResults.Size * sizeof(float), GpuBackendType.WebGpu);
         var finalResult = await partialResults.DownloadAsync();
         return finalResult[0];
     }

@@ -70,6 +70,14 @@ public sealed partial class WebGpuBackend : IWinogradF23Transforms, IWinogradFus
                         new DelegateTunedKernelCandidate<TunedConv2DBackwardArgs>("webgpu.conv2d_dx.winograd_f23", TunedKernelOrigin.Builtin,
                             true, shape => WinogradF23Pipeline.AdmitsShape(shape) && WinogradKernelsReady,
                             (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardDataWinograd(a)) LaunchDxDirect(a); }),
+                        // The stride-2 input gradients of ConvDgradS2KernelTemplate (#1476 ported): the 3 x 3 four-phase kernel and
+                        // the 1 x 1 kernel written straight into dX with its zero phases.
+                        new DelegateTunedKernelCandidate<TunedConv2DBackwardArgs>("webgpu.conv2d_dx.s2k3", TunedKernelOrigin.Builtin,
+                            true, shape => PortableConvDgradS2.K3Enabled && PortableConvDgradS2.AdmitsK3Shape(shape) && DgradS2Ready,
+                            (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardInputS2K3(a)) LaunchDxDirect(a); }),
+                        new DelegateTunedKernelCandidate<TunedConv2DBackwardArgs>("webgpu.conv2d_dx.s2k1", TunedKernelOrigin.Builtin,
+                            true, shape => PortableConvDgradS2.K1Enabled && PortableConvDgradS2.AdmitsK1Shape(shape) && DgradS2Ready,
+                            (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardInputS2K1(a)) LaunchDxDirect(a); }),
                     });
                 return _conv2DBackwardDataSlot;
             }

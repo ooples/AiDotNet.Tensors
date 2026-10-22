@@ -15,9 +15,13 @@ public sealed partial class HipBackend : IDeviceScalarOps
         BroadcastMultiplyFirstAxis(buffer, scalar, buffer, 1, size);
     }
 
-    /// <remarks>No fused multi-tensor launch here; the reduction below is host-staged.</remarks>
-    bool IDeviceScalarOps.SupportsMultiTensorSumOfSquares => false;
+    /// <remarks>multi_tensor_sum_squares writes the double on the device, so the compiled plan's finiteness check needs
+    /// no host read (#1519); host-staged when that kernel did not build.</remarks>
+    bool IDeviceScalarOps.SupportsMultiTensorSumOfSquares => IsAvailable && _kernelCache.ContainsKey("multi_tensor_sum_squares");
 
     void IDeviceScalarOps.MultiTensorSumOfSquares(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer sumOfSquares)
-        => PortableDeviceScalarOps.MultiTensorSumOfSquares(this, tensors, sizes, sumOfSquares);
+    {
+        if (_kernelCache.ContainsKey("multi_tensor_sum_squares")) MultiTensorSumOfSquares(tensors, sizes, sumOfSquares);
+        else PortableDeviceScalarOps.MultiTensorSumOfSquares(this, tensors, sizes, sumOfSquares);
+    }
 }

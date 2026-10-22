@@ -136,6 +136,41 @@ public sealed partial class CudaBackend
             new DeclaredBindings(indices, table, output));
     }
 
+    private static readonly string[] s_scatterAddNames = { "indices", "source", "out" };
+
+    private static readonly Func<DeclaredKey, CodegenProgram> s_buildScatterAdd =
+        key => CodegenBackendPrograms.ScatterAddDeterministic(key.D0, key.D1, key.D2);
+
+    /// <summary>The key of a deterministic scatter-add: count, destinations, features.</summary>
+    internal static DeclaredKey ScatterAddDeterministicKey(int count, int destinations, int features) =>
+        new(DeclaredFamily.ScatterAddDeterministic, count, destinations, features, 0, 0, 0);
+
+    /// <summary>
+    /// The deterministic scatter-add through its declared program (#890 phase 4e): the same result, bit for bit, as
+    /// the scanning deterministic kernels, and with no atomic emitted at all. The program reduces over every source
+    /// for each destination, so it costs destinations x count: above the crossover the sorted kernels
+    /// (<see cref="TrySortedScatterAdd"/>) remain the faster route and this one declines, as they do to it when the
+    /// destination count is small. False -- nothing launched -- when the route is off or the shape declines.
+    /// </summary>
+    internal bool TryDeclaredScatterAddDeterministic(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output,
+        int count, int destinations, int features)
+    {
+        if (count <= 0 || destinations <= 0 || features <= 0 || indices.Size < count ||
+            (long)source.Size < (long)count * features || (long)output.Size < (long)destinations * features)
+            return false;
+        // The scan is quadratic in the destination count, so it is admitted only where that product stays near the
+        // work the sorted path does anyway (its sort is count log count over the same rows).
+        if ((long)destinations * count > 1L << 22) return false;
+        return TryRunDeclaredProgram(ScatterAddDeterministicKey(count, destinations, features), s_buildScatterAdd,
+            s_scatterAddNames, new DeclaredBindings(indices, source, output));
+    }
+
+    /// <summary>The deterministic scatter-add as a resident-program stage.</summary>
+    internal DeclaredResidentStage ScatterAddDeterministicStage(IGpuBuffer source, IGpuBuffer indices,
+        IGpuBuffer output, int count, int destinations, int features) =>
+        new(ScatterAddDeterministicKey(count, destinations, features), s_buildScatterAdd, s_scatterAddNames,
+            new DeclaredBindings(indices, source, output));
+
     private static readonly string[] s_indexSelectNames = { "indices", "source", "out" };
 
     private static readonly Func<DeclaredKey, CodegenProgram> s_buildIndexSelect =
