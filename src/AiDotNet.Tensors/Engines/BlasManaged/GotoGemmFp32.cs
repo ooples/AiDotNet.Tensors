@@ -69,6 +69,14 @@ internal static class GotoGemmFp32
     /// </summary>
     internal static bool PackBothUnderOccupies(int m, int threadBudget)
         => threadBudget > 1 && (m + PackBothMinMc - 1) / PackBothMinMc < threadBudget;
+
+    /// <summary>
+    /// True when PackBoth cannot take this M itself: its fp32 6x16 kernel needs m % Mr == 0, and an unaligned M is
+    /// tail-split, or on a many-core host sent whole to StreamingStrategy, which is far slower at small thread budgets
+    /// (#653: DiT's 256x4608x1152 projection took 328 ms at 2 threads against 34 ms on this path at 1). This per-tile
+    /// path handles the M and N tails itself and gives the same bits at every thread count.
+    /// </summary>
+    internal static bool PackBothNeedsTailSplit(int m) => m % Mr != 0;
     /// <summary>Shape regime where the per-tile GotoBLAS path beats the PackBoth strategy (measured on the
     /// 3990X via --ab-prod): large/balanced (M≥512) OR wide-K (K≥2N, e.g. MLP-fc2). PackBoth's wide-N
     /// N-axis path wins the small-M wide-N shapes (DiT QKV M256×N3456, MLP-fc1 M256×N4608 — GotoGemm was

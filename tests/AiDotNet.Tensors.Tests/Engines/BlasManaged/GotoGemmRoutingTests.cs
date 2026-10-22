@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.BlasManaged;
 using AiDotNet.Tensors.Helpers;
@@ -207,6 +207,55 @@ public sealed class GotoGemmRoutingTests
                     worst = Math.Max(worst, Math.Abs(expected - actual));
                 }
             Assert.True(worst < 1e-3, $"max |C - C_ref| = {worst:E3}");
+        }
+        finally
+        {
+            CpuParallelSettings.MaxDegreeOfParallelism = before;
+        }
+    }
+
+    // #653: PackBoth's fp32 6x16 kernel needs m % 6 == 0. An unaligned M (DiT's 256-token projections) was tail-split, or
+    // on a many-core host sent whole to Streaming, which at 2-4 threads ran 256x4608x1152 in 316 ms against 34 ms on one.
+    [Theory]
+    [InlineData(256, true)]
+    [InlineData(130, true)]
+    [InlineData(252, false)]
+    [InlineData(768, false)]
+    public void PackBothNeedsTailSplit_ExactlyWhenMIsNotAMultipleOfItsTile(int m, bool expected)
+    {
+        Assert.Equal(expected, GotoGemmFp32.PackBothNeedsTailSplit(m));
+    }
+
+    // The DiT projection that ran 10x slower at 2 threads than at 1 (#653) now takes the per-tile route at every
+    // budget, which gives the same bits whatever the thread count.
+    [SkippableFact]
+    public void AnUnalignedMFusedLinear_IsBitIdenticalAtEveryThreadCount()
+    {
+        Skip.IfNot(GotoGemmFp32.IsAvailable, "The packed GotoGemm route is unavailable on this CPU/OS/runtime.");
+        int before = CpuParallelSettings.MaxDegreeOfParallelism;
+        var engine = new CpuEngine();
+        var rng = RandomHelper.CreateSeededRandom(653);
+        Tensor<float> Rand(params int[] shape)
+        {
+            var t = new Tensor<float>(shape);
+            for (int i = 0; i < t.Length; i++) t[i] = (float)(rng.NextDouble() - 0.5);
+            return t;
+        }
+        var x = Rand(256, 4608);
+        var w = Rand(4608, 1152);
+        var bias = Rand(1152);
+        float[]? first = null;
+        try
+        {
+            foreach (int threads in new[] { 1, 2, 3, 4, 8, 16 })
+            {
+                CpuParallelSettings.MaxDegreeOfParallelism = threads;
+                float[] y = engine.FusedLinear(x, w, bias, FusedActivationType.None).ToArray();
+                if (first is null) { first = y; continue; }
+                for (int i = 0; i < y.Length; i++)
+                    Assert.True(BitConverter.SingleToInt32Bits(first[i]) == BitConverter.SingleToInt32Bits(y[i]),
+                        $"threads={threads}: element {i} is {y[i]}, at 1 thread {first[i]}");
+            }
         }
         finally
         {
