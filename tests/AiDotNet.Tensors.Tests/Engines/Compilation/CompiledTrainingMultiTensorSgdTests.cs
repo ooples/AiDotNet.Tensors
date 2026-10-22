@@ -95,6 +95,7 @@ public class CompiledTrainingMultiTensorSgdTests : IDisposable
                 {
                     GpuLaunchProbe.CaptureReadbackSites = priorCapture;
                 }
+                _output.WriteLine($"backend: {gpu!.GetBackend().GetType().Name}");
                 _output.WriteLine($"blocking readbacks over {Steps} SGD steps: {readbacks}");
                 foreach (var site in sites) _output.WriteLine("  site: " + site);
                 // A backend whose guarded update reads the guard in its kernel needs no download at all. Where the

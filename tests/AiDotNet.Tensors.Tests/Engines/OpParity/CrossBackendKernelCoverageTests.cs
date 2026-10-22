@@ -73,6 +73,12 @@ public sealed class CrossBackendKernelCoverageTests
         "mixed_precision_forward", "mixed_precision_backward",  // CudaBackend.MixedPrecisionConv.cs
         "global_maxpool2d_with_indices",                       // -> global_maxpool2d (+backward)
         "tk_im2col_pbl",                                       // -> im2col (CudaBackend.ConvGemm.cs); [P, B*L] layout for the registry
+        // Device finite guard (#1502): CUDA/HIP read the guard inside the multi-tensor updates and their
+        // multi_tensor_sum_squares writes the double directly (CudaOptimizerKernels.cs).
+        "sgd_update_guarded",                                  // -> sgd_multi_tensor_update (finiteGuard)
+        "adam_update_guarded",                                 // -> adam_multi_tensor_update (finiteGuard)
+        "adamw_update_guarded",                                // -> adamw_multi_tensor_update (finiteGuard)
+        "sum_squares_finish_double",                           // -> multi_tensor_sum_squares (double result)
         "conv_transpose2d_backward_weights",                   // -> conv_transpose2d_backward_kernel
         "gru_accumulate_bias_gradients", "gru_accumulate_weight_gradients_hh",
         "gru_accumulate_weight_gradients_ih",                  // -> gru_accumulate_weight_gradients (fused hh/ih/bias)

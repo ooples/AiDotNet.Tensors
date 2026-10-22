@@ -7,8 +7,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
 public sealed partial class VulkanBackend : ISeededGumbelSoftmaxBackend, IUninitializedGpuAllocation, IMultiTensorGpuOptimizerBackend, IDeviceReadbackFactory
 {
-    // No asynchronous device-to-host copy is wired on this backend: the readback downloads when it is queued.
-    IDeviceReadback IDeviceReadbackFactory.CreateReadback(int byteCapacity) => new SynchronousDeviceReadback(this, byteCapacity);
+    // A copy submitted without waiting; the host waits for it only on Read (#1521).
+    IDeviceReadback IDeviceReadbackFactory.CreateReadback(int byteCapacity) => new VulkanDeviceReadback(this, byteCapacity);
 
     /// <summary>
     /// This backend's allocation does no separate fill that could be skipped, so the plain allocation already meets
@@ -16,10 +16,10 @@ public sealed partial class VulkanBackend : ISeededGumbelSoftmaxBackend, IUninit
     /// </summary>
     public IGpuBuffer AllocateBufferUninitialized(int size) => AllocateBuffer(size);
     /// <summary>
-    /// The guarded updates read the guard on the host (<see cref="PerTensorMultiTensorOptimizer"/>): this backend's
-    /// Adam/AdamW/SGD kernels take no guard argument, so the verdict is downloaded before the launch.
+    /// The guarded updates read the guard on the device and write nothing when it is not finite
+    /// (VulkanFiniteGuardKernels, #1521).
     /// </summary>
-    public bool GuardsFiniteOnDevice => false;
+    public bool GuardsFiniteOnDevice => true;
 
     public void AdamMultiTensorUpdate(
         IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
@@ -42,8 +42,8 @@ public sealed partial class VulkanBackend : ISeededGumbelSoftmaxBackend, IUninit
         IReadOnlyList<IGpuBuffer> firstMoments, IReadOnlyList<IGpuBuffer> secondMoments,
         IReadOnlyList<int> sizes, float learningRate, float beta1, float beta2, float epsilon,
         float weightDecay, int step, IGpuBuffer finiteGuard)
-        => PerTensorMultiTensorOptimizer.UpdateGuarded(this, decoupledWeightDecay, parameters, gradients, firstMoments,
-            secondMoments, sizes, learningRate, beta1, beta2, epsilon, weightDecay, step, finiteGuard);
+        => AdamGuardedOnDevice(decoupledWeightDecay, parameters, gradients, firstMoments, secondMoments, sizes,
+            learningRate, beta1, beta2, epsilon, weightDecay, step, finiteGuard);
 
     public void SgdMultiTensorUpdate(
         IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients, IReadOnlyList<int> sizes,
@@ -53,5 +53,5 @@ public sealed partial class VulkanBackend : ISeededGumbelSoftmaxBackend, IUninit
     public void SgdMultiTensorUpdateGuarded(
         IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients, IReadOnlyList<int> sizes,
         float learningRate, float weightDecay, IGpuBuffer finiteGuard)
-        => PerTensorMultiTensorOptimizer.SgdGuarded(this, parameters, gradients, sizes, learningRate, weightDecay, finiteGuard);
+        => SgdGuardedOnDevice(parameters, gradients, sizes, learningRate, weightDecay, finiteGuard);
 }

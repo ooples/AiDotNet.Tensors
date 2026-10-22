@@ -16,10 +16,11 @@ public sealed partial class WebGpuBackend : IDeviceScalarOps
         BroadcastMultiplyFirstAxis(buffer, scalar, buffer, 1, size);
     }
 
-    /// <remarks>No fused multi-tensor launch here; the reduction below is host-staged.</remarks>
-    bool IDeviceScalarOps.SupportsMultiTensorSumOfSquares => false;
+    /// <remarks>Reduced on the device (WebGpuFiniteGuardKernels), so the compiled plan's finiteness check needs no
+    /// host read (#1522).</remarks>
+    bool IDeviceScalarOps.SupportsMultiTensorSumOfSquares => IsAvailable;
 
     void IDeviceScalarOps.MultiTensorSumOfSquares(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer sumOfSquares)
-        => PortableDeviceScalarOps.MultiTensorSumOfSquares(this, tensors, sizes, sumOfSquares);
+        => MultiTensorSumOfSquares(tensors, sizes, sumOfSquares);
 }
 #endif

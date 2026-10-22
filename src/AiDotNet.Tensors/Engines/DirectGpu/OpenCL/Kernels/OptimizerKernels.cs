@@ -70,6 +70,25 @@ __kernel void sgd_momentum_update(
 // Vanilla SGD update
 // Formula: param = param - lr * grad
 // ---------------------------------------------------------------------------
+inline void sgd_body(__global float* param, __global const float* gradient, const float learningRate,
+    const float weightDecay, const int idx)
+{
+    float grad = gradient[idx];
+    if (weightDecay > 0.0f) {
+        grad += weightDecay * param[idx];
+    }
+
+    param[idx] -= learningRate * grad;
+}
+
+// The device-side finiteness guard: a double in the guard buffer's first eight bytes (a multi-tensor sum of squares,
+// NaN when any gradient is not finite). Read as its high word's exponent bits, so the test needs no double support
+// and survives fast-relaxed-math.
+inline bool guard_not_finite(__global const uint* guard)
+{
+    return (guard[1] & 0x7ff00000u) == 0x7ff00000u;
+}
+
 __kernel void sgd_update(
     __global float* param,
     __global const float* gradient,
@@ -79,13 +98,21 @@ __kernel void sgd_update(
 {
     const int idx = get_global_id(0);
     if (idx >= size) return;
+    sgd_body(param, gradient, learningRate, weightDecay, idx);
+}
 
-    float grad = gradient[idx];
-    if (weightDecay > 0.0f) {
-        grad += weightDecay * param[idx];
-    }
-
-    param[idx] -= learningRate * grad;
+// sgd_update that writes nothing when the guard is not finite (IMultiTensorGpuOptimizerBackend's guarded update).
+__kernel void sgd_update_guarded(
+    __global float* param,
+    __global const float* gradient,
+    const float learningRate,
+    const float weightDecay,
+    const int size,
+    __global const uint* guard)
+{
+    const int idx = get_global_id(0);
+    if (idx >= size || guard_not_finite(guard)) return;
+    sgd_body(param, gradient, learningRate, weightDecay, idx);
 }
 
 // ---------------------------------------------------------------------------
@@ -96,22 +123,10 @@ __kernel void sgd_update(
 //          v_hat = v / (1 - beta2^t)
 //          param = param - lr * m_hat / (sqrt(v_hat) + epsilon)
 // ---------------------------------------------------------------------------
-__kernel void adam_update(
-    __global float* param,
-    __global const float* gradient,
-    __global float* m,
-    __global float* v,
-    const float learningRate,
-    const float beta1,
-    const float beta2,
-    const float epsilon,
-    const float weightDecay,
-    const int step,
-    const int size)
+inline void adam_body(__global float* param, __global const float* gradient, __global float* m, __global float* v,
+    const float learningRate, const float beta1, const float beta2, const float epsilon, const float weightDecay,
+    const int step, const int idx)
 {
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-
     float grad = gradient[idx];
     if (weightDecay > 0.0f) {
         grad += weightDecay * param[idx];
@@ -135,11 +150,7 @@ __kernel void adam_update(
     param[idx] -= learningRate * m_hat / (sqrt(v_hat) + epsilon);
 }
 
-// ---------------------------------------------------------------------------
-// AdamW optimizer update (decoupled weight decay)
-// Like Adam but weight decay is applied directly to params, not gradients
-// ---------------------------------------------------------------------------
-__kernel void adamw_update(
+__kernel void adam_update(
     __global float* param,
     __global const float* gradient,
     __global float* m,
@@ -154,7 +165,37 @@ __kernel void adamw_update(
 {
     const int idx = get_global_id(0);
     if (idx >= size) return;
+    adam_body(param, gradient, m, v, learningRate, beta1, beta2, epsilon, weightDecay, step, idx);
+}
 
+// adam_update that writes nothing when the guard is not finite.
+__kernel void adam_update_guarded(
+    __global float* param,
+    __global const float* gradient,
+    __global float* m,
+    __global float* v,
+    const float learningRate,
+    const float beta1,
+    const float beta2,
+    const float epsilon,
+    const float weightDecay,
+    const int step,
+    const int size,
+    __global const uint* guard)
+{
+    const int idx = get_global_id(0);
+    if (idx >= size || guard_not_finite(guard)) return;
+    adam_body(param, gradient, m, v, learningRate, beta1, beta2, epsilon, weightDecay, step, idx);
+}
+
+// ---------------------------------------------------------------------------
+// AdamW optimizer update (decoupled weight decay)
+// Like Adam but weight decay is applied directly to params, not gradients
+// ---------------------------------------------------------------------------
+inline void adamw_body(__global float* param, __global const float* gradient, __global float* m, __global float* v,
+    const float learningRate, const float beta1, const float beta2, const float epsilon, const float weightDecay,
+    const int step, const int idx)
+{
     float grad = gradient[idx];
 
     // Decoupled weight decay (applied directly to params, not gradients)
@@ -177,6 +218,44 @@ __kernel void adamw_update(
 
     // Update parameters
     param[idx] -= learningRate * m_hat / (sqrt(v_hat) + epsilon);
+}
+
+__kernel void adamw_update(
+    __global float* param,
+    __global const float* gradient,
+    __global float* m,
+    __global float* v,
+    const float learningRate,
+    const float beta1,
+    const float beta2,
+    const float epsilon,
+    const float weightDecay,
+    const int step,
+    const int size)
+{
+    const int idx = get_global_id(0);
+    if (idx >= size) return;
+    adamw_body(param, gradient, m, v, learningRate, beta1, beta2, epsilon, weightDecay, step, idx);
+}
+
+// adamw_update that writes nothing when the guard is not finite.
+__kernel void adamw_update_guarded(
+    __global float* param,
+    __global const float* gradient,
+    __global float* m,
+    __global float* v,
+    const float learningRate,
+    const float beta1,
+    const float beta2,
+    const float epsilon,
+    const float weightDecay,
+    const int step,
+    const int size,
+    __global const uint* guard)
+{
+    const int idx = get_global_id(0);
+    if (idx >= size || guard_not_finite(guard)) return;
+    adamw_body(param, gradient, m, v, learningRate, beta1, beta2, epsilon, weightDecay, step, idx);
 }
 
 // ---------------------------------------------------------------------------
@@ -1071,29 +1150,73 @@ __kernel void sparse_proximal_l1_update(
 
 // Global-norm clip, the OpenCL port of CUDA's multi-tensor kernels: one work-group of 256 per tensor (the host
 // launches global = local = 256). Each work-item strides the tensor; work-item 0 then adds the group's partials, in
-// order, to acc[0]. Launches on one queue run in order, so the accumulation needs no atomics and is deterministic.
+// order, to acc[0], and marks acc[1] (as bits) when any element was not finite. Launches on one queue run in order,
+// so the accumulation needs no atomics and is deterministic. Finiteness is tested on the exponent bits:
+// fast-relaxed-math may fold isfinite() to true.
 __kernel void tensor_sum_squares_accumulate(__global const float* x, const int n, __global float* acc)
 {
     __local float partial[256];
+    __local uint flags[256];
     const int lid = get_local_id(0);
     float v = 0.0f;
-    for (int i = lid; i < n; i += 256) { const float e = x[i]; v += e * e; }
+    uint bad = 0u;
+    for (int i = lid; i < n; i += 256)
+    {
+        const float e = x[i];
+        v += e * e;
+        bad |= (as_uint(e) & 0x7f800000u) == 0x7f800000u ? 1u : 0u;
+    }
     partial[lid] = v;
+    flags[lid] = bad;
     barrier(CLK_LOCAL_MEM_FENCE);
     if (lid == 0)
     {
         float s = 0.0f;
-        for (int j = 0; j < 256; j++) s += partial[j];
+        uint f = 0u;
+        for (int j = 0; j < 256; j++) { s += partial[j]; f |= flags[j]; }
         acc[0] += s;
+        if (f != 0u) acc[1] = as_float(1u);
     }
 }
 
-// PyTorch clip_grad_norm_ coefficient: min(1, maxNorm / (norm + 1e-6)); a non-finite norm leaves the gradients
-// unscaled (1). Finiteness is tested on the exponent bits: fast-relaxed-math may fold isfinite() to true.
+// The accumulated (float sum, non-finite mark) as the double IDeviceScalarOps and the guarded updates read: NaN when
+// any element was not finite, DBL_MAX when only the float sum overflowed (every element finite, as CUDA's double
+// accumulation would say), else the float sum exactly. Built from bits, so the device needs no double support.
+__kernel void sum_squares_finish_double(__global float* acc)
+{
+    if (get_global_id(0) != 0) return;
+    const uint u = as_uint(acc[0]);
+    const uint e = (u >> 23) & 0xffu, mant = u & 0x7fffffu;
+    uint hi, lo;
+    if (as_uint(acc[1]) != 0u) { hi = 0x7ff80000u; lo = 0u; }
+    else if (e == 0xffu) { hi = 0x7fefffffu; lo = 0xffffffffu; }
+    else if (e == 0u && mant == 0u) { hi = 0u; lo = 0u; }
+    else if (e == 0u)
+    {
+        // A subnormal float: normalise its mantissa into the double's.
+        const int shift = (int)clz(mant) - 8;
+        const uint m = (mant << shift) & 0x7fffffu;
+        hi = ((uint)(1 - shift - 127 + 1023) << 20) | (m >> 3);
+        lo = m << 29;
+    }
+    else { hi = ((e + 896u) << 20) | (mant >> 3); lo = mant << 29; }
+    acc[0] = as_float(lo);
+    acc[1] = as_float(hi);
+}
+
+// PyTorch clip_grad_norm_ coefficient: min(1, maxNorm / (norm + 1e-6)), from the double sum_squares_finish_double
+// wrote (narrowed back to a float: it came from one). A non-finite norm -- or a sum past the float range, as before --
+// leaves the gradients unscaled (1).
 __kernel void clip_scale_from_sum_squares(__global const float* acc, const float maxNorm, __global float* scale)
 {
     if (get_global_id(0) != 0) return;
-    const float norm = sqrt(acc[0]);
+    const uint lo = as_uint(acc[0]), hi = as_uint(acc[1]);
+    const int e = (int)((hi >> 20) & 0x7ffu) - 1023;
+    float sum;
+    if (e > 127) sum = as_float(0x7f800000u);
+    else if (e < -126) sum = 0.0f;
+    else sum = as_float(((uint)(e + 127) << 23) | ((hi & 0xfffffu) << 3) | (lo >> 29));
+    const float norm = sqrt(sum);
     const float c = (as_uint(norm) & 0x7f800000u) != 0x7f800000u ? maxNorm / (norm + 1e-6f) : 1.0f;
     scale[0] = c < 1.0f ? c : 1.0f;
 }
@@ -1114,7 +1237,8 @@ __kernel void scale_by_device_scalar_inplace(__global float* x, const int n, __g
         return new[]
         {
             "sgd_momentum_update",            "tensor_sum_squares_accumulate",
-            "clip_scale_from_sum_squares",
+            "clip_scale_from_sum_squares",   "sum_squares_finish_double",
+            "sgd_update_guarded",            "adam_update_guarded",            "adamw_update_guarded",
             "scale_by_device_scalar_inplace",
 
             "sgd_update",

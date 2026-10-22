@@ -16,6 +16,24 @@ internal static class PerTensorMultiTensorOptimizer
         IReadOnlyList<int> sizes, float learningRate, float beta1, float beta2, float epsilon,
         float weightDecay, int step)
     {
+        ValidateAdam(parameters, gradients, firstMoments, secondMoments, sizes, epsilon, step);
+        int n = parameters.Count;
+        for (int t = 0; t < n; t++)
+        {
+            if (decoupledWeightDecay)
+                backend.AdamWUpdate(parameters[t], gradients[t], firstMoments[t], secondMoments[t],
+                    learningRate, beta1, beta2, epsilon, weightDecay, step, sizes[t]);
+            else
+                backend.AdamUpdate(parameters[t], gradients[t], firstMoments[t], secondMoments[t],
+                    learningRate, beta1, beta2, epsilon, weightDecay, step, sizes[t]);
+        }
+    }
+
+    /// <summary>The argument checks every Adam/AdamW <c>MultiTensorUpdate</c> runs before launching anything.</summary>
+    public static void ValidateAdam(IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
+        IReadOnlyList<IGpuBuffer> firstMoments, IReadOnlyList<IGpuBuffer> secondMoments, IReadOnlyList<int> sizes,
+        float epsilon, int step)
+    {
         if (parameters is null) throw new ArgumentNullException(nameof(parameters));
         if (gradients is null) throw new ArgumentNullException(nameof(gradients));
         if (firstMoments is null) throw new ArgumentNullException(nameof(firstMoments));
@@ -27,17 +45,22 @@ internal static class PerTensorMultiTensorOptimizer
         if (step < 1) throw new ArgumentOutOfRangeException(nameof(step), "Step must be at least 1.");
         if (epsilon <= 0) throw new ArgumentOutOfRangeException(nameof(epsilon), "Epsilon must be positive.");
         for (int t = 0; t < n; t++)
-            if (sizes[t] <= 0) throw new ArgumentOutOfRangeException(nameof(sizes), "Every tensor size must be positive.");
-
-        for (int t = 0; t < n; t++)
         {
-            if (decoupledWeightDecay)
-                backend.AdamWUpdate(parameters[t], gradients[t], firstMoments[t], secondMoments[t],
-                    learningRate, beta1, beta2, epsilon, weightDecay, step, sizes[t]);
-            else
-                backend.AdamUpdate(parameters[t], gradients[t], firstMoments[t], secondMoments[t],
-                    learningRate, beta1, beta2, epsilon, weightDecay, step, sizes[t]);
+            if (parameters[t] is null || gradients[t] is null || firstMoments[t] is null || secondMoments[t] is null)
+                throw new ArgumentNullException(nameof(parameters), "Every Adam buffer is required.");
+            if (sizes[t] <= 0) throw new ArgumentOutOfRangeException(nameof(sizes), "Every tensor size must be positive.");
+            if (parameters[t].Size < sizes[t] || gradients[t].Size < sizes[t]
+                || firstMoments[t].Size < sizes[t] || secondMoments[t].Size < sizes[t])
+                throw new ArgumentException("An Adam buffer is smaller than its size.", nameof(sizes));
         }
+    }
+
+    /// <summary>The guard is a double in the first two float slots.</summary>
+    public static void ValidateGuard(IGpuBuffer finiteGuard)
+    {
+        if (finiteGuard is null) throw new ArgumentNullException(nameof(finiteGuard));
+        if (finiteGuard.Size < 2)
+            throw new ArgumentException("The finite guard needs two float slots.", nameof(finiteGuard));
     }
 
     /// <summary>
