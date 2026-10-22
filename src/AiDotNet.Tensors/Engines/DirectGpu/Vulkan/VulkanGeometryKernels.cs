@@ -27,10 +27,13 @@ float cubic_kernel(float d, float a) {
 
 int clamp_i(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
+// GLSL leaves % undefined when an operand is negative (drivers differ: NVIDIA's truncates), so these never take the
+// remainder of a negative index.
 int reflect_index(int i, int extent) {
     if (extent == 1) return 0;
     int period = 2 * (extent - 1);
-    int r = ((i % period) + period) % period;
+    // The reflection is even about 0, so |i| lands on the same pixel.
+    int r = abs(i) % period;
     return r < extent ? r : period - r;
 }
 
@@ -38,8 +41,7 @@ int pad_boundary(int idx, int extent, int mode) {
     if (extent <= 0) return 0;
     if (mode == 2) { if (idx < 0) return 0; if (idx >= extent) return extent - 1; return idx; }
     if (mode == 1) return reflect_index(idx, extent);
-    int r = ((idx % extent) + extent) % extent;
-    return r;
+    return idx >= 0 ? idx % extent : extent - 1 - ((-idx - 1) % extent);
 }
 ";
 

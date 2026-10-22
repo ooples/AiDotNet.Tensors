@@ -317,13 +317,14 @@ public sealed class VulkanTunedKernelTests
         // The fastest of several samples, not the median: another process on the device or the CPU can only add
         // time to a sample, and with the median a loaded machine inflated the one-run figure enough to fail this
         // (seen once in four runs while another test suite was running). The fastest sample is the least disturbed.
-        double Fastest(int repetitions)
+        // Interleaved, each one-run sample right after a sixteen-run one: the device drops its clocks when idle, and
+        // eleven one-run samples in a row were timed mostly at idle clocks (7.8 ms for a run that takes ~0.6 ms).
+        double one = double.MaxValue, sixteen = double.MaxValue;
+        for (int i = 0; i < 11; i++)
         {
-            double best = double.MaxValue;
-            for (int i = 0; i < 11; i++) best = Math.Min(best, backend.MeasureTunedKernelMilliseconds(Run, repetitions));
-            return best;
+            sixteen = Math.Min(sixteen, backend.MeasureTunedKernelMilliseconds(Run, 16));
+            one = Math.Min(one, backend.MeasureTunedKernelMilliseconds(Run, 1));
         }
-        double one = Fastest(1), sixteen = Fastest(16);
         Assert.True(one > 0, $"one run measured {one} ms");
         // Sixteen runs do sixteen times the device work; a harness that measured nothing, or only its own overhead,
         // would report about the same for both.

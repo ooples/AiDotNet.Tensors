@@ -50,9 +50,33 @@ public sealed unsafe partial class VulkanBackend
         {
             if (EnsureTimestampPool())
             {
-                WriteTuneTimestamp(0, reset: true);
-                for (int i = 0; i < repetitions; i++) run();
-                WriteTuneTimestamp(1, reset: false);
+                if (SubmitsWithoutWaiting)
+                {
+                    // Both timestamps go into the command buffer the runs are recorded into, and the buffer is not
+                    // submitted until all of them are in. Written in waited submissions of their own, the timestamps
+                    // also counted the device's idle time between submissions (about 3.5 ms on a WDDM driver),
+                    // which swamped a single run and skewed every comparison the tuner made.
+                    _device.WaitForPendingSubmissions();
+                    int limit = _device.CoalescedDispatchLimit;
+                    _device.CoalescedDispatchLimit = int.MaxValue;
+                    try
+                    {
+                        RecordTuneTimestamp(0, reset: true);
+                        for (int i = 0; i < repetitions; i++) run();
+                        RecordTuneTimestamp(1, reset: false);
+                        _device.WaitForPendingSubmissions();
+                    }
+                    finally
+                    {
+                        _device.CoalescedDispatchLimit = limit;
+                    }
+                }
+                else
+                {
+                    WriteTuneTimestamp(0, reset: true);
+                    for (int i = 0; i < repetitions; i++) run();
+                    WriteTuneTimestamp(1, reset: false);
+                }
                 ulong* ticks = stackalloc ulong[2];
                 int result = VulkanTimestampBindings.vkGetQueryPoolResults(_device.Device, _tuneQueryPool, 0, 2,
                     (UIntPtr)(2 * sizeof(ulong)), ticks, sizeof(ulong),
@@ -100,6 +124,18 @@ public sealed unsafe partial class VulkanBackend
             return false;
         }
         return true;
+    }
+
+    // A timestamp recorded into the open (unsubmitted) command buffer, behind the dispatches recorded before it.
+    private void RecordTuneTimestamp(uint query, bool reset)
+    {
+        lock (_computeLock)
+        {
+            var cmd = _device.OpenCommandBuffer();
+            if (reset) VulkanTimestampBindings.vkCmdResetQueryPool(cmd, _tuneQueryPool, 0, 2);
+            VulkanTimestampBindings.vkCmdWriteTimestamp(cmd, VulkanTimestampBindings.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                _tuneQueryPool, query);
+        }
     }
 
     private void WriteTuneTimestamp(uint query, bool reset)
