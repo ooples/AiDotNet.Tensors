@@ -204,6 +204,10 @@ public sealed partial class CudaBackend
             for (int attempt = 0; ; attempt++)
             {
                 DeclaredElementwise? built = null;
+                // Only a LINK failure against an image that came off disk is evidence of a torn cache file. A later
+                // GetFunction rejection (the local-memory budget) is the kernel's own spill: discarding every cached
+                // cubin for it would delete good caches and retry into the same rejection.
+                bool linkFailedOnDiskImage = false;
                 try
                 {
                     var spec = build();
@@ -211,16 +215,31 @@ public sealed partial class CudaBackend
                     string entry = "declared_" + SafeName(spec.Name);
                     string ptx = emitter.EmitElementwise(spec, entry, _ccMajor, _ccMinor);
                     var objects = new List<byte[]>();
+                    bool anyFromDisk = false;
                     foreach (var called in emitter.CalledFunctions)
                     {
                         var library = MathLibrary(called.Library)
                             ?? throw new NotSupportedException("The " + called.Library + " library did not compile.");
+                        anyFromDisk |= _mathLibraryCacheFiles.ContainsKey(called.Library);
                         if (!objects.Contains(library)) objects.Add(library);
                     }
                     _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
-                    var module = objects.Count == 0
-                        ? _directPtxRuntime.LoadModule(ptx, allowExperimentalJitFallback: true)
-                        : _directPtxRuntime.LoadLinkedModule(ptx, objects);
+                    DirectPtxModule module;
+                    if (objects.Count == 0)
+                        module = _directPtxRuntime.LoadModule(ptx, allowExperimentalJitFallback: true);
+                    else
+                    {
+                        try
+                        {
+                            module = _directPtxRuntime.LoadLinkedModule(ptx, objects);
+                        }
+                        catch (Exception ex) when (anyFromDisk &&
+                            ex is NotSupportedException or InvalidOperationException or ArgumentException)
+                        {
+                            linkFailedOnDiskImage = true;
+                            throw;
+                        }
+                    }
                     try
                     {
                         built = new DeclaredElementwise(module, module.GetFunction(entry, out _), spec);
@@ -234,7 +253,7 @@ public sealed partial class CudaBackend
                 catch (Exception ex) when (ex is NotSupportedException or InvalidOperationException or ArgumentException)
                 {
                     LastElementwiseDecline = key + ": " + ex.Message;
-                    if (attempt == 0 && DiscardCachedMathLibraries()) continue;
+                    if (attempt == 0 && linkFailedOnDiskImage && DiscardCachedMathLibraries()) continue;
                 }
                 _declaredElementwise[key] = built;
                 return built;
