@@ -9965,6 +9965,28 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         IntPtr gkPtr = gradKey.Handle;
         IntPtr gvPtr = gradValue.Handle;
 
+        // #1528: the tiled backward (atomic-free, so deterministic too) wherever its tile fits the head dimension.
+        int tile = Kernels.CudaAttentionKernels.TiledBackwardTile(headDim);
+        if (tile > 0 && _kernelCache.TryGetValue("flash_attention_backward_kv_t" + tile, out var tiledKv)
+            && _kernelCache.TryGetValue("flash_attention_backward_q_t" + tile, out var tiledQ))
+        {
+            uint shared = (uint)Kernels.CudaAttentionKernels.TiledBackwardSharedBytes(tile, headDim);
+            uint bhCount = (uint)(batch * numHeads);
+            void** argsKv = stackalloc void*[18];
+            argsKv[0] = &goPtr; argsKv[1] = &qPtr; argsKv[2] = &kPtr; argsKv[3] = &vPtr; argsKv[4] = &oPtr;
+            argsKv[5] = &sPtr; argsKv[6] = &gkPtr; argsKv[7] = &gvPtr; argsKv[8] = &batch; argsKv[9] = &numHeads;
+            argsKv[10] = &seqQ; argsKv[11] = &seqK; argsKv[12] = &headDim; argsKv[13] = &scale; argsKv[14] = &causalFlag;
+            argsKv[15] = &biasPtr; argsKv[16] = &hasBias; argsKv[17] = &biasBatchStride;
+            LaunchKernel2DWithSharedMem(tiledKv, (uint)((seqK + tile - 1) / tile), bhCount, 256, 1, shared, argsKv);
+            void** argsQ2 = stackalloc void*[17];
+            argsQ2[0] = &goPtr; argsQ2[1] = &qPtr; argsQ2[2] = &kPtr; argsQ2[3] = &vPtr; argsQ2[4] = &oPtr;
+            argsQ2[5] = &sPtr; argsQ2[6] = &gqPtr; argsQ2[7] = &batch; argsQ2[8] = &numHeads; argsQ2[9] = &seqQ;
+            argsQ2[10] = &seqK; argsQ2[11] = &headDim; argsQ2[12] = &scale; argsQ2[13] = &causalFlag;
+            argsQ2[14] = &biasPtr; argsQ2[15] = &hasBias; argsQ2[16] = &biasBatchStride;
+            LaunchKernel2DWithSharedMem(tiledQ, (uint)((seqQ + tile - 1) / tile), bhCount, 256, 1, shared, argsQ2);
+            return;
+        }
+
         if (GpuDeterminism.IsActive)
         {
             var kernelQ = _kernelCache["flash_attention_backward_gradq_deterministic"];

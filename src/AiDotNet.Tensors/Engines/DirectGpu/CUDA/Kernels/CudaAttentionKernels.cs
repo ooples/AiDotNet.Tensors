@@ -1057,8 +1057,217 @@ extern ""C"" __global__ void rope_interleaved(
     output[baseIdx + 2 * i] = xEven * c - xOdd * sn;
     output[baseIdx + 2 * i + 1] = xEven * sn + xOdd * c;
 }
-";
+" + TiledBackwardSource(32) + TiledBackwardSource(16);
         }
+
+        /// <summary>The tile edge of the tiled backward for a head dimension: 32 up to 64, 16 up to 128, else none.</summary>
+        internal static int TiledBackwardTile(int headDim) => headDim <= 64 ? 32 : headDim <= 128 ? 16 : 0;
+
+        /// <summary>Dynamic shared memory of a tiled backward kernel: four padded [T, headDim + 1] tiles, two [T, T]
+        /// tiles and two T-vectors.</summary>
+        internal static int TiledBackwardSharedBytes(int tile, int headDim) =>
+            (4 * tile * (headDim + 1) + 2 * tile * tile + 2 * tile) * sizeof(float);
+
+        // The FlashAttention backward as two tiled kernels (#1528), atomic-free and deterministic: every output cell is
+        // owned by one thread and accumulated in a fixed order. A block holds T keys (dK/dV) or T queries (dQ) and
+        // walks the other side tile by tile, recomputing the scores and dS = P * (dP - D) * scale for the tile pair in
+        // shared memory; D = dO . O per query row is reduced in-kernel with warp shuffles, so no workspace is needed.
+        // Rows are padded to headDim + 1 floats so the dot products across rows do not share banks.
+        private static string TiledBackwardSource(int t) => @"
+extern ""C"" __global__ __launch_bounds__(256) void flash_attention_backward_kv_t" + t + @"(
+    const float* __restrict__ gradOutput, const float* __restrict__ query, const float* __restrict__ key,
+    const float* __restrict__ value, const float* __restrict__ output, const float* __restrict__ softmaxStats,
+    float* __restrict__ gradKey, float* __restrict__ gradValue,
+    int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, int isCausal,
+    const float* __restrict__ attentionBias, int hasBias, int biasBatchStride)
+{
+    const int T = " + t + @";
+    const int PER = 256 / T;
+    extern __shared__ float sm[];
+    const int ld = headDim + 1;
+    float* Ks = sm;
+    float* Vs = Ks + T * ld;
+    float* Qs = Vs + T * ld;
+    float* Gs = Qs + T * ld;
+    float* Ps = Gs + T * ld;
+    float* Ss = Ps + T * T;
+    float* Ls = Ss + T * T;
+    float* Ds = Ls + T;
+    const int bh = blockIdx.y;
+    const int k0 = blockIdx.x * T;
+    const int tid = threadIdx.x;
+    if (bh >= batch * numHeads || k0 >= seqK) return;
+    const long kBase = (long)bh * seqK * headDim, qBase = (long)bh * seqQ * headDim;
+    const long biasHead = hasBias ? (long)(bh / numHeads) * biasBatchStride + (long)(bh % numHeads) * seqQ * seqK : 0;
+    const int kt = min(T, seqK - k0);
+    for (int i = tid; i < T * headDim; i += 256) {
+        int r = i / headDim, c = i - r * headDim;
+        bool ok = r < kt;
+        Ks[r * ld + c] = ok ? key[kBase + (long)(k0 + r) * headDim + c] : 0.0f;
+        Vs[r * ld + c] = ok ? value[kBase + (long)(k0 + r) * headDim + c] : 0.0f;
+    }
+    float accK[8], accV[8];
+    #pragma unroll
+    for (int j = 0; j < 8; j++) { accK[j] = 0.0f; accV[j] = 0.0f; }
+    // Causal (key <= query): a query before k0 sees no key of this tile.
+    for (int q0 = isCausal ? k0 : 0; q0 < seqQ; q0 += T) {
+        const int qt = min(T, seqQ - q0);
+        __syncthreads();
+        for (int i = tid; i < T * headDim; i += 256) {
+            int r = i / headDim, c = i - r * headDim;
+            bool ok = r < qt;
+            Qs[r * ld + c] = ok ? query[qBase + (long)(q0 + r) * headDim + c] : 0.0f;
+            Gs[r * ld + c] = ok ? gradOutput[qBase + (long)(q0 + r) * headDim + c] : 0.0f;
+        }
+        {
+            int row = tid / PER, lane = tid - row * PER;
+            float sum = 0.0f;
+            if (row < qt)
+                for (int c = lane; c < headDim; c += PER)
+                    sum += gradOutput[qBase + (long)(q0 + row) * headDim + c] * output[qBase + (long)(q0 + row) * headDim + c];
+            for (int off = PER / 2; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, off, PER);
+            if (lane == 0) { Ds[row] = sum; Ls[row] = row < qt ? softmaxStats[(long)bh * seqQ + q0 + row] : 0.0f; }
+        }
+        __syncthreads();
+        for (int i = tid; i < T * T; i += 256) {
+            int qq = i / T, kk = i - qq * T;
+            float pw = 0.0f, ds = 0.0f;
+            if (qq < qt && kk < kt && !(isCausal && k0 + kk > q0 + qq)) {
+                float sc = 0.0f, dp = 0.0f;
+                for (int c = 0; c < headDim; c++) {
+                    sc += Qs[qq * ld + c] * Ks[kk * ld + c];
+                    dp += Gs[qq * ld + c] * Vs[kk * ld + c];
+                }
+                sc *= scale;
+                if (hasBias) sc += attentionBias[biasHead + (long)(q0 + qq) * seqK + k0 + kk];
+                pw = expf(sc - Ls[qq]);
+                ds = pw * (dp - Ds[qq]) * scale;
+            }
+            Ps[i] = pw;
+            Ss[i] = ds;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            int i = tid + j * 256;
+            if (i < T * headDim) {
+                int kk = i / headDim, c = i - kk * headDim;
+                float av = 0.0f, ak = 0.0f;
+                for (int qq = 0; qq < qt; qq++) {
+                    av += Ps[qq * T + kk] * Gs[qq * ld + c];
+                    ak += Ss[qq * T + kk] * Qs[qq * ld + c];
+                }
+                accV[j] += av;
+                accK[j] += ak;
+            }
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        int i = tid + j * 256;
+        if (i < T * headDim) {
+            int kk = i / headDim, c = i - kk * headDim;
+            if (kk < kt) {
+                gradValue[kBase + (long)(k0 + kk) * headDim + c] = accV[j];
+                gradKey[kBase + (long)(k0 + kk) * headDim + c] = accK[j];
+            }
+        }
+    }
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void flash_attention_backward_q_t" + t + @"(
+    const float* __restrict__ gradOutput, const float* __restrict__ query, const float* __restrict__ key,
+    const float* __restrict__ value, const float* __restrict__ output, const float* __restrict__ softmaxStats,
+    float* __restrict__ gradQuery,
+    int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, int isCausal,
+    const float* __restrict__ attentionBias, int hasBias, int biasBatchStride)
+{
+    const int T = " + t + @";
+    const int PER = 256 / T;
+    extern __shared__ float sm[];
+    const int ld = headDim + 1;
+    float* Ks = sm;
+    float* Vs = Ks + T * ld;
+    float* Qs = Vs + T * ld;
+    float* Gs = Qs + T * ld;
+    float* Ss = Gs + T * ld;
+    float* Ls = Ss + 2 * T * T;
+    float* Ds = Ls + T;
+    const int bh = blockIdx.y;
+    const int q0 = blockIdx.x * T;
+    const int tid = threadIdx.x;
+    if (bh >= batch * numHeads || q0 >= seqQ) return;
+    const long kBase = (long)bh * seqK * headDim, qBase = (long)bh * seqQ * headDim;
+    const long biasHead = hasBias ? (long)(bh / numHeads) * biasBatchStride + (long)(bh % numHeads) * seqQ * seqK : 0;
+    const int qt = min(T, seqQ - q0);
+    for (int i = tid; i < T * headDim; i += 256) {
+        int r = i / headDim, c = i - r * headDim;
+        bool ok = r < qt;
+        Qs[r * ld + c] = ok ? query[qBase + (long)(q0 + r) * headDim + c] : 0.0f;
+        Gs[r * ld + c] = ok ? gradOutput[qBase + (long)(q0 + r) * headDim + c] : 0.0f;
+    }
+    {
+        int row = tid / PER, lane = tid - row * PER;
+        float sum = 0.0f;
+        if (row < qt)
+            for (int c = lane; c < headDim; c += PER)
+                sum += gradOutput[qBase + (long)(q0 + row) * headDim + c] * output[qBase + (long)(q0 + row) * headDim + c];
+        for (int off = PER / 2; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, off, PER);
+        if (lane == 0) { Ds[row] = sum; Ls[row] = row < qt ? softmaxStats[(long)bh * seqQ + q0 + row] : 0.0f; }
+    }
+    float accQ[8];
+    #pragma unroll
+    for (int j = 0; j < 8; j++) accQ[j] = 0.0f;
+    // Causal (key <= query): no key past the tile's last query.
+    const int kEnd = isCausal ? min(seqK, q0 + qt) : seqK;
+    for (int k0 = 0; k0 < kEnd; k0 += T) {
+        const int kt = min(T, seqK - k0);
+        __syncthreads();
+        for (int i = tid; i < T * headDim; i += 256) {
+            int r = i / headDim, c = i - r * headDim;
+            bool ok = r < kt;
+            Ks[r * ld + c] = ok ? key[kBase + (long)(k0 + r) * headDim + c] : 0.0f;
+            Vs[r * ld + c] = ok ? value[kBase + (long)(k0 + r) * headDim + c] : 0.0f;
+        }
+        __syncthreads();
+        for (int i = tid; i < T * T; i += 256) {
+            int qq = i / T, kk = i - qq * T;
+            float ds = 0.0f;
+            if (qq < qt && kk < kt && !(isCausal && k0 + kk > q0 + qq)) {
+                float sc = 0.0f, dp = 0.0f;
+                for (int c = 0; c < headDim; c++) {
+                    sc += Qs[qq * ld + c] * Ks[kk * ld + c];
+                    dp += Gs[qq * ld + c] * Vs[kk * ld + c];
+                }
+                sc *= scale;
+                if (hasBias) sc += attentionBias[biasHead + (long)(q0 + qq) * seqK + k0 + kk];
+                float pw = expf(sc - Ls[qq]);
+                ds = pw * (dp - Ds[qq]) * scale;
+            }
+            Ss[i] = ds;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            int i = tid + j * 256;
+            if (i < T * headDim) {
+                int qq = i / headDim, c = i - qq * headDim;
+                float aq = 0.0f;
+                for (int kk = 0; kk < kt; kk++) aq += Ss[qq * T + kk] * Ks[kk * ld + c];
+                accQ[j] += aq;
+            }
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        int i = tid + j * 256;
+        if (i < T * headDim) {
+            int qq = i / headDim, c = i - qq * headDim;
+            if (qq < qt) gradQuery[qBase + (long)(q0 + qq) * headDim + c] = accQ[j];
+        }
+    }
+}
+";
 
         public static string[] GetKernelNames()
         {
@@ -1069,6 +1278,10 @@ extern ""C"" __global__ void rope_interleaved(
                 "flash_attention_backward",
                 "flash_attention_backward_gradq_deterministic",
                 "flash_attention_backward_gradkv_deterministic",
+                "flash_attention_backward_kv_t32",
+                "flash_attention_backward_q_t32",
+                "flash_attention_backward_kv_t16",
+                "flash_attention_backward_q_t16",
                 "grouped_query_attention",
                 "grouped_query_attention_backward",
                 "grouped_query_attention_backward_gradq_deterministic",
