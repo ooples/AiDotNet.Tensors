@@ -101,7 +101,12 @@ internal static class SassProbeTool
             registers = Math.Max(registers, cubin.RegisterCount(kernel));
         foreach (string kernel in cubin.Kernels)
         {
-            var code = pass == "none" ? cubin.Instructions(kernel) : SassScheduler.RecomputeControl(cubin.Instructions(kernel), architecture);
+            // reorder: SassFfmaReorder (operand reuse and register banks), then the scheduler's control words.
+            var source = pass == "reorder" ? SassFfmaReorder.Reorder(cubin.Instructions(kernel)) : cubin.Instructions(kernel);
+            if (pass == "reorder")
+                Console.WriteLine("  FFMA same-bank file reads: ptxas " + SassFfmaReorder.BankConflicts(cubin.Instructions(kernel)) +
+                    ", reordered " + SassFfmaReorder.BankConflicts(source));
+            var code = pass == "none" ? cubin.Instructions(kernel) : SassScheduler.RecomputeControl(source, architecture);
             if (code is null)
             {
                 decline = "declined: " + SassScheduler.LastDecline;
