@@ -1068,6 +1068,12 @@ class Program
             return;
         }
 
+        if (args[0] == "--sgemm-tile")
+        {
+            SgemmTileTool.Run(args);
+            return;
+        }
+
         if (args[0] == "--profile-gemm")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.ProfileGemm();

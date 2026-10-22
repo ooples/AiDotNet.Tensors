@@ -31,9 +31,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// <param name="RegisterTranspose">With <c>AsyncStages</c>, an operand contiguous along K is not copied element by
 /// element: each thread loads 16-byte vectors into registers while the current stage computes and stores them
 /// transposed into the stage being refilled afterwards (as CUTLASS does for a K-contiguous SIMT operand).</param>
+/// <param name="FragmentPipeline">With <c>AsyncStages</c>, the shared-memory fragments are double-buffered in
+/// registers: each k step's fragments load while the previous step's FMAs run, and the K tile's wait and barrier sit
+/// before its last step's FMAs, so the next tile's first fragments load under them (CUTLASS's warp-level pipeline).
+/// Without it every tile starts with the barrier and then waits for its first fragments.</param>
 internal readonly record struct PtxGemmConfiguration(
     int BlockM, int BlockN, int BlockK, int ThreadM, int ThreadN, int VectorWidth, int SharedPad, bool DoubleBuffer,
-    bool SplitTile = false, int Swizzle = 1, int MinBlocksPerSM = 1, int AsyncStages = 0, bool RegisterTranspose = false)
+    bool SplitTile = false, int Swizzle = 1, int MinBlocksPerSM = 1, int AsyncStages = 0, bool RegisterTranspose = false,
+    bool FragmentPipeline = false)
 {
     internal int ThreadsN => BlockN / ThreadN;
     internal int ThreadsM => BlockM / ThreadM;
@@ -45,11 +50,11 @@ internal readonly record struct PtxGemmConfiguration(
     internal int SharedBytes => checked(Stages * BlockK * (PitchA + PitchB) * sizeof(float));
 
     /// <summary>A short stable name, used in kernel identities and evolution records.</summary>
-    internal string Name => string.Format(CultureInfo.InvariantCulture, "b{0}x{1}x{2}-t{3}x{4}-v{5}-p{6}-{7}{8}{9}{10}",
+    internal string Name => string.Format(CultureInfo.InvariantCulture, "b{0}x{1}x{2}-t{3}x{4}-v{5}-p{6}-{7}{8}{9}{10}{11}",
         BlockM, BlockN, BlockK, ThreadM, ThreadN, VectorWidth, SharedPad,
         IsAsync ? "as" + AsyncStages.ToString(CultureInfo.InvariantCulture) + (RegisterTranspose ? "r" : "") : DoubleBuffer ? "db" : "sb",
         SplitTile ? "-split" : "", Swizzle > 1 ? "-g" + Swizzle.ToString(CultureInfo.InvariantCulture) : "",
-        MinBlocksPerSM > 1 ? "-o" + MinBlocksPerSM.ToString(CultureInfo.InvariantCulture) : "");
+        MinBlocksPerSM > 1 ? "-o" + MinBlocksPerSM.ToString(CultureInfo.InvariantCulture) : "", FragmentPipeline ? "-fp" : "");
 
     // The thread tile's fragment granularity: 4 x 4 fragments when split, one TM x TN run otherwise.
     internal int FragmentM => SplitTile ? 4 : ThreadM;
@@ -107,6 +112,8 @@ internal readonly record struct PtxGemmConfiguration(
         if (IsAsync && DoubleBuffer) return "the cp.async pipeline replaces register double buffering";
         if (IsAsync && VectorWidth != 4) return "cp.async needs the 16-byte-aligned (vector width 4) admission";
         if (RegisterTranspose && !IsAsync) return "register transposition is a cp.async pipeline option";
+        if (FragmentPipeline && !IsAsync) return "the fragment pipeline is a cp.async pipeline option";
+        if (FragmentPipeline && BlockK % 2 != 0) return "the fragment pipeline alternates two register sets over an even K tile";
         if (SharedBytes > (IsAsync ? MaxDynamicSharedBytes : MaxStaticSharedBytes))
             return IsAsync ? "shared memory exceeds 99 KiB" : "shared memory exceeds 48 KiB";
         if (ThreadM * ThreadN > 128) return "more than 128 accumulators per thread";
@@ -280,7 +287,37 @@ internal static class PtxSgemmGenerator
             internal string[][] Staged = Array.Empty<string[]>();  // registers holding the slot's VW loaded values
             internal string Step = "";  // u64 bytes to advance every slot pointer by one K tile
             internal bool ViaRegisters;  // staged through registers (always, or a transposed operand of a cp.async kernel)
+            // Affine slots: slot s sits a fixed (DeltaK, DeltaMn) * s from slot 0 in the tile, so only slot 0 keeps
+            // registers (pointer, k and mn offsets, shared offset); slot s's global address is slot 0's plus s * Stride
+            // (a u64 register: ld enters it), its k offset and shared offset slot 0's plus constants.
+            internal bool Affine;
+            internal int DeltaK, DeltaMn;
+            internal string Stride = "";
         }
+
+        // The global address of `op`'s slot s for the current tile: a register (slot 0, or a non-affine slot), or one
+        // computed into a fresh register from slot 0's.
+        private string SlotAddress(Operand op, int s)
+        {
+            if (!op.Affine || s == 0) return op.SlotPointer[s];
+            string address = Rd();
+            L($"mad.lo.u64 {address}, {op.Stride}, {I(s)}, {op.SlotPointer[0]};");
+            return address;
+        }
+
+        // k0 + the k offset of `op`'s slot s, into a fresh register.
+        private string SlotKGlobal(Operand op, int s, string k0)
+        {
+            string kGlobal = R();
+            int slot = op.Affine ? 0 : s;
+            L($"add.u32 {kGlobal}, {k0}, {_slotK[(op.Name, slot)]};");
+            if (op.Affine && s * op.DeltaK != 0) L($"add.u32 {kGlobal}, {kGlobal}, {I(s * op.DeltaK)};");
+            return kGlobal;
+        }
+
+        // The register holding a slot-relative offset (k, mn or shared bytes) and the constant to add for slot s.
+        private (string Register, int Constant) SlotOffset(Dictionary<(string, int), string> offsets, Operand op, int s, int perSlot) =>
+            op.Affine ? (offsets[(op.Name, 0)], s * perSlot) : (offsets[(op.Name, s)], 0);
 
         internal string Build(int ccMajor, int ccMinor)
         {
@@ -378,6 +415,11 @@ internal static class PtxSgemmGenerator
             var fb = new string[_c.ThreadN];
             for (int i = 0; i < fa.Length; i++) fa[i] = CF();
             for (int i = 0; i < fb.Length; i++) fb[i] = CF();
+            // The fragment pipeline's second register set.
+            var fa2 = new string[_c.FragmentPipeline ? _c.ThreadM : 0];
+            var fb2 = new string[_c.FragmentPipeline ? _c.ThreadN : 0];
+            for (int i = 0; i < fa2.Length; i++) fa2[i] = CF();
+            for (int i = 0; i < fb2.Length; i++) fb2[i] = CF();
 
             // Per-thread shared read offsets for the inner product: the thread's first A row ty*FM and B column tx*FN
             // (bytes); its other fragments sit at compile-time offsets (RowOffset / ColumnOffset).
@@ -414,11 +456,25 @@ internal static class PtxSgemmGenerator
                         L($"add.u32 {k0}, {k0}, {I(_c.BlockK)};");
                     }
                 }
+                if (_c.FragmentPipeline)
+                {
+                    // Tile 0 lands, and its first fragments load ahead of the loop.
+                    L($"cp.async.wait_group {I(_c.AsyncStages - 2)};");
+                    L("bar.sync 0;");
+                    string firstA = R(), firstB = R();
+                    L($"add.u32 {firstA}, {curA}, {aRead};");
+                    L($"add.u32 {firstB}, {curB}, {bRead};");
+                    LoadFragments(fa, fb, firstA, firstB, 0);
+                }
                 Label("K_LOOP");
                 // Tile `tile` has landed once at most Stages-2 younger groups are pending; the barrier also retires
                 // every thread's reads of the stage the next issue overwrites (computed in the previous iteration).
-                L($"cp.async.wait_group {I(_c.AsyncStages - 2)};");
-                L("bar.sync 0;");
+                // The fragment pipeline waits at the end of the previous iteration instead (see ComputePipelined).
+                if (!_c.FragmentPipeline)
+                {
+                    L($"cp.async.wait_group {I(_c.AsyncStages - 2)};");
+                    L("bar.sync 0;");
+                }
                 string next = R(), issueStage = R(), hasNext = P(), nextK0 = R(), offA = R(), offB = R();
                 L($"add.u32 {next}, {tile}, {I(_c.AsyncStages - 1)};");
                 L($"setp.lt.u32 {hasNext}, {next}, {tiles};");
@@ -435,11 +491,29 @@ internal static class PtxSgemmGenerator
                 L($"rem.u32 {computeStage}, {tile}, {I(_c.AsyncStages)};");
                 L($"mad.lo.u32 {stageA}, {computeStage}, {I(tileBytesA)}, {curA};");
                 L($"mad.lo.u32 {stageB}, {computeStage}, {I(tileBytesB)}, {curB};");
-                Compute(stageA, stageB, aRead, bRead, fa, fb, acc);
-                // The refilled stage was last read in the previous iteration (the barrier above retired it) and is
-                // next read Stages-1 iterations on, after at least one more barrier.
-                FinishTile(a, curA, offA);
-                FinishTile(b, curB, offB);
+                if (_c.FragmentPipeline)
+                {
+                    string nextStage = R(), nextA = R(), nextB = R();
+                    L($"add.u32 {nextStage}, {tile}, 1;");
+                    L($"rem.u32 {nextStage}, {nextStage}, {I(_c.AsyncStages)};");
+                    L($"mad.lo.u32 {nextA}, {nextStage}, {I(tileBytesA)}, {curA};");
+                    L($"mad.lo.u32 {nextB}, {nextStage}, {I(tileBytesB)}, {curB};");
+                    ComputePipelined(stageA, stageB, nextA, nextB, aRead, bRead, new[] { fa, fa2 }, new[] { fb, fb2 }, acc, () =>
+                    {
+                        // Before the barrier: the refilled stage's transposed stores (read after the barrier, next
+                        // iteration at the earliest).
+                        FinishTile(a, curA, offA);
+                        FinishTile(b, curB, offB);
+                    });
+                }
+                else
+                {
+                    Compute(stageA, stageB, aRead, bRead, fa, fb, acc);
+                    // The refilled stage was last read in the previous iteration (the barrier above retired it) and is
+                    // next read Stages-1 iterations on, after at least one more barrier.
+                    FinishTile(a, curA, offA);
+                    FinishTile(b, curB, offB);
+                }
                 string more = P();
                 L($"add.u32 {tile}, {tile}, 1;");
                 L($"setp.lt.u32 {more}, {tile}, {tiles};");
@@ -564,8 +638,34 @@ internal static class PtxSgemmGenerator
             };
             string ld64 = Rd();
             L($"cvt.u64.u32 {ld64}, {ld};");
+            // Consecutive slots are Threads * vw elements apart along the contiguous dimension; when that is a whole
+            // number of rows of it, they differ by constant (k, mn) steps and share slot 0's registers.
+            int slotStep = _c.Threads * vw, contiguous = contiguousAlongK ? _c.BlockK : mnTile;
+            op.Affine = slots > 1 && slotStep % contiguous == 0;
+            if (op.Affine)
+            {
+                op.DeltaK = contiguousAlongK ? 0 : slotStep / mnTile;
+                op.DeltaMn = contiguousAlongK ? slotStep / _c.BlockK : 0;
+                op.Stride = Rd();
+                // Bytes from slot s to s + 1: DeltaMn rows of ld along K, DeltaK rows of ld along MN.
+                L($"mul.lo.u64 {op.Stride}, {ld64}, {I((long)(contiguousAlongK ? op.DeltaMn : op.DeltaK) * _ob)};");
+            }
             for (int s = 0; s < slots; s++)
             {
+                op.Staged[s] = new string[viaRegisters ? vw : 0];
+                for (int v = 0; v < op.Staged[s].Length; v++) op.Staged[s][v] = CF();
+                op.SlotK[s] = s;
+                op.SlotMn[s] = s;
+                if (op.Affine && s > 0)
+                {
+                    // Only the bound: slot 0's mn plus s * DeltaMn must exist.
+                    string mnSlot = R(), slotIn = P();
+                    L($"add.u32 {mnSlot}, {blockMn}, {_slotMn[(name, 0)]};");
+                    if (s * op.DeltaMn != 0) L($"add.u32 {mnSlot}, {mnSlot}, {I(s * op.DeltaMn)};");
+                    L($"setp.lt.u32 {slotIn}, {mnSlot}, {mnLimit};");
+                    op.SlotMnInBounds[s] = slotIn;
+                    continue;
+                }
                 // Element index of the slot's first value in the tile, walked along the contiguous dimension. The
                 // thread id enters at run time; the slot index at emit time.
                 string linear = R();
@@ -596,10 +696,6 @@ internal static class PtxSgemmGenerator
                 op.SlotPointer[s] = ptr;
                 op.SlotMnInBounds[s] = inBounds;
                 // Keep the k offset and the mn offset as registers too (shared store address and the K bound).
-                op.SlotK[s] = s;
-                op.SlotMn[s] = s;
-                op.Staged[s] = new string[viaRegisters ? vw : 0];
-                for (int v = 0; v < op.Staged[s].Length; v++) op.Staged[s][v] = CF();
                 _slotK[(name, s)] = kOff;
                 _slotMn[(name, s)] = mnOff;
                 if (!viaRegisters)
@@ -647,23 +743,27 @@ internal static class PtxSgemmGenerator
             int bytes = _slotBytes[op.Name];
             for (int s = 0; s < op.SlotPointer.Length; s++)
             {
-                string kGlobal = R(), ok = P(), size = R(), dst = R();
-                L($"add.u32 {kGlobal}, {k0}, {_slotK[(op.Name, s)]};");
+                string ok = P(), size = R(), dst = R();
+                string kGlobal = SlotKGlobal(op, s, k0);
                 L($"setp.lt.and.u32 {ok}, {kGlobal}, {k}, {op.SlotMnInBounds[s]};");
                 L($"and.pred {ok}, {ok}, {issue};");
                 L($"selp.u32 {size}, {I(bytes)}, 0, {ok};");
-                L($"add.u32 {dst}, {buffer}, {_slotShared[(op.Name, s)]};");
+                var (shared, sharedConstant) = SlotOffset(_slotShared, op, s, (op.DeltaK * op.Pitch + op.DeltaMn) * sizeof(float));
+                L($"add.u32 {dst}, {buffer}, {shared};");
                 L($"add.u32 {dst}, {dst}, {stageOffset};");
+                string source = SlotAddress(op, s);
+                string at = sharedConstant != 0 ? dst + "+" + I(sharedConstant) : dst;
                 // 16-byte copies may bypass L1 (.cg); 4-byte copies must go through it (.ca).
                 L(bytes == 16
-                    ? $"cp.async.cg.shared.global [{dst}], [{op.SlotPointer[s]}], 16, {size};"
-                    : $"cp.async.ca.shared.global [{dst}], [{op.SlotPointer[s]}], {I(bytes)}, {size};");
+                    ? $"cp.async.cg.shared.global [{at}], [{source}], 16, {size};"
+                    : $"cp.async.ca.shared.global [{at}], [{source}], {I(bytes)}, {size};");
             }
         }
 
         private void Advance(Operand op)
         {
-            foreach (string ptr in op.SlotPointer) L($"add.u64 {ptr}, {ptr}, {op.Step};");
+            for (int s = 0; s < (op.Affine ? 1 : op.SlotPointer.Length); s++)
+                L($"add.u64 {op.SlotPointer[s]}, {op.SlotPointer[s]}, {op.Step};");
         }
 
         // Global -> registers for the tile starting at k0; values outside the matrix are zero.
@@ -672,18 +772,19 @@ internal static class PtxSgemmGenerator
             int vw = _c.VectorWidth;
             for (int s = 0; s < op.SlotPointer.Length; s++)
             {
-                string kGlobal = R(), ok = P();
-                L($"add.u32 {kGlobal}, {k0}, {_slotK[(op.Name, s)]};");
+                string ok = P();
+                string kGlobal = SlotKGlobal(op, s, k0);
                 L($"setp.lt.and.u32 {ok}, {kGlobal}, {k}, {op.SlotMnInBounds[s]};");
+                string pointer = SlotAddress(op, s);
                 foreach (string v in op.Staged[s]) L($"mov.{Ct} {v}, {Zero};");
                 if (vw == 4)
-                    L($"@{ok} ld.global.v4.f32 {{{op.Staged[s][0]}, {op.Staged[s][1]}, {op.Staged[s][2]}, {op.Staged[s][3]}}}, [{op.SlotPointer[s]}];");
+                    L($"@{ok} ld.global.v4.f32 {{{op.Staged[s][0]}, {op.Staged[s][1]}, {op.Staged[s][2]}, {op.Staged[s][3]}}}, [{pointer}];");
                 else if (_p == PtxGemmPrecision.Bf16InFp32Out)
                 {
                     // BF16 operand: its bits are an FP32's upper half, so widening is a 16-bit shift.
                     string bits = R();
                     L($"mov.u32 {bits}, 0;");
-                    L($"@{ok} ld.global.u16 {bits}, [{op.SlotPointer[s]}];");
+                    L($"@{ok} ld.global.u16 {bits}, [{pointer}];");
                     L($"shl.b32 {bits}, {bits}, 16;");
                     L($"mov.b32 {op.Staged[s][0]}, {bits};");
                 }
@@ -691,11 +792,11 @@ internal static class PtxSgemmGenerator
                 {
                     // FP16 operand: widen to FP32 at load, so shared memory and the inner product stay FP32.
                     string half = H();
-                    L($"@{ok} ld.global.b16 {half}, [{op.SlotPointer[s]}];");
+                    L($"@{ok} ld.global.b16 {half}, [{pointer}];");
                     L($"@{ok} cvt.f32.f16 {op.Staged[s][0]}, {half};");
                 }
                 else
-                    L($"@{ok} ld.global.{Ct} {op.Staged[s][0]}, [{op.SlotPointer[s]}];");
+                    L($"@{ok} ld.global.{Ct} {op.Staged[s][0]}, [{pointer}];");
             }
         }
 
@@ -705,11 +806,14 @@ internal static class PtxSgemmGenerator
             int vw = _c.VectorWidth;
             for (int s = 0; s < op.SlotPointer.Length; s++)
             {
-                string kOff = _slotK[(op.Name, s)], mnOff = _slotMn[(op.Name, s)];
+                var (kOff, _) = SlotOffset(_slotK, op, s, op.DeltaK);
+                var (mnOff, _) = SlotOffset(_slotMn, op, s, op.DeltaMn);
                 string address = R();
                 L($"mad.lo.u32 {address}, {kOff}, {I(op.Pitch)}, {mnOff};");
                 L($"shl.b32 {address}, {address}, {I(Log2(_cb))};");
                 L($"add.u32 {address}, {address}, {buffer};");
+                // An affine slot's element sits (DeltaK * pitch + DeltaMn) * s elements past slot 0's.
+                if (op.Affine && s > 0) L($"add.u32 {address}, {address}, {I((op.DeltaK * op.Pitch + op.DeltaMn) * s * _cb)};");
                 if (op.ContiguousAlongK)
                 {
                     // The vector runs along K: a column of the K-major tile, one row apart per element.
@@ -746,6 +850,53 @@ internal static class PtxSgemmGenerator
                     {
                         string a = acc[i * fb.Length + j];
                         L($"fma.rn.{Ct} {a}, {fa[i]}, {fb[j]}, {a};");
+                    }
+            }
+        }
+
+        // One k step's fragments (row kk of the stage) into the given register set.
+        private void LoadFragments(string[] fa, string[] fb, string aBase, string bBase, int kk)
+        {
+            int aRow = kk * _c.PitchA * _cb, bRow = kk * _c.PitchB * _cb;
+            for (int i = 0; i < fa.Length; i += 4) LoadFragment(fa, i, aBase, aRow + _c.RowOffset(i) * _cb);
+            for (int j = 0; j < fb.Length; j += 4) LoadFragment(fb, j, bBase, bRow + _c.ColumnOffset(j) * _cb);
+        }
+
+        // Compute with fragments double-buffered in registers: step kk's FMAs use set kk % 2 while step kk + 1's
+        // fragments load into the other. Before the last step's FMAs, `beforeBarrier` runs, then the wait for the next
+        // tile and the barrier, then the next tile's first fragments load (into set 0: the K tile is even) under the
+        // last step's FMAs. The barrier retires every read of this tile's stage (its last fragments loaded before it),
+        // so the next iteration's copy may refill it; on the last tile the extra fragment loads read a stale stage and
+        // are never used.
+        private void ComputePipelined(string curA, string curB, string nextA, string nextB, string aRead, string bRead,
+            string[][] fa, string[][] fb, string[] acc, Action beforeBarrier)
+        {
+            string aBase = R(), bBase = R();
+            L($"add.u32 {aBase}, {curA}, {aRead};");
+            L($"add.u32 {bBase}, {curB}, {bRead};");
+            for (int kk = 0; kk < _c.BlockK; kk++)
+            {
+                var curFa = fa[kk % 2];
+                var curFb = fb[kk % 2];
+                if (kk + 1 < _c.BlockK)
+                {
+                    LoadFragments(fa[(kk + 1) % 2], fb[(kk + 1) % 2], aBase, bBase, kk + 1);
+                }
+                else
+                {
+                    beforeBarrier();
+                    L($"cp.async.wait_group {I(_c.AsyncStages - 2)};");
+                    L("bar.sync 0;");
+                    string nextABase = R(), nextBBase = R();
+                    L($"add.u32 {nextABase}, {nextA}, {aRead};");
+                    L($"add.u32 {nextBBase}, {nextB}, {bRead};");
+                    LoadFragments(fa[0], fb[0], nextABase, nextBBase, 0);
+                }
+                for (int i = 0; i < curFa.Length; i++)
+                    for (int j = 0; j < curFb.Length; j++)
+                    {
+                        string a = acc[i * curFb.Length + j];
+                        L($"fma.rn.{Ct} {a}, {curFa[i]}, {curFb[j]}, {a};");
                     }
             }
         }
