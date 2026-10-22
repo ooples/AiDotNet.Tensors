@@ -2506,7 +2506,9 @@ public partial class DirectGpuTensorEngine
                         return;
                     }
                     // Read each id as the CPU does (round half to even, NaN ignored), select rows through ids clamped into
-                    // the table (resident_index_select has no bounds check), then zero the rows whose id was outside it.
+                    // the table, then zero the rows whose id was outside it. The clamp is kept now that every
+                    // resident_index_select bounds its own index: it is what makes this result independent of the
+                    // backend's policy, and HipBackend.IndexSelect resolves a kernel its sources do not define.
                     ids32!.Normalize(idBuffer.Buffer);
                     ids32.ClampAndMarkInvalid(vocabSize);
                     indexBackend!.ConvertIndicesToInt32(ids32.Clamped, ids32.Int32, numIndices);
