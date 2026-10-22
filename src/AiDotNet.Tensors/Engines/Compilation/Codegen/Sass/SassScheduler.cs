@@ -21,14 +21,17 @@
 // what every edge into it leaves pending (loop heads iterated to a fixpoint), so a loop keeps its prefetched global
 // loads in flight across the back edge as ptxas does -- waiting on every scoreboard there cost a 3x3 convolution's data
 // gradient 12% on the RTX 3080 (CALL.REL.NOINC, a loop exit, counts as a branch). The other control instructions
-// (barriers, EXIT, convergence, DEPBAR) still wait on every scoreboard. BSSY must: letting global loads stay pending
-// across a BSSY region made a dilated 3x3 convolution's output wrong on the RTX 3080, every run, with every register
-// dependency waited for (a wait at the BSSY or the divergent BRA fixed it, one at the region's first instruction did not;
-// ptxas keeps them pending there, so some rule is still unknown). The yield bits stay as they were. An operand
-// reuse flag survives only where the instruction's stall is no longer than ptxas's: the reuse cache is valid only when
-// the next instruction follows closely enough that the scheduler cannot have issued another warp in between --
-// lengthening the stall of an instruction that keeps its reuse flags faulted on sm_75 (ptxas's own schedule with four
-// extra stall cycles on its memory instructions read stale operands).
+// (barriers, EXIT, convergence, DEPBAR) still wait on every scoreboard. BSSY regions (sm_86), all found on the RTX 3080
+// with every register dependency already waited for: BSSY issues its divergent branch no sooner than 12 cycles on
+// (ptxas never less; 1 made dense 3x3 convolutions' weight staging compute wrong values, 6 was the fewest that ran);
+// the scoreboards holding read releases or other short operations are waited for at the BSSY (left pending, a dilated
+// 3x3 convolution's index arithmetic inside the region came out wrong for every lane past the first channel); global
+// loads stay in flight across the region, as ptxas leaves them, and their scoreboards are not touched until after the
+// reconvergence target. sm_75 keeps the full wait at BSSY. The yield bits stay as they were. An operand reuse flag
+// survives only where the instruction's stall is no longer than ptxas's: the reuse cache is valid only when the next
+// instruction follows closely enough that the scheduler cannot have issued another warp in between -- lengthening the
+// stall of an instruction that keeps its reuse flags faulted on sm_75 (ptxas's own schedule with four extra stall
+// cycles on its memory instructions read stale operands).
 // A kernel with an opcode the table does not know is left alone (null).
 
 using System;
@@ -113,7 +116,7 @@ public static class SassScheduler
     private sealed record Timing(int GuardPredicateLatency, int MaxStall, IReadOnlyDictionary<string, int> IssueStalls,
         IReadOnlyDictionary<string, (string Pipe, int Cycles)> Pipes, int UniformEarlyWriteAfterRead = 0,
         IReadOnlyDictionary<string, int>? Latencies = null, IReadOnlyDictionary<string, string>? LatencyClasses = null,
-        int SameClassLatency = 0, int CrossClassLatency = 0);
+        int SameClassLatency = 0, int CrossClassLatency = 0, bool RegionsKeepLoads = false);
 
     private static readonly Dictionary<string, string> s_ampereLatencyClasses = new()
     {
@@ -141,8 +144,9 @@ public static class SassScheduler
     private static readonly Dictionary<int, Timing> s_timings = new()
     {
         [75] = new(12, 12, new Dictionary<string, int> { ["BMOV"] = 11, ["BAR"] = 5 }, s_noPipes),
-        [86] = new(13, 13, new Dictionary<string, int> { ["BMOV"] = 11, ["BAR"] = 6, ["DEPBAR"] = 4, ["LDGDEPBAR"] = 4 }, s_ampere, 3,
-            new Dictionary<string, int> { ["P2R"] = 6, ["IMAD.WIDE"] = 5, ["I2FP"] = 5 }, s_ampereLatencyClasses, 4, 5),
+        [86] = new(13, 13, new Dictionary<string, int> { ["BMOV"] = 11, ["BAR"] = 6, ["DEPBAR"] = 4, ["LDGDEPBAR"] = 4, ["BSSY"] = 12 },
+            s_ampere, 3, new Dictionary<string, int> { ["P2R"] = 6, ["IMAD.WIDE"] = 5, ["I2FP"] = 5 }, s_ampereLatencyClasses, 4, 5,
+            RegionsKeepLoads: true),
     };
 
     /// <summary>
@@ -223,6 +227,8 @@ public static class SassScheduler
             var pendingComplete = new long[6];   // per scoreboard: the latest expected completion among them
             for (int s = 0; s < pendingUse.Length; s++) pendingUse[s] = long.MaxValue;
             var outstanding = new int[6];
+            var shortOps = new bool[6];   // per scoreboard: holds something other than a global load's result
+            int frozen = 0, frozenUntil = -1;   // scoreboards a BSSY region keeps in flight, and where the region ends
             long cycle = 0;   // issue cycle of the current instruction
             var scoreboardSetAt = new long[6];
             for (int s = 0; s < scoreboardSetAt.Length; s++) scoreboardSetAt[s] = long.MinValue / 2;
@@ -244,6 +250,7 @@ public static class SassScheduler
                     : (e.UniformPredicates ? UniformPredicateKey : PredicateKey) + instruction.GuardPredicate;
                 var predicateWrites = Predicates(instruction, e.PredicateWrites, e.UniformPredicates);
                 bool target = targets.Contains(i);
+                if (i >= frozenUntil) frozen = 0;
                 // Fixed-latency state never crosses a block boundary; scoreboards cross branches (BRA, and CALL.REL.NOINC,
                 // which ptxas leaves a loop through) and branch targets, but every other control instruction (barriers,
                 // EXIT, convergence, DEPBAR) waits on them all.
@@ -258,9 +265,23 @@ public static class SassScheduler
 
                 // Waits.
                 int wait = 0;
-                if (drain)
+                if (drain && e.Mnemonic == "BSSY" && timing.RegionsKeepLoads)
                 {
-                    wait = AllScoreboards & ~asyncMask;
+                    // A BSSY region may keep global loads in flight, but nothing else: the scoreboards holding read
+                    // releases or short operations are waited for first, and the ones left in flight are neither set
+                    // nor waited on (BSYNC and the reconvergence target included) until the region has closed.
+                    for (int b = 0; b < 6; b++) if (shortOps[b]) wait |= 1 << b;
+                    int end = BranchTarget(code, i);
+                    wait &= ~asyncMask;
+                    frozen = 0;
+                    for (int b = 0; b < 6; b++) if (outstanding[b] != 0 && (wait >> b & 1) == 0) frozen |= 1 << b;
+                    frozenUntil = end + 1;   // through the reconvergence target
+                }
+                else if (drain)
+                {
+                    // BSYNC closing a region leaves the loads from before it pending (ptxas waits for them at their
+                    // first reader after the region).
+                    wait = AllScoreboards & ~asyncMask & ~frozen;
                 }
                 else
                 {
@@ -280,7 +301,7 @@ public static class SassScheduler
                     if (writes.Count != 0)
                     {
                         long complete = cycle + (global ? GlobalLoadCycles : e.Mnemonic is "LDS" or "LDSM" ? SharedLoadCycles : OtherVariableCycles);
-                        writeBoard = ChooseBoard(global ? longBoards : boards, outstanding, pendingUse, pendingComplete, firstUse[i], complete, conserve: global);
+                        writeBoard = ChooseBoard(Unfrozen(global ? longBoards : boards), outstanding, pendingUse, pendingComplete, firstUse[i], complete, conserve: global);
                         writeComplete = complete;
                         if (outstanding[writeBoard] >= ScoreboardDepth) wait |= 1 << writeBoard;
                     }
@@ -290,7 +311,7 @@ public static class SassScheduler
                     if (reads.Count != 0 && overwritten[i] && !(useInBlock[i] && firstUse[i] <= firstOverwrite[i]))
                     {
                         readReleased = cycle + SourceReadCycles;
-                        readBoard = ChooseBoard(shortBoards, outstanding, pendingUse, pendingComplete,
+                        readBoard = ChooseBoard(Unfrozen(shortBoards), outstanding, pendingUse, pendingComplete,
                             firstOverwrite[i], readReleased);
                         if (outstanding[readBoard] >= ScoreboardDepth) wait |= 1 << readBoard;
                     }
@@ -303,6 +324,7 @@ public static class SassScheduler
                         if ((wait >> s & 1) != 0)
                         {
                             outstanding[s] = 0;
+                            shortOps[s] = false;
                             pendingUse[s] = long.MaxValue;
                             pendingComplete[s] = 0;
                         }
@@ -398,6 +420,7 @@ public static class SassScheduler
                     if (writeBoard != SassInstruction.NoScoreboard)
                     {
                         outstanding[writeBoard]++;
+                        shortOps[writeBoard] |= !global;
                         pendingUse[writeBoard] = Math.Min(pendingUse[writeBoard], firstUse[i]);
                         pendingComplete[writeBoard] = Math.Max(pendingComplete[writeBoard], writeComplete);
                         scoreboardSetAt[writeBoard] = cycle;
@@ -406,6 +429,7 @@ public static class SassScheduler
                     if (readBoard != SassInstruction.NoScoreboard)
                     {
                         outstanding[readBoard]++;
+                        shortOps[readBoard] = true;
                         pendingUse[readBoard] = Math.Min(pendingUse[readBoard], firstOverwrite[i]);
                         pendingComplete[readBoard] = Math.Max(pendingComplete[readBoard], readReleased);
                         scoreboardSetAt[readBoard] = cycle;
@@ -443,7 +467,7 @@ public static class SassScheduler
                 if (branch)
                 {
                     int to = BranchTarget(code, i);
-                    var state = new ScoreState(pendingWrite, pendingRead, outstanding, scoreboardSetAt);
+                    var state = new ScoreState(pendingWrite, pendingRead, outstanding, scoreboardSetAt, shortOps);
                     var edges = to > i ? forwardEntry : backOut;
                     if (to > i || !drainTargets.Contains(to))
                         edges[to] = edges.TryGetValue(to, out var known) ? known.Union(state) : state;
@@ -470,6 +494,15 @@ public static class SassScheduler
             foreach (var edge in backOut)
                 backEntry[edge.Key] = backEntry.TryGetValue(edge.Key, out var assumed) ? assumed.Union(edge.Value) : edge.Value;
 
+            // Inside a BSSY region, the scoreboards still holding loads from before it are neither set nor reused
+            // (see the file header); the region falls back to every board only if none other is left.
+            int[] Unfrozen(int[] candidates)
+            {
+                if (frozen == 0) return candidates;
+                var free = candidates.Where(b => (frozen >> b & 1) == 0).ToArray();
+                return free.Length != 0 ? free : candidates;
+            }
+
             // Adds a predecessor's pending scoreboards to the current state. A back edge's set cycles belong to the
             // previous trip and are taken as at least ScoreboardSetDelay ago; the choice model treats its boards as
             // holding a global load needed now.
@@ -481,6 +514,7 @@ public static class SassScheduler
                 {
                     if (state.Outstanding[b] == 0) continue;
                     outstanding[b] = Math.Max(outstanding[b], state.Outstanding[b]);
+                    shortOps[b] |= state.Short[b];
                     long setAt = clampSetAt ? Math.Min(state.SetAt[b], cycle - ScoreboardSetDelay) : state.SetAt[b];
                     scoreboardSetAt[b] = Math.Max(scoreboardSetAt[b], setAt);
                     pendingUse[b] = Math.Min(pendingUse[b], cycle);
@@ -500,8 +534,9 @@ public static class SassScheduler
     // clear costs nothing).
     private sealed class ScoreState
     {
-        public ScoreState(Dictionary<int, int> write, Dictionary<int, int> read, int[] outstanding, long[] setAt)
+        public ScoreState(Dictionary<int, int> write, Dictionary<int, int> read, int[] outstanding, long[] setAt, bool[] shortOps)
         {
+            Short = (bool[])shortOps.Clone();
             Write = new Dictionary<int, int>(write);
             Read = new Dictionary<int, int>(read);
             Outstanding = (int[])outstanding.Clone();
@@ -512,16 +547,18 @@ public static class SassScheduler
         public Dictionary<int, int> Read { get; }
         public int[] Outstanding { get; }
         public long[] SetAt { get; }
+        public bool[] Short { get; }
 
         public ScoreState Union(ScoreState other)
         {
-            var union = new ScoreState(Write, Read, Outstanding, SetAt);
+            var union = new ScoreState(Write, Read, Outstanding, SetAt, Short);
             foreach (var pair in other.Write) union.Write[pair.Key] = (union.Write.TryGetValue(pair.Key, out int m) ? m : 0) | pair.Value;
             foreach (var pair in other.Read) union.Read[pair.Key] = (union.Read.TryGetValue(pair.Key, out int m) ? m : 0) | pair.Value;
             for (int b = 0; b < Outstanding.Length; b++)
             {
                 union.Outstanding[b] = Math.Max(union.Outstanding[b], other.Outstanding[b]);
                 union.SetAt[b] = Math.Max(union.SetAt[b], other.SetAt[b]);
+                union.Short[b] |= other.Short[b];
             }
             return union;
         }
@@ -532,7 +569,8 @@ public static class SassScheduler
         {
             foreach (var pair in other.Write) if (!Write.TryGetValue(pair.Key, out int m) || (pair.Value & ~m) != 0) return false;
             foreach (var pair in other.Read) if (!Read.TryGetValue(pair.Key, out int m) || (pair.Value & ~m) != 0) return false;
-            for (int b = 0; b < Outstanding.Length; b++) if (other.Outstanding[b] > Outstanding[b]) return false;
+            for (int b = 0; b < Outstanding.Length; b++)
+                if (other.Outstanding[b] > Outstanding[b] || (other.Short[b] && !Short[b])) return false;
             return true;
         }
     }

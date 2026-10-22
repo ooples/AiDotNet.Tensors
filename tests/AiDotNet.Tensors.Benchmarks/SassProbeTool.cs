@@ -610,6 +610,32 @@ internal static class SassProbeTool
             bool identical = true;
             for (int i = 0; i < a0.Length && identical; i++)
                 identical = BitConverter.SingleToInt32Bits(a0[i]) == BitConverter.SingleToInt32Bits(a1[i]);
+            if (!identical && Environment.GetEnvironmentVariable("AIDOTNET_SASS_MISMATCH") == "1")
+            {
+                // Which elements differ and how: a scheduling hazard leaves a pattern (one channel, one tile edge...).
+                int count = 0;
+                var shown = new List<string>();
+                for (int i = 0; i < a0.Length; i++)
+                    if (BitConverter.SingleToInt32Bits(a0[i]) != BitConverter.SingleToInt32Bits(a1[i]))
+                    {
+                        if (shown.Count < 24) shown.Add(i + ":" + a0[i].ToString("G6", CultureInfo.InvariantCulture) + "/" + a1[i].ToString("G6", CultureInfo.InvariantCulture));
+                        count++;
+                    }
+                Console.WriteLine("  mismatches " + count + " of " + a0.Length + ": " + string.Join(" ", shown));
+                // Which PTX output plane (by a 784-element stride guess) each SASS plane matches, if any.
+                int plane = int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_SASS_PLANE"), out int pl) ? pl : 784;
+                for (int c = 0; c * plane < a1.Length && c < 16; c++)
+                {
+                    var matches = new List<int>();
+                    for (int d = 0; d * plane < a0.Length; d++)
+                    {
+                        bool same = true;
+                        for (int j = 0; j < plane && same; j++) same = a1[c * plane + j] == a0[d * plane + j];
+                        if (same) matches.Add(d);
+                    }
+                    Console.WriteLine("  sass plane " + c + " = ptx planes [" + string.Join(",", matches.Take(8)) + "]");
+                }
+            }
 
             var ptxSamples = new List<double>();
             var sassSamples = new List<double>();

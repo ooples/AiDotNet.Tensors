@@ -581,4 +581,40 @@ public class SassInstructionTests
             ?? throw new InvalidOperationException(SassScheduler.LastDecline);
         Assert.True(scheduled[0].Control.Stall >= 13, "LDGSTS issued " + scheduled[0].Control.Stall + " cycles after the ISETP.");
     }
+
+    // A dense 3x3 convolution's BSSY region (driver cubin, RTX 3080), with its nvdisasm text.
+    private static readonly SassInstruction LdgR34 = new(0x0000000620224981UL, 0x000168000c1e9900UL);   // @P4 LDG.E.CONSTANT R34, [R32.64]
+    private static readonly SassInstruction Bssy = new(0x0000029000007945UL, 0x000fd80003800000UL);     // BSSY B0, `(.L_x_0)
+    private static readonly SassInstruction Bsync = new(0x0000000000007941UL, 0x001fea0003800000UL);    // BSYNC B0
+
+    // LDG R34 and LDS R48 in flight, then BSSY B0 -> 5, the region (one FFMA), BSYNC, and readers of R34 and R48.
+    private static SassInstruction[] BssyRegion()
+    {
+        var ldg = LdgR34;
+        ldg.GuardPredicate = SassInstruction.TruePredicate;
+        var bssy = Bssy;
+        bssy.SetBits(32, 50, (5 - 3) * 16);
+        return new[] { ldg, Lds128, bssy, FfmaOf(9, 2, 5, 2), Bsync, FfmaOf(10, 34, 4, 10), FfmaOf(11, 48, 4, 11), Exit };
+    }
+
+    /// <summary>
+    /// sm_86 BSSY regions: BSSY issues its divergent branch 12 cycles on (1 made convolutions' weight staging wrong on
+    /// the RTX 3080); the short scoreboards (here the shared load's) are waited for at the BSSY; a global load stays in
+    /// flight through the region, BSYNC included, and is waited for by its first reader. sm_75 keeps the full wait.
+    /// </summary>
+    [Fact]
+    public void ABssyRegionKeepsGlobalLoadsInFlight()
+    {
+        var scheduled = SassScheduler.RecomputeControl(BssyRegion(), 86) ?? throw new InvalidOperationException(SassScheduler.LastDecline);
+        int load = scheduled[0].Control.WriteScoreboard, shared = scheduled[1].Control.WriteScoreboard;
+        Assert.NotEqual(load, shared);
+        Assert.True(scheduled[2].Control.Stall >= 12, "BSSY stalls " + scheduled[2].Control.Stall);
+        Assert.NotEqual(0, scheduled[2].Control.WaitMask & (1 << shared));
+        Assert.Equal(0, scheduled[2].Control.WaitMask & (1 << load));
+        Assert.Equal(0, scheduled[4].Control.WaitMask & (1 << load));
+        Assert.NotEqual(0, scheduled[5].Control.WaitMask & (1 << load));
+
+        var sm75 = SassScheduler.RecomputeControl(BssyRegion(), 75) ?? throw new InvalidOperationException(SassScheduler.LastDecline);
+        Assert.Equal(0x3f, sm75[2].Control.WaitMask);
+    }
 }
