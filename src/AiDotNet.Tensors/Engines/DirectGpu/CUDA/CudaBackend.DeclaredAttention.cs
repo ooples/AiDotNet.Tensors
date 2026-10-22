@@ -56,6 +56,13 @@ public sealed partial class CudaBackend
     // The causal bias of each (seqQ, seqK): 0 for a key at or before q + seqK - seqQ, AttentionMaskedLogit after.
     private readonly Dictionary<long, IGpuBuffer> _causalBiases = new();
 
+    // The paged key bias of each (pages * blockSize, seqLen): 0 inside the sequence, AttentionMaskedLogit in the
+    // last page's unused tail.
+    private readonly Dictionary<long, IGpuBuffer> _pagedKeyBiases = new();
+
+    // The paged prefill's causal bias of each (numQueries, pages * blockSize, startPos).
+    private readonly Dictionary<(int Queries, int Length, int StartPos), IGpuBuffer> _pagedCausalBiases = new();
+
     private Func<DeclaredKey, CodegenProgram>? _buildAttention;
     private Func<CodegenKernelSpec, PtxPassLowering?>? _lowerAttention, _lowerAttentionUnbounded;
 
@@ -277,6 +284,57 @@ public sealed partial class CudaBackend
         new(PagedAttentionDecodeKey(heads, kvHeads, headDim, blockSize, pages, blocks, scale), s_buildPagedDecode,
             s_pagedDecodeNames, new DeclaredBindings(blockTable, query, keyCache, valueCache, keyBias, output));
 
+    private static readonly string[] s_pagedPrefillNames =
+        { "block_table", "q", "kcache", "vcache", "causal_bias", "out" };
+
+    private static readonly Func<DeclaredKey, CodegenProgram> s_buildPagedPrefill =
+        key => CodegenBackendPrograms.PagedAttentionPrefill(key.D0, key.D1, key.D2, key.D3, key.D4, key.D5,
+            (int)key.Momentum, key.Epsilon);
+
+    /// <summary>
+    /// The key of a paged prefill: heads, kvHeads, headDim, blockSize, pages, blocks, the scale in the epsilon slot
+    /// and the query count in the momentum one -- the six dimension slots are full, and a query count is exact in a
+    /// float well past the extent the kernel guards admit.
+    /// </summary>
+    internal static DeclaredKey PagedAttentionPrefillKey(int heads, int kvHeads, int headDim, int blockSize, int pages,
+        int blocks, int numQueries, float scale) =>
+        new(DeclaredFamily.PagedAttentionPrefill, heads, kvHeads, headDim, blockSize, scale, numQueries, name: null,
+            d4: pages, d5: blocks);
+
+    /// <summary>
+    /// Paged attention's prefill step through its declared program, in CudaBackend.PagedAttentionPrefill's contract.
+    /// <paramref name="causalBias"/> is [numQueries, pages * blockSize]: 0 where query qi may see key k and the masked
+    /// logit elsewhere. False -- nothing launched -- when the route is off or the shape declines.
+    /// </summary>
+    internal bool TryDeclaredPagedAttentionPrefill(IGpuBuffer blockTable, IGpuBuffer query, IGpuBuffer keyCache,
+        IGpuBuffer valueCache, IGpuBuffer causalBias, IGpuBuffer output, int heads, int kvHeads, int headDim,
+        int blockSize, int pages, int blocks, int numQueries, float scale)
+    {
+        if (heads <= 0 || kvHeads <= 0 || headDim <= 0 || blockSize <= 0 || pages <= 0 || blocks <= 0 ||
+            numQueries <= 0)
+            return false;
+        if (heads % kvHeads != 0) return false;
+        long cacheElements = (long)blocks * blockSize * kvHeads * headDim;
+        long rows = (long)numQueries * heads;
+        long seqK = (long)pages * blockSize;
+        if (blockTable.Size < pages || (long)query.Size < rows * headDim ||
+            keyCache.Size < cacheElements || valueCache.Size < cacheElements ||
+            (long)causalBias.Size < (long)numQueries * seqK || (long)output.Size < rows * headDim)
+            return false;
+        return TryRunDeclaredProgram(
+            PagedAttentionPrefillKey(heads, kvHeads, headDim, blockSize, pages, blocks, numQueries, scale),
+            s_buildPagedPrefill, s_pagedPrefillNames,
+            new DeclaredBindings(blockTable, query, keyCache, valueCache, causalBias, output));
+    }
+
+    /// <summary>Paged attention's prefill step as a resident-program stage, in the same contract.</summary>
+    internal DeclaredResidentStage PagedAttentionPrefillStage(IGpuBuffer blockTable, IGpuBuffer query,
+        IGpuBuffer keyCache, IGpuBuffer valueCache, IGpuBuffer causalBias, IGpuBuffer output, int heads, int kvHeads,
+        int headDim, int blockSize, int pages, int blocks, int numQueries, float scale) =>
+        new(PagedAttentionPrefillKey(heads, kvHeads, headDim, blockSize, pages, blocks, numQueries, scale),
+            s_buildPagedPrefill, s_pagedPrefillNames,
+            new DeclaredBindings(blockTable, query, keyCache, valueCache, causalBias, output));
+
     // The cached causal bias for (seqQ, seqK), created on first use; null when first needed under a capture or when
     // it does not fit the scratch budget, with the reason in decline so the caller can record it. The caller holds
     // _directPtxLock.
@@ -382,9 +440,181 @@ public sealed partial class CudaBackend
         return bias;
     }
 
+    /// <summary>
+    /// The paged decode's key bias, [length] where length is <c>pages * blockSize</c>: 0 for a key position inside the
+    /// sequence and the masked logit for one in the last page's unused tail. The program reduces over every position
+    /// of every page it is given, and comparing a position against seqLen is not a quasi-affine index, so the tail is
+    /// masked through an input instead.
+    /// </summary>
+    internal static float[] PagedKeyBias(int length, int seqLen)
+    {
+        var bias = new float[length];
+        for (int k = seqLen; k < length; k++) bias[k] = (float)CodegenBackendPrograms.AttentionMaskedLogit;
+        return bias;
+    }
+
+    // The cached paged key bias for (length, seqLen), created on first use; null when first needed under a capture or
+    // when it does not fit the scratch budget, with the reason in decline. The caller holds _directPtxLock.
+    private IGpuBuffer? PagedKeyBiasBuffer(int length, int seqLen, out string? decline)
+    {
+        decline = null;
+        long cacheKey = ((long)length << 32) | (uint)seqLen;
+        if (_pagedKeyBiases.TryGetValue(cacheKey, out var buffer)) return buffer;
+        if (IsStreamCapturing())
+        {
+            decline = "A paged decode stage is first built outside capture.";
+            return null;
+        }
+        long bytes = checked((long)length * sizeof(float));
+        if (!DeclaredScratchFits(bytes, out decline)) return null;
+        try
+        {
+            buffer = AllocateBuffer(PagedKeyBias(length, seqLen));
+        }
+        catch (InvalidOperationException ex)
+        {
+            // As for the causal bias: the budget is an eighth of the device's TOTAL memory, so a bias that fits it can
+            // still exceed the free VRAM or the per-allocation cap, and both throw an InvalidOperationException. Every
+            // caller reads a false as "the hand-written kernel serves this call", so the throw must not escape.
+            System.Diagnostics.Trace.TraceWarning(
+                "[CudaBackend] the paged key bias for " + length.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                " positions could not be allocated; the declared route declines this shape: " + ex);
+            decline = "the paged key bias (" + length.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                " positions) could not be allocated, so the hand-written kernel, which needs none, serves this shape.";
+            return null;
+        }
+        _pagedKeyBiases[cacheKey] = buffer;
+        _declaredScratchBytes = checked(_declaredScratchBytes + bytes);
+        return buffer;
+    }
+
+    /// <summary>
+    /// The paged decode through its declared program, in CudaBackend.PagedAttentionDecode's contract: the backend
+    /// builds the key bias the program needs. False -- nothing launched -- when the route is off, the shape declines
+    /// or the bias cannot be built; the hand-written kernel then serves the call.
+    /// </summary>
+    private bool TryDeclaredPagedDecodeRouted(IGpuBuffer query, IGpuBuffer keyCache, IGpuBuffer valueCache,
+        IGpuBuffer blockTable, IGpuBuffer output, int heads, int kvHeads, int headDim, int blockSize, int seqLen,
+        float scale)
+    {
+        if (!DeclaredKernelsEnabled || heads <= 0 || kvHeads <= 0 || headDim <= 0 || blockSize <= 0 || seqLen <= 0 ||
+            heads % kvHeads != 0)
+            return false;
+        int pages = (seqLen + blockSize - 1) / blockSize;
+        long blockStride = (long)blockSize * kvHeads * headDim;
+        long blocks = keyCache.Size / blockStride;
+        if (blocks <= 0 || blocks > int.MaxValue) return false;
+        int length = checked(pages * blockSize);
+        IGpuBuffer? keyBias;
+        lock (_directPtxLock)
+        {
+            if ((keyBias = PagedKeyBiasBuffer(length, seqLen, out string? biasDecline)) is null)
+            {
+                if (biasDecline is not null)
+                    _declaredDeclines[PagedAttentionDecodeKey(heads, kvHeads, headDim, blockSize, pages, (int)blocks,
+                        scale)] = biasDecline;
+                return false;
+            }
+        }
+        return TryDeclaredPagedAttentionDecode(blockTable, query, keyCache, valueCache, keyBias, output, heads, kvHeads,
+            headDim, blockSize, pages, (int)blocks, scale);
+    }
+
+    /// <summary>
+    /// The paged prefill's causal bias, [numQueries, length] where length is <c>pages * blockSize</c>: 0 where query
+    /// qi (at logical position <c>startPos + qi</c>) may see key k, the masked logit elsewhere. One input carries both
+    /// the causal rule and the last page's unused tail, neither of which is a quasi-affine index.
+    /// </summary>
+    internal static float[] PagedCausalBias(int numQueries, int length, int startPos)
+    {
+        var bias = new float[checked(numQueries * length)];
+        for (int q = 0; q < numQueries; q++)
+        {
+            int last = startPos + q;
+            for (int k = last + 1; k < length; k++) bias[q * length + k] = (float)CodegenBackendPrograms.AttentionMaskedLogit;
+        }
+        return bias;
+    }
+
+    // The cached paged causal bias for (numQueries, length, startPos). The caller holds _directPtxLock.
+    private IGpuBuffer? PagedCausalBiasBuffer(int numQueries, int length, int startPos, out string? decline)
+    {
+        decline = null;
+        var cacheKey = (numQueries, length, startPos);
+        if (_pagedCausalBiases.TryGetValue(cacheKey, out var buffer)) return buffer;
+        if (IsStreamCapturing())
+        {
+            decline = "A paged prefill stage is first built outside capture.";
+            return null;
+        }
+        long bytes = checked((long)numQueries * length * sizeof(float));
+        if (!DeclaredScratchFits(bytes, out decline)) return null;
+        try
+        {
+            buffer = AllocateBuffer(PagedCausalBias(numQueries, length, startPos));
+        }
+        catch (InvalidOperationException ex)
+        {
+            // As for the causal bias: fitting the budget (an eighth of TOTAL memory) does not mean the allocation
+            // succeeds, and both the OOM and the per-allocation cap arrive as an InvalidOperationException. A throw
+            // here would skip the hand-written kernel that every caller falls back to.
+            System.Diagnostics.Trace.TraceWarning(
+                "[CudaBackend] the paged causal bias for " +
+                numQueries.ToString(System.Globalization.CultureInfo.InvariantCulture) + "x" +
+                length.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                " could not be allocated; the declared route declines this shape: " + ex);
+            decline = "the paged causal bias (" + (bytes >> 20).ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                " MiB) could not be allocated, so the hand-written kernel, which needs none, serves this shape.";
+            return null;
+        }
+        _pagedCausalBiases[cacheKey] = buffer;
+        _declaredScratchBytes = checked(_declaredScratchBytes + bytes);
+        return buffer;
+    }
+
+    /// <summary>
+    /// The paged prefill through its declared program, in CudaBackend.PagedAttentionPrefill's contract: the backend
+    /// builds the causal bias the program needs. False -- nothing launched -- when the route is off, the shape
+    /// declines or the bias cannot be built; the hand-written kernel then serves the call.
+    /// </summary>
+    private bool TryDeclaredPagedPrefillRouted(IGpuBuffer query, IGpuBuffer keyCache, IGpuBuffer valueCache,
+        IGpuBuffer blockTable, IGpuBuffer output, int heads, int kvHeads, int headDim, int blockSize, int numQueries,
+        int startPos, float scale)
+    {
+        if (!DeclaredKernelsEnabled || heads <= 0 || kvHeads <= 0 || headDim <= 0 || blockSize <= 0 ||
+            numQueries <= 0 || startPos < 0 || heads % kvHeads != 0)
+            return false;
+        // The key carries the query count in its float momentum slot, so a count past a float's exact integers would
+        // alias another shape's program. The kernel guards stop long before this, which makes it a cheap assertion.
+        if (numQueries > 1 << 24) return false;
+        int seqLen = checked(startPos + numQueries);
+        int pages = (seqLen + blockSize - 1) / blockSize;
+        long blockStride = (long)blockSize * kvHeads * headDim;
+        long blocks = keyCache.Size / blockStride;
+        if (pages <= 0 || blocks <= 0 || blocks > int.MaxValue) return false;
+        int length = checked(pages * blockSize);
+        IGpuBuffer? causalBias;
+        lock (_directPtxLock)
+        {
+            if ((causalBias = PagedCausalBiasBuffer(numQueries, length, startPos, out string? biasDecline)) is null)
+            {
+                if (biasDecline is not null)
+                    _declaredDeclines[PagedAttentionPrefillKey(heads, kvHeads, headDim, blockSize, pages, (int)blocks,
+                        numQueries, scale)] = biasDecline;
+                return false;
+            }
+        }
+        return TryDeclaredPagedAttentionPrefill(blockTable, query, keyCache, valueCache, causalBias, output, heads,
+            kvHeads, headDim, blockSize, pages, (int)blocks, numQueries, scale);
+    }
+
     private void DisposeCausalBiases()
     {
         foreach (var buffer in _causalBiases.Values) buffer.Dispose();
         _causalBiases.Clear();
+        foreach (var buffer in _pagedKeyBiases.Values) buffer.Dispose();
+        _pagedKeyBiases.Clear();
+        foreach (var buffer in _pagedCausalBiases.Values) buffer.Dispose();
+        _pagedCausalBiases.Clear();
     }
 }

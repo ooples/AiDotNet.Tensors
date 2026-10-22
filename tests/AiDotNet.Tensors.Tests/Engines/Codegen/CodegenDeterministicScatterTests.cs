@@ -84,6 +84,98 @@ public class CodegenDeterministicScatterTests
             }
     }
 
+    /// <summary>
+    /// The accumulating variant adds onto the destination's existing value, which the caller binds to both the seed
+    /// and the output. The scanning kernel it replaces does the same, one thread per destination cell.
+    /// </summary>
+    [Theory]
+    [InlineData(9, 4, 3)]
+    [InlineData(6, 1, 1)]
+    public void ScatterAddAccumulate_AddsOntoTheSeed(int count, int destinations, int features)
+    {
+        var indices = new int[count];
+        for (int i = 0; i < count; i++) indices[i] = i % 4 == 3 ? -1 : (i * 3) % destinations;
+        var source = new double[(long)count * features];
+        for (int i = 0; i < source.Length; i++) source[i] = ((i * 29) % 17) - 8;
+        var seed = new double[(long)destinations * features];
+        for (int i = 0; i < seed.Length; i++) seed[i] = 100 + i;
+        var idTensor = new double[count];
+        for (int i = 0; i < count; i++) idTensor[i] = indices[i];
+
+        var outputs = CodegenBackendPrograms.ScatterAddAccumulateDeterministic(count, destinations, features)
+            .Interpret(new Dictionary<string, double[]>
+                { ["indices"] = idTensor, ["source"] = source, ["seed"] = seed });
+
+        for (int d = 0; d < destinations; d++)
+            for (int f = 0; f < features; f++)
+            {
+                double expected = seed[d * features + f];
+                for (int i = 0; i < count; i++)
+                    if (indices[i] == d) expected += source[(long)i * features + f];
+                Assert.Equal(expected, outputs["out"][d * features + f], 12);
+            }
+    }
+
+    /// <summary>
+    /// The segment maximum and minimum over unsorted ids, with an empty segment left at each reduction's identity --
+    /// not at zero, which for a max over negative values would be a wrong answer that looks plausible.
+    /// </summary>
+    [Fact]
+    public void SegmentMaxAndMin_ReduceEachSegmentAndLeaveAnEmptyOneAtTheIdentity()
+    {
+        int[] ids = { 2, 0, 2, 3, 0, 2 };        // segment 1 receives nothing
+        const int Segments = 4, Features = 2;
+        var source = new double[ids.Length * Features];
+        // All negative, so a zero identity would win a maximum it should not.
+        for (int i = 0; i < source.Length; i++) source[i] = -(i + 1);
+        var idTensor = new double[ids.Length];
+        for (int i = 0; i < ids.Length; i++) idTensor[i] = ids[i];
+        var inputs = new Dictionary<string, double[]> { ["indices"] = idTensor, ["source"] = source };
+
+        var maxima = CodegenBackendPrograms.SegmentMax(ids.Length, Segments, Features).Interpret(inputs);
+        var minima = CodegenBackendPrograms.SegmentMin(ids.Length, Segments, Features).Interpret(inputs);
+
+        for (int s = 0; s < Segments; s++)
+            for (int f = 0; f < Features; f++)
+            {
+                double high = double.NegativeInfinity, low = double.PositiveInfinity;
+                for (int i = 0; i < ids.Length; i++)
+                    if (ids[i] == s)
+                    {
+                        high = Math.Max(high, source[i * Features + f]);
+                        low = Math.Min(low, source[i * Features + f]);
+                    }
+                Assert.Equal(high, maxima["out"][s * Features + f], 12);
+                Assert.Equal(low, minima["out"][s * Features + f], 12);
+            }
+        Assert.Equal(double.NegativeInfinity, maxima["out"][1 * Features]);
+        Assert.Equal(double.PositiveInfinity, minima["out"][1 * Features]);
+    }
+
+    /// <summary>The segment reductions must be atomic-free for the same reason the scatter-add is.</summary>
+    [Fact]
+    public void SegmentReductions_EmitNoAtomic()
+    {
+        foreach (var program in new[]
+                 {
+                     CodegenBackendPrograms.SegmentMax(16, 4, 8),
+                     CodegenBackendPrograms.SegmentMin(16, 4, 8),
+                     CodegenBackendPrograms.ScatterAddAccumulateDeterministic(16, 4, 8),
+                 })
+        {
+            var emitter = new PtxAffineEmitter();
+            string ptx = emitter.Emit(program.Passes[0], 7, 5);
+            Assert.Equal(0, emitter.AtomicStores);
+            Assert.DoesNotContain("red.global", ptx, StringComparison.Ordinal);
+            Assert.DoesNotContain("atom.", ptx, StringComparison.Ordinal);
+            Assert.True(emitter.IndirectIndexLoads > 0, program.Passes[0].Name + " must read the index tensor");
+        }
+        // The minimum reduces with a maximum over negated terms, so its padding identity must be -inf: a 0 fill
+        // would make an empty segment return -0 instead of +inf, and a segment of positives return 0.
+        var minPtx = new PtxAffineEmitter().Emit(CodegenBackendPrograms.SegmentMin(16, 4, 8).Passes[0], 7, 5);
+        Assert.Contains("0fFF800000", minPtx, StringComparison.Ordinal);
+    }
+
     /// <summary>A shifted index that clamped would hand every miss to destination 0.</summary>
     [Fact]
     public void AShiftedIndexRefusesToClamp()

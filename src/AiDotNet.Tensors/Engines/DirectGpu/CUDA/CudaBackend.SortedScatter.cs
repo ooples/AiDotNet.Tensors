@@ -171,6 +171,76 @@ public sealed partial class CudaBackend
         new(ScatterAddDeterministicKey(count, destinations, features), s_buildScatterAdd, s_scatterAddNames,
             new DeclaredBindings(indices, source, output));
 
+    private static readonly string[] s_scatterAddAccumulateNames = { "indices", "source", "seed", "out" };
+
+    private static readonly Func<DeclaredKey, CodegenProgram> s_buildScatterAddAccumulate =
+        key => CodegenBackendPrograms.ScatterAddAccumulateDeterministic(key.D0, key.D1, key.D2);
+
+    /// <summary>The key of a deterministic scatter-add onto a seed: count, destinations, features.</summary>
+    internal static DeclaredKey ScatterAddAccumulateKey(int count, int destinations, int features) =>
+        new(DeclaredFamily.ScatterAddAccumulateDeterministic, count, destinations, features, 0, 0, 0);
+
+    /// <summary>
+    /// The deterministic scatter-add onto the destination's existing value through its declared program (#890 phase
+    /// 4e): the same result, bit for bit, as scatter_add_accumulate_deterministic, with no atomic emitted. The seed
+    /// and the output are the same buffer, which is what accumulating in place means. Declines above the same
+    /// crossover as <see cref="TryDeclaredScatterAddDeterministic"/>.
+    /// </summary>
+    internal bool TryDeclaredScatterAddAccumulate(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer destination,
+        int count, int destinations, int features)
+    {
+        if (count <= 0 || destinations <= 0 || features <= 0 || indices.Size < count ||
+            (long)source.Size < (long)count * features ||
+            (long)destination.Size < (long)destinations * features)
+            return false;
+        if ((long)destinations * count > 1L << 22) return false;
+        return TryRunDeclaredProgram(ScatterAddAccumulateKey(count, destinations, features),
+            s_buildScatterAddAccumulate, s_scatterAddAccumulateNames,
+            new DeclaredBindings(indices, source, destination, destination));
+    }
+
+    /// <summary>The deterministic scatter-add onto a seed as a resident-program stage.</summary>
+    internal DeclaredResidentStage ScatterAddAccumulateStage(IGpuBuffer source, IGpuBuffer indices,
+        IGpuBuffer destination, int count, int destinations, int features) =>
+        new(ScatterAddAccumulateKey(count, destinations, features), s_buildScatterAddAccumulate,
+            s_scatterAddAccumulateNames, new DeclaredBindings(indices, source, destination, destination));
+
+    private static readonly Func<DeclaredKey, CodegenProgram> s_buildSegmentMax =
+        key => CodegenBackendPrograms.SegmentMax(key.D0, key.D1, key.D2);
+
+    private static readonly Func<DeclaredKey, CodegenProgram> s_buildSegmentMin =
+        key => CodegenBackendPrograms.SegmentMin(key.D0, key.D1, key.D2);
+
+    /// <summary>The key of a segment reduction: count, segments, features.</summary>
+    internal static DeclaredKey SegmentReduceKey(DeclaredFamily family, int count, int segments, int features) =>
+        new(family, count, segments, features, 0, 0, 0);
+
+    /// <summary>
+    /// A deterministic segment maximum or minimum through its declared program (#890 phase 4e): the sources reduced
+    /// per segment id, with no atomic emitted and no ordering assumption on the ids. With features = 1 and the ids a
+    /// sparse matrix's row indices this is the CSR segmented reduction over that matrix's rows. False -- nothing
+    /// launched -- when the route is off or the shape declines.
+    /// </summary>
+    internal bool TryDeclaredSegmentReduce(IGpuBuffer source, IGpuBuffer segmentIds, IGpuBuffer output, int count,
+        int segments, int features, bool maximum)
+    {
+        if (count <= 0 || segments <= 0 || features <= 0 || segmentIds.Size < count ||
+            (long)source.Size < (long)count * features || (long)output.Size < (long)segments * features)
+            return false;
+        if ((long)segments * count > 1L << 22) return false;
+        var family = maximum ? DeclaredFamily.SegmentMax : DeclaredFamily.SegmentMin;
+        return TryRunDeclaredProgram(SegmentReduceKey(family, count, segments, features),
+            maximum ? s_buildSegmentMax : s_buildSegmentMin, s_scatterAddNames,
+            new DeclaredBindings(segmentIds, source, output));
+    }
+
+    /// <summary>A deterministic segment maximum or minimum as a resident-program stage.</summary>
+    internal DeclaredResidentStage SegmentReduceStage(IGpuBuffer source, IGpuBuffer segmentIds, IGpuBuffer output,
+        int count, int segments, int features, bool maximum) =>
+        new(SegmentReduceKey(maximum ? DeclaredFamily.SegmentMax : DeclaredFamily.SegmentMin, count, segments, features),
+            maximum ? s_buildSegmentMax : s_buildSegmentMin, s_scatterAddNames,
+            new DeclaredBindings(segmentIds, source, output));
+
     private static readonly string[] s_indexSelectNames = { "indices", "source", "out" };
 
     private static readonly Func<DeclaredKey, CodegenProgram> s_buildIndexSelect =
