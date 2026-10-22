@@ -52,6 +52,29 @@ public sealed class GotoGemmRoutingTests
         Assert.False(GotoGemmFp32.PackBothUnderOccupies(m, threadBudget));
     }
 
+    // #653: short-M blocking gives about 1.5 tiles per thread (RunParallel claims tiles dynamically), within the
+    // [32, 128] tile-width clamp.
+    [Theory]
+    [InlineData(256, 1152, 16, 96)]
+    [InlineData(256, 1152, 32, 48)]
+    [InlineData(256, 1152, 8, 128)]
+    [InlineData(77, 1152, 16, 48)]
+    [InlineData(77, 1152, 32, 32)]
+    [InlineData(256, 4608, 16, 128)]
+    public void ShortMBlocks_GiveAboutOneAndAHalfTilesPerThread(int m, int n, int threads, int expectedNc)
+    {
+        int saved = CpuParallelSettings.MaxDegreeOfParallelism;
+        try
+        {
+            CpuParallelSettings.MaxDegreeOfParallelism = threads;
+            var (mc, nc, _) = GotoGemmFp32.ChooseParallelBlocks(m, n);
+            Assert.Equal(expectedNc, nc);
+            int tiles = ((m + mc - 1) / mc) * ((n + nc - 1) / nc);
+            if (nc > 32 && nc < 128) Assert.True(2 * tiles >= 3 * threads, $"{tiles} tiles for {threads} threads");
+        }
+        finally { CpuParallelSettings.MaxDegreeOfParallelism = saved; }
+    }
+
     // A thin-M no-transpose GEMM with deep K (and at least 128 rows) runs packed (GotoGemm). Its tile width depends on the
     // thread count, so the result may not: with n a multiple of 16 every element is the same K-blocked FMA chain at every
     // count. (N stays above 128, out of the JIT generator's box, which takes small shapes only on one thread.)

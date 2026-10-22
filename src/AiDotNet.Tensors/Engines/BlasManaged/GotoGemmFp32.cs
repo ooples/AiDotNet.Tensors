@@ -128,20 +128,26 @@ internal static class GotoGemmFp32
             //      the WHOLE K per tail-row, so for deep-K it is very expensive. mc=64 on m=256 = 4 blocks ×
             //      4-row tail craters deep-K to 32% MKL; mc=128 = 2 even blocks holds ~49%. So derive the
             //      block count from M (~128-row blocks), NOT from the core count.
-            //  (2) nc then fills the cores (ic*ceil(n/nc) ~ cores), narrow for narrow-N, clamped [32,128]
-            //      (a multiple of Nr=16) for microkernel efficiency + a small L2-resident B-panel.
             // Net: m=256,n=4608 374→455 GF (1.2x); m=256,n=1152 deep-K 251→~387 GF (1.5x) vs the old (120,128).
             int cores = CpuParallelSettings.MaxDegreeOfParallelism;
             if (cores <= 0) cores = System.Environment.ProcessorCount;
             int ic = System.Math.Max(1, (int)System.Math.Round(m / 128.0));
             int mc = (m + ic - 1) / ic;
-            int targetJc = System.Math.Max(1, (cores + ic - 1) / ic);
+            // (2) nc then gives ~1.5 tiles per core, narrow for narrow-N, clamped [32,128] (a multiple of Nr=16) for
+            //      microkernel efficiency + a small L2-resident B-panel. RunParallel hands tiles out dynamically, so
+            //      the spare half-tile per core absorbs uneven worker speed; at one tile per core, DiT's 256x1152x1152
+            //      projection got 18 tiles on 16 threads and waited on the two doubled-up workers (#653).
+            int targetJc = System.Math.Max(1, (TilesPerCoreTimes2 * cores + 2 * ic - 1) / (2 * ic));
             int nc = System.Math.Max(32, System.Math.Min(128, n / targetJc));
             nc = System.Math.Max(16, (nc / 16) * 16);
             return (mc, nc, kc);
         }
         return (120, 128, kc);                              // skewed / smaller
     }
+
+    // Short-M tiles per core, times 2 (3 = 1.5 tiles per core). Measured on the 3990X with dynamic tile claiming,
+    // M256 N1152 at 16 / 32 threads: 1.25x / 1.25x over one tile per core; M77 N1152 1.12-1.14x at 8-16 (#653).
+    private const int TilesPerCoreTimes2 = 3;
 
 #if NET5_0_OR_GREATER
     // Direct pack-vs-kernel timing (diagnostic; set s_timing during a profiling run only). Coarse
@@ -377,23 +383,35 @@ internal static class GotoGemmFp32
         bool timing = s_timing;
         long enter = timing ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         long callMax = 0, callMin = long.MaxValue;
-        CpuParallelSettings.ParallelForOrSerial(0, totalTiles, (long)m * n * k, tileIdx =>
+        // Each participant claims the next tile from a shared counter instead of a fixed run of tiles: the pool hands
+        // its chunks out round-robin with no stealing, so one slow or preempted worker held the whole GEMM (#653,
+        // 256x1152x3456 1.44x / 1.53x faster this way at 8 / 16 threads). Which thread runs a tile does not change
+        // its bits.
+        int degree = CpuParallelSettings.MaxDegreeOfParallelism;
+        if (degree <= 0) degree = Environment.ProcessorCount;
+        int claimers = Math.Min(degree, totalTiles);
+        int next = -1;
+        CpuParallelSettings.ParallelForOrSerial(0, claimers, (long)m * n * k, _ =>
         {
-            int ic = (int)(tileIdx % numIcL) * mcL;
-            int jc = (int)(tileIdx / numIcL) * ncL;
-            int effMc = Math.Min(mcL, mL - ic);
-            int effNc = Math.Min(ncL, nL - jc);
-            if (effMc <= 0 || effNc <= 0) return;
-            long start = timing ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-            RunTile((float*)ai, ldaL, (float*)bi, ldbL, (float*)ci, ldcL, ic, jc, effMc, effNc, kL, mcL, ncL, kcL);
-            if (timing)
+            int tileIdx;
+            while ((tileIdx = Interlocked.Increment(ref next)) < totalTiles)
             {
-                long dur = System.Diagnostics.Stopwatch.GetTimestamp() - start;
-                Interlocked.Add(ref s_tileTicks, dur);
-                long seenMax; while (dur > (seenMax = Volatile.Read(ref callMax)) && Interlocked.CompareExchange(ref callMax, dur, seenMax) != seenMax) { }
-                long seenMin; while (dur < (seenMin = Volatile.Read(ref callMin)) && Interlocked.CompareExchange(ref callMin, dur, seenMin) != seenMin) { }
-                Interlocked.Add(ref s_tileLagTicks, start - enter);
-                Interlocked.Increment(ref s_tileCount);
+                int ic = (tileIdx % numIcL) * mcL;
+                int jc = (tileIdx / numIcL) * ncL;
+                int effMc = Math.Min(mcL, mL - ic);
+                int effNc = Math.Min(ncL, nL - jc);
+                if (effMc <= 0 || effNc <= 0) continue;
+                long start = timing ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+                RunTile((float*)ai, ldaL, (float*)bi, ldbL, (float*)ci, ldcL, ic, jc, effMc, effNc, kL, mcL, ncL, kcL);
+                if (timing)
+                {
+                    long dur = System.Diagnostics.Stopwatch.GetTimestamp() - start;
+                    Interlocked.Add(ref s_tileTicks, dur);
+                    long seenMax; while (dur > (seenMax = Volatile.Read(ref callMax)) && Interlocked.CompareExchange(ref callMax, dur, seenMax) != seenMax) { }
+                    long seenMin; while (dur < (seenMin = Volatile.Read(ref callMin)) && Interlocked.CompareExchange(ref callMin, dur, seenMin) != seenMin) { }
+                    Interlocked.Add(ref s_tileLagTicks, start - enter);
+                    Interlocked.Increment(ref s_tileCount);
+                }
             }
         }, deterministicSafe: true);
         if (timing)
