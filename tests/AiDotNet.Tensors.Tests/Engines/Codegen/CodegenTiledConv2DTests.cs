@@ -141,7 +141,7 @@ public sealed class CodegenTiledConv2DTests
         Assert.Contains("fma.rn.f32", partialPtx);
         Assert.Contains("ld.global.nc.f32", combinePtx);
         Assert.Contains("add.rn.f32", combinePtx);
-        Assert.Contains("max.f32", combinePtx);
+        Assert.Contains("setp.le.f32", combinePtx);   // the NaN-propagating ReLU
 
         CodegenAutotuneIdentity identity = CodegenAutotuneIdentity.Create(
             spec, "test-device", 8, 6);
@@ -201,7 +201,7 @@ public sealed class CodegenTiledConv2DTests
         Assert.Contains("ld.shared.v4.f32", ptx);
         Assert.Contains("fma.rn.f32", ptx);
         Assert.Contains("add.rn.f32", ptx);
-        Assert.Contains("max.f32", ptx);
+        Assert.Contains("setp.le.f32", ptx);   // the NaN-propagating ReLU
         Assert.Contains("st.global.f32", ptx);
         Assert.DoesNotContain("st.global.v4.f32", ptx);
         Assert.DoesNotContain("mma.sync", ptx);

@@ -286,6 +286,9 @@ public sealed class CudaTunedKernelTests
     public void PublicSoftmax_ThroughTheRegistry_MatchesTheReferenceAndCachesADecision()
     {
         using var backend = RequireBackend();
+        // The declared softmax program (#890 phase 4a) serves Softmax ahead of the registry; this pins the registry's
+        // own path, so the declared route is off here (DeclaredProgramRouteTests covers it).
+        backend.DeclaredKernelsSwitch = false;
         TunedKernelMode? previousMode = TunedKernelPolicy.ModeOverride;
         bool previousPersist = TunedKernelPolicy.PersistDecisions;
         double previousBudget = TunedKernelPolicy.BudgetMilliseconds;

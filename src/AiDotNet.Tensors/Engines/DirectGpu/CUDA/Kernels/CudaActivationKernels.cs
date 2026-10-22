@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 // CUDA activation kernels and simple elementwise ops.
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
 {
@@ -804,8 +804,9 @@ extern ""C"" __global__ __launch_bounds__(256) void abs_vector(const float* __re
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    float x = A[idx];
-    B[idx] = x < 0.0f ? -x : x;
+    // fabsf clears the sign, as abs_vector_vec4 and the CPU engine do. `x < 0 ? -x : x` kept -0 and, with fast
+    // math flushing the comparison, every negative subnormal: the scalar and 128-bit kernels disagreed.
+    B[idx] = fabsf(A[idx]);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void exp_vector(const float* __restrict__ A, float* __restrict__ B, int size)
@@ -1494,7 +1495,8 @@ extern ""C"" __global__ __launch_bounds__(256) void min_vectors_vec4(const float
     float4 a = reinterpret_cast<const float4*>(A)[idx];
     float4 b = reinterpret_cast<const float4*>(B)[idx];
     float4 c;
-    c.x = fminf(a.x, b.x); c.y = fminf(a.y, b.y); c.z = fminf(a.z, b.z); c.w = fminf(a.w, b.w);
+    // a < b ? a : b, as min_vectors and the CPU engine (x86 MINPS); see max_vectors_vec4.
+    c.x = a.x < b.x ? a.x : b.x; c.y = a.y < b.y ? a.y : b.y; c.z = a.z < b.z ? a.z : b.z; c.w = a.w < b.w ? a.w : b.w;
     reinterpret_cast<float4*>(C)[idx] = c;
 }
 
@@ -1505,7 +1507,9 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
     float4 a = reinterpret_cast<const float4*>(A)[idx];
     float4 b = reinterpret_cast<const float4*>(B)[idx];
     float4 c;
-    c.x = fmaxf(a.x, b.x); c.y = fmaxf(a.y, b.y); c.z = fmaxf(a.z, b.z); c.w = fmaxf(a.w, b.w);
+    // a > b ? a : b, as max_vectors and the CPU engine (x86 MAXPS: the second operand when either is NaN). fmaxf
+    // dropped the NaN instead, so a NaN's fate depended on whether the buffers happened to be 16-byte aligned.
+    c.x = a.x > b.x ? a.x : b.x; c.y = a.y > b.y ? a.y : b.y; c.z = a.z > b.z ? a.z : b.z; c.w = a.w > b.w ? a.w : b.w;
     reinterpret_cast<float4*>(C)[idx] = c;
 }
 ";

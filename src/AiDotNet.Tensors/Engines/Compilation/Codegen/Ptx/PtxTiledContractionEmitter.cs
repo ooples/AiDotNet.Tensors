@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 
 using System;
 using System.Globalization;
@@ -16,6 +16,8 @@ namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
 /// </remarks>
 public sealed class PtxTiledContractionEmitter
 {
+    private bool _async = true;
+
     private const int FixedR = 16;
     private const int FixedRd = 8;
     private const int FixedP = 4;
@@ -45,8 +47,8 @@ public sealed class PtxTiledContractionEmitter
     /// <summary>Plans and emits one exact FP32 contraction.</summary>
     public string Emit(CodegenKernelSpec spec, int computeMajor, int computeMinor)
     {
-        if (computeMajor < 8)
-            throw new NotSupportedException("The double-buffered tiled path requires cp.async on sm_80+.");
+        // sm_80+ stages tiles with cp.async; Turing (sm_75) with a synchronous register round trip.
+        _async = PtxSharedCopy.HasAsyncCopy(computeMajor);
         if (!CodegenTiledContractionPlan.TryCreate(
                 spec, _schedule, out var possible, out string reason))
             throw new NotSupportedException("This spec cannot use the tiled contraction: " + reason);
@@ -112,8 +114,8 @@ public sealed class PtxTiledContractionEmitter
         // Prologue. Every slab is a whole tile, so each 16-byte async copy is valid and no
         // zero-fill convention is needed.
         EmitAsyncStage(plan, step: 0, buffer: 0);
-        L("cp.async.commit_group;");
-        L("cp.async.wait_group 0;");
+        PtxSharedCopy.Commit(_async, L);
+        PtxSharedCopy.Wait(_async, L);
         L("bar.sync 0;");
 
         for (int step = 0; step < plan.Steps; step++)
@@ -122,7 +124,7 @@ public sealed class PtxTiledContractionEmitter
             if (step + 1 < plan.Steps)
             {
                 EmitAsyncStage(plan, step + 1, 1 - current);
-                L("cp.async.commit_group;");
+                PtxSharedCopy.Commit(_async, L);
             }
 
             EmitCompute(plan, current, accumulators);
@@ -131,7 +133,7 @@ public sealed class PtxTiledContractionEmitter
             {
                 // The barrier both publishes the next slab and proves every warp has
                 // stopped reading the buffer that will be reused two steps later.
-                L("cp.async.wait_group 0;");
+                PtxSharedCopy.Wait(_async, L);
                 L("bar.sync 0;");
             }
         }
@@ -205,7 +207,7 @@ public sealed class PtxTiledContractionEmitter
             L($"add.u64 {source}, %rd0, {bytes};");
             L($"mul.wide.u32 {sharedBytes}, {index}, 16;");
             L($"add.u64 {destination}, %rd3, {sharedBytes};");
-            L($"@{valid} cp.async.ca.shared.global [{destination}+{I(bufferBase)}], [{source}], 16;");
+            PtxSharedCopy.Emit(_async, L, NextF, NextP, $"{destination}+{I(bufferBase)}", source, 16, valid);
         }
 
         for (int pass = 0; pass < streamPasses; pass++)
@@ -224,7 +226,7 @@ public sealed class PtxTiledContractionEmitter
             L($"add.u64 {source}, %rd1, {bytes};");
             L($"mul.wide.u32 {sharedBytes}, {index}, 16;");
             L($"add.u64 {destination}, %rd3, {sharedBytes};");
-            L($"@{valid} cp.async.ca.shared.global [{destination}+{I(streamSharedBase)}], [{source}], 16;");
+            PtxSharedCopy.Emit(_async, L, NextF, NextP, $"{destination}+{I(streamSharedBase)}", source, 16, valid);
         }
     }
 
@@ -394,7 +396,12 @@ public sealed class PtxTiledContractionEmitter
                 if (scale is not null)
                     L($"mul.rn.f32 {accumulators[i, j]}, {accumulators[i, j]}, {scale};");
                 if (activation == CodegenActivationKind.ReLU)
-                    L($"max.f32 {accumulators[i, j]}, {accumulators[i, j]}, 0f00000000;");
+                {
+                    // NaN propagates, as PtxAffineEmitter's ReLU and the hand-written relu_nan_safe.
+                    string nonPositive = NextP();
+                    L($"setp.le.f32 {nonPositive}, {accumulators[i, j]}, 0f00000000;");
+                    L($"selp.f32 {accumulators[i, j]}, 0f00000000, {accumulators[i, j]}, {nonPositive};");
+                }
                 L($"mad.lo.u32 {n}, %r6, {I(plan.ThreadTileN)}, {I(j)};");
                 L($"mad.lo.u32 {element}, {localM}, {I(plan.N)}, %r11;");
                 L($"add.u32 {element}, {element}, {n};");

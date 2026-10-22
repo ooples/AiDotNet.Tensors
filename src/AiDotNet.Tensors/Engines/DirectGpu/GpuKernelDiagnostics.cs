@@ -365,6 +365,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
                 // Residency first: when a process dies holding gigabytes of device buffers, that is
                 // usually the story, and it is invisible in a managed heap dump.
                 text.AppendLine("# buffers: " + DescribeBufferResidency());
+                text.AppendLine("# peak local bytes/thread (direct PTX): " +
+                    PeakLocalBytesPerThread.ToString(CultureInfo.InvariantCulture));
                 foreach (var line in RecentLaunches()) text.AppendLine(line);
                 File.WriteAllText(fullPath, text.ToString());
             }
@@ -464,6 +466,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
         private static long _liveBufferBytes;
         private static long _peakLiveBufferBytes;
         private static long _totalBuffersAllocated;
+        private static long _peakLocalBytesPerThread;
 
         /// <summary>Device buffers currently allocated and not yet released.</summary>
         public static long LiveBufferCount => Interlocked.Read(ref _liveBufferCount);
@@ -476,6 +479,27 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
 
         /// <summary>Every buffer allocated so far, released or not.</summary>
         public static long TotalBuffersAllocated => Interlocked.Read(ref _totalBuffersAllocated);
+
+        /// <summary>
+        /// The largest local bytes/thread the JIT reported for any direct-PTX kernel this process loaded, 0 when
+        /// none spilled. A module linked with a math library is allowed a budget for the library's own call stack;
+        /// this is the measured figure that budget can be calibrated against, which the rejection message alone
+        /// cannot give because it is only printed for kernels that exceed it.
+        /// </summary>
+        public static long PeakLocalBytesPerThread => Interlocked.Read(ref _peakLocalBytesPerThread);
+
+        /// <summary>Records the local bytes/thread the JIT reported for one kernel. One interlocked read in the
+        /// common case; safe to call on every function load.</summary>
+        public static void RecordLocalBytesPerThread(long bytes)
+        {
+            long peak = Interlocked.Read(ref _peakLocalBytesPerThread);
+            while (bytes > peak)
+            {
+                long seen = Interlocked.CompareExchange(ref _peakLocalBytesPerThread, bytes, peak);
+                if (seen == peak) break;
+                peak = seen;
+            }
+        }
 
         /// <summary>
         /// Records a device buffer allocation. Two interlocked adds; safe to call on every allocation.

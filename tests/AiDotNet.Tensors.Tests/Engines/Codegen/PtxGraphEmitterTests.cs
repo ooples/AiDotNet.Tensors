@@ -35,7 +35,7 @@ public class PtxGraphEmitterTests
         PtxCodegenKernel kernel = Assert.IsType<PtxCodegenKernel>(result.Kernel);
         Assert.NotNull(result.Source);
         Assert.Contains(".visible .entry", result.Source, StringComparison.Ordinal);
-        Assert.Contains("max.f32", result.Source, StringComparison.Ordinal);   // the ReLU
+        Assert.Contains("setp.le.f32", result.Source, StringComparison.Ordinal);   // the NaN-propagating ReLU
         Assert.Equal(CodegenTarget.DirectPtx, kernel.Target);
         Assert.Equal(CodegenNativeCompilationKind.CudaPtxModuleLoader,
             kernel.RequiredRuntime.Compilation);

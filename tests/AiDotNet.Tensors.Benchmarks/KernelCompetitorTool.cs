@@ -26,8 +26,9 @@ internal static class KernelCompetitorTool
             Path.Combine("artifacts", "competitor-ratios.tsv"));
         string selector = KernelToolArgs.Selector(args);
         int selected = string.Equals(selector, "all", StringComparison.OrdinalIgnoreCase)
-            ? CodegenKernelCatalog.All.Count
-            : CodegenKernelCatalog.Find(selector) is null ? 0 : 1;
+            ? CodegenKernelCatalog.All.Count + CodegenKernelCatalog.Programs.Count
+            : CodegenKernelCatalog.Find(selector) is null &&
+              CodegenKernelCatalog.FindProgram(selector) is null ? 0 : 1;
         KernelToolArgs.RequireNonEmptySelection(selector, selected, "kernel-competitor");
         string maxSpread = ValueOf(args, "--max-spread-pct") ?? "5.0";
         if (!double.TryParse(maxSpread, NumberStyles.Float, CultureInfo.InvariantCulture,

@@ -229,6 +229,7 @@ public sealed partial class CudaBackend : IInstantNgpBackend, IFrexpBackend, IRe
     {
         int total = checked(outerSize * indexAxis * innerSize);
         if (total <= 0) return;
+        if (TryDeclaredIndexSelect(source, indices, output, outerSize, sourceAxis, indexAxis, innerSize)) return;
         var kernel = ResolveInstantNgpKernel("resident_index_select");
         using var _ = PushContext();
         IntPtr s = source.Handle, i = indices.Handle, o = output.Handle;

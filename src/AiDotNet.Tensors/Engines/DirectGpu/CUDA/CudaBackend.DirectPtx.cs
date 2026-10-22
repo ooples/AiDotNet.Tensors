@@ -6777,6 +6777,7 @@ public sealed partial class CudaBackend
             foreach (DirectPtxCodegenKernel compiled in _directPtxCodegenKernels.Values)
                 compiled.Dispose();
             _directPtxCodegenKernels.Clear();
+            DisposeDeclaredPrograms();
             LastCodegenNativeArtifactSizeBytes = 0;
             _directPtxRuntime?.Dispose();
             _directPtxRuntime = null;

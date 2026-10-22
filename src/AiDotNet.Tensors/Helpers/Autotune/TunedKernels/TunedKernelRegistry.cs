@@ -46,6 +46,18 @@ public enum TunedKernelOp
     OptimizerUpdate,
     /// <summary>Reduction.</summary>
     Reduction,
+    /// <summary>Depthwise 2-D convolution forward, NCHW (channel multiplier 1).</summary>
+    DepthwiseConv2DForward,
+    /// <summary>Depthwise 2-D convolution gradient with respect to the input.</summary>
+    DepthwiseConv2DBackwardData,
+    /// <summary>Depthwise 2-D convolution gradient with respect to the filter.</summary>
+    DepthwiseConv2DBackwardFilter,
+    /// <summary>Transposed 2-D convolution forward, NCHW, weights [inC, outC, kH, kW].</summary>
+    ConvTranspose2DForward,
+    /// <summary>Transposed 2-D convolution gradient with respect to the input.</summary>
+    ConvTranspose2DBackwardData,
+    /// <summary>Transposed 2-D convolution gradient with respect to the filter.</summary>
+    ConvTranspose2DBackwardFilter,
 }
 
 /// <summary>Where a registered candidate came from.</summary>

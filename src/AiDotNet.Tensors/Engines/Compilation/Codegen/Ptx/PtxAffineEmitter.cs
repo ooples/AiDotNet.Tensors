@@ -252,6 +252,77 @@ public sealed partial class PtxAffineEmitter
     public bool EnableSharedStaging { get; set; } = true;
 
     /// <summary>
+    /// Lowers an eligible reduction as one WARP per output instead of one thread. Default on.
+    /// </summary>
+    /// <remarks>
+    /// The 32 lanes read CONSECUTIVE elements of the contiguous reduction axis -- term k is
+    /// read by lane <c>k mod 32</c> on trip <c>k / 32</c> -- and a butterfly shuffle combines
+    /// their partials, after which lane 0 alone runs the epilogue and stores. The caller
+    /// still passes the ORIGINAL spec, and the oracle is still that spec. Eligibility and the
+    /// rewrite are <see cref="CodegenWarpReduction"/>. Off-switch kept for paired A/B.
+    /// </remarks>
+    public bool EnableWarpReduction { get; set; } = true;
+
+    /// <summary>
+    /// Emits a streaming pointwise spec through the warp-per-row kernel and its 128-bit
+    /// accesses (<see cref="CodegenRowFusion.TryPlanStreaming"/>). Default on; off-switch
+    /// kept for paired A/B. The parameters are the spec's own, in order.
+    /// </summary>
+    public bool EnableStreamingRows { get; set; } = true;
+
+    /// <summary>
+    /// Emits an expression body, one rounded instruction per node, and returns a FRESH
+    /// register: an in-place activation must never write over a loaded or held operand.
+    /// </summary>
+    private string EmitBody(CodegenExpr body, Func<int, string> operand)
+    {
+        string result = body.Lower(operand, F32, (op, a, b) =>
+        {
+            string d = NextF();
+            L(b is null ? $"{op} {d}, {a};" : $"{op} {d}, {a}, {b};");
+            return d;
+        }, EmitCall, index => _scalarRegisters is { } scalars && index < scalars.Length
+            ? scalars[index]
+            : throw new NotSupportedException("This kernel has no runtime scalar parameter " + index + "."));
+        string fresh = NextF();
+        L($"mov.f32 {fresh}, {result};");
+        return fresh;
+    }
+
+    // Library functions the kernel being emitted calls, in first-call order; Assemble declares them.
+    private readonly List<CodegenLibraryFunction> _calledFunctions = new();
+
+    // The registers holding the kernel's runtime scalar parameters (elementwise kernels only).
+    private string[]? _scalarRegisters;
+
+    /// <summary>The library functions the last emitted kernel calls: the module must be linked with them.</summary>
+    public IReadOnlyList<CodegenLibraryFunction> CalledFunctions { get; private set; } = Array.Empty<CodegenLibraryFunction>();
+
+    // A call by the PTX ABI: each float argument and the result in its own .param, inside a scope.
+    private string EmitCall(CodegenLibraryFunction function, string[] arguments)
+    {
+        if (!_calledFunctions.Exists(f => f.Symbol == function.Symbol)) _calledFunctions.Add(function);
+        string result = NextF();
+        _body.Append("    {\n");
+        for (int i = 0; i < arguments.Length; i++)
+            _body.Append("    .param .b32 aidn_arg").Append(I(i)).Append(";\n");
+        _body.Append("    .param .b32 aidn_ret;\n");
+        for (int i = 0; i < arguments.Length; i++)
+            _body.Append("    st.param.f32 [aidn_arg").Append(I(i)).Append("], ").Append(arguments[i]).Append(";\n");
+        _body.Append("    call.uni (aidn_ret), ").Append(function.Symbol).Append(", (");
+        for (int i = 0; i < arguments.Length; i++) _body.Append(i == 0 ? "" : ", ").Append("aidn_arg").Append(I(i));
+        _body.Append(");\n")
+             .Append("    ld.param.f32 ").Append(result).Append(", [aidn_ret];\n")
+             .Append("    }\n");
+        return result;
+    }
+
+    /// <summary>True when the last emission used the warp-per-output lowering.</summary>
+    public bool WarpReduced { get; private set; }
+
+    private const int WarpLanes = CodegenWarpReduction.Lanes;
+
+    /// <summary>
     /// Cooperatively loads a block-invariant operand into shared memory, once per
     /// strip-mine iteration, and returns the register holding the shared base address.
     /// </summary>
@@ -422,8 +493,14 @@ public sealed partial class PtxAffineEmitter
                 return x;
 
             case CodegenActivationKind.ReLU:
-                L($"max.f32 {x}, {x}, 0f00000000;");
+            {
+                // NaN propagates, as the hand-written relu_nan_safe: max.f32 would return 0 for NaN
+                // (max.NaN exists only from sm_80). x <= 0 is false for NaN, so NaN is kept.
+                string nonPositive = NextP();
+                L($"setp.le.f32 {nonPositive}, {x}, 0f00000000;");
+                L($"selp.f32 {x}, 0f00000000, {x}, {nonPositive};");
                 return x;
+            }
 
             case CodegenActivationKind.Tanh:
                 return EmitTanh(x, Log2E, One);
@@ -910,6 +987,13 @@ public sealed partial class PtxAffineEmitter
     public bool EnableVectorLoads { get; set; } = true;
 
     /// <summary>
+    /// Tiles a reduction that has no operand reuse four outputs wide along its contiguous output axis, so each term is
+    /// read with one vector load for four outputs (a split's combine: each output sums 8-16 partials). Off by default:
+    /// the same forcing on pure streaming kernels measured slower (see the note where the tile is chosen).
+    /// </summary>
+    public bool VectorTileReductions { get; set; }
+
+    /// <summary>
     /// True when <paramref name="axis"/> indexes the binding's unit-stride dimension
     /// directly and covers all of it -- the condition under which four consecutive
     /// values of that axis are four consecutive, in-range, aligned floats.
@@ -943,7 +1027,10 @@ public sealed partial class PtxAffineEmitter
                 I(width) + ".");
 
         string offset = EmitOffset(binding, axisReg, reductionValues, reductionAxes, out string? pred);
-        if (pred != null)
+        // The vector runs along the unit-stride dimension, which the caller proved in range, so a guard can only come
+        // from a data-dependent index on another dimension (an embedding row): it is the same for all four lanes, and
+        // the whole vector is predicated on it, keeping the out-of-range fill when it fails.
+        if (pred != null && (!binding.HasIndirection || binding.NeedsConversion))
             throw new InvalidOperationException(
                 "A vectorised binding must be provably in range; " + binding.Name + " produced a guard.");
 
@@ -982,6 +1069,11 @@ public sealed partial class PtxAffineEmitter
             L($"shr.b32 {hiHigh}, {hi}, 16;");
             EmitWiden(binding.ElementType, hiHigh, regs[3]);
         }
+        else if (pred != null)
+        {
+            foreach (string reg in regs) L($"mov.f32 {reg}, {_outOfRangeFill};");
+            L($"@{pred} ld.global.v4.f32 {{{regs[0]}, {regs[1]}, {regs[2]}, {regs[3]}}}, [{address}];");
+        }
         else
         {
             L($"ld.global.v4.f32 {{{regs[0]}, {regs[1]}, {regs[2]}, {regs[3]}}}, [{address}];");
@@ -1006,6 +1098,24 @@ public sealed partial class PtxAffineEmitter
         // PtxAffineEmitter.Algebra.cs for why that separation is deliberate rather than lazy.
         if (spec.Algebra != CodegenAlgebra.Real)
             return EmitAlgebraic(spec, computeMajor, computeMinor);
+
+        if (EnableStreamingRows && CodegenRowFusion.TryPlanStreaming(spec) is { } stream)
+            return EmitRowProgram(stream, spec.Name, computeMajor, computeMinor);
+
+        if (ImplicitGemm && PlanImplicitGemm(spec, out _) is { } gemm)
+            return EmitImplicitGemm(spec, computeMajor, computeMinor, gemm);
+
+        // WARP PER OUTPUT. Everything below emits the lane-interleaved spec unchanged except
+        // for three things the lowering forbids -- tiling, staging and a block that is not a
+        // whole number of warps -- and the shuffle that closes the reduction.
+        int warpLaneAxis = -1;
+        WarpReduced = false;
+        if (EnableWarpReduction && CodegenWarpReduction.TryLaneInterleave(spec, out var laneSpec))
+        {
+            spec = laneSpec;
+            warpLaneAxis = spec.Space.Axes.Count - 1;
+            WarpReduced = true;
+        }
 
         var space = spec.Space;
         var axes = space.Axes;
@@ -1056,8 +1166,18 @@ public sealed partial class PtxAffineEmitter
         // reuse instead of traffic.
         var tileAxes = new List<int>();
         var tileFactors = new List<int>();
-        if (Coarsening > 1 && parallel.Length > 0)
+        // A warp lowering must not tile: a tile would give one thread several lanes'
+        // worth of the interleaved axis, and the shuffle assumes one lane per thread.
+        if (Coarsening > 1 && parallel.Length > 0 && warpLaneAxis < 0)
             SelectTile(spec, axes, parallel, Coarsening, MaxTileLanes, tileAxes, tileFactors);
+        // Opt-in (see VectorTileReductions): a reduction with no reuse to tile for still reads four contiguous outputs'
+        // terms with one vector load each.
+        if (VectorTileReductions && tileAxes.Count == 0 && reduction.Length > 0 && parallel.Length > 0 &&
+            warpLaneAxis < 0 && axes[parallel[parallel.Length - 1]].Extent % VectorWidth == 0)
+        {
+            tileAxes.Add(parallel[parallel.Length - 1]);
+            tileFactors.Add(VectorWidth);
+        }
 
         // NOT COARSENED FOR STREAMING, AND THAT IS A MEASURED DECISION. SelectTile
         // minimises loads-per-MAC, so a kernel with no reduction has no reuse to find and it
@@ -1098,7 +1218,9 @@ public sealed partial class PtxAffineEmitter
 
         // Block size derived so a block's threads all agree on the slow axes, which is
         // the precondition for staging a block-invariant operand in shared memory.
-        int blockThreads = EnableSharedStaging
+        // A derived block need not be a whole number of warps, and a warp that straddles two
+        // blocks would shuffle with lanes that are not there.
+        int blockThreads = EnableSharedStaging && warpLaneAxis < 0
             ? ChooseBlockThreads(axes, parallel, tileAxes, tileFactors, out var varyingAxes)
             : PassThroughBlock(out varyingAxes);
 
@@ -1183,7 +1305,7 @@ public sealed partial class PtxAffineEmitter
 
         bool twoDimensional = false;
         int blockX = blockThreads, blockY = 1;
-        if (EnableInputStaging && dataOperand >= 0 &&
+        if (EnableInputStaging && dataOperand >= 0 && warpLaneAxis < 0 &&
             CanStageInput(spec, axes, tileAxes, tileFactors, dataOperand, out int bx, out int by))
         {
             twoDimensional = true;
@@ -1313,7 +1435,7 @@ public sealed partial class PtxAffineEmitter
         CheckLimits(spec, blocks, threadCount);
         LaunchBlocks = (uint)blocks;
 
-        _sb.Clear(); _body.Clear(); _r = _f = _p = _rd = 0; EmittedLoads = 0; ElidedGuards = 0;
+        _sb.Clear(); _body.Clear(); _calledFunctions.Clear(); _r = _f = _p = _rd = 0; EmittedLoads = 0; ElidedGuards = 0;
         IndirectIndexLoads = 0; AtomicStores = 0; ExtraOutputStores = 0; VectorisedStores = 0;
         _inputBindings = spec.Inputs;
         // Reset with the register counters: a label counter that survives between
@@ -1637,6 +1759,7 @@ public sealed partial class PtxAffineEmitter
             {
                 string? product = null;
                 string? productPred = null;
+                var operandValue = new Dictionary<int, string>();
                 foreach (int inputIdx in spec.ProductInputs)
                 {
                     var binding = spec.Inputs[inputIdx];
@@ -1670,7 +1793,13 @@ public sealed partial class PtxAffineEmitter
                         // lane-unaware: weights[k, c] is unit-stride in c, so it took
                         // this path, and once k was also tiled every lane received lane
                         // zero's k. Keying it like every other load fixes that.
-                        int group = reductionValues[innermost] / vectorGroup;
+                        // The group is numbered by TRIP, not by the innermost axis alone: the
+                        // cache outlives a trip, and with further unrolled reduction axes the
+                        // innermost axis restarts at 0 for each of their values. Keyed by its
+                        // own value, every (n, oh) of a depthwise weight gradient reused the
+                        // first one's dOut vector. The innermost axis varies fastest and its
+                        // extent is a multiple of the width, so trip / width names one group.
+                        long group = t / vectorGroup;
                         string key = LoadKey(inputIdx, binding, tileAxes, laneOffsets[l], -1) +
                                      "#g" + group.ToString(CultureInfo.InvariantCulture);
                         if (!reductionVectorCache.TryGetValue(key, out string[]? rvec))
@@ -1735,7 +1864,14 @@ public sealed partial class PtxAffineEmitter
                             scalarCache[key] = (value, pred);
                         }
                     }
-                    if (product is null) { product = value; productPred = pred; }
+                    if (spec.Body is not null)
+                    {
+                        // Loaded exactly as a product operand would be; the expression,
+                        // not a multiply chain, combines them below.
+                        operandValue[inputIdx] = value;
+                        productPred = productPred is null ? pred : AndPred(productPred, pred);
+                    }
+                    else if (product is null) { product = value; productPred = pred; }
                     else
                     {
                         string mul = NextF();
@@ -1744,6 +1880,8 @@ public sealed partial class PtxAffineEmitter
                         productPred = AndPred(productPred, pred);
                     }
                 }
+                if (spec.Body is not null)
+                    product = EmitBody(spec.Body, input => operandValue[input]);
 
                 // The pre-reduction slot: shift, then transform, per TERM. An epilogue
                 // activation cannot do this -- it runs once on the finished accumulator,
@@ -1780,6 +1918,26 @@ public sealed partial class PtxAffineEmitter
                         L($"ex2.approx.f32 {transformed}, {scaledT};");
                     }
                     product = transformed;
+                }
+
+                // The oracle (CodegenKernelSpec.Interpret) gives an out-of-range tap the identity
+                // OF THE REDUCTION and skips the pre-bias and the pre-reduce for that term
+                // entirely. The emitter can leave the select out only where the guarded load's
+                // fill reaches the accumulator unchanged -- a bare product of operands, where
+                // 0 * x == 0 under Sum (a Max over more than one operand is refused above). An
+                // expression body maps the fill to anything (a - b yields -b), the pre-bias adds
+                // to it, and the pre-reduce transforms it (exp(0) == 1), so each of those has to
+                // put the identity back. Today's declared bodies bind in range, which is why this
+                // is a latent public-spec defect rather than a wrong gradient in the attention,
+                // normalisation or convolution routes.
+                if (productPred is not null &&
+                    (spec.Body is not null || spec.PreBiasInput.HasValue ||
+                     spec.PreReduce != CodegenPreReduceOp.None))
+                {
+                    string identity = NextF(), kept = NextF();
+                    L($"mov.f32 {identity}, {_outOfRangeFill};");
+                    L($"selp.f32 {kept}, {product!}, {identity}, {productPred};");
+                    product = kept;
                 }
 
                 // An out-of-range tap contributes the additive identity; the guarded
@@ -1834,6 +1992,32 @@ public sealed partial class PtxAffineEmitter
             accs = (string[])accsFixed.Clone();
         }
 
+        if (warpLaneAxis >= 0)
+        {
+            // Every lane of the warp is live here: the thread count is outputs x 32 and the
+            // block a multiple of 32, so the bounds guard retires whole warps, never part of
+            // one. The butterfly leaves the full reduction in EVERY lane; lane 0 then runs
+            // the epilogue alone, so each output is written once.
+            if (blockThreads % WarpLanes != 0)
+                throw new InvalidOperationException(
+                    "Warp reduction needs a whole number of warps per block; got " + I(blockThreads) + ".");
+            string combineOp = spec.Reduce == CodegenReduceKind.Max ? "max.f32" : "add.rn.f32";
+            string acc = accs[0];
+            for (int offset = WarpLanes / 2; offset >= 1; offset /= 2)
+            {
+                string bits = NextR(), otherBits = NextR(), other = NextF(), combined = NextF();
+                L($"mov.b32 {bits}, {acc};");
+                L($"shfl.sync.bfly.b32 {otherBits}, {bits}, {I(offset)}, 31, 0xffffffff;");
+                L($"mov.b32 {other}, {otherBits};");
+                L($"{combineOp} {combined}, {acc}, {other};");
+                acc = combined;
+            }
+            accs[0] = acc;
+            string notLeader = NextP();
+            L($"setp.ne.u32 {notLeader}, {axisReg[warpLaneAxis]}, 0;");
+            L($"@{notLeader} bra END;");
+        }
+
         // Epilogue and store, per lane. Bias and scale are hoisted when they do not
         // reference the coarsened axis, which for a channel-indexed bias is always.
         // The epilogue caches on the SAME key as the body. Hoisting it to lane 0 whenever
@@ -1874,6 +2058,12 @@ public sealed partial class PtxAffineEmitter
                 L($"mul.rn.f32 {scaled}, {acc}, {F32(spec.ReduceScale)};");
                 acc = scaled;
             }
+            if (spec.ReduceOffset != 0.0)
+            {
+                string offset = NextF();
+                L($"add.rn.f32 {offset}, {acc}, {F32(spec.ReduceOffset)};");
+                acc = offset;
+            }
 
             if (spec.BiasInput.HasValue)
             {
@@ -1903,7 +2093,28 @@ public sealed partial class PtxAffineEmitter
                 L($"mul.rn.f32 {na}, {acc}, {v};");
                 acc = na;
             }
+            if (spec.PostScaleInput.HasValue)
+                acc = EpilogueOperand(spec.PostScaleInput.Value, "mul", acc);
+            if (spec.PostBiasInput.HasValue)
+                acc = EpilogueOperand(spec.PostBiasInput.Value, "add", acc);
             acc = EmitActivation(spec.Activation, acc);
+
+            // Loads (once per distinct address, through the same cache as the bias and the
+            // scale) and applies one post-scale or post-bias operand.
+            string EpilogueOperand(int input, string op, string value)
+            {
+                var binding = spec.Inputs[input];
+                string key = LoadKey(input, binding, tileAxes, laneOffsets[l], -1);
+                if (!epilogueCache.TryGetValue(key, out string? loaded))
+                {
+                    loaded = EmitLoad(binding, basePtr[binding.ParameterIndex], laneAxisReg[l],
+                                      reductionValues, reduction, out _);
+                    epilogueCache[key] = loaded;
+                }
+                string result = NextF();
+                L($"{op}.rn.f32 {result}, {value}, {loaded};");
+                return result;
+            }
 
             if (pendingStore is not null)
             {
@@ -2135,8 +2346,26 @@ public sealed partial class PtxAffineEmitter
     /// </remarks>
     private string Assemble()
     {
+        CalledFunctions = _calledFunctions.ToArray();
+        if (_calledFunctions.Count != 0)
+        {
+            // Every called function, declared at module scope ahead of the entry; the linker resolves them.
+            var declarations = new System.Text.StringBuilder();
+            foreach (var function in _calledFunctions)
+            {
+                declarations.Append(".extern .func (.param .b32 func_retval0) ").Append(function.Symbol).Append('(');
+                for (int i = 0; i < function.Arity; i++)
+                    declarations.Append(i == 0 ? "" : ", ").Append(".param .b32 ").Append(function.Symbol).Append("_param_").Append(I(i));
+                declarations.Append(");\n");
+            }
+            string header = _sb.ToString();
+            int entry = header.IndexOf(".visible .entry", StringComparison.Ordinal);
+            if (entry < 0) throw new InvalidOperationException("The kernel has no entry to declare its calls ahead of.");
+            _sb.Clear().Append(header, 0, entry).Append(declarations).Append('\n').Append(header, entry, header.Length - entry);
+            _calledFunctions.Clear();
+        }
         if (SharedMemoryBytes > 0)
-            _sb.Append("    .shared .align 4 .b8 stageBuf[")
+            _sb.Append("    .shared .align 16 .b8 stageBuf[")
                .Append(I(SharedMemoryBytes)).Append("];\n");
         _sb.Append("    .reg .pred %p<").Append(I(_p + 8)).Append(">;\n")
            .Append("    .reg .b32 %r<").Append(I(_r + 8)).Append(">;\n")
@@ -2373,7 +2602,24 @@ public sealed partial class PtxAffineEmitter
         L($"mul.wide.s32 {posBytes}, {position}, 4;");
         L($"add.u64 {posAddr}, {_basePointers![indexBinding.ParameterIndex]}, {posBytes};");
 
-        if (positionPredicate is null)
+        if (indirect.FloatIndices)
+        {
+            // A declared float index: loaded as f32 and truncated toward zero (cvt.rzi.s32.f32, what C's (int)
+            // compiles to: NaN to 0, saturating), so the value -- never the bit pattern -- is the index.
+            string asFloat = NextF();
+            if (positionPredicate is null)
+            {
+                L($"ld.global.nc.f32 {asFloat}, [{posAddr}];");
+                L($"cvt.rzi.s32.f32 {raw}, {asFloat};");
+            }
+            else
+            {
+                L($"mov.u32 {raw}, 0xFFFFFFFF;");
+                L($"@{positionPredicate} ld.global.nc.f32 {asFloat}, [{posAddr}];");
+                L($"@{positionPredicate} cvt.rzi.s32.f32 {raw}, {asFloat};");
+            }
+        }
+        else if (positionPredicate is null)
         {
             L($"ld.global.nc.u32 {raw}, [{posAddr}];");
         }

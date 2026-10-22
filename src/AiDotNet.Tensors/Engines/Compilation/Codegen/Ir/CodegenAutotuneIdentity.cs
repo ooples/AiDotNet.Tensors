@@ -375,7 +375,7 @@ public sealed record CodegenAutotuneIdentity(
         text.Append(";end-candidate;");
     }
 
-    private static string CanonicalSpec(CodegenKernelSpec spec)
+    internal static string CanonicalSpec(CodegenKernelSpec spec)
     {
         var text = new StringBuilder();
         text.Append("name=").Append(spec.Name).Append(';');
@@ -403,6 +403,14 @@ public sealed record CodegenAutotuneIdentity(
             .Append(";preBias=").Append(Optional(spec.PreBiasInput))
             .Append(";preBiasScale=").Append(spec.PreBiasScale.ToString("R", CultureInfo.InvariantCulture))
             .Append(";algebra=").Append(spec.Algebra).Append(';');
+        // Appended only when present, so every identity recorded before these fields
+        // existed still resolves to the same cache entry.
+        if (spec.Body is not null)
+            text.Append("body=").Append(spec.Body).Append(';');
+        if (spec.HasExtendedEpilogue)
+            text.Append("reduceOffset=").Append(spec.ReduceOffset.ToString("R", CultureInfo.InvariantCulture))
+                .Append(";postScale=").Append(Optional(spec.PostScaleInput))
+                .Append(";postBias=").Append(Optional(spec.PostBiasInput)).Append(';');
 
         for (int i = 0; i < spec.ExtraOutputs.Count; i++)
         {
@@ -440,6 +448,8 @@ public sealed record CodegenAutotuneIdentity(
                     .Append(indirect.IndexInput.ToString(CultureInfo.InvariantCulture)).Append(',')
                     .Append(indirect.Bound.ToString(CultureInfo.InvariantCulture)).Append(',')
                     .Append(indirect.OutOfRange).Append(',');
+                // Only when set, so every int32-indexed identity (and its persisted decision) is unchanged.
+                if (indirect.FloatIndices) text.Append("f32,");
                 AppendExpr(text, indirect.Position);
             }
             text.Append(';');
