@@ -16,9 +16,12 @@
 // wrote it -- ptxas leaves exactly 12, and an ALU guard read after the ordinary 6 faulted -- while a predicate read as an
 // operand (a compare's combine input, SEL's selector) needs only the ALU latency.
 //
-// Control flow is handled conservatively: a branch target or a control instruction waits on every scoreboard and
-// issues only after every fixed-latency result is ready, so no state crosses a block boundary. The yield bits stay as
-// they were. An operand reuse flag survives only where the instruction's stall is no longer than ptxas's: the reuse
+// Control flow: a branch target or a control instruction issues only after every fixed-latency result is ready, so no
+// fixed-latency state crosses a block boundary. Scoreboards do cross branches: a branch target starts from the union of
+// what every edge into it leaves pending (loop heads iterated to a fixpoint), so a loop keeps its prefetched global
+// loads in flight across the back edge as ptxas does -- waiting on every scoreboard there cost a 3x3 convolution's
+// data gradient 12% on the RTX 3080. The other control instructions (barriers, EXIT, convergence, DEPBAR, CALL) still
+// wait on every scoreboard. The yield bits stay as they were. An operand reuse flag survives only where the instruction's stall is no longer than ptxas's: the reuse
 // cache is valid only when the next instruction follows closely enough that the scheduler cannot have issued another
 // warp in between -- lengthening the stall of an instruction that keeps its reuse flags faulted on sm_75 (ptxas's own
 // schedule with four extra stall cycles on its memory instructions read stale operands).
@@ -192,227 +195,343 @@ public static class SassScheduler
         var targets = BranchTargets(code);
         if (AsyncScoreboard(code, effects) is not int asyncBoard) return null;
         var overwritten = SourcesOverwritten(code, effects);
-        var (firstUse, firstOverwrite) = NextHazards(code, effects, targets);
+        var (firstUse, firstOverwrite, useInBlock) = NextHazards(code, effects, targets);
         int asyncMask = asyncBoard >= 0 ? 1 << asyncBoard : 0;
-        var result = new SassInstruction[code.Count];
-        var pendingWrite = new Dictionary<int, int>();   // register -> write scoreboard covering it
-        var pendingRead = new Dictionary<int, int>();    // register -> read scoreboard covering it
-        var readyAt = new Dictionary<int, (long Ready, long Produced)>();   // register or predicate key -> readable at
-        var earlyAt = new Dictionary<int, (long Ready, string Class)>();     // register -> readable at, by its own class
-        var pendingUse = new long[6];        // per scoreboard: the earliest first use among the operations it covers
-        var pendingComplete = new long[6];   // per scoreboard: the latest expected completion among them
-        for (int s = 0; s < pendingUse.Length; s++) pendingUse[s] = long.MaxValue;
         var boards = Enumerable.Range(0, 6).Where(b => b != asyncBoard).ToArray();
-        var outstanding = new int[6];
-        var holdsGlobal = new bool[6];   // per scoreboard: covers a global load not yet waited on
-        long cycle = 0;   // issue cycle of the current instruction
-        var scoreboardSetAt = new long[6];
-        for (int s = 0; s < scoreboardSetAt.Length; s++) scoreboardSetAt[s] = long.MinValue / 2;
-        var predicateWrittenAt = new Dictionary<int, long>();   // predicate key -> cycle of the compare
-        var pipeFreeAt = new Dictionary<string, (long Ready, long Produced)>();   // pipe -> next issue cycle allowed
-        var uniformReadAt = new Dictionary<int, long>();   // uniform register key -> latest uniform-pipe reader's cycle
-        var originalStall = new int[code.Count];
-        var issueCycle = new long[code.Count];
+        int[] shortBoards = boards.Take(ShortBoards).ToArray(), longBoards = boards.Skip(ShortBoards).ToArray();
 
-        for (int i = 0; i < code.Count; i++)
+        // Scoreboards stay pending across branches (see ScoreState): a branch target starts from the union of what is
+        // pending on every edge into it. Forward edges are known when the target is reached; a loop head's back edges
+        // come from the previous pass, repeated until no back edge brings anything its head did not assume. A head that
+        // does not settle within MaxPasses waits on every scoreboard instead (the conservative schedule).
+        var backEntry = new Dictionary<int, ScoreState>();
+        var drainTargets = new HashSet<int>();
+        for (int pass = 0; ; pass++)
         {
-            var instruction = code[i];
-            var e = effects[i];
-            var reads = Registers(instruction, e.Reads);
-            var writes = Registers(instruction, e.Writes);
-            var predicateReads = Predicates(instruction, e.PredicateReads, e.UniformPredicates);
-            predicateReads.AddRange(Predicates(instruction, e.UniformPredicateReads, uniform: true));
-            int guard = instruction.GuardPredicate == SassInstruction.TruePredicate ? -1
-                : (e.UniformPredicates ? UniformPredicateKey : PredicateKey) + instruction.GuardPredicate;
-            var predicateWrites = Predicates(instruction, e.PredicateWrites, e.UniformPredicates);
-            bool boundary = targets.Contains(i) || e.Latency == SassLatency.Control;
+            var forwardEntry = new Dictionary<int, ScoreState>();
+            var backOut = new Dictionary<int, ScoreState>();
+            var result = new SassInstruction[code.Count];
+            var pendingWrite = new Dictionary<int, int>();   // register -> mask of write scoreboards covering it
+            var pendingRead = new Dictionary<int, int>();    // register -> mask of read scoreboards covering it
+            var readyAt = new Dictionary<int, (long Ready, long Produced)>();   // register or predicate key -> readable at
+            var earlyAt = new Dictionary<int, (long Ready, string Class)>();     // register -> readable at, by its own class
+            var pendingUse = new long[6];        // per scoreboard: the earliest first use among the operations it covers
+            var pendingComplete = new long[6];   // per scoreboard: the latest expected completion among them
+            for (int s = 0; s < pendingUse.Length; s++) pendingUse[s] = long.MaxValue;
+            var outstanding = new int[6];
+            long cycle = 0;   // issue cycle of the current instruction
+            var scoreboardSetAt = new long[6];
+            for (int s = 0; s < scoreboardSetAt.Length; s++) scoreboardSetAt[s] = long.MinValue / 2;
+            var predicateWrittenAt = new Dictionary<int, long>();   // predicate key -> cycle of the compare
+            var pipeFreeAt = new Dictionary<string, (long Ready, long Produced)>();   // pipe -> next issue cycle allowed
+            var uniformReadAt = new Dictionary<int, long>();   // uniform register key -> latest uniform-pipe reader's cycle
+            var originalStall = new int[code.Count];
+            var issueCycle = new long[code.Count];
 
-            // Waits.
-            int wait = 0;
-            if (boundary)
+            for (int i = 0; i < code.Count; i++)
             {
-                wait = AllScoreboards & ~asyncMask;
-            }
-            else
-            {
-                foreach (int r in reads) if (pendingWrite.TryGetValue(r, out int s)) wait |= 1 << s;
-                foreach (int r in writes)
+                var instruction = code[i];
+                var e = effects[i];
+                var reads = Registers(instruction, e.Reads);
+                var writes = Registers(instruction, e.Writes);
+                var predicateReads = Predicates(instruction, e.PredicateReads, e.UniformPredicates);
+                predicateReads.AddRange(Predicates(instruction, e.UniformPredicateReads, uniform: true));
+                int guard = instruction.GuardPredicate == SassInstruction.TruePredicate ? -1
+                    : (e.UniformPredicates ? UniformPredicateKey : PredicateKey) + instruction.GuardPredicate;
+                var predicateWrites = Predicates(instruction, e.PredicateWrites, e.UniformPredicates);
+                bool target = targets.Contains(i);
+                // Fixed-latency state never crosses a block boundary; scoreboards cross branches (BRA) and branch targets
+                // but every other control instruction (barriers, EXIT, convergence, DEPBAR, CALL) waits on them all.
+                bool boundary = target || e.Latency == SassLatency.Control;
+                bool drain = (e.Latency == SassLatency.Control && e.Mnemonic != "BRA") || (target && drainTargets.Contains(i));
+                if (target && !drain)
                 {
-                    if (pendingWrite.TryGetValue(r, out int s)) wait |= 1 << s;
-                    if (pendingRead.TryGetValue(r, out int t)) wait |= 1 << t;
+                    if (forwardEntry.TryGetValue(i, out var forward)) Merge(forward, clampSetAt: false);
+                    if (backEntry.TryGetValue(i, out var back)) Merge(back, clampSetAt: true);
                 }
-            }
-            // The scoreboards this instruction will set, chosen now so a full one is waited on first.
-            int writeBoard = SassInstruction.NoScoreboard, readBoard = SassInstruction.NoScoreboard;
-            long writeComplete = 0, readReleased = 0;
-            bool global = e.Mnemonic == "LDG";
-            if (e.Latency == SassLatency.Variable)
-            {
-                if (writes.Count != 0)
+
+                // Waits.
+                int wait = 0;
+                if (drain)
                 {
-                    long complete = cycle + (global ? GlobalLoadCycles : e.Mnemonic == "LDS" ? SharedLoadCycles : OtherVariableCycles);
-                    var candidates = boards;
-                    if (global && boards.Count(b => holdsGlobal[b]) is int holding && holding > 0 && holding >= boards.Length - ShortBoards)
-                        candidates = boards.Where(b => holdsGlobal[b]).ToArray();
-                    writeBoard = ChooseBoard(candidates, outstanding, pendingUse, pendingComplete, firstUse[i], complete, conserve: global);
-                    writeComplete = complete;
-                    if (outstanding[writeBoard] >= ScoreboardDepth) wait |= 1 << writeBoard;
+                    wait = AllScoreboards & ~asyncMask;
                 }
-                if (reads.Count != 0 && overwritten[i])
+                else
                 {
-                    readReleased = cycle + SourceReadCycles;
-                    readBoard = ChooseBoard(boards.Where(b => b != writeBoard).ToArray(), outstanding, pendingUse, pendingComplete,
-                        firstOverwrite[i], readReleased);
-                    if (outstanding[readBoard] >= ScoreboardDepth) wait |= 1 << readBoard;
-                }
-            }
-            if (wait != 0)
-            {
-                Clear(pendingWrite, wait);
-                Clear(pendingRead, wait);
-                for (int s = 0; s < outstanding.Length; s++)
-                    if ((wait >> s & 1) != 0)
+                    foreach (int r in reads) if (pendingWrite.TryGetValue(r, out int m)) wait |= m;
+                    foreach (int r in writes)
                     {
-                        outstanding[s] = 0;
-                        holdsGlobal[s] = false;
-                        pendingUse[s] = long.MaxValue;
-                        pendingComplete[s] = 0;
+                        if (pendingWrite.TryGetValue(r, out int m)) wait |= m;
+                        if (pendingRead.TryGetValue(r, out int n)) wait |= n;
                     }
-            }
-
-            // Fixed-latency readiness: everything at a boundary; otherwise the registers and predicates it reads or
-            // overwrites. The previous instruction's stall carries the delay.
-            // Each constraint: the cycle this instruction may issue at, and the cycle of the instruction it waits for
-            // (only stalls of instructions issued since then delay it usefully).
-            long ready = cycle, produced = cycle;
-            void Need(long at, long from)
-            {
-                if (at > ready) ready = at;
-                if (at > cycle && from < produced) produced = from;
-            }
-            for (int s = 0; s < scoreboardSetAt.Length; s++)
-                if ((wait >> s & 1) != 0) Need(scoreboardSetAt[s] + ScoreboardSetDelay, scoreboardSetAt[s]);
-            timing.Pipes.TryGetValue(e.Mnemonic, out var pipe);
-            if (boundary)
-            {
-                foreach (var at in readyAt.Values) Need(at.Ready, at.Produced);
-                foreach (long at in predicateWrittenAt.Values) Need(at + guardLatency, at);
-                foreach (var at in pipeFreeAt.Values) Need(at.Ready, at.Produced);
-                foreach (long at in uniformReadAt.Values) Need(at + timing.UniformEarlyWriteAfterRead, at);
-            }
-            else
-            {
-                string? consumerClass = timing.LatencyClasses is { } lc && lc.TryGetValue(e.Mnemonic, out var cc) ? cc : null;
-                foreach (int r in reads)
-                    if (readyAt.TryGetValue(r, out var at))
-                        Need(consumerClass is not null && earlyAt.TryGetValue(r, out var early) && early.Class == consumerClass ? early.Ready : at.Ready, at.Produced);
-                foreach (int r in writes) if (readyAt.TryGetValue(r, out var at)) Need(at.Ready, at.Produced);
-                foreach (int p in predicateReads) if (readyAt.TryGetValue(p, out var at)) Need(at.Ready, at.Produced);
-                if (guard >= 0 && predicateWrittenAt.TryGetValue(guard, out long written))
-                    Need(written + guardLatency, written);
-                foreach (int p in predicateWrites) if (readyAt.TryGetValue(p, out var at)) Need(at.Ready, at.Produced);
-                if (e.ReadsAllPredicates)
-                    foreach (var pair in readyAt) if (pair.Key >= PredicateKey && pair.Key < UniformPredicateKey) Need(pair.Value.Ready, pair.Value.Produced);
-                if (pipe.Pipe is not null && pipeFreeAt.TryGetValue(pipe.Pipe, out var free)) Need(free.Ready, free.Produced);
-                if (e.Mnemonic is "UMOV" or "ULDC")
-                    foreach (int r in writes) if (uniformReadAt.TryGetValue(r, out long read)) Need(read + timing.UniformEarlyWriteAfterRead, read);
-            }
-            if (ready > cycle)
-            {
-                // Spread the delay over the instructions issued since the producer, latest first.
-                long missing = ready - cycle;
-                for (int k = i - 1; k >= 0 && missing > 0 && issueCycle[k] >= produced; k--)
-                {
-                    var control = result[k].Control;
-                    int cap = effects[k].Latency == SassLatency.Variable ? MaxVariableStall : timing.MaxStall;
-                    int add = (int)Math.Min(missing, cap - control.Stall);
-                    if (add <= 0) continue;
-                    result[k].Control = control with { Stall = control.Stall + add };
-                    missing -= add;
                 }
-                if (missing > 0)
+                // The scoreboards this instruction will set, chosen now so a full one is waited on first.
+                int writeBoard = SassInstruction.NoScoreboard, readBoard = SassInstruction.NoScoreboard;
+                long writeComplete = 0, readReleased = 0;
+                bool global = e.Mnemonic == "LDG";
+                if (e.Latency == SassLatency.Variable)
                 {
-                    int from = i - 1;
-                    while (from > 0 && issueCycle[from - 1] >= produced) from--;
-                    LastDecline = "instruction " + i + " (" + e.Mnemonic + ") needs " + missing + " more cycles than the stalls since cycle " +
-                        produced + " (instruction " + from + ", " + effects[from].Mnemonic + ") can hold";
+                    if (writes.Count != 0)
+                    {
+                        long complete = cycle + (global ? GlobalLoadCycles : e.Mnemonic == "LDS" ? SharedLoadCycles : OtherVariableCycles);
+                        writeBoard = ChooseBoard(global ? longBoards : boards, outstanding, pendingUse, pendingComplete, firstUse[i], complete, conserve: global);
+                        writeComplete = complete;
+                        if (outstanding[writeBoard] >= ScoreboardDepth) wait |= 1 << writeBoard;
+                    }
+                    // No read scoreboard when nothing can overwrite a source, or when the first use of the result comes, in
+                    // the same straight-line block, no later than the first overwrite: that use waits on the write
+                    // scoreboard, whose release implies the sources were read. ptxas likewise leaves most loads without one.
+                    if (reads.Count != 0 && overwritten[i] && !(useInBlock[i] && firstUse[i] <= firstOverwrite[i]))
+                    {
+                        readReleased = cycle + SourceReadCycles;
+                        readBoard = ChooseBoard(shortBoards, outstanding, pendingUse, pendingComplete,
+                            firstOverwrite[i], readReleased);
+                        if (outstanding[readBoard] >= ScoreboardDepth) wait |= 1 << readBoard;
+                    }
+                }
+                if (wait != 0)
+                {
+                    Clear(pendingWrite, wait);
+                    Clear(pendingRead, wait);
+                    for (int s = 0; s < outstanding.Length; s++)
+                        if ((wait >> s & 1) != 0)
+                        {
+                            outstanding[s] = 0;
+                            pendingUse[s] = long.MaxValue;
+                            pendingComplete[s] = 0;
+                        }
+                }
+
+                // Fixed-latency readiness: everything at a boundary; otherwise the registers and predicates it reads or
+                // overwrites. The previous instruction's stall carries the delay.
+                // Each constraint: the cycle this instruction may issue at, and the cycle of the instruction it waits for
+                // (only stalls of instructions issued since then delay it usefully).
+                long ready = cycle, produced = cycle;
+                void Need(long at, long from)
+                {
+                    if (at > ready) ready = at;
+                    if (at > cycle && from < produced) produced = from;
+                }
+                for (int s = 0; s < scoreboardSetAt.Length; s++)
+                    if ((wait >> s & 1) != 0) Need(scoreboardSetAt[s] + ScoreboardSetDelay, scoreboardSetAt[s]);
+                timing.Pipes.TryGetValue(e.Mnemonic, out var pipe);
+                if (boundary)
+                {
+                    foreach (var at in readyAt.Values) Need(at.Ready, at.Produced);
+                    foreach (long at in predicateWrittenAt.Values) Need(at + guardLatency, at);
+                    foreach (var at in pipeFreeAt.Values) Need(at.Ready, at.Produced);
+                    foreach (long at in uniformReadAt.Values) Need(at + timing.UniformEarlyWriteAfterRead, at);
+                }
+                else
+                {
+                    string? consumerClass = timing.LatencyClasses is { } lc && lc.TryGetValue(e.Mnemonic, out var cc) ? cc : null;
+                    foreach (int r in reads)
+                        if (readyAt.TryGetValue(r, out var at))
+                            Need(consumerClass is not null && earlyAt.TryGetValue(r, out var early) && early.Class == consumerClass ? early.Ready : at.Ready, at.Produced);
+                    foreach (int r in writes) if (readyAt.TryGetValue(r, out var at)) Need(at.Ready, at.Produced);
+                    foreach (int p in predicateReads) if (readyAt.TryGetValue(p, out var at)) Need(at.Ready, at.Produced);
+                    if (guard >= 0 && predicateWrittenAt.TryGetValue(guard, out long written))
+                        Need(written + guardLatency, written);
+                    foreach (int p in predicateWrites) if (readyAt.TryGetValue(p, out var at)) Need(at.Ready, at.Produced);
+                    if (e.ReadsAllPredicates)
+                        foreach (var pair in readyAt) if (pair.Key >= PredicateKey && pair.Key < UniformPredicateKey) Need(pair.Value.Ready, pair.Value.Produced);
+                    if (pipe.Pipe is not null && pipeFreeAt.TryGetValue(pipe.Pipe, out var free)) Need(free.Ready, free.Produced);
+                    if (e.Mnemonic is "UMOV" or "ULDC")
+                        foreach (int r in writes) if (uniformReadAt.TryGetValue(r, out long read)) Need(read + timing.UniformEarlyWriteAfterRead, read);
+                }
+                if (ready > cycle)
+                {
+                    // Spread the delay over the instructions issued since the producer, latest first.
+                    long missing = ready - cycle;
+                    for (int k = i - 1; k >= 0 && missing > 0 && issueCycle[k] >= produced; k--)
+                    {
+                        var control = result[k].Control;
+                        int cap = effects[k].Latency == SassLatency.Variable ? MaxVariableStall : timing.MaxStall;
+                        int add = (int)Math.Min(missing, cap - control.Stall);
+                        if (add <= 0) continue;
+                        result[k].Control = control with { Stall = control.Stall + add };
+                        missing -= add;
+                    }
+                    if (missing > 0)
+                    {
+                        int from = i - 1;
+                        while (from > 0 && issueCycle[from - 1] >= produced) from--;
+                        LastDecline = "instruction " + i + " (" + e.Mnemonic + ") needs " + missing + " more cycles than the stalls since cycle " +
+                            produced + " (instruction " + from + ", " + effects[from].Mnemonic + ") can hold";
+                        return null;
+                    }
+                    cycle = ready;
+                }
+                issueCycle[i] = cycle;
+                if (boundary)
+                {
+                    readyAt.Clear();
+                    earlyAt.Clear();
+                    predicateWrittenAt.Clear();
+                    pipeFreeAt.Clear();
+                    uniformReadAt.Clear();
+                }
+                if (pipe.Pipe is not null) pipeFreeAt[pipe.Pipe] = (cycle + pipe.Cycles, cycle);
+                if (timing.UniformEarlyWriteAfterRead > 0 && pipe.Pipe == "uniform")
+                    foreach (int r in reads) if (r >= UniformRegisterKey) uniformReadAt[r] = cycle;
+
+                // This instruction's own scoreboards.
+                if (e.Mnemonic == "LDGDEPBAR")
+                {
+                    // Commits the outstanding copies to the scoreboard the DEPBARs count; only they wait on it.
+                    writeBoard = asyncBoard;
+                    scoreboardSetAt[asyncBoard] = cycle;
+                }
+                else if (e.Latency == SassLatency.Variable)
+                {
+                    if (writeBoard != SassInstruction.NoScoreboard)
+                    {
+                        outstanding[writeBoard]++;
+                        pendingUse[writeBoard] = Math.Min(pendingUse[writeBoard], firstUse[i]);
+                        pendingComplete[writeBoard] = Math.Max(pendingComplete[writeBoard], writeComplete);
+                        scoreboardSetAt[writeBoard] = cycle;
+                        foreach (int r in writes) { pendingWrite[r] = 1 << writeBoard; readyAt.Remove(r); earlyAt.Remove(r); }
+                    }
+                    if (readBoard != SassInstruction.NoScoreboard)
+                    {
+                        outstanding[readBoard]++;
+                        pendingUse[readBoard] = Math.Min(pendingUse[readBoard], firstOverwrite[i]);
+                        pendingComplete[readBoard] = Math.Max(pendingComplete[readBoard], readReleased);
+                        scoreboardSetAt[readBoard] = cycle;
+                        // Or-ed: an earlier reader of the register, on another scoreboard, may still be pending.
+                        foreach (int r in reads) pendingRead[r] = (pendingRead.TryGetValue(r, out int m) ? m : 0) | 1 << readBoard;
+                    }
+                }
+                else if (e.Latency == SassLatency.Fixed)
+                {
+                    string? producerClass = timing.LatencyClasses is { } pc && pc.TryGetValue(e.Mnemonic, out var cls) ? cls : null;
+                    int latency = timing.Latencies is { } l && l.TryGetValue(e.Mnemonic, out int own) ? own
+                        : producerClass is not null ? timing.CrossClassLatency : e.FixedLatency;
+                    foreach (int r in writes)
+                    {
+                        readyAt[r] = (cycle + latency, cycle);
+                        if (producerClass is not null) earlyAt[r] = (cycle + timing.SameClassLatency, producerClass);
+                        else earlyAt.Remove(r);
+                    }
+                    foreach (int p in predicateWrites)
+                    {
+                        readyAt[p] = (cycle + latency, cycle);
+                        predicateWrittenAt[p] = cycle;
+                    }
+                }
+
+                var original = instruction.Control;
+                var updated = instruction;
+                int baseStall = timing.IssueStalls.TryGetValue(e.Mnemonic, out int fixedStall) ? fixedStall : 1;
+                updated.Control = new SassControl(baseStall, original.Yield, writeBoard, readBoard, wait, original.Reuse);
+                result[i] = updated;
+                originalStall[i] = original.Stall;
+                cycle += baseStall;
+
+                // A branch hands what is pending to its target.
+                if (e.Mnemonic == "BRA")
+                {
+                    int to = BranchTarget(code, i);
+                    var state = new ScoreState(pendingWrite, pendingRead, outstanding, scoreboardSetAt);
+                    var edges = to > i ? forwardEntry : backOut;
+                    if (to > i || !drainTargets.Contains(to))
+                        edges[to] = edges.TryGetValue(to, out var known) ? known.Union(state) : state;
+                }
+            }
+            // Reuse flags only where the stall did not grow (see the file header).
+            for (int i = 0; i < result.Length; i++)
+            {
+                var control = result[i].Control;
+                if (control.Reuse != 0 && control.Stall > originalStall[i]) result[i].Control = control with { Reuse = 0 };
+            }
+            if (backOut.All(edge => backEntry.TryGetValue(edge.Key, out var assumed) && assumed.Covers(edge.Value))) return result;
+            if (pass >= MaxPasses)
+            {
+                if (pass > MaxPasses)
+                {
+                    LastDecline = "scoreboard state at the loop heads did not settle";
                     return null;
                 }
-                cycle = ready;
+                drainTargets.UnionWith(backOut.Keys);
+                backEntry.Clear();
+                continue;
             }
-            issueCycle[i] = cycle;
-            if (boundary)
-            {
-                readyAt.Clear();
-                earlyAt.Clear();
-                predicateWrittenAt.Clear();
-                pipeFreeAt.Clear();
-                uniformReadAt.Clear();
-            }
-            if (pipe.Pipe is not null) pipeFreeAt[pipe.Pipe] = (cycle + pipe.Cycles, cycle);
-            if (timing.UniformEarlyWriteAfterRead > 0 && pipe.Pipe == "uniform")
-                foreach (int r in reads) if (r >= UniformRegisterKey) uniformReadAt[r] = cycle;
+            foreach (var edge in backOut)
+                backEntry[edge.Key] = backEntry.TryGetValue(edge.Key, out var assumed) ? assumed.Union(edge.Value) : edge.Value;
 
-            // This instruction's own scoreboards.
-            if (e.Mnemonic == "LDGDEPBAR")
+            // Adds a predecessor's pending scoreboards to the current state. A back edge's set cycles belong to the
+            // previous trip and are taken as at least ScoreboardSetDelay ago; the choice model treats its boards as
+            // holding a global load needed now.
+            void Merge(ScoreState state, bool clampSetAt)
             {
-                // Commits the outstanding copies to the scoreboard the DEPBARs count; only they wait on it.
-                writeBoard = asyncBoard;
-                scoreboardSetAt[asyncBoard] = cycle;
-            }
-            else if (e.Latency == SassLatency.Variable)
-            {
-                if (writeBoard != SassInstruction.NoScoreboard)
+                foreach (var pair in state.Write) pendingWrite[pair.Key] = (pendingWrite.TryGetValue(pair.Key, out int m) ? m : 0) | pair.Value;
+                foreach (var pair in state.Read) pendingRead[pair.Key] = (pendingRead.TryGetValue(pair.Key, out int m) ? m : 0) | pair.Value;
+                for (int b = 0; b < 6; b++)
                 {
-                    outstanding[writeBoard]++;
-                    holdsGlobal[writeBoard] |= global;
-                    pendingUse[writeBoard] = Math.Min(pendingUse[writeBoard], firstUse[i]);
-                    pendingComplete[writeBoard] = Math.Max(pendingComplete[writeBoard], writeComplete);
-                    scoreboardSetAt[writeBoard] = cycle;
-                    foreach (int r in writes) { pendingWrite[r] = writeBoard; readyAt.Remove(r); earlyAt.Remove(r); }
-                }
-                if (readBoard != SassInstruction.NoScoreboard)
-                {
-                    outstanding[readBoard]++;
-                    pendingUse[readBoard] = Math.Min(pendingUse[readBoard], firstOverwrite[i]);
-                    pendingComplete[readBoard] = Math.Max(pendingComplete[readBoard], readReleased);
-                    scoreboardSetAt[readBoard] = cycle;
-                    foreach (int r in reads) pendingRead[r] = readBoard;
+                    if (state.Outstanding[b] == 0) continue;
+                    outstanding[b] = Math.Max(outstanding[b], state.Outstanding[b]);
+                    long setAt = clampSetAt ? Math.Min(state.SetAt[b], cycle - ScoreboardSetDelay) : state.SetAt[b];
+                    scoreboardSetAt[b] = Math.Max(scoreboardSetAt[b], setAt);
+                    pendingUse[b] = Math.Min(pendingUse[b], cycle);
+                    pendingComplete[b] = Math.Max(pendingComplete[b], cycle + GlobalLoadCycles);
                 }
             }
-            else if (e.Latency == SassLatency.Fixed)
-            {
-                string? producerClass = timing.LatencyClasses is { } pc && pc.TryGetValue(e.Mnemonic, out var cls) ? cls : null;
-                int latency = timing.Latencies is { } l && l.TryGetValue(e.Mnemonic, out int own) ? own
-                    : producerClass is not null ? timing.CrossClassLatency : e.FixedLatency;
-                foreach (int r in writes)
-                {
-                    readyAt[r] = (cycle + latency, cycle);
-                    if (producerClass is not null) earlyAt[r] = (cycle + timing.SameClassLatency, producerClass);
-                    else earlyAt.Remove(r);
-                }
-                foreach (int p in predicateWrites)
-                {
-                    readyAt[p] = (cycle + latency, cycle);
-                    predicateWrittenAt[p] = cycle;
-                }
-            }
-
-            var original = instruction.Control;
-            var updated = instruction;
-            int baseStall = timing.IssueStalls.TryGetValue(e.Mnemonic, out int fixedStall) ? fixedStall : 1;
-            updated.Control = new SassControl(baseStall, original.Yield, writeBoard, readBoard, wait, original.Reuse);
-            result[i] = updated;
-            originalStall[i] = original.Stall;
-            cycle += baseStall;
         }
-        // Reuse flags only where the stall did not grow (see the file header).
-        for (int i = 0; i < result.Length; i++)
+    }
+
+    // Passes over a kernel with loops before its loop heads' scoreboard state settles (or they fall back to waiting).
+    private const int MaxPasses = 24;
+
+    // What is pending on the scoreboards at one program point: per register, the write and read scoreboards (masks)
+    // that may still cover it, and per scoreboard how many operations it may hold and when it was last set. Along
+    // different paths into a branch target these differ; the union is safe (an instruction then waits on every
+    // scoreboard any path left covering its registers, and a scoreboard is a counter: waiting on one that is already
+    // clear costs nothing).
+    private sealed class ScoreState
+    {
+        public ScoreState(Dictionary<int, int> write, Dictionary<int, int> read, int[] outstanding, long[] setAt)
         {
-            var control = result[i].Control;
-            if (control.Reuse != 0 && control.Stall > originalStall[i]) result[i].Control = control with { Reuse = 0 };
+            Write = new Dictionary<int, int>(write);
+            Read = new Dictionary<int, int>(read);
+            Outstanding = (int[])outstanding.Clone();
+            SetAt = (long[])setAt.Clone();
         }
-        return result;
+
+        public Dictionary<int, int> Write { get; }
+        public Dictionary<int, int> Read { get; }
+        public int[] Outstanding { get; }
+        public long[] SetAt { get; }
+
+        public ScoreState Union(ScoreState other)
+        {
+            var union = new ScoreState(Write, Read, Outstanding, SetAt);
+            foreach (var pair in other.Write) union.Write[pair.Key] = (union.Write.TryGetValue(pair.Key, out int m) ? m : 0) | pair.Value;
+            foreach (var pair in other.Read) union.Read[pair.Key] = (union.Read.TryGetValue(pair.Key, out int m) ? m : 0) | pair.Value;
+            for (int b = 0; b < Outstanding.Length; b++)
+            {
+                union.Outstanding[b] = Math.Max(union.Outstanding[b], other.Outstanding[b]);
+                union.SetAt[b] = Math.Max(union.SetAt[b], other.SetAt[b]);
+            }
+            return union;
+        }
+
+        // Whether this state already accounts for everything `other` leaves pending (set cycles aside: a loop head
+        // clamps them).
+        public bool Covers(ScoreState other)
+        {
+            foreach (var pair in other.Write) if (!Write.TryGetValue(pair.Key, out int m) || (pair.Value & ~m) != 0) return false;
+            foreach (var pair in other.Read) if (!Read.TryGetValue(pair.Key, out int m) || (pair.Value & ~m) != 0) return false;
+            for (int b = 0; b < Outstanding.Length; b++) if (other.Outstanding[b] > Outstanding[b]) return false;
+            return true;
+        }
+    }
+
+    // The instruction index a BRA at `at` jumps to.
+    private static int BranchTarget(IReadOnlyList<SassInstruction> code, int at)
+    {
+        long offset = (long)code[at].Bits(32, 50);
+        if ((offset & (1L << 49)) != 0) offset -= 1L << 50;
+        return (int)(((at + 1) * (long)InstructionBytes + offset) / InstructionBytes);
     }
 
     // Predicates, uniform predicates and uniform registers live in the same readiness map as vector registers, each
@@ -476,11 +595,12 @@ public static class SassScheduler
     // Per variable-latency instruction: the first later instruction that reads or writes a register it writes, and the
     // first that writes a register it reads, before the next block boundary (which waits on every scoreboard; it
     // stands for both when nothing in the block does).
-    private static (long[] FirstUse, long[] FirstOverwrite) NextHazards(IReadOnlyList<SassInstruction> code,
+    private static (long[] FirstUse, long[] FirstOverwrite, bool[] UseInBlock) NextHazards(IReadOnlyList<SassInstruction> code,
         SassEffects[] effects, HashSet<int> targets)
     {
         var firstUse = new long[code.Count];
         var firstOverwrite = new long[code.Count];
+        var useInBlock = new bool[code.Count];
         for (int i = 0; i < code.Count; i++)
         {
             if (effects[i].Latency != SassLatency.Variable) continue;
@@ -497,8 +617,9 @@ public static class SassScheduler
             }
             firstUse[i] = use >= 0 ? use : j;
             firstOverwrite[i] = overwrite >= 0 ? overwrite : j;
+            useInBlock[i] = use >= 0;
         }
-        return (firstUse, firstOverwrite);
+        return (firstUse, firstOverwrite, useInBlock);
     }
 
     // Per instruction: whether any instruction that can execute after it writes a register it reads -- a later one,
@@ -571,10 +692,14 @@ public static class SassScheduler
         return predicates;
     }
 
+    // Waiting on `waitMask` clears those scoreboards from every register's mask.
     private static void Clear(Dictionary<int, int> pending, int waitMask)
     {
-        var cleared = new List<int>();
-        foreach (var pair in pending) if ((waitMask >> pair.Value & 1) != 0) cleared.Add(pair.Key);
-        foreach (int r in cleared) pending.Remove(r);
+        foreach (int r in pending.Keys.ToList())
+        {
+            int left = pending[r] & ~waitMask;
+            if (left == 0) pending.Remove(r);
+            else pending[r] = left;
+        }
     }
 }

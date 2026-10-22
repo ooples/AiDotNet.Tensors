@@ -511,4 +511,33 @@ public class SassInstructionTests
         Assert.Throws<ArgumentException>(() => new SassCubin(badNames));
         Assert.Throws<ArgumentException>(() => new SassCubin(image.Take(image.Length / 2).ToArray()));
     }
+
+    /// <summary>
+    /// Scoreboards cross a loop head: a load issued before the loop is waited for at its first use inside it, not at
+    /// the head (draining every scoreboard there cost a 3x3 data gradient 12% on the RTX 3080).
+    /// </summary>
+    [Fact]
+    public void ALoopHeadDoesNotDrainTheScoreboards()
+    {
+        // LDS R48 at 0; loop: LEA at 1 (the head), FFMA reading R48 at 2, branch back to 1 at 3.
+        var code = new[] { Lds128, Lea, FfmaOf(9, 48, 4, 9), Branch(3, 1), Exit };
+        var scheduled = SassScheduler.RecomputeControl(code) ?? throw new InvalidOperationException(SassScheduler.LastDecline);
+        Assert.Equal(0, scheduled[1].Control.WaitMask);
+        Assert.NotEqual(0, scheduled[2].Control.WaitMask & (1 << scheduled[0].Control.WriteScoreboard));
+    }
+
+    /// <summary>
+    /// A load issued at the end of one trip and read at the top of the next is waited for through the back edge: the
+    /// loop head's state includes what the branch back leaves pending.
+    /// </summary>
+    [Fact]
+    public void ALoopCarriedLoadIsWaitedForThroughTheBackEdge()
+    {
+        // Loop: LEA at 0 (the head), FFMA reading R48 at 1, LDS R48 at 2 (for the next trip), branch back to 0 at 3.
+        var code = new[] { Lea, FfmaOf(9, 48, 4, 9), Lds128, Branch(3, 0), Exit };
+        var scheduled = SassScheduler.RecomputeControl(code) ?? throw new InvalidOperationException(SassScheduler.LastDecline);
+        int board = scheduled[2].Control.WriteScoreboard;
+        Assert.NotEqual(SassInstruction.NoScoreboard, board);
+        Assert.NotEqual(0, scheduled[1].Control.WaitMask & (1 << board));
+    }
 }
