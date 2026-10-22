@@ -123,7 +123,12 @@ public sealed partial class CudaBackend
                 program = BuildAttentionProgram(declaredKey, s_buildFlashBackward, s_flashBackwardNames);
                 _declaredPrograms[declaredKey] = program;
             }
-            if (program is not null && causal && (causalBias = CausalBiasBuffer(seqQ, seqK)) is null) return false;
+            if (program is not null && causal &&
+                (causalBias = CausalBiasBuffer(seqQ, seqK, out string? biasDecline)) is null)
+            {
+                if (biasDecline is not null) _declaredDeclines[declaredKey] = biasDecline;
+                return false;
+            }
         }
         if (program is null) return false;
         var bound = new DeclaredBindings(gradOutput, query, key, value, output, softmaxStats, causalBias, gradQuery,
@@ -210,7 +215,12 @@ public sealed partial class CudaBackend
                 program = BuildAttentionProgram(declaredKey, _buildAttention ??= BuildAttention, names);
                 _declaredPrograms[declaredKey] = program;
             }
-            if (program is not null && causal && (causalBias = CausalBiasBuffer(seqQ, seqK)) is null) return false;
+            if (program is not null && causal &&
+                (causalBias = CausalBiasBuffer(seqQ, seqK, out string? biasDecline)) is null)
+            {
+                if (biasDecline is not null) _declaredDeclines[declaredKey] = biasDecline;
+                return false;
+            }
         }
         if (program is null) return false;
         var bound = new DeclaredBindings(query, key, value, output, mask, causalBias, stats ?? weights);
@@ -221,17 +231,23 @@ public sealed partial class CudaBackend
         return true;
     }
 
-    // The cached causal bias for (seqQ, seqK), created on first use; null when first needed under a capture. The
-    // caller holds _directPtxLock.
-    private IGpuBuffer? CausalBiasBuffer(int seqQ, int seqK)
+    // The cached causal bias for (seqQ, seqK), created on first use; null when first needed under a capture or when
+    // it does not fit the scratch budget, with the reason in decline so the caller can record it. The caller holds
+    // _directPtxLock.
+    private IGpuBuffer? CausalBiasBuffer(int seqQ, int seqK, out string? decline)
     {
+        decline = null;
         long cacheKey = ((long)seqQ << 32) | (uint)seqK;
         if (_causalBiases.TryGetValue(cacheKey, out var buffer)) return buffer;
-        if (IsStreamCapturing()) return null;
+        if (IsStreamCapturing())
+        {
+            decline = "A causal attention stage is first built outside capture.";
+            return null;
+        }
         // One bias per (seqQ, seqK), held for the backend's lifetime like a program's scratch, so it is admitted
         // against the same budget. Null declines the route and the hand-written kernel serves the call.
         long bytes = checked((long)seqQ * seqK * sizeof(float));
-        if (!DeclaredScratchFits(bytes, out _)) return null;
+        if (!DeclaredScratchFits(bytes, out decline)) return null;
         buffer = AllocateBuffer(CausalBias(seqQ, seqK));
         _causalBiases[cacheKey] = buffer;
         _declaredScratchBytes = checked(_declaredScratchBytes + bytes);
@@ -253,8 +269,8 @@ public sealed partial class CudaBackend
         IGpuBuffer? causalBias = null;
         lock (_directPtxLock)
         {
-            if (causal && (causalBias = CausalBiasBuffer(seqQ, seqK)) is null)
-                throw new NotSupportedException("A causal attention stage is first built outside capture.");
+            if (causal && (causalBias = CausalBiasBuffer(seqQ, seqK, out string? biasDecline)) is null)
+                throw new NotSupportedException(biasDecline ?? "The causal attention bias could not be built.");
             if (!_declaredPrograms.ContainsKey(declaredKey) && !IsStreamCapturing())
                 _declaredPrograms[declaredKey] = BuildAttentionProgram(declaredKey, _buildAttention ??= BuildAttention,
                     storeWeights ? s_attentionNames : s_attentionNamesNoWeights);
