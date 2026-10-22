@@ -87,9 +87,25 @@ public static class SassScheduler
     // Fixed latencies that differ from the table's (measured on sm_75): sm_86 reads a P2R result 4 cycles after it at
     // the closest (sm_75: 14), so 6 -- the ALU margin -- holds, where 14 could not be expressed before an overwrite of
     // the P2R's register one instruction later (a declined catalog kernel).
+    //
+    // Latency classes (sm_86): a fixed-latency result is readable sooner by a consumer in its own class. Over the 81
+    // kernels ptxas compiles for sm_86, it reads FP32 results (FADD/FMUL/FFMA) 4 cycles on in FP32 consumers, integer-
+    // ALU results 4 on in ALU consumers, IMAD results 4 on in IMADs, and 5 on across classes (FADD -> FSETP, IADD3 ->
+    // IMAD, IMAD -> ISETP, FMUL -> FSEL) and into memory operands. The table's 6 (sm_75) cost a dense 3x3 convolution
+    // -- FMUL -> FADD chains -- 5% on the RTX 3080.
     private sealed record Timing(int GuardPredicateLatency, int MaxStall, IReadOnlyDictionary<string, int> IssueStalls,
         IReadOnlyDictionary<string, (string Pipe, int Cycles)> Pipes, int UniformEarlyWriteAfterRead = 0,
-        IReadOnlyDictionary<string, int>? Latencies = null);
+        IReadOnlyDictionary<string, int>? Latencies = null, IReadOnlyDictionary<string, string>? LatencyClasses = null,
+        int SameClassLatency = 0, int CrossClassLatency = 0);
+
+    private static readonly Dictionary<string, string> s_ampereLatencyClasses = new()
+    {
+        ["FADD"] = "fp", ["FMUL"] = "fp", ["FFMA"] = "fp",
+        ["IADD3"] = "alu", ["LEA"] = "alu", ["LOP3"] = "alu", ["MOV"] = "alu", ["SEL"] = "alu", ["SHF"] = "alu",
+        ["FSEL"] = "alu", ["FMNMX"] = "alu", ["IMNMX"] = "alu", ["IABS"] = "alu", ["ISETP"] = "alu", ["FSETP"] = "alu",
+        ["PLOP3"] = "alu",
+        ["IMAD"] = "imad", ["IMAD.HI"] = "imad",
+    };
 
     private static readonly Dictionary<string, (string Pipe, int Cycles)> s_noPipes = new();
 
@@ -109,7 +125,7 @@ public static class SassScheduler
     {
         [75] = new(12, 12, new Dictionary<string, int> { ["BMOV"] = 11, ["BAR"] = 5 }, s_noPipes),
         [86] = new(13, 13, new Dictionary<string, int> { ["BMOV"] = 11, ["BAR"] = 6, ["DEPBAR"] = 4, ["LDGDEPBAR"] = 4 }, s_ampere, 3,
-            new Dictionary<string, int> { ["P2R"] = 6 }),
+            new Dictionary<string, int> { ["P2R"] = 6, ["IMAD.WIDE"] = 5, ["I2FP"] = 5 }, s_ampereLatencyClasses, 4, 5),
     };
 
     /// <summary>
@@ -172,6 +188,7 @@ public static class SassScheduler
         var pendingWrite = new Dictionary<int, int>();   // register -> write scoreboard covering it
         var pendingRead = new Dictionary<int, int>();    // register -> read scoreboard covering it
         var readyAt = new Dictionary<int, (long Ready, long Produced)>();   // register or predicate key -> readable at
+        var earlyAt = new Dictionary<int, (long Ready, string Class)>();     // register -> readable at, by its own class
         var pendingUse = new long[6];   // per scoreboard: the earliest first use among the operations it covers
         for (int s = 0; s < pendingUse.Length; s++) pendingUse[s] = long.MaxValue;
         var boards = Enumerable.Range(0, 6).Where(b => b != asyncBoard).ToArray();
@@ -266,7 +283,10 @@ public static class SassScheduler
             }
             else
             {
-                foreach (int r in reads) if (readyAt.TryGetValue(r, out var at)) Need(at.Ready, at.Produced);
+                string? consumerClass = timing.LatencyClasses is { } lc && lc.TryGetValue(e.Mnemonic, out var cc) ? cc : null;
+                foreach (int r in reads)
+                    if (readyAt.TryGetValue(r, out var at))
+                        Need(consumerClass is not null && earlyAt.TryGetValue(r, out var early) && early.Class == consumerClass ? early.Ready : at.Ready, at.Produced);
                 foreach (int r in writes) if (readyAt.TryGetValue(r, out var at)) Need(at.Ready, at.Produced);
                 foreach (int p in predicateReads) if (readyAt.TryGetValue(p, out var at)) Need(at.Ready, at.Produced);
                 if (guard >= 0 && predicateWrittenAt.TryGetValue(guard, out long written))
@@ -305,6 +325,7 @@ public static class SassScheduler
             if (boundary)
             {
                 readyAt.Clear();
+                earlyAt.Clear();
                 predicateWrittenAt.Clear();
                 pipeFreeAt.Clear();
                 uniformReadAt.Clear();
@@ -326,7 +347,7 @@ public static class SassScheduler
                 {
                     outstanding[writeBoard]++;
                     scoreboardSetAt[writeBoard] = cycle;
-                    foreach (int r in writes) { pendingWrite[r] = writeBoard; readyAt.Remove(r); }
+                    foreach (int r in writes) { pendingWrite[r] = writeBoard; readyAt.Remove(r); earlyAt.Remove(r); }
                 }
                 if (readBoard != SassInstruction.NoScoreboard)
                 {
@@ -337,8 +358,15 @@ public static class SassScheduler
             }
             else if (e.Latency == SassLatency.Fixed)
             {
-                int latency = timing.Latencies is { } l && l.TryGetValue(e.Mnemonic, out int own) ? own : e.FixedLatency;
-                foreach (int r in writes) readyAt[r] = (cycle + latency, cycle);
+                string? producerClass = timing.LatencyClasses is { } pc && pc.TryGetValue(e.Mnemonic, out var cls) ? cls : null;
+                int latency = timing.Latencies is { } l && l.TryGetValue(e.Mnemonic, out int own) ? own
+                    : producerClass is not null ? timing.CrossClassLatency : e.FixedLatency;
+                foreach (int r in writes)
+                {
+                    readyAt[r] = (cycle + latency, cycle);
+                    if (producerClass is not null) earlyAt[r] = (cycle + timing.SameClassLatency, producerClass);
+                    else earlyAt.Remove(r);
+                }
                 foreach (int p in predicateWrites)
                 {
                     readyAt[p] = (cycle + latency, cycle);
