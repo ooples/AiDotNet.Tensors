@@ -25,6 +25,8 @@ public sealed class WebGpuShaderCompilationTests
         "WebGpuBatchExecutionKernels.Main",   // the shared main() prologue every batch-execution shader appends to
         "WebGpuKernels.RnnCellSource",        // concatenated after the common header that defines fast_tanh
         "WebGpuTunedRowKernels.RowPrologue",  // the row kernels' shared main() prologue, closed by each family's body
+        "WebGpuBatchNormRegisterKernels.Forward",    // templates: SourceFor fills in the name and the values per thread
+        "WebGpuBatchNormRegisterKernels.Backward",
     };
 
     private const string Validator = @"
@@ -117,6 +119,9 @@ process.exit(0);
                     Emit(type.Name + "." + member.Name, source);
                 }
             }
+            // The register-resident BatchNorm, one module per kernel and per-thread variant (generated, not fields).
+            foreach (var name in AiDotNet.Tensors.Engines.DirectGpu.BatchNormRegisterKernelTemplate.GetKernelNames())
+                Emit("BatchNormRegister." + name, WebGpuBatchNormRegisterKernels.SourceFor(name));
             // The FP32 PyTorch-parity kernels, one translated module per kernel (#1125, #1128).
             foreach (var module in CudaDialectToWgsl.Translate(AiDotNet.Tensors.Engines.DirectGpu.TorchParityF32Kernels.GetSource()))
             {

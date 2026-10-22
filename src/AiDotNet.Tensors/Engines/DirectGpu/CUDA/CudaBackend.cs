@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 // Direct CUDA backend for NVIDIA GPUs (Driver API + NVRTC + cuBLAS fallback).
 using System;
 using System.Collections.Concurrent;
@@ -9,6 +9,7 @@ using System.Text;
 using System.Threading;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation.Codegen;
+using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
@@ -966,8 +967,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         return BitConverter.ToString(hash).Replace("-", "").Substring(0, 32);
     }
 
-    private IntPtr CompileKernelModule(
-        int device, string source, string moduleName, string[] kernelNames, bool useFastMath = true)
+    /// <summary>
+    /// A hand-written CUDA C module's source as NVRTC compiles it: standard headers stripped (NVRTC has the builtins)
+    /// and the constants they would have defined. Shared with the static-metric audit, so it compiles what runs.
+    /// </summary>
+    internal static string PrepareNvrtcSource(string source)
     {
         // NVRTC doesn't support standard C headers — strip #include <math.h> etc.
         source = source.Replace("#include <math.h>", "// math.h stripped for NVRTC (built-in)")
@@ -995,7 +999,31 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 #endif
 ";
         source = nvrtcPreamble + source;
+        return source;
+    }
 
+    /// <summary>The NVRTC options every hand-written module compiles with, for a device of this capability.</summary>
+    internal static string[] NvrtcOptions(int major, int minor, bool useFastMath)
+    {
+        var optionsList = new List<string> { $"--gpu-architecture=sm_{major}{minor}" };
+        optionsList.AddRange(NvrtcNativeBindings.JitCompatibilityOptions);
+        if (useFastMath)
+            optionsList.Add("--use_fast_math");
+        var cudaInclude = GetCudaIncludePath();
+        if (cudaInclude != null)
+            optionsList.Add($"--include-path={cudaInclude}");
+        return optionsList.ToArray();
+    }
+
+    private IntPtr CompileKernelModule(
+        int device, string source, string moduleName, string[] kernelNames, bool useFastMath = true)
+    {
+        // Which module defines each kernel the cache will hold -- the last to compile it, as the cache keeps -- so the
+        // declared elementwise kernels derive their math from the copy that actually runs (CudaMathLibrary).
+        var defining = new CudaMathModule(moduleName, source, useFastMath);
+        lock (_kernelModules)
+            foreach (string kernelName in kernelNames) _kernelModules[kernelName] = defining;
+        source = PrepareNvrtcSource(source);
         var (major, minor) = GetComputeCapability(device);
         string arch = $"--gpu-architecture=sm_{major}{minor}";
         IReadOnlyList<string> jitOptions = NvrtcNativeBindings.JitCompatibilityOptions;
@@ -1044,15 +1072,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         }
 
         // Compile with NVRTC
-        var optionsList = new List<string> { arch };
-        optionsList.AddRange(jitOptions);
-        if (useFastMath)
-            optionsList.Add("--use_fast_math");
-        var cudaInclude = GetCudaIncludePath();
-        if (cudaInclude != null)
-            optionsList.Add($"--include-path={cudaInclude}");
-
-        string[] options = optionsList.ToArray();
+        string[] options = NvrtcOptions(major, minor, useFastMath);
 
         IntPtr program = IntPtr.Zero;
         var result = NvrtcNativeBindings.nvrtcCreateProgram(
@@ -1271,6 +1291,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // Narrow row-major GEMMs (TrySkinnyGemm / TrySkinnyGemmTransposedA), tried before cuBLAS.
         _skinnyGemmModule = CompileKernelModule(device, Kernels.CudaSkinnyGemmKernels.GetSource(), "skinny_gemm_kernels",
             Kernels.CudaSkinnyGemmKernels.GetKernelNames());
+        // The deterministic scatter-add as a stable sort and an ordered segment sum (TrySortedScatterAdd).
+        _sortedScatterModule = CompileKernelModule(device, Kernels.CudaSortedScatterKernels.GetSource(),
+            "sorted_scatter_kernels", Kernels.CudaSortedScatterKernels.GetKernelNames());
         // Narrow convolutions as an implicit GEMM (TryConv2DImplicitGemm), a candidate of the forward tuned-kernel slot.
         _implicitConvModule = CompileKernelModule(device, Kernels.CudaImplicitConvKernels.GetSource(), "implicit_conv_kernels",
             Kernels.CudaImplicitConvKernels.GetKernelNames());
@@ -2377,6 +2400,14 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // #1265: a shape tuned and measured faster than cuBLAS in the current math mode runs its generated kernel. A
         // measured verdict comes before the narrow kernels' shape heuristics, which otherwise took the shape first.
         if (TryRoutedGemm(A, B, C, M, N, K, alpha, beta)) return;
+        if (TryDeclaredGemm(DeclaredFamily.Gemm, A, B, C, 1, M, N, K, alpha, beta)) return;
+        GemmIncumbent(A, B, C, M, N, K, alpha, beta);
+    }
+
+    // Gemm after the declared GEMM slot: the narrow kernels, then cuBLAS. The slot's reference for this layout.
+    private void GemmIncumbent(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha, float beta)
+    {
+        using var _ = PushContext();
         if (TrySkinnyGemm(A, B, C, M, N, K, transB: false, alpha, beta)
             || TrySmallGemm(A, B, C, M, N, K, transA: false, transB: false, alpha, beta))
         {
@@ -2421,6 +2452,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             TryDirectPtxGemmTiled(
                 A, B, C, M, K, N, DirectPtxLinearWeightLayout.OutputMajor))
             return;
+        if (TryDeclaredGemm(DeclaredFamily.GemmTransposedB, A, B, C, 1, M, N, K, alpha, beta)) return;
+        MatMulTransposedIncumbent(A, B, C, M, N, K, alpha, beta);
+    }
+
+    // MatMulTransposed after the declared GEMM slot: the narrow kernels, then cuBLAS. The slot's reference for this layout.
+    private void MatMulTransposedIncumbent(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha, float beta)
+    {
         if (TrySkinnyGemm(A, B, C, M, N, K, transB: true, alpha, beta)) return;
         if (TrySmallGemm(A, B, C, M, N, K, transA: false, transB: true, alpha, beta)) return;
 
@@ -2466,6 +2504,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         ValidateGemmArgs(A, B, C, M, N, K);
+        if (TryDeclaredGemm(DeclaredFamily.GemmTransposedA, A, B, C, 1, M, N, K, alpha, beta)) return;
+        MatMulTransposedAIncumbent(A, B, C, M, N, K, alpha, beta);
+    }
+
+    // MatMulTransposedA after the declared GEMM slot: the narrow kernels, then cuBLAS. The slot's reference for this layout.
+    private void MatMulTransposedAIncumbent(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha, float beta)
+    {
         if (TrySkinnyGemmTransposedA(A, B, C, M, N, K, alpha, beta)) return;
         if (TrySmallGemm(A, B, C, M, N, K, transA: true, transB: false, alpha, beta)) return;
 
@@ -2527,7 +2572,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 A, B, C, M, K, N, DirectPtxLinearWeightLayout.InputMajor,
                 batchCount))
             return;
+        if (TryDeclaredGemm(DeclaredFamily.Gemm, A, B, C, batchCount, M, N, K, alpha, beta)) return;
+        BatchedGemmIncumbent(A, B, C, M, N, K, batchCount, alpha, beta);
+    }
 
+    // BatchedGemm after the declared GEMM slot: cuBLAS strided-batched. The slot's reference for batched products.
+    private void BatchedGemmIncumbent(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, int batchCount, float alpha, float beta)
+    {
         using var _ = PushContext();
         ApplyDeterministicGemmMathMode();
         float alphaVal = alpha;
@@ -3888,6 +3939,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     /// and a ReLU were two over the same [M, N] output.</summary>
     private unsafe void LaunchBiasAdd(IGpuBuffer A, IGpuBuffer bias, IGpuBuffer C, int M, int N, bool relu)
     {
+        if (TryDeclaredBiasAdd(A, bias, C, M, N, relu)) return;
         if (!_kernelCache.TryGetValue("bias_add_out", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: bias_add_out");
 
@@ -4023,9 +4075,22 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         LaunchElementwiseKernel("add_vectors", A, B, C, size);
     }
 
-    public void AddRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Relu(C, C, size); }
-    public void AddSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Sigmoid(C, C, size); }
-    public void AddGelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Gelu(C, C, size); }
+    // One declared kernel for the pair (#890 phase 4a) where the hand-written path makes two launches.
+    public void AddRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
+    {
+        if (TryDeclaredAddActivation("relu", A, B, C, size)) return;
+        Add(A, B, C, size); Relu(C, C, size);
+    }
+    public void AddSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
+    {
+        if (TryDeclaredAddActivation("sigmoid", A, B, C, size)) return;
+        Add(A, B, C, size); Sigmoid(C, C, size);
+    }
+    public void AddGelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
+    {
+        if (TryDeclaredAddActivation("gelu", A, B, C, size)) return;
+        Add(A, B, C, size); Gelu(C, C, size);
+    }
 
     public void Subtract(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
@@ -4213,6 +4278,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public void Softmax(IGpuBuffer A, IGpuBuffer B, int batchSize, int features)
     {
+        // The declared program first (#890 phase 4a); the kernels below serve any shape it declines.
+        if (TryDeclaredSoftmax(A, B, batchSize, features)) return;
         // Fail-closed direct-PTX fast path (issue #840); returns false until GPU-promoted.
         if (TryDirectPtxSoftmax(A, B, batchSize, features)) return;
         LaunchSoftmaxKernel(A, B, batchSize, features);
@@ -4994,6 +5061,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         if (GpuDeterminism.IsActive)
         {
+            // #890 phase 4e: the same fixed-order sums through a stable sort of the targets (output is zeroed above).
+            if (TrySortedScatterAdd(input, targetIndices, output, numEdges, numNodes, features, accumulate: true,
+                    rows: sourceIndices, weights: edgeValues))
+                return;
             // Issue #382: per-target-node thread scans edges in fixed order.
             if (!_kernelCache.TryGetValue("scatter_add_edges_deterministic", out var krnlD))
                 throw new GpuCapabilityUnavailableException("CUDA kernel not found: scatter_add_edges_deterministic");
@@ -5914,6 +5985,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     private unsafe void LaunchUnaryKernel(string kernelName, IGpuBuffer input, IGpuBuffer output, int size)
     {
+        // A declared kernel first (#890 phase 4a), computing this kernel's own expression; the kernels below serve
+        // anything it declines.
+        if (TryDeclaredElementwise(kernelName, output, size, input)) return;
         // Try vec4 variant for 4x throughput on bandwidth-limited ops
         if (size % 4 == 0 && Vec4Aligned(input, output) && _kernelCache.TryGetValue(kernelName + "_vec4", out var vec4Kernel))
         {
@@ -5959,6 +6033,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (A.Size < size || B.Size < size || C.Size < size)
             throw new InvalidOperationException(
                 $"Elementwise '{kernelName}' operand buffer too small for size {size}: A={A.Size} B={B.Size} C={C.Size}.");
+        // A declared kernel first (#890 phase 4a), computing this kernel's own expression.
+        if (TryDeclaredElementwise(kernelName, C, size, A, B)) return;
         // Try vec4 variant for 4x throughput on bandwidth-limited ops
         if (size % 4 == 0 && Vec4Aligned(A, B, C) && _kernelCache.TryGetValue(kernelName + "_vec4", out var vec4Kernel))
         {
@@ -5996,6 +6072,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     private unsafe void LaunchScaleKernel(IGpuBuffer A, IGpuBuffer B, float scalar, int size)
     {
+        if (TryDeclaredElementwise("scale_vector", B, size, A, scalarCount: 1, s0: scalar)) return;
         // Try vec4 variant
         if (size % 4 == 0 && Vec4Aligned(A, B) && _kernelCache.TryGetValue("scale_vector_vec4", out var vec4Kernel))
         {
@@ -6747,6 +6824,14 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (CudaDispatchPolicy.UseCudnnForConv)
         {
             using var _profileCudnn = CudaDispatchPolicy.Scope("Conv2D", useVendor: true);
+            // The vendor slot: cuDNN's default algorithm unless a measured route (another cuDNN algorithm, or the
+            // backend's own) is faster for the shape.
+            if (batch > 0 && outHeight > 0 && outWidth > 0)
+            {
+                var vendorArgs = new CudaConv2DArgs(input, kernel, output, batch, inChannels, inHeight, inWidth,
+                    outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+                if (Conv2DForwardVendorSlot.TryExecute(vendorArgs.Shape(), vendorArgs)) return;
+            }
             using var _ctxCudnn = PushContext();
             EnsureCudnnConv();
             // Stream affinity: cuDNN kernels launch onto this backend's
@@ -7104,7 +7189,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         {
             var tuned = new TunedConv2DBackwardArgs(gradOutput, kernel, gradInput, false, batch, inChannels, inHeight, inWidth,
                 outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
-            if (Conv2DBackwardDataSlot.TryExecute(tuned.Shape(), tuned)) return;
+            var slot = CudaDispatchPolicy.UseCudnnForConv ? Conv2DBackwardVendorSlot(weightGradient: false)
+                : Conv2DBackwardDataSlot;
+            if (slot.TryExecute(tuned.Shape(), tuned)) return;
         }
         if (TryConv2DBackwardInputGemm(gradOutput, kernel, gradInput, batch, inChannels, inHeight, inWidth,
                 outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW))
@@ -7163,7 +7250,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         {
             var tuned = new TunedConv2DBackwardArgs(input, gradOutput, gradKernel, true, batch, inChannels, inHeight, inWidth,
                 outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
-            if (Conv2DBackwardFilterSlot.TryExecute(tuned.Shape(), tuned)) return;
+            var slot = CudaDispatchPolicy.UseCudnnForConv ? Conv2DBackwardVendorSlot(weightGradient: true)
+                : Conv2DBackwardFilterSlot;
+            if (slot.TryExecute(tuned.Shape(), tuned)) return;
         }
         if (TryConv2DBackwardKernelGemm(input, gradOutput, gradKernel, batch, inChannels, inHeight, inWidth,
                 outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW))
@@ -7366,7 +7455,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         LaunchKernel2D(cudaKernel, gridX, gridY, gridZ, (uint)blockSize, (uint)blockSize, args);
     }
 
-    public unsafe void DepthwiseConv2D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
+    private unsafe void DepthwiseConv2DIncumbent(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
         int batch, int channels, int inHeight, int inWidth,
         int outHeight, int outWidth,
         int kernelH, int kernelW,
@@ -7411,7 +7500,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         LaunchKernel3D(cudaKernel, gx, gy, gz, blockDimXY, blockDimXY, 1, args);
     }
 
-    public unsafe void ConvTranspose2D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
+    private unsafe void ConvTranspose2DIncumbent(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
         int batch, int inChannels, int inHeight, int inWidth,
         int outChannels, int outHeight, int outWidth,
         int kernelH, int kernelW,
@@ -7452,7 +7541,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         LaunchKernel3D(cudaKernel, gx, gy, gz, blockDimXY, blockDimXY, 1, args);
     }
 
-    public unsafe void ConvTranspose2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
+    private unsafe void ConvTranspose2DBackwardInputIncumbent(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
         int batch, int inChannels, int inHeight, int inWidth,
         int outChannels, int outHeight, int outWidth,
         int kernelH, int kernelW,
@@ -7503,7 +7592,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         LaunchKernel(cudaKernel, gridX, DefaultBlockSize, args);
     }
 
-    public unsafe void ConvTranspose2DBackwardKernel(IGpuBuffer input, IGpuBuffer gradOutput, IGpuBuffer gradKernel,
+    private unsafe void ConvTranspose2DBackwardKernelIncumbent(IGpuBuffer input, IGpuBuffer gradOutput, IGpuBuffer gradKernel,
         int batch, int inChannels, int inHeight, int inWidth,
         int outChannels, int outHeight, int outWidth,
         int kernelH, int kernelW,
@@ -8645,6 +8734,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             uint gridGZ = (uint)batch;
             LaunchKernel2D(krnlGrid, gridGX, gridGY, gridGZ, (uint)blockSize, (uint)blockSize, argsG);
 
+            // #890 phase 4e: the input gradient through the sorted scatter, bit-identical to the scanning kernel.
+            if (TrySortedGridSampleGradInput(gradOutput, grid, gradInput, batch, channels, inHeight, inWidth, outHeight,
+                    outWidth, paddingMode, alignCorners))
+                return;
             if (!_kernelCache.TryGetValue("grid_sample_backward_grad_input_deterministic", out var krnlIn))
                 throw new GpuCapabilityUnavailableException("CUDA kernel not found: grid_sample_backward_grad_input_deterministic");
 
@@ -8699,6 +8792,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         IGpuBuffer runningMean, IGpuBuffer runningVar, IGpuBuffer saveMean, IGpuBuffer saveInvVar,
         int batch, int channels, int spatialSize, float epsilon, float momentum, bool training)
     {
+        // The declared program first in training (#890 phase 4a); the kernels below serve any shape it declines.
+        if (training && TryDeclaredBatchNormTraining(input, output, gamma, beta, runningMean, runningVar,
+                saveMean, saveInvVar, batch, channels, spatialSize, epsilon, momentum))
+            return;
         if (TryDirectPtxBatchNormUnit64(
                 input, output, gamma, beta, runningMean, runningVar,
                 saveMean, saveInvVar, batch, channels, spatialSize,
@@ -8884,6 +8981,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
         int batch, int channels, int spatialSize, float epsilon)
     {
+        // The declared program first (#890 phase 4a); the kernels below serve any shape it declines.
+        if (TryDeclaredBatchNormBackward(gradOutput, input, gamma, saveMean, saveInvVar,
+                gradInput, gradGamma, gradBeta, batch, channels, spatialSize))
+            return;
         if (TryDirectPtxBatchNormBackwardUnit64(
                 gradOutput, input, gamma, saveMean, saveInvVar,
                 gradInput, gradGamma, gradBeta,
@@ -8923,6 +9024,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     public unsafe void LayerNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, int batchSize, int normalizedSize, float epsilon)
     {
+        // The declared program first (#890 phase 4a); the hand-written kernels below serve any shape it declines.
+        if (TryDeclaredLayerNorm(input, output, gamma, beta, saveMean, saveInvVar, batchSize, normalizedSize, epsilon))
+            return;
         if (normalizedSize == PtxRowNormalizationD64Kernel.Dimension &&
             TryDirectPtxLayerNormD64(
                 input, output, gamma, beta, saveMean, saveInvVar, batchSize, epsilon))
@@ -8940,6 +9044,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
         int batchSize, int normalizedSize, float epsilon)
     {
+        // The declared program first (#890 phase 4a); the kernels below serve any shape it declines.
+        if (TryDeclaredLayerNormBackward(gradOutput, input, gamma, saveMean, saveInvVar,
+                gradInput, gradGamma, gradBeta, batchSize, normalizedSize))
+            return;
         if (normalizedSize == PtxRowNormalizationD64Kernel.Dimension &&
             TryDirectPtxLayerNormBackwardD64(
                 gradOutput, input, gamma, saveMean, saveInvVar,
@@ -8965,6 +9073,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     public unsafe void GroupNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, int batch, int numGroups, int channels, int spatialSize, float epsilon)
     {
+        // The declared program first (#890 phase 4a); the kernels below serve any shape it declines.
+        if (TryDeclaredGroupNorm(input, output, gamma, beta, saveMean, saveInvVar,
+                batch, numGroups, channels, spatialSize, epsilon))
+            return;
         if (TryDirectPtxGroupNormUnit64(
                 input, output, gamma, beta, saveMean, saveInvVar,
                 batch, numGroups, channels, spatialSize, epsilon))
@@ -9215,6 +9327,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     public unsafe void RmsNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer saveRms,
         int batchSize, int normalizedSize, float epsilon)
     {
+        // The declared program first (#890 phase 4a); the kernels below serve any shape it declines.
+        if (TryDeclaredRmsNorm(input, output, gamma, saveRms, batchSize, normalizedSize, epsilon))
+            return;
         if (normalizedSize == PtxRowNormalizationD64Kernel.Dimension &&
             TryDirectPtxRmsNormD64(input, output, gamma, saveRms, batchSize, epsilon))
             return;
@@ -9243,6 +9358,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     public unsafe void RmsNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer saveRms,
         IGpuBuffer gradInput, IGpuBuffer gradGamma, int batchSize, int normalizedSize, float epsilon)
     {
+        // The declared program first (#890 phase 4a); the kernels below serve any shape it declines.
+        if (TryDeclaredRmsNormBackward(gradOutput, input, gamma, saveRms, gradInput, gradGamma,
+                batchSize, normalizedSize))
+            return;
         if (normalizedSize == PtxRowNormalizationD64Kernel.Dimension &&
             TryDirectPtxRmsNormBackwardD64(
                 gradOutput, input, gamma, saveRms,
@@ -9388,6 +9507,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public unsafe void Embedding(IGpuBuffer indices, IGpuBuffer embeddingTable, IGpuBuffer output, int numIndices, int embeddingDim)
     {
+        if (TryDeclaredEmbedding(indices, embeddingTable, output, numIndices, embeddingDim)) return;
         if (!_kernelCache.TryGetValue("embedding_forward", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: embedding_forward");
 
@@ -9414,6 +9534,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         if (GpuDeterminism.IsActive)
         {
+            // #890 phase 4e: the same sums in the same order through a stable sort -- O(tokens) instead of
+            // O(vocabulary x tokens) (429 ms -> see TrySortedScatterAdd for a 4096-token, 32000-row embedding).
+            if (TrySortedScatterAdd(gradOutput, indices, gradEmbedding, numIndices, vocabSize, embeddingDim,
+                    accumulate: false))
+                return;
             // Issue #382: atomicAdd in embedding_backward is FP-non-deterministic
             // across runs. Route to the atomic-free deterministic variant — one
             // thread per (v, d) output cell scans numIndices in fixed order.
@@ -9536,6 +9661,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new ArgumentException("The attention-weights buffer is too small.", nameof(attentionWeights));
         if (mask is not null && mask.Size < seqQ * seqK)
             throw new ArgumentException("The attention mask must contain at least seqQ * seqK elements.", nameof(mask));
+        int maskMode = mask is null ? 0 : mask.Size >= weightsSize ? 2 : 1;
+        // #890 phase 4d: the declared program (two implicit GEMMs around a row softmax) unless the logits are soft-capped.
+        if (TryDeclaredAttention(query, key, value, output, attentionWeights, mask, batch, numHeads, kvHeads, seqQ, seqK,
+                headDim, scale, isCausal, maskMode, softcap))
+            return;
 
         IntPtr queryPtr = query.Handle;
         IntPtr keyPtr = key.Handle;
@@ -9544,7 +9674,6 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         IntPtr weightsPtr = attentionWeights?.Handle ?? IntPtr.Zero;
         IntPtr maskPtr = mask?.Handle ?? IntPtr.Zero;
         int causalFlag = isCausal ? 1 : 0;
-        int maskMode = mask is null ? 0 : mask.Size >= weightsSize ? 2 : 1;
         int storeWeights = attentionWeights is null ? 0 : 1;
         void** args = stackalloc void*[17];
         args[0] = &queryPtr;
@@ -9677,6 +9806,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             gradQuery, gradKey, gradValue,
             batch, numHeads, numHeads, seqQ, seqK, headDim, scale))
             return;
+        // #890 phase 4d: the six products and the softmax gradient as one declared program, no transposed copies.
+        if (TryDeclaredAttentionBackward(gradOutput, query, key, value, attentionWeights, gradQuery, gradKey, gradValue,
+                batch, numHeads, seqQ, seqK, headDim, scale))
+            return;
         int batchHeads = checked(batch * numHeads);
         int qkSize = checked(seqQ * seqK);
 
@@ -9739,6 +9872,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
     {
         using var _ = PushContext();
+        // #890 phase 4d: the declared attention program (materialised scores, 1.4-9.8x the fused kernel on a GTX
+        // 1660 Ti), with the row log-sum-exp as softmaxStats. Not with a bias, nor causal across unequal lengths: the
+        // flash kernel's causal rule (key <= query) has no offset, the declared one aligns the last query and key.
+        if (attentionBias is null && (!isCausal || seqQ == seqK) &&
+            TryDeclaredAttention(query, key, value, output, null, null, batch, numHeads, numHeads, seqQ, seqK, headDim,
+                scale, isCausal, maskMode: 0, softcap: 0f, stats: softmaxStats))
+            return;
         var kernel = _kernelCache["flash_attention_v2"];
         uint gridX = (uint)((seqQ + 31) / 32);
         uint gridY = (uint)(batch * numHeads);
@@ -9785,6 +9925,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             gradQuery, gradKey, gradValue,
             batch, numHeads, seqQ, seqK, headDim, scale, isCausal,
             attentionBias, biasBatchStride))
+            return;
+        // #890 phase 4d: the declared backward (weights recomputed from softmaxStats) where the forward was declared.
+        if (attentionBias is null &&
+            TryDeclaredFlashAttentionBackward(gradOutput, query, key, value, output, softmaxStats, gradQuery, gradKey,
+                gradValue, batch, numHeads, seqQ, seqK, headDim, scale, isCausal))
             return;
             FlashAttentionBackwardLaunch(
                 gradOutput, query, key, value,
@@ -10505,6 +10650,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public unsafe void SoftmaxBackward(IGpuBuffer gradOutput, IGpuBuffer output, IGpuBuffer gradInput, int batchSize, int features)
     {
+        // The declared program first (#890 phase 4a); the kernels below serve any shape it declines.
+        if (TryDeclaredSoftmaxBackward(gradOutput, output, gradInput, batchSize, features)) return;
         // Fail-closed direct-PTX fast path (issue #840): dX = S*(dY - sum(dY*S)); S=output, dY=gradOutput.
         if (TryDirectPtxSoftmaxBackward(output, gradOutput, gradInput, batchSize, features)) return;
         if (batchSize > 0 && features > 0 &&
@@ -10540,6 +10687,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public unsafe void LeakyRelu(IGpuBuffer A, IGpuBuffer B, float alpha, int size)
     {
+        if (TryDeclaredElementwise("leaky_relu", B, size, A, scalarCount: 1, s0: alpha)) return;
         if (!_kernelCache.TryGetValue("leaky_relu", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: leaky_relu");
 
@@ -10580,6 +10728,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public unsafe void Elu(IGpuBuffer A, IGpuBuffer B, float alpha, int size)
     {
+        if (TryDeclaredElementwise("elu", B, size, A, scalarCount: 1, s0: alpha)) return;
         if (!_kernelCache.TryGetValue("elu", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: elu");
 
@@ -10825,6 +10974,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public unsafe void Relu6(IGpuBuffer A, IGpuBuffer B, int size)
     {
+        if (TryDeclaredElementwise("relu6", B, size, A)) return;
         if (!_kernelCache.TryGetValue("relu6", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: relu6");
         using var _ = PushContext();
@@ -10917,6 +11067,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public unsafe void Threshold(IGpuBuffer input, IGpuBuffer output, float threshold, float value, int size)
     {
+        if (TryDeclaredElementwise("threshold_forward", output, size, input, scalarCount: 2, s0: threshold, s1: value)) return;
         if (!_kernelCache.TryGetValue("threshold_forward", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: threshold_forward");
         using var _ = PushContext();
@@ -11088,7 +11239,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         Fill(counts, 0f, outputSize);
         IntPtr sPtr = source.Handle, idxPtr = indices.Handle, oPtr = output.Handle, cPtr = counts.Handle;
 
-        if (GpuDeterminism.IsActive)
+        if (GpuDeterminism.IsActive && featureSize > 0 &&
+            TrySortedScatterAdd(source, indices, output, sourceSize / featureSize, outputSize, featureSize,
+                accumulate: false, counts: counts))
+        {
+            // #890 phase 4e: scatter_mean_activation_deterministic's sums and counts, through a stable sort.
+        }
+        else if (GpuDeterminism.IsActive)
         {
             // Issue #382: route to atomic-free variant — per (dstRow, col) output cell.
             if (!_kernelCache.TryGetValue("scatter_mean_activation_deterministic", out var kernelD))
@@ -11251,6 +11408,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             input, weight, bias, output, batchSize, inFeatures, outFeatures,
             DirectPtxLinearActivation.Relu, DirectPtxLinearWeightLayout.InputMajor))
             return;
+        if (TryDeclaredFusedLinear(input, weight, bias, output, batchSize, inFeatures, outFeatures,
+            CodegenActivationKind.ReLU))
+            return;
         if (!_kernelCache.TryGetValue("fused_linear_relu", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_relu");
         using var _ = PushContext();
@@ -11270,6 +11430,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (TryDirectPtxFusedLinearTiled(
             input, weight, bias, output, batchSize, inFeatures, outFeatures,
             DirectPtxLinearActivation.Sigmoid, DirectPtxLinearWeightLayout.InputMajor))
+            return;
+        if (TryDeclaredFusedLinear(input, weight, bias, output, batchSize, inFeatures, outFeatures,
+            CodegenActivationKind.Sigmoid))
             return;
         if (!_kernelCache.TryGetValue("fused_linear_sigmoid", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_sigmoid");
@@ -11291,6 +11454,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             input, weight, bias, output, batchSize, inFeatures, outFeatures,
             DirectPtxLinearActivation.Tanh, DirectPtxLinearWeightLayout.InputMajor))
             return;
+        if (TryDeclaredFusedLinear(input, weight, bias, output, batchSize, inFeatures, outFeatures,
+            CodegenActivationKind.Tanh))
+            return;
         if (!_kernelCache.TryGetValue("fused_linear_tanh", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_tanh");
         using var _ = PushContext();
@@ -11310,6 +11476,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (TryDirectPtxFusedLinearTiled(
             input, weight, bias, output, batchSize, inFeatures, outFeatures,
             DirectPtxLinearActivation.GeluTanh, DirectPtxLinearWeightLayout.InputMajor))
+            return;
+        if (TryDeclaredFusedLinear(input, weight, bias, output, batchSize, inFeatures, outFeatures,
+            CodegenActivationKind.Gelu))
             return;
         if (!_kernelCache.TryGetValue("fused_linear_gelu", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_gelu");
@@ -11359,6 +11528,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             input, weight, bias, output, batchSize, inFeatures, outFeatures,
             DirectPtxLinearActivation.Swish, DirectPtxLinearWeightLayout.InputMajor))
             return;
+        if (TryDeclaredFusedLinear(input, weight, bias, output, batchSize, inFeatures, outFeatures,
+            CodegenActivationKind.Swish))
+            return;
         if (!_kernelCache.TryGetValue("fused_linear_swish", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_swish");
         using var _ = PushContext();
@@ -11378,6 +11550,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (TryDirectPtxFusedLinearBackward(
             gradOutput, input, weight, preActivation, gradInput, gradWeight, gradBias,
             batchSize, inFeatures, outFeatures, DirectPtxLinearActivation.Relu))
+            return;
+        if (TryDeclaredFusedLinearBackward(gradOutput, input, weight, preActivation, gradInput, gradWeight, gradBias,
+            batchSize, inFeatures, outFeatures, CodegenActivationKind.ReLU))
             return;
         // Grad input kernel
         if (!_kernelCache.TryGetValue("fused_linear_relu_backward_grad_input", out var giKernel))
@@ -11422,6 +11597,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             gradOutput, input, weight, output, gradInput, gradWeight, gradBias,
             batchSize, inFeatures, outFeatures, DirectPtxLinearActivation.Sigmoid))
             return;
+        if (TryDeclaredFusedLinearBackward(gradOutput, input, weight, output, gradInput, gradWeight, gradBias,
+            batchSize, inFeatures, outFeatures, CodegenActivationKind.Sigmoid))
+            return;
         if (!_kernelCache.TryGetValue("fused_linear_sigmoid_backward_grad_input", out var giKernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_sigmoid_backward_grad_input");
         using var _ = PushContext();
@@ -11461,6 +11639,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (TryDirectPtxFusedLinearBackward(
             gradOutput, input, weight, output, gradInput, gradWeight, gradBias,
             batchSize, inFeatures, outFeatures, DirectPtxLinearActivation.Tanh))
+            return;
+        if (TryDeclaredFusedLinearBackward(gradOutput, input, weight, output, gradInput, gradWeight, gradBias,
+            batchSize, inFeatures, outFeatures, CodegenActivationKind.Tanh))
             return;
         if (!_kernelCache.TryGetValue("fused_linear_tanh_backward_grad_input", out var giKernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_tanh_backward_grad_input");
@@ -11502,6 +11683,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             gradOutput, input, weight, preActivation, gradInput, gradWeight, gradBias,
             batchSize, inFeatures, outFeatures, DirectPtxLinearActivation.GeluTanh))
             return;
+        if (TryDeclaredFusedLinearBackward(gradOutput, input, weight, preActivation, gradInput, gradWeight, gradBias,
+            batchSize, inFeatures, outFeatures, CodegenActivationKind.Gelu))
+            return;
         if (!_kernelCache.TryGetValue("fused_linear_gelu_backward_grad_input", out var giKernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_gelu_backward_grad_input");
         using var _ = PushContext();
@@ -11541,6 +11725,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (TryDirectPtxFusedLinearBackward(
             gradOutput, input, weight, preActivation, gradInput, gradWeight, gradBias,
             batchSize, inFeatures, outFeatures, DirectPtxLinearActivation.Swish))
+            return;
+        if (TryDeclaredFusedLinearBackward(gradOutput, input, weight, preActivation, gradInput, gradWeight, gradBias,
+            batchSize, inFeatures, outFeatures, CodegenActivationKind.Swish))
             return;
         if (!_kernelCache.TryGetValue("fused_linear_swish_backward_grad_input", out var giKernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_swish_backward_grad_input");
@@ -12606,6 +12793,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public unsafe void Clamp(IGpuBuffer A, IGpuBuffer B, float min, float max, int size)
     {
+        if (TryDeclaredElementwise("clamp", B, size, A, scalarCount: 2, s0: min, s1: max)) return;
         if (!_kernelCache.TryGetValue("clamp", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: clamp");
 
@@ -12798,6 +12986,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (output.Size < size)
             throw new ArgumentException($"Buffer 'output' capacity ({output.Size}) is less than size ({size}).", nameof(output));
 
+        if (TryDeclaredElementwise("lerp_fused", output, size, a, b, scalarCount: 1, s0: t)) return;
+
         if (!_kernelCache.TryGetValue("lerp_fused", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: lerp_fused");
 
@@ -12914,6 +13104,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         if (GpuDeterminism.IsActive)
         {
+            // #890 phase 4e: the same fixed-order sums through a stable sort, O(sources) instead of O(dest x sources).
+            if (TrySortedScatterAdd(source, indices, destination, sourceSize, destSize, 1, accumulate: true)) return;
             if (!_kernelCache.TryGetValue("scatter_add_accumulate_deterministic", out var kernelDet))
                 throw new GpuCapabilityUnavailableException("CUDA kernel not found: scatter_add_accumulate_deterministic");
             // One thread PER DESTINATION CELL (not per source element): each thread solely owns its
@@ -12971,6 +13163,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (TryDirectPtxGather(source, indices, output, numIndices, featureSize))
             return;
 #endif
+        if (TryDeclaredEmbedding(indices, source, output, numIndices, featureSize)) return;
         if (!_kernelCache.TryGetValue("embedding_forward", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: embedding_forward");
 
@@ -13045,6 +13238,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     }
     public unsafe void TakeAlongDim(IGpuBuffer input, IGpuBuffer indices, IGpuBuffer output, int outerSize, int axisOut, int innerSize, int axisIn)
     {
+        if (TryDeclaredTakeAlongDim(input, indices, output, outerSize, axisOut, innerSize, axisIn)) return;
         var kernel = ResolveParity210Kernel("parity210_take_along_dim_f");
         using var _ = PushContext();
         int __total = outerSize*axisOut*innerSize; if (__total <= 0) return;
@@ -13454,6 +13648,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public unsafe void Where(IGpuBuffer condition, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
+        if (TryDeclaredElementwise("where_select", C, size, condition, A, B)) return;
         if (!_kernelCache.TryGetValue("where_select", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: where_select");
 
@@ -13861,6 +14056,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients, IReadOnlyList<int> sizes,
         float learningRate, float weightDecay)
         => SgdMultiTensorImpl(parameters, gradients, sizes, learningRate, weightDecay, IntPtr.Zero, IntPtr.Zero);
+
+    /// <summary>The guarded updates below read the guard in their kernels (<c>sgd_multi_tensor_update</c> and the
+    /// Adam kernels take it as an argument), so nothing is read back before a launch.</summary>
+    public bool GuardsFiniteOnDevice => true;
 
     /// <summary>
     /// <see cref="SgdMultiTensorUpdate"/> whose kernel reads <paramref name="finiteGuard"/> (a double) on the device and
@@ -18759,6 +18958,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             CudaNativeBindings.cuModuleUnload(_skinnyGemmModule);
             _skinnyGemmModule = IntPtr.Zero;
         }
+        DisposeSortedScatter();
 
         if (_implicitConvModule != IntPtr.Zero)
         {
@@ -18879,6 +19079,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     // Helper: launch a kernel by name with stackalloc args
     private unsafe void LaunchFusedUnary(string kernelName, IGpuBuffer input, IGpuBuffer output, int size)
     {
+        if (TryDeclaredElementwise(kernelName, output, size, input)) return;
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
             throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {kernelName}");
         using var _ = PushContext();
@@ -18890,6 +19091,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     private unsafe void LaunchFusedBinary(string kernelName, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size)
     {
+        if (TryDeclaredElementwise(kernelName, output, size, a, b)) return;
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
             throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {kernelName}");
         using var _ = PushContext();
@@ -18912,6 +19114,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     private unsafe void LaunchFusedScalar(string kernelName, IGpuBuffer input, IGpuBuffer output, float scalar, int size)
     {
+        if (TryDeclaredElementwise(kernelName, output, size, input, scalarCount: 1, s0: scalar)) return;
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
             throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {kernelName}");
         using var _ = PushContext();

@@ -954,6 +954,21 @@ internal static class DifferentiableOps
         Tensor<T> GradForInPlace() =>
             gradForInPlaceCache ??= (grad.IsContiguous ? grad : grad.Contiguous());
 
+        // A compiled GPU step's deferrable gradient (GradientDeferral): when this step already holds a contribution, park
+        // this one for the consuming backward to sum as it loads, instead of an in-place add pass.
+        if (!needsOutOfPlace && GradientDeferral.Enabled
+            && engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine { DeferredGradients: { } deferral }
+            && deferral.Accepts(tensor) && grad.IsContiguous && grad.Length == tensor.Length)
+        {
+            int slot = tensor._gradIndex;
+            Tensor<T>? held = slot >= 0 && _indexedGrads != null && slot < _indexedGrads.Length
+                ? (Tensor<T>?)_indexedGrads[slot]
+                : grads.TryGetValue(tensor, out var heldDict) ? heldDict : null;
+            if (held is not null && IsWrittenThisStep(held) && held.IsContiguous && !HasOverlappingStorage(held, grad)
+                && deferral.TryPark(tensor, grad))
+                return;
+        }
+
         // Fast path: use indexed array when grad indices are assigned (avoids hash lookup)
         int idx = tensor._gradIndex;
         if (idx >= 0 && _indexedGrads != null && idx < _indexedGrads.Length)

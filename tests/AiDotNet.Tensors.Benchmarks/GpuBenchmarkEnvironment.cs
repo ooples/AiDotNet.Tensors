@@ -42,7 +42,12 @@ internal static class GpuBenchmarkEnvironment
         bool afterSuite = false,
         bool ignoreMixedWddmProcesses = false)
     {
-        RequireNoForeignPython(label);
+        int? launcher = int.TryParse(
+            Environment.GetEnvironmentVariable("AIDOTNET_BENCHMARK_LAUNCHER_PID"),
+            out int launcherId) && launcherId > 0
+                ? launcherId
+                : null;
+        RequireNoForeignPython(label, launcher);
         string processMonitor = RunNvidiaSmi("pmon", "-c", "1", "-s", "u");
         int? trustedOrchestrator = int.TryParse(
             Environment.GetEnvironmentVariable("AIDOTNET_BENCHMARK_ORCHESTRATOR_PID"),
@@ -71,7 +76,10 @@ internal static class GpuBenchmarkEnvironment
         }
     }
 
-    private static void RequireNoForeignPython(string label)
+    // The launcher (AIDOTNET_BENCHMARK_LAUNCHER_PID) is the Python script that started this bench as its child -
+    // tools/bakeoff/run_bakeoff.py runs the generated lane that way - and waits on it doing no GPU work, so it is not a
+    // foreign Python workload. Without the exemption the competitor lane refused itself on every run.
+    private static void RequireNoForeignPython(string label, int? launcher)
     {
         var conflicts = new List<string>();
         foreach (Process process in Process.GetProcesses())
@@ -80,7 +88,7 @@ internal static class GpuBenchmarkEnvironment
             {
                 try
                 {
-                    if (process.Id == Environment.ProcessId)
+                    if (process.Id == Environment.ProcessId || process.Id == launcher)
                         continue;
                     string name = process.ProcessName;
                     if (string.Equals(name, "python", StringComparison.OrdinalIgnoreCase) ||

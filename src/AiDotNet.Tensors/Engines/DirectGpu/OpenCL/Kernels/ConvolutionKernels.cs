@@ -421,8 +421,6 @@ __kernel void conv_transpose2d_backward_input(
     const int b = idx / (inWidth * inHeight * inChannels);
 
     // Effective output dimensions excluding output padding
-    const int outHeight_eff = outHeight - outputPadH;
-    const int outWidth_eff = outWidth - outputPadW;
 
     float sum = 0.0f;
 
@@ -432,8 +430,9 @@ __kernel void conv_transpose2d_backward_input(
                 int oh = ih * strideH - padH + kh;
                 int ow = iw * strideW - padW + kw;
 
-                // Only consider positions within effective output (excluding output padding region)
-                if (oh >= 0 && oh < outHeight_eff && ow >= 0 && ow < outWidth_eff) {
+                // Every output row, the output-padding ones included: the forward writes them too (the adjoint of
+                // ConvTranspose2D is Conv2D over the whole gradOutput, as on the CPU engine).
+                if (oh >= 0 && oh < outHeight && ow >= 0 && ow < outWidth) {
                     int goIdx = ((b * outChannels + oc) * outHeight + oh) * outWidth + ow;
                     int kIdx = ((ic * outChannels + oc) * kernelH + kh) * kernelW + kw;
                     sum += gradOutput[goIdx] * weights[kIdx];
@@ -476,8 +475,6 @@ __kernel void conv_transpose2d_backward_weights(
     const int ic = idx / (kernelW * kernelH * outChannels);
 
     // Effective output dimensions excluding output padding
-    const int outHeight_eff = outHeight - outputPadH;
-    const int outWidth_eff = outWidth - outputPadW;
 
     float sum = 0.0f;
 
@@ -487,8 +484,9 @@ __kernel void conv_transpose2d_backward_weights(
                 int oh = ih * strideH - padH + kh;
                 int ow = iw * strideW - padW + kw;
 
-                // Only consider positions within effective output (excluding output padding region)
-                if (oh >= 0 && oh < outHeight_eff && ow >= 0 && ow < outWidth_eff) {
+                // Every output row, the output-padding ones included: the forward writes them too (the adjoint of
+                // ConvTranspose2D is Conv2D over the whole gradOutput, as on the CPU engine).
+                if (oh >= 0 && oh < outHeight && ow >= 0 && ow < outWidth) {
                     int inIdx = ((b * inChannels + ic) * inHeight + ih) * inWidth + iw;
                     int goIdx = ((b * outChannels + oc) * outHeight + oh) * outWidth + ow;
                     sum += input[inIdx] * gradOutput[goIdx];

@@ -33,6 +33,62 @@ internal static class DirectPtxArchitecture
     };
 
     /// <summary>
+    /// Devices the kernel conveyor (verify, release, bench: #890) develops specs on: Turing (SM75) and later, where the
+    /// affine emitters' PTX is verified against its fp64 oracle (all 13 catalog kernels on a GTX 1660 Ti, SM75). This is a
+    /// development gate, not a promotion: which generated kernel ships on an architecture is still decided by that
+    /// architecture's own release evidence (competitor and limiter), and the hand-written kernels keep their GA102 gates.
+    /// </summary>
+    internal static bool HasCodegenConveyor(int major, int minor) =>
+        major > 7 || (major == 7 && minor >= 5);
+
+    /// <summary>
+    /// Architectures a declared program may serve a PRODUCTION call on: the ones whose own release evidence has been
+    /// taken. <see cref="HasCodegenConveyor"/> is the development gate its own documentation says it is, and using it
+    /// to route production let a lowered program launch wherever ptxas accepted it -- docs/CODEGEN_MULTI_ARCH_VALIDATION.md
+    /// is explicit that the SM80/86/89/90 matrix is assembly portability evidence only and that "the
+    /// second-architecture performance gate is external and remains unsatisfied".
+    ///
+    /// The default set is the two lanes the repository documents as physical: SM75, where
+    /// <see cref="HasCodegenConveyor"/> records all 13 catalog kernels verified against their fp64 oracle, and GA102
+    /// SM86, the primary Ampere lane that runs correctness, head-to-head, autotune, competitor, limiter and release
+    /// evidence. Anywhere else the hand-written kernels serve the call, which is the same outcome as a decline.
+    ///
+    /// A lane that has its own evidence widens the set with AIDOTNET_DECLARED_KERNELS_ARCH, a comma-separated list of
+    /// compute capabilities ("86,90") or "all". This is the same shape as
+    /// <see cref="HasValidatedOnlineAttention"/>: an architecture supplies its own measurement instead of inheriting
+    /// another family's.
+    /// </summary>
+    internal static bool HasReleasedCodegenKernels(int major, int minor)
+    {
+        if (!HasCodegenConveyor(major, minor)) return false;
+        var released = s_releasedCodegenArchitectures;
+        if (released is null) return (major, minor) is (7, 5) || IsGa102Sm86(major, minor);
+        return released.Count == 0 || released.Contains(major * 10 + minor);
+    }
+
+    // Null when AIDOTNET_DECLARED_KERNELS_ARCH is unset (the documented lanes); empty for "all"; otherwise the
+    // capabilities it lists. Read once: the variable is a deployment decision, not a per-call one.
+    private static readonly HashSet<int>? s_releasedCodegenArchitectures = ParseReleasedArchitectures(
+        Environment.GetEnvironmentVariable("AIDOTNET_DECLARED_KERNELS_ARCH"));
+
+    private static HashSet<int>? ParseReleasedArchitectures(string? configured)
+    {
+        // Not string.IsNullOrWhiteSpace: net471's overload carries no NotNullWhen annotation, so the flow analysis
+        // does not learn that configured is non-null afterwards.
+        if (configured is null) return null;
+        string trimmed = configured.Trim();
+        if (trimmed.Length == 0) return null;
+        if (string.Equals(trimmed, "all", StringComparison.OrdinalIgnoreCase)) return new HashSet<int>();
+        var set = new HashSet<int>();
+        foreach (string part in configured.Split(','))
+            if (int.TryParse(part.Trim(), System.Globalization.NumberStyles.Integer,
+                    System.Globalization.CultureInfo.InvariantCulture, out int capability) && capability > 0)
+                set.Add(capability);
+        // An unparseable value is not "every architecture": fall back to the documented lanes.
+        return set.Count == 0 ? null : set;
+    }
+
+    /// <summary>
     /// The checked-in asynchronous attention implementation is an Ampere
     /// specialization. Other families must supply and benchmark their own
     /// implementation instead of silently inheriting Ampere's tuning.

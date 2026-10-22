@@ -13,6 +13,12 @@ public sealed partial class HipBackend : IFftBackend, IGenericFftBackend, IMeshg
     /// <remarks>HIP keeps its power-of-two FFT kernel.</remarks>
     bool IGenericFftBackend.PrefersGenericFftForPowerOfTwo => false;
 
+    /// <summary>
+    /// The guarded updates read the guard on the host (<see cref="PerTensorMultiTensorOptimizer"/>): this backend's
+    /// Adam/AdamW/SGD kernels take no guard argument, so the verdict is downloaded before the launch.
+    /// </summary>
+    public bool GuardsFiniteOnDevice => false;
+
     public void AdamMultiTensorUpdate(
         IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
         IReadOnlyList<IGpuBuffer> firstMoments, IReadOnlyList<IGpuBuffer> secondMoments,

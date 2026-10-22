@@ -196,6 +196,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// <see cref="Engines.DirectGpuTensorEngine.FirstWriteRedirects"/>). Dropped by the eager step.</summary>
     private readonly Engines.FirstWriteRedirectTable _firstWriteRedirects = new();
 
+    // The gradients whose second contribution the GPU step body parks for the consuming fused BatchNorm+ReLU backward
+    // (Autodiff.GradientDeferral), or null when the plan has none.
+    private Autodiff.GradientDeferral? _gradientDeferral;
+
     /// <summary>Host-engine eager step: per gradient buffer, true when every writer is a generic backward step, so
     /// the buffer is not zeroed and its first contribution of the step is copied in (GradWriteGeneration). Null when
     /// the backward is all-specialized, pooled, or has no such buffer. Entries are cleared by
@@ -2331,7 +2335,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             guard = _finitenessSumSquares;
         }
         _finitenessGuard = guard;
-        if (deferToDeviceGuard && cuda is Engines.DirectGpu.IDeviceReadbackFactory factory)
+        // Only where the guarded update reads the guard on the device. Elsewhere it reads it on the host anyway, so
+        // deferring would add a second device-to-host copy per step and save none: resolve finiteness here instead.
+        if (deferToDeviceGuard && cuda is Engines.DirectGpu.IMultiTensorGpuOptimizerBackend { GuardsFiniteOnDevice: true }
+            && cuda is Engines.DirectGpu.IDeviceReadbackFactory factory)
         {
             // The update kernel reads the sum itself and writes nothing when it is not finite; the host learns the
             // outcome from a readback it waits on only at the next step (or when asked), so this step never blocks.
@@ -3874,9 +3881,15 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         bool completed = false;
         _firstWriteRedirects.BeginRun();
         if (redirectEngine is not null) redirectEngine.FirstWriteRedirects = _firstWriteRedirects;
+        _gradientDeferral?.Reset();
+        // Restored rather than cleared: this body can run nested inside another plan's on this thread, and clearing
+        // would lose what the outer one parked.
+        var outerDeferral = redirectEngine?.DeferredGradients;
+        if (redirectEngine is not null) redirectEngine.DeferredGradients = _gradientDeferral;
         try { RunGpuStepBodyForCaptureCore(backend); completed = true; }
         finally
         {
+            if (redirectEngine is not null) redirectEngine.DeferredGradients = outerDeferral;
             if (redirectEngine is not null) redirectEngine.FirstWriteRedirects = null;
             // Only a whole executed run is evidence; a capture records, and a body that threw left its pairing unknown.
             _firstWriteRedirects.EndRun(executed && completed);
@@ -8731,7 +8744,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var shortcutPairs = new Dictionary<int, (int Main, int Shortcut)>();
         var consumedByShortcutPair = new HashSet<int>();
         if (typeof(T) == typeof(float) && preferGenericForGpu && !useGradPool && fp16HeteroOrder is null
-            && engine is DirectGpuTensorEngine shortcutEngine
+            && engine is IConvShortcutPairEngine shortcutEngine
             && Environment.GetEnvironmentVariable("AIDOTNET_CONV_SHORTCUT_FUSION") != "0")
         {
             var excluded = new HashSet<int>(fusedStepIndices);
@@ -9176,6 +9189,14 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             plan._aliasedGradViews = aliasedGradViews?.ToArray();
             plan._eagerFirstWriteCandidates = eagerFirstWriteCandidates;
             plan._backwardStepKinds = backwardStepNames.ToArray();
+            // A fused BatchNorm+ReLU output read by exactly two steps (a residual block's input: the next block's first
+            // convolution and its shortcut): its backward sums both contributions as it loads them.
+            var deferrable = new List<object>();
+            foreach (var fs in forwardSteps)
+                if ((fs.OpName == "BatchNormReLU" || fs.OpName == "BatchNormAddReLU")
+                    && consumerCount.TryGetValue(fs.OutputBuffer, out int outputUses) && outputUses == 2)
+                    deferrable.Add(fs.OutputBuffer);
+            if (deferrable.Count > 0 && engine is DirectGpuTensorEngine) plan._gradientDeferral = new Autodiff.GradientDeferral(deferrable);
             scope.ReleaseStorageLeases();
             return plan;
         }

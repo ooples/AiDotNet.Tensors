@@ -378,17 +378,17 @@ __device__ __forceinline__ void wino_f32w_fused_body(
     const int c0 = blockIdx.x * WF_TC, k0 = blockIdx.y * WF_TK;
     const int TT = tilesH * tilesW, P = N * TT;
     const int pBegin = blockIdx.z * tilesPerSplit, pEnd = min(P, pBegin + tilesPerSplit);
-    const int tc = tid & 7, tk = (tid >> 3) & 7, tx = tid >> 6;
+    // Accumulator role: component xc, k rows kq*8 .. kq*8 + 7, c columns cq*8 .. cq*8 + 7 (a quarter-warp's 8 threads
+    // share xc and read 2 u rows and 4 v rows: broadcast and conflict-free).
+    const int cq = tid & 3, kq = (tid >> 2) & 3, xc = tid >> 4;
     // Transform role: tile j (fastest, so a warp's loads walk along image rows) of the chunk, channel row r.
     const int tj = tid & (WF_PC - 1), tr = tid / WF_PC;
 
-    float acc[4][4][4];
+    float acc[8][8];
     #pragma unroll
-    for (int a = 0; a < 4; a++)
+    for (int a = 0; a < 8; a++)
         #pragma unroll
-        for (int b = 0; b < 4; b++)
-            #pragma unroll
-            for (int e = 0; e < 4; e++) acc[a][b][e] = 0.0f;
+        for (int b = 0; b < 8; b++) acc[a][b] = 0.0f;
 
     for (int pc = pBegin; pc < pEnd; pc += WF_PC)
     {
@@ -458,18 +458,16 @@ __device__ __forceinline__ void wino_f32w_fused_body(
         #pragma unroll
         for (int j = 0; j < WF_PC; j++)
         {
+            const float4 u0 = *reinterpret_cast<const float4*>(&Us[xc][j][kq * 8]);
+            const float4 u1 = *reinterpret_cast<const float4*>(&Us[xc][j][kq * 8 + 4]);
+            const float4 v0 = *reinterpret_cast<const float4*>(&Vs[xc][j][cq * 8]);
+            const float4 v1 = *reinterpret_cast<const float4*>(&Vs[xc][j][cq * 8 + 4]);
+            const float uu[8] = { u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w };
+            const float vv[8] = { v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w };
             #pragma unroll
-            for (int xi = 0; xi < 4; xi++)
-            {
-                const int xx = tx * 4 + xi;
-                const float4 u = *reinterpret_cast<const float4*>(&Us[xx][j][tk * 4]);
-                const float4 v = *reinterpret_cast<const float4*>(&Vs[xx][j][tc * 4]);
-                const float uu[4] = { u.x, u.y, u.z, u.w }, vv[4] = { v.x, v.y, v.z, v.w };
+            for (int a = 0; a < 8; a++)
                 #pragma unroll
-                for (int a = 0; a < 4; a++)
-                    #pragma unroll
-                    for (int b = 0; b < 4; b++) acc[xi][a][b] = fmaf(uu[a], vv[b], acc[xi][a][b]);
-            }
+                for (int b = 0; b < 8; b++) acc[a][b] = fmaf(uu[a], vv[b], acc[a][b]);
         }
         __syncthreads();
     }
@@ -488,15 +486,13 @@ __device__ __forceinline__ void wino_f32w_fused_body(
     #pragma unroll
     for (int quarter = 0; quarter < 4; quarter++)
     {
-        if ((tk >> 1) == quarter)
+        if (kq == quarter)
         {
             #pragma unroll
-            for (int xi = 0; xi < 4; xi++)
+            for (int a = 0; a < 8; a++)
                 #pragma unroll
-                for (int a = 0; a < 4; a++)
-                    #pragma unroll
-                    for (int b = 0; b < 4; b++)
-                        Ms[(tx * 4 + xi) * 264 + ((tk & 1) * 4 + a) * 33 + tc * 4 + b] = acc[xi][a][b];
+                for (int b = 0; b < 8; b++)
+                    Ms[xc * 264 + a * 33 + cq * 8 + b] = acc[a][b];
         }
         __syncthreads();
         {
@@ -546,15 +542,13 @@ __device__ __forceinline__ void wino_f32w_fused_body(
     #pragma unroll
     for (int half = 0; half < 2; half++)
     {
-        if ((tk >> 2) == half)
+        if ((kq >> 1) == half)
         {
             #pragma unroll
-            for (int xi = 0; xi < 4; xi++)
+            for (int a = 0; a < 8; a++)
                 #pragma unroll
-                for (int a = 0; a < 4; a++)
-                    #pragma unroll
-                    for (int b = 0; b < 4; b++)
-                        Ms[(tx * 4 + xi) * 528 + ((tk & 3) * 4 + a) * 33 + tc * 4 + b] = acc[xi][a][b];
+                for (int b = 0; b < 8; b++)
+                    Ms[xc * 528 + ((kq & 1) * 8 + a) * 33 + cq * 8 + b] = acc[a][b];
         }
         __syncthreads();
         for (int pair = tid; pair < 512; pair += 256)

@@ -957,6 +957,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 // are the only ones here that declare shared memory and a fixed 256-wide group, so a driver that
                 // rejects them must drop only the fused candidate and leave the transforms above serving.
                 CompileWinogradModule(WinogradKernelGroup.Fused, "Winograd fused weight-gradient kernels");
+                CompileBatchNormRegisterModule();
 
                 // Winograd F(4x4, 3x3) forward transforms: a separate module so a driver that rejects it drops only this
                 // candidate.

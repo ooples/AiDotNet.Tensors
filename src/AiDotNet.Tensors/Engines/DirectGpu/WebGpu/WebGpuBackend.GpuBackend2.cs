@@ -156,13 +156,14 @@ public sealed partial class WebGpuBackend
         int strideH, int strideW, int padH, int padW,
         int outputPadH, int outputPadW)
     {
-        // Apply output padding to resolve transposed convolution output size ambiguity.
-        // outH_final = outH + outputPadH, outW_final = outW + outputPadW
-        int finalOutH = outHeight + outputPadH;
-        int finalOutW = outWidth + outputPadW;
+        // outHeight/outWidth already INCLUDE the output padding: every caller computes them as
+        // (in - 1) * stride - 2 * pad + kernel + outputPad and sizes the buffer to match
+        // (DirectGpuTensorEngine.cs, ConvTranspose2D/BackwardInput/BackwardKernel), so adding outputPad here counted it
+        // twice - it inflated out_height, which the shader also uses as the row stride, so the whole tensor was
+        // mis-indexed rather than only its tail. Metal and Vulkan take the dimensions as given; so do we.
         var uniforms = MakeConvUniforms(batch, inChannels, outChannels,
-            inHeight, inWidth, finalOutH, finalOutW, kernelH, kernelW, strideH, strideW, padH, padW);
-        var (wgX, wgY, wgZ) = CalcWorkgroups8x8(finalOutW, finalOutH, batch * outChannels);
+            inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW);
+        var (wgX, wgY, wgZ) = CalcWorkgroups8x8(outWidth, outHeight, batch * outChannels);
         Dispatch3Buffer3DAsync("ConvTranspose2D", WebGpuKernels.ConvTranspose2DSource, "conv_transpose2d",
             input, kernel, output, uniforms, wgX, wgY, wgZ).GetAwaiter().GetResult();
     }
@@ -174,11 +175,13 @@ public sealed partial class WebGpuBackend
         int strideH, int strideW, int padH, int padW,
         int outputPadH, int outputPadW)
     {
-        // Use adjusted output dimensions including output padding for backward pass
-        int finalOutH = outHeight + outputPadH;
-        int finalOutW = outWidth + outputPadW;
+        // outHeight/outWidth already INCLUDE the output padding: every caller computes them as
+        // (in - 1) * stride - 2 * pad + kernel + outputPad and sizes the buffer to match
+        // (DirectGpuTensorEngine.cs, ConvTranspose2D/BackwardInput/BackwardKernel), so adding outputPad here counted it
+        // twice - it inflated out_height, which the shader also uses as the row stride, so the whole tensor was
+        // mis-indexed rather than only its tail. Metal and Vulkan take the dimensions as given; so do we.
         var uniforms = MakeConvUniforms(batch, inChannels, outChannels,
-            inHeight, inWidth, finalOutH, finalOutW, kernelH, kernelW, strideH, strideW, padH, padW);
+            inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW);
         var (wgX, wgY, wgZ) = CalcWorkgroups8x8(inWidth, inHeight, batch * inChannels);
         Dispatch3Buffer3DAsync("ConvTranspose2DBackwardInput",
             WebGpuKernels.ConvTranspose2DBackwardInputSource, "conv_transpose2d_backward_input",
@@ -193,11 +196,14 @@ public sealed partial class WebGpuBackend
         int outputPadH, int outputPadW)
     {
         // dL/dW[ic,oc,ky,kx] = sum over batch, input positions of input * gradOutput
-        int finalOutH = outHeight + outputPadH;
-        int finalOutW = outWidth + outputPadW;
+        // outHeight/outWidth already INCLUDE the output padding: every caller computes them as
+        // (in - 1) * stride - 2 * pad + kernel + outputPad and sizes the buffer to match
+        // (DirectGpuTensorEngine.cs, ConvTranspose2D/BackwardInput/BackwardKernel), so adding outputPad here counted it
+        // twice - it inflated out_height, which the shader also uses as the row stride, so the whole tensor was
+        // mis-indexed rather than only its tail. Metal and Vulkan take the dimensions as given; so do we.
         int totalKernelElements = inChannels * outChannels * kernelH * kernelW;
         var uniforms = MakeConvUniforms(batch, inChannels, outChannels,
-            inHeight, inWidth, finalOutH, finalOutW, kernelH, kernelW, strideH, strideW, padH, padW);
+            inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW);
         Dispatch3BufferAsync("ConvTranspose2DBackwardKernel",
             WebGpuKernels.ConvTranspose2DBackwardKernelSource, "conv_transpose2d_backward_kernel",
             input, gradOutput, gradKernel, uniforms, totalKernelElements).GetAwaiter().GetResult();

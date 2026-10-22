@@ -68,12 +68,21 @@ public sealed class CodegenIndirectIndex
     /// <summary>What happens when the loaded index falls outside <see cref="Bound"/>.</summary>
     public CodegenIndexOutOfRange OutOfRange { get; }
 
+    /// <summary>
+    /// The index tensor holds float32 values (a float tensor of indices, as torch.take_along_dim's callers pass), each
+    /// converted by truncation toward zero -- <c>cvt.rzi.s32.f32</c>, the conversion C's <c>(int)</c> compiles to: NaN
+    /// reads as 0 and a value outside the int range saturates. Declared, never inferred: an int32 index tensor read as
+    /// float (or the reverse) would compute with a reinterpreted bit pattern.
+    /// </summary>
+    public bool FloatIndices { get; }
+
     /// <summary>Creates a data-dependent index.</summary>
     public CodegenIndirectIndex(
         int indexInput,
         CodegenAffineExpr position,
         int bound,
-        CodegenIndexOutOfRange outOfRange = CodegenIndexOutOfRange.Skip)
+        CodegenIndexOutOfRange outOfRange = CodegenIndexOutOfRange.Skip,
+        bool floatIndices = false)
     {
         if (indexInput < 0) throw new ArgumentOutOfRangeException(nameof(indexInput));
         if (bound <= 0) throw new ArgumentOutOfRangeException(nameof(bound));
@@ -82,6 +91,16 @@ public sealed class CodegenIndirectIndex
         Position = position ?? throw new ArgumentNullException(nameof(position));
         Bound = bound;
         OutOfRange = outOfRange;
+        FloatIndices = floatIndices;
+    }
+
+    // cvt.rzi.s32.f32 (and so C's (int) on the device): truncation toward zero, NaN to 0, saturation outside the range.
+    private static int TruncateLikeTheDevice(double value)
+    {
+        if (double.IsNaN(value)) return 0;
+        if (value >= int.MaxValue) return int.MaxValue;
+        if (value <= int.MinValue) return int.MinValue;
+        return (int)value;
     }
 
     /// <summary>
@@ -105,7 +124,8 @@ public sealed class CodegenIndirectIndex
         // The index tensor carries integral values in a double array, because the reference
         // interpreter is uniformly fp64. Truncation rather than rounding matches the i32
         // load the emitter performs.
-        int index = (int)indexTensor[position];
+        // A float index is first rounded to float32, as the device holds it, then converted as cvt.rzi does.
+        int index = FloatIndices ? TruncateLikeTheDevice((float)indexTensor[position]) : (int)indexTensor[position];
 
         if (index >= 0 && index < Bound) { active = true; return index; }
 
@@ -124,5 +144,5 @@ public sealed class CodegenIndirectIndex
         "in" + IndexInput.ToString(System.Globalization.CultureInfo.InvariantCulture) +
         "[" + Position.Describe(axes) + "]<" +
         Bound.ToString(System.Globalization.CultureInfo.InvariantCulture) + ", " +
-        (OutOfRange == CodegenIndexOutOfRange.Clamp ? "clamp" : "skip") + ">";
+        (OutOfRange == CodegenIndexOutOfRange.Clamp ? "clamp" : "skip") + (FloatIndices ? ", f32" : "") + ">";
 }

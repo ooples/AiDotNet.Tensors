@@ -247,7 +247,7 @@ public sealed class CodegenTiledContractionTests
         Assert.Contains("ld.param.u64 %rd4, [p2]", ptx);
         Assert.Contains("ld.global.f32", ptx);
         Assert.Contains("add.rn.f32", ptx);
-        Assert.Contains("max.f32", ptx);
+        Assert.Contains("setp.le.f32", ptx);   // the NaN-propagating ReLU
         Assert.Contains("cp.async.ca.shared.global", ptx);
         Assert.Contains("ld.shared.v2.f32", ptx);
     }
@@ -265,7 +265,7 @@ public sealed class CodegenTiledContractionTests
         Assert.Contains("ld.param.u64 %rd5, [p3]", ptx);
         int bias = ptx.LastIndexOf("add.rn.f32", System.StringComparison.Ordinal);
         int scale = ptx.LastIndexOf("mul.rn.f32", System.StringComparison.Ordinal);
-        int relu = ptx.LastIndexOf("max.f32", System.StringComparison.Ordinal);
+        int relu = ptx.LastIndexOf("setp.le.f32", System.StringComparison.Ordinal);   // the NaN-propagating ReLU
         Assert.True(bias >= 0 && bias < scale && scale < relu);
         string rowPattern = ", %r7, " + emitter.Plan!.ThreadTileM + ",";
         Assert.Equal(emitter.Plan.ThreadTileM,

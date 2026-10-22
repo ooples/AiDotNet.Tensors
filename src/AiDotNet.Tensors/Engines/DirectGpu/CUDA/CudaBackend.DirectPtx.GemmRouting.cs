@@ -25,6 +25,8 @@ public enum CudaGemmDispatchPath
     /// <summary>One of the backend's hand-written narrow GEMMs (skinny_gemm*, small_gemm_*), for shapes with no tuned
     /// route.</summary>
     NarrowGemm = 4,
+    /// <summary>A declared GEMM program (#890 phase 4c), lowered by the codegen conveyor.</summary>
+    DeclaredProgram = 5,
 }
 
 /// <summary>

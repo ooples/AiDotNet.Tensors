@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 //
 // Complex and quaternion kernels.
 //
@@ -52,7 +52,7 @@ public sealed partial class PtxAffineEmitter
         // refusing it would have made the whole addition useless.
         bool loopReduction = trips > FullUnrollLimit;
 
-        _sb.Clear(); _body.Clear();
+        _sb.Clear(); _body.Clear(); _calledFunctions.Clear();
         _r = _f = _p = _rd = 0;
         EmittedLoads = 0; ElidedGuards = 0; IndirectIndexLoads = 0; AtomicStores = 0;
         AlgebraProductTerms = 0;

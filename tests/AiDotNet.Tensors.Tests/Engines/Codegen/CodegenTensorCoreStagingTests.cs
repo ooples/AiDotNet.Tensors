@@ -421,8 +421,8 @@ public class CodegenTensorCoreStagingTests
             MatMul(512, 512, 512, CodegenActivationKind.ReLU), Sm86Major, Sm86Minor);
 
         // Once per accumulator register of all four tiles.
-        Assert.Equal(32, CountOccurrences(ptx, "max.f32 %fc"));
-        Assert.True(ptx.IndexOf("max.f32 %fc", StringComparison.Ordinal)
+        Assert.Equal(32, CountOccurrences(ptx, "setp.le.f32 %p3, %fc"));   // the NaN-propagating ReLU
+        Assert.True(ptx.IndexOf("setp.le.f32 %p3, %fc", StringComparison.Ordinal)
                   < ptx.IndexOf("wmma.store", StringComparison.Ordinal));
     }
 

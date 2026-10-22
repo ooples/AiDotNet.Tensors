@@ -110,12 +110,18 @@ public class CodegenActivationTests
         Assert.DoesNotContain("tanh.approx", ptx, StringComparison.Ordinal);
     }
 
-    /// <summary>ReLU stays exact — max is not an approximation, and it must not regress.</summary>
+    /// <summary>
+    /// ReLU stays exact and propagates NaN, as the hand-written relu_nan_safe and PyTorch do: x &lt;= 0 selects zero,
+    /// which is false for NaN. max.f32 would return 0 for a NaN input (max.NaN exists only from sm_80), so it must not
+    /// come back.
+    /// </summary>
     [Fact]
-    public void Relu_StillEmitsAPlainMax_AndNoTranscendental()
+    public void Relu_SelectsZeroAndPropagatesNaN_AndNoTranscendental()
     {
         string ptx = new PtxAffineEmitter().Emit(SpecWith(CodegenActivationKind.ReLU), 8, 6);
-        Assert.Contains("max.f32", ptx, StringComparison.Ordinal);
+        Assert.Contains("setp.le.f32", ptx, StringComparison.Ordinal);
+        Assert.Contains(", 0f00000000, ", ptx, StringComparison.Ordinal);   // selp.f32 x, 0, x, x <= 0
+        Assert.DoesNotContain("max.f32", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain("ex2.approx", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain("rcp.approx", ptx, StringComparison.Ordinal);
     }

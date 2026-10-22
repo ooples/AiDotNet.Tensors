@@ -23,8 +23,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
 /// <remarks>
 /// CUDA only for now, as a specialization of an operation every backend already serves rather than a CUDA-only
 /// capability: the other five keep computing this gradient through their own tuned input-gradient candidates, so
-/// nothing is unavailable there. The follow-ups for the ports are HIP #1479, Metal #1480, OpenCL #1481,
-/// Vulkan #1482 and WebGPU #1483.
+/// nothing is unavailable there. This holds for all three families here: the 3 x 3 four-phase kernel
+/// (conv2d_dgrad_s2k3_g*), the 1 x 1 stride-2 kernel (conv2d_dgrad_s2k1_g*) and the projection-shortcut pair
+/// (conv2d_dgrad_s2k3sc_g*, whose absence only leaves the compiled plan's pair unfused). The follow-ups for the ports
+/// cover all three: HIP #1479, Metal #1480, OpenCL #1481, Vulkan #1482 and WebGPU #1483.
 /// </remarks>
 internal static class CudaConvDgradS2Kernels
 {
