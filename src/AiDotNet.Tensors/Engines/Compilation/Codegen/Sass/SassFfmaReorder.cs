@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 // FFMA ordering for the own SASS backend (#1442). A register-blocked GEMM's inner loop is runs of independent FFMAs
 // (each accumulates a different register from a shared fragment of A and of B), and their order decides two operand
 // costs ptxas leaves on the table on sm_86:
@@ -28,8 +28,16 @@ public static class SassFfmaReorder
     /// <summary>
     /// <paramref name="code"/> with each run of at least <paramref name="minimumRun"/> consecutive, unguarded,
     /// independent register-form FFMAs that no branch enters mid-run reordered and its reuse flags recomputed; other instructions are untouched. The
-    /// control words' stalls inside a run are set to 1 (the scheduler recomputes them).
+    /// control words' stalls inside a run are set to 1 (the scheduler recomputes them), and the union of the run's
+    /// scoreboard waits is carried by whichever FFMA now comes first.
     /// </summary>
+    /// <remarks>
+    /// The waits have to be hoisted, not carried along: ptxas puts the wait on the loads' scoreboard on the FFMA that
+    /// reads those fragments first, so an order that moves that FFMA later would leave the new first FFMA issuing
+    /// without it, reading stale fragment registers. The union on the first instruction is at least as strict as what
+    /// each instruction waited for before, and every instruction keeps its own mask as well, so the result is safe
+    /// before <see cref="SassScheduler.RecomputeControl"/> runs and unchanged by it afterwards.
+    /// </remarks>
     public static SassInstruction[] Reorder(IReadOnlyList<SassInstruction> code, int banks = 2, int minimumRun = 4)
     {
         if (code is null) throw new ArgumentNullException(nameof(code));
@@ -117,6 +125,8 @@ public static class SassFfmaReorder
     private static void ReorderRun(SassInstruction[] code, int start, int end, int banks)
     {
         var remaining = new List<SassInstruction>();
+        int waits = 0;
+        for (int i = start; i < end; i++) waits |= code[i].Control.WaitMask;
         for (int i = start; i < end; i++) remaining.Add(code[i]);
         var order = new List<SassInstruction>(remaining.Count);
         SassInstruction? previous = null;
@@ -145,7 +155,14 @@ public static class SassFfmaReorder
             if (k + 1 < order.Count)
                 for (int slot = 0; slot < 2; slot++)
                     if (order[k + 1].Register(SourceFields[slot]) == instruction.Register(SourceFields[slot])) reuse |= 1 << slot;
-            instruction.Control = instruction.Control with { Stall = 1, Reuse = reuse };
+            // The first FFMA of the new order waits for everything the run as a whole waited for; the others keep
+            // their own masks, which that union already covers.
+            instruction.Control = instruction.Control with
+            {
+                Stall = 1,
+                Reuse = reuse,
+                WaitMask = k == 0 ? waits : instruction.Control.WaitMask,
+            };
             code[start + k] = instruction;
         }
     }

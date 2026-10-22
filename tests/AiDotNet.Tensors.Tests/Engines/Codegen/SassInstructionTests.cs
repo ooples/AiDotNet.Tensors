@@ -503,6 +503,21 @@ public class SassInstructionTests
         Assert.Equal(entered.Select(i => i.Low), kept.Select(i => i.Low));
     }
 
+    /// <summary>
+    /// The run's scoreboard waits are hoisted onto whichever FFMA ends up first. ptxas puts the wait on the loads'
+    /// scoreboard on the FFMA that reads those fragments first, and the greedy order moves exactly that one later, so
+    /// carrying the mask along would leave the new first FFMA reading fragment registers the loads had not filled.
+    /// </summary>
+    [Fact]
+    public void TheFfmaReorderHoistsTheRunsScoreboardWaits()
+    {
+        var run = new[] { FfmaOf(9, 2, 4, 6), FfmaOf(11, 3, 4, 11), FfmaOf(13, 3, 6, 13), FfmaOf(15, 5, 8, 15) };
+        run[0].Control = run[0].Control with { WaitMask = 0b100 };
+        var free = SassFfmaReorder.Reorder(run.Concat(new[] { Exit }).ToArray());
+        Assert.NotEqual(run[0].Low, free[0].Low);                   // the one that carried the wait did move
+        Assert.NotEqual(0, free[0].Control.WaitMask & 0b100);       // and the wait stayed in front of the run
+    }
+
     /// <summary>A malformed image is refused with ArgumentException, not an index fault.</summary>
     [Fact]
     public void AMalformedCubinIsRefused()
