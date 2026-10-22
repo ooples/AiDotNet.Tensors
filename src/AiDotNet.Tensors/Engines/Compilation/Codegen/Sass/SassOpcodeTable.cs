@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 // What each Volta-family SASS opcode reads and writes, for the own SASS backend's register allocation and scheduling
 // (#1442). An instruction's bits 0-8 name the operation and bits 9-11 its operand form; --sass-learn measured, on the
 // catalog's kernels compiled for sm_75, where each form keeps its register sources:
@@ -112,6 +112,20 @@ public static class SassOpcodeTable
     private const int A = SassInstruction.RaField, B = SassInstruction.RbField, C = SassInstruction.RcField;
     private const int D = SassInstruction.RdField;
 
+    // The measured encoding fields of the Volta-family word that decide an instruction's effects. A wrong value here
+    // compiles and runs: it corrupts the dependencies the scheduler sees, so each position is named once here and used
+    // by both the specs and Decode. --sass-learn is what checks them, against nvdisasm.
+    private const int SizeField = 73;              // memory access width in 3 bits: 4 = 32-bit, 5 = 64, 6 = 128
+    private const int MatrixCountField = 72;       // LDSM destination count in 2 bits: 1 << count registers
+    private const int MmaShapeLowField = 75;       // HMMA shape, low bit
+    private const int MmaShapeHighField = 83;      // HMMA shape, high bit
+    private const int PredicateOut0 = 81;          // first predicate destination
+    private const int PredicateOut1 = 84;          // second predicate destination
+    private const int PredicateIn = 87;            // the guard-style predicate source every ALU form reads
+    private const int CarryIn = 77;                // second predicate source: IADD3's carry, PLOP3's second input
+    private const int PlopThirdSource = 68;        // PLOP3's third predicate source, bits 68-70
+    private const int PlopThirdSourceIsUniform = 67;   // ... and the bit that makes it a UNIFORM predicate
+
     // Fixed latencies. The fewest cycles ptxas leaves between a producer and its first reader over the catalog's
     // kernels on sm_75 (--sass-learn) are 4 for the ALU, but that is a minimum over particular pairs, not a latency:
     // scheduling every ALU result at 4 faulted the first kernel. 6 ran every catalog kernel bit-identically; the wide
@@ -138,35 +152,35 @@ public static class SassOpcodeTable
         [0x002] = new("MOV", SassLatency.Fixed, true, 1, Sources.BOnly, [], []),
         [0x003] = new("P2R", SassLatency.Fixed, true, 1, Sources.A, [], [], ReadsAllPredicates: true, FixedLatency: 14),
         [0x005] = new("CS2R", SassLatency.Fixed, true, 2, Sources.None, [], [], FixedLatency: 8),
-        [0x007] = new("SEL", SassLatency.Fixed, true, 1, Sources.AB, [], [87]),
-        [0x008] = new("FSEL", SassLatency.Fixed, true, 1, Sources.AB, [], [87]),
-        [0x009] = new("FMNMX", SassLatency.Fixed, true, 1, Sources.AB, [], [87]),
-        [0x00b] = new("FSETP", SassLatency.Fixed, false, 0, Sources.AB, [81, 84], [87]),
-        [0x00c] = new("ISETP", SassLatency.Fixed, false, 0, Sources.AB, [81, 84], [87]),
-        [0x010] = new("IADD3", SassLatency.Fixed, true, 1, Sources.ABC, [81, 84], [87, 77]),
-        [0x011] = new("LEA", SassLatency.Fixed, true, 1, Sources.ABC, [81], [87]),
-        [0x012] = new("LOP3", SassLatency.Fixed, true, 1, Sources.ABC, [81], [87]),
+        [0x007] = new("SEL", SassLatency.Fixed, true, 1, Sources.AB, [], [PredicateIn]),
+        [0x008] = new("FSEL", SassLatency.Fixed, true, 1, Sources.AB, [], [PredicateIn]),
+        [0x009] = new("FMNMX", SassLatency.Fixed, true, 1, Sources.AB, [], [PredicateIn]),
+        [0x00b] = new("FSETP", SassLatency.Fixed, false, 0, Sources.AB, [PredicateOut0, PredicateOut1], [PredicateIn]),
+        [0x00c] = new("ISETP", SassLatency.Fixed, false, 0, Sources.AB, [PredicateOut0, PredicateOut1], [PredicateIn]),
+        [0x010] = new("IADD3", SassLatency.Fixed, true, 1, Sources.ABC, [PredicateOut0, PredicateOut1], [PredicateIn, CarryIn]),
+        [0x011] = new("LEA", SassLatency.Fixed, true, 1, Sources.ABC, [PredicateOut0], [PredicateIn]),
+        [0x012] = new("LOP3", SassLatency.Fixed, true, 1, Sources.ABC, [PredicateOut0], [PredicateIn]),
         [0x013] = new("IABS", SassLatency.Fixed, true, 1, Sources.BOnly, [], []),
-        [0x017] = new("IMNMX", SassLatency.Fixed, true, 1, Sources.AB, [], [87]),
+        [0x017] = new("IMNMX", SassLatency.Fixed, true, 1, Sources.AB, [], [PredicateIn]),
         [0x019] = new("SHF", SassLatency.Fixed, true, 1, Sources.ABC, [], []),
-        [0x01c] = new("PLOP3", SassLatency.Fixed, false, 0, Sources.None, [81, 84], [87, 77, 68], UniformThirdPredicateFlag: 67),
+        [0x01c] = new("PLOP3", SassLatency.Fixed, false, 0, Sources.None, [PredicateOut0, PredicateOut1], [PredicateIn, CarryIn, PlopThirdSource], UniformThirdPredicateFlag: PlopThirdSourceIsUniform),
         [0x020] = new("FMUL", SassLatency.Fixed, true, 1, Sources.AB, [], []),
         [0x021] = new("FADD", SassLatency.Fixed, true, 1, Sources.AB, [], []),
         [0x023] = new("FFMA", SassLatency.Fixed, true, 1, Sources.ABC, [], []),
-        [0x024] = new("IMAD", SassLatency.Fixed, true, 1, Sources.ABC, [], [87]),
-        [0x025] = new("IMAD.WIDE", SassLatency.Fixed, true, 2, Sources.ABC, [], [87], WideC: true, FixedLatency: 8),
-        [0x027] = new("IMAD.HI", SassLatency.Fixed, true, 1, Sources.ABC, [], [87]),
+        [0x024] = new("IMAD", SassLatency.Fixed, true, 1, Sources.ABC, [], [PredicateIn]),
+        [0x025] = new("IMAD.WIDE", SassLatency.Fixed, true, 2, Sources.ABC, [], [PredicateIn], WideC: true, FixedLatency: 8),
+        [0x027] = new("IMAD.HI", SassLatency.Fixed, true, 1, Sources.ABC, [], [PredicateIn]),
         // sm_80+: cvt.rn.f32.s32/u32 is I2FP, a fixed-latency ALU conversion (no scoreboard; ptxas reads it 5 cycles on).
         [0x045] = new("I2FP", SassLatency.Fixed, true, 1, Sources.BOnly, [], []),
         [0x082] = new("UMOV", SassLatency.Fixed, true, 1, Sources.BOnly, [], [], Uniform: true),
-        [0x087] = new("USEL", SassLatency.Fixed, true, 1, Sources.AB, [], [87], Uniform: true),
-        [0x08c] = new("UISETP", SassLatency.Fixed, false, 0, Sources.AB, [81, 84], [87], Uniform: true),
-        [0x090] = new("UIADD3", SassLatency.Fixed, true, 1, Sources.ABC, [81, 84], [87, 77], Uniform: true),
-        [0x091] = new("ULEA", SassLatency.Fixed, true, 1, Sources.ABC, [81], [87], Uniform: true),
-        [0x092] = new("ULOP3", SassLatency.Fixed, true, 1, Sources.ABC, [81], [87], Uniform: true),
+        [0x087] = new("USEL", SassLatency.Fixed, true, 1, Sources.AB, [], [PredicateIn], Uniform: true),
+        [0x08c] = new("UISETP", SassLatency.Fixed, false, 0, Sources.AB, [PredicateOut0, PredicateOut1], [PredicateIn], Uniform: true),
+        [0x090] = new("UIADD3", SassLatency.Fixed, true, 1, Sources.ABC, [PredicateOut0, PredicateOut1], [PredicateIn, CarryIn], Uniform: true),
+        [0x091] = new("ULEA", SassLatency.Fixed, true, 1, Sources.ABC, [PredicateOut0], [PredicateIn], Uniform: true),
+        [0x092] = new("ULOP3", SassLatency.Fixed, true, 1, Sources.ABC, [PredicateOut0], [PredicateIn], Uniform: true),
         [0x099] = new("USHF", SassLatency.Fixed, true, 1, Sources.ABC, [], [], Uniform: true),
-        [0x0a4] = new("UIMAD", SassLatency.Fixed, true, 1, Sources.ABC, [], [87], Uniform: true),
-        [0x0a5] = new("UIMAD.WIDE", SassLatency.Fixed, true, 2, Sources.ABC, [], [87], WideC: true, Uniform: true),
+        [0x0a4] = new("UIMAD", SassLatency.Fixed, true, 1, Sources.ABC, [], [PredicateIn], Uniform: true),
+        [0x0a5] = new("UIMAD.WIDE", SassLatency.Fixed, true, 2, Sources.ABC, [], [PredicateIn], WideC: true, Uniform: true),
         [0x0b9] = new("ULDC", SassLatency.Fixed, true, 1, Sources.None, [], [], Uniform: true, SizedD: true),
         [0x1c2] = new("R2UR", SassLatency.Variable, true, 1, Sources.A, [], [], Uniform: true, VectorSources: true),
         [0x1c3] = new("S2UR", SassLatency.Variable, true, 1, Sources.None, [], [], Uniform: true),
@@ -187,7 +201,7 @@ public static class SassOpcodeTable
         // D (4 registers) = A (4) x B (2) + C (4), on the tensor pipe's fixed latency (ptxas sets no scoreboard; it never
         // reads a result sooner than 56 cycles on, over the TF32 and FP16 GEMM seeds on sm_86).
         [0x03c] = new("HMMA", SassLatency.Fixed, true, 4, Sources.ABC, [], [], Mma: true, FixedLatency: 56),
-        [0x1ae] = new("LDGSTS", SassLatency.Variable, false, 0, Sources.None, [], [87], AsyncCopy: true),
+        [0x1ae] = new("LDGSTS", SassLatency.Variable, false, 0, Sources.None, [], [PredicateIn], AsyncCopy: true),
         [0x1af] = new("LDGDEPBAR", SassLatency.Variable, false, 0, Sources.None, [], []),
         [0x118] = new("NOP", SassLatency.Control, false, 0, Sources.None, [], []),
         [0x11a] = new("DEPBAR", SassLatency.Control, false, 0, Sources.None, [], []),
@@ -215,7 +229,7 @@ public static class SassOpcodeTable
         {
             // Only the register form (0x23c) and the FP32-accumulating shapes --sass-learn has seen (bits 75 and 83:
             // 01 = 1688.F32.TF32, 10 = 16816.F32); another variant may size its operands differently.
-            int shape = (int)instruction.Bits(75, 1) | (int)instruction.Bits(83, 1) << 1;
+            int shape = (int)instruction.Bits(MmaShapeLowField, 1) | (int)instruction.Bits(MmaShapeHighField, 1) << 1;
             if (form != 1 || shape is not (1 or 2)) return null;
             writes.Add(new SassRegisterOperand(D, 4));
             reads.Add(new SassRegisterOperand(A, 4));
@@ -224,7 +238,7 @@ public static class SassOpcodeTable
         }
         else if (spec.MatrixLoad)
         {
-            int count = (int)instruction.Bits(72, 2);
+            int count = (int)instruction.Bits(MatrixCountField, 2);
             if (form != 4 || count == 3) return null;
             reads.Add(new SassRegisterOperand(A, 1));
             writes.Add(new SassRegisterOperand(D, 1 << count));
@@ -239,7 +253,7 @@ public static class SassOpcodeTable
         else if (spec.Memory)
         {
             // Access width in registers from the size field: 4 = 32 bits, 5 = 64, 6 = 128.
-            int size = (int)instruction.Bits(73, 3);
+            int size = (int)instruction.Bits(SizeField, 3);
             int width = size switch { 5 => 2, 6 => 4, _ => 1 };
             reads.Add(new SassRegisterOperand(A, spec.AddressWidth));
             if (spec.Store) reads.Add(new SassRegisterOperand(B, width));
@@ -247,7 +261,7 @@ public static class SassOpcodeTable
         }
         else
         {
-            int dWidth = spec.SizedD ? (instruction.Bits(73, 3) == 5 ? 2 : 1) : spec.DWidth;
+            int dWidth = spec.SizedD ? (instruction.Bits(SizeField, 3) == 5 ? 2 : 1) : spec.DWidth;
             if (spec.WritesD) writes.Add(new SassRegisterOperand(D, dWidth, uniformD));
             switch (spec.Sources)
             {
@@ -295,13 +309,13 @@ public static class SassOpcodeTable
             }
         }
         // PLOP3 P0, PT, PT, PT, UP0 (a uniform compare's result moved to a vector predicate): bit 67 makes the third
-        // source, bits 68-70, a uniform predicate. Missing it scheduled the PLOP3 1 cycle after the UISETP writing UP0
+        // source (PlopThirdSource, bits 68-70) a uniform predicate. Missing it scheduled the PLOP3 1 cycle after the UISETP writing UP0
         // (ptxas leaves 6), and two catalog convolutions computed wrong results on the RTX 3080.
         IReadOnlyList<int> predicateReads = spec.PredicateReads, uniformPredicateReads = [];
         if (spec.UniformThirdPredicateFlag >= 0 && instruction.Bits(spec.UniformThirdPredicateFlag, 1) != 0)
         {
-            predicateReads = [.. spec.PredicateReads.Where(f => f != 68)];
-            uniformPredicateReads = [68];
+            predicateReads = [.. spec.PredicateReads.Where(f => f != PlopThirdSource)];
+            uniformPredicateReads = [PlopThirdSource];
         }
         return new SassEffects(spec.Mnemonic, spec.Latency, writes, reads, spec.PredicateWrites, predicateReads,
             spec.ReadsAllPredicates, spec.Latency == SassLatency.Fixed ? spec.FixedLatency : 0, spec.Uniform, uniformPredicateReads);

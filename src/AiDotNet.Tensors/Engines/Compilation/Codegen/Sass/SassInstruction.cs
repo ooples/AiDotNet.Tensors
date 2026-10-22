@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 // One 128-bit Volta-family SASS instruction (sm_70 through sm_89 share the layout below), the unit the own SASS backend
 // (#1442) rewrites. The field positions were measured, not assumed: --sass-learn matched 17 624 instructions of the
 // catalog's kernels (ptxas 13.1, sm_75) against nvdisasm's text with no disagreement:
@@ -123,19 +123,29 @@ public struct SassInstruction : IEquatable<SassInstruction>
         SetBits(field, 8, (ulong)register);
     }
 
+    // The control word's six fields, each named once so the getter and the setter cannot drift apart: a position that
+    // disagreed between them would read back a different schedule than it wrote, silently.
+    private const int StallField = 105, StallWidth = 4;
+    private const int YieldField = 109, YieldWidth = 1;
+    private const int WriteScoreboardField = 110, WriteScoreboardWidth = 3;
+    private const int ReadScoreboardField = 113, ReadScoreboardWidth = 3;
+    private const int WaitMaskField = 116, WaitMaskWidth = 6;
+    private const int ReuseField = 122, ReuseWidth = 4;
+
     /// <summary>The scheduling control word (bits 105-125).</summary>
     public SassControl Control
     {
-        readonly get => new((int)Bits(105, 4), Bits(109, 1) != 0, (int)Bits(110, 3), (int)Bits(113, 3), (int)Bits(116, 6),
-            (int)Bits(122, 4));
+        readonly get => new((int)Bits(StallField, StallWidth), Bits(YieldField, YieldWidth) != 0,
+            (int)Bits(WriteScoreboardField, WriteScoreboardWidth), (int)Bits(ReadScoreboardField, ReadScoreboardWidth),
+            (int)Bits(WaitMaskField, WaitMaskWidth), (int)Bits(ReuseField, ReuseWidth));
         set
         {
-            SetBits(105, 4, (ulong)value.Stall);
-            SetBits(109, 1, value.Yield ? 1UL : 0UL);
-            SetBits(110, 3, (ulong)value.WriteScoreboard);
-            SetBits(113, 3, (ulong)value.ReadScoreboard);
-            SetBits(116, 6, (ulong)value.WaitMask);
-            SetBits(122, 4, (ulong)value.Reuse);
+            SetBits(StallField, StallWidth, (ulong)value.Stall);
+            SetBits(YieldField, YieldWidth, value.Yield ? 1UL : 0UL);
+            SetBits(WriteScoreboardField, WriteScoreboardWidth, (ulong)value.WriteScoreboard);
+            SetBits(ReadScoreboardField, ReadScoreboardWidth, (ulong)value.ReadScoreboard);
+            SetBits(WaitMaskField, WaitMaskWidth, (ulong)value.WaitMask);
+            SetBits(ReuseField, ReuseWidth, (ulong)value.Reuse);
         }
     }
 
