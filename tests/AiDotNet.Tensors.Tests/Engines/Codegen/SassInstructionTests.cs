@@ -303,6 +303,75 @@ public class SassInstructionTests
         Assert.Contains("sm_90", SassScheduler.LastDecline);
     }
 
+    // Instructions from the driver's sm_86 cubins (RTX 3080), with their nvdisasm text.
+    private static readonly SassInstruction UimadWide86 = new(0x00000004080672a5UL, 0x000fc8000f8e003fUL);  // UIMAD.WIDE.U32 UR6, UR8, UR4, URZ
+    private static readonly SassInstruction Uimad86 = new(0xfffffffe070778a4UL, 0x000fc6000f8e0204UL);      // UIMAD UR7, UR7, -0x2, UR4
+    private static readonly SassInstruction UmovUr4 = new(0x0000003f00047c82UL, 0x000fe40008000000UL);      // UMOV UR4, URZ
+    private static readonly SassInstruction UisetpUp0 = new(0x000000080400788cUL, 0x000fcc000bf06270UL);    // UISETP.GE.AND UP0, UPT, UR4, 0x8, UPT
+    private static readonly SassInstruction PlopFromUp0 = new(0x000000000000781cUL, 0x000fe20003f0f008UL);  // PLOP3.LUT P0, PT, PT, PT, UP0, 0x80, 0x0
+    private static readonly SassInstruction FaddImmediate = new(0x3f80000014147421UL, 0x000fc60000000000UL); // FADD R20, R20, 1
+    private static readonly SassInstruction I2fp = new(0x0000000000007245UL, 0x000fca0000201400UL);        // I2FP.F32.S32 R0, R0
+
+    /// <summary>
+    /// sm_86 pipe issue spacing: two integer-ALU instructions issue 2 cycles apart (ptxas never leaves less on sm_86),
+    /// while sm_75 keeps its measured schedule.
+    /// </summary>
+    [Fact]
+    public void Sm86SpacesTheIntegerPipe()
+    {
+        var code = new[] { IaddCarryOut, IaddUniform, Exit };   // independent: R16/P6 against R68/UR7
+        var sm86 = SassScheduler.RecomputeControl(code, 86) ?? throw new InvalidOperationException(SassScheduler.LastDecline);
+        Assert.True(sm86[0].Control.Stall >= 2);
+        var sm75 = SassScheduler.RecomputeControl(code, 75) ?? throw new InvalidOperationException(SassScheduler.LastDecline);
+        Assert.Equal(1, sm75[0].Control.Stall);
+        Assert.Equal(("uniform", 2), SassScheduler.PipeIssue("UIMAD", 86));
+        Assert.Null(SassScheduler.PipeIssue("FFMA", 86));
+    }
+
+    /// <summary>
+    /// A UMOV overwriting a register an earlier UIMAD reads issues 3 cycles after it on sm_86: the GEMM whose UMOV UR4
+    /// issued 1 (then 2) cycles after UIMAD UR7, UR7, -0x2, UR4 faulted on the RTX 3080.
+    /// </summary>
+    [Fact]
+    public void AnEarlyUniformWriteWaitsForTheLateRead()
+    {
+        var scheduled = SassScheduler.RecomputeControl(new[] { UimadWide86, Uimad86, UmovUr4, Exit }, 86)
+            ?? throw new InvalidOperationException(SassScheduler.LastDecline);
+        Assert.True(scheduled[1].Control.Stall >= 3, "UMOV issued " + scheduled[1].Control.Stall + " cycles after the UIMAD.");
+        Assert.True(scheduled[0].Control.Stall >= 2);   // the uniform pipe's spacing
+    }
+
+    /// <summary>
+    /// PLOP3 with bit 67 set reads its third source from the uniform predicate file: the scheduler holds it the ALU
+    /// latency after the UISETP writing UP0. Decoding it as P0 issued the PLOP3 1 cycle on and two convolutions
+    /// computed wrong results on the RTX 3080.
+    /// </summary>
+    [Fact]
+    public void PlopReadsAUniformPredicate()
+    {
+        var plop = SassOpcodeTable.Decode(PlopFromUp0) ?? throw new InvalidOperationException("PLOP3 unknown");
+        Assert.Equal(new[] { 68 }, plop.UniformPredicateReads);
+        Assert.DoesNotContain(68, plop.PredicateReads);
+        var scheduled = SassScheduler.RecomputeControl(new[] { UisetpUp0, PlopFromUp0, Exit }, 86)
+            ?? throw new InvalidOperationException(SassScheduler.LastDecline);
+        Assert.True(scheduled[0].Control.Stall >= 6, "PLOP3 issued " + scheduled[0].Control.Stall + " cycles after UISETP.");
+    }
+
+    /// <summary>
+    /// Two-source operations with an immediate (FADD R, R, imm is form 2) read only A; I2FP (sm_80+) is a
+    /// fixed-latency conversion reading B.
+    /// </summary>
+    [Fact]
+    public void ImmediateFormsAndI2fpDecode()
+    {
+        var fadd = SassOpcodeTable.Decode(FaddImmediate) ?? throw new InvalidOperationException("FADD form 2 unknown");
+        Assert.Equal(new[] { SassInstruction.RaField }, fadd.Reads.Select(o => o.Field));
+        var i2fp = SassOpcodeTable.Decode(I2fp) ?? throw new InvalidOperationException("I2FP unknown");
+        Assert.Equal("I2FP", i2fp.Mnemonic);
+        Assert.Equal(SassLatency.Fixed, i2fp.Latency);
+        Assert.Equal(new[] { SassInstruction.RbField }, i2fp.Reads.Select(o => o.Field));
+    }
+
     /// <summary>A barrier holds its successor 5 cycles: an LDS issued 1 cycle after BAR.SYNC read a stale tile.</summary>
     [Fact]
     public void ABarrierHoldsItsSuccessorFiveCycles()
