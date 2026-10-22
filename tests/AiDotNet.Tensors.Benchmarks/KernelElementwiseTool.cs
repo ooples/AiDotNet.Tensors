@@ -210,8 +210,12 @@ DONE:
                     if (!backend.TryDeclaredElementwise(function.Kernel, new[] { input }, declared, scalars, n))
                         throw new InvalidOperationException(function.Kernel + " was not declared: " + backend.LastElementwiseDecline);
                     // --control: the hand-written side runs a DIFFERENT kernel, so the comparison must find mismatches.
-                    backend.LaunchHandWrittenElementwise(control ? (function.Kernel == "sigmoid" ? "relu" : "sigmoid") : function.Kernel,
-                        new[] { input }, hand, control ? Array.Empty<float>() : scalars, n);
+                    // A missing module would leave `hand` holding the PREVIOUS chunk, whose mismatches look like a
+                    // detected difference: under --control the arm would pass without the second kernel ever running.
+                    string handKernel = control ? (function.Kernel == "sigmoid" ? "relu" : "sigmoid") : function.Kernel;
+                    if (!backend.LaunchHandWrittenElementwise(handKernel, new[] { input }, hand,
+                            control ? Array.Empty<float>() : scalars, n))
+                        throw new InvalidOperationException(handKernel + ": the hand-written kernel is not loaded.");
                     cmp[0] = &aPtr; cmp[1] = &bPtr; cmp[2] = &cPtr; cmp[3] = &n; cmp[4] = &baseBits;
                     backend.LaunchDiagnostic(module, compare, gridN, 256, cmp);
                 }
