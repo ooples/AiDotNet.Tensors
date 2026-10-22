@@ -286,7 +286,7 @@ internal static class SassProbeTool
         return conflicts;
     }
 
-    private static string BankProbePtx(int major, int minor)
+    internal static string BankProbePtx(int major, int minor)
     {
         var sb = new System.Text.StringBuilder();
         sb.Append(".version ").Append(PtxAffineEmitter.PtxIsaVersionFor(major, minor)).Append("\n.target sm_").Append(major).Append(minor).Append("\n.address_size 64\n")

@@ -155,6 +155,8 @@ public static class SassOpcodeTable
         [0x024] = new("IMAD", SassLatency.Fixed, true, 1, Sources.ABC, [], [87]),
         [0x025] = new("IMAD.WIDE", SassLatency.Fixed, true, 2, Sources.ABC, [], [87], WideC: true, FixedLatency: 8),
         [0x027] = new("IMAD.HI", SassLatency.Fixed, true, 1, Sources.ABC, [], [87]),
+        // sm_80+: cvt.rn.f32.s32/u32 is I2FP, a fixed-latency ALU conversion (no scoreboard; ptxas reads it 5 cycles on).
+        [0x045] = new("I2FP", SassLatency.Fixed, true, 1, Sources.BOnly, [], []),
         [0x082] = new("UMOV", SassLatency.Fixed, true, 1, Sources.BOnly, [], [], Uniform: true),
         [0x087] = new("USEL", SassLatency.Fixed, true, 1, Sources.AB, [], [87], Uniform: true),
         [0x08c] = new("UISETP", SassLatency.Fixed, false, 0, Sources.AB, [81, 84], [87], Uniform: true),

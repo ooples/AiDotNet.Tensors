@@ -80,8 +80,13 @@ public static class SassScheduler
     // than 3 (UIMAD, ULEA, USEL and USHF readers alike), the vector instructions that read a uniform register take 1,
     // and the GEMM above, given the pipe spacing, still faulted with a UMOV 2 cycles after the UIMAD reading its
     // register and ran with 3.
+    //
+    // Fixed latencies that differ from the table's (measured on sm_75): sm_86 reads a P2R result 4 cycles after it at
+    // the closest (sm_75: 14), so 6 -- the ALU margin -- holds, where 14 could not be expressed before an overwrite of
+    // the P2R's register one instruction later (a declined catalog kernel).
     private sealed record Timing(int GuardPredicateLatency, int MaxStall, IReadOnlyDictionary<string, int> IssueStalls,
-        IReadOnlyDictionary<string, (string Pipe, int Cycles)> Pipes, int UniformEarlyWriteAfterRead = 0);
+        IReadOnlyDictionary<string, (string Pipe, int Cycles)> Pipes, int UniformEarlyWriteAfterRead = 0,
+        IReadOnlyDictionary<string, int>? Latencies = null);
 
     private static readonly Dictionary<string, (string Pipe, int Cycles)> s_noPipes = new();
 
@@ -89,7 +94,7 @@ public static class SassScheduler
     {
         ["IADD3"] = ("alu", 2), ["LEA"] = ("alu", 2), ["LOP3"] = ("alu", 2), ["ISETP"] = ("alu", 2), ["MOV"] = ("alu", 2),
         ["SEL"] = ("alu", 2), ["SHF"] = ("alu", 2), ["IABS"] = ("alu", 2), ["IMNMX"] = ("alu", 4), ["PLOP3"] = ("alu", 2),
-        ["P2R"] = ("alu", 2), ["FSEL"] = ("alu", 2), ["FSETP"] = ("alu", 2), ["FMNMX"] = ("alu", 2),
+        ["P2R"] = ("alu", 2), ["I2FP"] = ("alu", 2), ["FSEL"] = ("alu", 2), ["FSETP"] = ("alu", 2), ["FMNMX"] = ("alu", 2),
         ["IMAD"] = ("imad", 2), ["IMAD.WIDE"] = ("imad", 4), ["IMAD.HI"] = ("imad", 4),
         ["UMOV"] = ("uniform", 2), ["USEL"] = ("uniform", 2), ["UISETP"] = ("uniform", 2), ["UIADD3"] = ("uniform", 2),
         ["ULEA"] = ("uniform", 2), ["ULOP3"] = ("uniform", 2), ["USHF"] = ("uniform", 2), ["UIMAD"] = ("uniform", 2),
@@ -100,7 +105,8 @@ public static class SassScheduler
     private static readonly Dictionary<int, Timing> s_timings = new()
     {
         [75] = new(12, 12, new Dictionary<string, int> { ["BMOV"] = 11, ["BAR"] = 5 }, s_noPipes),
-        [86] = new(13, 13, new Dictionary<string, int> { ["BMOV"] = 11, ["BAR"] = 6, ["DEPBAR"] = 4, ["LDGDEPBAR"] = 4 }, s_ampere, 3),
+        [86] = new(13, 13, new Dictionary<string, int> { ["BMOV"] = 11, ["BAR"] = 6, ["DEPBAR"] = 4, ["LDGDEPBAR"] = 4 }, s_ampere, 3,
+            new Dictionary<string, int> { ["P2R"] = 6 }),
     };
 
     /// <summary>
@@ -271,7 +277,10 @@ public static class SassScheduler
                 }
                 if (missing > 0)
                 {
-                    LastDecline = "instruction " + i + " needs " + missing + " more cycles than the stalls since cycle " + produced + " can hold";
+                    int from = i - 1;
+                    while (from > 0 && issueCycle[from - 1] >= produced) from--;
+                    LastDecline = "instruction " + i + " (" + e.Mnemonic + ") needs " + missing + " more cycles than the stalls since cycle " +
+                        produced + " (instruction " + from + ", " + effects[from].Mnemonic + ") can hold";
                     return null;
                 }
                 cycle = ready;
@@ -312,10 +321,11 @@ public static class SassScheduler
             }
             else if (e.Latency == SassLatency.Fixed)
             {
-                foreach (int r in writes) readyAt[r] = (cycle + e.FixedLatency, cycle);
+                int latency = timing.Latencies is { } l && l.TryGetValue(e.Mnemonic, out int own) ? own : e.FixedLatency;
+                foreach (int r in writes) readyAt[r] = (cycle + latency, cycle);
                 foreach (int p in predicateWrites)
                 {
-                    readyAt[p] = (cycle + e.FixedLatency, cycle);
+                    readyAt[p] = (cycle + latency, cycle);
                     predicateWrittenAt[p] = cycle;
                 }
             }

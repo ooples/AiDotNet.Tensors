@@ -71,6 +71,8 @@ internal static class SassLearnTool
                 lines.AddRange(Disassemble(ptx, "sgemm_" + config.Name.Replace('-', '_') + "_" + layout.Name, arch, bin, work));
             }
         }
+        // The bank probe's FFMA-bound kernel (--sass-probe --bank): on sm_80+ its int-to-float conversion is I2FP.
+        lines.AddRange(Disassemble(SassProbeTool.BankProbePtx(major, minor), "bank_probe", arch, bin, work));
         Console.WriteLine("SASS LEARN sm_" + arch + ": " + lines.Count + " instructions from " +
             lines.Select(l => l.Kernel).Distinct().Count() + " kernels");
         ReportGuard(lines);
