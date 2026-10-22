@@ -44,9 +44,12 @@ public static class SassScheduler
     [ThreadStatic] public static string? LastDecline;
     private const int InstructionBytes = 16;
 
-    // Write scoreboards 0-2 and read scoreboards 3-5, each used round-robin. Sharing a scoreboard is always safe
-    // (it is a counter: waiting on it waits for every instruction that set it), only sometimes slower.
-    private const int WriteScoreboards = 3, ReadScoreboardBase = 3;
+    // The six scoreboards (less the one cp.async reserves) split into three write scoreboards and the rest for reads,
+    // each class used round-robin. Sharing a scoreboard is always safe (it is a counter: waiting on it waits for every
+    // instruction that set it), only sometimes slower -- so global loads get a write scoreboard of their own: a shared
+    // load's reader waiting on a scoreboard a prefetching LDG also set waits out the global latency, which cost the
+    // register-blocked GEMM 5% on the RTX 3080.
+    private const int WriteScoreboards = 3;
     private const int ScoreboardSetDelay = 2;
 
     // A scoreboard is a small counter: an instruction that would raise one past this many outstanding operations
@@ -162,12 +165,18 @@ public static class SassScheduler
             }
         var targets = BranchTargets(code);
         if (AsyncScoreboard(code, effects) is not int asyncBoard) return null;
+        var overwritten = SourcesOverwritten(code, effects);
+        var (firstUse, firstOverwrite) = NextHazards(code, effects, targets);
         int asyncMask = asyncBoard >= 0 ? 1 << asyncBoard : 0;
         var result = new SassInstruction[code.Count];
         var pendingWrite = new Dictionary<int, int>();   // register -> write scoreboard covering it
         var pendingRead = new Dictionary<int, int>();    // register -> read scoreboard covering it
         var readyAt = new Dictionary<int, (long Ready, long Produced)>();   // register or predicate key -> readable at
-        int nextWrite = 0, nextRead = 0;
+        var pendingUse = new long[6];   // per scoreboard: the earliest first use among the operations it covers
+        for (int s = 0; s < pendingUse.Length; s++) pendingUse[s] = long.MaxValue;
+        var boards = Enumerable.Range(0, 6).Where(b => b != asyncBoard).ToArray();
+        int longBoard = boards[0];
+        int[] shortBoards = boards.Skip(1).Take(WriteScoreboards - 1).ToArray(), readBoards = boards.Skip(WriteScoreboards).ToArray();
         var outstanding = new int[6];
         long cycle = 0;   // issue cycle of the current instruction
         var scoreboardSetAt = new long[6];
@@ -212,12 +221,14 @@ public static class SassScheduler
             {
                 if (writes.Count != 0)
                 {
-                    writeBoard = NextBoard(ref nextWrite, 0, WriteScoreboards, asyncBoard);
+                    writeBoard = e.Mnemonic == "LDG" ? longBoard : ChooseBoard(shortBoards, outstanding, pendingUse, firstUse[i]);
+                    pendingUse[writeBoard] = Math.Min(pendingUse[writeBoard], firstUse[i]);
                     if (outstanding[writeBoard] >= ScoreboardDepth) wait |= 1 << writeBoard;
                 }
-                if (reads.Count != 0)
+                if (reads.Count != 0 && overwritten[i])
                 {
-                    readBoard = NextBoard(ref nextRead, ReadScoreboardBase, 6 - ReadScoreboardBase, asyncBoard);
+                    readBoard = ChooseBoard(readBoards, outstanding, pendingUse, firstOverwrite[i]);
+                    pendingUse[readBoard] = Math.Min(pendingUse[readBoard], firstOverwrite[i]);
                     if (outstanding[readBoard] >= ScoreboardDepth) wait |= 1 << readBoard;
                 }
             }
@@ -225,7 +236,12 @@ public static class SassScheduler
             {
                 Clear(pendingWrite, wait);
                 Clear(pendingRead, wait);
-                for (int s = 0; s < outstanding.Length; s++) if ((wait >> s & 1) != 0) outstanding[s] = 0;
+                for (int s = 0; s < outstanding.Length; s++)
+                    if ((wait >> s & 1) != 0)
+                    {
+                        outstanding[s] = 0;
+                        pendingUse[s] = long.MaxValue;
+                    }
             }
 
             // Fixed-latency readiness: everything at a boundary; otherwise the registers and predicates it reads or
@@ -371,12 +387,87 @@ public static class SassScheduler
         return null;
     }
 
-    // Round-robin over count scoreboards from first, skipping the reserved one.
-    private static int NextBoard(ref int next, int first, int count, int reserved)
+    // The scoreboard for an operation first needed at instruction `use`. A wait on a scoreboard waits for everything it
+    // covers, so adding an operation to one whose earliest pending use comes sooner makes that earlier wait also wait
+    // for it. In order of preference: an idle scoreboard; one whose pending uses all come at or after `use` (the
+    // tightest such); otherwise the one whose earliest pending use is latest (the least extra waiting).
+    private static int ChooseBoard(int[] candidates, int[] outstanding, long[] pendingUse, long use)
     {
-        int board = first + next++ % count;
-        if (board == reserved) board = first + next++ % count;
-        return board;
+        int best = -1;
+        foreach (int b in candidates) if (outstanding[b] == 0) return b;
+        foreach (int b in candidates)
+            if (pendingUse[b] >= use && (best < 0 || pendingUse[b] < pendingUse[best])) best = b;
+        if (best >= 0) return best;
+        foreach (int b in candidates) if (best < 0 || pendingUse[b] > pendingUse[best]) best = b;
+        return best;
+    }
+
+    // Per variable-latency instruction: the first later instruction that reads or writes a register it writes, and the
+    // first that writes a register it reads, before the next block boundary (which waits on every scoreboard; it
+    // stands for both when nothing in the block does).
+    private static (long[] FirstUse, long[] FirstOverwrite) NextHazards(IReadOnlyList<SassInstruction> code,
+        SassEffects[] effects, HashSet<int> targets)
+    {
+        var firstUse = new long[code.Count];
+        var firstOverwrite = new long[code.Count];
+        for (int i = 0; i < code.Count; i++)
+        {
+            if (effects[i].Latency != SassLatency.Variable) continue;
+            var writes = new HashSet<int>(Registers(code[i], effects[i].Writes));
+            var reads = new HashSet<int>(Registers(code[i], effects[i].Reads));
+            long use = -1, overwrite = -1;
+            int j = i + 1;
+            for (; j < code.Count && (use < 0 || overwrite < 0); j++)
+            {
+                if (targets.Contains(j) || effects[j].Latency == SassLatency.Control) break;
+                var laterWrites = Registers(code[j], effects[j].Writes);
+                if (use < 0 && (laterWrites.Exists(writes.Contains) || Registers(code[j], effects[j].Reads).Exists(writes.Contains))) use = j;
+                if (overwrite < 0 && laterWrites.Exists(reads.Contains)) overwrite = j;
+            }
+            firstUse[i] = use >= 0 ? use : j;
+            firstOverwrite[i] = overwrite >= 0 ? overwrite : j;
+        }
+        return (firstUse, firstOverwrite);
+    }
+
+    // Per instruction: whether any instruction that can execute after it writes a register it reads -- a later one,
+    // or an earlier one inside a loop (a backward branch's range) containing it. Only then does a variable-latency
+    // instruction need a read scoreboard: nothing else can overwrite its sources before it has read them. ptxas
+    // likewise leaves most shared loads without one; giving every LDS of the register-blocked GEMM a read scoreboard
+    // filled them to their depth and cost it 5% on the RTX 3080.
+    private static bool[] SourcesOverwritten(IReadOnlyList<SassInstruction> code, SassEffects[] effects)
+    {
+        var writers = new Dictionary<int, List<int>>();
+        for (int i = 0; i < code.Count; i++)
+            foreach (int r in Registers(code[i], effects[i].Writes))
+            {
+                if (!writers.TryGetValue(r, out var list)) writers[r] = list = new List<int>();
+                list.Add(i);
+            }
+        var loops = new List<(int Start, int End)>();
+        for (int i = 0; i < code.Count; i++)
+        {
+            int op = code[i].Opcode & 0x1ff;
+            if (op != 0x147 && op != 0x144) continue;   // BRA, CALL.REL.NOINC
+            long offset = (long)code[i].Bits(32, 50);
+            if ((offset & (1L << 49)) != 0) offset -= 1L << 50;
+            long target = ((i + 1) * (long)InstructionBytes + offset) / InstructionBytes;
+            if (target <= i) loops.Add(((int)target, i));
+        }
+        var result = new bool[code.Count];
+        for (int i = 0; i < code.Count; i++)
+        {
+            if (effects[i].Latency != SassLatency.Variable) continue;
+            int earliest = i;
+            foreach (var loop in loops) if (loop.Start <= i && i <= loop.End && loop.Start < earliest) earliest = loop.Start;
+            foreach (int r in Registers(code[i], effects[i].Reads))
+                if (writers.TryGetValue(r, out var list) && list.Exists(w => w != i && (w > i || w >= earliest)))
+                {
+                    result[i] = true;
+                    break;
+                }
+        }
+        return result;
     }
 
     private static List<int> Registers(in SassInstruction instruction, IReadOnlyList<SassRegisterOperand> operands)
