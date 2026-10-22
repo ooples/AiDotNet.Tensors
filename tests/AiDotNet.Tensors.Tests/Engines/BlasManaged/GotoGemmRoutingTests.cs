@@ -253,7 +253,7 @@ public sealed class GotoGemmRoutingTests
                 float[] y = engine.FusedLinear(x, w, bias, FusedActivationType.None).ToArray();
                 if (first is null) { first = y; continue; }
                 for (int i = 0; i < y.Length; i++)
-                    Assert.True(BitConverter.SingleToInt32Bits(first[i]) == BitConverter.SingleToInt32Bits(y[i]),
+                    Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(first[i]) == TestHelpers.MathCompat.SingleToInt32Bits(y[i]),
                         $"threads={threads}: element {i} is {y[i]}, at 1 thread {first[i]}");
             }
         }
