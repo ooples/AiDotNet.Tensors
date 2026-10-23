@@ -661,7 +661,7 @@ public class SassInstructionTests
     }
 
     // An epilogue-length tail (EXIT waits for every result in flight, and an MMA's takes 56 cycles).
-    private static SassInstruction[] Tail() => Enumerable.Range(0, 6).Select(k => FfmaOf(120 + k, 2, 4, 120 + k)).Append(Exit).ToArray();
+    private static SassInstruction[] Tail() => Enumerable.Range(0, 6).Select(k => FfmaOf(120 + k, 2, 4, 120 + k)).Concat(new[] { Exit }).ToArray();   // Concat: net462 has no Enumerable.Append
 
     // HMMA.1688.F32.TF32 R{d}, R64, R214, R{d}: an independent MMA on accumulator R{d}..R{d+3}.
     private static SassInstruction HmmaOn(int d)
