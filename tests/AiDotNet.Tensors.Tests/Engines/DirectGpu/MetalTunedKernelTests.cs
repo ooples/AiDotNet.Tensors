@@ -496,7 +496,8 @@ public sealed class MetalTunedKernelTests
             Assert.Contains("metal.conv2d.im2col_gemm", applicable);
             Assert.Equal(WinogradF23Pipeline.AdmitsShape(args.Shape()), applicable.Contains("metal.conv2d.winograd_gemm"));
             Assert.Equal(WinogradF23Pipeline.AdmitsShape(args.Shape()), applicable.Contains("metal.conv2d.winograd_f43_gemm"));
-            Assert.Equal(4, backend.Conv2DForwardSlot.CandidateIds.Count);
+            Assert.Equal(WinogradF23Pipeline.AdmitsShape(args.Shape()), applicable.Contains("metal.conv2d.winograd_fused"));
+            Assert.Equal(5, backend.Conv2DForwardSlot.CandidateIds.Count);
         }
     }
 }

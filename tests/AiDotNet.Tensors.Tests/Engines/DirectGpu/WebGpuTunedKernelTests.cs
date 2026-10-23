@@ -584,9 +584,9 @@ public sealed class WebGpuTunedKernelTests
                 }
             }
             // Every candidate applies to these small shapes, so a variant that silently dropped out fails here --
-            // except the two Winograd routes (F(2x2) and F(4x4), #1432), which admit only 3x3 stride-1 undilated shapes (WinogradF23Pipeline).
+            // except the three Winograd routes (F(2x2), F(4x4) and fused F(2x2), #1432), which admit only 3x3 stride-1 undilated shapes (WinogradF23Pipeline).
             Assert.Equal(backend.Conv2DForwardSlot.CandidateIds.Count, Applicable(backend.Conv2DForwardSlot, args.Shape()).Count
-                + (k > 7 ? 1 : 0) + (WinogradF23Pipeline.AdmitsShape(args.Shape()) ? 0 : 2));
+                + (k > 7 ? 1 : 0) + (WinogradF23Pipeline.AdmitsShape(args.Shape()) ? 0 : 3));
         }
     }
 }
