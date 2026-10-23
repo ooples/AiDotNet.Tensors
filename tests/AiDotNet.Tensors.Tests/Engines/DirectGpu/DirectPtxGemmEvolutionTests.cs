@@ -63,6 +63,10 @@ public sealed class DirectPtxGemmEvolutionTests
         // 68 SMs (RTX 3080). 128^3: a 128 x 128 tile is one block, so the default must be a small tile.
         PtxGemmConfiguration small = PtxGemmEvolution.Seeds(nn, 128, 128, 128, 68)[0];
         Assert.True((128 / small.BlockM) * (128 / small.BlockN) >= 16, small.Name);
+        // 1024^3: 64 blocks of 128 x 128 cover at least half of 68 SMs, so the larger tile stays the default (it ran 16%
+        // faster than 128 x 64 there on an RTX 3080); at 640^3 its 25 blocks do not, and a smaller tile is chosen.
+        Assert.Equal(128 * 128, PtxGemmEvolution.Seeds(nn, 1024, 1024, 1024, 68)[0].BlockM * PtxGemmEvolution.Seeds(nn, 1024, 1024, 1024, 68)[0].BlockN);
+        Assert.True(PtxGemmEvolution.Seeds(nn, 640, 640, 640, 68)[0].BlockM * PtxGemmEvolution.Seeds(nn, 640, 640, 640, 68)[0].BlockN < 128 * 128);
         // 4096^3: the largest seed tile already launches 1,024 blocks.
         PtxGemmConfiguration large = PtxGemmEvolution.Seeds(nn, 4096, 4096, 4096, 68)[0];
         Assert.Equal(128 * 128, large.BlockM * large.BlockN);

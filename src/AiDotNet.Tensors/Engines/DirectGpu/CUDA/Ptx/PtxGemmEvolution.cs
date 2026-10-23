@@ -33,8 +33,11 @@ internal static class PtxGemmEvolution
         var candidates = new[]
         {
             // SM 8.0+: cp.async for the M/N-contiguous operand, register transposition for a K-contiguous one, split
-            // fragments, grouped rasterization, two blocks per multiprocessor (the best strict-FP32 probe kernel).
+            // fragments, grouped rasterization, two blocks per multiprocessor, register-pipelined fragments (the best
+            // strict-FP32 kernel: 3-4% faster than without the fragment pipeline at 1024^3 to 4096^3 on an RTX 3080).
+            new PtxGemmConfiguration(128, 128, 16, 8, 8, 4, 4, false, true, 8, 2, 2, true, FragmentPipeline: true),
             new PtxGemmConfiguration(128, 128, 16, 8, 8, 4, 4, false, true, 8, 2, 2, true),
+            new PtxGemmConfiguration(128, 64, 16, 8, 4, 4, 4, false, true, 8, 2, 2, true, FragmentPipeline: true),
             new PtxGemmConfiguration(128, 64, 16, 8, 4, 4, 4, false, true, 8, 2, 2, true),
             new PtxGemmConfiguration(64, 64, 16, 4, 4, 4, 4, false, false, 8, 2, 3, true),
             // Any device: register staging.
@@ -59,8 +62,11 @@ internal static class PtxGemmEvolution
     }
 
     /// <summary>
-    /// The largest-tile admitted seed that still launches at least one block per multiprocessor (a 128 x 128 tile gives a
-    /// 128^3 problem a single block); with no such seed, the one launching the most blocks. Vector access breaks ties.
+    /// The largest-tile admitted seed that still launches blocks for at least half the multiprocessors (a 128 x 128 tile
+    /// gives a 128^3 problem a single block); with no such seed, the one launching the most blocks. Vector access breaks
+    /// ties, then seed order. Half, not all: a larger tile does less redundant loading, and on an RTX 3080 (68 SMs) the
+    /// 128 x 128 seed beat the 128 x 64 one at 768^3 to 1024^3 with 36 to 64 blocks (90 vs 103 us at 768^3, 119 vs
+    /// 135 us at 1024^3), while at 640^3 (25 blocks) it lost (74 vs 47 us).
     /// </summary>
     internal static PtxGemmConfiguration DefaultFor(IReadOnlyList<PtxGemmConfiguration> admitted, int m, int n, int multiprocessors)
     {
@@ -69,7 +75,7 @@ internal static class PtxGemmEvolution
         PtxGemmConfiguration? best = null;
         foreach (var c in admitted)
         {
-            if (Blocks(c, m, n) < multiprocessors) continue;
+            if (2 * Blocks(c, m, n) < multiprocessors) continue;
             if (best is not { } b || c.BlockM * c.BlockN > b.BlockM * b.BlockN ||
                 (c.BlockM * c.BlockN == b.BlockM * b.BlockN && c.VectorWidth > b.VectorWidth))
                 best = c;
@@ -477,13 +483,14 @@ internal static class PtxGemmEvolution
     private sealed class Codec : IEvolutionGenomeCodec<PtxGemmConfiguration>
     {
         public string Id => "cuda-ptx-gemm-typed";
-        public string VersionHash => "2";
+        public string VersionHash => "3";
 
         public string Serialize(PtxGemmConfiguration genome) => string.Join("|", new[]
         {
             F(genome.BlockM), F(genome.BlockN), F(genome.BlockK), F(genome.ThreadM), F(genome.ThreadN),
             F(genome.VectorWidth), F(genome.SharedPad), genome.DoubleBuffer ? "1" : "0", genome.SplitTile ? "1" : "0",
             F(genome.Swizzle), F(genome.MinBlocksPerSM), F(genome.AsyncStages), genome.RegisterTranspose ? "1" : "0",
+            genome.FragmentPipeline ? "1" : "0",
         });
 
         public PtxGemmConfiguration Deserialize(string payload)
@@ -491,11 +498,11 @@ internal static class PtxGemmEvolution
             if (payload is null) throw new ArgumentNullException(nameof(payload));
             string[] v = payload.Split('|');
             // Eight fields is the version-1 genome (no fragment split, plain rasterization, no occupancy floor, register
-            // staging).
-            if (v.Length is not (8 or 13)) throw new InvalidDataException("Invalid PTX GEMM genome field count.");
-            bool v2 = v.Length == 13;
+            // staging); thirteen the version-2 genome (no fragment pipeline).
+            if (v.Length is not (8 or 13 or 14)) throw new InvalidDataException("Invalid PTX GEMM genome field count.");
+            bool v2 = v.Length >= 13, v3 = v.Length == 14;
             var genome = new PtxGemmConfiguration(P(v[0]), P(v[1]), P(v[2]), P(v[3]), P(v[4]), P(v[5]), P(v[6]), B(v[7]),
-                v2 && B(v[8]), v2 ? P(v[9]) : 1, v2 ? P(v[10]) : 1, v2 ? P(v[11]) : 0, v2 && B(v[12]));
+                v2 && B(v[8]), v2 ? P(v[9]) : 1, v2 ? P(v[10]) : 1, v2 ? P(v[11]) : 0, v2 && B(v[12]), v3 && B(v[13]));
             if (genome.Invalidity() is { } reason) throw new InvalidDataException("Invalid PTX GEMM genome: " + reason);
             return genome;
         }
@@ -516,7 +523,7 @@ internal static class PtxGemmEvolution
     {
         private static readonly int[] Tiles = { 32, 64, 128, 256 };
         private static readonly int[] KTiles = { 8, 16, 32 };
-        private static readonly int[] ThreadTiles = { 4, 8 };
+        private static readonly int[] ThreadTiles = { 4, 8, 16 };
         private readonly PtxGemmLayout _layout;
         private readonly int _m, _n, _k, _ccMajor;
 
@@ -530,7 +537,7 @@ internal static class PtxGemmEvolution
         }
 
         public string Id => "cuda-ptx-gemm-constrained-variation";
-        public string VersionHash => "2";
+        public string VersionHash => "3";
 
         public ValueTask<PtxGemmConfiguration> ProposeAsync(
             EvolutionVariationContext<PtxGemmConfiguration> context, CancellationToken cancellationToken = default)
@@ -552,7 +559,7 @@ internal static class PtxGemmEvolution
         }
 
         private static PtxGemmConfiguration Mutate(PtxGemmConfiguration value, StableRandom random) =>
-            random.NextInt(13) switch
+            random.NextInt(14) switch
             {
                 0 => value with { BlockM = Pick(Tiles, random) },
                 1 => value with { BlockN = Pick(Tiles, random) },
@@ -568,6 +575,7 @@ internal static class PtxGemmEvolution
                 // Switching to cp.async drops register double buffering (the pipeline replaces it).
                 11 => value with { AsyncStages = Pick(PtxGemmConfiguration.AsyncStageCounts, random), DoubleBuffer = false },
                 12 => value with { RegisterTranspose = !value.RegisterTranspose },
+                13 => value with { FragmentPipeline = !value.FragmentPipeline },
                 _ => throw new InvalidOperationException(),
             };
 
