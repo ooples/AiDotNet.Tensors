@@ -51,7 +51,13 @@ internal static class StreamingStrategy
         int m, int n, int k,
         in BlasOptions<T> options = default) where T : unmanaged
     {
-        int procs = options.NumThreads > 0 ? options.NumThreads : Environment.ProcessorCount;
+        // The default budget is the engine's thread cap, not the machine's processor count: a forward capped at 2 threads
+        // on a 128-thread host otherwise split N into ~128 column tiles narrower than the microkernel, each re-reading
+        // all of A, and ran them on 2 workers -- 256x4608x1152 took 328 ms against 34 ms single-threaded (#653). The M
+        // and N splits write disjoint outputs with the same per-element order, so the result does not depend on it.
+        int procs = options.NumThreads > 0
+            ? options.NumThreads
+            : Math.Max(1, Math.Min(Environment.ProcessorCount, Helpers.CpuParallelSettings.MaxDegreeOfParallelism));
         // -1 from caller = force single-thread (deterministic regression-test path).
         if (options.NumThreads < 0) procs = 1;
         // Determinism comes from either the global BlasProvider switch or the per-call
