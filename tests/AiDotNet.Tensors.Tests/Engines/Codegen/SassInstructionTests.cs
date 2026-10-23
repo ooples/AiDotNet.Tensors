@@ -659,4 +659,47 @@ public class SassInstructionTests
         Assert.Equal(0, scheduled[7].Control.WaitMask & (1 << load));   // and the OUTER BSYNC, which is the point
         Assert.NotEqual(0, scheduled[8].Control.WaitMask & (1 << load));   // its first reader waits
     }
+
+    // An epilogue-length tail (EXIT waits for every result in flight, and an MMA's takes 56 cycles).
+    private static SassInstruction[] Tail() => Enumerable.Range(0, 6).Select(k => FfmaOf(120 + k, 2, 4, 120 + k)).Append(Exit).ToArray();
+
+    // HMMA.1688.F32.TF32 R{d}, R64, R214, R{d}: an independent MMA on accumulator R{d}..R{d+3}.
+    private static SassInstruction HmmaOn(int d)
+    {
+        var hmma = Hmma1688;
+        hmma.SetRegister(SassInstruction.RdField, d);
+        hmma.SetRegister(SassInstruction.RcField, d);
+        return hmma;
+    }
+
+    /// <summary>
+    /// An HMMA's 56-cycle result crosses the loop branch right after it instead of being waited for there (3 capped
+    /// stalls cannot hold it: every Tensor-Core GEMM was declined); the next trip's MMA on the same accumulator still
+    /// waits the full latency, held by the instructions from the loop head on.
+    /// </summary>
+    [Fact]
+    public void AnMmaResultCrossesTheLoopBranch()
+    {
+        // Loop: 5 independent FFMAs at 0-4, the MMA on R32 at 5, a branch back to 0 at 6.
+        var code = Enumerable.Range(0, 5).Select(k => FfmaOf(100 + k, 2, 4, 100 + k))
+            .Concat(new[] { HmmaOn(32), Branch(6, 0) }).Concat(Tail()).ToArray();
+        var scheduled = SassScheduler.RecomputeControl(code, 86) ?? throw new InvalidOperationException(SassScheduler.LastDecline);
+        int trip = Enumerable.Range(0, 7).Sum(k => scheduled[k].Control.Stall);
+        Assert.True(trip >= 56, "the MMA re-reads R32 after " + trip + " cycles");
+    }
+
+    /// <summary>
+    /// sm_86: an HMMA reads its sources late (an IMAD.MOV overwriting its A operand 2 cycles on made an FP16 GEMM's
+    /// results wrong on the RTX 3080; ptxas leaves 7), and its pipe takes 8 cycles per MMA (ptxas never less).
+    /// </summary>
+    [Fact]
+    public void AnMmaHoldsItsSourcesAndItsPipe()
+    {
+        var war = SassScheduler.RecomputeControl(new[] { HmmaOn(32), WithRd(Lea, 64) }.Concat(Tail()).ToArray(), 86)
+            ?? throw new InvalidOperationException(SassScheduler.LastDecline);
+        Assert.True(war[0].Control.Stall >= 7, "R64 overwritten " + war[0].Control.Stall + " cycles after the HMMA reading it");
+        var pipe = SassScheduler.RecomputeControl(new[] { HmmaOn(32), HmmaOn(40) }.Concat(Tail()).ToArray(), 86)
+            ?? throw new InvalidOperationException(SassScheduler.LastDecline);
+        Assert.True(pipe[0].Control.Stall >= 8, "the second HMMA issued " + pipe[0].Control.Stall + " cycles after the first");
+    }
 }
