@@ -286,7 +286,10 @@ public static class SassScheduler
                 // its readers (the next trip's MMAs, the epilogue) come long after; ptxas branches right away. So at a
                 // branch to a target that is not drained, and at such a target, MMA results are not waited for: the
                 // branch hands them to its target as cycles still to wait, the fall-through keeps them, and readers
-                // wait as usual. Every other fixed-latency result, and every other control instruction, still waits.
+                // wait as usual. NOP, DEPBAR and BAR pass them on too: they read and write no register, and the
+                // readiness they skip is kept past them (see the boundary reset below), so the first reader after them
+                // still waits. Every other fixed-latency result, and every other control instruction (EXIT, BSSY,
+                // BSYNC, ...), still waits.
                 bool fallThroughOnly = e.Mnemonic is "NOP" or "DEPBAR" or "BAR";   // touch no registers, no control transfer
                 bool canCarry = (branch || fallThroughOnly || (target && e.Latency != SassLatency.Control))
                     && !(branch && drainTargets.Contains(BranchTarget(code, i))) && !(target && drainTargets.Contains(i));
@@ -379,7 +382,29 @@ public static class SassScheduler
                 timing.Pipes.TryGetValue(e.Mnemonic, out var pipe);
                 if (boundary)
                 {
-                    foreach (var pair in readyAt) if (!(canCarry && carried.Contains(pair.Key))) Need(pair.Value.Ready, pair.Value.Produced);
+                    // A carried MMA result is skipped only where nothing here needs it: this instruction (a branch target
+                    // may itself be the reader, such as a loop-head MMA on the previous trip's accumulator) and, at a
+                    // branch, the target's first instruction, which has no instruction before it in its block to hold
+                    // the delay - so it is waited for here instead (#1540).
+                    HashSet<int>? touched = null;
+                    if (canCarry)
+                    {
+                        touched = new HashSet<int>(reads);
+                        touched.UnionWith(writes);
+                        touched.UnionWith(predicateReads);
+                        touched.UnionWith(predicateWrites);
+                        if (guard >= 0) touched.Add(guard);
+                        if (branch)
+                        {
+                            int to = BranchTarget(code, i);
+                            var te = effects[to];
+                            touched.UnionWith(Registers(code[to], te.Reads));
+                            touched.UnionWith(Registers(code[to], te.Writes));
+                        }
+                    }
+                    foreach (var pair in readyAt)
+                        if (!(canCarry && carried.Contains(pair.Key) && touched is not null && !touched.Contains(pair.Key)))
+                            Need(pair.Value.Ready, pair.Value.Produced);
                     foreach (long at in predicateWrittenAt.Values) Need(at + guardLatency, at);
                     foreach (var at in pipeFreeAt.Values) Need(at.Ready, at.Produced);
                     foreach (long at in uniformReadAt.Values) Need(at + timing.UniformEarlyWriteAfterRead, at);

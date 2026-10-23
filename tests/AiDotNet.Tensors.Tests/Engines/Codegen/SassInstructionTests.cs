@@ -689,6 +689,22 @@ public class SassInstructionTests
     }
 
     /// <summary>
+    /// The MMA that reads the carried accumulator is the loop head itself, the branch target. A target skips the carried
+    /// results it is handed, so it must not skip the ones it reads: the next trip's MMA on R32 still waits the full
+    /// 56 cycles from the previous one, here held at the branch since nothing before the target is in the loop.
+    /// </summary>
+    [Fact]
+    public void AnMmaAtTheLoopHeadWaitsForTheCarriedAccumulator()
+    {
+        // Loop: the MMA on R32 at 0 (the branch target), 5 independent FFMAs at 1-5, a branch back to 0 at 6.
+        var code = new[] { HmmaOn(32) }.Concat(Enumerable.Range(0, 5).Select(k => FfmaOf(100 + k, 2, 4, 100 + k)))
+            .Concat(new[] { Branch(6, 0) }).Concat(Tail()).ToArray();
+        var scheduled = SassScheduler.RecomputeControl(code, 86) ?? throw new InvalidOperationException(SassScheduler.LastDecline);
+        int trip = Enumerable.Range(0, 7).Sum(k => scheduled[k].Control.Stall);
+        Assert.True(trip >= 56, "the loop-head MMA re-reads R32 after " + trip + " cycles");
+    }
+
+    /// <summary>
     /// sm_86: an HMMA reads its sources late (an IMAD.MOV overwriting its A operand 2 cycles on made an FP16 GEMM's
     /// results wrong on the RTX 3080; ptxas leaves 7), and its pipe takes 8 cycles per MMA (ptxas never less).
     /// </summary>
