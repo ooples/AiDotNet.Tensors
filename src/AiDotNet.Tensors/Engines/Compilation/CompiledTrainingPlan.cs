@@ -13043,6 +13043,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
 
         // Divide backward: gradA = gradOut / B, gradB = -gradOut * A / (B * B)
+        // A multi-consumer operand's gradient is the sum of every consumer's contribution, so it is added into the
+        // buffer unless this is the step's first write (AccumulatesInto), as the Add and Multiply backwards do. The
+        // copy it used to make kept only the divide's share: h / s + h * s lost the product's gradient through s.
         if (step.OpType == OpType.TensorDivide && step.Inputs.Length == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous)
         {
@@ -13054,18 +13057,27 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var gradOut = gradMap[output];
             var gradA = gradMap[inputA];
             var gradB = gradMap[inputB];
+            bool accumA = consumerCount.ContainsKey(inputA) && consumerCount[inputA] > 1;
+            bool accumB = consumerCount.ContainsKey(inputB) && consumerCount[inputB] > 1;
+            if (claimsFirstWrite is not null) claimsFirstWrite.Value = true;
             return eng =>
             {
                 var gA = eng.TensorDivide(gradOut, inputB);
                 using var gAKeep1 = new KeepAliveScope(gA);
                 using var gradAKeep2 = new KeepAliveScope(gradA);
-                gA.AsSpanUnmarked().CopyTo(gradA.AsWritableSpanUnmarked());
+                if (AccumulatesInto(gradA, accumA))
+                    eng.TensorAddInto(gradA, gradA, gA);
+                else
+                    gA.AsSpanUnmarked().CopyTo(gradA.AsWritableSpanUnmarked());
                 var negGradTimesA = eng.TensorNegate(eng.TensorMultiply(gradOut, inputA));
                 var bSquared = eng.TensorMultiply(inputB, inputB);
                 var gB = eng.TensorDivide(negGradTimesA, bSquared);
                 using var gBKeep1 = new KeepAliveScope(gB);
                 using var gradBKeep2 = new KeepAliveScope(gradB);
-                gB.AsSpanUnmarked().CopyTo(gradB.AsWritableSpanUnmarked());
+                if (AccumulatesInto(gradB, accumB))
+                    eng.TensorAddInto(gradB, gradB, gB);
+                else
+                    gB.AsSpanUnmarked().CopyTo(gradB.AsWritableSpanUnmarked());
                 inputA.Grad = gradA;
                 inputB.Grad = gradB;
             };

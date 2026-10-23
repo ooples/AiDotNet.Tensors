@@ -567,6 +567,16 @@ class Program
             return;
         }
 
+        if (args.Length > 0 && args[0] == "--sass-probe")
+        {
+            SassProbeTool.Run(args.Skip(1).ToArray());
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--sass-learn")
+        {
+            SassLearnTool.Run(args.Skip(1).ToArray());
+            return;
+        }
         if (args.Length > 0 && args[0] == "--kernel-elementwise")
         {
             KernelElementwiseTool.Run(args.Skip(1).ToArray());

@@ -142,8 +142,10 @@ extern ""C"" __global__ void wino_f43_input(const float* __restrict__ x, float* 
 }
 
 // y[n][k] 4x4 tile = A^T M A from M[x][k][p] (one GEMM split).
+// The convolution's epilogue (#1432, IWinogradF43Transforms): epi bit 0 adds bias[k], bit 1 applies ReLU (v < 0 is false
+// for NaN, which passes, as in the relu kernel). The convolution routes here pass 0.
 extern ""C"" __global__ void wino_f43_output(const float* __restrict__ mm, float* __restrict__ y,
-    int N, int K, int outH, int outW, int tilesH, int tilesW)
+    int N, int K, int outH, int outW, int tilesH, int tilesW, const float* __restrict__ bias, int epi)
 {
     int P = N * tilesH * tilesW;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;   // idx = k*P + p
@@ -178,7 +180,11 @@ extern ""C"" __global__ void wino_f43_output(const float* __restrict__ mm, float
         for (int j = 0; j < 4; j++)
         {
             int ww = tw * 4 + j;
-            if (ww < outW) dst[h * outW + ww] = o[j];
+            if (ww >= outW) continue;
+            float v = o[j];
+            if (epi & 1) v += bias[k];
+            if ((epi & 2) && v < 0.0f) v = 0.0f;
+            dst[h * outW + ww] = v;
         }
     }
 }
