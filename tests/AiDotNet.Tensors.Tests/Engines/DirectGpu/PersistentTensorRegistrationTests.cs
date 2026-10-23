@@ -69,6 +69,9 @@ public class PersistentTensorRegistrationTests
     }
 
     private static void AssertDidNotCopyTheTensor(long? allocated, string operation, Tensor<float> tensor)
+        => AssertDidNotCopyTheTensor(allocated, operation, (long)tensor.Length * sizeof(float));
+
+    private static void AssertDidNotCopyTheTensor(long? allocated, string operation, long tensorBytes)
     {
         if (allocated is not long bytes)
             return;   // net471: the identity and value assertions carry the test
@@ -76,7 +79,7 @@ public class PersistentTensorRegistrationTests
         Assert.True(
             bytes < 256 * 1024,
             $"{operation} allocated {bytes:N0} bytes; it must not detach the "
-                + $"{(long)tensor.Length * sizeof(float):N0}-byte tensor.");
+                + $"{tensorBytes:N0}-byte tensor.");
     }
 
     private static void AssertStillSharesStorage(Tensor<float> source, Tensor<float> alias)
@@ -89,26 +92,54 @@ public class PersistentTensorRegistrationTests
             "the copy-on-write alias was detached from its source: cache maintenance requested writable storage.");
     }
 
+    /// <summary>
+    /// Registers a fresh tensor and a copy-on-write alias of it, unregisters the alias, and returns
+    /// the managed bytes that unregistration allocated on this thread (null on net471). Asserts the
+    /// alias still shares its source's storage and that both still read their value.
+    /// </summary>
+    /// <remarks>
+    /// Every call builds a NEW pair, which is what makes a warm-up call sound: a detach rewrites the
+    /// alias onto storage of its own, so unregistering the SAME alias a second time has nothing left
+    /// to copy and would read clean however broken the path is.
+    /// </remarks>
+    private static long? MeasureUnregisterOfAFreshAlias(DirectGpuTensorEngine engine)
+    {
+        using var source = new Tensor<float>(new[] { Elements });
+        source[0] = 17.25f;
+        using var alias = (Tensor<float>)source.CloneShared();
+        AssertStillSharesStorage(source, alias);
+
+        engine.RegisterPersistentTensor(source, PersistentTensorRole.Weights);
+        engine.RegisterPersistentTensor(alias, PersistentTensorRole.Weights);
+
+        long? allocated = MeasureAllocatedBytes(() => engine.UnregisterPersistentTensor(alias));
+
+        AssertStillSharesStorage(source, alias);
+        Assert.Equal(17.25f, source[0]);
+        Assert.Equal(17.25f, alias[0]);
+
+        engine.UnregisterPersistentTensor(source);
+        return allocated;
+    }
+
     [Fact]
     public void UnregisterPersistentTensor_DoesNotDetachCopyOnWriteAlias()
     {
         using var engine = new DirectGpuTensorEngine();
-        using var source = new Tensor<float>(new[] { Elements });
-        source[0] = 17.25f;
-        using var clone = (Tensor<float>)source.CloneShared();
-        AssertStillSharesStorage(source, clone);
 
-        engine.RegisterPersistentTensor(source, PersistentTensorRole.Weights);
-        engine.RegisterPersistentTensor(clone, PersistentTensorRole.Weights);
+        // Warm the path before measuring it, as RegisterPersistentTensor_DoesNotMaterialiseTheTensor
+        // below already does. The FIRST unregistration in a process pays that path's one-time costs
+        // -- the generic instantiation, the static initializers behind the cache dictionaries -- on
+        // whichever thread runs it, and charges them to this measurement. Measured directly, a cold
+        // call read 12,360 bytes on Windows and 393,288 in the CI build job, which failed the job
+        // against the 256 KB threshold with no copy anywhere in the path: every warm call allocates
+        // exactly 0 bytes. The warm-up has its own pair and asserts the same invariants on it, so it
+        // cannot hide a detach -- it reports one twice instead.
+        MeasureUnregisterOfAFreshAlias(engine);
 
-        long? allocated = MeasureAllocatedBytes(() => engine.UnregisterPersistentTensor(clone));
+        long? allocated = MeasureUnregisterOfAFreshAlias(engine);
 
-        AssertDidNotCopyTheTensor(allocated, "Unregistering a COW alias", clone);
-        AssertStillSharesStorage(source, clone);
-        Assert.Equal(17.25f, source[0]);
-        Assert.Equal(17.25f, clone[0]);
-
-        engine.UnregisterPersistentTensor(source);
+        AssertDidNotCopyTheTensor(allocated, "Unregistering a COW alias", (long)Elements * sizeof(float));
     }
 
     [Fact]
