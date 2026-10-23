@@ -43,6 +43,11 @@ public sealed class DirectPtxSgemmGeneratorTests
         // cp.async for the M/N-contiguous operand, register transposition for the K-contiguous one.
         new(128, 128, 16, 8, 8, 4, 4, false, true, 8, 2, 2, true),
         new(64, 128, 16, 4, 8, 4, 0, false, true, 4, 1, 3, true),
+        // Register-pipelined fragments: the default seed, a 16 x 8 thread tile over register transposition, and
+        // 4-byte cp.async copies (the affine fast path for tiles inside K, the general path at the K edge).
+        new(128, 128, 16, 8, 8, 4, 4, false, true, 8, 2, 2, true, FragmentPipeline: true),
+        new(256, 128, 16, 16, 8, 4, 4, false, true, 1, 1, 3, true, FragmentPipeline: true),
+        new(128, 256, 8, 8, 16, 4, 4, false, true, 8, 1, 4, false, FragmentPipeline: true),
     };
 
     // (M, N, K): degenerate, odd (no tile divides), exact tiles, tall / wide / deep, and vector-aligned odd.

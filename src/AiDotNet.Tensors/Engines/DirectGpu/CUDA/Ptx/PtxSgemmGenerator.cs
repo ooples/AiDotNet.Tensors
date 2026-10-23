@@ -65,7 +65,9 @@ internal readonly record struct PtxGemmConfiguration(
     internal int ColumnOffset(int j) => j / FragmentN * ThreadsN * FragmentN + j % FragmentN;
 
     /// <summary>
-    /// The emit-able configurations over the genome's axes: the domain the evolutionary search (#1263) explores.
+    /// The emit-able configurations over the genome's base axes: the domain the evolutionary search (#1263) starts from
+    /// (its mutations also reach 16-wide thread tiles and the fragment pipeline, which this enumeration leaves out to keep
+    /// the every-configuration emission test bounded).
     /// </summary>
     internal static IEnumerable<PtxGemmConfiguration> SearchSpace()
     {
