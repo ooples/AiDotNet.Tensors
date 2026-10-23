@@ -1,5 +1,41 @@
 # Changelog
 
+## [0.142.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.141.0...v0.142.0) (2026-10-23)
+
+
+### Features
+
+* **codegen:** [#890](https://github.com/ooples/AiDotNet.Tensors/issues/890) phase 4d/4e - paged prefill, segment reductions, and the routes that call them ([#1526](https://github.com/ooples/AiDotNet.Tensors/issues/1526)) ([8fe96aa](https://github.com/ooples/AiDotNet.Tensors/commit/8fe96aacf009e312bbdaab0f5caccdde4ff65577))
+* **codegen:** own SASS backend - bit model, cubin rewriter, scheduler ([#1442](https://github.com/ooples/AiDotNet.Tensors/issues/1442)) ([#1504](https://github.com/ooples/AiDotNet.Tensors/issues/1504)) ([5e22587](https://github.com/ooples/AiDotNet.Tensors/commit/5e225873d4b99c368044d0bed3eec4ef65fd3e4b))
+
+
+### Bug Fixes
+
+* **autotune:** re-measure the fastest candidate once when two lost pairs refuse it, instead of letting a slower clean candidate win ([#1492](https://github.com/ooples/AiDotNet.Tensors/issues/1492)) ([8463b32](https://github.com/ooples/AiDotNet.Tensors/commit/8463b324f7b432a99fe000a72263f742ad0c599b))
+* **compilation:** add the divide backward into a shared operand's gradient ([#1533](https://github.com/ooples/AiDotNet.Tensors/issues/1533)) ([82825df](https://github.com/ooples/AiDotNet.Tensors/commit/82825df47d914b7e7684cafa2c094c0c7ab9e014))
+* **cuda:** build an attention shape's program at its first sighting so identical calls agree bit for bit ([#1532](https://github.com/ooples/AiDotNet.Tensors/issues/1532)) ([c0864fd](https://github.com/ooples/AiDotNet.Tensors/commit/c0864fd09e01c2f1a038029afb6c96e6f75b4aa9)), closes [#1529](https://github.com/ooples/AiDotNet.Tensors/issues/1529)
+* **gpu:** compiled-plan steps on a non-cuda gpu - the readback waits where it is read, and the fusion expectations come from the backend ([#1503](https://github.com/ooples/AiDotNet.Tensors/issues/1503)) ([307a659](https://github.com/ooples/AiDotNet.Tensors/commit/307a6590b11f23c50e07d314162347b50770488b))
+* **gpu:** ConvTranspose2D gradients include the output-padding rows ([#1508](https://github.com/ooples/AiDotNet.Tensors/issues/1508)) ([b4c0d94](https://github.com/ooples/AiDotNet.Tensors/commit/b4c0d94cf7d8ec6d7057a58cd01af2427e4eefd6))
+* **gpu:** IndexSelect yields zeros for an out-of-range index ([#1515](https://github.com/ooples/AiDotNet.Tensors/issues/1515)) ([82b6d81](https://github.com/ooples/AiDotNet.Tensors/commit/82b6d81e150dea3714e22e607fabccb7df2464d1))
+* **opencl:** keep the readback event before the commit can flush, and check the flush ([#1518](https://github.com/ooples/AiDotNet.Tensors/issues/1518)) ([01df74b](https://github.com/ooples/AiDotNet.Tensors/commit/01df74b9552b3440df50aced1a2ed067e4cf6af0))
+* **vulkan:** GridSample reflection, AdaDelta weight decay, tuning timestamps in the runs' command buffer ([#1525](https://github.com/ooples/AiDotNet.Tensors/issues/1525)) ([87643de](https://github.com/ooples/AiDotNet.Tensors/commit/87643de8ca7e829f707643d48e19caac4f20b6b5)), closes [#1524](https://github.com/ooples/AiDotNet.Tensors/issues/1524)
+
+
+### Performance
+
+* **codegen:** [#890](https://github.com/ooples/AiDotNet.Tensors/issues/890) phase 4a/4b - normalisation, pointwise and convolution as declared specs (draft) ([#1457](https://github.com/ooples/AiDotNet.Tensors/issues/1457)) ([da43b2c](https://github.com/ooples/AiDotNet.Tensors/commit/da43b2c612268cfc01e41009d496167a21ab538d))
+* **codegen:** [#890](https://github.com/ooples/AiDotNet.Tensors/issues/890) phase 4a/4d/4e - groupnorm backward, paged decode, deterministic scatter ([#1516](https://github.com/ooples/AiDotNet.Tensors/issues/1516)) ([ea29a79](https://github.com/ooples/AiDotNet.Tensors/commit/ea29a7980aa8e68671e3bc52c235f03cc2356eba))
+* **cpu:** GEMMs at 2-4 threads no longer run 5-19x slower than at one ([#1534](https://github.com/ooples/AiDotNet.Tensors/issues/1534)) ([22679b1](https://github.com/ooples/AiDotNet.Tensors/commit/22679b155ea4fe7e2925ac0202cb16f4ffa4cacd))
+* **cuda:** attention falls back to the flash kernel; fix the [#890](https://github.com/ooples/AiDotNet.Tensors/issues/890) route tool on sm_86 ([#1530](https://github.com/ooples/AiDotNet.Tensors/issues/1530)) ([5231b9b](https://github.com/ooples/AiDotNet.Tensors/commit/5231b9b0f14ac2c5738e72e5d71aa321e19f6b1b))
+* **cuda:** fused Winograd dW accumulates a 1 x 8k x 8c block per thread - 32 FMAs per two shared loads (step -53 us) ([#1506](https://github.com/ooples/AiDotNet.Tensors/issues/1506)) ([4e62cc1](https://github.com/ooples/AiDotNet.Tensors/commit/4e62cc16e212be92c77ac1adf9bad5d5d250cdcf))
+* **cuda:** one input-gradient launch for ResNet's strided conv and its projection shortcut (step -73 us) ([#1494](https://github.com/ooples/AiDotNet.Tensors/issues/1494)) ([c50bafe](https://github.com/ooples/AiDotNet.Tensors/commit/c50bafeb84e7f89d9e52e27c6562531a6a5b189c))
+* **cuda:** ResNet-18 BatchNorm backwards skip two activation passes (step 2.241 -&gt; 2.211 ms) ([#1490](https://github.com/ooples/AiDotNet.Tensors/issues/1490)) ([254b38a](https://github.com/ooples/AiDotNet.Tensors/commit/254b38aa3614ba4de331f943120250320e6cbc88))
+* **cuda:** tiled, atomic-free FlashAttention backward (21-33x the hand-written kernel) ([#1531](https://github.com/ooples/AiDotNet.Tensors/issues/1531)) ([6c73e63](https://github.com/ooples/AiDotNet.Tensors/commit/6c73e63ac7bda7619dd58f0db62f581b0b018750))
+* **gpu:** device-side finiteness guard and non-blocking readback on HIP, Metal, Vulkan and WebGPU ([#1523](https://github.com/ooples/AiDotNet.Tensors/issues/1523)) ([9aba09d](https://github.com/ooples/AiDotNet.Tensors/commit/9aba09d81861cb624aa4665db403df94f7eb59b8))
+* **gpu:** fused Winograd F(2x2,3x3) forward on Vulkan, Metal and WebGPU ([#1432](https://github.com/ooples/AiDotNet.Tensors/issues/1432)) ([#1536](https://github.com/ooples/AiDotNet.Tensors/issues/1536)) ([e0a9a32](https://github.com/ooples/AiDotNet.Tensors/commit/e0a9a32eef15e6363deee011818688a200e45d2c))
+* **gpu:** port the stride-2 input gradients to HIP, Metal, OpenCL, Vulkan and WebGPU ([#1517](https://github.com/ooples/AiDotNet.Tensors/issues/1517)) ([7abd0d1](https://github.com/ooples/AiDotNet.Tensors/commit/7abd0d1f250134ac59980a5811ce0d61d5bf7976)), closes [#1479](https://github.com/ooples/AiDotNet.Tensors/issues/1479) [#1480](https://github.com/ooples/AiDotNet.Tensors/issues/1480) [#1481](https://github.com/ooples/AiDotNet.Tensors/issues/1481) [#1482](https://github.com/ooples/AiDotNet.Tensors/issues/1482) [#1483](https://github.com/ooples/AiDotNet.Tensors/issues/1483)
+* **gpu:** Winograd F(4x4,3x3) forward on Vulkan, Metal, WebGPU and HIP through a shared pipeline ([#1432](https://github.com/ooples/AiDotNet.Tensors/issues/1432)) ([#1535](https://github.com/ooples/AiDotNet.Tensors/issues/1535)) ([8a0c9a7](https://github.com/ooples/AiDotNet.Tensors/commit/8a0c9a7eeece039bcba9ebc777a01488541fba21))
+
 ## [0.141.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.140.0...v0.141.0) (2026-10-21)
 
 
