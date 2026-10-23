@@ -269,6 +269,21 @@ internal static class PtxSgemmGenerator
         private string F() => "%f" + (_f++).ToString(CultureInfo.InvariantCulture);
         private void L(string line) => _body.Append("    ").AppendLine(line);
         private void Label(string label) => _body.Append(label).AppendLine(":");
+        private int _labels;
+        private readonly Dictionary<(string, string), string> _copyBase = new();
+
+        // The loop-invariant part of a copy's shared address (stage base + the thread's slot-0 offset), computed once:
+        // inside the loop only the warp-uniform stage offset is added, which ptxas folds into a uniform register, so
+        // the per-thread address register a cp.async reads is never rewritten (no wait on the previous copy's read).
+        private string CopyBase(Operand op, string buffer)
+        {
+            if (_copyBase.TryGetValue((op.Name, buffer), out string? known)) return known;
+            var (shared0, _) = SlotOffset(_slotShared, op, 0, 0);
+            string copyBase = R();
+            L($"add.u32 {copyBase}, {buffer}, {shared0};");
+            _copyBase[(op.Name, buffer)] = copyBase;
+            return copyBase;
+        }
         private static string I(int value) => value.ToString(CultureInfo.InvariantCulture);
         private static string I(long value) => value.ToString(CultureInfo.InvariantCulture);
 
@@ -293,6 +308,9 @@ internal static class PtxSgemmGenerator
             internal bool Affine;
             internal int DeltaK, DeltaMn;
             internal string Stride = "";
+            // A cp.async operand's copy size per slot for a tile wholly inside K: the bytes when the slot's row/column
+            // exists, else 0 (zero-fill). Computed once; the fast path of IssueTile uses it.
+            internal string[] FullSize = Array.Empty<string>();
         }
 
         // The global address of `op`'s slot s for the current tile: a register (slot 0, or a non-affine slot), or one
@@ -466,6 +484,12 @@ internal static class PtxSgemmGenerator
                     L($"add.u32 {firstB}, {curB}, {bRead};");
                     LoadFragments(fa, fb, firstA, firstB, 0);
                 }
+                // Stage indices, kept as wrapping counters (a remainder by the stage count costs a compare-and-subtract
+                // sequence inside the loop): the stage computed now, the next one, and the one being refilled.
+                string computeIdx = R(), nextIdx = R(), issueIdx = R();
+                L($"mov.u32 {computeIdx}, 0;");
+                L($"mov.u32 {nextIdx}, {I(1 % _c.AsyncStages)};");
+                L($"mov.u32 {issueIdx}, {I(_c.AsyncStages - 1)};");
                 Label("K_LOOP");
                 // Tile `tile` has landed once at most Stages-2 younger groups are pending; the barrier also retires
                 // every thread's reads of the stage the next issue overwrites (computed in the previous iteration).
@@ -478,7 +502,7 @@ internal static class PtxSgemmGenerator
                 string next = R(), issueStage = R(), hasNext = P(), nextK0 = R(), offA = R(), offB = R();
                 L($"add.u32 {next}, {tile}, {I(_c.AsyncStages - 1)};");
                 L($"setp.lt.u32 {hasNext}, {next}, {tiles};");
-                L($"rem.u32 {issueStage}, {next}, {I(_c.AsyncStages)};");
+                L($"mov.u32 {issueStage}, {issueIdx};");
                 L($"mul.lo.u32 {nextK0}, {next}, {I(_c.BlockK)};");
                 Advance(a);
                 Advance(b);
@@ -488,14 +512,13 @@ internal static class PtxSgemmGenerator
                 IssueTile(b, curB, offB, nextK0, k, hasNext);
                 L("cp.async.commit_group;");
                 string computeStage = R(), stageA = R(), stageB = R();
-                L($"rem.u32 {computeStage}, {tile}, {I(_c.AsyncStages)};");
+                L($"mov.u32 {computeStage}, {computeIdx};");
                 L($"mad.lo.u32 {stageA}, {computeStage}, {I(tileBytesA)}, {curA};");
                 L($"mad.lo.u32 {stageB}, {computeStage}, {I(tileBytesB)}, {curB};");
                 if (_c.FragmentPipeline)
                 {
                     string nextStage = R(), nextA = R(), nextB = R();
-                    L($"add.u32 {nextStage}, {tile}, 1;");
-                    L($"rem.u32 {nextStage}, {nextStage}, {I(_c.AsyncStages)};");
+                    L($"mov.u32 {nextStage}, {nextIdx};");
                     L($"mad.lo.u32 {nextA}, {nextStage}, {I(tileBytesA)}, {curA};");
                     L($"mad.lo.u32 {nextB}, {nextStage}, {I(tileBytesB)}, {curB};");
                     ComputePipelined(stageA, stageB, nextA, nextB, aRead, bRead, new[] { fa, fa2 }, new[] { fb, fb2 }, acc, () =>
@@ -513,6 +536,13 @@ internal static class PtxSgemmGenerator
                     // next read Stages-1 iterations on, after at least one more barrier.
                     FinishTile(a, curA, offA);
                     FinishTile(b, curB, offB);
+                }
+                foreach (string idx in new[] { computeIdx, nextIdx, issueIdx })
+                {
+                    string wrap = P();
+                    L($"add.u32 {idx}, {idx}, 1;");
+                    L($"setp.eq.u32 {wrap}, {idx}, {I(_c.AsyncStages)};");
+                    L($"selp.u32 {idx}, 0, {idx}, {wrap};");
                 }
                 string more = P();
                 L($"add.u32 {tile}, {tile}, 1;");
@@ -708,6 +738,15 @@ internal static class PtxSgemmGenerator
                     _slotBytes[name] = vw * sizeof(float);
                 }
             }
+            if (!viaRegisters)
+            {
+                op.FullSize = new string[slots];
+                for (int s = 0; s < slots; s++)
+                {
+                    op.FullSize[s] = R();
+                    L($"selp.u32 {op.FullSize[s]}, {I(vw * sizeof(float))}, 0, {op.SlotMnInBounds[s]};");
+                }
+            }
             // One K tile further: BK elements along K, or BK rows of ld elements.
             op.Step = Rd();
             if (contiguousAlongK) L($"mov.u64 {op.Step}, {I((long)_c.BlockK * _ob)};");
@@ -741,6 +780,34 @@ internal static class PtxSgemmGenerator
                 return;
             }
             int bytes = _slotBytes[op.Name];
+            string? done = null;
+            if (op.Affine)
+            {
+                CopyBase(op, buffer);   // defined on the straight-line path, before any branch
+                // Fast path, a tile wholly inside K and wanted: each slot's size is fixed (FullSize) and its source is
+                // the previous slot's plus Stride, so a copy is an address add and the cp.async. The general path
+                // below handles the K edge and the past-the-end tiles.
+                string end = R(), full = P(), slow = "COPY_SLOW_" + I(_labels), after = "COPY_DONE_" + I(_labels);
+                _labels++;
+                done = after;
+                L($"add.u32 {end}, {k0}, {I(_c.BlockK)};");
+                L($"setp.le.and.u32 {full}, {end}, {k}, {issue};");
+                L($"@!{full} bra.uni {slow};");
+                string dst = R(), src = Rd();
+                L($"add.u32 {dst}, {CopyBase(op, buffer)}, {stageOffset};");
+                L($"mov.u64 {src}, {op.SlotPointer[0]};");
+                int perSlot = (op.DeltaK * op.Pitch + op.DeltaMn) * sizeof(float);
+                for (int s = 0; s < op.SlotPointer.Length; s++)
+                {
+                    if (s > 0) L($"add.u64 {src}, {src}, {op.Stride};");
+                    string at = s * perSlot != 0 ? dst + "+" + I(s * perSlot) : dst;
+                    L(bytes == 16
+                        ? $"cp.async.cg.shared.global [{at}], [{src}], 16, {op.FullSize[s]};"
+                        : $"cp.async.ca.shared.global [{at}], [{src}], {I(bytes)}, {op.FullSize[s]};");
+                }
+                L($"bra.uni {after};");
+                Label(slow);
+            }
             for (int s = 0; s < op.SlotPointer.Length; s++)
             {
                 string ok = P(), size = R(), dst = R();
@@ -758,6 +825,7 @@ internal static class PtxSgemmGenerator
                     ? $"cp.async.cg.shared.global [{at}], [{source}], 16, {size};"
                     : $"cp.async.ca.shared.global [{at}], [{source}], {I(bytes)}, {size};");
             }
+            if (done is not null) Label(done);
         }
 
         private void Advance(Operand op)
