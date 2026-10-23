@@ -17,6 +17,12 @@ public class DeterministicModeTests
     [Fact]
     public void BlasProvider_SetDeterministicMode_Toggles()
     {
+        // IsDeterministicMode reads this thread's override (TensorCodecOptions.SetCurrent) before the
+        // process-wide flag. A test elsewhere that leaves an override on a shared xUnit thread would mask
+        // SetDeterministicMode here, and restoring the merged value would then write it into the global.
+        // So run with no override, capture the real global, and put both back.
+        bool? overrideBefore = BlasProvider.GetThreadLocalDeterministicMode();
+        BlasProvider.SetThreadLocalDeterministicMode(null);
         bool before = BlasProvider.IsDeterministicMode;
         try
         {
@@ -28,7 +34,8 @@ public class DeterministicModeTests
         }
         finally
         {
-            BlasProvider.SetDeterministicMode(before);  // restore
+            BlasProvider.SetDeterministicMode(before);
+            BlasProvider.SetThreadLocalDeterministicMode(overrideBefore);
         }
     }
 
