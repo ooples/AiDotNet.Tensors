@@ -37,6 +37,7 @@ internal static class PtxGemmEvolution
             // strict-FP32 kernel: 3-4% faster than without the fragment pipeline at 1024^3 to 4096^3 on an RTX 3080).
             new PtxGemmConfiguration(128, 128, 16, 8, 8, 4, 4, false, true, 8, 2, 2, true, FragmentPipeline: true),
             new PtxGemmConfiguration(128, 128, 16, 8, 8, 4, 4, false, true, 8, 2, 2, true),
+            new PtxGemmConfiguration(128, 64, 16, 8, 4, 4, 4, false, true, 8, 2, 2, true, FragmentPipeline: true),
             new PtxGemmConfiguration(128, 64, 16, 8, 4, 4, 4, false, true, 8, 2, 2, true),
             new PtxGemmConfiguration(64, 64, 16, 4, 4, 4, 4, false, false, 8, 2, 3, true),
             // Any device: register staging.
@@ -61,8 +62,11 @@ internal static class PtxGemmEvolution
     }
 
     /// <summary>
-    /// The largest-tile admitted seed that still launches at least one block per multiprocessor (a 128 x 128 tile gives a
-    /// 128^3 problem a single block); with no such seed, the one launching the most blocks. Vector access breaks ties.
+    /// The largest-tile admitted seed that still launches blocks for at least half the multiprocessors (a 128 x 128 tile
+    /// gives a 128^3 problem a single block); with no such seed, the one launching the most blocks. Vector access breaks
+    /// ties, then seed order. Half, not all: a larger tile does less redundant loading, and on an RTX 3080 (68 SMs) the
+    /// 128 x 128 seed beat the 128 x 64 one at 768^3 to 1024^3 with 36 to 64 blocks (90 vs 103 us at 768^3, 119 vs
+    /// 135 us at 1024^3), while at 640^3 (25 blocks) it lost (74 vs 47 us).
     /// </summary>
     internal static PtxGemmConfiguration DefaultFor(IReadOnlyList<PtxGemmConfiguration> admitted, int m, int n, int multiprocessors)
     {
@@ -71,7 +75,7 @@ internal static class PtxGemmEvolution
         PtxGemmConfiguration? best = null;
         foreach (var c in admitted)
         {
-            if (Blocks(c, m, n) < multiprocessors) continue;
+            if (2 * Blocks(c, m, n) < multiprocessors) continue;
             if (best is not { } b || c.BlockM * c.BlockN > b.BlockM * b.BlockN ||
                 (c.BlockM * c.BlockN == b.BlockM * b.BlockN && c.VectorWidth > b.VectorWidth))
                 best = c;

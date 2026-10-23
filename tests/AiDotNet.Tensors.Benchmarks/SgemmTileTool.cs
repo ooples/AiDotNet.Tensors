@@ -17,6 +17,10 @@ internal static class SgemmTileTool
     // Name grammar (PtxGemmConfiguration.Name): b{M}x{N}x{K}-t{TM}x{TN}-v{V}-p{P}-{sb|db|as{S}[r]}[-split][-g{G}][-o{O}]
     internal static PtxGemmConfiguration Parse(string name)
     {
+        // Strict: a near-miss name must not be timed as some other configuration under the requested name.
+        if (!System.Text.RegularExpressions.Regex.IsMatch(name,
+                @"^b\d+x\d+x\d+-t\d+x\d+-v\d+-p\d+-(sb|db|as\d+r?)(-split)?(-g\d+)?(-o\d+)?(-fp)?$"))
+            throw new FormatException("not a configuration name (b{M}x{N}x{K}-t{TM}x{TN}-v{V}-p{P}-{sb|db|as{S}[r]}[-split][-g{G}][-o{O}][-fp]): " + name);
         var parts = name.Split('-');
         int[] Dims(string s, char prefix) => Array.ConvertAll(s.TrimStart(prefix).Split('x'), x => int.Parse(x, CultureInfo.InvariantCulture));
         var b = Dims(parts[0], 'b');
@@ -72,8 +76,15 @@ internal static class SgemmTileTool
     {
         using var runtime = new DirectPtxRuntime();
         int major = runtime.ComputeCapabilityMajor, minor = runtime.ComputeCapabilityMinor;
-        int size = Array.IndexOf(args, "--size") is int sz && sz >= 0 ? int.Parse(args[sz + 1], CultureInfo.InvariantCulture) : 2048;
-        string baselineName = Array.IndexOf(args, "--baseline") is int bl && bl >= 0 ? args[bl + 1] : "b128x128x16-t8x8-v4-p4-as2r-split-g8-o2";
+        string? Option(string flag) => Array.IndexOf(args, flag) is int at && at >= 0
+            ? (at + 1 < args.Length ? args[at + 1] : throw new ArgumentException(flag + " needs a value"))
+            : null;
+        string? sizeText = Option("--size");
+        int size = 2048;
+        if (sizeText is not null && (!int.TryParse(sizeText, NumberStyles.Integer, CultureInfo.InvariantCulture, out size) || size <= 0))
+            throw new ArgumentException("--size needs a positive integer, not " + sizeText);
+        string baselineName = Option("--baseline") ?? "b128x128x16-t8x8-v4-p4-as2r-split-g8-o2";
+        Parse(baselineName);
         var names = new List<string>();
         for (int i = 0; i < args.Length; i++)
             if (args[i] == "--config" && i + 1 < args.Length) names.AddRange(args[i + 1].Split(','));
@@ -146,15 +157,17 @@ internal static class SgemmTileTool
                         runtime.Synchronize();
                         var actual = new float[elements];
                         c1.Download<float>(actual);
+                        // Bit-identical, else within the generator tests' oracle bound relative to the K-term sum
+                        // (a different reduction order rounds differently; an output near zero is still bounded by K).
                         long differ = 0;
                         double worst = 0;
                         for (long i = 0; i < elements; i++)
                         {
                             if (BitConverter.SingleToInt32Bits(actual[i]) == BitConverter.SingleToInt32Bits(expected[i])) continue;
                             differ++;
-                            worst = Math.Max(worst, Math.Abs(actual[i] - expected[i]) / Math.Max(1e-3, Math.Abs(expected[i])));
+                            worst = Math.Max(worst, Math.Abs(actual[i] - expected[i]) / size);
                         }
-                        string output = differ == 0 ? "same" : worst < 1e-4 ? "~" + worst.ToString("E0", CultureInfo.InvariantCulture) : "WRONG";
+                        string output = differ == 0 ? "same" : worst < 2e-5 ? "~" + worst.ToString("E0", CultureInfo.InvariantCulture) : "WRONG";
                         var baseSamples = new List<double>();
                         var samples = new List<double>();
                         for (int round = 0; round < 15; round++)
