@@ -137,7 +137,8 @@ internal static class GotoGemmFp32
             //      microkernel efficiency + a small L2-resident B-panel. RunParallel hands tiles out dynamically, so
             //      the spare half-tile per core absorbs uneven worker speed; at one tile per core, DiT's 256x1152x1152
             //      projection got 18 tiles on 16 threads and waited on the two doubled-up workers (#653).
-            int targetJc = System.Math.Max(1, (TilesPerCoreTimes2 * cores + 2 * ic - 1) / (2 * ic));
+            int tpc2 = s_staticTiles ? 2 : TilesPerCoreTimes2;
+            int targetJc = System.Math.Max(1, (tpc2 * cores + 2 * ic - 1) / (2 * ic));
             int nc = System.Math.Max(32, System.Math.Min(128, n / targetJc));
             nc = System.Math.Max(16, (nc / 16) * 16);
             return (mc, nc, kc);
@@ -148,6 +149,9 @@ internal static class GotoGemmFp32
     // Short-M tiles per core, times 2 (3 = 1.5 tiles per core). Measured on the 3990X with dynamic tile claiming,
     // M256 N1152 at 16 / 32 threads: 1.25x / 1.25x over one tile per core; M77 N1152 1.12-1.14x at 8-16 (#653).
     private const int TilesPerCoreTimes2 = 3;
+    // EXPERIMENT switch: the #1534 static split with one tile per core.
+    internal static bool s_staticTiles = Environment.GetEnvironmentVariable("AIDOTNET_GOTO_STATIC_TILES") == "1";
+    internal static bool s_claimColumns = Environment.GetEnvironmentVariable("AIDOTNET_GOTO_CLAIM_COLUMNS") == "1";
 
 #if NET5_0_OR_GREATER
     // Direct pack-vs-kernel timing (diagnostic; set s_timing during a profiling run only). Coarse
@@ -387,6 +391,43 @@ internal static class GotoGemmFp32
         // its chunks out round-robin with no stealing, so one slow or preempted worker held the whole GEMM (#653,
         // 256x1152x3456 1.44x / 1.53x faster this way at 8 / 16 threads). Which thread runs a tile does not change
         // its bits.
+        if (s_staticTiles)
+        {
+            CpuParallelSettings.ParallelForOrSerial(0, totalTiles, (long)m * n * k, tileIdx =>
+            {
+                int ic = (tileIdx % numIcL) * mcL;
+                int jc = (tileIdx / numIcL) * ncL;
+                int effMc = Math.Min(mcL, mL - ic);
+                int effNc = Math.Min(ncL, nL - jc);
+                if (effMc <= 0 || effNc <= 0) return;
+                RunTile((float*)ai, ldaL, (float*)bi, ldbL, (float*)ci, ldcL, ic, jc, effMc, effNc, kL, mcL, ncL, kcL);
+            }, deterministicSafe: true);
+            return;
+        }
+        if (s_claimColumns)
+        {
+            int degreeC = CpuParallelSettings.MaxDegreeOfParallelism;
+            if (degreeC <= 0) degreeC = Environment.ProcessorCount;
+            int claimersC = Math.Min(degreeC, numJc);
+            int nextCol = -1;
+            CpuParallelSettings.ParallelForOrSerial(0, claimersC, (long)m * n * k, _ =>
+            {
+                int col;
+                while ((col = Interlocked.Increment(ref nextCol)) < numJc)
+                {
+                    int jc = col * ncL;
+                    int effNc = Math.Min(ncL, nL - jc);
+                    for (int icb = 0; icb < numIcL; icb++)
+                    {
+                        int ic = icb * mcL;
+                        int effMc = Math.Min(mcL, mL - ic);
+                        if (effMc <= 0 || effNc <= 0) continue;
+                        RunTile((float*)ai, ldaL, (float*)bi, ldbL, (float*)ci, ldcL, ic, jc, effMc, effNc, kL, mcL, ncL, kcL);
+                    }
+                }
+            }, deterministicSafe: true);
+            return;
+        }
         int degree = CpuParallelSettings.MaxDegreeOfParallelism;
         if (degree <= 0) degree = Environment.ProcessorCount;
         int claimers = Math.Min(degree, totalTiles);
