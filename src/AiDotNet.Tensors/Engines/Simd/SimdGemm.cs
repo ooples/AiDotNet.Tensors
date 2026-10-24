@@ -598,6 +598,20 @@ internal static partial class SimdGemm
     }
 
     /// <summary>
+    /// Whether the packed pointer kernels the cached-B paths below run can execute on this machine.
+    /// </summary>
+    /// <remarks>
+    /// MacroKernel and the micro-kernels it calls use <c>Fma.MultiplyAdd</c>, <c>Avx.LoadVector256</c> and
+    /// <c>Avx.MaskStore</c> with no checks of their own, and an intrinsic the hardware does not have throws
+    /// PlatformNotSupportedException instead of degrading. The cached-B entry points are public and do not pass
+    /// through SgemmAddInternal, which carries the same condition at its own dispatch, so each one tests this and
+    /// routes to the portable Vector/scalar path instead. Without it every cached-B GEMM threw on a CPU without
+    /// AVX2 -- about 80 AiDotNet model tests per cross-ISA partition failed under DOTNET_EnableAVX2=0 while the
+    /// default and AVX-512-off configurations passed.
+    /// </remarks>
+    private static bool PackedKernelsSupported => Avx2.IsSupported && Fma.IsSupported;
+
+    /// <summary>
     /// Compute C = A·B using a cached pre-packed B keyed on the B array's
     /// object identity. On cache miss, pre-packs B and stores. On hit,
     /// skips the PackB work entirely (18-20% of Sgemm time saved on BERT
@@ -648,8 +662,9 @@ internal static partial class SimdGemm
 
         // Cache-eligibility gate: if n > Nc, the outer loop iterates jc multiple
         // times and our single-jc assumption breaks. Also skip if AVX-512 path is
-        // eligible (the specialised kernel's layout differs).
-        if (n > Nc || Avx512Sgemm.CanUse)
+        // eligible (the specialised kernel's layout differs), and when this machine
+        // cannot run the packed kernels at all (see PackedKernelsSupported).
+        if (n > Nc || Avx512Sgemm.CanUse || !PackedKernelsSupported)
         {
             c.Clear();
             SgemmAddInternal(a, k, false, b.AsSpan(), n, false, c, m, k, n,
@@ -955,7 +970,9 @@ internal static partial class SimdGemm
 
         c.Clear();
 
-        if (n > Nc || Avx512Sgemm.CanUse)
+        // The same gate as the float cached-B entry above, including the machine that cannot run the
+        // packed kernels: the int8 path dequantises into the very same MacroKernel.
+        if (n > Nc || Avx512Sgemm.CanUse || !PackedKernelsSupported)
         {
             SgemmAddInternal(a, k, false, b.AsSpan(), n, false, c, m, k, n,
                 allowParallel: UseParallelGemm, clearedOutput: true);
