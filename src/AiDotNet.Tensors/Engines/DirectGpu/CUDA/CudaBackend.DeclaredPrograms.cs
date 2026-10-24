@@ -68,6 +68,12 @@ internal enum DeclaredFamily
 
     /// <summary>The deterministic segment minimum (#890 phase 4e).</summary>
     SegmentMin,
+
+    /// <summary><c>dst[i] = src[offset + i * stride]</c> (#1441).</summary>
+    StridedGather,
+
+    /// <summary><c>dst[offset + i * stride] = src[i]</c>, in place (#1441).</summary>
+    StridedScatter,
 }
 
 /// <summary>One declared program: its family and shape (unused dimensions are 0).</summary>

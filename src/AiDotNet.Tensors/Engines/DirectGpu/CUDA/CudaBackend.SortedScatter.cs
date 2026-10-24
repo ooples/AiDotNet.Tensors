@@ -241,6 +241,70 @@ public sealed partial class CudaBackend
             maximum ? s_buildSegmentMax : s_buildSegmentMin, s_scatterAddNames,
             new DeclaredBindings(segmentIds, source, output));
 
+    // AIDOTNET_DECLARED_STRIDED=1 opts the strided gather/scatter into the declared route; it is off by default until
+    // the programs are verified on an NVIDIA GPU (see StridedDeclaredPromoted).
+    private static readonly bool s_declaredStridedOptIn =
+        Environment.GetEnvironmentVariable("AIDOTNET_DECLARED_STRIDED") == "1";
+
+    /// <summary>
+    /// Whether the declared strided gather and scatter (#1441) have been verified on an NVIDIA GPU. While false they
+    /// run only with AIDOTNET_DECLARED_STRIDED=1 (or <see cref="DeclaredStridedSwitch"/>); the hand-written
+    /// strided_gather / strided_scatter kernels serve every call otherwise. Set it to true once
+    /// CodegenStridedGatherScatterTests' driver comparison passes: the route is then on by default, like every other
+    /// declared family, and AIDOTNET_DECLARED_KERNELS=0 still turns it off.
+    /// </summary>
+    internal const bool StridedDeclaredPromoted = false;
+
+    /// <summary>Overrides AIDOTNET_DECLARED_STRIDED for this backend (verification tooling and tests).</summary>
+    internal bool? DeclaredStridedSwitch { get; set; }
+
+    private bool DeclaredStridedEnabled => DeclaredStridedSwitch ?? (StridedDeclaredPromoted || s_declaredStridedOptIn);
+
+    private static readonly string[] s_stridedNames = { "src", "dst" };
+
+    private static readonly Func<DeclaredKey, CodegenProgram> s_buildStridedGather =
+        key => CodegenBackendPrograms.StridedGather(key.D0, key.D1, key.D2, key.D3);
+
+    private static readonly Func<DeclaredKey, CodegenProgram> s_buildStridedScatter =
+        key => CodegenBackendPrograms.StridedScatter(key.D0, key.D1, key.D2, key.D3);
+
+    /// <summary>The key of a strided gather or scatter: count, the strided tensor's length, offset, stride.</summary>
+    internal static DeclaredKey StridedKey(DeclaredFamily family, int count, int length, int offset, int stride) =>
+        new(family, count, length, offset, stride, 0, 0);
+
+    /// <summary>
+    /// StridedGather through its declared program (#1441). Off by default (<see cref="StridedDeclaredPromoted"/>);
+    /// below the size at which the declared call's bookkeeping costs more than the launch it replaces, it keeps the
+    /// hand-written kernel, as Embedding does. False -- nothing launched -- when off or the shape declines.
+    /// </summary>
+    internal bool TryDeclaredStridedGather(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
+    {
+        if (!DeclaredStridedEnabled || count < 16384) return false;
+        return TryRunDeclaredProgram(StridedKey(DeclaredFamily.StridedGather, count, src.Size, offset, stride),
+            s_buildStridedGather, s_stridedNames, new DeclaredBindings(src, dst));
+    }
+
+    /// <summary>
+    /// StridedScatter through its declared program (#1441): it writes only the strided cells, so the destination keeps
+    /// the rest, as with the hand-written kernel. Off by default; the same size floor as the gather.
+    /// </summary>
+    internal bool TryDeclaredStridedScatter(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
+    {
+        if (!DeclaredStridedEnabled || count < 16384) return false;
+        return TryRunDeclaredProgram(StridedKey(DeclaredFamily.StridedScatter, count, dst.Size, offset, stride),
+            s_buildStridedScatter, s_stridedNames, new DeclaredBindings(src, dst));
+    }
+
+    /// <summary>The strided gather as a resident-program stage.</summary>
+    internal DeclaredResidentStage StridedGatherStage(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count) =>
+        new(StridedKey(DeclaredFamily.StridedGather, count, src.Size, offset, stride), s_buildStridedGather,
+            s_stridedNames, new DeclaredBindings(src, dst));
+
+    /// <summary>The strided scatter as a resident-program stage.</summary>
+    internal DeclaredResidentStage StridedScatterStage(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count) =>
+        new(StridedKey(DeclaredFamily.StridedScatter, count, dst.Size, offset, stride), s_buildStridedScatter,
+            s_stridedNames, new DeclaredBindings(src, dst));
+
     private static readonly string[] s_indexSelectNames = { "indices", "source", "out" };
 
     private static readonly Func<DeclaredKey, CodegenProgram> s_buildIndexSelect =
