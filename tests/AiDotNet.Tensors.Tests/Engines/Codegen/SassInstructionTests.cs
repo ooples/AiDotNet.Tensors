@@ -718,4 +718,20 @@ public class SassInstructionTests
             ?? throw new InvalidOperationException(SassScheduler.LastDecline);
         Assert.True(pipe[0].Control.Stall >= 8, "the second HMMA issued " + pipe[0].Control.Stall + " cycles after the first");
     }
+
+    /// <summary>
+    /// A stall of 12 or more is encoded only with the yield bit clear: ptxas never sets both, nvdisasm rejects the
+    /// combination as undefined, and keeping ptxas's yield on an instruction whose stall grew to 12 faulted a kernel.
+    /// </summary>
+    [Fact]
+    public void ALongStallClearsTheYieldBit()
+    {
+        var isetp = IsetpP5;
+        isetp.Control = isetp.Control with { Yield = true, Stall = 1 };
+        var scheduled = SassScheduler.RecomputeControl(new[] { isetp, LdgstsP5, Exit }, 86)
+            ?? throw new InvalidOperationException(SassScheduler.LastDecline);
+        Assert.True(scheduled[0].Control.Stall >= 12);
+        Assert.False(scheduled[0].Control.Yield, "stall " + scheduled[0].Control.Stall + " encoded with the yield bit set");
+        Assert.All(scheduled, i => Assert.False(i.Control.Stall >= 12 && i.Control.Yield));
+    }
 }
