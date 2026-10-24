@@ -9,7 +9,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 /// SpMM using AiDotNet's own managed HIP kernels (<c>csr_spmm</c> /
 /// <c>csr_spmm_warp</c> / <c>csr_spmm_double</c> in
 /// <see cref="Kernels.HipSparseKernels"/>), with the same host-array entry shape as
-/// <see cref="HipSparseBackend"/> but dispatching the managed kernels instead of
+/// the rocSPARSE adapter it replaced but dispatching the managed kernels instead of
 /// rocSPARSE — the supply-chain-removal default for AMD GPUs (issue #515, P6).
 ///
 /// <para>Routed by <see cref="LinearAlgebra.Sparse.SparseOps"/> ahead of rocSPARSE for float and double SpMM and for

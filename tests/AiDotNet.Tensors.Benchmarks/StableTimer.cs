@@ -509,6 +509,122 @@ internal static class StableTimer
         return Pair(samplesA, samplesB, ratios, attempts);
     }
 
+    /// <summary>
+    /// The median of n paired ratios A/B and a distribution-free confidence interval for it.
+    /// </summary>
+    /// <param name="Median">The median ratio; above 1 means B is faster.</param>
+    /// <param name="Lower">The interval's lower end: the median is at least this, at <paramref name="Confidence"/>.</param>
+    /// <param name="Upper">The interval's upper end.</param>
+    /// <param name="Pairs">The number of paired ratios measured.</param>
+    /// <param name="Confidence">The two-sided confidence level of [Lower, Upper].</param>
+    internal readonly record struct RatioBound(double Median, double Lower, double Upper, int Pairs, double Confidence);
+
+    /// <summary>
+    /// Times A and B as <paramref name="pairs"/> AB/BA brackets and bounds the median of their ratios.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The spread gate of <see cref="MeasureCalibratedHostPair"/> asks three consecutive samples to agree within 5%, which
+    /// a virtualized GPU never does: on GitHub's macOS runner the per-arm timings of the Metal Meshgrid2D gate (#921)
+    /// swing 8-70% and the paired ratio 6-42%, so every comparison came back "no verdict" even where every run's median
+    /// was 1.34-1.73x. Noise that large does not make the question unanswerable; it makes it a statistical one.
+    /// </para>
+    /// <para>
+    /// Each bracket times A, B, B, A back to back, so a drift that is linear across the bracket cancels, and gives one
+    /// ratio. The median's interval comes from order statistics alone (the sign-test interval): the median of n
+    /// independent ratios lies between the k-th smallest and the k-th largest with probability at least
+    /// <paramref name="confidence"/>, whatever the noise distribution, where k is the largest rank whose binomial(n, 1/2)
+    /// tail stays within (1 - confidence) / 2. No normality or equal variance is assumed, and noise only widens the
+    /// interval: a verdict is reached when the whole interval lies on one side of the bar.
+    /// </para>
+    /// </remarks>
+    internal static RatioBound MeasurePairedRatioBound(
+        Action launchA,
+        Action synchronizeA,
+        Action launchB,
+        Action synchronizeB,
+        int pairs = 41,
+        double confidence = 0.95,
+        int warmups = 3,
+        double targetBatchMilliseconds = 5.0)
+    {
+        if (launchA is null) throw new ArgumentNullException(nameof(launchA));
+        if (synchronizeA is null) throw new ArgumentNullException(nameof(synchronizeA));
+        if (launchB is null) throw new ArgumentNullException(nameof(launchB));
+        if (synchronizeB is null) throw new ArgumentNullException(nameof(synchronizeB));
+        if (pairs < 6) throw new ArgumentOutOfRangeException(nameof(pairs), "Fewer than 6 ratios give no 95% interval.");
+        if (!(confidence > 0 && confidence < 1)) throw new ArgumentOutOfRangeException(nameof(confidence));
+        if (warmups < 0) throw new ArgumentOutOfRangeException(nameof(warmups));
+        if (!(targetBatchMilliseconds > 0) || double.IsInfinity(targetBatchMilliseconds))
+            throw new ArgumentOutOfRangeException(nameof(targetBatchMilliseconds));
+
+        for (int i = 0; i < warmups; i++)
+        {
+            launchA();
+            synchronizeA();
+            launchB();
+            synchronizeB();
+        }
+
+        const int calibrationLaunches = 3;
+        double calibrationA = double.PositiveInfinity;
+        double calibrationB = double.PositiveInfinity;
+        for (int i = 0; i < 3; i++)
+        {
+            calibrationA = Math.Min(calibrationA, TimeHostBatch(launchA, synchronizeA, calibrationLaunches));
+            calibrationB = Math.Min(calibrationB, TimeHostBatch(launchB, synchronizeB, calibrationLaunches));
+        }
+        int iterationsA = CalibratedIterationsFromMicroseconds(calibrationA, targetBatchMilliseconds);
+        int iterationsB = CalibratedIterationsFromMicroseconds(calibrationB, targetBatchMilliseconds);
+
+        var ratios = new List<double>(pairs);
+        for (int pair = 0; pair < pairs; pair++)
+        {
+            double aFirst = TimeHostBatch(launchA, synchronizeA, iterationsA);
+            double bFirst = TimeHostBatch(launchB, synchronizeB, iterationsB);
+            double bSecond = TimeHostBatch(launchB, synchronizeB, iterationsB);
+            double aSecond = TimeHostBatch(launchA, synchronizeA, iterationsA);
+            ratios.Add((aFirst + aSecond) / (bFirst + bSecond));
+        }
+        return BoundMedian(ratios, confidence);
+    }
+
+    /// <summary>The median of <paramref name="ratios"/> and its distribution-free confidence interval.</summary>
+    internal static RatioBound BoundMedian(IReadOnlyList<double> ratios, double confidence)
+    {
+        if (ratios is null) throw new ArgumentNullException(nameof(ratios));
+        var ordered = new List<double>(ratios);
+        ordered.Sort();
+        int k = MedianIntervalRank(ordered.Count, confidence);
+        if (k < 1)
+            throw new ArgumentOutOfRangeException(nameof(ratios),
+                ordered.Count + " ratios are too few for a " + confidence.ToString("P0", CultureInfo.InvariantCulture) + " interval.");
+        return new RatioBound(Median(ordered), ordered[k - 1], ordered[ordered.Count - k], ordered.Count, confidence);
+    }
+
+    /// <summary>
+    /// The 1-based rank k such that [x(k), x(n-k+1)] covers the median of n independent samples with probability at
+    /// least <paramref name="confidence"/>: the largest k with P(Binomial(n, 1/2) &lt; k) &lt;= (1 - confidence) / 2.
+    /// Zero when n is too small for any interval at that level.
+    /// </summary>
+    /// <remarks>At 95% this gives the standard sign-test ranks: n = 10 gives 2, n = 21 gives 6, n = 41 gives 14.</remarks>
+    internal static int MedianIntervalRank(int n, double confidence)
+    {
+        if (n < 1) throw new ArgumentOutOfRangeException(nameof(n));
+        double tail = (1 - confidence) / 2;
+        double logHalfN = n * Math.Log(0.5);
+        double cumulative = 0, logChoose = 0;   // log C(n, 0) = 0
+        int k = 0;
+        for (int i = 0; i <= n; i++)
+        {
+            if (i > 0) logChoose += Math.Log(n - i + 1) - Math.Log(i);
+            double mass = Math.Exp(logChoose + logHalfN);
+            if (cumulative + mass > tail) break;
+            cumulative += mass;
+            k = i + 1;
+        }
+        return k;
+    }
     private static int CalibratedIterationsFromMicroseconds(
         double microsecondsPerLaunch,
         double targetBatchMilliseconds)
