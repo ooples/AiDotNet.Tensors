@@ -38,7 +38,12 @@ public static class SassListScheduler
             int end = start + 1;
             while (end < code.Count && effects[end].Latency != SassLatency.Control && !targets.Contains(end)) end++;
             int cut = (int)Math.Min(end, (long)start + s_dbgLength);
-            if (cut - start > 2 && blocks++ < s_dbgBlocks) ScheduleBlock(code, effects, start, cut, result, origin);
+            if (cut - start > 2 && blocks++ < s_dbgBlocks)
+            {
+                ScheduleBlock(code, effects, start, cut, result, origin);
+                if (Environment.GetEnvironmentVariable("AIDOTNET_SASS_LISTPRINT") == "1")
+                    Console.WriteLine($"LIST block {blocks - 1}: {start}..{cut - 1} order " + string.Join(",", origin.Skip(start).Take(cut - start)));
+            }
             start = end;
         }
         for (int k = 0; k < result.Length; k++)

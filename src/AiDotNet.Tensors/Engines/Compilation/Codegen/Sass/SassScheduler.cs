@@ -559,6 +559,10 @@ public static class SassScheduler
             {
                 var control = result[i].Control;
                 if (control.Reuse != 0 && control.Stall > originalStall[i]) result[i].Control = control with { Reuse = 0 };
+                // A stall of 12 or more is encoded only with the yield bit clear: ptxas never sets both (0 of 13,000+
+                // control words), and nvdisasm rejects the combination as an undefined value. Keeping ptxas's yield on an
+                // instruction whose stall grew to 12 produced such words, and one of them faulted a reordered kernel.
+                if (result[i].Control is { Stall: >= 12, Yield: true } raised) result[i].Control = raised with { Yield = false };
             }
             if (spreadPastPrevious)
             {
