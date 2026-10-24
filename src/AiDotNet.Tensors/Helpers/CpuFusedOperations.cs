@@ -633,13 +633,14 @@ public static class CpuFusedOperations
 
             if (simdGelu && hasBias)
             {
-                // The fused kernel below uses Fma.MultiplyAdd and SimdKernels.FastSigmoid256, which is
-                // written for the Avx2+Fma guard its callers inside SimdKernels carry. This arm is
-                // reached on Avx.IsSupported alone, so a machine with AVX and no FMA threw
+                // The fused kernel below uses Fma.MultiplyAdd and SimdKernels.FastSigmoid256, whose
+                // PadeSigmoid.Sigmoid8 calls Avx2.Add and Avx2.ShiftLeftLogical unguarded: it is written for
+                // the Avx2+Fma guard its callers inside SimdKernels carry. This arm is reached on
+                // Avx.IsSupported alone, so a machine with AVX but not both threw
                 // PlatformNotSupportedException out of the epilogue. Take the two-pass form this path
                 // replaced instead — bias through the AVX row kernel, then the guarded GELU pass — which
                 // keeps the epilogue vectorised rather than dropping to the scalar loop.
-                if (!Fma.IsSupported)
+                if (!Fma.IsSupported || !Avx2.IsSupported)
                 {
                     if (M * N >= parallelThreshold && M >= MinParallelRows)
                         CpuParallelSettings.ParallelForOrSerial(0, M, (long)M * N, i => ApplyBiasReluRowSimd(output, bias, i, N, false));

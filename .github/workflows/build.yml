@@ -208,7 +208,9 @@ jobs:
         #   4. Print whether the PR met the +COVERAGE_RATCHET_INCREMENT target
         #      (informational only — does NOT fail; baseline must be advanced
         #      explicitly via a separate PR that updates the file).
-        COVERAGE_FILE=$(find ./coverage -name "coverage.cobertura.xml" -type f | head -1)
+        # The full suite's file only: ./coverage/avx2-off holds the five-test fallback run, which compared with the
+        # full-suite baseline would read as a collapse. (The report and codecov merge both.)
+        COVERAGE_FILE=$(find ./coverage -path ./coverage/avx2-off -prune -o -name "coverage.cobertura.xml" -type f -print | head -1)
         if [ -z "$COVERAGE_FILE" ]; then
           echo "::error::No coverage file found!"
           exit 1
