@@ -50,7 +50,8 @@ internal static class SassProbeTool
     {
         if (pass is null) throw new ArgumentNullException(nameof(pass));
         bool known = pass is "control" or "stall" or "sb" or "max" or "noreuse" or "ptxasreuse" or "plus" or "plusalu"
-                or "plusvar" or "pluscontrol" or "plus1" or "keepcontrol" or "upto"
+                or "plusvar" or "pluscontrol" or "plus1" or "keepcontrol" or "upto" or "none" or "reorder" or "list"
+            || (pass.StartsWith("list+", StringComparison.Ordinal) && pass.Length > 5)
             || (pass.StartsWith("keep:", StringComparison.Ordinal) && pass.Length > 5)
             || pass.StartsWith("mix:", StringComparison.Ordinal)
             || (pass.StartsWith("maxnreg:", StringComparison.Ordinal)
@@ -151,7 +152,10 @@ internal static class SassProbeTool
         foreach (string kernel in cubin.Kernels)
         {
             // reorder: SassFfmaReorder (operand reuse and register banks), then the scheduler's control words.
-            var source = pass == "reorder" ? SassFfmaReorder.Reorder(cubin.Instructions(kernel)) : cubin.Instructions(kernel);
+            var source = pass == "reorder" ? SassFfmaReorder.Reorder(cubin.Instructions(kernel))
+                : pass.StartsWith("list", StringComparison.Ordinal)
+                    ? SassListScheduler.Reorder(cubin.Instructions(kernel)) ?? cubin.Instructions(kernel)
+                : cubin.Instructions(kernel);
             if (pass == "reorder")
                 Console.WriteLine("  FFMA same-bank file reads: ptxas " + SassFfmaReorder.BankConflicts(cubin.Instructions(kernel)) +
                     ", reordered " + SassFfmaReorder.BankConflicts(source));
@@ -161,11 +165,13 @@ internal static class SassProbeTool
                 decline = "declined: " + SassScheduler.LastDecline;
                 return image;
             }
-            var ptxasCode = cubin.Instructions(kernel);
+            // After a reorder the reference control word of position i is the one ptxas gave the instruction now there.
+            var ptxasCode = pass.StartsWith("list", StringComparison.Ordinal) ? source.ToArray() : cubin.Instructions(kernel);
+            string mode = pass.StartsWith("list+", StringComparison.Ordinal) ? pass.Substring(5) : pass;
             for (int i = 0; i < code.Length; i++)
             {
                 var o = ptxasCode[i].Control; var n = code[i].Control;
-                code[i].Control = pass switch
+                code[i].Control = mode switch
                 {
                     "stall" => o with { Stall = n.Stall },                    // our stalls, ptxas scoreboards
                     "sb" => n with { Stall = o.Stall },                       // our scoreboards, ptxas stalls
@@ -194,7 +200,7 @@ internal static class SassProbeTool
             }
             if (dump)
             {
-                var original = cubin.Instructions(kernel);
+                var original = ptxasCode;
                 for (int i = 0; i < original.Length; i++)
                 {
                     var o = original[i].Control; var n = code[i].Control;
