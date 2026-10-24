@@ -51,7 +51,7 @@ internal static class SassProbeTool
         if (pass is null) throw new ArgumentNullException(nameof(pass));
         bool known = pass is "control" or "stall" or "sb" or "max" or "noreuse" or "ptxasreuse" or "plus" or "plusalu"
                 or "plusvar" or "pluscontrol" or "plus1" or "keepcontrol" or "upto" or "none" or "reorder" or "list"
-            || (pass.StartsWith("list+", StringComparison.Ordinal) && pass.Length > 5)
+            || (pass.StartsWith("list+", StringComparison.Ordinal) && pass.Length > 5) || pass.StartsWith("except:", StringComparison.Ordinal) || pass.StartsWith("stall:", StringComparison.Ordinal)
             || (pass.StartsWith("keep:", StringComparison.Ordinal) && pass.Length > 5)
             || pass.StartsWith("mix:", StringComparison.Ordinal)
             || (pass.StartsWith("maxnreg:", StringComparison.Ordinal)
@@ -189,6 +189,10 @@ internal static class SassProbeTool
                     _ when pass.StartsWith("keep:", StringComparison.Ordinal) => SassOpcodeTable.Decode(ptxasCode[i])?.Mnemonic == pass.Substring(5) ? n with { Stall = Math.Max(n.Stall, o.Stall) } : n,
                     "keepcontrol" => SassOpcodeTable.Decode(ptxasCode[i])?.Latency == SassLatency.Control ? n with { Stall = Math.Max(n.Stall, o.Stall) } : n,
                     "upto" => i < upto ? n : n with { Stall = Math.Max(n.Stall, o.Stall) },
+                    // except:<i>[,<j>...]: ours, with ptxas's longer stall kept at the listed positions only (hazard hunting)
+                    // stall:<i>=<n>[,<j>=<m>...]: ours, with those positions' stalls set exactly (reuse dropped there)
+                    _ when mode.StartsWith("stall:", StringComparison.Ordinal) && mode.Substring(6).Split(',').Select(t => t.Split('=')).FirstOrDefault(t => t[0] == i.ToString(CultureInfo.InvariantCulture)) is { } set => n with { Stall = int.Parse(set[1], CultureInfo.InvariantCulture), Reuse = 0 },
+                    _ when mode.StartsWith("except:", StringComparison.Ordinal) => Array.IndexOf(mode.Substring(7).Split(','), i.ToString(CultureInfo.InvariantCulture)) >= 0 ? n with { Stall = Math.Max(n.Stall, o.Stall) } : n,
                     // mix:<fields>: ours, with ptxas's S(tall) and/or U (reuse flags); the scoreboards stay ours
                     _ when pass.StartsWith("mix:", StringComparison.Ordinal) => n with
                     {

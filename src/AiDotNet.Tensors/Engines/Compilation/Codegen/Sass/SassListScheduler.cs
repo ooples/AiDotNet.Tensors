@@ -37,7 +37,7 @@ public static class SassListScheduler
             if (effects[start].Latency == SassLatency.Control) { start++; continue; }
             int end = start + 1;
             while (end < code.Count && effects[end].Latency != SassLatency.Control && !targets.Contains(end)) end++;
-            int cut = Math.Min(end, start + s_dbgLength);
+            int cut = (int)Math.Min(end, (long)start + s_dbgLength);
             if (cut - start > 2 && blocks++ < s_dbgBlocks) ScheduleBlock(code, effects, start, cut, result, origin);
             start = end;
         }

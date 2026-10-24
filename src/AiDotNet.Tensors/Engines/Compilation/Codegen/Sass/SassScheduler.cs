@@ -432,6 +432,10 @@ public static class SassScheduler
                     if (e.ReadsAllPredicates)
                         foreach (var pair in readyAt) if (pair.Key >= PredicateKey && pair.Key < UniformPredicateKey) Need(pair.Value.Ready, pair.Value.Produced);
                     if (pipe.Pipe is not null && pipeFreeAt.TryGetValue(pipe.Pipe, out var free)) Need(free.Ready, free.Produced);
+                    // EXPERIMENT (#1442 cp.async hazard): a predicate-writing ALU compare 4 cycles after an IMAD-pipe op.
+                    if (Environment.GetEnvironmentVariable("AIDOTNET_SASS_IMADSETP") is string gap && e.PredicateWrites.Count > 0 &&
+                        pipe.Pipe == "alu" && pipeFreeAt.TryGetValue("imad", out var imadFree))
+                        Need(imadFree.Produced + int.Parse(gap), imadFree.Produced);
                     if (e.Mnemonic is "UMOV" or "ULDC")
                         foreach (int r in writes) if (uniformReadAt.TryGetValue(r, out long read)) Need(read + timing.UniformEarlyWriteAfterRead, read);
                 }
