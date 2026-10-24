@@ -272,7 +272,9 @@ internal static class SassLearnTool
                 else if (effects.Latency == AiDotNet.Tensors.Engines.Compilation.Codegen.Sass.SassLatency.Variable)
                 {
                     if (control.WriteScoreboard != 7) foreach (int r in writes) pendingWrite[r] = control.WriteScoreboard;
-                    if (control.ReadScoreboard != 7) foreach (int r in reads) pendingRead[r] = control.ReadScoreboard;
+                    // A variable-latency instruction's read scoreboard covers its vector sources; a uniform operand is read at issue
+                    // (ptxas overwrites one with a UMOV right after an LDS reading it, without a wait).
+                    if (control.ReadScoreboard != 7) foreach (int r in reads) if (r < 1000) pendingRead[r] = control.ReadScoreboard;
                     foreach (int r in writes) fixedReady.Remove(r);
                 }
                 else

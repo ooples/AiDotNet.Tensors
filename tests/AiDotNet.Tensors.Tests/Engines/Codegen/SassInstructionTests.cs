@@ -734,4 +734,24 @@ public class SassInstructionTests
         Assert.False(scheduled[0].Control.Yield, "stall " + scheduled[0].Control.Stall + " encoded with the yield bit set");
         Assert.All(scheduled, i => Assert.False(i.Control.Stall >= 12 && i.Control.Yield));
     }
+
+    // Shared memory with uniform-register offsets (sm_86 driver cubins, RTX 3080).
+    private static readonly SassInstruction LdsUr5 = new(0x000000055b207984UL, 0x002fe2000800cc00UL);   // LDS.128 R32, [R91.X16+UR5]
+    private static readonly SassInstruction LdsNoUr = new(0x0001000062247984UL, 0x000fe2000000cc00UL);  // LDS.128 R36, [R98.X16+0x100]
+    private static readonly SassInstruction StsUr9 = new(0x0000000424007988UL, 0x000fe20008004809UL);   // STS [R36.X4+UR9], R4
+
+    /// <summary>
+    /// LDS and STS with a uniform-register offset read that register: bit 91 marks the form, the register sits at bits
+    /// 32 (LDS) or 64 (STS). Missing it let a reordered LDS run ahead of the UIMAD writing its offset.
+    /// </summary>
+    [Fact]
+    public void SharedMemoryReadsItsUniformOffset()
+    {
+        var lds = SassOpcodeTable.Decode(LdsUr5) ?? throw new InvalidOperationException("LDS unknown");
+        Assert.Contains(lds.Reads, o => o.Uniform && o.Field == SassInstruction.RbField && LdsUr5.UniformRegister(o.Field) == 5);
+        Assert.DoesNotContain((SassOpcodeTable.Decode(LdsNoUr) ?? throw new InvalidOperationException()).Reads, o => o.Uniform);
+        var sts = SassOpcodeTable.Decode(StsUr9) ?? throw new InvalidOperationException("STS unknown");
+        Assert.Contains(sts.Reads, o => o.Uniform && o.Field == SassInstruction.RcField && StsUr9.UniformRegister(o.Field) == 9);
+        Assert.Contains(sts.Reads, o => !o.Uniform && o.Field == SassInstruction.RbField);   // the data register
+    }
 }

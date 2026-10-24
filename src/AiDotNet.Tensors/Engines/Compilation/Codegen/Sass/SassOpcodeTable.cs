@@ -258,6 +258,13 @@ public static class SassOpcodeTable
             reads.Add(new SassRegisterOperand(A, spec.AddressWidth));
             if (spec.Store) reads.Add(new SassRegisterOperand(B, width));
             else writes.Add(new SassRegisterOperand(D, width));
+            // Shared memory with a uniform-register offset ([R.X16+UR5+imm]): bit 91 marks it, and the uniform register
+            // sits at bits 32 for LDS and at bits 64 for STS (whose data register holds bits 32). sm_86: bit 91 set on
+            // all 288 LDS and 89 STS that nvdisasm prints with a UR across the probe kernels, clear on all 1,421 without.
+            // (LDG/STG/LDGSTS set bit 91 for another reason.) Missing it let a reordered LDS run ahead of the UIMAD
+            // writing its offset.
+            if ((op == 0x184 || op == 0x188) && instruction.Bits(91, 1) != 0)
+                reads.Add(new SassRegisterOperand(op == 0x184 ? B : C, 1, Uniform: true));
         }
         else
         {
