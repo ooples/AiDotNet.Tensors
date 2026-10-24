@@ -260,6 +260,28 @@ public sealed partial class CudaBackend
 
     private bool DeclaredStridedEnabled => DeclaredStridedSwitch ?? (StridedDeclaredPromoted || s_declaredStridedOptIn);
 
+    // Below this many elements the declared call's bookkeeping costs more than the launch it replaces, as Embedding's.
+    private const int DeclaredStridedMinElements = 16384;
+
+    // The offset and count are baked into each program, so a workload that varies them would build and keep one module
+    // per tuple. Past this many strided programs, a new shape keeps the hand-written kernel; shapes already built run on.
+    internal const int DeclaredStridedProgramCap = 32;
+
+    private int _declaredStridedPrograms;
+
+    // Whether a strided key may run through the declared route: one already built, or a new one within the cap (which
+    // it then claims). Under the program lock, so concurrent new shapes cannot both take the last slot.
+    private bool AdmitStridedKey(DeclaredKey key)
+    {
+        lock (_directPtxLock)
+        {
+            if (_declaredPrograms.ContainsKey(key)) return true;
+            if (_declaredStridedPrograms >= DeclaredStridedProgramCap) return false;
+            _declaredStridedPrograms++;
+            return true;
+        }
+    }
+
     private static readonly string[] s_stridedNames = { "src", "dst" };
 
     private static readonly Func<DeclaredKey, CodegenProgram> s_buildStridedGather =
@@ -279,9 +301,10 @@ public sealed partial class CudaBackend
     /// </summary>
     internal bool TryDeclaredStridedGather(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
     {
-        if (!DeclaredStridedEnabled || count < 16384) return false;
-        return TryRunDeclaredProgram(StridedKey(DeclaredFamily.StridedGather, count, src.Size, offset, stride),
-            s_buildStridedGather, s_stridedNames, new DeclaredBindings(src, dst));
+        if (!DeclaredStridedEnabled || count < DeclaredStridedMinElements) return false;
+        var key = StridedKey(DeclaredFamily.StridedGather, count, src.Size, offset, stride);
+        return AdmitStridedKey(key) &&
+            TryRunDeclaredProgram(key, s_buildStridedGather, s_stridedNames, new DeclaredBindings(src, dst));
     }
 
     /// <summary>
@@ -290,9 +313,10 @@ public sealed partial class CudaBackend
     /// </summary>
     internal bool TryDeclaredStridedScatter(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
     {
-        if (!DeclaredStridedEnabled || count < 16384) return false;
-        return TryRunDeclaredProgram(StridedKey(DeclaredFamily.StridedScatter, count, dst.Size, offset, stride),
-            s_buildStridedScatter, s_stridedNames, new DeclaredBindings(src, dst));
+        if (!DeclaredStridedEnabled || count < DeclaredStridedMinElements) return false;
+        var key = StridedKey(DeclaredFamily.StridedScatter, count, dst.Size, offset, stride);
+        return AdmitStridedKey(key) &&
+            TryRunDeclaredProgram(key, s_buildStridedScatter, s_stridedNames, new DeclaredBindings(src, dst));
     }
 
     /// <summary>The strided gather as a resident-program stage.</summary>

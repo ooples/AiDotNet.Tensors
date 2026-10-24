@@ -301,8 +301,19 @@ internal static class DirectPtxFeatureGate
     internal static bool IsCapsuleEnabled => TestOverride ??
         (CapsuleSquashPromoted || EnvironmentMasterEnabled || EnvironmentCapsuleEnabled);
 
-    /// <summary>Lets the unpromoted capsule-squash shapes dispatch, for verification and benchmarking.</summary>
-    internal static bool CapsuleExperimentOverride { get; set; }
+    [ThreadStatic]
+    private static bool s_capsuleExperimentOverride;
+
+    /// <summary>
+    /// Lets the unpromoted capsule-squash shapes dispatch, for verification and benchmarking. Thread-local, like the
+    /// SGD-momentum and global-average-pool overrides: a process-global flag would admit the unpromoted route in
+    /// unrelated concurrent dispatches and make test results order-dependent.
+    /// </summary>
+    internal static bool CapsuleExperimentOverride
+    {
+        get => s_capsuleExperimentOverride;
+        set => s_capsuleExperimentOverride = value;
+    }
 
     internal static bool IsPagedDecodeEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentPagedDecodeEnabled);

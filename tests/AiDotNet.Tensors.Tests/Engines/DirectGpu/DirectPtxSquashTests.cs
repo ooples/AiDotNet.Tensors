@@ -143,6 +143,10 @@ public class DirectPtxSquashTests
     public void DriverOnlyRoutedSquash_MatchesTheNvrtcKernel(int numCapsules, int capsuleDim)
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        // Skip only off the architecture the kernel targets; on SM86 a decline is a defect, asserted below.
+        using (var probe = new DirectPtxRuntime())
+            Skip.IfNot(DirectPtxArchitecture.HasValidatedCapsuleSquash(probe.ComputeCapabilityMajor, probe.ComputeCapabilityMinor),
+                "The capsule-squash specialization targets GA10x/SM86.");
         using var backend = CudaBackend.CreateOrThrow();
         int elements = numCapsules * capsuleDim;
         var random = RandomHelper.CreateSeededRandom(20261026);
@@ -169,9 +173,9 @@ public class DirectPtxSquashTests
             long before = backend.DirectPtxSquashDispatchCount;
             backend.Squash(x, ptxY, numCapsules, capsuleDim, PtxFusedSquashF32Kernel.Epsilon);
             backend.SquashBackward(g, x, ptxDx, numCapsules, capsuleDim, PtxFusedSquashF32Kernel.Epsilon);
-            Skip.If(backend.DirectPtxSquashDispatchCount == before,
-                "The direct-PTX squash did not dispatch on this device: " + backend.DirectPtxLastError);
-            Assert.Equal(before + 2, backend.DirectPtxSquashDispatchCount);
+            Assert.True(backend.DirectPtxSquashDispatchCount == before + 2,
+                "The direct-PTX squash declined on SM86 (" + (backend.DirectPtxSquashDispatchCount - before) +
+                " of 2 calls dispatched): " + backend.DirectPtxLastError);
         }
         finally
         {

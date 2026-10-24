@@ -21,6 +21,11 @@ public sealed class DeclaredStridedRouteTests
     {
         Skip.IfNot(CudaBackend.IsCudaAvailable, "Requires an NVIDIA CUDA driver and GPU.");
         using var backend = CudaBackend.CreateOrThrow();
+        // Skip only where the declared route is unavailable by design (switched off for the process, or an
+        // architecture without released codegen kernels). Anywhere else a decline is a defect, and is asserted below.
+        backend.DeclaredStridedSwitch = true;
+        Skip.IfNot(backend.DeclaredKernelsEnabled,
+            "The declared route is off for this process or this architecture has no released codegen kernels.");
         int length = offset + (count - 1) * stride + 1 + 3;   // a tail past the last strided element
         var random = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(1441);
         var wide = new float[length];
@@ -43,9 +48,9 @@ public sealed class DeclaredStridedRouteTests
         long before = backend.DeclaredProgramLaunches;
         backend.StridedGather(wideBuffer, gatheredDeclared, offset, stride, count);
         backend.StridedScatter(narrowBuffer, scatteredDeclared, offset, stride, count);
-        Skip.If(backend.DeclaredProgramLaunches == before,
-            "The declared route did not run on this device (switched off or the architecture has no released kernels).");
-        Assert.Equal(before + 2, backend.DeclaredProgramLaunches);
+        Assert.True(backend.DeclaredProgramLaunches == before + 2,
+            "The declared strided route declined on a device that supports it: " +
+            (backend.DeclaredProgramLaunches - before) + " of 2 calls ran it.");
 
         Assert.Equal(backend.DownloadBuffer(gatheredHand), backend.DownloadBuffer(gatheredDeclared));
         Assert.Equal(backend.DownloadBuffer(scatteredHand), backend.DownloadBuffer(scatteredDeclared));

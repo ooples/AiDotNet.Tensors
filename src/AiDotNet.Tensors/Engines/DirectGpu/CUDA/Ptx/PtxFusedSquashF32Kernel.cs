@@ -79,12 +79,29 @@ internal sealed class PtxFusedSquashF32Kernel : IDisposable
         Blueprint = CreateBlueprint(runtime.ArchitectureFamily, direction, numCapsules, capsuleDim, blockThreads);
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor, direction, numCapsules, capsuleDim,
             blockThreads);
-        _module = runtime.LoadModule(Ptx);
-        _function = _module.GetFunction(EntryPointOf(direction), out DirectPtxFunctionInfo info);
-        int activeBlocks = _module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
-        Blueprint.ResourceBudget.Validate(EntryPointOf(direction), info, BlockThreads, activeBlocks);
-        Audit = DirectPtxKernelAudit.Create(
-            Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, _module);
+        // The constructor owns the module until every check passes: a failure after the load (function lookup,
+        // occupancy, the resource budget, the audit) disposes it and rethrows. Without that, the dispatch path, which
+        // catches the failure and caches nothing, would leak one module per call.
+        DirectPtxModule module = runtime.LoadModule(Ptx);
+        try
+        {
+            _function = module.GetFunction(EntryPointOf(direction), out DirectPtxFunctionInfo info);
+            int activeBlocks = module.GetActiveBlocksPerMultiprocessor(_function, BlockThreads);
+            Blueprint.ResourceBudget.Validate(EntryPointOf(direction), info, BlockThreads, activeBlocks);
+            Audit = DirectPtxKernelAudit.Create(
+                Blueprint, runtime.DeviceFingerprint, Ptx, info, BlockThreads, activeBlocks, module);
+        }
+        catch
+        {
+            try { module.Dispose(); }
+            catch (Exception cleanup)
+            {
+                // The original failure is the one to report; a cleanup failure is traced, not substituted.
+                System.Diagnostics.Trace.TraceWarning("Disposing a failed squash module failed: " + cleanup);
+            }
+            throw;
+        }
+        _module = module;
     }
 
     /// <summary>Forward: <paramref name="input"/> to <paramref name="output"/>.</summary>

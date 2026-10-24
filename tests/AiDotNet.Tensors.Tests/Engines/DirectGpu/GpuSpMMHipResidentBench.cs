@@ -56,12 +56,14 @@ public sealed class GpuSpMMHipResidentBench
             using var dRowPtr = Ints(backend, rowPtr);
             using var dColIdx = Ints(backend, colIdx);
 
-            // The kernel HipCustomSparseBackend.SpMM picks for this width.
-            string kernel = s.N % 4 == 0 ? "vec4" : s.N <= 64 ? "warp" : "scalar";
+            // The kernel HipCustomSparseBackend.SpMM picks for this width, by the same rule.
+            var kernel = HipCustomSparseBackend.SelectSpMMKernel(s.N);
             Action custom = kernel switch
             {
-                "vec4" => () => backend.CsrSpMMVec4(dValues, dColIdx, dRowPtr, dB, dOut, s.Rows, s.Cols, s.N, nnz),
-                "warp" => () => backend.CsrSpMMWarp(dValues, dColIdx, dRowPtr, dB, dOut, s.Rows, s.Cols, s.N, nnz),
+                HipCustomSparseBackend.SpMMKernel.Vec4 =>
+                    () => backend.CsrSpMMVec4(dValues, dColIdx, dRowPtr, dB, dOut, s.Rows, s.Cols, s.N, nnz),
+                HipCustomSparseBackend.SpMMKernel.Warp =>
+                    () => backend.CsrSpMMWarp(dValues, dColIdx, dRowPtr, dB, dOut, s.Rows, s.Cols, s.N, nnz),
                 _ => () => backend.CsrSpMM(dValues, dColIdx, dRowPtr, dB, dOut, s.Rows, s.Cols, s.N, nnz),
             };
 

@@ -525,6 +525,7 @@ public sealed partial class CudaBackend
 
         foreach (var program in _declaredPrograms.Values) program?.Dispose();
         _declaredPrograms.Clear();
+        _declaredStridedPrograms = 0;
     }
 
     // ---- LayerNorm ------------------------------------------------------------------------------------------------

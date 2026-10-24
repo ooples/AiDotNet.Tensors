@@ -445,28 +445,8 @@ internal static class StableTimer
             throw new ArgumentOutOfRangeException(nameof(bracketsPerAttempt),
                 "Use a positive odd bracket count so its median is an observed sample.");
 
-        for (int i = 0; i < warmups; i++)
-        {
-            launchA();
-            synchronizeA();
-            launchB();
-            synchronizeB();
-        }
-
-        const int calibrationLaunches = 3;
-        double calibrationA = double.PositiveInfinity;
-        double calibrationB = double.PositiveInfinity;
-        for (int i = 0; i < 3; i++)
-        {
-            calibrationA = Math.Min(calibrationA,
-                TimeHostBatch(launchA, synchronizeA, calibrationLaunches));
-            calibrationB = Math.Min(calibrationB,
-                TimeHostBatch(launchB, synchronizeB, calibrationLaunches));
-        }
-        int iterationsA = CalibratedIterationsFromMicroseconds(
-            calibrationA, targetBatchMilliseconds);
-        int iterationsB = CalibratedIterationsFromMicroseconds(
-            calibrationB, targetBatchMilliseconds);
+        var (iterationsA, iterationsB) = CalibrateHostPair(
+            launchA, synchronizeA, launchB, synchronizeB, warmups, targetBatchMilliseconds);
 
         var samplesA = new List<double>(3);
         var samplesB = new List<double>(3);
@@ -530,8 +510,8 @@ internal static class StableTimer
     /// was 1.34-1.73x. Noise that large does not make the question unanswerable; it makes it a statistical one.
     /// </para>
     /// <para>
-    /// Each bracket times A, B, B, A back to back, so a drift that is linear across the bracket cancels, and gives one
-    /// ratio. The median's interval comes from order statistics alone (the sign-test interval): the median of n
+    /// Each bracket times A, B, B, A (even brackets) or B, A, A, B (odd ones) back to back and gives one ratio: either
+    /// order cancels a drift linear across the bracket, and alternating them cancels a position effect too. The median's interval comes from order statistics alone (the sign-test interval): the median of n
     /// independent ratios lies between the k-th smallest and the k-th largest with probability at least
     /// <paramref name="confidence"/>, whatever the noise distribution, where k is the largest rank whose binomial(n, 1/2)
     /// tail stays within (1 - confidence) / 2. No normality or equal variance is assumed, and noise only widens the
@@ -558,6 +538,47 @@ internal static class StableTimer
         if (!(targetBatchMilliseconds > 0) || double.IsInfinity(targetBatchMilliseconds))
             throw new ArgumentOutOfRangeException(nameof(targetBatchMilliseconds));
 
+        var (iterationsA, iterationsB) = CalibrateHostPair(
+            launchA, synchronizeA, launchB, synchronizeB, warmups, targetBatchMilliseconds);
+
+        // Even brackets run A-B-B-A, odd ones B-A-A-B. Each order cancels a drift linear across the bracket, and
+        // alternating them also cancels an effect tied to position (which arm runs first or last, warm or cold), so
+        // neither arm is systematically favoured by where it sits.
+        var ratios = new List<double>(pairs);
+        for (int pair = 0; pair < pairs; pair++)
+        {
+            double a, b;
+            if (pair % 2 == 0)
+            {
+                double aFirst = TimeHostBatch(launchA, synchronizeA, iterationsA);
+                double bFirst = TimeHostBatch(launchB, synchronizeB, iterationsB);
+                double bSecond = TimeHostBatch(launchB, synchronizeB, iterationsB);
+                double aSecond = TimeHostBatch(launchA, synchronizeA, iterationsA);
+                a = aFirst + aSecond;
+                b = bFirst + bSecond;
+            }
+            else
+            {
+                double bFirst = TimeHostBatch(launchB, synchronizeB, iterationsB);
+                double aFirst = TimeHostBatch(launchA, synchronizeA, iterationsA);
+                double aSecond = TimeHostBatch(launchA, synchronizeA, iterationsA);
+                double bSecond = TimeHostBatch(launchB, synchronizeB, iterationsB);
+                a = aFirst + aSecond;
+                b = bFirst + bSecond;
+            }
+            ratios.Add(a / b);
+        }
+        return BoundMedian(ratios, confidence);
+    }
+
+    /// <summary>
+    /// Warms both launches, then picks each one's batch length so a batch takes about
+    /// <paramref name="targetBatchMilliseconds"/>: the shared front half of every calibrated host-paired measurement.
+    /// </summary>
+    private static (int IterationsA, int IterationsB) CalibrateHostPair(
+        Action launchA, Action synchronizeA, Action launchB, Action synchronizeB,
+        int warmups, double targetBatchMilliseconds)
+    {
         for (int i = 0; i < warmups; i++)
         {
             launchA();
@@ -574,19 +595,8 @@ internal static class StableTimer
             calibrationA = Math.Min(calibrationA, TimeHostBatch(launchA, synchronizeA, calibrationLaunches));
             calibrationB = Math.Min(calibrationB, TimeHostBatch(launchB, synchronizeB, calibrationLaunches));
         }
-        int iterationsA = CalibratedIterationsFromMicroseconds(calibrationA, targetBatchMilliseconds);
-        int iterationsB = CalibratedIterationsFromMicroseconds(calibrationB, targetBatchMilliseconds);
-
-        var ratios = new List<double>(pairs);
-        for (int pair = 0; pair < pairs; pair++)
-        {
-            double aFirst = TimeHostBatch(launchA, synchronizeA, iterationsA);
-            double bFirst = TimeHostBatch(launchB, synchronizeB, iterationsB);
-            double bSecond = TimeHostBatch(launchB, synchronizeB, iterationsB);
-            double aSecond = TimeHostBatch(launchA, synchronizeA, iterationsA);
-            ratios.Add((aFirst + aSecond) / (bFirst + bSecond));
-        }
-        return BoundMedian(ratios, confidence);
+        return (CalibratedIterationsFromMicroseconds(calibrationA, targetBatchMilliseconds),
+            CalibratedIterationsFromMicroseconds(calibrationB, targetBatchMilliseconds));
     }
 
     /// <summary>The median of <paramref name="ratios"/> and its distribution-free confidence interval.</summary>

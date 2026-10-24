@@ -17,6 +17,26 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 /// </summary>
 internal static class HipCustomSparseBackend
 {
+    /// <summary>The managed CSR SpMM kernel <see cref="SpMM"/> launches for a dense width.</summary>
+    internal enum SpMMKernel
+    {
+        /// <summary><c>csr_spmm_vec4</c>: four columns per lane, when N is a multiple of 4.</summary>
+        Vec4,
+
+        /// <summary><c>csr_spmm_warp</c>: a warp per row, for narrow N.</summary>
+        Warp,
+
+        /// <summary><c>csr_spmm</c>: the 2-D scalar kernel, for wide N.</summary>
+        Scalar,
+    }
+
+    /// <summary>
+    /// The kernel <see cref="SpMM"/> launches for dense width <paramref name="n"/>: the one rule, shared with the
+    /// resident benchmark so the two cannot time different kernels.
+    /// </summary>
+    internal static SpMMKernel SelectSpMMKernel(int n) =>
+        n % 4 == 0 ? SpMMKernel.Vec4 : n <= WarpColumnThreshold ? SpMMKernel.Warp : SpMMKernel.Scalar;
+
     /// <summary>N (dense column count) at or below which the warp-per-row kernel is
     /// preferred over the 2-D scalar kernel (mirrors
     /// <see cref="CUDA.CudaSparseBackend"/>; first-cut, to be tuned by the #515 bar).</summary>
@@ -103,15 +123,18 @@ internal static class HipCustomSparseBackend
                 UploadInts(colIdxBuf.Handle, colIdx);
 
                 // Same pick as CudaSparseBackend: vec4 when N % 4 == 0, warp-per-row for narrow N, else 2-D scalar.
-                if (n % 4 == 0)
-                    backend.CsrSpMMVec4(valuesBuf, colIdxBuf, rowPtrBuf, bBuf, outBuf,
-                        rows, cols, n, values.Length);
-                else if (n <= WarpColumnThreshold)
-                    backend.CsrSpMMWarp(valuesBuf, colIdxBuf, rowPtrBuf, bBuf, outBuf,
-                        rows, cols, n, values.Length);
-                else
-                    backend.CsrSpMM(valuesBuf, colIdxBuf, rowPtrBuf, bBuf, outBuf,
-                        rows, cols, n, values.Length);
+                switch (SelectSpMMKernel(n))
+                {
+                    case SpMMKernel.Vec4:
+                        backend.CsrSpMMVec4(valuesBuf, colIdxBuf, rowPtrBuf, bBuf, outBuf, rows, cols, n, values.Length);
+                        break;
+                    case SpMMKernel.Warp:
+                        backend.CsrSpMMWarp(valuesBuf, colIdxBuf, rowPtrBuf, bBuf, outBuf, rows, cols, n, values.Length);
+                        break;
+                    default:
+                        backend.CsrSpMM(valuesBuf, colIdxBuf, rowPtrBuf, bBuf, outBuf, rows, cols, n, values.Length);
+                        break;
+                }
 
                 backend.DownloadBuffer(outBuf, output);
                 return output;
