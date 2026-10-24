@@ -116,7 +116,7 @@ public static class SassScheduler
     private sealed record Timing(int GuardPredicateLatency, int MaxStall, IReadOnlyDictionary<string, int> IssueStalls,
         IReadOnlyDictionary<string, (string Pipe, int Cycles)> Pipes, int UniformEarlyWriteAfterRead = 0,
         IReadOnlyDictionary<string, int>? Latencies = null, IReadOnlyDictionary<string, string>? LatencyClasses = null,
-        int SameClassLatency = 0, int CrossClassLatency = 0, bool RegionsKeepLoads = false);
+        int SameClassLatency = 0, int CrossClassLatency = 0, bool RegionsKeepLoads = false, int MmaSourceReadCycles = 0);
 
     private static readonly Dictionary<string, string> s_ampereLatencyClasses = new()
     {
@@ -139,6 +139,9 @@ public static class SassScheduler
         ["ULEA"] = ("uniform", 2), ["ULOP3"] = ("uniform", 2), ["USHF"] = ("uniform", 2), ["UIMAD"] = ("uniform", 2),
         ["UIMAD.WIDE"] = ("uniform", 2), ["ULDC"] = ("uniform", 2),
         ["MUFU"] = ("xu", 8), ["I2F"] = ("xu", 8), ["F2I"] = ("xu", 8),
+        // The tensor pipe: ptxas never issues an HMMA (m16n8k8 TF32 or m16n8k16 FP16) sooner than 8 cycles after the
+        // previous one, and FP16 GEMM results came out wrong on the RTX 3080 with them 1 cycle apart.
+        ["HMMA"] = ("tensor", 8),
     };
 
     private static readonly Dictionary<int, Timing> s_timings = new()
@@ -146,7 +149,7 @@ public static class SassScheduler
         [75] = new(12, 12, new Dictionary<string, int> { ["BMOV"] = 11, ["BAR"] = 5 }, s_noPipes),
         [86] = new(13, 13, new Dictionary<string, int> { ["BMOV"] = 11, ["BAR"] = 6, ["DEPBAR"] = 4, ["LDGDEPBAR"] = 4, ["BSSY"] = 12 },
             s_ampere, 3, new Dictionary<string, int> { ["P2R"] = 6, ["IMAD.WIDE"] = 5, ["I2FP"] = 5 }, s_ampereLatencyClasses, 4, 5,
-            RegionsKeepLoads: true),
+            RegionsKeepLoads: true, MmaSourceReadCycles: 7),
     };
 
     /// <summary>
@@ -231,6 +234,9 @@ public static class SassScheduler
             var pendingRead = new Dictionary<int, int>();    // register -> mask of read scoreboards covering it
             var readyAt = new Dictionary<int, (long Ready, long Produced)>();   // register or predicate key -> readable at
             var earlyAt = new Dictionary<int, (long Ready, string Class)>();     // register -> readable at, by its own class
+            // Registers whose pending readiness came from a Tensor-Core MMA: carried across branches (CarriesAcrossBranches)
+            // instead of waited for at them.
+            var carried = new HashSet<int>();
             var pendingUse = new long[6];        // per scoreboard: the earliest first use among the operations it covers
             var pendingComplete = new long[6];   // per scoreboard: the latest expected completion among them
             for (int s = 0; s < pendingUse.Length; s++) pendingUse[s] = long.MaxValue;
@@ -247,7 +253,10 @@ public static class SassScheduler
             for (int s = 0; s < scoreboardSetAt.Length; s++) scoreboardSetAt[s] = long.MinValue / 2;
             var predicateWrittenAt = new Dictionary<int, long>();   // predicate key -> cycle of the compare
             var pipeFreeAt = new Dictionary<string, (long Ready, long Produced)>();   // pipe -> next issue cycle allowed
-            var uniformReadAt = new Dictionary<int, long>();   // uniform register key -> latest uniform-pipe reader's cycle
+            var uniformReadAt = new Dictionary<int, long>();
+            // An HMMA reads its A, B and C registers several cycles after it issues, and nothing interlocks a later
+            // write to them: register -> the cycle it may be overwritten from (MmaSourceReadCycles after the HMMA).
+            var mmaReadUntil = new Dictionary<int, long>();   // uniform register key -> latest uniform-pipe reader's cycle
             var originalStall = new int[code.Count];
             var issueCycle = new long[code.Count];
 
@@ -273,6 +282,17 @@ public static class SassScheduler
                 bool boundary = target || e.Latency == SassLatency.Control;
                 bool branch = e.Mnemonic is "BRA" or "CALL";
                 bool drain = (e.Latency == SassLatency.Control && !branch) || (target && drainTargets.Contains(i));
+                // An HMMA's 56-cycle result outlives the few instructions between a loop's last MMA and its branch, and
+                // its readers (the next trip's MMAs, the epilogue) come long after; ptxas branches right away. So at a
+                // branch to a target that is not drained, and at such a target, MMA results are not waited for: the
+                // branch hands them to its target as cycles still to wait, the fall-through keeps them, and readers
+                // wait as usual. NOP, DEPBAR and BAR pass them on too: they read and write no register, and the
+                // readiness they skip is kept past them (see the boundary reset below), so the first reader after them
+                // still waits. Every other fixed-latency result, and every other control instruction (EXIT, BSSY,
+                // BSYNC, ...), still waits.
+                bool fallThroughOnly = e.Mnemonic is "NOP" or "DEPBAR" or "BAR";   // touch no registers, no control transfer
+                bool canCarry = (branch || fallThroughOnly || (target && e.Latency != SassLatency.Control))
+                    && !(branch && drainTargets.Contains(BranchTarget(code, i))) && !(target && drainTargets.Contains(i));
                 if (target && !drain)
                 {
                     if (forwardEntry.TryGetValue(i, out var forward)) Merge(forward, clampSetAt: false, at: i);
@@ -362,13 +382,39 @@ public static class SassScheduler
                 timing.Pipes.TryGetValue(e.Mnemonic, out var pipe);
                 if (boundary)
                 {
-                    foreach (var at in readyAt.Values) Need(at.Ready, at.Produced);
+                    // A carried MMA result is skipped only where nothing here needs it: this instruction (a branch target
+                    // may itself be the reader, such as a loop-head MMA on the previous trip's accumulator) and, at a
+                    // branch, the target's first instruction, which has no instruction before it in its block to hold
+                    // the delay - so it is waited for here instead (#1540).
+                    HashSet<int>? touched = null;
+                    if (canCarry)
+                    {
+                        touched = new HashSet<int>(reads);
+                        touched.UnionWith(writes);
+                        touched.UnionWith(predicateReads);
+                        touched.UnionWith(predicateWrites);
+                        if (guard >= 0) touched.Add(guard);
+                        if (branch)
+                        {
+                            int to = BranchTarget(code, i);
+                            var te = effects[to];
+                            touched.UnionWith(Registers(code[to], te.Reads));
+                            touched.UnionWith(Registers(code[to], te.Writes));
+                        }
+                    }
+                    foreach (var pair in readyAt)
+                        if (!(canCarry && carried.Contains(pair.Key) && touched is not null && !touched.Contains(pair.Key)))
+                            Need(pair.Value.Ready, pair.Value.Produced);
                     foreach (long at in predicateWrittenAt.Values) Need(at + guardLatency, at);
                     foreach (var at in pipeFreeAt.Values) Need(at.Ready, at.Produced);
                     foreach (long at in uniformReadAt.Values) Need(at + timing.UniformEarlyWriteAfterRead, at);
+                    foreach (long at in mmaReadUntil.Values) Need(at, at - timing.MmaSourceReadCycles);
                 }
                 else
                 {
+                    // sm_86: an IMAD.MOV overwriting the A operand of the HMMA issued 2 cycles earlier made an FP16 GEMM's
+                    // results wrong on the RTX 3080; ptxas never overwrites an HMMA source sooner than 7 cycles on.
+                    foreach (int r in writes) if (mmaReadUntil.TryGetValue(r, out long until)) Need(until, until - timing.MmaSourceReadCycles);
                     string? consumerClass = timing.LatencyClasses is { } lc && lc.TryGetValue(e.Mnemonic, out var cc) ? cc : null;
                     foreach (int r in reads)
                         if (readyAt.TryGetValue(r, out var at))
@@ -416,13 +462,20 @@ public static class SassScheduler
                 issueCycle[i] = cycle;
                 if (boundary)
                 {
+                    var kept = canCarry ? readyAt.Where(pair => carried.Contains(pair.Key)).ToList() : null;
                     readyAt.Clear();
+                    carried.Clear();
+                    if (kept is not null)
+                        foreach (var pair in kept) { readyAt[pair.Key] = pair.Value; carried.Add(pair.Key); }
                     earlyAt.Clear();
                     predicateWrittenAt.Clear();
                     pipeFreeAt.Clear();
                     uniformReadAt.Clear();
+                    mmaReadUntil.Clear();
                 }
                 if (pipe.Pipe is not null) pipeFreeAt[pipe.Pipe] = (cycle + pipe.Cycles, cycle);
+                if (timing.MmaSourceReadCycles > 0 && e.Mnemonic == "HMMA")
+                    foreach (int r in reads) mmaReadUntil[r] = cycle + timing.MmaSourceReadCycles;
                 if (timing.UniformEarlyWriteAfterRead > 0 && pipe.Pipe == "uniform")
                     foreach (int r in reads) if (r >= UniformRegisterKey) uniformReadAt[r] = cycle;
 
@@ -442,7 +495,7 @@ public static class SassScheduler
                         pendingUse[writeBoard] = Math.Min(pendingUse[writeBoard], firstUse[i]);
                         pendingComplete[writeBoard] = Math.Max(pendingComplete[writeBoard], writeComplete);
                         scoreboardSetAt[writeBoard] = cycle;
-                        foreach (int r in writes) { pendingWrite[r] = 1 << writeBoard; readyAt.Remove(r); earlyAt.Remove(r); }
+                        foreach (int r in writes) { pendingWrite[r] = 1 << writeBoard; readyAt.Remove(r); earlyAt.Remove(r); carried.Remove(r); }
                     }
                     if (readBoard != SassInstruction.NoScoreboard)
                     {
@@ -465,6 +518,8 @@ public static class SassScheduler
                         readyAt[r] = (cycle + latency, cycle);
                         if (producerClass is not null) earlyAt[r] = (cycle + timing.SameClassLatency, producerClass);
                         else earlyAt.Remove(r);
+                        if (e.Mnemonic == "HMMA") carried.Add(r);
+                        else carried.Remove(r);
                     }
                     foreach (int p in predicateWrites)
                     {
@@ -487,6 +542,9 @@ public static class SassScheduler
                 {
                     int to = BranchTarget(code, i);
                     var state = new ScoreState(pendingWrite, pendingRead, outstanding, scoreboardSetAt, shortOps);
+                    if (canCarry)
+                        foreach (int r in carried)
+                            if (readyAt.TryGetValue(r, out var at) && at.Ready > cycle) state.Carried[r] = at.Ready - cycle;
                     var edges = to > i ? forwardEntry : backOut;
                     if (to > i || !drainTargets.Contains(to))
                         edges[to] = edges.TryGetValue(to, out var known) ? known.Union(state) : state;
@@ -541,6 +599,15 @@ public static class SassScheduler
             // holding a global load needed now.
             void Merge(ScoreState state, bool clampSetAt, int at)
             {
+                // MMA results an edge brings, counted from this target's first issue cycle: only instructions from the
+                // target on may hold the remaining delay.
+                foreach (var pair in state.Carried)
+                {
+                    long ready = cycle + pair.Value;
+                    if (!readyAt.TryGetValue(pair.Key, out var known) || known.Ready < ready) readyAt[pair.Key] = (ready, cycle);
+                    earlyAt.Remove(pair.Key);
+                    carried.Add(pair.Key);
+                }
                 foreach (var pair in state.Write) pendingWrite[pair.Key] = (pendingWrite.TryGetValue(pair.Key, out int m) ? m : 0) | pair.Value;
                 foreach (var pair in state.Read) pendingRead[pair.Key] = (pendingRead.TryGetValue(pair.Key, out int m) ? m : 0) | pair.Value;
                 for (int b = 0; b < 6; b++)
@@ -573,6 +640,7 @@ public static class SassScheduler
         public ScoreState(Dictionary<int, int> write, Dictionary<int, int> read, int[] outstanding, long[] setAt, bool[] shortOps)
         {
             Short = (bool[])shortOps.Clone();
+            Carried = new Dictionary<int, long>();
             Write = new Dictionary<int, int>(write);
             Read = new Dictionary<int, int>(read);
             Outstanding = (int[])outstanding.Clone();
@@ -585,9 +653,15 @@ public static class SassScheduler
         public long[] SetAt { get; }
         public bool[] Short { get; }
 
+        // MMA results still in flight at the branch: register key -> cycles left after the target can first issue.
+        public Dictionary<int, long> Carried { get; }
+
         public ScoreState Union(ScoreState other)
         {
             var union = new ScoreState(Write, Read, Outstanding, SetAt, Short);
+            foreach (var pair in Carried) union.Carried[pair.Key] = pair.Value;
+            foreach (var pair in other.Carried)
+                union.Carried[pair.Key] = Math.Max(union.Carried.TryGetValue(pair.Key, out long c) ? c : 0, pair.Value);
             foreach (var pair in other.Write) union.Write[pair.Key] = (union.Write.TryGetValue(pair.Key, out int m) ? m : 0) | pair.Value;
             foreach (var pair in other.Read) union.Read[pair.Key] = (union.Read.TryGetValue(pair.Key, out int m) ? m : 0) | pair.Value;
             for (int b = 0; b < Outstanding.Length; b++)
@@ -607,6 +681,7 @@ public static class SassScheduler
             foreach (var pair in other.Read) if (!Read.TryGetValue(pair.Key, out int m) || (pair.Value & ~m) != 0) return false;
             for (int b = 0; b < Outstanding.Length; b++)
                 if (other.Outstanding[b] > Outstanding[b] || (other.Short[b] && !Short[b])) return false;
+            foreach (var pair in other.Carried) if (!Carried.TryGetValue(pair.Key, out long c) || c < pair.Value) return false;
             return true;
         }
     }
