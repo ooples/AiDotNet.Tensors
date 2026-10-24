@@ -759,6 +759,12 @@ public static class PtxParityRegistry
             "the public FusedBiasDropout path now invokes the optional fused-random capability before allocating " +
             "the established temporary. Device parity awaits SM86 access; static tests prove the float4 input/bias " +
             "transactions, fused mask/output stores, repeated-bias address mapping, and pointer-only exact ABI."),
+        new PtxParitySpec("PtxFusedSquashF32Kernel", PtxParityStatus.Deferred,
+            "capsule squash forward and backward, CudaBackend.Squash / SquashBackward (#833)",
+            "routed ahead of the NVRTC kernels, fail-closed until DirectPtxFeatureGate.CapsuleSquashPromoted. Device " +
+            "parity awaits SM86 access (DirectPtxSquashTests' driver tests: FP64 reference and NVRTC within one ulp); " +
+            "static tests prove one v4 load and store per 16 bytes, FP64 fma/sqrt/div accumulation, one FP32 rounding " +
+            "per element and a pointer-only ABI, and the capsule gate's ptxas build shows no spills."),
         new PtxParitySpec("PtxFusedDdimStepF32Kernel", PtxParityStatus.Deferred,
             "currently advertised deterministic fused DDIM update (#849)",
             "the public fused-advanced CUDA route now attempts exact-shape direct PTX first. Device parity " +
