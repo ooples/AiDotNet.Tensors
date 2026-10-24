@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.142.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.142.0...v0.142.1) (2026-10-24)
+
+
+### Bug Fixes
+
+* **codegen:** the SASS scheduler schedules the Tensor-Core GEMM again ([#1540](https://github.com/ooples/AiDotNet.Tensors/issues/1540)) ([778a846](https://github.com/ooples/AiDotNet.Tensors/commit/778a84685e3c4a50d5a96e8fcb224cc5f8253447))
+* **simd:** the cached-b gemms and the fused gelu epilogue throw without avx2 ([#1542](https://github.com/ooples/AiDotNet.Tensors/issues/1542)) ([69c026e](https://github.com/ooples/AiDotNet.Tensors/commit/69c026e4ffabd41f1cec91581c32c3126ef26e51))
+
+
+### Performance
+
+* **ptx:** FP32 GEMM register-pipelined fragments and a leaner cp.async loop ([#1538](https://github.com/ooples/AiDotNet.Tensors/issues/1538)) ([5f78dc9](https://github.com/ooples/AiDotNet.Tensors/commit/5f78dc9f3f74a008650da16943af968c7aafb95f))
+
 ## [0.142.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.141.0...v0.142.0) (2026-10-23)
 
 
