@@ -49,7 +49,6 @@ Eager launches and launches recorded into a CUDA graph capture are measured and 
 | `hiprtc0604` (runtime compiler) | **Required** for generated kernels | When the backend is constructed | The backend is unavailable |
 | `hipblas` | Optional | At backend initialization, only if its code objects cover the GPU's architecture (`TryConfigureForArchitecture`) | GEMMs use the direct HIP kernels |
 | `rocblas` | Optional | With hipBLAS, and for rocSOLVER-backed linear algebra | As hipBLAS |
-| `rocsparse` | Optional | Lazily (`HipSparseBackend.IsAvailable`) | The custom sparse kernels serve |
 | `MIOpen` | Optional | Lazily, on the first convolution that would use it | The generic kernels run |
 
 ## OpenCL (`OpenClBackend`)
