@@ -42,6 +42,10 @@ public static class CpuFusedOperations
     // Threshold for parallelization (number of elements)
     private const int PARALLEL_THRESHOLD = 4096;
 
+    // The fewest rows ApplyBiasActivationInPlace splits across threads: it parallelizes by row, so a matrix with fewer
+    // rows than this runs serially whatever its element count.
+    private const int MinParallelRows = 4;
+
     #region Fused GEMM + Bias + Activation (Float Arrays)
 
     /// <summary>
@@ -629,12 +633,35 @@ public static class CpuFusedOperations
 
             if (simdGelu && hasBias)
             {
+                // The fused kernel below uses Fma.MultiplyAdd and SimdKernels.FastSigmoid256, whose
+                // PadeSigmoid.Sigmoid8 calls Avx2.Add and Avx2.ShiftLeftLogical unguarded: it is written for
+                // the Avx2+Fma guard its callers inside SimdKernels carry. This arm is reached on
+                // Avx.IsSupported alone, so a machine with AVX but not both threw
+                // PlatformNotSupportedException out of the epilogue. Take the two-pass form this path
+                // replaced instead — bias through the AVX row kernel, then the guarded GELU pass — which
+                // keeps the epilogue vectorised rather than dropping to the scalar loop.
+                if (!Fma.IsSupported || !Avx2.IsSupported)
+                {
+                    if (M * N >= parallelThreshold && M >= MinParallelRows)
+                        CpuParallelSettings.ParallelForOrSerial(0, M, (long)M * N, i => ApplyBiasReluRowSimd(output, bias, i, N, false));
+                    else
+                        for (int i = 0; i < M; i++)
+                            ApplyBiasReluRowSimd(output, bias, i, N, false);
+
+                    unsafe
+                    {
+                        fixed (float* pOut = output)
+                            SimdKernels.GELUUnsafe(pOut, pOut, M * N);
+                    }
+                    return;
+                }
+
                 // Truly fused bias+GELU path — one SIMD pass over output
                 // adds bias and applies GELU. Saves the ~786 KB memory
                 // round-trip the two-pass form needed (load+bias+store,
                 // then load+gelu+store). For BERT FFN up this cuts
                 // ~200 µs per call; 12 calls per BERT = ~2.4 ms.
-                if (M * N >= parallelThreshold && M >= 4)
+                if (M * N >= parallelThreshold && M >= MinParallelRows)
                     CpuParallelSettings.ParallelForOrSerial(0, M, (long)M * N, i => ApplyBiasGeluRowSimd(output, bias!, i, N));
                 else
                     for (int i = 0; i < M; i++)
@@ -644,7 +671,7 @@ public static class CpuFusedOperations
 
             if (hasBias)
             {
-                if (M * N >= parallelThreshold && M >= 4)
+                if (M * N >= parallelThreshold && M >= MinParallelRows)
                 {
                     CpuParallelSettings.ParallelForOrSerial(0, M, (long)M * N, i => ApplyBiasReluRowSimd(output, bias, i, N, simdRelu));
                 }
@@ -657,7 +684,7 @@ public static class CpuFusedOperations
             else if (simdRelu)
             {
                 // Pure ReLU, no bias
-                if (M * N >= parallelThreshold && M >= 4)
+                if (M * N >= parallelThreshold && M >= MinParallelRows)
                     CpuParallelSettings.ParallelForOrSerial(0, M, (long)M * N, i => ApplyBiasReluRowSimd(output, null, i, N, true));
                 else
                     for (int i = 0; i < M; i++)
