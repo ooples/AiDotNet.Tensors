@@ -509,7 +509,8 @@ public static class SassScheduler
                         pendingComplete[readBoard] = Math.Max(pendingComplete[readBoard], readReleased);
                         scoreboardSetAt[readBoard] = cycle;
                         // Or-ed: an earlier reader of the register, on another scoreboard, may still be pending.
-                        foreach (int r in reads) pendingRead[r] = (pendingRead.TryGetValue(r, out int m) ? m : 0) | 1 << readBoard;
+                        foreach (int r in reads)
+                            if (r < UniformRegisterKey) pendingRead[r] = (pendingRead.TryGetValue(r, out int m) ? m : 0) | 1 << readBoard;
                     }
                 }
                 else if (e.Latency == SassLatency.Fixed)
@@ -773,7 +774,8 @@ public static class SassScheduler
         {
             if (effects[i].Latency != SassLatency.Variable) continue;
             var writes = new HashSet<int>(Registers(code[i], effects[i].Writes));
-            var reads = new HashSet<int>(Registers(code[i], effects[i].Reads));
+            // Vector sources only: a uniform operand is read at issue (see VectorSources).
+            var reads = new HashSet<int>(VectorSources(code[i], effects[i]));
             long use = -1, overwrite = -1;
             int j = i + 1;
             for (; j < code.Count && (use < 0 || overwrite < 0); j++)
@@ -820,7 +822,7 @@ public static class SassScheduler
             if (effects[i].Latency != SassLatency.Variable) continue;
             int earliest = i;
             foreach (var loop in loops) if (loop.Start <= i && i <= loop.End && loop.Start < earliest) earliest = loop.Start;
-            foreach (int r in Registers(code[i], effects[i].Reads))
+            foreach (int r in VectorSources(code[i], effects[i]))
                 if (writers.TryGetValue(r, out var list) && list.Exists(w => w != i && (w > i || w >= earliest)))
                 {
                     result[i] = true;
@@ -829,6 +831,11 @@ public static class SassScheduler
         }
         return result;
     }
+
+    // The sources a variable-latency instruction's read scoreboard covers: its vector registers. A uniform operand (an
+    // LDS/STS offset) is read at issue: ptxas overwrites one with a UMOV right after the LDS reading it, without a wait.
+    private static IEnumerable<int> VectorSources(in SassInstruction instruction, SassEffects effects) =>
+        Registers(instruction, effects.Reads).Where(r => r < UniformRegisterKey);
 
     private static List<int> Registers(in SassInstruction instruction, IReadOnlyList<SassRegisterOperand> operands)
     {
