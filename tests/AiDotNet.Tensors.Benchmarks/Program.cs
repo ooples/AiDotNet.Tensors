@@ -27,6 +27,25 @@ class Program
             return;
         }
 
+        // GPU-free cubin generation, verification and SASS audit for the capsule-squash family (#833).
+        if (args.Length > 0 && args[0] == "--generate-direct-ptx-capsule-cubins")
+        {
+            Environment.ExitCode = DirectPtxCapsuleCubinTool.Generate(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--verify-direct-ptx-capsule-cubins")
+        {
+            Environment.ExitCode = DirectPtxCapsuleCubinTool.Verify(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-capsule-sass")
+        {
+            Environment.ExitCode = DirectPtxCapsuleCubinTool.AuditSass(args);
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--generate-direct-ptx-spectral-cubins")
         {
             Environment.ExitCode = DirectPtxSpectralCubinTool.Generate(args);

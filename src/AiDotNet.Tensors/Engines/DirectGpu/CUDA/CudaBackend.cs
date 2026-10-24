@@ -4303,6 +4303,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public unsafe void Squash(IGpuBuffer input, IGpuBuffer output, int numCapsules, int capsuleDim, float epsilon)
     {
+        // Fail-closed direct-PTX path (#833); returns false until the capsule family is promoted.
+        if (TryDirectPtxSquash(input, output, numCapsules, capsuleDim, epsilon)) return;
         if (!_kernelCache.TryGetValue("squash", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: squash");
 
@@ -4324,6 +4326,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public unsafe void SquashBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int numCapsules, int capsuleDim, float epsilon)
     {
+        // Fail-closed direct-PTX path (#833); returns false until the capsule family is promoted.
+        if (TryDirectPtxSquashBackward(gradOutput, input, gradInput, numCapsules, capsuleDim, epsilon)) return;
         if (!_kernelCache.TryGetValue("squash_backward", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: squash_backward");
 

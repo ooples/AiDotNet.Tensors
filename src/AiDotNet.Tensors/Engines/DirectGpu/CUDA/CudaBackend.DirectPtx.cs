@@ -6774,6 +6774,7 @@ public sealed partial class CudaBackend
                 _directPtxCholesky4x4Plans.Clear();
             }
             DisposeDirectPtxSolver4x4Kernels();
+            DisposeDirectPtxSquashKernels();
             foreach (DirectPtxCodegenKernel compiled in _directPtxCodegenKernels.Values)
                 compiled.Dispose();
             _directPtxCodegenKernels.Clear();
