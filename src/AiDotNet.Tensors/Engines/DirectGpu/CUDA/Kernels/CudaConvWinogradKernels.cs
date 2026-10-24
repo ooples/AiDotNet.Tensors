@@ -366,7 +366,15 @@ extern ""C"" __global__ void wino_f23_output(const float* __restrict__ mm, float
 #define WF_TC 32
 #define WF_PC 8
 #define WF_LD 36   // padded row: a warp's 8 tiles x 4 channels of transform stores hit 32 distinct banks
+<<<<<<< Updated upstream
 template <bool DIRECT>
+=======
+// PAIR (host: tilesW even; chunks start at multiples of WF_PC, so tiles 2j and 2j + 1 of a chunk are horizontal
+// neighbours in one image row, both in range or both not): threads 0-127 each transform one 4 x 6 x window covering two
+// tiles' 4 x 4 patches (24 loads instead of 32, shared column transforms), threads 128-255 one 2 x 4 dY window (two
+// tiles' 2 x 2). The stored U and V are bit-identical to the one-tile transforms'.
+template <bool PAIR>
+>>>>>>> Stashed changes
 __device__ __forceinline__ void wino_f32w_fused_body(
     const float* __restrict__ x, const float* __restrict__ dy, float* __restrict__ out,
     int N, int C, int H, int W, int K, int outH, int outW, int pad, int tilesH, int tilesW, int tilesPerSplit)
@@ -392,6 +400,92 @@ __device__ __forceinline__ void wino_f32w_fused_body(
 
     for (int pc = pBegin; pc < pEnd; pc += WF_PC)
     {
+        if (PAIR)
+        {
+            const int jp = tid & 3, r = (tid >> 2) & 31;   // tile pair (2jp, 2jp + 1) of the chunk, channel row r
+            const int p = pc + 2 * jp;
+            const bool pin = p < pEnd;
+            int n = 0, th = 0, tw = 0;
+            if (pin) { n = p / TT; int t = p - n * TT; th = t / tilesW; tw = t - th * tilesW; }
+            if (tid < 128)
+            {
+                const int c = c0 + r;
+                const int h0 = th * 2 - pad, w0 = tw * 2 - pad;
+                const float* src = x + ((long long)n * C + (c < C ? c : 0)) * H * W;
+                const bool cin = pin && c < C;
+                float d[4][6];
+                #pragma unroll
+                for (int i = 0; i < 4; i++)
+                {
+                    const int hh = h0 + i;
+                    #pragma unroll
+                    for (int j = 0; j < 6; j++)
+                    {
+                        const int ww = w0 + j;
+                        d[i][j] = (cin && (unsigned)hh < (unsigned)H && (unsigned)ww < (unsigned)W) ? __ldg(src + hh * W + ww) : 0.0f;
+                    }
+                }
+                float s[4][6];
+                #pragma unroll
+                for (int j = 0; j < 6; j++)
+                {
+                    s[0][j] = d[0][j] - d[2][j];
+                    s[1][j] = d[1][j] + d[2][j];
+                    s[2][j] = d[2][j] - d[1][j];
+                    s[3][j] = d[1][j] - d[3][j];
+                }
+                #pragma unroll
+                for (int q = 0; q < 2; q++)
+                {
+                    const int cc = 2 * q, tq = 2 * jp + q;
+                    #pragma unroll
+                    for (int i = 0; i < 4; i++)
+                    {
+                        Vs[i * 4 + 0][tq][r] = s[i][cc + 0] - s[i][cc + 2];
+                        Vs[i * 4 + 1][tq][r] = s[i][cc + 1] + s[i][cc + 2];
+                        Vs[i * 4 + 2][tq][r] = s[i][cc + 2] - s[i][cc + 1];
+                        Vs[i * 4 + 3][tq][r] = s[i][cc + 1] - s[i][cc + 3];
+                    }
+                }
+            }
+            else
+            {
+                const int k = k0 + r;
+                float g[2][4];
+                #pragma unroll
+                for (int i = 0; i < 2; i++)
+                    #pragma unroll
+                    for (int j = 0; j < 4; j++) g[i][j] = 0.0f;
+                if (pin && k < K)
+                {
+                    const float* src = dy + ((long long)n * K + k) * outH * outW;
+                    const int h = th * 2, w = tw * 2;
+                    #pragma unroll
+                    for (int i = 0; i < 2; i++)
+                        #pragma unroll
+                        for (int j = 0; j < 4; j++)
+                            if ((i == 0 || h + 1 < outH) && (j == 0 || w + j < outW)) g[i][j] = __ldg(src + (h + i) * outW + w + j);
+                }
+                #pragma unroll
+                for (int q = 0; q < 2; q++)
+                {
+                    const int tq = 2 * jp + q;
+                    const float g00 = g[0][2 * q], g01 = g[0][2 * q + 1], g10 = g[1][2 * q], g11 = g[1][2 * q + 1];
+                    const float ra[4] = { g00, g00 + g10, g00 - g10, -g10 };
+                    const float rb[4] = { g01, g01 + g11, g01 - g11, -g11 };
+                    #pragma unroll
+                    for (int i = 0; i < 4; i++)
+                    {
+                        Us[i * 4 + 0][tq][r] = ra[i];
+                        Us[i * 4 + 1][tq][r] = ra[i] + rb[i];
+                        Us[i * 4 + 2][tq][r] = ra[i] - rb[i];
+                        Us[i * 4 + 3][tq][r] = -rb[i];
+                    }
+                }
+            }
+        }
+        else
+        {
         const int p = pc + tj;
         const bool pin = p < pEnd;
         int n = 0, th = 0, tw = 0;
@@ -453,6 +547,7 @@ __device__ __forceinline__ void wino_f32w_fused_body(
                 Vs[i * 4 + 2][tj][tr] = s[i][2] - s[i][1];
                 Vs[i * 4 + 3][tj][tr] = s[i][1] - s[i][3];
             }
+        }
         }
         __syncthreads();
         #pragma unroll
@@ -600,6 +695,13 @@ extern ""C"" __global__ __launch_bounds__(256) void wino_f32w_fused(
 {
     wino_f32w_fused_body<false>(x, dy, out, N, C, H, W, K, outH, outW, pad, tilesH, tilesW, tilesPerSplit);
 }
+#define WF_ENTRY(NAME, PAIR) \
+extern ""C"" __global__ __launch_bounds__(256) void NAME(const float* __restrict__ x, const float* __restrict__ dy, \
+    float* __restrict__ out, int N, int C, int H, int W, int K, int outH, int outW, int pad, int tilesH, int tilesW, \
+    int tilesPerSplit) \
+{ wino_f32w_fused_body<PAIR>(x, dy, out, N, C, H, W, K, outH, outW, pad, tilesH, tilesW, tilesPerSplit); }
+WF_ENTRY(wino_f32w_fused, false)
+WF_ENTRY(wino_f32w_fused_pair, true)
 
 // dW[k][c][3][3] = sum over the splits of partials[z][q][k][c] (q = 3i + j), in split order.
 extern ""C"" __global__ __launch_bounds__(256) void conv2d_wgrad_winograd_finish(
@@ -617,6 +719,10 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_wgrad_winograd_finish
     public static string[] GetKernelNames() => new[]
     {
         "wino_f23_filter", "wino_f23_filter_flip", "wino_f23_input", "wino_gemm128", "wino_gemm64", "wino_f23_output", "wino_f32w_dy", "wino_f32w_input", "wino_f32w_output",
+<<<<<<< Updated upstream
         "wino_f32w_fused", "wino_f32w_fused_direct", "conv2d_wgrad_winograd_finish",
+=======
+        "wino_f32w_fused", "wino_f32w_fused_pair", "conv2d_wgrad_winograd_finish",
+>>>>>>> Stashed changes
     };
 }

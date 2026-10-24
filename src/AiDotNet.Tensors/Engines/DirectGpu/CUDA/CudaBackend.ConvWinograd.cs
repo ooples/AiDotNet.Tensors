@@ -186,10 +186,27 @@ public sealed partial class CudaBackend : IWinogradF23Transforms, IWinogradFused
         if (splits > 1 && (partials = TryConvScratch(ref _winogradDwPartials, 9L * splits * kc)) is null) return false;
 
         using var _ = PushContext();
+<<<<<<< Updated upstream
         IWinogradFusedFilterGradient fused = this;
         fused.FusedFilterGradient(splits == 1, a.First, partials ?? a.Output, a.Second, gx * gy * splits,
             new[] { n, c, h, w, k, outH, outW, pad, tilesH, tilesW, tilesPerSplit });
         if (partials is not null) fused.FusedFilterGradientFinish(partials, a.Output, (int)kc, splits);
+=======
+        IntPtr xPtr = a.First.Handle, dyPtr = a.Second.Handle, partPtr = partials.Handle, dwPtr = a.Output.Handle;
+        int tps = tilesPerSplit;
+        void** fa = stackalloc void*[15];
+        fa[0] = &xPtr; fa[1] = &dyPtr; fa[2] = &partPtr; fa[3] = &n; fa[4] = &c; fa[5] = &h; fa[6] = &w; fa[7] = &k;
+        fa[8] = &outH; fa[9] = &outW; fa[10] = &pad; fa[11] = &tilesH; fa[12] = &tilesW; fa[13] = &tps;
+        // Even tile rows: the pair transforms (one x and one dY window per two neighbouring tiles), bit-identical.
+        // WF_PAIR=0 keeps the one-tile transforms (A/B).
+        bool pair = tilesW % 2 == 0 && Environment.GetEnvironmentVariable("WF_PAIR") != "0";
+        LaunchKernel3D(_kernelCache[pair ? "wino_f32w_fused_pair" : "wino_f32w_fused"], (uint)gx, (uint)gy, (uint)splits, (uint)DefaultBlockSize, 1, 1, fa, 0);
+        int kci = (int)kc;
+        void** ra = stackalloc void*[4];
+        ra[0] = &partPtr; ra[1] = &dwPtr; ra[2] = &kci; ra[3] = &splits;
+        LaunchKernel(_kernelCache["conv2d_wgrad_winograd_finish"], (uint)((9 * kc + DefaultBlockSize - 1) / DefaultBlockSize),
+            (uint)DefaultBlockSize, ra);
+>>>>>>> Stashed changes
         return true;
     }
 
