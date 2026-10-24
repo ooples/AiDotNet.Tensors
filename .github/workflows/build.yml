@@ -126,6 +126,22 @@ jobs:
           -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura \
           DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Exclude="[*]AiDotNet.Tensors.Engines.DirectGpu.*,[*]AiDotNet.Tensors.Engines.DirectGpuTensorEngine*,[*]AiDotNet.Tensors.Engines.Cu*,[*]AiDotNet.Tensors.Engines.ClBlast*,[*]AiDotNet.Tensors.Engines.OpenCl*,[*]AiDotNet.Tensors.Engines.Simd.*,[*]AiDotNet.Tensors.Engines.BlasManaged.*"
 
+    - name: Test the AVX2/FMA fallbacks (DOTNET_EnableAVX2=0)
+      env:
+        # Whether the JIT reports an instruction set is fixed per process, so the paths a CPU without AVX2 or FMA
+        # takes cannot be reached from the main run: only a host started with the ISA switched off sees
+        # Avx2.IsSupported and Fma.IsSupported false (on .NET 10, DOTNET_EnableAVX2=0 turns FMA off too; Avx stays
+        # on). Before #1542 the cached-B GEMMs and the fused bias+GELU epilogue threw PlatformNotSupportedException
+        # there. Its coverage lands under ./coverage with the main run's and is merged into the report and codecov.
+        DOTNET_EnableAVX2: '0'
+      run: |
+        dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-build --verbosity normal --framework net10.0 \
+          --filter "FullyQualifiedName~InstructionSetFallbackTests" \
+          --collect:"XPlat Code Coverage" \
+          --results-directory ./coverage/avx2-off \
+          -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura \
+          DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Exclude="[*]AiDotNet.Tensors.Engines.DirectGpu.*,[*]AiDotNet.Tensors.Engines.DirectGpuTensorEngine*,[*]AiDotNet.Tensors.Engines.Cu*,[*]AiDotNet.Tensors.Engines.ClBlast*,[*]AiDotNet.Tensors.Engines.OpenCl*,[*]AiDotNet.Tensors.Engines.Simd.*,[*]AiDotNet.Tensors.Engines.BlasManaged.*"
+
     # If --blame-hang-timeout (a test made no progress for 300s) or --blame-crash (test host
     # native-crashed, e.g. a CUDA-finalizer 0xC0000005) fired, the hang/crash dump + the
     # Sequence file naming the culprit test land under ./coverage. NOTE the glob is Sequence*.xml:
