@@ -27453,11 +27453,14 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <c>Unsafe.ReadUnaligned</c> / <c>Unsafe.WriteUnaligned</c> for
     /// 32-byte vector load/store, avoiding Span bounds-check overhead.
     /// </summary>
-    // LayerNorm parallel break-even (elements). Below this, run serial to avoid the
-    // worker-pool park/wakeup floor that dominates small-op latency. Env-tunable.
+    // LayerNorm parallel break-even (elements): the elementwise grain. Below it, run serial. The old 512K floor
+    // dated from a ~190 µs pool wakeup; with the current pool it kept DiT's [256, 1152] LayerNorm serial at every
+    // thread count (#653, 3990X, 16 threads: 142-149 µs serial vs 14-33 µs parallel; [77, 1024] 43-46 vs 12-14 µs;
+    // [1024, 64] 42-43 vs 16-21 µs; at 4 threads every shape from [256, 64] up was as fast or faster in parallel).
+    // Env-tunable.
     private static readonly long _lnParallelMinWork =
         long.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_LN_PARALLEL_MINWORK"), out var lnw) && lnw > 0
-            ? lnw : 524_288;
+            ? lnw : CpuParallelSettings.ElementwiseGrain;
 
     // Row-count parallel gate: a LayerNorm over many independent rows parallelizes
     // well even when total elements are below _lnParallelMinWork — the work-only
@@ -27544,16 +27547,9 @@ public partial class CpuEngine : ITensorLevelEngine
 #else
         bool useSimd = false;
 #endif
-        // Serial below the parallel break-even. The old 50K threshold was far too
-        // low: a transformer LayerNorm at [B*seq, d] = [1024, 64] = 65 536 elements
-        // is only ~25 µs of single-pass SIMD work, but dispatching its 1024 tiny rows
-        // to the worker pool — which has parked between this and the previous op
-        // (MHA / FFN / the other 3 LayerNorms in the block) — pays the full park/
-        // wakeup latency (~190 µs measured, profiled as ManualResetEventSlim/semaphore
-        // wait, not compute). Net: parallel was ~7× SLOWER than serial at this size.
-        // Raised to 512K elements so small/medium LayerNorms (transformers at modest
-        // batch×seq) stay serial; large ones (BERT-scale, millions of elements, where
-        // serial is ms and dwarfs the wakeup) still parallelize. Env-tunable.
+        // Serial below the parallel break-even (_lnParallelMinWork elements or _lnParallelMinRows rows). An older
+        // pool paid ~190 µs to wake its parked workers, which made a [1024, 64] LayerNorm ~7x slower in parallel
+        // and set a 512K floor; the current pool wakes far cheaper, so the floor is the elementwise grain (#653).
         // Enable the register-resident single-pass fs=64 fast path only for batch
         // sizes where it is profiled to win (see _lnFusedFs64MaxBatch). fs==64 is the
         // common transformer/LSTM hidden width; the path requires the AVX2 branch.
