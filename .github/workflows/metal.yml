@@ -8,7 +8,8 @@ name: Metal (macOS, Apple GPU)
 # runners expose a Metal device, so this job runs the Metal tests there and times the Meshgrid2D promotion gate.
 #
 # The hosted runner's GPU is virtualized, so its timings are a check that the gate holds on Apple hardware, not a
-# tuned-profile measurement (#1254 still needs a physical Mac).
+# tuned-profile measurement (#1254 still needs a physical Mac). The Meshgrid2D gate decides on a confidence interval,
+# which that noise widens but does not bias.
 
 on:
   push:
@@ -64,9 +65,10 @@ jobs:
 
     - name: Meshgrid2D promotion gate (#921)
       if: always()
-      # Informational: the hosted runner's GPU is virtualized and its per-arm timings swing 25-70%, so the stability
-      # gate usually reports "no verdict". The medians are recorded here; correctness gates in the step above.
-      continue-on-error: true
+      # Gating. The hosted runner's GPU is virtualized and its timings swing 8-70%, so a spread gate never converged;
+      # the gate now promotes a shape only when the 95% distribution-free interval of its median speedup over 41
+      # AB/BA brackets lies wholly at or above 1.10x (StableTimer.MeasurePairedRatioBound). The fused route is what
+      # TensorMeshgrid takes on Metal, so a shape that stops clearing the bar fails this step.
       run: |
         dotnet run --project tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmarks.csproj \
           --configuration Release --no-build -- --metal-meshgrid2d
