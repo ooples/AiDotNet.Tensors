@@ -80,6 +80,9 @@ internal enum DeclaredFamily
 
     /// <summary>The row-wise scatter softmax (#1441).</summary>
     ScatterSoftmaxRows,
+
+    /// <summary>CSR · dense → dense (#1441).</summary>
+    CsrSpMM,
 }
 
 /// <summary>One declared program: its family and shape (unused dimensions are 0).</summary>
@@ -533,6 +536,7 @@ public sealed partial class CudaBackend
         _declaredPrograms.Clear();
         _declaredStridedPrograms = 0;
         _declaredScatterRowsPrograms = 0;
+        _declaredCsrSpMMPrograms = 0;
     }
 
     // ---- LayerNorm ------------------------------------------------------------------------------------------------

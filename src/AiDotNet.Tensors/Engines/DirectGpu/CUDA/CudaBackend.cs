@@ -4772,6 +4772,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
+        if (TryDeclaredCsrSpMM(csrValues, csrColIndices, csrRowPointers, denseB, output, M, K, N, nnz))
+            return;
+
         if (!_kernelCache.TryGetValue("csr_spmm", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: csr_spmm");
 
