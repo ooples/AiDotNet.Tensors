@@ -456,6 +456,13 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             return CloneDeepCopy();
         }
 
+        // An arena reissues its arrays: after Reset the next tensor it rents gets this same array and writes it
+        // directly, not through this storage, so nothing privatizes a shared clone first and the clone would change
+        // under its owner. A clone taken to keep an arena result past the arena's next step (#653: a predictor copying
+        // its output out of its inference arena) must own its data.
+        if (GetLiveBackingArrayOrNull() is { } backing && Helpers.TensorArena.IsArenaIssued(backing))
+            return CloneDeepCopy();
+
         // Share the same TensorStorage (the ctor AddRefs it); flag both sides as COW sharers so the
         // first in-place write on either privatizes via EnsureOwnedForWrite, preserving deep-copy
         // semantics at O(1)-until-write.
