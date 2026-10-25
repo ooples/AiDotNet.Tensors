@@ -320,20 +320,26 @@ public sealed partial class CudaBackend
     /// Whether a capped family may run <paramref name="key"/>: one already built, or a new one within
     /// <paramref name="cap"/>, which it then claims. A new key is claimed only where
     /// <see cref="TryRunDeclaredProgram"/> would go on to build it -- the declared route enabled and the stream not
-    /// capturing -- so a call that route declines without building consumes no slot. Under the program lock, so
-    /// concurrent new shapes cannot both take the last one. A build that fails is cached, so it claims a slot once.
+    /// capturing -- so a call that route declines without building consumes no slot. Callers validate their buffers
+    /// first, for the same reason. A key is claimed once: it is reserved under the program lock, so concurrent calls
+    /// for one new shape share its slot and concurrent new shapes cannot both take the last one. A build that fails is
+    /// cached, so it too claims a slot once.
     /// </summary>
     private bool ClaimDeclaredSlot(DeclaredKey key, ref int claimed, int cap)
     {
         if (!DeclaredKernelsEnabled) return false;
         lock (_directPtxLock)
         {
-            if (_declaredPrograms.ContainsKey(key)) return true;
+            if (_declaredPrograms.ContainsKey(key) || _declaredClaimedKeys.Contains(key)) return true;
             if (claimed >= cap || IsStreamCapturing()) return false;
             claimed++;
+            _declaredClaimedKeys.Add(key);
             return true;
         }
     }
+
+    // The keys ClaimDeclaredSlot has claimed, built or not yet; guarded by _directPtxLock.
+    private readonly HashSet<DeclaredKey> _declaredClaimedKeys = new();
 
     /// <summary>
     /// Runs the program <paramref name="build"/> makes for <paramref name="key"/>, with <paramref name="bound"/>
@@ -556,6 +562,7 @@ public sealed partial class CudaBackend
         _declaredStridedPrograms = 0;
         _declaredScatterRowsPrograms = 0;
         _declaredCsrSpMMPrograms = 0;
+        _declaredClaimedKeys.Clear();
     }
 
     // ---- LayerNorm ------------------------------------------------------------------------------------------------

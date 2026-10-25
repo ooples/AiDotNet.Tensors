@@ -80,9 +80,10 @@ public sealed partial class CudaBackend
         IGpuBuffer counts, int sourceRows, int innerSize, int outputRows)
     {
         var key = ScatterRowsKey(DeclaredFamily.ScatterMeanRows, sourceRows, innerSize, outputRows);
-        if (!AdmitScatterRows(key, sourceRows, innerSize, outputRows) || indices.Size < sourceRows ||
-            (long)source.Size < (long)sourceRows * innerSize || (long)output.Size < (long)outputRows * innerSize ||
-            counts.Size < outputRows)
+        // The buffers first: a call declined for them must not claim a program slot.
+        if (indices.Size < sourceRows || (long)source.Size < (long)sourceRows * innerSize ||
+            (long)output.Size < (long)outputRows * innerSize || counts.Size < outputRows ||
+            !AdmitScatterRows(key, sourceRows, innerSize, outputRows))
             return false;
         return TryRunDeclaredProgram(key, _buildScatterMeanRows ??= BuildScatterMeanRows, s_scatterMeanRowsNames,
             new DeclaredBindings(source, indices, counts, output));
@@ -97,8 +98,9 @@ public sealed partial class CudaBackend
         int sourceRows, int innerSize, int numGroups)
     {
         var key = ScatterRowsKey(DeclaredFamily.ScatterSoftmaxRows, sourceRows, innerSize, numGroups);
-        if (!AdmitScatterRows(key, sourceRows, innerSize, numGroups) || indices.Size < sourceRows ||
-            (long)source.Size < (long)sourceRows * innerSize || (long)output.Size < (long)sourceRows * innerSize)
+        // The buffers first: a call declined for them must not claim a program slot.
+        if (indices.Size < sourceRows || (long)source.Size < (long)sourceRows * innerSize ||
+            (long)output.Size < (long)sourceRows * innerSize || !AdmitScatterRows(key, sourceRows, innerSize, numGroups))
             return false;
         return TryRunDeclaredProgram(key, _buildScatterSoftmaxRows ??= BuildScatterSoftmaxRows, s_scatterSoftmaxRowsNames,
             new DeclaredBindings(indices, source, output));
