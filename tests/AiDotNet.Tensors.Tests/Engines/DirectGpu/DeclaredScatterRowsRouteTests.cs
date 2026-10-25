@@ -33,6 +33,9 @@ public sealed class DeclaredScatterRowsRouteTests
         for (int i = 0; i < sourceRows; i++) ids[i] = i % 11 == 10 ? -1 : random.Next(groups - 1);   // the last group stays empty
         var values = new float[sourceRows * innerSize];
         for (int i = 0; i < values.Length; i++) values[i] = (float)(random.NextDouble() * 6 - 3);
+        // A row outside the groups writes 0 for the softmax whatever it holds, +Inf and an overflowing value included.
+        for (int i = 0; i < sourceRows; i++)
+            if (ids[i] < 0) { values[i * innerSize] = float.PositiveInfinity; values[i * innerSize + innerSize - 1] = 500f; }
 
         using var source = backend.AllocateBuffer(values);
         using var indices = backend.AllocateByteBuffer(ids.Length * sizeof(int));
@@ -60,7 +63,11 @@ public sealed class DeclaredScatterRowsRouteTests
 
         Assert.Equal(backend.DownloadBuffer(countsHand), backend.DownloadBuffer(countsDeclared));
         AssertClose(backend.DownloadBuffer(meanHand), backend.DownloadBuffer(meanDeclared));
-        AssertClose(backend.DownloadBuffer(softmaxHand), backend.DownloadBuffer(softmaxDeclared));
+        var softmax = backend.DownloadBuffer(softmaxDeclared);
+        AssertClose(backend.DownloadBuffer(softmaxHand), softmax);
+        for (int i = 0; i < sourceRows; i++)
+            if (ids[i] < 0)
+                for (int j = 0; j < innerSize; j++) Assert.Equal(0f, softmax[i * innerSize + j]);
     }
 
     private static void AssertClose(float[] expected, float[] actual)

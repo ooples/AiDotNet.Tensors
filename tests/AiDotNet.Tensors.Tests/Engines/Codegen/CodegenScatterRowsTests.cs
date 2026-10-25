@@ -83,7 +83,7 @@ public class CodegenScatterRowsTests
     public void ScatterSoftmax_NormalisesEachGroupsColumns_AndZeroesARowOutsideTheGroups()
     {
         var source = Source();
-        var outputs = CodegenBackendPrograms.ScatterSoftmaxRows(Ids.Length, Inner, Groups).Interpret(Inputs(source));
+        var outputs = CodegenBackendPrograms.ScatterSoftmaxRows(Ids.Length, Inner, Groups, NotEqual).Interpret(Inputs(source));
 
         for (int i = 0; i < Ids.Length; i++)
             for (int j = 0; j < Inner; j++)
@@ -112,13 +112,37 @@ public class CodegenScatterRowsTests
             }
     }
 
+    /// <summary>
+    /// The hand-written kernel writes 0 for a row whose group lies outside [0, numGroups), whatever the row holds. A
+    /// declared pass that multiplied its exponential by a gathered zero would write NaN for an infinite or overflowing
+    /// value, so the sentinel rows here hold +Inf, a value whose exponential overflows FP32, and NaN.
+    /// </summary>
+    [Fact]
+    public void ScatterSoftmax_WritesExactZeroForOutOfGroupRowsHoldingNonFiniteOrHugeValues()
+    {
+        var source = Source();
+        source[4 * Inner + 0] = double.PositiveInfinity;    // row 4, index -1
+        source[4 * Inner + 1] = 1000.0;                     // exp overflows even FP64
+        source[4 * Inner + 2] = double.NaN;
+        source[7 * Inner + 0] = double.PositiveInfinity;    // row 7, index 4 == numGroups
+        source[7 * Inner + 1] = double.NaN;
+        source[7 * Inner + 2] = 1e30;
+        var outputs = CodegenBackendPrograms.ScatterSoftmaxRows(Ids.Length, Inner, Groups, NotEqual).Interpret(Inputs(source));
+
+        foreach (int row in new[] { 4, 7 })
+            for (int j = 0; j < Inner; j++)
+                Assert.Equal(0.0, outputs["out"][row * Inner + j]);
+        // The in-group rows are untouched by the sentinels: group 1's column 0 still sums to 1.
+        Assert.Equal(1.0, outputs["out"][0 * Inner] + outputs["out"][3 * Inner] + outputs["out"][6 * Inner], 12);
+    }
+
     [Fact]
     public void ScatterRows_EmitNoAtomic()
     {
         foreach (var program in new[]
                  {
                      CodegenBackendPrograms.ScatterMeanRows(64, 8, 16, NotEqual),
-                     CodegenBackendPrograms.ScatterSoftmaxRows(64, 8, 16),
+                     CodegenBackendPrograms.ScatterSoftmaxRows(64, 8, 16, NotEqual),
                  })
             foreach (var pass in program.Passes)
             {

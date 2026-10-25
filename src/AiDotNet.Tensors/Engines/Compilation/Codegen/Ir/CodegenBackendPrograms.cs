@@ -398,16 +398,20 @@ public static class CodegenBackendPrograms
     /// group g = indices[i] and each column j, <c>out[i, j] = exp(source[i, j] - max_g[j]) / sum_g[j]</c>, with the
     /// maximum and the sum over the rows of g. The maximum is the segment maximum; the reciprocal sum is the scatter
     /// inversion of <c>exp(source - max)</c>, summed in increasing row as the hand-written kernel loops; each row then
-    /// gathers its group's two by indices[i]. A row whose group lies outside [0, numGroups) gathers zeros and so writes
-    /// 0, as there.
+    /// gathers its group's two by indices[i]. A row whose group lies outside [0, numGroups) writes exactly 0, as there,
+    /// whatever its source values: the normalising pass reads a per-group one through indices[i], so such a row's term
+    /// is skipped entirely (its bias and exponential included) rather than multiplied by a gathered zero, which an
+    /// infinite or overflowing exponential would turn into NaN.
     /// </summary>
     /// <remarks>
     /// The hand-written kernel divides by the sum; the IR multiplies by its reciprocal, so the two can differ by one
     /// FP32 ulp, as the declared attention softmax does. Both write the same value wherever the sum is exactly a power
     /// of two.
     /// </remarks>
-    public static CodegenProgram ScatterSoftmaxRows(int sourceRows, int innerSize, int numGroups)
+    public static CodegenProgram ScatterSoftmaxRows(int sourceRows, int innerSize, int numGroups,
+        CodegenLibraryFunction notEqualZero)
     {
+        if (notEqualZero is null) throw new ArgumentNullException(nameof(notEqualZero));
         var passes = new List<CodegenKernelSpec>();
         var temps = new List<long>();
         int[] groupShape = { numGroups, innerSize };
@@ -446,11 +450,29 @@ public static class CodegenBackendPrograms
             temps.Add((long)sourceRows * innerSize);
         }
 
-        // out[i, j] = exp(source[i, j] + row_negmax[i, j]) * row_recipsum[i, j]. A row outside the groups gathered 0
-        // for its reciprocal sum, so it writes 0.
+        // group_ones[g] = a + (1 - a), a = notEqual(negmax[g, 0], 0): exactly 1 for every group, NaN included.
+        var groupNonZero = CodegenExpr.Call(notEqualZero, Op(0), CodegenExpr.Constant(0.0));
+        var groupOneBody = CodegenExpr.Add(groupNonZero, CodegenExpr.Subtract(CodegenExpr.Constant(1.0), groupNonZero));
+        passes.Add(new CodegenKernelSpec("scatter_softmax_group_ones",
+            new CodegenIterationSpace(CodegenAxis.Parallel("g", numGroups)),
+            new[] { new CodegenTensorBinding(0, "negmax", groupShape, new[] { A(0), CodegenAffineExpr.Const(0) }) },
+            Bind(1, "group_ones", new[] { numGroups }, isOutput: true), groupOneBody.Operands(), CodegenReduceKind.None,
+            body: groupOneBody));
+        temps.Add(numGroups);
+
+        // out[i, j] = exp(source[i, j] * group_ones[indices[i]] + row_negmax[i, j]) * row_recipsum[i, j]. For a row
+        // outside the groups the group_ones read is out of range, so the whole term -- bias and exponential included --
+        // is the identity 0, and the row writes 0 even where its source is infinite.
         passes.Add(new CodegenKernelSpec("scatter_softmax_out", rowSpace,
-            new[] { Bind(0, "source", rowShape), Bind(1, "row_negmax", rowShape), Bind(2, "row_recipsum", rowShape) },
-            Bind(3, "out", rowShape, isOutput: true), new[] { 0 }, CodegenReduceKind.None,
+            new[]
+            {
+                Bind(0, "source", rowShape), Bind(1, "row_negmax", rowShape), Bind(2, "row_recipsum", rowShape),
+                new CodegenTensorBinding(3, "indices", new[] { sourceRows }, new[] { A(0) },
+                    elementType: CodegenElementType.Int32),
+                new CodegenTensorBinding(4, "group_ones", new[] { numGroups }, new[] { CodegenAffineExpr.Const(0) },
+                    indirect: new CodegenIndirectIndex?[] { new CodegenIndirectIndex(3, A(0), numGroups) }),
+            },
+            Bind(5, "out", rowShape, isOutput: true), new[] { 0, 4 }, CodegenReduceKind.None,
             scaleInput: 2, preReduce: CodegenPreReduceOp.Exp, preBiasInput: 1));
         return new CodegenProgram(passes, temps, "row-wise scatter softmax (backend contract)");
     }
