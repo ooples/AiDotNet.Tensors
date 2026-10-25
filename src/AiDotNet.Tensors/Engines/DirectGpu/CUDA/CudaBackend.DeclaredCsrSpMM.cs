@@ -34,9 +34,9 @@ public sealed partial class CudaBackend
 
     /// <summary>
     /// The largest rows x nnz admitted. The inversion visits every stored entry for every row, against csr_spmm's own
-    /// row's entries only, so it is admitted only where that product stays small, as the scatter inversions are.
+    /// row's entries only, so it is admitted only where that product stays small: the scatter inversions' budget.
     /// </summary>
-    internal const long DeclaredCsrSpMMMaxRowEntries = 1L << 22;
+    internal const long DeclaredCsrSpMMMaxRowEntries = DeclaredScatterRowsWorkLimit;
 
     private int _declaredCsrSpMMPrograms;
 
@@ -70,14 +70,7 @@ public sealed partial class CudaBackend
             (long)output.Size < (long)rows * n)
             return false;
         var key = CsrSpMMKey(rows, cols, n, nnz);
-        lock (_directPtxLock)
-        {
-            if (!_declaredPrograms.ContainsKey(key))
-            {
-                if (_declaredCsrSpMMPrograms >= DeclaredCsrSpMMProgramCap) return false;
-                _declaredCsrSpMMPrograms++;
-            }
-        }
+        if (!ClaimDeclaredSlot(key, ref _declaredCsrSpMMPrograms, DeclaredCsrSpMMProgramCap)) return false;
         return TryRunDeclaredProgram(key, _buildCsrSpMM ??= BuildCsrSpMM, s_csrSpMMNames,
             new DeclaredBindings(rowPointers, colIndices, values, dense, output));
     }

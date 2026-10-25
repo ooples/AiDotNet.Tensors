@@ -317,6 +317,25 @@ public sealed partial class CudaBackend
     }
 
     /// <summary>
+    /// Whether a capped family may run <paramref name="key"/>: one already built, or a new one within
+    /// <paramref name="cap"/>, which it then claims. A new key is claimed only where
+    /// <see cref="TryRunDeclaredProgram"/> would go on to build it -- the declared route enabled and the stream not
+    /// capturing -- so a call that route declines without building consumes no slot. Under the program lock, so
+    /// concurrent new shapes cannot both take the last one. A build that fails is cached, so it claims a slot once.
+    /// </summary>
+    private bool ClaimDeclaredSlot(DeclaredKey key, ref int claimed, int cap)
+    {
+        if (!DeclaredKernelsEnabled) return false;
+        lock (_directPtxLock)
+        {
+            if (_declaredPrograms.ContainsKey(key)) return true;
+            if (claimed >= cap || IsStreamCapturing()) return false;
+            claimed++;
+            return true;
+        }
+    }
+
+    /// <summary>
     /// Runs the program <paramref name="build"/> makes for <paramref name="key"/>, with <paramref name="bound"/>
     /// supplying the tensors named by <paramref name="names"/> (slot k is names[k]); every other tensor of the program
     /// is scratch this backend allocates once per key. Returns false -- having launched nothing -- when the route is

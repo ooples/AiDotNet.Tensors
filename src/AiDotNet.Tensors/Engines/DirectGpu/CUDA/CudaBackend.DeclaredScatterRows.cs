@@ -34,6 +34,12 @@ public sealed partial class CudaBackend
     /// </summary>
     internal const int DeclaredScatterRowsProgramCap = 32;
 
+    /// <summary>
+    /// The largest groups x source rows admitted. The declared scan visits every source row for every group, as the
+    /// hand-written kernels do, so it is admitted only where that product stays small.
+    /// </summary>
+    internal const long DeclaredScatterRowsWorkLimit = 1L << 22;
+
     private int _declaredScatterRowsPrograms;
 
     private static readonly string[] s_scatterMeanRowsNames = { "source", "indices", "counts", "out" };
@@ -41,37 +47,30 @@ public sealed partial class CudaBackend
 
     private Func<DeclaredKey, CodegenProgram>? _buildScatterMeanRows;
 
-    private static readonly Func<DeclaredKey, CodegenProgram> s_buildScatterSoftmaxRows =
-        key => CodegenBackendPrograms.ScatterSoftmaxRows(key.D0, key.D1, key.D2);
+    private Func<DeclaredKey, CodegenProgram>? _buildScatterSoftmaxRows;
 
-    // The mean's clamp calls the derived not_equal_scalar, so its builder needs this backend.
-    private CodegenProgram BuildScatterMeanRows(DeclaredKey key)
-    {
-        var notEqual = (ResolveElementwise("not_equal_scalar")
+    // Both programs build their tensors of ones with the derived not_equal_scalar, so their builders need this backend.
+    private CodegenLibraryFunction NotEqualScalar() =>
+        (ResolveElementwise("not_equal_scalar")
             ?? throw new NotSupportedException("not_equal_scalar has no derived function: " +
                 ElementwiseRefusal("not_equal_scalar"))).Handle;
-        return CodegenBackendPrograms.ScatterMeanRows(key.D0, key.D1, key.D2, notEqual);
-    }
+
+    private CodegenProgram BuildScatterMeanRows(DeclaredKey key) =>
+        CodegenBackendPrograms.ScatterMeanRows(key.D0, key.D1, key.D2, NotEqualScalar());
+
+    private CodegenProgram BuildScatterSoftmaxRows(DeclaredKey key) =>
+        CodegenBackendPrograms.ScatterSoftmaxRows(key.D0, key.D1, key.D2, NotEqualScalar());
 
     /// <summary>The key of a row-wise scatter: source rows, inner size, groups.</summary>
     internal static DeclaredKey ScatterRowsKey(DeclaredFamily family, int sourceRows, int innerSize, int groups) =>
         new(family, sourceRows, innerSize, groups, 0, 0, 0);
 
     // The scan is quadratic in the group count, as the hand-written kernels are; admitted only where that stays small,
-    // like the declared scatter-add. One already built, or a new one within the cap, which it then claims.
-    private bool AdmitScatterRows(DeclaredKey key, int sourceRows, int innerSize, int groups)
-    {
-        if (!DeclaredScatterRowsEnabled || sourceRows <= 0 || innerSize <= 0 || groups <= 0 ||
-            (long)groups * sourceRows > 1L << 22)
-            return false;
-        lock (_directPtxLock)
-        {
-            if (_declaredPrograms.ContainsKey(key)) return true;
-            if (_declaredScatterRowsPrograms >= DeclaredScatterRowsProgramCap) return false;
-            _declaredScatterRowsPrograms++;
-            return true;
-        }
-    }
+    // like the declared scatter-add, and within the cap (see ClaimDeclaredSlot).
+    private bool AdmitScatterRows(DeclaredKey key, int sourceRows, int innerSize, int groups) =>
+        DeclaredScatterRowsEnabled && sourceRows > 0 && innerSize > 0 && groups > 0 &&
+        (long)groups * sourceRows <= DeclaredScatterRowsWorkLimit &&
+        ClaimDeclaredSlot(key, ref _declaredScatterRowsPrograms, DeclaredScatterRowsProgramCap);
 
     /// <summary>
     /// ScatterMeanRowsWithCounts through its declared program (#1441): the counts and the means, with no atomic. Off
@@ -101,7 +100,7 @@ public sealed partial class CudaBackend
         if (!AdmitScatterRows(key, sourceRows, innerSize, numGroups) || indices.Size < sourceRows ||
             (long)source.Size < (long)sourceRows * innerSize || (long)output.Size < (long)sourceRows * innerSize)
             return false;
-        return TryRunDeclaredProgram(key, s_buildScatterSoftmaxRows, s_scatterSoftmaxRowsNames,
+        return TryRunDeclaredProgram(key, _buildScatterSoftmaxRows ??= BuildScatterSoftmaxRows, s_scatterSoftmaxRowsNames,
             new DeclaredBindings(indices, source, output));
     }
 
@@ -116,5 +115,5 @@ public sealed partial class CudaBackend
     internal DeclaredResidentStage ScatterSoftmaxRowsStage(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output,
         int sourceRows, int innerSize, int numGroups) =>
         new(ScatterRowsKey(DeclaredFamily.ScatterSoftmaxRows, sourceRows, innerSize, numGroups),
-            s_buildScatterSoftmaxRows, s_scatterSoftmaxRowsNames, new DeclaredBindings(indices, source, output));
+            _buildScatterSoftmaxRows ??= BuildScatterSoftmaxRows, s_scatterSoftmaxRowsNames, new DeclaredBindings(indices, source, output));
 }
