@@ -8,8 +8,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 public sealed partial class CudaBackend
 {
-    // AIDOTNET_DECLARED_SCATTER_ROWS=1 opts the row-wise scatter mean and softmax into the declared route; they are
-    // off by default until verified on an NVIDIA GPU (see ScatterRowsDeclaredPromoted).
+    // AIDOTNET_DECLARED_SCATTER_ROWS=1 opts the row-wise scatter mean and softmax into the declared route while they are
+    // unpromoted; they are on by default since their verification on an NVIDIA GPU (see ScatterRowsDeclaredPromoted).
     private static readonly bool s_declaredScatterRowsOptIn =
         Environment.GetEnvironmentVariable("AIDOTNET_DECLARED_SCATTER_ROWS") == "1";
 
@@ -20,7 +20,7 @@ public sealed partial class CudaBackend
     /// to true once DeclaredScatterRowsRouteTests passes on the device: the routes are then on by default, like every
     /// other declared family, and AIDOTNET_DECLARED_KERNELS=0 still turns them off.
     /// </summary>
-    internal const bool ScatterRowsDeclaredPromoted = false;
+    internal const bool ScatterRowsDeclaredPromoted = true;
 
     /// <summary>Overrides AIDOTNET_DECLARED_SCATTER_ROWS for this backend (verification tooling and tests).</summary>
     internal bool? DeclaredScatterRowsSwitch { get; set; }
@@ -73,7 +73,7 @@ public sealed partial class CudaBackend
         ClaimDeclaredSlot(key, ref _declaredScatterRowsPrograms, DeclaredScatterRowsProgramCap);
 
     /// <summary>
-    /// ScatterMeanRowsWithCounts through its declared program (#1441): the counts and the means, with no atomic. Off
+    /// ScatterMeanRowsWithCounts through its declared program (#1441): the counts and the means, with no atomic. On
     /// by default (<see cref="ScatterRowsDeclaredPromoted"/>). False -- nothing launched -- when off or declined.
     /// </summary>
     internal bool TryDeclaredScatterMeanRows(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output,
@@ -91,7 +91,7 @@ public sealed partial class CudaBackend
 
     /// <summary>
     /// ScatterSoftmaxRows through its declared program (#1441), within one FP32 ulp of the hand-written kernel (it
-    /// multiplies by the reciprocal sum where that divides). Off by default. False -- nothing launched -- when off or
+    /// multiplies by the reciprocal sum where that divides). On by default. False -- nothing launched -- when off or
     /// declined.
     /// </summary>
     internal bool TryDeclaredScatterSoftmaxRows(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output,

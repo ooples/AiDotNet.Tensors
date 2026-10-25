@@ -226,7 +226,7 @@ public sealed partial class PtxAffineEmitter
         // the reuse -- and must vary along the contiguous one, or there is nothing to
         // stage per column.
         if (ReferencesAxis(spec.Inputs[dataInput], reuseAxis)) return false;
-        if (!ReferencesAxis(spec.Inputs[dataInput], contiguousAxis)) return false;
+        if (!MapReferencesAxis(spec.Inputs[dataInput], contiguousAxis)) return false;
 
         long x = axes[contiguousAxis].Extent / tileFactors[0];
         long y = axes[reuseAxis].Extent / tileFactors[1];
@@ -1004,6 +1004,9 @@ public sealed partial class PtxAffineEmitter
         int last = binding.Map.Count - 1;
         if (last < 0 || binding.Stride(last) != 1) return false;
 
+        // An indirect index that reads the axis gives each of the four elements its own index and range test.
+        if (IndirectReferencesAxis(binding, axis)) return false;
+
         var expr = binding.Map[last];
         if (expr.Terms.Count != 1 || expr.Terms[0].Axis != axis ||
             expr.Terms[0].Coefficient != 1 || expr.Constant != 0 || expr.Divisor != 1)
@@ -1019,7 +1022,7 @@ public sealed partial class PtxAffineEmitter
     /// </summary>
     private string[] EmitVectorLoad(
         CodegenTensorBinding binding, string basePointer, string[] axisReg,
-        int[] reductionValues, int[] reductionAxes, int width)
+        int[] reductionValues, int[] reductionAxes, int width, out string? predicate)
     {
         if (width != VectorWidth)
             throw new InvalidOperationException(
@@ -1081,6 +1084,8 @@ public sealed partial class PtxAffineEmitter
 
         VectorisedLoads++;
         EmittedLoads++;
+        // Only the f32 form is predicated; a guarded narrow binding was refused above.
+        predicate = binding.NeedsConversion ? null : pred;
         return regs;
     }
 
@@ -1357,7 +1362,7 @@ public sealed partial class PtxAffineEmitter
 
                     // Keyed by this dimension only if it varies here and is invariant in
                     // the other -- that invariance is the reuse being exploited.
-                    if (!ReferencesAxis(binding, tileAxis)) continue;
+                    if (!MapReferencesAxis(binding, tileAxis)) continue;
                     if (ReferencesAxis(binding, other)) continue;
 
                     // Every OTHER axis this operand reads is either a reduction axis, which
@@ -1694,7 +1699,7 @@ public sealed partial class PtxAffineEmitter
         // A lane vector's address depends on the reduction values, so it must NOT --
         // sharing one cache let trip 1 reuse trip 0's vector and silently corrupted
         // both 1x1 kernels while their neighbours stayed exact.
-        var reductionVectorCache = new Dictionary<string, string[]>(StringComparer.Ordinal);
+        var reductionVectorCache = new Dictionary<string, (string[] Regs, string? Pred)>(StringComparer.Ordinal);
 
         // Per-thread base for each dimension-keyed slice, hoisted once. The block
         // coordinate is the only runtime term in a staged read, so lifting it here keeps
@@ -1753,7 +1758,7 @@ public sealed partial class PtxAffineEmitter
             // unit-stride in the contiguous axis has its Tw values at consecutive
             // aligned addresses, so those collapse further into one ld.global.v4.f32.
             var scalarCache = new Dictionary<string, (string Value, string? Pred)>(StringComparer.Ordinal);
-            var laneVectorCache = new Dictionary<string, string[]>(StringComparer.Ordinal);
+            var laneVectorCache = new Dictionary<string, (string[] Regs, string? Pred)>(StringComparer.Ordinal);
 
             for (int l = 0; l < lanes; l++)
             {
@@ -1776,15 +1781,19 @@ public sealed partial class PtxAffineEmitter
                         // Key on every referenced tiled axis EXCEPT the contiguous one,
                         // whose Tw positions the vector itself covers.
                         string key = LoadKey(inputIdx, binding, tileAxes, laneOffsets[l], coarsenAxis);
-                        if (!laneVectorCache.TryGetValue(key, out string[]? vec))
+                        // The vector's guard (an indirect row's range test) is the term's predicate too: an expression
+                        // body, pre-bias or pre-reduce has to put the reduction's identity back where it fails.
+                        if (!laneVectorCache.TryGetValue(key, out var vec))
                         {
-                            vec = EmitVectorLoad(binding, basePtr[binding.ParameterIndex],
+                            var regs = EmitVectorLoad(binding, basePtr[binding.ParameterIndex],
                                                  laneAxisReg[BaseLaneFor(l, tileAxes, laneOffsets, coarsenAxis)],
-                                                 reductionValues, reduction, VectorWidth);
+                                                 reductionValues, reduction, VectorWidth, out string? vecPred);
+                            vec = (regs, vecPred);
                             laneVectorCache[key] = vec;
                         }
                         int slot = tileAxes.IndexOf(coarsenAxis);
-                        value = vec[laneOffsets[l][slot]];
+                        value = vec.Regs[laneOffsets[l][slot]];
+                        pred = vec.Pred;
                     }
                     else if (vectorGroup > 1 && innermost >= 0 && vectorisable[inputIdx])
                     {
@@ -1802,13 +1811,16 @@ public sealed partial class PtxAffineEmitter
                         long group = t / vectorGroup;
                         string key = LoadKey(inputIdx, binding, tileAxes, laneOffsets[l], -1) +
                                      "#g" + group.ToString(CultureInfo.InvariantCulture);
-                        if (!reductionVectorCache.TryGetValue(key, out string[]? rvec))
+                        if (!reductionVectorCache.TryGetValue(key, out var rvec))
                         {
-                            rvec = EmitVectorLoad(binding, basePtr[binding.ParameterIndex],
-                                                  laneAxisReg[l], reductionValues, reduction, vectorGroup);
+                            var regs = EmitVectorLoad(binding, basePtr[binding.ParameterIndex],
+                                                  laneAxisReg[l], reductionValues, reduction, vectorGroup,
+                                                  out string? vecPred);
+                            rvec = (regs, vecPred);
                             reductionVectorCache[key] = rvec;
                         }
-                        value = rvec[reductionValues[innermost] % vectorGroup];
+                        value = rvec.Regs[reductionValues[innermost] % vectorGroup];
+                        pred = rvec.Pred;
                     }
                     else if (sharedBase != null && SliceFor(stagedSlices, inputIdx) is { } slice)
                     {
@@ -1929,10 +1941,12 @@ public sealed partial class PtxAffineEmitter
                 // to it, and the pre-reduce transforms it (exp(0) == 1), so each of those has to
                 // put the identity back. Today's declared bodies bind in range, which is why this
                 // is a latent public-spec defect rather than a wrong gradient in the attention,
-                // normalisation or convolution routes.
+                // normalisation or convolution routes. A product with an indirect Skip test needs it
+                // too: there a rejected entry stands for "no term at all" (CSR SpMM's entries of
+                // other rows), and 0 times another operand's infinity is NaN, not 0.
                 if (productPred is not null &&
                     (spec.Body is not null || spec.PreBiasInput.HasValue ||
-                     spec.PreReduce != CodegenPreReduceOp.None))
+                     spec.PreReduce != CodegenPreReduceOp.None || SkipsIndirectInProduct(spec)))
                 {
                     string identity = NextF(), kept = NextF();
                     L($"mov.f32 {identity}, {_outOfRangeFill};");
@@ -2310,13 +2324,38 @@ public sealed partial class PtxAffineEmitter
         return lane;
     }
 
-    /// <summary>True when a binding's index map reads <paramref name="axis"/>.</summary>
-    private static bool ReferencesAxis(CodegenTensorBinding binding, int axis)
+    /// <summary>
+    /// True when the value a binding loads depends on <paramref name="axis"/>: its index map reads it, or an
+    /// indirect index's position or shift does. A deterministic scatter's source reads its destination axis only
+    /// through the shift, and a CSR row's bounds only through the position; counting the map alone keyed every
+    /// lane of a tiled destination to lane 0's load and range test.
+    /// </summary>
+    private static bool ReferencesAxis(CodegenTensorBinding binding, int axis) =>
+        MapReferencesAxis(binding, axis) || IndirectReferencesAxis(binding, axis);
+
+    /// <summary>True when a binding's index map itself reads <paramref name="axis"/>.</summary>
+    private static bool MapReferencesAxis(CodegenTensorBinding binding, int axis)
     {
         if (axis < 0) return false;
         for (int d = 0; d < binding.Map.Count; d++)
             foreach (var term in binding.Map[d].Terms)
                 if (term.Axis == axis) return true;
+        return false;
+    }
+
+    /// <summary>True when an indirect index of the binding reads <paramref name="axis"/> (position or shift).</summary>
+    private static bool IndirectReferencesAxis(CodegenTensorBinding binding, int axis)
+    {
+        if (axis < 0) return false;
+        foreach (var indirect in binding.Indirect)
+        {
+            if (indirect is null) continue;
+            foreach (var term in indirect.Position.Terms)
+                if (term.Axis == axis) return true;
+            if (indirect.Offset is { } shift)
+                foreach (var term in shift.Terms)
+                    if (term.Axis == axis) return true;
+        }
         return false;
     }
 
@@ -2471,7 +2510,8 @@ public sealed partial class PtxAffineEmitter
 
     /// <summary>
     /// Computes one affine dimension's index, contributing its exactness and bounds terms to
-    /// <paramref name="predicate"/>.
+    /// <paramref name="predicate"/>. With <paramref name="bounded"/> false the value is not an address and only the
+    /// exactness term is contributed (an indirect index's shift, which may be any integer).
     /// </summary>
     private string EmitAffineIndex(
         CodegenAffineExpr expr,
@@ -2479,7 +2519,8 @@ public sealed partial class PtxAffineEmitter
         int[] reductionValues,
         HashSet<int> reductionSet,
         int dim,
-        ref string? predicate)
+        ref string? predicate,
+        bool bounded = true)
     {
         // Fold every reduction-axis term into the constant; keep parallel terms symbolic.
         int folded = expr.Constant;
@@ -2545,7 +2586,7 @@ public sealed partial class PtxAffineEmitter
             long span = (long)term.Coefficient * (axesMeta[term.Axis].Extent - 1);
             if (term.Coefficient >= 0) rangeHi += span; else rangeLo += span;
         }
-        bool canEscape = expr.Divisor != 1 || rangeLo < 0 || rangeHi >= dim;
+        bool canEscape = bounded && (expr.Divisor != 1 || rangeLo < 0 || rangeHi >= dim);
         if (!canEscape) ElidedGuards++;
         if (canEscape)
         {
@@ -2635,10 +2676,12 @@ public sealed partial class PtxAffineEmitter
         if (indirect.Offset is { } shift)
         {
             // The deterministic-scatter shift: the range test below then accepts exactly the one destination whose
-            // axis value equals the loaded index, and Skip hands every other the reduction's identity.
+            // axis value equals the loaded index, and Skip hands every other the reduction's identity. The shift is a
+            // value, not an address, so it may be negative (CSR SpMM's p - (nnz - 1)): only an inexact division
+            // rejects it, as in CodegenIndirectIndex.Resolve.
             string? shiftPredicate = null;
             string shifted = EmitAffineIndex(shift, axisReg, reductionValues, reductionSet, int.MaxValue,
-                ref shiftPredicate);
+                ref shiftPredicate, bounded: false);
             string difference = NextR();
             L($"sub.s32 {difference}, {raw}, {shifted};");
             raw = difference;
@@ -2769,6 +2812,16 @@ public sealed partial class PtxAffineEmitter
         L($"add.u32 {rounded}, {bits}, {bias};");
         L($"shr.u32 {result}, {rounded}, 16;");
         return result;
+    }
+
+    // True when a product of more than one operand admits one of them through an indirect Skip range test.
+    private static bool SkipsIndirectInProduct(CodegenKernelSpec spec)
+    {
+        if (spec.ProductInputs.Count < 2) return false;
+        foreach (int inputIdx in spec.ProductInputs)
+            foreach (var indirect in spec.Inputs[inputIdx].Indirect)
+                if (indirect is { OutOfRange: CodegenIndexOutOfRange.Skip }) return true;
+        return false;
     }
 
     private string? AndPred(string? a, string? b)

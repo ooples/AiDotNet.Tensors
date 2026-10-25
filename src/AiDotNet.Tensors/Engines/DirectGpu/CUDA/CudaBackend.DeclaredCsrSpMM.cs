@@ -8,8 +8,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 public sealed partial class CudaBackend
 {
-    // AIDOTNET_DECLARED_CSR_SPMM=1 opts CsrSpMM into the declared route; it is off by default until verified on an
-    // NVIDIA GPU (see CsrSpMMDeclaredPromoted).
+    // AIDOTNET_DECLARED_CSR_SPMM=1 opts CsrSpMM into the declared route while it is unpromoted; it is on by default since
+    // its verification on an NVIDIA GPU (see CsrSpMMDeclaredPromoted).
     private static readonly bool s_declaredCsrSpMMOptIn =
         Environment.GetEnvironmentVariable("AIDOTNET_DECLARED_CSR_SPMM") == "1";
 
@@ -19,7 +19,7 @@ public sealed partial class CudaBackend
     /// call otherwise. Set it to true once DeclaredCsrSpMMRouteTests passes on the device: the route is then on by
     /// default, like every other declared family, and AIDOTNET_DECLARED_KERNELS=0 still turns it off.
     /// </summary>
-    internal const bool CsrSpMMDeclaredPromoted = false;
+    internal const bool CsrSpMMDeclaredPromoted = true;
 
     /// <summary>Overrides AIDOTNET_DECLARED_CSR_SPMM for this backend (verification tooling and tests).</summary>
     internal bool? DeclaredCsrSpMMSwitch { get; set; }
@@ -58,7 +58,7 @@ public sealed partial class CudaBackend
         new(DeclaredFamily.CsrSpMM, rows, cols, n, nnz, 0, 0);
 
     /// <summary>
-    /// CsrSpMM through its declared program (#1441), with no atomic. Off by default
+    /// CsrSpMM through its declared program (#1441), with no atomic. On by default
     /// (<see cref="CsrSpMMDeclaredPromoted"/>). False -- nothing launched -- when off or declined.
     /// </summary>
     internal bool TryDeclaredCsrSpMM(IGpuBuffer values, IGpuBuffer colIndices, IGpuBuffer rowPointers,
