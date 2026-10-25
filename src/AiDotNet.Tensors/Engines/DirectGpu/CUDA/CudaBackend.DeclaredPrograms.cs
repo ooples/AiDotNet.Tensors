@@ -74,6 +74,12 @@ internal enum DeclaredFamily
 
     /// <summary><c>dst[offset + i * stride] = src[i]</c>, in place (#1441).</summary>
     StridedScatter,
+
+    /// <summary>The row-wise scatter mean with its counts (#1441).</summary>
+    ScatterMeanRows,
+
+    /// <summary>The row-wise scatter softmax (#1441).</summary>
+    ScatterSoftmaxRows,
 }
 
 /// <summary>One declared program: its family and shape (unused dimensions are 0).</summary>
@@ -526,6 +532,7 @@ public sealed partial class CudaBackend
         foreach (var program in _declaredPrograms.Values) program?.Dispose();
         _declaredPrograms.Clear();
         _declaredStridedPrograms = 0;
+        _declaredScatterRowsPrograms = 0;
     }
 
     // ---- LayerNorm ------------------------------------------------------------------------------------------------

@@ -237,7 +237,7 @@ public static class CodegenBackendPrograms
     // The three scatter programs share one shape: destinations x features in parallel, the sources reduced, and
     // source i admitted only where indices[i] - d lands in [0, 1).
     private static (CodegenIterationSpace Space, CodegenTensorBinding Indices, CodegenTensorBinding Source)
-        ScatterInversion(int count, int destinations, int features)
+        ScatterInversion(int count, int destinations, int features, string sourceName = "source")
     {
         if (count <= 0 || destinations <= 0 || features <= 0)
             throw new ArgumentOutOfRangeException(nameof(count), "Scatter extents must be positive.");
@@ -246,7 +246,7 @@ public static class CodegenBackendPrograms
             CodegenAxis.Reduce("i", count));
         var indices = new CodegenTensorBinding(0, "indices", new[] { count }, new[] { A(2) },
             elementType: CodegenElementType.Int32);
-        var source = new CodegenTensorBinding(1, "source", new[] { 1, count, features },
+        var source = new CodegenTensorBinding(1, sourceName, new[] { 1, count, features },
             new[] { CodegenAffineExpr.Const(0), A(2), A(1) },
             indirect: new CodegenIndirectIndex?[]
             {
@@ -254,6 +254,132 @@ public static class CodegenBackendPrograms
                 null, null,
             });
         return (space, indices, source);
+    }
+
+    /// <summary>
+    /// The row-wise scatter mean (#1441), in CudaBackend.ScatterMeanRowsWithCounts' contract:
+    /// <c>counts[g] = |{i : indices[i] == g}|</c> and <c>out[g, j] = sum of source[i, j] over those i, times
+    /// 1 / counts[g]</c>, 0 for a group nothing targets. Four passes, with no atomic: a tensor of ones; the counts as
+    /// the scatter inversion of those ones; the sums as the inversion of the source (both summed in increasing i,
+    /// as the hand-written kernel loops); and the mean as the sums times the reciprocal of
+    /// <c>count - notEqual(count, 0) + 1</c>, which is the count itself unless it is 0, when it is 1 -- an empty
+    /// group's sum is exactly 0, so it means 0 without a branch, as the hand-written kernel's <c>count &gt; 0 ? ... :
+    /// 0</c>. <paramref name="notEqualZero"/> is the derived <c>not_equal_scalar</c> (an IEEE unordered comparison:
+    /// NaN differs from everything).
+    /// </summary>
+    public static CodegenProgram ScatterMeanRows(int sourceRows, int innerSize, int outputRows,
+        CodegenLibraryFunction notEqualZero)
+    {
+        if (notEqualZero is null) throw new ArgumentNullException(nameof(notEqualZero));
+        var passes = new List<CodegenKernelSpec>();
+        var temps = new List<long>();
+
+        // ones[i] = a + (1 - a) with a = notEqual(source[i, 0], 0): what the counts sum. A pass needs a value operand
+        // (an index tensor cannot be one); a is exactly 0 or 1 for every x -- NaN and infinities included -- so this is
+        // exactly 1 for every row, where x * 0 + 1 would be NaN for an infinite x.
+        var rowInput = new CodegenTensorBinding(0, "source", new[] { sourceRows, innerSize },
+            new[] { A(0), CodegenAffineExpr.Const(0) });
+        var nonZero = CodegenExpr.Call(notEqualZero, Op(0), CodegenExpr.Constant(0.0));
+        var oneBody = CodegenExpr.Add(nonZero, CodegenExpr.Subtract(CodegenExpr.Constant(1.0), nonZero));
+        passes.Add(new CodegenKernelSpec("scatter_mean_ones", new CodegenIterationSpace(CodegenAxis.Parallel("i", sourceRows)),
+            new[] { rowInput },
+            new CodegenTensorBinding(1, "ones", new[] { 1, sourceRows, 1 },
+                new[] { CodegenAffineExpr.Const(0), A(0), CodegenAffineExpr.Const(0) }, isOutput: true),
+            oneBody.Operands(),
+            CodegenReduceKind.None, body: oneBody));
+        temps.Add(sourceRows);
+
+        var (countSpace, countIndices, ones) = ScatterInversion(sourceRows, outputRows, 1, "ones");
+        passes.Add(new CodegenKernelSpec("scatter_mean_counts", countSpace, new[] { countIndices, ones },
+            new CodegenTensorBinding(2, "counts", new[] { outputRows, 1 }, new[] { A(0), A(1) }, isOutput: true),
+            new[] { 1 }, CodegenReduceKind.Sum));
+
+        var (sumSpace, sumIndices, source) = ScatterInversion(sourceRows, outputRows, innerSize);
+        passes.Add(new CodegenKernelSpec("scatter_mean_sums", sumSpace, new[] { sumIndices, source },
+            new CodegenTensorBinding(2, "sums", new[] { outputRows, innerSize }, new[] { A(0), A(1) }, isOutput: true),
+            new[] { 1 }, CodegenReduceKind.Sum));
+        temps.Add((long)outputRows * innerSize);
+
+        // recip[g] = 1 / (count - notEqual(count, 0) + 1): 1/count, or 1 for an empty group.
+        var clamped = CodegenExpr.Add(
+            CodegenExpr.Subtract(Op(0), CodegenExpr.Call(notEqualZero, Op(0), CodegenExpr.Constant(0.0))),
+            CodegenExpr.Constant(1.0));
+        passes.Add(RowPass("scatter_mean_recip", new[] { outputRows, 1 }, new[] { "counts" }, "recip", clamped,
+            CodegenActivationKind.Reciprocal));
+        temps.Add(outputRows);
+
+        var meanSpace = new CodegenIterationSpace(CodegenAxis.Parallel("g", outputRows), CodegenAxis.Parallel("j", innerSize));
+        passes.Add(new CodegenKernelSpec("scatter_mean_out", meanSpace,
+            new[]
+            {
+                Bind(0, "sums", new[] { outputRows, innerSize }),
+                new CodegenTensorBinding(1, "recip", new[] { outputRows, 1 }, new[] { A(0), CodegenAffineExpr.Const(0) }),
+            },
+            Bind(2, "out", new[] { outputRows, innerSize }, isOutput: true), new[] { 0 }, CodegenReduceKind.None,
+            scaleInput: 1));
+        return new CodegenProgram(passes, temps, "row-wise scatter mean with counts (backend contract)");
+    }
+
+    /// <summary>
+    /// The row-wise scatter softmax (#1441), in CudaBackend.ScatterSoftmaxRows' contract: for each source row i in
+    /// group g = indices[i] and each column j, <c>out[i, j] = exp(source[i, j] - max_g[j]) / sum_g[j]</c>, with the
+    /// maximum and the sum over the rows of g. The maximum is the segment maximum; the reciprocal sum is the scatter
+    /// inversion of <c>exp(source - max)</c>, summed in increasing row as the hand-written kernel loops; each row then
+    /// gathers its group's two by indices[i]. A row whose group lies outside [0, numGroups) gathers zeros and so writes
+    /// 0, as there.
+    /// </summary>
+    /// <remarks>
+    /// The hand-written kernel divides by the sum; the IR multiplies by its reciprocal, so the two can differ by one
+    /// FP32 ulp, as the declared attention softmax does. Both write the same value wherever the sum is exactly a power
+    /// of two.
+    /// </remarks>
+    public static CodegenProgram ScatterSoftmaxRows(int sourceRows, int innerSize, int numGroups)
+    {
+        var passes = new List<CodegenKernelSpec>();
+        var temps = new List<long>();
+        int[] groupShape = { numGroups, innerSize };
+
+        // negmax[g, j] = -max over g's rows (a negated maximum is the bias the exponentials subtract).
+        var (maxSpace, maxIndices, maxSource) = ScatterInversion(sourceRows, numGroups, innerSize);
+        passes.Add(new CodegenKernelSpec("scatter_softmax_negmax", maxSpace, new[] { maxIndices, maxSource },
+            new CodegenTensorBinding(2, "negmax", groupShape, new[] { A(0), A(1) }, isOutput: true),
+            new[] { 1 }, CodegenReduceKind.Max, reduceScale: -1.0));
+        temps.Add((long)numGroups * innerSize);
+
+        // recipsum[g, j] = 1 / sum over g's rows of exp(source - max).
+        var (sumSpace, sumIndices, sumSource) = ScatterInversion(sourceRows, numGroups, innerSize);
+        passes.Add(new CodegenKernelSpec("scatter_softmax_recipsum", sumSpace,
+            new[] { sumIndices, sumSource, Bind(2, "negmax", groupShape) },
+            new CodegenTensorBinding(3, "recipsum", groupShape, new[] { A(0), A(1) }, isOutput: true),
+            new[] { 1 }, CodegenReduceKind.Sum, activation: CodegenActivationKind.Reciprocal,
+            preReduce: CodegenPreReduceOp.Exp, preBiasInput: 2));
+        temps.Add((long)numGroups * innerSize);
+
+        // Each row gathers its group's two statistics by indices[i] (zeros for a group outside [0, numGroups)), so
+        // the normalising pass reads them per row: an indirect index cannot address a pre-reduce bias.
+        int[] rowShape = { sourceRows, innerSize };
+        var rowSpace = new CodegenIterationSpace(CodegenAxis.Parallel("i", sourceRows), CodegenAxis.Parallel("j", innerSize));
+        foreach (string statistic in new[] { "negmax", "recipsum" })
+        {
+            passes.Add(new CodegenKernelSpec("scatter_softmax_gather_" + statistic, rowSpace,
+                new[]
+                {
+                    new CodegenTensorBinding(0, "indices", new[] { sourceRows }, new[] { A(0) },
+                        elementType: CodegenElementType.Int32),
+                    new CodegenTensorBinding(1, statistic, groupShape, new[] { CodegenAffineExpr.Const(0), A(1) },
+                        indirect: new CodegenIndirectIndex?[] { new CodegenIndirectIndex(0, A(0), numGroups), null }),
+                },
+                Bind(2, "row_" + statistic, rowShape, isOutput: true), new[] { 1 }, CodegenReduceKind.None));
+            temps.Add((long)sourceRows * innerSize);
+        }
+
+        // out[i, j] = exp(source[i, j] + row_negmax[i, j]) * row_recipsum[i, j]. A row outside the groups gathered 0
+        // for its reciprocal sum, so it writes 0.
+        passes.Add(new CodegenKernelSpec("scatter_softmax_out", rowSpace,
+            new[] { Bind(0, "source", rowShape), Bind(1, "row_negmax", rowShape), Bind(2, "row_recipsum", rowShape) },
+            Bind(3, "out", rowShape, isOutput: true), new[] { 0 }, CodegenReduceKind.None,
+            scaleInput: 2, preReduce: CodegenPreReduceOp.Exp, preBiasInput: 1));
+        return new CodegenProgram(passes, temps, "row-wise scatter softmax (backend contract)");
     }
 
     /// <summary>

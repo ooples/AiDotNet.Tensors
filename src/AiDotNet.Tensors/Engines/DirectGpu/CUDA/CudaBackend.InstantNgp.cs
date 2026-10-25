@@ -311,14 +311,22 @@ public sealed partial class CudaBackend : IInstantNgpBackend, IFrexpBackend, IRe
 
     public void ScatterMeanRowsWithCounts(
         IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, IGpuBuffer counts,
-        int sourceRows, int innerSize, int outputRows) =>
+        int sourceRows, int innerSize, int outputRows)
+    {
+        // Declared route (#1441), off by default until verified; the hand-written kernel otherwise.
+        if (TryDeclaredScatterMeanRows(source, indices, output, counts, sourceRows, innerSize, outputRows)) return;
         LaunchResidentRows4("resident_scatter_mean_rows_counts", source, indices, output, counts,
             Math.Max(checked(outputRows * innerSize), outputRows), sourceRows, innerSize, outputRows);
+    }
 
     public void ScatterSoftmaxRows(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output,
-        int sourceRows, int innerSize, int numGroups) =>
+        int sourceRows, int innerSize, int numGroups)
+    {
+        // Declared route (#1441), off by default until verified; the hand-written kernel otherwise.
+        if (TryDeclaredScatterSoftmaxRows(source, indices, output, sourceRows, innerSize, numGroups)) return;
         LaunchResidentRows3("resident_scatter_softmax_rows", source, indices, output,
             checked(sourceRows * innerSize), sourceRows, innerSize, numGroups);
+    }
 
     public void ScatterAddBackwardRows(
         IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradSource,
