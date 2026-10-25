@@ -116,7 +116,7 @@ public static class SassScheduler
     private sealed record Timing(int GuardPredicateLatency, int MaxStall, IReadOnlyDictionary<string, int> IssueStalls,
         IReadOnlyDictionary<string, (string Pipe, int Cycles)> Pipes, int UniformEarlyWriteAfterRead = 0,
         IReadOnlyDictionary<string, int>? Latencies = null, IReadOnlyDictionary<string, string>? LatencyClasses = null,
-        int SameClassLatency = 0, int CrossClassLatency = 0, bool RegionsKeepLoads = false, int MmaSourceReadCycles = 0);
+        int SameClassLatency = 0, int CrossClassLatency = 0, int R2urToVectorUniformRead = 0, bool RegionsKeepLoads = false, int MmaSourceReadCycles = 0);
 
     private static readonly Dictionary<string, string> s_ampereLatencyClasses = new()
     {
@@ -148,7 +148,7 @@ public static class SassScheduler
     {
         [75] = new(12, 12, new Dictionary<string, int> { ["BMOV"] = 11, ["BAR"] = 5 }, s_noPipes),
         [86] = new(13, 13, new Dictionary<string, int> { ["BMOV"] = 11, ["BAR"] = 6, ["DEPBAR"] = 4, ["LDGDEPBAR"] = 4, ["BSSY"] = 12 },
-            s_ampere, 3, new Dictionary<string, int> { ["P2R"] = 6, ["IMAD.WIDE"] = 5, ["I2FP"] = 5 }, s_ampereLatencyClasses, 4, 5,
+            s_ampere, 3, new Dictionary<string, int> { ["P2R"] = 6, ["IMAD.WIDE"] = 5, ["I2FP"] = 5 }, s_ampereLatencyClasses, 4, 5, R2urToVectorUniformRead: 5,
             RegionsKeepLoads: true, MmaSourceReadCycles: 7),
     };
 
@@ -254,6 +254,7 @@ public static class SassScheduler
             var predicateWrittenAt = new Dictionary<int, long>();   // predicate key -> cycle of the compare
             var pipeFreeAt = new Dictionary<string, (long Ready, long Produced)>();   // pipe -> next issue cycle allowed
             var uniformReadAt = new Dictionary<int, long>();
+            long r2urAt = long.MinValue / 2;   // issue cycle of the last R2UR
             // An HMMA reads its A, B and C registers several cycles after it issues, and nothing interlocks a later
             // write to them: register -> the cycle it may be overwritten from (MmaSourceReadCycles after the HMMA).
             var mmaReadUntil = new Dictionary<int, long>();   // uniform register key -> latest uniform-pipe reader's cycle
@@ -432,7 +433,14 @@ public static class SassScheduler
                     if (e.ReadsAllPredicates)
                         foreach (var pair in readyAt) if (pair.Key >= PredicateKey && pair.Key < UniformPredicateKey) Need(pair.Value.Ready, pair.Value.Produced);
                     if (pipe.Pipe is not null && pipeFreeAt.TryGetValue(pipe.Pipe, out var free)) Need(free.Ready, free.Produced);
-                    if (e.Mnemonic is "UMOV" or "ULDC")
+                    // sm_86: a vector instruction reading any uniform register issues 5 cycles after an R2UR (to any
+                    // register): an I2F reading UR13 2-4 cycles after R2UR UR5 read a wrong value on the RTX 3080, 5 ran
+                    // (ptxas leaves 6). Uniform-pipe readers are not affected (ptxas issues a UIADD3 1 cycle on).
+                    if (timing.R2urToVectorUniformRead > 0 && !e.UniformPredicates && reads.Exists(r => r >= UniformRegisterKey))
+                        Need(r2urAt + timing.R2urToVectorUniformRead, r2urAt);
+                    // R2UR and S2UR write their uniform register early too: an R2UR UR5 one cycle after a USEL reading UR5 made
+                    // an FP32 GEMM's results wrong on the RTX 3080 (ptxas leaves 3).
+                    if (e.Mnemonic is "UMOV" or "ULDC" or "R2UR" or "S2UR")
                         foreach (int r in writes) if (uniformReadAt.TryGetValue(r, out long read)) Need(read + timing.UniformEarlyWriteAfterRead, read);
                 }
                 if (ready > cycle)
@@ -474,6 +482,7 @@ public static class SassScheduler
                     mmaReadUntil.Clear();
                 }
                 if (pipe.Pipe is not null) pipeFreeAt[pipe.Pipe] = (cycle + pipe.Cycles, cycle);
+                if (e.Mnemonic == "R2UR") r2urAt = cycle;
                 if (timing.MmaSourceReadCycles > 0 && e.Mnemonic == "HMMA")
                     foreach (int r in reads) mmaReadUntil[r] = cycle + timing.MmaSourceReadCycles;
                 if (timing.UniformEarlyWriteAfterRead > 0 && pipe.Pipe == "uniform")
@@ -505,7 +514,8 @@ public static class SassScheduler
                         pendingComplete[readBoard] = Math.Max(pendingComplete[readBoard], readReleased);
                         scoreboardSetAt[readBoard] = cycle;
                         // Or-ed: an earlier reader of the register, on another scoreboard, may still be pending.
-                        foreach (int r in reads) pendingRead[r] = (pendingRead.TryGetValue(r, out int m) ? m : 0) | 1 << readBoard;
+                        foreach (int r in reads)
+                            if (r < UniformRegisterKey) pendingRead[r] = (pendingRead.TryGetValue(r, out int m) ? m : 0) | 1 << readBoard;
                     }
                 }
                 else if (e.Latency == SassLatency.Fixed)
@@ -555,6 +565,10 @@ public static class SassScheduler
             {
                 var control = result[i].Control;
                 if (control.Reuse != 0 && control.Stall > originalStall[i]) result[i].Control = control with { Reuse = 0 };
+                // A stall of 12 or more is encoded only with the yield bit clear: ptxas never sets both (0 of 13,000+
+                // control words), and nvdisasm rejects the combination as an undefined value. Keeping ptxas's yield on an
+                // instruction whose stall grew to 12 produced such words, and one of them faulted a reordered kernel.
+                if (result[i].Control is { Stall: >= 12, Yield: true } raised) result[i].Control = raised with { Yield = false };
             }
             if (spreadPastPrevious)
             {
@@ -765,7 +779,8 @@ public static class SassScheduler
         {
             if (effects[i].Latency != SassLatency.Variable) continue;
             var writes = new HashSet<int>(Registers(code[i], effects[i].Writes));
-            var reads = new HashSet<int>(Registers(code[i], effects[i].Reads));
+            // Vector sources only: a uniform operand is read at issue (see VectorSources).
+            var reads = new HashSet<int>(VectorSources(code[i], effects[i]));
             long use = -1, overwrite = -1;
             int j = i + 1;
             for (; j < code.Count && (use < 0 || overwrite < 0); j++)
@@ -812,7 +827,7 @@ public static class SassScheduler
             if (effects[i].Latency != SassLatency.Variable) continue;
             int earliest = i;
             foreach (var loop in loops) if (loop.Start <= i && i <= loop.End && loop.Start < earliest) earliest = loop.Start;
-            foreach (int r in Registers(code[i], effects[i].Reads))
+            foreach (int r in VectorSources(code[i], effects[i]))
                 if (writers.TryGetValue(r, out var list) && list.Exists(w => w != i && (w > i || w >= earliest)))
                 {
                     result[i] = true;
@@ -821,6 +836,11 @@ public static class SassScheduler
         }
         return result;
     }
+
+    // The sources a variable-latency instruction's read scoreboard covers: its vector registers. A uniform operand (an
+    // LDS/STS offset) is read at issue: ptxas overwrites one with a UMOV right after the LDS reading it, without a wait.
+    private static IEnumerable<int> VectorSources(in SassInstruction instruction, SassEffects effects) =>
+        Registers(instruction, effects.Reads).Where(r => r < UniformRegisterKey);
 
     private static List<int> Registers(in SassInstruction instruction, IReadOnlyList<SassRegisterOperand> operands)
     {

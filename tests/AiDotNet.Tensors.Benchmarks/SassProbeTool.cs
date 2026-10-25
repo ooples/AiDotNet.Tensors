@@ -50,7 +50,8 @@ internal static class SassProbeTool
     {
         if (pass is null) throw new ArgumentNullException(nameof(pass));
         bool known = pass is "control" or "stall" or "sb" or "max" or "noreuse" or "ptxasreuse" or "plus" or "plusalu"
-                or "plusvar" or "pluscontrol" or "plus1" or "keepcontrol" or "upto"
+                or "plusvar" or "pluscontrol" or "plus1" or "keepcontrol" or "upto" or "none" or "reorder" or "list"
+            || (pass.StartsWith("list+", StringComparison.Ordinal) && pass.Length > 5) || pass.StartsWith("except:", StringComparison.Ordinal) || pass.StartsWith("stall:", StringComparison.Ordinal) || pass.StartsWith("waitall:", StringComparison.Ordinal) || pass.StartsWith("swap:", StringComparison.Ordinal)
             || (pass.StartsWith("keep:", StringComparison.Ordinal) && pass.Length > 5)
             || pass.StartsWith("mix:", StringComparison.Ordinal)
             || (pass.StartsWith("maxnreg:", StringComparison.Ordinal)
@@ -114,7 +115,9 @@ internal static class SassProbeTool
                 byte[] Rewrite(byte[] image)
                 {
                     if (Value(args, "--save") is { } savePath) System.IO.File.WriteAllBytes(savePath, image);
-                    return ApplyPass(image, major * 10 + minor, pass, upto, Array.IndexOf(args, "--dump") >= 0 && dumped++ == 0, out registers, out decline);
+                    var rewritten = ApplyPass(image, major * 10 + minor, pass, upto, Array.IndexOf(args, "--dump") >= 0 && dumped++ == 0, out registers, out decline);
+                    if (Array.IndexOf(args, "--save-rewritten") is int sr && sr >= 0) System.IO.File.WriteAllBytes(args[sr + 1], rewritten);
+                    return rewritten;
                 }
                 using var ptxModule = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
                 // maxnreg:N -- the PTX path capped at N registers by ptxas itself: what occupancy alone buys.
@@ -141,6 +144,21 @@ internal static class SassProbeTool
 
     // Rewrites every kernel of a cubin under one pass. The default is the scheduler's control words; the others mix
     // them with ptxas's per instruction, to bisect a fault or a mismatch to the rule that causes it.
+    // swap:<a>,<b>[;<c>,<d>...]: the instructions at those positions exchanged (hazard hunting; the caller vouches for independence).
+    private static SassInstruction[] Swapped(SassInstruction[] code, string spec)
+    {
+        foreach (var pair in spec.Split(';'))
+        {
+            var ab = pair.Split(',');
+            int a = int.Parse(ab[0], CultureInfo.InvariantCulture), b = int.Parse(ab[1], CultureInfo.InvariantCulture);
+            (code[a], code[b]) = (code[b], code[a]);
+            code[a].Control = code[a].Control with { Reuse = 0 };
+            code[b].Control = code[b].Control with { Reuse = 0 };
+            if (Math.Min(a, b) > 0) code[Math.Min(a, b) - 1].Control = code[Math.Min(a, b) - 1].Control with { Reuse = 0 };
+        }
+        return code;
+    }
+
     private static byte[] ApplyPass(byte[] image, int architecture, string pass, int upto, bool dump, out int registers, out string? decline)
     {
         var cubin = new SassCubin(image);
@@ -151,7 +169,11 @@ internal static class SassProbeTool
         foreach (string kernel in cubin.Kernels)
         {
             // reorder: SassFfmaReorder (operand reuse and register banks), then the scheduler's control words.
-            var source = pass == "reorder" ? SassFfmaReorder.Reorder(cubin.Instructions(kernel)) : cubin.Instructions(kernel);
+            var source = pass == "reorder" ? SassFfmaReorder.Reorder(cubin.Instructions(kernel))
+                : pass.StartsWith("list", StringComparison.Ordinal)
+                    ? SassListScheduler.Reorder(cubin.Instructions(kernel)) ?? cubin.Instructions(kernel)
+                : pass.StartsWith("swap:", StringComparison.Ordinal) ? Swapped(cubin.Instructions(kernel), pass.Substring(5).Split('|')[0])
+                : cubin.Instructions(kernel);
             if (pass == "reorder")
                 Console.WriteLine("  FFMA same-bank file reads: ptxas " + SassFfmaReorder.BankConflicts(cubin.Instructions(kernel)) +
                     ", reordered " + SassFfmaReorder.BankConflicts(source));
@@ -161,11 +183,13 @@ internal static class SassProbeTool
                 decline = "declined: " + SassScheduler.LastDecline;
                 return image;
             }
-            var ptxasCode = cubin.Instructions(kernel);
+            // After a reorder the reference control word of position i is the one ptxas gave the instruction now there.
+            var ptxasCode = pass.StartsWith("list", StringComparison.Ordinal) || pass.StartsWith("swap:", StringComparison.Ordinal) ? source.ToArray() : cubin.Instructions(kernel);
+            string mode = pass.StartsWith("list+", StringComparison.Ordinal) ? pass.Substring(5) : pass.StartsWith("swap:", StringComparison.Ordinal) ? (pass.Contains('|') ? pass.Substring(pass.IndexOf('|') + 1) : "control") : pass;
             for (int i = 0; i < code.Length; i++)
             {
                 var o = ptxasCode[i].Control; var n = code[i].Control;
-                code[i].Control = pass switch
+                code[i].Control = mode switch
                 {
                     "stall" => o with { Stall = n.Stall },                    // our stalls, ptxas scoreboards
                     "sb" => n with { Stall = o.Stall },                       // our scoreboards, ptxas stalls
@@ -183,6 +207,12 @@ internal static class SassProbeTool
                     _ when pass.StartsWith("keep:", StringComparison.Ordinal) => SassOpcodeTable.Decode(ptxasCode[i])?.Mnemonic == pass.Substring(5) ? n with { Stall = Math.Max(n.Stall, o.Stall) } : n,
                     "keepcontrol" => SassOpcodeTable.Decode(ptxasCode[i])?.Latency == SassLatency.Control ? n with { Stall = Math.Max(n.Stall, o.Stall) } : n,
                     "upto" => i < upto ? n : n with { Stall = Math.Max(n.Stall, o.Stall) },
+                    // except:<i>[,<j>...]: ours, with ptxas's longer stall kept at the listed positions only (hazard hunting)
+                    // stall:<i>=<n>[,<j>=<m>...]: ours, with those positions' stalls set exactly (reuse dropped there)
+                    _ when mode.StartsWith("stall:", StringComparison.Ordinal) && mode.Substring(6).Split(',').Select(t => t.Split('=')).FirstOrDefault(t => t[0] == i.ToString(CultureInfo.InvariantCulture)) is { } set => n with { Stall = int.Parse(set[1], CultureInfo.InvariantCulture), Reuse = 0 },
+                    // waitall:<i>[,<j>...]: ours, with those positions waiting on every scoreboard (but the cp.async one)
+                    _ when mode.StartsWith("waitall:", StringComparison.Ordinal) && Array.IndexOf(mode.Substring(8).Split(','), i.ToString(CultureInfo.InvariantCulture)) >= 0 => n with { WaitMask = 0x3f & ~(1 << 7) },
+                    _ when mode.StartsWith("except:", StringComparison.Ordinal) => Array.IndexOf(mode.Substring(7).Split(','), i.ToString(CultureInfo.InvariantCulture)) >= 0 ? n with { Stall = Math.Max(n.Stall, o.Stall) } : n,
                     // mix:<fields>: ours, with ptxas's S(tall) and/or U (reuse flags); the scoreboards stay ours
                     _ when pass.StartsWith("mix:", StringComparison.Ordinal) => n with
                     {
@@ -194,7 +224,7 @@ internal static class SassProbeTool
             }
             if (dump)
             {
-                var original = cubin.Instructions(kernel);
+                var original = ptxasCode;
                 for (int i = 0; i < original.Length; i++)
                 {
                     var o = original[i].Control; var n = code[i].Control;

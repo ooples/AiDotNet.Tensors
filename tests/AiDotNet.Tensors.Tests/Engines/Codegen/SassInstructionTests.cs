@@ -718,4 +718,61 @@ public class SassInstructionTests
             ?? throw new InvalidOperationException(SassScheduler.LastDecline);
         Assert.True(pipe[0].Control.Stall >= 8, "the second HMMA issued " + pipe[0].Control.Stall + " cycles after the first");
     }
+
+    /// <summary>
+    /// A stall of 12 or more is encoded only with the yield bit clear: ptxas never sets both, nvdisasm rejects the
+    /// combination as undefined, and keeping ptxas's yield on an instruction whose stall grew to 12 faulted a kernel.
+    /// </summary>
+    [Fact]
+    public void ALongStallClearsTheYieldBit()
+    {
+        var isetp = IsetpP5;
+        isetp.Control = isetp.Control with { Yield = true, Stall = 1 };
+        var scheduled = SassScheduler.RecomputeControl(new[] { isetp, LdgstsP5, Exit }, 86)
+            ?? throw new InvalidOperationException(SassScheduler.LastDecline);
+        Assert.True(scheduled[0].Control.Stall >= 12);
+        Assert.False(scheduled[0].Control.Yield, "stall " + scheduled[0].Control.Stall + " encoded with the yield bit set");
+        Assert.All(scheduled, i => Assert.False(i.Control.Stall >= 12 && i.Control.Yield));
+    }
+
+    // Shared memory with uniform-register offsets (sm_86 driver cubins, RTX 3080).
+    private static readonly SassInstruction LdsUr5 = new(0x000000055b207984UL, 0x002fe2000800cc00UL);   // LDS.128 R32, [R91.X16+UR5]
+    private static readonly SassInstruction LdsNoUr = new(0x0001000062247984UL, 0x000fe2000000cc00UL);  // LDS.128 R36, [R98.X16+0x100]
+    private static readonly SassInstruction StsUr9 = new(0x0000000424007988UL, 0x000fe20008004809UL);   // STS [R36.X4+UR9], R4
+
+    /// <summary>
+    /// LDS and STS with a uniform-register offset read that register: bit 91 marks the form, the register sits at bits
+    /// 32 (LDS) or 64 (STS). Missing it let a reordered LDS run ahead of the UIMAD writing its offset.
+    /// </summary>
+    [Fact]
+    public void SharedMemoryReadsItsUniformOffset()
+    {
+        var lds = SassOpcodeTable.Decode(LdsUr5) ?? throw new InvalidOperationException("LDS unknown");
+        Assert.Contains(lds.Reads, o => o.Uniform && o.Field == SassInstruction.RbField && LdsUr5.UniformRegister(o.Field) == 5);
+        Assert.DoesNotContain((SassOpcodeTable.Decode(LdsNoUr) ?? throw new InvalidOperationException()).Reads, o => o.Uniform);
+        var sts = SassOpcodeTable.Decode(StsUr9) ?? throw new InvalidOperationException("STS unknown");
+        Assert.Contains(sts.Reads, o => o.Uniform && o.Field == SassInstruction.RcField && StsUr9.UniformRegister(o.Field) == 9);
+        Assert.Contains(sts.Reads, o => !o.Uniform && o.Field == SassInstruction.RbField);   // the data register
+    }
+
+    // An FP32 GEMM's uniform setup (sm_86 driver cubin, RTX 3080).
+    private static readonly SassInstruction UselUr13 = new(0x00000008050d7887UL, 0x000fc60009000000UL);   // USEL UR13, UR5, 0x8, UP2
+    private static readonly SassInstruction R2urUr5 = new(0x00000000040573c2UL, 0x002e6200000e0000UL);    // R2UR UR5, R4
+    private static readonly SassInstruction I2fUr13 = new(0x0000000d00027d06UL, 0x000eb00008209000UL);    // I2F.U32.RP R2, UR13
+
+    /// <summary>
+    /// sm_86 R2UR rules: it writes its uniform register early, so it issues 3 cycles after a uniform-pipe reader of that
+    /// register (1 cycle after a USEL reading UR5 made a GEMM wrong); and a vector instruction reading any uniform
+    /// register issues 5 cycles after it (an I2F reading UR13 2-4 cycles after R2UR UR5 read a wrong value).
+    /// </summary>
+    [Fact]
+    public void AnR2urHoldsUniformReaders()
+    {
+        var war = SassScheduler.RecomputeControl(new[] { UselUr13, R2urUr5, Exit }, 86)
+            ?? throw new InvalidOperationException(SassScheduler.LastDecline);
+        Assert.True(war[0].Control.Stall >= 3, "R2UR issued " + war[0].Control.Stall + " cycles after the USEL reading UR5");
+        var read = SassScheduler.RecomputeControl(new[] { UselUr13, R2urUr5, I2fUr13, Exit }, 86)
+            ?? throw new InvalidOperationException(SassScheduler.LastDecline);
+        Assert.True(read[1].Control.Stall >= 5, "I2F read a uniform register " + read[1].Control.Stall + " cycles after the R2UR");
+    }
 }
