@@ -460,7 +460,11 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // directly, not through this storage, so nothing privatizes a shared clone first and the clone would change
         // under its owner. A clone taken to keep an arena result past the arena's next step (#653: a predictor copying
         // its output out of its inference arena) must own its data.
-        if (GetLiveBackingArrayOrNull() is { } backing && Helpers.TensorArena.IsArenaIssued(backing))
+        // The identity accessor, not the marking one: this asks only WHICH array backs the storage, never reads
+        // through it. GetLiveBackingArrayOrNull marks the array escaped before IsArenaIssued can say "not an
+        // arena", so for a tracked non-arena result the buffer could no longer return to the thread cache on
+        // disposal -- repeated clones lost that reuse while still taking the copy-on-write path below.
+        if (GetLiveBackingArrayIdentityOrNull() is { } backing && Helpers.TensorArena.IsArenaIssued(backing))
             return CloneDeepCopy();
 
         // Share the same TensorStorage (the ctor AddRefs it); flag both sides as COW sharers so the
