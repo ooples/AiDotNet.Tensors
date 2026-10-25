@@ -126,6 +126,13 @@ internal static class DirectPtxArchitecture
         (major, minor) == (8, 6);
 
     /// <summary>
+    /// The capsule-squash specialization (#833) targets GA10x/SM86, the architecture every other checked-in family is
+    /// measured on. It is not yet measured there: dispatch also requires the capsule gate and promotion.
+    /// </summary>
+    internal static bool HasValidatedCapsuleSquash(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
     /// The checked-in embedding-gather specialization is measured only on
     /// GA102/SM86. Admitting the whole Ampere family would run PTX that was
     /// never validated on SM80/SM87, so this pins the exact pair.

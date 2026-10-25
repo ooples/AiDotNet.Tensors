@@ -159,13 +159,16 @@ public static class CudaToPtxTransferLedger
 
         // --- Triaged anomalies: the 4 census kernels that mapped to no epic
         // #833 child during the full 888-kernel cross-reference. Recorded so the
-        // tracker's disposition of every kernel is explicit.
+        // tracker's disposition of every kernel is explicit. (fused_ddim_step was
+        // later ported under #849, above.)
         new CudaToPtxEntry("resident_mode", "(none)", PtxTransferStatus.NotPlanned,
             "GPU-residency infra/utility kernel, not a compute op; excluded from the PTX transfer."),
-        new CudaToPtxEntry("squash", "(none)", PtxTransferStatus.NotPlanned,
-            "capsule-network squash activation; reassigned to #839 (pointwise/activation) scope — no standalone transfer entry."),
-        new CudaToPtxEntry("squash_backward", "(none)", PtxTransferStatus.NotPlanned,
-            "squash activation backward; reassigned to #839 (pointwise/activation) scope."),
+        // Reassigned to #839, which closed without porting them, so they had no PTX at all.
+        new CudaToPtxEntry("squash", "PtxFusedSquashF32Kernel", PtxTransferStatus.PtxInProgress,
+            "#833: exact (capsules,width) buckets (1152,8) (9216,8) (1280,16) (10240,16), eps 1e-8, FP64 accumulation " +
+            "with the CUDA source's contractions; routed, fail-closed until DirectPtxFeatureGate.CapsuleSquashPromoted."),
+        new CudaToPtxEntry("squash_backward", "PtxFusedSquashF32Kernel", PtxTransferStatus.PtxInProgress,
+            "#833: the exact vector-Jacobian product over the same buckets; routed, fail-closed until promoted."),
     };
 
     public static IEnumerable<CudaToPtxEntry> NotPlanned =>

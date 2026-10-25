@@ -4170,6 +4170,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (lastIdx >= src.Size) throw new ArgumentOutOfRangeException(nameof(count), $"Strided gather would access index {lastIdx} but source size is {src.Size}.");
         if (count > dst.Size) throw new ArgumentOutOfRangeException(nameof(count), $"Count ({count}) exceeds destination size ({dst.Size}).");
 
+        // Declared route (#1441), off by default until verified; the hand-written kernel below otherwise.
+        if (TryDeclaredStridedGather(src, dst, offset, stride, count)) return;
         if (!_kernelCache.TryGetValue("strided_gather", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: strided_gather. Register the kernel or use CPU fallback.");
 
@@ -4198,6 +4200,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (lastIdx >= dst.Size) throw new ArgumentOutOfRangeException(nameof(count), $"Strided scatter would access index {lastIdx} but destination size is {dst.Size}.");
         if (count > src.Size) throw new ArgumentOutOfRangeException(nameof(count), $"Count ({count}) exceeds source size ({src.Size}).");
 
+        // Declared route (#1441), off by default until verified; the hand-written kernel below otherwise.
+        if (TryDeclaredStridedScatter(src, dst, offset, stride, count)) return;
         if (!_kernelCache.TryGetValue("strided_scatter", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: strided_scatter. Register the kernel or use CPU fallback.");
 
@@ -4303,6 +4307,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public unsafe void Squash(IGpuBuffer input, IGpuBuffer output, int numCapsules, int capsuleDim, float epsilon)
     {
+        // Fail-closed direct-PTX path (#833); returns false until the capsule family is promoted.
+        if (TryDirectPtxSquash(input, output, numCapsules, capsuleDim, epsilon)) return;
         if (!_kernelCache.TryGetValue("squash", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: squash");
 
@@ -4324,6 +4330,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public unsafe void SquashBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int numCapsules, int capsuleDim, float epsilon)
     {
+        // Fail-closed direct-PTX path (#833); returns false until the capsule family is promoted.
+        if (TryDirectPtxSquashBackward(gradOutput, input, gradInput, numCapsules, capsuleDim, epsilon)) return;
         if (!_kernelCache.TryGetValue("squash_backward", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: squash_backward");
 

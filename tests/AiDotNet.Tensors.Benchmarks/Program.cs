@@ -27,6 +27,25 @@ class Program
             return;
         }
 
+        // GPU-free cubin generation, verification and SASS audit for the capsule-squash family (#833).
+        if (args.Length > 0 && args[0] == "--generate-direct-ptx-capsule-cubins")
+        {
+            Environment.ExitCode = DirectPtxCapsuleCubinTool.Generate(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--verify-direct-ptx-capsule-cubins")
+        {
+            Environment.ExitCode = DirectPtxCapsuleCubinTool.Verify(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-capsule-sass")
+        {
+            Environment.ExitCode = DirectPtxCapsuleCubinTool.AuditSass(args);
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--generate-direct-ptx-spectral-cubins")
         {
             Environment.ExitCode = DirectPtxSpectralCubinTool.Generate(args);
@@ -1490,6 +1509,12 @@ class Program
             return;
         }
 
+        if (args[0] == "--squash-strided-promotion-gate")
+        {
+            Environment.ExitCode = SquashStridedPromotionGate.Run();
+            return;
+        }
+
         // Per-call cost of the Vulkan ops with an optional operand when it is left out (max pooling without indices)
         if (args[0] == "--vulkan-optional-binding")
         {
@@ -2272,6 +2297,7 @@ class Program
         Console.WriteLine("  --webgpu-tuned-profile [out.json] [rounds] : Tune the WebGPU kernel registry on Dawn and export a profile");
         Console.WriteLine("  --vulkan-meshgrid2d : Time the Vulkan fused Meshgrid2D route against the composed route");
         Console.WriteLine("  --metal-meshgrid2d : Time the Metal fused Meshgrid2D route against the composed route (macOS)");
+        Console.WriteLine("  --squash-strided-promotion-gate : #833 squash PTX and #1441 declared strided routes vs NVRTC (CUDA)");
         Console.WriteLine("  --fused-basic-block : Time the #1353 persistent fused ResNet basic block against the unfused route (CUDA)");
         Console.WriteLine("  --webgpu-meshgrid2d-dawn : Time WebGPU's fused Meshgrid2D against the composed route on Dawn");
         Console.WriteLine("  --metal    : Run Metal backend diagnostics (macOS/Apple Silicon)");

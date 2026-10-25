@@ -310,6 +310,53 @@ public static class CodegenBackendPrograms
     }
 
     /// <summary>
+    /// <c>dst[i] = src[offset + i * stride]</c> for i in [0, count): CudaBackend.StridedGather's contract (#1441). The
+    /// read is affine, so it needs no index tensor; the caller has checked that the last element read is inside src.
+    /// </summary>
+    public static CodegenProgram StridedGather(int count, int sourceLength, int offset, int stride)
+    {
+        ValidateStrided(count, sourceLength, offset, stride, "source");
+        var space = new CodegenIterationSpace(CodegenAxis.Parallel("i", count));
+        var source = new CodegenTensorBinding(0, "src", new[] { sourceLength }, new[] { Strided(offset, stride) });
+        var output = new CodegenTensorBinding(1, "dst", new[] { count }, new[] { A(0) }, isOutput: true);
+        var pass = new CodegenKernelSpec("strided_gather", space, new[] { source }, output, new[] { 0 },
+            CodegenReduceKind.None);
+        return new CodegenProgram(new[] { pass }, Array.Empty<long>(), "strided_gather (backend contract)");
+    }
+
+    /// <summary>
+    /// <c>dst[offset + i * stride] = src[i]</c> for i in [0, count): CudaBackend.StridedScatter's contract (#1441). The
+    /// write is affine and injective (stride &gt; 0), so each written cell has one owner and no atomic is needed, and the
+    /// cells between the strided ones are not written: the caller's destination keeps them, as with the hand-written
+    /// kernel. (The interpreter's output starts at zero, so there they read 0.)
+    /// </summary>
+    public static CodegenProgram StridedScatter(int count, int destinationLength, int offset, int stride)
+    {
+        ValidateStrided(count, destinationLength, offset, stride, "destination");
+        var space = new CodegenIterationSpace(CodegenAxis.Parallel("i", count));
+        var source = new CodegenTensorBinding(0, "src", new[] { count }, new[] { A(0) });
+        var output = new CodegenTensorBinding(1, "dst", new[] { destinationLength }, new[] { Strided(offset, stride) },
+            isOutput: true);
+        var pass = new CodegenKernelSpec("strided_scatter", space, new[] { source }, output, new[] { 0 },
+            CodegenReduceKind.None);
+        return new CodegenProgram(new[] { pass }, Array.Empty<long>(), "strided_scatter (backend contract)");
+    }
+
+    private static CodegenAffineExpr Strided(int offset, int stride) =>
+        new(new[] { new CodegenAffineTerm(0, stride) }, offset);
+
+    private static void ValidateStrided(int count, int length, int offset, int stride, string side)
+    {
+        if (count <= 0 || length <= 0)
+            throw new ArgumentOutOfRangeException(nameof(count), "Strided extents must be positive.");
+        if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset));
+        if (stride <= 0) throw new ArgumentOutOfRangeException(nameof(stride));
+        if (offset + (long)(count - 1) * stride >= length)
+            throw new ArgumentOutOfRangeException(nameof(count),
+                "The last strided element lies past the " + side + " (" + length + " elements).");
+    }
+
+    /// <summary>
     /// <c>out[o, j, i] = source[o, indices[j], i]</c>: indices int32 [indexAxis], source [outer, sourceAxis, inner],
     /// out [outer, indexAxis, inner] -- CudaBackend.IndexSelect's contract. An index outside [0, sourceAxis) yields
     /// zeros, which resident_index_select now bounds to as well.

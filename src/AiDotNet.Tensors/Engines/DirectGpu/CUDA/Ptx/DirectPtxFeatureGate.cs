@@ -36,6 +36,7 @@ internal static class DirectPtxFeatureGate
     internal const string QuantizedLinearEnvironmentVariable = "AIDOTNET_DIRECT_PTX_QUANTIZED_LINEAR";
     internal const string ReductionEnvironmentVariable = "AIDOTNET_DIRECT_PTX_REDUCTION";
     internal const string GatherEnvironmentVariable = "AIDOTNET_DIRECT_PTX_GATHER";
+    internal const string CapsuleEnvironmentVariable = "AIDOTNET_DIRECT_PTX_CAPSULE";
     internal const string Cholesky4x4EnvironmentVariable = "AIDOTNET_DIRECT_PTX_CHOLESKY_4X4";
     internal const string LuFactor4x4EnvironmentVariable = "AIDOTNET_DIRECT_PTX_LU_FACTOR_4X4";
     internal const string Qr4x4EnvironmentVariable = "AIDOTNET_DIRECT_PTX_QR_4X4";
@@ -68,6 +69,7 @@ internal static class DirectPtxFeatureGate
     private static readonly bool EnvironmentPagedPrefillEnabled = ReadEnabled(PagedPrefillEnvironmentVariable);
     private static readonly bool EnvironmentReductionEnabled = ReadEnabled(ReductionEnvironmentVariable);
     private static readonly bool EnvironmentGatherEnabled = ReadEnabled(GatherEnvironmentVariable);
+    private static readonly bool EnvironmentCapsuleEnabled = ReadEnabled(CapsuleEnvironmentVariable);
     private static readonly bool EnvironmentCholesky4x4Enabled = ReadEnabled(Cholesky4x4EnvironmentVariable);
     private static readonly bool EnvironmentLuFactor4x4Enabled = ReadEnabled(LuFactor4x4EnvironmentVariable);
     private static readonly bool EnvironmentQr4x4Enabled = ReadEnabled(Qr4x4EnvironmentVariable);
@@ -285,6 +287,33 @@ internal static class DirectPtxFeatureGate
         (EnvironmentMasterEnabled || EnvironmentReductionEnabled);
     internal static bool IsGatherEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentGatherEnabled);
+
+    /// <summary>
+    /// Whether the capsule-squash direct-PTX specialization (#833) has been verified on an NVIDIA GPU. While false the
+    /// family runs only with <see cref="CapsuleEnvironmentVariable"/> (or the master switch) set AND
+    /// <see cref="CapsuleExperimentOverride"/>; CUDA's NVRTC squash kernels serve every call otherwise. Set it to true
+    /// once the verification in PtxFusedSquashF32Kernel's tests and experiment passes: every supported shape is then
+    /// promoted, and the family is on by default with no environment variable.
+    /// </summary>
+    internal const bool CapsuleSquashPromoted = false;
+
+    /// <summary>The capsule-squash family's switch: on by default once promoted, otherwise opt-in.</summary>
+    internal static bool IsCapsuleEnabled => TestOverride ??
+        (CapsuleSquashPromoted || EnvironmentMasterEnabled || EnvironmentCapsuleEnabled);
+
+    [ThreadStatic]
+    private static bool s_capsuleExperimentOverride;
+
+    /// <summary>
+    /// Lets the unpromoted capsule-squash shapes dispatch, for verification and benchmarking. Thread-local, like the
+    /// SGD-momentum and global-average-pool overrides: a process-global flag would admit the unpromoted route in
+    /// unrelated concurrent dispatches and make test results order-dependent.
+    /// </summary>
+    internal static bool CapsuleExperimentOverride
+    {
+        get => s_capsuleExperimentOverride;
+        set => s_capsuleExperimentOverride = value;
+    }
 
     internal static bool IsPagedDecodeEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentPagedDecodeEnabled);

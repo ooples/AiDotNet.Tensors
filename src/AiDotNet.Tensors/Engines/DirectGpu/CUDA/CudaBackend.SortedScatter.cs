@@ -241,6 +241,94 @@ public sealed partial class CudaBackend
             maximum ? s_buildSegmentMax : s_buildSegmentMin, s_scatterAddNames,
             new DeclaredBindings(segmentIds, source, output));
 
+    // AIDOTNET_DECLARED_STRIDED=1 opts the strided gather/scatter into the declared route; it is off by default until
+    // the programs are verified on an NVIDIA GPU (see StridedDeclaredPromoted).
+    private static readonly bool s_declaredStridedOptIn =
+        Environment.GetEnvironmentVariable("AIDOTNET_DECLARED_STRIDED") == "1";
+
+    /// <summary>
+    /// Whether the declared strided gather and scatter (#1441) have been verified on an NVIDIA GPU. While false they
+    /// run only with AIDOTNET_DECLARED_STRIDED=1 (or <see cref="DeclaredStridedSwitch"/>); the hand-written
+    /// strided_gather / strided_scatter kernels serve every call otherwise. Set it to true once
+    /// CodegenStridedGatherScatterTests' driver comparison passes: the route is then on by default, like every other
+    /// declared family, and AIDOTNET_DECLARED_KERNELS=0 still turns it off.
+    /// </summary>
+    internal const bool StridedDeclaredPromoted = false;
+
+    /// <summary>Overrides AIDOTNET_DECLARED_STRIDED for this backend (verification tooling and tests).</summary>
+    internal bool? DeclaredStridedSwitch { get; set; }
+
+    private bool DeclaredStridedEnabled => DeclaredStridedSwitch ?? (StridedDeclaredPromoted || s_declaredStridedOptIn);
+
+    // Below this many elements the declared call's bookkeeping costs more than the launch it replaces, as Embedding's.
+    private const int DeclaredStridedMinElements = 16384;
+
+    // The offset and count are baked into each program, so a workload that varies them would build and keep one module
+    // per tuple. Past this many strided programs, a new shape keeps the hand-written kernel; shapes already built run on.
+    internal const int DeclaredStridedProgramCap = 32;
+
+    private int _declaredStridedPrograms;
+
+    // Whether a strided key may run through the declared route: one already built, or a new one within the cap (which
+    // it then claims). Under the program lock, so concurrent new shapes cannot both take the last slot.
+    private bool AdmitStridedKey(DeclaredKey key)
+    {
+        lock (_directPtxLock)
+        {
+            if (_declaredPrograms.ContainsKey(key)) return true;
+            if (_declaredStridedPrograms >= DeclaredStridedProgramCap) return false;
+            _declaredStridedPrograms++;
+            return true;
+        }
+    }
+
+    private static readonly string[] s_stridedNames = { "src", "dst" };
+
+    private static readonly Func<DeclaredKey, CodegenProgram> s_buildStridedGather =
+        key => CodegenBackendPrograms.StridedGather(key.D0, key.D1, key.D2, key.D3);
+
+    private static readonly Func<DeclaredKey, CodegenProgram> s_buildStridedScatter =
+        key => CodegenBackendPrograms.StridedScatter(key.D0, key.D1, key.D2, key.D3);
+
+    /// <summary>The key of a strided gather or scatter: count, the strided tensor's length, offset, stride.</summary>
+    internal static DeclaredKey StridedKey(DeclaredFamily family, int count, int length, int offset, int stride) =>
+        new(family, count, length, offset, stride, 0, 0);
+
+    /// <summary>
+    /// StridedGather through its declared program (#1441). Off by default (<see cref="StridedDeclaredPromoted"/>);
+    /// below the size at which the declared call's bookkeeping costs more than the launch it replaces, it keeps the
+    /// hand-written kernel, as Embedding does. False -- nothing launched -- when off or the shape declines.
+    /// </summary>
+    internal bool TryDeclaredStridedGather(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
+    {
+        if (!DeclaredStridedEnabled || count < DeclaredStridedMinElements) return false;
+        var key = StridedKey(DeclaredFamily.StridedGather, count, src.Size, offset, stride);
+        return AdmitStridedKey(key) &&
+            TryRunDeclaredProgram(key, s_buildStridedGather, s_stridedNames, new DeclaredBindings(src, dst));
+    }
+
+    /// <summary>
+    /// StridedScatter through its declared program (#1441): it writes only the strided cells, so the destination keeps
+    /// the rest, as with the hand-written kernel. Off by default; the same size floor as the gather.
+    /// </summary>
+    internal bool TryDeclaredStridedScatter(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
+    {
+        if (!DeclaredStridedEnabled || count < DeclaredStridedMinElements) return false;
+        var key = StridedKey(DeclaredFamily.StridedScatter, count, dst.Size, offset, stride);
+        return AdmitStridedKey(key) &&
+            TryRunDeclaredProgram(key, s_buildStridedScatter, s_stridedNames, new DeclaredBindings(src, dst));
+    }
+
+    /// <summary>The strided gather as a resident-program stage.</summary>
+    internal DeclaredResidentStage StridedGatherStage(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count) =>
+        new(StridedKey(DeclaredFamily.StridedGather, count, src.Size, offset, stride), s_buildStridedGather,
+            s_stridedNames, new DeclaredBindings(src, dst));
+
+    /// <summary>The strided scatter as a resident-program stage.</summary>
+    internal DeclaredResidentStage StridedScatterStage(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count) =>
+        new(StridedKey(DeclaredFamily.StridedScatter, count, dst.Size, offset, stride), s_buildStridedScatter,
+            s_stridedNames, new DeclaredBindings(src, dst));
+
     private static readonly string[] s_indexSelectNames = { "indices", "source", "out" };
 
     private static readonly Func<DeclaredKey, CodegenProgram> s_buildIndexSelect =

@@ -13,10 +13,16 @@ namespace AiDotNet.Tensors.Benchmarks;
 /// #921: times Metal's fused two-vector Meshgrid2D (one <c>bx_meshgrid2d</c> dispatch writes both grids, taken by
 /// <see cref="DirectGpuTensorEngine.TensorMeshgrid{T}(Tensor{T}[], string)"/>) against the composed route it replaced,
 /// a reshape then a broadcast per grid, through the same engine so both sides pay the same allocation and dispatch
-/// overheads. Paired host timing; a shape counts as promoted only on a stable speedup of at least 1.10x, and an
-/// unstable comparison is reported as unstable rather than as a number. Exit 0 = every cell promoted, 1 = some cell
-/// did not clear the gate, 2 = no Metal device.
+/// overheads. A shape is promoted only when the 95% confidence interval of the median paired speedup lies wholly at or
+/// above 1.10x, kept composed when it lies wholly below, and reported as undecided otherwise. Exit 0 = every cell
+/// promoted, 1 = some cell did not clear the gate, 2 = no Metal device.
 /// </summary>
+/// <remarks>
+/// The hosted runner's GPU is virtualized: its timings swing 8-70%, so the three-sample spread gate never converged and
+/// every cell was "no verdict" although each run's median was 1.34-1.73x. The verdict now comes from
+/// <see cref="StableTimer.MeasurePairedRatioBound"/>, a distribution-free interval over 41 AB/BA brackets, which noise
+/// widens but does not bias.
+/// </remarks>
 internal static class MetalMeshgrid2DExperiment
 {
     private const double PromotionSpeedup = 1.10;
@@ -48,7 +54,7 @@ internal static class MetalMeshgrid2DExperiment
 
             var engine = new DirectGpuTensorEngine(new DirectGpuEngine(backend));
             Console.WriteLine("Metal Meshgrid2D fused vs composed on " + backend.DeviceName);
-            Console.WriteLine("shape        mode  composed       fused          speedup  spread  verdict");
+            Console.WriteLine("shape        mode  median   95% interval        verdict");
             bool allPromoted = true;
             foreach (var (n0, n1) in new[] { (256, 256), (1024, 256) })
                 foreach (string indexing in new[] { "ij", "xy" })
@@ -73,14 +79,16 @@ internal static class MetalMeshgrid2DExperiment
                         grids[0].Dispose();
                         grids[1].Dispose();
                     }
-                    var pair = StableTimer.MeasureCalibratedHostPair(Composed, backend.Synchronize, Fused, backend.Synchronize);
-                    bool promoted = pair.Stable && pair.Ratio >= PromotionSpeedup;
+                    // Ratio = composed / fused: above 1 means the fused route is faster.
+                    var bound = StableTimer.MeasurePairedRatioBound(Composed, backend.Synchronize, Fused, backend.Synchronize);
+                    bool promoted = bound.Lower >= PromotionSpeedup;
+                    bool rejected = bound.Upper < PromotionSpeedup;
                     allPromoted &= promoted;
-                    Console.WriteLine(string.Format(CultureInfo.InvariantCulture, "{0,-12} {1,-5} {2,-14} {3,-14} {4,-8} {5,-7} {6}",
-                        n0 + "x" + n1, indexing, pair.A.Describe(), pair.B.Describe(),
-                        pair.Ratio.ToString("0.00", CultureInfo.InvariantCulture) + "x",
-                        (pair.RelativeSpread * 100).ToString("0.0", CultureInfo.InvariantCulture) + "%",
-                        !pair.Stable ? "UNSTABLE (no verdict)" : promoted ? "promote" : "keep composed"));
+                    Console.WriteLine(string.Format(CultureInfo.InvariantCulture, "{0,-12} {1,-5} {2,-8} [{3:0.00}x, {4:0.00}x]    {5}",
+                        n0 + "x" + n1, indexing, bound.Median.ToString("0.00", CultureInfo.InvariantCulture) + "x",
+                        bound.Lower, bound.Upper,
+                        promoted ? "promote" : rejected ? "keep composed" : "undecided (interval spans " +
+                            PromotionSpeedup.ToString("0.00", CultureInfo.InvariantCulture) + "x)"));
                 }
             return allPromoted ? 0 : 1;
         }
