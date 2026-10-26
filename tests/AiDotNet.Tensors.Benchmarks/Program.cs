@@ -248,6 +248,11 @@ class Program
             DirectPtxFusedLinearExperiment.Run(runs);
             return;
         }
+        if (args.Length > 0 && args[0] == "--ptx-campaign")
+        {
+            DirectPtxDenseLinearFullExperiment.RunPtxCampaign(args);
+            return;
+        }
         if (args.Length > 0 && args[0] == "--direct-ptx-dense-linear-full")
         {
             int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
