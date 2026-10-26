@@ -13258,7 +13258,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     public unsafe void ScatterAddBackward(IGpuBuffer gradDestination, IGpuBuffer indices, IGpuBuffer gradSource,
         int numIndices, int featureSize)
     {
-        // ScatterAddBackward is essentially a Gather operation
+        // ScatterAddBackward is essentially a Gather operation: the embedding's declared gather (#1441).
+        if (featureSize > 0 &&
+            TryDeclaredRowGather(indices, gradDestination, gradSource, numIndices, featureSize, gradDestination.Size / featureSize))
+            return;
         if (!_kernelCache.TryGetValue("embedding_forward", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: embedding_forward");
 
@@ -13426,6 +13429,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     }
     public unsafe void IndexWrite(IGpuBuffer output, IGpuBuffer indices, IGpuBuffer source, float fillValue, int mode, int outerSize, int idxAxis, int innerSize, int dstAxis)
     {
+        // Declared route (#1441): the same last-index-wins write.
+        if (TryDeclaredIndexWrite(output, indices, source, copy: mode == 0, fillValue, outerSize, idxAxis, innerSize, dstAxis))
+            return;
         var kernel = ResolveParity210Kernel("parity210_index_write");
         using var _ = PushContext();
         int __total = outerSize*dstAxis*innerSize; if (__total <= 0) return;
@@ -13726,6 +13732,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     }
     public unsafe void ScatterReduce(IGpuBuffer output, IGpuBuffer source, IGpuBuffer index, int outerSize, int srcDim, int dstDim, int innerSize, int mode)
     {
+        // Declared route (#1441): deterministic sum, maximum and minimum; the product keeps the kernel below.
+        if (TryDeclaredScatterReduce(output, source, index, outerSize, srcDim, dstDim, innerSize, mode)) return;
         var kernel = ResolveParity210Kernel("parity210_scatter_reduce");
         using var _ = PushContext();
         int __total = outerSize*srcDim*innerSize; if (__total <= 0) return;
@@ -19784,6 +19792,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public unsafe void IndexSelect(IGpuBuffer input, IGpuBuffer indices, IGpuBuffer output, int numIndices, int innerSize)
     {
+        // Declared route (#1441): the float-id row gather.
+        if (TryDeclaredRowGatherFloatIds(indices, input, output, numIndices, innerSize)) return;
         if (!_kernelCache.TryGetValue("index_select", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: index_select");
         using var _ = PushContext();

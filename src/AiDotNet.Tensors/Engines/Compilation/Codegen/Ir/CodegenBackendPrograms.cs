@@ -185,15 +185,30 @@ public static partial class CodegenBackendPrograms
     /// <c>out[t, e] = table[ids[t], e]</c>: ids int32 [tokens], table [vocabulary, width]. An id outside
     /// [0, vocabulary) yields a zero row (the hand-written kernel read outside the table).
     /// </summary>
-    public static CodegenProgram Embedding(int tokens, int vocabulary, int width)
+    public static CodegenProgram Embedding(int tokens, int vocabulary, int width) =>
+        Embedding(tokens, vocabulary, width, floatIndices: false);
+
+    /// <summary>
+    /// <see cref="Embedding(int, int, int)"/> with float32 ids truncated toward zero, in CudaBackend.IndexSelect's
+    /// (index_select) contract (#1441); an id outside the table yields a zero row where index_select read outside it.
+    /// </summary>
+    public static CodegenProgram EmbeddingFloatIds(int tokens, int vocabulary, int width) =>
+        Embedding(tokens, vocabulary, width, floatIndices: true);
+
+    private static CodegenProgram Embedding(int tokens, int vocabulary, int width, bool floatIndices)
     {
         if (tokens <= 0 || vocabulary <= 0 || width <= 0)
             throw new ArgumentOutOfRangeException(nameof(tokens), "Embedding extents must be positive.");
         var space = new CodegenIterationSpace(CodegenAxis.Parallel("t", tokens), CodegenAxis.Parallel("e", width));
-        var ids = new CodegenTensorBinding(0, "ids", new[] { tokens }, new[] { A(0) }, elementType: CodegenElementType.Int32);
+        var ids = new CodegenTensorBinding(0, "ids", new[] { tokens }, new[] { A(0) },
+            elementType: floatIndices ? CodegenElementType.Float32 : CodegenElementType.Int32);
         var table = new CodegenTensorBinding(1, "table", new[] { vocabulary, width },
             new[] { CodegenAffineExpr.Const(0), A(1) },
-            indirect: new CodegenIndirectIndex?[] { new CodegenIndirectIndex(0, A(0), vocabulary), null });
+            indirect: new CodegenIndirectIndex?[]
+            {
+                new CodegenIndirectIndex(0, A(0), vocabulary, CodegenIndexOutOfRange.Skip, floatIndices: floatIndices),
+                null,
+            });
         var output = new CodegenTensorBinding(2, "out", new[] { tokens, width }, new[] { A(0), A(1) }, isOutput: true);
         var pass = new CodegenKernelSpec("embedding", space, new[] { ids, table }, output, new[] { 1 }, CodegenReduceKind.None);
         return new CodegenProgram(new[] { pass }, Array.Empty<long>(), "embedding (backend contract)");
@@ -620,13 +635,24 @@ public static partial class CodegenBackendPrograms
     /// toward zero, as the hand-written kernel's <c>(int)</c>), input [outer, axisIn, inner], out [outer, axisOut,
     /// inner] -- CudaBackend.TakeAlongDim's contract. An index outside [0, axisIn) yields 0, as there.
     /// </summary>
-    public static CodegenProgram TakeAlongDim(int outer, int axisOut, int inner, int axisIn)
+    public static CodegenProgram TakeAlongDim(int outer, int axisOut, int inner, int axisIn) =>
+        TakeAlongDim(outer, axisOut, inner, axisIn, floatIndices: true);
+
+    /// <summary>
+    /// <see cref="TakeAlongDim(int, int, int, int)"/> with int32 indices, in CudaBackend.Parity210TakeAlongDim's
+    /// contract (#1441): an index outside [0, axisIn) yields 0, as there.
+    /// </summary>
+    public static CodegenProgram TakeAlongDimInt(int outer, int axisOut, int inner, int axisIn) =>
+        TakeAlongDim(outer, axisOut, inner, axisIn, floatIndices: false);
+
+    private static CodegenProgram TakeAlongDim(int outer, int axisOut, int inner, int axisIn, bool floatIndices)
     {
         if (outer <= 0 || axisOut <= 0 || inner <= 0 || axisIn <= 0)
             throw new ArgumentOutOfRangeException(nameof(outer), "TakeAlongDim extents must be positive.");
         var space = new CodegenIterationSpace(CodegenAxis.Parallel("o", outer), CodegenAxis.Parallel("j", axisOut),
             CodegenAxis.Parallel("i", inner));
-        var indices = new CodegenTensorBinding(0, "indices", new[] { outer, axisOut, inner }, new[] { A(0), A(1), A(2) });
+        var indices = new CodegenTensorBinding(0, "indices", new[] { outer, axisOut, inner }, new[] { A(0), A(1), A(2) },
+            elementType: floatIndices ? CodegenElementType.Float32 : CodegenElementType.Int32);
         // The position of an index within the flat indices tensor: (o * axisOut + j) * inner + i.
         var position = new CodegenAffineExpr(new[]
         {
@@ -636,7 +662,7 @@ public static partial class CodegenBackendPrograms
             new[] { A(0), CodegenAffineExpr.Const(0), A(2) },
             indirect: new CodegenIndirectIndex?[]
             {
-                null, new CodegenIndirectIndex(0, position, axisIn, floatIndices: true), null,
+                null, new CodegenIndirectIndex(0, position, axisIn, floatIndices: floatIndices), null,
             });
         var output = new CodegenTensorBinding(2, "out", new[] { outer, axisOut, inner }, new[] { A(0), A(1), A(2) },
             isOutput: true);

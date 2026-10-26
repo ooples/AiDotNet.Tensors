@@ -439,6 +439,203 @@ public static partial class CodegenBackendPrograms
             });
 
     /// <summary>
+    /// The deterministic index write (#1441), in CudaBackend.IndexWrite's contract (parity210_index_write): for each
+    /// destination slice t, the LAST j with <c>indices[j] == t</c> writes <c>out[o, t, i] = source[o, j, i]</c>
+    /// (<paramref name="copy"/>) or <paramref name="fillValue"/>; a slice no index names keeps its value. The caller
+    /// binds <c>seed</c> and <c>out</c> to the same buffer, as an in-place write means. The same program serves
+    /// Parity210IndexCopy and Parity210IndexFill, whose duplicate indices race in the hand-written kernels; here the
+    /// last one wins, as IndexWrite's does.
+    /// </summary>
+    /// <remarks>
+    /// The last match is a maximum: <c>iota[j] = j</c> (a sum of ones over j' &lt; j, the condition an affine read that
+    /// leaves the tensor otherwise), maximised over the matching j with its argmax, -1 when none. The final pass
+    /// selects through <paramref name="select"/> (the derived where_select) on <c>argmax + 1</c>, which is 0 exactly
+    /// when no index matched, so an untouched slice keeps its seed bit for bit.
+    /// </remarks>
+    public static CodegenProgram IndexWrite(int outer, int indexLength, int inner, int destinationAxis, bool copy,
+        float fillValue, CodegenLibraryFunction notEqualZero, CodegenLibraryFunction select)
+    {
+        if (outer <= 0 || indexLength <= 0 || inner <= 0 || destinationAxis <= 0)
+            throw new ArgumentOutOfRangeException(nameof(outer), "Index write extents must be positive.");
+        if (notEqualZero is null) throw new ArgumentNullException(nameof(notEqualZero));
+        if (select is null) throw new ArgumentNullException(nameof(select));
+        var passes = new List<CodegenKernelSpec>();
+        var temps = new List<long>();
+
+        // one[0] = a + (1 - a), a = notEqual(seed[0], 0): exactly 1.
+        var nonZero = CodegenExpr.Call(notEqualZero, Op(0), CodegenExpr.Constant(0.0));
+        var oneBody = CodegenExpr.Add(nonZero, CodegenExpr.Subtract(CodegenExpr.Constant(1.0), nonZero));
+        long cells = (long)outer * destinationAxis * inner;
+        passes.Add(new CodegenKernelSpec("index_write_one", new CodegenIterationSpace(CodegenAxis.Parallel("u", 1)),
+            new[] { new CodegenTensorBinding(0, "seed", new[] { checked((int)cells) }, new[] { A(0) }) },
+            Bind(1, "one", new[] { 1 }, isOutput: true), oneBody.Operands(), CodegenReduceKind.None, body: oneBody));
+        temps.Add(1);
+
+        // ones_j[j] = one[0].
+        passes.Add(new CodegenKernelSpec("index_write_ones", new CodegenIterationSpace(CodegenAxis.Parallel("j", indexLength)),
+            new[] { new CodegenTensorBinding(0, "one", new[] { 1 }, new[] { CodegenAffineExpr.Const(0) }) },
+            Bind(1, "ones_j", new[] { indexLength }, isOutput: true), new[] { 0 }, CodegenReduceKind.None));
+        temps.Add(indexLength);
+
+        // iota[j] = sum over j' of ones_j[j - j' - 1], which is in range exactly for j' < j.
+        passes.Add(new CodegenKernelSpec("index_write_iota",
+            new CodegenIterationSpace(CodegenAxis.Parallel("j", indexLength), CodegenAxis.Reduce("k", indexLength)),
+            new[]
+            {
+                new CodegenTensorBinding(0, "ones_j", new[] { indexLength },
+                    new[] { new CodegenAffineExpr(new[] { new CodegenAffineTerm(0, 1), new CodegenAffineTerm(1, -1) }, -1) }),
+            },
+            Bind(1, "iota", new[] { indexLength }, isOutput: true), new[] { 0 }, CodegenReduceKind.Sum));
+        temps.Add(indexLength);
+
+        // last[t] = the largest j with indices[j] == t, -1 when none (an argmax over the matching iota).
+        var lastSpace = new CodegenIterationSpace(CodegenAxis.Parallel("t", destinationAxis), CodegenAxis.Reduce("j", indexLength));
+        var lastIota = new CodegenTensorBinding(1, "iota", new[] { 1, indexLength }, new[] { CodegenAffineExpr.Const(0), A(1) },
+            indirect: new CodegenIndirectIndex?[]
+            {
+                new CodegenIndirectIndex(0, A(1), 1, CodegenIndexOutOfRange.Skip, floatIndices: false, offset: A(0)), null,
+            });
+        passes.Add(new CodegenKernelSpec("index_write_last", lastSpace,
+            new[]
+            {
+                new CodegenTensorBinding(0, "indices", new[] { indexLength }, new[] { A(1) }, elementType: CodegenElementType.Int32),
+                lastIota,
+            },
+            Bind(2, "last_value", new[] { destinationAxis }, isOutput: true), new[] { 1 }, CodegenReduceKind.Max,
+            extraOutputs: new[]
+            {
+                new CodegenExtraOutput(Bind(3, "last", new[] { destinationAxis }, isOutput: true),
+                    CodegenExtraOutputKind.ArgMaxIndex, A(1), NoWinnerIndex: -1, IndexAsFloat: true),
+            }));
+        temps.Add(destinationAxis);
+        temps.Add(destinationAxis);
+
+        // out[o, t, i] = select(last[t] + 1, written, seed[o, t, i]).
+        var space = new CodegenIterationSpace(CodegenAxis.Parallel("o", outer), CodegenAxis.Parallel("t", destinationAxis),
+            CodegenAxis.Parallel("i", inner));
+        int[] shape = { outer, destinationAxis, inner };
+        var inputs = new List<CodegenTensorBinding>
+        {
+            new CodegenTensorBinding(0, "seed", shape, new[] { A(0), A(1), A(2) }),
+            new CodegenTensorBinding(1, "last", new[] { destinationAxis }, new[] { A(1) }),
+        };
+        CodegenExpr written;
+        if (copy)
+        {
+            // source[o, last[t], i]; clamped rather than skipped, since an unmatched slice selects its seed anyway. last
+            // is bound a second time as that index's source: one binding cannot be both an index and an operand.
+            inputs.Add(new CodegenTensorBinding(2, "last", new[] { destinationAxis }, new[] { A(1) }));
+            inputs.Add(new CodegenTensorBinding(3, "source", new[] { outer, indexLength, inner },
+                new[] { A(0), CodegenAffineExpr.Const(0), A(2) },
+                indirect: new CodegenIndirectIndex?[]
+                {
+                    null, new CodegenIndirectIndex(2, A(1), indexLength, CodegenIndexOutOfRange.Clamp, floatIndices: true), null,
+                }));
+            written = Op(3);
+        }
+        else
+        {
+            written = CodegenExpr.Constant(fillValue);
+        }
+        var body = CodegenExpr.Call(select, CodegenExpr.Add(Op(1), CodegenExpr.Constant(1.0)), written, Op(0));
+        passes.Add(new CodegenKernelSpec(copy ? "index_write_copy" : "index_write_fill", space, inputs.ToArray(),
+            new CodegenTensorBinding(inputs.Count, "out", shape, new[] { A(0), A(1), A(2) }, isOutput: true),
+            body.Operands(), CodegenReduceKind.None, body: body));
+        return new CodegenProgram(passes, temps, "deterministic index write (backend contract)");
+    }
+
+    /// <summary>
+    /// The deterministic index add (#1441), in CudaBackend.Parity210IndexAdd's contract: <c>out[o, t, i] +=
+    /// sum over the j with indices[j] == t of source[o, j, i]</c>, in increasing j, with no atomic. The caller binds
+    /// <c>seed</c> and <c>out</c> to the same buffer; an index outside [0, destinationAxis) adds nowhere.
+    /// </summary>
+    public static CodegenProgram IndexAdd(int outer, int destinationAxis, int inner, int indexLength)
+    {
+        if (outer <= 0 || destinationAxis <= 0 || inner <= 0 || indexLength <= 0)
+            throw new ArgumentOutOfRangeException(nameof(outer), "Index add extents must be positive.");
+        var space = new CodegenIterationSpace(CodegenAxis.Parallel("o", outer), CodegenAxis.Parallel("t", destinationAxis),
+            CodegenAxis.Parallel("i", inner), CodegenAxis.Reduce("j", indexLength));
+        int[] shape = { outer, destinationAxis, inner };
+        var pass = new CodegenKernelSpec("index_add", space,
+            new[]
+            {
+                new CodegenTensorBinding(0, "indices", new[] { indexLength }, new[] { A(3) }, elementType: CodegenElementType.Int32),
+                new CodegenTensorBinding(1, "source", new[] { outer, 1, indexLength, inner },
+                    new[] { A(0), CodegenAffineExpr.Const(0), A(3), A(2) },
+                    indirect: new CodegenIndirectIndex?[]
+                    {
+                        null,
+                        new CodegenIndirectIndex(0, A(3), 1, CodegenIndexOutOfRange.Skip, floatIndices: false, offset: A(1)),
+                        null, null,
+                    }),
+                new CodegenTensorBinding(2, "seed", shape, new[] { A(0), A(1), A(2) }),
+            },
+            new CodegenTensorBinding(3, "out", shape, new[] { A(0), A(1), A(2) }, isOutput: true),
+            new[] { 1 }, CodegenReduceKind.Sum, biasInput: 2);
+        return new CodegenProgram(new[] { pass }, Array.Empty<long>(), "deterministic index add (backend contract)");
+    }
+
+    /// <summary>
+    /// The deterministic scatter reduction (#1441), in CudaBackend.ScatterReduce's contract for its sum (mode 0),
+    /// maximum (2) and minimum (3): <c>out[o, t, i] = seed op (every source[o, s, i] with index[o, s, i] == t)</c>, the
+    /// sum in increasing s, an index outside [0, dstDim) contributing nowhere. The caller binds <c>seed</c> and
+    /// <c>out</c> to the same buffer. The maximum and minimum reduce the matches first (a NaN never wins, as fmaxf)
+    /// and fold the seed in through <paramref name="extreme"/> (the derived max_vectors or min_vectors).
+    /// </summary>
+    public static CodegenProgram ScatterReduce(int outer, int sourceDim, int destinationDim, int inner, int mode,
+        CodegenLibraryFunction? extreme)
+    {
+        if (outer <= 0 || sourceDim <= 0 || destinationDim <= 0 || inner <= 0)
+            throw new ArgumentOutOfRangeException(nameof(outer), "Scatter reduce extents must be positive.");
+        if (mode is not (0 or 2 or 3))
+            throw new NotSupportedException("Scatter reduce mode " + mode + " (a product) has no declared reduction.");
+        if (mode != 0 && extreme is null) throw new ArgumentNullException(nameof(extreme));
+        var space = new CodegenIterationSpace(CodegenAxis.Parallel("o", outer), CodegenAxis.Parallel("t", destinationDim),
+            CodegenAxis.Parallel("i", inner), CodegenAxis.Reduce("s", sourceDim));
+        int[] shape = { outer, destinationDim, inner };
+        // index[o, s, i] sits at (o * sourceDim + s) * inner + i.
+        var position = new CodegenAffineExpr(new[]
+        {
+            new CodegenAffineTerm(0, sourceDim * inner), new CodegenAffineTerm(3, inner), new CodegenAffineTerm(2, 1),
+        }, 0);
+        var index = new CodegenTensorBinding(0, "index", new[] { outer * sourceDim * inner }, new[] { position },
+            elementType: CodegenElementType.Int32);
+        var source = new CodegenTensorBinding(1, "source", new[] { outer, 1, sourceDim, inner },
+            new[] { A(0), CodegenAffineExpr.Const(0), A(3), A(2) },
+            indirect: new CodegenIndirectIndex?[]
+            {
+                null,
+                new CodegenIndirectIndex(0, position, 1, CodegenIndexOutOfRange.Skip, floatIndices: false, offset: A(1)),
+                null, null,
+            });
+        var seed = new CodegenTensorBinding(2, "seed", shape, new[] { A(0), A(1), A(2) });
+        if (mode == 0)
+        {
+            var sum = new CodegenKernelSpec("scatter_reduce_sum", space, new[] { index, source, seed },
+                new CodegenTensorBinding(3, "out", shape, new[] { A(0), A(1), A(2) }, isOutput: true),
+                new[] { 1 }, CodegenReduceKind.Sum, biasInput: 2);
+            return new CodegenProgram(new[] { sum }, Array.Empty<long>(), "deterministic scatter reduce sum (backend contract)");
+        }
+
+        bool minimum = mode == 3;
+        var matches = minimum
+            ? new CodegenKernelSpec("scatter_reduce_min_matches", space, new[] { index, source },
+                new CodegenTensorBinding(2, "matches", shape, new[] { A(0), A(1), A(2) }, isOutput: true),
+                new[] { 1 }, CodegenReduceKind.Max, reduceScale: -1.0, body: CodegenExpr.Negate(Op(1)))
+            : new CodegenKernelSpec("scatter_reduce_max_matches", space, new[] { index, source },
+                new CodegenTensorBinding(2, "matches", shape, new[] { A(0), A(1), A(2) }, isOutput: true),
+                new[] { 1 }, CodegenReduceKind.Max);
+        var fold = CodegenExpr.Call(extreme!, Op(0), Op(1));
+        var cellSpace = new CodegenIterationSpace(CodegenAxis.Parallel("o", outer), CodegenAxis.Parallel("t", destinationDim),
+            CodegenAxis.Parallel("i", inner));
+        var combine = new CodegenKernelSpec(minimum ? "scatter_reduce_min" : "scatter_reduce_max", cellSpace,
+            new[] { Bind(0, "seed", shape), Bind(1, "matches", shape) }, Bind(2, "out", shape, isOutput: true),
+            fold.Operands(), CodegenReduceKind.None, body: fold);
+        return new CodegenProgram(new[] { matches, combine }, new long[] { outer * (long)destinationDim * inner },
+            minimum ? "deterministic scatter reduce min (backend contract)" : "deterministic scatter reduce max (backend contract)");
+    }
+
+    /// <summary>
     /// The activation-layout scatter mean (#1441), in CudaBackend.ScatterMean's contract: <c>counts[g]</c> (int32) is
     /// the number of source rows with indices[i] == g, and <c>output[g, f]</c> their sum divided by the count, or the
     /// (zero) sum for an empty group -- scatter_mean_divide's <c>if (cnt &gt; 0) output /= cnt</c>. The sums run in

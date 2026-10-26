@@ -116,6 +116,21 @@ internal enum DeclaredFamily
 
     /// <summary>The CSR segmented standard deviation over float-encoded indices (#1441).</summary>
     CsrSegmentedStdDev,
+
+    /// <summary>The deterministic index write, copy and fill, the last index winning (#1441).</summary>
+    IndexWrite,
+
+    /// <summary>The deterministic index add onto the destination (#1441).</summary>
+    IndexAdd,
+
+    /// <summary>The deterministic scatter reduction's sum, maximum and minimum (#1441).</summary>
+    ScatterReduce,
+
+    /// <summary>Take-along-dim with int32 indices (#1441).</summary>
+    TakeAlongDimInt,
+
+    /// <summary>A row gather by float32 ids (#1441).</summary>
+    EmbeddingFloatIds,
 }
 
 /// <summary>One declared program: its family and shape (unused dimensions are 0).</summary>

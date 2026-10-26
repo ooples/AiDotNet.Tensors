@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // The scalar math the declared elementwise kernels call (#890 phase 4a): every hand-written elementwise kernel --
 // relu, gelu, sinf, lgammaf, fmodf, leaky_relu(alpha), ... -- turned into a device FUNCTION from its own source, so a
 // declared kernel that calls it computes exactly what the kernel it replaces computed: the same expression, compiled by
@@ -155,6 +155,10 @@ internal static class CudaMathLibrary
         }
         if (close < 0) { reason = kernel + ": unbalanced body"; return null; }
         string body = source.Substring(open + 1, close - open - 1);
+        // Comments are not code: where_select's mention of "the condition buffer" made the name test below read it
+        // as a second use of the condition, so where_select had no derived function (#1441).
+        body = Regex.Replace(body, @"/\*.*?\*/", " ", RegexOptions.Singleline);
+        body = Regex.Replace(body, @"//[^\r\n]*", "");
 
         body = Regex.Replace(body, @"^\s*int\s+idx\s*=\s*blockIdx\.x\s*\*\s*blockDim\.x\s*\+\s*threadIdx\.x\s*;\s*$", "",
             RegexOptions.Multiline);
