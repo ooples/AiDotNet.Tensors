@@ -31,6 +31,12 @@ internal interface IDirectPtxBackend : IFp16ActivationBackend
     /// <summary>The direct-PTX TryDirectPtxOnlineAttentionFamily route.</summary>
     bool TryDirectPtxOnlineAttentionFamily(IGpuBuffer queryHalf, IGpuBuffer keyHalf, IGpuBuffer valueHalf, IGpuBuffer outputFloat, IGpuBuffer? softmaxStatsFloat, int batch, int queryHeads, int keyValueHeads, int querySequence, int keyValueSequence, float scale, bool isCausal, bool emitSoftmaxStats = true, int causalQueryOffset = 0);
 
+    /// <summary>
+    /// The FP16 flash-attention forward (#1549): any sequence lengths, head dimension 64 or 128, causal or not,
+    /// grouped-query heads; FP32 output and the per-row log-sum-exp (natural log) of the scaled scores.
+    /// </summary>
+    bool TryDirectPtxFlashAttention(IGpuBuffer queryHalf, IGpuBuffer keyHalf, IGpuBuffer valueHalf, IGpuBuffer outputFloat, IGpuBuffer softmaxStatsFloat, int batch, int queryHeads, int keyValueHeads, int querySequence, int keyValueSequence, int headDimension, float scale, bool isCausal, int causalQueryOffset = 0);
+
     /// <summary>The direct-PTX TryDirectPtxGroupNormSwishUnit64 route.</summary>
     bool TryDirectPtxGroupNormSwishUnit64(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta, int batch, int groups, int channels, int spatialSize, float epsilon);
 
