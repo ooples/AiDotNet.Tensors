@@ -177,6 +177,29 @@ public sealed class Fp16AccumulateRoutingTests
         }
     }
 
+    // Opt-in (AIDOTNET_RUN_TC_GEMM_PROBE=1): per-shape evolution of the FP16-accumulate kernel (TuneFp16AccumulateRouteAsync,
+    // not persisted) and its verdict against cuBLAS, on the shapes the fixed candidates lost.
+    [SkippableFact]
+    public async System.Threading.Tasks.Task Probe_EvolvedRouteVerdicts()
+    {
+        Skip.IfNot(Environment.GetEnvironmentVariable("AIDOTNET_RUN_TC_GEMM_PROBE") == "1", "Set AIDOTNET_RUN_TC_GEMM_PROBE=1.");
+        using var backend = RequireAmpereBackend();
+        foreach (var (m, n, k) in new[] { (2048, 2048, 2048), (4096, 768, 3072), (4096, 3072, 768), (1024, 768, 3072),
+                     (12544, 128, 1152), (1024, 1024, 1024), (4096, 4096, 4096) })
+        {
+            var options = new AiDotNet.Evolution.EvolutionEngineOptions
+            {
+                RunId = $"fp16acc-route-probe-{m}x{n}x{k}", Seed = 1549, MaxEvaluationAttempts = 48, MaxProposals = 96,
+                MaxGenerations = 6, ProposalBatchSize = 8, MaxDegreeOfParallelism = 1, IslandCount = 1,
+                MigrationInterval = 0, MigrantsPerIsland = 1,
+            };
+            var started = System.Diagnostics.Stopwatch.StartNew();
+            var verdict = await backend.TuneFp16AccumulateRouteAsync(m, n, k, options, persist: false);
+            _output.WriteLine($"M{m} N{n} K{k}: routed {verdict.Routed}, {verdict.Kernel}, median {verdict.MedianSpeedup:F3}x, " +
+                $"tuned in {started.Elapsed.TotalSeconds:F0} s; {verdict.Reason}");
+        }
+    }
+
     // Opt-in (AIDOTNET_RUN_TC_GEMM_PROBE=1): the route's verdict on representative large shapes on this device.
     [SkippableFact]
     public void Probe_RouteVerdicts()
