@@ -75,6 +75,39 @@ extern ""C"" __global__ __launch_bounds__(256) void convert_fp16_to_fp32_native(
     output[idx] = h2f(input[idx]);
 }
 
+// max|x| over an FP16 buffer, as an FP16 bit pattern (#1549): for every non-NaN half, the 15 magnitude bits order like
+// the magnitude, and a NaN's (above 0x7C00) orders above infinity, so the max of (h & 0x7FFF) is max|x| or a NaN/inf
+// pattern that fails any bound. Grid-stride, warp max, one atomicMax per block into *result (zeroed by the caller).
+extern ""C"" __global__ __launch_bounds__(256) void fp16_absmax_bits(
+    const unsigned short* __restrict__ input, unsigned int* __restrict__ result, int size)
+{
+    unsigned int m = 0u;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < size; i += gridDim.x * blockDim.x)
+    {
+        unsigned int bits = (unsigned int)(input[i] & 0x7FFFu);
+        m = bits > m ? bits : m;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+    {
+        unsigned int other = __shfl_xor_sync(0xffffffffu, m, offset);
+        m = other > m ? other : m;
+    }
+    __shared__ unsigned int warpMax[8];
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (lane == 0) warpMax[warp] = m;
+    __syncthreads();
+    if (warp == 0)
+    {
+        m = lane < (int)(blockDim.x >> 5) ? warpMax[lane] : 0u;
+        for (int offset = 4; offset > 0; offset >>= 1)
+        {
+            unsigned int other = __shfl_xor_sync(0xffffffffu, m, offset);
+            m = other > m ? other : m;
+        }
+        if (lane == 0) atomicMax(result, m);
+    }
+}
+
 // FP16-NATIVE GELU: reads FP16 directly, computes in FP32 in-register, writes FP16. No FP32 buffer is
 // materialized — half the bandwidth + half-resident activation, the property the GPU memory/util win needs.
 extern ""C"" __global__ __launch_bounds__(256) void fp16_gelu_native(
@@ -348,6 +381,7 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_layernorm_grad_params_n
     {
         "convert_fp32_to_fp16_native",
         "convert_fp16_to_fp32_native",
+        "fp16_absmax_bits",
         "fp16_gelu_native",
         "fp16_relu_native",
         "fp16_add_native",

@@ -314,6 +314,103 @@ public sealed class DirectPtxTensorCoreGemmTests
         Assert.True(float.IsInfinity(Run(fp16Accumulate: true)), "a 131072 FP16 partial sum should overflow to infinity");
     }
 
+    private static byte[] HalfBytesOf(Half[] values)
+    {
+        var bytes = new byte[values.Length * 2];
+        for (int i = 0; i < values.Length; i++)
+        {
+            ushort bits = BitConverter.HalfToUInt16Bits(values[i]);
+            bytes[2 * i] = (byte)bits;
+            bytes[2 * i + 1] = (byte)(bits >> 8);
+        }
+        return bytes;
+    }
+
+    private static CudaBackend RequireAmpereBackend()
+    {
+        var backend = new CudaBackend();
+        if (!backend.IsAvailable || backend.GetDirectPtxRuntime().ComputeCapabilityMajor < 8)
+        {
+            backend.Dispose();
+            Skip.If(true, "Needs a CUDA device of compute capability 8.0+.");
+        }
+        return backend;
+    }
+
+    // #1549: the guard's max|x| reduction, as an FP16 bit pattern: positive and negative maxima, a value past one block's
+    // span, infinity, and NaN (which must land at or above infinity's pattern so it fails any bound).
+    [SkippableFact]
+    public void AbsMaxFp16Bits_IsTheLargestMagnitude_AndNaNOrInfinityExceedsEveryFiniteBound()
+    {
+        using var backend = RequireAmpereBackend();
+        using var word = backend.AllocateBuffer(1);
+        ushort Run(Half[] values)
+        {
+            using var input = backend.AllocateByteBuffer(values.Length * 2);
+            backend.UploadBytes(input, HalfBytesOf(values));
+            backend.AbsMaxFp16Bits(input, values.Length, word.Handle);
+            float[] raw = backend.DownloadBuffer(word);
+            return (ushort)(BitConverter.SingleToInt32Bits(raw[0]) & 0xFFFF);
+        }
+        var rng = new Random(5);
+        Half[] values = Enumerable.Range(0, 300_000).Select(_ => (Half)(rng.NextDouble() * 2 - 1)).ToArray();
+        values[123_457] = (Half)(-37.5f);
+        Assert.Equal(BitConverter.HalfToUInt16Bits((Half)37.5f), Run(values));
+        values[250_001] = (Half)41f;
+        Assert.Equal(BitConverter.HalfToUInt16Bits((Half)41f), Run(values));
+        values[7] = Half.NegativeInfinity;
+        Assert.Equal((ushort)0x7C00, Run(values));
+        values[7] = Half.NaN;
+        Assert.True(Run(values) > 0x7C00, "NaN must order above infinity");
+    }
+
+    // #1549: the guarded kernel makes the device-side choice per launch. Inside the bound it must give exactly the bits of
+    // the unguarded FP16-accumulate kernel; past it (the 131072 case) exactly the bits of the FP32-accumulate kernel, with
+    // no infinity.
+    [SkippableFact]
+    public void GuardedFp16Accumulate_UsesFp16InsideTheBound_AndFp32AccumulationPastIt()
+    {
+        using var backend = RequireAmpereBackend();
+        DirectPtxRuntime runtime = backend.GetDirectPtxRuntime();
+        var config = new PtxTensorCoreGemmConfiguration(64, 64, 32, 32, 32, 2, 4);
+        var layout = new PtxGemmLayout(false, false);
+        const int m = 64, n = 64, k = 256;
+        using var amax = backend.AllocateBuffer(2);
+        IntPtr amaxA = amax.Handle, amaxB = amax.Handle + 4;
+        float[] Run(Half[] a, Half[] b, bool fp16Accumulate, bool guard)
+        {
+            using var da = backend.AllocateByteBuffer(m * k * 2);
+            using var db = backend.AllocateByteBuffer(k * n * 2);
+            using var dc = backend.AllocateBuffer(m * n);
+            backend.UploadBytes(da, HalfBytesOf(a));
+            backend.UploadBytes(db, HalfBytesOf(b));
+            using var kernel = new PtxTensorCoreGemmKernel(runtime, config, layout, PtxTensorCorePrecision.Fp16,
+                fp16Accumulate: fp16Accumulate, fp16AccumulateGuard: guard);
+            if (guard)
+            {
+                backend.AbsMaxFp16Bits(da, m * k, amaxA);
+                backend.AbsMaxFp16Bits(db, k * n, amaxB);
+                kernel.LaunchGuarded(da.Handle, db.Handle, dc.Handle, m, n, k, k, n, n, 1f, 0f, amaxA, amaxB);
+            }
+            else
+            {
+                kernel.Launch(da.Handle, db.Handle, dc.Handle, m, n, k, k, n, n, 1f, 0f);
+            }
+            return backend.DownloadBuffer(dc);
+        }
+        var rng = new Random(9);
+        Half[] smallA = Enumerable.Range(0, m * k).Select(_ => (Half)(rng.NextDouble() * 2 - 1)).ToArray();
+        Half[] smallB = Enumerable.Range(0, k * n).Select(_ => (Half)(rng.NextDouble() * 2 - 1)).ToArray();
+        Assert.Equal(Run(smallA, smallB, fp16Accumulate: true, guard: false), Run(smallA, smallB, fp16Accumulate: true, guard: true));
+
+        Half[] bigA = Enumerable.Repeat((Half)64f, m * k).ToArray();
+        Half[] bigB = Enumerable.Repeat((Half)64f, k * n).ToArray();
+        float[] fp32 = Run(bigA, bigB, fp16Accumulate: false, guard: false);
+        float[] guarded = Run(bigA, bigB, fp16Accumulate: true, guard: true);
+        Assert.Equal(1048576f, fp32[0]);
+        Assert.Equal(fp32, guarded);
+    }
+
     // Opt-in speed probe (AIDOTNET_RUN_TC_GEMM_PROBE=1): FP16 operands and FP32 output, FP32 accumulation against FP16
     // accumulation with per-tile promotion (#1549), same configurations, CUDA events, and cuBLAS FP16 -> FP32 for scale.
     // The operands are in [-1, 1), so each partial sum is far below 65504. A development check, not evidence.
