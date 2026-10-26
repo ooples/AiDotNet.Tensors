@@ -1504,6 +1504,7 @@ public static partial class WeightRegistry
         // mutated bytes) and a re-materialize would read stale pool bytes. Nothing to release.
         if (weight.IsWritableMmapAliased) return;
         if (weight.DataVector.Length == 0) return; // already released
+        long claimed;
         lock (_lock)
         {
             if (IsMaterializedOwnerActiveUnlocked(weight.StreamingPoolHandle))
@@ -1511,7 +1512,38 @@ public static partial class WeightRegistry
                 weight.StreamingDropDeferred = true;
                 return;
             }
+            if (weight.DataVector.Length == 0) return; // released by another thread since the check above
+
+            // Claimed as an active use while it is written back and dropped below, outside the lock. A scope's
+            // Dispose ends its own use before releasing, so without the claim a sibling thread's budget shedding
+            // could write back and drop this same owner concurrently: one thread then serialized from the storage
+            // the other had just emptied (StressTest_ConcurrentMaterialize_ProducesCorrectBytes). Shedding skips
+            // active owners, and another release of this weight defers, as it would for any pinned owner.
+            claimed = weight.StreamingPoolHandle;
+            _materializedActiveUses.TryGetValue(claimed, out int uses);
+            _materializedActiveUses[claimed] = uses + 1;
         }
+
+        try
+        {
+            ReleaseClaimedOwnerToPool(weight);
+        }
+        finally
+        {
+            lock (_lock)
+            {
+                if (_materializedActiveUses.TryGetValue(claimed, out int uses))
+                {
+                    if (uses <= 1) _materializedActiveUses.Remove(claimed);
+                    else _materializedActiveUses[claimed] = uses - 1;
+                }
+            }
+        }
+    }
+
+    // The write-back and drop of ReleaseToPool, run while the caller holds the owner's claim.
+    private static void ReleaseClaimedOwnerToPool<T>(Tensor<T> weight)
+    {
         // Native and lossless stores are writable. Persist the CURRENT resident values before
         // dropping their owner; otherwise ReleaseToPool alone would resurrect the stale snapshot
         // captured at registration. Quantized inference stores are immutable and their original
@@ -1886,7 +1918,7 @@ public static partial class WeightRegistry
             {
                 for (int i = 0; i < toFetch.Length; i++)
                 {
-                    try { capturedPool.Rehydrate(toFetch[i], isPrefetch: true); }
+                    try { capturedPool.WarmForPrefetch(toFetch[i]); }
                     catch (InvalidOperationException) { /* per-handle "unknown" — keep going */ }
                     catch (System.IO.IOException) { /* per-handle disk error */ }
                     catch (UnauthorizedAccessException) { /* per-handle permissions */ }
@@ -2030,7 +2062,7 @@ public static partial class WeightRegistry
         {
             try
             {
-                capturedPool.Rehydrate(handle, isPrefetch: true);
+                capturedPool.WarmForPrefetch(handle);
             }
             catch (System.IO.IOException) { /* disk error mid-prefetch */ }
             catch (ObjectDisposedException) { /* pool disposed mid-prefetch */ }

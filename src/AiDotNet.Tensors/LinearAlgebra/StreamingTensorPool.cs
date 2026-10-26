@@ -354,9 +354,10 @@ public sealed class StreamingTensorPool : IDisposable
     /// <see cref="ReplaceEntryData(long, byte[])"/> straight from the stream a write-back encoded into, without the
     /// intermediate array (#2322). When the entry is resident and its buffer holds the new content with at most an
     /// eighth to spare, the buffer is refilled in place; otherwise a new one is allocated with a little headroom,
-    /// so a lossless entry whose size drifts by a few bytes from step to step settles on one buffer. The buffer
-    /// is the pool's alone: every reader copies out under this lock (the span <see cref="Rehydrate(long, bool)"/>
-    /// returns is only taken by prefetch, which discards it).
+    /// so a lossless entry whose size drifts by a few bytes from step to step settles on one buffer. A buffer that
+    /// <see cref="Rehydrate(long, bool)"/> has lent out as a span is never refilled; a new one is installed instead,
+    /// so the caller's span keeps the bytes it was given. Every other reader copies out under this lock, and prefetch
+    /// only warms the entry (<see cref="WarmForPrefetch"/>) without lending it.
     /// </summary>
     internal void ReplaceEntryData(long handleId, PooledChunkWriteStream source)
     {
@@ -370,7 +371,7 @@ public sealed class StreamingTensorPool : IDisposable
             if (!_entries.TryGetValue(handleId, out var entry)) return;
             var existing = entry.Data;
             byte[] buffer;
-            if (existing is not null && existing.Length >= length
+            if (existing is not null && !entry.DataLent && existing.Length >= length
                 && existing.Length - length <= existing.Length / WriteBackInPlaceSlackDivisor)
             {
                 buffer = existing;
@@ -404,6 +405,7 @@ public sealed class StreamingTensorPool : IDisposable
         long oldResident = entry.Data?.Length ?? 0;
         entry.Data = buffer;
         entry.DataLength = length;
+        entry.DataLent = false;
         entry.ResidentBytes = buffer.Length;
         // The new bytes have NOT been written to the backing file, so force the
         // next eviction to (re-)write them rather than dropping the resident copy
@@ -512,7 +514,15 @@ public sealed class StreamingTensorPool : IDisposable
     /// derive prefetch effectiveness counters (hit / miss / issue) in
     /// <see cref="StreamingPoolReport"/>.
     /// </summary>
-    public ReadOnlySpan<byte> Rehydrate(long handleId, bool isPrefetch)
+    public ReadOnlySpan<byte> Rehydrate(long handleId, bool isPrefetch) => RehydrateCore(handleId, isPrefetch, lend: true);
+
+    /// <summary>
+    /// The prefetch side of <see cref="Rehydrate(long, bool)"/>: pages the entry in and records the prefetch, without
+    /// handing out a span. The buffer is not lent, so a later write-back may still refill it in place.
+    /// </summary>
+    internal void WarmForPrefetch(long handleId) => RehydrateCore(handleId, isPrefetch: true, lend: false);
+
+    private ReadOnlySpan<byte> RehydrateCore(long handleId, bool isPrefetch, bool lend)
     {
         lock (_lock)
         {
@@ -591,6 +601,7 @@ public sealed class StreamingTensorPool : IDisposable
 
                 entry.Data = buffer;
                 entry.DataLength = buffer.Length;
+                entry.DataLent = false;
                 // entry.Data now holds exactly what's in the backing file, which
                 // is still on disk — so a subsequent eviction can drop this resident
                 // copy without re-writing it. (Cleared only if the content is later
@@ -628,7 +639,12 @@ public sealed class StreamingTensorPool : IDisposable
                 _lruOrder.Remove(node);
                 _lruOrder.AddFirst(node);
             }
-            return new ReadOnlySpan<byte>(entry.Data!, 0, entry.DataLength);
+            var data = entry.Data ?? throw new InvalidOperationException(
+                $"Streaming pool: handle {handleId} has no resident bytes after rehydrating.");
+            // A span over the pool's own buffer: from now on a write-back installs a new one rather than refilling it
+            // under the caller.
+            if (lend) entry.DataLent = true;
+            return new ReadOnlySpan<byte>(data, 0, entry.DataLength);
         }
     }
 
@@ -1505,6 +1521,9 @@ public sealed class StreamingTensorPool : IDisposable
         // buffer when the new content fits (#2322), so a variable-size (lossless) entry keeps one buffer across steps
         // instead of allocating a fresh one each time. ResidentBytes accounts the whole buffer, which is what is held.
         public int DataLength;
+        // Set once Rehydrate has handed out a span over Data. That span must keep reading the bytes it was given, so
+        // a write-back then installs a new buffer instead of refilling this one. Cleared when Data is replaced.
+        public bool DataLent;
         public long ResidentBytes;
         public long PagedOutBytes;
         // Set during eviction so Rehydrate knows the decompress target

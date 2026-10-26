@@ -239,6 +239,44 @@ public class StreamingRestoreBufferRecyclingTests
         }
     }
     /// <summary>
+    /// <c>Rehydrate</c> hands out a span over the pool's own buffer, documented to stay valid for the caller. A
+    /// write-back must therefore install a new buffer instead of refilling a lent one: the span keeps the bytes it
+    /// was given, and the entry reads back the new content. A prefetch only warms the entry, so it does not stop the
+    /// in-place refill.
+    /// </summary>
+    [Fact]
+    public void AWriteBack_LeavesALentSpanUnchanged_ButStillRefillsAfterPrefetch()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "aidotnet-2322-lent-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            using var pool = new StreamingTensorPool(new GpuOffloadOptions { StreamingBackingStorePath = dir, StreamingPoolMaxResidentBytes = 1 << 20 });
+            byte[] original = Enumerable.Range(0, 1000).Select(i => (byte)(i % 251)).ToArray();
+            long lent = pool.Register((byte[])original.Clone());
+            long warmed = pool.Register((byte[])original.Clone());
+
+            var span = pool.Rehydrate(lent, isPrefetch: false);
+            pool.WarmForPrefetch(warmed);
+
+            byte[] updated = Enumerable.Range(0, 950).Select(i => (byte)((i * 7) % 253)).ToArray();
+            foreach (long handle in new[] { lent, warmed })
+            {
+                using var stream = new PooledChunkWriteStream();
+                stream.Write(updated, 0, updated.Length);
+                pool.ReplaceEntryData(handle, stream);
+            }
+
+            Assert.Equal(original, span.ToArray());
+            Assert.Equal(updated, pool.Rehydrate(lent, isPrefetch: false).ToArray());
+            // Only the prefetched entry was refilled in place.
+            Assert.Equal(1, pool.WriteBackInPlaceCount);
+        }
+        finally
+        {
+            try { if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true); } catch (IOException) { }
+        }
+    }
+    /// <summary>
     /// A write-back that fits the entry's resident buffer refills it in place; the entry then reads back exactly
     /// the new content, both resident and after paging to disk and back.
     /// </summary>
