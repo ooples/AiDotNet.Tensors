@@ -631,8 +631,18 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     // that holds this gate acquires the registry lock, so the registry may take it with Monitor.TryEnter while
     // holding its own lock.
     private object? _streamingTransitionGate;
-    private object StreamingTransitionGate =>
-        System.Threading.LazyInitializer.EnsureInitialized(ref _streamingTransitionGate, () => new object());
+    private object StreamingTransitionGate
+    {
+        get
+        {
+            // Allocated on first streaming use only; ordinary tensors never pay for it. Explicit CAS rather than
+            // LazyInitializer, whose net471 signature carries no nullable annotations.
+            object? gate = System.Threading.Volatile.Read(ref _streamingTransitionGate);
+            if (gate is not null) return gate;
+            var created = new object();
+            return System.Threading.Interlocked.CompareExchange(ref _streamingTransitionGate, created, null) ?? created;
+        }
+    }
 
     /// <inheritdoc cref="IStreamingDroppable.TryWriteBackAndDropForStreaming"/>
     internal StreamingReleaseOutcome TryWriteBackAndDropForStreaming(bool wait)
