@@ -24,7 +24,13 @@ public enum CodegenReduceKind
     Sum,
 
     /// <summary>Maximum of the operand product over the reduction axes.</summary>
-    Max
+    Max,
+
+    /// <summary>
+    /// Product of the terms over the reduction axes, in reduction order (identity 1). Only the generic affine
+    /// lowering supports it: row fusion, split and warp reductions, and the tiled emitters refuse it.
+    /// </summary>
+    Product
 }
 
 /// <summary>
@@ -802,6 +808,14 @@ public sealed class CodegenKernelSpec
         return output;
     }
 
+    // The value an empty reduction, or an out-of-range term, contributes.
+    private static double Identity(CodegenReduceKind reduce) => reduce switch
+    {
+        CodegenReduceKind.Max => double.NegativeInfinity,
+        CodegenReduceKind.Product => 1.0,
+        _ => 0.0,
+    };
+
     /// <summary>
     /// The emitter's <c>max.f32</c> (and the hand-written kernels' <c>fmaxf</c>): a NaN operand yields the other one,
     /// so a NaN term never wins a maximum. <see cref="Math.Max(double, double)"/> propagates NaN instead, which made the
@@ -957,7 +971,7 @@ public sealed class CodegenKernelSpec
             }
             for (int r = 0; r < reduction.Length; r++) values[reduction[r]] = 0;
 
-            double acc = Reduce == CodegenReduceKind.Max ? double.NegativeInfinity : 0.0;
+            double acc = Identity(Reduce);
             long argIndex = SecondaryNoWinnerIndex;
             long trips = Space.ReductionTripCount;
 
@@ -1004,7 +1018,7 @@ public sealed class CodegenKernelSpec
                 // the exact-agreement gate passed it -- the one failure mode a shared oracle
                 // cannot catch. It is latent only because maxpool2d_2x2 has no padding.
                 if (anyOutOfBounds)
-                    product = Reduce == CodegenReduceKind.Max ? double.NegativeInfinity : 0.0;
+                    product = Identity(Reduce);
 
                 // The pre-reduction slot: a broadcast shift, then an elementwise transform,
                 // applied to EACH term before it is combined. This is what softmax's
@@ -1040,6 +1054,7 @@ public sealed class CodegenKernelSpec
                 acc = Reduce switch
                 {
                     CodegenReduceKind.Sum => acc + product,
+                    CodegenReduceKind.Product => acc * product,
                     CodegenReduceKind.Max => MaxLikeTheDevice(acc, product),
                     _ => product
                 };

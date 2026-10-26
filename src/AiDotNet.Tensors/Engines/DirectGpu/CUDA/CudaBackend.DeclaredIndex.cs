@@ -38,7 +38,7 @@ public sealed partial class CudaBackend
     // D0..D3 = outer, source dim, destination dim, inner; D4 = the mode.
     private CodegenProgram BuildScatterReduce(DeclaredKey key) =>
         CodegenBackendPrograms.ScatterReduce(key.D0, key.D1, key.D2, key.D3, key.D4,
-            key.D4 == 0 ? null : DerivedFunction(key.D4 == 2 ? "max_vectors" : "min_vectors"));
+            key.D4 < 2 ? null : DerivedFunction(key.D4 == 2 ? "max_vectors" : "min_vectors"));
 
     private const long DeclaredGatherFloor = 16384;
 
@@ -83,13 +83,13 @@ public sealed partial class CudaBackend
     }
 
     /// <summary>
-    /// ScatterReduce's sum, maximum and minimum (modes 0, 2, 3) through the declared reduction (#1441), deterministic
-    /// where the hand-written kernel's compare-and-swap is not. The product (mode 1) keeps the hand-written kernel.
+    /// ScatterReduce (every mode) through the declared reduction (#1441), deterministic where the hand-written
+    /// kernel's compare-and-swap is not.
     /// </summary>
     internal bool TryDeclaredScatterReduce(IGpuBuffer output, IGpuBuffer source, IGpuBuffer index, int outer,
         int sourceDim, int destinationDim, int inner, int mode)
     {
-        if (!DeclaredScatterRowsEnabled || mode is not (0 or 2 or 3) || outer <= 0 || sourceDim <= 0 ||
+        if (!DeclaredScatterRowsEnabled || mode is < 0 or > 3 || outer <= 0 || sourceDim <= 0 ||
             destinationDim <= 0 || inner <= 0 || (long)sourceDim * destinationDim > DeclaredScatterRowsWorkLimit ||
             (long)index.Size < (long)outer * sourceDim * inner || (long)source.Size < (long)outer * sourceDim * inner ||
             (long)output.Size < (long)outer * destinationDim * inner)
@@ -98,6 +98,30 @@ public sealed partial class CudaBackend
         if (!ClaimDeclaredSlot(key, ref _declaredScatterRowsPrograms, DeclaredScatterRowsProgramCap)) return false;
         return TryRunDeclaredProgram(key, _buildScatterReduce ??= BuildScatterReduce, s_scatterReduceNames,
             new DeclaredBindings(index, source, output, output));
+    }
+
+    private static readonly string[] s_maskedScatterNames = { "seed", "mask", "prefix", "source", "out" };
+
+    private Func<DeclaredKey, CodegenProgram>? _buildMaskedScatter;
+
+    private CodegenProgram BuildMaskedScatter(DeclaredKey key) =>
+        CodegenBackendPrograms.MaskedScatter(key.D0, key.D1, NotEqualScalar(), DerivedFunction("where_select"));
+
+    /// <summary>
+    /// Parity210MaskedScatter through its declared program (#1441), in place. The mask is a byte buffer (its size is in
+    /// bytes, one per element). False -- nothing launched -- when declined.
+    /// </summary>
+    internal bool TryDeclaredMaskedScatter(IGpuBuffer output, IGpuBuffer mask, IGpuBuffer prefix, IGpuBuffer source,
+        int total)
+    {
+        int sourceLength = source.Size;
+        if (!DeclaredScatterRowsEnabled || total <= 0 || sourceLength <= 0 || (long)total < DeclaredGatherFloor ||
+            mask.Size < total || prefix.Size < total || output.Size < total)
+            return false;
+        var key = new DeclaredKey(DeclaredFamily.MaskedScatter, total, sourceLength, 0, 0, 0f, 0f);
+        if (!ClaimDeclaredSlot(key, ref _declaredScatterRowsPrograms, DeclaredScatterRowsProgramCap)) return false;
+        return TryRunDeclaredProgram(key, _buildMaskedScatter ??= BuildMaskedScatter, s_maskedScatterNames,
+            new DeclaredBindings(output, mask, prefix, source, output));
     }
 
     /// <summary>Parity210TakeAlongDim (int32 indices) through its declared gather (#1441). False when declined.</summary>

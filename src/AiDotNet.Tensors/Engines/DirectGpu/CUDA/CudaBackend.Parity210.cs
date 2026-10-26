@@ -306,6 +306,8 @@ public sealed partial class CudaBackend : IParity210Backend
         IGpuBuffer output, IGpuBuffer maskInt8, IGpuBuffer prefixSumInt32,
         IGpuBuffer source, int total)
     {
+        // Declared route (#1441).
+        if (TryDeclaredMaskedScatter(output, maskInt8, prefixSumInt32, source, total)) return;
         var kernel = ResolveParity210Kernel("parity210_masked_scatter");
         using var _ = PushContext();
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);

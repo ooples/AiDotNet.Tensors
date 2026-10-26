@@ -404,6 +404,12 @@ public static class CodegenRowFusion
         reason = "";
         if (program.Passes.Count == 0) { reason = "no passes"; return null; }
         foreach (var pass in program.Passes)
+            if (pass.Reduce == CodegenReduceKind.Product)
+            {
+                reason = pass.Name + " is a product reduction, which the row kernel does not combine";
+                return null;
+            }
+        foreach (var pass in program.Passes)
             if (pass.HasIntegerValues)
             {
                 reason = pass.Name + " reads or writes integer values, which only the affine lowering converts";

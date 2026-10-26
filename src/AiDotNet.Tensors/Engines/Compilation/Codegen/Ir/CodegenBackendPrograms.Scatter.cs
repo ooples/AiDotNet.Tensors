@@ -545,6 +545,66 @@ public static partial class CodegenBackendPrograms
     }
 
     /// <summary>
+    /// The masked scatter (#1441), in CudaBackend.Parity210MaskedScatter's contract: where the byte mask is set,
+    /// <c>out[k] = source[prefix[k]]</c> when that position is inside the source; everywhere else out keeps its value.
+    /// The mask is read as uint8 values; whether the prefix position is inside the source is its own pass (a ones read
+    /// through it, 0 when skipped), and the write selects through <paramref name="select"/> (the derived where_select)
+    /// on <c>mask * valid</c>, so an unwritten element keeps its seed bit for bit. The caller binds <c>seed</c> and
+    /// <c>out</c> to the same buffer.
+    /// </summary>
+    public static CodegenProgram MaskedScatter(int total, int sourceLength, CodegenLibraryFunction notEqualZero,
+        CodegenLibraryFunction select)
+    {
+        if (total <= 0 || sourceLength <= 0)
+            throw new ArgumentOutOfRangeException(nameof(total), "Masked scatter extents must be positive.");
+        if (notEqualZero is null) throw new ArgumentNullException(nameof(notEqualZero));
+        if (select is null) throw new ArgumentNullException(nameof(select));
+        var passes = new List<CodegenKernelSpec>();
+        var temps = new List<long>();
+
+        // ones[s] = a + (1 - a), a = notEqual(source[s], 0).
+        var nonZero = CodegenExpr.Call(notEqualZero, Op(0), CodegenExpr.Constant(0.0));
+        var oneBody = CodegenExpr.Add(nonZero, CodegenExpr.Subtract(CodegenExpr.Constant(1.0), nonZero));
+        passes.Add(new CodegenKernelSpec("masked_scatter_ones", new CodegenIterationSpace(CodegenAxis.Parallel("s", sourceLength)),
+            new[] { Bind(0, "source", new[] { sourceLength }) }, Bind(1, "ones", new[] { sourceLength }, isOutput: true),
+            oneBody.Operands(), CodegenReduceKind.None, body: oneBody));
+        temps.Add(sourceLength);
+
+        // valid[k] = ones[prefix[k]]: 1 inside the source, 0 (the skipped read) outside it.
+        var space = new CodegenIterationSpace(CodegenAxis.Parallel("k", total));
+        var prefix = new CodegenTensorBinding(0, "prefix", new[] { total }, new[] { A(0) }, elementType: CodegenElementType.Int32);
+        passes.Add(new CodegenKernelSpec("masked_scatter_valid", space,
+            new[]
+            {
+                prefix,
+                new CodegenTensorBinding(1, "ones", new[] { sourceLength }, new[] { CodegenAffineExpr.Const(0) },
+                    indirect: new CodegenIndirectIndex?[] { new CodegenIndirectIndex(0, A(0), sourceLength) }),
+            },
+            Bind(2, "valid", new[] { total }, isOutput: true), new[] { 1 }, CodegenReduceKind.None));
+        temps.Add(total);
+
+        // out[k] = select(mask[k] * valid[k], source[prefix[k]], seed[k]); the source read is clamped, as an
+        // unwritten element selects its seed anyway.
+        var body = CodegenExpr.Call(select, CodegenExpr.Multiply(Op(1), Op(2)), Op(4), Op(0));
+        passes.Add(new CodegenKernelSpec("masked_scatter", space,
+            new[]
+            {
+                Bind(0, "seed", new[] { total }),
+                new CodegenTensorBinding(1, "mask", new[] { total }, new[] { A(0) }, elementType: CodegenElementType.UInt8,
+                    integerValue: true),
+                Bind(2, "valid", new[] { total }),
+                new CodegenTensorBinding(3, "prefix", new[] { total }, new[] { A(0) }, elementType: CodegenElementType.Int32),
+                new CodegenTensorBinding(4, "source", new[] { sourceLength }, new[] { CodegenAffineExpr.Const(0) },
+                    indirect: new CodegenIndirectIndex?[]
+                    {
+                        new CodegenIndirectIndex(3, A(0), sourceLength, CodegenIndexOutOfRange.Clamp),
+                    }),
+            },
+            Bind(5, "out", new[] { total }, isOutput: true), body.Operands(), CodegenReduceKind.None, body: body));
+        return new CodegenProgram(passes, temps, "masked scatter (backend contract)");
+    }
+
+    /// <summary>
     /// The deterministic index add (#1441), in CudaBackend.Parity210IndexAdd's contract: <c>out[o, t, i] +=
     /// sum over the j with indices[j] == t of source[o, j, i]</c>, in increasing j, with no atomic. The caller binds
     /// <c>seed</c> and <c>out</c> to the same buffer; an index outside [0, destinationAxis) adds nowhere.
@@ -576,20 +636,21 @@ public static partial class CodegenBackendPrograms
     }
 
     /// <summary>
-    /// The deterministic scatter reduction (#1441), in CudaBackend.ScatterReduce's contract for its sum (mode 0),
-    /// maximum (2) and minimum (3): <c>out[o, t, i] = seed op (every source[o, s, i] with index[o, s, i] == t)</c>, the
-    /// sum in increasing s, an index outside [0, dstDim) contributing nowhere. The caller binds <c>seed</c> and
-    /// <c>out</c> to the same buffer. The maximum and minimum reduce the matches first (a NaN never wins, as fmaxf)
-    /// and fold the seed in through <paramref name="extreme"/> (the derived max_vectors or min_vectors).
+    /// The deterministic scatter reduction (#1441), in CudaBackend.ScatterReduce's contract for every mode -- sum (0),
+    /// product (1), maximum (2), minimum (3): <c>out[o, t, i] = seed op (every source[o, s, i] with index[o, s, i] ==
+    /// t)</c>, in increasing s, an index outside [0, dstDim) contributing nowhere. The caller binds <c>seed</c> and
+    /// <c>out</c> to the same buffer. The sum adds the seed after the matches and the product multiplies it in after
+    /// them, where the hand-written compare-and-swap folds each match into the seed in arrival order, so the two can
+    /// differ in rounding. The maximum and minimum reduce the matches first (a NaN never wins, as fmaxf) and fold the
+    /// seed in through <paramref name="extreme"/> (the derived max_vectors or min_vectors).
     /// </summary>
     public static CodegenProgram ScatterReduce(int outer, int sourceDim, int destinationDim, int inner, int mode,
         CodegenLibraryFunction? extreme)
     {
         if (outer <= 0 || sourceDim <= 0 || destinationDim <= 0 || inner <= 0)
             throw new ArgumentOutOfRangeException(nameof(outer), "Scatter reduce extents must be positive.");
-        if (mode is not (0 or 2 or 3))
-            throw new NotSupportedException("Scatter reduce mode " + mode + " (a product) has no declared reduction.");
-        if (mode != 0 && extreme is null) throw new ArgumentNullException(nameof(extreme));
+        if (mode is < 0 or > 3) throw new ArgumentOutOfRangeException(nameof(mode), "Scatter reduce modes are 0..3.");
+        if (mode >= 2 && extreme is null) throw new ArgumentNullException(nameof(extreme));
         var space = new CodegenIterationSpace(CodegenAxis.Parallel("o", outer), CodegenAxis.Parallel("t", destinationDim),
             CodegenAxis.Parallel("i", inner), CodegenAxis.Reduce("s", sourceDim));
         int[] shape = { outer, destinationDim, inner };
@@ -615,6 +676,13 @@ public static partial class CodegenBackendPrograms
                 new CodegenTensorBinding(3, "out", shape, new[] { A(0), A(1), A(2) }, isOutput: true),
                 new[] { 1 }, CodegenReduceKind.Sum, biasInput: 2);
             return new CodegenProgram(new[] { sum }, Array.Empty<long>(), "deterministic scatter reduce sum (backend contract)");
+        }
+        if (mode == 1)
+        {
+            var product = new CodegenKernelSpec("scatter_reduce_prod", space, new[] { index, source, seed },
+                new CodegenTensorBinding(3, "out", shape, new[] { A(0), A(1), A(2) }, isOutput: true),
+                new[] { 1 }, CodegenReduceKind.Product, scaleInput: 2);
+            return new CodegenProgram(new[] { product }, Array.Empty<long>(), "deterministic scatter reduce product (backend contract)");
         }
 
         bool minimum = mode == 3;

@@ -131,6 +131,9 @@ internal enum DeclaredFamily
 
     /// <summary>A row gather by float32 ids (#1441).</summary>
     EmbeddingFloatIds,
+
+    /// <summary>The masked scatter through a byte mask and its prefix positions (#1441).</summary>
+    MaskedScatter,
 }
 
 /// <summary>One declared program: its family and shape (unused dimensions are 0).</summary>

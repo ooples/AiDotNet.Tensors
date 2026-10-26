@@ -78,6 +78,7 @@ public class CodegenIndexFamilyTests
 
     [Theory]
     [InlineData(0)]
+    [InlineData(1)]
     [InlineData(2)]
     [InlineData(3)]
     public void ScatterReduce_MatchesTheSequentialReduction(int mode)
@@ -101,7 +102,7 @@ public class CodegenIndexFamilyTests
                     int cell = (o * dst + t) * inner + i;
                     double v = source[k], pf = expected[cell];
                     // fmaxf / fminf: a NaN operand yields the other.
-                    expected[cell] = mode == 0 ? pf + v
+                    expected[cell] = mode == 0 ? pf + v : mode == 1 ? pf * v
                         : double.IsNaN(v) ? pf : double.IsNaN(pf) ? v : mode == 2 ? Math.Max(pf, v) : Math.Min(pf, v);
                 }
         var actual = outputs["out"];
@@ -112,9 +113,44 @@ public class CodegenIndexFamilyTests
         }
     }
 
+    /// <summary>A product's out-of-range term is the identity 1, and an empty product leaves the seed exactly.</summary>
     [Fact]
-    public void ScatterReduce_RefusesTheProductItCannotDeclare() =>
-        Assert.Throws<NotSupportedException>(() => CodegenBackendPrograms.ScatterReduce(1, 2, 2, 1, 1, null));
+    public void AProductReductionEmitsItsIdentityAndMultiplies()
+    {
+        var pass = CodegenBackendPrograms.ScatterReduce(2, 64, 5, 3, 1, null).Passes[0];
+        string ptx = new AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx.PtxAffineEmitter().Emit(pass, 8, 6);
+        Assert.Contains("0f3F800000", ptx);
+        Assert.Contains("mul.rn.f32", ptx);
+        Assert.Null(CodegenRowFusion.TryPlan(new CodegenProgram(new[] { pass }, Array.Empty<long>(), "p"), out string reason));
+        Assert.False(CodegenSplitReduction.IsSplittable(pass));
+    }
+
+    [Fact]
+    public void MaskedScatter_WritesMaskedElementsWithAValidPrefixAndKeepsTheRest()
+    {
+        double[] seed = { 1, 2, double.NaN, 4, 5, 6 };
+        double[] mask = { 1, 0, 1, 255, 1, 0 };
+        int[] prefix = { 0, 1, 1, 7, -1, 2 };   // element 3's and 4's positions lie outside the 3-long source
+        double[] source = { 10, 20, 30 };
+        var outputs = CodegenBackendPrograms.MaskedScatter(6, 3, NotEqual, Select).Interpret(new Dictionary<string, double[]>
+        {
+            ["source"] = source, ["prefix"] = D(prefix), ["seed"] = seed, ["mask"] = mask,
+        });
+        var actual = outputs["out"];
+        double[] expected = { 10, 2, 20, 4, 5, 6 };
+        for (int k = 0; k < 6; k++) Assert.Equal(expected[k], actual[k]);
+    }
+
+    [Fact]
+    public void AByteMaskLoadsAsUnsignedBytes()
+    {
+        var pass = CodegenBackendPrograms.MaskedScatter(64, 16, NotEqual, Select).Passes[2];
+        string ptx = new AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx.PtxAffineEmitter().Emit(pass, 8, 6);
+        Assert.Contains("ld.global.nc.u8", ptx);
+        Assert.Contains("cvt.rn.f32.u32", ptx);
+        Assert.Throws<ArgumentException>(() => new CodegenTensorBinding(0, "m", new[] { 4 }, new[] { CodegenAffineExpr.Axis(0) },
+            elementType: CodegenElementType.UInt8));
+    }
 
     [Fact]
     public void TakeAlongDimInt_AndFloatIdGathers_ZeroOutOfRangeIndices()

@@ -123,12 +123,12 @@ public sealed class DeclaredIndexFamilyRouteTests
         for (int k = 0; k < index.Length; k++) index[k] = k % 9 == 8 ? -1 : random.Next(destinationDim);
         using var src = backend.AllocateBuffer(source);
         using var idx = Ints(backend, index);
-        foreach (int mode in new[] { 0, 2, 3 })
+        foreach (int mode in new[] { 0, 1, 2, 3 })
         {
             var r = Both(backend, seed, o => backend.ScatterReduce(o, src, idx, outer, sourceDim, destinationDim, inner, mode));
-            if (mode == 0)
+            if (mode <= 1)
             {
-                // A cell the NaN reaches is NaN in both; the sums otherwise differ only in the atomic's order.
+                // A cell the NaN reaches is NaN in both; the sums and products otherwise differ only in rounding order.
                 for (int k = 0; k < r.Hand.Length; k++)
                     if (float.IsNaN(r.Hand[k])) Assert.True(float.IsNaN(r.Declared[k]), "sum index " + k);
                     else Assert.True(Math.Abs(r.Hand[k] - r.Declared[k]) <= 1e-4f * Math.Max(1f, Math.Abs(r.Hand[k])),
@@ -136,6 +136,31 @@ public sealed class DeclaredIndexFamilyRouteTests
             }
             else Assert.Equal(r.Hand, r.Declared);
         }
+    }
+
+    [SkippableTheory]
+    [InlineData(20000, 5000)]
+    [InlineData(65536, 100)]
+    public void MaskedScatter_MatchesTheHandWrittenKernel(int total, int sourceLength)
+    {
+        using var backend = OpenOrSkip();
+        var random = RandomHelper.CreateSeededRandom(1453 + total);
+        var seed = Values(random, total);
+        var source = Values(random, sourceLength);
+        var mask = new byte[total];
+        var prefix = new int[total];
+        int running = 0;
+        for (int k = 0; k < total; k++)
+        {
+            mask[k] = (byte)(random.NextDouble() < 0.4 ? (k % 3 == 0 ? 255 : 1) : 0);
+            prefix[k] = mask[k] != 0 ? running++ : -1;   // positions past the source stay unwritten
+        }
+        using var maskBuf = backend.AllocateByteBuffer(total);
+        backend.UploadByteBuffer(maskBuf, mask);
+        using var prefixBuf = Ints(backend, prefix);
+        using var src = backend.AllocateBuffer(source);
+        var r = Both(backend, seed, o => backend.Parity210MaskedScatter(o, maskBuf, prefixBuf, src, total));
+        Assert.Equal(r.Hand, r.Declared);
     }
 
     [SkippableFact]

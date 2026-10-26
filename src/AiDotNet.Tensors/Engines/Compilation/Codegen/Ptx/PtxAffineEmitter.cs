@@ -1451,7 +1451,12 @@ public sealed partial class PtxAffineEmitter
         _stageLabel = 0;
 
         // The out-of-range fill is the reduction's identity, not always zero.
-        _outOfRangeFill = spec.Reduce == CodegenReduceKind.Max ? "0fFF800000" : "0f00000000";
+        _outOfRangeFill = spec.Reduce switch
+        {
+            CodegenReduceKind.Max => "0fFF800000",
+            CodegenReduceKind.Product => "0f3F800000",
+            _ => "0f00000000",
+        };
 
         // Under a maximum, a product of operands has no single sensible identity: -inf times
         // a positive operand is -inf, but -inf times zero is NaN.
@@ -1593,9 +1598,12 @@ public sealed partial class PtxAffineEmitter
         for (int l = 0; l < lanes; l++)
         {
             accs[l] = NextF();
-            L(spec.Reduce == CodegenReduceKind.Max
-                ? $"mov.f32 {accs[l]}, 0fFF800000;   // -inf"
-                : $"mov.f32 {accs[l]}, 0f00000000;");
+            L(spec.Reduce switch
+            {
+                CodegenReduceKind.Max => $"mov.f32 {accs[l]}, 0fFF800000;   // -inf",
+                CodegenReduceKind.Product => $"mov.f32 {accs[l]}, 0f3F800000;   // 1",
+                _ => $"mov.f32 {accs[l]}, 0f00000000;",
+            });
         }
 
         // One index register per lane, tracking which reduction term is currently winning.
@@ -1946,9 +1954,12 @@ public sealed partial class PtxAffineEmitter
                 // normalisation or convolution routes. A product with an indirect Skip test needs it
                 // too: there a rejected entry stands for "no term at all" (CSR SpMM's entries of
                 // other rows), and 0 times another operand's infinity is NaN, not 0.
+                // Under a product the fill is 1, and 1 times the other operands is not the identity, so a guarded
+                // term of a product always selects it.
                 if (productPred is not null &&
                     (spec.Body is not null || spec.PreBiasInput.HasValue ||
-                     spec.PreReduce != CodegenPreReduceOp.None || SkipsIndirectInProduct(spec)))
+                     spec.PreReduce != CodegenPreReduceOp.None || SkipsIndirectInProduct(spec) ||
+                     (spec.Reduce == CodegenReduceKind.Product && spec.ProductInputs.Count > 1)))
                 {
                     string identity = NextF(), kept = NextF();
                     L($"mov.f32 {identity}, {_outOfRangeFill};");
@@ -1981,7 +1992,9 @@ public sealed partial class PtxAffineEmitter
                 else
                 {
                     string na = NextF();
-                    L($"add.rn.f32 {na}, {accs[l]}, {product!};");
+                    L(spec.Reduce == CodegenReduceKind.Product
+                        ? $"mul.rn.f32 {na}, {accs[l]}, {product!};"
+                        : $"add.rn.f32 {na}, {accs[l]}, {product!};");
                     accs[l] = na;
                 }
             }
@@ -2018,6 +2031,8 @@ public sealed partial class PtxAffineEmitter
             if (blockThreads % WarpLanes != 0)
                 throw new InvalidOperationException(
                     "Warp reduction needs a whole number of warps per block; got " + I(blockThreads) + ".");
+            if (spec.Reduce == CodegenReduceKind.Product)
+                throw new NotSupportedException("A warp-reduced product is not lowered; the lane spec refuses it.");
             string combineOp = spec.Reduce == CodegenReduceKind.Max ? "max.f32" : "add.rn.f32";
             string acc = accs[0];
             for (int offset = WarpLanes / 2; offset >= 1; offset /= 2)
@@ -2167,6 +2182,8 @@ public sealed partial class PtxAffineEmitter
             }
             else if (spec.Output.IsIntegerValue)
             {
+                if (spec.Output.ElementType != CodegenElementType.Int32)
+                    throw new NotSupportedException("Only an int32 integer-value output is stored; '" + spec.Output.Name + "'.");
                 // An integer-value output (a count): the nearest integer, saturating, NaN to 0 -- cvt.rni's rules,
                 // which the interpreter mirrors.
                 string asInt = NextR();
@@ -2750,18 +2767,21 @@ public sealed partial class PtxAffineEmitter
 
         if (binding.IsIntegerValue)
         {
-            // A count read as a number: every int32 up to 2^24 converts exactly, and rounding beyond that is cvt's.
+            // A count read as a number: every int32 up to 2^24 converts exactly, and rounding beyond that is cvt's. A
+            // byte mask loads zero-extended.
             string raw = NextR();
+            bool bytes = binding.ElementType == CodegenElementType.UInt8;
+            string load = bytes ? "ld.global.nc.u8" : "ld.global.nc.s32";
             if (predicate is null)
             {
-                L($"ld.global.nc.s32 {raw}, [{addr}];");
+                L($"{load} {raw}, [{addr}];");
             }
             else
             {
                 L($"mov.u32 {raw}, 0;");
-                L($"@{predicate} ld.global.nc.s32 {raw}, [{addr}];");
+                L($"@{predicate} {load} {raw}, [{addr}];");
             }
-            L($"cvt.rn.f32.s32 {dst}, {raw};");
+            L(bytes ? $"cvt.rn.f32.u32 {dst}, {raw};" : $"cvt.rn.f32.s32 {dst}, {raw};");
             if (predicate is not null && _outOfRangeFill != "0f00000000")
             {
                 string fill = NextF();
