@@ -1098,8 +1098,31 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
 
     // Graph teardown stays best-effort, but a failure is recorded: an EndGraphLifetime that throws leaves the engine's
     // buffer eviction suspended for the rest of the process, and nothing else would say why (#1558).
-    private static void TraceGraphTeardownFailure(string action, Exception ex) =>
-        Trace.TraceWarning("[CompiledInferencePlan] could not " + action + ": " + ex);
+    private static void TraceGraphTeardownFailure(string action, Exception ex)
+    {
+        try
+        {
+            Trace.TraceWarning("[CompiledInferencePlan] could not " + action + ": " + ex);
+        }
+        catch (Exception listenerFailure)
+        {
+            // A trace listener that throws must not stop teardown: the next step still has to run, and a failed
+            // replay still has to reach its eager fallback. The lost warning is counted and its listener's exception
+            // kept instead (UnreportedTeardownFailures, LastUnreportedTeardownFailure), since tracing it would call
+            // the same listeners again.
+            System.Threading.Interlocked.Increment(ref _unreportedTeardownFailures);
+            System.Threading.Volatile.Write(ref _lastUnreportedTeardownFailure, listenerFailure);
+        }
+    }
+
+    private static int _unreportedTeardownFailures;
+    private static Exception? _lastUnreportedTeardownFailure;
+
+    /// <summary>Teardown failures whose warning could not be traced because a trace listener threw.</summary>
+    internal static int UnreportedTeardownFailures => System.Threading.Volatile.Read(ref _unreportedTeardownFailures);
+
+    /// <summary>The exception the trace listener threw for the latest such failure; null when there has been none.</summary>
+    internal static Exception? LastUnreportedTeardownFailure => System.Threading.Volatile.Read(ref _lastUnreportedTeardownFailure);
 
     /// <summary>Runs one graph-teardown step; a failure is traced and teardown carries on.</summary>
     internal static void BestEffortTeardown(Action step, string action)
