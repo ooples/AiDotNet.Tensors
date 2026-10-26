@@ -108,7 +108,16 @@ public static class PtxResidentComposer
                 throw new NotSupportedException(step.EntryPoint + " runs " + step.BlockX + "-thread blocks; the chain runs " + blockX + ".");
             maxBlocks = Math.Max(maxBlocks, step.Blocks);
             string prefix = "s" + k.ToString(CultureInfo.InvariantCulture) + "_";
-            var stage = Parse(step, prefix);
+            Stage stage;
+            try
+            {
+                stage = Parse(step, prefix);
+            }
+            catch (RegexMatchTimeoutException ex)
+            {
+                // The caller's resident-decline path handles NotSupportedException; a timeout declines the chain too.
+                throw new NotSupportedException(step.EntryPoint + " exceeded the pattern timeout while parsing its PTX.", ex);
+            }
             foreach (string declaration in stage.Externs)
                 if (!externs.Contains(declaration)) externs.Add(declaration);
             foreach (var call in step.Calls)
@@ -218,9 +227,9 @@ public static class PtxResidentComposer
         internal string Body = "";
     }
 
-    private static readonly Regex Label = new(@"^([A-Za-z_]\w*):\s*$", RegexOptions.Compiled);
-    private static readonly Regex SharedDecl = new(@"^\s*\.shared\s+\.align\s+(\d+)\s+\.b8\s+([A-Za-z_]\w*)\[(\d+)\];\s*$", RegexOptions.Compiled);
-    private static readonly Regex RegDecl = new(@"^\s*\.reg\s+\.(pred|b32|b64|f32|f64)\s+%(p|r|rd|f|fd)<(\d+)>;\s*$", RegexOptions.Compiled);
+    private static readonly Regex Label = new(@"^([A-Za-z_]\w*):\s*$", RegexOptions.Compiled, RegexTimeout);
+    private static readonly Regex SharedDecl = new(@"^\s*\.shared\s+\.align\s+(\d+)\s+\.b8\s+([A-Za-z_]\w*)\[(\d+)\];\s*$", RegexOptions.Compiled, RegexTimeout);
+    private static readonly Regex RegDecl = new(@"^\s*\.reg\s+\.(pred|b32|b64|f32|f64)\s+%(p|r|rd|f|fd)<(\d+)>;\s*$", RegexOptions.Compiled, RegexTimeout);
 
     private static Stage Parse(PtxProgramStep step, string prefix)
     {

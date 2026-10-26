@@ -1,6 +1,5 @@
 using System;
 using System.Globalization;
-using System.Threading;
 using AiDotNet.Tensors.Engines.Gpu;
 using Xunit;
 
@@ -14,6 +13,30 @@ public class GpuExecutionOptionsCultureTests
 {
     private const string Prefix = "AIDOTNET_GPU_";
 
+    // Sets a variable and the culture for the scope, and restores both, the variable to whatever it held before.
+    private sealed class Scope : IDisposable
+    {
+        private readonly string _variable;
+        private readonly string? _previousValue;
+        private readonly CultureInfo _previousCulture;
+
+        public Scope(string name, string culture)
+        {
+            _variable = Prefix + name;
+            _previousValue = Environment.GetEnvironmentVariable(_variable);
+            _previousCulture = CultureInfo.CurrentCulture;
+            CultureInfo.CurrentCulture = new CultureInfo(culture);
+        }
+
+        public void Set(string? value) => Environment.SetEnvironmentVariable(_variable, value);
+
+        public void Dispose()
+        {
+            CultureInfo.CurrentCulture = _previousCulture;
+            Environment.SetEnvironmentVariable(_variable, _previousValue);
+        }
+    }
+
     [Theory]
     [InlineData("de-DE")]
     [InlineData("fr-FR")]
@@ -21,37 +44,22 @@ public class GpuExecutionOptionsCultureTests
     public void ADecimalVariableParsesTheSameInEveryCulture(string culture)
     {
         const string Name = "TEST_1557_DOUBLE";
-        var previous = CultureInfo.CurrentCulture;
-        Environment.SetEnvironmentVariable(Prefix + Name, "0.5");
-        try
-        {
-            CultureInfo.CurrentCulture = new CultureInfo(culture);
-            Assert.True(GpuExecutionOptions.TryGetEnvDouble(Name, out double value));
-            Assert.Equal(0.5, value);
-        }
-        finally
-        {
-            CultureInfo.CurrentCulture = previous;
-            Environment.SetEnvironmentVariable(Prefix + Name, null);
-        }
+        using var scope = new Scope(Name, culture);
+        scope.Set("0.5");
+        Assert.True(GpuExecutionOptions.TryGetEnvDouble(Name, out double value));
+        Assert.Equal(0.5, value);
     }
 
     [Fact]
     public void AnUnsetOrUnparsableDecimalVariableIsNotRead()
     {
         const string Name = "TEST_1557_DOUBLE_ABSENT";
-        Environment.SetEnvironmentVariable(Prefix + Name, null);
+        using var scope = new Scope(Name, "en-US");
+        scope.Set(null);
         Assert.False(GpuExecutionOptions.TryGetEnvDouble(Name, out double unset));
         Assert.Equal(0.0, unset);
-        Environment.SetEnvironmentVariable(Prefix + Name, "half");
-        try
-        {
-            Assert.False(GpuExecutionOptions.TryGetEnvDouble(Name, out _));
-        }
-        finally
-        {
-            Environment.SetEnvironmentVariable(Prefix + Name, null);
-        }
+        scope.Set("half");
+        Assert.False(GpuExecutionOptions.TryGetEnvDouble(Name, out _));
     }
 
     [Theory]
@@ -60,21 +68,12 @@ public class GpuExecutionOptionsCultureTests
     public void AnIntegerVariableRejectsGroupSeparatorsInEveryCulture(string culture)
     {
         const string Name = "TEST_1557_INT";
-        var previous = CultureInfo.CurrentCulture;
-        try
-        {
-            CultureInfo.CurrentCulture = new CultureInfo(culture);
-            Environment.SetEnvironmentVariable(Prefix + Name, "4096");
-            Assert.True(GpuExecutionOptions.TryGetEnvInt(Name, out int value));
-            Assert.Equal(4096, value);
-            // "4.096" is a thousands-grouped 4096 only under de-DE; a configuration value must not change meaning there.
-            Environment.SetEnvironmentVariable(Prefix + Name, "4.096");
-            Assert.False(GpuExecutionOptions.TryGetEnvInt(Name, out _));
-        }
-        finally
-        {
-            CultureInfo.CurrentCulture = previous;
-            Environment.SetEnvironmentVariable(Prefix + Name, null);
-        }
+        using var scope = new Scope(Name, culture);
+        scope.Set("4096");
+        Assert.True(GpuExecutionOptions.TryGetEnvInt(Name, out int value));
+        Assert.Equal(4096, value);
+        // "4.096" is a thousands-grouped 4096 only under de-DE; a configuration value must not change meaning there.
+        scope.Set("4.096");
+        Assert.False(GpuExecutionOptions.TryGetEnvInt(Name, out _));
     }
 }

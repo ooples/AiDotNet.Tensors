@@ -59,7 +59,19 @@ internal static class CudaMathLibrary
         lock (s_lock)
         {
             if (s_resolved.TryGetValue(key, out var known)) return known;
-            var function = Derive(kernel, module, module.Source, out string reason);
+            CudaMathFunction? function;
+            string reason;
+            try
+            {
+                function = Derive(kernel, module, module.Source, out reason);
+            }
+            catch (RegexMatchTimeoutException ex)
+            {
+                // A refusal like any other: the kernel keeps its hand-written path and the reason is recorded.
+                System.Diagnostics.Trace.TraceWarning("[CudaMathLibrary] " + kernel + ": source analysis timed out: " + ex);
+                function = null;
+                reason = kernel + ": the source analysis exceeded its pattern timeout";
+            }
             if (function is null) s_refusals[key] = reason;
             s_resolved[key] = function;
             return function;

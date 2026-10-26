@@ -891,7 +891,13 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                         }
                         // Capture failed (a non-capturable op remains) — disable + resume eviction.
                         _graphCaptureDisabled = true;
-                        if (_graphEvictionSuspended) { gte.EndGraphLifetime(); _graphEvictionSuspended = false; }
+                        if (_graphEvictionSuspended)
+                        {
+                            // Best-effort, so the eager fallback below still runs this call.
+                            try { gte.EndGraphLifetime(); }
+                            catch (Exception endEx) { TraceGraphTeardownFailure("end the graph lifetime after a failed capture", endEx); }
+                            _graphEvictionSuspended = false;
+                        }
                     }
                     finally
                     {
@@ -912,7 +918,13 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                         _graphBackend = null;
                         _graphEngine = null;
                     }
-                    if (_graphEvictionSuspended) { gte.EndGraphLifetime(); _graphEvictionSuspended = false; }
+                    if (_graphEvictionSuspended)
+                    {
+                        // Best-effort, so the eager fallback below still runs this call.
+                        try { gte.EndGraphLifetime(); }
+                        catch (Exception endEx) { TraceGraphTeardownFailure("end the graph lifetime after a failed capture", endEx); }
+                        _graphEvictionSuspended = false;
+                    }
                 }
             }
 
