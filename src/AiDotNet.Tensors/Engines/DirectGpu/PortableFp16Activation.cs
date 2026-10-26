@@ -200,6 +200,18 @@ internal static class PortableFp16Activation
         Narrow(backend, c, cHalf, cCount);
     }
 
+    /// <summary>
+    /// <see cref="IFp16ConvBatchedGemmBackend.GemmFp16ConvBatched"/> with a half output on a backend whose native conv
+    /// GEMM writes FP32: <paramref name="gemmFp32Out"/> fills an FP32 scratch of <paramref name="count"/> elements,
+    /// which is narrowed into <paramref name="cHalf"/>.
+    /// </summary>
+    public static void ConvGemmHalfOut(IDirectGpuBackend backend, IGpuBuffer cHalf, int count, Action<IGpuBuffer> gemmFp32Out)
+    {
+        using var c = backend.AllocateBuffer(Math.Max(1, count));
+        gemmFp32Out(c);
+        Narrow(backend, c, cHalf, count);
+    }
+
     public static void CopyBytes(IDirectGpuBackend backend, IGpuBuffer source, IGpuBuffer destination, long byteCount)
     {
         if (source is null) throw new ArgumentNullException(nameof(source));

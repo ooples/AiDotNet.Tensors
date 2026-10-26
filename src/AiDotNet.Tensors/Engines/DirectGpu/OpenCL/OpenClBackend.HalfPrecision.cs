@@ -16,7 +16,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     /// (issue #560) lights up on OpenCL devices — AMD, Intel, and NVIDIA — with
     /// no extra dispatch logic in the engine.
     /// </summary>
-    public sealed partial class OpenClBackend : IGpuHalfPrecisionBackend
+    public sealed partial class OpenClBackend : IGpuHalfPrecisionBackend, IFp16ConvBatchedGemmBackend
     {
         private readonly object _halfGemmLock = new();
         private bool _halfGemmKernelsTried;
@@ -48,6 +48,26 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             int m, int n, int k)
             => DispatchHalfGemm(HalfPrecisionGemmKernels.Fp16In32fOutKernelName,
                 aFp16, bFp16, cFp32, m, n, k, GpuScalarType.Float32);
+
+        /// <inheritdoc/>
+        public void GemmFp16ConvBatched(IGpuBuffer weightsFp16, IGpuBuffer colFp16, IGpuBuffer output, int m, int pixels,
+            int k, int batch, bool halfOutput)
+        {
+            if (weightsFp16 is null) throw new ArgumentNullException(nameof(weightsFp16));
+            if (colFp16 is null) throw new ArgumentNullException(nameof(colFp16));
+            if (output is null) throw new ArgumentNullException(nameof(output));
+            if (m <= 0 || pixels <= 0 || k <= 0 || batch <= 0)
+                throw new ArgumentException($"GEMM dims must be positive (M={m}, pixels={pixels}, K={k}, batch={batch}).");
+            int n = checked(batch * pixels);
+            if (halfOutput)
+            {
+                PortableFp16Activation.ConvGemmHalfOut(this, output, checked(m * n),
+                    scratch => GemmFp16ConvBatched(weightsFp16, colFp16, scratch, m, pixels, k, batch, halfOutput: false));
+                return;
+            }
+            DispatchHalfGemm(HalfPrecisionGemmKernels.Fp16In32fOutNchwKernelName,
+                weightsFp16, colFp16, output, m, n, k, GpuScalarType.Float32, pixels);
+        }
 
         /// <inheritdoc/>
         /// <remarks>
@@ -122,7 +142,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
 
         private void DispatchHalfGemm(string kernelName, IGpuBuffer a, IGpuBuffer b, IGpuBuffer c,
-            int m, int n, int k, GpuScalarType outputType)
+            int m, int n, int k, GpuScalarType outputType, int pixels = 0)
         {
             if (a is null) throw new ArgumentNullException(nameof(a));
             if (b is null) throw new ArgumentNullException(nameof(b));
@@ -149,6 +169,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             kernel.SetArg(arg++, m);
             kernel.SetArg(arg++, n);
             kernel.SetArg(arg++, k);
+            if (pixels > 0) kernel.SetArg(arg++, pixels);   // the NCHW variant's per-image column count
 
             // Global sizes rounded up to a full tile; the kernel guards the
             // out-of-range lanes (they still participate in the local-memory

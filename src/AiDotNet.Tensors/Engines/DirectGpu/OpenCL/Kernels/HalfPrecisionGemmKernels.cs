@@ -45,6 +45,10 @@ internal static class HalfPrecisionGemmKernels
     /// <summary>Kernel name: FP16 inputs, FP32 accumulator + output.</summary>
     public const string Fp16In32fOutKernelName = "gemm_fp16in_fp32out";
 
+    /// <summary>Kernel name: <see cref="Fp16In32fOutKernelName"/> over <c>batch * P</c> columns, stored NCHW (the FP16
+    /// im2col conv's per-image GEMM).</summary>
+    public const string Fp16In32fOutNchwKernelName = "gemm_fp16in_fp32out_nchw";
+
     /// <summary>Kernel name: FP16 inputs, FP32 accumulator, FP16 output.</summary>
     public const string Fp16In16fOutKernelName = "gemm_fp16in_fp16out";
 
@@ -59,6 +63,7 @@ internal static class HalfPrecisionGemmKernels
     public static string[] GetKernelNames() => new[]
     {
         Fp16In32fOutKernelName,
+        Fp16In32fOutNchwKernelName,
         Fp16In16fOutKernelName,
         Fp16BackwardKernelName,
     };
@@ -107,6 +112,44 @@ __kernel void gemm_fp16in_fp32out(
 
     if (row < M && col < N)
         C[row * N + col] = acc;
+}
+
+// gemm_fp16in_fp32out over N = batch * P columns, stored NCHW: column n = b * P + p of row i goes to
+// C[(b * M + i) * P + p] (the FP16 im2col conv's per-image GEMM).
+__kernel void gemm_fp16in_fp32out_nchw(
+    __global const ushort* A,
+    __global const ushort* B,
+    __global float* C,
+    const int M, const int N, const int K, const int P)
+{
+    const int lx = get_local_id(0);
+    const int ly = get_local_id(1);
+    const int col = get_group_id(0) * HGEMM_TS + lx;
+    const int row = get_group_id(1) * HGEMM_TS + ly;
+
+    __local float Asub[HGEMM_TS][HGEMM_TS];
+    __local float Bsub[HGEMM_TS][HGEMM_TS];
+
+    float acc = 0.0f;
+    const int numTiles = (K + HGEMM_TS - 1) / HGEMM_TS;
+    for (int t = 0; t < numTiles; ++t)
+    {
+        const int aCol = t * HGEMM_TS + lx;
+        const int bRow = t * HGEMM_TS + ly;
+        Asub[ly][lx] = (row < M && aCol < K)
+            ? vload_half(row * K + aCol, (__global const half*)A) : 0.0f;
+        Bsub[ly][lx] = (bRow < K && col < N)
+            ? vload_half(bRow * N + col, (__global const half*)B) : 0.0f;
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        for (int kk = 0; kk < HGEMM_TS; ++kk)
+            acc += Asub[ly][kk] * Bsub[kk][lx];
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (row < M && col < N)
+        C[((col / P) * M + row) * P + col % P] = acc;
 }
 
 __kernel void gemm_fp16in_fp16out(

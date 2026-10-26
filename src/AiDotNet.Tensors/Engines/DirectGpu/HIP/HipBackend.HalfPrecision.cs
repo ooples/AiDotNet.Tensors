@@ -21,7 +21,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 /// proven layout rather than re-deriving it.
 /// </para>
 /// </summary>
-public sealed partial class HipBackend : IGpuHalfPrecisionBackend
+public sealed partial class HipBackend : IGpuHalfPrecisionBackend, IFp16ConvBatchedGemmBackend
 {
     /// <inheritdoc/>
     /// <remarks>
@@ -165,6 +165,60 @@ public sealed partial class HipBackend : IGpuHalfPrecisionBackend
             HipBlasNative.HipBlasGemmAlgo.Default);
         if (status != HipBlasNative.HipBlasStatus.Success)
             throw new InvalidOperationException($"hipblasGemmEx(FP16 in / FP32 out) failed: {status}");
+
+        SyncHalfGemm();
+    }
+
+    /// <inheritdoc/>
+    public void GemmFp16ConvBatched(IGpuBuffer weightsFp16, IGpuBuffer colFp16, IGpuBuffer output, int m, int pixels, int k,
+        int batch, bool halfOutput)
+    {
+        if (weightsFp16 is null) throw new ArgumentNullException(nameof(weightsFp16));
+        if (colFp16 is null) throw new ArgumentNullException(nameof(colFp16));
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (m <= 0 || pixels <= 0 || k <= 0 || batch <= 0)
+            throw new ArgumentException($"GEMM dims must be positive (M={m}, pixels={pixels}, K={k}, batch={batch}).");
+        EnsureHalfGemmSupported();
+        int n = checked(batch * pixels);
+        if (!HasVendorHalfGemm)
+        {
+            // The direct path: widen, one FP32 GEMM over the batch ([M][batch][pixels]), then permute to NCHW.
+            using var wFp32 = AllocateBuffer(checked(m * k));
+            using var colFp32 = AllocateBuffer(checked(k * n));
+            using var product = AllocateBuffer(checked(m * n));
+            ConvertToFp32(weightsFp16, wFp32, checked(m * k));
+            ConvertToFp32(colFp16, colFp32, checked(k * n));
+            Gemm(wFp32, colFp32, product, m, n, k);
+            if (!halfOutput)
+            {
+                Permute(product, output, new[] { m, batch, pixels }, new[] { 1, 0, 2 });
+                return;
+            }
+            using var nchw = AllocateBuffer(checked(m * n));
+            Permute(product, nchw, new[] { m, batch, pixels }, new[] { 1, 0, 2 });
+            ConvertToFp16(nchw, output, checked(m * n));
+            return;
+        }
+
+        float alpha = 1.0f, beta = 0.0f;
+        // Row-major out_b[M, P] = W[M, K] @ col_b[K, P] is column-major out_b^T = col_b^T @ W^T: A is the image's col
+        // slice (ld = batch * P, next image P on), B the shared weights (stride 0), C the image's NCHW block.
+        var status = HipBlasNative.hipblasGemmStridedBatchedEx(
+            _hipblasHandle,
+            HipBlasNative.HipBlasOperation.None,
+            HipBlasNative.HipBlasOperation.None,
+            pixels, m, k,
+            ref alpha,
+            ((HipGpuBuffer)colFp16).Handle, HipBlasNative.HipBlasDatatype.R_16F, n, pixels,
+            ((HipGpuBuffer)weightsFp16).Handle, HipBlasNative.HipBlasDatatype.R_16F, k, 0,
+            ref beta,
+            ((HipGpuBuffer)output).Handle,
+            halfOutput ? HipBlasNative.HipBlasDatatype.R_16F : HipBlasNative.HipBlasDatatype.R_32F, pixels, (long)m * pixels,
+            batch,
+            HipBlasNative.HipBlasDatatype.R_32F,
+            HipBlasNative.HipBlasGemmAlgo.Default);
+        if (status != HipBlasNative.HipBlasStatus.Success)
+            throw new InvalidOperationException($"hipblasGemmStridedBatchedEx(FP16 conv) failed: {status}");
 
         SyncHalfGemm();
     }
