@@ -122,6 +122,9 @@ public static partial class WeightRegistry
     /// The byte cap of the restore-array pool (<see cref="GpuOffloadOptions.StreamingRestoreBufferPoolBytes"/>).
     /// Lock-free: a reference read is atomic, and drops call this from inside and outside <c>_lock</c>.
     /// </summary>
+    /// <summary>The configured streaming pool, or <c>null</c> before first use; for diagnostics and tests.</summary>
+    internal static StreamingTensorPool? CurrentStreamingPool => System.Threading.Volatile.Read(ref _streamingPool);
+
     internal static long RestoreBufferPoolCapBytes() => System.Threading.Volatile.Read(ref _options).EffectiveStreamingRestoreBufferPoolBytes();
 
     /// <summary>Registers a weight tensor with the registry. Routes to

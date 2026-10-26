@@ -661,10 +661,11 @@ public sealed class StreamingTensorPool : IDisposable
         lock (_lock)
         {
             ThrowIfDisposed();
-            // Reuse Rehydrate to consolidate the resident-/paged-out
+            // Reuse the rehydrate core to consolidate the resident-/paged-out
             // codepaths, then snapshot the bytes into a caller-owned
-            // array before releasing the lock.
-            var span = Rehydrate(handleId);
+            // array before releasing the lock. Nothing outlives the lock, so the
+            // entry is not lent and a later write-back may still refill it in place.
+            var span = RehydrateCore(handleId, isPrefetch: false, lend: false);
             var copy = new byte[span.Length];
             span.CopyTo(copy);
             return copy;
@@ -689,7 +690,9 @@ public sealed class StreamingTensorPool : IDisposable
         lock (_lock)
         {
             ThrowIfDisposed();
-            var span = Rehydrate(handleId);
+            // Copied out under the lock, so not lent: this is the registry's ordinary restore path, and a lent
+            // entry would make every later write-back allocate a fresh buffer instead of refilling this one.
+            var span = RehydrateCore(handleId, isPrefetch: false, lend: false);
             var rented = RentedSnapshots.Rent(span.Length);
             span.CopyTo(rented);
             length = span.Length;

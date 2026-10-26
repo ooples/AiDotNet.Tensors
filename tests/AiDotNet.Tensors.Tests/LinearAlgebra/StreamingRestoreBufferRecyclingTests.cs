@@ -333,6 +333,37 @@ public class StreamingRestoreBufferRecyclingTests
         }
     }
     /// <summary>
+    /// The registry's own restore path copies the entry out under the pool lock, so it must not mark the entry lent:
+    /// otherwise every write-back after an ordinary Materialize allocates a fresh buffer, which is the allocation
+    /// the in-place refill exists to remove. Each materialize/release cycle of a resident lossless weight refills.
+    /// </summary>
+    [Fact]
+    public void ARegistryMaterialize_LeavesTheEntryRefillableInPlace()
+    {
+        string dir = Configure(restorePoolBytes: 4 * Cap);
+        try
+        {
+            var weight = RegisterWeights(step: 0)[N - 1];   // the most recently registered entry is still resident
+            StreamingTensorPool pool = WeightRegistry.CurrentStreamingPool
+                ?? throw new InvalidOperationException("Registering a streaming weight should have created the pool.");
+            long before = pool.WriteBackInPlaceCount;
+            const int Cycles = 3;
+            for (int cycle = 0; cycle < Cycles; cycle++)
+            {
+                WeightRegistry.Materialize(weight);
+                Assert.Equal(Value(N - 1, L / 3, 0), weight[L / 3]);
+                // The values are unchanged, so each lossless re-encoding has exactly the size the entry holds.
+                WeightRegistry.ReleaseToPool(weight);
+            }
+            Assert.Equal(before + Cycles, pool.WriteBackInPlaceCount);
+        }
+        finally
+        {
+            Cleanup(dir);
+        }
+    }
+
+    /// <summary>
     /// A write-back that fits the entry's resident buffer refills it in place; the entry then reads back exactly
     /// the new content, both resident and after paging to disk and back.
     /// </summary>

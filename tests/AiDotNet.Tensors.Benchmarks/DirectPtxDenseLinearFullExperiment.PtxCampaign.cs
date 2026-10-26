@@ -42,16 +42,21 @@ internal static partial class DirectPtxDenseLinearFullExperiment
         int m = Arg("m", 2048), n = Arg("n", 2048), k = Arg("k", 2048);
         int generations = Arg("generations", 8), islands = Arg("islands", 2);
         string model = Text("model", "claude-opus-5-5");
-        decimal maxUsd = Arg("max-usd", 50);
+        // A dollar cap is fractional ("--max-usd=0.50"), so it is not parsed as an integer.
+        decimal maxUsd = decimal.Parse(Text("max-usd", "50"), System.Globalization.NumberStyles.Number,
+            System.Globalization.CultureInfo.InvariantCulture);
+        if (maxUsd <= 0) throw new ArgumentOutOfRangeException(nameof(args), "--max-usd must be positive.");
         string output = Path.GetFullPath(Text("out", Path.Combine(Path.GetTempPath(), "aidotnet-ptx-campaign",
             target + "-" + DateTime.UtcNow.ToString("yyyyMMddHHmmss", System.Globalization.CultureInfo.InvariantCulture))));
         Directory.CreateDirectory(output);
         using var log = new StreamWriter(Path.Combine(output, "campaign.jsonl"));
+        // stdout keeps the benchmarks' "name_json=" prefix that the other experiments' log scrapers key on; the file is
+        // plain JSON Lines, one record per line, with the record kind as a field.
         void Emit(string kind, object payload)
         {
-            string line = "ptx_campaign_" + kind + "_json=" + JsonSerializer.Serialize(payload);
-            Console.WriteLine(line);
-            log.WriteLine(line);
+            string json = JsonSerializer.Serialize(payload);
+            Console.WriteLine("ptx_campaign_" + kind + "_json=" + json);
+            log.WriteLine(JsonSerializer.Serialize(new { kind, record = payload }));
             log.Flush();
         }
 
@@ -148,25 +153,35 @@ internal static partial class DirectPtxDenseLinearFullExperiment
 
         // 4. The winner must still be correct, qualify under the promotion gate, and be timed against cuBLAS.
         string winner = best.Candidate.CanonicalGenome.Genome.Source;
-        PtxCorrectnessReport check = correctness.Evaluate(winner);
-        PtxTimingReport measured = timing.Measure(winner, incumbent);
         File.WriteAllText(Path.Combine(output, "winner.ptx"), winner);
-        if (check.Passed && measured.QualifiesForPromotion)
+        PtxCorrectnessReport check = correctness.Evaluate(winner);
+        if (!check.Passed)
+        {
+            // A rejected kernel is never launched for timing: it may fault or hang, and the verdict must still be written.
+            Emit("verdict", new { target, m, n, k, sm, promoted = false, correct = false, reason = check.Message, output });
+            return;
+        }
+        PtxTimingReport measured = timing.Measure(winner, incumbent);
+        if (measured.QualifiesForPromotion)
             PtxKernelArtifact.Create(compiler, check, measured, incumbent, timing.Identity).Save(Path.Combine(output, "artifact"));
         CudaGemmRouteDecision vendor = backend.TuneGemmRouteAsync(m, n, k, EvolutionOptions("campaign-cublas-" + target), persist: false)
             .GetAwaiter().GetResult();
+        // Production routing re-tunes on its own, so its paired cuBLAS measurement describes the campaign's incumbent
+        // only when that tune chose the same kernel. Otherwise the comparison is reported as unavailable, never as a
+        // product of two measurements of different kernels.
+        bool sameKernel = string.Equals(vendor.Kernel, incumbentConfig.Name, StringComparison.Ordinal);
         Emit("verdict", new
         {
             target, m, n, k, sm,
-            correct = check.Passed,
+            correct = true,
             qualifies_over_incumbent = measured.QualifiesForPromotion,
             timing = measured.Message,
-            // The parameterized incumbent against cuBLAS, from production routing's own paired measurement; the
-            // rewrite's speedup over the incumbent multiplies it.
-            incumbent_vs_cublas_median = vendor.MedianSpeedup,
+            route_kernel = vendor.Kernel,
+            incumbent_kernel = incumbentConfig.Name,
+            incumbent_vs_cublas_median = sameKernel ? vendor.MedianSpeedup : (double?)null,
             cublas_us = vendor.CublasMicroseconds,
-            incumbent_us = vendor.DirectPtxMicroseconds,
-            estimated_rewrite_vs_cublas = vendor.MedianSpeedup * (best.Evaluation.Quality ?? 0),
+            incumbent_us = sameKernel ? vendor.DirectPtxMicroseconds : (double?)null,
+            estimated_rewrite_vs_cublas = sameKernel ? vendor.MedianSpeedup * (best.Evaluation.Quality ?? 0) : (double?)null,
             output,
         });
     }
