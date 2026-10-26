@@ -65,6 +65,8 @@ public sealed class DeclaredIndexFamilyRouteTests
         {
             using var buffer = backend.AllocateBuffer(seed);
             backend.DeclaredKernelsSwitch = declared;
+            // Forced: the routes are shape-gated by default, and this verifies them at every shape.
+            backend.DeclaredScatterRowsSwitch = declared;
             long before = backend.DeclaredProgramLaunches;
             call(buffer);
             if (declared)
@@ -72,6 +74,7 @@ public sealed class DeclaredIndexFamilyRouteTests
             results[declared ? 1 : 0] = backend.DownloadBuffer(buffer);
         }
         backend.DeclaredKernelsSwitch = null;
+        backend.DeclaredScatterRowsSwitch = null;
         return (results[0], results[1]);
     }
 
@@ -190,7 +193,7 @@ public sealed class DeclaredIndexFamilyRouteTests
         for (int k = 0; k < picks; k++) { iids[k] = random.Next(rows); fids[k] = iids[k] + 0.75f; }
         using var fidBuf = backend.AllocateBuffer(fids);
         using var iidBuf = Ints(backend, iids);
-        var s1 = Both(backend, new float[picks * width], o => backend.IndexSelect(inBuf, fidBuf, o, picks, width));
+        var s1 = Both(backend, new float[picks * width], o => backend.IndexSelect(inBuf, fidBuf, o, picks, width));   // forced by Both
         Assert.Equal(s1.Hand, s1.Declared);
         var s2 = Both(backend, new float[picks * width], o => backend.ScatterAddBackward(inBuf, iidBuf, o, picks, width));
         Assert.Equal(s2.Hand, s2.Declared);

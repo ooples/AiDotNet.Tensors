@@ -32,7 +32,7 @@ public sealed partial class CudaBackend
         IGpuBuffer dense, IGpuBuffer bias, IGpuBuffer output, int rows, int cols, int n, int nnz)
     {
         if (!DeclaredCsrSpMMEnabled || rows <= 0 || cols <= 0 || n <= 0 || nnz <= 0 ||
-            (long)rows * nnz > DeclaredCsrSpMMMaxRowEntries || rowPointers.Size < rows + 1 ||
+            rowPointers.Size < rows + 1 ||
             colIndices.Size < nnz || values.Size < nnz || (long)dense.Size < (long)cols * n || bias.Size < n ||
             (long)output.Size < (long)rows * n)
             return false;
@@ -55,7 +55,7 @@ public sealed partial class CudaBackend
         IGpuBuffer dense, IGpuBuffer output, int rows, int cols, int n, int nnz)
     {
         if (!DeclaredCsrSpMMEnabled || rows <= 0 || cols <= 0 || n <= 0 || nnz <= 0 ||
-            (long)rows * nnz > DeclaredCsrSpMMMaxRowEntries || rowPointers.SizeInBytes < (rows + 1L) * sizeof(int) ||
+            rowPointers.SizeInBytes < (rows + 1L) * sizeof(int) ||
             colIndices.SizeInBytes < (long)nnz * sizeof(int) || values.SizeInBytes < (long)nnz * sizeof(double) ||
             dense.SizeInBytes < (long)cols * n * sizeof(double) || output.SizeInBytes < (long)rows * n * sizeof(double))
             return false;
@@ -72,9 +72,13 @@ public sealed partial class CudaBackend
     internal bool TryDeclaredCsrSddmm(IGpuBuffer rowIndices, IGpuBuffer colIndices, IGpuBuffer x, IGpuBuffer y,
         IGpuBuffer output, int nnz, int innerK)
     {
-        if (!DeclaredCsrSpMMEnabled || nnz <= 0 || innerK <= 0 || rowIndices.Size < nnz || colIndices.Size < nnz ||
+        if (!CsrFamilyAllowed || nnz <= 0 || innerK <= 0 || rowIndices.Size < nnz || colIndices.Size < nnz ||
             output.Size < nnz)
             return false;
+        // 1.1-2.5x for nnz x k from about 100k to a few million; 0.7-0.98x outside (launch-bound below, the
+        // hand-written per-entry dot ahead above).
+        long work = (long)nnz * innerK;
+        if (!CsrFamilyForced && (work < 100_000 || work > 8_000_000)) return false;
         int xRows = x.Size / innerK, yRows = y.Size / innerK;
         if (xRows <= 0 || yRows <= 0) return false;
         var key = new DeclaredKey(DeclaredFamily.CsrSddmm, nnz, innerK, xRows, yRows, 0, 0);
@@ -111,7 +115,7 @@ public sealed partial class CudaBackend
     {
         int entries = colIndices.Size;
         if (!DeclaredCsrSpMMEnabled || rows <= 0 || k <= 0 || n <= 0 || entries <= 0 ||
-            (long)rows * entries > DeclaredCsrSpMMMaxRowEntries || rowPointers.Size < rows + 1 ||
+            rowPointers.Size < rows + 1 ||
             (long)input.Size < (long)k * n || (long)output.Size < (long)rows * n)
             return false;
         var key = new DeclaredKey(family, rows, k, n, entries,
@@ -129,7 +133,10 @@ public sealed partial class CudaBackend
     internal bool TryDeclaredScatterAddEdges(IGpuBuffer input, IGpuBuffer sourceIndices, IGpuBuffer targetIndices,
         IGpuBuffer? edgeValues, IGpuBuffer output, int numNodes, int numEdges, int features)
     {
-        if (!DeclaredCsrSpMMEnabled || numNodes <= 0 || numEdges <= 0 || features <= 0 ||
+        // An inversion (every edge for every node): 1.05-1.32x up to about 20k node-edges, then the atomic and sorted
+        // kernels lead.
+        if (!CsrFamilyForced && (long)numNodes * numEdges > 20_000) return false;
+        if (!CsrFamilyAllowed || numNodes <= 0 || numEdges <= 0 || features <= 0 ||
             (long)numNodes * numEdges > DeclaredCsrSpMMMaxRowEntries || sourceIndices.Size < numEdges ||
             targetIndices.Size < numEdges || (long)input.Size < (long)numNodes * features ||
             (long)output.Size < (long)numNodes * features || (edgeValues is not null && edgeValues.Size < numEdges))

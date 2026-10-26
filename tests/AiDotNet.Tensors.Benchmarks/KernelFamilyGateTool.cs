@@ -8,7 +8,9 @@
 // (default 1.0: no worse than the hand-written kernel).
 //
 // Options: --family <prefix> (only cases whose name starts with it), --samples <n> (default 31), --batch <n> calls per
-// sample (default 10), --min-ratio <r>.
+// sample (default 10), --min-ratio <r>, --deterministic (AiDotNetEngine's deterministic mode, so the incumbents are the
+// deterministic kernels), --gated (a case the declared route declines passes: the hand-written kernel serves it, which
+// is what shape gating decides).
 
 using System;
 using System.Collections.Generic;
@@ -37,6 +39,16 @@ internal static class KernelFamilyGateTool
         int samples = int.Parse(Value(args, "--samples") ?? "31", CultureInfo.InvariantCulture);
         int batch = int.Parse(Value(args, "--batch") ?? "10", CultureInfo.InvariantCulture);
         double minRatio = double.Parse(Value(args, "--min-ratio") ?? "1.0", CultureInfo.InvariantCulture);
+        bool gated = Array.IndexOf(args, "--gated") >= 0;
+        bool deterministic = Array.IndexOf(args, "--deterministic") >= 0;
+        bool previousDeterminism = AiDotNet.Tensors.Engines.AiDotNetEngine.DeterministicMode;
+        AiDotNet.Tensors.Engines.AiDotNetEngine.SetDeterministicMode(deterministic);
+        try { RunCases(only, samples, batch, minRatio, gated, deterministic); }
+        finally { AiDotNet.Tensors.Engines.AiDotNetEngine.SetDeterministicMode(previousDeterminism); }
+    }
+
+    private static void RunCases(string? only, int samples, int batch, double minRatio, bool gated, bool deterministic)
+    {
 
         using var engine = new DirectGpuEngine();
         if (engine.Backend is not CudaBackend backend)
@@ -44,7 +56,8 @@ internal static class KernelFamilyGateTool
             Console.WriteLine("The declared routes are CUDA-only; no CUDA backend here.");
             return;
         }
-        Console.WriteLine("FAMILY GATE (p15) - declared vs hand-written, interleaved paired medians, us per call");
+        Console.WriteLine("FAMILY GATE (p15) - declared vs hand-written, interleaved paired medians, us per call" +
+            (deterministic ? " [deterministic]" : "") + (gated ? " [gated]" : ""));
         Console.WriteLine("case                                            declared us  incumbent us   ratio  routed");
         var failures = new List<string>();
         foreach (var gate in Cases())
@@ -83,11 +96,11 @@ internal static class KernelFamilyGateTool
                 }
                 backend.DeclaredKernelsSwitch = null;
                 double md = Median(declared), mi = Median(incumbent), mr = Median(ratios);
-                bool ok = routed && mr >= minRatio;
+                bool ok = routed ? mr >= minRatio : gated;
                 if (!ok) failures.Add(gate.Name + (routed ? " ratio " + mr.ToString("F2", CultureInfo.InvariantCulture) : " not routed"));
                 Console.WriteLine(gate.Name.PadRight(46) + md.ToString("F1", CultureInfo.InvariantCulture).PadLeft(13) +
                     mi.ToString("F1", CultureInfo.InvariantCulture).PadLeft(14) + mr.ToString("F2", CultureInfo.InvariantCulture).PadLeft(8) +
-                    "x" + (routed ? "  yes" : "  NO") + (ok ? "" : "  FAIL"));
+                    "x" + (routed ? "  yes" : gated ? "  gated" : "  NO") + (ok ? "" : "  FAIL"));
             }
         }
         Console.WriteLine(failures.Count == 0 ? "GATE PASS" : "GATE FAIL: " + string.Join("; ", failures));
@@ -156,7 +169,7 @@ internal static class KernelFamilyGateTool
 
     private static IEnumerable<GateCase> Cases()
     {
-        foreach (var (rows, inner, groups) in new[] { (1000, 16, 37), (4096, 8, 256), (20000, 64, 64) })
+        foreach (var (rows, inner, groups) in new[] { (1000, 16, 37), (4096, 8, 256), (20000, 64, 64), (16384, 128, 256), (65536, 32, 64) })
         {
             string shape = rows + "x" + inner + "->" + groups;
             yield return new GateCase("ScatterMaxArgmaxRows " + shape, b =>
@@ -165,6 +178,20 @@ internal static class KernelFamilyGateTool
                 var src = set.Add(b.AllocateBuffer(Values(r, rows * inner))); var idx = set.Add(Ints(b, GroupIds(r, rows, groups)));
                 var o = set.Add(b.AllocateBuffer(groups * inner)); var a = set.Add(b.AllocateBuffer(groups * inner));
                 return (() => b.ScatterMaxWithArgmaxRows(src, idx, o, a, rows, inner, groups), set);
+            });
+            yield return new GateCase("ScatterMeanRows " + shape, b =>
+            {
+                var r = new Random(31); var set = new BufferSet();
+                var src = set.Add(b.AllocateBuffer(Values(r, rows * inner))); var idx = set.Add(Ints(b, GroupIds(r, rows, groups)));
+                var o = set.Add(b.AllocateBuffer(groups * inner)); var c = set.Add(b.AllocateBuffer(groups));
+                return (() => b.ScatterMeanRowsWithCounts(src, idx, o, c, rows, inner, groups), set);
+            });
+            yield return new GateCase("ScatterSoftmaxRows " + shape, b =>
+            {
+                var r = new Random(32); var set = new BufferSet();
+                var src = set.Add(b.AllocateBuffer(Values(r, rows * inner))); var idx = set.Add(Ints(b, GroupIds(r, rows, groups)));
+                var o = set.Add(b.AllocateBuffer(rows * inner));
+                return (() => b.ScatterSoftmaxRows(src, idx, o, rows, inner, groups), set);
             });
             yield return new GateCase("ScatterAddRows " + shape, b =>
             {
@@ -214,7 +241,7 @@ internal static class KernelFamilyGateTool
             });
         }
 
-        foreach (var (rows, cols, n, density) in new[] { (64, 48, 16, 0.1), (128, 256, 32, 0.05), (512, 512, 64, 0.01) })
+        foreach (var (rows, cols, n, density) in new[] { (64, 48, 16, 0.1), (128, 256, 32, 0.05), (512, 512, 64, 0.01), (2048, 2048, 64, 0.01), (8192, 8192, 128, 0.002), (4096, 1024, 256, 0.05) })
         {
             string shape = rows + "x" + cols + "x" + n;
             Func<CudaBackend, Random, BufferSet, (IGpuBuffer V, IGpuBuffer C, IGpuBuffer R, IGpuBuffer D, int Nnz)> csr = (b, r, set) =>
@@ -278,7 +305,7 @@ internal static class KernelFamilyGateTool
                 });
         }
 
-        foreach (var (nodes, edges, features, weighted) in new[] { (50, 200, 16, false), (300, 1000, 32, true), (1000, 4000, 64, true) })
+        foreach (var (nodes, edges, features, weighted) in new[] { (50, 200, 16, false), (300, 1000, 32, true), (1000, 4000, 64, true), (100, 20000, 128, false) })
             yield return new GateCase("ScatterAddEdges " + nodes + "x" + edges + "x" + features + (weighted ? " w" : ""), b =>
             {
                 var r = new Random(15); var set = new BufferSet();
@@ -291,7 +318,7 @@ internal static class KernelFamilyGateTool
                 return (() => b.ScatterAddEdges(x, s, t, w, o, nodes, edges, features), set);
             });
 
-        foreach (var (outer, idxLen, inner, dst) in new[] { (2, 9, 5, 12), (4, 64, 16, 100), (8, 256, 64, 512) })
+        foreach (var (outer, idxLen, inner, dst) in new[] { (2, 9, 5, 12), (4, 64, 16, 100), (8, 256, 64, 512), (1, 1024, 512, 1024) })
         {
             string shape = outer + "x" + idxLen + "x" + inner + "->" + dst;
             Func<CudaBackend, Random, BufferSet, (IGpuBuffer O, IGpuBuffer I, IGpuBuffer S)> data = (b, r, set) =>
@@ -317,7 +344,7 @@ internal static class KernelFamilyGateTool
             });
         }
 
-        foreach (var (outer, srcDim, dstDim, inner) in new[] { (2, 9, 5, 3), (3, 200, 40, 8), (4, 1024, 256, 16) })
+        foreach (var (outer, srcDim, dstDim, inner) in new[] { (2, 9, 5, 3), (3, 200, 40, 8), (4, 1024, 256, 16), (2, 16384, 32, 64) })
             foreach (int mode in new[] { 0, 1, 2, 3 })
                 yield return new GateCase("ScatterReduce" + mode + " " + outer + "x" + srcDim + "->" + dstDim + "x" + inner, b =>
                 {
@@ -374,7 +401,7 @@ internal static class KernelFamilyGateTool
 
         foreach (var (bt, h, kvh, sq, sk, d, causal) in new[]
                  {
-                     (2, 8, 2, 128, 128, 64, false), (2, 8, 2, 128, 128, 64, true), (1, 32, 8, 256, 256, 128, true),
+                     (2, 8, 2, 128, 128, 64, false), (2, 8, 2, 128, 128, 64, true), (1, 16, 4, 192, 192, 64, true),
                      (4, 32, 8, 1, 1024, 128, true),
                  })
         {

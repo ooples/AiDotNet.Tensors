@@ -11393,9 +11393,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             if (!_kernelCache.TryGetValue("scatter_mean", out var scatterKernel))
                 throw new GpuCapabilityUnavailableException("CUDA kernel not found: scatter_mean");
             uint grid1 = (uint)((sourceSize + DefaultBlockSize - 1) / DefaultBlockSize);
-            void** args1 = stackalloc void*[6];
+            void** args1 = stackalloc void*[7];
             args1[0] = &sPtr; args1[1] = &idxPtr; args1[2] = &oPtr; args1[3] = &cPtr;
-            args1[4] = &sourceSize; args1[5] = &featureSize;
+            args1[4] = &sourceSize; args1[5] = &featureSize; args1[6] = &outputSize;
             LaunchKernel(scatterKernel, grid1, DefaultBlockSize, args1);
         }
 
@@ -13443,8 +13443,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     }
     public unsafe void IndexWrite(IGpuBuffer output, IGpuBuffer indices, IGpuBuffer source, float fillValue, int mode, int outerSize, int idxAxis, int innerSize, int dstAxis)
     {
-        // Declared route (#1441): the same last-index-wins write.
-        if (TryDeclaredIndexWrite(output, indices, source, copy: mode == 0, fillValue, outerSize, idxAxis, innerSize, dstAxis))
+        // Declared route (#1441): the same last-index-wins write, 3.7-4x from dstAxis x idxAxis = 1M (the hand-written
+        // kernel scans every index per element); 0.58-0.83x below half a million.
+        if ((ScatterRowsForced || (long)dstAxis * idxAxis >= 1L << 19) &&
+            TryDeclaredIndexWrite(output, indices, source, copy: mode == 0, fillValue, outerSize, idxAxis, innerSize, dstAxis))
             return;
         var kernel = ResolveParity210Kernel("parity210_index_write");
         using var _ = PushContext();
@@ -19806,8 +19808,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public unsafe void IndexSelect(IGpuBuffer input, IGpuBuffer indices, IGpuBuffer output, int numIndices, int innerSize)
     {
-        // Declared route (#1441): the float-id row gather.
-        if (TryDeclaredRowGatherFloatIds(indices, input, output, numIndices, innerSize)) return;
+        // Declared route (#1441): the float-id row gather. It ties index_select (0.99-1.01x), so it runs only when the
+        // scatter-rows family is forced.
+        if (ScatterRowsForced && TryDeclaredRowGatherFloatIds(indices, input, output, numIndices, innerSize)) return;
         if (!_kernelCache.TryGetValue("index_select", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: index_select");
         using var _ = PushContext();

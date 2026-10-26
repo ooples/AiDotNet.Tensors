@@ -8,23 +8,33 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 public sealed partial class CudaBackend
 {
-    // AIDOTNET_DECLARED_CSR_SPMM=1 opts CsrSpMM into the declared route while it is unpromoted; it is on by default since
-    // its verification on an NVIDIA GPU (see CsrSpMMDeclaredPromoted).
+    // AIDOTNET_DECLARED_CSR_SPMM=1 opts CsrSpMM (every layout, fp64 and the segmented reductions) into the declared
+    // route. It is verified on an NVIDIA GPU but off by default: walking each row's entries it measured 0.45-1.0x of the
+    // hand-written kernels on an RTX 3080, never robustly faster (see CsrSpMMDeclaredPromoted).
     private static readonly bool s_declaredCsrSpMMOptIn =
         Environment.GetEnvironmentVariable("AIDOTNET_DECLARED_CSR_SPMM") == "1";
 
     /// <summary>
-    /// Whether the declared CSR SpMM (#1441) has been verified on an NVIDIA GPU. While false it runs only with
-    /// AIDOTNET_DECLARED_CSR_SPMM=1 (or <see cref="DeclaredCsrSpMMSwitch"/>); the hand-written csr_spmm serves every
-    /// call otherwise. Set it to true once DeclaredCsrSpMMRouteTests passes on the device: the route is then on by
-    /// default, like every other declared family, and AIDOTNET_DECLARED_KERNELS=0 still turns it off.
+    /// Whether the declared CSR SpMM family (#1441) runs by default. It is verified on an NVIDIA GPU
+    /// (DeclaredCsrSpMMRouteTests, DeclaredSparseFamilyRouteTests) but measured no faster than the hand-written kernels
+    /// (--kernel-family-gate: 0.45-1.0x), so it stays false: it runs only with AIDOTNET_DECLARED_CSR_SPMM=1 or
+    /// <see cref="DeclaredCsrSpMMSwitch"/>. SDDMM and the small edge scatter are gated separately (CsrFamilyAllowed).
     /// </summary>
-    internal const bool CsrSpMMDeclaredPromoted = true;
+    internal const bool CsrSpMMDeclaredPromoted = false;
 
     /// <summary>Overrides AIDOTNET_DECLARED_CSR_SPMM for this backend (verification tooling and tests).</summary>
     internal bool? DeclaredCsrSpMMSwitch { get; set; }
 
     private bool DeclaredCsrSpMMEnabled => DeclaredCsrSpMMSwitch ?? (CsrSpMMDeclaredPromoted || s_declaredCsrSpMMOptIn);
+
+    /// <summary>
+    /// The routes of this family that measured faster than their hand-written kernels at some shapes (SDDMM, the small
+    /// edge scatter) run there by default, whatever <see cref="CsrSpMMDeclaredPromoted"/> says; DeclaredCsrSpMMSwitch =
+    /// false still turns them off, and forcing the family (switch true or the env opt-in) runs them at every shape.
+    /// </summary>
+    private bool CsrFamilyAllowed => DeclaredCsrSpMMSwitch != false;
+
+    private bool CsrFamilyForced => DeclaredCsrSpMMSwitch == true || s_declaredCsrSpMMOptIn;
 
     /// <summary>
     /// The most CSR SpMM programs built per backend. Each bakes rows, columns, the dense width and nnz, and nnz varies
@@ -33,8 +43,8 @@ public sealed partial class CudaBackend
     internal const int DeclaredCsrSpMMProgramCap = 32;
 
     /// <summary>
-    /// The largest rows x nnz admitted. The inversion visits every stored entry for every row, against csr_spmm's own
-    /// row's entries only, so it is admitted only where that product stays small: the scatter inversions' budget.
+    /// The largest nodes x edges an edge scatter admits (an inversion: every edge for every node), the scatter
+    /// inversions' budget. CSR SpMM and the segmented reductions walk their own rows' entries and carry no such limit.
     /// </summary>
     internal const long DeclaredCsrSpMMMaxRowEntries = DeclaredScatterRowsWorkLimit;
 
@@ -65,7 +75,7 @@ public sealed partial class CudaBackend
         IGpuBuffer dense, IGpuBuffer output, int rows, int cols, int n, int nnz)
     {
         if (!DeclaredCsrSpMMEnabled || rows <= 0 || cols <= 0 || n <= 0 || nnz <= 0 ||
-            (long)rows * nnz > DeclaredCsrSpMMMaxRowEntries || rowPointers.Size < rows + 1 ||
+            rowPointers.Size < rows + 1 ||
             colIndices.Size < nnz || values.Size < nnz || (long)dense.Size < (long)cols * n ||
             (long)output.Size < (long)rows * n)
             return false;

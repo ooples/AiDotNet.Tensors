@@ -45,6 +45,8 @@ public sealed partial class CudaBackend
     internal bool TryDeclaredScatterMaxArgmaxRows(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output,
         IGpuBuffer argmax, int sourceRows, int innerSize, int outputRows)
     {
+        // 1.27x at 65536 rows; 0.89-0.99x below.
+        if (!ScatterRowsForced && sourceRows < 65536) return false;
         var key = ScatterRowsKey(DeclaredFamily.ScatterMaxArgmaxRows, sourceRows, innerSize, outputRows);
         long cells = (long)outputRows * innerSize;
         if (indices.Size < sourceRows || (long)source.Size < (long)sourceRows * innerSize || output.Size < cells ||
@@ -58,6 +60,8 @@ public sealed partial class CudaBackend
     internal bool TryDeclaredScatterMaxBackwardRows(IGpuBuffer gradOutput, IGpuBuffer argmax, IGpuBuffer gradSource,
         int sourceRows, int innerSize, int outputRows)
     {
+        // 1.69x at 4096x8 -> 256 groups; 0.94-0.98x for wide rows or few groups.
+        if (!ScatterRowsForced && (innerSize > 8 || outputRows < 128)) return false;
         var key = ScatterRowsKey(DeclaredFamily.ScatterMaxBackwardRows, sourceRows, innerSize, outputRows);
         long cells = (long)outputRows * innerSize;
         if (argmax.Size < cells || gradOutput.Size < cells || (long)gradSource.Size < (long)sourceRows * innerSize ||
@@ -71,6 +75,8 @@ public sealed partial class CudaBackend
     internal bool TryDeclaredScatterMeanBackwardRows(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer counts,
         IGpuBuffer gradSource, int sourceRows, int innerSize, int outputRows)
     {
+        // 0.73-0.93x at every shape: forced only.
+        if (!ScatterRowsForced) return false;
         var key = ScatterRowsKey(DeclaredFamily.ScatterMeanBackwardRows, sourceRows, innerSize, outputRows);
         if (counts.Size < outputRows || indices.Size < sourceRows || (long)gradOutput.Size < (long)outputRows * innerSize ||
             (long)gradSource.Size < (long)sourceRows * innerSize ||
@@ -84,6 +90,8 @@ public sealed partial class CudaBackend
     internal bool TryDeclaredScatterSoftmaxBackwardRows(IGpuBuffer gradOutput, IGpuBuffer output, IGpuBuffer indices,
         IGpuBuffer gradSource, int sourceRows, int innerSize, int numGroups)
     {
+        // 1.22x at 4096 rows to 47x at 65536; 0.78x at 1000.
+        if (!ScatterRowsForced && sourceRows < 4096) return false;
         var key = ScatterRowsKey(DeclaredFamily.ScatterSoftmaxBackwardRows, sourceRows, innerSize, numGroups);
         long cells = (long)sourceRows * innerSize;
         if (indices.Size < sourceRows || gradOutput.Size < cells || output.Size < cells || gradSource.Size < cells ||
@@ -98,6 +106,8 @@ public sealed partial class CudaBackend
         int sourceRows, int innerSize, int outputRows)
     {
         if (!DeclaredScatterRowsEnabled) return false;
+        // 1.18-1.42x from 4096 rows; 0.98x at 1000.
+        if (!ScatterRowsForced && sourceRows < 4096) return false;
         return TryDeclaredScatterAddDeterministic(source, indices, output, sourceRows, outputRows, innerSize);
     }
 
@@ -108,6 +118,8 @@ public sealed partial class CudaBackend
     internal bool TryDeclaredScatterAddBackwardRows(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradSource,
         int sourceRows, int innerSize, int outputRows)
     {
+        // A gather that ties its hand-written kernel (0.78-1.08x across runs, 0.89x on the gated rerun): forced only.
+        if (!ScatterRowsForced) return false;
         if (!DeclaredScatterRowsEnabled || sourceRows <= 0 || innerSize <= 0 || outputRows <= 0 ||
             indices.Size < sourceRows || (long)gradOutput.Size < (long)outputRows * innerSize ||
             (long)gradSource.Size < (long)sourceRows * innerSize)
@@ -123,6 +135,8 @@ public sealed partial class CudaBackend
     internal bool TryDeclaredScatterMeanActivation(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output,
         IGpuBuffer counts, int sourceSize, int outputSize, int featureSize)
     {
+        // 0.01-0.74x against the atomic and the sorted/deterministic kernels alike: forced only.
+        if (!ScatterRowsForced) return false;
         if (featureSize <= 0 || outputSize <= 0 || sourceSize <= 0 || sourceSize % featureSize != 0) return false;
         int sourceRows = sourceSize / featureSize;
         var key = ScatterRowsKey(DeclaredFamily.ScatterMeanActivation, sourceRows, outputSize, featureSize);

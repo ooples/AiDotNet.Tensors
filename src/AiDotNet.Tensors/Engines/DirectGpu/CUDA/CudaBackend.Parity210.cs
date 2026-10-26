@@ -269,7 +269,9 @@ public sealed partial class CudaBackend : IParity210Backend
         int outerSize, int dstAxis, int innerSize, int idxLen)
     {
         // Declared route (#1441): deterministic, the last duplicate index winning where the kernel races.
-        if (TryDeclaredIndexWrite(output, indicesInt32, source, copy: true, 0f, outerSize, idxLen, innerSize, dstAxis))
+        // Forced only: the fill measured 0.14-0.93x and the copy shares its incumbent's single pass.
+        if (ScatterRowsForced &&
+            TryDeclaredIndexWrite(output, indicesInt32, source, copy: true, 0f, outerSize, idxLen, innerSize, dstAxis))
             return;
         var kernel = ResolveParity210Kernel("parity210_index_copy");
         using var _ = PushContext();
@@ -287,7 +289,8 @@ public sealed partial class CudaBackend : IParity210Backend
         IGpuBuffer output, IGpuBuffer indicesInt32, float fillValue,
         int outerSize, int dstAxis, int innerSize, int idxLen)
     {
-        if (TryDeclaredIndexWrite(output, indicesInt32, null, copy: false, fillValue, outerSize, idxLen, innerSize, dstAxis))
+        if (ScatterRowsForced &&
+            TryDeclaredIndexWrite(output, indicesInt32, null, copy: false, fillValue, outerSize, idxLen, innerSize, dstAxis))
             return;
         var kernel = ResolveParity210Kernel("parity210_index_fill");
         using var _ = PushContext();

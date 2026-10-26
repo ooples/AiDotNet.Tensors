@@ -1176,11 +1176,13 @@ inline void atomic_add_float(__global volatile float* addr, float val) {
 // then divided by per-output-row count. The atomic_add_float CAS loop is FP-
 // non-deterministic across runs (issue #382). When DeterministicMode is set,
 // dispatch routes to scatter_mean_deterministic below.
-__kernel void scatter_mean(__global const float* source, __global const int* indices, __global volatile float* output, __global volatile int* counts, const int sourceSize, const int featureSize)
+__kernel void scatter_mean(__global const float* source, __global const int* indices, __global volatile float* output, __global volatile int* counts, const int sourceSize, const int featureSize, const int outputSize)
 {
     const int idx = get_global_id(0); if (idx >= sourceSize) return;
     int row = idx / featureSize; int col = idx % featureSize;
     int targetRow = indices[row];
+    // An index outside [0, outputSize) contributes nowhere, as the deterministic variant skips it.
+    if (targetRow < 0 || targetRow >= outputSize) return;
     atomic_add_float(&output[targetRow * featureSize + col], source[idx]);
     if (col == 0) atomic_add(&counts[targetRow], 1);
 }

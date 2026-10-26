@@ -71,6 +71,8 @@ public sealed partial class CudaBackend
     internal bool TryDeclaredIndexAdd(IGpuBuffer output, IGpuBuffer indices, IGpuBuffer source, int outer,
         int destinationAxis, int inner, int indexLength)
     {
+        // 0.94-0.99x small, 0.02-0.10x against the atomic kernel at scale: forced only.
+        if (!ScatterRowsForced) return false;
         if (!DeclaredScatterRowsEnabled || outer <= 0 || destinationAxis <= 0 || inner <= 0 || indexLength <= 0 ||
             (long)destinationAxis * indexLength > DeclaredScatterRowsWorkLimit || indices.Size < indexLength ||
             (long)output.Size < (long)outer * destinationAxis * inner ||
@@ -89,6 +91,9 @@ public sealed partial class CudaBackend
     internal bool TryDeclaredScatterReduce(IGpuBuffer output, IGpuBuffer source, IGpuBuffer index, int outer,
         int sourceDim, int destinationDim, int inner, int mode)
     {
+        // The sum where the compare-and-swap contends -- many sources a destination -- measured 3.7x at 16384 -> 32;
+        // every other mode and shape lost (0.13-0.95x).
+        if (!ScatterRowsForced && !(mode == 0 && sourceDim >= 128L * destinationDim)) return false;
         if (!DeclaredScatterRowsEnabled || mode is < 0 or > 3 || outer <= 0 || sourceDim <= 0 ||
             destinationDim <= 0 || inner <= 0 || (long)sourceDim * destinationDim > DeclaredScatterRowsWorkLimit ||
             (long)index.Size < (long)outer * sourceDim * inner || (long)source.Size < (long)outer * sourceDim * inner ||
@@ -114,6 +119,8 @@ public sealed partial class CudaBackend
     internal bool TryDeclaredMaskedScatter(IGpuBuffer output, IGpuBuffer mask, IGpuBuffer prefix, IGpuBuffer source,
         int total)
     {
+        // 0.42x: forced only.
+        if (!ScatterRowsForced) return false;
         int sourceLength = source.Size;
         if (!DeclaredScatterRowsEnabled || total <= 0 || sourceLength <= 0 || (long)total < DeclaredGatherFloor ||
             mask.Size < total || prefix.Size < total || output.Size < total)
