@@ -82,7 +82,8 @@ internal sealed class PtxFlashAttentionKernel : IDisposable
         arguments[8] = &group;
         arguments[9] = &scaleLog2;
         arguments[10] = &offset;
-        uint gridX = (uint)((querySequence + PtxFlashAttentionGenerator.BlockM - 1) / PtxFlashAttentionGenerator.BlockM);
+        int blockM = PtxFlashAttentionGenerator.BlockM(HeadDimension);
+        uint gridX = (uint)((querySequence + blockM - 1) / blockM);
         _module.Launch(_function, gridX, (uint)(batch * queryHeads), 1, PtxFlashAttentionGenerator.Threads, 1, 1,
             _sharedBytes, arguments, stream);
     }
