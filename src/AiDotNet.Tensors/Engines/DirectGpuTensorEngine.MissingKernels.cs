@@ -2793,22 +2793,22 @@ public partial class DirectGpuTensorEngine
             if (gradOutput.Length < maxIndices.Length)
                 return base.ReduceMaxBackward(gradOutput, maxIndices, inputShape);
 
+            // An index outside the input contributes nothing (the CPU path skips it too); the scatter kernel does not
+            // bounds-check, so such a call stays on the CPU path.
+            for (int i = 0; i < maxIndices.Length; i++)
+                if ((uint)maxIndices[i] >= (uint)inputSize)
+                    return base.ReduceMaxBackward(gradOutput, maxIndices, inputShape);
+
+            // One scatter-add launch: output[maxIndices[i]] += gradOutput[i]. This was four one-element launches per
+            // index, which for Informer's ProbSparse attention (tens of thousands of indices per call) held a single
+            // training step for minutes (AiDotNet#1804).
             using var gradient = GetOrAllocateBuffer(backend, gradOutput);
-            using var current = backend.AllocateBuffer(1);
-            using var update = backend.AllocateBuffer(1);
-            using var sum = backend.AllocateBuffer(1);
+            using var indices = backend.AllocateIntBuffer(maxIndices);
             return DispatchDeferredGpuOp<T>(backend, inputSize, (int[])inputShape.Clone(), output =>
             {
                 backend.Fill(output, 0f, inputSize);
-                for (int i = 0; i < maxIndices.Length; i++)
-                {
-                    int index = maxIndices[i];
-                    if ((uint)index >= (uint)inputSize) continue;
-                    backend.Copy(output, index, current, 0, 1);
-                    backend.Copy(gradient.Buffer, i, update, 0, 1);
-                    backend.Add(current, update, sum, 1);
-                    backend.Copy(sum, 0, output, index, 1);
-                }
+                if (maxIndices.Length > 0)
+                    backend.ScatterAdd(gradient.Buffer, indices, output, maxIndices.Length, inputSize);
             });
         }
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("ValidateHostFloatIds", capabilityGap); return base.ReduceMaxBackward(gradOutput, maxIndices, inputShape); }
@@ -3333,33 +3333,26 @@ public partial class DirectGpuTensorEngine
                 return base.Upsample3DBackward(gradOutput, inputShape, scaleD, scaleH, scaleW);
 
             int inputLength = checked(batch * channels * inputDepth * inputHeight * inputWidth);
+            int gradientLength = checked(inputLength * scaleD * scaleH * scaleW);
+            // Each output gradient flows to the one input cell it was copied from: a fixed index map, applied with one
+            // scatter-add launch instead of four one-element launches per output cell.
+            var target = new int[gradientLength];
+            for (int b = 0; b < batch; b++)
+            for (int c = 0; c < channels; c++)
+            for (int d = 0; d < outputDepth; d++)
+            for (int h = 0; h < outputHeight; h++)
+            for (int w = 0; w < outputWidth; w++)
+            {
+                int gradientIndex = (((b * channels + c) * outputDepth + d) * outputHeight + h) * outputWidth + w;
+                target[gradientIndex] = (((b * channels + c) * inputDepth + d / scaleD)
+                    * inputHeight + h / scaleH) * inputWidth + w / scaleW;
+            }
             using var gradient = GetOrAllocateBuffer(backend, gradOutput);
-            using var current = backend.AllocateBuffer(1);
-            using var update = backend.AllocateBuffer(1);
-            using var sum = backend.AllocateBuffer(1);
+            using var indices = backend.AllocateIntBuffer(target);
             return DispatchDeferredGpuOp<T>(backend, inputLength, (int[])inputShape.Clone(), output =>
             {
                 backend.Fill(output, 0f, inputLength);
-                for (int b = 0; b < batch; b++)
-                for (int c = 0; c < channels; c++)
-                for (int d = 0; d < inputDepth; d++)
-                for (int h = 0; h < inputHeight; h++)
-                for (int w = 0; w < inputWidth; w++)
-                {
-                    int inputIndex = ((((b * channels + c) * inputDepth + d)
-                        * inputHeight + h) * inputWidth + w);
-                    for (int sd = 0; sd < scaleD; sd++)
-                    for (int sh = 0; sh < scaleH; sh++)
-                    for (int sw = 0; sw < scaleW; sw++)
-                    {
-                        int gradientIndex = ((((b * channels + c) * outputDepth + d * scaleD + sd)
-                            * outputHeight + h * scaleH + sh) * outputWidth + w * scaleW + sw);
-                        backend.Copy(output, inputIndex, current, 0, 1);
-                        backend.Copy(gradient.Buffer, gradientIndex, update, 0, 1);
-                        backend.Add(current, update, sum, 1);
-                        backend.Copy(sum, 0, output, inputIndex, 1);
-                    }
-                }
+                backend.ScatterAdd(gradient.Buffer, indices, output, gradientLength, inputLength);
             });
         }
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("ValidateHostFloatIds", capabilityGap); return base.Upsample3DBackward(gradOutput, inputShape, scaleD, scaleH, scaleW); }
