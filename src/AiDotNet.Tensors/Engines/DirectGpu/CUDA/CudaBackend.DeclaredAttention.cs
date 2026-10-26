@@ -133,8 +133,7 @@ public sealed partial class CudaBackend
             headDim >= 1 << AttentionMaskShift || (causal && seqQ != seqK) ||
             (long)batch * heads * seqQ * seqK > AttentionMaxScoreElements)
             return false;
-        var declaredKey = new DeclaredKey(DeclaredFamily.FlashAttentionBackward, batch, heads, seqQ, seqK, scale, 0, null,
-            0, headDim | (causal ? AttentionCausalBit : 0));
+        var declaredKey = FlashAttentionBackwardKey(batch, heads, seqQ, seqK, headDim, scale, causal);
         IGpuBuffer? causalBias = null;
         DeclaredProgram? program;
         lock (_directPtxLock)
@@ -415,6 +414,62 @@ public sealed partial class CudaBackend
         return new DeclaredResidentStage(declaredKey, _buildAttention ??= BuildAttention,
             storeWeights ? s_attentionNames : s_attentionNamesNoWeights,
             new DeclaredBindings(query, key, value, output, mask, causalBias, weights),
+            _lowerAttention ??= pass => LowerAttentionPass(pass, minBlocks: 2));
+    }
+
+    /// <summary>
+    /// The attention backward as a resident-program stage (#1440), in ScaledDotProductAttentionBackward's contract
+    /// (the stored weights); the stage's program is the one the routed call runs for the same key, so a training step's
+    /// forward and backward attention can share one resident launch.
+    /// </summary>
+    internal DeclaredResidentStage AttentionBackwardStage(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key,
+        IGpuBuffer value, IGpuBuffer weights, IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue, int batch,
+        int heads, int seqQ, int seqK, int headDim, float scale)
+    {
+        var declaredKey = AttentionBackwardKey(batch, heads, seqQ, seqK, headDim, scale);
+        lock (_directPtxLock)
+        {
+            if (!_declaredPrograms.ContainsKey(declaredKey) && !IsStreamCapturing())
+                _declaredPrograms[declaredKey] = BuildAttentionProgram(declaredKey, s_buildAttentionBackward,
+                    s_attentionBackwardNames);
+        }
+        return new DeclaredResidentStage(declaredKey, s_buildAttentionBackward, s_attentionBackwardNames,
+            new DeclaredBindings(gradOutput, query, key, value, weights, gradQuery, gradKey, gradValue),
+            _lowerAttention ??= pass => LowerAttentionPass(pass, minBlocks: 2));
+    }
+
+    /// <summary>The key of a FlashAttentionBackward call: the head size and the causal bit share the last slot.</summary>
+    internal static DeclaredKey FlashAttentionBackwardKey(int batch, int heads, int seqQ, int seqK, int headDim,
+        float scale, bool causal) =>
+        new(DeclaredFamily.FlashAttentionBackward, batch, heads, seqQ, seqK, scale, 0, null, 0,
+            headDim | (causal ? AttentionCausalBit : 0));
+
+    /// <summary>
+    /// FlashAttentionBackward as a resident-program stage (#1440), in its stats contract: the weights recomputed from
+    /// <paramref name="softmaxStats"/>. Causal only across equal lengths, as the routed call.
+    /// </summary>
+    internal DeclaredResidentStage FlashAttentionBackwardStage(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key,
+        IGpuBuffer value, IGpuBuffer output, IGpuBuffer softmaxStats, IGpuBuffer gradQuery, IGpuBuffer gradKey,
+        IGpuBuffer gradValue, int batch, int heads, int seqQ, int seqK, int headDim, float scale, bool causal)
+    {
+        if (causal && seqQ != seqK)
+            throw new NotSupportedException("A causal FlashAttentionBackward stage needs equal query and key lengths.");
+        if (headDim <= 0 || headDim >= 1 << AttentionMaskShift)
+            throw new ArgumentOutOfRangeException(nameof(headDim), headDim,
+                "The head size must be positive and below the key's mask field.");
+        var declaredKey = FlashAttentionBackwardKey(batch, heads, seqQ, seqK, headDim, scale, causal);
+        IGpuBuffer? causalBias = null;
+        lock (_directPtxLock)
+        {
+            if (causal && (causalBias = CausalBiasBuffer(seqQ, seqK, out string? biasDecline)) is null)
+                throw new NotSupportedException(biasDecline ?? "The causal attention bias could not be built.");
+            if (!_declaredPrograms.ContainsKey(declaredKey) && !IsStreamCapturing())
+                _declaredPrograms[declaredKey] = BuildAttentionProgram(declaredKey, s_buildFlashBackward,
+                    s_flashBackwardNames);
+        }
+        return new DeclaredResidentStage(declaredKey, s_buildFlashBackward, s_flashBackwardNames,
+            new DeclaredBindings(gradOutput, query, key, value, output, softmaxStats, causalBias, gradQuery, gradKey,
+                gradValue),
             _lowerAttention ??= pass => LowerAttentionPass(pass, minBlocks: 2));
     }
 
