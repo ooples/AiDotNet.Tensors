@@ -35,7 +35,7 @@ public sealed partial class PtxAffineEmitter
         "0d" + BitConverter.DoubleToInt64Bits(value).ToString("X16", CultureInfo.InvariantCulture);
 
     private static string F32Bits(double value) =>
-        "0f" + BitConverter.SingleToInt32Bits((float)value).ToString("X8", CultureInfo.InvariantCulture);
+        "0f" + AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx.PtxCompat.SingleToInt32Bits((float)value).ToString("X8", CultureInfo.InvariantCulture);
 
     private string Lit(double value) => _plainDouble ? D64(value) : F32Bits(value);
 
