@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.143.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.142.0...v0.143.0) (2026-10-26)
+
+
+### ⚠ BREAKING CHANGES
+
+* AiDotNet.Tensors.Engines.DirectGpu.HIP.RocSparse is removed; use CpuSparseDeviceOps, which it always delegated to.
+
+### Features
+
+* close the remaining gaps in [#921](https://github.com/ooples/AiDotNet.Tensors/issues/921), [#515](https://github.com/ooples/AiDotNet.Tensors/issues/515), [#1441](https://github.com/ooples/AiDotNet.Tensors/issues/1441) and [#833](https://github.com/ooples/AiDotNet.Tensors/issues/833) ([#1543](https://github.com/ooples/AiDotNet.Tensors/issues/1543)) ([4aea57d](https://github.com/ooples/AiDotNet.Tensors/commit/4aea57d7f3eb7366ea8d3c46cd93127db4f1e5d8))
+* **codegen:** declare the row-wise scatter mean, softmax and csr spmm ([#1441](https://github.com/ooples/AiDotNet.Tensors/issues/1441)) ([#1546](https://github.com/ooples/AiDotNet.Tensors/issues/1546)) ([cc26929](https://github.com/ooples/AiDotNet.Tensors/commit/cc269299fd5860572f11222009ba4b21e6a18f32))
+
+
+### Bug Fixes
+
+* Clone() of an arena tensor deep-copies instead of sharing copy-on-write ([#653](https://github.com/ooples/AiDotNet.Tensors/issues/653)) ([#1547](https://github.com/ooples/AiDotNet.Tensors/issues/1547)) ([7b0f824](https://github.com/ooples/AiDotNet.Tensors/commit/7b0f8244bf74bdadb103a3f4869ee04176caff9e))
+* **codegen:** SASS scheduler correctness - yield on long stalls, LDS/STS uniform offsets, R2UR spacing ([#1544](https://github.com/ooples/AiDotNet.Tensors/issues/1544)) ([4328dd4](https://github.com/ooples/AiDotNet.Tensors/commit/4328dd43af1af356735a0938d0a02bdb6af641d1))
+* **codegen:** the SASS scheduler schedules the Tensor-Core GEMM again ([#1540](https://github.com/ooples/AiDotNet.Tensors/issues/1540)) ([778a846](https://github.com/ooples/AiDotNet.Tensors/commit/778a84685e3c4a50d5a96e8fcb224cc5f8253447))
+* **simd:** the cached-b gemms and the fused gelu epilogue throw without avx2 ([#1542](https://github.com/ooples/AiDotNet.Tensors/issues/1542)) ([69c026e](https://github.com/ooples/AiDotNet.Tensors/commit/69c026e4ffabd41f1cec91581c32c3126ef26e51))
+
+
+### Performance
+
+* **codegen:** SASS instruction reordering - the [#1442](https://github.com/ooples/AiDotNet.Tensors/issues/1442) gate met (TF32 Tensor-Core GEMM 1.13x ptxas) ([#1545](https://github.com/ooples/AiDotNet.Tensors/issues/1545)) ([ec84bfd](https://github.com/ooples/AiDotNet.Tensors/commit/ec84bfd13e86d50e334a0e94c3236b56f35cd231))
+* **ptx:** FP32 GEMM register-pipelined fragments and a leaner cp.async loop ([#1538](https://github.com/ooples/AiDotNet.Tensors/issues/1538)) ([5f78dc9](https://github.com/ooples/AiDotNet.Tensors/commit/5f78dc9f3f74a008650da16943af968c7aafb95f))
+
 ## [0.142.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.141.0...v0.142.0) (2026-10-23)
 
 
