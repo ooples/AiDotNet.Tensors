@@ -3071,6 +3071,10 @@ public sealed class GradientTape<T> : IDisposable
         }
         DifferentiableOps._threadTapeDepth--;
         SetCurrentTape(_parent);
+        // The step boundary for recycled streaming restore arrays (#2322): once no tape is active anywhere, no
+        // closure recorded on one can still read an array a dropped weight released, so the parked ones may be reused.
+        if (_parent is null && !DifferentiableOps.AnyTapeActive())
+            LinearAlgebra.StreamingRestoreBuffers.ReleaseParked();
         // AiDotNet#1340: explicitly clear the cached delegate chain's
         // per-step references (Output / Inputs / SavedState / Backward)
         // BEFORE nulling the chain pointer. Without this, if any external

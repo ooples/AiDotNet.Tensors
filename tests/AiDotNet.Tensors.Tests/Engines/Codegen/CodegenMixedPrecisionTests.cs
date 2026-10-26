@@ -163,7 +163,8 @@ public class CodegenMixedPrecisionTests
 
     /// <summary>An element type the emitter cannot store is refused, not silently widened.</summary>
     [Theory]
-    [InlineData(CodegenElementType.Float64)]
+    [InlineData(CodegenElementType.Int64)]
+    [InlineData(CodegenElementType.FP8_E4M3)]
     public void UnsupportedElementType_IsRefused(CodegenElementType type)
     {
         Assert.Throws<ArgumentException>(() => new CodegenTensorBinding(

@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // CUDA activation kernels and simple elementwise ops.
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
 {
@@ -624,13 +624,16 @@ extern ""C"" __global__ __launch_bounds__(256) void bilinear_upsample2d(const fl
 // ===========================================================================
 // scatter_mean — atomic accumulator. NON-DETERMINISTIC (issue #382);
 // see scatter_mean_deterministic below.
-extern ""C"" __global__ __launch_bounds__(256) void scatter_mean(const float* __restrict__ source, const int* __restrict__ indices, float* __restrict__ output, int* __restrict__ counts, int sourceSize, int featureSize)
+extern ""C"" __global__ __launch_bounds__(256) void scatter_mean(const float* __restrict__ source, const int* __restrict__ indices, float* __restrict__ output, int* __restrict__ counts, int sourceSize, int featureSize, int outputSize)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= sourceSize) return;
     int row = idx / featureSize;
     int col = idx % featureSize;
     int targetRow = indices[row];
+    // An index outside [0, outputSize) contributes nowhere, as the deterministic variant skips it; unchecked it wrote
+    // before or past the output buffer (CUDA 700 on a -1 id, #1441).
+    if (targetRow < 0 || targetRow >= outputSize) return;
     atomicAdd(&output[targetRow * featureSize + col], source[idx]);
     if (col == 0) atomicAdd(&counts[targetRow], 1);
 }

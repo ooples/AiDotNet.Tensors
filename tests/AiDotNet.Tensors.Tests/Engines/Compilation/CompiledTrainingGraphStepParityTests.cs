@@ -108,10 +108,11 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         public int MixedMaskReplays;   // replays whose copy mask held some inputs but not all
         public long InputCopiesSkipped;   // replays' skipped input copies (unchanged inputs)
         public long ResidentCopiesSkipped;   // ... of device-resident inputs, on an unchanged version alone
-        public bool ClobberedLossGradient;   // the loss gradient's device buffer was zeroed between replays
+        public bool ClobberedLossGradient;
+        public bool ReleasedIntermediatePending;   // a forward intermediate held a download from a released buffer at retirement   // the loss gradient's device buffer was zeroed between replays
     }
 
-    private static Run Train(DirectGpuTensorEngine gpu, bool capture, bool failCapture = false, bool composedMse = false, bool failInsideCapture = false, bool releasedInputBinding = false, bool retireGraphBeforeLastRead = false, bool droppedTargetBinding = false, int nonFiniteStep = -1, double maxGradNorm = 0, int clipOffFromStep = int.MaxValue, LrSchedule? schedule = null, OptimizerType optimizer = OptimizerType.Adam, int clipOnFromStep = int.MaxValue, bool pingPong = true, int feedEvery = 1, int feedTargetEvery = 0, bool poisonSkippedStaging = false, bool clobberLossGradient = false, bool residentInputs = false)
+    private static Run Train(DirectGpuTensorEngine gpu, bool capture, bool failCapture = false, bool composedMse = false, bool failInsideCapture = false, bool releasedInputBinding = false, bool retireGraphBeforeLastRead = false, bool releasedIntermediateDownload = false, bool droppedTargetBinding = false, int nonFiniteStep = -1, double maxGradNorm = 0, int clipOffFromStep = int.MaxValue, LrSchedule? schedule = null, OptimizerType optimizer = OptimizerType.Adam, int clipOnFromStep = int.MaxValue, bool pingPong = true, int feedEvery = 1, int feedTargetEvery = 0, bool poisonSkippedStaging = false, bool clobberLossGradient = false, bool residentInputs = false)
     {
         var x = Rand([Batch, Inputs], 1, 1f);
         var y = Rand([Batch, Outputs], 2, 1f);
@@ -228,7 +229,26 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                 // plan computed a wrong loss or reported one it never downloaded.
                 double reference = CpuLoss(x, y, parameters, composedMse);
                 var lossTensor = plan.Step();
-                if (retireGraphBeforeLastRead && s == Steps - 1)
+                if (releasedIntermediateDownload && s == Steps - 1)
+                {
+                    // A forward intermediate whose pending download reads a device buffer the pool already took back,
+                    // as an aliased output can be by the time the plan retires (TFT on the GPU): retiring must not
+                    // materialize it, the next forward recomputes it.
+                    var backend = gpu.GetBackend()!;
+                    var lossOutput = typeof(CompiledTrainingPlan<float>)
+                        .GetField("_lossOutput", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(concrete);
+                    var steps = (CompiledStep<float>[])typeof(CompiledTrainingPlan<float>)
+                        .GetField("_forwardSteps", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(concrete)!;
+                    var intermediate = steps.Select(st => st.OutputBuffer)
+                        .First(o => !ReferenceEquals(o, lossOutput) && o._gpuBuffer is not null);
+                    var key = intermediate.GetBackingArrayForCacheLookupUnsafe()!;
+                    var released = backend.AllocateBuffer(new float[intermediate.Length]);
+                    AiDotNet.Tensors.Helpers.HostSync.Register(key, arr =>
+                        System.Array.Copy(backend.DownloadBuffer(released), (float[])arr, intermediate.Length));
+                    released.Dispose();
+                    run.ReleasedIntermediatePending = AiDotNet.Tensors.Helpers.HostSync.IsPending(key);
+                }
+                if ((retireGraphBeforeLastRead || releasedIntermediateDownload) && s == Steps - 1)
                 {
                     // Retire the replayed graph BEFORE anything reads this step's results, as ConfigureOptimizer,
                     // EnableFrozenWeightOptimizations and Dispose do: the rollback must land the device results on
@@ -249,7 +269,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                 .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(concrete)!;
             run.Losses = losses;
             run.FinalWeights = parameters.Select(p => p.ToArray()).ToArray();
-            run.ReplayedAGraph = exec != IntPtr.Zero || retireGraphBeforeLastRead;
+            run.ReplayedAGraph = exec != IntPtr.Zero || retireGraphBeforeLastRead || releasedIntermediateDownload;
             run.LastGradients = lastGradients;
             run.StepStates = states;
             // Read before anything else resolves the plan's step count: a checkpoint must resolve it itself.
@@ -712,6 +732,36 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
 
             var eager = Train(gpu, capture: false);
             var retired = Train(gpu, capture: true, retireGraphBeforeLastRead: true);
+            int last = Steps - 1;
+            Assert.True(Math.Abs(eager.Losses[last] - retired.Losses[last]) <= 1e-5 * Math.Max(1, Math.Abs(eager.Losses[last])),
+                $"last loss after retiring the graph {retired.Losses[last]:G6} != eager {eager.Losses[last]:G6}");
+            for (int p = 0; p < eager.LastGradients.Length; p++)
+                for (int i = 0; i < eager.LastGradients[p].Length; i++)
+                    Assert.True(Math.Abs(eager.LastGradients[p][i] - retired.LastGradients[p][i]) <= 1e-5f,
+                        $"grad {p}[{i}] after retiring the graph {retired.LastGradients[p][i]} != eager {eager.LastGradients[p][i]}");
+        }
+    }
+
+    /// <summary>
+    /// Retiring a replayed graph lands the step's RESULTS on the host, not its forward intermediates: an intermediate
+    /// can hold a pending download from a device buffer the pool has already taken back, and materializing it threw
+    /// ObjectDisposedException out of Dispose (AiDotNet's TFT on the GPU, AiDotNet#1804). The results must still land.
+    /// </summary>
+    [SkippableFact]
+    public void Retiring_a_replayed_graph_skips_an_intermediate_whose_buffer_was_released()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                "Whole-step graph capture is CUDA-only.");
+            Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                "Graph capture is disabled for this process.");
+
+            var eager = Train(gpu, capture: false);
+            var retired = Train(gpu, capture: true, releasedIntermediateDownload: true);
+            Assert.True(retired.ReleasedIntermediatePending, "the released intermediate's download was not pending, so the test proves nothing");
             int last = Steps - 1;
             Assert.True(Math.Abs(eager.Losses[last] - retired.Losses[last]) <= 1e-5 * Math.Max(1, Math.Abs(eager.Losses[last])),
                 $"last loss after retiring the graph {retired.Losses[last]:G6} != eager {eager.Losses[last]:G6}");

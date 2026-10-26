@@ -29,7 +29,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 /// kernel is needed because the data is already f32.
 /// </para>
 /// </summary>
-public sealed partial class WebGpuBackend : IGpuHalfPrecisionBackend
+public sealed partial class WebGpuBackend : IGpuHalfPrecisionBackend, IFp16ConvBatchedGemmBackend
 {
     /// <inheritdoc/>
     /// <remarks>
@@ -96,6 +96,33 @@ public sealed partial class WebGpuBackend : IGpuHalfPrecisionBackend
         // Inputs already carry FP16 precision (f32 storage, truncated mantissa);
         // the WGSL GEMM accumulates in f32 and writes an f32 result.
         Gemm(aFp16, bFp16, cFp32, m, n, k);
+    }
+
+    /// <inheritdoc/>
+    public void GemmFp16ConvBatched(IGpuBuffer weightsFp16, IGpuBuffer colFp16, IGpuBuffer output, int m, int pixels, int k,
+        int batch, bool halfOutput)
+    {
+        if (weightsFp16 is null) throw new ArgumentNullException(nameof(weightsFp16));
+        if (colFp16 is null) throw new ArgumentNullException(nameof(colFp16));
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (m <= 0 || pixels <= 0 || k <= 0 || batch <= 0)
+            throw new ArgumentException($"GEMM dims must be positive (M={m}, pixels={pixels}, K={k}, batch={batch}).");
+        int n = checked(batch * pixels);
+        if (halfOutput)
+        {
+            PortableFp16Activation.ConvGemmHalfOut(this, output, checked(m * n),
+                scratch => GemmFp16ConvBatched(weightsFp16, colFp16, scratch, m, pixels, k, batch, halfOutput: false));
+            return;
+        }
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(m),
+            BitConverter.Int32BitsToSingle(n),
+            BitConverter.Int32BitsToSingle(k),
+            BitConverter.Int32BitsToSingle(pixels),
+        };
+        Dispatch3BufferAsync("ConvGemmNchw", WebGpuKernels.ConvGemmNchwSource, "conv_gemm_nchw",
+            weightsFp16, colFp16, output, uniforms, checked(m * n)).GetAwaiter().GetResult();
     }
 
     /// <inheritdoc/>

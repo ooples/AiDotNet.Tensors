@@ -6887,6 +6887,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // 4x4→N=16) are tiny GEMMs where the im2col + launch overhead exceeds the win. Gate on N/K/M so
                 // only the large convs take the FP16 path; the small ones stay on the FP32 conv kernel.
                 bool fp16ConvWorth = gemmN > Fp16ConvTinyGemmN && gemmK >= 64 && gemmM >= 16;
+                // col[K, b*oh*ow] holds image b's columns at b*oh*ow, so one GEMM over the batch writes [outC][b][oh*ow],
+                // not NCHW: a batch above one needs the per-image GEMM (else it takes the FP32 conv below).
+                var batchedConvGemm = b > 1 ? rbk as IFp16ConvBatchedGemmBackend : null;
+                if (b > 1 && batchedConvGemm is null) fp16ConvWorth = false;
                 if (s_fp16Conv && fp16ConvWorth
                     && rbk is Engines.Gpu.IGpuHalfPrecisionBackend hbConvR
                     && hbConvR.SupportsHgemm && hbConvR.Fp16Im2colAvailable)
@@ -6902,12 +6906,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     // FP16-act: keep the conv OUTPUT FP16 (GemmFp16HalfOut) + tag, so the next op reads FP16 (no convert).
                     if (Fp16ActEnabled && rbk is IFp16ActivationBackend { SupportsFp16ActivationStorage: true } cbOut)
                     {
-                        cbOut.GemmFp16HalfOut(wHalf, colHalf, outBuf, M, N, K);
+                        if (batchedConvGemm is not null)
+                            batchedConvGemm.GemmFp16ConvBatched(wHalf, colHalf, outBuf, M, oh * ow, K, b, halfOutput: true);
+                        else
+                            cbOut.GemmFp16HalfOut(wHalf, colHalf, outBuf, M, N, K);
                         ResidentSyncCheck("Conv2DInto");
                         BindResidentBufferFp16(output, outBuf, rbk, M * N);
                         return;
                     }
-                    hbConvR.GemmFp16In32fOut(wHalf, colHalf, outBuf, M, N, K);
+                    if (batchedConvGemm is not null)
+                        batchedConvGemm.GemmFp16ConvBatched(wHalf, colHalf, outBuf, M, oh * ow, K, b, halfOutput: false);
+                    else
+                        hbConvR.GemmFp16In32fOut(wHalf, colHalf, outBuf, M, N, K);
                 }
                 else if (s_fp16Conv && gemmN <= Fp16ConvTinyGemmN && gemmK >= 64 && gemmM >= 16
                     && rbk is IFp16ActivationBackend cudaDirectConv && cudaDirectConv.Fp16DirectConvAvailable)

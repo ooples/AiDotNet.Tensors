@@ -938,10 +938,25 @@ public sealed partial class PtxAffineEmitter
         foreach (int f in factors) lanes *= f;
         long threads = spec.Output.ElementCount / Math.Max(1, lanes);
         double blocks = Math.Max(1.0, (threads + BlockThreads - 1) / (double)BlockThreads);
-        double occupancy = 1.0 + OccupancyCoefficient / Math.Max(blocks / Multiprocessors, 0.05);
+        // An inversion (a source admitted by an indirect shift: the scatters and segment reductions) gains no reuse
+        // from a tile -- every lane reads its own range test -- so its occupancy is floored at one block rather than a
+        // twentieth of a wave. Under the general floor every grid below 3.4 blocks looked equally occupied, the tie went
+        // to the largest tile, and a small scatter ran one block on the whole device (0.4x of its hand-written kernel,
+        // #1441). The general floor stays for everything else, whose tiles it was tuned on.
+        double floor = IsInversion(spec) ? 1.0 / Multiprocessors : 0.05;
+        double occupancy = 1.0 + OccupancyCoefficient / Math.Max(blocks / Multiprocessors, floor);
 
         // Compute never binds for these kernels, so the two memory terms decide it.
         return Math.Max(loadInstructions, dramEquivalent) * occupancy;
+    }
+
+    // True when a product operand is admitted through an indirect shift (CodegenIndirectIndex.Offset).
+    private static bool IsInversion(CodegenKernelSpec spec)
+    {
+        foreach (int inputIndex in spec.ProductInputs)
+            foreach (var indirect in spec.Inputs[inputIndex].Indirect)
+                if (indirect?.Offset is not null) return true;
+        return false;
     }
 
     /// <summary>Loads per MAC for a candidate tile, from operand dependence alone.</summary>
@@ -994,6 +1009,15 @@ public sealed partial class PtxAffineEmitter
     public bool VectorTileReductions { get; set; }
 
     /// <summary>
+    /// How many trips of a long inversion's reduction are unrolled into one loop trip (1 leaves it rolled); see
+    /// CodegenReductionUnroll.
+    /// </summary>
+    public int ReductionUnroll { get; set; } = s_reductionUnroll;
+
+    private static readonly int s_reductionUnroll =
+        int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_REDUCTION_UNROLL"), out int unroll) && unroll >= 1 ? unroll : 16;
+
+    /// <summary>
     /// True when <paramref name="axis"/> indexes the binding's unit-stride dimension
     /// directly and covers all of it -- the condition under which four consecutive
     /// values of that axis are four consecutive, in-range, aligned floats.
@@ -1001,6 +1025,8 @@ public sealed partial class PtxAffineEmitter
     private static bool IsUnitStrideIn(
         CodegenTensorBinding binding, int axis, IReadOnlyList<CodegenAxis> axes)
     {
+        // An integer-value tensor converts element by element; it never takes a vector path.
+        if (binding.IsIntegerValue) return false;
         int last = binding.Map.Count - 1;
         if (last < 0 || binding.Stride(last) != 1) return false;
 
@@ -1099,10 +1125,32 @@ public sealed partial class PtxAffineEmitter
     {
         if (spec is null) throw new ArgumentNullException(nameof(spec));
 
+        // An fp64 tensor makes the whole spec fp64, and a data-dependent reduction extent is a loop with run-time
+        // bounds: only the plain lowering emits either (PtxAffineEmitter.Plain).
+        if (LowersPlainly(spec)) return EmitPlain(spec, computeMajor, computeMinor);
+
         // A non-real algebra takes its own path, leaving everything below untouched. See
         // PtxAffineEmitter.Algebra.cs for why that separation is deliberate rather than lazy.
         if (spec.Algebra != CodegenAlgebra.Real)
             return EmitAlgebraic(spec, computeMajor, computeMinor);
+
+        // A long inversion (a scatter or segment reduction over thousands of sources) is a rolled loop whose every trip
+        // waits on its own index load; split by ReductionUnroll it issues that many independent loads a trip, as the
+        // hand-written kernels' unrolled loops do, and visits the terms in the same order.
+        if (ReductionUnroll > 1 && IsInversion(spec) && spec.Space.ReductionAxes.Length == 1 &&
+            spec.Space.ReductionTripCount > FullUnrollLimit)
+        {
+            // The largest power of two up to ReductionUnroll that divides the extent: 16 measured fastest where it
+            // divides (1.21x of the hand-written scatter at 4096 and 20000 rows), and a factor that does not divide
+            // would leave the whole loop rolled (0.48x at 1000 rows).
+            long extent = spec.Space.ReductionTripCount;
+            for (int factor = ReductionUnroll; factor >= 2; factor /= 2)
+                if (extent % factor == 0 && CodegenReductionUnroll.TrySplit(spec, factor) is { } unrolled)
+                {
+                    spec = unrolled;
+                    break;
+                }
+        }
 
         if (EnableStreamingRows && CodegenRowFusion.TryPlanStreaming(spec) is { } stream)
             return EmitRowProgram(stream, spec.Name, computeMajor, computeMinor);
@@ -1241,7 +1289,7 @@ public sealed partial class PtxAffineEmitter
                 // The staged slice is addressed in 4-byte units and re-read as f32, so a
                 // narrow binding would be staged at the wrong stride. Excluded until the
                 // staging path carries an element size of its own.
-                if (spec.Inputs[inputIdx].NeedsConversion) continue;
+                if (spec.Inputs[inputIdx].NeedsConversion || spec.Inputs[inputIdx].IsIntegerValue) continue;
 
                 bool varies = false;
                 foreach (int ax in varyingAxes)
@@ -1358,7 +1406,7 @@ public sealed partial class PtxAffineEmitter
                 foreach (int inputIdx in spec.ProductInputs)
                 {
                     var binding = spec.Inputs[inputIdx];
-                    if (binding.NeedsConversion) continue;   // see the flat staging note
+                    if (binding.NeedsConversion || binding.IsIntegerValue) continue;   // see the flat staging note
 
                     // Keyed by this dimension only if it varies here and is invariant in
                     // the other -- that invariance is the reuse being exploited.
@@ -1449,7 +1497,12 @@ public sealed partial class PtxAffineEmitter
         _stageLabel = 0;
 
         // The out-of-range fill is the reduction's identity, not always zero.
-        _outOfRangeFill = spec.Reduce == CodegenReduceKind.Max ? "0fFF800000" : "0f00000000";
+        _outOfRangeFill = spec.Reduce switch
+        {
+            CodegenReduceKind.Max => "0fFF800000",
+            CodegenReduceKind.Product => "0f3F800000",
+            _ => "0f00000000",
+        };
 
         // Under a maximum, a product of operands has no single sensible identity: -inf times
         // a positive operand is -inf, but -inf times zero is NaN.
@@ -1591,9 +1644,12 @@ public sealed partial class PtxAffineEmitter
         for (int l = 0; l < lanes; l++)
         {
             accs[l] = NextF();
-            L(spec.Reduce == CodegenReduceKind.Max
-                ? $"mov.f32 {accs[l]}, 0fFF800000;   // -inf"
-                : $"mov.f32 {accs[l]}, 0f00000000;");
+            L(spec.Reduce switch
+            {
+                CodegenReduceKind.Max => $"mov.f32 {accs[l]}, 0fFF800000;   // -inf",
+                CodegenReduceKind.Product => $"mov.f32 {accs[l]}, 0f3F800000;   // 1",
+                _ => $"mov.f32 {accs[l]}, 0f00000000;",
+            });
         }
 
         // One index register per lane, tracking which reduction term is currently winning.
@@ -1604,7 +1660,7 @@ public sealed partial class PtxAffineEmitter
             for (int l = 0; l < lanes; l++)
             {
                 argIndex[l] = NextR();
-                L($"mov.u32 {argIndex[l]}, 0;");
+                L($"mov.u32 {argIndex[l]}, {I(spec.SecondaryNoWinnerIndex)};");
             }
         }
 
@@ -1944,9 +2000,12 @@ public sealed partial class PtxAffineEmitter
                 // normalisation or convolution routes. A product with an indirect Skip test needs it
                 // too: there a rejected entry stands for "no term at all" (CSR SpMM's entries of
                 // other rows), and 0 times another operand's infinity is NaN, not 0.
+                // Under a product the fill is 1, and 1 times the other operands is not the identity, so a guarded
+                // term of a product always selects it.
                 if (productPred is not null &&
                     (spec.Body is not null || spec.PreBiasInput.HasValue ||
-                     spec.PreReduce != CodegenPreReduceOp.None || SkipsIndirectInProduct(spec)))
+                     spec.PreReduce != CodegenPreReduceOp.None || SkipsIndirectInProduct(spec) ||
+                     (spec.Reduce == CodegenReduceKind.Product && spec.ProductInputs.Count > 1)))
                 {
                     string identity = NextF(), kept = NextF();
                     L($"mov.f32 {identity}, {_outOfRangeFill};");
@@ -1969,16 +2028,19 @@ public sealed partial class PtxAffineEmitter
 
                         string candidate = EmitAffine(
                             spec.SecondaryIndexExpr!, laneAxisReg[l], reductionValues, reduction);
-                        string chosen = NextR();
-                        L($"selp.b32 {chosen}, {candidate}, {argIndex[l]}, {beats};");
-                        argIndex[l] = chosen;
+                        // In place, as max.f32 updates the accumulator: in a rolled reduction loop the register is
+                        // loop-carried, and a fresh one per trip would leave the next trip comparing against the
+                        // initial index (every looped argmax came out as its no-winner value).
+                        L($"selp.b32 {argIndex[l]}, {candidate}, {argIndex[l]}, {beats};");
                     }
                     L($"max.f32 {accs[l]}, {accs[l]}, {product!};");
                 }
                 else
                 {
                     string na = NextF();
-                    L($"add.rn.f32 {na}, {accs[l]}, {product!};");
+                    L(spec.Reduce == CodegenReduceKind.Product
+                        ? $"mul.rn.f32 {na}, {accs[l]}, {product!};"
+                        : $"add.rn.f32 {na}, {accs[l]}, {product!};");
                     accs[l] = na;
                 }
             }
@@ -2015,6 +2077,8 @@ public sealed partial class PtxAffineEmitter
             if (blockThreads % WarpLanes != 0)
                 throw new InvalidOperationException(
                     "Warp reduction needs a whole number of warps per block; got " + I(blockThreads) + ".");
+            if (spec.Reduce == CodegenReduceKind.Product)
+                throw new NotSupportedException("A warp-reduced product is not lowered; the lane spec refuses it.");
             string combineOp = spec.Reduce == CodegenReduceKind.Max ? "max.f32" : "add.rn.f32";
             string acc = accs[0];
             for (int offset = WarpLanes / 2; offset >= 1; offset /= 2)
@@ -2152,7 +2216,7 @@ public sealed partial class PtxAffineEmitter
                 //
                 // The destination must be zeroed by the caller before launch, since this
                 // adds to whatever is already there.
-                if (spec.Output.NeedsConversion)
+                if (spec.Output.NeedsConversion || spec.Output.IsIntegerValue)
                     throw new NotSupportedException(
                         "A scatter destination must be fp32: there is no atomic add for a " +
                         "16-bit float here, and emulating one with a compare-and-swap loop " +
@@ -2161,6 +2225,17 @@ public sealed partial class PtxAffineEmitter
                 if (lanePred is null) L($"red.global.add.f32 [{laneAddr}], {acc};");
                 else L($"@{lanePred} red.global.add.f32 [{laneAddr}], {acc};");
                 AtomicStores++;
+            }
+            else if (spec.Output.IsIntegerValue)
+            {
+                if (spec.Output.ElementType != CodegenElementType.Int32)
+                    throw new NotSupportedException("Only an int32 integer-value output is stored; '" + spec.Output.Name + "'.");
+                // An integer-value output (a count): the nearest integer, saturating, NaN to 0 -- cvt.rni's rules,
+                // which the interpreter mirrors.
+                string asInt = NextR();
+                L($"cvt.rni.s32.f32 {asInt}, {acc};");
+                if (lanePred is null) L($"st.global.s32 [{laneAddr}], {asInt};");
+                else L($"@{lanePred} st.global.s32 [{laneAddr}], {asInt};");
             }
             else if (spec.Output.NeedsConversion)
             {
@@ -2182,8 +2257,16 @@ public sealed partial class PtxAffineEmitter
                 string secondAddr = NextRd(), secondByte = NextRd();
                 L($"mul.wide.u32 {secondByte}, {secondOff}, 4;");
                 L($"add.u64 {secondAddr}, {basePtr[spec.SecondaryOutput.ParameterIndex]}, {secondByte};");
-                if (secondPred is null) L($"st.global.u32 [{secondAddr}], {argIndex[l]};");
-                else L($"@{secondPred} st.global.u32 [{secondAddr}], {argIndex[l]};");
+                string stored = argIndex[l], storeType = "u32";
+                if (spec.SecondaryIndexAsFloat)
+                {
+                    // Declared as a float position (the row-wise scatter maximum's argmax buffer): exact to 2^24.
+                    stored = NextF();
+                    storeType = "f32";
+                    L($"cvt.rn.f32.s32 {stored}, {argIndex[l]};");
+                }
+                if (secondPred is null) L($"st.global.{storeType} [{secondAddr}], {stored};");
+                else L($"@{secondPred} st.global.{storeType} [{secondAddr}], {stored};");
             }
 
             // EVERY REMAINING EXTRA OUTPUT, from the SAME accumulator. The count is not
@@ -2221,6 +2304,10 @@ public sealed partial class PtxAffineEmitter
                 L($"mul.wide.u32 {extraByte}, {extraOff}, {I(extra.Binding.ElementBytes)};");
                 L($"add.u64 {extraAddr}, {basePtr[extra.Binding.ParameterIndex]}, {extraByte};");
 
+                if (extra.Binding.IsIntegerValue)
+                    throw new NotSupportedException(
+                        "Extra output '" + extra.Binding.Name + "' is declared as integer values; only the primary " +
+                        "output converts to int32.");
                 if (extra.Binding.NeedsConversion)
                 {
                     string narrowedExtra = EmitNarrow(extra.Binding.ElementType, value);
@@ -2586,7 +2673,16 @@ public sealed partial class PtxAffineEmitter
             long span = (long)term.Coefficient * (axesMeta[term.Axis].Extent - 1);
             if (term.Coefficient >= 0) rangeHi += span; else rangeLo += span;
         }
-        bool canEscape = bounded && (expr.Divisor != 1 || rangeLo < 0 || rangeHi >= dim);
+        // A floor division of a never-negative numerator (a grouped head, h / g) stays inside [lo / d, hi / d], so it
+        // needs a guard only when that range leaves the dimension -- as any other index. An exact division keeps its
+        // own predicate above, and a possibly negative numerator truncates toward zero, so both stay guarded.
+        if (expr.Divisor > 1 && !expr.RequiresExactDivision && rangeLo >= 0)
+        {
+            rangeLo /= expr.Divisor;
+            rangeHi /= expr.Divisor;
+        }
+        bool divides = expr.Divisor != 1 && (expr.RequiresExactDivision || rangeLo < 0);
+        bool canEscape = bounded && (divides || rangeLo < 0 || rangeHi >= dim);
         if (!canEscape) ElidedGuards++;
         if (canEscape)
         {
@@ -2723,6 +2819,33 @@ public sealed partial class PtxAffineEmitter
         string byteOff = NextRd(), addr = NextRd(), dst = NextF();
         L($"mul.wide.s32 {byteOff}, {offset}, {I(binding.ElementBytes)};");
         L($"add.u64 {addr}, {basePtr}, {byteOff};");
+
+        if (binding.IsIntegerValue)
+        {
+            // A count read as a number: every int32 up to 2^24 converts exactly, and rounding beyond that is cvt's. A
+            // byte mask loads zero-extended.
+            string raw = NextR();
+            bool bytes = binding.ElementType == CodegenElementType.UInt8;
+            string load = bytes ? "ld.global.nc.u8" : "ld.global.nc.s32";
+            if (predicate is null)
+            {
+                L($"{load} {raw}, [{addr}];");
+            }
+            else
+            {
+                L($"mov.u32 {raw}, 0;");
+                L($"@{predicate} {load} {raw}, [{addr}];");
+            }
+            L(bytes ? $"cvt.rn.f32.u32 {dst}, {raw};" : $"cvt.rn.f32.s32 {dst}, {raw};");
+            if (predicate is not null && _outOfRangeFill != "0f00000000")
+            {
+                string fill = NextF();
+                L($"mov.f32 {fill}, {_outOfRangeFill};");
+                L($"selp.f32 {dst}, {dst}, {fill}, {predicate};");
+            }
+            EmittedLoads++;
+            return dst;
+        }
 
         if (binding.NeedsConversion)
         {

@@ -422,6 +422,8 @@ public sealed class CodegenTensorBinding
     public int ElementBytes => ElementType switch
     {
         CodegenElementType.Float16 or CodegenElementType.BFloat16 => 2,
+        CodegenElementType.UInt8 => 1,
+        CodegenElementType.Float64 => 8,
         _ => 4,
     };
 
@@ -429,7 +431,16 @@ public sealed class CodegenTensorBinding
     /// True when this tensor holds indices rather than values, so it may be read only as an
     /// index source and never as an arithmetic operand.
     /// </summary>
-    public bool IsIndexTensor => ElementType == CodegenElementType.Int32;
+    public bool IsIndexTensor => ElementType == CodegenElementType.Int32 && !IsIntegerValue;
+
+    /// <summary>
+    /// True for an int32 (or uint8) tensor declared as holding VALUES -- a count or a byte mask, read or written as a
+    /// number -- rather than indices. Its loads convert exactly to fp32 (<c>cvt.rn.f32.s32</c> / <c>.u32</c>) and an
+    /// int32 store rounds the fp32 result to the nearest integer (<c>cvt.rni.s32.f32</c>); it can never address another
+    /// tensor. Only the generic affine path lowers one: the planners that rebuild bindings (row fusion, split and warp
+    /// reductions, implicit GEMM) refuse it.
+    /// </summary>
+    public bool IsIntegerValue { get; }
 
     /// <summary>True when a load has to widen, or a store narrow, to reach fp32.</summary>
     public bool NeedsConversion =>
@@ -470,15 +481,26 @@ public sealed class CodegenTensorBinding
         CodegenAffineExpr[] map,
         bool isOutput = false,
         CodegenElementType elementType = CodegenElementType.Float32,
-        CodegenIndirectIndex?[]? indirect = null)
+        CodegenIndirectIndex?[]? indirect = null,
+        bool integerValue = false)
     {
         ElementType = elementType;
+        if (integerValue && elementType is not (CodegenElementType.Int32 or CodegenElementType.UInt8))
+            throw new ArgumentException(
+                "Only an int32 or uint8 tensor can be declared as integer values; '" + name + "' is " + elementType + ".",
+                nameof(integerValue));
+        if (elementType == CodegenElementType.UInt8 && !integerValue)
+            throw new ArgumentException(
+                "A uint8 tensor is admitted only as integer values (a byte mask read as a number); '" + name + "'.",
+                nameof(elementType));
+        IsIntegerValue = integerValue;
         // Int32 is admitted for INDEX tensors only. Making it a real element type rather
         // than letting an index tensor masquerade as fp32 is what lets the emitter refuse to
         // multiply by one: a gather's index buffer read as a float operand would produce
         // arithmetic out of a bit pattern, silently.
         if (elementType is not (CodegenElementType.Float32 or CodegenElementType.Float16
-                or CodegenElementType.BFloat16 or CodegenElementType.Int32))
+                or CodegenElementType.BFloat16 or CodegenElementType.Int32 or CodegenElementType.UInt8
+                or CodegenElementType.Float64))
             throw new ArgumentException(
                 "The PTX emitter stores fp32, fp16, bf16, or int32 indices; got " + elementType +
                 ". Anything else must be refused here rather than silently emitted as fp32.",

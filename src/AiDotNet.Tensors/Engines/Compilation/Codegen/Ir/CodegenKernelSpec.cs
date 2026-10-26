@@ -24,7 +24,13 @@ public enum CodegenReduceKind
     Sum,
 
     /// <summary>Maximum of the operand product over the reduction axes.</summary>
-    Max
+    Max,
+
+    /// <summary>
+    /// Product of the terms over the reduction axes, in reduction order (identity 1). Only the generic affine
+    /// lowering supports it: row fusion, split and warp reductions, and the tiled emitters refuse it.
+    /// </summary>
+    Product
 }
 
 /// <summary>
@@ -86,13 +92,37 @@ public enum CodegenExtraOutputKind
 /// multiplier on the primary result.</param>
 /// <param name="BiasInput">Optional input added after that multiplier.</param>
 /// <param name="BiasScale">Multiplier on that input.</param>
+/// <param name="NoWinnerIndex">For <see cref="CodegenExtraOutputKind.ArgMaxIndex"/>, what is written when no term
+/// beats the reduction's identity (an empty group, or every term -infinity or NaN): a max-pool's 0, or the -1 a
+/// row-wise scatter maximum's backward reads as "no source row".</param>
+/// <param name="IndexAsFloat">For <see cref="CodegenExtraOutputKind.ArgMaxIndex"/>, write the position as a float
+/// (exact up to 2^24) instead of as a 32-bit integer.</param>
 public sealed record CodegenExtraOutput(
     CodegenTensorBinding Binding,
     CodegenExtraOutputKind Kind,
     CodegenAffineExpr? IndexExpr = null,
     double Scale = 1.0,
     int? BiasInput = null,
-    double BiasScale = 1.0);
+    double BiasScale = 1.0,
+    int NoWinnerIndex = 0,
+    bool IndexAsFloat = false);
+
+/// <summary>
+/// A data-dependent reduction extent (#1441): the spec's single reduction axis <paramref name="Axis"/> runs over
+/// <c>[indices[Position], indices[Position + 1])</c> -- a CSR row's entries -- rather than its whole declared extent,
+/// which becomes only the bound every index is clamped to. <paramref name="IndexInput"/> is an int32 index tensor, or a
+/// float32 one with <paramref name="FloatIndices"/> (truncated as <c>(int)</c>). <paramref name="Initial"/>, when set, is
+/// the accumulator's starting value instead of the reduction's identity (csr_segmented_max starts from -3.402823e38);
+/// <paramref name="EmptyValue"/>, when set, is written for an empty range in place of the reduced value and epilogue.
+/// Only the plain lowering emits such a spec: every planner that retiles or splits a reduction refuses it.
+/// </summary>
+public sealed record CodegenReductionRange(
+    int Axis,
+    int IndexInput,
+    CodegenAffineExpr Position,
+    bool FloatIndices = false,
+    double? Initial = null,
+    double? EmptyValue = null);
 
 /// <summary>Epilogue activation applied after bias and scale.</summary>
 public enum CodegenActivationKind
@@ -169,6 +199,39 @@ public sealed class CodegenKernelSpec
     /// <summary>The tensor the kernel writes.</summary>
     public CodegenTensorBinding Output { get; }
 
+    /// <summary>The data-dependent extent of the reduction, or null for a full one (see <see cref="CodegenReductionRange"/>).</summary>
+    public CodegenReductionRange? ReductionRange { get; }
+
+    /// <summary>
+    /// True when any binding is stored as Float64: the spec computes in fp64, which only the plain fp64 lowering
+    /// (PtxAffineEmitter.Double) emits; every planner that rebuilds or retiles a spec refuses one.
+    /// </summary>
+    public bool HasDoubles
+    {
+        get
+        {
+            if (Output.ElementType == CodegenElementType.Float64) return true;
+            foreach (var input in _inputs) if (input.ElementType == CodegenElementType.Float64) return true;
+            foreach (var extra in _extraOutputs) if (extra.Binding.ElementType == CodegenElementType.Float64) return true;
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// True when any binding is an int32 tensor of values (<see cref="CodegenTensorBinding.IsIntegerValue"/>). Only the
+    /// generic affine lowering converts those; every planner that rebuilds bindings refuses such a spec.
+    /// </summary>
+    public bool HasIntegerValues
+    {
+        get
+        {
+            if (Output.IsIntegerValue) return true;
+            foreach (var input in _inputs) if (input.IsIntegerValue) return true;
+            foreach (var extra in _extraOutputs) if (extra.Binding.IsIntegerValue) return true;
+            return false;
+        }
+    }
+
     /// <summary>Indices into <see cref="Inputs"/> whose loads are multiplied inside the reduction.</summary>
     public IReadOnlyList<int> ProductInputs => _productInputs;
 
@@ -235,6 +298,12 @@ public sealed class CodegenKernelSpec
     /// numbers while corrupting every gradient.
     /// </remarks>
     public CodegenAffineExpr? SecondaryIndexExpr => FirstArgMax?.IndexExpr;
+
+    /// <summary>What <see cref="SecondaryOutput"/> holds when no term wins (see <see cref="CodegenExtraOutput.NoWinnerIndex"/>).</summary>
+    public int SecondaryNoWinnerIndex => FirstArgMax?.NoWinnerIndex ?? 0;
+
+    /// <summary>Whether <see cref="SecondaryOutput"/> holds the position as a float rather than an integer.</summary>
+    public bool SecondaryIndexAsFloat => FirstArgMax?.IndexAsFloat ?? false;
 
     /// <summary>The first argmax extra, which is what the legacy secondary pair named.</summary>
     private CodegenExtraOutput? FirstArgMax
@@ -353,10 +422,12 @@ public sealed class CodegenKernelSpec
         double reduceOffset = 0.0,
         int? postScaleInput = null,
         int? postBiasInput = null,
-        CodegenExpr? body = null)
+        CodegenExpr? body = null,
+        CodegenReductionRange? reductionRange = null)
     {
         if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Kernel needs a name.", nameof(name));
         Name = name;
+        ReductionRange = reductionRange;
         Space = space ?? throw new ArgumentNullException(nameof(space));
         _inputs = inputs ?? throw new ArgumentNullException(nameof(inputs));
         Output = output ?? throw new ArgumentNullException(nameof(output));
@@ -574,6 +645,26 @@ public sealed class CodegenKernelSpec
         if (!output.IsOutput)
             throw new ArgumentException("Output binding must be marked IsOutput.", nameof(output));
 
+        if (reductionRange is not null)
+        {
+            if (space.ReductionAxes.Length != 1 || space.ReductionAxes[0] != reductionRange.Axis)
+                throw new ArgumentException(
+                    "A reduction range must name the spec's single reduction axis.", nameof(reductionRange));
+            Require(reductionRange.IndexInput, nameof(reductionRange));
+            var rangeSource = inputs[reductionRange.IndexInput];
+            if (reductionRange.FloatIndices ? rangeSource.ElementType != CodegenElementType.Float32 : !rangeSource.IsIndexTensor)
+                throw new ArgumentException(
+                    "A reduction range reads its bounds from an int32 index tensor, or a float32 one declared FloatIndices; '" +
+                    rangeSource.Name + "' is " + rangeSource.ElementType + ".", nameof(reductionRange));
+            if (Array.IndexOf(productInputs, reductionRange.IndexInput) >= 0)
+                throw new ArgumentException("The range's index tensor cannot also be an operand.", nameof(reductionRange));
+            foreach (var term in reductionRange.Position.Terms)
+                if (space.Axes[term.Axis].IsReduction)
+                    throw new ArgumentException("A range's position reads parallel axes only.", nameof(reductionRange));
+            if (reductionRange.Position.Divisor != 1)
+                throw new ArgumentException("A range's position is a plain affine index.", nameof(reductionRange));
+        }
+
         bool hasReductionAxis = space.ReductionAxes.Length > 0;
         if (hasReductionAxis && reduce == CodegenReduceKind.None)
             throw new ArgumentException("Reduction axes declared but reduce kind is None.", nameof(reduce));
@@ -774,6 +865,35 @@ public sealed class CodegenKernelSpec
         return output;
     }
 
+    // The value an empty reduction, or an out-of-range term, contributes.
+    private static double Identity(CodegenReduceKind reduce) => reduce switch
+    {
+        CodegenReduceKind.Max => double.NegativeInfinity,
+        CodegenReduceKind.Product => 1.0,
+        _ => 0.0,
+    };
+
+    /// <summary>
+    /// The emitter's <c>max.f32</c> (and the hand-written kernels' <c>fmaxf</c>): a NaN operand yields the other one,
+    /// so a NaN term never wins a maximum. <see cref="Math.Max(double, double)"/> propagates NaN instead, which made the
+    /// oracle disagree with every kernel on a NaN input.
+    /// </summary>
+    internal static double MaxLikeTheDevice(double acc, double term) =>
+        double.IsNaN(acc) ? term : double.IsNaN(term) ? acc : Math.Max(acc, term);
+
+    /// <summary>
+    /// What <c>cvt.rni.s32.f32</c> stores for an integer-value output: the nearest integer (ties to even), NaN as 0,
+    /// saturated to the int32 range. The accumulator is first rounded to fp32, as the device holds it.
+    /// </summary>
+    internal static double RoundToInt32LikeTheDevice(double value)
+    {
+        double asFloat = (float)value;
+        if (double.IsNaN(asFloat)) return 0;
+        if (asFloat >= int.MaxValue) return int.MaxValue;
+        if (asFloat <= int.MinValue) return int.MinValue;
+        return Math.Round(asFloat, MidpointRounding.ToEven);
+    }
+
     /// <summary>Refuses an int32 index tensor used where a value operand is expected.</summary>
     private void RefuseIndexOperand(int input, string role)
     {
@@ -908,9 +1028,23 @@ public sealed class CodegenKernelSpec
             }
             for (int r = 0; r < reduction.Length; r++) values[reduction[r]] = 0;
 
-            double acc = Reduce == CodegenReduceKind.Max ? double.NegativeInfinity : 0.0;
-            long argIndex = 0;
+            double acc = Identity(Reduce);
+            long argIndex = SecondaryNoWinnerIndex;
             long trips = Space.ReductionTripCount;
+
+            // A data-dependent range: [indices[position], indices[position + 1]), clamped to the axis' extent.
+            int rangeLo = 0, rangeHi = int.MaxValue;
+            if (ReductionRange is { } range)
+            {
+                if (range.Initial is { } initial) acc = initial;
+                var source = inputData[range.IndexInput];
+                int position = range.Position.Evaluate(values, out _);
+                int Bound(int at) => at < 0 || at >= source.Length ? 0
+                    : range.FloatIndices ? CodegenIndirectIndex.TruncateLikeTheDevice((float)source[at]) : (int)source[at];
+                int extent = axes[range.Axis].Extent;
+                rangeLo = Math.Max(0, Bound(position));
+                rangeHi = Math.Min(extent, Bound(position + 1));
+            }
 
             for (long t = 0; t < trips; t++)
             {
@@ -921,6 +1055,9 @@ public sealed class CodegenKernelSpec
                     values[reduction[r]] = (int)(rrest % extent);
                     rrest /= extent;
                 }
+                if (ReductionRange is { } active &&
+                    (values[active.Axis] < rangeLo || values[active.Axis] >= rangeHi))
+                    continue;
 
                 double product = 1.0;
                 bool anyOutOfBounds = false;
@@ -955,7 +1092,7 @@ public sealed class CodegenKernelSpec
                 // the exact-agreement gate passed it -- the one failure mode a shared oracle
                 // cannot catch. It is latent only because maxpool2d_2x2 has no padding.
                 if (anyOutOfBounds)
-                    product = Reduce == CodegenReduceKind.Max ? double.NegativeInfinity : 0.0;
+                    product = Identity(Reduce);
 
                 // The pre-reduction slot: a broadcast shift, then an elementwise transform,
                 // applied to EACH term before it is combined. This is what softmax's
@@ -991,7 +1128,8 @@ public sealed class CodegenKernelSpec
                 acc = Reduce switch
                 {
                     CodegenReduceKind.Sum => acc + product,
-                    CodegenReduceKind.Max => Math.Max(acc, product),
+                    CodegenReduceKind.Product => acc * product,
+                    CodegenReduceKind.Max => MaxLikeTheDevice(acc, product),
                     _ => product
                 };
             }
@@ -1024,6 +1162,7 @@ public sealed class CodegenKernelSpec
                 if (ok) acc += inputData[PostBiasInput.Value][off];
             }
             acc = ApplyActivation(Activation, acc);
+            if (ReductionRange is { EmptyValue: { } emptyValue } && rangeLo >= rangeHi) acc = emptyValue;
 
             for (int e = 0; e < _extraOutputs.Length; e++)
             {
@@ -1058,6 +1197,7 @@ public sealed class CodegenKernelSpec
                 // embedding backward are the ordinary case, not the corner case -- and the
                 // emitter lowers that to red.global.add.f32. An oracle that assigned would
                 // disagree with a CORRECT kernel and look like a kernel bug.
+                if (Output.IsIntegerValue) acc = RoundToInt32LikeTheDevice(acc);
                 if (Output.NeedsAtomicStore) output[outOff] += acc;
                 else output[outOff] = acc;
             }

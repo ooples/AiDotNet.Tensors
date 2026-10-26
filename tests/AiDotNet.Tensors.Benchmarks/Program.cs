@@ -1,4 +1,4 @@
-﻿using System.Linq;
+using System.Linq;
 using BenchmarkDotNet.Configs;
 using BenchmarkDotNet.Running;
 using AiDotNet.Tensors.Benchmarks;
@@ -246,6 +246,11 @@ class Program
         {
             int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
             DirectPtxFusedLinearExperiment.Run(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--ptx-campaign")
+        {
+            DirectPtxDenseLinearFullExperiment.RunPtxCampaign(args);
             return;
         }
         if (args.Length > 0 && args[0] == "--direct-ptx-dense-linear-full")
@@ -622,6 +627,12 @@ class Program
         if (args.Length > 0 && args[0] == "--kernel-dump")
         {
             KernelConveyorTool.Run("dump", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-family-gate")
+        {
+            KernelFamilyGateTool.Run(args.Skip(1).ToArray());
             return;
         }
 

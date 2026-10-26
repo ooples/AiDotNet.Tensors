@@ -117,6 +117,36 @@ void main() {
 }";
 
     /// <summary>
+    /// <see cref="GemmFp16In32fOut"/> over <c>N = batch * P</c> columns, stored NCHW: column <c>n = b * P + p</c> of
+    /// row <c>i</c> goes to <c>C[(b * M + i) * P + p]</c> (the FP16 im2col conv's per-image GEMM). Push constants
+    /// carry {M, N, K, P}.
+    /// </summary>
+    public static string GemmFp16In32fOutNchw => Header + @"
+layout(set=0,binding=0) readonly buffer Ab { uint Apacked[]; };
+layout(set=0,binding=1) readonly buffer Bb { uint Bpacked[]; };
+layout(set=0,binding=2) writeonly buffer Cb { float C[]; };
+layout(push_constant) uniform PC { uint M; uint N; uint K; uint P; };
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= M * N) return;
+    uint row = gid / N;
+    uint col = gid % N;
+    uint aBase = row * K;
+    float acc = 0.0;
+    for (uint kk = 0u; kk < K; ++kk) {
+        uint ae = aBase + kk;
+        uint be = kk * N + col;
+        vec2 ap = unpackHalf2x16(Apacked[ae >> 1]);
+        vec2 bp = unpackHalf2x16(Bpacked[be >> 1]);
+        float av = ((ae & 1u) == 0u) ? ap.x : ap.y;
+        float bv = ((be & 1u) == 0u) ? bp.x : bp.y;
+        acc += av * bv;
+    }
+    C[((col / P) * M + row) * P + col % P] = acc;
+}";
+
+    /// <summary>
     /// Generalized transposed FP16 GEMM for the fused matmul BACKWARD: <c>C[Mo,No] = op(A)·op(B)</c>, FP16
     /// packed inputs, FP32 accumulator + output. <c>transA</c>/<c>transB</c> (0/1, via push constants) select how
     /// each logical operand is read from storage with no materialized transpose — op(A) logical [Mo,Kc]:

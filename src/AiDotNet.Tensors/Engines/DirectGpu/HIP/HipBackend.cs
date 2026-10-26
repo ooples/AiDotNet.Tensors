@@ -3062,7 +3062,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         else
         {
             if (!_kernelCache.TryGetValue("scatter_mean", out var k1)) throw new GpuCapabilityUnavailableException("HIP kernel not found: scatter_mean");
-            void** a1 = stackalloc void*[6]; a1[0] = &sPtr; a1[1] = &idxPtr; a1[2] = &oPtr; a1[3] = &cPtr; a1[4] = &sourceSize; a1[5] = &featureSize;
+            void** a1 = stackalloc void*[7]; a1[0] = &sPtr; a1[1] = &idxPtr; a1[2] = &oPtr; a1[3] = &cPtr; a1[4] = &sourceSize; a1[5] = &featureSize; a1[6] = &outputSize;
             LaunchKernel(k1, (uint)((sourceSize + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, a1);
         }
 

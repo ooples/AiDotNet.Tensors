@@ -40,13 +40,15 @@ public sealed class CrossBackendKernelCoverageTests
     private const int GenuineGapFloor = 0;
 
     // OpenCL-specific plumbing CUDA/HIP cover via cuBLAS / cudaMemset — mirrored by design, never ported.
+    // gemm_fp16in_fp32out_nchw is the batched fp16 im2col conv's per-image GEMM: CUDA runs it as
+    // cublasGemmStridedBatchedEx and HIP as hipblasGemmStridedBatchedEx (IFp16ConvBatchedGemmBackend).
     private static readonly HashSet<string> OpenClOnlyByDesign = new(StringComparer.Ordinal)
     {
         "CopyMatrix", "CopyMatrixFast", "CopyPadMatrix", "TransposeMatrix", "TransposeMatrixFast",
         "TransposePadMatrix", "XgemmDirectNN", "XgemmDirectNT", "XgemmDirectTN", "XgemmDirectTT",
         "copy_block_2d", "copy_rows", "copy_submatrix", "fill_buffer", "gemm_batched_tiled",
         "gemm_clblast_rdna1", "gemm_coalesced", "gemm_double_buffered", "gemm_fp16_backward",
-        "gemm_fp16in_fp16out", "gemm_fp16in_fp32out", "gemm_kreg4", "gemm_low_register", "gemm_medium_tile",
+        "gemm_fp16in_fp16out", "gemm_fp16in_fp32out", "gemm_fp16in_fp32out_nchw", "gemm_kreg4", "gemm_low_register", "gemm_medium_tile",
         "gemm_prefetch", "gemm_small", "gemm_small_tile", "gemm_tiled_simple", "gemm_vectorized",
         "gemm_vectorized_tile", "gemm_wide_vec", "pad_copy", "pad_copy_from_column_major",
         "pad_copy_transpose", "sparse_gemm_2_4", "transpose2d",

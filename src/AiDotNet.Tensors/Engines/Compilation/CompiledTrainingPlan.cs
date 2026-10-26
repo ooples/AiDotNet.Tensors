@@ -392,11 +392,14 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     {
         // A disposed engine's context is gone: nothing can be downloaded, and nothing can read the results anyway.
         bool landResults = deviceHoldsResults && engine.GetBackend() is Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true, ContextIsLive: true };
-        void Unbind(Tensor<T>? t)
+        // isResult: the loss and gradient state the host reads after this. A forward intermediate is not one: the next
+        // forward recomputes it, and its device buffer may already be back in the pool, so materializing it threw
+        // ObjectDisposedException out of Dispose (TFT on the GPU, AiDotNet#1804).
+        void Unbind(Tensor<T>? t, bool isResult = true)
         {
             if (t is null || t._gpuBuffer is null) return;
             var backing = t.GetBackingArrayForCacheLookupUnsafe();
-            if (landResults)
+            if (landResults && isResult)
             {
                 // The graph wrote this step's values on the device: land them on the host before unbinding.
                 if (backing is not null) Helpers.HostSync.TryMaterialize(backing);
@@ -422,7 +425,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // failed capture served those stale device copies: with a composed loss (ReduceMean over (pred - y)^2) the
         // reported loss froze at the last warmup step's value and the backward read stale intermediates.
         if (_forwardSteps is not null)
-            foreach (var step in _forwardSteps) Unbind(step.OutputBuffer);
+            foreach (var step in _forwardSteps) Unbind(step.OutputBuffer, isResult: ReferenceEquals(step.OutputBuffer, _lossOutput));
         Unbind(_lossOutput);
         // The pre-pass bound every external input (the batch and target slots) to a stable device buffer holding THAT
         // step's data - the captured graph re-uploads them per replay (RefreshGraphInputInPlace), the eager step does

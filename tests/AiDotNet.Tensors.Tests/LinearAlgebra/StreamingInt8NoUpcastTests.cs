@@ -66,6 +66,50 @@ public class StreamingInt8NoUpcastTests
         finally { Cleanup(dir); }
     }
 
+    /// <summary>
+    /// A no-upcast int8 owner keeps its fp32 view empty and holds the int8 buffer instead. When the pool pages its
+    /// snapshot out, the eviction drain must free that buffer: treating the empty fp32 view as "already released" left
+    /// every evicted int8 weight resident, so an int8 streaming model's resident set was no longer bounded.
+    /// </summary>
+    [Fact]
+    public void Int8Inference_AnEvictedOwner_ReleasesItsInt8Buffer()
+    {
+        const int inDim = 16, outDim = 32, n = inDim * outDim;
+        var dir = Path.Combine(Path.GetTempPath(), $"aidotnet-int8ev-{Guid.NewGuid():N}");
+        // Room for one int8 entry (512 data bytes plus header and scales), not two: paging the second in evicts the first.
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingBackingStorePath = dir,
+            StreamingPoolMaxResidentBytes = 1000,
+            StreamingStoreDtype = StreamingStoreDtype.Int8,
+            TransparentAutoEviction = true,
+        });
+        WeightRegistry.SetStreamingExecutionTraining(false); // inference
+        try
+        {
+            Tensor<float> Weight(int offset)
+            {
+                var w = new Tensor<float>(new[] { inDim, outDim });
+                for (int i = 0; i < n; i++) w[i] = Val(i + offset);
+                w.Lifetime = WeightLifetime.Streaming;
+                WeightRegistry.RegisterWeight(w);
+                return w;
+            }
+
+            var first = Weight(0);
+            var second = Weight(n);
+            WeightRegistry.Materialize(first);
+            Assert.NotNull(first.StreamingInt8);
+            Assert.Equal(0, first.DataVector.Length);
+
+            // Paging the second in evicts the first's snapshot; the drain at the end of this Materialize releases it.
+            WeightRegistry.Materialize(second);
+            Assert.NotNull(second.StreamingInt8);
+            Assert.Null(first.StreamingInt8);
+        }
+        finally { Cleanup(dir); }
+    }
+
     [Fact]
     public void Int8Training_Materialize_DecodesToFp32_NoInt8Attached()
     {

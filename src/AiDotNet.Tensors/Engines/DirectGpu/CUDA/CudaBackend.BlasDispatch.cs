@@ -143,6 +143,31 @@ public sealed partial class CudaBackend
         return AiDotNet.Tensors.Engines.CublasStatus.Success;
     }
 
+    /// <summary>
+    /// <c>cublasGemmStridedBatchedEx</c> with FP32 scalars, or, without cuBLAS, the generated GEMM for its type
+    /// combination (see <see cref="BlasGemmEx"/>) over the same batch and strides.
+    /// </summary>
+    private unsafe AiDotNet.Tensors.Engines.CublasStatus BlasGemmStridedBatchedEx(CublasOperation opA, CublasOperation opB,
+        int m, int n, int k, IntPtr alpha, IntPtr a, int aType, int lda, long strideA, IntPtr b, int bType, int ldb,
+        long strideB, IntPtr beta, IntPtr c, int cType, int ldc, long strideC, int batch, int computeType, int algorithm)
+    {
+        if (UsesCublas)
+            return CuBlasNative.cublasGemmStridedBatchedEx(_cublasHandle, opA, opB, m, n, k, alpha, a, aType, lda, strideA,
+                b, bType, ldb, strideB, beta, c, cType, ldc, strideC, batch, computeType, algorithm);
+        if (aType != bType) throw new NotSupportedException($"GEMM with operand types {aType} and {bType} needs cuBLAS.");
+        PtxGemmPrecision precision = (aType, cType) switch
+        {
+            (CuBlasNative.CUDA_R_32F, CuBlasNative.CUDA_R_32F) => PtxGemmPrecision.Fp32,
+            (CuBlasNative.CUDA_R_16F, CuBlasNative.CUDA_R_32F) => PtxGemmPrecision.Fp16InFp32Out,
+            (CuBlasNative.CUDA_R_16F, CuBlasNative.CUDA_R_16F) => PtxGemmPrecision.Fp16InFp16Out,
+            (CuBlasNative.CUDA_R_16BF, CuBlasNative.CUDA_R_32F) => PtxGemmPrecision.Bf16InFp32Out,
+            _ => throw new NotSupportedException($"GEMM with operand type {aType} and output type {cType} needs cuBLAS."),
+        };
+        FallbackGemm(precision, opA, opB, m, n, k, *(float*)alpha, a, lda, b, ldb, *(float*)beta, c, ldc, batch,
+            strideA, strideB, strideC, GemmLaunchStream);
+        return AiDotNet.Tensors.Engines.CublasStatus.Success;
+    }
+
     // cuBLAS's column-major C[m x n] (ldc) = alpha * opA(A) opB(B) + beta * C is the row-major problem
     // C[n x m] = opB(B)^T opA(A)^T on the same memory: the generated kernel's A is cuBLAS's B (transposed exactly when
     // opB is), its B is cuBLAS's A (transposed exactly when opA is), and M and N swap.

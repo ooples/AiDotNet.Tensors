@@ -252,6 +252,36 @@ internal static class HipBlasNative
         HipBlasDatatype computeType,
         HipBlasGemmAlgo algo); // lgtm[cs/unmanaged-code] HIP BLAS requires native bindings.
 
+    /// <summary>
+    /// <see cref="hipblasGemmEx"/> over <paramref name="batchCount"/> problems, each operand advancing by its stride
+    /// (in elements) per problem — the cuBLAS-compatible <c>hipblasGemmStridedBatchedEx</c>.
+    /// </summary>
+    [DllImport(HipBlasLibrary, EntryPoint = "hipblasGemmStridedBatchedEx", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern HipBlasStatus hipblasGemmStridedBatchedEx(
+        IntPtr handle,
+        HipBlasOperation transA,
+        HipBlasOperation transB,
+        int m,
+        int n,
+        int k,
+        ref float alpha,
+        IntPtr A,
+        HipBlasDatatype aType,
+        int lda,
+        long strideA,
+        IntPtr B,
+        HipBlasDatatype bType,
+        int ldb,
+        long strideB,
+        ref float beta,
+        IntPtr C,
+        HipBlasDatatype cType,
+        int ldc,
+        long strideC,
+        int batchCount,
+        HipBlasDatatype computeType,
+        HipBlasGemmAlgo algo); // lgtm[cs/unmanaged-code] HIP BLAS requires native bindings.
+
     private static bool TryLoadLibrary()
     {
         return RocmNativeLibraryResolver.GetCandidates(

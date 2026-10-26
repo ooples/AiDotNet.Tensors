@@ -10315,7 +10315,7 @@ KERNEL VARIANTS (A/B testing):
                 k1.SetArg(arg1++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
                 k1.SetArg(arg1++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
                 k1.SetArg(arg1++, ((DirectOpenClGpuBuffer)counts).Buffer.Handle);
-                k1.SetArg(arg1++, sourceSize); k1.SetArg(arg1++, featureSize);
+                k1.SetArg(arg1++, sourceSize); k1.SetArg(arg1++, featureSize); k1.SetArg(arg1++, outputSize);
                 k1.Execute1D(sourceSize, Math.Min(256, sourceSize));
             }
 

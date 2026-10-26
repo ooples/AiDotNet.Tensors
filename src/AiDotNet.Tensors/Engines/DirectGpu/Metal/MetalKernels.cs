@@ -1255,11 +1255,14 @@ kernel void scatter_mean(
     device atomic_int* counts [[buffer(3)]],
     constant uint& sourceSize [[buffer(4)]],
     constant uint& featureSize [[buffer(5)]],
+    constant uint& outputSize [[buffer(6)]],
     uint gid [[thread_position_in_grid]])
 {
     if (gid < sourceSize) {
         uint row = gid / featureSize; uint col = gid % featureSize;
         int targetRow = indices[row];
+        // An index outside [0, outputSize) contributes nowhere, as the deterministic variant skips it.
+        if (targetRow < 0 || (uint)targetRow >= outputSize) return;
         atomic_fetch_add_explicit(&output[targetRow * featureSize + col], source[gid], memory_order_relaxed);
         if (col == 0) atomic_fetch_add_explicit(&counts[targetRow], 1, memory_order_relaxed);
     }
@@ -2075,6 +2078,30 @@ kernel void matmul_fp16_fp32out(
             sum += float(A[row * K + k]) * float(B[k * N + col]);
         }
         C[row * N + col] = sum;
+    }
+}
+
+// The FP16 im2col conv's per-image GEMM (IFp16ConvBatchedGemmBackend): matmul_fp16_fp32out over N = batch * P
+// columns, stored NCHW - column n = b * P + p of row i goes to C[(b * M + i) * P + p].
+kernel void matmul_fp16_fp32out_nchw(
+    device const half* A [[buffer(0)]],
+    device const half* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    constant uint& K [[buffer(5)]],
+    constant uint& P [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint row = gid.y;
+    uint col = gid.x;
+
+    if (row < M && col < N) {
+        float sum = 0.0f;
+        for (uint k = 0; k < K; k++) {
+            sum += float(A[row * K + k]) * float(B[k * N + col]);
+        }
+        C[((col / P) * M + row) * P + col % P] = sum;
     }
 }
 

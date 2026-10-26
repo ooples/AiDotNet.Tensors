@@ -74,6 +74,25 @@ internal sealed class PooledChunkWriteStream : Stream
         return result;
     }
 
+    /// <summary>Copies everything written so far to the start of <paramref name="destination"/>, which must hold <see cref="Length"/> bytes.</summary>
+    public void CopyTo(byte[] destination)
+    {
+        ThrowIfDisposed();
+        if (destination is null) throw new ArgumentNullException(nameof(destination));
+        if (destination.Length < _length)
+            throw new ArgumentException($"Destination holds {destination.Length} bytes; the stream has {_length}.", nameof(destination));
+        long remaining = _length;
+        int at = 0;
+        foreach (var chunk in _chunks)
+        {
+            if (remaining <= 0) break;
+            int n = (int)Math.Min(ChunkSize, remaining);
+            Buffer.BlockCopy(chunk, 0, destination, at, n);
+            at += n;
+            remaining -= n;
+        }
+    }
+
     // Writes land in the chunks directly, so there is nothing to flush.
     public override void Flush() => ThrowIfDisposed();
 

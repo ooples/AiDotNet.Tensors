@@ -133,8 +133,7 @@ public sealed partial class CudaBackend
             headDim >= 1 << AttentionMaskShift || (causal && seqQ != seqK) ||
             (long)batch * heads * seqQ * seqK > AttentionMaxScoreElements)
             return false;
-        var declaredKey = new DeclaredKey(DeclaredFamily.FlashAttentionBackward, batch, heads, seqQ, seqK, scale, 0, null,
-            0, headDim | (causal ? AttentionCausalBit : 0));
+        var declaredKey = FlashAttentionBackwardKey(batch, heads, seqQ, seqK, headDim, scale, causal);
         IGpuBuffer? causalBias = null;
         DeclaredProgram? program;
         lock (_directPtxLock)
@@ -163,6 +162,44 @@ public sealed partial class CudaBackend
 
     private static readonly Func<DeclaredKey, CodegenProgram> s_buildAttentionBackward = key =>
         CodegenBackendPrograms.ScaledDotProductAttentionBackward(key.D0, key.D1, key.D2, key.D3, key.D5, key.Epsilon);
+
+    private static readonly Func<DeclaredKey, CodegenProgram> s_buildGroupedAttentionBackward = key =>
+        CodegenBackendPrograms.ScaledDotProductAttentionBackward(key.D0, key.D1, key.D4, key.D2, key.D3, key.D5,
+            key.Epsilon);
+
+    /// <summary>
+    /// The grouped-query attention backward through its declared program (#1440): the same products as the attention
+    /// backward, with k and v read at head h / g and dk, dv summed over each group's query heads. Only where the group is
+    /// the consistent heads / kvHeads (the hand-written kernel honours an explicit, possibly inconsistent, group).
+    /// False -- nothing launched -- when declined.
+    /// </summary>
+    private bool TryDeclaredGroupedAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key,
+        IGpuBuffer value, IGpuBuffer weights, IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue, int batch,
+        int heads, int kvHeads, int queriesPerKV, int seqQ, int seqK, int headDim, float scale)
+    {
+        if (!DeclaredKernelsEnabled || batch <= 0 || heads <= 0 || kvHeads <= 0 || seqQ <= 0 || seqK <= 0 ||
+            headDim <= 0 || heads % kvHeads != 0 || queriesPerKV != heads / kvHeads ||
+            (long)batch * heads * seqQ * seqK > AttentionMaxScoreElements)
+            return false;
+        var declaredKey = new DeclaredKey(DeclaredFamily.GroupedQueryAttentionBackward, batch, heads, seqQ, seqK, scale, 0,
+            null, kvHeads, headDim);
+        DeclaredProgram? program;
+        lock (_directPtxLock)
+        {
+            if (!_declaredPrograms.TryGetValue(declaredKey, out program))
+            {
+                if (IsStreamCapturing() || !AttentionShapeRecurs(declaredKey)) return false;
+                program = BuildAttentionProgram(declaredKey, s_buildGroupedAttentionBackward, s_attentionBackwardNames);
+                _declaredPrograms[declaredKey] = program;
+            }
+        }
+        if (program is null) return false;
+        var bound = new DeclaredBindings(gradOutput, query, key, value, weights, gradQuery, gradKey, gradValue);
+        if (!AlignedFor(program, s_attentionBackwardNames, bound)) return false;
+        if (TryLaunchDeclaredResidentChecked(declaredKey, program, s_attentionBackwardNames, bound)) return true;
+        RunDeclaredProgram(program, s_attentionBackwardNames, bound);
+        return true;
+    }
 
     /// <summary>The key of an attention backward call; the scale is the key's epsilon slot.</summary>
     internal static DeclaredKey AttentionBackwardKey(int batch, int heads, int seqQ, int seqK, int headDim, float scale) =>
@@ -418,6 +455,62 @@ public sealed partial class CudaBackend
             _lowerAttention ??= pass => LowerAttentionPass(pass, minBlocks: 2));
     }
 
+    /// <summary>
+    /// The attention backward as a resident-program stage (#1440), in ScaledDotProductAttentionBackward's contract
+    /// (the stored weights); the stage's program is the one the routed call runs for the same key, so a training step's
+    /// forward and backward attention can share one resident launch.
+    /// </summary>
+    internal DeclaredResidentStage AttentionBackwardStage(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key,
+        IGpuBuffer value, IGpuBuffer weights, IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue, int batch,
+        int heads, int seqQ, int seqK, int headDim, float scale)
+    {
+        var declaredKey = AttentionBackwardKey(batch, heads, seqQ, seqK, headDim, scale);
+        lock (_directPtxLock)
+        {
+            if (!_declaredPrograms.ContainsKey(declaredKey) && !IsStreamCapturing())
+                _declaredPrograms[declaredKey] = BuildAttentionProgram(declaredKey, s_buildAttentionBackward,
+                    s_attentionBackwardNames);
+        }
+        return new DeclaredResidentStage(declaredKey, s_buildAttentionBackward, s_attentionBackwardNames,
+            new DeclaredBindings(gradOutput, query, key, value, weights, gradQuery, gradKey, gradValue),
+            _lowerAttention ??= pass => LowerAttentionPass(pass, minBlocks: 2));
+    }
+
+    /// <summary>The key of a FlashAttentionBackward call: the head size and the causal bit share the last slot.</summary>
+    internal static DeclaredKey FlashAttentionBackwardKey(int batch, int heads, int seqQ, int seqK, int headDim,
+        float scale, bool causal) =>
+        new(DeclaredFamily.FlashAttentionBackward, batch, heads, seqQ, seqK, scale, 0, null, 0,
+            headDim | (causal ? AttentionCausalBit : 0));
+
+    /// <summary>
+    /// FlashAttentionBackward as a resident-program stage (#1440), in its stats contract: the weights recomputed from
+    /// <paramref name="softmaxStats"/>. Causal only across equal lengths, as the routed call.
+    /// </summary>
+    internal DeclaredResidentStage FlashAttentionBackwardStage(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key,
+        IGpuBuffer value, IGpuBuffer output, IGpuBuffer softmaxStats, IGpuBuffer gradQuery, IGpuBuffer gradKey,
+        IGpuBuffer gradValue, int batch, int heads, int seqQ, int seqK, int headDim, float scale, bool causal)
+    {
+        if (causal && seqQ != seqK)
+            throw new NotSupportedException("A causal FlashAttentionBackward stage needs equal query and key lengths.");
+        if (headDim <= 0 || headDim >= 1 << AttentionMaskShift)
+            throw new ArgumentOutOfRangeException(nameof(headDim), headDim,
+                "The head size must be positive and below the key's mask field.");
+        var declaredKey = FlashAttentionBackwardKey(batch, heads, seqQ, seqK, headDim, scale, causal);
+        IGpuBuffer? causalBias = null;
+        lock (_directPtxLock)
+        {
+            if (causal && (causalBias = CausalBiasBuffer(seqQ, seqK, out string? biasDecline)) is null)
+                throw new NotSupportedException(biasDecline ?? "The causal attention bias could not be built.");
+            if (!_declaredPrograms.ContainsKey(declaredKey) && !IsStreamCapturing())
+                _declaredPrograms[declaredKey] = BuildAttentionProgram(declaredKey, s_buildFlashBackward,
+                    s_flashBackwardNames);
+        }
+        return new DeclaredResidentStage(declaredKey, s_buildFlashBackward, s_flashBackwardNames,
+            new DeclaredBindings(gradOutput, query, key, value, output, softmaxStats, causalBias, gradQuery, gradKey,
+                gradValue),
+            _lowerAttention ??= pass => LowerAttentionPass(pass, minBlocks: 2));
+    }
+
     // An attention program with its contractions as implicit GEMMs, retried unbounded where the two-blocks-a-SM bound
     // makes the JIT spill; null (with the reason recorded) when it cannot be built.
     private DeclaredProgram? BuildAttentionProgram(DeclaredKey key, Func<DeclaredKey, CodegenProgram> build, string[] names)
@@ -623,8 +716,37 @@ public sealed partial class CudaBackend
             kvHeads, headDim, blockSize, pages, (int)blocks, numQueries, scale);
     }
 
+    // The one-entry block table { 0 } FlashDecode reads its contiguous cache through; guarded by _directPtxLock.
+    private IGpuBuffer? _identityBlockTable;
+
+    /// <summary>
+    /// FlashDecode through the declared paged decode (#1440): a contiguous [seqLen, kvHeads, headDim] cache is a paged one
+    /// of a single block seqLen tokens long, read through the block table { 0 }. The split count is the hand-written
+    /// kernel's schedule, not part of the result, so it is not consulted. False -- nothing launched -- when declined.
+    /// </summary>
+    private bool TryDeclaredFlashDecode(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value, IGpuBuffer output, int heads,
+        int kvHeads, int headDim, int seqLen, float scale)
+    {
+        if (!DeclaredKernelsEnabled || seqLen <= 0) return false;
+        IGpuBuffer table;
+        lock (_directPtxLock)
+        {
+            if (_identityBlockTable is null)
+            {
+                if (IsStreamCapturing()) return false;
+                var buffer = AllocateByteBuffer(sizeof(int));
+                UploadByteBuffer(buffer, new byte[sizeof(int)]);
+                _identityBlockTable = buffer;
+            }
+            table = _identityBlockTable;
+        }
+        return TryDeclaredPagedDecodeRouted(query, key, value, table, output, heads, kvHeads, headDim, seqLen, seqLen, scale);
+    }
+
     private void DisposeCausalBiases()
     {
+        _identityBlockTable?.Dispose();
+        _identityBlockTable = null;
         foreach (var buffer in _causalBiases.Values) buffer.Dispose();
         _causalBiases.Clear();
         foreach (var buffer in _pagedKeyBiases.Values) buffer.Dispose();

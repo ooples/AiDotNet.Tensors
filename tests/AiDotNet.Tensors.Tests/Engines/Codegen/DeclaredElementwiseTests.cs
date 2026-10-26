@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // The pointwise family on declared kernels (#890 phase 4a): a declared body that calls a library function derived
 // from the hand-written kernel's own source. The IR, the emitted kernel and the derivation rules are pinned here on
 // the CPU; the device half runs routed operators bit for bit against the hand-written kernels.
@@ -129,6 +129,30 @@ extern ""C"" __global__ void bare_exit(const float* __restrict__ x, float* __res
             Assert.Null(CudaMathLibrary.Resolve(kernel, module));
             Assert.Contains(why, CudaMathLibrary.RefusalOf(kernel, module) ?? "", StringComparison.Ordinal);
         }
+    }
+
+    /// <summary>
+    /// A comment naming an input is not a use of it: where_select's comment about "the condition buffer" made the
+    /// deriver refuse it (#1441), so every declared program that selects lost its only exact select.
+    /// </summary>
+    [Fact]
+    public void CommentsDoNotCountAsUses()
+    {
+        const string source = @"
+extern ""C"" __global__ void pick(const float* __restrict__ condition, const float* __restrict__ a,
+    const float* __restrict__ b, float* __restrict__ output, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    // The condition buffer holds 1 or 0; output is written once. /* size, a and b too */
+    /* a block comment naming condition and output */
+    output[idx] = condition[idx] != 0.0f ? a[idx] : b[idx];
+}
+";
+        var module = Module(source);
+        var pick = CudaMathLibrary.Resolve("pick", module);
+        Assert.True(pick is not null, CudaMathLibrary.RefusalOf("pick", module));
+        Assert.Equal(3, pick!.Inputs);
     }
 
     /// <summary>

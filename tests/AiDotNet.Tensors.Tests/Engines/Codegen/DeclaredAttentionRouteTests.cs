@@ -519,6 +519,139 @@ public class DeclaredAttentionRouteTests
         for (int o = 0; o < results[0].Length; o++) AssertBitIdentical(results[0][o], results[1][o], "buffer " + o);
     }
 
+    /// <summary>
+    /// A training step's attention as one resident program (#1440): the forward stage storing its weights, then the
+    /// backward stage reading them. Bit-identical to the same stages launched separately in one cooperative launch,
+    /// and the gradients match the routed ScaledDotProductAttentionBackward to 2e-5.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(1, 2, 8, 8, 16)]
+    [InlineData(2, 2, 16, 24, 32)]
+    public void ForwardAndBackwardAttentionStagesRunAsOneResidentLaunch(int batch, int heads, int seqQ, int seqK, int dim)
+    {
+        using var backend = OpenBackendOrSkip();
+        Skip.IfNot(backend.SupportsResidentProgram, "A declared resident program needs a cooperative launch.");
+        float scale = (float)(1.0 / Math.Sqrt(dim));
+        float[] q = Fill(batch * heads * seqQ * dim, 1), k = Fill(batch * heads * seqK * dim, 2);
+        float[] v = Fill(batch * heads * seqK * dim, 3), dout = Fill(batch * heads * seqQ * dim, 4);
+        using var barrier = backend.AllocateResidentBarrier();
+        var results = new float[3][][];
+        for (int mode = 0; mode < 3; mode++)
+        {
+            using var bq = backend.AllocateBuffer(q);
+            using var bk = backend.AllocateBuffer(k);
+            using var bv = backend.AllocateBuffer(v);
+            using var bdout = backend.AllocateBuffer(dout);
+            using var output = backend.AllocateBuffer(batch * heads * seqQ * dim);
+            using var weights = backend.AllocateBuffer(batch * heads * seqQ * seqK);
+            using var dq = backend.AllocateBuffer(Fill(q.Length, 5));
+            using var dk = backend.AllocateBuffer(Fill(k.Length, 6));
+            using var dv = backend.AllocateBuffer(Fill(v.Length, 7));
+            var forward = backend.AttentionStage(bq, bk, bv, output, weights, null, batch, heads, heads, seqQ, seqK, dim,
+                scale, causal: false);
+            var stages = new[]
+            {
+                forward,
+                backend.AttentionBackwardStage(bdout, bq, bk, bv, weights, dq, dk, dv, batch, heads, seqQ, seqK, dim, scale),
+            };
+            if (mode == 2)
+            {
+                // The routed backward from the same stored weights.
+                backend.RunDeclaredStagesSeparately(new[] { forward });
+                backend.ScaledDotProductAttentionBackward(bdout, bq, bk, bv, weights, dq, dk, dv, batch, heads, seqQ, seqK,
+                    dim, scale, isCausal: false);
+            }
+            else
+            {
+                long before = backend.DeclaredProgramLaunches;
+                if (mode == 0) backend.RunDeclaredStagesSeparately(stages);
+                else Assert.True(backend.RunDeclaredResidentProgram(stages, barrier) >= 1);
+                backend.Synchronize();
+                Assert.Equal(mode == 0 ? 2 : 1, backend.DeclaredProgramLaunches - before);
+            }
+            backend.Synchronize();
+            results[mode] = new[] { backend.DownloadBuffer(dq), backend.DownloadBuffer(dk), backend.DownloadBuffer(dv) };
+        }
+        string[] what = { "dq", "dk", "dv" };
+        for (int o = 0; o < 3; o++)
+        {
+            AssertBitIdentical(results[0][o], results[1][o], what[o]);
+            var routed = new double[results[2][o].Length];
+            for (int i = 0; i < routed.Length; i++) routed[i] = results[2][o][i];
+            Assert.True(MaxError(routed, results[0][o]) <= 2e-5, what[o] + ": stage vs routed backward");
+        }
+    }
+
+    /// <summary>
+    /// FlashAttentionBackward as a resident-program stage (#1440), causal and not: two backwards from one forward run as
+    /// one cooperative launch, bit-identical to the same stages launched separately, and equal to the routed call's
+    /// gradients to 2e-5.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(1, 2, 32, 32, false)]
+    [InlineData(2, 2, 40, 16, true)]
+    public void FlashAttentionBackwardStagesRunAsOneResidentLaunch(int batch, int heads, int seq, int headDim, bool causal)
+    {
+        using var backend = OpenBackendOrSkip();
+        Skip.IfNot(backend.SupportsResidentProgram, "A declared resident program needs a cooperative launch.");
+        float scale = (float)(1.0 / Math.Sqrt(headDim));
+        int n = batch * heads * seq * headDim, rows = batch * heads * seq;
+        using var bq = backend.AllocateBuffer(Fill(n, 1));
+        using var bk = backend.AllocateBuffer(Fill(n, 2));
+        using var bv = backend.AllocateBuffer(Fill(n, 3));
+        using var bdout = backend.AllocateBuffer(Fill(n, 4));
+        using var bdout2 = backend.AllocateBuffer(Fill(n, 8));
+        using var bo = backend.AllocateBuffer(n);
+        using var stats = backend.AllocateBuffer(rows);
+        backend.FlashAttentionV2(bq, bk, bv, bo, stats, batch, heads, seq, seq, headDim, scale, causal);
+        using var barrier = backend.AllocateResidentBarrier();
+        var results = new float[3][][];
+        for (int mode = 0; mode < 3; mode++)
+        {
+            using var dq = backend.AllocateBuffer(Fill(n, 5));
+            using var dk = backend.AllocateBuffer(Fill(n, 6));
+            using var dv = backend.AllocateBuffer(Fill(n, 7));
+            using var dq2 = backend.AllocateBuffer(Fill(n, 5));
+            using var dk2 = backend.AllocateBuffer(Fill(n, 6));
+            using var dv2 = backend.AllocateBuffer(Fill(n, 7));
+            if (mode == 2)
+            {
+                backend.FlashAttentionBackward(bdout, bq, bk, bv, bo, stats, dq, dk, dv, batch, heads, seq, seq, headDim,
+                    scale, causal);
+                backend.FlashAttentionBackward(bdout2, bq, bk, bv, bo, stats, dq2, dk2, dv2, batch, heads, seq, seq,
+                    headDim, scale, causal);
+            }
+            else
+            {
+                var stages = new[]
+                {
+                    backend.FlashAttentionBackwardStage(bdout, bq, bk, bv, bo, stats, dq, dk, dv, batch, heads, seq, seq,
+                        headDim, scale, causal),
+                    backend.FlashAttentionBackwardStage(bdout2, bq, bk, bv, bo, stats, dq2, dk2, dv2, batch, heads, seq,
+                        seq, headDim, scale, causal),
+                };
+                long before = backend.DeclaredProgramLaunches;
+                if (mode == 0) backend.RunDeclaredStagesSeparately(stages);
+                else Assert.True(backend.RunDeclaredResidentProgram(stages, barrier) >= 1);
+                backend.Synchronize();
+                Assert.Equal(mode == 0 ? 2 : 1, backend.DeclaredProgramLaunches - before);
+            }
+            backend.Synchronize();
+            results[mode] = new[]
+            {
+                backend.DownloadBuffer(dq), backend.DownloadBuffer(dk), backend.DownloadBuffer(dv),
+                backend.DownloadBuffer(dq2), backend.DownloadBuffer(dk2), backend.DownloadBuffer(dv2),
+            };
+        }
+        for (int o = 0; o < results[0].Length; o++)
+        {
+            AssertBitIdentical(results[0][o], results[1][o], "gradient " + o);
+            var routed = new double[results[2][o].Length];
+            for (int i = 0; i < routed.Length; i++) routed[i] = results[2][o][i];
+            Assert.True(MaxError(routed, results[0][o]) <= 2e-5, "gradient " + o + ": stage vs routed backward");
+        }
+    }
+
     private static void AssertBitIdentical(float[] expected, float[] actual, string what)
     {
         Assert.Equal(expected.Length, actual.Length);

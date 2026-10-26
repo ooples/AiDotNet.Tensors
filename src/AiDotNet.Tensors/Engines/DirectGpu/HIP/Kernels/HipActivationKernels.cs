@@ -1038,12 +1038,14 @@ extern ""C"" __global__ __launch_bounds__(256) void bilinear_upsample2d(const fl
 }
 
 // NON-DETERMINISTIC (issue #382); see scatter_mean_activation_deterministic.
-extern ""C"" __global__ __launch_bounds__(256) void scatter_mean(const float* source, const int* indices, float* output, int* counts, int sourceSize, int featureSize)
+extern ""C"" __global__ __launch_bounds__(256) void scatter_mean(const float* source, const int* indices, float* output, int* counts, int sourceSize, int featureSize, int outputSize)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= sourceSize) return;
     int row = idx / featureSize; int col = idx % featureSize;
     int targetRow = indices[row];
+    // An index outside [0, outputSize) contributes nowhere, as the deterministic variant skips it.
+    if (targetRow < 0 || targetRow >= outputSize) return;
     atomicAdd(&output[targetRow * featureSize + col], source[idx]);
     if (col == 0) atomicAdd(&counts[targetRow], 1);
 }

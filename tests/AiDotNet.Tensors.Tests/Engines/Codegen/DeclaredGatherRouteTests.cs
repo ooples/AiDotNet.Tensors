@@ -311,6 +311,9 @@ public class DeclaredGatherRouteTests
         bool weighted)
     {
         using var backend = OpenBackendOrSkip();
+        // The declared edge scatter and ScatterMean (#1441) take small graphs ahead of both kernels compared here; they
+        // have their own route tests (DeclaredSparseFamilyRouteTests, DeclaredScatterRowsFamilyRouteTests).
+        backend.DeclaredKernelsSwitch = false;
         bool previous = AiDotNetEngine.DeterministicMode;
         AiDotNetEngine.SetDeterministicMode(true);
         try
