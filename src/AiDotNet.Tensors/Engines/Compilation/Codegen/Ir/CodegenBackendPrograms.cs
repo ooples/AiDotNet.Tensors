@@ -345,7 +345,20 @@ public static partial class CodegenBackendPrograms
     /// are built with <paramref name="notEqualZero"/> (the derived not_equal_scalar), as the scatter mean's are.
     /// </para>
     /// </remarks>
-    public static CodegenProgram CsrSpMM(int rows, int cols, int n, int nnz, CodegenLibraryFunction notEqualZero)
+    public static CodegenProgram CsrSpMM(int rows, int cols, int n, int nnz, CodegenLibraryFunction notEqualZero) =>
+        CsrSpMM(rows, cols, n, nnz, notEqualZero, bias: false);
+
+    /// <summary>
+    /// <see cref="CsrSpMM(int, int, int, int, CodegenLibraryFunction)"/> plus a per-column bias, in
+    /// CudaBackend.CsrSpMMBias' contract: <c>out[r, j] = bias[j] + sum over row r's entries</c>. The bias is the
+    /// reduction's epilogue, added after the entries' sum where csr_spmm_bias starts its sum from it, so the two can
+    /// differ by the rounding of that one addition.
+    /// </summary>
+    public static CodegenProgram CsrSpMMBias(int rows, int cols, int n, int nnz, CodegenLibraryFunction notEqualZero) =>
+        CsrSpMM(rows, cols, n, nnz, notEqualZero, bias: true);
+
+    private static CodegenProgram CsrSpMM(int rows, int cols, int n, int nnz, CodegenLibraryFunction notEqualZero,
+        bool bias)
     {
         if (rows <= 0 || cols <= 0 || n <= 0 || nnz <= 0)
             throw new ArgumentOutOfRangeException(nameof(rows), "CSR SpMM extents must be positive.");
@@ -377,19 +390,21 @@ public static partial class CodegenBackendPrograms
                     CodegenIndexOutOfRange.Skip, floatIndices: false,
                     offset: new CodegenAffineExpr(new[] { new CodegenAffineTerm(2, 1) }, 1)),
             });
-        passes.Add(new CodegenKernelSpec("csr_spmm", space,
-            new[]
-            {
-                new CodegenTensorBinding(0, "rowPtr", new[] { rows + 1 }, new[] { A(0) },
-                    elementType: CodegenElementType.Int32),
-                new CodegenTensorBinding(1, "colIdx", new[] { nnz }, new[] { A(2) }, elementType: CodegenElementType.Int32),
-                new CodegenTensorBinding(2, "values", new[] { nnz }, new[] { A(2) }),
-                new CodegenTensorBinding(3, "dense", new[] { cols, n }, new[] { CodegenAffineExpr.Const(0), A(1) },
-                    indirect: new CodegenIndirectIndex?[] { new CodegenIndirectIndex(1, A(2), cols), null }),
-                rowStart,
-                rowEnd,
-            },
-            Bind(6, "out", new[] { rows, n }, isOutput: true), new[] { 2, 3, 4, 5 }, CodegenReduceKind.Sum));
+        var inputs = new List<CodegenTensorBinding>
+        {
+            new CodegenTensorBinding(0, "rowPtr", new[] { rows + 1 }, new[] { A(0) },
+                elementType: CodegenElementType.Int32),
+            new CodegenTensorBinding(1, "colIdx", new[] { nnz }, new[] { A(2) }, elementType: CodegenElementType.Int32),
+            new CodegenTensorBinding(2, "values", new[] { nnz }, new[] { A(2) }),
+            new CodegenTensorBinding(3, "dense", new[] { cols, n }, new[] { CodegenAffineExpr.Const(0), A(1) },
+                indirect: new CodegenIndirectIndex?[] { new CodegenIndirectIndex(1, A(2), cols), null }),
+            rowStart,
+            rowEnd,
+        };
+        if (bias) inputs.Add(new CodegenTensorBinding(6, "bias", new[] { n }, new[] { A(1) }));
+        passes.Add(new CodegenKernelSpec(bias ? "csr_spmm_bias" : "csr_spmm", space, inputs.ToArray(),
+            Bind(inputs.Count, "out", new[] { rows, n }, isOutput: true), new[] { 2, 3, 4, 5 }, CodegenReduceKind.Sum,
+            biasInput: bias ? 6 : null));
         return new CodegenProgram(passes, temps, "csr spmm as an inversion over the stored entries (backend contract)");
     }
 

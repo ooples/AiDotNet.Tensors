@@ -98,6 +98,15 @@ internal enum DeclaredFamily
 
     /// <summary>The activation-layout scatter mean with int32 counts (#1441).</summary>
     ScatterMeanActivation,
+
+    /// <summary>CSR · dense + bias (#1441).</summary>
+    CsrSpMMBias,
+
+    /// <summary>Sampled dense-dense matrix multiplication at a sparse pattern (#1441).</summary>
+    CsrSddmm,
+
+    /// <summary>A graph layer's edge scatter-add, unweighted or weighted (#1441).</summary>
+    ScatterAddEdges,
 }
 
 /// <summary>One declared program: its family and shape (unused dimensions are 0).</summary>

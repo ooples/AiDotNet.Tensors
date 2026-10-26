@@ -4819,6 +4819,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         if (nnz == 0) return;
+        // Declared route (#1441).
+        if (TryDeclaredCsrSddmm(rowIndices, colIndices, x, y, output, nnz, innerK)) return;
 
         if (!_kernelCache.TryGetValue("sddmm", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: sddmm");
@@ -4862,6 +4864,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
+        // Declared route (#1441): csr_spmm_warp's contract is CsrSpMM's, the same sums in the same order.
+        if (TryDeclaredCsrSpMM(csrValues, csrColIndices, csrRowPointers, denseB, output, M, K, N, nnz)) return;
 
         if (!_kernelCache.TryGetValue("csr_spmm_warp", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: csr_spmm_warp");
@@ -4963,6 +4967,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 $"CsrSpMMVec4 requires N divisible by 4 (got {N}); the float4-vectorized kernel " +
                 "would silently skip the last N % 4 output columns. Use CsrSpMM for unaligned N.",
                 nameof(N));
+        // Declared route (#1441): csr_spmm_vec4's contract is CsrSpMM's.
+        if (TryDeclaredCsrSpMM(csrValues, csrColIndices, csrRowPointers, denseB, output, M, K, N, nnz)) return;
 
         if (!_kernelCache.TryGetValue("csr_spmm_vec4", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: csr_spmm_vec4");
@@ -5020,6 +5026,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
+        // Declared route (#1441).
+        if (TryDeclaredCsrSpMMBias(csrValues, csrColIndices, csrRowPointers, denseB, bias, output, M, K, N, nnz)) return;
 
         if (!_kernelCache.TryGetValue("csr_spmm_bias", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: csr_spmm_bias");
@@ -5062,6 +5070,12 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
+
+        // Declared route (#1441): fixed-order sums with no atomic, so deterministic in every mode; it writes every
+        // output, so nothing needs zeroing.
+        if (TryDeclaredScatterAddEdges(input, sourceIndices, targetIndices, edgeValues, output, numNodes, numEdges,
+                features))
+            return;
 
         using var _ = PushContext();
 

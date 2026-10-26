@@ -176,6 +176,66 @@ public static partial class CodegenBackendPrograms
     }
 
     /// <summary>
+    /// Sampled dense-dense matrix multiplication (#1441), in CudaBackend.CsrSddmm's contract: for each stored entry p,
+    /// <c>out[p] = sum over k of x[rowIndices[p], k] * y[colIndices[p], k]</c>, in increasing k. x has
+    /// <paramref name="xRows"/> rows and y <paramref name="yRows"/>; an index outside them contributes nothing (the
+    /// hand-written kernel read outside the matrix).
+    /// </summary>
+    public static CodegenProgram CsrSddmm(int nnz, int innerK, int xRows, int yRows)
+    {
+        if (nnz <= 0 || innerK <= 0 || xRows <= 0 || yRows <= 0)
+            throw new ArgumentOutOfRangeException(nameof(nnz), "SDDMM extents must be positive.");
+        var space = new CodegenIterationSpace(CodegenAxis.Parallel("p", nnz), CodegenAxis.Reduce("k", innerK));
+        var rowIndices = new CodegenTensorBinding(0, "rowIndices", new[] { nnz }, new[] { A(0) },
+            elementType: CodegenElementType.Int32);
+        var colIndices = new CodegenTensorBinding(1, "colIndices", new[] { nnz }, new[] { A(0) },
+            elementType: CodegenElementType.Int32);
+        var x = new CodegenTensorBinding(2, "x", new[] { xRows, innerK }, new[] { CodegenAffineExpr.Const(0), A(1) },
+            indirect: new CodegenIndirectIndex?[] { new CodegenIndirectIndex(0, A(0), xRows), null });
+        var y = new CodegenTensorBinding(3, "y", new[] { yRows, innerK }, new[] { CodegenAffineExpr.Const(0), A(1) },
+            indirect: new CodegenIndirectIndex?[] { new CodegenIndirectIndex(1, A(0), yRows), null });
+        var output = new CodegenTensorBinding(4, "out", new[] { nnz }, new[] { A(0) }, isOutput: true);
+        var pass = new CodegenKernelSpec("sddmm", space, new[] { rowIndices, colIndices, x, y }, output,
+            new[] { 2, 3 }, CodegenReduceKind.Sum);
+        return new CodegenProgram(new[] { pass }, Array.Empty<long>(), "sddmm (backend contract)");
+    }
+
+    /// <summary>
+    /// The edge scatter-add of a graph layer (#1441), in CudaBackend.ScatterAddEdges' contract: <c>out[t, f] = sum over
+    /// the edges e with target[e] == t of input[source[e], f] (times edgeValues[e] when weighted)</c>, in increasing e
+    /// -- scatter_add_edges_deterministic's order. An inversion over the edges: the input is read through the source
+    /// index and admitted only where <c>target[e] - t</c> lands in [0, 1), as the deterministic scatter-add admits.
+    /// </summary>
+    public static CodegenProgram ScatterAddEdges(int numNodes, int numEdges, int features, bool weighted)
+    {
+        if (numNodes <= 0 || numEdges <= 0 || features <= 0)
+            throw new ArgumentOutOfRangeException(nameof(numNodes), "Edge scatter extents must be positive.");
+        var space = new CodegenIterationSpace(
+            CodegenAxis.Parallel("t", numNodes), CodegenAxis.Parallel("f", features), CodegenAxis.Reduce("e", numEdges));
+        var target = new CodegenTensorBinding(0, "targetIndices", new[] { numEdges }, new[] { A(2) },
+            elementType: CodegenElementType.Int32);
+        var source = new CodegenTensorBinding(1, "sourceIndices", new[] { numEdges }, new[] { A(2) },
+            elementType: CodegenElementType.Int32);
+        var admit = new CodegenIndirectIndex(0, A(2), 1, CodegenIndexOutOfRange.Skip, floatIndices: false, offset: A(0));
+        var input = new CodegenTensorBinding(2, "input", new[] { 1, numNodes, features },
+            new[] { CodegenAffineExpr.Const(0), CodegenAffineExpr.Const(0), A(1) },
+            indirect: new CodegenIndirectIndex?[] { admit, new CodegenIndirectIndex(1, A(2), numNodes), null });
+        var inputs = new List<CodegenTensorBinding> { target, source, input };
+        var product = new List<int> { 2 };
+        if (weighted)
+        {
+            inputs.Add(new CodegenTensorBinding(3, "edgeValues", new[] { 1, numEdges },
+                new[] { CodegenAffineExpr.Const(0), A(2) }, indirect: new CodegenIndirectIndex?[] { admit, null }));
+            product.Add(3);
+        }
+        var output = new CodegenTensorBinding(inputs.Count, "output", new[] { numNodes, features }, new[] { A(0), A(1) },
+            isOutput: true);
+        var pass = new CodegenKernelSpec(weighted ? "scatter_add_edges_weighted" : "scatter_add_edges", space,
+            inputs.ToArray(), output, product.ToArray(), CodegenReduceKind.Sum);
+        return new CodegenProgram(new[] { pass }, Array.Empty<long>(), "edge scatter-add (backend contract)");
+    }
+
+    /// <summary>
     /// The activation-layout scatter mean (#1441), in CudaBackend.ScatterMean's contract: <c>counts[g]</c> (int32) is
     /// the number of source rows with indices[i] == g, and <c>output[g, f]</c> their sum divided by the count, or the
     /// (zero) sum for an empty group -- scatter_mean_divide's <c>if (cnt &gt; 0) output /= cnt</c>. The sums run in
