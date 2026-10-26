@@ -72,6 +72,6 @@ public sealed partial class CudaBackend
         var key = CsrSpMMKey(rows, cols, n, nnz);
         if (!ClaimDeclaredSlot(key, ref _declaredCsrSpMMPrograms, DeclaredCsrSpMMProgramCap)) return false;
         return TryRunDeclaredProgram(key, _buildCsrSpMM ??= BuildCsrSpMM, s_csrSpMMNames,
-            new DeclaredBindings(rowPointers, colIndices, values, dense, output));
+            new DeclaredBindings(rowPointers, colIndices, values, dense, output), residentWhenSmall: true);
     }
 }

@@ -62,9 +62,9 @@ public sealed partial class CudaBackend
         if (!ClaimDeclaredSlot(key, ref _declaredScatterRowsPrograms, DeclaredScatterRowsProgramCap)) return false;
         return copy
             ? TryRunDeclaredProgram(key, _buildIndexWrite ??= BuildIndexWrite, s_indexWriteCopyNames,
-                new DeclaredBindings(output, indices, source!, output))
+                new DeclaredBindings(output, indices, source!, output), residentWhenSmall: true)
             : TryRunDeclaredProgram(key, _buildIndexWrite ??= BuildIndexWrite, s_indexWriteFillNames,
-                new DeclaredBindings(output, indices, output));
+                new DeclaredBindings(output, indices, output), residentWhenSmall: true);
     }
 
     /// <summary>Parity210IndexAdd through the declared index add (#1441), with no atomic. False when declined.</summary>
@@ -79,7 +79,7 @@ public sealed partial class CudaBackend
         var key = new DeclaredKey(DeclaredFamily.IndexAdd, outer, destinationAxis, inner, indexLength, 0f, 0f);
         if (!ClaimDeclaredSlot(key, ref _declaredScatterRowsPrograms, DeclaredScatterRowsProgramCap)) return false;
         return TryRunDeclaredProgram(key, s_buildIndexAdd, s_indexAddNames,
-            new DeclaredBindings(indices, source, output, output));
+            new DeclaredBindings(indices, source, output, output), residentWhenSmall: true);
     }
 
     /// <summary>
@@ -97,7 +97,7 @@ public sealed partial class CudaBackend
         var key = new DeclaredKey(DeclaredFamily.ScatterReduce, outer, sourceDim, destinationDim, inner, 0f, 0f, d4: mode);
         if (!ClaimDeclaredSlot(key, ref _declaredScatterRowsPrograms, DeclaredScatterRowsProgramCap)) return false;
         return TryRunDeclaredProgram(key, _buildScatterReduce ??= BuildScatterReduce, s_scatterReduceNames,
-            new DeclaredBindings(index, source, output, output));
+            new DeclaredBindings(index, source, output, output), residentWhenSmall: true);
     }
 
     private static readonly string[] s_maskedScatterNames = { "seed", "mask", "prefix", "source", "out" };
@@ -121,7 +121,7 @@ public sealed partial class CudaBackend
         var key = new DeclaredKey(DeclaredFamily.MaskedScatter, total, sourceLength, 0, 0, 0f, 0f);
         if (!ClaimDeclaredSlot(key, ref _declaredScatterRowsPrograms, DeclaredScatterRowsProgramCap)) return false;
         return TryRunDeclaredProgram(key, _buildMaskedScatter ??= BuildMaskedScatter, s_maskedScatterNames,
-            new DeclaredBindings(output, mask, prefix, source, output));
+            new DeclaredBindings(output, mask, prefix, source, output), residentWhenSmall: true);
     }
 
     /// <summary>Parity210TakeAlongDim (int32 indices) through its declared gather (#1441). False when declined.</summary>
@@ -133,7 +133,7 @@ public sealed partial class CudaBackend
             indices.Size < count || (long)input.Size < (long)outer * axisIn * inner || output.Size < count)
             return false;
         return TryRunDeclaredProgram(new DeclaredKey(DeclaredFamily.TakeAlongDimInt, outer, axisOut, inner, axisIn, 0f, 0f),
-            s_buildTakeAlongDimInt, s_takeAlongDimIntNames, new DeclaredBindings(indices, input, output));
+            s_buildTakeAlongDimInt, s_takeAlongDimIntNames, new DeclaredBindings(indices, input, output), residentWhenSmall: true);
     }
 
     /// <summary>
@@ -147,7 +147,7 @@ public sealed partial class CudaBackend
             ids.Size < tokens || (long)output.Size < (long)tokens * width || (long)table.Size < (long)vocabulary * width)
             return false;
         return TryRunDeclaredProgram(EmbeddingKey(tokens, vocabulary, width), s_buildEmbedding, s_embeddingNames,
-            new DeclaredBindings(ids, table, output));
+            new DeclaredBindings(ids, table, output), residentWhenSmall: true);
     }
 
     /// <summary>
@@ -161,6 +161,6 @@ public sealed partial class CudaBackend
             return false;
         return TryRunDeclaredProgram(
             new DeclaredKey(DeclaredFamily.EmbeddingFloatIds, tokens, table.Size / width, width, 0, 0f, 0f),
-            s_buildEmbeddingFloatIds, s_embeddingNames, new DeclaredBindings(ids, table, output));
+            s_buildEmbeddingFloatIds, s_embeddingNames, new DeclaredBindings(ids, table, output), residentWhenSmall: true);
     }
 }

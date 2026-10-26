@@ -938,10 +938,25 @@ public sealed partial class PtxAffineEmitter
         foreach (int f in factors) lanes *= f;
         long threads = spec.Output.ElementCount / Math.Max(1, lanes);
         double blocks = Math.Max(1.0, (threads + BlockThreads - 1) / (double)BlockThreads);
-        double occupancy = 1.0 + OccupancyCoefficient / Math.Max(blocks / Multiprocessors, 0.05);
+        // An inversion (a source admitted by an indirect shift: the scatters and segment reductions) gains no reuse
+        // from a tile -- every lane reads its own range test -- so its occupancy is floored at one block rather than a
+        // twentieth of a wave. Under the general floor every grid below 3.4 blocks looked equally occupied, the tie went
+        // to the largest tile, and a small scatter ran one block on the whole device (0.4x of its hand-written kernel,
+        // #1441). The general floor stays for everything else, whose tiles it was tuned on.
+        double floor = IsInversion(spec) ? 1.0 / Multiprocessors : 0.05;
+        double occupancy = 1.0 + OccupancyCoefficient / Math.Max(blocks / Multiprocessors, floor);
 
         // Compute never binds for these kernels, so the two memory terms decide it.
         return Math.Max(loadInstructions, dramEquivalent) * occupancy;
+    }
+
+    // True when a product operand is admitted through an indirect shift (CodegenIndirectIndex.Offset).
+    private static bool IsInversion(CodegenKernelSpec spec)
+    {
+        foreach (int inputIndex in spec.ProductInputs)
+            foreach (var indirect in spec.Inputs[inputIndex].Indirect)
+                if (indirect?.Offset is not null) return true;
+        return false;
     }
 
     /// <summary>Loads per MAC for a candidate tile, from operand dependence alone.</summary>
@@ -992,6 +1007,15 @@ public sealed partial class PtxAffineEmitter
     /// the same forcing on pure streaming kernels measured slower (see the note where the tile is chosen).
     /// </summary>
     public bool VectorTileReductions { get; set; }
+
+    /// <summary>
+    /// How many trips of a long inversion's reduction are unrolled into one loop trip (1 leaves it rolled); see
+    /// CodegenReductionUnroll.
+    /// </summary>
+    public int ReductionUnroll { get; set; } = s_reductionUnroll;
+
+    private static readonly int s_reductionUnroll =
+        int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_REDUCTION_UNROLL"), out int unroll) && unroll >= 1 ? unroll : 16;
 
     /// <summary>
     /// True when <paramref name="axis"/> indexes the binding's unit-stride dimension
@@ -1109,6 +1133,24 @@ public sealed partial class PtxAffineEmitter
         // PtxAffineEmitter.Algebra.cs for why that separation is deliberate rather than lazy.
         if (spec.Algebra != CodegenAlgebra.Real)
             return EmitAlgebraic(spec, computeMajor, computeMinor);
+
+        // A long inversion (a scatter or segment reduction over thousands of sources) is a rolled loop whose every trip
+        // waits on its own index load; split by ReductionUnroll it issues that many independent loads a trip, as the
+        // hand-written kernels' unrolled loops do, and visits the terms in the same order.
+        if (ReductionUnroll > 1 && IsInversion(spec) && spec.Space.ReductionAxes.Length == 1 &&
+            spec.Space.ReductionTripCount > FullUnrollLimit)
+        {
+            // The largest power of two up to ReductionUnroll that divides the extent: 16 measured fastest where it
+            // divides (1.21x of the hand-written scatter at 4096 and 20000 rows), and a factor that does not divide
+            // would leave the whole loop rolled (0.48x at 1000 rows).
+            long extent = spec.Space.ReductionTripCount;
+            for (int factor = ReductionUnroll; factor >= 2; factor /= 2)
+                if (extent % factor == 0 && CodegenReductionUnroll.TrySplit(spec, factor) is { } unrolled)
+                {
+                    spec = unrolled;
+                    break;
+                }
+        }
 
         if (EnableStreamingRows && CodegenRowFusion.TryPlanStreaming(spec) is { } stream)
             return EmitRowProgram(stream, spec.Name, computeMajor, computeMinor);

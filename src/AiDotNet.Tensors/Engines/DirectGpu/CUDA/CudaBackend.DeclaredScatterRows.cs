@@ -86,7 +86,7 @@ public sealed partial class CudaBackend
             !AdmitScatterRows(key, sourceRows, innerSize, outputRows))
             return false;
         return TryRunDeclaredProgram(key, _buildScatterMeanRows ??= BuildScatterMeanRows, s_scatterMeanRowsNames,
-            new DeclaredBindings(source, indices, counts, output));
+            new DeclaredBindings(source, indices, counts, output), residentWhenSmall: true);
     }
 
     /// <summary>
@@ -103,7 +103,7 @@ public sealed partial class CudaBackend
             (long)output.Size < (long)sourceRows * innerSize || !AdmitScatterRows(key, sourceRows, innerSize, numGroups))
             return false;
         return TryRunDeclaredProgram(key, _buildScatterSoftmaxRows ??= BuildScatterSoftmaxRows, s_scatterSoftmaxRowsNames,
-            new DeclaredBindings(indices, source, output));
+            new DeclaredBindings(indices, source, output), residentWhenSmall: true);
     }
 
     /// <summary>The row-wise scatter mean as a resident-program stage.</summary>

@@ -21,7 +21,8 @@ public class CodegenIndirectLoweringTests
         foreach (var pass in program.Passes)
             if (pass.Name == name)
             {
-                emitter = new PtxAffineEmitter();
+                // Rolled, so each assertion counts one trip's instructions.
+                emitter = new PtxAffineEmitter { ReductionUnroll = 1 };
                 return emitter.Emit(pass, 8, 6);
             }
         throw new Xunit.Sdk.XunitException("no pass " + name);
@@ -77,9 +78,22 @@ public class CodegenIndirectLoweringTests
     [Fact]
     public void AGuardedVectorLoadSelectsTheIdentityUnderAPreReduce()
     {
-        string ptx = EmitPass(CodegenBackendPrograms.ScatterSoftmaxRows(1000, 16, 37, NotEqual),
-            "scatter_softmax_recipsum", out var emitter);
-        Assert.True(emitter.VectorisedLoads > 0, "the source is expected to load as vectors here");
+        // sum_i exp(table[ids[i], f] + bias[d, f]): the table row is an indirect gather (guarded), read four features
+        // at a time along the coarsened contiguous axis.
+        var space = new CodegenIterationSpace(CodegenAxis.Parallel("d", 37), CodegenAxis.Parallel("f", 16),
+            CodegenAxis.Reduce("i", 1000));
+        var ids = new CodegenTensorBinding(0, "ids", new[] { 1000 }, new[] { CodegenAffineExpr.Axis(2) },
+            elementType: CodegenElementType.Int32);
+        var table = new CodegenTensorBinding(1, "table", new[] { 64, 16 }, new[] { CodegenAffineExpr.Const(0), CodegenAffineExpr.Axis(1) },
+            indirect: new CodegenIndirectIndex?[] { new CodegenIndirectIndex(0, CodegenAffineExpr.Axis(2), 64), null });
+        var bias = new CodegenTensorBinding(2, "bias", new[] { 37, 16 }, new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1) });
+        var output = new CodegenTensorBinding(3, "out", new[] { 37, 16 }, new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1) },
+            isOutput: true);
+        var spec = new CodegenKernelSpec("gather_exp_sum", space, new[] { ids, table, bias }, output, new[] { 1 },
+            CodegenReduceKind.Sum, preReduce: CodegenPreReduceOp.Exp, preBiasInput: 2);
+        var emitter = new PtxAffineEmitter();
+        string ptx = emitter.Emit(spec, 8, 6);
+        Assert.True(emitter.VectorisedLoads > 0, "the table is expected to load as vectors here");
         Assert.Equal(4, Regex.Matches(ptx, @"selp\.f32").Count);
     }
 

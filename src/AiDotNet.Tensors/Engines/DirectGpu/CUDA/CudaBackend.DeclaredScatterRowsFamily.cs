@@ -51,7 +51,7 @@ public sealed partial class CudaBackend
             argmax.Size < cells || !AdmitScatterRows(key, sourceRows, innerSize, outputRows))
             return false;
         return TryRunDeclaredProgram(key, s_buildScatterMaxArgmaxRows, s_scatterMaxArgmaxRowsNames,
-            new DeclaredBindings(indices, source, output, argmax));
+            new DeclaredBindings(indices, source, output, argmax), residentWhenSmall: true);
     }
 
     /// <summary>ScatterMaxBackwardRows through its declared program (#1441). False when declined.</summary>
@@ -64,7 +64,7 @@ public sealed partial class CudaBackend
             !AdmitScatterRows(key, sourceRows, innerSize, outputRows))
             return false;
         return TryRunDeclaredProgram(key, s_buildScatterMaxBackwardRows, s_scatterMaxBackwardRowsNames,
-            new DeclaredBindings(argmax, gradOutput, gradSource));
+            new DeclaredBindings(argmax, gradOutput, gradSource), residentWhenSmall: true);
     }
 
     /// <summary>ScatterMeanBackwardRows through its declared program (#1441). False when declined.</summary>
@@ -77,7 +77,7 @@ public sealed partial class CudaBackend
             !AdmitScatterRows(key, sourceRows, innerSize, outputRows))
             return false;
         return TryRunDeclaredProgram(key, _buildScatterMeanBackwardRows ??= BuildScatterMeanBackwardRows,
-            s_scatterMeanBackwardRowsNames, new DeclaredBindings(counts, indices, gradOutput, gradSource));
+            s_scatterMeanBackwardRowsNames, new DeclaredBindings(counts, indices, gradOutput, gradSource), residentWhenSmall: true);
     }
 
     /// <summary>ScatterSoftmaxBackwardRows through its declared program (#1441). False when declined.</summary>
@@ -90,7 +90,7 @@ public sealed partial class CudaBackend
             !AdmitScatterRows(key, sourceRows, innerSize, numGroups))
             return false;
         return TryRunDeclaredProgram(key, _buildScatterSoftmaxBackwardRows ??= BuildScatterSoftmaxBackwardRows,
-            s_scatterSoftmaxBackwardRowsNames, new DeclaredBindings(indices, output, gradOutput, gradSource));
+            s_scatterSoftmaxBackwardRowsNames, new DeclaredBindings(indices, output, gradOutput, gradSource), residentWhenSmall: true);
     }
 
     /// <summary>ScatterAddRows through the deterministic scatter-add's program (#1441): the same sums in the same order.</summary>
@@ -113,7 +113,7 @@ public sealed partial class CudaBackend
             (long)gradSource.Size < (long)sourceRows * innerSize)
             return false;
         return TryRunDeclaredProgram(EmbeddingKey(sourceRows, outputRows, innerSize), s_buildEmbedding,
-            s_embeddingNames, new DeclaredBindings(indices, gradOutput, gradSource));
+            s_embeddingNames, new DeclaredBindings(indices, gradOutput, gradSource), residentWhenSmall: true);
     }
 
     /// <summary>
@@ -130,6 +130,6 @@ public sealed partial class CudaBackend
             counts.Size < outputSize || !AdmitScatterRows(key, sourceRows, featureSize, outputSize))
             return false;
         return TryRunDeclaredProgram(key, _buildScatterMeanActivation ??= BuildScatterMeanActivation,
-            s_scatterMeanActivationNames, new DeclaredBindings(source, indices, counts, output));
+            s_scatterMeanActivationNames, new DeclaredBindings(source, indices, counts, output), residentWhenSmall: true);
     }
 }

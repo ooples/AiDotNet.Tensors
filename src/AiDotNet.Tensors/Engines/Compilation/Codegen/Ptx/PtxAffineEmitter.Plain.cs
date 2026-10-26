@@ -314,7 +314,7 @@ public sealed partial class PtxAffineEmitter
            .Append("    .reg .b32 %r<").Append(I(_r + 8)).Append(">;\n")
            .Append("    .reg .b64 %rd<").Append(I(_rd + 8)).Append(">;\n")
            .Append("    .reg .f32 %f<").Append(I(_f + 8)).Append(">;\n")
-           .Append("    .reg .f64 %fd<").Append(I(_fd + 8)).Append(">;\n")
+           .Append(_fd > 0 ? "    .reg .f64 %fd<" + I(_fd + 8) + ">;\n" : "")
            .Append(_body);
         return _sb.ToString();
     }

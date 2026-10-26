@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // Declared programs as resident-program stages (#890 phase 4 on phase 3's resident program, #1430): a chain of
 // declared calls -- LayerNorm, then Softmax, then ... -- runs as ONE persistent cooperative launch composed from the
 // stages' own kernels (PtxResidentComposer), a grid barrier between them. Every stage is the same kernel the
@@ -342,13 +342,20 @@ public sealed partial class CudaBackend
     /// with barriers (the results are the same kernels', so bit-identical). False, nothing launched, when it does not
     /// apply or does not compose. A call allocates nothing once the key's composition is built.
     /// </summary>
+    // The most 256-thread blocks an sm_7x/8x multiprocessor holds (2048 threads); occupancy decides the real figure.
+    private const int ResidentBlocksPerSmCeiling = 8;
+
     private unsafe bool TryLaunchDeclaredResident(DeclaredKey key, DeclaredProgram program, in DeclaredBindings bound)
     {
         var steps = program.Lowering.Steps;
         if (steps.Count < 2 || !SupportsResidentProgram) return false;
-        int wave = Math.Max(1, _multiProcessorCount);
+        // A chain whose every stage fits one co-resident wave: the composed grid then gives each stage at least the
+        // blocks its own launch had, so composing only removes launches. The bound before composing is the
+        // architecture's (ResidentBlocksPerSmCeiling blocks a multiprocessor); the composed grid, sized by the
+        // occupancy of the composed kernel, is the real one and is checked once it exists.
+        long wave = (long)Math.Max(1, _multiProcessorCount) * ResidentBlocksPerSmCeiling;
         for (int s = 0; s < steps.Count; s++)
-            if (steps[s].Blocks > (uint)wave) return false;
+            if (steps[s].Blocks > wave) return false;
 
         DeclaredResident? resident;
         IGpuBuffer? barrier;
@@ -364,6 +371,10 @@ public sealed partial class CudaBackend
             barrier = _keyResidentBarrier;
         }
         if (resident is null || barrier is null) return false;
+        // The composed grid, from the composed kernel's occupancy: a stage with more blocks would loop virtual blocks
+        // on fewer real ones than its own launch, so the separate launches serve it.
+        for (int s = 0; s < steps.Count; s++)
+            if (steps[s].Blocks > (uint)resident.Grid) return false;
 
         using var _ = PushContext();
         var sources = resident.ArgumentSources;

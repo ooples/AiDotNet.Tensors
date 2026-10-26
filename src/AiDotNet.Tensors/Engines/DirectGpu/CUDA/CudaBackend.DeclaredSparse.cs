@@ -39,7 +39,7 @@ public sealed partial class CudaBackend
         var key = new DeclaredKey(DeclaredFamily.CsrSpMMBias, rows, cols, n, nnz, 0, 0);
         if (!ClaimDeclaredSlot(key, ref _declaredCsrSpMMPrograms, DeclaredCsrSpMMProgramCap)) return false;
         return TryRunDeclaredProgram(key, _buildCsrSpMMBias ??= BuildCsrSpMMBias, s_csrSpMMBiasNames,
-            new DeclaredBindings(rowPointers, colIndices, values, dense, bias, output));
+            new DeclaredBindings(rowPointers, colIndices, values, dense, bias, output), residentWhenSmall: true);
     }
 
     private static readonly string[] s_csrSpMMDoubleNames = { "rowPtr", "colIdx", "values", "dense", "out" };
@@ -62,7 +62,7 @@ public sealed partial class CudaBackend
         var key = new DeclaredKey(DeclaredFamily.CsrSpMMDouble, rows, cols, n, nnz, 0f, 0f);
         if (!ClaimDeclaredSlot(key, ref _declaredCsrSpMMPrograms, DeclaredCsrSpMMProgramCap)) return false;
         return TryRunDeclaredProgram(key, s_buildCsrSpMMDouble, s_csrSpMMDoubleNames,
-            new DeclaredBindings(rowPointers, colIndices, values, dense, output));
+            new DeclaredBindings(rowPointers, colIndices, values, dense, output), residentWhenSmall: true);
     }
 
     /// <summary>
@@ -80,7 +80,7 @@ public sealed partial class CudaBackend
         var key = new DeclaredKey(DeclaredFamily.CsrSddmm, nnz, innerK, xRows, yRows, 0, 0);
         if (!ClaimDeclaredSlot(key, ref _declaredCsrSpMMPrograms, DeclaredCsrSpMMProgramCap)) return false;
         return TryRunDeclaredProgram(key, s_buildCsrSddmm, s_csrSddmmNames,
-            new DeclaredBindings(rowIndices, colIndices, x, y, output));
+            new DeclaredBindings(rowIndices, colIndices, x, y, output), residentWhenSmall: true);
     }
 
     private static readonly string[] s_csrSegmentedNames = { "colIndices", "rowPointers", "input", "out" };
@@ -118,7 +118,7 @@ public sealed partial class CudaBackend
             family == DeclaredFamily.CsrSegmentedStdDev ? epsilon : 0f, 0f);
         if (!ClaimDeclaredSlot(key, ref _declaredCsrSpMMPrograms, DeclaredCsrSpMMProgramCap)) return false;
         return TryRunDeclaredProgram(key, _buildCsrSegmented ??= BuildCsrSegmented, s_csrSegmentedNames,
-            new DeclaredBindings(colIndices, rowPointers, input, output));
+            new DeclaredBindings(colIndices, rowPointers, input, output), residentWhenSmall: true);
     }
 
     /// <summary>
@@ -139,8 +139,8 @@ public sealed partial class CudaBackend
         if (!ClaimDeclaredSlot(key, ref _declaredCsrSpMMPrograms, DeclaredCsrSpMMProgramCap)) return false;
         return weighted
             ? TryRunDeclaredProgram(key, s_buildScatterAddEdges, s_scatterAddEdgesWeightedNames,
-                new DeclaredBindings(targetIndices, sourceIndices, input, edgeValues!, output))
+                new DeclaredBindings(targetIndices, sourceIndices, input, edgeValues!, output), residentWhenSmall: true)
             : TryRunDeclaredProgram(key, s_buildScatterAddEdges, s_scatterAddEdgesNames,
-                new DeclaredBindings(targetIndices, sourceIndices, input, output));
+                new DeclaredBindings(targetIndices, sourceIndices, input, output), residentWhenSmall: true);
     }
 }
