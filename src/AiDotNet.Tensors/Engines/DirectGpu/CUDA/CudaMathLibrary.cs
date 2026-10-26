@@ -44,6 +44,9 @@ internal sealed record CudaMathFunction(string Kernel, CudaMathModule Module, in
 
 internal static class CudaMathLibrary
 {
+    // Kernel sources and composed PTX can be large; a pathological input fails here instead of hanging the caller.
+    private static readonly TimeSpan RegexTimeout = TimeSpan.FromSeconds(5);
+
     private static readonly Dictionary<(string Module, string Kernel), CudaMathFunction?> s_resolved = new();
     private static readonly Dictionary<(string Module, string Kernel), string> s_refusals = new();
     private static readonly object s_lock = new();
@@ -92,7 +95,7 @@ internal static class CudaMathLibrary
     {
         var sb = new StringBuilder(source.Length);
         int at = 0;
-        foreach (Match kernel in Regex.Matches(source, @"extern\s+""C""\s+__global__"))
+        foreach (Match kernel in Regex.Matches(source, @"extern\s+""C""\s+__global__", RegexOptions.None, RegexTimeout))
         {
             if (kernel.Index < at) continue;
             int open = source.IndexOf('{', kernel.Index);
@@ -113,12 +116,12 @@ internal static class CudaMathLibrary
         // static before a device function or variable that is not already static and not extern "C".
         return Regex.Replace(library,
             @"(?m)^(?<indent>[ \t]*)(?!static\b)(?!extern\b)(?!template\b)(?<head>(?:inline\s+|__forceinline__\s+|__noinline__\s+)*(?:__device__|__constant__)\b)",
-            "${indent}static ${head}");
+            "${indent}static ${head}", RegexOptions.None, RegexTimeout);
     }
 
     private static CudaMathFunction? Derive(string kernel, CudaMathModule module, string source, out string reason)
     {
-        var header = Regex.Match(source, @"\bvoid\s+" + Regex.Escape(kernel) + @"\s*\(([^)]*)\)\s*\{");
+        var header = Regex.Match(source, @"\bvoid\s+" + Regex.Escape(kernel) + @"\s*\(([^)]*)\)\s*\{", RegexOptions.None, RegexTimeout);
         if (!header.Success) { reason = kernel + ": no definition with a body"; return null; }
         var inputs = new List<string>();
         var scalars = new List<string>();
@@ -126,17 +129,17 @@ internal static class CudaMathLibrary
         string? output = null, size = null;
         foreach (string raw in header.Groups[1].Value.Split(','))
         {
-            string p = Regex.Replace(raw.Replace("__restrict__", ""), @"\s+", " ").Trim();
+            string p = Regex.Replace(raw.Replace("__restrict__", ""), @"\s+", " ", RegexOptions.None, RegexTimeout).Trim();
             Match m;
-            if ((m = Regex.Match(p, @"^const float ?\* ?(\w+)$")).Success) { inputs.Add(m.Groups[1].Value); order.Append('i'); }
-            else if ((m = Regex.Match(p, @"^float ?\* ?(\w+)$")).Success)
+            if ((m = Regex.Match(p, @"^const float ?\* ?(\w+)$", RegexOptions.None, RegexTimeout)).Success) { inputs.Add(m.Groups[1].Value); order.Append('i'); }
+            else if ((m = Regex.Match(p, @"^float ?\* ?(\w+)$", RegexOptions.None, RegexTimeout)).Success)
             {
                 if (output is not null) { reason = kernel + ": two outputs"; return null; }
                 output = m.Groups[1].Value;
                 order.Append('o');
             }
-            else if ((m = Regex.Match(p, @"^float (\w+)$")).Success) { scalars.Add(m.Groups[1].Value); order.Append('s'); }
-            else if ((m = Regex.Match(p, @"^int (\w+)$")).Success)
+            else if ((m = Regex.Match(p, @"^float (\w+)$", RegexOptions.None, RegexTimeout)).Success) { scalars.Add(m.Groups[1].Value); order.Append('s'); }
+            else if ((m = Regex.Match(p, @"^int (\w+)$", RegexOptions.None, RegexTimeout)).Success)
             {
                 if (size is not null) { reason = kernel + ": more than one int parameter"; return null; }
                 size = m.Groups[1].Value;
@@ -157,28 +160,28 @@ internal static class CudaMathLibrary
         string body = source.Substring(open + 1, close - open - 1);
         // Comments are not code: where_select's mention of "the condition buffer" made the name test below read it
         // as a second use of the condition, so where_select had no derived function (#1441).
-        body = Regex.Replace(body, @"/\*.*?\*/", " ", RegexOptions.Singleline);
-        body = Regex.Replace(body, @"//[^\r\n]*", "");
+        body = Regex.Replace(body, @"/\*.*?\*/", " ", RegexOptions.Singleline, RegexTimeout);
+        body = Regex.Replace(body, @"//[^\r\n]*", "", RegexOptions.None, RegexTimeout);
 
         body = Regex.Replace(body, @"^\s*int\s+idx\s*=\s*blockIdx\.x\s*\*\s*blockDim\.x\s*\+\s*threadIdx\.x\s*;\s*$", "",
-            RegexOptions.Multiline);
+            RegexOptions.Multiline, RegexTimeout);
         body = Regex.Replace(body, @"^\s*if\s*\(\s*idx\s*>=\s*" + Regex.Escape(size) + @"\s*\)\s*return\s*;\s*$", "",
-            RegexOptions.Multiline);
+            RegexOptions.Multiline, RegexTimeout);
         for (int k = 0; k < inputs.Count; k++)
-            body = Regex.Replace(body, @"\b" + Regex.Escape(inputs[k]) + @"\s*\[\s*idx\s*\]", "aidn_v" + k.ToString(CultureInfo.InvariantCulture));
-        body = Regex.Replace(body, @"\b" + Regex.Escape(output) + @"\s*\[\s*idx\s*\]\s*=(?!=)", "return ");
+            body = Regex.Replace(body, @"\b" + Regex.Escape(inputs[k]) + @"\s*\[\s*idx\s*\]", "aidn_v" + k.ToString(CultureInfo.InvariantCulture), RegexOptions.None, RegexTimeout);
+        body = Regex.Replace(body, @"\b" + Regex.Escape(output) + @"\s*\[\s*idx\s*\]\s*=(?!=)", "return ", RegexOptions.None, RegexTimeout);
         // "out[idx] = X; return;" became "return X; return;": the second is unreachable, and invalid in a float function.
-        body = Regex.Replace(body, @"(return [^;]*;)\s*return\s*;", "$1");
+        body = Regex.Replace(body, @"(return [^;]*;)\s*return\s*;", "$1", RegexOptions.None, RegexTimeout);
 
         // A tensor read anywhere but at idx (mean[0]), or the length itself (a loss averaged over size), is not a
         // function of the element: the kernel is not elementwise.
         foreach (string name in inputs)
-            if (Regex.IsMatch(body, @"\b" + Regex.Escape(name) + @"\b")) { reason = kernel + ": reads " + name + " other than at idx"; return null; }
-        if (Regex.IsMatch(body, @"\b" + Regex.Escape(output) + @"\b")) { reason = kernel + ": uses " + output + " other than storing at idx"; return null; }
-        if (Regex.IsMatch(body, @"\b" + Regex.Escape(size) + @"\b")) { reason = kernel + ": reads the length " + size; return null; }
+            if (Regex.IsMatch(body, @"\b" + Regex.Escape(name) + @"\b", RegexOptions.None, RegexTimeout)) { reason = kernel + ": reads " + name + " other than at idx"; return null; }
+        if (Regex.IsMatch(body, @"\b" + Regex.Escape(output) + @"\b", RegexOptions.None, RegexTimeout)) { reason = kernel + ": uses " + output + " other than storing at idx"; return null; }
+        if (Regex.IsMatch(body, @"\b" + Regex.Escape(size) + @"\b", RegexOptions.None, RegexTimeout)) { reason = kernel + ": reads the length " + size; return null; }
         foreach (string forbidden in new[] { "idx", "blockIdx", "threadIdx", "blockDim", "gridDim", "__syncthreads", "__shared__", "atomic" })
-            if (Regex.IsMatch(body, @"\b" + forbidden + @"\b")) { reason = kernel + ": the body uses " + forbidden; return null; }
-        if (Regex.IsMatch(body, @"\breturn\s*;")) { reason = kernel + ": exits without storing"; return null; }
+            if (Regex.IsMatch(body, @"\b" + forbidden + @"\b", RegexOptions.None, RegexTimeout)) { reason = kernel + ": the body uses " + forbidden; return null; }
+        if (Regex.IsMatch(body, @"\breturn\s*;", RegexOptions.None, RegexTimeout)) { reason = kernel + ": exits without storing"; return null; }
         if (!body.Contains("return ", StringComparison.Ordinal)) { reason = kernel + ": never stores"; return null; }
 
         var parameters = new List<string>();

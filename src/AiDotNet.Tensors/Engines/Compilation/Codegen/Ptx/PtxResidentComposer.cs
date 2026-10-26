@@ -70,6 +70,9 @@ public sealed class PtxResidentComposition
 /// <summary>Composes lowered kernels into one resident (persistent cooperative) kernel.</summary>
 public static class PtxResidentComposer
 {
+    // Kernel sources and composed PTX can be large; a pathological input fails here instead of hanging the caller.
+    private static readonly TimeSpan RegexTimeout = TimeSpan.FromSeconds(5);
+
     /// <summary>The argument naming the two-word grid barrier (zeroed once; reusable launch after launch).</summary>
     public const string BarrierArgument = "#resident_barrier";
 
@@ -233,7 +236,7 @@ public static class PtxResidentComposer
         if (at == lines.Length) throw new NotSupportedException(step.EntryPoint + " has no entry.");
         for (at++; at < lines.Length && !lines[at].TrimStart().StartsWith(")", StringComparison.Ordinal); at++)
         {
-            var m = Regex.Match(lines[at], @"\.param\s+\.u64\s+([A-Za-z_]\w*)");
+            var m = Regex.Match(lines[at], @"\.param\s+\.u64\s+([A-Za-z_]\w*)", RegexOptions.None, RegexTimeout);
             if (!m.Success) throw new NotSupportedException(step.EntryPoint + " has a parameter that is not a pointer: " + lines[at].Trim());
             stage.Parameters.Add(m.Groups[1].Value);
         }
@@ -302,12 +305,12 @@ public static class PtxResidentComposer
             }
             line = line.Replace("%ctaid.x", "%resvb").Replace("ld.global.nc.", "ld.global.");
             line = Regex.Replace(line, @"\bbra(\.uni)?\s+([A-Za-z_]\w*);",
-                m => labels.Contains(m.Groups[2].Value) ? "bra" + m.Groups[1].Value + " " + prefix + m.Groups[2].Value + ";" : m.Value);
+                m => labels.Contains(m.Groups[2].Value) ? "bra" + m.Groups[1].Value + " " + prefix + m.Groups[2].Value + ";" : m.Value, RegexOptions.None, RegexTimeout);
             foreach (string parameter in stage.Parameters)
                 line = line.Replace("[" + parameter + "]", "[" + prefix + parameter + "]");
             for (int s = 0; s < stage.Shared.Count; s++)
                 line = Regex.Replace(line, @"\b" + Regex.Escape(stage.Shared[s].Name) + @"\b",
-                    s == 0 ? OverlaidShared : prefix + stage.Shared[s].Name);
+                    s == 0 ? OverlaidShared : prefix + stage.Shared[s].Name, RegexOptions.None, RegexTimeout);
             sb.Append(line).Append('\n');
         }
         stage.Body = sb.ToString();
