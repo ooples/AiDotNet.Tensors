@@ -1255,11 +1255,14 @@ kernel void scatter_mean(
     device atomic_int* counts [[buffer(3)]],
     constant uint& sourceSize [[buffer(4)]],
     constant uint& featureSize [[buffer(5)]],
+    constant uint& outputSize [[buffer(6)]],
     uint gid [[thread_position_in_grid]])
 {
     if (gid < sourceSize) {
         uint row = gid / featureSize; uint col = gid % featureSize;
         int targetRow = indices[row];
+        // An index outside [0, outputSize) contributes nowhere, as the deterministic variant skips it.
+        if (targetRow < 0 || (uint)targetRow >= outputSize) return;
         atomic_fetch_add_explicit(&output[targetRow * featureSize + col], source[gid], memory_order_relaxed);
         if (col == 0) atomic_fetch_add_explicit(&counts[targetRow], 1, memory_order_relaxed);
     }

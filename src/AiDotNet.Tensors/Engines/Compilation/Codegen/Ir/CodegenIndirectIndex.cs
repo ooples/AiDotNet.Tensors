@@ -122,7 +122,7 @@ public sealed class CodegenIndirectIndex
     }
 
     // cvt.rzi.s32.f32 (and so C's (int) on the device): truncation toward zero, NaN to 0, saturation outside the range.
-    private static int TruncateLikeTheDevice(double value)
+    internal static int TruncateLikeTheDevice(double value)
     {
         if (double.IsNaN(value)) return 0;
         if (value >= int.MaxValue) return int.MaxValue;

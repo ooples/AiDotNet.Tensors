@@ -747,7 +747,7 @@ public sealed partial class MetalBackend
             using var enc1 = _commandQueue.CreateScopedComputeEncoder();
             enc1.SetPipelineState(p1.Handle);
             enc1.SetBuffer(src, 0); enc1.SetBuffer(idx, 1); enc1.SetBuffer(outp, 2); enc1.SetBuffer(cnt, 3);
-            enc1.SetBytes((uint)sourceSize, 4); enc1.SetBytes((uint)featureSize, 5);
+            enc1.SetBytes((uint)sourceSize, 4); enc1.SetBytes((uint)featureSize, 5); enc1.SetBytes((uint)outputSize, 6);
             enc1.DispatchThreadgroups(tg1, tpg1);
         }
 

@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // Direct CUDA backend for NVIDIA GPUs (Driver API + NVRTC + cuBLAS fallback).
 using System;
 using System.Collections.Concurrent;
@@ -3706,6 +3706,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (splits <= 0 && headDim == PtxFusedDecodeAttentionD64Kernel.HeadDimension &&
             TryDirectPtxFlashDecodeD64(q, k, v, output, heads, kvHeads, seqLen, scale))
             return output;
+        // #1440: the declared paged decode, the contiguous cache read as a single page.
+        if (TryDeclaredFlashDecode(q, k, v, output, heads, kvHeads, headDim, seqLen, scale)) return output;
         if (!_kernelCache.TryGetValue("flash_decode_partial", out var partKernel))
         {
             output.Dispose();
@@ -4822,6 +4824,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         if (nnz == 0) return;
+        // Declared route (#1441).
+        if (TryDeclaredCsrSddmm(rowIndices, colIndices, x, y, output, nnz, innerK)) return;
 
         if (!_kernelCache.TryGetValue("sddmm", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: sddmm");
@@ -4865,6 +4869,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
+        // Declared route (#1441): csr_spmm_warp's contract is CsrSpMM's, the same sums in the same order.
+        if (TryDeclaredCsrSpMM(csrValues, csrColIndices, csrRowPointers, denseB, output, M, K, N, nnz)) return;
 
         if (!_kernelCache.TryGetValue("csr_spmm_warp", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: csr_spmm_warp");
@@ -4910,6 +4916,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
+
+        // Declared route (#1441): the fp64 program.
+        if (TryDeclaredCsrSpMMDouble(csrValues, csrColIndices, csrRowPointers, denseB, output, M, K, N, nnz)) return;
 
         if (!_kernelCache.TryGetValue("csr_spmm_double", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: csr_spmm_double");
@@ -4966,6 +4975,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 $"CsrSpMMVec4 requires N divisible by 4 (got {N}); the float4-vectorized kernel " +
                 "would silently skip the last N % 4 output columns. Use CsrSpMM for unaligned N.",
                 nameof(N));
+        // Declared route (#1441): csr_spmm_vec4's contract is CsrSpMM's.
+        if (TryDeclaredCsrSpMM(csrValues, csrColIndices, csrRowPointers, denseB, output, M, K, N, nnz)) return;
 
         if (!_kernelCache.TryGetValue("csr_spmm_vec4", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: csr_spmm_vec4");
@@ -5023,6 +5034,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
+        // Declared route (#1441).
+        if (TryDeclaredCsrSpMMBias(csrValues, csrColIndices, csrRowPointers, denseB, bias, output, M, K, N, nnz)) return;
 
         if (!_kernelCache.TryGetValue("csr_spmm_bias", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: csr_spmm_bias");
@@ -5065,6 +5078,12 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
+
+        // Declared route (#1441): fixed-order sums with no atomic, so deterministic in every mode; it writes every
+        // output, so nothing needs zeroing.
+        if (TryDeclaredScatterAddEdges(input, sourceIndices, targetIndices, edgeValues, output, numNodes, numEdges,
+                features))
+            return;
 
         using var _ = PushContext();
 
@@ -5168,6 +5187,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
+        // Declared route (#1441).
+        if (TryDeclaredCsrSegmented(DeclaredFamily.CsrSegmentedMax, csrColIndices, csrRowPointers, input, output, M, K, N))
+            return;
 
         if (!_kernelCache.TryGetValue("csr_segmented_max", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: csr_segmented_max");
@@ -5205,6 +5227,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
+        // Declared route (#1441).
+        if (TryDeclaredCsrSegmented(DeclaredFamily.CsrSegmentedMin, csrColIndices, csrRowPointers, input, output, M, K, N))
+            return;
 
         if (!_kernelCache.TryGetValue("csr_segmented_min", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: csr_segmented_min");
@@ -5243,6 +5268,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
+        // Declared route (#1441).
+        if (TryDeclaredCsrSegmented(DeclaredFamily.CsrSegmentedStdDev, csrColIndices, csrRowPointers, input, output,
+                M, K, N, epsilon))
+            return;
 
         if (!_kernelCache.TryGetValue("csr_segmented_stddev", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: csr_segmented_stddev");
@@ -10156,6 +10185,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
     {
         using var _ = PushContext();
+        // #1440: the declared attention program, which takes grouped key/value heads (h reads h / g), the same causal
+        // rule (a KV-cache offset) and stores the normalised weights when asked.
+        if (TryDeclaredAttention(query, key, value, output, attentionWeights, null, batch, numQHeads, numKVHeads, seqQ, seqK,
+                headDim, scale, isCausal, maskMode: 0, softcap: 0f))
+            return;
         var kernel = _kernelCache["grouped_query_attention"];
         uint gridX = (uint)((seqQ + 31) / 32);
         uint gridY = (uint)(batch * numQHeads);
@@ -10207,6 +10241,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 gradOutput, query, key, value, attentionWeights,
                 gradQuery, gradKey, gradValue,
                 batch, numQHeads, numKVHeads, seqQ, seqK, headDim, scale))
+            return;
+        // #1440: the declared backward with grouped key/value heads.
+        if (TryDeclaredGroupedAttentionBackward(gradOutput, query, key, value, attentionWeights, gradQuery, gradKey,
+                gradValue, batch, numQHeads, numKVHeads, queriesPerKV, seqQ, seqK, headDim, scale))
             return;
             GroupedQueryAttentionBackwardLaunch(
                 gradOutput, query, key, value,
@@ -11325,6 +11363,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public unsafe void ScatterMean(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, IGpuBuffer counts, int sourceSize, int outputSize, int featureSize)
     {
+        // Declared route (#1441): the counts and means with no atomic, deterministic in every mode; it writes every
+        // output and count, so nothing needs zeroing first.
+        if (TryDeclaredScatterMeanActivation(source, indices, output, counts, sourceSize, outputSize, featureSize)) return;
         using var _ = PushContext();
         // Initialize output and counts to zero before accumulation
         Fill(output, 0f, outputSize * featureSize);
@@ -11355,9 +11396,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             if (!_kernelCache.TryGetValue("scatter_mean", out var scatterKernel))
                 throw new GpuCapabilityUnavailableException("CUDA kernel not found: scatter_mean");
             uint grid1 = (uint)((sourceSize + DefaultBlockSize - 1) / DefaultBlockSize);
-            void** args1 = stackalloc void*[6];
+            void** args1 = stackalloc void*[7];
             args1[0] = &sPtr; args1[1] = &idxPtr; args1[2] = &oPtr; args1[3] = &cPtr;
-            args1[4] = &sourceSize; args1[5] = &featureSize;
+            args1[4] = &sourceSize; args1[5] = &featureSize; args1[6] = &outputSize;
             LaunchKernel(scatterKernel, grid1, DefaultBlockSize, args1);
         }
 
@@ -13234,7 +13275,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     public unsafe void ScatterAddBackward(IGpuBuffer gradDestination, IGpuBuffer indices, IGpuBuffer gradSource,
         int numIndices, int featureSize)
     {
-        // ScatterAddBackward is essentially a Gather operation
+        // ScatterAddBackward is essentially a Gather operation: the embedding's declared gather (#1441).
+        if (featureSize > 0 &&
+            TryDeclaredRowGather(indices, gradDestination, gradSource, numIndices, featureSize, gradDestination.Size / featureSize))
+            return;
         if (!_kernelCache.TryGetValue("embedding_forward", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: embedding_forward");
 
@@ -13402,6 +13446,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     }
     public unsafe void IndexWrite(IGpuBuffer output, IGpuBuffer indices, IGpuBuffer source, float fillValue, int mode, int outerSize, int idxAxis, int innerSize, int dstAxis)
     {
+        // Declared route (#1441): the same last-index-wins write, 3.7-4x from dstAxis x idxAxis = 1M (the hand-written
+        // kernel scans every index per element); 0.58-0.83x below half a million.
+        if ((ScatterRowsForced || (long)dstAxis * idxAxis >= 1L << 19) &&
+            TryDeclaredIndexWrite(output, indices, source, copy: mode == 0, fillValue, outerSize, idxAxis, innerSize, dstAxis))
+            return;
         var kernel = ResolveParity210Kernel("parity210_index_write");
         using var _ = PushContext();
         int __total = outerSize*dstAxis*innerSize; if (__total <= 0) return;
@@ -13702,6 +13751,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     }
     public unsafe void ScatterReduce(IGpuBuffer output, IGpuBuffer source, IGpuBuffer index, int outerSize, int srcDim, int dstDim, int innerSize, int mode)
     {
+        // Declared route (#1441): deterministic sum, maximum and minimum; the product keeps the kernel below.
+        if (TryDeclaredScatterReduce(output, source, index, outerSize, srcDim, dstDim, innerSize, mode)) return;
         var kernel = ResolveParity210Kernel("parity210_scatter_reduce");
         using var _ = PushContext();
         int __total = outerSize*srcDim*innerSize; if (__total <= 0) return;
@@ -19760,6 +19811,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public unsafe void IndexSelect(IGpuBuffer input, IGpuBuffer indices, IGpuBuffer output, int numIndices, int innerSize)
     {
+        // Declared route (#1441): the float-id row gather. It ties index_select (0.99-1.01x), so it runs only when the
+        // scatter-rows family is forced.
+        if (ScatterRowsForced && TryDeclaredRowGatherFloatIds(indices, input, output, numIndices, innerSize)) return;
         if (!_kernelCache.TryGetValue("index_select", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: index_select");
         using var _ = PushContext();

@@ -1,4 +1,4 @@
-﻿using System.Linq;
+using System.Linq;
 using BenchmarkDotNet.Configs;
 using BenchmarkDotNet.Running;
 using AiDotNet.Tensors.Benchmarks;
@@ -627,6 +627,12 @@ class Program
         if (args.Length > 0 && args[0] == "--kernel-dump")
         {
             KernelConveyorTool.Run("dump", args.Skip(1).ToArray());
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--kernel-family-gate")
+        {
+            KernelFamilyGateTool.Run(args.Skip(1).ToArray());
             return;
         }
 

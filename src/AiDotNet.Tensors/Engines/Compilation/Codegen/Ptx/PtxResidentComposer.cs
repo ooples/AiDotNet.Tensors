@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // A chain of declared kernels as ONE persistent cooperative launch (#890 phase 4, on the resident program of phase 3,
 // #1430): the stages' own PTX, composed into one entry that walks every stage's blocks with a grid barrier between
 // stages, so a launch-bound chain pays one launch instead of one per kernel.
@@ -93,7 +93,7 @@ public static class PtxResidentComposer
         var body = new StringBuilder();
         var externs = new List<string>();
         var calls = new List<CodegenLibraryFunction>();
-        int maxP = 0, maxR = 0, maxRd = 0, maxF = 0, sharedBytes = 0, overlaidBytes = 0, overlaidAlign = 0;
+        int maxP = 0, maxR = 0, maxRd = 0, maxF = 0, maxFd = 0, sharedBytes = 0, overlaidBytes = 0, overlaidAlign = 0;
         uint maxBlocks = 0;
 
         for (int k = 0; k < steps.Count; k++)
@@ -111,6 +111,7 @@ public static class PtxResidentComposer
             foreach (var call in step.Calls)
                 if (!calls.Exists(c => c.Symbol == call.Symbol)) calls.Add(call);
             maxP = Math.Max(maxP, stage.P); maxR = Math.Max(maxR, stage.R); maxRd = Math.Max(maxRd, stage.Rd); maxF = Math.Max(maxF, stage.F);
+            maxFd = Math.Max(maxFd, stage.Fd);
             foreach (string parameter in stage.Parameters) parameters.Add(prefix + parameter);
             arguments.AddRange(step.Arguments);
             for (int s = 0; s < stage.Shared.Count; s++)
@@ -166,6 +167,7 @@ public static class PtxResidentComposer
            .Append("    .reg .b32 %r<").Append(maxR.ToString(CultureInfo.InvariantCulture)).Append(">;\n")
            .Append("    .reg .b64 %rd<").Append(maxRd.ToString(CultureInfo.InvariantCulture)).Append(">;\n")
            .Append("    .reg .f32 %f<").Append(maxF.ToString(CultureInfo.InvariantCulture)).Append(">;\n")
+           .Append(maxFd > 0 ? "    .reg .f64 %fd<" + maxFd.ToString(CultureInfo.InvariantCulture) + ">;\n" : "")
            .Append("    .reg .b32 %resvb, %resnct, %resgen, %resarr, %reslast, %rescur, %resdummy;\n")
            .Append("    .reg .b64 %resbar;\n")
            .Append("    .reg .pred %resdone, %resleader, %reslastone, %resspin;\n")
@@ -209,13 +211,13 @@ public static class PtxResidentComposer
         internal List<string> Parameters { get; } = new();
         internal List<string> Externs { get; } = new();
         internal List<(string Name, int Align, int Bytes)> Shared { get; } = new();
-        internal int P, R, Rd, F;
+        internal int P, R, Rd, F, Fd;
         internal string Body = "";
     }
 
     private static readonly Regex Label = new(@"^([A-Za-z_]\w*):\s*$", RegexOptions.Compiled);
     private static readonly Regex SharedDecl = new(@"^\s*\.shared\s+\.align\s+(\d+)\s+\.b8\s+([A-Za-z_]\w*)\[(\d+)\];\s*$", RegexOptions.Compiled);
-    private static readonly Regex RegDecl = new(@"^\s*\.reg\s+\.(pred|b32|b64|f32)\s+%(p|r|rd|f)<(\d+)>;\s*$", RegexOptions.Compiled);
+    private static readonly Regex RegDecl = new(@"^\s*\.reg\s+\.(pred|b32|b64|f32|f64)\s+%(p|r|rd|f|fd)<(\d+)>;\s*$", RegexOptions.Compiled);
 
     private static Stage Parse(PtxProgramStep step, string prefix)
     {
@@ -260,6 +262,7 @@ public static class PtxResidentComposer
                     case "p": stage.P = Math.Max(stage.P, count); break;
                     case "r": stage.R = Math.Max(stage.R, count); break;
                     case "rd": stage.Rd = Math.Max(stage.Rd, count); break;
+                    case "fd": stage.Fd = Math.Max(stage.Fd, count); break;
                     default: stage.F = Math.Max(stage.F, count); break;
                 }
                 continue;

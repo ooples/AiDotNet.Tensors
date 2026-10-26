@@ -83,6 +83,63 @@ internal enum DeclaredFamily
 
     /// <summary>CSR · dense → dense (#1441).</summary>
     CsrSpMM,
+
+    /// <summary>The row-wise scatter maximum with its float argmax (#1441).</summary>
+    ScatterMaxArgmaxRows,
+
+    /// <summary>The backward of the row-wise scatter maximum (#1441).</summary>
+    ScatterMaxBackwardRows,
+
+    /// <summary>The backward of the row-wise scatter mean (#1441).</summary>
+    ScatterMeanBackwardRows,
+
+    /// <summary>The backward of the row-wise scatter softmax (#1441).</summary>
+    ScatterSoftmaxBackwardRows,
+
+    /// <summary>The activation-layout scatter mean with int32 counts (#1441).</summary>
+    ScatterMeanActivation,
+
+    /// <summary>CSR · dense + bias (#1441).</summary>
+    CsrSpMMBias,
+
+    /// <summary>Sampled dense-dense matrix multiplication at a sparse pattern (#1441).</summary>
+    CsrSddmm,
+
+    /// <summary>A graph layer's edge scatter-add, unweighted or weighted (#1441).</summary>
+    ScatterAddEdges,
+
+    /// <summary>The CSR segmented maximum over float-encoded indices (#1441).</summary>
+    CsrSegmentedMax,
+
+    /// <summary>The CSR segmented minimum over float-encoded indices (#1441).</summary>
+    CsrSegmentedMin,
+
+    /// <summary>The CSR segmented standard deviation over float-encoded indices (#1441).</summary>
+    CsrSegmentedStdDev,
+
+    /// <summary>The deterministic index write, copy and fill, the last index winning (#1441).</summary>
+    IndexWrite,
+
+    /// <summary>The deterministic index add onto the destination (#1441).</summary>
+    IndexAdd,
+
+    /// <summary>The deterministic scatter reduction's sum, maximum and minimum (#1441).</summary>
+    ScatterReduce,
+
+    /// <summary>Take-along-dim with int32 indices (#1441).</summary>
+    TakeAlongDimInt,
+
+    /// <summary>A row gather by float32 ids (#1441).</summary>
+    EmbeddingFloatIds,
+
+    /// <summary>The masked scatter through a byte mask and its prefix positions (#1441).</summary>
+    MaskedScatter,
+
+    /// <summary>CSR · dense → dense in double precision (#1441).</summary>
+    CsrSpMMDouble,
+
+    /// <summary>The grouped-query attention backward, key/value heads shared by groups of query heads (#1440).</summary>
+    GroupedQueryAttentionBackward,
 }
 
 /// <summary>One declared program: its family and shape (unused dimensions are 0).</summary>
@@ -473,7 +530,7 @@ public sealed partial class CudaBackend
         // The scratch this program would pin for the backend's lifetime, decided BEFORE any of it is allocated.
         long scratchBytes = 0;
         foreach (var pair in lowering.Buffers)
-            if (!slotOf.ContainsKey(pair.Key)) scratchBytes = checked(scratchBytes + pair.Value * sizeof(float));
+            if (!slotOf.ContainsKey(pair.Key)) scratchBytes = checked(scratchBytes + ScratchFloats(lowering, pair.Key) * sizeof(float));
         if (!DeclaredScratchFits(scratchBytes, out string? overBudget))
         {
             decline = overBudget;
@@ -490,7 +547,7 @@ public sealed partial class CudaBackend
             {
                 if (slotOf.ContainsKey(pair.Key)) continue;
                 scratchOf[pair.Key] = scratch.Count;
-                scratch.Add(AllocateBuffer(checked((int)pair.Value)));
+                scratch.Add(AllocateBuffer(checked((int)ScratchFloats(lowering, pair.Key))));
             }
             var argumentSlots = new int[lowering.Steps.Count][];
             for (int s = 0; s < lowering.Steps.Count; s++)
@@ -529,6 +586,10 @@ public sealed partial class CudaBackend
             throw;
         }
     }
+
+    // Scratch is allocated in floats: an fp64 intermediate needs two per element, a byte mask a quarter of one.
+    private static long ScratchFloats(PtxProgramLowering lowering, string name) =>
+        (lowering.BufferBytes(name) + sizeof(float) - 1) / sizeof(float);
 
     /// <summary>Why the program for <paramref name="key"/> declined, or null when it did not.</summary>
     internal string? DeclaredDeclineReason(DeclaredKey key)

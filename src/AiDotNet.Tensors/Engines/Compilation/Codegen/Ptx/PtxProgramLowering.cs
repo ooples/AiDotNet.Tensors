@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // Lowers a whole declared program (CodegenProgram) to an ordered list of PTX launches -- what a backend runs when it
 // routes a call to a declared program instead of a hand-written kernel.
 //
@@ -41,12 +41,23 @@ public sealed record PtxPassLowering(IReadOnlyList<PtxPassKernel> Kernels, Codeg
 public sealed class PtxProgramLowering
 {
     private PtxProgramLowering(IReadOnlyList<PtxProgramStep> steps, IReadOnlyDictionary<string, long> buffers,
-        IReadOnlyList<string> passLowerings)
+        IReadOnlyList<string> passLowerings, IReadOnlyDictionary<string, int> elementBytes)
     {
         Steps = steps;
         Buffers = buffers;
         PassLowerings = passLowerings;
+        ElementBytes = elementBytes;
     }
+
+    /// <summary>
+    /// Bytes per element of every program tensor that is not 4 bytes wide (an fp64 tensor, a byte mask); a name absent
+    /// here, "#temp" scratch included, is 4 bytes. A caller allocating scratch sizes it by this, not by element count.
+    /// </summary>
+    public IReadOnlyDictionary<string, int> ElementBytes { get; }
+
+    /// <summary>The bytes buffer <paramref name="name"/> occupies.</summary>
+    public long BufferBytes(string name) =>
+        Buffers[name] * (ElementBytes.TryGetValue(name, out int bytes) ? bytes : sizeof(float));
 
     /// <summary>How each pass was lowered, parallel to the program's passes ("row-fused x3", "split x2", ...).</summary>
     public IReadOnlyList<string> PassLowerings { get; }
@@ -68,17 +79,30 @@ public sealed class PtxProgramLowering
         if (program is null) throw new ArgumentNullException(nameof(program));
         if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("A lowering needs a name.", nameof(name));
 
-        // A launch binds each pass's inputs and its one output by name; an argmax, extra outputs or an atomic
-        // (scatter) output would need parameters -- and zeroing -- this lowering does not provide.
+        // A launch binds each pass's inputs, its output and its extra outputs (an argmax) by name, in parameter order;
+        // an atomic (scatter) output would need zeroing this lowering does not provide.
         foreach (var pass in program.Passes)
-            if (pass.SecondaryOutput is not null || pass.ExtraOutputs.Count != 0 || pass.Output.NeedsAtomicStore)
+            if (pass.Output.NeedsAtomicStore)
                 throw new NotSupportedException(pass.Name + " has outputs a program launch does not bind.");
 
         var steps = new List<PtxProgramStep>();
         var labels = new List<string>();
         var buffers = new Dictionary<string, long>(StringComparer.Ordinal);
         foreach (var source in program.Sources()) buffers[source.Name] = source.ElementCount;
-        foreach (var pass in program.Passes) buffers[pass.Output.Name] = pass.Output.ElementCount;
+        foreach (var pass in program.Passes)
+        {
+            buffers[pass.Output.Name] = pass.Output.ElementCount;
+            foreach (var extra in pass.ExtraOutputs) buffers[extra.Binding.Name] = extra.Binding.ElementCount;
+        }
+        var elementBytes = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var pass in program.Passes)
+        {
+            foreach (var input in pass.Inputs)
+                if (input.ElementBytes != sizeof(float)) elementBytes[input.Name] = input.ElementBytes;
+            if (pass.Output.ElementBytes != sizeof(float)) elementBytes[pass.Output.Name] = pass.Output.ElementBytes;
+            foreach (var extra in pass.ExtraOutputs)
+                if (extra.Binding.ElementBytes != sizeof(float)) elementBytes[extra.Binding.Name] = extra.Binding.ElementBytes;
+        }
 
         var passes = program.Passes;
         int at = 0, temp = 0;
@@ -171,6 +195,7 @@ public sealed class PtxProgramLowering
             var args = new List<string>();
             foreach (var input in pass.Inputs) args.Add(input.Name);
             args.Add(pass.Output.Name);
+            foreach (var extra in pass.ExtraOutputs) args.Add(extra.Binding.Name);
             if (custom is not null)
             {
                 steps.Add(Step(custom.Kernels[0], args));
@@ -182,7 +207,7 @@ public sealed class PtxProgramLowering
                 labels.Add("single");
             }
         }
-        return new PtxProgramLowering(steps, buffers, labels);
+        return new PtxProgramLowering(steps, buffers, labels, elementBytes);
     }
 
     private static PtxProgramStep Step(PtxPassKernel kernel, IReadOnlyList<string> args) =>
