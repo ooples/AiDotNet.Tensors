@@ -33,7 +33,7 @@ public enum CodegenAttentionMask
 }
 
 /// <summary>Declared programs shaped as the hand-written backend normalisation kernels.</summary>
-public static class CodegenBackendPrograms
+public static partial class CodegenBackendPrograms
 {
     private static CodegenExpr Op(int input) => CodegenExpr.Operand(input);
 

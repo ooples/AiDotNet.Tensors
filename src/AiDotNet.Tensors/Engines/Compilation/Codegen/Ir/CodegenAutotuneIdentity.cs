@@ -423,6 +423,10 @@ public sealed record CodegenAutotuneIdentity(
                 .Append(";extraBias=").Append(Optional(extra.BiasInput))
                 .Append(";extraBiasScale=")
                 .Append(extra.BiasScale.ToString("R", CultureInfo.InvariantCulture)).Append(';');
+            // Only when not the default, so every identity recorded before these existed is unchanged.
+            if (extra.NoWinnerIndex != 0)
+                text.Append("extraNoWinner=").Append(extra.NoWinnerIndex.ToString(CultureInfo.InvariantCulture)).Append(';');
+            if (extra.IndexAsFloat) text.Append("extraIndexAsFloat;");
         }
 
         return text.ToString();

@@ -94,7 +94,7 @@ public static class CodegenSplitReduction
         if (spec is null) throw new ArgumentNullException(nameof(spec));
         return IsSplittable(spec.Reduce) &&
             spec.SecondaryOutput is null && spec.SecondaryIndexExpr is null &&
-            spec.ExtraOutputs.Count == 0 && !AnyIndirection(spec);
+            spec.ExtraOutputs.Count == 0 && !AnyIndirection(spec) && !spec.HasIntegerValues;
     }
 
     private static bool AnyIndirection(CodegenKernelSpec spec)
@@ -151,6 +151,11 @@ public static class CodegenSplitReduction
             throw new NotSupportedException(
                 "A split would have to rebuild extra outputs from the combined value; the " +
                 "combine pass does not carry them, so the spec stays single-pass.");
+
+        if (spec.HasIntegerValues)
+            throw new NotSupportedException(
+                "A split rebuilds the spec's bindings, and integer-value tensors are lowered only by the generic " +
+                "affine path, so the spec stays single-pass.");
 
         if (AnyIndirection(spec))
             throw new NotSupportedException(

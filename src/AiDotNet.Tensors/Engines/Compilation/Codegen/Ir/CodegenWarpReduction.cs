@@ -55,6 +55,8 @@ public static class CodegenWarpReduction
     {
         if (spec is null) throw new ArgumentNullException(nameof(spec));
         laneSpec = spec;
+        // The lane spec rebuilds every binding; an integer-value tensor stays on the generic path that converts it.
+        if (spec.HasIntegerValues) return false;
         int axis = ContiguousAxis(spec);
         if (axis < 0) return false;
 

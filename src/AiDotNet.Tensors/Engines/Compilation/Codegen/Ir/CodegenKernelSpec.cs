@@ -86,13 +86,20 @@ public enum CodegenExtraOutputKind
 /// multiplier on the primary result.</param>
 /// <param name="BiasInput">Optional input added after that multiplier.</param>
 /// <param name="BiasScale">Multiplier on that input.</param>
+/// <param name="NoWinnerIndex">For <see cref="CodegenExtraOutputKind.ArgMaxIndex"/>, what is written when no term
+/// beats the reduction's identity (an empty group, or every term -infinity or NaN): a max-pool's 0, or the -1 a
+/// row-wise scatter maximum's backward reads as "no source row".</param>
+/// <param name="IndexAsFloat">For <see cref="CodegenExtraOutputKind.ArgMaxIndex"/>, write the position as a float
+/// (exact up to 2^24) instead of as a 32-bit integer.</param>
 public sealed record CodegenExtraOutput(
     CodegenTensorBinding Binding,
     CodegenExtraOutputKind Kind,
     CodegenAffineExpr? IndexExpr = null,
     double Scale = 1.0,
     int? BiasInput = null,
-    double BiasScale = 1.0);
+    double BiasScale = 1.0,
+    int NoWinnerIndex = 0,
+    bool IndexAsFloat = false);
 
 /// <summary>Epilogue activation applied after bias and scale.</summary>
 public enum CodegenActivationKind
@@ -169,6 +176,21 @@ public sealed class CodegenKernelSpec
     /// <summary>The tensor the kernel writes.</summary>
     public CodegenTensorBinding Output { get; }
 
+    /// <summary>
+    /// True when any binding is an int32 tensor of values (<see cref="CodegenTensorBinding.IsIntegerValue"/>). Only the
+    /// generic affine lowering converts those; every planner that rebuilds bindings refuses such a spec.
+    /// </summary>
+    public bool HasIntegerValues
+    {
+        get
+        {
+            if (Output.IsIntegerValue) return true;
+            foreach (var input in _inputs) if (input.IsIntegerValue) return true;
+            foreach (var extra in _extraOutputs) if (extra.Binding.IsIntegerValue) return true;
+            return false;
+        }
+    }
+
     /// <summary>Indices into <see cref="Inputs"/> whose loads are multiplied inside the reduction.</summary>
     public IReadOnlyList<int> ProductInputs => _productInputs;
 
@@ -235,6 +257,12 @@ public sealed class CodegenKernelSpec
     /// numbers while corrupting every gradient.
     /// </remarks>
     public CodegenAffineExpr? SecondaryIndexExpr => FirstArgMax?.IndexExpr;
+
+    /// <summary>What <see cref="SecondaryOutput"/> holds when no term wins (see <see cref="CodegenExtraOutput.NoWinnerIndex"/>).</summary>
+    public int SecondaryNoWinnerIndex => FirstArgMax?.NoWinnerIndex ?? 0;
+
+    /// <summary>Whether <see cref="SecondaryOutput"/> holds the position as a float rather than an integer.</summary>
+    public bool SecondaryIndexAsFloat => FirstArgMax?.IndexAsFloat ?? false;
 
     /// <summary>The first argmax extra, which is what the legacy secondary pair named.</summary>
     private CodegenExtraOutput? FirstArgMax
@@ -774,6 +802,19 @@ public sealed class CodegenKernelSpec
         return output;
     }
 
+    /// <summary>
+    /// What <c>cvt.rni.s32.f32</c> stores for an integer-value output: the nearest integer (ties to even), NaN as 0,
+    /// saturated to the int32 range. The accumulator is first rounded to fp32, as the device holds it.
+    /// </summary>
+    internal static double RoundToInt32LikeTheDevice(double value)
+    {
+        double asFloat = (float)value;
+        if (double.IsNaN(asFloat)) return 0;
+        if (asFloat >= int.MaxValue) return int.MaxValue;
+        if (asFloat <= int.MinValue) return int.MinValue;
+        return Math.Round(asFloat, MidpointRounding.ToEven);
+    }
+
     /// <summary>Refuses an int32 index tensor used where a value operand is expected.</summary>
     private void RefuseIndexOperand(int input, string role)
     {
@@ -909,7 +950,7 @@ public sealed class CodegenKernelSpec
             for (int r = 0; r < reduction.Length; r++) values[reduction[r]] = 0;
 
             double acc = Reduce == CodegenReduceKind.Max ? double.NegativeInfinity : 0.0;
-            long argIndex = 0;
+            long argIndex = SecondaryNoWinnerIndex;
             long trips = Space.ReductionTripCount;
 
             for (long t = 0; t < trips; t++)
@@ -1058,6 +1099,7 @@ public sealed class CodegenKernelSpec
                 // embedding backward are the ordinary case, not the corner case -- and the
                 // emitter lowers that to red.global.add.f32. An oracle that assigned would
                 // disagree with a CORRECT kernel and look like a kernel bug.
+                if (Output.IsIntegerValue) acc = RoundToInt32LikeTheDevice(acc);
                 if (Output.NeedsAtomicStore) output[outOff] += acc;
                 else output[outOff] = acc;
             }

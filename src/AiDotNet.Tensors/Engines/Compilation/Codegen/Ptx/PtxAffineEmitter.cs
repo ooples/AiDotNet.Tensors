@@ -1001,6 +1001,8 @@ public sealed partial class PtxAffineEmitter
     private static bool IsUnitStrideIn(
         CodegenTensorBinding binding, int axis, IReadOnlyList<CodegenAxis> axes)
     {
+        // An integer-value tensor converts element by element; it never takes a vector path.
+        if (binding.IsIntegerValue) return false;
         int last = binding.Map.Count - 1;
         if (last < 0 || binding.Stride(last) != 1) return false;
 
@@ -1241,7 +1243,7 @@ public sealed partial class PtxAffineEmitter
                 // The staged slice is addressed in 4-byte units and re-read as f32, so a
                 // narrow binding would be staged at the wrong stride. Excluded until the
                 // staging path carries an element size of its own.
-                if (spec.Inputs[inputIdx].NeedsConversion) continue;
+                if (spec.Inputs[inputIdx].NeedsConversion || spec.Inputs[inputIdx].IsIntegerValue) continue;
 
                 bool varies = false;
                 foreach (int ax in varyingAxes)
@@ -1358,7 +1360,7 @@ public sealed partial class PtxAffineEmitter
                 foreach (int inputIdx in spec.ProductInputs)
                 {
                     var binding = spec.Inputs[inputIdx];
-                    if (binding.NeedsConversion) continue;   // see the flat staging note
+                    if (binding.NeedsConversion || binding.IsIntegerValue) continue;   // see the flat staging note
 
                     // Keyed by this dimension only if it varies here and is invariant in
                     // the other -- that invariance is the reuse being exploited.
@@ -1604,7 +1606,7 @@ public sealed partial class PtxAffineEmitter
             for (int l = 0; l < lanes; l++)
             {
                 argIndex[l] = NextR();
-                L($"mov.u32 {argIndex[l]}, 0;");
+                L($"mov.u32 {argIndex[l]}, {I(spec.SecondaryNoWinnerIndex)};");
             }
         }
 
@@ -2152,7 +2154,7 @@ public sealed partial class PtxAffineEmitter
                 //
                 // The destination must be zeroed by the caller before launch, since this
                 // adds to whatever is already there.
-                if (spec.Output.NeedsConversion)
+                if (spec.Output.NeedsConversion || spec.Output.IsIntegerValue)
                     throw new NotSupportedException(
                         "A scatter destination must be fp32: there is no atomic add for a " +
                         "16-bit float here, and emulating one with a compare-and-swap loop " +
@@ -2161,6 +2163,15 @@ public sealed partial class PtxAffineEmitter
                 if (lanePred is null) L($"red.global.add.f32 [{laneAddr}], {acc};");
                 else L($"@{lanePred} red.global.add.f32 [{laneAddr}], {acc};");
                 AtomicStores++;
+            }
+            else if (spec.Output.IsIntegerValue)
+            {
+                // An integer-value output (a count): the nearest integer, saturating, NaN to 0 -- cvt.rni's rules,
+                // which the interpreter mirrors.
+                string asInt = NextR();
+                L($"cvt.rni.s32.f32 {asInt}, {acc};");
+                if (lanePred is null) L($"st.global.s32 [{laneAddr}], {asInt};");
+                else L($"@{lanePred} st.global.s32 [{laneAddr}], {asInt};");
             }
             else if (spec.Output.NeedsConversion)
             {
@@ -2182,8 +2193,16 @@ public sealed partial class PtxAffineEmitter
                 string secondAddr = NextRd(), secondByte = NextRd();
                 L($"mul.wide.u32 {secondByte}, {secondOff}, 4;");
                 L($"add.u64 {secondAddr}, {basePtr[spec.SecondaryOutput.ParameterIndex]}, {secondByte};");
-                if (secondPred is null) L($"st.global.u32 [{secondAddr}], {argIndex[l]};");
-                else L($"@{secondPred} st.global.u32 [{secondAddr}], {argIndex[l]};");
+                string stored = argIndex[l], storeType = "u32";
+                if (spec.SecondaryIndexAsFloat)
+                {
+                    // Declared as a float position (the row-wise scatter maximum's argmax buffer): exact to 2^24.
+                    stored = NextF();
+                    storeType = "f32";
+                    L($"cvt.rn.f32.s32 {stored}, {argIndex[l]};");
+                }
+                if (secondPred is null) L($"st.global.{storeType} [{secondAddr}], {stored};");
+                else L($"@{secondPred} st.global.{storeType} [{secondAddr}], {stored};");
             }
 
             // EVERY REMAINING EXTRA OUTPUT, from the SAME accumulator. The count is not
@@ -2221,6 +2240,10 @@ public sealed partial class PtxAffineEmitter
                 L($"mul.wide.u32 {extraByte}, {extraOff}, {I(extra.Binding.ElementBytes)};");
                 L($"add.u64 {extraAddr}, {basePtr[extra.Binding.ParameterIndex]}, {extraByte};");
 
+                if (extra.Binding.IsIntegerValue)
+                    throw new NotSupportedException(
+                        "Extra output '" + extra.Binding.Name + "' is declared as integer values; only the primary " +
+                        "output converts to int32.");
                 if (extra.Binding.NeedsConversion)
                 {
                     string narrowedExtra = EmitNarrow(extra.Binding.ElementType, value);
@@ -2723,6 +2746,30 @@ public sealed partial class PtxAffineEmitter
         string byteOff = NextRd(), addr = NextRd(), dst = NextF();
         L($"mul.wide.s32 {byteOff}, {offset}, {I(binding.ElementBytes)};");
         L($"add.u64 {addr}, {basePtr}, {byteOff};");
+
+        if (binding.IsIntegerValue)
+        {
+            // A count read as a number: every int32 up to 2^24 converts exactly, and rounding beyond that is cvt's.
+            string raw = NextR();
+            if (predicate is null)
+            {
+                L($"ld.global.nc.s32 {raw}, [{addr}];");
+            }
+            else
+            {
+                L($"mov.u32 {raw}, 0;");
+                L($"@{predicate} ld.global.nc.s32 {raw}, [{addr}];");
+            }
+            L($"cvt.rn.f32.s32 {dst}, {raw};");
+            if (predicate is not null && _outOfRangeFill != "0f00000000")
+            {
+                string fill = NextF();
+                L($"mov.f32 {fill}, {_outOfRangeFill};");
+                L($"selp.f32 {dst}, {dst}, {fill}, {predicate};");
+            }
+            EmittedLoads++;
+            return dst;
+        }
 
         if (binding.NeedsConversion)
         {

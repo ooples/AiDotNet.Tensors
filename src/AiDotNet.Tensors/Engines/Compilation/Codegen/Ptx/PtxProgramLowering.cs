@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // Lowers a whole declared program (CodegenProgram) to an ordered list of PTX launches -- what a backend runs when it
 // routes a call to a declared program instead of a hand-written kernel.
 //
@@ -68,17 +68,21 @@ public sealed class PtxProgramLowering
         if (program is null) throw new ArgumentNullException(nameof(program));
         if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("A lowering needs a name.", nameof(name));
 
-        // A launch binds each pass's inputs and its one output by name; an argmax, extra outputs or an atomic
-        // (scatter) output would need parameters -- and zeroing -- this lowering does not provide.
+        // A launch binds each pass's inputs, its output and its extra outputs (an argmax) by name, in parameter order;
+        // an atomic (scatter) output would need zeroing this lowering does not provide.
         foreach (var pass in program.Passes)
-            if (pass.SecondaryOutput is not null || pass.ExtraOutputs.Count != 0 || pass.Output.NeedsAtomicStore)
+            if (pass.Output.NeedsAtomicStore)
                 throw new NotSupportedException(pass.Name + " has outputs a program launch does not bind.");
 
         var steps = new List<PtxProgramStep>();
         var labels = new List<string>();
         var buffers = new Dictionary<string, long>(StringComparer.Ordinal);
         foreach (var source in program.Sources()) buffers[source.Name] = source.ElementCount;
-        foreach (var pass in program.Passes) buffers[pass.Output.Name] = pass.Output.ElementCount;
+        foreach (var pass in program.Passes)
+        {
+            buffers[pass.Output.Name] = pass.Output.ElementCount;
+            foreach (var extra in pass.ExtraOutputs) buffers[extra.Binding.Name] = extra.Binding.ElementCount;
+        }
 
         var passes = program.Passes;
         int at = 0, temp = 0;
@@ -171,6 +175,7 @@ public sealed class PtxProgramLowering
             var args = new List<string>();
             foreach (var input in pass.Inputs) args.Add(input.Name);
             args.Add(pass.Output.Name);
+            foreach (var extra in pass.ExtraOutputs) args.Add(extra.Binding.Name);
             if (custom is not null)
             {
                 steps.Add(Step(custom.Kernels[0], args));
