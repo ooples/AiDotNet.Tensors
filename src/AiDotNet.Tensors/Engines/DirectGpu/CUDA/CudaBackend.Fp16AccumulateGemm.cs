@@ -199,8 +199,9 @@ public sealed partial class CudaBackend
         }
     }
 
-    // Paired ABBA rounds of cuBLAS against the kernel. Takes ownership of the kernel: kept in the route on a win, disposed
-    // otherwise.
+    // Paired ABBA rounds of cuBLAS against the kernel. A verdict whose median wins but one round lost (one disturbed round
+    // would otherwise keep cuBLAS for the process) is measured once more, and that second set of rounds must pass on its
+    // own. Takes ownership of the kernel: kept in the route on a win, disposed otherwise.
     private Fp16AccumulateRoute VerdictAgainstCublas(PtxTensorCoreGemmKernel kernel, IGpuBuffer a, IGpuBuffer b, IGpuBuffer c,
         int m, int n, int k)
     {
@@ -208,10 +209,10 @@ public sealed partial class CudaBackend
         GemmRouteVerdict verdict;
         try
         {
-            verdict = PairedRounds(
+            verdict = ConfirmFp16AccumulateVerdict(() => PairedRounds(
                 () => { for (int i = 0; i < reps; i++) CublasGemmFp16In32fOut(a, b, c, m, n, k); },
                 () => { for (int i = 0; i < reps; i++) LaunchFp16Accumulate(kernel, a, b, c, m, n, k); },
-                reps);
+                reps));
         }
         catch
         {
@@ -224,6 +225,19 @@ public sealed partial class CudaBackend
             return new Fp16AccumulateRoute(null, verdict.Reason, verdict.MedianSpeedup);
         }
         return new Fp16AccumulateRoute(kernel, $"{kernel.Configuration.Name}: {verdict.Reason}", verdict.MedianSpeedup);
+    }
+
+    // The first verdict, or, when its median won but a round lost, a second measurement's verdict on its own.
+    internal static GemmRouteVerdict ConfirmFp16AccumulateVerdict(Func<GemmRouteVerdict> measure)
+    {
+        GemmRouteVerdict first = measure();
+        if (first.Wins || first.MedianSpeedup < GemmRouteMedianMargin) return first;
+        GemmRouteVerdict second = measure();
+        return second with
+        {
+            Reason = $"{second.Reason} (re-measured: the first rounds' median {first.MedianSpeedup:F3}x won but one " +
+                     $"round was {first.MinimumSpeedup:F3}x)",
+        };
     }
 
     /// <summary>

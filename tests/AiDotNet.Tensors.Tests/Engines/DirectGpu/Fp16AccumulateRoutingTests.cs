@@ -43,6 +43,29 @@ public sealed class Fp16AccumulateRoutingTests
         return backend;
     }
 
+    // One disturbed round must not keep cuBLAS for the process: a winning median with a losing round is measured again,
+    // and the second measurement decides on its own; a clear win or a losing median is final.
+    [Fact]
+    public void Verdict_WinningMedianWithALosingRound_IsReMeasuredOnce()
+    {
+        static CudaBackend.GemmRouteVerdict V(double median, double minimum) =>
+            new(median >= 1.02 && minimum >= 1.0, median, minimum, 0, 0, 8, $"{median}/{minimum}");
+        CudaBackend.GemmRouteVerdict Run(params CudaBackend.GemmRouteVerdict[] sequence)
+        {
+            int calls = 0;
+            var result = CudaBackend.ConfirmFp16AccumulateVerdict(() => sequence[calls++]);
+            Assert.Equal(sequence.Length, calls);
+            return result;
+        }
+        Assert.True(Run(V(1.2, 1.1)).Wins);                          // clear win: measured once
+        Assert.False(Run(V(0.99, 0.9)).Wins);                        // losing median: measured once
+        var retried = Run(V(1.2, 0.85), V(1.19, 1.05));              // outlier round: the re-measurement wins
+        Assert.True(retried.Wins);
+        Assert.Contains("re-measured", retried.Reason);
+        Assert.False(Run(V(1.2, 0.85), V(1.15, 0.95)).Wins);         // the re-measurement must pass on its own
+        Assert.False(Run(V(1.2, 0.85), V(1.01, 1.0)).Wins);
+    }
+
     [SkippableFact]
     public void LargeShape_IsEvaluated_AndAgreesWithTheFp64Reference()
     {
