@@ -242,6 +242,9 @@ public class DeclaredGatherRouteTests
     public void TheSortedScatterIsBitIdenticalToTheScanningKernels(int tokens, int vocabulary, int width)
     {
         using var backend = OpenBackendOrSkip();
+        // Below the crossover the declared scatter-add takes these calls ahead of both kernels compared here (it is
+        // checked against the ordered sum in DeclaredScatterAddRouteTests); off, the sorted and scanning kernels serve.
+        backend.DeclaredKernelsSwitch = false;
         bool previous = AiDotNetEngine.DeterministicMode;
         AiDotNetEngine.SetDeterministicMode(true);
         try

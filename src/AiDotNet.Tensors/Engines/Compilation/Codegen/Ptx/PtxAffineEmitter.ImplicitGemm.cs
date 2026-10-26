@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // A tiled implicit-GEMM lowering for any two-operand sum reduction (#890 phase 4b).
 //
 // The specialised tiled convolution covers stride 1, dilation 1, padding 1 only, and the tiled
@@ -295,7 +295,7 @@ public sealed partial class PtxAffineEmitter
                 for (int k = 0; k < plan.Own.Length; k++) axisReg[plan.Own[k]] = plan.OwnAxes[e][k];
                 string[] loaded = plan.Vector
                     ? EmitVectorLoad(binding, basePtr[binding.ParameterIndex], axisReg, Array.Empty<int>(), Array.Empty<int>(),
-                        VectorWidth)
+                        VectorWidth, out _)
                     : new[]
                     {
                         EmitLoad(binding, basePtr[binding.ParameterIndex], axisReg, Array.Empty<int>(), Array.Empty<int>(),

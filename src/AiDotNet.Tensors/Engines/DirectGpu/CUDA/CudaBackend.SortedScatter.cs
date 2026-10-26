@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // The deterministic scatter-add as a stable sort and an ordered segment sum (CudaSortedScatterKernels): bit-identical
 // to the scanning deterministic kernels, which cost O(destinations x sources).
 
@@ -269,18 +269,9 @@ public sealed partial class CudaBackend
 
     private int _declaredStridedPrograms;
 
-    // Whether a strided key may run through the declared route: one already built, or a new one within the cap (which
-    // it then claims). Under the program lock, so concurrent new shapes cannot both take the last slot.
-    private bool AdmitStridedKey(DeclaredKey key)
-    {
-        lock (_directPtxLock)
-        {
-            if (_declaredPrograms.ContainsKey(key)) return true;
-            if (_declaredStridedPrograms >= DeclaredStridedProgramCap) return false;
-            _declaredStridedPrograms++;
-            return true;
-        }
-    }
+    // Whether a strided key may run through the declared route (see ClaimDeclaredSlot).
+    private bool AdmitStridedKey(DeclaredKey key) =>
+        ClaimDeclaredSlot(key, ref _declaredStridedPrograms, DeclaredStridedProgramCap);
 
     private static readonly string[] s_stridedNames = { "src", "dst" };
 

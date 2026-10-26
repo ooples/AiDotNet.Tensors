@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // Row fusion (#890 phase 4a): a row-shaped program runs as ONE warp-per-row kernel that reads
 // its sources once. These pin which programs are accepted, and the property fusion exists
 // for -- every source element is loaded once, however many passes read it.
@@ -352,5 +352,19 @@ public class CodegenRowFusionTests
             count++;
         return count;
     }
-}
 
+    /// <summary>
+    /// A width-1 row makes an elementwise pass's output and a per-row read of it the same addresses. The fused kernel
+    /// would read it back with a non-coherent load of what it only just stored, so the plan must refuse: the scatter
+    /// mean's recip, read by its output pass at innerSize 1, came back 0 on the device (#1441).
+    /// </summary>
+    [Fact]
+    public void APerRowReadOfAnElementwiseIntermediateIsNotFused()
+    {
+        var program = CodegenBackendPrograms.ScatterMeanRows(1, 1, 3,
+            new CodegenLibraryFunction("not_equal_scalar", "test", 2, a => a[0] != a[1] ? 1.0 : 0.0));
+        var tail = new CodegenProgram(new[] { program.Passes[3], program.Passes[4] }, new long[] { 3 }, "recip, out");
+        Assert.Null(CodegenRowFusion.TryPlan(tail, out string reason));
+        Assert.Contains("recip", reason);
+    }
+}

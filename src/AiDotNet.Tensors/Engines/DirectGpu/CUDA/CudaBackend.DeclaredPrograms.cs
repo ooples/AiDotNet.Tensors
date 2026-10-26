@@ -74,6 +74,15 @@ internal enum DeclaredFamily
 
     /// <summary><c>dst[offset + i * stride] = src[i]</c>, in place (#1441).</summary>
     StridedScatter,
+
+    /// <summary>The row-wise scatter mean with its counts (#1441).</summary>
+    ScatterMeanRows,
+
+    /// <summary>The row-wise scatter softmax (#1441).</summary>
+    ScatterSoftmaxRows,
+
+    /// <summary>CSR · dense → dense (#1441).</summary>
+    CsrSpMM,
 }
 
 /// <summary>One declared program: its family and shape (unused dimensions are 0).</summary>
@@ -308,6 +317,31 @@ public sealed partial class CudaBackend
     }
 
     /// <summary>
+    /// Whether a capped family may run <paramref name="key"/>: one already built, or a new one within
+    /// <paramref name="cap"/>, which it then claims. A new key is claimed only where
+    /// <see cref="TryRunDeclaredProgram"/> would go on to build it -- the declared route enabled and the stream not
+    /// capturing -- so a call that route declines without building consumes no slot. Callers validate their buffers
+    /// first, for the same reason. A key is claimed once: it is reserved under the program lock, so concurrent calls
+    /// for one new shape share its slot and concurrent new shapes cannot both take the last one. A build that fails is
+    /// cached, so it too claims a slot once.
+    /// </summary>
+    private bool ClaimDeclaredSlot(DeclaredKey key, ref int claimed, int cap)
+    {
+        if (!DeclaredKernelsEnabled) return false;
+        lock (_directPtxLock)
+        {
+            if (_declaredPrograms.ContainsKey(key) || _declaredClaimedKeys.Contains(key)) return true;
+            if (claimed >= cap || IsStreamCapturing()) return false;
+            claimed++;
+            _declaredClaimedKeys.Add(key);
+            return true;
+        }
+    }
+
+    // The keys ClaimDeclaredSlot has claimed, built or not yet; guarded by _directPtxLock.
+    private readonly HashSet<DeclaredKey> _declaredClaimedKeys = new();
+
+    /// <summary>
     /// Runs the program <paramref name="build"/> makes for <paramref name="key"/>, with <paramref name="bound"/>
     /// supplying the tensors named by <paramref name="names"/> (slot k is names[k]); every other tensor of the program
     /// is scratch this backend allocates once per key. Returns false -- having launched nothing -- when the route is
@@ -526,6 +560,9 @@ public sealed partial class CudaBackend
         foreach (var program in _declaredPrograms.Values) program?.Dispose();
         _declaredPrograms.Clear();
         _declaredStridedPrograms = 0;
+        _declaredScatterRowsPrograms = 0;
+        _declaredCsrSpMMPrograms = 0;
+        _declaredClaimedKeys.Clear();
     }
 
     // ---- LayerNorm ------------------------------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // Fusing a row-wise program -- softmax, LayerNorm, RMSNorm, GroupNorm -- into ONE kernel.
 //
 // As separate passes each statistic re-reads the whole input: LayerNorm at 8192x1024 is three
@@ -423,6 +423,11 @@ public static class CodegenRowFusion
 
         var bindings = new Dictionary<string, CodegenRowBinding>(StringComparer.Ordinal);
         var produced = new HashSet<string>(StringComparer.Ordinal);
+        // Intermediates written per element: held in registers by the threads that wrote them, never re-read from
+        // memory, so no later pass may read one -- not even as a per-row value. A width-1 row makes an elementwise
+        // pass's output and a per-row read of it the same addresses, and the per-row read is a non-coherent load of
+        // what this kernel only just stored (the scatter mean's recip read back by its output pass, #1441).
+        var producedPerElement = new HashSet<string>(StringComparer.Ordinal);
         var rowPasses = new HashSet<string>(StringComparer.Ordinal);
         var columnPasses = new List<string>();
         var rewrittenPasses = new Dictionary<string, CodegenKernelSpec>(StringComparer.Ordinal);
@@ -446,7 +451,7 @@ public static class CodegenRowFusion
                 foreach (var input in pass.Inputs)
                 {
                     var binding = Classify(input, rowAxes, extents);
-                    if (binding is null || binding.Kind != CodegenRowOperandKind.Row)
+                    if (binding is null || binding.Kind != CodegenRowOperandKind.Row || producedPerElement.Contains(input.Name))
                     {
                         reason = pass.Name + " is a row pass reading the non-row '" + input.Name + "'";
                         return null;
@@ -482,7 +487,8 @@ public static class CodegenRowFusion
                         reason = pass.Name + " reads '" + input.Name + "' with an index map the row kernel does not hold";
                         return null;
                     }
-                    if (binding.Kind != CodegenRowOperandKind.Row && produced.Contains(input.Name))
+                    if ((binding.Kind != CodegenRowOperandKind.Row && produced.Contains(input.Name)) ||
+                        producedPerElement.Contains(input.Name))
                     {
                         reason = pass.Name + " reads the non-row intermediate '" + input.Name + "'";
                         return null;
@@ -539,7 +545,8 @@ public static class CodegenRowFusion
                 }
                 bindings[binding.Key] = binding;
                 // A matrix the kernel PRODUCED is not held in registers; only sources are.
-                if (binding.Kind != CodegenRowOperandKind.Row && produced.Contains(input.Name))
+                if ((binding.Kind != CodegenRowOperandKind.Row && produced.Contains(input.Name)) ||
+                    producedPerElement.Contains(input.Name))
                 {
                     reason = pass.Name + " reads the non-row intermediate '" + input.Name + "'";
                     return null;
@@ -565,6 +572,7 @@ public static class CodegenRowFusion
             }
             bindings[output.Key] = output;
             produced.Add(pass.Output.Name);
+            if (!reduces) producedPerElement.Add(pass.Output.Name);
         }
 
         var parameters = new List<string>();

@@ -917,6 +917,8 @@ public class DirectPtxSoftmaxTests
         {
             using var backend = new CudaBackend();
             Skip.IfNot(backend.IsDirectPtxSoftmaxEnabled, "Requires a validated Ampere CUDA backend.");
+            // The declared programs (#890) take softmax ahead of the direct-PTX route; off, the public route reaches it.
+            backend.DeclaredKernelsSwitch = false;
             const int m = 64, n = 256;
 
             Assert.True(backend.PrewarmDirectPtxSoftmax(m, n), backend.DirectPtxLastError);
@@ -1131,6 +1133,8 @@ public class DirectPtxSoftmaxTests
         {
             using var backend = new CudaBackend();
             Skip.IfNot(backend.IsDirectPtxSoftmaxEnabled, "Requires a validated Ampere CUDA backend.");
+            // The declared programs (#890) take softmax ahead of the direct-PTX route; off, the public route reaches it.
+            backend.DeclaredKernelsSwitch = false;
             const int m = 64, n = 256, size = m * n;
             var random = RandomHelper.CreateSeededRandom(20265700);
 
