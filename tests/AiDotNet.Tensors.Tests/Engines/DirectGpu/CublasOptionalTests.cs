@@ -173,12 +173,15 @@ public sealed class CublasOptionalTests
         {
             backend.Gemm(a, b, c, m, n, k);
             Assert.Equal(before + 1, backend.FallbackGemmDispatchCount);
+            // The reported route is the one that ran, not the cuBLAS slot it ran in.
+            Assert.Equal(CudaGemmDispatchPath.GeneratedFallback, backend.LastGemmDispatchPath);
         }
         using (AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.Push(
                    new AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions { UseCublas = true }))
         {
             backend.Gemm(a, b, c, m, n, k);
             Assert.Equal(before + 1, backend.FallbackGemmDispatchCount);   // cuBLAS again
+            Assert.Equal(CudaGemmDispatchPath.Cublas, backend.LastGemmDispatchPath);
         }
         Assert.Equal(priorOverride, AiDotNet.Tensors.Helpers.BlasProvider.GetThreadLocalDeterministicMode());
     }
