@@ -273,7 +273,21 @@ public sealed partial class CudaBackend
         var module = functions.Count == 0 ? null : functions[0].Module;
         if (module is not null)
         {
-            string source = CudaMathLibrary.LibrarySource(module, functions);
+            string source;
+            try
+            {
+                source = CudaMathLibrary.LibrarySource(module, functions);
+            }
+            catch (System.Text.RegularExpressions.RegexMatchTimeoutException ex)
+            {
+                // The library declines like a failed compile: no image, and every caller keeps its hand-written path.
+                System.Diagnostics.Trace.TraceWarning("[CudaBackend] " + moduleName + " library: source analysis timed out: " + ex);
+                const string timedOut = "the source analysis exceeded its pattern timeout";
+                LastElementwiseDecline = moduleName + " library: " + timedOut;
+                _mathLibraryLogs[moduleName] = timedOut;
+                _mathLibraries[moduleName] = null;
+                return null;
+            }
             var options = new List<string>(NvrtcOptions(_ccMajor, _ccMinor, module.FastMath)) { "--relocatable-device-code=true" };
             string? cacheDir = GetKernelCacheDirectory();
             string key = ComputeCacheKey(source, string.Join(" ", options) + " " + NvrtcNativeBindings.VersionTag, module.FastMath);
