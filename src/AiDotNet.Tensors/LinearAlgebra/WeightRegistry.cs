@@ -1306,9 +1306,12 @@ public static partial class WeightRegistry
             // optimizer update survives owner shedding and the variable-size entry remains valid.
             // The encoding goes from its pooled stream straight into the entry, refilling the entry's own buffer when
             // it is resident and the new size fits (#2322), instead of through a fresh exact-length array.
+            // The caller holds the tensor's streaming gate, which the registry lock may already be waiting on (the
+            // owner-budget shed takes it under _lock), so the pool is read without the registry lock. A registered
+            // weight's pool exists; without one there is no entry to write to.
+            StreamingTensorPool? losslessPool = System.Threading.Volatile.Read(ref _streamingPool);
+            if (losslessPool is null) return false;
             var encoded = SerializeLosslessToStream(weight, out byte[]? rawShuffled);
-            StreamingTensorPool losslessPool;
-            lock (_lock) { losslessPool = StreamingPoolUnlocked(); }
             if (encoded is null)
             {
                 losslessPool.ReplaceEntryData(weight.StreamingPoolHandle,
@@ -1329,8 +1332,8 @@ public static partial class WeightRegistry
         {
             return false;
         }
-        StreamingTensorPool pool;
-        lock (_lock) { pool = StreamingPoolUnlocked(); }
+        StreamingTensorPool? pool = System.Threading.Volatile.Read(ref _streamingPool);
+        if (pool is null) return false;
         pool.ReplaceEntryData(weight.StreamingPoolHandle, bytes);
         return true;
     }
@@ -1381,21 +1384,16 @@ public static partial class WeightRegistry
             // inference owners are immutable, so their pool snapshot is already authoritative;
             // native/lossless owners must write back successfully first. A write-back failure or
             // shared refcount leaves the owner resident AND accounted so no mutation can be lost.
+            // The write-back and drop run as one gated step, so a release of the same owner on another thread cannot
+            // read its array mid-drop. _lock is held here, so the gate is only tried: a busy owner is being released
+            // by someone else right now and is left for them.
             bool shed;
             if (_ownerByHandle.TryGetValue(victim, out var weak) && weak.TryGetTarget(out var owner))
             {
-                bool safeToDrop = owner.StreamingStoreIsReadOnly;
-                if (!safeToDrop)
-                {
-                    try { safeToDrop = owner.TryWriteBackResidentForStreaming(); }
-                    catch { /* leave resident + accounted; correctness beats the soft budget */ }
-                }
-                shed = false;
-                if (safeToDrop)
-                {
-                    try { shed = owner.TryDropStorageForStreaming(throwOnSharedRefcount: false); }
-                    catch { /* shared refcount → leave resident + accounted */ }
-                }
+                StreamingReleaseOutcome outcome;
+                try { outcome = owner.TryWriteBackAndDropForStreaming(wait: false); }
+                catch { outcome = StreamingReleaseOutcome.Retained; /* leave resident + accounted */ }
+                shed = outcome is StreamingReleaseOutcome.Released or StreamingReleaseOutcome.AlreadyReleased;
             }
             else
             {
@@ -1547,14 +1545,9 @@ public static partial class WeightRegistry
         // Native and lossless stores are writable. Persist the CURRENT resident values before
         // dropping their owner; otherwise ReleaseToPool alone would resurrect the stale snapshot
         // captured at registration. Quantized inference stores are immutable and their original
-        // pool snapshot remains authoritative.
-        bool storeIsReadOnly = weight.StreamingStoreEncoding != StreamingEncoding.Native
-            && weight.StreamingStoreEncoding != StreamingEncoding.Lossless;
-        if (!storeIsReadOnly && !weight.TryWriteBackResidentForStreaming())
-        {
-            weight.StreamingDropDeferred = true;
-            return;
-        }
+        // pool snapshot remains authoritative. The claim keeps the shed and the eviction drain off this owner;
+        // the write-back and drop still run as one gated step (TryWriteBackAndDropForStreaming) against the
+        // paths that take no claim, such as a deferred-drop finalize.
 
         // Soft-defer drop — mirrors the RegisterWeight #430 fix. A streaming
         // weight's storage can be SHARED (refcount > 1) at release time when a
@@ -1572,7 +1565,10 @@ public static partial class WeightRegistry
         // once the peer ref releases. A deferred (still-resident) weight is never
         // corrupt — only un-evicted — so this can only cost a little extra
         // residency, never correctness.
-        bool dropped = weight.TryDropStorageForStreaming(throwOnSharedRefcount: false);
+        StreamingReleaseOutcome outcome = weight.TryWriteBackAndDropForStreaming(wait: true);
+        // A concurrent release already dropped it (and untracked it); nothing is left to defer.
+        if (outcome == StreamingReleaseOutcome.AlreadyReleased) return;
+        bool dropped = outcome == StreamingReleaseOutcome.Released;
         weight.StreamingDropDeferred = !dropped;
         // #1715: the owner copy is gone — stop counting it against the materialized-owner budget.
         if (dropped)
@@ -2373,42 +2369,36 @@ public static partial class WeightRegistry
 
         foreach (long handle in evicted)
         {
-            IStreamingDroppable? owner = null;
             lock (_lock)
             {
-                if (_ownerByHandle.TryGetValue(handle, out var weak) && !weak.TryGetTarget(out owner))
+                if (!_ownerByHandle.TryGetValue(handle, out var weak)) continue;
+                if (!weak.TryGetTarget(out var owner))
                 {
                     // Tensor was GC'd without UnregisterWeight — prune the dead
                     // entry; there's no resident copy left to drop.
                     _ownerByHandle.Remove(handle);
+                    continue;
                 }
-            }
 
-            // Only drop if the owner still maps to THIS handle (a re-registered
-            // tensor could have a new handle). Soft drop tolerates shared
-            // refcount (returns false) and only throws on view/non-contiguous
-            // storage, which a registered weight never is — guarded anyway.
-            if (owner is not null && owner.StreamingPoolHandle == handle)
-            {
+                // Only drop if the owner still maps to THIS handle (a re-registered tensor could have a new handle),
+                // and never while a MaterializeScope holds it: that caller is reading and may be updating the
+                // resident copy, and a drop here would persist the values from before its update and then discard
+                // the array holding the update. The scope's own release writes back and drops it instead. The
+                // check and the drop happen under _lock, which is what a scope takes to enter, so none can start in
+                // between; the owner's gate is therefore only tried, and a busy owner is already being released.
+                if (owner.StreamingPoolHandle != handle || IsMaterializedOwnerActiveUnlocked(handle)) continue;
+
                 // #1715: the pool just paged out this handle's snapshot taken at register time. If the
                 // owner MUTATED its resident copy since (a GetParameters round-trip / optimizer step),
                 // that snapshot is stale — write the owner's CURRENT bytes back BEFORE dropping so a
-                // later Materialize rehydrates the mutation, not the stale value. Writable-encoding-gated
-                // inside TryWriteBackResidentForStreaming, so read-only inference (bf16/int8/int4) is a no-op.
-                // A quantized owner is immutable, so its registered snapshot remains authoritative.
-                // A native/lossless owner may have changed and is dropped only after exact write-back
-                // succeeds. Never convert a persistence failure into silent parameter loss.
-                bool safeToDrop = owner.StreamingStoreIsReadOnly;
-                if (!safeToDrop)
-                {
-                    try { safeToDrop = owner.TryWriteBackResidentForStreaming(); }
-                    catch { /* leave resident; correctness beats reclaiming this owner */ }
-                }
-                if (safeToDrop)
-                {
-                    try { owner.TryDropStorageForStreaming(throwOnSharedRefcount: false); }
-                    catch (InvalidOperationException) { /* not droppable (view/non-contiguous) — leave resident */ }
-                }
+                // later Materialize rehydrates the mutation, not the stale value. A quantized owner is
+                // immutable, so its registered snapshot remains authoritative. A native/lossless owner is
+                // dropped only after exact write-back succeeds. Never convert a persistence failure into
+                // silent parameter loss.
+                StreamingReleaseOutcome outcome;
+                try { outcome = owner.TryWriteBackAndDropForStreaming(wait: false); }
+                catch { continue; /* write-back failed or not droppable (view/non-contiguous) — leave resident */ }
+                if (outcome == StreamingReleaseOutcome.Released) UntrackMaterializedOwner(handle);
             }
         }
     }

@@ -112,6 +112,62 @@ public class StreamingRestoreBufferRecyclingTests
     }
 
     /// <summary>
+    /// Workers on separate threads materialize, check and update disjoint weights while each one's release pushes the
+    /// owner budget over and sheds its siblings' cold owners. A release and a shed of the same owner used to
+    /// interleave: the write-back read the array the shed had just dropped, either throwing on the emptied array
+    /// (CI, PR #1548) or, once that array was recycled into another weight's restore, persisting the other weight's
+    /// values. Every weight must read back exactly its own latest values, and no release may fail.
+    /// </summary>
+    [Theory]
+    [InlineData(StreamingStoreDtype.Lossless)]
+    [InlineData(StreamingStoreDtype.FullPrecision)]
+    public async System.Threading.Tasks.Task ConcurrentReleaseAndShed_NeverPersistAnotherWeightsValues(StreamingStoreDtype dtype)
+    {
+        AssertNoTapeIsOpen();
+        string dir = Configure(restorePoolBytes: 4 * Cap, dtype);
+        try
+        {
+            var weights = RegisterWeights(step: 0);
+            const int Workers = 4, Rounds = 40;
+            var tasks = new System.Threading.Tasks.Task[Workers];
+            for (int worker = 0; worker < Workers; worker++)
+            {
+                int w = worker;
+                tasks[w] = System.Threading.Tasks.Task.Run(() =>
+                {
+                    for (int round = 1; round <= Rounds; round++)
+                    {
+                        for (int i = w; i < N; i += Workers)
+                        {
+                            using (WeightRegistry.MaterializeMany(new[] { weights[i] }))
+                            {
+                                for (int j = 0; j < L; j++)
+                                {
+                                    if (weights[i][j] != Value(i, j, round - 1))
+                                        throw new Xunit.Sdk.XunitException(
+                                            $"Weight {i} element {j} round {round}: expected {Value(i, j, round - 1)}, got {weights[i][j]}.");
+                                }
+                                for (int j = 0; j < L; j++) weights[i][j] = Value(i, j, round);
+                            }
+                        }
+                    }
+                });
+            }
+            await System.Threading.Tasks.Task.WhenAll(tasks);
+
+            for (int i = 0; i < N; i++)
+            {
+                WeightRegistry.Materialize(weights[i]);
+                for (int j = 0; j < L; j++) Assert.Equal(Value(i, j, Rounds), weights[i][j]);
+            }
+        }
+        finally
+        {
+            Cleanup(dir);
+        }
+    }
+
+    /// <summary>
     /// A closure recorded on an open tape may still read an array a shed weight released, so the array is parked,
     /// not pooled, until the outermost tape closes.
     /// </summary>

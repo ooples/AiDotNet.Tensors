@@ -43,10 +43,28 @@ internal interface IStreamingDroppable
     /// dropping a mutated streaming weight so the mutation is not lost.</summary>
     bool TryWriteBackResidentForStreaming();
 
+    /// <summary>Writes back (for a writable store) and drops this tensor's resident data as one step that no other
+    /// write-back or drop of the same tensor can interleave with. <paramref name="wait"/> false returns
+    /// <see cref="StreamingReleaseOutcome.Busy"/> instead of blocking, for callers holding the registry lock.</summary>
+    StreamingReleaseOutcome TryWriteBackAndDropForStreaming(bool wait);
+
     /// <summary>Promotes a quantized inference snapshot to an exact writable streaming
     /// encoding before a model enters training. Implemented on the closed generic owner so
     /// the non-generic registry can migrate mixed element types one tensor at a time.</summary>
     void PromoteStreamingStoreForTraining();
+}
+
+/// <summary>What <see cref="IStreamingDroppable.TryWriteBackAndDropForStreaming"/> did.</summary>
+internal enum StreamingReleaseOutcome
+{
+    /// <summary>The current values were persisted (when writable) and the resident data dropped.</summary>
+    Released,
+    /// <summary>Another caller had already dropped the resident data; nothing remained to release.</summary>
+    AlreadyReleased,
+    /// <summary>The write-back failed or the storage is shared, so the data stays resident for a later retry.</summary>
+    Retained,
+    /// <summary>Another write-back or drop of this tensor was in progress and the caller chose not to wait.</summary>
+    Busy
 }
 
 /// <summary>
@@ -604,6 +622,44 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// A failed soft drop leaves the original storage untouched for a later retry.</returns>
     internal bool TryDropStorageForStreaming(bool throwOnSharedRefcount = false)
     {
+        lock (StreamingTransitionGate) return TryDropStorageForStreamingGated(throwOnSharedRefcount);
+    }
+
+    // Serializes this tensor's streaming write-back against its drop. Without it, a write-back reading the resident
+    // array could race a drop on another thread (MaterializeScope release vs. the owner-budget shed): the reader
+    // saw the emptied array, or, once dropped arrays are recycled (#2322), another tensor's restored values. Nothing
+    // that holds this gate acquires the registry lock, so the registry may take it with Monitor.TryEnter while
+    // holding its own lock.
+    private object? _streamingTransitionGate;
+    private object StreamingTransitionGate =>
+        System.Threading.LazyInitializer.EnsureInitialized(ref _streamingTransitionGate, () => new object());
+
+    /// <inheritdoc cref="IStreamingDroppable.TryWriteBackAndDropForStreaming"/>
+    internal StreamingReleaseOutcome TryWriteBackAndDropForStreaming(bool wait)
+    {
+        object gate = StreamingTransitionGate;
+        bool taken = false;
+        try
+        {
+            if (wait) System.Threading.Monitor.Enter(gate, ref taken);
+            else System.Threading.Monitor.TryEnter(gate, ref taken);
+            if (!taken) return StreamingReleaseOutcome.Busy;
+            if (DataVector.Length == 0) return StreamingReleaseOutcome.AlreadyReleased;
+            bool storeIsReadOnly = StreamingStoreEncoding != StreamingEncoding.Native
+                && StreamingStoreEncoding != StreamingEncoding.Lossless;
+            if (!storeIsReadOnly && !TryWriteBackResidentForStreaming()) return StreamingReleaseOutcome.Retained;
+            return TryDropStorageForStreamingGated(throwOnSharedRefcount: false)
+                ? StreamingReleaseOutcome.Released
+                : StreamingReleaseOutcome.Retained;
+        }
+        finally
+        {
+            if (taken) System.Threading.Monitor.Exit(gate);
+        }
+    }
+
+    private bool TryDropStorageForStreamingGated(bool throwOnSharedRefcount)
+    {
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (!IsContiguous || _storageOffset != 0 || IsView)
             throw new InvalidOperationException(
@@ -711,6 +767,8 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
 
     bool IStreamingDroppable.TryWriteBackResidentForStreaming() => TryWriteBackResidentForStreaming();
 
+    StreamingReleaseOutcome IStreamingDroppable.TryWriteBackAndDropForStreaming(bool wait) => TryWriteBackAndDropForStreaming(wait);
+
     void IStreamingDroppable.PromoteStreamingStoreForTraining()
     {
         if (this is Tensor<T> tensor)
@@ -726,6 +784,11 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// <c>Materialize</c> rehydrates the mutation instead of the stale register-time snapshot.
     /// </summary>
     internal bool TryWriteBackResidentForStreaming()
+    {
+        lock (StreamingTransitionGate) return TryWriteBackResidentForStreamingGated();
+    }
+
+    private bool TryWriteBackResidentForStreamingGated()
     {
         if (StreamingPoolHandle < 0) return false;
         if (StreamingStoreEncoding != StreamingEncoding.Native
