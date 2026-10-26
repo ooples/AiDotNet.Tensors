@@ -26,14 +26,23 @@ internal static class PtxFlashAttentionGenerator
 {
     internal const string EntryPoint = "flash_attention_fp16";
     internal const int BlockN = 64;
-    internal const int Threads = 128;
+
+    /// <summary>
+    /// Warps per block, each owning one m16 tile of query rows. Eight (128 rows sharing each K/V tile, half the K/V
+    /// traffic per row) at head dimension 128 and for causal attention; four for non-causal head dimension 64, where
+    /// the smaller block keeps more blocks per SM in flight (RTX 3080, B2 H16 S4096: D64 1489 against 1575 us; D64
+    /// causal 765 against 824 us; D128 3109 against 3271 us).
+    /// </summary>
+    internal static int Warps(int headDimension, bool isCausal) => headDimension == 128 || isCausal ? 8 : 4;
+
+    internal static int Threads(int headDimension, bool isCausal) => 32 * Warps(headDimension, isCausal);
 
     /// <summary>Query rows per warp: one m16 tile (two would share every K and V fragment, but spill registers at both
     /// head dimensions).</summary>
     internal static int RowsPerWarp(int headDimension) => 16;
 
-    /// <summary>Query rows per block (four warps).</summary>
-    internal static int BlockM(int headDimension) => 4 * RowsPerWarp(headDimension);
+    /// <summary>Query rows per block.</summary>
+    internal static int BlockM(int headDimension, bool isCausal) => Warps(headDimension, isCausal) * RowsPerWarp(headDimension);
 
     internal static bool SupportsHeadDimension(int headDimension) => headDimension is 64 or 128;
 
@@ -90,7 +99,8 @@ internal static class PtxFlashAttentionGenerator
         private int RowBytes => Pitch(_d) * 2;
         private int KSteps => _d / 16;          // k16 steps over the head dimension
         private int DTiles => _d / 8;           // n8 output tiles over the head dimension
-        private int ChunksPerThread => BlockN * (_d / 8) / Threads;   // per 64-row tile
+        private int ThreadCount => Threads(_d, _causal);
+        private int ChunksPerThread => BlockN * (_d / 8) / ThreadCount;   // per 64-row tile
 
         private string R() => "%r" + I(_r++);
         private string F() => "%f" + I(_f++);
@@ -215,14 +225,14 @@ internal static class PtxFlashAttentionGenerator
 
             _m0 = R();
             L($"mov.u32 {_m0}, %ctaid.x;");
-            L($"mul.lo.u32 {_m0}, {_m0}, {I(BlockM(_d))};");
+            L($"mul.lo.u32 {_m0}, {_m0}, {I(BlockM(_d, _causal))};");
 
             // Shared regions: Q, K stage 0/1, V stage 0/1.
             _qShared = R(); _kShared = R(); _vShared = R();
-            // K, then V; the Q block is staged through the V buffer before the first V tile.
+            // K, then V (adjacent); the Q block (64 or 128 rows) is staged through the end of them before the first tiles.
             L($"mov.u32 {_kShared}, smem;");
             L($"add.u32 {_vShared}, {_kShared}, {I(TileBytes)};");
-            L($"mov.u32 {_qShared}, {_vShared};");
+            L($"add.u32 {_qShared}, {_kShared}, {I((2 - BlockM(_d, _causal) / BlockN) * TileBytes)};");
 
             // This thread's cp.async chunks of a 64-row tile: chunk c = tid + i * 128 is row c / (D / 8), column c % (D / 8).
             int chunksPerRow = _d / 8;
@@ -233,7 +243,7 @@ internal static class PtxFlashAttentionGenerator
             {
                 string c = R(), col = R();
                 _chunkRow[i] = R(); _chunkShared[i] = R(); _chunkGlobal[i] = RD();
-                L($"add.u32 {c}, {_tid}, {I(i * Threads)};");
+                L($"add.u32 {c}, {_tid}, {I(i * ThreadCount)};");
                 L($"shr.u32 {_chunkRow[i]}, {c}, {I(Log2(chunksPerRow))};");
                 L($"and.b32 {col}, {c}, {I(chunksPerRow - 1)};");
                 L($"mul.lo.u32 {_chunkShared[i]}, {_chunkRow[i]}, {I(RowBytes)};");
@@ -276,7 +286,7 @@ internal static class PtxFlashAttentionGenerator
             if (_causal)
             {
                 string lastRow = R(), lastKey = R(), causalTiles = R(), none = P();
-                L($"add.u32 {lastRow}, {_m0}, {I(BlockM(_d) - 1)};");
+                L($"add.u32 {lastRow}, {_m0}, {I(BlockM(_d, _causal) - 1)};");
                 L($"sub.u32 {lastKey}, {_sq}, 1;");
                 L($"min.u32 {lastRow}, {lastRow}, {lastKey};");
                 L($"add.s32 {lastKey}, {lastRow}, {_offset};");
@@ -299,7 +309,7 @@ internal static class PtxFlashAttentionGenerator
             ResetState();
 
             // The Q block (64-row tiles), then K/V tile 0, as the first cp.async group.
-            for (int q = 0; q < BlockM(_d) / BlockN; q++)
+            for (int q = 0; q < BlockM(_d, _causal) / BlockN; q++)
             {
                 string rowStart = R(), shared = R();
                 L($"add.u32 {rowStart}, {_m0}, {I(q * BlockN)};");
@@ -308,15 +318,18 @@ internal static class PtxFlashAttentionGenerator
             }
             _qf = new string[Mt, KSteps, 4];
             for (int m = 0; m < Mt; m++) for (int s = 0; s < KSteps; s++) for (int e = 0; e < 4; e++) _qf[m, s, e] = R();
-            // Q (in the V buffer) and K tile 0; Q fragments to registers; then V tile 0 into the freed buffer.
-            IssueKeys("0");
+            // Q fragments to registers, then K tile 0 resident and V tile 0 in flight into the freed buffers.
             L("cp.async.commit_group;");
             L("cp.async.wait_group 0;");
             L("bar.sync 0;");
             LoadQueryFragments();
             L("bar.sync 0;");
+            IssueKeys("0");
+            L("cp.async.commit_group;");
             IssueValues("0");
             L("cp.async.commit_group;");
+            L("cp.async.wait_group 1;");
+            L("bar.sync 0;");
         }
 
         private void ResetState()

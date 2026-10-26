@@ -37,7 +37,7 @@ internal sealed class PtxFlashAttentionKernel : IDisposable
         _sharedBytes = (uint)PtxFlashAttentionGenerator.SharedBytes(headDimension);
         Blueprint = CreateBlueprint(runtime.ArchitectureFamily, headDimension, isCausal, fp16Accumulate, emitStats);
         DirectPtxLoadedKernel loaded = DirectPtxResourceInitialization.LoadKernel(
-            runtime, Ptx, PtxFlashAttentionGenerator.EntryPoint, PtxFlashAttentionGenerator.Threads, Blueprint);
+            runtime, Ptx, PtxFlashAttentionGenerator.EntryPoint, PtxFlashAttentionGenerator.Threads(headDimension, isCausal), Blueprint);
         _module = loaded.Module;
         _function = loaded.Function;
         Audit = loaded.Audit;
@@ -82,9 +82,9 @@ internal sealed class PtxFlashAttentionKernel : IDisposable
         arguments[8] = &group;
         arguments[9] = &scaleLog2;
         arguments[10] = &offset;
-        int blockM = PtxFlashAttentionGenerator.BlockM(HeadDimension);
+        int blockM = PtxFlashAttentionGenerator.BlockM(HeadDimension, IsCausal);
         uint gridX = (uint)((querySequence + blockM - 1) / blockM);
-        _module.Launch(_function, gridX, (uint)(batch * queryHeads), 1, PtxFlashAttentionGenerator.Threads, 1, 1,
+        _module.Launch(_function, gridX, (uint)(batch * queryHeads), 1, (uint)PtxFlashAttentionGenerator.Threads(HeadDimension, IsCausal), 1, 1,
             _sharedBytes, arguments, stream);
     }
 
