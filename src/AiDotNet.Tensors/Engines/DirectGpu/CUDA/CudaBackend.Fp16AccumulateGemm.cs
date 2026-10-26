@@ -32,9 +32,12 @@ public sealed partial class CudaBackend
     // (RTX 3080 probe: 3136x64x576 0.99x), and timing it against cuBLAS would cost more than it can return.
     private const long Fp16AccumulateMinWork = 1L << 29;
 
-    // The fastest configurations of the #1549 probe across the measured shapes.
+    // The fastest configurations of the #1549 probes across the measured shapes (the first two: the evolved winners of
+    // 7 shapes out of 7 on an RTX 3080).
     private static readonly PtxTensorCoreGemmConfiguration[] s_fp16AccumulateCandidates =
     {
+        new(128, 128, 16, 64, 64, 2, 8),
+        new(64, 64, 32, 32, 32, 2, 8),
         new(64, 128, 32, 64, 32, 3, 8),
         new(128, 128, 16, 64, 64, 3, 8),
         new(128, 64, 16, 64, 32, 4, 8),
@@ -122,7 +125,10 @@ public sealed partial class CudaBackend
             kernel.Launch(a.Handle, b.Handle, c.Handle, m, n, k, k, n, n, 1f, 0f, stream: _stream);
     }
 
-    private Fp16AccumulateRoute TuneFp16AccumulateRoute(IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, int m, int n, int k)
+    // Picks the fastest of the fixed candidates (and `extra`, first) that loads and reproduces cuBLAS, then times it
+    // against cuBLAS.
+    private Fp16AccumulateRoute TuneFp16AccumulateRoute(IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, int m, int n, int k,
+        PtxTensorCoreGemmConfiguration? extra = null)
     {
         DirectPtxRuntime runtime;
         try
@@ -144,7 +150,11 @@ public sealed partial class CudaBackend
             double scale = 0;
             foreach (float v in reference) scale = Math.Max(scale, Math.Abs((double)v));
 
+            var candidates = new List<PtxTensorCoreGemmConfiguration>();
+            if (extra is { } evolved) candidates.Add(evolved);
             foreach (var config in s_fp16AccumulateCandidates)
+                if (!candidates.Contains(config)) candidates.Add(config);
+            foreach (var config in candidates)
             {
                 if (!PtxTensorCoreGemmGenerator.Admits(config, layout, m, n, k, k, n, n, 0, 0, 0, PtxTensorCorePrecision.Fp16))
                     continue;
@@ -167,7 +177,7 @@ public sealed partial class CudaBackend
                     kernel.Dispose();
                     continue;
                 }
-                double ms = TimeFp16Gemm(() => LaunchFp16Accumulate(kernel, a, b, c, m, n, k), 3);
+                double ms = TimeFp16Gemm(() => LaunchFp16Accumulate(kernel, a, b, c, m, n, k), 10);
                 if (ms < bestMs)
                 {
                     best?.Dispose();
@@ -218,8 +228,8 @@ public sealed partial class CudaBackend
 
     /// <summary>
     /// Evolves the FP16-accumulate tensor-core GEMM for <c>C[M,N] = A[M,K] @ B[K,N]</c> (FP16 in, FP32 out) on this device,
-    /// checks the winner reproduces cuBLAS's output on operands in [-1, 1), times it against cuBLAS in paired rounds, and
-    /// routes <see cref="GemmFp16In32fOut"/> for this shape to it only on a
+    /// takes the fastest of the winner and the fixed candidates that reproduces cuBLAS's output on operands in [-1, 1),
+    /// times it against cuBLAS in paired rounds, and routes <see cref="GemmFp16In32fOut"/> for this shape to it only on a
     /// win (#1549). The verdict, either way, is persisted (unless <paramref name="persist"/> is false), so a later process
     /// applies it on the shape's first call without measuring.
     /// </summary>
@@ -244,21 +254,10 @@ public sealed partial class CudaBackend
         UploadBytes(a, RandomHalfBytes(m * k, rng));
         UploadBytes(b, RandomHalfBytes(k * n, rng));
 
-        var kernel = new PtxTensorCoreGemmKernel(runtime, winner, layout, PtxTensorCorePrecision.Fp16,
-            fp16Accumulate: true);
-        CublasGemmFp16In32fOut(a, b, c, m, n, k);
-        float[] reference = DownloadBuffer(c);
-        LaunchFp16Accumulate(kernel, a, b, c, m, n, k);
-        float[] actual = DownloadBuffer(c);
-        double scale = 0, diff = 0;
-        for (int i = 0; i < reference.Length; i++)
-        {
-            scale = Math.Max(scale, Math.Abs((double)reference[i]));
-            diff = Math.Max(diff, Math.Abs((double)actual[i] - reference[i]));
-        }
-        Fp16AccumulateRoute route = diff <= 5e-3 * Math.Max(scale, 1e-30)
-            ? VerdictAgainstCublas(kernel, a, b, c, m, n, k)
-            : DisposeAndReject(kernel, $"{winner.Name} disagrees with cuBLAS: max |diff| / max |C| = {diff / scale:E2}");
+        // The search's winner competes with the fixed candidates on the same operands: its ranking is a short measurement,
+        // so it must also beat them here to be kept.
+        Fp16AccumulateRoute route = TuneFp16AccumulateRoute(a, b, c, m, n, k, winner);
+        PtxTensorCoreGemmConfiguration chosen = route.Kernel?.Configuration ?? winner;
         if (_fp16AccumulateRoutes.TryGetValue((m, n, k), out var previous)) previous.Dispose();
         _fp16AccumulateRoutes[(m, n, k)] = route;
 
@@ -271,8 +270,8 @@ public sealed partial class CudaBackend
                 {
                     ["device"] = PtxGemmEvolution.Fingerprint(runtime).LocalKey,
                     ["route"] = route.Kernel is not null ? "ptx" : "cublas",
-                    ["kernel"] = winner.Name,
-                    ["genome"] = PtxTensorCoreGemmEvolution.GenomeCodec.Serialize(winner),
+                    ["kernel"] = chosen.Name,
+                    ["genome"] = PtxTensorCoreGemmEvolution.GenomeCodec.Serialize(chosen),
                     ["codec-id"] = PtxTensorCoreGemmEvolution.GenomeCodec.Id,
                     ["codec-version"] = PtxTensorCoreGemmEvolution.GenomeCodec.VersionHash,
                     ["median-speedup"] = route.MedianSpeedup.ToString("R", CultureInfo.InvariantCulture),
@@ -281,13 +280,7 @@ public sealed partial class CudaBackend
             };
             AutotuneCache.TryStore(Fp16AccumulateRouteKernelId, new ShapeProfile(m, n, k, 0), choice);
         }
-        return (route.Kernel is not null, winner.Name, route.MedianSpeedup, route.Reason);
-
-        static Fp16AccumulateRoute DisposeAndReject(PtxTensorCoreGemmKernel kernel, string reason)
-        {
-            kernel.Dispose();
-            return new Fp16AccumulateRoute(null, reason, 0);
-        }
+        return (route.Kernel is not null, chosen.Name, route.MedianSpeedup, route.Reason);
     }
 
     // A verdict TuneFp16AccumulateRouteAsync persisted for this device and shape, or null when there is none (or it is
