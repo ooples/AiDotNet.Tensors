@@ -89,7 +89,6 @@ internal static class PtxTensorCoreGemmEvolution
         using var backend = new PtxGemmEvolution.ExperimentBackend<PtxTensorCoreGemmConfiguration>(runtime, layout, m, n, k,
             configuration =>
             {
-                // FP16 accumulation is timed unguarded: the guarded kernel runs the same main loop after one branch.
                 var kernel = new PtxTensorCoreGemmKernel(runtime, configuration, layout, precision, fp16Accumulate: fp16Accumulate);
                 return new PtxGemmEvolution.LoadedGemm(kernel, kernel.Audit,
                     (a, b, c) => kernel.Launch(a, b, c, m, n, k, lda, ldb, n, 1f, 0f));

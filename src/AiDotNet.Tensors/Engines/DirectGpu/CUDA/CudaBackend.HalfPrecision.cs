@@ -68,44 +68,9 @@ public sealed partial class CudaBackend
                 cFp16.Handle, n, "cublasHgemm");
     }
 
-    /// <summary>
-    /// Writes max|x| over the first <paramref name="count"/> FP16 elements of <paramref name="inputFp16"/> into the u32 at
-    /// <paramref name="resultWord"/> (a device address) as an FP16 bit pattern in its low 16 bits, on this backend's
-    /// stream with no host synchronization (#1549). A NaN or infinity yields a pattern at or above 0x7C00.
-    /// </summary>
-    internal unsafe void AbsMaxFp16Bits(IGpuBuffer inputFp16, int count, IntPtr resultWord)
-    {
-        if (inputFp16 is null) throw new ArgumentNullException(nameof(inputFp16));
-        if (count <= 0) throw new ArgumentOutOfRangeException(nameof(count));
-        if (!_kernelCache.TryGetValue("fp16_absmax_bits", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: fp16_absmax_bits");
-        using var _ = PushContext();
-        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuMemsetD32Async(resultWord, 0u, 1, _stream), "cuMemsetD32Async(absmax)");
-        // Enough blocks to fill the device a few times over; the grid-stride loop covers any size.
-        uint grid = (uint)Math.Min((count + DefaultBlockSize - 1) / DefaultBlockSize, 4096);
-        IntPtr inPtr = inputFp16.Handle;
-        IntPtr outPtr = resultWord;
-        int size = count;
-        void** args = stackalloc void*[3];
-        args[0] = &inPtr;
-        args[1] = &outPtr;
-        args[2] = &size;
-        LaunchKernel(kernel, grid, DefaultBlockSize, args);
-    }
-
     /// <inheritdoc/>
-    public void GemmFp16In32fOut(IGpuBuffer aFp16, IGpuBuffer bFp16, IGpuBuffer cFp32,
+    public unsafe void GemmFp16In32fOut(IGpuBuffer aFp16, IGpuBuffer bFp16, IGpuBuffer cFp32,
         int m, int n, int k)
-        => GemmFp16In32fOut(aFp16, bFp16, cFp32, m, n, k, IntPtr.Zero, IntPtr.Zero);
-
-    /// <summary>
-    /// <see cref="GemmFp16In32fOut(IGpuBuffer, IGpuBuffer, IGpuBuffer, int, int, int)"/> with cached operand bounds for
-    /// the FP16-accumulate route (#1549): <paramref name="amaxA"/> / <paramref name="amaxB"/>, when not zero, are device
-    /// words holding max|A| / max|B| as FP16 bit patterns (see <see cref="AbsMaxFp16Bits"/>), current for the operand's
-    /// contents, so the route skips that operand's reduction. A caller caches one for a weight it converts once.
-    /// </summary>
-    internal unsafe void GemmFp16In32fOut(IGpuBuffer aFp16, IGpuBuffer bFp16, IGpuBuffer cFp32,
-        int m, int n, int k, IntPtr amaxA, IntPtr amaxB)
     {
         if (!SupportsHgemm)
             throw new NotSupportedException(
@@ -122,7 +87,7 @@ public sealed partial class CudaBackend
 
         if (TryDirectPtxFp16Gemm(aFp16, bFp16, cFp32, m, n, k))
             return;
-        if (TryFp16AccumulateGemm(aFp16, bFp16, cFp32, m, n, k, amaxA, amaxB))
+        if (TryFp16AccumulateGemm(aFp16, bFp16, cFp32, m, n, k))
             return;
         CublasGemmFp16In32fOut(aFp16, bFp16, cFp32, m, n, k);
     }

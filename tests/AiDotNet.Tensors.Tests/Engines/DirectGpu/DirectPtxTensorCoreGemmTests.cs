@@ -271,7 +271,7 @@ public sealed class DirectPtxTensorCoreGemmTests
                         fp16Accumulate: true);
                     Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
                     Assert.Contains("f16.f16.f16.f16", kernel.Ptx);
-                    Assert.DoesNotContain("f32.f16.f16.f32", kernel.Ptx);
+                    Assert.Contains("bar.red.or.pred", kernel.Ptx);   // the block-wide overflow vote before the FP32 redo
                     foreach (var (m, n, k) in Fp16Shapes)
                     {
                         CheckFp16(runtime, kernel, 1, m, n, k, 1f, 0f, poisonC: false);
@@ -284,11 +284,11 @@ public sealed class DirectPtxTensorCoreGemmTests
                 }
     }
 
-    // The documented limit of FP16 accumulation: a K tile's partial sum must stay below 65504. 32 products of
-    // 64 x 64 = 4096 each make a 131072 partial in a 32-deep tile, which FP16 cannot hold, while FP32 accumulation of the
-    // same problem is exact. Callers that cannot bound their operands must keep FP32 accumulation.
+    // The limit of FP16 accumulation: a K tile's partial sum must stay below 65504. 32 products of 64 x 64 = 4096 each
+    // make a 131072 partial in a 32-deep tile, which FP16 cannot hold; the kernel sees the infinity after its main loop
+    // and redoes the tile with FP32 accumulation, which is exact here.
     [SkippableFact]
-    public void Fp16Accumulate_TilePartialAbove65504_Overflows_WhereFp32AccumulationDoesNot()
+    public void Fp16Accumulate_TilePartialAbove65504_IsRedoneInFp32_Exactly()
     {
         using var runtime = RequireAmpere();
         var config = new PtxTensorCoreGemmConfiguration(64, 64, 32, 32, 32, 2, 4);
@@ -300,7 +300,7 @@ public sealed class DirectPtxTensorCoreGemmTests
         using var dc = runtime.AllocateBytes((nuint)(m * n * 4));
         da.Upload<Half>(values);
         db.Upload<Half>(values);
-        float Run(bool fp16Accumulate)
+        float[] Run(bool fp16Accumulate)
         {
             using var kernel = new PtxTensorCoreGemmKernel(runtime, config, layout, PtxTensorCorePrecision.Fp16,
                 fp16Accumulate: fp16Accumulate);
@@ -308,10 +308,59 @@ public sealed class DirectPtxTensorCoreGemmTests
             runtime.Synchronize();
             var c = new float[m * n];
             dc.Download<float>(c);
-            return c[0];
+            return c;
         }
-        Assert.Equal(131072f, Run(fp16Accumulate: false));
-        Assert.True(float.IsInfinity(Run(fp16Accumulate: true)), "a 131072 FP16 partial sum should overflow to infinity");
+        float[] fp32 = Run(fp16Accumulate: false);
+        Assert.Equal(131072f, fp32[0]);
+        Assert.Equal(fp32, Run(fp16Accumulate: true));
+    }
+
+    // #1549: the redo is per block. A has 64 rows of 64s (their blocks overflow) over 64 rows in [-1, 1) (theirs do not);
+    // the overflowing rows must equal the FP32-accumulate kernel bit for bit and the others must equal the FP16-accumulate
+    // result of those rows alone, so the redo neither leaks into a clean block nor skips a dirty one. A NaN operand stays
+    // NaN in its row (no redo can hide it); the rest of its block takes the FP32 result and the other blocks are untouched.
+    [SkippableFact]
+    public void Fp16Accumulate_RedoesOnlyTheBlocksThatOverflow()
+    {
+        using var runtime = RequireAmpere();
+        var config = new PtxTensorCoreGemmConfiguration(64, 64, 32, 32, 32, 2, 4);
+        var layout = new PtxGemmLayout(false, false);
+        const int n = 128, k = 256;
+        var rng = new Random(9);
+        Half[] big = Enumerable.Repeat((Half)64f, 64 * k).ToArray();
+        Half[] small = Enumerable.Range(0, 64 * k).Select(_ => (Half)(rng.NextDouble() * 2 - 1)).ToArray();
+        Half[] b = Enumerable.Range(0, k * n).Select(_ => (Half)(rng.Next(-64, 65))).ToArray();
+        float[] Run(Half[] a, int m, bool fp16Accumulate)
+        {
+            using var da = runtime.AllocateBytes((nuint)(m * k * 2));
+            using var db = runtime.AllocateBytes((nuint)(k * n * 2));
+            using var dc = runtime.AllocateBytes((nuint)(m * n * 4));
+            da.Upload<Half>(a);
+            db.Upload<Half>(b);
+            using var kernel = new PtxTensorCoreGemmKernel(runtime, config, layout, PtxTensorCorePrecision.Fp16,
+                fp16Accumulate: fp16Accumulate);
+            kernel.Launch(da.Pointer, db.Pointer, dc.Pointer, m, n, k, k, n, n, 1f, 0f);
+            runtime.Synchronize();
+            var c = new float[m * n];
+            dc.Download<float>(c);
+            return c;
+        }
+        Half[] mixed = big.Concat(small).ToArray();
+        float[] fp32 = Run(mixed, 128, fp16Accumulate: false);
+        float[] actual = Run(mixed, 128, fp16Accumulate: true);
+        float[] smallOnly = Run(small, 64, fp16Accumulate: true);
+        Assert.Equal(fp32.Take(64 * n), actual.Take(64 * n));
+        Assert.Equal(smallOnly, actual.Skip(64 * n));
+        Assert.Contains(fp32.Take(64 * n), v => Math.Abs(v) >= 65504f);   // the 64s do overflow an FP16 partial
+
+        mixed[64 * k + 5 * k + 3] = Half.NaN;   // row 69
+        float[] withNaN = Run(mixed, 128, fp16Accumulate: true);
+        Assert.All(withNaN.Skip(69 * n).Take(n), v => Assert.True(float.IsNaN(v)));
+        Assert.Equal(fp32.Take(64 * n), withNaN.Take(64 * n));
+        // The NaN's block redoes in FP32 (its accumulators went non-finite), so its other rows take the FP32 values.
+        Assert.Equal(fp32.Skip(64 * n).Take(5 * n), withNaN.Skip(64 * n).Take(5 * n));
+        Assert.Equal(fp32.Skip(70 * n), withNaN.Skip(70 * n));
+        Assert.NotEqual(actual.Skip(70 * n), withNaN.Skip(70 * n));
     }
 
     private static byte[] HalfBytesOf(Half[] values)
@@ -335,80 +384,6 @@ public sealed class DirectPtxTensorCoreGemmTests
             Skip.If(true, "Needs a CUDA device of compute capability 8.0+.");
         }
         return backend;
-    }
-
-    // #1549: the guard's max|x| reduction, as an FP16 bit pattern: positive and negative maxima, a value past one block's
-    // span, infinity, and NaN (which must land at or above infinity's pattern so it fails any bound).
-    [SkippableFact]
-    public void AbsMaxFp16Bits_IsTheLargestMagnitude_AndNaNOrInfinityExceedsEveryFiniteBound()
-    {
-        using var backend = RequireAmpereBackend();
-        using var word = backend.AllocateBuffer(1);
-        ushort Run(Half[] values)
-        {
-            using var input = backend.AllocateByteBuffer(values.Length * 2);
-            backend.UploadBytes(input, HalfBytesOf(values));
-            backend.AbsMaxFp16Bits(input, values.Length, word.Handle);
-            float[] raw = backend.DownloadBuffer(word);
-            return (ushort)(BitConverter.SingleToInt32Bits(raw[0]) & 0xFFFF);
-        }
-        var rng = new Random(5);
-        Half[] values = Enumerable.Range(0, 300_000).Select(_ => (Half)(rng.NextDouble() * 2 - 1)).ToArray();
-        values[123_457] = (Half)(-37.5f);
-        Assert.Equal(BitConverter.HalfToUInt16Bits((Half)37.5f), Run(values));
-        values[250_001] = (Half)41f;
-        Assert.Equal(BitConverter.HalfToUInt16Bits((Half)41f), Run(values));
-        values[7] = Half.NegativeInfinity;
-        Assert.Equal((ushort)0x7C00, Run(values));
-        values[7] = Half.NaN;
-        Assert.True(Run(values) > 0x7C00, "NaN must order above infinity");
-    }
-
-    // #1549: the guarded kernel makes the device-side choice per launch. Inside the bound it must give exactly the bits of
-    // the unguarded FP16-accumulate kernel; past it (the 131072 case) exactly the bits of the FP32-accumulate kernel, with
-    // no infinity.
-    [SkippableFact]
-    public void GuardedFp16Accumulate_UsesFp16InsideTheBound_AndFp32AccumulationPastIt()
-    {
-        using var backend = RequireAmpereBackend();
-        DirectPtxRuntime runtime = backend.GetDirectPtxRuntime();
-        var config = new PtxTensorCoreGemmConfiguration(64, 64, 32, 32, 32, 2, 4);
-        var layout = new PtxGemmLayout(false, false);
-        const int m = 64, n = 64, k = 256;
-        using var amax = backend.AllocateBuffer(2);
-        IntPtr amaxA = amax.Handle, amaxB = amax.Handle + 4;
-        float[] Run(Half[] a, Half[] b, bool fp16Accumulate, bool guard)
-        {
-            using var da = backend.AllocateByteBuffer(m * k * 2);
-            using var db = backend.AllocateByteBuffer(k * n * 2);
-            using var dc = backend.AllocateBuffer(m * n);
-            backend.UploadBytes(da, HalfBytesOf(a));
-            backend.UploadBytes(db, HalfBytesOf(b));
-            using var kernel = new PtxTensorCoreGemmKernel(runtime, config, layout, PtxTensorCorePrecision.Fp16,
-                fp16Accumulate: fp16Accumulate, fp16AccumulateGuard: guard);
-            if (guard)
-            {
-                backend.AbsMaxFp16Bits(da, m * k, amaxA);
-                backend.AbsMaxFp16Bits(db, k * n, amaxB);
-                kernel.LaunchGuarded(da.Handle, db.Handle, dc.Handle, m, n, k, k, n, n, 1f, 0f, amaxA, amaxB);
-            }
-            else
-            {
-                kernel.Launch(da.Handle, db.Handle, dc.Handle, m, n, k, k, n, n, 1f, 0f);
-            }
-            return backend.DownloadBuffer(dc);
-        }
-        var rng = new Random(9);
-        Half[] smallA = Enumerable.Range(0, m * k).Select(_ => (Half)(rng.NextDouble() * 2 - 1)).ToArray();
-        Half[] smallB = Enumerable.Range(0, k * n).Select(_ => (Half)(rng.NextDouble() * 2 - 1)).ToArray();
-        Assert.Equal(Run(smallA, smallB, fp16Accumulate: true, guard: false), Run(smallA, smallB, fp16Accumulate: true, guard: true));
-
-        Half[] bigA = Enumerable.Repeat((Half)64f, m * k).ToArray();
-        Half[] bigB = Enumerable.Repeat((Half)64f, k * n).ToArray();
-        float[] fp32 = Run(bigA, bigB, fp16Accumulate: false, guard: false);
-        float[] guarded = Run(bigA, bigB, fp16Accumulate: true, guard: true);
-        Assert.Equal(1048576f, fp32[0]);
-        Assert.Equal(fp32, guarded);
     }
 
     // Opt-in speed probe (AIDOTNET_RUN_TC_GEMM_PROBE=1): FP16 operands and FP32 output, FP32 accumulation against FP16

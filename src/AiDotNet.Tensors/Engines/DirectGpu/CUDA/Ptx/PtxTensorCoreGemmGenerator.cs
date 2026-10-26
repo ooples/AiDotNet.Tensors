@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Linq;
 using System.Text;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
@@ -115,19 +116,9 @@ internal static class PtxTensorCoreGemmGenerator
     /// partial sum covers <c>BlockK</c> products and is rounded to FP16 (2^-11 relative) and must stay below 65504; the
     /// running total stays FP32.
     /// </param>
-    /// <param name="fp16AccumulateGuard">
-    /// With <paramref name="fp16Accumulate"/>: the kernel takes two more arguments, device pointers to the FP16 bit
-    /// patterns of max|A| and max|B| (low 16 bits of a u32, as the abs-max reduction writes them), and accumulates in
-    /// FP16 only when <c>max|A| * max|B| * BlockK &lt; 65504</c>, the bound on every tile's partial sum; otherwise (and
-    /// for a NaN or infinite operand) the whole launch runs the FP32-accumulate MMAs. The choice is uniform per launch,
-    /// made on the device, so a caller never synchronizes to make it.
-    /// </param>
     internal static string Emit(PtxTensorCoreGemmConfiguration config, PtxGemmLayout layout, int ccMajor, int ccMinor,
-        PtxTensorCorePrecision precision = PtxTensorCorePrecision.Tf32, bool halfOutput = false, bool fp16Accumulate = false,
-        bool fp16AccumulateGuard = false)
+        PtxTensorCorePrecision precision = PtxTensorCorePrecision.Tf32, bool halfOutput = false, bool fp16Accumulate = false)
     {
-        if (fp16AccumulateGuard && !fp16Accumulate)
-            throw new ArgumentException("The FP16-accumulate guard needs FP16 accumulation.", nameof(fp16AccumulateGuard));
         if (ccMajor < 8) throw new PlatformNotSupportedException("Tensor-Core MMA and cp.async need compute capability 8.0+.");
         if (halfOutput && precision != PtxTensorCorePrecision.Fp16)
             throw new ArgumentException("An FP16 output needs FP16 operands.", nameof(halfOutput));
@@ -136,7 +127,7 @@ internal static class PtxTensorCoreGemmGenerator
         string? invalid = config.Invalidity(layout, precision);
         if (invalid is not null)
             throw new ArgumentException("Invalid Tensor-Core GEMM configuration " + config.Name + ": " + invalid, nameof(config));
-        return new Emitter(config, layout, precision, halfOutput, fp16Accumulate, fp16AccumulateGuard).Build(ccMajor, ccMinor);
+        return new Emitter(config, layout, precision, halfOutput, fp16Accumulate).Build(ccMajor, ccMinor);
     }
 
     /// <summary>
@@ -163,16 +154,14 @@ internal static class PtxTensorCoreGemmGenerator
         private readonly PtxTensorCorePrecision _precision;
         private readonly bool _halfOutput;
         private readonly bool _fp16Accumulate;
-        private readonly bool _guard;
-        private string _useHalf = "";   // predicate: this launch accumulates in FP16 (guarded mode only)
+        private string _overflow = "";  // predicate: a K tile's FP16 partial overflowed in this warp (recovering mode)
         private readonly int _eb, _mmaK, _chunk;
         private readonly StringBuilder _body = new(128_000);
         private int _r32, _r64, _pred, _f, _h;
 
         internal Emitter(PtxTensorCoreGemmConfiguration config, PtxGemmLayout layout, PtxTensorCorePrecision precision,
-            bool halfOutput, bool fp16Accumulate, bool guard)
+            bool halfOutput, bool fp16Accumulate)
         {
-            _guard = guard;
             _c = config;
             _layout = layout;
             _precision = precision;
@@ -220,23 +209,6 @@ internal static class PtxTensorCoreGemmGenerator
                 L($"ld.param.u32 {reg}, [{name}];");
             L($"ld.param.f32 {alpha}, [alpha];");
             L($"ld.param.f32 {beta}, [beta];");
-            if (_guard)
-            {
-                // max|A| * max|B| * BlockK < 65504 bounds every K tile's FP16 partial sum. NaN fails the compare.
-                string amaxA = Rd(), amaxB = Rd(), bitsA = R(), bitsB = R(), hA = H(), hB = H(), fA = F(), fB = F(), bound = F();
-                L($"ld.param.u64 {amaxA}, [amax_a];");
-                L($"ld.param.u64 {amaxB}, [amax_b];");
-                L($"ld.global.u32 {bitsA}, [{amaxA}];");
-                L($"ld.global.u32 {bitsB}, [{amaxB}];");
-                L($"cvt.u16.u32 {hA}, {bitsA};");
-                L($"cvt.u16.u32 {hB}, {bitsB};");
-                L($"cvt.f32.f16 {fA}, {hA};");
-                L($"cvt.f32.f16 {fB}, {hB};");
-                L($"mul.rn.f32 {bound}, {fA}, {fB};");
-                L($"mul.rn.f32 {bound}, {bound}, 0f{BitConverter.ToInt32(BitConverter.GetBytes((float)_c.BlockK), 0):X8};");
-                _useHalf = P();
-                L($"setp.lt.f32 {_useHalf}, {bound}, 0f477FE000;");   // 65504
-            }
 
             // Coordinates: block origin, batch, warp origin within the block, lane group / thread-in-group.
             string tid = R(), warp = R(), lane = R(), gid = R(), tig = R(), wm = R(), wn = R();
@@ -297,9 +269,7 @@ internal static class PtxTensorCoreGemmGenerator
             L($"setp.eq.u32 {empty}, {tiles}, 0;");
             L($"@{empty} bra EPILOGUE;");
 
-            // The main loop. Guarded: the device-side bound picks one of two complete copies once per launch (FP16 or FP32
-            // accumulation), so the loop that runs has no per-step branch and matches the unguarded kernel instruction for
-            // instruction.
+            // The main loop, emitted once per accumulation mode (FP16 accumulation emits an FP32 copy for its overflow redo).
             void MainLoop(string suffix, bool halfMode)
             {
                 // Prologue: tiles 0 .. Stages-2 in flight (a group per tile, empty past the last tile).
@@ -343,7 +313,7 @@ internal static class PtxTensorCoreGemmGenerator
                     L($"rem.u32 {computeStage}, {tile}, {I(_c.Stages)};");
                     L($"mad.lo.u32 {stageA}, {computeStage}, {I(stageBytesA)}, {aFrag};");
                     L($"mad.lo.u32 {stageB}, {computeStage}, {I(stageBytesB)}, {bFrag};");
-                    Compute(a, b, stageA, stageB, acc, halfMode);
+                    Compute(a, b, stageA, stageB, acc, halfMode, suffix);
                 }
                 string more = P();
                 L($"add.u32 {tile}, {tile}, 1;");
@@ -352,17 +322,42 @@ internal static class PtxTensorCoreGemmGenerator
                 L("cp.async.wait_group 0;");
             }
 
-            if (_guard)
+            if (_fp16Accumulate)
             {
-                L($"@!{_useHalf} bra MAIN_F32;");
+                // Recovering FP16 accumulation (#1549): run the FP16-accumulate loop, remembering whether any of this
+                // warp's K tiles overflowed; combine the warps' flags in shared memory after the loop; and when one
+                // did, zero the accumulators, rewind the operand pointers and redo the block's tile with the FP32 loop.
+                // Only a block that overflowed pays twice; the result is then exactly the FP32-accumulate kernel's.
+                string anyOverflow = P();
+                _overflow = P();
+                L($"setp.ne.u32 {_overflow}, 0, 0;");
+                var savedA = a.ChunkPointer.Select(_ => Rd()).ToArray();
+                var savedB = b.ChunkPointer.Select(_ => Rd()).ToArray();
+                for (int i = 0; i < savedA.Length; i++) L($"mov.u64 {savedA[i]}, {a.ChunkPointer[i]};");
+                for (int i = 0; i < savedB.Length; i++) L($"mov.u64 {savedB[i]}, {b.ChunkPointer[i]};");
                 MainLoop("_F16", halfMode: true);
-                L("bra EPILOGUE;");
-                Label("MAIN_F32");
+                // A K tile's FP16 partial past 65504 became infinity when promoted (an infinite or NaN operand makes one
+                // too), and an infinite or NaN FP32 total stays so (inf + -inf is NaN), while finite FP16 products
+                // (at most 65504^2 each) cannot overflow an FP32 total. So a non-finite accumulator after the loop is
+                // exactly "some tile overflowed": one check per accumulator per launch, nothing per tile.
+                foreach (string accumulator in acc)
+                {
+                    string magnitude = F(), nonFinite = P();
+                    L($"abs.f32 {magnitude}, {accumulator};");
+                    L($"setp.gtu.f32 {nonFinite}, {magnitude}, 0f7F7FFFFF;");   // above FLT_MAX: infinity; NaN: unordered
+                    L($"or.pred {_overflow}, {_overflow}, {nonFinite};");
+                }
+                // One barrier ORs every thread's flag across the block (no shared memory needed).
+                L($"bar.red.or.pred {anyOverflow}, 0, {_overflow};");
+                L($"@!{anyOverflow} bra EPILOGUE;");
+                foreach (string accumulator in acc) L($"mov.f32 {accumulator}, 0f00000000;");
+                for (int i = 0; i < savedA.Length; i++) L($"mov.u64 {a.ChunkPointer[i]}, {savedA[i]};");
+                for (int i = 0; i < savedB.Length; i++) L($"mov.u64 {b.ChunkPointer[i]}, {savedB[i]};");
                 MainLoop("_F32", halfMode: false);
             }
             else
             {
-                MainLoop("", halfMode: _fp16Accumulate);
+                MainLoop("", halfMode: false);
             }
 
             Label("EPILOGUE");
@@ -374,16 +369,14 @@ internal static class PtxTensorCoreGemmGenerator
             ptx.Append(".target sm_").Append(I(ccMajor)).AppendLine(I(ccMinor));
             ptx.AppendLine(".address_size 64");
             ptx.Append("// tc-gemm ").Append(Fp16 ? (_halfOutput ? "fp16 -> fp16" : "fp16 -> fp32") : "tf32")
-                .Append(_fp16Accumulate ? (_guard ? " (fp16 accumulate per k tile, guarded)" : " (fp16 accumulate per k tile)") : "")
+                .Append(_fp16Accumulate ? " (fp16 accumulate per k tile, fp32 redo on overflow)" : "")
                 .Append(' ').Append(_c.Name).Append(' ').AppendLine(_layout.Name);
             ptx.AppendLine(".extern .shared .align 16 .b8 smem[];");
             ptx.Append(".visible .entry ").Append(EntryPoint).AppendLine("(");
             ptx.AppendLine("    .param .u64 a_ptr, .param .u64 b_ptr, .param .u64 c_ptr,");
             ptx.AppendLine("    .param .u32 m, .param .u32 n, .param .u32 k, .param .u32 lda, .param .u32 ldb, .param .u32 ldc,");
             ptx.AppendLine("    .param .f32 alpha, .param .f32 beta,");
-            ptx.AppendLine(_guard
-                ? "    .param .u64 stride_a, .param .u64 stride_b, .param .u64 stride_c, .param .u64 amax_a, .param .u64 amax_b)"
-                : "    .param .u64 stride_a, .param .u64 stride_b, .param .u64 stride_c)");
+            ptx.AppendLine("    .param .u64 stride_a, .param .u64 stride_b, .param .u64 stride_c)");
             ptx.Append(".maxntid ").Append(I(_c.Threads)).AppendLine(", 1, 1");
             ptx.AppendLine("{");
             ptx.Append("    .reg .pred %p<").Append(I(Math.Max(1, _pred))).AppendLine(">;");
@@ -546,7 +539,7 @@ internal static class PtxTensorCoreGemmGenerator
             L($"mov.b32 {destination}, {{{lo}, {hi}}};");
         }
 
-        private void Compute(Operand a, Operand b, string stageA, string stageB, string[] acc, bool halfMode)
+        private void Compute(Operand a, Operand b, string stageA, string stageB, string[] acc, bool halfMode, string suffix)
         {
             int tilesM = _c.TilesM, tilesN = _c.TilesN;
             var fa = new string[tilesM, 4];
@@ -570,9 +563,8 @@ internal static class PtxTensorCoreGemmGenerator
                     L($"mov.b32 {half[i]}, 0;");
                 }
             }
-            for (int kk = 0; kk < _c.BlockK / _mmaK; kk++)
+            void Fragments(int kBase)
             {
-                int kBase = kk * _mmaK;
                 if (Fp16)
                 {
                     string aTrans = a.ContiguousAlongK ? "" : ".trans";
@@ -600,6 +592,22 @@ internal static class PtxTensorCoreGemmGenerator
                     LoadFragment(b, stageB, column, kBase, fb[nt, 0], scratch);
                     LoadFragment(b, stageB, column, kBase + kHalf, fb[nt, 1], scratch);
                 }
+            }
+
+            void Fp32Mmas()
+            {
+                for (int mt = 0; mt < tilesM; mt++)
+                    for (int nt = 0; nt < tilesN; nt++)
+                    {
+                        int c = (mt * tilesN + nt) * 4;
+                        string d = $"{{{acc[c]}, {acc[c + 1]}, {acc[c + 2]}, {acc[c + 3]}}}";
+                        L($"{mma} {d}, {{{fa[mt, 0]}, {fa[mt, 1]}, {fa[mt, 2]}, {fa[mt, 3]}}}, {{{fb[nt, 0]}, {fb[nt, 1]}}}, {d};");
+                    }
+            }
+
+            for (int kk = 0; kk < _c.BlockK / _mmaK; kk++)
+            {
+                Fragments(kk * _mmaK);
                 if (halfMode)
                 {
                     for (int mt = 0; mt < tilesM; mt++)
@@ -612,13 +620,7 @@ internal static class PtxTensorCoreGemmGenerator
                 }
                 else
                 {
-                    for (int mt = 0; mt < tilesM; mt++)
-                        for (int nt = 0; nt < tilesN; nt++)
-                        {
-                            int c = (mt * tilesN + nt) * 4;
-                            string d = $"{{{acc[c]}, {acc[c + 1]}, {acc[c + 2]}, {acc[c + 3]}}}";
-                            L($"{mma} {d}, {{{fa[mt, 0]}, {fa[mt, 1]}, {fa[mt, 2]}, {fa[mt, 3]}}}, {{{fb[nt, 0]}, {fb[nt, 1]}}}, {d};");
-                        }
+                    Fp32Mmas();
                 }
             }
 

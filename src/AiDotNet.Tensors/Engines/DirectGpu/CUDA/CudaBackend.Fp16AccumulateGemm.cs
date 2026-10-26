@@ -16,11 +16,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 /// <summary>
 /// FP16-accumulate routing of <see cref="GemmFp16In32fOut"/> (#1549). On GeForce cards FP16-accumulate tensor-core MMA
 /// issues at full rate while FP32-accumulate issues at half rate, so a GEMM that accumulates each K tile in FP16 and
-/// promotes it into an FP32 total can run up to twice as fast as cuBLAS's FP32-accumulate GEMM. Every routed launch is
-/// guarded on the device: max|A| and max|B| are reduced first, and the kernel accumulates in FP16 only when
-/// <c>max|A| * max|B| * BlockK &lt; 65504</c> (no tile's partial sum can overflow), otherwise in FP32. The first eager
-/// call of a large shape times guarded candidates against cuBLAS in paired rounds (the reductions included) and routes
-/// the shape only when the best one wins; the verdict lives for the process. AIDOTNET_FP16_ACCUMULATE=0 turns it off.
+/// promotes it into an FP32 total can run up to twice as fast as cuBLAS's FP32-accumulate GEMM. Overflow is handled in
+/// the kernel: a partial sum past 65504 becomes infinite (finite FP16 products cannot overflow the FP32 total, so a
+/// non-finite accumulator after the loop means an FP16 partial overflowed or an operand was already non-finite), and a
+/// block that sees one recomputes its tile with FP32 accumulation, so the output never depends on operand magnitude.
+/// The first eager call of a large shape times candidates against cuBLAS in paired rounds and routes the shape only
+/// when the best one wins; the verdict lives for the process. AIDOTNET_FP16_ACCUMULATE=0 turns it off.
 /// </summary>
 public sealed partial class CudaBackend
 {
@@ -28,7 +29,7 @@ public sealed partial class CudaBackend
         Environment.GetEnvironmentVariable("AIDOTNET_FP16_ACCUMULATE") != "0";
 
     // Below this much work the GEMM is bound by memory or latency, not the MMA rate, so FP16 accumulation buys nothing
-    // (RTX 3080 probe: 3136x64x576 0.99x) while the guard's reductions still cost a pass over the operands.
+    // (RTX 3080 probe: 3136x64x576 0.99x), and timing it against cuBLAS would cost more than it can return.
     private const long Fp16AccumulateMinWork = 1L << 29;
 
     // The fastest configurations of the #1549 probe across the measured shapes.
@@ -41,7 +42,7 @@ public sealed partial class CudaBackend
         new(64, 64, 16, 32, 32, 3, 8),
     };
 
-    private const string Fp16AccumulateRouteVariant = "cuda-fp16acc-route-v1";
+    private const string Fp16AccumulateRouteVariant = "cuda-fp16acc-route-v2";
     private static readonly KernelId Fp16AccumulateRouteKernelId = new("gemm", "cuda-ptx-fp16acc-route");
 
     private sealed class Fp16AccumulateRoute : IDisposable
@@ -61,7 +62,6 @@ public sealed partial class CudaBackend
 
     private readonly ConcurrentDictionary<(int M, int N, int K), Fp16AccumulateRoute> _fp16AccumulateRoutes = new();
     private readonly object _fp16AccumulateTuneLock = new();
-    private IGpuBuffer? _fp16AccumulateAmax;   // two u32 words: max|A|, max|B| as FP16 bit patterns
     private long _fp16AccumulateDispatchCount;
 
     /// <summary>Routed FP16-accumulate GEMM launches on this backend (test and diagnostics hook).</summary>
@@ -74,24 +74,22 @@ public sealed partial class CudaBackend
             : null;
 
     /// <summary>
-    /// Tests: routes a shape to the guarded FP16-accumulate kernel of <paramref name="config"/> without timing it, so the
-    /// routed path (including its device-side fallback) can be checked independently of which route measures faster.
+    /// Tests: routes a shape to the FP16-accumulate kernel of <paramref name="config"/> without timing it, so the
+    /// routed path (including its in-kernel FP32 redo) can be checked independently of which route measures faster.
     /// </summary>
     internal void ForceFp16AccumulateRouteForTests(int m, int n, int k, PtxTensorCoreGemmConfiguration config)
     {
         var kernel = new PtxTensorCoreGemmKernel(GetDirectPtxRuntime(), config, new PtxGemmLayout(false, false),
-            PtxTensorCorePrecision.Fp16, fp16Accumulate: true, fp16AccumulateGuard: true);
+            PtxTensorCorePrecision.Fp16, fp16Accumulate: true);
         if (_fp16AccumulateRoutes.TryGetValue((m, n, k), out var previous)) previous.Dispose();
         _fp16AccumulateRoutes[(m, n, k)] = new Fp16AccumulateRoute(kernel, "forced for tests", 0);
     }
 
     /// <summary>
-    /// Runs <c>C[M,N] = A[M,K] @ B[K,N]</c> (FP16 in, FP32 out, row-major) through the guarded FP16-accumulate kernel when
-    /// this shape is routed; false leaves the call to cuBLAS. <paramref name="amaxA"/> / <paramref name="amaxB"/>, when not
-    /// zero, are device words already holding max|A| / max|B| (a cached weight bound), so that reduction is skipped.
+    /// Runs <c>C[M,N] = A[M,K] @ B[K,N]</c> (FP16 in, FP32 out, row-major) through the FP16-accumulate kernel when this
+    /// shape is routed; false leaves the call to cuBLAS.
     /// </summary>
-    internal bool TryFp16AccumulateGemm(IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, int m, int n, int k,
-        IntPtr amaxA = default, IntPtr amaxB = default)
+    internal bool TryFp16AccumulateGemm(IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, int m, int n, int k)
     {
         if (!s_fp16AccumulateEnabled || _ccMajor < 8 || (long)m * n * k < Fp16AccumulateMinWork) return false;
         if (!_fp16AccumulateRoutes.TryGetValue((m, n, k), out var route))
@@ -111,28 +109,17 @@ public sealed partial class CudaBackend
             }
         }
         if (route.Kernel is null) return false;
-        LaunchFp16Accumulate(route.Kernel, a, b, c, m, n, k, amaxA, amaxB);
+        LaunchFp16Accumulate(route.Kernel, a, b, c, m, n, k);
         Interlocked.Increment(ref _fp16AccumulateDispatchCount);
         return true;
     }
 
     private void LaunchFp16Accumulate(PtxTensorCoreGemmKernel kernel, IGpuBuffer a, IGpuBuffer b, IGpuBuffer c,
-        int m, int n, int k, IntPtr amaxA, IntPtr amaxB)
+        int m, int n, int k)
     {
-        IGpuBuffer amax = _fp16AccumulateAmax ??= AllocateBuffer(2);
-        if (amaxA == IntPtr.Zero)
-        {
-            amaxA = amax.Handle;
-            AbsMaxFp16Bits(a, m * k, amaxA);
-        }
-        if (amaxB == IntPtr.Zero)
-        {
-            amaxB = amax.Handle + 4;
-            AbsMaxFp16Bits(b, k * n, amaxB);
-        }
         using var _ = PushContext();
         lock (GpuDispatchLock)
-            kernel.LaunchGuarded(a.Handle, b.Handle, c.Handle, m, n, k, k, n, n, 1f, 0f, amaxA, amaxB, stream: _stream);
+            kernel.Launch(a.Handle, b.Handle, c.Handle, m, n, k, k, n, n, 1f, 0f, stream: _stream);
     }
 
     private Fp16AccumulateRoute TuneFp16AccumulateRoute(IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, int m, int n, int k)
@@ -165,13 +152,13 @@ public sealed partial class CudaBackend
                 try
                 {
                     kernel = new PtxTensorCoreGemmKernel(runtime, config, layout, PtxTensorCorePrecision.Fp16,
-                        fp16Accumulate: true, fp16AccumulateGuard: true);
+                        fp16Accumulate: true);
                 }
                 catch (InvalidOperationException)
                 {
                     continue;   // spills or does not load on this device
                 }
-                LaunchFp16Accumulate(kernel, a, b, c, m, n, k, IntPtr.Zero, IntPtr.Zero);
+                LaunchFp16Accumulate(kernel, a, b, c, m, n, k);
                 float[] actual = DownloadBuffer(c);
                 double diff = 0;
                 for (int i = 0; i < actual.Length; i++) diff = Math.Max(diff, Math.Abs((double)actual[i] - reference[i]));
@@ -180,7 +167,7 @@ public sealed partial class CudaBackend
                     kernel.Dispose();
                     continue;
                 }
-                double ms = TimeFp16Gemm(() => LaunchFp16Accumulate(kernel, a, b, c, m, n, k, IntPtr.Zero, IntPtr.Zero), 3);
+                double ms = TimeFp16Gemm(() => LaunchFp16Accumulate(kernel, a, b, c, m, n, k), 3);
                 if (ms < bestMs)
                 {
                     best?.Dispose();
@@ -202,8 +189,8 @@ public sealed partial class CudaBackend
         }
     }
 
-    // Paired ABBA rounds of cuBLAS against the guarded kernel (its max-abs reductions included). Takes ownership of the
-    // kernel: kept in the route on a win, disposed otherwise.
+    // Paired ABBA rounds of cuBLAS against the kernel. Takes ownership of the kernel: kept in the route on a win, disposed
+    // otherwise.
     private Fp16AccumulateRoute VerdictAgainstCublas(PtxTensorCoreGemmKernel kernel, IGpuBuffer a, IGpuBuffer b, IGpuBuffer c,
         int m, int n, int k)
     {
@@ -213,7 +200,7 @@ public sealed partial class CudaBackend
         {
             verdict = PairedRounds(
                 () => { for (int i = 0; i < reps; i++) CublasGemmFp16In32fOut(a, b, c, m, n, k); },
-                () => { for (int i = 0; i < reps; i++) LaunchFp16Accumulate(kernel, a, b, c, m, n, k, IntPtr.Zero, IntPtr.Zero); },
+                () => { for (int i = 0; i < reps; i++) LaunchFp16Accumulate(kernel, a, b, c, m, n, k); },
                 reps);
         }
         catch
@@ -231,8 +218,8 @@ public sealed partial class CudaBackend
 
     /// <summary>
     /// Evolves the FP16-accumulate tensor-core GEMM for <c>C[M,N] = A[M,K] @ B[K,N]</c> (FP16 in, FP32 out) on this device,
-    /// checks the guarded winner reproduces cuBLAS's output on operands in [-1, 1), times it against cuBLAS in paired
-    /// rounds (its max-abs reductions included), and routes <see cref="GemmFp16In32fOut"/> for this shape to it only on a
+    /// checks the winner reproduces cuBLAS's output on operands in [-1, 1), times it against cuBLAS in paired rounds, and
+    /// routes <see cref="GemmFp16In32fOut"/> for this shape to it only on a
     /// win (#1549). The verdict, either way, is persisted (unless <paramref name="persist"/> is false), so a later process
     /// applies it on the shape's first call without measuring.
     /// </summary>
@@ -258,10 +245,10 @@ public sealed partial class CudaBackend
         UploadBytes(b, RandomHalfBytes(k * n, rng));
 
         var kernel = new PtxTensorCoreGemmKernel(runtime, winner, layout, PtxTensorCorePrecision.Fp16,
-            fp16Accumulate: true, fp16AccumulateGuard: true);
+            fp16Accumulate: true);
         CublasGemmFp16In32fOut(a, b, c, m, n, k);
         float[] reference = DownloadBuffer(c);
-        LaunchFp16Accumulate(kernel, a, b, c, m, n, k, IntPtr.Zero, IntPtr.Zero);
+        LaunchFp16Accumulate(kernel, a, b, c, m, n, k);
         float[] actual = DownloadBuffer(c);
         double scale = 0, diff = 0;
         for (int i = 0; i < reference.Length; i++)
@@ -334,7 +321,7 @@ public sealed partial class CudaBackend
             if (!PtxTensorCoreGemmGenerator.Admits(configuration, layout, m, n, k, k, n, n, 0, 0, 0, PtxTensorCorePrecision.Fp16))
                 return null;
             var kernel = new PtxTensorCoreGemmKernel(runtime, configuration, layout, PtxTensorCorePrecision.Fp16,
-                fp16Accumulate: true, fp16AccumulateGuard: true);
+                fp16Accumulate: true);
             return new Fp16AccumulateRoute(kernel, reason, median);
         }
         catch (Exception exception) when (exception is InvalidOperationException or ArgumentException or
@@ -387,7 +374,5 @@ public sealed partial class CudaBackend
     {
         foreach (var route in _fp16AccumulateRoutes.Values) route.Dispose();
         _fp16AccumulateRoutes.Clear();
-        _fp16AccumulateAmax?.Dispose();
-        _fp16AccumulateAmax = null;
     }
 }
