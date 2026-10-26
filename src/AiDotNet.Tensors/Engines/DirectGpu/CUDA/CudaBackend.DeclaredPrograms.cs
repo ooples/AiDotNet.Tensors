@@ -83,6 +83,21 @@ internal enum DeclaredFamily
 
     /// <summary>CSR · dense → dense (#1441).</summary>
     CsrSpMM,
+
+    /// <summary>The row-wise scatter maximum with its float argmax (#1441).</summary>
+    ScatterMaxArgmaxRows,
+
+    /// <summary>The backward of the row-wise scatter maximum (#1441).</summary>
+    ScatterMaxBackwardRows,
+
+    /// <summary>The backward of the row-wise scatter mean (#1441).</summary>
+    ScatterMeanBackwardRows,
+
+    /// <summary>The backward of the row-wise scatter softmax (#1441).</summary>
+    ScatterSoftmaxBackwardRows,
+
+    /// <summary>The activation-layout scatter mean with int32 counts (#1441).</summary>
+    ScatterMeanActivation,
 }
 
 /// <summary>One declared program: its family and shape (unused dimensions are 0).</summary>

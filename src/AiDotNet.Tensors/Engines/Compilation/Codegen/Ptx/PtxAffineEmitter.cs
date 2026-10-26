@@ -1971,9 +1971,10 @@ public sealed partial class PtxAffineEmitter
 
                         string candidate = EmitAffine(
                             spec.SecondaryIndexExpr!, laneAxisReg[l], reductionValues, reduction);
-                        string chosen = NextR();
-                        L($"selp.b32 {chosen}, {candidate}, {argIndex[l]}, {beats};");
-                        argIndex[l] = chosen;
+                        // In place, as max.f32 updates the accumulator: in a rolled reduction loop the register is
+                        // loop-carried, and a fresh one per trip would leave the next trip comparing against the
+                        // initial index (every looped argmax came out as its no-winner value).
+                        L($"selp.b32 {argIndex[l]}, {candidate}, {argIndex[l]}, {beats};");
                     }
                     L($"max.f32 {accs[l]}, {accs[l]}, {product!};");
                 }

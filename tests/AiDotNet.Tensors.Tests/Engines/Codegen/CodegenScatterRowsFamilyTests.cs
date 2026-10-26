@@ -48,6 +48,20 @@ public class CodegenScatterRowsFamilyTests
         Assert.DoesNotContain("st.global.u32", ptx);
     }
 
+    /// <summary>
+    /// A rolled reduction loop carries the argmax register from trip to trip, so the select must write it in place.
+    /// Writing a fresh register per trip left every looped argmax at its no-winner value on the device.
+    /// </summary>
+    [Fact]
+    public void ALoopedArgmaxIsUpdatedInPlace()
+    {
+        string ptx = new PtxAffineEmitter().Emit(CodegenBackendPrograms.ScatterMaxArgmaxRows(300, 33, 7).Passes[0], 8, 6);
+        Assert.Contains("LOOP", ptx);
+        var select = System.Text.RegularExpressions.Regex.Match(ptx, @"selp\.b32 (%r\d+), %r\d+, (%r\d+), %p\d+;");
+        Assert.True(select.Success, "no argmax select in the loop");
+        Assert.Equal(select.Groups[1].Value, select.Groups[2].Value);
+    }
+
     [Fact]
     public void ScatterMaxBackward_RoutesEachGradientToItsArgmaxRow()
     {

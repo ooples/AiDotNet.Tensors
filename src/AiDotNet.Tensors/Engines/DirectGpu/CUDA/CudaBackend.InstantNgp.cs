@@ -247,6 +247,7 @@ public sealed partial class CudaBackend : IInstantNgpBackend, IFrexpBackend, IRe
     {
         int total = checked(outputRows * innerSize);
         if (total <= 0) return;
+        if (TryDeclaredScatterMaxArgmaxRows(source, indices, output, argmax, sourceRows, innerSize, outputRows)) return;
         var kernel = ResolveInstantNgpKernel("resident_scatter_max_argmax_rows");
         using var _ = PushContext();
         IntPtr s = source.Handle, i = indices.Handle, o = output.Handle, a = argmax.Handle;
@@ -305,9 +306,13 @@ public sealed partial class CudaBackend : IInstantNgpBackend, IFrexpBackend, IRe
     }
 
     public void ScatterAddRows(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output,
-        int sourceRows, int innerSize, int outputRows) =>
+        int sourceRows, int innerSize, int outputRows)
+    {
+        // Declared route (#1441): the deterministic scatter-add's program, the same sums in the same order.
+        if (TryDeclaredScatterAddRows(source, indices, output, sourceRows, innerSize, outputRows)) return;
         LaunchResidentRows3("resident_scatter_add_rows", source, indices, output,
             checked(outputRows * innerSize), sourceRows, innerSize, outputRows);
+    }
 
     public void ScatterMeanRowsWithCounts(
         IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, IGpuBuffer counts,
@@ -330,27 +335,42 @@ public sealed partial class CudaBackend : IInstantNgpBackend, IFrexpBackend, IRe
 
     public void ScatterAddBackwardRows(
         IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradSource,
-        int sourceRows, int innerSize, int outputRows) =>
+        int sourceRows, int innerSize, int outputRows)
+    {
+        // Declared route (#1441): the embedding's gather.
+        if (TryDeclaredScatterAddBackwardRows(gradOutput, indices, gradSource, sourceRows, innerSize, outputRows)) return;
         LaunchResidentRows3("resident_scatter_add_backward_rows", gradOutput, indices, gradSource,
             checked(sourceRows * innerSize), sourceRows, innerSize, outputRows);
+    }
 
     public void ScatterMeanBackwardRows(
         IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer counts, IGpuBuffer gradSource,
-        int sourceRows, int innerSize, int outputRows) =>
+        int sourceRows, int innerSize, int outputRows)
+    {
+        if (TryDeclaredScatterMeanBackwardRows(gradOutput, indices, counts, gradSource, sourceRows, innerSize, outputRows))
+            return;
         LaunchResidentRows4("resident_scatter_mean_backward_rows", gradOutput, indices, counts, gradSource,
             checked(sourceRows * innerSize), sourceRows, innerSize, outputRows);
+    }
 
     public void ScatterMaxBackwardRows(
         IGpuBuffer gradOutput, IGpuBuffer argmax, IGpuBuffer gradSource,
-        int sourceRows, int innerSize, int outputRows) =>
+        int sourceRows, int innerSize, int outputRows)
+    {
+        if (TryDeclaredScatterMaxBackwardRows(gradOutput, argmax, gradSource, sourceRows, innerSize, outputRows)) return;
         LaunchResidentRows3("resident_scatter_max_backward_rows", gradOutput, argmax, gradSource,
             checked(sourceRows * innerSize), sourceRows, innerSize, outputRows);
+    }
 
     public void ScatterSoftmaxBackwardRows(
         IGpuBuffer gradOutput, IGpuBuffer output, IGpuBuffer indices, IGpuBuffer gradSource,
-        int sourceRows, int innerSize, int numGroups) =>
+        int sourceRows, int innerSize, int numGroups)
+    {
+        if (TryDeclaredScatterSoftmaxBackwardRows(gradOutput, output, indices, gradSource, sourceRows, innerSize, numGroups))
+            return;
         LaunchResidentRows4("resident_scatter_softmax_backward_rows", gradOutput, output, indices, gradSource,
             checked(sourceRows * innerSize), sourceRows, innerSize, numGroups);
+    }
 
     public unsafe void CtcLoss(
         IGpuBuffer logProbs, IGpuBuffer targets, IGpuBuffer inputLengths,

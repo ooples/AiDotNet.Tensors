@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // Direct CUDA backend for NVIDIA GPUs (Driver API + NVRTC + cuBLAS fallback).
 using System;
 using System.Collections.Concurrent;
@@ -11322,6 +11322,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public unsafe void ScatterMean(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, IGpuBuffer counts, int sourceSize, int outputSize, int featureSize)
     {
+        // Declared route (#1441): the counts and means with no atomic, deterministic in every mode; it writes every
+        // output and count, so nothing needs zeroing first.
+        if (TryDeclaredScatterMeanActivation(source, indices, output, counts, sourceSize, outputSize, featureSize)) return;
         using var _ = PushContext();
         // Initialize output and counts to zero before accumulation
         Fill(output, 0f, outputSize * featureSize);
