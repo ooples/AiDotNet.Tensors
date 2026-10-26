@@ -137,6 +137,9 @@ internal enum DeclaredFamily
 
     /// <summary>CSR · dense → dense in double precision (#1441).</summary>
     CsrSpMMDouble,
+
+    /// <summary>The grouped-query attention backward, key/value heads shared by groups of query heads (#1440).</summary>
+    GroupedQueryAttentionBackward,
 }
 
 /// <summary>One declared program: its family and shape (unused dimensions are 0).</summary>

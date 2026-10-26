@@ -3703,6 +3703,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (splits <= 0 && headDim == PtxFusedDecodeAttentionD64Kernel.HeadDimension &&
             TryDirectPtxFlashDecodeD64(q, k, v, output, heads, kvHeads, seqLen, scale))
             return output;
+        // #1440: the declared paged decode, the contiguous cache read as a single page.
+        if (TryDeclaredFlashDecode(q, k, v, output, heads, kvHeads, headDim, seqLen, scale)) return output;
         if (!_kernelCache.TryGetValue("flash_decode_partial", out var partKernel))
         {
             output.Dispose();
@@ -10180,6 +10182,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
     {
         using var _ = PushContext();
+        // #1440: the declared attention program, which takes grouped key/value heads (h reads h / g), the same causal
+        // rule (a KV-cache offset) and stores the normalised weights when asked.
+        if (TryDeclaredAttention(query, key, value, output, attentionWeights, null, batch, numQHeads, numKVHeads, seqQ, seqK,
+                headDim, scale, isCausal, maskMode: 0, softcap: 0f))
+            return;
         var kernel = _kernelCache["grouped_query_attention"];
         uint gridX = (uint)((seqQ + 31) / 32);
         uint gridY = (uint)(batch * numQHeads);
@@ -10231,6 +10238,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 gradOutput, query, key, value, attentionWeights,
                 gradQuery, gradKey, gradValue,
                 batch, numQHeads, numKVHeads, seqQ, seqK, headDim, scale))
+            return;
+        // #1440: the declared backward with grouped key/value heads.
+        if (TryDeclaredGroupedAttentionBackward(gradOutput, query, key, value, attentionWeights, gradQuery, gradKey,
+                gradValue, batch, numQHeads, numKVHeads, queriesPerKV, seqQ, seqK, headDim, scale))
             return;
             GroupedQueryAttentionBackwardLaunch(
                 gradOutput, query, key, value,

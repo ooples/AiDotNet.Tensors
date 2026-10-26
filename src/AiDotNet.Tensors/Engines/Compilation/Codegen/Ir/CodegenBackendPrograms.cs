@@ -1003,14 +1003,27 @@ public static partial class CodegenBackendPrograms
     /// gradient, as in the forward. Every product reads its operands in place -- no transposed copies.
     /// </summary>
     public static CodegenProgram ScaledDotProductAttentionBackward(int batch, int heads, int seqQ, int seqK, int headDim,
-        double scale)
+        double scale) =>
+        ScaledDotProductAttentionBackward(batch, heads, heads, seqQ, seqK, headDim, scale);
+
+    /// <summary>
+    /// <see cref="ScaledDotProductAttentionBackward(int, int, int, int, int, double)"/> with grouped key/value heads
+    /// (#1440), in CudaBackend.GroupedQueryAttentionBackward's contract: query head h reads key/value head h / g
+    /// (g = heads / kvHeads), so dq and dP read k and v there, and dk and dv [batch, kvHeads, seqK, headDim] sum over the
+    /// g query heads of each group as well as over the queries.
+    /// </summary>
+    public static CodegenProgram ScaledDotProductAttentionBackward(int batch, int heads, int kvHeads, int seqQ, int seqK,
+        int headDim, double scale)
     {
-        if (batch <= 0 || heads <= 0 || seqQ <= 0 || seqK <= 0 || headDim <= 0)
+        if (batch <= 0 || heads <= 0 || kvHeads <= 0 || seqQ <= 0 || seqK <= 0 || headDim <= 0)
             throw new ArgumentOutOfRangeException(nameof(batch), "Attention extents must be positive.");
-        var passes = AttentionBackwardPasses(batch, heads, seqQ, seqK, headDim, scale, "weights", rowdotFromOutput: false);
+        if (heads % kvHeads != 0) throw new ArgumentException("heads must be a multiple of kvHeads.", nameof(kvHeads));
+        var passes = AttentionBackwardPasses(batch, heads, seqQ, seqK, headDim, scale, "weights", rowdotFromOutput: false,
+            kvHeads: kvHeads);
         long p = (long)batch * heads * seqQ * seqK;
         return new CodegenProgram(passes, new[] { p, (long)batch * heads * seqQ, p },
-            "scaled dot-product attention backward (backend contract)");
+            kvHeads == heads ? "scaled dot-product attention backward (backend contract)"
+                : "grouped-query attention backward (backend contract)");
     }
 
     /// <summary>
@@ -1053,8 +1066,12 @@ public static partial class CodegenBackendPrograms
     // The backward's products from the weights tensor `weights`: dv, dP, the row term (sum_k P dP, or sum_e dout out),
     // dS, dq, dk.
     private static List<CodegenKernelSpec> AttentionBackwardPasses(int batch, int heads, int seqQ, int seqK, int headDim,
-        double scale, string weights, bool rowdotFromOutput)
+        double scale, string weights, bool rowdotFromOutput, int kvHeads = 0)
     {
+        if (kvHeads <= 0) kvHeads = heads;
+        int group = heads / kvHeads;
+        if (group > 1)
+            return GroupedAttentionBackwardPasses(batch, heads, kvHeads, seqQ, seqK, headDim, scale, weights, rowdotFromOutput);
         int[] qShape = { batch, heads, seqQ, headDim }, kShape = { batch, heads, seqK, headDim };
         int[] pShape = { batch, heads, seqQ, seqK };
         CodegenTensorBinding T(int parameter, string name, int[] shape, int a0, int a1, int a2, int a3, bool output = false) =>
@@ -1101,6 +1118,84 @@ public static partial class CodegenBackendPrograms
         passes.Add(new CodegenKernelSpec("attention_dk", Space("k", seqK, "d", headDim, "q", seqQ),
             new[] { T(0, "ds", pShape, 0, 1, 4, 2), T(1, "q", qShape, 0, 1, 4, 3) },
             T(2, "dk", kShape, 0, 1, 2, 3, output: true), new[] { 0, 1 }, CodegenReduceKind.Sum));
+        return passes;
+    }
+
+    // The grouped backward: k and v [batch, kvHeads, seqK, headDim] read at h / g; dv and dk reduce over (j, q) with the
+    // query head h = kvh * g + j, in increasing j then q.
+    private static List<CodegenKernelSpec> GroupedAttentionBackwardPasses(int batch, int heads, int kvHeads, int seqQ,
+        int seqK, int headDim, double scale, string weights, bool rowdotFromOutput)
+    {
+        int group = heads / kvHeads;
+        int[] qShape = { batch, heads, seqQ, headDim }, kvShape = { batch, kvHeads, seqK, headDim };
+        int[] pShape = { batch, heads, seqQ, seqK };
+        var kvHeadOf = new CodegenAffineExpr(new[] { new CodegenAffineTerm(1, 1) }, 0, group);
+        CodegenTensorBinding T(int parameter, string name, int[] shape, int a0, int a1, int a2, int a3, bool output = false) =>
+            new(parameter, name, shape, new[] { A(a0), A(a1), A(a2), A(a3) }, output);
+        CodegenIterationSpace Space(string m, int mExtent, string n, int nExtent, string r, int rExtent) =>
+            new(CodegenAxis.Parallel("b", batch), CodegenAxis.Parallel("h", heads), CodegenAxis.Parallel(m, mExtent),
+                CodegenAxis.Parallel(n, nExtent), CodegenAxis.Reduce(r, rExtent));
+        // The grouped reductions: b, kvh, m, n parallel; j (query head within the group), q reduced.
+        CodegenIterationSpace GroupSpace(string m, int mExtent, string n, int nExtent) =>
+            new(CodegenAxis.Parallel("b", batch), CodegenAxis.Parallel("kvh", kvHeads), CodegenAxis.Parallel(m, mExtent),
+                CodegenAxis.Parallel(n, nExtent), CodegenAxis.Reduce("j", group), CodegenAxis.Reduce("q", seqQ));
+        // The query head of a grouped reduction: kvh * g + j.
+        var headOfGroup = new CodegenAffineExpr(new[] { new CodegenAffineTerm(1, group), new CodegenAffineTerm(4, 1) }, 0);
+        var passes = new List<CodegenKernelSpec>();
+
+        // dv[b,kvh,k,e] = sum_j sum_q P[b,kvh*g+j,q,k] dout[b,kvh*g+j,q,e]
+        passes.Add(new CodegenKernelSpec("attention_dv_grouped", GroupSpace("k", seqK, "e", headDim),
+            new[]
+            {
+                new CodegenTensorBinding(0, weights, pShape, new[] { A(0), headOfGroup, A(5), A(2) }),
+                new CodegenTensorBinding(1, "dout", qShape, new[] { A(0), headOfGroup, A(5), A(3) }),
+            },
+            T(2, "dv", kvShape, 0, 1, 2, 3, output: true), new[] { 0, 1 }, CodegenReduceKind.Sum));
+        // dP[b,h,q,k] = sum_e dout[b,h,q,e] v[b,h/g,k,e]
+        passes.Add(new CodegenKernelSpec("attention_dp_grouped", Space("q", seqQ, "k", seqK, "e", headDim),
+            new[]
+            {
+                T(0, "dout", qShape, 0, 1, 2, 4),
+                new CodegenTensorBinding(1, "v", kvShape, new[] { A(0), kvHeadOf, A(3), A(4) }),
+            },
+            T(2, "dp", pShape, 0, 1, 2, 3, output: true), new[] { 0, 1 }, CodegenReduceKind.Sum));
+        // dot[b,h,q] = sum_k P dP (or sum_e dout out)
+        var dotSpace = new CodegenIterationSpace(CodegenAxis.Parallel("b", batch), CodegenAxis.Parallel("h", heads),
+            CodegenAxis.Parallel("q", seqQ), CodegenAxis.Reduce("k", rowdotFromOutput ? headDim : seqK));
+        passes.Add(new CodegenKernelSpec("attention_rowdot", dotSpace,
+            rowdotFromOutput
+                ? new[] { T(0, "dout", qShape, 0, 1, 2, 3), T(1, "out", qShape, 0, 1, 2, 3) }
+                : new[] { T(0, weights, pShape, 0, 1, 2, 3), T(1, "dp", pShape, 0, 1, 2, 3) },
+            new CodegenTensorBinding(2, "rowdot", new[] { batch, heads, seqQ }, new[] { A(0), A(1), A(2) }, isOutput: true),
+            new[] { 0, 1 }, CodegenReduceKind.Sum));
+        // dS = scale * P * (dP - dot)
+        var dsSpace = new CodegenIterationSpace(CodegenAxis.Parallel("b", batch), CodegenAxis.Parallel("h", heads),
+            CodegenAxis.Parallel("q", seqQ), CodegenAxis.Parallel("k", seqK));
+        var dsBody = CodegenExpr.Multiply(CodegenExpr.Multiply(CodegenExpr.Constant(scale), Op(0)),
+            CodegenExpr.Subtract(Op(1), Op(2)));
+        passes.Add(new CodegenKernelSpec("attention_ds", dsSpace,
+            new[]
+            {
+                T(0, weights, pShape, 0, 1, 2, 3), T(1, "dp", pShape, 0, 1, 2, 3),
+                new CodegenTensorBinding(2, "rowdot", new[] { batch, heads, seqQ }, new[] { A(0), A(1), A(2) }),
+            },
+            T(3, "ds", pShape, 0, 1, 2, 3, output: true), dsBody.Operands(), CodegenReduceKind.None, body: dsBody));
+        // dq[b,h,q,d] = sum_k dS[b,h,q,k] k[b,h/g,k,d]
+        passes.Add(new CodegenKernelSpec("attention_dq_grouped", Space("q", seqQ, "d", headDim, "k", seqK),
+            new[]
+            {
+                T(0, "ds", pShape, 0, 1, 2, 4),
+                new CodegenTensorBinding(1, "k", kvShape, new[] { A(0), kvHeadOf, A(4), A(3) }),
+            },
+            T(2, "dq", qShape, 0, 1, 2, 3, output: true), new[] { 0, 1 }, CodegenReduceKind.Sum));
+        // dk[b,kvh,k,d] = sum_j sum_q dS[b,kvh*g+j,q,k] q[b,kvh*g+j,q,d]
+        passes.Add(new CodegenKernelSpec("attention_dk_grouped", GroupSpace("k", seqK, "d", headDim),
+            new[]
+            {
+                new CodegenTensorBinding(0, "ds", pShape, new[] { A(0), headOfGroup, A(5), A(2) }),
+                new CodegenTensorBinding(1, "q", qShape, new[] { A(0), headOfGroup, A(5), A(3) }),
+            },
+            T(2, "dk", kvShape, 0, 1, 2, 3, output: true), new[] { 0, 1 }, CodegenReduceKind.Sum));
         return passes;
     }
 

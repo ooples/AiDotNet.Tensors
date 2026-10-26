@@ -164,6 +164,44 @@ public sealed partial class CudaBackend
     private static readonly Func<DeclaredKey, CodegenProgram> s_buildAttentionBackward = key =>
         CodegenBackendPrograms.ScaledDotProductAttentionBackward(key.D0, key.D1, key.D2, key.D3, key.D5, key.Epsilon);
 
+    private static readonly Func<DeclaredKey, CodegenProgram> s_buildGroupedAttentionBackward = key =>
+        CodegenBackendPrograms.ScaledDotProductAttentionBackward(key.D0, key.D1, key.D4, key.D2, key.D3, key.D5,
+            key.Epsilon);
+
+    /// <summary>
+    /// The grouped-query attention backward through its declared program (#1440): the same products as the attention
+    /// backward, with k and v read at head h / g and dk, dv summed over each group's query heads. Only where the group is
+    /// the consistent heads / kvHeads (the hand-written kernel honours an explicit, possibly inconsistent, group).
+    /// False -- nothing launched -- when declined.
+    /// </summary>
+    private bool TryDeclaredGroupedAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key,
+        IGpuBuffer value, IGpuBuffer weights, IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue, int batch,
+        int heads, int kvHeads, int queriesPerKV, int seqQ, int seqK, int headDim, float scale)
+    {
+        if (!DeclaredKernelsEnabled || batch <= 0 || heads <= 0 || kvHeads <= 0 || seqQ <= 0 || seqK <= 0 ||
+            headDim <= 0 || heads % kvHeads != 0 || queriesPerKV != heads / kvHeads ||
+            (long)batch * heads * seqQ * seqK > AttentionMaxScoreElements)
+            return false;
+        var declaredKey = new DeclaredKey(DeclaredFamily.GroupedQueryAttentionBackward, batch, heads, seqQ, seqK, scale, 0,
+            null, kvHeads, headDim);
+        DeclaredProgram? program;
+        lock (_directPtxLock)
+        {
+            if (!_declaredPrograms.TryGetValue(declaredKey, out program))
+            {
+                if (IsStreamCapturing() || !AttentionShapeRecurs(declaredKey)) return false;
+                program = BuildAttentionProgram(declaredKey, s_buildGroupedAttentionBackward, s_attentionBackwardNames);
+                _declaredPrograms[declaredKey] = program;
+            }
+        }
+        if (program is null) return false;
+        var bound = new DeclaredBindings(gradOutput, query, key, value, weights, gradQuery, gradKey, gradValue);
+        if (!AlignedFor(program, s_attentionBackwardNames, bound)) return false;
+        if (TryLaunchDeclaredResidentChecked(declaredKey, program, s_attentionBackwardNames, bound)) return true;
+        RunDeclaredProgram(program, s_attentionBackwardNames, bound);
+        return true;
+    }
+
     /// <summary>The key of an attention backward call; the scale is the key's epsilon slot.</summary>
     internal static DeclaredKey AttentionBackwardKey(int batch, int heads, int seqQ, int seqK, int headDim, float scale) =>
         new(DeclaredFamily.ScaledDotProductAttentionBackward, batch, heads, seqQ, seqK, scale, 0, null, 0, headDim);
@@ -623,8 +661,37 @@ public sealed partial class CudaBackend
             kvHeads, headDim, blockSize, pages, (int)blocks, numQueries, scale);
     }
 
+    // The one-entry block table { 0 } FlashDecode reads its contiguous cache through; guarded by _directPtxLock.
+    private IGpuBuffer? _identityBlockTable;
+
+    /// <summary>
+    /// FlashDecode through the declared paged decode (#1440): a contiguous [seqLen, kvHeads, headDim] cache is a paged one
+    /// of a single block seqLen tokens long, read through the block table { 0 }. The split count is the hand-written
+    /// kernel's schedule, not part of the result, so it is not consulted. False -- nothing launched -- when declined.
+    /// </summary>
+    private bool TryDeclaredFlashDecode(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value, IGpuBuffer output, int heads,
+        int kvHeads, int headDim, int seqLen, float scale)
+    {
+        if (!DeclaredKernelsEnabled || seqLen <= 0) return false;
+        IGpuBuffer table;
+        lock (_directPtxLock)
+        {
+            if (_identityBlockTable is null)
+            {
+                if (IsStreamCapturing()) return false;
+                var buffer = AllocateByteBuffer(sizeof(int));
+                UploadByteBuffer(buffer, new byte[sizeof(int)]);
+                _identityBlockTable = buffer;
+            }
+            table = _identityBlockTable;
+        }
+        return TryDeclaredPagedDecodeRouted(query, key, value, table, output, heads, kvHeads, headDim, seqLen, seqLen, scale);
+    }
+
     private void DisposeCausalBiases()
     {
+        _identityBlockTable?.Dispose();
+        _identityBlockTable = null;
         foreach (var buffer in _causalBiases.Values) buffer.Dispose();
         _causalBiases.Clear();
         foreach (var buffer in _pagedKeyBiases.Values) buffer.Dispose();
