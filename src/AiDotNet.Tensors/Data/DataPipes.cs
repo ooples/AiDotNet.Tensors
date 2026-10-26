@@ -166,7 +166,7 @@ public static class DataPipeExtensions
         }
         public IEnumerator<TSample> GetEnumerator()
         {
-            var rng = _seed.HasValue ? new Random(_seed.Value) : new Random();
+            var rng = _seed.HasValue ? AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(_seed.Value) : AiDotNet.Tensors.Helpers.RandomHelper.CreateSecureRandom();
             var buffer = new List<TSample>(_bufferSize);
             using var e = _src.GetEnumerator();
             // Prime the buffer.
