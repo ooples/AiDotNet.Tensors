@@ -108,16 +108,25 @@ internal static class PtxTensorCoreGemmGenerator
 {
     internal const string EntryPoint = "aidotnet_tc_sgemm";
 
+    /// <param name="fp16Accumulate">
+    /// FP16 operands only: accumulate each K tile in FP16 (<c>mma...f16.f16.f16.f16</c>) and add the tile's partial sums
+    /// into the FP32 accumulators before the next tile (#1549). On GeForce cards FP16-accumulate MMA issues at full rate
+    /// while FP32-accumulate issues at half rate (RTX 3080: ~120 vs ~60 TFLOP/s), so this doubles the math ceiling. Each
+    /// partial sum covers <c>BlockK</c> products and is rounded to FP16 (2^-11 relative) and must stay below 65504; the
+    /// running total stays FP32.
+    /// </param>
     internal static string Emit(PtxTensorCoreGemmConfiguration config, PtxGemmLayout layout, int ccMajor, int ccMinor,
-        PtxTensorCorePrecision precision = PtxTensorCorePrecision.Tf32, bool halfOutput = false)
+        PtxTensorCorePrecision precision = PtxTensorCorePrecision.Tf32, bool halfOutput = false, bool fp16Accumulate = false)
     {
         if (ccMajor < 8) throw new PlatformNotSupportedException("Tensor-Core MMA and cp.async need compute capability 8.0+.");
         if (halfOutput && precision != PtxTensorCorePrecision.Fp16)
             throw new ArgumentException("An FP16 output needs FP16 operands.", nameof(halfOutput));
+        if (fp16Accumulate && precision != PtxTensorCorePrecision.Fp16)
+            throw new ArgumentException("FP16 accumulation needs FP16 operands.", nameof(fp16Accumulate));
         string? invalid = config.Invalidity(layout, precision);
         if (invalid is not null)
             throw new ArgumentException("Invalid Tensor-Core GEMM configuration " + config.Name + ": " + invalid, nameof(config));
-        return new Emitter(config, layout, precision, halfOutput).Build(ccMajor, ccMinor);
+        return new Emitter(config, layout, precision, halfOutput, fp16Accumulate).Build(ccMajor, ccMinor);
     }
 
     /// <summary>
@@ -143,17 +152,19 @@ internal static class PtxTensorCoreGemmGenerator
         private readonly PtxGemmLayout _layout;
         private readonly PtxTensorCorePrecision _precision;
         private readonly bool _halfOutput;
+        private readonly bool _fp16Accumulate;
         private readonly int _eb, _mmaK, _chunk;
         private readonly StringBuilder _body = new(128_000);
         private int _r32, _r64, _pred, _f, _h;
 
         internal Emitter(PtxTensorCoreGemmConfiguration config, PtxGemmLayout layout, PtxTensorCorePrecision precision,
-            bool halfOutput)
+            bool halfOutput, bool fp16Accumulate)
         {
             _c = config;
             _layout = layout;
             _precision = precision;
             _halfOutput = halfOutput;
+            _fp16Accumulate = fp16Accumulate;
             _eb = PtxTensorCoreGemmConfiguration.ElementBytes(precision);
             _mmaK = PtxTensorCoreGemmConfiguration.MmaK(precision);
             _chunk = PtxTensorCoreGemmConfiguration.ChunkElements(precision);
@@ -314,6 +325,7 @@ internal static class PtxTensorCoreGemmGenerator
             ptx.Append(".target sm_").Append(I(ccMajor)).AppendLine(I(ccMinor));
             ptx.AppendLine(".address_size 64");
             ptx.Append("// tc-gemm ").Append(Fp16 ? (_halfOutput ? "fp16 -> fp16" : "fp16 -> fp32") : "tf32")
+                .Append(_fp16Accumulate ? " (fp16 accumulate per k tile)" : "")
                 .Append(' ').Append(_c.Name).Append(' ').AppendLine(_layout.Name);
             ptx.AppendLine(".extern .shared .align 16 .b8 smem[];");
             ptx.Append(".visible .entry ").Append(EntryPoint).AppendLine("(");
@@ -496,6 +508,17 @@ internal static class PtxTensorCoreGemmGenerator
             string mma = Fp16
                 ? "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"
                 : "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32";
+            // FP16 accumulation: two packed half2 registers per m16n8 tile ({d0, d1}, {d2, d3}), zeroed for this K tile.
+            string[] half = Array.Empty<string>();
+            if (_fp16Accumulate)
+            {
+                half = new string[tilesM * tilesN * 2];
+                for (int i = 0; i < half.Length; i++)
+                {
+                    half[i] = R();
+                    L($"mov.b32 {half[i]}, 0;");
+                }
+            }
             for (int kk = 0; kk < _c.BlockK / _mmaK; kk++)
             {
                 int kBase = kk * _mmaK;
@@ -529,9 +552,33 @@ internal static class PtxTensorCoreGemmGenerator
                 for (int mt = 0; mt < tilesM; mt++)
                     for (int nt = 0; nt < tilesN; nt++)
                     {
+                        if (_fp16Accumulate)
+                        {
+                            int h = (mt * tilesN + nt) * 2;
+                            string dh = $"{{{half[h]}, {half[h + 1]}}}";
+                            L($"mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {dh}, {{{fa[mt, 0]}, {fa[mt, 1]}, {fa[mt, 2]}, {fa[mt, 3]}}}, {{{fb[nt, 0]}, {fb[nt, 1]}}}, {dh};");
+                            continue;
+                        }
                         int c = (mt * tilesN + nt) * 4;
                         string d = $"{{{acc[c]}, {acc[c + 1]}, {acc[c + 2]}, {acc[c + 3]}}}";
                         L($"{mma} {d}, {{{fa[mt, 0]}, {fa[mt, 1]}, {fa[mt, 2]}, {fa[mt, 3]}}}, {{{fb[nt, 0]}, {fb[nt, 1]}}}, {d};");
+                    }
+            }
+
+            // Promote this K tile's FP16 partial sums into the FP32 accumulators. A half2 register holds {d0, d1} (or
+            // {d2, d3}) low then high, matching the FP32 accumulators' order.
+            if (_fp16Accumulate)
+            {
+                for (int t = 0; t < tilesM * tilesN; t++)
+                    for (int pair = 0; pair < 2; pair++)
+                    {
+                        string lo = H(), hi = H(), flo = F(), fhi = F();
+                        int c = t * 4 + pair * 2;
+                        L($"mov.b32 {{{lo}, {hi}}}, {half[t * 2 + pair]};");
+                        L($"cvt.f32.f16 {flo}, {lo};");
+                        L($"cvt.f32.f16 {fhi}, {hi};");
+                        L($"add.rn.f32 {acc[c]}, {acc[c]}, {flo};");
+                        L($"add.rn.f32 {acc[c + 1]}, {acc[c + 1]}, {fhi};");
                     }
             }
         }

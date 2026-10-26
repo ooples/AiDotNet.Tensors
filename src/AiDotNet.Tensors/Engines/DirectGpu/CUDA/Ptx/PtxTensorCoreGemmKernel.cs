@@ -17,22 +17,25 @@ internal sealed class PtxTensorCoreGemmKernel : IDisposable
     internal PtxGemmLayout Layout { get; }
     internal PtxTensorCorePrecision Precision { get; }
     internal bool HalfOutput { get; }
+    /// <summary>Each K tile accumulates in FP16 and is promoted into the FP32 total (#1549).</summary>
+    internal bool Fp16Accumulate { get; }
     internal string Ptx { get; }
     internal DirectPtxKernelBlueprint Blueprint { get; }
     internal DirectPtxKernelAudit Audit { get; }
 
     internal PtxTensorCoreGemmKernel(DirectPtxRuntime runtime, PtxTensorCoreGemmConfiguration configuration, PtxGemmLayout layout,
-        PtxTensorCorePrecision precision = PtxTensorCorePrecision.Tf32, bool halfOutput = false)
+        PtxTensorCorePrecision precision = PtxTensorCorePrecision.Tf32, bool halfOutput = false, bool fp16Accumulate = false)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         Configuration = configuration;
         Layout = layout;
         Precision = precision;
         HalfOutput = halfOutput;
+        Fp16Accumulate = fp16Accumulate;
         Ptx = PtxTensorCoreGemmGenerator.Emit(configuration, layout, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
-            precision, halfOutput);
+            precision, halfOutput, fp16Accumulate);
         _sharedBytes = (uint)configuration.SharedBytes(layout, precision);
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, configuration, layout, precision, halfOutput);
+        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, configuration, layout, precision, halfOutput, fp16Accumulate);
         DirectPtxLoadedKernel loaded = DirectPtxResourceInitialization.LoadKernel(
             runtime, Ptx, PtxTensorCoreGemmGenerator.EntryPoint, configuration.Threads, Blueprint);
         _module = loaded.Module;
@@ -79,19 +82,22 @@ internal sealed class PtxTensorCoreGemmKernel : IDisposable
     public void Dispose() => _module.Dispose();
 
     private static DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture,
-        PtxTensorCoreGemmConfiguration configuration, PtxGemmLayout layout, PtxTensorCorePrecision precision, bool halfOutput)
+        PtxTensorCoreGemmConfiguration configuration, PtxGemmLayout layout, PtxTensorCorePrecision precision, bool halfOutput,
+        bool fp16Accumulate)
     {
         var operandType = precision == PtxTensorCorePrecision.Fp16 ? DirectPtxPhysicalType.Float16 : DirectPtxPhysicalType.Float32;
         var outputType = halfOutput ? DirectPtxPhysicalType.Float16 : DirectPtxPhysicalType.Float32;
         string math = precision == PtxTensorCorePrecision.Fp16
-            ? "FP16 Tensor Core (mma.sync m16n8k16), FP32 accumulate"
+            ? fp16Accumulate
+                ? "FP16 Tensor Core (mma.sync m16n8k16), FP16 accumulate per K tile, promoted to an FP32 total"
+                : "FP16 Tensor Core (mma.sync m16n8k16), FP32 accumulate"
             : "TF32 Tensor Core (mma.sync m16n8k8), FP32 accumulate; operands rounded to TF32 (cvt.rna)";
         var any = new DirectPtxExtent(1, 1);
         return new DirectPtxKernelBlueprint(
             Operation: "tc-sgemm",
             Version: 1,
             Architecture: architecture,
-            Variant: configuration.Name + "-" + layout.Name + "-" + precision.ToString().ToLowerInvariant() + (halfOutput ? "-f16out" : ""),
+            Variant: configuration.Name + "-" + layout.Name + "-" + precision.ToString().ToLowerInvariant() + (halfOutput ? "-f16out" : "") + (fp16Accumulate ? "-f16acc" : ""),
             Tensors:
             [
                 new("a", operandType, DirectPtxPhysicalLayout.RowMajor2D,
