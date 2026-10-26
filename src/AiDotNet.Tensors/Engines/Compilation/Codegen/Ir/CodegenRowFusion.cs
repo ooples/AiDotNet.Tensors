@@ -403,6 +403,30 @@ public static class CodegenRowFusion
         if (program is null) throw new ArgumentNullException(nameof(program));
         reason = "";
         if (program.Passes.Count == 0) { reason = "no passes"; return null; }
+        foreach (var pass in program.Passes)
+            if (pass.Reduce == CodegenReduceKind.Product)
+            {
+                reason = pass.Name + " is a product reduction, which the row kernel does not combine";
+                return null;
+            }
+        foreach (var pass in program.Passes)
+            if (pass.ReductionRange is not null)
+            {
+                reason = pass.Name + " has a data-dependent reduction extent, which only the plain lowering emits";
+                return null;
+            }
+        foreach (var pass in program.Passes)
+            if (pass.HasDoubles)
+            {
+                reason = pass.Name + " computes in fp64, which only the fp64 lowering emits";
+                return null;
+            }
+        foreach (var pass in program.Passes)
+            if (pass.HasIntegerValues)
+            {
+                reason = pass.Name + " reads or writes integer values, which only the affine lowering converts";
+                return null;
+            }
 
         // The row/column split comes from the first REDUCING pass: its parallel axes are the
         // row. A program with no reduction is pointwise; its last axis is the column.

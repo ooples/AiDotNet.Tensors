@@ -29,6 +29,14 @@ public sealed partial class CudaBackend
         DeclaredScatterRowsSwitch ?? (ScatterRowsDeclaredPromoted || s_declaredScatterRowsOptIn);
 
     /// <summary>
+    /// True when the family is forced on (DeclaredScatterRowsSwitch = true, or AIDOTNET_DECLARED_SCATTER_ROWS=1): every
+    /// route then runs its declared program at any shape, as verification needs. Otherwise each route runs it only at
+    /// the shapes where it measured no slower than the hand-written kernel (the p15 gate, --kernel-family-gate, on an
+    /// RTX 3080 -- see each route's rule).
+    /// </summary>
+    private bool ScatterRowsForced => DeclaredScatterRowsSwitch == true || s_declaredScatterRowsOptIn;
+
+    /// <summary>
     /// The most row-scatter programs built per backend. Each bakes its three extents, so a workload that varies them
     /// would otherwise keep one set of modules per shape; past the cap a new shape keeps the hand-written kernel.
     /// </summary>
@@ -80,13 +88,15 @@ public sealed partial class CudaBackend
         IGpuBuffer counts, int sourceRows, int innerSize, int outputRows)
     {
         var key = ScatterRowsKey(DeclaredFamily.ScatterMeanRows, sourceRows, innerSize, outputRows);
+        // Measured 0.54-0.86x of resident_scatter_mean_rows_counts at every shape: forced only.
+        if (!ScatterRowsForced) return false;
         // The buffers first: a call declined for them must not claim a program slot.
         if (indices.Size < sourceRows || (long)source.Size < (long)sourceRows * innerSize ||
             (long)output.Size < (long)outputRows * innerSize || counts.Size < outputRows ||
             !AdmitScatterRows(key, sourceRows, innerSize, outputRows))
             return false;
         return TryRunDeclaredProgram(key, _buildScatterMeanRows ??= BuildScatterMeanRows, s_scatterMeanRowsNames,
-            new DeclaredBindings(source, indices, counts, output));
+            new DeclaredBindings(source, indices, counts, output), residentWhenSmall: true);
     }
 
     /// <summary>
@@ -98,12 +108,14 @@ public sealed partial class CudaBackend
         int sourceRows, int innerSize, int numGroups)
     {
         var key = ScatterRowsKey(DeclaredFamily.ScatterSoftmaxRows, sourceRows, innerSize, numGroups);
+        // 1.08x at 4096 rows to 41x at 65536 against resident_scatter_softmax_rows; 0.69x at 1000.
+        if (!ScatterRowsForced && sourceRows < 4096) return false;
         // The buffers first: a call declined for them must not claim a program slot.
         if (indices.Size < sourceRows || (long)source.Size < (long)sourceRows * innerSize ||
             (long)output.Size < (long)sourceRows * innerSize || !AdmitScatterRows(key, sourceRows, innerSize, numGroups))
             return false;
         return TryRunDeclaredProgram(key, _buildScatterSoftmaxRows ??= BuildScatterSoftmaxRows, s_scatterSoftmaxRowsNames,
-            new DeclaredBindings(indices, source, output));
+            new DeclaredBindings(indices, source, output), residentWhenSmall: true);
     }
 
     /// <summary>The row-wise scatter mean as a resident-program stage.</summary>

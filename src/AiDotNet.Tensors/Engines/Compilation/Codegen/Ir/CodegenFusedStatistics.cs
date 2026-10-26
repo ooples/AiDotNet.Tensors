@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // Softmax and LayerNorm as multi-pass programs over the existing spec form.
 //
 // These were blocked on the BODY's shape, not on the number of passes. The spec applies
@@ -81,6 +81,14 @@ public sealed record CodegenProgram(
                     "Pass '" + pass.Name + "' writes '" + pass.Output.Name + "', which the " +
                     "program already has. Every intermediate must be written exactly once.");
             produced.Add(pass.Output.Name, pass.Output);
+            foreach (var extra in pass.ExtraOutputs)
+            {
+                if (produced.ContainsKey(extra.Binding.Name) || seen.ContainsKey(extra.Binding.Name))
+                    throw new InvalidOperationException(
+                        "Pass '" + pass.Name + "' writes '" + extra.Binding.Name + "', which the " +
+                        "program already has. Every intermediate must be written exactly once.");
+                produced.Add(extra.Binding.Name, extra.Binding);
+            }
         }
         return sources;
     }
@@ -109,7 +117,12 @@ public sealed record CodegenProgram(
         {
             var operands = new double[pass.Inputs.Count][];
             for (int i = 0; i < operands.Length; i++) operands[i] = values[pass.Inputs[i].Name];
-            double[] result = pass.Interpret(operands);
+            double[] result = pass.Interpret(operands, out _, out double[][] extras);
+            for (int e = 0; e < extras.Length; e++)
+            {
+                values[pass.ExtraOutputs[e].Binding.Name] = extras[e];
+                outputs[pass.ExtraOutputs[e].Binding.Name] = extras[e];
+            }
             // Disjoint slices: each pass's result is zero outside its slice, so adding them assembles the output.
             if (PassesWriteDisjointSlices && outputs.TryGetValue(pass.Output.Name, out var assembled))
             {

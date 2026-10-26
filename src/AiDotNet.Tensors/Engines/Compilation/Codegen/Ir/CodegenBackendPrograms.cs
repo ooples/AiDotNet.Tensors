@@ -33,7 +33,7 @@ public enum CodegenAttentionMask
 }
 
 /// <summary>Declared programs shaped as the hand-written backend normalisation kernels.</summary>
-public static class CodegenBackendPrograms
+public static partial class CodegenBackendPrograms
 {
     private static CodegenExpr Op(int input) => CodegenExpr.Operand(input);
 
@@ -185,15 +185,30 @@ public static class CodegenBackendPrograms
     /// <c>out[t, e] = table[ids[t], e]</c>: ids int32 [tokens], table [vocabulary, width]. An id outside
     /// [0, vocabulary) yields a zero row (the hand-written kernel read outside the table).
     /// </summary>
-    public static CodegenProgram Embedding(int tokens, int vocabulary, int width)
+    public static CodegenProgram Embedding(int tokens, int vocabulary, int width) =>
+        Embedding(tokens, vocabulary, width, floatIndices: false);
+
+    /// <summary>
+    /// <see cref="Embedding(int, int, int)"/> with float32 ids truncated toward zero, in CudaBackend.IndexSelect's
+    /// (index_select) contract (#1441); an id outside the table yields a zero row where index_select read outside it.
+    /// </summary>
+    public static CodegenProgram EmbeddingFloatIds(int tokens, int vocabulary, int width) =>
+        Embedding(tokens, vocabulary, width, floatIndices: true);
+
+    private static CodegenProgram Embedding(int tokens, int vocabulary, int width, bool floatIndices)
     {
         if (tokens <= 0 || vocabulary <= 0 || width <= 0)
             throw new ArgumentOutOfRangeException(nameof(tokens), "Embedding extents must be positive.");
         var space = new CodegenIterationSpace(CodegenAxis.Parallel("t", tokens), CodegenAxis.Parallel("e", width));
-        var ids = new CodegenTensorBinding(0, "ids", new[] { tokens }, new[] { A(0) }, elementType: CodegenElementType.Int32);
+        var ids = new CodegenTensorBinding(0, "ids", new[] { tokens }, new[] { A(0) },
+            elementType: floatIndices ? CodegenElementType.Float32 : CodegenElementType.Int32);
         var table = new CodegenTensorBinding(1, "table", new[] { vocabulary, width },
             new[] { CodegenAffineExpr.Const(0), A(1) },
-            indirect: new CodegenIndirectIndex?[] { new CodegenIndirectIndex(0, A(0), vocabulary), null });
+            indirect: new CodegenIndirectIndex?[]
+            {
+                new CodegenIndirectIndex(0, A(0), vocabulary, CodegenIndexOutOfRange.Skip, floatIndices: floatIndices),
+                null,
+            });
         var output = new CodegenTensorBinding(2, "out", new[] { tokens, width }, new[] { A(0), A(1) }, isOutput: true);
         var pass = new CodegenKernelSpec("embedding", space, new[] { ids, table }, output, new[] { 1 }, CodegenReduceKind.None);
         return new CodegenProgram(new[] { pass }, Array.Empty<long>(), "embedding (backend contract)");
@@ -345,52 +360,48 @@ public static class CodegenBackendPrograms
     /// are built with <paramref name="notEqualZero"/> (the derived not_equal_scalar), as the scatter mean's are.
     /// </para>
     /// </remarks>
-    public static CodegenProgram CsrSpMM(int rows, int cols, int n, int nnz, CodegenLibraryFunction notEqualZero)
+    public static CodegenProgram CsrSpMM(int rows, int cols, int n, int nnz, CodegenLibraryFunction notEqualZero) =>
+        CsrSpMM(rows, cols, n, nnz, notEqualZero, bias: false);
+
+    /// <summary>
+    /// <see cref="CsrSpMM(int, int, int, int, CodegenLibraryFunction)"/> plus a per-column bias, in
+    /// CudaBackend.CsrSpMMBias' contract: <c>out[r, j] = bias[j] + sum over row r's entries</c>. The bias is the
+    /// reduction's epilogue, added after the entries' sum where csr_spmm_bias starts its sum from it, so the two can
+    /// differ by the rounding of that one addition.
+    /// </summary>
+    public static CodegenProgram CsrSpMMBias(int rows, int cols, int n, int nnz, CodegenLibraryFunction notEqualZero) =>
+        CsrSpMM(rows, cols, n, nnz, notEqualZero, bias: true);
+
+    private static CodegenProgram CsrSpMM(int rows, int cols, int n, int nnz, CodegenLibraryFunction notEqualZero,
+        bool bias)
     {
         if (rows <= 0 || cols <= 0 || n <= 0 || nnz <= 0)
             throw new ArgumentOutOfRangeException(nameof(rows), "CSR SpMM extents must be positive.");
         if (notEqualZero is null) throw new ArgumentNullException(nameof(notEqualZero));
-        var passes = new List<CodegenKernelSpec>();
-        var temps = new List<long>();
+        return new CodegenProgram(new[] { CsrSpMMPass(rows, cols, n, nnz, CodegenElementType.Float32, bias) },
+            Array.Empty<long>(), bias ? "csr spmm + bias (backend contract)" : "csr spmm (backend contract)");
+    }
 
-        // ones[p] = a + (1 - a), a = notEqual(values[p], 0): exactly 1 for every entry.
-        var nonZero = CodegenExpr.Call(notEqualZero, Op(0), CodegenExpr.Constant(0.0));
-        var oneBody = CodegenExpr.Add(nonZero, CodegenExpr.Subtract(CodegenExpr.Constant(1.0), nonZero));
-        passes.Add(new CodegenKernelSpec("csr_spmm_ones", new CodegenIterationSpace(CodegenAxis.Parallel("p", nnz)),
-            new[] { Bind(0, "values", new[] { nnz }) }, Bind(1, "ones", new[] { nnz }, isOutput: true),
-            oneBody.Operands(), CodegenReduceKind.None, body: oneBody));
-        temps.Add(nnz);
-
-        // out[r, j] = sum_p values[p] * dense[colIdx[p], j] * [rowPtr[r] <= p] * [p < rowPtr[r + 1]].
+    // out[r, j] = sum over p in [rowPtr[r], rowPtr[r + 1]) of values[p] * dense[colIdx[p], j] (+ bias[j]): each thread
+    // walks its own row's entries in increasing p, as csr_spmm does -- a data-dependent reduction extent.
+    internal static CodegenKernelSpec CsrSpMMPass(int rows, int cols, int n, int nnz, CodegenElementType type, bool bias)
+    {
         var space = new CodegenIterationSpace(CodegenAxis.Parallel("r", rows), CodegenAxis.Parallel("j", n),
             CodegenAxis.Reduce("p", nnz));
-        var rowStart = new CodegenTensorBinding(4, "ones", new[] { nnz }, new[] { CodegenAffineExpr.Const(0) },
-            indirect: new CodegenIndirectIndex?[]
-            {
-                new CodegenIndirectIndex(0, A(0), nnz, CodegenIndexOutOfRange.Skip, floatIndices: false,
-                    offset: new CodegenAffineExpr(new[] { new CodegenAffineTerm(2, 1) }, -(nnz - 1))),
-            });
-        var rowEnd = new CodegenTensorBinding(5, "ones", new[] { nnz }, new[] { CodegenAffineExpr.Const(0) },
-            indirect: new CodegenIndirectIndex?[]
-            {
-                new CodegenIndirectIndex(0, new CodegenAffineExpr(new[] { new CodegenAffineTerm(0, 1) }, 1), nnz,
-                    CodegenIndexOutOfRange.Skip, floatIndices: false,
-                    offset: new CodegenAffineExpr(new[] { new CodegenAffineTerm(2, 1) }, 1)),
-            });
-        passes.Add(new CodegenKernelSpec("csr_spmm", space,
-            new[]
-            {
-                new CodegenTensorBinding(0, "rowPtr", new[] { rows + 1 }, new[] { A(0) },
-                    elementType: CodegenElementType.Int32),
-                new CodegenTensorBinding(1, "colIdx", new[] { nnz }, new[] { A(2) }, elementType: CodegenElementType.Int32),
-                new CodegenTensorBinding(2, "values", new[] { nnz }, new[] { A(2) }),
-                new CodegenTensorBinding(3, "dense", new[] { cols, n }, new[] { CodegenAffineExpr.Const(0), A(1) },
-                    indirect: new CodegenIndirectIndex?[] { new CodegenIndirectIndex(1, A(2), cols), null }),
-                rowStart,
-                rowEnd,
-            },
-            Bind(6, "out", new[] { rows, n }, isOutput: true), new[] { 2, 3, 4, 5 }, CodegenReduceKind.Sum));
-        return new CodegenProgram(passes, temps, "csr spmm as an inversion over the stored entries (backend contract)");
+        var inputs = new List<CodegenTensorBinding>
+        {
+            new CodegenTensorBinding(0, "rowPtr", new[] { rows + 1 }, new[] { A(0) }, elementType: CodegenElementType.Int32),
+            new CodegenTensorBinding(1, "colIdx", new[] { nnz }, new[] { A(2) }, elementType: CodegenElementType.Int32),
+            new CodegenTensorBinding(2, "values", new[] { nnz }, new[] { A(2) }, elementType: type),
+            new CodegenTensorBinding(3, "dense", new[] { cols, n }, new[] { CodegenAffineExpr.Const(0), A(1) }, elementType: type,
+                indirect: new CodegenIndirectIndex?[] { new CodegenIndirectIndex(1, A(2), cols), null }),
+        };
+        if (bias) inputs.Add(new CodegenTensorBinding(4, "bias", new[] { n }, new[] { A(1) }, elementType: type));
+        return new CodegenKernelSpec(type == CodegenElementType.Float64 ? "csr_spmm_double" : bias ? "csr_spmm_bias" : "csr_spmm",
+            space, inputs.ToArray(),
+            new CodegenTensorBinding(inputs.Count, "out", new[] { rows, n }, new[] { A(0), A(1) }, isOutput: true, elementType: type),
+            new[] { 2, 3 }, CodegenReduceKind.Sum, biasInput: bias ? 4 : null,
+            reductionRange: new CodegenReductionRange(2, 0, A(0)));
     }
 
     /// <summary>
@@ -605,13 +616,24 @@ public static class CodegenBackendPrograms
     /// toward zero, as the hand-written kernel's <c>(int)</c>), input [outer, axisIn, inner], out [outer, axisOut,
     /// inner] -- CudaBackend.TakeAlongDim's contract. An index outside [0, axisIn) yields 0, as there.
     /// </summary>
-    public static CodegenProgram TakeAlongDim(int outer, int axisOut, int inner, int axisIn)
+    public static CodegenProgram TakeAlongDim(int outer, int axisOut, int inner, int axisIn) =>
+        TakeAlongDim(outer, axisOut, inner, axisIn, floatIndices: true);
+
+    /// <summary>
+    /// <see cref="TakeAlongDim(int, int, int, int)"/> with int32 indices, in CudaBackend.Parity210TakeAlongDim's
+    /// contract (#1441): an index outside [0, axisIn) yields 0, as there.
+    /// </summary>
+    public static CodegenProgram TakeAlongDimInt(int outer, int axisOut, int inner, int axisIn) =>
+        TakeAlongDim(outer, axisOut, inner, axisIn, floatIndices: false);
+
+    private static CodegenProgram TakeAlongDim(int outer, int axisOut, int inner, int axisIn, bool floatIndices)
     {
         if (outer <= 0 || axisOut <= 0 || inner <= 0 || axisIn <= 0)
             throw new ArgumentOutOfRangeException(nameof(outer), "TakeAlongDim extents must be positive.");
         var space = new CodegenIterationSpace(CodegenAxis.Parallel("o", outer), CodegenAxis.Parallel("j", axisOut),
             CodegenAxis.Parallel("i", inner));
-        var indices = new CodegenTensorBinding(0, "indices", new[] { outer, axisOut, inner }, new[] { A(0), A(1), A(2) });
+        var indices = new CodegenTensorBinding(0, "indices", new[] { outer, axisOut, inner }, new[] { A(0), A(1), A(2) },
+            elementType: floatIndices ? CodegenElementType.Float32 : CodegenElementType.Int32);
         // The position of an index within the flat indices tensor: (o * axisOut + j) * inner + i.
         var position = new CodegenAffineExpr(new[]
         {
@@ -621,7 +643,7 @@ public static class CodegenBackendPrograms
             new[] { A(0), CodegenAffineExpr.Const(0), A(2) },
             indirect: new CodegenIndirectIndex?[]
             {
-                null, new CodegenIndirectIndex(0, position, axisIn, floatIndices: true), null,
+                null, new CodegenIndirectIndex(0, position, axisIn, floatIndices: floatIndices), null,
             });
         var output = new CodegenTensorBinding(2, "out", new[] { outer, axisOut, inner }, new[] { A(0), A(1), A(2) },
             isOutput: true);
@@ -962,14 +984,27 @@ public static class CodegenBackendPrograms
     /// gradient, as in the forward. Every product reads its operands in place -- no transposed copies.
     /// </summary>
     public static CodegenProgram ScaledDotProductAttentionBackward(int batch, int heads, int seqQ, int seqK, int headDim,
-        double scale)
+        double scale) =>
+        ScaledDotProductAttentionBackward(batch, heads, heads, seqQ, seqK, headDim, scale);
+
+    /// <summary>
+    /// <see cref="ScaledDotProductAttentionBackward(int, int, int, int, int, double)"/> with grouped key/value heads
+    /// (#1440), in CudaBackend.GroupedQueryAttentionBackward's contract: query head h reads key/value head h / g
+    /// (g = heads / kvHeads), so dq and dP read k and v there, and dk and dv [batch, kvHeads, seqK, headDim] sum over the
+    /// g query heads of each group as well as over the queries.
+    /// </summary>
+    public static CodegenProgram ScaledDotProductAttentionBackward(int batch, int heads, int kvHeads, int seqQ, int seqK,
+        int headDim, double scale)
     {
-        if (batch <= 0 || heads <= 0 || seqQ <= 0 || seqK <= 0 || headDim <= 0)
+        if (batch <= 0 || heads <= 0 || kvHeads <= 0 || seqQ <= 0 || seqK <= 0 || headDim <= 0)
             throw new ArgumentOutOfRangeException(nameof(batch), "Attention extents must be positive.");
-        var passes = AttentionBackwardPasses(batch, heads, seqQ, seqK, headDim, scale, "weights", rowdotFromOutput: false);
+        if (heads % kvHeads != 0) throw new ArgumentException("heads must be a multiple of kvHeads.", nameof(kvHeads));
+        var passes = AttentionBackwardPasses(batch, heads, seqQ, seqK, headDim, scale, "weights", rowdotFromOutput: false,
+            kvHeads: kvHeads);
         long p = (long)batch * heads * seqQ * seqK;
         return new CodegenProgram(passes, new[] { p, (long)batch * heads * seqQ, p },
-            "scaled dot-product attention backward (backend contract)");
+            kvHeads == heads ? "scaled dot-product attention backward (backend contract)"
+                : "grouped-query attention backward (backend contract)");
     }
 
     /// <summary>
@@ -1012,8 +1047,12 @@ public static class CodegenBackendPrograms
     // The backward's products from the weights tensor `weights`: dv, dP, the row term (sum_k P dP, or sum_e dout out),
     // dS, dq, dk.
     private static List<CodegenKernelSpec> AttentionBackwardPasses(int batch, int heads, int seqQ, int seqK, int headDim,
-        double scale, string weights, bool rowdotFromOutput)
+        double scale, string weights, bool rowdotFromOutput, int kvHeads = 0)
     {
+        if (kvHeads <= 0) kvHeads = heads;
+        int group = heads / kvHeads;
+        if (group > 1)
+            return GroupedAttentionBackwardPasses(batch, heads, kvHeads, seqQ, seqK, headDim, scale, weights, rowdotFromOutput);
         int[] qShape = { batch, heads, seqQ, headDim }, kShape = { batch, heads, seqK, headDim };
         int[] pShape = { batch, heads, seqQ, seqK };
         CodegenTensorBinding T(int parameter, string name, int[] shape, int a0, int a1, int a2, int a3, bool output = false) =>
@@ -1060,6 +1099,84 @@ public static class CodegenBackendPrograms
         passes.Add(new CodegenKernelSpec("attention_dk", Space("k", seqK, "d", headDim, "q", seqQ),
             new[] { T(0, "ds", pShape, 0, 1, 4, 2), T(1, "q", qShape, 0, 1, 4, 3) },
             T(2, "dk", kShape, 0, 1, 2, 3, output: true), new[] { 0, 1 }, CodegenReduceKind.Sum));
+        return passes;
+    }
+
+    // The grouped backward: k and v [batch, kvHeads, seqK, headDim] read at h / g; dv and dk reduce over (j, q) with the
+    // query head h = kvh * g + j, in increasing j then q.
+    private static List<CodegenKernelSpec> GroupedAttentionBackwardPasses(int batch, int heads, int kvHeads, int seqQ,
+        int seqK, int headDim, double scale, string weights, bool rowdotFromOutput)
+    {
+        int group = heads / kvHeads;
+        int[] qShape = { batch, heads, seqQ, headDim }, kvShape = { batch, kvHeads, seqK, headDim };
+        int[] pShape = { batch, heads, seqQ, seqK };
+        var kvHeadOf = new CodegenAffineExpr(new[] { new CodegenAffineTerm(1, 1) }, 0, group);
+        CodegenTensorBinding T(int parameter, string name, int[] shape, int a0, int a1, int a2, int a3, bool output = false) =>
+            new(parameter, name, shape, new[] { A(a0), A(a1), A(a2), A(a3) }, output);
+        CodegenIterationSpace Space(string m, int mExtent, string n, int nExtent, string r, int rExtent) =>
+            new(CodegenAxis.Parallel("b", batch), CodegenAxis.Parallel("h", heads), CodegenAxis.Parallel(m, mExtent),
+                CodegenAxis.Parallel(n, nExtent), CodegenAxis.Reduce(r, rExtent));
+        // The grouped reductions: b, kvh, m, n parallel; j (query head within the group), q reduced.
+        CodegenIterationSpace GroupSpace(string m, int mExtent, string n, int nExtent) =>
+            new(CodegenAxis.Parallel("b", batch), CodegenAxis.Parallel("kvh", kvHeads), CodegenAxis.Parallel(m, mExtent),
+                CodegenAxis.Parallel(n, nExtent), CodegenAxis.Reduce("j", group), CodegenAxis.Reduce("q", seqQ));
+        // The query head of a grouped reduction: kvh * g + j.
+        var headOfGroup = new CodegenAffineExpr(new[] { new CodegenAffineTerm(1, group), new CodegenAffineTerm(4, 1) }, 0);
+        var passes = new List<CodegenKernelSpec>();
+
+        // dv[b,kvh,k,e] = sum_j sum_q P[b,kvh*g+j,q,k] dout[b,kvh*g+j,q,e]
+        passes.Add(new CodegenKernelSpec("attention_dv_grouped", GroupSpace("k", seqK, "e", headDim),
+            new[]
+            {
+                new CodegenTensorBinding(0, weights, pShape, new[] { A(0), headOfGroup, A(5), A(2) }),
+                new CodegenTensorBinding(1, "dout", qShape, new[] { A(0), headOfGroup, A(5), A(3) }),
+            },
+            T(2, "dv", kvShape, 0, 1, 2, 3, output: true), new[] { 0, 1 }, CodegenReduceKind.Sum));
+        // dP[b,h,q,k] = sum_e dout[b,h,q,e] v[b,h/g,k,e]
+        passes.Add(new CodegenKernelSpec("attention_dp_grouped", Space("q", seqQ, "k", seqK, "e", headDim),
+            new[]
+            {
+                T(0, "dout", qShape, 0, 1, 2, 4),
+                new CodegenTensorBinding(1, "v", kvShape, new[] { A(0), kvHeadOf, A(3), A(4) }),
+            },
+            T(2, "dp", pShape, 0, 1, 2, 3, output: true), new[] { 0, 1 }, CodegenReduceKind.Sum));
+        // dot[b,h,q] = sum_k P dP (or sum_e dout out)
+        var dotSpace = new CodegenIterationSpace(CodegenAxis.Parallel("b", batch), CodegenAxis.Parallel("h", heads),
+            CodegenAxis.Parallel("q", seqQ), CodegenAxis.Reduce("k", rowdotFromOutput ? headDim : seqK));
+        passes.Add(new CodegenKernelSpec("attention_rowdot", dotSpace,
+            rowdotFromOutput
+                ? new[] { T(0, "dout", qShape, 0, 1, 2, 3), T(1, "out", qShape, 0, 1, 2, 3) }
+                : new[] { T(0, weights, pShape, 0, 1, 2, 3), T(1, "dp", pShape, 0, 1, 2, 3) },
+            new CodegenTensorBinding(2, "rowdot", new[] { batch, heads, seqQ }, new[] { A(0), A(1), A(2) }, isOutput: true),
+            new[] { 0, 1 }, CodegenReduceKind.Sum));
+        // dS = scale * P * (dP - dot)
+        var dsSpace = new CodegenIterationSpace(CodegenAxis.Parallel("b", batch), CodegenAxis.Parallel("h", heads),
+            CodegenAxis.Parallel("q", seqQ), CodegenAxis.Parallel("k", seqK));
+        var dsBody = CodegenExpr.Multiply(CodegenExpr.Multiply(CodegenExpr.Constant(scale), Op(0)),
+            CodegenExpr.Subtract(Op(1), Op(2)));
+        passes.Add(new CodegenKernelSpec("attention_ds", dsSpace,
+            new[]
+            {
+                T(0, weights, pShape, 0, 1, 2, 3), T(1, "dp", pShape, 0, 1, 2, 3),
+                new CodegenTensorBinding(2, "rowdot", new[] { batch, heads, seqQ }, new[] { A(0), A(1), A(2) }),
+            },
+            T(3, "ds", pShape, 0, 1, 2, 3, output: true), dsBody.Operands(), CodegenReduceKind.None, body: dsBody));
+        // dq[b,h,q,d] = sum_k dS[b,h,q,k] k[b,h/g,k,d]
+        passes.Add(new CodegenKernelSpec("attention_dq_grouped", Space("q", seqQ, "d", headDim, "k", seqK),
+            new[]
+            {
+                T(0, "ds", pShape, 0, 1, 2, 4),
+                new CodegenTensorBinding(1, "k", kvShape, new[] { A(0), kvHeadOf, A(4), A(3) }),
+            },
+            T(2, "dq", qShape, 0, 1, 2, 3, output: true), new[] { 0, 1 }, CodegenReduceKind.Sum));
+        // dk[b,kvh,k,d] = sum_j sum_q dS[b,kvh*g+j,q,k] q[b,kvh*g+j,q,d]
+        passes.Add(new CodegenKernelSpec("attention_dk_grouped", GroupSpace("k", seqK, "d", headDim),
+            new[]
+            {
+                new CodegenTensorBinding(0, "ds", pShape, new[] { A(0), headOfGroup, A(5), A(2) }),
+                new CodegenTensorBinding(1, "q", qShape, new[] { A(0), headOfGroup, A(5), A(3) }),
+            },
+            T(2, "dk", kvShape, 0, 1, 2, 3, output: true), new[] { 0, 1 }, CodegenReduceKind.Sum));
         return passes;
     }
 

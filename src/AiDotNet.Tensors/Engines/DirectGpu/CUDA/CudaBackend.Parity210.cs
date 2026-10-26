@@ -216,6 +216,8 @@ public sealed partial class CudaBackend : IParity210Backend
         IGpuBuffer input, IGpuBuffer indicesInt32, IGpuBuffer output,
         int outSize, int inputLinearLen)
     {
+        // Declared route (#1441): the embedding's gather at width 1.
+        if (TryDeclaredRowGather(indicesInt32, input, output, outSize, 1, inputLinearLen)) return;
         var kernel = ResolveParity210Kernel("parity210_take_linear");
         using var _ = PushContext();
         uint grid = (uint)((outSize + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -231,6 +233,7 @@ public sealed partial class CudaBackend : IParity210Backend
         IGpuBuffer input, IGpuBuffer indicesInt32, IGpuBuffer output,
         int outerSize, int idxAxis, int innerSize, int srcAxis)
     {
+        if (TryDeclaredTakeAlongDimInt(input, indicesInt32, output, outerSize, idxAxis, innerSize, srcAxis)) return;
         var kernel = ResolveParity210Kernel("parity210_take_along_dim");
         using var _ = PushContext();
         int total = outerSize * idxAxis * innerSize;
@@ -247,6 +250,8 @@ public sealed partial class CudaBackend : IParity210Backend
         IGpuBuffer output, IGpuBuffer indicesInt32, IGpuBuffer source,
         int outerSize, int dstAxis, int innerSize, int idxLen)
     {
+        // Declared route (#1441): fixed-order sums onto the destination, no atomic.
+        if (TryDeclaredIndexAdd(output, indicesInt32, source, outerSize, dstAxis, innerSize, idxLen)) return;
         var kernel = ResolveParity210Kernel("parity210_index_add");
         using var _ = PushContext();
         int total = outerSize * idxLen * innerSize;
@@ -263,6 +268,11 @@ public sealed partial class CudaBackend : IParity210Backend
         IGpuBuffer output, IGpuBuffer indicesInt32, IGpuBuffer source,
         int outerSize, int dstAxis, int innerSize, int idxLen)
     {
+        // Declared route (#1441): deterministic, the last duplicate index winning where the kernel races.
+        // Forced only: the fill measured 0.14-0.93x and the copy shares its incumbent's single pass.
+        if (ScatterRowsForced &&
+            TryDeclaredIndexWrite(output, indicesInt32, source, copy: true, 0f, outerSize, idxLen, innerSize, dstAxis))
+            return;
         var kernel = ResolveParity210Kernel("parity210_index_copy");
         using var _ = PushContext();
         int total = outerSize * idxLen * innerSize;
@@ -279,6 +289,9 @@ public sealed partial class CudaBackend : IParity210Backend
         IGpuBuffer output, IGpuBuffer indicesInt32, float fillValue,
         int outerSize, int dstAxis, int innerSize, int idxLen)
     {
+        if (ScatterRowsForced &&
+            TryDeclaredIndexWrite(output, indicesInt32, null, copy: false, fillValue, outerSize, idxLen, innerSize, dstAxis))
+            return;
         var kernel = ResolveParity210Kernel("parity210_index_fill");
         using var _ = PushContext();
         int total = outerSize * idxLen * innerSize;
@@ -296,6 +309,8 @@ public sealed partial class CudaBackend : IParity210Backend
         IGpuBuffer output, IGpuBuffer maskInt8, IGpuBuffer prefixSumInt32,
         IGpuBuffer source, int total)
     {
+        // Declared route (#1441).
+        if (TryDeclaredMaskedScatter(output, maskInt8, prefixSumInt32, source, total)) return;
         var kernel = ResolveParity210Kernel("parity210_masked_scatter");
         using var _ = PushContext();
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
