@@ -119,7 +119,7 @@ internal static class TensorManipOperators
             var raw = new int[rank];
             var span = shapeTensor.AsSpan();
             for (int i = 0; i < rank; i++)
-                raw[i] = Convert.ToInt32(span[i]!);
+                raw[i] = checked((int)Math.Round(AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<T>().ToDouble(span[i])));
 
             var result = new int[rank];
             int inferAt = -1;
@@ -491,7 +491,7 @@ internal static class TensorManipOperators
                     var idxArr = new int[idxSrc.Length];
                     for (int i = 0; i < idxSrc.Length; i++)
                     {
-                        double v = Convert.ToDouble(idxSrc[i]!);
+                        double v = AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<T>().ToDouble(idxSrc[i]);
                         idxArr[i] = v >= int.MaxValue ? int.MaxValue
                                   : v <= int.MinValue ? int.MinValue
                                   : (int)Math.Round(v);
@@ -669,7 +669,7 @@ internal static class TensorManipOperators
 
     // ─── Helpers ────────────────────────────────────────────────────────
 
-    private static int[] ToInt32Array<T>(Tensor<T> t) where T : unmanaged
+    internal static int[] ToInt32Array<T>(Tensor<T> t) where T : unmanaged
     {
         var span = t.AsSpan();
         var result = new int[span.Length];
@@ -679,7 +679,7 @@ internal static class TensorManipOperators
             // int64 "starts" / "ends" inputs. Loaded as float those look
             // like ±9.2e18; clamp to int range so the downstream slice
             // logic treats them as "clip to dim length" naturally.
-            double d = Convert.ToDouble(span[i]!);
+            double d = AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<T>().ToDouble(span[i]);
             if (d >= int.MaxValue) result[i] = int.MaxValue;
             else if (d <= int.MinValue) result[i] = int.MinValue;
             else result[i] = (int)Math.Round(d);
@@ -707,7 +707,7 @@ internal static class TensorManipOperators
         // Gather we need Tensor<int>. Materialize a plain int[] once up front.
         var src = t.AsSpan();
         var dst = new int[src.Length];
-        for (int i = 0; i < src.Length; i++) dst[i] = Convert.ToInt32(src[i]!);
+        for (int i = 0; i < src.Length; i++) dst[i] = checked((int)Math.Round(AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<T>().ToDouble(src[i])));
         return new Tensor<int>(t._shape, new Vector<int>(dst));
     }
 }

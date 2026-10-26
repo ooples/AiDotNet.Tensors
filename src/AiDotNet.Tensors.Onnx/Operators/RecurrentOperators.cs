@@ -621,7 +621,7 @@ internal static class RecurrentOperators
         var result = new int[span.Length];
         for (int i = 0; i < span.Length; i++)
         {
-            double v = Convert.ToDouble(span[i]!);
+            double v = AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<T>().ToDouble(span[i]);
             result[i] = (int)Math.Round(v);
         }
         return result;

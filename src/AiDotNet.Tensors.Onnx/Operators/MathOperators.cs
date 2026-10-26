@@ -76,7 +76,7 @@ internal static class MathOperators
 
             var shapeSpan = shapeT.AsSpan();
             var shape = new int[shapeSpan.Length];
-            for (int i = 0; i < shapeSpan.Length; i++) shape[i] = Convert.ToInt32(shapeSpan[i]!);
+            for (int i = 0; i < shapeSpan.Length; i++) shape[i] = checked((int)Math.Round(AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<T>().ToDouble(shapeSpan[i])));
 
             // "value" attribute is a TensorProto with a single element. Default = 0.
             var valueAttr = ctx.GetAttribute(node, "value");
@@ -87,7 +87,7 @@ internal static class MathOperators
                 var constTensor = InitializerLoader.Load<T>(valueAttr.T);
                 var v = constTensor.AsSpan()[0];
                 ctx.PutTensor(node.Output[0], FillTensor<T>(shape,
-                    Convert.ToDouble(v!)));
+                    AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<T>().ToDouble(v)));
                 return;
             }
             ctx.PutTensor(node.Output[0], FillTensor<T>(shape, value));
@@ -425,7 +425,7 @@ internal static class MathOperators
         {
             for (int i = 0; i < indexSpan.Length; i++)
             {
-                int indexValue = Convert.ToInt32(indexSpan[i]!);
+                int indexValue = checked((int)Math.Round(AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<T>().ToDouble(indexSpan[i])));
                 if (indexValue < 0) indexValue += depth;
                 if (indexValue < 0 || indexValue >= depth) continue;
 
@@ -621,7 +621,7 @@ internal static class MathOperators
     {
         var span = t.AsSpan();
         var result = new int[span.Length];
-        for (int i = 0; i < span.Length; i++) result[i] = Convert.ToInt32(span[i]!);
+        for (int i = 0; i < span.Length; i++) result[i] = checked((int)Math.Round(AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<T>().ToDouble(span[i])));
         return result;
     }
 
