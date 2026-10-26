@@ -66,6 +66,29 @@ public sealed class Fp16AccumulateRoutingTests
         Assert.False(Run(V(1.2, 0.85), V(1.01, 1.0)).Wins);
     }
 
+    // A device whose FP32 accumulation already issues at the FP16 rate (a datacenter part, or an unlocked GeForce card)
+    // cannot gain: the first call keeps cuBLAS without tuning, and says why.
+    [SkippableFact]
+    public void FullRateFp32Accumulation_KeepsCublas_WithoutTuning()
+    {
+        using var backend = RequireAmpereBackend();
+        backend.ForceMmaRateForTests(120, 123);
+        const int m = 1024, n = 1024, k = 1024;
+        using var da = backend.AllocateByteBuffer(m * k * 2);
+        using var db = backend.AllocateByteBuffer(k * n * 2);
+        using var dc = backend.AllocateBuffer(m * n);
+        backend.UploadBytes(da, HalfBytes(Enumerable.Repeat((Half)0.5f, m * k).ToArray()));
+        backend.UploadBytes(db, HalfBytes(Enumerable.Repeat((Half)0.25f, k * n).ToArray()));
+        long before = backend.Fp16AccumulateDispatchCount;
+        backend.GemmFp16In32fOut(da, db, dc, m, n, k);
+        var verdict = backend.Fp16AccumulateVerdict(m, n, k);
+        Assert.True(verdict.HasValue);
+        Assert.False(verdict!.Value.Routed);
+        Assert.Contains("FP16 rate", verdict.Value.Reason);
+        Assert.Equal(before, backend.Fp16AccumulateDispatchCount);
+        Assert.All(backend.DownloadBuffer(dc), v => Assert.Equal(0.125f * k, v));
+    }
+
     [SkippableFact]
     public void LargeShape_IsEvaluated_AndAgreesWithTheFp64Reference()
     {

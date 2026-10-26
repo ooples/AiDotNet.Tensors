@@ -22,12 +22,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 /// non-finite accumulator after the loop means an FP16 partial overflowed or an operand was already non-finite), and a
 /// block that sees one recomputes its tile with FP32 accumulation, so the output never depends on operand magnitude.
 /// The first eager call of a large shape times candidates against cuBLAS in paired rounds and routes the shape only
-/// when the best one wins; the verdict lives for the process. AIDOTNET_FP16_ACCUMULATE=0 turns it off.
+/// when the best one wins; the verdict lives for the process. Before the first such measurement the device's MMA issue
+/// rates are probed once (<see cref="PtxMmaRateProbe"/>): where FP32 accumulation already issues at the FP16 rate (a
+/// datacenter or workstation part, or a GeForce card unlocked by a speed-select module) nothing can double and no shape
+/// is tuned. AIDOTNET_FP16_ACCUMULATE=0 turns the route off; =1 tunes even at full rate.
 /// </summary>
 public sealed partial class CudaBackend
 {
     private static readonly bool s_fp16AccumulateEnabled =
         Environment.GetEnvironmentVariable("AIDOTNET_FP16_ACCUMULATE") != "0";
+    private static readonly bool s_fp16AccumulateForced =
+        Environment.GetEnvironmentVariable("AIDOTNET_FP16_ACCUMULATE") == "1";
 
     // Below this much work the GEMM is bound by memory or latency, not the MMA rate, so FP16 accumulation buys nothing
     // (RTX 3080 probe: 3136x64x576 0.99x), and timing it against cuBLAS would cost more than it can return.
@@ -46,7 +51,7 @@ public sealed partial class CudaBackend
         new(64, 64, 16, 32, 32, 3, 8),
     };
 
-    private const string Fp16AccumulateRouteVariant = "cuda-fp16acc-route-v2";
+    private const string Fp16AccumulateRouteVariant = "cuda-fp16acc-route-v3";
     private static readonly KernelId Fp16AccumulateRouteKernelId = new("gemm", "cuda-ptx-fp16acc-route");
 
     private sealed class Fp16AccumulateRoute : IDisposable
@@ -66,6 +71,7 @@ public sealed partial class CudaBackend
 
     private readonly ConcurrentDictionary<(int M, int N, int K, bool HalfOutput), Fp16AccumulateRoute> _fp16AccumulateRoutes = new();
     private readonly object _fp16AccumulateTuneLock = new();
+    private PtxMmaRateProbe.Result? _mmaRate;   // measured once, under _fp16AccumulateTuneLock
     private long _fp16AccumulateDispatchCount;
 
     /// <summary>Routed FP16-accumulate GEMM launches on this backend (test and diagnostics hook).</summary>
@@ -108,9 +114,11 @@ public sealed partial class CudaBackend
             {
                 if (!_fp16AccumulateRoutes.TryGetValue((m, n, k, halfOutput), out route))
                 {
-                    // A verdict persisted by TuneFp16AccumulateRouteAsync (an evolved kernel for this device) wins over
-                    // the quick pick among a few fixed candidates.
-                    route = TryLoadPersistedFp16AccumulateRoute(m, n, k, halfOutput) ??
+                    // Where FP32 accumulation already issues at full rate nothing can double: no shape is tuned. A
+                    // verdict persisted by TuneFp16AccumulateRouteAsync (an evolved kernel for this device and rate)
+                    // wins over the quick pick among a few fixed candidates.
+                    route = Fp16AccumulateRateRejection() ??
+                            TryLoadPersistedFp16AccumulateRoute(m, n, k, halfOutput) ??
                             TuneFp16AccumulateRoute(a, b, c, m, n, k, halfOutput);
                     _fp16AccumulateRoutes[(m, n, k, halfOutput)] = route;
                 }
@@ -120,6 +128,50 @@ public sealed partial class CudaBackend
         LaunchFp16Accumulate(route.Kernel, a, b, c, m, n, k);
         Interlocked.Increment(ref _fp16AccumulateDispatchCount);
         return true;
+    }
+
+    /// <summary>
+    /// Measures this device's tensor-core issue rate for FP16 MMA with FP32 accumulation and with FP16 accumulation
+    /// (#1549). On GeForce cards the FP32-accumulate form issues at a fraction of the FP16-accumulate rate (RTX 3080:
+    /// about 62 against 123 TFLOP/s); datacenter and workstation parts, and GeForce cards unlocked by a speed-select
+    /// module, issue both at the same rate. Takes a few hundred milliseconds; needs compute capability 8.0+.
+    /// </summary>
+    public (double Fp32AccumulateTflops, double Fp16AccumulateTflops, bool Fp32AccumulateIsFullRate)
+        MeasureTensorCoreAccumulateRates()
+    {
+        if (!IsAvailable) throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
+        var result = PtxMmaRateProbe.Measure(GetDirectPtxRuntime());
+        return (result.Fp32AccumulateTflops, result.Fp16AccumulateTflops, result.Fp32AccumulateIsFullRate);
+    }
+
+    // The device's rate class, measured on first use (null when the probe cannot run here).
+    private PtxMmaRateProbe.Result? MmaRate()
+    {
+        if (_mmaRate is null)
+        {
+            try
+            {
+                _mmaRate = PtxMmaRateProbe.Measure(GetDirectPtxRuntime());
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException or DllNotFoundException)
+            {
+                return null;
+            }
+        }
+        return _mmaRate;
+    }
+
+    /// <summary>Tests: the rate the route believes this device has (as if measured), e.g. an unlocked card's.</summary>
+    internal void ForceMmaRateForTests(double fp32AccumulateTflops, double fp16AccumulateTflops) =>
+        _mmaRate = new PtxMmaRateProbe.Result(fp32AccumulateTflops, fp16AccumulateTflops);
+
+    // A route that keeps cuBLAS because FP32 accumulation already runs at full rate, or null to go on.
+    private Fp16AccumulateRoute? Fp16AccumulateRateRejection()
+    {
+        if (s_fp16AccumulateForced || MmaRate() is not { Fp32AccumulateIsFullRate: true } rate) return null;
+        return new Fp16AccumulateRoute(null,
+            $"FP32 accumulation already issues at the FP16 rate on this device ({rate.Fp32AccumulateTflops:F0} against " +
+            $"{rate.Fp16AccumulateTflops:F0} TFLOP/s): FP16 accumulation cannot double it", 0);
     }
 
     private void LaunchFp16Accumulate(PtxTensorCoreGemmKernel kernel, IGpuBuffer a, IGpuBuffer b, IGpuBuffer c,
@@ -288,6 +340,7 @@ public sealed partial class CudaBackend
                 Parameters = new Dictionary<string, string>(StringComparer.Ordinal)
                 {
                     ["device"] = PtxGemmEvolution.Fingerprint(runtime).LocalKey,
+                    ["mma-rate"] = MmaRate()?.RateClass ?? "unknown",
                     ["route"] = route.Kernel is not null ? "ptx" : "cublas",
                     ["kernel"] = chosen.Name,
                     ["genome"] = PtxTensorCoreGemmEvolution.GenomeCodec.Serialize(chosen),
@@ -321,6 +374,8 @@ public sealed partial class CudaBackend
         {
             DirectPtxRuntime runtime = GetDirectPtxRuntime();
             if (!Matches(p, "device", PtxGemmEvolution.Fingerprint(runtime).LocalKey)) return null;
+            // A verdict measured at another MMA rate (the card was unlocked or relocked since) is stale.
+            if (!Matches(p, "mma-rate", MmaRate()?.RateClass ?? "unknown")) return null;
             string reason = p.TryGetValue("reason", out string? r) ? "persisted: " + r : "persisted";
             double median = p.TryGetValue("median-speedup", out string? ms) &&
                 double.TryParse(ms, NumberStyles.Float, CultureInfo.InvariantCulture, out double parsed) ? parsed : 0;
