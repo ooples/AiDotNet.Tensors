@@ -58,23 +58,26 @@ internal sealed class PtxTensorCoreGemmKernel : IDisposable
     {
         if (Fp16AccumulateGuard)
             throw new InvalidOperationException("A guarded FP16-accumulate GEMM needs the max-abs pointers (LaunchGuarded).");
-        LaunchCore(a, b, c, m, n, k, lda, ldb, ldc, alpha, beta, batch, strideA, strideB, strideC, IntPtr.Zero, IntPtr.Zero);
+        LaunchCore(a, b, c, m, n, k, lda, ldb, ldc, alpha, beta, batch, strideA, strideB, strideC, IntPtr.Zero, IntPtr.Zero,
+            IntPtr.Zero);
     }
 
     /// <summary>
     /// <see cref="Launch"/> for a guarded FP16-accumulate kernel: <paramref name="amaxA"/> and <paramref name="amaxB"/> are
     /// device addresses of u32 words whose low 16 bits are the FP16 bit patterns of max|A| and max|B| over the operands.
+    /// <paramref name="stream"/> must be the stream the max-abs reductions ran on (zero: the runtime's stream).
     /// </summary>
     internal void LaunchGuarded(IntPtr a, IntPtr b, IntPtr c, int m, int n, int k, int lda, int ldb, int ldc,
-        float alpha, float beta, IntPtr amaxA, IntPtr amaxB, int batch = 1, long strideA = 0, long strideB = 0, long strideC = 0)
+        float alpha, float beta, IntPtr amaxA, IntPtr amaxB, int batch = 1, long strideA = 0, long strideB = 0, long strideC = 0,
+        IntPtr stream = default)
     {
         if (!Fp16AccumulateGuard) throw new InvalidOperationException("This kernel is not a guarded FP16-accumulate GEMM.");
         if (amaxA == IntPtr.Zero || amaxB == IntPtr.Zero) throw new ArgumentException("The max-abs pointers must be device addresses.");
-        LaunchCore(a, b, c, m, n, k, lda, ldb, ldc, alpha, beta, batch, strideA, strideB, strideC, amaxA, amaxB);
+        LaunchCore(a, b, c, m, n, k, lda, ldb, ldc, alpha, beta, batch, strideA, strideB, strideC, amaxA, amaxB, stream);
     }
 
     private unsafe void LaunchCore(IntPtr a, IntPtr b, IntPtr c, int m, int n, int k, int lda, int ldb, int ldc,
-        float alpha, float beta, int batch, long strideA, long strideB, long strideC, IntPtr amaxA, IntPtr amaxB)
+        float alpha, float beta, int batch, long strideA, long strideB, long strideC, IntPtr amaxA, IntPtr amaxB, IntPtr stream)
     {
         if (batch < 1 || batch > 65535) throw new ArgumentOutOfRangeException(nameof(batch));
         if (!PtxTensorCoreGemmGenerator.Admits(Configuration, Layout, m, n, k, lda, ldb, ldc, strideA, strideB, strideC, Precision))
@@ -105,7 +108,7 @@ internal sealed class PtxTensorCoreGemmKernel : IDisposable
         arguments[15] = &amaxBPointer;
         uint gridX = (uint)((n + Configuration.BlockN - 1) / Configuration.BlockN);
         uint gridY = (uint)((m + Configuration.BlockM - 1) / Configuration.BlockM);
-        _module.Launch(_function, gridX, gridY, (uint)batch, (uint)Configuration.Threads, 1, 1, _sharedBytes, arguments);
+        _module.Launch(_function, gridX, gridY, (uint)batch, (uint)Configuration.Threads, 1, 1, _sharedBytes, arguments, stream);
     }
 
     public void Dispose() => _module.Dispose();

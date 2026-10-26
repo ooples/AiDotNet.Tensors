@@ -297,54 +297,73 @@ internal static class PtxTensorCoreGemmGenerator
             L($"setp.eq.u32 {empty}, {tiles}, 0;");
             L($"@{empty} bra EPILOGUE;");
 
-            // Prologue: tiles 0 .. Stages-2 in flight (a group per tile, empty past the last tile).
-            L($"mov.u32 {k0}, 0;");
-            for (int s = 0; s < _c.Stages - 1; s++)
+            // The main loop. Guarded: the device-side bound picks one of two complete copies once per launch (FP16 or FP32
+            // accumulation), so the loop that runs has no per-step branch and matches the unguarded kernel instruction for
+            // instruction.
+            void MainLoop(string suffix, bool halfMode)
             {
-                string issue = P();
-                L($"setp.gt.u32 {issue}, {tiles}, {I(s)};");
-                IssueTile(a, I(s * stageBytesA), k0, k, issue);
-                IssueTile(b, I(s * stageBytesB), k0, k, issue);
-                L("cp.async.commit_group;");
-                if (s < _c.Stages - 2)
+                // Prologue: tiles 0 .. Stages-2 in flight (a group per tile, empty past the last tile).
+                L($"mov.u32 {k0}, 0;");
+                for (int s = 0; s < _c.Stages - 1; s++)
                 {
+                    string issue = P();
+                    L($"setp.gt.u32 {issue}, {tiles}, {I(s)};");
+                    IssueTile(a, I(s * stageBytesA), k0, k, issue);
+                    IssueTile(b, I(s * stageBytesB), k0, k, issue);
+                    L("cp.async.commit_group;");
+                    if (s < _c.Stages - 2)
+                    {
+                        Advance(a);
+                        Advance(b);
+                        L($"add.u32 {k0}, {k0}, {I(_c.BlockK)};");
+                    }
+                }
+                L($"mov.u32 {tile}, 0;");
+
+                Label("K_LOOP" + suffix);
+                L($"cp.async.wait_group {I(_c.Stages - 2)};");
+                L("bar.sync 0;");
+                {
+                    // Issue tile (tile + Stages - 1) into stage (tile + Stages - 1) % Stages, then compute stage tile % Stages.
+                    string next = R(), issueStage = R(), issue = P(), nextK0 = R();
+                    L($"add.u32 {next}, {tile}, {I(_c.Stages - 1)};");
+                    L($"setp.lt.u32 {issue}, {next}, {tiles};");
+                    L($"rem.u32 {issueStage}, {next}, {I(_c.Stages)};");
+                    L($"mul.lo.u32 {nextK0}, {next}, {I(_c.BlockK)};");
                     Advance(a);
                     Advance(b);
-                    L($"add.u32 {k0}, {k0}, {I(_c.BlockK)};");
+                    string offA = R(), offB = R();
+                    L($"mul.lo.u32 {offA}, {issueStage}, {I(stageBytesA)};");
+                    L($"mul.lo.u32 {offB}, {issueStage}, {I(stageBytesB)};");
+                    IssueTile(a, offA, nextK0, k, issue);
+                    IssueTile(b, offB, nextK0, k, issue);
+                    L("cp.async.commit_group;");
+
+                    string computeStage = R(), stageA = R(), stageB = R();
+                    L($"rem.u32 {computeStage}, {tile}, {I(_c.Stages)};");
+                    L($"mad.lo.u32 {stageA}, {computeStage}, {I(stageBytesA)}, {aFrag};");
+                    L($"mad.lo.u32 {stageB}, {computeStage}, {I(stageBytesB)}, {bFrag};");
+                    Compute(a, b, stageA, stageB, acc, halfMode);
                 }
+                string more = P();
+                L($"add.u32 {tile}, {tile}, 1;");
+                L($"setp.lt.u32 {more}, {tile}, {tiles};");
+                L($"@{more} bra K_LOOP{suffix};");
+                L("cp.async.wait_group 0;");
             }
-            L($"mov.u32 {tile}, 0;");
 
-            Label("K_LOOP");
-            L($"cp.async.wait_group {I(_c.Stages - 2)};");
-            L("bar.sync 0;");
+            if (_guard)
             {
-                // Issue tile (tile + Stages - 1) into stage (tile + Stages - 1) % Stages, then compute stage tile % Stages.
-                string next = R(), issueStage = R(), issue = P(), nextK0 = R();
-                L($"add.u32 {next}, {tile}, {I(_c.Stages - 1)};");
-                L($"setp.lt.u32 {issue}, {next}, {tiles};");
-                L($"rem.u32 {issueStage}, {next}, {I(_c.Stages)};");
-                L($"mul.lo.u32 {nextK0}, {next}, {I(_c.BlockK)};");
-                Advance(a);
-                Advance(b);
-                string offA = R(), offB = R();
-                L($"mul.lo.u32 {offA}, {issueStage}, {I(stageBytesA)};");
-                L($"mul.lo.u32 {offB}, {issueStage}, {I(stageBytesB)};");
-                IssueTile(a, offA, nextK0, k, issue);
-                IssueTile(b, offB, nextK0, k, issue);
-                L("cp.async.commit_group;");
-
-                string computeStage = R(), stageA = R(), stageB = R();
-                L($"rem.u32 {computeStage}, {tile}, {I(_c.Stages)};");
-                L($"mad.lo.u32 {stageA}, {computeStage}, {I(stageBytesA)}, {aFrag};");
-                L($"mad.lo.u32 {stageB}, {computeStage}, {I(stageBytesB)}, {bFrag};");
-                Compute(a, b, stageA, stageB, acc);
+                L($"@!{_useHalf} bra MAIN_F32;");
+                MainLoop("_F16", halfMode: true);
+                L("bra EPILOGUE;");
+                Label("MAIN_F32");
+                MainLoop("_F32", halfMode: false);
             }
-            string more = P();
-            L($"add.u32 {tile}, {tile}, 1;");
-            L($"setp.lt.u32 {more}, {tile}, {tiles};");
-            L($"@{more} bra K_LOOP;");
-            L("cp.async.wait_group 0;");
+            else
+            {
+                MainLoop("", halfMode: _fp16Accumulate);
+            }
 
             Label("EPILOGUE");
             Epilogue(cPtr, m, n, ldc, alpha, beta, bm, bn, warpM0, warpN0, gid, tig, acc);
@@ -527,7 +546,7 @@ internal static class PtxTensorCoreGemmGenerator
             L($"mov.b32 {destination}, {{{lo}, {hi}}};");
         }
 
-        private void Compute(Operand a, Operand b, string stageA, string stageB, string[] acc)
+        private void Compute(Operand a, Operand b, string stageA, string stageB, string[] acc, bool halfMode)
         {
             int tilesM = _c.TilesM, tilesN = _c.TilesN;
             var fa = new string[tilesM, 4];
@@ -542,7 +561,7 @@ internal static class PtxTensorCoreGemmGenerator
                 : "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32";
             // FP16 accumulation: two packed half2 registers per m16n8 tile ({d0, d1}, {d2, d3}), zeroed for this K tile.
             string[] half = Array.Empty<string>();
-            if (_fp16Accumulate)
+            if (halfMode)
             {
                 half = new string[tilesM * tilesN * 2];
                 for (int i = 0; i < half.Length; i++)
@@ -581,10 +600,7 @@ internal static class PtxTensorCoreGemmGenerator
                     LoadFragment(b, stageB, column, kBase, fb[nt, 0], scratch);
                     LoadFragment(b, stageB, column, kBase + kHalf, fb[nt, 1], scratch);
                 }
-                // Guarded: a uniform branch (the predicate is the same for the whole launch) picks the MMA form.
-                string fp32Label = "MMA_F32_" + I(kk), doneLabel = "MMA_DONE_" + I(kk);
-                if (_guard) L($"@!{_useHalf} bra {fp32Label};");
-                if (_fp16Accumulate)
+                if (halfMode)
                 {
                     for (int mt = 0; mt < tilesM; mt++)
                         for (int nt = 0; nt < tilesN; nt++)
@@ -593,10 +609,8 @@ internal static class PtxTensorCoreGemmGenerator
                             string dh = $"{{{half[h]}, {half[h + 1]}}}";
                             L($"mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {dh}, {{{fa[mt, 0]}, {fa[mt, 1]}, {fa[mt, 2]}, {fa[mt, 3]}}}, {{{fb[nt, 0]}, {fb[nt, 1]}}}, {dh};");
                         }
-                    if (_guard) L($"bra {doneLabel};");
                 }
-                if (_guard) Label(fp32Label);
-                if (!_fp16Accumulate || _guard)
+                else
                 {
                     for (int mt = 0; mt < tilesM; mt++)
                         for (int nt = 0; nt < tilesN; nt++)
@@ -606,15 +620,12 @@ internal static class PtxTensorCoreGemmGenerator
                             L($"{mma} {d}, {{{fa[mt, 0]}, {fa[mt, 1]}, {fa[mt, 2]}, {fa[mt, 3]}}}, {{{fb[nt, 0]}, {fb[nt, 1]}}}, {d};");
                         }
                 }
-                if (_guard) Label(doneLabel);
             }
 
             // Promote this K tile's FP16 partial sums into the FP32 accumulators. A half2 register holds {d0, d1} (or
             // {d2, d3}) low then high, matching the FP32 accumulators' order.
-            if (_fp16Accumulate)
+            if (halfMode)
             {
-                // Guarded: on the FP32 path the half accumulators stayed zero, so promoting them adds zero; skip it.
-                if (_guard) L($"@!{_useHalf} bra PROMOTE_DONE;");
                 for (int t = 0; t < tilesM * tilesN; t++)
                     for (int pair = 0; pair < 2; pair++)
                     {
@@ -626,7 +637,6 @@ internal static class PtxTensorCoreGemmGenerator
                         L($"add.rn.f32 {acc[c]}, {acc[c]}, {flo};");
                         L($"add.rn.f32 {acc[c + 1]}, {acc[c + 1]}, {fhi};");
                     }
-                if (_guard) Label("PROMOTE_DONE");
             }
         }
 

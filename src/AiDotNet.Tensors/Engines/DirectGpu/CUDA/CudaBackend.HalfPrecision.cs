@@ -94,8 +94,18 @@ public sealed partial class CudaBackend
     }
 
     /// <inheritdoc/>
-    public unsafe void GemmFp16In32fOut(IGpuBuffer aFp16, IGpuBuffer bFp16, IGpuBuffer cFp32,
+    public void GemmFp16In32fOut(IGpuBuffer aFp16, IGpuBuffer bFp16, IGpuBuffer cFp32,
         int m, int n, int k)
+        => GemmFp16In32fOut(aFp16, bFp16, cFp32, m, n, k, IntPtr.Zero, IntPtr.Zero);
+
+    /// <summary>
+    /// <see cref="GemmFp16In32fOut(IGpuBuffer, IGpuBuffer, IGpuBuffer, int, int, int)"/> with cached operand bounds for
+    /// the FP16-accumulate route (#1549): <paramref name="amaxA"/> / <paramref name="amaxB"/>, when not zero, are device
+    /// words holding max|A| / max|B| as FP16 bit patterns (see <see cref="AbsMaxFp16Bits"/>), current for the operand's
+    /// contents, so the route skips that operand's reduction. A caller caches one for a weight it converts once.
+    /// </summary>
+    internal unsafe void GemmFp16In32fOut(IGpuBuffer aFp16, IGpuBuffer bFp16, IGpuBuffer cFp32,
+        int m, int n, int k, IntPtr amaxA, IntPtr amaxB)
     {
         if (!SupportsHgemm)
             throw new NotSupportedException(
@@ -112,7 +122,14 @@ public sealed partial class CudaBackend
 
         if (TryDirectPtxFp16Gemm(aFp16, bFp16, cFp32, m, n, k))
             return;
+        if (TryFp16AccumulateGemm(aFp16, bFp16, cFp32, m, n, k, amaxA, amaxB))
+            return;
+        CublasGemmFp16In32fOut(aFp16, bFp16, cFp32, m, n, k);
+    }
 
+    // cuBLAS FP16 in, FP32 accumulate, FP32 out (row-major C = A @ B).
+    private unsafe void CublasGemmFp16In32fOut(IGpuBuffer aFp16, IGpuBuffer bFp16, IGpuBuffer cFp32, int m, int n, int k)
+    {
         using var _ = PushContext();
         // GemmEx needs alpha/beta as POINTERS to scalars in the
         // accumulator type — FP32 here (computeType = COMPUTE_32F).

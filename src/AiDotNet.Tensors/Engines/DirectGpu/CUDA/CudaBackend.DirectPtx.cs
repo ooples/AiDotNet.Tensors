@@ -6735,6 +6735,7 @@ public sealed partial class CudaBackend
             _directPtxStridedDotKernels.Dispose();
             _directPtxCrossEntropyKernels.Dispose();
             _directPtxFp16GemmKernels.Dispose();
+        DisposeFp16AccumulateRoutes();
             _directPtxGemmKernels.Dispose();
             DisposeGemmRoutes();
             DisposeFallbackGemmKernels();
