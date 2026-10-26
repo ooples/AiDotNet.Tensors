@@ -5504,6 +5504,36 @@ fn update_traces(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// <summary>
     /// Batched matrix multiplication kernel.
     /// </summary>
+    // The FP16 im2col conv's per-image GEMM (IFp16ConvBatchedGemmBackend): C[M, N] = A[M, K] . B[K, N] with N = batch * P,
+    // stored NCHW - column n = b * P + p of row i goes to C[(b * M + i) * P + p]. Halves are f32 with a truncated mantissa
+    // on this backend, so the operands are plain f32 arrays.
+    public const string ConvGemmNchwSource = @"
+@group(0) @binding(0) var<storage, read> A: array<f32>;
+@group(0) @binding(1) var<storage, read> B: array<f32>;
+@group(0) @binding(2) var<storage, read_write> C: array<f32>;
+
+struct ConvGemmParams {
+    M: u32,
+    N: u32,
+    K: u32,
+    P: u32,
+}
+@group(0) @binding(3) var<uniform> params: ConvGemmParams;
+
+@compute @workgroup_size(256)
+fn conv_gemm_nchw(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.M * params.N) { return; }
+    let row = idx / params.N;
+    let col = idx % params.N;
+    var acc: f32 = 0.0;
+    for (var k: u32 = 0u; k < params.K; k = k + 1u) {
+        acc = acc + A[row * params.K + k] * B[k * params.N + col];
+    }
+    C[((col / params.P) * params.M + row) * params.P + col % params.P] = acc;
+}
+";
+
     public const string BatchedGemmSource = @"
 @group(0) @binding(0) var<storage, read> A: array<f32>;
 @group(0) @binding(1) var<storage, read> B: array<f32>;

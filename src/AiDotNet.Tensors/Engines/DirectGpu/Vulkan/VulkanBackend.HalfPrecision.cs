@@ -21,7 +21,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 /// compilation; <see cref="SupportsHgemm"/> reflects that.
 /// </para>
 /// </summary>
-public sealed partial class VulkanBackend : IGpuHalfPrecisionBackend
+public sealed partial class VulkanBackend : IGpuHalfPrecisionBackend, IFp16ConvBatchedGemmBackend
 {
     /// <inheritdoc/>
     /// <remarks>
@@ -106,6 +106,38 @@ public sealed partial class VulkanBackend : IGpuHalfPrecisionBackend
         if (!TryGlslGemmFp16In32fOut(aFp16, bFp16, cFp32, m, n, k))
             throw new NotSupportedException(
                 "Vulkan FP16 GEMM requires libshaderc for runtime GLSL compilation, which is unavailable.");
+    }
+
+    /// <inheritdoc/>
+    public void GemmFp16ConvBatched(IGpuBuffer weightsFp16, IGpuBuffer colFp16, IGpuBuffer output, int m, int pixels, int k,
+        int batch, bool halfOutput)
+    {
+        if (weightsFp16 is null) throw new ArgumentNullException(nameof(weightsFp16));
+        if (colFp16 is null) throw new ArgumentNullException(nameof(colFp16));
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (m <= 0 || pixels <= 0 || k <= 0 || batch <= 0)
+            throw new ArgumentException($"GEMM dims must be positive (M={m}, pixels={pixels}, K={k}, batch={batch}).");
+        int n = checked(batch * pixels);
+        if (halfOutput)
+        {
+            PortableFp16Activation.ConvGemmHalfOut(this, output, checked(m * n),
+                scratch => GemmFp16ConvBatched(weightsFp16, colFp16, scratch, m, pixels, k, batch, halfOutput: false));
+            return;
+        }
+        var pipeline = GetOrCreateGlslPipeline(VulkanGemmKernels.GemmFp16In32fOutNchw, 3, 4 * sizeof(uint));
+        if (pipeline is null)
+            throw new NotSupportedException(
+                "Vulkan FP16 GEMM requires libshaderc for runtime GLSL compilation, which is unavailable.");
+        var vbA = AsVulkan(weightsFp16);
+        var vbB = AsVulkan(colFp16);
+        var vbC = AsVulkan(output);
+        var pushConstants = new uint[] { (uint)m, (uint)n, (uint)k, (uint)pixels };
+        var threadRes = _device.AcquireThreadResources();
+        lock (_computeLock)
+        {
+            pipeline.UpdateDescriptorSet(vbA.Storage, vbB.Storage, vbC.Storage);
+            RecordAndExecuteWithPushData(pipeline, m * n, pushConstants, 4 * sizeof(uint), threadRes);
+        }
     }
 
     /// <inheritdoc/>

@@ -20,7 +20,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 /// mixed-precision matmul (matches <c>cublasGemmEx(CUDA_R_16F, COMPUTE_32F)</c>).
 /// </para>
 /// </summary>
-public sealed partial class MetalBackend : IGpuHalfPrecisionBackend
+public sealed partial class MetalBackend : IGpuHalfPrecisionBackend, IFp16ConvBatchedGemmBackend
 {
     /// <inheritdoc/>
     public bool SupportsHgemm => IsAvailable;
@@ -124,6 +124,45 @@ public sealed partial class MetalBackend : IGpuHalfPrecisionBackend
         encoder.SetBytes((uint)m, 3);
         encoder.SetBytes((uint)n, 4);
         encoder.SetBytes((uint)k, 5);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
+    /// <inheritdoc/>
+    public void GemmFp16ConvBatched(IGpuBuffer weightsFp16, IGpuBuffer colFp16, IGpuBuffer output, int m, int pixels, int k,
+        int batch, bool halfOutput)
+    {
+        ThrowIfDisposed();
+        if (weightsFp16 is null) throw new ArgumentNullException(nameof(weightsFp16));
+        if (colFp16 is null) throw new ArgumentNullException(nameof(colFp16));
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (m <= 0 || pixels <= 0 || k <= 0 || batch <= 0)
+            throw new ArgumentException($"GEMM dims must be positive (M={m}, pixels={pixels}, K={k}, batch={batch}).");
+        int n = checked(batch * pixels);
+        if (halfOutput)
+        {
+            PortableFp16Activation.ConvGemmHalfOut(this, output, checked(m * n),
+                scratch => GemmFp16ConvBatched(weightsFp16, colFp16, scratch, m, pixels, k, batch, halfOutput: false));
+            return;
+        }
+        if (weightsFp16 is not MetalGpuBuffer aBuffer ||
+            colFp16 is not MetalGpuBuffer bBuffer ||
+            output is not MetalGpuBuffer cBuffer)
+        {
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        }
+
+        var pipeline = GetPipeline("Matrix", _matrixLibrary, "matmul_fp16_fp32out_nchw");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate2DDispatch(n, m);
+
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(aBuffer, 0);
+        encoder.SetBuffer(bBuffer, 1);
+        encoder.SetBuffer(cBuffer, 2);
+        encoder.SetBytes((uint)m, 3);
+        encoder.SetBytes((uint)n, 4);
+        encoder.SetBytes((uint)k, 5);
+        encoder.SetBytes((uint)pixels, 6);
         encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
 

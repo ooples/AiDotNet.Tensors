@@ -23,7 +23,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 /// with AutocastScope and lossless on training loss curves.</item>
 /// </list>
 /// </summary>
-public sealed partial class CudaBackend
+public sealed partial class CudaBackend : IFp16ConvBatchedGemmBackend
 {
     /// <inheritdoc/>
     public bool SupportsHgemm => IsAvailable && _ccMajor >= 5;
@@ -227,6 +227,45 @@ public sealed partial class CudaBackend
         CuBlasNative.CheckCublasStatus(status, "cublasGemmEx(FP16 output-major M=16)");
         BiasAdd(outputFloat, biasFloat, outputFloat, rows, outFeatures);
         Gelu(outputFloat, outputFloat, checked(rows * outFeatures));
+    }
+
+    private long _fp16ConvBatchedDispatchCount;
+
+    /// <summary>Per-image conv GEMMs run by <see cref="GemmFp16ConvBatched"/> (test and diagnostics hook).</summary>
+    internal long Fp16ConvBatchedDispatchCount => System.Threading.Interlocked.Read(ref _fp16ConvBatchedDispatchCount);
+
+    /// <inheritdoc/>
+    public unsafe void GemmFp16ConvBatched(IGpuBuffer weightsFp16, IGpuBuffer colFp16, IGpuBuffer output, int m, int pixels,
+        int k, int batch, bool halfOutput)
+    {
+        if (!SupportsHgemm) throw new NotSupportedException("GemmFp16ConvBatched requires CUDA compute capability >= 5.0 (Maxwell+).");
+        if (weightsFp16 is null) throw new ArgumentNullException(nameof(weightsFp16));
+        if (colFp16 is null) throw new ArgumentNullException(nameof(colFp16));
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (m <= 0 || pixels <= 0 || k <= 0 || batch <= 0)
+            throw new ArgumentException($"GEMM dims must be positive (M={m}, pixels={pixels}, K={k}, batch={batch}).");
+        long columns = (long)batch * pixels;
+        if (weightsFp16.SizeInBytes < (long)m * k * 2) throw new ArgumentException("weights half buffer too small.", nameof(weightsFp16));
+        if (colFp16.SizeInBytes < (long)k * columns * 2) throw new ArgumentException("col half buffer too small.", nameof(colFp16));
+        if (output.SizeInBytes < (long)m * columns * (halfOutput ? 2 : 4)) throw new ArgumentException("output buffer too small.", nameof(output));
+
+        using var _ = PushContext();
+        float alpha = 1f, beta = 0f;
+        // Row-major out_b[M, P] = W[M, K] @ col_b[K, P] is column-major out_b^T[P, M] = col_b^T @ W^T: cuBLAS's A is the
+        // image's col slice (ld = batch * P, next image P columns on), its B the shared weights (stride 0), its C the
+        // image's NCHW block (ld = P, next image M * P on).
+        var status = BlasGemmStridedBatchedEx(CublasOperation.None, CublasOperation.None,
+            pixels, m, k,
+            (IntPtr)(&alpha),
+            colFp16.Handle, CuBlasNative.CUDA_R_16F, checked((int)columns), pixels,
+            weightsFp16.Handle, CuBlasNative.CUDA_R_16F, k, 0,
+            (IntPtr)(&beta),
+            output.Handle, halfOutput ? CuBlasNative.CUDA_R_16F : CuBlasNative.CUDA_R_32F, pixels, (long)m * pixels,
+            batch, CuBlasNative.CUBLAS_COMPUTE_32F, CuBlasNative.CUBLAS_GEMM_DEFAULT);
+        if (status == AiDotNet.Tensors.Engines.CublasStatus.NotSupported)
+            throw new NotSupportedException($"FP16 Tensor-Core batched GEMM not supported on this device (cc {_ccMajor}.{_ccMinor}).");
+        CuBlasNative.CheckCublasStatus(status, "cublasGemmStridedBatchedEx(GemmFp16ConvBatched)");
+        System.Threading.Interlocked.Increment(ref _fp16ConvBatchedDispatchCount);
     }
 
     /// <summary>
