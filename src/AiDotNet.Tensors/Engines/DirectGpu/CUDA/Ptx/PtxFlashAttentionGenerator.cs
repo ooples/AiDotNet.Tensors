@@ -9,8 +9,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// <summary>
 /// FlashAttention-2 style forward for FP16 Q/K/V on Ampere+ tensor cores (#1549): <c>O = softmax(scale * Q K^T) V</c>
 /// for any query and key length, head dimension 64 or 128, causal or not, grouped-query heads. One block of four warps
-/// owns 64 query rows (one m16 tile per warp, Q fragments held in registers); key/value tiles of 64 rows stream through a
-/// double-buffered <c>cp.async</c> pipeline into padded shared rows (conflict-free <c>ldmatrix</c>). Scores and the
+/// owns 64 query rows (one m16 tile per warp, Q fragments held in registers, the Q block staged through the V buffer);
+/// key/value tiles of 64 rows stream through one K and one V buffer (FlashAttention-2 order: K_{j+1} loads during the
+/// softmax and P V of tile j, V_{j+1} during the next Q K^T) into padded shared rows (conflict-free <c>ldmatrix</c>).
+/// Scores and the
 /// output accumulate on <c>mma.sync.m16n8k16</c>; the online softmax (running row max and sum) stays FP32 in registers,
 /// and no score or probability matrix touches memory.
 /// <para>
@@ -38,8 +40,9 @@ internal static class PtxFlashAttentionGenerator
     /// <summary>Halves per shared-memory row: the head dimension padded by 8 so ldmatrix rows hit distinct banks.</summary>
     internal static int Pitch(int headDimension) => headDimension + 8;
 
-    /// <summary>Dynamic shared memory: the Q block plus two K and two V stages of 64 padded rows.</summary>
-    internal static int SharedBytes(int headDimension) => (BlockM(headDimension) + 4 * BlockN) * Pitch(headDimension) * 2;
+    /// <summary>Dynamic shared memory: one K and one V tile of 64 padded rows (the Q block is staged through V). Small
+    /// enough for four blocks per SM at head dimension 64, where registers, not shared memory, bound occupancy.</summary>
+    internal static int SharedBytes(int headDimension) => 2 * BlockN * Pitch(headDimension) * 2;
 
     internal static string Emit(int ccMajor, int ccMinor, int headDimension, bool isCausal, bool fp16Accumulate,
         bool emitStats)
@@ -84,7 +87,6 @@ internal static class PtxFlashAttentionGenerator
 
         private int Mt => RowsPerWarp(_d) / 16;   // m16 tiles per warp
         private int TileBytes => BlockN * Pitch(_d) * 2;
-        private int QBytes => BlockM(_d) * Pitch(_d) * 2;
         private int RowBytes => Pitch(_d) * 2;
         private int KSteps => _d / 16;          // k16 steps over the head dimension
         private int DTiles => _d / 8;           // n8 output tiles over the head dimension
@@ -116,8 +118,15 @@ internal static class PtxFlashAttentionGenerator
                 L($"bar.red.or.pred {any}, 0, {_bad};");
                 L($"@!{any} bra EPILOGUE;");
                 ResetState();
-                IssueKeyValue("0", stage: 0);
+                // Restart the stream: K tile 0 resident, V tile 0 in flight, as the loop expects.
+                L("cp.async.wait_group 0;");
+                L("bar.sync 0;");
+                IssueKeys("0");
                 L("cp.async.commit_group;");
+                IssueValues("0");
+                L("cp.async.commit_group;");
+                L("cp.async.wait_group 1;");
+                L("bar.sync 0;");
                 MainLoop("_F32", half: false);
             }
             else
@@ -210,9 +219,10 @@ internal static class PtxFlashAttentionGenerator
 
             // Shared regions: Q, K stage 0/1, V stage 0/1.
             _qShared = R(); _kShared = R(); _vShared = R();
-            L($"mov.u32 {_qShared}, smem;");
-            L($"add.u32 {_kShared}, {_qShared}, {I(QBytes)};");
-            L($"add.u32 {_vShared}, {_kShared}, {I(2 * TileBytes)};");
+            // K, then V; the Q block is staged through the V buffer before the first V tile.
+            L($"mov.u32 {_kShared}, smem;");
+            L($"add.u32 {_vShared}, {_kShared}, {I(TileBytes)};");
+            L($"mov.u32 {_qShared}, {_vShared};");
 
             // This thread's cp.async chunks of a 64-row tile: chunk c = tid + i * 128 is row c / (D / 8), column c % (D / 8).
             int chunksPerRow = _d / 8;
@@ -296,11 +306,17 @@ internal static class PtxFlashAttentionGenerator
                 L($"add.u32 {shared}, {_qShared}, {I(q * TileBytes)};");
                 IssueTile(_qGlobal, shared, rowStart, _sq);
             }
-            IssueKeyValue("0", stage: 0);
-            L("cp.async.commit_group;");
-
             _qf = new string[Mt, KSteps, 4];
             for (int m = 0; m < Mt; m++) for (int s = 0; s < KSteps; s++) for (int e = 0; e < 4; e++) _qf[m, s, e] = R();
+            // Q (in the V buffer) and K tile 0; Q fragments to registers; then V tile 0 into the freed buffer.
+            IssueKeys("0");
+            L("cp.async.commit_group;");
+            L("cp.async.wait_group 0;");
+            L("bar.sync 0;");
+            LoadQueryFragments();
+            L("bar.sync 0;");
+            IssueValues("0");
+            L("cp.async.commit_group;");
         }
 
         private void ResetState()
@@ -336,59 +352,31 @@ internal static class PtxFlashAttentionGenerator
             }
         }
 
-        // K and V tile `tile` (a register or immediate tile index) into stage `stage` (0 or 1, or a register offset).
-        private void IssueKeyValue(string tile, int stage) => IssueKeyValue(tile, I(stage * TileBytes));
-
-        private void IssueKeyValue(string tile, string stageOffset)
+        private void LoadQueryFragments()
         {
-            string rowStart = R(), kDst = R(), vDst = R();
-            if (tile == "0") L($"mov.u32 {rowStart}, 0;");
-            else L($"shl.b32 {rowStart}, {tile}, 6;");
-            L($"add.u32 {kDst}, {_kShared}, {stageOffset};");
-            L($"add.u32 {vDst}, {_vShared}, {stageOffset};");
-            IssueTile(_kGlobal, kDst, rowStart, _sk);
-            IssueTile(_vGlobal, vDst, rowStart, _sk);
-        }
-
-        private void MainLoop(string suffix, bool half)
-        {
-            string j = R();
-            L($"mov.u32 {j}, 0;");
-            Label("TILE" + suffix);
-            // Prefetch tile j + 1 into the other stage (an empty group past the last tile keeps the wait count uniform).
-            string next = R(), hasNext = P(), nextStage = R();
-            L($"add.u32 {next}, {j}, 1;");
-            L($"setp.lt.u32 {hasNext}, {next}, {_tiles};");
-            L($"and.b32 {nextStage}, {next}, 1;");
-            L($"mul.lo.u32 {nextStage}, {nextStage}, {I(TileBytes)};");
-            L($"@!{hasNext} bra NOPREFETCH{suffix};");
-            IssueKeyValue(next, nextStage);
-            Label("NOPREFETCH" + suffix);
-            L("cp.async.commit_group;");
-            L("cp.async.wait_group 1;");
-            L("bar.sync 0;");
-
-            // Q fragments: loaded once, on the first tile (the Q tile arrived with K/V tile 0).
-            string first = P();
-            L($"setp.eq.u32 {first}, {j}, 0;");
-            L($"@!{first} bra QREADY{suffix};");
             for (int m = 0; m < Mt; m++)
                 for (int s = 0; s < KSteps; s++)
                     L($"ldmatrix.sync.aligned.m8n8.x4.shared.b16 {{{_qf[m, s, 0]}, {_qf[m, s, 1]}, {_qf[m, s, 2]}, {_qf[m, s, 3]}}}, " +
                       $"[{_qLane}+{I(m * 16 * RowBytes + s * 32)}];");
-            Label("QREADY" + suffix);
+        }
 
-            string stage = R(), kStage = R(), vStage = R();
-            L($"and.b32 {stage}, {j}, 1;");
-            L($"mul.lo.u32 {stage}, {stage}, {I(TileBytes)};");
-            L($"add.u32 {kStage}, {_kShared}, {stage};");
-            L($"add.u32 {kStage}, {kStage}, {_kLane};");
-            L($"add.u32 {vStage}, {_vShared}, {stage};");
-            L($"add.u32 {vStage}, {vStage}, {_vLane};");
+        // K or V tile `tile` (a register or "0") into its one buffer.
+        private void IssueKeys(string tile) => IssueOne(_kGlobal, _kShared, tile);
 
-            // Scores for every m tile (sharing each K fragment), then one m tile at a time - promote (FP16), mask, softmax,
-            // pack to P fragments - so only one tile's FP32 scores are live at once.
-            string[,,] raw = Scores(kStage, half);
+        private void IssueValues(string tile) => IssueOne(_vGlobal, _vShared, tile);
+
+        private void IssueOne(string global, string shared, string tile)
+        {
+            string rowStart = R();
+            if (tile == "0") L($"mov.u32 {rowStart}, 0;");
+            else L($"shl.b32 {rowStart}, {tile}, 6;");
+            IssueTile(global, shared, rowStart, _sk);
+        }
+
+        // One m tile at a time - promote (FP16), mask, softmax, pack to P fragments - so only one tile's FP32 scores are
+        // live at once. Returns the P fragments [m, k16 step, 4].
+        private string[,,] SoftmaxAndPack(string[,,] raw, string j, bool half, string suffix)
+        {
             string needMask = NeedMask(j, out string n0, out string warpRow);
             var pa = new string[Mt, 4, 4];
             for (int m = 0; m < Mt; m++)
@@ -446,14 +434,49 @@ internal static class PtxFlashAttentionGenerator
                 }
                 RescaleOutputs(m, alpha, suffix);
             }
-            ProbabilitiesTimesValues(pa, vStage, half);
+            return pa;
+        }
 
+        // One K and one V buffer: entering tile j, K_j is resident and V_j in flight. S = Q K_j; K_{j+1} streams in during
+        // the softmax and P V; V_{j+1} during the next tile's Q K^T.
+        private void MainLoop(string suffix, bool half)
+        {
+            string j = R();
+            L($"mov.u32 {j}, 0;");
+            Label("TILE" + suffix);
+            string next = R(), hasNext = P();
+            L($"add.u32 {next}, {j}, 1;");
+            L($"setp.lt.u32 {hasNext}, {next}, {_tiles};");
+            string kLane = R(), vLane = R();
+            L($"add.u32 {kLane}, {_kShared}, {_kLane};");
+            L($"add.u32 {vLane}, {_vShared}, {_vLane};");
+
+            string[,,] raw = Scores(kLane, half);
+            L("bar.sync 0;");                                   // every warp is done with K_j
+            L($"@!{hasNext} bra NOK{suffix};");
+            IssueKeys(next);
+            Label("NOK" + suffix);
+            L("cp.async.commit_group;");
+
+            var pa = SoftmaxAndPack(raw, j, half, suffix);
+
+            L("cp.async.wait_group 1;");                        // V_j landed (K_{j+1} may still be in flight)
             L("bar.sync 0;");
+            ProbabilitiesTimesValues(pa, vLane, half);
+            L("bar.sync 0;");                                   // every warp is done with V_j
+            L($"@!{hasNext} bra NOV{suffix};");
+            IssueValues(next);
+            Label("NOV" + suffix);
+            L("cp.async.commit_group;");
+            L("cp.async.wait_group 1;");                        // K_{j+1} landed (V_{j+1} may still be in flight)
+            L("bar.sync 0;");
+
             L($"add.u32 {j}, {j}, 1;");
             string more = P();
             L($"setp.lt.u32 {more}, {j}, {_tiles};");
             L($"@{more} bra TILE{suffix};");
         }
+
         // S (per m tile, 16 x 64) = Q K^T over eight n8 key tiles, every K fragment pair feeding each of the warp's m
         // tiles: FP32 accumulators [m, n, 4] (c0, c1 row g; c2, c3 row g + 8), or packed FP16 pairs [m, n, 2] when half.
         private string[,,] Scores(string kStage, bool half)
