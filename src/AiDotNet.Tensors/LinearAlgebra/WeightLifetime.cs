@@ -163,11 +163,16 @@ public sealed class GpuOffloadOptions
     /// </summary>
     public long StreamingRestoreBufferPoolBytes { get; set; } = -1;
 
+    // The automatic restore-buffer budget: this share of the resident budget, and never more than the ceiling.
+    private const long AutoRestoreBufferPoolBudgetDivisor = 8;
+    private const long AutoRestoreBufferPoolCeilingBytes = 1L << 30;
+
     /// <summary>The effective <see cref="StreamingRestoreBufferPoolBytes"/>: the configured value, or the automatic size.</summary>
     internal long EffectiveStreamingRestoreBufferPoolBytes()
         => StreamingRestoreBufferPoolBytes >= 0
             ? StreamingRestoreBufferPoolBytes
-            : Math.Min(1L << 30, Math.Max(0, StreamingPoolMaxResidentBytes) / 8);
+            : Math.Min(AutoRestoreBufferPoolCeilingBytes,
+                Math.Max(0, StreamingPoolMaxResidentBytes) / AutoRestoreBufferPoolBudgetDivisor);
 
     /// <summary>
     /// The caller's estimate of the model's TOTAL streaming-weight footprint, in the

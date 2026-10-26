@@ -924,7 +924,10 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         DisposeStreamingMmapOwner();
         var oldStorage = _storage;
         _data = fresh;
-        _storage = new TensorStorage<T>(_data);
+        // A restore-pool array shares its array's GPU-cache epoch, as other wrappers of a caller-owned array do: the
+        // GPU engine keys persistent buffers by the backing array, so a recycled array's storage with a fresh local
+        // version would match an upload made for the weight it held before, and the epoch bump below would not reach it.
+        _storage = new TensorStorage<T>(_data, shareExternalGpuCacheEpoch: restoredArray is not null);
         InvalidateGpuBindingAfterStorageReplacement();
         oldStorage.Release();
 

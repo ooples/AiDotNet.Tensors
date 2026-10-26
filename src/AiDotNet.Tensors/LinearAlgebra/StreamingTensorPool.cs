@@ -370,19 +370,28 @@ public sealed class StreamingTensorPool : IDisposable
             if (!_entries.TryGetValue(handleId, out var entry)) return;
             var existing = entry.Data;
             byte[] buffer;
-            if (existing is not null && existing.Length >= length && existing.Length - length <= existing.Length / 8)
+            if (existing is not null && existing.Length >= length
+                && existing.Length - length <= existing.Length / WriteBackInPlaceSlackDivisor)
             {
                 buffer = existing;
                 _writeBackInPlaceCount++;
             }
             else
             {
-                buffer = new byte[length + length / 32];
+                // Widened before adding: a stream near int.MaxValue would overflow length + headroom and fail the
+                // allocation before the updated weight was installed. Past one array's reach, no headroom.
+                long withHeadroom = (long)length + length / WriteBackHeadroomDivisor;
+                buffer = new byte[withHeadroom > int.MaxValue ? length : (int)withHeadroom];
             }
             source.CopyTo(buffer);
             InstallEntryDataUnlocked(handleId, entry, buffer, length);
         }
     }
+
+    // A write-back refills the existing buffer while at most 1/8 of it would go unused; a new buffer gets 1/32 extra,
+    // so an entry whose size drifts by a few bytes from step to step settles on one buffer.
+    private const int WriteBackInPlaceSlackDivisor = 8;
+    private const int WriteBackHeadroomDivisor = 32;
 
     private long _writeBackInPlaceCount;
 

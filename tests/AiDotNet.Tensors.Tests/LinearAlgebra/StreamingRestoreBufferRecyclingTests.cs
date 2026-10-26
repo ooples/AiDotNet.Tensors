@@ -55,6 +55,12 @@ public class StreamingRestoreBufferRecyclingTests
         return dir;
     }
 
+    // The collection runs alone (DisableParallelization), so an open tape here was leaked by an earlier test; say so
+    // rather than fail the pooling assertions that depend on there being none.
+    private static void AssertNoTapeIsOpen()
+        => Assert.False(AiDotNet.Tensors.Engines.Autodiff.DifferentiableOps.AnyTapeActive(),
+            "A gradient tape is still open from an earlier test, so shed arrays are parked rather than pooled.");
+
     private static void Cleanup(string dir)
     {
         WeightRegistry.Reset();
@@ -115,6 +121,7 @@ public class StreamingRestoreBufferRecyclingTests
         string dir = Configure(restorePoolBytes: 4 * Cap);
         try
         {
+            AssertNoTapeIsOpen();
             StreamingRestoreBuffers<float>.Clear();
             var weights = RegisterWeights(step: 0);
             using (new GradientTape<float>())
@@ -170,6 +177,7 @@ public class StreamingRestoreBufferRecyclingTests
         string dir = Configure(restorePoolBytes: 4 * Cap);
         try
         {
+            AssertNoTapeIsOpen();
             StreamingRestoreBuffers<float>.Clear();
             var weights = RegisterWeights(step: 0);
             for (int round = 0; round < 2; round++)
@@ -196,6 +204,40 @@ public class StreamingRestoreBufferRecyclingTests
         }
     }
 
+    /// <summary>
+    /// The GPU engine caches uploads by backing array and serves one while the tensor's GPU-cache version matches.
+    /// A weight restored into a recycled array must therefore report a version that no upload of the array's earlier
+    /// contents carries: a fresh storage restarting at its own version 0 matched such an upload.
+    /// </summary>
+    [Fact]
+    public void ARecycledArray_DoesNotMatchAGpuUploadOfItsEarlierContents()
+    {
+        string dir = Configure(restorePoolBytes: 4 * Cap);
+        try
+        {
+            AssertNoTapeIsOpen();
+            StreamingRestoreBuffers<float>.Clear();
+            var weights = RegisterWeights(step: 0);
+            for (int round = 0; round < 2; round++)
+                for (int i = 0; i < N; i++) WeightRegistry.Materialize(weights[i]);
+
+            // An upload of the pooled array's current contents, recorded at the version the array had then. A tensor
+            // over a caller array shares that array's epoch, as the restored weight's storage now does.
+            var pooled = StreamingRestoreBuffers<float>.Rent(L, out bool recycled);
+            Assert.True(recycled, "Expected a pooled array after shedding owners outside any tape.");
+            int uploadedAt = new Tensor<float>(pooled, new[] { L }).GpuCacheVersion;
+            StreamingRestoreBuffers<float>.Park(pooled);
+
+            var target = weights.First(w => w.DataVector.Length == 0);
+            WeightRegistry.Materialize(target);
+            Assert.Same(pooled, target.GetReadOnlyDataArray());
+            Assert.NotEqual(uploadedAt, target.GpuCacheVersion);
+        }
+        finally
+        {
+            Cleanup(dir);
+        }
+    }
     /// <summary>
     /// A write-back that fits the entry's resident buffer refills it in place; the entry then reads back exactly
     /// the new content, both resident and after paging to disk and back.
