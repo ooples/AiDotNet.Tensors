@@ -124,6 +124,49 @@ public sealed class DeclaredSparseFamilyRouteTests
     }
 
     [SkippableTheory]
+    [InlineData(64, 48, 16, 0.10)]
+    [InlineData(17, 9, 4, 0.30)]
+    [InlineData(200, 100, 8, 0.02)]
+    public void CsrSegmentedReductions_MatchTheHandWrittenKernels(int rows, int k, int n, double density)
+    {
+        using var backend = OpenOrSkip();
+        var random = RandomHelper.CreateSeededRandom(1444 + rows);
+        var rowPtr = new List<float> { 0 };
+        var cols = new List<float>();
+        for (int r = 0; r < rows; r++)
+        {
+            if (r % 5 != 3)
+                for (int c = 0; c < k; c++)
+                    if (random.NextDouble() < density) cols.Add(c);
+            rowPtr.Add(cols.Count);
+        }
+        cols.Add(0);   // a slot past the last row pointer belongs to no row
+        var inputValues = new float[k * n];
+        for (int i = 0; i < inputValues.Length; i++) inputValues[i] = (float)(random.NextDouble() * 6 - 3);
+        inputValues[0] = float.NegativeInfinity;
+        inputValues[1] = float.NaN;
+        using var colIdx = backend.AllocateBuffer(cols.ToArray());
+        using var rowPointers = backend.AllocateBuffer(rowPtr.ToArray());
+        using var input = backend.AllocateBuffer(inputValues);
+
+        AssertClose(
+            Run(backend, false, rows * n, o => backend.CsrSegmentedMax(colIdx, rowPointers, input, o, rows, k, n)),
+            Run(backend, true, rows * n, o => backend.CsrSegmentedMax(colIdx, rowPointers, input, o, rows, k, n)),
+            "segmented max");
+        AssertClose(
+            Run(backend, false, rows * n, o => backend.CsrSegmentedMin(colIdx, rowPointers, input, o, rows, k, n)),
+            Run(backend, true, rows * n, o => backend.CsrSegmentedMin(colIdx, rowPointers, input, o, rows, k, n)),
+            "segmented min");
+        inputValues[0] = 0.5f;
+        inputValues[1] = -1.5f;
+        using var finite = backend.AllocateBuffer(inputValues);
+        AssertClose(
+            Run(backend, false, rows * n, o => backend.CsrSegmentedStdDev(colIdx, rowPointers, finite, o, rows, k, n)),
+            Run(backend, true, rows * n, o => backend.CsrSegmentedStdDev(colIdx, rowPointers, finite, o, rows, k, n)),
+            "segmented stddev");
+    }
+
+    [SkippableTheory]
     [InlineData(50, 200, 16, false)]
     [InlineData(50, 200, 16, true)]
     [InlineData(300, 1000, 8, true)]

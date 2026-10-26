@@ -107,6 +107,15 @@ internal enum DeclaredFamily
 
     /// <summary>A graph layer's edge scatter-add, unweighted or weighted (#1441).</summary>
     ScatterAddEdges,
+
+    /// <summary>The CSR segmented maximum over float-encoded indices (#1441).</summary>
+    CsrSegmentedMax,
+
+    /// <summary>The CSR segmented minimum over float-encoded indices (#1441).</summary>
+    CsrSegmentedMin,
+
+    /// <summary>The CSR segmented standard deviation over float-encoded indices (#1441).</summary>
+    CsrSegmentedStdDev,
 }
 
 /// <summary>One declared program: its family and shape (unused dimensions are 0).</summary>

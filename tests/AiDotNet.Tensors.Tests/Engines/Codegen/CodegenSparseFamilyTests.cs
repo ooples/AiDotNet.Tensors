@@ -55,6 +55,70 @@ public class CodegenSparseFamilyTests
         Assert.Equal(expected, outputs["out"]);
     }
 
+    private static readonly CodegenLibraryFunction Max = new("max_vectors", "test", 2, a => a[0] > a[1] ? a[0] : a[1]);
+    private static readonly CodegenLibraryFunction Min = new("min_vectors", "test", 2, a => a[0] < a[1] ? a[0] : a[1]);
+    private static readonly CodegenLibraryFunction Divide = new("divide_vectors", "test", 2, a => a[1] != 0 ? a[0] / a[1] : 0);
+    private static readonly CodegenLibraryFunction Sqrt = new("sqrt_vector", "test", 1, a => Math.Sqrt(a[0]));
+
+    // 4 rows (row 1 empty), 3 input rows, 2 columns; 6 column-index slots, the last past the final row pointer.
+    private static readonly double[] SegRowPtr = { 0, 2, 2, 4, 5 };
+    private static readonly double[] SegCol = { 2.7, 0, 1, 1, 2, 0 };   // float-encoded, truncated as (int)
+    private static readonly double[] SegInput = { 1, -2, double.NegativeInfinity, 4, 5, double.NaN };
+
+    private static Dictionary<string, double[]> SegSources() => new()
+    {
+        ["colIndices"] = SegCol, ["rowPointers"] = SegRowPtr, ["input"] = SegInput,
+    };
+
+    private static double SegReference(int r, int j, Func<List<double>, double> reduce)
+    {
+        var values = new List<double>();
+        for (int p = (int)SegRowPtr[r]; p < (int)SegRowPtr[r + 1]; p++) values.Add(SegInput[(int)SegCol[p] * 2 + j]);
+        return values.Count == 0 ? 0 : reduce(values);
+    }
+
+    [Fact]
+    public void CsrSegmentedMaxAndMin_MatchTheKernelsLoopsWithEmptyRowsAndNonFiniteValues()
+    {
+        var max = CodegenBackendPrograms.CsrSegmentedMax(4, 3, 2, 6, NotEqual, Max).Interpret(SegSources())["out"];
+        var min = CodegenBackendPrograms.CsrSegmentedMin(4, 3, 2, 6, NotEqual, Min).Interpret(SegSources())["out"];
+        for (int r = 0; r < 4; r++)
+            for (int j = 0; j < 2; j++)
+            {
+                // fmaxf/fminf from the kernel's +-3.402823e38 start: NaN never wins, -inf/+inf clamp to the start.
+                double m = SegReference(r, j, v => { double a = (float)-3.402823e+38; foreach (var x in v) if (x > a) a = x; return a; });
+                double n = SegReference(r, j, v => { double a = (float)3.402823e+38; foreach (var x in v) if (x < a) a = x; return a; });
+                Assert.Equal(m, max[r * 2 + j]);
+                Assert.Equal(n, min[r * 2 + j]);
+            }
+    }
+
+    [Fact]
+    public void CsrSegmentedStdDev_IsTheTwoPassStandardDeviation()
+    {
+        var input = new double[] { 1, -2, 3, 4, 5, 0.5 };
+        var sources = SegSources();
+        sources["input"] = input;
+        var std = CodegenBackendPrograms.CsrSegmentedStdDev(4, 3, 2, 6, 1e-8f, NotEqual, Divide, Sqrt).Interpret(sources)["out"];
+        for (int r = 0; r < 4; r++)
+            for (int j = 0; j < 2; j++)
+            {
+                var values = new List<double>();
+                for (int p = (int)SegRowPtr[r]; p < (int)SegRowPtr[r + 1]; p++) values.Add(input[(int)SegCol[p] * 2 + j]);
+                double expected = 0;
+                if (values.Count > 0)
+                {
+                    double mean = 0;
+                    foreach (var v in values) mean += v;
+                    mean /= values.Count;
+                    double acc = 0;
+                    foreach (var v in values) acc += (v - mean) * (v - mean);
+                    expected = Math.Sqrt(acc / values.Count + (double)1e-8f);
+                }
+                Assert.Equal(expected, std[r * 2 + j], 12);
+            }
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

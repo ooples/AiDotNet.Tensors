@@ -60,6 +60,44 @@ public sealed partial class CudaBackend
             new DeclaredBindings(rowIndices, colIndices, x, y, output));
     }
 
+    private static readonly string[] s_csrSegmentedNames = { "colIndices", "rowPointers", "input", "out" };
+
+    private Func<DeclaredKey, CodegenProgram>? _buildCsrSegmented;
+
+    private CodegenLibraryFunction DerivedFunction(string kernel) =>
+        (ResolveElementwise(kernel)
+            ?? throw new NotSupportedException(kernel + " has no derived function: " + ElementwiseRefusal(kernel))).Handle;
+
+    // D0..D3 = rows, K, N, the column-index slots; the stddev's epsilon is the key's own.
+    private CodegenProgram BuildCsrSegmented(DeclaredKey key) => key.Family switch
+    {
+        DeclaredFamily.CsrSegmentedMax => CodegenBackendPrograms.CsrSegmentedMax(key.D0, key.D1, key.D2, key.D3,
+            NotEqualScalar(), DerivedFunction("max_vectors")),
+        DeclaredFamily.CsrSegmentedMin => CodegenBackendPrograms.CsrSegmentedMin(key.D0, key.D1, key.D2, key.D3,
+            NotEqualScalar(), DerivedFunction("min_vectors")),
+        _ => CodegenBackendPrograms.CsrSegmentedStdDev(key.D0, key.D1, key.D2, key.D3,
+            key.Epsilon, NotEqualScalar(), DivideVectors(), DerivedFunction("sqrt_vector")),
+    };
+
+    /// <summary>
+    /// CsrSegmentedMax / Min / StdDev through their declared programs (#1441). The column-index buffer's length bounds
+    /// the entries (one past the last row pointer belongs to no row). False -- nothing launched -- when declined.
+    /// </summary>
+    internal bool TryDeclaredCsrSegmented(DeclaredFamily family, IGpuBuffer colIndices, IGpuBuffer rowPointers,
+        IGpuBuffer input, IGpuBuffer output, int rows, int k, int n, float epsilon = 0f)
+    {
+        int entries = colIndices.Size;
+        if (!DeclaredCsrSpMMEnabled || rows <= 0 || k <= 0 || n <= 0 || entries <= 0 ||
+            (long)rows * entries > DeclaredCsrSpMMMaxRowEntries || rowPointers.Size < rows + 1 ||
+            (long)input.Size < (long)k * n || (long)output.Size < (long)rows * n)
+            return false;
+        var key = new DeclaredKey(family, rows, k, n, entries,
+            family == DeclaredFamily.CsrSegmentedStdDev ? epsilon : 0f, 0f);
+        if (!ClaimDeclaredSlot(key, ref _declaredCsrSpMMPrograms, DeclaredCsrSpMMProgramCap)) return false;
+        return TryRunDeclaredProgram(key, _buildCsrSegmented ??= BuildCsrSegmented, s_csrSegmentedNames,
+            new DeclaredBindings(colIndices, rowPointers, input, output));
+    }
+
     /// <summary>
     /// ScatterAddEdges through its declared program (#1441): the edges' fixed-order sums with no atomic, so it serves
     /// deterministic mode and the default alike. Admitted where nodes x edges stays within the inversions' budget; the

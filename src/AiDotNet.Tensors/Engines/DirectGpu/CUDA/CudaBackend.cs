@@ -5179,6 +5179,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
+        // Declared route (#1441).
+        if (TryDeclaredCsrSegmented(DeclaredFamily.CsrSegmentedMax, csrColIndices, csrRowPointers, input, output, M, K, N))
+            return;
 
         if (!_kernelCache.TryGetValue("csr_segmented_max", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: csr_segmented_max");
@@ -5216,6 +5219,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
+        // Declared route (#1441).
+        if (TryDeclaredCsrSegmented(DeclaredFamily.CsrSegmentedMin, csrColIndices, csrRowPointers, input, output, M, K, N))
+            return;
 
         if (!_kernelCache.TryGetValue("csr_segmented_min", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: csr_segmented_min");
@@ -5254,6 +5260,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
+        // Declared route (#1441).
+        if (TryDeclaredCsrSegmented(DeclaredFamily.CsrSegmentedStdDev, csrColIndices, csrRowPointers, input, output,
+                M, K, N, epsilon))
+            return;
 
         if (!_kernelCache.TryGetValue("csr_segmented_stddev", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: csr_segmented_stddev");

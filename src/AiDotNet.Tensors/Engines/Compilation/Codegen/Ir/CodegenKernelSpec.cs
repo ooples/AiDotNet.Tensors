@@ -803,6 +803,14 @@ public sealed class CodegenKernelSpec
     }
 
     /// <summary>
+    /// The emitter's <c>max.f32</c> (and the hand-written kernels' <c>fmaxf</c>): a NaN operand yields the other one,
+    /// so a NaN term never wins a maximum. <see cref="Math.Max(double, double)"/> propagates NaN instead, which made the
+    /// oracle disagree with every kernel on a NaN input.
+    /// </summary>
+    internal static double MaxLikeTheDevice(double acc, double term) =>
+        double.IsNaN(acc) ? term : double.IsNaN(term) ? acc : Math.Max(acc, term);
+
+    /// <summary>
     /// What <c>cvt.rni.s32.f32</c> stores for an integer-value output: the nearest integer (ties to even), NaN as 0,
     /// saturated to the int32 range. The accumulator is first rounded to fp32, as the device holds it.
     /// </summary>
@@ -1032,7 +1040,7 @@ public sealed class CodegenKernelSpec
                 acc = Reduce switch
                 {
                     CodegenReduceKind.Sum => acc + product,
-                    CodegenReduceKind.Max => Math.Max(acc, product),
+                    CodegenReduceKind.Max => MaxLikeTheDevice(acc, product),
                     _ => product
                 };
             }

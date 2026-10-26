@@ -236,6 +236,209 @@ public static partial class CodegenBackendPrograms
     }
 
     /// <summary>
+    /// The CSR segmented maximum (#1441), in CudaBackend.CsrSegmentedMax's contract: float-encoded column indices and
+    /// row pointers (read as (int), truncating), <c>out[r, j] = max(-3.402823e38, max over row r's entries p of
+    /// input[col[p], j])</c>, and 0 for an empty row. <paramref name="entries"/> is the column-index buffer's length; an
+    /// entry past the last row pointer belongs to no row.
+    /// </summary>
+    /// <remarks>
+    /// A row's extent is data, so the entries are first assigned their rows -- <c>rowOf[p] = |{r : rowPtr[r + 1] &lt;=
+    /// p}|</c>, an int32 sum over the row pointers -- and the maximum is then a segment maximum over the entries keyed by
+    /// rowOf, gathering input through the column index. An empty row's maximum would be the reduction's identity, so
+    /// the final pass reads it through a per-row gate that only a row with at least one entry passes, and the skipped
+    /// term is exactly 0. The clamp is <paramref name="maximum"/>, the derived max_vectors.
+    /// </remarks>
+    public static CodegenProgram CsrSegmentedMax(int rows, int k, int n, int entries, CodegenLibraryFunction notEqualZero,
+        CodegenLibraryFunction maximum) =>
+        CsrSegmentedExtreme(rows, k, n, entries, notEqualZero, maximum, minimum: false);
+
+    /// <summary>
+    /// The CSR segmented minimum (#1441), CudaBackend.CsrSegmentedMin's contract: <see cref="CsrSegmentedMax"/> with the
+    /// minimum (as <c>-max(-x)</c>, exact) and the clamp <c>min(x, 3.402823e38)</c> through <paramref name="minimum"/>,
+    /// the derived min_vectors.
+    /// </summary>
+    public static CodegenProgram CsrSegmentedMin(int rows, int k, int n, int entries, CodegenLibraryFunction notEqualZero,
+        CodegenLibraryFunction minimum) =>
+        CsrSegmentedExtreme(rows, k, n, entries, notEqualZero, minimum, minimum: true);
+
+    /// <summary>
+    /// The CSR segmented standard deviation (#1441), CudaBackend.CsrSegmentedStdDev's contract: per row and column, the
+    /// two-pass mean then <c>sqrt(sum (x - mean)^2 / count + epsilon)</c>, 0 for an empty row. The entries are keyed by
+    /// their rows as in <see cref="CsrSegmentedMax"/>; the division and square root are <paramref name="divide"/> and
+    /// <paramref name="sqrt"/>, the derived divide_vectors and sqrt_vector.
+    /// </summary>
+    public static CodegenProgram CsrSegmentedStdDev(int rows, int k, int n, int entries, float epsilon,
+        CodegenLibraryFunction notEqualZero, CodegenLibraryFunction divide, CodegenLibraryFunction sqrt)
+    {
+        if (divide is null) throw new ArgumentNullException(nameof(divide));
+        if (sqrt is null) throw new ArgumentNullException(nameof(sqrt));
+        var passes = new List<CodegenKernelSpec>();
+        var temps = new List<long>();
+        CsrRowsOfEntries(rows, entries, notEqualZero, passes, temps);
+
+        // count[r] as a float.
+        passes.Add(new CodegenKernelSpec("csr_segmented_count_float",
+            new CodegenIterationSpace(CodegenAxis.Parallel("r", rows)),
+            new[]
+            {
+                new CodegenTensorBinding(0, "row_counts", new[] { rows }, new[] { A(0) },
+                    elementType: CodegenElementType.Int32, integerValue: true),
+            },
+            Bind(1, "row_counts_f", new[] { rows }, isOutput: true), new[] { 0 }, CodegenReduceKind.None));
+        temps.Add(rows);
+
+        int[] cells = { rows, n };
+        // sum[r, j] over row r's entries, in increasing entry order.
+        passes.Add(CsrSegmentPass("csr_segmented_sum", rows, k, n, entries, "row_sum", CodegenReduceKind.Sum));
+        temps.Add((long)rows * n);
+
+        // mean[r, j] = divide(sum, count).
+        var meanBody = CodegenExpr.Call(divide, Op(0), Op(1));
+        var rowSpace = new CodegenIterationSpace(CodegenAxis.Parallel("r", rows), CodegenAxis.Parallel("j", n));
+        passes.Add(new CodegenKernelSpec("csr_segmented_mean", rowSpace,
+            new[] { Bind(0, "row_sum", cells), new CodegenTensorBinding(1, "row_counts_f", new[] { rows }, new[] { A(0) }) },
+            Bind(2, "row_mean", cells, isOutput: true), meanBody.Operands(), CodegenReduceKind.None, body: meanBody));
+        temps.Add((long)rows * n);
+
+        // squares[r, j] = sum over row r's entries of (x - mean)^2.
+        passes.Add(CsrSegmentPass("csr_segmented_squares", rows, k, n, entries, "row_squares", CodegenReduceKind.Sum,
+            preBiasMean: true));
+        temps.Add((long)rows * n);
+
+        // out[r, j] = sqrt(divide(squares, count) + epsilon), through the non-empty gate.
+        var stdBody = CodegenExpr.Multiply(
+            CodegenExpr.Call(sqrt, CodegenExpr.Add(CodegenExpr.Call(divide, Op(0), Op(1)), CodegenExpr.Constant(epsilon))),
+            Op(3));
+        passes.Add(new CodegenKernelSpec("csr_segmented_stddev", rowSpace,
+            new[]
+            {
+                Bind(0, "row_squares", cells),
+                new CodegenTensorBinding(1, "row_counts_f", new[] { rows }, new[] { A(0) }),
+                RowCountsIndex(2, rows),
+                NonEmptyGate(3, 2, entries),
+            },
+            Bind(4, "out", cells, isOutput: true), stdBody.Operands(), CodegenReduceKind.None, body: stdBody));
+        return new CodegenProgram(passes, temps, "csr segmented stddev (backend contract)");
+    }
+
+    private static CodegenProgram CsrSegmentedExtreme(int rows, int k, int n, int entries,
+        CodegenLibraryFunction notEqualZero, CodegenLibraryFunction clamp, bool minimum)
+    {
+        if (clamp is null) throw new ArgumentNullException(nameof(clamp));
+        var passes = new List<CodegenKernelSpec>();
+        var temps = new List<long>();
+        CsrRowsOfEntries(rows, entries, notEqualZero, passes, temps);
+
+        int[] cells = { rows, n };
+        passes.Add(CsrSegmentPass(minimum ? "csr_segmented_min_reduce" : "csr_segmented_max_reduce", rows, k, n,
+            entries, "row_extreme", CodegenReduceKind.Max, negate: minimum));
+        temps.Add((long)rows * n);
+
+        // out[r, j] = clamp(extreme, -+3.402823e38), through the non-empty gate.
+        double bound = minimum ? 3.402823e+38 : -3.402823e+38;
+        var body = CodegenExpr.Multiply(CodegenExpr.Call(clamp, Op(0), CodegenExpr.Constant((float)bound)), Op(2));
+        passes.Add(new CodegenKernelSpec(minimum ? "csr_segmented_min" : "csr_segmented_max",
+            new CodegenIterationSpace(CodegenAxis.Parallel("r", rows), CodegenAxis.Parallel("j", n)),
+            new[] { Bind(0, "row_extreme", cells), RowCountsIndex(1, rows), NonEmptyGate(2, 1, entries) },
+            Bind(3, "out", cells, isOutput: true), body.Operands(), CodegenReduceKind.None, body: body));
+        return new CodegenProgram(passes, temps, minimum ? "csr segmented min (backend contract)" : "csr segmented max (backend contract)");
+    }
+
+    // ones[p] (from the column indices, as the scatter mean builds its ones), rowOf[p] (int32) = |{r : rowPtr[r + 1] <=
+    // p}|, and row_counts[r] (int32) = |{p : rowOf[p] == r}|.
+    private static void CsrRowsOfEntries(int rows, int entries, CodegenLibraryFunction notEqualZero,
+        List<CodegenKernelSpec> passes, List<long> temps)
+    {
+        if (rows <= 0 || entries <= 0) throw new ArgumentOutOfRangeException(nameof(rows), "CSR extents must be positive.");
+        if (notEqualZero is null) throw new ArgumentNullException(nameof(notEqualZero));
+        var nonZero = CodegenExpr.Call(notEqualZero, Op(0), CodegenExpr.Constant(0.0));
+        var oneBody = CodegenExpr.Add(nonZero, CodegenExpr.Subtract(CodegenExpr.Constant(1.0), nonZero));
+        passes.Add(new CodegenKernelSpec("csr_segmented_ones", new CodegenIterationSpace(CodegenAxis.Parallel("p", entries)),
+            new[] { Bind(0, "colIndices", new[] { entries }) }, Bind(1, "ones", new[] { entries }, isOutput: true),
+            oneBody.Operands(), CodegenReduceKind.None, body: oneBody));
+        temps.Add(entries);
+
+        // rowOf[p]: rowPtr[r + 1] <= p exactly when rowPtr[r + 1] - (p + 1 - entries) lies in [0, entries).
+        var rowOfSpace = new CodegenIterationSpace(CodegenAxis.Parallel("p", entries), CodegenAxis.Reduce("r", rows));
+        var ends = new CodegenTensorBinding(1, "ones", new[] { entries }, new[] { CodegenAffineExpr.Const(0) },
+            indirect: new CodegenIndirectIndex?[]
+            {
+                new CodegenIndirectIndex(0, new CodegenAffineExpr(new[] { new CodegenAffineTerm(1, 1) }, 1), entries,
+                    CodegenIndexOutOfRange.Skip, floatIndices: true,
+                    offset: new CodegenAffineExpr(new[] { new CodegenAffineTerm(0, 1) }, 1 - entries)),
+            });
+        passes.Add(new CodegenKernelSpec("csr_segmented_row_of", rowOfSpace,
+            new[] { new CodegenTensorBinding(0, "rowPointers", new[] { rows + 1 }, new[] { A(1) }), ends },
+            new CodegenTensorBinding(2, "row_of", new[] { entries }, new[] { A(0) }, isOutput: true,
+                elementType: CodegenElementType.Int32, integerValue: true),
+            new[] { 1 }, CodegenReduceKind.Sum));
+        temps.Add(entries);
+
+        // row_counts[r] = the entries keyed to r.
+        var countSpace = new CodegenIterationSpace(CodegenAxis.Parallel("r", rows), CodegenAxis.Reduce("p", entries));
+        passes.Add(new CodegenKernelSpec("csr_segmented_counts", countSpace,
+            new[]
+            {
+                new CodegenTensorBinding(0, "row_of", new[] { entries }, new[] { A(1) }, elementType: CodegenElementType.Int32),
+                new CodegenTensorBinding(1, "ones", new[] { 1, entries }, new[] { CodegenAffineExpr.Const(0), A(1) },
+                    indirect: new CodegenIndirectIndex?[]
+                    {
+                        new CodegenIndirectIndex(0, A(1), 1, CodegenIndexOutOfRange.Skip, floatIndices: false, offset: A(0)),
+                        null,
+                    }),
+            },
+            new CodegenTensorBinding(2, "row_counts", new[] { rows }, new[] { A(0) }, isOutput: true,
+                elementType: CodegenElementType.Int32, integerValue: true),
+            new[] { 1 }, CodegenReduceKind.Sum));
+        temps.Add(rows);
+    }
+
+    // A reduction over the entries keyed to each row: input gathered through the column index and admitted where
+    // rowOf[p] == r. With preBiasMean the term is (x - mean[r, j])^2; with negate the reduction is a maximum of -x.
+    private static CodegenKernelSpec CsrSegmentPass(string name, int rows, int k, int n, int entries, string output,
+        CodegenReduceKind reduce, bool negate = false, bool preBiasMean = false)
+    {
+        var space = new CodegenIterationSpace(
+            CodegenAxis.Parallel("r", rows), CodegenAxis.Parallel("j", n), CodegenAxis.Reduce("p", entries));
+        var inputs = new List<CodegenTensorBinding>
+        {
+            new CodegenTensorBinding(0, "row_of", new[] { entries }, new[] { A(2) }, elementType: CodegenElementType.Int32),
+            new CodegenTensorBinding(1, "colIndices", new[] { entries }, new[] { A(2) }),
+            new CodegenTensorBinding(2, "input", new[] { 1, k, n },
+                new[] { CodegenAffineExpr.Const(0), CodegenAffineExpr.Const(0), A(1) },
+                indirect: new CodegenIndirectIndex?[]
+                {
+                    new CodegenIndirectIndex(0, A(2), 1, CodegenIndexOutOfRange.Skip, floatIndices: false, offset: A(0)),
+                    new CodegenIndirectIndex(1, A(2), k, CodegenIndexOutOfRange.Skip, floatIndices: true),
+                    null,
+                }),
+        };
+        if (preBiasMean) inputs.Add(Bind(3, "row_mean", new[] { rows, n }));
+        var outBinding = Bind(inputs.Count, output, new[] { rows, n }, isOutput: true);
+        if (negate)
+        {
+            var body = CodegenExpr.Negate(Op(2));
+            return new CodegenKernelSpec(name, space, inputs.ToArray(), outBinding, body.Operands(), reduce,
+                reduceScale: -1.0, body: body);
+        }
+        return new CodegenKernelSpec(name, space, inputs.ToArray(), outBinding, new[] { 2 }, reduce,
+            preReduce: preBiasMean ? CodegenPreReduceOp.Square : CodegenPreReduceOp.None,
+            preBiasInput: preBiasMean ? 3 : null, preBiasScale: preBiasMean ? -1.0 : 1.0);
+    }
+
+    private static CodegenTensorBinding RowCountsIndex(int parameter, int rows) =>
+        new(parameter, "row_counts", new[] { rows }, new[] { A(0) }, elementType: CodegenElementType.Int32);
+
+    // ones[row_counts[r] - 1]: in range exactly for a row with at least one entry; a skipped read makes the term 0.
+    private static CodegenTensorBinding NonEmptyGate(int parameter, int countsInput, int entries) =>
+        new(parameter, "ones", new[] { entries }, new[] { CodegenAffineExpr.Const(0) },
+            indirect: new CodegenIndirectIndex?[]
+            {
+                new CodegenIndirectIndex(countsInput, A(0), entries, CodegenIndexOutOfRange.Skip, floatIndices: false,
+                    offset: CodegenAffineExpr.Const(1)),
+            });
+
+    /// <summary>
     /// The activation-layout scatter mean (#1441), in CudaBackend.ScatterMean's contract: <c>counts[g]</c> (int32) is
     /// the number of source rows with indices[i] == g, and <c>output[g, f]</c> their sum divided by the count, or the
     /// (zero) sum for an empty group -- scatter_mean_divide's <c>if (cnt &gt; 0) output /= cnt</c>. The sums run in
