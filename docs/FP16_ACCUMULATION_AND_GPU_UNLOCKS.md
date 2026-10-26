@@ -39,7 +39,9 @@ Measured on an RTX 3080 (FP16 in, FP32 out, operands in [-1, 1)), verdict vs cuB
 
 ## FP16 flash attention
 
-With the direct-PTX attention opt-in (`AIDOTNET_DIRECT_PTX_ATTENTION=1`, or the master `AIDOTNET_DIRECT_PTX=1`), `FlashAttention` on CUDA converts Q/K/V to FP16 and runs one of two kernels:
+`FlashAttention` on CUDA runs the FP16 flash kernel **by default wherever the caller already chose FP16**: inside an `AutocastScope(PrecisionMode.Float16)`, or when the query is an FP16-resident activation. This matches PyTorch, which keeps FP32 SDPA exact and uses its FP16 kernels for FP16 tensors and autocast. Plain FP32 attention stays on the exact FP32 kernel; with inputs in [-1, 1] the FP16 kernel's output error is 1e-4 to 4.4e-4.
+
+With the direct-PTX attention opt-in (`AIDOTNET_DIRECT_PTX_ATTENTION=1`, or the master `AIDOTNET_DIRECT_PTX=1`), FP32 attention takes the FP16 kernels too: Q/K/V are converted to FP16 and one of two kernels runs:
 - **The online kernel** handles its validated short shapes (S ≤ 128, D = 64).
 - **`PtxFlashAttentionKernel`** handles every other length and D = 128. It is a FlashAttention-2 style forward:
   - grouped-query heads, and causal masking with an offset;

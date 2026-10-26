@@ -12808,7 +12808,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             || backend is not IDirectPtxBackend directCuda)
             return false;
 
-        if (!directCuda.IsDirectPtxAttentionEnabled
+        // FP16 attention by default wherever the caller already chose FP16 - an FP16 autocast scope or FP16-resident
+        // activations - like PyTorch; plain FP32 attention stays exact unless the direct-PTX attention opt-in is set.
+        bool reducedPrecision = (Gpu.AutocastScope.IsEnabled && Gpu.AutocastScope.ActivePrecision == Gpu.PrecisionMode.Float16)
+            || TryFp16ResidentInput(query, out _) is not null;
+        if (!(directCuda.IsDirectPtxAttentionEnabled || reducedPrecision)
             // Module JIT and the eager scratch allocations below are not
             // stream-capture safe. Captured graphs keep the established
             // resident NVRTC path until a PTX prewarm/capture API is added.
@@ -12841,7 +12845,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 value, keyValueElements, directCuda, backend, out valueHalfOwned);
             // The online kernel for its validated short shapes (S <= 128, D = 64); the flash kernel for every other
             // length and for D = 128 (#1549).
-            bool online = headDim == PtxOnlineFusedAttention128x64Kernel.HeadDimension
+            bool online = directCuda.IsDirectPtxAttentionEnabled
+                && headDim == PtxOnlineFusedAttention128x64Kernel.HeadDimension
                 && PtxOnlineFusedAttention128x64Kernel.IsSupportedSequenceLength(seqQ)
                 && PtxOnlineFusedAttention128x64Kernel.IsSupportedSequenceLength(seqK);
             bool launched = online
@@ -12852,7 +12857,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 : directCuda.TryDirectPtxFlashAttention(
                     queryHalf, keyHalf, valueHalf,
                     directOutput.Buffer, directStats.Buffer,
-                    batch, heads, heads, seqQ, seqK, headDim, scale, isCausal);
+                    batch, heads, heads, seqQ, seqK, headDim, scale, isCausal,
+                    causalQueryOffset: 0, reducedPrecisionRequested: reducedPrecision);
             if (!launched)
             {
                 AliasDiag($"FlashAttention direct-PTX FELLBACK: {directCuda.DirectPtxLastError ?? "specialization unavailable"}");

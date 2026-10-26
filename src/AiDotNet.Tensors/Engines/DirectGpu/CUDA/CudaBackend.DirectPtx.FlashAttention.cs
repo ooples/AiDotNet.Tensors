@@ -7,7 +7,8 @@ using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 /// <summary>
-/// The FP16 flash-attention forward (#1549) behind the direct-PTX attention opt-in: any sequence lengths, head dimension
+/// The FP16 flash-attention forward (#1549), behind the direct-PTX attention opt-in or wherever the caller already chose
+/// FP16 (an autocast scope, FP16-resident activations): any sequence lengths, head dimension
 /// 64 or 128, causal (with an offset) or not, grouped-query heads; FP32 output and the per-row log-sum-exp the
 /// FlashAttention backward reads. Accumulates in FP16 (with the kernel's FP32 redo on overflow) where FP16 accumulation
 /// issues faster than FP32 accumulation on this device, else in FP32; AIDOTNET_FP16_ACCUMULATE=0 keeps FP32.
@@ -36,9 +37,11 @@ public sealed partial class CudaBackend
         int headDimension,
         float scale,
         bool isCausal,
-        int causalQueryOffset = 0)
+        int causalQueryOffset = 0,
+        bool reducedPrecisionRequested = false)
     {
-        if (!_directPtxAttentionOptedIn || !IsAvailable || _ccMajor < 8)
+        // The direct-PTX attention opt-in, or a caller that already chose FP16 (autocast, FP16 activations).
+        if (!(_directPtxAttentionOptedIn || reducedPrecisionRequested) || !IsAvailable || _ccMajor < 8)
             return false;
         if (!PtxFlashAttentionGenerator.SupportsHeadDimension(headDimension))
         {

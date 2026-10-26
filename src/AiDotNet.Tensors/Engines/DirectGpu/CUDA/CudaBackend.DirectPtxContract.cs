@@ -24,8 +24,8 @@ public sealed partial class CudaBackend : IDirectPtxBackend
     bool IDirectPtxBackend.TryDirectPtxOnlineAttentionFamily(IGpuBuffer queryHalf, IGpuBuffer keyHalf, IGpuBuffer valueHalf, IGpuBuffer outputFloat, IGpuBuffer? softmaxStatsFloat, int batch, int queryHeads, int keyValueHeads, int querySequence, int keyValueSequence, float scale, bool isCausal, bool emitSoftmaxStats, int causalQueryOffset)
         => TryDirectPtxOnlineAttentionFamily(queryHalf, keyHalf, valueHalf, outputFloat, softmaxStatsFloat, batch, queryHeads, keyValueHeads, querySequence, keyValueSequence, scale, isCausal, emitSoftmaxStats, causalQueryOffset);
 
-    bool IDirectPtxBackend.TryDirectPtxFlashAttention(IGpuBuffer queryHalf, IGpuBuffer keyHalf, IGpuBuffer valueHalf, IGpuBuffer outputFloat, IGpuBuffer softmaxStatsFloat, int batch, int queryHeads, int keyValueHeads, int querySequence, int keyValueSequence, int headDimension, float scale, bool isCausal, int causalQueryOffset)
-        => TryDirectPtxFlashAttention(queryHalf, keyHalf, valueHalf, outputFloat, softmaxStatsFloat, batch, queryHeads, keyValueHeads, querySequence, keyValueSequence, headDimension, scale, isCausal, causalQueryOffset);
+    bool IDirectPtxBackend.TryDirectPtxFlashAttention(IGpuBuffer queryHalf, IGpuBuffer keyHalf, IGpuBuffer valueHalf, IGpuBuffer outputFloat, IGpuBuffer softmaxStatsFloat, int batch, int queryHeads, int keyValueHeads, int querySequence, int keyValueSequence, int headDimension, float scale, bool isCausal, int causalQueryOffset, bool reducedPrecisionRequested)
+        => TryDirectPtxFlashAttention(queryHalf, keyHalf, valueHalf, outputFloat, softmaxStatsFloat, batch, queryHeads, keyValueHeads, querySequence, keyValueSequence, headDimension, scale, isCausal, causalQueryOffset, reducedPrecisionRequested);
 
     bool IDirectPtxBackend.TryDirectPtxGroupNormSwishUnit64(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta, int batch, int groups, int channels, int spatialSize, float epsilon)
         => TryDirectPtxGroupNormSwishUnit64(input, output, gamma, beta, batch, groups, channels, spatialSize, epsilon);

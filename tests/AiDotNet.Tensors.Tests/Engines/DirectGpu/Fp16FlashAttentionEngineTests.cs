@@ -35,6 +35,58 @@ public sealed class Fp16FlashAttentionEngineTests
         return worst;
     }
 
+    // Default routing without the direct-PTX opt-in: an FP16 autocast scope (the caller chose FP16) takes the flash
+    // kernel; plain FP32 attention stays on the exact FP32 kernel.
+    [SkippableTheory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void WithoutTheOptIn_Fp16AutocastTakesTheFlashKernel_AndFp32StaysExact(bool autocast)
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        bool? previous = DirectPtxFeatureGate.TestOverride;
+        DirectPtxFeatureGate.TestOverride = false;
+        try
+        {
+            using var engine = new DirectGpuTensorEngine();
+            Skip.IfNot(engine.IsGpuAvailable, "CUDA tensor engine is unavailable.");
+            var backend = Assert.IsType<CudaBackend>(engine.GetBackend());
+            Skip.If(backend.IsDirectPtxAttentionEnabled, "The opt-in must be off for this test.");
+            var rng = new Random(77);
+            int[] shape = { 2, 4, 257, 64 };
+            Tensor<float> q = Random(rng, shape, 1.0), k = Random(rng, shape, 1.0), v = Random(rng, shape, 1.0);
+            const double scale = 0.125;
+            long before = backend.DirectPtxFlashAttentionDispatchCount;
+            Tensor<float> output, stats;
+            if (autocast)
+            {
+                using var scope = new AiDotNet.Tensors.Engines.Gpu.AutocastScope(AiDotNet.Tensors.Engines.Gpu.PrecisionMode.Float16);
+                output = engine.FlashAttention(q, k, v, scale, true, out stats);
+            }
+            else
+            {
+                output = engine.FlashAttention(q, k, v, scale, true, out stats);
+            }
+            Tensor<float> expected = new CpuEngine().FlashAttention(q, k, v, scale, true, out Tensor<float> expectedStats);
+            double outputError = MaxAbsDiff(output, expected), statsError = MaxAbsDiff(stats, expectedStats);
+            _output.WriteLine($"autocast={autocast}: flash launches {backend.DirectPtxFlashAttentionDispatchCount - before}, " +
+                              $"output max |err| {outputError:E2}, logsumexp max |err| {statsError:E2}");
+            if (autocast)
+            {
+                Assert.Equal(before + 1, backend.DirectPtxFlashAttentionDispatchCount);
+                Assert.True(outputError <= 1.5e-2 && statsError <= 1.5e-2, $"FP16 attention error {outputError:E2} / {statsError:E2}");
+            }
+            else
+            {
+                Assert.Equal(before, backend.DirectPtxFlashAttentionDispatchCount);
+                Assert.True(outputError <= 1e-4 && statsError <= 1e-4, $"FP32 attention must stay exact: {outputError:E2} / {statsError:E2}");
+            }
+        }
+        finally
+        {
+            DirectPtxFeatureGate.TestOverride = previous;
+        }
+    }
+
     [SkippableTheory]
     [InlineData(2, 4, 300, 64, false)]
     [InlineData(2, 4, 300, 64, true)]
