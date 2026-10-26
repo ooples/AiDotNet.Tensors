@@ -2008,6 +2008,16 @@ public static class OpParityRegistry
             e => e.ReduceMaxBackward(rmgo.F(), new[] { 5 }, new[] { 4, 6 }),
             e => e.ReduceMaxBackward(rmgo.D(), new[] { 5 }, new[] { 4, 6 }),
             ParityTol.Exact, opMethod: "ReduceMaxBackward", graphCaptureExpectation: GraphCaptureExpectation.BackwardKernel);
+
+        // ReduceMax backward over many indices with repeats, as attention's per-row max produces: 384 gradients
+        // scattered into [16,24], several onto the same cell. The GPU path is one scatter-add launch (AiDotNet#1804).
+        var rmmGo = OpInput.Rand(5141, new[] { 384 });
+        var rmmIdx = new int[384];
+        for (int i = 0; i < rmmIdx.Length; i++) rmmIdx[i] = (i * 37 + i / 5) % (16 * 24) / 3 * 3;
+        yield return new OpCase("ReduceMaxBackward[16,24;384 repeated]", "reduction",
+            e => e.ReduceMaxBackward(rmmGo.F(), rmmIdx, new[] { 16, 24 }),
+            e => e.ReduceMaxBackward(rmmGo.D(), rmmIdx, new[] { 16, 24 }),
+            ParityTol.Accum(1e-5), opMethod: "ReduceMaxBackward", graphCaptureExpectation: GraphCaptureExpectation.BackwardKernel);
     }
 
     // Trilinear backward, multi-head graph attention, occupancy-grid update.
@@ -3393,6 +3403,10 @@ public static class OpParityRegistry
         yield return new OpCase("Upsample3DBackward[1,2,4,4,4->1,2,2,2,2]", "shape",
             e => e.Upsample3DBackward(OpInput.Rand(2512, new[] { 1, 2, 4, 4, 4 }).F(), new[] { 1, 2, 2, 2, 2 }, 2, 2, 2),
             e => e.Upsample3DBackward(OpInput.Rand(2512, new[] { 1, 2, 4, 4, 4 }).D(), new[] { 1, 2, 2, 2, 2 }, 2, 2, 2), ParityTol.Accum(1e-3), opMethod: "Upsample3DBackward", graphCaptureExpectation: GraphCaptureExpectation.BackwardKernel);
+        // Unequal scales per axis, so a wrong axis in the gradient-to-input index map cannot cancel out.
+        yield return new OpCase("Upsample3DBackward[2,3,4,3,6->2,3,2,3,2;2x1x3]", "shape",
+            e => e.Upsample3DBackward(OpInput.Rand(2513, new[] { 2, 3, 4, 3, 6 }).F(), new[] { 2, 3, 2, 3, 2 }, 2, 1, 3),
+            e => e.Upsample3DBackward(OpInput.Rand(2513, new[] { 2, 3, 4, 3, 6 }).D(), new[] { 2, 3, 2, 3, 2 }, 2, 1, 3), ParityTol.Accum(1e-3), opMethod: "Upsample3DBackward", graphCaptureExpectation: GraphCaptureExpectation.BackwardKernel);
     }
 
     // Audio (mu-law), FFT, gaussian-splat covariance, gumbel-softmax backward.
