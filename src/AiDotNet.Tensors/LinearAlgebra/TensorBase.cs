@@ -654,7 +654,10 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
             if (wait) System.Threading.Monitor.Enter(gate, ref taken);
             else System.Threading.Monitor.TryEnter(gate, ref taken);
             if (!taken) return StreamingReleaseOutcome.Busy;
-            if (DataVector.Length == 0) return StreamingReleaseOutcome.AlreadyReleased;
+            // An empty data vector is not released while a no-upcast int8/int4 form is attached: Materialize leaves the
+            // fp32 view empty and keeps the quantized buffer, which only the drop below frees.
+            if (DataVector.Length == 0 && StreamingInt8 is null && StreamingInt4 is null)
+                return StreamingReleaseOutcome.AlreadyReleased;
             bool storeIsReadOnly = StreamingStoreEncoding != StreamingEncoding.Native
                 && StreamingStoreEncoding != StreamingEncoding.Lossless;
             if (!storeIsReadOnly && !TryWriteBackResidentForStreaming()) return StreamingReleaseOutcome.Retained;

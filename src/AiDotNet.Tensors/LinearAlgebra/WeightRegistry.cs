@@ -118,13 +118,13 @@ public static partial class WeightRegistry
         get { lock (_lock) return _options; }
     }
 
+    /// <summary>The configured streaming pool, or <c>null</c> before first use; for diagnostics and tests.</summary>
+    internal static StreamingTensorPool? CurrentStreamingPool => System.Threading.Volatile.Read(ref _streamingPool);
+
     /// <summary>
     /// The byte cap of the restore-array pool (<see cref="GpuOffloadOptions.StreamingRestoreBufferPoolBytes"/>).
     /// Lock-free: a reference read is atomic, and drops call this from inside and outside <c>_lock</c>.
     /// </summary>
-    /// <summary>The configured streaming pool, or <c>null</c> before first use; for diagnostics and tests.</summary>
-    internal static StreamingTensorPool? CurrentStreamingPool => System.Threading.Volatile.Read(ref _streamingPool);
-
     internal static long RestoreBufferPoolCapBytes() => System.Threading.Volatile.Read(ref _options).EffectiveStreamingRestoreBufferPoolBytes();
 
     /// <summary>Registers a weight tensor with the registry. Routes to
@@ -821,6 +821,23 @@ public static partial class WeightRegistry
         return (int)byteCountLong;
     }
 
+    /// <summary><see cref="SerializeLossless{T}"/> left in its pooled stream (see <see cref="StreamingStoreCodec.EncodeLosslessToStream"/>).</summary>
+    private static PooledChunkWriteStream? SerializeLosslessToStream<T>(Tensor<T> tensor, out byte[]? rawShuffled)
+    {
+        if (typeof(T) == typeof(float))
+        {
+            return StreamingStoreCodec.EncodeLosslessToStream(System.Runtime.InteropServices.MemoryMarshal.AsBytes(
+                new ReadOnlySpan<float>((float[])(object)tensor.GetReadOnlyDataArray())), sizeof(float), out rawShuffled);
+        }
+        if (typeof(T) == typeof(double))
+        {
+            return StreamingStoreCodec.EncodeLosslessToStream(System.Runtime.InteropServices.MemoryMarshal.AsBytes(
+                new ReadOnlySpan<double>((double[])(object)tensor.GetReadOnlyDataArray())), sizeof(double), out rawShuffled);
+        }
+        throw new NotSupportedException(
+            $"Lossless streaming store is only supported for float/double, not {typeof(T).Name}.");
+    }
+
     /// <summary>Lossless (byte-shuffle + LZ4) serialization — variable size.</summary>
     /// <remarks>
     /// <para>
@@ -844,23 +861,6 @@ public static partial class WeightRegistry
     /// call — on the code path whose purpose is to make a large model FIT.
     /// </para>
     /// </remarks>
-    /// <summary><see cref="SerializeLossless{T}"/> left in its pooled stream (see <see cref="StreamingStoreCodec.EncodeLosslessToStream"/>).</summary>
-    private static PooledChunkWriteStream? SerializeLosslessToStream<T>(Tensor<T> tensor, out byte[]? rawShuffled)
-    {
-        if (typeof(T) == typeof(float))
-        {
-            return StreamingStoreCodec.EncodeLosslessToStream(System.Runtime.InteropServices.MemoryMarshal.AsBytes(
-                new ReadOnlySpan<float>((float[])(object)tensor.GetReadOnlyDataArray())), sizeof(float), out rawShuffled);
-        }
-        if (typeof(T) == typeof(double))
-        {
-            return StreamingStoreCodec.EncodeLosslessToStream(System.Runtime.InteropServices.MemoryMarshal.AsBytes(
-                new ReadOnlySpan<double>((double[])(object)tensor.GetReadOnlyDataArray())), sizeof(double), out rawShuffled);
-        }
-        throw new NotSupportedException(
-            $"Lossless streaming store is only supported for float/double, not {typeof(T).Name}.");
-    }
-
     private static byte[] SerializeLossless<T>(Tensor<T> tensor)
     {
         if (typeof(T) == typeof(float))
@@ -2352,13 +2352,14 @@ public static partial class WeightRegistry
     /// evictions from any source (Register, prefetch) are reconciled at the next
     /// Materialize.
     /// <para>
-    /// The drops run OUTSIDE <see cref="_lock"/> — <c>TryDropStorageForStreaming</c>
-    /// only touches the tensor's own storage refcount (a CAS), acquiring neither
-    /// the registry nor the pool lock, so there's no lock-order hazard. A soft
-    /// drop (<c>throwOnSharedRefcount: false</c>) leaves a weight resident when
-    /// its storage is still shared — the training-tape case — which is correct:
-    /// transparent streaming targets inference, where a paged-out weight's
-    /// refcount is 1 and the drop succeeds.
+    /// Each owner is released under <see cref="_lock"/>: the check that no scope is using it and its
+    /// <c>TryWriteBackAndDropForStreaming(wait: false)</c> run without the lock released in between. That call only
+    /// tries the owner's streaming transition gate (<c>Monitor.TryEnter</c>), and may re-encode the resident data
+    /// into the pool, which takes the pool lock and can evict, writing to the backing store. The lock order is
+    /// therefore the registry's <see cref="_lock"/>, then the owner's gate, then the pool's lock: code holding an
+    /// owner's gate must not take the registry lock, and the pool must not call back into the registry while it
+    /// holds its own. A soft drop (<c>throwOnSharedRefcount: false</c>) still leaves a weight resident when its
+    /// storage is shared, the training-tape case.
     /// </para>
     /// </summary>
     private static void DrainOwnerDropsAfterEviction()

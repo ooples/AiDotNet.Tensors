@@ -10,8 +10,10 @@ namespace AiDotNet.Tensors.Benchmarks;
 /// campaign spend it again on every call and every retry.
 /// </summary>
 /// <remarks>
-/// <c>claude -p</c> reports tokens but no spend, so each call is charged its full cap before it starts: the campaign's
-/// total cannot exceed the budget, though it usually spends less than <see cref="CommittedUsd"/>. Each call runs one
+/// <c>claude -p</c> reports tokens but no spend, so each call reserves its full cap before it starts, and the reserved
+/// caps together stay within the budget. That bounds what the campaign starts, not what it spends: Claude Code checks
+/// its cap after a response, so the response that crosses it still completes, and a call can spend somewhat past its
+/// own cap. <see cref="CommittedUsd"/> is the sum of reserved caps, not an upper bound on actual spend. Each call runs one
 /// attempt (retries off); the evolution loop's next request is the retry, and it is charged like any other call. Once
 /// the remaining budget is under the per-call cap's floor, calls are refused with an
 /// <see cref="EvolutionResourceBudgetException"/>, so no further process is started.
@@ -40,7 +42,7 @@ internal sealed class CampaignUsdBudgetChatClient : IProgramChatClient
 
     public string ModelId => _model;
 
-    /// <summary>Dollars charged so far: the sum of every started call's cap, an upper bound on what was spent.</summary>
+    /// <summary>Dollars reserved so far: the sum of every started call's cap. Not an upper bound on actual spend.</summary>
     public decimal CommittedUsd { get { lock (_gate) return _committedUsd; } }
 
     /// <summary>Calls refused because the remaining budget could not cover one.</summary>
