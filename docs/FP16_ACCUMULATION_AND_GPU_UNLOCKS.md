@@ -37,6 +37,43 @@ Measured on an RTX 3080 (FP16 in, FP32 out, operands in [-1, 1)), verdict vs cuB
 | 12544×128×1152 | 1.544x | 1.631x |
 | 1024³ | 1.298x | 1.274x |
 
+## FP16 flash attention
+
+With the direct-PTX attention opt-in (`AIDOTNET_DIRECT_PTX_ATTENTION=1`, or the master `AIDOTNET_DIRECT_PTX=1`), `FlashAttention` on CUDA converts Q/K/V to FP16 and runs one of two kernels:
+- **The online kernel** handles its validated short shapes (S ≤ 128, D = 64).
+- **`PtxFlashAttentionKernel`** handles every other length and D = 128. It is a FlashAttention-2 style forward:
+  - grouped-query heads, and causal masking with an offset;
+  - FP32 output and the per-row log-sum-exp that the existing device backward reads;
+  - one K and one V buffer in FlashAttention-2 order, so occupancy is bound by registers rather than shared memory;
+  - 4 or 8 warps per block depending on shape.
+
+Accumulation follows the GEMM rules above:
+- Q·Kᵀ and P·V accumulate in FP16 per 64-key tile, wherever FP16 accumulation issues faster.
+- P·V partials are promoted into FP32 outputs.
+- A block whose scores or outputs go non-finite redoes its rows with FP32 accumulation. Overflow-sized scores and P·V partials reproduce the FP32 kernel exactly.
+
+RTX 3080, FP16 Q/K/V in [-1, 1), scale 1/√D, against PyTorch 2.14's best FP16 SDPA backend (cuDNN or memory-efficient; no flash backend on Windows). Runs were interleaved; each figure is the best of two.
+
+| shape (B×H×S×D) | PyTorch | Tensors | speedup |
+|---|---|---|---|
+| 8×16×512×64 | 178.8 µs | 117.7 µs | 1.52x |
+| 8×16×1024×64 | 601.6 µs | 411.3 µs | 1.46x |
+| 4×16×2048×64 | 1177.1 µs | 799.8 µs | 1.47x |
+| 2×16×4096×64 | 2355.2 µs | 1520.3 µs | 1.55x |
+| 8×16×1024×128 | 1137.1 µs | 811.0 µs | 1.40x |
+| 2×16×4096×128 | 4488.2 µs | 3138.3 µs | 1.43x |
+| 8×16×512×64 causal | 135.0 µs | 85.2 µs | 1.58x |
+| 8×16×1024×64 causal | 408.6 µs | 231.8 µs | 1.76x |
+| 4×16×2048×64 causal | 745.1 µs | 411.0 µs | 1.81x |
+| 2×16×4096×64 causal | 1388.8 µs | 780.3 µs | 1.78x |
+| 8×16×1024×128 causal | 689.9 µs | 497.4 µs | 1.39x |
+| 2×16×4096×128 causal | 2447.8 µs | 1674.8 µs | 1.46x |
+
+**Why not 2x:**
+- PyTorch's cuDNN path already runs at 57–61 TFLOP/s, close to the card's FP32-accumulate ceiling (62).
+- The FP16-accumulate ceiling is about twice that (123).
+- The flash kernel reaches 85–92 TFLOP/s at D = 64, about 75% of that ceiling. The rest goes to the FP32 softmax and the per-tile synchronization.
+
 ## Rate detection
 
 The FP16-accumulate route only pays where FP32 accumulation is the slower form, so Tensors measures this before tuning anything:
