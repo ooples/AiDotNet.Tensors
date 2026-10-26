@@ -36,6 +36,24 @@ public class GpuExecutionOptionsCultureTests
         }
     }
 
+    [Fact]
+    public void AnUnsetOrUnparsableDecimalVariableIsNotRead()
+    {
+        const string Name = "TEST_1557_DOUBLE_ABSENT";
+        Environment.SetEnvironmentVariable(Prefix + Name, null);
+        Assert.False(GpuExecutionOptions.TryGetEnvDouble(Name, out double unset));
+        Assert.Equal(0.0, unset);
+        Environment.SetEnvironmentVariable(Prefix + Name, "half");
+        try
+        {
+            Assert.False(GpuExecutionOptions.TryGetEnvDouble(Name, out _));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(Prefix + Name, null);
+        }
+    }
+
     [Theory]
     [InlineData("de-DE")]
     [InlineData("en-US")]
