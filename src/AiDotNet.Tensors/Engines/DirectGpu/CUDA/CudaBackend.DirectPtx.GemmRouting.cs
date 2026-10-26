@@ -27,6 +27,9 @@ public enum CudaGemmDispatchPath
     NarrowGemm = 4,
     /// <summary>A declared GEMM program (#890 phase 4c), lowered by the codegen conveyor.</summary>
     DeclaredProgram = 5,
+    /// <summary>The generated GEMM serving the cuBLAS slot because cuBLAS is not in use: not loadable on this machine, or
+    /// turned off (<c>AIDOTNET_DISABLE_CUBLAS=1</c>, <c>TensorCodecOptions.UseCublas = false</c>).</summary>
+    GeneratedFallback = 6,
 }
 
 /// <summary>

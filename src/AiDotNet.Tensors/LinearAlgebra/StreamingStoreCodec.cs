@@ -1016,23 +1016,48 @@ internal static class StreamingStoreCodec
         // The stream buffer is pooled chunks now, so ToArray is the only allocation: a streamed
         // training weight is re-encoded every time it is shed, and that buffer was the larger half
         // of the garbage the write-back produced (#2322).
-        using var ms = new PooledChunkWriteStream();
-        ms.WriteByte(DeflateCompressedTag);
-        using (var ds = CreateLosslessCompressor(ms))
-            WriteShuffledPlanes(raw, elem, ds);
-
-        // ms.Length counts the tag byte, so the compressed payload is ms.Length - LosslessTagLength.
-        if (ms.Length - LosslessTagLength < raw.Length)
+        var ms = EncodeLosslessToStream(raw, elem, out byte[]? rawOut);
+        if (ms is null)
+            return rawOut ?? throw new InvalidOperationException("Lossless encode produced neither a stream nor raw bytes.");
+        using (ms)
             return ms.ToArray();
+    }
 
+    /// <summary>
+    /// The lossless encoding of <paramref name="raw"/>, left in a pooled stream so a caller that copies it straight
+    /// into its destination skips <see cref="PooledChunkWriteStream.ToArray"/> (#2322 write-back). Returns null and
+    /// sets <paramref name="rawShuffled"/> instead when compression did not shrink the payload. The caller disposes
+    /// the stream.
+    /// </summary>
+    internal static PooledChunkWriteStream? EncodeLosslessToStream(ReadOnlySpan<byte> raw, int elem, out byte[]? rawShuffled)
+    {
+        rawShuffled = null;
+        var ms = new PooledChunkWriteStream();
+        try
+        {
+            ms.WriteByte(DeflateCompressedTag);
+            using (var ds = CreateLosslessCompressor(ms))
+                WriteShuffledPlanes(raw, elem, ds);
+
+            // ms.Length counts the tag byte, so the compressed payload is ms.Length - LosslessTagLength.
+            if (ms.Length - LosslessTagLength < raw.Length)
+                return ms;
+        }
+        catch
+        {
+            ms.Dispose();
+            throw;
+        }
+
+        ms.Dispose();
         // Didn't shrink (rare — tiny or high-entropy) — store the raw shuffled bytes so the
         // round-trip is still exact and never larger than shuffled + 1. Re-shuffling costs a second
         // pass on a path that is already the uncommon one, and it is what lets the common path
         // avoid holding the shuffled copy at all.
-        var rawOut = new byte[LosslessTagLength + raw.Length];
-        rawOut[0] = RawShuffledTag;
-        BytePlaneShuffle(raw, rawOut.AsSpan(LosslessTagLength), elem);
-        return rawOut;
+        rawShuffled = new byte[LosslessTagLength + raw.Length];
+        rawShuffled[0] = RawShuffledTag;
+        BytePlaneShuffle(raw, rawShuffled.AsSpan(LosslessTagLength), elem);
+        return null;
     }
 
     // Run-length matches only (distance 1), no general LZ77 match search. What compresses in a

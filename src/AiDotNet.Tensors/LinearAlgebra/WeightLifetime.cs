@@ -154,6 +154,27 @@ public sealed class GpuOffloadOptions
     public long StreamingPoolMaxResidentBytes { get; set; } = DefaultResidentBudgetBytes();
 
     /// <summary>
+    /// Most bytes of restore arrays kept for reuse, per element type (#2322). Streaming rebuilds every weight from
+    /// its stored bytes on each forward and backward, so without reuse a large model allocates its whole weight set
+    /// again every pass. Arrays a dropped weight released are kept, up to this many bytes, and handed to the next
+    /// restore of the same length. A negative value (the default) sizes it automatically: one eighth of
+    /// <see cref="StreamingPoolMaxResidentBytes"/>, at most 1 GiB, so reuse never takes more than a small share of
+    /// the memory budget streaming exists to protect. Zero turns reuse off.
+    /// </summary>
+    public long StreamingRestoreBufferPoolBytes { get; set; } = -1;
+
+    // The automatic restore-buffer budget: this share of the resident budget, and never more than the ceiling.
+    private const long AutoRestoreBufferPoolBudgetDivisor = 8;
+    private const long AutoRestoreBufferPoolCeilingBytes = 1L << 30;
+
+    /// <summary>The effective <see cref="StreamingRestoreBufferPoolBytes"/>: the configured value, or the automatic size.</summary>
+    internal long EffectiveStreamingRestoreBufferPoolBytes()
+        => StreamingRestoreBufferPoolBytes >= 0
+            ? StreamingRestoreBufferPoolBytes
+            : Math.Min(AutoRestoreBufferPoolCeilingBytes,
+                Math.Max(0, StreamingPoolMaxResidentBytes) / AutoRestoreBufferPoolBudgetDivisor);
+
+    /// <summary>
     /// The caller's estimate of the model's TOTAL streaming-weight footprint, in the
     /// weights' native precision (fp32/fp64 bytes = ParameterCount × element size).
     /// Zero (the default) means "unknown". When known, it makes
