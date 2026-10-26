@@ -18,7 +18,9 @@ namespace AiDotNet.Tensors.Benchmarks;
 /// </summary>
 /// <remarks>
 /// <para>Run: <c>--ptx-campaign gemm-large [--m=2048 --n=2048 --k=2048] [--generations=8] [--islands=2]
-/// [--model=claude-opus-5-5] [--max-usd=50] [--out=dir]</c>. The model is reached through the Claude Code CLI
+/// [--model=claude-opus-5-5] [--max-usd=50] [--max-usd-per-call=5] [--out=dir]</c>. <c>--max-usd</c> caps the whole
+/// campaign (<see cref="CampaignUsdBudgetChatClient"/>); each call is capped at <c>--max-usd-per-call</c> and charged
+/// that cap. The model is reached through the Claude Code CLI
 /// (<c>claude -p</c>) on PATH, so the run uses that login. Every proposal, verdict and the final comparison is written
 /// as JSON lines to stdout and to the output directory.</para>
 /// <para>Kernels win or lose per GPU: a campaign's verdict holds for the card it ran on. To confirm on another card
@@ -46,6 +48,9 @@ internal static partial class DirectPtxDenseLinearFullExperiment
         decimal maxUsd = decimal.Parse(Text("max-usd", "50"), System.Globalization.NumberStyles.Number,
             System.Globalization.CultureInfo.InvariantCulture);
         if (maxUsd <= 0) throw new ArgumentOutOfRangeException(nameof(args), "--max-usd must be positive.");
+        decimal maxUsdPerCall = Math.Min(decimal.Parse(Text("max-usd-per-call", "5"), System.Globalization.NumberStyles.Number,
+            System.Globalization.CultureInfo.InvariantCulture), maxUsd);
+        if (maxUsdPerCall <= 0) throw new ArgumentOutOfRangeException(nameof(args), "--max-usd-per-call must be positive.");
         string output = Path.GetFullPath(Text("out", Path.Combine(Path.GetTempPath(), "aidotnet-ptx-campaign",
             target + "-" + DateTime.UtcNow.ToString("yyyyMMddHHmmss", System.Globalization.CultureInfo.InvariantCulture))));
         Directory.CreateDirectory(output);
@@ -112,7 +117,9 @@ internal static partial class DirectPtxDenseLinearFullExperiment
         var ledger = new EvolutionResourceLedger("ptx-campaign-" + target,
             new EvolutionResources(new[] { new KeyValuePair<string, decimal>("cost_units", 1_000_000m) }));
         var resources = new ProgramEvolutionResourceOptions(ledger, 1_000m, ptxOptions.CostUnitVersionHash);
-        var client = new ClaudeCodeChatClient(new ClaudeCodeChatClientOptions { Model = model, MaxBudgetUsd = maxUsd });
+        // MaxBudgetUsd caps one claude -p process, and every call and retry starts another, so the campaign's budget is
+        // held across calls by the wrapper instead.
+        var client = new CampaignUsdBudgetChatClient(model, maxUsd, maxUsdPerCall);
         var variation = PtxProgramVariation.Create(client, compiler, ptxOptions, resources);
         var correctnessGate = new DelegateProgramFitnessEvaluator((genome, _, token) =>
         {
@@ -144,6 +151,9 @@ internal static partial class DirectPtxDenseLinearFullExperiment
             target, generations, islands, model,
             best_speedup_over_incumbent = best?.Evaluation.Quality,
             proposals = usage.Proposals, calls = usage.ChatCalls, input_tokens = usage.InputTokens, output_tokens = usage.OutputTokens,
+            max_usd = maxUsd, max_usd_per_call = maxUsdPerCall,
+            // An upper bound: every call is charged its full cap, since claude -p reports no spend back.
+            usd_committed = client.CommittedUsd, calls_refused_for_budget = client.RefusedCalls,
         });
         if (best is null || (best.Evaluation.Quality ?? 0) <= 1.0)
         {
