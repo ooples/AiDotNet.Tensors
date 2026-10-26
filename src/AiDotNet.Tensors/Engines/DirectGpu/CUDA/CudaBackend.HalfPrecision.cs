@@ -258,7 +258,15 @@ public sealed partial class CudaBackend
             Ahalf, Bhalf, Chalf, M, N, K,
             outputType: DirectPtxGemmOutputType.Float16))
             return;
+        if (alpha == 1f && beta == 0f && TryFp16AccumulateGemm(Ahalf, Bhalf, Chalf, M, N, K, halfOutput: true))
+            return;
+        CublasGemmFp16HalfOut(Ahalf, Bhalf, Chalf, M, N, K, alpha, beta);
+    }
 
+    // cuBLAS FP16 in, FP32 accumulate, FP16 out (row-major C = alpha * A @ B + beta * C).
+    private unsafe void CublasGemmFp16HalfOut(IGpuBuffer Ahalf, IGpuBuffer Bhalf, IGpuBuffer Chalf, int M, int N, int K,
+        float alpha, float beta)
+    {
         using var _ = PushContext();
         float aVal = alpha, bVal = beta;
         IntPtr alphaPtr = (IntPtr)(&aVal);

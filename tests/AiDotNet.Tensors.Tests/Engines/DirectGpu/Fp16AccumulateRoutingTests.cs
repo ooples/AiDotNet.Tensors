@@ -148,6 +148,56 @@ public sealed class Fp16AccumulateRoutingTests
         Assert.All(exact, v => Assert.Equal(64f * 64f * k, v));
     }
 
+    // The half-output route (GemmFp16HalfOut, the FP16 conv path's GEMM), forced: small operands agree with the fp64
+    // reference to FP16-accumulation plus FP16-output accuracy; and K tiles of +-131072 partials (A all 64, B +64 for 32
+    // rows then -64 for 32) overflow FP16 but cancel to exactly 0, which the FP32 redo gives (without it: inf - inf = NaN).
+    [SkippableFact]
+    public void RoutedHalfOutputShape_Agrees_AndOverflowingTilesAreRedoneExactly()
+    {
+        using var backend = RequireAmpereBackend();
+        const int m = 1024, n = 1024, k = 1024;
+        backend.ForceFp16AccumulateRouteForTests(m, n, k,
+            new AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx.PtxTensorCoreGemmConfiguration(64, 64, 32, 32, 32, 2, 8),
+            halfOutput: true);
+        var rng = new Random(17);
+        Half[] a = Enumerable.Range(0, m * k).Select(_ => (Half)(rng.NextDouble() * 2 - 1)).ToArray();
+        Half[] b = Enumerable.Range(0, k * n).Select(_ => (Half)(rng.NextDouble() * 2 - 1)).ToArray();
+        using var da = backend.AllocateByteBuffer(m * k * 2);
+        using var db = backend.AllocateByteBuffer(k * n * 2);
+        using var dc = backend.AllocateByteBuffer(m * n * 2);
+        backend.UploadBytes(da, HalfBytes(a));
+        backend.UploadBytes(db, HalfBytes(b));
+        float[] Output()
+        {
+            byte[] bytes = backend.DownloadByteBuffer(dc, m * n * 2);
+            return Enumerable.Range(0, m * n)
+                .Select(i => (float)BitConverter.UInt16BitsToHalf((ushort)(bytes[2 * i] | (bytes[2 * i + 1] << 8)))).ToArray();
+        }
+        long before = backend.Fp16AccumulateDispatchCount;
+        backend.GemmFp16HalfOut(da, db, dc, m, n, k);
+        Assert.Equal(before + 1, backend.Fp16AccumulateDispatchCount);
+        float[] c = Output();
+        for (int s = 0; s < 400; s++)
+        {
+            int i = rng.Next(m), j = rng.Next(n);
+            double sum = 0, abs = 0;
+            for (int p = 0; p < k; p++)
+            {
+                double prod = (double)a[i * k + p] * (double)b[p * n + j];
+                sum += prod;
+                abs += Math.Abs(prod);
+            }
+            Assert.True(Math.Abs(c[i * n + j] - sum) <= 3 * Math.Pow(2, -11) * abs + Math.Pow(2, -11) * Math.Abs(sum) + 1e-3,
+                $"C[{i},{j}] = {c[i * n + j]}, expected {sum} (sum|ab| {abs})");
+        }
+
+        backend.UploadBytes(da, HalfBytes(Enumerable.Repeat((Half)64f, m * k).ToArray()));
+        backend.UploadBytes(db, HalfBytes(Enumerable.Range(0, k * n).Select(i => (Half)((i / n) % 64 < 32 ? 64f : -64f)).ToArray()));
+        backend.GemmFp16HalfOut(da, db, dc, m, n, k);
+        Assert.Equal(before + 2, backend.Fp16AccumulateDispatchCount);
+        Assert.All(Output(), v => Assert.Equal(0f, v));
+    }
+
     // Opt-in (AIDOTNET_RUN_TC_GEMM_PROBE=1): per shape, cuBLAS against the best of a few configurations with FP32
     // accumulation and with FP16 accumulation (operands in [-1, 1): no block redoes), and the FP16-accumulate kernel when
     // every block overflows and redoes (all operands 64), the worst case of the in-kernel recovery.
