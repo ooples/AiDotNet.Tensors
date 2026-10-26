@@ -107,6 +107,23 @@ public sealed record CodegenExtraOutput(
     int NoWinnerIndex = 0,
     bool IndexAsFloat = false);
 
+/// <summary>
+/// A data-dependent reduction extent (#1441): the spec's single reduction axis <paramref name="Axis"/> runs over
+/// <c>[indices[Position], indices[Position + 1])</c> -- a CSR row's entries -- rather than its whole declared extent,
+/// which becomes only the bound every index is clamped to. <paramref name="IndexInput"/> is an int32 index tensor, or a
+/// float32 one with <paramref name="FloatIndices"/> (truncated as <c>(int)</c>). <paramref name="Initial"/>, when set, is
+/// the accumulator's starting value instead of the reduction's identity (csr_segmented_max starts from -3.402823e38);
+/// <paramref name="EmptyValue"/>, when set, is written for an empty range in place of the reduced value and epilogue.
+/// Only the plain lowering emits such a spec: every planner that retiles or splits a reduction refuses it.
+/// </summary>
+public sealed record CodegenReductionRange(
+    int Axis,
+    int IndexInput,
+    CodegenAffineExpr Position,
+    bool FloatIndices = false,
+    double? Initial = null,
+    double? EmptyValue = null);
+
 /// <summary>Epilogue activation applied after bias and scale.</summary>
 public enum CodegenActivationKind
 {
@@ -181,6 +198,9 @@ public sealed class CodegenKernelSpec
 
     /// <summary>The tensor the kernel writes.</summary>
     public CodegenTensorBinding Output { get; }
+
+    /// <summary>The data-dependent extent of the reduction, or null for a full one (see <see cref="CodegenReductionRange"/>).</summary>
+    public CodegenReductionRange? ReductionRange { get; }
 
     /// <summary>
     /// True when any binding is stored as Float64: the spec computes in fp64, which only the plain fp64 lowering
@@ -402,10 +422,12 @@ public sealed class CodegenKernelSpec
         double reduceOffset = 0.0,
         int? postScaleInput = null,
         int? postBiasInput = null,
-        CodegenExpr? body = null)
+        CodegenExpr? body = null,
+        CodegenReductionRange? reductionRange = null)
     {
         if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Kernel needs a name.", nameof(name));
         Name = name;
+        ReductionRange = reductionRange;
         Space = space ?? throw new ArgumentNullException(nameof(space));
         _inputs = inputs ?? throw new ArgumentNullException(nameof(inputs));
         Output = output ?? throw new ArgumentNullException(nameof(output));
@@ -622,6 +644,26 @@ public sealed class CodegenKernelSpec
         if (postBiasInput.HasValue) Require(postBiasInput.Value, nameof(postBiasInput));
         if (!output.IsOutput)
             throw new ArgumentException("Output binding must be marked IsOutput.", nameof(output));
+
+        if (reductionRange is not null)
+        {
+            if (space.ReductionAxes.Length != 1 || space.ReductionAxes[0] != reductionRange.Axis)
+                throw new ArgumentException(
+                    "A reduction range must name the spec's single reduction axis.", nameof(reductionRange));
+            Require(reductionRange.IndexInput, nameof(reductionRange));
+            var rangeSource = inputs[reductionRange.IndexInput];
+            if (reductionRange.FloatIndices ? rangeSource.ElementType != CodegenElementType.Float32 : !rangeSource.IsIndexTensor)
+                throw new ArgumentException(
+                    "A reduction range reads its bounds from an int32 index tensor, or a float32 one declared FloatIndices; '" +
+                    rangeSource.Name + "' is " + rangeSource.ElementType + ".", nameof(reductionRange));
+            if (Array.IndexOf(productInputs, reductionRange.IndexInput) >= 0)
+                throw new ArgumentException("The range's index tensor cannot also be an operand.", nameof(reductionRange));
+            foreach (var term in reductionRange.Position.Terms)
+                if (space.Axes[term.Axis].IsReduction)
+                    throw new ArgumentException("A range's position reads parallel axes only.", nameof(reductionRange));
+            if (reductionRange.Position.Divisor != 1)
+                throw new ArgumentException("A range's position is a plain affine index.", nameof(reductionRange));
+        }
 
         bool hasReductionAxis = space.ReductionAxes.Length > 0;
         if (hasReductionAxis && reduce == CodegenReduceKind.None)
@@ -990,6 +1032,20 @@ public sealed class CodegenKernelSpec
             long argIndex = SecondaryNoWinnerIndex;
             long trips = Space.ReductionTripCount;
 
+            // A data-dependent range: [indices[position], indices[position + 1]), clamped to the axis' extent.
+            int rangeLo = 0, rangeHi = int.MaxValue;
+            if (ReductionRange is { } range)
+            {
+                if (range.Initial is { } initial) acc = initial;
+                var source = inputData[range.IndexInput];
+                int position = range.Position.Evaluate(values, out _);
+                int Bound(int at) => at < 0 || at >= source.Length ? 0
+                    : range.FloatIndices ? CodegenIndirectIndex.TruncateLikeTheDevice((float)source[at]) : (int)source[at];
+                int extent = axes[range.Axis].Extent;
+                rangeLo = Math.Max(0, Bound(position));
+                rangeHi = Math.Min(extent, Bound(position + 1));
+            }
+
             for (long t = 0; t < trips; t++)
             {
                 long rrest = t;
@@ -999,6 +1055,9 @@ public sealed class CodegenKernelSpec
                     values[reduction[r]] = (int)(rrest % extent);
                     rrest /= extent;
                 }
+                if (ReductionRange is { } active &&
+                    (values[active.Axis] < rangeLo || values[active.Axis] >= rangeHi))
+                    continue;
 
                 double product = 1.0;
                 bool anyOutOfBounds = false;
@@ -1103,6 +1162,7 @@ public sealed class CodegenKernelSpec
                 if (ok) acc += inputData[PostBiasInput.Value][off];
             }
             acc = ApplyActivation(Activation, acc);
+            if (ReductionRange is { EmptyValue: { } emptyValue } && rangeLo >= rangeHi) acc = emptyValue;
 
             for (int e = 0; e < _extraOutputs.Length; e++)
             {

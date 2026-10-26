@@ -57,14 +57,32 @@ public class CodegenSparseFamilyTests
                 for (int p = rowPtr[r]; p < rowPtr[r + 1]; p++) expected[r * 2 + j] += values[p] * dense[colIdx[p] * 2 + j];
         Assert.Equal(expected, outputs["out"]);
 
-        string ptx = new AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx.PtxAffineEmitter().Emit(program.Passes[1], 8, 6);
+        string ptx = new AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx.PtxAffineEmitter().Emit(program.Passes[0], 8, 6);
         Assert.Contains("ld.global.nc.f64", ptx);
         Assert.Contains("mul.rn.f64", ptx);
         Assert.Contains("add.rn.f64", ptx);
         Assert.Contains("st.global.f64", ptx);
         Assert.DoesNotContain("ld.global.nc.f32", ptx);
-        Assert.False(CodegenSplitReduction.IsSplittable(program.Passes[1]));
+        Assert.False(CodegenSplitReduction.IsSplittable(program.Passes[0]));
         Assert.Null(CodegenRowFusion.TryPlan(program, out _));
+    }
+
+    /// <summary>
+    /// A CSR row's entries are a data-dependent reduction extent: the plain lowering loads [rowPtr[r], rowPtr[r + 1])
+    /// and walks only those entries, skipping an empty row's body, instead of testing every stored entry per row.
+    /// </summary>
+    [Fact]
+    public void CsrSpMM_WalksOnlyItsOwnRowsEntries()
+    {
+        var pass = CodegenBackendPrograms.CsrSpMM(64, 48, 16, 300, NotEqual).Passes[0];
+        Assert.NotNull(pass.ReductionRange);
+        string ptx = new AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx.PtxAffineEmitter().Emit(pass, 8, 6);
+        Assert.Contains("(ranged)", ptx);
+        Assert.Contains("PLAINSKIP0", ptx);
+        Assert.Matches(@"setp\.lt\.s32 %p\d+, %r\d+, %r\d+;", ptx);   // the loop ends at the loaded bound
+        Assert.DoesNotMatch(@"setp\.lt\.s32 %p\d+, %r\d+, 300;", ptx);  // never at the declared nnz extent (only clamps)
+        Assert.False(CodegenSplitReduction.IsSplittable(pass));
+        Assert.Null(CodegenRowFusion.TryPlan(new CodegenProgram(new[] { pass }, Array.Empty<long>(), "p"), out _));
     }
 
     [Fact]
@@ -87,6 +105,7 @@ public class CodegenSparseFamilyTests
     private static readonly CodegenLibraryFunction Min = new("min_vectors", "test", 2, a => a[0] < a[1] ? a[0] : a[1]);
     private static readonly CodegenLibraryFunction Divide = new("divide_vectors", "test", 2, a => a[1] != 0 ? a[0] / a[1] : 0);
     private static readonly CodegenLibraryFunction Sqrt = new("sqrt_vector", "test", 1, a => Math.Sqrt(a[0]));
+    private static readonly CodegenLibraryFunction Select = new("where_select", "test", 3, a => a[0] != 0 ? a[1] : a[2]);
 
     // 4 rows (row 1 empty), 3 input rows, 2 columns; 6 column-index slots, the last past the final row pointer.
     private static readonly double[] SegRowPtr = { 0, 2, 2, 4, 5 };
@@ -127,7 +146,7 @@ public class CodegenSparseFamilyTests
         var input = new double[] { 1, -2, 3, 4, 5, 0.5 };
         var sources = SegSources();
         sources["input"] = input;
-        var std = CodegenBackendPrograms.CsrSegmentedStdDev(4, 3, 2, 6, 1e-8f, NotEqual, Divide, Sqrt).Interpret(sources)["out"];
+        var std = CodegenBackendPrograms.CsrSegmentedStdDev(4, 3, 2, 6, 1e-8f, NotEqual, Divide, Sqrt, Select).Interpret(sources)["out"];
         for (int r = 0; r < 4; r++)
             for (int j = 0; j < 2; j++)
             {

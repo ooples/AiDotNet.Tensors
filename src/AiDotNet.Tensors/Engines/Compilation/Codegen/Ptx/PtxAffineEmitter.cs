@@ -1101,8 +1101,9 @@ public sealed partial class PtxAffineEmitter
     {
         if (spec is null) throw new ArgumentNullException(nameof(spec));
 
-        // An fp64 tensor makes the whole spec fp64, which only the plain fp64 lowering emits (PtxAffineEmitter.Double).
-        if (ComputesInDouble(spec)) return EmitDouble(spec, computeMajor, computeMinor);
+        // An fp64 tensor makes the whole spec fp64, and a data-dependent reduction extent is a loop with run-time
+        // bounds: only the plain lowering emits either (PtxAffineEmitter.Plain).
+        if (LowersPlainly(spec)) return EmitPlain(spec, computeMajor, computeMinor);
 
         // A non-real algebra takes its own path, leaving everything below untouched. See
         // PtxAffineEmitter.Algebra.cs for why that separation is deliberate rather than lazy.
@@ -2630,7 +2631,16 @@ public sealed partial class PtxAffineEmitter
             long span = (long)term.Coefficient * (axesMeta[term.Axis].Extent - 1);
             if (term.Coefficient >= 0) rangeHi += span; else rangeLo += span;
         }
-        bool canEscape = bounded && (expr.Divisor != 1 || rangeLo < 0 || rangeHi >= dim);
+        // A floor division of a never-negative numerator (a grouped head, h / g) stays inside [lo / d, hi / d], so it
+        // needs a guard only when that range leaves the dimension -- as any other index. An exact division keeps its
+        // own predicate above, and a possibly negative numerator truncates toward zero, so both stay guarded.
+        if (expr.Divisor > 1 && !expr.RequiresExactDivision && rangeLo >= 0)
+        {
+            rangeLo /= expr.Divisor;
+            rangeHi /= expr.Divisor;
+        }
+        bool divides = expr.Divisor != 1 && (expr.RequiresExactDivision || rangeLo < 0);
+        bool canEscape = bounded && (divides || rangeLo < 0 || rangeHi >= dim);
         if (!canEscape) ElidedGuards++;
         if (canEscape)
         {

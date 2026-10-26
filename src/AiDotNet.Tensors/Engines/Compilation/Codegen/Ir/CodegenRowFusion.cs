@@ -410,6 +410,12 @@ public static class CodegenRowFusion
                 return null;
             }
         foreach (var pass in program.Passes)
+            if (pass.ReductionRange is not null)
+            {
+                reason = pass.Name + " has a data-dependent reduction extent, which only the plain lowering emits";
+                return null;
+            }
+        foreach (var pass in program.Passes)
             if (pass.HasDoubles)
             {
                 reason = pass.Name + " computes in fp64, which only the fp64 lowering emits";

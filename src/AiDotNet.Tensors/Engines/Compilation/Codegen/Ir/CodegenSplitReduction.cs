@@ -94,7 +94,8 @@ public static class CodegenSplitReduction
         if (spec is null) throw new ArgumentNullException(nameof(spec));
         return IsSplittable(spec.Reduce) &&
             spec.SecondaryOutput is null && spec.SecondaryIndexExpr is null &&
-            spec.ExtraOutputs.Count == 0 && !AnyIndirection(spec) && !spec.HasIntegerValues && !spec.HasDoubles;
+            spec.ExtraOutputs.Count == 0 && !AnyIndirection(spec) && !spec.HasIntegerValues && !spec.HasDoubles &&
+            spec.ReductionRange is null;
     }
 
     private static bool AnyIndirection(CodegenKernelSpec spec)

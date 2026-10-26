@@ -99,7 +99,7 @@ public sealed partial class CudaBackend
         DeclaredFamily.CsrSegmentedMin => CodegenBackendPrograms.CsrSegmentedMin(key.D0, key.D1, key.D2, key.D3,
             NotEqualScalar(), DerivedFunction("min_vectors")),
         _ => CodegenBackendPrograms.CsrSegmentedStdDev(key.D0, key.D1, key.D2, key.D3,
-            key.Epsilon, NotEqualScalar(), DivideVectors(), DerivedFunction("sqrt_vector")),
+            key.Epsilon, NotEqualScalar(), DivideVectors(), DerivedFunction("sqrt_vector"), DerivedFunction("where_select")),
     };
 
     /// <summary>

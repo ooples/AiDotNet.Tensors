@@ -412,6 +412,17 @@ public sealed record CodegenAutotuneIdentity(
                 .Append(";postScale=").Append(Optional(spec.PostScaleInput))
                 .Append(";postBias=").Append(Optional(spec.PostBiasInput)).Append(';');
 
+        // Only when present, so every identity recorded before ranges existed is unchanged.
+        if (spec.ReductionRange is { } range)
+        {
+            text.Append("range=").Append(range.Axis.ToString(CultureInfo.InvariantCulture)).Append(',')
+                .Append(range.IndexInput.ToString(CultureInfo.InvariantCulture)).Append(',');
+            AppendExpr(text, range.Position);
+            text.Append(range.FloatIndices ? ",f" : ",i")
+                .Append(",init=").Append(range.Initial?.ToString("R", CultureInfo.InvariantCulture) ?? "-")
+                .Append(",empty=").Append(range.EmptyValue?.ToString("R", CultureInfo.InvariantCulture) ?? "-").Append(';');
+        }
+
         for (int i = 0; i < spec.ExtraOutputs.Count; i++)
         {
             var extra = spec.ExtraOutputs[i];
