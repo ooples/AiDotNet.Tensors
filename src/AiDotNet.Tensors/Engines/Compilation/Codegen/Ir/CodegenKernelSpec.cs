@@ -183,6 +183,21 @@ public sealed class CodegenKernelSpec
     public CodegenTensorBinding Output { get; }
 
     /// <summary>
+    /// True when any binding is stored as Float64: the spec computes in fp64, which only the plain fp64 lowering
+    /// (PtxAffineEmitter.Double) emits; every planner that rebuilds or retiles a spec refuses one.
+    /// </summary>
+    public bool HasDoubles
+    {
+        get
+        {
+            if (Output.ElementType == CodegenElementType.Float64) return true;
+            foreach (var input in _inputs) if (input.ElementType == CodegenElementType.Float64) return true;
+            foreach (var extra in _extraOutputs) if (extra.Binding.ElementType == CodegenElementType.Float64) return true;
+            return false;
+        }
+    }
+
+    /// <summary>
     /// True when any binding is an int32 tensor of values (<see cref="CodegenTensorBinding.IsIntegerValue"/>). Only the
     /// generic affine lowering converts those; every planner that rebuilds bindings refuses such a spec.
     /// </summary>

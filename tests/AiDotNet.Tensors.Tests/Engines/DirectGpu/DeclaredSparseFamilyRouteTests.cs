@@ -125,6 +125,57 @@ public sealed class DeclaredSparseFamilyRouteTests
 
     [SkippableTheory]
     [InlineData(64, 48, 16, 0.10)]
+    [InlineData(17, 9, 1, 0.30)]
+    [InlineData(128, 256, 33, 0.05)]
+    public void CsrSpMMDouble_MatchesTheHandWrittenKernel(int rows, int cols, int n, double density)
+    {
+        using var backend = OpenOrSkip();
+        var random = RandomHelper.CreateSeededRandom(1446 + rows);
+        var rowPtr = new int[rows + 1];
+        var colList = new List<int>();
+        var valueList = new List<double>();
+        for (int r = 0; r < rows; r++)
+        {
+            if (r % 5 != 3)
+                for (int c = 0; c < cols; c++)
+                    if (random.NextDouble() < density) { colList.Add(c); valueList.Add(random.NextDouble() * 4 - 2); }
+            rowPtr[r + 1] = colList.Count;
+        }
+        int nnz = colList.Count;
+        var dense = new double[cols * n];
+        for (int i = 0; i < dense.Length; i++) dense[i] = random.NextDouble() * 6 - 3;
+
+        IGpuBuffer Doubles(double[] data)
+        {
+            var buffer = backend.AllocateByteBuffer(data.Length * sizeof(double));
+            var bytes = new byte[data.Length * sizeof(double)];
+            Buffer.BlockCopy(data, 0, bytes, 0, bytes.Length);
+            backend.UploadByteBuffer(buffer, bytes);
+            return buffer;
+        }
+        using var values = Doubles(valueList.ToArray());
+        using var denseBuf = Doubles(dense);
+        using var colIdx = Ints(backend, colList.ToArray());
+        using var rowPointers = Ints(backend, rowPtr);
+        var results = new double[2][];
+        foreach (bool declared in new[] { false, true })
+        {
+            using var output = backend.AllocateByteBuffer(rows * n * sizeof(double));
+            backend.DeclaredCsrSpMMSwitch = declared;
+            long before = backend.DeclaredProgramLaunches;
+            backend.CsrSpMMDouble(values, colIdx, rowPointers, denseBuf, output, rows, cols, n, nnz);
+            if (declared) Assert.True(backend.DeclaredProgramLaunches == before + 1, "The declared fp64 route declined.");
+            var bytes = backend.DownloadByteBuffer(output, rows * n * sizeof(double));
+            results[declared ? 1 : 0] = new double[rows * n];
+            Buffer.BlockCopy(bytes, 0, results[declared ? 1 : 0], 0, bytes.Length);
+        }
+        for (int i = 0; i < rows * n; i++)
+            Assert.True(Math.Abs(results[0][i] - results[1][i]) <= 1e-12 * Math.Max(1, Math.Abs(results[0][i])),
+                $"index {i}: hand-written {results[0][i]:R}, declared {results[1][i]:R}");
+    }
+
+    [SkippableTheory]
+    [InlineData(64, 48, 16, 0.10)]
     [InlineData(17, 9, 4, 0.30)]
     [InlineData(200, 100, 8, 0.02)]
     public void CsrSegmentedReductions_MatchTheHandWrittenKernels(int rows, int k, int n, double density)

@@ -4912,6 +4912,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
+        // Declared route (#1441): the fp64 program.
+        if (TryDeclaredCsrSpMMDouble(csrValues, csrColIndices, csrRowPointers, denseB, output, M, K, N, nnz)) return;
+
         if (!_kernelCache.TryGetValue("csr_spmm_double", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: csr_spmm_double");
 

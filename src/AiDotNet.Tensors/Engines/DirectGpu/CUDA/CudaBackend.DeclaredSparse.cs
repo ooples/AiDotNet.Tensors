@@ -42,6 +42,29 @@ public sealed partial class CudaBackend
             new DeclaredBindings(rowPointers, colIndices, values, dense, bias, output));
     }
 
+    private static readonly string[] s_csrSpMMDoubleNames = { "rowPtr", "colIdx", "values", "dense", "out" };
+
+    private static readonly Func<DeclaredKey, CodegenProgram> s_buildCsrSpMMDouble =
+        key => CodegenBackendPrograms.CsrSpMMDouble(key.D0, key.D1, key.D2, key.D3);
+
+    /// <summary>
+    /// CsrSpMMDouble through its fp64 declared program (#1441). The fp64 buffers' sizes are in bytes (8 per element).
+    /// False -- nothing launched -- when declined.
+    /// </summary>
+    internal bool TryDeclaredCsrSpMMDouble(IGpuBuffer values, IGpuBuffer colIndices, IGpuBuffer rowPointers,
+        IGpuBuffer dense, IGpuBuffer output, int rows, int cols, int n, int nnz)
+    {
+        if (!DeclaredCsrSpMMEnabled || rows <= 0 || cols <= 0 || n <= 0 || nnz <= 0 ||
+            (long)rows * nnz > DeclaredCsrSpMMMaxRowEntries || rowPointers.SizeInBytes < (rows + 1L) * sizeof(int) ||
+            colIndices.SizeInBytes < (long)nnz * sizeof(int) || values.SizeInBytes < (long)nnz * sizeof(double) ||
+            dense.SizeInBytes < (long)cols * n * sizeof(double) || output.SizeInBytes < (long)rows * n * sizeof(double))
+            return false;
+        var key = new DeclaredKey(DeclaredFamily.CsrSpMMDouble, rows, cols, n, nnz, 0f, 0f);
+        if (!ClaimDeclaredSlot(key, ref _declaredCsrSpMMPrograms, DeclaredCsrSpMMProgramCap)) return false;
+        return TryRunDeclaredProgram(key, s_buildCsrSpMMDouble, s_csrSpMMDoubleNames,
+            new DeclaredBindings(rowPointers, colIndices, values, dense, output));
+    }
+
     /// <summary>
     /// CsrSddmm through its declared program (#1441). x's and y's row counts come from their sizes. False -- nothing
     /// launched -- when declined.

@@ -40,6 +40,34 @@ public class CodegenSparseFamilyTests
     }
 
     [Fact]
+    public void CsrSpMMDouble_SumsInDoublePrecisionAndLowersToF64()
+    {
+        int[] rowPtr = { 0, 2, 2, 3 };
+        int[] colIdx = { 1, 0, 2 };
+        double[] values = { 1.0 / 3, -2.0 / 7, 1e-9 };
+        double[] dense = { 1, 2, 3, 4, 5, double.PositiveInfinity };
+        var program = CodegenBackendPrograms.CsrSpMMDouble(3, 3, 2, 3);
+        var outputs = program.Interpret(new Dictionary<string, double[]>
+        {
+            ["rowPtr"] = D(rowPtr), ["colIdx"] = D(colIdx), ["values"] = values, ["dense"] = dense,
+        });
+        var expected = new double[6];
+        for (int r = 0; r < 3; r++)
+            for (int j = 0; j < 2; j++)
+                for (int p = rowPtr[r]; p < rowPtr[r + 1]; p++) expected[r * 2 + j] += values[p] * dense[colIdx[p] * 2 + j];
+        Assert.Equal(expected, outputs["out"]);
+
+        string ptx = new AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx.PtxAffineEmitter().Emit(program.Passes[1], 8, 6);
+        Assert.Contains("ld.global.nc.f64", ptx);
+        Assert.Contains("mul.rn.f64", ptx);
+        Assert.Contains("add.rn.f64", ptx);
+        Assert.Contains("st.global.f64", ptx);
+        Assert.DoesNotContain("ld.global.nc.f32", ptx);
+        Assert.False(CodegenSplitReduction.IsSplittable(program.Passes[1]));
+        Assert.Null(CodegenRowFusion.TryPlan(program, out _));
+    }
+
+    [Fact]
     public void Sddmm_DotsTheSampledRowsAndColumns()
     {
         int[] rows = { 0, 2, 1, 2 }, cols = { 1, 0, 1, 3 };

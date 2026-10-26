@@ -423,6 +423,7 @@ public sealed class CodegenTensorBinding
     {
         CodegenElementType.Float16 or CodegenElementType.BFloat16 => 2,
         CodegenElementType.UInt8 => 1,
+        CodegenElementType.Float64 => 8,
         _ => 4,
     };
 
@@ -498,7 +499,8 @@ public sealed class CodegenTensorBinding
         // multiply by one: a gather's index buffer read as a float operand would produce
         // arithmetic out of a bit pattern, silently.
         if (elementType is not (CodegenElementType.Float32 or CodegenElementType.Float16
-                or CodegenElementType.BFloat16 or CodegenElementType.Int32 or CodegenElementType.UInt8))
+                or CodegenElementType.BFloat16 or CodegenElementType.Int32 or CodegenElementType.UInt8
+                or CodegenElementType.Float64))
             throw new ArgumentException(
                 "The PTX emitter stores fp32, fp16, bf16, or int32 indices; got " + elementType +
                 ". Anything else must be refused here rather than silently emitted as fp32.",

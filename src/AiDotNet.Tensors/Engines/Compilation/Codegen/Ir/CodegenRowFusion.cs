@@ -410,6 +410,12 @@ public static class CodegenRowFusion
                 return null;
             }
         foreach (var pass in program.Passes)
+            if (pass.HasDoubles)
+            {
+                reason = pass.Name + " computes in fp64, which only the fp64 lowering emits";
+                return null;
+            }
+        foreach (var pass in program.Passes)
             if (pass.HasIntegerValues)
             {
                 reason = pass.Name + " reads or writes integer values, which only the affine lowering converts";

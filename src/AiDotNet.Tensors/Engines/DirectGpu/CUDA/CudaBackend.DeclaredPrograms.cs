@@ -134,6 +134,9 @@ internal enum DeclaredFamily
 
     /// <summary>The masked scatter through a byte mask and its prefix positions (#1441).</summary>
     MaskedScatter,
+
+    /// <summary>CSR · dense → dense in double precision (#1441).</summary>
+    CsrSpMMDouble,
 }
 
 /// <summary>One declared program: its family and shape (unused dimensions are 0).</summary>
@@ -524,7 +527,7 @@ public sealed partial class CudaBackend
         // The scratch this program would pin for the backend's lifetime, decided BEFORE any of it is allocated.
         long scratchBytes = 0;
         foreach (var pair in lowering.Buffers)
-            if (!slotOf.ContainsKey(pair.Key)) scratchBytes = checked(scratchBytes + pair.Value * sizeof(float));
+            if (!slotOf.ContainsKey(pair.Key)) scratchBytes = checked(scratchBytes + ScratchFloats(lowering, pair.Key) * sizeof(float));
         if (!DeclaredScratchFits(scratchBytes, out string? overBudget))
         {
             decline = overBudget;
@@ -541,7 +544,7 @@ public sealed partial class CudaBackend
             {
                 if (slotOf.ContainsKey(pair.Key)) continue;
                 scratchOf[pair.Key] = scratch.Count;
-                scratch.Add(AllocateBuffer(checked((int)pair.Value)));
+                scratch.Add(AllocateBuffer(checked((int)ScratchFloats(lowering, pair.Key))));
             }
             var argumentSlots = new int[lowering.Steps.Count][];
             for (int s = 0; s < lowering.Steps.Count; s++)
@@ -580,6 +583,10 @@ public sealed partial class CudaBackend
             throw;
         }
     }
+
+    // Scratch is allocated in floats: an fp64 intermediate needs two per element, a byte mask a quarter of one.
+    private static long ScratchFloats(PtxProgramLowering lowering, string name) =>
+        (lowering.BufferBytes(name) + sizeof(float) - 1) / sizeof(float);
 
     /// <summary>Why the program for <paramref name="key"/> declined, or null when it did not.</summary>
     internal string? DeclaredDeclineReason(DeclaredKey key)

@@ -1101,6 +1101,9 @@ public sealed partial class PtxAffineEmitter
     {
         if (spec is null) throw new ArgumentNullException(nameof(spec));
 
+        // An fp64 tensor makes the whole spec fp64, which only the plain fp64 lowering emits (PtxAffineEmitter.Double).
+        if (ComputesInDouble(spec)) return EmitDouble(spec, computeMajor, computeMinor);
+
         // A non-real algebra takes its own path, leaving everything below untouched. See
         // PtxAffineEmitter.Algebra.cs for why that separation is deliberate rather than lazy.
         if (spec.Algebra != CodegenAlgebra.Real)

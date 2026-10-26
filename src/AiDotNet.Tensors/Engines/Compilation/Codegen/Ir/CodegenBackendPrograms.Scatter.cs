@@ -545,6 +545,59 @@ public static partial class CodegenBackendPrograms
     }
 
     /// <summary>
+    /// CSR SpMM in double precision (#1441), in CudaBackend.CsrSpMMDouble's contract: values, dense and out are fp64,
+    /// <c>out[r, j] = sum over row r's entries p of values[p] * dense[colIdx[p], j]</c> in increasing p, an empty row
+    /// exactly 0. The same inversion over the stored entries as <see cref="CsrSpMM(int, int, int, int,
+    /// CodegenLibraryFunction)"/>; every pass computes in fp64 (PtxAffineEmitter.Double). Its tensor of ones is the
+    /// column indices read as integer values times 0, plus 1 -- exact for any finite integer, so it needs no fp32
+    /// library function.
+    /// </summary>
+    public static CodegenProgram CsrSpMMDouble(int rows, int cols, int n, int nnz)
+    {
+        if (rows <= 0 || cols <= 0 || n <= 0 || nnz <= 0)
+            throw new ArgumentOutOfRangeException(nameof(rows), "CSR SpMM extents must be positive.");
+        var f64 = CodegenElementType.Float64;
+        var oneBody = CodegenExpr.Add(CodegenExpr.Multiply(Op(0), CodegenExpr.Constant(0.0)), CodegenExpr.Constant(1.0));
+        var ones = new CodegenKernelSpec("csr_spmm_double_ones", new CodegenIterationSpace(CodegenAxis.Parallel("p", nnz)),
+            new[]
+            {
+                new CodegenTensorBinding(0, "colIdx", new[] { nnz }, new[] { A(0) }, elementType: CodegenElementType.Int32,
+                    integerValue: true),
+            },
+            new CodegenTensorBinding(1, "ones", new[] { nnz }, new[] { A(0) }, isOutput: true, elementType: f64),
+            oneBody.Operands(), CodegenReduceKind.None, body: oneBody);
+
+        var space = new CodegenIterationSpace(CodegenAxis.Parallel("r", rows), CodegenAxis.Parallel("j", n),
+            CodegenAxis.Reduce("p", nnz));
+        var main = new CodegenKernelSpec("csr_spmm_double", space,
+            new[]
+            {
+                new CodegenTensorBinding(0, "rowPtr", new[] { rows + 1 }, new[] { A(0) }, elementType: CodegenElementType.Int32),
+                new CodegenTensorBinding(1, "colIdx", new[] { nnz }, new[] { A(2) }, elementType: CodegenElementType.Int32),
+                new CodegenTensorBinding(2, "values", new[] { nnz }, new[] { A(2) }, elementType: f64),
+                new CodegenTensorBinding(3, "dense", new[] { cols, n }, new[] { CodegenAffineExpr.Const(0), A(1) },
+                    elementType: f64,
+                    indirect: new CodegenIndirectIndex?[] { new CodegenIndirectIndex(1, A(2), cols), null }),
+                new CodegenTensorBinding(4, "ones", new[] { nnz }, new[] { CodegenAffineExpr.Const(0) }, elementType: f64,
+                    indirect: new CodegenIndirectIndex?[]
+                    {
+                        new CodegenIndirectIndex(0, A(0), nnz, CodegenIndexOutOfRange.Skip, floatIndices: false,
+                            offset: new CodegenAffineExpr(new[] { new CodegenAffineTerm(2, 1) }, -(nnz - 1))),
+                    }),
+                new CodegenTensorBinding(5, "ones", new[] { nnz }, new[] { CodegenAffineExpr.Const(0) }, elementType: f64,
+                    indirect: new CodegenIndirectIndex?[]
+                    {
+                        new CodegenIndirectIndex(0, new CodegenAffineExpr(new[] { new CodegenAffineTerm(0, 1) }, 1), nnz,
+                            CodegenIndexOutOfRange.Skip, floatIndices: false,
+                            offset: new CodegenAffineExpr(new[] { new CodegenAffineTerm(2, 1) }, 1)),
+                    }),
+            },
+            new CodegenTensorBinding(6, "out", new[] { rows, n }, new[] { A(0), A(1) }, isOutput: true, elementType: f64),
+            new[] { 2, 3, 4, 5 }, CodegenReduceKind.Sum);
+        return new CodegenProgram(new[] { ones, main }, new long[] { nnz }, "fp64 csr spmm (backend contract)");
+    }
+
+    /// <summary>
     /// The masked scatter (#1441), in CudaBackend.Parity210MaskedScatter's contract: where the byte mask is set,
     /// <c>out[k] = source[prefix[k]]</c> when that position is inside the source; everywhere else out keeps its value.
     /// The mask is read as uint8 values; whether the prefix position is inside the source is its own pass (a ones read

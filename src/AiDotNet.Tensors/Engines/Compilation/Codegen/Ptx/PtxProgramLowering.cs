@@ -41,12 +41,23 @@ public sealed record PtxPassLowering(IReadOnlyList<PtxPassKernel> Kernels, Codeg
 public sealed class PtxProgramLowering
 {
     private PtxProgramLowering(IReadOnlyList<PtxProgramStep> steps, IReadOnlyDictionary<string, long> buffers,
-        IReadOnlyList<string> passLowerings)
+        IReadOnlyList<string> passLowerings, IReadOnlyDictionary<string, int> elementBytes)
     {
         Steps = steps;
         Buffers = buffers;
         PassLowerings = passLowerings;
+        ElementBytes = elementBytes;
     }
+
+    /// <summary>
+    /// Bytes per element of every program tensor that is not 4 bytes wide (an fp64 tensor, a byte mask); a name absent
+    /// here, "#temp" scratch included, is 4 bytes. A caller allocating scratch sizes it by this, not by element count.
+    /// </summary>
+    public IReadOnlyDictionary<string, int> ElementBytes { get; }
+
+    /// <summary>The bytes buffer <paramref name="name"/> occupies.</summary>
+    public long BufferBytes(string name) =>
+        Buffers[name] * (ElementBytes.TryGetValue(name, out int bytes) ? bytes : sizeof(float));
 
     /// <summary>How each pass was lowered, parallel to the program's passes ("row-fused x3", "split x2", ...).</summary>
     public IReadOnlyList<string> PassLowerings { get; }
@@ -82,6 +93,15 @@ public sealed class PtxProgramLowering
         {
             buffers[pass.Output.Name] = pass.Output.ElementCount;
             foreach (var extra in pass.ExtraOutputs) buffers[extra.Binding.Name] = extra.Binding.ElementCount;
+        }
+        var elementBytes = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var pass in program.Passes)
+        {
+            foreach (var input in pass.Inputs)
+                if (input.ElementBytes != sizeof(float)) elementBytes[input.Name] = input.ElementBytes;
+            if (pass.Output.ElementBytes != sizeof(float)) elementBytes[pass.Output.Name] = pass.Output.ElementBytes;
+            foreach (var extra in pass.ExtraOutputs)
+                if (extra.Binding.ElementBytes != sizeof(float)) elementBytes[extra.Binding.Name] = extra.Binding.ElementBytes;
         }
 
         var passes = program.Passes;
@@ -187,7 +207,7 @@ public sealed class PtxProgramLowering
                 labels.Add("single");
             }
         }
-        return new PtxProgramLowering(steps, buffers, labels);
+        return new PtxProgramLowering(steps, buffers, labels, elementBytes);
     }
 
     private static PtxProgramStep Step(PtxPassKernel kernel, IReadOnlyList<string> args) =>
