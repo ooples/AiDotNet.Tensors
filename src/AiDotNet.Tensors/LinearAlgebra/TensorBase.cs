@@ -658,6 +658,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         // Drop any no-upcast quantized weight too — the pool holds the canonical bytes.
         StreamingInt8 = null;
         StreamingInt4 = null;
+        var droppedData = _data;
         _data = replacementData;
         _storage = replacementStorage;
         InvalidateGpuBindingAfterStorageReplacement();
@@ -666,7 +667,32 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         catch (Exception error) { System.Diagnostics.Trace.TraceWarning("Streaming storage cleanup failed: {0}", error); }
         try { DisposeStreamingMmapOwner(); }
         catch (Exception error) { System.Diagnostics.Trace.TraceWarning("Streaming mapping cleanup failed: {0}", error); }
+        ParkDroppedRestoreArray(claimedStorage, droppedData);
         return true;
+    }
+
+    /// <summary>
+    /// Offers a dropped weight's array back to the restore pool (#2322) when nothing else can still read it: the
+    /// claimed storage was the only one wrapping it, it spans the whole array, and no GPU result is still due to be
+    /// downloaded into it. The pool itself only takes arrays a restore created, and holds them back until no
+    /// gradient tape is active.
+    /// </summary>
+    private void ParkDroppedRestoreArray(TensorStorage<T> claimedStorage, Vector<T> droppedData)
+    {
+        try
+        {
+            if (!StreamingRestoreBuffers<T>.Supported) return;
+            if (System.Threading.Volatile.Read(ref droppedData.LiveStorages) != 1) return;
+            if (!claimedStorage.TryGetBackingArrayIdentity(out var array, out int offset) || array is null) return;
+            if (offset != 0 || array.Length != Length) return;
+            if (Helpers.HostSync.IsPending(array)) return;
+            StreamingRestoreBuffers<T>.Park(array);
+        }
+        catch (Exception error)
+        {
+            // Recycling is an optimization; a failure leaves the array to the garbage collector as before.
+            System.Diagnostics.Trace.TraceWarning("Streaming restore-array recycling skipped: {0}", error);
+        }
     }
 
     // Explicit IStreamingDroppable implementation — the underlying members are
@@ -730,6 +756,10 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
                 "Streaming restore requires contiguous, non-view, zero-offset tensors.");
 
         Vector<T> fresh;
+        // The float/double paths decode into an array from the restore pool (#2322); a recycled one needs its
+        // identity-keyed caches invalidated once it is installed.
+        bool recycled = false;
+        T[]? restoredArray = null;
         // bf16-encoded store (StreamingEncoding.Bf16): the backing bytes are
         // 2-per-element bf16; widen them back to T (float/double) here. The pool is
         // byte-agnostic, so the 2x-smaller bytes flowed through register/evict/
@@ -743,15 +773,17 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
                     $"expected {expectedBf16} bytes (Length={Length} × 2).");
             if (typeof(T) == typeof(float))
             {
-                var arr = new float[Length];
+                var arr = StreamingRestoreBuffers<float>.Rent(Length, out recycled);
                 StreamingStoreCodec.DecodeFloat(bytes, arr);
-                fresh = Vector<T>.WrapMemory((T[])(object)arr);
+                restoredArray = (T[])(object)arr;
+                fresh = Vector<T>.WrapMemory(restoredArray);
             }
             else if (typeof(T) == typeof(double))
             {
-                var arr = new double[Length];
+                var arr = StreamingRestoreBuffers<double>.Rent(Length, out recycled);
                 StreamingStoreCodec.DecodeDouble(bytes, arr);
-                fresh = Vector<T>.WrapMemory((T[])(object)arr);
+                restoredArray = (T[])(object)arr;
+                fresh = Vector<T>.WrapMemory(restoredArray);
             }
             else
             {
@@ -827,15 +859,17 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
             // Lossless (byte-shuffle + LZ4): variable-size payload → exact bytes for T.
             if (typeof(T) == typeof(float))
             {
-                var arr = new float[Length];
+                var arr = StreamingRestoreBuffers<float>.Rent(Length, out recycled);
                 StreamingStoreCodec.DecodeLosslessFloat(bytes, arr);
-                fresh = Vector<T>.WrapMemory((T[])(object)arr);
+                restoredArray = (T[])(object)arr;
+                fresh = Vector<T>.WrapMemory(restoredArray);
             }
             else if (typeof(T) == typeof(double))
             {
-                var arr = new double[Length];
+                var arr = StreamingRestoreBuffers<double>.Rent(Length, out recycled);
                 StreamingStoreCodec.DecodeLosslessDouble(bytes, arr);
-                fresh = Vector<T>.WrapMemory((T[])(object)arr);
+                restoredArray = (T[])(object)arr;
+                fresh = Vector<T>.WrapMemory(restoredArray);
             }
             else
             {
@@ -865,7 +899,24 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
             // constrained to struct on TensorBase, so we go through typed
             // arrays via the (T[])(object)typed[] cast that's safe at runtime
             // when typeof(T) matches.
-            fresh = DeserializeToVector(bytes, Length);
+            if (typeof(T) == typeof(float))
+            {
+                var arr = StreamingRestoreBuffers<float>.Rent(Length, out recycled);
+                bytes.CopyTo(System.Runtime.InteropServices.MemoryMarshal.AsBytes(arr.AsSpan()));
+                restoredArray = (T[])(object)arr;
+                fresh = Vector<T>.WrapMemory(restoredArray);
+            }
+            else if (typeof(T) == typeof(double))
+            {
+                var arr = StreamingRestoreBuffers<double>.Rent(Length, out recycled);
+                bytes.CopyTo(System.Runtime.InteropServices.MemoryMarshal.AsBytes(arr.AsSpan()));
+                restoredArray = (T[])(object)arr;
+                fresh = Vector<T>.WrapMemory(restoredArray);
+            }
+            else
+            {
+                fresh = DeserializeToVector(bytes, Length);
+            }
         }
 
         // Re-materializing as a heap copy supersedes any zero-copy mmap alias;
@@ -876,6 +927,14 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         _storage = new TensorStorage<T>(_data);
         InvalidateGpuBindingAfterStorageReplacement();
         oldStorage.Release();
+
+        // A recycled array (#2322) keeps the identity of the weight it last held, so every cache keyed by array
+        // identity sees the refill as an in-place mutation: the CPU derived-weight caches and any GPU upload epoch.
+        if (recycled && restoredArray is not null)
+        {
+            Engines.InferenceWeightCache.Invalidate(restoredArray);
+            TensorStorage<T>.InvalidateExternalArrayEpoch(restoredArray);
+        }
     }
 
     private static int ElementSizeForStreaming()

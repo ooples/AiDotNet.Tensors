@@ -99,6 +99,18 @@ internal sealed class TensorStorage<T>
         if (Volatile.Read(ref _trackGpuCacheVersion)) Interlocked.Increment(ref _gpuCacheVersion);
     }
 
+    /// <summary>
+    /// Advances the shared GPU-cache epoch of <paramref name="array"/>, if any wrapper started tracking one, so an
+    /// upload cached under that array identity is not reused after the array is refilled with other contents (a
+    /// recycled streaming restore array, #2322).
+    /// </summary>
+    internal static void InvalidateExternalArrayEpoch(T[] array)
+    {
+        if (array is null || !ExternalArrayGpuCacheEpochs.Any) return;
+        if (ExternalArrayGpuCacheEpochs.Table.TryGetValue(array, out var epoch) && Volatile.Read(ref epoch.IsTracked))
+            Interlocked.Increment(ref epoch.Version);
+    }
+
     internal void CopyGpuCacheTrackingFrom(TensorStorage<T> source)
     {
         // COW replacement owns a different array. Copy the snapshot, never the external

@@ -248,7 +248,7 @@ public sealed class StreamingTensorPool : IDisposable
                 throw new ArgumentOutOfRangeException(nameof(reservedBytes));
 
             long id = _nextHandleId++;
-            var entry = new Entry { Data = data, ResidentBytes = data.Length };
+            var entry = new Entry { Data = data, DataLength = data.Length, ResidentBytes = data.Length };
             LinkedListNode<long>? node = null;
             bool entryAdded = false;
             bool residentBytesAdded = false;
@@ -346,45 +346,90 @@ public sealed class StreamingTensorPool : IDisposable
         {
             ThrowIfDisposed();
             if (!_entries.TryGetValue(handleId, out var entry)) return;
+            InstallEntryDataUnlocked(handleId, entry, newData, newData.Length);
+        }
+    }
 
-            long oldResident = entry.Data?.Length ?? 0;
-            entry.Data = newData;
-            entry.ResidentBytes = newData.Length;
-            // The new bytes have NOT been written to the backing file, so force the
-            // next eviction to (re-)write them rather than dropping the resident copy
-            // as if the file already held it. Also reset the compressed/uncompressed
-            // metadata: the caller supplies canonical native or lossless bytes, so a
-            // prior compressed page-out's sizes no longer describe this content.
-            entry.BackingFileCurrent = false;
-            entry.IsCompressed = false;
-            entry.UncompressedBytes = newData.Length;
-
-            // Net resident delta: the new buffer replaces whatever was resident before
-            // (which is 0 when the entry was paged out). Keep _residentBytes exact so
-            // the budget check below — and every future one — stays correct.
-            long delta = newData.Length - oldResident;
-            if (delta != 0)
+    /// <summary>
+    /// <see cref="ReplaceEntryData(long, byte[])"/> straight from the stream a write-back encoded into, without the
+    /// intermediate array (#2322). When the entry is resident and its buffer holds the new content with at most an
+    /// eighth to spare, the buffer is refilled in place; otherwise a new one is allocated with a little headroom,
+    /// so a lossless entry whose size drifts by a few bytes from step to step settles on one buffer. The buffer
+    /// is the pool's alone: every reader copies out under this lock (the span <see cref="Rehydrate(long, bool)"/>
+    /// returns is only taken by prefetch, which discards it).
+    /// </summary>
+    internal void ReplaceEntryData(long handleId, PooledChunkWriteStream source)
+    {
+        if (source is null) throw new ArgumentNullException(nameof(source));
+        if (source.Length > int.MaxValue)
+            throw new InvalidOperationException($"Streaming pool: write-back of {source.Length} bytes exceeds one array.");
+        int length = (int)source.Length;
+        lock (_lock)
+        {
+            ThrowIfDisposed();
+            if (!_entries.TryGetValue(handleId, out var entry)) return;
+            var existing = entry.Data;
+            byte[] buffer;
+            if (existing is not null && existing.Length >= length && existing.Length - length <= existing.Length / 8)
             {
-                Interlocked.Add(ref _residentBytes, delta);
-                long peak = Interlocked.Read(ref _residentBytesPeak);
-                long current = Interlocked.Read(ref _residentBytes);
-                if (current > peak) Interlocked.Exchange(ref _residentBytesPeak, current);
-            }
-
-            // The entry is resident again — make sure it's in the LRU so eviction can
-            // page it back to disk (carrying the new bytes) under budget pressure.
-            if (!_lruIndex.TryGetValue(handleId, out var node))
-            {
-                node = _lruOrder.AddFirst(handleId);
-                _lruIndex[handleId] = node;
+                buffer = existing;
+                _writeBackInPlaceCount++;
             }
             else
             {
-                _lruOrder.Remove(node);
-                _lruOrder.AddFirst(node);
+                buffer = new byte[length + length / 32];
             }
-            EvictIfOverBudget();
+            source.CopyTo(buffer);
+            InstallEntryDataUnlocked(handleId, entry, buffer, length);
         }
+    }
+
+    private long _writeBackInPlaceCount;
+
+    /// <summary>Write-backs that refilled the entry's existing buffer instead of allocating (diagnostics, tests).</summary>
+    internal long WriteBackInPlaceCount { get { lock (_lock) return _writeBackInPlaceCount; } }
+
+    /// <summary>Installs <paramref name="length"/> bytes of <paramref name="buffer"/> as the entry's content. Caller holds <see cref="_lock"/>.</summary>
+    private void InstallEntryDataUnlocked(long handleId, Entry entry, byte[] buffer, int length)
+    {
+        long oldResident = entry.Data?.Length ?? 0;
+        entry.Data = buffer;
+        entry.DataLength = length;
+        entry.ResidentBytes = buffer.Length;
+        // The new bytes have NOT been written to the backing file, so force the
+        // next eviction to (re-)write them rather than dropping the resident copy
+        // as if the file already held it. Also reset the compressed/uncompressed
+        // metadata: the caller supplies canonical native or lossless bytes, so a
+        // prior compressed page-out's sizes no longer describe this content.
+        entry.BackingFileCurrent = false;
+        entry.IsCompressed = false;
+        entry.UncompressedBytes = length;
+
+        // Net resident delta: the new buffer replaces whatever was resident before
+        // (which is 0 when the entry was paged out). Keep _residentBytes exact so
+        // the budget check below — and every future one — stays correct.
+        long delta = buffer.Length - oldResident;
+        if (delta != 0)
+        {
+            Interlocked.Add(ref _residentBytes, delta);
+            long peak = Interlocked.Read(ref _residentBytesPeak);
+            long current = Interlocked.Read(ref _residentBytes);
+            if (current > peak) Interlocked.Exchange(ref _residentBytesPeak, current);
+        }
+
+        // The entry is resident again — make sure it's in the LRU so eviction can
+        // page it back to disk (carrying the new bytes) under budget pressure.
+        if (!_lruIndex.TryGetValue(handleId, out var node))
+        {
+            node = _lruOrder.AddFirst(handleId);
+            _lruIndex[handleId] = node;
+        }
+        else
+        {
+            _lruOrder.Remove(node);
+            _lruOrder.AddFirst(node);
+        }
+        EvictIfOverBudget();
     }
 
     /// <summary>
@@ -536,6 +581,7 @@ public sealed class StreamingTensorPool : IDisposable
                 }
 
                 entry.Data = buffer;
+                entry.DataLength = buffer.Length;
                 // entry.Data now holds exactly what's in the backing file, which
                 // is still on disk — so a subsequent eviction can drop this resident
                 // copy without re-writing it. (Cleared only if the content is later
@@ -573,7 +619,7 @@ public sealed class StreamingTensorPool : IDisposable
                 _lruOrder.Remove(node);
                 _lruOrder.AddFirst(node);
             }
-            return entry.Data!;
+            return new ReadOnlySpan<byte>(entry.Data!, 0, entry.DataLength);
         }
     }
 
@@ -948,7 +994,7 @@ public sealed class StreamingTensorPool : IDisposable
         // memory-bound models this feature is meant to help. After
         // this change peak is entry.Data + encodeBuf ≈ ~536 MB,
         // and entry.Data is freed BEFORE the write returns.
-        int uncompressed = entry.Data.Length;
+        int uncompressed = entry.DataLength;
 
         // Clean/dirty eviction. Once an entry's backing file has been written it
         // holds that entry's exact bytes for the rest of its life: callers can
@@ -1446,6 +1492,10 @@ public sealed class StreamingTensorPool : IDisposable
     private sealed class Entry
     {
         public byte[]? Data;
+        // Bytes of Data that are the entry's content. Data can be longer: a write-back refills the entry's existing
+        // buffer when the new content fits (#2322), so a variable-size (lossless) entry keeps one buffer across steps
+        // instead of allocating a fresh one each time. ResidentBytes accounts the whole buffer, which is what is held.
+        public int DataLength;
         public long ResidentBytes;
         public long PagedOutBytes;
         // Set during eviction so Rehydrate knows the decompress target

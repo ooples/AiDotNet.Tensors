@@ -118,6 +118,12 @@ public static partial class WeightRegistry
         get { lock (_lock) return _options; }
     }
 
+    /// <summary>
+    /// The byte cap of the restore-array pool (<see cref="GpuOffloadOptions.StreamingRestoreBufferPoolBytes"/>).
+    /// Lock-free: a reference read is atomic, and drops call this from inside and outside <c>_lock</c>.
+    /// </summary>
+    internal static long RestoreBufferPoolCapBytes() => System.Threading.Volatile.Read(ref _options).EffectiveStreamingRestoreBufferPoolBytes();
+
     /// <summary>Registers a weight tensor with the registry. Routes to
     /// the streaming pool / offload allocator based on the tensor's
     /// <see cref="Tensor{T}.Lifetime"/>.</summary>
@@ -835,6 +841,23 @@ public static partial class WeightRegistry
     /// call — on the code path whose purpose is to make a large model FIT.
     /// </para>
     /// </remarks>
+    /// <summary><see cref="SerializeLossless{T}"/> left in its pooled stream (see <see cref="StreamingStoreCodec.EncodeLosslessToStream"/>).</summary>
+    private static PooledChunkWriteStream? SerializeLosslessToStream<T>(Tensor<T> tensor, out byte[]? rawShuffled)
+    {
+        if (typeof(T) == typeof(float))
+        {
+            return StreamingStoreCodec.EncodeLosslessToStream(System.Runtime.InteropServices.MemoryMarshal.AsBytes(
+                new ReadOnlySpan<float>((float[])(object)tensor.GetReadOnlyDataArray())), sizeof(float), out rawShuffled);
+        }
+        if (typeof(T) == typeof(double))
+        {
+            return StreamingStoreCodec.EncodeLosslessToStream(System.Runtime.InteropServices.MemoryMarshal.AsBytes(
+                new ReadOnlySpan<double>((double[])(object)tensor.GetReadOnlyDataArray())), sizeof(double), out rawShuffled);
+        }
+        throw new NotSupportedException(
+            $"Lossless streaming store is only supported for float/double, not {typeof(T).Name}.");
+    }
+
     private static byte[] SerializeLossless<T>(Tensor<T> tensor)
     {
         if (typeof(T) == typeof(float))
@@ -1281,7 +1304,20 @@ public static partial class WeightRegistry
         {
             // Training's Auto tier is lossless. Re-encode the current values exactly so an
             // optimizer update survives owner shedding and the variable-size entry remains valid.
-            bytes = SerializeLossless(weight);
+            // The encoding goes from its pooled stream straight into the entry, refilling the entry's own buffer when
+            // it is resident and the new size fits (#2322), instead of through a fresh exact-length array.
+            var encoded = SerializeLosslessToStream(weight, out byte[]? rawShuffled);
+            StreamingTensorPool losslessPool;
+            lock (_lock) { losslessPool = StreamingPoolUnlocked(); }
+            if (encoded is null)
+            {
+                losslessPool.ReplaceEntryData(weight.StreamingPoolHandle,
+                    rawShuffled ?? throw new InvalidOperationException("Lossless encode produced neither a stream nor raw bytes."));
+                return true;
+            }
+            using (encoded)
+                losslessPool.ReplaceEntryData(weight.StreamingPoolHandle, encoded);
+            return true;
         }
         else if (weight.StreamingStoreEncoding == StreamingEncoding.Native)
         {
@@ -2175,6 +2211,7 @@ public static partial class WeightRegistry
             // of a reused handle id (dedup sees it as "already in-flight").
             _inFlightPrefetches.Clear();
             _options = new GpuOffloadOptions();
+            StreamingRestoreBuffers.Clear();
             // CodeRabbit #604: clear the training-mode hint too. Otherwise a
             // prior `false` (set by the last model's SetTrainingMode) persists
             // process-wide and silently biases StreamingStoreDtype.Auto toward

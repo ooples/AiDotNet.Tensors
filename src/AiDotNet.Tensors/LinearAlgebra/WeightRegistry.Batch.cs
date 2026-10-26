@@ -54,6 +54,8 @@ public static partial class WeightRegistry
                 retiredPool = _streamingPool;
                 retiredAllocator = _offloadAllocator;
                 _options = options;
+                // Pooled restore arrays were kept under the previous cap; start the new configuration empty.
+                StreamingRestoreBuffers.Clear();
                 _streamingPool = candidatePool;
                 _offloadAllocator = offloadAllocator;
                 PublishBatch(pending, lifetime);
