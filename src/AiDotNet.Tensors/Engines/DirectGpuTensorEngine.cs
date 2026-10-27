@@ -5199,7 +5199,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private StepScratchPool? CurrentScratchPool => t_scratchPool is { } pool && ReferenceEquals(pool.Engine, this) ? pool : null;
 
     /// <summary>A new scratch pool for a compiled plan on this engine.</summary>
-    internal StepScratchPool CreateScratchPool() => new(this);
+    internal StepScratchPool CreateScratchPool()
+    {
+        var pool = new StepScratchPool(this);
+        lock (_scratchPools)
+        {
+            _scratchPools.RemoveAll(w => !w.TryGetTarget(out _));
+            _scratchPools.Add(new WeakReference<StepScratchPool>(pool));
+        }
+        return pool;
+    }
+
+    // Every plan's pool on this engine, for ClearActionScratchPool (called outside any step, where no pool is current).
+    private readonly System.Collections.Generic.List<WeakReference<StepScratchPool>> _scratchPools = new();
 
     /// <summary>Makes <paramref name="pool"/> this thread's scratch pool for a step body; returns the previous one,
     /// for <see cref="RestoreScratchPool"/> (a plan's body can run nested inside another's).</summary>
@@ -5235,7 +5247,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
-    /// Held around each compiled step once the engine is trained from several threads. The steps share the engine's
+    /// Held around each compiled step on this engine. The steps share the engine's
     /// device caches, resident bindings and stream, and one step's work against another's (a weight re-upload, a
     /// retired buffer, an optimizer update reading a parameter another thread just rebound) faulted the context (CUDA
     /// 700, concurrent GPU Autoformer, AiDotNet#1804). One stream runs their kernels in turn anyway, so serializing the
@@ -5346,7 +5358,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             else backend.Fill(b, 0f, length);
             return b;
         }
-        if (b is not null) { StepScratchPool.Untrack(b); pool.Keys.Remove(b); try { b.Dispose(); } catch { } }
+        if (b is not null)
+        {
+            // A buffer an earlier step's work is still queued against is released stream-ordered (the CUDA buffer frees
+            // with cuMemFreeAsync on the compute stream; one a captured graph uses is held until that capture's graphs
+            // end - CaptureMemoryPool). A second dispose of an already-released slot is the only failure to ignore.
+            StepScratchPool.Untrack(b);
+            pool.Keys.Remove(b);
+            try { b.Dispose(); } catch (ObjectDisposedException) { }
+        }
         var nb = backend.AllocateBuffer(length);   // first pass at this (action,local): record the stable buffer
         pool.Slots[key] = nb;
         pool.Track(nb);
@@ -5392,7 +5412,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return (((length - 1L) >> shift) + 1) << shift;
     }
 
-    /// <summary>Dispose + clear the scratch pool of the compiled step running on this thread. Call at the training→eval transition:
+    /// <summary>Dispose + clear the scratch pools of every compiled plan on this engine. Call at the training→eval transition:
     /// these pooled transient buffers are training-only (the captured graph does NOT replay during forward-only
     /// eval), and on a big model (d256/L4+) they hold GBs that the async pool reserved at the training peak.
     /// Freeing them returns that memory to the pool (then trimmable to the OS on the next alloc-OOM retry), so
@@ -5400,7 +5420,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// step will run on this plan (eval is terminal); a replay after this would read freed device memory.</summary>
     public void ClearActionScratchPool()
     {
-        CurrentScratchPool?.Release();
+        StepScratchPool[] pools;
+        lock (_scratchPools)
+        {
+            pools = _scratchPools.Select(w => w.TryGetTarget(out var p) ? p : null).Where(p => p is not null).ToArray()!;
+            _scratchPools.Clear();
+        }
+        foreach (var pool in pools) pool.Release();
         FirstWriteRedirects?.Clear();   // the pooled slots it maps are gone
     }
 

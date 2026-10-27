@@ -1074,7 +1074,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var backing = gradient.GetBackingArrayForCacheLookupUnsafe();
         if (backing is null || !ReferenceEquals(gradient._gpuMaterializerKey, backing) || !Helpers.HostSync.IsPending(backing))
             return false;
-        Engines.DirectGpu.IGpuBuffer copy;
+        Engines.DirectGpu.IGpuBuffer? copy = null;
         try
         {
             copy = backend.AllocateBuffer(gradient.Length);
@@ -1082,6 +1082,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
         catch (Exception ex) when (ex is NotSupportedException or InvalidOperationException or OutOfMemoryException)
         {
+            copy?.Dispose();   // the gradient lands on the host instead; nothing else owns this buffer
             return false;
         }
         gradient._gpuBuffer = copy;
@@ -3405,25 +3406,25 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Tensor<T> Step()
     {
+        // Every compiled step on a GPU engine holds the engine's step lock (see DirectGpuTensorEngine.CompiledStepLock).
+        // Taking it only once the engine was seen shared left a race: a step that read "not shared" kept running
+        // unlocked beside the first step of the thread that made it shared. Uncontended, the lock costs nothing.
+        var gpuEngine = _engine as Engines.DirectGpuTensorEngine;
+        gpuEngine?.NoteCompiledStepThread();
+        if (gpuEngine is null) return StepLocked();
+        lock (gpuEngine.CompiledStepLock) return StepLocked();
+    }
+
+    private Tensor<T> StepLocked()
+    {
         ResolvePingPongClaims(force: false);
         // The pre-step parameter upload and mark reset are part of the step: under the lock, so a concurrent caller
         // cannot upload parameters into buffers another thread's StepCore is reading.
-        var gpuEngine = _engine as Engines.DirectGpuTensorEngine;
-        gpuEngine?.NoteCompiledStepThread();
-        bool serialized = gpuEngine is { CompiledStepsFromSeveralThreads: true };
-        if (serialized) System.Threading.Monitor.Enter(gpuEngine!.CompiledStepLock);
-        try
+        lock (_stepSync)
         {
-            lock (_stepSync)
-            {
-                ClearPlanBufferReleaseMarks();
-                UploadHostWrittenParameters();
-                return StepCore();
-            }
-        }
-        finally
-        {
-            if (serialized) System.Threading.Monitor.Exit(gpuEngine!.CompiledStepLock);
+            ClearPlanBufferReleaseMarks();
+            UploadHostWrittenParameters();
+            return StepCore();
         }
     }
 

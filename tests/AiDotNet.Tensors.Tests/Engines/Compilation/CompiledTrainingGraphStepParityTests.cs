@@ -1092,7 +1092,9 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         using (gpu)
         {
             AiDotNetEngine.Current = gpu;
-            float[] Train(int seed)
+            // afterFirstStep: the concurrent run's rendezvous, so every plan has stepped before any plan's second step
+            // and the remaining steps overlap (Parallel.For guarantees no overlap).
+            float[] Train(int seed, System.Threading.Barrier? afterFirstStep = null)
             {
                 var x = Rand([Inputs, 64], seed, 1f);
                 var y = Rand([Hidden, 64], seed + 1, 1f);
@@ -1115,16 +1117,28 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                         FeedBatch(x, y, s);
                         plan.Step();
                         gpu.InvalidateAllWeightCaches();   // as FusedTrainingSession does after every fused step
+                        if (s == 0 && afterFirstStep is not null)
+                            Assert.True(afterFirstStep.SignalAndWait(TimeSpan.FromMinutes(2)), "the other plans never reached their first step");
                     }
                 }
                 return w.ToArray();
             }
             int[] seeds = { 101, 202, 303, 404 };
-            var alone = seeds.Select(Train).ToArray();
+            var alone = seeds.Select(s => Train(s)).ToArray();
             var together = new float[seeds.Length][];
             var errors = new System.Collections.Concurrent.ConcurrentBag<Exception>();
-            System.Threading.Tasks.Parallel.For(0, seeds.Length, new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = seeds.Length },
-                i => { try { together[i] = Train(seeds[i]); } catch (Exception ex) { errors.Add(ex); } });
+            using var rendezvous = new System.Threading.Barrier(seeds.Length);
+            var tasks = Enumerable.Range(0, seeds.Length).Select(i => System.Threading.Tasks.Task.Factory.StartNew(() =>
+            {
+                try { together[i] = Train(seeds[i], rendezvous); }
+                catch (Exception ex)
+                {
+                    errors.Add(ex);
+                    // A plan that fails before the rendezvous must not leave the others waiting for it.
+                    try { rendezvous.RemoveParticipant(); } catch (InvalidOperationException) { }
+                }
+            }, System.Threading.Tasks.TaskCreationOptions.LongRunning)).ToArray();
+            Assert.True(System.Threading.Tasks.Task.WaitAll(tasks, TimeSpan.FromMinutes(5)), "the concurrent plans did not finish");
             Assert.True(errors.IsEmpty, string.Join(" | ", errors.Select(e => e.GetType().Name + ": " + e.Message)));
             for (int i = 0; i < seeds.Length; i++)
                 for (int k = 0; k < alone[i].Length; k++)
