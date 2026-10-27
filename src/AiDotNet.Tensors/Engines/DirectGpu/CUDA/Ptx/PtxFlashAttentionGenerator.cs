@@ -156,7 +156,7 @@ internal static class PtxFlashAttentionGenerator
                 .AppendLine(_stats ? " + logsumexp" : "");
             ptx.AppendLine("//");
             ptx.AppendLine(".version 7.1");
-            ptx.Append(".target sm_").Append(I(ccMajor)).AppendLine(I(ccMinor));
+            ptx.Append(".target ").AppendLine(PtxIsa71Target.For(ccMajor, ccMinor));
             ptx.AppendLine(".address_size 64");
             ptx.AppendLine(".extern .shared .align 16 .b8 smem[];");
             ptx.Append(".visible .entry ").Append(EntryPoint).AppendLine("(");
@@ -445,7 +445,7 @@ internal static class PtxFlashAttentionGenerator
                     L($"add.f32 {x}, {x}, {y};");
                     L($"fma.rn.f32 {_rowSum[m, r]}, {_rowSum[m, r]}, {alpha[r]}, {x};");
                 }
-                RescaleOutputs(m, alpha, suffix);
+                RescaleOutputs(m, alpha);
             }
             return pa;
         }
@@ -729,15 +729,11 @@ internal static class PtxFlashAttentionGenerator
             return alpha;
         }
 
-        // O *= alpha per row. Once a row's max settles alpha is exactly 1 (ex2(0)); a warp-uniform vote skips the
-        // multiplies when no row of this m tile in the warp changed.
-        private void RescaleOutputs(int m, string[] alpha, string suffix)
+        // O *= alpha per row, every tile. A warp vote that skipped the multiplies once the row maxes settle (alpha
+        // exactly 1) measured slower at D = 128: the branch splits the tile body and stops ptxas interleaving the
+        // softmax with the P V MMAs.
+        private void RescaleOutputs(int m, string[] alpha)
         {
-            string changed = P(), other = P(), any = P(), label = "RESCALED" + suffix + "_" + I(m);
-            L($"setp.neu.f32 {changed}, {alpha[0]}, 0f3F800000;");
-            L($"setp.neu.f32 {other}, {alpha[1]}, 0f3F800000;");
-            L($"or.pred {changed}, {changed}, {other};");
-
             for (int r = 0; r < 2; r++)
                 for (int n = 0; n < DTiles; n++)
                 {

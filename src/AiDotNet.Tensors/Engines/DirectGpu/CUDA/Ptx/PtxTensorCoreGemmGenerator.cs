@@ -366,7 +366,7 @@ internal static class PtxTensorCoreGemmGenerator
 
             var ptx = new StringBuilder(_body.Length + 2_048);
             ptx.AppendLine(".version 7.1");
-            ptx.Append(".target sm_").Append(I(ccMajor)).AppendLine(I(ccMinor));
+            ptx.Append(".target ").AppendLine(ccMajor >= 8 ? PtxIsa71Target.For(ccMajor, ccMinor) : "sm_" + I(ccMajor) + I(ccMinor));
             ptx.AppendLine(".address_size 64");
             ptx.Append("// tc-gemm ").Append(Fp16 ? (_halfOutput ? "fp16 -> fp16" : "fp16 -> fp32") : "tf32")
                 .Append(_fp16Accumulate ? " (fp16 accumulate per k tile, fp32 redo on overflow)" : "")

@@ -17,6 +17,8 @@ public sealed partial class CudaBackend
 {
     private readonly Dictionary<(int HeadDimension, bool IsCausal, bool Fp16Accumulate), PtxFlashAttentionKernel>
         _directPtxFlashAttentionKernels = new();
+    // Specializations whose build failed (JIT rejection, register or local-memory budget): not retried on every call.
+    private readonly Dictionary<(int HeadDimension, bool IsCausal, bool Fp16Accumulate), string> _directPtxFlashAttentionFailed = new();
     private long _directPtxFlashAttentionDispatchCount;
 
     /// <summary>Flash-attention forward launches on this backend (test and diagnostics hook).</summary>
@@ -59,6 +61,11 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "causal-query-offset-without-causal-mask";
             return false;
         }
+        if (!(scale > 0) || !PtxCompat.IsFinite(scale))
+        {
+            DirectPtxLastError = "flash-attention-scale-not-positive-finite";
+            return false;
+        }
         long queryBytes = (long)batch * queryHeads * querySequence * headDimension * 2;
         long keyValueBytes = (long)batch * keyValueHeads * keyValueSequence * headDimension * 2;
         if (queryHalf.SizeInBytes < queryBytes || keyHalf.SizeInBytes < keyValueBytes || valueHalf.SizeInBytes < keyValueBytes ||
@@ -77,6 +84,11 @@ public sealed partial class CudaBackend
             lock (_directPtxLock)
             {
                 var key = (headDimension, isCausal, fp16Accumulate);
+                if (_directPtxFlashAttentionFailed.TryGetValue(key, out var buildError))
+                {
+                    DirectPtxLastError = buildError;
+                    return false;
+                }
                 if (!_directPtxFlashAttentionKernels.TryGetValue(key, out var kernel))
                 {
                     // Capture may launch only an already-loaded kernel: no module JIT while the stream records.
@@ -86,8 +98,18 @@ public sealed partial class CudaBackend
                         return false;
                     }
                     _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
-                    kernel = new PtxFlashAttentionKernel(_directPtxRuntime, headDimension, isCausal, fp16Accumulate,
-                        emitStats: true);
+                    try
+                    {
+                        kernel = new PtxFlashAttentionKernel(_directPtxRuntime, headDimension, isCausal, fp16Accumulate,
+                            emitStats: true);
+                    }
+                    catch (Exception ex) when (ex is InvalidOperationException or ArgumentException
+                                                   or NotSupportedException or PlatformNotSupportedException)
+                    {
+                        DirectPtxLastError = $"flash-attention-specialization-failed-to-load: {ex.GetType().Name}: {ex.Message}";
+                        _directPtxFlashAttentionFailed.Add(key, DirectPtxLastError);
+                        return false;
+                    }
                     _directPtxFlashAttentionKernels[key] = kernel;
                 }
                 lock (GpuDispatchLock)
@@ -113,6 +135,7 @@ public sealed partial class CudaBackend
         {
             foreach (var kernel in _directPtxFlashAttentionKernels.Values) kernel.Dispose();
             _directPtxFlashAttentionKernels.Clear();
+            _directPtxFlashAttentionFailed.Clear();
         }
     }
 }

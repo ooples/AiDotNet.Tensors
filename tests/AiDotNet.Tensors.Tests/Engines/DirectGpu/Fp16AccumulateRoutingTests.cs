@@ -89,6 +89,41 @@ public sealed class Fp16AccumulateRoutingTests
         Assert.All(backend.DownloadBuffer(dc), v => Assert.Equal(0.125f * k, v));
     }
 
+    // Deterministic mode (the library default): a measured verdict holds only if it is recorded, so every later process
+    // applies the same one. When the cache refuses the record, the shape keeps cuBLAS under determinism; with
+    // determinism off the measured verdict stands.
+    [SkippableTheory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void UnrecordableVerdict_KeepsCublasUnderDeterminism(bool deterministic)
+    {
+        using var backend = RequireAmpereBackend();
+        backend.Fp16AccumulateCacheUnavailableForTests = true;
+        AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(deterministic);
+        try
+        {
+            const int m = 1024, n = 1024, k = 1024;
+            var rng = new Random(29);
+            using var da = backend.AllocateByteBuffer(m * k * 2);
+            using var db = backend.AllocateByteBuffer(k * n * 2);
+            using var dc = backend.AllocateBuffer(m * n);
+            backend.UploadBytes(da, HalfBytes(Enumerable.Range(0, m * k).Select(_ => (Half)(rng.NextDouble() * 2 - 1)).ToArray()));
+            backend.UploadBytes(db, HalfBytes(Enumerable.Range(0, k * n).Select(_ => (Half)(rng.NextDouble() * 2 - 1)).ToArray()));
+            backend.GemmFp16In32fOut(da, db, dc, m, n, k);
+            var verdict = backend.Fp16AccumulateVerdict(m, n, k);
+            Assert.True(verdict.HasValue);
+            _output.WriteLine($"deterministic={deterministic}: routed {verdict!.Value.Routed}; {verdict.Value.Reason}");
+            if (deterministic)
+                Assert.False(verdict.Value.Routed);
+            else
+                Assert.DoesNotContain("deterministic mode", verdict.Value.Reason);
+        }
+        finally
+        {
+            AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(null);
+        }
+    }
+
     [SkippableFact]
     public void LargeShape_IsEvaluated_AndAgreesWithTheFp64Reference()
     {

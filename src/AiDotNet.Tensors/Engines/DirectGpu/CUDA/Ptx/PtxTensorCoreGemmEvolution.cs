@@ -96,7 +96,7 @@ internal static class PtxTensorCoreGemmEvolution
             configuration => configuration.Name,
             halfOperands: precision == PtxTensorCorePrecision.Fp16,
             // FP16 accumulation rounds each K tile's partial sum to FP16: allow its error, as the route's cuBLAS check does.
-            relativeTolerance: fp16Accumulate ? 5e-3 : 1e-4);
+            relativeTolerance: fp16Accumulate ? CudaBackend.Fp16AccumulateRelativeTolerance : 1e-4);
         var experiment = new KernelTuningExperiment<PtxTensorCoreGemmConfiguration>(
             backend,
             new DeviceEventKernelTuningTimer(new PtxGemmEvolution.CudaEventClock(runtime)),

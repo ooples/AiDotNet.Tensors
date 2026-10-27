@@ -51,6 +51,8 @@ public sealed class Fp16FlashAttentionEngineTests
             Skip.IfNot(engine.IsGpuAvailable, "CUDA tensor engine is unavailable.");
             var backend = Assert.IsType<CudaBackend>(engine.GetBackend());
             Skip.If(backend.IsDirectPtxAttentionEnabled, "The opt-in must be off for this test.");
+            Skip.IfNot(backend.GetDirectPtxRuntime().ComputeCapabilityMajor >= 8,
+                "The flash kernel needs compute capability 8.0+ (older devices keep the FP32 kernel).");
             var rng = new Random(77);
             int[] shape = { 2, 4, 257, 64 };
             Tensor<float> q = Random(rng, shape, 1.0), k = Random(rng, shape, 1.0), v = Random(rng, shape, 1.0);

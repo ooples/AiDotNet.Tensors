@@ -131,6 +131,81 @@ public sealed class PtxFlashAttentionTests
         }
     }
 
+    // The log-sum-exp side output (production always emits it; the backward reads it) against fp64, both accumulate forms:
+    // causal with a negative offset, so the first rows see no key (zeros out, -inf log-sum-exp) and a whole 64-row block
+    // can be empty; and grouped heads over a ragged key length.
+    [SkippableTheory]
+    [InlineData(64, false)]
+    [InlineData(64, true)]
+    [InlineData(128, false)]
+    [InlineData(128, true)]
+    public void LogSumExp_MatchesTheReference_IncludingRowsWithNoVisibleKey(int d, bool fp16Accumulate)
+    {
+        using var runtime = RequireAmpere();
+        using var causal = new PtxFlashAttentionKernel(runtime, d, isCausal: true, fp16Accumulate, emitStats: true);
+        using var plain = new PtxFlashAttentionKernel(runtime, d, isCausal: false, fp16Accumulate, emitStats: true);
+        foreach (var (kernel, b, hq, hkv, sq, sk, offset) in new[]
+                 {
+                     (causal, 1, 2, 1, 200, 150, -70),   // rows 0..69 see no key (the first 64-row block entirely)
+                     (plain, 2, 4, 2, 100, 130, 0),
+                 })
+        {
+            var rng = new Random(d * 100 + sq + (fp16Accumulate ? 1 : 0));
+            Half[] q = RandomHalf(rng, b * hq * sq * d, 1.0), k = RandomHalf(rng, b * hkv * sk * d, 1.0), v = RandomHalf(rng, b * hkv * sk * d, 1.0);
+            float scale = (float)(1.0 / Math.Sqrt(d));
+            using var dq = runtime.AllocateBytes((nuint)(q.Length * 2));
+            using var dk = runtime.AllocateBytes((nuint)(k.Length * 2));
+            using var dv = runtime.AllocateBytes((nuint)(v.Length * 2));
+            using var dout = runtime.AllocateBytes((nuint)(q.Length * 4));
+            using var dlse = runtime.AllocateBytes((nuint)(b * hq * sq * 4));
+            dq.Upload<Half>(q);
+            dk.Upload<Half>(k);
+            dv.Upload<Half>(v);
+            kernel.Launch(dq.Pointer, dk.Pointer, dv.Pointer, dout.Pointer, dlse.Pointer, b, hq, hkv, sq, sk, scale, offset);
+            runtime.Synchronize();
+            var output = new float[q.Length];
+            var lse = new float[b * hq * sq];
+            dout.Download<float>(output);
+            dlse.Download<float>(lse);
+
+            double[] expected = Reference(q, k, v, b, hq, hkv, sq, sk, d, scale, kernel.IsCausal, offset);
+            double outputError = 0, lseError = 0;
+            for (int i = 0; i < expected.Length; i++) outputError = Math.Max(outputError, Math.Abs(output[i] - expected[i]));
+            for (int bh = 0; bh < b * hq; bh++)
+            {
+                int bb = bh / hq, kvh = bh % hq / (hq / hkv);
+                for (int i = 0; i < sq; i++)
+                {
+                    int visible = kernel.IsCausal ? Math.Min(sk, i + offset + 1) : sk;
+                    float got = lse[bh * sq + i];
+                    if (visible <= 0)
+                    {
+                        Assert.True(float.IsNegativeInfinity(got), $"row {i} sees no key: logsumexp {got}, expected -inf");
+                        for (int c = 0; c < d; c++) Assert.Equal(0f, output[(bh * sq + i) * d + c]);
+                        continue;
+                    }
+                    var logits = new double[visible];
+                    double max = double.NegativeInfinity;
+                    for (int j = 0; j < visible; j++)
+                    {
+                        double dot = 0;
+                        for (int c = 0; c < d; c++)
+                            dot += (double)q[(bh * sq + i) * d + c] * (double)k[((bb * hkv + kvh) * sk + j) * d + c];
+                        logits[j] = dot * scale;
+                        max = Math.Max(max, logits[j]);
+                    }
+                    double sum = 0;
+                    foreach (double l in logits) sum += Math.Exp(l - max);
+                    lseError = Math.Max(lseError, Math.Abs(got - (max + Math.Log(sum))));
+                }
+            }
+            _output.WriteLine($"d{d} f16acc={fp16Accumulate} causal={kernel.IsCausal} offset {offset}: output max |err| {outputError:E2}, " +
+                              $"logsumexp max |err| {lseError:E2}");
+            Assert.True(outputError <= (fp16Accumulate ? 6e-3 : 3e-3), $"output max |err| {outputError:E2}");
+            Assert.True(lseError <= (fp16Accumulate ? 6e-3 : 3e-3), $"logsumexp max |err| {lseError:E2}");
+        }
+    }
+
     // Opt-in (AIDOTNET_RUN_FLASH_PROBE=1): both accumulate forms on the PyTorch SDPA comparison shapes (FP16 Q/K/V in
     // [-1, 1), scale 1 / sqrt(D)); best of 5 rounds of 20 launches, host-timed around a synchronize.
     [SkippableFact]

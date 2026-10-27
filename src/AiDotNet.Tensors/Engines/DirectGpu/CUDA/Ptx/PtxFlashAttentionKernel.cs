@@ -60,6 +60,9 @@ internal sealed class PtxFlashAttentionKernel : IDisposable
         if (querySequence <= 0) throw new ArgumentOutOfRangeException(nameof(querySequence));
         if (keyValueSequence <= 0) throw new ArgumentOutOfRangeException(nameof(keyValueSequence));
         if ((long)batch * queryHeads > 65535) throw new ArgumentOutOfRangeException(nameof(queryHeads), "B * Hq exceeds grid y.");
+        // The kernel scales the raw row max once, which commutes with the max only for a positive scale.
+        if (!(scale > 0) || !PtxCompat.IsFinite(scale))
+            throw new ArgumentOutOfRangeException(nameof(scale), "Flash attention needs a positive, finite scale.");
         if (!IsCausal && causalOffset != 0) throw new ArgumentException("A causal offset needs a causal kernel.", nameof(causalOffset));
         if (EmitStats && logSumExp == IntPtr.Zero) throw new ArgumentException("This kernel writes logsumexp.", nameof(logSumExp));
         if ((((long)query | (long)key | (long)value | (long)output) & 15) != 0)

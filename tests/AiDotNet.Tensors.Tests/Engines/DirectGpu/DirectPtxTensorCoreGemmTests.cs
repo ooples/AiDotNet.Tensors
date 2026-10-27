@@ -363,29 +363,6 @@ public sealed class DirectPtxTensorCoreGemmTests
         Assert.NotEqual(actual.Skip(70 * n), withNaN.Skip(70 * n));
     }
 
-    private static byte[] HalfBytesOf(Half[] values)
-    {
-        var bytes = new byte[values.Length * 2];
-        for (int i = 0; i < values.Length; i++)
-        {
-            ushort bits = BitConverter.HalfToUInt16Bits(values[i]);
-            bytes[2 * i] = (byte)bits;
-            bytes[2 * i + 1] = (byte)(bits >> 8);
-        }
-        return bytes;
-    }
-
-    private static CudaBackend RequireAmpereBackend()
-    {
-        var backend = new CudaBackend();
-        if (!backend.IsAvailable || backend.GetDirectPtxRuntime().ComputeCapabilityMajor < 8)
-        {
-            backend.Dispose();
-            Skip.If(true, "Needs a CUDA device of compute capability 8.0+.");
-        }
-        return backend;
-    }
-
     // Opt-in speed probe (AIDOTNET_RUN_TC_GEMM_PROBE=1): FP16 operands and FP32 output, FP32 accumulation against FP16
     // accumulation with per-tile promotion (#1549), same configurations, CUDA events, and cuBLAS FP16 -> FP32 for scale.
     // The operands are in [-1, 1), so each partial sum is far below 65504. A development check, not evidence.

@@ -41,8 +41,7 @@ internal static class PtxMmaRateProbe
     {
         var ptx = new StringBuilder();
         ptx.AppendLine(".version 7.1");
-        ptx.Append(".target sm_").Append(ccMajor.ToString(CultureInfo.InvariantCulture))
-            .AppendLine(ccMinor.ToString(CultureInfo.InvariantCulture));
+        ptx.Append(".target ").AppendLine(PtxIsa71Target.For(ccMajor, ccMinor));
         ptx.AppendLine(".address_size 64");
         foreach (bool fp16 in new[] { false, true })
         {
@@ -111,7 +110,8 @@ internal static class PtxMmaRateProbe
         return ptx.ToString();
     }
 
-    /// <summary>Runs both loops (best of three timed launches each, after a warm-up) on the runtime's stream.</summary>
+    /// <summary>Runs both loops in ABBA order (each run: a warm-up, then the best of three timed launches) on the runtime's
+    /// stream.</summary>
     internal static unsafe Result Measure(DirectPtxRuntime runtime, int iterations = 4096)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
@@ -145,8 +145,9 @@ internal static class PtxMmaRateProbe
             return flops / best / 1e12;
         }
 
-        double fp32 = Tflops(Fp32AccumulateEntry);
-        double fp16 = Tflops(Fp16AccumulateEntry);
-        return new Result(fp32, fp16);
+        // ABBA, each form's best: clock ramp or thermal drift hits both forms alike instead of biasing the ratio.
+        double fp32First = Tflops(Fp32AccumulateEntry), fp16First = Tflops(Fp16AccumulateEntry);
+        double fp16Second = Tflops(Fp16AccumulateEntry), fp32Second = Tflops(Fp32AccumulateEntry);
+        return new Result(Math.Max(fp32First, fp32Second), Math.Max(fp16First, fp16Second));
     }
 }
