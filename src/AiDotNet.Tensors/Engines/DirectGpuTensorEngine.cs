@@ -5361,20 +5361,26 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private IGpuBuffer RentTransientScratch(IDirectGpuBackend backend, int length, bool fullyWritten = false)
     {
-        long sizeClass = TransientSizeClass(length);
+        // The caller gets exactly `length` elements: a slot is a size class larger, and an op that reads its buffer's
+        // Size (a download into a host vector: StridedGather, GenerateDropoutMask) would otherwise return the slack.
+        // Where views are free the slot is shared by size class and handed out as an exact-length view of itself;
+        // elsewhere the slot is keyed by the exact length.
+        bool views = backend is IGpuBufferViews { ViewsAreFreeAtAnyOffset: true };
+        long sizeClass = views ? TransientSizeClass(length) : length;
         var pool = CurrentScratchPool!;
         var key = (pool.TransientLocal++, sizeClass);
-        if (pool.Transient.TryGetValue(key, out var b) && b.Handle != System.IntPtr.Zero)
+        if (!pool.Transient.TryGetValue(key, out var b) || b.Handle == System.IntPtr.Zero)
         {
-            if (fullyWritten) return b;
+            b = backend.AllocateBuffer(checked((int)sizeClass));
+            pool.Transient[key] = b;
+            pool.Track(b);
+        }
+        else if (!fullyWritten)
+        {
             if (backend is IDeviceZeroFill zero) zero.ZeroBuffer(b, length);
             else backend.Fill(b, 0f, length);
-            return b;
         }
-        var nb = backend.AllocateBuffer(checked((int)sizeClass));
-        pool.Transient[key] = nb;
-        pool.Track(nb);
-        return nb;
+        return b.Size != length && backend is IGpuBufferViews exact && exact.TryCreateView(b, 0, length) is { } view ? view : b;
     }
 
     internal static long TransientSizeClass(int length)

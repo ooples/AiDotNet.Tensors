@@ -37,6 +37,25 @@ public class CompiledGpuStepGuardTests
         Assert.Equal(new[] { 1 }, Assert.IsType<int[]>(read[1]));
     }
 
+    [Fact]
+    public void A_saved_int_tensor_whose_shape_overflows_is_rejected_as_corrupt()
+    {
+        // [65536]^4 wraps to 0 in int, matching an empty value list; the tensor constructor then threw an
+        // ArgumentException the plan loader does not treat as a corrupt file.
+        using var ms = new MemoryStream();
+        using (var writer = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true))
+        {
+            writer.Write(1);                                    // one saved-state entry
+            writer.Write(PlanFormatConstants.TagInt32Tensor);
+            writer.Write(4);
+            for (int i = 0; i < 4; i++) writer.Write(65536);
+            writer.Write(0);                                    // no values
+        }
+        ms.Position = 0;
+        using var reader = new BinaryReader(ms, Encoding.UTF8, leaveOpen: true);
+        Assert.Throws<InvalidDataException>(() => SavedStateSerializerTestProxy.Read(reader, Array.Empty<Tensor<float>>()));
+    }
+
     [Theory]
     [InlineData(int.MaxValue, 1)]   // start + length overflows to negative and passed a start + length check
     [InlineData(3, 2)]

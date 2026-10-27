@@ -440,10 +440,27 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (_liveGradientMap is { } liveGradients)
             foreach (var parameter in _parameters)
                 if (liveGradients.TryGetValue(parameter, out var current)) parameterGradients.Add(current);
+        // Parameter and intermediate gradients share pooled backing arrays, and unbinding drops the array's pending
+        // download. In _preAllocatedGrads order an intermediate could drop it before a later parameter gradient landed,
+        // leaving that gradient's stale host values. So: take the intermediates out of their arrays' groups, land the
+        // parameter gradients, and only then unbind.
+        if (landResults)
+        {
+            foreach (var buffer in _preAllocatedGrads)
+                if (buffer is not null && !parameterGradients.Contains(buffer))
+                    Helpers.ResidentHostMirror.Detach(buffer);
+            foreach (var gradient in parameterGradients)
+            {
+                if (gradient._gpuBuffer is null || _gradientsHandedOff?.Contains(gradient) == true) continue;
+                if (gradient.GetBackingArrayForCacheLookupUnsafe() is { } array) Helpers.HostSync.TryMaterialize(array);
+                Helpers.HostSync.TryMaterialize(gradient.DataVector);
+            }
+        }
         for (int i = 0; i < _preAllocatedGrads.Length; i++)
             Unbind(_preAllocatedGrads[i], isResult: parameterGradients.Contains(_preAllocatedGrads[i]));
+        // Aliased views are views of intermediate gradients (parameters are excluded): nothing to land.
         if (_aliasedGradViews is { } views)
-            foreach (var (view, _) in views) Unbind(view);
+            foreach (var (view, _) in views) Unbind(view, isResult: false);
         Unbind(_lossGradSeed);
         Unbind(_lossGradDest);
         // The pre-pass (and the aborted capture) ran every forward op on the capture path, where GPU ops bind their

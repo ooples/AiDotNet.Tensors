@@ -270,6 +270,9 @@ internal static class SavedStateSerializer
             if (d < 0)
                 throw new InvalidDataException($"SavedState Tensor<int> dimension {d} cannot be negative. The plan file is corrupt.");
             expected *= d;
+            if (expected > int.MaxValue)
+                throw new InvalidDataException(
+                    $"SavedState Tensor<int> shape [{string.Join(",", shape)}] exceeds the largest tensor. The plan file is corrupt.");
         }
         if (expected != values.Length)
             throw new InvalidDataException(

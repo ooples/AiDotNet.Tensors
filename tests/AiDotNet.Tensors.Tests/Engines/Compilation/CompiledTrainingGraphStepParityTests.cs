@@ -1009,9 +1009,14 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                                 $"action {action}: d[{i}] {d[i]} != unpooled {expected[i]} (a shared slot was not re-zeroed?)");
                         if (action == 0) afterOne = Slots();
                     }
+                    // A pooled slot is a size class larger than the request; what an op gets is exactly its length
+                    // (a dropout mask downloads its buffer into the returned vector).
+                    gpu.SetCurrentScratchAction(Depth);
+                    var mask = ((IEngine)gpu).GenerateDropoutMask<float>(5, 0.5f, 2f, 7);
+                    Assert.Equal(5, mask.Length);
                     gpu.SetCurrentScratchAction(-1);
                     Assert.True(afterOne > 0, "the op drew no transient scratch, so the test proves nothing");
-                    Assert.Equal(afterOne, Slots());
+                    Assert.Equal(afterOne + 1, Slots());
                 }
             }
             finally
