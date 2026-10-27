@@ -1095,6 +1095,30 @@ fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
     gates[(p.t * B + b) * 4 * H + row] = select(lstm_sig(s), bx_tanh(s), row / H == 2);
 }");
 
+    public static readonly string LstmGateCell = Shader(
+        new[] { "r:pre", "r:old", "rw:y" }, "N: i32, H: i32", LstmSig + Main + @"
+    if (i >= p.N) { return; }
+    let g = (i / p.H) * 4 * p.H + i % p.H;
+    let ig = lstm_sig(pre[g]); let fg = lstm_sig(pre[g + p.H]);
+    let z = bx_tanh(pre[g + 2 * p.H]); let og = lstm_sig(pre[g + 3 * p.H]);
+    let c = fg * old[i] + ig * z;
+    y[i] = og * bx_tanh(c); y[p.N + i] = c;
+}");
+    public static readonly string LstmGateCellBackward = Shader(
+        new[] { "r:pre", "r:old", "r:y", "r:dy", "rw:dg", "rw:dc" }, "N: i32, H: i32", LstmSig + Main + @"
+    if (i >= p.N) { return; }
+    let g = (i / p.H) * 4 * p.H + i % p.H;
+    let ig = lstm_sig(pre[g]); let fg = lstm_sig(pre[g + p.H]);
+    let z = bx_tanh(pre[g + 2 * p.H]); let og = lstm_sig(pre[g + 3 * p.H]);
+    let tc = bx_tanh(y[p.N + i]); let dh = dy[i];
+    let d = dy[p.N + i] + dh * og * (1.0 - tc * tc);
+    dg[g] = d * z * ig * (1.0 - ig);
+    dg[g + p.H] = d * old[i] * fg * (1.0 - fg);
+    dg[g + 2 * p.H] = d * ig * (1.0 - z * z);
+    dg[g + 3 * p.H] = dh * tc * og * (1.0 - og);
+    dc[i] = d * fg;
+}");
+
     public static readonly string LstmCell = Shader(
         new[] { "r:gates", "rw:allC", "rw:allH", "rw:y" }, "t: i32, B: i32, T: i32, H: i32", Main + @"
     let H = p.H; let B = p.B; let t = p.t;
@@ -1207,6 +1231,8 @@ fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
         [BatchExecutionCudaKernels.LaQrReduced] = LaQrReduced,
         [BatchExecutionCudaKernels.FaLse] = FaLse, [BatchExecutionCudaKernels.FaOut] = FaOut, [BatchExecutionCudaKernels.FaDelta] = FaDelta,
         [BatchExecutionCudaKernels.FaDq] = FaDq, [BatchExecutionCudaKernels.FaDk] = FaDk, [BatchExecutionCudaKernels.FaDv] = FaDv,
+        [BatchExecutionCudaKernels.LstmGateCell] = LstmGateCell,
+        [BatchExecutionCudaKernels.LstmGateCellBackward] = LstmGateCellBackward,
         [BatchExecutionCudaKernels.LstmGates] = LstmGates, [BatchExecutionCudaKernels.LstmCell] = LstmCell,
         [BatchExecutionCudaKernels.LstmCellBackward] = LstmCellBackward, [BatchExecutionCudaKernels.LstmHiddenBackward] = LstmHiddenBackward,
         [BatchExecutionCudaKernels.LstmInputGrad] = LstmInputGrad, [BatchExecutionCudaKernels.LstmWeightIhGrad] = LstmWeightIhGrad,

@@ -6,6 +6,8 @@ internal static partial class BatchExecutionCudaKernels
         LstmHiddenBackward = "lstm_p_dh", LstmInputGrad = "lstm_p_gin", LstmWeightIhGrad = "lstm_p_gwih",
         LstmWeightHhGrad = "lstm_p_gwhh", LstmBiasGrad = "lstm_p_gbias";
 
+    public const string LstmGateCell = "lstm_p_gate_cell", LstmGateCellBackward = "lstm_p_gate_cell_bwd";
+
     // #1107 / #1108: the fused-LSTM training contract (IFusedLstmSequenceTraining) for every backend, as the CPU
     // reference defines it: batch-major x [B, T, In] and y [B, T, H], PyTorch gate order (i, f, g, o) with rows
     // W[g * H + h, :], the two biases summed. One thread per output element and no work-group coupling, so any hidden
@@ -93,6 +95,32 @@ extern ""C"" __global__ __launch_bounds__(256) void lstm_p_gbias(const float* dp
         for (int b = 0; b < B; b++) s += dpre[(t * B + b) * 4 * H + row];
     gbih[row] = s;
     gbhh[row] = s;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void lstm_p_gate_cell(const float* pre, const float* old, float* y, int N, int H) {
+    int k = bx_gid(); if (k >= N) return;
+    int g = (k / H) * 4 * H + k % H;
+    float ig = 1.0f / (1.0f + expf(-pre[g]));
+    float fg = 1.0f / (1.0f + expf(-pre[g + H]));
+    float z = tanhf(pre[g + 2 * H]);
+    float og = 1.0f / (1.0f + expf(-pre[g + 3 * H]));
+    float c = fg * old[k] + ig * z;
+    y[k] = og * tanhf(c); y[N + k] = c;
+}
+extern ""C"" __global__ __launch_bounds__(256) void lstm_p_gate_cell_bwd(const float* pre, const float* old, const float* y, const float* dy, float* dg, float* dc, int N, int H) {
+    int k = bx_gid(); if (k >= N) return;
+    int g = (k / H) * 4 * H + k % H;
+    float ig = 1.0f / (1.0f + expf(-pre[g]));
+    float fg = 1.0f / (1.0f + expf(-pre[g + H]));
+    float z = tanhf(pre[g + 2 * H]);
+    float og = 1.0f / (1.0f + expf(-pre[g + 3 * H]));
+    float tc = tanhf(y[N + k]); float dh = dy[k];
+    float d = dy[N + k] + dh * og * (1.0f - tc * tc);
+    dg[g] = d * z * ig * (1.0f - ig);
+    dg[g + H] = d * old[k] * fg * (1.0f - fg);
+    dg[g + 2 * H] = d * ig * (1.0f - z * z);
+    dg[g + 3 * H] = dh * tc * og * (1.0f - og);
+    dc[k] = d * fg;
 }
 ";
 }
