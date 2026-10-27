@@ -92,14 +92,13 @@ public sealed class Fp16AccumulateRoutingTests
     // Deterministic mode (the library default): a measured verdict holds only if it is recorded, so every later process
     // applies the same one. When the cache refuses the record, the shape keeps cuBLAS under determinism; with
     // determinism off the measured verdict stands.
-    [SkippableTheory]
-    [InlineData(true)]
-    [InlineData(false)]
-    public void UnrecordableVerdict_KeepsCublasUnderDeterminism(bool deterministic)
+    [SkippableFact]
+    public void UnrecordableVerdict_KeepsCublasUnderDeterminism()
     {
         using var backend = RequireAmpereBackend();
         backend.Fp16AccumulateCacheUnavailableForTests = true;
-        AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(deterministic);
+        backend.ForceMmaRateForTests(62, 123);
+        AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(false);
         try
         {
             const int m = 1024, n = 1024, k = 1024;
@@ -110,13 +109,20 @@ public sealed class Fp16AccumulateRoutingTests
             backend.UploadBytes(da, HalfBytes(Enumerable.Range(0, m * k).Select(_ => (Half)(rng.NextDouble() * 2 - 1)).ToArray()));
             backend.UploadBytes(db, HalfBytes(Enumerable.Range(0, k * n).Select(_ => (Half)(rng.NextDouble() * 2 - 1)).ToArray()));
             backend.GemmFp16In32fOut(da, db, dc, m, n, k);
-            var verdict = backend.Fp16AccumulateVerdict(m, n, k);
-            Assert.True(verdict.HasValue);
-            _output.WriteLine($"deterministic={deterministic}: routed {verdict!.Value.Routed}; {verdict.Value.Reason}");
-            if (deterministic)
-                Assert.False(verdict.Value.Routed);
-            else
-                Assert.DoesNotContain("deterministic mode", verdict.Value.Reason);
+            var measured = backend.Fp16AccumulateVerdict(m, n, k);
+            Assert.True(measured.HasValue);
+            _output.WriteLine($"non-deterministic: routed {measured!.Value.Routed}; {measured.Value.Reason}");
+            Skip.IfNot(measured.Value.Routed, $"No winning route on this device/run: {measured.Value.Reason}");
+            long routedCount = backend.Fp16AccumulateDispatchCount;
+            Assert.True(routedCount > 0);
+
+            // Reuse the same winning verdict, so timing drift cannot turn this into an unrelated cuBLAS loss.
+            AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(true);
+            backend.GemmFp16In32fOut(da, db, dc, m, n, k);
+            var deterministic = backend.Fp16AccumulateVerdict(m, n, k)!.Value;
+            Assert.False(deterministic.Routed);
+            Assert.Contains("deterministic mode", deterministic.Reason);
+            Assert.Equal(routedCount, backend.Fp16AccumulateDispatchCount);
         }
         finally
         {

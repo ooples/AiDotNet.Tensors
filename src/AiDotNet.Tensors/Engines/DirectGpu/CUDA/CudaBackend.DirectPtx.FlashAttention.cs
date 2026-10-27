@@ -61,7 +61,7 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "causal-query-offset-without-causal-mask";
             return false;
         }
-        if (!(scale > 0) || !PtxCompat.IsFinite(scale))
+        if (!PtxFlashAttentionKernel.TryConvertScale(scale, out _))
         {
             DirectPtxLastError = "flash-attention-scale-not-positive-finite";
             return false;

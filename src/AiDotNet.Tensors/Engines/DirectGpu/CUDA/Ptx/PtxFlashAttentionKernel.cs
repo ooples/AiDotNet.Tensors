@@ -24,6 +24,14 @@ internal sealed class PtxFlashAttentionKernel : IDisposable
     internal DirectPtxKernelBlueprint Blueprint { get; }
     internal DirectPtxKernelAudit Audit { get; }
 
+    // Validate the value actually passed to ex2: a finite caller scale can overflow this conversion.
+    internal static bool TryConvertScale(float scale, out float scaleLog2)
+    {
+        const float log2E = 1.4426950408889634f;
+        scaleLog2 = scale * log2E;
+        return scale > 0 && PtxCompat.IsFinite(scaleLog2);
+    }
+
     internal PtxFlashAttentionKernel(DirectPtxRuntime runtime, int headDimension, bool isCausal, bool fp16Accumulate,
         bool emitStats = false)
     {
@@ -61,8 +69,8 @@ internal sealed class PtxFlashAttentionKernel : IDisposable
         if (keyValueSequence <= 0) throw new ArgumentOutOfRangeException(nameof(keyValueSequence));
         if ((long)batch * queryHeads > 65535) throw new ArgumentOutOfRangeException(nameof(queryHeads), "B * Hq exceeds grid y.");
         // The kernel scales the raw row max once, which commutes with the max only for a positive scale.
-        if (!(scale > 0) || !PtxCompat.IsFinite(scale))
-            throw new ArgumentOutOfRangeException(nameof(scale), "Flash attention needs a positive, finite scale.");
+        if (!TryConvertScale(scale, out float scaleLog2))
+            throw new ArgumentOutOfRangeException(nameof(scale), "Flash attention needs a positive scale with a finite base-2 conversion.");
         if (!IsCausal && causalOffset != 0) throw new ArgumentException("A causal offset needs a causal kernel.", nameof(causalOffset));
         if (EmitStats && logSumExp == IntPtr.Zero) throw new ArgumentException("This kernel writes logsumexp.", nameof(logSumExp));
         if ((((long)query | (long)key | (long)value | (long)output) & 15) != 0)
@@ -71,7 +79,6 @@ internal sealed class PtxFlashAttentionKernel : IDisposable
         ulong q = (ulong)query, k = (ulong)key, v = (ulong)value, o = (ulong)output, lse = (ulong)logSumExp;
         uint sq = (uint)querySequence, sk = (uint)keyValueSequence, hq = (uint)queryHeads;
         uint group = (uint)(queryHeads / keyValueHeads);
-        float scaleLog2 = scale * 1.4426950408889634f;
         int offset = causalOffset;
         void** arguments = stackalloc void*[11];
         arguments[0] = &q;

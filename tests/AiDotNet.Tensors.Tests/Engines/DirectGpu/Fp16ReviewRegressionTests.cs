@@ -140,7 +140,7 @@ public sealed class Fp16ReviewRegressionTests
         using var output = backend.AllocateBuffer(64);
         using var stats = backend.AllocateBuffer(1);
         long before = backend.DirectPtxFlashAttentionDispatchCount;
-        foreach (float scale in new[] { 0f, -1f, float.NaN, float.PositiveInfinity, float.NegativeInfinity })
+        foreach (float scale in new[] { 0f, -1f, float.NaN, float.PositiveInfinity, float.NegativeInfinity, 3e38f, float.MaxValue })
         {
             Assert.False(backend.TryDirectPtxFlashAttention(qkv, qkv, qkv, output, stats,
                 1, 1, 1, 1, 1, 64, scale, false, reducedPrecisionRequested: true));
@@ -150,6 +150,25 @@ public sealed class Fp16ReviewRegressionTests
             Assert.Equal("scale", error.ParamName);
         }
         Assert.Equal(before, backend.DirectPtxFlashAttentionDispatchCount);
+    }
+
+    [SkippableTheory]
+    [InlineData(0.125f)]
+    [InlineData(1e38f)]
+    public void SupportedScales_KeepZeroScoresUniform(float scale)
+    {
+        using var backend = RequireAmpere();
+        const int sequence = 16, d = 64;
+        using var qk = backend.AllocateByteBuffer(sequence * d * 2);
+        using var v = backend.AllocateByteBuffer(sequence * d * 2);
+        using var output = backend.AllocateBuffer(sequence * d);
+        using var stats = backend.AllocateBuffer(sequence);
+        backend.UploadBytes(qk, HalfBytes(sequence * d, 0));
+        backend.UploadBytes(v, HalfBytes(sequence * d, 1));
+        Assert.True(backend.TryDirectPtxFlashAttention(qk, qk, v, output, stats,
+            1, 1, 1, sequence, sequence, d, scale, false, reducedPrecisionRequested: true), backend.DirectPtxLastError);
+        Assert.All(backend.DownloadBuffer(output), x => Assert.InRange(Math.Abs(x - 1f), 0f, 1e-5f));
+        Assert.All(backend.DownloadBuffer(stats), x => Assert.InRange(Math.Abs(x - Math.Log(sequence)), 0, 1e-5));
     }
 
     [SkippableFact]
