@@ -523,11 +523,16 @@ public partial class CpuEngine
         });
     }
 
-    private static void XLstmScanBackward<T>(
+    protected static void XLstmScanBackward<T>(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output, object[] savedState,
         IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         int numHeads = (int)savedState[0];
+        if (engine is DirectGpuTensorEngine gpu)
+        {
+            gpu.XLstmDeviceBackward(gradOutput, inputs, numHeads, grads);
+            return;
+        }
         var qProj = inputs[0];
         var kProj = inputs[1];
         var vProj = inputs[2];

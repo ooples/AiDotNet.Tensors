@@ -14,6 +14,8 @@ internal static partial class BatchExecutionCudaKernels
     // size runs and the source translates mechanically to OpenCL, Metal and GLSL. Caches: allH / allC [(T + 1), B, H]
     // (index (t * B + b) * H + h), activated gates [T, B, 4H], and the backward's pre-activation gradients dpre [T, B, 4H].
     // The weight and bias gradients sum over (t, b) in a fixed order, so they are deterministic.
+    public const string XLstmTrainingForward = "xlstm_train_forward", XLstmTrainingBackward = "xlstm_train_backward";
+
     internal const string LstmSource = @"
 extern ""C"" __global__ __launch_bounds__(256) void lstm_p_gates(const float* x, const float* wih, const float* whh, const float* bih, const float* bhh, const float* allH, float* gates, int t, int B, int T, int In, int H) {
     int k = bx_gid(); if (k >= B * 4 * H) return;
@@ -121,6 +123,82 @@ extern ""C"" __global__ __launch_bounds__(256) void lstm_p_gate_cell_bwd(const f
     dg[g + 2 * H] = d * ig * (1.0f - z * z);
     dg[g + 3 * H] = dh * tc * og * (1.0f - og);
     dc[k] = d * fg;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void xlstm_train_forward(const float* Q, const float* K, const float* V, const float* I, const float* F, const float* O, float* Y, float* S, int B, int T, int M, int H) {
+    int bh = bx_gid(); if (bh >= B * H) return;
+    int D = M / H; int W = D * D + D; int z = bh * (T + 1) * W;
+    float scale = 1.0f / sqrtf((float)D);
+    for (int j = 0; j < W; j++) S[z + j] = 0.0f;
+    for (int t = 0; t < T; t++) {
+        int x = (bh / H * T + t) * M + (bh % H) * D;
+        int g = (bh / H * T + t) * H + bh % H;
+        int a = z + t * W; int c = a + W;
+        float iv = (I[g] > 4.85e8f ? 4.85e8f : I[g]); float f = F[g];
+        for (int j = 0; j < D; j++) {
+            S[c + D * D + j] = f * S[a + D * D + j] + iv * K[x + j] * scale;
+            for (int r = 0; r < D; r++) S[c + r * D + j] = f * S[a + r * D + j] + iv * V[x + r] * K[x + j] * scale;
+        }
+        float nq = 0.0f;
+        for (int j = 0; j < D; j++) nq += S[c + D * D + j] * Q[x + j];
+        float nf = fmaxf(fabsf(nq), 1.0f);
+        for (int r = 0; r < D; r++) {
+            float v = 0.0f;
+            for (int j = 0; j < D; j++) v += S[c + r * D + j] * Q[x + j];
+            Y[x + r] = O[g] * v / nf;
+        }
+    }
+}
+extern ""C"" __global__ __launch_bounds__(256) void xlstm_train_backward(const float* Q, const float* K, const float* V, const float* I, const float* F, const float* O, const float* DY, const float* S, float* A, float* G, int B, int T, int M, int H) {
+    int bh = bx_gid(); if (bh >= B * H) return;
+    int D = M / H; int W = D * D + D; int z = bh * (T + 1) * W; int az = bh * W;
+    int N = B * T * M; int NG = B * T * H;
+    float scale = 1.0f / sqrtf((float)D);
+    for (int j = 0; j < W; j++) A[az + j] = 0.0f;
+    for (int t = T - 1; t >= 0; t--) {
+        int x = (bh / H * T + t) * M + (bh % H) * D;
+        int g = (bh / H * T + t) * H + bh % H;
+        int a = z + t * W; int c = a + W;
+        float iv = (I[g] > 4.85e8f ? 4.85e8f : I[g]); float f = F[g]; float o = O[g];
+        float nq = 0.0f;
+        for (int j = 0; j < D; j++) { nq += S[c + D * D + j] * Q[x + j]; G[x + j] = 0.0f; }
+        float nf = fmaxf(fabsf(nq), 1.0f); float dnf = 0.0f; float doGate = 0.0f;
+        for (int r = 0; r < D; r++) {
+            float v = 0.0f;
+            for (int j = 0; j < D; j++) v += S[c + r * D + j] * Q[x + j];
+            doGate += DY[x + r] * v / nf;
+            dnf -= DY[x + r] * o * v / (nf * nf);
+            float dn = DY[x + r] * o / nf;
+            for (int j = 0; j < D; j++) {
+                A[az + r * D + j] += dn * Q[x + j];
+                G[x + j] += S[c + r * D + j] * dn;
+            }
+        }
+        float dnq = fabsf(nq) > 1.0f ? dnf * (nq > 0.0f ? 1.0f : -1.0f) : 0.0f;
+        float di = 0.0f; float df = 0.0f;
+        for (int j = 0; j < D; j++) {
+            A[az + D * D + j] += dnq * Q[x + j];
+            G[x + j] += dnq * S[c + D * D + j];
+            di += A[az + D * D + j] * K[x + j] * scale;
+            df += A[az + D * D + j] * S[a + D * D + j];
+            float dk = A[az + D * D + j] * iv;
+            for (int r = 0; r < D; r++) dk += A[az + r * D + j] * iv * V[x + r];
+            G[N + x + j] = dk * scale;
+        }
+        for (int r = 0; r < D; r++) {
+            float dv = 0.0f;
+            for (int j = 0; j < D; j++) {
+                float dc = A[az + r * D + j];
+                dv += dc * iv * K[x + j] * scale;
+                di += dc * V[x + r] * K[x + j] * scale;
+                df += dc * S[a + r * D + j];
+            }
+            G[2 * N + x + r] = dv;
+        }
+        G[3 * N + g] = I[g] > 4.85e8f ? 0.0f : di;
+        G[3 * N + NG + g] = df; G[3 * N + 2 * NG + g] = doGate;
+        for (int j = 0; j < W; j++) A[az + j] *= f;
+    }
 }
 ";
 }

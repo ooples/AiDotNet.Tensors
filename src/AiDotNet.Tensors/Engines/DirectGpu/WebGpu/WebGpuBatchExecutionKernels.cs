@@ -1095,6 +1095,87 @@ fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
     gates[(p.t * B + b) * 4 * H + row] = select(lstm_sig(s), bx_tanh(s), row / H == 2);
 }");
 
+    public static readonly string XLstmTrainingForward = Shader(
+        new[] { "r:Q", "r:K", "r:V", "r:I", "r:F", "r:O", "rw:Y", "rw:S" }, "B: i32, T: i32, M: i32, H: i32", Main + @"
+
+    var bh: i32 = i; if (bh >= p.B * p.H) { return; }
+    var D: i32 = p.M / p.H; var W: i32 = D * D + D; var z: i32 = bh * (p.T + 1) * W;
+    var scale: f32 = 1.0 / sqrt(f32(D));
+    for (var j: i32 = 0; j < W; j++) { S[z + j] = 0.0; }
+    for (var t: i32 = 0; t < p.T; t++) {
+        var x: i32 = (bh / p.H * p.T + t) * p.M + (bh % p.H) * D;
+        var g: i32 = (bh / p.H * p.T + t) * p.H + bh % p.H;
+        var a: i32 = z + t * W; var c: i32 = a + W;
+        var iv: f32 = min(I[g], 4.85e8); var f: f32 = F[g];
+        for (var j: i32 = 0; j < D; j++) {
+            S[c + D * D + j] = f * S[a + D * D + j] + iv * K[x + j] * scale;
+            for (var r: i32 = 0; r < D; r++) { S[c + r * D + j] = f * S[a + r * D + j] + iv * V[x + r] * K[x + j] * scale; }
+        }
+        var nq: f32 = 0.0;
+        for (var j: i32 = 0; j < D; j++) { nq += S[c + D * D + j] * Q[x + j]; }
+        var nf: f32 = max(abs(nq), 1.0);
+        for (var r: i32 = 0; r < D; r++) {
+            var v: f32 = 0.0;
+            for (var j: i32 = 0; j < D; j++) { v += S[c + r * D + j] * Q[x + j]; }
+            Y[x + r] = O[g] * v / nf;
+        }
+    }
+}");
+
+    public static readonly string XLstmTrainingBackward = Shader(
+        new[] { "r:Q", "r:K", "r:V", "r:I", "r:F", "r:O", "r:DY", "r:S", "rw:A", "rw:G" }, "B: i32, T: i32, M: i32, H: i32", Main + @"
+
+    var bh: i32 = i; if (bh >= p.B * p.H) { return; }
+    var D: i32 = p.M / p.H; var W: i32 = D * D + D; var z: i32 = bh * (p.T + 1) * W; var az: i32 = bh * W;
+    var N: i32 = p.B * p.T * p.M; var NG: i32 = p.B * p.T * p.H;
+    var scale: f32 = 1.0 / sqrt(f32(D));
+    for (var j: i32 = 0; j < W; j++) { A[az + j] = 0.0; }
+    for (var t: i32 = p.T - 1; t >= 0; t--) {
+        var x: i32 = (bh / p.H * p.T + t) * p.M + (bh % p.H) * D;
+        var g: i32 = (bh / p.H * p.T + t) * p.H + bh % p.H;
+        var a: i32 = z + t * W; var c: i32 = a + W;
+        var iv: f32 = min(I[g], 4.85e8); var f: f32 = F[g]; var o: f32 = O[g];
+        var nq: f32 = 0.0;
+        for (var j: i32 = 0; j < D; j++) { nq += S[c + D * D + j] * Q[x + j]; G[x + j] = 0.0; }
+        var nf: f32 = max(abs(nq), 1.0); var dnf: f32 = 0.0; var doGate: f32 = 0.0;
+        for (var r: i32 = 0; r < D; r++) {
+            var v: f32 = 0.0;
+            for (var j: i32 = 0; j < D; j++) { v += S[c + r * D + j] * Q[x + j]; }
+            doGate += DY[x + r] * v / nf;
+            dnf -= DY[x + r] * o * v / (nf * nf);
+            var dn: f32 = DY[x + r] * o / nf;
+            for (var j: i32 = 0; j < D; j++) {
+                A[az + r * D + j] += dn * Q[x + j];
+                G[x + j] += S[c + r * D + j] * dn;
+            }
+        }
+        var dnq: f32 = select(0.0, dnf * select(-1.0, 1.0, nq > 0.0), abs(nq) > 1.0);
+        var di: f32 = 0.0; var df: f32 = 0.0;
+        for (var j: i32 = 0; j < D; j++) {
+            A[az + D * D + j] += dnq * Q[x + j];
+            G[x + j] += dnq * S[c + D * D + j];
+            di += A[az + D * D + j] * K[x + j] * scale;
+            df += A[az + D * D + j] * S[a + D * D + j];
+            var dk: f32 = A[az + D * D + j] * iv;
+            for (var r: i32 = 0; r < D; r++) { dk += A[az + r * D + j] * iv * V[x + r]; }
+            G[N + x + j] = dk * scale;
+        }
+        for (var r: i32 = 0; r < D; r++) {
+            var dv: f32 = 0.0;
+            for (var j: i32 = 0; j < D; j++) {
+                var dc: f32 = A[az + r * D + j];
+                dv += dc * iv * K[x + j] * scale;
+                di += dc * V[x + r] * K[x + j] * scale;
+                df += dc * S[a + r * D + j];
+            }
+            G[2 * N + x + r] = dv;
+        }
+        G[3 * N + g] = select(di, 0.0, I[g] > 4.85e8);
+        G[3 * N + NG + g] = df; G[3 * N + 2 * NG + g] = doGate;
+        for (var j: i32 = 0; j < W; j++) { A[az + j] *= f; }
+    }
+}");
+
     public static readonly string LstmGateCell = Shader(
         new[] { "r:pre", "r:old", "rw:y" }, "N: i32, H: i32", LstmSig + Main + @"
     if (i >= p.N) { return; }
@@ -1231,6 +1312,8 @@ fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
         [BatchExecutionCudaKernels.LaQrReduced] = LaQrReduced,
         [BatchExecutionCudaKernels.FaLse] = FaLse, [BatchExecutionCudaKernels.FaOut] = FaOut, [BatchExecutionCudaKernels.FaDelta] = FaDelta,
         [BatchExecutionCudaKernels.FaDq] = FaDq, [BatchExecutionCudaKernels.FaDk] = FaDk, [BatchExecutionCudaKernels.FaDv] = FaDv,
+        [BatchExecutionCudaKernels.XLstmTrainingForward] = XLstmTrainingForward,
+        [BatchExecutionCudaKernels.XLstmTrainingBackward] = XLstmTrainingBackward,
         [BatchExecutionCudaKernels.LstmGateCell] = LstmGateCell,
         [BatchExecutionCudaKernels.LstmGateCellBackward] = LstmGateCellBackward,
         [BatchExecutionCudaKernels.LstmGates] = LstmGates, [BatchExecutionCudaKernels.LstmCell] = LstmCell,
