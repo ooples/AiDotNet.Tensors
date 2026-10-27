@@ -445,7 +445,8 @@ public class FusedOptimizerNonFiniteGradientTests
             Assert.Equal(1, plan.NonFiniteStepsSkipped);
             Assert.Empty(state.OptimizerCalls);
             Assert.Equal(2, state.ClassifyFloatCalls);
-            Assert.Equal(1, state.FillCalls);
+            // Four Adam moment buffers are zeroed during configuration; one fill seeds the finite check.
+            Assert.Equal(5, state.FillCalls);
             Assert.Equal(2, state.MultiplyCalls);
             Assert.Equal(1, state.ScalarMinCalls);
             Assert.Equal(0, state.DownloadBufferCalls);
@@ -472,7 +473,8 @@ public class FusedOptimizerNonFiniteGradientTests
             Assert.Equal(0, plan.NonFiniteStepsSkipped);
             Assert.Equal(new[] { "AdamMultiTensorUpdate" }, state.OptimizerCalls);
             Assert.Equal(2, state.ClassifyFloatCalls);
-            Assert.Equal(1, state.FillCalls);
+            // Four Adam moment buffers are zeroed during configuration; one fill seeds the finite check.
+            Assert.Equal(5, state.FillCalls);
             Assert.Equal(2, state.MultiplyCalls);
             Assert.Equal(1, state.ScalarMinCalls);
             Assert.Equal(0, state.DownloadBufferCalls);

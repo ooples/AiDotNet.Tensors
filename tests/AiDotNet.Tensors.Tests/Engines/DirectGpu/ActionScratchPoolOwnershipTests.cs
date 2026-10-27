@@ -25,6 +25,7 @@ public sealed class ActionScratchPoolOwnershipTests : IClassFixture<DirectGpuTen
         var gpu = _fixture.Engine as DirectGpuTensorEngine;
         Skip.If(gpu is null, "Not a DirectGpu engine.");
 
+        var previousPool = DirectGpuTensorEngine.EnterScratchPool(gpu.CreateScratchPool());
         gpu.SuspendActivationEviction();   // with the capture path: a compiled step's resident scope, which pools
         using (gpu.EnterCompiledCapturePath())
         {
@@ -53,6 +54,7 @@ public sealed class ActionScratchPoolOwnershipTests : IClassFixture<DirectGpuTen
             finally
             {
                 gpu.SetCurrentScratchAction(-1);
+                DirectGpuTensorEngine.RestoreScratchPool(previousPool);
                 gpu.ClearActionScratchPool();
                 gpu.ResumeActivationEviction();
             }

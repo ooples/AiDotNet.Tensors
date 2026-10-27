@@ -6262,6 +6262,14 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        // A compiled GPU replay keeps the argmax on the device (relative positions along the reduced axes).
+        if (savedState[0] is Tensor<int> deviceIndices)
+        {
+            var deviceGrad = engine.ReduceMaxBackwardWithTensorIndices(
+                gradOutput, deviceIndices, inputs[0]._shape, (int[])savedState[1]);
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
+            return;
+        }
         var maxIndices = (int[])savedState[0];
         var inputShape = inputs[0]._shape;
         var grad = engine.ReduceMaxBackward(gradOutput, maxIndices, inputShape);
