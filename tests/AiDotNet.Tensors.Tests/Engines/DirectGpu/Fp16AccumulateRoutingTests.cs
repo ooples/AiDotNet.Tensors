@@ -221,6 +221,84 @@ public sealed class Fp16AccumulateRoutingTests
         Assert.All(Output(), v => Assert.Equal(0f, v));
     }
 
+    // The batched conv GEMM (GemmFp16ConvBatched: one GEMM per image, NCHW) through the forced FP16-accumulate route: each
+    // image's out[b] = W @ col[:, b * P ..] against an fp64 reference, both outputs; then overflow-sized operands (W all 64,
+    // col +64 for 32 rows then -64) whose tile partials overflow FP16 but cancel to exactly 0 through the FP32 redo.
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void RoutedConvBatched_WritesEveryImageInNchw_AndRedoesOverflowExactly(bool halfOutput)
+    {
+        using var backend = RequireAmpereBackend();
+        const int m = 128, pixels = 784, k = 1152, batch = 8;   // 9.2e8 multiply-adds: past the route's minimum work
+        int n = batch * pixels;
+        backend.ForceFp16AccumulateRouteForTests(m, pixels, k,
+            new AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx.PtxTensorCoreGemmConfiguration(64, 64, 32, 32, 32, 2, 8),
+            halfOutput, batch);
+        var rng = new Random(23);
+        Half[] w = Enumerable.Range(0, m * k).Select(_ => (Half)(rng.NextDouble() * 2 - 1)).ToArray();
+        Half[] col = Enumerable.Range(0, k * n).Select(_ => (Half)(rng.NextDouble() * 2 - 1)).ToArray();
+        using var dw = backend.AllocateByteBuffer(m * k * 2);
+        using var dcol = backend.AllocateByteBuffer(k * n * 2);
+        using var dout = halfOutput ? backend.AllocateByteBuffer(m * n * 2) : backend.AllocateBuffer(m * n);
+        backend.UploadBytes(dw, HalfBytes(w));
+        backend.UploadBytes(dcol, HalfBytes(col));
+        float[] Output()
+        {
+            if (!halfOutput) return backend.DownloadBuffer(dout);
+            byte[] bytes = backend.DownloadByteBuffer(dout, m * n * 2);
+            return Enumerable.Range(0, m * n)
+                .Select(i => (float)BitConverter.UInt16BitsToHalf((ushort)(bytes[2 * i] | (bytes[2 * i + 1] << 8)))).ToArray();
+        }
+        long before = backend.Fp16AccumulateDispatchCount;
+        backend.GemmFp16ConvBatched(dw, dcol, dout, m, pixels, k, batch, halfOutput);
+        Assert.Equal(before + 1, backend.Fp16AccumulateDispatchCount);
+        float[] c = Output();
+        for (int s = 0; s < 600; s++)
+        {
+            int b = rng.Next(batch), i = rng.Next(m), p = rng.Next(pixels);
+            double sum = 0, abs = 0;
+            for (int q = 0; q < k; q++)
+            {
+                double prod = (double)w[i * k + q] * (double)col[q * n + b * pixels + p];
+                sum += prod;
+                abs += Math.Abs(prod);
+            }
+            float got = c[(b * m + i) * pixels + p];
+            Assert.True(Math.Abs(got - sum) <= 3 * Math.Pow(2, -11) * abs + (halfOutput ? Math.Pow(2, -11) * Math.Abs(sum) : 0) + 1e-3,
+                $"out[{b}][{i}][{p}] = {got}, expected {sum} (sum|ab| {abs})");
+        }
+
+        backend.UploadBytes(dw, HalfBytes(Enumerable.Repeat((Half)64f, m * k).ToArray()));
+        backend.UploadBytes(dcol, HalfBytes(Enumerable.Range(0, k * n).Select(i => (Half)((i / n) % 64 < 32 ? 64f : -64f)).ToArray()));
+        backend.GemmFp16ConvBatched(dw, dcol, dout, m, pixels, k, batch, halfOutput);
+        Assert.Equal(before + 2, backend.Fp16AccumulateDispatchCount);
+        Assert.All(Output(), v => Assert.Equal(0f, v));
+    }
+
+    // Opt-in (AIDOTNET_RUN_TC_GEMM_PROBE=1): the batched conv GEMM's route verdicts (quick pick vs cuBLAS strided-batched)
+    // on ResNet-style shapes; 196 pixels is not 16-byte aligned for the kernel's strides and keeps cuBLAS.
+    [SkippableFact]
+    public void Probe_ConvBatchedRouteVerdicts()
+    {
+        Skip.IfNot(Environment.GetEnvironmentVariable("AIDOTNET_RUN_TC_GEMM_PROBE") == "1", "Set AIDOTNET_RUN_TC_GEMM_PROBE=1.");
+        using var backend = RequireAmpereBackend();
+        foreach (var (m, pixels, k, batch) in new[] { (64, 3136, 576, 8), (128, 784, 1152, 8), (256, 196, 2304, 8), (64, 3136, 576, 32) })
+        {
+            int n = batch * pixels;
+            var rng = new Random(m + pixels + k);
+            using var dw = backend.AllocateByteBuffer(m * k * 2);
+            using var dcol = backend.AllocateByteBuffer(k * n * 2);
+            using var dout = backend.AllocateBuffer(m * n);
+            backend.UploadBytes(dw, HalfBytes(Enumerable.Range(0, m * k).Select(_ => (Half)(rng.NextDouble() * 2 - 1)).ToArray()));
+            backend.UploadBytes(dcol, HalfBytes(Enumerable.Range(0, k * n).Select(_ => (Half)(rng.NextDouble() * 2 - 1)).ToArray()));
+            backend.GemmFp16ConvBatched(dw, dcol, dout, m, pixels, k, batch, halfOutput: false);
+            var verdict = backend.Fp16AccumulateVerdict(m, pixels, k, halfOutput: false, batch: batch);
+            _output.WriteLine($"M{m} P{pixels} K{k} batch {batch}: " +
+                (verdict is { } v ? $"routed {v.Routed}, median {v.MedianSpeedup:F3}x; {v.Reason}" : "not evaluated"));
+        }
+    }
+
     // Opt-in (AIDOTNET_RUN_TC_GEMM_PROBE=1): per shape, cuBLAS against the best of a few configurations with FP32
     // accumulation and with FP16 accumulation (operands in [-1, 1): no block redoes), and the FP16-accumulate kernel when
     // every block overflows and redoes (all operands 64), the worst case of the in-kernel recovery.

@@ -256,6 +256,17 @@ public sealed partial class CudaBackend : IFp16ConvBatchedGemmBackend
         if (colFp16.SizeInBytes < (long)k * columns * 2) throw new ArgumentException("col half buffer too small.", nameof(colFp16));
         if (output.SizeInBytes < (long)m * columns * (halfOutput ? 2 : 4)) throw new ArgumentException("output buffer too small.", nameof(output));
 
+        // The FP16-accumulate route (#1549) where it beats cuBLAS on this device; else cuBLAS's strided-batched GEMM.
+        if (!TryFp16AccumulateConvBatched(weightsFp16, colFp16, output, m, pixels, k, batch, halfOutput))
+            CublasGemmFp16ConvBatched(weightsFp16, colFp16, output, m, pixels, k, batch, halfOutput);
+        System.Threading.Interlocked.Increment(ref _fp16ConvBatchedDispatchCount);
+    }
+
+    // cuBLAS FP16 in, FP32 accumulate, one GEMM per image straight into NCHW (see GemmFp16ConvBatched).
+    private unsafe void CublasGemmFp16ConvBatched(IGpuBuffer weightsFp16, IGpuBuffer colFp16, IGpuBuffer output, int m,
+        int pixels, int k, int batch, bool halfOutput)
+    {
+        long columns = (long)batch * pixels;
         using var _ = PushContext();
         float alpha = 1f, beta = 0f;
         // Row-major out_b[M, P] = W[M, K] @ col_b[K, P] is column-major out_b^T[P, M] = col_b^T @ W^T: cuBLAS's A is the
@@ -272,7 +283,6 @@ public sealed partial class CudaBackend : IFp16ConvBatchedGemmBackend
         if (status == AiDotNet.Tensors.Engines.CublasStatus.NotSupported)
             throw new NotSupportedException($"FP16 Tensor-Core batched GEMM not supported on this device (cc {_ccMajor}.{_ccMinor}).");
         CuBlasNative.CheckCublasStatus(status, "cublasGemmStridedBatchedEx(GemmFp16ConvBatched)");
-        System.Threading.Interlocked.Increment(ref _fp16ConvBatchedDispatchCount);
     }
 
     /// <summary>

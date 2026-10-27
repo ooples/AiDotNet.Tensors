@@ -69,7 +69,19 @@ public sealed partial class CudaBackend
         public void Dispose() => Kernel?.Dispose();
     }
 
-    private readonly ConcurrentDictionary<(int M, int N, int K, bool HalfOutput), Fp16AccumulateRoute> _fp16AccumulateRoutes = new();
+    // One routed problem: C[M, N] = A[M, K] @ B for each of Batch problems. Batch 1 is the plain row-major GEMM; above one
+    // it is the FP16 im2col conv's per-image GEMM (IFp16ConvBatchedGemmBackend): B is image b's slice of col[K, Batch * N]
+    // (ld Batch * N, next image N columns on), A the shared weights, C image b's NCHW block (ld N, next image M * N on).
+    private readonly record struct Fp16AccumulateProblem(int M, int N, int K, bool HalfOutput, int Batch)
+    {
+        internal int Ldb => Batch * N;
+        internal long StrideB => N;
+        internal long StrideC => (long)M * N;
+        internal long OutputElements => (long)Batch * M * N;
+        internal long Work => (long)Batch * M * N * K;
+    }
+
+    private readonly ConcurrentDictionary<Fp16AccumulateProblem, Fp16AccumulateRoute> _fp16AccumulateRoutes = new();
     private readonly object _fp16AccumulateTuneLock = new();
     private PtxMmaRateProbe.Result? _mmaRate;   // measured once, under _fp16AccumulateTuneLock
     private long _fp16AccumulateDispatchCount;
@@ -79,8 +91,8 @@ public sealed partial class CudaBackend
 
     /// <summary>The verdict for one shape, or null when it was never evaluated (test and diagnostics hook).</summary>
     internal (bool Routed, string Reason, double MedianSpeedup)? Fp16AccumulateVerdict(int m, int n, int k,
-        bool halfOutput = false) =>
-        _fp16AccumulateRoutes.TryGetValue((m, n, k, halfOutput), out var route)
+        bool halfOutput = false, int batch = 1) =>
+        _fp16AccumulateRoutes.TryGetValue(new Fp16AccumulateProblem(m, n, k, halfOutput, batch), out var route)
             ? (route.Kernel is not null, route.Reason, route.MedianSpeedup)
             : null;
 
@@ -89,12 +101,13 @@ public sealed partial class CudaBackend
     /// routed path (including its in-kernel FP32 redo) can be checked independently of which route measures faster.
     /// </summary>
     internal void ForceFp16AccumulateRouteForTests(int m, int n, int k, PtxTensorCoreGemmConfiguration config,
-        bool halfOutput = false)
+        bool halfOutput = false, int batch = 1)
     {
         var kernel = new PtxTensorCoreGemmKernel(GetDirectPtxRuntime(), config, new PtxGemmLayout(false, false),
             PtxTensorCorePrecision.Fp16, halfOutput, fp16Accumulate: true);
-        if (_fp16AccumulateRoutes.TryGetValue((m, n, k, halfOutput), out var previous)) previous.Dispose();
-        _fp16AccumulateRoutes[(m, n, k, halfOutput)] = new Fp16AccumulateRoute(kernel, "forced for tests", 0);
+        var problem = new Fp16AccumulateProblem(m, n, k, halfOutput, batch);
+        if (_fp16AccumulateRoutes.TryGetValue(problem, out var previous)) previous.Dispose();
+        _fp16AccumulateRoutes[problem] = new Fp16AccumulateRoute(kernel, "forced for tests", 0);
     }
 
     /// <summary>
@@ -102,30 +115,41 @@ public sealed partial class CudaBackend
     /// this shape is routed; false leaves the call to cuBLAS.
     /// </summary>
     internal bool TryFp16AccumulateGemm(IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, int m, int n, int k,
-        bool halfOutput = false)
+        bool halfOutput = false) =>
+        TryFp16Accumulate(new Fp16AccumulateProblem(m, n, k, halfOutput, 1), a, b, c);
+
+    /// <summary>
+    /// The FP16 im2col conv's per-image GEMM (<see cref="GemmFp16ConvBatched"/>) through the FP16-accumulate kernel, batched
+    /// over images with strides, when this shape is routed; false leaves it to cuBLAS's strided-batched GEMM.
+    /// </summary>
+    internal bool TryFp16AccumulateConvBatched(IGpuBuffer weights, IGpuBuffer col, IGpuBuffer output, int m, int pixels,
+        int k, int batch, bool halfOutput) =>
+        TryFp16Accumulate(new Fp16AccumulateProblem(m, pixels, k, halfOutput, batch), weights, col, output);
+
+    private bool TryFp16Accumulate(Fp16AccumulateProblem problem, IGpuBuffer a, IGpuBuffer b, IGpuBuffer c)
     {
-        if (!s_fp16AccumulateEnabled || _ccMajor < 8 || (long)m * n * k < Fp16AccumulateMinWork) return false;
-        if (!_fp16AccumulateRoutes.TryGetValue((m, n, k, halfOutput), out var route))
+        if (!s_fp16AccumulateEnabled || _ccMajor < 8 || problem.Work < Fp16AccumulateMinWork) return false;
+        if (!_fp16AccumulateRoutes.TryGetValue(problem, out var route))
         {
             // Tuning measures with synchronizing events, which a stream capture cannot record: capture keeps cuBLAS until
             // an eager call of the shape has decided.
             if (IsStreamCapturing()) return false;
             lock (_fp16AccumulateTuneLock)
             {
-                if (!_fp16AccumulateRoutes.TryGetValue((m, n, k, halfOutput), out route))
+                if (!_fp16AccumulateRoutes.TryGetValue(problem, out route))
                 {
                     // Where FP32 accumulation already issues at full rate nothing can double: no shape is tuned. A
                     // verdict persisted by TuneFp16AccumulateRouteAsync (an evolved kernel for this device and rate)
                     // wins over the quick pick among a few fixed candidates.
                     route = Fp16AccumulateRateRejection() ??
-                            TryLoadPersistedFp16AccumulateRoute(m, n, k, halfOutput) ??
-                            TuneFp16AccumulateRoute(a, b, c, m, n, k, halfOutput);
-                    _fp16AccumulateRoutes[(m, n, k, halfOutput)] = route;
+                            (problem.Batch == 1 ? TryLoadPersistedFp16AccumulateRoute(problem.M, problem.N, problem.K, problem.HalfOutput) : null) ??
+                            TuneFp16AccumulateRoute(a, b, c, problem);
+                    _fp16AccumulateRoutes[problem] = route;
                 }
             }
         }
         if (route.Kernel is null) return false;
-        LaunchFp16Accumulate(route.Kernel, a, b, c, m, n, k);
+        LaunchFp16Accumulate(route.Kernel, a, b, c, problem);
         Interlocked.Increment(ref _fp16AccumulateDispatchCount);
         return true;
     }
@@ -175,18 +199,31 @@ public sealed partial class CudaBackend
     }
 
     private void LaunchFp16Accumulate(PtxTensorCoreGemmKernel kernel, IGpuBuffer a, IGpuBuffer b, IGpuBuffer c,
-        int m, int n, int k)
+        Fp16AccumulateProblem p)
     {
         using var _ = PushContext();
         lock (GpuDispatchLock)
-            kernel.Launch(a.Handle, b.Handle, c.Handle, m, n, k, k, n, n, 1f, 0f, stream: _stream);
+            kernel.Launch(a.Handle, b.Handle, c.Handle, p.M, p.N, p.K, p.K, p.Ldb, p.N, 1f, 0f,
+                p.Batch, 0, p.StrideB, p.StrideC, stream: _stream);
     }
+
+    private void CublasFp16Accumulate(IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, Fp16AccumulateProblem p)
+    {
+        if (p.Batch == 1) CublasFp16Gemm(a, b, c, p.M, p.N, p.K, p.HalfOutput);
+        else CublasGemmFp16ConvBatched(a, b, c, p.M, p.N, p.K, p.Batch, p.HalfOutput);
+    }
+
+    private static bool AdmitsFp16Accumulate(PtxTensorCoreGemmConfiguration config, PtxGemmLayout layout, Fp16AccumulateProblem p) =>
+        PtxTensorCoreGemmGenerator.Admits(config, layout, p.M, p.N, p.K, p.K, p.Ldb, p.N,
+            0, p.Batch > 1 ? p.StrideB : 0, p.Batch > 1 ? p.StrideC : 0, PtxTensorCorePrecision.Fp16);
 
     // Picks the fastest of the fixed candidates (and `extra`, first) that loads and reproduces cuBLAS, then times it
     // against cuBLAS.
-    private Fp16AccumulateRoute TuneFp16AccumulateRoute(IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, int m, int n, int k,
-        bool halfOutput, PtxTensorCoreGemmConfiguration? extra = null)
+    private Fp16AccumulateRoute TuneFp16AccumulateRoute(IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, Fp16AccumulateProblem problem,
+        PtxTensorCoreGemmConfiguration? extra = null)
     {
+        bool halfOutput = problem.HalfOutput;
+        int outputCount = checked((int)problem.OutputElements);
         DirectPtxRuntime runtime;
         try
         {
@@ -202,8 +239,8 @@ public sealed partial class CudaBackend
         try
         {
             // cuBLAS's output, the reference every candidate must reproduce (to FP16-accumulation accuracy).
-            CublasFp16Gemm(a, b, c, m, n, k, halfOutput);
-            float[] reference = DownloadGemmOutput(c, m * n, halfOutput);
+            CublasFp16Accumulate(a, b, c, problem);
+            float[] reference = DownloadGemmOutput(c, outputCount, halfOutput);
             double scale = 0;
             foreach (float v in reference) scale = Math.Max(scale, Math.Abs((double)v));
 
@@ -213,7 +250,7 @@ public sealed partial class CudaBackend
                 if (!candidates.Contains(config)) candidates.Add(config);
             foreach (var config in candidates)
             {
-                if (!PtxTensorCoreGemmGenerator.Admits(config, layout, m, n, k, k, n, n, 0, 0, 0, PtxTensorCorePrecision.Fp16))
+                if (!AdmitsFp16Accumulate(config, layout, problem))
                     continue;
                 PtxTensorCoreGemmKernel kernel;
                 try
@@ -225,8 +262,8 @@ public sealed partial class CudaBackend
                 {
                     continue;   // spills or does not load on this device
                 }
-                LaunchFp16Accumulate(kernel, a, b, c, m, n, k);
-                float[] actual = DownloadGemmOutput(c, m * n, halfOutput);
+                LaunchFp16Accumulate(kernel, a, b, c, problem);
+                float[] actual = DownloadGemmOutput(c, outputCount, halfOutput);
                 double diff = 0;
                 for (int i = 0; i < actual.Length; i++) diff = Math.Max(diff, Math.Abs((double)actual[i] - reference[i]));
                 if (!(diff <= 5e-3 * Math.Max(scale, 1e-30)))
@@ -234,7 +271,7 @@ public sealed partial class CudaBackend
                     kernel.Dispose();
                     continue;
                 }
-                double ms = TimeFp16Gemm(() => LaunchFp16Accumulate(kernel, a, b, c, m, n, k), 10);
+                double ms = TimeFp16Gemm(() => LaunchFp16Accumulate(kernel, a, b, c, problem), 10);
                 if (ms < bestMs)
                 {
                     best?.Dispose();
@@ -247,7 +284,7 @@ public sealed partial class CudaBackend
                 }
             }
             if (best is null) return new Fp16AccumulateRoute(null, "no candidate admits, loads and reproduces cuBLAS", 0);
-            return VerdictAgainstCublas(best, a, b, c, m, n, k, halfOutput);
+            return VerdictAgainstCublas(best, a, b, c, problem);
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {
@@ -260,15 +297,15 @@ public sealed partial class CudaBackend
     // would otherwise keep cuBLAS for the process) is measured once more, and that second set of rounds must pass on its
     // own. Takes ownership of the kernel: kept in the route on a win, disposed otherwise.
     private Fp16AccumulateRoute VerdictAgainstCublas(PtxTensorCoreGemmKernel kernel, IGpuBuffer a, IGpuBuffer b, IGpuBuffer c,
-        int m, int n, int k, bool halfOutput)
+        Fp16AccumulateProblem problem)
     {
         const int reps = 3;
         GemmRouteVerdict verdict;
         try
         {
             verdict = ConfirmFp16AccumulateVerdict(() => PairedRounds(
-                () => { for (int i = 0; i < reps; i++) CublasFp16Gemm(a, b, c, m, n, k, halfOutput); },
-                () => { for (int i = 0; i < reps; i++) LaunchFp16Accumulate(kernel, a, b, c, m, n, k); },
+                () => { for (int i = 0; i < reps; i++) CublasFp16Accumulate(a, b, c, problem); },
+                () => { for (int i = 0; i < reps; i++) LaunchFp16Accumulate(kernel, a, b, c, problem); },
                 reps));
         }
         catch
@@ -327,10 +364,11 @@ public sealed partial class CudaBackend
 
         // The search's winner competes with the fixed candidates on the same operands: its ranking is a short measurement,
         // so it must also beat them here to be kept.
-        Fp16AccumulateRoute route = TuneFp16AccumulateRoute(a, b, c, m, n, k, halfOutput, winner);
+        var problem = new Fp16AccumulateProblem(m, n, k, halfOutput, 1);
+        Fp16AccumulateRoute route = TuneFp16AccumulateRoute(a, b, c, problem, winner);
         PtxTensorCoreGemmConfiguration chosen = route.Kernel?.Configuration ?? winner;
-        if (_fp16AccumulateRoutes.TryGetValue((m, n, k, halfOutput), out var previous)) previous.Dispose();
-        _fp16AccumulateRoutes[(m, n, k, halfOutput)] = route;
+        if (_fp16AccumulateRoutes.TryGetValue(problem, out var previous)) previous.Dispose();
+        _fp16AccumulateRoutes[problem] = route;
 
         if (persist)
         {
