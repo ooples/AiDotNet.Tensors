@@ -415,7 +415,15 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             t._gpuBackend = null;
             t._gpuBufferVersion = -1;
         }
-        for (int i = 0; i < _preAllocatedGrads.Length; i++) Unbind(_preAllocatedGrads[i]);
+        // Only the PARAMETERS' gradients are results a reader can still ask for (Gradients, the host optimizer path).
+        // Every other pre-allocated gradient is an intermediate the next backward recomputes; landing all of them
+        // downloaded ~800 MB of activation gradients per plan when N-BEATS finished training on the GPU (966 tensors,
+        // ~0.35 s a plan, two plans a Train call: the largest fixed cost of a GPU Train, AiDotNet#1804).
+        var parameterGradients = new HashSet<Tensor<T>>(_gradients, ReferenceEqualityComparer<Tensor<T>>.Instance);
+        if (_liveGradientMap is { } liveGradients)
+            foreach (var current in liveGradients.Values) parameterGradients.Add(current);
+        for (int i = 0; i < _preAllocatedGrads.Length; i++)
+            Unbind(_preAllocatedGrads[i], isResult: parameterGradients.Contains(_preAllocatedGrads[i]));
         if (_aliasedGradViews is { } views)
             foreach (var (view, _) in views) Unbind(view);
         Unbind(_lossGradSeed);
@@ -991,7 +999,16 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (_engine is not Engines.DirectGpuTensorEngine gte
             || gte.GetBackend() is not Engines.DirectGpu.IGpuGraphCapture { ContextIsLive: true })
             return;
-        foreach (var gradient in Gradients)
+        var gradients = Gradients;
+        // The intermediate gradients share pooled backing arrays with these, and a host read of an array downloads
+        // every resident member on it: landing N-BEATS's parameter gradients downloaded all 966 of the plan's gradient
+        // buffers (~800 MB) at the end of every GPU Train. The intermediates' device values are discarded with the
+        // plan, so take them out of their groups first (AiDotNet#1804).
+        var landed = new HashSet<Tensor<T>>(gradients.Where(g => g is not null)!, ReferenceEqualityComparer<Tensor<T>>.Instance);
+        foreach (var buffer in _preAllocatedGrads)
+            if (buffer is not null && !landed.Contains(buffer))
+                Helpers.ResidentHostMirror.Detach(buffer);
+        foreach (var gradient in gradients)
         {
             if (gradient?.GetBackingArrayForCacheLookupUnsafe() is not { } backing) continue;
             try { Helpers.HostSync.TryMaterialize(backing); }
