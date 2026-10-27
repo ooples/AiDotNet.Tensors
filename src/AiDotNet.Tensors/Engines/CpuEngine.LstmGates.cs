@@ -108,13 +108,17 @@ public partial class CpuEngine
     {
         var pre = gates.GetFlattenedData();
         var activated = new float[gates.Length];
-        for (int offset = 0; offset < activated.Length; offset += 4 * hidden)
-        {
-            Simd.SimdKernels.Sigmoid(pre.AsSpan(offset, hidden), activated.AsSpan(offset, hidden));
-            Simd.SimdKernels.Sigmoid(pre.AsSpan(offset + hidden, hidden), activated.AsSpan(offset + hidden, hidden));
-            Simd.SimdKernels.Tanh(pre.AsSpan(offset + 2 * hidden, hidden), activated.AsSpan(offset + 2 * hidden, hidden));
-            Simd.SimdKernels.Sigmoid(pre.AsSpan(offset + 3 * hidden, hidden), activated.AsSpan(offset + 3 * hidden, hidden));
-        }
+        int count = gates.Length / 4;
+        // Gate-major scratch lets each activation process one long SIMD span instead
+        // of restarting its dispatch and vector tail for every spatial position.
+        for (int row = 0; row < count / hidden; row++)
+            for (int gate = 0; gate < 4; gate++)
+                pre.AsSpan(row * 4 * hidden + gate * hidden, hidden)
+                    .CopyTo(activated.AsSpan(gate * count + row * hidden, hidden));
+        Simd.SimdKernels.Sigmoid(activated.AsSpan(0, count), activated.AsSpan(0, count));
+        Simd.SimdKernels.Sigmoid(activated.AsSpan(count, count), activated.AsSpan(count, count));
+        Simd.SimdKernels.Tanh(activated.AsSpan(2 * count, count), activated.AsSpan(2 * count, count));
+        Simd.SimdKernels.Sigmoid(activated.AsSpan(3 * count, count), activated.AsSpan(3 * count, count));
         return activated;
     }
 
@@ -127,12 +131,11 @@ public partial class CpuEngine
         var cell = write.Span.Slice(count, count); var hiddenOut = write.Span.Slice(0, count);
         for (int k = 0; k < count; k++)
         {
-            int g = (k / hidden) * 4 * hidden + k % hidden;
-            cell[k] = act[g + hidden] * old[k] + act[g] * act[g + 2 * hidden];
+            cell[k] = act[count + k] * old[k] + act[k] * act[2 * count + k];
         }
         Simd.SimdKernels.Tanh(cell, hiddenOut);
         for (int k = 0; k < count; k++)
-            hiddenOut[k] *= act[(k / hidden) * 4 * hidden + k % hidden + 3 * hidden];
+            hiddenOut[k] *= act[3 * count + k];
         return result;
     }
 
@@ -148,7 +151,7 @@ public partial class CpuEngine
         for (int k = 0; k < count; k++)
         {
             int g = (k / hidden) * 4 * hidden + k % hidden;
-            float i = act[g], f = act[g + hidden], z = act[g + 2 * hidden], o = act[g + 3 * hidden];
+            float i = act[k], f = act[count + k], z = act[2 * count + k], o = act[3 * count + k];
             float d = dy[count + k] + dy[k] * o * (1 - tc[k] * tc[k]);
             gw.Span[g] = d * z * i * (1 - i);
             gw.Span[g + hidden] = d * old[k] * f * (1 - f);
