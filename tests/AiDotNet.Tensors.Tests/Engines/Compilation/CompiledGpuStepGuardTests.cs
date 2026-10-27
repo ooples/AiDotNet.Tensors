@@ -57,6 +57,27 @@ public class CompiledGpuStepGuardTests
     }
 
     [Theory]
+    [InlineData(-1, 0)]
+    [InlineData(3, 2)]
+    [InlineData(0, 1)]
+    public void A_saved_int_tensor_with_invalid_shape_or_value_count_is_rejected(int dimension, int valueCount)
+    {
+        using var ms = new MemoryStream();
+        using (var writer = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true))
+        {
+            writer.Write(1);
+            writer.Write(PlanFormatConstants.TagInt32Tensor);
+            writer.Write(1);
+            writer.Write(dimension);
+            writer.Write(valueCount);
+            for (int i = 0; i < valueCount; i++) writer.Write(i);
+        }
+        ms.Position = 0;
+        using var reader = new BinaryReader(ms, Encoding.UTF8, leaveOpen: true);
+        Assert.Throws<InvalidDataException>(() => SavedStateSerializerTestProxy.Read(reader, Array.Empty<Tensor<float>>()));
+    }
+
+    [Theory]
     [InlineData(int.MaxValue, 1)]   // start + length overflows to negative and passed a start + length check
     [InlineData(3, 2)]
     [InlineData(-1, 1)]
