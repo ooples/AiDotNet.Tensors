@@ -5218,6 +5218,34 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         return true;
     }
 
+    // Moment state starts at zero on the device; allocating and uploading a host zero array
+    // adds LOH/GC pressure and a full transfer for every parameter and every optimizer slot.
+    internal static Engines.DirectGpu.IGpuBuffer AllocateGpuOptimizerState(
+        Engines.DirectGpu.IDirectGpuBackend backend, int length)
+    {
+        if (length == 0) return backend.AllocateBuffer(Array.Empty<float>());
+        var buffer = backend is Engines.DirectGpu.IUninitializedGpuAllocation uninitialized
+            ? uninitialized.AllocateBufferUninitialized(length)
+            : backend.AllocateBuffer(length);
+        try
+        {
+            backend.Fill(buffer, 0f, length);
+            return buffer;
+        }
+        catch (NotSupportedException ex)
+        {
+            buffer.Dispose();
+            Engines.DirectGpu.GpuLaunchProbe.OnFallback("AllocateGpuOptimizerState", ex);
+            return backend.AllocateBuffer(new float[length]);
+        }
+        catch
+        {
+            buffer.Dispose();
+            throw;
+        }
+    }
+
+
     private unsafe void ConfigureOptimizerFloat(
         OptimizerType optimizerType, LrSchedule schedule, float beta1, float beta2, float eps, float weightDecay,
         FusedOptimizerExtras extras)
@@ -5415,17 +5443,17 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 {
                     if (needsMomentum)
                     {
-                        gpuM[p] = paramBackend.AllocateBuffer(new float[lengths[p]]);
+                        gpuM[p] = AllocateGpuOptimizerState(paramBackend, lengths[p]);
                         _gpuOptimizerBuffers.Add(gpuM[p]!);
                     }
                     if (needsSecondMoment)
                     {
-                        gpuV[p] = paramBackend.AllocateBuffer(new float[lengths[p]]);
+                        gpuV[p] = AllocateGpuOptimizerState(paramBackend, lengths[p]);
                         _gpuOptimizerBuffers.Add(gpuV[p]!);
                     }
                     if (needsThirdState)
                     {
-                        gpuVMax[p] = paramBackend.AllocateBuffer(new float[lengths[p]]);
+                        gpuVMax[p] = AllocateGpuOptimizerState(paramBackend, lengths[p]);
                         _gpuOptimizerBuffers.Add(gpuVMax[p]!);
                     }
                 }
@@ -6842,17 +6870,17 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 {
                     if (needsMomentum)
                     {
-                        gpuM[p] = paramBackend.AllocateBuffer(new float[lengths[p]]);
+                        gpuM[p] = AllocateGpuOptimizerState(paramBackend, lengths[p]);
                         _gpuOptimizerBuffers.Add(gpuM[p]!);
                     }
                     if (needsSecondMoment)
                     {
-                        gpuV[p] = paramBackend.AllocateBuffer(new float[lengths[p]]);
+                        gpuV[p] = AllocateGpuOptimizerState(paramBackend, lengths[p]);
                         _gpuOptimizerBuffers.Add(gpuV[p]!);
                     }
                     if (needsThirdState)
                     {
-                        gpuVMax[p] = paramBackend.AllocateBuffer(new float[lengths[p]]);
+                        gpuVMax[p] = AllocateGpuOptimizerState(paramBackend, lengths[p]);
                         _gpuOptimizerBuffers.Add(gpuVMax[p]!);
                     }
                 }
