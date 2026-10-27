@@ -1460,6 +1460,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// </summary>
     private static HashSet<CompiledStep<T>>? AliasReshapeViewGradients(
         List<CompiledStep<T>> forwardSteps,
+        IEnumerable<Tensor<T>> allTensors,
         Tensor<T>[] parameters,
         Dictionary<Tensor<T>, int> consumerCount,
         IEngine engine,
@@ -1484,8 +1485,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // residual stream itself, which has a second consumer); the aliased operand's write is then a no-op
             // (CopyFirstWrite / the specialized add skip a copy onto itself). On the parity Transformer (CUDA) these
             // were 4 of the captured step's 512 KB device-to-device copies.
-            bool add = step.OpType == OpType.TensorAdd && step.Inputs.Length == 2
-                && !ReferenceEquals(step.Inputs[0], step.Inputs[1]);
+            // BroadcastAdd has the same identity gradient for an operand whose shape equals the output.
+            // The shape check below keeps reduced operands separate; channel-bias fusion retains its own rule.
+            bool add = (step.OpType == OpType.TensorAdd
+                || (step.OpType == OpType.TensorBroadcastAdd && step.OpName != "TensorChannelBiasAdd"))
+                && step.Inputs.Length == 2 && !ReferenceEquals(step.Inputs[0], step.Inputs[1]);
             // A per-channel bias add passes its input's gradient through unchanged (the bias takes the reduction), so the
             // input is aliased as an add operand is (the bias, a different shape, keeps its own buffer). GPU only: the CPU plan fuses Conv2D,
             // this add and ReLU into one backward that reads these buffers itself. On the parity CNN (CUDA) these were
@@ -1494,7 +1498,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 && !ReferenceEquals(step.Inputs[0], step.Inputs[1]);
             if (!reshape && !add && !channelBias) continue;
             var output = step.OutputBuffer;
-            if (!gradMap.TryGetValue(output, out var outputGrad) || !outputGrad.IsContiguous) continue;
+            if (!gradMap.TryGetValue(output, out var outputGrad))
+            {
+                outputGrad = TensorAllocator.RentUninitialized<T>(output._shape);
+                gradMap[output] = outputGrad;
+                allGrads.Add(outputGrad);
+            }
+            if (!outputGrad.IsContiguous) continue;
             int aliasedInputs = 0;
             foreach (var input in step.Inputs)
             {
@@ -1512,11 +1522,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // A broadcast operand's gradient is a reduction of the output gradient, not the output gradient.
                     continue;
                 }
-                if (!gradMap.TryGetValue(input, out var ownGrad)) continue;
+                gradMap.TryGetValue(input, out var ownGrad);
                 var view = outputGrad.ReshapeViewUnrecorded(input._shape);
                 gradMap[input] = view;
                 rootOf[view] = rootOf.TryGetValue(outputGrad, out var outputRoot) ? outputRoot : outputGrad;
-                dropped.Add(ownGrad);
+                if (ownGrad is not null) dropped.Add(ownGrad);
                 aliasedInputs++;
                 if (device)
                 {
@@ -1533,6 +1543,15 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (aliasedInputs == step.Inputs.Length)
                 (aliased ??= new HashSet<CompiledStep<T>>(ReferenceEqualityComparer<CompiledStep<T>>.Instance)).Add(step);
         }
+        // Resolve identity views before allocating the remaining gradients: a view needs no throwaway buffer.
+        foreach (var tensor in allTensors)
+        {
+            if (gradMap.ContainsKey(tensor)) continue;
+            var grad = TensorAllocator.RentUninitialized<T>(tensor._shape);
+            gradMap[tensor] = grad;
+            allGrads.Add(grad);
+        }
+
         // Only where the step is captured into a device graph (CUDA): the pass exists to cut that graph's copy nodes, and
         // on Vulkan, which replays no graph, merged multi-consumer gradients gave the permute and spectral (RFFT/IRFFT)
         // ops a wrong first-step gradient in CompiledTrainingOpStalenessProbeTests while the per-tensor buffers do not.
@@ -8611,17 +8630,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
         else
         {
-            foreach (var tensor in allTensors)
-            {
-                var grad = TensorAllocator.RentUninitialized<T>(tensor._shape);
-                gradMap[tensor] = grad;
-                allGrads.Add(grad);
-            }
             // The multi-consumer merge relies on the backward running in exact reverse forward order, which holds on
             // the GPU generic path (no dataflow fusion, no host specializations appended out of order).
             bool staticReverseBackward = engine.SupportsGpu
                 && Environment.GetEnvironmentVariable("AIDOTNET_GPU_PREFER_GENERIC") != "0";
-            aliasedReshapeSteps = AliasReshapeViewGradients(forwardSteps, parameters, consumerCount, engine, gradMap, allGrads,
+            aliasedReshapeSteps = AliasReshapeViewGradients(forwardSteps, allTensors, parameters, consumerCount, engine, gradMap, allGrads,
                 staticReverseBackward, out aliasedGradViews);
         }
 
