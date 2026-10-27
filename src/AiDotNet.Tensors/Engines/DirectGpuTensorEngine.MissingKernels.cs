@@ -5179,7 +5179,9 @@ public partial class DirectGpuTensorEngine
         try
         {
             int total = 1; for (int d = 0; d < rank; d++) total = checked(total * inputShape[d]);
-            var source = gradOutput.IsContiguous ? gradOutput : (Tensor<T>)gradOutput.Contiguous();
+            // GetOrAllocateBuffer gathers strided views on the device. Calling
+            // Contiguous here would download broadcast/strided adjoints first.
+            var source = gradOutput;
             int rowSize = source._shape[rank - 1];
             int rowCount = rowSize == 0 ? 0 : source.Length / rowSize;
             var sourceShape = (int[])source._shape.Clone();
@@ -5242,8 +5244,7 @@ public partial class DirectGpuTensorEngine
             int innerSize = 1; for (int k = dim + 1; k < rank; k++) innerSize *= inputShape[k];
             int copyLength = checked(length * innerSize);
             if (gradOutput.Length != checked(outerSize * copyLength)) return null;
-            var source = gradOutput.IsContiguous ? gradOutput : (Tensor<T>)gradOutput.Contiguous();
-            using var bufSrc = GetOrAllocateBuffer(backend, source);
+            using var bufSrc = GetOrAllocateBuffer(backend, gradOutput);
             return DispatchDeferredGpuOp<T>(backend, n, (int[])inputShape.Clone(), output =>
             {
                 backend.Fill(output, 0f, n);

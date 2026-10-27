@@ -12,6 +12,25 @@ namespace AiDotNet.Tensors.Tests.Engines;
 [Collection("CompilationGlobalState")]
 public class LstmGateKernelTests
 {
+    [Fact, Trait("Category", "RequiresOpenCL")]
+    public void NarrowAndSliceBackward_GatherStridedAdjointsWithoutDownloads()
+    {
+        using var backend = new OpenClBackend(); Assert.True(backend.IsAvailable);
+        using var direct = new DirectGpuEngine(backend); using var engine = new DirectGpuTensorEngine(direct);
+        var resident = engine.TensorAddScalar(new Tensor<float>(new float[] { 0, 1, 2, 3, 4, 5 }, new[] { 2, 3 }), 1f);
+        var gradient = engine.TensorPermute(resident, new[] { 1, 0 });
+        Tensor<float>? narrow, slice;
+        using (var scope = AiDotNet.Tensors.Engines.Diagnostics.GpuResidencyScope.Begin(captureOperations: true))
+        {
+            narrow = engine.TryNarrowBackwardOnDevice(gradient, new[] { 3, 4 }, 1, 1, 2);
+            slice = engine.TrySliceBackwardOnDevice(gradient, new[] { 3, 4 }, new[] { 0, 1 });
+            Assert.True(scope.Downloads == 0, string.Join("\n", scope.Events));
+        }
+        var expected = new float[] { 0, 1, 4, 0, 0, 2, 5, 0, 0, 3, 6, 0 };
+        Assert.NotNull(narrow); Assert.NotNull(slice);
+        Assert.Equal(expected, narrow!.ToArray()); Assert.Equal(expected, slice!.ToArray());
+    }
+
     [Theory]
     [InlineData(8, 128, 512)]
     [InlineData(7, 13, 24)]
@@ -93,6 +112,7 @@ public class LstmGateKernelTests
         Assert.Equal(expected, gradients[source].ToArray());
     }
 
+#if NET7_0_OR_GREATER
     [Fact]
     public void WebGpuXLstmBackward_UsesEightStorageBindings()
     {
@@ -100,6 +120,7 @@ public class LstmGateKernelTests
         Assert.Equal(8, System.Text.RegularExpressions.Regex.Matches(source, @"var<storage").Count);
         Assert.Contains("IFO", source);
     }
+#endif
     [Fact]
     public void WideFloatGates_MatchDecomposedGradientsWithSaturatedInputs()
     {
