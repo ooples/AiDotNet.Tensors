@@ -66,6 +66,11 @@ public sealed partial class CudaBackend
         internal PtxTensorCoreGemmKernel? Kernel { get; }
         internal string Reason { get; }
         internal double MedianSpeedup { get; }
+        // Set before publication; dispatch re-checks the calling thread's current mode.
+        internal bool Recorded { get; set; } = true;
+        internal bool CanRun(bool deterministic) => Kernel is not null && (Recorded || !deterministic);
+        internal string ReasonFor(bool deterministic) => Kernel is not null && !Recorded && deterministic
+            ? $"deterministic mode: the verdict ({Reason}) could not be recorded, so cuBLAS runs" : Reason;
         public void Dispose() => Kernel?.Dispose();
     }
 
@@ -102,7 +107,7 @@ public sealed partial class CudaBackend
     internal (bool Routed, string Reason, double MedianSpeedup)? Fp16AccumulateVerdict(int m, int n, int k,
         bool halfOutput = false, int batch = 1) =>
         _fp16AccumulateRoutes.TryGetValue(new Fp16AccumulateProblem(m, n, k, halfOutput, batch), out var route)
-            ? (route.Kernel is not null, route.Reason, route.MedianSpeedup)
+            ? (route.CanRun(GpuDeterminism.IsActive), route.ReasonFor(GpuDeterminism.IsActive), route.MedianSpeedup)
             : null;
 
     /// <summary>
@@ -110,12 +115,12 @@ public sealed partial class CudaBackend
     /// routed path (including its in-kernel FP32 redo) can be checked independently of which route measures faster.
     /// </summary>
     internal void ForceFp16AccumulateRouteForTests(int m, int n, int k, PtxTensorCoreGemmConfiguration config,
-        bool halfOutput = false, int batch = 1)
+        bool halfOutput = false, int batch = 1, bool recorded = true)
     {
         var kernel = new PtxTensorCoreGemmKernel(GetDirectPtxRuntime(), config, new PtxGemmLayout(false, false),
             PtxTensorCorePrecision.Fp16, halfOutput, fp16Accumulate: true);
         var problem = new Fp16AccumulateProblem(m, n, k, halfOutput, batch);
-        ReplaceFp16AccumulateRoute(problem, new Fp16AccumulateRoute(kernel, "forced for tests", 0));
+        ReplaceFp16AccumulateRoute(problem, new Fp16AccumulateRoute(kernel, "forced for tests", 0) { Recorded = recorded });
     }
 
     /// <summary>
@@ -165,8 +170,8 @@ public sealed partial class CudaBackend
                 }
             }
         }
-        if (route.Kernel is null) return false;
-        LaunchFp16Accumulate(route.Kernel, a, b, c, problem);
+        if (!route.CanRun(GpuDeterminism.IsActive)) return false;
+        LaunchFp16Accumulate(route.Kernel!, a, b, c, problem);
         Interlocked.Increment(ref _fp16AccumulateDispatchCount);
         return true;
     }
@@ -241,11 +246,8 @@ public sealed partial class CudaBackend
         Fp16AccumulateProblem problem)
     {
         Fp16AccumulateRoute route = TuneFp16AccumulateRoute(a, b, c, problem);
-        bool recorded = PersistFp16AccumulateRoute(problem, route, route.Kernel?.Configuration);
-        if (recorded || route.Kernel is null || !GpuDeterminism.IsActive) return route;
-        route.Dispose();
-        return new Fp16AccumulateRoute(null,
-            $"deterministic mode: the verdict ({route.Reason}) could not be recorded, so cuBLAS runs", route.MedianSpeedup);
+        route.Recorded = PersistFp16AccumulateRoute(problem, route, route.Kernel?.Configuration);
+        return route;
     }
 
     private static ShapeProfile Fp16AccumulateShape(Fp16AccumulateProblem p) => p.Batch == 1
@@ -426,6 +428,8 @@ public sealed partial class CudaBackend
         int m, int n, int k, EvolutionEngineOptions? engineOptions = null, KernelTuningOptions? tuningOptions = null,
         bool persist = true, bool halfOutput = false, CancellationToken cancellationToken = default)
     {
+        // Preserve the caller's thread-local mode across the asynchronous evolution search.
+        bool deterministic = GpuDeterminism.IsActive;
         if (m <= 0) throw new ArgumentOutOfRangeException(nameof(m));
         if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n));
         if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
@@ -448,10 +452,10 @@ public sealed partial class CudaBackend
         var problem = new Fp16AccumulateProblem(m, n, k, halfOutput, 1);
         Fp16AccumulateRoute route = TuneFp16AccumulateRoute(a, b, c, problem, winner);
         PtxTensorCoreGemmConfiguration chosen = route.Kernel?.Configuration ?? winner;
+        // Finish recording before another thread can observe this route.
+        route.Recorded = persist && PersistFp16AccumulateRoute(problem, route, chosen);
         ReplaceFp16AccumulateRoute(problem, route);
-
-        if (persist) PersistFp16AccumulateRoute(problem, route, chosen);
-        return (route.Kernel is not null, chosen.Name, route.MedianSpeedup, route.Reason);
+        return (route.CanRun(deterministic), chosen.Name, route.MedianSpeedup, route.ReasonFor(deterministic));
     }
 
     // A verdict recorded for this device, MMA rate and problem (by a first call or TuneFp16AccumulateRouteAsync), or null

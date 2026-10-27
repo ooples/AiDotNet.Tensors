@@ -132,7 +132,7 @@ public sealed class PtxFlashAttentionTests
     }
 
     // The log-sum-exp side output (production always emits it; the backward reads it) against fp64, both accumulate forms:
-    // causal with a negative offset, so the first rows see no key (zeros out, -inf log-sum-exp) and a whole 64-row block
+    // causal with a negative offset, so the first rows see no key (zeros out, -inf log-sum-exp) and a whole 128-row block
     // can be empty; and grouped heads over a ragged key length.
     [SkippableTheory]
     [InlineData(64, false)]
@@ -146,7 +146,7 @@ public sealed class PtxFlashAttentionTests
         using var plain = new PtxFlashAttentionKernel(runtime, d, isCausal: false, fp16Accumulate, emitStats: true);
         foreach (var (kernel, b, hq, hkv, sq, sk, offset) in new[]
                  {
-                     (causal, 1, 2, 1, 200, 150, -70),   // rows 0..69 see no key (the first 64-row block entirely)
+                     (causal, 1, 2, 1, 200, 150, -140),  // rows 0..139 see no key, including the first 128-row causal block
                      (plain, 2, 4, 2, 100, 130, 0),
                  })
         {
