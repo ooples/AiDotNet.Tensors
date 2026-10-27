@@ -2172,7 +2172,7 @@ public partial class DirectGpuTensorEngine
             // clamp(x, min, +inf) == max(x, min) exactly (no MaxValue capping of large/inf inputs).
             float minF = ToFloatScalar(min);
             using var bufA = GetOrAllocateBuffer(backend, tensor);
-            var bufOut = AllocateOutputBuffer(backend, tensor.Length);
+            var bufOut = AllocateFullyWrittenOutputBuffer(backend, tensor.Length);
             backend.Clamp(bufA.Buffer, bufOut.Buffer, minF, float.PositiveInfinity, tensor.Length);
             var result = new Tensor<T>(FinishGpuOp<T>(backend, bufOut, tensor.Length), tensor.Shape._dims);
             // Same node and boxed bound CpuEngine records, so the backward sees an identical saved state.
@@ -2195,7 +2195,7 @@ public partial class DirectGpuTensorEngine
             // clamp(x, -inf, max) == min(x, max) exactly.
             float maxF = ToFloatScalar(max);
             using var bufA = GetOrAllocateBuffer(backend, tensor);
-            var bufOut = AllocateOutputBuffer(backend, tensor.Length);
+            var bufOut = AllocateFullyWrittenOutputBuffer(backend, tensor.Length);
             backend.Clamp(bufA.Buffer, bufOut.Buffer, float.NegativeInfinity, maxF, tensor.Length);
             var result = new Tensor<T>(FinishGpuOp<T>(backend, bufOut, tensor.Length), tensor.Shape._dims);
             Autodiff.DifferentiableOps.RecordUnary("TensorClampMax", result, tensor,
@@ -3991,7 +3991,7 @@ public partial class DirectGpuTensorEngine
             using (sortedTest)
             using (sortedIndices)
             {
-                var bufMask = AllocateOutputBuffer(backend, n);
+                var bufMask = AllocateFullyWrittenOutputBuffer(backend, n);
                 backend.IsIn(bufElem.Buffer, sortedTest.Buffer, bufMask.Buffer, n, testLen);
                 return PackMaskResident(backend, bufMask, elements._shape, n, invert);
             }
@@ -4046,7 +4046,7 @@ public partial class DirectGpuTensorEngine
             var c = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
             int n = tensor.Length;
             using var bufX = GetOrAllocateBuffer(backend, c);
-            using var bufMask = AllocateOutputBuffer(backend, n);
+            using var bufMask = AllocateFullyWrittenOutputBuffer(backend, n);
             using var count = AllocateOutputBuffer(backend, 1);
             backend.NotEqualScalar(bufX.Buffer, bufMask.Buffer, 0f, n);
             backend.SumAxis(bufMask.Buffer, count.Buffer, 1, n);
@@ -4103,7 +4103,7 @@ public partial class DirectGpuTensorEngine
         try
         {
             int outN = totalRows * totalCols;
-            var bufOut = AllocateOutputBuffer(backend, outN);
+            var bufOut = AllocateFullyWrittenOutputBuffer(backend, outN);
             backend.Fill(bufOut.Buffer, 0f, outN);
             var blockBufs = new List<OwnedBuffer>();
             int rowOff = 0, colOff = 0;
@@ -4995,7 +4995,7 @@ public partial class DirectGpuTensorEngine
             var c = input.IsContiguous ? input : (Tensor<T>)input.Contiguous();
             int n = input.Length;
             using var bufIn = GetOrAllocateBuffer(backend, c);
-            var bufHist = AllocateOutputBuffer(backend, bins);
+            var bufHist = AllocateFullyWrittenOutputBuffer(backend, bins);
             backend.Fill(bufHist.Buffer, 0f, bins);
             backend.Histc(bufIn.Buffer, bufHist.Buffer, n, bins, mn, mx);
             var arr = FinishGpuOp<T>(backend, bufHist, bins);
@@ -5395,7 +5395,7 @@ public partial class DirectGpuTensorEngine
                     allocatedIndexBuffers++;
                 }
 
-                using var flatPositions = AllocateOutputBuffer(backend, count);
+                using var flatPositions = AllocateFullyWrittenOutputBuffer(backend, count);
                 using var scaledAxis = AllocateOutputBuffer(backend, count);
                 backend.Fill(flatPositions.Buffer, 0f, count);
                 for (int axis = rank - 1; axis >= 0; axis--)
@@ -5518,9 +5518,9 @@ public partial class DirectGpuTensorEngine
             if (gradOutput.Length != checked(outerSize * copyLength)) return null;
             var source = gradOutput.IsContiguous ? gradOutput : (Tensor<T>)gradOutput.Contiguous();
             using var bufSrc = GetOrAllocateBuffer(backend, source);
+            // The output is allocated zeroed (in the step pool too, by one memset); a Fill on top zeroed it twice.
             return DispatchDeferredGpuOp<T>(backend, n, (int[])inputShape.Clone(), output =>
             {
-                backend.Fill(output, 0f, n);
                 for (int outer = 0; outer < outerSize; outer++)
                     backend.Copy(bufSrc.Buffer, outer * copyLength,
                         output, checked((outer * dimSize + start) * innerSize), copyLength);
@@ -6180,7 +6180,7 @@ public partial class DirectGpuTensorEngine
         using var classBuffer = classIds is null
             ? AllocateOutputBuffer(backend, 1)
             : GetOrAllocateBuffer(backend, classIds);
-        using var suppressed = AllocateOutputBuffer(backend, length);
+        using var suppressed = AllocateFullyWrittenOutputBuffer(backend, length);
         using var capacity = AllocateOutputBuffer(backend, length);
         using var countBuffer = AllocateOutputBuffer(backend, 1);
         backend.Fill(suppressed.Buffer, 0f, length);
@@ -6410,7 +6410,7 @@ public partial class DirectGpuTensorEngine
             using var bufSpecIm = AllocateOutputBuffer(backend, batch * outFrames * nFft);
             backend.BuildSpectrum(bufNewMag.Buffer, bufNewPhase.Buffer, bufSpecRe.Buffer, bufSpecIm.Buffer, batch, numFreqs, outFrames, nFft);
             using var bufWinSum = AllocateOutputBuffer(backend, outTotal);
-            var bufResult = AllocateOutputBuffer(backend, outTotal);
+            var bufResult = AllocateFullyWrittenOutputBuffer(backend, outTotal);
             backend.Fill(bufResult.Buffer, 0f, outTotal);
             backend.Fill(bufWinSum.Buffer, 0f, outTotal);
             backend.IstftFromSpectrum(bufSpecRe.Buffer, bufSpecIm.Buffer, bufWin.Buffer, bufResult.Buffer, bufWinSum.Buffer, batch, outFrames, nFft, hopLength, outputLength, 1);
@@ -6797,7 +6797,7 @@ public partial class DirectGpuTensorEngine
             int n = x.Length;
             using var bufX = GetOrAllocateBuffer(backend, cx);
             using var bufQ = GetOrAllocateBuffer(backend, cq);
-            var bufOut = AllocateOutputBuffer(backend, n);
+            var bufOut = AllocateFullyWrittenOutputBuffer(backend, n);
             backend.Zeta(bufX.Buffer, bufQ.Buffer, bufOut.Buffer, n);
             var arr = FinishGpuOp<T>(backend, bufOut, n);
             return new Tensor<T>(arr, (int[])x._shape.Clone());
@@ -6816,7 +6816,7 @@ public partial class DirectGpuTensorEngine
             var c = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
             int len = tensor.Length;
             using var bufX = GetOrAllocateBuffer(backend, c);
-            var bufOut = AllocateOutputBuffer(backend, len);
+            var bufOut = AllocateFullyWrittenOutputBuffer(backend, len);
             backend.Polygamma(bufX.Buffer, bufOut.Buffer, n, len);
             var arr = FinishGpuOp<T>(backend, bufOut, len);
             return new Tensor<T>(arr, (int[])tensor._shape.Clone());
@@ -6935,7 +6935,7 @@ public partial class DirectGpuTensorEngine
             int n = a.Length;
             using var bufA = GetOrAllocateBuffer(backend, ca);
             using var bufB = GetOrAllocateBuffer(backend, cb);
-            var bufOut = AllocateOutputBuffer(backend, n);
+            var bufOut = AllocateFullyWrittenOutputBuffer(backend, n);
             backend.NextAfter(bufA.Buffer, bufB.Buffer, bufOut.Buffer, n);
             var arr = FinishGpuOp<T>(backend, bufOut, n);
             var res = new Tensor<T>(arr, (int[])a._shape.Clone());
@@ -7037,7 +7037,7 @@ public partial class DirectGpuTensorEngine
             int n = x.Length;
             using var bufX = GetOrAllocateBuffer(backend, cx);
             using var bufE = GetOrAllocateInt32IndexBuffer(backend, ce);
-            var bufOut = AllocateOutputBuffer(backend, n);
+            var bufOut = AllocateFullyWrittenOutputBuffer(backend, n);
             backend.Ldexp(bufX.Buffer, bufE.Buffer, bufOut.Buffer, n);
             var arr = FinishGpuOp<T>(backend, bufOut, n);
             return new Tensor<T>(arr, (int[])x._shape.Clone());
@@ -7070,7 +7070,7 @@ public partial class DirectGpuTensorEngine
             int n = a.Length;
             using var bufA = GetOrAllocateBuffer(backend, ca);
             using var bufB = GetOrAllocateBuffer(backend, cb);
-            var bufOut = AllocateOutputBuffer(backend, n);
+            var bufOut = AllocateFullyWrittenOutputBuffer(backend, n);
             backend.LogicalOp(bufA.Buffer, bufB.Buffer, bufOut.Buffer, mode, n);
             var arr = FinishGpuOp<Bit>(backend, bufOut, n);
             return new Tensor<Bit>(arr, (int[])a._shape.Clone());
@@ -7095,7 +7095,7 @@ public partial class DirectGpuTensorEngine
             var ca = a.IsContiguous ? a : (Tensor<Bit>)a.Contiguous();
             int n = a.Length;
             using var bufA = GetOrAllocateBuffer(backend, ca);
-            var bufOut = AllocateOutputBuffer(backend, n);
+            var bufOut = AllocateFullyWrittenOutputBuffer(backend, n);
             backend.LogicalNot(bufA.Buffer, bufOut.Buffer, n);
             var arr = FinishGpuOp<Bit>(backend, bufOut, n);
             return new Tensor<Bit>(arr, (int[])a._shape.Clone());
@@ -7128,7 +7128,7 @@ public partial class DirectGpuTensorEngine
             int n = a.Length;
             using var bufA = GetOrAllocateBuffer(backend, ca);
             using var bufB = GetOrAllocateBuffer(backend, cb);
-            var bufOut = AllocateOutputBuffer(backend, n);
+            var bufOut = AllocateFullyWrittenOutputBuffer(backend, n);
             backend.Equal(bufA.Buffer, bufB.Buffer, bufOut.Buffer, n);
             return PackMaskResident(backend, bufOut, a._shape, n, invert: false);
         }
@@ -7147,7 +7147,7 @@ public partial class DirectGpuTensorEngine
             int n = a.Length;
             float s = ToFloatScalar(scalar);
             using var bufA = GetOrAllocateBuffer(backend, ca);
-            var bufOut = AllocateOutputBuffer(backend, n);
+            var bufOut = AllocateFullyWrittenOutputBuffer(backend, n);
             // NotEqualScalar gives (a != s); invert to get equality.
             backend.NotEqualScalar(bufA.Buffer, bufOut.Buffer, s, n);
             return PackMaskResident(backend, bufOut, a._shape, n, invert: true);
@@ -7207,7 +7207,7 @@ public partial class DirectGpuTensorEngine
             int n = a.Length;
             using var bufA = GetOrAllocateBuffer(backend, ca);
             using var bufB = GetOrAllocateBuffer(backend, cb);
-            using var bufMask = AllocateOutputBuffer(backend, n);
+            using var bufMask = AllocateFullyWrittenOutputBuffer(backend, n);
             using var bufNeg = AllocateOutputBuffer(backend, n);
             using var bufMin = AllocateOutputBuffer(backend, 1);
             backend.Equal(bufA.Buffer, bufB.Buffer, bufMask.Buffer, n);   // 1.0 where equal
@@ -7246,7 +7246,7 @@ public partial class DirectGpuTensorEngine
         {
             using var maskBuf = AllocCloseMask(backend, a, b, rtol, atol, equalNan, out int n);
             // allclose iff EVERY element is close (mask all 1) iff min(mask) == 1.  min = -max(-mask).
-            using var bufNeg = AllocateOutputBuffer(backend, n);
+            using var bufNeg = AllocateFullyWrittenOutputBuffer(backend, n);
             using var bufMin = AllocateOutputBuffer(backend, 1);
             backend.Negate(maskBuf.Buffer, bufNeg.Buffer, n);
             backend.MaxAxis(bufNeg.Buffer, bufMin.Buffer, 1, n);
@@ -7267,7 +7267,7 @@ public partial class DirectGpuTensorEngine
         var thr = TensorAddScalar(TensorMultiplyScalar(TensorAbs(b), rtol), atol);   // atol + rtol*|b|, GPU
         using var diffBuf = GetOrAllocateBuffer(backend, diff);
         using var thrBuf = GetOrAllocateBuffer(backend, thr);
-        using var lessMask = AllocateOutputBuffer(backend, n);
+        using var lessMask = AllocateFullyWrittenOutputBuffer(backend, n);
         using var equalMask = AllocateOutputBuffer(backend, n);
         var closeMask = AllocateOutputBuffer(backend, n);
         backend.LessThan(diffBuf.Buffer, thrBuf.Buffer, lessMask.Buffer, n);
@@ -7306,7 +7306,7 @@ public partial class DirectGpuTensorEngine
             var ct = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
             int n = tensor.Length;
             using var bufA = GetOrAllocateBuffer(backend, ct);
-            var bufOut = AllocateOutputBuffer(backend, n);
+            var bufOut = AllocateFullyWrittenOutputBuffer(backend, n);
             backend.ClassifyFloat(bufA.Buffer, bufOut.Buffer, mode, n);
             return PackMaskResident(backend, bufOut, tensor._shape, n, invert: false);
         }
@@ -9598,7 +9598,7 @@ public partial class DirectGpuTensorEngine
             int inLen = checked(batch * channels * depth * height * width);
             using var gradOutBuf = GetOrAllocateBuffer(backend, gradOutput);
             using var idxBuf = GetOrAllocateInt32IndexBuffer(backend, maxIndices);
-            using var gradInBuf = AllocateOutputBuffer(backend, inLen);
+            using var gradInBuf = AllocateFullyWrittenOutputBuffer(backend, inLen);
             backend.Fill(gradInBuf.Buffer, 0f, inLen);
             backend.MaxPool3DBackward(gradOutBuf.Buffer, idxBuf.Buffer, gradInBuf.Buffer,
                 batch, channels, depth, height, width, outD, outH, outW);
@@ -9648,7 +9648,7 @@ public partial class DirectGpuTensorEngine
                             }
             using var gradOutBuf = GetOrAllocateBuffer(backend, gradOutput);
             using var idxBuf = new OwnedBuffer(backend.AllocateIntBuffer(flat), ownsBuffer: true);
-            var gradInBuf = AllocateOutputBuffer(backend, inLen);
+            var gradInBuf = AllocateFullyWrittenOutputBuffer(backend, inLen);
             try
             {
                 backend.Fill(gradInBuf.Buffer, 0f, inLen);

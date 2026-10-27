@@ -148,7 +148,7 @@ public partial class DirectGpuTensorEngine
         try
         {
             using var x = GetOrAllocateBuffer(backend, tensor.IsContiguous ? tensor : tensor.Contiguous());
-            using var slices = AllocateOutputBuffer(backend, tensor.Length);
+            using var slices = AllocateFullyWrittenOutputBuffer(backend, tensor.Length);
             if (outer == 1) backend.Copy(x.Buffer, slices.Buffer, tensor.Length);
             else backend.Permute(x.Buffer, slices.Buffer, new[] { outer, extent, inner }, new[] { 1, 0, 2 });
             int padded = 1;
