@@ -22220,6 +22220,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorRound<T>(Tensor<T> tensor)
     {
+        if (Compilation.GraphMode.IsActive) return base.TensorRound(tensor);
+        if (typeof(T) == typeof(float) && TryGetBackend(out var backend))
+        {
+            using var input = GetOrAllocateBuffer(backend, tensor);
+            var output = AllocateOutputBuffer(backend, tensor.Length);
+            try
+            {
+                backend.Round(input.Buffer, output.Buffer, tensor.Length);
+                var rounded = DeferTensorResult<T>(backend, output.Buffer, tensor.Length, tensor.Shape.ToArray());
+                Autodiff.DifferentiableOps.RecordUnary("Round", rounded, tensor, Autodiff.BackwardFunctions<T>.SignBackward);
+                return rounded;
+            }
+            catch { output.Dispose(); throw; }
+        }
+
         try
         {
             var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Round(input, output, size));

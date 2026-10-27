@@ -148,4 +148,44 @@ public class XLstmDeviceTrainingTests
         }
         Assert.Equal(new float[] { 6, 20 }, result.ToArray());
     }
+
+    [Fact]
+    public void OpenCl_RoundUsesEvenTiesAndZeroDerivativeWithoutDownloads()
+    {
+        using var backend = new OpenClBackend(); Assert.True(backend.IsAvailable);
+        using var direct = new DirectGpuEngine(backend); using var engine = new DirectGpuTensorEngine(direct);
+        var input = new Tensor<float>(new float[] { -2.5f, -1.5f, -.5f, .5f, 1.5f, 2.5f }, new[] { 2, 3 });
+        Tensor<float> output; Dictionary<Tensor<float>, Tensor<float>> gradients;
+        using (var scope = AiDotNet.Tensors.Engines.Diagnostics.GpuResidencyScope.Begin(captureOperations: true))
+        {
+            using var tape = new GradientTape<float>();
+            output = engine.TensorRound(engine.TensorAddScalar(input, 0f));
+            gradients = tape.ComputeGradients(engine.ReduceSum(output, null), new[] { input });
+            Assert.True(scope.Downloads == 0, string.Join("\n", scope.Events));
+        }
+        Assert.Equal(new float[] { -2, -2, 0, 0, 2, 2 }, output.ToArray());
+        Assert.All(gradients[input].ToArray(), value => Assert.Equal(0, value));
+    }
+
+    [Fact]
+    public void OpenCl_CompiledRoundRefreshesValuesAndPreservesZeroDerivative()
+    {
+        using var backend = new OpenClBackend(); Assert.True(backend.IsAvailable);
+        using var direct = new DirectGpuEngine(backend); using var engine = new DirectGpuTensorEngine(direct);
+        var input = new Tensor<float>(new[] { 2, 3 });
+        Tensor<float> Loss(IEngine e) => e.ReduceSum(e.TensorAdd(e.TensorRound(input), input), null);
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable()) { Loss(engine); plan = scope.CompileTraining(new[] { input }); }
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0);
+            for (int step = 0; step < 2; step++)
+            {
+                for (int i = 0; i < input.Length; i++) input[i] = i - 2.5f + step;
+                var expected = Loss(new CpuEngine()); var actual = plan.Step();
+                Near(expected, actual);
+                Assert.All(input.Grad!.ToArray(), value => Assert.Equal(1, value));
+            }
+        }
+    }
 }
