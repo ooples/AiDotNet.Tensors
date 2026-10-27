@@ -45,6 +45,8 @@ public static partial class BlasManaged
     /// here and stay on the fast path).
     /// </summary>
     internal const long MachineKernelMinWork = 4_000_000;
+    private const int DenseTransAMinDimension = 512;
+
 
     // #653 machine-code GEBP investigation: force the machine-code kernel ON even for shapes the
     // PrefersStrategyOverMachineKernel gate would route to the managed strategy, so the two paths
@@ -968,7 +970,8 @@ public static partial class BlasManaged
             // streaming versus ~22 ms packed; 512x1024x512 also favored packing. Keep the
             // small-shape gate, and keep this decision independent of the requested thread count.
             bool denseTransA = typeof(T) == typeof(float) && mr == 6 && transA && !transB
-                && m >= 512 && n >= 512 && k >= 512;
+                && options.ParallelismAxis != ParallelismAxis.N
+                && m >= DenseTransAMinDimension && n >= DenseTransAMinDimension && k >= DenseTransAMinDimension;
             if (splitMAligned < gateProcs * mr && options.PackingMode == PackingMode.Auto && !denseTransA)
             {
                 // Auto + too few aligned mr-blocks for the packed kernel to beat all-Streaming,

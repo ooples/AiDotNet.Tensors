@@ -8,6 +8,36 @@ namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 [Collection("BlasManaged-Stats-Serial")]
 public sealed class DenseTransATailTests
 {
+    [SkippableFact]
+    public void ExplicitNAxis_DenseTransposedA_RetainsSupportedStreamingRoute()
+    {
+        Skip.IfNot(Environment.ProcessorCount >= 86 &&
+            Gemm.GetEvolutionTuningTile<float>(PackingMode.ForcePackBoth, true).Mr == 6,
+            "Exercises the many-core AVX2 tail occupancy fallback.");
+        const int m = 512, n = 512, k = 512;
+        const int lda = m + 3, ldb = n + 5, ldc = n + 7;
+        var a = new float[k * lda];
+        var b = new float[k * ldb];
+        var c = new float[m * ldc];
+        for (int i = 0; i < a.Length; i++) a[i] = 1;
+        for (int i = 0; i < b.Length; i++) b[i] = 1;
+        for (int i = 0; i < c.Length; i++) c[i] = float.NaN;
+        var options = new BlasOptions<float> { ParallelismAxis = ParallelismAxis.N, NumThreads = 3 };
+        var previous = AiDotNet.Tensors.Helpers.BlasProvider.GetThreadLocalDeterministicMode();
+        try
+        {
+            // Bypass learned routing so a cached Streaming decision cannot hide the regression.
+            AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(true);
+            Gemm.Gemm<float>(a, lda, true, b, ldb, false, c, ldc, m, n, k, in options);
+        }
+        finally { AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(previous); }
+        for (int row = 0; row < m; row++)
+        {
+            for (int col = 0; col < n; col++) Assert.Equal((float)k, c[row * ldc + col]);
+            for (int col = n; col < ldc; col++) Assert.True(float.IsNaN(c[row * ldc + col]));
+        }
+    }
+
     [Fact]
     public void ParallelPackedGemm_DoesNotRetainUnusedArenaBuffers()
     {
