@@ -117,11 +117,11 @@ public sealed class RandomSampler : ISampler
 
     private Random MakeRng()
     {
-        if (!_hasSeed) return new Random();
+        if (!_hasSeed) return AiDotNet.Tensors.Helpers.RandomHelper.CreateSecureRandom();
         // Fold epoch into the seed so successive epochs yield different
         // shuffles, but the (seed, epoch) pair is reproducible across runs
         // — same contract as PyTorch's seed_worker / set_epoch idiom.
-        return new Random(unchecked((int)(_seedBase * 0x9E3779B1u + (uint)_epoch)));
+        return AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(unchecked((int)(_seedBase * 0x9E3779B1u + (uint)_epoch)));
     }
 }
 
@@ -169,8 +169,8 @@ public sealed class WeightedRandomSampler : ISampler
     public IEnumerable<int> GetIndices()
     {
         var rng = _hasSeed
-            ? new Random(unchecked((int)(_seedBase * 0x9E3779B1u + (uint)_epoch)))
-            : new Random();
+            ? AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(unchecked((int)(_seedBase * 0x9E3779B1u + (uint)_epoch)))
+            : AiDotNet.Tensors.Helpers.RandomHelper.CreateSecureRandom();
 
         for (int s = 0; s < Count; s++)
         {
@@ -226,8 +226,8 @@ public sealed class SubsetRandomSampler : ISampler
     public IEnumerable<int> GetIndices()
     {
         var rng = _hasSeed
-            ? new Random(unchecked((int)(_seedBase * 0x9E3779B1u + (uint)_epoch)))
-            : new Random();
+            ? AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(unchecked((int)(_seedBase * 0x9E3779B1u + (uint)_epoch)))
+            : AiDotNet.Tensors.Helpers.RandomHelper.CreateSecureRandom();
         // Yield from a copy so multiple iterations don't share a permutation.
         var perm = (int[])_indices.Clone();
         for (int i = perm.Length - 1; i > 0; i--)
@@ -358,7 +358,7 @@ public sealed class DistributedSampler : ISampler
         for (int i = 0; i < _datasetCount; i++) indices[i] = i;
         if (_shuffle)
         {
-            var rng = new Random(unchecked((int)(_seedBase * 0x9E3779B1u + (uint)_epoch)));
+            var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(unchecked((int)(_seedBase * 0x9E3779B1u + (uint)_epoch)));
             for (int i = indices.Length - 1; i > 0; i--)
             {
                 int j = rng.Next(i + 1);

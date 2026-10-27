@@ -829,12 +829,12 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                 // Fail closed: an input could not be refreshed in place, or the output could not be downloaded
                 // — discard the captured graph and run this call eagerly so we never serve a result computed
                 // from stale device inputs or read from a stale host buffer. Capture stays disabled afterward.
-                if (_graphExec != IntPtr.Zero) { try { cb.DestroyCapturedGraph(_graphExec); } catch { } _graphExec = IntPtr.Zero; }
+                if (_graphExec != IntPtr.Zero) { var failedExec = _graphExec; BestEffortTeardown(() => cb.DestroyCapturedGraph(failedExec), "destroy the captured graph after a failed replay"); _graphExec = IntPtr.Zero; }
                 _graphBackend = null;
                 _graphCaptureDisabled = true;
                 if (_graphEvictionSuspended && _graphEngine is not null)
                 {
-                    try { _graphEngine.EndGraphLifetime(); } catch { }
+                    var replayEngine = _graphEngine; BestEffortTeardown(() => replayEngine.EndGraphLifetime(), "end the graph lifetime after a failed replay");
                     _graphEvictionSuspended = false;
                 }
                 _graphEngine = null;
@@ -891,27 +891,38 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                         }
                         // Capture failed (a non-capturable op remains) — disable + resume eviction.
                         _graphCaptureDisabled = true;
-                        if (_graphEvictionSuspended) { gte.EndGraphLifetime(); _graphEvictionSuspended = false; }
+                        if (_graphEvictionSuspended)
+                        {
+                            // Best-effort, so the eager fallback below still runs this call.
+                            BestEffortTeardown(gte.EndGraphLifetime, "end the graph lifetime after a failed capture");
+                            _graphEvictionSuspended = false;
+                        }
                     }
                     finally
                     {
                         gte.EndInferenceCapture();
                     }
                 }
-                catch
+                catch (Exception ex)
                 {
+                    TraceGraphTeardownFailure("capture the inference graph; this plan now runs eagerly", ex);
                     _graphCaptureDisabled = true;
                     // A throw after _graphExec was assigned (the first LaunchCapturedGraph or the output
                     // download above) leaves the graph executable allocated — destroy it so it isn't leaked
                     // until Dispose, and HasGraph-style state reflects that capture was abandoned.
                     if (_graphExec != IntPtr.Zero)
                     {
-                        try { cb.DestroyCapturedGraph(_graphExec); } catch { }
+                        var abandonedExec = _graphExec; BestEffortTeardown(() => cb.DestroyCapturedGraph(abandonedExec), "destroy a graph abandoned mid-capture");
                         _graphExec = IntPtr.Zero;
                         _graphBackend = null;
                         _graphEngine = null;
                     }
-                    if (_graphEvictionSuspended) { gte.EndGraphLifetime(); _graphEvictionSuspended = false; }
+                    if (_graphEvictionSuspended)
+                    {
+                        // Best-effort, so the eager fallback below still runs this call.
+                        BestEffortTeardown(gte.EndGraphLifetime, "end the graph lifetime after a failed capture");
+                        _graphEvictionSuspended = false;
+                    }
                 }
             }
 
@@ -1085,6 +1096,46 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         Engines.DirectGpu.CUDA.CudaBackend.DestroyCapturedGraphFromFinalizer(_graphExec);
     }
 
+    // Graph teardown stays best-effort, but a failure is recorded: an EndGraphLifetime that throws leaves the engine's
+    // buffer eviction suspended for the rest of the process, and nothing else would say why (#1558).
+    private static void TraceGraphTeardownFailure(string action, Exception ex)
+    {
+        try
+        {
+            Trace.TraceWarning("[CompiledInferencePlan] could not " + action + ": " + ex);
+        }
+        catch (Exception listenerFailure)
+        {
+            // A trace listener that throws must not stop teardown: the next step still has to run, and a failed
+            // replay still has to reach its eager fallback. The lost warning is counted and its listener's exception
+            // kept instead (UnreportedTeardownFailures, LastUnreportedTeardownFailure), since tracing it would call
+            // the same listeners again.
+            System.Threading.Interlocked.Increment(ref _unreportedTeardownFailures);
+            System.Threading.Volatile.Write(ref _lastUnreportedTeardownFailure, listenerFailure);
+        }
+    }
+
+    private static int _unreportedTeardownFailures;
+    private static Exception? _lastUnreportedTeardownFailure;
+
+    /// <summary>Teardown failures whose warning could not be traced because a trace listener threw.</summary>
+    internal static int UnreportedTeardownFailures => System.Threading.Volatile.Read(ref _unreportedTeardownFailures);
+
+    /// <summary>The exception the trace listener threw for the latest such failure; null when there has been none.</summary>
+    internal static Exception? LastUnreportedTeardownFailure => System.Threading.Volatile.Read(ref _lastUnreportedTeardownFailure);
+
+    /// <summary>Runs one graph-teardown step; a failure is traced and teardown carries on.</summary>
+    internal static void BestEffortTeardown(Action step, string action)
+    {
+        try
+        {
+            step();
+        }
+        catch (Exception ex)
+        {
+            TraceGraphTeardownFailure(action, ex);
+        }
+    }
     public void Dispose()
     {
         if (_disposed) return;
@@ -1095,12 +1146,12 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         // then resume the eviction we suspended for the graph's lifetime.
         if (_graphExec != IntPtr.Zero && _graphBackend is not null)
         {
-            try { _graphBackend.DestroyCapturedGraph(_graphExec); } catch { }
+            var disposedExec = _graphExec; var disposedBackend = _graphBackend; BestEffortTeardown(() => disposedBackend.DestroyCapturedGraph(disposedExec), "destroy the captured graph on dispose");
             _graphExec = IntPtr.Zero;
         }
         if (_graphEvictionSuspended && _graphEngine is not null)
         {
-            try { _graphEngine.EndGraphLifetime(); } catch { }
+            var disposedEngine = _graphEngine; BestEffortTeardown(() => disposedEngine.EndGraphLifetime(), "end the graph lifetime on dispose");
             _graphEvictionSuspended = false;
         }
 

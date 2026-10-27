@@ -296,10 +296,11 @@ public sealed class GpuExecutionOptions
         }
     }
 
-    private static bool TryGetEnvInt(string name, out int value)
+    // Invariant culture: an environment variable is machine configuration, not localized text (#1557).
+    internal static bool TryGetEnvInt(string name, out int value)
     {
         var envValue = Environment.GetEnvironmentVariable(EnvPrefix + name);
-        if (!string.IsNullOrEmpty(envValue) && int.TryParse(envValue, out value))
+        if (!string.IsNullOrEmpty(envValue) && int.TryParse(envValue, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out value))
         {
             return true;
         }
@@ -307,10 +308,10 @@ public sealed class GpuExecutionOptions
         return false;
     }
 
-    private static bool TryGetEnvDouble(string name, out double value)
+    internal static bool TryGetEnvDouble(string name, out double value)
     {
         var envValue = Environment.GetEnvironmentVariable(EnvPrefix + name);
-        if (!string.IsNullOrEmpty(envValue) && double.TryParse(envValue, out value))
+        if (!string.IsNullOrEmpty(envValue) && double.TryParse(envValue, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out value))
         {
             return true;
         }
