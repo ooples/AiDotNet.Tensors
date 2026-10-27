@@ -79,6 +79,46 @@ internal static class ResidentHostMirror
     }
 
     /// <summary>
+    /// The resident member on <paramref name="array"/> whose device buffer holds storage range
+    /// [<paramref name="offset"/>, <paramref name="offset"/> + <paramref name="length"/>), and where that range starts
+    /// in its buffer. A slice of a resident step tensor shares this array but not the member's buffer field, so this
+    /// is the only way to reach its device data without downloading it.
+    /// </summary>
+    internal static bool TryFindCovering<T>(T[] array, int offset, int length, object backend,
+        out IGpuBuffer? buffer, out int bufferOffset)
+    {
+        buffer = null; bufferOffset = 0;
+        if (!_groups.TryGetValue(array, out var g) || g is not Group<T> group) return false;
+        WeakReference<Tensor<T>>[] members;
+        lock (group.Members) members = group.Members.ToArray();
+        foreach (var weak in members)
+        {
+            if (!weak.TryGetTarget(out var t) || !HasContiguousResidentBuffer(t)) continue;
+            if (!ReferenceEquals(t._gpuBackend, backend) || !ReferenceEquals(t.GetBackingArrayForCacheLookupUnsafe(), array)) continue;
+            var b = t._gpuBuffer!;
+            if (b.Handle == IntPtr.Zero) continue;
+            int start = offset - t._storageOffset;
+            if (start < 0 || start + length > t.Length || b.Size < (long)start + length) continue;
+            buffer = b; bufferOffset = start;
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Takes <paramref name="tensor"/> out of its backing array's group, so a download of that array no longer copies
+    /// its device data back. For a tensor whose device value is being discarded: a retiring plan's intermediate
+    /// gradients share pooled backing arrays with the parameter gradients it does land.
+    /// </summary>
+    internal static void Detach<T>(Tensor<T> tensor)
+    {
+        if (tensor.GetBackingArrayForCacheLookupUnsafe() is not { } array) return;
+        if (!_groups.TryGetValue(array, out var g) || g is not Group<T> group) return;
+        lock (group.Members)
+            group.Members.RemoveAll(w => !w.TryGetTarget(out var m) || ReferenceEquals(m, tensor));
+    }
+
+    /// <summary>
     /// Arms the download for <paramref name="tensor"/>'s backing array after a device-side write: the next host read
     /// of ANY view on that array refreshes every resident view on it.
     /// </summary>

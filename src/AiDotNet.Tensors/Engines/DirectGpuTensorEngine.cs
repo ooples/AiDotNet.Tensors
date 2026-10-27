@@ -1662,6 +1662,36 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             : null;
     }
 
+    /// <summary>
+    /// A contiguous view into a tensor a compiled step bound to its own device buffer (ResidentHostMirror): copy the
+    /// view's range from that buffer on the device. Neither the activation cache nor the storage's device state knows
+    /// such a buffer, so the slice used to be materialized on the host - a download that aborts CUDA-graph capture,
+    /// and a round trip every step outside it (AiDotNet#1804: StackBackward's per-input gradient slices kept DeepAR's
+    /// training step off graph replay). Only while the device copy is the authoritative one (a host read is pending).
+    /// </summary>
+    private bool TrySliceResidentMemberOnDevice<T>(IDirectGpuBackend backend, Tensor<T> view, out OwnedBuffer result)
+    {
+        result = default;
+        if (typeof(T) != typeof(float) || !view.IsView || !view.IsContiguous || view.Length == 0) return false;
+        if (view.GetBackingArrayForCacheLookupUnsafe() is not T[] array || !Helpers.HostSync.IsPending(array)) return false;
+        if (!Helpers.ResidentHostMirror.TryFindCovering(array, view._storageOffset, view.Length, backend,
+                out var memberBuffer, out int start) || memberBuffer is null)
+            return false;
+        var output = AllocateOutputBuffer(backend, view.Length);
+        try
+        {
+            backend.Copy(memberBuffer, start, output.Buffer, 0, view.Length);
+        }
+        catch (NotSupportedException ex)
+        {
+            output.Dispose();
+            GpuLaunchProbe.OnFallback("SliceResidentMemberOnDevice", ex);
+            return false;
+        }
+        result = output;
+        return true;
+    }
+
     /// <summary>A contiguous slice (nonzero offset) of device-only data: copy the range on the device.</summary>
     private bool TrySliceViewOnDevice<T>(IDirectGpuBackend backend, Tensor<T> view, out OwnedBuffer result)
         => TrySliceViewOnDevice(backend, view, DeviceAuthoritativeViewBase(backend, view), out result);
@@ -1783,6 +1813,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return permuted;
         if (TrySliceViewOnDevice(backend, tensor, out var sliced))
             return sliced;
+        if (TrySliceResidentMemberOnDevice(backend, tensor, out var memberSlice))
+            return memberSlice;
         if (!tensor.IsContiguous || tensor._storageOffset != 0)
             tensor = (Tensor<T>)tensor.Contiguous();
 
@@ -6834,6 +6866,65 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// here keeps the negate GPU-resident (no download). Returns false off the resident step → caller does CPU.</summary>
     internal bool TensorNegateIntoResident<T>(Tensor<T> output, Tensor<T> input)
         => TryUnaryResidentInto(output, input, static (be, i, o, n) => be.Negate(i, o, n), "NegateLazy");
+
+    /// <summary>
+    /// A compiled step's ReduceMax on the device: the max into the step's output buffer and the argmax as a device
+    /// tensor for the backward (relative positions along the reduced axes, with those axes normalized). The host path
+    /// read the input back on every replay, which aborts CUDA-graph capture (AiDotNet#1804). False when the device
+    /// path cannot take it.
+    /// </summary>
+    internal bool TryReduceMaxWithIndicesIntoResident<T>(Tensor<T> output, Tensor<T> input, int[] axes, bool keepDims,
+        out Tensor<int>? indices, out int[]? normalizedAxes)
+    {
+        indices = null; normalizedAxes = null;
+        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive || !input.IsContiguous || !TryGetBackend(out _))
+            return false;
+        Tensor<T> values;
+        Tensor<int> idx;
+        using (new Autodiff.NoGradScope<T>())
+            values = ReduceMaxWithTensorIndices(input, axes, keepDims, out idx);
+        // The CPU base answered (a capability gap): let the caller's host path run instead.
+        if (values._gpuBuffer is null || idx is null || values.Length != output.Length) return false;
+        CopyResultInto(this, values, output);
+        indices = idx;
+        normalizedAxes = NormalizeResidentReductionAxes(axes, input.Rank);
+        return true;
+    }
+
+    /// <summary>
+    /// A compiled step's Narrow, sliced on the device straight into the step's output buffer. The lazy closure
+    /// otherwise ran the eager TensorNarrow, which returns a host view of the input's storage; copying that into the
+    /// output uploaded it as if it were a constant - a synchronous host-to-device copy that aborts CUDA-graph capture
+    /// and, outside capture, round-trips every slice through the host on every step (AiDotNet#1804: DeepAR's per-step
+    /// input slices kept its whole training step off graph replay). Any axis is a last-axis slice of the input viewed
+    /// as [outer, axis * inner]: one SliceLastAxis launch. False when the device path cannot take it.
+    /// </summary>
+    internal bool TensorNarrowIntoResident<T>(Tensor<T> output, Tensor<T> input, int dim, int start, int length)
+    {
+        if (Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float) || !input.IsContiguous) return false;
+        if (!TryGetBackend(out var backend) || backend is not IGpuBatchExecution layout) return false;
+        int rank = input.Rank;
+        if ((uint)dim >= (uint)rank || start < 0 || length < 0 || start + length > input._shape[dim]) return false;
+        int outer = 1; for (int k = 0; k < dim; k++) outer *= input._shape[k];
+        int inner = 1; for (int k = dim + 1; k < rank; k++) inner *= input._shape[k];
+        int axisInner = checked(input._shape[dim] * inner), sliceSize = checked(length * inner);
+        int outLength = checked(outer * sliceSize);
+        if (output.Length != outLength) return false;
+        if (outLength == 0) return true;
+        try
+        {
+            using var inBuf = GetResidentOrPersistentInputBuffer(backend, input);
+            var outBuf = GetOrCreateResidentBuffer(backend, output, outLength, fullyWritten: true);
+            if (inBuf.Buffer.Handle == System.IntPtr.Zero || inBuf.Buffer.Size < input.Length
+                || outBuf.Handle == System.IntPtr.Zero || outBuf.Size < outLength)
+                return false;
+            layout.SliceLastAxis(inBuf.Buffer, outBuf, outer, axisInner, checked(start * inner), sliceSize);
+            ResidentSyncCheck("NarrowLazy");
+            BindResidentBuffer(output, outBuf, backend);
+            return true;
+        }
+        catch (NotSupportedException uex) { GpuLaunchProbe.OnFallback("TensorNarrowIntoResident", uex); return false; }
+    }
 
     void IEngine.ReLUInto<T>(Tensor<T> dest, Tensor<T> input)
     {
@@ -18939,10 +19030,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             return null;
 
-        // GetOrAllocateBuffer and every TileAxis expansion below may allocate synchronously. CUDA
-        // forbids those allocations after cuStreamBeginCapture (CUDA 906), so decline the composed
-        // path before touching either input and let the established caller fallback own the case.
-        if (backend is IGpuGraphCapture cuda && cuda.IsStreamCapturing())
+        // Inside a compiled step the expansions below draw from the per-action scratch pool, so a CUDA-graph
+        // capture allocates nothing. Outside it, a capture would see a synchronous allocation (CUDA 906): decline
+        // then, before touching either input. Declining during a compiled capture sent the op to the CPU base,
+        // whose download aborted the capture for every model with a two-sided broadcast (AiDotNet#1804).
+        if (backend is IGpuGraphCapture cuda && cuda.IsStreamCapturing() && !ScratchPoolingActive)
             return null;
 
         if (!CanBroadcast(a.Shape._dims, b.Shape._dims))
@@ -18974,7 +19066,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         using var inputA = GetOrAllocateBuffer(backend, a);
         using var inputB = GetOrAllocateBuffer(backend, b);
-        var temporaries = new List<IGpuBuffer>();
+        var temporaries = new List<OwnedBuffer>();
 
         try
         {
@@ -18996,8 +19088,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
                     int repeats = outputShape[axis];
                     int expandedLength = checked(currentLength * repeats);
-                    IGpuBuffer expanded = backend.AllocateBuffer(expandedLength);
-                    temporaries.Add(expanded);
+                    var expandedLease = AllocateFullyWrittenOutputBuffer(backend, expandedLength);
+                    temporaries.Add(expandedLease);
+                    IGpuBuffer expanded = expandedLease.Buffer;
                     backend.TileAxis(current, expanded, outerSize, 1, innerSize, repeats);
                     current = expanded;
                     currentShape[axis] = repeats;
@@ -27340,6 +27433,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> ReduceMax<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
         var safeAxes = axes ?? Array.Empty<int>();
+        // Recording a compiled plan: the base ReduceMax records a graph node (its backward scatters into the argmax
+        // positions on the device). The index-returning variant below is not graph-capturable and threw, which
+        // rejected the WHOLE fused step for any model that took a max under compiled GPU training - a stabilized
+        // softmax, a log-sum-exp, Autoformer's lag selection - and dropped it onto the eager tape with a host
+        // optimizer (AiDotNet#1804: Autoformer trained 5.5x slower than PyTorch on the GPU for this reason).
+        if (Compilation.GraphMode.IsActive)
+            return base.ReduceMax(input, safeAxes, keepDims);
         if (IsTapeActive<T>())
             return ReduceMaxWithTensorIndices(input, safeAxes, keepDims, out _);
         if (!TryGetBackend(out var backend))

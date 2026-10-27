@@ -34418,11 +34418,22 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedEffectiveAxes = effectiveAxes.ToArray();
                 // savedState[0] will be populated with maxIndices at execute time.
                 // The execute delegate must bypass GraphMode to avoid infinite recursion.
-                var savedStateArr = new object[] { Array.Empty<int>() };
+                var savedStateArr = new object[] { Array.Empty<int>(), captureAxes };
                 var capturedSelf = this;
                 return scope.RecordUnary(LazyNodeType.Custom, "ReduceMax", input, outShape,
                     (eng, output) =>
                     {
+                        // On the GPU the max and its argmax are computed on the device and the backward reads the
+                        // device indices (ReduceMaxBackward dispatches on them). The host odometer below read the
+                        // input back to the host on every replay, which aborts CUDA-graph capture (AiDotNet#1804).
+                        if (eng is DirectGpuTensorEngine gpuMax
+                            && gpuMax.TryReduceMaxWithIndicesIntoResident(output, capturedInput, capturedEffectiveAxes,
+                                capturedKeepDims, out var deviceIndices, out var deviceAxes))
+                        {
+                            savedStateArr[0] = deviceIndices!;
+                            savedStateArr[1] = deviceAxes!;
+                            return;
+                        }
                         // Axis-aware max that fills EVERY output element. The previous
                         // implementation computed a single GLOBAL max over the whole
                         // input and wrote it to output[0] only — correct solely when
@@ -49523,7 +49534,11 @@ public partial class CpuEngine : ITensorLevelEngine
                 var outShape = (int[])tensor._shape.Clone();
                 outShape[dim] = length;
                 return scope.RecordUnary(LazyNodeType.Custom, "Narrow", tensor, outShape,
-                    (eng, output) => { var r = eng.TensorNarrow(captured, capDim, capStart, capLen); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
+                    (eng, output) =>
+                    {
+                        if (eng is DirectGpuTensorEngine gpu && gpu.TensorNarrowIntoResident(output, captured, capDim, capStart, capLen)) return;
+                        var r = eng.TensorNarrow(captured, capDim, capStart, capLen); DirectGpuTensorEngine.CopyResultInto(eng, r, output);
+                    },
                     BackwardFunctions<T>.NarrowBackward, new object[] { dim, start, length });
             }
         }
