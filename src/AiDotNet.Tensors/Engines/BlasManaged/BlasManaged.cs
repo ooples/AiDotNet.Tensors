@@ -963,7 +963,13 @@ public static partial class BlasManaged
         int gateProcs = System.Environment.ProcessorCount;
         if (m >= mr && n >= nr && (m % mr != 0 || n % nr != 0))
         {
-            if (splitMAligned < gateProcs * mr && options.PackingMode == PackingMode.Auto)
+            // Dense transposed-A products amortize packing even when the aligned rows cannot
+            // occupy every logical CPU. On 128-thread AVX2, 512x2048x3072 took ~643 ms
+            // streaming versus ~22 ms packed; 512x1024x512 also favored packing. Keep the
+            // small-shape gate, and keep this decision independent of the requested thread count.
+            bool denseTransA = typeof(T) == typeof(float) && mr == 6 && transA && !transB
+                && m >= 512 && n >= 512 && k >= 512;
+            if (splitMAligned < gateProcs * mr && options.PackingMode == PackingMode.Auto && !denseTransA)
             {
                 // Auto + too few aligned mr-blocks for the packed kernel to beat all-Streaming,
                 // and a tail IS present — route the WHOLE shape to Streaming, which handles the
