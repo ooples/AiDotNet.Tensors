@@ -177,19 +177,22 @@ public sealed class DirectPtxTensorCoreGemmTests
         // The oracle reads C as the kernel will: rounded to FP16 when the output is FP16.
         double[] cSeen = cFloat.Select(v => halfOut ? (double)(float)(Half)v : v).ToArray();
         var expected = new double[batch * m * n];
+        var absProducts = new double[batch * m * n];
         for (int z = 0; z < batch; z++)
             for (int i = 0; i < m; i++)
                 for (int j = 0; j < n; j++)
                 {
-                    double sum = 0;
+                    double sum = 0, abs = 0;
                     for (int p = 0; p < k; p++)
                     {
                         double av = (double)(layout.TransposeA ? a[z * m * k + p * lda + i] : a[z * m * k + i * lda + p]);
                         double bv = (double)(layout.TransposeB ? b[z * k * n + j * ldb + p] : b[z * k * n + p * ldb + j]);
                         sum += av * bv;
+                        abs += Math.Abs(av * bv);
                     }
                     int index = z * m * n + i * n + j;
                     expected[index] = alpha * sum + (beta == 0 ? 0 : beta * cSeen[index]);
+                    absProducts[index] = abs;
                 }
         using var da = runtime.AllocateBytes((nuint)(Math.Max(1, a.Length) * 2));
         using var db = runtime.AllocateBytes((nuint)(Math.Max(1, b.Length) * 2));
@@ -216,10 +219,16 @@ public sealed class DirectPtxTensorCoreGemmTests
         }
         // FP16 operands are exact; products accumulate in FP32. An FP16 output adds one rounding (2^-11 relative).
         double bound = 1e-4 * Math.Abs(alpha) * Math.Max(1, k) + 1e-5 * (1 + Math.Abs(beta));
-        string what = $"{kernel.Configuration.Name} {layout.Name} fp16{(halfOut ? "->fp16" : "->fp32")} b{batch} M{m} N{n} K{k} alpha{alpha} beta{beta}";
+        // FP16 accumulation (#1549): each K tile's partial sum is rounded to FP16 once per MMA step of the tile
+        // (BlockK / 16 steps) and once more when promoted, each at most 2^-11 of the partial's magnitude, which is at
+        // most the tile's sum of |a b|. Summed over tiles: (BlockK / 16 + 1) * 2^-11 * sum |a b|.
+        double accumulateUlps = kernel.Fp16Accumulate ? (kernel.Configuration.BlockK / 16 + 1) * Math.Pow(2, -11) : 0;
+        string what = $"{kernel.Configuration.Name} {layout.Name} fp16{(halfOut ? "->fp16" : "->fp32")}" +
+            $"{(kernel.Fp16Accumulate ? " f16acc" : "")} b{batch} M{m} N{n} K{k} alpha{alpha} beta{beta}";
         for (int i = 0; i < actual.Length; i++)
         {
-            double allowed = bound + (halfOut ? Math.Abs(expected[i]) * 1e-3 : 0);
+            double allowed = bound + (halfOut ? Math.Abs(expected[i]) * 1e-3 : 0)
+                + accumulateUlps * Math.Abs(alpha) * absProducts[i];
             Assert.True(Math.Abs(actual[i] - expected[i]) <= allowed, $"{what}: [{i}] got {actual[i]}, expected {expected[i]}");
         }
     }
@@ -245,6 +254,195 @@ public sealed class DirectPtxTensorCoreGemmTests
                     CheckFp16(runtime, kernel, 1, 64, 64, 64, 1f, 0f, poisonC: true);
                     CheckFp16(runtime, kernel, 1, 64, 64, 0, 1f, 3f, poisonC: false);
                 }
+    }
+
+    // #1549: FP16 accumulation per K tile, promoted into an FP32 total, over the same sampled configurations, layouts,
+    // shapes and scalars, within the bound CheckFp16 derives from the per-tile FP16 roundings.
+    [SkippableFact]
+    public void Fp16Accumulate_SampledConfigurations_MatchTheOracle_BothOutputs()
+    {
+        using var runtime = RequireAmpere();
+        var configs = Sampled.Where(c => Layouts.All(l => c.Invalidity(l, PtxTensorCorePrecision.Fp16) is null)).ToList();
+        foreach (var config in configs)
+            foreach (var layout in Layouts)
+                foreach (bool halfOut in new[] { false, true })
+                {
+                    using var kernel = new PtxTensorCoreGemmKernel(runtime, config, layout, PtxTensorCorePrecision.Fp16, halfOut,
+                        fp16Accumulate: true);
+                    Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+                    Assert.Contains("f16.f16.f16.f16", kernel.Ptx);
+                    Assert.Contains("bar.red.or.pred", kernel.Ptx);   // the block-wide overflow vote before the FP32 redo
+                    foreach (var (m, n, k) in Fp16Shapes)
+                    {
+                        CheckFp16(runtime, kernel, 1, m, n, k, 1f, 0f, poisonC: false);
+                        CheckFp16(runtime, kernel, 1, m, n, k, 0.5f, 2f, poisonC: false);
+                    }
+                    CheckFp16(runtime, kernel, 3, 40, 48, 56, -1.5f, 0.25f, poisonC: false);
+                    CheckFp16(runtime, kernel, 1, 64, 64, 64, 1f, 0f, poisonC: true);
+                    CheckFp16(runtime, kernel, 1, 64, 64, 0, 1f, 3f, poisonC: false);
+                    CheckFp16(runtime, kernel, 1, 64, 64, 4096, 1f, 0f, poisonC: false);   // many promoted tiles
+                }
+    }
+
+    // The limit of FP16 accumulation: a K tile's partial sum must stay below 65504. 32 products of 64 x 64 = 4096 each
+    // make a 131072 partial in a 32-deep tile, which FP16 cannot hold; the kernel sees the infinity after its main loop
+    // and redoes the tile with FP32 accumulation, which is exact here.
+    [SkippableFact]
+    public void Fp16Accumulate_TilePartialAbove65504_IsRedoneInFp32_Exactly()
+    {
+        using var runtime = RequireAmpere();
+        var config = new PtxTensorCoreGemmConfiguration(64, 64, 32, 32, 32, 2, 4);
+        var layout = new PtxGemmLayout(false, false);
+        const int m = 64, n = 64, k = 32;
+        Half[] values = Enumerable.Repeat((Half)64f, m * k).ToArray();
+        using var da = runtime.AllocateBytes((nuint)(m * k * 2));
+        using var db = runtime.AllocateBytes((nuint)(k * n * 2));
+        using var dc = runtime.AllocateBytes((nuint)(m * n * 4));
+        da.Upload<Half>(values);
+        db.Upload<Half>(values);
+        float[] Run(bool fp16Accumulate)
+        {
+            using var kernel = new PtxTensorCoreGemmKernel(runtime, config, layout, PtxTensorCorePrecision.Fp16,
+                fp16Accumulate: fp16Accumulate);
+            kernel.Launch(da.Pointer, db.Pointer, dc.Pointer, m, n, k, k, n, n, 1f, 0f, 1, (long)m * k, (long)k * n, (long)m * n);
+            runtime.Synchronize();
+            var c = new float[m * n];
+            dc.Download<float>(c);
+            return c;
+        }
+        float[] fp32 = Run(fp16Accumulate: false);
+        Assert.Equal(131072f, fp32[0]);
+        Assert.Equal(fp32, Run(fp16Accumulate: true));
+    }
+
+    // #1549: the redo is per block. A has 64 rows of 64s (their blocks overflow) over 64 rows in [-1, 1) (theirs do not);
+    // the overflowing rows must equal the FP32-accumulate kernel bit for bit and the others must equal the FP16-accumulate
+    // result of those rows alone, so the redo neither leaks into a clean block nor skips a dirty one. A NaN operand stays
+    // NaN in its row (no redo can hide it); the rest of its block takes the FP32 result and the other blocks are untouched.
+    [SkippableFact]
+    public void Fp16Accumulate_RedoesOnlyTheBlocksThatOverflow()
+    {
+        using var runtime = RequireAmpere();
+        var config = new PtxTensorCoreGemmConfiguration(64, 64, 32, 32, 32, 2, 4);
+        var layout = new PtxGemmLayout(false, false);
+        const int n = 128, k = 256;
+        var rng = new Random(9);
+        Half[] big = Enumerable.Repeat((Half)64f, 64 * k).ToArray();
+        Half[] small = Enumerable.Range(0, 64 * k).Select(_ => (Half)(rng.NextDouble() * 2 - 1)).ToArray();
+        Half[] b = Enumerable.Range(0, k * n).Select(_ => (Half)(rng.Next(-64, 65))).ToArray();
+        float[] Run(Half[] a, int m, bool fp16Accumulate)
+        {
+            using var da = runtime.AllocateBytes((nuint)(m * k * 2));
+            using var db = runtime.AllocateBytes((nuint)(k * n * 2));
+            using var dc = runtime.AllocateBytes((nuint)(m * n * 4));
+            da.Upload<Half>(a);
+            db.Upload<Half>(b);
+            using var kernel = new PtxTensorCoreGemmKernel(runtime, config, layout, PtxTensorCorePrecision.Fp16,
+                fp16Accumulate: fp16Accumulate);
+            kernel.Launch(da.Pointer, db.Pointer, dc.Pointer, m, n, k, k, n, n, 1f, 0f);
+            runtime.Synchronize();
+            var c = new float[m * n];
+            dc.Download<float>(c);
+            return c;
+        }
+        Half[] mixed = big.Concat(small).ToArray();
+        float[] fp32 = Run(mixed, 128, fp16Accumulate: false);
+        float[] actual = Run(mixed, 128, fp16Accumulate: true);
+        float[] smallOnly = Run(small, 64, fp16Accumulate: true);
+        Assert.Equal(fp32.Take(64 * n), actual.Take(64 * n));
+        Assert.Equal(smallOnly, actual.Skip(64 * n));
+        Assert.Contains(fp32.Take(64 * n), v => Math.Abs(v) >= 65504f);   // the 64s do overflow an FP16 partial
+
+        mixed[64 * k + 5 * k + 3] = Half.NaN;   // row 69
+        float[] withNaN = Run(mixed, 128, fp16Accumulate: true);
+        Assert.All(withNaN.Skip(69 * n).Take(n), v => Assert.True(float.IsNaN(v)));
+        Assert.Equal(fp32.Take(64 * n), withNaN.Take(64 * n));
+        // The NaN's block redoes in FP32 (its accumulators went non-finite), so its other rows take the FP32 values.
+        Assert.Equal(fp32.Skip(64 * n).Take(5 * n), withNaN.Skip(64 * n).Take(5 * n));
+        Assert.Equal(fp32.Skip(70 * n), withNaN.Skip(70 * n));
+        Assert.NotEqual(actual.Skip(70 * n), withNaN.Skip(70 * n));
+    }
+
+    // Opt-in speed probe (AIDOTNET_RUN_TC_GEMM_PROBE=1): FP16 operands and FP32 output, FP32 accumulation against FP16
+    // accumulation with per-tile promotion (#1549), same configurations, CUDA events, and cuBLAS FP16 -> FP32 for scale.
+    // The operands are in [-1, 1), so each partial sum is far below 65504. A development check, not evidence.
+    [SkippableFact]
+    public void Probe_Fp16AccumulateAgainstFp32Accumulate()
+    {
+        Skip.IfNot(Environment.GetEnvironmentVariable("AIDOTNET_RUN_TC_GEMM_PROBE") == "1", "Set AIDOTNET_RUN_TC_GEMM_PROBE=1.");
+        using var backend = new CudaBackend();
+        Skip.IfNot(backend.IsAvailable, "CUDA is unavailable.");
+        DirectPtxRuntime runtime = backend.GetDirectPtxRuntime();
+        var layout = new PtxGemmLayout(false, false);
+        static byte[] HalfBytes(float[] values)
+        {
+            var bytes = new byte[values.Length * 2];
+            for (int i = 0; i < values.Length; i++)
+            {
+                ushort bits = BitConverter.HalfToUInt16Bits((Half)values[i]);
+                bytes[2 * i] = (byte)bits;
+                bytes[2 * i + 1] = (byte)(bits >> 8);
+            }
+            return bytes;
+        }
+        foreach (var (m, n, k) in new[] { (4096, 4096, 4096), (1024, 3072, 768), (1024, 768, 3072), (3136, 64, 576), (12544, 128, 1152) })
+        {
+            using var ah = backend.AllocateByteBuffer(m * k * 2);
+            using var bh = backend.AllocateByteBuffer(k * n * 2);
+            using var reference = backend.AllocateBuffer(m * n);
+            using var c = backend.AllocateBuffer(m * n);
+            backend.UploadBytes(ah, HalfBytes(Values(m * k, 3)));
+            backend.UploadBytes(bh, HalfBytes(Values(k * n, 4)));
+            double flops = 2d * m * n * k;
+            double Time(Action launch)
+            {
+                for (int i = 0; i < 3; i++) launch();
+                backend.Synchronize();
+                using var start = backend.CreateEvent(enableTiming: true);
+                using var end = backend.CreateEvent(enableTiming: true);
+                const int reps = 20;
+                backend.RecordEvent(start, backend.DefaultStream);
+                for (int i = 0; i < reps; i++) launch();
+                backend.RecordEvent(end, backend.DefaultStream);
+                end.Synchronize();
+                return backend.GetEventElapsedTime(start, end) / reps;
+            }
+            double cublas = Time(() => backend.GemmFp16In32fOut(ah, bh, reference, m, n, k));
+            float[] expected = backend.DownloadBuffer(reference);
+            double scale = expected.Max(v => Math.Abs((double)v));
+            double best32 = double.MaxValue, best16 = double.MaxValue;
+            string best32Name = "", best16Name = "";
+            foreach (var config in PtxTensorCoreGemmConfiguration.SearchSpace(layout, PtxTensorCorePrecision.Fp16)
+                         .Where(x => x.BlockM >= 64 && x.BlockN >= 64 && x.Stages >= 3 && x.SharedPad == 8))
+            {
+                foreach (bool fp16Accumulate in new[] { false, true })
+                {
+                    PtxTensorCoreGemmKernel kernel;
+                    try
+                    {
+                        kernel = new PtxTensorCoreGemmKernel(runtime, config, layout, PtxTensorCorePrecision.Fp16,
+                            fp16Accumulate: fp16Accumulate);
+                    }
+                    catch (InvalidOperationException)
+                    {
+                        continue;
+                    }
+                    using var _ = kernel;
+                    if (!PtxTensorCoreGemmGenerator.Admits(config, layout, m, n, k, k, n, n, 0, 0, 0, PtxTensorCorePrecision.Fp16)) continue;
+                    double ms = Time(() => kernel.Launch(ah.Handle, bh.Handle, c.Handle, m, n, k, k, n, n, 1f, 0f));
+                    float[] actual = backend.DownloadBuffer(c);
+                    double diff = 0;
+                    for (int i = 0; i < actual.Length; i += 97) diff = Math.Max(diff, Math.Abs(actual[i] - expected[i]));
+                    Assert.True(diff / scale < 5e-3, $"{config.Name} f16acc={fp16Accumulate} disagrees with cuBLAS: {diff / scale:E2}");
+                    if (fp16Accumulate && ms < best16) { best16 = ms; best16Name = config.Name; }
+                    if (!fp16Accumulate && ms < best32) { best32 = ms; best32Name = config.Name; }
+                }
+            }
+            _output.WriteLine($"M{m} N{n} K{k}: cuBLAS FP16->FP32 {flops / cublas / 1e9:F1} TFLOP/s; " +
+                $"best FP32-acc {flops / best32 / 1e9:F1} TFLOP/s ({best32Name}); " +
+                $"best FP16-acc {flops / best16 / 1e9:F1} TFLOP/s ({best16Name}); FP16-acc / FP32-acc {best32 / best16:F2}x, " +
+                $"FP16-acc / cuBLAS {cublas / best16:F2}x");
+        }
     }
 
     [Fact]

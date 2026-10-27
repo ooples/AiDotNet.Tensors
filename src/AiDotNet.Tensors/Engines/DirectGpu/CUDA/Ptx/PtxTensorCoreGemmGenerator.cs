@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Linq;
 using System.Text;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
@@ -108,16 +109,25 @@ internal static class PtxTensorCoreGemmGenerator
 {
     internal const string EntryPoint = "aidotnet_tc_sgemm";
 
+    /// <param name="fp16Accumulate">
+    /// FP16 operands only: accumulate each K tile in FP16 (<c>mma...f16.f16.f16.f16</c>) and add the tile's partial sums
+    /// into the FP32 accumulators before the next tile (#1549). On GeForce cards FP16-accumulate MMA issues at full rate
+    /// while FP32-accumulate issues at half rate (RTX 3080: ~120 vs ~60 TFLOP/s), so this doubles the math ceiling. Each
+    /// partial sum covers <c>BlockK</c> products and is rounded to FP16 (2^-11 relative) and must stay below 65504; the
+    /// running total stays FP32.
+    /// </param>
     internal static string Emit(PtxTensorCoreGemmConfiguration config, PtxGemmLayout layout, int ccMajor, int ccMinor,
-        PtxTensorCorePrecision precision = PtxTensorCorePrecision.Tf32, bool halfOutput = false)
+        PtxTensorCorePrecision precision = PtxTensorCorePrecision.Tf32, bool halfOutput = false, bool fp16Accumulate = false)
     {
         if (ccMajor < 8) throw new PlatformNotSupportedException("Tensor-Core MMA and cp.async need compute capability 8.0+.");
         if (halfOutput && precision != PtxTensorCorePrecision.Fp16)
             throw new ArgumentException("An FP16 output needs FP16 operands.", nameof(halfOutput));
+        if (fp16Accumulate && precision != PtxTensorCorePrecision.Fp16)
+            throw new ArgumentException("FP16 accumulation needs FP16 operands.", nameof(fp16Accumulate));
         string? invalid = config.Invalidity(layout, precision);
         if (invalid is not null)
             throw new ArgumentException("Invalid Tensor-Core GEMM configuration " + config.Name + ": " + invalid, nameof(config));
-        return new Emitter(config, layout, precision, halfOutput).Build(ccMajor, ccMinor);
+        return new Emitter(config, layout, precision, halfOutput, fp16Accumulate).Build(ccMajor, ccMinor);
     }
 
     /// <summary>
@@ -143,17 +153,20 @@ internal static class PtxTensorCoreGemmGenerator
         private readonly PtxGemmLayout _layout;
         private readonly PtxTensorCorePrecision _precision;
         private readonly bool _halfOutput;
+        private readonly bool _fp16Accumulate;
+        private string _overflow = "";  // predicate: a K tile's FP16 partial overflowed in this warp (recovering mode)
         private readonly int _eb, _mmaK, _chunk;
         private readonly StringBuilder _body = new(128_000);
         private int _r32, _r64, _pred, _f, _h;
 
         internal Emitter(PtxTensorCoreGemmConfiguration config, PtxGemmLayout layout, PtxTensorCorePrecision precision,
-            bool halfOutput)
+            bool halfOutput, bool fp16Accumulate)
         {
             _c = config;
             _layout = layout;
             _precision = precision;
             _halfOutput = halfOutput;
+            _fp16Accumulate = fp16Accumulate;
             _eb = PtxTensorCoreGemmConfiguration.ElementBytes(precision);
             _mmaK = PtxTensorCoreGemmConfiguration.MmaK(precision);
             _chunk = PtxTensorCoreGemmConfiguration.ChunkElements(precision);
@@ -256,54 +269,96 @@ internal static class PtxTensorCoreGemmGenerator
             L($"setp.eq.u32 {empty}, {tiles}, 0;");
             L($"@{empty} bra EPILOGUE;");
 
-            // Prologue: tiles 0 .. Stages-2 in flight (a group per tile, empty past the last tile).
-            L($"mov.u32 {k0}, 0;");
-            for (int s = 0; s < _c.Stages - 1; s++)
+            // The main loop, emitted once per accumulation mode (FP16 accumulation emits an FP32 copy for its overflow redo).
+            void MainLoop(string suffix, bool halfMode)
             {
-                string issue = P();
-                L($"setp.gt.u32 {issue}, {tiles}, {I(s)};");
-                IssueTile(a, I(s * stageBytesA), k0, k, issue);
-                IssueTile(b, I(s * stageBytesB), k0, k, issue);
-                L("cp.async.commit_group;");
-                if (s < _c.Stages - 2)
+                // Prologue: tiles 0 .. Stages-2 in flight (a group per tile, empty past the last tile).
+                L($"mov.u32 {k0}, 0;");
+                for (int s = 0; s < _c.Stages - 1; s++)
                 {
+                    string issue = P();
+                    L($"setp.gt.u32 {issue}, {tiles}, {I(s)};");
+                    IssueTile(a, I(s * stageBytesA), k0, k, issue);
+                    IssueTile(b, I(s * stageBytesB), k0, k, issue);
+                    L("cp.async.commit_group;");
+                    if (s < _c.Stages - 2)
+                    {
+                        Advance(a);
+                        Advance(b);
+                        L($"add.u32 {k0}, {k0}, {I(_c.BlockK)};");
+                    }
+                }
+                L($"mov.u32 {tile}, 0;");
+
+                Label("K_LOOP" + suffix);
+                L($"cp.async.wait_group {I(_c.Stages - 2)};");
+                L("bar.sync 0;");
+                {
+                    // Issue tile (tile + Stages - 1) into stage (tile + Stages - 1) % Stages, then compute stage tile % Stages.
+                    string next = R(), issueStage = R(), issue = P(), nextK0 = R();
+                    L($"add.u32 {next}, {tile}, {I(_c.Stages - 1)};");
+                    L($"setp.lt.u32 {issue}, {next}, {tiles};");
+                    L($"rem.u32 {issueStage}, {next}, {I(_c.Stages)};");
+                    L($"mul.lo.u32 {nextK0}, {next}, {I(_c.BlockK)};");
                     Advance(a);
                     Advance(b);
-                    L($"add.u32 {k0}, {k0}, {I(_c.BlockK)};");
+                    string offA = R(), offB = R();
+                    L($"mul.lo.u32 {offA}, {issueStage}, {I(stageBytesA)};");
+                    L($"mul.lo.u32 {offB}, {issueStage}, {I(stageBytesB)};");
+                    IssueTile(a, offA, nextK0, k, issue);
+                    IssueTile(b, offB, nextK0, k, issue);
+                    L("cp.async.commit_group;");
+
+                    string computeStage = R(), stageA = R(), stageB = R();
+                    L($"rem.u32 {computeStage}, {tile}, {I(_c.Stages)};");
+                    L($"mad.lo.u32 {stageA}, {computeStage}, {I(stageBytesA)}, {aFrag};");
+                    L($"mad.lo.u32 {stageB}, {computeStage}, {I(stageBytesB)}, {bFrag};");
+                    Compute(a, b, stageA, stageB, acc, halfMode, suffix);
                 }
+                string more = P();
+                L($"add.u32 {tile}, {tile}, 1;");
+                L($"setp.lt.u32 {more}, {tile}, {tiles};");
+                L($"@{more} bra K_LOOP{suffix};");
+                L("cp.async.wait_group 0;");
             }
-            L($"mov.u32 {tile}, 0;");
 
-            Label("K_LOOP");
-            L($"cp.async.wait_group {I(_c.Stages - 2)};");
-            L("bar.sync 0;");
+            if (_fp16Accumulate)
             {
-                // Issue tile (tile + Stages - 1) into stage (tile + Stages - 1) % Stages, then compute stage tile % Stages.
-                string next = R(), issueStage = R(), issue = P(), nextK0 = R();
-                L($"add.u32 {next}, {tile}, {I(_c.Stages - 1)};");
-                L($"setp.lt.u32 {issue}, {next}, {tiles};");
-                L($"rem.u32 {issueStage}, {next}, {I(_c.Stages)};");
-                L($"mul.lo.u32 {nextK0}, {next}, {I(_c.BlockK)};");
-                Advance(a);
-                Advance(b);
-                string offA = R(), offB = R();
-                L($"mul.lo.u32 {offA}, {issueStage}, {I(stageBytesA)};");
-                L($"mul.lo.u32 {offB}, {issueStage}, {I(stageBytesB)};");
-                IssueTile(a, offA, nextK0, k, issue);
-                IssueTile(b, offB, nextK0, k, issue);
-                L("cp.async.commit_group;");
-
-                string computeStage = R(), stageA = R(), stageB = R();
-                L($"rem.u32 {computeStage}, {tile}, {I(_c.Stages)};");
-                L($"mad.lo.u32 {stageA}, {computeStage}, {I(stageBytesA)}, {aFrag};");
-                L($"mad.lo.u32 {stageB}, {computeStage}, {I(stageBytesB)}, {bFrag};");
-                Compute(a, b, stageA, stageB, acc);
+                // Recovering FP16 accumulation (#1549): run the FP16-accumulate loop, remembering whether any of this
+                // warp's K tiles overflowed; combine the warps' flags in shared memory after the loop; and when one
+                // did, zero the accumulators, rewind the operand pointers and redo the block's tile with the FP32 loop.
+                // Only a block that overflowed pays twice; the result is then exactly the FP32-accumulate kernel's.
+                string anyOverflow = P();
+                _overflow = P();
+                L($"setp.ne.u32 {_overflow}, 0, 0;");
+                var savedA = a.ChunkPointer.Select(_ => Rd()).ToArray();
+                var savedB = b.ChunkPointer.Select(_ => Rd()).ToArray();
+                for (int i = 0; i < savedA.Length; i++) L($"mov.u64 {savedA[i]}, {a.ChunkPointer[i]};");
+                for (int i = 0; i < savedB.Length; i++) L($"mov.u64 {savedB[i]}, {b.ChunkPointer[i]};");
+                MainLoop("_F16", halfMode: true);
+                // A K tile's FP16 partial past 65504 became infinity when promoted (an infinite or NaN operand makes one
+                // too), and an infinite or NaN FP32 total stays so (inf + -inf is NaN), while finite FP16 products
+                // (at most 65504^2 each) cannot overflow an FP32 total. So a non-finite accumulator after the loop is
+                // exactly "some tile overflowed": one check per accumulator per launch, nothing per tile.
+                foreach (string accumulator in acc)
+                {
+                    string magnitude = F(), nonFinite = P();
+                    L($"abs.f32 {magnitude}, {accumulator};");
+                    L($"setp.gtu.f32 {nonFinite}, {magnitude}, 0f7F7FFFFF;");   // above FLT_MAX: infinity; NaN: unordered
+                    L($"or.pred {_overflow}, {_overflow}, {nonFinite};");
+                }
+                // One barrier ORs every thread's flag across the block (no shared memory needed).
+                L($"bar.red.or.pred {anyOverflow}, 0, {_overflow};");
+                L($"@!{anyOverflow} bra EPILOGUE;");
+                foreach (string accumulator in acc) L($"mov.f32 {accumulator}, 0f00000000;");
+                for (int i = 0; i < savedA.Length; i++) L($"mov.u64 {a.ChunkPointer[i]}, {savedA[i]};");
+                for (int i = 0; i < savedB.Length; i++) L($"mov.u64 {b.ChunkPointer[i]}, {savedB[i]};");
+                MainLoop("_F32", halfMode: false);
             }
-            string more = P();
-            L($"add.u32 {tile}, {tile}, 1;");
-            L($"setp.lt.u32 {more}, {tile}, {tiles};");
-            L($"@{more} bra K_LOOP;");
-            L("cp.async.wait_group 0;");
+            else
+            {
+                MainLoop("", halfMode: false);
+            }
 
             Label("EPILOGUE");
             Epilogue(cPtr, m, n, ldc, alpha, beta, bm, bn, warpM0, warpN0, gid, tig, acc);
@@ -311,9 +366,10 @@ internal static class PtxTensorCoreGemmGenerator
 
             var ptx = new StringBuilder(_body.Length + 2_048);
             ptx.AppendLine(".version 7.1");
-            ptx.Append(".target sm_").Append(I(ccMajor)).AppendLine(I(ccMinor));
+            ptx.Append(".target ").AppendLine(PtxIsa71Target.For(ccMajor, ccMinor));
             ptx.AppendLine(".address_size 64");
             ptx.Append("// tc-gemm ").Append(Fp16 ? (_halfOutput ? "fp16 -> fp16" : "fp16 -> fp32") : "tf32")
+                .Append(_fp16Accumulate ? " (fp16 accumulate per k tile, fp32 redo on overflow)" : "")
                 .Append(' ').Append(_c.Name).Append(' ').AppendLine(_layout.Name);
             ptx.AppendLine(".extern .shared .align 16 .b8 smem[];");
             ptx.Append(".visible .entry ").Append(EntryPoint).AppendLine("(");
@@ -483,7 +539,7 @@ internal static class PtxTensorCoreGemmGenerator
             L($"mov.b32 {destination}, {{{lo}, {hi}}};");
         }
 
-        private void Compute(Operand a, Operand b, string stageA, string stageB, string[] acc)
+        private void Compute(Operand a, Operand b, string stageA, string stageB, string[] acc, bool halfMode, string suffix)
         {
             int tilesM = _c.TilesM, tilesN = _c.TilesN;
             var fa = new string[tilesM, 4];
@@ -496,9 +552,19 @@ internal static class PtxTensorCoreGemmGenerator
             string mma = Fp16
                 ? "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"
                 : "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32";
-            for (int kk = 0; kk < _c.BlockK / _mmaK; kk++)
+            // FP16 accumulation: two packed half2 registers per m16n8 tile ({d0, d1}, {d2, d3}), zeroed for this K tile.
+            string[] half = Array.Empty<string>();
+            if (halfMode)
             {
-                int kBase = kk * _mmaK;
+                half = new string[tilesM * tilesN * 2];
+                for (int i = 0; i < half.Length; i++)
+                {
+                    half[i] = R();
+                    L($"mov.b32 {half[i]}, 0;");
+                }
+            }
+            void Fragments(int kBase)
+            {
                 if (Fp16)
                 {
                     string aTrans = a.ContiguousAlongK ? "" : ".trans";
@@ -526,12 +592,52 @@ internal static class PtxTensorCoreGemmGenerator
                     LoadFragment(b, stageB, column, kBase, fb[nt, 0], scratch);
                     LoadFragment(b, stageB, column, kBase + kHalf, fb[nt, 1], scratch);
                 }
+            }
+
+            void Fp32Mmas()
+            {
                 for (int mt = 0; mt < tilesM; mt++)
                     for (int nt = 0; nt < tilesN; nt++)
                     {
                         int c = (mt * tilesN + nt) * 4;
                         string d = $"{{{acc[c]}, {acc[c + 1]}, {acc[c + 2]}, {acc[c + 3]}}}";
                         L($"{mma} {d}, {{{fa[mt, 0]}, {fa[mt, 1]}, {fa[mt, 2]}, {fa[mt, 3]}}}, {{{fb[nt, 0]}, {fb[nt, 1]}}}, {d};");
+                    }
+            }
+
+            for (int kk = 0; kk < _c.BlockK / _mmaK; kk++)
+            {
+                Fragments(kk * _mmaK);
+                if (halfMode)
+                {
+                    for (int mt = 0; mt < tilesM; mt++)
+                        for (int nt = 0; nt < tilesN; nt++)
+                        {
+                            int h = (mt * tilesN + nt) * 2;
+                            string dh = $"{{{half[h]}, {half[h + 1]}}}";
+                            L($"mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {dh}, {{{fa[mt, 0]}, {fa[mt, 1]}, {fa[mt, 2]}, {fa[mt, 3]}}}, {{{fb[nt, 0]}, {fb[nt, 1]}}}, {dh};");
+                        }
+                }
+                else
+                {
+                    Fp32Mmas();
+                }
+            }
+
+            // Promote this K tile's FP16 partial sums into the FP32 accumulators. A half2 register holds {d0, d1} (or
+            // {d2, d3}) low then high, matching the FP32 accumulators' order.
+            if (halfMode)
+            {
+                for (int t = 0; t < tilesM * tilesN; t++)
+                    for (int pair = 0; pair < 2; pair++)
+                    {
+                        string lo = H(), hi = H(), flo = F(), fhi = F();
+                        int c = t * 4 + pair * 2;
+                        L($"mov.b32 {{{lo}, {hi}}}, {half[t * 2 + pair]};");
+                        L($"cvt.f32.f16 {flo}, {lo};");
+                        L($"cvt.f32.f16 {fhi}, {hi};");
+                        L($"add.rn.f32 {acc[c]}, {acc[c]}, {flo};");
+                        L($"add.rn.f32 {acc[c + 1]}, {acc[c + 1]}, {fhi};");
                     }
             }
         }

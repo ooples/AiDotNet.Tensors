@@ -1,4 +1,4 @@
-using System;
+﻿﻿using System;
 using System.Collections.Concurrent;
 using System.Linq;
 using System.Runtime.CompilerServices;
@@ -316,6 +316,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // quiescence barrier after which no in-flight kernel references it. Guarded by _persistentBufferLock.
     private readonly List<IGpuBuffer> _retiredWeightBuffers = new();
 
+    // Whether a weight buffer the cache lets go of may be freed NOW, or must be left to its finalizer. Freeing assumes
+    // the cache is its only owner once a synchronize has drained in-flight kernels; on an engine trained from several
+    // threads another thread may still hold it - bound to its parameter, behind a host download it registers after its
+    // fused step - and launch on it later. One thread's per-step InvalidateAllWeightCaches freed another thread's just-
+    // updated weights that way (concurrent GPU Autoformer, CUDA 700, AiDotNet#1804). There a released buffer is only
+    // dropped: its finalizer frees it once nothing references it, as PyTorch frees a CUDA tensor.
+    private bool CacheMayFreeReleasedBuffers => !_compiledStepsFromSeveralThreads;
+
     // Monotonic per-call counter for stochastic-op seeds (dropout, etc.). The old code seeded the
     // GPU dropout RNG from Environment.TickCount / DateTime.UtcNow.Ticks. TickCount has ~15 ms
     // resolution, so the many dropout calls a training step fires in <1 ms all got the SAME seed →
@@ -415,7 +423,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (_capturePathDepth.Enter() == 1)
             System.Threading.Interlocked.Increment(ref s_capturePathEngines);
-        s_residentScratchEngine = this;   // route the static AllocateOutputBuffer's transient allocs here
         return new CapturePathScope(this);
     }
 
@@ -429,8 +436,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (e is not null && e._capturePathDepth.Exit() == 0)
             {
                 System.Threading.Interlocked.Decrement(ref s_capturePathEngines);
-                e._currentScratchAction = -1;
-                if (ReferenceEquals(s_residentScratchEngine, e)) s_residentScratchEngine = null;
+                e.CurrentScratchPool?.Begin(-1);
             }
         }
     }
@@ -1601,7 +1607,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (typeof(T) != typeof(float) || loss.Length == 0 || loss.TryGetGpuBuffer() is null) return false;
         if (ResidentStepActive || Compilation.GraphMode.IsActive || !TryGetBackend(out var backend)) return false;
         if (backend is IGpuGraphCapture cuda && cuda.IsStreamCapturing()) return false;
-        var output = AllocateOutputBuffer(backend, loss.Length);
+        var output = AllocateFullyWrittenOutputBuffer(backend, loss.Length);
         try
         {
             backend.Fill(output.Buffer, 1f, loss.Length);
@@ -1662,6 +1668,36 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             : null;
     }
 
+    /// <summary>
+    /// A contiguous view into a tensor a compiled step bound to its own device buffer (ResidentHostMirror): copy the
+    /// view's range from that buffer on the device. Neither the activation cache nor the storage's device state knows
+    /// such a buffer, so the slice used to be materialized on the host - a download that aborts CUDA-graph capture,
+    /// and a round trip every step outside it (AiDotNet#1804: StackBackward's per-input gradient slices kept DeepAR's
+    /// training step off graph replay). Only while the device copy is the authoritative one (a host read is pending).
+    /// </summary>
+    private bool TrySliceResidentMemberOnDevice<T>(IDirectGpuBackend backend, Tensor<T> view, out OwnedBuffer result)
+    {
+        result = default;
+        if (typeof(T) != typeof(float) || !view.IsView || !view.IsContiguous || view.Length == 0) return false;
+        if (view.GetBackingArrayForCacheLookupUnsafe() is not T[] array || !Helpers.HostSync.IsPending(array)) return false;
+        if (!Helpers.ResidentHostMirror.TryFindCovering(view, array, view._storageOffset, view.Length, backend,
+                out var memberBuffer, out int start) || memberBuffer is null)
+            return false;
+        var output = AllocateFullyWrittenOutputBuffer(backend, view.Length);
+        try
+        {
+            backend.Copy(memberBuffer, start, output.Buffer, 0, view.Length);
+        }
+        catch (NotSupportedException ex)
+        {
+            output.Dispose();
+            GpuLaunchProbe.OnFallback("SliceResidentMemberOnDevice", ex);
+            return false;
+        }
+        result = output;
+        return true;
+    }
+
     /// <summary>A contiguous slice (nonzero offset) of device-only data: copy the range on the device.</summary>
     private bool TrySliceViewOnDevice<T>(IDirectGpuBackend backend, Tensor<T> view, out OwnedBuffer result)
         => TrySliceViewOnDevice(backend, view, DeviceAuthoritativeViewBase(backend, view), out result);
@@ -1698,7 +1734,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         if (view._storageOffset == 0) return false;
         if (baseBuffer is null || baseBuffer.Size < (long)view._storageOffset + view.Length) return false;
-        var output = AllocateOutputBuffer(backend, view.Length);
+        var output = AllocateFullyWrittenOutputBuffer(backend, view.Length);
         try
         {
             backend.Copy(baseBuffer, view._storageOffset, output.Buffer, 0, view.Length);
@@ -1809,6 +1845,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return permuted;
         if (TrySliceViewOnDevice(backend, tensor, out var sliced))
             return sliced;
+        if (TrySliceResidentMemberOnDevice(backend, tensor, out var memberSlice))
+            return memberSlice;
         if (!tensor.IsContiguous || tensor._storageOffset != 0)
             tensor = (Tensor<T>)tensor.Contiguous();
 
@@ -2696,7 +2734,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         var vector = tensor.DataVector;
         if (vector._deviceState is not { Buffer: { } buffer } state) return;
-        if (_actionScratchBuffers.Contains(buffer)) return;   // the per-action scratch pool owns it
+        if (StepScratchPool.IsPooled(buffer)) return;   // a step scratch pool owns it
         if (!tensor.IsContiguous || tensor._storageOffset != 0 || tensor.Length != vector.Length) return;
         if (s_staleDropTrace)
             StaleDropDiag($"RELEASE-DEAD len={tensor.Length} caller=" + new System.Diagnostics.StackTrace(1, false).ToString().Replace(System.Environment.NewLine, " <- "));
@@ -3045,6 +3083,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // evicted from the cache (no new reader can obtain them); the synchronize is a quiescence barrier
             // draining any in-flight kernel that fetched them lock-free before eviction, so freeing them now is
             // safe. Skipped under capture (sync illegal) — they persist to the next non-capturing drain.
+            if (!capturing && _retiredWeightBuffers.Count > 0 && !CacheMayFreeReleasedBuffers)
+                _retiredWeightBuffers.Clear();   // left to their finalizers (see CacheMayFreeReleasedBuffers)
             if (!capturing && _retiredWeightBuffers.Count > 0)
             {
                 backend.Synchronize();
@@ -3113,7 +3153,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private static OwnedBuffer AllocateFullyWrittenOutputBuffer(IDirectGpuBackend backend, int size)
     {
-        var eng = s_residentScratchEngine;
+        var eng = t_scratchPool?.Engine;
         if (eng is not null && eng.ScratchPoolingActive)
             return new OwnedBuffer(eng.RentActionScratchOrAllocate(backend, size, fullyWritten: true), ownsBuffer: false);
         return new OwnedBuffer(AllocateReclaiming(backend, b => AllocateDeviceBufferUninitialized(b, size)), ownsBuffer: true);
@@ -3156,10 +3196,26 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // PR #638 capture-determinism: inside a compiled action during the resident step, draw from the engine's
         // per-action static pool (stable address by (action,local) → no graph alloc node, no AUTO_FREE
         // non-determinism). ownsBuffer:false so the caller's using/Dispose is a no-op on the pooled buffer.
-        var eng = s_residentScratchEngine;
+        var eng = t_scratchPool?.Engine;
         if (eng is not null && eng.ScratchPoolingActive)
             return new OwnedBuffer(eng.RentActionScratchOrAllocate(backend, size), ownsBuffer: false);
         return new OwnedBuffer(AllocateReclaiming(backend, b => b.AllocateBuffer(size)), ownsBuffer: true);
+    }
+
+    /// <summary>
+    /// A zero-filled scratch buffer that is dead once the calling op returns: never an output, never bound to a
+    /// tensor, never read after the op. Inside a compiled step it comes from the step's transient arena, which every
+    /// action shares (see <see cref="RentTransientScratch"/>), so a CUDA-graph capture allocates nothing and the
+    /// step holds its largest action's scratch rather than the sum over all of them; elsewhere it is an owned buffer
+    /// freed when the lease is disposed.
+    /// </summary>
+    private static OwnedBuffer AllocateTransientScratch(IDirectGpuBackend backend, int size, bool fullyWritten = false)
+    {
+        var eng = t_scratchPool?.Engine;
+        if (eng is not null && eng.ScratchPoolingActive)
+            return new OwnedBuffer(eng.RentTransientScratch(backend, size, fullyWritten), ownsBuffer: false);
+        return new OwnedBuffer(AllocateReclaiming(backend,
+            b => fullyWritten ? AllocateDeviceBufferUninitialized(b, size) : b.AllocateBuffer(size)), ownsBuffer: true);
     }
 
     // Synchronously download a GPU op's output and free its buffer. Used by the array/span-based
@@ -5159,16 +5215,94 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // within that action): action i's allocs ALWAYS map to the same buffers regardless of what other actions
     // do → robust + deterministic across the pre-residency pass, the capture pass, and every replay. The pool
     // persists for the plan's life (the replayed graph bakes in these addresses). Pooling engages ONLY inside a
-    // compiled action (_currentScratchAction >= 0); the pre-pass (EnsureResidentBuffer) and the eager optimizer
+    // compiled action (the pools Action >= 0); the pre-pass (EnsureResidentBuffer) and the eager optimizer
     // run with action = -1 → normal alloc, so the cached-once persistent buffers are never pooled.
-    private readonly System.Collections.Generic.Dictionary<long, IGpuBuffer> _actionScratchPool = new();
-    // The pool's buffers by identity: a tensor wrapping one (a pooled zero gradient, a pooled reduction) does not own it,
-    // so freeing that tensor's storage early must leave the buffer to the pool, whose captured graphs bake its address.
-    private readonly System.Collections.Generic.HashSet<IGpuBuffer> _actionScratchBuffers = new();
-    private int _currentScratchAction = -1;
-    private int _currentScratchLocal;
-    // The (action, local) key of each pooled buffer, so a first-write gradient copy can name the slot it came from.
-    private readonly System.Collections.Generic.Dictionary<IGpuBuffer, long> _actionScratchKeys = new();
+    // The pool is the PLAN's (StepScratchPool), entered by the thread running its step body: one pool per engine was
+    // shared by every plan and thread on it (AiDotNet#1804, see StepScratchPool).
+    [ThreadStatic] private static StepScratchPool? t_scratchPool;
+
+    /// <summary>The scratch pool of the compiled step this thread is running on this engine, or null.</summary>
+    private StepScratchPool? CurrentScratchPool => t_scratchPool is { } pool && ReferenceEquals(pool.Engine, this) ? pool : null;
+
+    /// <summary>A new scratch pool for a compiled plan on this engine.</summary>
+    internal StepScratchPool CreateScratchPool()
+    {
+        var pool = new StepScratchPool(this);
+        lock (_scratchPools)
+        {
+            _scratchPools.RemoveAll(w => !w.TryGetTarget(out _));
+            _scratchPools.Add(new WeakReference<StepScratchPool>(pool));
+        }
+        return pool;
+    }
+
+    // Every plan's pool on this engine, for ClearActionScratchPool (called outside any step, where no pool is current).
+    private readonly System.Collections.Generic.List<WeakReference<StepScratchPool>> _scratchPools = new();
+
+    /// <summary>Makes <paramref name="pool"/> this thread's scratch pool for a step body; returns the previous one,
+    /// for <see cref="RestoreScratchPool"/> (a plan's body can run nested inside another's).</summary>
+    internal static StepScratchPool? EnterScratchPool(StepScratchPool? pool)
+    {
+        var previous = t_scratchPool;
+        t_scratchPool = pool;
+        return previous;
+    }
+
+    internal static void RestoreScratchPool(StepScratchPool? previous) => t_scratchPool = previous;
+
+    // Whole-step CUDA-graph capture assumes nothing else uses this engine's GPU while a step records: its warm-up, pre-pass
+    // and capture share the engine's device caches and stream with any other thread's work, so a second thread training
+    // on the same engine corrupted captured steps and faulted the context (CUDA 700; concurrent GPU Autoformer,
+    // AiDotNet#1804). PyTorch states the same rule for torch.cuda.graph. So capture is for an engine one thread trains
+    // on: the first compiled step's thread owns it, and once another thread steps, no plan on the engine captures again.
+    private int _compiledStepThread;
+    private volatile bool _compiledStepsFromSeveralThreads;
+    private readonly object _graphCaptureGate = new();
+
+    /// <summary>
+    /// Records that the calling thread runs a compiled training step on this engine. A thread other than the first marks
+    /// the engine shared, after waiting out any capture in progress (<see cref="EnterGraphCaptureExclusion"/>), so no capture
+    /// can be recording while that thread's GPU work starts.
+    /// </summary>
+    internal void NoteCompiledStepThread()
+    {
+        int thread = Environment.CurrentManagedThreadId;
+        int owner = System.Threading.Interlocked.CompareExchange(ref _compiledStepThread, thread, 0);
+        if (owner == 0 || owner == thread || _compiledStepsFromSeveralThreads) return;
+        lock (_graphCaptureGate) _compiledStepsFromSeveralThreads = true;
+    }
+
+    /// <summary>
+    /// Held around each compiled step on this engine. The steps share the engine's
+    /// device caches, resident bindings and stream, and one step's work against another's (a weight re-upload, a
+    /// retired buffer, an optimizer update reading a parameter another thread just rebound) faulted the context (CUDA
+    /// 700, concurrent GPU Autoformer, AiDotNet#1804). One stream runs their kernels in turn anyway, so serializing the
+    /// steps costs no device time.
+    /// </summary>
+    internal object CompiledStepLock { get; } = new();
+
+    internal bool CompiledStepsFromSeveralThreads => _compiledStepsFromSeveralThreads;
+
+    /// <summary>True when compiled steps on this engine may be captured as CUDA graphs: one thread trains on it.</summary>
+    internal bool AllowsWholeStepCapture => !_compiledStepsFromSeveralThreads;
+
+    /// <summary>Held by a plan from its capture pre-pass to the instantiated graph: another thread's first compiled step
+    /// waits for it.</summary>
+    internal IDisposable EnterGraphCaptureExclusion()
+    {
+        System.Threading.Monitor.Enter(_graphCaptureGate);
+        return new GraphCaptureExclusion(_graphCaptureGate);
+    }
+
+    private sealed class GraphCaptureExclusion : IDisposable
+    {
+        private object? _gate;
+        public GraphCaptureExclusion(object gate) => _gate = gate;
+        public void Dispose()
+        {
+            if (System.Threading.Interlocked.Exchange(ref _gate, null) is { } gate) System.Threading.Monitor.Exit(gate);
+        }
+    }
 
     /// <summary>
     /// The running compiled plan's first-write redirects (null outside its captured step body; see
@@ -5176,7 +5310,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// contribution of the step is handed that accumulator's device buffer, so the op writes the gradient in place and
     /// the first-write copy (a memcpy node per gradient per captured step) finds one buffer and issues nothing.
     /// </summary>
-    internal FirstWriteRedirectTable? FirstWriteRedirects { get; set; }
+    internal FirstWriteRedirectTable? FirstWriteRedirects
+    {
+        get => t_firstWriteRedirects;
+        set => t_firstWriteRedirects = value;
+    }
+
+    // Per thread, as the plan lends it to the step body running on this thread (like DeferredGradients).
+    [ThreadStatic] private static FirstWriteRedirectTable? t_firstWriteRedirects;
 
     /// <summary>
     /// The compiled plan's deferred gradient contributions while its GPU step body runs (see
@@ -5195,17 +5336,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal void RecordFirstWriteRedirect(IGpuBuffer contribution, IGpuBuffer accumulator, int length)
     {
         if (FirstWriteRedirects is not { } table || ReferenceEquals(contribution, accumulator)
-            || !_actionScratchKeys.TryGetValue(contribution, out long key) || accumulator.Size < length)
+            || CurrentScratchPool is not { } pool || !pool.Keys.TryGetValue(contribution, out long key) || accumulator.Size < length)
             return;
         table.Offer(key, contribution, accumulator);
     }
 
     /// <summary>Mark the compiled action whose transient scratch allocs are pooled by (action, local) for
     /// capture determinism. Call before each fwd/bwd action; pass -1 to disable (pre-pass / optimizer / eval).</summary>
-    internal void SetCurrentScratchAction(int action) { _currentScratchAction = action; _currentScratchLocal = 0; }
+    internal void SetCurrentScratchAction(int action) => CurrentScratchPool?.Begin(action);
 
-    /// <summary>True while inside a compiled action whose transient scratch should draw from the static pool.</summary>
-    private bool ScratchPoolingActive => _currentScratchAction >= 0 && ResidentStepActive;
+    /// <summary>True while inside a compiled action whose transient scratch should draw from its plan's pool, on the
+    /// thread running that step.</summary>
+    private bool ScratchPoolingActive => CurrentScratchPool is { Action: >= 0 } && ResidentStepActive;
 
     /// <summary>Pool a transient when inside a compiled action (stable buffer by (action,local)); else normal alloc.
     /// Exposed for the static AllocateOutputBuffer routing.</summary>
@@ -5214,7 +5356,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     private IGpuBuffer RentActionScratch(IDirectGpuBackend backend, int length, bool fullyWritten = false)
     {
-        long key = ((long)_currentScratchAction << 32) | (uint)_currentScratchLocal++;
+        var pool = CurrentScratchPool!;
+        long key = ((long)pool.Action << 32) | (uint)pool.Local++;
         if (FirstWriteRedirects is { } redirects && redirects.TryGetTarget(key, out var target))
         {
             if (target.Handle != System.IntPtr.Zero && target.Size >= length)
@@ -5229,7 +5372,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
             redirects.Drop(key);
         }
-        if (_actionScratchPool.TryGetValue(key, out var b) && b is not null
+        if (pool.Slots.TryGetValue(key, out var b) && b is not null
             && b.Handle != System.IntPtr.Zero && b.Size >= length)
         {
             // Re-zero on reuse to preserve the alloc-zero invariant (accumulate / partial-write ops read it).
@@ -5241,15 +5384,61 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             else backend.Fill(b, 0f, length);
             return b;
         }
-        if (b is not null) { _actionScratchBuffers.Remove(b); _actionScratchKeys.Remove(b); try { b.Dispose(); } catch { } }
+        if (b is not null)
+        {
+            // A buffer an earlier step's work is still queued against is released stream-ordered (the CUDA buffer frees
+            // with cuMemFreeAsync on the compute stream; one a captured graph uses is held until that capture's graphs
+            // end - CaptureMemoryPool). A second dispose of an already-released slot is the only failure to ignore.
+            StepScratchPool.Untrack(b);
+            pool.Keys.Remove(b);
+            try { b.Dispose(); } catch (ObjectDisposedException) { }
+        }
         var nb = backend.AllocateBuffer(length);   // first pass at this (action,local): record the stable buffer
-        _actionScratchPool[key] = nb;
-        _actionScratchBuffers.Add(nb);
-        _actionScratchKeys[nb] = key;
+        pool.Slots[key] = nb;
+        pool.Track(nb);
+        pool.Keys[nb] = key;
         return nb;
     }
 
-    /// <summary>Dispose + clear the per-action capture scratch pool. Call at the training→eval transition:
+    /// <summary>
+    /// A buffer of at least <paramref name="length"/> elements from the transient arena, zero-filled as a fresh
+    /// allocation is unless the caller's next kernel writes all of it (<paramref name="fullyWritten"/>). The size class rounds up to eight steps per power of two (at most 12.5% over), so actions
+    /// whose scratch differs slightly in size still share a buffer.
+    /// </summary>
+    private IGpuBuffer RentTransientScratch(IDirectGpuBackend backend, int length, bool fullyWritten = false)
+    {
+        // The caller gets exactly `length` elements: a slot is a size class larger, and an op that reads its buffer's
+        // Size (a download into a host vector: StridedGather, GenerateDropoutMask) would otherwise return the slack.
+        // Where views are free the slot is shared by size class and handed out as an exact-length view of itself;
+        // elsewhere the slot is keyed by the exact length.
+        bool views = backend is IGpuBufferViews { ViewsAreFreeAtAnyOffset: true };
+        long sizeClass = views ? TransientSizeClass(length) : length;
+        var pool = CurrentScratchPool!;
+        var key = (pool.TransientLocal++, sizeClass);
+        if (!pool.Transient.TryGetValue(key, out var b) || b.Handle == System.IntPtr.Zero)
+        {
+            b = backend.AllocateBuffer(checked((int)sizeClass));
+            pool.Transient[key] = b;
+            pool.Track(b);
+        }
+        else if (!fullyWritten)
+        {
+            if (backend is IDeviceZeroFill zero) zero.ZeroBuffer(b, length);
+            else backend.Fill(b, 0f, length);
+        }
+        return b.Size != length && backend is IGpuBufferViews exact && exact.TryCreateView(b, 0, length) is { } view ? view : b;
+    }
+
+    internal static long TransientSizeClass(int length)
+    {
+        if (length <= 16) return 16;
+        int shift = 0;
+        while ((length - 1L) >> shift >= 16) shift++;
+        // ((length - 1) >> shift) is in [8, 15]: round up to the next multiple of 2^shift.
+        return (((length - 1L) >> shift) + 1) << shift;
+    }
+
+    /// <summary>Dispose + clear the scratch pools of every compiled plan on this engine. Call at the training→eval transition:
     /// these pooled transient buffers are training-only (the captured graph does NOT replay during forward-only
     /// eval), and on a big model (d256/L4+) they hold GBs that the async pool reserved at the training peak.
     /// Freeing them returns that memory to the pool (then trimmable to the OS on the next alloc-OOM retry), so
@@ -5257,20 +5446,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// step will run on this plan (eval is terminal); a replay after this would read freed device memory.</summary>
     public void ClearActionScratchPool()
     {
-        foreach (var kv in _actionScratchPool)
-            { try { kv.Value?.Dispose(); } catch { } }
-        _actionScratchPool.Clear();
-        _actionScratchBuffers.Clear();
-        _actionScratchKeys.Clear();
+        StepScratchPool[] pools;
+        lock (_scratchPools)
+        {
+            pools = _scratchPools.Select(w => w.TryGetTarget(out var p) ? p : null).Where(p => p is not null).ToArray()!;
+            _scratchPools.Clear();
+        }
+        foreach (var pool in pools) pool.Release();
         FirstWriteRedirects?.Clear();   // the pooled slots it maps are gone
-        _currentScratchAction = -1;
-        _currentScratchLocal = 0;
     }
-
-    // Set during the resident step so the STATIC AllocateOutputBuffer can route transient allocs into this
-    // engine's per-action pool. Plain static (one plan captures at a time on the single GPU; resident step is
-    // single-threaded in practice). Set on EnterCompiledCapturePath, cleared when its depth returns to 0.
-    private static DirectGpuTensorEngine? s_residentScratchEngine;
 
     private IGpuBuffer GetOrCreateResidentBuffer<T>(IDirectGpuBackend backend, Tensor<T> t, int length, bool fullyWritten = false)
     {
@@ -6366,7 +6550,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             var srcData = DirectGpuEngine.ToFloatArray(source.GetDataArray());
             using var srcBuf = backend.AllocateBuffer(srcData);
-            using var dstBuf = backend.AllocateBuffer(count);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var dstBufLease = AllocateTransientScratch(backend, count);
+            var dstBuf = dstBufLease.Buffer;
             backend.StridedGather(srcBuf, dstBuf, offset, stride, count);
             var resultFloat = backend.DownloadBuffer(dstBuf);
             return new Vector<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat));
@@ -6858,6 +7044,83 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// here keeps the negate GPU-resident (no download). Returns false off the resident step → caller does CPU.</summary>
     internal bool TensorNegateIntoResident<T>(Tensor<T> output, Tensor<T> input)
         => TryUnaryResidentInto(output, input, static (be, i, o, n) => be.Negate(i, o, n), "NegateLazy");
+
+    /// <summary>
+    /// A compiled step's ReduceMax on the device: the max into the step's output buffer and the argmax as a device
+    /// tensor for the backward (relative positions along the reduced axes, with those axes normalized). The host path
+    /// read the input back on every replay, which aborts CUDA-graph capture (AiDotNet#1804). False when the device
+    /// path cannot take it.
+    /// </summary>
+    internal bool TryReduceMaxWithIndicesIntoResident<T>(Tensor<T> output, Tensor<T> input, int[] axes, bool keepDims,
+        out Tensor<int>? indices, out int[]? normalizedAxes)
+    {
+        indices = null; normalizedAxes = null;
+        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive || !input.IsContiguous || !TryGetBackend(out _))
+            return false;
+        // The device argmax kernels carry indices as floats, exact only up to 2^24: a longer reduction would send the
+        // backward's gradient to a neighbouring element, so it stays on the exact host path.
+        long span = 1;
+        foreach (int a in NormalizeResidentReductionAxes(axes, input.Rank)) span *= input._shape[a];
+        if (span > (1L << 24)) return false;
+        Tensor<T> values;
+        Tensor<int> idx;
+        using (new Autodiff.NoGradScope<T>())
+            values = ReduceMaxWithTensorIndices(input, axes, keepDims, out idx);
+        // The CPU base answered (a capability gap): let the caller's host path run instead.
+        if (values._gpuBuffer is null || idx is null || values.Length != output.Length) return false;
+        CopyResultInto(this, values, output);
+        indices = idx;
+        normalizedAxes = NormalizeResidentReductionAxes(axes, input.Rank);
+        return true;
+    }
+
+    /// <summary>
+    /// A compiled step's Narrow, sliced on the device straight into the step's output buffer. The lazy closure
+    /// otherwise ran the eager TensorNarrow, which returns a host view of the input's storage; copying that into the
+    /// output uploaded it as if it were a constant - a synchronous host-to-device copy that aborts CUDA-graph capture
+    /// and, outside capture, round-trips every slice through the host on every step (AiDotNet#1804: DeepAR's per-step
+    /// input slices kept its whole training step off graph replay). Any axis is a last-axis slice of the input viewed
+    /// as [outer, axis * inner]: one SliceLastAxis launch. False when the device path cannot take it.
+    /// </summary>
+    internal bool TensorNarrowIntoResident<T>(Tensor<T> output, Tensor<T> input, int dim, int start, int length)
+    {
+        if (Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float) || !input.IsContiguous) return false;
+        if (!TryGetBackend(out var backend) || backend is not IGpuBatchExecution layout) return false;
+        int rank = input.Rank;
+        if ((uint)dim >= (uint)rank || start < 0 || length < 0 || start > input._shape[dim] - length) return false; // start + length can overflow
+        int outer = 1; for (int k = 0; k < dim; k++) outer = checked(outer * input._shape[k]);
+        int inner = 1; for (int k = dim + 1; k < rank; k++) inner = checked(inner * input._shape[k]);
+        int axisInner = checked(input._shape[dim] * inner), sliceSize = checked(length * inner);
+        int outLength = checked(outer * sliceSize);
+        if (output.Length != outLength) return false;
+        if (outLength == 0) return true;
+        try
+        {
+            using var inBuf = GetResidentOrPersistentInputBuffer(backend, input);
+            // A slice that is one contiguous range of the input (nothing outside the narrowed axis, e.g. a time step
+            // of a time-major batch) is a view: the output borrows the input's device buffer at an offset, as a
+            // compiled reshape borrows it whole (TryAliasResidentOutput), and no kernel runs. Safe for the same
+            // reason: the step suspends eviction, so the input's buffer is live, and stable, for the whole step and
+            // every replay of its graph. Not for a buffer the lease owns (a one-off upload freed on dispose).
+            if (outer == 1 && ResidentStepActive && !inBuf.OwnsBuffer
+                && backend is IGpuBufferViews { ViewsAreFreeAtAnyOffset: true } views
+                && inBuf.Buffer.Handle != System.IntPtr.Zero && inBuf.Buffer.Size >= input.Length
+                && views.TryCreateView(inBuf.Buffer, checked(start * inner), outLength) is { } view)
+            {
+                BindResidentBuffer(output, view, backend);
+                return true;
+            }
+            var outBuf = GetOrCreateResidentBuffer(backend, output, outLength, fullyWritten: true);
+            if (inBuf.Buffer.Handle == System.IntPtr.Zero || inBuf.Buffer.Size < input.Length
+                || outBuf.Handle == System.IntPtr.Zero || outBuf.Size < outLength)
+                return false;
+            layout.SliceLastAxis(inBuf.Buffer, outBuf, outer, axisInner, checked(start * inner), sliceSize);
+            ResidentSyncCheck("NarrowLazy");
+            BindResidentBuffer(output, outBuf, backend);
+            return true;
+        }
+        catch (NotSupportedException uex) { GpuLaunchProbe.OnFallback("TensorNarrowIntoResident", uex); return false; }
+    }
 
     void IEngine.ReLUInto<T>(Tensor<T> dest, Tensor<T> input)
     {
@@ -8475,8 +8738,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 if (Helpers.HostSync.IsPending(pair.Key))
                     (kept ??= new List<KeyValuePair<object, GpuBufferCacheEntry>>()).Add(pair);
-                else
+                else if (CacheMayFreeReleasedBuffers)
                     pair.Value.Dispose();
+                // else: dropped, freed by its finalizer once unreferenced (see CacheMayFreeReleasedBuffers)
             }
             List<KeyValuePair<object, int>>? keptStamps = null;
             if (kept is not null)
@@ -8495,8 +8759,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 foreach (var stamp in keptStamps!) _persistentWeightHostVersion[stamp.Key] = stamp.Value;
             }
             // Reclaim any buffers still awaiting deferred disposal: the whole cache is being torn down, so
-            // there is no reader to race and they would otherwise leak.
-            foreach (var retired in _retiredWeightBuffers) retired.Dispose();
+            // there is no reader to race and they would otherwise leak (on a shared engine their finalizers do).
+            if (CacheMayFreeReleasedBuffers)
+                foreach (var retired in _retiredWeightBuffers) retired.Dispose();
             _retiredWeightBuffers.Clear();
         }
     }
@@ -12049,7 +12314,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             throw new InvalidOperationException("A GPU backend is required to scale an ABC compute tensor.");
         float scale = scalar is float value ? value : Convert.ToSingle(scalar);
         using var inputBuffer = GetOrAllocateBuffer(backend, tensor);
-        using var outputBuffer = AllocateOutputBuffer(backend, tensor.Length);
+        using var outputBuffer = AllocateFullyWrittenOutputBuffer(backend, tensor.Length);
         backend.Scale(inputBuffer.Buffer, outputBuffer.Buffer, scale, tensor.Length);
         var result = DeferTensorResult<T>(backend, outputBuffer.Buffer, tensor.Length, tensor.Shape.ToArray());
         outputBuffer.RelinquishOwnership();
@@ -12779,14 +13044,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             || backend is not IDirectPtxBackend directCuda)
             return false;
 
-        if (!directCuda.IsDirectPtxAttentionEnabled
+        // FP16 attention by default wherever the caller already chose FP16 - an FP16 autocast scope or FP16-resident
+        // activations - like PyTorch; plain FP32 attention stays exact unless the direct-PTX attention opt-in is set.
+        bool reducedPrecision = (Gpu.AutocastScope.IsEnabled && Gpu.AutocastScope.ActivePrecision == Gpu.PrecisionMode.Float16)
+            || TryFp16ResidentInput(query, out _) is not null;
+        if (!(directCuda.IsDirectPtxAttentionEnabled || reducedPrecision)
             // Module JIT and the eager scratch allocations below are not
             // stream-capture safe. Captured graphs keep the established
             // resident NVRTC path until a PTX prewarm/capture API is added.
             || (directCuda is IGpuGraphCapture capturing && capturing.IsStreamCapturing())
-            || !PtxOnlineFusedAttention128x64Kernel.IsSupportedSequenceLength(seqQ)
-            || !PtxOnlineFusedAttention128x64Kernel.IsSupportedSequenceLength(seqK)
-            || headDim != PtxOnlineFusedAttention128x64Kernel.HeadDimension
+            || (headDim != PtxOnlineFusedAttention128x64Kernel.HeadDimension && headDim != 128)
             || key.Shape._dims[0] != batch || value.Shape._dims[0] != batch
             || key.Shape._dims[1] != heads || value.Shape._dims[1] != heads
             || key.Shape._dims[3] != headDim || value.Shape._dims[2] != seqK
@@ -12812,10 +13079,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 key, keyValueElements, directCuda, backend, out keyHalfOwned);
             IGpuBuffer valueHalf = ResolveToFp16(
                 value, keyValueElements, directCuda, backend, out valueHalfOwned);
-            if (!directCuda.TryDirectPtxOnlineAttentionFamily(
-                queryHalf, keyHalf, valueHalf,
-                directOutput.Buffer, directStats.Buffer,
-                batch, heads, heads, seqQ, seqK, scale, isCausal))
+            // The online kernel for its validated short shapes (S <= 128, D = 64); the flash kernel for every other
+            // length and for D = 128 (#1549).
+            bool online = directCuda.IsDirectPtxAttentionEnabled
+                && headDim == PtxOnlineFusedAttention128x64Kernel.HeadDimension
+                && PtxOnlineFusedAttention128x64Kernel.IsSupportedSequenceLength(seqQ)
+                && PtxOnlineFusedAttention128x64Kernel.IsSupportedSequenceLength(seqK);
+            bool launched = online
+                ? directCuda.TryDirectPtxOnlineAttentionFamily(
+                    queryHalf, keyHalf, valueHalf,
+                    directOutput.Buffer, directStats.Buffer,
+                    batch, heads, heads, seqQ, seqK, scale, isCausal)
+                : directCuda.TryDirectPtxFlashAttention(
+                    queryHalf, keyHalf, valueHalf,
+                    directOutput.Buffer, directStats.Buffer,
+                    batch, heads, heads, seqQ, seqK, headDim, scale, isCausal,
+                    causalQueryOffset: 0, reducedPrecisionRequested: reducedPrecision);
+            if (!launched)
             {
                 AliasDiag($"FlashAttention direct-PTX FELLBACK: {directCuda.DirectPtxLastError ?? "specialization unavailable"}");
                 return false;
@@ -14243,7 +14523,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             using var magnitudeBuffer = GetOrAllocateBuffer(backend, framesMajor);
             using var filterbankBuffer = GetOrAllocateBuffer(backend, filterbank);
-            using var powerBuffer = AllocateOutputBuffer(backend, magnitude.Length);
+            using var powerBuffer = AllocateFullyWrittenOutputBuffer(backend, magnitude.Length);
             using var melBuffer = AllocateOutputBuffer(backend, batch * numFrames * nMels);
             backend.Multiply(magnitudeBuffer.Buffer, magnitudeBuffer.Buffer, powerBuffer.Buffer, magnitude.Length);
             backend.ApplyMelFilterbank(powerBuffer.Buffer, filterbankBuffer.Buffer, melBuffer.Buffer,
@@ -16942,7 +17222,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
             else
             {
-                using var transposedBuffer = backend.AllocateBuffer(outerSize * innerSize);
+                // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                using var transposedBufferLease = AllocateTransientScratch(backend, outerSize * innerSize);
+                var transposedBuffer = transposedBufferLease.Buffer;
                 backend.Transpose(input.Buffer, transposedBuffer, outerSize, innerSize);
                 backend.SumAxis(transposedBuffer, outputBuffer, innerSize, outerSize);
             }
@@ -17165,7 +17447,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (!philoxFused)
                 {
                     float scale = 1.0f / (1.0f - (float)dropoutRate);
-                    using var temporary = backend.AllocateBuffer(input.Length);
+                    // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                    using var temporaryLease = AllocateTransientScratch(backend, input.Length);
+                    var temporary = temporaryLease.Buffer;
                     backend.Dropout(inputBuffer.Buffer, temporary, maskBuffer, input.Length,
                         (float)dropoutRate, seed, true);
 
@@ -18904,10 +19188,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             return null;
 
-        // GetOrAllocateBuffer and every TileAxis expansion below may allocate synchronously. CUDA
-        // forbids those allocations after cuStreamBeginCapture (CUDA 906), so decline the composed
-        // path before touching either input and let the established caller fallback own the case.
-        if (backend is IGpuGraphCapture cuda && cuda.IsStreamCapturing())
+        // Inside a compiled step the expansions below draw from the per-action scratch pool, so a CUDA-graph
+        // capture allocates nothing. Outside it, a capture would see a synchronous allocation (CUDA 906): decline
+        // then, before touching either input. Declining during a compiled capture sent the op to the CPU base,
+        // whose download aborted the capture for every model with a two-sided broadcast (AiDotNet#1804).
+        if (backend is IGpuGraphCapture cuda && cuda.IsStreamCapturing() && !ScratchPoolingActive)
             return null;
 
         if (!CanBroadcast(a.Shape._dims, b.Shape._dims))
@@ -18939,7 +19224,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         using var inputA = GetOrAllocateBuffer(backend, a);
         using var inputB = GetOrAllocateBuffer(backend, b);
-        var temporaries = new List<IGpuBuffer>();
+        var temporaries = new List<OwnedBuffer>();
 
         try
         {
@@ -18961,8 +19246,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
                     int repeats = outputShape[axis];
                     int expandedLength = checked(currentLength * repeats);
-                    IGpuBuffer expanded = backend.AllocateBuffer(expandedLength);
-                    temporaries.Add(expanded);
+                    var expandedLease = AllocateFullyWrittenOutputBuffer(backend, expandedLength);
+                    temporaries.Add(expandedLease);
+                    IGpuBuffer expanded = expandedLease.Buffer;
                     backend.TileAxis(current, expanded, outerSize, 1, innerSize, repeats);
                     current = expanded;
                     currentShape[axis] = repeats;
@@ -19051,12 +19337,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
                 using var bufferA = GetOrAllocateBuffer(backend, a);
                 using var bufferB = GetOrAllocateBuffer(backend, b);
-                using var ones = backend.AllocateBuffer(innerSize);
-                using var expandedB = backend.AllocateBuffer(a.Length);
-                backend.Fill(ones, 1f, innerSize);
-                backend.OuterProduct(bufferB.Buffer, ones, expandedB, outerSize, innerSize);
+                // One first-axis broadcast kernel, not a ones vector, an outer product and a multiply.
+                var firstAxis = backend as IGpuBatchExecution ?? throw new NotSupportedException("first-axis broadcast");
                 return RecordGpuResult(DispatchDeferredGpuOp<T>(backend, a.Length, a.Shape.ToArray(), output =>
-                    backend.Multiply(bufferA.Buffer, expandedB, output, a.Length)));
+                    firstAxis.BroadcastMulFirst(bufferB.Buffer, bufferA.Buffer, output, outerSize, innerSize), fullyWritten: true));
             }
 
             // Pattern 3: (batch, seq, features) * (1, 1, features) -> common in attention/normalization
@@ -19092,12 +19376,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 int outerSize = b.Shape._dims[0], innerSize = b.Shape._dims[1];
                 using var bufferA = GetOrAllocateBuffer(backend, a);
                 using var bufferB = GetOrAllocateBuffer(backend, b);
-                using var ones = backend.AllocateBuffer(innerSize);
-                using var expandedA = backend.AllocateBuffer(b.Length);
-                backend.Fill(ones, 1f, innerSize);
-                backend.OuterProduct(bufferA.Buffer, ones, expandedA, outerSize, innerSize);
+                var firstAxis = backend as IGpuBatchExecution ?? throw new NotSupportedException("first-axis broadcast");
                 return RecordGpuResult(DispatchDeferredGpuOp<T>(backend, b.Length, b.Shape.ToArray(), output =>
-                    backend.Multiply(expandedA, bufferB.Buffer, output, b.Length)));
+                    firstAxis.BroadcastMulFirst(bufferA.Buffer, bufferB.Buffer, output, outerSize, innerSize), fullyWritten: true));
             }
 
             // Rank-generic path: expand only the stretched axes with backend.TileAxis, then multiply.
@@ -19466,7 +19747,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int size = input.Length;
         var outputBuffer = backend.AllocateBuffer(size);
 
-        using var scalarBuffer = backend.AllocateBuffer(size);
+        // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+        using var scalarBufferLease = AllocateTransientScratch(backend, size);
+        var scalarBuffer = scalarBufferLease.Buffer;
         backend.Fill(scalarBuffer, scalar, size);
 
         backend.GreaterThan(input.Buffer, scalarBuffer, outputBuffer, size);
@@ -20605,7 +20888,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             float alphaFloat = ToFloatScalar(alpha);
             using var bufferA = GetOrAllocateBuffer(backend, tensor);
-            using var bufferB = AllocateOutputBuffer(backend, tensor.Length);
+            using var bufferB = AllocateFullyWrittenOutputBuffer(backend, tensor.Length);
             backend.LeakyRelu(bufferA.Buffer, bufferB.Buffer, alphaFloat, tensor.Length);
             var gpuOutput = DeferTensorResult<T>(backend, bufferB.Buffer, tensor.Length, tensor.Shape._dims);
             bufferB.RelinquishOwnership();
@@ -21582,7 +21865,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 int size = gradOutput.Length;
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var iBuf = GetOrAllocateBuffer(backend, input);
-                var oBuf = AllocateOutputBuffer(backend, size);
+                var oBuf = AllocateFullyWrittenOutputBuffer(backend, size);
                 try
                 {
                     backend.ReluBackward(gBuf.Buffer, iBuf.Buffer, oBuf.Buffer, size);
@@ -21604,7 +21887,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 int size = gradOutput.Length;
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var oBuf = GetOrAllocateBuffer(backend, output);
-                var rBuf = AllocateOutputBuffer(backend, size);
+                var rBuf = AllocateFullyWrittenOutputBuffer(backend, size);
                 try
                 {
                     backend.SigmoidBackward(gBuf.Buffer, oBuf.Buffer, rBuf.Buffer, size);
@@ -21626,7 +21909,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 int size = gradOutput.Length;
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var oBuf = GetOrAllocateBuffer(backend, output);
-                var rBuf = AllocateOutputBuffer(backend, size);
+                var rBuf = AllocateFullyWrittenOutputBuffer(backend, size);
                 try
                 {
                     backend.TanhBackward(gBuf.Buffer, oBuf.Buffer, rBuf.Buffer, size);
@@ -21675,7 +21958,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var iBuf = GetOrAllocateBuffer(backend, input);
-                var oBuf = AllocateOutputBuffer(backend, gradOutput.Length);
+                var oBuf = AllocateFullyWrittenOutputBuffer(backend, gradOutput.Length);
                 try
                 {
                     backend.GeluBackward(gBuf.Buffer, iBuf.Buffer, oBuf.Buffer, gradOutput.Length);
@@ -21696,7 +21979,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var iBuf = GetOrAllocateBuffer(backend, input);
-                var oBuf = AllocateOutputBuffer(backend, gradOutput.Length);
+                var oBuf = AllocateFullyWrittenOutputBuffer(backend, gradOutput.Length);
                 try
                 {
                     backend.LeakyReluBackward(gBuf.Buffer, iBuf.Buffer, oBuf.Buffer, (float)negativeSlope, gradOutput.Length);
@@ -21717,7 +22000,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var iBuf = GetOrAllocateBuffer(backend, input);
-                var oBuf = AllocateOutputBuffer(backend, gradOutput.Length);
+                var oBuf = AllocateFullyWrittenOutputBuffer(backend, gradOutput.Length);
                 try
                 {
                     backend.SwishBackward(gBuf.Buffer, iBuf.Buffer, oBuf.Buffer, gradOutput.Length);
@@ -21738,7 +22021,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var iBuf = GetOrAllocateBuffer(backend, input);
-                var oBuf = AllocateOutputBuffer(backend, gradOutput.Length);
+                var oBuf = AllocateFullyWrittenOutputBuffer(backend, gradOutput.Length);
                 try
                 {
                     backend.MishBackward(gBuf.Buffer, iBuf.Buffer, oBuf.Buffer, gradOutput.Length);
@@ -21759,7 +22042,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var iBuf = GetOrAllocateBuffer(backend, input);
-                var oBuf = AllocateOutputBuffer(backend, gradOutput.Length);
+                var oBuf = AllocateFullyWrittenOutputBuffer(backend, gradOutput.Length);
                 try
                 {
                     backend.SoftplusBackward(gBuf.Buffer, iBuf.Buffer, oBuf.Buffer, gradOutput.Length);
@@ -21780,7 +22063,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var iBuf = GetOrAllocateBuffer(backend, input);
-                var oBuf = AllocateOutputBuffer(backend, gradOutput.Length);
+                var oBuf = AllocateFullyWrittenOutputBuffer(backend, gradOutput.Length);
                 try
                 {
                     backend.HardswishBackward(gBuf.Buffer, iBuf.Buffer, oBuf.Buffer, gradOutput.Length);
@@ -21808,7 +22091,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int size = gradOutput.Length;
             using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
             using var iBuf = GetOrAllocateBuffer(backend, input);
-            var outBuf = AllocateOutputBuffer(backend, size);
+            var outBuf = AllocateFullyWrittenOutputBuffer(backend, size);
             try
             {
                 backend.SeluBackward(gBuf.Buffer, iBuf.Buffer, outBuf.Buffer, 1.6732632423543772f, 1.0507009873554805f, size);
@@ -21830,7 +22113,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var iBuf = GetOrAllocateBuffer(backend, input);
-                var oBuf = AllocateOutputBuffer(backend, gradOutput.Length);
+                var oBuf = AllocateFullyWrittenOutputBuffer(backend, gradOutput.Length);
                 try
                 {
                     backend.HardsigmoidBackward(gBuf.Buffer, iBuf.Buffer, oBuf.Buffer, gradOutput.Length);
@@ -21851,7 +22134,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var iBuf = GetOrAllocateBuffer(backend, input);
-                var oBuf = AllocateOutputBuffer(backend, gradOutput.Length);
+                var oBuf = AllocateFullyWrittenOutputBuffer(backend, gradOutput.Length);
                 try
                 {
                     backend.Relu6Backward(gBuf.Buffer, iBuf.Buffer, oBuf.Buffer, gradOutput.Length);
@@ -21872,7 +22155,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var iBuf = GetOrAllocateBuffer(backend, input);
-                var oBuf = AllocateOutputBuffer(backend, gradOutput.Length);
+                var oBuf = AllocateFullyWrittenOutputBuffer(backend, gradOutput.Length);
                 try
                 {
                     backend.ThresholdBackward(gBuf.Buffer, iBuf.Buffer, oBuf.Buffer, (float)threshold, gradOutput.Length);
@@ -21899,7 +22182,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int size = gradOutput.Length;
             using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
             using var oBuf = GetOrAllocateBuffer(backend, output);
-            var outBuf = AllocateOutputBuffer(backend, size);
+            var outBuf = AllocateFullyWrittenOutputBuffer(backend, size);
             try
             {
                 backend.ReciprocalBackward(gBuf.Buffer, oBuf.Buffer, outBuf.Buffer, size);
@@ -22536,7 +22819,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             float minF = ToFloatScalar(min);
             float maxF = ToFloatScalar(max);
             using var bufferA = GetOrAllocateBuffer(backend, tensor);
-            var bufferOut = AllocateOutputBuffer(backend, tensor.Length);
+            var bufferOut = AllocateFullyWrittenOutputBuffer(backend, tensor.Length);
             backend.Clamp(bufferA.Buffer, bufferOut.Buffer, minF, maxF, tensor.Length);
             var result = DeferTensorResult<T>(backend, bufferOut.Buffer, tensor.Length, tensor.Shape.ToArray());
             var numOps = MathHelper.GetNumericOperations<T>();
@@ -22565,7 +22848,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var condBuf = GetOrAllocateBuffer(backend, condition);
             using var xBuf = GetOrAllocateBuffer(backend, x);
             using var yBuf = GetOrAllocateBuffer(backend, y);
-            var outBuf = AllocateOutputBuffer(backend, x.Length);
+            var outBuf = AllocateFullyWrittenOutputBuffer(backend, x.Length);
             backend.Where(condBuf.Buffer, xBuf.Buffer, yBuf.Buffer, outBuf.Buffer, x.Length);
             var output = DeferTensorResult<T>(backend, outBuf.Buffer, x.Length, x.Shape.ToArray());
             Autodiff.DifferentiableOps.RecordBinary("Where", output, x, y, Autodiff.BackwardFunctions<T>.WhereBackward,
@@ -24258,7 +24541,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int size = logits.Length;
             using var bufL = GetOrAllocateBuffer(backend, logits);
             using var bufT = GetOrAllocateBuffer(backend, targets);
-            using var bufOut = AllocateOutputBuffer(backend, size);
+            using var bufOut = AllocateFullyWrittenOutputBuffer(backend, size);
             backend.BceWithLogitsLoss(bufL.Buffer, bufT.Buffer, bufOut.Buffer, size);
             return ScalarMeanResult<T>(backend, bufOut, size);
         }
@@ -24363,7 +24646,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             using var bufI = GetOrAllocateBuffer(backend, input);
             using var bufT = GetOrAllocateBuffer(backend, target);
-            using var bufOut = AllocateOutputBuffer(backend, input.Length);
+            using var bufOut = AllocateFullyWrittenOutputBuffer(backend, input.Length);
             backend.KlDivLoss(bufI.Buffer, bufT.Buffer, bufOut.Buffer, input.Length);
             return ScalarMeanResult<T>(backend, bufOut, input.Length);
         }
@@ -24668,7 +24951,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             float threshF = ToFloatScalar(threshold);
             float valueF = ToFloatScalar(value);
             using var bufIn = GetOrAllocateBuffer(backend, tensor);
-            var bufOut = AllocateOutputBuffer(backend, tensor.Length);
+            var bufOut = AllocateFullyWrittenOutputBuffer(backend, tensor.Length);
             backend.Threshold(bufIn.Buffer, bufOut.Buffer, threshF, valueF, tensor.Length);
             var output = DeferTensorResult<T>(backend, bufOut.Buffer, tensor.Length, tensor.Shape.ToArray());
             // Saved state MUST be a boxed double, matching what CpuEngine records and what
@@ -24750,7 +25033,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int outC = input.Shape._dims[1] / (kH * kW);
             int totalOut = batch * outC * outH * outW;
             using var bufIn = GetOrAllocateBuffer(backend, input);
-            var bufOut = AllocateOutputBuffer(backend, totalOut);
+            var bufOut = AllocateFullyWrittenOutputBuffer(backend, totalOut);
             backend.Fill(bufOut.Buffer, 0f, totalOut);
             backend.Fold(bufIn.Buffer, bufOut.Buffer, batch, outC, outH, outW, kH, kW, sH, sW, pH, pW);
             var foldResult = DeferTensorResult<T>(backend, bufOut.Buffer, totalOut,
@@ -24906,7 +25189,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var iBuf = GetOrAllocateBuffer(backend, input);
                 using var oBuf = GetOrAllocateBuffer(backend, output);
-                var rBuf = AllocateOutputBuffer(backend, gradOutput.Length);
+                var rBuf = AllocateFullyWrittenOutputBuffer(backend, gradOutput.Length);
                 try
                 {
                     backend.EluBackward(gBuf.Buffer, iBuf.Buffer, oBuf.Buffer, rBuf.Buffer, (float)alpha, gradOutput.Length);
@@ -25212,7 +25495,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             float alphaFloat = ToFloatScalar(alpha);
             using var bufferA = GetOrAllocateBuffer(backend, tensor);
-            var bufferB = AllocateOutputBuffer(backend, tensor.Length);
+            var bufferB = AllocateFullyWrittenOutputBuffer(backend, tensor.Length);
             backend.LeakyRelu(bufferA.Buffer, bufferB.Buffer, alphaFloat, tensor.Length);
             var gpuOutput = DeferTensorResult<T>(backend, bufferB.Buffer, tensor.Length, tensor.Shape.ToArray());
             Autodiff.DifferentiableOps.RecordUnary("LeakyReLU", gpuOutput, tensor,
@@ -25411,12 +25694,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 int outerSize = a.Shape._dims[0], innerSize = a.Shape._dims[1];
                 using var bufA = GetOrAllocateBuffer(backend, a);
                 using var bufB = GetOrAllocateBuffer(backend, b);
-                using var ones = backend.AllocateBuffer(innerSize);
-                using var expandedB = AllocateOutputBuffer(backend, a.Length);
-                backend.Fill(ones, 1f, innerSize);
-                backend.OuterProduct(bufB.Buffer, ones, expandedB.Buffer, outerSize, innerSize);
+                // One first-axis broadcast kernel. Expanding the column through a ones vector and an outer product
+                // cost two memsets, a fill, a GEMM and the add: five graph nodes per bias add (an LSTM's per step).
+                var firstAxis = backend as IGpuBatchExecution ?? throw new NotSupportedException("first-axis broadcast");
                 return RecordGpuResult(DispatchDeferredGpuOp<T>(backend, a.Length, a.Shape.ToArray(), output =>
-                    backend.Add(bufA.Buffer, expandedB.Buffer, output, a.Length)));
+                    firstAxis.BroadcastAddFirst(bufB.Buffer, bufA.Buffer, output, outerSize, innerSize), fullyWritten: true));
             }
             catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorBroadcastAdd", capabilityGap); }
         }
@@ -25481,12 +25763,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 int outerSize = a.Shape._dims[0], innerSize = a.Shape._dims[1];
                 using var bufA = GetOrAllocateBuffer(backend, a);
                 using var bufB = GetOrAllocateBuffer(backend, b);
-                using var ones = backend.AllocateBuffer(innerSize);
-                using var expandedB = AllocateOutputBuffer(backend, a.Length);
-                backend.Fill(ones, 1f, innerSize);
-                backend.OuterProduct(bufB.Buffer, ones, expandedB.Buffer, outerSize, innerSize);
+                // a - b as a + (-b): negation is exact, so this is the same IEEE result, in two kernels rather than
+                // a ones fill, an outer product, two memsets and the subtract.
+                // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                using var negatedB = AllocateTransientScratch(backend, outerSize, fullyWritten: true);
+                backend.Negate(bufB.Buffer, negatedB.Buffer, outerSize);
+                var firstAxis = backend as IGpuBatchExecution ?? throw new NotSupportedException("first-axis broadcast");
                 return RecordGpuResult(DispatchDeferredGpuOp<T>(backend, a.Length, a.Shape.ToArray(), output =>
-                    backend.Subtract(bufA.Buffer, expandedB.Buffer, output, a.Length)));
+                    firstAxis.BroadcastAddFirst(negatedB.Buffer, bufA.Buffer, output, outerSize, innerSize), fullyWritten: true));
             }
             catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorBroadcastSubtract", capabilityGap); }
         }
@@ -25551,12 +25835,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 int outerSize = a.Shape._dims[0], innerSize = a.Shape._dims[1];
                 using var bufA = GetOrAllocateBuffer(backend, a);
                 using var bufB = GetOrAllocateBuffer(backend, b);
-                using var ones = backend.AllocateBuffer(innerSize);
-                using var expandedB = AllocateOutputBuffer(backend, a.Length);
-                backend.Fill(ones, 1f, innerSize);
+                // A true division (a * (1 / b) rounds differently), but no per-call ones fill or zeroing: the ones
+                // vector is the engine's cached one and the outer product writes the whole expansion.
+                var ones = GetCachedOnesBuffer(backend, innerSize);
+                if (ones is null) return base.TensorBroadcastDivide(a, b);
+                // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                using var expandedB = AllocateTransientScratch(backend, a.Length, fullyWritten: true);
                 backend.OuterProduct(bufB.Buffer, ones, expandedB.Buffer, outerSize, innerSize);
                 return RecordGpuResult(DispatchDeferredGpuOp<T>(backend, a.Length, a.Shape.ToArray(), output =>
-                    backend.Divide(bufA.Buffer, expandedB.Buffer, output, a.Length)));
+                    backend.Divide(bufA.Buffer, expandedB.Buffer, output, a.Length), fullyWritten: true));
             }
             catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorBroadcastDivide", capabilityGap); }
         }
@@ -25740,7 +26027,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 bool handedOff = false;
                 try
                 {
-                    using var denominator = backend.AllocateBuffer(tensor.Length);
+                    // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                    using var denominatorLease = AllocateTransientScratch(backend, tensor.Length);
+                    var denominator = denominatorLease.Buffer;
                     backend.Fill(denominator, Convert.ToSingle(scalar), tensor.Length);
                     backend.Divide(input.Buffer, denominator, output.Buffer, tensor.Length);
                     handedOff = true;
@@ -25982,7 +26271,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var condBuf = new OwnedBuffer(backend.AllocateBuffer(predicate), ownsBuffer: true);
             using var xBuf = GetOrAllocateBuffer(backend, x);
             using var yBuf = GetOrAllocateBuffer(backend, y);
-            var outBuf = AllocateOutputBuffer(backend, x.Length);
+            var outBuf = AllocateFullyWrittenOutputBuffer(backend, x.Length);
             backend.Where(condBuf.Buffer, xBuf.Buffer, yBuf.Buffer, outBuf.Buffer, x.Length);
             var output = DeferTensorResult<T>(backend, outBuf.Buffer, x.Length, x.Shape.ToArray());
 
@@ -26060,7 +26349,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 using var xBuf = GetOrAllocateBuffer(backend, x);
                 using var yBuf = GetOrAllocateBuffer(backend, y);
-                var outBuf = AllocateOutputBuffer(backend, x.Length);
+                var outBuf = AllocateFullyWrittenOutputBuffer(backend, x.Length);
                 backend.Where(condBuf.Buffer, xBuf.Buffer, yBuf.Buffer, outBuf.Buffer, x.Length);
                 var output = DeferTensorResult<T>(backend, outBuf.Buffer, x.Length, x.Shape.ToArray());
                 // Same byte[] 0/1 encoding CpuEngine records. WhereBackward accepts Tensor<T> or byte[];
@@ -26579,7 +26868,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 var source = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
                 using var input = GetOrAllocateBuffer(backend, source);
-                using var squares = backend.AllocateBuffer(tensor.Length);
+                // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                using var squaresLease = AllocateTransientScratch(backend, tensor.Length);
+                var squares = squaresLease.Buffer;
                 backend.Multiply(input.Buffer, input.Buffer, squares, tensor.Length);
                 return (T)(object)backend.Sum(squares, tensor.Length);
             }
@@ -26664,7 +26955,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     ordinals[i] = i;
 
                 using var ordinalBuffer = backend.AllocateBuffer(ordinals);
-                using var scaled = backend.AllocateBuffer(count);
+                // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                using var scaledLease = AllocateTransientScratch(backend, count);
+                var scaled = scaledLease.Buffer;
                 return DispatchDeferredGpuOp<T>(backend, count, new[] { count }, output =>
                 {
                     // Separate kernels intentionally preserve the CPU's multiply-then-add rounding.
@@ -26963,8 +27256,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     bool handedOff = false;
                     try
                     {
-                        using var squared = backend.AllocateBuffer(tensor.Length);
-                        using var sums = backend.AllocateBuffer(outerSize);
+                        // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                        using var squaredLease = AllocateTransientScratch(backend, tensor.Length);
+                        var squared = squaredLease.Buffer;
+                        // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                        using var sumsLease = AllocateTransientScratch(backend, outerSize);
+                        var sums = sumsLease.Buffer;
                         backend.Multiply(input.Buffer, input.Buffer, squared, tensor.Length);
                         backend.SumAxis(squared, sums, outerSize, reduceSize);
                         backend.Sqrt(sums, output.Buffer, outerSize);
@@ -27329,6 +27626,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> ReduceMax<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
         var safeAxes = axes ?? Array.Empty<int>();
+        // Recording a compiled plan: the base ReduceMax records a graph node (its backward scatters into the argmax
+        // positions on the device). The index-returning variant below is not graph-capturable and threw, which
+        // rejected the WHOLE fused step for any model that took a max under compiled GPU training - a stabilized
+        // softmax, a log-sum-exp, Autoformer's lag selection - and dropped it onto the eager tape with a host
+        // optimizer (AiDotNet#1804: Autoformer trained 5.5x slower than PyTorch on the GPU for this reason).
+        if (Compilation.GraphMode.IsActive)
+            return base.ReduceMax(input, safeAxes, keepDims);
         if (IsTapeActive<T>())
             return ReduceMaxWithTensorIndices(input, safeAxes, keepDims, out _);
         if (!TryGetBackend(out var backend))
@@ -27681,7 +27985,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         uint rngSeed = seed.HasValue
                             ? unchecked((uint)seed.GetValueOrDefault())
                             : unchecked((uint)System.Threading.Interlocked.Increment(ref _gpuRngSeed));
-                        using var output = backend.AllocateBuffer(length);
+                        // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                        using var outputLease = AllocateTransientScratch(backend, length);
+                        var output = outputLease.Buffer;
                         backend.GenerateStatelessDropoutMask(
                             output, length, (uint)threshold64, outputScale, rngSeed);
                         return new Vector<T>((T[])(object)backend.DownloadBuffer(output));
@@ -28001,7 +28307,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 var indexData = indices.GetFlattenedData();
                 int elementCount = checked(indices.Length * depth);
-                using var one = backend.AllocateBuffer(1);
+                // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                using var oneLease = AllocateTransientScratch(backend, 1);
+                var one = oneLease.Buffer;
                 backend.Fill(one, 1f, 1);
                 return DispatchDeferredGpuOp<T>(backend, elementCount,
                     new[] { indices.Length, depth }, output =>
@@ -28033,7 +28341,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 using var input = GetOrAllocateBuffer(backend, tensor);
-                using var expected = backend.AllocateBuffer(tensor.Length);
+                // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                using var expectedLease = AllocateTransientScratch(backend, tensor.Length);
+                var expected = expectedLease.Buffer;
                 backend.Fill(expected, Convert.ToSingle(value), tensor.Length);
                 var output = AllocateOutputBuffer(backend, tensor.Length);
                 bool handedOff = false;
@@ -28145,7 +28455,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 using var input = GetOrAllocateBuffer(backend, tensor);
-                using var scalar = backend.AllocateBuffer(tensor.Length);
+                // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                using var scalarLease = AllocateTransientScratch(backend, tensor.Length);
+                var scalar = scalarLease.Buffer;
                 backend.Fill(scalar, Convert.ToSingle(value), tensor.Length);
                 var output = backend.AllocateBuffer(tensor.Length);
                 backend.GreaterThan(input.Buffer, scalar, output, tensor.Length);
@@ -28182,7 +28494,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 using var input = GetOrAllocateBuffer(backend, tensor);
-                using var scalar = backend.AllocateBuffer(tensor.Length);
+                // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                using var scalarLease = AllocateTransientScratch(backend, tensor.Length);
+                var scalar = scalarLease.Buffer;
                 backend.Fill(scalar, Convert.ToSingle(value), tensor.Length);
                 var output = backend.AllocateBuffer(tensor.Length);
                 backend.LessThan(input.Buffer, scalar, output, tensor.Length);
@@ -28338,7 +28652,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 var inputBuffer = UploadTensorRaw(backend, input);
-                using var unitGradient = backend.AllocateBuffer(input.Length);
+                // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                using var unitGradientLease = AllocateTransientScratch(backend, input.Length);
+                var unitGradient = unitGradientLease.Buffer;
                 backend.Fill(unitGradient, 1f, input.Length);
                 var output = backend.AllocateBuffer(input.Length);
                 try
@@ -28366,7 +28682,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 int elementCount = checked(size * size);
-                using var ones = backend.AllocateBuffer(size);
+                // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                using var onesLease = AllocateTransientScratch(backend, size);
+                var ones = onesLease.Buffer;
                 backend.Fill(ones, 1f, size);
                 return DispatchDeferredGpuOp<T>(backend, elementCount, new[] { size, size }, output =>
                 {
@@ -28712,7 +29030,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (TryGetBackend(out var backend))
             {
                 using var src = GetOrAllocateBuffer(backend, tensor);
-                var dst = AllocateOutputBuffer(backend, tensor.Length);
+                var dst = AllocateFullyWrittenOutputBuffer(backend, tensor.Length);
                 try
                 {
                     backend.CopyBuffer(src.Buffer, dst.Buffer, tensor.Length);
@@ -30730,7 +31048,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int numBands = gammaBands.Length;
 
             using var inputBuffer = GetOrAllocateBuffer(backend, waveforms);
-            using var paddedReal = AllocateOutputBuffer(backend, paddedLength);
+            using var paddedReal = AllocateFullyWrittenOutputBuffer(backend, paddedLength);
             using var paddedImaginary = AllocateOutputBuffer(backend, paddedLength);
             backend.Fill(paddedReal.Buffer, 0f, paddedLength);
             backend.Fill(paddedImaginary.Buffer, 0f, paddedLength);

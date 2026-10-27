@@ -45,6 +45,8 @@ public static partial class BlasManaged
     /// here and stay on the fast path).
     /// </summary>
     internal const long MachineKernelMinWork = 4_000_000;
+    private const int DenseTransAMinDimension = 512;
+
 
     // #653 machine-code GEBP investigation: force the machine-code kernel ON even for shapes the
     // PrefersStrategyOverMachineKernel gate would route to the managed strategy, so the two paths
@@ -963,7 +965,14 @@ public static partial class BlasManaged
         int gateProcs = System.Environment.ProcessorCount;
         if (m >= mr && n >= nr && (m % mr != 0 || n % nr != 0))
         {
-            if (splitMAligned < gateProcs * mr && options.PackingMode == PackingMode.Auto)
+            // Dense transposed-A products amortize packing even when the aligned rows cannot
+            // occupy every logical CPU. On 128-thread AVX2, 512x2048x3072 took ~643 ms
+            // streaming versus ~22 ms packed; 512x1024x512 also favored packing. Keep the
+            // small-shape gate, and keep this decision independent of the requested thread count.
+            bool denseTransA = typeof(T) == typeof(float) && mr == 6 && transA && !transB
+                && options.ParallelismAxis != ParallelismAxis.N
+                && m >= DenseTransAMinDimension && n >= DenseTransAMinDimension && k >= DenseTransAMinDimension;
+            if (splitMAligned < gateProcs * mr && options.PackingMode == PackingMode.Auto && !denseTransA)
             {
                 // Auto + too few aligned mr-blocks for the packed kernel to beat all-Streaming,
                 // and a tail IS present — route the WHOLE shape to Streaming, which handles the

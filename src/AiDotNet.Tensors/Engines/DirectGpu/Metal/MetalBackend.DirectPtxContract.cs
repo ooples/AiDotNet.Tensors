@@ -24,6 +24,9 @@ public sealed partial class MetalBackend : IDirectPtxBackend
     bool IDirectPtxBackend.TryDirectPtxOnlineAttentionFamily(IGpuBuffer queryHalf, IGpuBuffer keyHalf, IGpuBuffer valueHalf, IGpuBuffer outputFloat, IGpuBuffer? softmaxStatsFloat, int batch, int queryHeads, int keyValueHeads, int querySequence, int keyValueSequence, float scale, bool isCausal, bool emitSoftmaxStats, int causalQueryOffset)
         => false;
 
+    bool IDirectPtxBackend.TryDirectPtxFlashAttention(IGpuBuffer queryHalf, IGpuBuffer keyHalf, IGpuBuffer valueHalf, IGpuBuffer outputFloat, IGpuBuffer softmaxStatsFloat, int batch, int queryHeads, int keyValueHeads, int querySequence, int keyValueSequence, int headDimension, float scale, bool isCausal, int causalQueryOffset, bool reducedPrecisionRequested)
+        => false;
+
     bool IDirectPtxBackend.TryDirectPtxGroupNormSwishUnit64(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta, int batch, int groups, int channels, int spatialSize, float epsilon)
         => false;
 

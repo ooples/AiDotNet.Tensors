@@ -521,11 +521,20 @@ public static class TensorAllocator
         for (int i = 0; i < shape.Length; i++)
             totalSize = checked(totalSize * shape[i]);
 
-        // #318: when ForceFreshAllocations is enabled the caller wants
-        // backing arrays exactly logical-Length sized. Skip both the
-        // arena and pool tiers — go straight to new Tensor<T>(shape).
+        // Freshness requires a new exact-sized array, not zero-filled scratch. Compiled training
+        // enables this policy while tracing its first step; keep the immediate-overwrite contract
+        // here too instead of clearing every forward output and gradient before the kernel writes it.
         if (TensorPool.ForceFreshAllocations)
+        {
+#if NET5_0_OR_GREATER
+            T[] fresh = RuntimeHelpers.IsReferenceOrContainsReferences<T>()
+                ? new T[totalSize]
+                : GC.AllocateUninitializedArray<T>(totalSize);
+            return Tensor<T>.FromMemory(new Memory<T>(fresh), shape);
+#else
             return new Tensor<T>(shape);
+#endif
+        }
 
         // Arena path: reuse the entire Tensor<T> object + backing array — truly zero alloc
         var arena = TensorArena.Current;

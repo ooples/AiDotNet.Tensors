@@ -773,6 +773,433 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     }
 
     /// <summary>
+    /// A time-major input sliced per step, each slice reshaped to a row and sliced again (DeepAR's packed batch,
+    /// AiDotNet#1804): every op stays resident, so the step must still capture. Before, the reshaped slice was read
+    /// as a host constant and uploaded inside the capture, which aborted it and left the plan replaying every op
+    /// from the host for the rest of training.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void A_sliced_and_reshaped_input_does_not_block_capture(bool reshape)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                "Whole-step graph capture is CUDA-only.");
+            Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                "Graph capture is disabled for this process.");
+            const int Time = 5, Feat = 1;
+            float[] TrainOnce(bool capture)
+            {
+            var x = Rand([Time, Feat, Batch], 1, 1f);
+            var y = Rand([Hidden, Batch], 2, 1f);
+            var w = Rand([Hidden, Feat], 3, 0.3f);
+            w.Gpu();
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.EnableTraining(new[] { w }))
+            {
+                Tensor<float>? acc = null;
+                for (int t = 0; t < Time; t++)
+                {
+                    var slice = gpu.TensorNarrow(x, 0, t, 1);                         // [1, Feat, Batch]
+                    var step = reshape ? gpu.Reshape(slice, new[] { Feat, Batch }) : slice;
+                    var row = reshape ? gpu.TensorNarrow(step, 0, 0, 1)              // [1, Batch]
+                                      : gpu.Reshape(gpu.TensorNarrow(step, 1, 0, 1), new[] { 1, Batch });
+                    var h = gpu.Tanh(gpu.TensorMatMul(w, row));                      // [Hidden, Batch]
+                    acc = acc is null ? h : gpu.TensorAdd(acc, h);
+                }
+                var diff = gpu.TensorSubtract(acc!, y);
+                gpu.ReduceMean(gpu.TensorMultiply(diff, diff), new[] { 0, 1 }, keepDims: false);
+                plan = scope.CompileTraining(new[] { w });
+            }
+            using (plan)
+            {
+                var concrete = (CompiledTrainingPlan<float>)plan;
+                if (!capture) concrete.DisableGraphStep();
+                plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
+                for (int s = 0; s < Steps; s++) { FeedBatch(x, y, s); plan.Step(); }
+                if (capture)
+                {
+                    Assert.True(concrete.GraphCaptureFailureReason is null,
+                        "capture failed: " + concrete.GraphCaptureFailureReason);
+                    AssertGraphCaptured(concrete);
+                }
+            }
+            return w.ToArray();
+            }
+            // The captured replay must train exactly as the eager plan does, slice for slice.
+            var eager = TrainOnce(capture: false);
+            var captured = TrainOnce(capture: true);
+            for (int i = 0; i < eager.Length; i++)
+                Assert.True(Math.Abs(eager[i] - captured[i]) <= 1e-5f, $"w[{i}] captured {captured[i]} != eager {eager[i]}");
+        }
+    }
+
+    /// <summary>
+    /// A null <see cref="CompiledTrainingPlan{T}.GraphCaptureFailureReason"/> also means capture was never tried (an
+    /// ineligible step, a disabled graph), and then a "captured" run compares eager with eager. Require the graph.
+    /// </summary>
+    private static void AssertGraphCaptured(CompiledTrainingPlan<float> plan)
+    {
+        var exec = (IntPtr)typeof(CompiledTrainingPlan<float>)
+            .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(plan)!;
+        Assert.True(exec != IntPtr.Zero, "no graph was captured, so the captured run compared eager with eager");
+    }
+
+    private static bool TryCudaCapture(DirectGpuTensorEngine? gpu)
+    {
+        if (gpu is null) return false;
+        if (gpu.GetBackend() is not AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend) return false;
+        return Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") != "0";
+    }
+
+    /// <summary>
+    /// Compiles a one-layer step around <paramref name="body"/>, trains it eagerly and captured, and requires the
+    /// capture to succeed and both to end on the same weights. Returns the captured plan's failure reason (null).
+    /// </summary>
+    private static void AssertCapturesLikeEager(DirectGpuTensorEngine gpu, int[] xShape, int[] yShape, int[] wShape,
+        Func<Tensor<float>, Tensor<float>, Tensor<float>, Tensor<float>> body)
+    {
+        float[] TrainOnce(bool capture)
+        {
+            var x = Rand(xShape, 11, 1f);
+            var y = Rand(yShape, 12, 1f);
+            var w = Rand(wShape, 13, 0.3f);
+            w.Gpu();
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.EnableTraining(new[] { w }))
+            {
+                var diff = gpu.TensorSubtract(body(x, y, w), y);
+                gpu.ReduceMean(gpu.TensorMultiply(diff, diff), Enumerable.Range(0, yShape.Length).ToArray(), keepDims: false);
+                plan = scope.CompileTraining(new[] { w });
+            }
+            using (plan)
+            {
+                var concrete = (CompiledTrainingPlan<float>)plan;
+                if (!capture) concrete.DisableGraphStep();
+                plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
+                for (int s = 0; s < Steps; s++) { FeedBatch(x, y, s); plan.Step(); }
+                if (capture)
+                {
+                    Assert.True(concrete.GraphCaptureFailureReason is null, "capture failed: " + concrete.GraphCaptureFailureReason);
+                    AssertGraphCaptured(concrete);
+                }
+            }
+            return w.ToArray();
+        }
+        var eager = TrainOnce(capture: false);
+        var captured = TrainOnce(capture: true);
+        for (int i = 0; i < eager.Length; i++)
+            Assert.True(Math.Abs(eager[i] - captured[i]) <= 1e-5f * Math.Max(1f, Math.Abs(eager[i])),
+                $"w[{i}] captured {captured[i]} != eager {eager[i]}");
+    }
+
+    /// <summary>
+    /// A max reduction in the step (a stabilized softmax: exp(h - max h)) under compiled GPU training. The GPU
+    /// ReduceMax recorded through its index-returning variant, which is not graph-capturable and threw, so the WHOLE
+    /// step was rejected and the model trained on the eager tape with a host optimizer (AiDotNet#1804: Autoformer,
+    /// 5.5x slower than PyTorch). It must now compile, capture, and train exactly as the eager plan does.
+    /// </summary>
+    [SkippableFact]
+    public void A_max_reduction_compiles_and_captures()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(TryCudaCapture(gpu), "Whole-step graph capture is CUDA-only or disabled.");
+            AssertCapturesLikeEager(gpu, [Inputs, Batch], [Hidden, Batch], [Hidden, Inputs], (x, y, w) =>
+            {
+                var h = gpu.Tanh(gpu.TensorMatMul(w, x));                                  // [Hidden, Batch]
+                var shifted = gpu.TensorSubtract(h, gpu.ReduceMax(h, new[] { 0 }, keepDims: true));
+                return gpu.TensorExp(shifted);
+            });
+        }
+    }
+
+    /// <summary>
+    /// A broadcast in which both operands expand ([B, C, 1] + [1, C, C], Autoformer's lag ranking). The GPU's general
+    /// broadcast declined under capture and the CPU base downloaded an operand, aborting the capture for the whole
+    /// step (AiDotNet#1804). It must now capture and train exactly as the eager plan does.
+    /// </summary>
+    [SkippableFact]
+    public void A_two_sided_broadcast_captures()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(TryCudaCapture(gpu), "Whole-step graph capture is CUDA-only or disabled.");
+            const int C = 6;
+            AssertCapturesLikeEager(gpu, [Batch, C, 1], [Batch, C, C], [1, C, C], (x, y, w) =>
+                gpu.Tanh(gpu.TensorAdd(x, w)));
+        }
+    }
+
+    /// <summary>
+    /// The device argmax carries its indices as floats, exact only to 2^24. Past that, index 2^24 + 1 rounds to 2^24
+    /// and ReduceMax's gradient would land on the element beside the max; such a reduction must take the exact path.
+    /// </summary>
+    [SkippableFact]
+    public void A_max_over_more_than_2_pow_24_elements_sends_its_gradient_to_the_max()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            const int N = (1 << 24) + 2;   // the max sits at N - 1 = 2^24 + 1, which a float cannot hold
+            var p = new Tensor<float>([1, N]);
+            p.AsWritableSpan()[N - 1] = 1f;
+            p.Gpu();
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.EnableTraining(new[] { p }))
+            {
+                var m = gpu.ReduceMax(p, new[] { 1 }, keepDims: false);
+                gpu.ReduceMean(gpu.TensorMultiply(m, m), new[] { 0 }, keepDims: false);
+                plan = scope.CompileTraining(new[] { p });
+            }
+            using (plan)
+            {
+                ((CompiledTrainingPlan<float>)plan).DisableGraphStep();
+                plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0f);
+                plan.Step();
+                plan.Step();
+                var g = plan.Gradients[0].ToArray();
+                Assert.Equal(2f, g[N - 1]);   // d(m^2)/dm at the max, m = 1
+                Assert.Equal(0f, g[N - 2]);
+            }
+        }
+    }
+
+    /// <summary>
+    /// A compiled step's transient scratch is shared by its actions: a deeper model of the same layers holds no more
+    /// of it. Keyed per action, it was kept for every action for the plan's life (24 GroupNorm backwards on
+    /// [32,256,256] held ~3.2 GiB) - device memory that grew with depth for no reason.
+    /// </summary>
+    [SkippableFact]
+    public void Transient_scratch_does_not_grow_with_depth()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            var pool = gpu.CreateScratchPool();
+            int Slots() => pool.Transient.Count;
+            var x = Rand([Batch, Inputs], 31, 1f);
+            var y = Rand([Hidden, Inputs], 32, 1f);
+            var expected = ((IEngine)gpu).PairwiseDistanceSquared(x, y).ToArray();   // unpooled
+            // The compiled step's resident path, as CompiledTrainingPlan runs it: one scratch action per op.
+            var outerPool = DirectGpuTensorEngine.EnterScratchPool(pool);
+            gpu.SuspendActivationEviction();
+            try
+            {
+                using (gpu.EnterCompiledCapturePath())
+                {
+                    int afterOne = 0;
+                    const int Depth = 6;
+                    for (int action = 0; action < Depth; action++)
+                    {
+                        gpu.SetCurrentScratchAction(action);
+                        var d = ((IEngine)gpu).PairwiseDistanceSquared(x, y).ToArray();
+                        for (int i = 0; i < expected.Length; i++)
+                            Assert.True(Math.Abs(d[i] - expected[i]) <= 1e-4f * Math.Max(1f, Math.Abs(expected[i])),
+                                $"action {action}: d[{i}] {d[i]} != unpooled {expected[i]} (a shared slot was not re-zeroed?)");
+                        if (action == 0) afterOne = Slots();
+                    }
+                    // A pooled slot is a size class larger than the request; what an op gets is exactly its length
+                    // (a dropout mask downloads its buffer into the returned vector).
+                    gpu.SetCurrentScratchAction(Depth);
+                    var mask = ((IEngine)gpu).GenerateDropoutMask<float>(5, 0.5f, 2f, 7);
+                    Assert.Equal(5, mask.Length);
+                    gpu.SetCurrentScratchAction(-1);
+                    Assert.True(afterOne > 0, "the op drew no transient scratch, so the test proves nothing");
+                    Assert.Equal(afterOne + 1, Slots());
+                }
+            }
+            finally
+            {
+                gpu.ResumeActivationEviction();
+                DirectGpuTensorEngine.RestoreScratchPool(outerPool);
+                pool.Release();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Retiring a plan whose graph ran lands the PARAMETERS' gradients on the host and nothing else. Every
+    /// intermediate gradient shares pooled backing arrays with them, and a host read of an array downloaded every
+    /// resident member on it: disposing N-BEATS's plans read ~800 MB back at the end of every GPU Train (AiDotNet#1804).
+    /// The readback at retirement is bounded by the parameter gradients now, and those still hold the last step's
+    /// values - whether the plan retires its graph by Dispose or keeps training eagerly after DisableGraphStep (which
+    /// retires through RollBackCaptureResidency, not LandGradientsOnHost).
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Retiring_a_replayed_plan_reads_back_only_the_parameter_gradients(bool viaDisableGraphStep)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(TryCudaCapture(gpu), "Whole-step graph capture is CUDA-only or disabled.");
+            const int Wide = 512;   // intermediates far larger than the parameters
+            var x = Rand([Inputs, Wide], 21, 1f);
+            var y = Rand([Hidden, Wide], 22, 1f);
+            var w1 = Rand([Hidden, Inputs], 23, 0.3f);
+            var w2 = Rand([Hidden, Hidden], 24, 0.3f);
+            w1.Gpu(); w2.Gpu();
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.EnableTraining(new[] { w1, w2 }))
+            {
+                var h = gpu.Tanh(gpu.TensorMatMul(w1, x));
+                var o = gpu.Tanh(gpu.TensorMatMul(w2, h));
+                var diff = gpu.TensorSubtract(o, y);
+                gpu.ReduceMean(gpu.TensorMultiply(diff, diff), new[] { 0, 1 }, keepDims: false);
+                plan = scope.CompileTraining(new[] { w1, w2 });
+            }
+            var concrete = (CompiledTrainingPlan<float>)plan;
+            plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
+            for (int s = 0; s < Steps; s++) { FeedBatch(x, y, s); plan.Step(); }
+            Assert.True(concrete.GraphCaptureFailureReason is null, "capture failed: " + concrete.GraphCaptureFailureReason);
+            AssertGraphCaptured(concrete);
+            var gradients = plan.Gradients;
+            long parameterBytes = gradients.Sum(g => (long)g.Length * sizeof(float));
+            long before = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.ReadbackBytes;
+            if (viaDisableGraphStep) concrete.DisableGraphStep();
+            else plan.Dispose();
+            long readBack = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.ReadbackBytes - before;
+            Assert.True(readBack <= parameterBytes + 1024,
+                $"retiring the graph read back {readBack} bytes; the parameter gradients are {parameterBytes}");
+            Assert.All(gradients, g => Assert.Contains(g.ToArray(), v => v != 0f));
+            if (viaDisableGraphStep) plan.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Plans trained from several threads on ONE engine train exactly as each does alone, with every step followed by
+    /// the engine-wide weight-cache invalidation a fused training session issues. That invalidation freed the weight
+    /// buffers another thread had just updated on the device and was about to read, and the steps shared the engine's
+    /// scratch pool and caches: concurrent GPU Autoformer faulted with CUDA 700 (AiDotNet#1804).
+    /// </summary>
+    [SkippableFact]
+    public void Plans_trained_concurrently_on_one_engine_train_as_they_do_alone()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            // afterFirstStep: the concurrent run's rendezvous, so every plan has stepped before any plan's second step
+            // and the remaining steps overlap (Parallel.For guarantees no overlap).
+            float[] Train(int seed, System.Threading.Barrier? afterFirstStep = null)
+            {
+                var x = Rand([Inputs, 64], seed, 1f);
+                var y = Rand([Hidden, 64], seed + 1, 1f);
+                var w = Rand([Hidden, Inputs], seed + 2, 0.3f);
+                w.Gpu();
+                ICompiledTrainingPlan<float> plan;
+                using (var scope = GraphMode.EnableTraining(new[] { w }))
+                {
+                    var h = gpu.Tanh(gpu.TensorMatMul(w, x));
+                    var shifted = gpu.TensorSubtract(h, gpu.ReduceMax(h, new[] { 0 }, keepDims: true));
+                    var diff = gpu.TensorSubtract(shifted, y);
+                    gpu.ReduceMean(gpu.TensorMultiply(diff, diff), new[] { 0, 1 }, keepDims: false);
+                    plan = scope.CompileTraining(new[] { w });
+                }
+                using (plan)
+                {
+                    plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
+                    for (int s = 0; s < 3 * Steps; s++)
+                    {
+                        FeedBatch(x, y, s);
+                        plan.Step();
+                        gpu.InvalidateAllWeightCaches();   // as FusedTrainingSession does after every fused step
+                        if (s == 0 && afterFirstStep is not null)
+                            Assert.True(afterFirstStep.SignalAndWait(TimeSpan.FromMinutes(2)), "the other plans never reached their first step");
+                    }
+                }
+                return w.ToArray();
+            }
+            int[] seeds = { 101, 202, 303, 404 };
+            var alone = seeds.Select(s => Train(s)).ToArray();
+            var together = new float[seeds.Length][];
+            var errors = new System.Collections.Concurrent.ConcurrentBag<Exception>();
+            using var rendezvous = new System.Threading.Barrier(seeds.Length);
+            var tasks = Enumerable.Range(0, seeds.Length).Select(i => System.Threading.Tasks.Task.Factory.StartNew(() =>
+            {
+                try { together[i] = Train(seeds[i], rendezvous); }
+                catch (Exception ex)
+                {
+                    errors.Add(ex);
+                    // A plan that fails before the rendezvous must not leave the others waiting for it.
+                    try { rendezvous.RemoveParticipant(); } catch (InvalidOperationException) { }
+                }
+            }, System.Threading.Tasks.TaskCreationOptions.LongRunning)).ToArray();
+            Assert.True(System.Threading.Tasks.Task.WaitAll(tasks, TimeSpan.FromMinutes(5)), "the concurrent plans did not finish");
+            Assert.True(errors.IsEmpty, string.Join(" | ", errors.Select(e => e.GetType().Name + ": " + e.Message)));
+            for (int i = 0; i < seeds.Length; i++)
+                for (int k = 0; k < alone[i].Length; k++)
+                    Assert.True(Math.Abs(alone[i][k] - together[i][k]) <= 1e-4f * Math.Max(1f, Math.Abs(alone[i][k])),
+                        $"plan {i}: w[{k}] trained concurrently {together[i][k]} != alone {alone[i][k]}");
+        }
+    }
+
+    /// <summary>
+    /// Disposing a plan whose graph ran reads nothing back: each parameter gradient keeps its last value on the device
+    /// in a buffer of its own, as PyTorch keeps <c>.grad</c>, and a later host read downloads it. Landing them cost
+    /// N-BEATS ~220 ms (96 MB) at the end of every GPU Train (AiDotNet#1804). The values read after Dispose must be the
+    /// ones the plan held: an identical run read before its Dispose is the reference.
+    /// </summary>
+    [SkippableFact]
+    public void Disposing_a_replayed_plan_keeps_the_parameter_gradients_on_the_device()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(TryCudaCapture(gpu), "Whole-step graph capture is CUDA-only or disabled.");
+            (float[][] Gradients, long DisposeReadback) Run(bool readBeforeDispose)
+            {
+                var x = Rand([Inputs, 512], 21, 1f);
+                var y = Rand([Hidden, 512], 22, 1f);
+                var w1 = Rand([Hidden, Inputs], 23, 0.3f);
+                var w2 = Rand([Hidden, Hidden], 24, 0.3f);
+                w1.Gpu(); w2.Gpu();
+                ICompiledTrainingPlan<float> plan;
+                using (var scope = GraphMode.EnableTraining(new[] { w1, w2 }))
+                {
+                    var h = gpu.Tanh(gpu.TensorMatMul(w1, x));
+                    var o = gpu.Tanh(gpu.TensorMatMul(w2, h));
+                    var diff = gpu.TensorSubtract(o, y);
+                    gpu.ReduceMean(gpu.TensorMultiply(diff, diff), new[] { 0, 1 }, keepDims: false);
+                    plan = scope.CompileTraining(new[] { w1, w2 });
+                }
+                var concrete = (CompiledTrainingPlan<float>)plan;
+                plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
+                for (int s = 0; s < Steps; s++) { FeedBatch(x, y, s); plan.Step(); }
+                AssertGraphCaptured(concrete);
+                var gradients = plan.Gradients;
+                float[][]? early = readBeforeDispose ? gradients.Select(g => g.ToArray()).ToArray() : null;
+                long before = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.ReadbackBytes;
+                plan.Dispose();
+                long readBack = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.ReadbackBytes - before;
+                return (early ?? gradients.Select(g => g.ToArray()).ToArray(), readBack);
+            }
+            var reference = Run(readBeforeDispose: true);
+            var handedOff = Run(readBeforeDispose: false);
+            Assert.True(handedOff.DisposeReadback < 1024, $"Dispose read back {handedOff.DisposeReadback} bytes");
+            Assert.All(handedOff.Gradients, g => Assert.Contains(g, v => v != 0f));
+            for (int p = 0; p < reference.Gradients.Length; p++)
+                for (int i = 0; i < reference.Gradients[p].Length; i++)
+                    Assert.True(Math.Abs(reference.Gradients[p][i] - handedOff.Gradients[p][i]) <= 1e-5f,
+                        $"grad {p}[{i}] read after Dispose {handedOff.Gradients[p][i]} != read before {reference.Gradients[p][i]}");
+        }
+    }
+
+    /// <summary>
     /// L2 regularization must land where the optimizer reads each gradient. It used to be written on the device
     /// whenever the gradient and parameter merely HAD device buffers, while the optimizer reads the host gradient
     /// unless the device copy is current and the parameter is resident - with mixed residency the term was silently

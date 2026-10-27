@@ -584,6 +584,12 @@ public static class PtxParityRegistry
         new PtxParitySpec("PtxOnlineFusedAttention128x64Kernel", PtxParityStatus.Deferred,
             "online fused attention",
             "fp16 Q/K/V + softmax-stats side output; needs bespoke fp16 input synthesis and a flash-attention oracle."),
+        new PtxParitySpec("PtxFlashAttentionKernel", PtxParityStatus.Deferred,
+            "FP16 flash-attention forward, FlashAttention / ScaledDotProductAttention (#1549)",
+            "fp16 Q/K/V in, fp32 output + log-sum-exp; driver-tested by PtxFlashAttentionTests against an fp64 oracle (D 64/128, " +
+            "causal with offset, GQA, ragged lengths, both accumulate forms, overflow redo) and end to end by " +
+            "Fp16FlashAttentionEngineTests against CpuEngine forward and backward; the three-way spec needs the same fp16 " +
+            "input synthesis as the online attention kernel."),
         new PtxParitySpec("PtxAttentionSoftmax32Kernel", PtxParityStatus.Deferred,
             "attention softmax (S=32)",
             "sub-kernel of the attention path; covered transitively by the attention spec once added."),

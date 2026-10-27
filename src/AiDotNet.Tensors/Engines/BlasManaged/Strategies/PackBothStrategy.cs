@@ -305,27 +305,15 @@ internal static class PackBothStrategy
                     }
                     else
                     {
-                        // M-axis (existing): shared packed-B, parallel over ic.
-                        byte[]? packBArray = null;
-                        try
-                        {
-                            Span<byte> packBBytesSpan = ArenaIntegration.TryRentBytes(packBBytes);
-                            if (packBBytesSpan.IsEmpty)
-                            {
-                                packBArray = ArrayPool<byte>.Shared.Rent(packBBytes);
-                                packBBytesSpan = packBArray.AsSpan(0, packBBytes);
-                            }
-                            RunParallelUnsafe<T>(
-                                aPtr, a.Length, lda, transA,
-                                bPtr, b.Length, ldb, transB,
-                                cPtr, c.Length, ldc,
-                                m, n, k, mc, nc, kc, mr, nr,
-                                packBBytesSpan, in options, elemSize);
-                        }
-                        finally
-                        {
-                            if (packBArray != null) ArrayPool<byte>.Shared.Return(packBArray);
-                        }
+                        // The worker needs a capturable array and rents its own aligned B buffer.
+                        // Pass only the capacity: renting an arena buffer here allocated a second,
+                        // unused pack-B buffer on every compiled GEMM.
+                        RunParallelUnsafe<T>(
+                            aPtr, a.Length, lda, transA,
+                            bPtr, b.Length, ldb, transB,
+                            cPtr, c.Length, ldc,
+                            m, n, k, mc, nc, kc, mr, nr,
+                            packBBytes, in options, elemSize);
                     }
                 }
             }
@@ -551,7 +539,7 @@ internal static class PackBothStrategy
         int m, int n, int k,
         int mc, int nc, int kc,
         int mr, int nr,
-        Span<byte> packBBytesSpan,
+        int packBBytes,
         in BlasOptions<T> options, int elemSize) where T : unmanaged
     {
         // Snapshot options fields: BlasOptions<T> is a ref struct and cannot be captured.
@@ -568,18 +556,15 @@ internal static class PackBothStrategy
 
         // Pack-B backing array: capturable by the lambda as a managed byte[].
         // The bytes are shared across all ic-parallel iterations (read-only after packing).
-        // CodeRabbit #366: was `new byte[packBBytesSpan.Length]`, defeating the
-        // allocator hierarchy (Layer 5/4/1) and adding a full managed alloc on
-        // every parallel GEMM call. Rent from the shared array pool instead and
-        // return in finally; capacity is bounded by packBBytesSpan.Length which
-        // itself caps at kc*nc*elemSize.
+        // Rent one shared array, returned in finally. The caller passes the required
+        // capacity without allocating a redundant arena or pooled buffer.
         //
         // Sub-P (#406): over-rent by 31 bytes so we can slice the pack buffer at
         // a 32-byte-aligned offset — required for Avx2Pack's non-temporal-store
         // fast path. Without alignment the NT path silently falls back to
         // regular cached stores (still correct, just no perf win).
         const int PackBAlignment = 32;
-        byte[] packBArr = System.Buffers.ArrayPool<byte>.Shared.Rent(packBBytesSpan.Length + PackBAlignment - 1);
+        byte[] packBArr = System.Buffers.ArrayPool<byte>.Shared.Rent(packBBytes + PackBAlignment - 1);
         int packBAlignedOffset;
         unsafe
         {
@@ -605,7 +590,7 @@ internal static class PackBothStrategy
                     int effectivePackBBytes = effectiveKc * effectiveNc * elemSize;
                     // Round up Nc to the next multiple of Nr so the last partial-N stripe
                     // is zero-padded into a full Nr-wide row (Task G2). The backing byte[]
-                    // (packBBytesSpan.Length = kc * nc * elemSize) always has room for this padding.
+                    // (packBBytes = kc * nc * elemSize) always has room for this padding.
                     int packedNc = ((effectiveNc + nr - 1) / nr) * nr;
                     int packedBElemCount = effectiveKc * packedNc;
                     int packedBByteCount = packedBElemCount * elemSize;

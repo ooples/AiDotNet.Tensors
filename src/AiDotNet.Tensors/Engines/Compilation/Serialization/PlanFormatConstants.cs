@@ -42,8 +42,10 @@ internal static class PlanFormatConstants
     /// caller's 1 - beta rather than 1 - (float)beta, so version 9 plans are rejected rather than read misaligned.
     /// Version 11 writes the fused optimizer's beta1, beta2, epsilon and weight decay as double instead of float, so a
     /// double plan keeps the caller's exact hyperparameters; version 10 plans are rejected rather than read misaligned.
+    /// Version 12 adds the TagInt32Tensor saved-state entry (a GPU ReduceMax's argmax): version 11 readers do not know
+    /// the tag, so they must reject these plans by version rather than fail on it mid-read.
     /// </remarks>
-    internal const ushort CurrentFormatVersion = 11;
+    internal const ushort CurrentFormatVersion = 12;
 
     /// <summary>
     /// Tensor-codec version. Semantically distinct from the format version:
@@ -109,6 +111,7 @@ internal static class PlanFormatConstants
     internal const byte TagInt64Array = 0x0B; // long[] — used by index snapshots that may exceed int.MaxValue (large-vocab embeddings)
     internal const byte TagBoolArray  = 0x0C;
     internal const byte TagFusedActivationParams = 0x0D;
+    internal const byte TagInt32Tensor = 0x0E; // shape + values: a device argmax a float plan's GPU ReduceMax keeps
 
     // ── MultiHeadAttentionForward saved-state schema ───────────────────────
     internal const int MultiHeadAttentionInputCount = 5;

@@ -268,7 +268,7 @@ public partial class DirectGpuTensorEngine
         {
             var source = tensor.IsContiguous ? tensor : tensor.Contiguous();
             using var x = GetOrAllocateBuffer(backend, source);
-            using var rows = AllocateOutputBuffer(backend, tensor.Length);
+            using var rows = AllocateFullyWrittenOutputBuffer(backend, tensor.Length);
             if (inner == 1) backend.Copy(x.Buffer, rows.Buffer, tensor.Length);
             else backend.Permute(x.Buffer, rows.Buffer, new[] { outer, extent, inner }, new[] { 0, 2, 1 });
             var (sorted, indices) = BitonicSortRowsToBuffers(backend, rows.Buffer, rowsCount, extent, descending: false);

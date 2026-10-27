@@ -291,9 +291,14 @@ internal static class PtxGemmEvolution
         private readonly Dictionary<TConfiguration, string> _compileErrors = new();
         private bool _disposed;
 
+        // Relative to the output scale; a family with coarser accumulation (FP16 accumulate, #1549) passes its own bound.
+        private readonly double _relativeTolerance;
+
         internal ExperimentBackend(DirectPtxRuntime runtime, PtxGemmLayout layout, int m, int n, int k,
-            Func<TConfiguration, LoadedGemm> compile, Func<TConfiguration, string> name, bool halfOperands = false)
+            Func<TConfiguration, LoadedGemm> compile, Func<TConfiguration, string> name, bool halfOperands = false,
+            double relativeTolerance = RelativeTolerance)
         {
+            _relativeTolerance = relativeTolerance;
             _runtime = runtime;
             _m = m;
             _n = n;
@@ -429,12 +434,12 @@ internal static class PtxGemmEvolution
             for (int s = 0; s < _sampleIndices.Length; s++)
                 maximumAbsolute = Math.Max(maximumAbsolute, Math.Abs(actual[_sampleIndices[s]] - _expected[s]));
             double relative = maximumAbsolute / _scale;
-            double absoluteTolerance = RelativeTolerance * _scale;
-            if (!(relative <= RelativeTolerance))
+            double absoluteTolerance = _relativeTolerance * _scale;
+            if (!(relative <= _relativeTolerance))
                 throw new KernelTuningValidationException(KernelTuningTrialStatus.OutputMismatch,
                     $"PTX GEMM {_name(configuration)} exceeded tolerance: max abs {maximumAbsolute:R}, relative {relative:R}.");
             return new KernelTuningCorrectnessEvidence(KernelTuningValidationScope.Output,
-                maximumAbsolute, relative, absoluteTolerance, RelativeTolerance);
+                maximumAbsolute, relative, absoluteTolerance, _relativeTolerance);
         }
 
         public KernelTuningResourceUsage GetResourceUsage(TConfiguration configuration)

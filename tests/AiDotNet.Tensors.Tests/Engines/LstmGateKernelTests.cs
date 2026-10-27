@@ -19,6 +19,13 @@ public class LstmGateKernelTests
         using var direct = new DirectGpuEngine(backend); using var engine = new DirectGpuTensorEngine(direct);
         var resident = engine.TensorAddScalar(new Tensor<float>(new float[] { 0, 1, 2, 3, 4, 5 }, new[] { 2, 3 }), 1f);
         var gradient = engine.TensorPermute(resident, new[] { 1, 0 });
+        // Force a reused nonzero allocation: OpenCL's pool does not promise
+        // initialized storage, so the scatter must clear untouched positions.
+        using (var poison = backend.AllocateBuffer(12))
+        {
+            backend.Fill(poison, 9f, 12);
+            backend.Synchronize();
+        }
         Tensor<float>? narrow, slice;
         using (var scope = AiDotNet.Tensors.Engines.Diagnostics.GpuResidencyScope.Begin(captureOperations: true))
         {
