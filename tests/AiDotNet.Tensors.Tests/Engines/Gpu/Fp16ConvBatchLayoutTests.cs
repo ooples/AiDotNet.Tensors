@@ -100,6 +100,51 @@ public class Fp16ConvBatchLayoutTests
         }
     }
 
+    // #1549: a conv large enough for the FP16-accumulate route (M 128, P 784, K 1152, batch 8) reaches it through the engine
+    // (the route evaluates the per-image GEMM's shape) and still matches CpuEngine in NCHW.
+    [SkippableFact]
+    public void LargeBatchedFp16Conv_ReachesTheFp16AccumulateRoute_AndMatchesTheCpu()
+    {
+        Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver not available");
+        var eng = AiDotNetEngine.Current;
+        Skip.IfNot(eng is DirectGpuTensorEngine, "active engine is not the CUDA backend");
+        var warm = new Tensor<float>(new float[] { 1, 2, 3, 4 }, new[] { 2, 2 });
+        _ = eng.TensorMatMul(warm, warm);
+        var backend = ((DirectGpuTensorEngine)eng).TestBackend as CudaBackend;
+        Skip.IfNot(backend is not null && backend.IsAvailable && backend.SupportsHgemm && backend.Fp16Im2colAvailable
+                   && backend.GetDirectPtxRuntime().ComputeCapabilityMajor >= 8, "Needs the CUDA FP16 im2col conv path on Ampere+.");
+        const int batch = 8, inC = 128, h = 28, w = 28, outC = 128;
+        var rng = new Random(15490);
+        var input = new Tensor<float>(Enumerable.Range(0, batch * inC * h * w).Select(_ => (float)(rng.NextDouble() * 2 - 1)).ToArray(),
+            new[] { batch, inC, h, w });
+        var kernel = new Tensor<float>(Enumerable.Range(0, outC * inC * 9).Select(_ => (float)(rng.NextDouble() * 2 - 1)).ToArray(),
+            new[] { outC, inC, 3, 3 });
+        float[] expected = new CpuEngine().Conv2D(input, kernel, 1, 1, 1).ToArray();
+        var gpu = (DirectGpuTensorEngine)eng;
+        var result = new Tensor<float>(new[] { batch, outC, h, w });
+        bool? previousConv = DirectGpuTensorEngine.Fp16ConvOverride;
+        DirectGpuTensorEngine.Fp16ConvOverride = true;
+        gpu.SuspendActivationEviction();
+        try
+        {
+            using (gpu.EnterCompiledCapturePath())
+                ((IEngine)gpu).Conv2DInto(result, input, kernel, 1, 1, 1);
+        }
+        finally
+        {
+            gpu.ResumeActivationEviction();
+            DirectGpuTensorEngine.Fp16ConvOverride = previousConv;
+        }
+        float[] actual = result.ToArray();
+        var verdict = backend!.Fp16AccumulateVerdict(outC, h * w, inC * 9, halfOutput: false, batch: batch);
+        Assert.True(verdict.HasValue, "the batched conv GEMM never reached the FP16-accumulate route");
+        // FP16 operands, K = 1152 products in [-1, 1), FP16 accumulation per tile when routed.
+        int bad = 0;
+        for (int i = 0; i < expected.Length; i++)
+            if (!(Math.Abs(actual[i] - expected[i]) <= 0.1)) bad++;
+        Assert.True(bad == 0, $"{bad}/{expected.Length} outputs off (route: {verdict!.Value.Routed}, {verdict.Value.Reason})");
+    }
+
     [SkippableTheory]
     [InlineData(1, false)]
     [InlineData(4, false)]
