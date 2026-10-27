@@ -1129,6 +1129,58 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     }
 
     /// <summary>
+    /// Disposing a plan whose graph ran reads nothing back: each parameter gradient keeps its last value on the device
+    /// in a buffer of its own, as PyTorch keeps <c>.grad</c>, and a later host read downloads it. Landing them cost
+    /// N-BEATS ~220 ms (96 MB) at the end of every GPU Train (AiDotNet#1804). The values read after Dispose must be the
+    /// ones the plan held: an identical run read before its Dispose is the reference.
+    /// </summary>
+    [SkippableFact]
+    public void Disposing_a_replayed_plan_keeps_the_parameter_gradients_on_the_device()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(TryCudaCapture(gpu), "Whole-step graph capture is CUDA-only or disabled.");
+            (float[][] Gradients, long DisposeReadback) Run(bool readBeforeDispose)
+            {
+                var x = Rand([Inputs, 512], 21, 1f);
+                var y = Rand([Hidden, 512], 22, 1f);
+                var w1 = Rand([Hidden, Inputs], 23, 0.3f);
+                var w2 = Rand([Hidden, Hidden], 24, 0.3f);
+                w1.Gpu(); w2.Gpu();
+                ICompiledTrainingPlan<float> plan;
+                using (var scope = GraphMode.EnableTraining(new[] { w1, w2 }))
+                {
+                    var h = gpu.Tanh(gpu.TensorMatMul(w1, x));
+                    var o = gpu.Tanh(gpu.TensorMatMul(w2, h));
+                    var diff = gpu.TensorSubtract(o, y);
+                    gpu.ReduceMean(gpu.TensorMultiply(diff, diff), new[] { 0, 1 }, keepDims: false);
+                    plan = scope.CompileTraining(new[] { w1, w2 });
+                }
+                var concrete = (CompiledTrainingPlan<float>)plan;
+                plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
+                for (int s = 0; s < Steps; s++) { FeedBatch(x, y, s); plan.Step(); }
+                AssertGraphCaptured(concrete);
+                var gradients = plan.Gradients;
+                float[][]? early = readBeforeDispose ? gradients.Select(g => g.ToArray()).ToArray() : null;
+                long before = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.ReadbackBytes;
+                plan.Dispose();
+                long readBack = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.ReadbackBytes - before;
+                return (early ?? gradients.Select(g => g.ToArray()).ToArray(), readBack);
+            }
+            var reference = Run(readBeforeDispose: true);
+            var handedOff = Run(readBeforeDispose: false);
+            Assert.True(handedOff.DisposeReadback < 1024, $"Dispose read back {handedOff.DisposeReadback} bytes");
+            Assert.All(handedOff.Gradients, g => Assert.Contains(g, v => v != 0f));
+            for (int p = 0; p < reference.Gradients.Length; p++)
+                for (int i = 0; i < reference.Gradients[p].Length; i++)
+                    Assert.True(Math.Abs(reference.Gradients[p][i] - handedOff.Gradients[p][i]) <= 1e-5f,
+                        $"grad {p}[{i}] read after Dispose {handedOff.Gradients[p][i]} != read before {reference.Gradients[p][i]}");
+        }
+    }
+
+    /// <summary>
     /// L2 regularization must land where the optimizer reads each gradient. It used to be written on the device
     /// whenever the gradient and parameter merely HAD device buffers, while the optimizer reads the host gradient
     /// unless the device copy is current and the parameter is resident - with mixed residency the term was silently

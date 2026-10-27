@@ -401,7 +401,21 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         void Unbind(Tensor<T>? t, bool isResult = true)
         {
             if (t is null || t._gpuBuffer is null) return;
+            // A gradient handed to its tensor's lifetime (LandGradientsOnHost) is bound to its own copy now.
+            if (_gradientsHandedOff?.Contains(t) == true) return;
             var backing = t.GetBackingArrayForCacheLookupUnsafe();
+            if (backing is not null && _gradientArraysHandedOff?.Contains(backing) == true)
+            {
+                // Another tensor on such a gradient's host array: drop only its own binding. The array's pending
+                // download (the group's, which reads the handed copies) is the gradient's value and must stay pending;
+                // removing or materializing it would lose the handover or download what it saves.
+                Helpers.ResidentHostMirror.Detach(t);
+                Helpers.HostSync.Remove(t.DataVector);
+                t._gpuBuffer = null;
+                t._gpuBackend = null;
+                t._gpuBufferVersion = -1;
+                return;
+            }
             if (landResults && isResult)
             {
                 // The graph wrote this step's values on the device: land them on the host before unbinding.
@@ -1014,10 +1028,49 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 Helpers.ResidentHostMirror.Detach(buffer);
         foreach (var gradient in gradients)
         {
-            if (gradient?.GetBackingArrayForCacheLookupUnsafe() is not { } backing) continue;
+            if (gradient is null || TryHandGradientToTensorLifetime(gradient)) continue;
+            if (gradient.GetBackingArrayForCacheLookupUnsafe() is not { } backing) continue;
             try { Helpers.HostSync.TryMaterialize(backing); }
             catch (InvalidOperationException) { /* released without a host copy: nothing left to preserve */ }
         }
+    }
+
+    // Gradients LandGradientsOnHost left on the device in a buffer of their own, and their host arrays.
+    private HashSet<Tensor<T>>? _gradientsHandedOff;
+    private HashSet<object>? _gradientArraysHandedOff;
+
+    /// <summary>
+    /// Keeps a parameter gradient's last value on the device past the plan, as PyTorch keeps <c>.grad</c>: one
+    /// device copy into a buffer the gradient now owns (freed with it), its host download still pending. Landing it
+    /// instead downloaded every parameter gradient whenever a plan retired - 96 MB, ~220 ms, at the end of each
+    /// N-BEATS GPU Train - though a finished training run seldom reads them (AiDotNet#1804). False when the gradient
+    /// is not a device-mirrored tensor this can keep (the caller lands it then).
+    /// </summary>
+    private bool TryHandGradientToTensorLifetime(Tensor<T> gradient)
+    {
+        if (typeof(T) != typeof(float) || !gradient.IsContiguous
+            || gradient._gpuBuffer is not { } source || source.Handle == IntPtr.Zero || source.Size < gradient.Length
+            || gradient._gpuBackend is not { } backend)
+            return false;
+        // Only a gradient whose host read goes through the resident mirror of its array, which reads its _gpuBuffer:
+        // that read is what the copy keeps answering.
+        var backing = gradient.GetBackingArrayForCacheLookupUnsafe();
+        if (backing is null || !ReferenceEquals(gradient._gpuMaterializerKey, backing) || !Helpers.HostSync.IsPending(backing))
+            return false;
+        Engines.DirectGpu.IGpuBuffer copy;
+        try
+        {
+            copy = backend.AllocateBuffer(gradient.Length);
+            backend.Copy(source, copy, gradient.Length);
+        }
+        catch (Exception ex) when (ex is NotSupportedException or InvalidOperationException or OutOfMemoryException)
+        {
+            return false;
+        }
+        gradient._gpuBuffer = copy;
+        (_gradientsHandedOff ??= new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance)).Add(gradient);
+        (_gradientArraysHandedOff ??= new HashSet<object>(ReferenceEqualityComparer<object>.Instance)).Add(backing);
+        return true;
     }
 
     /// <summary>
