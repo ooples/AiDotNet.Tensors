@@ -196,6 +196,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// <see cref="Engines.DirectGpuTensorEngine.FirstWriteRedirects"/>). Dropped by the eager step.</summary>
     private readonly Engines.FirstWriteRedirectTable _firstWriteRedirects = new();
 
+    // The stable buffers this plan's compiled actions draw their outputs and scratch from (see Engines.StepScratchPool).
+    private Engines.StepScratchPool? _scratchPool;
+
     // The gradients whose second contribution the GPU step body parks for the consuming fused BatchNorm+ReLU backward
     // (Autodiff.GradientDeferral), or null when the plan has none.
     private Autodiff.GradientDeferral? _gradientDeferral;
@@ -1015,6 +1018,22 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             try { Helpers.HostSync.TryMaterialize(backing); }
             catch (InvalidOperationException) { /* released without a host copy: nothing left to preserve */ }
         }
+    }
+
+    /// <summary>
+    /// True while this plan may use whole-step capture: its engine is trained from one thread. Once another thread runs
+    /// compiled steps on the engine, a graph this plan captured is retired (its last results landed, as on any
+    /// retirement) and the plan steps without graph replay, as it does when capture fails.
+    /// </summary>
+    private bool RetireGraphIfEngineShared(Engines.DirectGpuTensorEngine engine)
+    {
+        if (engine.AllowsWholeStepCapture) return true;
+        if (_stepGraphExec != IntPtr.Zero)
+        {
+            RecordGraphCaptureFailure("another thread trains on this engine; whole-step capture needs exclusive use of it");
+            InvalidateCapturedStepGraph();
+        }
+        return false;
     }
 
     private void InvalidateCapturedStepGraph()
@@ -3319,11 +3338,22 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         ResolvePingPongClaims(force: false);
         // The pre-step parameter upload and mark reset are part of the step: under the lock, so a concurrent caller
         // cannot upload parameters into buffers another thread's StepCore is reading.
-        lock (_stepSync)
+        var gpuEngine = _engine as Engines.DirectGpuTensorEngine;
+        gpuEngine?.NoteCompiledStepThread();
+        bool serialized = gpuEngine is { CompiledStepsFromSeveralThreads: true };
+        if (serialized) System.Threading.Monitor.Enter(gpuEngine!.CompiledStepLock);
+        try
         {
-            ClearPlanBufferReleaseMarks();
-            UploadHostWrittenParameters();
-            return StepCore();
+            lock (_stepSync)
+            {
+                ClearPlanBufferReleaseMarks();
+                UploadHostWrittenParameters();
+                return StepCore();
+            }
+        }
+        finally
+        {
+            if (serialized) System.Threading.Monitor.Exit(gpuEngine!.CompiledStepLock);
         }
     }
 
@@ -3348,7 +3378,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (s_graphStepEnabled && !_graphStepDisabled && _graphStepEligible && typeof(T) == typeof(float)
             && _checkpointing is null && _fp16HeteroOrder is null
             && _engine is Engines.DirectGpuTensorEngine gte
-            && gte.GetBackend() is Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true } cb)
+            && gte.GetBackend() is Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true } cb
+            && RetireGraphIfEngineShared(gte))
         {
             _graphStepCalls++;
             if (_graphStepCalls > GraphWarmupSteps)
@@ -3376,6 +3407,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 if (!_graphEvictionSuspended) { gte.BeginGraphLifetime(); _graphEvictionSuspended = true; }
                 if (_stepGraphExec == IntPtr.Zero)
                 {
+                    // Nothing else on the engine starts compiled GPU work while this records (see
+                    // DirectGpuTensorEngine.NoteCompiledStepThread); released when this block exits.
+                    using var captureExclusion = gte.EnterGraphCaptureExclusion();
                     // PRE-RESIDENCY runs the body with the embedding index buffer EAGER (managed=false): the embedding
                     // delegate uploads THIS step's indices inline, REGISTERS the per-step refresh action, and makes the
                     // table/output/index buffers resident. CAPTURE then re-runs the body with managed=TRUE so the
@@ -3906,6 +3940,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         bool completed = false;
         _firstWriteRedirects.BeginRun();
         if (redirectEngine is not null) redirectEngine.FirstWriteRedirects = _firstWriteRedirects;
+        // This plan's own scratch pool, for this thread, for the body only (see Engines.StepScratchPool).
+        var outerScratchPool = redirectEngine is not null
+            ? Engines.DirectGpuTensorEngine.EnterScratchPool(_scratchPool ??= redirectEngine.CreateScratchPool())
+            : null;
         _gradientDeferral?.Reset();
         // Restored rather than cleared: this body can run nested inside another plan's on this thread, and clearing
         // would lose what the outer one parked.
@@ -3915,7 +3953,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         finally
         {
             if (redirectEngine is not null) redirectEngine.DeferredGradients = outerDeferral;
-            if (redirectEngine is not null) redirectEngine.FirstWriteRedirects = null;
+            if (redirectEngine is not null)
+            {
+                redirectEngine.FirstWriteRedirects = null;
+                Engines.DirectGpuTensorEngine.RestoreScratchPool(outerScratchPool);
+            }
             // Only a whole executed run is evidence; a capture records, and a body that threw left its pairing unknown.
             _firstWriteRedirects.EndRun(executed && completed);
         }

@@ -316,6 +316,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // quiescence barrier after which no in-flight kernel references it. Guarded by _persistentBufferLock.
     private readonly List<IGpuBuffer> _retiredWeightBuffers = new();
 
+    // Whether a weight buffer the cache lets go of may be freed NOW, or must be left to its finalizer. Freeing assumes
+    // the cache is its only owner once a synchronize has drained in-flight kernels; on an engine trained from several
+    // threads another thread may still hold it - bound to its parameter, behind a host download it registers after its
+    // fused step - and launch on it later. One thread's per-step InvalidateAllWeightCaches freed another thread's just-
+    // updated weights that way (concurrent GPU Autoformer, CUDA 700, AiDotNet#1804). There a released buffer is only
+    // dropped: its finalizer frees it once nothing references it, as PyTorch frees a CUDA tensor.
+    private bool CacheMayFreeReleasedBuffers => !_compiledStepsFromSeveralThreads;
+
     // Monotonic per-call counter for stochastic-op seeds (dropout, etc.). The old code seeded the
     // GPU dropout RNG from Environment.TickCount / DateTime.UtcNow.Ticks. TickCount has ~15 ms
     // resolution, so the many dropout calls a training step fires in <1 ms all got the SAME seed →
@@ -415,7 +423,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (_capturePathDepth.Enter() == 1)
             System.Threading.Interlocked.Increment(ref s_capturePathEngines);
-        s_residentScratchEngine = this;   // route the static AllocateOutputBuffer's transient allocs here
         return new CapturePathScope(this);
     }
 
@@ -429,8 +436,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (e is not null && e._capturePathDepth.Exit() == 0)
             {
                 System.Threading.Interlocked.Decrement(ref s_capturePathEngines);
-                e._currentScratchAction = -1;
-                if (ReferenceEquals(s_residentScratchEngine, e)) s_residentScratchEngine = null;
+                e.CurrentScratchPool?.Begin(-1);
             }
         }
     }
@@ -1674,7 +1680,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         result = default;
         if (typeof(T) != typeof(float) || !view.IsView || !view.IsContiguous || view.Length == 0) return false;
         if (view.GetBackingArrayForCacheLookupUnsafe() is not T[] array || !Helpers.HostSync.IsPending(array)) return false;
-        if (!Helpers.ResidentHostMirror.TryFindCovering(array, view._storageOffset, view.Length, backend,
+        if (!Helpers.ResidentHostMirror.TryFindCovering(view, array, view._storageOffset, view.Length, backend,
                 out var memberBuffer, out int start) || memberBuffer is null)
             return false;
         var output = AllocateFullyWrittenOutputBuffer(backend, view.Length);
@@ -2702,7 +2708,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         var vector = tensor.DataVector;
         if (vector._deviceState is not { Buffer: { } buffer } state) return;
-        if (_actionScratchBuffers.Contains(buffer)) return;   // the per-action scratch pool owns it
+        if (StepScratchPool.IsPooled(buffer)) return;   // a step scratch pool owns it
         if (!tensor.IsContiguous || tensor._storageOffset != 0 || tensor.Length != vector.Length) return;
         if (s_staleDropTrace)
             StaleDropDiag($"RELEASE-DEAD len={tensor.Length} caller=" + new System.Diagnostics.StackTrace(1, false).ToString().Replace(System.Environment.NewLine, " <- "));
@@ -3051,6 +3057,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // evicted from the cache (no new reader can obtain them); the synchronize is a quiescence barrier
             // draining any in-flight kernel that fetched them lock-free before eviction, so freeing them now is
             // safe. Skipped under capture (sync illegal) — they persist to the next non-capturing drain.
+            if (!capturing && _retiredWeightBuffers.Count > 0 && !CacheMayFreeReleasedBuffers)
+                _retiredWeightBuffers.Clear();   // left to their finalizers (see CacheMayFreeReleasedBuffers)
             if (!capturing && _retiredWeightBuffers.Count > 0)
             {
                 backend.Synchronize();
@@ -3119,7 +3127,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private static OwnedBuffer AllocateFullyWrittenOutputBuffer(IDirectGpuBackend backend, int size)
     {
-        var eng = s_residentScratchEngine;
+        var eng = t_scratchPool?.Engine;
         if (eng is not null && eng.ScratchPoolingActive)
             return new OwnedBuffer(eng.RentActionScratchOrAllocate(backend, size, fullyWritten: true), ownsBuffer: false);
         return new OwnedBuffer(AllocateReclaiming(backend, b => AllocateDeviceBufferUninitialized(b, size)), ownsBuffer: true);
@@ -3162,7 +3170,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // PR #638 capture-determinism: inside a compiled action during the resident step, draw from the engine's
         // per-action static pool (stable address by (action,local) → no graph alloc node, no AUTO_FREE
         // non-determinism). ownsBuffer:false so the caller's using/Dispose is a no-op on the pooled buffer.
-        var eng = s_residentScratchEngine;
+        var eng = t_scratchPool?.Engine;
         if (eng is not null && eng.ScratchPoolingActive)
             return new OwnedBuffer(eng.RentActionScratchOrAllocate(backend, size), ownsBuffer: false);
         return new OwnedBuffer(AllocateReclaiming(backend, b => b.AllocateBuffer(size)), ownsBuffer: true);
@@ -3177,7 +3185,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private static OwnedBuffer AllocateTransientScratch(IDirectGpuBackend backend, int size, bool fullyWritten = false)
     {
-        var eng = s_residentScratchEngine;
+        var eng = t_scratchPool?.Engine;
         if (eng is not null && eng.ScratchPoolingActive)
             return new OwnedBuffer(eng.RentTransientScratch(backend, size, fullyWritten), ownsBuffer: false);
         return new OwnedBuffer(AllocateReclaiming(backend,
@@ -5181,25 +5189,82 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // within that action): action i's allocs ALWAYS map to the same buffers regardless of what other actions
     // do → robust + deterministic across the pre-residency pass, the capture pass, and every replay. The pool
     // persists for the plan's life (the replayed graph bakes in these addresses). Pooling engages ONLY inside a
-    // compiled action (_currentScratchAction >= 0); the pre-pass (EnsureResidentBuffer) and the eager optimizer
+    // compiled action (the pools Action >= 0); the pre-pass (EnsureResidentBuffer) and the eager optimizer
     // run with action = -1 → normal alloc, so the cached-once persistent buffers are never pooled.
-    private readonly System.Collections.Generic.Dictionary<long, IGpuBuffer> _actionScratchPool = new();
-    // The pool's buffers by identity: a tensor wrapping one (a pooled zero gradient, a pooled reduction) does not own it,
-    // so freeing that tensor's storage early must leave the buffer to the pool, whose captured graphs bake its address.
-    private readonly System.Collections.Generic.HashSet<IGpuBuffer> _actionScratchBuffers = new();
-    private int _currentScratchAction = -1;
-    private int _currentScratchLocal;
-    // The step's transient arena (AllocateTransientScratch): scratch that dies when its op returns, keyed by
-    // (transient-local index within the action, size class) and so SHARED by every action. Actions run in order on
-    // one stream, in eager replay and in the captured graph alike, so action j's kernels start after action i's
-    // finished with the same buffer, as they did when each op freed its scratch stream-ordered. Keying per action
-    // instead kept every action's scratch for the plan's life: 24 GroupNorm backwards on [32,256,256] held ~3.2 GiB.
-    // A slot is never resized (a size class is its own slot), so no buffer a captured graph baked in is ever freed
-    // before ClearActionScratchPool.
-    private readonly System.Collections.Generic.Dictionary<(int Local, long SizeClass), IGpuBuffer> _transientScratch = new();
-    private int _currentTransientLocal;
-    // The (action, local) key of each pooled buffer, so a first-write gradient copy can name the slot it came from.
-    private readonly System.Collections.Generic.Dictionary<IGpuBuffer, long> _actionScratchKeys = new();
+    // The pool is the PLAN's (StepScratchPool), entered by the thread running its step body: one pool per engine was
+    // shared by every plan and thread on it (AiDotNet#1804, see StepScratchPool).
+    [ThreadStatic] private static StepScratchPool? t_scratchPool;
+
+    /// <summary>The scratch pool of the compiled step this thread is running on this engine, or null.</summary>
+    private StepScratchPool? CurrentScratchPool => t_scratchPool is { } pool && ReferenceEquals(pool.Engine, this) ? pool : null;
+
+    /// <summary>A new scratch pool for a compiled plan on this engine.</summary>
+    internal StepScratchPool CreateScratchPool() => new(this);
+
+    /// <summary>Makes <paramref name="pool"/> this thread's scratch pool for a step body; returns the previous one,
+    /// for <see cref="RestoreScratchPool"/> (a plan's body can run nested inside another's).</summary>
+    internal static StepScratchPool? EnterScratchPool(StepScratchPool? pool)
+    {
+        var previous = t_scratchPool;
+        t_scratchPool = pool;
+        return previous;
+    }
+
+    internal static void RestoreScratchPool(StepScratchPool? previous) => t_scratchPool = previous;
+
+    // Whole-step CUDA-graph capture assumes nothing else uses this engine's GPU while a step records: its warm-up, pre-pass
+    // and capture share the engine's device caches and stream with any other thread's work, so a second thread training
+    // on the same engine corrupted captured steps and faulted the context (CUDA 700; concurrent GPU Autoformer,
+    // AiDotNet#1804). PyTorch states the same rule for torch.cuda.graph. So capture is for an engine one thread trains
+    // on: the first compiled step's thread owns it, and once another thread steps, no plan on the engine captures again.
+    private int _compiledStepThread;
+    private volatile bool _compiledStepsFromSeveralThreads;
+    private readonly object _graphCaptureGate = new();
+
+    /// <summary>
+    /// Records that the calling thread runs a compiled training step on this engine. A thread other than the first marks
+    /// the engine shared, after waiting out any capture in progress (<see cref="EnterGraphCaptureExclusion"/>), so no capture
+    /// can be recording while that thread's GPU work starts.
+    /// </summary>
+    internal void NoteCompiledStepThread()
+    {
+        int thread = Environment.CurrentManagedThreadId;
+        int owner = System.Threading.Interlocked.CompareExchange(ref _compiledStepThread, thread, 0);
+        if (owner == 0 || owner == thread || _compiledStepsFromSeveralThreads) return;
+        lock (_graphCaptureGate) _compiledStepsFromSeveralThreads = true;
+    }
+
+    /// <summary>
+    /// Held around each compiled step once the engine is trained from several threads. The steps share the engine's
+    /// device caches, resident bindings and stream, and one step's work against another's (a weight re-upload, a
+    /// retired buffer, an optimizer update reading a parameter another thread just rebound) faulted the context (CUDA
+    /// 700, concurrent GPU Autoformer, AiDotNet#1804). One stream runs their kernels in turn anyway, so serializing the
+    /// steps costs no device time.
+    /// </summary>
+    internal object CompiledStepLock { get; } = new();
+
+    internal bool CompiledStepsFromSeveralThreads => _compiledStepsFromSeveralThreads;
+
+    /// <summary>True when compiled steps on this engine may be captured as CUDA graphs: one thread trains on it.</summary>
+    internal bool AllowsWholeStepCapture => !_compiledStepsFromSeveralThreads;
+
+    /// <summary>Held by a plan from its capture pre-pass to the instantiated graph: another thread's first compiled step
+    /// waits for it.</summary>
+    internal IDisposable EnterGraphCaptureExclusion()
+    {
+        System.Threading.Monitor.Enter(_graphCaptureGate);
+        return new GraphCaptureExclusion(_graphCaptureGate);
+    }
+
+    private sealed class GraphCaptureExclusion : IDisposable
+    {
+        private object? _gate;
+        public GraphCaptureExclusion(object gate) => _gate = gate;
+        public void Dispose()
+        {
+            if (System.Threading.Interlocked.Exchange(ref _gate, null) is { } gate) System.Threading.Monitor.Exit(gate);
+        }
+    }
 
     /// <summary>
     /// The running compiled plan's first-write redirects (null outside its captured step body; see
@@ -5207,7 +5272,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// contribution of the step is handed that accumulator's device buffer, so the op writes the gradient in place and
     /// the first-write copy (a memcpy node per gradient per captured step) finds one buffer and issues nothing.
     /// </summary>
-    internal FirstWriteRedirectTable? FirstWriteRedirects { get; set; }
+    internal FirstWriteRedirectTable? FirstWriteRedirects
+    {
+        get => t_firstWriteRedirects;
+        set => t_firstWriteRedirects = value;
+    }
+
+    // Per thread, as the plan lends it to the step body running on this thread (like DeferredGradients).
+    [ThreadStatic] private static FirstWriteRedirectTable? t_firstWriteRedirects;
 
     /// <summary>
     /// The compiled plan's deferred gradient contributions while its GPU step body runs (see
@@ -5226,17 +5298,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal void RecordFirstWriteRedirect(IGpuBuffer contribution, IGpuBuffer accumulator, int length)
     {
         if (FirstWriteRedirects is not { } table || ReferenceEquals(contribution, accumulator)
-            || !_actionScratchKeys.TryGetValue(contribution, out long key) || accumulator.Size < length)
+            || CurrentScratchPool is not { } pool || !pool.Keys.TryGetValue(contribution, out long key) || accumulator.Size < length)
             return;
         table.Offer(key, contribution, accumulator);
     }
 
     /// <summary>Mark the compiled action whose transient scratch allocs are pooled by (action, local) for
     /// capture determinism. Call before each fwd/bwd action; pass -1 to disable (pre-pass / optimizer / eval).</summary>
-    internal void SetCurrentScratchAction(int action) { _currentScratchAction = action; _currentScratchLocal = 0; _currentTransientLocal = 0; }
+    internal void SetCurrentScratchAction(int action) => CurrentScratchPool?.Begin(action);
 
-    /// <summary>True while inside a compiled action whose transient scratch should draw from the static pool.</summary>
-    private bool ScratchPoolingActive => _currentScratchAction >= 0 && ResidentStepActive;
+    /// <summary>True while inside a compiled action whose transient scratch should draw from its plan's pool, on the
+    /// thread running that step.</summary>
+    private bool ScratchPoolingActive => CurrentScratchPool is { Action: >= 0 } && ResidentStepActive;
 
     /// <summary>Pool a transient when inside a compiled action (stable buffer by (action,local)); else normal alloc.
     /// Exposed for the static AllocateOutputBuffer routing.</summary>
@@ -5245,7 +5318,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     private IGpuBuffer RentActionScratch(IDirectGpuBackend backend, int length, bool fullyWritten = false)
     {
-        long key = ((long)_currentScratchAction << 32) | (uint)_currentScratchLocal++;
+        var pool = CurrentScratchPool!;
+        long key = ((long)pool.Action << 32) | (uint)pool.Local++;
         if (FirstWriteRedirects is { } redirects && redirects.TryGetTarget(key, out var target))
         {
             if (target.Handle != System.IntPtr.Zero && target.Size >= length)
@@ -5260,7 +5334,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
             redirects.Drop(key);
         }
-        if (_actionScratchPool.TryGetValue(key, out var b) && b is not null
+        if (pool.Slots.TryGetValue(key, out var b) && b is not null
             && b.Handle != System.IntPtr.Zero && b.Size >= length)
         {
             // Re-zero on reuse to preserve the alloc-zero invariant (accumulate / partial-write ops read it).
@@ -5272,11 +5346,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             else backend.Fill(b, 0f, length);
             return b;
         }
-        if (b is not null) { _actionScratchBuffers.Remove(b); _actionScratchKeys.Remove(b); try { b.Dispose(); } catch { } }
+        if (b is not null) { StepScratchPool.Untrack(b); pool.Keys.Remove(b); try { b.Dispose(); } catch { } }
         var nb = backend.AllocateBuffer(length);   // first pass at this (action,local): record the stable buffer
-        _actionScratchPool[key] = nb;
-        _actionScratchBuffers.Add(nb);
-        _actionScratchKeys[nb] = key;
+        pool.Slots[key] = nb;
+        pool.Track(nb);
+        pool.Keys[nb] = key;
         return nb;
     }
 
@@ -5288,8 +5362,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private IGpuBuffer RentTransientScratch(IDirectGpuBackend backend, int length, bool fullyWritten = false)
     {
         long sizeClass = TransientSizeClass(length);
-        var key = (_currentTransientLocal++, sizeClass);
-        if (_transientScratch.TryGetValue(key, out var b) && b.Handle != System.IntPtr.Zero)
+        var pool = CurrentScratchPool!;
+        var key = (pool.TransientLocal++, sizeClass);
+        if (pool.Transient.TryGetValue(key, out var b) && b.Handle != System.IntPtr.Zero)
         {
             if (fullyWritten) return b;
             if (backend is IDeviceZeroFill zero) zero.ZeroBuffer(b, length);
@@ -5297,8 +5372,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return b;
         }
         var nb = backend.AllocateBuffer(checked((int)sizeClass));
-        _transientScratch[key] = nb;
-        _actionScratchBuffers.Add(nb);
+        pool.Transient[key] = nb;
+        pool.Track(nb);
         return nb;
     }
 
@@ -5311,7 +5386,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return (((length - 1L) >> shift) + 1) << shift;
     }
 
-    /// <summary>Dispose + clear the per-action capture scratch pool. Call at the training→eval transition:
+    /// <summary>Dispose + clear the scratch pool of the compiled step running on this thread. Call at the training→eval transition:
     /// these pooled transient buffers are training-only (the captured graph does NOT replay during forward-only
     /// eval), and on a big model (d256/L4+) they hold GBs that the async pool reserved at the training peak.
     /// Freeing them returns that memory to the pool (then trimmable to the OS on the next alloc-OOM retry), so
@@ -5319,24 +5394,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// step will run on this plan (eval is terminal); a replay after this would read freed device memory.</summary>
     public void ClearActionScratchPool()
     {
-        foreach (var kv in _actionScratchPool)
-            { try { kv.Value?.Dispose(); } catch { } }
-        _actionScratchPool.Clear();
-        foreach (var kv in _transientScratch)
-            { try { kv.Value.Dispose(); } catch { } }
-        _transientScratch.Clear();
-        _currentTransientLocal = 0;
-        _actionScratchBuffers.Clear();
-        _actionScratchKeys.Clear();
+        CurrentScratchPool?.Release();
         FirstWriteRedirects?.Clear();   // the pooled slots it maps are gone
-        _currentScratchAction = -1;
-        _currentScratchLocal = 0;
     }
-
-    // Set during the resident step so the STATIC AllocateOutputBuffer can route transient allocs into this
-    // engine's per-action pool. Plain static (one plan captures at a time on the single GPU; resident step is
-    // single-threaded in practice). Set on EnterCompiledCapturePath, cleared when its depth returns to 0.
-    private static DirectGpuTensorEngine? s_residentScratchEngine;
 
     private IGpuBuffer GetOrCreateResidentBuffer<T>(IDirectGpuBackend backend, Tensor<T> t, int length, bool fullyWritten = false)
     {
@@ -8620,8 +8680,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 if (Helpers.HostSync.IsPending(pair.Key))
                     (kept ??= new List<KeyValuePair<object, GpuBufferCacheEntry>>()).Add(pair);
-                else
+                else if (CacheMayFreeReleasedBuffers)
                     pair.Value.Dispose();
+                // else: dropped, freed by its finalizer once unreferenced (see CacheMayFreeReleasedBuffers)
             }
             List<KeyValuePair<object, int>>? keptStamps = null;
             if (kept is not null)
@@ -8640,8 +8701,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 foreach (var stamp in keptStamps!) _persistentWeightHostVersion[stamp.Key] = stamp.Value;
             }
             // Reclaim any buffers still awaiting deferred disposal: the whole cache is being torn down, so
-            // there is no reader to race and they would otherwise leak.
-            foreach (var retired in _retiredWeightBuffers) retired.Dispose();
+            // there is no reader to race and they would otherwise leak (on a shared engine their finalizers do).
+            if (CacheMayFreeReleasedBuffers)
+                foreach (var retired in _retiredWeightBuffers) retired.Dispose();
             _retiredWeightBuffers.Clear();
         }
     }

@@ -986,13 +986,13 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         using (gpu)
         {
             AiDotNetEngine.Current = gpu;
-            var arena = typeof(DirectGpuTensorEngine).GetField("_transientScratch", BindingFlags.NonPublic | BindingFlags.Instance)!;
-            int Slots() => ((System.Collections.ICollection)arena.GetValue(gpu)!).Count;
+            var pool = gpu.CreateScratchPool();
+            int Slots() => pool.Transient.Count;
             var x = Rand([Batch, Inputs], 31, 1f);
             var y = Rand([Hidden, Inputs], 32, 1f);
             var expected = ((IEngine)gpu).PairwiseDistanceSquared(x, y).ToArray();   // unpooled
-            gpu.ClearActionScratchPool();
             // The compiled step's resident path, as CompiledTrainingPlan runs it: one scratch action per op.
+            var outerPool = DirectGpuTensorEngine.EnterScratchPool(pool);
             gpu.SuspendActivationEviction();
             try
             {
@@ -1017,7 +1017,8 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             finally
             {
                 gpu.ResumeActivationEviction();
-                gpu.ClearActionScratchPool();
+                DirectGpuTensorEngine.RestoreScratchPool(outerPool);
+                pool.Release();
             }
         }
     }
@@ -1070,6 +1071,60 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                 $"retiring the graph read back {readBack} bytes; the parameter gradients are {parameterBytes}");
             Assert.All(gradients, g => Assert.Contains(g.ToArray(), v => v != 0f));
             if (viaDisableGraphStep) plan.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Plans trained from several threads on ONE engine train exactly as each does alone, with every step followed by
+    /// the engine-wide weight-cache invalidation a fused training session issues. That invalidation freed the weight
+    /// buffers another thread had just updated on the device and was about to read, and the steps shared the engine's
+    /// scratch pool and caches: concurrent GPU Autoformer faulted with CUDA 700 (AiDotNet#1804).
+    /// </summary>
+    [SkippableFact]
+    public void Plans_trained_concurrently_on_one_engine_train_as_they_do_alone()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            float[] Train(int seed)
+            {
+                var x = Rand([Inputs, 64], seed, 1f);
+                var y = Rand([Hidden, 64], seed + 1, 1f);
+                var w = Rand([Hidden, Inputs], seed + 2, 0.3f);
+                w.Gpu();
+                ICompiledTrainingPlan<float> plan;
+                using (var scope = GraphMode.EnableTraining(new[] { w }))
+                {
+                    var h = gpu.Tanh(gpu.TensorMatMul(w, x));
+                    var shifted = gpu.TensorSubtract(h, gpu.ReduceMax(h, new[] { 0 }, keepDims: true));
+                    var diff = gpu.TensorSubtract(shifted, y);
+                    gpu.ReduceMean(gpu.TensorMultiply(diff, diff), new[] { 0, 1 }, keepDims: false);
+                    plan = scope.CompileTraining(new[] { w });
+                }
+                using (plan)
+                {
+                    plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
+                    for (int s = 0; s < 3 * Steps; s++)
+                    {
+                        FeedBatch(x, y, s);
+                        plan.Step();
+                        gpu.InvalidateAllWeightCaches();   // as FusedTrainingSession does after every fused step
+                    }
+                }
+                return w.ToArray();
+            }
+            int[] seeds = { 101, 202, 303, 404 };
+            var alone = seeds.Select(Train).ToArray();
+            var together = new float[seeds.Length][];
+            var errors = new System.Collections.Concurrent.ConcurrentBag<Exception>();
+            System.Threading.Tasks.Parallel.For(0, seeds.Length, new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = seeds.Length },
+                i => { try { together[i] = Train(seeds[i]); } catch (Exception ex) { errors.Add(ex); } });
+            Assert.True(errors.IsEmpty, string.Join(" | ", errors.Select(e => e.GetType().Name + ": " + e.Message)));
+            for (int i = 0; i < seeds.Length; i++)
+                for (int k = 0; k < alone[i].Length; k++)
+                    Assert.True(Math.Abs(alone[i][k] - together[i][k]) <= 1e-4f * Math.Max(1f, Math.Abs(alone[i][k])),
+                        $"plan {i}: w[{k}] trained concurrently {together[i][k]} != alone {alone[i][k]}");
         }
     }
 

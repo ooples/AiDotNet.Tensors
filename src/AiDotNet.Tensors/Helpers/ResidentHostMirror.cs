@@ -82,9 +82,12 @@ internal static class ResidentHostMirror
     /// The resident member on <paramref name="array"/> whose device buffer holds storage range
     /// [<paramref name="offset"/>, <paramref name="offset"/> + <paramref name="length"/>), and where that range starts
     /// in its buffer. A slice of a resident step tensor shares this array but not the member's buffer field, so this
-    /// is the only way to reach its device data without downloading it.
+    /// is the only way to reach its device data without downloading it. Only a member over the SAME storage as
+    /// <paramref name="view"/> counts: host arrays are pooled, so a member that merely shares the array may be a
+    /// tensor of another plan or thread holding unrelated data, and copying from its buffer read that data (or a
+    /// buffer its owner was releasing: a concurrent GPU Autoformer faulted with CUDA 700).
     /// </summary>
-    internal static bool TryFindCovering<T>(T[] array, int offset, int length, object backend,
+    internal static bool TryFindCovering<T>(Tensor<T> view, T[] array, int offset, int length, object backend,
         out IGpuBuffer? buffer, out int bufferOffset)
     {
         buffer = null; bufferOffset = 0;
@@ -95,6 +98,7 @@ internal static class ResidentHostMirror
         {
             if (!weak.TryGetTarget(out var t) || !HasContiguousResidentBuffer(t)) continue;
             if (!ReferenceEquals(t._gpuBackend, backend) || !ReferenceEquals(t.GetBackingArrayForCacheLookupUnsafe(), array)) continue;
+            if (!t.SharesStorageWith(view)) continue;
             var b = t._gpuBuffer!;
             if (b.Handle == IntPtr.Zero) continue;
             int start = offset - t._storageOffset;
