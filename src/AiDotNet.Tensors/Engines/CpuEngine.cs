@@ -38496,6 +38496,7 @@ public partial class CpuEngine : ITensorLevelEngine
         using var destinationKeep24 = new KeepAliveScope(destination);
         source.AsSpanUnmarked().Slice(0, source.Length).CopyTo(destination.AsWritableSpanUnmarked());
         destination.IncrementVersion();
+        InvalidatePersistentTensor(destination);
     }
 
     /// <inheritdoc/>

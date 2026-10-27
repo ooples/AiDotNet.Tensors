@@ -22437,6 +22437,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // rebind, which re-registers the host-read download for this buffer.
                 destination.IncrementVersion();
                 BindResidentBuffer(destination, destinationBuffer, backend);
+                // Invalidate CPU-derived weight packs without invoking the host-write GPU re-upload path.
+                base.InvalidatePersistentTensor(destination);
                 return;
             }
             catch (NotSupportedException ex) {

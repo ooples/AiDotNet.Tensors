@@ -114,4 +114,38 @@ public class XLstmDeviceTrainingTests
             }
         }
     }
+
+    [Fact]
+    public void TensorCopy_InvalidatesCpuWeightPacks()
+    {
+        var engine = new CpuEngine();
+        var target = new Tensor<float>(new[] { 2, 2 });
+        var source = new Tensor<float>(new[] { 2, 2 }); source[0] = 3;
+        var backing = target.GetLiveBackingArrayOrNull()!;
+        long version = AiDotNet.Tensors.Engines.Simd.SimdGemm.WeightArrayVersionOf(backing);
+        engine.TensorCopy(source, target);
+        Assert.True(AiDotNet.Tensors.Engines.Simd.SimdGemm.WeightArrayVersionOf(backing) > version);
+        Assert.Equal(3, target[0]);
+    }
+
+    [Fact]
+    public void OpenCl_CopyIntoPersistentWeightStaysResidentAndRefreshesConsumers()
+    {
+        using var backend = new OpenClBackend(); Assert.True(backend.IsAvailable);
+        using var direct = new DirectGpuEngine(backend); using var gpu = new DirectGpuTensorEngine(direct);
+        IEngine engine = gpu;
+        var target = new Tensor<float>(new[] { 2, 2 }); target[0] = 1; target[3] = 1;
+        var source = new Tensor<float>(new[] { 2, 2 }); source[0] = 3; source[3] = 4;
+        engine.RegisterPersistentTensor(target, PersistentTensorRole.Weights);
+        var input = new Tensor<float>(new[] { 1, 2 }); input[0] = 2; input[1] = 5;
+        engine.TensorMatMul(input, target);
+        Tensor<float> result;
+        using (var scope = AiDotNet.Tensors.Engines.Diagnostics.GpuResidencyScope.Begin(captureOperations: true))
+        {
+            engine.TensorCopy(source, target);
+            result = engine.TensorMatMul(input, target);
+            Assert.True(scope.Downloads == 0, string.Join("\n", scope.Events));
+        }
+        Assert.Equal(new float[] { 6, 20 }, result.ToArray());
+    }
 }
