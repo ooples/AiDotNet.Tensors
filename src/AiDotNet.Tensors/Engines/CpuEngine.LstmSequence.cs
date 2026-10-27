@@ -349,6 +349,20 @@ public partial class CpuEngine
             return (Tensor<T>)(object)outF;
         }
 
+        // Reuse the typed GEMM/activation core for double inference too. The generic
+        // numeric loop defeats the fused layer dispatch and is slower than composed GEMMs.
+        if (typeof(T) == typeof(double))
+        {
+            var output = LstmSequenceForwardDoubleTrain(
+                (Tensor<double>)(object)input, (Tensor<double>?)(object?)h0, (Tensor<double>?)(object?)c0,
+                (Tensor<double>)(object)wIh, (Tensor<double>)(object)wHh,
+                (Tensor<double>?)(object?)bIh, (Tensor<double>?)(object?)bHh,
+                batch, seqLen, inFeatures, hidden, gateRows, returnSequences, wantState,
+                out var hn, out var cn);
+            finalHidden = (Tensor<T>)(object)hn; finalCell = (Tensor<T>)(object)cn;
+            return (Tensor<T>)(object)output;
+        }
+
         return LstmSequenceForwardGeneric(
             input, h0, c0, wIh, wHh, bIh, bHh,
             batch, seqLen, inFeatures, hidden, gateRows, returnSequences, wantState,

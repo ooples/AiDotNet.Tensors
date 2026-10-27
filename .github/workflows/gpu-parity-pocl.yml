@@ -19,7 +19,7 @@ name: GPU Parity (POCL / CPU-OpenCL)
 # Vulkan/WebGpu) and the GPU-feature-specific OpenCL kernels (FlashDecode/PagedAttention/QuantGemm/
 # RopeGqa) are excluded — POCL can't provide those devices/features, so they'd fail "unavailable".
 #
-# STATUS: informational (continue-on-error), NOT required. POCL has also shown intermittent
+# STATUS: recurrent-foundations is a required pass; the other shards are informational. POCL has shown intermittent
 # DirectGpu-init failures on hosted runners that are unreproducible without POCL hardware locally.
 # This runs + uploads a per-shard divergence report but never blocks. Promote a shard to required
 # in branch protection only once it is reliably green here. The fully reliable gate remains real GPU
@@ -57,7 +57,7 @@ jobs:
         # tape-gradient); AIDOTNET_PARITY_SHARD=k/N partitions each into sub-shards via ParityShard so
         # each POCL process stays under its per-process kernel-compile ceiling. `name` is the job label.
         include:
-          - { name: recurrent-foundations, required: true, filter: "FullyQualifiedName~LstmGateKernelTests|FullyQualifiedName~LstmFinalStateGradientTests|FullyQualifiedName~XLstmDeviceTrainingTests" }
+          - { name: recurrent-foundations, required: true, coverage: true, filter: "FullyQualifiedName~LstmGateKernelTests|FullyQualifiedName~LstmFinalStateGradientTests|FullyQualifiedName~XLstmDeviceTrainingTests" }
           - { name: lstm,            filter: "FullyQualifiedName~GpuMissingKernelsParityTests.LstmSequence" }
           - { name: missing-kernels, filter: "FullyQualifiedName~GpuMissingKernelsParityTests&FullyQualifiedName!~LstmSequence" }
           - { name: scan-kernels,    filter: "FullyQualifiedName~ScanGpuParityTests|FullyQualifiedName~Rwkv4WkvGpuParityTests" }

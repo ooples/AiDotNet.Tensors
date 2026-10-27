@@ -12,6 +12,25 @@ namespace AiDotNet.Tensors.Tests.Engines;
 [Collection("CompilationGlobalState")]
 public class LstmGateKernelTests
 {
+    [Fact]
+    public void WideFloatGates_MatchDecomposedGradientsWithSaturatedInputs()
+    {
+        var engine = new CpuEngine(); var gates = Values<float>(new[] { 2, 256 }); var old = Values<float>(new[] { 2, 64 });
+        for (int i = 0; i < gates.Length; i++) gates[i] *= 20;
+        var sources = new[] { gates, old };
+        Tensor<float> actual; Dictionary<Tensor<float>, Tensor<float>> gradients;
+        using (var tape = new GradientTape<float>())
+        {
+            actual = Loss(engine, gates, old, 3, false);
+            gradients = tape.ComputeGradients(actual, sources);
+        }
+        using var reference = new GradientTape<float>();
+        var expected = Loss(engine, gates, old, 3, true);
+        var expectedGradients = reference.ComputeGradients(expected, sources);
+        Near(expected, actual, 3e-4);
+        foreach (var source in sources) Near(expectedGradients[source], gradients[source], 3e-5);
+    }
+
     [Fact, Trait("Category", "RequiresOpenCL")]
     public void TensorCopy_PermutedSourceRemainsResident()
     {

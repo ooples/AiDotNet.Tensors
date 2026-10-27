@@ -46,6 +46,8 @@ public partial class CpuEngine
 
     protected virtual Tensor<T> RunLstmGatePacket<T>(Tensor<T> gates, Tensor<T> previousCell)
     {
+        if (typeof(T) == typeof(float))
+            return (Tensor<T>)(object)RunLstmGatePacketFloat((Tensor<float>)(object)gates, (Tensor<float>)(object)previousCell);
         var ops = MathHelper.GetNumericOperations<T>();
         int count = previousCell.Length, hidden = previousCell.Shape[previousCell.Rank - 1];
         var pre = gates.GetFlattenedData(); var old = previousCell.GetFlattenedData();
@@ -69,6 +71,14 @@ public partial class CpuEngine
         object[]? saved, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         if (engine is DirectGpuTensorEngine gpu && gpu.TryLstmGateBackward(gradient, inputs, output, grads)) return;
+        if (typeof(T) == typeof(float))
+        {
+            var (dgFloat, dcFloat) = LstmGateBackwardFloat((Tensor<float>)(object)gradient,
+                (Tensor<float>)(object)inputs[0], (Tensor<float>)(object)inputs[1], (Tensor<float>)(object)output);
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], (Tensor<T>)(object)dgFloat, engine);
+            DifferentiableOps.AccumulateGrad(grads, inputs[1], (Tensor<T>)(object)dcFloat, engine);
+            return;
+        }
         var ops = MathHelper.GetNumericOperations<T>();
         int count = inputs[1].Length, hidden = inputs[1].Shape[inputs[1].Rank - 1];
         var pre = inputs[0].GetFlattenedData(); var old = inputs[1].GetFlattenedData();
@@ -94,4 +104,59 @@ public partial class CpuEngine
         DifferentiableOps.AccumulateGrad(grads, inputs[0], dg, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], dc, engine);
     }
+    private static float[] ActivateLstmGatesFloat(Tensor<float> gates, int hidden)
+    {
+        var pre = gates.GetFlattenedData();
+        var activated = new float[gates.Length];
+        for (int offset = 0; offset < activated.Length; offset += 4 * hidden)
+        {
+            Simd.SimdKernels.Sigmoid(pre.AsSpan(offset, hidden), activated.AsSpan(offset, hidden));
+            Simd.SimdKernels.Sigmoid(pre.AsSpan(offset + hidden, hidden), activated.AsSpan(offset + hidden, hidden));
+            Simd.SimdKernels.Tanh(pre.AsSpan(offset + 2 * hidden, hidden), activated.AsSpan(offset + 2 * hidden, hidden));
+            Simd.SimdKernels.Sigmoid(pre.AsSpan(offset + 3 * hidden, hidden), activated.AsSpan(offset + 3 * hidden, hidden));
+        }
+        return activated;
+    }
+
+    private static Tensor<float> RunLstmGatePacketFloat(Tensor<float> gates, Tensor<float> previousCell)
+    {
+        int count = previousCell.Length, hidden = previousCell.Shape[previousCell.Rank - 1];
+        var act = ActivateLstmGatesFloat(gates, hidden); var old = previousCell.GetFlattenedData();
+        var result = new Tensor<float>(new[] { checked(2 * count) });
+        using var write = result.LeaseWritable();
+        var cell = write.Span.Slice(count, count); var hiddenOut = write.Span.Slice(0, count);
+        for (int k = 0; k < count; k++)
+        {
+            int g = (k / hidden) * 4 * hidden + k % hidden;
+            cell[k] = act[g + hidden] * old[k] + act[g] * act[g + 2 * hidden];
+        }
+        Simd.SimdKernels.Tanh(cell, hiddenOut);
+        for (int k = 0; k < count; k++)
+            hiddenOut[k] *= act[(k / hidden) * 4 * hidden + k % hidden + 3 * hidden];
+        return result;
+    }
+
+    private static (Tensor<float> gates, Tensor<float> cell) LstmGateBackwardFloat(
+        Tensor<float> gradient, Tensor<float> gates, Tensor<float> previousCell, Tensor<float> output)
+    {
+        int count = previousCell.Length, hidden = previousCell.Shape[previousCell.Rank - 1];
+        var act = ActivateLstmGatesFloat(gates, hidden); var old = previousCell.GetFlattenedData();
+        var dy = gradient.GetFlattenedData(); var y = output.GetFlattenedData();
+        var tc = new float[count]; Simd.SimdKernels.Tanh(y.AsSpan(count, count), tc.AsSpan());
+        var dg = new Tensor<float>(gates.Shape.ToArray()); var dc = new Tensor<float>(previousCell.Shape.ToArray());
+        using var gw = dg.LeaseWritable(); using var cw = dc.LeaseWritable();
+        for (int k = 0; k < count; k++)
+        {
+            int g = (k / hidden) * 4 * hidden + k % hidden;
+            float i = act[g], f = act[g + hidden], z = act[g + 2 * hidden], o = act[g + 3 * hidden];
+            float d = dy[count + k] + dy[k] * o * (1 - tc[k] * tc[k]);
+            gw.Span[g] = d * z * i * (1 - i);
+            gw.Span[g + hidden] = d * old[k] * f * (1 - f);
+            gw.Span[g + 2 * hidden] = d * i * (1 - z * z);
+            gw.Span[g + 3 * hidden] = dy[k] * tc[k] * o * (1 - o);
+            cw.Span[k] = d * f;
+        }
+        return (dg, dc);
+    }
+
 }
