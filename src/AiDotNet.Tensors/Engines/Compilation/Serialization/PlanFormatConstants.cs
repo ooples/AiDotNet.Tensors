@@ -109,6 +109,7 @@ internal static class PlanFormatConstants
     internal const byte TagInt64Array = 0x0B; // long[] — used by index snapshots that may exceed int.MaxValue (large-vocab embeddings)
     internal const byte TagBoolArray  = 0x0C;
     internal const byte TagFusedActivationParams = 0x0D;
+    internal const byte TagInt32Tensor = 0x0E; // shape + values: a device argmax a float plan's GPU ReduceMax keeps
 
     // ── MultiHeadAttentionForward saved-state schema ───────────────────────
     internal const int MultiHeadAttentionInputCount = 5;

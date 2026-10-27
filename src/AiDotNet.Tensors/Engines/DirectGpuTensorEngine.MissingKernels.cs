@@ -318,8 +318,8 @@ public partial class DirectGpuTensorEngine
         using var targetBuffer = GetOrAllocateBuffer(backend, targetValues);
         using var inputLengthBuffer = GetOrAllocateBuffer(backend, inputLengthValues);
         using var targetLengthBuffer = GetOrAllocateBuffer(backend, targetLengthValues);
-        // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-        using var workspaceLease = AllocateOutputBuffer(backend, checked(batchSize * 2 * maxStates));
+        // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+        using var workspaceLease = AllocateTransientScratch(backend, checked(batchSize * 2 * maxStates));
         var workspace = workspaceLease.Buffer;
         return DispatchDeferredGpuOp<T>(backend, batchSize, new[] { batchSize }, losses =>
             ctcBackend.CtcLoss(
@@ -343,8 +343,8 @@ public partial class DirectGpuTensorEngine
             return base.TensorMax(tensor, value);
 
         using var input = GetOrAllocateBuffer(backend, tensor);
-        // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-        using var scalarLease = AllocateOutputBuffer(backend, tensor.Length);
+        // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+        using var scalarLease = AllocateTransientScratch(backend, tensor.Length);
         var scalar = scalarLease.Buffer;
         backend.Fill(scalar, Convert.ToSingle(value), tensor.Length);
         var result = DispatchDeferredGpuOp<T>(backend, tensor.Length, tensor.Shape.ToArray(), output =>
@@ -362,8 +362,8 @@ public partial class DirectGpuTensorEngine
             return base.TensorMin(tensor, value);
 
         using var input = GetOrAllocateBuffer(backend, tensor);
-        // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-        using var scalarLease = AllocateOutputBuffer(backend, tensor.Length);
+        // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+        using var scalarLease = AllocateTransientScratch(backend, tensor.Length);
         var scalar = scalarLease.Buffer;
         backend.Fill(scalar, Convert.ToSingle(value), tensor.Length);
         var result = DispatchDeferredGpuOp<T>(backend, tensor.Length, tensor.Shape.ToArray(), output =>
@@ -660,8 +660,8 @@ public partial class DirectGpuTensorEngine
         using var input = GetOrAllocateBuffer(backend, contiguousIndices);
         return DispatchDeferredGpuOp<int>(backend, total, new[] { total }, output =>
         {
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var offsetBatchLease = AllocateOutputBuffer(backend, edgeCount);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var offsetBatchLease = AllocateTransientScratch(backend, edgeCount);
             var offsetBatch = offsetBatchLease.Buffer;
             for (int batch = 0; batch < batchSize; batch++)
             {
@@ -1221,23 +1221,23 @@ public partial class DirectGpuTensorEngine
         // GPU-native layout), so InterleaveComplex was added to all backends to close that gap.
         var gpuResult = DispatchDeferredGpuOp<T>(backend, batchSize * numFreqs * 2, outputShape, output =>
         {
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var padRealLease = AllocateOutputBuffer(backend, batchSize * nFft);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var padRealLease = AllocateTransientScratch(backend, batchSize * nFft);
             var padReal = padRealLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var padImagLease = AllocateOutputBuffer(backend, batchSize * nFft);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var padImagLease = AllocateTransientScratch(backend, batchSize * nFft);
             var padImag = padImagLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var specRealLease = AllocateOutputBuffer(backend, batchSize * nFft);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var specRealLease = AllocateTransientScratch(backend, batchSize * nFft);
             var specReal = specRealLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var specImagLease = AllocateOutputBuffer(backend, batchSize * nFft);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var specImagLease = AllocateTransientScratch(backend, batchSize * nFft);
             var specImag = specImagLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var packRealLease = AllocateOutputBuffer(backend, batchSize * numFreqs);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var packRealLease = AllocateTransientScratch(backend, batchSize * numFreqs);
             var packReal = packRealLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var packImagLease = AllocateOutputBuffer(backend, batchSize * numFreqs);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var packImagLease = AllocateTransientScratch(backend, batchSize * numFreqs);
             var packImag = packImagLease.Buffer;
 
             // Zero-pad every signal from signalLength up to nFft in one strided copy.
@@ -1316,11 +1316,11 @@ public partial class DirectGpuTensorEngine
         {
             // The de-interleave is now ONE kernel over the whole batch instead of two single-element
             // device copies per frequency bin per signal (~1.06M copies at numFreqs=129, batchSize=4096).
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var allRealLease = AllocateOutputBuffer(backend, batchSize * numFreqs);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var allRealLease = AllocateTransientScratch(backend, batchSize * numFreqs);
             var allReal = allRealLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var allImagLease = AllocateOutputBuffer(backend, batchSize * numFreqs);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var allImagLease = AllocateTransientScratch(backend, batchSize * numFreqs);
             var allImag = allImagLease.Buffer;
             backend.DeinterleaveComplex(inputBuffer.Buffer, allReal, allImag, batchSize * numFreqs);
 
@@ -1347,20 +1347,20 @@ public partial class DirectGpuTensorEngine
 
             using var indexBuffer = backend.AllocateIntBuffer(gatherIndex);
             using var signBuffer = backend.AllocateBuffer(imagSign);
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var fullRealLease = AllocateOutputBuffer(backend, fullCount);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var fullRealLease = AllocateTransientScratch(backend, fullCount);
             var fullReal = fullRealLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var fullImagRawLease = AllocateOutputBuffer(backend, fullCount);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var fullImagRawLease = AllocateTransientScratch(backend, fullCount);
             var fullImagRaw = fullImagRawLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var fullImagLease = AllocateOutputBuffer(backend, fullCount);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var fullImagLease = AllocateTransientScratch(backend, fullCount);
             var fullImag = fullImagLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var timeRealLease = AllocateOutputBuffer(backend, fullCount);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var timeRealLease = AllocateTransientScratch(backend, fullCount);
             var timeReal = timeRealLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var timeImagLease = AllocateOutputBuffer(backend, fullCount);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var timeImagLease = AllocateTransientScratch(backend, fullCount);
             var timeImag = timeImagLease.Buffer;
             backend.Gather(allReal, indexBuffer, fullReal, fullCount, 1);
             backend.Gather(allImag, indexBuffer, fullImagRaw, fullCount, 1);
@@ -2407,38 +2407,38 @@ public partial class DirectGpuTensorEngine
 
             using var a = GetOrAllocateBuffer(backend, x1);
             using var b = GetOrAllocateBuffer(backend, x2);
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var productLease = AllocateOutputBuffer(backend, x1.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var productLease = AllocateTransientScratch(backend, x1.Length);
             var product = productLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var squareALease = AllocateOutputBuffer(backend, x1.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var squareALease = AllocateTransientScratch(backend, x1.Length);
             var squareA = squareALease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var squareBLease = AllocateOutputBuffer(backend, x1.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var squareBLease = AllocateTransientScratch(backend, x1.Length);
             var squareB = squareBLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var dotLease = AllocateOutputBuffer(backend, batchSize);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var dotLease = AllocateTransientScratch(backend, batchSize);
             var dot = dotLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var sumSquareALease = AllocateOutputBuffer(backend, batchSize);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var sumSquareALease = AllocateTransientScratch(backend, batchSize);
             var sumSquareA = sumSquareALease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var sumSquareBLease = AllocateOutputBuffer(backend, batchSize);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var sumSquareBLease = AllocateTransientScratch(backend, batchSize);
             var sumSquareB = sumSquareBLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var normALease = AllocateOutputBuffer(backend, batchSize);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var normALease = AllocateTransientScratch(backend, batchSize);
             var normA = normALease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var normBLease = AllocateOutputBuffer(backend, batchSize);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var normBLease = AllocateTransientScratch(backend, batchSize);
             var normB = normBLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var clampedALease = AllocateOutputBuffer(backend, batchSize);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var clampedALease = AllocateTransientScratch(backend, batchSize);
             var clampedA = clampedALease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var clampedBLease = AllocateOutputBuffer(backend, batchSize);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var clampedBLease = AllocateTransientScratch(backend, batchSize);
             var clampedB = clampedBLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var denominatorLease = AllocateOutputBuffer(backend, batchSize);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var denominatorLease = AllocateTransientScratch(backend, batchSize);
             var denominator = denominatorLease.Buffer;
 
             var cosRes = DispatchDeferredGpuOp<T>(backend, batchSize, outShape, output =>
@@ -2486,35 +2486,35 @@ public partial class DirectGpuTensorEngine
         {
             using var inputA = GetOrAllocateBuffer(backend, a);
             using var inputB = GetOrAllocateBuffer(backend, b);
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var productLease = AllocateOutputBuffer(backend, a.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var productLease = AllocateTransientScratch(backend, a.Length);
             var product = productLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var squareALease = AllocateOutputBuffer(backend, a.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var squareALease = AllocateTransientScratch(backend, a.Length);
             var squareA = squareALease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var squareBLease = AllocateOutputBuffer(backend, a.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var squareBLease = AllocateTransientScratch(backend, a.Length);
             var squareB = squareBLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var dotLease = AllocateOutputBuffer(backend, 1);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var dotLease = AllocateTransientScratch(backend, 1);
             var dot = dotLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var sumSquareALease = AllocateOutputBuffer(backend, 1);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var sumSquareALease = AllocateTransientScratch(backend, 1);
             var sumSquareA = sumSquareALease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var sumSquareBLease = AllocateOutputBuffer(backend, 1);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var sumSquareBLease = AllocateTransientScratch(backend, 1);
             var sumSquareB = sumSquareBLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var normALease = AllocateOutputBuffer(backend, 1);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var normALease = AllocateTransientScratch(backend, 1);
             var normA = normALease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var normBLease = AllocateOutputBuffer(backend, 1);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var normBLease = AllocateTransientScratch(backend, 1);
             var normB = normBLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var normProductLease = AllocateOutputBuffer(backend, 1);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var normProductLease = AllocateTransientScratch(backend, 1);
             var normProduct = normProductLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var denominatorLease = AllocateOutputBuffer(backend, 1);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var denominatorLease = AllocateTransientScratch(backend, 1);
             var denominator = denominatorLease.Buffer;
 
             return DispatchDeferredGpuOp<T>(backend, 1, new[] { 1 }, output =>
@@ -2825,38 +2825,38 @@ public partial class DirectGpuTensorEngine
             int outputLength = checked(rowsX * rowsY);
             using var inputX = GetOrAllocateBuffer(backend, x);
             using var inputY = GetOrAllocateBuffer(backend, y);
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var squareXLease = AllocateOutputBuffer(backend, x.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var squareXLease = AllocateTransientScratch(backend, x.Length);
             var squareX = squareXLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var squareYLease = AllocateOutputBuffer(backend, y.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var squareYLease = AllocateTransientScratch(backend, y.Length);
             var squareY = squareYLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var normXLease = AllocateOutputBuffer(backend, rowsX);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var normXLease = AllocateTransientScratch(backend, rowsX);
             var normX = normXLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var normYLease = AllocateOutputBuffer(backend, rowsY);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var normYLease = AllocateTransientScratch(backend, rowsY);
             var normY = normYLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var onesXLease = AllocateOutputBuffer(backend, rowsX);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var onesXLease = AllocateTransientScratch(backend, rowsX);
             var onesX = onesXLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var onesYLease = AllocateOutputBuffer(backend, rowsY);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var onesYLease = AllocateTransientScratch(backend, rowsY);
             var onesY = onesYLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var expandedXLease = AllocateOutputBuffer(backend, outputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var expandedXLease = AllocateTransientScratch(backend, outputLength);
             var expandedX = expandedXLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var expandedYLease = AllocateOutputBuffer(backend, outputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var expandedYLease = AllocateTransientScratch(backend, outputLength);
             var expandedY = expandedYLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var normSumLease = AllocateOutputBuffer(backend, outputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var normSumLease = AllocateTransientScratch(backend, outputLength);
             var normSum = normSumLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var dotLease = AllocateOutputBuffer(backend, outputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var dotLease = AllocateTransientScratch(backend, outputLength);
             var dot = dotLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var twiceDotLease = AllocateOutputBuffer(backend, outputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var twiceDotLease = AllocateTransientScratch(backend, outputLength);
             var twiceDot = twiceDotLease.Buffer;
 
             return DispatchDeferredGpuOp<T>(backend, outputLength, new[] { rowsX, rowsY }, output =>
@@ -2939,20 +2939,20 @@ public partial class DirectGpuTensorEngine
             using var inputBuffer = GetOrAllocateBuffer(backend, input);
             using var meanBuffer = GetOrAllocateBuffer(backend, mean);
             using var varianceBuffer = GetOrAllocateBuffer(backend, variance);
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var differencesLease = AllocateOutputBuffer(backend, input.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var differencesLease = AllocateTransientScratch(backend, input.Length);
             var differences = differencesLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var safeVarianceLease = AllocateOutputBuffer(backend, 1);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var safeVarianceLease = AllocateTransientScratch(backend, 1);
             var safeVariance = safeVarianceLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var scaleLease = AllocateOutputBuffer(backend, 1);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var scaleLease = AllocateTransientScratch(backend, 1);
             var scale = scaleLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var gradientScaleLease = AllocateOutputBuffer(backend, 1);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var gradientScaleLease = AllocateTransientScratch(backend, 1);
             var gradientScale = gradientScaleLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var scaledDifferencesLease = AllocateOutputBuffer(backend, input.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var scaledDifferencesLease = AllocateTransientScratch(backend, input.Length);
             var scaledDifferences = scaledDifferencesLease.Buffer;
             backend.Fill(scale, 2f / input.Length, 1);
 
@@ -3029,8 +3029,8 @@ public partial class DirectGpuTensorEngine
             // carries the true variance, so epsilon folds in here over batch*groups values.
             if (backend is IDirectPtxBackend declaredBackend)
             {
-                // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-                using var declaredRstdLease = AllocateOutputBuffer(backend, groupCount);
+                // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                using var declaredRstdLease = AllocateTransientScratch(backend, groupCount);
                 var declaredRstd = declaredRstdLease.Buffer;
                 backend.AddScalar(varianceBuffer.Buffer, declaredRstd, (float)epsilon, groupCount);
                 backend.Sqrt(declaredRstd, declaredRstd, groupCount);
@@ -3082,83 +3082,83 @@ public partial class DirectGpuTensorEngine
                     return directInput;
                 }
             }
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var onesGroupLease = AllocateOutputBuffer(backend, groupSize);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var onesGroupLease = AllocateTransientScratch(backend, groupSize);
             var onesGroup = onesGroupLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var onesSpatialLease = AllocateOutputBuffer(backend, spatial);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var onesSpatialLease = AllocateTransientScratch(backend, spatial);
             var onesSpatial = onesSpatialLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var onesBatchLease = AllocateOutputBuffer(backend, batch);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var onesBatchLease = AllocateTransientScratch(backend, batch);
             var onesBatch = onesBatchLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var meanExpandedLease = AllocateOutputBuffer(backend, input.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var meanExpandedLease = AllocateTransientScratch(backend, input.Length);
             var meanExpanded = meanExpandedLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var centeredLease = AllocateOutputBuffer(backend, input.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var centeredLease = AllocateTransientScratch(backend, input.Length);
             var centered = centeredLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var safeVarianceLease = AllocateOutputBuffer(backend, groupCount);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var safeVarianceLease = AllocateTransientScratch(backend, groupCount);
             var safeVariance = safeVarianceLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var standardDeviationLease = AllocateOutputBuffer(backend, groupCount);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var standardDeviationLease = AllocateTransientScratch(backend, groupCount);
             var standardDeviation = standardDeviationLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var inverseStandardDeviationLease = AllocateOutputBuffer(backend, groupCount);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var inverseStandardDeviationLease = AllocateTransientScratch(backend, groupCount);
             var inverseStandardDeviation = inverseStandardDeviationLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var inverseStandardDeviationExpandedLease = AllocateOutputBuffer(backend, input.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var inverseStandardDeviationExpandedLease = AllocateTransientScratch(backend, input.Length);
             var inverseStandardDeviationExpanded = inverseStandardDeviationExpandedLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var normalizedLease = AllocateOutputBuffer(backend, input.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var normalizedLease = AllocateTransientScratch(backend, input.Length);
             var normalized = normalizedLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var gammaSpatialLease = AllocateOutputBuffer(backend, channels * spatial);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var gammaSpatialLease = AllocateTransientScratch(backend, channels * spatial);
             var gammaSpatial = gammaSpatialLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var gammaExpandedLease = AllocateOutputBuffer(backend, input.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var gammaExpandedLease = AllocateTransientScratch(backend, input.Length);
             var gammaExpanded = gammaExpandedLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var scaledGradientLease = AllocateOutputBuffer(backend, input.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var scaledGradientLease = AllocateTransientScratch(backend, input.Length);
             var scaledGradient = scaledGradientLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var scaledGradientNormLease = AllocateOutputBuffer(backend, input.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var scaledGradientNormLease = AllocateTransientScratch(backend, input.Length);
             var scaledGradientNorm = scaledGradientNormLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var sumGradientLease = AllocateOutputBuffer(backend, groupCount);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var sumGradientLease = AllocateTransientScratch(backend, groupCount);
             var sumGradient = sumGradientLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var sumGradientNormLease = AllocateOutputBuffer(backend, groupCount);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var sumGradientNormLease = AllocateTransientScratch(backend, groupCount);
             var sumGradientNorm = sumGradientNormLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var sumGradientExpandedLease = AllocateOutputBuffer(backend, input.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var sumGradientExpandedLease = AllocateTransientScratch(backend, input.Length);
             var sumGradientExpanded = sumGradientExpandedLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var sumGradientNormExpandedLease = AllocateOutputBuffer(backend, input.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var sumGradientNormExpandedLease = AllocateTransientScratch(backend, input.Length);
             var sumGradientNormExpanded = sumGradientNormExpandedLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var groupScaledGradientLease = AllocateOutputBuffer(backend, input.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var groupScaledGradientLease = AllocateTransientScratch(backend, input.Length);
             var groupScaledGradient = groupScaledGradientLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var firstDifferenceLease = AllocateOutputBuffer(backend, input.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var firstDifferenceLease = AllocateTransientScratch(backend, input.Length);
             var firstDifference = firstDifferenceLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var normalizedProjectionLease = AllocateOutputBuffer(backend, input.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var normalizedProjectionLease = AllocateTransientScratch(backend, input.Length);
             var normalizedProjection = normalizedProjectionLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var groupDifferenceLease = AllocateOutputBuffer(backend, input.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var groupDifferenceLease = AllocateTransientScratch(backend, input.Length);
             var groupDifference = groupDifferenceLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var inputScaleLease = AllocateOutputBuffer(backend, input.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var inputScaleLease = AllocateTransientScratch(backend, input.Length);
             var inputScale = inputScaleLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var gammaProductsLease = AllocateOutputBuffer(backend, input.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var gammaProductsLease = AllocateTransientScratch(backend, input.Length);
             var gammaProducts = gammaProductsLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var gammaProductsPermutedLease = AllocateOutputBuffer(backend, input.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var gammaProductsPermutedLease = AllocateTransientScratch(backend, input.Length);
             var gammaProductsPermuted = gammaProductsPermutedLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var gradientPermutedLease = AllocateOutputBuffer(backend, input.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var gradientPermutedLease = AllocateTransientScratch(backend, input.Length);
             var gradientPermuted = gradientPermutedLease.Buffer;
             using var gradInputBuffer = AllocateOutputBuffer(backend, input.Length);
             using var gradGammaBuffer = AllocateOutputBuffer(backend, channels);
@@ -3244,26 +3244,26 @@ public partial class DirectGpuTensorEngine
             using var inputBuffer = GetOrAllocateBuffer(backend, input);
             using var centerBuffer = GetOrAllocateBuffer(backend, centers);
             using var epsilonBuffer = GetOrAllocateBuffer(backend, epsilons);
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var sampleLease = AllocateOutputBuffer(backend, features);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var sampleLease = AllocateTransientScratch(backend, features);
             var sample = sampleLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var differencesLease = AllocateOutputBuffer(backend, centerElements);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var differencesLease = AllocateTransientScratch(backend, centerElements);
             var differences = differencesLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var squaresLease = AllocateOutputBuffer(backend, centerElements);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var squaresLease = AllocateTransientScratch(backend, centerElements);
             var squares = squaresLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var distancesLease = AllocateOutputBuffer(backend, numCenters);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var distancesLease = AllocateTransientScratch(backend, numCenters);
             var distances = distancesLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var weightedLease = AllocateOutputBuffer(backend, numCenters);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var weightedLease = AllocateTransientScratch(backend, numCenters);
             var weighted = weightedLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var negatedLease = AllocateOutputBuffer(backend, numCenters);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var negatedLease = AllocateTransientScratch(backend, numCenters);
             var negated = negatedLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var rowLease = AllocateOutputBuffer(backend, numCenters);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var rowLease = AllocateTransientScratch(backend, numCenters);
             var row = rowLease.Buffer;
 
             var rbfResult = DispatchDeferredGpuOp<T>(backend, outputLength,
@@ -3553,53 +3553,53 @@ public partial class DirectGpuTensorEngine
             int outputDimensions = checked(dimensions * 2 * numFrequencies);
             int outputLength = checked(points * outputDimensions);
             using var input = GetOrAllocateBuffer(backend, positions);
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var highAnglesLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var highAnglesLease = AllocateTransientScratch(backend, inputLength);
             var highAngles = highAnglesLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var lowAnglesLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var lowAnglesLease = AllocateTransientScratch(backend, inputLength);
             var lowAngles = lowAnglesLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var splitInputLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var splitInputLease = AllocateTransientScratch(backend, inputLength);
             var splitInput = splitInputLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var inputBigLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var inputBigLease = AllocateTransientScratch(backend, inputLength);
             var inputBig = inputBigLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var inputHighLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var inputHighLease = AllocateTransientScratch(backend, inputLength);
             var inputHigh = inputHighLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var inputLowLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var inputLowLease = AllocateTransientScratch(backend, inputLength);
             var inputLow = inputLowLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var scratchALease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var scratchALease = AllocateTransientScratch(backend, inputLength);
             var scratchA = scratchALease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var scratchBLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var scratchBLease = AllocateTransientScratch(backend, inputLength);
             var scratchB = scratchBLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var sinHighLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var sinHighLease = AllocateTransientScratch(backend, inputLength);
             var sinHigh = sinHighLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var cosHighLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var cosHighLease = AllocateTransientScratch(backend, inputLength);
             var cosHigh = cosHighLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var sinLowLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var sinLowLease = AllocateTransientScratch(backend, inputLength);
             var sinLow = sinLowLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var cosLowLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var cosLowLease = AllocateTransientScratch(backend, inputLength);
             var cosLow = cosLowLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var trigTermALease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var trigTermALease = AllocateTransientScratch(backend, inputLength);
             var trigTermA = trigTermALease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var trigTermBLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var trigTermBLease = AllocateTransientScratch(backend, inputLength);
             var trigTermB = trigTermBLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var sinesLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var sinesLease = AllocateTransientScratch(backend, inputLength);
             var sines = sinesLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var cosinesLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var cosinesLease = AllocateTransientScratch(backend, inputLength);
             var cosines = cosinesLease.Buffer;
 
             return DispatchDeferredGpuOp<T>(backend, outputLength,
@@ -3682,74 +3682,74 @@ public partial class DirectGpuTensorEngine
 
             using var input = GetOrAllocateBuffer(backend, positions);
             using var gradient = GetOrAllocateBuffer(backend, encodedGradient);
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var highAnglesLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var highAnglesLease = AllocateTransientScratch(backend, inputLength);
             var highAngles = highAnglesLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var lowAnglesLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var lowAnglesLease = AllocateTransientScratch(backend, inputLength);
             var lowAngles = lowAnglesLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var splitInputLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var splitInputLease = AllocateTransientScratch(backend, inputLength);
             var splitInput = splitInputLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var inputBigLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var inputBigLease = AllocateTransientScratch(backend, inputLength);
             var inputBig = inputBigLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var inputHighLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var inputHighLease = AllocateTransientScratch(backend, inputLength);
             var inputHigh = inputHighLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var inputLowLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var inputLowLease = AllocateTransientScratch(backend, inputLength);
             var inputLow = inputLowLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var scratchALease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var scratchALease = AllocateTransientScratch(backend, inputLength);
             var scratchA = scratchALease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var scratchBLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var scratchBLease = AllocateTransientScratch(backend, inputLength);
             var scratchB = scratchBLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var sinHighLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var sinHighLease = AllocateTransientScratch(backend, inputLength);
             var sinHigh = sinHighLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var cosHighLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var cosHighLease = AllocateTransientScratch(backend, inputLength);
             var cosHigh = cosHighLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var sinLowLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var sinLowLease = AllocateTransientScratch(backend, inputLength);
             var sinLow = sinLowLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var cosLowLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var cosLowLease = AllocateTransientScratch(backend, inputLength);
             var cosLow = cosLowLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var trigTermALease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var trigTermALease = AllocateTransientScratch(backend, inputLength);
             var trigTermA = trigTermALease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var trigTermBLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var trigTermBLease = AllocateTransientScratch(backend, inputLength);
             var trigTermB = trigTermBLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var sinesLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var sinesLease = AllocateTransientScratch(backend, inputLength);
             var sines = sinesLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var cosinesLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var cosinesLease = AllocateTransientScratch(backend, inputLength);
             var cosines = cosinesLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var gradientSinesLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var gradientSinesLease = AllocateTransientScratch(backend, inputLength);
             var gradientSines = gradientSinesLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var gradientCosinesLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var gradientCosinesLease = AllocateTransientScratch(backend, inputLength);
             var gradientCosines = gradientCosinesLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var rawSineTermsLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var rawSineTermsLease = AllocateTransientScratch(backend, inputLength);
             var rawSineTerms = rawSineTermsLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var rawCosineTermsLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var rawCosineTermsLease = AllocateTransientScratch(backend, inputLength);
             var rawCosineTerms = rawCosineTermsLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var sineTermsLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var sineTermsLease = AllocateTransientScratch(backend, inputLength);
             var sineTerms = sineTermsLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var cosineTermsLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var cosineTermsLease = AllocateTransientScratch(backend, inputLength);
             var cosineTerms = cosineTermsLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var accumulatedLease = AllocateOutputBuffer(backend, inputLength);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var accumulatedLease = AllocateTransientScratch(backend, inputLength);
             var accumulated = accumulatedLease.Buffer;
 
             return DispatchDeferredGpuOp<T>(backend, inputLength,
@@ -3927,32 +3927,32 @@ public partial class DirectGpuTensorEngine
         int length = output.Length;
         using var gradient = GetOrAllocateBuffer(backend, gradOutput);
         using var sparsemaxOutput = GetOrAllocateBuffer(backend, output);
-        // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-        using var zerosLease = AllocateOutputBuffer(backend, length);
+        // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+        using var zerosLease = AllocateTransientScratch(backend, length);
         var zeros = zerosLease.Buffer;
-        // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-        using var supportMaskLease = AllocateOutputBuffer(backend, length);
+        // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+        using var supportMaskLease = AllocateTransientScratch(backend, length);
         var supportMask = supportMaskLease.Buffer;
-        // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-        using var supportedGradientLease = AllocateOutputBuffer(backend, length);
+        // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+        using var supportedGradientLease = AllocateTransientScratch(backend, length);
         var supportedGradient = supportedGradientLease.Buffer;
-        // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-        using var gradientSumsLease = AllocateOutputBuffer(backend, rows);
+        // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+        using var gradientSumsLease = AllocateTransientScratch(backend, rows);
         var gradientSums = gradientSumsLease.Buffer;
-        // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-        using var supportCountsLease = AllocateOutputBuffer(backend, rows);
+        // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+        using var supportCountsLease = AllocateTransientScratch(backend, rows);
         var supportCounts = supportCountsLease.Buffer;
-        // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-        using var safeSupportCountsLease = AllocateOutputBuffer(backend, rows);
+        // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+        using var safeSupportCountsLease = AllocateTransientScratch(backend, rows);
         var safeSupportCounts = safeSupportCountsLease.Buffer;
-        // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-        using var meanGradientLease = AllocateOutputBuffer(backend, rows);
+        // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+        using var meanGradientLease = AllocateTransientScratch(backend, rows);
         var meanGradient = meanGradientLease.Buffer;
-        // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-        using var expandedMeanGradientLease = AllocateOutputBuffer(backend, length);
+        // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+        using var expandedMeanGradientLease = AllocateTransientScratch(backend, length);
         var expandedMeanGradient = expandedMeanGradientLease.Buffer;
-        // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-        using var centeredGradientLease = AllocateOutputBuffer(backend, length);
+        // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+        using var centeredGradientLease = AllocateTransientScratch(backend, length);
         var centeredGradient = centeredGradientLease.Buffer;
 
         return DispatchDeferredGpuOp<T>(backend, length, (int[])output._shape.Clone(), result =>
@@ -4507,8 +4507,8 @@ public partial class DirectGpuTensorEngine
 
     private static float DownloadScalar(IDirectGpuBackend backend, IGpuBuffer source, int offset = 0)
     {
-        // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-        using var scalarLease = AllocateOutputBuffer(backend, 1);
+        // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+        using var scalarLease = AllocateTransientScratch(backend, 1);
         var scalar = scalarLease.Buffer;
         backend.Copy(source, offset, scalar, 0, 1);
         backend.Synchronize();
@@ -9091,41 +9091,41 @@ public partial class DirectGpuTensorEngine
             using var inputBuffer = GetOrAllocateBuffer(backend, input);
             using var gradientBuffer = GetOrAllocateBuffer(backend, gradOutput);
             using var outputBuffer = GetOrAllocateBuffer(backend, output);
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var squaredLease = AllocateOutputBuffer(backend, input.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var squaredLease = AllocateTransientScratch(backend, input.Length);
             var squared = squaredLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var sumSquaresLease = AllocateOutputBuffer(backend, outerSize);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var sumSquaresLease = AllocateTransientScratch(backend, outerSize);
             var sumSquares = sumSquaresLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var normLease = AllocateOutputBuffer(backend, outerSize);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var normLease = AllocateTransientScratch(backend, outerSize);
             var norm = normLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var onesLease = AllocateOutputBuffer(backend, innerSize);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var onesLease = AllocateTransientScratch(backend, innerSize);
             var ones = onesLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var expandedNormLease = AllocateOutputBuffer(backend, input.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var expandedNormLease = AllocateTransientScratch(backend, input.Length);
             var expandedNorm = expandedNormLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var normalizedLease = AllocateOutputBuffer(backend, input.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var normalizedLease = AllocateTransientScratch(backend, input.Length);
             var normalized = normalizedLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var softmaxGradientLease = AllocateOutputBuffer(backend, input.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var softmaxGradientLease = AllocateTransientScratch(backend, input.Length);
             var softmaxGradient = softmaxGradientLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var productsLease = AllocateOutputBuffer(backend, input.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var productsLease = AllocateTransientScratch(backend, input.Length);
             var products = productsLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var dotLease = AllocateOutputBuffer(backend, outerSize);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var dotLease = AllocateTransientScratch(backend, outerSize);
             var dot = dotLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var expandedDotLease = AllocateOutputBuffer(backend, input.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var expandedDotLease = AllocateTransientScratch(backend, input.Length);
             var expandedDot = expandedDotLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var projectionLease = AllocateOutputBuffer(backend, input.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var projectionLease = AllocateTransientScratch(backend, input.Length);
             var projection = projectionLease.Buffer;
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var numeratorLease = AllocateOutputBuffer(backend, input.Length);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var numeratorLease = AllocateTransientScratch(backend, input.Length);
             var numerator = numeratorLease.Buffer;
 
             backend.Multiply(inputBuffer.Buffer, inputBuffer.Buffer, squared, input.Length);
@@ -9396,8 +9396,8 @@ public partial class DirectGpuTensorEngine
                             logBuffer.Buffer, output, rows, classes, 1f, deviceSeed);
                 });
             using var softBuffer = GetOrAllocateBuffer(backend, softSample);
-            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var selectedIndicesLease = AllocateOutputBuffer(backend, rows);
+            // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var selectedIndicesLease = AllocateTransientScratch(backend, rows);
             var selectedIndices = selectedIndicesLease.Buffer;
             backend.ArgMaxAxis(softBuffer.Buffer, selectedIndices, rows, classes);
             return DispatchDeferredGpuOp<T>(

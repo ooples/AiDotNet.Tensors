@@ -49530,6 +49530,10 @@ public partial class CpuEngine : ITensorLevelEngine
             if (scope != null)
             {
                 var captured = tensor;
+                // Validated at record time, as the eager CreateNarrowView does: the replay hands these to a device kernel.
+                if ((uint)dim >= (uint)tensor.Rank) throw new ArgumentOutOfRangeException(nameof(dim));
+                if (start < 0 || length < 0 || start > tensor._shape[dim] - length)
+                    throw new ArgumentOutOfRangeException(nameof(start), $"Narrow [{start}, {start}+{length}) is outside dimension {dim} of size {tensor._shape[dim]}.");
                 int capDim = dim, capStart = start, capLen = length;
                 var outShape = (int[])tensor._shape.Clone();
                 outShape[dim] = length;

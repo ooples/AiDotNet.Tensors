@@ -13,7 +13,7 @@ namespace AiDotNet.Tensors.Engines.Compilation.Serialization;
 /// <c>long[]</c>, <c>double</c>, <c>float</c>, <c>bool</c>, <c>string</c>,
 /// <c>byte[]</c>, <c>bool[]</c>, <see cref="FusedActivationParams"/>, and
 /// <c>Tensor&lt;T&gt;</c> (serialized as a tensor-table
-/// ID reference). <c>long[]</c> support exists for index snapshots that may
+/// ID reference), <c>Tensor&lt;int&gt;</c> (by value: a GPU ReduceMax's argmax). <c>long[]</c> support exists for index snapshots that may
 /// exceed <c>int.MaxValue</c> (e.g. large-vocab embedding lookups with
 /// <c>Tensor&lt;long&gt;</c> indices).</para>
 /// </summary>
@@ -151,6 +151,18 @@ internal static class SavedStateSerializer
                 writer.Write(tensorMap.GetId(tensor));
                 break;
 
+            case Tensor<int> indices:
+                // Not in the plan's tensor table (that holds Tensor<T>): a GPU ReduceMax keeps its argmax as a device
+                // Tensor<int> (AiDotNet#1804), so it is written by value, landed on the host first.
+                writer.Write(PlanFormatConstants.TagInt32Tensor);
+                var indexShape = indices._shape;
+                writer.Write(indexShape.Length);
+                foreach (int d in indexShape) writer.Write(d);
+                var indexValues = indices.ToArray();
+                writer.Write(indexValues.Length);
+                foreach (int v in indexValues) writer.Write(v);
+                break;
+
             case Enum enumVal:
                 // Enum-valued savedState entries (e.g. FusedActivationType
                 // captured by CpuFusionPass). Serialize as
@@ -174,7 +186,7 @@ internal static class SavedStateSerializer
                 // load never encounters a mystery tag byte.
                 throw new NotSupportedException(
                     $"SavedState entry of type {value.GetType().FullName} cannot be serialized. " +
-                    "Supported types: null, int, int[], long, long[], double, float, bool, string, byte[], bool[], FusedActivationParams, Tensor<T>, Enum.");
+                    "Supported types: null, int, int[], long, long[], double, float, bool, string, byte[], bool[], FusedActivationParams, Tensor<T>, Tensor<int>, Enum.");
         }
     }
 
@@ -197,6 +209,7 @@ internal static class SavedStateSerializer
             PlanFormatConstants.TagByteArray  => ReadByteArray(reader),
             PlanFormatConstants.TagTensorRef  => ReadTensorRef(reader, tensorTable),
             PlanFormatConstants.TagEnum       => ReadEnum(reader),
+            PlanFormatConstants.TagInt32Tensor => ReadInt32Tensor(reader),
             _ => throw new InvalidDataException(
                 $"Unknown SavedState type tag 0x{tag:X2} — the file may be corrupt or " +
                 "from a newer format version that this binary cannot read."),
@@ -245,6 +258,23 @@ internal static class SavedStateSerializer
                 $"[0, {tensorTable.Length}). The plan file is corrupt.");
         }
         return tensorTable[id];
+    }
+
+    private static Tensor<int> ReadInt32Tensor(BinaryReader reader)
+    {
+        var shape = ReadInt32Array(reader);
+        var values = ReadInt32Array(reader);
+        long expected = 1;
+        foreach (int d in shape)
+        {
+            if (d < 0)
+                throw new InvalidDataException($"SavedState Tensor<int> dimension {d} cannot be negative. The plan file is corrupt.");
+            expected *= d;
+        }
+        if (expected != values.Length)
+            throw new InvalidDataException(
+                $"SavedState Tensor<int> holds {values.Length} values for shape [{string.Join(",", shape)}]. The plan file is corrupt.");
+        return new Tensor<int>(values, shape);
     }
 
     private static int[] ReadInt32Array(BinaryReader reader)

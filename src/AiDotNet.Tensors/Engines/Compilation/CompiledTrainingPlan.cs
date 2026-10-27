@@ -421,7 +421,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // ~0.35 s a plan, two plans a Train call: the largest fixed cost of a GPU Train, AiDotNet#1804).
         var parameterGradients = new HashSet<Tensor<T>>(_gradients, ReferenceEqualityComparer<Tensor<T>>.Instance);
         if (_liveGradientMap is { } liveGradients)
-            foreach (var current in liveGradients.Values) parameterGradients.Add(current);
+            foreach (var parameter in _parameters)
+                if (liveGradients.TryGetValue(parameter, out var current)) parameterGradients.Add(current);
         for (int i = 0; i < _preAllocatedGrads.Length; i++)
             Unbind(_preAllocatedGrads[i], isResult: parameterGradients.Contains(_preAllocatedGrads[i]));
         if (_aliasedGradViews is { } views)

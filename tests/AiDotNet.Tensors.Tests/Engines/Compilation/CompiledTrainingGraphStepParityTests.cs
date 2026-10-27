@@ -822,8 +822,11 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                 plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
                 for (int s = 0; s < Steps; s++) { FeedBatch(x, y, s); plan.Step(); }
                 if (capture)
+                {
                     Assert.True(concrete.GraphCaptureFailureReason is null,
                         "capture failed: " + concrete.GraphCaptureFailureReason);
+                    AssertGraphCaptured(concrete);
+                }
             }
             return w.ToArray();
             }
@@ -833,6 +836,17 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             for (int i = 0; i < eager.Length; i++)
                 Assert.True(Math.Abs(eager[i] - captured[i]) <= 1e-5f, $"w[{i}] captured {captured[i]} != eager {eager[i]}");
         }
+    }
+
+    /// <summary>
+    /// A null <see cref="CompiledTrainingPlan{T}.GraphCaptureFailureReason"/> also means capture was never tried (an
+    /// ineligible step, a disabled graph), and then a "captured" run compares eager with eager. Require the graph.
+    /// </summary>
+    private static void AssertGraphCaptured(CompiledTrainingPlan<float> plan)
+    {
+        var exec = (IntPtr)typeof(CompiledTrainingPlan<float>)
+            .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(plan)!;
+        Assert.True(exec != IntPtr.Zero, "no graph was captured, so the captured run compared eager with eager");
     }
 
     private static bool TryCudaCapture(DirectGpuTensorEngine? gpu)
@@ -869,7 +883,10 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                 plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
                 for (int s = 0; s < Steps; s++) { FeedBatch(x, y, s); plan.Step(); }
                 if (capture)
+                {
                     Assert.True(concrete.GraphCaptureFailureReason is null, "capture failed: " + concrete.GraphCaptureFailureReason);
+                    AssertGraphCaptured(concrete);
+                }
             }
             return w.ToArray();
         }
@@ -923,13 +940,100 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     }
 
     /// <summary>
+    /// The device argmax carries its indices as floats, exact only to 2^24. Past that, index 2^24 + 1 rounds to 2^24
+    /// and ReduceMax's gradient would land on the element beside the max; such a reduction must take the exact path.
+    /// </summary>
+    [SkippableFact]
+    public void A_max_over_more_than_2_pow_24_elements_sends_its_gradient_to_the_max()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            const int N = (1 << 24) + 2;   // the max sits at N - 1 = 2^24 + 1, which a float cannot hold
+            var p = new Tensor<float>([1, N]);
+            p.AsWritableSpan()[N - 1] = 1f;
+            p.Gpu();
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.EnableTraining(new[] { p }))
+            {
+                var m = gpu.ReduceMax(p, new[] { 1 }, keepDims: false);
+                gpu.ReduceMean(gpu.TensorMultiply(m, m), new[] { 0 }, keepDims: false);
+                plan = scope.CompileTraining(new[] { p });
+            }
+            using (plan)
+            {
+                ((CompiledTrainingPlan<float>)plan).DisableGraphStep();
+                plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0f);
+                plan.Step();
+                plan.Step();
+                var g = plan.Gradients[0].ToArray();
+                Assert.Equal(2f, g[N - 1]);   // d(m^2)/dm at the max, m = 1
+                Assert.Equal(0f, g[N - 2]);
+            }
+        }
+    }
+
+    /// <summary>
+    /// A compiled step's transient scratch is shared by its actions: a deeper model of the same layers holds no more
+    /// of it. Keyed per action, it was kept for every action for the plan's life (24 GroupNorm backwards on
+    /// [32,256,256] held ~3.2 GiB) - device memory that grew with depth for no reason.
+    /// </summary>
+    [SkippableFact]
+    public void Transient_scratch_does_not_grow_with_depth()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            var arena = typeof(DirectGpuTensorEngine).GetField("_transientScratch", BindingFlags.NonPublic | BindingFlags.Instance)!;
+            int Slots() => ((System.Collections.ICollection)arena.GetValue(gpu)!).Count;
+            var x = Rand([Batch, Inputs], 31, 1f);
+            var y = Rand([Hidden, Inputs], 32, 1f);
+            var expected = ((IEngine)gpu).PairwiseDistanceSquared(x, y).ToArray();   // unpooled
+            gpu.ClearActionScratchPool();
+            // The compiled step's resident path, as CompiledTrainingPlan runs it: one scratch action per op.
+            gpu.SuspendActivationEviction();
+            try
+            {
+                using (gpu.EnterCompiledCapturePath())
+                {
+                    int afterOne = 0;
+                    const int Depth = 6;
+                    for (int action = 0; action < Depth; action++)
+                    {
+                        gpu.SetCurrentScratchAction(action);
+                        var d = ((IEngine)gpu).PairwiseDistanceSquared(x, y).ToArray();
+                        for (int i = 0; i < expected.Length; i++)
+                            Assert.True(Math.Abs(d[i] - expected[i]) <= 1e-4f * Math.Max(1f, Math.Abs(expected[i])),
+                                $"action {action}: d[{i}] {d[i]} != unpooled {expected[i]} (a shared slot was not re-zeroed?)");
+                        if (action == 0) afterOne = Slots();
+                    }
+                    gpu.SetCurrentScratchAction(-1);
+                    Assert.True(afterOne > 0, "the op drew no transient scratch, so the test proves nothing");
+                    Assert.Equal(afterOne, Slots());
+                }
+            }
+            finally
+            {
+                gpu.ResumeActivationEviction();
+                gpu.ClearActionScratchPool();
+            }
+        }
+    }
+
+    /// <summary>
     /// Retiring a plan whose graph ran lands the PARAMETERS' gradients on the host and nothing else. Every
     /// intermediate gradient shares pooled backing arrays with them, and a host read of an array downloaded every
     /// resident member on it: disposing N-BEATS's plans read ~800 MB back at the end of every GPU Train (AiDotNet#1804).
-    /// The readback at Dispose is bounded by the parameter gradients now, and those still hold the last step's values.
+    /// The readback at retirement is bounded by the parameter gradients now, and those still hold the last step's
+    /// values - whether the plan retires its graph by Dispose or keeps training eagerly after DisableGraphStep (which
+    /// retires through RollBackCaptureResidency, not LandGradientsOnHost).
     /// </summary>
-    [SkippableFact]
-    public void Retiring_a_replayed_plan_reads_back_only_the_parameter_gradients()
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Retiring_a_replayed_plan_reads_back_only_the_parameter_gradients(bool viaDisableGraphStep)
     {
         Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
         using (gpu)
@@ -955,14 +1059,17 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
             for (int s = 0; s < Steps; s++) { FeedBatch(x, y, s); plan.Step(); }
             Assert.True(concrete.GraphCaptureFailureReason is null, "capture failed: " + concrete.GraphCaptureFailureReason);
+            AssertGraphCaptured(concrete);
             var gradients = plan.Gradients;
             long parameterBytes = gradients.Sum(g => (long)g.Length * sizeof(float));
             long before = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.ReadbackBytes;
-            plan.Dispose();
+            if (viaDisableGraphStep) concrete.DisableGraphStep();
+            else plan.Dispose();
             long readBack = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.ReadbackBytes - before;
             Assert.True(readBack <= parameterBytes + 1024,
-                $"Dispose read back {readBack} bytes; the parameter gradients are {parameterBytes}");
+                $"retiring the graph read back {readBack} bytes; the parameter gradients are {parameterBytes}");
             Assert.All(gradients, g => Assert.Contains(g.ToArray(), v => v != 0f));
+            if (viaDisableGraphStep) plan.Dispose();
         }
     }
 
