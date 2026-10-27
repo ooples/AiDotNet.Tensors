@@ -586,7 +586,7 @@ public partial class CpuEngine
                 }
             }
 
-            var wHhSpan = wHh.GetFlattenedData().AsSpan();
+            var wHhData = wHh.GetFlattenedData();
             float[]? bHhArr = bHh?.GetFlattenedData();
             float[]? h0Arr = h0?.GetFlattenedData();
             float[]? c0Arr = c0?.GetFlattenedData();
@@ -597,9 +597,7 @@ public partial class CpuEngine
             // exactly the [K, N] row-major layout SgemmSequential expects, so the
             // per-step call needs no further transpose or packing setup.
             var wHhT = wHhTBuf;
-            for (int g = 0; g < gateRows; g++)
-                for (int hh2 = 0; hh2 < hidden; hh2++)
-                    wHhT[hh2 * gateRows + g] = wHhSpan[g * hidden + hh2];
+            SimdGemm.Transpose(wHhData, 0, hidden, wHhT, 0, gateRows, gateRows, hidden);
 
             using var outArrLease = output.LeaseArray();
             var outArr = (float[])(object)outArrLease.Array;
@@ -726,7 +724,8 @@ public partial class CpuEngine
 
         for (int t = 0; t < seqLen; t++)
         {
-            // hh = h_prev @ wHhT, [rows, hidden] @ [hidden, gateRows]. SgemmSequential
+            // hh = h_prev @ wHhT, [rows, hidden] @ [hidden, gateRows]. The write-first route
+            // skips redundant clearing while retaining the serial direct kernel. It
             // is the DIRECT 6×16 AVX2 kernel (the cached-pre-packed path measured slower
             // at this small K=hidden). Serial WITHIN a thread — the batch-level fan-out
             // (when present) already supplies the parallelism, and re-threading this tiny
@@ -737,7 +736,7 @@ public partial class CpuEngine
             // 87, the asm panel kernel serial 53 / parallel 88, and OpenBLAS 66. The
             // managed serial kernel is the measured optimum here — do NOT route this
             // through JitGemmAvx2 or native BLAS without re-running that bench.
-            SimdGemm.SgemmSequential(
+            SimdGemm.SgemmRecurrentOverwrite(
                 hP.AsSpan(0, rows * hidden),
                 wHhT.AsSpan(0, hidden * gateRows),
                 hh.AsSpan(0, rows * gateRows),

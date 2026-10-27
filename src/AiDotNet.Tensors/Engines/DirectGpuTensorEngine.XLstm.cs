@@ -20,13 +20,13 @@ public partial class DirectGpuTensorEngine
             if (inputs[j].Rank != 3 || inputs[j].Shape[0] != b || inputs[j].Shape[1] != t ||
                 inputs[j].Shape[2] != (j < 3 ? m : numHeads))
                 throw new ArgumentException("Incompatible xLSTM projection or gate shape.");
-        if (typeof(T) != typeof(float))
-            throw new NotSupportedException("Device xLSTM requires float tensors.");
         // The base method records graph metadata only; replay dispatches back to this device implementation.
         if (GraphMode.IsActive)
             return base.XLstmScanForward(qProj, kProj, vProj, iGate, fGate, oGate, numHeads);
-        if (!TryGetBackend(out var backend) || backend is not IFusedLstmSequenceTraining fused)
-            throw new NotSupportedException("Device xLSTM requires a GPU kernel launcher.");
+        if (!TryGetBackend(out var backend))
+            throw new NotSupportedException("DirectGpuTensorEngine xLSTM requires an available GPU backend.");
+        if (typeof(T) != typeof(float) || backend is not IFusedLstmSequenceTraining fused)
+            throw new NotSupportedException($"{backend.GetType().Name} xLSTM requires float tensors and a fused kernel launcher; requested {typeof(T).Name}.");
         GradientTape<T>.Current?.BindEngineIfUnset(this);
         using var q = GetOrAllocateBuffer(backend, qProj);
         using var k = GetOrAllocateBuffer(backend, kProj);
@@ -48,8 +48,10 @@ public partial class DirectGpuTensorEngine
     internal void XLstmDeviceBackward<T>(Tensor<T> gradient, Tensor<T>[] inputs, int heads,
         Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend) || backend is not IFusedLstmSequenceTraining fused)
-            throw new NotSupportedException("Device xLSTM backward requires float tensors and a GPU kernel launcher.");
+        if (!TryGetBackend(out var backend))
+            throw new NotSupportedException("DirectGpuTensorEngine xLSTM backward requires an available GPU backend.");
+        if (typeof(T) != typeof(float) || backend is not IFusedLstmSequenceTraining fused)
+            throw new NotSupportedException($"{backend.GetType().Name} xLSTM backward requires float tensors and a fused kernel launcher; requested {typeof(T).Name}.");
         int b = inputs[0].Shape[0], t = inputs[0].Shape[1], m = inputs[0].Shape[2], d = m / heads;
         int n = inputs[0].Length, ng = inputs[3].Length;
         using var q = GetOrAllocateBuffer(backend, inputs[0]);

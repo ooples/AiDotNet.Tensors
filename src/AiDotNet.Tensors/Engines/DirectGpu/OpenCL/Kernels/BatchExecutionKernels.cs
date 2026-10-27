@@ -263,7 +263,7 @@ __kernel void bx_fft_from_storage(__global const uint* words, __global float* de
             K.LaSymmetrize, K.LaLuSolve, K.LaLdlFactor, K.LaLdlSolve, K.LaSolveVector, K.LaTriangularSolveVector,
             K.LaCholeskyBackwardLower, K.LaSolveBackwardVector, K.LaSvdReduced, K.LaQrReduced,
             K.FaLse, K.FaOut, K.FaDelta, K.FaDq, K.FaDk, K.FaDv,
-            K.LstmGates, K.LstmCell, K.LstmCellBackward, K.LstmHiddenBackward, K.LstmInputGrad, K.LstmWeightIhGrad,
+            K.StridedViewCopy, K.LstmGates, K.LstmCell, K.LstmCellBackward, K.LstmHiddenBackward, K.LstmInputGrad, K.LstmWeightIhGrad,
             K.LstmWeightHhGrad, K.LstmBiasGrad, K.LstmGateCell, K.LstmGateCellBackward, K.XLstmTrainingForward, K.XLstmTrainingBackward,
             K.DlLinearGelu, K.DlLinearGeluFp16, K.DlW8A8LinearGelu, K.DlW8A8Epilogue, K.DcConv2dDirectFp16Hw
         };

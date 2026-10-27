@@ -6,6 +6,9 @@ using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using System.Runtime.CompilerServices;
+#if NET9_0_OR_GREATER
+using System.Runtime.Intrinsics;
+#endif
 using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines;
@@ -735,14 +738,14 @@ public partial class CpuEngine
             int rowsAll = batch * seqLen;
             var dgAll = ws.Wx.AsSpan(0, rowsAll * G);
             if (gradInput is not null && wIhArr is not null)
-                SimdGemm.Sgemm(dgAll, G, false, wIhArr.AsSpan(0, G * inFeatures), inFeatures, false,
-                    gradInput.AsWritableSpanUnmarked(), rowsAll, G, inFeatures);
+                LstmSoloGemm(dgAll, G, wIhArr.AsSpan(0, G * inFeatures), inFeatures,
+                    gradInput.AsWritableSpanUnmarked(), rowsAll, inFeatures, G);
             if (needWIh && inputArr is not null)
             {
                 fullWIh = new Tensor<float>(new[] { G, inFeatures });
                 using var wIhKeep = new KeepAliveScope(fullWIh);
-                SimdGemm.Sgemm(dgAll, G, true, inputArr.AsSpan(0, rowsAll * inFeatures), inFeatures, false,
-                    fullWIh.AsWritableSpanUnmarked(), G, rowsAll, inFeatures);
+                LstmSoloGemm(dgAll, G, inputArr.AsSpan(0, rowsAll * inFeatures), inFeatures,
+                    fullWIh.AsWritableSpanUnmarked(), G, inFeatures, rowsAll, transA: true);
             }
             if (needWHh)
             {
@@ -756,8 +759,8 @@ public partial class CpuEngine
                         Array.Copy(hiddens, b * hStride, hPrev, b * seqLen * hidden, seqLen * hidden);
                     fullWHh = new Tensor<float>(new[] { G, hidden });
                     using var wHhKeep = new KeepAliveScope(fullWHh);
-                    SimdGemm.Sgemm(dgAll, G, true, hPrev.AsSpan(0, rowsAll * hidden), hidden, false,
-                        fullWHh.AsWritableSpanUnmarked(), G, rowsAll, hidden);
+                    LstmSoloGemm(dgAll, G, hPrev.AsSpan(0, rowsAll * hidden), hidden,
+                        fullWHh.AsWritableSpanUnmarked(), G, hidden, rowsAll, transA: true);
                 }
                 finally
                 {
@@ -967,8 +970,18 @@ public partial class CpuEngine
                                  System.ReadOnlySpan<double> b, int ldb, bool transB,
                                  System.Span<double> c, int m, int k, int n)
     {
+#if NET5_0_OR_GREATER
+        // The recurrent projection has small M and contiguous operands. Its
+        // overwrite kernel avoids the streaming dispatch and redundant C clear.
+        if (!transA && !transB && lda == k && ldb == n && m <= 32 && k <= 256 && n <= 1024
+            && System.Runtime.Intrinsics.X86.Avx2.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported)
+        {
+            SimdGemm.DgemmDirectParallelMInto(a, b, c, m, k, n);
+            return;
+        }
+#endif
         BlasManaged.BlasManaged.Gemm<double>(a, lda, transA, b, ldb, transB, c, n, m, n, k,
-            new BlasManaged.BlasOptions<double> { PackingMode = BlasManaged.PackingMode.DisableAutotune });
+            new BlasManaged.BlasOptions<double> { PackingMode = BlasManaged.PackingMode.DisableAutotune, BetaZero = true });
     }
 
     /// <summary>In-place logistic sigmoid over a double span, at full precision.</summary>
@@ -978,7 +991,19 @@ public partial class CpuEngine
     [MethodImpl(Hot)]
     private static void SigmoidExactInPlaceD(double[] buf, int off, int len)
     {
-        for (int i = off; i < off + len; i++) buf[i] = 1.0 / (1.0 + Math.Exp(-buf[i]));
+        int i = off;
+#if NET9_0_OR_GREATER
+        if (System.Runtime.Intrinsics.Vector256.IsHardwareAccelerated)
+        {
+            var one = System.Runtime.Intrinsics.Vector256.Create(1.0);
+            for (; i <= off + len - 4; i += 4)
+            {
+                var x = System.Runtime.Intrinsics.Vector256.LoadUnsafe(ref buf[i]);
+                (one / (one + System.Runtime.Intrinsics.Vector256.Exp(-x))).StoreUnsafe(ref buf[i]);
+            }
+        }
+#endif
+        for (; i < off + len; i++) buf[i] = 1.0 / (1.0 + Math.Exp(-buf[i]));
     }
 
     /// <summary>In-place hyperbolic tangent over a double span, at full precision.</summary>
@@ -988,7 +1013,20 @@ public partial class CpuEngine
     private static void TanhExactInPlaceD(double[] buf, int off, int len)
     {
         // tanh(x) = 2/(1+exp(-2x)) - 1 (overflow-safe; large |x| → ±1, never NaN).
-        for (int i = off; i < off + len; i++) buf[i] = 2.0 / (1.0 + Math.Exp(-2.0 * buf[i])) - 1.0;
+        int i = off;
+#if NET9_0_OR_GREATER
+        if (System.Runtime.Intrinsics.Vector256.IsHardwareAccelerated)
+        {
+            var one = System.Runtime.Intrinsics.Vector256.Create(1.0);
+            var two = System.Runtime.Intrinsics.Vector256.Create(2.0);
+            for (; i <= off + len - 4; i += 4)
+            {
+                var x = System.Runtime.Intrinsics.Vector256.LoadUnsafe(ref buf[i]);
+                (two / (one + System.Runtime.Intrinsics.Vector256.Exp(-two * x)) - one).StoreUnsafe(ref buf[i]);
+            }
+        }
+#endif
+        for (; i < off + len; i++) buf[i] = 2.0 / (1.0 + Math.Exp(-2.0 * buf[i])) - 1.0;
     }
 
     /// <summary>

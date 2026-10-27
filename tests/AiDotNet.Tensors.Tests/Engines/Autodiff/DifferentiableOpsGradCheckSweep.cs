@@ -354,6 +354,7 @@ public class DifferentiableOpsGradCheckSweep
                                    SafeTensor([1, 3, 2], r), SafeTensor([2, 3, 2], r), 2, 0.1],
         ["GatedDeltaNetScanForward"] = r => [SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r),
                                              SafeTensor([1, 3, 2], r), SafeTensor([1, 3, 2], r), 2],
+        ["LstmCellFromGates"] = r => [SafeTensor([2, 12], r), SafeTensor([2, 3], r), null!],
         ["XLstmScanForward"] = r => [SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r),
                                      SafeTensor([1, 3, 2], r), SafeTensor([1, 3, 2], r), SafeTensor([1, 3, 2], r), 2],
         // RgLru: [batch, seqLen, recDim] with a per-recDim decay vector.

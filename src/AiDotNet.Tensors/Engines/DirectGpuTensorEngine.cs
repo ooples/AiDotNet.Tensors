@@ -1670,7 +1670,33 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private bool TrySliceViewOnDevice<T>(IDirectGpuBackend backend, Tensor<T> view, IGpuBuffer? baseBuffer, out OwnedBuffer result)
     {
         result = default;
-        if (typeof(T) != typeof(float) || !view.IsContiguous || view._storageOffset == 0) return false;
+        if (typeof(T) != typeof(float)) return false;
+        if (!view.IsContiguous)
+        {
+            if (baseBuffer is null || backend is not IFusedLstmSequenceTraining fused) return false;
+            long last = view._storageOffset;
+            var layout = new float[2 * view.Rank];
+            for (int d = 0; d < view.Rank; d++)
+            {
+                if (view._strides[d] < 0) return false;
+                last += (long)(view.Shape[d] - 1) * view._strides[d];
+                layout[d] = BitConverter.ToSingle(BitConverter.GetBytes(view.Shape[d]), 0);
+                layout[view.Rank + d] = BitConverter.ToSingle(BitConverter.GetBytes(view._strides[d]), 0);
+            }
+            if (view._storageOffset < 0 || last >= baseBuffer.Size) return false;
+            var metadata = backend.AllocateBuffer(layout);
+            var gathered = AllocateFullyWrittenOutputBuffer(backend, view.Length);
+            try
+            {
+                fused.StatefulLstmLauncher(BatchExecutionCudaKernels.StridedViewCopy, view.Length,
+                    baseBuffer, gathered.Buffer, metadata, view.Rank, view._storageOffset, view.Length);
+            }
+            catch { gathered.DisposeAfterQueuedUse(backend); throw; }
+            finally { DisposeBufferAfterQueuedUse(backend, metadata); }
+            result = gathered;
+            return true;
+        }
+        if (view._storageOffset == 0) return false;
         if (baseBuffer is null || baseBuffer.Size < (long)view._storageOffset + view.Length) return false;
         var output = AllocateOutputBuffer(backend, view.Length);
         try
@@ -22225,14 +22251,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             using var input = GetOrAllocateBuffer(backend, tensor);
             var output = AllocateOutputBuffer(backend, tensor.Length);
+            bool transferred = false;
             try
             {
                 backend.Round(input.Buffer, output.Buffer, tensor.Length);
                 var rounded = DeferTensorResult<T>(backend, output.Buffer, tensor.Length, tensor.Shape.ToArray());
+                output.RelinquishOwnership();
+                transferred = true;
                 Autodiff.DifferentiableOps.RecordUnary("Round", rounded, tensor, Autodiff.BackwardFunctions<T>.SignBackward);
                 return rounded;
             }
-            catch { output.Dispose(); throw; }
+            catch
+            {
+                if (!transferred) output.Dispose();
+                throw;
+            }
         }
 
         try
@@ -22433,6 +22466,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.TensorCopy<T>(Tensor<T> source, Tensor<T> destination)
     {
+        if (source is not null && destination is not null && typeof(T) == typeof(float)
+            && source.Length == destination.Length && destination.IsContiguous && destination.StorageOffset != 0
+            && !Compilation.GraphMode.IsActive && TryGetBackend(out var viewBackend))
+        {
+            destination.PrepareForInPlaceWrite();
+            // Update the shared vector's device storage, not a detached buffer for
+            // this view. Sibling views and compiled consumers must see the write.
+            var storage = new Tensor<T>(new[] { destination.DataVector.Length }, destination.DataVector);
+            using var whole = GetOrAllocateBuffer(viewBackend, storage);
+            using var input = GetOrAllocateBuffer(viewBackend, source);
+            viewBackend.Copy(input.Buffer, 0, whole.Buffer, destination.StorageOffset, destination.Length);
+            storage.IncrementVersion();
+            BindResidentBuffer(storage, whole.Buffer, viewBackend);
+            base.InvalidatePersistentTensor(destination);
+            input.DisposeAfterQueuedUse(viewBackend);
+            whole.RelinquishOwnership();
+            return;
+        }
         if (source is not null && destination is not null && typeof(T) == typeof(float)
             && source.Length == destination.Length && destination.IsContiguous && destination._storageOffset == 0
             && !Compilation.GraphMode.IsActive && TryGetBackend(out var backend))
@@ -24787,7 +24838,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // record the same Reshape node the base records, so autograd is unchanged.
         if (!tensor.IsContiguous && typeof(T) == typeof(float)
             && !Compilation.GraphMode.IsActive && AiDotNet.Tensors.Engines.Compilation.AutoTracer.TryGetCompiledPlan<T>("Reshape", tensor._shape) is null
-            && TryGetBackend(out var permuteBackend) && TryPermuteViewOnDevice(permuteBackend, tensor, out var permuted))
+            && TryGetBackend(out var permuteBackend)
+            && (TryPermuteViewOnDevice(permuteBackend, tensor, out var permuted)
+                || TrySliceViewOnDevice(permuteBackend, tensor, out permuted)))
         {
             var contiguous = DeferTensorResult<T>(permuteBackend, permuted.Buffer, tensor.Length, tensor.Shape.ToArray());
             Tensor<T> reshaped;
@@ -24826,7 +24879,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return result;
     }
     public override Tensor<T> TensorFlatten<T>(Tensor<T> tensor) => base.TensorFlatten(tensor);
-    public override Tensor<T> TensorSqueeze<T>(Tensor<T> tensor, int axis) => base.TensorSqueeze(tensor, axis);
+    public override Tensor<T> TensorSqueeze<T>(Tensor<T> tensor, int axis)
+    {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (Compilation.GraphMode.IsActive) return base.TensorSqueeze(tensor, axis);
+        var compiled = Compilation.AutoTracer.TryGetCompiledPlan<T>("TensorSqueeze", tensor._shape);
+        if (compiled is not null) return compiled.Execute();
+        Tensor<T> result;
+        using (Autodiff.DifferentiableOps.SuppressTensorViewRecording())
+        {
+            result = axis == -1 ? tensor.Squeeze() : tensor.Squeeze(axis < 0 ? tensor.Rank + axis : axis);
+            if (result.Rank == 0) result = result.Reshape(new[] { 1 });
+        }
+        Autodiff.DifferentiableOps.RecordUnary("TensorSqueeze", result, tensor,
+            Autodiff.BackwardFunctions<T>.SqueezeBackward, new object[] { axis });
+        Compilation.AutoTracer.RecordOp("TensorSqueeze", result, eng => eng.TensorSqueeze(tensor, axis));
+        return result;
+    }
 
     public override Tensor<T> EluBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> output, double alpha)
     {
@@ -24858,13 +24927,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (dim < 0 || dim >= tensor.Rank) throw new ArgumentOutOfRangeException(nameof(dim));
         if (start < 0 || length < 0 || start > tensor.Shape[dim] - length)
             throw new ArgumentOutOfRangeException(nameof(start));
-        // Every axis needs a device slice. Host narrow views of the time axis retained
-        // source strides/offsets that later arithmetic and squeeze materialized on CPU.
-        var startArr = new int[tensor.Rank];
-        var lengthArr = tensor.Shape.ToArray();
-        startArr[dim] = start;
-        lengthArr[dim] = length;
-        return TensorSlice(tensor, startArr, lengthArr);
+        // Narrow is a storage view. Device consumers gather its strides when they
+        // require contiguous input; creating the view itself neither copies nor downloads.
+        if (length == 0)
+        {
+            var starts = new int[tensor.Rank]; starts[dim] = start;
+            var lengths = tensor.Shape.ToArray(); lengths[dim] = 0;
+            return TensorSlice(tensor, starts, lengths);
+        }
+        return base.TensorNarrow(tensor, dim, start, length);
     }
 
     public override Tensor<T> TensorConstantPad<T>(Tensor<T> tensor, int[] padding, T value)
@@ -27031,7 +27102,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private Tensor<T>? TryDeviceRectSlice<T>(Tensor<T> tensor, int[] start, int[] length)
     {
-        if (typeof(T) != typeof(float) || !tensor.IsContiguous || start.Length != tensor.Rank
+        if (typeof(T) != typeof(float) || start.Length != tensor.Rank
             || length.Length != tensor.Rank || tensor.Rank == 0 || !TryGetBackend(out var backend))
             return null;
 
@@ -27043,11 +27114,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             total = checked(total * length[d]);
         }
 
+        OwnedBuffer inputLease = default;
         IGpuBuffer? output = null;
         bool handedOff = false;
         try
         {
-            var input = UploadTensorRaw(backend, tensor);
+            inputLease = GetOrAllocateBuffer(backend, tensor);
+            var input = inputLease.Buffer;
             output = AllocateDeviceBufferUninitialized(backend, total);   // every route below writes all of it
             int segment = length[tensor.Rank - 1];
             int rows = total / segment;
@@ -27097,7 +27170,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         finally
         {
-            if (!handedOff) output?.Dispose();
+            inputLease.DisposeAfterQueuedUse(backend);
+            if (!handedOff && output is not null) DisposeBufferAfterQueuedUse(backend, output);
         }
     }
 

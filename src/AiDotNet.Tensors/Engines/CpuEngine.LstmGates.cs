@@ -129,7 +129,18 @@ public partial class CpuEngine
         var result = new Tensor<float>(new[] { checked(2 * count) });
         using var write = result.LeaseWritable();
         var cell = write.Span.Slice(count, count); var hiddenOut = write.Span.Slice(0, count);
-        for (int k = 0; k < count; k++)
+        int position = 0;
+#if NET5_0_OR_GREATER
+        if (System.Numerics.Vector.IsHardwareAccelerated)
+        {
+            int width = System.Numerics.Vector<float>.Count;
+            for (; position <= count - width; position += width)
+                (new System.Numerics.Vector<float>(act, count + position) * new System.Numerics.Vector<float>(old, position)
+                    + new System.Numerics.Vector<float>(act, position) * new System.Numerics.Vector<float>(act, 2 * count + position))
+                    .CopyTo(cell.Slice(position, width));
+        }
+#endif
+        for (int k = position; k < count; k++)
         {
             cell[k] = act[count + k] * old[k] + act[k] * act[2 * count + k];
         }
@@ -148,9 +159,35 @@ public partial class CpuEngine
         var tc = new float[count]; Simd.SimdKernels.Tanh(y.AsSpan(count, count), tc.AsSpan());
         var dg = new Tensor<float>(gates.Shape.ToArray()); var dc = new Tensor<float>(previousCell.Shape.ToArray());
         using var gw = dg.LeaseWritable(); using var cw = dc.LeaseWritable();
-        for (int k = 0; k < count; k++)
+        for (int row = 0; row < count / hidden; row++)
         {
-            int g = (k / hidden) * 4 * hidden + k % hidden;
+            int column = 0;
+#if NET5_0_OR_GREATER
+            if (System.Numerics.Vector.IsHardwareAccelerated)
+            {
+                int width = System.Numerics.Vector<float>.Count;
+                var one = System.Numerics.Vector<float>.One;
+                for (; column <= hidden - width; column += width)
+                {
+                    int k = row * hidden + column, g = row * 4 * hidden + column;
+                    var i = new System.Numerics.Vector<float>(act, k);
+                    var f = new System.Numerics.Vector<float>(act, count + k);
+                    var z = new System.Numerics.Vector<float>(act, 2 * count + k);
+                    var o = new System.Numerics.Vector<float>(act, 3 * count + k);
+                    var tanh = new System.Numerics.Vector<float>(tc, k);
+                    var dh = new System.Numerics.Vector<float>(dy, k);
+                    var d = new System.Numerics.Vector<float>(dy, count + k) + dh * o * (one - tanh * tanh);
+                    (d * z * i * (one - i)).CopyTo(gw.Span.Slice(g, width));
+                    (d * new System.Numerics.Vector<float>(old, k) * f * (one - f)).CopyTo(gw.Span.Slice(g + hidden, width));
+                    (d * i * (one - z * z)).CopyTo(gw.Span.Slice(g + 2 * hidden, width));
+                    (dh * tanh * o * (one - o)).CopyTo(gw.Span.Slice(g + 3 * hidden, width));
+                    (d * f).CopyTo(cw.Span.Slice(k, width));
+                }
+            }
+#endif
+            for (; column < hidden; column++)
+            {
+            int k = row * hidden + column, g = row * 4 * hidden + column;
             float i = act[k], f = act[count + k], z = act[2 * count + k], o = act[3 * count + k];
             float d = dy[count + k] + dy[k] * o * (1 - tc[k] * tc[k]);
             gw.Span[g] = d * z * i * (1 - i);
@@ -158,6 +195,7 @@ public partial class CpuEngine
             gw.Span[g + 2 * hidden] = d * i * (1 - z * z);
             gw.Span[g + 3 * hidden] = dy[k] * tc[k] * o * (1 - o);
             cw.Span[k] = d * f;
+            }
         }
         return (dg, dc);
     }

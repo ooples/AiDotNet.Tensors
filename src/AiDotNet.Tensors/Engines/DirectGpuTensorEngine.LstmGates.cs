@@ -23,11 +23,14 @@ public partial class DirectGpuTensorEngine
         {
             fused.StatefulLstmLauncher(BatchExecutionCudaKernels.LstmGateCell, count,
                 pre.Buffer, old.Buffer, output.Buffer, count, hidden);
-            backend.Synchronize();
             var result = DeferTensorResult<T>(backend, output.Buffer, 2 * count, new[] { 2 * count });
             output.RelinquishOwnership(); return result;
         }
-        finally { backend.Synchronize(); output.Dispose(); }
+        finally
+        {
+            pre.DisposeAfterQueuedUse(backend); old.DisposeAfterQueuedUse(backend);
+            output.DisposeAfterQueuedUse(backend);
+        }
     }
 
     internal bool TryLstmGateBackward<T>(Tensor<T> gradient, Tensor<T>[] inputs, Tensor<T> output,
@@ -46,7 +49,6 @@ public partial class DirectGpuTensorEngine
         {
             fused.StatefulLstmLauncher(BatchExecutionCudaKernels.LstmGateCellBackward, count,
                 pre.Buffer, old.Buffer, y.Buffer, dy.Buffer, dg.Buffer, dc.Buffer, count, hidden);
-            backend.Synchronize();
             var gatesGrad = DeferTensorResult<T>(backend, dg.Buffer, inputs[0].Length, inputs[0].Shape.ToArray());
             dg.RelinquishOwnership();
             var cellGrad = DeferTensorResult<T>(backend, dc.Buffer, count, inputs[1].Shape.ToArray());
@@ -55,6 +57,11 @@ public partial class DirectGpuTensorEngine
             DifferentiableOps.AccumulateGrad(grads, inputs[1], cellGrad, this);
             return true;
         }
-        finally { backend.Synchronize(); dg.Dispose(); dc.Dispose(); }
+        finally
+        {
+            pre.DisposeAfterQueuedUse(backend); old.DisposeAfterQueuedUse(backend);
+            dy.DisposeAfterQueuedUse(backend); y.DisposeAfterQueuedUse(backend);
+            dg.DisposeAfterQueuedUse(backend); dc.DisposeAfterQueuedUse(backend);
+        }
     }
 }

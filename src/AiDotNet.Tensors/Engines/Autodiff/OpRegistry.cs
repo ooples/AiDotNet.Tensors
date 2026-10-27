@@ -513,7 +513,8 @@ internal static class OpRegistry
         "TensorSoftMarginLoss", "TensorRenorm", "TensorNormExceptDim", "TensorGradient",
         "TensorPadSequence", "TensorIndexReduce", "TensorConvTranspose1D", "TensorConvTbc",
 
-        // Recurrent cells and sequences composed from linear, gate and stack ops (CpuEngine.TorchRnn)
+        // Recurrent wrappers record their component ops; float/double LSTM cells
+        // delegate to the fused sequence node, other numeric types to gate ops.
         "TensorRnnCell", "TensorLstmCell", "TensorGruCell", "TensorRecurrent",
 
         // General convolution: index-map spread, flip/permute, narrow and Conv2D/Conv3D (CpuEngine.TorchConvolution)

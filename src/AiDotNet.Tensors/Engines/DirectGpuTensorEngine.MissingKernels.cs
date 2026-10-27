@@ -7499,8 +7499,10 @@ public partial class DirectGpuTensorEngine
                     var terminalC = Transient(backend.AllocateBuffer(B * Hd));
                     backend.Copy(ownGradOutput.Buffer, offset, terminalH, 0, B * Hd);
                     backend.Copy(ownGradOutput.Buffer, offset + B * Hd, terminalC, 0, B * Hd);
+                    if (backend is not IFusedLstmSequenceTraining statefulBackend)
+                        throw new InvalidOperationException($"Stateful LSTM backward requires fused training support from {backend.GetType().Name}.");
                     PortableLstmSequence.Backward(backend,
-                        ((IFusedLstmSequenceTraining)backend).StatefulLstmLauncher,
+                        statefulBackend.StatefulLstmLauncher,
                         gradOut, ownAllH.Buffer, ownAllC.Buffer, ownGates.Buffer,
                         ownWih.Buffer, ownWhh.Buffer, ownInput.Buffer,
                         bufGradInput, bufDH0, bufDC0, bufDWih, bufDWhh, bufDBih, bufDBhh,

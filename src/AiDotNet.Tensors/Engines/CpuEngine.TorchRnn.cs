@@ -41,9 +41,18 @@ public partial class CpuEngine
         if (cell == null) throw new ArgumentNullException(nameof(cell));
         var (x, h, unbatched) = BatchCell(input, hidden, this);
         var c = unbatched ? Reshape(cell, new[] { 1, cell.Length }) : cell;
-        // A length-one sequence shares the fused forward and the independent h/c adjoints.
-        LstmSequenceForward(Reshape(x, new[] { x.Shape[0], 1, x.Shape[1] }), h, c,
-            wIh, wHh, bIh, bHh, out var hNext, out var cNext);
+        Tensor<T> hNext, cNext;
+        if (typeof(T) == typeof(float) || typeof(T) == typeof(double))
+        {
+            // A length-one sequence shares the fused forward and the independent h/c adjoints.
+            LstmSequenceForward(Reshape(x, new[] { x.Shape[0], 1, x.Shape[1] }), h, c,
+                wIh, wHh, bIh, bHh, out hNext, out cNext);
+        }
+        else
+        {
+            var gates = TensorAdd(TorchLinear(x, wIh, bIh), TorchLinear(h, wHh, bHh));
+            hNext = LstmCellFromGates(gates, c, out cNext);
+        }
         return (Unbatch(hNext, unbatched), Unbatch(cNext, unbatched));
     }
 

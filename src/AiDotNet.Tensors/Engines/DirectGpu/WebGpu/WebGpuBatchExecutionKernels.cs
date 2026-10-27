@@ -1123,7 +1123,7 @@ fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
 }");
 
     public static readonly string XLstmTrainingBackward = Shader(
-        new[] { "r:Q", "r:K", "r:V", "r:I", "r:F", "r:O", "r:DY", "r:S", "rw:A", "rw:G" }, "B: i32, T: i32, M: i32, H: i32", Main + @"
+        new[] { "r:Q", "r:K", "r:V", "r:IFO", "r:DY", "r:S", "rw:A", "rw:G" }, "B: i32, T: i32, M: i32, H: i32", Main + @"
 
     var bh: i32 = i; if (bh >= p.B * p.H) { return; }
     var D: i32 = p.M / p.H; var W: i32 = D * D + D; var z: i32 = bh * (p.T + 1) * W; var az: i32 = bh * W;
@@ -1134,7 +1134,7 @@ fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
         var x: i32 = (bh / p.H * p.T + t) * p.M + (bh % p.H) * D;
         var g: i32 = (bh / p.H * p.T + t) * p.H + bh % p.H;
         var a: i32 = z + t * W; var c: i32 = a + W;
-        var iv: f32 = min(I[g], 4.85e8); var f: f32 = F[g]; var o: f32 = O[g];
+        var iv: f32 = min(IFO[g], 4.85e8); var f: f32 = IFO[NG + g]; var o: f32 = IFO[2 * NG + g];
         var nq: f32 = 0.0;
         for (var j: i32 = 0; j < D; j++) { nq += S[c + D * D + j] * Q[x + j]; G[x + j] = 0.0; }
         var nf: f32 = max(abs(nq), 1.0); var dnf: f32 = 0.0; var doGate: f32 = 0.0;
@@ -1170,7 +1170,7 @@ fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
             }
             G[2 * N + x + r] = dv;
         }
-        G[3 * N + g] = select(di, 0.0, I[g] > 4.85e8);
+        G[3 * N + g] = select(di, 0.0, IFO[g] > 4.85e8);
         G[3 * N + NG + g] = df; G[3 * N + 2 * NG + g] = doGate;
         for (var j: i32 = 0; j < W; j++) { A[az + j] *= f; }
     }
@@ -1184,6 +1184,17 @@ fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
     let z = bx_tanh(pre[g + 2 * p.H]); let og = lstm_sig(pre[g + 3 * p.H]);
     let c = fg * old[i] + ig * z;
     y[i] = og * bx_tanh(c); y[p.N + i] = c;
+}");
+    public static readonly string StridedViewCopy = Shader(
+        new[] { "r:input", "rw:output", "r:layout" }, "rank: i32, offset: i32, count: i32", Main + @"
+    if (i >= p.count) { return; }
+    var remaining = i; var source = p.offset;
+    for (var d = p.rank - 1; d >= 0; d--) {
+        let extent = bitcast<i32>(layout[d]);
+        source += (remaining % extent) * bitcast<i32>(layout[p.rank + d]);
+        remaining /= extent;
+    }
+    output[i] = input[source];
 }");
     public static readonly string LstmGateCellBackward = Shader(
         new[] { "r:pre", "r:old", "r:y", "r:dy", "rw:dg", "rw:dc" }, "N: i32, H: i32", LstmSig + Main + @"
@@ -1314,6 +1325,7 @@ fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
         [BatchExecutionCudaKernels.FaDq] = FaDq, [BatchExecutionCudaKernels.FaDk] = FaDk, [BatchExecutionCudaKernels.FaDv] = FaDv,
         [BatchExecutionCudaKernels.XLstmTrainingForward] = XLstmTrainingForward,
         [BatchExecutionCudaKernels.XLstmTrainingBackward] = XLstmTrainingBackward,
+        [BatchExecutionCudaKernels.StridedViewCopy] = StridedViewCopy,
         [BatchExecutionCudaKernels.LstmGateCell] = LstmGateCell,
         [BatchExecutionCudaKernels.LstmGateCellBackward] = LstmGateCellBackward,
         [BatchExecutionCudaKernels.LstmGates] = LstmGates, [BatchExecutionCudaKernels.LstmCell] = LstmCell,

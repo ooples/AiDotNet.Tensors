@@ -12,6 +12,94 @@ namespace AiDotNet.Tensors.Tests.Engines;
 [Collection("CompilationGlobalState")]
 public class LstmGateKernelTests
 {
+    [Theory]
+    [InlineData(8, 128, 512)]
+    [InlineData(7, 13, 24)]
+    [InlineData(2, 13, 148)]
+    public void RecurrentProjection_OverwritesPoisonedScratchIncludingTails(int m, int k, int n)
+    {
+        var a = Enumerable.Range(0, m * k).Select(i => (float)Math.Sin(i * .13) * .1f).ToArray();
+        var b = Enumerable.Range(0, k * n).Select(i => (float)Math.Cos(i * .17) * .1f).ToArray();
+        var c = Enumerable.Repeat(float.NaN, m * n).ToArray();
+        AiDotNet.Tensors.Engines.Simd.SimdGemm.SgemmRecurrentOverwrite(a, b, c, m, k, n);
+        for (int row = 0; row < m; row++)
+            for (int col = 0; col < n; col++)
+            {
+                double expected = 0;
+                for (int inner = 0; inner < k; inner++) expected += (double)a[row * k + inner] * b[inner * n + col];
+                Assert.InRange(Math.Abs(c[row * n + col] - expected), 0, 1e-6);
+            }
+    }
+
+    [Fact, Trait("Category", "RequiresOpenCL")]
+    public void TensorCopy_OffsetDestinationUpdatesSiblingViewsWithoutHostTransfer()
+    {
+        using var backend = new OpenClBackend(); Assert.True(backend.IsAvailable);
+        using var direct = new DirectGpuEngine(backend); using var engine = new DirectGpuTensorEngine(direct);
+        var root = engine.TensorAddScalar(new Tensor<float>(Enumerable.Range(0, 8).Select(i => (float)i).ToArray(), new[] { 8 }), 1f);
+        var view = engine.TensorNarrow(root, 0, 2, 3);
+        var sibling = engine.TensorNarrow(root, 0, 1, 5);
+        var replacement = engine.TensorAddScalar(new Tensor<float>(new[] { 3 }), 9f);
+        Tensor<float> observed;
+        using (var scope = AiDotNet.Tensors.Engines.Diagnostics.GpuResidencyScope.Begin(captureOperations: true))
+        {
+            ((IEngine)engine).TensorCopy(replacement, view);
+            observed = engine.TensorAddScalar(sibling, 1f);
+            Assert.True(scope.Downloads == 0, string.Join("\n", scope.Events));
+        }
+        Assert.Equal(new float[] { 3, 10, 10, 10, 7 }, observed.ToArray());
+        Assert.Equal(new float[] { 1, 2, 9, 9, 9, 6, 7, 8 }, root.ToArray());
+        Assert.Equal(new float[] { 9, 9, 9 }, view.ToArray());
+    }
+    [Fact]
+    public void DecimalLstmCell_RecordsBothStateAdjoints()
+    {
+        var engine = new CpuEngine();
+        var x = new Tensor<decimal>(new decimal[] { .2m }, new[] { 1, 1 });
+        var h = new Tensor<decimal>(new decimal[] { .3m }, new[] { 1, 1 });
+        var c = new Tensor<decimal>(new decimal[] { .4m }, new[] { 1, 1 });
+        var wi = new Tensor<decimal>(new decimal[] { .1m, .2m, .3m, .4m }, new[] { 4, 1 });
+        var wh = new Tensor<decimal>(new decimal[] { .2m, .3m, .4m, .5m }, new[] { 4, 1 });
+        using var tape = new GradientTape<decimal>();
+        var (nextH, nextC) = engine.TensorLstmCell(x, h, c, wi, wh);
+        var gradients = tape.ComputeGradients(engine.ReduceSum(engine.TensorAdd(nextH, nextC), null), new[] { x, h, c, wi, wh });
+        foreach (var source in new[] { x, h, c, wi, wh })
+        {
+            Assert.True(gradients.ContainsKey(source));
+            Assert.All(gradients[source].ToArray(), value => Assert.True(value > 0));
+        }
+    }
+
+    [Fact, Trait("Category", "RequiresOpenCL")]
+    public void NarrowViews_PreserveStorageAndReshapeOnDeviceWithGradients()
+    {
+        using var backend = new OpenClBackend(); Assert.True(backend.IsAvailable);
+        using var direct = new DirectGpuEngine(backend); using var engine = new DirectGpuTensorEngine(direct);
+        var source = engine.TensorAddScalar(new Tensor<float>(Enumerable.Range(0, 24).Select(i => (float)i).ToArray(), new[] { 2, 3, 4 }), 1f);
+        using var tape = new GradientTape<float>();
+        Tensor<float> reshaped; Dictionary<Tensor<float>, Tensor<float>> gradients;
+        using (var scope = AiDotNet.Tensors.Engines.Diagnostics.GpuResidencyScope.Begin(captureOperations: true))
+        {
+            var view = engine.TensorNarrow(source, 1, 1, 1);
+            Assert.True(source.SharesStorageWith(view));
+            Assert.Equal(4, view.StorageOffset);
+            reshaped = engine.Reshape(view, new[] { 2, 4 });
+            gradients = tape.ComputeGradients(engine.ReduceSum(engine.TensorMultiply(reshaped, reshaped), null), new[] { source });
+            Assert.True(scope.Downloads == 0, string.Join("\n", scope.Events));
+        }
+        Assert.Equal(new float[] { 5, 6, 7, 8, 17, 18, 19, 20 }, reshaped.ToArray());
+        var expected = new float[24];
+        for (int b = 0; b < 2; b++) for (int j = 0; j < 4; j++) expected[b * 12 + 4 + j] = 2 * (b * 12 + 5 + j);
+        Assert.Equal(expected, gradients[source].ToArray());
+    }
+
+    [Fact]
+    public void WebGpuXLstmBackward_UsesEightStorageBindings()
+    {
+        var source = AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuBatchExecutionKernels.XLstmTrainingBackward;
+        Assert.Equal(8, System.Text.RegularExpressions.Regex.Matches(source, @"var<storage").Count);
+        Assert.Contains("IFO", source);
+    }
     [Fact]
     public void WideFloatGates_MatchDecomposedGradientsWithSaturatedInputs()
     {

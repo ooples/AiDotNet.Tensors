@@ -7,6 +7,7 @@ internal static partial class BatchExecutionCudaKernels
         LstmWeightHhGrad = "lstm_p_gwhh", LstmBiasGrad = "lstm_p_gbias";
 
     public const string LstmGateCell = "lstm_p_gate_cell", LstmGateCellBackward = "lstm_p_gate_cell_bwd";
+    public const string StridedViewCopy = "bx_strided_view_copy";
 
     // #1107 / #1108: the fused-LSTM training contract (IFusedLstmSequenceTraining) for every backend, as the CPU
     // reference defines it: batch-major x [B, T, In] and y [B, T, H], PyTorch gate order (i, f, g, o) with rows
@@ -17,6 +18,15 @@ internal static partial class BatchExecutionCudaKernels
     public const string XLstmTrainingForward = "xlstm_train_forward", XLstmTrainingBackward = "xlstm_train_backward";
 
     internal const string LstmSource = @"
+extern ""C"" __global__ __launch_bounds__(256) void bx_strided_view_copy(const float* input, float* output, const int* layout, int rank, int offset, int count) {
+    int k = bx_gid(); if (k >= count) return;
+    int remaining = k; int source = offset;
+    for (int d = rank - 1; d >= 0; d--) {
+        source += (remaining % layout[d]) * layout[rank + d];
+        remaining /= layout[d];
+    }
+    output[k] = input[source];
+}
 extern ""C"" __global__ __launch_bounds__(256) void lstm_p_gates(const float* x, const float* wih, const float* whh, const float* bih, const float* bhh, const float* allH, float* gates, int t, int B, int T, int In, int H) {
     int k = bx_gid(); if (k >= B * 4 * H) return;
     int b = k / (4 * H); int row = k - b * 4 * H;
