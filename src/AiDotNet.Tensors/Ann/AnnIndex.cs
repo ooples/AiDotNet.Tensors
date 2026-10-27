@@ -308,7 +308,7 @@ namespace AiDotNet.Tensors.Ann
             IDirectGpuBackend? gpu = null)
         {
             int k = Math.Max(1, Math.Min(kRaw, n));
-            var rng = new Random(seed);
+            var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(seed);
             var centroids = new float[k * dim];
             // Init: distinct random samples.
             var picked = new HashSet<int>();

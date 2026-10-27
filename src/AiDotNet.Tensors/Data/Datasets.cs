@@ -281,7 +281,7 @@ public static class DatasetExtensions
 
         var perm = new int[dataset.Count];
         for (int i = 0; i < perm.Length; i++) perm[i] = i;
-        var rng = seed is null ? new Random() : new Random(seed.Value);
+        var rng = seed is null ? AiDotNet.Tensors.Helpers.RandomHelper.CreateSecureRandom() : AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(seed.Value);
         // Fisher-Yates.
         for (int i = perm.Length - 1; i > 0; i--)
         {

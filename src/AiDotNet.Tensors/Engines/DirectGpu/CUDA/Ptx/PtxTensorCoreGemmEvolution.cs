@@ -71,8 +71,11 @@ internal static class PtxTensorCoreGemmEvolution
         KernelTuningDeploymentRegistry<PtxTensorCoreGemmConfiguration>? deploymentRegistry = null,
         IKernelTuningStore<PtxTensorCoreGemmConfiguration>? store = null,
         Action<PtxTensorCoreGemmConfiguration, KernelTuningTrialResult>? onTrial = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool fp16Accumulate = false)
     {
+        if (fp16Accumulate && precision != PtxTensorCorePrecision.Fp16)
+            throw new ArgumentException("FP16 accumulation needs FP16 operands.", nameof(fp16Accumulate));
         if (runtime is null) throw new ArgumentNullException(nameof(runtime));
         if (m <= 0) throw new ArgumentOutOfRangeException(nameof(m));
         if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n));
@@ -86,12 +89,14 @@ internal static class PtxTensorCoreGemmEvolution
         using var backend = new PtxGemmEvolution.ExperimentBackend<PtxTensorCoreGemmConfiguration>(runtime, layout, m, n, k,
             configuration =>
             {
-                var kernel = new PtxTensorCoreGemmKernel(runtime, configuration, layout, precision);
+                var kernel = new PtxTensorCoreGemmKernel(runtime, configuration, layout, precision, fp16Accumulate: fp16Accumulate);
                 return new PtxGemmEvolution.LoadedGemm(kernel, kernel.Audit,
                     (a, b, c) => kernel.Launch(a, b, c, m, n, k, lda, ldb, n, 1f, 0f));
             },
             configuration => configuration.Name,
-            halfOperands: precision == PtxTensorCorePrecision.Fp16);
+            halfOperands: precision == PtxTensorCorePrecision.Fp16,
+            // FP16 accumulation rounds each K tile's partial sum to FP16: allow its error, as the route's cuBLAS check does.
+            relativeTolerance: fp16Accumulate ? CudaBackend.Fp16AccumulateRelativeTolerance : 1e-4);
         var experiment = new KernelTuningExperiment<PtxTensorCoreGemmConfiguration>(
             backend,
             new DeviceEventKernelTuningTimer(new PtxGemmEvolution.CudaEventClock(runtime)),
@@ -100,7 +105,8 @@ internal static class PtxTensorCoreGemmEvolution
             KernelTuningTimingScope.SteadyStateExecution);
         var identity = new KernelTuningIdentity(
             EvolutionKernelId,
-            new ShapeProfile(m, n, k, (layout.TransposeA ? 1 : 0) | (layout.TransposeB ? 2 : 0) | ((int)precision << 2)),
+            new ShapeProfile(m, n, k, (layout.TransposeA ? 1 : 0) | (layout.TransposeB ? 2 : 0) | ((int)precision << 2) |
+                (fp16Accumulate ? 1 << 4 : 0)),
             PtxGemmEvolution.Fingerprint(runtime),
             KernelTuningBackend.Cuda,
             SearchSpaceVersion,

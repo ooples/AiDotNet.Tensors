@@ -268,11 +268,11 @@ internal static class QuantizedOperators
                 for (int i = 1; i < xSpan.Length; i++)
                 {
                     var v = xSpan[i];
-                    if (Convert.ToDouble(v!) < Convert.ToDouble(minV!)) minV = v;
-                    if (Convert.ToDouble(v!) > Convert.ToDouble(maxV!)) maxV = v;
+                    if (AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<T>().ToDouble(v) < AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<T>().ToDouble(minV)) minV = v;
+                    if (AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<T>().ToDouble(v) > AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<T>().ToDouble(maxV)) maxV = v;
                 }
-                double adjMin = Math.Min(0.0, Convert.ToDouble(minV!));
-                double adjMax = Math.Max(0.0, Convert.ToDouble(maxV!));
+                double adjMin = Math.Min(0.0, AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<T>().ToDouble(minV));
+                double adjMax = Math.Max(0.0, AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<T>().ToDouble(maxV));
                 double scale = (adjMax - adjMin) / 255.0;
                 if (scale <= 0.0) scale = 1.0; // degenerate all-zero input
                 double interZp = 0.0 - adjMin / scale;
@@ -283,7 +283,7 @@ internal static class QuantizedOperators
                 var yDst = yOut.AsWritableSpan();
                 for (int i = 0; i < xSpan.Length; i++)
                 {
-                    double xv = Convert.ToDouble(xSpan[i]!);
+                    double xv = AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<T>().ToDouble(xSpan[i]);
                     double q = Math.Round(xv / scale) + zp;
                     if (q < 0) q = 0; if (q > 255) q = 255;
                     yDst[i] = ops.FromDouble(q);
@@ -466,7 +466,7 @@ internal static class QuantizedOperators
         var span = zeroPoint.AsSpan();
         for (int i = 0; i < span.Length; i++)
         {
-            double v = Convert.ToDouble(span[i]!);
+            double v = AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<T>().ToDouble(span[i]);
             if (v > 127.0 || v < -128.0) return true;
         }
         return false;

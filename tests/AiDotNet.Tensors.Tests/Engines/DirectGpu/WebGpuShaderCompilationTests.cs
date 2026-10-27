@@ -27,6 +27,7 @@ public sealed class WebGpuShaderCompilationTests
         "WebGpuTunedRowKernels.RowPrologue",  // the row kernels' shared main() prologue, closed by each family's body
         "WebGpuBatchNormRegisterKernels.Forward",    // templates: SourceFor fills in the name and the values per thread
         "WebGpuBatchNormRegisterKernels.Backward",
+        "WebGpuConvDgradS2Kernels.Entry",     // the stride-2 dgrad kernels' shared entry-point header, closed by each body
     };
 
     private const string Validator = @"

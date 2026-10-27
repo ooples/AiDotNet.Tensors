@@ -63,7 +63,7 @@ public static class Pruning
         for (int i = 0; i < total; i++) mask[i] = true;
         if (toPrune == 0) return new PrunedTensor<T>(raw, mask);
 
-        var rng = new Random(seed);
+        var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(seed);
         var indices = new int[total];
         for (int i = 0; i < total; i++) indices[i] = i;
         // Fisher-Yates shuffle, then pick the first `toPrune` to mask out.
@@ -141,7 +141,7 @@ public static class Pruning
         for (int i = dim + 1; i < raw.Rank; i++) inner *= raw._shape[i];
 
         int toPrune = (int)Math.Round(amount * axisLen);
-        var rng = new Random(seed);
+        var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(seed);
         var sliceIndices = new int[axisLen];
         for (int i = 0; i < axisLen; i++) sliceIndices[i] = i;
         for (int i = axisLen - 1; i > 0; i--)
