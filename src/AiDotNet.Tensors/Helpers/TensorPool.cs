@@ -38,9 +38,11 @@ public static class TensorPool
     /// variable so consumer test rigs can flip it without code
     /// changes.</para>
     ///
-    /// <para>Cost when enabled: every <c>Rent</c> goes through
-    /// <c>new T[totalSize]</c> instead of the ArrayPool / thread-
-    /// local cache path. For training loops with many small
+    /// <para>Cost when enabled: every rent allocates an exact-sized
+    /// array instead of using the ArrayPool / thread-local cache.
+    /// <c>Rent</c> still zeroes its values; <c>RentUninitialized</c>
+    /// may skip clearing reference-free values on supported runtimes.
+    /// For training loops with many small
     /// allocations this turns into Gen-0 GC pressure — the same
     /// regression the pool was designed to avoid. Don't enable
     /// globally unless you have a measured determinism need.</para>
