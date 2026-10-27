@@ -13,6 +13,23 @@ namespace AiDotNet.Tensors.Tests.Engines;
 [Trait("Category", "RequiresOpenCL")]
 public class XLstmDeviceTrainingTests
 {
+    [Fact]
+    public void OpenCl_NoOpSqueeze_PreservesBranchedGradientWithoutDownloads()
+    {
+        using var backend = new OpenClBackend(); Assert.True(backend.IsAvailable);
+        using var direct = new DirectGpuEngine(backend); using var engine = new DirectGpuTensorEngine(direct);
+        var x = new Tensor<float>(new float[] { 1, 2, 3, 4, 5, 6 }, new[] { 2, 3 });
+        using var tape = new GradientTape<float>();
+        GpuLaunchProbe.Reset();
+        var y = engine.TensorMultiply(x, x);
+        var squeezed = engine.TensorSqueeze(y, -1);
+        Assert.Same(y, squeezed);
+        var loss = engine.ReduceSum(engine.TensorAdd(squeezed, y), null);
+        var gradients = tape.ComputeGradients(loss, new[] { x });
+        Assert.Equal(0, GpuLaunchProbe.Readbacks);
+        Assert.Equal(new float[] { 4, 8, 12, 16, 20, 24 }, gradients[x].ToArray());
+    }
+
     [Theory] [InlineData(0)] [InlineData(1)] [InlineData(2)]
     public void OpenCl_NarrowEveryAxisAndItsGradientStayOnDevice(int axis)
     {

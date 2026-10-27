@@ -125,8 +125,11 @@ jobs:
           sleep 2
         done
         if [ "$device_ready" -ne 1 ]; then
-          echo "::error::POCL device setup failed after three attempts."
-          exit 1
+          if [ "${{ matrix.required }}" = "true" ]; then
+            echo "::error::POCL device setup failed after three attempts."
+            exit 1
+          fi
+          echo "::warning::POCL device setup failed after three attempts; this legacy shard is informational."
         fi
 
     - name: Build tests (net10.0)

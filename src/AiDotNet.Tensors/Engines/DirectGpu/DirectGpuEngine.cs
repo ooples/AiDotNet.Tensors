@@ -228,8 +228,12 @@ public sealed class DirectGpuEngine : IDisposable
     /// Internal so deterministic routing tests can exercise conversion and dispatch without probing
     /// machine hardware. Production callers continue to use the public capability-detecting constructor.
     /// </remarks>
-    internal DirectGpuEngine(IDirectGpuBackend backend)
+    internal DirectGpuEngine(IDirectGpuBackend backend) : this(backend, borrowsBackend: false) { }
+
+    /// <summary>Wraps a backend whose lifetime may be owned by a shared fixture.</summary>
+    internal DirectGpuEngine(IDirectGpuBackend backend, bool borrowsBackend)
     {
+        _borrowsBackend = borrowsBackend;
         _backend = backend ?? throw new ArgumentNullException(nameof(backend));
         _fusionManager = new KernelFusionManager();
         _isAvailable = backend.IsAvailable;

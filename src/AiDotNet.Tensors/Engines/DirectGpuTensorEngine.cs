@@ -25174,8 +25174,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             result = axis == -1 ? tensor.Squeeze() : tensor.Squeeze(axis < 0 ? tensor.Rank + axis : axis);
             if (result.Rank == 0) result = result.Reshape(new[] { 1 });
         }
-        Autodiff.DifferentiableOps.RecordUnary("TensorSqueeze", result, tensor,
-            Autodiff.BackwardFunctions<T>.SqueezeBackward, new object[] { axis });
+        // A no-op squeeze returns the input itself; recording it creates a tape self-edge.
+        if (!ReferenceEquals(result, tensor))
+            Autodiff.DifferentiableOps.RecordUnary("TensorSqueeze", result, tensor,
+                Autodiff.BackwardFunctions<T>.SqueezeBackward, new object[] { axis });
         Compilation.AutoTracer.RecordOp("TensorSqueeze", result, eng => eng.TensorSqueeze(tensor, axis));
         return result;
     }

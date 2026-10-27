@@ -101,10 +101,25 @@ internal static class DawnHostedWebGpu
 public sealed class DawnHostedWebGpuBackendTests
 {
     [SkippableFact]
+    public void BorrowedEngineDisposal_PreservesSharedBackend()
+    {
+        var backend = DawnHostedWebGpu.BackendOrSkip();
+        using (var direct = new DirectGpuEngine(backend, borrowsBackend: true))
+        using (var engine = new DirectGpuTensorEngine(direct))
+        {
+            var x = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(new float[] { 1, 2 }, new[] { 2 });
+            Assert.Equal(new float[] { 2, 3 }, engine.TensorAddScalar(x, 1f).ToArray());
+        }
+        Assert.True(backend.IsAvailable);
+        using var buffer = backend.AllocateBuffer(new float[] { 3, 4 });
+        Assert.Equal(new float[] { 3, 4 }, backend.DownloadBuffer(buffer));
+    }
+
+    [SkippableFact]
     public void XLstm_PackedGateBackwardMatchesCpuForAllSixInputs()
     {
         var backend = DawnHostedWebGpu.BackendOrSkip();
-        using var direct = new DirectGpuEngine(backend);
+        using var direct = new DirectGpuEngine(backend, borrowsBackend: true);
         using var gpu = new DirectGpuTensorEngine(direct);
         var cpu = new CpuEngine();
         var inputs = Enumerable.Range(0, 6).Select(j =>
