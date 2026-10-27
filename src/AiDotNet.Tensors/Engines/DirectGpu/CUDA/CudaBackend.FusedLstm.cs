@@ -22,6 +22,7 @@ public sealed partial class CudaBackend : IFusedLstmSequenceTraining, ILstmLastS
             seqLen, batch, inputSize, hiddenSize, lastStepOnly: true);
     }
 
+    PortableGenericFft.Launcher IFusedLstmSequenceTraining.StatefulLstmLauncher => LaunchBatchKernel;
     int IFusedLstmSequenceTraining.MaxFusedLstmHidden => MaxRnnBlockSize;
     bool IFusedLstmSequenceTraining.LstmBackwardOverwritesGradients => true;
 

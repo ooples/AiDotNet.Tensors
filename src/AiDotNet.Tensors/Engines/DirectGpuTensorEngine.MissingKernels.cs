@@ -7199,6 +7199,9 @@ public partial class DirectGpuTensorEngine
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (wIh is null) throw new ArgumentNullException(nameof(wIh));
         if (wHh is null) throw new ArgumentNullException(nameof(wHh));
+        if (wantState && TryStatefulLstmTraining(input, h0, c0, wIh, wHh, bIh, bHh,
+            returnSequences, out finalHidden, out finalCell) is { } stateful)
+            return stateful;
         // Compiled training: one fused forward + BPTT node in place of the per-timestep op chain (see
         // TryRecordLstmSequenceTrain). The returnSequences = false slice is recorded after it, as the eager path does.
         // A last-step-only model gets a node whose output is h_T itself where the backend can differentiate that alone.
@@ -7489,6 +7492,21 @@ public partial class DirectGpuTensorEngine
                 var bufDH0 = Transient(Zeros(B * Hd));
                 var bufDC0 = Transient(Zeros(B * Hd));
 
+                if (meta.Length > 9 && meta[9] != 0)
+                {
+                    int offset = (returnSequences ? B * S : B) * Hd;
+                    var terminalH = Transient(backend.AllocateBuffer(B * Hd));
+                    var terminalC = Transient(backend.AllocateBuffer(B * Hd));
+                    backend.Copy(ownGradOutput.Buffer, offset, terminalH, 0, B * Hd);
+                    backend.Copy(ownGradOutput.Buffer, offset + B * Hd, terminalC, 0, B * Hd);
+                    PortableLstmSequence.Backward(backend,
+                        ((IFusedLstmSequenceTraining)backend).StatefulLstmLauncher,
+                        gradOut, ownAllH.Buffer, ownAllC.Buffer, ownGates.Buffer,
+                        ownWih.Buffer, ownWhh.Buffer, ownInput.Buffer,
+                        bufGradInput, bufDH0, bufDC0, bufDWih, bufDWhh, bufDBih, bufDBhh,
+                        S, B, In, Hd, terminalH, terminalC);
+                }
+                else
                 backend.LstmBackwardSequence(
                     gradOut, ownAllH.Buffer, ownAllC.Buffer, ownGates.Buffer, bufH0, bufC0,
                     ownWih.Buffer, ownWhh.Buffer, ownInput.Buffer,

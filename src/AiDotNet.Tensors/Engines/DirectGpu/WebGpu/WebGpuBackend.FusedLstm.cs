@@ -7,6 +7,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 // output element with no work-group coupling, so there is no hidden-size limit.
 public sealed partial class WebGpuBackend : IFusedLstmSequenceTraining
 {
+    PortableGenericFft.Launcher IFusedLstmSequenceTraining.StatefulLstmLauncher => LaunchBatch;
     int IFusedLstmSequenceTraining.MaxFusedLstmHidden => int.MaxValue;
     bool IFusedLstmSequenceTraining.LstmBackwardOverwritesGradients => false;
 }

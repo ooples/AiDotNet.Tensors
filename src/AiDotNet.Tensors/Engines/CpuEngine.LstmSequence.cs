@@ -197,32 +197,37 @@ public partial class CpuEngine
         if (bHh is not null && (bHh.Rank != 1 || bHh.Shape[0] != gateRows))
             throw new ArgumentException($"bHh must be [{gateRows}].", nameof(bHh));
 
+        if (seqLen == 0)
+        {
+            finalHidden = h0 ?? new Tensor<T>(new[] { batch, hidden });
+            finalCell = c0 ?? new Tensor<T>(new[] { batch, hidden });
+            return returnSequences ? new Tensor<T>(new[] { batch, 0, hidden }) : finalHidden;
+        }
+
         if (GraphMode.IsActive)
         {
-            // The state-returning API has three live outputs, while the compiled IR owns one
-            // output per node. Build it from ordinary recorded primitives instead of executing
-            // the fused kernel multiple times or refreshing out-parameters through side effects.
-            // Compiled training takes the same differentiable path. The common single-output
-            // inference overload remains one fused replay step.
-            //
-            // Exception: float single-output TRAINING on a host engine records ONE node that runs the fused training
-            // forward and the fused BPTT backward (as the eager tape path does), instead of the per-timestep graph of
-            // ~30 primitives per step whose replay and backward cost several times the whole fused computation.
-            if (!wantState && !GraphMode.IsInferenceTrace && typeof(T) == typeof(float) && seqLen > 0
-                && this is not DirectGpuTensorEngine && GraphMode.Current is { } trainScope)
+            // Host training records one fused kernel for either scalar type. State outputs are
+            // views of a single packet so the backward receives all three adjoints together.
+            if (!GraphMode.IsInferenceTrace && seqLen > 0
+                && this is not DirectGpuTensorEngine && GraphMode.Current is { } trainScope
+                && (typeof(T) == typeof(float) || typeof(T) == typeof(double)))
             {
                 trainScope.BindEngineIfUnset(this);
-                finalHidden = (Tensor<T>)(object)s_emptyState;
-                finalCell = (Tensor<T>)(object)s_emptyState;
-                return (Tensor<T>)(object)RecordLstmSequenceTrainFloat(trainScope,
-                    (Tensor<float>)(object)input,
-                    (Tensor<float>?)(object?)h0,
-                    (Tensor<float>?)(object?)c0,
-                    (Tensor<float>)(object)wIh,
-                    (Tensor<float>)(object)wHh,
-                    (Tensor<float>?)(object?)bIh,
-                    (Tensor<float>?)(object?)bHh,
-                    batch, seqLen, inFeatures, hidden, returnSequences);
+                Tensor<T> packed;
+                if (typeof(T) == typeof(float))
+                    packed = (Tensor<T>)(object)RecordLstmSequenceTrainFloat(trainScope,
+                        (Tensor<float>)(object)input, (Tensor<float>?)(object?)h0, (Tensor<float>?)(object?)c0,
+                        (Tensor<float>)(object)wIh, (Tensor<float>)(object)wHh,
+                        (Tensor<float>?)(object?)bIh, (Tensor<float>?)(object?)bHh,
+                        batch, seqLen, inFeatures, hidden, returnSequences, wantState);
+                else
+                    packed = (Tensor<T>)(object)RecordLstmSequenceTrainDouble(trainScope,
+                        (Tensor<double>)(object)input, (Tensor<double>?)(object?)h0, (Tensor<double>?)(object?)c0,
+                        (Tensor<double>)(object)wIh, (Tensor<double>)(object)wHh,
+                        (Tensor<double>?)(object?)bIh, (Tensor<double>?)(object?)bHh,
+                        batch, seqLen, inFeatures, hidden, returnSequences, wantState);
+                return UnpackLstmTrainingOutput(this, packed, batch, seqLen, hidden, returnSequences, wantState,
+                    out finalHidden, out finalCell);
             }
 
             if (wantState || !GraphMode.IsInferenceTrace)
@@ -284,18 +289,6 @@ public partial class CpuEngine
         // RecordIfActive keys on — GraphMode is the separate graph-compilation flag.
         if (Autodiff.DifferentiableOps.IsRecording<T>())
         {
-            // The fused BPTT node has one output edge, so it cannot represent gradients arriving
-            // independently through the sequence output, final hidden state, and final cell state.
-            // This path previously threw. Build only the state-returning tape path from ordinary
-            // differentiable primitives; inference and the single-output training hot path remain fused.
-            if (wantState)
-            {
-                return LstmSequenceForwardGraph(
-                    input, h0, c0, wIh, wHh, bIh, bHh,
-                    batch, seqLen, inFeatures, hidden, returnSequences,
-                    out finalHidden, out finalCell);
-            }
-
             if (typeof(T) == typeof(float))
             {
                 var trainOut = LstmSequenceForwardFloatTrain(

@@ -16,6 +16,9 @@ internal interface IFusedLstmSequenceTraining
     /// <summary>The largest hidden size the sequence kernels handle correctly on this device.</summary>
     int MaxFusedLstmHidden { get; }
 
+    /// <summary>Launcher for the shared cell kernels, including independent terminal-state adjoints.</summary>
+    PortableGenericFft.Launcher StatefulLstmLauncher { get; }
+
     /// <summary>
     /// Whether <see cref="IDirectGpuBackend.LstmBackwardSequence"/> writes every gradient output rather than
     /// accumulating into it, so the caller need not zero them first (on CUDA that zeroing was five memsets per LSTM
