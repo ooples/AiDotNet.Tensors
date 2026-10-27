@@ -174,11 +174,11 @@ public class LstmFinalStateGradientTests
         foreach (var parameter in p) Near(expected[parameter], actual[parameter], tolerance);
     }
 
-    [SkippableFact]
+    [Fact, Trait("Category", "RequiresOpenCL")]
     public void OpenCl_StateAdjointsAndCompiledReplay_MatchCpu()
     {
         using var backend = new OpenClBackend();
-        Skip.IfNot(backend.IsAvailable, "OpenCL is not available.");
+        Assert.True(backend.IsAvailable, "OpenCL is not available.");
         using var direct = new DirectGpuEngine(backend);
         using var engine = new DirectGpuTensorEngine(direct);
         foreach (bool sequence in new[] { true, false })

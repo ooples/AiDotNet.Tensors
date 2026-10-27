@@ -147,7 +147,6 @@ public class TapeBailAuditTests
         // The (tensor, tensor) overloads skip only their unrecorded fast path under a tape; the recording path still runs
         // the device kernel and saves the operand clones MaxBackward/MinBackward read. The (tensor, scalar) overloads
         // record ClampMin/ClampMax unconditionally.
-        "TensorMax",
         "TensorMin",
     };
 

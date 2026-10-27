@@ -22439,13 +22439,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             try
             {
+                destination.PrepareForInPlaceWrite();
                 // A destination with no device buffer yet gets one: the copy overwrites every element, so it needs no
                 // upload of its stale host values. Falling back to the host copy here downloaded the source, which
                 // inside a captured training step is a host read that aborts CUDA graph capture.
                 var destinationBuffer = ResolveResidentBufferNoUpload(backend, destination, destination.Length, includePersistentWeightCache: false);
                 if (destinationBuffer is null || destinationBuffer.Handle == IntPtr.Zero)
                     destinationBuffer = GetOrCreateResidentBuffer(backend, destination, destination.Length, fullyWritten: true);
-                using var sourceBuffer = GetOrAllocateBuffer(backend, source.IsContiguous ? source : (Tensor<T>)source.Contiguous());
+                using var sourceBuffer = GetOrAllocateBuffer(backend, source);
                 if (!ReferenceEquals(sourceBuffer.Buffer, destinationBuffer))
                     backend.Copy(sourceBuffer.Buffer, destinationBuffer, destination.Length);
                 // The device copy is now the authoritative value: bump the version (host snapshot is stale) and

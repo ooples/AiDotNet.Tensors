@@ -20,6 +20,8 @@ internal static class OpRegistry
     /// </summary>
     internal static readonly HashSet<string> DifferentiableOps = new(StringComparer.Ordinal)
     {
+        "LstmCellFromGates",
+
         // Tensor-level unary maths with their own backward (CpuEngine.ElementwiseExtra)
         "TensorAcosh", "TensorAsinh", "TensorExp2", "TensorExpm1", "TensorLog10", "TensorLog1p", "TensorLog2",
         "TensorRsqrt", "TensorTan", "TensorTrunc",

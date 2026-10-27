@@ -846,6 +846,10 @@ public static class OpParityRegistry
         yield return HomogeneousOutputCase("TensorLstmCell[all-outputs]", "recurrent", "TensorLstmCell",
             e => { var (h, c) = e.TensorLstmCell(cellX.F(), cellH.F(), cellC.F(), wIh.F(), wHh.F()); return new[] { h, c }; },
             e => { var (h, c) = e.TensorLstmCell(cellX.D(), cellH.D(), cellC.D(), wIh.D(), wHh.D()); return new[] { h, c }; }, ParityTol.Accum(1e-4));
+        var gates = OpInput.Rand(7320, new[] { 2, 16 });
+        yield return HomogeneousOutputCase("LstmCellFromGates[all-outputs]", "recurrent", "LstmCellFromGates",
+            e => { var h = e.LstmCellFromGates(gates.F(), cellC.F(), out var c); return new[] { h, c }; },
+            e => { var h = e.LstmCellFromGates(gates.D(), cellC.D(), out var c); return new[] { h, c }; }, ParityTol.Accum(1e-4));
         var seq = OpInput.Rand(7306, new[] { 3, 2, 3 });
         var gIh = OpInput.Rand(7307, new[] { 12, 3 });
         var gHh = OpInput.Rand(7308, new[] { 12, 4 });

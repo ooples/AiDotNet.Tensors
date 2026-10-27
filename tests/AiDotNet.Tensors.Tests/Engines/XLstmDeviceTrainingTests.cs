@@ -10,6 +10,7 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines;
 
 [Collection("CompilationGlobalState")]
+[Trait("Category", "RequiresOpenCL")]
 public class XLstmDeviceTrainingTests
 {
     [Theory] [InlineData(0)] [InlineData(1)] [InlineData(2)]

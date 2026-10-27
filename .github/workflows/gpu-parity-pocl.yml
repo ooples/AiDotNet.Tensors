@@ -57,6 +57,7 @@ jobs:
         # tape-gradient); AIDOTNET_PARITY_SHARD=k/N partitions each into sub-shards via ParityShard so
         # each POCL process stays under its per-process kernel-compile ceiling. `name` is the job label.
         include:
+          - { name: recurrent-foundations, required: true, filter: "FullyQualifiedName~LstmGateKernelTests|FullyQualifiedName~LstmFinalStateGradientTests|FullyQualifiedName~XLstmDeviceTrainingTests" }
           - { name: lstm,            filter: "FullyQualifiedName~GpuMissingKernelsParityTests.LstmSequence" }
           - { name: missing-kernels, filter: "FullyQualifiedName~GpuMissingKernelsParityTests&FullyQualifiedName!~LstmSequence" }
           - { name: scan-kernels,    filter: "FullyQualifiedName~ScanGpuParityTests|FullyQualifiedName~Rwkv4WkvGpuParityTests" }
@@ -121,7 +122,7 @@ jobs:
 
     - name: Run CPU-vs-GPU parity on POCL (shard ${{ matrix.name }})
       # Informational only: POCL is not yet reliable as a hard gate on hosted runners (see header).
-      continue-on-error: true
+      continue-on-error: ${{ !matrix.required }}
       env:
         AIDOTNET_OPENCL_ALLOW_CPU: '1'
         AIDOTNET_REQUIRE_GPU_TESTS: '1'

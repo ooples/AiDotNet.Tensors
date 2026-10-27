@@ -6,6 +6,10 @@ namespace AiDotNet.Tensors.Engines;
 
 public partial class DirectGpuTensorEngine
 {
+    /// <summary>Validates and records the cell through the shared wrapper; the packet dispatches to the device kernel.</summary>
+    public override Tensor<T> LstmCellFromGates<T>(Tensor<T> gates, Tensor<T> previousCell, out Tensor<T> cell)
+        => base.LstmCellFromGates(gates, previousCell, out cell);
+
     protected override Tensor<T> RunLstmGatePacket<T>(Tensor<T> gates, Tensor<T> previousCell)
     {
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)

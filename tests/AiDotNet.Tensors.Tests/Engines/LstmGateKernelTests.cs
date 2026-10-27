@@ -12,6 +12,39 @@ namespace AiDotNet.Tensors.Tests.Engines;
 [Collection("CompilationGlobalState")]
 public class LstmGateKernelTests
 {
+    [Fact, Trait("Category", "RequiresOpenCL")]
+    public void TensorCopy_PermutedSourceRemainsResident()
+    {
+        using var backend = new OpenClBackend(); Assert.True(backend.IsAvailable);
+        using var direct = new DirectGpuEngine(backend); using var engine = new DirectGpuTensorEngine(direct);
+        var source = engine.TensorAddScalar(new Tensor<float>(new float[] { 1, 2, 3, 4, 5, 6 }, new[] { 2, 3 }), 1f);
+        var transposed = source.Transpose(new[] { 1, 0 });
+        var destination = new Tensor<float>(new[] { 3, 2 });
+        using (var scope = AiDotNet.Tensors.Engines.Diagnostics.GpuResidencyScope.Begin(captureOperations: true))
+        {
+            ((IEngine)engine).TensorCopy(transposed, destination);
+            Assert.True(scope.Downloads == 0, string.Join("\n", scope.Events));
+        }
+        Assert.Equal(new float[] { 2, 5, 3, 6, 4, 7 }, destination.ToArray());
+    }
+
+    [Fact, Trait("Category", "RequiresOpenCL")]
+    public void TensorCopy_CpuCowPeerRemainsIndependentOnGpuWrite()
+    {
+        using var backend = new OpenClBackend(); Assert.True(backend.IsAvailable);
+        using var direct = new DirectGpuEngine(backend); using var engine = new DirectGpuTensorEngine(direct);
+        var original = new Tensor<float>(new float[] { 1, 2, 3 }, new[] { 3 });
+        var clone = (Tensor<float>)original.CloneShared();
+        var replacement = engine.TensorAddScalar(new Tensor<float>(new[] { 3 }), 9f);
+        using (var scope = AiDotNet.Tensors.Engines.Diagnostics.GpuResidencyScope.Begin(captureOperations: true))
+        {
+            ((IEngine)engine).TensorCopy(replacement, original);
+            Assert.True(scope.Downloads == 0, string.Join("\n", scope.Events));
+        }
+        Assert.Equal(new float[] { 9, 9, 9 }, original.ToArray());
+        Assert.Equal(new float[] { 1, 2, 3 }, clone.ToArray());
+    }
+
     private static Tensor<T> Values<T>(int[] shape)
     {
         var result = new Tensor<T>(shape);
@@ -87,10 +120,10 @@ public class LstmGateKernelTests
         }
     }
     [Fact] public void CompiledGateKernel_Replays() => Replay(new CpuEngine());
-    [SkippableFact]
+    [Fact, Trait("Category", "RequiresOpenCL")]
     public void OpenCl_GateKernelAndReplay_MatchCpu()
     {
-        using var backend = new OpenClBackend(); Skip.IfNot(backend.IsAvailable, "OpenCL unavailable.");
+        using var backend = new OpenClBackend(); Assert.True(backend.IsAvailable, "OpenCL unavailable.");
         using var direct = new DirectGpuEngine(backend); using var engine = new DirectGpuTensorEngine(direct);
         foreach (int mask in new[] { 1, 2, 3 }) Check<float>(engine, true, mask, 3e-5);
         Replay(engine);
