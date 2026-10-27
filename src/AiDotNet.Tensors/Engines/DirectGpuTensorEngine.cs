@@ -6340,7 +6340,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             var srcData = DirectGpuEngine.ToFloatArray(source.GetDataArray());
             using var srcBuf = backend.AllocateBuffer(srcData);
-            using var dstBuf = backend.AllocateBuffer(count);
+            // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+            using var dstBufLease = AllocateOutputBuffer(backend, count);
+            var dstBuf = dstBufLease.Buffer;
             backend.StridedGather(srcBuf, dstBuf, offset, stride, count);
             var resultFloat = backend.DownloadBuffer(dstBuf);
             return new Vector<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat));
@@ -16971,7 +16973,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
             else
             {
-                using var transposedBuffer = backend.AllocateBuffer(outerSize * innerSize);
+                // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                using var transposedBufferLease = AllocateOutputBuffer(backend, outerSize * innerSize);
+                var transposedBuffer = transposedBufferLease.Buffer;
                 backend.Transpose(input.Buffer, transposedBuffer, outerSize, innerSize);
                 backend.SumAxis(transposedBuffer, outputBuffer, innerSize, outerSize);
             }
@@ -17194,7 +17198,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (!philoxFused)
                 {
                     float scale = 1.0f / (1.0f - (float)dropoutRate);
-                    using var temporary = backend.AllocateBuffer(input.Length);
+                    // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                    using var temporaryLease = AllocateOutputBuffer(backend, input.Length);
+                    var temporary = temporaryLease.Buffer;
                     backend.Dropout(inputBuffer.Buffer, temporary, maskBuffer, input.Length,
                         (float)dropoutRate, seed, true);
 
@@ -19080,8 +19086,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
                 using var bufferA = GetOrAllocateBuffer(backend, a);
                 using var bufferB = GetOrAllocateBuffer(backend, b);
-                using var ones = backend.AllocateBuffer(innerSize);
-                using var expandedB = backend.AllocateBuffer(a.Length);
+                // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                using var onesLease = AllocateOutputBuffer(backend, innerSize);
+                var ones = onesLease.Buffer;
+                // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                using var expandedBLease = AllocateOutputBuffer(backend, a.Length);
+                var expandedB = expandedBLease.Buffer;
                 backend.Fill(ones, 1f, innerSize);
                 backend.OuterProduct(bufferB.Buffer, ones, expandedB, outerSize, innerSize);
                 return RecordGpuResult(DispatchDeferredGpuOp<T>(backend, a.Length, a.Shape.ToArray(), output =>
@@ -19121,8 +19131,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 int outerSize = b.Shape._dims[0], innerSize = b.Shape._dims[1];
                 using var bufferA = GetOrAllocateBuffer(backend, a);
                 using var bufferB = GetOrAllocateBuffer(backend, b);
-                using var ones = backend.AllocateBuffer(innerSize);
-                using var expandedA = backend.AllocateBuffer(b.Length);
+                // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                using var onesLease = AllocateOutputBuffer(backend, innerSize);
+                var ones = onesLease.Buffer;
+                // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                using var expandedALease = AllocateOutputBuffer(backend, b.Length);
+                var expandedA = expandedALease.Buffer;
                 backend.Fill(ones, 1f, innerSize);
                 backend.OuterProduct(bufferA.Buffer, ones, expandedA, outerSize, innerSize);
                 return RecordGpuResult(DispatchDeferredGpuOp<T>(backend, b.Length, b.Shape.ToArray(), output =>
@@ -19495,7 +19509,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int size = input.Length;
         var outputBuffer = backend.AllocateBuffer(size);
 
-        using var scalarBuffer = backend.AllocateBuffer(size);
+        // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+        using var scalarBufferLease = AllocateOutputBuffer(backend, size);
+        var scalarBuffer = scalarBufferLease.Buffer;
         backend.Fill(scalarBuffer, scalar, size);
 
         backend.GreaterThan(input.Buffer, scalarBuffer, outputBuffer, size);
@@ -25393,7 +25409,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 int outerSize = a.Shape._dims[0], innerSize = a.Shape._dims[1];
                 using var bufA = GetOrAllocateBuffer(backend, a);
                 using var bufB = GetOrAllocateBuffer(backend, b);
-                using var ones = backend.AllocateBuffer(innerSize);
+                // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                using var onesLease = AllocateOutputBuffer(backend, innerSize);
+                var ones = onesLease.Buffer;
                 using var expandedB = AllocateOutputBuffer(backend, a.Length);
                 backend.Fill(ones, 1f, innerSize);
                 backend.OuterProduct(bufB.Buffer, ones, expandedB.Buffer, outerSize, innerSize);
@@ -25463,7 +25481,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 int outerSize = a.Shape._dims[0], innerSize = a.Shape._dims[1];
                 using var bufA = GetOrAllocateBuffer(backend, a);
                 using var bufB = GetOrAllocateBuffer(backend, b);
-                using var ones = backend.AllocateBuffer(innerSize);
+                // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                using var onesLease = AllocateOutputBuffer(backend, innerSize);
+                var ones = onesLease.Buffer;
                 using var expandedB = AllocateOutputBuffer(backend, a.Length);
                 backend.Fill(ones, 1f, innerSize);
                 backend.OuterProduct(bufB.Buffer, ones, expandedB.Buffer, outerSize, innerSize);
@@ -25533,7 +25553,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 int outerSize = a.Shape._dims[0], innerSize = a.Shape._dims[1];
                 using var bufA = GetOrAllocateBuffer(backend, a);
                 using var bufB = GetOrAllocateBuffer(backend, b);
-                using var ones = backend.AllocateBuffer(innerSize);
+                // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                using var onesLease = AllocateOutputBuffer(backend, innerSize);
+                var ones = onesLease.Buffer;
                 using var expandedB = AllocateOutputBuffer(backend, a.Length);
                 backend.Fill(ones, 1f, innerSize);
                 backend.OuterProduct(bufB.Buffer, ones, expandedB.Buffer, outerSize, innerSize);
@@ -25722,7 +25744,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 bool handedOff = false;
                 try
                 {
-                    using var denominator = backend.AllocateBuffer(tensor.Length);
+                    // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                    using var denominatorLease = AllocateOutputBuffer(backend, tensor.Length);
+                    var denominator = denominatorLease.Buffer;
                     backend.Fill(denominator, Convert.ToSingle(scalar), tensor.Length);
                     backend.Divide(input.Buffer, denominator, output.Buffer, tensor.Length);
                     handedOff = true;
@@ -26561,7 +26585,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 var source = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
                 using var input = GetOrAllocateBuffer(backend, source);
-                using var squares = backend.AllocateBuffer(tensor.Length);
+                // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                using var squaresLease = AllocateOutputBuffer(backend, tensor.Length);
+                var squares = squaresLease.Buffer;
                 backend.Multiply(input.Buffer, input.Buffer, squares, tensor.Length);
                 return (T)(object)backend.Sum(squares, tensor.Length);
             }
@@ -26646,7 +26672,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     ordinals[i] = i;
 
                 using var ordinalBuffer = backend.AllocateBuffer(ordinals);
-                using var scaled = backend.AllocateBuffer(count);
+                // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                using var scaledLease = AllocateOutputBuffer(backend, count);
+                var scaled = scaledLease.Buffer;
                 return DispatchDeferredGpuOp<T>(backend, count, new[] { count }, output =>
                 {
                     // Separate kernels intentionally preserve the CPU's multiply-then-add rounding.
@@ -26945,8 +26973,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     bool handedOff = false;
                     try
                     {
-                        using var squared = backend.AllocateBuffer(tensor.Length);
-                        using var sums = backend.AllocateBuffer(outerSize);
+                        // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                        using var squaredLease = AllocateOutputBuffer(backend, tensor.Length);
+                        var squared = squaredLease.Buffer;
+                        // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                        using var sumsLease = AllocateOutputBuffer(backend, outerSize);
+                        var sums = sumsLease.Buffer;
                         backend.Multiply(input.Buffer, input.Buffer, squared, tensor.Length);
                         backend.SumAxis(squared, sums, outerSize, reduceSize);
                         backend.Sqrt(sums, output.Buffer, outerSize);
@@ -27660,7 +27692,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         uint rngSeed = seed.HasValue
                             ? unchecked((uint)seed.GetValueOrDefault())
                             : unchecked((uint)System.Threading.Interlocked.Increment(ref _gpuRngSeed));
-                        using var output = backend.AllocateBuffer(length);
+                        // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                        using var outputLease = AllocateOutputBuffer(backend, length);
+                        var output = outputLease.Buffer;
                         backend.GenerateStatelessDropoutMask(
                             output, length, (uint)threshold64, outputScale, rngSeed);
                         return new Vector<T>((T[])(object)backend.DownloadBuffer(output));
@@ -27980,7 +28014,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 var indexData = indices.GetFlattenedData();
                 int elementCount = checked(indices.Length * depth);
-                using var one = backend.AllocateBuffer(1);
+                // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                using var oneLease = AllocateOutputBuffer(backend, 1);
+                var one = oneLease.Buffer;
                 backend.Fill(one, 1f, 1);
                 return DispatchDeferredGpuOp<T>(backend, elementCount,
                     new[] { indices.Length, depth }, output =>
@@ -28012,7 +28048,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 using var input = GetOrAllocateBuffer(backend, tensor);
-                using var expected = backend.AllocateBuffer(tensor.Length);
+                // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                using var expectedLease = AllocateOutputBuffer(backend, tensor.Length);
+                var expected = expectedLease.Buffer;
                 backend.Fill(expected, Convert.ToSingle(value), tensor.Length);
                 var output = AllocateOutputBuffer(backend, tensor.Length);
                 bool handedOff = false;
@@ -28124,7 +28162,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 using var input = GetOrAllocateBuffer(backend, tensor);
-                using var scalar = backend.AllocateBuffer(tensor.Length);
+                // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                using var scalarLease = AllocateOutputBuffer(backend, tensor.Length);
+                var scalar = scalarLease.Buffer;
                 backend.Fill(scalar, Convert.ToSingle(value), tensor.Length);
                 var output = backend.AllocateBuffer(tensor.Length);
                 backend.GreaterThan(input.Buffer, scalar, output, tensor.Length);
@@ -28161,7 +28201,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 using var input = GetOrAllocateBuffer(backend, tensor);
-                using var scalar = backend.AllocateBuffer(tensor.Length);
+                // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                using var scalarLease = AllocateOutputBuffer(backend, tensor.Length);
+                var scalar = scalarLease.Buffer;
                 backend.Fill(scalar, Convert.ToSingle(value), tensor.Length);
                 var output = backend.AllocateBuffer(tensor.Length);
                 backend.LessThan(input.Buffer, scalar, output, tensor.Length);
@@ -28317,7 +28359,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 var inputBuffer = UploadTensorRaw(backend, input);
-                using var unitGradient = backend.AllocateBuffer(input.Length);
+                // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                using var unitGradientLease = AllocateOutputBuffer(backend, input.Length);
+                var unitGradient = unitGradientLease.Buffer;
                 backend.Fill(unitGradient, 1f, input.Length);
                 var output = backend.AllocateBuffer(input.Length);
                 try
@@ -28345,7 +28389,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 int elementCount = checked(size * size);
-                using var ones = backend.AllocateBuffer(size);
+                // Transient scratch: pooled per action inside a compiled step, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
+                using var onesLease = AllocateOutputBuffer(backend, size);
+                var ones = onesLease.Buffer;
                 backend.Fill(ones, 1f, size);
                 return DispatchDeferredGpuOp<T>(backend, elementCount, new[] { size, size }, output =>
                 {
