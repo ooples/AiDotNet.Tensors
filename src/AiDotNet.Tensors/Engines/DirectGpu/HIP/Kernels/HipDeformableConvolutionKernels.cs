@@ -85,7 +85,7 @@ __device__ float bilinear_sample(
 // Offsets: [batch, deformGroups * 2 * kH * kW, outH, outW]
 // Mask:    [batch, deformGroups * kH * kW, outH, outW] (optional for DCNv2)
 // Output:  [batch, outChannels, outH, outW]
-extern ""C"" __global__ __launch_bounds__(256) void deformable_conv2d(
+__device__ __forceinline__ void deformable_conv2d_at(
     const float* input,
     const float* weights,
     const float* offsets,
@@ -108,11 +108,11 @@ extern ""C"" __global__ __launch_bounds__(256) void deformable_conv2d(
     int dilationW,
     int groups,
     int deformGroups,
-    int hasMask)
+    int hasMask, int gridStrideZ)
 {
     int ow = blockIdx.x * blockDim.x + threadIdx.x;
     int oh = blockIdx.y * blockDim.y + threadIdx.y;
-    int boc = blockIdx.z;
+    int boc = gridStrideZ;
 
     if (ow >= outWidth || oh >= outHeight || boc >= batch * outChannels) return;
 
@@ -166,6 +166,35 @@ extern ""C"" __global__ __launch_bounds__(256) void deformable_conv2d(
 
     int outIdx = ((b * outChannels + oc) * outHeight + oh) * outWidth + ow;
     output[outIdx] = sum;
+}
+extern ""C"" __global__ __launch_bounds__(256) void deformable_conv2d(
+    const float* input,
+    const float* weights,
+    const float* offsets,
+    const float* mask,
+    float* output,
+    int batch,
+    int inChannels,
+    int inHeight,
+    int inWidth,
+    int outChannels,
+    int outHeight,
+    int outWidth,
+    int kernelH,
+    int kernelW,
+    int strideH,
+    int strideW,
+    int padH,
+    int padW,
+    int dilationH,
+    int dilationW,
+    int groups,
+    int deformGroups,
+    int hasMask)
+{
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch * outChannels; gridStrideZ += gridDim.z)
+        deformable_conv2d_at(input, weights, offsets, mask, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups, hasMask, gridStrideZ);
 }
 
 // Backward pass for input gradients

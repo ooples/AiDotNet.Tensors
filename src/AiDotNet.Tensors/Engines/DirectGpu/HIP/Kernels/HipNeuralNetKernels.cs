@@ -1551,18 +1551,25 @@ extern ""C"" __global__ __launch_bounds__(256) void transpose_2d(
     B[col * rows + row] = A[row * cols + col];
 }
 
-extern ""C"" __global__ __launch_bounds__(256) void batched_transpose(
-    const float* A, float* B, int batch, int rows, int cols)
+__device__ __forceinline__ void batched_transpose_at(
+    const float* A, float* B, int batch, int rows, int cols, int gridStrideZ)
 {
     int col = blockIdx.x * blockDim.x + threadIdx.x;
     int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int b = blockIdx.z;
+    int b = gridStrideZ;
 
     if (col >= cols || row >= rows || b >= batch) return;
 
     int inIdx = b * rows * cols + row * cols + col;
     int outIdx = b * cols * rows + col * rows + row;
     B[outIdx] = A[inIdx];
+}
+extern ""C"" __global__ __launch_bounds__(256) void batched_transpose(
+    const float* A, float* B, int batch, int rows, int cols)
+{
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch; gridStrideZ += gridDim.z)
+        batched_transpose_at(A, B, batch, rows, cols, gridStrideZ);
 }
 
 // Global-norm clip over every gradient in one launch each, the HIP twin of CUDA's multi_tensor_* kernels. ptrs holds
@@ -2531,13 +2538,13 @@ extern ""C"" __global__ __launch_bounds__(256) void adaptive_avgpool_backward(
 // rejected the launch (hipErrorLaunchFailure, which then poisoned the context for later kernels).
 #define BATCHED_TILE_SIZE 16
 
-extern ""C"" __global__ __launch_bounds__(256) void batched_gemm(
+__device__ __forceinline__ void batched_gemm_at(
     const float* A, const float* B, float* C,
     int M, int N, int K, int batchCount,
-    float alpha, float beta)
+    float alpha, float beta, int gridStrideZ)
 {
     // Each block handles one tile of output
-    int batch = blockIdx.z;
+    int batch = gridStrideZ;
     int row = blockIdx.y * BATCHED_TILE_SIZE + threadIdx.y;
     int col = blockIdx.x * BATCHED_TILE_SIZE + threadIdx.x;
 
@@ -2594,6 +2601,19 @@ extern ""C"" __global__ __launch_bounds__(256) void batched_gemm(
         int outIdx = row * N + col;
         Cbatch[outIdx] = beta == 0.0f ? alpha * sum : alpha * sum + beta * Cbatch[outIdx];
     }
+}
+extern ""C"" __global__ __launch_bounds__(256) void batched_gemm(
+    const float* A, const float* B, float* C,
+    int M, int N, int K, int batchCount,
+    float alpha, float beta)
+{
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batchCount; gridStrideZ += gridDim.z)
+        {
+            batched_gemm_at(A, B, C, M, N, K, batchCount, alpha, beta, gridStrideZ);
+            // Shared memory is reused by the next index; no thread may overwrite it while another still reads it.
+            __syncthreads();
+        }
 }
 
 #undef BATCHED_TILE_SIZE

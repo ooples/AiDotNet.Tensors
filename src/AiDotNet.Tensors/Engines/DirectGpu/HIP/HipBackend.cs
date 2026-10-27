@@ -1301,6 +1301,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     /// </summary>
     private unsafe void LaunchKernel2D(IntPtr kernel, uint gridX, uint gridY, uint blockX, uint blockY, void** args, uint sharedMem = 0)
     {
+        EnsureLaunchableGrid(gridY, 1, "hipModuleLaunchKernel (2D)");
         GpuLaunchProbe.OnLaunch();
         var result = HipNativeBindings.hipModuleLaunchKernel(
             kernel, gridX, gridY, 1, blockX, blockY, 1,
@@ -1418,6 +1419,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     private unsafe void LaunchKernel2DOnStream(IntPtr kernel, uint gridX, uint gridY, uint blockX, uint blockY, IntPtr[] args, IntPtr stream, uint sharedMem = 0)
     {
+        EnsureLaunchableGrid(gridY, 1, "hipModuleLaunchKernel (2D)");
         fixed (IntPtr* argsPtr = args)
         {
             // HIP driver API calls are required for kernel dispatch.
@@ -1429,6 +1431,18 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         }
     }
 
+    /// <summary>The hardware limit on gridDim.y and gridDim.z; gridDim.x allows 2^31 - 1.</summary>
+    private const long MaxGridDimY = 65535;
+
+    /// <summary>Refuses a grid the hardware cannot launch, naming the dimensions; the runtime reports only an invalid value.</summary>
+    private static void EnsureLaunchableGrid(uint gridY, uint gridZ, string launch)
+    {
+        if (gridY > MaxGridDimY || gridZ > MaxGridDimY)
+            throw new ArgumentOutOfRangeException(nameof(gridY),
+                $"{launch}: grid ({gridY} on y, {gridZ} on z) exceeds the hardware limit of {MaxGridDimY} on gridDim.y and " +
+                "gridDim.z. The launch site must clamp the axis and the kernel must grid-stride over the remainder.");
+    }
+
     private unsafe void LaunchKernel3D(IntPtr kernel, uint gridX, uint gridY, uint gridZ, uint blockX, uint blockY, uint blockZ, IntPtr[] args, uint sharedMem = 0)
     {
         LaunchKernel3DOnStream(kernel, gridX, gridY, gridZ, blockX, blockY, blockZ, args, _stream, sharedMem);
@@ -1436,6 +1450,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     private unsafe void LaunchKernel3D(IntPtr kernel, uint gridX, uint gridY, uint gridZ, uint blockX, uint blockY, uint blockZ, void** args, uint sharedMem = 0)
     {
+        EnsureLaunchableGrid(gridY, gridZ, "hipModuleLaunchKernel (3D)");
         GpuLaunchProbe.OnLaunch();
         var result = HipNativeBindings.hipModuleLaunchKernel(
             kernel, gridX, gridY, gridZ, blockX, blockY, blockZ,
@@ -1445,6 +1460,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     private unsafe void LaunchKernel3DOnStream(IntPtr kernel, uint gridX, uint gridY, uint gridZ, uint blockX, uint blockY, uint blockZ, IntPtr[] args, IntPtr stream, uint sharedMem = 0)
     {
+        EnsureLaunchableGrid(gridY, gridZ, "hipModuleLaunchKernel (3D)");
         fixed (IntPtr* argsPtr = args)
         {
             // HIP driver API calls are required for kernel dispatch.
@@ -1956,7 +1972,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             const int tileSize = 16;
             uint gridX = (uint)((N + tileSize - 1) / tileSize);
             uint gridY = (uint)((M + tileSize - 1) / tileSize);
-            uint gridZ = (uint)batchCount;
+            uint gridZ = (uint)Math.Min((long)batchCount, MaxGridDimY);
             LaunchKernel3D(krnl, gridX, gridY, gridZ, (uint)tileSize, (uint)tileSize, 1, args);
             Synchronize();
             }
@@ -2193,9 +2209,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             args[4] = &spatialSize;
 
 
-            // 2D grid: x=spatial, y=batch*channels — eliminates integer division in kernel
+            // 2D grid: x=spatial, y=batch*channels rows, clamped to the hardware's 65535; the kernel strides over the rest.
             uint gridX = (uint)((spatialSize + DefaultBlockSize - 1) / DefaultBlockSize);
-            uint gridY = (uint)(batch * channels);
+            uint gridY = (uint)Math.Min((long)batch * channels, MaxGridDimY);
             LaunchKernel2D(krnl, gridX, gridY, DefaultBlockSize, 1, args);
             Synchronize();
             }
@@ -4591,7 +4607,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
             uint gridX = (uint)((outWidth + 7) / 8);
             uint gridY = (uint)((outHeight + 7) / 8);
-            uint gridZ = (uint)(batch * outChannels * outDepth);
+            uint gridZ = (uint)Math.Min((long)(batch * outChannels * outDepth), MaxGridDimY);
             LaunchKernel3D(krnl, gridX, gridY, gridZ, 8, 8, 1, args);
             Synchronize();
 
@@ -4631,7 +4647,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
             uint gridX = (uint)((outWidth + 15) / 16);
             uint gridY = (uint)((outHeight + 15) / 16);
-            uint gridZ = (uint)(batch * channels);
+            uint gridZ = (uint)Math.Min((long)(batch * channels), MaxGridDimY);
             LaunchKernel3D(krnl, gridX, gridY, gridZ, 16, 16, 1, args);
             Synchronize();
 
@@ -4675,7 +4691,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
             uint gridX = (uint)((outWidth + 15) / 16);
             uint gridY = (uint)((outHeight + 15) / 16);
-            uint gridZ = (uint)(batch * outChannels);
+            uint gridZ = (uint)Math.Min((long)(batch * outChannels), MaxGridDimY);
             LaunchKernel3D(krnl, gridX, gridY, gridZ, 16, 16, 1, args);
             Synchronize();
             }
@@ -4806,7 +4822,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
             uint gridX = (uint)((outWidth + 15) / 16);
             uint gridY = (uint)((outHeight + 15) / 16);
-            uint gridZ = (uint)(batch * channels);
+            uint gridZ = (uint)Math.Min((long)(batch * channels), MaxGridDimY);
             LaunchKernel3D(krnl, gridX, gridY, gridZ, 16, 16, 1, args);
             Synchronize();
 
@@ -4835,7 +4851,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 throw new GpuCapabilityUnavailableException("HIP kernel not found: maxpool2d_backward_deterministic");
             uint gDX = (uint)((inWidth + 15) / 16);
             uint gDY = (uint)((inHeight + 15) / 16);
-            uint gDZ = (uint)(batch * channels);
+            uint gDZ = (uint)Math.Min((long)(batch * channels), MaxGridDimY);
             LaunchKernel3D(krnlD, gDX, gDY, gDZ, 16, 16, 1, args);
             Synchronize();
             return;
@@ -4845,7 +4861,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             throw new GpuCapabilityUnavailableException("HIP kernel not found: maxpool2d_backward");
         uint gridX = (uint)((outWidth + 15) / 16);
         uint gridY = (uint)((outHeight + 15) / 16);
-        uint gridZ = (uint)(batch * channels);
+        uint gridZ = (uint)Math.Min((long)(batch * channels), MaxGridDimY);
         LaunchKernel3D(krnl, gridX, gridY, gridZ, 16, 16, 1, args);
         Synchronize();
     }
@@ -4884,7 +4900,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
             uint gridX = (uint)((outWidth + 15) / 16);
             uint gridY = (uint)((outHeight + 15) / 16);
-            uint gridZ = (uint)(batch * channels);
+            uint gridZ = (uint)Math.Min((long)(batch * channels), MaxGridDimY);
             LaunchKernel3D(krnl, gridX, gridY, gridZ, 16, 16, 1, args);
             Synchronize();
 
@@ -4925,7 +4941,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
             uint gridX = (uint)((inWidth + 15) / 16);
             uint gridY = (uint)((inHeight + 15) / 16);
-            uint gridZ = (uint)(batch * channels);
+            uint gridZ = (uint)Math.Min((long)(batch * channels), MaxGridDimY);
             LaunchKernel3D(krnl, gridX, gridY, gridZ, 16, 16, 1, args);
             Synchronize();
 
@@ -5063,7 +5079,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
             uint gridX = (uint)((outWidth + 15) / 16);
             uint gridY = (uint)((outHeight + 15) / 16);
-            uint gridZ = (uint)(batch * channels);
+            uint gridZ = (uint)Math.Min((long)(batch * channels), MaxGridDimY);
             LaunchKernel3D(krnl, gridX, gridY, gridZ, 16, 16, 1, args);
             Synchronize();
             }
@@ -5108,7 +5124,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
             uint gridX = (uint)((outWidth + 7) / 8);
             uint gridY = (uint)((outHeight + 7) / 8);
-            uint gridZ = (uint)(batch * channels * outDepth);
+            uint gridZ = (uint)Math.Min((long)(batch * channels * outDepth), MaxGridDimY);
             LaunchKernel3D(krnl, gridX, gridY, gridZ, 8, 8, 1, args);
             Synchronize();
             }
@@ -5135,7 +5151,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 throw new GpuCapabilityUnavailableException("HIP kernel not found: maxpool3d_backward_deterministic");
             uint gDX = (uint)((inWidth + 7) / 8);
             uint gDY = (uint)((inHeight + 7) / 8);
-            uint gDZ = (uint)(batch * channels * inDepth);
+            uint gDZ = (uint)Math.Min((long)(batch * channels * inDepth), MaxGridDimY);
             LaunchKernel3D(krnlD, gDX, gDY, gDZ, 8, 8, 1, args);
             Synchronize();
             return;
@@ -5145,7 +5161,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             throw new GpuCapabilityUnavailableException("HIP kernel not found: maxpool3d_backward");
         uint gridX = (uint)((outWidth + 7) / 8);
         uint gridY = (uint)((outHeight + 7) / 8);
-        uint gridZ = (uint)(batch * channels * outDepth);
+        uint gridZ = (uint)Math.Min((long)(batch * channels * outDepth), MaxGridDimY);
         LaunchKernel3D(krnl, gridX, gridY, gridZ, 8, 8, 1, args);
         Synchronize();
     }
@@ -5180,7 +5196,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
             uint gridX = (uint)((outWidth + 7) / 8);
             uint gridY = (uint)((outHeight + 7) / 8);
-            uint gridZ = (uint)(batch * channels * outDepth);
+            uint gridZ = (uint)Math.Min((long)(batch * channels * outDepth), MaxGridDimY);
             LaunchKernel3D(krnl, gridX, gridY, gridZ, 8, 8, 1, args);
             Synchronize();
             }
@@ -5206,7 +5222,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 throw new GpuCapabilityUnavailableException("HIP kernel not found: nearest_upsample3d_backward_deterministic");
             uint gDX = (uint)((inWidth + 7) / 8);
             uint gDY = (uint)((inHeight + 7) / 8);
-            uint gDZ = (uint)(batch * channels * inDepth);
+            uint gDZ = (uint)Math.Min((long)(batch * channels * inDepth), MaxGridDimY);
             LaunchKernel3D(krnlD, gDX, gDY, gDZ, 8, 8, 1, args);
             Synchronize();
             return;
@@ -5219,7 +5235,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int outWidth = inWidth * scaleW;
         uint gridX = (uint)((outWidth + 7) / 8);
         uint gridY = (uint)((outHeight + 7) / 8);
-        uint gridZ = (uint)(batch * channels * outDepth);
+        uint gridZ = (uint)Math.Min((long)(batch * channels * outDepth), MaxGridDimY);
         LaunchKernel3D(krnl, gridX, gridY, gridZ, 8, 8, 1, args);
         Synchronize();
     }
@@ -5728,7 +5744,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             return false;
 
         uint gridX = (uint)((cols + DefaultBlockSize - 1) / DefaultBlockSize);
-        uint gridY = (uint)rows;
+        uint gridY = (uint)Math.Min((long)rows, MaxGridDimY);
         IntPtr inputPtr = input.Handle;
         IntPtr outputPtr = output.Handle;
         IntPtr biasPtr = bias.Handle;
@@ -5944,7 +5960,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             // Grid dimensions: outWidth x outHeight x (batch * outChannels)
             uint gridX = (uint)((outWidth + 15) / 16);
             uint gridY = (uint)((outHeight + 15) / 16);
-            uint gridZ = (uint)(batch * outChannels);
+            uint gridZ = (uint)Math.Min((long)(batch * outChannels), MaxGridDimY);
             LaunchKernel3D(krnl, gridX, gridY, gridZ, 16, 16, 1, args);
             Synchronize();
 
@@ -6100,7 +6116,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             // Grid dimensions: outWidth x outHeight x (batch * outChannels)
             uint gridX = (uint)((outWidth + 15) / 16);
             uint gridY = (uint)((outHeight + 15) / 16);
-            uint gridZ = (uint)(batch * outChannels);
+            uint gridZ = (uint)Math.Min((long)(batch * outChannels), MaxGridDimY);
             LaunchKernel3D(krnl, gridX, gridY, gridZ, 16, 16, 1, args);
             Synchronize();
 
@@ -6506,7 +6522,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
 
             uint gridX = (uint)((seqQ + 31) / 32);
-            uint gridY = (uint)(batch * numHeads);
+            uint gridY = (uint)Math.Min((long)(batch * numHeads), MaxGridDimY);
             uint sharedBytes = (uint)(2 * 32 * headDim * sizeof(float));
             LaunchKernel2D(krnl, gridX, gridY, 32, 1, args, sharedBytes);
             Synchronize();
@@ -6558,7 +6574,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             argsQ[16] = &biasBatchStride;
 
             uint gQX = (uint)((seqQ + 63) / 64);
-            uint gQY = (uint)(batch * numHeads);
+            uint gQY = (uint)Math.Min((long)(batch * numHeads), MaxGridDimY);
             LaunchKernel2D(krnlQ, gQX, gQY, 64, 1, argsQ);
 
             if (!_kernelCache.TryGetValue("flash_attention_backward_gradkv_deterministic", out var krnlKV))
@@ -6585,7 +6601,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
             uint gKVX = (uint)((headDim + 15) / 16);
             uint gKVY = (uint)((seqK + 3) / 4);
-            uint gKVZ = (uint)(batch * numHeads);
+            uint gKVZ = (uint)Math.Min((long)(batch * numHeads), MaxGridDimY);
             LaunchKernel3D(krnlKV, gKVX, gKVY, gKVZ, 16, 4, 1, argsKV);
             Synchronize();
             return;
@@ -6616,7 +6632,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         args[18] = &biasBatchStride;
 
         uint gridX = (uint)((seqQ + 31) / 32);
-        uint gridY = (uint)(batch * numHeads);
+        uint gridY = (uint)Math.Min((long)(batch * numHeads), MaxGridDimY);
         uint sharedBytes = (uint)(2 * 32 * headDim * sizeof(float));
         LaunchKernel2D(krnl, gridX, gridY, 32, 1, args, sharedBytes);
         Synchronize();
@@ -6658,7 +6674,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
 
             uint gridX = (uint)((seqQ + 31) / 32);
-            uint gridY = (uint)(batch * numQHeads);
+            uint gridY = (uint)Math.Min((long)(batch * numQHeads), MaxGridDimY);
             uint sharedBytes = (uint)(2 * 32 * headDim * sizeof(float));
             LaunchKernel2D(krnl, gridX, gridY, 32, 1, args, sharedBytes);
             Synchronize();
@@ -6716,7 +6732,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             argsQg[12] = &headDim;
             argsQg[13] = &scale;
             uint gqX = (uint)((seqQ + 63) / 64);
-            uint gqY = (uint)(batch * numQHeads);
+            uint gqY = (uint)Math.Min((long)(batch * numQHeads), MaxGridDimY);
             LaunchKernel2D(kQg, gqX, gqY, 64, 1, argsQg);
 
             if (!_kernelCache.TryGetValue("grouped_query_attention_backward_gradkv_deterministic", out var kKVg))
@@ -6739,7 +6755,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             argsKVg[14] = &scale;
             uint gkvX = (uint)((headDim + 15) / 16);
             uint gkvY = (uint)((seqK + 3) / 4);
-            uint gkvZ = (uint)(batch * numKVHeads);
+            uint gkvZ = (uint)Math.Min((long)(batch * numKVHeads), MaxGridDimY);
             LaunchKernel3D(kKVg, gkvX, gkvY, gkvZ, 16, 4, 1, argsKVg);
             Synchronize();
             return;
@@ -6767,7 +6783,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         args[15] = &scale;
 
         uint gridX = (uint)((seqQ + 31) / 32);
-        uint gridY = (uint)(batch * numQHeads);
+        uint gridY = (uint)Math.Min((long)(batch * numQHeads), MaxGridDimY);
         uint sharedBytes = (uint)(2 * 32 * headDim * sizeof(float));
         LaunchKernel2D(krnl, gridX, gridY, 32, 1, args, sharedBytes);
         Synchronize();
@@ -6817,7 +6833,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
             uint gridX = (uint)((cols + 15) / 16);
             uint gridY = (uint)((rows + 15) / 16);
-            uint gridZ = (uint)batch;
+            uint gridZ = (uint)Math.Min((long)batch, MaxGridDimY);
             LaunchKernel3D(krnl, gridX, gridY, gridZ, 16, 16, 1, args);
             Synchronize();
             }
@@ -9056,7 +9072,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             // 3D grid: (width, height, batch)
             uint gridX = (uint)((outputWidth + 15) / 16);
             uint gridY = (uint)((outputHeight + 15) / 16);
-            uint gridZ = (uint)batch;
+            uint gridZ = (uint)Math.Min((long)batch, MaxGridDimY);
             LaunchKernel3D(krnl, gridX, gridY, gridZ, 16, 16, 1, args);
             Synchronize();
             }
@@ -9089,7 +9105,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
                 uint gridX = (uint)((outWidth + 15) / 16);
                 uint gridY = (uint)((outHeight + 15) / 16);
-                uint gridZ = (uint)(batch * channels);
+                uint gridZ = (uint)Math.Min((long)(batch * channels), MaxGridDimY);
                 LaunchKernel3D(krnl, gridX, gridY, gridZ, 16, 16, 1, args);
                 Synchronize();
             }
@@ -9128,7 +9144,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             argsG[11] = &alignCornersInt;
             uint gGX = (uint)((outWidth + 15) / 16);
             uint gGY = (uint)((outHeight + 15) / 16);
-            uint gGZ = (uint)batch;
+            uint gGZ = (uint)Math.Min((long)batch, MaxGridDimY);
             LaunchKernel3D(krnlG, gGX, gGY, gGZ, 16, 16, 1, argsG);
 
             if (!_kernelCache.TryGetValue("grid_sample_backward_grad_input_deterministic", out var krnlI))
@@ -9148,7 +9164,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             argsI[10] = &alignCornersInt;
             uint gIX = (uint)((inWidth + 15) / 16);
             uint gIY = (uint)((inHeight + 15) / 16);
-            uint gIZ = (uint)(batch * channels);
+            uint gIZ = (uint)Math.Min((long)(batch * channels), MaxGridDimY);
             LaunchKernel3D(krnlI, gIX, gIY, gIZ, 16, 16, 1, argsI);
             Synchronize();
             return;
@@ -9173,7 +9189,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         args[12] = &alignCornersInt;
         uint gridX = (uint)((outWidth + 15) / 16);
         uint gridY = (uint)((outHeight + 15) / 16);
-        uint gridZ = (uint)batch;
+        uint gridZ = (uint)Math.Min((long)batch, MaxGridDimY);
         LaunchKernel3D(krnl, gridX, gridY, gridZ, 16, 16, 1, args);
         Synchronize();
     }
@@ -9427,7 +9443,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
         {
             uint gridX = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
-            uint gridY = (uint)batch;
+            uint gridY = (uint)Math.Min((long)batch, MaxGridDimY);
 
             {
             IntPtr _p0 = inputReal.Handle;
@@ -9454,7 +9470,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         {
             int numButterflies = n / 2;
             uint gridX = (uint)((numButterflies + DefaultBlockSize - 1) / DefaultBlockSize);
-            uint gridZ = (uint)batch;
+            uint gridZ = (uint)Math.Min((long)batch, MaxGridDimY);
 
                 {
                 IntPtr _p0 = transformReal.Handle;

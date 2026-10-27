@@ -380,10 +380,10 @@ extern ""C"" __global__ __launch_bounds__(256) void scale_inverse(float* real, f
 }
 
 // Batched FFT bit reversal
-extern ""C"" __global__ __launch_bounds__(256) void batched_bit_reverse(
-    const float* srcReal, const float* srcImag, float* dstReal, float* dstImag, int batch, int n, int log2n)
+__device__ __forceinline__ void batched_bit_reverse_at(
+    const float* srcReal, const float* srcImag, float* dstReal, float* dstImag, int batch, int n, int log2n, int gridStrideY)
 {
-    int b = blockIdx.y;
+    int b = gridStrideY;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= batch || idx >= n) return;
 
@@ -399,12 +399,19 @@ extern ""C"" __global__ __launch_bounds__(256) void batched_bit_reverse(
     dstReal[baseOffset + idx] = srcReal[baseOffset + reversed];
     dstImag[baseOffset + idx] = srcImag[baseOffset + reversed];
 }
+extern ""C"" __global__ __launch_bounds__(256) void batched_bit_reverse(
+    const float* srcReal, const float* srcImag, float* dstReal, float* dstImag, int batch, int n, int log2n)
+{
+    // gridDim.y is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideY = blockIdx.y; gridStrideY < batch; gridStrideY += gridDim.y)
+        batched_bit_reverse_at(srcReal, srcImag, dstReal, dstImag, batch, n, log2n, gridStrideY);
+}
 
 // Batched FFT butterfly
-extern ""C"" __global__ __launch_bounds__(256) void batched_fft_butterfly(
-    float* real, float* imag, int batch, int n, int stride, int inverse)
+__device__ __forceinline__ void batched_fft_butterfly_at(
+    float* real, float* imag, int batch, int n, int stride, int inverse, int gridStrideZ)
 {
-    int b = blockIdx.z;
+    int b = gridStrideZ;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int halfStride = stride / 2;
     int numButterflies = n / stride;
@@ -433,6 +440,13 @@ extern ""C"" __global__ __launch_bounds__(256) void batched_fft_butterfly(
     imag[topIdx] = topImag + twiddledImag;
     real[botIdx] = topReal - twiddledReal;
     imag[botIdx] = topImag - twiddledImag;
+}
+extern ""C"" __global__ __launch_bounds__(256) void batched_fft_butterfly(
+    float* real, float* imag, int batch, int n, int stride, int inverse)
+{
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch; gridStrideZ += gridDim.z)
+        batched_fft_butterfly_at(real, imag, batch, n, stride, inverse, gridStrideZ);
 }
 ";
     }

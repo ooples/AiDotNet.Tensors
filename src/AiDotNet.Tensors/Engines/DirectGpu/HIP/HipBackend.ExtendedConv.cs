@@ -102,7 +102,7 @@ public sealed partial class HipBackend : ITrilinearInterpolationKernels, IConvTr
         const int blockSize = 8;
         uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
         uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
-        uint gridZ = (uint)(batch * channels * outDepth);
+        uint gridZ = (uint)Math.Min((long)(batch * channels * outDepth), MaxGridDimY);
         IntPtr i = input.Handle, o = output.Handle;
         int vB = batch, vC = channels, vID = inDepth, vIH = inHeight, vIW = inWidth;
         int vOD = outDepth, vOH = outHeight, vOW = outWidth, vKD = kernelD, vKH = kernelH, vKW = kernelW;
@@ -129,7 +129,7 @@ public sealed partial class HipBackend : ITrilinearInterpolationKernels, IConvTr
         const int blockSize = 8;
         uint gridX = (uint)((inWidth + blockSize - 1) / blockSize);
         uint gridY = (uint)((inHeight + blockSize - 1) / blockSize);
-        uint gridZ = (uint)(batch * channels * inDepth);
+        uint gridZ = (uint)Math.Min((long)(batch * channels * inDepth), MaxGridDimY);
         IntPtr go = gradOutput.Handle, gi = gradInput.Handle;
         int vB = batch, vC = channels, vID = inDepth, vIH = inHeight, vIW = inWidth;
         int vOD = outDepth, vOH = outHeight, vOW = outWidth, vKD = kernelD, vKH = kernelH, vKW = kernelW;
