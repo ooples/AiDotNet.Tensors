@@ -19,7 +19,7 @@ internal static class PortableFusedAttention
             : throw new NotSupportedException($"fused attention: stride {name} = {value} does not fit the portable kernels' int32 indexing.");
 
     // The scalars every fa_p_ kernel reads, in AttentionSource's order (scale and soft-cap as float bits): int32 words bit-cast into a float-typed allocation, which the kernels read as int* / array<i32>.
-    private static IGpuBuffer Meta(IDirectGpuBackend backend, in FusedAttentionParams p, int headDim)
+    private static MetaLease Meta(IDirectGpuBackend backend, in FusedAttentionParams p, int headDim)
     {
         int[] values =
         {
@@ -34,7 +34,33 @@ internal static class PortableFusedAttention
         };
         var words = new float[K.FaMetaCount];
         for (int i = 0; i < values.Length; i++) words[i] = BitConverter.ToSingle(BitConverter.GetBytes(values[i]), 0);
-        return backend.AllocateBuffer(words);
+        // The block depends only on the shapes, strides and flags, which a training step repeats. Uploading it on every
+        // launch was a host/device crossing per attention forward and backward (#1570): keep one per backend and block.
+        var cache = MetaCache.GetValue(backend, static _ => new System.Collections.Concurrent.ConcurrentDictionary<string, IGpuBuffer>());
+        string key = string.Join(",", values);
+        if (cache.TryGetValue(key, out var cached)) return new MetaLease(cached, owned: false);
+        lock (cache)
+        {
+            if (cache.TryGetValue(key, out cached)) return new MetaLease(cached, owned: false);
+            var created = backend.AllocateBuffer(words);
+            if (cache.Count >= MaxCachedMetaBlocks) return new MetaLease(created, owned: true);
+            cache[key] = created;
+            return new MetaLease(created, owned: false);
+        }
+    }
+
+    // Bounded so a workload whose shapes keep changing falls back to a per-launch upload instead of growing the cache.
+    private const int MaxCachedMetaBlocks = 256;
+    // Entries live as long as their backend: the table drops a backend's blocks when the backend is collected.
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<IDirectGpuBackend,
+        System.Collections.Concurrent.ConcurrentDictionary<string, IGpuBuffer>> MetaCache = new();
+
+    private readonly struct MetaLease : IDisposable
+    {
+        private readonly bool _owned;
+        public MetaLease(IGpuBuffer buffer, bool owned) { Buffer = buffer; _owned = owned; }
+        public IGpuBuffer Buffer { get; }
+        public void Dispose() { if (_owned) Buffer.Dispose(); }
     }
 
     private static int Elements(int rows, int headDim)
@@ -51,7 +77,8 @@ internal static class PortableFusedAttention
         if (p.Sq <= 0 || p.B * p.H <= 0) return;
         int rows = checked(p.B * p.H * p.Sq);
         int elements = Elements(rows, headDim);
-        using var meta = Meta(backend, p, headDim);
+        using var metaLease = Meta(backend, p, headDim);
+        var meta = metaLease.Buffer;
         // Without a mask the kernels never read it (has-mask is 0); the metadata buffer stands in for the binding.
         var maskBuffer = mask ?? meta;
         launch(K.FaLse, rows, q, k, meta, maskBuffer, lse, rows);
@@ -65,7 +92,8 @@ internal static class PortableFusedAttention
         if (p.B * p.H <= 0) return;
         int rows = checked(p.B * p.H * p.Sq);
         int keys = checked(p.B * p.H * p.Sk);
-        using var meta = Meta(backend, p, headDim);
+        using var metaLease = Meta(backend, p, headDim);
+        var meta = metaLease.Buffer;
         // lse in [0, rows), delta in [rows, 2 rows): one binding for both keeps every kernel within 8 storage buffers.
         using var stats = backend.AllocateBuffer(Math.Max(1, 2 * rows));
         var maskBuffer = mask ?? meta;

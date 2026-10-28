@@ -5727,6 +5727,34 @@ public partial class DirectGpuTensorEngine
         }
     }
 
+    // A strided view's shape/stride metadata repeats every step (the transformer's Q/K/V narrows are gathered on each
+    // reshape). Uploading it per call made three host/device crossings per warm step (#1570). Bounded so a workload
+    // with ever-changing view layouts falls back to a per-call upload instead of growing the cache without limit.
+    private const int MaxCachedStridedViewLayouts = 1024;
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(IDirectGpuBackend, string), IGpuBuffer> _stridedViewLayouts = new();
+    private readonly object _stridedViewLayoutsGate = new();
+
+    private IGpuBuffer CachedStridedViewLayout(IDirectGpuBackend backend, float[] layout, out bool cached)
+    {
+        var bits = new int[layout.Length];
+        for (int i = 0; i < layout.Length; i++) bits[i] = BitConverter.ToInt32(BitConverter.GetBytes(layout[i]), 0);
+        var key = (backend, string.Join(",", bits));
+        cached = true;
+        if (_stridedViewLayouts.TryGetValue(key, out var existing)) return existing;
+        lock (_stridedViewLayoutsGate)
+        {
+            if (_stridedViewLayouts.TryGetValue(key, out existing)) return existing;
+            var created = backend.AllocateBuffer(layout);
+            if (_stridedViewLayouts.Count >= MaxCachedStridedViewLayouts)
+            {
+                cached = false;
+                return created;
+            }
+            _stridedViewLayouts[key] = created;
+            return created;
+        }
+    }
+
     private static float[] AdaptivePoolMatrix(int inSize, int outSize)
     {
         var matrix = new float[checked(outSize * inSize)];
