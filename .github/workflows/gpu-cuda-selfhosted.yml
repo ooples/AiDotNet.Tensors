@@ -1,0 +1,116 @@
+name: GPU (CUDA, self-hosted)
+
+# Why this lane exists (#1569)
+# ----------------------------
+# Hosted runners have no GPU, so every CUDA test skips there and CI goes green without running them. Two CUDA crash
+# classes reached main that way (grid Y/Z overflow at batch 128 in ResNet-18 / VGG-11 inference; optimizer moments
+# freed at the tape's end in MobileNetV2 training), and #1566 broke three CUDA tests unnoticed (#1570). This lane runs
+# the GPU suites and AiDotNet's model families on a real NVIDIA GPU, and a test that skips here fails the lane unless
+# its reason is an explicit exemption (another backend's device, an architecture requirement).
+#
+# To enable it, register a self-hosted runner on a machine with an NVIDIA GPU and the CUDA driver (.NET 10 SDK and
+# PowerShell 7 installed), with the labels `self-hosted, gpu, cuda`, then set the repository variable
+# CUDA_RUNNER_ENABLED=true. Until the variable is set every job is skipped, so nothing waits for a runner that does
+# not exist. Pull requests from forks never run here: a self-hosted runner must not execute untrusted code.
+
+on:
+  schedule:
+    - cron: '30 6 * * *'
+  workflow_dispatch:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'src/AiDotNet.Tensors/Engines/DirectGpu/**'
+      - 'src/AiDotNet.Tensors/Engines/DirectGpuTensorEngine*.cs'
+      - 'src/AiDotNet.Tensors/Engines/Gpu/**'
+      - '.github/workflows/gpu-cuda-selfhosted.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_NOLOGO: true
+  # A missing device is a failure on this lane, not a skip.
+  AIDOTNET_REQUIRE_GPU_TESTS: '1'
+
+jobs:
+  cuda:
+    if: >-
+      ${{ vars.CUDA_RUNNER_ENABLED == 'true' &&
+          (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: [self-hosted, gpu, cuda]
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        path: AiDotNet.Tensors
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '10.0.x'
+        dotnet-quality: 'preview'
+
+    - name: Record the GPU and driver
+      run: |
+        $gpu = nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv,noheader
+        if ($LASTEXITCODE -ne 0) { Write-Output "::error::nvidia-smi failed: this runner has no usable NVIDIA driver."; exit 1 }
+        "Runner GPU: $gpu" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
+
+    - name: Build tests (net10.0)
+      run: dotnet build AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --framework net10.0
+
+    - name: GPU suites (DirectGpu, Autodiff, Compilation, Parity)
+      run: |
+        dotnet test AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj `
+          --configuration Release --no-build --framework net10.0 `
+          --filter "(FullyQualifiedName~Engines.DirectGpu|FullyQualifiedName~Engines.Autodiff|FullyQualifiedName~Engines.Compilation|FullyQualifiedName~Parity|FullyQualifiedName~GruSequence|FullyQualifiedName~FusedConv2DBatchNorm)&Category!=Benchmark&Category!=Performance" `
+          --logger "trx;LogFilePath=${{ runner.temp }}/trx/cuda.trx" `
+          --blame-hang --blame-hang-timeout 900s --blame-crash
+
+    - name: Fail on unexplained skips
+      if: always()
+      # Allowed: another backend's device or toolchain (this runner has CUDA, not necessarily HIP, Metal, Vulkan, WebGPU
+      # or a Python with torch), and explicit architecture requirements. A CUDA test skipping for any other reason fails.
+      run: >-
+        python AiDotNet.Tensors/scripts/ci/summarize-test-skips.py --title "CUDA" --fail-on-skip
+        --allowed-skip "(HIP|ROCm|Metal|MoltenVK|Vulkan|WebGPU|Dawn|AIDOTNET_WEBGPU_NODE_DIR|POCL|DirectML|macOS)|requires sm_|compute capability|torch|python|PARITY_PYTHON"
+        "${{ runner.temp }}/trx/*.trx"
+
+    - name: Check out AiDotNet beside this checkout
+      uses: actions/checkout@v4
+      with:
+        repository: ooples/AiDotNet
+        path: aidn
+
+    - name: AiDotNet model families on CUDA (2 training steps, inference up to batch 128)
+      # Builds AiDotNet against this checkout (UseLocalTensors resolves ../../AiDotNet.Tensors from aidn/src), so the
+      # model families exercise exactly this commit's kernels. Runs every family the harness defines.
+      run: |
+        $program = Get-Content aidn/benchmarks/AiDotNet.PyTorchParity/Program.cs -Raw
+        $families = 'mlp','cnn','lstm','transformer','gru','resnet18','resnet50','vgg11','mobilenetv2','densenet121','vit' |
+          Where-Object { $program -match ('"' + $_ + '"\s*=>') }
+        "Model families: $($families -join ', ')" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
+        dotnet run -c Release --project aidn/benchmarks/AiDotNet.PyTorchParity -p:UseLocalTensors=true -- `
+          --models ($families -join ',') --device cuda --epochs 1 --train-batches 2 --batch-size 64 `
+          --inference-iterations 3 --warmup-iterations 1 --output "${{ runner.temp }}/aidotnet-cuda.json"
+        if ($LASTEXITCODE -ne 0) { Write-Output "::error::An AiDotNet model family failed on CUDA."; exit 1 }
+
+    - name: Upload results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: gpu-cuda-results
+        path: |
+          ${{ runner.temp }}/trx/**
+          ${{ runner.temp }}/aidotnet-cuda.json
+        if-no-files-found: ignore

@@ -2,13 +2,16 @@
 """Summarise passed, failed and skipped tests from TRX files into the GitHub job summary (#1569).
 
 A skipped test does not fail a build, so a GPU lane whose tests skip goes green without running them. This report makes
-every skip visible, with its reason, on the run's summary page. It never changes the job's result.
+every skip visible, with its reason, on the run's summary page. By default it never changes the job's result; with
+--fail-on-skip (a lane that has the device), any skip whose reason does not match --allowed-skip fails the job, so the
+lane cannot pass by not running.
 
-Usage: summarize-test-skips.py --title "POCL (shard)" path/to/*.trx [more.trx ...]
+Usage: summarize-test-skips.py --title "POCL (shard)" [--fail-on-skip] [--allowed-skip REGEX] path/to/*.trx [...]
 """
 import argparse
 import glob
 import os
+import re
 import sys
 import xml.etree.ElementTree as ET
 
@@ -27,6 +30,10 @@ def reason_of(result):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--title", required=True)
+    parser.add_argument("--fail-on-skip", action="store_true",
+                        help="fail when a test skips for a reason --allowed-skip does not match")
+    parser.add_argument("--allowed-skip", default=None,
+                        help="regex over skip reasons that are explicit, reasoned exemptions (e.g. 'requires sm_8')")
     parser.add_argument("paths", nargs="+")
     args = parser.parse_args()
 
@@ -66,6 +73,17 @@ def main():
     sys.stdout.write(text)
     if skipped:
         print(f"::notice title=Skipped tests ({args.title})::{len(skipped)} test(s) skipped; reasons are in the job summary.")
+    if args.fail_on_skip:
+        if not files:
+            print(f"::error title=No test results ({args.title})::No TRX file was produced.")
+            return 1
+        allowed = re.compile(args.allowed_skip) if args.allowed_skip else None
+        unexpected = [(n, r) for n, r in skipped if not (allowed and allowed.search(r))]
+        if unexpected:
+            for name, reason in unexpected[:50]:
+                print(f"::error title=Unexpected skip::{name}: {reason}")
+            print(f"{len(unexpected)} test(s) skipped on a lane that has the device; see the job summary.")
+            return 1
     return 0
 
 
