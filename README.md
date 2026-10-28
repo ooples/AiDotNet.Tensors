@@ -6,12 +6,27 @@
 
 A high-performance .NET tensor library with hand-written AVX2/AVX-512 SIMD kernels in `SimdKernels.cs` / `SimdGemm.cs` / `SimdConvHelper.cs`. Every hot path runs through our own managed-C# kernels — we do NOT call into `System.Numerics.Tensors`, MKL.NET, or oneDNN through the standard wrappers. In the latest benchmark run on a Threadripper 3990X (see [CPU Benchmarks](#cpu-benchmarks) for every number, the versions compared and the losses), AiDotNet.Tensors was faster than TorchSharp 0.107 (libtorch) in 73 of 82 measurements, than ML.NET 5.0 and TensorFlow.NET 0.150 in all of them, than NumSharp 0.70 in 45 of 48 and than MathNet.Numerics 5.0 in all 33.
 
-> **Note on dependencies.** The .nupkg ships with the following PackageReferences:
-> `Microsoft.Extensions.Logging.Abstractions`, `System.Text.Json`,
-> `System.Threading.Channels`, `K4os.Compression.LZ4` (LZ4 compression for
-> serialized tensor blobs) and `BouncyCastle.Cryptography`. It ships no native
-> CPU math library: OpenBLAS and Intel MKL were removed under #368, and every CPU
-> GEMM runs the managed kernels.
+> **Note on dependencies.** The `AiDotNet.Tensors` package depends on
+> `AiDotNet.Evolution`, `Microsoft.Extensions.Logging.Abstractions`,
+> `K4os.Compression.LZ4` (LZ4 compression for serialized tensor blobs),
+> `BouncyCastle.Cryptography` and `Silk.NET.Shaderc.Native` (the shaderc GLSL to
+> SPIR-V compiler the Vulkan backend uses), plus BCL polyfills on .NET Framework and
+> .NET Standard (`System.Text.Json`, `System.Threading.Channels`, and on
+> netstandard2.0 `System.Reflection.Emit`). It ships no native CPU math library:
+> OpenBLAS and Intel MKL were removed under #368, and by default every CPU GEMM runs
+> the managed kernels.
+>
+> **When oneDNN is used.** Intel oneDNN is never bundled with `AiDotNet.Tensors`; it
+> ships separately as `AiDotNet.Native.OneDNN` (oneDNN 3.2, `dnnl.dll` for win-x64).
+> On net8.0 and net10.0 only (the oneDNN path is compiled out of the net471, net462 and
+> netstandard2.0 builds), when a `dnnl` library can be loaded - from that package, the
+> application directory, or the system library search path - the CPU engine tries
+> oneDNN first for float32 Conv2D forward, in-place ReLU and sigmoid, softmax, and
+> large element-wise add and multiply. GEMM stays on the managed kernels unless
+> `AIDOTNET_ONEDNN_GEMM=1` is set. Any call oneDNN declines falls back to the managed
+> kernel, and so does every call in deterministic mode or while another thread is
+> already inside oneDNN. `AIDOTNET_DISABLE_ONEDNN=1` turns oneDNN off even when the
+> library is present.
 >
 > **Performance numbers above assume net8.0+.** On net471 the SIMD/intrinsics
 > helpers are excluded (System.Runtime.Intrinsics is unavailable pre-net6); a
@@ -26,7 +41,7 @@ A high-performance .NET tensor library with hand-written AVX2/AVX-512 SIMD kerne
 - **BLIS-Style GEMM**: Tiled matrix multiply with FMA micro-kernel, cache-aware panel packing
 - **GPU Acceleration**: Optional CUDA, HIP/ROCm, OpenCL, Metal, Vulkan, and WebGPU support via separate packages, with CPU-vs-GPU op-parity validated across every backend (#775)
 - **Native ANN Index**: Dependency-free approximate-nearest-neighbour search (Flat / IVF / PQ / IVFPQ) via `AnnIndex`, with fused `IAnnBackend` GPU kernels across all seven backends — no FAISS / MKL dependency (#824)
-- **Multi-Target**: Supports .NET 10.0 and .NET Framework 4.7.1
+- **Multi-Target**: net10.0, net8.0, net471, net462 and netstandard2.0
 - **Generic Math**: Works with any numeric type via `INumericOperations<T>` interface
 
 ## Installation
@@ -42,6 +57,30 @@ dotnet add package AiDotNet.Native.CLBlast
 # Optional: CUDA for NVIDIA GPU acceleration (requires NVIDIA GPU)
 dotnet add package AiDotNet.Native.CUDA
 ```
+
+### Published packages
+
+These packages are published to [nuget.org](https://www.nuget.org/profiles/ooples):
+
+| Package | Contents |
+|---------|----------|
+| `AiDotNet.Tensors` | The library (managed code only) |
+| `AiDotNet.Native.CLBlast` | CLBlast 1.6.3 for OpenCL, win-x64 |
+| `AiDotNet.Native.CUDA` | NVIDIA CUDA 12 runtime (cudart, cuBLAS, cuBLASLt, nvRTC), win-x64, delivered through the `AiDotNet.Native.CUDA.Fragments.N` packages it depends on |
+| `AiDotNet.Native.ROCm` | AMD rocBLAS, hipBLAS and the HIP runtime, win-x64 |
+| `AiDotNet.Native.OneDNN` | Intel oneDNN 3.2, win-x64 |
+| `AiDotNet.Native.MoltenVK` | MoltenVK 1.4.1 for Vulkan on macOS (x64 and arm64) |
+
+Each `AiDotNet.Native.*` package carries the upstream licence text of what it
+redistributes and a `NATIVE-MANIFEST.json` listing the upstream version, licence and
+SHA-256 of every native file. The one exception is the Windows HIP runtime in
+`AiDotNet.Native.ROCm` (`amdhip64_6.dll`): it is closed source under AMD's HIP SDK
+licence, which AMD does not publish as a text file, so its manifest entry names the
+licence but no licence file is bundled.
+
+`AiDotNet.Tensors.Gpu`, `AiDotNet.Tensors.Onnx`, `AiDotNet.Tensors.Cli` and
+`AiDotNet.Tensors.Analyzers` are built from this repository but are **not** published
+to NuGet. The analyzers run only when this repository builds.
 
 ## Quick Start
 
@@ -318,7 +357,7 @@ Provides GPU acceleration via NVIDIA CUDA (NVIDIA GPUs only):
 dotnet add package AiDotNet.Native.CUDA
 ```
 
-**Performance**: 30,000+ GFLOPS for matrix operations on modern NVIDIA GPUs.
+**Performance**: not benchmarked yet, so no speedup is published for it.
 
 **Requirements**:
 - NVIDIA GPU (GeForce, Quadro, or Tesla)
@@ -344,7 +383,7 @@ If CUDA is not available, you'll get detailed troubleshooting steps explaining e
 
 ## Requirements
 
-- .NET 10.0 or .NET Framework 4.7.1+
+- .NET 8.0 or later, .NET Framework 4.6.2 or later, or another .NET Standard 2.0 runtime
 - Windows x64, Linux x64, or macOS x64/arm64
 
 ## License
