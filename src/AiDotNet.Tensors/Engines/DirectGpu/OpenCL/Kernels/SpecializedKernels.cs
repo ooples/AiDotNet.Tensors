@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // OpenCL kernels for specialized mathematical operations used in advanced layers:
 // - Hyperbolic geometry (Poincare ball operations)
 // - Octonion algebra (8D hypercomplex numbers)

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Activation function kernels for neural network layers.
 // Works on ALL .NET versions including .NET Framework 4.6.2.
 

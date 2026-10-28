@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // OpenCL kernels for FP16 (half-precision) conversion operations.
 // Uses cl_khr_fp16 extension for native half-precision support.
 
