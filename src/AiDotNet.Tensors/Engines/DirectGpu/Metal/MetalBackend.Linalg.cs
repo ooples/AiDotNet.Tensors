@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Metal dispatchers for the torch.linalg decomposition kernels (#211 moat #2).
 
 using static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings;

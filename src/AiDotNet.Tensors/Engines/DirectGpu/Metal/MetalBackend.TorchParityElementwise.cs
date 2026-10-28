@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // #1125: the PyTorch-parity kernels in FP32 (TorchParityF32Kernels), translated to MSL and compiled with strict math.
 // The Dawn parity suites run the same dialect source (as WGSL) against the CPU references.
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;

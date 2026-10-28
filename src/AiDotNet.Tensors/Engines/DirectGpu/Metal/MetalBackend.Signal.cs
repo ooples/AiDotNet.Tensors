@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Metal GPU backend - FFT, Signal Processing, and RNG operations.
 
 using AiDotNet.Tensors.Helpers;

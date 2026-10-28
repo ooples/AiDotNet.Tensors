@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Metal native bindings using Objective-C runtime interop.
 // Provides P/Invoke declarations for Metal framework on macOS/iOS.
 

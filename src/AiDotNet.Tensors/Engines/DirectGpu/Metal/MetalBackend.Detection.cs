@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Metal launcher shims for the vision detection kernels (Issue #217).
 // Mirrors MetalBackend.Parity210.cs — pipeline resolved via shader library
 // handle, dispatched with 1-D thread grid sized to total output cells.

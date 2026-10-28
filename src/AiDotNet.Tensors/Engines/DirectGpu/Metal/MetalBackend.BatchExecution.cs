@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Metal IGpuBatchExecution (#1142): the shared batch kernels, translated to MSL and compiled with strict math.
 using static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings;
 using K = AiDotNet.Tensors.Engines.DirectGpu.BatchExecutionCudaKernels;
