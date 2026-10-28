@@ -43,7 +43,7 @@ internal static class HipLocallyConnectedKernels
 // Weights: [outH, outW, outC, inC, kH, kW]
 // Bias:    [outC] (optional)
 // Output:  [batch, outC, outH, outW]
-extern ""C"" __global__ __launch_bounds__(256) void locally_connected_conv2d(
+__device__ __forceinline__ void locally_connected_conv2d_at(
     const float* input,
     const float* weights,
     const float* bias,
@@ -59,11 +59,11 @@ extern ""C"" __global__ __launch_bounds__(256) void locally_connected_conv2d(
     int kernelW,
     int strideH,
     int strideW,
-    int hasBias)
+    int hasBias, int gridStrideZ)
 {
     int ow = blockIdx.x * blockDim.x + threadIdx.x;
     int oh = blockIdx.y * blockDim.y + threadIdx.y;
-    int boc = blockIdx.z;
+    int boc = gridStrideZ;
 
     if (ow >= outWidth || oh >= outHeight || boc >= batch * outChannels) return;
 
@@ -105,6 +105,28 @@ extern ""C"" __global__ __launch_bounds__(256) void locally_connected_conv2d(
     // Write output
     int outIdx = ((b * outChannels + oc) * outHeight + oh) * outWidth + ow;
     output[outIdx] = sum;
+}
+extern ""C"" __global__ __launch_bounds__(256) void locally_connected_conv2d(
+    const float* input,
+    const float* weights,
+    const float* bias,
+    float* output,
+    int batch,
+    int inChannels,
+    int inHeight,
+    int inWidth,
+    int outChannels,
+    int outHeight,
+    int outWidth,
+    int kernelH,
+    int kernelW,
+    int strideH,
+    int strideW,
+    int hasBias)
+{
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch * outChannels; gridStrideZ += gridDim.z)
+        locally_connected_conv2d_at(input, weights, bias, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, hasBias, gridStrideZ);
 }
 
 // Backward pass for input gradients

@@ -886,6 +886,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
                 VulkanNativeBindings.vkCmdPushConstants(batchCmd, pipeline.Layout, VulkanNativeBindings.VK_SHADER_STAGE_COMPUTE_BIT, 0, pushConstantSize, ptr);
             }
             uint batchWgCount = CalculateWorkgroupCount(dispatchSize, workgroupSize);
+            EnsureDispatchable(batchWgCount);
             JournalDispatch(pipeline, batchWgCount, workgroupSize);
             VulkanNativeBindings.vkCmdDispatch(batchCmd, batchWgCount, 1, 1);
             _batchDispatchCount++;
@@ -915,10 +916,23 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         }
 
         uint workgroupCount = CalculateWorkgroupCount(dispatchSize, workgroupSize);
+
+        EnsureDispatchable(workgroupCount);
         JournalDispatch(pipeline, workgroupCount, workgroupSize);
         VulkanNativeBindings.vkCmdDispatch(cmdBuffer, workgroupCount, 1, 1);
         if (!deferred) VulkanNativeBindings.vkEndCommandBuffer(cmdBuffer);
         SubmitDispatch(cmdBuffer, threadRes, deferred, pipeline, ds);
+    }
+
+    /// <summary>
+    /// Refuses a 1-D dispatch past the device's X workgroup limit, naming it. The spec guarantees only 65535, so on a
+    /// device at that minimum a 256-wide kernel stops at about 16.7M elements; NVIDIA and AMD report about 2^31.
+    /// </summary>
+    private void EnsureDispatchable(uint workgroupCount)
+    {
+        if (workgroupCount > _device.Limits.maxComputeWorkGroupCountX)
+            throw new NotSupportedException(
+                $"The dispatch needs {workgroupCount} X workgroups; this Vulkan device supports {_device.Limits.maxComputeWorkGroupCountX}.");
     }
 
     private static uint CalculateWorkgroupCount(int elementCount, int workgroupSize)
@@ -968,6 +982,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
 
             // Dispatch
             uint wgCount = VulkanKernels.CalculateWorkgroupCount(elementCount);
+            EnsureDispatchable(wgCount);
             JournalDispatch(pipeline, wgCount, VulkanKernels.WorkgroupSize);
             VulkanNativeBindings.vkCmdDispatch(batchCmd, wgCount, 1, 1);
 
@@ -1011,6 +1026,8 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
             0, sizeof(uint), &size);
 
         uint workgroupCount = VulkanKernels.CalculateWorkgroupCount(elementCount);
+
+        EnsureDispatchable(workgroupCount);
         JournalDispatch(pipeline, workgroupCount, VulkanKernels.WorkgroupSize);
         VulkanNativeBindings.vkCmdDispatch(cmdBuffer, workgroupCount, 1, 1);
 
@@ -1074,6 +1091,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
 
         // Dispatch compute
         uint workgroupCount = VulkanKernels.CalculateWorkgroupCount(elementCount);
+        EnsureDispatchable(workgroupCount);
         JournalDispatch(pipeline, workgroupCount, VulkanKernels.WorkgroupSize);
         VulkanNativeBindings.vkCmdDispatch(cmdBuffer, workgroupCount, 1, 1);
 

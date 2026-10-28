@@ -773,17 +773,17 @@ extern ""C"" __global__ __launch_bounds__(256) void scaled_softmax(
 // ===========================================================================
 
 // Fused Bias + Dropout (for training)
-extern ""C"" __global__ __launch_bounds__(256) void bias_dropout(
+__device__ __forceinline__ void bias_dropout_at(
     const float* __restrict__ input,
     float* __restrict__ output,
     const float* __restrict__ bias,
     const unsigned int* __restrict__ mask,
-    int rows, int cols, float dropoutProb, float scale)
+    int rows, int cols, float dropoutProb, float scale, int gridStrideY)
 {
-    // 2D grid: blockIdx.y = row, blockIdx.x * blockDim.x + threadIdx.x = column
+    // 2D grid: gridStrideY = row, blockIdx.x * blockDim.x + threadIdx.x = column
     // Eliminates ~20-cycle integer division from idx % cols
     int col = blockIdx.x * blockDim.x + threadIdx.x;
-    int row = blockIdx.y;
+    int row = gridStrideY;
     if (col >= cols || row >= rows) return;
 
     int idx = row * cols + col;
@@ -792,6 +792,17 @@ extern ""C"" __global__ __launch_bounds__(256) void bias_dropout(
     // Apply dropout using pre-generated mask
     unsigned int m = mask[idx];
     output[idx] = (m != 0) ? val * scale : 0.0f;
+}
+extern ""C"" __global__ __launch_bounds__(256) void bias_dropout(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    const float* __restrict__ bias,
+    const unsigned int* __restrict__ mask,
+    int rows, int cols, float dropoutProb, float scale)
+{
+    // gridDim.y is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideY = blockIdx.y; gridStrideY < rows; gridStrideY += gridDim.y)
+        bias_dropout_at(input, output, bias, mask, rows, cols, dropoutProb, scale, gridStrideY);
 }
 
 // ===========================================================================
