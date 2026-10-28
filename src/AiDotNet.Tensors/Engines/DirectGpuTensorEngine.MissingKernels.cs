@@ -7952,10 +7952,33 @@ public partial class DirectGpuTensorEngine
             float scale = (float)(1.0 / System.Math.Sqrt(d));
             T scaleT = (T)(object)scale;
             var input2d = (input.IsContiguous ? input : (Tensor<T>)input.Contiguous()).Reshape(new[] { B * S, D });
-            // Q/K/V projections on the GPU (2-D GEMM), then split into [B*H, S, d].
-            var qh = ReshapePermuteHeads(backend, TensorMatMul(input2d, qWeight), B, S, H, d);
-            var kh = ReshapePermuteHeads(backend, TensorMatMul(input2d, kWeight), B, S, H, d);
-            var vh = ReshapePermuteHeads(backend, TensorMatMul(input2d, vWeight), B, S, H, d);
+            // Q/K/V projections on the GPU (2-D GEMM), [B*S, D] each.
+            var q2d = TensorMatMul(input2d, qWeight);
+            var k2d = TensorMatMul(input2d, kWeight);
+            var v2d = TensorMatMul(input2d, vWeight);
+
+            // #2384: without a mask, ONE fused FlashAttention launch covers all B*H heads, reading the head-interleaved
+            // [B, S, H*d] projections in place. The per-(batch, head) loop below launches ~7 kernels per pair, so its
+            // cost grew linearly with batch (Transformer b128 with 4 heads: 512 iterations per layer, 85x PyTorch).
+            // The loop remains for masks (it zeroes fully masked rows explicitly) and for a backend without the kernel.
+            if (mask is null
+                && TryFusedAttentionOnDevice("MultiHeadAttentionForward", q2d.Reshape(new[] { B, S, D }),
+                    k2d.Reshape(new[] { B, S, D }), v2d.Reshape(new[] { B, S, D }), null, B, H, S, S, d, interleaved: true,
+                    1.0 / System.Math.Sqrt(d), 0.0, causal: false, causalOffset: 0, new[] { B, S, D }) is { } fusedHeads)
+            {
+                var fusedProj = TensorMatMul(fusedHeads.Reshape(new[] { B * S, D }), outWeight);
+                var fusedResult = fusedProj.Reshape(new[] { B, S, D });
+                bool fusedTapeActive = IsTapeActive<T>();
+                if (!fusedTapeActive)
+                    DropTransientActivationsCreatedAfter(actSnapshot, fusedProj.DataVector, allThreads: true);
+                if (s_mhaDiag) MhaDiag(fusedTapeActive);
+                return fusedResult;
+            }
+
+            // Split into [B*H, S, d] for the per-head loop.
+            var qh = ReshapePermuteHeads(backend, q2d, B, S, H, d);
+            var kh = ReshapePermuteHeads(backend, k2d, B, S, H, d);
+            var vh = ReshapePermuteHeads(backend, v2d, B, S, H, d);
 
             var headOuts = new Tensor<T>[B * H];
             Tensor<T>? maskFill = null;
