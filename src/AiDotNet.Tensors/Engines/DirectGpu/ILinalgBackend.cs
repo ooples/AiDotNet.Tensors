@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Secondary capability interface for backends that ship native GPU kernels
 // for the torch.linalg op surface. DirectGpuTensorEngine type-tests against
 // this interface when dispatching Cholesky / LU / QR / Eigh; backends that

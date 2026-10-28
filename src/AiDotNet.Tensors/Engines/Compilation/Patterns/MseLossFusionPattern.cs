@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Built-in fusion: ReduceMean(Square(Subtract(p, y))) over every axis -> one mean-squared-error node.
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.Autodiff;

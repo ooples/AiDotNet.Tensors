@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Generalized kernel fusion framework for combining GPU operations.
 // Tracks operation sequences and matches against registered fused kernels.
 
