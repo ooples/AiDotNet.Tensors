@@ -1,16 +1,19 @@
 using System;
 using System.Diagnostics;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.DirectGpu;
+using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 using AiDotNet.Tensors.Helpers.Autotune.TunedKernels;
-using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Benchmarks;
 
 /// <summary>
-/// VGG-16's thirteen 3x3 convolutions at batch 1, 224x224, on the GPU engine (#1432): each layer under the tuned slot's
-/// own choice and under every forced forward candidate, warm, synchronised per call. Reports milliseconds and effective
-/// TFLOP/s (2 * N * K * C * 9 * P * Q over the time), so a new route can be judged per layer against the others.
-/// Usage: --gpu-vgg-convs [candidate-id ...]  (no ids: the tuned choice plus every OpenCL forward candidate)
+/// VGG-16's thirteen 3x3 convolutions (batch 1, 224x224, bias + ReLU) on OpenCL (#1432): for each layer, the forward
+/// slot's own choice against every applicable candidate, timed as paired AB/BA brackets
+/// (<see cref="StableTimer.MeasurePairedRatioBound"/>) so a desktop GPU's noise widens the interval instead of deciding the
+/// answer. Candidates run directly, not through the slot, whose per-shape decision cache would otherwise serve the first
+/// decision to every later "forced" run.
+/// Usage: --gpu-vgg-convs [pairs]   (default 21 pairs per comparison)
 /// </summary>
 internal static class GpuVggConvBench
 {
@@ -23,73 +26,78 @@ internal static class GpuVggConvBench
         (512, 512, 14), (512, 512, 14), (512, 512, 14),
     };
 
-    private static readonly string[] DefaultCandidates =
+    public static void Run(string[] args)
     {
-        "opencl.conv2d.winograd_gemm", "opencl.conv2d.winograd_f43_gemm", "opencl.conv2d.winograd_fused",
-        "opencl.conv2d.im2col_rb_gemm", "opencl.conv2d.direct",
-    };
-
-    public static void Run(string[] candidates)
-    {
-        using var gpu = new DirectGpuTensorEngine();
-        if (!gpu.IsGpuAvailable) { Console.WriteLine("No DirectGpu backend."); return; }
-        var backend = gpu.GetBackend();
-        Console.WriteLine($"backend {backend?.GetType().Name}");
-        var routes = new string?[candidates.Length == 0 ? DefaultCandidates.Length + 1 : candidates.Length + 1];
-        routes[0] = null;
-        var ids = candidates.Length == 0 ? DefaultCandidates : candidates;
-        for (int i = 0; i < ids.Length; i++) routes[i + 1] = ids[i];
-
+        int pairs = args.Length > 0 && int.TryParse(args[0], out int p) ? p : 21;
+        using var backend = new OpenClBackend();
+        if (!backend.IsAvailable) { Console.WriteLine("OpenCL is not available."); return; }
+        var slot = backend.Conv2DForwardSlot;
         var rng = new Random(16);
-        Tensor<float> Rand(params int[] shape)
+        float[] Rand(int n)
         {
-            int n = 1; foreach (var d in shape) n *= d;
             var a = new float[n];
             for (int i = 0; i < n; i++) a[i] = (float)(rng.NextDouble() * 2 - 1) * 0.05f;
-            return new Tensor<float>(a, shape);
+            return a;
         }
 
-        Console.WriteLine($"{"layer",-18}" + string.Concat(Array.ConvertAll(routes, r => $"{Short(r),16}")));
-        double[] totals = new double[routes.Length];
+        double tunedTotal = 0, bestTotal = 0;
         foreach (var (c, k, hw) in Layers)
         {
-            var input = gpu.TensorAddScalar(Rand(1, c, hw, hw), 0f);   // resident input, as inside a forward
-            var kernel = Rand(k, c, 3, 3);
-            var bias = Rand(k);
+            using var input = backend.AllocateBuffer(Rand(c * hw * hw));
+            using var kernel = backend.AllocateBuffer(Rand(k * c * 9));
+            using var bias = backend.AllocateBuffer(Rand(k));
+            using var output = backend.AllocateBuffer(k * hw * hw);
+            var a = new TunedConv2DArgs(input, kernel, output, 1, c, hw, hw, k, hw, hw, 3, 3, 1, 1, 1, 1, 1, 1,
+                bias, FusedActivationType.ReLU);
+            var shape = a.Shape();
+            TunedKernelPolicy.SetOverride(TunedKernelOp.Conv2DForward, null);
+            slot.InvalidateDecisions();
+            var tuned = slot.Resolve(shape, a);
+            if (tuned is null) { Console.WriteLine($"{c}->{k} @{hw}: no candidate applies"); continue; }
             double flops = 2.0 * k * c * 9 * hw * hw;
-            string row = $"{$"{c}->{k} @{hw}",-18}";
-            for (int r = 0; r < routes.Length; r++)
+            double tunedMs = MedianMs(() => tuned.Execute(a), backend.Synchronize);
+            tunedTotal += tunedMs;
+            Console.WriteLine($"{c}->{k} @{hw}: slot picks {tuned.Id}  {tunedMs:F3} ms ({flops / tunedMs / 1e9:F1} TFLOP/s)");
+
+            double bestMs = tunedMs;
+            foreach (var id in slot.CandidateIds)
             {
-                TunedKernelPolicy.SetOverride(TunedKernelOp.Conv2DForward, routes[r]);
-                double ms;
+                var candidate = slot.Candidate(id);
+                if (candidate is null || id == tuned.Id || !candidate.IsApplicable(shape)) continue;
+                StableTimer.RatioBound bound;
                 try
                 {
-                    for (int w = 0; w < 5; w++) gpu.FusedConv2D(input, kernel, bias, 1, 1, 1, 1, 1, 1, FusedActivationType.ReLU);
-                    backend?.Synchronize();
-                    var times = new double[15];
-                    for (int i = 0; i < times.Length; i++)
-                    {
-                        var sw = Stopwatch.StartNew();
-                        gpu.FusedConv2D(input, kernel, bias, 1, 1, 1, 1, 1, 1, FusedActivationType.ReLU);
-                        backend?.Synchronize();
-                        times[i] = sw.Elapsed.TotalMilliseconds;
-                    }
-                    Array.Sort(times);
-                    ms = times[times.Length / 2];
+                    bound = StableTimer.MeasurePairedRatioBound(() => tuned.Execute(a), backend.Synchronize,
+                        () => candidate.Execute(a), backend.Synchronize, pairs);
                 }
                 catch (Exception ex) when (ex is NotSupportedException or InvalidOperationException)
                 {
-                    ms = double.NaN;
+                    Console.WriteLine($"    {id,-36} failed: {ex.GetType().Name}");
+                    continue;
                 }
-                totals[r] += double.IsNaN(ms) ? 0 : ms;
-                row += double.IsNaN(ms) ? $"{"n/a",16}" : $"{$"{ms:F3} ({flops / ms / 1e9:F1})",16}";
+                string verdict = bound.Lower > 1.0 ? "FASTER than the pick" : bound.Upper < 1.0 ? "slower" : "no verdict";
+                Console.WriteLine($"    {id,-36} speedup {bound.Median:F2}x [{bound.Lower:F2}, {bound.Upper:F2}]  {verdict}");
+                if (bound.Lower > 1.0) bestMs = Math.Min(bestMs, tunedMs / bound.Median);
             }
-            Console.WriteLine(row);
+            bestTotal += bestMs;
         }
-        TunedKernelPolicy.SetOverride(TunedKernelOp.Conv2DForward, null);
-        Console.WriteLine($"{"total ms",-18}" + string.Concat(Array.ConvertAll(totals, t => $"{t,16:F3}")));
-        Console.WriteLine("cells: median ms (effective TFLOP/s); n/a = the route declined or failed the shape");
+        Console.WriteLine($"total: slot's picks {tunedTotal:F2} ms; with every clearly faster candidate {bestTotal:F2} ms");
+        Console.WriteLine("speedup = pick time / candidate time, median of paired AB/BA ratios with its 95% interval");
     }
 
-    private static string Short(string? id) => id is null ? "tuned" : id.Substring(id.LastIndexOf('.') + 1);
+    private static double MedianMs(Action launch, Action synchronize)
+    {
+        for (int w = 0; w < 5; w++) launch();
+        synchronize();
+        var times = new double[21];
+        for (int i = 0; i < times.Length; i++)
+        {
+            var sw = Stopwatch.StartNew();
+            launch();
+            synchronize();
+            times[i] = sw.Elapsed.TotalMilliseconds;
+        }
+        Array.Sort(times);
+        return times[times.Length / 2];
+    }
 }
