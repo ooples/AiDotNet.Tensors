@@ -421,25 +421,17 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
         return deviations.Length > 1 ? deviations[deviations.Length - 2] : deviations.Length == 1 ? deviations[0] : 1.0;
     }
 
-    // The build these kernels came from. A candidate keeps its id when its kernel changes (#1432: the batched GEMM behind
-    // opencl.conv2d.winograd_f43_gemm got 1.4-1.8x faster under the same id), so a key over the ids alone let every
-    // machine that had tuned keep serving the decision it measured against the old kernel, across upgrades.
-    private static readonly string s_buildIdentity =
-        typeof(TunedKernelSlot<TArgs>).Assembly.ManifestModule.ModuleVersionId.ToString("N");
-
-    private static string PoolKey(ITunedKernelCandidate<TArgs>[] candidates) => PoolKey(candidates, s_buildIdentity);
-
     // 32-bit FNV-1a.
     private const uint FnvOffsetBasis = 2166136261;
     private const uint FnvPrime = 16777619;
 
-    // FNV-1a over the build identity and the ordered candidate ids, as 8 hex digits: a short name for the candidate set
-    // as this build implements it.
-    internal static string PoolKey(ITunedKernelCandidate<TArgs>[] candidates, string buildIdentity)
+    // FNV-1a over the ordered candidate ids, as 8 hex digits: a short, stable name for the candidate set. It holds across
+    // package upgrades on purpose: keying it by build (tried in #1432) discarded every persisted decision on each upgrade,
+    // and until the tuning budget re-covered every shape over several processes the uncovered ones served the reference
+    // (ResNet-50 predict on OpenCL: 8 ms with the kept decisions, 184 ms in the first process after a rebuild).
+    private static string PoolKey(ITunedKernelCandidate<TArgs>[] candidates)
     {
         uint h = FnvOffsetBasis;
-        foreach (char ch in buildIdentity) { h ^= ch; h *= FnvPrime; }
-        h ^= '|'; h *= FnvPrime;
         foreach (var c in candidates)
         {
             foreach (char ch in c.Id) { h ^= ch; h *= FnvPrime; }
@@ -447,7 +439,6 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
         }
         return h.ToString("x8", System.Globalization.CultureInfo.InvariantCulture);
     }
-
     internal static double MaxRelativeError(float[] expected, float[] actual, double scale)
     {
         if (actual.Length != expected.Length) return double.PositiveInfinity;

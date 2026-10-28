@@ -609,16 +609,4 @@ public sealed class TunedKernelRegistryTests : IDisposable
             Directory.Delete(dir, recursive: true);
         }
     }
-
-    // A candidate keeps its id when its kernel changes, so a persisted decision must not outlive the build that measured
-    // it: otherwise an upgraded kernel is never measured again on a machine that had already tuned (#1432).
-    [Fact]
-    public void PersistedDecisionKey_ChangesWithTheBuild_NotJustTheCandidateIds()
-    {
-        var candidates = new ITunedKernelCandidate<Args>[] { new Fake("ref", 1f, 1.0), new Fake("fast", 1f, 0.5) };
-        string thisBuild = TunedKernelSlot<Args>.PoolKey(candidates, "build-a");
-        Assert.Equal(thisBuild, TunedKernelSlot<Args>.PoolKey(candidates, "build-a"));
-        Assert.NotEqual(thisBuild, TunedKernelSlot<Args>.PoolKey(candidates, "build-b"));
-        Assert.NotEqual(thisBuild, TunedKernelSlot<Args>.PoolKey(new ITunedKernelCandidate<Args>[] { candidates[0] }, "build-a"));
-    }
 }
