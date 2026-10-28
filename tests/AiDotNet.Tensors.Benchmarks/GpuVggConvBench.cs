@@ -50,12 +50,20 @@ internal static class GpuVggConvBench
             var a = new TunedConv2DArgs(input, kernel, output, 1, c, hw, hw, k, hw, hw, 3, 3, 1, 1, 1, 1, 1, 1,
                 bias, FusedActivationType.ReLU);
             var shape = a.Shape();
+            // What FusedConv2D enters for host-authoritative weights outside a tape: routes that derive a form from the
+            // weights (the F(4x4, 3x3) filter transform) cache it, as they do in real inference.
+            var weightKey = new object();
+            Action Run(ITunedKernelCandidate<TunedConv2DArgs> candidate) => () =>
+            {
+                using (ConvWeightIdentity.Enter(weightKey, 0)) candidate.Execute(a);
+            };
             TunedKernelPolicy.SetOverride(TunedKernelOp.Conv2DForward, null);
             slot.InvalidateDecisions();
-            var tuned = slot.Resolve(shape, a);
+            ITunedKernelCandidate<TunedConv2DArgs>? tuned;
+            using (ConvWeightIdentity.Enter(weightKey, 0)) tuned = slot.Resolve(shape, a);
             if (tuned is null) { Console.WriteLine($"{c}->{k} @{hw}: no candidate applies"); continue; }
             double flops = 2.0 * k * c * 9 * hw * hw;
-            double tunedMs = MedianMs(() => tuned.Execute(a), backend.Synchronize);
+            double tunedMs = MedianMs(Run(tuned), backend.Synchronize);
             tunedTotal += tunedMs;
             Console.WriteLine($"{c}->{k} @{hw}: slot picks {tuned.Id}  {tunedMs:F3} ms ({flops / tunedMs / 1e9:F1} TFLOP/s)");
 
@@ -67,8 +75,8 @@ internal static class GpuVggConvBench
                 StableTimer.RatioBound bound;
                 try
                 {
-                    bound = StableTimer.MeasurePairedRatioBound(() => tuned.Execute(a), backend.Synchronize,
-                        () => candidate.Execute(a), backend.Synchronize, pairs);
+                    bound = StableTimer.MeasurePairedRatioBound(Run(tuned), backend.Synchronize,
+                        Run(candidate), backend.Synchronize, pairs);
                 }
                 catch (Exception ex) when (ex is NotSupportedException or InvalidOperationException)
                 {
@@ -83,6 +91,41 @@ internal static class GpuVggConvBench
         }
         Console.WriteLine($"total: slot's picks {tunedTotal:F2} ms; with every clearly faster candidate {bestTotal:F2} ms");
         Console.WriteLine("speedup = pick time / candidate time, median of paired AB/BA ratios with its 95% interval");
+    }
+
+    /// <summary>
+    /// The F(4x4, 3x3) route's three per-call stages on each VGG layer (the filter transform is cached by the real route):
+    /// input transform, the 36 batched GEMMs, and the output transform with its epilogue. Usage: --gpu-vgg-f43-stages
+    /// </summary>
+    public static void RunF43Stages()
+    {
+        using var backend = new OpenClBackend();
+        if (!backend.IsAvailable) { Console.WriteLine("OpenCL is not available."); return; }
+        IWinogradF43Transforms t = backend;
+        var rng = new Random(16);
+        float[] Rand(int n)
+        {
+            var a = new float[n];
+            for (int i = 0; i < n; i++) a[i] = (float)(rng.NextDouble() * 2 - 1) * 0.05f;
+            return a;
+        }
+        Console.WriteLine($"{"layer",-16}{"input ms",10}{"gemm ms",10}{"output ms",10}{"gemm TFLOP/s",14}");
+        foreach (var (c, k, hw) in Layers)
+        {
+            int tiles = (hw + 3) / 4, p = tiles * tiles;
+            using var x = backend.AllocateBuffer(Rand(c * hw * hw));
+            using var w = backend.AllocateBuffer(Rand(k * c * 9));
+            using var bias = backend.AllocateBuffer(Rand(k));
+            using var y = backend.AllocateBuffer(k * hw * hw);
+            using var u = backend.AllocateBuffer(36 * k * c);
+            using var v = backend.AllocateBuffer(36 * c * p);
+            using var m = backend.AllocateBuffer(36 * k * p);
+            t.FilterF43(w, u, k, c);
+            double input = MedianMs(() => t.InputF43(x, v, 1, c, hw, hw, 1, tiles, tiles), backend.Synchronize);
+            double gemm = MedianMs(() => backend.BatchedGemm(u, v, m, k, p, c, 36), backend.Synchronize);
+            double output = MedianMs(() => t.OutputF43(m, y, 1, k, hw, hw, tiles, tiles, bias, 3), backend.Synchronize);
+            Console.WriteLine($"{$"{c}->{k} @{hw}",-16}{input,10:F3}{gemm,10:F3}{output,10:F3}{2.0 * 36 * k * p * c / gemm / 1e9,14:F2}");
+        }
     }
 
     private static double MedianMs(Action launch, Action synchronize)

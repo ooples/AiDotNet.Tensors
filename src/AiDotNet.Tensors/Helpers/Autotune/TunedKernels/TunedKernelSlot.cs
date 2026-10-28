@@ -421,10 +421,21 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
         return deviations.Length > 1 ? deviations[deviations.Length - 2] : deviations.Length == 1 ? deviations[0] : 1.0;
     }
 
-    // FNV-1a over the ordered candidate ids, as 8 hex digits: a short, stable name for the candidate set.
-    private static string PoolKey(ITunedKernelCandidate<TArgs>[] candidates)
+    // The build these kernels came from. A candidate keeps its id when its kernel changes (#1432: the batched GEMM behind
+    // opencl.conv2d.winograd_f43_gemm got 1.4-1.8x faster under the same id), so a key over the ids alone let every
+    // machine that had tuned keep serving the decision it measured against the old kernel, across upgrades.
+    private static readonly string s_buildIdentity =
+        typeof(TunedKernelSlot<TArgs>).Assembly.ManifestModule.ModuleVersionId.ToString("N");
+
+    private static string PoolKey(ITunedKernelCandidate<TArgs>[] candidates) => PoolKey(candidates, s_buildIdentity);
+
+    // FNV-1a over the build identity and the ordered candidate ids, as 8 hex digits: a short name for the candidate set
+    // as this build implements it.
+    internal static string PoolKey(ITunedKernelCandidate<TArgs>[] candidates, string buildIdentity)
     {
         uint h = 2166136261;
+        foreach (char ch in buildIdentity) { h ^= ch; h *= 16777619; }
+        h ^= '|'; h *= 16777619;
         foreach (var c in candidates)
         {
             foreach (char ch in c.Id) { h ^= ch; h *= 16777619; }
