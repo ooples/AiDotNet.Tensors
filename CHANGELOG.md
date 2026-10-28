@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.144.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.143.0...v0.144.0) (2026-10-28)
+
+
+### Features
+
+* **codegen:** declare the remaining gather/scatter, sparse, index and attention kernels ([#1440](https://github.com/ooples/AiDotNet.Tensors/issues/1440), [#1441](https://github.com/ooples/AiDotNet.Tensors/issues/1441)) ([#1552](https://github.com/ooples/AiDotNet.Tensors/issues/1552)) ([bbaedac](https://github.com/ooples/AiDotNet.Tensors/commit/bbaedaca110d41281055404386f39d84957b3215))
+* **cuda:** attention backward and flash backward as resident-program stages ([#1440](https://github.com/ooples/AiDotNet.Tensors/issues/1440)) ([#1550](https://github.com/ooples/AiDotNet.Tensors/issues/1550)) ([d732ae7](https://github.com/ooples/AiDotNet.Tensors/commit/d732ae71218c5fc837120ce0d03a4fa66f9c416a))
+
+
+### Bug Fixes
+
+* **compiled-gpu:** keep the captured training step on the device for every model ([#1564](https://github.com/ooples/AiDotNet.Tensors/issues/1564)) ([98ecfcd](https://github.com/ooples/AiDotNet.Tensors/commit/98ecfcd1f0209378a369f54fe39e718e3ba7c47d))
+* **compiled:** retiring a replayed graph lands only the step's results ([#1554](https://github.com/ooples/AiDotNet.Tensors/issues/1554)) ([b217eb1](https://github.com/ooples/AiDotNet.Tensors/commit/b217eb14e7d88b94c5e24ee063dd12993e38fb64))
+* five defects (seeding, regex timeouts, culture parsing, swallowed teardown, onnx conversions) ([#1560](https://github.com/ooples/AiDotNet.Tensors/issues/1560)) ([3e576a1](https://github.com/ooples/AiDotNet.Tensors/commit/3e576a10d23231010b038c61b62f89d45b13adcd))
+* **gpu:** fp16 im2col conv writes nchw for batch &gt; 1 ([#1562](https://github.com/ooples/AiDotNet.Tensors/issues/1562)) ([9197575](https://github.com/ooples/AiDotNet.Tensors/commit/919757528cb89da68fab25251271688d2b087b0b))
+* **gpu:** grid-stride batch-derived grid axes past 65535, and keep caller-owned TensorCopy destinations across a tape ([#1567](https://github.com/ooples/AiDotNet.Tensors/issues/1567)) ([767372a](https://github.com/ooples/AiDotNet.Tensors/commit/767372a27ab51b19c7001751cb22451d6c6f7f5e))
+
+
+### Performance
+
+* **cuda:** fp16 accumulation on stock geforce tensor cores - gemm routes, flash attention, rate probe ([#1549](https://github.com/ooples/AiDotNet.Tensors/issues/1549)) ([#1565](https://github.com/ooples/AiDotNet.Tensors/issues/1565)) ([f20fb4d](https://github.com/ooples/AiDotNet.Tensors/commit/f20fb4d92c74e27c3f74bc155c3083dc4989b346))
+* fuse recurrent state gradients and preserve GPU residency ([#1566](https://github.com/ooples/AiDotNet.Tensors/issues/1566)) ([927a99b](https://github.com/ooples/AiDotNet.Tensors/commit/927a99b6f74994cb55b8fd9e7d3907632fc945e1))
+* **gpu:** scatter-add the reduce-max and upsample-3d backwards in one launch ([#1551](https://github.com/ooples/AiDotNet.Tensors/issues/1551)) ([6dba14a](https://github.com/ooples/AiDotNet.Tensors/commit/6dba14a0b4cdef012d888000e5bfc2292d54e275))
+* **streaming:** recycle restore arrays and write back in place (AiDotNet[#2322](https://github.com/ooples/AiDotNet.Tensors/issues/2322)) ([#1548](https://github.com/ooples/AiDotNet.Tensors/issues/1548)) ([bfbca3c](https://github.com/ooples/AiDotNet.Tensors/commit/bfbca3cfe2e68fb7e2fa6d6c04437b19d6a82eb4))
+
 ## [0.143.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.142.0...v0.143.0) (2026-10-26)
 
 
