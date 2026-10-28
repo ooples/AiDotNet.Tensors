@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Regression coverage for TensorAllocator's int→long dim-product fix.
 //
 // Before this fix `Rent` / `RentPinned` accumulated the dim product in
