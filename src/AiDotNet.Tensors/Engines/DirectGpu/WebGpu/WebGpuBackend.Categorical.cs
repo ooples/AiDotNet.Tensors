@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // WebGPU launcher for categorical sampling. Dispatches the WGSL twin of the OpenCL
 // categorical_sample kernel through the same Dispatch2BufferAsync path the other ops use.
 #if NET8_0_OR_GREATER

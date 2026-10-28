@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // WebGPU WGSL compute shader — radix-2 Cooley-Tukey FFT. Matches the Metal/
 // Vulkan peer kernels. One workgroup per batch slice.
 

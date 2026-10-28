@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // WebGPU launcher shims for the parity-210 kernels. Each WGSL source in
 // WebGpuParity210Kernels is a self-contained compute shader (WebGPU
 // compiles one pipeline per source), so each method just plumbs the

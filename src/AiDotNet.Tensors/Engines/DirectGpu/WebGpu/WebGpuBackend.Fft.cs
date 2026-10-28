@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // WebGPU FFT dispatcher — async launcher for WebGpuFftKernels.Fft.
 // Mirrors the Parity210 / Linalg dispatcher style. WebGPU is async-native,
 // so the sync IFftBackend signature can't be satisfied here — callers who

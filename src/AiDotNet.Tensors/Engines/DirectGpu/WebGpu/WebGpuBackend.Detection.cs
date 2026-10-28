@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // WebGPU launcher shims for the vision detection kernels (Issue #217). Each
 // WGSL source in WebGpuDetectionKernels is a self-contained compute shader
 // (one pipeline per source), dispatched 1-D over n*m (IoU) or n (per-box).

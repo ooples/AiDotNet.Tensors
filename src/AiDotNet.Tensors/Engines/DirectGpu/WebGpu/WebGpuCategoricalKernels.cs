@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // WGSL kernel for categorical sampling — the device twin of CpuEngine.TensorCategoricalSample and
 // of the OpenCL/CUDA/HIP/Vulkan/Metal kernels.
 //
