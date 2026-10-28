@@ -450,7 +450,10 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
         var reader = _w.SoleReader(step.OutputBuffer);
         bool foldable = reader?.OpName switch
         {
-            "Conv2D" or "AvgPool2D" => value == 0,
+            "Conv2D" => value == 0,
+            // count_include_pad must hold for the pool's own padding too, or folding would start counting it.
+            "AvgPool2D" => value == 0 && (reader.SavedState is { Length: > 3 } rs && rs[3] is true
+                || reader.SavedState is { Length: > 2 } ps && ps[2] is int[] own && own.All(x => x == 0)),
             "MaxPool2D" => double.IsNegativeInfinity(value) || value <= -3.0e38,
             _ => false,
         };
