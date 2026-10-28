@@ -1112,6 +1112,9 @@ AiDotNet.Tensors.Operators.AbsOperatorDouble.Invoke(System.Runtime.Intrinsics.Ve
 AiDotNet.Tensors.Operators.AbsOperatorFloat.Invoke(System.Runtime.Intrinsics.Vector128<float> x) -> System.Runtime.Intrinsics.Vector128<float>
 AiDotNet.Tensors.Operators.AbsOperatorFloat.Invoke(System.Runtime.Intrinsics.Vector256<float> x) -> System.Runtime.Intrinsics.Vector256<float>
 AiDotNet.Tensors.Operators.AbsOperatorFloat.Invoke(System.Runtime.Intrinsics.Vector512<float> x) -> System.Runtime.Intrinsics.Vector512<float>
+AiDotNet.Tensors.Operators.AcoshOperatorDouble.Invoke(System.Runtime.Intrinsics.Vector128<double> x) -> System.Runtime.Intrinsics.Vector128<double>
+AiDotNet.Tensors.Operators.AcoshOperatorDouble.Invoke(System.Runtime.Intrinsics.Vector256<double> x) -> System.Runtime.Intrinsics.Vector256<double>
+AiDotNet.Tensors.Operators.AcoshOperatorDouble.Invoke(System.Runtime.Intrinsics.Vector512<double> x) -> System.Runtime.Intrinsics.Vector512<double>
 AiDotNet.Tensors.Operators.AcoshOperatorFloat.Invoke(System.Runtime.Intrinsics.Vector128<float> x) -> System.Runtime.Intrinsics.Vector128<float>
 AiDotNet.Tensors.Operators.AcoshOperatorFloat.Invoke(System.Runtime.Intrinsics.Vector256<float> x) -> System.Runtime.Intrinsics.Vector256<float>
 AiDotNet.Tensors.Operators.AcoshOperatorFloat.Invoke(System.Runtime.Intrinsics.Vector512<float> x) -> System.Runtime.Intrinsics.Vector512<float>
@@ -1151,6 +1154,9 @@ AiDotNet.Tensors.Operators.AddOperatorULong.Invoke(System.Runtime.Intrinsics.Vec
 AiDotNet.Tensors.Operators.AddOperatorUShort.Invoke(System.Runtime.Intrinsics.Vector128<ushort> x, System.Runtime.Intrinsics.Vector128<ushort> y) -> System.Runtime.Intrinsics.Vector128<ushort>
 AiDotNet.Tensors.Operators.AddOperatorUShort.Invoke(System.Runtime.Intrinsics.Vector256<ushort> x, System.Runtime.Intrinsics.Vector256<ushort> y) -> System.Runtime.Intrinsics.Vector256<ushort>
 AiDotNet.Tensors.Operators.AddOperatorUShort.Invoke(System.Runtime.Intrinsics.Vector512<ushort> x, System.Runtime.Intrinsics.Vector512<ushort> y) -> System.Runtime.Intrinsics.Vector512<ushort>
+AiDotNet.Tensors.Operators.AsinhOperatorDouble.Invoke(System.Runtime.Intrinsics.Vector128<double> x) -> System.Runtime.Intrinsics.Vector128<double>
+AiDotNet.Tensors.Operators.AsinhOperatorDouble.Invoke(System.Runtime.Intrinsics.Vector256<double> x) -> System.Runtime.Intrinsics.Vector256<double>
+AiDotNet.Tensors.Operators.AsinhOperatorDouble.Invoke(System.Runtime.Intrinsics.Vector512<double> x) -> System.Runtime.Intrinsics.Vector512<double>
 AiDotNet.Tensors.Operators.AsinhOperatorFloat.Invoke(System.Runtime.Intrinsics.Vector128<float> x) -> System.Runtime.Intrinsics.Vector128<float>
 AiDotNet.Tensors.Operators.AsinhOperatorFloat.Invoke(System.Runtime.Intrinsics.Vector256<float> x) -> System.Runtime.Intrinsics.Vector256<float>
 AiDotNet.Tensors.Operators.AsinhOperatorFloat.Invoke(System.Runtime.Intrinsics.Vector512<float> x) -> System.Runtime.Intrinsics.Vector512<float>
@@ -1160,6 +1166,9 @@ AiDotNet.Tensors.Operators.AsinOperatorDouble.Invoke(System.Runtime.Intrinsics.V
 AiDotNet.Tensors.Operators.AsinOperatorFloat.Invoke(System.Runtime.Intrinsics.Vector128<float> x) -> System.Runtime.Intrinsics.Vector128<float>
 AiDotNet.Tensors.Operators.AsinOperatorFloat.Invoke(System.Runtime.Intrinsics.Vector256<float> x) -> System.Runtime.Intrinsics.Vector256<float>
 AiDotNet.Tensors.Operators.AsinOperatorFloat.Invoke(System.Runtime.Intrinsics.Vector512<float> x) -> System.Runtime.Intrinsics.Vector512<float>
+AiDotNet.Tensors.Operators.AtanhOperatorDouble.Invoke(System.Runtime.Intrinsics.Vector128<double> x) -> System.Runtime.Intrinsics.Vector128<double>
+AiDotNet.Tensors.Operators.AtanhOperatorDouble.Invoke(System.Runtime.Intrinsics.Vector256<double> x) -> System.Runtime.Intrinsics.Vector256<double>
+AiDotNet.Tensors.Operators.AtanhOperatorDouble.Invoke(System.Runtime.Intrinsics.Vector512<double> x) -> System.Runtime.Intrinsics.Vector512<double>
 AiDotNet.Tensors.Operators.AtanhOperatorFloat.Invoke(System.Runtime.Intrinsics.Vector128<float> x) -> System.Runtime.Intrinsics.Vector128<float>
 AiDotNet.Tensors.Operators.AtanhOperatorFloat.Invoke(System.Runtime.Intrinsics.Vector256<float> x) -> System.Runtime.Intrinsics.Vector256<float>
 AiDotNet.Tensors.Operators.AtanhOperatorFloat.Invoke(System.Runtime.Intrinsics.Vector512<float> x) -> System.Runtime.Intrinsics.Vector512<float>

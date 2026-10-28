@@ -17483,9 +17483,6 @@ AiDotNet.Tensors.Operators.AbsOperatorFloat.Invoke(float x) -> float
 AiDotNet.Tensors.Operators.AcoshOperatorDouble
 AiDotNet.Tensors.Operators.AcoshOperatorDouble.AcoshOperatorDouble() -> void
 AiDotNet.Tensors.Operators.AcoshOperatorDouble.Invoke(double x) -> double
-AiDotNet.Tensors.Operators.AcoshOperatorDouble.Invoke(System.Runtime.Intrinsics.Vector128<double> x) -> System.Runtime.Intrinsics.Vector128<double>
-AiDotNet.Tensors.Operators.AcoshOperatorDouble.Invoke(System.Runtime.Intrinsics.Vector256<double> x) -> System.Runtime.Intrinsics.Vector256<double>
-AiDotNet.Tensors.Operators.AcoshOperatorDouble.Invoke(System.Runtime.Intrinsics.Vector512<double> x) -> System.Runtime.Intrinsics.Vector512<double>
 AiDotNet.Tensors.Operators.AcoshOperatorFloat
 AiDotNet.Tensors.Operators.AcoshOperatorFloat.AcoshOperatorFloat() -> void
 AiDotNet.Tensors.Operators.AcoshOperatorFloat.Invoke(float x) -> float
@@ -17528,9 +17525,6 @@ AiDotNet.Tensors.Operators.AddOperatorUShort.Invoke(ushort x, ushort y) -> ushor
 AiDotNet.Tensors.Operators.AsinhOperatorDouble
 AiDotNet.Tensors.Operators.AsinhOperatorDouble.AsinhOperatorDouble() -> void
 AiDotNet.Tensors.Operators.AsinhOperatorDouble.Invoke(double x) -> double
-AiDotNet.Tensors.Operators.AsinhOperatorDouble.Invoke(System.Runtime.Intrinsics.Vector128<double> x) -> System.Runtime.Intrinsics.Vector128<double>
-AiDotNet.Tensors.Operators.AsinhOperatorDouble.Invoke(System.Runtime.Intrinsics.Vector256<double> x) -> System.Runtime.Intrinsics.Vector256<double>
-AiDotNet.Tensors.Operators.AsinhOperatorDouble.Invoke(System.Runtime.Intrinsics.Vector512<double> x) -> System.Runtime.Intrinsics.Vector512<double>
 AiDotNet.Tensors.Operators.AsinhOperatorFloat
 AiDotNet.Tensors.Operators.AsinhOperatorFloat.AsinhOperatorFloat() -> void
 AiDotNet.Tensors.Operators.AsinhOperatorFloat.Invoke(float x) -> float
@@ -17543,9 +17537,6 @@ AiDotNet.Tensors.Operators.AsinOperatorFloat.Invoke(float x) -> float
 AiDotNet.Tensors.Operators.AtanhOperatorDouble
 AiDotNet.Tensors.Operators.AtanhOperatorDouble.AtanhOperatorDouble() -> void
 AiDotNet.Tensors.Operators.AtanhOperatorDouble.Invoke(double x) -> double
-AiDotNet.Tensors.Operators.AtanhOperatorDouble.Invoke(System.Runtime.Intrinsics.Vector128<double> x) -> System.Runtime.Intrinsics.Vector128<double>
-AiDotNet.Tensors.Operators.AtanhOperatorDouble.Invoke(System.Runtime.Intrinsics.Vector256<double> x) -> System.Runtime.Intrinsics.Vector256<double>
-AiDotNet.Tensors.Operators.AtanhOperatorDouble.Invoke(System.Runtime.Intrinsics.Vector512<double> x) -> System.Runtime.Intrinsics.Vector512<double>
 AiDotNet.Tensors.Operators.AtanhOperatorFloat
 AiDotNet.Tensors.Operators.AtanhOperatorFloat.AtanhOperatorFloat() -> void
 AiDotNet.Tensors.Operators.AtanhOperatorFloat.Invoke(float x) -> float

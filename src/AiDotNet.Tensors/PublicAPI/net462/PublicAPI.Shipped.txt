@@ -578,25 +578,6 @@ static System.Index.Start.get -> System.Index
 static System.Range.All.get -> System.Range
 static System.Range.EndAt(System.Index end) -> System.Range
 static System.Range.StartAt(System.Index start) -> System.Range
-static System.Runtime.Intrinsics.Vector128.Create(double e0, double e1) -> System.Runtime.Intrinsics.Vector128<double>
-static System.Runtime.Intrinsics.Vector128.Create(float e0, float e1, float e2, float e3) -> System.Runtime.Intrinsics.Vector128<float>
-static System.Runtime.Intrinsics.Vector128.Create<T>(T e0, T e1) -> System.Runtime.Intrinsics.Vector128<T>
-static System.Runtime.Intrinsics.Vector128.Create<T>(T value) -> System.Runtime.Intrinsics.Vector128<T>
-static System.Runtime.Intrinsics.Vector128.GetElement<T>(System.Runtime.Intrinsics.Vector128<T> vector, int index) -> T
-static System.Runtime.Intrinsics.Vector128.IsHardwareAccelerated.get -> bool
-static System.Runtime.Intrinsics.Vector128<T>.Count.get -> int
-static System.Runtime.Intrinsics.Vector256.Create(double e0, double e1, double e2, double e3) -> System.Runtime.Intrinsics.Vector256<double>
-static System.Runtime.Intrinsics.Vector256.Create(float e0, float e1, float e2, float e3, float e4, float e5, float e6, float e7) -> System.Runtime.Intrinsics.Vector256<float>
-static System.Runtime.Intrinsics.Vector256.Create<T>(T value) -> System.Runtime.Intrinsics.Vector256<T>
-static System.Runtime.Intrinsics.Vector256.GetElement<T>(System.Runtime.Intrinsics.Vector256<T> vector, int index) -> T
-static System.Runtime.Intrinsics.Vector256.IsHardwareAccelerated.get -> bool
-static System.Runtime.Intrinsics.Vector256<T>.Count.get -> int
-static System.Runtime.Intrinsics.Vector512.Create(double e0, double e1, double e2, double e3, double e4, double e5, double e6, double e7) -> System.Runtime.Intrinsics.Vector512<double>
-static System.Runtime.Intrinsics.Vector512.Create(float e0, float e1, float e2, float e3, float e4, float e5, float e6, float e7, float e8, float e9, float e10, float e11, float e12, float e13, float e14, float e15) -> System.Runtime.Intrinsics.Vector512<float>
-static System.Runtime.Intrinsics.Vector512.Create<T>(T value) -> System.Runtime.Intrinsics.Vector512<T>
-static System.Runtime.Intrinsics.Vector512.GetElement<T>(System.Runtime.Intrinsics.Vector512<T> vector, int index) -> T
-static System.Runtime.Intrinsics.Vector512.IsHardwareAccelerated.get -> bool
-static System.Runtime.Intrinsics.Vector512<T>.Count.get -> int
 System.Half
 System.Half.CompareTo(object! obj) -> int
 System.Half.CompareTo(System.Half other) -> int
@@ -619,15 +600,3 @@ System.Range.GetOffsetAndLength(int length) -> (int Offset, int Length)
 System.Range.Range() -> void
 System.Range.Range(System.Index start, System.Index end) -> void
 System.Range.Start.get -> System.Index
-System.Runtime.Intrinsics.Vector128
-System.Runtime.Intrinsics.Vector128<T>
-System.Runtime.Intrinsics.Vector128<T>.CopyTo(System.Span<T> destination) -> void
-System.Runtime.Intrinsics.Vector128<T>.Vector128() -> void
-System.Runtime.Intrinsics.Vector256
-System.Runtime.Intrinsics.Vector256<T>
-System.Runtime.Intrinsics.Vector256<T>.CopyTo(System.Span<T> destination) -> void
-System.Runtime.Intrinsics.Vector256<T>.Vector256() -> void
-System.Runtime.Intrinsics.Vector512
-System.Runtime.Intrinsics.Vector512<T>
-System.Runtime.Intrinsics.Vector512<T>.CopyTo(System.Span<T> destination) -> void
-System.Runtime.Intrinsics.Vector512<T>.Vector512() -> void
