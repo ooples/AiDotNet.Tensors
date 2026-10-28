@@ -350,7 +350,7 @@ If CUDA is not available, you'll get detailed troubleshooting steps explaining e
 ## License
 
 AiDotNet.Tensors is licensed under the [Business Source License 1.1](LICENSE) (BSL 1.1),
-with Ooples Finance LLC as Licensor. Its Additional Use Grant allows any non-commercial
+with CrowdTrainer LLC as Licensor. Its Additional Use Grant allows any non-commercial
 use (education, research, personal projects and internal evaluation), and training and
 inference operations are unrestricted regardless of license status. Each version converts
 to the Apache License 2.0 four years after its release. See

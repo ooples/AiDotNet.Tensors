@@ -10,9 +10,9 @@
     <Version>1.0.0-preview</Version>
     <Title>AiDotNet.Tensors.Onnx</Title>
     <Description>ONNX model importer for AiDotNet.Tensors. Parses ONNX protobuf files and produces a compiled inference plan (ICompiledPlan&lt;T&gt;) that runs through the AiDotNet.Tensors fusion + autotune stack. Supports the operator set needed for common image-classification and transformer models (ResNet, BERT, ViT).</Description>
-    <Company>Ooples Finance</Company>
+    <Company>CrowdTrainer LLC</Company>
     <Authors>ooples</Authors>
-    <Copyright>Ooples Finance LLC 2025</Copyright>
+    <Copyright>Copyright (C) 2026 CrowdTrainer LLC</Copyright>
     <PackageProjectUrl>https://github.com/ooples/AiDotNet.Tensors</PackageProjectUrl>
     <RepositoryType>git</RepositoryType>
     <RepositoryUrl>https://github.com/ooples/AiDotNet.Tensors</RepositoryUrl>
