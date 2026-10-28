@@ -143,6 +143,13 @@ internal sealed class ActivationCacheEntry : IDisposable
     /// <summary>The registry (engine) this entry is bound in; a storage's entry slot is shared by all engines.</summary>
     internal object? Owner;
 
+    /// <summary>
+    /// True when the entry holds the device copy of a tensor its caller handed in as a write destination (TensorCopy's
+    /// destination): a tensor the caller owns -- an optimizer moment, say -- not a result an op produced. When that
+    /// write leaves the tensor's only valid copy on the device during a tape, the tape's end must keep its values
+    /// (materialize, then free) rather than release it as a dead step intermediate.
+    /// </summary>
+    public bool HostOrigin { get; internal set; }
     // 5-arg overload preserved for reflection-based callers (test helpers like
     // EvictActivationsCreatedAfterLifetimeTests.GetActivationCacheEntryCtor
     // resolve ctors by exact-arity signature, which doesn't honor C# default
@@ -2451,6 +2458,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         _activationCache.TryAdd(cacheKey, entry);
     }
 
+    /// <summary>
+    /// Records that <paramref name="destination"/>'s device copy holds a tensor its caller owns (a write destination
+    /// it handed in), so a tape ending while that copy is the only valid one keeps its values. See
+    /// <see cref="ActivationCacheEntry.HostOrigin"/>.
+    /// </summary>
+    private void MarkCallerOwnedDestination<T>(Tensor<T> destination)
+    {
+        lock (_activationCacheLock)
+        {
+            if (destination.GetBackingArrayForCacheLookupUnsafe() is { } array && _activationCache.TryGetValue(array, out var byArray))
+                byArray.HostOrigin = true;
+            if (_activationCache.TryGetValue(destination.DataVector, out var byVector))
+                byVector.HostOrigin = true;
+        }
+    }
+
     private void RemoveActivationCacheEntry(object cacheKey)
     {
         ActivationCacheEntry? removed = null;
@@ -2489,7 +2512,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 cuda.ConvertToFp16(e.Buffer, fp16, elementCount);
             }
             catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TryCompressActivationFp16ByKey", capabilityGap); return false; }
-            _activationCache[key] = new ActivationCacheEntry(fp16, e.Shape, e.Timestamp, e.Backend, managedBytes: e.ManagedBytes, isFp16: true, elementCount: elementCount, hostVersion: e.HostVersion);
+            _activationCache[key] = new ActivationCacheEntry(fp16, e.Shape, e.Timestamp, e.Backend, managedBytes: e.ManagedBytes, isFp16: true, elementCount: elementCount, hostVersion: e.HostVersion) { HostOrigin = e.HostOrigin };
             old = e;
         }
         if (old is not null && old.Backend is IQueuedBufferRelease c) c.ReleaseAfterQueuedWork(old.Buffer);
@@ -2543,7 +2566,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
             catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TryUpcastActivationFp32ByKey", capabilityGap); return false; }
             // Same ManagedBytes carry-through as the FP16 compress swap above.
-            _activationCache[key] = new ActivationCacheEntry(fp32, e.Shape, e.Timestamp, e.Backend, managedBytes: e.ManagedBytes, isFp16: false, elementCount: e.ElementCount, hostVersion: e.HostVersion);
+            _activationCache[key] = new ActivationCacheEntry(fp32, e.Shape, e.Timestamp, e.Backend, managedBytes: e.ManagedBytes, isFp16: false, elementCount: e.ElementCount, hostVersion: e.HostVersion) { HostOrigin = e.HostOrigin };
             old = e;
         }
         if (old is not null && old.Backend is IQueuedBufferRelease c) c.ReleaseAfterQueuedWork(old.Buffer);
@@ -2819,7 +2842,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 {
                     if (Helpers.HostSync.IsPending(entries[i].Key))
                     {
-                        switch (mode)
+                        // A caller-owned host tensor written in place on the device during the step (an optimizer
+                        // moment, a parameter) is neither a step intermediate nor scratch: keep its values, as the
+                        // safe path does, whichever mode the caller asked for.
+                        var effectiveMode = entry.HostOrigin ? ActivationReleaseMode.MaterializeThenFree : mode;
+                        switch (effectiveMode)
                         {
                             case ActivationReleaseMode.MaterializeThenFree:
                                 // #226 safe path: flush the pending DtoH so a later CPU read still sees correct data.
@@ -22789,6 +22816,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 BindResidentBuffer(destination, destinationBuffer, backend);
                 // Invalidate CPU-derived weight packs without invoking the host-write GPU re-upload path.
                 base.InvalidatePersistentTensor(destination);
+                MarkCallerOwnedDestination(destination);
                 return;
             }
             catch (NotSupportedException ex) {

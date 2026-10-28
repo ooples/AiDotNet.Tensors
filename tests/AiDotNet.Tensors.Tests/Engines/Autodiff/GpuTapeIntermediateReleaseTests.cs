@@ -217,6 +217,39 @@ public sealed class GpuTapeIntermediateReleaseTests : IClassFixture<DirectGpuTen
             Assert.True(Math.Abs(g[i] - expected[i]) < 1e-3f, $"dL/dw[{i}] ten tapes later: gpu {g[i]} cpu {expected[i]}");
     }
     [SkippableFact]
+    public void AHostTensorWrittenOnTheDeviceDuringTheTape_KeepsItsValuesAfterIt()
+    {
+        // An eager optimizer keeps its moments in host tensors it owns and updates them with engine ops inside the
+        // training step's tape: m = beta1 * m + (1 - beta1) * g, written back with TensorCopy(mNew, m). That write
+        // leaves m's only valid copy on the device, and the tape's end freed it as a dead step intermediate, so the
+        // next step's read of m threw (MobileNetV2 trained on CUDA failed at its second step). A tensor the caller
+        // owns is not an intermediate, whatever wrote it.
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        IEngine gpu = _fixture.Engine!;
+        var w = Rand(new[] { 32, 48 }, 2);
+        var x = Rand(new[] { 64, 32 }, 3);
+        var moment = new Tensor<float>(new[] { 32, 48 });
+        float[] expectedMoment;
+        using (var tape = new GradientTape<float>())
+        {
+            var (_, _, loss) = Forward(gpu, x, w);
+            var grad = tape.ComputeGradients(loss, new[] { w })[w];
+            expectedMoment = grad.ToArray().Select(v => 0.1f * v).ToArray();
+            var updated = gpu.TensorAdd(gpu.TensorMultiplyScalar(moment, 0.9f), gpu.TensorMultiplyScalar(grad, 0.1f));
+            gpu.TensorCopy(updated, moment);
+        }
+
+        var values = moment.ToArray();
+        for (int i = 0; i < values.Length; i++)
+            Assert.True(Math.Abs(values[i] - expectedMoment[i]) < 1e-5f, $"moment[{i}] after the tape: {values[i]} vs {expectedMoment[i]}");
+
+        // And it keeps working as the next step's input.
+        var next = gpu.TensorMultiplyScalar(moment, 2f).ToArray();
+        for (int i = 0; i < next.Length; i++)
+            Assert.True(Math.Abs(next[i] - 2 * expectedMoment[i]) < 1e-5f, $"2 * moment[{i}]: {next[i]}");
+    }
+
+    [SkippableFact]
     public void SharedGradientContribution_IsCopiedOnTheDevice()
     {
         // z = x + y hands the SAME upstream gradient to x and to y; the second destination gets its own copy. That
