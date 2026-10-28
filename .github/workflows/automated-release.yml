@@ -315,6 +315,7 @@ jobs:
           mkdir -p sbom
           "$RUNNER_TEMP/cyclonedx/dotnet-CycloneDX" src/AiDotNet.Tensors/AiDotNet.Tensors.csproj \
             --configuration Release \
+            --disable-package-restore \
             --output sbom \
             --filename "AiDotNet.Tensors.${PACKAGE_VERSION}.cdx.json" \
             --output-format Json \
@@ -369,6 +370,11 @@ jobs:
           Write-Host "Packing version $VERSION"
 
           New-Item -ItemType Directory -Force -Path out | Out-Null
+
+          # Every committed native binary must match its package's NATIVE-MANIFEST.json (version,
+          # licence, SHA-256) before anything is packed. CUDA is staged below and verified by
+          # tools/pack-cuda-split.ps1 against the manifest tools/stage-cuda-redist.ps1 writes.
+          & ./tools/Test-NativeManifest.ps1
 
           # Pack main package
           if (Test-Path "src/AiDotNet.Tensors/AiDotNet.Tensors.csproj") {

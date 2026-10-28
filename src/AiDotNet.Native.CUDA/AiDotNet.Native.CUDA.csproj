@@ -37,6 +37,12 @@
     <None Include="runtimes\**\*.dll" CopyToOutputDirectory="PreserveNewest" Link="%(RecursiveDir)%(Filename)%(Extension)" />
   </ItemGroup>
 
+  <!-- NVIDIA's licence for the redistributed runtime. tools/pack-cuda-split.ps1 packs it, together with the
+       NATIVE-MANIFEST.json that tools/stage-cuda-redist.ps1 generates, into the meta and fragment packages. -->
+  <ItemGroup>
+    <None Include="LICENSE.CUDA.txt" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
   <!-- Build targets to copy native library -->
   <ItemGroup>
     <None Include="build\AiDotNet.Native.CUDA.targets" Pack="true" PackagePath="build" />

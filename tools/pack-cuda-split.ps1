@@ -10,9 +10,15 @@
   TorchSharp uses to ship its multi-GB CUDA runtime through nuget.org.
 
   Layout produced (all under the 250 MB limit, all pushed to nuget.org):
-    AiDotNet.Native.CUDA               - meta package: build/.targets + manifest, NO dlls,
+    AiDotNet.Native.CUDA               - meta package: build/.targets + chunk manifest, NO dlls,
+                                         plus LICENSE.CUDA.txt and NATIVE-MANIFEST.json;
                                          depends on every fragment package below.
-    AiDotNet.Native.CUDA.Fragments.N   - one ~ChunkMiB byte-chunk of one native DLL each.
+    AiDotNet.Native.CUDA.Fragments.N   - one ~ChunkMiB byte-chunk of one native DLL each,
+                                         plus LICENSE.CUDA.txt.
+
+  Before splitting, tools/Test-NativeManifest.ps1 checks the staged DLLs against the
+  NATIVE-MANIFEST.json that tools/stage-cuda-redist.ps1 wrote, so a stale or partial
+  staging cannot be packed.
 
   At the CONSUMER'S build, the .targets in the meta package reassembles each DLL from its
   ordered chunks (restored via the fragment dependencies) into the build output, on
@@ -47,6 +53,20 @@ $dlls = Get-ChildItem $NativeDir -Filter *.dll -ErrorAction SilentlyContinue | S
 if (-not $dlls -or $dlls.Count -eq 0) {
     throw "No CUDA DLLs found in $NativeDir - run tools/stage-cuda-redist.ps1 first."
 }
+
+# Upstream licence and the per-file inventory both ship with the package.
+$licensePath = Join-Path $cudaProjDir "LICENSE.CUDA.txt"
+$nativeManifestPath = Join-Path $cudaProjDir "NATIVE-MANIFEST.json"
+if (-not (Test-Path -LiteralPath $licensePath)) { throw "Missing $licensePath" }
+if (-not (Test-Path -LiteralPath $nativeManifestPath)) {
+    throw "Missing $nativeManifestPath - run tools/stage-cuda-redist.ps1, which writes it while staging."
+}
+# The inventory describes the package's runtimes dir, so it can only vouch for that layout.
+$defaultNativeDir = [System.IO.Path]::GetFullPath((Join-Path $cudaProjDir "runtimes/win-x64/native"))
+if ([System.IO.Path]::GetFullPath($NativeDir).TrimEnd([char]'\', [char]'/') -ne $defaultNativeDir.TrimEnd([char]'\', [char]'/')) {
+    throw "-NativeDir must be the package's runtimes/win-x64/native folder so NATIVE-MANIFEST.json can be verified."
+}
+& (Join-Path $PSScriptRoot "Test-NativeManifest.ps1") -Package AiDotNet.Native.CUDA
 
 # ── 1. Split each DLL into <=ChunkMiB chunks (streamed, never loads a whole DLL) ──────
 $manifestLines = @()       # "<dll>|<totalBytes>|<chunkCount>"
@@ -114,6 +134,7 @@ foreach ($chunkName in $chunkNames) {
   </PropertyGroup>
   <ItemGroup>
     <None Include="$chunkAbs" Pack="true" PackagePath="cuda-fragments/$chunkName" />
+    <None Include="$licensePath" Pack="true" PackagePath="LICENSE.CUDA.txt" />
   </ItemGroup>
 </Project>
 "@ | Set-Content -Path (Join-Path $fragProjDir "$fragId.csproj") -Encoding UTF8
@@ -148,6 +169,8 @@ New-Item -ItemType Directory -Force -Path $metaProjDir | Out-Null
   <ItemGroup>
     <None Include="$buildDir/AiDotNet.Native.CUDA.targets" Pack="true" PackagePath="build/AiDotNet.Native.CUDA.targets" />
     <None Include="$manifestPath" Pack="true" PackagePath="build/cuda-fragments.manifest" />
+    <None Include="$licensePath" Pack="true" PackagePath="LICENSE.CUDA.txt" />
+    <None Include="$nativeManifestPath" Pack="true" PackagePath="NATIVE-MANIFEST.json" />
   </ItemGroup>
   <ItemGroup>
 $depXml
