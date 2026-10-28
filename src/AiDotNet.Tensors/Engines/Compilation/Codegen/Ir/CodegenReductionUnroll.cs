@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Partial unrolling of a long reduction (#1441): the spec's single reduction axis i (extent E = U * E') becomes an outer
 // axis io (extent E', in i's place) and an inner axis ii (extent U, appended last), every index term c * i rewritten as
 // c * U * io + c * ii. The emitter then peels io into a run-time loop and unrolls ii, so each loop trip issues U

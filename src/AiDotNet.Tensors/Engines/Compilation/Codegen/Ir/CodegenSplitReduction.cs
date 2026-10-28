@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Split a reduction across blocks, so parallelism can come from the reduction.
 //
 // The emitter maps parallel axes to threads and reduction axes to loops, always. When

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The declared normalisation programs in the EXACT contract of the hand-written backend kernels they replace
 // (#890 phase 4a), so a backend can route an existing call to them with no change to its callers.
 //

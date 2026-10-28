@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // AVX-512 hand-emitted intrinsic kernel emitter — Phase B for issue #225.
 //
 // Companion to CpuDotNetJitEmitter. Where the JIT emitter relies on
