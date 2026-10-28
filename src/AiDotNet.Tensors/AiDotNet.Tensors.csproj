@@ -27,7 +27,7 @@
     <RepositoryType>git</RepositoryType>
     <RepositoryUrl>https://github.com/ooples/AiDotNet.Tensors</RepositoryUrl>
     <PackageTags>tensors; simd; vectorization; linear-algebra; matrix; vector; performance; net471; net10; avx2; avx512; gpu</PackageTags>
-    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageLicenseFile>LICENSE</PackageLicenseFile>
     <PackageRequireLicenseAcceptance>True</PackageRequireLicenseAcceptance>
     <LangVersion>latest</LangVersion>
     <EvolutionProjectPath Condition="'$(EvolutionProjectPath)' == ''">$(MSBuildProjectDirectory)\..\..\..\AiDotNet.Evolution\src\AiDotNet.Evolution\AiDotNet.Evolution.csproj</EvolutionProjectPath>
@@ -101,6 +101,14 @@
       <PackagePath>\</PackagePath>
     </None>
     <None Include="..\..\README.md">
+      <Pack>True</Pack>
+      <PackagePath>\</PackagePath>
+    </None>
+    <None Include="..\..\LICENSE">
+      <Pack>True</Pack>
+      <PackagePath>\</PackagePath>
+    </None>
+    <None Include="..\..\THIRD-PARTY-NOTICES.txt">
       <Pack>True</Pack>
       <PackagePath>\</PackagePath>
     </None>
