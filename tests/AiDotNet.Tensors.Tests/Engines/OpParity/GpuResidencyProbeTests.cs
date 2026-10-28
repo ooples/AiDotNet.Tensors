@@ -106,6 +106,7 @@ public sealed class GpuResidencyProbeTests
             long internalReadbacks;
             long internalReadbackBytes;
             string[] internalReadbackSites;
+            string[] fallbacksDuringOp;
             try
             {
                 using var result = op.RunFloat(gpu);
@@ -113,6 +114,7 @@ public sealed class GpuResidencyProbeTests
                 internalReadbacks = GpuLaunchProbe.Readbacks;
                 internalReadbackBytes = GpuLaunchProbe.ReadbackBytes;
                 internalReadbackSites = GpuLaunchProbe.ReadbackSites;
+                fallbacksDuringOp = GpuLaunchProbe.Fallbacks;
                 _ = result.ToArray();
             }
             catch (Exception ex)
@@ -135,7 +137,10 @@ public sealed class GpuResidencyProbeTests
             }
             Assert.True(op.GpuMinimumKernelLaunches > 0,
                 $"{op.Name} has an invalid minimum GPU kernel launch count: {op.GpuMinimumKernelLaunches}.");
-            if (launches >= op.GpuMinimumKernelLaunches) { covered.Add(op.Name); continue; }
+            // Launches alone do not prove the op ran on the device: setup work (a state copy, a layout upload) launches too,
+            // and an override that caught a capability gap and returned the CPU result still made them. An op that reported
+            // a fallback is not covered, whatever it launched.
+            if (launches >= op.GpuMinimumKernelLaunches && fallbacksDuringOp.Length == 0) { covered.Add(op.Name); continue; }
             if (op.GpuProbeExpectation == GpuProbeExpectation.MetadataOnly)
             {
                 metadata.Add($"{op.Name}\t{op.Category}");
@@ -145,9 +150,9 @@ public sealed class GpuResidencyProbeTests
             // override — its device path was declined by a guard or threw and got swallowed by a
             // `catch { return base.Op(...); }`. GpuLaunchProbe.Fallbacks carries that reason when the
             // override is instrumented; without it the worklist says "launches 0/1" and stops there.
-            string reasons = GpuLaunchProbe.Fallbacks.Length == 0
+            string reasons = fallbacksDuringOp.Length == 0
                 ? string.Empty
-                : "\t" + string.Join(" | ", GpuLaunchProbe.Fallbacks);
+                : "\t" + string.Join(" | ", fallbacksDuringOp);
             fallback.Add($"{op.Name}\t{op.Category}\tlaunches {launches}/{op.GpuMinimumKernelLaunches}{reasons}");
             if (GpuLaunchProbe.KernelMisses > 0)
                 hollow.Add($"{op.Name}\t{op.Category}\tmissing-kernel: {string.Join(",", GpuLaunchProbe.MissedKernelNames)}");

@@ -221,7 +221,13 @@ public sealed class GruSequenceTests
         var gD = TapeGradients(cpu, wd, projD, resetAfter);
         var gF = TapeGradients(cpu, wf, F(projD), resetAfter);
         foreach (var name in gD.Keys)
+        {
             Assert.True(Cosine(gD[name], gF[name]) >= 0.99999, $"{name}: float-path gradient cosine {Cosine(gD[name], gF[name])}.");
+            // Element-wise too: a cosine of 1 accepts any uniform scale error (a doubled bias gradient, a missing r factor).
+            for (int i = 0; i < gD[name].Length; i++)
+                Assert.True(Math.Abs(gD[name][i] - gF[name][i]) <= 1e-4 + 1e-3 * Math.Abs(gD[name][i]),
+                    $"{name}[{i}]: double {gD[name][i]}, float {gF[name][i]}.");
+        }
     }
 
     private static DirectGpuTensorEngine? TryGpu()

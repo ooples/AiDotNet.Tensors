@@ -58,7 +58,8 @@ public sealed class PyTorchGruParityTests
             }));
             var psi = new ProcessStartInfo(HeadToHeadNetworkHarness.PythonExecutable)
             {
-                RedirectStandardError = true, RedirectStandardOutput = true, UseShellExecute = false,
+                // stdout is not read (the result is a file), so it is not redirected: an unread pipe that fills blocks the child.
+                RedirectStandardError = true, RedirectStandardOutput = false, UseShellExecute = false,
             };
             foreach (var a in new[] { script, casePath, resultPath, "--dtype", dtype }) psi.ArgumentList.Add(a);
             Process? p;
@@ -67,8 +68,14 @@ public sealed class PyTorchGruParityTests
             if (p is null) { skipReason = "python did not start."; return null; }
             using (p)
             {
-                string err = p.StandardError.ReadToEnd();
-                p.WaitForExit(120_000);
+                // Read stderr while waiting: reading it to the end first would never return from a child that hangs.
+                var errRead = p.StandardError.ReadToEndAsync();
+                if (!p.WaitForExit(120_000))
+                {
+                    try { p.Kill(); } catch (InvalidOperationException) { }   // it exited between the wait and the kill
+                    throw new TimeoutException($"{script} did not finish within 120 s.");
+                }
+                string err = errRead.GetAwaiter().GetResult();
                 if (p.ExitCode != 0)
                 {
                     skipReason = err.Contains("No module named 'torch'", StringComparison.Ordinal)
