@@ -116,6 +116,28 @@ public sealed class DeviceMemoryReclaimTests
         }
     }
 
+    [Fact]
+    public void StepBoundary_SkipsTheCollection_WhenOwnersDisposedWhatWasHandedOut()
+    {
+        // A TensorScope ending an inference call disposes its intermediates: they are back in the pool and credited, so
+        // the collection their allocation asked for would recover nothing (#1432: it ran on every ResNet-50 predict).
+        DeviceMemoryReclaim.ResetCountsForTests();
+        DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectAfterDeviceBytes);
+        Assert.True(DeviceMemoryReclaim.CollectionDue);
+        DeviceMemoryReclaim.OnDeviceRelease(DeviceMemoryReclaim.CollectAfterDeviceBytes);
+        Assert.False(DeviceMemoryReclaim.CollectIfDueAtStepBoundary());
+        Assert.False(DeviceMemoryReclaim.CollectionDue);
+    }
+
+    [Fact]
+    public void StepBoundary_Collects_WhenAbandonedBytesRemainPastTheThreshold()
+    {
+        DeviceMemoryReclaim.ResetCountsForTests();
+        DeviceMemoryReclaim.OnDeviceAllocation(2 * DeviceMemoryReclaim.CollectAfterDeviceBytes);
+        DeviceMemoryReclaim.OnDeviceRelease(DeviceMemoryReclaim.CollectAfterDeviceBytes / 2);   // some disposed, most abandoned
+        Assert.True(DeviceMemoryReclaim.CollectIfDueAtStepBoundary());
+        Assert.False(DeviceMemoryReclaim.CollectionDue);
+    }
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static void AbandonBuffer(IDirectGpuBackend backend) => backend.AllocateBuffer(1024);
 
