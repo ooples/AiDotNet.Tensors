@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // OpenCL launcher shims for the vision-detection kernels (Issue #217).
 // Mirrors OpenClBackend.Parity210.cs's pattern: each method pulls the
 // compiled DirectOpenClKernel from _kernelCache and dispatches via

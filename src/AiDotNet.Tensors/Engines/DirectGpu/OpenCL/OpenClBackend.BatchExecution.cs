@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // OpenCL IGpuBatchExecution (#1142, #916). The fused kernels were compiled but never reachable; this wires them.
 using AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels;
 
