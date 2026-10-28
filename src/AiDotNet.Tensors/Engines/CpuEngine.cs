@@ -27093,7 +27093,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsInferenceTrace)
         {
-            Tensor<T>[] outputs = CaptureInferenceKernelOutputs(
+            Tensor<T>[] outputs = CaptureInferenceKernelOutputsWithState(
                 new[] { input, gamma, beta },
                 engine =>
                 {
