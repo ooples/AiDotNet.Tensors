@@ -1,6 +1,6 @@
 using System.Runtime.CompilerServices;
 using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 
 #if NET5_0_OR_GREATER
 using System;

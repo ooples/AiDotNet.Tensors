@@ -1,6 +1,6 @@
 using System.Runtime.CompilerServices;
 using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Tensors#401 / AiDotNet#1349: per-row-scaled INT8 weight-only GEMM.
 //
 // The existing SgemmWithInt8CachedB computes a per-tensor symmetric scale
