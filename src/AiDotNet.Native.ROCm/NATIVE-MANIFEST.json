@@ -41,7 +41,7 @@
       "name": "HIP runtime for Windows (amdhip64)",
       "supplier": "Advanced Micro Devices, Inc.",
       "version": "6.4 (file version 10.0.3652.0)",
-      "license": "Proprietary: the AMD HIP SDK for Windows licence agreement. The Windows HIP runtime is closed source (unlike the MIT-licensed Linux HIP/CLR runtime). Its licence is shown by the HIP SDK installer and is not published as a downloadable text, so no licence file is bundled for it.",
+      "license": "Proprietary: the AMD HIP SDK for Windows licence agreement. The Windows HIP runtime is closed source (unlike the MIT-licensed Linux HIP/CLR runtime). Its licence is shown by the HIP SDK installer and is not published as a downloadable text, so its text is not bundled; the package licence file LICENSE.txt names this binary, its version and SHA-256, and where AMD shows the licence.",
       "licenseFile": null,
       "upstream": "https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html",
       "provenance": "The DLL's version resource reads ProductName \"amdhip64 6.4 AMD-APP.dbg (3652.0)\", FileVersion 10.0.3652.0.",

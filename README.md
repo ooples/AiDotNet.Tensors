@@ -75,8 +75,14 @@ Each `AiDotNet.Native.*` package carries the upstream licence text of what it
 redistributes and a `NATIVE-MANIFEST.json` listing the upstream version, licence and
 SHA-256 of every native file. The one exception is the Windows HIP runtime in
 `AiDotNet.Native.ROCm` (`amdhip64_6.dll`): it is closed source under AMD's HIP SDK
-licence, which AMD does not publish as a text file, so its manifest entry names the
-licence but no licence file is bundled.
+licence, which AMD does not publish as a text file, so its text is not bundled; the
+package's `LICENSE.txt` names the binary, its version and SHA-256, and where AMD shows
+the licence.
+
+The NuGet licence of each `AiDotNet.Native.*` GPU package (`CUDA`, its
+`CUDA.Fragments.N` packages, and `ROCm`) is that bundled `LICENSE.txt`, not this
+repository's licence, because the binaries are NVIDIA's and AMD's. Only the packaging
+glue (MSBuild targets and scripts) is under this repository's licence.
 
 `AiDotNet.Tensors.Gpu`, `AiDotNet.Tensors.Onnx`, `AiDotNet.Tensors.Cli` and
 `AiDotNet.Tensors.Analyzers` are built from this repository but are **not** published

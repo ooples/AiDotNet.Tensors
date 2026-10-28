@@ -8,7 +8,9 @@
     <Company>AiDotNet</Company>
     <Description>Native AMD ROCm binaries (rocBLAS + MIOpen) for GPU-accelerated deep learning on AMD GPUs. Provides assembly-tuned GEMM (rocBLAS) achieving 60-80% peak TFLOPS, and optimized convolution/normalization/pooling/attention primitives (MIOpen). Install this package alongside AiDotNet.Tensors for automatic AMD GPU acceleration via HIP.</Description>
     <PackageTags>rocm;rocblas;miopen;hip;amd;gpu;blas;deep-learning;native</PackageTags>
-    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <!-- The binaries are AMD's (MIT rocBLAS/hipBLAS and the proprietary Windows HIP runtime), not ours, so the
+         package declares a licence file that names each one rather than an SPDX expression. -->
+    <PackageLicenseFile>LICENSE.txt</PackageLicenseFile>
     <PackageProjectUrl>https://github.com/ooples/AiDotNet.Tensors</PackageProjectUrl>
     <RepositoryUrl>https://github.com/ooples/AiDotNet.Tensors</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
@@ -40,6 +42,7 @@
        native file. No Exists() condition: a missing file must fail the pack, not ship a package
        without its licence. -->
   <ItemGroup>
+    <None Include="LICENSE.txt" Pack="true" PackagePath="\" />
     <None Include="LICENSE.rocBLAS.txt" Pack="true" PackagePath="\" />
     <None Include="LICENSE.hipBLAS.txt" Pack="true" PackagePath="\" />
     <None Include="NATIVE-MANIFEST.json" Pack="true" PackagePath="\" />

@@ -7,6 +7,7 @@
   version, licence and SHA-256 of each one. This check fails when:
     - a manifest is missing, malformed, or names a different package;
     - a component has no name, version or licence, or names a licence file that does not exist;
+    - a component has no licence file and the package's LICENSE.txt does not name its files by SHA-256;
     - a listed file is missing, or its size or SHA-256 differs from the manifest;
     - a file under runtimes/ is not listed (a binary would ship without an inventory entry);
     - the same file is listed twice.
@@ -77,6 +78,17 @@ foreach ($dir in $dirs) {
         }
         $files = @($component.files)
         if ($files.Count -eq 0) { $failures.Add("$label lists no files.") }
+        # A component whose licence text cannot be bundled is described in the package licence file instead
+        # (LICENSE.txt), which must name each of its files by SHA-256 so a replaced binary cannot keep a stale entry.
+        if (-not [string]$component.licenseFile) {
+            $statementPath = Join-Path $dir.FullName "LICENSE.txt"
+            $statement = if (Test-Path -LiteralPath $statementPath) { Get-Content -LiteralPath $statementPath -Raw } else { "" }
+            foreach ($entry in $files) {
+                if (-not $statement.Contains(([string]$entry.sha256).ToLowerInvariant())) {
+                    $failures.Add("$label has no licence file, and LICENSE.txt does not name '$($entry.path)' by its SHA-256.")
+                }
+            }
+        }
         foreach ($entry in $files) {
             $rel = [string]$entry.path
             if (-not $listed.Add($rel)) { $failures.Add("$label '$rel' is listed more than once."); continue }
