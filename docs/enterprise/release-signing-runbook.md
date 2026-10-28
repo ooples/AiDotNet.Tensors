@@ -1,7 +1,7 @@
 # Enterprise licensing — activation runbook (operator)
 
 The code is shipped and inert-by-default. This runbook is the **operator checklist**
-to turn each layer on. Everything here is done **once** by Ooples in a secure
+to turn each layer on. Everything here is done **once** by CrowdTrainer LLC in a secure
 environment; none of it can (or should) be automated by a code change, because it
 involves secrets and CA-issued certificates.
 

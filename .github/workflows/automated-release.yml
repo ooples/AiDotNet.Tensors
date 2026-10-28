@@ -436,7 +436,7 @@ jobs:
           Write-Host "=== Packages created ==="
           Get-ChildItem out/
 
-      # Code-signs every .nupkg with the Ooples code-signing certificate so a
+      # Code-signs every .nupkg with the CrowdTrainer LLC code-signing certificate so a
       # tampered/repacked package fails NuGet signature verification (real
       # tamper-evidence — see docs/enterprise/licensing-security-model.md). This
       # is a NO-OP when the cert secrets are absent (forks, PRs, or before the
