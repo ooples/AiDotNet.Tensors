@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // #1630 / #91: CUDA Graph INFERENCE capture (counterpart to GraphedTrainingStep). The argument
 // guards + state machine all fire BEFORE any GPU call, so they're host-agnostic and covered here
 // via a DispatchProxy mock backend (gated to non-Framework — DispatchProxy is .NET Core 5+, same

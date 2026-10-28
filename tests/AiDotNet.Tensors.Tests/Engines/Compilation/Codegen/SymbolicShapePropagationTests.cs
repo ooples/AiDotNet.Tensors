@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Constraint propagation tests for issue #225 dynamic-shapes section.
 
 #nullable disable

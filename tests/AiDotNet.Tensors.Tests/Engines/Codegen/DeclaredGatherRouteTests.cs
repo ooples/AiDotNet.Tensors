@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Gather and deterministic scatter (#890 phase 4e): Embedding / Gather run the declared lookup
 // (CodegenBackendPrograms.Embedding), and the deterministic EmbeddingBackward and ScatterAdd run the sorted kernels
 // (CudaSortedScatterKernels). A gather copies and the sorted scatter makes the same additions in the same order, so

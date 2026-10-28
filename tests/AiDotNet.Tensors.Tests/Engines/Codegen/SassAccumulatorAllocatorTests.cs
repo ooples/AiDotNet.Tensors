@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The own SASS backend's accumulator allocator (#1442). No device and no toolkit: the instructions are built with the
 // measured bit model, and what is checked is what the allocator promises -- that re-pairing is the only renaming that
 // can move a mod-2 bank conflict at all, that the map it emits keeps every accumulator zeroed, and that the strict

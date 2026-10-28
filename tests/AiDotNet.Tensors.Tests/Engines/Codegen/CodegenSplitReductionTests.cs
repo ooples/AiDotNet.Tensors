@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Splitting a reduction must not change the answer.
 //
 // The split exists because depthwise_conv2d_3x3_bwd_weights ran 4052.6 us against a

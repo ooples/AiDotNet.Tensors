@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Phase F of issue #225: CUDA Graph training capture. Tests cover
 // the state-machine plumbing + options on every platform; actual
 // CUDA-level capture/replay requires an NVIDIA GPU and is

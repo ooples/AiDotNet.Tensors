@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The tiled implicit-GEMM lowering (#890 phase 4b): which axes become M, N and the batch slices,
 // what it refuses, the structure of the kernel it emits, and -- on device -- every tile shape
 // against the fp64 interpreter on ragged tiles and a partial reduction chunk.

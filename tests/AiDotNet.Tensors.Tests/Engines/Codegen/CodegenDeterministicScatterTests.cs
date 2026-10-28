@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The deterministic scatter-add as a declared program (#890 phase 4e). #890's determinism gap is that a scatter
 // accumulates through an atomic float add, which sums in arrival order; these tests hold the program to the summation
 // order the repo's deterministic kernels promise (increasing source index) AND assert that no atomic is emitted, since

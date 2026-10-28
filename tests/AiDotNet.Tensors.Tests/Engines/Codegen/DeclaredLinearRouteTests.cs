@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The declared linear-layer route (#890 phase 4c): CudaBackend.FusedLinear{ReLU,Sigmoid,Tanh,GELU,Swish} and their
 // backwards are served by declared programs in the hand-written kernels' contract. Both routes -- declared, and the
 // hand-written kernels with the switch off -- are checked against an fp64 reference written out here.

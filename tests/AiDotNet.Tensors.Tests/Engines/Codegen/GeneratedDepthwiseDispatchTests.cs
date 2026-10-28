@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The generated depthwise kernel is reachable from the backend, and agrees with the
 // kernel it replaces.
 //

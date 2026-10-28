@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The production gate for declared programs is not the development gate.
 //
 // HasCodegenConveyor's own documentation calls itself "a development gate, not a promotion:

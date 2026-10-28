@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The index family as declared programs (#1441) on the fp64 interpreter: index write / copy / fill (last index wins),
 // index add, scatter reduce (sum, max, min), int32 take-along-dim and float-id gathers, against the kernels' loops.
 
