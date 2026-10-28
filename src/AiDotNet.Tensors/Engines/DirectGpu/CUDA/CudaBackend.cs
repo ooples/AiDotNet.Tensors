@@ -600,6 +600,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public CudaBackend(int deviceIndex)
     {
+        DeviceOrdinal = deviceIndex;
         _kernelCache = new ConcurrentDictionary<string, IntPtr>(StringComparer.Ordinal);
         // Resolve explicit configuration before native probing or the availability fallback. A
         // misspelled policy is a caller error, not evidence that CUDA is unavailable, and must not
