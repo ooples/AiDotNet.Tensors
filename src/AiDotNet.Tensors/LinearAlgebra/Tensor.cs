@@ -3751,7 +3751,22 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         tensor._gpuBufferContainsRawInt32 = bufferContainsRawInt32;
         tensor._gpuBufferContainsRawInt64 = bufferContainsRawInt64;
         if (ownsBuffer)
+        {
             tensor._storage.AttachGpuBufferOwner(buffer);
+            // Inside a TensorScope an owned result is freed when the scope ends unless kept (#1432). A later read throws
+            // the released-intermediate error instead of downloading a recycled buffer.
+            if (Engines.TensorScope.Current is not null)
+            {
+                var scopedVector = tensor.DataVector;
+                var scopedStorage = tensor._storage;
+                Engines.TensorScope.Track(scopedVector, () =>
+                {
+                    Helpers.HostSync.Release(scopedVector, Engines.DirectGpuTensorEngine.ReleasedIntermediateMessage);
+                    scopedStorage.DisposeGpuBufferOwner();
+                    tensor._gpuBuffer = null;
+                });
+            }
+        }
         tensor._ownsGpuBuffer = false;
 
         // Register deferred GPU-to-CPU download keyed by the Vector (not the backing array,

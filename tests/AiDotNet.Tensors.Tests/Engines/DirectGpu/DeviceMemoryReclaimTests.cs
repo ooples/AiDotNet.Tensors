@@ -75,6 +75,9 @@ public sealed class DeviceMemoryReclaimTests
         DeviceMemoryReclaim.TapeOpen = () => false;
         try
         {
+            // Bytes other tests left in the process-wide counters could pass CollectNowAfterDeviceBytes, which collects on
+            // the spot and clears the flag this test reads.
+            DeviceMemoryReclaim.ResetCountsForTests();
             DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectAfterDeviceBytes);
             Assert.True(DeviceMemoryReclaim.CollectionDue);
 
@@ -99,6 +102,9 @@ public sealed class DeviceMemoryReclaimTests
         DeviceMemoryReclaim.TapeOpen = () => true;
         try
         {
+            // Bytes other tests left in the process-wide counters could pass CollectNowAfterDeviceBytes, which collects on
+            // the spot and clears the flag this test reads.
+            DeviceMemoryReclaim.ResetCountsForTests();
             DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectAfterDeviceBytes);
             using (new AiDotNet.Tensors.Engines.Autodiff.InferenceModeScope<float>()) { }
             Assert.True(DeviceMemoryReclaim.CollectionDue);

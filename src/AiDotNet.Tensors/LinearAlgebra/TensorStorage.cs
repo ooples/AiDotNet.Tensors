@@ -329,6 +329,12 @@ internal sealed class TensorStorage<T>
         return Interlocked.CompareExchange(ref _refCount, 0, 1) == 1;
     }
 
+    /// <summary>
+    /// Frees the attached GPU buffer owner now, ahead of the last reference (a TensorScope ending). Later releases find
+    /// no owner and free nothing twice.
+    /// </summary>
+    internal void DisposeGpuBufferOwner() => Interlocked.Exchange(ref _gpuBufferOwner, null)?.Dispose();
+
     /// <summary>Releases resources only after the caller has installed replacement storage.</summary>
     internal void DisposeClaimedOwners()
     {

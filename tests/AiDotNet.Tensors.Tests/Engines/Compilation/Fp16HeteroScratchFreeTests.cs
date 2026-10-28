@@ -80,8 +80,22 @@ public class Fp16HeteroScratchFreeTests
     // fingerprint) and the resident activation-cache bytes right after the backward. Each run captures its OWN
     // fresh graph (distinct tensors) and clears the activation cache first, so the two runs don't share cache
     // state (a shared snapshot would treat the other run's entries as pre-existing and confound the A/B).
-    private sealed record ScratchRun(double GradNorm, long ForwardBytes, long PeakBackwardBytes, long AfterBackwardBytes,
-        long GradBytes, bool Collected);
+    private sealed class ScratchRun
+    {
+        public ScratchRun(double gradNorm, long forwardBytes, long peakBackwardBytes, long afterBackwardBytes, long gradBytes,
+            bool collected)
+        {
+            GradNorm = gradNorm; ForwardBytes = forwardBytes; PeakBackwardBytes = peakBackwardBytes;
+            AfterBackwardBytes = afterBackwardBytes; GradBytes = gradBytes; Collected = collected;
+        }
+
+        public double GradNorm { get; }
+        public long ForwardBytes { get; }
+        public long PeakBackwardBytes { get; }
+        public long AfterBackwardBytes { get; }
+        public long GradBytes { get; }
+        public bool Collected { get; }
+    }
 
     private static ScratchRun RunOnce(DirectGpuTensorEngine gpu, bool scratchFree)
     {

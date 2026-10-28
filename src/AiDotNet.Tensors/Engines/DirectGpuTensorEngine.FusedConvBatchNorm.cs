@@ -20,6 +20,13 @@ public partial class DirectGpuTensorEngine
         int strideH, int strideW, int padH, int padW, int dilationH, int dilationW,
         FusedActivationType activation)
     {
+        // The CPU path's argument contract, before anything below dereferences them.
+        if (input is null) throw new System.ArgumentNullException(nameof(input));
+        if (kernel is null) throw new System.ArgumentNullException(nameof(kernel));
+        if (gamma is null) throw new System.ArgumentNullException(nameof(gamma));
+        if (beta is null) throw new System.ArgumentNullException(nameof(beta));
+        if (runningMean is null) throw new System.ArgumentNullException(nameof(runningMean));
+        if (runningVariance is null) throw new System.ArgumentNullException(nameof(runningVariance));
         bool recording = GraphMode.IsActive || (GradientTape<T>.Current is not null && !NoGradScope<T>.IsSuppressed);
         if (recording || !TryGetBackend(out _)
             || !(DeviceOnly(kernel) || (bias is not null && DeviceOnly(bias)) || DeviceOnly(gamma) || DeviceOnly(beta)

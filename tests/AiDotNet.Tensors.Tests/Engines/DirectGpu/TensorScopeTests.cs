@@ -93,6 +93,44 @@ public sealed class TensorScopeTests
         Assert.Throws<InvalidOperationException>(() => handedUp.ToArray());
     }
 
+    // Results that live in the activation cache rather than owning their buffer (TensorPower's FinishGpuOp path) are
+    // freed by the engine's cache when the scope ends, like a finished tape's intermediates, unless kept.
+    [SkippableFact]
+    public void ActivationCacheResults_AreFreedToo_ExceptTheKeptOne()
+    {
+        using var gpu = TryEngine();
+        Skip.If(gpu is null, "No DirectGpu backend.");
+        var source = new Tensor<float>(new[] { 1f, 2f, 3f, 4f }, new[] { 4 });
+        Tensor<float> intermediate, kept;
+        using (var scope = TensorScope.Begin())
+        {
+            intermediate = gpu.TensorPower(source, 3f);
+            kept = scope.Keep(gpu.TensorPower(source, 0.5f));
+        }
+
+        Assert.Equal(2f, kept.ToArray()[3], 4);
+        Assert.Throws<InvalidOperationException>(() => intermediate.ToArray());
+    }
+
+    // A result built over a buffer it owns (Tensor.FromGpuBuffer, as the fused attention and FFT paths make them).
+    [SkippableFact]
+    public void OwnedBufferResults_AreFreedToo()
+    {
+        using var gpu = TryEngine();
+        Skip.If(gpu is null, "No DirectGpu backend.");
+        var backend = gpu.GetBackend();
+        Skip.If(backend is null, "No DirectGpu backend.");
+        Tensor<float> dropped, kept;
+        using (var scope = TensorScope.Begin())
+        {
+            dropped = Tensor<float>.FromGpuBuffer(backend!, backend!.AllocateBuffer(new[] { 1f, 2f }), new[] { 2 });
+            kept = scope.Keep(Tensor<float>.FromGpuBuffer(backend, backend.AllocateBuffer(new[] { 5f, 6f }), new[] { 2 }));
+        }
+
+        Assert.Equal(new[] { 5f, 6f }, kept.ToArray());
+        Assert.Throws<InvalidOperationException>(() => dropped.ToArray());
+    }
+
     [SkippableFact]
     public void DisposingOutOfOrder_Throws()
     {

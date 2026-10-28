@@ -38,6 +38,10 @@ public sealed class TensorScope : IDisposable
     private readonly int _threadId;
     // Keyed by storage (the vector), so a kept view keeps the result it views.
     private readonly Dictionary<object, Action> _results = new(Autodiff.ReferenceEqualityComparer<object>.Instance);
+    // Storage keys (vectors and host arrays) of the kept results: the activation-cache release below spares them.
+    private readonly HashSet<object> _kept = new(Autodiff.ReferenceEqualityComparer<object>.Instance);
+    // Engines whose activation cache gained entries in this scope, with the cache timestamp from before the first one.
+    private Dictionary<DirectGpuTensorEngine, long>? _activationOwners;
     private bool _disposed;
 
     private TensorScope(TensorScope? outer)
@@ -66,6 +70,8 @@ public sealed class TensorScope : IDisposable
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
         ThrowIfDisposed();
         object storage = tensor.DataVector;
+        _kept.Add(storage);
+        if (tensor.GetBackingArrayForCacheLookupUnsafe() is { } array) _kept.Add(array);
         if (_results.TryGetValue(storage, out var release))
         {
             _results.Remove(storage);
@@ -98,8 +104,27 @@ public sealed class TensorScope : IDisposable
     internal static void Track(object storage, Action release)
     {
         var scope = s_current;
-        if (scope is null || scope._threadId != Environment.CurrentManagedThreadId) return;
+        // A buffer created while a graph is captured belongs to the compiled plan, which outlives any scope.
+        if (scope is null || scope._threadId != Environment.CurrentManagedThreadId || Compilation.GraphMode.IsActive) return;
         scope._results[storage] = release;
+    }
+
+    /// <summary>
+    /// Records that <paramref name="engine"/> is about to cache an activation on this thread, with its cache timestamp
+    /// from before that entry: when the scope (and each enclosing one) ends, the engine frees the entries created after
+    /// it that nothing kept, as a finished gradient tape does. Results that live in the activation cache instead of
+    /// owning their buffers (most element-wise and reduction results) are freed this way.
+    /// </summary>
+    internal static void EnlistActivationOwner(DirectGpuTensorEngine engine, long timestampBeforeEntry)
+    {
+        var scope = s_current;
+        if (scope is null || scope._threadId != Environment.CurrentManagedThreadId || Compilation.GraphMode.IsActive) return;
+        for (; scope is not null; scope = scope._outer)
+        {
+            scope._activationOwners ??= new Dictionary<DirectGpuTensorEngine, long>();
+            if (scope._activationOwners.ContainsKey(engine)) break;   // enclosing scopes enlisted it earlier
+            scope._activationOwners[engine] = timestampBeforeEntry;
+        }
     }
 
     private void Adopt(object storage, Action release)
@@ -118,6 +143,15 @@ public sealed class TensorScope : IDisposable
         s_current = _outer;
         foreach (var release in _results.Values) release();
         _results.Clear();
+        if (_activationOwners is not null)
+        {
+            // The kept results of enclosing scopes are this scope's results too until they end: spare them all.
+            var spared = new HashSet<object>(_kept, Autodiff.ReferenceEqualityComparer<object>.Instance);
+            for (var outer = _outer; outer is not null; outer = outer._outer) spared.UnionWith(outer._kept);
+            foreach (var owner in _activationOwners)
+                owner.Key.EvictActivationsCreatedAfter(owner.Value, spared, ActivationReleaseMode.Release);
+            _activationOwners = null;
+        }
     }
 
     private void ThrowIfDisposed()

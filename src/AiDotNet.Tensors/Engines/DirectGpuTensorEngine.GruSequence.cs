@@ -18,9 +18,10 @@ public partial class DirectGpuTensorEngine
     public override Tensor<T> GruSequenceForward<T>(Tensor<T> input, Tensor<T>? h0, Tensor<T> wIh, Tensor<T> wHh,
         Tensor<T>? bIh, Tensor<T>? bHh, out Tensor<T> finalHidden, bool returnSequences = false)
     {
-        var (batch, seqLen, _, hidden) = ValidateGruSequence(input, h0, wIh, wHh, bIh, bHh);
-        // Graph capture records the host op's lazy node, whose replay runs this engine eagerly.
-        if (seqLen == 0 || GraphMode.IsActive || typeof(T) != typeof(float) || !TryGetBackend(out var backend)
+        var (batch, seqLen, inputSize, hidden) = ValidateGruSequence(input, h0, wIh, wHh, bIh, bHh);
+        // Graph capture records the host op's lazy node, whose replay runs this engine eagerly. An empty extent has
+        // nothing to launch and the kernels require positive ones: the host path returns the empty result.
+        if (seqLen == 0 || batch == 0 || inputSize == 0 || GraphMode.IsActive || typeof(T) != typeof(float) || !TryGetBackend(out var backend)
             || backend is not IFusedLstmSequenceTraining fused)
             return base.GruSequenceForward(input, h0, wIh, wHh, bIh, bHh, out finalHidden, returnSequences);
         var sequence = GruSequenceOnDevice(backend, fused, input, h0, wIh, wHh, bIh, bHh, batch, seqLen, hidden)
@@ -54,14 +55,22 @@ public partial class DirectGpuTensorEngine
                 bi.Buffer, bh.Buffer, y.Buffer, allH.Buffer, gates.Buffer, ghn.Buffer, seqLen, batch, inFeatures, hidden);
 
             var sequence = DeferTensorResult<T>(backend, y.Buffer, batch * seqLen * hidden, new[] { batch, seqLen, hidden });
-            // The caches live as long as the recorded node (or this call, untaped): owned tensors over their buffers.
+            y.RelinquishOwnership();
+            if (!DifferentiableOps.IsRecording<T>())
+            {
+                // No backward will read the caches (about 5x the output): back to the pool once the forward has run,
+                // not when a collection finalizes them.
+                allH.DisposeAfterQueuedUse(backend); gates.DisposeAfterQueuedUse(backend); ghn.DisposeAfterQueuedUse(backend);
+                handedOff = true;
+                return sequence;
+            }
+            // The caches live as long as the recorded node: owned tensors over their buffers.
             var allHTensor = DeferTensorResult<float>(backend, allH.Buffer, allHSize, new[] { allHSize });
             var gatesTensor = DeferTensorResult<float>(backend, gates.Buffer, gatesSize, new[] { gatesSize });
             var ghnTensor = DeferTensorResult<float>(backend, ghn.Buffer, ghnSize, new[] { ghnSize });
-            y.RelinquishOwnership(); allH.RelinquishOwnership(); gates.RelinquishOwnership(); ghn.RelinquishOwnership();
+            allH.RelinquishOwnership(); gates.RelinquishOwnership(); ghn.RelinquishOwnership();
             handedOff = true;
 
-            if (DifferentiableOps.IsRecording<T>())
             {
                 var inputs = GruSequenceInputs(input, h0, wIh, wHh, bIh, bHh, out var present);
                 DifferentiableOps.RecordIfActive("GruSequenceForward", sequence, inputs, GruSequenceBackwardOnDevice<T>,

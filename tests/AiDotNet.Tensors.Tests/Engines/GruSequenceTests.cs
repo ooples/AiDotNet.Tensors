@@ -17,7 +17,20 @@ public sealed class GruSequenceTests
 {
     private const int B = 3, T = 4, In = 5, H = 6;
 
-    private sealed record Weights<TT>(Tensor<TT> X, Tensor<TT> H0, Tensor<TT> WIh, Tensor<TT> WHh, Tensor<TT> BIh, Tensor<TT> BHh);
+    private sealed class Weights<TT>
+    {
+        public Weights(Tensor<TT> x, Tensor<TT> h0, Tensor<TT> wIh, Tensor<TT> wHh, Tensor<TT> bIh, Tensor<TT> bHh)
+        {
+            X = x; H0 = h0; WIh = wIh; WHh = wHh; BIh = bIh; BHh = bHh;
+        }
+
+        public Tensor<TT> X { get; }
+        public Tensor<TT> H0 { get; }
+        public Tensor<TT> WIh { get; }
+        public Tensor<TT> WHh { get; }
+        public Tensor<TT> BIh { get; }
+        public Tensor<TT> BHh { get; }
+    }
 
     private static double[] RandArray(int seed, int n, double scale)
     {
@@ -226,11 +239,20 @@ public sealed class GruSequenceTests
         var w = ToFloat(MakeDouble());
         var projection = F(new Tensor<double>(RandArray(7, B * T * H, 1.0), new[] { B, T, H }));
         var cpu = TapeGradients(new CpuEngine(), w, projection);
+        // The device path must have run, forward and backward: two launches per step each way, then four for the input,
+        // weight and bias gradients. A host fallback would pass the value checks below without launching any of them.
+        AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Reset();
         var device = TapeGradients(gpu, w, projection);
+        Assert.True(AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Count >= 4 * T + 4,
+            $"the GRU device kernels did not run (launches {AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Count}).");
         foreach (var name in cpu.Keys)
         {
             double cosine = Cosine(cpu[name], device[name]);
             Assert.True(cosine >= 0.99999, $"{name}: GPU gradient cosine {cosine} against the CPU.");
+            // A cosine cannot see a scale error (a doubled bias gradient, a missing 1/N): compare every element too.
+            for (int i = 0; i < cpu[name].Length; i++)
+                Assert.True(Math.Abs(cpu[name][i] - device[name][i]) <= 1e-4 + 1e-3 * Math.Abs(cpu[name][i]),
+                    $"{name}[{i}]: CPU {cpu[name][i]}, GPU {device[name][i]}.");
         }
     }
 }

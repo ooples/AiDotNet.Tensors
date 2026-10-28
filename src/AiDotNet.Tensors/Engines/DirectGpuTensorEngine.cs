@@ -1718,13 +1718,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             if (baseBuffer is null || backend is not IFusedLstmSequenceTraining fused) return false;
             long last = view._storageOffset;
-            var layout = new float[2 * view.Rank];
+            var layout = new int[2 * view.Rank];
             for (int d = 0; d < view.Rank; d++)
             {
                 if (view._strides[d] < 0) return false;
                 last += (long)(view.Shape[d] - 1) * view._strides[d];
-                layout[d] = BitConverter.ToSingle(BitConverter.GetBytes(view.Shape[d]), 0);
-                layout[view.Rank + d] = BitConverter.ToSingle(BitConverter.GetBytes(view._strides[d]), 0);
+                layout[d] = view.Shape[d];
+                layout[view.Rank + d] = view._strides[d];
             }
             if (view._storageOffset < 0 || last >= baseBuffer.Size) return false;
             var metadata = CachedStridedViewLayout(backend, layout, out bool metadataCached);
@@ -2448,6 +2448,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         long managedBytes = 4L;
         for (int d = 0; d < shape.Length; d++) managedBytes *= shape[d];
 
+        // Inside a TensorScope this entry is a result of the scope's call: it is freed when the scope ends unless kept.
+        if (TensorScope.Current is not null) TensorScope.EnlistActivationOwner(this, ActivationCacheTimestampSnapshot());
         var timestamp = System.Threading.Interlocked.Increment(ref _activationCacheTimestamp);
         var entry = new ActivationCacheEntry(buffer, shape, timestamp, backend, managedBytes,
             isFp16, isFp16 ? elementCount : 0, hostVersion);
@@ -27387,15 +27389,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                                 var tensor = tensors[t];
                                 int tensorAxis = tensor.Shape._dims[normAxis];
                                 int slice = tensorAxis * inner;
-                                using var input = GetOrAllocateBuffer(backend, tensor);
-                                if (outer == 1)
-                                    backend.Copy(input.Buffer, 0, outBuf.Buffer, axisOffset * inner, slice);
-                                else
-                                    // ONE launch per input: row o of the [outer, slice] input goes to columns
-                                    // [axisOffset*inner, +slice) of row o of the [outer, axisTotal*inner] output.
-                                    // Copy2DStrided is on IDirectGpuBackend, so it is recorded/capturable like Copy.
-                                    backend.Copy2DStrided(input.Buffer, outBuf.Buffer, outer, slice,
-                                        axisTotal * inner, axisOffset * inner);
+                                // A strided input comes back as an owned gather buffer. The copy below is only queued,
+                                // so the buffer returns to the pool after the queued work, not when this loop moves on.
+                                var input = GetOrAllocateBuffer(backend, tensor);
+                                try
+                                {
+                                    if (outer == 1)
+                                        backend.Copy(input.Buffer, 0, outBuf.Buffer, axisOffset * inner, slice);
+                                    else
+                                        // ONE launch per input: row o of the [outer, slice] input goes to columns
+                                        // [axisOffset*inner, +slice) of row o of the [outer, axisTotal*inner] output.
+                                        // Copy2DStrided is on IDirectGpuBackend, so it is recorded/capturable like Copy.
+                                        backend.Copy2DStrided(input.Buffer, outBuf.Buffer, outer, slice,
+                                            axisTotal * inner, axisOffset * inner);
+                                }
+                                finally
+                                {
+                                    input.DisposeAfterQueuedUse(backend);
+                                }
                                 axisOffset += tensorAxis;
                             }
                             int[] outShape = (int[])a.Shape._dims.Clone();
@@ -28230,8 +28241,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         lock (_stridedViewLayoutsGate)
         {
-            foreach (var entry in _stridedViewLayouts) DisposeBufferAfterQueuedUse(entry.Key.Item1, entry.Value);
-            _stridedViewLayouts.Clear();
+            foreach (var (layoutBackend, layoutBuffer) in _stridedViewLayoutBuffers) DisposeBufferAfterQueuedUse(layoutBackend, layoutBuffer);
+            _stridedViewLayoutBuffers.Clear();
+            _stridedViewLayoutCount = 0;
         }
 
         lock (_occupancyBufferCacheGate)

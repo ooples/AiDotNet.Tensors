@@ -429,17 +429,21 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
 
     private static string PoolKey(ITunedKernelCandidate<TArgs>[] candidates) => PoolKey(candidates, s_buildIdentity);
 
+    // 32-bit FNV-1a.
+    private const uint FnvOffsetBasis = 2166136261;
+    private const uint FnvPrime = 16777619;
+
     // FNV-1a over the build identity and the ordered candidate ids, as 8 hex digits: a short name for the candidate set
     // as this build implements it.
     internal static string PoolKey(ITunedKernelCandidate<TArgs>[] candidates, string buildIdentity)
     {
-        uint h = 2166136261;
-        foreach (char ch in buildIdentity) { h ^= ch; h *= 16777619; }
-        h ^= '|'; h *= 16777619;
+        uint h = FnvOffsetBasis;
+        foreach (char ch in buildIdentity) { h ^= ch; h *= FnvPrime; }
+        h ^= '|'; h *= FnvPrime;
         foreach (var c in candidates)
         {
-            foreach (char ch in c.Id) { h ^= ch; h *= 16777619; }
-            h ^= '|'; h *= 16777619;
+            foreach (char ch in c.Id) { h ^= ch; h *= FnvPrime; }
+            h ^= '|'; h *= FnvPrime;
         }
         return h.ToString("x8", System.Globalization.CultureInfo.InvariantCulture);
     }

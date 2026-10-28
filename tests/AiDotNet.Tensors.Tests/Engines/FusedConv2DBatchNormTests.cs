@@ -1,6 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
 using System;
+using System.Collections.Generic;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -25,8 +26,24 @@ public sealed class FusedConv2DBatchNormTests
         return new Tensor<float>(data, shape);
     }
 
-    private sealed record Case(Tensor<float> Input, Tensor<float> Kernel, Tensor<float>? Bias, Tensor<float> Gamma,
-        Tensor<float> Beta, Tensor<float> Mean, Tensor<float> Variance);
+    private sealed class Case
+    {
+        public Case(Tensor<float> input, Tensor<float> kernel, Tensor<float>? bias, Tensor<float> gamma, Tensor<float> beta,
+            Tensor<float> mean, Tensor<float> variance)
+        {
+            Input = input; Kernel = kernel; Bias = bias; Gamma = gamma; Beta = beta; Mean = mean; Variance = variance;
+        }
+
+        public Tensor<float> Input { get; }
+        public Tensor<float> Kernel { get; }
+        public Tensor<float>? Bias { get; }
+        public Tensor<float> Gamma { get; }
+        public Tensor<float> Beta { get; }
+        public Tensor<float> Mean { get; }
+        public Tensor<float> Variance { get; }
+
+        public Case WithVariance(Tensor<float> variance) => new(Input, Kernel, Bias, Gamma, Beta, Mean, variance);
+    }
 
     private static Case Make(bool withBias) => new(
         Rand(1, -1f, 1f, Batch, InC, H, W), Rand(2, -0.5f, 0.5f, OutC, InC, K, K),
@@ -125,7 +142,7 @@ public sealed class FusedConv2DBatchNormTests
         c.Mean[OutC - 1] = 0.7f;
         AssertClose(Unfused(cpu, c, 1, 1, FusedActivationType.None), Fused(cpu, c, 1, 1, FusedActivationType.None));
 
-        var replacedVariance = c with { Variance = Rand(8, 0.1f, 2f, OutC) };   // a different tensor, same kernel
+        var replacedVariance = c.WithVariance(Rand(8, 0.1f, 2f, OutC));   // a different tensor, same kernel
         AssertClose(Unfused(cpu, replacedVariance, 1, 1, FusedActivationType.None),
             Fused(cpu, replacedVariance, 1, 1, FusedActivationType.None));
     }
@@ -150,5 +167,104 @@ public sealed class FusedConv2DBatchNormTests
         var fused = Grads(FusedLoss);
         var unfused = Grads(UnfusedLoss);
         for (int i = 0; i < sources.Length; i++) AssertClose(unfused[i], fused[i]);
+    }
+
+    // Device weight caches (and the Winograd filter transform) are keyed by the folded kernel's identity, so an
+    // unchanged call must return the same folded tensors, and a changed parameter new ones.
+    [Fact]
+    public void TheFold_KeepsItsIdentity_UntilAParameterChanges()
+    {
+        var c = Make(withBias: true);
+        var first = CpuEngine.ConvBatchNormFold<float>.Get(c.Kernel, c.Bias, c.Gamma, c.Beta, c.Mean, c.Variance, 1e-5,
+            CpuEngine.ConvBatchNormFold<float>.FoldOnHost);
+        var again = CpuEngine.ConvBatchNormFold<float>.Get(c.Kernel, c.Bias, c.Gamma, c.Beta, c.Mean, c.Variance, 1e-5,
+            CpuEngine.ConvBatchNormFold<float>.FoldOnHost);
+        Assert.Same(first.Kernel, again.Kernel);
+        Assert.Same(first.Bias, again.Bias);
+
+        c.Gamma[0] = 2.5f;
+        var rebuilt = CpuEngine.ConvBatchNormFold<float>.Get(c.Kernel, c.Bias, c.Gamma, c.Beta, c.Mean, c.Variance, 1e-5,
+            CpuEngine.ConvBatchNormFold<float>.FoldOnHost);
+        Assert.NotSame(first.Kernel, rebuilt.Kernel);
+        Assert.NotSame(first.Bias, rebuilt.Bias);
+        var epsilonChanged = CpuEngine.ConvBatchNormFold<float>.Get(c.Kernel, c.Bias, c.Gamma, c.Beta, c.Mean, c.Variance, 1e-3,
+            CpuEngine.ConvBatchNormFold<float>.FoldOnHost);
+        Assert.NotSame(rebuilt.Kernel, epsilonChanged.Kernel);
+    }
+
+    // Under a tape with recording suppressed the op is inference: it folds and records no node, so nothing upstream
+    // receives a gradient through it.
+    [Fact]
+    public void UnderATape_WithNoGrad_FoldsAndRecordsNothing()
+    {
+        var cpu = new CpuEngine();
+        var c = Make(withBias: true);
+        var expected = Unfused(cpu, c, 1, 1, FusedActivationType.ReLU);
+        using var tape = new GradientTape<float>();
+        Tensor<float> y;
+        using (new NoGradScope<float>()) y = Fused(cpu, c, 1, 1, FusedActivationType.ReLU);
+        AssertClose(expected, y);
+        var loss = cpu.ReduceMean(cpu.TensorMultiply(y, y), new[] { 0, 1, 2, 3 }, keepDims: false);
+        var grads = tape.ComputeGradients(loss, new[] { c.Kernel, c.Gamma });
+        Assert.False(grads.ContainsKey(c.Kernel), "a gradient reached the kernel through a no-grad call.");
+        Assert.False(grads.ContainsKey(c.Gamma), "a gradient reached gamma through a no-grad call.");
+    }
+
+    // The tape path's gradients against central differences of the op itself, in double precision: numerics, not just
+    // the routing a comparison with the same composition would check.
+    [Fact]
+    public void UnderATape_GradientsMatchCentralDifferences()
+    {
+        var cpu = new CpuEngine();
+        Tensor<double> D(Tensor<float> t) => new(Array.ConvertAll(t.ToArray(), v => (double)v), t.Shape.ToArray());
+        var f = Make(withBias: true);
+        var x = D(f.Input); var k = D(f.Kernel); var b = D(f.Bias!); var g = D(f.Gamma); var be = D(f.Beta);
+        var m = D(f.Mean); var v = D(f.Variance);
+        var weights = new Tensor<double>(Array.ConvertAll(Rand(9, -1f, 1f, Batch, OutC, H, W).ToArray(), q => (double)q),
+            new[] { Batch, OutC, H, W });
+        Tensor<double> Loss() => cpu.ReduceMean(cpu.TensorMultiply(
+            cpu.FusedConv2DBatchNorm(x, k, b, g, be, m, v, 1e-5, 1, 1, 1, 1, 1, 1, FusedActivationType.None), weights),
+            new[] { 0, 1, 2, 3 }, keepDims: false);
+
+        var sources = new[] { x, k, b, g, be };
+        Dictionary<Tensor<double>, Tensor<double>> analytic;
+        using (var tape = new GradientTape<double>()) analytic = tape.ComputeGradients(Loss(), sources);
+
+        const double Eps = 1e-6;
+        foreach (var source in sources)
+        {
+            var a = analytic[source].ToArray();
+            for (int i = 0; i < source.Length; i += Math.Max(1, source.Length / 17))
+            {
+                double keep = source.GetFlatIndexValue(i);
+                source.SetFlatIndexValue(i, keep + Eps); double up = Loss().ToArray()[0];
+                source.SetFlatIndexValue(i, keep - Eps); double down = Loss().ToArray()[0];
+                source.SetFlatIndexValue(i, keep);
+                double numeric = (up - down) / (2 * Eps);
+                Assert.True(Math.Abs(a[i] - numeric) <= 1e-6 + 1e-4 * Math.Abs(numeric),
+                    $"gradient [{i}] of a [{string.Join(",", source.Shape.ToArray())}] source: analytic {a[i]}, numeric {numeric}.");
+            }
+        }
+    }
+
+    [SkippableFact]
+    public void Gpu_UnderATape_GradientsMatchTheCpu()
+    {
+        DirectGpuTensorEngine? gpu = null;
+        try { gpu = new DirectGpuTensorEngine(); } catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException or DllNotFoundException) { }
+        Skip.If(gpu is null || !gpu.IsGpuAvailable, "No DirectGpu backend.");
+        using var _ = gpu;
+        var c = Make(withBias: true);
+        var sources = new[] { c.Input, c.Kernel, c.Gamma, c.Beta };
+        Tensor<float>[] Grads(IEngine e)
+        {
+            using var tape = new GradientTape<float>();
+            var y = Fused(e, c, 1, 1, FusedActivationType.ReLU);
+            var g = tape.ComputeGradients(e.ReduceMean(y, new[] { 0, 1, 2, 3 }, keepDims: false), sources);
+            return Array.ConvertAll(sources, s => g[s]);
+        }
+        var expected = Grads(new CpuEngine());
+        var actual = Grads(gpu!);
+        for (int i = 0; i < sources.Length; i++) AssertClose(expected[i], actual[i], 1e-3f);
     }
 }

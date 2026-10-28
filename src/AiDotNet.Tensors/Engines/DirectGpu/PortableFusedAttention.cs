@@ -32,19 +32,18 @@ internal static class PortableFusedAttention
             p.Causal, p.CausalOffset, p.HasMask,
             BitConverter.ToInt32(BitConverter.GetBytes(p.Scale), 0), BitConverter.ToInt32(BitConverter.GetBytes(p.Softcap), 0),
         };
-        var words = new float[K.FaMetaCount];
-        for (int i = 0; i < values.Length; i++) words[i] = BitConverter.ToSingle(BitConverter.GetBytes(values[i]), 0);
         // The block depends only on the shapes, strides and flags, which a training step repeats. Uploading it on every
-        // launch was a host/device crossing per attention forward and backward (#1570): keep one per backend and block.
-        var cache = MetaCache.GetValue(backend, static _ => new System.Collections.Concurrent.ConcurrentDictionary<string, IGpuBuffer>());
-        string key = string.Join(",", values);
-        if (cache.TryGetValue(key, out var cached)) return new MetaLease(cached, owned: false);
+        // launch was a host/device crossing per attention forward and backward (#1570): keep one per backend and block,
+        // keyed by the words themselves, and build the uploaded floats only on a miss.
+        var cache = MetaCache.GetValue(backend, static _ =>
+            new System.Collections.Concurrent.ConcurrentDictionary<int[], IGpuBuffer>(Int32WordsComparer.Instance));
+        if (cache.TryGetValue(values, out var cached)) return new MetaLease(cached, owned: false);
         lock (cache)
         {
-            if (cache.TryGetValue(key, out cached)) return new MetaLease(cached, owned: false);
-            var created = backend.AllocateBuffer(words);
+            if (cache.TryGetValue(values, out cached)) return new MetaLease(cached, owned: false);
+            var created = backend.AllocateBuffer(Int32WordsComparer.AsFloatBits(values, K.FaMetaCount));
             if (cache.Count >= MaxCachedMetaBlocks) return new MetaLease(created, owned: true);
-            cache[key] = created;
+            cache[values] = created;
             return new MetaLease(created, owned: false);
         }
     }
@@ -53,7 +52,7 @@ internal static class PortableFusedAttention
     private const int MaxCachedMetaBlocks = 256;
     // Entries live as long as their backend: the table drops a backend's blocks when the backend is collected.
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<IDirectGpuBackend,
-        System.Collections.Concurrent.ConcurrentDictionary<string, IGpuBuffer>> MetaCache = new();
+        System.Collections.Concurrent.ConcurrentDictionary<int[], IGpuBuffer>> MetaCache = new();
 
     private readonly struct MetaLease : IDisposable
     {

@@ -28,7 +28,13 @@ internal static class GpuVggConvBench
 
     public static void Run(string[] args)
     {
-        int pairs = args.Length > 0 && int.TryParse(args[0], out int p) ? p : 21;
+        int pairs = 21;
+        if (args.Length > 0 && (!int.TryParse(args[0], out pairs) || pairs < 6))
+        {
+            // StableTimer.MeasurePairedRatioBound needs 6 pairs for a 95% interval.
+            Console.WriteLine($"--gpu-vgg-convs [pairs]: pairs must be an integer of at least 6, got '{args[0]}'.");
+            return;
+        }
         using var backend = new OpenClBackend();
         if (!backend.IsAvailable) { Console.WriteLine("OpenCL is not available."); return; }
         var slot = backend.Conv2DForwardSlot;

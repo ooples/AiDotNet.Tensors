@@ -5731,29 +5731,36 @@ public partial class DirectGpuTensorEngine
     // reshape). Uploading it per call made three host/device crossings per warm step (#1570). Bounded so a workload
     // with ever-changing view layouts falls back to a per-call upload instead of growing the cache without limit.
     private const int MaxCachedStridedViewLayouts = 1024;
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<(IDirectGpuBackend, string), IGpuBuffer> _stridedViewLayouts = new();
+    private readonly System.Runtime.CompilerServices.ConditionalWeakTable<IDirectGpuBackend,
+        System.Collections.Concurrent.ConcurrentDictionary<int[], IGpuBuffer>> _stridedViewLayouts = new();
+    private int _stridedViewLayoutCount;
     private readonly object _stridedViewLayoutsGate = new();
 
-    private IGpuBuffer CachedStridedViewLayout(IDirectGpuBackend backend, float[] layout, out bool cached)
+    // layout = the view's shape then its strides, as int32 words; the kernel reads them through a float-typed buffer.
+    private IGpuBuffer CachedStridedViewLayout(IDirectGpuBackend backend, int[] layout, out bool cached)
     {
-        var bits = new int[layout.Length];
-        for (int i = 0; i < layout.Length; i++) bits[i] = BitConverter.ToInt32(BitConverter.GetBytes(layout[i]), 0);
-        var key = (backend, string.Join(",", bits));
+        var map = _stridedViewLayouts.GetValue(backend, static _ =>
+            new System.Collections.Concurrent.ConcurrentDictionary<int[], IGpuBuffer>(Int32WordsComparer.Instance));
         cached = true;
-        if (_stridedViewLayouts.TryGetValue(key, out var existing)) return existing;
+        if (map.TryGetValue(layout, out var existing)) return existing;
         lock (_stridedViewLayoutsGate)
         {
-            if (_stridedViewLayouts.TryGetValue(key, out existing)) return existing;
-            var created = backend.AllocateBuffer(layout);
-            if (_stridedViewLayouts.Count >= MaxCachedStridedViewLayouts)
+            if (map.TryGetValue(layout, out existing)) return existing;
+            var created = backend.AllocateBuffer(Int32WordsComparer.AsFloatBits(layout, layout.Length));
+            if (_stridedViewLayoutCount >= MaxCachedStridedViewLayouts)
             {
                 cached = false;
                 return created;
             }
-            _stridedViewLayouts[key] = created;
+            map[layout] = created;
+            _stridedViewLayoutCount++;
+            _stridedViewLayoutBuffers.Add((backend, created));
             return created;
         }
     }
+
+    // Every cached layout buffer with its backend, for Dispose (a ConditionalWeakTable cannot be enumerated on net471).
+    private readonly System.Collections.Generic.List<(IDirectGpuBackend Backend, IGpuBuffer Buffer)> _stridedViewLayoutBuffers = new();
 
     private static float[] AdaptivePoolMatrix(int inSize, int outSize)
     {

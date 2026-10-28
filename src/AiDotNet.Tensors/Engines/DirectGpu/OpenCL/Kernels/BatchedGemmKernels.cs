@@ -219,7 +219,8 @@ void gemm_batched_rb128v(__global const float* restrict A, __global const float*
 }
 // #1432: rb64 for the Winograd per-point products of late layers (M = K = 512, N = 16-49 tiles), which stream A once and
 // were latency-bound in rb64 (about 30 GB/s): K advances 32 at a time, A rows load as float4, and the next tile's loads
-// are issued into registers before the current tile is multiplied, so one barrier per step covers them.
+// are issued into registers before the current tile is multiplied, so they are in flight during the products. LDS is
+// single-buffered: a double-buffered version halved occupancy and ran 2x slower.
 __kernel __attribute__((reqd_work_group_size(16, 16, 1)))
 void gemm_batched_rb64p(__global const float* restrict A, __global const float* restrict B, __global float* restrict C,
     const int M, const int N, const int K)
@@ -227,10 +228,9 @@ void gemm_batched_rb64p(__global const float* restrict A, __global const float* 
     const int tx = get_local_id(0), ty = get_local_id(1);
     const int bn0 = get_group_id(0) * 64, bm0 = get_group_id(1) * 64;
     const long b = get_group_id(2);
-    const int kBegin = 0, kEnd = K;
     A += b * M * K; B += b * K * N; C += b * M * N;
-    __local float As[1][32][65];
-    __local float Bs[1][32][65];
+    __local float As[32][65];
+    __local float Bs[32][65];
     const int tid = ty * 16 + tx;
     // A tile 64 x 32: work item (row tid >> 2, columns (tid & 3) * 8 .. + 8). B tile 32 x 64: (row tid >> 3, columns (tid & 7) * 8 .. + 8).
     const int ar = tid >> 2, ac = (tid & 3) * 8, br = tid >> 3, bc = (tid & 7) * 8;
@@ -240,32 +240,31 @@ void gemm_batched_rb64p(__global const float* restrict A, __global const float* 
     for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
     #define RBP_LOAD(k0) { \
         int gr = bm0 + ar; \
-        if (vecA && gr < M && (k0) + ac + 8 <= kEnd) { \
+        if (vecA && gr < M && (k0) + ac + 8 <= K) { \
             float4 v0 = vload4(0, A + (long)gr * K + (k0) + ac); float4 v1 = vload4(0, A + (long)gr * K + (k0) + ac + 4); \
             pa[0] = v0.x; pa[1] = v0.y; pa[2] = v0.z; pa[3] = v0.w; pa[4] = v1.x; pa[5] = v1.y; pa[6] = v1.z; pa[7] = v1.w; \
         } else { \
-            for (int q = 0; q < 8; q++) { int gc = (k0) + ac + q; pa[q] = (gr < M && gc < kEnd) ? A[(long)gr * K + gc] : 0.0f; } \
+            for (int q = 0; q < 8; q++) { int gc = (k0) + ac + q; pa[q] = (gr < M && gc < K) ? A[(long)gr * K + gc] : 0.0f; } \
         } \
         int kr = (k0) + br; \
-        for (int q = 0; q < 8; q++) { int gc = bn0 + bc + q; pb[q] = (kr < kEnd && gc < N) ? B[(long)kr * N + gc] : 0.0f; } \
+        for (int q = 0; q < 8; q++) { int gc = bn0 + bc + q; pb[q] = (kr < K && gc < N) ? B[(long)kr * N + gc] : 0.0f; } \
     }
-    #define RBP_STORE(s) { \
-        for (int q = 0; q < 8; q++) As[s][ac + q][ar] = pa[q]; \
-        for (int q = 0; q < 8; q++) Bs[s][br][bc + q] = pb[q]; \
+    #define RBP_STORE() { \
+        for (int q = 0; q < 8; q++) As[ac + q][ar] = pa[q]; \
+        for (int q = 0; q < 8; q++) Bs[br][bc + q] = pb[q]; \
     }
-    const int s = 0;
-    RBP_LOAD(kBegin);
-    for (int k0 = kBegin; k0 < kEnd; k0 += 32)
+    RBP_LOAD(0);
+    for (int k0 = 0; k0 < K; k0 += 32)
     {
-        RBP_STORE(0);
+        RBP_STORE();
         barrier(CLK_LOCAL_MEM_FENCE);
         // The next tile's global loads are in flight while this one is multiplied.
-        if (k0 + 32 < kEnd) RBP_LOAD(k0 + 32);
+        if (k0 + 32 < K) RBP_LOAD(k0 + 32);
         for (int kk = 0; kk < 32; kk++)
         {
             float a[4], bb[4];
-            for (int i = 0; i < 4; i++) a[i] = As[s][kk][ty + 16 * i];
-            for (int j = 0; j < 4; j++) bb[j] = Bs[s][kk][tx + 16 * j];
+            for (int i = 0; i < 4; i++) a[i] = As[kk][ty + 16 * i];
+            for (int j = 0; j < 4; j++) bb[j] = Bs[kk][tx + 16 * j];
             for (int i = 0; i < 4; i++)
                 for (int j = 0; j < 4; j++) acc[i][j] = mad(a[i], bb[j], acc[i][j]);
         }
