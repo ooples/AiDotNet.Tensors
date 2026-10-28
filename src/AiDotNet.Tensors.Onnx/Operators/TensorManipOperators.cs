@@ -504,7 +504,9 @@ internal static class TensorManipOperators
                     var intIndices = new Tensor<int>(capturedIndices._shape, new Vector<int>(idxArr));
                     var r = eng.Gather(capturedData, intIndices, capturedAxis);
                     r.AsSpan().CopyTo(output.AsWritableSpan());
-                });
+                },
+                // The axis, for readers of the plan (the ONNX exporter); replay uses the closure.
+                savedState: new object[] { capturedAxis });
             ctx.PutTensor(node.Output[0], lazy);
         }
     }

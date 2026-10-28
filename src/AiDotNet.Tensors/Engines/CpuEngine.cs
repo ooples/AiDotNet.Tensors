@@ -27100,7 +27100,8 @@ public partial class CpuEngine : ITensorLevelEngine
                     Tensor<T> result = engine.LayerNorm(
                         input, gamma, beta, epsilon, out Tensor<T> freshMean, out Tensor<T> freshVariance);
                     return new[] { result, freshMean, freshVariance };
-                });
+                },
+                savedState: new object[] { epsilon });
             mean = outputs[1];
             variance = outputs[2];
             return outputs[0];

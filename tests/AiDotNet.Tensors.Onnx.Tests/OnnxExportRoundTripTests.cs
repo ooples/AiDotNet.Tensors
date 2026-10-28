@@ -1,4 +1,6 @@
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Compilation;
+using AiDotNet.Tensors.LinearAlgebra;
 using AiDotNet.Tensors.Onnx.Protos;
 using Google.Protobuf;
 using Xunit;
@@ -133,13 +135,49 @@ public class OnnxExportRoundTripTests
     }
 
     [Fact]
+    public void Export_EngineTracedPlan_RoundTrips()
+    {
+        // The Tensors-only path: a plan traced from engine calls, exported with the plan overload.
+        var (plan, input) = EnginePlans.LinearRelu();
+        var data = RandomArray(seed: 77, n: input.Length);
+        data.AsSpan().CopyTo(input.AsWritableSpan());
+        input.MarkModified();
+        var expected = plan.Execute().ToArray();
+
+        var model = OnnxExporter.Export(plan);
+        var feeds = new[] { new RoundTripCases.Feed("input", input._shape, data) };
+        AssertClose(expected, RoundTrip.Run(model.ToByteArray(), feeds));
+    }
+
+    [Fact]
     public void Export_UnsupportedOperation_NamesIt()
     {
-        var c = RoundTripCases.Get("LstmUnsupported");
-        using var stream = new MemoryStream(c.Bytes);
-        var imported = OnnxImporter.Import<float>(stream, new CpuEngine());
-        var e = Assert.Throws<NotSupportedException>(() => OnnxExporter.Export(imported));
-        Assert.Contains("no ONNX translation", e.Message);
+        var plan = EnginePlans.CumSum();
+        var e = Assert.Throws<NotSupportedException>(() => OnnxExporter.Export(plan));
+        Assert.Contains("TensorCumSum", e.Message);
+    }
+}
+
+/// <summary>Plans traced directly from engine calls, as a Tensors-only user builds them.</summary>
+internal static class EnginePlans
+{
+    internal static (ICompiledPlan<float> Plan, Tensor<float> Input) LinearRelu()
+    {
+        var engine = new CpuEngine();
+        var input = new Tensor<float>(new[] { 2, 4 });
+        var w = new Tensor<float>(RandomArray(seed: 78, n: 12), new[] { 4, 3 });
+        var b = new Tensor<float>(RandomArray(seed: 79, n: 3), new[] { 3 });
+        var plan = new CompiledModelCache<float>().GetOrCompileInference(input, () =>
+            engine.ReLU(engine.TensorBroadcastAdd(engine.TensorMatMul(input, w), b)));
+        return (plan, input);
+    }
+
+    internal static ICompiledPlan<float> CumSum()
+    {
+        var engine = new CpuEngine();
+        var input = new Tensor<float>(new[] { 2, 4 });
+        return new CompiledModelCache<float>().GetOrCompileInference(input, () =>
+            engine.ReLU(engine.TensorCumSum(input, 1)));
     }
 }
 
@@ -372,7 +410,20 @@ internal static class RoundTripCases
             var ff = Linear(n.Op("Gelu", new[] { Linear(h, D, F) }), F, D);
             return (Norm(n.Op("Add", new[] { ff, h })), new[] { 1, S, D }, 20);
         }));
-        cases.Add(Named("LstmUnsupported", n =>
+        cases.Add(Named("GruSequence", n =>
+        {
+            var x = n.In("X", new[] { 3, 1, 2 });
+            var outs = n.OpMulti("GRU", new[] { x, n.W(new[] { 1, 9, 2 }), n.W(new[] { 1, 9, 3 }) }, 1, Int("hidden_size", 3));
+            return (outs[0], new[] { 3, 1, 1, 3 }, 17);
+        }));
+        cases.Add(Named("WhereEqual", n =>
+        {
+            var a = n.In("A", new[] { 2, 3 });
+            var b = n.In("B", new[] { 2, 3 });
+            var eq = n.Op("Equal", new[] { a, a });
+            return (n.Op("Where", new[] { eq, b, a }), new[] { 2, 3 }, 17);
+        }));
+        cases.Add(Named("LstmSequence", n =>
         {
             var x = n.In("X", new[] { 3, 1, 2 });
             var outs = n.OpMulti("LSTM", new[] { x, n.W(new[] { 1, 12, 2 }), n.W(new[] { 1, 12, 3 }) }, 1, Int("hidden_size", 3));

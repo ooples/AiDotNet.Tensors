@@ -112,7 +112,9 @@ public partial class CpuEngine
 
     /// <summary>
     /// Captures every tensor returned by a homogeneous multi-output inference kernel. Each output
-    /// remains independently selectable as a compiled-plan result. Coordinating sibling execution
+    /// remains independently selectable as a compiled-plan result. <paramref name="savedState"/> records the
+    /// kernel's scalar parameters on every output's step (readers such as the ONNX exporter need them; replay
+    /// does not). Coordinating sibling execution
     /// into a single launch is a performance optimization; it is deliberately separate from this
     /// correctness boundary.
     /// </summary>
@@ -120,7 +122,8 @@ public partial class CpuEngine
     protected Tensor<T>[] CaptureInferenceKernelOutputs<T>(
         Tensor<T>[] inputs,
         Func<IEngine, Tensor<T>[]> execute,
-        [CallerMemberName] string operationName = "")
+        [CallerMemberName] string operationName = "",
+        object[]? savedState = null)
     {
         var scope = GraphMode.Current
             ?? throw new InvalidOperationException("Inference kernel capture requires an active graph scope.");
@@ -160,7 +163,8 @@ public partial class CpuEngine
                         throw new InvalidOperationException(
                             $"{operationName} changed its output count between trace and replay.");
                     DirectGpuTensorEngine.CopyResultInto(engine, results[selectedOutput], output);
-                });
+                },
+                savedState: savedState);
         }
 
         return captured;

@@ -1,3 +1,4 @@
+using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -19,8 +20,8 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
     private static readonly HashSet<string> Supported = new(StringComparer.Ordinal)
     {
         "TensorAdd", "TensorBroadcastAdd", "TensorSubtract", "TensorBroadcastSubtract", "TensorMultiply",
-        "TensorBroadcastMultiply", "TensorDivide", "TensorMax", "TensorMin", "TensorPowerTensor",
-        "TensorMatMul", "TensorBatchMatMul", "BatchMatMul",
+        "TensorBroadcastMultiply", "TensorDivide", "TensorBroadcastDivide", "TensorMax", "TensorMin", "TensorPowerTensor",
+        "TensorMatMul", "TensorBatchMatMul", "BatchMatMul", "Equal",
         "ReLU", "Sigmoid", "Tanh", "GELU", "LeakyReLU", "Softmax",
         "TensorExp", "TensorLog", "TensorSqrt", "TensorAbs", "TensorNegate", "TensorPower", "TensorErfc",
         "TensorSign", "TensorFloor", "TensorCeiling", "TensorRound", "Floor", "Ceiling", "Round", "Sign",
@@ -28,10 +29,22 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
         "Reshape", "TensorTranspose", "TensorPermute", "TensorSqueeze", "TensorExpandDims", "Expand",
         "TensorSlice", "TensorSplit", "Concat", "Concatenate", "Gather",
         "Conv2D", "ConvTranspose2D", "MaxPool2D", "AvgPool2D", "Pad",
-        "BatchNormInference", "LayerNorm", "ReduceSum", "ReduceMean",
+        "BatchNormInference", "LayerNorm", "LayerNorm[0]", "ReduceSum", "ReduceMean", "FusedLinear",
     };
 
-    internal bool CanTranslate(CompiledStep<T> step) => Supported.Contains(step.OpName);
+    /// <summary>Pads folded into the conv or pool that reads them: the padded tensor, its source and the padding.</summary>
+    private readonly Dictionary<Tensor<T>, (string Source, int Top, int Left, int Bottom, int Right)> _foldedPads =
+        new(OnnxGraphWriter<T>.TensorIdentity.Instance);
+
+    internal bool CanTranslate(CompiledStep<T> step)
+    {
+        if (!Supported.Contains(step.OpName)) return false;
+        // A fused linear translates when its activation has an exact ONNX form without parameters.
+        return step.OpName != "FusedLinear" || FusedActivation(step) is
+            FusedActivationType.None or FusedActivationType.ReLU or FusedActivationType.Sigmoid or
+            FusedActivationType.Tanh or FusedActivationType.GELU or FusedActivationType.Softmax or
+            FusedActivationType.Swish;
+    }
 
     internal void Translate(CompiledStep<T> step, string[] inputs, string output)
     {
@@ -48,10 +61,19 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
             case "TensorBroadcastSubtract": Binary("Sub", inputs, output); return;
             case "TensorMultiply":
             case "TensorBroadcastMultiply": Binary("Mul", inputs, output); return;
-            case "TensorDivide": Binary("Div", inputs, output); return;
+            case "TensorDivide":
+            case "TensorBroadcastDivide": Binary("Div", inputs, output); return;
             case "TensorMax": Binary("Max", inputs, output); return;
             case "TensorMin": Binary("Min", inputs, output); return;
             case "TensorPowerTensor": Binary("Pow", inputs, output); return;
+            case "Equal":
+            {
+                // The plan holds the comparison as 1/0 in the element type; ONNX Equal yields bool.
+                string equal = _w.NewName("equal");
+                _w.AddNode("Equal", new[] { inputs[0], inputs[1] }, new[] { equal });
+                _w.AddNode("Cast", new[] { equal }, new[] { output }, Int("to", OnnxGraphWriter<T>.ElementType));
+                return;
+            }
             case "TensorMatMul":
             case "TensorBatchMatMul":
             case "BatchMatMul": Binary("MatMul", inputs, output); return;
@@ -160,15 +182,20 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
                 _w.AddNode("BatchNormalization", inputs, new[] { output }, Float("epsilon", StateDouble(step, 0)));
                 return;
             case "LayerNorm":
+            case "LayerNorm[0]":
             {
                 // The engine normalizes over the trailing dimensions gamma spans.
                 int axis = step.Inputs[0].Rank - step.Inputs[1].Rank;
-                double epsilon = state is { Length: > 2 } && state[2] is double e ? e : 1e-5;
+                // The traced form saves [mean, variance, epsilon]; the inference capture saves [epsilon].
+                int epsilonIndex = step.OpName == "LayerNorm" ? 2 : 0;
+                if (state is null || state.Length <= epsilonIndex || state[epsilonIndex] is not double epsilon)
+                    throw new NotSupportedException($"The {step.OpName} step does not record its epsilon.");
                 _w.AddNode("LayerNormalization", inputs, new[] { output }, Int("axis", axis), Float("epsilon", epsilon));
                 return;
             }
             case "ReduceSum":
             case "ReduceMean": Reduce(step, inputs, output); return;
+            case "FusedLinear": FusedLinear(step, inputs, output); return;
         }
         throw new NotSupportedException($"No ONNX translation for '{step.OpName}'.");
     }
@@ -230,7 +257,7 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
 
     private bool IsAllZeroConstant(Tensor<T> t)
     {
-        if (_w.IsRuntimeValue(t) || t.Layout != TensorLayout.Nchw || !t.IsContiguous) return false;
+        if (_w.IsRuntimeValue(t) || t.Layout != LinearAlgebra.TensorLayout.Nchw || !t.IsContiguous) return false;
         var ops = MathHelper.GetNumericOperations<T>();
         foreach (var v in t.AsSpan())
         {
@@ -269,9 +296,32 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
 
     private void Gather(CompiledStep<T> step, string[] inputs, string output)
     {
-        // state: the indices (int[], flattened) and the axis. The indices' shape is the output's shape at the gathered
-        // axis minus the data's remaining dims.
-        int axis = Normalize(StateInt(step, 1), step.Inputs[0].Rank);
+        int dataRank = step.Inputs[0].Rank;
+        if (step.Inputs.Length == 2)
+        {
+            // The ONNX importer's form: the indices are a tensor input holding integer values; state: the axis.
+            int gatherAxis = Normalize(StateInt(step, 0), dataRank);
+            var indicesTensor = step.Inputs[1];
+            string indicesName;
+            if (_w.IsRuntimeValue(indicesTensor))
+            {
+                indicesName = _w.NewName("indices");
+                _w.AddNode("Cast", new[] { inputs[1] }, new[] { indicesName },
+                    Int("to", (long)Protos.TensorProto.Types.DataType.Int64));
+            }
+            else
+            {
+                var ops = MathHelper.GetNumericOperations<T>();
+                var values = indicesTensor.ToArray().Select(v => (long)Math.Round(ops.ToDouble(v))).ToArray();
+                indicesName = _w.AddInt64(values, indicesTensor._shape);
+            }
+            _w.AddNode("Gather", new[] { inputs[0], indicesName }, new[] { output }, Int("axis", gatherAxis));
+            return;
+        }
+
+        // The engine's form: state holds the indices and the axis. The indices' shape is the output's shape at the
+        // gathered axis minus the data's remaining dims.
+        int axis = Normalize(StateInt(step, 1), dataRank);
         var indicesState = State(step, 0);
         long[] indices = indicesState switch
         {
@@ -279,10 +329,46 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
             Tensor<int> t => t.ToArray().Select(i => (long)i).ToArray(),
             _ => throw new NotSupportedException($"Gather saved indices of type {indicesState.GetType().Name}."),
         };
-        int dataRank = step.Inputs[0].Rank;
         int indicesRank = step.OutputBuffer.Rank - dataRank + 1;
         var indicesShape = step.OutputBuffer._shape.Skip(axis).Take(indicesRank).ToArray();
         _w.AddNode("Gather", new[] { inputs[0], _w.AddInt64(indices, indicesShape) }, new[] { output }, Int("axis", axis));
+    }
+
+    private static FusedActivationType? FusedActivation(CompiledStep<T> step)
+        => step.SavedState is { Length: > 0 } state ? state[0] as FusedActivationType? : FusedActivationType.None;
+
+    /// <summary>input @ weights (+ bias), then the activation: MatMul, Add and the activation's ONNX operator.</summary>
+    private void FusedLinear(CompiledStep<T> step, string[] inputs, string output)
+    {
+        var activation = FusedActivation(step) ?? throw new NotSupportedException("FusedLinear saved no activation.");
+        bool hasBias = inputs.Length > 2;
+        string linear = hasBias || activation != FusedActivationType.None ? _w.NewName("linear") : output;
+        _w.AddNode("MatMul", new[] { inputs[0], inputs[1] }, new[] { linear });
+        string pre = linear;
+        if (hasBias)
+        {
+            pre = activation == FusedActivationType.None ? output : _w.NewName("biased");
+            _w.AddNode("Add", new[] { linear, inputs[2] }, new[] { pre });
+        }
+        switch (activation)
+        {
+            case FusedActivationType.None: return;
+            case FusedActivationType.ReLU: _w.AddNode("Relu", new[] { pre }, new[] { output }); return;
+            case FusedActivationType.Sigmoid: _w.AddNode("Sigmoid", new[] { pre }, new[] { output }); return;
+            case FusedActivationType.Tanh: _w.AddNode("Tanh", new[] { pre }, new[] { output }); return;
+            case FusedActivationType.GELU: Gelu(pre, output); return;   // the fused epilogue is the tanh form
+            case FusedActivationType.Softmax:
+                _w.AddNode("Softmax", new[] { pre }, new[] { output }, Int("axis", -1));
+                return;
+            case FusedActivationType.Swish:
+            {
+                string sig = _w.NewName("sigmoid");
+                _w.AddNode("Sigmoid", new[] { pre }, new[] { sig });
+                _w.AddNode("Mul", new[] { pre, sig }, new[] { output });
+                return;
+            }
+        }
+        throw new NotSupportedException($"FusedLinear activation {activation} has no ONNX translation.");
     }
 
     private void Conv(CompiledStep<T> step, string[] inputs, string output)
@@ -293,10 +379,11 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
         var pads = Pair(StateInts(step, 1));
         var dilations = Pair(StateInts(step, 2));
         int group = x._shape[1] / w._shape[1];
+        var allPads = WithFoldedPad(step, inputs, pads);
         _w.AddNode("Conv", new[] { inputs[0], inputs[1] }, new[] { output },
             Ints("kernel_shape", new[] { w._shape[2], w._shape[3] }),
             Ints("strides", strides),
-            Ints("pads", new[] { pads[0], pads[1], pads[0], pads[1] }),
+            Ints("pads", allPads),
             Ints("dilations", dilations),
             Int("group", group));
     }
@@ -329,8 +416,9 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
         var kernel = Pair(StateInts(step, 0));
         var strides = step.SavedState is { Length: > 1 } ? Pair(StateInts(step, 1)) : kernel;
         int pad = step.SavedState is { Length: > 2 } ? StateInt(step, 2) : 0;
+        var allPads = WithFoldedPad(step, inputs, new[] { pad, pad });
         _w.AddNode("MaxPool", new[] { inputs[0] }, new[] { output },
-            Ints("kernel_shape", kernel), Ints("strides", strides), Ints("pads", new[] { pad, pad, pad, pad }));
+            Ints("kernel_shape", kernel), Ints("strides", strides), Ints("pads", allPads));
     }
 
     private void AvgPool(CompiledStep<T> step, string[] inputs, string output)
@@ -340,9 +428,12 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
         var strides = Pair(StateInts(step, 1));
         var pads = Pair(StateInts(step, 2));
         bool countIncludePad = step.SavedState is { Length: > 3 } && step.SavedState[3] is bool b && b;
+        // A folded zero pad was averaged over as real elements: count_include_pad's semantics.
+        if (_foldedPads.ContainsKey(step.Inputs[0])) countIncludePad = true;
+        var allPads = WithFoldedPad(step, inputs, pads);
         _w.AddNode("AveragePool", new[] { inputs[0] }, new[] { output },
             Ints("kernel_shape", kernel), Ints("strides", strides),
-            Ints("pads", new[] { pads[0], pads[1], pads[0], pads[1] }),
+            Ints("pads", allPads),
             Int("count_include_pad", countIncludePad ? 1 : 0));
     }
 
@@ -354,6 +445,20 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
         int top = StateInt(step, 0), left = StateInt(step, 1), bottom = StateInt(step, 2), right = StateInt(step, 3);
         double value = StateDouble(step, 4);
         int rank = step.Inputs[0].Rank;
+        // A pad whose only reader is a conv or pool becomes that operator's (possibly asymmetric) pads, the form the
+        // importer lowered it from: zero for conv and average pool, -inf for max pool.
+        var reader = _w.SoleReader(step.OutputBuffer);
+        bool foldable = reader?.OpName switch
+        {
+            "Conv2D" or "AvgPool2D" => value == 0,
+            "MaxPool2D" => double.IsNegativeInfinity(value) || value <= -3.0e38,
+            _ => false,
+        };
+        if (rank == 4 && foldable && reader is not null && ReferenceEquals(reader.Inputs[0], step.OutputBuffer))
+        {
+            _foldedPads[step.OutputBuffer] = (inputs[0], top, left, bottom, right);
+            return;
+        }
         var pads = new long[2 * rank];
         pads[rank - 2] = top; pads[rank - 1] = left;
         pads[2 * rank - 2] = bottom; pads[2 * rank - 1] = right;
@@ -373,6 +478,21 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
             _w.AddNode(op, new[] { inputs[0], _w.AddInt64(axes) }, new[] { output }, Int("keepdims", keepDims ? 1 : 0));
         else
             _w.AddNode(op, new[] { inputs[0] }, new[] { output }, Ints("axes", axes), Int("keepdims", keepDims ? 1 : 0));
+    }
+
+    /// <summary>
+    /// ONNX pads [top, left, bottom, right] for a conv or pool with symmetric <paramref name="symmetric"/> padding, plus
+    /// a pad folded into it; a folded pad's source replaces the step's first input.
+    /// </summary>
+    private int[] WithFoldedPad(CompiledStep<T> step, string[] inputs, int[] symmetric)
+    {
+        var pads = new[] { symmetric[0], symmetric[1], symmetric[0], symmetric[1] };
+        if (_foldedPads.TryGetValue(step.Inputs[0], out var folded))
+        {
+            inputs[0] = folded.Source;
+            pads[0] += folded.Top; pads[1] += folded.Left; pads[2] += folded.Bottom; pads[3] += folded.Right;
+        }
+        return pads;
     }
 
     private static int[] Pair(int[] values) => values.Length switch

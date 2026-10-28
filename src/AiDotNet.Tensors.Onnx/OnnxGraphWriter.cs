@@ -19,6 +19,7 @@ internal sealed class OnnxGraphWriter<T> where T : unmanaged
     private readonly HashSet<string> _usedNames = new(StringComparer.Ordinal);
     private readonly HashSet<TensorStorage<T>> _dynamicStorages = new(ReferenceEqualityComparer<TensorStorage<T>>.Instance);
     private readonly HashSet<Tensor<T>> _initializers = new(ReferenceEqualityComparer<Tensor<T>>.Instance);
+    private readonly Dictionary<Tensor<T>, CompiledStep<T>?> _soleReader = new(ReferenceEqualityComparer<Tensor<T>>.Instance);
     private int _nextId;
 
     internal OnnxGraphWriter(OnnxExportOptions options)
@@ -54,8 +55,10 @@ internal sealed class OnnxGraphWriter<T> where T : unmanaged
             _dynamicStorages.Add(pair.Value._storage);
             _graph.Input.Add(ValueInfo(name, pair.Value._shape, elementType));
         }
+        steps = LiveSteps(steps, outputs.Values);
         // Every buffer a step writes is runtime data, never an initializer, whichever tensor object views it.
         foreach (var step in steps) _dynamicStorages.Add(step.OutputBuffer._storage);
+        IndexReaders(steps, outputs.Values);
 
         var translator = new OnnxStepTranslator<T>(this);
         var unsupported = new List<string>();
@@ -87,6 +90,7 @@ internal sealed class OnnxGraphWriter<T> where T : unmanaged
             _graph.Output.Add(ValueInfo(name, pair.Value._shape, elementType));
         }
 
+        PruneUnusedInitializers();
         var model = new ModelProto
         {
             IrVersion = 8,
@@ -96,6 +100,62 @@ internal sealed class OnnxGraphWriter<T> where T : unmanaged
         };
         model.OpsetImport.Add(new OperatorSetIdProto { Domain = string.Empty, Version = Opset });
         return model;
+    }
+
+    /// <summary>
+    /// The steps the outputs depend on, in order. Steps whose results nothing reads (for example the mean and variance
+    /// a layer norm also produces) are dropped. A step that overwrites a tensor ends that tensor's earlier value.
+    /// </summary>
+    private static CompiledStep<T>[] LiveSteps(CompiledStep<T>[] steps, IEnumerable<Tensor<T>> outputs)
+    {
+        var live = new HashSet<Tensor<T>>(outputs, ReferenceEqualityComparer<Tensor<T>>.Instance);
+        var keep = new bool[steps.Length];
+        for (int i = steps.Length - 1; i >= 0; i--)
+        {
+            var step = steps[i];
+            if (!live.Remove(step.OutputBuffer)) continue;
+            keep[i] = true;
+            foreach (var input in step.Inputs) live.Add(input);
+        }
+        var result = new List<CompiledStep<T>>(steps.Length);
+        for (int i = 0; i < steps.Length; i++)
+            if (keep[i]) result.Add(steps[i]);
+        return result.ToArray();
+    }
+
+    /// <summary>Records, for every tensor a step produces, the one step that reads it (null when several do).</summary>
+    private void IndexReaders(CompiledStep<T>[] steps, IEnumerable<Tensor<T>> outputs)
+    {
+        foreach (var output in outputs) _soleReader[output] = null;   // a graph output has an outside reader
+        foreach (var step in steps)
+        {
+            foreach (var input in step.Inputs)
+            {
+                if (_soleReader.TryGetValue(input, out var existing))
+                {
+                    if (!ReferenceEquals(existing, step)) _soleReader[input] = null;
+                }
+                else
+                {
+                    _soleReader[input] = step;
+                }
+            }
+        }
+    }
+
+    /// <summary>The only step reading <paramref name="tensor"/>, or null when it has several readers or is an output.</summary>
+    internal CompiledStep<T>? SoleReader(Tensor<T> tensor) => _soleReader.TryGetValue(tensor, out var reader) ? reader : null;
+
+    /// <summary>Removes initializers no node reads (a constant a translation replaced, such as an elided zero).</summary>
+    private void PruneUnusedInitializers()
+    {
+        var read = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var node in _graph.Node)
+            foreach (var input in node.Input)
+                read.Add(input);
+        for (int i = _graph.Initializer.Count - 1; i >= 0; i--)
+            if (!read.Contains(_graph.Initializer[i].Name))
+                _graph.Initializer.RemoveAt(i);
     }
 
     // ── Names ──────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -188,6 +248,14 @@ internal sealed class OnnxGraphWriter<T> where T : unmanaged
         var tensorType = new TypeProto.Types.Tensor { ElemType = elementType, Shape = new TensorShapeProto() };
         foreach (var d in shape) tensorType.Shape.Dim.Add(new TensorShapeProto.Types.Dimension { DimValue = d });
         return new ValueInfoProto { Name = name, Type = new TypeProto { TensorType = tensorType } };
+    }
+
+    /// <summary>Tensor identity (reference) equality.</summary>
+    internal sealed class TensorIdentity : IEqualityComparer<Tensor<T>>
+    {
+        public static readonly TensorIdentity Instance = new();
+        public bool Equals(Tensor<T>? x, Tensor<T>? y) => ReferenceEquals(x, y);
+        public int GetHashCode(Tensor<T> obj) => RuntimeHelpers.GetHashCode(obj);
     }
 
     private sealed class ReferenceEqualityComparer<TItem> : IEqualityComparer<TItem> where TItem : class
