@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP launcher shims for the vision detection kernels (Issue #217).
 // Direct port of CudaBackend.Detection.cs — kernel resolved from
 // _kernelCache, dispatched via 256-thread block / grid-ceil.
