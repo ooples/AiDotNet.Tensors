@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // GPU dispatch for the audio primitives that have native kernels (the
 // composable ops — Spectrogram, PitchShift, TimeStretch — stay on the
 // inherited CpuEngine path since they internally call the already

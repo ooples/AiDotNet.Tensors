@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // DirectGpuTensorEngine GPU routing for torch.linalg decompositions (#211).
 // Each method tries the GPU path (via ILinalgBackend on the active backend)
 // and falls back to the managed CPU implementation when:

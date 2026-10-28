@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CPU reference implementations for the tail of Issue #217:
 //   RoI family: RoIAlign, RoIPool, PsRoIAlign, PsRoIPool
 //   Audio primitives: Spectrogram, AmplitudeToDB, MuLaw encode/decode,
