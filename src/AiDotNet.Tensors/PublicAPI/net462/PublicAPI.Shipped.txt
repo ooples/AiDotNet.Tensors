@@ -1,0 +1,633 @@
+#nullable enable
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.GraphedInferenceStep.GraphedInferenceStep(AiDotNet.Tensors.Engines.DirectGpu.IDirectGpuBackend! backend, System.IntPtr stream, System.Action! forward, AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.GraphedInferenceStepOptions? options = null) -> void
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.GraphedTrainingStep.GraphedTrainingStep(AiDotNet.Tensors.Engines.DirectGpu.IDirectGpuBackend! backend, System.IntPtr stream, System.Action! trainingStep, AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.GraphedTrainingStepOptions? options = null) -> void
+AiDotNet.Tensors.Engines.CudaBlasContext.CublasHandle.get -> System.IntPtr
+AiDotNet.Tensors.Engines.CudaDeviceMemory<T>.DevicePtr.get -> System.IntPtr
+AiDotNet.Tensors.Engines.CuDnnActivation.BackwardGpu(System.IntPtr outputDevPtr, System.IntPtr gradOutputDevPtr, System.IntPtr inputDevPtr, System.IntPtr gradInputDevPtr, int n, int c, int h, int w, AiDotNet.Tensors.Engines.CuDnnNative.CudnnActivationMode mode, double coef = 0, AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType dataType = AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType.Float) -> void
+AiDotNet.Tensors.Engines.CuDnnActivation.ForwardGpu(System.IntPtr inputDevPtr, System.IntPtr outputDevPtr, int n, int c, int h, int w, AiDotNet.Tensors.Engines.CuDnnNative.CudnnActivationMode mode, double coef = 0, AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType dataType = AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType.Float) -> void
+AiDotNet.Tensors.Engines.CuDnnActivationDescriptor.Handle.get -> System.IntPtr
+AiDotNet.Tensors.Engines.CuDnnBatchNorm.BackwardGpu(System.IntPtr inputDevPtr, System.IntPtr gradOutputDevPtr, System.IntPtr gradInputDevPtr, System.IntPtr scaleDevPtr, System.IntPtr gradScaleDevPtr, System.IntPtr gradBiasDevPtr, System.IntPtr savedMeanDevPtr, System.IntPtr savedInvVarDevPtr, int n, int c, int h, int w, double epsilon = 1E-05, AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType dataType = AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType.Float) -> void
+AiDotNet.Tensors.Engines.CuDnnBatchNorm.ForwardInferenceGpu(System.IntPtr inputDevPtr, System.IntPtr outputDevPtr, System.IntPtr scaleDevPtr, System.IntPtr biasDevPtr, System.IntPtr runningMeanDevPtr, System.IntPtr runningVarDevPtr, int n, int c, int h, int w, double epsilon = 1E-05, AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType dataType = AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType.Float) -> void
+AiDotNet.Tensors.Engines.CuDnnBatchNorm.ForwardTrainingGpu(System.IntPtr inputDevPtr, System.IntPtr outputDevPtr, System.IntPtr scaleDevPtr, System.IntPtr biasDevPtr, System.IntPtr runningMeanDevPtr, System.IntPtr runningVarDevPtr, System.IntPtr saveMeanDevPtr, System.IntPtr saveInvVarDevPtr, int n, int c, int h, int w, double epsilon = 1E-05, double momentum = 0.1, AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType dataType = AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType.Float) -> void
+AiDotNet.Tensors.Engines.CuDnnContext.Handle.get -> System.IntPtr
+AiDotNet.Tensors.Engines.CuDnnConvolution.Conv2DBackwardDataGpu(System.IntPtr filterDevPtr, System.IntPtr gradOutputDevPtr, System.IntPtr gradInputDevPtr, int n, int c, int h, int w, int k, int filterH, int filterW, int outputHeight, int outputWidth, int padH = 0, int padW = 0, int strideH = 1, int strideW = 1, int dilationH = 1, int dilationW = 1, AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType dataType = AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType.Float, int algorithm = -1, AiDotNet.Tensors.Engines.CuDnnNative.CudnnMathType mathType = AiDotNet.Tensors.Engines.CuDnnNative.CudnnMathType.TensorOp) -> void
+AiDotNet.Tensors.Engines.CuDnnConvolution.Conv2DBackwardFilterGpu(System.IntPtr inputDevPtr, System.IntPtr gradOutputDevPtr, System.IntPtr gradFilterDevPtr, int n, int c, int h, int w, int k, int filterH, int filterW, int outputHeight, int outputWidth, int padH = 0, int padW = 0, int strideH = 1, int strideW = 1, int dilationH = 1, int dilationW = 1, AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType dataType = AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType.Float, int algorithm = -1, AiDotNet.Tensors.Engines.CuDnnNative.CudnnMathType mathType = AiDotNet.Tensors.Engines.CuDnnNative.CudnnMathType.TensorOp) -> void
+AiDotNet.Tensors.Engines.CuDnnConvolution.Conv2DForwardGpu(System.IntPtr inputDevPtr, System.IntPtr filterDevPtr, System.IntPtr outputDevPtr, int n, int c, int h, int w, int k, int filterH, int filterW, int outputHeight, int outputWidth, int padH = 0, int padW = 0, int strideH = 1, int strideW = 1, int dilationH = 1, int dilationW = 1, AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType dataType = AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType.Float, int algorithm = -1, AiDotNet.Tensors.Engines.CuDnnNative.CudnnMathType mathType = AiDotNet.Tensors.Engines.CuDnnNative.CudnnMathType.TensorOp) -> void
+AiDotNet.Tensors.Engines.CuDnnConvolutionDescriptor.Handle.get -> System.IntPtr
+AiDotNet.Tensors.Engines.CuDnnFilterDescriptor.Handle.get -> System.IntPtr
+AiDotNet.Tensors.Engines.CuDnnPooling.BackwardGpu(System.IntPtr outputDevPtr, System.IntPtr gradOutputDevPtr, System.IntPtr inputDevPtr, System.IntPtr gradInputDevPtr, int n, int c, int h, int w, int outputH, int outputW, int windowH, int windowW, int padH, int padW, int strideH, int strideW, AiDotNet.Tensors.Engines.CuDnnNative.CudnnPoolingMode mode, AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType dataType = AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType.Float) -> void
+AiDotNet.Tensors.Engines.CuDnnPooling.ForwardGpu(System.IntPtr inputDevPtr, System.IntPtr outputDevPtr, int n, int c, int h, int w, int outputH, int outputW, int windowH, int windowW, int padH, int padW, int strideH, int strideW, AiDotNet.Tensors.Engines.CuDnnNative.CudnnPoolingMode mode, AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType dataType = AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType.Float) -> void
+AiDotNet.Tensors.Engines.CuDnnPoolingDescriptor.Handle.get -> System.IntPtr
+AiDotNet.Tensors.Engines.CuDnnSoftmax.BackwardGpu(System.IntPtr outputDevPtr, System.IntPtr gradOutputDevPtr, System.IntPtr gradInputDevPtr, int n, int c, int h = 1, int w = 1, AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType dataType = AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType.Float) -> void
+AiDotNet.Tensors.Engines.CuDnnSoftmax.ForwardGpu(System.IntPtr inputDevPtr, System.IntPtr outputDevPtr, int n, int c, int h = 1, int w = 1, AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType dataType = AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType.Float) -> void
+AiDotNet.Tensors.Engines.CuDnnTensorDescriptor.Handle.get -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.CuBlasLtMatmul.MatmulFused(System.IntPtr aDev, int m, int k, bool transA, System.IntPtr bDev, int n, bool transB, System.IntPtr cDev, System.IntPtr dDev, System.IntPtr biasDev, AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasLtEpilogue epilogue, float alpha = 1, float beta = 0, System.IntPtr workspace = default(System.IntPtr), ulong workspaceSizeInBytes = 0, System.IntPtr stream = default(System.IntPtr), AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasDataType dtype = AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasDataType.Float32, AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasComputeType computeType = AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasComputeType.Float32, AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasDataType? outputDtype = null) -> void
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.CuBlasLtMatmul.MatmulInt8ToInt32(System.IntPtr aDev, int m, int k, bool transA, System.IntPtr bDev, int n, bool transB, System.IntPtr dDev, System.IntPtr stream = default(System.IntPtr)) -> void
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.CaptureGraph(System.Action! launch) -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.DestroyCapturedGraph(System.IntPtr graphExec) -> void
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.EnqueueCapturedGraph(System.IntPtr graphExec) -> void
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.LaunchCapturedGraph(System.IntPtr graphExec) -> void
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.TryUpdateCapturedGraph(System.IntPtr graphExec, System.Action! relaunch) -> bool
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaEvent.Handle.get -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaOffloadAllocator.CudaOffloadAllocator(System.IntPtr sharedContext) -> void
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaOffloadAllocator.WrapDevicePointerAsBuffer(System.IntPtr devicePointer, int elementCount, int elementByteSize) -> AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer?
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaStream.Handle.get -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclComm.AllGather(System.IntPtr sendBuf, System.IntPtr recvBuf, ulong sendCount, AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclDataType dtype, System.IntPtr stream) -> void
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclComm.AllReduce(System.IntPtr sendBuf, System.IntPtr recvBuf, ulong count, AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclDataType dtype, AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclRedOp op, System.IntPtr stream) -> void
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclComm.Broadcast(System.IntPtr sendBuf, System.IntPtr recvBuf, ulong count, AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclDataType dtype, int root, System.IntPtr stream) -> void
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclComm.Handle.get -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclComm.Recv(System.IntPtr buf, ulong count, AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclDataType dtype, int peer, System.IntPtr stream) -> void
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclComm.Reduce(System.IntPtr sendBuf, System.IntPtr recvBuf, ulong count, AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclDataType dtype, AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclRedOp op, int root, System.IntPtr stream) -> void
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclComm.ReduceScatter(System.IntPtr sendBuf, System.IntPtr recvBuf, ulong recvCount, AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclDataType dtype, AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclRedOp op, System.IntPtr stream) -> void
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclComm.Send(System.IntPtr buf, ulong count, AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclDataType dtype, int peer, System.IntPtr stream) -> void
+AiDotNet.Tensors.Engines.DirectGpu.GpuOffloadHandle.GpuOffloadHandle(System.IntPtr host, System.IntPtr device, long bytes, AiDotNet.Tensors.LinearAlgebra.OffloadScheme scheme, object? opaque = null) -> void
+AiDotNet.Tensors.Engines.DirectGpu.HIP.HipDeviceProperties.HdpMemFlushCntl -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.HIP.HipDeviceProperties.HdpRegFlushCntl -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.HIP.HipDeviceProperties.MaxSharedMemoryPerMultiProcessor -> System.UIntPtr
+AiDotNet.Tensors.Engines.DirectGpu.HIP.HipDeviceProperties.MemPitch -> System.UIntPtr
+AiDotNet.Tensors.Engines.DirectGpu.HIP.HipDeviceProperties.ReservedSharedMemPerBlock -> System.UIntPtr
+AiDotNet.Tensors.Engines.DirectGpu.HIP.HipDeviceProperties.SharedMemPerBlock -> System.UIntPtr
+AiDotNet.Tensors.Engines.DirectGpu.HIP.HipDeviceProperties.SharedMemPerBlockOptin -> System.UIntPtr
+AiDotNet.Tensors.Engines.DirectGpu.HIP.HipDeviceProperties.SharedMemPerMultiprocessor -> System.UIntPtr
+AiDotNet.Tensors.Engines.DirectGpu.HIP.HipDeviceProperties.SurfaceAlignment -> System.UIntPtr
+AiDotNet.Tensors.Engines.DirectGpu.HIP.HipDeviceProperties.TextureAlignment -> System.UIntPtr
+AiDotNet.Tensors.Engines.DirectGpu.HIP.HipDeviceProperties.TexturePitchAlignment -> System.UIntPtr
+AiDotNet.Tensors.Engines.DirectGpu.HIP.HipDeviceProperties.TotalConstMem -> System.UIntPtr
+AiDotNet.Tensors.Engines.DirectGpu.HIP.HipDeviceProperties.TotalGlobalMem -> System.UIntPtr
+AiDotNet.Tensors.Engines.DirectGpu.HIP.HipEvent.Handle.get -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.HIP.HipStream.Handle.get -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer.Handle.get -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.IGpuDevicePointerWrapper.WrapDevicePointerAsBuffer(System.IntPtr devicePointer, int elementCount, int elementByteSize) -> AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer?
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalCommandQueue.CalculateThreadgroupSize(System.IntPtr pipelineState, int workSize) -> (AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MTLSize Threadgroups, AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MTLSize ThreadsPerThreadgroup)
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalCommandQueue.CalculateThreadgroupSize2D(System.IntPtr pipelineState, int width, int height) -> (AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MTLSize Threadgroups, AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MTLSize ThreadsPerThreadgroup)
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalCommandQueue.CreateBlitEncoder(System.IntPtr commandBuffer) -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalCommandQueue.CreateCommandBuffer() -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalCommandQueue.CreateCommandBufferUnretained() -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalCommandQueue.CreateComputeEncoder(System.IntPtr commandBuffer) -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalCommandQueue.ExecuteSync(System.IntPtr pipelineState, System.Action<System.IntPtr>! setupAction, AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MTLSize threadgroups, AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MTLSize threadsPerThreadgroup) -> void
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalCommandQueue.Handle.get -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalDevice.CreateBuffer(ulong sizeInBytes, AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MTLResourceOptions options = AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MTLResourceOptions.CPUCacheModeDefaultCache) -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalDevice.CreateBufferWithData(System.IntPtr data, ulong sizeInBytes, AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MTLResourceOptions options = AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MTLResourceOptions.CPUCacheModeDefaultCache) -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalDevice.CreateCommandQueue() -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalDevice.CreateCommandQueue(ulong maxCommandBufferCount) -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalDevice.CreateComputePipelineState(System.IntPtr function, out string? error) -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalDevice.CreateLibrary(string! source, out string? error) -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalDevice.CreateLibrary(string! source, System.IntPtr compileOptions, out string? error) -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalDevice.Handle.get -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalGpuBuffer.Contents.get -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalGpuBuffer.CopyFromPointer(System.IntPtr source, int sizeInBytes, int offsetInBytes = 0) -> void
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalGpuBuffer.Handle.get -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalPipelineState.Handle.get -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalShaderLibrary.CompileLibrary(string! libraryName, string! source) -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalShaderLibrary.CompileLibrary(string! libraryName, string! source, bool requireStrictFloatingPoint) -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalShaderLibrary.CreatePipelineState(System.IntPtr function) -> AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalPipelineState!
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalShaderLibrary.GetFunction(System.IntPtr library, string! functionName) -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalShaderLibrary.GetFunctionNames(System.IntPtr library) -> System.Collections.Generic.IReadOnlyList<string!>!
+AiDotNet.Tensors.Engines.DirectGpu.Metal.ScopedComputeEncoder.CommandBuffer.get -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Metal.ScopedComputeEncoder.Handle.get -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Metal.ScopedComputeEncoder.SetBuffer(System.IntPtr buffer, ulong offset, ulong index) -> void
+AiDotNet.Tensors.Engines.DirectGpu.Metal.ScopedComputeEncoder.SetPipelineState(System.IntPtr pipelineState) -> void
+AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClCommandQueue.Handle.get -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClCommandQueue.OpenClCommandQueue(AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend! backend, System.IntPtr context, System.IntPtr device, AiDotNet.Tensors.Engines.Gpu.GpuStreamType streamType, bool enableProfiling = false) -> void
+AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClEvent.Handle.get -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.ThreadCommandResources.CommandBuffer.get -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.ThreadCommandResources.CommandPool.get -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.ThreadCommandResources.Fence.get -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.ThreadCommandResources.ThreadCommandResources(System.IntPtr commandPool, System.IntPtr commandBuffer, System.IntPtr fence) -> void
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkBufferMemoryBarrier.buffer -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkCommandBufferAllocateInfo.commandPool -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkComputePipelineCreateInfo.basePipelineHandle -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkComputePipelineCreateInfo.layout -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkDescriptorBufferInfo.buffer -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkDescriptorSetAllocateInfo.descriptorPool -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkDescriptorSetAllocateInfo.pSetLayouts -> System.IntPtr*
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkDescriptorSetLayoutBinding.pImmutableSamplers -> System.IntPtr*
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkMappedMemoryRange.memory -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkPipelineLayoutCreateInfo.pSetLayouts -> System.IntPtr*
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkPipelineShaderStageCreateInfo.module -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkSubmitInfo.pCommandBuffers -> System.IntPtr*
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkSubmitInfo.pSignalSemaphores -> System.IntPtr*
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkSubmitInfo.pWaitSemaphores -> System.IntPtr*
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkWriteDescriptorSet.dstSet -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBuffer.Handle.get -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBuffer.Memory.get -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanComputePipeline.DescriptorSet.get -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanComputePipeline.Handle.get -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanComputePipeline.Layout.get -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanDevice.CommandPool.get -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanDevice.ComputeQueue.get -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanDevice.Device.get -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanDevice.Fence.get -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanDevice.SubmitAndWait(System.IntPtr commandBuffer) -> void
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanDevice.SubmitAndWait(System.IntPtr commandBuffer, System.IntPtr fence) -> void
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanGpuBuffer.Handle.get -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanShaderModule.Handle.get -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CaptureGpuGraph(System.Action! forward) -> System.IntPtr
+AiDotNet.Tensors.Engines.DirectGpuTensorEngine.DestroyGpuGraph(System.IntPtr graphExec) -> void
+AiDotNet.Tensors.Engines.DirectGpuTensorEngine.LaunchGpuGraph(System.IntPtr graphExec) -> void
+AiDotNet.Tensors.Engines.Gpu.CudaGraphScope.CudaGraphScope(AiDotNet.Tensors.Engines.DirectGpu.IDirectGpuBackend! backend, System.IntPtr stream) -> void
+AiDotNet.Tensors.Engines.Gpu.IGpuEvent.Handle.get -> System.IntPtr
+AiDotNet.Tensors.Engines.Gpu.IGpuStream.Handle.get -> System.IntPtr
+AiDotNet.Tensors.Engines.Gpu.IInferenceGraphCaptureEngine.CaptureGpuGraph(System.Action! forward) -> System.IntPtr
+AiDotNet.Tensors.Engines.Gpu.IInferenceGraphCaptureEngine.DestroyGpuGraph(System.IntPtr graphExec) -> void
+AiDotNet.Tensors.Engines.Gpu.IInferenceGraphCaptureEngine.LaunchGpuGraph(System.IntPtr graphExec) -> void
+AiDotNet.Tensors.Engines.OpenClBuffer<T>.Handle.get -> System.IntPtr
+AiDotNet.Tensors.Engines.OpenClContext.CommandQueue.get -> System.IntPtr
+AiDotNet.Tensors.Engines.OpenClContext.Device.get -> System.IntPtr
+AiDotNet.Tensors.Engines.OpenClContext.Handle.get -> System.IntPtr
+AiDotNet.Tensors.Engines.OpenClKernel.Execute1D(System.IntPtr commandQueue, int globalSize, int localSize) -> void
+AiDotNet.Tensors.Engines.OpenClKernel.Execute2D(System.IntPtr commandQueue, int globalSizeX, int globalSizeY, int localSizeX, int localSizeY) -> void
+AiDotNet.Tensors.Engines.OpenClKernel.Handle.get -> System.IntPtr
+AiDotNet.Tensors.Engines.OpenClKernel.SetArg(uint index, System.IntPtr buffer) -> void
+AiDotNet.Tensors.Engines.OpenClProgram.Handle.get -> System.IntPtr
+AiDotNet.Tensors.Engines.Optimized.ICpuOptimizedTensor<T>.NativeMemoryHandle.get -> System.IntPtr
+AiDotNet.Tensors.Engines.Optimized.ICpuOptimizedTensor<T>.OneDnnMemoryDescriptor.get -> System.IntPtr
+AiDotNet.Tensors.Helpers.SecureSeededRandom.Dispose() -> void
+AiDotNet.Tensors.LinearAlgebra.TensorBase<T>.OffloadDevicePointer.get -> System.IntPtr
+AiDotNet.Tensors.LinearAlgebra.TensorBase<T>.OffloadHostPointer.get -> System.IntPtr
+override AiDotNet.Tensors.Bit.Equals(object! obj) -> bool
+override System.Half.Equals(object! obj) -> bool
+override System.Half.GetHashCode() -> int
+override System.Half.ToString() -> string!
+override System.Index.Equals(object? obj) -> bool
+override System.Index.GetHashCode() -> int
+override System.Index.ToString() -> string!
+override System.Range.Equals(object? obj) -> bool
+override System.Range.GetHashCode() -> int
+override System.Range.ToString() -> string!
+readonly AiDotNet.Tensors.Engines.DirectGpu.GpuOffloadHandle.DevicePointer -> System.IntPtr
+readonly AiDotNet.Tensors.Engines.DirectGpu.GpuOffloadHandle.HostPointer -> System.IntPtr
+static AiDotNet.Tensors.Engines.CuBlasNative.cublasCreate(out System.IntPtr handle) -> AiDotNet.Tensors.Engines.CublasStatus
+static AiDotNet.Tensors.Engines.CuBlasNative.cublasDestroy(System.IntPtr handle) -> AiDotNet.Tensors.Engines.CublasStatus
+static AiDotNet.Tensors.Engines.CuBlasNative.cublasDgemm(System.IntPtr handle, AiDotNet.Tensors.Engines.CublasOperation transa, AiDotNet.Tensors.Engines.CublasOperation transb, int m, int n, int k, ref double alpha, System.IntPtr A, int lda, System.IntPtr B, int ldb, ref double beta, System.IntPtr C, int ldc) -> AiDotNet.Tensors.Engines.CublasStatus
+static AiDotNet.Tensors.Engines.CuBlasNative.cublasGemmEx(System.IntPtr handle, AiDotNet.Tensors.Engines.CublasOperation transa, AiDotNet.Tensors.Engines.CublasOperation transb, int m, int n, int k, System.IntPtr alpha, System.IntPtr A, int Atype, int lda, System.IntPtr B, int Btype, int ldb, System.IntPtr beta, System.IntPtr C, int Ctype, int ldc, int computeType, int algo) -> AiDotNet.Tensors.Engines.CublasStatus
+static AiDotNet.Tensors.Engines.CuBlasNative.cublasGemmStridedBatchedEx(System.IntPtr handle, AiDotNet.Tensors.Engines.CublasOperation transa, AiDotNet.Tensors.Engines.CublasOperation transb, int m, int n, int k, System.IntPtr alpha, System.IntPtr A, int Atype, int lda, long strideA, System.IntPtr B, int Btype, int ldb, long strideB, System.IntPtr beta, System.IntPtr C, int Ctype, int ldc, long strideC, int batchCount, int computeType, int algo) -> AiDotNet.Tensors.Engines.CublasStatus
+static AiDotNet.Tensors.Engines.CuBlasNative.cublasGetVersion(System.IntPtr handle, out int version) -> AiDotNet.Tensors.Engines.CublasStatus
+static AiDotNet.Tensors.Engines.CuBlasNative.cublasHgemm(System.IntPtr handle, AiDotNet.Tensors.Engines.CublasOperation transa, AiDotNet.Tensors.Engines.CublasOperation transb, int m, int n, int k, ref ushort alpha, System.IntPtr A, int lda, System.IntPtr B, int ldb, ref ushort beta, System.IntPtr C, int ldc) -> AiDotNet.Tensors.Engines.CublasStatus
+static AiDotNet.Tensors.Engines.CuBlasNative.cublasSaxpy(System.IntPtr handle, int n, ref float alpha, System.IntPtr x, int incx, System.IntPtr y, int incy) -> AiDotNet.Tensors.Engines.CublasStatus
+static AiDotNet.Tensors.Engines.CuBlasNative.cublasScopy(System.IntPtr handle, int n, System.IntPtr x, int incx, System.IntPtr y, int incy) -> AiDotNet.Tensors.Engines.CublasStatus
+static AiDotNet.Tensors.Engines.CuBlasNative.cublasSdot(System.IntPtr handle, int n, System.IntPtr x, int incx, System.IntPtr y, int incy, out float result) -> AiDotNet.Tensors.Engines.CublasStatus
+static AiDotNet.Tensors.Engines.CuBlasNative.cublasSetMathMode(System.IntPtr handle, int mode) -> AiDotNet.Tensors.Engines.CublasStatus
+static AiDotNet.Tensors.Engines.CuBlasNative.cublasSetStream(System.IntPtr handle, System.IntPtr stream) -> AiDotNet.Tensors.Engines.CublasStatus
+static AiDotNet.Tensors.Engines.CuBlasNative.cublasSgemm(System.IntPtr handle, AiDotNet.Tensors.Engines.CublasOperation transa, AiDotNet.Tensors.Engines.CublasOperation transb, int m, int n, int k, ref float alpha, System.IntPtr A, int lda, System.IntPtr B, int ldb, ref float beta, System.IntPtr C, int ldc) -> AiDotNet.Tensors.Engines.CublasStatus
+static AiDotNet.Tensors.Engines.CuBlasNative.cublasSgemmBatched(System.IntPtr handle, AiDotNet.Tensors.Engines.CublasOperation transa, AiDotNet.Tensors.Engines.CublasOperation transb, int m, int n, int k, ref float alpha, System.IntPtr[]! Aarray, int lda, System.IntPtr[]! Barray, int ldb, ref float beta, System.IntPtr[]! Carray, int ldc, int batchCount) -> AiDotNet.Tensors.Engines.CublasStatus
+static AiDotNet.Tensors.Engines.CuBlasNative.cublasSgemmStridedBatched(System.IntPtr handle, AiDotNet.Tensors.Engines.CublasOperation transa, AiDotNet.Tensors.Engines.CublasOperation transb, int m, int n, int k, ref float alpha, System.IntPtr A, int lda, long strideA, System.IntPtr B, int ldb, long strideB, ref float beta, System.IntPtr C, int ldc, long strideC, int batchCount) -> AiDotNet.Tensors.Engines.CublasStatus
+static AiDotNet.Tensors.Engines.CuBlasNative.cublasSscal(System.IntPtr handle, int n, ref float alpha, System.IntPtr x, int incx) -> AiDotNet.Tensors.Engines.CublasStatus
+static AiDotNet.Tensors.Engines.CuBlasNative.cuMemcpyDtoD(System.IntPtr dstDevice, System.IntPtr srcDevice, ulong byteCount) -> AiDotNet.Tensors.Engines.CudaResult
+static AiDotNet.Tensors.Engines.CuBlasNative.cuMemcpyDtoH(System.IntPtr dstHost, System.IntPtr srcDevice, ulong byteCount) -> AiDotNet.Tensors.Engines.CudaResult
+static AiDotNet.Tensors.Engines.CuBlasNative.cuMemcpyHtoD(System.IntPtr dstDevice, System.IntPtr srcHost, ulong byteCount) -> AiDotNet.Tensors.Engines.CudaResult
+static AiDotNet.Tensors.Engines.CuBlasNative.cuMemsetD32(System.IntPtr dstDevice, uint value, ulong count) -> AiDotNet.Tensors.Engines.CudaResult
+static AiDotNet.Tensors.Engines.DirectGpu.GpuKernelDiagnostics.RecordLaunchByHandle(System.IntPtr handle, long globalSize, long localSize, int argCount) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.GpuKernelDiagnostics.RegisterKernelName(System.IntPtr handle, string! name) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.GpuKernelDiagnostics.UnregisterKernelName(System.IntPtr handle) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.OnAlloc(System.IntPtr ptr, long bytes) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.OnFree(System.IntPtr ptr) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalCommandQueue.Commit(System.IntPtr commandBuffer) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalCommandQueue.CopyBuffer(System.IntPtr encoder, System.IntPtr sourceBuffer, ulong sourceOffset, System.IntPtr destBuffer, ulong destOffset, ulong size) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalCommandQueue.DispatchThreadgroups(System.IntPtr encoder, AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MTLSize threadgroups, AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MTLSize threadsPerThreadgroup) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalCommandQueue.DispatchThreads(System.IntPtr encoder, AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MTLSize threads, AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MTLSize threadsPerThreadgroup) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalCommandQueue.EndEncoding(System.IntPtr encoder) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalCommandQueue.GetError(System.IntPtr commandBuffer) -> string?
+static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalCommandQueue.GetStatus(System.IntPtr commandBuffer) -> AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MTLCommandBufferStatus
+static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalCommandQueue.MemoryBarrier(System.IntPtr encoder, AiDotNet.Tensors.Engines.DirectGpu.Metal.MTLBarrierScope scope) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalCommandQueue.SetBuffer(System.IntPtr encoder, System.IntPtr buffer, ulong offset, ulong index) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalCommandQueue.SetBytes(System.IntPtr encoder, System.IntPtr bytes, ulong length, ulong index) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalCommandQueue.SetBytes<T>(System.IntPtr encoder, T value, ulong index) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalCommandQueue.SetPipelineState(System.IntPtr encoder, System.IntPtr pipelineState) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalCommandQueue.SetThreadgroupMemoryLength(System.IntPtr encoder, ulong length, ulong index) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalCommandQueue.WaitUntilCompleted(System.IntPtr commandBuffer) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalCommandQueue.WaitUntilScheduled(System.IntPtr commandBuffer) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalDevice.TryCreateStrictFloatingPointOptions() -> System.IntPtr
+static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.CreateDefaultDevice() -> System.IntPtr
+static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.CreateNSString(string! str) -> System.IntPtr
+static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.GetErrorDescription(System.IntPtr nsError) -> string?
+static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.GetStringFromNSString(System.IntPtr nsString) -> string?
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkAllocateCommandBuffers(System.IntPtr device, AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkCommandBufferAllocateInfo* pAllocateInfo, System.IntPtr* pCommandBuffers) -> int
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkAllocateDescriptorSets(System.IntPtr device, AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkDescriptorSetAllocateInfo* pAllocateInfo, System.IntPtr* pDescriptorSets) -> int
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkAllocateMemory(System.IntPtr device, AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkMemoryAllocateInfo* pAllocateInfo, System.IntPtr pAllocator, out System.IntPtr pMemory) -> int
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkBeginCommandBuffer(System.IntPtr commandBuffer, AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkCommandBufferBeginInfo* pBeginInfo) -> int
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkBindBufferMemory(System.IntPtr device, System.IntPtr buffer, System.IntPtr memory, ulong memoryOffset) -> int
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkCmdBindDescriptorSets(System.IntPtr commandBuffer, int pipelineBindPoint, System.IntPtr layout, uint firstSet, uint descriptorSetCount, System.IntPtr* pDescriptorSets, uint dynamicOffsetCount, uint* pDynamicOffsets) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkCmdBindPipeline(System.IntPtr commandBuffer, int pipelineBindPoint, System.IntPtr pipeline) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkCmdCopyBuffer(System.IntPtr commandBuffer, System.IntPtr srcBuffer, System.IntPtr dstBuffer, uint regionCount, AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkBufferCopy* pRegions) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkCmdDispatch(System.IntPtr commandBuffer, uint groupCountX, uint groupCountY, uint groupCountZ) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkCmdPipelineBarrier(System.IntPtr commandBuffer, uint srcStageMask, uint dstStageMask, uint dependencyFlags, uint memoryBarrierCount, System.IntPtr pMemoryBarriers, uint bufferMemoryBarrierCount, AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkBufferMemoryBarrier* pBufferMemoryBarriers, uint imageMemoryBarrierCount, System.IntPtr pImageMemoryBarriers) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkCmdPushConstants(System.IntPtr commandBuffer, System.IntPtr layout, uint stageFlags, uint offset, uint size, void* pValues) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkCreateBuffer(System.IntPtr device, AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkBufferCreateInfo* pCreateInfo, System.IntPtr pAllocator, out System.IntPtr pBuffer) -> int
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkCreateCommandPool(System.IntPtr device, AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkCommandPoolCreateInfo* pCreateInfo, System.IntPtr pAllocator, out System.IntPtr pCommandPool) -> int
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkCreateComputePipelines(System.IntPtr device, System.IntPtr pipelineCache, uint createInfoCount, AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkComputePipelineCreateInfo* pCreateInfos, System.IntPtr pAllocator, System.IntPtr* pPipelines) -> int
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkCreateDescriptorPool(System.IntPtr device, AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkDescriptorPoolCreateInfo* pCreateInfo, System.IntPtr pAllocator, out System.IntPtr pDescriptorPool) -> int
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkCreateDescriptorSetLayout(System.IntPtr device, AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkDescriptorSetLayoutCreateInfo* pCreateInfo, System.IntPtr pAllocator, out System.IntPtr pSetLayout) -> int
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkCreateDevice(System.IntPtr physicalDevice, AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkDeviceCreateInfo* pCreateInfo, System.IntPtr pAllocator, out System.IntPtr pDevice) -> int
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkCreateFence(System.IntPtr device, AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkFenceCreateInfo* pCreateInfo, System.IntPtr pAllocator, out System.IntPtr pFence) -> int
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkCreateInstance(AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkInstanceCreateInfo* pCreateInfo, System.IntPtr pAllocator, out System.IntPtr pInstance) -> int
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkCreatePipelineLayout(System.IntPtr device, AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkPipelineLayoutCreateInfo* pCreateInfo, System.IntPtr pAllocator, out System.IntPtr pPipelineLayout) -> int
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkCreateShaderModule(System.IntPtr device, AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkShaderModuleCreateInfo* pCreateInfo, System.IntPtr pAllocator, out System.IntPtr pShaderModule) -> int
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkDestroyBuffer(System.IntPtr device, System.IntPtr buffer, System.IntPtr pAllocator) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkDestroyCommandPool(System.IntPtr device, System.IntPtr commandPool, System.IntPtr pAllocator) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkDestroyDescriptorPool(System.IntPtr device, System.IntPtr descriptorPool, System.IntPtr pAllocator) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkDestroyDescriptorSetLayout(System.IntPtr device, System.IntPtr descriptorSetLayout, System.IntPtr pAllocator) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkDestroyDevice(System.IntPtr device, System.IntPtr pAllocator) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkDestroyFence(System.IntPtr device, System.IntPtr fence, System.IntPtr pAllocator) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkDestroyInstance(System.IntPtr instance, System.IntPtr pAllocator) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkDestroyPipeline(System.IntPtr device, System.IntPtr pipeline, System.IntPtr pAllocator) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkDestroyPipelineLayout(System.IntPtr device, System.IntPtr pipelineLayout, System.IntPtr pAllocator) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkDestroyShaderModule(System.IntPtr device, System.IntPtr shaderModule, System.IntPtr pAllocator) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkDeviceWaitIdle(System.IntPtr device) -> int
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkEndCommandBuffer(System.IntPtr commandBuffer) -> int
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkEnumerateDeviceExtensionProperties(System.IntPtr physicalDevice, byte* pLayerName, uint* pPropertyCount, AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkExtensionProperties* pProperties) -> int
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkEnumeratePhysicalDevices(System.IntPtr instance, ref uint pPhysicalDeviceCount, System.IntPtr* pPhysicalDevices) -> int
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkFlushMappedMemoryRanges(System.IntPtr device, uint memoryRangeCount, AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkMappedMemoryRange* pMemoryRanges) -> int
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkFreeCommandBuffers(System.IntPtr device, System.IntPtr commandPool, uint commandBufferCount, System.IntPtr* pCommandBuffers) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkFreeMemory(System.IntPtr device, System.IntPtr memory, System.IntPtr pAllocator) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkGetBufferMemoryRequirements(System.IntPtr device, System.IntPtr buffer, AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkMemoryRequirements* pMemoryRequirements) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkGetDeviceQueue(System.IntPtr device, uint queueFamilyIndex, uint queueIndex, out System.IntPtr pQueue) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkGetFenceStatus(System.IntPtr device, System.IntPtr fence) -> int
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkGetPhysicalDeviceFeatures(System.IntPtr physicalDevice, uint* pFeatures) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkGetPhysicalDeviceFeatures2(System.IntPtr physicalDevice, AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkPhysicalDeviceFeatures2* pFeatures) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkGetPhysicalDeviceMemoryProperties(System.IntPtr physicalDevice, AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkPhysicalDeviceMemoryProperties* pMemoryProperties) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkGetPhysicalDeviceProperties(System.IntPtr physicalDevice, AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkPhysicalDeviceProperties* pProperties) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkGetPhysicalDeviceProperties2(System.IntPtr physicalDevice, AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkPhysicalDeviceProperties2* pProperties) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkGetPhysicalDeviceQueueFamilyProperties(System.IntPtr physicalDevice, ref uint pQueueFamilyPropertyCount, AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkQueueFamilyProperties* pQueueFamilyProperties) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkMapMemory(System.IntPtr device, System.IntPtr memory, ulong offset, ulong size, uint flags, out System.IntPtr ppData) -> int
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkQueueSubmit(System.IntPtr queue, uint submitCount, AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkSubmitInfo* pSubmits, System.IntPtr fence) -> int
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkQueueWaitIdle(System.IntPtr queue) -> int
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkResetCommandBuffer(System.IntPtr commandBuffer, uint flags) -> int
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkResetCommandPool(System.IntPtr device, System.IntPtr commandPool, uint flags) -> int
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkResetFences(System.IntPtr device, uint fenceCount, System.IntPtr* pFences) -> int
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkUnmapMemory(System.IntPtr device, System.IntPtr memory) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkUpdateDescriptorSets(System.IntPtr device, uint descriptorWriteCount, AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VkWriteDescriptorSet* pDescriptorWrites, uint descriptorCopyCount, System.IntPtr pDescriptorCopies) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanNativeBindings.vkWaitForFences(System.IntPtr device, uint fenceCount, System.IntPtr* pFences, uint waitAll, ulong timeout) -> int
+static extern AiDotNet.Tensors.Engines.ClBlastNative.Dgemm(AiDotNet.Tensors.Engines.ClBlastNative.Layout layout, AiDotNet.Tensors.Engines.ClBlastNative.Transpose transA, AiDotNet.Tensors.Engines.ClBlastNative.Transpose transB, System.UIntPtr m, System.UIntPtr n, System.UIntPtr k, double alpha, System.IntPtr aBuffer, System.UIntPtr aOffset, System.UIntPtr aLd, System.IntPtr bBuffer, System.UIntPtr bOffset, System.UIntPtr bLd, double beta, System.IntPtr cBuffer, System.UIntPtr cOffset, System.UIntPtr cLd, ref System.IntPtr queue, System.IntPtr eventPtr) -> AiDotNet.Tensors.Engines.ClBlastNative.StatusCode
+static extern AiDotNet.Tensors.Engines.ClBlastNative.OverrideParameters(System.IntPtr device, string! kernelName, int precision, System.UIntPtr numParameters, string![]! names, System.UIntPtr[]! values) -> AiDotNet.Tensors.Engines.ClBlastNative.StatusCode
+static extern AiDotNet.Tensors.Engines.ClBlastNative.Sgemm(AiDotNet.Tensors.Engines.ClBlastNative.Layout layout, AiDotNet.Tensors.Engines.ClBlastNative.Transpose transA, AiDotNet.Tensors.Engines.ClBlastNative.Transpose transB, System.UIntPtr m, System.UIntPtr n, System.UIntPtr k, float alpha, System.IntPtr aBuffer, System.UIntPtr aOffset, System.UIntPtr aLd, System.IntPtr bBuffer, System.UIntPtr bOffset, System.UIntPtr bLd, float beta, System.IntPtr cBuffer, System.UIntPtr cOffset, System.UIntPtr cLd, ref System.IntPtr queue, System.IntPtr eventPtr) -> AiDotNet.Tensors.Engines.ClBlastNative.StatusCode
+static extern AiDotNet.Tensors.Engines.ClBlastNative.SgemmStridedBatched(AiDotNet.Tensors.Engines.ClBlastNative.Layout layout, AiDotNet.Tensors.Engines.ClBlastNative.Transpose transA, AiDotNet.Tensors.Engines.ClBlastNative.Transpose transB, System.UIntPtr m, System.UIntPtr n, System.UIntPtr k, float alpha, System.IntPtr aBuffer, System.UIntPtr aOffset, System.UIntPtr aLd, System.UIntPtr aStride, System.IntPtr bBuffer, System.UIntPtr bOffset, System.UIntPtr bLd, System.UIntPtr bStride, float beta, System.IntPtr cBuffer, System.UIntPtr cOffset, System.UIntPtr cLd, System.UIntPtr cStride, System.UIntPtr batchCount, ref System.IntPtr queue, System.IntPtr eventPtr) -> AiDotNet.Tensors.Engines.ClBlastNative.StatusCode
+static extern AiDotNet.Tensors.Engines.CuBlasNative.cublasSetWorkspace(System.IntPtr handle, System.IntPtr workspace, System.UIntPtr workspaceSizeInBytes) -> AiDotNet.Tensors.Engines.CublasStatus
+static extern AiDotNet.Tensors.Engines.CuBlasNative.cuCtxCreate(out System.IntPtr context, uint flags, int device) -> AiDotNet.Tensors.Engines.CudaResult
+static extern AiDotNet.Tensors.Engines.CuBlasNative.cuCtxDestroy(System.IntPtr context) -> AiDotNet.Tensors.Engines.CudaResult
+static extern AiDotNet.Tensors.Engines.CuBlasNative.cuCtxPopCurrent(out System.IntPtr context) -> AiDotNet.Tensors.Engines.CudaResult
+static extern AiDotNet.Tensors.Engines.CuBlasNative.cuCtxPushCurrent(System.IntPtr context) -> AiDotNet.Tensors.Engines.CudaResult
+static extern AiDotNet.Tensors.Engines.CuBlasNative.cuDeviceGetDefaultMemPool(out System.IntPtr pool, int device) -> AiDotNet.Tensors.Engines.CudaResult
+static extern AiDotNet.Tensors.Engines.CuBlasNative.cuDevicePrimaryCtxRetain(out System.IntPtr context, int device) -> AiDotNet.Tensors.Engines.CudaResult
+static extern AiDotNet.Tensors.Engines.CuBlasNative.cuMemAlloc(out System.IntPtr devicePtr, ulong byteSize) -> AiDotNet.Tensors.Engines.CudaResult
+static extern AiDotNet.Tensors.Engines.CuBlasNative.cuMemAllocAsync(out System.IntPtr devicePtr, ulong byteSize, System.IntPtr hStream) -> AiDotNet.Tensors.Engines.CudaResult
+static extern AiDotNet.Tensors.Engines.CuBlasNative.cuMemAllocHost(out System.IntPtr hostPtr, ulong byteSize) -> AiDotNet.Tensors.Engines.CudaResult
+static extern AiDotNet.Tensors.Engines.CuBlasNative.cuMemFree(System.IntPtr devicePtr) -> AiDotNet.Tensors.Engines.CudaResult
+static extern AiDotNet.Tensors.Engines.CuBlasNative.cuMemFreeAsync(System.IntPtr devicePtr, System.IntPtr hStream) -> AiDotNet.Tensors.Engines.CudaResult
+static extern AiDotNet.Tensors.Engines.CuBlasNative.cuMemFreeHost(System.IntPtr hostPtr) -> AiDotNet.Tensors.Engines.CudaResult
+static extern AiDotNet.Tensors.Engines.CuBlasNative.cuMemPoolSetAttribute(System.IntPtr pool, int attr, ref ulong value) -> AiDotNet.Tensors.Engines.CudaResult
+static extern AiDotNet.Tensors.Engines.CuBlasNative.cuMemPoolTrimTo(System.IntPtr pool, ulong minBytesToKeep) -> AiDotNet.Tensors.Engines.CudaResult
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnActivationBackward(System.IntPtr handle, System.IntPtr activationDesc, ref float alpha, System.IntPtr yDesc, System.IntPtr y, System.IntPtr dyDesc, System.IntPtr dy, System.IntPtr xDesc, System.IntPtr x, ref float beta, System.IntPtr dxDesc, System.IntPtr dx) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnActivationForward(System.IntPtr handle, System.IntPtr activationDesc, ref float alpha, System.IntPtr xDesc, System.IntPtr x, ref float beta, System.IntPtr yDesc, System.IntPtr y) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnAddTensor(System.IntPtr handle, ref float alpha, System.IntPtr aDesc, System.IntPtr A, ref float beta, System.IntPtr cDesc, System.IntPtr C) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnBatchNormalizationBackward(System.IntPtr handle, AiDotNet.Tensors.Engines.CuDnnNative.CudnnBatchNormMode mode, ref float alphaDataDiff, ref float betaDataDiff, ref float alphaParamDiff, ref float betaParamDiff, System.IntPtr xDesc, System.IntPtr x, System.IntPtr dyDesc, System.IntPtr dy, System.IntPtr dxDesc, System.IntPtr dx, System.IntPtr bnScaleBiasDiffDesc, System.IntPtr bnScale, System.IntPtr resultBnScaleDiff, System.IntPtr resultBnBiasDiff, double epsilon, System.IntPtr savedMean, System.IntPtr savedInvVariance) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnBatchNormalizationForwardInference(System.IntPtr handle, AiDotNet.Tensors.Engines.CuDnnNative.CudnnBatchNormMode mode, ref float alpha, ref float beta, System.IntPtr xDesc, System.IntPtr x, System.IntPtr yDesc, System.IntPtr y, System.IntPtr bnScaleBiasMeanVarDesc, System.IntPtr bnScale, System.IntPtr bnBias, System.IntPtr estimatedMean, System.IntPtr estimatedVariance, double epsilon) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnBatchNormalizationForwardTraining(System.IntPtr handle, AiDotNet.Tensors.Engines.CuDnnNative.CudnnBatchNormMode mode, ref float alpha, ref float beta, System.IntPtr xDesc, System.IntPtr x, System.IntPtr yDesc, System.IntPtr y, System.IntPtr bnScaleBiasMeanVarDesc, System.IntPtr bnScale, System.IntPtr bnBias, double exponentialAverageFactor, System.IntPtr resultRunningMean, System.IntPtr resultRunningVariance, double epsilon, System.IntPtr resultSaveMean, System.IntPtr resultSaveInvVariance) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnConvolutionBackwardBias(System.IntPtr handle, ref float alpha, System.IntPtr dyDesc, System.IntPtr dy, ref float beta, System.IntPtr dbDesc, System.IntPtr db) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnConvolutionBackwardData(System.IntPtr handle, ref float alpha, System.IntPtr wDesc, System.IntPtr w, System.IntPtr dyDesc, System.IntPtr dy, System.IntPtr convDesc, AiDotNet.Tensors.Engines.CuDnnNative.CudnnConvolutionBwdDataAlgo algo, System.IntPtr workSpace, ulong workSpaceSizeInBytes, ref float beta, System.IntPtr dxDesc, System.IntPtr dx) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnConvolutionBackwardFilter(System.IntPtr handle, ref float alpha, System.IntPtr xDesc, System.IntPtr x, System.IntPtr dyDesc, System.IntPtr dy, System.IntPtr convDesc, AiDotNet.Tensors.Engines.CuDnnNative.CudnnConvolutionBwdFilterAlgo algo, System.IntPtr workSpace, ulong workSpaceSizeInBytes, ref float beta, System.IntPtr dwDesc, System.IntPtr dw) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnConvolutionForward(System.IntPtr handle, ref float alpha, System.IntPtr xDesc, System.IntPtr x, System.IntPtr wDesc, System.IntPtr w, System.IntPtr convDesc, AiDotNet.Tensors.Engines.CuDnnNative.CudnnConvolutionFwdAlgo algo, System.IntPtr workSpace, ulong workSpaceSizeInBytes, ref float beta, System.IntPtr yDesc, System.IntPtr y) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnConvolutionForwardDouble(System.IntPtr handle, ref double alpha, System.IntPtr xDesc, System.IntPtr x, System.IntPtr wDesc, System.IntPtr w, System.IntPtr convDesc, AiDotNet.Tensors.Engines.CuDnnNative.CudnnConvolutionFwdAlgo algo, System.IntPtr workSpace, ulong workSpaceSizeInBytes, ref double beta, System.IntPtr yDesc, System.IntPtr y) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnCreate(out System.IntPtr handle) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnCreateActivationDescriptor(out System.IntPtr activationDesc) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnCreateAttnDescriptor(out System.IntPtr attnDesc) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnCreateConvolutionDescriptor(out System.IntPtr convDesc) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnCreateDropoutDescriptor(out System.IntPtr dropoutDesc) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnCreateFilterDescriptor(out System.IntPtr filterDesc) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnCreateOpTensorDescriptor(out System.IntPtr opTensorDesc) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnCreatePoolingDescriptor(out System.IntPtr poolingDesc) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnCreateReduceTensorDescriptor(out System.IntPtr reduceTensorDesc) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnCreateRNNDescriptor(out System.IntPtr rnnDesc) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnCreateTensorDescriptor(out System.IntPtr tensorDesc) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnDeriveBNTensorDescriptor(System.IntPtr derivedBnDesc, System.IntPtr xDesc, AiDotNet.Tensors.Engines.CuDnnNative.CudnnBatchNormMode mode) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnDestroy(System.IntPtr handle) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnDestroyActivationDescriptor(System.IntPtr activationDesc) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnDestroyAttnDescriptor(System.IntPtr attnDesc) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnDestroyConvolutionDescriptor(System.IntPtr convDesc) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnDestroyDropoutDescriptor(System.IntPtr dropoutDesc) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnDestroyFilterDescriptor(System.IntPtr filterDesc) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnDestroyOpTensorDescriptor(System.IntPtr opTensorDesc) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnDestroyPoolingDescriptor(System.IntPtr poolingDesc) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnDestroyReduceTensorDescriptor(System.IntPtr reduceTensorDesc) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnDestroyRNNDescriptor(System.IntPtr rnnDesc) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnDestroyTensorDescriptor(System.IntPtr tensorDesc) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnDropoutBackward(System.IntPtr handle, System.IntPtr dropoutDesc, System.IntPtr dyDesc, System.IntPtr dy, System.IntPtr dxDesc, System.IntPtr dx, System.IntPtr reserveSpace, ulong reserveSpaceSizeInBytes) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnDropoutForward(System.IntPtr handle, System.IntPtr dropoutDesc, System.IntPtr xDesc, System.IntPtr x, System.IntPtr yDesc, System.IntPtr y, System.IntPtr reserveSpace, ulong reserveSpaceSizeInBytes) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnDropoutGetReserveSpaceSize(System.IntPtr xDesc, out ulong sizeInBytes) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnDropoutGetStatesSize(System.IntPtr handle, out ulong sizeInBytes) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnGetConvolution2dForwardOutputDim(System.IntPtr convDesc, System.IntPtr inputTensorDesc, System.IntPtr filterDesc, out int n, out int c, out int h, out int w) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnGetConvolutionBackwardDataWorkspaceSize(System.IntPtr handle, System.IntPtr wDesc, System.IntPtr dyDesc, System.IntPtr convDesc, System.IntPtr dxDesc, AiDotNet.Tensors.Engines.CuDnnNative.CudnnConvolutionBwdDataAlgo algo, out ulong sizeInBytes) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnGetConvolutionBackwardFilterWorkspaceSize(System.IntPtr handle, System.IntPtr xDesc, System.IntPtr dyDesc, System.IntPtr convDesc, System.IntPtr dwDesc, AiDotNet.Tensors.Engines.CuDnnNative.CudnnConvolutionBwdFilterAlgo algo, out ulong sizeInBytes) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnGetConvolutionForwardAlgorithm_v7(System.IntPtr handle, System.IntPtr xDesc, System.IntPtr wDesc, System.IntPtr convDesc, System.IntPtr yDesc, int requestedAlgoCount, out int returnedAlgoCount, System.IntPtr perfResults) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnGetConvolutionForwardWorkspaceSize(System.IntPtr handle, System.IntPtr xDesc, System.IntPtr wDesc, System.IntPtr convDesc, System.IntPtr yDesc, AiDotNet.Tensors.Engines.CuDnnNative.CudnnConvolutionFwdAlgo algo, out ulong sizeInBytes) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnGetErrorString(AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus status) -> System.IntPtr
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnGetMultiHeadAttnBuffers(System.IntPtr handle, System.IntPtr attnDesc, out ulong weightSizeInBytes, out ulong workSpaceSizeInBytes, out ulong reserveSpaceSizeInBytes) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnGetMultiHeadAttnWeights(System.IntPtr handle, System.IntPtr attnDesc, AiDotNet.Tensors.Engines.CuDnnNative.CudnnMultiHeadAttnWeightKind wKind, ulong weightSizeInBytes, System.IntPtr weights, System.IntPtr wDesc, out System.IntPtr wAddr) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnGetPooling2dForwardOutputDim(System.IntPtr poolingDesc, System.IntPtr inputTensorDesc, out int n, out int c, out int h, out int w) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnGetReductionWorkspaceSize(System.IntPtr handle, System.IntPtr reduceTensorDesc, System.IntPtr aDesc, System.IntPtr cDesc, out ulong sizeInBytes) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnGetRNNTempSpaceSizes(System.IntPtr handle, System.IntPtr rnnDesc, int fMode, System.IntPtr xDesc, out ulong workSpaceSize, out ulong reserveSpaceSize) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnGetRNNWeightSpaceSize(System.IntPtr handle, System.IntPtr rnnDesc, out ulong weightSpaceSize) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnMultiHeadAttnForward(System.IntPtr handle, System.IntPtr attnDesc, int currIdx, int[]! loWinIdx, int[]! hiWinIdx, int[]! devSeqLengthsQO, int[]! devSeqLengthsKV, System.IntPtr qDesc, System.IntPtr queries, System.IntPtr residuals, System.IntPtr kDesc, System.IntPtr keys, System.IntPtr vDesc, System.IntPtr values, System.IntPtr oDesc, System.IntPtr output, ulong weightSizeInBytes, System.IntPtr weights, ulong workSpaceSizeInBytes, System.IntPtr workSpace, ulong reserveSpaceSizeInBytes, System.IntPtr reserveSpace) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnOpTensor(System.IntPtr handle, System.IntPtr opTensorDesc, ref float alpha1, System.IntPtr aDesc, System.IntPtr A, ref float alpha2, System.IntPtr bDesc, System.IntPtr B, ref float beta, System.IntPtr cDesc, System.IntPtr C) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnPoolingBackward(System.IntPtr handle, System.IntPtr poolingDesc, ref float alpha, System.IntPtr yDesc, System.IntPtr y, System.IntPtr dyDesc, System.IntPtr dy, System.IntPtr xDesc, System.IntPtr x, ref float beta, System.IntPtr dxDesc, System.IntPtr dx) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnPoolingForward(System.IntPtr handle, System.IntPtr poolingDesc, ref float alpha, System.IntPtr xDesc, System.IntPtr x, ref float beta, System.IntPtr yDesc, System.IntPtr y) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnReduceTensor(System.IntPtr handle, System.IntPtr reduceTensorDesc, System.IntPtr indices, ulong indicesSizeInBytes, System.IntPtr workspace, ulong workspaceSizeInBytes, ref float alpha, System.IntPtr aDesc, System.IntPtr A, ref float beta, System.IntPtr cDesc, System.IntPtr C) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnScaleTensor(System.IntPtr handle, System.IntPtr yDesc, System.IntPtr y, ref float alpha) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnSetActivationDescriptor(System.IntPtr activationDesc, AiDotNet.Tensors.Engines.CuDnnNative.CudnnActivationMode mode, AiDotNet.Tensors.Engines.CuDnnNative.CudnnNanPropagation reluNanOpt, double coef) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnSetAttnDescriptor(System.IntPtr attnDesc, uint attnMode, int nHeads, double smScaler, AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType dataType, AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType computePrec, AiDotNet.Tensors.Engines.CuDnnNative.CudnnMathType mathType, System.IntPtr attnDropoutDesc, System.IntPtr postDropoutDesc, int qSize, int kSize, int vSize, int qProjSize, int kProjSize, int vProjSize, int oProjSize, int qoMaxSeqLength, int kvMaxSeqLength, int maxBatchSize, int maxBeamSize) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnSetConvolution2dDescriptor(System.IntPtr convDesc, int padH, int padW, int strideH, int strideW, int dilationH, int dilationW, AiDotNet.Tensors.Engines.CuDnnNative.CudnnConvolutionMode mode, AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType computeType) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnSetConvolutionGroupCount(System.IntPtr convDesc, int groupCount) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnSetConvolutionMathType(System.IntPtr convDesc, AiDotNet.Tensors.Engines.CuDnnNative.CudnnMathType mathType) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnSetConvolutionNdDescriptor(System.IntPtr convDesc, int arrayLength, int[]! padA, int[]! strideA, int[]! dilationA, AiDotNet.Tensors.Engines.CuDnnNative.CudnnConvolutionMode mode, AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType computeType) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnSetDropoutDescriptor(System.IntPtr dropoutDesc, System.IntPtr handle, float dropout, System.IntPtr states, ulong stateSizeInBytes, ulong seed) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnSetFilter4dDescriptor(System.IntPtr filterDesc, AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType dataType, AiDotNet.Tensors.Engines.CuDnnNative.CudnnTensorFormat format, int k, int c, int h, int w) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnSetFilterNdDescriptor(System.IntPtr filterDesc, AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType dataType, AiDotNet.Tensors.Engines.CuDnnNative.CudnnTensorFormat format, int nbDims, int[]! filterDimA) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnSetPooling2dDescriptor(System.IntPtr poolingDesc, AiDotNet.Tensors.Engines.CuDnnNative.CudnnPoolingMode mode, AiDotNet.Tensors.Engines.CuDnnNative.CudnnNanPropagation maxPoolNanOpt, int windowHeight, int windowWidth, int verticalPadding, int horizontalPadding, int verticalStride, int horizontalStride) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnSetPoolingNdDescriptor(System.IntPtr poolingDesc, AiDotNet.Tensors.Engines.CuDnnNative.CudnnPoolingMode mode, AiDotNet.Tensors.Engines.CuDnnNative.CudnnNanPropagation maxPoolNanOpt, int nbDims, int[]! windowDimA, int[]! paddingA, int[]! strideA) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnSetReduceTensorDescriptor(System.IntPtr reduceTensorDesc, AiDotNet.Tensors.Engines.CuDnnNative.CudnnReduceTensorOp reduceTensorOp, AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType reduceTensorCompType, AiDotNet.Tensors.Engines.CuDnnNative.CudnnNanPropagation reduceTensorNanOpt, int reduceTensorIndices, int reduceTensorIndicesType) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnSetRNNDescriptor_v8(System.IntPtr rnnDesc, int algo, AiDotNet.Tensors.Engines.CuDnnNative.CudnnRnnMode cellMode, int biasMode, AiDotNet.Tensors.Engines.CuDnnNative.CudnnDirectionMode dirMode, AiDotNet.Tensors.Engines.CuDnnNative.CudnnRnnInputMode inputMode, AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType dataType, AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType mathPrec, AiDotNet.Tensors.Engines.CuDnnNative.CudnnMathType mathType, int inputSize, int hiddenSize, int projSize, int numLayers, System.IntPtr dropoutDesc, int auxFlags) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnSetStream(System.IntPtr handle, System.IntPtr stream) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnSetTensor(System.IntPtr handle, System.IntPtr yDesc, System.IntPtr y, System.IntPtr valuePtr) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnSetTensor4dDescriptor(System.IntPtr tensorDesc, AiDotNet.Tensors.Engines.CuDnnNative.CudnnTensorFormat format, AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType dataType, int n, int c, int h, int w) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnSetTensor4dDescriptorEx(System.IntPtr tensorDesc, AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType dataType, int n, int c, int h, int w, int nStride, int cStride, int hStride, int wStride) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnSetTensorNdDescriptor(System.IntPtr tensorDesc, AiDotNet.Tensors.Engines.CuDnnNative.CudnnDataType dataType, int nbDims, int[]! dimA, int[]! strideA) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnSoftmaxBackward(System.IntPtr handle, AiDotNet.Tensors.Engines.CuDnnNative.CudnnSoftmaxAlgorithm algo, AiDotNet.Tensors.Engines.CuDnnNative.CudnnSoftmaxMode mode, ref float alpha, System.IntPtr yDesc, System.IntPtr y, System.IntPtr dyDesc, System.IntPtr dy, ref float beta, System.IntPtr dxDesc, System.IntPtr dx) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnSoftmaxForward(System.IntPtr handle, AiDotNet.Tensors.Engines.CuDnnNative.CudnnSoftmaxAlgorithm algo, AiDotNet.Tensors.Engines.CuDnnNative.CudnnSoftmaxMode mode, ref float alpha, System.IntPtr xDesc, System.IntPtr x, ref float beta, System.IntPtr yDesc, System.IntPtr y) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.CuDnnNative.cudnnTransformTensor(System.IntPtr handle, ref float alpha, System.IntPtr xDesc, System.IntPtr x, ref float beta, System.IntPtr yDesc, System.IntPtr y) -> AiDotNet.Tensors.Engines.CuDnnNative.CudnnStatus
+static extern AiDotNet.Tensors.Engines.DirectGpu.CUDA.CuBlasLtNative.cublasLtCreate(out System.IntPtr handle) -> AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasStatus
+static extern AiDotNet.Tensors.Engines.DirectGpu.CUDA.CuBlasLtNative.cublasLtDestroy(System.IntPtr handle) -> AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasStatus
+static extern AiDotNet.Tensors.Engines.DirectGpu.CUDA.CuBlasLtNative.cublasLtMatmul(System.IntPtr handle, System.IntPtr computeDesc, ref float alpha, System.IntPtr A, System.IntPtr Adesc, System.IntPtr B, System.IntPtr Bdesc, ref float beta, System.IntPtr C, System.IntPtr Cdesc, System.IntPtr D, System.IntPtr Ddesc, System.IntPtr algo, System.IntPtr workspace, ulong workspaceSizeInBytes, System.IntPtr stream) -> AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasStatus
+static extern AiDotNet.Tensors.Engines.DirectGpu.CUDA.CuBlasLtNative.cublasLtMatmulDescCreate(out System.IntPtr matmulDesc, AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasComputeType computeType, AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasDataType scaleType) -> AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasStatus
+static extern AiDotNet.Tensors.Engines.DirectGpu.CUDA.CuBlasLtNative.cublasLtMatmulDescDestroy(System.IntPtr matmulDesc) -> AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasStatus
+static extern AiDotNet.Tensors.Engines.DirectGpu.CUDA.CuBlasLtNative.cublasLtMatmulDescSetAttribute(System.IntPtr matmulDesc, AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasLtMatmulDescAttributes attr, System.IntPtr valuePtr, ulong sizeInBytes) -> AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasStatus
+static extern AiDotNet.Tensors.Engines.DirectGpu.CUDA.CuBlasLtNative.cublasLtMatmulInt32(System.IntPtr handle, System.IntPtr computeDesc, ref int alpha, System.IntPtr A, System.IntPtr Adesc, System.IntPtr B, System.IntPtr Bdesc, ref int beta, System.IntPtr C, System.IntPtr Cdesc, System.IntPtr D, System.IntPtr Ddesc, System.IntPtr algo, System.IntPtr workspace, ulong workspaceSizeInBytes, System.IntPtr stream) -> AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasStatus
+static extern AiDotNet.Tensors.Engines.DirectGpu.CUDA.CuBlasLtNative.cublasLtMatrixLayoutCreate(out System.IntPtr matLayout, AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasDataType type, ulong rows, ulong cols, long ld) -> AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasStatus
+static extern AiDotNet.Tensors.Engines.DirectGpu.CUDA.CuBlasLtNative.cublasLtMatrixLayoutDestroy(System.IntPtr matLayout) -> AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasStatus
+static extern AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclNative.ncclAllGather(System.IntPtr sendbuff, System.IntPtr recvbuff, ulong sendcount, AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclDataType datatype, System.IntPtr comm, System.IntPtr stream) -> AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclResult
+static extern AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclNative.ncclAllReduce(System.IntPtr sendbuff, System.IntPtr recvbuff, ulong count, AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclDataType datatype, AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclRedOp op, System.IntPtr comm, System.IntPtr stream) -> AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclResult
+static extern AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclNative.ncclBroadcast(System.IntPtr sendbuff, System.IntPtr recvbuff, ulong count, AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclDataType datatype, int root, System.IntPtr comm, System.IntPtr stream) -> AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclResult
+static extern AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclNative.ncclCommCount(System.IntPtr comm, out int count) -> AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclResult
+static extern AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclNative.ncclCommDestroy(System.IntPtr comm) -> AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclResult
+static extern AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclNative.ncclCommInitAll(System.IntPtr[]! comms, int ndev, int[]! devlist) -> AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclResult
+static extern AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclNative.ncclCommInitRank(out System.IntPtr comm, int nranks, AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclUniqueId commId, int rank) -> AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclResult
+static extern AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclNative.ncclCommUserRank(System.IntPtr comm, out int rank) -> AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclResult
+static extern AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclNative.ncclGetErrorStringPtr(AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclResult result) -> System.IntPtr
+static extern AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclNative.ncclRecv(System.IntPtr recvbuff, ulong count, AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclDataType datatype, int peer, System.IntPtr comm, System.IntPtr stream) -> AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclResult
+static extern AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclNative.ncclReduce(System.IntPtr sendbuff, System.IntPtr recvbuff, ulong count, AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclDataType datatype, AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclRedOp op, int root, System.IntPtr comm, System.IntPtr stream) -> AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclResult
+static extern AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclNative.ncclReduceScatter(System.IntPtr sendbuff, System.IntPtr recvbuff, ulong recvcount, AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclDataType datatype, AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclRedOp op, System.IntPtr comm, System.IntPtr stream) -> AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclResult
+static extern AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclNative.ncclSend(System.IntPtr sendbuff, ulong count, AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclDataType datatype, int peer, System.IntPtr comm, System.IntPtr stream) -> AiDotNet.Tensors.Engines.DirectGpu.CUDA.NcclResult
+static extern AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.CopyAllDevices() -> System.IntPtr
+static extern AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.GetClass(string! name) -> System.IntPtr
+static extern AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.RegisterSelector(string! name) -> System.IntPtr
+static extern AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Release(System.IntPtr obj) -> void
+static extern AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Retain(System.IntPtr obj) -> System.IntPtr
+static extern AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.SendMessage(System.IntPtr receiver, System.IntPtr selector) -> System.IntPtr
+static extern AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.SendMessage(System.IntPtr receiver, System.IntPtr selector, System.IntPtr arg1) -> System.IntPtr
+static extern AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.SendMessage(System.IntPtr receiver, System.IntPtr selector, System.IntPtr arg1, System.IntPtr arg2) -> System.IntPtr
+static extern AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.SendMessage(System.IntPtr receiver, System.IntPtr selector, System.IntPtr arg1, System.IntPtr arg2, System.IntPtr arg3) -> System.IntPtr
+static extern AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.SendMessage(System.IntPtr receiver, System.IntPtr selector, System.IntPtr arg1, ulong arg2) -> System.IntPtr
+static extern AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.SendMessageBool(System.IntPtr receiver, System.IntPtr selector) -> bool
+static extern AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.SendMessageBool(System.IntPtr receiver, System.IntPtr selector, System.IntPtr arg1) -> bool
+static extern AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.SendMessageDispatch(System.IntPtr receiver, System.IntPtr selector, AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MTLSize gridSize, AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MTLSize threadgroupSize) -> void
+static extern AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.SendMessageDoubleReturn(System.IntPtr receiver, System.IntPtr selector) -> double
+static extern AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.SendMessageNSRange(System.IntPtr receiver, System.IntPtr selector, AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.NSRange range) -> void
+static extern AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.SendMessagePtr(System.IntPtr receiver, System.IntPtr selector, System.IntPtr pointer, ulong length, ulong options) -> System.IntPtr
+static extern AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.SendMessageSetBuffer(System.IntPtr receiver, System.IntPtr selector, System.IntPtr buffer, ulong offset, ulong index) -> void
+static extern AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.SendMessageSetBytes(System.IntPtr receiver, System.IntPtr selector, System.IntPtr bytes, ulong length, ulong index) -> void
+static extern AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.SendMessageSetThreadgroupMemory(System.IntPtr receiver, System.IntPtr selector, ulong length, ulong index) -> void
+static extern AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.SendMessageULong(System.IntPtr receiver, System.IntPtr selector, ulong arg1) -> System.IntPtr
+static extern AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.SendMessageULong2(System.IntPtr receiver, System.IntPtr selector, ulong arg1, ulong arg2) -> System.IntPtr
+static extern AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.SendMessageULongReturn(System.IntPtr receiver, System.IntPtr selector) -> ulong
+static extern AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.SendMessageVoid(System.IntPtr receiver, System.IntPtr selector) -> void
+static extern AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.SendMessageVoid(System.IntPtr receiver, System.IntPtr selector, System.IntPtr arg1) -> void
+static extern AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.SendMessageVoid(System.IntPtr receiver, System.IntPtr selector, System.IntPtr arg1, System.IntPtr arg2) -> void
+static extern AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.SendMessageVoidULong(System.IntPtr receiver, System.IntPtr selector, ulong arg1) -> void
+static extern AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.SendMessageWithError(System.IntPtr receiver, System.IntPtr selector, System.IntPtr arg1, ref System.IntPtr errorOut) -> System.IntPtr
+static extern AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.SendMessageWithError(System.IntPtr receiver, System.IntPtr selector, System.IntPtr arg1, System.IntPtr arg2, ref System.IntPtr errorOut) -> System.IntPtr
+static extern AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuNativeBindings.wgpuCreateInstance(System.IntPtr descriptor) -> System.IntPtr
+static extern AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuNativeBindings.wgpuInstanceRelease(System.IntPtr instance) -> void
+static extern AiDotNet.Tensors.Engines.OpenClNative.clBuildProgram(System.IntPtr program, uint numDevices, System.IntPtr[]! deviceList, string! options, System.IntPtr pfnNotify, System.IntPtr userData) -> AiDotNet.Tensors.Engines.OpenClNative.ClError
+static extern AiDotNet.Tensors.Engines.OpenClNative.clCreateBuffer(System.IntPtr context, AiDotNet.Tensors.Engines.OpenClNative.ClMemFlags flags, System.UIntPtr size, System.IntPtr hostPtr, out AiDotNet.Tensors.Engines.OpenClNative.ClError errcode) -> System.IntPtr
+static extern AiDotNet.Tensors.Engines.OpenClNative.clCreateCommandQueue(System.IntPtr context, System.IntPtr device, AiDotNet.Tensors.Engines.OpenClNative.ClCommandQueueProperties properties, out AiDotNet.Tensors.Engines.OpenClNative.ClError errcode) -> System.IntPtr
+static extern AiDotNet.Tensors.Engines.OpenClNative.clCreateCommandQueueWithProperties(System.IntPtr context, System.IntPtr device, ulong[]! properties, out AiDotNet.Tensors.Engines.OpenClNative.ClError errcode) -> System.IntPtr
+static extern AiDotNet.Tensors.Engines.OpenClNative.clCreateContext(System.IntPtr[]! properties, uint numDevices, System.IntPtr[]! devices, System.IntPtr pfnNotify, System.IntPtr userData, out AiDotNet.Tensors.Engines.OpenClNative.ClError errcode) -> System.IntPtr
+static extern AiDotNet.Tensors.Engines.OpenClNative.clCreateContextFromType(System.IntPtr[]! properties, AiDotNet.Tensors.Engines.OpenClNative.ClDeviceType deviceType, System.IntPtr pfnNotify, System.IntPtr userData, out AiDotNet.Tensors.Engines.OpenClNative.ClError errcode) -> System.IntPtr
+static extern AiDotNet.Tensors.Engines.OpenClNative.clCreateKernel(System.IntPtr program, string! kernelName, out AiDotNet.Tensors.Engines.OpenClNative.ClError errcode) -> System.IntPtr
+static extern AiDotNet.Tensors.Engines.OpenClNative.clCreateKernelsInProgram(System.IntPtr program, uint numKernels, System.IntPtr[]! kernels, out uint numKernelsRet) -> AiDotNet.Tensors.Engines.OpenClNative.ClError
+static extern AiDotNet.Tensors.Engines.OpenClNative.clCreateProgramWithBinary(System.IntPtr context, uint numDevices, System.IntPtr[]! deviceList, System.UIntPtr[]? lengths, System.IntPtr[]! binaries, int[]! binaryStatus, out AiDotNet.Tensors.Engines.OpenClNative.ClError errcode) -> System.IntPtr
+static extern AiDotNet.Tensors.Engines.OpenClNative.clCreateProgramWithIL(System.IntPtr context, byte[]! il, System.UIntPtr length, out AiDotNet.Tensors.Engines.OpenClNative.ClError errcode) -> System.IntPtr
+static extern AiDotNet.Tensors.Engines.OpenClNative.clCreateProgramWithSource(System.IntPtr context, uint count, string![]! strings, System.UIntPtr[]? lengths, out AiDotNet.Tensors.Engines.OpenClNative.ClError errcode) -> System.IntPtr
+static extern AiDotNet.Tensors.Engines.OpenClNative.clEnqueueCopyBuffer(System.IntPtr commandQueue, System.IntPtr srcBuffer, System.IntPtr dstBuffer, System.UIntPtr srcOffset, System.UIntPtr dstOffset, System.UIntPtr size, uint numEventsInWaitList, System.IntPtr[]! eventWaitList, out System.IntPtr evt) -> AiDotNet.Tensors.Engines.OpenClNative.ClError
+static extern AiDotNet.Tensors.Engines.OpenClNative.clEnqueueFillBuffer(System.IntPtr commandQueue, System.IntPtr buffer, System.IntPtr pattern, System.UIntPtr patternSize, System.UIntPtr offset, System.UIntPtr size, uint numEventsInWaitList, System.IntPtr[]! eventWaitList, out System.IntPtr evt) -> AiDotNet.Tensors.Engines.OpenClNative.ClError
+static extern AiDotNet.Tensors.Engines.OpenClNative.clEnqueueNDRangeKernel(System.IntPtr commandQueue, System.IntPtr kernel, uint workDim, System.UIntPtr[]! globalWorkOffset, System.UIntPtr[]! globalWorkSize, System.UIntPtr[]! localWorkSize, uint numEventsInWaitList, System.IntPtr[]! eventWaitList, out System.IntPtr evt) -> AiDotNet.Tensors.Engines.OpenClNative.ClError
+static extern AiDotNet.Tensors.Engines.OpenClNative.clEnqueueReadBuffer(System.IntPtr commandQueue, System.IntPtr buffer, uint blockingRead, System.UIntPtr offset, System.UIntPtr size, System.IntPtr ptr, uint numEventsInWaitList, System.IntPtr[]! eventWaitList, out System.IntPtr evt) -> AiDotNet.Tensors.Engines.OpenClNative.ClError
+static extern AiDotNet.Tensors.Engines.OpenClNative.clEnqueueWriteBuffer(System.IntPtr commandQueue, System.IntPtr buffer, uint blockingWrite, System.UIntPtr offset, System.UIntPtr size, System.IntPtr ptr, uint numEventsInWaitList, System.IntPtr[]! eventWaitList, out System.IntPtr evt) -> AiDotNet.Tensors.Engines.OpenClNative.ClError
+static extern AiDotNet.Tensors.Engines.OpenClNative.clFinish(System.IntPtr commandQueue) -> AiDotNet.Tensors.Engines.OpenClNative.ClError
+static extern AiDotNet.Tensors.Engines.OpenClNative.clFlush(System.IntPtr commandQueue) -> AiDotNet.Tensors.Engines.OpenClNative.ClError
+static extern AiDotNet.Tensors.Engines.OpenClNative.clGetDeviceIDs(System.IntPtr platform, AiDotNet.Tensors.Engines.OpenClNative.ClDeviceType deviceType, uint numEntries, System.IntPtr[]! devices, out uint numDevices) -> AiDotNet.Tensors.Engines.OpenClNative.ClError
+static extern AiDotNet.Tensors.Engines.OpenClNative.clGetDeviceInfo(System.IntPtr device, AiDotNet.Tensors.Engines.OpenClNative.ClDeviceInfo paramName, System.UIntPtr paramValueSize, byte[]! paramValue, out System.UIntPtr paramValueSizeRet) -> AiDotNet.Tensors.Engines.OpenClNative.ClError
+static extern AiDotNet.Tensors.Engines.OpenClNative.clGetDeviceInfo(System.IntPtr device, AiDotNet.Tensors.Engines.OpenClNative.ClDeviceInfo paramName, System.UIntPtr paramValueSize, out uint paramValue, out System.UIntPtr paramValueSizeRet) -> AiDotNet.Tensors.Engines.OpenClNative.ClError
+static extern AiDotNet.Tensors.Engines.OpenClNative.clGetDeviceInfo(System.IntPtr device, AiDotNet.Tensors.Engines.OpenClNative.ClDeviceInfo paramName, System.UIntPtr paramValueSize, out ulong paramValue, out System.UIntPtr paramValueSizeRet) -> AiDotNet.Tensors.Engines.OpenClNative.ClError
+static extern AiDotNet.Tensors.Engines.OpenClNative.clGetKernelWorkGroupInfo(System.IntPtr kernel, System.IntPtr device, AiDotNet.Tensors.Engines.OpenClNative.ClKernelWorkGroupInfo paramName, System.UIntPtr paramValueSize, out System.UIntPtr paramValue, out System.UIntPtr paramValueSizeRet) -> AiDotNet.Tensors.Engines.OpenClNative.ClError
+static extern AiDotNet.Tensors.Engines.OpenClNative.clGetPlatformIDs(uint numEntries, System.IntPtr[]! platforms, out uint numPlatforms) -> AiDotNet.Tensors.Engines.OpenClNative.ClError
+static extern AiDotNet.Tensors.Engines.OpenClNative.clGetPlatformInfo(System.IntPtr platform, AiDotNet.Tensors.Engines.OpenClNative.ClPlatformInfo paramName, System.UIntPtr paramValueSize, byte[]! paramValue, out System.UIntPtr paramValueSizeRet) -> AiDotNet.Tensors.Engines.OpenClNative.ClError
+static extern AiDotNet.Tensors.Engines.OpenClNative.clGetProgramBuildInfo(System.IntPtr program, System.IntPtr device, AiDotNet.Tensors.Engines.OpenClNative.ClProgramBuildInfo paramName, System.UIntPtr paramValueSize, byte[]! paramValue, out System.UIntPtr paramValueSizeRet) -> AiDotNet.Tensors.Engines.OpenClNative.ClError
+static extern AiDotNet.Tensors.Engines.OpenClNative.clReleaseCommandQueue(System.IntPtr commandQueue) -> AiDotNet.Tensors.Engines.OpenClNative.ClError
+static extern AiDotNet.Tensors.Engines.OpenClNative.clReleaseContext(System.IntPtr context) -> AiDotNet.Tensors.Engines.OpenClNative.ClError
+static extern AiDotNet.Tensors.Engines.OpenClNative.clReleaseEvent(System.IntPtr evt) -> AiDotNet.Tensors.Engines.OpenClNative.ClError
+static extern AiDotNet.Tensors.Engines.OpenClNative.clReleaseKernel(System.IntPtr kernel) -> AiDotNet.Tensors.Engines.OpenClNative.ClError
+static extern AiDotNet.Tensors.Engines.OpenClNative.clReleaseMemObject(System.IntPtr memobj) -> AiDotNet.Tensors.Engines.OpenClNative.ClError
+static extern AiDotNet.Tensors.Engines.OpenClNative.clReleaseProgram(System.IntPtr program) -> AiDotNet.Tensors.Engines.OpenClNative.ClError
+static extern AiDotNet.Tensors.Engines.OpenClNative.clRetainContext(System.IntPtr context) -> AiDotNet.Tensors.Engines.OpenClNative.ClError
+static extern AiDotNet.Tensors.Engines.OpenClNative.clSetKernelArg(System.IntPtr kernel, uint argIndex, System.UIntPtr argSize, ref System.IntPtr argValue) -> AiDotNet.Tensors.Engines.OpenClNative.ClError
+static extern AiDotNet.Tensors.Engines.OpenClNative.clSetKernelArg(System.IntPtr kernel, uint argIndex, System.UIntPtr argSize, System.IntPtr argValue) -> AiDotNet.Tensors.Engines.OpenClNative.ClError
+static extern AiDotNet.Tensors.Engines.OpenClNative.clSetKernelArgFloat(System.IntPtr kernel, uint argIndex, System.UIntPtr argSize, ref float argValue) -> AiDotNet.Tensors.Engines.OpenClNative.ClError
+static extern AiDotNet.Tensors.Engines.OpenClNative.clSetKernelArgInt(System.IntPtr kernel, uint argIndex, System.UIntPtr argSize, ref int argValue) -> AiDotNet.Tensors.Engines.OpenClNative.ClError
+static extern AiDotNet.Tensors.Engines.OpenClNative.clWaitForEvents(uint numEvents, System.IntPtr[]! eventList) -> AiDotNet.Tensors.Engines.OpenClNative.ClError
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Classes.MTLCompileOptions -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Classes.MTLComputePipelineDescriptor -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Classes.NSArray -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Classes.NSError -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Classes.NSString -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MPS.EncodeToCommandBuffer -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MPS.InitWithBuffer -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MPS.InitWithDevice -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MPS.InitWithDeviceTransposeLeft -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MPS.MatrixDescriptorWithRows -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MPS.MPSCNNConvolution -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MPS.MPSCNNConvolutionDescriptor -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MPS.MPSCNNNeuronReLU -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MPS.MPSCNNNeuronSigmoid -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MPS.MPSCNNNeuronTanH -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MPS.MPSCNNPoolingAverage -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MPS.MPSCNNPoolingMax -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MPS.MPSMatrix -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MPS.MPSMatrixDescriptor -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MPS.MPSMatrixLogSoftMax -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MPS.MPSMatrixMultiplication -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MPS.MPSMatrixNeuron -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MPS.MPSMatrixNeuronGradient -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MPS.MPSMatrixSoftMax -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MPS.MPSMatrixVectorMultiplication -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.MPS.SetNeuronType -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.AddCompletedHandler -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.Alloc -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.Autorelease -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.BlitCommandEncoder -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.Code -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.CommandBuffer -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.CommandBufferWithUnretainedReferences -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.Commit -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.ComputeCommandEncoder -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.ComputeCommandEncoderWithDispatchType -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.Contents -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.CopyFromBuffer -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.Count -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.CurrentAllocatedSize -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.Description -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.DidModifyRange -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.DispatchThreadgroups -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.DispatchThreads -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.Domain -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.EndEncoding -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.Enqueue -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.Error -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.FillBuffer -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.FunctionNames -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.GpuEndTime -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.GpuStartTime -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.Init -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.Length -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.LocalizedDescription -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.MaxBufferLength -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.MaxThreadgroupMemoryLength -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.MaxThreadsPerThreadgroup -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.MaxTotalThreadsPerThreadgroup -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.MemoryBarrierWithResources -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.MemoryBarrierWithScope -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.Name -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.NewBufferWithBytes -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.NewBufferWithLength -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.NewCommandQueue -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.NewCommandQueueWithMaxCommandBufferCount -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.NewComputePipelineStateWithDescriptor -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.NewComputePipelineStateWithFunction -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.NewDefaultLibrary -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.NewFunctionWithName -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.NewLibraryWithData -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.NewLibraryWithSource -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.ObjectAtIndex -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.PresentDrawable -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.RecommendedMaxWorkingSetSize -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.RegistryID -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.Release -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.RespondsToSelector -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.Retain -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.SetBuffer -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.SetBytes -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.SetComputePipelineState -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.SetFastMathEnabled -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.SetMathFloatingPointFunctions -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.SetMathMode -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.SetTexture -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.SetThreadgroupMemoryLength -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.StaticThreadgroupMemoryLength -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.Status -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.StringWithUTF8String -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.SupportsFamily -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.SynchronizeResource -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.ThreadExecutionWidth -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.UTF8String -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.WaitUntilCompleted -> System.IntPtr
+static readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings.Selectors.WaitUntilScheduled -> System.IntPtr
+static System.Half.Epsilon.get -> System.Half
+static System.Half.explicit operator double(System.Half value) -> double
+static System.Half.explicit operator float(System.Half value) -> float
+static System.Half.explicit operator System.Half(byte value) -> System.Half
+static System.Half.explicit operator System.Half(decimal value) -> System.Half
+static System.Half.explicit operator System.Half(double value) -> System.Half
+static System.Half.explicit operator System.Half(int value) -> System.Half
+static System.Half.explicit operator System.Half(long value) -> System.Half
+static System.Half.explicit operator System.Half(sbyte value) -> System.Half
+static System.Half.explicit operator System.Half(short value) -> System.Half
+static System.Half.explicit operator System.Half(uint value) -> System.Half
+static System.Half.explicit operator System.Half(ulong value) -> System.Half
+static System.Half.explicit operator System.Half(ushort value) -> System.Half
+static System.Half.implicit operator System.Half(float value) -> System.Half
+static System.Half.IsInfinity(System.Half value) -> bool
+static System.Half.IsNaN(System.Half value) -> bool
+static System.Half.IsNegativeInfinity(System.Half value) -> bool
+static System.Half.IsPositiveInfinity(System.Half value) -> bool
+static System.Half.MaxValue.get -> System.Half
+static System.Half.MinValue.get -> System.Half
+static System.Half.NaN.get -> System.Half
+static System.Half.NegativeInfinity.get -> System.Half
+static System.Half.operator !=(System.Half left, System.Half right) -> bool
+static System.Half.operator -(System.Half value) -> System.Half
+static System.Half.operator <(System.Half left, System.Half right) -> bool
+static System.Half.operator <=(System.Half left, System.Half right) -> bool
+static System.Half.operator ==(System.Half left, System.Half right) -> bool
+static System.Half.operator >(System.Half left, System.Half right) -> bool
+static System.Half.operator >=(System.Half left, System.Half right) -> bool
+static System.Half.PositiveInfinity.get -> System.Half
+static System.Index.End.get -> System.Index
+static System.Index.FromEnd(int value) -> System.Index
+static System.Index.FromStart(int value) -> System.Index
+static System.Index.implicit operator System.Index(int value) -> System.Index
+static System.Index.Start.get -> System.Index
+static System.Range.All.get -> System.Range
+static System.Range.EndAt(System.Index end) -> System.Range
+static System.Range.StartAt(System.Index start) -> System.Range
+static System.Runtime.Intrinsics.Vector128.Create(double e0, double e1) -> System.Runtime.Intrinsics.Vector128<double>
+static System.Runtime.Intrinsics.Vector128.Create(float e0, float e1, float e2, float e3) -> System.Runtime.Intrinsics.Vector128<float>
+static System.Runtime.Intrinsics.Vector128.Create<T>(T e0, T e1) -> System.Runtime.Intrinsics.Vector128<T>
+static System.Runtime.Intrinsics.Vector128.Create<T>(T value) -> System.Runtime.Intrinsics.Vector128<T>
+static System.Runtime.Intrinsics.Vector128.GetElement<T>(System.Runtime.Intrinsics.Vector128<T> vector, int index) -> T
+static System.Runtime.Intrinsics.Vector128.IsHardwareAccelerated.get -> bool
+static System.Runtime.Intrinsics.Vector128<T>.Count.get -> int
+static System.Runtime.Intrinsics.Vector256.Create(double e0, double e1, double e2, double e3) -> System.Runtime.Intrinsics.Vector256<double>
+static System.Runtime.Intrinsics.Vector256.Create(float e0, float e1, float e2, float e3, float e4, float e5, float e6, float e7) -> System.Runtime.Intrinsics.Vector256<float>
+static System.Runtime.Intrinsics.Vector256.Create<T>(T value) -> System.Runtime.Intrinsics.Vector256<T>
+static System.Runtime.Intrinsics.Vector256.GetElement<T>(System.Runtime.Intrinsics.Vector256<T> vector, int index) -> T
+static System.Runtime.Intrinsics.Vector256.IsHardwareAccelerated.get -> bool
+static System.Runtime.Intrinsics.Vector256<T>.Count.get -> int
+static System.Runtime.Intrinsics.Vector512.Create(double e0, double e1, double e2, double e3, double e4, double e5, double e6, double e7) -> System.Runtime.Intrinsics.Vector512<double>
+static System.Runtime.Intrinsics.Vector512.Create(float e0, float e1, float e2, float e3, float e4, float e5, float e6, float e7, float e8, float e9, float e10, float e11, float e12, float e13, float e14, float e15) -> System.Runtime.Intrinsics.Vector512<float>
+static System.Runtime.Intrinsics.Vector512.Create<T>(T value) -> System.Runtime.Intrinsics.Vector512<T>
+static System.Runtime.Intrinsics.Vector512.GetElement<T>(System.Runtime.Intrinsics.Vector512<T> vector, int index) -> T
+static System.Runtime.Intrinsics.Vector512.IsHardwareAccelerated.get -> bool
+static System.Runtime.Intrinsics.Vector512<T>.Count.get -> int
+System.Half
+System.Half.CompareTo(object! obj) -> int
+System.Half.CompareTo(System.Half other) -> int
+System.Half.Equals(System.Half other) -> bool
+System.Half.Half() -> void
+System.Half.ToString(string! format) -> string!
+System.Half.ToString(string! format, System.IFormatProvider! provider) -> string!
+System.Half.ToString(System.IFormatProvider! provider) -> string!
+System.Index
+System.Index.Equals(System.Index other) -> bool
+System.Index.GetOffset(int length) -> int
+System.Index.Index() -> void
+System.Index.Index(int value, bool fromEnd = false) -> void
+System.Index.IsFromEnd.get -> bool
+System.Index.Value.get -> int
+System.Range
+System.Range.End.get -> System.Index
+System.Range.Equals(System.Range other) -> bool
+System.Range.GetOffsetAndLength(int length) -> (int Offset, int Length)
+System.Range.Range() -> void
+System.Range.Range(System.Index start, System.Index end) -> void
+System.Range.Start.get -> System.Index
+System.Runtime.Intrinsics.Vector128
+System.Runtime.Intrinsics.Vector128<T>
+System.Runtime.Intrinsics.Vector128<T>.CopyTo(System.Span<T> destination) -> void
+System.Runtime.Intrinsics.Vector128<T>.Vector128() -> void
+System.Runtime.Intrinsics.Vector256
+System.Runtime.Intrinsics.Vector256<T>
+System.Runtime.Intrinsics.Vector256<T>.CopyTo(System.Span<T> destination) -> void
+System.Runtime.Intrinsics.Vector256<T>.Vector256() -> void
+System.Runtime.Intrinsics.Vector512
+System.Runtime.Intrinsics.Vector512<T>
+System.Runtime.Intrinsics.Vector512<T>.CopyTo(System.Span<T> destination) -> void
+System.Runtime.Intrinsics.Vector512<T>.Vector512() -> void

@@ -1,0 +1,7 @@
+#nullable enable
+AiDotNet.Tensors.LinearAlgebra.Tensor<T>.ToDLPack(AiDotNet.Tensors.Interop.DLPackStream consumerStream = default(AiDotNet.Tensors.Interop.DLPackStream)) -> System.IntPtr
+AiDotNet.Tensors.LinearAlgebra.Tensor<T>.ToDLPackLegacy(AiDotNet.Tensors.Interop.DLPackStream consumerStream = default(AiDotNet.Tensors.Interop.DLPackStream)) -> System.IntPtr
+static AiDotNet.Tensors.Interop.DLPack.GetCudaConsumerStream(int deviceId = 0) -> System.IntPtr
+static AiDotNet.Tensors.Interop.DLPackStream.FromHandle(System.IntPtr streamHandle) -> AiDotNet.Tensors.Interop.DLPackStream
+static AiDotNet.Tensors.LinearAlgebra.Tensor<T>.FromDLPack(System.IntPtr managedTensorVersioned) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+static AiDotNet.Tensors.LinearAlgebra.Tensor<T>.FromDLPackLegacy(System.IntPtr managedTensor) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!

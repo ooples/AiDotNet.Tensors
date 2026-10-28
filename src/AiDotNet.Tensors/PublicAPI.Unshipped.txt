@@ -1,0 +1,17 @@
+#nullable enable
+AiDotNet.Tensors.Interop.DLPack
+AiDotNet.Tensors.Interop.DLPackStream
+AiDotNet.Tensors.Interop.DLPackStream.DLPackStream() -> void
+AiDotNet.Tensors.Interop.DLPackStream.Equals(AiDotNet.Tensors.Interop.DLPackStream other) -> bool
+AiDotNet.Tensors.Interop.DLPackStream.IsNoSync.get -> bool
+const AiDotNet.Tensors.Interop.DLPack.MajorVersion = 1 -> int
+const AiDotNet.Tensors.Interop.DLPack.MinorVersion = 3 -> int
+override AiDotNet.Tensors.Interop.DLPackStream.Equals(object? obj) -> bool
+override AiDotNet.Tensors.Interop.DLPackStream.GetHashCode() -> int
+override AiDotNet.Tensors.Interop.DLPackStream.ToString() -> string!
+static AiDotNet.Tensors.Interop.DLPackStream.Default.get -> AiDotNet.Tensors.Interop.DLPackStream
+static AiDotNet.Tensors.Interop.DLPackStream.LegacyDefault.get -> AiDotNet.Tensors.Interop.DLPackStream
+static AiDotNet.Tensors.Interop.DLPackStream.NoSync.get -> AiDotNet.Tensors.Interop.DLPackStream
+static AiDotNet.Tensors.Interop.DLPackStream.operator !=(AiDotNet.Tensors.Interop.DLPackStream left, AiDotNet.Tensors.Interop.DLPackStream right) -> bool
+static AiDotNet.Tensors.Interop.DLPackStream.operator ==(AiDotNet.Tensors.Interop.DLPackStream left, AiDotNet.Tensors.Interop.DLPackStream right) -> bool
+static AiDotNet.Tensors.Interop.DLPackStream.PerThreadDefault.get -> AiDotNet.Tensors.Interop.DLPackStream
