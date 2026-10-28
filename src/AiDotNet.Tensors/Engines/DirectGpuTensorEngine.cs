@@ -1720,7 +1720,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 layout[view.Rank + d] = BitConverter.ToSingle(BitConverter.GetBytes(view._strides[d]), 0);
             }
             if (view._storageOffset < 0 || last >= baseBuffer.Size) return false;
-            var metadata = backend.AllocateBuffer(layout);
+            var metadata = CachedStridedViewLayout(backend, layout, out bool metadataCached);
             var gathered = AllocateFullyWrittenOutputBuffer(backend, view.Length);
             try
             {
@@ -1728,7 +1728,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     baseBuffer, gathered.Buffer, metadata, view.Rank, view._storageOffset, view.Length);
             }
             catch { gathered.DisposeAfterQueuedUse(backend); throw; }
-            finally { DisposeBufferAfterQueuedUse(backend, metadata); }
+            finally { if (!metadataCached) DisposeBufferAfterQueuedUse(backend, metadata); }
             result = gathered;
             return true;
         }
@@ -27324,14 +27324,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var a = tensors[0];
                 int rank = a.Rank;
                 int normAxis = axis < 0 ? rank + axis : axis;
-                if (normAxis >= 0 && normAxis < rank && a.IsContiguous)
+                // Strided inputs (narrow/permute views) are gathered on the device by GetOrAllocateBuffer below.
+                if (normAxis >= 0 && normAxis < rank)
                 {
                     bool shapesOk = true;
                     int axisTotal = 0;
                     for (int t = 0; t < tensors.Length && shapesOk; t++)
                     {
                         var tensor = tensors[t];
-                        shapesOk = tensor.Rank == rank && tensor.IsContiguous;
+                        shapesOk = tensor.Rank == rank;
                         for (int k = 0; k < rank && shapesOk; k++)
                             if (k != normAxis && a.Shape._dims[k] != tensor.Shape._dims[k])
                                 shapesOk = false;
@@ -28194,6 +28195,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // A backward may still have queued a pooling GEMM that reads one of these.
             foreach (var entry in _adaptivePoolMatrices) DisposeBufferAfterQueuedUse(entry.Key.Item1, entry.Value);
             _adaptivePoolMatrices.Clear();
+        }
+
+        lock (_stridedViewLayoutsGate)
+        {
+            foreach (var entry in _stridedViewLayouts) DisposeBufferAfterQueuedUse(entry.Key.Item1, entry.Value);
+            _stridedViewLayouts.Clear();
         }
 
         lock (_occupancyBufferCacheGate)

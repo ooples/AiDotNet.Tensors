@@ -4007,7 +4007,7 @@ public static class OpParityRegistry
         var sq = OpInput.Rand(811, new[] { 4, 1, 8 });
         var diag = OpInput.Rand(812, new[] { 4 });
         yield return new OpCase("TensorSqueeze[4,1,8;ax1]", "shape", e => e.TensorSqueeze(sq.F(), 1), e => e.TensorSqueeze(sq.D(), 1), ParityTol.Exact, opMethod: "TensorSqueeze") { GpuProbeExpectation = GpuProbeExpectation.MetadataOnly };
-        yield return new OpCase("TensorNarrow[4,8;d1,1,4]", "shape", e => e.TensorNarrow(m.F(), 1, 1, 4), e => e.TensorNarrow(m.D(), 1, 1, 4), ParityTol.Exact, opMethod: "TensorNarrow");
+        yield return new OpCase("TensorNarrow[4,8;d1,1,4]", "shape", e => e.TensorNarrow(m.F(), 1, 1, 4), e => e.TensorNarrow(m.D(), 1, 1, 4), ParityTol.Exact, opMethod: "TensorNarrow") { GpuProbeExpectation = GpuProbeExpectation.MetadataOnly };
         yield return new OpCase("TensorRepeatInterleave[4,8;2,d0]", "shape", e => e.TensorRepeatInterleave(m.F(), 2, 0), e => e.TensorRepeatInterleave(m.D(), 2, 0), ParityTol.Exact, opMethod: "TensorRepeatInterleave");
         yield return new OpCase("TensorTile[4,8;2,1]", "shape", e => e.TensorTile(m.F(), new[] { 2, 1 }), e => e.TensorTile(m.D(), new[] { 2, 1 }), ParityTol.Exact, opMethod: "TensorTile");
         yield return new OpCase("TensorRot90[4,8]", "shape", e => e.TensorRot90(m.F(), 1, new[] { 0, 1 }), e => e.TensorRot90(m.D(), 1, new[] { 0, 1 }), ParityTol.Exact, opMethod: "TensorRot90");

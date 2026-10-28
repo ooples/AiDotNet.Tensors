@@ -194,6 +194,7 @@ public sealed class GpuResidencyProbeTests
             ("ExpandDims", new[] { 2, 3 }, x => gpu.TensorExpandDims(x, 1), new[] { 1f, 2f, 3f, 4f, 5f, 6f }),
             ("Flatten", new[] { 2, 3 }, x => gpu.TensorFlatten(x), new[] { 1f, 2f, 3f, 4f, 5f, 6f }),
             ("Squeeze", new[] { 2, 1, 3 }, x => gpu.TensorSqueeze(x, 1), new[] { 1f, 2f, 3f, 4f, 5f, 6f }),
+            ("Narrow", new[] { 2, 3 }, x => gpu.TensorNarrow(x, 1, 1, 2), new[] { 2f, 3f, 5f, 6f }),
             ("Permute", new[] { 2, 3 }, x => gpu.TensorPermute(x, new[] { 1, 0 }), new[] { 1f, 4f, 2f, 5f, 3f, 6f }),
             ("MoveDim", new[] { 2, 3 }, x => gpu.TensorMoveDim(x, 0, 1), new[] { 1f, 4f, 2f, 5f, 3f, 6f }),
             ("SwapAxes", new[] { 2, 3 }, x => gpu.TensorSwapAxes(x, 0, 1), new[] { 1f, 4f, 2f, 5f, 3f, 6f }),
