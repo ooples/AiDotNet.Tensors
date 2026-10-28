@@ -123,17 +123,17 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_direct(
     output[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = r;
 }
 
-extern ""C"" __global__ __launch_bounds__(256) void conv2d_backward_input(
+__device__ __forceinline__ void conv2d_backward_input_at(
     const float* gradOutput, const float* kernel, float* gradInput,
     int batch, int inChannels, int inHeight, int inWidth,
     int outChannels, int outHeight, int outWidth,
     int kernelH, int kernelW, int strideH, int strideW,
-    int padH, int padW, int dilationH, int dilationW)
+    int padH, int padW, int dilationH, int dilationW, int gridStrideZ)
 {
     int iw = blockIdx.x * blockDim.x + threadIdx.x;
     int ih = blockIdx.y * blockDim.y + threadIdx.y;
-    int ic = blockIdx.z % inChannels;
-    int b = blockIdx.z / inChannels;
+    int ic = gridStrideZ % inChannels;
+    int b = gridStrideZ / inChannels;
 
     if (iw >= inWidth || ih >= inHeight || b >= batch) return;
 
@@ -156,6 +156,17 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_backward_input(
         }
     }
     gradInput[((b * inChannels + ic) * inHeight + ih) * inWidth + iw] = sum;
+}
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_backward_input(
+    const float* gradOutput, const float* kernel, float* gradInput,
+    int batch, int inChannels, int inHeight, int inWidth,
+    int outChannels, int outHeight, int outWidth,
+    int kernelH, int kernelW, int strideH, int strideW,
+    int padH, int padW, int dilationH, int dilationW)
+{
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch * inChannels; gridStrideZ += gridDim.z)
+        conv2d_backward_input_at(gradOutput, kernel, gradInput, batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, gridStrideZ);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void conv2d_backward_kernel(
@@ -193,16 +204,16 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_backward_kernel(
     gradKernel[idx] = sum;
 }
 
-extern ""C"" __global__ __launch_bounds__(256) void depthwise_conv2d(
+__device__ __forceinline__ void depthwise_conv2d_at(
     const float* input, const float* kernel, float* output,
     int batch, int channels, int inHeight, int inWidth,
     int outHeight, int outWidth, int kernelH, int kernelW,
-    int strideH, int strideW, int padH, int padW)
+    int strideH, int strideW, int padH, int padW, int gridStrideZ)
 {
     int ow = blockIdx.x * blockDim.x + threadIdx.x;
     int oh = blockIdx.y * blockDim.y + threadIdx.y;
-    int c = blockIdx.z % channels;
-    int b = blockIdx.z / channels;
+    int c = gridStrideZ % channels;
+    int b = gridStrideZ / channels;
 
     if (ow >= outWidth || oh >= outHeight || b >= batch) return;
 
@@ -220,18 +231,28 @@ extern ""C"" __global__ __launch_bounds__(256) void depthwise_conv2d(
     }
     output[((b * channels + c) * outHeight + oh) * outWidth + ow] = sum;
 }
+extern ""C"" __global__ __launch_bounds__(256) void depthwise_conv2d(
+    const float* input, const float* kernel, float* output,
+    int batch, int channels, int inHeight, int inWidth,
+    int outHeight, int outWidth, int kernelH, int kernelW,
+    int strideH, int strideW, int padH, int padW)
+{
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch * channels; gridStrideZ += gridDim.z)
+        depthwise_conv2d_at(input, kernel, output, batch, channels, inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, gridStrideZ);
+}
 
-extern ""C"" __global__ __launch_bounds__(256) void conv_transpose2d(
+__device__ __forceinline__ void conv_transpose2d_at(
     const float* input, const float* kernel, float* output,
     int batch, int inChannels, int inHeight, int inWidth,
     int outChannels, int outHeight, int outWidth,
     int kernelH, int kernelW, int strideH, int strideW, int padH, int padW,
-    int outputPadH, int outputPadW)
+    int outputPadH, int outputPadW, int gridStrideZ)
 {
     int ow = blockIdx.x * blockDim.x + threadIdx.x;
     int oh = blockIdx.y * blockDim.y + threadIdx.y;
-    int oc = blockIdx.z % outChannels;
-    int b = blockIdx.z / outChannels;
+    int oc = gridStrideZ % outChannels;
+    int b = gridStrideZ / outChannels;
 
     if (ow >= outWidth || oh >= outHeight || b >= batch) return;
 
@@ -254,6 +275,17 @@ extern ""C"" __global__ __launch_bounds__(256) void conv_transpose2d(
         }
     }
     output[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = sum;
+}
+extern ""C"" __global__ __launch_bounds__(256) void conv_transpose2d(
+    const float* input, const float* kernel, float* output,
+    int batch, int inChannels, int inHeight, int inWidth,
+    int outChannels, int outHeight, int outWidth,
+    int kernelH, int kernelW, int strideH, int strideW, int padH, int padW,
+    int outputPadH, int outputPadW)
+{
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch * outChannels; gridStrideZ += gridDim.z)
+        conv_transpose2d_at(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, outputPadH, outputPadW, gridStrideZ);
 }
 
 // Transposed Conv2D backward pass for input gradients
@@ -335,17 +367,17 @@ extern ""C"" __global__ __launch_bounds__(256) void conv_transpose2d_backward_ke
 // ===========================================================================
 #define TILE_OUT 16
 
-extern ""C"" __global__ __launch_bounds__(256) void conv2d_tiled(
+__device__ __forceinline__ void conv2d_tiled_at(
     const float* input, const float* weight, float* output,
     int batch, int inChannels, int inHeight, int inWidth,
     int outChannels, int outHeight, int outWidth,
     int kernelH, int kernelW, int strideH, int strideW,
-    int padH, int padW, int dilationH, int dilationW, const float* __restrict__ bias, int epi)
+    int padH, int padW, int dilationH, int dilationW, const float* __restrict__ bias, int epi, int gridStrideZ)
 {
     int tileRow = blockIdx.y * TILE_OUT;
     int tileCol = blockIdx.x * TILE_OUT;
-    int oc = blockIdx.z % outChannels;
-    int b  = blockIdx.z / outChannels;
+    int oc = gridStrideZ % outChannels;
+    int b  = gridStrideZ / outChannels;
 
     int tx = threadIdx.x;
     int ty = threadIdx.y;
@@ -406,6 +438,21 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_tiled(
         if ((epi & 2) && r < 0.0f) r = 0.0f;
         output[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = r;
     }
+}
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_tiled(
+    const float* input, const float* weight, float* output,
+    int batch, int inChannels, int inHeight, int inWidth,
+    int outChannels, int outHeight, int outWidth,
+    int kernelH, int kernelW, int strideH, int strideW,
+    int padH, int padW, int dilationH, int dilationW, const float* __restrict__ bias, int epi)
+{
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch * outChannels; gridStrideZ += gridDim.z)
+        {
+            conv2d_tiled_at(input, weight, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, bias, epi, gridStrideZ);
+            // Shared memory is reused by the next index; no thread may overwrite it while another still reads it.
+            __syncthreads();
+        }
 }
 
 // ===========================================================================
@@ -527,20 +574,20 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_winograd_f2x2_3x3(
     }
 }
 
-extern ""C"" __global__ __launch_bounds__(256) void conv3d_direct(
+__device__ __forceinline__ void conv3d_direct_at(
     const float* input, const float* kernel, float* output,
     int batch, int inChannels, int inDepth, int inHeight, int inWidth,
     int outChannels, int outDepth, int outHeight, int outWidth,
     int kernelD, int kernelH, int kernelW,
     int strideD, int strideH, int strideW,
     int padD, int padH, int padW,
-    int dilationD, int dilationH, int dilationW)
+    int dilationD, int dilationH, int dilationW, int gridStrideZ)
 {
     int ow = blockIdx.x * blockDim.x + threadIdx.x;
     int oh = blockIdx.y * blockDim.y + threadIdx.y;
-    int od = blockIdx.z % outDepth;
-    int oc = (blockIdx.z / outDepth) % outChannels;
-    int b = blockIdx.z / (outDepth * outChannels);
+    int od = gridStrideZ % outDepth;
+    int oc = (gridStrideZ / outDepth) % outChannels;
+    int b = gridStrideZ / (outDepth * outChannels);
 
     if (ow >= outWidth || oh >= outHeight || od >= outDepth || b >= batch) return;
 
@@ -562,6 +609,19 @@ extern ""C"" __global__ __launch_bounds__(256) void conv3d_direct(
         }
     }
     output[(((b * outChannels + oc) * outDepth + od) * outHeight + oh) * outWidth + ow] = sum;
+}
+extern ""C"" __global__ __launch_bounds__(256) void conv3d_direct(
+    const float* input, const float* kernel, float* output,
+    int batch, int inChannels, int inDepth, int inHeight, int inWidth,
+    int outChannels, int outDepth, int outHeight, int outWidth,
+    int kernelD, int kernelH, int kernelW,
+    int strideD, int strideH, int strideW,
+    int padD, int padH, int padW,
+    int dilationD, int dilationH, int dilationW)
+{
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch * outChannels * outDepth; gridStrideZ += gridDim.z)
+        conv3d_direct_at(input, kernel, output, batch, inChannels, inDepth, inHeight, inWidth, outChannels, outDepth, outHeight, outWidth, kernelD, kernelH, kernelW, strideD, strideH, strideW, padD, padH, padW, dilationD, dilationH, dilationW, gridStrideZ);
 }
 
 // #775: Trilinear interpolation of a [D,H,W,C] grid at [P,3] positions -> [P,C]. One thread per output

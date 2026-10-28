@@ -1774,18 +1774,25 @@ extern ""C"" __global__ __launch_bounds__(256) void transpose_2d(
     B[col * rows + row] = A[row * cols + col];
 }
 
-extern ""C"" __global__ __launch_bounds__(256) void batched_transpose(
-    const float* A, float* B, int batch, int rows, int cols)
+__device__ __forceinline__ void batched_transpose_at(
+    const float* A, float* B, int batch, int rows, int cols, int gridStrideZ)
 {
     int col = blockIdx.x * blockDim.x + threadIdx.x;
     int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int b = blockIdx.z;
+    int b = gridStrideZ;
 
     if (col >= cols || row >= rows || b >= batch) return;
 
     int inIdx = b * rows * cols + row * cols + col;
     int outIdx = b * cols * rows + col * rows + row;
     B[outIdx] = A[inIdx];
+}
+extern ""C"" __global__ __launch_bounds__(256) void batched_transpose(
+    const float* A, float* B, int batch, int rows, int cols)
+{
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch; gridStrideZ += gridDim.z)
+        batched_transpose_at(A, B, batch, rows, cols, gridStrideZ);
 }
 
 // Rectangular N-d slice (rank <= 8) in ONE launch: each thread maps its index in the slice [outDims] to the

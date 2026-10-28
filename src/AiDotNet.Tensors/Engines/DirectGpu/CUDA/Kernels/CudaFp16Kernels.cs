@@ -472,16 +472,16 @@ extern ""C"" __global__ __launch_bounds__(256) void im2col_kn_fp16hw(
 // im2col + launch overhead exceeds the Tensor-Core GEMM win). FP32 input rounded to FP16 per access (mirrors
 // im2col_kn_fp16hw), FP16 weights, FP32 multiply-accumulate (matches GemmFp16In32fOut numerics), FP32 output.
 // One thread per output (ow, oh) with a 3D grid z = b*outChannels. Capture-safe (single kernel, no device alloc).
-extern ""C"" __global__ void conv2d_direct_fp16hw(
+__device__ __forceinline__ void conv2d_direct_fp16hw_at(
     const float* __restrict__ input, const unsigned short* __restrict__ weightsHalf, float* __restrict__ output,
     int batch, int inChannels, int inHeight, int inWidth,
     int outChannels, int outHeight, int outWidth,
     int kernelH, int kernelW, int strideH, int strideW,
-    int padH, int padW, int dilationH, int dilationW)
+    int padH, int padW, int dilationH, int dilationW, int gridStrideZ)
 {
     int ow = blockIdx.x * blockDim.x + threadIdx.x;
     int oh = blockIdx.y * blockDim.y + threadIdx.y;
-    int bz = blockIdx.z;                 // b * outChannels + oc
+    int bz = gridStrideZ;                 // b * outChannels + oc
     if (ow >= outWidth || oh >= outHeight) return;
     int oc = bz % outChannels;
     int b  = bz / outChannels;
@@ -502,6 +502,17 @@ extern ""C"" __global__ void conv2d_direct_fp16hw(
         }
     }
     output[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = acc;
+}
+extern ""C"" __global__ void conv2d_direct_fp16hw(
+    const float* __restrict__ input, const unsigned short* __restrict__ weightsHalf, float* __restrict__ output,
+    int batch, int inChannels, int inHeight, int inWidth,
+    int outChannels, int outHeight, int outWidth,
+    int kernelH, int kernelW, int strideH, int strideW,
+    int padH, int padW, int dilationH, int dilationW)
+{
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch * outChannels; gridStrideZ += gridDim.z)
+        conv2d_direct_fp16hw_at(input, weightsHalf, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, gridStrideZ);
 }
 
 // FP16-IN variant of im2col_kn_fp16hw: input is already FP16 (unsigned short), output FP16 col[K,N] in the SAME

@@ -4053,15 +4053,18 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             DefaultBlockSize * sizeof(float), args);
     }
 
+    /// <summary>The hardware limit on gridDim.y (and gridDim.z); gridDim.x allows 2^31 - 1.</summary>
+    private const long MaxGridDimY = 65535;
+
     public unsafe void Conv2DBiasAdd(IGpuBuffer output, IGpuBuffer bias, int batch, int channels, int spatialSize)
     {
         if (!_kernelCache.TryGetValue("conv2d_bias_add", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: conv2d_bias_add");
 
         using var _ = PushContext();
-        // 2D grid: x=spatial, y=batch*channels — eliminates integer division in kernel
+        // 2D grid: x=spatial, y=batch*channels rows, clamped to the hardware's 65535; the kernel strides over the rest.
         uint gridX = (uint)((spatialSize + DefaultBlockSize - 1) / DefaultBlockSize);
-        uint gridY = (uint)(batch * channels);
+        uint gridY = (uint)Math.Min((long)batch * channels, MaxGridDimY);
         IntPtr outPtr = output.Handle;
         IntPtr biasPtr = bias.Handle;
         void** args = stackalloc void*[5];
@@ -4078,12 +4081,12 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         long n = (long)batch * channels * spatialSize;
         if (!IsAvailable || batch <= 0 || channels <= 0 || spatialSize <= 0 || input.Size < n || output.Size < n
-            || bias.Size < channels || (long)batch * channels > 65535
+            || bias.Size < channels
             || !_kernelCache.TryGetValue("conv2d_bias_add_out", out var biasOutKernel))
             return false;
         using var _ = PushContext();
         uint gridX = (uint)((spatialSize + DefaultBlockSize - 1) / DefaultBlockSize);
-        uint gridY = (uint)(batch * channels);
+        uint gridY = (uint)Math.Min((long)batch * channels, MaxGridDimY);
         IntPtr inPtr = input.Handle, biasPtr = bias.Handle, outPtr = output.Handle;
         int b = batch, c = channels, s = spatialSize;
         void** args = stackalloc void*[6];
@@ -5146,8 +5149,21 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    /// <summary>
+    /// Refuses a grid the hardware cannot launch before the driver does, naming the dimensions. The driver reports only
+    /// "Invalid value", which is how a batch x channels product past 65535 on gridDim.y reached users with no shape.
+    /// </summary>
+    private static void EnsureLaunchableGrid(uint gridY, uint gridZ, string launch)
+    {
+        if (gridY > MaxGridDimY || gridZ > MaxGridDimY)
+            throw new ArgumentOutOfRangeException(nameof(gridY),
+                $"{launch}: grid ({gridY} on y, {gridZ} on z) exceeds the hardware limit of {MaxGridDimY} on gridDim.y and " +
+                "gridDim.z. The launch site must clamp the axis and the kernel must grid-stride over the remainder.");
+    }
+
     private unsafe void LaunchKernel2D(IntPtr kernel, uint gridX, uint gridY, uint blockX, uint blockY, void** args)
     {
+        EnsureLaunchableGrid(gridY, 1, "cuLaunchKernel");
         CuBlasNative.CheckCudaResult(
             CudaNativeBindings.cuLaunchKernel(
                 kernel,
@@ -6256,7 +6272,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         using var _ = PushContext();
         uint gridX = (uint)((cols + DefaultBlockSize - 1) / DefaultBlockSize);
-        uint gridY = (uint)rows;
+        uint gridY = (uint)Math.Min((long)rows, MaxGridDimY);
         IntPtr dataPtr = data.Handle;
         IntPtr biasPtr = bias.Handle;
         int r = rows;
@@ -6610,6 +6626,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     private unsafe void LaunchKernel2D(IntPtr kernel, uint gridX, uint gridY, uint gridZ, uint blockX, uint blockY, void** args)
     {
+        EnsureLaunchableGrid(gridY, gridZ, "cuLaunchKernel2D");
         CuBlasNative.CheckCudaResult(
             CudaNativeBindings.cuLaunchKernel(
                 kernel,
@@ -6640,6 +6657,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     private unsafe void LaunchKernel3D(IntPtr kernel, uint gridX, uint gridY, uint gridZ, uint blockX, uint blockY, uint blockZ, void** args, uint sharedMemBytes = 0)
     {
+        EnsureLaunchableGrid(gridY, gridZ, "cuLaunchKernel3D");
         CuBlasNative.CheckCudaResult(
             CudaNativeBindings.cuLaunchKernel(
                 kernel,
@@ -6978,7 +6996,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             const int TILE_OUT = 16;
             uint gx = (uint)((outWidth + TILE_OUT - 1) / TILE_OUT);
             uint gy = (uint)((outHeight + TILE_OUT - 1) / TILE_OUT);
-            uint gz = (uint)(batch * outChannels);
+            uint gz = (uint)Math.Min((long)(batch * outChannels), MaxGridDimY);
 
             // Shared memory: one input channel tile at a time
             int effKH = (kernelH - 1) * dilationH + 1;
@@ -7101,7 +7119,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         const int BLOCK = 16;
         uint gx = (uint)((outWidth + BLOCK - 1) / BLOCK);
         uint gy = (uint)((outHeight + BLOCK - 1) / BLOCK);
-        uint gz = (uint)(batch * outChannels);
+        uint gz = (uint)Math.Min((long)(batch * outChannels), MaxGridDimY);
         void** a = stackalloc void*[18];
         a[0] = &inputPtr; a[1] = &wPtr; a[2] = &outputPtr;
         a[3] = &batch; a[4] = &inChannels; a[5] = &inHeight; a[6] = &inWidth;
@@ -7270,7 +7288,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         const int BLOCK = 16;
         uint gx = (uint)((inWidth + BLOCK - 1) / BLOCK);
         uint gy = (uint)((inHeight + BLOCK - 1) / BLOCK);
-        uint gz = (uint)(batch * inChannels);
+        uint gz = (uint)Math.Min((long)(batch * inChannels), MaxGridDimY);
 
         IntPtr gradOutputPtr = gradOutput.Handle;
         IntPtr kernelPtr = kernel.Handle;
@@ -7482,7 +7500,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         const int blockSize = 16;
         uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
         uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
-        uint gridZ = (uint)(batch * outChannels * outDepth);
+        uint gridZ = (uint)Math.Min((long)(batch * outChannels * outDepth), MaxGridDimY);
         IntPtr inputPtr = input.Handle;
         IntPtr kernelPtr = kernel.Handle;
         IntPtr outputPtr = output.Handle;
@@ -7555,7 +7573,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         const uint blockDimXY = 16;
         uint gx = (uint)((outWidth + blockDimXY - 1) / blockDimXY);
         uint gy = (uint)((outHeight + blockDimXY - 1) / blockDimXY);
-        uint gz = (uint)(batch * channels);
+        uint gz = (uint)Math.Min((long)(batch * channels), MaxGridDimY);
         LaunchKernel3D(cudaKernel, gx, gy, gz, blockDimXY, blockDimXY, 1, args);
     }
 
@@ -7596,7 +7614,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         const uint blockDimXY = 16;
         uint gx = (uint)((outWidth + blockDimXY - 1) / blockDimXY);
         uint gy = (uint)((outHeight + blockDimXY - 1) / blockDimXY);
-        uint gz = (uint)(batch * outChannels);
+        uint gz = (uint)Math.Min((long)(batch * outChannels), MaxGridDimY);
         LaunchKernel3D(cudaKernel, gx, gy, gz, blockDimXY, blockDimXY, 1, args);
     }
 
@@ -7717,7 +7735,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         const int blockSize = 16;
         uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
         uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
-        uint gridZ = (uint)(batch * outChannels);
+        uint gridZ = (uint)Math.Min((long)(batch * outChannels), MaxGridDimY);
 
         IntPtr inputPtr = input.Handle;
         IntPtr weightsPtr = weights.Handle;
@@ -7856,7 +7874,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         const int blockSize = 16;
         uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
         uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
-        uint gridZ = (uint)(batch * outChannels);
+        uint gridZ = (uint)Math.Min((long)(batch * outChannels), MaxGridDimY);
 
         IntPtr inputPtr = input.Handle;
         IntPtr weightsPtr = weights.Handle;
@@ -8133,7 +8151,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         const int blockSize = 16;
         uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
         uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
-        uint gridZ = (uint)(batch * channels);
+        uint gridZ = (uint)Math.Min((long)(batch * channels), MaxGridDimY);
 
         IntPtr inputPtr = input.Handle;
         IntPtr outputPtr = output.Handle;
@@ -8262,7 +8280,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // Deterministic variant grid: per (b, c, ih, iw) input cell.
             uint gridDX = (uint)((inWidth + blockSize - 1) / blockSize);
             uint gridDY = (uint)((inHeight + blockSize - 1) / blockSize);
-            uint gridDZ = (uint)(batch * channels);
+            uint gridDZ = (uint)Math.Min((long)(batch * channels), MaxGridDimY);
             LaunchKernel2D(kernelD, gridDX, gridDY, gridDZ, (uint)blockSize, (uint)blockSize, argsD);
             return;
         }
@@ -8281,7 +8299,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
         uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
-        uint gridZ = (uint)(batch * channels);
+        uint gridZ = (uint)Math.Min((long)(batch * channels), MaxGridDimY);
 
         void** args = stackalloc void*[9];
         args[0] = &gradOutPtr;
@@ -8310,7 +8328,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         const int blockSize = 16;
         uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
         uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
-        uint gridZ = (uint)(batch * channels);
+        uint gridZ = (uint)Math.Min((long)(batch * channels), MaxGridDimY);
 
         IntPtr inputPtr = input.Handle;
         IntPtr outputPtr = output.Handle;
@@ -8353,7 +8371,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         const int blockSize = 16;
         uint gridX = (uint)((inWidth + blockSize - 1) / blockSize);
         uint gridY = (uint)((inHeight + blockSize - 1) / blockSize);
-        uint gridZ = (uint)(batch * channels);
+        uint gridZ = (uint)Math.Min((long)(batch * channels), MaxGridDimY);
 
         IntPtr gradOutPtr = gradOutput.Handle;
         IntPtr gradInPtr = gradInput.Handle;
@@ -8525,7 +8543,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         const int blockSize = 8;
         uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
         uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
-        uint gridZ = (uint)(batch * channels * outDepth);
+        uint gridZ = (uint)Math.Min((long)(batch * channels * outDepth), MaxGridDimY);
 
         IntPtr inputPtr = input.Handle;
         IntPtr outputPtr = output.Handle;
@@ -8586,7 +8604,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 throw new GpuCapabilityUnavailableException("CUDA kernel not found: maxpool3d_backward_deterministic");
             uint gridDX = (uint)((inWidth + blockSize - 1) / blockSize);
             uint gridDY = (uint)((inHeight + blockSize - 1) / blockSize);
-            uint gridDZ = (uint)(batch * channels * inDepth);
+            uint gridDZ = (uint)Math.Min((long)(batch * channels * inDepth), MaxGridDimY);
             LaunchKernel2D(kernelD, gridDX, gridDY, gridDZ, (uint)blockSize, (uint)blockSize, args);
             return;
         }
@@ -8596,7 +8614,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
         uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
-        uint gridZ = (uint)(batch * channels * outDepth);
+        uint gridZ = (uint)Math.Min((long)(batch * channels * outDepth), MaxGridDimY);
         LaunchKernel2D(kernel, gridX, gridY, gridZ, (uint)blockSize, (uint)blockSize, args);
     }
 
@@ -8616,7 +8634,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         const int blockSize = 8;
         uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
         uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
-        uint gridZ = (uint)(batch * channels * outDepth);
+        uint gridZ = (uint)Math.Min((long)(batch * channels * outDepth), MaxGridDimY);
 
         IntPtr inputPtr = input.Handle;
         IntPtr outputPtr = output.Handle;
@@ -8664,7 +8682,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             argsD[9] = &scaleW;
             uint gridDX = (uint)((inWidth + blockSize - 1) / blockSize);
             uint gridDY = (uint)((inHeight + blockSize - 1) / blockSize);
-            uint gridDZ = (uint)(batch * channels * inDepth);
+            uint gridDZ = (uint)Math.Min((long)(batch * channels * inDepth), MaxGridDimY);
             LaunchKernel2D(kernelD, gridDX, gridDY, gridDZ, (uint)blockSize, (uint)blockSize, argsD);
             return;
         }
@@ -8678,7 +8696,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
         uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
-        uint gridZ = (uint)(batch * channels * outDepth);
+        uint gridZ = (uint)Math.Min((long)(batch * channels * outDepth), MaxGridDimY);
 
         void** args = stackalloc void*[10];
         args[0] = &gradOutPtr;
@@ -8708,7 +8726,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         const int blockSize = 16;
         uint gridX = (uint)((outputWidth + blockSize - 1) / blockSize);
         uint gridY = (uint)((outputHeight + blockSize - 1) / blockSize);
-        uint gridZ = (uint)batch;
+        uint gridZ = (uint)Math.Min((long)batch, MaxGridDimY);
 
         IntPtr thetaPtr = theta.Handle;
         IntPtr gridPtr = grid.Handle;
@@ -8732,7 +8750,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         const int blockSize = 16;
         uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
         uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
-        uint gridZ = (uint)(batch * channels);
+        uint gridZ = (uint)Math.Min((long)(batch * channels), MaxGridDimY);
 
         IntPtr inputPtr = input.Handle;
         IntPtr gridPtr = grid.Handle;
@@ -8790,7 +8808,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             argsG[11] = &alignCornersInt;
             uint gridGX = (uint)((outWidth + blockSize - 1) / blockSize);
             uint gridGY = (uint)((outHeight + blockSize - 1) / blockSize);
-            uint gridGZ = (uint)batch;
+            uint gridGZ = (uint)Math.Min((long)batch, MaxGridDimY);
             LaunchKernel2D(krnlGrid, gridGX, gridGY, gridGZ, (uint)blockSize, (uint)blockSize, argsG);
 
             // #890 phase 4e: the input gradient through the sorted scatter, bit-identical to the scanning kernel.
@@ -8814,7 +8832,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             argsI[10] = &alignCornersInt;
             uint gridIX = (uint)((inWidth + blockSize - 1) / blockSize);
             uint gridIY = (uint)((inHeight + blockSize - 1) / blockSize);
-            uint gridIZ = (uint)(batch * channels);
+            uint gridIZ = (uint)Math.Min((long)(batch * channels), MaxGridDimY);
             LaunchKernel2D(krnlIn, gridIX, gridIY, gridIZ, (uint)blockSize, (uint)blockSize, argsI);
             return;
         }
@@ -8824,7 +8842,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
         uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
-        uint gridZ = (uint)batch;
+        uint gridZ = (uint)Math.Min((long)batch, MaxGridDimY);
 
         void** args = stackalloc void*[14];
         args[0] = &gradOutputPtr;
@@ -9540,7 +9558,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         using var _ = PushContext();
         // 2D grid: x = columns (threads per row), y = rows
         uint gridX = (uint)((cols + DefaultBlockSize - 1) / DefaultBlockSize);
-        uint gridY = (uint)rows;
+        uint gridY = (uint)Math.Min((long)rows, MaxGridDimY);
         IntPtr inputPtr = input.Handle;
         IntPtr outputPtr = output.Handle;
         IntPtr biasPtr = bias.Handle;
@@ -9970,7 +9988,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         var kernel = _kernelCache["flash_attention_v2"];
         uint gridX = (uint)((seqQ + 31) / 32);
-        uint gridY = (uint)(batch * numHeads);
+        uint gridY = (uint)Math.Min((long)(batch * numHeads), MaxGridDimY);
         int causalFlag = isCausal ? 1 : 0;
         int hasBias = attentionBias is not null ? 1 : 0;
         IntPtr biasPtr = attentionBias is not null ? attentionBias.Handle : IntPtr.Zero;
@@ -10108,7 +10126,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             argsQ[15] = &hasBias;
             argsQ[16] = &biasBatchStride;
             uint gridQX = (uint)((seqQ + 63) / 64);
-            uint gridQY = (uint)(batch * numHeads);
+            uint gridQY = (uint)Math.Min((long)(batch * numHeads), MaxGridDimY);
             LaunchKernel2D(kernelQ, gridQX, gridQY, 64, 1, argsQ);
 
             var kernelKV = _kernelCache["flash_attention_backward_gradkv_deterministic"];
@@ -10133,14 +10151,14 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             argsKV[17] = &biasBatchStride;
             uint gridKVX = (uint)((headDim + 15) / 16);
             uint gridKVY = (uint)((seqK + 3) / 4);
-            uint gridKVZ = (uint)(batch * numHeads);
+            uint gridKVZ = (uint)Math.Min((long)(batch * numHeads), MaxGridDimY);
             LaunchKernel3D(kernelKV, gridKVX, gridKVY, gridKVZ, 16, 4, 1, argsKV);
             return;
         }
 
         var kernel = _kernelCache["flash_attention_backward"];
         uint gridX = (uint)((seqQ + 31) / 32);
-        uint gridY = (uint)(batch * numHeads);
+        uint gridY = (uint)Math.Min((long)(batch * numHeads), MaxGridDimY);
         void** args = stackalloc void*[19];
         args[0] = &goPtr;
         args[1] = &qPtr;
@@ -10192,7 +10210,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             return;
         var kernel = _kernelCache["grouped_query_attention"];
         uint gridX = (uint)((seqQ + 31) / 32);
-        uint gridY = (uint)(batch * numQHeads);
+        uint gridY = (uint)Math.Min((long)(batch * numQHeads), MaxGridDimY);
         int queriesPerKV = numQHeads / numKVHeads;
         int causalFlag = isCausal ? 1 : 0;
         int storeWeights = attentionWeights != null ? 1 : 0;
@@ -10295,7 +10313,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             argsQg[12] = &headDim;
             argsQg[13] = &scale;
             uint gqX = (uint)((seqQ + 63) / 64);
-            uint gqY = (uint)(batch * numQHeads);
+            uint gqY = (uint)Math.Min((long)(batch * numQHeads), MaxGridDimY);
             LaunchKernel2D(kqGqa, gqX, gqY, 64, 1, argsQg);
 
             var kkvGqa = _kernelCache["grouped_query_attention_backward_gradkv_deterministic"];
@@ -10317,14 +10335,14 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             argsKVg[14] = &scale;
             uint gkvX = (uint)((headDim + 15) / 16);
             uint gkvY = (uint)((seqK + 3) / 4);
-            uint gkvZ = (uint)(batch * numKVHeads);
+            uint gkvZ = (uint)Math.Min((long)(batch * numKVHeads), MaxGridDimY);
             LaunchKernel3D(kkvGqa, gkvX, gkvY, gkvZ, 16, 4, 1, argsKVg);
             return;
         }
 
         var kernel = _kernelCache["grouped_query_attention_backward"];
         uint gridX = (uint)((seqQ + 31) / 32);
-        uint gridY = (uint)(batch * numQHeads);
+        uint gridY = (uint)Math.Min((long)(batch * numQHeads), MaxGridDimY);
         void** args = stackalloc void*[16];
         args[0] = &goPtr;
         args[1] = &qPtr;
@@ -10404,7 +10422,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         const uint blockX = 16, blockY = 16;
         uint gridX = ((uint)cols + blockX - 1) / blockX;
         uint gridY = ((uint)rows + blockY - 1) / blockY;
-        uint gridZ = (uint)batch;
+        uint gridZ = (uint)Math.Min((long)batch, MaxGridDimY);
         IntPtr aPtr = A.Handle;
         IntPtr bPtr = B.Handle;
         void** args = stackalloc void*[5];

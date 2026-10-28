@@ -18,16 +18,16 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
 // ===========================================================================
 
 // Max Pooling 2D with optional indices for backward pass
-extern ""C"" __global__ __launch_bounds__(256) void maxpool2d(
+__device__ __forceinline__ void maxpool2d_at(
     const float* __restrict__ input, float* __restrict__ output, int* __restrict__ indices,
     int batch, int channels, int inHeight, int inWidth,
     int outHeight, int outWidth, int kernelH, int kernelW,
-    int strideH, int strideW, int padH, int padW, int saveIndices)
+    int strideH, int strideW, int padH, int padW, int saveIndices, int gridStrideZ)
 {
     int ow = blockIdx.x * blockDim.x + threadIdx.x;
     int oh = blockIdx.y * blockDim.y + threadIdx.y;
-    int c = blockIdx.z % channels;
-    int b = blockIdx.z / channels;
+    int c = gridStrideZ % channels;
+    int b = gridStrideZ / channels;
 
     if (ow >= outWidth || oh >= outHeight || b >= batch) return;
 
@@ -60,17 +60,27 @@ extern ""C"" __global__ __launch_bounds__(256) void maxpool2d(
         indices[outIdx] = maxIdx;
     }
 }
+extern ""C"" __global__ __launch_bounds__(256) void maxpool2d(
+    const float* __restrict__ input, float* __restrict__ output, int* __restrict__ indices,
+    int batch, int channels, int inHeight, int inWidth,
+    int outHeight, int outWidth, int kernelH, int kernelW,
+    int strideH, int strideW, int padH, int padW, int saveIndices)
+{
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch * channels; gridStrideZ += gridDim.z)
+        maxpool2d_at(input, output, indices, batch, channels, inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, saveIndices, gridStrideZ);
+}
 
 // Max Pooling 2D backward pass
 // NON-DETERMINISTIC across runs (issue #382); see maxpool2d_backward_deterministic.
-extern ""C"" __global__ __launch_bounds__(256) void maxpool2d_backward(
+__device__ __forceinline__ void maxpool2d_backward_at(
     const float* __restrict__ gradOutput, const int* __restrict__ indices, float* __restrict__ gradInput,
-    int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)
+    int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth, int gridStrideZ)
 {
     int ow = blockIdx.x * blockDim.x + threadIdx.x;
     int oh = blockIdx.y * blockDim.y + threadIdx.y;
-    int c = blockIdx.z % channels;
-    int b = blockIdx.z / channels;
+    int c = gridStrideZ % channels;
+    int b = gridStrideZ / channels;
 
     if (ow >= outWidth || oh >= outHeight || b >= batch) return;
 
@@ -83,6 +93,14 @@ extern ""C"" __global__ __launch_bounds__(256) void maxpool2d_backward(
     int inputIdx = ((b * channels + c) * inHeight + ih) * inWidth + iw;
 
     atomicAdd(&gradInput[inputIdx], grad);
+}
+extern ""C"" __global__ __launch_bounds__(256) void maxpool2d_backward(
+    const float* __restrict__ gradOutput, const int* __restrict__ indices, float* __restrict__ gradInput,
+    int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)
+{
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch * channels; gridStrideZ += gridDim.z)
+        maxpool2d_backward_at(gradOutput, indices, gradInput, batch, channels, inHeight, inWidth, outHeight, outWidth, gridStrideZ);
 }
 
 // maxpool2d_backward -- bit-deterministic variant (issue #382).
@@ -101,15 +119,15 @@ extern ""C"" __global__ __launch_bounds__(256) void maxpool2d_backward(
 // so every index lies inside its window and every cell, cell 0 included, takes the bounded scan. The forward stored
 // cell 0 for such a window, so cell 0 scanned the whole output plane: one 196-iteration thread per plane, stalling its
 // warp, ~135 us per step on the parity CNN's first pool.
-extern ""C"" __global__ __launch_bounds__(256) void maxpool2d_backward_deterministic(
+__device__ __forceinline__ void maxpool2d_backward_deterministic_at(
     const float* __restrict__ gradOutput, const int* __restrict__ indices, float* __restrict__ gradInput,
     int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth,
-    int kernelH, int kernelW, int strideH, int strideW, int padH, int padW)
+    int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int gridStrideZ)
 {
     int iw = blockIdx.x * blockDim.x + threadIdx.x;
     int ih = blockIdx.y * blockDim.y + threadIdx.y;
-    int c = blockIdx.z % channels;
-    int b = blockIdx.z / channels;
+    int c = gridStrideZ % channels;
+    int b = gridStrideZ / channels;
     if (iw >= inWidth || ih >= inHeight || b >= batch) return;
 
     int targetMaxIdx = ih * inWidth + iw;
@@ -140,6 +158,15 @@ extern ""C"" __global__ __launch_bounds__(256) void maxpool2d_backward_determini
     // gradient in `sum`, so assignment is correct and does not depend on gradInput having been zeroed
     // first (the null-stream zeroing is not ordered against this kernel's non-blocking stream).
     gradInput[((b * channels + c) * inHeight + ih) * inWidth + iw] = sum;
+}
+extern ""C"" __global__ __launch_bounds__(256) void maxpool2d_backward_deterministic(
+    const float* __restrict__ gradOutput, const int* __restrict__ indices, float* __restrict__ gradInput,
+    int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth,
+    int kernelH, int kernelW, int strideH, int strideW, int padH, int padW)
+{
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch * channels; gridStrideZ += gridDim.z)
+        maxpool2d_backward_deterministic_at(gradOutput, indices, gradInput, batch, channels, inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, gridStrideZ);
 }
 
 // Average Pooling 2D
@@ -205,16 +232,16 @@ extern ""C"" __global__ __launch_bounds__(256) void maxpool2d_backward_recompute
             out[cell] = cell == winner ? g : 0.0f;
         }
 }
-extern ""C"" __global__ __launch_bounds__(256) void avgpool2d(
+__device__ __forceinline__ void avgpool2d_at(
     const float* __restrict__ input, float* __restrict__ output,
     int batch, int channels, int inHeight, int inWidth,
     int outHeight, int outWidth, int kernelH, int kernelW,
-    int strideH, int strideW, int padH, int padW, int countIncludePad)
+    int strideH, int strideW, int padH, int padW, int countIncludePad, int gridStrideZ)
 {
     int ow = blockIdx.x * blockDim.x + threadIdx.x;
     int oh = blockIdx.y * blockDim.y + threadIdx.y;
-    int c = blockIdx.z % channels;
-    int b = blockIdx.z / channels;
+    int c = gridStrideZ % channels;
+    int b = gridStrideZ / channels;
 
     if (ow >= outWidth || oh >= outHeight || b >= batch) return;
 
@@ -238,18 +265,28 @@ extern ""C"" __global__ __launch_bounds__(256) void avgpool2d(
     int divisor = countIncludePad ? (kernelH * kernelW) : count;
     output[((b * channels + c) * outHeight + oh) * outWidth + ow] = sum / (float)max(divisor, 1);
 }
-
-// Average Pooling 2D backward pass
-extern ""C"" __global__ __launch_bounds__(256) void avgpool2d_backward(
-    const float* __restrict__ gradOutput, float* __restrict__ gradInput,
+extern ""C"" __global__ __launch_bounds__(256) void avgpool2d(
+    const float* __restrict__ input, float* __restrict__ output,
     int batch, int channels, int inHeight, int inWidth,
     int outHeight, int outWidth, int kernelH, int kernelW,
     int strideH, int strideW, int padH, int padW, int countIncludePad)
 {
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch * channels; gridStrideZ += gridDim.z)
+        avgpool2d_at(input, output, batch, channels, inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, countIncludePad, gridStrideZ);
+}
+
+// Average Pooling 2D backward pass
+__device__ __forceinline__ void avgpool2d_backward_at(
+    const float* __restrict__ gradOutput, float* __restrict__ gradInput,
+    int batch, int channels, int inHeight, int inWidth,
+    int outHeight, int outWidth, int kernelH, int kernelW,
+    int strideH, int strideW, int padH, int padW, int countIncludePad, int gridStrideZ)
+{
     int iw = blockIdx.x * blockDim.x + threadIdx.x;
     int ih = blockIdx.y * blockDim.y + threadIdx.y;
-    int c = blockIdx.z % channels;
-    int b = blockIdx.z / channels;
+    int c = gridStrideZ % channels;
+    int b = gridStrideZ / channels;
 
     if (iw >= inWidth || ih >= inHeight || b >= batch) return;
 
@@ -280,6 +317,16 @@ extern ""C"" __global__ __launch_bounds__(256) void avgpool2d_backward(
     }
 
     gradInput[((b * channels + c) * inHeight + ih) * inWidth + iw] = sum;
+}
+extern ""C"" __global__ __launch_bounds__(256) void avgpool2d_backward(
+    const float* __restrict__ gradOutput, float* __restrict__ gradInput,
+    int batch, int channels, int inHeight, int inWidth,
+    int outHeight, int outWidth, int kernelH, int kernelW,
+    int strideH, int strideW, int padH, int padW, int countIncludePad)
+{
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch * channels; gridStrideZ += gridDim.z)
+        avgpool2d_backward_at(gradOutput, gradInput, batch, channels, inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, countIncludePad, gridStrideZ);
 }
 
 // Global Average Pooling 2D
@@ -452,19 +499,19 @@ extern ""C"" __global__ __launch_bounds__(256) void adaptive_avgpool2d(
 
 // Max Pooling 3D with optional indices for backward pass
 // Input layout: NCDHW (batch, channels, depth, height, width)
-extern ""C"" __global__ __launch_bounds__(256) void maxpool3d(
+__device__ __forceinline__ void maxpool3d_at(
     const float* __restrict__ input, float* __restrict__ output, int* __restrict__ indices,
     int batch, int channels,
     int inDepth, int inHeight, int inWidth,
     int outDepth, int outHeight, int outWidth,
     int kernelD, int kernelH, int kernelW,
     int strideD, int strideH, int strideW,
-    int saveIndices)
+    int saveIndices, int gridStrideZ)
 {
     // Thread maps to (ow, oh) with grid z for (batch * channels * outDepth)
     int ow = blockIdx.x * blockDim.x + threadIdx.x;
     int oh = blockIdx.y * blockDim.y + threadIdx.y;
-    int linear_z = blockIdx.z;
+    int linear_z = gridStrideZ;
 
     int od = linear_z % outDepth;
     int c = (linear_z / outDepth) % channels;
@@ -511,17 +558,30 @@ extern ""C"" __global__ __launch_bounds__(256) void maxpool3d(
         indices[outIdx] = maxIdx;
     }
 }
+extern ""C"" __global__ __launch_bounds__(256) void maxpool3d(
+    const float* __restrict__ input, float* __restrict__ output, int* __restrict__ indices,
+    int batch, int channels,
+    int inDepth, int inHeight, int inWidth,
+    int outDepth, int outHeight, int outWidth,
+    int kernelD, int kernelH, int kernelW,
+    int strideD, int strideH, int strideW,
+    int saveIndices)
+{
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch * channels * outDepth; gridStrideZ += gridDim.z)
+        maxpool3d_at(input, output, indices, batch, channels, inDepth, inHeight, inWidth, outDepth, outHeight, outWidth, kernelD, kernelH, kernelW, strideD, strideH, strideW, saveIndices, gridStrideZ);
+}
 
 // Max Pooling 3D backward pass
-extern ""C"" __global__ __launch_bounds__(256) void maxpool3d_backward(
+__device__ __forceinline__ void maxpool3d_backward_at(
     const float* __restrict__ gradOutput, const int* __restrict__ indices, float* __restrict__ gradInput,
     int batch, int channels,
     int inDepth, int inHeight, int inWidth,
-    int outDepth, int outHeight, int outWidth)
+    int outDepth, int outHeight, int outWidth, int gridStrideZ)
 {
     int ow = blockIdx.x * blockDim.x + threadIdx.x;
     int oh = blockIdx.y * blockDim.y + threadIdx.y;
-    int linear_z = blockIdx.z;
+    int linear_z = gridStrideZ;
 
     int od = linear_z % outDepth;
     int c = (linear_z / outDepth) % channels;
@@ -545,19 +605,29 @@ extern ""C"" __global__ __launch_bounds__(256) void maxpool3d_backward(
                  + ih * inWidth + iw;
     atomicAdd(&gradInput[inputIdx], grad);
 }
-
-// maxpool3d_backward — bit-deterministic variant (issue #382).
-// One thread per (b, c, id, ih, iw) input cell scans every output position and
-// accumulates gradients from output cells whose indices[outIdx] points here.
-extern ""C"" __global__ __launch_bounds__(256) void maxpool3d_backward_deterministic(
+extern ""C"" __global__ __launch_bounds__(256) void maxpool3d_backward(
     const float* __restrict__ gradOutput, const int* __restrict__ indices, float* __restrict__ gradInput,
     int batch, int channels,
     int inDepth, int inHeight, int inWidth,
     int outDepth, int outHeight, int outWidth)
 {
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch * channels * outDepth; gridStrideZ += gridDim.z)
+        maxpool3d_backward_at(gradOutput, indices, gradInput, batch, channels, inDepth, inHeight, inWidth, outDepth, outHeight, outWidth, gridStrideZ);
+}
+
+// maxpool3d_backward — bit-deterministic variant (issue #382).
+// One thread per (b, c, id, ih, iw) input cell scans every output position and
+// accumulates gradients from output cells whose indices[outIdx] points here.
+__device__ __forceinline__ void maxpool3d_backward_deterministic_at(
+    const float* __restrict__ gradOutput, const int* __restrict__ indices, float* __restrict__ gradInput,
+    int batch, int channels,
+    int inDepth, int inHeight, int inWidth,
+    int outDepth, int outHeight, int outWidth, int gridStrideZ)
+{
     int iw = blockIdx.x * blockDim.x + threadIdx.x;
     int ih = blockIdx.y * blockDim.y + threadIdx.y;
-    int linear_z = blockIdx.z;
+    int linear_z = gridStrideZ;
     int id = linear_z % inDepth;
     int c = (linear_z / inDepth) % channels;
     int b = linear_z / (inDepth * channels);
@@ -580,21 +650,31 @@ extern ""C"" __global__ __launch_bounds__(256) void maxpool3d_backward_determini
     }
     gradInput[((b * channels + c) * inDepth + id) * inHeight * inWidth + ih * inWidth + iw] += sum;
 }
+extern ""C"" __global__ __launch_bounds__(256) void maxpool3d_backward_deterministic(
+    const float* __restrict__ gradOutput, const int* __restrict__ indices, float* __restrict__ gradInput,
+    int batch, int channels,
+    int inDepth, int inHeight, int inWidth,
+    int outDepth, int outHeight, int outWidth)
+{
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch * channels * inDepth; gridStrideZ += gridDim.z)
+        maxpool3d_backward_deterministic_at(gradOutput, indices, gradInput, batch, channels, inDepth, inHeight, inWidth, outDepth, outHeight, outWidth, gridStrideZ);
+}
 
 // Average Pooling 3D
 // Input layout: NCDHW (batch, channels, depth, height, width)
-extern ""C"" __global__ __launch_bounds__(256) void avgpool3d(
+__device__ __forceinline__ void avgpool3d_at(
     const float* input, float* output,
     int batch, int channels,
     int inDepth, int inHeight, int inWidth,
     int outDepth, int outHeight, int outWidth,
     int kernelD, int kernelH, int kernelW,
     int strideD, int strideH, int strideW,
-    int countIncludePad)
+    int countIncludePad, int gridStrideZ)
 {
     int ow = blockIdx.x * blockDim.x + threadIdx.x;
     int oh = blockIdx.y * blockDim.y + threadIdx.y;
-    int linear_z = blockIdx.z;
+    int linear_z = gridStrideZ;
 
     int od = linear_z % outDepth;
     int c = (linear_z / outDepth) % channels;
@@ -630,10 +710,8 @@ extern ""C"" __global__ __launch_bounds__(256) void avgpool3d(
                + oh * outWidth + ow;
     output[outIdx] = sum / (float)max(divisor, 1);
 }
-
-// Average Pooling 3D backward pass
-extern ""C"" __global__ __launch_bounds__(256) void avgpool3d_backward(
-    const float* __restrict__ gradOutput, float* __restrict__ gradInput,
+extern ""C"" __global__ __launch_bounds__(256) void avgpool3d(
+    const float* input, float* output,
     int batch, int channels,
     int inDepth, int inHeight, int inWidth,
     int outDepth, int outHeight, int outWidth,
@@ -641,9 +719,24 @@ extern ""C"" __global__ __launch_bounds__(256) void avgpool3d_backward(
     int strideD, int strideH, int strideW,
     int countIncludePad)
 {
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch * channels * outDepth; gridStrideZ += gridDim.z)
+        avgpool3d_at(input, output, batch, channels, inDepth, inHeight, inWidth, outDepth, outHeight, outWidth, kernelD, kernelH, kernelW, strideD, strideH, strideW, countIncludePad, gridStrideZ);
+}
+
+// Average Pooling 3D backward pass
+__device__ __forceinline__ void avgpool3d_backward_at(
+    const float* __restrict__ gradOutput, float* __restrict__ gradInput,
+    int batch, int channels,
+    int inDepth, int inHeight, int inWidth,
+    int outDepth, int outHeight, int outWidth,
+    int kernelD, int kernelH, int kernelW,
+    int strideD, int strideH, int strideW,
+    int countIncludePad, int gridStrideZ)
+{
     int iw = blockIdx.x * blockDim.x + threadIdx.x;
     int ih = blockIdx.y * blockDim.y + threadIdx.y;
-    int linear_z = blockIdx.z;
+    int linear_z = gridStrideZ;
 
     int id = linear_z % inDepth;
     int c = (linear_z / inDepth) % channels;
@@ -689,6 +782,19 @@ extern ""C"" __global__ __launch_bounds__(256) void avgpool3d_backward(
     int inputIdx = ((b * channels + c) * inDepth + id) * inHeight * inWidth
                  + ih * inWidth + iw;
     gradInput[inputIdx] = sum;
+}
+extern ""C"" __global__ __launch_bounds__(256) void avgpool3d_backward(
+    const float* __restrict__ gradOutput, float* __restrict__ gradInput,
+    int batch, int channels,
+    int inDepth, int inHeight, int inWidth,
+    int outDepth, int outHeight, int outWidth,
+    int kernelD, int kernelH, int kernelW,
+    int strideD, int strideH, int strideW,
+    int countIncludePad)
+{
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch * channels * inDepth; gridStrideZ += gridDim.z)
+        avgpool3d_backward_at(gradOutput, gradInput, batch, channels, inDepth, inHeight, inWidth, outDepth, outHeight, outWidth, kernelD, kernelH, kernelW, strideD, strideH, strideW, countIncludePad, gridStrideZ);
 }
 
 // ===========================================================================
@@ -768,11 +874,11 @@ extern ""C"" __global__ __launch_bounds__(256) void nearest_neighbor_upsample_ba
 
 // Nearest Neighbor Upsample 3D
 // Upsamples each spatial dimension by integer scale factors
-extern ""C"" __global__ __launch_bounds__(256) void nearest_upsample3d(
+__device__ __forceinline__ void nearest_upsample3d_at(
     const float* input, float* output,
     int batch, int channels,
     int inDepth, int inHeight, int inWidth,
-    int scaleD, int scaleH, int scaleW)
+    int scaleD, int scaleH, int scaleW, int gridStrideZ)
 {
     int outDepth = inDepth * scaleD;
     int outHeight = inHeight * scaleH;
@@ -780,7 +886,7 @@ extern ""C"" __global__ __launch_bounds__(256) void nearest_upsample3d(
 
     int ow = blockIdx.x * blockDim.x + threadIdx.x;
     int oh = blockIdx.y * blockDim.y + threadIdx.y;
-    int linear_z = blockIdx.z;
+    int linear_z = gridStrideZ;
 
     int od = linear_z % outDepth;
     int c = (linear_z / outDepth) % channels;
@@ -800,13 +906,23 @@ extern ""C"" __global__ __launch_bounds__(256) void nearest_upsample3d(
 
     output[outIdx] = input[inputIdx];
 }
-
-// Nearest Neighbor Upsample 3D backward pass
-extern ""C"" __global__ __launch_bounds__(256) void nearest_upsample3d_backward(
-    const float* __restrict__ gradOutput, float* __restrict__ gradInput,
+extern ""C"" __global__ __launch_bounds__(256) void nearest_upsample3d(
+    const float* input, float* output,
     int batch, int channels,
     int inDepth, int inHeight, int inWidth,
     int scaleD, int scaleH, int scaleW)
+{
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch * channels * inDepth * scaleD; gridStrideZ += gridDim.z)
+        nearest_upsample3d_at(input, output, batch, channels, inDepth, inHeight, inWidth, scaleD, scaleH, scaleW, gridStrideZ);
+}
+
+// Nearest Neighbor Upsample 3D backward pass
+__device__ __forceinline__ void nearest_upsample3d_backward_at(
+    const float* __restrict__ gradOutput, float* __restrict__ gradInput,
+    int batch, int channels,
+    int inDepth, int inHeight, int inWidth,
+    int scaleD, int scaleH, int scaleW, int gridStrideZ)
 {
     int outDepth = inDepth * scaleD;
     int outHeight = inHeight * scaleH;
@@ -814,7 +930,7 @@ extern ""C"" __global__ __launch_bounds__(256) void nearest_upsample3d_backward(
 
     int ow = blockIdx.x * blockDim.x + threadIdx.x;
     int oh = blockIdx.y * blockDim.y + threadIdx.y;
-    int linear_z = blockIdx.z;
+    int linear_z = gridStrideZ;
 
     int od = linear_z % outDepth;
     int c = (linear_z / outDepth) % channels;
@@ -834,15 +950,25 @@ extern ""C"" __global__ __launch_bounds__(256) void nearest_upsample3d_backward(
 
     atomicAdd(&gradInput[inputIdx], gradOutput[outIdx]);
 }
-
-// nearest_upsample3d_backward — bit-deterministic variant (issue #382).
-// One thread per (b, c, id, ih, iw) input cell sums the gradients from the
-// scaleD*scaleH*scaleW output cells that map back to this input cell.
-extern ""C"" __global__ __launch_bounds__(256) void nearest_upsample3d_backward_deterministic(
+extern ""C"" __global__ __launch_bounds__(256) void nearest_upsample3d_backward(
     const float* __restrict__ gradOutput, float* __restrict__ gradInput,
     int batch, int channels,
     int inDepth, int inHeight, int inWidth,
     int scaleD, int scaleH, int scaleW)
+{
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch * channels * inDepth * scaleD; gridStrideZ += gridDim.z)
+        nearest_upsample3d_backward_at(gradOutput, gradInput, batch, channels, inDepth, inHeight, inWidth, scaleD, scaleH, scaleW, gridStrideZ);
+}
+
+// nearest_upsample3d_backward — bit-deterministic variant (issue #382).
+// One thread per (b, c, id, ih, iw) input cell sums the gradients from the
+// scaleD*scaleH*scaleW output cells that map back to this input cell.
+__device__ __forceinline__ void nearest_upsample3d_backward_deterministic_at(
+    const float* __restrict__ gradOutput, float* __restrict__ gradInput,
+    int batch, int channels,
+    int inDepth, int inHeight, int inWidth,
+    int scaleD, int scaleH, int scaleW, int gridStrideZ)
 {
     int outHeight = inHeight * scaleH;
     int outWidth = inWidth * scaleW;
@@ -850,7 +976,7 @@ extern ""C"" __global__ __launch_bounds__(256) void nearest_upsample3d_backward_
 
     int iw = blockIdx.x * blockDim.x + threadIdx.x;
     int ih = blockIdx.y * blockDim.y + threadIdx.y;
-    int linear_z = blockIdx.z;
+    int linear_z = gridStrideZ;
     int id = linear_z % inDepth;
     int c = (linear_z / inDepth) % channels;
     int b = linear_z / (inDepth * channels);
@@ -871,6 +997,16 @@ extern ""C"" __global__ __launch_bounds__(256) void nearest_upsample3d_backward_
     }
     int inputIdx = ((b * channels + c) * inDepth + id) * inHeight * inWidth + ih * inWidth + iw;
     gradInput[inputIdx] += sum;
+}
+extern ""C"" __global__ __launch_bounds__(256) void nearest_upsample3d_backward_deterministic(
+    const float* __restrict__ gradOutput, float* __restrict__ gradInput,
+    int batch, int channels,
+    int inDepth, int inHeight, int inWidth,
+    int scaleD, int scaleH, int scaleW)
+{
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch * channels * inDepth; gridStrideZ += gridDim.z)
+        nearest_upsample3d_backward_deterministic_at(gradOutput, gradInput, batch, channels, inDepth, inHeight, inWidth, scaleD, scaleH, scaleW, gridStrideZ);
 }
 
 // ===========================================================================

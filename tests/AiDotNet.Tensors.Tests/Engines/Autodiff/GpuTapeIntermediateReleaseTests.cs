@@ -217,6 +217,80 @@ public sealed class GpuTapeIntermediateReleaseTests : IClassFixture<DirectGpuTen
             Assert.True(Math.Abs(g[i] - expected[i]) < 1e-3f, $"dL/dw[{i}] ten tapes later: gpu {g[i]} cpu {expected[i]}");
     }
     [SkippableFact]
+    public void AHostTensorWrittenOnTheDeviceDuringTheTape_KeepsItsValuesAfterIt()
+    {
+        // An eager optimizer keeps its moments in host tensors it owns and updates them with engine ops inside the
+        // training step's tape: m = beta1 * m + (1 - beta1) * g, written back with TensorCopy(mNew, m). That write
+        // leaves m's only valid copy on the device, and the tape's end freed it as a dead step intermediate, so the
+        // next step's read of m threw (MobileNetV2 trained on CUDA failed at its second step). A tensor the caller
+        // owns is not an intermediate, whatever wrote it.
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        IEngine gpu = _fixture.Engine!;
+        var w = Rand(new[] { 32, 48 }, 2);
+        var x = Rand(new[] { 64, 32 }, 3);
+        var moment = new Tensor<float>(new[] { 32, 48 });
+        float[] expectedMoment;
+        using (var tape = new GradientTape<float>())
+        {
+            var (_, _, loss) = Forward(gpu, x, w);
+            var grad = tape.ComputeGradients(loss, new[] { w })[w];
+            expectedMoment = grad.ToArray().Select(v => 0.1f * v).ToArray();
+            var updated = gpu.TensorAdd(gpu.TensorMultiplyScalar(moment, 0.9f), gpu.TensorMultiplyScalar(grad, 0.1f));
+            gpu.TensorCopy(updated, moment);
+        }
+
+        var values = moment.ToArray();
+        for (int i = 0; i < values.Length; i++)
+            Assert.True(Math.Abs(values[i] - expectedMoment[i]) < 1e-5f, $"moment[{i}] after the tape: {values[i]} vs {expectedMoment[i]}");
+
+        // And it keeps working as the next step's input.
+        var next = gpu.TensorMultiplyScalar(moment, 2f).ToArray();
+        for (int i = 0; i < next.Length; i++)
+            Assert.True(Math.Abs(next[i] - 2 * expectedMoment[i]) < 1e-5f, $"2 * moment[{i}]: {next[i]}");
+    }
+
+    [SkippableFact]
+    public void AResidualStep_ReadsNothingBackAtTheTapesEnd()
+    {
+        // Keeping caller-owned TensorCopy destinations must not make an ordinary eager step download at the tape's end.
+        // A residual add gives h two consumers, so backward accumulates two gradient contributions into it: those
+        // accumulators are step intermediates and are freed without a copy. (The compiled plan's first-write
+        // TensorCopy into its persistent gradient buffers runs only inside a GradWriteGeneration; the plan's own
+        // transfer-count tests in Parity guard that path.)
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        IEngine gpu = _fixture.Engine!;
+        var w = Rand(new[] { 32, 32 }, 7);
+        var x = Rand(new[] { 64, 32 }, 8);
+        bool savedCapture = GpuLaunchProbe.CaptureReadbackSites;
+        long disposeReadbackBytes;
+        string disposeSites;
+        try
+        {
+            GpuLaunchProbe.CaptureReadbackSites = true;
+            var tape = new GradientTape<float>();
+            try
+            {
+                var h = gpu.TensorTanh(gpu.TensorMatMul(x, w));
+                var residual = gpu.TensorAdd(h, gpu.TensorTanh(gpu.TensorMatMul(h, w)));   // h has two consumers
+                var loss = gpu.ReduceSum(gpu.TensorMultiply(residual, residual), new[] { 0, 1 }, keepDims: false);
+                tape.ComputeGradients(loss, new[] { w });
+            }
+            finally
+            {
+                GpuLaunchProbe.Reset();
+                tape.Dispose();
+                disposeReadbackBytes = GpuLaunchProbe.ReadbackBytes;
+                disposeSites = string.Join("; ", GpuLaunchProbe.ReadbackSites);
+            }
+        }
+        finally
+        {
+            GpuLaunchProbe.CaptureReadbackSites = savedCapture;
+        }
+        Assert.True(disposeReadbackBytes == 0, $"tape dispose read back {disposeReadbackBytes} bytes: {disposeSites}");
+    }
+
+    [SkippableFact]
     public void SharedGradientContribution_IsCopiedOnTheDevice()
     {
         // z = x + y hands the SAME upstream gradient to x and to y; the second destination gets its own copy. That

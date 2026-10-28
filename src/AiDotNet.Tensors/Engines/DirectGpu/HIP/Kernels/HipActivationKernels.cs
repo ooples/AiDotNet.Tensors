@@ -483,14 +483,20 @@ extern ""C"" __global__ __launch_bounds__(256) void sum_axis_rows_split(const fl
     if (threadIdx.x == 0) partial[(size_t)row * (unsigned int)chunks + chunk] = scratch[0];
 }
 
-extern ""C"" __global__ __launch_bounds__(256) void bias_add(float* __restrict__ data, const float* __restrict__ bias, int rows, int cols)
+__device__ __forceinline__ void bias_add_at(float* __restrict__ data, const float* __restrict__ bias, int rows, int cols, int gridStrideY)
 {
-    // 2D grid: blockIdx.y = row, blockIdx.x * blockDim.x + threadIdx.x = column
+    // 2D grid: gridStrideY = row, blockIdx.x * blockDim.x + threadIdx.x = column
     // Eliminates ~20-cycle integer division from idx % cols
     int col = blockIdx.x * blockDim.x + threadIdx.x;
-    int row = blockIdx.y;
+    int row = gridStrideY;
     if (col >= cols || row >= rows) return;
     data[row * cols + col] += bias[col];
+}
+extern ""C"" __global__ __launch_bounds__(256) void bias_add(float* __restrict__ data, const float* __restrict__ bias, int rows, int cols)
+{
+    // gridDim.y is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideY = blockIdx.y; gridStrideY < rows; gridStrideY += gridDim.y)
+        bias_add_at(data, bias, rows, cols, gridStrideY);
 }
 
 // Trigonometric
@@ -1080,13 +1086,14 @@ extern ""C"" __global__ __launch_bounds__(256) void scatter_mean_divide(float* o
 
 // Conv2D bias add in NCHW format: output[b,c,h,w] += bias[c]
 // Memory layout: output is [batch, channels, height, width] in row-major order
+// gridDim.y is capped at 65535, so the launch clamps it and each block strides over the remaining rows.
 extern ""C"" __global__ __launch_bounds__(256) void conv2d_bias_add(float* __restrict__ output, const float* __restrict__ bias, int batch, int channels, int spatialSize)
 {
     int spatialIdx = blockIdx.x * blockDim.x + threadIdx.x;
-    int bc = blockIdx.y;
-    if (spatialIdx >= spatialSize || bc >= batch * channels) return;
-    int channel = bc % channels;
-    output[bc * spatialSize + spatialIdx] += bias[channel];
+    if (spatialIdx >= spatialSize) return;
+    int rows = batch * channels;
+    for (int bc = blockIdx.y; bc < rows; bc += gridDim.y)
+        output[(long long)bc * spatialSize + spatialIdx] += bias[bc % channels];
 }
 
 // ===========================================================================

@@ -1150,12 +1150,18 @@ extern ""C"" __global__ __launch_bounds__(256) void sum_axis_rows_split(const fl
     }
 }
 
-extern ""C"" __global__ __launch_bounds__(256) void bias_add(float* __restrict__ data, const float* __restrict__ bias, int rows, int cols)
+__device__ __forceinline__ void bias_add_at(float* __restrict__ data, const float* __restrict__ bias, int rows, int cols, int gridStrideY)
 {
     int col = blockIdx.x * blockDim.x + threadIdx.x;
-    int row = blockIdx.y;
+    int row = gridStrideY;
     if (col >= cols || row >= rows) return;
     data[row * cols + col] += __ldg(&bias[col]);
+}
+extern ""C"" __global__ __launch_bounds__(256) void bias_add(float* __restrict__ data, const float* __restrict__ bias, int rows, int cols)
+{
+    // gridDim.y is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideY = blockIdx.y; gridStrideY < rows; gridStrideY += gridDim.y)
+        bias_add_at(data, bias, rows, cols, gridStrideY);
 }
 
 // Bias add with separate output: C[i,j] = A[i,j] + bias[j], over the flat [rows * cols] range (grid-stride). One block
@@ -1193,25 +1199,29 @@ extern ""C"" __global__ __launch_bounds__(256) void bias_add_out(const float* __
 // Conv2D bias add in NCHW format: output[b,c,h,w] += bias[c]
 // Uses 2D grid to eliminate integer division/modulo:
 //   blockIdx.y = batch * channel index, blockIdx.x * blockDim.x + threadIdx.x = spatial index
+// gridDim.y is capped at 65535 by the hardware, so the launch clamps it and each block strides over the
+// remaining (batch, channel) rows: batch 128 x 512 channels is 65536 rows, one more than a grid can hold.
 // conv2d_bias_add written out of place: output = input + bias[channel], one pass. The in-place form needed the input
 // copied into a zero-filled output first (a fill, a copy and the add: three passes over a convolution's output).
 extern ""C"" __global__ __launch_bounds__(256) void conv2d_bias_add_out(const float* __restrict__ input,
     const float* __restrict__ bias, float* __restrict__ output, int batch, int channels, int spatialSize)
 {
     int spatialIdx = blockIdx.x * blockDim.x + threadIdx.x;
-    int bc = blockIdx.y;
-    if (spatialIdx >= spatialSize || bc >= batch * channels) return;
-    int channel = bc % channels;
-    long long i = (long long)bc * spatialSize + spatialIdx;
-    output[i] = input[i] + __ldg(&bias[channel]);
+    if (spatialIdx >= spatialSize) return;
+    int rows = batch * channels;
+    for (int bc = blockIdx.y; bc < rows; bc += gridDim.y)
+    {
+        long long i = (long long)bc * spatialSize + spatialIdx;
+        output[i] = input[i] + __ldg(&bias[bc % channels]);
+    }
 }
 extern ""C"" __global__ __launch_bounds__(256) void conv2d_bias_add(float* __restrict__ output, const float* __restrict__ bias, int batch, int channels, int spatialSize)
 {
     int spatialIdx = blockIdx.x * blockDim.x + threadIdx.x;
-    int bc = blockIdx.y;
-    if (spatialIdx >= spatialSize || bc >= batch * channels) return;
-    int channel = bc % channels;
-    output[bc * spatialSize + spatialIdx] += __ldg(&bias[channel]);
+    if (spatialIdx >= spatialSize) return;
+    int rows = batch * channels;
+    for (int bc = blockIdx.y; bc < rows; bc += gridDim.y)
+        output[(long long)bc * spatialSize + spatialIdx] += __ldg(&bias[bc % channels]);
 }
 
 // ===========================================================================

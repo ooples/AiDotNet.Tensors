@@ -159,16 +159,16 @@ extern ""C"" __global__ __launch_bounds__(256) void topk(
 // Generate affine sampling grid from transformation matrices
 // theta: [batch, 2, 3] affine transformation matrices (row-major)
 // grid: [batch, outH, outW, 2] output sampling coordinates in [-1, 1]
-extern ""C"" __global__ __launch_bounds__(256) void affine_grid(
+__device__ __forceinline__ void affine_grid_at(
     const float* theta,
     float* grid,
     int batch,
     int outHeight,
-    int outWidth)
+    int outWidth, int gridStrideZ)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
-    int b = blockIdx.z;
+    int b = gridStrideZ;
 
     if (x >= outWidth || y >= outHeight || b >= batch) return;
 
@@ -186,6 +186,17 @@ extern ""C"" __global__ __launch_bounds__(256) void affine_grid(
     int gridIdx = ((b * outHeight + y) * outWidth + x) * 2;
     grid[gridIdx] = outX;
     grid[gridIdx + 1] = outY;
+}
+extern ""C"" __global__ __launch_bounds__(256) void affine_grid(
+    const float* theta,
+    float* grid,
+    int batch,
+    int outHeight,
+    int outWidth)
+{
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch; gridStrideZ += gridDim.z)
+        affine_grid_at(theta, grid, batch, outHeight, outWidth, gridStrideZ);
 }
 
 // ===========================================================================
@@ -205,7 +216,7 @@ __device__ __forceinline__ bool gs_point_usable(float ix, float iy)
 // output: [batch, channels, outH, outW]
 // paddingMode: 0 = zeros, 1 = border
 // alignCorners: if true, treat [-1,1] as exact corner coordinates
-extern ""C"" __global__ __launch_bounds__(256) void grid_sample(
+__device__ __forceinline__ void grid_sample_at(
     const float* input,
     const float* grid,
     float* output,
@@ -216,11 +227,11 @@ extern ""C"" __global__ __launch_bounds__(256) void grid_sample(
     int outHeight,
     int outWidth,
     int paddingMode,
-    int alignCorners)
+    int alignCorners, int gridStrideZ)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
-    int bc = blockIdx.z;
+    int bc = gridStrideZ;
     int b = bc / channels;
     int c = bc % channels;
 
@@ -291,13 +302,30 @@ extern ""C"" __global__ __launch_bounds__(256) void grid_sample(
     int outIdx = ((b * channels + c) * outHeight + y) * outWidth + x;
     output[outIdx] = result;
 }
+extern ""C"" __global__ __launch_bounds__(256) void grid_sample(
+    const float* input,
+    const float* grid,
+    float* output,
+    int batch,
+    int channels,
+    int inHeight,
+    int inWidth,
+    int outHeight,
+    int outWidth,
+    int paddingMode,
+    int alignCorners)
+{
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch * channels; gridStrideZ += gridDim.z)
+        grid_sample_at(input, grid, output, batch, channels, inHeight, inWidth, outHeight, outWidth, paddingMode, alignCorners, gridStrideZ);
+}
 
 // ===========================================================================
 // GRID SAMPLE BACKWARD KERNEL
 // ===========================================================================
 
 // Backward pass for grid sampling - computes gradients for input and grid
-extern ""C"" __global__ __launch_bounds__(256) void grid_sample_backward(
+__device__ __forceinline__ void grid_sample_backward_at(
     const float* gradOutput,
     const float* input,
     const float* grid,
@@ -310,11 +338,11 @@ extern ""C"" __global__ __launch_bounds__(256) void grid_sample_backward(
     int outHeight,
     int outWidth,
     int paddingMode,
-    int alignCorners)
+    int alignCorners, int gridStrideZ)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
-    int b = blockIdx.z;
+    int b = gridStrideZ;
 
     if (x >= outWidth || y >= outHeight || b >= batch) return;
 
@@ -395,6 +423,25 @@ extern ""C"" __global__ __launch_bounds__(256) void grid_sample_backward(
     gradGrid[gridIdx] = gradGridX;
     gradGrid[gridIdx + 1] = gradGridY;
 }
+extern ""C"" __global__ __launch_bounds__(256) void grid_sample_backward(
+    const float* gradOutput,
+    const float* input,
+    const float* grid,
+    float* gradInput,
+    float* gradGrid,
+    int batch,
+    int channels,
+    int inHeight,
+    int inWidth,
+    int outHeight,
+    int outWidth,
+    int paddingMode,
+    int alignCorners)
+{
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch; gridStrideZ += gridDim.z)
+        grid_sample_backward_at(gradOutput, input, grid, gradInput, gradGrid, batch, channels, inHeight, inWidth, outHeight, outWidth, paddingMode, alignCorners, gridStrideZ);
+}
 
 // ===========================================================================
 // GRID SAMPLE BACKWARD — DETERMINISTIC SPLIT (issue #382)
@@ -405,15 +452,15 @@ extern ""C"" __global__ __launch_bounds__(256) void grid_sample_backward(
 //               output position and accumulates the bilinear weight times
 //               gradOutput from any of the four corner positions that map to
 //               this input cell. No atomics; deterministic across runs.
-extern ""C"" __global__ __launch_bounds__(256) void grid_sample_backward_grad_grid_deterministic(
+__device__ __forceinline__ void grid_sample_backward_grad_grid_deterministic_at(
     const float* gradOutput, const float* input, const float* grid,
     float* gradGrid,
     int batch, int channels, int inHeight, int inWidth,
-    int outHeight, int outWidth, int paddingMode, int alignCorners)
+    int outHeight, int outWidth, int paddingMode, int alignCorners, int gridStrideZ)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
-    int b = blockIdx.z;
+    int b = gridStrideZ;
     if (x >= outWidth || y >= outHeight || b >= batch) return;
 
     int gridIdx = ((b * outHeight + y) * outWidth + x) * 2;
@@ -468,16 +515,26 @@ extern ""C"" __global__ __launch_bounds__(256) void grid_sample_backward_grad_gr
     gradGrid[gridIdx] = gradGridX;
     gradGrid[gridIdx + 1] = gradGridY;
 }
-
-extern ""C"" __global__ __launch_bounds__(256) void grid_sample_backward_grad_input_deterministic(
-    const float* gradOutput, const float* grid,
-    float* gradInput,
+extern ""C"" __global__ __launch_bounds__(256) void grid_sample_backward_grad_grid_deterministic(
+    const float* gradOutput, const float* input, const float* grid,
+    float* gradGrid,
     int batch, int channels, int inHeight, int inWidth,
     int outHeight, int outWidth, int paddingMode, int alignCorners)
 {
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch; gridStrideZ += gridDim.z)
+        grid_sample_backward_grad_grid_deterministic_at(gradOutput, input, grid, gradGrid, batch, channels, inHeight, inWidth, outHeight, outWidth, paddingMode, alignCorners, gridStrideZ);
+}
+
+__device__ __forceinline__ void grid_sample_backward_grad_input_deterministic_at(
+    const float* gradOutput, const float* grid,
+    float* gradInput,
+    int batch, int channels, int inHeight, int inWidth,
+    int outHeight, int outWidth, int paddingMode, int alignCorners, int gridStrideZ)
+{
     int w_in = blockIdx.x * blockDim.x + threadIdx.x;
     int h_in = blockIdx.y * blockDim.y + threadIdx.y;
-    int bc = blockIdx.z;
+    int bc = gridStrideZ;
     if (w_in >= inWidth || h_in >= inHeight || bc >= batch * channels) return;
 
     int b = bc / channels;
@@ -526,6 +583,16 @@ extern ""C"" __global__ __launch_bounds__(256) void grid_sample_backward_grad_in
         }
     }
     gradInput[((b * channels + c) * inHeight + h_in) * inWidth + w_in] += sum;
+}
+extern ""C"" __global__ __launch_bounds__(256) void grid_sample_backward_grad_input_deterministic(
+    const float* gradOutput, const float* grid,
+    float* gradInput,
+    int batch, int channels, int inHeight, int inWidth,
+    int outHeight, int outWidth, int paddingMode, int alignCorners)
+{
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch * channels; gridStrideZ += gridDim.z)
+        grid_sample_backward_grad_input_deterministic_at(gradOutput, grid, gradInput, batch, channels, inHeight, inWidth, outHeight, outWidth, paddingMode, alignCorners, gridStrideZ);
 }
 
 // #775: 3D Gaussian-splat covariance R*S^2*R^T. rotations [N,4] quaternion, scales [N,3] -> [N,6] upper
