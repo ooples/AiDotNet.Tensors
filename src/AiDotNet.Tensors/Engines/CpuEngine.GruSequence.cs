@@ -392,8 +392,21 @@ public partial class CpuEngine
         bool keepCache, out GruSequenceCacheFloat? cache)
     {
         int inFeatures = input.Shape[2], g3 = 3 * hidden, rows = seqLen * batch;
+        // Without a tape nothing outlives the call but the output: the scratch (about 11 MB at B=128, T=32, H=64) comes
+        // from the pool instead of fresh, zeroed large-object allocations, which cost more than the recurrence itself.
+        // A taped call keeps its arrays as the backward's cache.
+        var rented = keepCache ? null : new List<float[]>();
+        float[] Scratch(int length)
+        {
+            if (rented is null) return new float[length];
+            var array = System.Buffers.ArrayPool<float>.Shared.Rent(length);
+            rented.Add(array);
+            return array;
+        }
+        try
+        {
         var x = input.ToArray();
-        var xt = new float[rows * inFeatures];
+        var xt = Scratch(rows * inFeatures);
         for (int b = 0; b < batch; b++)
             for (int t = 0; t < seqLen; t++)
                 Array.Copy(x, (b * seqLen + t) * inFeatures, xt, (t * batch + b) * inFeatures, inFeatures);
@@ -410,16 +423,17 @@ public partial class CpuEngine
             wnT = new float[hidden * hidden];
             Simd.SimdGemm.Transpose(whh, 2 * hidden * hidden, hidden, wnT, 0, hidden, hidden, hidden);
         }
-        var gi = new float[rows * g3];
+        var gi = Scratch(rows * g3);
         Simd.SimdGemm.Sgemm(xt, inFeatures, false, wihT, g3, false, gi, rows, inFeatures, g3);
         var bi = bIh?.ToArray() ?? new float[g3];
         var bh = bHh?.ToArray() ?? new float[g3];
 
-        var allH = new float[(seqLen + 1) * batch * hidden];
+        var allH = Scratch((seqLen + 1) * batch * hidden);
         if (h0 is not null) Array.Copy(h0.ToArray(), allH, batch * hidden);
-        var gates = new float[rows * g3];
-        var ghn = new float[rows * hidden];
-        var rh = resetAfter ? Array.Empty<float>() : new float[rows * hidden];
+        else Array.Clear(allH, 0, batch * hidden);   // a rented array is not zeroed
+        var gates = Scratch(rows * g3);
+        var ghn = Scratch(rows * hidden);
+        var rh = resetAfter ? Array.Empty<float>() : Scratch(rows * hidden);
         var y = new float[batch * seqLen * hidden];
         // Batch rows never interact, so each chunk of them runs the whole recurrence on its own thread.
         ForEachBatchChunk(batch, hidden, (b0, b1) =>
@@ -435,12 +449,7 @@ public partial class CpuEngine
                     for (int b = b0; b < b1; b++)
                     {
                         int iRow = (t * batch + b) * g3, hRow = (b - b0) * hRows, prev = (t * batch + b) * hidden;
-                        for (int j = 0; j < hidden; j++)
-                        {
-                            float r = 1f / (1f + MathF.Exp(-(gi[iRow + j] + bi[j] + gh[hRow + j] + bh[j])));
-                            gates[iRow + j] = r;
-                            rh[prev + j] = r * allH[prev + j];
-                        }
+                        GruResetRow(gi, iRow, bi, gh, hRow, bh, allH, prev, gates, rh, hidden);
                     }
                     Simd.SimdGemm.SgemmSequential(rh.AsSpan((t * batch + b0) * hidden, chunk * hidden), wnT, gn, chunk, hidden, hidden);
                 }
@@ -448,20 +457,8 @@ public partial class CpuEngine
                 {
                     int iRow = (t * batch + b) * g3, hRow = (b - b0) * hRows, prev = (t * batch + b) * hidden;
                     int next = ((t + 1) * batch + b) * hidden, outRow = (b * seqLen + t) * hidden;
-                    for (int j = 0; j < hidden; j++)
-                    {
-                        float r = resetAfter
-                            ? 1f / (1f + MathF.Exp(-(gi[iRow + j] + bi[j] + gh[hRow + j] + bh[j])))
-                            : gates[iRow + j];
-                        float z = 1f / (1f + MathF.Exp(-(gi[iRow + hidden + j] + bi[hidden + j] + gh[hRow + hidden + j] + bh[hidden + j])));
-                        float hn = (resetAfter ? gh[hRow + 2 * hidden + j] : gn[(b - b0) * hidden + j]) + bh[2 * hidden + j];
-                        float n = MathF.Tanh(gi[iRow + 2 * hidden + j] + bi[2 * hidden + j] + (resetAfter ? r * hn : hn));
-                        float hv = (1f - z) * n + z * allH[prev + j];
-                        gates[iRow + j] = r; gates[iRow + hidden + j] = z; gates[iRow + 2 * hidden + j] = n;
-                        ghn[prev + j] = hn;
-                        allH[next + j] = hv;
-                        y[outRow + j] = hv;
-                    }
+                    GruCellRow(gi, iRow, bi, gh, hRow, bh, resetAfter ? gh : gn, resetAfter ? hRow + 2 * hidden : (b - b0) * hidden,
+                        resetAfter, allH, prev, next, gates, ghn, y, outRow, hidden);
                 }
             }
         });
@@ -474,6 +471,102 @@ public partial class CpuEngine
             }
             : null;
         return new Tensor<float>(y, new[] { batch, seqLen, hidden });
+        }
+        finally
+        {
+            if (rented is not null)
+                foreach (var array in rented) System.Buffers.ArrayPool<float>.Shared.Return(array);
+        }
+    }
+
+    // r = sigmoid(input sum + recurrent sum) for one row, and r * h for the candidate's recurrent product (the reset-before
+    // form); eight units at a time in AVX registers where available, as the LSTM path computes its gates.
+    private static unsafe void GruResetRow(float[] gi, int iRow, float[] bi, float[] gh, int hRow, float[] bh,
+        float[] allH, int prev, float[] gates, float[] rh, int hidden)
+    {
+        int j = 0;
+#if NET5_0_OR_GREATER
+        if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported)
+        {
+            fixed (float* giP = gi) fixed (float* biP = bi) fixed (float* ghP = gh) fixed (float* bhP = bh)
+            fixed (float* hP = allH) fixed (float* gP = gates) fixed (float* rhP = rh)
+            {
+                for (; j + 8 <= hidden; j += 8)
+                {
+                    var s = System.Runtime.Intrinsics.X86.Avx.Add(
+                        System.Runtime.Intrinsics.X86.Avx.Add(System.Runtime.Intrinsics.X86.Avx.LoadVector256(giP + iRow + j), System.Runtime.Intrinsics.X86.Avx.LoadVector256(biP + j)),
+                        System.Runtime.Intrinsics.X86.Avx.Add(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ghP + hRow + j), System.Runtime.Intrinsics.X86.Avx.LoadVector256(bhP + j)));
+                    var r = Simd.SimdKernels.FastSigmoid256(s);
+                    System.Runtime.Intrinsics.X86.Avx.Store(gP + iRow + j, r);
+                    System.Runtime.Intrinsics.X86.Avx.Store(rhP + prev + j,
+                        System.Runtime.Intrinsics.X86.Avx.Multiply(r, System.Runtime.Intrinsics.X86.Avx.LoadVector256(hP + prev + j)));
+                }
+            }
+        }
+#endif
+        for (; j < hidden; j++)
+        {
+            float r = 1f / (1f + MathF.Exp(-(gi[iRow + j] + bi[j] + gh[hRow + j] + bh[j])));
+            gates[iRow + j] = r;
+            rh[prev + j] = r * allH[prev + j];
+        }
+    }
+
+    // One row of the cell: r (reset-after form; the reset-before form already stored it), z, the candidate n from its
+    // recurrent sum hnSrc[hnRow + j] + bhn, and h' = (1 - z) n + z h; eight units at a time in AVX registers where available.
+    private static unsafe void GruCellRow(float[] gi, int iRow, float[] bi, float[] gh, int hRow, float[] bh, float[] hnSrc,
+        int hnRow, bool resetAfter, float[] allH, int prev, int next, float[] gates, float[] ghn, float[] y, int outRow, int hidden)
+    {
+        int j = 0;
+        int h2 = 2 * hidden;
+#if NET5_0_OR_GREATER
+        if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported)
+        {
+            fixed (float* giP = gi) fixed (float* biP = bi) fixed (float* ghP = gh) fixed (float* bhP = bh)
+            fixed (float* hnP = hnSrc) fixed (float* hP = allH) fixed (float* gP = gates) fixed (float* ghnP = ghn)
+            fixed (float* yP = y)
+            {
+                for (; j + 8 <= hidden; j += 8)
+                {
+                    System.Runtime.Intrinsics.Vector256<float> Sum(float* a, int ai, float* b, int bi2)
+                        => System.Runtime.Intrinsics.X86.Avx.Add(System.Runtime.Intrinsics.X86.Avx.LoadVector256(a + ai), System.Runtime.Intrinsics.X86.Avx.LoadVector256(b + bi2));
+                    var r = resetAfter
+                        ? Simd.SimdKernels.FastSigmoid256(System.Runtime.Intrinsics.X86.Avx.Add(Sum(giP, iRow + j, biP, j), Sum(ghP, hRow + j, bhP, j)))
+                        : System.Runtime.Intrinsics.X86.Avx.LoadVector256(gP + iRow + j);
+                    var z = Simd.SimdKernels.FastSigmoid256(System.Runtime.Intrinsics.X86.Avx.Add(
+                        Sum(giP, iRow + hidden + j, biP, hidden + j), Sum(ghP, hRow + hidden + j, bhP, hidden + j)));
+                    var hn = Sum(hnP, hnRow + j, bhP, h2 + j);
+                    var nIn = Sum(giP, iRow + h2 + j, biP, h2 + j);
+                    var n = Simd.SimdKernels.FastTanh256(resetAfter
+                        ? System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(r, hn, nIn)
+                        : System.Runtime.Intrinsics.X86.Avx.Add(nIn, hn));
+                    var hp = System.Runtime.Intrinsics.X86.Avx.LoadVector256(hP + prev + j);
+                    // (1 - z) n + z h = n + z (h - n)
+                    var hv = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(z, System.Runtime.Intrinsics.X86.Avx.Subtract(hp, n), n);
+                    System.Runtime.Intrinsics.X86.Avx.Store(gP + iRow + j, r);
+                    System.Runtime.Intrinsics.X86.Avx.Store(gP + iRow + hidden + j, z);
+                    System.Runtime.Intrinsics.X86.Avx.Store(gP + iRow + h2 + j, n);
+                    System.Runtime.Intrinsics.X86.Avx.Store(ghnP + prev + j, hn);
+                    System.Runtime.Intrinsics.X86.Avx.Store(hP + next + j, hv);
+                    System.Runtime.Intrinsics.X86.Avx.Store(yP + outRow + j, hv);
+                }
+            }
+        }
+#endif
+        for (; j < hidden; j++)
+        {
+            float r = resetAfter
+                ? 1f / (1f + MathF.Exp(-(gi[iRow + j] + bi[j] + gh[hRow + j] + bh[j])))
+                : gates[iRow + j];
+            float z = 1f / (1f + MathF.Exp(-(gi[iRow + hidden + j] + bi[hidden + j] + gh[hRow + hidden + j] + bh[hidden + j])));
+            float hn = hnSrc[hnRow + j] + bh[h2 + j];
+            float n = MathF.Tanh(gi[iRow + h2 + j] + bi[h2 + j] + (resetAfter ? r * hn : hn));
+            float hv = (1f - z) * n + z * allH[prev + j];
+            gates[iRow + j] = r; gates[iRow + hidden + j] = z; gates[iRow + h2 + j] = n;
+            ghn[prev + j] = hn;
+            allH[next + j] = hv;
+            y[outRow + j] = hv;
+        }
     }
 
     // The float BPTT: per step the gate gradients and the recurrent GEMMs into dh, then three GEMMs over all steps for
@@ -491,8 +584,14 @@ public partial class CpuEngine
         var gy = ((Tensor<float>)(object)gradOutput).ToArray();
         var whh = ((Tensor<float>)(object)wHh).ToArray();
         var wih = ((Tensor<float>)(object)wIh).ToArray();
-        var dgi = new float[rows * g3];
-        var dgh = new float[rows * g3];
+        // dgi / dgh and the time-major input gradient are this call's scratch: pooled, as every element is written before
+        // it is read. The gradients handed to the tape are fresh arrays.
+        var pool = System.Buffers.ArrayPool<float>.Shared;
+        var dgi = pool.Rent(rows * g3);
+        var dgh = pool.Rent(rows * g3);
+        var gxTimeMajor = pool.Rent(rows * inFeatures);
+        try
+        {
         var dh = new float[batch * hidden];
         ForEachBatchChunk(batch, hidden, (b0, b1) =>
         {
@@ -551,7 +650,6 @@ public partial class CpuEngine
             }
         });
 
-        var gxTimeMajor = new float[rows * inFeatures];
         Simd.SimdGemm.Sgemm(dgi, g3, false, wih, inFeatures, false, gxTimeMajor, rows, g3, inFeatures);
         var gx = new float[batch * seqLen * inFeatures];
         for (int b = 0; b < batch; b++)
@@ -580,6 +678,13 @@ public partial class CpuEngine
                 for (int c = 0; c < g3; c++) { sbi[c] += dgi[r * g3 + c]; sbh[c] += dgh[r * g3 + c]; }
             if (bIh is not null) DifferentiableOps.AccumulateGrad(grads, bIh, Wrap(sbi, g3), engine);
             if (bHh is not null) DifferentiableOps.AccumulateGrad(grads, bHh, Wrap(sbh, g3), engine);
+        }
+        }
+        finally
+        {
+            pool.Return(dgi);
+            pool.Return(dgh);
+            pool.Return(gxTimeMajor);
         }
     }
 
