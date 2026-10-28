@@ -28,8 +28,8 @@ its `NATIVE-MANIFEST.json`.
 
 ## Release integrity
 
-Release packages carry a GitHub build-provenance attestation and a CycloneDX SBOM is attached to each GitHub release.
-Verify a downloaded package with:
+Starting with the first release built after this policy was added, release packages carry a GitHub build-provenance
+attestation and a CycloneDX SBOM is attached to each GitHub release. Verify a downloaded package with:
 
 ```
 gh attestation verify AiDotNet.Tensors.<version>.nupkg --repo ooples/AiDotNet.Tensors
