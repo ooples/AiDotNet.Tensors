@@ -7776,7 +7776,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorRound<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope != null) { var c = tensor; return scope.RecordUnary(LazyNodeType.Custom, "Round", tensor, tensor._shape, (eng, o) => { var r = eng.TensorRound(c); r.AsSpan().CopyTo(o.AsWritableSpan()); }, BackwardFunctions<T>.SignBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope != null) { var c = tensor; return scope.RecordUnary(LazyNodeType.Custom, "Round", tensor, tensor._shape, (eng, o) => { var r = eng.TensorRound(c); DirectGpuTensorEngine.CopyResultInto(eng, r, o); }, BackwardFunctions<T>.SignBackward); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Round", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -38507,6 +38507,7 @@ public partial class CpuEngine : ITensorLevelEngine
         using var destinationKeep24 = new KeepAliveScope(destination);
         source.AsSpanUnmarked().Slice(0, source.Length).CopyTo(destination.AsWritableSpanUnmarked());
         destination.IncrementVersion();
+        InvalidatePersistentTensor(destination);
     }
 
     /// <inheritdoc/>

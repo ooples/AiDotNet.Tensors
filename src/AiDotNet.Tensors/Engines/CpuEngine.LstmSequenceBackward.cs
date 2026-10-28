@@ -6,6 +6,9 @@ using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using System.Runtime.CompilerServices;
+#if NET9_0_OR_GREATER
+using System.Runtime.Intrinsics;
+#endif
 using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines;
@@ -125,25 +128,6 @@ public partial class CpuEngine
         bool returnSequences, bool wantState,
         out Tensor<float> finalHidden, out Tensor<float> finalCell)
     {
-        // The fused BPTT node records gradients only for `output`; `finalHidden`
-        // / `finalCell` are returned as fresh detached tensors. Letting a tape
-        // see them would silently stop gradients at the LSTM boundary, so
-        // explicitly reject the (wantState ∧ active-tape) combination. Callers
-        // that want differentiable state at chunk boundaries should slice them
-        // out of `output` (or call the unfused path that records each timestep).
-        if (wantState && DifferentiableOps.ThreadTapeActive())
-        {
-            throw new ArgumentException(
-                "LstmSequenceForwardFloatTrain: wantState=true is not yet supported under an active gradient tape. " +
-                "The fused BPTT node records gradients only for the sequence output; the returned finalHidden / " +
-                "finalCell tensors carry no backward edge and would silently detach the graph. " +
-                "Either set wantState=false, or slice the final hidden/cell out of the returned output tensor.",
-                nameof(wantState));
-        }
-
-        int G = gateRows;                 // 4 * hidden
-        int totalRows = batch * seqLen;
-
         // A fused op may receive stride-only views from a preceding permute.
         // GetFlattenedData is zero-copy for packed tensors and materializes only
         // a view, while the tape continues to record the original tensor identity.
@@ -161,80 +145,14 @@ public partial class CpuEngine
         var cells = ws.Cells;
         var hiddens = ws.Hiddens;
 
-        var output = returnSequences
-            ? new Tensor<float>(new[] { batch, seqLen, hidden })
-            : new Tensor<float>(new[] { batch, hidden });
+        var output = new Tensor<float>(LstmTrainingOutputShape(batch, seqLen, hidden, returnSequences, wantState));
         using var outSpanLease = output.LeaseWritable();
         var outSpan = outSpanLease.Span;
-
-        // seqLen == 0 corner case: the timestep loop below is skipped, so the
-        // last-hidden output stays at its default zero-init. Match the generic
-        // (unfused) LSTM implementation, which returns "last hidden = h0" when
-        // there are no timesteps: copy the seeded h_0 into the [batch, hidden]
-        // output here (returnSequences=true yields an empty [batch, 0, hidden]
-        // tensor and needs no fill).
-        if (seqLen == 0)
-        {
-            if (!returnSequences)
-            {
-                for (int b = 0; b < batch; b++)
-                    for (int h = 0; h < hidden; h++)
-                        outSpan[b * hidden + h] = h0Arr is null ? 0f : h0Arr[b * hidden + h];
-            }
-
-            if (wantState)
-            {
-                finalHidden = new Tensor<float>(new[] { batch, hidden });
-                finalCell = new Tensor<float>(new[] { batch, hidden });
-                using var fhSpan0Lease = finalHidden.LeaseWritable();
-                var fhSpan0 = fhSpan0Lease.Span;
-                using var fcSpan0Lease = finalCell.LeaseWritable();
-                var fcSpan0 = fcSpan0Lease.Span;
-                for (int b = 0; b < batch; b++)
-                    for (int h = 0; h < hidden; h++)
-                    {
-                        fhSpan0[b * hidden + h] = h0Arr is null ? 0f : h0Arr[b * hidden + h];
-                        fcSpan0[b * hidden + h] = c0Arr is null ? 0f : c0Arr[b * hidden + h];
-                    }
-            }
-            else
-            {
-                finalHidden = s_emptyState;
-                finalCell = s_emptyState;
-            }
-
-            // No timesteps means no gates were computed — there's nothing for
-            // BPTT to consume, so don't record a tape node. Callers that pass
-            // a gradient of `output` against h0 still get correct semantics
-            // because the framework handles "no recorded op" as a no-op edge.
-            return output;
-        }
 
         LstmTrainForwardCoreFloat(inArr, wIhArr, wHhArr, bIhArr, bHhArr, h0Arr, c0Arr,
             returnSequences, ws, outSpan);
 
-        // Final-state outs (last timestep). The fused node owns gradients via the
-        // returned `output`; final states are passthrough (not differentiated here).
-        if (wantState)
-        {
-            finalHidden = new Tensor<float>(new[] { batch, hidden });
-            finalCell = new Tensor<float>(new[] { batch, hidden });
-            using var fhSpanLease = finalHidden.LeaseWritable();
-            var fhSpan = fhSpanLease.Span;
-            using var fcSpanLease = finalCell.LeaseWritable();
-            var fcSpan = fcSpanLease.Span;
-            for (int b = 0; b < batch; b++)
-                for (int h = 0; h < hidden; h++)
-                {
-                    fhSpan[b * hidden + h] = hiddens[(b * (seqLen + 1) + seqLen) * hidden + h];
-                    fcSpan[b * hidden + h] = cells[(b * (seqLen + 1) + seqLen) * hidden + h];
-                }
-        }
-        else
-        {
-            finalHidden = s_emptyState;
-            finalCell = s_emptyState;
-        }
+        if (wantState) WriteLstmFinalStates(outSpan, hiddens, cells, batch, seqLen, hidden, returnSequences);
 
         // Build the differentiable-input array (only the tensors we return grads for).
         // Order is fixed: input, wIh, wHh, [bIh], [bHh], [h0], [c0].
@@ -252,13 +170,14 @@ public partial class CpuEngine
 
         // meta carries dims, the returnSequences flag, and the optional-input indices.
         var meta = new int[] { batch, seqLen, inFeatures, hidden, returnSequences ? 1 : 0,
-                               idxBIh, idxBHh, idxH0, idxC0 };
+                               idxBIh, idxBHh, idxH0, idxC0, wantState ? 1 : 0 };
         var savedState = new object[] { ws.Gates, cells, hiddens, meta, ws.TanhC, ws };
 
         DifferentiableOps.RecordIfActive<float>(
             "LstmSequenceForward", output, inputsArr, LstmSequenceBackwardFloat, savedState);
 
-        return output;
+        return UnpackLstmTrainingOutput(this, output, batch, seqLen, hidden, returnSequences, wantState,
+            out finalHidden, out finalCell);
     }
 
     // ── Batch-chunked fused LSTM training kernel ─────────────────────────────────────────────────────────────────────
@@ -694,7 +613,7 @@ public partial class CpuEngine
         Compilation.LazyTensorScope scope,
         Tensor<float> input, Tensor<float>? h0, Tensor<float>? c0,
         Tensor<float> wIh, Tensor<float> wHh, Tensor<float>? bIh, Tensor<float>? bHh,
-        int batch, int seqLen, int inFeatures, int hidden, bool returnSequences)
+        int batch, int seqLen, int inFeatures, int hidden, bool returnSequences, bool wantState = false)
     {
         // Order is fixed (the backward indexes it through meta): input, wIh, wHh, [bIh], [bHh], [h0], [c0].
         int nInputs = 3 + (bIh is not null ? 1 : 0) + (bHh is not null ? 1 : 0)
@@ -709,11 +628,11 @@ public partial class CpuEngine
         int idxH0 = h0 is not null ? idx : -1; if (h0 is not null) inputsArr[idx++] = h0;
         int idxC0 = c0 is not null ? idx : -1; if (c0 is not null) inputsArr[idx++] = c0;
         var meta = new int[] { batch, seqLen, inFeatures, hidden, returnSequences ? 1 : 0,
-                               idxBIh, idxBHh, idxH0, idxC0 };
+                               idxBIh, idxBHh, idxH0, idxC0, wantState ? 1 : 0 };
 
         var ws = new LstmTrainWorkspace(batch, seqLen, inFeatures, hidden);
         var savedState = new object[] { ws.Gates, ws.Cells, ws.Hiddens, meta, ws.TanhC, ws };
-        var outputShape = returnSequences ? new[] { batch, seqLen, hidden } : new[] { batch, hidden };
+        var outputShape = LstmTrainingOutputShape(batch, seqLen, hidden, returnSequences, wantState);
         int outputLength = returnSequences ? batch * seqLen * hidden : batch * hidden;
 
         return scope.RecordVariadic(Compilation.LazyNodeType.Custom, "LstmSequenceTrain", inputsArr, outputShape,
@@ -731,7 +650,8 @@ public partial class CpuEngine
                     // The core writes every output position, so the uninitialized plan buffer needs no clear.
                     using var outputKeep1 = new KeepAliveScope(output);
                     LstmTrainForwardCoreFloat(inArr, wIhArr, wHhArr, bIhArr, bHhArr, h0Arr, c0Arr,
-                        returnSequences, ws, output.AsWritableSpanUnmarked());
+                        returnSequences, ws, output.AsWritableSpanUnmarked().Slice(0, outputLength));
+                    if (wantState) WriteLstmFinalStates(output.AsWritableSpanUnmarked(), ws.Hiddens, ws.Cells, batch, seqLen, hidden, returnSequences);
                     output.IncrementVersion();
                 }
                 else
@@ -740,6 +660,7 @@ public partial class CpuEngine
                     using var stagedKeep1 = new KeepAliveScope(staged);
                     LstmTrainForwardCoreFloat(inArr, wIhArr, wHhArr, bIhArr, bHhArr, h0Arr, c0Arr,
                         returnSequences, ws, staged.AsWritableSpanUnmarked().Slice(0, outputLength));
+                    if (wantState) WriteLstmFinalStates(staged.AsWritableSpanUnmarked(), ws.Hiddens, ws.Cells, batch, seqLen, hidden, returnSequences);
                     DirectGpuTensorEngine.CopyResultInto(eng, staged, output);
                 }
             },
@@ -792,14 +713,14 @@ public partial class CpuEngine
             IntPtr gradInputPtr = (IntPtr)pGradInput;
             if (chunks == 1)
             {
-                LstmBackwardChunk(0, ws, scratch, gradOutArr, returnSequences, wHhArr, wIhArr, inputArr, gradInputPtr,
+                LstmBackwardChunk(0, ws, scratch, gradOutArr, returnSequences, meta.Length > 9 && meta[9] != 0, wHhArr, wIhArr, inputArr, gradInputPtr,
                     needWHh, needBias, needH0);
             }
             else
             {
                 long work = (long)batch * seqLen * G * (inFeatures + hidden);
                 CpuParallelSettings.ParallelForOrSerial(0, chunks, work,
-                    c => LstmBackwardChunk(c, ws, scratch, gradOutArr, returnSequences, wHhArr, wIhArr, inputArr, gradInputPtr,
+                    c => LstmBackwardChunk(c, ws, scratch, gradOutArr, returnSequences, meta.Length > 9 && meta[9] != 0, wHhArr, wIhArr, inputArr, gradInputPtr,
                         needWHh, needBias, needH0),
                     deterministicSafe: true);
             }
@@ -817,14 +738,14 @@ public partial class CpuEngine
             int rowsAll = batch * seqLen;
             var dgAll = ws.Wx.AsSpan(0, rowsAll * G);
             if (gradInput is not null && wIhArr is not null)
-                SimdGemm.Sgemm(dgAll, G, false, wIhArr.AsSpan(0, G * inFeatures), inFeatures, false,
-                    gradInput.AsWritableSpanUnmarked(), rowsAll, G, inFeatures);
+                LstmSoloGemm(dgAll, G, wIhArr.AsSpan(0, G * inFeatures), inFeatures,
+                    gradInput.AsWritableSpanUnmarked(), rowsAll, inFeatures, G);
             if (needWIh && inputArr is not null)
             {
                 fullWIh = new Tensor<float>(new[] { G, inFeatures });
                 using var wIhKeep = new KeepAliveScope(fullWIh);
-                SimdGemm.Sgemm(dgAll, G, true, inputArr.AsSpan(0, rowsAll * inFeatures), inFeatures, false,
-                    fullWIh.AsWritableSpanUnmarked(), G, rowsAll, inFeatures);
+                LstmSoloGemm(dgAll, G, inputArr.AsSpan(0, rowsAll * inFeatures), inFeatures,
+                    fullWIh.AsWritableSpanUnmarked(), G, inFeatures, rowsAll, transA: true);
             }
             if (needWHh)
             {
@@ -838,8 +759,8 @@ public partial class CpuEngine
                         Array.Copy(hiddens, b * hStride, hPrev, b * seqLen * hidden, seqLen * hidden);
                     fullWHh = new Tensor<float>(new[] { G, hidden });
                     using var wHhKeep = new KeepAliveScope(fullWHh);
-                    SimdGemm.Sgemm(dgAll, G, true, hPrev.AsSpan(0, rowsAll * hidden), hidden, false,
-                        fullWHh.AsWritableSpanUnmarked(), G, rowsAll, hidden);
+                    LstmSoloGemm(dgAll, G, hPrev.AsSpan(0, rowsAll * hidden), hidden,
+                        fullWHh.AsWritableSpanUnmarked(), G, hidden, rowsAll, transA: true);
                 }
                 finally
                 {
@@ -902,7 +823,7 @@ public partial class CpuEngine
     /// (xᵀ·dgates, h_{t-1}ᵀ·dgates, Σ dgates). Leaves dh/dc after t = 0 in the chunk's carries for gradH0/gradC0.
     /// </summary>
     [MethodImpl(Hot)]
-    private static unsafe void LstmBackwardChunk(int c, LstmTrainWorkspace ws, LstmBackwardScratch scratch, float[] gradOutArr, bool returnSequences,
+    private static unsafe void LstmBackwardChunk(int c, LstmTrainWorkspace ws, LstmBackwardScratch scratch, float[] gradOutArr, bool returnSequences, bool withFinalStates,
         float[] wHhArr, float[]? wIhArr, float[]? inputArr, IntPtr gradInputPtr, bool needWHh, bool needBias, bool needH0)
     {
         int batch = ws.Batch, seqLen = ws.SeqLen, inFeatures = ws.InFeatures, hidden = ws.Hidden;
@@ -936,6 +857,12 @@ public partial class CpuEngine
         int hStride = (seqLen + 1) * hidden;
         Array.Clear(dh, 0, nb * hidden);
         Array.Clear(dc, 0, nb * hidden);
+        if (withFinalStates)
+        {
+            int stateOffset = (returnSequences ? batch * seqLen : batch) * hidden;
+            Array.Copy(gradOutArr, stateOffset + b0 * hidden, dh, 0, nb * hidden);
+            Array.Copy(gradOutArr, stateOffset + batch * hidden + b0 * hidden, dc, 0, nb * hidden);
+        }
 
         for (int t = seqLen - 1; t >= 0; t--)
         {
@@ -1043,8 +970,18 @@ public partial class CpuEngine
                                  System.ReadOnlySpan<double> b, int ldb, bool transB,
                                  System.Span<double> c, int m, int k, int n)
     {
+#if NET5_0_OR_GREATER
+        // The recurrent projection has small M and contiguous operands. Its
+        // overwrite kernel avoids the streaming dispatch and redundant C clear.
+        if (!transA && !transB && lda == k && ldb == n && m <= 32 && k <= 256 && n <= 1024
+            && System.Runtime.Intrinsics.X86.Avx2.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported)
+        {
+            SimdGemm.DgemmDirectParallelMInto(a, b, c, m, k, n);
+            return;
+        }
+#endif
         BlasManaged.BlasManaged.Gemm<double>(a, lda, transA, b, ldb, transB, c, n, m, n, k,
-            new BlasManaged.BlasOptions<double> { PackingMode = BlasManaged.PackingMode.DisableAutotune });
+            new BlasManaged.BlasOptions<double> { PackingMode = BlasManaged.PackingMode.DisableAutotune, BetaZero = true });
     }
 
     /// <summary>In-place logistic sigmoid over a double span, at full precision.</summary>
@@ -1054,7 +991,19 @@ public partial class CpuEngine
     [MethodImpl(Hot)]
     private static void SigmoidExactInPlaceD(double[] buf, int off, int len)
     {
-        for (int i = off; i < off + len; i++) buf[i] = 1.0 / (1.0 + Math.Exp(-buf[i]));
+        int i = off;
+#if NET9_0_OR_GREATER
+        if (System.Runtime.Intrinsics.Vector256.IsHardwareAccelerated)
+        {
+            var one = System.Runtime.Intrinsics.Vector256.Create(1.0);
+            for (; i <= off + len - 4; i += 4)
+            {
+                var x = System.Runtime.Intrinsics.Vector256.LoadUnsafe(ref buf[i]);
+                (one / (one + System.Runtime.Intrinsics.Vector256.Exp(-x))).StoreUnsafe(ref buf[i]);
+            }
+        }
+#endif
+        for (; i < off + len; i++) buf[i] = 1.0 / (1.0 + Math.Exp(-buf[i]));
     }
 
     /// <summary>In-place hyperbolic tangent over a double span, at full precision.</summary>
@@ -1064,7 +1013,20 @@ public partial class CpuEngine
     private static void TanhExactInPlaceD(double[] buf, int off, int len)
     {
         // tanh(x) = 2/(1+exp(-2x)) - 1 (overflow-safe; large |x| → ±1, never NaN).
-        for (int i = off; i < off + len; i++) buf[i] = 2.0 / (1.0 + Math.Exp(-2.0 * buf[i])) - 1.0;
+        int i = off;
+#if NET9_0_OR_GREATER
+        if (System.Runtime.Intrinsics.Vector256.IsHardwareAccelerated)
+        {
+            var one = System.Runtime.Intrinsics.Vector256.Create(1.0);
+            var two = System.Runtime.Intrinsics.Vector256.Create(2.0);
+            for (; i <= off + len - 4; i += 4)
+            {
+                var x = System.Runtime.Intrinsics.Vector256.LoadUnsafe(ref buf[i]);
+                (two / (one + System.Runtime.Intrinsics.Vector256.Exp(-two * x)) - one).StoreUnsafe(ref buf[i]);
+            }
+        }
+#endif
+        for (; i < off + len; i++) buf[i] = 2.0 / (1.0 + Math.Exp(-2.0 * buf[i])) - 1.0;
     }
 
     /// <summary>
@@ -1072,9 +1034,8 @@ public partial class CpuEngine
     /// </summary>
     /// <remarks>
     /// Separate from the inference forward because training has to retain per-timestep gate
-    /// activations for BPTT, which inference discards. <paramref name="wantState"/> is rejected
-    /// under an active gradient tape: the fused node records a backward edge only for the sequence
-    /// output, so a returned final hidden/cell would silently carry no gradient.
+    /// activations for BPTT, which inference discards. When final states are requested, one
+    /// packed output gathers all three adjoints before the fused backward executes.
     /// </remarks>
     [MethodImpl(Hot)]
     private Tensor<double> LstmSequenceForwardDoubleTrain(
@@ -1084,21 +1045,9 @@ public partial class CpuEngine
         bool returnSequences, bool wantState,
         out Tensor<double> finalHidden, out Tensor<double> finalCell)
     {
-        if (wantState && DifferentiableOps.ThreadTapeActive())
-        {
-            throw new ArgumentException(
-                "LstmSequenceForwardDoubleTrain: wantState=true is not supported under an active gradient tape. " +
-                "The fused BPTT node records gradients only for the sequence output; the returned finalHidden / " +
-                "finalCell carry no backward edge. Set wantState=false, or slice the final state out of the output.",
-                nameof(wantState));
-        }
-
         int G = gateRows;
         int totalRows = batch * seqLen;
 
-        var inSpan = input.GetFlattenedData().AsSpan();
-        var wIhSpan = wIh.GetFlattenedData().AsSpan();
-        var wHhSpan = wHh.GetFlattenedData().AsSpan();
         double[]? bIhArr = bIh?.GetFlattenedData();
         double[]? bHhArr = bHh?.GetFlattenedData();
         double[]? h0Arr = h0?.GetFlattenedData();
@@ -1109,6 +1058,44 @@ public partial class CpuEngine
         var cells = new double[batch * (seqLen + 1) * hidden];
         var hiddens = new double[batch * (seqLen + 1) * hidden];
 
+        var output = new Tensor<double>(LstmTrainingOutputShape(batch, seqLen, hidden, returnSequences, wantState));
+        using var outSpanLease = output.LeaseWritable();
+        var outSpan = outSpanLease.Span;
+        LstmTrainForwardCoreDouble(input.GetFlattenedData(), wIh.GetFlattenedData(), wHh.GetFlattenedData(),
+            bIhArr, bHhArr, h0Arr, c0Arr, batch, seqLen, inFeatures, hidden,
+            returnSequences, gates, cells, hiddens, outSpan);
+        if (wantState) WriteLstmFinalStates(outSpan, hiddens, cells, batch, seqLen, hidden, returnSequences);
+
+        int nInputs = 3 + (bIh is not null ? 1 : 0) + (bHh is not null ? 1 : 0)
+                        + (h0 is not null ? 1 : 0) + (c0 is not null ? 1 : 0);
+        var inputsArr = new Tensor<double>[nInputs];
+        int idx = 0;
+        inputsArr[idx++] = input;
+        inputsArr[idx++] = wIh;
+        inputsArr[idx++] = wHh;
+        int idxBIh = bIh is not null ? idx : -1; if (bIh is not null) inputsArr[idx++] = bIh;
+        int idxBHh = bHh is not null ? idx : -1; if (bHh is not null) inputsArr[idx++] = bHh;
+        int idxH0 = h0 is not null ? idx : -1; if (h0 is not null) inputsArr[idx++] = h0;
+        int idxC0 = c0 is not null ? idx : -1; if (c0 is not null) inputsArr[idx++] = c0;
+
+        var meta = new int[] { batch, seqLen, inFeatures, hidden, returnSequences ? 1 : 0,
+                               idxBIh, idxBHh, idxH0, idxC0, wantState ? 1 : 0 };
+        var savedState = new object[] { gates, cells, hiddens, meta };
+
+        DifferentiableOps.RecordIfActive<double>(
+            "LstmSequenceForward", output, inputsArr, LstmSequenceBackwardDouble, savedState);
+
+        return UnpackLstmTrainingOutput(this, output, batch, seqLen, hidden, returnSequences, wantState,
+            out finalHidden, out finalCell);
+    }
+
+    private static void LstmTrainForwardCoreDouble(
+        double[] input, double[] wIh, double[] wHh, double[]? bIhArr, double[]? bHhArr,
+        double[]? h0Arr, double[]? c0Arr, int batch, int seqLen, int inFeatures, int hidden,
+        bool returnSequences, double[] gates, double[] cells, double[] hiddens, Span<double> outSpan)
+    {
+        int G = 4 * hidden, totalRows = batch * seqLen;
+        var inSpan = input.AsSpan(); var wIhSpan = wIh.AsSpan(); var wHhSpan = wHh.AsSpan();
         for (int b = 0; b < batch; b++)
         {
             int baseTc = b * (seqLen + 1) * hidden;
@@ -1135,34 +1122,6 @@ public partial class CpuEngine
         for (int g = 0; g < G; g++)
             for (int h = 0; h < hidden; h++)
                 wHhT[h * G + g] = wHhSpan[g * hidden + h];
-
-        var output = returnSequences
-            ? new Tensor<double>(new[] { batch, seqLen, hidden })
-            : new Tensor<double>(new[] { batch, hidden });
-        using var outSpanLease = output.LeaseWritable();
-        var outSpan = outSpanLease.Span;
-
-        if (seqLen == 0)
-        {
-            if (!returnSequences)
-                for (int b = 0; b < batch; b++)
-                    for (int h = 0; h < hidden; h++)
-                        outSpan[b * hidden + h] = h0Arr is null ? 0.0 : h0Arr[b * hidden + h];
-            if (wantState)
-            {
-                finalHidden = new Tensor<double>(new[] { batch, hidden });
-                finalCell = new Tensor<double>(new[] { batch, hidden });
-                var fh0 = finalHidden.AsWritableSpan(); var fc0 = finalCell.AsWritableSpan();
-                for (int b = 0; b < batch; b++)
-                    for (int h = 0; h < hidden; h++)
-                    {
-                        fh0[b * hidden + h] = h0Arr is null ? 0.0 : h0Arr[b * hidden + h];
-                        fc0[b * hidden + h] = c0Arr is null ? 0.0 : c0Arr[b * hidden + h];
-                    }
-            }
-            else { finalHidden = new Tensor<double>(new[] { 0 }); finalCell = new Tensor<double>(new[] { 0 }); }
-            return output;
-        }
 
         var hPrev = new double[batch * hidden];
         var hh = new double[batch * G];
@@ -1241,40 +1200,6 @@ public partial class CpuEngine
                 Array.Copy(hiddens, (b * (seqLen + 1) + t + 1) * hidden, hPrev, b * hidden, hidden);
         }
 
-        if (wantState)
-        {
-            finalHidden = new Tensor<double>(new[] { batch, hidden });
-            finalCell = new Tensor<double>(new[] { batch, hidden });
-            var fh = finalHidden.AsWritableSpan(); var fc = finalCell.AsWritableSpan();
-            for (int b = 0; b < batch; b++)
-                for (int h = 0; h < hidden; h++)
-                {
-                    fh[b * hidden + h] = hiddens[(b * (seqLen + 1) + seqLen) * hidden + h];
-                    fc[b * hidden + h] = cells[(b * (seqLen + 1) + seqLen) * hidden + h];
-                }
-        }
-        else { finalHidden = new Tensor<double>(new[] { 0 }); finalCell = new Tensor<double>(new[] { 0 }); }
-
-        int nInputs = 3 + (bIh is not null ? 1 : 0) + (bHh is not null ? 1 : 0)
-                        + (h0 is not null ? 1 : 0) + (c0 is not null ? 1 : 0);
-        var inputsArr = new Tensor<double>[nInputs];
-        int idx = 0;
-        inputsArr[idx++] = input;
-        inputsArr[idx++] = wIh;
-        inputsArr[idx++] = wHh;
-        int idxBIh = bIh is not null ? idx : -1; if (bIh is not null) inputsArr[idx++] = bIh;
-        int idxBHh = bHh is not null ? idx : -1; if (bHh is not null) inputsArr[idx++] = bHh;
-        int idxH0 = h0 is not null ? idx : -1; if (h0 is not null) inputsArr[idx++] = h0;
-        int idxC0 = c0 is not null ? idx : -1; if (c0 is not null) inputsArr[idx++] = c0;
-
-        var meta = new int[] { batch, seqLen, inFeatures, hidden, returnSequences ? 1 : 0,
-                               idxBIh, idxBHh, idxH0, idxC0 };
-        var savedState = new object[] { gates, cells, hiddens, meta };
-
-        DifferentiableOps.RecordIfActive<double>(
-            "LstmSequenceForward", output, inputsArr, LstmSequenceBackwardDouble, savedState);
-
-        return output;
     }
 
     /// <summary>
@@ -1311,6 +1236,12 @@ public partial class CpuEngine
         var dcNext = pool.Rent(batch * hidden);
         System.Array.Clear(dhNext, 0, batch * hidden);
         System.Array.Clear(dcNext, 0, batch * hidden);
+        if (meta.Length > 9 && meta[9] != 0)
+        {
+            int stateOffset = (returnSequences ? batch * seqLen : batch) * hidden;
+            gradOutSpan.Slice(stateOffset, batch * hidden).CopyTo(dhNext);
+            gradOutSpan.Slice(stateOffset + batch * hidden, batch * hidden).CopyTo(dcNext);
+        }
         var dgatesT = pool.Rent(batch * G);
         var dhPrev = pool.Rent(batch * hidden);
 

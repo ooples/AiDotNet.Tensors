@@ -4,6 +4,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 // whole row and the hidden size is bounded only to match the other backends.
 public sealed partial class VulkanBackend : IFusedLstmSequenceTraining
 {
+    PortableGenericFft.Launcher IFusedLstmSequenceTraining.StatefulLstmLauncher => LaunchSolver;
     int IFusedLstmSequenceTraining.MaxFusedLstmHidden => 1024;
     bool IFusedLstmSequenceTraining.LstmBackwardOverwritesGradients => false;
 }

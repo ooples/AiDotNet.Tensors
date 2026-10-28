@@ -1542,6 +1542,23 @@ internal static partial class SimdGemm
         SgemmAddInternal(a, k, false, b, n, false, c, m, k, n, allowParallel: false, clearedOutput: true);
     }
 
+    /// <summary>Sequential recurrent projection with a write-first direct kernel.
+    /// Only the store-only route skips clearing; other shapes retain normal dispatch.</summary>
+    internal static void SgemmRecurrentOverwrite(
+        ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c, int m, int k, int n)
+    {
+#if NET5_0_OR_GREATER
+        if (Avx2.IsSupported && Fma.IsSupported && m >= Mr && k > 0 && k <= 512
+            && n >= Nr && n % 8 == 0 && (long)m * k * n <= SmallMatmulWorkThreshold)
+        {
+            ValidateGemmOperands(a.Length, k, false, b.Length, n, false, c.Length, m, k, n);
+            SgemmDirect(a, k, b, n, c, m, k, n, clearedOutput: true);
+            return;
+        }
+#endif
+        SgemmSequential(a, b, c, m, k, n);
+    }
+
     /// <summary>
     /// Runs the managed SGEMM implementation under an explicit per-call execution policy for autotuning.
     /// </summary>

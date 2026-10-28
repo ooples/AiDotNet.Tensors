@@ -17,6 +17,10 @@ public partial interface IEngine
     Tensor<T> TensorRnnCell<T>(Tensor<T> input, Tensor<T> hidden, Tensor<T> wIh, Tensor<T> wHh,
         Tensor<T>? bIh = null, Tensor<T>? bHh = null, RnnCellType cell = RnnCellType.RnnTanh);
 
+    /// <summary>Fused sigmoid/tanh LSTM update from preprojected [i,f,g,o] gates.
+    /// Gates match the cell shape with four times its last dimension. Both returned states are differentiable.</summary>
+    Tensor<T> LstmCellFromGates<T>(Tensor<T> gates, Tensor<T> previousCell, out Tensor<T> cell);
+
     /// <summary>One LSTM step returning (h', c') (<c>torch.lstm_cell</c>).</summary>
     (Tensor<T> Hidden, Tensor<T> Cell) TensorLstmCell<T>(Tensor<T> input, Tensor<T> hidden, Tensor<T> cell,
         Tensor<T> wIh, Tensor<T> wHh, Tensor<T>? bIh = null, Tensor<T>? bHh = null);

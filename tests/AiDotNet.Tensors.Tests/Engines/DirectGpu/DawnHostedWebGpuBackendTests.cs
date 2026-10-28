@@ -1,5 +1,6 @@
 #if NET7_0_OR_GREATER
 using System;
+using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 using Xunit;
@@ -99,6 +100,50 @@ internal static class DawnHostedWebGpu
 [Collection("DirectGpuSerial")]
 public sealed class DawnHostedWebGpuBackendTests
 {
+    [SkippableFact]
+    public void BorrowedEngineDisposal_PreservesSharedBackend()
+    {
+        var backend = DawnHostedWebGpu.BackendOrSkip();
+        using (var direct = new DirectGpuEngine(backend, borrowsBackend: true))
+        using (var engine = new DirectGpuTensorEngine(direct))
+        {
+            var x = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(new float[] { 1, 2 }, new[] { 2 });
+            Assert.Equal(new float[] { 2, 3 }, engine.TensorAddScalar(x, 1f).ToArray());
+        }
+        Assert.True(backend.IsAvailable);
+        using var buffer = backend.AllocateBuffer(new float[] { 3, 4 });
+        Assert.Equal(new float[] { 3, 4 }, backend.DownloadBuffer(buffer));
+    }
+
+    [SkippableFact]
+    public void XLstm_PackedGateBackwardMatchesCpuForAllSixInputs()
+    {
+        var backend = DawnHostedWebGpu.BackendOrSkip();
+        using var direct = new DirectGpuEngine(backend, borrowsBackend: true);
+        using var gpu = new DirectGpuTensorEngine(direct);
+        var cpu = new CpuEngine();
+        var inputs = Enumerable.Range(0, 6).Select(j =>
+        {
+            var shape = new[] { 2, 3, j < 3 ? 6 : 2 };
+            return new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(
+                Enumerable.Range(0, shape[0] * shape[1] * shape[2]).Select(i => j < 3 ? .2f * MathF.Sin(i + j) : .6f + .1f * MathF.Sin(i + j)).ToArray(), shape);
+        }).ToArray();
+        (float[] Output, float[][] Gradients) Evaluate(CpuEngine engine)
+        {
+            using var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>();
+            var output = engine.XLstmScanForward(inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], inputs[5], 2);
+            var gradients = tape.ComputeGradients(engine.ReduceSum(engine.TensorMultiply(output, output), null), inputs);
+            return (output.ToArray(), inputs.Select(x => gradients[x].ToArray()).ToArray());
+        }
+        var expected = Evaluate(cpu); var actual = Evaluate(gpu);
+        void Near(float[] left, float[] right)
+        {
+            Assert.Equal(left.Length, right.Length);
+            for (int i = 0; i < left.Length; i++) Assert.InRange(Math.Abs(left[i] - right[i]), 0, 4e-4f * (1 + Math.Abs(left[i])));
+        }
+        Near(expected.Output, actual.Output);
+        for (int i = 0; i < inputs.Length; i++) Near(expected.Gradients[i], actual.Gradients[i]);
+    }
     [SkippableFact]
     public void Initializes_ThroughTheShippedModule_AndReportsTheDevice()
     {

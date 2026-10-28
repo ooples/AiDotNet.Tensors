@@ -19,7 +19,7 @@ name: GPU Parity (POCL / CPU-OpenCL)
 # Vulkan/WebGpu) and the GPU-feature-specific OpenCL kernels (FlashDecode/PagedAttention/QuantGemm/
 # RopeGqa) are excluded — POCL can't provide those devices/features, so they'd fail "unavailable".
 #
-# STATUS: informational (continue-on-error), NOT required. POCL has also shown intermittent
+# STATUS: recurrent-foundations is a required pass; the other shards are informational. POCL has shown intermittent
 # DirectGpu-init failures on hosted runners that are unreproducible without POCL hardware locally.
 # This runs + uploads a per-shard divergence report but never blocks. Promote a shard to required
 # in branch protection only once it is reliably green here. The fully reliable gate remains real GPU
@@ -57,6 +57,7 @@ jobs:
         # tape-gradient); AIDOTNET_PARITY_SHARD=k/N partitions each into sub-shards via ParityShard so
         # each POCL process stays under its per-process kernel-compile ceiling. `name` is the job label.
         include:
+          - { name: recurrent-foundations, required: true, coverage: true, filter: "FullyQualifiedName~LstmGateKernelTests|FullyQualifiedName~LstmFinalStateGradientTests|FullyQualifiedName~XLstmDeviceTrainingTests" }
           - { name: lstm,            filter: "FullyQualifiedName~GpuMissingKernelsParityTests.LstmSequence" }
           - { name: missing-kernels, filter: "FullyQualifiedName~GpuMissingKernelsParityTests&FullyQualifiedName!~LstmSequence" }
           - { name: scan-kernels,    filter: "FullyQualifiedName~ScanGpuParityTests|FullyQualifiedName~Rwkv4WkvGpuParityTests" }
@@ -103,9 +104,9 @@ jobs:
         # Packages.gz whose size disagreed with its own Release file ("Mirror sync in progress"),
         # and tape-grad-6 went red on PR #1017 with nothing in its log but an apt error.
         #
-        # The parity step below is deliberately `continue-on-error` because POCL is not reliable
-        # enough on hosted runners to gate on. Setup failing the job anyway contradicts that: it
-        # reports a problem with the change under test when the problem is a Google mirror.
+        # Keep unrelated package mirrors out of device setup. The focused recurrence
+        # shard requires a working device and passing tests; broad legacy shards
+        # remain informational. Retry device discovery below, not numerical failures.
         #
         # Removed by name rather than globbing `*.list`, so a runner image that keeps the Ubuntu
         # archive in a `.list` file is not left with no sources at all. `rm -f` is a no-op when
@@ -114,14 +115,29 @@ jobs:
         sudo apt-get update -o Acquire::Retries=3
         sudo apt-get install -y -o Acquire::Retries=3 ocl-icd-opencl-dev pocl-opencl-icd clinfo
         echo "=== clinfo: OpenCL platforms/devices ==="
-        clinfo || echo "::warning::clinfo failed — POCL may not be registered."
+        device_ready=0
+        for attempt in 1 2 3; do
+          if clinfo -l > /tmp/pocl-devices.txt && grep -q 'Device #' /tmp/pocl-devices.txt; then
+            cat /tmp/pocl-devices.txt
+            device_ready=1
+            break
+          fi
+          sleep 2
+        done
+        if [ "$device_ready" -ne 1 ]; then
+          if [ "${{ matrix.required }}" = "true" ]; then
+            echo "::error::POCL device setup failed after three attempts."
+            exit 1
+          fi
+          echo "::warning::POCL device setup failed after three attempts; this legacy shard is informational."
+        fi
 
     - name: Build tests (net10.0)
       run: dotnet build tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --framework net10.0
 
     - name: Run CPU-vs-GPU parity on POCL (shard ${{ matrix.name }})
-      # Informational only: POCL is not yet reliable as a hard gate on hosted runners (see header).
-      continue-on-error: true
+      # The focused recurrence shard is required; broad legacy shards remain informational.
+      continue-on-error: ${{ !matrix.required }}
       env:
         AIDOTNET_OPENCL_ALLOW_CPU: '1'
         AIDOTNET_REQUIRE_GPU_TESTS: '1'

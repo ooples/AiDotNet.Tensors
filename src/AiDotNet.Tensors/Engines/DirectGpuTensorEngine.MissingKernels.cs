@@ -5453,7 +5453,9 @@ public partial class DirectGpuTensorEngine
         try
         {
             int total = 1; for (int d = 0; d < rank; d++) total = checked(total * inputShape[d]);
-            var source = gradOutput.IsContiguous ? gradOutput : (Tensor<T>)gradOutput.Contiguous();
+            // GetOrAllocateBuffer gathers strided views on the device. Calling
+            // Contiguous here would download broadcast/strided adjoints first.
+            var source = gradOutput;
             int rowSize = source._shape[rank - 1];
             int rowCount = rowSize == 0 ? 0 : source.Length / rowSize;
             var sourceShape = (int[])source._shape.Clone();
@@ -5516,15 +5518,17 @@ public partial class DirectGpuTensorEngine
             int innerSize = 1; for (int k = dim + 1; k < rank; k++) innerSize *= inputShape[k];
             int copyLength = checked(length * innerSize);
             if (gradOutput.Length != checked(outerSize * copyLength)) return null;
-            var source = gradOutput.IsContiguous ? gradOutput : (Tensor<T>)gradOutput.Contiguous();
-            using var bufSrc = GetOrAllocateBuffer(backend, source);
-            // The output is allocated zeroed (in the step pool too, by one memset); a Fill on top zeroed it twice.
+            using var bufSrc = GetOrAllocateBuffer(backend, gradOutput);
+            // Pools on OpenCL and other backends may return arbitrary old values.
+            // Clear on device before the partial scatter; request uninitialized
+            // storage so capture-aware allocators do not clear the output twice.
             return DispatchDeferredGpuOp<T>(backend, n, (int[])inputShape.Clone(), output =>
             {
+                backend.Fill(output, 0f, n);
                 for (int outer = 0; outer < outerSize; outer++)
                     backend.Copy(bufSrc.Buffer, outer * copyLength,
                         output, checked((outer * dimSize + start) * innerSize), copyLength);
-            });
+            }, fullyWritten: true);
         }
         catch (Exception)
         {
@@ -7473,6 +7477,9 @@ public partial class DirectGpuTensorEngine
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (wIh is null) throw new ArgumentNullException(nameof(wIh));
         if (wHh is null) throw new ArgumentNullException(nameof(wHh));
+        if (wantState && TryStatefulLstmTraining(input, h0, c0, wIh, wHh, bIh, bHh,
+            returnSequences, out finalHidden, out finalCell) is { } stateful)
+            return stateful;
         // Compiled training: one fused forward + BPTT node in place of the per-timestep op chain (see
         // TryRecordLstmSequenceTrain). The returnSequences = false slice is recorded after it, as the eager path does.
         // A last-step-only model gets a node whose output is h_T itself where the backend can differentiate that alone.
@@ -7763,6 +7770,23 @@ public partial class DirectGpuTensorEngine
                 var bufDH0 = Transient(Zeros(B * Hd));
                 var bufDC0 = Transient(Zeros(B * Hd));
 
+                if (meta.Length > 9 && meta[9] != 0)
+                {
+                    int offset = (returnSequences ? B * S : B) * Hd;
+                    var terminalH = Transient(backend.AllocateBuffer(B * Hd));
+                    var terminalC = Transient(backend.AllocateBuffer(B * Hd));
+                    backend.Copy(ownGradOutput.Buffer, offset, terminalH, 0, B * Hd);
+                    backend.Copy(ownGradOutput.Buffer, offset + B * Hd, terminalC, 0, B * Hd);
+                    if (backend is not IFusedLstmSequenceTraining statefulBackend)
+                        throw new InvalidOperationException($"Stateful LSTM backward requires fused training support from {backend.GetType().Name}.");
+                    PortableLstmSequence.Backward(backend,
+                        statefulBackend.StatefulLstmLauncher,
+                        gradOut, ownAllH.Buffer, ownAllC.Buffer, ownGates.Buffer,
+                        ownWih.Buffer, ownWhh.Buffer, ownInput.Buffer,
+                        bufGradInput, bufDH0, bufDC0, bufDWih, bufDWhh, bufDBih, bufDBhh,
+                        S, B, In, Hd, terminalH, terminalC);
+                }
+                else
                 backend.LstmBackwardSequence(
                     gradOut, ownAllH.Buffer, ownAllC.Buffer, ownGates.Buffer, bufH0, bufC0,
                     ownWih.Buffer, ownWhh.Buffer, ownInput.Buffer,

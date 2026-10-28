@@ -47,6 +47,9 @@ public sealed class WebGpuBatchExecutionKernelsTests
             else throw new InvalidOperationException($"Unexpected CUDA parameter '{param}' in {name}.");
         }
 
+        // The WebGPU adapter packs I/F/O into one buffer to fit the guaranteed
+        // eight-binding limit; scalar arguments and all remaining buffers retain order.
+        if (name == BatchExecutionCudaKernels.XLstmTrainingBackward) expectedAccess.RemoveRange(4, 2);
         var bindings = Regex.Matches(wgsl, @"@binding\((\d+)\) var<storage, (read|read_write)>", RegexOptions.None, RegexTimeout);
         Assert.Equal(expectedAccess, bindings.Select(m => m.Groups[2].Value).ToList());
         Assert.Equal(Enumerable.Range(0, expectedAccess.Count).Select(i => i.ToString()),

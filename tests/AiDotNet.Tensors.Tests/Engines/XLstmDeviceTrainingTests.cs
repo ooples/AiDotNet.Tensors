@@ -1,0 +1,209 @@
+using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Compilation;
+using AiDotNet.Tensors.Engines.DirectGpu;
+using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
+using AiDotNet.Tensors.Engines.Optimization;
+using AiDotNet.Tensors.LinearAlgebra;
+using Xunit;
+
+namespace AiDotNet.Tensors.Tests.Engines;
+
+[Collection("CompilationGlobalState")]
+[Trait("Category", "RequiresOpenCL")]
+public class XLstmDeviceTrainingTests
+{
+    [Fact]
+    public void OpenCl_NoOpSqueeze_PreservesBranchedGradientWithoutDownloads()
+    {
+        using var backend = new OpenClBackend(); Assert.True(backend.IsAvailable);
+        using var direct = new DirectGpuEngine(backend); using var engine = new DirectGpuTensorEngine(direct);
+        var x = new Tensor<float>(new float[] { 1, 2, 3, 4, 5, 6 }, new[] { 2, 3 });
+        using var tape = new GradientTape<float>();
+        GpuLaunchProbe.Reset();
+        var y = engine.TensorMultiply(x, x);
+        var squeezed = engine.TensorSqueeze(y, -1);
+        Assert.Same(y, squeezed);
+        var loss = engine.ReduceSum(engine.TensorAdd(squeezed, y), null);
+        var gradients = tape.ComputeGradients(loss, new[] { x });
+        Assert.Equal(0, GpuLaunchProbe.Readbacks);
+        Assert.Equal(new float[] { 4, 8, 12, 16, 20, 24 }, gradients[x].ToArray());
+    }
+
+    [Theory] [InlineData(0)] [InlineData(1)] [InlineData(2)]
+    public void OpenCl_NarrowEveryAxisAndItsGradientStayOnDevice(int axis)
+    {
+        using var backend = new OpenClBackend(); Assert.True(backend.IsAvailable, backend.InitializationException?.ToString());
+        using var direct = new DirectGpuEngine(backend); using var engine = new DirectGpuTensorEngine(direct);
+        var x = new Tensor<float>(new[] { 2, 3, 4 });
+        for (int i = 0; i < x.Length; i++) x[i] = i;
+        using var tape = new GradientTape<float>();
+        GpuLaunchProbe.Reset();
+        var resident = engine.TensorAddScalar(x, 1f);
+        var slice = engine.TensorNarrow(resident, axis, 1, 1);
+        var squeezed = engine.TensorSqueeze(slice, axis);
+        var result = engine.TensorAdd(squeezed, squeezed);
+        var gradients = tape.ComputeGradients(engine.ReduceSum(result, null), new[] { x });
+        Assert.Equal(0, GpuLaunchProbe.Readbacks);
+        int stride = axis == 0 ? 12 : axis == 1 ? 4 : 1;
+        for (int i = 0; i < x.Length; i++) Assert.Equal((i / stride) % x.Shape[axis] == 1 ? 2f : 0f, gradients[x][i]);
+    }
+    [Fact]
+    public void OpenCl_MaximumPreservesSavedInputsAndStridedArithmeticResidency()
+    {
+        using var backend = new OpenClBackend(); Assert.True(backend.IsAvailable, backend.InitializationException?.ToString());
+        using var direct = new DirectGpuEngine(backend); using var engine = new DirectGpuTensorEngine(direct);
+        var a = new Tensor<float>(new[] { 2, 3 }); var b = new Tensor<float>(new[] { 2, 3 });
+        for (int i = 0; i < a.Length; i++) { a[i] = i - 2; b[i] = .5f; }
+        using var tape = new GradientTape<float>();
+        GpuLaunchProbe.Reset();
+        var maximum = engine.TensorMax(a, b);
+        var transposed = engine.TensorTranspose(maximum);
+        var sum = engine.TensorAdd(transposed, transposed);
+        var loss = engine.ReduceSum(sum, null);
+        a[0] = 9; // Saved max mask must still reflect the pre-mutation value.
+        var gradients = tape.ComputeGradients(loss, new[] { a, b });
+        Assert.Equal(0, GpuLaunchProbe.Readbacks);
+        for (int i = 0; i < a.Length; i++)
+        {
+            Assert.Equal(i - 2 > .5f ? 2 : 0, gradients[a][i]);
+            Assert.Equal(i - 2 > .5f ? 0 : 2, gradients[b][i]);
+        }
+    }
+    private static Tensor<float>[] Inputs(int width, float scale)
+    {
+        return Enumerable.Range(0, 6).Select(j =>
+        {
+            var x = new Tensor<float>(new[] { 2, 4, j < 3 ? width * 2 : 2 });
+            for (int i = 0; i < x.Length; i++) x[i] = j < 3 ? scale * MathF.Sin(i * .7f + j) : .6f + .3f * MathF.Sin(i + j);
+            return x;
+        }).ToArray();
+    }
+    private static Tensor<float> Loss(CpuEngine e, Tensor<float>[] x)
+    {
+        var y = e.XLstmScanForward(x[0], x[1], x[2], x[3], x[4], x[5], 2);
+        return e.ReduceSum(e.TensorMultiply(y, y), null);
+    }
+    private static void Near(Tensor<float> expected, Tensor<float> actual)
+    {
+        Assert.Equal(expected.Shape, actual.Shape);
+        for (int i = 0; i < actual.Length; i++)
+            Assert.InRange(Math.Abs(expected[i] - actual[i]), 0, 4e-4f * (1 + Math.Abs(expected[i])));
+    }
+    [Theory]
+    [InlineData(3, .2f)] [InlineData(3, 2f)] [InlineData(65, .2f)]
+    public void OpenCl_ForwardAndAllSixGradientsStayOnDevice(int width, float scale)
+    {
+        using var backend = new OpenClBackend(); Assert.True(backend.IsAvailable, backend.InitializationException?.ToString());
+        using var direct = new DirectGpuEngine(backend); using var engine = new DirectGpuTensorEngine(direct);
+        var x = Inputs(width, scale);
+        Tensor<float> expected; Dictionary<Tensor<float>, Tensor<float>> reference;
+        using (var tape = new GradientTape<float>())
+        { expected = Loss(new CpuEngine(), x); reference = tape.ComputeGradients(expected, x); }
+        GpuLaunchProbe.Reset();
+        Tensor<float> actual; Dictionary<Tensor<float>, Tensor<float>> gradients;
+        using (var tape = new GradientTape<float>())
+        { actual = Loss(engine, x); gradients = tape.ComputeGradients(actual, x); }
+        Assert.True(GpuLaunchProbe.Count >= 3);
+        Assert.Equal(0, GpuLaunchProbe.Readbacks);
+        Near(expected, actual);
+        foreach (var input in x) Near(reference[input], gradients[input]);
+    }
+    [Fact]
+    public void OpenCl_CompiledTrainingRefreshesInputs()
+    {
+        using var backend = new OpenClBackend(); Assert.True(backend.IsAvailable, backend.InitializationException?.ToString());
+        using var direct = new DirectGpuEngine(backend); using var engine = new DirectGpuTensorEngine(direct);
+        var x = Inputs(3, 2);
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable()) { Loss(engine, x); plan = scope.CompileTraining(x); }
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0);
+            for (int step = 0; step < 3; step++)
+            {
+                x[0][0] = .4f + step;
+                Tensor<float> expected; Dictionary<Tensor<float>, Tensor<float>> reference;
+                using (var tape = new GradientTape<float>())
+                { expected = Loss(new CpuEngine(), x); reference = tape.ComputeGradients(expected, x); }
+                var actual = plan.Step();
+                Near(expected, actual);
+                foreach (var input in x) Near(reference[input], input.Grad!);
+            }
+        }
+    }
+
+    [Fact]
+    public void TensorCopy_InvalidatesCpuWeightPacks()
+    {
+        var engine = new CpuEngine();
+        var target = new Tensor<float>(new[] { 2, 2 });
+        var source = new Tensor<float>(new[] { 2, 2 }); source[0] = 3;
+        var backing = target.GetLiveBackingArrayOrNull()!;
+        long version = AiDotNet.Tensors.Engines.Simd.SimdGemm.WeightArrayVersionOf(backing);
+        engine.TensorCopy(source, target);
+        Assert.True(AiDotNet.Tensors.Engines.Simd.SimdGemm.WeightArrayVersionOf(backing) > version);
+        Assert.Equal(3, target[0]);
+    }
+
+    [Fact]
+    public void OpenCl_CopyIntoPersistentWeightStaysResidentAndRefreshesConsumers()
+    {
+        using var backend = new OpenClBackend(); Assert.True(backend.IsAvailable);
+        using var direct = new DirectGpuEngine(backend); using var gpu = new DirectGpuTensorEngine(direct);
+        IEngine engine = gpu;
+        var target = new Tensor<float>(new[] { 2, 2 }); target[0] = 1; target[3] = 1;
+        var source = new Tensor<float>(new[] { 2, 2 }); source[0] = 3; source[3] = 4;
+        engine.RegisterPersistentTensor(target, PersistentTensorRole.Weights);
+        var input = new Tensor<float>(new[] { 1, 2 }); input[0] = 2; input[1] = 5;
+        engine.TensorMatMul(input, target);
+        Tensor<float> result;
+        using (var scope = AiDotNet.Tensors.Engines.Diagnostics.GpuResidencyScope.Begin(captureOperations: true))
+        {
+            engine.TensorCopy(source, target);
+            result = engine.TensorMatMul(input, target);
+            Assert.True(scope.Downloads == 0, string.Join("\n", scope.Events));
+        }
+        Assert.Equal(new float[] { 6, 20 }, result.ToArray());
+    }
+
+    [Fact]
+    public void OpenCl_RoundUsesEvenTiesAndZeroDerivativeWithoutDownloads()
+    {
+        using var backend = new OpenClBackend(); Assert.True(backend.IsAvailable);
+        using var direct = new DirectGpuEngine(backend); using var engine = new DirectGpuTensorEngine(direct);
+        var input = new Tensor<float>(new float[] { -2.5f, -1.5f, -.5f, .5f, 1.5f, 2.5f }, new[] { 2, 3 });
+        Tensor<float> output; Dictionary<Tensor<float>, Tensor<float>> gradients;
+        using (var scope = AiDotNet.Tensors.Engines.Diagnostics.GpuResidencyScope.Begin(captureOperations: true))
+        {
+            using var tape = new GradientTape<float>();
+            output = engine.TensorRound(engine.TensorAddScalar(input, 0f));
+            gradients = tape.ComputeGradients(engine.ReduceSum(output, null), new[] { input });
+            Assert.True(scope.Downloads == 0, string.Join("\n", scope.Events));
+        }
+        Assert.Equal(new float[] { -2, -2, 0, 0, 2, 2 }, output.ToArray());
+        Assert.All(gradients[input].ToArray(), value => Assert.Equal(0, value));
+    }
+
+    [Fact]
+    public void OpenCl_CompiledRoundRefreshesValuesAndPreservesZeroDerivative()
+    {
+        using var backend = new OpenClBackend(); Assert.True(backend.IsAvailable);
+        using var direct = new DirectGpuEngine(backend); using var engine = new DirectGpuTensorEngine(direct);
+        var input = new Tensor<float>(new[] { 2, 3 });
+        Tensor<float> Loss(IEngine e) => e.ReduceSum(e.TensorAdd(e.TensorRound(input), input), null);
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable()) { Loss(engine); plan = scope.CompileTraining(new[] { input }); }
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0);
+            for (int step = 0; step < 2; step++)
+            {
+                for (int i = 0; i < input.Length; i++) input[i] = i - 2.5f + step;
+                var expected = Loss(new CpuEngine()); var actual = plan.Step();
+                Near(expected, actual);
+                Assert.All(input.Grad!.ToArray(), value => Assert.Equal(1, value));
+            }
+        }
+    }
+}

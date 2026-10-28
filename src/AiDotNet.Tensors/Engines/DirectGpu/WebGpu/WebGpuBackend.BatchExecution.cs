@@ -54,6 +54,19 @@ public sealed partial class WebGpuBackend : IGpuBatchExecution
     {
         if (threads <= 0) return;
         var (workgroups, _) = _device.CalculateWorkgroups1D(threads);
+        if (name == K.XLstmTrainingBackward)
+        {
+            int count = checked((int)args[10] * (int)args[11] * (int)args[13]);
+            using var gates = AllocateBuffer(checked(3 * count));
+            for (int gate = 0; gate < 3; gate++)
+                Copy((IGpuBuffer)args[3 + gate], 0, gates, gate * count, count);
+            // WebGPU guarantees eight storage bindings per stage. Pack the three
+            // scalar gates without transferring any tensor values to the host.
+            args = new object[] { args[0], args[1], args[2], gates, args[6], args[7], args[8], args[9],
+                args[10], args[11], args[12], args[13] };
+            DispatchBatchAsync(name, workgroups, args).GetAwaiter().GetResult();
+            return;
+        }
         DispatchBatchAsync(name, workgroups, args).GetAwaiter().GetResult();
     }
 

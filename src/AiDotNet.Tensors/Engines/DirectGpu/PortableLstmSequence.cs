@@ -42,15 +42,18 @@ internal static class PortableLstmSequence
         IGpuBuffer weightsIh, IGpuBuffer weightsHh, IGpuBuffer input,
         IGpuBuffer gradInput, IGpuBuffer gradHInit, IGpuBuffer gradCInit,
         IGpuBuffer gradWeightsIh, IGpuBuffer gradWeightsHh, IGpuBuffer gradBiasIh, IGpuBuffer gradBiasHh,
-        int seqLen, int batch, int inputSize, int hiddenSize)
+        int seqLen, int batch, int inputSize, int hiddenSize,
+        IGpuBuffer? gradHFinal = null, IGpuBuffer? gradCFinal = null)
     {
         Check(seqLen, batch, inputSize, hiddenSize);
         int state = batch * hiddenSize;
         using var dh = backend.AllocateBuffer(state);
         using var dc = backend.AllocateBuffer(state);
         using var dpre = backend.AllocateBuffer(checked(seqLen * batch * 4 * hiddenSize));
-        backend.Fill(dh, 0f, state);
-        backend.Fill(dc, 0f, state);
+        if (gradHFinal is null) backend.Fill(dh, 0f, state);
+        else backend.Copy(gradHFinal, 0, dh, 0, state);
+        if (gradCFinal is null) backend.Fill(dc, 0f, state);
+        else backend.Copy(gradCFinal, 0, dc, 0, state);
         for (int t = seqLen - 1; t >= 0; t--)
         {
             launch(K.LstmCellBackward, state, gradOutput, cacheGates, allC, dh, dc, dpre, t, batch, seqLen, hiddenSize);

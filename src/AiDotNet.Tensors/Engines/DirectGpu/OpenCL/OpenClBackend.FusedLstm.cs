@@ -6,6 +6,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     // work-group: H is bounded by the kernel's work-group limit on this device.
     public sealed partial class OpenClBackend : IFusedLstmSequenceTraining
     {
+        PortableGenericFft.Launcher IFusedLstmSequenceTraining.StatefulLstmLauncher => LaunchBatch;
         int IFusedLstmSequenceTraining.MaxFusedLstmHidden => MaxLstmSequenceHidden();
         bool IFusedLstmSequenceTraining.LstmBackwardOverwritesGradients => false;
 
