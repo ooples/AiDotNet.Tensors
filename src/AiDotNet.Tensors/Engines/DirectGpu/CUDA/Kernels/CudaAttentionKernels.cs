@@ -119,7 +119,7 @@ extern ""C"" __global__ __launch_bounds__(256) void scaled_dot_product_attention
 // Shared mem: 2 * ATTN_BC * headDim floats
 // ===========================================================================
 
-extern ""C"" __global__ __launch_bounds__(256) void flash_attention_v2(
+__device__ __forceinline__ void flash_attention_v2_at(
     const float* __restrict__ query,          // [batch * heads * seqQ * headDim]
     const float* __restrict__ key,            // [batch * heads * seqK * headDim]
     const float* __restrict__ value,          // [batch * heads * seqK * headDim]
@@ -134,11 +134,11 @@ extern ""C"" __global__ __launch_bounds__(256) void flash_attention_v2(
     int isCausal,
     const float* __restrict__ attentionBias,  // optional, NULL if unused
     int hasBias,
-    int biasBatchStride)
+    int biasBatchStride, int gridStrideY)
 {
     int qBase = blockIdx.x * ATTN_BR;
     int qi = qBase + threadIdx.x;
-    int bh = blockIdx.y;
+    int bh = gridStrideY;
 
     if (bh >= batch * numHeads) return;
     if (headDim > MAX_HEAD_DIM) return;
@@ -232,6 +232,31 @@ extern ""C"" __global__ __launch_bounds__(256) void flash_attention_v2(
         softmaxStats[sOffset] = rowMax + logf(fmaxf(rowSum, 1e-20f));
     }
 }
+extern ""C"" __global__ __launch_bounds__(256) void flash_attention_v2(
+    const float* __restrict__ query,          // [batch * heads * seqQ * headDim]
+    const float* __restrict__ key,            // [batch * heads * seqK * headDim]
+    const float* __restrict__ value,          // [batch * heads * seqK * headDim]
+    float* __restrict__ output,               // [batch * heads * seqQ * headDim]
+    float* __restrict__ softmaxStats,         // [batch * heads * seqQ] (log-sum-exp)
+    int batch,
+    int numHeads,
+    int seqQ,
+    int seqK,
+    int headDim,
+    float scale,
+    int isCausal,
+    const float* __restrict__ attentionBias,  // optional, NULL if unused
+    int hasBias,
+    int biasBatchStride)
+{
+    // gridDim.y is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideY = blockIdx.y; gridStrideY < batch * numHeads; gridStrideY += gridDim.y)
+        {
+            flash_attention_v2_at(query, key, value, output, softmaxStats, batch, numHeads, seqQ, seqK, headDim, scale, isCausal, attentionBias, hasBias, biasBatchStride, gridStrideY);
+            // Shared memory is reused by the next index; no thread may overwrite it while another still reads it.
+            __syncthreads();
+        }
+}
 
 // ===========================================================================
 // FLASH ATTENTION BACKWARD
@@ -248,7 +273,7 @@ extern ""C"" __global__ __launch_bounds__(256) void flash_attention_v2(
 //   gradq: per (bh, qi) -> writes gradQuery only, no atomics
 //   gradkv: per (bh, ki, d) -> writes gradKey[ki, d] and gradValue[ki, d]
 //          by iterating qi in fixed ascending order
-extern ""C"" __global__ __launch_bounds__(256) void flash_attention_backward_gradq_deterministic(
+__device__ __forceinline__ void flash_attention_backward_gradq_deterministic_at(
     const float* __restrict__ gradOutput,
     const float* __restrict__ query,
     const float* __restrict__ key,
@@ -265,10 +290,10 @@ extern ""C"" __global__ __launch_bounds__(256) void flash_attention_backward_gra
     int isCausal,
     const float* __restrict__ attentionBias,
     int hasBias,
-    int biasBatchStride)
+    int biasBatchStride, int gridStrideY)
 {
     int qi = blockIdx.x * blockDim.x + threadIdx.x;
-    int bh = blockIdx.y;
+    int bh = gridStrideY;
     if (qi >= seqQ || bh >= batch * numHeads) return;
 
     int qOffset = bh * seqQ * headDim + qi * headDim;
@@ -316,8 +341,31 @@ extern ""C"" __global__ __launch_bounds__(256) void flash_attention_backward_gra
         }
     }
 }
+extern ""C"" __global__ __launch_bounds__(256) void flash_attention_backward_gradq_deterministic(
+    const float* __restrict__ gradOutput,
+    const float* __restrict__ query,
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    const float* __restrict__ output,
+    const float* __restrict__ softmaxStats,
+    float* __restrict__ gradQuery,
+    int batch,
+    int numHeads,
+    int seqQ,
+    int seqK,
+    int headDim,
+    float scale,
+    int isCausal,
+    const float* __restrict__ attentionBias,
+    int hasBias,
+    int biasBatchStride)
+{
+    // gridDim.y is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideY = blockIdx.y; gridStrideY < batch * numHeads; gridStrideY += gridDim.y)
+        flash_attention_backward_gradq_deterministic_at(gradOutput, query, key, value, output, softmaxStats, gradQuery, batch, numHeads, seqQ, seqK, headDim, scale, isCausal, attentionBias, hasBias, biasBatchStride, gridStrideY);
+}
 
-extern ""C"" __global__ __launch_bounds__(256) void flash_attention_backward_gradkv_deterministic(
+__device__ __forceinline__ void flash_attention_backward_gradkv_deterministic_at(
     const float* __restrict__ gradOutput,
     const float* __restrict__ query,
     const float* __restrict__ key,
@@ -335,11 +383,11 @@ extern ""C"" __global__ __launch_bounds__(256) void flash_attention_backward_gra
     int isCausal,
     const float* __restrict__ attentionBias,
     int hasBias,
-    int biasBatchStride)
+    int biasBatchStride, int gridStrideZ)
 {
     int d = blockIdx.x * blockDim.x + threadIdx.x;
     int ki = blockIdx.y * blockDim.y + threadIdx.y;
-    int bh = blockIdx.z;
+    int bh = gridStrideZ;
     if (d >= headDim || ki >= seqK || bh >= batch * numHeads) return;
 
     int kOffset = bh * seqK * headDim;
@@ -388,8 +436,32 @@ extern ""C"" __global__ __launch_bounds__(256) void flash_attention_backward_gra
     gradValue[vOffset + ki * headDim + d] = accV;
     gradKey[kOffset + ki * headDim + d] = accK;
 }
+extern ""C"" __global__ __launch_bounds__(256) void flash_attention_backward_gradkv_deterministic(
+    const float* __restrict__ gradOutput,
+    const float* __restrict__ query,
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    const float* __restrict__ output,
+    const float* __restrict__ softmaxStats,
+    float* __restrict__ gradKey,
+    float* __restrict__ gradValue,
+    int batch,
+    int numHeads,
+    int seqQ,
+    int seqK,
+    int headDim,
+    float scale,
+    int isCausal,
+    const float* __restrict__ attentionBias,
+    int hasBias,
+    int biasBatchStride)
+{
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch * numHeads; gridStrideZ += gridDim.z)
+        flash_attention_backward_gradkv_deterministic_at(gradOutput, query, key, value, output, softmaxStats, gradKey, gradValue, batch, numHeads, seqQ, seqK, headDim, scale, isCausal, attentionBias, hasBias, biasBatchStride, gridStrideZ);
+}
 
-extern ""C"" __global__ __launch_bounds__(256) void flash_attention_backward(
+__device__ __forceinline__ void flash_attention_backward_at(
     const float* __restrict__ gradOutput,     // [batch * heads * seqQ * headDim]
     const float* __restrict__ query,          // [batch * heads * seqQ * headDim]
     const float* __restrict__ key,            // [batch * heads * seqK * headDim]
@@ -408,11 +480,11 @@ extern ""C"" __global__ __launch_bounds__(256) void flash_attention_backward(
     int isCausal,
     const float* __restrict__ attentionBias,  // optional bias (NULL if unused)
     int hasBias,
-    int biasBatchStride)
+    int biasBatchStride, int gridStrideY)
 {
     int qBase = blockIdx.x * ATTN_BR;
     int qi = qBase + threadIdx.x;
-    int bh = blockIdx.y;
+    int bh = gridStrideY;
 
     if (bh >= batch * numHeads) return;
 
@@ -516,6 +588,35 @@ extern ""C"" __global__ __launch_bounds__(256) void flash_attention_backward(
         __syncthreads();
     }
 }
+extern ""C"" __global__ __launch_bounds__(256) void flash_attention_backward(
+    const float* __restrict__ gradOutput,     // [batch * heads * seqQ * headDim]
+    const float* __restrict__ query,          // [batch * heads * seqQ * headDim]
+    const float* __restrict__ key,            // [batch * heads * seqK * headDim]
+    const float* __restrict__ value,          // [batch * heads * seqK * headDim]
+    const float* __restrict__ output,         // [batch * heads * seqQ * headDim]
+    const float* __restrict__ softmaxStats,   // [batch * heads * seqQ]
+    float* __restrict__ gradQuery,            // [batch * heads * seqQ * headDim]
+    float* __restrict__ gradKey,              // [batch * heads * seqK * headDim]
+    float* __restrict__ gradValue,            // [batch * heads * seqK * headDim]
+    int batch,
+    int numHeads,
+    int seqQ,
+    int seqK,
+    int headDim,
+    float scale,
+    int isCausal,
+    const float* __restrict__ attentionBias,  // optional bias (NULL if unused)
+    int hasBias,
+    int biasBatchStride)
+{
+    // gridDim.y is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideY = blockIdx.y; gridStrideY < batch * numHeads; gridStrideY += gridDim.y)
+        {
+            flash_attention_backward_at(gradOutput, query, key, value, output, softmaxStats, gradQuery, gradKey, gradValue, batch, numHeads, seqQ, seqK, headDim, scale, isCausal, attentionBias, hasBias, biasBatchStride, gridStrideY);
+            // Shared memory is reused by the next index; no thread may overwrite it while another still reads it.
+            __syncthreads();
+        }
+}
 
 // ===========================================================================
 // GROUPED QUERY ATTENTION (GQA)
@@ -524,7 +625,7 @@ extern ""C"" __global__ __launch_bounds__(256) void flash_attention_backward(
 // Shared mem: 2 * ATTN_BC * headDim floats
 // ===========================================================================
 
-extern ""C"" __global__ __launch_bounds__(256) void grouped_query_attention(
+__device__ __forceinline__ void grouped_query_attention_at(
     const float* query,          // [batch * numQHeads * seqQ * headDim]
     const float* key,            // [batch * numKVHeads * seqK * headDim]
     const float* value,          // [batch * numKVHeads * seqK * headDim]
@@ -539,11 +640,11 @@ extern ""C"" __global__ __launch_bounds__(256) void grouped_query_attention(
     int headDim,
     float scale,
     int isCausal,
-    int storeWeights)
+    int storeWeights, int gridStrideY)
 {
     int qBase = blockIdx.x * ATTN_BR;
     int qi = qBase + threadIdx.x;
-    int bqh = blockIdx.y;
+    int bqh = gridStrideY;
 
     if (bqh >= batch * numQHeads) return;
     if (headDim > MAX_HEAD_DIM) return;
@@ -653,6 +754,31 @@ extern ""C"" __global__ __launch_bounds__(256) void grouped_query_attention(
         }
     }
 }
+extern ""C"" __global__ __launch_bounds__(256) void grouped_query_attention(
+    const float* query,          // [batch * numQHeads * seqQ * headDim]
+    const float* key,            // [batch * numKVHeads * seqK * headDim]
+    const float* value,          // [batch * numKVHeads * seqK * headDim]
+    float* output,               // [batch * numQHeads * seqQ * headDim]
+    float* attentionWeights,     // [batch * numQHeads * seqQ * seqK] (optional)
+    int batch,
+    int numQHeads,
+    int numKVHeads,
+    int queriesPerKV,
+    int seqQ,
+    int seqK,
+    int headDim,
+    float scale,
+    int isCausal,
+    int storeWeights)
+{
+    // gridDim.y is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideY = blockIdx.y; gridStrideY < batch * numQHeads; gridStrideY += gridDim.y)
+        {
+            grouped_query_attention_at(query, key, value, output, attentionWeights, batch, numQHeads, numKVHeads, queriesPerKV, seqQ, seqK, headDim, scale, isCausal, storeWeights, gridStrideY);
+            // Shared memory is reused by the next index; no thread may overwrite it while another still reads it.
+            __syncthreads();
+        }
+}
 
 // ===========================================================================
 // GQA BACKWARD
@@ -665,7 +791,7 @@ extern ""C"" __global__ __launch_bounds__(256) void grouped_query_attention(
 // GQA backward — bit-deterministic variants (issue #382). Same split as Flash:
 //   gradq: per (bqh, qi) writes gradQuery only (no atomics)
 //   gradkv: per (b, kvh, ki, d) writes gradKey/gradValue with fixed (qh, qi) order
-extern ""C"" __global__ __launch_bounds__(256) void grouped_query_attention_backward_gradq_deterministic(
+__device__ __forceinline__ void grouped_query_attention_backward_gradq_deterministic_at(
     const float* gradOutput,
     const float* query,
     const float* key,
@@ -679,10 +805,10 @@ extern ""C"" __global__ __launch_bounds__(256) void grouped_query_attention_back
     int seqQ,
     int seqK,
     int headDim,
-    float scale)
+    float scale, int gridStrideY)
 {
     int qi = blockIdx.x * blockDim.x + threadIdx.x;
-    int bqh = blockIdx.y;
+    int bqh = gridStrideY;
     if (qi >= seqQ || bqh >= batch * numQHeads) return;
 
     int b = bqh / numQHeads;
@@ -718,8 +844,28 @@ extern ""C"" __global__ __launch_bounds__(256) void grouped_query_attention_back
         }
     }
 }
+extern ""C"" __global__ __launch_bounds__(256) void grouped_query_attention_backward_gradq_deterministic(
+    const float* gradOutput,
+    const float* query,
+    const float* key,
+    const float* value,
+    const float* attentionWeights,
+    float* gradQuery,
+    int batch,
+    int numQHeads,
+    int numKVHeads,
+    int queriesPerKV,
+    int seqQ,
+    int seqK,
+    int headDim,
+    float scale)
+{
+    // gridDim.y is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideY = blockIdx.y; gridStrideY < batch * numQHeads; gridStrideY += gridDim.y)
+        grouped_query_attention_backward_gradq_deterministic_at(gradOutput, query, key, value, attentionWeights, gradQuery, batch, numQHeads, numKVHeads, queriesPerKV, seqQ, seqK, headDim, scale, gridStrideY);
+}
 
-extern ""C"" __global__ __launch_bounds__(256) void grouped_query_attention_backward_gradkv_deterministic(
+__device__ __forceinline__ void grouped_query_attention_backward_gradkv_deterministic_at(
     const float* gradOutput,
     const float* query,
     const float* key,
@@ -734,11 +880,11 @@ extern ""C"" __global__ __launch_bounds__(256) void grouped_query_attention_back
     int seqQ,
     int seqK,
     int headDim,
-    float scale)
+    float scale, int gridStrideZ)
 {
     int d = blockIdx.x * blockDim.x + threadIdx.x;
     int ki = blockIdx.y * blockDim.y + threadIdx.y;
-    int bkvh = blockIdx.z;
+    int bkvh = gridStrideZ;
     if (d >= headDim || ki >= seqK || bkvh >= batch * numKVHeads) return;
 
     int b = bkvh / numKVHeads;
@@ -791,8 +937,29 @@ extern ""C"" __global__ __launch_bounds__(256) void grouped_query_attention_back
     gradValue[kvOffsetBase + ki * headDim + d] = accV;
     gradKey[kvOffsetBase + ki * headDim + d] = accK;
 }
+extern ""C"" __global__ __launch_bounds__(256) void grouped_query_attention_backward_gradkv_deterministic(
+    const float* gradOutput,
+    const float* query,
+    const float* key,
+    const float* value,
+    const float* attentionWeights,
+    float* gradKey,
+    float* gradValue,
+    int batch,
+    int numQHeads,
+    int numKVHeads,
+    int queriesPerKV,
+    int seqQ,
+    int seqK,
+    int headDim,
+    float scale)
+{
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch * numKVHeads; gridStrideZ += gridDim.z)
+        grouped_query_attention_backward_gradkv_deterministic_at(gradOutput, query, key, value, attentionWeights, gradKey, gradValue, batch, numQHeads, numKVHeads, queriesPerKV, seqQ, seqK, headDim, scale, gridStrideZ);
+}
 
-extern ""C"" __global__ __launch_bounds__(256) void grouped_query_attention_backward(
+__device__ __forceinline__ void grouped_query_attention_backward_at(
     const float* gradOutput,       // [batch * numQHeads * seqQ * headDim]
     const float* query,            // [batch * numQHeads * seqQ * headDim]
     const float* key,              // [batch * numKVHeads * seqK * headDim]
@@ -808,11 +975,11 @@ extern ""C"" __global__ __launch_bounds__(256) void grouped_query_attention_back
     int seqQ,
     int seqK,
     int headDim,
-    float scale)
+    float scale, int gridStrideY)
 {
     int qBase = blockIdx.x * ATTN_BR;
     int qi = qBase + threadIdx.x;
-    int bqh = blockIdx.y;
+    int bqh = gridStrideY;
 
     if (bqh >= batch * numQHeads) return;
     if (headDim > MAX_HEAD_DIM) return;
@@ -925,6 +1092,32 @@ extern ""C"" __global__ __launch_bounds__(256) void grouped_query_attention_back
         }
         __syncthreads();
     }
+}
+extern ""C"" __global__ __launch_bounds__(256) void grouped_query_attention_backward(
+    const float* gradOutput,       // [batch * numQHeads * seqQ * headDim]
+    const float* query,            // [batch * numQHeads * seqQ * headDim]
+    const float* key,              // [batch * numKVHeads * seqK * headDim]
+    const float* value,            // [batch * numKVHeads * seqK * headDim]
+    const float* attentionWeights, // [batch * numQHeads * seqQ * seqK]
+    float* gradQuery,              // [batch * numQHeads * seqQ * headDim]
+    float* gradKey,                // [batch * numKVHeads * seqK * headDim]
+    float* gradValue,              // [batch * numKVHeads * seqK * headDim]
+    int batch,
+    int numQHeads,
+    int numKVHeads,
+    int queriesPerKV,
+    int seqQ,
+    int seqK,
+    int headDim,
+    float scale)
+{
+    // gridDim.y is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideY = blockIdx.y; gridStrideY < batch * numQHeads; gridStrideY += gridDim.y)
+        {
+            grouped_query_attention_backward_at(gradOutput, query, key, value, attentionWeights, gradQuery, gradKey, gradValue, batch, numQHeads, numKVHeads, queriesPerKV, seqQ, seqK, headDim, scale, gridStrideY);
+            // Shared memory is reused by the next index; no thread may overwrite it while another still reads it.
+            __syncthreads();
+        }
 }
 
 // ===========================================================================
