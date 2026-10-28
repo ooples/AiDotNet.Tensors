@@ -21,6 +21,8 @@ internal static class OpRegistry
     internal static readonly HashSet<string> DifferentiableOps = new(StringComparer.Ordinal)
     {
         "LstmCellFromGates",
+        // Fused GRU sequence: one node, fused BPTT on the host and the device (#1568)
+        "GruSequenceForward",
 
         // Tensor-level unary maths with their own backward (CpuEngine.ElementwiseExtra)
         "TensorAcosh", "TensorAsinh", "TensorExp2", "TensorExpm1", "TensorLog10", "TensorLog1p", "TensorLog2",
