@@ -2737,8 +2737,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Message a host read of a released step intermediate throws (see <see cref="ActivationReleaseMode.Release"/>).
     /// </summary>
     internal const string ReleasedIntermediateMessage =
-        "This tensor is a GPU intermediate of a finished GradientTape step: its device memory was released when the " +
-        "tape was disposed (or after its last backward use) without copying it to the host, as PyTorch frees an " +
+        "This tensor is a GPU intermediate of a finished GradientTape step or TensorScope: its device memory was released " +
+        "when the tape was disposed, when the scope that created it ended (TensorScope.Keep keeps a result), or after its " +
+        "last backward use, without copying it to the host, as PyTorch frees an " +
         "unreferenced CUDA tensor. Read it inside the tape scope, or call GradientTape.Retain(tensor) before the tape " +
         "ends to keep it. (The loss and gradients returned by ComputeGradients are kept automatically.)";
 
@@ -4337,6 +4338,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // when it is collected. The gradients backward computes but does not return are freed as soon as backward ends
         // (GradientTape.ReleaseDroppedGradients).
         if (TrackOwnedResultBytes) TrackOwnedResult(outputBuffer);
+        // Inside a TensorScope the result is freed when the scope ends unless kept (#1432), not when the GC finalizes it.
+        if (TensorScope.Current is not null) TensorScope.Track(vector, () => ReleaseDeadDeviceStorage(tensor));
         return tensor;
     }
 

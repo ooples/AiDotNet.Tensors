@@ -84,6 +84,14 @@ internal static class DeviceMemoryReclaim
 
     /// <summary>Whether a backend has asked for a collection at the next step or inference boundary.</summary>
     internal static bool CollectionDue => Volatile.Read(ref s_collectionDue) != 0;
+
+    /// <summary>Test hook: starts the byte and allocation counts from zero with no collection due.</summary>
+    internal static void ResetCountsForTests()
+    {
+        Interlocked.Exchange(ref s_driverBytesSinceCollection, 0);
+        Interlocked.Exchange(ref s_allocationsSinceCollection, 0);
+        Volatile.Write(ref s_collectionDue, 0);
+    }
     // Device bytes handed out since the last collection, across every backend: one collection serves them all.
     private static long s_driverBytesSinceCollection;
 
