@@ -85,10 +85,10 @@ jobs:
           - { name: tape-grad-6,  filter: "FullyQualifiedName~Engines.OpParity.TapeGradientParityTests", shard: "6/6" }
     name: gpu-parity-pocl (${{ matrix.name }})
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
     - name: Setup .NET
-      uses: actions/setup-dotnet@v4
+      uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
       with:
         dotnet-version: '10.0.x'
         dotnet-quality: 'preview'
@@ -153,7 +153,7 @@ jobs:
 
     - name: Upload device-path coverage to Codecov
       if: always() && matrix.coverage
-      uses: codecov/codecov-action@v4
+      uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4.6.0
       with:
         files: ./coverage/**/coverage.cobertura.xml
         disable_search: true
@@ -164,7 +164,7 @@ jobs:
         CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
     - name: Upload parity divergence report
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       if: always()
       with:
         name: opparity-pocl-${{ matrix.name }}
