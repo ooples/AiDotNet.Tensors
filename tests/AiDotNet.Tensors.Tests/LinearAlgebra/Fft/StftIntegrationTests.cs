@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // STFT / ISTFT integration tests: end-to-end roundtrip reconstruction,
 // FFT-based convolution matches direct convolution, and windowed overlap-add
 // reconstructs exactly for COLA-compliant window/hop pairs.
