@@ -5445,6 +5445,34 @@ public partial interface IEngine
         FusedActivationType activation);
 
     /// <summary>
+    /// A 2D convolution followed by inference batch norm (running statistics) and <paramref name="activation"/>:
+    /// <c>activation(BatchNormInference(conv2d(input, kernel) + bias))</c>. Outside a gradient tape or graph capture the
+    /// batch norm is folded into the convolution's weights and bias (cached until any parameter changes), so the whole
+    /// sequence is one fused convolution with no separate bias, batch-norm or activation pass. Under a tape or capture
+    /// it runs the unfused ops, which record their own gradients.
+    /// </summary>
+    /// <param name="input">Input, [batch, inChannels, height, width].</param>
+    /// <param name="kernel">Kernel, [outChannels, inChannels, kernelH, kernelW].</param>
+    /// <param name="bias">The convolution's bias, [outChannels], or null.</param>
+    /// <param name="gamma">Batch-norm scale, [outChannels].</param>
+    /// <param name="beta">Batch-norm shift, [outChannels].</param>
+    /// <param name="runningMean">Running mean, [outChannels].</param>
+    /// <param name="runningVariance">Running variance, [outChannels].</param>
+    /// <param name="epsilon">Numerical stabiliser added to the variance.</param>
+    /// <param name="strideH">Vertical stride.</param>
+    /// <param name="strideW">Horizontal stride.</param>
+    /// <param name="padH">Vertical zero padding.</param>
+    /// <param name="padW">Horizontal zero padding.</param>
+    /// <param name="dilationH">Vertical dilation.</param>
+    /// <param name="dilationW">Horizontal dilation.</param>
+    /// <param name="activation">The activation applied to the normalized values.</param>
+    Tensor<T> FusedConv2DBatchNorm<T>(
+        Tensor<T> input, Tensor<T> kernel, Tensor<T>? bias,
+        Tensor<T> gamma, Tensor<T> beta, Tensor<T> runningMean, Tensor<T> runningVariance, double epsilon,
+        int strideH, int strideW, int padH, int padW, int dilationH, int dilationW,
+        FusedActivationType activation);
+
+    /// <summary>
     /// Performs a fused 3D convolution: output = activation(conv3d(input, kernel) + bias).
     /// Combines convolution, bias addition, and activation into a single optimized operation.
     /// </summary>

@@ -77,6 +77,23 @@ public sealed class TensorScope : IDisposable
     /// <summary>The number of results this scope will free when it ends.</summary>
     public int TrackedCount => _results.Count;
 
+    /// <summary>
+    /// Stops tracking on this thread until the returned handle is disposed: for engine caches built during a call (a
+    /// folded kernel, say), which outlive the scope that happened to be open.
+    /// </summary>
+    internal static SuspendHandle Suspend()
+    {
+        var suspended = s_current;
+        s_current = null;
+        return new SuspendHandle(suspended);
+    }
+
+    internal readonly struct SuspendHandle : IDisposable
+    {
+        private readonly TensorScope? _suspended;
+        internal SuspendHandle(TensorScope? suspended) => _suspended = suspended;
+        public void Dispose() => s_current = _suspended;
+    }
     /// <summary>Records a GPU result created on this thread with the innermost open scope, if any.</summary>
     internal static void Track(object storage, Action release)
     {

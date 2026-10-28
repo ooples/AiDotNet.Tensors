@@ -507,6 +507,8 @@ internal static class OpRegistry
     {
         // Advanced indexing (TensorTake) and grouped GEMM (narrow / matmul / concat): composed from recorded ops
         "TensorIndex", "TensorGroupedMatMul",
+        // Conv, inference batch norm and activation: recorded as the unfused ops under a tape, folded otherwise (#1432)
+        "FusedConv2DBatchNorm",
         // Composed from recorded ops (reparameterized normal, constant masks, reshape/permute, matmul, conv, scatter_reduce)
         "TensorNormal", "TensorAlphaDropout", "TensorFeatureAlphaDropout", "TensorChannelDropout",
         "TensorBilinear", "TensorChannelShuffle", "TensorPixelUnshuffle", "TensorLocalResponseNorm",
