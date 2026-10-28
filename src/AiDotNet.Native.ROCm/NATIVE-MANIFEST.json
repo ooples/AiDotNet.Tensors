@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "package": "AiDotNet.Native.ROCm",
+  "description": "Inventory of every third-party native file this package redistributes: upstream version, licence and SHA-256. tools/Test-NativeManifest.ps1 checks it against the files on disk before release packing.",
+  "components": [
+    {
+      "name": "rocBLAS",
+      "supplier": "Advanced Micro Devices, Inc.",
+      "version": "4.4.1",
+      "license": "MIT, plus the third-party notices included in the licence file",
+      "licenseFile": "LICENSE.rocBLAS.txt",
+      "licenseSource": "https://raw.githubusercontent.com/ROCm/rocBLAS/rocm-6.4.2/LICENSE.md",
+      "upstream": "https://github.com/ROCm/rocBLAS/tree/rocm-6.4.2",
+      "provenance": "The DLL embeds the version string \"4.4.1.86c9f06e-dirty\": rocBLAS 4.4.1 (the rocBLAS version of ROCm 6.4.2 and 6.4.3) built from ROCm/rocBLAS commit 86c9f06e. It is the rocBLAS shipped by the AMD HIP SDK for Windows, which publishes no per-file hashes, so the SHA-256 is recorded but not compared against an upstream artifact.",
+      "files": [
+        {
+          "path": "runtimes/win-x64/native/rocblas.dll",
+          "size": 44545944,
+          "sha256": "ae4fec606b9bf2fc6c6fa3412c7545bc55185715c7d9a3d8245603b4bba83d22"
+        }
+      ]
+    },
+    {
+      "name": "hipBLAS",
+      "supplier": "Advanced Micro Devices, Inc.",
+      "version": "unknown: the DLL carries no version resource or version string",
+      "license": "MIT",
+      "licenseFile": "LICENSE.hipBLAS.txt",
+      "licenseSource": "https://raw.githubusercontent.com/ROCm/hipBLAS/rocm-6.4.2/LICENSE.md",
+      "upstream": "https://github.com/ROCm/hipBLAS/tree/rocm-6.4.2",
+      "provenance": "Taken from the AMD HIP SDK for Windows 6.4 together with rocblas.dll. The hipBLAS release in ROCm 6.4.x is 2.4.0, but the binary itself does not state its version.",
+      "files": [
+        {
+          "path": "runtimes/win-x64/native/hipblas.dll",
+          "size": 1081752,
+          "sha256": "6842e73070ed9fbf5904293dcb5dc8c576a53011983e4516a709fca6028f91da"
+        }
+      ]
+    },
+    {
+      "name": "HIP runtime for Windows (amdhip64)",
+      "supplier": "Advanced Micro Devices, Inc.",
+      "version": "6.4 (file version 10.0.3652.0)",
+      "license": "Proprietary: the AMD HIP SDK for Windows licence agreement. The Windows HIP runtime is closed source (unlike the MIT-licensed Linux HIP/CLR runtime). Its licence is shown by the HIP SDK installer and is not published as a downloadable text, so no licence file is bundled for it.",
+      "licenseFile": null,
+      "upstream": "https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html",
+      "provenance": "The DLL's version resource reads ProductName \"amdhip64 6.4 AMD-APP.dbg (3652.0)\", FileVersion 10.0.3652.0.",
+      "files": [
+        {
+          "path": "runtimes/win-x64/native/amdhip64_6.dll",
+          "size": 17740696,
+          "sha256": "5b22a1bb9d9aa5d4f69b524641a5115edb982c2b605f12195364e977b9927f26"
+        }
+      ]
+    }
+  ]
+}
