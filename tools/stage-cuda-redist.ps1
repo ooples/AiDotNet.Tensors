@@ -21,12 +21,15 @@
 
 .EXAMPLE
   ./tools/stage-cuda-redist.ps1                       # download CUDA 12.6.3 redist
-  ./tools/stage-cuda-redist.ps1 -LocalSource C:\cuda  # copy from a local folder
+  ./tools/stage-cuda-redist.ps1 -LocalSource C:\cuda -LocalSourceVersion 12.6.3  # copy from a local folder
 #>
 param(
     [string]$CudaVersion = "12.6.3",
     [string]$OutputDir = "$PSScriptRoot/../src/AiDotNet.Native.CUDA/runtimes/win-x64/native",
     [string]$LocalSource = "",
+    # Required with -LocalSource: the CUDA release the local DLLs come from (for example 12.6.3), recorded in the manifest.
+    # The DLLs carry no single release number, and a package must not ship without one.
+    [string]$LocalSourceVersion = "",
     # Inventory of the staged files (vendor version, licence, SHA-256), packed into the
     # AiDotNet.Native.CUDA meta package. Generated here because the DLLs are not in git.
     [string]$ManifestPath = "$PSScriptRoot/../src/AiDotNet.Native.CUDA/NATIVE-MANIFEST.json"
@@ -66,13 +69,26 @@ function Write-Manifest($components) {
 }
 
 if ($LocalSource) {
-    Write-Host "Staging CUDA runtime from local source: $LocalSource"
-    $files = @(Get-ChildItem $LocalSource -Filter *.dll | Where-Object { Want $_.Name } | ForEach-Object { Stage-File $_ })
-    if ($files.Count -eq 0) { throw "No CUDA runtime DLLs found in $LocalSource" }
+    if (-not $LocalSourceVersion) {
+        throw "-LocalSource needs -LocalSourceVersion (the CUDA release the DLLs come from, e.g. 12.6.3): the manifest must record a version."
+    }
+    Write-Host "Staging CUDA runtime $LocalSourceVersion from local source: $LocalSource"
+    $local = @(Get-ChildItem $LocalSource -Filter *.dll | Where-Object { Want $_.Name })
+    # The same set the download path stages: a partial folder (cudart alone, say) would otherwise pack a CUDA package
+    # without cuBLAS or nvRTC, and the manifest and split-pack checks only validate the files that are listed.
+    $missing = @($wanted | Where-Object { $prefix = $_; -not ($local | Where-Object { $_.Name -like "$prefix*" }) })
+    if ($missing.Count -gt 0) { throw "$LocalSource is missing CUDA runtime DLLs: $(($missing | ForEach-Object { "$_*.dll" }) -join ', ')" }
+    # nvRTC loads the builtins of its own major version (nvrtc64_120_0 -> nvrtc-builtins64_12x).
+    $nvrtcMajor = @($local | Where-Object { $_.Name -match '^nvrtc64_(\d+?)0_' } | ForEach-Object { $Matches[1] } | Select-Object -Unique)
+    if ($nvrtcMajor.Count -ne 1 -or -not ($local | Where-Object { $_.Name -like "nvrtc-builtins64_$($nvrtcMajor[0])*" })) {
+        throw "$LocalSource needs exactly one nvrtc64 major version and its matching nvrtc-builtins64 DLL."
+    }
+    $files = @($local | Sort-Object Name | ForEach-Object { Stage-File $_ })
     Write-Manifest @([ordered]@{
         name        = "NVIDIA CUDA runtime (staged from a local folder)"
         supplier    = "NVIDIA Corporation"
-        version     = "unknown: staged with -LocalSource, not from a versioned NVIDIA redistributable archive"
+        version     = $LocalSourceVersion
+        provenance  = "Copied from a local folder with -LocalSource; the version was stated by whoever staged it, not read from a checksummed NVIDIA redistributable archive."
         license     = $licenseText
         licenseFile = "LICENSE.CUDA.txt"
         upstream    = $LocalSource
