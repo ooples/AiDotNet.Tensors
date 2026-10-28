@@ -5727,6 +5727,41 @@ public partial class DirectGpuTensorEngine
         }
     }
 
+    // A strided view's shape/stride metadata repeats every step (the transformer's Q/K/V narrows are gathered on each
+    // reshape). Uploading it per call made three host/device crossings per warm step (#1570). Bounded so a workload
+    // with ever-changing view layouts falls back to a per-call upload instead of growing the cache without limit.
+    private const int MaxCachedStridedViewLayouts = 1024;
+    private readonly System.Runtime.CompilerServices.ConditionalWeakTable<IDirectGpuBackend,
+        System.Collections.Concurrent.ConcurrentDictionary<int[], IGpuBuffer>> _stridedViewLayouts = new();
+    private int _stridedViewLayoutCount;
+    private readonly object _stridedViewLayoutsGate = new();
+
+    // layout = the view's shape then its strides, as int32 words; the kernel reads them through a float-typed buffer.
+    private IGpuBuffer CachedStridedViewLayout(IDirectGpuBackend backend, int[] layout, out bool cached)
+    {
+        var map = _stridedViewLayouts.GetValue(backend, static _ =>
+            new System.Collections.Concurrent.ConcurrentDictionary<int[], IGpuBuffer>(Int32WordsComparer.Instance));
+        cached = true;
+        if (map.TryGetValue(layout, out var existing)) return existing;
+        lock (_stridedViewLayoutsGate)
+        {
+            if (map.TryGetValue(layout, out existing)) return existing;
+            var created = backend.AllocateBuffer(Int32WordsComparer.AsFloatBits(layout, layout.Length));
+            if (_stridedViewLayoutCount >= MaxCachedStridedViewLayouts)
+            {
+                cached = false;
+                return created;
+            }
+            map[layout] = created;
+            _stridedViewLayoutCount++;
+            _stridedViewLayoutBuffers.Add((backend, created));
+            return created;
+        }
+    }
+
+    // Every cached layout buffer with its backend, for Dispose (a ConditionalWeakTable cannot be enumerated on net471).
+    private readonly System.Collections.Generic.List<(IDirectGpuBackend Backend, IGpuBuffer Buffer)> _stridedViewLayoutBuffers = new();
+
     private static float[] AdaptivePoolMatrix(int inSize, int outSize)
     {
         var matrix = new float[checked(outSize * inSize)];

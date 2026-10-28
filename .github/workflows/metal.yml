@@ -63,6 +63,11 @@ jobs:
           --logger "console;verbosity=normal" --logger "trx;LogFileName=metal.trx" --results-directory ./metal-results \
           --blame-hang --blame-hang-timeout 600s --blame-crash
 
+    - name: Report skipped tests
+      # A skip does not fail a build, so this lane can go green without running its tests: list every skip with its reason.
+      if: always()
+      run: python3 scripts/ci/summarize-test-skips.py --title "Metal" "./metal-results/*.trx"
+
     - name: Meshgrid2D promotion gate (#921)
       if: always()
       # Gating. The hosted runner's GPU is virtualized and its timings swing 8-70%, so a spread gate never converged;

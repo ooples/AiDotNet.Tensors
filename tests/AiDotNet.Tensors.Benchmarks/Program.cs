@@ -1152,6 +1152,19 @@ class Program
             return;
         }
 
+        // #1432: VGG-16's 3x3 convolutions on OpenCL, the forward slot's pick against every candidate (paired).
+        if (args[0] == "--gpu-vgg-f43-stages")
+        {
+            GpuVggConvBench.RunF43Stages();
+            return;
+        }
+
+        if (args[0] == "--gpu-vgg-convs")
+        {
+            GpuVggConvBench.Run(args.Skip(1).ToArray());
+            return;
+        }
+
         if (args[0] == "--ab-conv2d-double")
         {
             Conv2DAbBench.RunConv2DDouble();
