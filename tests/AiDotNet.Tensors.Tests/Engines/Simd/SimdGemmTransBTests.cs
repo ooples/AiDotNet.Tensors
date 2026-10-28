@@ -24,7 +24,7 @@ public class SimdGemmTransBTests
         return a;
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(128, 512, 784)]   // the parity MLP's first-layer input gradient
     [InlineData(64, 37, 9)]       // k tail of 5; three groups of three
     [InlineData(66, 20, 7)]       // two groups of three and a single column (odd n); two scalar rows
@@ -32,6 +32,8 @@ public class SimdGemmTransBTests
     [InlineData(9, 3, 1)]         // k below one vector: all scalar tail; one column
     public void ColumnsMatchThemselvesAlone_AndADoubleReference(int m, int k, int n)
     {
+        // The direct kernels are register FMA chains with no portable form; production reaches them only behind an FMA gate.
+        Skip.IfNot(System.Runtime.Intrinsics.X86.Fma.IsSupported, "the direct GEMM kernels need FMA");
         var a = Rand(m * k, m + 3 * k);
         var b = Rand(n * k, n + 5 * k);   // stored [n, k]
         var c = new float[m * n];
