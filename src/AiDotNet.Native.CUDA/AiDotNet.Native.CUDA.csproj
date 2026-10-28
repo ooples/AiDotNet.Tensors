@@ -8,7 +8,9 @@
     <Company>AiDotNet</Company>
     <Description>Native CUDA binaries for NVIDIA GPU-accelerated operations. Provides cuBLAS + the nvRTC runtime kernel compiler required by AiDotNet.Tensors for NVIDIA GPU acceleration (no CUDA Toolkit install needed).</Description>
     <PackageTags>cuda;nvidia;gpu;blas;native;cublas;nvrtc</PackageTags>
-    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <!-- The binaries are NVIDIA's, not ours, so the package declares a licence file (NVIDIA's EULA behind a header
+         naming the files it covers) rather than an SPDX expression. WriteCudaPackageLicense below generates it. -->
+    <PackageLicenseFile>LICENSE.txt</PackageLicenseFile>
     <PackageProjectUrl>https://github.com/ooples/AiDotNet.Tensors</PackageProjectUrl>
     <RepositoryUrl>https://github.com/ooples/AiDotNet.Tensors</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
@@ -42,6 +44,20 @@
   <ItemGroup>
     <None Include="LICENSE.CUDA.txt" Pack="true" PackagePath="\" />
   </ItemGroup>
+
+  <!-- The package licence file is PACKAGE-LICENSE-HEADER.txt followed by LICENSE.CUDA.txt. It is generated rather than
+       committed so NVIDIA's text exists once, byte-identical to the archive copy tools/stage-cuda-redist.ps1 checks.
+       tools/pack-cuda-split.ps1 builds the same file for the published meta and fragment packages. -->
+  <Target Name="WriteCudaPackageLicense" BeforeTargets="_GetPackageFiles">
+    <PropertyGroup>
+      <_CudaPackageLicense>$(MSBuildProjectDirectory)\$(IntermediateOutputPath)LICENSE.txt</_CudaPackageLicense>
+      <_CudaPackageLicenseText>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)\PACKAGE-LICENSE-HEADER.txt'))$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)\LICENSE.CUDA.txt'))</_CudaPackageLicenseText>
+    </PropertyGroup>
+    <WriteLinesToFile File="$(_CudaPackageLicense)" Lines="$([MSBuild]::Escape($(_CudaPackageLicenseText)))" Overwrite="true" WriteOnlyWhenDifferent="true" />
+    <ItemGroup>
+      <None Include="$(_CudaPackageLicense)" Pack="true" PackagePath="LICENSE.txt" />
+    </ItemGroup>
+  </Target>
 
   <!-- Build targets to copy native library -->
   <ItemGroup>
