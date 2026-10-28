@@ -71,6 +71,22 @@ public partial class CpuEngine
     private protected Tensor<T> GruSequenceRecorded<T>(Tensor<T> input, Tensor<T>? h0, Tensor<T> wIh,
         Tensor<T> wHh, Tensor<T>? bIh, Tensor<T>? bHh, int batch, int seqLen, int hidden)
     {
+        if (typeof(T) == typeof(float))
+        {
+            bool recording = DifferentiableOps.IsRecording<T>();
+            var sequenceF = GruForwardFloat((Tensor<float>)(object)input, (Tensor<float>?)(object?)h0,
+                (Tensor<float>)(object)wIh, (Tensor<float>)(object)wHh, (Tensor<float>?)(object?)bIh,
+                (Tensor<float>?)(object?)bHh, batch, seqLen, hidden, recording, out var cacheF);
+            var sequenceT = (Tensor<T>)(object)sequenceF;
+            if (recording)
+            {
+                var floatInputs = GruSequenceInputs(input, h0, wIh, wHh, bIh, bHh, out var floatPresent);
+                DifferentiableOps.RecordIfActive("GruSequenceForward", sequenceT, floatInputs, GruSequenceBackwardFloat<T>,
+                    new object[] { cacheF!, floatPresent });
+            }
+            return sequenceT;
+        }
+
         GruSequenceCache cache;
         Tensor<T> sequence;
         using (new NoGradScope<T>())
@@ -281,5 +297,164 @@ public partial class CpuEngine
         for (int r = 0; r < count; r++)
             for (int c = 0; c < width; c++) sums[c] += rows[r * width + c];
         return FromDoubles<T>(sums, new[] { width });
+    }
+
+    /// <summary>The float path's saved activations, time-major so each step's rows are contiguous for the GEMMs:
+    /// allH [(T + 1), B, H], gates [T, B, 3H] (r, z, n), ghn [T, B, H], and the input [T, B, In].</summary>
+    private protected sealed class GruSequenceCacheFloat
+    {
+        internal float[] AllH = Array.Empty<float>();
+        internal float[] Gates = Array.Empty<float>();
+        internal float[] Ghn = Array.Empty<float>();
+        internal float[] InputTimeMajor = Array.Empty<float>();
+        internal int Batch, SeqLen, Input, Hidden;
+    }
+
+    // One GEMM for every step's input sums [T * B, 3H], then one [B, H] x [H, 3H] recurrent GEMM per step on the
+    // contiguous previous state, with the gate math fused into a single pass.
+    private static Tensor<float> GruForwardFloat(Tensor<float> input, Tensor<float>? h0, Tensor<float> wIh,
+        Tensor<float> wHh, Tensor<float>? bIh, Tensor<float>? bHh, int batch, int seqLen, int hidden, bool keepCache,
+        out GruSequenceCacheFloat? cache)
+    {
+        int inFeatures = input.Shape[2], g3 = 3 * hidden, rows = seqLen * batch;
+        var x = input.ToArray();
+        var xt = new float[rows * inFeatures];
+        for (int b = 0; b < batch; b++)
+            for (int t = 0; t < seqLen; t++)
+                Array.Copy(x, (b * seqLen + t) * inFeatures, xt, (t * batch + b) * inFeatures, inFeatures);
+        var wihT = new float[inFeatures * g3];
+        Simd.SimdGemm.Transpose(wIh.ToArray(), 0, inFeatures, wihT, 0, g3, g3, inFeatures);
+        var whhT = new float[hidden * g3];
+        Simd.SimdGemm.Transpose(wHh.ToArray(), 0, hidden, whhT, 0, g3, g3, hidden);
+        var gi = new float[rows * g3];
+        Simd.SimdGemm.Sgemm(xt, inFeatures, false, wihT, g3, false, gi, rows, inFeatures, g3);
+        var bi = bIh?.ToArray() ?? new float[g3];
+        var bh = bHh?.ToArray() ?? new float[g3];
+
+        var allH = new float[(seqLen + 1) * batch * hidden];
+        if (h0 is not null) Array.Copy(h0.ToArray(), allH, batch * hidden);
+        var gates = new float[rows * g3];
+        var ghn = new float[rows * hidden];
+        var y = new float[batch * seqLen * hidden];
+        // Batch rows never interact, so each chunk of them runs the whole recurrence on its own thread.
+        ForEachBatchChunk(batch, hidden, (b0, b1) =>
+        {
+            int chunk = b1 - b0;
+            var gh = new float[chunk * g3];
+            for (int t = 0; t < seqLen; t++)
+            {
+                Simd.SimdGemm.SgemmSequential(allH.AsSpan((t * batch + b0) * hidden, chunk * hidden), whhT, gh, chunk, hidden, g3);
+                for (int b = b0; b < b1; b++)
+                {
+                    int iRow = (t * batch + b) * g3, hRow = (b - b0) * g3, prev = (t * batch + b) * hidden;
+                    int next = ((t + 1) * batch + b) * hidden, outRow = (b * seqLen + t) * hidden;
+                    for (int j = 0; j < hidden; j++)
+                    {
+                        float r = 1f / (1f + MathF.Exp(-(gi[iRow + j] + bi[j] + gh[hRow + j] + bh[j])));
+                        float z = 1f / (1f + MathF.Exp(-(gi[iRow + hidden + j] + bi[hidden + j] + gh[hRow + hidden + j] + bh[hidden + j])));
+                        float hn = gh[hRow + 2 * hidden + j] + bh[2 * hidden + j];
+                        float n = MathF.Tanh(gi[iRow + 2 * hidden + j] + bi[2 * hidden + j] + r * hn);
+                        float hv = (1f - z) * n + z * allH[prev + j];
+                        gates[iRow + j] = r; gates[iRow + hidden + j] = z; gates[iRow + 2 * hidden + j] = n;
+                        ghn[prev + j] = hn;
+                        allH[next + j] = hv;
+                        y[outRow + j] = hv;
+                    }
+                }
+            }
+        });
+
+        cache = keepCache
+            ? new GruSequenceCacheFloat
+            {
+                AllH = allH, Gates = gates, Ghn = ghn, InputTimeMajor = xt,
+                Batch = batch, SeqLen = seqLen, Input = inFeatures, Hidden = hidden,
+            }
+            : null;
+        return new Tensor<float>(y, new[] { batch, seqLen, hidden });
+    }
+
+    // The float BPTT: per step the gate gradients and one [B, 3H] x [3H, H] GEMM for the recurrent term, then three
+    // GEMMs over all steps for the input and weight gradients.
+    private static void GruSequenceBackwardFloat<T>(Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var cache = (GruSequenceCacheFloat)savedState[0];
+        var present = (GruOptionalInputs)savedState[1];
+        var (input, h0, wIh, wHh, bIh, bHh) = UnpackGruSequenceInputs(inputs, present);
+        int batch = cache.Batch, seqLen = cache.SeqLen, hidden = cache.Hidden, inFeatures = cache.Input;
+        int g3 = 3 * hidden, rows = seqLen * batch;
+        var gy = ((Tensor<float>)(object)gradOutput).ToArray();
+        var whh = ((Tensor<float>)(object)wHh).ToArray();
+        var wih = ((Tensor<float>)(object)wIh).ToArray();
+        var dgi = new float[rows * g3];
+        var dgh = new float[rows * g3];
+        var dh = new float[batch * hidden];
+        ForEachBatchChunk(batch, hidden, (b0, b1) =>
+        {
+            int chunk = b1 - b0;
+            var rec = new float[chunk * hidden];
+            for (int t = seqLen - 1; t >= 0; t--)
+            {
+                for (int b = b0; b < b1; b++)
+                {
+                    int gRow = (t * batch + b) * g3, sRow = (t * batch + b) * hidden;
+                    for (int j = 0; j < hidden; j++)
+                    {
+                        float r = cache.Gates[gRow + j], z = cache.Gates[gRow + hidden + j], n = cache.Gates[gRow + 2 * hidden + j];
+                        float hn = cache.Ghn[sRow + j], hp = cache.AllH[sRow + j];
+                        float dhv = gy[(b * seqLen + t) * hidden + j] + dh[b * hidden + j];
+                        float dnp = dhv * (1f - z) * (1f - n * n);
+                        float drp = dnp * hn * r * (1f - r);
+                        float dzp = dhv * (hp - n) * z * (1f - z);
+                        dgi[gRow + j] = drp; dgi[gRow + hidden + j] = dzp; dgi[gRow + 2 * hidden + j] = dnp;
+                        dgh[gRow + j] = drp; dgh[gRow + hidden + j] = dzp; dgh[gRow + 2 * hidden + j] = dnp * r;
+                        dh[b * hidden + j] = dhv * z;
+                    }
+                }
+                Simd.SimdGemm.SgemmSequential(dgh.AsSpan((t * batch + b0) * g3, chunk * g3), whh, rec, chunk, g3, hidden);
+                for (int k = 0; k < rec.Length; k++) dh[b0 * hidden + k] += rec[k];
+            }
+        });
+
+        var gxTimeMajor = new float[rows * inFeatures];
+        Simd.SimdGemm.Sgemm(dgi, g3, false, wih, inFeatures, false, gxTimeMajor, rows, g3, inFeatures);
+        var gx = new float[batch * seqLen * inFeatures];
+        for (int b = 0; b < batch; b++)
+            for (int t = 0; t < seqLen; t++)
+                Array.Copy(gxTimeMajor, (t * batch + b) * inFeatures, gx, (b * seqLen + t) * inFeatures, inFeatures);
+        var gwih = new float[g3 * inFeatures];
+        Simd.SimdGemm.Sgemm(dgi, g3, true, cache.InputTimeMajor, inFeatures, false, gwih, g3, rows, inFeatures);
+        var gwhh = new float[g3 * hidden];
+        Simd.SimdGemm.Sgemm(dgh, g3, true, cache.AllH.AsSpan(0, rows * hidden), hidden, false, gwhh, g3, rows, hidden);
+
+        Tensor<T> Wrap(float[] data, params int[] shape) => (Tensor<T>)(object)new Tensor<float>(data, shape);
+        DifferentiableOps.AccumulateGrad(grads, input, Wrap(gx, batch, seqLen, inFeatures), engine);
+        if (h0 is not null) DifferentiableOps.AccumulateGrad(grads, h0, Wrap(dh, batch, hidden), engine);
+        DifferentiableOps.AccumulateGrad(grads, wIh, Wrap(gwih, g3, inFeatures), engine);
+        DifferentiableOps.AccumulateGrad(grads, wHh, Wrap(gwhh, g3, hidden), engine);
+        if (bIh is not null || bHh is not null)
+        {
+            var sbi = new float[g3];
+            var sbh = new float[g3];
+            for (int r = 0; r < rows; r++)
+                for (int c = 0; c < g3; c++) { sbi[c] += dgi[r * g3 + c]; sbh[c] += dgh[r * g3 + c]; }
+            if (bIh is not null) DifferentiableOps.AccumulateGrad(grads, bIh, Wrap(sbi, g3), engine);
+            if (bHh is not null) DifferentiableOps.AccumulateGrad(grads, bHh, Wrap(sbh, g3), engine);
+        }
+    }
+
+    // Splits the batch into contiguous chunks, one per worker, once a step's work is worth a thread (the LSTM path's
+    // rule of thumb); a small batch runs inline.
+    private static void ForEachBatchChunk(int batch, int hidden, Action<int, int> body)
+    {
+        int workers = Math.Min(Environment.ProcessorCount, batch / 8);
+        if (workers <= 1 || (long)batch * hidden < 4096) { body(0, batch); return; }
+        int size = (batch + workers - 1) / workers;
+        System.Threading.Tasks.Parallel.For(0, workers, w =>
+        {
+            int b0 = w * size, b1 = Math.Min(batch, b0 + size);
+            if (b0 < b1) body(b0, b1);
+        });
     }
 }

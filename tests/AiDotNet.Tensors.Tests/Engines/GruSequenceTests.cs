@@ -162,6 +162,34 @@ public sealed class GruSequenceTests
         }
     }
 
+    // The float path splits a large batch across threads (the shapes above run inline): against the double path, which
+    // is separate code, at a batch that takes the parallel route.
+    [Fact]
+    public void Cpu_FloatPathOnALargeBatch_MatchesTheDoublePath()
+    {
+        const int Batch = 64, Steps = 6, Inputs = 8, Hidden = 64;
+        Tensor<double> D(int seed, double scale, params int[] shape)
+        {
+            int n = 1; foreach (var s in shape) n *= s;
+            return new Tensor<double>(RandArray(seed, n, scale), shape);
+        }
+        var wd = new Weights<double>(D(11, 1.0, Batch, Steps, Inputs), D(12, 0.5, Batch, Hidden),
+            D(13, 0.2, 3 * Hidden, Inputs), D(14, 0.2, 3 * Hidden, Hidden), D(15, 0.2, 3 * Hidden), D(16, 0.2, 3 * Hidden));
+        var projD = D(17, 1.0, Batch, Steps, Hidden);
+        var cpu = new CpuEngine();
+
+        var yD = cpu.GruSequenceForward(wd.X, wd.H0, wd.WIh, wd.WHh, wd.BIh, wd.BHh, returnSequences: true).ToArray();
+        var wf = ToFloat(wd);
+        var yF = cpu.GruSequenceForward(wf.X, wf.H0, wf.WIh, wf.WHh, wf.BIh, wf.BHh, returnSequences: true).ToArray();
+        for (int i = 0; i < yD.Length; i++)
+            Assert.True(Math.Abs(yD[i] - yF[i]) <= 1e-4, $"y[{i}]: double {yD[i]}, float {yF[i]}.");
+
+        var gD = TapeGradients(cpu, wd, projD);
+        var gF = TapeGradients(cpu, wf, F(projD));
+        foreach (var name in gD.Keys)
+            Assert.True(Cosine(gD[name], gF[name]) >= 0.99999, $"{name}: float-path gradient cosine {Cosine(gD[name], gF[name])}.");
+    }
+
     private static DirectGpuTensorEngine? TryGpu()
     {
         try
