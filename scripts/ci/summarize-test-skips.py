@@ -77,6 +77,11 @@ def main():
         if not files:
             print(f"::error title=No test results ({args.title})::No TRX file was produced.")
             return 1
+        # A run that executed nothing (discovery matched no tests, or every test was an allowed skip) proves nothing.
+        executed = counts["Passed"] + counts["Failed"]
+        if executed == 0:
+            print(f"::error title=No tests executed ({args.title})::The result files hold no passed or failed test.")
+            return 1
         allowed = re.compile(args.allowed_skip) if args.allowed_skip else None
         unexpected = [(n, r) for n, r in skipped if not (allowed and allowed.search(r))]
         if unexpected:

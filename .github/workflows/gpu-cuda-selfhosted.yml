@@ -23,6 +23,12 @@ on:
       - 'src/AiDotNet.Tensors/Engines/DirectGpu/**'
       - 'src/AiDotNet.Tensors/Engines/DirectGpuTensorEngine*.cs'
       - 'src/AiDotNet.Tensors/Engines/Gpu/**'
+      # Shared paths that decide GPU residency and buffer lifetime: a CUDA regression there must surface before merge.
+      - 'src/AiDotNet.Tensors/Engines/TensorScope.cs'
+      - 'src/AiDotNet.Tensors/Engines/Autodiff/**'
+      - 'src/AiDotNet.Tensors/LinearAlgebra/Tensor.cs'
+      - 'src/AiDotNet.Tensors/LinearAlgebra/TensorStorage.cs'
+      - 'src/AiDotNet.Tensors/Helpers/Autotune/**'
       - '.github/workflows/gpu-cuda-selfhosted.yml'
 
 concurrency:
@@ -36,8 +42,13 @@ env:
   DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
   DOTNET_CLI_TELEMETRY_OPTOUT: true
   DOTNET_NOLOGO: true
-  # A missing device is a failure on this lane, not a skip.
-  AIDOTNET_REQUIRE_GPU_TESTS: '1'
+  # Automatic selection takes CUDA only, so a backend-agnostic test or model run cannot silently land on OpenCL (which
+  # NVIDIA's driver also provides); GpuLaneBackendTests fails the suite if the engine resolves anything else.
+  AIDOTNET_DIRECTGPU_BACKENDS: cuda
+  AIDOTNET_EXPECT_GPU_BACKEND: CUDA
+  # AIDOTNET_REQUIRE_GPU_TESTS is not set: it turns every backend's absence into a throw, and the suites include cases for
+  # HIP, Metal, Vulkan and WebGPU this runner does not have. A missing CUDA device fails here through the skip check below
+  # instead, whose exemptions name the other backends only.
 
 jobs:
   cuda:
@@ -50,12 +61,13 @@ jobs:
       run:
         shell: pwsh
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         path: AiDotNet.Tensors
+        persist-credentials: false
 
     - name: Setup .NET
-      uses: actions/setup-dotnet@v4
+      uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
       with:
         dotnet-version: '10.0.x'
         dotnet-quality: 'preview'
@@ -73,7 +85,7 @@ jobs:
       run: |
         dotnet test AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj `
           --configuration Release --no-build --framework net10.0 `
-          --filter "(FullyQualifiedName~Engines.DirectGpu|FullyQualifiedName~Engines.Autodiff|FullyQualifiedName~Engines.Compilation|FullyQualifiedName~Parity|FullyQualifiedName~GruSequence|FullyQualifiedName~FusedConv2DBatchNorm)&Category!=Benchmark&Category!=Performance" `
+          --filter "(FullyQualifiedName~GpuLaneBackend|FullyQualifiedName~Engines.DirectGpu|FullyQualifiedName~Engines.Autodiff|FullyQualifiedName~Engines.Compilation|FullyQualifiedName~Parity|FullyQualifiedName~GruSequence|FullyQualifiedName~FusedConv2DBatchNorm)&Category!=Benchmark&Category!=Performance" `
           --logger "trx;LogFilePath=${{ runner.temp }}/trx/cuda.trx" `
           --blame-hang --blame-hang-timeout 900s --blame-crash
 
@@ -83,22 +95,30 @@ jobs:
       # or a Python with torch), and explicit architecture requirements. A CUDA test skipping for any other reason fails.
       run: >-
         python AiDotNet.Tensors/scripts/ci/summarize-test-skips.py --title "CUDA" --fail-on-skip
-        --allowed-skip "(HIP|ROCm|Metal|MoltenVK|Vulkan|WebGPU|Dawn|AIDOTNET_WEBGPU_NODE_DIR|POCL|DirectML|macOS)|requires sm_|compute capability|torch|python|PARITY_PYTHON"
+        --allowed-skip "(?i)(HIP|ROCm|Metal|MoltenVK|Vulkan|WebGPU|Dawn|AIDOTNET_WEBGPU_NODE_DIR|OpenCL|POCL|DirectML|macOS)|requires sm_|compute capability|torch|python|PARITY_PYTHON"
         "${{ runner.temp }}/trx/*.trx"
 
     - name: Check out AiDotNet beside this checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         repository: ooples/AiDotNet
+        # The parity harness's model families come from ooples/AiDotNet#2381; until it merges, point this at its branch.
+        ref: ${{ vars.AIDOTNET_HARNESS_REF || 'master' }}
         path: aidn
+        persist-credentials: false
 
     - name: AiDotNet model families on CUDA (2 training steps, inference up to batch 128)
       # Builds AiDotNet against this checkout (UseLocalTensors resolves ../../AiDotNet.Tensors from aidn/src), so the
-      # model families exercise exactly this commit's kernels. Runs every family the harness defines.
+      # model families exercise exactly this commit's kernels. Every family is required: the regressions this lane exists
+      # for were in ResNet-18 / VGG-11 inference at batch 128 and MobileNetV2 training, so a harness without one fails.
       run: |
         $program = Get-Content aidn/benchmarks/AiDotNet.PyTorchParity/Program.cs -Raw
-        $families = 'mlp','cnn','lstm','transformer','gru','resnet18','resnet50','vgg11','mobilenetv2','densenet121','vit' |
-          Where-Object { $program -match ('"' + $_ + '"\s*=>') }
+        $families = 'mlp','cnn','lstm','transformer','gru','resnet18','resnet50','vgg11','mobilenetv2','densenet121','vit'
+        $missing = $families | Where-Object { $program -notmatch ('"' + $_ + '"\s*=>') }
+        if ($missing) {
+          Write-Output "::error::The AiDotNet parity harness does not define: $($missing -join ', '). Set AIDOTNET_HARNESS_REF to a ref that does (ooples/AiDotNet#2381)."
+          exit 1
+        }
         "Model families: $($families -join ', ')" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
         dotnet run -c Release --project aidn/benchmarks/AiDotNet.PyTorchParity -p:UseLocalTensors=true -- `
           --models ($families -join ',') --device cuda --epochs 1 --train-batches 2 --batch-size 64 `
@@ -107,7 +127,7 @@ jobs:
 
     - name: Upload results
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       with:
         name: gpu-cuda-results
         path: |
