@@ -1,7 +1,6 @@
 using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
-using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 using Xunit.Abstractions;
@@ -11,7 +10,8 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// <summary>
 /// AiDotNet #2384: an unmasked GPU <c>MultiHeadAttentionForward</c> looped over every (batch, head) pair with about
 /// seven launches each, so Transformer and ViT inference time grew linearly with batch (85x PyTorch at b128). It now
-/// runs the fused FlashAttention kernel once over all heads, so its launch count must not depend on the batch.
+/// attends over all heads at once (batched GEMMs, or the fused kernel for long sequences), so its launch count must
+/// not depend on the batch.
 /// </summary>
 [Collection("DirectGpuSerial")]
 public sealed class MultiHeadAttentionLaunchCountTests : IClassFixture<DirectGpuTensorEngineTestFixture>
@@ -43,8 +43,6 @@ public sealed class MultiHeadAttentionLaunchCountTests : IClassFixture<DirectGpu
         Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
         var gpu = _fixture.Engine as DirectGpuTensorEngine;
         Skip.If(gpu is null, "Not a DirectGpu engine.");
-        Skip.IfNot(gpu!.GetBackend() is IFusedAttentionBackend fused && fused.SupportsFusedAttention(Model / Heads),
-            "The backend has no fused attention kernel.");
         IEngine engine = gpu;
         var cpu = new CpuEngine();
 
