@@ -121,6 +121,28 @@ public sealed class TensorScopeTests
         Assert.Throws<InvalidOperationException>(() => intermediate.ToArray());
     }
     [SkippableFact]
+    public void InsideADeferredExecutionScope_TheReleaseWaitsForTheGraph()
+    {
+        // A recorded graph references the scope's buffers until it executes; HIP's buffers do not consult the deferral
+        // gate themselves, so the scope queues its whole release behind it.
+        using var gpu = TryEngine(out string noGpu);
+        Skip.If(gpu is null, noGpu);
+        Tensor<float> intermediate;
+        AiDotNet.Tensors.Engines.Gpu.GpuBufferReleaseDeferral.Begin();
+        try
+        {
+            using (TensorScope.Begin())
+                intermediate = Resident(gpu, 16, 3f);
+            Assert.Equal(18f, intermediate.ToArray()[15]);   // still valid: the graph has not run yet
+        }
+        finally
+        {
+            AiDotNet.Tensors.Engines.Gpu.GpuBufferReleaseDeferral.EndAndRelease();
+        }
+
+        Assert.Throws<InvalidOperationException>(() => gpu.TensorAddScalar(intermediate, 1f).ToArray());
+    }
+    [SkippableFact]
     public void KeepingAView_KeepsTheResultItViews()
     {
         using var gpu = TryEngine(out string noGpu);

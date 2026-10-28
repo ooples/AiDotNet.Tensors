@@ -2821,11 +2821,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <summary>
     /// Evicts this thread's activation-cache entries created after <paramref name="snapshot"/> (except
     /// <paramref name="protect"/>), handling entries whose only valid copy is on the device per <paramref name="mode"/>.
-    /// With <paramref name="releasableOnly"/>, only entries keyed by one of those storage keys are evicted (a
+    /// With <paramref name="releasableOnly"/>, only entries whose storage key it accepts are evicted (a
     /// <see cref="TensorScope"/> passes the storages created inside it, so a tensor that predates it is never freed).
     /// </summary>
     internal long EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect, ActivationReleaseMode mode,
-        HashSet<object>? releasableOnly = null, bool afterQueuedWork = false)
+        Func<object, bool>? releasableOnly = null, bool afterQueuedWork = false)
     {
         // The activation timestamp counter is process-wide, so "created after my snapshot"
         // also matches a CONCURRENT tape's activations on another thread. Free only THIS
@@ -2843,7 +2843,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (entries[i].Value.Timestamp <= snapshot) continue;   // pre-existing — keep
                 if (entries[i].Value.ThreadId != callerThreadId) continue; // another thread's live buffer
                 if (protect is not null && protect.Contains(entries[i].Key)) continue; // live gradient — keep
-                if (releasableOnly is not null && !releasableOnly.Contains(entries[i].Key)) continue; // predates the scope
+                if (releasableOnly is not null && !releasableOnly(entries[i].Key)) continue; // predates the scope
                 if (mode == ActivationReleaseMode.Release && Helpers.HostSync.IsRetained(entries[i].Key))
                     continue; // the caller kept it past the tape (GradientTape.Retain / returned gradients)
                 if (_activationCache.TryRemove(entries[i].Key, out var entry))
@@ -31191,9 +31191,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             outputBuffer.RelinquishOwnership();
             return result;
         }
-        catch
+        catch (Exception ex)
         {
             if (ThrowOnGpuKernelFallback) throw;
+            // Recorded, so the residency probe and fallback log see the CPU result for what it is.
+            GpuLaunchProbe.OnFallback("NativePacFeatures", ex);
             return base.NativePacFeatures(
                 waveforms, sampleRate, envelopeRate, thetaLow, thetaHigh, gammaBands);
         }

@@ -210,7 +210,7 @@ internal sealed class TensorStorage<T>
         _refCount = 1;
         // The first storage over a vector is the tensor that created it: an open TensorScope owns it (#1432). A further
         // storage over the same vector wraps an existing tensor's values, which stay their owner's.
-        if (Interlocked.Increment(ref data.LiveStorages) == 1)
+        if (Interlocked.Increment(ref data.LiveStorages) == 1 && Engines.TensorScope.Current is not null)
             Engines.TensorScope.OnStorageCreated(data, data.GetBackingArrayIdentity());
         if (shareExternalGpuCacheEpoch
             && data.TryGetBackingArrayIdentity(out var externalArray, out _)   // identity: the epoch table key
@@ -240,7 +240,8 @@ internal sealed class TensorStorage<T>
         _data = new Vector<T>(size);
         _refCount = 1;
         _data.LiveStorages = 1;
-        Engines.TensorScope.OnStorageCreated(_data, _data.GetBackingArrayIdentity());
+        if (Engines.TensorScope.Current is not null)
+            Engines.TensorScope.OnStorageCreated(_data, _data.GetBackingArrayIdentity());
     }
 
     /// <summary>

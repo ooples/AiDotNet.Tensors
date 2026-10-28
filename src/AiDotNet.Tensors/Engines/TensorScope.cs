@@ -43,11 +43,15 @@ public sealed class TensorScope : IDisposable
     private readonly HashSet<object> _kept = new(Autodiff.ReferenceEqualityComparer<object>.Instance);
     // Engines whose activation cache gained entries in this scope, with the cache timestamp from before the first one.
     private Dictionary<DirectGpuTensorEngine, long>? _activationOwners;
-    // Storage keys (vectors and host arrays) of the tensors created on this thread while the scope was open, its nested
-    // scopes' included once they end. The activation-cache release frees only entries keyed by these: a tensor that existed
-    // before the scope (a destination handed to an *Into op, a parameter written in place) is the caller's, and so is an
-    // engine cache built while the scope was suspended (a folded convolution kernel).
-    private HashSet<object>? _created;
+    // Storage keys (vectors and host arrays) of the tensors created on this thread while the scope, or a scope nested in it,
+    // was open. The activation-cache release frees only entries keyed by these: a tensor that existed before the scope (a
+    // destination handed to an *Into op, a parameter written in place) is the caller's, and so is an engine cache built while
+    // the scope was suspended (a folded convolution kernel). Held weakly: a whole inference call's intermediates, host
+    // arrays included, stay collectable while the scope is open.
+    private readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, object> _created = new();
+    // Declared before s_mark: static fields initialize in order, and the callback returns it.
+    private static readonly object s_marker = new();
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, object>.CreateValueCallback s_mark = _ => s_marker;
     private bool _disposed;
 
     private TensorScope(TensorScope? outer)
@@ -108,16 +112,19 @@ public sealed class TensorScope : IDisposable
     }
     /// <summary>
     /// Records a tensor storage created on this thread (its vector, and its host array when it has one) with the innermost
-    /// open scope, if any. Called by every new storage, so it costs one thread-static read when no scope is open.
+    /// open scope and each scope enclosing it. Callers check <see cref="Current"/> first, so a storage made with no scope
+    /// open costs one thread-static read.
     /// </summary>
     internal static void OnStorageCreated(object vector, object? array)
     {
-        var scope = s_current;
-        if (scope is null) return;
-        scope._created ??= new HashSet<object>(Autodiff.ReferenceEqualityComparer<object>.Instance);
-        scope._created.Add(vector);
-        if (array is not null) scope._created.Add(array);
+        for (var scope = s_current; scope is not null; scope = scope._outer)
+        {
+            scope._created.GetValue(vector, s_mark);
+            if (array is not null) scope._created.GetValue(array, s_mark);
+        }
     }
+
+    private bool Created(object key) => _created.TryGetValue(key, out _);
 
     /// <summary>Records a GPU result created on this thread with the innermost open scope, if any.</summary>
     internal static void Track(object storage, Action release)
@@ -160,26 +167,25 @@ public sealed class TensorScope : IDisposable
                 "TensorScope disposed out of order or on another thread: dispose nested scopes innermost first, on the thread that began them.");
         _disposed = true;
         s_current = _outer;
+        // Inside a deferred-execution scope the recorded graph still references these buffers until it executes, and not every
+        // backend's buffers consult the deferral gate on disposal (HIP's do not): queue the whole release behind the graph.
+        if (!Gpu.GpuBufferReleaseDeferral.TryDefer(Release)) Release();
+    }
+
+    private void Release()
+    {
         foreach (var release in _results.Values) release();
         _results.Clear();
-        var created = _created;
-        _created = null;
-        if (_activationOwners is not null && created is not null)
+        if (_activationOwners is not null)
         {
             // The kept results of enclosing scopes are this scope's results too until they end: spare them all.
             var spared = new HashSet<object>(_kept, Autodiff.ReferenceEqualityComparer<object>.Instance);
             for (var outer = _outer; outer is not null; outer = outer._outer) spared.UnionWith(outer._kept);
             foreach (var owner in _activationOwners)
                 owner.Key.EvictActivationsCreatedAfter(owner.Value, spared, ActivationReleaseMode.Release,
-                    releasableOnly: created, afterQueuedWork: true);
+                    releasableOnly: Created, afterQueuedWork: true);
         }
         _activationOwners = null;
-        // What this scope created and kept is the enclosing scope's to free when it ends, unless it is kept there too.
-        if (created is not null && _outer is not null)
-        {
-            _outer._created ??= new HashSet<object>(Autodiff.ReferenceEqualityComparer<object>.Instance);
-            _outer._created.UnionWith(created);
-        }
     }
 
     private void ThrowIfDisposed()
