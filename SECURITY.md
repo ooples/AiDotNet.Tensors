@@ -23,14 +23,41 @@ Security fixes are made on `main` and shipped in the next release of the package
 In scope: the managed code in this repository, the build and release workflows, and the packaging of the native
 runtime packages. Vulnerabilities in a redistributed third-party native binary (CLBlast, oneDNN, MoltenVK, the NVIDIA
 CUDA runtime, AMD ROCm) should also be reported upstream to that vendor; please tell us as well so the redistributed
-version can be updated. Each native package records the exact upstream version and SHA-256 of every binary it ships in
-its `NATIVE-MANIFEST.json`.
+version can be updated. Each native package records the SHA-256 of every binary it ships, and its upstream version, in its
+`NATIVE-MANIFEST.json`. One binary states no version: `hipblas.dll` in `AiDotNet.Native.ROCm` has no version
+resource or string, so its manifest entry names the release it was taken from (the AMD HIP SDK for Windows 6.4, whose
+hipBLAS is 2.4.0); its SHA-256 identifies the exact file.
 
 ## Release integrity
 
 Starting with the first release built after this policy was added, release packages carry a GitHub build-provenance
-attestation and a CycloneDX SBOM is attached to each GitHub release. Verify a downloaded package with:
+attestation and a CycloneDX SBOM is attached to each GitHub release.
+
+The attestation covers the package bytes the release workflow built and signed, which are the `.nupkg` assets
+attached to the GitHub release. Verify one with:
 
 ```
+gh release download v<version> --repo ooples/AiDotNet.Tensors --pattern "AiDotNet.Tensors.<version>.nupkg"
 gh attestation verify AiDotNet.Tensors.<version>.nupkg --repo ooples/AiDotNet.Tensors
 ```
+
+A package downloaded from NuGet.org does not verify this way: NuGet.org adds its repository signature, which rewrites
+the package's `.signature.p7s` entry and so its bytes. Its contents are unchanged, so check a NuGet download against
+the attested release asset by comparing every entry except `.signature.p7s`. For example, in PowerShell:
+
+```
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+function Get-EntryHashes($path) {
+  $zip = [IO.Compression.ZipFile]::OpenRead((Resolve-Path $path))
+  try {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $zip.Entries | Where-Object { $_.FullName -ne '.signature.p7s' } | Sort-Object FullName | ForEach-Object {
+      $s = $_.Open(); try { '{0} {1}' -f $_.FullName, [Convert]::ToHexString($sha.ComputeHash($s)) } finally { $s.Dispose() }
+    }
+  } finally { $zip.Dispose() }
+}
+Compare-Object (Get-EntryHashes attested/AiDotNet.Tensors.<version>.nupkg) (Get-EntryHashes nuget/aidotnet.tensors.<version>.nupkg)
+```
+
+No output means the NuGet package holds exactly the attested contents. `dotnet nuget verify --all <package>` then
+checks the NuGet download's own signatures.

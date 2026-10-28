@@ -73,7 +73,11 @@ These packages are published to [nuget.org](https://www.nuget.org/profiles/oople
 
 Each `AiDotNet.Native.*` package carries the upstream licence text of what it
 redistributes and a `NATIVE-MANIFEST.json` listing the upstream version, licence and
-SHA-256 of every native file. The one exception is the Windows HIP runtime in
+SHA-256 of every native file. For CUDA, the licence and manifest are in the
+`AiDotNet.Native.CUDA` package itself: its `AiDotNet.Native.CUDA.Fragments.N` dependencies
+carry only byte chunks of the DLLs, which the meta package reassembles and whose SHA-256
+the manifest records. `hipblas.dll` in `AiDotNet.Native.ROCm` states no version of its own,
+so its entry names the HIP SDK release it came from. The one licence exception is the Windows HIP runtime in
 `AiDotNet.Native.ROCm` (`amdhip64_6.dll`): it is closed source under AMD's HIP SDK
 licence, which AMD does not publish as a text file, so its text is not bundled; the
 package's `LICENSE.txt` names the binary, its version and SHA-256, and where AMD shows
