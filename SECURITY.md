@@ -33,16 +33,22 @@ hipBLAS is 2.4.0); its SHA-256 identifies the exact file.
 Starting with the first release built after this policy was added, release packages carry a GitHub build-provenance
 attestation and a CycloneDX SBOM is attached to each GitHub release.
 
-The attestation covers the package bytes the release workflow built and signed, which are the `.nupkg` assets
-attached to the GitHub release. Verify one with:
+The attestation covers the package bytes the release workflow built, which are the `.nupkg` assets attached to the
+GitHub release. It signs a provenance statement about those bytes, not the package itself. The release code-signs the
+packages only when its signing certificate is configured, so check a package's own signature separately with
+`dotnet nuget verify --all <package>` (below). Verify a release asset's provenance with:
 
 ```
 gh release download v<version> --repo ooples/AiDotNet.Tensors --pattern "AiDotNet.Tensors.<version>.nupkg"
-gh attestation verify AiDotNet.Tensors.<version>.nupkg --repo ooples/AiDotNet.Tensors
+gh attestation verify AiDotNet.Tensors.<version>.nupkg --repo ooples/AiDotNet.Tensors \
+  --signer-workflow ooples/AiDotNet.Tensors/.github/workflows/attest-release.yml
 ```
 
-A package downloaded from NuGet.org does not verify this way: NuGet.org adds its repository signature, which rewrites
-the package's `.signature.p7s` entry and so its bytes. Its contents are unchanged, so check a NuGet download against
+`--signer-workflow` accepts only attestations made by the release's attestation workflow, not by any workflow in the
+repository.
+
+A package downloaded from NuGet.org does not verify this way: NuGet.org adds its repository signature in the package's
+`.signature.p7s` entry (creating it, or extending the author signature), which changes its bytes. Its contents are unchanged, so check a NuGet download against
 the attested release asset by comparing every entry except `.signature.p7s`. For example, in PowerShell:
 
 ```
@@ -52,12 +58,13 @@ function Get-EntryHashes($path) {
   try {
     $sha = [Security.Cryptography.SHA256]::Create()
     $zip.Entries | Where-Object { $_.FullName -ne '.signature.p7s' } | Sort-Object FullName | ForEach-Object {
-      $s = $_.Open(); try { '{0} {1}' -f $_.FullName, [Convert]::ToHexString($sha.ComputeHash($s)) } finally { $s.Dispose() }
+      $s = $_.Open(); try { '{0} {1}' -f $_.FullName, [BitConverter]::ToString($sha.ComputeHash($s)).Replace('-', '') } finally { $s.Dispose() }
     }
   } finally { $zip.Dispose() }
 }
 Compare-Object (Get-EntryHashes attested/AiDotNet.Tensors.<version>.nupkg) (Get-EntryHashes nuget/aidotnet.tensors.<version>.nupkg)
 ```
 
-No output means the NuGet package holds exactly the attested contents. `dotnet nuget verify --all <package>` then
-checks the NuGet download's own signatures.
+It runs in Windows PowerShell 5.1 and PowerShell 7. No output means the NuGet package holds exactly the attested
+contents. `dotnet nuget verify --all <package>` then checks the package's signatures: NuGet.org's repository signature,
+and the author signature when the release was code-signed.

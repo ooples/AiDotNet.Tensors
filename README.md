@@ -393,7 +393,7 @@ If CUDA is not available, you'll get detailed troubleshooting steps explaining e
 
 ## Requirements
 
-- .NET 8.0 or later, .NET Framework 4.6.2 or later, or another .NET Standard 2.0 runtime
+- .NET 8.0 or later, .NET Framework 4.6.2 or later, or another runtime that implements .NET Standard 2.0
 - Windows x64, Linux x64, or macOS x64/arm64
 
 ## License
