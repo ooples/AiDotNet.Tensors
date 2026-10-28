@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // #409 (S.3 verification step #2): confirm the compute-bound FP32 path that the
 // issue cares about (BERT/GPT2/ViT FFN-shaped GEMMs) routes through the machine-code
 // 6x16 microkernel — NOT the load-bound C# Avx2Fp32_8x8 (8x8) kernel — by measuring

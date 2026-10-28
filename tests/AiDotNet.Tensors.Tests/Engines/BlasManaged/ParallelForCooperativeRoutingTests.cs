@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CpuParallelSettings.ParallelForOrSerial routes its parallel path through the persistent
 // worker pool (PersistentParallelExecutor) instead of raw Parallel.For when UseCooperativePool
 // is on (the default). These pin that the routing is a pure scheduling change — bit-identical

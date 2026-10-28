@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // #477: per-component breakdown of the float LstmSequenceForward at the AIsEval
 // workload, each piece timed in isolation at its real shape with MIN-of-many, so
 // the remaining gap to torch (~2.78ms) is attacked where the cycles actually are

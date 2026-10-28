@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // #409 S.4 follow-through: PackAOnlyStrategy must compute correct results for ANY (m, n),
 // including m % mr != 0 and n % nr != 0. Previously it threw NotSupportedException for the
 // remainder; that surfaced on CI as a hard failure when BlasManaged.Gemm split with one mr
