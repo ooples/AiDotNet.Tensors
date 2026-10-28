@@ -23,7 +23,8 @@ namespace AiDotNet.Tensors.Engines;
 /// </code>
 /// <para>
 /// Every GPU result created on this thread while the scope is open belongs to it, including a layer's cached input or
-/// a result handed to a gradient tape. Reading one after the scope ends throws an
+/// a result handed to a gradient tape. A tensor that existed before the scope stays its owner's even when an op inside
+/// the scope writes it (a destination handed to an *Into op). Reading a freed result after the scope ends throws an
 /// <see cref="InvalidOperationException"/>; it never returns stale data. Keep what outlives the scope, and do not run
 /// a backward pass across a scope's end. Scopes nest: <see cref="Keep{T}"/> inside a nested scope hands the result to
 /// the enclosing one, which frees it when it ends unless it is kept there too. Results on the CPU are unaffected.
@@ -42,6 +43,11 @@ public sealed class TensorScope : IDisposable
     private readonly HashSet<object> _kept = new(Autodiff.ReferenceEqualityComparer<object>.Instance);
     // Engines whose activation cache gained entries in this scope, with the cache timestamp from before the first one.
     private Dictionary<DirectGpuTensorEngine, long>? _activationOwners;
+    // Storage keys (vectors and host arrays) of the tensors created on this thread while the scope was open, its nested
+    // scopes' included once they end. The activation-cache release frees only entries keyed by these: a tensor that existed
+    // before the scope (a destination handed to an *Into op, a parameter written in place) is the caller's, and so is an
+    // engine cache built while the scope was suspended (a folded convolution kernel).
+    private HashSet<object>? _created;
     private bool _disposed;
 
     private TensorScope(TensorScope? outer)
@@ -100,6 +106,19 @@ public sealed class TensorScope : IDisposable
         internal SuspendHandle(TensorScope? suspended) => _suspended = suspended;
         public void Dispose() => s_current = _suspended;
     }
+    /// <summary>
+    /// Records a tensor storage created on this thread (its vector, and its host array when it has one) with the innermost
+    /// open scope, if any. Called by every new storage, so it costs one thread-static read when no scope is open.
+    /// </summary>
+    internal static void OnStorageCreated(object vector, object? array)
+    {
+        var scope = s_current;
+        if (scope is null) return;
+        scope._created ??= new HashSet<object>(Autodiff.ReferenceEqualityComparer<object>.Instance);
+        scope._created.Add(vector);
+        if (array is not null) scope._created.Add(array);
+    }
+
     /// <summary>Records a GPU result created on this thread with the innermost open scope, if any.</summary>
     internal static void Track(object storage, Action release)
     {
@@ -143,14 +162,23 @@ public sealed class TensorScope : IDisposable
         s_current = _outer;
         foreach (var release in _results.Values) release();
         _results.Clear();
-        if (_activationOwners is not null)
+        var created = _created;
+        _created = null;
+        if (_activationOwners is not null && created is not null)
         {
             // The kept results of enclosing scopes are this scope's results too until they end: spare them all.
             var spared = new HashSet<object>(_kept, Autodiff.ReferenceEqualityComparer<object>.Instance);
             for (var outer = _outer; outer is not null; outer = outer._outer) spared.UnionWith(outer._kept);
             foreach (var owner in _activationOwners)
-                owner.Key.EvictActivationsCreatedAfter(owner.Value, spared, ActivationReleaseMode.Release);
-            _activationOwners = null;
+                owner.Key.EvictActivationsCreatedAfter(owner.Value, spared, ActivationReleaseMode.Release,
+                    releasableOnly: created, afterQueuedWork: true);
+        }
+        _activationOwners = null;
+        // What this scope created and kept is the enclosing scope's to free when it ends, unless it is kept there too.
+        if (created is not null && _outer is not null)
+        {
+            _outer._created ??= new HashSet<object>(Autodiff.ReferenceEqualityComparer<object>.Instance);
+            _outer._created.UnionWith(created);
         }
     }
 

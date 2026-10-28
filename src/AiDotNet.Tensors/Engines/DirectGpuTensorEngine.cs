@@ -2756,7 +2756,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// pool at once. Only a tensor covering its whole vector qualifies, so the buffer is the vector's own. Its pending
     /// download is replaced by the released-intermediate error, so a read that should not happen fails loudly.
     /// </summary>
-    internal void ReleaseDeadDeviceStorage<T>(Tensor<T> tensor)
+    internal void ReleaseDeadDeviceStorage<T>(Tensor<T> tensor, bool afterQueuedWork = false)
     {
         var vector = tensor.DataVector;
         if (vector._deviceState is not { Buffer: { } buffer } state) return;
@@ -2768,7 +2768,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (tensor.GetBackingArrayForCacheLookupUnsafe() is { } array) Helpers.HostSync.Release(array, ReleasedIntermediateMessage);
         state.Buffer = null;
         state.DeviceValid = false;
-        buffer.Dispose();
+        if (afterQueuedWork && tensor._gpuBackend is IQueuedBufferRelease queued) queued.ReleaseAfterQueuedWork(buffer);
+        else buffer.Dispose();
     }
 
     internal void DetachToTensorLifetime(IEnumerable<object> keys)
@@ -2820,8 +2821,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <summary>
     /// Evicts this thread's activation-cache entries created after <paramref name="snapshot"/> (except
     /// <paramref name="protect"/>), handling entries whose only valid copy is on the device per <paramref name="mode"/>.
+    /// With <paramref name="releasableOnly"/>, only entries keyed by one of those storage keys are evicted (a
+    /// <see cref="TensorScope"/> passes the storages created inside it, so a tensor that predates it is never freed).
     /// </summary>
-    internal long EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect, ActivationReleaseMode mode)
+    internal long EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect, ActivationReleaseMode mode,
+        HashSet<object>? releasableOnly = null, bool afterQueuedWork = false)
     {
         // The activation timestamp counter is process-wide, so "created after my snapshot"
         // also matches a CONCURRENT tape's activations on another thread. Free only THIS
@@ -2839,6 +2843,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (entries[i].Value.Timestamp <= snapshot) continue;   // pre-existing — keep
                 if (entries[i].Value.ThreadId != callerThreadId) continue; // another thread's live buffer
                 if (protect is not null && protect.Contains(entries[i].Key)) continue; // live gradient — keep
+                if (releasableOnly is not null && !releasableOnly.Contains(entries[i].Key)) continue; // predates the scope
                 if (mode == ActivationReleaseMode.Release && Helpers.HostSync.IsRetained(entries[i].Key))
                     continue; // the caller kept it past the tape (GradientTape.Retain / returned gradients)
                 if (_activationCache.TryRemove(entries[i].Key, out var entry))
@@ -2872,7 +2877,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
         }
         long released = 0;
-        foreach (var entry in toDispose) { released += entry.Buffer.SizeInBytes; entry.Dispose(); }
+        foreach (var entry in toDispose)
+        {
+            released += entry.Buffer.SizeInBytes;
+            // A scope ends while work that reads its results can still be queued: each backend frees after that work (CUDA:
+            // stream-ordered), as TryFreeActivationByKey does, so the pool cannot hand the buffer to a later kernel early.
+            if (afterQueuedWork && entry.Backend is IQueuedBufferRelease queued) queued.ReleaseAfterQueuedWork(entry.Buffer);
+            else entry.Dispose();
+        }
         return released;
     }
 
@@ -4341,7 +4353,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // (GradientTape.ReleaseDroppedGradients).
         if (TrackOwnedResultBytes) TrackOwnedResult(outputBuffer);
         // Inside a TensorScope the result is freed when the scope ends unless kept (#1432), not when the GC finalizes it.
-        if (TensorScope.Current is not null) TensorScope.Track(vector, () => ReleaseDeadDeviceStorage(tensor));
+        if (TensorScope.Current is not null) TensorScope.Track(vector, () => ReleaseDeadDeviceStorage(tensor, afterQueuedWork: true));
         return tensor;
     }
 

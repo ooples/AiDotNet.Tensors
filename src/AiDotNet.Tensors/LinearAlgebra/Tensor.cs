@@ -3762,7 +3762,15 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
                 Engines.TensorScope.Track(scopedVector, () =>
                 {
                     Helpers.HostSync.Release(scopedVector, Engines.DirectGpuTensorEngine.ReleasedIntermediateMessage);
-                    scopedStorage.DisposeGpuBufferOwner();
+                    // After the work already queued on the backend (CUDA: stream-ordered), so the pool cannot hand the buffer to a
+                    // later kernel while one that reads this result is still pending.
+                    scopedStorage.DisposeGpuBufferOwner(owner =>
+                    {
+                        if (owner is Engines.DirectGpu.IGpuBuffer gpuBuffer && backend is Engines.DirectGpu.IQueuedBufferRelease queued)
+                            queued.ReleaseAfterQueuedWork(gpuBuffer);
+                        else
+                            owner.Dispose();
+                    });
                     tensor._gpuBuffer = null;
                 });
             }

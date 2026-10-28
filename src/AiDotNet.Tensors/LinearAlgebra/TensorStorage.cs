@@ -208,7 +208,10 @@ internal sealed class TensorStorage<T>
     {
         _data = data ?? throw new ArgumentNullException(nameof(data));
         _refCount = 1;
-        Interlocked.Increment(ref data.LiveStorages);
+        // The first storage over a vector is the tensor that created it: an open TensorScope owns it (#1432). A further
+        // storage over the same vector wraps an existing tensor's values, which stay their owner's.
+        if (Interlocked.Increment(ref data.LiveStorages) == 1)
+            Engines.TensorScope.OnStorageCreated(data, data.GetBackingArrayIdentity());
         if (shareExternalGpuCacheEpoch
             && data.TryGetBackingArrayIdentity(out var externalArray, out _)   // identity: the epoch table key
             && externalArray is not null)
@@ -237,6 +240,7 @@ internal sealed class TensorStorage<T>
         _data = new Vector<T>(size);
         _refCount = 1;
         _data.LiveStorages = 1;
+        Engines.TensorScope.OnStorageCreated(_data, _data.GetBackingArrayIdentity());
     }
 
     /// <summary>
@@ -333,7 +337,19 @@ internal sealed class TensorStorage<T>
     /// Frees the attached GPU buffer owner now, ahead of the last reference (a TensorScope ending). Later releases find
     /// no owner and free nothing twice.
     /// </summary>
-    internal void DisposeGpuBufferOwner() => Interlocked.Exchange(ref _gpuBufferOwner, null)?.Dispose();
+    internal void DisposeGpuBufferOwner() => DisposeGpuBufferOwner(null);
+
+    /// <summary>
+    /// Detaches the owned GPU buffer and frees it through <paramref name="release"/> when given (a backend's release after
+    /// its queued work), else disposes it.
+    /// </summary>
+    internal void DisposeGpuBufferOwner(Action<IDisposable>? release)
+    {
+        var owner = Interlocked.Exchange(ref _gpuBufferOwner, null);
+        if (owner is null) return;
+        if (release is null) owner.Dispose();
+        else release(owner);
+    }
 
     /// <summary>Releases resources only after the caller has installed replacement storage.</summary>
     internal void DisposeClaimedOwners()
