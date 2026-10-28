@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Correctness tests for the HIP paged-attention decode kernel (P1), validated against a standard-
 // attention CPU oracle. Skips without a ROCm device; runs on a ROCm host / CI.
 

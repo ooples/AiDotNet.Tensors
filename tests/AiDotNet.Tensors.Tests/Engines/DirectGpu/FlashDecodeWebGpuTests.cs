@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Correctness tests for the WebGPU fused decode-attention kernel (P2, FlashDecoding), validated against a
 // standard-attention CPU oracle. Skips without a WebGPU device.
 

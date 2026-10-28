@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 //
 // Reflection-driven differential correctness harness for the DirectGpu backend.
 //
