@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Submission without waiting (#1191): a dispatch is submitted and the caller returns; the wait happens when a
 // result is read on the host. Coalescing (#1192): consecutive dispatches are recorded into one command buffer and
 // submitted together.

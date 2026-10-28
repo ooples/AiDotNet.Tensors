@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // GLSL compute kernels for the Vulkan conv/pool family (issue #646). Each is a 1D-flattened port of the
 // corresponding VERIFIED OpenCL kernel (one thread per output element; index decoded from gl_GlobalInvocationID.x),
 // so the math matches the OpenCL/CUDA references. Dispatched via VulkanBackend.TryDispatchConvPoolGlsl with the
