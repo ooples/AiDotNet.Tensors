@@ -10,10 +10,11 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 /// <summary>
-/// The shared gru_p_ kernels (#1568) on each backend, through the launcher the engine uses
-/// (<see cref="IFusedLstmSequenceTraining.StatefulLstmLauncher"/>), against a CPU forward and BPTT in double: PyTorch
-/// nn.GRU gate order (r, z, n), the reset gate applied to the recurrent term after its bias, a nonzero h0, and the
-/// gradients of the input, h0, both weights and both biases.
+/// The shared gru_p_ / gru_rb_ kernels (#1568) on each backend, through the launcher the engine uses
+/// (<see cref="IFusedLstmSequenceTraining.StatefulLstmLauncher"/>), against a CPU forward and BPTT in double: nn.GRU's
+/// gate order (r, z, n), a nonzero h0, the gradients of the input, h0, both weights and both biases, and both
+/// placements of the reset gate (after the recurrent sum, PyTorch; before the recurrent product, Cho et al. / Keras
+/// reset_after=False).
 /// </summary>
 [Collection("DirectGpuSerial")]
 public sealed class GruSequenceBackendParityTests
@@ -37,26 +38,36 @@ public sealed class GruSequenceBackendParityTests
     private sealed record Expected(double[] Y, double[] GIn, double[] GH0, double[] GWih, double[] GWhh, double[] GBih, double[] GBhh);
 
     private static Expected Reference(float[] x, float[] h0, float[] wih, float[] whh, float[] bih, float[] bhh, float[] gy,
-        int bN, int tN, int inN, int hN)
+        int bN, int tN, int inN, int hN, bool resetAfter)
     {
         var y = new double[bN * tN * hN];
         var hs = new double[bN, tN + 1, hN];
-        var r = new double[bN, tN, hN]; var z = new double[bN, tN, hN]; var n = new double[bN, tN, hN]; var hn = new double[bN, tN, hN];
+        var r = new double[bN, tN, hN]; var z = new double[bN, tN, hN]; var n = new double[bN, tN, hN];
+        var hn = new double[bN, tN, hN]; var rh = new double[bN, tN, hN];
         for (int b = 0; b < bN; b++)
         {
             for (int h = 0; h < hN; h++) hs[b, 0, h] = h0[b * hN + h];
             for (int t = 0; t < tN; t++)
+            {
+                double In(int row) { double s = bih[row]; for (int i = 0; i < inN; i++) s += (double)wih[row * inN + i] * x[(b * tN + t) * inN + i]; return s; }
                 for (int h = 0; h < hN; h++)
                 {
-                    double In(int g) { int row = g * hN + h; double s = bih[row]; for (int i = 0; i < inN; i++) s += (double)wih[row * inN + i] * x[(b * tN + t) * inN + i]; return s; }
-                    double Hd(int g) { int row = g * hN + h; double s = bhh[row]; for (int j = 0; j < hN; j++) s += (double)whh[row * hN + j] * hs[b, t, j]; return s; }
-                    r[b, t, h] = 1 / (1 + Math.Exp(-(In(0) + Hd(0))));
-                    z[b, t, h] = 1 / (1 + Math.Exp(-(In(1) + Hd(1))));
-                    hn[b, t, h] = Hd(2);
-                    n[b, t, h] = Math.Tanh(In(2) + r[b, t, h] * hn[b, t, h]);
-                    y[(b * tN + t) * hN + h] = (1 - z[b, t, h]) * n[b, t, h] + z[b, t, h] * hs[b, t, h];
-                    if (h == hN - 1) for (int k = 0; k < hN; k++) hs[b, t + 1, k] = y[(b * tN + t) * hN + k];
+                    double sr = bhh[h], sz = bhh[hN + h];
+                    for (int j = 0; j < hN; j++) { sr += (double)whh[h * hN + j] * hs[b, t, j]; sz += (double)whh[(hN + h) * hN + j] * hs[b, t, j]; }
+                    r[b, t, h] = 1 / (1 + Math.Exp(-(In(h) + sr)));
+                    z[b, t, h] = 1 / (1 + Math.Exp(-(In(hN + h) + sz)));
+                    rh[b, t, h] = r[b, t, h] * hs[b, t, h];
                 }
+                for (int h = 0; h < hN; h++)
+                {
+                    double s = bhh[2 * hN + h];
+                    for (int j = 0; j < hN; j++) s += (double)whh[(2 * hN + h) * hN + j] * (resetAfter ? hs[b, t, j] : rh[b, t, j]);
+                    hn[b, t, h] = s;
+                    n[b, t, h] = Math.Tanh(In(2 * hN + h) + (resetAfter ? r[b, t, h] * s : s));
+                    y[(b * tN + t) * hN + h] = (1 - z[b, t, h]) * n[b, t, h] + z[b, t, h] * hs[b, t, h];
+                }
+                for (int h = 0; h < hN; h++) hs[b, t + 1, h] = y[(b * tN + t) * hN + h];
+            }
         }
 
         var gIn = new double[bN * tN * inN]; var gH0 = new double[bN * hN];
@@ -72,15 +83,36 @@ public sealed class GruSequenceBackendParityTests
                 {
                     double dhv = gy[(b * tN + t) * hN + h] + dhNext[h];
                     double dnp = dhv * (1 - z[b, t, h]) * (1 - n[b, t, h] * n[b, t, h]);
-                    double drp = dnp * hn[b, t, h] * r[b, t, h] * (1 - r[b, t, h]);
                     double dzp = dhv * (hs[b, t, h] - n[b, t, h]) * z[b, t, h] * (1 - z[b, t, h]);
-                    dgi[h] = drp; dgi[hN + h] = dzp; dgi[2 * hN + h] = dnp;
-                    dgh[h] = drp; dgh[hN + h] = dzp; dgh[2 * hN + h] = dnp * r[b, t, h];
+                    dgi[hN + h] = dzp; dgh[hN + h] = dzp; dgi[2 * hN + h] = dnp;
+                    if (resetAfter)
+                    {
+                        double drp = dnp * hn[b, t, h] * r[b, t, h] * (1 - r[b, t, h]);
+                        dgi[h] = drp; dgh[h] = drp; dgh[2 * hN + h] = dnp * r[b, t, h];
+                    }
+                    else
+                    {
+                        dgh[2 * hN + h] = dnp;
+                    }
                     dh[h] = dhv * z[b, t, h];
                 }
+                if (!resetAfter)
+                    for (int k = 0; k < hN; k++)
+                    {
+                        double drh = 0;
+                        for (int j = 0; j < hN; j++) drh += dgh[2 * hN + j] * whh[(2 * hN + j) * hN + k];
+                        double drp = drh * hs[b, t, k] * r[b, t, k] * (1 - r[b, t, k]);
+                        dgi[k] = drp; dgh[k] = drp;
+                        dh[k] += drh * r[b, t, k];
+                    }
+                int hRows = resetAfter ? 3 * hN : 2 * hN;
                 for (int row = 0; row < 3 * hN; row++)
                 {
-                    for (int j = 0; j < hN; j++) { dh[j] += dgh[row] * whh[row * hN + j]; gWhh[row * hN + j] += dgh[row] * hs[b, t, j]; }
+                    for (int j = 0; j < hN; j++)
+                    {
+                        if (row < hRows) dh[j] += dgh[row] * whh[row * hN + j];
+                        gWhh[row * hN + j] += dgh[row] * (row < hRows ? hs[b, t, j] : rh[b, t, j]);
+                    }
                     for (int i = 0; i < inN; i++)
                     {
                         gIn[(b * tN + t) * inN + i] += dgi[row] * wih[row * inN + i];
@@ -97,7 +129,7 @@ public sealed class GruSequenceBackendParityTests
 
     private static void AssertClose(double[] expected, float[] actual, string what)
     {
-        Assert.Equal(expected.Length, actual.Length < expected.Length ? actual.Length : expected.Length);
+        Assert.True(actual.Length >= expected.Length, $"{what}: {actual.Length} values for {expected.Length} expected.");
         for (int i = 0; i < expected.Length; i++)
             Assert.True(Math.Abs(expected[i] - actual[i]) <= 2e-4 + 2e-3 * Math.Abs(expected[i]),
                 $"{what}[{i}]: expected {expected[i]}, got {actual[i]}.");
@@ -105,23 +137,25 @@ public sealed class GruSequenceBackendParityTests
 
     private static void Check(IDirectGpuBackend backend, PortableGenericFft.Launcher launch)
     {
+        foreach (bool resetAfter in new[] { true, false })
         foreach (var (bN, tN, inN, hN) in Shapes)
         {
             var x = Values(bN * tN * inN, 1, 0.05f); var h0 = Values(bN * hN, 9, 0.04f);
             var wih = Values(3 * hN * inN, 2, 0.03f); var whh = Values(3 * hN * hN, 3, 0.03f);
             var bih = Values(3 * hN, 4, 0.02f); var bhh = Values(3 * hN, 6, 0.025f);
             var gy = Values(bN * tN * hN, 5, 0.1f);
-            var e = Reference(x, h0, wih, whh, bih, bhh, gy, bN, tN, inN, hN);
-            string shape = $"B={bN} T={tN} In={inN} H={hN}";
-            var (allHSize, gatesSize, ghnSize) = PortableGruSequence.CacheSizes(tN, bN, hN);
+            var e = Reference(x, h0, wih, whh, bih, bhh, gy, bN, tN, inN, hN, resetAfter);
+            string shape = $"B={bN} T={tN} In={inN} H={hN} resetAfter={resetAfter}";
+            var (allHSize, gatesSize, ghnSize, rhSize) = PortableGruSequence.CacheSizes(tN, bN, hN);
 
             using var bx = backend.AllocateBuffer(x); using var bh0 = backend.AllocateBuffer(h0);
             using var bwih = backend.AllocateBuffer(wih); using var bwhh = backend.AllocateBuffer(whh);
             using var bbih = backend.AllocateBuffer(bih); using var bbhh = backend.AllocateBuffer(bhh);
             using var y = backend.AllocateBuffer(bN * tN * hN);
             using var allH = backend.AllocateBuffer(allHSize); using var gates = backend.AllocateBuffer(gatesSize);
-            using var ghn = backend.AllocateBuffer(ghnSize);
-            PortableGruSequence.Forward(backend, launch, bx, bh0, bwih, bwhh, bbih, bbhh, y, allH, gates, ghn, tN, bN, inN, hN);
+            using var ghn = backend.AllocateBuffer(ghnSize); using var rh = backend.AllocateBuffer(rhSize);
+            PortableGruSequence.Forward(backend, launch, bx, bh0, bwih, bwhh, bbih, bbhh, y, allH, gates, ghn, rh,
+                tN, bN, inN, hN, resetAfter);
             AssertClose(e.Y, backend.DownloadBuffer(y), $"{shape} output");
 
             using var bgy = backend.AllocateBuffer(gy);
@@ -132,8 +166,8 @@ public sealed class GruSequenceBackendParityTests
             foreach (var (buf, count) in new[] { (gIn, bN * tN * inN), (gH0, bN * hN), (gWih, 3 * hN * inN),
                          (gWhh, 3 * hN * hN), (gBih, 3 * hN), (gBhh, 3 * hN) })
                 backend.Fill(buf, float.NaN, count);
-            PortableGruSequence.Backward(backend, launch, bgy, allH, gates, ghn, bwih, bwhh, bx,
-                gIn, gH0, gWih, gWhh, gBih, gBhh, tN, bN, inN, hN);
+            PortableGruSequence.Backward(backend, launch, bgy, allH, gates, ghn, rh, bwih, bwhh, bx,
+                gIn, gH0, gWih, gWhh, gBih, gBhh, tN, bN, inN, hN, resetAfter: resetAfter);
             AssertClose(e.GIn, backend.DownloadBuffer(gIn), $"{shape} gradInput");
             AssertClose(e.GH0, backend.DownloadBuffer(gH0), $"{shape} gradH0");
             AssertClose(e.GWih, backend.DownloadBuffer(gWih), $"{shape} gradWih");

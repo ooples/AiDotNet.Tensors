@@ -4460,7 +4460,9 @@ public partial interface IEngine
     /// <c>(r, z, n)</c> along the first axis of <paramref name="wIh"/> / <paramref name="wHh"/> and their biases,
     /// <c>r = σ(W_ir x + b_ir + W_hr h + b_hr)</c>, <c>z = σ(W_iz x + b_iz + W_hz h + b_hz)</c>,
     /// <c>n = tanh(W_in x + b_in + r ⊙ (W_hn h + b_hn))</c> and <c>h' = (1 − z) ⊙ n + z ⊙ h</c>. The reset gate
-    /// multiplies the recurrent term after its bias, so the two biases are not interchangeable.
+    /// multiplies the recurrent term after its bias, so the two biases are not interchangeable. With
+    /// <paramref name="resetAfter"/> false the reset gate applies before the recurrent product instead (Cho et al. 2014,
+    /// Keras <c>reset_after=False</c>): <c>n = tanh(W_in x + b_in + W_hn (r ⊙ h) + b_hn)</c>.
     /// </summary>
     /// <remarks>
     /// Differentiable: under a gradient tape the whole sequence is one node whose backward is the fused
@@ -4475,16 +4477,18 @@ public partial interface IEngine
     /// <param name="bHh">Recurrent bias <c>[3 * hidden]</c>, or null.</param>
     /// <param name="returnSequences">True for every step's output <c>[batch, seq, hidden]</c>; false for the last
     /// step's <c>[batch, hidden]</c>.</param>
+    /// <param name="resetAfter">True (PyTorch) to apply the reset gate to the candidate's recurrent sum; false (Cho et
+    /// al., Keras <c>reset_after=False</c>) to apply it to the hidden state before the recurrent product.</param>
     Tensor<T> GruSequenceForward<T>(Tensor<T> input, Tensor<T>? h0, Tensor<T> wIh, Tensor<T> wHh,
-        Tensor<T>? bIh, Tensor<T>? bHh, bool returnSequences = false);
+        Tensor<T>? bIh, Tensor<T>? bHh, bool returnSequences = false, bool resetAfter = true);
 
     /// <summary>
-    /// <see cref="GruSequenceForward{T}(Tensor{T}, Tensor{T}?, Tensor{T}, Tensor{T}, Tensor{T}?, Tensor{T}?, bool)"/>
+    /// <see cref="GruSequenceForward{T}(Tensor{T}, Tensor{T}?, Tensor{T}, Tensor{T}, Tensor{T}?, Tensor{T}?, bool, bool)"/>
     /// that also returns the final hidden state, for chunked or streaming use.
     /// </summary>
     /// <param name="finalHidden">Receives the final hidden state <c>[batch, hidden]</c>.</param>
     Tensor<T> GruSequenceForward<T>(Tensor<T> input, Tensor<T>? h0, Tensor<T> wIh, Tensor<T> wHh,
-        Tensor<T>? bIh, Tensor<T>? bHh, out Tensor<T> finalHidden, bool returnSequences = false);
+        Tensor<T>? bIh, Tensor<T>? bHh, out Tensor<T> finalHidden, bool returnSequences = false, bool resetAfter = true);
 
     /// <summary>
     /// Fused LSTM sequence forward that also returns the final hidden and cell states for

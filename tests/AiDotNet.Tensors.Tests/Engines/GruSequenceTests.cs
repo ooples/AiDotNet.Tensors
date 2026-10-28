@@ -52,8 +52,10 @@ public sealed class GruSequenceTests
 
     private static Weights<float> ToFloat(Weights<double> w) => new(F(w.X), F(w.H0), F(w.WIh), F(w.WHh), F(w.BIh), F(w.BHh));
 
-    // PyTorch nn.GRU, written out: r and z from both sums, n = tanh(Win x + bin + r * (Whn h + bhn)).
-    private static double[] Reference(Weights<double> w, bool useH0, bool useBias)
+    // nn.GRU's equations written out: r and z from both sums; with the reset gate after the recurrent sum (PyTorch),
+    // n = tanh(Win x + bin + r * (Whn h + bhn)); before it (Cho et al., Keras reset_after=False),
+    // n = tanh(Win x + bin + Whn (r * h) + bhn).
+    private static double[] Reference(Weights<double> w, bool useH0, bool useBias, bool resetAfter = true)
     {
         var x = w.X.ToArray(); var wih = w.WIh.ToArray(); var whh = w.WHh.ToArray();
         var bih = useBias ? w.BIh.ToArray() : new double[3 * H];
@@ -65,21 +67,32 @@ public sealed class GruSequenceTests
             if (useH0) Array.Copy(w.H0.ToArray(), b * H, h, 0, H);
             for (int t = 0; t < T; t++)
             {
+                double InputSum(int row)
+                {
+                    double s = bih[row];
+                    for (int i = 0; i < In; i++) s += wih[row * In + i] * x[(b * T + t) * In + i];
+                    return s;
+                }
+                double RecurrentSum(int row, double[] v)
+                {
+                    double s = bhh[row];
+                    for (int k = 0; k < H; k++) s += whh[row * H + k] * v[k];
+                    return s;
+                }
+                var r = new double[H]; var z = new double[H];
+                for (int j = 0; j < H; j++)
+                {
+                    r[j] = 1 / (1 + Math.Exp(-(InputSum(j) + RecurrentSum(j, h))));
+                    z[j] = 1 / (1 + Math.Exp(-(InputSum(H + j) + RecurrentSum(H + j, h))));
+                }
+                var rh = new double[H];
+                for (int k = 0; k < H; k++) rh[k] = r[k] * h[k];
                 var next = new double[H];
                 for (int j = 0; j < H; j++)
                 {
-                    double Gate(int g, bool input)
-                    {
-                        int row = g * H + j;
-                        double s = input ? bih[row] : bhh[row];
-                        if (input) for (int i = 0; i < In; i++) s += wih[row * In + i] * x[(b * T + t) * In + i];
-                        else for (int k = 0; k < H; k++) s += whh[row * H + k] * h[k];
-                        return s;
-                    }
-                    double r = 1 / (1 + Math.Exp(-(Gate(0, true) + Gate(0, false))));
-                    double z = 1 / (1 + Math.Exp(-(Gate(1, true) + Gate(1, false))));
-                    double n = Math.Tanh(Gate(2, true) + r * Gate(2, false));
-                    next[j] = (1 - z) * n + z * h[j];
+                    double n = Math.Tanh(InputSum(2 * H + j)
+                        + (resetAfter ? r[j] * RecurrentSum(2 * H + j, h) : RecurrentSum(2 * H + j, rh)));
+                    next[j] = (1 - z[j]) * n + z[j] * h[j];
                     y[(b * T + t) * H + j] = next[j];
                 }
                 h = next;
@@ -87,25 +100,28 @@ public sealed class GruSequenceTests
         }
         return y;
     }
-
-    private static Tensor<TT> Run<TT>(IEngine e, Weights<TT> w, bool useH0, bool useBias, bool sequences, out Tensor<TT> final)
+    private static Tensor<TT> Run<TT>(IEngine e, Weights<TT> w, bool useH0, bool useBias, bool sequences, out Tensor<TT> final,
+        bool resetAfter = true)
         => e.GruSequenceForward(w.X, useH0 ? w.H0 : null, w.WIh, w.WHh, useBias ? w.BIh : null, useBias ? w.BHh : null,
-            out final, sequences);
+            out final, sequences, resetAfter);
 
     [Theory]
-    [InlineData(true, true)]
-    [InlineData(false, true)]
-    [InlineData(true, false)]
-    public void Cpu_MatchesNnGruEquations(bool useH0, bool useBias)
+    [InlineData(true, true, true)]
+    [InlineData(false, true, true)]
+    [InlineData(true, false, true)]
+    [InlineData(true, true, false)]
+    [InlineData(false, true, false)]
+    [InlineData(true, false, false)]
+    public void Cpu_MatchesNnGruEquations(bool useH0, bool useBias, bool resetAfter)
     {
         var w = MakeDouble();
-        var expected = Reference(w, useH0, useBias);
-        var y = Run(new CpuEngine(), w, useH0, useBias, sequences: true, out var final);
+        var expected = Reference(w, useH0, useBias, resetAfter);
+        var y = Run(new CpuEngine(), w, useH0, useBias, sequences: true, out var final, resetAfter);
         var actual = y.ToArray();
         Assert.Equal(new[] { B, T, H }, y.Shape.ToArray());
         for (int i = 0; i < expected.Length; i++) Assert.Equal(expected[i], actual[i], 12);
 
-        var last = Run(new CpuEngine(), w, useH0, useBias, sequences: false, out _).ToArray();
+        var last = Run(new CpuEngine(), w, useH0, useBias, sequences: false, out _, resetAfter).ToArray();
         var finalValues = final.ToArray();
         for (int b = 0; b < B; b++)
             for (int j = 0; j < H; j++)
@@ -119,11 +135,12 @@ public sealed class GruSequenceTests
     private static Tensor<TT> Loss<TT>(IEngine e, Tensor<TT> y, Tensor<TT> projection)
         => e.ReduceMean(e.TensorMultiply(y, projection), new[] { 0, 1, 2 }, keepDims: false);
 
-    private static Dictionary<string, double[]> TapeGradients<TT>(IEngine e, Weights<TT> w, Tensor<TT> projection)
+    private static Dictionary<string, double[]> TapeGradients<TT>(IEngine e, Weights<TT> w, Tensor<TT> projection,
+        bool resetAfter = true)
     {
         var sources = new[] { w.X, w.H0, w.WIh, w.WHh, w.BIh, w.BHh };
         using var tape = new GradientTape<TT>();
-        var y = e.GruSequenceForward(w.X, w.H0, w.WIh, w.WHh, w.BIh, w.BHh, returnSequences: true);
+        var y = e.GruSequenceForward(w.X, w.H0, w.WIh, w.WHh, w.BIh, w.BHh, returnSequences: true, resetAfter: resetAfter);
         var g = tape.ComputeGradients(Loss(e, y, projection), sources);
         var names = new[] { "x", "h0", "wIh", "wHh", "bIh", "bHh" };
         var result = new Dictionary<string, double[]>();
@@ -139,16 +156,18 @@ public sealed class GruSequenceTests
         return ab / Math.Sqrt(aa * bb);
     }
 
-    [Fact]
-    public void Cpu_GradientsMatchCentralDifferences()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Cpu_GradientsMatchCentralDifferences(bool resetAfter)
     {
         var cpu = new CpuEngine();
         var w = MakeDouble();
         var projection = new Tensor<double>(RandArray(7, B * T * H, 1.0), new[] { B, T, H });
-        var analytic = TapeGradients(cpu, w, projection);
+        var analytic = TapeGradients(cpu, w, projection, resetAfter);
 
-        double LossAt() => Loss(cpu, cpu.GruSequenceForward(w.X, w.H0, w.WIh, w.WHh, w.BIh, w.BHh, returnSequences: true),
-            projection).ToArray()[0];
+        double LossAt() => Loss(cpu, cpu.GruSequenceForward(w.X, w.H0, w.WIh, w.WHh, w.BIh, w.BHh, returnSequences: true,
+            resetAfter: resetAfter), projection).ToArray()[0];
         var tensors = new Dictionary<string, Tensor<double>>
         {
             ["x"] = w.X, ["h0"] = w.H0, ["wIh"] = w.WIh, ["wHh"] = w.WHh, ["bIh"] = w.BIh, ["bHh"] = w.BHh,
@@ -177,8 +196,10 @@ public sealed class GruSequenceTests
 
     // The float path splits a large batch across threads (the shapes above run inline): against the double path, which
     // is separate code, at a batch that takes the parallel route.
-    [Fact]
-    public void Cpu_FloatPathOnALargeBatch_MatchesTheDoublePath()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Cpu_FloatPathOnALargeBatch_MatchesTheDoublePath(bool resetAfter)
     {
         const int Batch = 64, Steps = 6, Inputs = 8, Hidden = 64;
         Tensor<double> D(int seed, double scale, params int[] shape)
@@ -191,14 +212,14 @@ public sealed class GruSequenceTests
         var projD = D(17, 1.0, Batch, Steps, Hidden);
         var cpu = new CpuEngine();
 
-        var yD = cpu.GruSequenceForward(wd.X, wd.H0, wd.WIh, wd.WHh, wd.BIh, wd.BHh, returnSequences: true).ToArray();
+        var yD = cpu.GruSequenceForward(wd.X, wd.H0, wd.WIh, wd.WHh, wd.BIh, wd.BHh, returnSequences: true, resetAfter: resetAfter).ToArray();
         var wf = ToFloat(wd);
-        var yF = cpu.GruSequenceForward(wf.X, wf.H0, wf.WIh, wf.WHh, wf.BIh, wf.BHh, returnSequences: true).ToArray();
+        var yF = cpu.GruSequenceForward(wf.X, wf.H0, wf.WIh, wf.WHh, wf.BIh, wf.BHh, returnSequences: true, resetAfter: resetAfter).ToArray();
         for (int i = 0; i < yD.Length; i++)
             Assert.True(Math.Abs(yD[i] - yF[i]) <= 1e-4, $"y[{i}]: double {yD[i]}, float {yF[i]}.");
 
-        var gD = TapeGradients(cpu, wd, projD);
-        var gF = TapeGradients(cpu, wf, F(projD));
+        var gD = TapeGradients(cpu, wd, projD, resetAfter);
+        var gF = TapeGradients(cpu, wf, F(projD), resetAfter);
         foreach (var name in gD.Keys)
             Assert.True(Cosine(gD[name], gF[name]) >= 0.99999, $"{name}: float-path gradient cosine {Cosine(gD[name], gF[name])}.");
     }
@@ -215,15 +236,17 @@ public sealed class GruSequenceTests
         return null;
     }
 
-    [SkippableFact]
-    public void Gpu_ForwardMatchesTheCpu_OnTheDevice()
+    [SkippableTheory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Gpu_ForwardMatchesTheCpu_OnTheDevice(bool resetAfter)
     {
         using var gpu = TryGpu();
         Skip.If(gpu is null, "No DirectGpu backend.");
         var w = ToFloat(MakeDouble());
-        var expected = Run(new CpuEngine(), w, true, true, sequences: true, out _).ToArray();
+        var expected = Run(new CpuEngine(), w, true, true, sequences: true, out _, resetAfter).ToArray();
         AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Reset();
-        var actual = Run(gpu, w, true, true, sequences: true, out var final);
+        var actual = Run(gpu, w, true, true, sequences: true, out var final, resetAfter);
         Assert.True(AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Count >= 2 * T,
             "the GPU engine did not launch the GRU kernels (two per step).");
         var values = actual.ToArray();
@@ -231,18 +254,20 @@ public sealed class GruSequenceTests
         Assert.Equal(new[] { B, H }, final.Shape.ToArray());
     }
 
-    [SkippableFact]
-    public void Gpu_GradientsMatchTheCpu()
+    [SkippableTheory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Gpu_GradientsMatchTheCpu(bool resetAfter)
     {
         using var gpu = TryGpu();
         Skip.If(gpu is null, "No DirectGpu backend.");
         var w = ToFloat(MakeDouble());
         var projection = F(new Tensor<double>(RandArray(7, B * T * H, 1.0), new[] { B, T, H }));
-        var cpu = TapeGradients(new CpuEngine(), w, projection);
+        var cpu = TapeGradients(new CpuEngine(), w, projection, resetAfter);
         // The device path must have run, forward and backward: two launches per step each way, then four for the input,
         // weight and bias gradients. A host fallback would pass the value checks below without launching any of them.
         AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Reset();
-        var device = TapeGradients(gpu, w, projection);
+        var device = TapeGradients(gpu, w, projection, resetAfter);
         Assert.True(AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Count >= 4 * T + 4,
             $"the GRU device kernels did not run (launches {AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Count}).");
         foreach (var name in cpu.Keys)

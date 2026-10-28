@@ -266,7 +266,8 @@ __kernel void bx_fft_from_storage(__global const uint* words, __global float* de
             K.StridedViewCopy, K.LstmGates, K.LstmCell, K.LstmCellBackward, K.LstmHiddenBackward, K.LstmInputGrad, K.LstmWeightIhGrad,
             K.LstmWeightHhGrad, K.LstmBiasGrad, K.LstmGateCell, K.LstmGateCellBackward, K.XLstmTrainingForward, K.XLstmTrainingBackward,
             K.GruProjection, K.GruCell, K.GruCellBackward, K.GruHiddenBackward, K.GruInputGrad, K.GruWeightIhGrad,
-            K.GruWeightHhGrad, K.GruBiasGrad,
+            K.GruWeightHhGrad, K.GruBiasGrad, K.GruRbResetHidden, K.GruRbCandidateProjection, K.GruRbCell, K.GruRbCellBackward,
+            K.GruRbResetBackward, K.GruRbHiddenBackward, K.GruRbWeightHhGrad,
             K.DlLinearGelu, K.DlLinearGeluFp16, K.DlW8A8LinearGelu, K.DlW8A8Epilogue, K.DcConv2dDirectFp16Hw
         };
     }

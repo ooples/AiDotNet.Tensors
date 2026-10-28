@@ -1210,6 +1210,107 @@ fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
     gbih[i] = si;
     gbhh[i] = sh;
 }");
+    // #1568 reset-before GRU (Cho et al., Keras reset_after=False): ports of the gru_rb_ kernels in BatchExecutionCudaKernels.GruSource.
+    public static readonly string GruRbResetHidden = Shader(
+        new[] { "r:pre", "r:allH", "rw:gates", "rw:rh" }, "t: i32, B: i32, H: i32",
+        LstmSig + Main + @"
+    let H = p.H; let B = p.B;
+    if (i >= B * H) { return; }
+    let b = i / H; let h = i - b * H;
+    let q = b * 6 * H;
+    let r = lstm_sig(pre[q + h] + pre[q + 3 * H + h]);
+    gates[(p.t * B + b) * 3 * H + h] = r;
+    rh[(p.t * B + b) * H + h] = r * allH[(p.t * B + b) * H + h];
+}");
+
+    public static readonly string GruRbCandidateProjection = Shader(
+        new[] { "r:whh", "r:bhh", "r:rh", "rw:pre" }, "t: i32, B: i32, H: i32",
+        Main + @"
+    let H = p.H; let B = p.B;
+    if (i >= B * H) { return; }
+    let b = i / H; let j = i - b * H;
+    var s = bhh[2 * H + j];
+    for (var q = 0; q < H; q++) { s += whh[(2 * H + j) * H + q] * rh[(p.t * B + b) * H + q]; }
+    pre[b * 6 * H + 5 * H + j] = s;
+}");
+
+    public static readonly string GruRbCell = Shader(
+        new[] { "r:pre", "rw:gates", "rw:ghn", "rw:allH", "rw:y" }, "t: i32, B: i32, T: i32, H: i32",
+        LstmSig + Main + @"
+    let H = p.H; let B = p.B;
+    if (i >= B * H) { return; }
+    let b = i / H; let h = i - b * H;
+    let q = b * 6 * H;
+    let z = lstm_sig(pre[q + H + h] + pre[q + 4 * H + h]);
+    let hn = pre[q + 5 * H + h];
+    let n = bx_tanh(pre[q + 2 * H + h] + hn);
+    let hp = allH[(p.t * B + b) * H + h];
+    let hv = (1.0 - z) * n + z * hp;
+    let gb = (p.t * B + b) * 3 * H;
+    gates[gb + H + h] = z; gates[gb + 2 * H + h] = n;
+    ghn[(p.t * B + b) * H + h] = hn;
+    allH[((p.t + 1) * B + b) * H + h] = hv;
+    y[(b * p.T + p.t) * H + h] = hv;
+}");
+
+    public static readonly string GruRbCellBackward = Shader(
+        new[] { "r:gy", "r:gates", "r:allH", "r:dh", "rw:dgi", "rw:dgh" }, "t: i32, B: i32, T: i32, H: i32",
+        Main + @"
+    let H = p.H; let B = p.B;
+    if (i >= B * H) { return; }
+    let b = i / H; let h = i - b * H;
+    let gb = (p.t * B + b) * 3 * H;
+    let z = gates[gb + H + h]; let n = gates[gb + 2 * H + h];
+    let hp = allH[(p.t * B + b) * H + h];
+    let dhv = gy[(b * p.T + p.t) * H + h] + dh[i];
+    let dnp = dhv * (1.0 - z) * (1.0 - n * n);
+    let dzp = dhv * (hp - n) * z * (1.0 - z);
+    dgi[gb + H + h] = dzp; dgh[gb + H + h] = dzp;
+    dgi[gb + 2 * H + h] = dnp; dgh[gb + 2 * H + h] = dnp;
+}");
+
+    public static readonly string GruRbResetBackward = Shader(
+        new[] { "r:gates", "r:allH", "r:whh", "rw:dgi", "rw:dgh", "rw:drr" }, "t: i32, B: i32, H: i32",
+        Main + @"
+    let H = p.H; let B = p.B;
+    if (i >= B * H) { return; }
+    let b = i / H; let q = i - b * H;
+    let gb = (p.t * B + b) * 3 * H;
+    var drh = 0.0;
+    for (var j = 0; j < H; j++) { drh += dgh[gb + 2 * H + j] * whh[(2 * H + j) * H + q]; }
+    let r = gates[gb + q];
+    let drp = drh * allH[(p.t * B + b) * H + q] * r * (1.0 - r);
+    dgi[gb + q] = drp; dgh[gb + q] = drp;
+    drr[i] = drh * r;
+}");
+
+    public static readonly string GruRbHiddenBackward = Shader(
+        new[] { "r:gy", "r:gates", "r:dgh", "r:whh", "r:drr", "rw:dh" }, "t: i32, B: i32, T: i32, H: i32",
+        Main + @"
+    let H = p.H; let B = p.B;
+    if (i >= B * H) { return; }
+    let b = i / H; let j = i - b * H;
+    let gb = (p.t * B + b) * 3 * H;
+    var s = (gy[(b * p.T + p.t) * H + j] + dh[i]) * gates[gb + H + j] + drr[i];
+    for (var row = 0; row < 2 * H; row++) { s += dgh[gb + row] * whh[row * H + j]; }
+    dh[i] = s;
+}");
+
+    public static readonly string GruRbWeightHhGrad = Shader(
+        new[] { "r:dgh", "r:allH", "r:rh", "rw:gwhh" }, "B: i32, T: i32, H: i32",
+        Main + @"
+    let H = p.H; let B = p.B; let T = p.T;
+    if (i >= 3 * H * H) { return; }
+    let row = i / H; let j = i - row * H;
+    var s = 0.0;
+    for (var t = 0; t < T; t++) {
+        for (var b = 0; b < B; b++) {
+            let src = select(rh[(t * B + b) * H + j], allH[(t * B + b) * H + j], row < 2 * H);
+            s += dgh[(t * B + b) * 3 * H + row] * src;
+        }
+    }
+    gwhh[i] = s;
+}");
     public static readonly string XLstmTrainingForward = Shader(
         new[] { "r:Q", "r:K", "r:V", "r:I", "r:F", "r:O", "rw:Y", "rw:S" }, "B: i32, T: i32, M: i32, H: i32", Main + @"
 
@@ -1451,6 +1552,12 @@ fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
         [BatchExecutionCudaKernels.GruCellBackward] = GruCellBackward, [BatchExecutionCudaKernels.GruHiddenBackward] = GruHiddenBackward,
         [BatchExecutionCudaKernels.GruInputGrad] = GruInputGrad, [BatchExecutionCudaKernels.GruWeightIhGrad] = GruWeightIhGrad,
         [BatchExecutionCudaKernels.GruWeightHhGrad] = GruWeightHhGrad, [BatchExecutionCudaKernels.GruBiasGrad] = GruBiasGrad,
+        [BatchExecutionCudaKernels.GruRbResetHidden] = GruRbResetHidden,
+        [BatchExecutionCudaKernels.GruRbCandidateProjection] = GruRbCandidateProjection,
+        [BatchExecutionCudaKernels.GruRbCell] = GruRbCell, [BatchExecutionCudaKernels.GruRbCellBackward] = GruRbCellBackward,
+        [BatchExecutionCudaKernels.GruRbResetBackward] = GruRbResetBackward,
+        [BatchExecutionCudaKernels.GruRbHiddenBackward] = GruRbHiddenBackward,
+        [BatchExecutionCudaKernels.GruRbWeightHhGrad] = GruRbWeightHhGrad,
         [BatchExecutionCudaKernels.DlLinearGelu] = DlLinearGelu, [BatchExecutionCudaKernels.DlLinearGeluFp16] = DlLinearGeluFp16,
         [BatchExecutionCudaKernels.DlW8A8LinearGelu] = DlW8A8LinearGelu, [BatchExecutionCudaKernels.DlW8A8Epilogue] = DlW8A8Epilogue,
         [BatchExecutionCudaKernels.DcConv2dDirectFp16Hw] = DcConv2dDirectFp16Hw,

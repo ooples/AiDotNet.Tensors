@@ -11,33 +11,33 @@ namespace AiDotNet.Tensors.Engines;
 public partial class DirectGpuTensorEngine
 {
     /// <summary>
-    /// The fused GRU sequence on the device (#1568): the shared gru_p_ kernels on every backend, with a recorded node whose
-    /// backward runs on the device too. Before this a GRU ran one timestep and one op at a time (11-13x slower than
-    /// PyTorch to train on CUDA). Float only; other types, and a backend that cannot launch the kernels, take the host path.
+    /// The fused GRU sequence on the device (#1568): the shared gru_p_ / gru_rb_ kernels on every backend, with a recorded
+    /// node whose backward runs on the device too. Before this a GRU ran one timestep and one op at a time (11-13x slower
+    /// than PyTorch to train on CUDA). Float only; other types, and a backend that cannot launch the kernels, take the host
+    /// path.
     /// </summary>
     public override Tensor<T> GruSequenceForward<T>(Tensor<T> input, Tensor<T>? h0, Tensor<T> wIh, Tensor<T> wHh,
-        Tensor<T>? bIh, Tensor<T>? bHh, out Tensor<T> finalHidden, bool returnSequences = false)
+        Tensor<T>? bIh, Tensor<T>? bHh, out Tensor<T> finalHidden, bool returnSequences = false, bool resetAfter = true)
     {
         var (batch, seqLen, inputSize, hidden) = ValidateGruSequence(input, h0, wIh, wHh, bIh, bHh);
         // Graph capture records the host op's lazy node, whose replay runs this engine eagerly. An empty extent has
         // nothing to launch and the kernels require positive ones: the host path returns the empty result.
-        if (seqLen == 0 || batch == 0 || inputSize == 0 || GraphMode.IsActive || typeof(T) != typeof(float) || !TryGetBackend(out var backend)
-            || backend is not IFusedLstmSequenceTraining fused)
-            return base.GruSequenceForward(input, h0, wIh, wHh, bIh, bHh, out finalHidden, returnSequences);
-        var sequence = GruSequenceOnDevice(backend, fused, input, h0, wIh, wHh, bIh, bHh, batch, seqLen, hidden)
-            ?? GruSequenceRecorded(input, h0, wIh, wHh, bIh, bHh, batch, seqLen, hidden);
+        if (seqLen == 0 || batch == 0 || inputSize == 0 || GraphMode.IsActive || typeof(T) != typeof(float)
+            || !TryGetBackend(out var backend) || backend is not IFusedLstmSequenceTraining fused)
+            return base.GruSequenceForward(input, h0, wIh, wHh, bIh, bHh, out finalHidden, returnSequences, resetAfter);
+        var sequence = GruSequenceOnDevice(backend, fused, input, h0, wIh, wHh, bIh, bHh, batch, seqLen, hidden, resetAfter)
+            ?? GruSequenceRecorded(input, h0, wIh, wHh, bIh, bHh, batch, seqLen, hidden, resetAfter);
         return GruSequenceOutputs(sequence, batch, seqLen, hidden, returnSequences, out finalHidden);
     }
 
     // Null when the backend cannot launch the kernels (the caller takes the host path).
     private Tensor<T>? GruSequenceOnDevice<T>(IDirectGpuBackend backend, IFusedLstmSequenceTraining fused,
         Tensor<T> input, Tensor<T>? h0, Tensor<T> wIh, Tensor<T> wHh, Tensor<T>? bIh, Tensor<T>? bHh,
-        int batch, int seqLen, int hidden)
+        int batch, int seqLen, int hidden, bool resetAfter)
     {
-
         int inFeatures = input.Shape[2];
-        var (allHSize, gatesSize, ghnSize) = PortableGruSequence.CacheSizes(seqLen, batch, hidden);
-        OwnedBuffer y = default, allH = default, gates = default, ghn = default;
+        var (allHSize, gatesSize, ghnSize, rhSize) = PortableGruSequence.CacheSizes(seqLen, batch, hidden);
+        OwnedBuffer y = default, allH = default, gates = default, ghn = default, rh = default;
         bool handedOff = false;
         try
         {
@@ -51,8 +51,10 @@ public partial class DirectGpuTensorEngine
             allH = AllocateFullyWrittenOutputBuffer(backend, allHSize);
             gates = AllocateFullyWrittenOutputBuffer(backend, gatesSize);
             ghn = AllocateFullyWrittenOutputBuffer(backend, ghnSize);
+            if (!resetAfter) rh = AllocateFullyWrittenOutputBuffer(backend, rhSize);
             PortableGruSequence.Forward(backend, fused.StatefulLstmLauncher, x.Buffer, hInit.Buffer, wi.Buffer, wh.Buffer,
-                bi.Buffer, bh.Buffer, y.Buffer, allH.Buffer, gates.Buffer, ghn.Buffer, seqLen, batch, inFeatures, hidden);
+                bi.Buffer, bh.Buffer, y.Buffer, allH.Buffer, gates.Buffer, ghn.Buffer, resetAfter ? null : rh.Buffer,
+                seqLen, batch, inFeatures, hidden, resetAfter);
 
             var sequence = DeferTensorResult<T>(backend, y.Buffer, batch * seqLen * hidden, new[] { batch, seqLen, hidden });
             y.RelinquishOwnership();
@@ -61,6 +63,7 @@ public partial class DirectGpuTensorEngine
                 // No backward will read the caches (about 5x the output): back to the pool once the forward has run,
                 // not when a collection finalizes them.
                 allH.DisposeAfterQueuedUse(backend); gates.DisposeAfterQueuedUse(backend); ghn.DisposeAfterQueuedUse(backend);
+                if (!resetAfter) rh.DisposeAfterQueuedUse(backend);
                 handedOff = true;
                 return sequence;
             }
@@ -68,14 +71,18 @@ public partial class DirectGpuTensorEngine
             var allHTensor = DeferTensorResult<float>(backend, allH.Buffer, allHSize, new[] { allHSize });
             var gatesTensor = DeferTensorResult<float>(backend, gates.Buffer, gatesSize, new[] { gatesSize });
             var ghnTensor = DeferTensorResult<float>(backend, ghn.Buffer, ghnSize, new[] { ghnSize });
+            var rhTensor = resetAfter ? null : DeferTensorResult<float>(backend, rh.Buffer, rhSize, new[] { rhSize });
             allH.RelinquishOwnership(); gates.RelinquishOwnership(); ghn.RelinquishOwnership();
+            if (!resetAfter) rh.RelinquishOwnership();
             handedOff = true;
 
-            {
-                var inputs = GruSequenceInputs(input, h0, wIh, wHh, bIh, bHh, out var present);
-                DifferentiableOps.RecordIfActive("GruSequenceForward", sequence, inputs, GruSequenceBackwardOnDevice<T>,
-                    new object[] { new[] { batch, seqLen, inFeatures, hidden }, present, allHTensor, gatesTensor, ghnTensor });
-            }
+            var inputs = GruSequenceInputs(input, h0, wIh, wHh, bIh, bHh, out var present);
+            DifferentiableOps.RecordIfActive("GruSequenceForward", sequence, inputs, GruSequenceBackwardOnDevice<T>,
+                new object[]
+                {
+                    new[] { batch, seqLen, inFeatures, hidden }, present, allHTensor, gatesTensor, ghnTensor,
+                    resetAfter, rhTensor ?? (object)resetAfter,
+                });
             return sequence;
         }
         catch (NotSupportedException capabilityGap)
@@ -85,7 +92,7 @@ public partial class DirectGpuTensorEngine
         }
         finally
         {
-            if (!handedOff) { y.Dispose(); allH.Dispose(); gates.Dispose(); ghn.Dispose(); }
+            if (!handedOff) { y.Dispose(); allH.Dispose(); gates.Dispose(); ghn.Dispose(); rh.Dispose(); }
         }
     }
 
@@ -107,6 +114,8 @@ public partial class DirectGpuTensorEngine
         var allH = (Tensor<float>)savedState[2];
         var gates = (Tensor<float>)savedState[3];
         var ghn = (Tensor<float>)savedState[4];
+        bool resetAfter = (bool)savedState[5];
+        var rhTensor = savedState[6] as Tensor<float>;
         int batch = dims[0], seqLen = dims[1], inFeatures = dims[2], hidden = dims[3], g3 = 3 * hidden;
         var (input, h0, wIh, wHh, bIh, bHh) = UnpackGruSequenceInputs(inputs, present);
 
@@ -114,6 +123,7 @@ public partial class DirectGpuTensorEngine
         using var cH = gpu.GetOrAllocateBuffer(backend, allH);
         using var cG = gpu.GetOrAllocateBuffer(backend, gates);
         using var cN = gpu.GetOrAllocateBuffer(backend, ghn);
+        using var cR = rhTensor is null ? default : gpu.GetOrAllocateBuffer(backend, rhTensor);
         using var x = gpu.GetOrAllocateBuffer(backend, input);
         using var wi = gpu.GetOrAllocateBuffer(backend, wIh);
         using var wh = gpu.GetOrAllocateBuffer(backend, wHh);
@@ -127,8 +137,8 @@ public partial class DirectGpuTensorEngine
         try
         {
             PortableGruSequence.Backward(backend, fused.StatefulLstmLauncher, gy.Buffer, cH.Buffer, cG.Buffer, cN.Buffer,
-                wi.Buffer, wh.Buffer, x.Buffer, dx.Buffer, dh0.Buffer, dwi.Buffer, dwh.Buffer, dbi.Buffer, dbh.Buffer,
-                seqLen, batch, inFeatures, hidden);
+                rhTensor is null ? null : cR.Buffer, wi.Buffer, wh.Buffer, x.Buffer, dx.Buffer, dh0.Buffer, dwi.Buffer,
+                dwh.Buffer, dbi.Buffer, dbh.Buffer, seqLen, batch, inFeatures, hidden, resetAfter: resetAfter);
             Tensor<T> Result(int index, int length, int[] shape)
             {
                 var tensor = gpu.DeferTensorResult<T>(backend, owned[index].Buffer, length, shape);

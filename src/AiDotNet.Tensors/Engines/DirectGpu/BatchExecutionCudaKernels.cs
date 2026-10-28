@@ -478,6 +478,8 @@ extern ""C"" __global__ __launch_bounds__(256) void bx_fft_from_storage(const un
         LaSolveBackwardVector, LaSvdReduced, LaQrReduced, FaLse, FaOut, FaDelta, FaDq, FaDk, FaDv,
         StridedViewCopy, LstmGates, LstmCell, LstmCellBackward, LstmHiddenBackward, LstmInputGrad, LstmWeightIhGrad, LstmWeightHhGrad, LstmBiasGrad, LstmGateCell, LstmGateCellBackward, XLstmTrainingForward, XLstmTrainingBackward,
         GruProjection, GruCell, GruCellBackward, GruHiddenBackward, GruInputGrad, GruWeightIhGrad, GruWeightHhGrad, GruBiasGrad,
+        GruRbResetHidden, GruRbCandidateProjection, GruRbCell, GruRbCellBackward, GruRbResetBackward, GruRbHiddenBackward,
+        GruRbWeightHhGrad,
         DlLinearGelu, DlLinearGeluFp16, DlW8A8LinearGelu, DlW8A8Epilogue, DcConv2dDirectFp16Hw
     };
 }
