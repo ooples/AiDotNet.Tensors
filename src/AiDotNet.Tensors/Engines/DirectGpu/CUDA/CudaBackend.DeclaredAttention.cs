@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Scaled dot-product attention on a declared program (#890 phase 4d): CudaBackend.ScaledDotProductAttention -- causal,
 // masked (shared or full), grouped-query, with or without the weights stored -- runs
 // CodegenBackendPrograms.ScaledDotProductAttention: the scores as an implicit GEMM with the scale and mask bias in its
