@@ -81,6 +81,9 @@ internal static class DeviceMemoryReclaim
     internal const long CollectNowAfterDeviceBytes = 4 * CollectAfterDeviceBytes;
 
     private static int s_collectionDue;
+
+    /// <summary>Whether a backend has asked for a collection at the next step or inference boundary.</summary>
+    internal static bool CollectionDue => Volatile.Read(ref s_collectionDue) != 0;
     // Device bytes handed out since the last collection, across every backend: one collection serves them all.
     private static long s_driverBytesSinceCollection;
 

@@ -67,6 +67,49 @@ public sealed class DeviceMemoryReclaimTests
         Assert.True(queue.IsEmpty);
     }
 
+    // An inference call has no tape, so before #1432 the due collection ran inside a later call's allocation.
+    [Fact]
+    public void LeavingTheOutermostInferenceScope_RunsTheDueCollection()
+    {
+        var tapeOpen = DeviceMemoryReclaim.TapeOpen;
+        DeviceMemoryReclaim.TapeOpen = () => false;
+        try
+        {
+            DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectAfterDeviceBytes);
+            Assert.True(DeviceMemoryReclaim.CollectionDue);
+
+            using (new AiDotNet.Tensors.Engines.Autodiff.InferenceModeScope<float>())
+            {
+                using (new AiDotNet.Tensors.Engines.Autodiff.InferenceModeScope<float>()) { }
+                Assert.True(DeviceMemoryReclaim.CollectionDue);   // a nested scope is not the end of the call
+            }
+            Assert.False(DeviceMemoryReclaim.CollectionDue);
+        }
+        finally
+        {
+            DeviceMemoryReclaim.TapeOpen = tapeOpen;
+            DeviceMemoryReclaim.CollectIfDueAtStepBoundary();
+        }
+    }
+
+    [Fact]
+    public void LeavingAnInferenceScopeInsideATape_LeavesTheCollectionToTheStepBoundary()
+    {
+        var tapeOpen = DeviceMemoryReclaim.TapeOpen;
+        DeviceMemoryReclaim.TapeOpen = () => true;
+        try
+        {
+            DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectAfterDeviceBytes);
+            using (new AiDotNet.Tensors.Engines.Autodiff.InferenceModeScope<float>()) { }
+            Assert.True(DeviceMemoryReclaim.CollectionDue);
+        }
+        finally
+        {
+            DeviceMemoryReclaim.TapeOpen = tapeOpen;
+            DeviceMemoryReclaim.CollectIfDueAtStepBoundary();
+        }
+    }
+
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static void AbandonBuffer(IDirectGpuBackend backend) => backend.AllocateBuffer(1024);
 
