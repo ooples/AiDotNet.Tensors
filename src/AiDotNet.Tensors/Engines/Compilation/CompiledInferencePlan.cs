@@ -277,6 +277,19 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     // ── Internal accessors for serialization ────────────────────────────
     // Note: CompiledInputTensor is already defined above for ThenAsync stitching.
     internal CompiledStep<T>[] Steps => _steps;
+
+    // The steps as the graph recorded them, before the CPU fusion passes (ConvBn folding, pointwise and attention
+    // fusion, batched GEMM, constant folding) replaced some of them with fused kernels whose saved state no longer
+    // names the original operations. Exporters (AiDotNet.Tensors.Onnx's OnnxExporter) read these: every step is one
+    // recorded engine operation with its own inputs and saved state. Null when the plan was built without them
+    // (deserialized or stitched plans), in which case the executed steps are the only record.
+    private CompiledStep<T>[]? _exportSteps;
+
+    /// <summary>The per-operation steps an exporter translates; see <see cref="_exportSteps"/>.</summary>
+    internal CompiledStep<T>[] ExportSteps => _exportSteps ?? _steps;
+
+    /// <summary>Every tensor the plan was traced against as a per-call input, in slot order.</summary>
+    internal Tensor<T>[] CompiledInputTensors => _compiledInputTensors;
     internal int[] CompiledInputShape => (int[])_compiledInputShape.Clone();
 
     /// <inheritdoc/>
@@ -1544,6 +1557,8 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                 optimizedSteps, finalOutput, engine, inputShape, inputTensor, pinnedHandles,
                 compiledInputTensors: compiledInputTensors,
                 storageLeases: storageLeases);
+            // Only when a pass replaced steps: otherwise the executed steps already are the recorded ones.
+            if (!ReferenceEquals(optimizedSteps, specializedSteps)) plan._exportSteps = specializedSteps;
             storageLeases = null;
             scope.ReleaseStorageLeases();
             return plan;
