@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 // cuMemGetInfo, the backed-off sweep and the deferred-free drain live in CudaBackend.cs.

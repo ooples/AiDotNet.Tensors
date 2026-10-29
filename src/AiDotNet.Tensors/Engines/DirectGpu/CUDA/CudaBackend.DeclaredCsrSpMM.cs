@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CSR SpMM through its declared program (#890 phase 4e, #1441).
 
 using System;
