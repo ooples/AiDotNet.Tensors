@@ -26290,6 +26290,11 @@ public partial class CpuEngine : ITensorLevelEngine
             || mean.GetCpuBackingForContiguousWrite(out int mOff) is not float[] mF || mOff != 0
             || variance.GetCpuBackingForContiguousWrite(out int vOff) is not float[] vF || vOff != 0)
             return false;
+        // The kernel walks raw pointers: an array shorter than its tensor (a deferred tensor not yet given storage) must
+        // take the checked path, not be read past its end.
+        if (inF.Length < input.Length || oF.Length < output.Length || gF.Length < channels || bF.Length < channels
+            || mF.Length < channels || vF.Length < channels)
+            return false;
         BatchNorm4DFloat(inF, gF, bF, (float)epsilon, batch, channels, spatial, mF, vF, oF);
         output.IncrementVersion();
         mean.IncrementVersion();
