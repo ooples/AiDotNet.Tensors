@@ -9240,7 +9240,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // shared Q/K/V matmul) counts with the generic writers. On the parity CPU Transformer that leaves the residual
         // streams and the norm outputs unzeroed: they were all seven buffers the step still cleared (787K floats).
         bool[]? eagerFirstWriteCandidates = null;
-        if (!useGradPool && genericBackwardCount > 0 && genericBackwardSteps.Count > 0)
+        // Also for an all-specialized backward whose writers claim first writes: claiming does not need a generic step.
+        if (!useGradPool && (genericBackwardSteps.Count > 0 || firstWriteClaimingSteps.Count > 0))
         {
             var genericConsumers = new Dictionary<Tensor<T>, int>();
             // A consumer with no backward writes no gradient, so it cannot disturb a first write either: a BatchNorm's
@@ -12699,6 +12700,60 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // GraFPrint has 18 BatchNorm layers; this saves ~3-5 ms per layer
         // (allocator pressure + AccumulateGrad orchestration).
         // Tier 1.4 of the compile-mode backward perf overhaul.
+        // Concatenate: each input's slice of the output gradient copied (or added) straight into that input's gradient
+        // buffer. The generic backward sliced every input's gradient into a freshly allocated tensor and then copied it
+        // in: on DenseNet-121 three quarters of the training step's allocations (1.2 GB of large-object garbage) and a
+        // second full copy per concatenation. Inputs run one after another, so an input concatenated twice accumulates.
+        if (step.OpName == "Concatenate" && typeof(T) == typeof(float) && step.Inputs.Length >= 1
+            && step.SavedState is { Length: >= 1 } concatSaved && concatSaved[0] is int concatAxisRaw
+            && step.OutputBuffer.IsContiguous && gradMap.TryGetValue(step.OutputBuffer, out var concatGradOut))
+        {
+            var outShape = step.OutputBuffer._shape;
+            int rank = outShape.Length;
+            int concatAxis = concatAxisRaw < 0 ? concatAxisRaw + rank : concatAxisRaw;
+            if (concatAxis < 0 || concatAxis >= rank) return null;
+            int outer = 1, inner = 1;
+            for (int d = 0; d < concatAxis; d++) outer *= outShape[d];
+            for (int d = concatAxis + 1; d < rank; d++) inner *= outShape[d];
+            int totalAxis = outShape[concatAxis];
+            var targets = new List<(Tensor<T> Grad, int Offset, int Size, bool Shared)>(step.Inputs.Length);
+            int axisOffset = 0;
+            foreach (var inp in step.Inputs)
+            {
+                if (inp.Rank != rank || !inp.IsContiguous) return null;
+                for (int d = 0; d < rank; d++)
+                    if (d != concatAxis && inp._shape[d] != outShape[d]) return null;
+                int size = inp._shape[concatAxis];
+                if (gradMap.TryGetValue(inp, out var inputGrad))
+                    targets.Add((inputGrad, axisOffset, size,
+                        consumerCount.TryGetValue(inp, out int uses) && uses > 1));
+                axisOffset += size;
+            }
+            if (axisOffset != totalAxis) return null;
+            if (claimsFirstWrite is not null) claimsFirstWrite.Value = true;
+            return eng =>
+            {
+                var source = TryGetLiveFloatBacking(concatGradOut)
+                    ?? throw new InvalidOperationException("Concatenate backward: the output gradient has no live host buffer.");
+                foreach (var (grad, offset, size, shared) in targets)
+                {
+                    bool accumulate = AccumulatesInto(grad, shared);
+                    var destination = TryGetLiveFloatBacking(grad)
+                        ?? throw new InvalidOperationException("Concatenate backward: an input gradient has no live host buffer.");
+                    int rowLength = size * inner;
+                    CpuParallelSettings.ParallelForOrSerial(0, outer, (long)outer * rowLength, row =>
+                    {
+                        int from = (row * totalAxis + offset) * inner, to = row * rowLength;
+                        if (!accumulate) { Array.Copy(source, from, destination, to, rowLength); return; }
+                        int w = System.Numerics.Vector<float>.Count, k = 0;
+                        for (; k + w <= rowLength; k += w)
+                            (new System.Numerics.Vector<float>(destination, to + k)
+                                + new System.Numerics.Vector<float>(source, from + k)).CopyTo(destination, to + k);
+                        for (; k < rowLength; k++) destination[to + k] += source[from + k];
+                    }, deterministicSafe: true);   // disjoint rows, one order per element
+                }
+            };
+        }
         // Fused training BatchNorm+ReLU (BatchNormReluFusionPattern on the CPU): the ReLU mask is applied inside the
         // batch-norm backward kernel, straight into the plan's buffers, claiming first writes like the BatchNorm branch
         // below. The BatchNorm output and its gradient never exist.
