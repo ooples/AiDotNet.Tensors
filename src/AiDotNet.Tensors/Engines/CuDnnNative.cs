@@ -1602,6 +1602,7 @@ public sealed class CuDnnActivation : IDisposable
             ref beta,
             outputDesc.Handle, outputDevPtr);
         CuDnnContext.CheckStatus(status, "ActivationForwardGpu");
+        DirectGpu.GpuLaunchProbe.OnLaunch();   // a cuDNN dispatch is GPU work: count it, as the residency probe expects
     }
 
     /// <summary>
@@ -1637,6 +1638,7 @@ public sealed class CuDnnActivation : IDisposable
             ref beta,
             inputDesc.Handle, gradInputDevPtr);
         CuDnnContext.CheckStatus(status, "ActivationBackwardGpu");
+        DirectGpu.GpuLaunchProbe.OnLaunch();   // a cuDNN dispatch is GPU work: count it, as the residency probe expects
     }
 
     public void Dispose()
@@ -1922,6 +1924,7 @@ public sealed class CuDnnConvolution : IDisposable
                 ref beta,
                 outputDesc.Handle, outputDevPtr);
             CuDnnContext.CheckStatus(status, "ConvolutionForward");
+            DirectGpu.GpuLaunchProbe.OnLaunch();   // a cuDNN dispatch is GPU work: count it, as the residency probe expects
         }
     }
 
@@ -2002,6 +2005,7 @@ public sealed class CuDnnConvolution : IDisposable
                 ref beta,
                 gradInputDesc.Handle, gradInputDevPtr);
             CuDnnContext.CheckStatus(status, "ConvolutionBackwardData");
+            DirectGpu.GpuLaunchProbe.OnLaunch();   // a cuDNN dispatch is GPU work: count it, as the residency probe expects
         }
     }
 
@@ -2078,6 +2082,7 @@ public sealed class CuDnnConvolution : IDisposable
                 ref beta,
                 gradFilterDesc.Handle, gradFilterDevPtr);
             CuDnnContext.CheckStatus(status, "ConvolutionBackwardFilter");
+            DirectGpu.GpuLaunchProbe.OnLaunch();   // a cuDNN dispatch is GPU work: count it, as the residency probe expects
         }
     }
 
@@ -2324,6 +2329,7 @@ public sealed class CuDnnPooling : IDisposable
             ref beta,
             outputDesc.Handle, outputDevPtr);
         CuDnnContext.CheckStatus(status, "PoolingForwardGpu");
+        DirectGpu.GpuLaunchProbe.OnLaunch();   // a cuDNN dispatch is GPU work: count it, as the residency probe expects
     }
 
     /// <summary>
@@ -2363,6 +2369,7 @@ public sealed class CuDnnPooling : IDisposable
             ref beta,
             inputDesc.Handle, gradInputDevPtr);
         CuDnnContext.CheckStatus(status, "PoolingBackwardGpu");
+        DirectGpu.GpuLaunchProbe.OnLaunch();   // a cuDNN dispatch is GPU work: count it, as the residency probe expects
     }
 
     public void Dispose()
@@ -2512,6 +2519,7 @@ public sealed class CuDnnBatchNorm : IDisposable
             runningMeanDevPtr, runningVarDevPtr,
             epsilon);
         CuDnnContext.CheckStatus(status, "BatchNormalizationForwardInferenceGpu");
+        DirectGpu.GpuLaunchProbe.OnLaunch();   // a cuDNN dispatch is GPU work: count it, as the residency probe expects
     }
 
     /// <summary>
@@ -2553,6 +2561,7 @@ public sealed class CuDnnBatchNorm : IDisposable
             epsilon,
             saveMeanDevPtr, saveInvVarDevPtr);
         CuDnnContext.CheckStatus(status, "BatchNormalizationForwardTrainingGpu");
+        DirectGpu.GpuLaunchProbe.OnLaunch();   // a cuDNN dispatch is GPU work: count it, as the residency probe expects
     }
 
     /// <summary>
@@ -2589,6 +2598,7 @@ public sealed class CuDnnBatchNorm : IDisposable
             epsilon,
             savedMeanDevPtr, savedInvVarDevPtr);
         CuDnnContext.CheckStatus(status, "BatchNormalizationBackwardGpu");
+        DirectGpu.GpuLaunchProbe.OnLaunch();   // a cuDNN dispatch is GPU work: count it, as the residency probe expects
     }
 
     public void Dispose()
@@ -2711,6 +2721,7 @@ public sealed class CuDnnSoftmax : IDisposable
             ref beta,
             outputDesc.Handle, outputDevPtr);
         CuDnnContext.CheckStatus(status, "SoftmaxForwardGpu");
+        DirectGpu.GpuLaunchProbe.OnLaunch();   // a cuDNN dispatch is GPU work: count it, as the residency probe expects
     }
 
     /// <summary>
@@ -2746,6 +2757,7 @@ public sealed class CuDnnSoftmax : IDisposable
             ref beta,
             dxDesc.Handle, gradInputDevPtr);
         CuDnnContext.CheckStatus(status, "SoftmaxBackwardGpu");
+        DirectGpu.GpuLaunchProbe.OnLaunch();   // a cuDNN dispatch is GPU work: count it, as the residency probe expects
     }
 
     public void Dispose()

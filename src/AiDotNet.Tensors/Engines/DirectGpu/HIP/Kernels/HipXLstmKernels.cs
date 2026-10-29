@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP kernel for the fused xLSTM (mLSTM) matrix-memory scan forward (issue ooples/AiDotNet#1464).
 // Mirrors CpuEngine.XLstmScan.cs / RecurrenceCpuKernels.XLstmForward. One thread owns (batch b,
 // head h) and carries the full C[headDim*headDim] cell + n[headDim] normalizer in private memory,

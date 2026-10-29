@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP/ROCm IoU/GIoU/DIoU/CIoU loss kernels for bounding box regression.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels;

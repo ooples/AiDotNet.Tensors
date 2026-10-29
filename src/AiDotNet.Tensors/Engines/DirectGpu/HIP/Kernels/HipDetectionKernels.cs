@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP kernels for the vision detection ops added by Issue #217.
 // Mirrors CudaDetectionKernels function-for-function — HIP's hiprtc accepts
 // the same CUDA-style source, so we keep the two files structurally identical

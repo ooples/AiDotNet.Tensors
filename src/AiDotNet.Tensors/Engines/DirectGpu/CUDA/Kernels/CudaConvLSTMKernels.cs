@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA kernels for ConvLSTM (Convolutional LSTM) neural network operations.
 // Implements spatiotemporal sequence learning with convolutional gates.
 

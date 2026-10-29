@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP sparse matrix kernels - CSR SpMM and GNN message passing operations.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels;

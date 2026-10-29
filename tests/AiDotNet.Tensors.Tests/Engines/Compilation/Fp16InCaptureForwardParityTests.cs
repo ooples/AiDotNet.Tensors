@@ -17,10 +17,20 @@ using Xunit.Abstractions;
 namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 
 [Collection(MixedPrecisionTestCollection.Name)] // serializes MixedPrecisionEmit.TestOverrideEnabled mutators
-public class Fp16InCaptureForwardParityTests
+public class Fp16InCaptureForwardParityTests : IClassFixture<AiDotNet.Tensors.Tests.Engines.DirectGpu.DirectGpuTensorEngineTestFixture>
 {
     private readonly ITestOutputHelper _out;
-    public Fp16InCaptureForwardParityTests(ITestOutputHelper o) { _out = o; }
+    private readonly AiDotNet.Tensors.Tests.Engines.DirectGpu.DirectGpuTensorEngineTestFixture _gpuFixture;
+    public Fp16InCaptureForwardParityTests(ITestOutputHelper o,
+        AiDotNet.Tensors.Tests.Engines.DirectGpu.DirectGpuTensorEngineTestFixture gpuFixture)
+    {
+        _out = o;
+        _gpuFixture = gpuFixture;
+    }
+
+    // The class's own GPU engine, or null without one. The GPU tests used to read AiDotNetEngine.Current, which is the
+    // CPU engine unless some other test has swapped it, so they skipped with "needs a CUDA GPU host" on CUDA hosts.
+    private DirectGpuTensorEngine GpuOrNull => _gpuFixture.IsAvailable ? _gpuFixture.Engine : null;
 
     private static Tensor<float> Rand(int[] shape, int seed)
     {
@@ -255,7 +265,7 @@ public class Fp16InCaptureForwardParityTests
         // as a HALF GPU buffer instead of up-casting to FP32. Measure the activation-dominated full-Step GPU
         // peak of the SAME FP16 plan with the store OFF vs ON — store-on must be strictly lower (the
         // activations occupy half the device bytes). Parity is covered by Fp16HeteroForwardBackward_OnGpu.
-        var gpu = AiDotNetEngine.Current as DirectGpuTensorEngine;
+        var gpu = GpuOrNull;
         Skip.If(gpu is null || !GpuMemoryTracker.Enabled, "needs GPU + AIDOTNET_GPU_MEMTRACK=1");
 
         float[] inD = RandData(new[] { 2048, 256 }, 1);
@@ -341,7 +351,7 @@ public class Fp16InCaptureForwardParityTests
         // no buffers. The actual peak REDUCTION is asserted in Fp16ForwardStore_LowersGpuPeakBytes (store on).
         // So this test only sanity-checks that both peaks were recorded; it must NOT assert fp16 < fp32, which
         // the measurement contradicts. Requires GPU + AIDOTNET_GPU_MEMTRACK=1.
-        var gpu = AiDotNetEngine.Current as DirectGpuTensorEngine;
+        var gpu = GpuOrNull;
         Skip.If(gpu is null || !GpuMemoryTracker.Enabled, "needs GPU + AIDOTNET_GPU_MEMTRACK=1");
 
         // Activation-dominated: big batch (2048) through modest 256x256 weights, so the held [2048,256]
@@ -424,7 +434,7 @@ public class Fp16InCaptureForwardParityTests
         // transient float up-casts are NODE OUTPUTS, so they aren't freed and the compress copies raise peak.
         // The real device VRAM win needs a node-output-transient free (purpose-built), not this cache pager.
         // Requires GPU + AIDOTNET_GPU_MEMTRACK=1 (+ AIDOTNET_FP16_GPU_CACHE=1 for the on-device compress path).
-        var gpu = AiDotNetEngine.Current as DirectGpuTensorEngine;
+        var gpu = GpuOrNull;
         Skip.If(gpu is null || !GpuMemoryTracker.Enabled, "needs GPU + AIDOTNET_GPU_MEMTRACK=1");
 
         var input = Rand(new[] { 256, 256 }, 1);
@@ -476,7 +486,7 @@ public class Fp16InCaptureForwardParityTests
         // Device-resident verification: the heterogeneous forward (FP16-native device kernels → Half
         // activation buffers) + backward (MixedPrecisionGraphBackward on the GPU engine) must produce a loss
         // and gradients matching FP32 on the actual CUDA backend. Skips on a non-GPU host.
-        var gpu = AiDotNetEngine.Current as DirectGpuTensorEngine;
+        var gpu = GpuOrNull;
         Skip.If(gpu is null, "needs a CUDA GPU host");
 
         var input = Rand(new[] { 4, 5 }, 1);

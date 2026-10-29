@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP Runtime P/Invoke bindings for AMD GPU access.
 // Provides direct access to HIP for MFMA kernel execution.
 

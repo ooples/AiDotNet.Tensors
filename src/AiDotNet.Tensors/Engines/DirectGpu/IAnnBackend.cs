@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Secondary interface for backends that ship native approximate-nearest-neighbour (ANN) kernels.
 // Follows the same optional-capability pattern as IFftBackend / IAudioBackend: if a backend implements
 // this interface, the engine dispatches ANN ops to the custom GPU kernel; otherwise the call

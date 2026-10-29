@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // One global->shared tile copy, lowered for the target: cp.async on sm_80+, and on Turing (sm_75), which has no
 // cp.async, a register round trip.
 //

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // #1432: OpenCL's fused Winograd F(2x2, 3x3) forward (WinogradFusedKernels, #1431) in WinogradF23KernelTemplate's
 // index-based conventions, emitted as Metal Shading Language and Vulkan GLSL. WGSL keeps its own copy
 // (WebGpu/WebGpuWinogradFusedKernels.cs).

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Fused activation type enum for IEngine abstraction layer.
 
 namespace AiDotNet.Tensors.Engines;
