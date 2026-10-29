@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Lowers a CodegenKernelSpec to SM86 PTX.
 //
 // This is the generated-code half of the C#-vs-Rust bake-off. It replaces
