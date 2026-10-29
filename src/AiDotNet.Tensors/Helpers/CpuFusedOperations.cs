@@ -248,7 +248,8 @@ public static class CpuFusedOperations
             if (totalPlanes >= 4 && totalElements >= ParallelElementThreshold)
             {
                 CpuParallelSettings.ParallelForOrSerial(0, totalPlanes, totalElements, p =>
-                    ApplyNchwPlaneSimd(output, bias, p, C, hw, applyRelu, upper));
+                    ApplyNchwPlaneSimd(output, bias, p, C, hw, applyRelu, upper),
+                    deterministicSafe: true);   // element-wise per plane: the same values at any thread count
             }
             else
             {
@@ -484,7 +485,8 @@ public static class CpuFusedOperations
             if (totalPlanes >= 4 && totalElements >= ParallelElementThreshold)
             {
                 CpuParallelSettings.ParallelForOrSerial(0, totalPlanes, totalElements, p =>
-                    ApplyNchwPlaneSimdDouble(output, bias, p, C, hw, activation == FusedActivationType.ReLU));
+                    ApplyNchwPlaneSimdDouble(output, bias, p, C, hw, activation == FusedActivationType.ReLU),
+                    deterministicSafe: true);   // element-wise per plane: the same values at any thread count
             }
             else
             {

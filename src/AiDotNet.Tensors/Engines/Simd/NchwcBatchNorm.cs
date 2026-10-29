@@ -99,7 +99,7 @@ internal static class NchwcBatchNorm
                     long groupBase = (long)task * spatial * CBlock;
                     ScaleBiasClampPacked((float*)inAddr + groupBase, (float*)outAddr + groupBase, spatial,
                         (float*)scaleAddr + ocg * CBlock, (float*)biasAddr + ocg * CBlock, clampLow, clampHigh);
-                });
+                }, deterministicSafe: true);   // each element is one FMA and clamp, whatever the thread count
             }
         }
         finally
@@ -169,7 +169,7 @@ internal static class NchwcBatchNorm
                     long chanBase = (long)task * spatial;
                     ScaleBiasClamp((float*)inAddr + chanBase, (float*)outAddr + chanBase, spatial,
                         packedScale[c], packedBias[c], clampLow, clampHigh);
-                });
+                }, deterministicSafe: true);   // each element is one FMA and clamp, whatever the thread count
             }
         }
         finally

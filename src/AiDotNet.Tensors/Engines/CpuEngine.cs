@@ -10887,7 +10887,10 @@ public partial class CpuEngine : ITensorLevelEngine
                 new ReadOnlySpan<float>(kArr, kOff, kLen),
                 new ReadOnlySpan<float>(inArr, inOff + n * inStride, inStride),
                 new Span<float>(outArr, outOff + n * outStride, outStride),
-                outChannels, inChannels, hw));
+                outChannels, inChannels, hw),
+            // Each image is a separate output written by one sequential GEMM in one order, so the result is the same at
+            // any thread count. Without this, deterministic reductions (AiDotNet's default) ran every image on one thread.
+            deterministicSafe: true);
         return true;
     }
 
@@ -49269,7 +49272,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         int start = c * Chunk;
                         SimdKernels.ClampUnsafe((float*)srcAddr + start, (float*)dstAddr + start,
                             Math.Min(Chunk, length - start), 0f, 6f);
-                    });
+                    }, deterministicSafe: true);   // element-wise: the same values at any thread count
                 }
             }
         }
