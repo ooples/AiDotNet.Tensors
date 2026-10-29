@@ -1197,6 +1197,53 @@ internal static partial class SimdGemm
         }
     }
 
+    /// <summary>Products up to this many FMAs take <see cref="SgemmTiledWithCachedOneDispatch"/>.</summary>
+    private const long CachedOneDispatchMaxWork = 32L * 1024 * 1024;
+
+    /// <summary>Below this many FMAs a prepacked-B product runs on the calling thread.</summary>
+    private const long CachedParallelMinWork = 512L * 1024;
+
+    [ThreadStatic] private static float[]? t_cachedTilePackedA;
+
+    /// <summary>
+    /// A small product against a prepacked B in one parallel dispatch: each (row block, column sub-block) tile packs
+    /// its own rows of A and runs every K panel itself, where the general path dispatched twice per K panel (pack A,
+    /// then compute). At batch-1 transformer sizes the dispatches cost more than the multiply. Each output still sums
+    /// the K panels in order, so the result is the general path's.
+    /// </summary>
+    private static unsafe void SgemmTiledWithCachedOneDispatch(
+        System.ReadOnlySpan<float> a, PrePackedB cached, System.Span<float> c, int m, int k, int n, int mc, int numRowBlocks)
+    {
+        int numColSubs = cached.NumColSubBlocks, colSubSize = cached.ColSubSize, numPc = cached.NumPcIters;
+        int nc = System.Math.Min(Nc, n);
+        int packedSize = ((mc + Mr - 1) / Mr) * Mr * Kc;
+        var subs = cached.PackedSubs;
+        fixed (float* aPtr = a)
+        fixed (float* cPtr = c)
+        {
+            float* ap = aPtr, cp = cPtr;
+            int aLen = a.Length, cLen = c.Length;
+            Helpers.CpuParallelSettings.LightweightParallel(numRowBlocks * numColSubs, tile =>
+            {
+                int r = tile / numColSubs, cs = tile % numColSubs;
+                int ic = r * mc, mcLocal = System.Math.Min(mc, m - ic);
+                int jStart = cs * colSubSize;
+                int subNc = cs == numColSubs - 1 ? nc - jStart : colSubSize;
+                if (mcLocal <= 0 || subNc <= 0) return;
+                var packedA = t_cachedTilePackedA;
+                if (packedA is null || packedA.Length < packedSize) t_cachedTilePackedA = packedA = new float[packedSize];
+                var aSpan = new System.ReadOnlySpan<float>(ap, aLen);
+                var cSpan = new System.Span<float>(cp, cLen);
+                for (int p = 0; p < numPc; p++)
+                {
+                    int pc = p * Kc, kc = System.Math.Min(Kc, k - pc);
+                    PackA(aSpan, packedA, k, ic, mcLocal, pc, kc);
+                    MacroKernel(packedA, subs[p * numColSubs + cs], cSpan, mcLocal, subNc, kc, n, ic, jStart);
+                }
+            });
+        }
+    }
+
     /// <summary>
     /// Tiled SGEMM using a pre-packed B. Mirrors SgemmTiled's jc/pc outer
     /// loop but reuses <see cref="PrePackedB.PackedSubs"/> instead of
@@ -1216,12 +1263,32 @@ internal static partial class SimdGemm
         bool canParallelize = UseParallelGemm
             && maxThreads > 1
             && numRowBlocks >= 1
-            && (long)m * k * n >= ParallelWorkThreshold;
+            // Lower than the general threshold: a small product here is one dispatch (SgemmTiledWithCachedOneDispatch).
+            && (long)m * k * n >= CachedParallelMinWork;
+        // Too few tiles for the threads: split the rows finer. A narrow output has few column sub-blocks (3 at n = 192),
+        // so a batch-1 ViT's [65, 768] x [768, 192] projection ran on 3 threads: 182 us against PyTorch's 66. B's
+        // packing does not depend on the row-block height, and each output still sums K in the same order, so the
+        // result is unchanged.
+        if (canParallelize && numRowBlocks * cached.NumColSubBlocks < maxThreads)
+        {
+            int rowBlocksWanted = (maxThreads + cached.NumColSubBlocks - 1) / cached.NumColSubBlocks;
+            int splitMc = Math.Max(2 * Mr, ((m + rowBlocksWanted - 1) / rowBlocksWanted + Mr - 1) / Mr * Mr);
+            if (splitMc < Mc)
+            {
+                Mc = splitMc;
+                numRowBlocks = (m + Mc - 1) / Mc;
+            }
+        }
         // Row blocks alone are enough to split: a prepacked B with one column sub-block (a narrow output, as ViT's
         // 192- and 768-wide feed-forward projections) ran the whole product on one thread however many rows it had,
         // 71% of a ViT predict. The tile loop below handles a single column sub-block; the tiles stay disjoint.
         bool useParallel2D = canParallelize && (cached.NumColSubBlocks >= 2 || numRowBlocks >= 2);
 
+        if (useParallel2D && (long)m * k * n <= CachedOneDispatchMaxWork)
+        {
+            SgemmTiledWithCachedOneDispatch(a, cached, c, m, k, n, Mc, numRowBlocks);
+            return;
+        }
         int mcRounded = ((Mc + Mr - 1) / Mr) * Mr;
         int packedASizePerRow = mcRounded * Kc;
         float[] packedABuf = useParallel2D
