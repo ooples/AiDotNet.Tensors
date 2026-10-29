@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Measured lowering choices, replacing modelled ones.
 //
 // The cost model is adequate in regimes it was calibrated on and badly wrong outside

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // GLSL compute (Vulkan) source-emitting codegen target.
 
 using System.Collections.Generic;

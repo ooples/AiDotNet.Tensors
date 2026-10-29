@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA kernels for the fused ANN primitives declared by IAnnBackend.
 // Each function is a single-pass kernel launched over output element count.
 // Mirrors AiDotNet.Tensors.Ann.AnnPrimitives function-for-function so the GPU

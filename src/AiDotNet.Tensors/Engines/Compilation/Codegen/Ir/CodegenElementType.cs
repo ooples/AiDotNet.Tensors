@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Codegen IR element type taxonomy — shared by every emitter (AVX-512
 // C#, Triton, HIP, MSL, WGSL, GLSL). See Engines/Compilation/Codegen/
 // Ir/ for the rest of the IR definitions and the lowering pass that

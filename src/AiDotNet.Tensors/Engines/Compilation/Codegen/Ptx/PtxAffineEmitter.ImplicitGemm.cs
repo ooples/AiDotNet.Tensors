@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // A tiled implicit-GEMM lowering for any two-operand sum reduction (#890 phase 4b).
 //
 // The specialised tiled convolution covers stride 1, dilation 1, padding 1 only, and the tiled

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The PTX emitter, wearing the interface every other emitter already wears.
 //
 // PtxAffineEmitter was referenced by nothing in the library except itself. It consumed
