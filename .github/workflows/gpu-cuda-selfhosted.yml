@@ -8,8 +8,9 @@ name: GPU (CUDA, self-hosted)
 # the GPU suites and AiDotNet's model families on a real NVIDIA GPU, and a test that skips here fails the lane unless
 # its reason is an explicit exemption (another backend's device, an architecture requirement).
 #
-# To enable it, register a self-hosted runner on a machine with an NVIDIA GPU and the CUDA driver (PowerShell 7 and
-# Python 3 on the machine PATH; the job installs the .NET SDK into its workspace), with the labels `self-hosted, gpu, cuda`, then set the repository variable
+# To enable it, register a self-hosted runner on a machine with an NVIDIA GPU and the CUDA driver and a CUDA 13
+# toolkit (its bin on the machine PATH, for NVRTC and cuBLAS), PowerShell 7 and Python 3 on the machine PATH; the job
+# installs the .NET SDK and cuDNN into its workspace), with the labels `self-hosted, gpu, cuda`, then set the repository variable
 # CUDA_RUNNER_ENABLED=true. Until the variable is set every job is skipped, so nothing waits for a runner that does
 # not exist. Pull requests from forks never run here: a self-hosted runner must not execute untrusted code.
 # The model families come from AiDotNet master's parity harness; the repository variable AIDOTNET_HARNESS_REF points
@@ -122,6 +123,32 @@ jobs:
         $gpu = nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv,noheader
         if ($LASTEXITCODE -ne 0) { Write-Output "::error::nvidia-smi failed: this runner has no usable NVIDIA driver."; exit 1 }
         "Runner GPU: $gpu" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
+
+    # The cuDNN paths (convolution candidates, batch norm) need cudnn64_9.dll on the loader path, and the toolkit's
+    # cuBLASLt for the CUDA it was built against: the CUDA 13 build pairs with a CUDA 13 toolkit's cublasLt64_13.dll.
+    # NVIDIA's public redistributable is fetched once into the workspace (it persists between runs) and checked
+    # against the SHA-256 in NVIDIA's own manifest.
+    - name: cuDNN
+      run: |
+        $version = '9.26.1.1'
+        $sha256 = 'c826d866641fed2c266ae1c11e679fcc1ef8517801a32a51715843051ce8df52'   # redistrib_9.26.1.json, windows-x86_64 cuda13
+        $root = Join-Path $env:GITHUB_WORKSPACE "cudnn-$version"
+        if (-not (Test-Path (Join-Path $root 'ok'))) {
+          $zip = Join-Path $env:RUNNER_TEMP 'cudnn.zip'
+          Invoke-WebRequest -UseBasicParsing -OutFile $zip `
+            "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-${version}_cuda13-archive.zip"
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLower() -ne $sha256) { Write-Output "::error::cuDNN archive SHA-256 mismatch."; exit 1 }
+          if (Test-Path $root) { Remove-Item -Recurse -Force $root }
+          New-Item -ItemType Directory -Force $root | Out-Null
+          tar -xf $zip -C $root
+          if ($LASTEXITCODE -ne 0) { Write-Output "::error::Extracting cuDNN failed."; exit 1 }
+          Remove-Item $zip
+          New-Item -ItemType File (Join-Path $root 'ok') | Out-Null
+        }
+        $dll = Get-ChildItem $root -Recurse -Filter cudnn64_9.dll | Select-Object -First 1
+        if (-not $dll) { Write-Output "::error::cudnn64_9.dll is not in the cuDNN archive."; exit 1 }
+        $dll.DirectoryName | Out-File -Append -FilePath $env:GITHUB_PATH
+        "cuDNN: $version (CUDA 13) at $($dll.DirectoryName)" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
 
     - name: Build tests (net10.0)
       run: dotnet build AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --framework net10.0
