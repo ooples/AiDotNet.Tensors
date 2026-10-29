@@ -271,13 +271,24 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
         return false;
     }
 
+    /// <summary>
+    /// Whether an average pool can absorb a zero pad: it counts padding in its divisor (count_include_pad, state 3),
+    /// or it has no padding of its own (state 2), so the folded pads are the only ones and change nothing else.
+    /// </summary>
+    private static bool PoolPaddingCountsOrIsZero(CompiledStep<T> pool)
+    {
+        if (pool.SavedState is { Length: > 3 } state && state[3] is true) return true;
+        return pool.SavedState is { Length: > 2 } own && own[2] is int[] pads && pads.All(p => p == 0);
+    }
+
     private bool IsAllZeroConstant(Tensor<T> t)
     {
         if (_w.IsRuntimeValue(t) || t.Layout != LinearAlgebra.TensorLayout.Nchw || !t.IsContiguous) return false;
         var ops = MathHelper.GetNumericOperations<T>();
         foreach (var v in t.AsSpan())
         {
-            // -0 is still zero for x + 0, but it would turn +0 inputs into... +0; equality covers both signs.
+            // Exactly zero, either sign (-0 == 0): dropping x + 0 then changes no value except a -0 input, which the
+            // add would have turned into +0.
             if (ops.ToDouble(v) != 0.0) return false;
         }
         return true;
@@ -468,8 +479,7 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
         {
             "Conv2D" => value == 0,
             // count_include_pad must hold for the pool's own padding too, or folding would start counting it.
-            "AvgPool2D" => value == 0 && (reader.SavedState is { Length: > 3 } rs && rs[3] is true
-                || reader.SavedState is { Length: > 2 } ps && ps[2] is int[] own && own.All(x => x == 0)),
+            "AvgPool2D" => value == 0 && PoolPaddingCountsOrIsZero(reader),
             "MaxPool2D" => double.IsNegativeInfinity(value) || value <= -3.0e38,
             _ => false,
         };

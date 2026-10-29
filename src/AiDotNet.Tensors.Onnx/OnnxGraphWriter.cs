@@ -62,9 +62,9 @@ internal sealed class OnnxGraphWriter<T> where T : unmanaged
 
         var translator = new OnnxStepTranslator<T>(this);
         var unsupported = new List<string>();
-        foreach (var step in steps)
+        foreach (var step in steps.Where(s => !translator.CanTranslate(s)))
         {
-            if (!translator.CanTranslate(step) && !unsupported.Contains(step.OpName))
+            if (!unsupported.Contains(step.OpName))
                 unsupported.Add(step.OpName);
         }
         if (unsupported.Count > 0)
