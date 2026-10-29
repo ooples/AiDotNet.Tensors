@@ -27151,7 +27151,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         // With reluOutput (a fused BatchNorm+ReLU), the incoming gradient is the ReLU's: lanes whose ReLU output is not
         // positive contribute +0, exactly as the separate ReLU backward (ReluBackwardUnsafe) wrote them.
-        float elemF = (float)((long)batch * spatialSize);   // the element count as float, as the kernel divides by it
+        float elemF = (float)batch * spatialSize;   // one rounding, as converting the exact product would round
         CpuParallelSettings.ParallelForOrSerial(0, channels, (long)channels * batch * spatialSize, [MethodImpl(Hot)] (c) =>
         {
             float invStd = 1f / MathF.Sqrt(vaF[c] + epsF);
