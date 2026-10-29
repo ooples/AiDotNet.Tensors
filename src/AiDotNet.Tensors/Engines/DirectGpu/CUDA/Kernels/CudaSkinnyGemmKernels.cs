@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA GEMM kernels for narrow row-major products (a small model's projections and their weight gradients).
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels

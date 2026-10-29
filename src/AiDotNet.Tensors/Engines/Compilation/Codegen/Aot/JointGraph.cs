@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Joint forward+backward graph — the representation AOTAutograd
 // operates on. Captures both halves of a training step in one
 // structure so whole-graph optimisations (DCE, in-place reinsertion,

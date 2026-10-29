@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP kernels for GRU (Gated Recurrent Unit) neural network operations.
 // Implements sequence-level forward and backward passes for efficient BPTT on AMD GPUs.
 

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // NVRTC bindings for runtime CUDA kernel compilation.
 using System;
 using System.Collections.Generic;

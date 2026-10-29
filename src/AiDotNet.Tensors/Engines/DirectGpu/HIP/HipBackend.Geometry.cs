@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP launcher shims for the geometry / sampling kernels (Issue #217).
 // Direct port of CudaBackend.Geometry.cs.
 

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Codegen compilation guards — sub-microsecond runtime checks that
 // decide whether a cached compiled kernel is still valid for the
 // current call's shapes / dtypes / graph structure.

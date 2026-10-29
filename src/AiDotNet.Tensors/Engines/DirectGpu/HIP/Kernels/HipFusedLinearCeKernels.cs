@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP kernels for the fused linear (LM head) + cross-entropy loss (#1464), WITHOUT materializing
 // the [N, vocab] logits. One thread per row recomputes its logits on the fly (the whole point of
 // the fused op) and atomic-adds its loss to a scalar accumulator; the caller divides by N.
