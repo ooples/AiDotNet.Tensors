@@ -3,10 +3,11 @@
 
 A skipped test does not fail a build, so a GPU lane whose tests skip goes green without running them. This report makes
 every skip visible, with its reason, on the run's summary page. By default it never changes the job's result; with
---fail-on-skip (a lane that has the device), any skip whose reason does not match --allowed-skip fails the job, so the
-lane cannot pass by not running.
+--fail-on-skip (a lane that has the device), any skip whose reason does not match --allowed-skip, and whose test name
+does not match --allowed-skip-test, fails the job, so the lane cannot pass by not running. --allowed-skip-test is for
+tests of another device (a HIP or Dawn device class on a CUDA lane), whose skip reasons do not name the backend.
 
-Usage: summarize-test-skips.py --title "POCL (shard)" [--fail-on-skip] [--allowed-skip REGEX] path/to/*.trx [...]
+Usage: summarize-test-skips.py --title "POCL (shard)" [--fail-on-skip] [--allowed-skip REGEX] [--allowed-skip-test REGEX] path/to/*.trx [...]
 """
 import argparse
 import glob
@@ -34,6 +35,8 @@ def main():
                         help="fail when a test skips for a reason --allowed-skip does not match")
     parser.add_argument("--allowed-skip", default=None,
                         help="regex over skip reasons that are explicit, reasoned exemptions (e.g. 'requires sm_8')")
+    parser.add_argument("--allowed-skip-test", default=None,
+                        help="regex over test names whose skips are exempt (tests of a device this lane does not have)")
     parser.add_argument("paths", nargs="+")
     args = parser.parse_args()
 
@@ -83,7 +86,9 @@ def main():
             print(f"::error title=No tests executed ({args.title})::The result files hold no passed or failed test.")
             return 1
         allowed = re.compile(args.allowed_skip) if args.allowed_skip else None
-        unexpected = [(n, r) for n, r in skipped if not (allowed and allowed.search(r))]
+        allowed_test = re.compile(args.allowed_skip_test) if args.allowed_skip_test else None
+        unexpected = [(n, r) for n, r in skipped
+                      if not (allowed and allowed.search(r)) and not (allowed_test and allowed_test.search(n))]
         if unexpected:
             for name, reason in unexpected[:50]:
                 print(f"::error title=Unexpected skip::{name}: {reason}")

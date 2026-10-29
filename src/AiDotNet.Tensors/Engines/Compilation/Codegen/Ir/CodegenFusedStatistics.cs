@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Softmax and LayerNorm as multi-pass programs over the existing spec form.
 //
 // These were blocked on the BODY's shape, not on the number of passes. The spec applies

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA kernels for native Complex<T> split-buffer tensor operations.
 // Uses separate real/imaginary GPU buffers for coalesced memory access.
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels

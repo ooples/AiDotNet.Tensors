@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP kernels for the fused Gated Linear Attention (GLA) sequence scan (issue ooples/AiDotNet#1464).
 // Mirrors the CPU reference in CpuEngine.GlaScan.cs exactly:
 //   per head, scalar-per-head gate g_t, matrix state S[di,ki]:

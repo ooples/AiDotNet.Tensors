@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The deterministic scatter-add as a stable sort and an ordered segment sum (CudaSortedScatterKernels): bit-identical
 // to the scanning deterministic kernels, which cost O(destinations x sources).
 

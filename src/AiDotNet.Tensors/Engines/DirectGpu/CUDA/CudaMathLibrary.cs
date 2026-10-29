@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The scalar math the declared elementwise kernels call (#890 phase 4a): every hand-written elementwise kernel --
 // relu, gelu, sinf, lgammaf, fmodf, leaky_relu(alpha), ... -- turned into a device FUNCTION from its own source, so a
 // declared kernel that calls it computes exactly what the kernel it replaces computed: the same expression, compiled by

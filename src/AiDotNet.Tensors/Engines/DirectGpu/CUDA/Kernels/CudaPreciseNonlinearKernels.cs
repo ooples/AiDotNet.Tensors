@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Accuracy-critical activation kernels, compiled WITHOUT --use_fast_math.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels

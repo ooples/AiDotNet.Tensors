@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // hipBLAS native bindings for HIP GEMM acceleration.
 using System;
 using System.Collections.Generic;

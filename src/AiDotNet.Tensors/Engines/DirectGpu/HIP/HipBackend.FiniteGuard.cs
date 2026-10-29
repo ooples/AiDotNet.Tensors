@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // NOTE: validated only by an NVRTC compile of the kernels -- the dev box has no AMD GPU.
 using System;
 using System.Collections.Generic;

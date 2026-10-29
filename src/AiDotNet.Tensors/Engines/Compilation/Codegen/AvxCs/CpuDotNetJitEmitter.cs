@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CPU reference emitter: lowers a CodegenGraph into a .NET
 // Expression tree, compiles it via LambdaExpression.Compile(), and
 // wraps the result in a CodegenKernel. The JIT then applies its own

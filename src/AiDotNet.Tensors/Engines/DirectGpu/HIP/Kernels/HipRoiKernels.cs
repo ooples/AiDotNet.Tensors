@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA kernels for the RoI family (torchvision roi_align / roi_pool) —
 // tail of Issue #217. One thread per output element.
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels

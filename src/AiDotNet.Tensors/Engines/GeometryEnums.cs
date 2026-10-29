@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Enumerations for the torchvision-style geometry / sampling ops added by
 // Issue #217: Interpolate, Pad, GridSample, AffineGrid.
 namespace AiDotNet.Tensors.Engines;

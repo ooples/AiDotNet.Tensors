@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Plain GEMMs on declared programs (#890 phase 4c): Gemm, MatMulTransposed, MatMulTransposedA and BatchedGemm at
 // alpha 1, beta 0 lower CodegenBackendPrograms.Gemm under one of a fixed set of schedules -- the planner's own
 // lowering or the implicit-GEMM emitter's tiles, optionally split along the reduction. (The tiled-contraction emitter
