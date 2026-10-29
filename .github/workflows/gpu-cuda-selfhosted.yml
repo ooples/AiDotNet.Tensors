@@ -54,6 +54,9 @@ env:
   GIT_CONFIG_COUNT: 1
   GIT_CONFIG_KEY_0: core.fsmonitor
   GIT_CONFIG_VALUE_0: false
+  # setup-dotnet installs into C:\Program Files\dotnet by default, which the runner's service account cannot write.
+  # Install into the workspace instead (resolved against it; it persists between runs, so the SDK is fetched once).
+  DOTNET_INSTALL_DIR: .dotnet
   # AIDOTNET_REQUIRE_GPU_TESTS is not set: it turns every backend's absence into a throw, and the suites include cases for
   # HIP, Metal, Vulkan and WebGPU this runner does not have. A missing CUDA device fails here through the skip check below
   # instead, whose exemptions name the other backends only.
