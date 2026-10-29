@@ -61,6 +61,8 @@ public sealed class MultiHeadAttentionLaunchCountTests : IClassFixture<DirectGpu
 
         var small = Rand([1, Seq, Model], 1, 1f);
         var large = Rand([16, Seq, Model], 2, 1f);
+        // A device route that threw and fell back to the CPU would pass both the launch bound and the parity check.
+        var fallbacksBefore = GpuLaunchProbe.Fallbacks;
         long smallLaunches = Launches(small);
         long largeLaunches = Launches(large);
         _output.WriteLine($"b1: {smallLaunches} launches, b16: {largeLaunches} launches");
@@ -70,6 +72,7 @@ public sealed class MultiHeadAttentionLaunchCountTests : IClassFixture<DirectGpu
             $"b16 took {largeLaunches} launches against {smallLaunches} at b1; the per-head loop is back.");
 
         var actual = engine.MultiHeadAttentionForward(large, qW, kW, vW, oW, Heads).ToArray();
+        Assert.Equal(fallbacksBefore, GpuLaunchProbe.Fallbacks);
         var expected = cpu.MultiHeadAttentionForward(large, qW, kW, vW, oW, Heads).ToArray();
         Assert.Equal(expected.Length, actual.Length);
         for (int i = 0; i < expected.Length; i++)
@@ -95,11 +98,13 @@ public sealed class MultiHeadAttentionLaunchCountTests : IClassFixture<DirectGpu
         DirectGpuTensorEngine.MhaBatchedScoreElementBudget = 0;   // every shape is past it: the fused branch
         try
         {
+            var fallbacksBefore = GpuLaunchProbe.Fallbacks;
             engine.MultiHeadAttentionForward(input, qW, kW, vW, oW, Heads);   // warm
             long before = GpuLaunchProbe.TotalEver;
             var actual = engine.MultiHeadAttentionForward(input, qW, kW, vW, oW, Heads).ToArray();
             long launches = GpuLaunchProbe.TotalEver - before;
             _output.WriteLine($"fused branch, b4: {launches} launches");
+            Assert.Equal(fallbacksBefore, GpuLaunchProbe.Fallbacks);
             // The per-head loop would take ~7 per (batch, head) pair: 112 here.
             Assert.True(launches < 4 * Heads * 7, $"The fused branch took {launches} launches; it fell back to the loop.");
 
