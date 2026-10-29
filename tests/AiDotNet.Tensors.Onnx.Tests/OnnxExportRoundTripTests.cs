@@ -273,6 +273,16 @@ internal static class RoundTripCases
                 return (n.Op(op, new[] { a, b }), new[] { 2, 3, 4 }, 17);
             }));
         }
+        foreach (var fmod in new[] { 0, 1 })
+        {
+            // fmod = 0 takes the divisor's sign (Python %), fmod = 1 the dividend's (C fmod); negative dividends tell them apart.
+            cases.Add(Named("Mod" + (fmod == 1 ? "Fmod" : "Floor"), n =>
+            {
+                var a = n.In("A", new[] { 2, 3, 4 }, -5f, 5f);
+                var b = n.W(new[] { 3, 1 }, 0.75f, 2f);
+                return (n.Op("Mod", new[] { a, b }, Int("fmod", fmod)), new[] { 2, 3, 4 }, 17);
+            }));
+        }
         cases.Add(Named("PowScalar", n =>
         {
             var a = n.In("A", new[] { 2, 3 }, 0.1f, 2f);
@@ -409,6 +419,71 @@ internal static class RoundTripCases
             var h = Norm(n.Op("Add", new[] { attn, x }));
             var ff = Linear(n.Op("Gelu", new[] { Linear(h, D, F) }), F, D);
             return (Norm(n.Op("Add", new[] { ff, h })), new[] { 1, S, D }, 20);
+        }));
+        cases.Add(Named("ResNet18", n =>
+        {
+            // torchvision resnet18's topology and widths (stem, 4 stages of 2 basic blocks, 1x1 projection shortcuts),
+            // on a 32x32 input to keep the run short. Weights have variance 1/fan_in so activations stay O(1) to the head.
+            var x = n.In("X", new[] { 1, 3, 32, 32 });
+            string Conv(string input, int cin, int cout, int k, int stride)
+            {
+                float b = (float)Math.Sqrt(3.0 / (cin * k * k));
+                int p = k / 2;
+                return n.Op("Conv", new[] { input, n.W(new[] { cout, cin, k, k }, -b, b) },
+                    Ints("kernel_shape", k, k), Ints("strides", stride, stride), Ints("pads", p, p, p, p));
+            }
+            string Bn(string input, int c) => n.Op("BatchNormalization", new[]
+            {
+                input, n.W(new[] { c }, 0.8f, 1.2f), n.W(new[] { c }, -0.1f, 0.1f), n.W(new[] { c }, -0.1f, 0.1f), n.W(new[] { c }, 0.8f, 1.2f),
+            }, Float("epsilon", 1e-5f));
+            string Block(string input, int cin, int cout, int stride)
+            {
+                var a = n.Op("Relu", new[] { Bn(Conv(input, cin, cout, 3, stride), cout) });
+                var b = Bn(Conv(a, cout, cout, 3, 1), cout);
+                var shortcut = stride == 1 && cin == cout ? input : Bn(Conv(input, cin, cout, 1, stride), cout);
+                return n.Op("Relu", new[] { n.Op("Add", new[] { b, shortcut }) });
+            }
+            var h = n.Op("Relu", new[] { Bn(Conv(x, 3, 64, 7, 2), 64) });
+            h = n.Op("MaxPool", new[] { h }, Ints("kernel_shape", 3, 3), Ints("strides", 2, 2), Ints("pads", 1, 1, 1, 1));
+            int c = 64;
+            foreach (var (width, stride) in new[] { (64, 1), (128, 2), (256, 2), (512, 2) })
+            {
+                h = Block(h, c, width, stride);
+                h = Block(h, width, width, 1);
+                c = width;
+            }
+            var flat = n.Op("Flatten", new[] { n.Op("GlobalAveragePool", new[] { h }) }, Int("axis", 1));
+            float fb = (float)Math.Sqrt(3.0 / 512);
+            return (n.Op("Gemm", new[] { flat, n.W(new[] { 10, 512 }, -fb, fb), n.W(new[] { 10 }) }, Int("transB", 1)), new[] { 1, 10 }, 17);
+        }));
+        cases.Add(Named("BertEncoder", n =>
+        {
+            // A 2-layer BERT-style encoder: position embedding + embedding LayerNorm, then per layer 2-head scaled
+            // dot-product self-attention (reshape/transpose head split and merge), residual + post-LayerNorm, GELU FFN.
+            const int S = 6, D = 16, H = 2, Dh = D / H, F = 32;
+            var x = n.In("X", new[] { 1, S, D });
+            string Linear(string input, int i, int o)
+            {
+                float b = (float)Math.Sqrt(3.0 / i);
+                return n.Op("Add", new[] { n.Op("MatMul", new[] { input, n.W(new[] { i, o }, -b, b) }), n.W(new[] { o }, -0.1f, 0.1f) });
+            }
+            string Norm(string input) => n.Op("LayerNormalization", new[] { input, n.W(new[] { D }, 0.8f, 1.2f), n.W(new[] { D }, -0.1f, 0.1f) },
+                Int("axis", -1), Float("epsilon", 1e-12f));
+            string Heads(string t) => n.Op("Transpose", new[] { n.Op("Reshape", new[] { t, n.I64(new long[] { 1, S, H, Dh }) }) },
+                Ints("perm", 0, 2, 1, 3));
+            var h = Norm(n.Op("Add", new[] { x, n.W(new[] { S, D }, -0.5f, 0.5f) }));
+            for (int layer = 0; layer < 2; layer++)
+            {
+                var q = Heads(Linear(h, D, D));
+                var kt = n.Op("Transpose", new[] { Heads(Linear(h, D, D)) }, Ints("perm", 0, 1, 3, 2));
+                var v = Heads(Linear(h, D, D));
+                var scores = n.Op("Div", new[] { n.Op("MatMul", new[] { q, kt }), n.W(new int[0], (float)Math.Sqrt(Dh), (float)Math.Sqrt(Dh)) });
+                var ctx = n.Op("MatMul", new[] { n.Op("Softmax", new[] { scores }, Int("axis", -1)), v });
+                var merged = n.Op("Reshape", new[] { n.Op("Transpose", new[] { ctx }, Ints("perm", 0, 2, 1, 3)), n.I64(new long[] { 1, S, D }) });
+                h = Norm(n.Op("Add", new[] { Linear(merged, D, D), h }));
+                h = Norm(n.Op("Add", new[] { Linear(n.Op("Gelu", new[] { Linear(h, D, F) }), F, D), h }));
+            }
+            return (h, new[] { 1, S, D }, 20);
         }));
         cases.Add(Named("GruSequence", n =>
         {
