@@ -47,7 +47,7 @@ public class SimdGemmDirectParallel2DTests
 
     private static int[] ThreadCounts => new[] { 1, 2, 3, 5, 16, Math.Max(2, Environment.ProcessorCount) };
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(64, 784, 512)]    // parity-MLP layer 1 forward (k > 512: previously the packed path)
     [InlineData(64, 512, 128)]    // parity-MLP layer 2 forward
     [InlineData(37, 300, 77)]     // ragged: last row block has 1 row, last column strip 13 columns (n % 8 != 0)
@@ -55,6 +55,8 @@ public class SimdGemmDirectParallel2DTests
     [InlineData(6, 256, 1000)]    // a single row block: all parallelism from columns
     public void MatchesReference_AndIsBitIdenticalAcrossPartitions(int m, int k, int n)
     {
+        // The direct kernels are register FMA chains with no portable form; production reaches them only behind an FMA gate.
+        Skip.IfNot(System.Runtime.Intrinsics.X86.Fma.IsSupported, "the direct GEMM kernels need FMA");
         var a = Rand(m * k, m * 31 + k);
         var b = Rand(k * n, n * 17 + k);
         var expected = Reference(a, b, m, k, n);
@@ -89,13 +91,15 @@ public class SimdGemmDirectParallel2DTests
 #if NET9_0_OR_GREATER
     // The 512-bit 6x32 tile computes each element as the same FMA chain the 256-bit tiles do, so the output may not
     // depend on which one the host runs. Forced on, it runs in software where the CPU lacks AVX-512 (same bits).
-    [Theory]
+    [SkippableTheory]
     [InlineData(64, 784, 512)]    // every strip a full 32 columns
     [InlineData(37, 300, 77)]     // 2 full strips, then a 13-column strip on the masked 16-wide kernel
     [InlineData(66, 96, 48)]      // a full strip and a 16-column remainder on the 6x16 kernel
     [InlineData(7, 40, 32)]       // one full row block (6x32 tile) and a 1-row masked block
     public void Vector512Tile_IsBitIdenticalTo256BitTiles(int m, int k, int n)
     {
+        // The direct kernels are register FMA chains with no portable form; production reaches them only behind an FMA gate.
+        Skip.IfNot(System.Runtime.Intrinsics.X86.Fma.IsSupported, "the direct GEMM kernels need FMA");
         var a = Rand(m * k, m * 13 + k);
         var b = Rand(k * n, n * 7 + k);
         var narrow = new float[m * n];
@@ -122,12 +126,14 @@ public class SimdGemmDirectParallel2DTests
     }
 
     // The transposed-A GEMM (a dense layer's dW = Xt*dY): full 6-row blocks take 32-column steps on the 512-bit tile.
-    [Theory]
+    [SkippableTheory]
     [InlineData(784, 64, 512)]    // the parity MLP's first-layer dW
     [InlineData(30, 17, 80)]      // 2 full 32-column steps, then a 16-column step
     [InlineData(29, 9, 70)]       // a 4-row remainder block, a scalar row, and a 6-column tail (mFull = 28)
     public void Vector512TransATile_IsBitIdenticalTo256BitTiles(int m, int k, int n)
     {
+        // The direct kernels are register FMA chains with no portable form; production reaches them only behind an FMA gate.
+        Skip.IfNot(System.Runtime.Intrinsics.X86.Fma.IsSupported, "the direct GEMM kernels need FMA");
         var a = Rand(k * m, m * 5 + k);   // stored [k, m]
         var b = Rand(k * n, n * 3 + k);
         var narrow = new float[m * n];
@@ -156,13 +162,15 @@ public class SimdGemmDirectParallel2DTests
     }
 #endif
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(128, 784, 512)]   // parity-MLP layer 1 forward at batch 128: 21 row blocks + a 2-row tail
     [InlineData(128, 512, 256)]   // layer 2
     [InlineData(131, 300, 250)]   // 5-row tail and a 10-column tail in the same call
     [InlineData(66, 96, 40)]      // n < 3 tiles: some column groups are just the masked tail
     public void ParallelMOverwrite_MatchesReference_AndIsBitIdenticalAcrossThreadCounts(int m, int k, int n)
     {
+        // The direct kernels are register FMA chains with no portable form; production reaches them only behind an FMA gate.
+        Skip.IfNot(System.Runtime.Intrinsics.X86.Fma.IsSupported, "the direct GEMM kernels need FMA");
         // The row x column-group split (with the m % 6 tail rows inside the last row chunk's tasks) must write every
         // element exactly once, whatever the pool size, and produce the same bits for every partition.
         var a = Rand(m * k, m * 13 + k);
@@ -197,6 +205,17 @@ public class SimdGemmDirectParallel2DTests
         const int m = 64, k = 784, n = 512;
         var a = Rand(m * k, 1);
         var b = Rand(k * n, 2);
+        if (!(System.Runtime.Intrinsics.X86.Avx2.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported))
+        {
+            // Without AVX2/FMA the gate must decline (the kernels would throw PlatformNotSupportedException) and the
+            // GEMM still be computed, on whatever route this machine can run.
+            var portable = new float[m * n];
+            int runsBeforePortable = SimdGemm.t_directParallel2DRuns;
+            SimdGemm.SgemmAddInternal(a, k, false, b, n, false, portable, m, k, n, allowParallel: true, clearedOutput: true);
+            Assert.Equal(runsBeforePortable, SimdGemm.t_directParallel2DRuns);
+            AssertMatchesReference(Reference(a, b, m, k, n), portable, k, "portable route C");
+            return;
+        }
         var direct = new float[m * n];
         Assert.True(SimdGemm.TrySgemmDirectParallel2D(a, k, b, n, direct, m, k, n, allowParallel: true));
 
@@ -225,12 +244,14 @@ public class SimdGemmDirectParallel2DTests
         }
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(64, 784, 512)]
     [InlineData(67, 100, 37)]    // ragged rows (67 = 11*6 + 1) and columns (37 = 2*16 + 5)
     [InlineData(6, 9, 16)]
     public void OverwritesEveryElementOfC_WithoutAClearedOutput(int m, int k, int n)
     {
+        // The direct kernels are register FMA chains with no portable form; production reaches them only behind an FMA gate.
+        Skip.IfNot(System.Runtime.Intrinsics.X86.Fma.IsSupported, "the direct GEMM kernels need FMA");
         // Sgemm and BlasManaged hand the 2D kernel an uncleared C: every element must be stored, edges included.
         var a = Rand(m * k, 5);
         var b = Rand(k * n, 6);
@@ -249,6 +270,18 @@ public class SimdGemmDirectParallel2DTests
         const int m = 64, k = 784, n = 512;
         var a = Rand(m * k, 3);
         var b = Rand(k * n, 4);
+        if (!System.Runtime.Intrinsics.X86.Fma.IsSupported)
+        {
+            // BlasManaged's thin-M route is gated on FMA: without it the 2D kernel must not be entered, and the GEMM
+            // must still come out right through the strategy paths.
+            var portable = new float[m * n];
+            int runsBeforePortable = SimdGemm.t_directParallel2DRuns;
+            AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(a, k, false, b, n, false, portable, n, m, n, k,
+                new AiDotNet.Tensors.Engines.BlasManaged.BlasOptions<float> { PackingMode = AiDotNet.Tensors.Engines.BlasManaged.PackingMode.DisableAutotune });
+            Assert.Equal(runsBeforePortable, SimdGemm.t_directParallel2DRuns);
+            AssertMatchesReference(Reference(a, b, m, k, n), portable, k, "portable route C");
+            return;
+        }
         var direct = new float[m * n];
         Assert.True(SimdGemm.TrySgemmDirectParallel2D(a, k, b, n, direct, m, k, n, allowParallel: true));
 

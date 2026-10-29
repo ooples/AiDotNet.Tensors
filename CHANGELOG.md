@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.144.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.144.1...v0.144.2) (2026-10-29)
+
+
+### Bug Fixes
+
+* v1 T-1 correctness (AVX2-off kernel parity, [#1570](https://github.com/ooples/AiDotNet.Tensors/issues/1570), CPU parity flakes, coverage baseline) ([#1578](https://github.com/ooples/AiDotNet.Tensors/issues/1578)) ([3680d3b](https://github.com/ooples/AiDotNet.Tensors/commit/3680d3b3d3a6a22db06042ced7981023a2760763))
+
+## [0.144.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.144.0...v0.144.1) (2026-10-29)
+
+
+### Bug Fixes
+
+* **gpu:** [#1570](https://github.com/ooples/AiDotNet.Tensors/issues/1570) residency regressions; fused gru, conv-bn folding and tensor scope; gpu smoke lane ([#1577](https://github.com/ooples/AiDotNet.Tensors/issues/1577)) ([f17bd87](https://github.com/ooples/AiDotNet.Tensors/commit/f17bd87d6d17b54c07d75ee0a49f381c61de839c))
+
+
+### Performance
+
+* **gpu:** batched multi-head attention forward instead of a per-head loop ([#1601](https://github.com/ooples/AiDotNet.Tensors/issues/1601)) ([29bb94f](https://github.com/ooples/AiDotNet.Tensors/commit/29bb94f4635f24d64cf18286d66dc58294fbd1a7))
+
 ## [0.144.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.143.0...v0.144.0) (2026-10-28)
 
 

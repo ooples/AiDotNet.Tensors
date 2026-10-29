@@ -45,7 +45,7 @@ public class SimdGemmTransAKernelTests
         return c;
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(784, 64, 512)]   // parity-MLP layer-1 dW
     [InlineData(512, 64, 128)]   // parity-MLP layer-2 dW
     [InlineData(128, 64, 10)]    // layer-3 dW: n < 16, whole width is a masked tail
@@ -56,6 +56,8 @@ public class SimdGemmTransAKernelTests
     [InlineData(3, 9, 40)]       // mFull = 0: all scalar rows
     public void MatchesTheFmaChainBitForBit(int m, int k, int n)
     {
+        // The direct kernels are register FMA chains with no portable form; production reaches them only behind an FMA gate.
+        Skip.IfNot(System.Runtime.Intrinsics.X86.Fma.IsSupported, "the direct GEMM kernels need FMA");
         var a = Rand(k * m, m * 7 + k);
         var b = Rand(k * n, n * 11 + k);
         var expected = Expected(a, b, m, k, n);
@@ -80,9 +82,11 @@ public class SimdGemmTransAKernelTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void ColumnTailWritesStayInsideTheRow()
     {
+        // The direct kernels are register FMA chains with no portable form; production reaches them only behind an FMA gate.
+        Skip.IfNot(System.Runtime.Intrinsics.X86.Fma.IsSupported, "the direct GEMM kernels need FMA");
         // C is embedded in a larger buffer: the kernel must not touch anything past m*n.
         const int m = 12, k = 4, n = 13;
         var a = Rand(k * m, 1);

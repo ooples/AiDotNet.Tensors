@@ -74,6 +74,11 @@ public sealed class MixedPrecisionCompiledPlan : IDisposable
     /// Exact, unlike a before/after read of the activation cache, which a garbage collection can shrink on its own.</summary>
     internal long ScratchBytesReleasedForTest => _scratchBytesReleased;
 
+    private long _peakBackwardResidentBytes;
+    /// <summary>The most device bytes (activation cache plus live owned results) resident after any backward node of
+    /// the free-mode backward. Sampled only while <see cref="DirectGpuTensorEngine.TrackOwnedResultBytes"/> is on.</summary>
+    internal long PeakBackwardResidentBytesForTest => _peakBackwardResidentBytes;
+
     // ── Forward Half-resident activation STORAGE (the last structural piece, #633) ─────────────────────
     // The hetero forward otherwise emits each Half matmul output as an FP32 device buffer (the engine up-casts
     // Tensor<Half> → FP32 in GetOrAllocateBuffer/FinishGpuOp), so the activations are stored FLOAT on the GPU and
@@ -312,7 +317,9 @@ public sealed class MixedPrecisionCompiledPlan : IDisposable
             var protect = _scratchFree ? new HashSet<object>(ReferenceEqualityComparer<object>.Instance) : null;
             return MixedPrecisionGraphBackward.BackwardOverOrder(_order, _output, _engine, seedScale,
                 onAfterNodeBackward: node =>
-                {
+                {                    if (DirectGpuTensorEngine.TrackOwnedResultBytes)
+                        _peakBackwardResidentBytes = Math.Max(_peakBackwardResidentBytes,
+                            _freeEng.CurrentActivationCacheBytes + _freeEng.LiveOwnedResultBytes);
                     if (_bwdReadByNode!.TryGetValue(node, out var reads))
                         foreach (var t in reads)
                             if (--rem[t] == 0) _freeEng.FreeFloatActivation(t);
