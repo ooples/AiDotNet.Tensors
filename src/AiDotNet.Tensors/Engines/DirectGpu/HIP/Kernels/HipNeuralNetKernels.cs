@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP neural network kernels - activation gradients, loss functions, optimizers.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels;

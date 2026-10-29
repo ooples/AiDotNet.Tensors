@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // #1113: HIP serves softmax, softmax backward, LayerNorm forward / input gradient / affine gradients and the RMSNorm
 // gamma gradient through the tuned-kernel registry, with its established kernels as each slot's reference.
 using System;

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Native GPU kernels for the audio primitives in Issue #217 tail. Ops
 // that compose existing GPU-accelerated STFT (Spectrogram, PitchShift,
 // TimeStretch) stay in managed code and don't live on this interface.

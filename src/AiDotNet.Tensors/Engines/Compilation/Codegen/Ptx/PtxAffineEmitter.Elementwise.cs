@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Elementwise kernels of RUNTIME length (#890 phase 4a): the pointwise family -- unary, binary, scalar-parameter,
 // column-broadcast -- as declared bodies over operands, one module per operator rather than one per shape. The
 // length, the broadcast width and any float scalars are kernel parameters; the host picks the 128-bit path when the

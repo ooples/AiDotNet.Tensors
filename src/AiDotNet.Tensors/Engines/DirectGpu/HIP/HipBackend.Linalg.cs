@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP dispatchers for the torch.linalg decomposition kernels (#211 moat #2).
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 

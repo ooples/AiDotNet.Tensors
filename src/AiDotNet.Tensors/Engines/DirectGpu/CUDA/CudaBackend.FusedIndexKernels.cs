@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 // The fused index kernels live in CudaBackend.cs; this maps the contract onto them.

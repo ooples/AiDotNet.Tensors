@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP activation kernels and simple elementwise ops.
 // HIP is source-compatible with CUDA device code.
 

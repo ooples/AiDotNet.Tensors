@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA IGpuBatchExecution (#1142). The fused operations already existed; this adds the batch plumbing and the
 // launcher for the batch kernels shared with HIP.
 using K = AiDotNet.Tensors.Engines.DirectGpu.BatchExecutionCudaKernels;

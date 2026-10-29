@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA launcher shims for the geometry / sampling kernels (Issue #217).
 
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
