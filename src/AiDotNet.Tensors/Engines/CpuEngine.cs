@@ -10864,14 +10864,19 @@ public partial class CpuEngine : ITensorLevelEngine
     /// projection convolutions ([128, 96, 16, 16] to 24 channels: 6.2 ms, against 0.58 ms in PyTorch); the per-pixel
     /// kernel they reached re-read the input for every four output channels and re-broadcast each weight per pixel.
     /// </summary>
+    private static bool IsConv1x1PerImageGemmShape(int batch, int kernelHeight, int kernelWidth, int strideH, int strideW,
+        int padH, int padW, int dilationH, int dilationW)
+        => kernelHeight == 1 && kernelWidth == 1 && strideH == 1 && strideW == 1 && padH == 0 && padW == 0
+            && dilationH == 1 && dilationW == 1 && batch >= 2;
+
     private static bool TryConv1x1PerImageGemm(
         Tensor<float> input, Tensor<float> kernel, Tensor<float> output,
         float[]? inputData, float[]? kernelData, float[]? outputData,
         int batch, int inChannels, int height, int width, int outChannels, int kernelHeight, int kernelWidth,
         int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
     {
-        if (kernelHeight != 1 || kernelWidth != 1 || strideH != 1 || strideW != 1 || padH != 0 || padW != 0
-            || dilationH != 1 || dilationW != 1 || batch < 2 || input.Layout != LinearAlgebra.TensorLayout.Nchw)
+        if (!IsConv1x1PerImageGemmShape(batch, kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW)
+            || input.Layout != LinearAlgebra.TensorLayout.Nchw)
             return false;
         int inOff = 0, kOff = 0, outOff = 0;
         float[]? inArr = inputData ?? (input.IsContiguous ? input.GetCpuBackingForStridedRead(out inOff) : null);
@@ -15169,7 +15174,15 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        var result = preAllocatedOutput ?? TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth]);
+        // The per-image 1x1 GEMM route writes every output element (DispatchFloatConv2D always passes it the arrays, so it
+        // never declines a shape it accepts): its output need not be zero-filled first, a full extra pass over expanded
+        // MobileNetV2 activations ([128, 144, 32, 32] is 75 MB).
+        bool fullyWrittenByRoute = typeof(T) == typeof(float) && input.Layout == LinearAlgebra.TensorLayout.Nchw
+            && !t_forceFullIm2Col && !t_forceImplicitGemmForTest
+            && IsConv1x1PerImageGemmShape(batch, kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW);
+        var result = preAllocatedOutput ?? (fullyWrittenByRoute
+            ? TensorAllocator.RentUninitialized<T>([batch, outChannels, outputHeight, outputWidth])
+            : TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth]));
         var inputData = input.GetReadOnlyDataArray();
         var kernelData = kernel.GetReadOnlyDataArray();
         using var outputDataLease = result.LeaseArray();
