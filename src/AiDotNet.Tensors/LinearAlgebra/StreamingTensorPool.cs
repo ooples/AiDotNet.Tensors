@@ -1343,7 +1343,7 @@ public sealed class StreamingTensorPool : IDisposable
             IsBackground = true,
             Name = "aidotnet-streaming-pool-sweep",
         };
-        thread.Start();
+        AiDotNet.Tensors.Helpers.DetachedContext.Start(thread);
     }
 
     /// <summary>
