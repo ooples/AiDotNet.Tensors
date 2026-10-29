@@ -29,7 +29,7 @@ jobs:
     # open a PR from a branch named release-please--anything to skip a required check.
     steps:
       - name: Read accepted types from release-please config
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           # Base branch, NOT the PR head: the config is the authority on what this check accepts,
           # so a PR must not be able to widen the rules it is being judged by.
@@ -39,7 +39,7 @@ jobs:
           persist-credentials: false
 
       - name: Check conventional-commit format
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             const fs = require('fs');
