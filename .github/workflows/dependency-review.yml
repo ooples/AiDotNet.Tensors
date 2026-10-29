@@ -1,0 +1,24 @@
+name: Dependency Review
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: moderate
+          # An allow-list, not deny-licenses: the deny matcher takes each entry as a whole constraint, so a composite such
+          # as `GPL-3.0-only AND MIT` passed a GPL-3.0 entry, and deny-licenses is deprecated from v5. Every identifier
+          # of a new dependency's licence expression must be one of these permissive licences (an OR needs only one).
+          allow-licenses: >-
+            MIT, MIT-0, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, Zlib, 0BSD, Unlicense, CC0-1.0, BSL-1.0, MS-PL,
+            Python-2.0, PSF-2.0

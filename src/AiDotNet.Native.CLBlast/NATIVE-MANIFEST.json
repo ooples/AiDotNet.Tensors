@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "package": "AiDotNet.Native.CLBlast",
+  "description": "Inventory of every third-party native file this package redistributes: upstream version, licence and SHA-256. tools/Test-NativeManifest.ps1 checks it against the files on disk before release packing.",
+  "components": [
+    {
+      "name": "CLBlast",
+      "supplier": "Cedric Nugteren and CLBlast contributors",
+      "version": "1.6.3",
+      "license": "Apache-2.0",
+      "licenseFile": "LICENSE.CLBlast.txt",
+      "licenseSource": "https://raw.githubusercontent.com/CNugteren/CLBlast/1.6.3/LICENSE",
+      "upstream": "https://github.com/CNugteren/CLBlast/releases/download/1.6.3/CLBlast-1.6.3-windows-x64.7z",
+      "provenance": "Byte-identical to bin/clblast.dll in the upstream 1.6.3 Windows x64 release archive (SHA-256 compared 2026-10-28).",
+      "files": [
+        {
+          "path": "runtimes/win-x64/native/clblast.dll",
+          "size": 5377536,
+          "sha256": "689155b9ea54237522f5deaa5d6aa943fc89b9a307f355bc451533511aa4d78b"
+        }
+      ]
+    }
+  ]
+}
