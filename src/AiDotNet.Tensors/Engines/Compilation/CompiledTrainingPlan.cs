@@ -13585,6 +13585,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var gradIn = gradMap[input];
             bool accum = UnaryAccumulates(input);
             var capInShape = (int[])input._shape.Clone();
+            // The scalar AvgPool2D overload also records padding and whether padded cells count in the divisor.
+            int[] poolPad = savedState.Length > 2 && savedState[2] is int[] { Length: 2 } recordedPad ? recordedPad : new[] { 0, 0 };
+            bool countIncludePad = savedState.Length > 3 && savedState[3] is bool recordedCip && recordedCip;
             bool direct = typeof(T) == typeof(float) && engine is CpuEngine && !engine.SupportsGpu
                 && input.Rank == 4 && output.Rank == 4;
             return eng =>
@@ -13603,11 +13606,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     if (!accum) Array.Clear(gi, giOff, gradIn.Length);
                     CpuEngine.AvgPool2DBackwardFloat(go, goOff, gi, giOff, capInShape[0] * capInShape[1],
                         capInShape[2], capInShape[3], output._shape[2], output._shape[3], poolSize[0], poolSize[1],
-                        poolStride[0], poolStride[1], 0, 0, countIncludePad: false);
+                        poolStride[0], poolStride[1], poolPad[0], poolPad[1], countIncludePad);
                 }
                 else
                 {
-                    var grad = eng.AvgPool2DBackward(gradOut, capInShape, poolSize, poolStride);
+                    var grad = eng.AvgPool2DBackward(gradOut, capInShape, poolSize, poolStride, poolPad, countIncludePad);
                     if (accum) eng.TensorAddInto(gradIn, gradIn, grad);
                     else grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
                 }

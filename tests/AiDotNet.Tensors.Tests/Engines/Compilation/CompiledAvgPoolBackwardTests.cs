@@ -11,8 +11,8 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// The CPU compiled plan's float AvgPool2D backward spreads the gradient straight into the plan's input-gradient buffer
 /// (the eager op rented a fresh input-sized result every step to copy or add in). It runs when the pool is its input
 /// gradient's sole writer; an input another op also reads takes the generic, accumulating backward. Against the eager
-/// tape both must give every parameter's gradient, on an overlapping pooling (stride below the window) and a plain 2x2
-/// one; later steps at learning rate zero must repeat step 0 bit for bit; and the sole-writer plan must have run the
+/// tape both must give every parameter's gradient (nonzero where connected), on an overlapping pooling (stride below
+/// the window), a plain 2x2 one, and padded ones that do and do not count padded cells in the divisor; later steps at learning rate zero must repeat step 0 bit for bit; and the sole-writer plan must have run the
 /// direct path.
 /// </summary>
 [Collection("CompilationGlobalState")]
@@ -27,11 +27,13 @@ public class CompiledAvgPoolBackwardTests
     }
 
     [Theory]
-    [InlineData(2, 2, false)]
-    [InlineData(2, 2, true)]
-    [InlineData(3, 2, false)]
-    [InlineData(3, 2, true)]
-    public void MatchesEager_AndRepeats(int pool, int stride, bool sharedInput)
+    [InlineData(2, 2, 0, false, false)]
+    [InlineData(2, 2, 0, false, true)]
+    [InlineData(3, 2, 0, false, false)]
+    [InlineData(3, 2, 0, false, true)]
+    [InlineData(3, 2, 1, false, false)]   // padded: edge windows divide by the cells they cover
+    [InlineData(3, 2, 1, true, false)]    // padded, padded cells counted in the divisor
+    public void MatchesEager_AndRepeats(int pool, int stride, int padding, bool countIncludePad, bool sharedInput)
     {
         var engine = new CpuEngine();
         var input = Filled(new[] { 2, 3, 9, 9 }, 1, 2f);
@@ -40,7 +42,10 @@ public class CompiledAvgPoolBackwardTests
         {
             int[] one = { 1, 1 }, pad = { 1, 1 };
             var t = engine.Tanh(engine.Conv2D(input, p[0], one, pad, one));
-            var pooled = engine.AvgPool2D(t, new[] { pool, pool }, new[] { stride, stride });
+            // The array overload records pool and stride only; the scalar one also padding and the divisor setting.
+            var pooled = padding == 0 && !countIncludePad
+                ? engine.AvgPool2D(t, new[] { pool, pool }, new[] { stride, stride })
+                : engine.AvgPool2D(t, pool, stride, padding, countIncludePad);
             var loss = engine.ReduceSum(engine.TensorMultiply(pooled, pooled), null);
             if (!sharedInput) return loss;
             // t is read again: its gradient accumulates the pool's contribution and this one's.
@@ -55,6 +60,10 @@ public class CompiledAvgPoolBackwardTests
             var grads = tape.ComputeGradients(Forward(eagerParams), sources: eagerParams);
             for (int i = 0; i < eagerParams.Length; i++)
                 eager[i] = grads.TryGetValue(eagerParams[i], out var g) ? g.ToArray() : new float[eagerParams[i].Length];
+            // Both paths share the pooling kernel, so agreement alone could hide a kernel that wrote nothing.
+            int connected = sharedInput ? eagerParams.Length : 1;
+            for (int i = 0; i < connected; i++)
+                Assert.True(Array.Exists(eager[i], v => v != 0f), $"parameter {i}: the eager gradient is all zero");
         }
 
         var ps = MakeParams();
@@ -75,6 +84,7 @@ public class CompiledAvgPoolBackwardTests
             var step0 = new float[ps.Length][];
             for (int i = 0; i < ps.Length; i++)
             {
+                if (i < (sharedInput ? ps.Length : 1)) Assert.True(ps[i].Grad is not null, $"parameter {i}: no compiled gradient");
                 step0[i] = ps[i].Grad?.ToArray() ?? new float[ps[i].Length];
                 for (int k = 0; k < step0[i].Length; k++)
                 {
