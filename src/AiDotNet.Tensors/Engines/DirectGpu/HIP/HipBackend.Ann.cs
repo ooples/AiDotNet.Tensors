@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP launcher shims for the fused ANN kernels (IAnnBackend). Kernels resolved
 // from _kernelCache, dispatched via 256-thread block / grid-ceil, mirroring the
 // detection idiom. Numerically identical to AnnPrimitives (the CPU oracle).

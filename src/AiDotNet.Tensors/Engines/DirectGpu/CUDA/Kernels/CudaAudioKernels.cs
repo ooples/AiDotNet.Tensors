@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA audio primitive kernels — Issue #217 tail. Spectrogram /
 // PitchShift / TimeStretch compose existing GPU STFT and stay in managed
 // code; this file holds only the element-wise and small-window kernels

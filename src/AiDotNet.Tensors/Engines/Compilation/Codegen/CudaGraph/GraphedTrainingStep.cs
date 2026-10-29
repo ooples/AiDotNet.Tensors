@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA Graph capture of a training step — forward + backward +
 // optimizer update recorded into a single cuGraph that replays
 // without per-iteration launch overhead.

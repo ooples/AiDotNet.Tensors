@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // A ptxas cubin opened for rewriting by the own SASS backend (#1442): an ELF64 image whose kernels' code lives in
 // ".text.<entry>" sections of 16-byte instructions. A kernel's register count is recorded twice and both must agree
 // with the code: in the high byte of the .text section header's sh_info (the low 24 bits are the kernel's symbol

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Lowers a whole declared program (CodegenProgram) to an ordered list of PTX launches -- what a backend runs when it
 // routes a call to a declared program instead of a hand-written kernel.
 //

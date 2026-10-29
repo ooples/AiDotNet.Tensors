@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // One definition of the Winograd F(2x2, 3x3) / F(3x3, 2x2) tile transforms, emitted as OpenCL C, HIP C++, Vulkan GLSL
 // and Metal Shading Language (#1368, #1369, #1370, #1371). WGSL has no C-like dialect and keeps its own copy
 // (WebGpu/WebGpuWinogradKernels.cs).

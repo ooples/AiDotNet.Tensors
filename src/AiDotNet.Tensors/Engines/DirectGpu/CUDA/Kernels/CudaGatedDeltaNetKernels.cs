@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA kernel for the fused Gated DeltaNet scan forward (issue ooples/AiDotNet#1464).
 // Same design as HipGatedDeltaNetKernels: one thread per (batch, head, value-row).
 

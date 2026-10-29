@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Shared helpers for every GPU source-string emitter (Triton, HIP,
 // MSL, WGSL, GLSL). Each emitter owns its kernel shell + local-
 // variable declaration syntax (Triton has no type annotations, WGSL

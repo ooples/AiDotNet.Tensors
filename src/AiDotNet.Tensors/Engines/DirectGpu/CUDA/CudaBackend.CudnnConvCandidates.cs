@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // cuDNN as candidates of the tuned convolution slots (#890 phase 4b). With cuDNN on (TensorCodecOptions.UseCudnn, the
 // default where it loads), the forward used to call cuDNN's implicit-precomp-GEMM unconditionally -- whatever the
 // shape, and bypassing every measured route -- and the backward never called cuDNN at all. Now each pass has a vendor
