@@ -175,6 +175,23 @@ internal sealed class ConvBnFusionPass : ICpuOptimizationPass
         var capturedPaddings = paddings;
         var capturedDilations = dilations;
         bool isDepthwise = conv.OpType == OpType.DepthwiseConv2D;
+        // Memory planning ran before this pass and is liveness-based: the conv's input dies at the conv, so the
+        // planner may give the BN's (or the activation's) output the conv input's storage. Convolving straight into
+        // that output would then be an in-place convolution, which reads rows it has already overwritten (wrong and,
+        // with the tiled parallel conv, nondeterministic). The conv's own output buffer never aliases its input, and
+        // no step runs between the conv and the BN, so it is a safe destination in that case.
+        var convScratch = conv.OutputBuffer;
+
+        void ConvInto(Tensor<T> output, Action<Tensor<T>> convolve)
+        {
+            if (!SharesStorage(output, capturedInput))
+            {
+                convolve(output);
+                return;
+            }
+            convolve(convScratch);
+            convScratch.AsSpan().CopyTo(output.AsWritableSpan());
+        }
 
         fused = new CompiledStep<T>(
             isDepthwise ? "FusedDepthwiseConvBn" : "FusedConvBnReLU",
@@ -189,8 +206,8 @@ internal sealed class ConvBnFusionPass : ICpuOptimizationPass
                 {
                     // Conv2DInto writes directly to output; then fused
                     // bias + activation in a single SIMD NCHW pass.
-                    cpuEngNonDw.Conv2DInto(output, capturedInput, capturedFusedWeights,
-                        capturedStrides, capturedPaddings, capturedDilations);
+                    ConvInto(output, dest => cpuEngNonDw.Conv2DInto(dest, capturedInput, capturedFusedWeights,
+                        capturedStrides, capturedPaddings, capturedDilations));
                     if (output.Rank == 4)
                     {
                         int N = output._shape[0], C = output._shape[1], H = output._shape[2], W = output._shape[3];
@@ -225,8 +242,8 @@ internal sealed class ConvBnFusionPass : ICpuOptimizationPass
                 // through via DepthwiseConv2DInto + NCHW bias+activation.
                 if (isDepthwise && eng is CpuEngine cpuEngDw && !eng.SupportsGpu && output.Rank == 4)
                 {
-                    cpuEngDw.DepthwiseConv2DInto(output, capturedInput, capturedFusedWeights,
-                        capturedStrides, capturedPaddings);
+                    ConvInto(output, dest => cpuEngDw.DepthwiseConv2DInto(dest, capturedInput, capturedFusedWeights,
+                        capturedStrides, capturedPaddings));
                     int N = output._shape[0], C = output._shape[1], H = output._shape[2], W = output._shape[3];
                     using var outArrLease = output.LeaseArray();
                     var outArr = (float[])(object)outArrLease.Array;
@@ -272,6 +289,13 @@ internal sealed class ConvBnFusionPass : ICpuOptimizationPass
             conv.SavedState);
 
         return true;
+    }
+
+    private static bool SharesStorage<T>(Tensor<T> a, Tensor<T> b)
+    {
+        using var la = a.LeaseArray();
+        using var lb = b.LeaseArray();
+        return ReferenceEquals(la.Array, lb.Array);
     }
 
     private static bool IsPointwiseActivation(string opName)

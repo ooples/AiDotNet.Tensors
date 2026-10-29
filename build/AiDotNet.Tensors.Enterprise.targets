@@ -5,7 +5,7 @@
 
     This file is auto-imported by the main csproj. It enforces that the
     AIDOTNET_DISABLE_TELEMETRY and AIDOTNET_DISABLE_LICENSE_GUARD compile-time
-    constants can ONLY be set in builds that present a valid Ooples enterprise
+    constants can ONLY be set in builds that present a valid CrowdTrainer LLC enterprise
     license. Without the license, the build fails before compilation
     reaches the #if-guarded code regions. The flags are AIDOTNET_-prefixed so
     the gate never trips on a generic DISABLE_TELEMETRY a package consumer might
@@ -196,7 +196,7 @@
     <Error
       Code="AIDOTNET002"
       Condition="'$(_AiDotNetEnterpriseLicensePath)' == ''"
-      Text="AIDOTNET_DISABLE_TELEMETRY / AIDOTNET_DISABLE_LICENSE_GUARD compile flags require AiDotNetEnterpriseLicensePath (or AIDOTNET_ENTERPRISE_LICENSE_PATH env var) pointing to the signed license file issued by Ooples for your tenant. See https://aidotnet.dev/enterprise." />
+      Text="AIDOTNET_DISABLE_TELEMETRY / AIDOTNET_DISABLE_LICENSE_GUARD compile flags require AiDotNetEnterpriseLicensePath (or AIDOTNET_ENTERPRISE_LICENSE_PATH env var) pointing to the signed license file issued by CrowdTrainer LLC for your tenant. See https://aidotnet.dev/enterprise." />
 
     <Error
       Code="AIDOTNET003"

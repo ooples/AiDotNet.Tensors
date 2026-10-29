@@ -1,0 +1,151 @@
+name: GPU (CUDA, self-hosted)
+
+# Why this lane exists (#1569)
+# ----------------------------
+# Hosted runners have no GPU, so every CUDA test skips there and CI goes green without running them. Two CUDA crash
+# classes reached main that way (grid Y/Z overflow at batch 128 in ResNet-18 / VGG-11 inference; optimizer moments
+# freed at the tape's end in MobileNetV2 training), and #1566 broke three CUDA tests unnoticed (#1570). This lane runs
+# the GPU suites and AiDotNet's model families on a real NVIDIA GPU, and a test that skips here fails the lane unless
+# its reason is an explicit exemption (another backend's device, an architecture requirement).
+#
+# To enable it, register a self-hosted runner on a machine with an NVIDIA GPU and the CUDA driver (.NET 10 SDK and
+# PowerShell 7 installed), with the labels `self-hosted, gpu, cuda`, then set the repository variable
+# CUDA_RUNNER_ENABLED=true. Until the variable is set every job is skipped, so nothing waits for a runner that does
+# not exist. Pull requests from forks never run here: a self-hosted runner must not execute untrusted code.
+# Until ooples/AiDotNet#2381 merges, also set AIDOTNET_HARNESS_REF to its branch: master's parity harness lacks most of
+# the model families, and the lane fails in its first minute saying so.
+
+on:
+  schedule:
+    - cron: '30 6 * * *'
+  workflow_dispatch:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'src/AiDotNet.Tensors/Engines/DirectGpu/**'
+      - 'src/AiDotNet.Tensors/Engines/DirectGpuTensorEngine*.cs'
+      - 'src/AiDotNet.Tensors/Engines/Gpu/**'
+      # Shared paths that decide GPU residency and buffer lifetime: a CUDA regression there must surface before merge.
+      - 'src/AiDotNet.Tensors/Engines/TensorScope.cs'
+      - 'src/AiDotNet.Tensors/Engines/Autodiff/**'
+      - 'src/AiDotNet.Tensors/LinearAlgebra/Tensor.cs'
+      - 'src/AiDotNet.Tensors/LinearAlgebra/TensorStorage.cs'
+      - 'src/AiDotNet.Tensors/Helpers/Autotune/**'
+      - '.github/workflows/gpu-cuda-selfhosted.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_NOLOGO: true
+  # Automatic selection takes CUDA only, so a backend-agnostic test or model run cannot silently land on OpenCL (which
+  # NVIDIA's driver also provides); GpuLaneBackendTests fails the suite if the engine resolves anything else.
+  AIDOTNET_DIRECTGPU_BACKENDS: cuda
+  AIDOTNET_EXPECT_GPU_BACKEND: CUDA
+  # AIDOTNET_REQUIRE_GPU_TESTS is not set: it turns every backend's absence into a throw, and the suites include cases for
+  # HIP, Metal, Vulkan and WebGPU this runner does not have. A missing CUDA device fails here through the skip check below
+  # instead, whose exemptions name the other backends only.
+
+jobs:
+  cuda:
+    if: >-
+      ${{ vars.CUDA_RUNNER_ENABLED == 'true' &&
+          (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: [self-hosted, gpu, cuda]
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      with:
+        path: AiDotNet.Tensors
+        persist-credentials: false
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+      with:
+        dotnet-version: '10.0.x'
+        dotnet-quality: 'preview'
+
+    # The skip check below is Python; a runner provisioned with only .NET and PowerShell would fail it after the tests.
+    - name: Setup Python
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+      with:
+        python-version: '3.12'
+
+    - name: Check out AiDotNet beside this checkout
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      with:
+        repository: ooples/AiDotNet
+        # The parity harness's model families come from ooples/AiDotNet#2381; until it merges, point this at its branch.
+        ref: ${{ vars.AIDOTNET_HARNESS_REF || 'master' }}
+        path: aidn
+        persist-credentials: false
+
+    # Every family is required: the regressions this lane exists for were in ResNet-18 / VGG-11 inference at batch 128
+    # and MobileNetV2 training. Checked first, so a lane enabled without a harness that defines them fails in its first
+    # minute with the fix in the message, not after the GPU suites.
+    - name: Check the AiDotNet harness defines every model family
+      run: |
+        $program = Get-Content aidn/benchmarks/AiDotNet.PyTorchParity/Program.cs -Raw
+        $families = 'mlp','cnn','lstm','transformer','gru','resnet18','resnet50','vgg11','mobilenetv2','densenet121','vit'
+        $missing = $families | Where-Object { $program -notmatch ('"' + $_ + '"\s*=>') }
+        if ($missing) {
+          Write-Output "::error::The AiDotNet parity harness at '${{ vars.AIDOTNET_HARNESS_REF || 'master' }}' does not define: $($missing -join ', '). Set the repository variable AIDOTNET_HARNESS_REF to a ref that does (ooples/AiDotNet#2381's branch until it merges)."
+          exit 1
+        }
+        "MODEL_FAMILIES=$($families -join ',')" | Out-File -Append -FilePath $env:GITHUB_ENV
+        "Model families: $($families -join ', ')" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
+
+    - name: Record the GPU and driver
+      run: |
+        $gpu = nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv,noheader
+        if ($LASTEXITCODE -ne 0) { Write-Output "::error::nvidia-smi failed: this runner has no usable NVIDIA driver."; exit 1 }
+        "Runner GPU: $gpu" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
+
+    - name: Build tests (net10.0)
+      run: dotnet build AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --framework net10.0
+
+    - name: GPU suites (DirectGpu, Autodiff, Compilation, Parity)
+      run: |
+        dotnet test AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj `
+          --configuration Release --no-build --framework net10.0 `
+          --filter "(FullyQualifiedName~GpuLaneBackend|FullyQualifiedName~Engines.DirectGpu|FullyQualifiedName~Engines.Autodiff|FullyQualifiedName~Engines.Compilation|FullyQualifiedName~Parity|FullyQualifiedName~GruSequence|FullyQualifiedName~FusedConv2DBatchNorm)&Category!=Benchmark&Category!=Performance" `
+          --logger "trx;LogFilePath=${{ runner.temp }}/trx/cuda.trx" `
+          --blame-hang --blame-hang-timeout 900s --blame-crash
+
+    - name: Fail on unexplained skips
+      if: always()
+      # Allowed: another backend's device or toolchain (this runner has CUDA, not necessarily HIP, Metal, Vulkan, WebGPU
+      # or a Python with torch), and explicit architecture requirements. A CUDA test skipping for any other reason fails.
+      run: >-
+        python AiDotNet.Tensors/scripts/ci/summarize-test-skips.py --title "CUDA" --fail-on-skip
+        --allowed-skip "(?i)(HIP|ROCm|Metal|MoltenVK|Vulkan|WebGPU|Dawn|AIDOTNET_WEBGPU_NODE_DIR|OpenCL|POCL|DirectML|macOS)|requires sm_|compute capability|torch|python|PARITY_PYTHON"
+        "${{ runner.temp }}/trx/*.trx"
+
+
+    - name: AiDotNet model families on CUDA (2 training steps, inference up to batch 128)
+      # Builds AiDotNet against this checkout (UseLocalTensors resolves ../../AiDotNet.Tensors from aidn/src), so the
+      # model families exercise exactly this commit's kernels; the families were checked at the start of the job.
+      run: |
+        dotnet run -c Release --project aidn/benchmarks/AiDotNet.PyTorchParity -p:UseLocalTensors=true -- `
+          --models $env:MODEL_FAMILIES --device cuda --epochs 1 --train-batches 2 --batch-size 64 `
+          --inference-iterations 3 --warmup-iterations 1 --output "${{ runner.temp }}/aidotnet-cuda.json"
+        if ($LASTEXITCODE -ne 0) { Write-Output "::error::An AiDotNet model family failed on CUDA."; exit 1 }
+
+    - name: Upload results
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: gpu-cuda-results
+        path: |
+          ${{ runner.temp }}/trx/**
+          ${{ runner.temp }}/aidotnet-cuda.json
+        if-no-files-found: ignore
