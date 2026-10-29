@@ -7889,6 +7889,10 @@ public partial class DirectGpuTensorEngine
 
     // PR #638 diag: pin the residual MHA leak source — count tape-active vs tapeless MHA-forward calls (the
     // tapeless ones get DropTransientActivationsCreatedAfter; tape-active are skipped). AIDOTNET_MHA_DIAG=1.
+    // Largest [B*H, S, S] score tensor (elements) the unmasked MHA forward materialises for its batched-GEMM route:
+    // 64M floats is 256 MB. Longer sequences take the fused kernel, which keeps O(S) state per row.
+    private const long MhaBatchedScoreElementBudget = 64L * 1024 * 1024;
+
     private static readonly bool s_mhaDiag = System.Environment.GetEnvironmentVariable("AIDOTNET_MHA_DIAG") == "1";
     private static long s_mhaTotal, s_mhaTapeActive;
     private const int MhaDiagDumpInterval = 500;                    // dump every N MHA calls
@@ -7952,10 +7956,55 @@ public partial class DirectGpuTensorEngine
             float scale = (float)(1.0 / System.Math.Sqrt(d));
             T scaleT = (T)(object)scale;
             var input2d = (input.IsContiguous ? input : (Tensor<T>)input.Contiguous()).Reshape(new[] { B * S, D });
-            // Q/K/V projections on the GPU (2-D GEMM), then split into [B*H, S, d].
-            var qh = ReshapePermuteHeads(backend, TensorMatMul(input2d, qWeight), B, S, H, d);
-            var kh = ReshapePermuteHeads(backend, TensorMatMul(input2d, kWeight), B, S, H, d);
-            var vh = ReshapePermuteHeads(backend, TensorMatMul(input2d, vWeight), B, S, H, d);
+            // Q/K/V projections on the GPU (2-D GEMM), [B*S, D] each.
+            var q2d = TensorMatMul(input2d, qWeight);
+            var k2d = TensorMatMul(input2d, kWeight);
+            var v2d = TensorMatMul(input2d, vWeight);
+
+            // #2384: without a mask, attend over all B*H heads at once. The per-(batch, head) loop below launches ~7
+            // kernels per pair, so its cost grew linearly with batch (Transformer b128 with 4 heads: 512 iterations
+            // per layer, 85x PyTorch). While the [B*H, S, S] scores fit the budget: one batched GEMM for Q K^T, one
+            // softmax and one batched GEMM with V, on the tuned GEMM kernels. Past it: the fused FlashAttention kernel,
+            // which never materialises the scores (the portable fused kernel recomputes each score per output column,
+            // so it lost to the loop at head width 64 on OpenCL). The loop remains for masks (it zeroes fully masked
+            // rows explicitly) and for a backend that has neither.
+            if (mask is null)
+            {
+                Tensor<T>? headsOut = null;
+                if ((long)B * H * S * S <= MhaBatchedScoreElementBudget)
+                {
+                    var qhB = ReshapePermuteHeads(backend, q2d, B, S, H, d);                                    // [B*H, S, d]
+                    var khT = PermuteResidentGpu(backend, k2d.Reshape(new[] { B, S, H, d }), new[] { 0, 2, 3, 1 })
+                        .Reshape(new[] { B * H, d, S });                                                       // [B*H, d, S]
+                    var vhB = ReshapePermuteHeads(backend, v2d, B, S, H, d);                                    // [B*H, S, d]
+                    var scoresB = TensorMultiplyScalar(BatchMatMul(qhB, khT), scaleT);                         // [B*H, S, S]
+                    var attnB = SoftmaxLastAxisGpu(backend, scoresB);
+                    headsOut = PermuteResidentGpu(backend, BatchMatMul(attnB, vhB).Reshape(new[] { B, H, S, d }),
+                        new[] { 0, 2, 1, 3 });                                                                 // [B, S, H, d]
+                }
+                else
+                {
+                    headsOut = TryFusedAttentionOnDevice("MultiHeadAttentionForward", q2d.Reshape(new[] { B, S, D }),
+                        k2d.Reshape(new[] { B, S, D }), v2d.Reshape(new[] { B, S, D }), null, B, H, S, S, d,
+                        interleaved: true, 1.0 / System.Math.Sqrt(d), 0.0, causal: false, causalOffset: 0,
+                        new[] { B, S, D });
+                }
+
+                if (headsOut is not null)
+                {
+                    var batchedProj = TensorMatMul(headsOut.Reshape(new[] { B * S, D }), outWeight);
+                    var batchedResult = batchedProj.Reshape(new[] { B, S, D });
+                    bool batchedTapeActive = IsTapeActive<T>();
+                    if (!batchedTapeActive)
+                        DropTransientActivationsCreatedAfter(actSnapshot, batchedProj.DataVector, allThreads: true);
+                    if (s_mhaDiag) MhaDiag(batchedTapeActive);
+                    return batchedResult;
+                }
+            }
+            // Split into [B*H, S, d] for the per-head loop.
+            var qh = ReshapePermuteHeads(backend, q2d, B, S, H, d);
+            var kh = ReshapePermuteHeads(backend, k2d, B, S, H, d);
+            var vh = ReshapePermuteHeads(backend, v2d, B, S, H, d);
 
             var headOuts = new Tensor<T>[B * H];
             Tensor<T>? maskFill = null;
