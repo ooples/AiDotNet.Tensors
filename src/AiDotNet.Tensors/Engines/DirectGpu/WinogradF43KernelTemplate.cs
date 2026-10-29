@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // #1432: the Winograd F(4x4, 3x3) tile transforms of OpenCL's WinogradF43Kernels, written once in
 // WinogradF23KernelTemplate's index-based conventions and emitted as Metal Shading Language and Vulkan GLSL. WGSL keeps
 // its own copy (WebGpu/WebGpuWinogradF43Kernels.cs).

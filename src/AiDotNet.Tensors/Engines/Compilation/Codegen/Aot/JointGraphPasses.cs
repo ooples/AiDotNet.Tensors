@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Passes that operate on the joint forward+backward graph: dead-
 // code elimination, min-cut activation partitioning, in-place op
 // reinsertion.

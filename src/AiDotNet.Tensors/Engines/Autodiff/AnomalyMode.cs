@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Anomaly detection with forward-op-site localization: points at the
 // original forward call when a NaN/Inf appears in the backward pass.
 

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Routes backend calls to DECLARED programs (#890 phase 4): a normalisation call is served by the program lowered from
 // its spec (PtxProgramLowering) instead of a hand-written kernel, in the hand-written kernel's own contract
 // (CodegenBackendPrograms). A program is lowered once per shape and its modules and scratch are cached; a shape the

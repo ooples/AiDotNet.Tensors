@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // GPU dispatch for the geometry / sampling ops added by Issue #217:
 // Interpolate, PadNd, GridSample (extended), AffineGrid3D. Falls through
 // to CpuEngine via inherited base.* when the backend does not implement

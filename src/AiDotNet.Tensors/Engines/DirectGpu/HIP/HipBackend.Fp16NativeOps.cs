@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // FP16-NATIVE elementwise / activation ops for the HIP backend (Tensors #558): GELU / ReLU / residual
 // add over half-stored activations. The kernels (fp16_gelu / fp16_relu / fp16_add in HipFp16Kernels)
 // read the activation DIRECTLY from a half buffer, compute in FP32 in-register (packed __half2, 2

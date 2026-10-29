@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // GPU fused decode-attention kernels (P2, FlashDecoding) for CUDA (nvRTC). Single-query attention over
 // contiguous K/V, sequence split across threads and merged by an online-softmax reduction.
 

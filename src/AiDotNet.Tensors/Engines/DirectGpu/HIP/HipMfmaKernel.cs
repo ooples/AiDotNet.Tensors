@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // AMD MFMA (Matrix Fused Multiply-Add) kernel using HIP intrinsics.
 // Provides 8-16x speedup over scalar OpenCL on MI100/MI200/MI300 and RDNA3.
 

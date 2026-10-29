@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP kernel for the fused RWKV-4 time-mixing WKV scan forward (#1464).
 // Mirrors CpuEngine.Rwkv4Wkv / RecurrenceCpuKernels.Rwkv4WkvForward. Per-channel scalar state
 // (aa, bb) with a running max pp, so one thread owns (batch b, channel c). Backward via tape.
