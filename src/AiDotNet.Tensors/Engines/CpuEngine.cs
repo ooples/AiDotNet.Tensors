@@ -16480,18 +16480,23 @@ public partial class CpuEngine : ITensorLevelEngine
             // hands back the live float[] (no copy).
             var destF = (float[])(object)dest._storage.GetDataArray();
             int destOff = dest._storageOffset;
-            // Col2ImAccumulate is accumulating — for overwrite mode, zero the
-            // destination region first.
-            if (!accumulate)
-                Array.Clear(destF, destOff, batch * inChannels * height * width);
             var gradOutputF = (float[])(object)gradOutput.GetFlattenedData();
             var kernelF = (float[])(object)kernel.GetFlattenedData();
-            if (UseBatchedConv(batch, colH, colW, outChannels))
+            bool batched = UseBatchedConv(batch, colH, colW, outChannels);
+            // A 1x1, stride-1, unpadded kernel's col2im is a plain copy, so the batched route overwrites the destination
+            // and needs no clear (half of DenseNet's convolutions).
+            bool overwritePointwise = batched && !accumulate && kernelHeight == 1 && kernelWidth == 1
+                && strideH == 1 && strideW == 1 && padH == 0 && padW == 0;
+            // Col2ImAccumulate is accumulating — for overwrite mode, zero the
+            // destination region first.
+            if (!accumulate && !overwritePointwise)
+                Array.Clear(destF, destOff, batch * inChannels * height * width);
+            if (batched)
             {
                 Conv2DBackwardInputBatchedFloat(
                     destF, destOff, gradOutputF, kernelF,
                     batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
-                    strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
+                    strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth, overwritePointwise);
                 return;
             }
             var pool = System.Buffers.ArrayPool<float>.Shared;
@@ -38951,9 +38956,45 @@ public partial class CpuEngine : ITensorLevelEngine
         // Exactly source.Length elements are copied, never a (possibly over-allocated) backing array's length.
         using var sourceKeep1 = new KeepAliveScope(source);
         using var destinationKeep24 = new KeepAliveScope(destination);
-        source.AsSpanUnmarked().Slice(0, source.Length).CopyTo(destination.AsWritableSpanUnmarked());
+        var sourceSpan = source.AsSpanUnmarked().Slice(0, source.Length);
+        var destinationSpan = destination.AsWritableSpanUnmarked();
+        if (typeof(T) == typeof(float) && source.Length >= ParallelCopyMinElements)
+        {
+            if (destinationSpan.Length < sourceSpan.Length)
+                throw new ArgumentException("Destination is shorter than the source.", nameof(destination));
+            unsafe
+            {
+                fixed (byte* ps = &System.Runtime.CompilerServices.Unsafe.As<T, byte>(
+                    ref System.Runtime.InteropServices.MemoryMarshal.GetReference(sourceSpan)))
+                fixed (byte* pd = &System.Runtime.CompilerServices.Unsafe.As<T, byte>(
+                    ref System.Runtime.InteropServices.MemoryMarshal.GetReference(destinationSpan)))
+                    ParallelCopyBytes((nint)ps, (nint)pd, (long)sourceSpan.Length * sizeof(float));
+            }
+        }
+        else
+            sourceSpan.CopyTo(destinationSpan);
         destination.IncrementVersion();
         InvalidatePersistentTensor(destination);
+    }
+
+    // A copy this large is split across the pool; below it one memcpy is faster than a dispatch.
+    private const int ParallelCopyMinElements = 256 * 1024;
+    private const int ParallelCopyChunkBytes = 1 << 20;
+
+    /// <summary>
+    /// Copies <paramref name="length"/> bytes from <paramref name="source"/> to <paramref name="destination"/> (both pinned) in 1 MB chunks across the
+    /// pool. The generic gradient accumulator's first write (CopyFirstWrite) copies whole activation-sized gradients:
+    /// one serial memcpy each was 2.7% of DenseNet-121's training step on the main thread.
+    /// </summary>
+    private static unsafe void ParallelCopyBytes(nint source, nint destination, long length)
+    {
+        int chunks = (int)((length + ParallelCopyChunkBytes - 1) / ParallelCopyChunkBytes);
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, length / sizeof(float), c =>
+        {
+            long start = (long)c * ParallelCopyChunkBytes;
+            long count = Math.Min(ParallelCopyChunkBytes, length - start);
+            Buffer.MemoryCopy((byte*)source + start, (byte*)destination + start, count, count);
+        }, deterministicSafe: true);   // a copy: the same at any thread count
     }
 
     /// <inheritdoc/>

@@ -102,13 +102,17 @@ public partial class CpuEngine
         }
     }
 
-    /// <summary>Accumulates into <paramref name="destF"/>; the caller clears it first when not accumulating.</summary>
+    /// <summary>
+    /// Accumulates into <paramref name="destF"/>; the caller clears it first when not accumulating. With
+    /// <paramref name="overwritePointwise"/> (a 1x1, stride-1, unpadded kernel, whose col2im is a plain copy) it
+    /// overwrites instead, so the caller need not clear.
+    /// </summary>
     private static void Conv2DBackwardInputBatchedFloat(
         float[] destF, int destOff, float[] gradOutputF, float[] kernelF,
         int batch, int inChannels, int height, int width,
         int outChannels, int kernelHeight, int kernelWidth,
         int strideH, int strideW, int padH, int padW, int dilationH, int dilationW,
-        int outputHeight, int outputWidth)
+        int outputHeight, int outputWidth, bool overwritePointwise = false)
     {
         int kHW = kernelHeight * kernelWidth;
         int colH = inChannels * kHW;
@@ -133,6 +137,11 @@ public partial class CpuEngine
             CpuParallelSettings.ParallelForOrSerial(0, batch * inChannels, (long)colH * colWAll, bc =>
             {
                 int b = bc / inChannels, c = bc % inChannels;
+                if (overwritePointwise)
+                {
+                    Array.Copy(cols, c * colWAll + b * colW, destF, destOff + (b * inChannels + c) * planeSize, planeSize);
+                    return;
+                }
                 Im2ColHelper.Col2ImAccumulateStrided(
                     new ReadOnlySpan<float>(cols, c * kHW * colWAll, kHW * colWAll), colWAll, b * colW,
                     new Span<float>(destF, destOff + (b * inChannels + c) * planeSize, planeSize),
