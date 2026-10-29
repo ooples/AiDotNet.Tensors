@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Optional capability interface for backends that ship native kernels for
 // the geometry / sampling ops added by Issue #217 (Interpolate, PadNd,
 // GridSample, AffineGrid3D). DirectGpuTensorEngine type-tests against

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Secondary interface for backends that ship native FFT kernels. Follows the
 // same pattern as IParity210Backend / ILinalgBackend: if a backend implements
 // this interface, the engine dispatches FFT ops to the custom GPU kernel;
