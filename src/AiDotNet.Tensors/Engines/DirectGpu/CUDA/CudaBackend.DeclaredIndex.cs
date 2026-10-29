@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The index family through declared programs (#890 phase 4e, #1441): the deterministic index write / copy / fill (the
 // last index wins) and index add, the scatter reduction's sum, maximum and minimum, and the remaining gathers (int32
 // take-along-dim, the linear take, float-id index_select and ScatterAddBackward). The writes and reductions share the

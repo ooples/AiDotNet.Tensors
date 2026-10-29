@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CompiledStep → CodegenGraph lowering. Walks a contiguous run of
 // fusible pointwise steps and emits an equivalent CodegenGraph that
 // the emitter layer turns into a single kernel.

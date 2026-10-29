@@ -15,11 +15,11 @@ namespace AiDotNet.Tensors.Licensing;
 /// guard. This is the cryptographic trust anchor that does NOT depend on the
 /// online license server (and therefore cannot be defeated by spoofing /
 /// MITM'ing that server — the single cheapest bypass of the online path):
-/// the entitlement is a JSON token signed by Ooples' private key, and the
+/// the entitlement is a JSON token signed by CrowdTrainer LLC's private key, and the
 /// runtime verifies it with an embedded RSA public key, fully offline.
 ///
 /// <para><b>Threat model — read this honestly.</b> RSA signature verification
-/// means an attacker cannot FORGE an entitlement without Ooples' private key.
+/// means an attacker cannot FORGE an entitlement without CrowdTrainer LLC's private key.
 /// It does NOT make the guard unbreakable: this runs in managed bytecode the
 /// attacker controls, so they can still patch out the verification call or swap
 /// the embedded key (see <see cref="LicenseTamperEvidence"/>, which makes the
@@ -50,12 +50,12 @@ public static class SignedEntitlement
     public const string Marker = "AiDotNet-Tensors-Entitlement-v1";
 
     /// <summary>
-    /// Placeholder for the embedded RSA public key. Until Ooples replaces this
+    /// Placeholder for the embedded RSA public key. Until CrowdTrainer LLC replaces this
     /// with the real public key, every entitlement is rejected (safe by
     /// default) and the runtime falls through to the existing online/trial
     /// path — so shipping this feature with the placeholder changes nothing.
     /// </summary>
-    public const string PublicKeyPlaceholderMarker = "REPLACE_WITH_REAL_OOPLES_ENTITLEMENT_PUBLIC_KEY";
+    public const string PublicKeyPlaceholderMarker = "REPLACE_WITH_REAL_LICENSE_ENTITLEMENT_PUBLIC_KEY";
 
     /// <summary>
     /// Embedded RSA public key as <c>{modulusBase64}:{exponentBase64}</c>

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Issue #301 — DDIM sampler-update chain detection for graph-mode auto-fusion.
 
 using System;

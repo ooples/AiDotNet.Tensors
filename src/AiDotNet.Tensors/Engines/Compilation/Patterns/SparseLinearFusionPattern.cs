@@ -1,5 +1,5 @@
 using System;
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Issue #301 — sparse-linear chain detection for graph-mode auto-fusion.
 
 using System.Collections.Generic;
