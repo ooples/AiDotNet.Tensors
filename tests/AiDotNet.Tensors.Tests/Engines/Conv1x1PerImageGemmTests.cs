@@ -45,4 +45,38 @@ public sealed class Conv1x1PerImageGemmTests
         for (int r = 0; r < 3; r++)
             Assert.Equal(y, e.Conv2D(input, kernel, new[] { 1, 1 }, new[] { 0, 0 }, new[] { 1, 1 }).ToArray());
     }
+
+    /// <summary>
+    /// Deep inputs on small maps take the shared-weight route (the weight packed once for the batch). These cases span
+    /// two K panels (cin over 512) and two row blocks (cout over 128), with whole and ragged pixel counts. The bound is
+    /// float summation's: cin * 2^-24 times the sum of the absolute products, which a misplaced panel or block exceeds.
+    /// </summary>
+    [Theory]
+    [InlineData(3, 960, 200, 4, 4)]
+    [InlineData(5, 576, 160, 4, 4)]
+    [InlineData(2, 640, 136, 3, 5)]
+    public void SharedWeightRoute_EqualsTheDirectSum_AndIsDeterministic(int n, int cin, int cout, int h, int w)
+    {
+        var x = Rand(3, n * cin * h * w); var k = Rand(4, cout * cin);
+        var e = new CpuEngine();
+        var input = new Tensor<float>(x, new[] { n, cin, h, w });
+        var kernel = new Tensor<float>(k, new[] { cout, cin, 1, 1 });
+        var y = e.Conv2D(input, kernel, new[] { 1, 1 }, new[] { 0, 0 }, new[] { 1, 1 }).ToArray();
+        int hw = h * w;
+        for (int b = 0; b < n; b++)
+            for (int o = 0; o < cout; o++)
+                for (int p = 0; p < hw; p++)
+                {
+                    double sum = 0, magnitude = 0;
+                    for (int i = 0; i < cin; i++)
+                    {
+                        double term = (double)k[o * cin + i] * x[(b * cin + i) * hw + p];
+                        sum += term; magnitude += Math.Abs(term);
+                    }
+                    float got = y[(b * cout + o) * hw + p];
+                    Assert.True(Math.Abs(sum - got) <= cin * Math.Pow(2, -24) * magnitude, $"[{b},{o},{p}]: {got} vs {sum}");
+                }
+        for (int r = 0; r < 3; r++)
+            Assert.Equal(y, e.Conv2D(input, kernel, new[] { 1, 1 }, new[] { 0, 0 }, new[] { 1, 1 }).ToArray());
+    }
 }

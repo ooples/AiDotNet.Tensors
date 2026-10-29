@@ -10886,6 +10886,13 @@ public partial class CpuEngine : ITensorLevelEngine
 
         int hw = height * width;
         int inStride = inChannels * hw, outStride = outChannels * hw, kLen = outChannels * inChannels;
+        if (Simd.SimdGemm.PrefersSharedA(outChannels, inChannels, hw))
+        {
+            // The weight is packed once for the batch; a per-image GEMM that packs repacked it for every image.
+            Simd.SimdGemm.SgemmSharedA(kArr, kOff, inArr, inOff, inStride, outArr, outOff, outStride,
+                outChannels, inChannels, hw, batch);
+            return true;
+        }
         long work = 2L * batch * outChannels * inChannels * hw;
         CpuParallelSettings.ParallelForOrSerial(0, batch, work, n =>
             Simd.SimdGemm.SgemmSequential(

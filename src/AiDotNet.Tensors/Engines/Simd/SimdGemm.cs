@@ -1548,6 +1548,74 @@ internal static partial class SimdGemm
         SgemmAddInternal(a, k, false, b, n, false, c, m, k, n, allowParallel: false, clearedOutput: true);
     }
 
+    /// <summary>
+    /// Computes C_i = A · B_i for <paramref name="count"/> independent [k, n] / [m, n] pairs that share one [m, k] A,
+    /// as a 1x1 convolution does with its weight over a batch of images. A is packed once, not once per pair: with a
+    /// small n (a 4x4 or 8x8 map) repacking the weight for every image cost more than the multiply. Pairs run in
+    /// parallel, each written by one sequential pass in a fixed order, so the result does not depend on the thread
+    /// count and matches <see cref="SgemmSequential"/> on each pair.
+    /// </summary>
+    /// <summary>
+    /// Whether <see cref="SgemmSharedA"/> beats one <see cref="SgemmSequential"/> per pair: when the per-pair GEMM
+    /// would pack A (it misses the unpacked direct kernel), since that packing is what sharing saves. Where the direct
+    /// kernel applies it won, e.g. b128 [960,160]x[160,16] 0.82 ms against 0.97 shared; [320,960]x[960,16] took
+    /// 1.77 ms shared against 3.42 per pair.
+    /// </summary>
+    internal static bool PrefersSharedA(int m, int k, int n)
+        => n <= Nc && !(n >= Nr && n % 8 == 0 && k <= SmallMatmulKThreshold && (long)m * k * n <= SmallMatmulWorkThreshold);
+
+    internal static void SgemmSharedA(
+        float[] a, int aOffset, float[] b, int bOffset, int bStride, float[] c, int cOffset, int cStride,
+        int m, int k, int n, int count)
+    {
+        if (n > Nc) throw new ArgumentOutOfRangeException(nameof(n), $"n must be at most {Nc}.");
+        int mc0 = SmallMc;
+        int rowBlocks = (m + mc0 - 1) / mc0, depthBlocks = (k + Kc - 1) / Kc;
+        int packedASize = ((mc0 + Mr - 1) / Mr) * Mr * Kc;
+        var packedA = new float[rowBlocks * depthBlocks][];
+        var aSpanSource = new ReadOnlyMemory<float>(a, aOffset, m * k);
+        try
+        {
+            for (int i = 0; i < packedA.Length; i++) packedA[i] = ArrayPool<float>.Shared.Rent(packedASize);
+            Helpers.CpuParallelSettings.ParallelForOrSerial(0, packedA.Length, (long)m * k, block =>
+            {
+                int pc = (block / rowBlocks) * Kc, ic = (block % rowBlocks) * mc0;
+                PackA(aSpanSource.Span, packedA[block], k, false, ic, Math.Min(mc0, m - ic), pc, Math.Min(Kc, k - pc));
+            }, deterministicSafe: true);
+
+            int packedBSize = Kc * (((n + Nr - 1) / Nr) * Nr);
+            Helpers.CpuParallelSettings.ParallelForOrSerial(0, count, 2L * count * m * k * n, pair =>
+            {
+                float[] packedB = ArrayPool<float>.Shared.Rent(packedBSize);
+                try
+                {
+                    var bPair = new ReadOnlySpan<float>(b, bOffset + pair * bStride, k * n);
+                    var cPair = new Span<float>(c, cOffset + pair * cStride, m * n);
+                    cPair.Clear();
+                    for (int pBlock = 0; pBlock < depthBlocks; pBlock++)
+                    {
+                        int pc = pBlock * Kc, kc = Math.Min(Kc, k - pc);
+                        PackB(bPair, packedB, n, false, pc, kc, 0, n);
+                        for (int rBlock = 0; rBlock < rowBlocks; rBlock++)
+                        {
+                            int ic = rBlock * mc0;
+                            MacroKernel(packedA[pBlock * rowBlocks + rBlock], packedB, cPair, Math.Min(mc0, m - ic), n, kc, n, ic, 0);
+                        }
+                    }
+                }
+                finally
+                {
+                    ArrayPool<float>.Shared.Return(packedB);
+                }
+            }, deterministicSafe: true);
+        }
+        finally
+        {
+            foreach (var block in packedA)
+                if (block is not null) ArrayPool<float>.Shared.Return(block);
+        }
+    }
+
     /// <summary>Sequential recurrent projection with a write-first direct kernel.
     /// Only the store-only route skips clearing; other shapes retain normal dispatch.</summary>
     internal static void SgemmRecurrentOverwrite(
