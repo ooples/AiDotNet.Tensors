@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA IoU/GIoU/DIoU/CIoU loss kernels for bounding box regression.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
