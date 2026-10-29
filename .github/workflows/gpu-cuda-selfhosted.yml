@@ -175,7 +175,13 @@ jobs:
       run: dotnet build AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --framework net10.0
 
     - name: GPU suites (DirectGpu, Autodiff, Compilation, Parity)
+      env:
+        # cuDNN's own error log, uploaded with the TRX. A cuDNN failure such as CUDNN_STATUS_EXECUTION_FAILED_CUDART
+        # then names the CUDA runtime call that failed, which the exception does not.
+        CUDNN_LOGERR_DBG: '1'
+        CUDNN_LOGDEST_DBG: ${{ runner.temp }}/trx/cudnn-errors.log
       run: |
+        New-Item -ItemType Directory -Force "${{ runner.temp }}/trx" | Out-Null
         dotnet test AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj `
           --configuration Release --no-build --framework net10.0 `
           --filter "(FullyQualifiedName~GpuLaneBackend|FullyQualifiedName~Engines.DirectGpu|FullyQualifiedName~Engines.Autodiff|FullyQualifiedName~Engines.Compilation|FullyQualifiedName~Parity|FullyQualifiedName~GruSequence|FullyQualifiedName~FusedConv2DBatchNorm)&Category!=Benchmark&Category!=Performance" `
