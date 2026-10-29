@@ -86,7 +86,7 @@ infra/tooling, not code:
    pipeline (`.github/workflows/automated-release.yml`) now signs every package
    via `dotnet nuget sign` + timestamp; it's a **no-op until** the
    `CODE_SIGNING_CERT_BASE64` / `CODE_SIGNING_CERT_PASSWORD` secrets are set, so
-   it never breaks a build. **To activate:** provision an Ooples code-signing
+   it never breaks a build. **To activate:** provision a CrowdTrainer LLC code-signing
    certificate and add those two secrets. (Authenticode-signing the individual
    DLLs is a further step — `signtool`/`osslsigncode` — once a cert exists.)
 3. **Sign the online validation response + client nonce** *(client DONE, needs
