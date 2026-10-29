@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The own SASS backend's scheduler (#1442): it owns the control word ptxas would otherwise choose. Given a kernel's
 // instructions in issue order, it recomputes every stall count, scoreboard assignment and wait mask from
 // SassOpcodeTable's view of what each instruction reads and writes:

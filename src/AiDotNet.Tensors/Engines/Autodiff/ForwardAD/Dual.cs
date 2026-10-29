@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Forward-mode AD dual numbers — packed primal + tangent tensors.
 
 using System;

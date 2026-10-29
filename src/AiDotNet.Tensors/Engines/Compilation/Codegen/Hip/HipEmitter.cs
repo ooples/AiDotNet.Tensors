@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP (AMD ROCm) source-emitting codegen target. Emits C kernels
 // that target hipcc / hiprtc.
 

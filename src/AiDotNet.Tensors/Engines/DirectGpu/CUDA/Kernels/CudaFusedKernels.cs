@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Fused operation kernels for CUDA - GEMM + Bias + Activation in single pass.
 // Eliminates memory round-trips for 20-50% performance gain.
 

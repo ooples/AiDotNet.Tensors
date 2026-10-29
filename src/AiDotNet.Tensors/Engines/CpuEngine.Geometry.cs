@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CPU reference implementations of the geometry / sampling ops added by
 // Issue #217: Interpolate (6 modes × 1D/2D/3D), PadNd (4 modes × any rank),
 // GridSample (bilinear / nearest / bicubic × zeros / border / reflection

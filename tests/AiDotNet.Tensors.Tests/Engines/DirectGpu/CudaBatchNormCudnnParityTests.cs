@@ -68,7 +68,11 @@ public sealed class CudaBatchNormCudnnParityTests : IDisposable
         int batch, int channels, int spatialSize)
     {
         var prev = TensorCodecOptions.Current;
+        var prevDeclared = cb.DeclaredKernelsSwitch;
         TensorCodecOptions.SetCurrent(new TensorCodecOptions { UseCudnnBatchNorm = useCudnn });
+        // The declared training program is tried before cuDNN and the hand-written kernel, so with it on both
+        // gate settings would run the same program and the comparison would be vacuous.
+        cb.DeclaredKernelsSwitch = false;
         try
         {
             int n = batch * channels * spatialSize;
@@ -114,6 +118,7 @@ public sealed class CudaBatchNormCudnnParityTests : IDisposable
         }
         finally
         {
+            cb.DeclaredKernelsSwitch = prevDeclared;
             TensorCodecOptions.SetCurrent(prev);
         }
     }

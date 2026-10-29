@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // A version stamp for how a number was measured.
 //
 // The measurement protocol changed fourteen times during this project, and each change
