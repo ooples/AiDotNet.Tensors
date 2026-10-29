@@ -25989,12 +25989,27 @@ public partial class CpuEngine : ITensorLevelEngine
             if (scope != null)
             {
                 var ci = input; var cg = gamma; var cb = beta; double ce = epsilon;
+                // A 4D float input on the CPU is normalized straight into the recorded output below, reading the input's
+                // live array: the eager path copied a pool-padded input whole (GetReadOnlyDataArray) and normalized into
+                // a fresh result it then copied into the recorded output -- two activation-sized temporaries per BatchNorm,
+                // over a quarter of everything a DenseNet-121 training trace allocated.
+                bool directIntoRecorded = typeof(T) == typeof(float) && !SupportsGpu && input.Rank == 4
+                    && input.IsContiguous && gamma.IsContiguous && beta.IsContiguous
+                    && gamma.Length == input._shape[1] && beta.Length == input._shape[1];
                 var savedScope = GraphMode.Current;
                 GraphMode.SetCurrent(null);
-                Tensor<T> eagerResult;
+                Tensor<T>? eagerResult = null;
                 try
                 {
-                    eagerResult = BatchNorm(ci, cg, cb, ce, out mean, out variance);
+                    if (directIntoRecorded)
+                    {
+                        mean = new Tensor<T>(new[] { input._shape[1] });
+                        variance = new Tensor<T>(new[] { input._shape[1] });
+                    }
+                    else
+                    {
+                        eagerResult = BatchNorm(ci, cg, cb, ce, out mean, out variance);
+                    }
                 }
                 finally
                 {
@@ -26021,7 +26036,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedMean = mean; var capturedVar = variance;
                 // Record in graph so compiled plan captures the dependency
                 var lazyResult = scope.RecordVariadic(LazyNodeType.Custom, "BatchNorm",
-                    new[] { input, gamma, beta }, eagerResult._shape,
+                    new[] { input, gamma, beta }, eagerResult?._shape ?? (int[])input._shape.Clone(),
                     (eng, output) =>
                     {
                         // Normalize straight into the plan's buffers: computing into fresh tensors and copying all three in
@@ -26044,10 +26059,39 @@ public partial class CpuEngine : ITensorLevelEngine
                         }
                     },
                     BackwardFunctions<T>.BatchNormBackward, new object[] { mean, variance, epsilon });
-                using var eagerResultKeep1 = new KeepAliveScope(eagerResult);
                 using var lazyResultKeep1 = new KeepAliveScope(lazyResult);
-                eagerResult.AsSpanUnmarked().CopyTo(lazyResult.AsWritableSpanUnmarked());
-                Helpers.TensorAllocator.Return(eagerResult);
+                if (eagerResult is null)
+                {
+                    var traceScope = GraphMode.Current;
+                    GraphMode.SetCurrent(null);
+                    try
+                    {
+                        if (TryBatchNormTrainingFloatInto(ci, cg, cb, ce, lazyResult, capturedMean, capturedVar))
+                        {
+                            // The values are in place: a read must not realize the node and normalize a second time.
+                            if (lazyResult.LazySource is LazyNode<T> recorded) recorded.IsRealized = true;
+                        }
+                        else
+                        {
+                            // A layout the direct kernel declines: the eager normalization, copied in.
+                            var fallback = BatchNorm(ci, cg, cb, ce, out var fallbackMean, out var fallbackVar);
+                            fallback.AsSpanUnmarked().CopyTo(lazyResult.AsWritableSpanUnmarked());
+                            fallbackMean.AsSpanUnmarked().CopyTo(capturedMean.AsWritableSpanUnmarked());
+                            fallbackVar.AsSpanUnmarked().CopyTo(capturedVar.AsWritableSpanUnmarked());
+                            Helpers.TensorAllocator.Return(fallback);
+                        }
+                    }
+                    finally
+                    {
+                        GraphMode.SetCurrent(traceScope);
+                    }
+                }
+                else
+                {
+                    using var eagerResultKeep1 = new KeepAliveScope(eagerResult);
+                    eagerResult.AsSpanUnmarked().CopyTo(lazyResult.AsWritableSpanUnmarked());
+                    Helpers.TensorAllocator.Return(eagerResult);
+                }
                 // Hand the batch statistics out as outputs OF this node. The replay above refreshes capturedMean /
                 // capturedVar as a side effect the plan cannot see, so a consumer reading them directly - the
                 // running-statistics EMA every BatchNorm layer keeps - depended only on leaf tensors and the plan's
