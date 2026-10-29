@@ -857,7 +857,9 @@ public static class FlashAttention<T> where T : unmanaged
                             float* pRowPtr = pPBlock + ii * Bc;
                             int jj = 0;
 #if NET5_0_OR_GREATER
-                            if (System.Runtime.Intrinsics.X86.Avx.IsSupported && kLen >= 8)
+                            // FastExp256 needs Avx2 and Fma (not just Avx): see FlashAttentionFloatSimd.RowMaxAndExp.
+                            if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported
+                                && kLen >= 8)
                             {
                                 var vLse = System.Runtime.Intrinsics.Vector256.Create(lseV);
                                 int bulkEnd = kLen - (kLen & 7);
