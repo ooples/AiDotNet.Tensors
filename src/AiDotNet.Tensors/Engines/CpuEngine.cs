@@ -10799,6 +10799,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // A test scope that pins the full-im2col or implicit-GEMM route must reach it: the direct and batched routes
         // below are chosen first, so a pinned comparison would otherwise compare one of them with itself.
         bool routePinned = t_forceFullIm2Col || t_forceImplicitGemmForTest;
+        if (!routePinned && TryConv1x1PerImageGemm(input, kernel, output, inputData, kernelData, outputData,
+                batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
+                strideH, strideW, padH, padW, dilationH, dilationW))
+            return;
 #if NET5_0_OR_GREATER
         if (!routePinned && input.Layout == LinearAlgebra.TensorLayout.Nchw
             && Simd.DirectConvAvx2.TryChoose(new Simd.DirectConvShape(Simd.DirectConvPass.Forward, batch, inChannels, outChannels,
@@ -10851,6 +10855,40 @@ public partial class CpuEngine : ITensorLevelEngine
             outChannels, kernelHeight, kernelWidth,
             outputHeight, outputWidth,
             strideH, strideW, padH, padW, dilationH, dilationW);
+    }
+
+    /// <summary>
+    /// A 1x1, stride-1, unpadded convolution over a batch is one GEMM per image: out[n] (Cout x HW) = W (Cout x Cin) *
+    /// x[n] (Cin x HW). Each image runs the tuned sequential GEMM, images in parallel, so every output element keeps one
+    /// summation order (deterministic). The routes below ran these shapes at 20-27 GFLOP/s on MobileNetV2's expansion and
+    /// projection convolutions ([128, 96, 16, 16] to 24 channels: 6.2 ms, against 0.58 ms in PyTorch); the per-pixel
+    /// kernel they reached re-read the input for every four output channels and re-broadcast each weight per pixel.
+    /// </summary>
+    private static bool TryConv1x1PerImageGemm(
+        Tensor<float> input, Tensor<float> kernel, Tensor<float> output,
+        float[]? inputData, float[]? kernelData, float[]? outputData,
+        int batch, int inChannels, int height, int width, int outChannels, int kernelHeight, int kernelWidth,
+        int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
+    {
+        if (kernelHeight != 1 || kernelWidth != 1 || strideH != 1 || strideW != 1 || padH != 0 || padW != 0
+            || dilationH != 1 || dilationW != 1 || batch < 2 || input.Layout != LinearAlgebra.TensorLayout.Nchw)
+            return false;
+        int inOff = 0, kOff = 0, outOff = 0;
+        float[]? inArr = inputData ?? (input.IsContiguous ? input.GetCpuBackingForStridedRead(out inOff) : null);
+        float[]? kArr = kernelData ?? (kernel.IsContiguous ? kernel.GetCpuBackingForStridedRead(out kOff) : null);
+        float[]? outArr = outputData ?? output.GetCpuBackingForContiguousWrite(out outOff);
+        if (inArr is null || kArr is null || outArr is null) return false;
+
+        int hw = height * width;
+        int inStride = inChannels * hw, outStride = outChannels * hw, kLen = outChannels * inChannels;
+        long work = 2L * batch * outChannels * inChannels * hw;
+        CpuParallelSettings.ParallelForOrSerial(0, batch, work, n =>
+            Simd.SimdGemm.SgemmSequential(
+                new ReadOnlySpan<float>(kArr, kOff, kLen),
+                new ReadOnlySpan<float>(inArr, inOff + n * inStride, inStride),
+                new Span<float>(outArr, outOff + n * outStride, outStride),
+                outChannels, inChannels, hw));
+        return true;
     }
 
     /// <summary>
