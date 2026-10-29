@@ -25799,6 +25799,11 @@ public partial class CpuEngine : ITensorLevelEngine
                     new[] { input, gamma, beta }, eagerResult._shape,
                     (eng, output) =>
                     {
+                        // Normalize straight into the plan's buffers: computing into fresh tensors and copying all three in
+                        // was a third of a DenseNet training step's main-thread copy time.
+                        if (eng is CpuEngine && !eng.SupportsGpu
+                            && TryBatchNormTrainingFloatInto(ci, cg, cb, ce, output, capturedMean, capturedVar))
+                            return;
                         var r = eng.BatchNorm(ci, cg, cb, ce, out var freshMean, out var freshVar);
                         try
                         {
@@ -25994,6 +25999,35 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Batch normalization for 4D tensors [batch, channels, height, width].
     /// Normalizes per channel across batch, height, and width dimensions.
     /// </summary>
+    /// <summary>
+    /// Training batch norm of a float NCHW tensor written straight into existing output, mean and variance tensors (a
+    /// compiled plan's buffers). False, with nothing written, unless every operand is float, contiguous and backed by a
+    /// managed array from offset 0 of the needed length; the caller then computes and copies.
+    /// </summary>
+    private static bool TryBatchNormTrainingFloatInto<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon,
+        Tensor<T> output, Tensor<T> mean, Tensor<T> variance)
+    {
+        if (typeof(T) != typeof(float) || input.Rank != 4 || !input.IsContiguous || !gamma.IsContiguous || !beta.IsContiguous
+            || !output.IsContiguous || !mean.IsContiguous || !variance.IsContiguous)
+            return false;
+        int batch = input._shape[0], channels = input._shape[1], spatial = input._shape[2] * input._shape[3];
+        if (output.Length != input.Length || mean.Length != channels || variance.Length != channels
+            || gamma.Length != channels || beta.Length != channels)
+            return false;
+        if (input.GetCpuBackingForStridedRead(out int inOff) is not float[] inF || inOff != 0
+            || gamma.GetCpuBackingForStridedRead(out int gOff) is not float[] gF || gOff != 0
+            || beta.GetCpuBackingForStridedRead(out int bOff) is not float[] bF || bOff != 0
+            || output.GetCpuBackingForContiguousWrite(out int oOff) is not float[] oF || oOff != 0
+            || mean.GetCpuBackingForContiguousWrite(out int mOff) is not float[] mF || mOff != 0
+            || variance.GetCpuBackingForContiguousWrite(out int vOff) is not float[] vF || vOff != 0)
+            return false;
+        BatchNorm4DFloat(inF, gF, bF, (float)epsilon, batch, channels, spatial, mF, vF, oF);
+        output.IncrementVersion();
+        mean.IncrementVersion();
+        variance.IncrementVersion();
+        return true;
+    }
+
     private Tensor<T> BatchNorm4D<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, T eps, INumericOperations<T> numOps, out Tensor<T> mean, out Tensor<T> variance)
     {
         int batch = input._shape[0];
