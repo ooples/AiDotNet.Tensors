@@ -421,18 +421,24 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
         return deviations.Length > 1 ? deviations[deviations.Length - 2] : deviations.Length == 1 ? deviations[0] : 1.0;
     }
 
-    // FNV-1a over the ordered candidate ids, as 8 hex digits: a short, stable name for the candidate set.
+    // 32-bit FNV-1a.
+    private const uint FnvOffsetBasis = 2166136261;
+    private const uint FnvPrime = 16777619;
+
+    // FNV-1a over the ordered candidate ids, as 8 hex digits: a short, stable name for the candidate set. It holds across
+    // package upgrades on purpose: keying it by build (tried in #1432) discarded every persisted decision on each upgrade,
+    // and until the tuning budget re-covered every shape over several processes the uncovered ones served the reference
+    // (ResNet-50 predict on OpenCL: 8 ms with the kept decisions, 184 ms in the first process after a rebuild).
     private static string PoolKey(ITunedKernelCandidate<TArgs>[] candidates)
     {
-        uint h = 2166136261;
+        uint h = FnvOffsetBasis;
         foreach (var c in candidates)
         {
-            foreach (char ch in c.Id) { h ^= ch; h *= 16777619; }
-            h ^= '|'; h *= 16777619;
+            foreach (char ch in c.Id) { h ^= ch; h *= FnvPrime; }
+            h ^= '|'; h *= FnvPrime;
         }
         return h.ToString("x8", System.Globalization.CultureInfo.InvariantCulture);
     }
-
     internal static double MaxRelativeError(float[] expected, float[] actual, double scale)
     {
         if (actual.Length != expected.Length) return double.PositiveInfinity;

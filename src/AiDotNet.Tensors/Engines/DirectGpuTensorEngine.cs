@@ -1718,16 +1718,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             if (baseBuffer is null || backend is not IFusedLstmSequenceTraining fused) return false;
             long last = view._storageOffset;
-            var layout = new float[2 * view.Rank];
+            var layout = new int[2 * view.Rank];
             for (int d = 0; d < view.Rank; d++)
             {
                 if (view._strides[d] < 0) return false;
                 last += (long)(view.Shape[d] - 1) * view._strides[d];
-                layout[d] = BitConverter.ToSingle(BitConverter.GetBytes(view.Shape[d]), 0);
-                layout[view.Rank + d] = BitConverter.ToSingle(BitConverter.GetBytes(view._strides[d]), 0);
+                layout[d] = view.Shape[d];
+                layout[view.Rank + d] = view._strides[d];
             }
             if (view._storageOffset < 0 || last >= baseBuffer.Size) return false;
-            var metadata = backend.AllocateBuffer(layout);
+            var metadata = CachedStridedViewLayout(backend, layout, out bool metadataCached);
             var gathered = AllocateFullyWrittenOutputBuffer(backend, view.Length);
             try
             {
@@ -1735,7 +1735,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     baseBuffer, gathered.Buffer, metadata, view.Rank, view._storageOffset, view.Length);
             }
             catch { gathered.DisposeAfterQueuedUse(backend); throw; }
-            finally { DisposeBufferAfterQueuedUse(backend, metadata); }
+            finally { if (!metadataCached) DisposeBufferAfterQueuedUse(backend, metadata); }
             result = gathered;
             return true;
         }
@@ -2448,6 +2448,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         long managedBytes = 4L;
         for (int d = 0; d < shape.Length; d++) managedBytes *= shape[d];
 
+        // Inside a TensorScope this entry is a result of the scope's call: it is freed when the scope ends unless kept.
+        if (TensorScope.Current is not null) TensorScope.EnlistActivationOwner(this, ActivationCacheTimestampSnapshot());
         var timestamp = System.Threading.Interlocked.Increment(ref _activationCacheTimestamp);
         var entry = new ActivationCacheEntry(buffer, shape, timestamp, backend, managedBytes,
             isFp16, isFp16 ? elementCount : 0, hostVersion);
@@ -2737,8 +2739,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Message a host read of a released step intermediate throws (see <see cref="ActivationReleaseMode.Release"/>).
     /// </summary>
     internal const string ReleasedIntermediateMessage =
-        "This tensor is a GPU intermediate of a finished GradientTape step: its device memory was released when the " +
-        "tape was disposed (or after its last backward use) without copying it to the host, as PyTorch frees an " +
+        "This tensor is a GPU intermediate of a finished GradientTape step or TensorScope: its device memory was released " +
+        "when the tape was disposed, when the scope that created it ended (TensorScope.Keep keeps a result), or after its " +
+        "last backward use, without copying it to the host, as PyTorch frees an " +
         "unreferenced CUDA tensor. Read it inside the tape scope, or call GradientTape.Retain(tensor) before the tape " +
         "ends to keep it. (The loss and gradients returned by ComputeGradients are kept automatically.)";
 
@@ -2753,7 +2756,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// pool at once. Only a tensor covering its whole vector qualifies, so the buffer is the vector's own. Its pending
     /// download is replaced by the released-intermediate error, so a read that should not happen fails loudly.
     /// </summary>
-    internal void ReleaseDeadDeviceStorage<T>(Tensor<T> tensor)
+    internal void ReleaseDeadDeviceStorage<T>(Tensor<T> tensor, bool afterQueuedWork = false)
     {
         var vector = tensor.DataVector;
         if (vector._deviceState is not { Buffer: { } buffer } state) return;
@@ -2765,7 +2768,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (tensor.GetBackingArrayForCacheLookupUnsafe() is { } array) Helpers.HostSync.Release(array, ReleasedIntermediateMessage);
         state.Buffer = null;
         state.DeviceValid = false;
-        buffer.Dispose();
+        if (afterQueuedWork && tensor._gpuBackend is IQueuedBufferRelease queued) queued.ReleaseAfterQueuedWork(buffer);
+        else buffer.Dispose();
     }
 
     internal void DetachToTensorLifetime(IEnumerable<object> keys)
@@ -2817,8 +2821,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <summary>
     /// Evicts this thread's activation-cache entries created after <paramref name="snapshot"/> (except
     /// <paramref name="protect"/>), handling entries whose only valid copy is on the device per <paramref name="mode"/>.
+    /// With <paramref name="releasableOnly"/>, only entries whose storage key it accepts are evicted (a
+    /// <see cref="TensorScope"/> passes the storages created inside it, so a tensor that predates it is never freed).
     /// </summary>
-    internal long EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect, ActivationReleaseMode mode)
+    internal long EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect, ActivationReleaseMode mode,
+        Func<object, bool>? releasableOnly = null, bool afterQueuedWork = false)
     {
         // The activation timestamp counter is process-wide, so "created after my snapshot"
         // also matches a CONCURRENT tape's activations on another thread. Free only THIS
@@ -2836,6 +2843,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (entries[i].Value.Timestamp <= snapshot) continue;   // pre-existing — keep
                 if (entries[i].Value.ThreadId != callerThreadId) continue; // another thread's live buffer
                 if (protect is not null && protect.Contains(entries[i].Key)) continue; // live gradient — keep
+                if (releasableOnly is not null && !releasableOnly(entries[i].Key)) continue; // predates the scope
                 if (mode == ActivationReleaseMode.Release && Helpers.HostSync.IsRetained(entries[i].Key))
                     continue; // the caller kept it past the tape (GradientTape.Retain / returned gradients)
                 if (_activationCache.TryRemove(entries[i].Key, out var entry))
@@ -2869,7 +2877,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
         }
         long released = 0;
-        foreach (var entry in toDispose) { released += entry.Buffer.SizeInBytes; entry.Dispose(); }
+        foreach (var entry in toDispose)
+        {
+            released += entry.Buffer.SizeInBytes;
+            // A scope ends while work that reads its results can still be queued: each backend frees after that work (CUDA:
+            // stream-ordered), as TryFreeActivationByKey does, so the pool cannot hand the buffer to a later kernel early.
+            if (afterQueuedWork && entry.Backend is IQueuedBufferRelease queued) queued.ReleaseAfterQueuedWork(entry.Buffer);
+            else entry.Dispose();
+        }
         return released;
     }
 
@@ -4337,6 +4352,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // when it is collected. The gradients backward computes but does not return are freed as soon as backward ends
         // (GradientTape.ReleaseDroppedGradients).
         if (TrackOwnedResultBytes) TrackOwnedResult(outputBuffer);
+        // Inside a TensorScope the result is freed when the scope ends unless kept (#1432), not when the GC finalizes it.
+        if (TensorScope.Current is not null) TensorScope.Track(vector, () => ReleaseDeadDeviceStorage(tensor, afterQueuedWork: true));
         return tensor;
     }
 
@@ -27352,14 +27369,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var a = tensors[0];
                 int rank = a.Rank;
                 int normAxis = axis < 0 ? rank + axis : axis;
-                if (normAxis >= 0 && normAxis < rank && a.IsContiguous)
+                // Strided inputs (narrow/permute views) are gathered on the device by GetOrAllocateBuffer below.
+                if (normAxis >= 0 && normAxis < rank)
                 {
                     bool shapesOk = true;
                     int axisTotal = 0;
                     for (int t = 0; t < tensors.Length && shapesOk; t++)
                     {
                         var tensor = tensors[t];
-                        shapesOk = tensor.Rank == rank && tensor.IsContiguous;
+                        shapesOk = tensor.Rank == rank;
                         for (int k = 0; k < rank && shapesOk; k++)
                             if (k != normAxis && a.Shape._dims[k] != tensor.Shape._dims[k])
                                 shapesOk = false;
@@ -27383,15 +27401,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                                 var tensor = tensors[t];
                                 int tensorAxis = tensor.Shape._dims[normAxis];
                                 int slice = tensorAxis * inner;
-                                using var input = GetOrAllocateBuffer(backend, tensor);
-                                if (outer == 1)
-                                    backend.Copy(input.Buffer, 0, outBuf.Buffer, axisOffset * inner, slice);
-                                else
-                                    // ONE launch per input: row o of the [outer, slice] input goes to columns
-                                    // [axisOffset*inner, +slice) of row o of the [outer, axisTotal*inner] output.
-                                    // Copy2DStrided is on IDirectGpuBackend, so it is recorded/capturable like Copy.
-                                    backend.Copy2DStrided(input.Buffer, outBuf.Buffer, outer, slice,
-                                        axisTotal * inner, axisOffset * inner);
+                                // A strided input comes back as an owned gather buffer. The copy below is only queued,
+                                // so the buffer returns to the pool after the queued work, not when this loop moves on.
+                                var input = GetOrAllocateBuffer(backend, tensor);
+                                try
+                                {
+                                    if (outer == 1)
+                                        backend.Copy(input.Buffer, 0, outBuf.Buffer, axisOffset * inner, slice);
+                                    else
+                                        // ONE launch per input: row o of the [outer, slice] input goes to columns
+                                        // [axisOffset*inner, +slice) of row o of the [outer, axisTotal*inner] output.
+                                        // Copy2DStrided is on IDirectGpuBackend, so it is recorded/capturable like Copy.
+                                        backend.Copy2DStrided(input.Buffer, outBuf.Buffer, outer, slice,
+                                            axisTotal * inner, axisOffset * inner);
+                                }
+                                finally
+                                {
+                                    input.DisposeAfterQueuedUse(backend);
+                                }
                                 axisOffset += tensorAxis;
                             }
                             int[] outShape = (int[])a.Shape._dims.Clone();
@@ -28222,6 +28249,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // A backward may still have queued a pooling GEMM that reads one of these.
             foreach (var entry in _adaptivePoolMatrices) DisposeBufferAfterQueuedUse(entry.Key.Item1, entry.Value);
             _adaptivePoolMatrices.Clear();
+        }
+
+        lock (_stridedViewLayoutsGate)
+        {
+            foreach (var (layoutBackend, layoutBuffer) in _stridedViewLayoutBuffers) DisposeBufferAfterQueuedUse(layoutBackend, layoutBuffer);
+            _stridedViewLayoutBuffers.Clear();
+            _stridedViewLayoutCount = 0;
         }
 
         lock (_occupancyBufferCacheGate)
@@ -31157,9 +31191,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             outputBuffer.RelinquishOwnership();
             return result;
         }
-        catch
+        catch (Exception ex)
         {
             if (ThrowOnGpuKernelFallback) throw;
+            // Recorded, so the residency probe and fallback log see the CPU result for what it is.
+            GpuLaunchProbe.OnFallback("NativePacFeatures", ex);
             return base.NativePacFeatures(
                 waveforms, sampleRate, envelopeRate, thetaLow, thetaHigh, gammaBands);
         }

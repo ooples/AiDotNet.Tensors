@@ -20,14 +20,14 @@
     <Version>1.0.0-preview</Version>
     <Title>AiDotNet.Tensors</Title>
     <Description>High-performance tensor operations with SIMD acceleration for .NET. Provides Vector, Matrix, and Tensor types with hardware-accelerated operations (Sin, Cos, Exp, Log, etc.). On net8.0+ uses hand-written AVX2/AVX-512 SIMD kernels via System.Runtime.Intrinsics for maximum throughput; on net471 falls back to scalar paths (System.Runtime.Intrinsics is unavailable pre-net6). Performance numbers in benchmarks assume net8.0+. Supports any numeric type via generic INumericOperations interface. Optional GPU acceleration available via separate packages. Optional anonymous telemetry (opt-in via AIDOTNET_TELEMETRY=true; default off in v0.205.0+).</Description>
-    <Company>Ooples Finance</Company>
+    <Company>CrowdTrainer LLC</Company>
     <Authors>ooples</Authors>
-    <Copyright>Ooples Finance LLC 2025</Copyright>
+    <Copyright>Copyright (C) 2026 CrowdTrainer LLC</Copyright>
     <PackageProjectUrl>https://github.com/ooples/AiDotNet.Tensors</PackageProjectUrl>
     <RepositoryType>git</RepositoryType>
     <RepositoryUrl>https://github.com/ooples/AiDotNet.Tensors</RepositoryUrl>
     <PackageTags>tensors; simd; vectorization; linear-algebra; matrix; vector; performance; net471; net10; avx2; avx512; gpu</PackageTags>
-    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageLicenseFile>LICENSE</PackageLicenseFile>
     <PackageRequireLicenseAcceptance>True</PackageRequireLicenseAcceptance>
     <LangVersion>latest</LangVersion>
     <EvolutionProjectPath Condition="'$(EvolutionProjectPath)' == ''">$(MSBuildProjectDirectory)\..\..\..\AiDotNet.Evolution\src\AiDotNet.Evolution\AiDotNet.Evolution.csproj</EvolutionProjectPath>
@@ -52,7 +52,7 @@
          release of a package should not have a prerelease dependency") when a
          stable Tensors release depends on a prerelease, which blocked the
          v0.131.0 and v0.132.0 release pipelines at the Pack NuGet job. -->
-    <PackageReference Include="AiDotNet.Evolution" Version="0.3.0" />
+    <PackageReference Include="AiDotNet.Evolution" Version="0.7.0" />
   </ItemGroup>
 
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
@@ -101,6 +101,14 @@
       <PackagePath>\</PackagePath>
     </None>
     <None Include="..\..\README.md">
+      <Pack>True</Pack>
+      <PackagePath>\</PackagePath>
+    </None>
+    <None Include="..\..\LICENSE">
+      <Pack>True</Pack>
+      <PackagePath>\</PackagePath>
+    </None>
+    <None Include="..\..\THIRD-PARTY-NOTICES.txt">
       <Pack>True</Pack>
       <PackagePath>\</PackagePath>
     </None>
@@ -157,13 +165,13 @@
        Don't reintroduce the package. -->
 
   <!-- System.Text.Json is needed for net471 as it's not built-in like net8.0.
-       Pinned to 10.0.12 to match what AiDotNet.Evolution asks for on net471: it
-       declares System.Text.Json >= 10.0.12 there, so referencing anything older
+       Pinned to 10.0.13 to match what AiDotNet.Evolution 0.7.0 asks for on net471: it
+       declares System.Text.Json >= 10.0.13 there, so referencing anything older
        directly wins the resolution and NuGet reports it as a downgrade (NU1605),
        which TreatWarningsAsErrors turns into a build failure. Keep this at or
        above whatever the referenced AiDotNet.Evolution requires. -->
   <ItemGroup Condition="'$(AiDnTargetFrameworkIdentifier)' == '.NETFramework'">
-    <PackageReference Include="System.Text.Json" Version="10.0.12" />
+    <PackageReference Include="System.Text.Json" Version="10.0.13" />
     <!-- ZipArchive (System.IO.Compression) ships in mscorlib on .NET 5+ but
          needs an explicit reference on net471 — used by PtReader to parse
          the modern zip-format PyTorch checkpoint. -->
@@ -182,7 +190,7 @@
   <!-- .NET Standard 2.0 (#679: .NET 5/6/7, Unity/Mono and other netstandard consumers): the same BCL polyfills as
        .NET Framework, plus Reflection.Emit for the compiled-backward IL path. -->
   <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0'">
-    <PackageReference Include="System.Text.Json" Version="10.0.12" />
+    <PackageReference Include="System.Text.Json" Version="10.0.13" />
     <PackageReference Include="System.Threading.Channels" Version="8.0.0" />
     <PackageReference Include="System.Reflection.Emit" Version="4.7.0" />
     <PackageReference Include="System.Reflection.Emit.ILGeneration" Version="4.7.0" />
