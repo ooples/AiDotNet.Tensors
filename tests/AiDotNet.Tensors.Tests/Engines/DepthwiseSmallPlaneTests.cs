@@ -15,7 +15,7 @@ public sealed class DepthwiseSmallPlaneTests
     [Theory]
     [InlineData(3, 5, 1, 4, 4, 1)]     // 4x4 output, padded
     [InlineData(2, 4, 2, 8, 8, 1)]     // 8x8 output, multiplier 2
-    [InlineData(2, 3, 1, 12, 10, 1)]   // 12-wide rows: one full vector and a partial one
+    [InlineData(2, 3, 1, 10, 12, 1)]   // 12-wide rows: one full vector and a partial one
     [InlineData(2, 3, 1, 6, 6, 0)]     // unpadded: 4x4 output
     [InlineData(4, 60, 1, 4, 4, 1)]    // 240 planes: several plane groups of the same-padded route
     [InlineData(2, 3, 1, 3, 5, 1)]     // 15 outputs: a ragged width and a partial vector
@@ -37,6 +37,18 @@ public sealed class DepthwiseSmallPlaneTests
     [Fact]
     public void AnInfinitePixel_ReachesOnlyItsNeighbourhood()
         => AssertDirectSum(1, 2, 1, 4, 4, 1, 3, x => x[1 * 4 + 3] = float.PositiveInfinity);
+
+    /// <summary>
+    /// The same-padded route keeps its tile between calls and clears it only when the slot geometry changes. A 4x4
+    /// plane and a 3x4 plane share slot and lead (both round to whole vectors), but the 4x4 one writes four more
+    /// pixels: run second, the 3x4 plane must still read a zero bottom margin, not the 4x4 plane's last row.
+    /// </summary>
+    [Fact]
+    public void ASmallerPlaneWithTheSameSlot_ReadsZeroMargins()
+    {
+        AssertDirectSum(1, 2, 1, 4, 4, 1, 3, x => { for (int i = 0; i < x.Length; i++) x[i] = 3f; });
+        AssertDirectSum(1, 2, 1, 3, 4, 1, 3, x => { });
+    }
 
     private static void AssertDirectSum(int n, int c, int multiplier, int h, int w, int pad, int kSize, Action<float[]> edit)
     {

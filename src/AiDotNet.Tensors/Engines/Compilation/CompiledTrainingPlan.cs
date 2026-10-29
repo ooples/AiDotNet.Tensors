@@ -9097,7 +9097,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // Every unary specialization overwrites its input's gradient and is taken only when it is that gradient's
             // sole writer (BuildSpecializedBackward's guard), so it can claim the write: a buffer it shares with
             // no-backward readers (a training BatchNorm's statistics) then needs no per-step zeroing.
-            if (action != null && !claims.Value && !preferGenericForGpu && step.Inputs.Length == 1
+            if (action != null && !claims.Value && step.Inputs.Length == 1
                 && gradMap.TryGetValue(step.Inputs[0], out var soleWriterGrad))
             {
                 var overwriting = action;
@@ -12164,6 +12164,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (step.Inputs.Length == 1
             && (gradWriterCount ?? consumerCount).TryGetValue(step.Inputs[0], out int unaryConsumers) && unaryConsumers > 1)
             return null;
+        // So a unary specialization below is its input gradient's sole writer, and the caller claims that first write
+        // for it: it must overwrite. Counting the no-backward readers too would make it add into a buffer nobody zeroed.
+        bool UnaryAccumulates(Tensor<T> input)
+            => (step.Inputs.Length == 1 ? gradWriterCount ?? consumerCount : consumerCount)
+                .TryGetValue(input, out int writers) && writers > 1;
 
         // Specialized backward delegates capture raw zero-based arrays. Apply
         // the same centralized eligibility contract as specialized forward:
@@ -13142,7 +13147,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 return null;
             var gradOut = gradMap[output];
             var gradIn = gradMap[input];
-            bool accum = consumerCount.ContainsKey(input) && consumerCount[input] > 1;
+            bool accum = UnaryAccumulates(input);
             return eng =>
             {
                 var grad = eng.DropoutBackward(gradOut, dropMask, dropRate);
@@ -13402,7 +13407,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var output = step.OutputBuffer;
             if (!gradMap.TryGetValue(output, out var gradOut) || !gradMap.TryGetValue(input, out var gradIn))
                 return null;
-            bool accum = consumerCount.TryGetValue(input, out int poolInputConsumers) && poolInputConsumers > 1;
+            bool accum = UnaryAccumulates(input);
             int pH = recomputePool[0], pW = recomputePool[1], sH = recomputeStride[0], sW = recomputeStride[1];
             return eng =>
             {
@@ -13445,7 +13450,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var gradOutArr = TryGetLiveFloatBacking(gradOut);
             var gradInArr = TryGetLiveFloatBacking(gradIn);
             if (gradOutArr is null || gradInArr is null) return null;
-            bool accum = consumerCount.TryGetValue(input, out int aapInputConsumers) && aapInputConsumers > 1;
+            bool accum = UnaryAccumulates(input);
             int planes = input._shape[0] * input._shape[1], inH = input._shape[2], inW = input._shape[3];
             var savedState = step.SavedState;
             return eng =>
@@ -13485,7 +13490,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (maxIndices is null && tensorIndices is null) return null;
             var gradOut = gradMap[output];
             var gradIn = gradMap[input];
-            bool accum = consumerCount.ContainsKey(input) && consumerCount[input] > 1;
+            bool accum = UnaryAccumulates(input);
             var capInShape = (int[])input._shape.Clone();
             return eng =>
             {
@@ -13512,7 +13517,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 return null;
             var gradOut = gradMap[output];
             var gradIn = gradMap[input];
-            bool accum = consumerCount.ContainsKey(input) && consumerCount[input] > 1;
+            bool accum = UnaryAccumulates(input);
             var capInShape = (int[])input._shape.Clone();
             return eng =>
             {

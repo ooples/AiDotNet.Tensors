@@ -703,8 +703,14 @@ internal static partial class SimdGemm
         int expectedMc = ChooseAdaptiveMc(m, k, n);
         var cached = GetOrBuildPrePackedB(b, k, n, m, expectedMc);
 
+        t_cachedBTiledCalls++;
         SgemmTiledWithCached(a, cached, c, m, k, n);
     }
+
+    [ThreadStatic] private static int t_cachedBTiledCalls;
+
+    /// <summary>How many SgemmWithCachedB calls on this thread reached the prepacked-B tiled path (tests: which route ran).</summary>
+    internal static int CachedBTiledCallsOnThisThread => t_cachedBTiledCalls;
 
     private static PrePackedB GetOrBuildPrePackedB(float[] b, int k, int n, int m, int expectedMc)
     {
@@ -1761,7 +1767,7 @@ internal static partial class SimdGemm
                 PackA(aSpanSource.Span, packedA[block], k, false, ic, Math.Min(mc0, m - ic), pc, Math.Min(Kc, k - pc));
             }, deterministicSafe: true);
 
-            int packedBSize = Kc * (((n + Nr - 1) / Nr) * Nr);
+            int packedBSize = Math.Min(Kc, k) * (((n + Nr - 1) / Nr) * Nr);   // one panel: at most Kc deep
             Helpers.CpuParallelSettings.ParallelForOrSerial(0, count, 2L * count * m * k * n, pair =>
             {
                 var packedB = t_sharedAPackedB;

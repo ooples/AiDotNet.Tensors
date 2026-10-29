@@ -254,12 +254,13 @@ public class CompiledConvBnGraphStepTests : IDisposable
 
             Assert.True(captured.ReplayedAGraph, "the plan is not replaying a graph after warm-up");
             // The GPU plan fuses the first BatchNorm with its ReLU (BatchNormReluFusionPattern) and the second with the
-            // residual add and the ReLU after it (BatchNormAddReluFusionPattern); the CPU plan fuses neither.
+            // residual add and the ReLU after it (BatchNormAddReluFusionPattern); the CPU plan fuses only the first (it has
+            // no BatchNorm+Add+ReLU kernel).
             _output.WriteLine("captured steps: " + string.Join(", ", captured.StepNames));
             Assert.Equal(1, captured.StepNames.Count(n => n == "BatchNormReLU"));
             Assert.Equal(1, captured.StepNames.Count(n => n == "BatchNormAddReLU"));
             Assert.DoesNotContain("BatchNorm", captured.StepNames);
-            Assert.DoesNotContain("BatchNormReLU", reference.StepNames);
+            Assert.Equal(1, reference.StepNames.Count(n => n == "BatchNormReLU"));
             Assert.DoesNotContain("BatchNormAddReLU", reference.StepNames);
             for (int s = 0; s < Steps; s++)
                 Assert.True(Math.Abs(reference.Losses[s] - captured.Losses[s]) <= 1e-4 * Math.Max(1, Math.Abs(reference.Losses[s])),

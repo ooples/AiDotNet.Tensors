@@ -19066,7 +19066,7 @@ public partial class CpuEngine : ITensorLevelEngine
     [ThreadStatic] private static float[]? t_depthwiseLanes;
     [ThreadStatic] private static Dictionary<long, System.Numerics.Vector<int>[]>? t_depthwiseSameMasks;
     [ThreadStatic] private static float[]? t_depthwiseSameTile;
-    [ThreadStatic] private static long t_depthwiseSameTileKey;
+    [ThreadStatic] private static (int Slot, int Lead, int Hw) t_depthwiseSameTileKey;
 
     private static unsafe void CopyPlanesIntoSlots(float[] x, float[] tile, int firstPlane, int planeCount,
         int outChannels, int inChannels, int multiplier, int hw, int slot, int lead)
@@ -19218,7 +19218,9 @@ public partial class CpuEngine : ITensorLevelEngine
         int tileLength = planeCount * slot;
         // The tile is this route's alone and only [lead, lead + hw) of a slot is ever written, so the margins stay zero
         // while the slot geometry is unchanged; clearing and copying each plane with Array calls cost more than its taps.
-        long tileKey = (uint)slot | ((long)lead << 32);
+        // hw is part of the key: two geometries can share slot and lead (hw 13 and 16 at 8 lanes) yet write different
+        // ranges, and the larger one's tail would sit in the smaller one's bottom margin.
+        var tileKey = (slot, lead, hw);
         var tile = t_depthwiseSameTile;
         if (tile is null || tile.Length < tileLength)
         {
@@ -26373,15 +26375,25 @@ public partial class CpuEngine : ITensorLevelEngine
             || beta.GetReadOnlyDataArray() is not float[] betaF)
             return false;
 
-        var meanF = new float[channels];
-        var varF = new float[channels];
+        // The statistics go straight into the plan's mean and variance when their backings start at offset zero (the
+        // kernel indexes them from 0); otherwise into scratch, copied over after.
+        float[]? meanBacking = mean.GetCpuBackingForContiguousWrite(out int meanOffset);
+        float[]? varBacking = variance.GetCpuBackingForContiguousWrite(out int varOffset);
+        bool meanDirect = meanBacking is not null && meanOffset == 0;
+        bool varDirect = varBacking is not null && varOffset == 0;
+        float[] meanF = meanDirect ? meanBacking! : new float[channels];
+        float[] varF = varDirect ? varBacking! : new float[channels];
         BatchNorm4DFloat(input, gammaF, betaF, (float)epsilon, batch, channels, spatialSize, meanF, varF, output);
         ParallelElementwiseChunks(x.Length, (start, count) =>
         {
             fixed (float* p = output) SimdKernels.ReLUUnsafe(p + start, p + start, count);
         });
-        meanF.AsSpan().CopyTo(mean.AsWritableSpan());
-        varF.AsSpan().CopyTo(variance.AsWritableSpan());
+        if (!meanDirect) meanF.AsSpan().CopyTo(mean.AsWritableSpan());
+        if (!varDirect) varF.AsSpan().CopyTo(variance.AsWritableSpan());
+        // Written through their backings, so the versions (and any device copies) must be told.
+        result.IncrementVersion();
+        mean.IncrementVersion();
+        variance.IncrementVersion();
         return true;
     }
 
@@ -27041,6 +27053,9 @@ public partial class CpuEngine : ITensorLevelEngine
                 BatchNormBackward4DFloat(goF, inF, gaF, meF, vaF, (float)epsilon,
                     input._shape[0], input._shape[1], input._shape[2] * input._shape[3],
                     giDest, giOff, accumulateInput, ggDest, ggOff, accumulateGamma, gbDest, gbOff, accumulateBeta);
+                destGradInput.IncrementVersion();
+                destGradGamma.IncrementVersion();
+                destGradBeta.IncrementVersion();
                 return;
             }
         }
@@ -27116,6 +27131,9 @@ public partial class CpuEngine : ITensorLevelEngine
         BatchNormBackward4DFloat(goF, inF, gaF, meF, vaF, (float)epsilon,
             input._shape[0], input._shape[1], input._shape[2] * input._shape[3],
             giDest, giOff, accumulateInput, ggDest, ggOff, accumulateGamma, gbDest, gbOff, accumulateBeta, reluF);
+        destGradInput.IncrementVersion();
+        destGradGamma.IncrementVersion();
+        destGradBeta.IncrementVersion();
         return true;
     }
 
@@ -27133,7 +27151,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         // With reluOutput (a fused BatchNorm+ReLU), the incoming gradient is the ReLU's: lanes whose ReLU output is not
         // positive contribute +0, exactly as the separate ReLU backward (ReluBackwardUnsafe) wrote them.
-        float elemF = (long)batch * spatialSize;
+        float elemF = (float)((long)batch * spatialSize);   // the element count as float, as the kernel divides by it
         CpuParallelSettings.ParallelForOrSerial(0, channels, (long)channels * batch * spatialSize, [MethodImpl(Hot)] (c) =>
         {
             float invStd = 1f / MathF.Sqrt(vaF[c] + epsF);
@@ -39041,7 +39059,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Disjoint spans only: CopyTo is a memmove, but chunks copied in parallel are not when views of one storage
         // overlap at an offset.
         if (typeof(T) == typeof(float) && source.Length >= ParallelCopyMinElements
-            && !((ReadOnlySpan<T>)sourceSpan).Overlaps(destinationSpan))
+            && !sourceSpan.Overlaps(destinationSpan))
         {
             if (destinationSpan.Length < sourceSpan.Length)
                 throw new ArgumentException("Destination is shorter than the source.", nameof(destination));

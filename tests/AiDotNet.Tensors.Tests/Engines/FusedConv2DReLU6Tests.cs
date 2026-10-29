@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
@@ -51,11 +51,11 @@ public sealed class FusedConv2DReLU6Tests
     {
         var e = new CpuEngine();
         var x = Rand(4, 1f, 1, 1, 3, 11);
-        var xd = x.ToArray(); xd[2] = float.NaN; xd[30] = float.NaN;   // vector body and scalar tail of the plane
+        var xd = x.ToArray(); xd[2] = float.NaN; xd[32] = float.NaN;   // vector body and the 33-plane's scalar tail
         var kernel = new Tensor<float>(new[] { 1f }, new[] { 1, 1, 1, 1 });
         var bias = new Tensor<float>(new[] { 0.5f }, new[] { 1 });
         var y = e.FusedConv2D(new Tensor<float>(xd, new[] { 1, 1, 3, 11 }), kernel, bias, 1, 1, 0, 0, 1, 1,
             FusedActivationType.ReLU6).ToArray();
-        Assert.True(float.IsNaN(y[2]) && float.IsNaN(y[30]), "NaN did not propagate");
+        Assert.True(float.IsNaN(y[2]) && float.IsNaN(y[32]), "NaN did not propagate");
     }
 }

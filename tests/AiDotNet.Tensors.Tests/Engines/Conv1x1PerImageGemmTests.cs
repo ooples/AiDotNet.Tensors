@@ -57,6 +57,7 @@ public sealed class Conv1x1PerImageGemmTests
     [InlineData(5, 576, 160, 4, 4)]
     [InlineData(2, 640, 136, 3, 5)]
     [InlineData(2, 640, 136, 8, 8)]     // 64 pixels: the per-image shared-weight route
+    [InlineData(2, 640, 136, 9, 9)]     // 81 pixels: the per-image route with a ragged column edge
     [InlineData(70, 960, 160, 1, 1)]    // 1x1 maps: 70 columns, a full 64-wide tile and a ragged one
     [InlineData(37, 576, 140, 2, 2)]    // 2x2 maps: 148 columns; an image's pixels span two tiles
     [InlineData(9, 96, 576, 2, 2)]      // shallow, wide: many row blocks over one column tile

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
@@ -66,6 +66,23 @@ public sealed class BatchNormInferenceFusedActivationTests
             FusedActivationType.ReLU6);
         Assert.Equal(TensorLayout.Nchwc8, packed.Layout);
         Assert.Equal(expected, e.ReorderToNchw(packed).ToArray());
+    }
+
+    /// <summary>The NCHWc8 kernel keeps NaN too, for both activations: the clamp must not return a bound for it.</summary>
+    [Theory]
+    [InlineData(FusedActivationType.ReLU)]
+    [InlineData(FusedActivationType.ReLU6)]
+    public void Nchwc8_NaN_Propagates(FusedActivationType act)
+    {
+        var e = new CpuEngine();
+        var x = Rand(31, 4f, 1, 8, 2, 3);
+        var xd = x.ToArray(); xd[0] = float.NaN; xd[13] = float.NaN; xd[47] = float.NaN;
+        var (g, b, m, v) = Stats(8);
+        var packed = e.BatchNormInference(e.ReorderToNchwc(new Tensor<float>(xd, new[] { 1, 8, 2, 3 }), TensorLayout.Nchwc8),
+            g, b, m, v, 1e-5, act);
+        Assert.Equal(TensorLayout.Nchwc8, packed.Layout);
+        var y = e.ReorderToNchw(packed).ToArray();
+        Assert.True(float.IsNaN(y[0]) && float.IsNaN(y[13]) && float.IsNaN(y[47]), "NaN did not propagate");
     }
 
     [Theory]

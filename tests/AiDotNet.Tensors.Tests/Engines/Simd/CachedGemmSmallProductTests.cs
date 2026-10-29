@@ -23,7 +23,7 @@ public sealed class CachedGemmSmallProductTests
     [Theory]
     [InlineData(65, 768, 192)]
     [InlineData(65, 192, 192)]
-    [InlineData(65, 192, 768)]
+    [InlineData(63, 192, 768)]    // wide n; m = 65 here takes the direct kernel (m >= 64, n % 8 == 0), not the cached B
     [InlineData(65, 192, 576)]
     [InlineData(37, 1000, 100)]   // two K panels, rows and columns off the tile sizes
     public void EqualsTheDirectSum_AndRepeats(int m, int k, int n)
@@ -31,7 +31,11 @@ public sealed class CachedGemmSmallProductTests
         var a = Rand(1, m * k);
         var b = Rand(2, k * n);
         var c = new float[m * n];
+        int tiledBefore = SimdGemm.CachedBTiledCallsOnThisThread;
         SimdGemm.SgemmWithCachedB(a, b, c, m, k, n);
+        if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported
+            && !Avx512Sgemm.CanUse && Environment.GetEnvironmentVariable("AIDOTNET_JIT_GEMM") != "1")
+            Assert.True(SimdGemm.CachedBTiledCallsOnThisThread == tiledBefore + 1, "the cached-B tiled path did not run");
         for (int i = 0; i < m; i++)
             for (int j = 0; j < n; j++)
             {

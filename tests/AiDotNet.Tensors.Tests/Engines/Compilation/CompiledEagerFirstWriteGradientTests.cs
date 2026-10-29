@@ -250,6 +250,72 @@ public class CompiledEagerFirstWriteGradientTests
             }
         }
     }
+    /// <summary>
+    /// A training BatchNorm followed by a pool: the pool is the sole writer of the BatchNorm output's gradient, but the
+    /// BatchNorm's batch-statistic nodes also read that output. The pool's specialized backward claims the gradient's
+    /// first write, so it must overwrite it: counting the statistic readers as consumers made it add into a buffer nobody
+    /// zeroed, and the gradients grew every step.
+    /// </summary>
+    [Theory]
+    [InlineData("MaxPool2D")]
+    [InlineData("AvgPool2D")]
+    public void PoolAfterTrainingBatchNorm_OverwritesItsClaimedGradient_BitExact(string pool)
+    {
+        var engine = new CpuEngine();
+        var input = Filled(new[] { 2, 4, 4, 4 }, 31, 2f);
+        Tensor<float>[] MakeParams() => new[]
+        {
+            Filled(new[] { 2, 4, 4, 4 }, 32, 1f), Filled(new[] { 4 }, 33, 1f), Filled(new[] { 4 }, 34, 1f),
+        };
+        string[] names = { "scale", "gamma", "beta" };
+        Tensor<float> Forward(Tensor<float>[] p)
+        {
+            var x = engine.TensorMultiply(input, p[0]);
+            var y = engine.BatchNorm(x, p[1], p[2], 1e-5, out _, out _);
+            var z = pool == "MaxPool2D" ? engine.MaxPool2D(y, 2, 2) : engine.AvgPool2D(y, 2, 2);
+            return engine.ReduceSum(engine.TensorMultiply(z, z), null);
+        }
+
+        var eagerParams = MakeParams();
+        var eager = new Tensor<float>[eagerParams.Length];
+        using (var tape = new GradientTape<float>())
+        {
+            var grads = tape.ComputeGradients(Forward(eagerParams), sources: eagerParams);
+            for (int i = 0; i < eagerParams.Length; i++) eager[i] = grads[eagerParams[i]];
+        }
+
+        var ps = MakeParams();
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            Forward(ps);
+            plan = scope.CompileTraining(ps);
+        }
+        using (plan)
+        {
+            var concrete = Assert.IsType<CompiledTrainingPlan<float>>(plan);
+            Assert.Contains("specialized:" + pool, concrete.BackwardStepKinds);
+
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);
+            plan.Step();
+            var step0 = new float[ps.Length][];
+            for (int i = 0; i < ps.Length; i++)
+            {
+                step0[i] = Snapshot(ps[i].Grad, names[i]);
+                AssertClose(eager[i], step0[i], $"{names[i]} step 0 vs eager");
+            }
+
+            for (int step = 1; step < 5; step++)
+            {
+                plan.Step();
+                for (int i = 0; i < ps.Length; i++)
+                    AssertBitEqual(step0[i], ps[i].Grad, $"{names[i]} step {step}");
+                if (step >= 2)
+                    Assert.Equal(0L, concrete.LastClearedGradElements);
+            }
+        }
+    }
+
     private static float[] Snapshot(Tensor<float>? grad, string what)
     {
         Assert.True(grad is not null, $"{what}.Grad is null");
