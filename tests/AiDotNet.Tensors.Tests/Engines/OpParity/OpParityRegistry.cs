@@ -2808,6 +2808,43 @@ public static class OpParityRegistry
             e => e.RgLruScanForward(lv.D(), lrg.D(), lig.D(), ldec.D()),
             ParityTol.Accum(1e-3), opMethod: "RgLruScanForward");
 
+        // GRU sequence (#1568): input [B,S,inF=8], wIh [3*hid,inF], wHh [3*hid,hid], hid=4, both biases; the reset gate
+        // after the recurrent sum (PyTorch) and before the recurrent product (Cho et al., Keras reset_after=False).
+        var gruIn = OpInput.Rand(3650, new[] { B, S, 8 });
+        var gruH0 = OpInput.Rand(3651, new[] { B, 4 });
+        var gruWIh = OpInput.Rand(3652, new[] { 12, 8 });
+        var gruWHh = OpInput.Rand(3653, new[] { 12, 4 });
+        var gruBIh = OpInput.Rand(3654, new[] { 12 });
+        var gruBHh = OpInput.Rand(3655, new[] { 12 });
+        yield return new OpCase("GruSequenceForward[2,4,8;hid4]", "scan",
+            e => e.GruSequenceForward(gruIn.F(), gruH0.F(), gruWIh.F(), gruWHh.F(), gruBIh.F(), gruBHh.F(), false),
+            e => e.GruSequenceForward(gruIn.D(), gruH0.D(), gruWIh.D(), gruWHh.D(), gruBIh.D(), gruBHh.D(), false),
+            ParityTol.Accum(1e-3), opMethod: "GruSequenceForward")
+        { GraphCaptureExpectation = GraphCaptureExpectation.Required };
+        yield return new OpCase("GruSequenceForwardResetBefore[2,4,8;hid4;seq]", "scan",
+            e => e.GruSequenceForward(gruIn.F(), gruH0.F(), gruWIh.F(), gruWHh.F(), gruBIh.F(), gruBHh.F(), true, false),
+            e => e.GruSequenceForward(gruIn.D(), gruH0.D(), gruWIh.D(), gruWHh.D(), gruBIh.D(), gruBHh.D(), true, false),
+            ParityTol.Accum(1e-3), opMethod: "GruSequenceForward")
+        { GraphCaptureExpectation = GraphCaptureExpectation.Required };
+        yield return new OpCase("GruSequenceForwardState[2,4,8;hid4]", "scan",
+            e => e.GruSequenceForward(gruIn.F(), null, gruWIh.F(), gruWHh.F(), null, null, out _, true),
+            e => e.GruSequenceForward(gruIn.D(), null, gruWIh.D(), gruWHh.D(), null, null, out _, true),
+            ParityTol.Accum(1e-3), opMethod: "GruSequenceForward")
+        {
+            GraphCaptureExpectation = GraphCaptureExpectation.Required,
+            TensorOutputContract = TensorOutputContract.HomogeneousMultiple,
+            RunFloatOutputs = e =>
+            {
+                var output = e.GruSequenceForward(gruIn.F(), null, gruWIh.F(), gruWHh.F(), null, null, out var finalHidden, true);
+                return new[] { output, finalHidden };
+            },
+            RunDoubleOutputs = e =>
+            {
+                var output = e.GruSequenceForward(gruIn.D(), null, gruWIh.D(), gruWHh.D(), null, null, out var finalHidden, true);
+                return new[] { output, finalHidden };
+            },
+        };
+
         // LSTM sequence: input [B,S,inF=8], wIh [4*hid,inF], wHh [4*hid,hid], hid=4.
         var lstmIn = OpInput.Rand(3640, new[] { B, S, 8 });
         var wIh = OpInput.Rand(3641, new[] { 16, 8 });
@@ -2990,6 +3027,18 @@ public static class OpParityRegistry
             e => e.FusedConv2D(c2In.F(), c2K.F(), c2B.F(), 1, 1, 1, 1, 1, 1, FusedActivationType.None),
             e => e.FusedConv2D(c2In.D(), c2K.D(), c2B.D(), 1, 1, 1, 1, 1, 1, FusedActivationType.None),
             ParityTol.Accum(1e-3), opMethod: "FusedConv2D");
+
+        // FusedConv2DBatchNorm (#1432): the same convolution with inference batch norm folded in, then ReLU.
+        var bnGamma = OpInput.Rand(3303, new[] { 3 }, 0.5, 1.5);
+        var bnBeta = OpInput.Rand(3304, new[] { 3 });
+        var bnMean = OpInput.Rand(3305, new[] { 3 });
+        var bnVar = OpInput.Rand(3306, new[] { 3 }, 0.1, 2.0);
+        yield return new OpCase("FusedConv2DBatchNorm[1,2,8,8;k3,2,3,3;relu]", "conv",
+            e => e.FusedConv2DBatchNorm(c2In.F(), c2K.F(), c2B.F(), bnGamma.F(), bnBeta.F(), bnMean.F(), bnVar.F(), 1e-5,
+                1, 1, 1, 1, 1, 1, FusedActivationType.ReLU),
+            e => e.FusedConv2DBatchNorm(c2In.D(), c2K.D(), c2B.D(), bnGamma.D(), bnBeta.D(), bnMean.D(), bnVar.D(), 1e-5,
+                1, 1, 1, 1, 1, 1, FusedActivationType.ReLU),
+            ParityTol.Accum(1e-3), opMethod: "FusedConv2DBatchNorm");
 
         // FusedConv3D: input [1,2,4,4,4], kernel [3,2,2,2,2], bias [3], stride1 pad0 -> [1,3,3,3,3].
         var c3In = OpInput.Rand(3310, new[] { 1, 2, 4, 4, 4 });
@@ -4007,7 +4056,7 @@ public static class OpParityRegistry
         var sq = OpInput.Rand(811, new[] { 4, 1, 8 });
         var diag = OpInput.Rand(812, new[] { 4 });
         yield return new OpCase("TensorSqueeze[4,1,8;ax1]", "shape", e => e.TensorSqueeze(sq.F(), 1), e => e.TensorSqueeze(sq.D(), 1), ParityTol.Exact, opMethod: "TensorSqueeze") { GpuProbeExpectation = GpuProbeExpectation.MetadataOnly };
-        yield return new OpCase("TensorNarrow[4,8;d1,1,4]", "shape", e => e.TensorNarrow(m.F(), 1, 1, 4), e => e.TensorNarrow(m.D(), 1, 1, 4), ParityTol.Exact, opMethod: "TensorNarrow");
+        yield return new OpCase("TensorNarrow[4,8;d1,1,4]", "shape", e => e.TensorNarrow(m.F(), 1, 1, 4), e => e.TensorNarrow(m.D(), 1, 1, 4), ParityTol.Exact, opMethod: "TensorNarrow") { GpuProbeExpectation = GpuProbeExpectation.MetadataOnly };
         yield return new OpCase("TensorRepeatInterleave[4,8;2,d0]", "shape", e => e.TensorRepeatInterleave(m.F(), 2, 0), e => e.TensorRepeatInterleave(m.D(), 2, 0), ParityTol.Exact, opMethod: "TensorRepeatInterleave");
         yield return new OpCase("TensorTile[4,8;2,1]", "shape", e => e.TensorTile(m.F(), new[] { 2, 1 }), e => e.TensorTile(m.D(), new[] { 2, 1 }), ParityTol.Exact, opMethod: "TensorTile");
         yield return new OpCase("TensorRot90[4,8]", "shape", e => e.TensorRot90(m.F(), 1, new[] { 0, 1 }), e => e.TensorRot90(m.D(), 1, new[] { 0, 1 }), ParityTol.Exact, opMethod: "TensorRot90");

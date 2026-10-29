@@ -1,0 +1,4 @@
+name: AiDotNet.Tensors CodeQL configuration
+
+queries:
+  - uses: security-and-quality

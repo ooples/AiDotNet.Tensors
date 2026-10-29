@@ -1,0 +1,32 @@
+Licence for the AiDotNet.Native.ROCm package
+============================================
+
+This package redistributes three AMD files for Windows x64, taken unmodified from
+the AMD HIP SDK for Windows 6.4. Each is under its own AMD licence; none of them
+is under the AiDotNet.Tensors licence. NATIVE-MANIFEST.json lists the version,
+licence and SHA-256 of every file.
+
+runtimes/win-x64/native/rocblas.dll
+  rocBLAS 4.4.1 (ROCm 6.4.2), Advanced Micro Devices, Inc.
+  MIT licence plus third-party notices; full text in LICENSE.rocBLAS.txt.
+  SHA-256 ae4fec606b9bf2fc6c6fa3412c7545bc55185715c7d9a3d8245603b4bba83d22
+
+runtimes/win-x64/native/hipblas.dll
+  hipBLAS (ROCm 6.4.x; the DLL does not state its version), Advanced Micro
+  Devices, Inc.
+  MIT licence; full text in LICENSE.hipBLAS.txt.
+  SHA-256 6842e73070ed9fbf5904293dcb5dc8c576a53011983e4516a709fca6028f91da
+
+runtimes/win-x64/native/amdhip64_6.dll
+  HIP runtime for Windows, version 6.4 (file version 10.0.3652.0), Advanced
+  Micro Devices, Inc.
+  Proprietary: licensed under the AMD HIP SDK for Windows licence agreement.
+  The Windows HIP runtime is closed source. AMD shows this licence only in the
+  HIP SDK installer and does not publish it as a downloadable text, so its text
+  is not bundled here. To read it, run the AMD HIP SDK for Windows 6.4 installer
+  from https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html
+  SHA-256 5b22a1bb9d9aa5d4f69b524641a5115edb982c2b605f12195364e977b9927f26
+
+The packaging glue (the MSBuild .targets file and the build scripts) is part of
+AiDotNet.Tensors and is licensed under that repository's licence:
+https://github.com/ooples/AiDotNet.Tensors/blob/main/LICENSE

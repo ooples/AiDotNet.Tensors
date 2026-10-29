@@ -40,6 +40,16 @@ internal static partial class SimdGemm
         // MacroKernel accumulates (C += panel) across the K-panel (pc) loop, so C starts cleared.
         c.Clear();
 
+        // MacroKernel runs Fma.MultiplyAdd with no check of its own, so without AVX2/FMA this threw
+        // PlatformNotSupportedException for every fp16-weight matmul (TensorMatMulFp16WeightB reaches here when the
+        // GotoGemm route, which needs AVX2 too, declines). Upcast one Kc-row panel of B at a time instead and
+        // accumulate it through SgemmAddInternal, which dispatches to kernels this machine can run.
+        if (!PackedKernelsSupported)
+        {
+            SgemmFp16WeightBUpcastPanels(a, b, c, m, k, n);
+            return;
+        }
+
         int Mc = ChooseAdaptiveMc(m, k, n);
         int mcRounded = ((Mc + Mr - 1) / Mr) * Mr;
         int ncRounded = ((Nc + Nr - 1) / Nr) * Nr;
@@ -94,6 +104,30 @@ internal static partial class SimdGemm
     }
 
 #if NET5_0_OR_GREATER
+    /// <summary>
+    /// The portable path of <see cref="SgemmFp16WeightB"/> for machines without AVX2/FMA: C (already cleared)
+    /// += A[:, pc..pc+kc) · fp32(B[pc..pc+kc, :]) for K panels of at most Kc rows, so the fp32 scratch is bounded by
+    /// Kc·n floats rather than the whole weight.
+    /// </summary>
+    private static void SgemmFp16WeightBUpcastPanels(
+        ReadOnlySpan<float> a, ReadOnlySpan<Half> b, Span<float> c, int m, int k, int n)
+    {
+        int panel = Math.Min(k, Kc);
+        float[] bf = ArrayPool<float>.Shared.Rent(checked(panel * n));
+        try
+        {
+            for (int pc = 0; pc < k; pc += panel)
+            {
+                int kc = Math.Min(panel, k - pc);
+                var src = b.Slice(pc * n, kc * n);
+                for (int i = 0; i < src.Length; i++) bf[i] = (float)src[i];
+                SgemmAddInternal(a.Slice(pc), k, false, new ReadOnlySpan<float>(bf, 0, kc * n), n, false, c,
+                    m, kc, n, allowParallel: UseParallelGemm, clearedOutput: pc == 0);
+            }
+        }
+        finally { ArrayPool<float>.Shared.Return(bf); }
+    }
+
     /// <summary>
     /// N-parallel fused fp16 tile: packs A once (shared) for this (jc,pc) tile, then each worker
     /// converts+packs its own disjoint B column-slice from Half (<see cref="PackBFromHalf"/>) and runs

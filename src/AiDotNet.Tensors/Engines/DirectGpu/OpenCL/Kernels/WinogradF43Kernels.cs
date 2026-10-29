@@ -138,6 +138,14 @@ __kernel void wino_f43_output(__global const float* restrict mm, __global float*
         o[2] = z1 + z2 + 4.0f * z3 + 4.0f * z4;
         o[3] = z1 - z2 + 8.0f * z3 - 8.0f * z4 + z5;
         int row = dst + (h + i) * outW;
+        if (w4 + 4 <= outW)
+        {
+            // A full row of the tile as one 16-byte store, contiguous with the next tile's (#1432: 1.03-1.36x on VGG-16's
+            // layers, paired on the RX 5500 XT; vector loads in the input transform measured 0.93-1.08x and were not kept).
+            vstore4((float4)(conv_epilogue(o[0], bias, k, epi), conv_epilogue(o[1], bias, k, epi),
+                conv_epilogue(o[2], bias, k, epi), conv_epilogue(o[3], bias, k, epi)), 0, y + row + w4);
+            continue;
+        }
         for (int j = 0; j < 4; j++)
             if (w4 + j < outW) y[row + w4 + j] = conv_epilogue(o[j], bias, k, epi);
     }

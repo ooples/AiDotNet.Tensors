@@ -46502,7 +46502,9 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             int i = 0;
 #if NET5_0_OR_GREATER
-            if (Vector256.IsHardwareAccelerated)
+            // FastExp256 runs Avx2 and Fma intrinsics unguarded; Vector256.IsHardwareAccelerated is true on AVX alone,
+            // so a CPU with AVX but not AVX2/FMA threw out of every float Swish/SiLU backward.
+            if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported)
             {
                 // sig = 1/(1+exp(-x)); deriv = sig + x*sig*(1-sig); out = g*deriv.
                 // FastExp256 (~1e-6 rel err, within float32 precision) — SiLU/Swish is in
@@ -46616,7 +46618,8 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             int i = 0;
 #if NET5_0_OR_GREATER
-            if (Vector256.IsHardwareAccelerated)
+            // FastExp256 needs Avx2 and Fma, not just a hardware-accelerated Vector256 (see SwishBackward).
+            if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported)
             {
                 var one = Vector256.Create(1f);
                 int n = rF.Length;
