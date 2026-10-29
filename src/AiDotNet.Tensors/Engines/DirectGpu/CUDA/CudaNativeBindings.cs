@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA Driver API bindings for direct kernel execution.
 using System;
 using System.Runtime.InteropServices;

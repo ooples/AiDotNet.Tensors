@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 namespace AiDotNet.Tensors.Engines.DirectGpu;
 
 /// <summary>Optional native kernels for fixed-shape rendering and ray-sampling geometry.</summary>

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Built-in fusion: three column blocks of one packed QKV projection feeding a head-interleaved attention -> one packed
 // attention node that reads the blocks in place.
 using System.Collections.Generic;

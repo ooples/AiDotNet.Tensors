@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Depthwise and transposed convolutions on declared programs (#890 phase 4b). Both are the dense convolution's spec
 // under another reading, so they lower through the same builder (BuildDeclaredConv) and share its program cache:
 //

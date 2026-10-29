@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA launcher shims for the RoI family (Issue #217 tail).
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;

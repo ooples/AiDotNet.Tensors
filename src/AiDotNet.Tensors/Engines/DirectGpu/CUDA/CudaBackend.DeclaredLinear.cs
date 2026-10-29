@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Linear layers on declared programs (#890 phase 4c): CudaBackend.FusedLinear{ReLU,Sigmoid,Tanh,GELU,Swish} and their
 // backwards are served by programs lowered from their specs (CodegenBackendPrograms.FusedLinear / FusedLinearBackward)
 // instead of the hand-written thread-per-output kernels, in those kernels' contract. They run after the direct-PTX

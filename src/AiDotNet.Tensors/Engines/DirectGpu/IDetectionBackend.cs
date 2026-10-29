@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Secondary interface for backends that ship native vision-detection
 // kernels (BoxIoU family, BoxArea, BoxConvert, MasksToBoxes).
 // DirectGpuTensorEngine type-tests against this interface when

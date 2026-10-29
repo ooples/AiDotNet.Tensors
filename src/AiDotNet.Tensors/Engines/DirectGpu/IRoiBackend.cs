@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Optional backend capability for the RoI family added by Issue #217.
 namespace AiDotNet.Tensors.Engines.DirectGpu
 {
