@@ -236,6 +236,43 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
     }
 
+    // Outputs inside fused Conv2D/bias/ReLU chains whose storage the plan released (ReleaseFusedChainInternals).
+    private List<Tensor<T>>? _releasedChainInternals;
+
+    /// <summary>
+    /// Frees the storage of outputs inside fused Conv2D/bias/ReLU chains: the fused forward writes the chain's activation
+    /// directly and the backward reads only the activation, input and kernel, so the raw convolution (and a ReLU'd bias
+    /// output) is never touched. AiDotNet's convolutions add their bias as a separate op, so this was a second copy of
+    /// every convolution output: ~0.5 GB on DenseNet-121. Skipped while the forward diagnostics are on (they materialize
+    /// each step's output); <see cref="RestoreReleasedChainInternals"/> gives them storage back if they are turned on later.
+    /// </summary>
+    private void ReleaseFusedChainInternals(List<Tensor<T>> internals)
+    {
+        if (internals.Count == 0 || SanitizeForwardBuffers || ForwardStepObserver is not null || _engine.SupportsGpu) return;
+        foreach (var tensor in internals)
+        {
+            bool leased = _storageLeases?.Remove(tensor) == true;
+            if (tensor.IsContiguous && tensor.TryDropStorageForStreaming())
+                (_releasedChainInternals ??= new List<Tensor<T>>()).Add(tensor);
+            else if (leased)
+                _storageLeases?.Add(tensor);
+        }
+    }
+
+    /// <summary>The forward diagnostics write every step's output, so released chain internals get storage again.</summary>
+    private void RestoreReleasedChainInternals()
+    {
+        var released = _releasedChainInternals;
+        if (released is null) return;
+        _releasedChainInternals = null;
+        foreach (var tensor in released)
+        {
+            using (var own = new Tensor<T>((int[])tensor._shape.Clone()))
+                tensor.RebindStorageFrom(own);
+            _storageLeases?.Add(tensor);
+        }
+    }
+
     /// <summary>Test hook: how many preallocated gradients share arrays under gradient pooling.</summary>
     internal int PooledGradientCount
     {
@@ -4309,6 +4346,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private Tensor<T> StepEager()
     {
         var engine = _engine;
+        if (_releasedChainInternals is not null && (SanitizeForwardBuffers || ForwardStepObserver is not null))
+            RestoreReleasedChainInternals();
         _gradHeldZero = null;   // the eager step writes gradient buffers outside the captured body's record
         _firstWriteRedirects.Clear();
         // #226 race fix: a compiled training step is ATOMIC — every forward activation it
@@ -8858,12 +8897,14 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var convEpilogueBackwardSpecs = new Dictionary<int, Action<IEngine>>();
         var consumedByConvEpilogue = new HashSet<int>();
         var convEpilogueChains = new Dictionary<int, int[]>();
+        var convEpilogueDeadInternals = new List<Tensor<T>>();
         if (typeof(T) == typeof(float) && !useGradPool && !preferGenericForGpu
             && engine is CpuEngine && !engine.SupportsGpu
             && Environment.GetEnvironmentVariable("AIDOTNET_CONV_EPILOGUE_FUSION") != "0")
         {
             DetectConvBiasActivationFusion(forwardSteps, consumerCount, gradMap, requiresGradTensors,
-                convEpilogueForwardSpecs, convEpilogueBackwardSpecs, consumedByConvEpilogue, convEpilogueChains);
+                convEpilogueForwardSpecs, convEpilogueBackwardSpecs, consumedByConvEpilogue, convEpilogueChains,
+                convEpilogueDeadInternals);
         }
 
         // Track GCHandles for cleanup on Dispose
@@ -9503,6 +9544,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (deferrable.Count > 0 && engine is DirectGpuTensorEngine) plan._gradientDeferral = new Autodiff.GradientDeferral(deferrable);
             scope.ReleaseStorageLeases();
             DropStorageOfRemovedOutputs(scope.Nodes, optimized, forwardSteps, parameters);
+            plan.ReleaseFusedChainInternals(convEpilogueDeadInternals);
             return plan;
         }
         finally
@@ -14329,7 +14371,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         Dictionary<int, Action<IEngine>> forwardSpecs,
         Dictionary<int, Action<IEngine>> backwardSpecs,
         HashSet<int> consumed,
-        Dictionary<int, int[]>? chainSteps = null)
+        Dictionary<int, int[]>? chainSteps = null,
+        List<Tensor<T>>? deadInternals = null)
     {
         if (typeof(T) != typeof(float)) return;
         // AIDOTNET_CONV_POOL_BACKWARD_FUSION=0 keeps a following max pool's backward separate (A/B and tests).
@@ -14504,6 +14547,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (relu) covered.Add(reluIdx);
             if (poolIdx >= 0) covered.Add(poolIdx);
             if (chainSteps is not null) chainSteps[poolIdx >= 0 ? poolIdx : last] = covered.ToArray();
+            // Outputs the fused chain never writes or reads on the CPU: the raw convolution always, and the bias add's output
+            // when a ReLU follows (the forward writes the activation, the backward reads the activation and the input).
+            if (deadInternals is not null)
+            {
+                deadInternals.Add(convOut);
+                if (relu) deadInternals.Add(biasOut);
+            }
         }
     }
 
