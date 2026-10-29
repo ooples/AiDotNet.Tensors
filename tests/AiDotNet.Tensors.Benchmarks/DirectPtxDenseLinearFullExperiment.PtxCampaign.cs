@@ -18,9 +18,11 @@ namespace AiDotNet.Tensors.Benchmarks;
 /// </summary>
 /// <remarks>
 /// <para>Run: <c>--ptx-campaign gemm-large [--m=2048 --n=2048 --k=2048] [--generations=8] [--islands=2]
-/// [--model=claude-opus-5-5] [--max-usd=50] [--max-usd-per-call=5] [--out=dir]</c>. <c>--max-usd</c> bounds the sum
-/// of the per-call caps the campaign reserves (<see cref="CampaignUsdBudgetChatClient"/>); each call is capped at
-/// <c>--max-usd-per-call</c>. The model is reached through the Claude Code CLI
+/// [--model=claude-opus-5-5] [--max-usd=50] [--max-usd-per-call=5] [--out=dir]</c>. <c>--max-usd</c> is the
+/// campaign's total budget (<see cref="ClaudeCodeChatClientOptions.TotalBudgetUsd"/>: each call reserves its cap out of
+/// what remains, and is charged what the CLI reports it cost); each call is capped at <c>--max-usd-per-call</c>. Once the
+/// budget is spent, further proposals fail without starting the CLI and the campaign finishes its generations and
+/// verdict. The model is reached through the Claude Code CLI
 /// (<c>claude -p</c>) on PATH, so the run uses that login. Every proposal, verdict and the final comparison is written
 /// as JSON lines to stdout and to the output directory.</para>
 /// <para>Kernels win or lose per GPU: a campaign's verdict holds for the card it ran on. To confirm on another card
@@ -113,13 +115,23 @@ internal static partial class DirectPtxDenseLinearFullExperiment
             AllowPatches = true,
             AllowRewrites = true,
             IncumbentProfile = null,
+            // Every editable line is catalogued in the prompt, about 192 bytes with its source. The 128x128 SGEMM
+            // incumbents run to about 3,250 lines (623,616 bytes), well past the 131,072 default's 682-line bound;
+            // 4,096 lines leaves headroom for the larger tiles.
+            MaxInputTokens = 4_096 * 192,
         };
         var ledger = new EvolutionResourceLedger("ptx-campaign-" + target,
             new EvolutionResources(new[] { new KeyValuePair<string, decimal>("cost_units", 1_000_000m) }));
         var resources = new ProgramEvolutionResourceOptions(ledger, 1_000m, ptxOptions.CostUnitVersionHash);
-        // MaxBudgetUsd caps one claude -p process, and every call and retry starts another, so the campaign's budget is
-        // held across calls by the wrapper instead.
-        var client = new CampaignUsdBudgetChatClient(model, maxUsd, maxUsdPerCall);
+        // MaxBudgetUsd caps one claude -p process, and every call starts another, so the campaign's budget is the client's
+        // TotalBudgetUsd across calls. Retries are off: the evolution loop's next request is the retry, charged like any other.
+        var client = new ClaudeCodeChatClient(new ClaudeCodeChatClientOptions
+        {
+            Model = model,
+            MaxBudgetUsd = maxUsdPerCall,
+            TotalBudgetUsd = maxUsd,
+            MaxRetries = 0,
+        });
         var variation = PtxProgramVariation.Create(client, compiler, ptxOptions, resources);
         var correctnessGate = new DelegateProgramFitnessEvaluator((genome, _, token) =>
         {
@@ -152,8 +164,8 @@ internal static partial class DirectPtxDenseLinearFullExperiment
             best_speedup_over_incumbent = best?.Evaluation.Quality,
             proposals = usage.Proposals, calls = usage.ChatCalls, input_tokens = usage.InputTokens, output_tokens = usage.OutputTokens,
             max_usd = maxUsd, max_usd_per_call = maxUsdPerCall,
-            // Reserved caps, not spend: claude -p reports no spend back, and a call can run somewhat past its own cap.
-            usd_committed = client.CommittedUsd, calls_refused_for_budget = client.RefusedCalls,
+            // Charged: each call's reported total_cost_usd, or its whole cap when the CLI reported none.
+            usd_spent = client.SpentUsd,
         });
         if (best is null || (best.Evaluation.Quality ?? 0) <= 1.0)
         {
