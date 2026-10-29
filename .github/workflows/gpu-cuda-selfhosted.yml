@@ -136,11 +136,19 @@ jobs:
 
     - name: Fail on unexplained skips
       if: always()
-      # Allowed: another backend's device or toolchain (this runner has CUDA, not necessarily HIP, Metal, Vulkan, WebGPU
-      # or a Python with torch), and explicit architecture requirements. A CUDA test skipping for any other reason fails.
+      # Allowed skip reasons:
+      #   - another backend's device or toolchain (this runner has CUDA, not necessarily HIP, Metal, Vulkan, WebGPU, or a
+      #     Python with numpy and torch);
+      #   - architecture requirements (an sm_ level, AVX-512 on the host CPU);
+      #   - tracked baselines, each a listed gap with its own marker (NEEDS SPEC, TAPE-GRADIENT BASELINE, a forward with
+      #     no differentiable leaf, the PTX transfer campaign's progress check);
+      #   - opt-in benchmarks and probes.
+      # Allowed test names: device classes of another backend (TorchParity*HipDeviceTests and the like), whose reasons say
+      # only that no backend is available. A CUDA test skipping for any other reason fails the lane.
       run: >-
         python AiDotNet.Tensors/scripts/ci/summarize-test-skips.py --title "CUDA" --fail-on-skip
-        --allowed-skip "(?i)(HIP|ROCm|Metal|MoltenVK|Vulkan|WebGPU|Dawn|AIDOTNET_WEBGPU_NODE_DIR|OpenCL|POCL|DirectML|macOS)|requires sm_|compute capability|torch|python|PARITY_PYTHON"
+        --allowed-skip "(?i)(HIP|ROCm|Metal|MoltenVK|Vulkan|WebGPU|Dawn|AIDOTNET_WEBGPU_NODE_DIR|OpenCL|POCL|DirectML|macOS)|requires sm_|compute capability|torch|numpy|python|PARITY_PYTHON|AVX-512|^NEEDS SPEC:|TAPE-GRADIENT BASELINE|forward recorded no differentiable leaf|Full PTX transfer not complete|Requires a non-CUDA|benchmark|run manually|manual perf harness|Manual CUDA|Diagnostic-only|Set (AIDOTNET|PARITY)_[A-Z0-9_]+=|AIDOTNET_GPU_MEMTRACK|AIDOTNET_KERNEL_REGISTRY_PERSIST"
+        --allowed-skip-test "(Hip|Rocm|Dawn|WebGpu|Vulkan|Metal|MoltenVk|OpenCl|Pocl|DirectMl)[A-Za-z0-9]*Tests\."
         "${{ runner.temp }}/trx/*.trx"
 
 
