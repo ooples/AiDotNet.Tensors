@@ -1580,7 +1580,8 @@ internal static class FusedOptimizer
     {
         int i = 0;
 #if NET5_0_OR_GREATER
-        if (Avx.IsSupported && length >= 8)
+        // The momentum blend below is Fma.MultiplyAdd: Avx alone (kept on with AVX2/FMA switched off) threw.
+        if (Avx.IsSupported && Fma.IsSupported && length >= 8)
         {
             var vB1 = Vector256.Create(beta1);
             var v1mB1 = Vector256.Create(1f - beta1);
