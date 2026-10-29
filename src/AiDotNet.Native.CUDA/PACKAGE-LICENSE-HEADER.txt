@@ -1,0 +1,29 @@
+Licence for the AiDotNet.Native.CUDA and AiDotNet.Native.CUDA.Fragments.* packages
+==================================================================================
+
+These packages redistribute NVIDIA CUDA 12 runtime files for Windows x64, taken
+unmodified from NVIDIA's redistributable archives (cuda_cudart, libcublas and
+cuda_nvrtc):
+
+  - cudart64_12.dll           (CUDA runtime)
+  - cublas64_12.dll           (cuBLAS)
+  - cublasLt64_12.dll         (cuBLASLt)
+  - nvrtc64_*.dll             (nvRTC runtime compiler)
+  - nvrtc-builtins64_*.dll    (nvRTC built-ins)
+
+The AiDotNet.Native.CUDA.Fragments.* packages carry these same files split into
+byte chunks; the AiDotNet.Native.CUDA package reassembles them at build time.
+NATIVE-MANIFEST.json, in the AiDotNet.Native.CUDA package, lists the exact file
+names, the NVIDIA component versions and the SHA-256 of every file.
+
+Those files are licensed by NVIDIA Corporation under the NVIDIA CUDA Toolkit
+End User License Agreement, reproduced in full below exactly as NVIDIA ships it
+in each archive (also packed as LICENSE.CUDA.txt). The redistributable runtime
+files are listed in its Attachment A.
+
+The packaging glue (the MSBuild .targets file, the chunk manifest and the build
+scripts) is part of AiDotNet.Tensors and is licensed under that repository's
+licence: https://github.com/ooples/AiDotNet.Tensors/blob/main/LICENSE
+
+==================================================================================
+

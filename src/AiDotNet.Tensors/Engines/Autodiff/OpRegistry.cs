@@ -21,6 +21,8 @@ internal static class OpRegistry
     internal static readonly HashSet<string> DifferentiableOps = new(StringComparer.Ordinal)
     {
         "LstmCellFromGates",
+        // Fused GRU sequence: one node, fused BPTT on the host and the device (#1568)
+        "GruSequenceForward",
 
         // Tensor-level unary maths with their own backward (CpuEngine.ElementwiseExtra)
         "TensorAcosh", "TensorAsinh", "TensorExp2", "TensorExpm1", "TensorLog10", "TensorLog1p", "TensorLog2",
@@ -507,6 +509,8 @@ internal static class OpRegistry
     {
         // Advanced indexing (TensorTake) and grouped GEMM (narrow / matmul / concat): composed from recorded ops
         "TensorIndex", "TensorGroupedMatMul",
+        // Conv, inference batch norm and activation: recorded as the unfused ops under a tape, folded otherwise (#1432)
+        "FusedConv2DBatchNorm",
         // Composed from recorded ops (reparameterized normal, constant masks, reshape/permute, matmul, conv, scatter_reduce)
         "TensorNormal", "TensorAlphaDropout", "TensorFeatureAlphaDropout", "TensorChannelDropout",
         "TensorBilinear", "TensorChannelShuffle", "TensorPixelUnshuffle", "TensorLocalResponseNorm",

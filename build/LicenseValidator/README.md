@@ -2,13 +2,13 @@
 
 This directory hosts the MSBuild Task DLL that gates the
 `AIDOTNET_DISABLE_TELEMETRY` / `AIDOTNET_DISABLE_LICENSE_GUARD` compile-time flags
-on a valid Ooples enterprise license via RSA-2048 PKCS#1 v1.5 SHA-256 signature
+on a valid CrowdTrainer LLC enterprise license via RSA-2048 PKCS#1 v1.5 SHA-256 signature
 verification **plus** a secret-key binding (the signed payload carries a
 `keyHash`; the build must supply the matching `AiDotNetEnterpriseLicenseKey`).
 The flags are AiDotNet-prefixed so the gate never trips on a generic
 `DISABLE_TELEMETRY` a package consumer defines for their own code.
 
-This README is the procedure for the **Ooples-side** operator that generates the
+This README is the procedure for the **CrowdTrainer LLC** operator that generates the
 signing keypair, replaces the placeholder public key embedded in the validator
 source, and issues real enterprise licenses to customers.
 
@@ -17,7 +17,7 @@ source, and issues real enterprise licenses to customers.
 ## 1. Generate the signing keypair (one-time setup)
 
 ```bash
-# Private key — keep in Ooples HSM / 1Password / password manager. NEVER commit.
+# Private key — keep in the CrowdTrainer LLC HSM / 1Password / password manager. NEVER commit.
 openssl genrsa -out enterprise-license-signing.key 2048
 
 # Public key in PKCS#1 RSAPublicKey ASN.1 SEQUENCE form (no SubjectPublicKeyInfo
@@ -161,7 +161,7 @@ When you suspect compromise or simply on the annual cycle:
 ## 5. Security notes
 
 - **Private key**: NEVER commit to git. NEVER put on a shared developer
-  workstation. Store in Ooples HSM or a password manager with two-person
+  workstation. Store in the CrowdTrainer LLC HSM or a password manager with two-person
   integrity.
 - **Public key**: it IS committed (in the validator source). Customers, OSS
   contributors, and review agents will see it. This is fine — public keys
