@@ -48,6 +48,12 @@ env:
   # NVIDIA's driver also provides); GpuLaneBackendTests fails the suite if the engine resolves anything else.
   AIDOTNET_DIRECTGPU_BACKENDS: cuda
   AIDOTNET_EXPECT_GPU_BACKEND: CUDA
+  # Git for Windows' installer can enable core.fsmonitor machine-wide. On a runner, every git call actions/checkout makes
+  # then starts an fsmonitor daemon that keeps checkout's temporary HOME open, and the step fails cleaning it up
+  # (EBUSY: resource busy or locked, rmdir '_work\_temp\<guid>'). Turn it off for this job's git processes.
+  GIT_CONFIG_COUNT: 1
+  GIT_CONFIG_KEY_0: core.fsmonitor
+  GIT_CONFIG_VALUE_0: false
   # AIDOTNET_REQUIRE_GPU_TESTS is not set: it turns every backend's absence into a throw, and the suites include cases for
   # HIP, Metal, Vulkan and WebGPU this runner does not have. A missing CUDA device fails here through the skip check below
   # instead, whose exemptions name the other backends only.
