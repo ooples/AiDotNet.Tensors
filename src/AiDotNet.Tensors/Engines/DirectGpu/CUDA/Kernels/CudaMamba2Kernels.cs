@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA kernel for the fused Mamba-2 SSD scan forward (#1464). One thread per (batch, channel flatD).
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;

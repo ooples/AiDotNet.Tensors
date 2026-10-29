@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP fused convolution kernels - Conv2D + BatchNorm/Bias + Activation in single pass.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The stride-2 input gradients of CUDA/Kernels/CudaConvDgradS2Kernels.cs (#1476, #1488, #1494) -- the 3 x 3 four-phase
 // kernel, the 1 x 1 kernel and the projection-shortcut pair -- written once in WinogradF23KernelTemplate's body
 // conventions and emitted as OpenCL C, HIP C++, Vulkan GLSL and Metal Shading Language (#1479, #1480, #1481, #1482).

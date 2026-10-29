@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Saved-tensor hooks: pack/unpack interception for tensors saved by
 // backward ops. Used to offload activations to cheaper storage
 // (CPU memory, int8 quantization, zstd compression, delta coding).

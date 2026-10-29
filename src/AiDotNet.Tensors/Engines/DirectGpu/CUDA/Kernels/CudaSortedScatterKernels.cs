@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Deterministic scatter-add without floating-point atomics (#890 phase 4e): a stable sort of the indices, then each
 // destination sums its own contributions in increasing source order.
 

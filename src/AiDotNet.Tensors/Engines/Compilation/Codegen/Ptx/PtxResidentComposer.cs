@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // A chain of declared kernels as ONE persistent cooperative launch (#890 phase 4, on the resident program of phase 3,
 // #1430): the stages' own PTX, composed into one entry that walks every stage's blocks with a grid barrier between
 // stages, so a launch-bound chain pays one launch instead of one per kernel.

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Predict a kernel's bottleneck from its index maps, without a GPU.
 //
 // This exists because we optimised the wrong thing for a long time. The release gate
