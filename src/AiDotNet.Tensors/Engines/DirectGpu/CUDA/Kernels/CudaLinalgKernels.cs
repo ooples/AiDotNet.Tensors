@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA NVRTC source for the core torch.linalg decomposition kernels:
 //   - parity211_cholesky  (SPD factorization)
 //   - parity211_lu_factor (LU with partial pivoting)

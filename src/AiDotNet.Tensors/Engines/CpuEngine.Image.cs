@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Image codec CPU implementations — Issue #217 tail.
 // - PNG: pure managed decoder + encoder (no native deps). Supports
 //   non-interlaced 8-bit colour types 0/2/4/6 (grey, rgb, grey+alpha,

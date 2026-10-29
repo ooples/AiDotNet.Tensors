@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Accuracy-critical trigonometry, compiled WITHOUT --use_fast_math.
 //
 // These kernels were part of CudaActivationKernels, whose module is compiled with --use_fast_math.

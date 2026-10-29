@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Shared host-boundary validation for the DirectGpu attention / quantized-GEMM entrypoints.
 // The kernels assume these preconditions (fixed-size per-head accumulators, in-kernel integer
 // divides, contiguous buffer reads); violating them corrupts device memory or divides by zero

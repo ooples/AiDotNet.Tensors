@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Kernels for CudaBackend lookups that had no definition (#775).
 //
 // CudaBackend asked _kernelCache for these names and no CUDA source defined them, so every call threw

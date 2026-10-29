@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // One definition of the tuned-kernel registry's generated row / column variants, emitted as OpenCL C and as Metal
 // Shading Language (#1114, #1116).
 using System.Collections.Generic;
