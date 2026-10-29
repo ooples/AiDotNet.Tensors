@@ -1548,13 +1548,8 @@ internal static partial class SimdGemm
         SgemmAddInternal(a, k, false, b, n, false, c, m, k, n, allowParallel: false, clearedOutput: true);
     }
 
-    /// <summary>
-    /// Computes C_i = A · B_i for <paramref name="count"/> independent [k, n] / [m, n] pairs that share one [m, k] A,
-    /// as a 1x1 convolution does with its weight over a batch of images. A is packed once, not once per pair: with a
-    /// small n (a 4x4 or 8x8 map) repacking the weight for every image cost more than the multiply. Pairs run in
-    /// parallel, each written by one sequential pass in a fixed order, so the result does not depend on the thread
-    /// count and matches <see cref="SgemmSequential"/> on each pair.
-    /// </summary>
+#if NET5_0_OR_GREATER
+    // The packing kernels these share are .NET 5+ only.
     /// <summary>
     /// Whether <see cref="SgemmSharedA"/> beats one <see cref="SgemmSequential"/> per pair: when the per-pair GEMM
     /// would pack A (it misses the unpacked direct kernel), since that packing is what sharing saves. Where the direct
@@ -1564,6 +1559,13 @@ internal static partial class SimdGemm
     internal static bool PrefersSharedA(int m, int k, int n)
         => n <= Nc && !(n >= Nr && n % 8 == 0 && k <= SmallMatmulKThreshold && (long)m * k * n <= SmallMatmulWorkThreshold);
 
+    /// <summary>
+    /// Computes C_i = A · B_i for <paramref name="count"/> independent [k, n] / [m, n] pairs that share one [m, k] A,
+    /// as a 1x1 convolution does with its weight over a batch of images. A is packed once, not once per pair: with a
+    /// small n (a 4x4 or 8x8 map) repacking the weight for every image cost more than the multiply. Pairs run in
+    /// parallel, each written by one sequential pass in a fixed order, so the result does not depend on the thread
+    /// count and matches <see cref="SgemmSequential"/> on each pair.
+    /// </summary>
     internal static void SgemmSharedA(
         float[] a, int aOffset, float[] b, int bOffset, int bStride, float[] c, int cOffset, int cStride,
         int m, int k, int n, int count)
@@ -1615,6 +1617,8 @@ internal static partial class SimdGemm
                 if (block is not null) ArrayPool<float>.Shared.Return(block);
         }
     }
+
+#endif
 
     /// <summary>Sequential recurrent projection with a write-first direct kernel.
     /// Only the store-only route skips clearing; other shapes retain normal dispatch.</summary>
