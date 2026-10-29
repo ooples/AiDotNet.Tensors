@@ -1,0 +1,55 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 8 * * 1'
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  # Cancel a superseded PR run, never a push to main: every merge shares the main ref, so
+  # cancelling there would kill the previous merge's analysis.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: CodeQL Analysis (C#)
+    # The release-please PR carries only version/CHANGELOG edits, so its PR scan is skipped. Only its own branch counts:
+    # a branch in this repository, which a fork's contributor cannot create, so a fork named `release-please--...` is
+    # still scanned. Every push to main is scanned: a squash merge takes its message from the PR title, which a
+    # contributor controls.
+    if: "${{ !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-please--') && github.event.pull_request.head.repo.full_name == github.repository) }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      security-events: write # upload the SARIF results to code scanning
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '10.0.x'
+          dotnet-quality: 'preview'
+      - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          languages: csharp
+          build-mode: manual
+          config-file: ./.github/codeql/codeql-config.yml
+      # Every shipped C# project, not only the core: the ONNX importer (with its generated protobuf code) and the CLI
+      # tool are separate packages the core does not reference, so building only the core left them unanalyzed.
+      - name: Build the shipped projects (net10.0)
+        run: |
+          dotnet build src/AiDotNet.Tensors/AiDotNet.Tensors.csproj --configuration Release --framework net10.0 -p:UseSharedCompilation=false
+          dotnet build src/AiDotNet.Tensors.Onnx/AiDotNet.Tensors.Onnx.csproj --configuration Release --framework net10.0 -p:UseSharedCompilation=false
+          dotnet build src/AiDotNet.Tensors.Cli/AiDotNet.Tensors.Cli.csproj --configuration Release --framework net10.0 -p:UseSharedCompilation=false
+      - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          category: /language:csharp

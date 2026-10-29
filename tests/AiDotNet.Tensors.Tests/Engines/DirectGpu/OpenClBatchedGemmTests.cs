@@ -21,6 +21,13 @@ public class OpenClBatchedGemmTests
         // M and N >= 128 take the 128-tile kernel; K not a multiple of its 8-step and N not of its four-wide loads.
         { 2, 130, 131, 37, 1f, 0f },
         { 1, 256, 128, 64, 1f, 0f },
+        // Plain products with M or N below 128 and K >= 32 take gemm_batched_rb64p (#1432): K not a multiple of four (no
+        // float4 A loads), a K % 8 == 4 tail inside its 32-deep step, ragged M and N against its 64 x 64 block, and a late
+        // VGG layer's Winograd per-point product.
+        { 3, 70, 50, 37, 1f, 0f },
+        { 2, 65, 33, 36, 1f, 0f },
+        { 2, 129, 49, 64, 1f, 0f },
+        { 4, 512, 49, 512, 1f, 0f },
     };
 
     [SkippableTheory]
