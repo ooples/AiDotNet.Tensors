@@ -9734,11 +9734,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             used.Add(step.OutputBuffer);
             foreach (var input in step.Inputs) used.Add(input);
         }
-        foreach (var output in recorded.Where(node => !kept.Contains(node)).OfType<LazyNode<T>>().Select(removed => removed.Output))
+        // Not an output the plan uses, and not one a kept node writes (a fused BatchNorm+ReLU writes its absorbed statistics).
+        foreach (var output in recorded.Where(node => !kept.Contains(node)).OfType<LazyNode<T>>().Select(removed => removed.Output)
+            .Where(output => !used.Contains(output) && !(output.LazySource is ILazyNode producer && kept.Contains(producer))))
         {
-            if (used.Contains(output)) continue;
-            // A kept node that writes this output (a fused BatchNorm+ReLU writes its absorbed statistics) is its producer.
-            if (output.LazySource is ILazyNode producer && kept.Contains(producer)) continue;
             output.LazySource = null;   // never realized from the removed node again
             output.TryDropStorageForStreaming();
         }
@@ -13739,8 +13738,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // rented a fresh input-sized result every step (a large-object-heap array per transition layer) to
                 // copy or add in. The arrays are fetched each step: a pooled gradient's array is assigned after build.
                 if (direct && eng is CpuEngine && !eng.SupportsGpu && gradOut.IsContiguous && gradIn.IsContiguous
-                    && (object?)gradOut.GetCpuBackingForStridedRead(out int goOff) is float[] go
-                    && (object?)gradIn.GetCpuBackingForContiguousWrite(out int giOff) is float[] gi
+                    && gradOut.GetCpuBackingForStridedRead(out int goOff) is float[] go
+                    && gradIn.GetCpuBackingForContiguousWrite(out int giOff) is float[] gi
                     && go.Length - goOff >= gradOut.Length && gi.Length - giOff >= gradIn.Length)
                 {
                     using var gradOutKeep = new KeepAliveScope(gradOut);
