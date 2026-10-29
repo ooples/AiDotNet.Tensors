@@ -94,6 +94,27 @@ jobs:
         if (-not $python) { Write-Output "::error::This runner has no python on PATH; install Python 3 for all users."; exit 1 }
         "Python: $(python --version) at $($python.Source)" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
 
+    # The PyTorch reference tests (nn.GRU parity on the CPU and on CUDA) call PARITY_PYTHON with numpy and torch. They
+    # go into a virtual environment in the workspace, built once per pinned set and reused, since the service account
+    # cannot install into the machine's Python. torch is the CPU build: the references run on the host.
+    - name: Python packages
+      run: |
+        $pins = 'numpy==2.3.4', 'torch==2.9.0'
+        $venv = Join-Path $env:GITHUB_WORKSPACE 'pyenv'
+        $marker = Join-Path $venv ('ok-' + (($pins -join '_') -replace '[^A-Za-z0-9_.]', '-'))
+        $py = Join-Path $venv 'Scripts\python.exe'
+        if (-not (Test-Path $marker)) {
+          if (Test-Path $venv) { Remove-Item -Recurse -Force $venv }
+          python -m venv $venv
+          if ($LASTEXITCODE -ne 0) { Write-Output "::error::Creating the Python virtual environment failed."; exit 1 }
+          & $py -m pip install --disable-pip-version-check -q $pins --extra-index-url https://download.pytorch.org/whl/cpu
+          if ($LASTEXITCODE -ne 0) { Write-Output "::error::Installing $($pins -join ', ') failed."; exit 1 }
+          New-Item -ItemType File -Path $marker | Out-Null
+        }
+        "PARITY_PYTHON=$py" | Out-File -Append -Encoding utf8 -FilePath $env:GITHUB_ENV
+        "Python packages (numpy, torch): $(& $py -I -c 'import numpy, torch; print(numpy.__version__, torch.__version__)')" |
+          Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
+
     - name: Check out AiDotNet beside this checkout
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
