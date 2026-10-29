@@ -80,7 +80,24 @@ public class Fp16HeteroScratchFreeTests
     // fingerprint) and the resident activation-cache bytes right after the backward. Each run captures its OWN
     // fresh graph (distinct tensors) and clears the activation cache first, so the two runs don't share cache
     // state (a shared snapshot would treat the other run's entries as pre-existing and confound the A/B).
-    private static (double gradNorm, long cacheBytesAfter, long scratchReleased, bool collected) RunOnce(DirectGpuTensorEngine gpu, bool scratchFree)
+    private sealed class ScratchRun
+    {
+        public ScratchRun(double gradNorm, long forwardBytes, long peakBackwardBytes, long afterBackwardBytes, long gradBytes,
+            bool collected)
+        {
+            GradNorm = gradNorm; ForwardBytes = forwardBytes; PeakBackwardBytes = peakBackwardBytes;
+            AfterBackwardBytes = afterBackwardBytes; GradBytes = gradBytes; Collected = collected;
+        }
+
+        public double GradNorm { get; }
+        public long ForwardBytes { get; }
+        public long PeakBackwardBytes { get; }
+        public long AfterBackwardBytes { get; }
+        public long GradBytes { get; }
+        public bool Collected { get; }
+    }
+
+    private static ScratchRun RunOnce(DirectGpuTensorEngine gpu, bool scratchFree)
     {
         var prevEnv = Environment.GetEnvironmentVariable("AIDOTNET_FP16_NO_SCRATCH_FREE");
         Environment.SetEnvironmentVariable("AIDOTNET_FP16_NO_SCRATCH_FREE", scratchFree ? null : "1");
@@ -90,32 +107,43 @@ public class Fp16HeteroScratchFreeTests
             gpu.ClearActivationCache(); // isolate this run's cache accounting from the capture + the other run
             using var plan = MixedPrecisionCompiledPlan.FromCapturedOrder(gpu, order, loss, paging: false);
             // Replicate the real Step condition: eviction suspended for the whole forward+backward (#226), so
-            // without the scratch-free the per-op backward scratch genuinely accumulates in the cache.
+            // scratch that nothing frees genuinely accumulates.
             gpu.SuspendActivationEviction();
+            // Resident bytes are the activation cache PLUS the results that own their device buffers: since #1566 a
+            // backward node's scratch is an owned result, not a cache entry, so the cache alone cannot see it.
+            DirectGpuTensorEngine.TrackOwnedResultBytes = true;
+            gpu.ResetOwnedResultTracking();
             try
             {
                 bool quiet = BeginNoGc();
                 int gen0 = GC.CollectionCount(0);
                 MixedPrecisionGraphBackward.Result grads;
-                long bytes;
+                long forwardBytes, afterBytes;
                 bool collected;
                 try
                 {
                     plan.Forward();
+                    forwardBytes = gpu.CurrentActivationCacheBytes + gpu.LiveOwnedResultBytes;
                     grads = plan.Backward();
-                    bytes = gpu.CurrentActivationCacheBytes;
+                    afterBytes = gpu.CurrentActivationCacheBytes + gpu.LiveOwnedResultBytes;
                     collected = GC.CollectionCount(0) != gen0;
                 }
                 finally { EndNoGc(quiet); }
                 double sum = 0;
+                // Every gradient the backward holds, in both maps. The device stores FP16 gradients up-converted to FP32,
+                // so each element is four device bytes either way.
+                long gradBytes = 0;
+                foreach (var kv in grads.Fp16) gradBytes += (long)kv.Value.Length * sizeof(float);
                 foreach (var kv in grads.Fp32)
                 {
                     var a = kv.Value.ToArray();
+                    gradBytes += (long)a.Length * sizeof(float);
                     for (int i = 0; i < a.Length; i++) sum += (double)a[i] * a[i];
                 }
-                return (Math.Sqrt(sum), bytes, plan.ScratchBytesReleasedForTest, collected);
+                return new ScratchRun(Math.Sqrt(sum), forwardBytes, plan.PeakBackwardResidentBytesForTest, afterBytes,
+                    gradBytes, collected);
             }
-            finally { gpu.ResumeActivationEviction(); }
+            finally { gpu.ResumeActivationEviction(); DirectGpuTensorEngine.TrackOwnedResultBytes = false; }
         }
         finally { Environment.SetEnvironmentVariable("AIDOTNET_FP16_NO_SCRATCH_FREE", prevEnv); }
     }
@@ -208,7 +236,7 @@ public class Fp16HeteroScratchFreeTests
     }
 
     [SkippableFact]
-    public void ScratchFree_PreservesGradients_AndLowersResidentCacheBytes()
+    public void ScratchFree_PreservesGradients_AndAccumulatesNoBackwardScratch()
     {
         using var gpu = new DirectGpuTensorEngine();
         Skip.If(!gpu.IsGpuAvailable, "needs a DirectGpu backend (CUDA/OpenCL/…).");
@@ -218,30 +246,35 @@ public class Fp16HeteroScratchFreeTests
 
         // (1) Correctness: the scratch release must not change the gradients. Over-eviction would degrade to a
         // re-upload (still correct); a wrong protect set that freed a live grad would corrupt this norm.
-        Assert.True(Math.Abs(on.gradNorm - off.gradNorm) <= 1e-3 * (1 + Math.Abs(off.gradNorm)),
-            $"scratch-free changed the gradient norm: on={on.gradNorm} off={off.gradNorm}.");
+        Assert.True(Math.Abs(on.GradNorm - off.GradNorm) <= 1e-3 * (1 + Math.Abs(off.GradNorm)),
+            $"scratch-free changed the gradient norm: on={on.GradNorm} off={off.GradNorm}.");
 
-        // (2) The release itself: the scratch-free backward frees per-op scratch after each node, the opt-out frees none.
-        // Counted exactly by the eviction, so a garbage collection cannot hide it.
-        Assert.True(on.scratchReleased > 0, $"scratch-free released no backward scratch (off released {off.scratchReleased}).");
-        Assert.Equal(0L, off.scratchReleased);
-
-        // (3) Peak win: with the release on, the resident activation-cache bytes after the backward are strictly lower.
-        // The opt-out's scratch is garbage the GC releases on its own, so a collection during either arm makes both read
-        // the same bytes (on=off=557056 in a full run; forcing one gave 229376 each). Each attempt starts from a fresh
-        // collection; the comparison is asserted on the first attempt neither arm collected in, and the test fails if no
-        // attempt is clean -- it never passes without making the comparison.
+        // (2) No backward scratch accumulates: after every backward node, the resident bytes (activation cache plus
+        // owned results) are at most the forward's resident bytes plus the gradients the backward holds. Before #1566
+        // the per-op scratch were cache entries that only the scratch-free release freed, so this held with it on and
+        // failed with it off. Since #1566 the scratch are owned results freed with their tensors, so both arms must
+        // hold it (#1570). A garbage collection inside the window frees dead buffers on its own and could hide a
+        // build-up, so the check is made on an attempt neither arm collected in, and the test fails if none is clean.
         const int Attempts = 8;
         for (int attempt = 0; ; attempt++)
         {
-            if (!on.collected && !off.collected)
+            if (!on.Collected && !off.Collected)
             {
-                Assert.True(on.cacheBytesAfter < off.cacheBytesAfter,
-                    $"scratch-free should lower resident cache bytes: on={on.cacheBytesAfter} off={off.cacheBytesAfter}.");
+                foreach (var (arm, run) in new[] { ("on", on), ("off", off) })
+                {
+                    long bound = run.ForwardBytes + run.GradBytes;
+                    Assert.True(run.PeakBackwardBytes > 0, $"scratch-free {arm}: the backward peak was not sampled.");
+                    Assert.True(run.PeakBackwardBytes <= bound,
+                        $"scratch-free {arm}: backward scratch accumulated. Peak resident {run.PeakBackwardBytes} bytes > " +
+                        $"forward {run.ForwardBytes} + gradients {run.GradBytes}.");
+                    Assert.True(run.AfterBackwardBytes <= bound,
+                        $"scratch-free {arm}: backward scratch outlived the backward. Resident {run.AfterBackwardBytes} " +
+                        $"bytes > forward {run.ForwardBytes} + gradients {run.GradBytes}.");
+                }
                 return;
             }
             Assert.True(attempt + 1 < Attempts,
-                $"a garbage collection ran during every one of {Attempts} attempts, so the resident-bytes comparison was never made.");
+                $"a garbage collection ran during every one of {Attempts} attempts, so the resident-bytes check was never made.");
             GC.Collect();
             GC.WaitForPendingFinalizers();
             GC.Collect();

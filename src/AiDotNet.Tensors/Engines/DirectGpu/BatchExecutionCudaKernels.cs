@@ -22,7 +22,7 @@ internal static partial class BatchExecutionCudaKernels
     public const int BroadcastAdd = 0, BroadcastMul = 1;
     public const int GateGlu = 0, GateGeGlu = 1, GateReGlu = 2, GateSwiGlu = 3;
 
-    public static string GetSource() => CoreSource + SolverSource + AttentionSource + LstmSource + DecodeLinearSource + DirectConvSource;
+    public static string GetSource() => CoreSource + SolverSource + AttentionSource + LstmSource + GruSource + DecodeLinearSource + DirectConvSource;
 
     private const string CoreSource = @"
 #ifndef INFINITY
@@ -477,6 +477,9 @@ extern ""C"" __global__ __launch_bounds__(256) void bx_fft_from_storage(const un
         LaSymmetrize, LaLuSolve, LaLdlFactor, LaLdlSolve, LaSolveVector, LaTriangularSolveVector, LaCholeskyBackwardLower,
         LaSolveBackwardVector, LaSvdReduced, LaQrReduced, FaLse, FaOut, FaDelta, FaDq, FaDk, FaDv,
         StridedViewCopy, LstmGates, LstmCell, LstmCellBackward, LstmHiddenBackward, LstmInputGrad, LstmWeightIhGrad, LstmWeightHhGrad, LstmBiasGrad, LstmGateCell, LstmGateCellBackward, XLstmTrainingForward, XLstmTrainingBackward,
+        GruProjection, GruCell, GruCellBackward, GruHiddenBackward, GruInputGrad, GruWeightIhGrad, GruWeightHhGrad, GruBiasGrad,
+        GruRbResetHidden, GruRbCandidateProjection, GruRbCell, GruRbCellBackward, GruRbResetBackward, GruRbHiddenBackward,
+        GruRbWeightHhGrad,
         DlLinearGelu, DlLinearGeluFp16, DlW8A8LinearGelu, DlW8A8Epilogue, DcConv2dDirectFp16Hw
     };
 }
