@@ -8,12 +8,13 @@ name: GPU (CUDA, self-hosted)
 # the GPU suites and AiDotNet's model families on a real NVIDIA GPU, and a test that skips here fails the lane unless
 # its reason is an explicit exemption (another backend's device, an architecture requirement).
 #
-# To enable it, register a self-hosted runner on a machine with an NVIDIA GPU and the CUDA driver (.NET 10 SDK and
-# PowerShell 7 installed), with the labels `self-hosted, gpu, cuda`, then set the repository variable
+# To enable it, register a self-hosted runner on a machine with an NVIDIA GPU and the CUDA driver and a CUDA 13
+# toolkit (its bin on the machine PATH, for NVRTC and cuBLAS), PowerShell 7 and Python 3 on the machine PATH; the job
+# installs the .NET SDK and cuDNN into its workspace), with the labels `self-hosted, gpu, cuda`, then set the repository variable
 # CUDA_RUNNER_ENABLED=true. Until the variable is set every job is skipped, so nothing waits for a runner that does
 # not exist. Pull requests from forks never run here: a self-hosted runner must not execute untrusted code.
-# Until ooples/AiDotNet#2381 merges, also set AIDOTNET_HARNESS_REF to its branch: master's parity harness lacks most of
-# the model families, and the lane fails in its first minute saying so.
+# The model families come from AiDotNet master's parity harness; the repository variable AIDOTNET_HARNESS_REF points
+# the lane at another AiDotNet ref when a harness change needs testing before it merges.
 
 on:
   schedule:
@@ -48,6 +49,15 @@ env:
   # NVIDIA's driver also provides); GpuLaneBackendTests fails the suite if the engine resolves anything else.
   AIDOTNET_DIRECTGPU_BACKENDS: cuda
   AIDOTNET_EXPECT_GPU_BACKEND: CUDA
+  # Git for Windows' installer can enable core.fsmonitor machine-wide. On a runner, every git call actions/checkout makes
+  # then starts an fsmonitor daemon that keeps checkout's temporary HOME open, and the step fails cleaning it up
+  # (EBUSY: resource busy or locked, rmdir '_work\_temp\<guid>'). Turn it off for this job's git processes.
+  GIT_CONFIG_COUNT: 1
+  GIT_CONFIG_KEY_0: core.fsmonitor
+  GIT_CONFIG_VALUE_0: false
+  # setup-dotnet installs into C:\Program Files\dotnet by default, which the runner's service account cannot write.
+  # Install into the workspace instead (resolved against it; it persists between runs, so the SDK is fetched once).
+  DOTNET_INSTALL_DIR: .dotnet
   # AIDOTNET_REQUIRE_GPU_TESTS is not set: it turns every backend's absence into a throw, and the suites include cases for
   # HIP, Metal, Vulkan and WebGPU this runner does not have. A missing CUDA device fails here through the skip check below
   # instead, whose exemptions name the other backends only.
@@ -71,20 +81,24 @@ jobs:
     - name: Setup .NET
       uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
       with:
+        # GA, not dotnet-quality 'preview': on the 10.0 channel that resolves to 10.0.100-rc.2, whose NuGet fails the
+        # build with NU1510. Hosted runners mask this with the image's newer preinstalled SDK; this runner has none.
         dotnet-version: '10.0.x'
-        dotnet-quality: 'preview'
 
-    # The skip check below is Python; a runner provisioned with only .NET and PowerShell would fail it after the tests.
-    - name: Setup Python
-      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
-      with:
-        python-version: '3.12'
+    # The skip check below is Python (standard library only); a runner without it would fail only after the tests.
+    # Not actions/setup-python: its Windows installer edits HKLM, which a runner's service account cannot, so the
+    # runner provides a Python 3 on PATH instead.
+    - name: Check for Python
+      run: |
+        $python = Get-Command python -ErrorAction SilentlyContinue
+        if (-not $python) { Write-Output "::error::This runner has no python on PATH; install Python 3 for all users."; exit 1 }
+        "Python: $(python --version) at $($python.Source)" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
 
     - name: Check out AiDotNet beside this checkout
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         repository: ooples/AiDotNet
-        # The parity harness's model families come from ooples/AiDotNet#2381; until it merges, point this at its branch.
+        # The parity harness's model families (ooples/AiDotNet#2381); AIDOTNET_HARNESS_REF overrides master.
         ref: ${{ vars.AIDOTNET_HARNESS_REF || 'master' }}
         path: aidn
         persist-credentials: false
@@ -98,7 +112,7 @@ jobs:
         $families = 'mlp','cnn','lstm','transformer','gru','resnet18','resnet50','vgg11','mobilenetv2','densenet121','vit'
         $missing = $families | Where-Object { $program -notmatch ('"' + $_ + '"\s*=>') }
         if ($missing) {
-          Write-Output "::error::The AiDotNet parity harness at '${{ vars.AIDOTNET_HARNESS_REF || 'master' }}' does not define: $($missing -join ', '). Set the repository variable AIDOTNET_HARNESS_REF to a ref that does (ooples/AiDotNet#2381's branch until it merges)."
+          Write-Output "::error::The AiDotNet parity harness at '${{ vars.AIDOTNET_HARNESS_REF || 'master' }}' does not define: $($missing -join ', '). Set the repository variable AIDOTNET_HARNESS_REF to a ref that does, or unset it to use master."
           exit 1
         }
         "MODEL_FAMILIES=$($families -join ',')" | Out-File -Append -FilePath $env:GITHUB_ENV
@@ -109,6 +123,32 @@ jobs:
         $gpu = nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv,noheader
         if ($LASTEXITCODE -ne 0) { Write-Output "::error::nvidia-smi failed: this runner has no usable NVIDIA driver."; exit 1 }
         "Runner GPU: $gpu" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
+
+    # The cuDNN paths (convolution candidates, batch norm) need cudnn64_9.dll on the loader path, and the toolkit's
+    # cuBLASLt for the CUDA it was built against: the CUDA 13 build pairs with a CUDA 13 toolkit's cublasLt64_13.dll.
+    # NVIDIA's public redistributable is fetched once into the workspace (it persists between runs) and checked
+    # against the SHA-256 in NVIDIA's own manifest.
+    - name: cuDNN
+      run: |
+        $version = '9.26.1.1'
+        $sha256 = 'c826d866641fed2c266ae1c11e679fcc1ef8517801a32a51715843051ce8df52'   # redistrib_9.26.1.json, windows-x86_64 cuda13
+        $root = Join-Path $env:GITHUB_WORKSPACE "cudnn-$version"
+        if (-not (Test-Path (Join-Path $root 'ok'))) {
+          $zip = Join-Path $env:RUNNER_TEMP 'cudnn.zip'
+          Invoke-WebRequest -UseBasicParsing -OutFile $zip `
+            "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-${version}_cuda13-archive.zip"
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLower() -ne $sha256) { Write-Output "::error::cuDNN archive SHA-256 mismatch."; exit 1 }
+          if (Test-Path $root) { Remove-Item -Recurse -Force $root }
+          New-Item -ItemType Directory -Force $root | Out-Null
+          tar -xf $zip -C $root
+          if ($LASTEXITCODE -ne 0) { Write-Output "::error::Extracting cuDNN failed."; exit 1 }
+          Remove-Item $zip
+          New-Item -ItemType File (Join-Path $root 'ok') | Out-Null
+        }
+        $dll = Get-ChildItem $root -Recurse -Filter cudnn64_9.dll | Select-Object -First 1
+        if (-not $dll) { Write-Output "::error::cudnn64_9.dll is not in the cuDNN archive."; exit 1 }
+        $dll.DirectoryName | Out-File -Append -FilePath $env:GITHUB_PATH
+        "cuDNN: $version (CUDA 13) at $($dll.DirectoryName)" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
 
     - name: Build tests (net10.0)
       run: dotnet build AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --framework net10.0
@@ -123,11 +163,20 @@ jobs:
 
     - name: Fail on unexplained skips
       if: always()
-      # Allowed: another backend's device or toolchain (this runner has CUDA, not necessarily HIP, Metal, Vulkan, WebGPU
-      # or a Python with torch), and explicit architecture requirements. A CUDA test skipping for any other reason fails.
+      # Allowed skip reasons:
+      #   - another backend's device or toolchain (this runner has CUDA, not necessarily HIP, Metal, Vulkan, WebGPU, or a
+      #     Python with numpy and torch);
+      #   - architecture requirements (an sm_ level, AVX-512 on the host CPU);
+      #   - tracked baselines, each a listed gap with its own marker (NEEDS SPEC, TAPE-GRADIENT BASELINE, a forward with
+      #     no differentiable leaf, the PTX transfer campaign's progress check);
+      #   - opt-in benchmarks and probes;
+      #   - "Not applicable: CUDA ...", a test of a mechanism CUDA deliberately does not use (it names CUDA's own).
+      # Allowed test names: device classes of another backend (TorchParity*HipDeviceTests and the like), whose reasons say
+      # only that no backend is available. A CUDA test skipping for any other reason fails the lane.
       run: >-
         python AiDotNet.Tensors/scripts/ci/summarize-test-skips.py --title "CUDA" --fail-on-skip
-        --allowed-skip "(?i)(HIP|ROCm|Metal|MoltenVK|Vulkan|WebGPU|Dawn|AIDOTNET_WEBGPU_NODE_DIR|OpenCL|POCL|DirectML|macOS)|requires sm_|compute capability|torch|python|PARITY_PYTHON"
+        --allowed-skip "(?i)(HIP|ROCm|Metal|MoltenVK|Vulkan|WebGPU|Dawn|AIDOTNET_WEBGPU_NODE_DIR|OpenCL|POCL|DirectML|macOS)|requires sm_|compute capability|torch|numpy|python|PARITY_PYTHON|AVX-512|^NEEDS SPEC:|TAPE-GRADIENT BASELINE|forward recorded no differentiable leaf|Full PTX transfer not complete|^Not applicable: CUDA |Requires a non-CUDA|benchmark|run manually|manual perf harness|Manual CUDA|Diagnostic-only|Set (AIDOTNET|PARITY)_[A-Z0-9_]+=|AIDOTNET_GPU_MEMTRACK|AIDOTNET_KERNEL_REGISTRY_PERSIST"
+        --allowed-skip-test "(Hip|Rocm|Dawn|WebGpu|Vulkan|Metal|MoltenVk|OpenCl|Pocl|DirectMl)[A-Za-z0-9]*Tests\."
         "${{ runner.temp }}/trx/*.trx"
 
 
