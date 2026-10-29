@@ -170,13 +170,19 @@ internal static class CpuJitKernels
     {
         // Pack ldc into the key: OP_GEMM_MICRO in opId, ldc in aligned flag area, kc in length
         long key = ((long)(OP_GEMM_MICRO + ldc) << 33) | (uint)kc;
-        var entry = _cache.GetOrAdd(key, _ => new Lazy<(ExecutableBuffer Buffer, Delegate Kernel)>(() =>
+        // Looked up first, with the compiling factory in another method: a lambda here captures kc and ldc, and its
+        // closure was allocated on every call, hit or miss. Every GEMM macro-kernel call comes here (6.7% of
+        // MobileNetV2 inference's allocated bytes).
+        if (!_cache.TryGetValue(key, out var entry)) entry = AddGemmMicroKernel(key, kc, ldc);
+        return (GemmMicroKernel)entry.Value.Kernel;
+    }
+
+    private static Lazy<(ExecutableBuffer Buffer, Delegate Kernel)> AddGemmMicroKernel(long key, int kc, int ldc)
+        => _cache.GetOrAdd(key, _ => new Lazy<(ExecutableBuffer Buffer, Delegate Kernel)>(() =>
         {
             var buf = GenerateGemmMicroKernel(kc, ldc);
             return (buf, (Delegate)buf.CreateDelegate<GemmMicroKernel>());
         }));
-        return (GemmMicroKernel)entry.Value.Kernel;
-    }
 
     /// <summary>
     /// Iter 42: get function pointer to a FAT kernel that JIT-emits the
