@@ -16,7 +16,7 @@ using Org.BouncyCastle.Security;
 namespace AiDotNet.Tensors.LicenseValidator;
 
 /// <summary>
-/// MSBuild task that validates an Ooples AiDotNet Enterprise license file before allowing the build
+/// MSBuild task that validates a CrowdTrainer LLC AiDotNet Enterprise license file before allowing the build
 /// to define <c>AIDOTNET_DISABLE_TELEMETRY</c> or <c>AIDOTNET_DISABLE_LICENSE_GUARD</c> compile flags.
 /// </summary>
 /// <remarks>
@@ -44,13 +44,13 @@ namespace AiDotNet.Tensors.LicenseValidator;
 /// <para>
 /// Validation order: file exists → JSON parses → marker matches → expiry date is in the future →
 /// every requested DISABLE_* flag is in the granted scope → RSA signature verifies against the
-/// embedded Ooples enterprise-license public key. Any failure logs a structured MSBuild error
+/// embedded CrowdTrainer LLC enterprise-license public key. Any failure logs a structured MSBuild error
 /// with a stable diagnostic code (AIDOTNET004 through AIDOTNET009) and aborts the build.
 /// </para>
 /// <para>
 /// <b>Public-key replacement</b>: the constant <see cref="EnterpriseLicensePublicKeyPkcs1Base64"/>
 /// currently ships as a marker placeholder (<c>PHASE4_PLACEHOLDER_*</c>). Production builds MUST
-/// replace it with the real Ooples enterprise-license public key generated per the procedure in
+/// replace it with the real CrowdTrainer LLC enterprise-license public key generated per the procedure in
 /// <see href="README.md"/>. While the placeholder is in place, every real license is rejected with
 /// AIDOTNET008 — the safe-by-default posture during rollout.
 /// </para>
@@ -62,7 +62,7 @@ public sealed class ValidateAiDotNetEnterpriseLicense : Task
     /// not been replaced with the production one. The character sequence is intentionally long
     /// enough that no real PKCS#1-encoded RSA-2048 key would ever start with it.
     /// </summary>
-    public const string PublicKeyPlaceholderMarker = "PHASE4_PLACEHOLDER_REPLACE_WITH_REAL_OOPLES_KEY";
+    public const string PublicKeyPlaceholderMarker = "PHASE4_PLACEHOLDER_REPLACE_WITH_REAL_LICENSE_SIGNING_KEY";
 
     /// <summary>
     /// Base64-encoded RSA-2048 public key (PKCS#1 format, no PEM BEGIN/END wrapping).
@@ -71,7 +71,7 @@ public sealed class ValidateAiDotNetEnterpriseLicense : Task
     /// To replace for production: generate the keypair per the README, then overwrite this constant
     /// with the contents of <c>enterprise-license-signing.pub</c> stripped of the
     /// <c>-----BEGIN/END PUBLIC KEY-----</c> markers and any newlines. The private key MUST stay in
-    /// the Ooples HSM / password manager and never be committed.
+    /// the CrowdTrainer LLC HSM / password manager and never be committed.
     /// </remarks>
     public const string EnterpriseLicensePublicKeyPkcs1Base64 = PublicKeyPlaceholderMarker;
 
@@ -175,7 +175,7 @@ public sealed class ValidateAiDotNetEnterpriseLicense : Task
                 if (string.Equals(pubKeyBase64, PublicKeyPlaceholderMarker, StringComparison.Ordinal))
                 {
                     Log.LogError(null, "AIDOTNET008", null, LicensePath, 0, 0, 0, 0,
-                        "AiDotNet Enterprise license verification refused: this build of the license validator ships with the placeholder public key (PHASE4_PLACEHOLDER_*). Production builds must replace EnterpriseLicensePublicKeyPkcs1Base64 in ValidateAiDotNetEnterpriseLicense.cs with the real Ooples key generated per build/LicenseValidator/README.md.");
+                        "AiDotNet Enterprise license verification refused: this build of the license validator ships with the placeholder public key (PHASE4_PLACEHOLDER_*). Production builds must replace EnterpriseLicensePublicKeyPkcs1Base64 in ValidateAiDotNetEnterpriseLicense.cs with the real CrowdTrainer LLC key generated per build/LicenseValidator/README.md.");
                     return false;
                 }
 

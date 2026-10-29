@@ -3139,6 +3139,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     rb128.Execute3D(RoundUpToMultiple(N, 128) / 8, RoundUpToMultiple(M, 128) / 8, batchCount, 16, 16, 1);
                     return;
                 }
+                // #1432: the prefetching variant where this kernel would run, once K fills its 32-deep step. Paired on
+                // the RX 5500 XT (F(4x4,3x3) per-point GEMMs, 36 batches): 1.65x at 512x49x512, 1.76x at 512x16x512,
+                // 1.49x at 512x49x256, 1.19x at 64x3136x64; slower at K = 3 (0.84x), which keeps rb64.
+                if (K >= 32 && TryBatchedGemmRb64Prefetch(A, B, C, M, N, K, batchCount)) return;
                 rb.SetArg(0, BufferHandle(A)); rb.SetArg(1, BufferHandle(B)); rb.SetArg(2, BufferHandle(C));
                 rb.SetArg(3, M); rb.SetArg(4, N); rb.SetArg(5, K);
                 rb.Execute3D(RoundUpToMultiple(N, 64) / 4, RoundUpToMultiple(M, 64) / 4, batchCount, 16, 16, 1);
