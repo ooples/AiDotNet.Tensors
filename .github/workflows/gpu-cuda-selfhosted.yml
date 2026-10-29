@@ -158,8 +158,10 @@ jobs:
         dotnet test AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj `
           --configuration Release --no-build --framework net10.0 `
           --filter "(FullyQualifiedName~GpuLaneBackend|FullyQualifiedName~Engines.DirectGpu|FullyQualifiedName~Engines.Autodiff|FullyQualifiedName~Engines.Compilation|FullyQualifiedName~Parity|FullyQualifiedName~GruSequence|FullyQualifiedName~FusedConv2DBatchNorm)&Category!=Benchmark&Category!=Performance" `
-          --logger "trx;LogFilePath=${{ runner.temp }}/trx/cuda.trx" `
+          --results-directory "${{ runner.temp }}/trx" --logger "trx;LogFileName=cuda.trx" `
           --blame-hang --blame-hang-timeout 900s --blame-crash
+      # With --blame the TRX logger ignores LogFilePath and writes under the project's TestResults; the results
+      # directory puts the TRX and any crash or hang dump where the skip check and the upload look.
 
     - name: Fail on unexplained skips
       if: always()
@@ -198,3 +200,5 @@ jobs:
           ${{ runner.temp }}/trx/**
           ${{ runner.temp }}/aidotnet-cuda.json
         if-no-files-found: ignore
+        # A crash dump is the full test host (gigabytes); keep it only long enough to analyse.
+        retention-days: 5
