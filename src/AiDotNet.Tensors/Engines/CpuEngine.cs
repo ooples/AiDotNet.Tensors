@@ -49215,8 +49215,24 @@ public partial class CpuEngine : ITensorLevelEngine
             var fSrc = (float[])(object)fSrcLease.Array;
             using var fDstLease = result.LeaseArray();
             var fDst = (float[])(object)fDstLease.Array;
-            for (int i = 0; i < length; i++)
-                fDst[i] = MathF.Max(0f, MathF.Min(6f, fSrc[i]));
+            // Vectorized and split across threads: this ran as one scalar loop, a full serial pass per ReLU6 (every
+            // expansion and depthwise stage of MobileNetV2). ClampUnsafe keeps NaN, as min(max(0, x), 6) did.
+            const int Chunk = 64 * 1024;
+            int chunks = (length + Chunk - 1) / Chunk;
+            unsafe
+            {
+                fixed (float* src = fSrc)
+                fixed (float* dst = fDst)
+                {
+                    nint srcAddr = (nint)src, dstAddr = (nint)dst;
+                    CpuParallelSettings.ParallelForOrSerial(0, chunks, length, c =>
+                    {
+                        int start = c * Chunk;
+                        SimdKernels.ClampUnsafe((float*)srcAddr + start, (float*)dstAddr + start,
+                            Math.Min(Chunk, length - start), 0f, 6f);
+                    });
+                }
+            }
         }
         else if (typeof(T) == typeof(double))
         {
