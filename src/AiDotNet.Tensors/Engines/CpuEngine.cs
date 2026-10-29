@@ -26985,6 +26985,29 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!destGradGamma.IsContiguous) throw new InvalidOperationException("destGradGamma must be contiguous.");
         if (!destGradBeta.IsContiguous) throw new InvalidOperationException("destGradBeta must be contiguous.");
 
+        // Float 4D: the kernel writes or accumulates straight into the plan's buffers. Computing into rented tensors
+        // and then copying or adding them in was an extra read and write of the whole input gradient per layer.
+        if (typeof(T) == typeof(float) && input.Rank == 4 && ShapesMatch(destGradInput._shape, input._shape)
+            && ShapesMatch(gradOutput._shape, input._shape)
+            && destGradGamma.Length == input._shape[1] && destGradBeta.Length == input._shape[1]
+            && destGradInput.GetCpuBackingForContiguousWrite(out int giOff) is float[] giDest
+            && destGradGamma.GetCpuBackingForContiguousWrite(out int ggOff) is float[] ggDest
+            && destGradBeta.GetCpuBackingForContiguousWrite(out int gbOff) is float[] gbDest)
+        {
+            using var goLease = gradOutput.LeaseArray();
+            using var meanLease = mean.LeaseArray();
+            using var varLease = variance.LeaseArray();
+            if (goLease.Array is float[] goF && input.GetReadOnlyDataArray() is float[] inF
+                && gamma.GetReadOnlyDataArray() is float[] gaF && meanLease.Array is float[] meF
+                && varLease.Array is float[] vaF)
+            {
+                BatchNormBackward4DFloat(goF, inF, gaF, meF, vaF, (float)epsilon,
+                    input._shape[0], input._shape[1], input._shape[2] * input._shape[3],
+                    giDest, giOff, accumulateInput, ggDest, ggOff, accumulateGamma, gbDest, gbOff, accumulateBeta);
+                return;
+            }
+        }
+
         var gi = BatchNormBackward(gradOutput, input, gamma, mean, variance, epsilon, out var gg, out var gb);
         try
         {
@@ -27026,6 +27049,82 @@ public partial class CpuEngine : ITensorLevelEngine
 
 
     /// <summary>
+    /// The float 4D batch-norm backward. As torch's batch_norm_cpu_backward: two reductions per channel, sum(dy) and
+    /// dot(dy, x - mean), then one pass dx = k1*dy + k2*(x - mean) + k3, one task per channel in a fixed order (the same
+    /// at any thread count). Each destination is overwritten, or added to when its accumulate flag is set, in the same
+    /// pass, so a caller with its own buffers needs no temporary and no copy.
+    /// </summary>
+    private static void BatchNormBackward4DFloat(float[] goF, float[] inF, float[] gaF, float[] meF, float[] vaF,
+        float epsF, int batch, int channels, int spatialSize,
+        float[] giF, int giOff, bool accumulateInput,
+        float[] ggF, int ggOff, bool accumulateGamma, float[] gbF, int gbOff, bool accumulateBeta)
+    {
+        float elemF = batch * spatialSize;
+        CpuParallelSettings.ParallelForOrSerial(0, channels, (long)channels * batch * spatialSize, [MethodImpl(Hot)] (c) =>
+        {
+            float invStd = 1f / MathF.Sqrt(vaF[c] + epsF);
+            float meanC = meF[c];
+            int width = System.Numerics.Vector<float>.Count;
+            var vMean = new System.Numerics.Vector<float>(meanC);
+            var accGrad = System.Numerics.Vector<float>.Zero;
+            var accGradX = System.Numerics.Vector<float>.Zero;
+            float sumGrad = 0f, sumGradX = 0f;
+            for (int n = 0; n < batch; n++)
+            {
+                int baseIdx = (n * channels + c) * spatialSize;
+                int s = 0;
+                if (System.Numerics.Vector.IsHardwareAccelerated)
+                {
+                    for (; s + width <= spatialSize; s += width)
+                    {
+                        var go = new System.Numerics.Vector<float>(goF, baseIdx + s);
+                        accGrad += go;
+                        accGradX += go * (new System.Numerics.Vector<float>(inF, baseIdx + s) - vMean);
+                    }
+                }
+                for (; s < spatialSize; s++)
+                {
+                    float go = goF[baseIdx + s];
+                    sumGrad += go;
+                    sumGradX += go * (inF[baseIdx + s] - meanC);
+                }
+            }
+            sumGrad += System.Numerics.Vector.Dot(accGrad, System.Numerics.Vector<float>.One);
+            sumGradX += System.Numerics.Vector.Dot(accGradX, System.Numerics.Vector<float>.One);
+
+            float gradGamma = sumGradX * invStd;
+            ggF[ggOff + c] = accumulateGamma ? ggF[ggOff + c] + gradGamma : gradGamma;
+            gbF[gbOff + c] = accumulateBeta ? gbF[gbOff + c] + sumGrad : sumGrad;
+            float gammaC = gaF[c];
+            float k1 = gammaC * invStd;
+            float k2 = -gammaC * invStd * invStd * invStd * sumGradX / elemF;
+            float k3 = -gammaC * invStd * sumGrad / elemF;
+            var vK1 = new System.Numerics.Vector<float>(k1);
+            var vK2 = new System.Numerics.Vector<float>(k2);
+            var vK3 = new System.Numerics.Vector<float>(k3);
+            for (int n = 0; n < batch; n++)
+            {
+                int baseIdx = (n * channels + c) * spatialSize;
+                int s = 0;
+                if (System.Numerics.Vector.IsHardwareAccelerated)
+                {
+                    for (; s + width <= spatialSize; s += width)
+                    {
+                        var dx = vK1 * new System.Numerics.Vector<float>(goF, baseIdx + s)
+                            + vK2 * (new System.Numerics.Vector<float>(inF, baseIdx + s) - vMean) + vK3;
+                        if (accumulateInput) dx = new System.Numerics.Vector<float>(giF, giOff + baseIdx + s) + dx;
+                        dx.CopyTo(giF, giOff + baseIdx + s);
+                    }
+                }
+                for (; s < spatialSize; s++)
+                {
+                    float dx = k1 * goF[baseIdx + s] + k2 * (inF[baseIdx + s] - meanC) + k3;
+                    giF[giOff + baseIdx + s] = accumulateInput ? giF[giOff + baseIdx + s] + dx : dx;
+                }
+            }
+        }, deterministicSafe: true);
+    }
+    /// <summary>
     /// Backward pass for 4D batch normalization [batch, channels, height, width].
     /// </summary>
     private Tensor<T> BatchNormBackward4D<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> gamma, Tensor<T> mean, Tensor<T> variance, T eps, INumericOperations<T> numOps, out Tensor<T> gradGamma, out Tensor<T> gradBeta)
@@ -27059,70 +27158,8 @@ public partial class CpuEngine : ITensorLevelEngine
             var gradInputT = TensorAllocator.RentUninitialized<T>(input._shape);
             var giF = (float[]?)(object?)gradInputT.GetCpuBackingForContiguousWrite(out int giOff)
                 ?? throw new InvalidOperationException("A rented CPU tensor has no managed backing array.");
-            float elemF = elementsPerChannel;
-
-            // As torch's batch_norm_cpu_backward and the double path below: two reductions per channel,
-            // sum(dy) and dot(dy, x - mean), then one pass dx = k1*dy + k2*(x - mean) + k3. The scalar form kept a
-            // third, redundant accumulator and ran every loop one element at a time.
-            CpuParallelSettings.ParallelForOrSerial(0, channels, (long)channels * elementsPerChannel, [MethodImpl(Hot)] (c) =>
-            {
-                float invStd = 1f / MathF.Sqrt(vaF[c] + epsF);
-                float meanC = meF[c];
-                int width = System.Numerics.Vector<float>.Count;
-                var vMean = new System.Numerics.Vector<float>(meanC);
-                var accGrad = System.Numerics.Vector<float>.Zero;
-                var accGradX = System.Numerics.Vector<float>.Zero;
-                float sumGrad = 0f, sumGradX = 0f;
-                for (int n = 0; n < batch; n++)
-                {
-                    int baseIdx = (n * channels + c) * spatialSize;
-                    int s = 0;
-                    if (System.Numerics.Vector.IsHardwareAccelerated)
-                    {
-                        for (; s + width <= spatialSize; s += width)
-                        {
-                            var go = new System.Numerics.Vector<float>(goF, baseIdx + s);
-                            accGrad += go;
-                            accGradX += go * (new System.Numerics.Vector<float>(inF, baseIdx + s) - vMean);
-                        }
-                    }
-                    for (; s < spatialSize; s++)
-                    {
-                        float go = goF[baseIdx + s];
-                        sumGrad += go;
-                        sumGradX += go * (inF[baseIdx + s] - meanC);
-                    }
-                }
-                sumGrad += System.Numerics.Vector.Dot(accGrad, System.Numerics.Vector<float>.One);
-                sumGradX += System.Numerics.Vector.Dot(accGradX, System.Numerics.Vector<float>.One);
-
-                ggF[c] = sumGradX * invStd;
-                gbF[c] = sumGrad;
-                float gammaC = gaF[c];
-                float k1 = gammaC * invStd;
-                float k2 = -gammaC * invStd * invStd * invStd * sumGradX / elemF;
-                float k3 = -gammaC * invStd * sumGrad / elemF;
-                var vK1 = new System.Numerics.Vector<float>(k1);
-                var vK2 = new System.Numerics.Vector<float>(k2);
-                var vK3 = new System.Numerics.Vector<float>(k3);
-                for (int n = 0; n < batch; n++)
-                {
-                    int baseIdx = (n * channels + c) * spatialSize;
-                    int s = 0;
-                    if (System.Numerics.Vector.IsHardwareAccelerated)
-                    {
-                        for (; s + width <= spatialSize; s += width)
-                        {
-                            var dx = vK1 * new System.Numerics.Vector<float>(goF, baseIdx + s)
-                                + vK2 * (new System.Numerics.Vector<float>(inF, baseIdx + s) - vMean) + vK3;
-                            dx.CopyTo(giF, giOff + baseIdx + s);
-                        }
-                    }
-                    for (; s < spatialSize; s++)
-                        giF[giOff + baseIdx + s] = k1 * goF[baseIdx + s] + k2 * (inF[baseIdx + s] - meanC) + k3;
-                }
-            }, deterministicSafe: true);   // one thread per channel, fixed order: the same at any thread count
-
+            BatchNormBackward4DFloat(goF, inF, gaF, meF, vaF, epsF, batch, channels, spatialSize,
+                giF, giOff, false, ggF, 0, false, gbF, 0, false);
             gradGamma = TensorAllocator.Rent<T>([channels], (Vector<T>)(object)Vector<float>.FromMemory(ggF));
             gradBeta = TensorAllocator.Rent<T>([channels], (Vector<T>)(object)Vector<float>.FromMemory(gbF));
             return gradInputT;
