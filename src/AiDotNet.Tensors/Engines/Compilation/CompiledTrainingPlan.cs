@@ -3155,7 +3155,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     }
                     piece -= owned;
                 }
-            });
+            }, deterministicSafe: true);   // zeroing: the same at any thread count
         }
         finally
         {
@@ -9728,7 +9728,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                 int count = Math.Min(chunkSize, len - start);
                                 if (count > 0) partials[chunk] = SimdKernels.SumUnsafe(p + start, count);
                                 else partials[chunk] = 0f;
-                            });
+                            }, deterministicSafe: true);   // fixed chunks, partials summed in order below
                             float total = 0f;
                             for (int c = 0; c < numChunks; c++) total += partials[c];
                             cOut[0] = total;
@@ -11606,7 +11606,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     else SimdKernels.AddScalar(source, op == PerRowScalarOp.Subtract ? -scalar : scalar, destination);
                 }
             };
-            return _ => CpuParallelSettings.ParallelForOrSerial(0, chunks, work, chunkBody);
+            return _ => CpuParallelSettings.ParallelForOrSerial(0, chunks, work, chunkBody, deterministicSafe: true);
         }
 
         var lD = TryGetLiveDoubleBacking(left);
@@ -11625,7 +11625,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 else SimdKernels.AddScalar(source, op == PerRowScalarOp.Subtract ? -scalar : scalar, destination);
             }
         };
-        return _ => CpuParallelSettings.ParallelForOrSerial(0, chunks, work, chunkBodyD);
+        return _ => CpuParallelSettings.ParallelForOrSerial(0, chunks, work, chunkBodyD, deterministicSafe: true);
     }
 
     /// <summary>
@@ -11835,7 +11835,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     matrix.AsSpan(row * cols, cols),
                     vector.AsSpan(0, cols));
             }
-        });
+        }, deterministicSafe: true);   // one row per output element
     }
 
     /// <summary>
@@ -12346,7 +12346,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             gOutArr, r * rowCopyBytes,
                             gInArr, r * dstRowBytes + rowCopyStartByte,
                             rowCopyBytes);
-                    });
+                    }, deterministicSafe: true);
 
                 input.Grad = gradIn;
             };
@@ -12385,7 +12385,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         fixed (float* g = gradOutData, o = outputData, d = gradInData)
                             Simd.SimdKernels.ReluBackwardUnsafe(g + start, o + start, d + start, count);
                     }
-                });
+                }, deterministicSafe: true);   // element-wise
                 input.Grad = gradIn;
             };
         }
