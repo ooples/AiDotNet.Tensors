@@ -18784,7 +18784,14 @@ public partial class CpuEngine : ITensorLevelEngine
         int outputWidth0 = (input._shape[3] + 2 * padding[1] - kernelWidth0) / stride[1] + 1;
         int outChannels0 = inChannels0 * multiplier0;
 
-        var outputData = new T[batch0 * outChannels0 * outputHeight0 * outputWidth0];
+        int outputLength0 = batch0 * outChannels0 * outputHeight0 * outputWidth0;
+        // The float kernels write every output element (the row form clears each row before accumulating), so the float
+        // output need not be zero-filled first: a fresh multi-megabyte array per call was a second full pass.
+#if NET5_0_OR_GREATER
+        var outputData = typeof(T) == typeof(float) ? GC.AllocateUninitializedArray<T>(outputLength0) : new T[outputLength0];
+#else
+        var outputData = new T[outputLength0];
+#endif
         DepthwiseConv2DComputeIntoOutput(input, kernel, stride, padding, outputData);
 
         var dwConvResult = TensorAllocator.Rent<T>([batch0, outChannels0, outputHeight0, outputWidth0], outputData);
@@ -18961,6 +18968,11 @@ public partial class CpuEngine : ITensorLevelEngine
             int b = idx / outChannels, oc = idx % outChannels, ic = oc / multiplier;
             int xPlane = (b * inChannels + ic) * height * width, yPlane = idx * outH * outW, wBase = oc * kH * kW;
             int vw = System.Numerics.Vector<float>.Count;
+            if (strideH == 1 && strideW == 1 && outW < 2 * vw && System.Numerics.Vector.IsHardwareAccelerated)
+            {
+                DepthwiseSmallPlaneStride1(x, xPlane, w, wBase, y, yPlane, height, width, kH, kW, padH, padW, outH, outW);
+                return;
+            }
             // In-bounds output columns per kernel column (independent of the row): ow * strideW + kw - padW in [0, width).
             // A negative reach (the tap is past the right edge for every column) must not truncate to column 0.
             Span<int> owFrom = stackalloc int[kW], owTo = stackalloc int[kW];
@@ -19006,6 +19018,51 @@ public partial class CpuEngine : ITensorLevelEngine
         }, deterministicSafe: true);
     }
 
+    // Per-thread scratch for DepthwiseSmallPlaneStride1: a zero-padded tile and one vector of lanes (arrays, not spans:
+    // System.Numerics.Vector has no span constructor on netstandard2.0 and net471).
+    [ThreadStatic] private static float[]? t_depthwiseTile;
+    [ThreadStatic] private static float[]? t_depthwiseLanes;
+
+    /// <summary>
+    /// One depthwise plane at stride 1 whose output rows are shorter than two vectors (the 8x8 and 4x4 maps of a network's
+    /// late stages). The plane is copied into a zero-padded scratch tile, then every output row is one vector accumulated
+    /// over the kh x kw taps in (kh, kw) order with a separate multiply and add, its first outW lanes stored. The row form
+    /// below ran these planes through scalar edge loops and per-tap row passes (960 channels at 4x4, batch 128: 4.3 ms,
+    /// PyTorch 0.5 ms). A padded tap adds 0 * w where the row form skipped it, which only differs for an infinite or NaN
+    /// weight (as a padded convolution in PyTorch computes it too).
+    /// </summary>
+    private static void DepthwiseSmallPlaneStride1(float[] x, int xPlane, float[] w, int wBase, float[] y, int yPlane,
+        int height, int width, int kH, int kW, int padH, int padW, int outH, int outW)
+    {
+        int vw = System.Numerics.Vector<float>.Count;
+        int cols = width + 2 * padW + 2 * vw;        // slack so a vector load from any tap column stays in the tile
+        int rows = height + 2 * padH;
+        int tileLength = rows * cols;
+        var tile = t_depthwiseTile;
+        if (tile is null || tile.Length < tileLength) t_depthwiseTile = tile = new float[Math.Max(tileLength, 1024)];
+        var lanes = t_depthwiseLanes ??= new float[vw];
+        Array.Clear(tile, 0, tileLength);
+        for (int r = 0; r < height; r++)
+            Array.Copy(x, xPlane + r * width, tile, (r + padH) * cols + padW, width);
+        for (int oh = 0; oh < outH; oh++)
+        {
+            int yRow = yPlane + oh * outW;
+            for (int col = 0; col < outW; col += vw)
+            {
+                var acc = System.Numerics.Vector<float>.Zero;
+                for (int kh = 0; kh < kH; kh++)
+                {
+                    int rowBase = (oh + kh) * cols + col;
+                    int wRow = wBase + kh * kW;
+                    for (int kw = 0; kw < kW; kw++)
+                        acc += new System.Numerics.Vector<float>(tile, rowBase + kw) * new System.Numerics.Vector<float>(w[wRow + kw]);
+                }
+                int count = Math.Min(vw, outW - col);
+                if (count == vw) acc.CopyTo(y, yRow + col);
+                else { acc.CopyTo(lanes); Array.Copy(lanes, 0, y, yRow + col, count); }
+            }
+        }
+    }
     /// <inheritdoc/>
     public Tensor<T> DepthwiseConv2DBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> kernel, int[] inputShape, int[] stride, int[] padding)
     {
