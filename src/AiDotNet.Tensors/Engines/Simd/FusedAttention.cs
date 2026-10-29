@@ -193,7 +193,8 @@ internal static class FusedAttention
             // Batch exp: compute exp(score[c] - max) for all c using AVX2 FastExp256
             int c = 0;
 #if NET5_0_OR_GREATER
-            if (Fma.IsSupported && bc >= 8)
+            // FastExp256 also runs Avx2.Add / Avx2.ShiftLeftLogical, so FMA alone (AVX+FMA3 without AVX2) is not enough.
+            if (Avx2.IsSupported && Fma.IsSupported && bc >= 8)
             {
                 var vNewMax = Vector256.Create(newMax);
                 var vLocalSum = Vector256<float>.Zero;

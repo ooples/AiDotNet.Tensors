@@ -186,10 +186,56 @@ internal static partial class SimdGemm
             return;
         }
 
+        // The fused tiles widen int8 with Avx2.ConvertToVector256Int32 and accumulate with Fma.MultiplyAdd, with no
+        // checks of their own, so a CPU without AVX2/FMA threw PlatformNotSupportedException here (reached from every
+        // int8 weight-only Linear and attention projection). Without them, dequantise B in Nc-row slabs -- bounded
+        // scratch, so a wide FFN never expands its whole weight -- and run each slab's columns through the shared GEMM
+        // dispatcher, which picks the Vector/scalar kernels this machine can run.
+        if (!PackedKernelsSupported)
+        {
+            SgemmInt8RowScaledDequantSlabs(a, bInt8, rowScales, c, m, k, n);
+            return;
+        }
+
         int expectedMc = ChooseAdaptiveMc(m, k, n);
         var cached = GetOrBuildInt8RowScaledPrePackedB(bInt8, rowScales, k, n, m, expectedMc);
 
         SgemmTiledWithInt8RowScaledCached(a, cached, c, m, k, n);
+    }
+
+    /// <summary>
+    /// The portable path of <see cref="SgemmWithInt8RowScaledCachedB(float[], sbyte[], ReadOnlySpan{float}, float[], int, int, int)"/>
+    /// for machines without AVX2/FMA: C[:, j0..j1) = A · dequant(B[j0..j1, :])ᵀ for column slabs of at most Nc, so the
+    /// FP32 scratch is bounded by Nc·k floats however wide N is. Each slab writes its own columns of C (ldc = n).
+    /// </summary>
+    private static void SgemmInt8RowScaledDequantSlabs(
+        float[] a, sbyte[] bInt8, ReadOnlySpan<float> rowScales, float[] c, int m, int k, int n)
+    {
+        int slabRows = Math.Min(n, Nc);
+        var slab = System.Buffers.ArrayPool<float>.Shared.Rent(checked(slabRows * k));
+        try
+        {
+            for (int j0 = 0; j0 < n; j0 += slabRows)
+            {
+                int nb = Math.Min(slabRows, n - j0);
+                for (int row = 0; row < nb; row++)
+                {
+                    float scale = rowScales[j0 + row];
+                    int src = (j0 + row) * k, dst = row * k;
+                    for (int col = 0; col < k; col++)
+                        slab[dst + col] = bInt8[src + col] * scale;
+                }
+                BlasProvider.GemmEx(
+                    m, nb, k,
+                    a, 0, k, false,
+                    slab, 0, k, true,
+                    c, j0, n);
+            }
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<float>.Shared.Return(slab);
+        }
     }
 
     private static Int8RowScaledPrePackedB GetOrBuildInt8RowScaledPrePackedB(

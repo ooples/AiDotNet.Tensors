@@ -28,7 +28,7 @@ namespace AiDotNet.Tensors.Licensing;
 public static class LicenseResponseVerifier
 {
     /// <summary>Placeholder embedded server-response public key — until replaced, signed-response verification is unavailable.</summary>
-    public const string PublicKeyPlaceholderMarker = "REPLACE_WITH_REAL_OOPLES_RESPONSE_SIGNING_PUBLIC_KEY";
+    public const string PublicKeyPlaceholderMarker = "REPLACE_WITH_REAL_LICENSE_RESPONSE_SIGNING_PUBLIC_KEY";
 
     /// <summary>
     /// Embedded RSA public key for the response-signing keypair, as
