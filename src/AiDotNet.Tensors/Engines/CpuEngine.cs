@@ -2596,8 +2596,50 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> BatchNormInference<T>(Tensor<T> x, Tensor<T> gamma, Tensor<T> beta, Tensor<T> mean, Tensor<T> variance, double epsilon,
         FusedActivationType activation)
-        => ApplyFusedActivation(BatchNormInference(x, gamma, beta, mean, variance, epsilon), activation);
+    {
+        if (x == null) throw new ArgumentNullException(nameof(x));
+        if (gamma == null) throw new ArgumentNullException(nameof(gamma));
+        if (beta == null) throw new ArgumentNullException(nameof(beta));
+        if (mean == null) throw new ArgumentNullException(nameof(mean));
+        if (variance == null) throw new ArgumentNullException(nameof(variance));
+        // A float ReLU or ReLU6 clamps inside the batch-norm kernel: one pass over the activation instead of two
+        // (MobileNetV2 and DenseNet run batch norm then an activation after almost every convolution).
+        if (typeof(T) == typeof(float) && !GraphMode.IsActive
+            && x.Rank == 4 && (activation == FusedActivationType.ReLU || activation == FusedActivationType.ReLU6)
+            && (x.Layout == LinearAlgebra.TensorLayout.Nchw
+                || (x.Layout == LinearAlgebra.TensorLayout.Nchwc8 && x._shape[1] % Simd.NchwcBatchNorm.CBlock == 0)))
+        {
+            return (Tensor<T>)(object)BatchNormInferenceFloatClamped(
+                (Tensor<float>)(object)x, (Tensor<float>)(object)gamma, (Tensor<float>)(object)beta,
+                (Tensor<float>)(object)mean, (Tensor<float>)(object)variance, epsilon,
+                0f, activation == FusedActivationType.ReLU6 ? 6f : float.PositiveInfinity);
+        }
+        return ApplyFusedActivation(BatchNormInference(x, gamma, beta, mean, variance, epsilon), activation);
+    }
 
+    private static Tensor<float> BatchNormInferenceFloatClamped(Tensor<float> x, Tensor<float> gamma, Tensor<float> beta,
+        Tensor<float> mean, Tensor<float> variance, double epsilon, float clampLow, float clampHigh)
+    {
+        int n = x._shape[0], c = x._shape[1], h = x._shape[2], w = x._shape[3];
+        // The kernel writes every element, so the result need not be zero-filled first (another pass over it).
+        var result = TensorAllocator.RentUninitialized<float>(x._shape);
+        result.Layout = x.Layout;
+        using var xKeep = new KeepAliveScope(x);
+        using var gammaKeep = new KeepAliveScope(gamma);
+        using var betaKeep = new KeepAliveScope(beta);
+        using var meanKeep = new KeepAliveScope(mean);
+        using var varianceKeep = new KeepAliveScope(variance);
+        using var resultKeep = new KeepAliveScope(result);
+        if (x.Layout == LinearAlgebra.TensorLayout.Nchwc8)
+            Simd.NchwcBatchNorm.RunNchwc8(x.AsSpanUnmarked(), gamma.AsSpanUnmarked(), beta.AsSpanUnmarked(),
+                mean.AsSpanUnmarked(), variance.AsSpanUnmarked(), (float)epsilon, result.AsWritableSpanUnmarked(),
+                n, c, h, w, clampLow, clampHigh);
+        else
+            Simd.NchwcBatchNorm.RunNchw(x.AsSpanUnmarked(), gamma.AsSpanUnmarked(), beta.AsSpanUnmarked(),
+                mean.AsSpanUnmarked(), variance.AsSpanUnmarked(), (float)epsilon, result.AsWritableSpanUnmarked(),
+                n, c, h, w, clampLow, clampHigh);
+        return result;
+    }
     /// <inheritdoc/>
     public virtual Tensor<T> BatchNormInference<T>(Tensor<T> x, Tensor<T> gamma, Tensor<T> beta, Tensor<T> mean, Tensor<T> variance, double epsilon)
     {
@@ -2649,7 +2691,9 @@ public partial class CpuEngine : ITensorLevelEngine
             var betaF  = (Tensor<float>)(object)beta;
             var meanF  = (Tensor<float>)(object)mean;
             var varF   = (Tensor<float>)(object)variance;
-            var result = new Tensor<float>(x._shape) { Layout = x.Layout };
+            // Every branch below writes every element, so the result need not be zero-filled first.
+            var result = TensorAllocator.RentUninitialized<float>(x._shape);
+            result.Layout = x.Layout;
             if (x.Layout == LinearAlgebra.TensorLayout.Nchwc8 && C % Simd.NchwcBatchNorm.CBlock == 0)
             {
                 using var xfKeep3 = new KeepAliveScope(xf);

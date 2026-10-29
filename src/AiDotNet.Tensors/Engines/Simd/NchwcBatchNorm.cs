@@ -1,6 +1,4 @@
 using System;
-using System.Runtime.InteropServices;
-using System.Threading.Tasks;
 using System.Runtime.CompilerServices;
 using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
@@ -19,9 +17,10 @@ namespace AiDotNet.Tensors.Engines.Simd;
 /// <c>bias' = beta - scale' * mean</c>. That collapses six broadcast ops
 /// (sub, add, sqrt, div, mul, add) into one fused FMA per element.</para>
 ///
-/// <para>The NCHWc8 path processes contiguous 8-wide lanes with a single
-/// <c>Vector256&lt;float&gt;</c> FMA per spatial cell — bandwidth-bound
-/// on modern CPUs (one load, one store, effectively one FMA).</para>
+/// <para>Both layouts read the input and write the output in place through pinned pointers: one load, one FMA and
+/// one store per element, which makes the op bandwidth-bound. An optional clamp applies a ReLU or ReLU6 in the same
+/// pass. Earlier versions copied the input into a pooled array and the result back out, three passes over each
+/// activation instead of one (a [128, 96, 16, 16] batch norm ran at 4 GB/s).</para>
 /// </summary>
 internal static class NchwcBatchNorm
 {
@@ -29,11 +28,9 @@ internal static class NchwcBatchNorm
 
     /// <summary>
     /// Inference BN on NCHWc8 layout <c>[N, C/8, H, W, 8]</c>.
-    /// <paramref name="scaleArr"/>/<paramref name="biasArr"/> have shape [C] in
-    /// channel-major order; the method packs them on the fly into [C/8, 8] to
-    /// match the lane layout.
+    /// <paramref name="gamma"/>/<paramref name="beta"/>/<paramref name="mean"/>/<paramref name="variance"/> have
+    /// shape [C] in channel-major order, which is also the lane order of the packed layout.
     /// </summary>
-    [MethodImpl(Hot)]
     public static void RunNchwc8(
         ReadOnlySpan<float> input,
         ReadOnlySpan<float> gamma,
@@ -43,6 +40,25 @@ internal static class NchwcBatchNorm
         float epsilon,
         Span<float> output,
         int N, int C, int H, int W)
+        => RunNchwc8(input, gamma, beta, mean, variance, epsilon, output, N, C, H, W,
+            float.NegativeInfinity, float.PositiveInfinity);
+
+    /// <summary>
+    /// <see cref="RunNchwc8(ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, float, Span{float}, int, int, int, int)"/>
+    /// with each output clamped to [<paramref name="clampLow"/>, <paramref name="clampHigh"/>] (0 and +inf for a
+    /// ReLU, 0 and 6 for a ReLU6) in the same pass.
+    /// </summary>
+    [MethodImpl(Hot)]
+    public static unsafe void RunNchwc8(
+        ReadOnlySpan<float> input,
+        ReadOnlySpan<float> gamma,
+        ReadOnlySpan<float> beta,
+        ReadOnlySpan<float> mean,
+        ReadOnlySpan<float> variance,
+        float epsilon,
+        Span<float> output,
+        int N, int C, int H, int W,
+        float clampLow, float clampHigh)
     {
         // Shape + buffer-length invariants. NCHWc8 requires C divisible by
         // CBlock; gamma/beta/mean/variance are per-channel (length C); input
@@ -64,58 +80,26 @@ internal static class NchwcBatchNorm
 
         int cg = C / CBlock;
         int spatial = H * W;
-        int hwC = spatial * CBlock;
-
-        // Rent everything from ArrayPool. Old code allocated packedScale/Bias
-        // fresh plus input.ToArray() plus new float[output.Length] plus a
-        // fresh float[CBlock=8] INSIDE the SIMD hot loop (spatial × 8 allocs
-        // per channel group, dominant cost on BN-heavy models).
         var packedScale = System.Buffers.ArrayPool<float>.Shared.Rent(C);
-        var packedBias  = System.Buffers.ArrayPool<float>.Shared.Rent(C);
+        var packedBias = System.Buffers.ArrayPool<float>.Shared.Rent(C);
         try
         {
-            for (int c = 0; c < C; c++)
+            PackScaleBias(gamma, beta, mean, variance, epsilon, C, packedScale, packedBias);
+            fixed (float* inPtr = input)
+            fixed (float* outPtr = output)
+            fixed (float* scalePtr = packedScale)
+            fixed (float* biasPtr = packedBias)
             {
-                double s = gamma[c] / Math.Sqrt((double)variance[c] + epsilon);
-                packedScale[c] = (float)s;
-                packedBias[c] = beta[c] - (float)(s * mean[c]);
-            }
-
-            var inArr  = System.Buffers.ArrayPool<float>.Shared.Rent(input.Length);
-            var outArr = System.Buffers.ArrayPool<float>.Shared.Rent(output.Length);
-            try
-            {
-                input.CopyTo(inArr.AsSpan(0, input.Length));
-
-#if NET5_0_OR_GREATER
-                bool useSimd = Avx.IsSupported && Fma.IsSupported;
-#endif
-                long totalOps = (long)N * cg * spatial;
-                if (totalOps >= 64 * 1024)
+                // ParallelForOrSerial returns after every task has run, so the pinned addresses outlive the work.
+                nint inAddr = (nint)inPtr, outAddr = (nint)outPtr, scaleAddr = (nint)scalePtr, biasAddr = (nint)biasPtr;
+                long totalOps = (long)N * cg * spatial * CBlock;
+                AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, N * cg, totalOps, task =>
                 {
-                    AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, N * cg, totalOps, task =>
-                        ProcessChannelGroup(inArr, outArr, task, cg, spatial, hwC, packedScale, packedBias
-#if NET5_0_OR_GREATER
-                            , useSimd
-#endif
-                        ));
-                }
-                else
-                {
-                    for (int task = 0; task < N * cg; task++)
-                        ProcessChannelGroup(inArr, outArr, task, cg, spatial, hwC, packedScale, packedBias
-#if NET5_0_OR_GREATER
-                            , useSimd
-#endif
-                        );
-                }
-
-                outArr.AsSpan(0, output.Length).CopyTo(output);
-            }
-            finally
-            {
-                System.Buffers.ArrayPool<float>.Shared.Return(outArr);
-                System.Buffers.ArrayPool<float>.Shared.Return(inArr);
+                    int ocg = task % cg;
+                    long groupBase = (long)task * spatial * CBlock;
+                    ScaleBiasClampPacked((float*)inAddr + groupBase, (float*)outAddr + groupBase, spatial,
+                        (float*)scaleAddr + ocg * CBlock, (float*)biasAddr + ocg * CBlock, clampLow, clampHigh);
+                });
             }
         }
         finally
@@ -125,77 +109,10 @@ internal static class NchwcBatchNorm
         }
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
-    private static void ProcessChannelGroup(
-        float[] inArr, float[] outArr,
-        int task, int cg, int spatial, int hwC,
-        float[] packedScale, float[] packedBias
-#if NET5_0_OR_GREATER
-        , bool useSimd
-#endif
-    )
-    {
-        int n = task / cg;
-        int ocg = task % cg;
-        int groupBase = (n * cg + ocg) * hwC;
-        int scaleBase = ocg * CBlock;
-
-#if NET5_0_OR_GREATER
-        if (useSimd)
-        {
-            // Vector load the scale/bias packed lanes — one 32-byte load each.
-            var vScale = Unsafe.ReadUnaligned<Vector256<float>>(
-                ref Unsafe.As<float, byte>(ref packedScale[scaleBase]));
-            var vBias = Unsafe.ReadUnaligned<Vector256<float>>(
-                ref Unsafe.As<float, byte>(ref packedBias[scaleBase]));
-
-            for (int sp = 0; sp < spatial; sp++)
-            {
-                int idx = groupBase + sp * CBlock;
-                // One 32-byte load + FMA + 32-byte store per 8 output
-                // elements. No scalar unpack, no fresh float[8] alloc.
-                var vIn = Unsafe.ReadUnaligned<Vector256<float>>(
-                    ref Unsafe.As<float, byte>(ref inArr[idx]));
-                var vOut = Fma.MultiplyAdd(vIn, vScale, vBias);
-                Unsafe.WriteUnaligned(
-                    ref Unsafe.As<float, byte>(ref outArr[idx]), vOut);
-            }
-        }
-        else
-#else
-        // audit-2026-05 phase 5 slice 3: net471 BCL SIMD. CBlock==8 maps to the
-        // 8-lane AVX2 Vector<float>; gated so 4-lane SSE2-only hosts use scalar.
-        if (System.Numerics.Vector<float>.Count == CBlock)
-        {
-            var vScale = new System.Numerics.Vector<float>(packedScale, scaleBase);
-            var vBias = new System.Numerics.Vector<float>(packedBias, scaleBase);
-            for (int sp = 0; sp < spatial; sp++)
-            {
-                int idx = groupBase + sp * CBlock;
-                var vIn = new System.Numerics.Vector<float>(inArr, idx);
-                (vIn * vScale + vBias).CopyTo(outArr, idx);
-            }
-        }
-        else
-#endif
-        {
-            for (int sp = 0; sp < spatial; sp++)
-            {
-                int idx = groupBase + sp * CBlock;
-                for (int cb = 0; cb < CBlock; cb++)
-                {
-                    outArr[idx + cb] =
-                        inArr[idx + cb] * packedScale[scaleBase + cb] + packedBias[scaleBase + cb];
-                }
-            }
-        }
-    }
-
     /// <summary>
     /// Inference BN on NCHW layout <c>[N, C, H, W]</c>. Shared with the NCHWc
     /// path — we always collapse to pre-combined scale/bias and emit one FMA.
     /// </summary>
-    [MethodImpl(Hot)]
     public static void RunNchw(
         ReadOnlySpan<float> input,
         ReadOnlySpan<float> gamma,
@@ -205,65 +122,54 @@ internal static class NchwcBatchNorm
         float epsilon,
         Span<float> output,
         int N, int C, int H, int W)
+        => RunNchw(input, gamma, beta, mean, variance, epsilon, output, N, C, H, W,
+            float.NegativeInfinity, float.PositiveInfinity);
+
+    /// <summary>
+    /// <see cref="RunNchw(ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, float, Span{float}, int, int, int, int)"/>
+    /// with each output clamped to [<paramref name="clampLow"/>, <paramref name="clampHigh"/>] (0 and +inf for a
+    /// ReLU, 0 and 6 for a ReLU6) in the same pass.
+    /// </summary>
+    [MethodImpl(Hot)]
+    public static unsafe void RunNchw(
+        ReadOnlySpan<float> input,
+        ReadOnlySpan<float> gamma,
+        ReadOnlySpan<float> beta,
+        ReadOnlySpan<float> mean,
+        ReadOnlySpan<float> variance,
+        float epsilon,
+        Span<float> output,
+        int N, int C, int H, int W,
+        float clampLow, float clampHigh)
     {
+        if (N < 0 || C < 0 || H < 0 || W < 0)
+            throw new ArgumentException("N/C/H/W must all be non-negative.");
+        long expected = (long)N * C * H * W;
+        if (input.Length < expected || output.Length < expected)
+            throw new ArgumentException(
+                $"input/output must hold at least N·C·H·W = {expected} floats.");
+        if (gamma.Length < C || beta.Length < C || mean.Length < C || variance.Length < C)
+            throw new ArgumentException(
+                $"gamma/beta/mean/variance must each hold at least C = {C} floats.");
+
         int spatial = H * W;
-        // Rent pre-combined scale/bias from ArrayPool — old code allocated
-        // these fresh every call. Small (C floats), but 53 BN calls per
-        // ResNet inference adds up to ~53 × 2 × C × sizeof(float) allocs.
         var packedScale = System.Buffers.ArrayPool<float>.Shared.Rent(C);
-        var packedBias  = System.Buffers.ArrayPool<float>.Shared.Rent(C);
+        var packedBias = System.Buffers.ArrayPool<float>.Shared.Rent(C);
         try
         {
-            for (int c = 0; c < C; c++)
+            PackScaleBias(gamma, beta, mean, variance, epsilon, C, packedScale, packedBias);
+            fixed (float* inPtr = input)
+            fixed (float* outPtr = output)
             {
-                double s = gamma[c] / Math.Sqrt((double)variance[c] + epsilon);
-                packedScale[c] = (float)s;
-                packedBias[c] = beta[c] - (float)(s * mean[c]);
-            }
-
-            // Old code did input.ToArray() + new float[output.Length] + a
-            // fresh `new float[8]` allocation INSIDE the SIMD loop (6 K+
-            // allocations per 50 K-element call, dominating the op cost).
-            // Rent input + output arrays from ArrayPool instead. Input copy
-            // is unavoidable when the caller passes a ReadOnlySpan (can't
-            // project back to an array without MemoryMarshal API that's
-            // Span-API-gated), but it's a single bulk CopyTo not 6 K small
-            // allocations.
-            var inArr  = System.Buffers.ArrayPool<float>.Shared.Rent(input.Length);
-            var outArr = System.Buffers.ArrayPool<float>.Shared.Rent(output.Length);
-            try
-            {
-                input.CopyTo(inArr.AsSpan(0, input.Length));
-
-#if NET5_0_OR_GREATER
-                bool useSimd = Avx.IsSupported && Fma.IsSupported;
-#endif
-                long totalOps = (long)N * C * spatial;
-                if (totalOps >= 64 * 1024)
+                // ParallelForOrSerial returns after every task has run, so the pinned addresses outlive the work.
+                nint inAddr = (nint)inPtr, outAddr = (nint)outPtr;
+                AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, N * C, expected, task =>
                 {
-                    AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, N * C, totalOps, task =>
-                        ProcessChannel(inArr, outArr, task, C, spatial, packedScale, packedBias
-#if NET5_0_OR_GREATER
-                            , useSimd
-#endif
-                        ));
-                }
-                else
-                {
-                    for (int task = 0; task < N * C; task++)
-                        ProcessChannel(inArr, outArr, task, C, spatial, packedScale, packedBias
-#if NET5_0_OR_GREATER
-                            , useSimd
-#endif
-                        );
-                }
-
-                outArr.AsSpan(0, output.Length).CopyTo(output);
-            }
-            finally
-            {
-                System.Buffers.ArrayPool<float>.Shared.Return(outArr);
-                System.Buffers.ArrayPool<float>.Shared.Return(inArr);
+                    int c = task % C;
+                    long chanBase = (long)task * spatial;
+                    ScaleBiasClamp((float*)inAddr + chanBase, (float*)outAddr + chanBase, spatial,
+                        packedScale[c], packedBias[c], clampLow, clampHigh);
+                });
             }
         }
         finally
@@ -273,78 +179,121 @@ internal static class NchwcBatchNorm
         }
     }
 
-    /// <summary>
-    /// Per-channel FMA kernel extracted so the Parallel.For lambda can call
-    /// a named static method (clearer than capturing refs into closures,
-    /// which the compiler rejects with CS8175 anyway). Uses
-    /// <c>Unsafe.ReadUnaligned</c>/<c>WriteUnaligned</c> for the SIMD
-    /// load/store — one 32-byte op each, versus the old code's
-    /// <c>Vector256.Create(scalar, scalar, ..., scalar)</c> from 8 array
-    /// reads + <c>CopyTo(new float[8])</c> + 8 array writes per vector
-    /// (which also allocated a fresh float[8] every iteration — the
-    /// dominant cost of the old kernel on BN-heavy models).
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
-    private static void ProcessChannel(
-        float[] inArr, float[] outArr,
-        int task, int C, int spatial,
-        float[] packedScale, float[] packedBias
-#if NET5_0_OR_GREATER
-        , bool useSimd
-#endif
-    )
+    // scale' = gamma / sqrt(var + eps) and bias' = beta - scale' * mean, computed in double as before.
+    private static void PackScaleBias(ReadOnlySpan<float> gamma, ReadOnlySpan<float> beta, ReadOnlySpan<float> mean,
+        ReadOnlySpan<float> variance, float epsilon, int C, float[] packedScale, float[] packedBias)
     {
-        int n = task / C;
-        int c = task % C;
-        int chanBase = (n * C + c) * spatial;
-        float s = packedScale[c];
-        float b = packedBias[c];
+        for (int c = 0; c < C; c++)
+        {
+            double s = gamma[c] / Math.Sqrt((double)variance[c] + epsilon);
+            packedScale[c] = (float)s;
+            packedBias[c] = beta[c] - (float)(s * mean[c]);
+        }
+    }
 
+    // A clamp to (-inf, +inf) is the identity for every finite value and for infinities, and it propagates NaN, so the
+    // unclamped call shares this kernel. The vector forms pass the bound FIRST: x86 max/min return the second operand
+    // when either is NaN, so max(low, NaN) is NaN, as PyTorch's relu(NaN) is, where max(NaN, low) would be low.
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
+    private static float Clamp(float v, float low, float high)
+    {
+        if (v < low) v = low;
+        if (v > high) v = high;
+        return v;
+    }
+
+    // The tail rounds as the vector body does: one fused rounding where the body uses FMA, so a plane's last elements
+    // (and an NCHW result against the all-vector NCHWc8 one) agree bit for bit.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static float MulAdd(float x, float s, float b)
+    {
 #if NET5_0_OR_GREATER
-        if (useSimd && spatial >= 8)
+        if (Fma.IsSupported) return MathF.FusedMultiplyAdd(x, s, b);
+#endif
+        return x * s + b;
+    }
+
+    // One NCHW channel plane: out[i] = clamp(in[i] * s + b).
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
+    private static unsafe void ScaleBiasClamp(float* input, float* output, int count, float s, float b,
+        float low, float high)
+    {
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (Avx.IsSupported && Fma.IsSupported)
         {
             var vS = Vector256.Create(s);
             var vB = Vector256.Create(b);
-            int i = 0;
-            for (; i + 8 <= spatial; i += 8)
+            var vLow = Vector256.Create(low);
+            var vHigh = Vector256.Create(high);
+            for (; i + 8 <= count; i += 8)
             {
-                int idx = chanBase + i;
-                // One 32-byte vector load — no scalar unpack.
-                var vIn = Unsafe.ReadUnaligned<Vector256<float>>(
-                    ref Unsafe.As<float, byte>(ref inArr[idx]));
-                var vOut = Fma.MultiplyAdd(vIn, vS, vB);
-                // One 32-byte vector store — no fresh float[8] alloc.
-                Unsafe.WriteUnaligned(
-                    ref Unsafe.As<float, byte>(ref outArr[idx]), vOut);
+                var v = Fma.MultiplyAdd(Avx.LoadVector256(input + i), vS, vB);
+                Avx.Store(output + i, Avx.Min(vHigh, Avx.Max(vLow, v)));
             }
-            for (; i < spatial; i++)
-                outArr[chanBase + i] = inArr[chanBase + i] * s + b;
         }
-        else
 #else
-        // audit-2026-05 phase 5 slice 3: net471 BCL SIMD. NCHW is contiguous in the
-        // spatial dimension, so this is lane-width-agnostic (works on SSE2 4-lane and
-        // AVX2 8-lane alike) — broadcast scale/bias, stride by Vector<float>.Count.
         int lanes = System.Numerics.Vector<float>.Count;
-        if (spatial >= lanes)
+        if (System.Numerics.Vector.IsHardwareAccelerated && count >= lanes)
         {
             var vS = new System.Numerics.Vector<float>(s);
             var vB = new System.Numerics.Vector<float>(b);
-            int i = 0;
-            for (; i + lanes <= spatial; i += lanes)
+            var vLow = new System.Numerics.Vector<float>(low);
+            var vHigh = new System.Numerics.Vector<float>(high);
+            for (; i + lanes <= count; i += lanes)
             {
-                int idx = chanBase + i;
-                var vIn = new System.Numerics.Vector<float>(inArr, idx);
-                (vIn * vS + vB).CopyTo(outArr, idx);
+                var v = Unsafe.ReadUnaligned<System.Numerics.Vector<float>>(input + i) * vS + vB;
+                Unsafe.WriteUnaligned(output + i,
+                    System.Numerics.Vector.Min(vHigh, System.Numerics.Vector.Max(vLow, v)));
             }
-            for (; i < spatial; i++)
-                outArr[chanBase + i] = inArr[chanBase + i] * s + b;
         }
-        else
 #endif
+        for (; i < count; i++)
+            output[i] = Clamp(MulAdd(input[i], s, b), low, high);
+    }
+
+    // One NCHWc8 channel group: every spatial cell holds CBlock lanes with per-lane scale and bias.
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
+    private static unsafe void ScaleBiasClampPacked(float* input, float* output, int spatial, float* scale, float* bias,
+        float low, float high)
+    {
+#if NET5_0_OR_GREATER
+        if (Avx.IsSupported && Fma.IsSupported)
         {
-            for (int i = 0; i < spatial; i++)
-                outArr[chanBase + i] = inArr[chanBase + i] * s + b;
+            var vS = Avx.LoadVector256(scale);
+            var vB = Avx.LoadVector256(bias);
+            var vLow = Vector256.Create(low);
+            var vHigh = Vector256.Create(high);
+            for (int sp = 0; sp < spatial; sp++)
+            {
+                float* p = input + sp * CBlock;
+                var v = Fma.MultiplyAdd(Avx.LoadVector256(p), vS, vB);
+                Avx.Store(output + sp * CBlock, Avx.Min(vHigh, Avx.Max(vLow, v)));
+            }
+            return;
         }
+#else
+        // CBlock == 8 maps to the 8-lane AVX2 Vector<float>; 4-lane SSE2-only hosts use the scalar loop.
+        if (System.Numerics.Vector.IsHardwareAccelerated && System.Numerics.Vector<float>.Count == CBlock)
+        {
+            var vS = Unsafe.ReadUnaligned<System.Numerics.Vector<float>>(scale);
+            var vB = Unsafe.ReadUnaligned<System.Numerics.Vector<float>>(bias);
+            var vLow = new System.Numerics.Vector<float>(low);
+            var vHigh = new System.Numerics.Vector<float>(high);
+            for (int sp = 0; sp < spatial; sp++)
+            {
+                var v = Unsafe.ReadUnaligned<System.Numerics.Vector<float>>(input + sp * CBlock) * vS + vB;
+                Unsafe.WriteUnaligned(output + sp * CBlock,
+                    System.Numerics.Vector.Min(vHigh, System.Numerics.Vector.Max(vLow, v)));
+            }
+            return;
+        }
+#endif
+        for (int sp = 0; sp < spatial; sp++)
+            for (int cb = 0; cb < CBlock; cb++)
+            {
+                int idx = sp * CBlock + cb;
+                output[idx] = Clamp(input[idx] * scale[cb] + bias[cb], low, high);
+            }
     }
 }
