@@ -9591,9 +9591,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             used.Add(step.OutputBuffer);
             foreach (var input in step.Inputs) used.Add(input);
         }
-        foreach (var removed in recorded.Where(node => !kept.Contains(node)).OfType<LazyNode<T>>())
+        foreach (var output in recorded.Where(node => !kept.Contains(node)).OfType<LazyNode<T>>().Select(removed => removed.Output))
         {
-            var output = removed.Output;
             if (used.Contains(output)) continue;
             // A kept node that writes this output (a fused BatchNorm+ReLU writes its absorbed statistics) is its producer.
             if (output.LazySource is ILazyNode producer && kept.Contains(producer)) continue;
