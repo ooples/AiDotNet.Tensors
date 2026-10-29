@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP kernels for spatial transformer operations including TopK selection.
 // HIP is source-compatible with CUDA device code.
 

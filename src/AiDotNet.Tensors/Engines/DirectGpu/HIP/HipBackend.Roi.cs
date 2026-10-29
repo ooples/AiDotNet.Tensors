@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP launcher shims for the RoI family (Issue #217 tail). Direct port of
 // CudaBackend.Roi.cs.
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;

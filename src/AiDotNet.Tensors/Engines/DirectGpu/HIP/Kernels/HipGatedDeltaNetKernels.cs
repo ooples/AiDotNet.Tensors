@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP kernel for the fused Gated DeltaNet (delta-rule) scan forward (issue ooples/AiDotNet#1464).
 // Mirrors CpuEngine.GatedDeltaNetScan / RecurrenceCpuKernels.GatedDeltaNetForward. Each value row
 // is independent, so one thread owns (batch b, head h, value-row di) and carries that row of the

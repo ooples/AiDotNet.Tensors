@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP kernel source — mirror of CudaLinalgKernels. HIP's C++ dialect compiles
 // CUDA-style `__global__` kernels directly through hipRTC, so the kernel bodies
 // are reused verbatim apart from the shared-memory declaration syntax.
