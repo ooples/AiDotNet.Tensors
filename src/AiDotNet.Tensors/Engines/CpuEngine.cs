@@ -16527,8 +16527,10 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             long perImageGemmF = (long)outChannels * colH * colW;
             if (batch > 1 && perImageGemmF < ConvBackwardParallelBatchMaxPerImage)
+                // Each image writes only its own gradient slice in one order, so the result is the same at any thread count;
+                // unmarked, deterministic reductions (AiDotNet's default) ran every image of the backward on one thread.
                 CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW,
-                    b => ProcessImageInputF(b, channelParallel: false));
+                    b => ProcessImageInputF(b, channelParallel: false), deterministicSafe: true);
             else
                 for (int b = 0; b < batch; b++) ProcessImageInputF(b, channelParallel: true);
             }
@@ -16590,7 +16592,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         for (int i = 0; i < inputSliceSize; i++) dstSpan[i] += product[i];
                     }
                     finally { System.Buffers.ArrayPool<double>.Shared.Return(product); }
-                });
+                }, deterministicSafe: true);   // per-image disjoint slices, one order each
                 return;
             }
 
@@ -26867,7 +26869,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     for (; s < spatialSize; s++)
                         giF[giOff + baseIdx + s] = k1 * goF[baseIdx + s] + k2 * (inF[baseIdx + s] - meanC) + k3;
                 }
-            });
+            }, deterministicSafe: true);   // one thread per channel, fixed order: the same at any thread count
 
             gradGamma = TensorAllocator.Rent<T>([channels], (Vector<T>)(object)Vector<float>.FromMemory(ggF));
             gradBeta = TensorAllocator.Rent<T>([channels], (Vector<T>)(object)Vector<float>.FromMemory(gbF));
@@ -40719,7 +40721,8 @@ public partial class CpuEngine : ITensorLevelEngine
             var outShape = ConcatenateOutputShape(tensors, normalizedAxis);
             result = AutoTensorCache.RentOrAllocate<T>(outShape);
             using var resultKeep47 = new KeepAliveScope(result);
-            ConcatenateContiguousInto(tensors, normalizedAxis, result.AsWritableSpanUnmarked());
+            if (!TryConcatenateRowsParallel(tensors, normalizedAxis, result))
+                ConcatenateContiguousInto(tensors, normalizedAxis, result.AsWritableSpanUnmarked());
         }
         // Fast path for axis=0 contiguous tensors: direct Array.Copy (any rank)
         else if (axis == 0 && tensors.All(t => t.IsContiguous))
@@ -40794,6 +40797,49 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <paramref name="axis"/> into <paramref name="destination"/> (row-major): for each index over the leading axes,
     /// one block copy per input. Pure copies, bit-identical to the element-wise walk.
     /// </summary>
+    /// <summary>
+    /// <see cref="ConcatenateContiguousInto{T}"/> with the leading-index rows copied in parallel: each row of the output
+    /// is the concatenation of one block per input, independent of every other row. DenseNet concatenates its growing
+    /// feature map at every layer (a [32, 1024, 4, 4] map is 2 MB per call); the serial copy was 18% of a DenseNet-121
+    /// predict. False, with nothing written, for a small copy, a single row, or an operand without a managed backing
+    /// array (the caller then copies serially).
+    /// </summary>
+    private static bool TryConcatenateRowsParallel<T>(Tensor<T>[] tensors, int axis, Tensor<T> destination)
+    {
+        var firstShape = tensors[0]._shape;
+        int outer = 1;
+        for (int d = 0; d < axis; d++) outer *= firstShape[d];
+        int inner = 1;
+        for (int d = axis + 1; d < firstShape.Length; d++) inner *= firstShape[d];
+        var blocks = new int[tensors.Length];
+        long rowLength = 0;
+        for (int i = 0; i < tensors.Length; i++) { blocks[i] = tensors[i]._shape[axis] * inner; rowLength += blocks[i]; }
+        long total = rowLength * outer;
+        if (outer < 2 || total < 256L * 1024) return false;
+
+        var dest = destination.GetCpuBackingForContiguousWrite(out int destOffset);
+        if (dest is null) return false;
+        var sources = new T[tensors.Length][];
+        var sourceOffsets = new int[tensors.Length];
+        for (int i = 0; i < tensors.Length; i++)
+        {
+            var source = tensors[i].GetCpuBackingForStridedRead(out sourceOffsets[i]);
+            if (source is null) return false;
+            sources[i] = source;
+        }
+        int row = (int)rowLength;
+        CpuParallelSettings.ParallelForOrSerial(0, outer, total, r =>
+        {
+            int d = destOffset + r * row;
+            for (int i = 0; i < sources.Length; i++)
+            {
+                Array.Copy(sources[i], sourceOffsets[i] + r * blocks[i], dest, d, blocks[i]);
+                d += blocks[i];
+            }
+        }, deterministicSafe: true);   // a copy: the same bytes at any thread count
+        return true;
+    }
+
     private static void ConcatenateContiguousInto<T>(Tensor<T>[] tensors, int axis, Span<T> destination)
     {
         var firstShape = tensors[0]._shape;
@@ -40837,7 +40883,8 @@ public partial class CpuEngine : ITensorLevelEngine
             if (outShape[d] != output._shape[d]) return false;
 
         using var outputKeep6 = new KeepAliveScope(output);
-        ConcatenateContiguousInto(tensors, normalizedAxis, output.AsWritableSpanUnmarked());
+        if (!TryConcatenateRowsParallel(tensors, normalizedAxis, output))
+            ConcatenateContiguousInto(tensors, normalizedAxis, output.AsWritableSpanUnmarked());
         output.IncrementVersion();
         return true;
     }
