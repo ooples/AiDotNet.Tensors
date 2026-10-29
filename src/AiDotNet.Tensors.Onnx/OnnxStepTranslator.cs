@@ -21,7 +21,7 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
     {
         "TensorAdd", "TensorBroadcastAdd", "TensorSubtract", "TensorBroadcastSubtract", "TensorMultiply",
         "TensorBroadcastMultiply", "TensorDivide", "TensorBroadcastDivide", "TensorMax", "TensorMin", "TensorPowerTensor",
-        "TensorMatMul", "TensorBatchMatMul", "BatchMatMul", "Equal",
+        "TensorMatMul", "TensorBatchMatMul", "BatchMatMul", "Equal", "Mod",
         "ReLU", "Sigmoid", "Tanh", "GELU", "LeakyReLU", "Softmax",
         "TensorExp", "TensorLog", "TensorSqrt", "TensorAbs", "TensorNegate", "TensorPower", "TensorErfc",
         "TensorSign", "TensorFloor", "TensorCeiling", "TensorRound", "Floor", "Ceiling", "Round", "Sign",
@@ -72,6 +72,22 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
                 string equal = _w.NewName("equal");
                 _w.AddNode("Equal", new[] { inputs[0], inputs[1] }, new[] { equal });
                 _w.AddNode("Cast", new[] { equal }, new[] { output }, Int("to", OnnxGraphWriter<T>.ElementType));
+                return;
+            }
+            case "Mod":
+            {
+                // The plan's operands are floating point, and ONNX allows only fmod = 1 on floats. The integer
+                // (divisor-signed) form is written as a - floor(a / b) * b, which equals it exactly on integers.
+                if (state is { Length: > 0 } && state[0] is true)
+                {
+                    _w.AddNode("Mod", new[] { inputs[0], inputs[1] }, new[] { output }, Int("fmod", 1));
+                    return;
+                }
+                string quotient = _w.NewName("mod_div"), floor = _w.NewName("mod_floor"), product = _w.NewName("mod_mul");
+                _w.AddNode("Div", new[] { inputs[0], inputs[1] }, new[] { quotient });
+                _w.AddNode("Floor", new[] { quotient }, new[] { floor });
+                _w.AddNode("Mul", new[] { floor, inputs[1] }, new[] { product });
+                _w.AddNode("Sub", new[] { inputs[0], product }, new[] { output });
                 return;
             }
             case "TensorMatMul":

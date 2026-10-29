@@ -270,6 +270,13 @@ internal static class TensorManipOperators
                 fullStep[ax] = step;
                 if (step != 1) anyNonUnitStep = true;
             }
+            // A clamped range can be empty (PyTorch's unflatten export slices shape[rank:] for the trailing dims);
+            // the result is a size-0 tensor of that shape, which the engine's slice does not take.
+            if (Array.IndexOf(fullLen, 0) >= 0)
+            {
+                ctx.PutTensor(node.Output[0], new Tensor<T>(fullLen));
+                return;
+            }
             if (!anyNonUnitStep)
             {
                 ctx.PutTensor(node.Output[0], ctx.Engine.TensorSlice(data, fullStart, fullLen));
