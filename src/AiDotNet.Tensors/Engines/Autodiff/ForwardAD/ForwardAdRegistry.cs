@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Forward-mode autograd rule registry — closes the issue #214 gap
 // "Forward-mode op rules registered through `OpRegistry`".
 

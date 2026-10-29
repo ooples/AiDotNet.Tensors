@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Declared programs as resident-program stages (#890 phase 4 on phase 3's resident program, #1430): a chain of
 // declared calls -- LayerNorm, then Softmax, then ... -- runs as ONE persistent cooperative launch composed from the
 // stages' own kernels (PtxResidentComposer), a grid barrier between them. Every stage is the same kernel the

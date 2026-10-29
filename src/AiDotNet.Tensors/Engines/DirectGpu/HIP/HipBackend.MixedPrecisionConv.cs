@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP IGpuMixedPrecisionConvBackend (#1142): 16-bit storage over the backend's own FP32 convolution.
 using AiDotNet.Tensors.Engines.Gpu;
 using P = AiDotNet.Tensors.Engines.DirectGpu.PortableMixedPrecisionConv;

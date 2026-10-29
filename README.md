@@ -398,7 +398,20 @@ If CUDA is not available, you'll get detailed troubleshooting steps explaining e
 
 ## License
 
-Apache 2.0 - See [LICENSE](LICENSE) for details.
+AiDotNet.Tensors is licensed under the [Business Source License 1.1](LICENSE) (BSL 1.1),
+with CrowdTrainer LLC as Licensor. Its Additional Use Grant allows any non-commercial
+use (education, research, personal projects and internal evaluation), and training and
+inference operations are unrestricted regardless of license status. Each version converts
+to the Apache License 2.0 four years after its release. See
+[aidotnet.dev/license](https://aidotnet.dev/license) for the license tiers, including the
+free Community license.
+
+The BSL applies to versions released after this change (0.145.0 and later). Versions
+published before it remain under the Apache License 2.0.
+
+Parts derived from CLBlast and ONNX remain under the Apache License 2.0; see
+[THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt). The `AiDotNet.Native.*` packages carry
+their vendors' licences.
 
 ## Contributing
 

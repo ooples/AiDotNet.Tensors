@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP kernels for native Complex<T> tensor operations.
 // HIP is source-compatible with CUDA device code.
 

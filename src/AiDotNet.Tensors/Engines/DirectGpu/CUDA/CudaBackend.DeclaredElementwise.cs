@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The pointwise family on declared kernels (#890 phase 4a): every elementwise launch -- unary, binary, scalar-parameter,
 // fused add + activation, bias broadcast -- runs a kernel emitted from a declared body (PtxAffineEmitter.EmitElementwise)
 // whose scalar math calls the function CudaMathLibrary derived from the hand-written kernel it replaces, linked from

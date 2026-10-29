@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Built-in fusion: MatMul + BiasAdd (+ optional activation) → FusedLinear.
 
 using System.Collections.Generic;

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP kernels for the fused ANN primitives (IAnnBackend). Supply-chain-clean
 // replacement for FaissNet/MKL — mirrors AiDotNet.Tensors.Ann.AnnPrimitives
 // function-for-function so the GPU path is numerically identical to the managed

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Dedicated HIP kernels (HCC, identical syntax to CUDA) for Issue #160 spectral/audio perf operations.
 // All kernels are fully GPU-resident — no host-side loops.
 

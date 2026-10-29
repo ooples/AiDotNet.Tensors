@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The rest of the row-wise scatter family as declared programs (#890 phase 4e, #1441), each in the exact contract of the
 // hand-written kernel it replaces: the scatter maximum with its argmax, the backward passes of the add, mean, maximum
 // and softmax, and the activation-layout ScatterMean with int32 counts. Like the scatter inversions before them, each

@@ -12,6 +12,24 @@ internal static partial class BatchExecutionCudaKernels
         GruRbCellBackward = "gru_rb_cell_bwd", GruRbResetBackward = "gru_rb_drh", GruRbHiddenBackward = "gru_rb_dh",
         GruRbWeightHhGrad = "gru_rb_gwhh";
 
+    /// <summary>Every GRU kernel, for the CUDA module that compiles them on their own (<see cref="GruPreciseSource"/>).</summary>
+    internal static readonly string[] GruKernelNames =
+    {
+        GruProjection, GruCell, GruCellBackward, GruHiddenBackward, GruInputGrad, GruWeightIhGrad, GruWeightHhGrad, GruBiasGrad,
+        GruRbResetHidden, GruRbCandidateProjection, GruRbCell, GruRbCellBackward, GruRbResetBackward, GruRbHiddenBackward,
+        GruRbWeightHhGrad,
+    };
+
+    /// <summary>
+    /// <see cref="GruSource"/> with the one helper it uses, compiled by CUDA without --use_fast_math. The batch module's
+    /// fast math swaps expf and the division in the sigmoid and tanh gates for approximations, and BPTT compounds their
+    /// error: on an RTX 3080 the input-weight gradient drifted 0.6% from the double reference (B=64, T=8, H=64) and the
+    /// reset-before forward missed 4 decimals, while the same kernels passed on OpenCL and Vulkan. HIP already compiles
+    /// the whole batch module precisely.
+    /// </summary>
+    internal const string GruPreciseSource =
+        "__device__ __forceinline__ int bx_gid() { return blockIdx.x * blockDim.x + threadIdx.x; }\n" + GruSource;
+
     // #1568: the fused GRU sequence, PyTorch nn.GRU semantics, as the CPU reference (CpuEngine.GruSequence) defines it:
     // batch-major x [B, T, In] and y [B, T, H], gate rows W[g * H + h, :] in the order (r, z, n), and
     //   r = sigmoid(Wir x + bir + Whr h + bhr), z = sigmoid(Wiz x + biz + Whz h + bhz),

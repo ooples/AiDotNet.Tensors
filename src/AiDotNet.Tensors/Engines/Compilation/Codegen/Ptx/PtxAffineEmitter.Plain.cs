@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The plain lowering (#1441): one thread per output, every reduction a rolled loop, computing in fp32 or fp64. It
 // serves the two kinds of spec the tuned path cannot:
 //

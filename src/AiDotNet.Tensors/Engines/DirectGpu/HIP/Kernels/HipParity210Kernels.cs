@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP kernels for the parity-210 op surface. Source-compatible with
 // CUDA/Parity210 (HIP's hiprtc provides device intrinsics without needing
 // <math.h>) — the two files stay structurally identical on purpose so we

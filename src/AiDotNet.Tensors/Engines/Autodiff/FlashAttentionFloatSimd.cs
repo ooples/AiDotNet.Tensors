@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 
 using System;
 using System.Runtime.CompilerServices;
@@ -109,10 +109,13 @@ internal static class FlashAttentionFloatSimd
         // Using SimdKernels.FastExp256 — same approximation FusedAttention
         // uses for online softmax. Saturates at ~88.7; correct for
         // softmax inputs which are typically bounded by definition.
+        // FastExp256 runs Avx2 and Fma intrinsics unguarded, so this arm needs both, not just Avx (which .NET keeps
+        // on with AVX2 switched off): without them every float FlashAttention forward threw. The scalar loop below
+        // takes the whole row instead.
         j = 0;
         float lLocal = 0f;
 #if NET5_0_OR_GREATER
-        if (Avx.IsSupported && kLen >= 8)
+        if (Avx2.IsSupported && Fma.IsSupported && kLen >= 8)
         {
             var vMNew = Vector256.Create(mNew);
             var vAcc = Vector256<float>.Zero;

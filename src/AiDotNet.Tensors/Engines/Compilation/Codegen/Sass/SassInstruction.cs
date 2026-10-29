@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // One 128-bit Volta-family SASS instruction (sm_70 through sm_89 share the layout below), the unit the own SASS backend
 // (#1442) rewrites. The field positions were measured, not assumed: --sass-learn matched 17 624 instructions of the
 // catalog's kernels (ptxas 13.1, sm_75) against nvdisasm's text with no disagreement:
