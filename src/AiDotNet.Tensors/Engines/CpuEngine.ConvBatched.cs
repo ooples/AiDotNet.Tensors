@@ -85,8 +85,7 @@ public partial class CpuEngine
             }, deterministicSafe: true);
             PackConvGradOutputByChannel(gradOutputF, packedGrad, batch, outChannels, colW);
 
-            // dW[outC, colH] = G[outC, batch*colW] . cols[colH, batch*colW]^T
-            Array.Clear(result, resultOff, totalLen);
+            // dW[outC, colH] = G[outC, batch*colW] . cols[colH, batch*colW]^T (Sgemm overwrites, so no clear first)
             Simd.SimdGemm.Sgemm(
                 new ReadOnlySpan<float>(packedGrad, 0, outChannels * colWAll), colWAll, false,
                 new ReadOnlySpan<float>(cols, 0, colH * colWAll), colWAll, true,
@@ -123,8 +122,7 @@ public partial class CpuEngine
         {
             PackConvGradOutputByChannel(gradOutputF, packedGrad, batch, outChannels, colW);
 
-            // cols[colH, batch*colW] = W[outC, colH]^T . G[outC, batch*colW]
-            Array.Clear(cols, 0, colH * colWAll);
+            // cols[colH, batch*colW] = W[outC, colH]^T . G[outC, batch*colW] (Sgemm overwrites, so no clear first)
             Simd.SimdGemm.Sgemm(
                 new ReadOnlySpan<float>(kernelF, 0, outChannels * colH), colH, true,
                 new ReadOnlySpan<float>(packedGrad, 0, outChannels * colWAll), colWAll, false,

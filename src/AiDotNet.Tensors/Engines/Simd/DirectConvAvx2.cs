@@ -511,11 +511,15 @@ internal static class DirectConvAvx2
                     int rowFloats = paddedW * Block, left = padW * Block, right = (paddedW - padW - width) * Block;
                     new Span<float>(d, padH * rowFloats).Clear();
                     new Span<float>(d + (long)(padH + height) * rowFloats, (paddedH - padH - height) * rowFloats).Clear();
+                    // The side halos are a few 8-float pixels per row: stored directly, as a Span.Clear call per row
+                    // cost about as much as clearing the whole plane.
+                    var zero = Vector256<float>.Zero;
                     for (int y = 0; y < height; y++)
                     {
                         float* row = d + (long)(y + padH) * rowFloats;
-                        new Span<float>(row, left).Clear();
-                        new Span<float>(row + left + width * Block, right).Clear();
+                        for (int i = 0; i < left; i += Block) Avx.Store(row + i, zero);
+                        float* tail = row + left + width * Block;
+                        for (int i = 0; i < right; i += Block) Avx.Store(tail + i, zero);
                     }
                 }
                 else
