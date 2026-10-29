@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP kernels for dot product operations. HIP is source-compatible with CUDA device code.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels;

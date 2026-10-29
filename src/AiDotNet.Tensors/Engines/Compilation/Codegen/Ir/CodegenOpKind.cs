@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Codegen IR op taxonomy. Each emitter dispatches on CodegenOpKind to
 // produce its target language — the enum is the cross-emitter
 // contract, and any op that doesn't appear here cannot be codegen'd

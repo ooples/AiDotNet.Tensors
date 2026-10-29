@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The geometry a convolution node carries.
 //
 // Kept as a typed record rather than an int[] because these four numbers are not

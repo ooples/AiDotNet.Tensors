@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA audio launcher shims (Issue #217 tail).
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 

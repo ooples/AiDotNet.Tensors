@@ -29,7 +29,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 /// <c>...ForwardInference</c> in eval, on GPU buffers via
 /// <c>CuDnnBatchNorm.ForwardTrainingGpu</c>/<c>ForwardInferenceGpu</c>) when
 /// <see cref="UseCudnnForBatchNorm"/>; otherwise the hand-written
-/// <c>batchnorm_forward</c> kernel. Both paths accumulate the UNBIASED
+/// <c>batchnorm_forward</c> kernel. The declared training program and the
+/// Direct PTX specialization are tried first and serve every shape they take,
+/// so this choice covers only the shapes they decline. Both paths accumulate the UNBIASED
 /// (Bessel-corrected) running variance — the paper-faithful estimator
 /// (Ioffe &amp; Szegedy 2015 §3.1) — while normalizing the current batch with the
 /// biased variance; the CUDA/HIP/OpenCL hand-written kernels were aligned to

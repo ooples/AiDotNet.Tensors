@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA kernels for hyperbolic (Poincare ball) neural network operations.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;

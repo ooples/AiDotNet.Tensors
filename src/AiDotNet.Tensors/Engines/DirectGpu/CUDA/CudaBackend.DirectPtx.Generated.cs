@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Dispatch to GENERATED kernels, for the families whose measurements earned it.
 //
 // PROMO-1 recorded which families beat cuDNN and which did not, but only the 1x1

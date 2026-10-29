@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Persistent tensor role enum for GPU memory management hints.
 
 namespace AiDotNet.Tensors.Engines;

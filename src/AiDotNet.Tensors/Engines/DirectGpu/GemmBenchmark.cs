@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // GEMM Benchmark to validate 25,000+ GFLOPS target on AMD GPUs.
 
 using System;

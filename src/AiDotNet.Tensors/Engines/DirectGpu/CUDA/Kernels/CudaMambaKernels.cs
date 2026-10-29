@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA kernel for the fused Mamba selective scan forward (#1464). One thread per (batch, channel).
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;

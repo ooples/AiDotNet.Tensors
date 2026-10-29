@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Generic-precision, arbitrary-length CUDA FFT kernels.
 //
 // This complements CudaFFTKernels, which ships float32 radix-2 only and requires callers with a non-power-of-two

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA kernels for the geometry / sampling ops added by Issue #217.
 // Covers Interpolate (nearest/bilinear/area/bicubic on 4D NCHW),
 // Pad (4 modes on 4D NCHW), GridSample (bilinear/nearest/bicubic with

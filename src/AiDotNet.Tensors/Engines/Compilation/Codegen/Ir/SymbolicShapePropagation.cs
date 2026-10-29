@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Symbolic-shape constraint propagation across codegen graph nodes —
 // addresses the issue #225 dynamic-shapes section: "Constraint
 // propagation across fusion passes".
