@@ -224,7 +224,9 @@ public static class CpuFusedOperations
         int totalPlanes = N * C;
 
 #if NET5_0_OR_GREATER
-        if (Avx.IsSupported && hw >= 8 &&
+        // Any plane size: the plane kernel's scalar tail covers planes shorter than a vector. Planes under 8 pixels (2x2
+        // late-stage maps) took the serial per-element delegate loop below, a third of a MobileNetV2 b128 epilogue.
+        if (Avx.IsSupported && hw >= 1 &&
             (activation == FusedActivationType.None
              || activation == FusedActivationType.ReLU
              || activation == FusedActivationType.ReLU6))

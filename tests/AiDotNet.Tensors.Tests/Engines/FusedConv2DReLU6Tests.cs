@@ -23,6 +23,7 @@ public sealed class FusedConv2DReLU6Tests
     [Theory]
     [InlineData(2, 8, 16, 9, 7, 1, 1)]    // 3x3, plane 63: a vector body and a scalar tail
     [InlineData(4, 16, 32, 8, 8, 1, 0)]   // 1x1, plane 64, past the parallel threshold
+    [InlineData(64, 16, 64, 2, 2, 1, 1)]  // 3x3 on 2x2: planes of 4, shorter than a vector (the late-stage maps)
     public void EqualsConvolutionBiasThenClamp(int n, int cin, int cout, int h, int w, int k3, int pad)
     {
         int k = k3 == 1 && pad == 1 ? 3 : 1;
