@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The rest of the sparse kernels through declared programs (#890 phase 4e, #1441): CSR SpMM with a bias (the warp and
 // vec4 layouts route to the CSR SpMM itself), SDDMM, and the graph edge scatter-add. They share CSR SpMM's switch and
 // cap; the inversions (bias SpMM, edges) share its size limit.

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Backend dispatch wiring (Phase C.5) — picks the best available
 // emitter for a given graph + dtype and produces a runnable kernel.
 

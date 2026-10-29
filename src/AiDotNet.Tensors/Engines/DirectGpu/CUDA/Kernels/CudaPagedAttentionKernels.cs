@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // GPU paged-attention kernels (P1) for CUDA (nvRTC).
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // #1113: HIP's Conv2D forward through the tuned-kernel registry. The reference is the dispatch HIP shipped (Winograd
 // F(2x2,3x3) for 3x3 stride-1 undilated filters, else the shared-memory tiled kernel, else the direct kernel); each of
 // those kernels and an im2col + one-GEMM formulation are offered on their own, and the registry measures per shape.

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA convolution kernels for neural network layers.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CodegenGraph -> CodegenKernelSpec: the front end.
 //
 // The PTX emitter consumed CodegenKernelSpec, which nothing in the engine could

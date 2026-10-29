@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP backend for AMD GPU with real MFMA (Matrix Fused Multiply-Add) support.
 // Target: 25,000+ GFLOPS on MI200, 15,000+ GFLOPS on RX 7900.
 

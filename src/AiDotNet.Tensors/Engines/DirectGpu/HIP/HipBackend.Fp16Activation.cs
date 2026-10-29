@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 
 // No FP16-native activation kernels here: those capabilities report false, so the engine keeps activations in FP32.

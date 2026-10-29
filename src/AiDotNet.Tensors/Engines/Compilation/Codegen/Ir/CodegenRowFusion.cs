@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Fusing a row-wise program -- softmax, LayerNorm, RMSNorm, GroupNorm -- into ONE kernel.
 //
 // As separate passes each statistic re-reads the whole input: LayerNorm at 8192x1024 is three

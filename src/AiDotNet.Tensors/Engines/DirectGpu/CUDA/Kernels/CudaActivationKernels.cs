@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA activation kernels and simple elementwise ops.
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
 {

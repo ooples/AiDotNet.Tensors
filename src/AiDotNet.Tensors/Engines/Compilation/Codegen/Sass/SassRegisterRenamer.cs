@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Register renaming for the own SASS backend (#1442): rewrites every vector register operand of a kernel through one
 // map, the primitive a register allocator's assignment is applied with. Renaming is only sound when the opcode table
 // names every register field of every instruction -- --sass-learn checks exactly that against nvdisasm (each printed

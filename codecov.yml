@@ -20,3 +20,16 @@ coverage:
       default:
         target: auto
         if_ci_failed: ignore
+
+# Every PR uploads coverage five times: build.yml's unit-test run (flag unittests) and four POCL shards
+# (gpu-parity-pocl.yml, flag gpu-pocl: recurrent-foundations, matmul-single-gradient, resident-training,
+# resident-program). The POCL shards finish within minutes and the unit-test run takes about an hour, so codecov
+# posted its statuses from the shards alone: project ~7% (-58 points) and "0.00% of diff hit" on every PR until
+# the main upload arrived, and for good when that run was cancelled or failed. Wait for all five. Keep this
+# count in step with the uploads: a new coverage shard raises it, a removed one lowers it.
+codecov:
+  notify:
+    after_n_builds: 5
+
+comment:
+  after_n_builds: 5

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP launcher shim for categorical sampling. The HIP launch API takes the same void**-array as
 // CUDA, so this mirrors the OpenCL launcher one-for-one apart from the runtime call.
 using System;

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // On-device paged KV cache (P1): the GPU-resident sibling of the CPU
 // AiDotNet.Tensors.Engines.Autodiff.PagedKVCache reference.
 
