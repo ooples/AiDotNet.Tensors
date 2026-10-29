@@ -207,6 +207,19 @@ jobs:
       # Builds AiDotNet against this checkout (UseLocalTensors resolves ../../AiDotNet.Tensors from aidn/src), so the
       # model families exercise exactly this commit's kernels; the families were checked at the start of the job.
       run: |
+        # This checkout can need a newer AiDotNet.Evolution than AiDotNet master pins (Tensors 0.7.0 vs AiDotNet
+        # 0.6.0 failed restore with NU1605, a package downgrade). Raise AiDotNet's central pin to this commit's version,
+        # as a consumer upgrading Tensors would; a newer pin on AiDotNet's side is kept.
+        $tensorsProj = Get-Content AiDotNet.Tensors/src/AiDotNet.Tensors/AiDotNet.Tensors.csproj -Raw
+        $want = [regex]::Match($tensorsProj, '<PackageReference Include="AiDotNet\.Evolution" Version="([^"]+)"').Groups[1].Value
+        $props = 'aidn/Directory.Packages.props'
+        $text = Get-Content $props -Raw
+        $pin = [regex]::Match($text, '(<PackageVersion Include="AiDotNet\.Evolution" Version=")([^"]+)(")')
+        if (-not $want -or -not $pin.Success) { Write-Output "::error::Could not read the AiDotNet.Evolution version from Tensors or AiDotNet."; exit 1 }
+        if ([version]$pin.Groups[2].Value -lt [version]$want) {
+          Write-Output "AiDotNet.Evolution: AiDotNet pins $($pin.Groups[2].Value), this Tensors needs $want; using $want."
+          Set-Content $props ($text.Remove($pin.Groups[2].Index, $pin.Groups[2].Length).Insert($pin.Groups[2].Index, $want)) -NoNewline
+        }
         dotnet run -c Release --project aidn/benchmarks/AiDotNet.PyTorchParity -p:UseLocalTensors=true -- `
           --models $env:MODEL_FAMILIES --device cuda --epochs 1 --train-batches 2 --batch-size 64 `
           --inference-iterations 3 --warmup-iterations 1 --output "${{ runner.temp }}/aidotnet-cuda.json"
