@@ -523,7 +523,7 @@ public static class ExecutionGraphBuilderExtensions
         return builder;
     }
 
-    private static void ApplyActivation(IDirectGpuBackend backend, IGpuBuffer input, IGpuBuffer output, FusedActivationType activation, int rows, int features)
+    internal static void ApplyActivation(IDirectGpuBackend backend, IGpuBuffer input, IGpuBuffer output, FusedActivationType activation, int rows, int features)
     {
         int size = rows * features;
         switch (activation)
