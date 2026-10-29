@@ -43999,7 +43999,8 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float) && result.Rank == 4
             && (bias is null || (bias.Rank == 1 && bias._shape[0] == result._shape[1]))
             && (activation == FusedActivationType.None
-                || activation == FusedActivationType.ReLU))
+                || activation == FusedActivationType.ReLU
+                || activation == FusedActivationType.ReLU6))
         {
             int N = result._shape[0], C = result._shape[1], H = result._shape[2], W = result._shape[3];
             using var outArrLease = result.LeaseArray();

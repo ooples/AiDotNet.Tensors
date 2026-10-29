@@ -226,8 +226,13 @@ public static class CpuFusedOperations
 #if NET5_0_OR_GREATER
         if (Avx.IsSupported && hw >= 8 &&
             (activation == FusedActivationType.None
-             || activation == FusedActivationType.ReLU))
+             || activation == FusedActivationType.ReLU
+             || activation == FusedActivationType.ReLU6))
         {
+            // A ReLU6 is the ReLU with an upper clamp at 6 in the same pass (MobileNetV2's expansion convolutions); it fell
+            // to the generic per-element activation handler, a second and much slower pass over the output.
+            bool applyRelu = activation != FusedActivationType.None;
+            float upper = activation == FusedActivationType.ReLU6 ? 6f : float.PositiveInfinity;
             // Per-plane work is `hw` elements ≈ hw/8 AVX256 vector ops.
             // For ResNet-style shapes (C=256, hw=14×14=196) per-plane
             // work is ~50 ns — the Parallel.For dispatch + sync cost
@@ -243,12 +248,12 @@ public static class CpuFusedOperations
             if (totalPlanes >= 4 && totalElements >= ParallelElementThreshold)
             {
                 CpuParallelSettings.ParallelForOrSerial(0, totalPlanes, totalElements, p =>
-                    ApplyNchwPlaneSimd(output, bias, p, C, hw, activation == FusedActivationType.ReLU));
+                    ApplyNchwPlaneSimd(output, bias, p, C, hw, applyRelu, upper));
             }
             else
             {
                 for (int p = 0; p < totalPlanes; p++)
-                    ApplyNchwPlaneSimd(output, bias, p, C, hw, activation == FusedActivationType.ReLU);
+                    ApplyNchwPlaneSimd(output, bias, p, C, hw, applyRelu, upper);
             }
             return;
         }
@@ -327,8 +332,11 @@ public static class CpuFusedOperations
     /// </summary>
     [MethodImpl(Hot)]
     private static unsafe void ApplyNchwPlaneSimd(
-        float[] output, float[]? bias, int planeIdx, int C, int hw, bool applyRelu)
+        float[] output, float[]? bias, int planeIdx, int C, int hw, bool applyRelu, float upper)
     {
+        // An upper bound (6 for a ReLU6) is applied after the NaN-safe ReLU with the bound as the FIRST min operand:
+        // MINPS returns its second operand when either is NaN, so a NaN lane stays NaN, as in the scalar tail.
+        bool clampUpper = !float.IsPositiveInfinity(upper);
         int c = planeIdx % C;
         float b = bias is not null ? bias[c] : 0f;
         int offset = planeIdx * hw;
@@ -337,12 +345,14 @@ public static class CpuFusedOperations
             int j = 0;
             var vZero = Vector256<float>.Zero;
             var vBias = Vector256.Create(b);
+            var vUpper = Vector256.Create(upper);
 
 #if NET8_0_OR_GREATER
             if (CpuFeatures.HasAVX512F)
             {
                 var vZero512 = Vector512<float>.Zero;
                 var vBias512 = Vector512.Create(b);
+                var vUpper512 = Vector512.Create(upper);
                 int simdLen512 = hw & ~31;
                 for (; j < simdLen512; j += 32)
                 {
@@ -353,6 +363,11 @@ public static class CpuFusedOperations
                         v0 = ReluNaNSafeAvx512(v0, vZero512);
                         v1 = ReluNaNSafeAvx512(v1, vZero512);
                     }
+                    if (clampUpper)
+                    {
+                        v0 = Avx512F.Min(vUpper512, v0);
+                        v1 = Avx512F.Min(vUpper512, v1);
+                    }
                     Avx512F.Store(pOut + j, v0);
                     Avx512F.Store(pOut + j + 16, v1);
                 }
@@ -360,13 +375,11 @@ public static class CpuFusedOperations
                 {
                     var v = Avx512F.Add(Avx512F.LoadVector512(pOut + j), vBias512);
                     if (applyRelu) v = ReluNaNSafeAvx512(v, vZero512);
+                    if (clampUpper) v = Avx512F.Min(vUpper512, v);
                     Avx512F.Store(pOut + j, v);
                 }
                 for (; j < hw; j++)
-                {
-                    float val = pOut[j] + b;
-                    pOut[j] = applyRelu && val < 0f ? 0f : val;
-                }
+                    pOut[j] = ScalarBiasActivation(pOut[j] + b, applyRelu, upper);
                 return;
             }
 #endif
@@ -385,6 +398,13 @@ public static class CpuFusedOperations
                     v2 = ReluNaNSafeAvx(v2, vZero);
                     v3 = ReluNaNSafeAvx(v3, vZero);
                 }
+                if (clampUpper)
+                {
+                    v0 = Avx.Min(vUpper, v0);
+                    v1 = Avx.Min(vUpper, v1);
+                    v2 = Avx.Min(vUpper, v2);
+                    v3 = Avx.Min(vUpper, v3);
+                }
                 Avx.Store(pOut + j,      v0);
                 Avx.Store(pOut + j + 8,  v1);
                 Avx.Store(pOut + j + 16, v2);
@@ -394,14 +414,21 @@ public static class CpuFusedOperations
             {
                 var v = Avx.Add(Avx.LoadVector256(pOut + j), vBias);
                 if (applyRelu) v = ReluNaNSafeAvx(v, vZero);
+                if (clampUpper) v = Avx.Min(vUpper, v);
                 Avx.Store(pOut + j, v);
             }
             for (; j < hw; j++)
-            {
-                float val = pOut[j] + b;
-                pOut[j] = applyRelu && val < 0f ? 0f : val;
-            }
+                pOut[j] = ScalarBiasActivation(pOut[j] + b, applyRelu, upper);
         }
+    }
+
+    // The scalar tail of a plane: a NaN-preserving ReLU (NaN < 0 is false), then the upper clamp (NaN > upper is false).
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static float ScalarBiasActivation(float val, bool applyRelu, float upper)
+    {
+        if (applyRelu && val < 0f) val = 0f;
+        if (val > upper) val = upper;
+        return val;
     }
 #endif
 
