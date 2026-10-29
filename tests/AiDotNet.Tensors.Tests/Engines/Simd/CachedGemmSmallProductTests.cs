@@ -31,11 +31,16 @@ public sealed class CachedGemmSmallProductTests
         var a = Rand(1, m * k);
         var b = Rand(2, k * n);
         var c = new float[m * n];
+#if NET5_0_OR_GREATER
         int tiledBefore = SimdGemm.CachedBTiledCallsOnThisThread;
+#endif
         SimdGemm.SgemmWithCachedB(a, b, c, m, k, n);
+#if NET5_0_OR_GREATER
+        // The prepacked-B route exists only on net5+ (net471 forwards to Sgemm).
         if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported
             && !Avx512Sgemm.CanUse && Environment.GetEnvironmentVariable("AIDOTNET_JIT_GEMM") != "1")
             Assert.True(SimdGemm.CachedBTiledCallsOnThisThread == tiledBefore + 1, "the cached-B tiled path did not run");
+#endif
         for (int i = 0; i < m; i++)
             for (int j = 0; j < n; j++)
             {
