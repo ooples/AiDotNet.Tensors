@@ -10869,6 +10869,9 @@ public partial class CpuEngine : ITensorLevelEngine
         => kernelHeight == 1 && kernelWidth == 1 && strideH == 1 && strideW == 1 && padH == 0 && padW == 0
             && dilationH == 1 && dilationW == 1 && batch >= 2;
 
+    // Below this many pixels per image a 1x1 convolution runs as one batch-wide GEMM (SgemmSharedAColumns).
+    private const int Conv1x1ColumnBatchMaxPixels = 64;
+
     private static bool TryConv1x1PerImageGemm(
         Tensor<float> input, Tensor<float> kernel, Tensor<float> output,
         float[]? inputData, float[]? kernelData, float[]? outputData,
@@ -10887,6 +10890,13 @@ public partial class CpuEngine : ITensorLevelEngine
         int hw = height * width;
         int inStride = inChannels * hw, outStride = outChannels * hw, kLen = outChannels * inChannels;
 #if NET5_0_OR_GREATER
+        if (hw < Conv1x1ColumnBatchMaxPixels)
+        {
+            // Small maps: the batch's pixels are the GEMM's columns, so a 1x1 or 2x2 map fills the micro-tiles.
+            Simd.SimdGemm.SgemmSharedAColumns(kArr, kOff, inArr, inOff, inStride, outArr, outOff, outStride,
+                outChannels, inChannels, hw, batch);
+            return true;
+        }
         if (Simd.SimdGemm.PrefersSharedA(outChannels, inChannels, hw))
         {
             // The weight is packed once for the batch; a per-image GEMM that packs repacked it for every image.
@@ -19049,8 +19059,7 @@ public partial class CpuEngine : ITensorLevelEngine
     // System.Numerics.Vector has no span constructor on netstandard2.0 and net471).
     [ThreadStatic] private static float[]? t_depthwiseTile;
     [ThreadStatic] private static float[]? t_depthwiseLanes;
-    [ThreadStatic] private static System.Numerics.Vector<int>[]? t_depthwiseSameMasks;
-    [ThreadStatic] private static long t_depthwiseSameMaskKey;
+    [ThreadStatic] private static Dictionary<long, System.Numerics.Vector<int>[]>? t_depthwiseSameMasks;
     [ThreadStatic] private static float[]? t_depthwiseSameTile;
     [ThreadStatic] private static long t_depthwiseSameTileKey;
 
@@ -19206,16 +19215,22 @@ public partial class CpuEngine : ITensorLevelEngine
         // while the slot geometry is unchanged; clearing and copying each plane with Array calls cost more than its taps.
         long tileKey = (uint)slot | ((long)lead << 32);
         var tile = t_depthwiseSameTile;
-        if (tile is null || tile.Length < tileLength || t_depthwiseSameTileKey != tileKey)
+        if (tile is null || tile.Length < tileLength)
         {
-            t_depthwiseSameTile = tile = new float[Math.Max(tileLength, tile?.Length ?? 0)];
+            t_depthwiseSameTile = tile = new float[Math.Max(tileLength, 4096)];
+            t_depthwiseSameTileKey = tileKey;
+        }
+        else if (t_depthwiseSameTileKey != tileKey)
+        {
+            // Another layer's geometry: its planes sat where this one's margins are.
+            Array.Clear(tile, 0, tile.Length);
             t_depthwiseSameTileKey = tileKey;
         }
         CopyPlanesIntoSlots(x, tile, firstPlane, planeCount, outChannels, inChannels, multiplier, hw, slot, lead);
 
         long key = (uint)width | ((long)kW << 16) | ((long)padW << 24) | ((long)vectors << 32);
-        var masks = t_depthwiseSameMasks;
-        if (masks is null || t_depthwiseSameMaskKey != key)
+        var maskCache = t_depthwiseSameMasks ??= new Dictionary<long, System.Numerics.Vector<int>[]>();
+        if (!maskCache.TryGetValue(key, out var masks))
         {
             // masks[v * kW + kw]: the lanes of vector v whose column stays in its row at kernel column kw.
             masks = new System.Numerics.Vector<int>[vectors * kW];
@@ -19230,8 +19245,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     }
                     masks[v * kW + kw] = new System.Numerics.Vector<int>(bits);
                 }
-            t_depthwiseSameMasks = masks;
-            t_depthwiseSameMaskKey = key;
+            maskCache[key] = masks;   // one entry per layer geometry
         }
 
         if (kH == 3 && kW == 3)

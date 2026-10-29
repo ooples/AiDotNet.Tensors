@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
@@ -47,7 +47,8 @@ public sealed class Conv1x1PerImageGemmTests
     }
 
     /// <summary>
-    /// Deep inputs on small maps take the shared-weight route (the weight packed once for the batch). These cases span
+    /// Deep inputs and small maps take the shared-weight routes (the weight packed once for the batch; under 64 pixels the
+    /// batch's pixels form one GEMM's columns). These cases span
     /// two K panels (cin over 512) and two row blocks (cout over 128), with whole and ragged pixel counts. The bound is
     /// float summation's: cin * 2^-24 times the sum of the absolute products, which a misplaced panel or block exceeds.
     /// </summary>
@@ -55,6 +56,10 @@ public sealed class Conv1x1PerImageGemmTests
     [InlineData(3, 960, 200, 4, 4)]
     [InlineData(5, 576, 160, 4, 4)]
     [InlineData(2, 640, 136, 3, 5)]
+    [InlineData(2, 640, 136, 8, 8)]     // 64 pixels: the per-image shared-weight route
+    [InlineData(70, 960, 160, 1, 1)]    // 1x1 maps: 70 columns, a full 64-wide tile and a ragged one
+    [InlineData(37, 576, 140, 2, 2)]    // 2x2 maps: 148 columns; an image's pixels span two tiles
+    [InlineData(9, 96, 576, 2, 2)]      // shallow, wide: many row blocks over one column tile
     public void SharedWeightRoute_EqualsTheDirectSum_AndIsDeterministic(int n, int cin, int cout, int h, int w)
     {
         var x = Rand(3, n * cin * h * w); var k = Rand(4, cout * cin);
