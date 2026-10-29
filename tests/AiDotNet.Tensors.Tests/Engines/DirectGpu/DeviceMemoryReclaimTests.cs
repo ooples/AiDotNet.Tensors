@@ -67,6 +67,77 @@ public sealed class DeviceMemoryReclaimTests
         Assert.True(queue.IsEmpty);
     }
 
+    // An inference call has no tape, so before #1432 the due collection ran inside a later call's allocation.
+    [Fact]
+    public void LeavingTheOutermostInferenceScope_RunsTheDueCollection()
+    {
+        var tapeOpen = DeviceMemoryReclaim.TapeOpen;
+        DeviceMemoryReclaim.TapeOpen = () => false;
+        try
+        {
+            // Bytes other tests left in the process-wide counters could pass CollectNowAfterDeviceBytes, which collects on
+            // the spot and clears the flag this test reads.
+            DeviceMemoryReclaim.ResetCountsForTests();
+            DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectAfterDeviceBytes);
+            Assert.True(DeviceMemoryReclaim.CollectionDue);
+
+            using (new AiDotNet.Tensors.Engines.Autodiff.InferenceModeScope<float>())
+            {
+                using (new AiDotNet.Tensors.Engines.Autodiff.InferenceModeScope<float>()) { }
+                Assert.True(DeviceMemoryReclaim.CollectionDue);   // a nested scope is not the end of the call
+            }
+            Assert.False(DeviceMemoryReclaim.CollectionDue);
+        }
+        finally
+        {
+            DeviceMemoryReclaim.TapeOpen = tapeOpen;
+            DeviceMemoryReclaim.CollectIfDueAtStepBoundary();
+        }
+    }
+
+    [Fact]
+    public void LeavingAnInferenceScopeInsideATape_LeavesTheCollectionToTheStepBoundary()
+    {
+        var tapeOpen = DeviceMemoryReclaim.TapeOpen;
+        DeviceMemoryReclaim.TapeOpen = () => true;
+        try
+        {
+            // Bytes other tests left in the process-wide counters could pass CollectNowAfterDeviceBytes, which collects on
+            // the spot and clears the flag this test reads.
+            DeviceMemoryReclaim.ResetCountsForTests();
+            DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectAfterDeviceBytes);
+            using (new AiDotNet.Tensors.Engines.Autodiff.InferenceModeScope<float>()) { }
+            Assert.True(DeviceMemoryReclaim.CollectionDue);
+        }
+        finally
+        {
+            DeviceMemoryReclaim.TapeOpen = tapeOpen;
+            DeviceMemoryReclaim.CollectIfDueAtStepBoundary();
+        }
+    }
+
+    [Fact]
+    public void StepBoundary_SkipsTheCollection_WhenOwnersDisposedWhatWasHandedOut()
+    {
+        // A TensorScope ending an inference call disposes its intermediates: they are back in the pool and credited, so
+        // the collection their allocation asked for would recover nothing (#1432: it ran on every ResNet-50 predict).
+        DeviceMemoryReclaim.ResetCountsForTests();
+        DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectAfterDeviceBytes);
+        Assert.True(DeviceMemoryReclaim.CollectionDue);
+        DeviceMemoryReclaim.OnDeviceRelease(DeviceMemoryReclaim.CollectAfterDeviceBytes);
+        Assert.False(DeviceMemoryReclaim.CollectIfDueAtStepBoundary());
+        Assert.False(DeviceMemoryReclaim.CollectionDue);
+    }
+
+    [Fact]
+    public void StepBoundary_Collects_WhenAbandonedBytesRemainPastTheThreshold()
+    {
+        DeviceMemoryReclaim.ResetCountsForTests();
+        DeviceMemoryReclaim.OnDeviceAllocation(2 * DeviceMemoryReclaim.CollectAfterDeviceBytes);
+        DeviceMemoryReclaim.OnDeviceRelease(DeviceMemoryReclaim.CollectAfterDeviceBytes / 2);   // some disposed, most abandoned
+        Assert.True(DeviceMemoryReclaim.CollectIfDueAtStepBoundary());
+        Assert.False(DeviceMemoryReclaim.CollectionDue);
+    }
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static void AbandonBuffer(IDirectGpuBackend backend) => backend.AllocateBuffer(1024);
 
