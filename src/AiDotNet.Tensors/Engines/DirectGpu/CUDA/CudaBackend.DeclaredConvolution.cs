@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Convolutions on declared programs (#890 phase 4b). A convolution's spec -- forward, or the data or weight gradient
 // derived from it by CodegenAdjoint -- is lowered as a tiled implicit GEMM (PtxAffineEmitter.EmitImplicitGemm), on its
 // own or split along a reduction axis (CodegenSplitReduction.TryPlanChunkedForTiles) for small outputs with long

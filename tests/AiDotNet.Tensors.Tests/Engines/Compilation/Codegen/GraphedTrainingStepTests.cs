@@ -34,16 +34,18 @@ public class GraphedTrainingStepTests
             new GraphedTrainingStep(null, (IntPtr)0x1, () => { }));
     }
 
-    [Fact(Skip = "Requires non-null IDirectGpuBackend to isolate the null-step path; "
-                + "the complementary Ctor_NullBackend_Throws test exercises the ctor-null branch, "
-                + "and the full IDirectGpuBackend stubbing surface (~40 members) doesn't earn its "
-                + "weight here. Phase F's CUDA integration harness covers the permutation.")]
+#if NETCOREAPP
+    // The constructor checks its arguments before any backend call, so the DispatchProxy mock (.NET Core 5+, as in
+    // GraphedInferenceStepTests) stands in for the backend.
+    [Fact]
     public void Ctor_NullStep_Throws()
     {
-        // Intentionally empty — guarded by the [Fact(Skip = ...)]
-        // attribute above. An empty body without a Skip would silently
-        // pass and provide false confidence.
+        var backend = AiDotNet.Tensors.Tests.Engines.DirectGpu.MockDirectGpuBackend.Create(
+            new AiDotNet.Tensors.Tests.Engines.DirectGpu.MockBackendState());
+        var thrown = Assert.Throws<ArgumentNullException>(() => new GraphedTrainingStep(backend, (IntPtr)0x1, null!));
+        Assert.Equal("trainingStep", thrown.ParamName);
     }
+#endif
 
     // ─── Options ─────────────────────────────────────────────────────
 

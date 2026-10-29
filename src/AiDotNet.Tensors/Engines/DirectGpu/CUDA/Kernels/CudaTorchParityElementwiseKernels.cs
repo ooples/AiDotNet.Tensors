@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Device kernels for PyTorch-parity elementwise ops that computed on the host (#1112).
 //
 // Each kernel mirrors the CPU reference lambda in CpuEngine.TorchMisc / TorchSpecial exactly, including the NaN

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP kernels for FP16 (half-precision) conversion operations.
 // HIP is source-compatible with CUDA for FP16 intrinsics.
 

@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The accumulator allocator of the own SASS backend (#1442): it chooses the register map that SassRegisterRenamer
 // applies, for the one allocation decision the GEMM's inner loop actually leaves open.
 //

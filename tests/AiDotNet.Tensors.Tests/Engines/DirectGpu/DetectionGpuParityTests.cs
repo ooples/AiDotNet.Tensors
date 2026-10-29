@@ -28,14 +28,9 @@ public class DetectionGpuParityTests : IClassFixture<DirectGpuTensorEngineTestFi
         _gpuAvailable = fixture.IsAvailable && BackendImplementsDetection();
     }
 
-    private bool BackendImplementsDetection()
-    {
-        var backendField = typeof(DirectGpuTensorEngine).GetField(
-            "_backend",
-            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
-        var backend = backendField?.GetValue(_fixture.Engine);
-        return backend is IDetectionBackend;
-    }
+    // Read through the engine's own accessor: a reflected private "_backend" field matched nothing on
+    // DirectGpuTensorEngine, so this class skipped on every backend, including the six that implement it.
+    private bool BackendImplementsDetection() => _fixture.Engine?.TestBackend is IDetectionBackend;
 
     private void SkipIfUnavailable() => Skip.If(!_gpuAvailable,
         "GPU backend without IDetectionBackend support — CPU fallback is exercised by BoxOpsTests instead.");

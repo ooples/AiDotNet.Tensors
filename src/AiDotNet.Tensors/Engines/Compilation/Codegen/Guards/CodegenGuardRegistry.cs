@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Thread-safe registry for compiled codegen kernels keyed by
 // compilation guard. Enforces a recompile budget so pathological
 // shape sweeps don't blow up the cache.

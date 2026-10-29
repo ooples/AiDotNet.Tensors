@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // DirectGpuTensorEngine entry point for the public Fft module. Backends that
 // implement IGenericFftBackend (CUDA, Vulkan) expose generic-precision radix-2
 // and Bluestein transforms through IEngine. Legacy power-of-two backends remain

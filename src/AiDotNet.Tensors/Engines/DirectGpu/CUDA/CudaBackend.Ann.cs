@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA launcher shims for the native ANN kernels (IAnnBackend).
 // Pattern matches CudaBackend.Detection.cs: kernel resolved from _kernelCache,
 // dispatched via 256-thread block / grid-ceil. Numerically mirrors AnnPrimitives.

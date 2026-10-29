@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Which generated convolution families may be dispatched to, and why.
 //
 // The generated kernels were measured against cuDNN in its CUDA-graph lane, at true fp32,
