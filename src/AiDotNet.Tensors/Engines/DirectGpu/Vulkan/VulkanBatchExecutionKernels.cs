@@ -34,7 +34,7 @@ int bx_gid() { return int(gl_GlobalInvocationID.x); }
     /// (read-only when const), each scalar a push constant in order, and the float builtins their GLSL names.
     /// </summary>
     public static readonly IReadOnlyDictionary<string, string> Solvers = TranslateSolvers(
-        BatchExecutionCudaKernels.SolverSource + BatchExecutionCudaKernels.AttentionSource + BatchExecutionCudaKernels.LstmSource
+        BatchExecutionCudaKernels.SolverSource + BatchExecutionCudaKernels.AttentionSource + BatchExecutionCudaKernels.LstmSource + BatchExecutionCudaKernels.GruSource
         + BatchExecutionCudaKernels.DecodeLinearSource + BatchExecutionCudaKernels.DirectConvSource);
 
     private static Dictionary<string, string> TranslateSolvers(string cuda)

@@ -3583,7 +3583,8 @@ namespace AiDotNet.Tensors.Engines.Simd
             int length = output.Length;
             int i = 0;
 
-            if (Avx.IsSupported && Fma.IsSupported && length >= 8)
+            // FastSigmoid256 (PadeSigmoid.Sigmoid8) runs Avx2 intrinsics unguarded: AVX+FMA is not enough.
+            if (Avx2.IsSupported && Fma.IsSupported && length >= 8)
             {
                 var vSqrt2OverPi = Vector256.Create(sqrt2OverPi);
                 var vCoeff = Vector256.Create(coeff);

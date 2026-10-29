@@ -1,0 +1,42 @@
+name: Attest Release Artifacts
+
+# Reusable workflow called by automated-release.yml. Attestation runs in a DIFFERENTLY NAMED
+# workflow on purpose: the NuGet trusted-publishing policy matches the OIDC token's workflow file
+# (automated-release.yml), so the id-token this job needs to sign the attestation cannot be
+# exchanged for a NuGet API key. publish-nuget stays the only automated-release.yml job with
+# id-token: write.
+
+on:
+  workflow_call:
+    inputs:
+      artifact-ids:
+        description: Comma-separated IDs of the immutable package and SBOM artifacts to attest
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  attest:
+    name: Attest package and SBOM provenance
+    permissions:
+      contents: read
+      id-token: write # sign the Sigstore provenance statement
+      attestations: write # store the attestation on the repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download packages and SBOM
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ inputs.artifact-ids }}
+          merge-multiple: true
+          path: out/
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            out/*.nupkg
+            out/*.cdx.json

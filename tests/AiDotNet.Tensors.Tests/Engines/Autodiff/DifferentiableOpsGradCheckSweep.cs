@@ -162,6 +162,14 @@ public class DifferentiableOpsGradCheckSweep
         ["CTCLoss"] = r => [LogProbs(4, 1, 3, r), CtcTargets(2, 3, r), new[] { 4 }, new[] { 2 }, 0],
         ["TensorCTCLoss"] = r => [LogProbs(4, 1, 3, r), CtcTargets(2, 3, r), new[] { 4 }, new[] { 2 }, 0],
 
+        // --- fused GRU sequence: input [B, T, in], h0 [B, H], stacked gate weights [3H, in] / [3H, H], biases [3H] ---
+        // Each form once: the reset-before form GRULayer uses, and PyTorch's reset-after form through the overload that
+        // also returns the final state (its out slot gets a placeholder; reflection writes the result over it).
+        ["GruSequenceForward|T,T,T,T,T,T,bool,bool"] = r => [SafeTensor([2, 3, 2], r), SafeTensor([2, 3], r),
+            SafeTensor([9, 2], r), SafeTensor([9, 3], r), SafeTensor([9], r), SafeTensor([9], r), true, false],
+        ["GruSequenceForward|T,T,T,T,T,T,T,bool,bool"] = r => [SafeTensor([2, 3, 2], r), SafeTensor([2, 3], r),
+            SafeTensor([9, 2], r), SafeTensor([9, 3], r), SafeTensor([9], r), SafeTensor([9], r), SafeTensor([2, 3], r),
+            true, true],
         // --- normalization: last-dim normalized shapes ---
         // These carry `out` parameters, which still need an args slot for Invoke: LayerNorm's
         // signature is (input, gamma, beta, epsilon, out mean, out variance) = 6, and RMSNorm's is

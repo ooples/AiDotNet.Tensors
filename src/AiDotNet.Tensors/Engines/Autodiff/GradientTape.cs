@@ -3394,6 +3394,12 @@ public sealed class InferenceModeScope<T> : IDisposable
         _activeCount--;
         InferenceModeFlag.Exit();
         NoGradScope<T>.DecrementSuppressionCount();
+        // Leaving the outermost inference scope ends an inference call, as disposing the outermost tape ends a training
+        // step: its intermediates are dead, so run the young collection a GPU backend asked for here, while they are
+        // still young, instead of inside a later call's allocation (#1432: one blocking collection per ResNet-50
+        // predict). Not inside a tape: the step's own boundary runs it there.
+        if (!InferenceModeFlag.IsActive && !Engines.DirectGpu.DeviceMemoryReclaim.TapeOpen())
+            Engines.DirectGpu.DeviceMemoryReclaim.CollectIfDueAtStepBoundary();
     }
 }
 

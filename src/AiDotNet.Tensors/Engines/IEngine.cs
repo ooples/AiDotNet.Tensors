@@ -4456,6 +4456,41 @@ public partial interface IEngine
         bool returnSequences = false);
 
     /// <summary>
+    /// Fused GRU over a whole sequence (#1568), PyTorch <c>nn.GRU</c> semantics: with gate rows in the order
+    /// <c>(r, z, n)</c> along the first axis of <paramref name="wIh"/> / <paramref name="wHh"/> and their biases,
+    /// <c>r = σ(W_ir x + b_ir + W_hr h + b_hr)</c>, <c>z = σ(W_iz x + b_iz + W_hz h + b_hz)</c>,
+    /// <c>n = tanh(W_in x + b_in + r ⊙ (W_hn h + b_hn))</c> and <c>h' = (1 − z) ⊙ n + z ⊙ h</c>. The reset gate
+    /// multiplies the recurrent term after its bias, so the two biases are not interchangeable. With
+    /// <paramref name="resetAfter"/> false the reset gate applies before the recurrent product instead (Cho et al. 2014,
+    /// Keras <c>reset_after=False</c>): <c>n = tanh(W_in x + b_in + W_hn (r ⊙ h) + b_hn)</c>.
+    /// </summary>
+    /// <remarks>
+    /// Differentiable: under a gradient tape the whole sequence is one node whose backward is the fused
+    /// backpropagation through time, with gradients for the input, <paramref name="h0"/>, both weights and both
+    /// biases. The GPU engine runs it as device kernels on every backend.
+    /// </remarks>
+    /// <param name="input">Input, batch-major <c>[batch, seq, inputSize]</c>.</param>
+    /// <param name="h0">Initial hidden state <c>[batch, hidden]</c>, or null for zeros.</param>
+    /// <param name="wIh">Input weights <c>[3 * hidden, inputSize]</c>.</param>
+    /// <param name="wHh">Recurrent weights <c>[3 * hidden, hidden]</c>.</param>
+    /// <param name="bIh">Input bias <c>[3 * hidden]</c>, or null.</param>
+    /// <param name="bHh">Recurrent bias <c>[3 * hidden]</c>, or null.</param>
+    /// <param name="returnSequences">True for every step's output <c>[batch, seq, hidden]</c>; false for the last
+    /// step's <c>[batch, hidden]</c>.</param>
+    /// <param name="resetAfter">True (PyTorch) to apply the reset gate to the candidate's recurrent sum; false (Cho et
+    /// al., Keras <c>reset_after=False</c>) to apply it to the hidden state before the recurrent product.</param>
+    Tensor<T> GruSequenceForward<T>(Tensor<T> input, Tensor<T>? h0, Tensor<T> wIh, Tensor<T> wHh,
+        Tensor<T>? bIh, Tensor<T>? bHh, bool returnSequences = false, bool resetAfter = true);
+
+    /// <summary>
+    /// <see cref="GruSequenceForward{T}(Tensor{T}, Tensor{T}?, Tensor{T}, Tensor{T}, Tensor{T}?, Tensor{T}?, bool, bool)"/>
+    /// that also returns the final hidden state, for chunked or streaming use.
+    /// </summary>
+    /// <param name="finalHidden">Receives the final hidden state <c>[batch, hidden]</c>.</param>
+    Tensor<T> GruSequenceForward<T>(Tensor<T> input, Tensor<T>? h0, Tensor<T> wIh, Tensor<T> wHh,
+        Tensor<T>? bIh, Tensor<T>? bHh, out Tensor<T> finalHidden, bool returnSequences = false, bool resetAfter = true);
+
+    /// <summary>
     /// Fused LSTM sequence forward that also returns the final hidden and cell states for
     /// chunked or streaming inference.
     /// </summary>
@@ -5442,6 +5477,34 @@ public partial interface IEngine
         int strideH, int strideW,
         int padH, int padW,
         int dilationH, int dilationW,
+        FusedActivationType activation);
+
+    /// <summary>
+    /// A 2D convolution followed by inference batch norm (running statistics) and <paramref name="activation"/>:
+    /// <c>activation(BatchNormInference(conv2d(input, kernel) + bias))</c>. Outside a gradient tape or graph capture the
+    /// batch norm is folded into the convolution's weights and bias (cached until any parameter changes), so the whole
+    /// sequence is one fused convolution with no separate bias, batch-norm or activation pass. Under a tape or capture
+    /// it runs the unfused ops, which record their own gradients.
+    /// </summary>
+    /// <param name="input">Input, [batch, inChannels, height, width].</param>
+    /// <param name="kernel">Kernel, [outChannels, inChannels, kernelH, kernelW].</param>
+    /// <param name="bias">The convolution's bias, [outChannels], or null.</param>
+    /// <param name="gamma">Batch-norm scale, [outChannels].</param>
+    /// <param name="beta">Batch-norm shift, [outChannels].</param>
+    /// <param name="runningMean">Running mean, [outChannels].</param>
+    /// <param name="runningVariance">Running variance, [outChannels].</param>
+    /// <param name="epsilon">Numerical stabiliser added to the variance.</param>
+    /// <param name="strideH">Vertical stride.</param>
+    /// <param name="strideW">Horizontal stride.</param>
+    /// <param name="padH">Vertical zero padding.</param>
+    /// <param name="padW">Horizontal zero padding.</param>
+    /// <param name="dilationH">Vertical dilation.</param>
+    /// <param name="dilationW">Horizontal dilation.</param>
+    /// <param name="activation">The activation applied to the normalized values.</param>
+    Tensor<T> FusedConv2DBatchNorm<T>(
+        Tensor<T> input, Tensor<T> kernel, Tensor<T>? bias,
+        Tensor<T> gamma, Tensor<T> beta, Tensor<T> runningMean, Tensor<T> runningVariance, double epsilon,
+        int strideH, int strideW, int padH, int padW, int dilationH, int dilationW,
         FusedActivationType activation);
 
     /// <summary>
