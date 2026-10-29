@@ -1041,7 +1041,10 @@ internal static partial class SimdGemm
             && maxThreads > 1
             && numRowBlocks >= 1
             && (long)m * k * n >= ParallelWorkThreshold;
-        bool useParallel2D = canParallelize && cached.NumColSubBlocks >= 2;
+        // Row blocks alone are enough to split: a prepacked B with one column sub-block (a narrow output, as ViT's
+        // 192- and 768-wide feed-forward projections) ran the whole product on one thread however many rows it had,
+        // 71% of a ViT predict. The tile loop below handles a single column sub-block; the tiles stay disjoint.
+        bool useParallel2D = canParallelize && (cached.NumColSubBlocks >= 2 || numRowBlocks >= 2);
 
         int mcRounded = ((Mc + Mr - 1) / Mr) * Mr;
         int packedASizePerRow = mcRounded * Kc;
@@ -1214,7 +1217,10 @@ internal static partial class SimdGemm
             && maxThreads > 1
             && numRowBlocks >= 1
             && (long)m * k * n >= ParallelWorkThreshold;
-        bool useParallel2D = canParallelize && cached.NumColSubBlocks >= 2;
+        // Row blocks alone are enough to split: a prepacked B with one column sub-block (a narrow output, as ViT's
+        // 192- and 768-wide feed-forward projections) ran the whole product on one thread however many rows it had,
+        // 71% of a ViT predict. The tile loop below handles a single column sub-block; the tiles stay disjoint.
+        bool useParallel2D = canParallelize && (cached.NumColSubBlocks >= 2 || numRowBlocks >= 2);
 
         int mcRounded = ((Mc + Mr - 1) / Mr) * Mr;
         int packedASizePerRow = mcRounded * Kc;
