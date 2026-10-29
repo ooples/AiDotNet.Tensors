@@ -174,13 +174,26 @@ public class CompiledEagerFirstWriteGradientTests
     }
 
     /// <summary>
-    /// DenseNet's pattern: a training BatchNorm whose input a later concatenation also reads, so the BatchNorm's specialized
-    /// backward and a generic backward both write that input's gradient. The BatchNorm and ReLU backwards claim their first writes,
-    /// and the BatchNorm's batch-statistic nodes (no backward) do not count as writers, so after the verification step
-    /// nothing is zeroed and every step still reproduces step 0's gradients bit for bit.
+    /// DenseNet's pattern: a training BatchNorm whose input a later concatenation also reads, so the BatchNorm's
+    /// specialized backward and a generic backward both write that input's gradient. The BatchNorm backward claims its
+    /// first write, and the BatchNorm's batch-statistic nodes (no backward) do not count as writers, so after the
+    /// verification step nothing is zeroed and every step still reproduces step 0's gradients bit for bit. A tanh follows
+    /// the BatchNorm so it is not fused with a ReLU.
     /// </summary>
     [Fact]
     public void TrainingBatchNorm_SharedInput_NeedsNoZeroing_AndStaysBitExact()
+        => AssertSharedInputBatchNorm(useRelu: false, "specialized:BatchNorm");
+
+    /// <summary>
+    /// The same graph with a ReLU after the BatchNorm: on the CPU the pair fuses (BatchNormReluFusionPattern), so the
+    /// BatchNorm output and its gradient have no buffer, and the fused backward masks the gradient inside the batch-norm
+    /// kernel. Its gradients must match the eager tape, need no zeroing, and repeat bit for bit.
+    /// </summary>
+    [Fact]
+    public void FusedTrainingBatchNormRelu_SharedInput_MatchesEager_NeedsNoZeroing()
+        => AssertSharedInputBatchNorm(useRelu: true, "specialized:BatchNormReLU");
+
+    private static void AssertSharedInputBatchNorm(bool useRelu, string expectedKind)
     {
         var engine = new CpuEngine();
         var input = Filled(new[] { 2, 4, 3, 3 }, 21, 2f);
@@ -193,7 +206,8 @@ public class CompiledEagerFirstWriteGradientTests
         {
             var x = engine.TensorMultiply(input, p[0]);
             var y = engine.BatchNorm(x, p[1], p[2], 1e-5, out _, out _);
-            var z = engine.TensorConcatenate(new[] { engine.ReLU(y), x }, 1);   // x: read by the BatchNorm and this concat
+            var a = useRelu ? engine.ReLU(y) : engine.Tanh(y);
+            var z = engine.TensorConcatenate(new[] { a, x }, 1);   // x: read by the BatchNorm and this concat
             return engine.ReduceSum(engine.TensorMultiply(z, z), null);
         }
 
@@ -215,10 +229,7 @@ public class CompiledEagerFirstWriteGradientTests
         using (plan)
         {
             var concrete = Assert.IsType<CompiledTrainingPlan<float>>(plan);
-            Assert.Contains("specialized:BatchNorm", concrete.BackwardStepKinds);
-            // The ReLU's input is also read by the batch-statistic nodes, which have no backward: it is still the only
-            // gradient writer, so it keeps its specialized (overwriting, claiming) backward.
-            Assert.Contains("specialized:ReLU", concrete.BackwardStepKinds);
+            Assert.Contains(expectedKind, concrete.BackwardStepKinds);
 
             plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);
             plan.Step();

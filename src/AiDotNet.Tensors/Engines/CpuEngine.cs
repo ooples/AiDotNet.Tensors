@@ -26353,6 +26353,38 @@ public partial class CpuEngine : ITensorLevelEngine
         return TensorAllocator.Rent<T>(input._shape, outputData);
     }
 
+    /// <summary>
+    /// Training BatchNorm then ReLU on a 4D float input, written straight into <paramref name="result"/> (the ReLU's
+    /// output), with the batch mean and variance written into <paramref name="mean"/> and <paramref name="variance"/>.
+    /// The compiled plan's BatchNorm+ReLU fusion runs this so the BatchNorm's own output tensor, and its gradient, need
+    /// no buffer. Same kernels as the separate ops (BatchNorm4DFloat, then ReLUUnsafe in place), so the same bits.
+    /// Returns false, writing nothing, for a shape or layout it does not take.
+    /// </summary>
+    internal unsafe bool TryBatchNormReluTrainingInto(Tensor<float> x, Tensor<float> gamma, Tensor<float> beta,
+        double epsilon, Tensor<float> result, Tensor<float> mean, Tensor<float> variance)
+    {
+        if (x.Rank != 4 || !result.IsContiguous || !ShapesMatch(result._shape, x._shape)) return false;
+        int batch = x._shape[0], channels = x._shape[1], spatialSize = x._shape[2] * x._shape[3];
+        if (mean.Length != channels || variance.Length != channels || gamma.Length != channels || beta.Length != channels)
+            return false;
+        if (result.GetCpuBackingForContiguousWrite(out int resultOffset) is not float[] output || resultOffset != 0)
+            return false;
+        if (x.GetReadOnlyDataArray() is not float[] input || gamma.GetReadOnlyDataArray() is not float[] gammaF
+            || beta.GetReadOnlyDataArray() is not float[] betaF)
+            return false;
+
+        var meanF = new float[channels];
+        var varF = new float[channels];
+        BatchNorm4DFloat(input, gammaF, betaF, (float)epsilon, batch, channels, spatialSize, meanF, varF, output);
+        ParallelElementwiseChunks(x.Length, (start, count) =>
+        {
+            fixed (float* p = output) SimdKernels.ReLUUnsafe(p + start, p + start, count);
+        });
+        meanF.AsSpan().CopyTo(mean.AsWritableSpan());
+        varF.AsSpan().CopyTo(variance.AsWritableSpan());
+        return true;
+    }
+
     private static unsafe void BatchNorm4DFloat(float[] input, float[] gamma, float[] beta, float eps,
         int batch, int channels, int spatialSize, float[] meanOut, float[] varOut, float[] output)
     {
@@ -27054,6 +27086,40 @@ public partial class CpuEngine : ITensorLevelEngine
 
 
     /// <summary>
+    /// Backward of a fused training BatchNorm+ReLU (4D float) into the compiled plan's buffers. The incoming gradient is
+    /// the ReLU output's, masked by <paramref name="reluOutput"/> inside the batch-norm kernel, so neither the masked
+    /// gradient nor the BatchNorm output's gradient is ever stored. Each destination is overwritten, or added to when its
+    /// flag is set. Returns false, writing nothing, for a shape or layout it does not take.
+    /// </summary>
+    internal bool TryBatchNormReluBackwardInto(
+        Tensor<float> destGradInput, Tensor<float> destGradGamma, Tensor<float> destGradBeta,
+        Tensor<float> gradOutput, Tensor<float> reluOutput, Tensor<float> input, Tensor<float> gamma,
+        Tensor<float> mean, Tensor<float> variance, double epsilon,
+        bool accumulateInput, bool accumulateGamma, bool accumulateBeta)
+    {
+        if (input.Rank != 4 || !destGradInput.IsContiguous || !destGradGamma.IsContiguous || !destGradBeta.IsContiguous
+            || !ShapesMatch(destGradInput._shape, input._shape) || !ShapesMatch(gradOutput._shape, input._shape)
+            || !ShapesMatch(reluOutput._shape, input._shape)
+            || destGradGamma.Length != input._shape[1] || destGradBeta.Length != input._shape[1])
+            return false;
+        if (destGradInput.GetCpuBackingForContiguousWrite(out int giOff) is not float[] giDest
+            || destGradGamma.GetCpuBackingForContiguousWrite(out int ggOff) is not float[] ggDest
+            || destGradBeta.GetCpuBackingForContiguousWrite(out int gbOff) is not float[] gbDest)
+            return false;
+        using var goLease = gradOutput.LeaseArray();
+        using var meanLease = mean.LeaseArray();
+        using var varLease = variance.LeaseArray();
+        if (goLease.Array is not float[] goF || input.GetReadOnlyDataArray() is not float[] inF
+            || gamma.GetReadOnlyDataArray() is not float[] gaF || meanLease.Array is not float[] meF
+            || varLease.Array is not float[] vaF || reluOutput.GetReadOnlyDataArray() is not float[] reluF)
+            return false;
+        BatchNormBackward4DFloat(goF, inF, gaF, meF, vaF, (float)epsilon,
+            input._shape[0], input._shape[1], input._shape[2] * input._shape[3],
+            giDest, giOff, accumulateInput, ggDest, ggOff, accumulateGamma, gbDest, gbOff, accumulateBeta, reluF);
+        return true;
+    }
+
+    /// <summary>
     /// The float 4D batch-norm backward. As torch's batch_norm_cpu_backward: two reductions per channel, sum(dy) and
     /// dot(dy, x - mean), then one pass dx = k1*dy + k2*(x - mean) + k3, one task per channel in a fixed order (the same
     /// at any thread count). Each destination is overwritten, or added to when its accumulate flag is set, in the same
@@ -27062,8 +27128,11 @@ public partial class CpuEngine : ITensorLevelEngine
     private static void BatchNormBackward4DFloat(float[] goF, float[] inF, float[] gaF, float[] meF, float[] vaF,
         float epsF, int batch, int channels, int spatialSize,
         float[] giF, int giOff, bool accumulateInput,
-        float[] ggF, int ggOff, bool accumulateGamma, float[] gbF, int gbOff, bool accumulateBeta)
+        float[] ggF, int ggOff, bool accumulateGamma, float[] gbF, int gbOff, bool accumulateBeta,
+        float[]? reluOutput = null)
     {
+        // With reluOutput (a fused BatchNorm+ReLU), the incoming gradient is the ReLU's: lanes whose ReLU output is not
+        // positive contribute +0, exactly as the separate ReLU backward (ReluBackwardUnsafe) wrote them.
         float elemF = (long)batch * spatialSize;
         CpuParallelSettings.ParallelForOrSerial(0, channels, (long)channels * batch * spatialSize, [MethodImpl(Hot)] (c) =>
         {
@@ -27083,6 +27152,10 @@ public partial class CpuEngine : ITensorLevelEngine
                     for (; s + width <= spatialSize; s += width)
                     {
                         var go = new System.Numerics.Vector<float>(goF, baseIdx + s);
+                        if (reluOutput is not null)
+                            go = System.Numerics.Vector.ConditionalSelect(System.Numerics.Vector.GreaterThan(
+                                new System.Numerics.Vector<float>(reluOutput, baseIdx + s), System.Numerics.Vector<float>.Zero),
+                                go, System.Numerics.Vector<float>.Zero);
                         accGrad += go;
                         accGradX += go * (new System.Numerics.Vector<float>(inF, baseIdx + s) - vMean);
                     }
@@ -27090,6 +27163,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (; s < spatialSize; s++)
                 {
                     float go = goF[baseIdx + s];
+                    if (reluOutput is not null && !(reluOutput[baseIdx + s] > 0f)) go = 0f;
                     sumGrad += go;
                     sumGradX += go * (inF[baseIdx + s] - meanC);
                 }
@@ -27115,7 +27189,12 @@ public partial class CpuEngine : ITensorLevelEngine
                 {
                     for (; s + width <= spatialSize; s += width)
                     {
-                        var dx = vK1 * new System.Numerics.Vector<float>(goF, baseIdx + s)
+                        var goV = new System.Numerics.Vector<float>(goF, baseIdx + s);
+                        if (reluOutput is not null)
+                            goV = System.Numerics.Vector.ConditionalSelect(System.Numerics.Vector.GreaterThan(
+                                new System.Numerics.Vector<float>(reluOutput, baseIdx + s), System.Numerics.Vector<float>.Zero),
+                                goV, System.Numerics.Vector<float>.Zero);
+                        var dx = vK1 * goV
                             + vK2 * (new System.Numerics.Vector<float>(inF, baseIdx + s) - vMean) + vK3;
                         if (accumulateInput) dx = new System.Numerics.Vector<float>(giF, giOff + baseIdx + s) + dx;
                         dx.CopyTo(giF, giOff + baseIdx + s);
@@ -27123,7 +27202,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
                 for (; s < spatialSize; s++)
                 {
-                    float dx = k1 * goF[baseIdx + s] + k2 * (inF[baseIdx + s] - meanC) + k3;
+                    float goS = reluOutput is not null && !(reluOutput[baseIdx + s] > 0f) ? 0f : goF[baseIdx + s];
+                    float dx = k1 * goS + k2 * (inF[baseIdx + s] - meanC) + k3;
                     giF[giOff + baseIdx + s] = accumulateInput ? giF[giOff + baseIdx + s] + dx : dx;
                 }
             }

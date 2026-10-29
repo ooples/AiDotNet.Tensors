@@ -9013,6 +9013,16 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var claims = new System.Runtime.CompilerServices.StrongBox<bool>();
             var action = preferGenericForGpu ? null : BuildSpecializedBackward(step, gradMap, consumerCount, engine, pinnedHandles,
                 requiresGrad: requiresGradTensors, claimsFirstWrite: claims, gradWriterCount: gradWriterCount);
+            // Every unary specialization overwrites its input's gradient and is taken only when it is that gradient's
+            // sole writer (BuildSpecializedBackward's guard), so it can claim the write: a buffer it shares with
+            // no-backward readers (a training BatchNorm's statistics) then needs no per-step zeroing.
+            if (action != null && !claims.Value && !preferGenericForGpu && step.Inputs.Length == 1
+                && gradMap.TryGetValue(step.Inputs[0], out var soleWriterGrad))
+            {
+                var overwriting = action;
+                action = eng => { AccumulatesInto(soleWriterGrad, false); overwriting(eng); };
+                claims.Value = true;
+            }
             if (action != null)
             {
                 backwardActions.Add(action);
@@ -12689,6 +12699,46 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // GraFPrint has 18 BatchNorm layers; this saves ~3-5 ms per layer
         // (allocator pressure + AccumulateGrad orchestration).
         // Tier 1.4 of the compile-mode backward perf overhaul.
+        // Fused training BatchNorm+ReLU (BatchNormReluFusionPattern on the CPU): the ReLU mask is applied inside the
+        // batch-norm backward kernel, straight into the plan's buffers, claiming first writes like the BatchNorm branch
+        // below. The BatchNorm output and its gradient never exist.
+        if (step.OpName == "BatchNormReLU" && typeof(T) == typeof(float) && step.Inputs.Length == 3
+            && engine is CpuEngine && !engine.SupportsGpu
+            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous && step.Inputs[2].IsContiguous
+            && step.OutputBuffer.IsContiguous
+            && step.SavedState is { Length: >= 3 } fusedSaved
+            && fusedSaved[0] is Tensor<T> fusedMeanT && fusedSaved[1] is Tensor<T> fusedVarT && fusedSaved[2] is double fusedEps
+            && gradMap.TryGetValue(step.OutputBuffer, out var fusedGradOut)
+            && gradMap.TryGetValue(step.Inputs[0], out var fusedGradInput)
+            && gradMap.TryGetValue(step.Inputs[1], out var fusedGradGamma)
+            && gradMap.TryGetValue(step.Inputs[2], out var fusedGradBeta))
+        {
+            var x = step.Inputs[0];
+            var gammaT = step.Inputs[1];
+            var betaT = step.Inputs[2];
+            var reluOut = step.OutputBuffer;
+            bool sharedInput = consumerCount.TryGetValue(x, out int xUses) && xUses > 1;
+            bool sharedGamma = consumerCount.TryGetValue(gammaT, out int gUses) && gUses > 1;
+            bool sharedBeta = consumerCount.TryGetValue(betaT, out int bUses) && bUses > 1;
+            if (claimsFirstWrite is not null) claimsFirstWrite.Value = true;
+            return eng =>
+            {
+                bool accumInput = AccumulatesInto(fusedGradInput, sharedInput);
+                bool accumGamma = AccumulatesInto(fusedGradGamma, sharedGamma);
+                bool accumBeta = AccumulatesInto(fusedGradBeta, sharedBeta);
+                if (eng is not CpuEngine cpu || !cpu.TryBatchNormReluBackwardInto(
+                        (Tensor<float>)(object)fusedGradInput, (Tensor<float>)(object)fusedGradGamma,
+                        (Tensor<float>)(object)fusedGradBeta, (Tensor<float>)(object)fusedGradOut,
+                        (Tensor<float>)(object)reluOut, (Tensor<float>)(object)x, (Tensor<float>)(object)gammaT,
+                        (Tensor<float>)(object)fusedMeanT, (Tensor<float>)(object)fusedVarT, fusedEps,
+                        accumInput, accumGamma, accumBeta))
+                    throw new InvalidOperationException(
+                        "Fused BatchNorm+ReLU backward: the compiled plan's buffers no longer fit the CPU kernel.");
+                x.Grad = fusedGradInput;
+                gammaT.Grad = fusedGradGamma;
+                betaT.Grad = fusedGradBeta;
+            };
+        }
         if (step.OpType == OpType.BatchNorm && step.Inputs.Length >= 3
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous && step.Inputs[2].IsContiguous)
         {
