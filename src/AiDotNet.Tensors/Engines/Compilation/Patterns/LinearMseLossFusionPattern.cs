@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Built-in fusion: a linear head into the mean squared error -> one node whose forward and backward are one launch each.
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.Autodiff;

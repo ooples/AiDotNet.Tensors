@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // A complete, target-independent description of one conv-class kernel:
 // an iteration space, tensor bindings with index maps, and a reduce+epilogue body.
 //

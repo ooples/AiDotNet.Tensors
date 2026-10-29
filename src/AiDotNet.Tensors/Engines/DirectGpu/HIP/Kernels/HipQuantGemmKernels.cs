@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Weight-only fused dequant-GEMM HIP kernels (P0: quantized LLM-serving decode hot path).
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels

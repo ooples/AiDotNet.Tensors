@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Instruction reordering for the own SASS backend (#1442): a list scheduler over each straight-line block, by critical
 // path with the tensor pipe's 8-cycle issue spacing, so independent work fills the gaps between MMAs. SassScheduler.
 // RecomputeControl then owns every control word as usual.

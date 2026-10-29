@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Which reductions run one WARP per output, and the lane-interleaved spec that lowering emits.
 //
 // One thread per output walks its own row, so the 32 threads of a warp read 32 different rows

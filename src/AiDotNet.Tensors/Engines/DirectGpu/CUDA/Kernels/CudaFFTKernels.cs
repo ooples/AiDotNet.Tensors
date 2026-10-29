@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA FFT kernels for Fast Fourier Transform operations.
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
 {

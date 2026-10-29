@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // SIMD compatibility layer for .NET Framework 4.6.2+ which lacks System.Runtime.Intrinsics
 // This polyfill allows the same code to compile across net462, net471, and net8.0 without conditionals
 

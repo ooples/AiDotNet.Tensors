@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA kernels for the vision detection ops added by Issue #217.
 // Each function is a single-pass kernel launched over output element count.
 // Mirrors OpenClDetectionKernels / HipDetectionKernels function-for-function.

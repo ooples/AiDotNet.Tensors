@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The backend contract behind IEngine.FftGeneric.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu;

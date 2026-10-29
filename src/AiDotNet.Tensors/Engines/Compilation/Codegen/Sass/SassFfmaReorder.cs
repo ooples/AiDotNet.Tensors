@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // FFMA ordering for the own SASS backend (#1442). A register-blocked GEMM's inner loop is runs of independent FFMAs
 // (each accumulates a different register from a shared fragment of A and of B), and their order decides two operand
 // costs ptxas leaves on the table on sm_86:
