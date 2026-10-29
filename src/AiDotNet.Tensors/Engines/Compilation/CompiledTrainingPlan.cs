@@ -279,7 +279,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         get
         {
             int n = 0;
-            if (_pooledGradients is { } pooled) foreach (bool p in pooled) if (p) n++;
+            if (_pooledGradients is { } pooled) n = pooled.Count(p => p);
             return n;
         }
     }
@@ -8559,6 +8559,22 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     internal static CompiledTrainingPlan<T> Compile(
         LazyTensorScope scope, IEngine engine, Tensor<T>[] parameters, Tensor<T>? explicitLoss)
     {
+        // The build registers its gradient placeholders in a thread-static set from the backward graph's construction
+        // to gradient pooling. A build that throws in between must not leave that set, and the shared scratch array the
+        // placeholders view, referenced from this thread.
+        try
+        {
+            return CompileCore(scope, engine, parameters, explicitLoss);
+        }
+        finally
+        {
+            t_gradPlaceholders = null;
+        }
+    }
+
+    private static CompiledTrainingPlan<T> CompileCore(
+        LazyTensorScope scope, IEngine engine, Tensor<T>[] parameters, Tensor<T>? explicitLoss)
+    {
         int[]? originalParameterToUnique = null;
 
         // Tied/shared weights may legitimately appear more than once while a
@@ -9459,7 +9475,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             }
             finally
             {
-                t_gradPlaceholders = null;
+                t_gradPlaceholders = null;   // pooling settled every placeholder; Compile clears it again on a throw
             }
         }
         // BIND EVERY FORWARD OUTPUT'S LIVE BACKING BEFORE THE PLAN RUNS.
@@ -9554,11 +9570,6 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     }
 
     /// <summary>
-    /// Generates a specialized forward delegate that bypasses engine dispatch overhead.
-    /// Calls BLAS/SIMD directly into the pre-allocated output buffer.
-    /// Eliminates: GraphMode check, tape recording, shape validation, DifferentiableOps.
-    /// </summary>
-    /// <summary>
     /// Frees the storage of traced tensors the compiled plan never computes or reads: outputs of recorded nodes the
     /// optimization passes removed (a fused BatchNorm's normalized output). The trace's tensor objects stay referenced
     /// by whoever recorded them (a layer's cached intermediates), so without this every such output kept its trace-time
@@ -9576,9 +9587,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             used.Add(step.OutputBuffer);
             foreach (var input in step.Inputs) used.Add(input);
         }
-        foreach (var node in recorded)
+        foreach (var removed in recorded.Where(node => !kept.Contains(node)).OfType<LazyNode<T>>())
         {
-            if (kept.Contains(node) || node is not LazyNode<T> removed) continue;
             var output = removed.Output;
             if (used.Contains(output)) continue;
             // A kept node that writes this output (a fused BatchNorm+ReLU writes its absorbed statistics) is its producer.
@@ -9619,6 +9629,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var readBeforeWrite = new bool[count];
             for (int g = 0; g < count; g++) { firstWrite[g] = None; lastUse[g] = -1; }
             var actionWrites = new HashSet<int>();
+            // The pooled index of a tensor's gradient, or None when it has no gradient being pooled.
+            int GradIndex(Tensor<T> t) => gradMap.TryGetValue(t, out var grad) && indexOf.TryGetValue(grad, out int i) ? i : None;
             for (int a = 0; a < actions; a++)
             {
                 // Writes first: a fused action (a conv epilogue chain) writes and reads its internal gradients itself, in
@@ -9626,23 +9638,19 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // gradient nobody produced.
                 actionWrites.Clear();
                 foreach (int s in coverage[a]!)
-                    foreach (var input in forwardSteps[s].Inputs)
+                    foreach (int w in forwardSteps[s].Inputs.Select(GradIndex).Where(i => i != None))
                     {
-                        if (!gradMap.TryGetValue(input, out var written) || !indexOf.TryGetValue(written, out int w)) continue;
                         actionWrites.Add(w);
                         if (firstWrite[w] == None) firstWrite[w] = a;
                         lastUse[w] = Math.Max(lastUse[w], a);
                     }
-                foreach (int s in coverage[a]!)
+                foreach (int r in coverage[a]!.Select(s => GradIndex(forwardSteps[s].OutputBuffer)).Where(i => i != None))
                 {
-                    if (!gradMap.TryGetValue(forwardSteps[s].OutputBuffer, out var read) || !indexOf.TryGetValue(read, out int r))
-                        continue;
                     if (firstWrite[r] == None && !actionWrites.Contains(r)) readBeforeWrite[r] = true;
                     lastUse[r] = Math.Max(lastUse[r], a);
                 }
             }
-            var excluded = new HashSet<Tensor<T>>();
-            foreach (var p in parameters) if (gradMap.TryGetValue(p, out var pg)) excluded.Add(pg);
+            var excluded = new HashSet<Tensor<T>>(parameters.Select(p => gradMap.TryGetValue(p, out var pg) ? pg : null).OfType<Tensor<T>>());
             if (gradMap.TryGetValue(lossOutput, out var lossGrad)) excluded.Add(lossGrad);
 
             var tenants = new List<int>();
@@ -9652,28 +9660,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     tenants.Add(g);
             tenants.Sort((x, y) => firstWrite[x] != firstWrite[y] ? firstWrite[x].CompareTo(firstWrite[y]) : lastUse[x].CompareTo(lastUse[y]));
 
-            // Linear scan: an array is free once its tenant's last action is strictly before the next start (an action
-            // is atomic, so two tenants of one action never share). Best fit by capacity, else grow the largest free one.
-            var capacity = new List<int>();
-            var free = new List<int>();
-            var active = new List<(int End, int Array)>();
-            var arrayOf = new int[count];
-            foreach (int g in tenants)
-            {
-                int start = firstWrite[g], need = allGrads[g].Length;
-                for (int k = active.Count - 1; k >= 0; k--)
-                    if (active[k].End < start) { free.Add(active[k].Array); active.RemoveAt(k); }
-                int pick = -1;
-                foreach (int b in free)
-                    if (capacity[b] >= need && (pick < 0 || capacity[b] < capacity[pick])) pick = b;
-                if (pick < 0)
-                    foreach (int b in free)
-                        if (pick < 0 || capacity[b] > capacity[pick]) pick = b;
-                if (pick < 0) { pick = capacity.Count; capacity.Add(need); }
-                else { free.Remove(pick); capacity[pick] = Math.Max(capacity[pick], need); }
-                arrayOf[g] = pick;
-                active.Add((lastUse[g], pick));
-            }
+            var arrayOf = AssignPooledArrays(tenants, firstWrite, lastUse, allGrads, out var capacity);
 
             var arrays = new T[capacity.Count][];
             for (int b = 0; b < arrays.Length; b++) arrays[b] = new T[capacity[b]];
@@ -9695,6 +9682,35 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var result = new int[actions][];
         for (int a = 0; a < actions; a++) result[a] = schedule[a]?.ToArray() ?? Array.Empty<int>();
         return (result, pooled);
+    }
+    /// <summary>
+    /// The linear scan behind gradient pooling: an array is free once its tenant's last action is strictly before the next
+    /// tenant's first (an action is atomic, so two tenants of one action never share). Each tenant, in start order, takes
+    /// the smallest free array that fits, else grows the largest free one, else opens a new one. Returns each gradient's
+    /// array and the arrays' sizes.
+    /// </summary>
+    private static int[] AssignPooledArrays(List<int> tenants, int[] firstWrite, int[] lastUse, List<Tensor<T>> allGrads,
+        out List<int> capacity)
+    {
+        var sizes = new List<int>();
+        var free = new List<int>();
+        var active = new List<(int End, int Array)>();
+        var arrayOf = new int[allGrads.Count];
+        foreach (int g in tenants)
+        {
+            int start = firstWrite[g], need = allGrads[g].Length;
+            for (int k = active.Count - 1; k >= 0; k--)
+                if (active[k].End < start) { free.Add(active[k].Array); active.RemoveAt(k); }
+            // Ties go to the earliest free array (the sorts are stable).
+            int pick = free.Where(b => sizes[b] >= need).OrderBy(b => sizes[b]).DefaultIfEmpty(-1).First();
+            if (pick < 0) pick = free.OrderByDescending(b => sizes[b]).DefaultIfEmpty(-1).First();
+            if (pick < 0) { pick = sizes.Count; sizes.Add(need); }
+            else { free.Remove(pick); sizes[pick] = Math.Max(sizes[pick], need); }
+            arrayOf[g] = pick;
+            active.Add((lastUse[g], pick));
+        }
+        capacity = sizes;
+        return arrayOf;
     }
     /// <summary>Pin an array and track the handle for later cleanup.</summary>
     private static GCHandle PinAndTrack(object array, List<GCHandle>? tracker)
@@ -9829,6 +9845,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         return 1;
     }
 
+    /// <summary>
+    /// Generates a specialized forward delegate that bypasses engine dispatch overhead.
+    /// Calls BLAS/SIMD directly into the pre-allocated output buffer.
+    /// Eliminates: GraphMode check, tape recording, shape validation, DifferentiableOps.
+    /// </summary>
     internal static unsafe Action<IEngine>? TryBuildSpecializedForward(
         CompiledStep<T> step,
         List<GCHandle>? handleTracker = null,

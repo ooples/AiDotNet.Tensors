@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -27,11 +28,20 @@ public class FusedConvChainStorageReleaseTests
         Filled(new[] { 4, 3, 3, 3 }, 31, 0.6f), Filled(new[] { 4 }, 32, 0.5f), Filled(new[] { 4, 4, 3, 3 }, 33, 0.6f), Filled(new[] { 4 }, 34, 0.5f),
     };
 
-    private static Tensor<float> Forward(IEngine engine, Tensor<float> input, Tensor<float>[] p)
+    // Records the chain internals (each raw convolution and bias output) the fused plan never touches.
+    private static Tensor<float> Forward(IEngine engine, Tensor<float> input, Tensor<float>[] p, List<Tensor<float>> internals)
     {
         int[] one = { 1, 1 }, pad = { 1, 1 };
-        var h = engine.ReLU(engine.TensorChannelBiasAdd(engine.Conv2D(input, p[0], one, pad, one), p[1]));
-        var y = engine.ReLU(engine.TensorChannelBiasAdd(engine.Conv2D(h, p[2], one, pad, one), p[3]));
+        Tensor<float> Chain(Tensor<float> x, Tensor<float> kernel, Tensor<float> bias)
+        {
+            var conv = engine.Conv2D(x, kernel, one, pad, one);
+            var biased = engine.TensorChannelBiasAdd(conv, bias);
+            internals.Add(conv);
+            internals.Add(biased);
+            return engine.ReLU(biased);
+        }
+        var h = Chain(input, p[0], p[1]);
+        var y = Chain(h, p[2], p[3]);
         return engine.ReduceSum(engine.TensorMultiply(y, y), null);
     }
 
@@ -42,12 +52,16 @@ public class FusedConvChainStorageReleaseTests
         try
         {
             var ps = MakeParams();
+            var internals = new List<Tensor<float>>();
             ICompiledTrainingPlan<float> plan;
             using (var scope = GraphMode.Enable())
             {
-                Forward(engine, input, ps);
+                Forward(engine, input, ps, internals);
                 plan = scope.CompileTraining(ps);
             }
+            // Fused, the plan releases the internals' storage; unfused, it computes them every step.
+            foreach (var t in internals)
+                Assert.True(t.HasMaterializedOptimizerStorage != fusion, $"fusion={fusion}: a chain internal's storage was {(fusion ? "kept" : "released")}");
             using (plan)
             {
                 plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);
@@ -59,6 +73,9 @@ public class FusedConvChainStorageReleaseTests
                     for (int step = 0; step < 2; step++)
                     {
                         plan.Step();
+                        // The diagnostics write every output, so turning them on gives the released internals storage again.
+                        if (sanitizeAfterCompile)
+                            Assert.All(internals, t => Assert.True(t.HasMaterializedOptimizerStorage, "a released internal got no storage back"));
                         for (int i = 0; i < ps.Length; i++)
                             result[step * ps.Length + i] = ps[i].Grad?.ToArray() ?? Array.Empty<float>();
                     }

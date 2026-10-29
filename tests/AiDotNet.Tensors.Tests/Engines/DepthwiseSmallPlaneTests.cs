@@ -39,15 +39,16 @@ public sealed class DepthwiseSmallPlaneTests
         => AssertDirectSum(1, 2, 1, 4, 4, 1, 3, x => x[1 * 4 + 3] = float.PositiveInfinity);
 
     /// <summary>
-    /// The same-padded route keeps its tile between calls and clears it only when the slot geometry changes. A 4x4
-    /// plane and a 3x4 plane share slot and lead (both round to whole vectors), but the 4x4 one writes four more
-    /// pixels: run second, the 3x4 plane must still read a zero bottom margin, not the 4x4 plane's last row.
+    /// The same-padded route keeps its tile between calls and clears it only when the slot geometry changes. A 4x3
+    /// plane and a 3x3 plane share lead (4) and slot (20 at 4 lanes, 24 at 8 and 16) at every vector width, but the
+    /// 4x3 one writes three more pixels: run second, the 3x3 plane must still read a zero bottom margin, not the 4x3
+    /// plane's last row.
     /// </summary>
     [Fact]
     public void ASmallerPlaneWithTheSameSlot_ReadsZeroMargins()
     {
-        AssertDirectSum(1, 2, 1, 4, 4, 1, 3, x => { for (int i = 0; i < x.Length; i++) x[i] = 3f; });
-        AssertDirectSum(1, 2, 1, 3, 4, 1, 3, x => { });
+        AssertDirectSum(1, 2, 1, 4, 3, 1, 3, x => { for (int i = 0; i < x.Length; i++) x[i] = 3f; });
+        AssertDirectSum(1, 2, 1, 3, 3, 1, 3, x => { });
     }
 
     private static void AssertDirectSum(int n, int c, int multiplier, int h, int w, int pad, int kSize, Action<float[]> edit)
