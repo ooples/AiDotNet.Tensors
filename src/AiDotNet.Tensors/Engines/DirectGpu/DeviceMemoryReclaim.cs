@@ -81,6 +81,17 @@ internal static class DeviceMemoryReclaim
     internal const long CollectNowAfterDeviceBytes = 4 * CollectAfterDeviceBytes;
 
     private static int s_collectionDue;
+
+    /// <summary>Whether a backend has asked for a collection at the next step or inference boundary.</summary>
+    internal static bool CollectionDue => Volatile.Read(ref s_collectionDue) != 0;
+
+    /// <summary>Test hook: starts the byte and allocation counts from zero with no collection due.</summary>
+    internal static void ResetCountsForTests()
+    {
+        Interlocked.Exchange(ref s_driverBytesSinceCollection, 0);
+        Interlocked.Exchange(ref s_allocationsSinceCollection, 0);
+        Volatile.Write(ref s_collectionDue, 0);
+    }
     // Device bytes handed out since the last collection, across every backend: one collection serves them all.
     private static long s_driverBytesSinceCollection;
 
@@ -166,15 +177,22 @@ internal static class DeviceMemoryReclaim
     /// allocation. Collecting inside an allocation promoted them instead (measured on OpenCL: device memory grew by
     /// 574 MB over 300 steps once results stopped carrying host arrays).
     /// </summary>
-    internal static void CollectIfDueAtStepBoundary()
+    /// <returns>Whether it collected.</returns>
+    internal static bool CollectIfDueAtStepBoundary()
     {
-        if (Interlocked.Exchange(ref s_collectionDue, 0) == 0) return;
+        if (Interlocked.Exchange(ref s_collectionDue, 0) == 0) return false;
+        // Owners may have disposed what was handed out since the request (a TensorScope ending an inference call, a
+        // tape releasing its intermediates): those buffers are back in the pool and credited, so a collection would
+        // recover nothing. Measured on ResNet-50 predicts under a TensorScope (OpenCL): every intermediate came back
+        // that way and no buffer was ever finalized, yet a blocking collection ran on every call.
+        if (Volatile.Read(ref s_driverBytesSinceCollection) < CollectAfterDeviceBytes) return false;
         Interlocked.Exchange(ref s_driverBytesSinceCollection, 0);
         Interlocked.Exchange(ref s_allocationsSinceCollection, 0);
         GC.Collect(0, GCCollectionMode.Forced, blocking: true);
         // The collected buffers come back through their finalizers. Waiting for them (they only queue a pool return)
         // lets the next step's allocations find them in the pool instead of going to the driver.
         GC.WaitForPendingFinalizers();
+        return true;
     }
 
     internal static void CollectUnreachable()

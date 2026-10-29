@@ -71,6 +71,10 @@ jobs:
           # The resident program on OpenCL (#1449): a row-local chain as one kernel, any other as ordinary enqueues, against a double-precision
           # reference. Metal's runs on metal.yml; Vulkan, WebGPU (Dawn) and HIP have no CI device.
           - { name: resident-program, coverage: true, filter: "FullyQualifiedName~OpenClResidentProgramTests" }
+          # Model scale (#1569): ResNet-18 inference at batch 1 and 128 against the CPU (a batch-derived launch dimension
+          # past a device limit only appears at model scale), warm training steps of five networks with no host crossing,
+          # and the fused GRU, folded conv batch norm and TensorScope on a real OpenCL device.
+          - { name: model-smoke, filter: "FullyQualifiedName~ModelInferenceSmokeTests|FullyQualifiedName~NetworkTrainingStepResidencyTests|FullyQualifiedName~GruSequenceTests|FullyQualifiedName~GruSequenceBackendParityTests.OpenCl|FullyQualifiedName~FusedConv2DBatchNormTests|FullyQualifiedName~TensorScopeTests" }
           - { name: op-forward-1, filter: "FullyQualifiedName~Engines.OpParity.OpParityTests", shard: "1/6" }
           - { name: op-forward-2, filter: "FullyQualifiedName~Engines.OpParity.OpParityTests", shard: "2/6" }
           - { name: op-forward-3, filter: "FullyQualifiedName~Engines.OpParity.OpParityTests", shard: "3/6" }
@@ -85,10 +89,10 @@ jobs:
           - { name: tape-grad-6,  filter: "FullyQualifiedName~Engines.OpParity.TapeGradientParityTests", shard: "6/6" }
     name: gpu-parity-pocl (${{ matrix.name }})
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
     - name: Setup .NET
-      uses: actions/setup-dotnet@v4
+      uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
       with:
         dotnet-version: '10.0.x'
         dotnet-quality: 'preview'
@@ -148,12 +152,18 @@ jobs:
         dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj \
           --configuration Release --no-build --framework net10.0 \
           --filter "(${{ matrix.filter }})&Category!=Benchmark&Category!=Performance" \
+          --logger "trx;LogFilePath=${{ runner.temp }}/trx/${{ matrix.name }}.trx" \
           --blame-hang --blame-hang-timeout 600s --blame-crash \
           ${{ matrix.coverage && '--collect:"XPlat Code Coverage" --results-directory ./coverage -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Exclude="[*]AiDotNet.Tensors.Engines.DirectGpu.*,[*]AiDotNet.Tensors.Engines.DirectGpuTensorEngine*,[*]AiDotNet.Tensors.Engines.Cu*,[*]AiDotNet.Tensors.Engines.ClBlast*,[*]AiDotNet.Tensors.Engines.OpenCl*,[*]AiDotNet.Tensors.Engines.Simd.*,[*]AiDotNet.Tensors.Engines.BlasManaged.*"' || '' }}
 
+    - name: Report skipped tests
+      # A skip does not fail a build, so a shard can go green without running its tests: list every skip with its reason.
+      if: always()
+      run: python3 scripts/ci/summarize-test-skips.py --title "POCL ${{ matrix.name }}" "${{ runner.temp }}/trx/*.trx"
+
     - name: Upload device-path coverage to Codecov
       if: always() && matrix.coverage
-      uses: codecov/codecov-action@v4
+      uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4.6.0
       with:
         files: ./coverage/**/coverage.cobertura.xml
         disable_search: true
@@ -164,7 +174,7 @@ jobs:
         CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
     - name: Upload parity divergence report
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       if: always()
       with:
         name: opparity-pocl-${{ matrix.name }}

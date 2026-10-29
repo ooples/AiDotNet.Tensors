@@ -266,7 +266,7 @@ public partial class DirectGpuTensorEngine
             throw new InvalidOperationException("The GPU backend that recorded a packed attention node is no longer available.");
         using var x = GetOrAllocateBuffer(backend, packed);
         using var o = GetOrAllocateBuffer(backend, output);
-        using var dO = GetOrAllocateBuffer(backend, gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous());
+        using var dO = GetOrAllocateBuffer(backend, gradOutput);
         using var l = GetOrAllocateBuffer(backend, lse);
         var target = ResolveDirectGradTarget(backend, into, packed.Length, x.Buffer, o.Buffer, dO.Buffer);
         if (target is not null && target.Handle == l.Buffer.Handle) target = null;
@@ -323,9 +323,9 @@ public partial class DirectGpuTensorEngine
         {
             var p = FusedParams(batch, heads, seqQ, seqK, headDim, interleaved, scale, softcap, causal, causalOffset);
             Tensor<int>? maskDevice = mask is null ? null : UploadAttentionMask(backend, mask, batch, heads, seqQ, seqK, ref p);
-            using var q = GetOrAllocateBuffer(backend, query.IsContiguous ? query : query.Contiguous());
-            using var k = GetOrAllocateBuffer(backend, key.IsContiguous ? key : key.Contiguous());
-            using var v = GetOrAllocateBuffer(backend, value.IsContiguous ? value : value.Contiguous());
+            using var q = GetOrAllocateBuffer(backend, query);
+            using var k = GetOrAllocateBuffer(backend, key);
+            using var v = GetOrAllocateBuffer(backend, value);
             int outLength = batch * heads * seqQ * headDim, rows = batch * heads * seqQ;
             output = AllocateFullyWrittenOutputBuffer(backend, outLength);
             ownsOutput = true;
@@ -444,11 +444,11 @@ public partial class DirectGpuTensorEngine
         bool ownsQ = false, ownsK = false, ownsV = false;
         try
         {
-            using var q = GetOrAllocateBuffer(backend, query.IsContiguous ? query : query.Contiguous());
-            using var k = GetOrAllocateBuffer(backend, key.IsContiguous ? key : key.Contiguous());
-            using var v = GetOrAllocateBuffer(backend, value.IsContiguous ? value : value.Contiguous());
+            using var q = GetOrAllocateBuffer(backend, query);
+            using var k = GetOrAllocateBuffer(backend, key);
+            using var v = GetOrAllocateBuffer(backend, value);
             using var o = GetOrAllocateBuffer(backend, output);
-            using var dO = GetOrAllocateBuffer(backend, gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous());
+            using var dO = GetOrAllocateBuffer(backend, gradOutput);
             using var l = GetOrAllocateBuffer(backend, lse);
             // A target must differ from every buffer the kernel reads and from the other targets.
             var targetQ = ResolveDirectGradTarget(backend, intoQ, query.Length, q.Buffer, k.Buffer, v.Buffer);

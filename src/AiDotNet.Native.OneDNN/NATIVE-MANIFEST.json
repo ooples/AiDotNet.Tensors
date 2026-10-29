@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "package": "AiDotNet.Native.OneDNN",
+  "description": "Inventory of every third-party native file this package redistributes: upstream version, licence and SHA-256. tools/Test-NativeManifest.ps1 checks it against the files on disk before release packing.",
+  "components": [
+    {
+      "name": "oneAPI Deep Neural Network Library (oneDNN)",
+      "supplier": "Intel Corporation and oneDNN contributors (UXL Foundation)",
+      "version": "3.2.0",
+      "license": "Apache-2.0",
+      "licenseFile": "LICENSE.OneDNN.txt",
+      "thirdPartyNoticesFile": "THIRD-PARTY-PROGRAMS.OneDNN.txt",
+      "licenseSource": "https://raw.githubusercontent.com/uxlfoundation/oneDNN/v3.2/LICENSE",
+      "thirdPartyNoticesSource": "https://raw.githubusercontent.com/uxlfoundation/oneDNN/v3.2/THIRD-PARTY-PROGRAMS",
+      "upstream": "https://github.com/uxlfoundation/oneDNN/releases/tag/v3.2",
+      "provenance": "The DLL's version resource reads \"3.2.0 (04b180b9a58a78cf1a1cd2329671a5060c2be8de)\", the commit tagged v3.2 upstream. oneDNN publishes no prebuilt Windows binary, so the SHA-256 is recorded but not compared against an upstream artifact.",
+      "files": [
+        {
+          "path": "runtimes/win-x64/native/dnnl.dll",
+          "size": 28629512,
+          "sha256": "3836587f9c5f5e7d5fab2a03693ef9726f390d99adc368039afee44f56391bc1"
+        }
+      ]
+    }
+  ]
+}
