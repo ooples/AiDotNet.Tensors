@@ -61,12 +61,7 @@ internal sealed class OnnxGraphWriter<T> where T : unmanaged
         IndexReaders(steps, outputs.Values);
 
         var translator = new OnnxStepTranslator<T>(this);
-        var unsupported = new List<string>();
-        foreach (var step in steps.Where(s => !translator.CanTranslate(s)))
-        {
-            if (!unsupported.Contains(step.OpName))
-                unsupported.Add(step.OpName);
-        }
+        var unsupported = steps.Where(s => !translator.CanTranslate(s)).Select(s => s.OpName).Distinct().ToList();
         if (unsupported.Count > 0)
             throw new NotSupportedException(
                 "The plan contains operations with no ONNX translation: " + string.Join(", ", unsupported) + ".");
