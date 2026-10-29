@@ -38958,7 +38958,10 @@ public partial class CpuEngine : ITensorLevelEngine
         using var destinationKeep24 = new KeepAliveScope(destination);
         var sourceSpan = source.AsSpanUnmarked().Slice(0, source.Length);
         var destinationSpan = destination.AsWritableSpanUnmarked();
-        if (typeof(T) == typeof(float) && source.Length >= ParallelCopyMinElements)
+        // Disjoint spans only: CopyTo is a memmove, but chunks copied in parallel are not when views of one storage
+        // overlap at an offset.
+        if (typeof(T) == typeof(float) && source.Length >= ParallelCopyMinElements
+            && !((ReadOnlySpan<T>)sourceSpan).Overlaps(destinationSpan))
         {
             if (destinationSpan.Length < sourceSpan.Length)
                 throw new ArgumentException("Destination is shorter than the source.", nameof(destination));

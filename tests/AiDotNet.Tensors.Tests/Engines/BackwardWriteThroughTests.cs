@@ -32,6 +32,20 @@ public sealed class BackwardWriteThroughTests
         Assert.Equal(source.ToArray(), destination.ToArray());
     }
 
+    [Fact]
+    public void LargeTensorCopy_BetweenOverlappingViews_IsAMove()
+    {
+        // Two views of one storage, the destination one element ahead: copied chunk by chunk, every chunk's last write
+        // would land on the next chunk's first source element before it is read.
+        const int length = 3 * 262144 + 12345;
+        var original = Rand(5, length + 1);
+        var storage = new Tensor<float>((float[])original.Clone(), new[] { length + 1 });
+        new CpuEngine().TensorCopy(storage.Slice(0, 0, length), storage.Slice(0, 1, length + 1));
+        var actual = storage.ToArray();
+        for (int i = 0; i < length; i++)
+            Assert.True(actual[i + 1] == original[i], $"[{i + 1}]: {actual[i + 1]}, expected {original[i]}");
+    }
+
     [Theory]
     [InlineData(4, 32, 16, 8, 8)]
     [InlineData(3, 24, 40, 4, 4)]
