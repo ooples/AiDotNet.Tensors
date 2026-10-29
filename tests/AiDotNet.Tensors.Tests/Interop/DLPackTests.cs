@@ -37,7 +37,7 @@ public sealed class DLPackTests
         public float* Data { get; }
 
         public FakeProducer(float[] values, long[] shape, long[]? strides, uint major = 1, uint minor = 3,
-            ulong flags = 0, bool versioned = true, byte code = 2, byte bits = 32)
+            ulong flags = 0, bool versioned = true, byte code = 2, byte bits = 32, int deviceType = 1, int deviceId = 0)
         {
             int header = versioned ? sizeof(DLManagedTensorVersionedLayout) : sizeof(DLManagedTensorLayout);
             Block = Marshal.AllocHGlobal(header + 16 * shape.Length + 4 * values.Length + 64);
@@ -50,8 +50,8 @@ public sealed class DLPackTests
             var tensor = new DLTensorLayout
             {
                 Data = (IntPtr)Data,
-                DeviceType = 1,
-                DeviceId = 0,
+                DeviceType = deviceType,
+                DeviceId = deviceId,
                 NDim = shape.Length,
                 Code = code,
                 Bits = bits,
@@ -118,8 +118,10 @@ public sealed class DLPackTests
 
     private static unsafe DLManagedTensorVersionedLayout ReadVersioned(IntPtr p) => *(DLManagedTensorVersionedLayout*)p;
 
-    private static void CallDeleter(IntPtr deleter, IntPtr self)
-        => Marshal.GetDelegateForFunctionPointer<Deleter>(deleter)(self);
+    // A raw unmanaged call, as a C consumer makes it (a delegate cast fails on .NET Framework when the pointer came
+    // from a managed delegate of another type).
+    private static unsafe void CallDeleter(IntPtr deleter, IntPtr self)
+        => ((delegate* unmanaged[Cdecl]<IntPtr, void>)deleter)(self);
 
     private static Tensor<float> Iota(params int[] shape)
     {
@@ -387,6 +389,105 @@ public sealed class DLPackTests
         Assert.Equal(DLPackStream.PerThreadDefault, DLPackStream.FromHandle(new IntPtr(2)));
         Assert.Equal(DLPackStream.LegacyDefault, DLPackStream.Default);   // stream=None means the legacy default
         Assert.True(DLPackStream.NoSync.IsNoSync);
+    }
+
+    [Fact]
+    public void Cpu_UnsignedAndBoolElementTypes_RoundTrip()
+    {
+        var bytes = new Tensor<byte>(new byte[] { 0, 7, 255 }, new[] { 3 });
+        using (var back = Tensor<byte>.FromDLPack(bytes.ToDLPack())) Assert.Equal(bytes.ToArray(), back.ToArray());
+        var ushorts = new Tensor<ushort>(new ushort[] { 0, 9, ushort.MaxValue }, new[] { 3 });
+        using (var back = Tensor<ushort>.FromDLPack(ushorts.ToDLPack())) Assert.Equal(ushorts.ToArray(), back.ToArray());
+        var uints = new Tensor<uint>(new[] { 0u, 11u, uint.MaxValue }, new[] { 3 });
+        using (var back = Tensor<uint>.FromDLPack(uints.ToDLPack())) Assert.Equal(uints.ToArray(), back.ToArray());
+        var ulongs = new Tensor<ulong>(new[] { 0ul, 13ul, ulong.MaxValue }, new[] { 3 });
+        using (var back = Tensor<ulong>.FromDLPack(ulongs.ToDLPack())) Assert.Equal(ulongs.ToArray(), back.ToArray());
+        var bools = new Tensor<bool>(new[] { true, false, true }, new[] { 3 });
+        using (var back = Tensor<bool>.FromDLPack(bools.ToDLPack())) Assert.Equal(bools.ToArray(), back.ToArray());
+    }
+
+    [Fact]
+    public void Export_OfAnElementTypeWithNoDLPackCode_Throws()
+    {
+        var t = new Tensor<decimal>(new[] { 1m, 2m }, new[] { 2 });
+        Assert.Throws<NotSupportedException>(() => t.ToDLPack());
+        Assert.Throws<NotSupportedException>(() => Tensor<decimal>.FromDLPack(Iota(2).ToDLPack()));
+    }
+
+    [Fact]
+    public void Export_OfAPackedLayout_Throws_UntilReorderedToNchw()
+    {
+        var engine = new CpuEngine();
+        var packed = engine.ReorderToNchwc(Iota(1, 8, 2, 2), TensorLayout.Nchwc8);
+        Assert.Throws<InvalidOperationException>(() => packed.ToDLPack());
+        using var back = Tensor<float>.FromDLPack(engine.ReorderToNchw(packed).ToDLPack());
+        Assert.Equal(Iota(1, 8, 2, 2).ToArray(), back.ToArray());
+    }
+
+    [Fact]
+    public void Import_OfAnUnsupportedDevice_CallsTheDeleter_AndThrows()
+    {
+        using var producer = new FakeProducer(new float[] { 1 }, new long[] { 1 }, new long[] { 1 }, deviceType: 4);   // kDLOpenCL
+        Assert.Throws<NotSupportedException>(() => Tensor<float>.FromDLPack(producer.Block));
+        Assert.Equal(1, producer.Calls);
+    }
+
+    [Fact]
+    public void Import_WithANegativeExtent_CallsTheDeleter_AndThrows()
+    {
+        using var producer = new FakeProducer(new float[] { 1 }, new long[] { -1 }, new long[] { 1 });
+        Assert.Throws<ArgumentException>(() => Tensor<float>.FromDLPack(producer.Block));
+        Assert.Equal(1, producer.Calls);
+    }
+
+    /// <summary>
+    /// A kDLCUDA capsule the CUDA import cannot take is refused before any device memory is touched, on every machine:
+    /// a non-float element type, a strided layout, the read-only flag, and a device no active CUDA backend runs on
+    /// (ordinal 7). Each refusal still runs the producer's deleter.
+    /// </summary>
+    [Fact]
+    public void CudaImport_RefusesWhatItCannotTake_AndCallsTheDeleter()
+    {
+        const int kDLCUDA = 2;
+        using (var asDouble = new FakeProducer(new float[] { 1, 2 }, new long[] { 1 }, new long[] { 1 }, code: 2, bits: 64, deviceType: kDLCUDA))
+        {
+            Assert.Throws<NotSupportedException>(() => Tensor<double>.FromDLPack(asDouble.Block));
+            Assert.Equal(1, asDouble.Calls);
+        }
+        using (var strided = new FakeProducer(new float[4], new long[] { 2, 2 }, new long[] { 1, 2 }, deviceType: kDLCUDA))
+        {
+            Assert.Throws<NotSupportedException>(() => Tensor<float>.FromDLPack(strided.Block));
+            Assert.Equal(1, strided.Calls);
+        }
+        using (var readOnly = new FakeProducer(new float[2], new long[] { 2 }, new long[] { 1 }, flags: 1, deviceType: kDLCUDA))
+        {
+            Assert.Throws<NotSupportedException>(() => Tensor<float>.FromDLPack(readOnly.Block));
+            Assert.Equal(1, readOnly.Calls);
+        }
+        using (var otherDevice = new FakeProducer(new float[2], new long[] { 2 }, new long[] { 1 }, deviceType: kDLCUDA, deviceId: 7))
+        {
+            Assert.Throws<NotSupportedException>(() => Tensor<float>.FromDLPack(otherDevice.Block));
+            Assert.Equal(1, otherDevice.Calls);
+        }
+        Assert.Throws<NotSupportedException>(() => DLPack.GetCudaConsumerStream(7));
+    }
+
+    [Fact]
+    public void Stream_EqualityAndNames_FollowTheCudaHandle()
+    {
+        var handle = DLPackStream.FromHandle(new IntPtr(0x30));
+        Assert.Equal("0x30", handle.ToString());
+        Assert.Equal("LegacyDefault", DLPackStream.LegacyDefault.ToString());
+        Assert.Equal("PerThreadDefault", DLPackStream.PerThreadDefault.ToString());
+        Assert.Equal("NoSync", DLPackStream.NoSync.ToString());
+        Assert.True(handle == DLPackStream.FromHandle(new IntPtr(0x30)));
+        Assert.True(handle != DLPackStream.PerThreadDefault);
+        Assert.True(handle.Equals((object)DLPackStream.FromHandle(new IntPtr(0x30))));
+        Assert.False(handle.Equals("0x30"));
+        Assert.Equal(handle.GetHashCode(), DLPackStream.FromHandle(new IntPtr(0x30)).GetHashCode());
+        // stream=None (Default) and the legacy default name the same CUDA stream.
+        Assert.True(DLPackStream.Default == DLPackStream.LegacyDefault);
+        Assert.False(DLPackStream.NoSync == DLPackStream.Default);
     }
 
     // ── CUDA ────────────────────────────────────────────────────────────────────────────────────────────────────

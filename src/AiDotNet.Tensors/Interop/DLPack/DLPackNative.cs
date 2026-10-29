@@ -99,18 +99,20 @@ internal static class DLPackNative
     }
 
 #if !NET5_0_OR_GREATER
+    /// <summary>The export deleter's delegate type on targets without UnmanagedCallersOnly.</summary>
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate void DeleterFn(IntPtr self);
 #endif
 
-    /// <summary>Calls a producer's C deleter on <paramref name="self"/>.</summary>
+    /// <summary>
+    /// Calls a producer's C deleter on <paramref name="self"/>, as a raw unmanaged call on every target. On .NET
+    /// Framework, GetDelegateForFunctionPointer on a pointer that came from a managed delegate hands back that delegate
+    /// and throws InvalidCastException when its type is not the one asked for, so a capsule from another managed
+    /// producer could never be released there.
+    /// </summary>
     internal static unsafe void InvokeDeleter(IntPtr deleter, IntPtr self)
     {
         if (deleter == IntPtr.Zero) return;
-#if NET5_0_OR_GREATER
         ((delegate* unmanaged[Cdecl]<IntPtr, void>)deleter)(self);
-#else
-        Marshal.GetDelegateForFunctionPointer<DeleterFn>(deleter)(self);
-#endif
     }
 }
