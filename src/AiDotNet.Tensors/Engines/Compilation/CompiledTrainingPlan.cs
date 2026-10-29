@@ -236,6 +236,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
     }
 
+    // Forward outputs sharing arrays by forward liveness (PoolForwardOnlyOutputs).
+    private int _pooledForwardOutputs;
+
+    /// <summary>Test hook: how many forward-only outputs share arrays under forward-output pooling.</summary>
+    internal int PooledForwardOutputCount => _pooledForwardOutputs;
+
     /// <summary>Test hook: AvgPool2D backwards this thread ran straight into the gradient buffer.</summary>
     [ThreadStatic] private static int t_directAvgPoolBackwards;
     internal static int DirectAvgPoolBackwardsOnThisThread => t_directAvgPoolBackwards;
@@ -8927,6 +8933,24 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 convEpilogueDeadInternals);
         }
 
+        // Forward-only outputs (no backward reads them) share arrays by forward liveness; see PoolForwardOnlyOutputs.
+        // Before any forward or backward specialization captures an array; tensors a fusion builder above captured are
+        // excluded. AIDOTNET_COMPILED_FORWARD_POOL=0 turns it off.
+        int pooledForwardOutputs = 0;
+        if ((typeof(T) == typeof(float) || typeof(T) == typeof(double)) && !useGradPool && !preferGenericForGpu
+            && !engine.SupportsGpu && fp16HeteroOrder is null
+            && Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_FORWARD_POOL") != "0")
+        {
+            var fusedAway = new HashSet<int>(fusedStepIndices);
+            fusedAway.UnionWith(skippableReduceSumIndices);
+            fusedAway.UnionWith(skippableReduceSumForwardIndices);
+            fusedAway.UnionWith(consumedBySlicePrefix);
+            fusedAway.UnionWith(analyticForwardSpecs.Keys);
+            fusedAway.UnionWith(slicePrefixForwardSpecs.Keys);
+            pooledForwardOutputs = PoolForwardOnlyOutputs(forwardSteps, parameters, explicitLoss, fusedAway,
+                consumedByConvEpilogue, convEpilogueChains);
+        }
+
         // Track GCHandles for cleanup on Dispose
         var pinnedHandles = new List<GCHandle>();
 
@@ -9565,6 +9589,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             scope.ReleaseStorageLeases();
             DropStorageOfRemovedOutputs(scope.Nodes, optimized, forwardSteps, parameters);
             plan.ReleaseFusedChainInternals(convEpilogueDeadInternals);
+        plan._pooledForwardOutputs = pooledForwardOutputs;
             return plan;
         }
         finally
@@ -9573,6 +9598,124 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
     }
 
+    /// <summary>
+    /// Forward-output pooling. A step output that no backward reads is needed only from the step that writes it to its
+    /// last forward reader, as PyTorch frees such an intermediate once it is consumed. Those outputs share arrays when
+    /// their forward lifetimes do not overlap (the gradient pool's linear scan, over forward positions). Read by no
+    /// backward means: written by a convolution, a bias-only fused convolution chain, a channel-bias add, an add, a
+    /// concatenation or an average pool (backwards that read their inputs and the gradient, never their output), and
+    /// read only by a concatenation, an add, an average pool, a channel-bias add or a sum (backwards that read only the
+    /// gradient). On DenseNet-121 these are each dense layer's new features (copied into the next concatenation) and
+    /// each transition's convolution (only average-pooled). Excluded: steps a fusion builder captured arrays for,
+    /// tensors a step keeps in its saved state, parameters, the loss, outputs nothing reads, in-place targets and
+    /// tensors whose storage another tensor shares (a view). The tensors keep their shapes; after a step their values
+    /// are whatever the array's last tenant wrote. Returns how many outputs share arrays.
+    /// </summary>
+    private static int PoolForwardOnlyOutputs(List<CompiledStep<T>> forwardSteps, Tensor<T>[] parameters,
+        Tensor<T>? explicitLoss, HashSet<int> fusedAway, HashSet<int> consumedByConvEpilogue,
+        Dictionary<int, int[]> convEpilogueChains)
+    {
+        const int MinPooledLength = 1 << 16;
+        int n = forwardSteps.Count;
+        // Where each output is written: a fused convolution chain writes its bias add (and ReLU) output at its convolution.
+        var emit = new int[n];
+        for (int i = 0; i < n; i++) emit[i] = i;
+        var chainOutputs = new Dictionary<int, bool>();   // a chain's last forward step -> whether it ends in a ReLU
+        foreach (var covered in convEpilogueChains.Values)
+        {
+            int conv = covered[0], last = -1;
+            bool relu = false;
+            foreach (int s in covered.Where(s => s != conv && consumedByConvEpilogue.Contains(s)))
+            {
+                emit[s] = conv;
+                last = Math.Max(last, s);
+                relu |= forwardSteps[s].OpType == OpType.ReLU;
+            }
+            if (last >= 0) chainOutputs[last] = relu;
+        }
+
+        var tensorComparer = ReferenceEqualityComparer<Tensor<T>>.Instance;
+        var readers = new Dictionary<Tensor<T>, List<int>>(tensorComparer);
+        var producers = new Dictionary<Tensor<T>, int>(tensorComparer);
+        var unsafeTensors = new HashSet<Tensor<T>>(parameters, tensorComparer);
+        if (explicitLoss is not null) unsafeTensors.Add(explicitLoss);
+        var storageUsers = new Dictionary<object, int>(ReferenceEqualityComparer<object>.Instance);
+        var seen = new HashSet<Tensor<T>>(tensorComparer);
+        void Count(Tensor<T> t)
+        {
+            if (seen.Add(t)) storageUsers[t._storage] = storageUsers.TryGetValue(t._storage, out int u) ? u + 1 : 1;
+        }
+        foreach (var p in parameters) Count(p);
+        for (int i = 0; i < n; i++)
+        {
+            var step = forwardSteps[i];
+            Count(step.OutputBuffer);
+            // A second writer (an in-place op) extends the lifetime past this model.
+            if (producers.ContainsKey(step.OutputBuffer)) unsafeTensors.Add(step.OutputBuffer);
+            else producers[step.OutputBuffer] = i;
+            foreach (var input in step.Inputs)
+            {
+                if (input is null) continue;
+                Count(input);
+                if (ReferenceEquals(input, step.OutputBuffer)) unsafeTensors.Add(input);
+                if (!readers.TryGetValue(input, out var list)) readers[input] = list = new List<int>();
+                list.Add(i);
+            }
+            if (step.SavedState is { } saved)
+                foreach (var t in saved.OfType<Tensor<T>>()) unsafeTensors.Add(t);
+        }
+
+        bool IsChainMember(int s) => consumedByConvEpilogue.Contains(s) || convEpilogueChains.Values.Any(c => c[0] == s);
+        bool BackwardIgnoresOutput(int s)
+        {
+            if (chainOutputs.TryGetValue(s, out bool relu)) return !relu;
+            if (IsChainMember(s)) return false;
+            var step = forwardSteps[s];
+            return step.OpType is OpType.Conv2D or OpType.TensorAdd or OpType.AvgPool2D
+                || step.OpName is "Concatenate" or "Concat" or "TensorChannelBiasAdd";
+        }
+        bool BackwardIgnoresInputs(int s)
+        {
+            if (IsChainMember(s)) return false;
+            var step = forwardSteps[s];
+            return step.OpType is OpType.TensorAdd or OpType.AvgPool2D or OpType.ReduceSum
+                || step.OpName is "Concatenate" or "Concat" or "TensorChannelBiasAdd";
+        }
+
+        var tenants = new List<Tensor<T>>();
+        var start = new List<int>();
+        var end = new List<int>();
+        foreach (var produced in producers)
+        {
+            var output = produced.Key;
+            int i = produced.Value;
+            if (fusedAway.Contains(i) || unsafeTensors.Contains(output) || output.Length < MinPooledLength
+                || !output.IsContiguous || output.IsView || output._storageOffset != 0
+                || storageUsers[output._storage] != 1 || !BackwardIgnoresOutput(i)
+                || !readers.TryGetValue(output, out var outputReaders))
+                continue;
+            if (outputReaders.Any(r => fusedAway.Contains(r) || !BackwardIgnoresInputs(r)))
+                continue;
+            tenants.Add(output);
+            start.Add(emit[i]);
+            end.Add(outputReaders.Max(r => emit[r]));
+        }
+        if (tenants.Count < 2) return 0;
+
+        var order = Enumerable.Range(0, tenants.Count)
+            .OrderBy(t => start[t]).ThenBy(t => end[t]).ToList();
+        var arrayOf = AssignPooledArrays(order, start.ToArray(), end.ToArray(), tenants, out var capacity);
+        if (capacity.Count == tenants.Count) return 0;   // nothing shares an array
+        var arrays = new T[capacity.Count][];
+        for (int b = 0; b < arrays.Length; b++) arrays[b] = new T[capacity[b]];
+        foreach (int t in order)
+        {
+            var output = tenants[t];
+            using (var view = Tensor<T>.FromMemory(new Memory<T>(arrays[arrayOf[t]], 0, output.Length), (int[])output._shape.Clone()))
+                output.RebindStorageFrom(view);
+        }
+        return tenants.Count;
+    }
     /// <summary>
     /// Frees the storage of traced tensors the compiled plan never computes or reads: outputs of recorded nodes the
     /// optimization passes removed (a fused BatchNorm's normalized output). The trace's tensor objects stay referenced
