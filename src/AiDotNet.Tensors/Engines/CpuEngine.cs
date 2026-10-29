@@ -3567,8 +3567,12 @@ public partial class CpuEngine : ITensorLevelEngine
                 {
                     // A float add on the CPU writes the recorded output directly: the eager op's result was an
                     // activation-sized temporary per convolution, garbage the moment it was copied in.
+                    // Only CPU-backed operands: a bias or input another engine left resident on a device has no array.
                     if (typeof(T) == typeof(float) && engine is CpuEngine cpuEngine && !engine.SupportsGpu
-                        && capturedInput.IsContiguous && capturedBias.IsContiguous && output.IsContiguous)
+                        && capturedInput.IsContiguous && capturedBias.IsContiguous && output.IsContiguous
+                        && capturedInput.GetCpuBackingForStridedRead(out _) is not null
+                        && capturedBias.GetCpuBackingForStridedRead(out _) is not null
+                        && output.GetCpuBackingForContiguousWrite(out _) is not null)
                     {
                         cpuEngine.ChannelBiasActivationInto((Tensor<float>)(object)output,
                             (Tensor<float>)(object)capturedInput, (Tensor<float>)(object)capturedBias, relu: false);
@@ -18629,6 +18633,41 @@ public partial class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    /// <summary>
+    /// Adds each output cell's gradient, divided by its window's count, into the input cells its window read, for
+    /// <paramref name="planes"/> (batch x channel) planes in parallel. Accumulates: a caller that overwrites clears the
+    /// input gradient first. The eager op and the compiled plan's backward (straight into its gradient buffer) share it.
+    /// </summary>
+    internal static void AvgPool2DBackwardFloat(float[] gradOut, int gradOutOffset, float[] gradIn, int gradInOffset,
+        int planes, int height, int width, int outputHeight, int outputWidth, int poolH, int poolW,
+        int strideH, int strideW, int padH, int padW, bool countIncludePad)
+    {
+        CpuParallelSettings.ParallelForOrSerial(0, planes, (long)planes * height * width, [MethodImpl(Hot)] (p) =>
+        {
+            int inputBaseOffset = gradInOffset + p * height * width;
+            int outputBaseOffset = gradOutOffset + p * outputHeight * outputWidth;
+            for (int oh = 0; oh < outputHeight; oh++)
+            {
+                int ihStart = oh * strideH - padH;
+                int khStart = Math.Max(0, -ihStart), khEnd = Math.Min(poolH, height - ihStart);
+                for (int ow = 0; ow < outputWidth; ow++)
+                {
+                    int iwStart = ow * strideW - padW;
+                    int kwStart = Math.Max(0, -iwStart), kwEnd = Math.Min(poolW, width - iwStart);
+                    int covered = Math.Max(0, khEnd - khStart) * Math.Max(0, kwEnd - kwStart);
+                    if (covered == 0) continue;
+                    float grad = gradOut[outputBaseOffset + oh * outputWidth + ow]
+                        * (1f / (countIncludePad ? poolH * poolW : covered));
+                    for (int kh = khStart; kh < khEnd; kh++)
+                    {
+                        int row = inputBaseOffset + (ihStart + kh) * width + iwStart;
+                        for (int kw = kwStart; kw < kwEnd; kw++) gradIn[row + kw] += grad;
+                    }
+                }
+            }
+        }, deterministicSafe: true);
+    }
+
     /// <inheritdoc/>
     public virtual Tensor<T> AvgPool2DBackward<T>(Tensor<T> gradOutput, int[] inputShape, int[] poolSize, int[] stride,
         int[]? padding = null, bool countIncludePad = false)
@@ -18674,32 +18713,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float))
         {
             var fGradIn = (float[])(object)gradInputData;
-            var fGradOut = (float[])(object)gradOutputData;
             Array.Clear(fGradIn, 0, fGradIn.Length);
-            CpuParallelSettings.ParallelForOrSerial(0, batch * channels, fGradIn.Length, [MethodImpl(Hot)] (p) =>
-            {
-                int inputBaseOffset = p * height * width;
-                int outputBaseOffset = p * outputHeight * outputWidth;
-                for (int oh = 0; oh < outputHeight; oh++)
-                {
-                    int ihStart = oh * strideH - padH;
-                    int khStart = Math.Max(0, -ihStart), khEnd = Math.Min(poolH, height - ihStart);
-                    for (int ow = 0; ow < outputWidth; ow++)
-                    {
-                        int iwStart = ow * strideW - padW;
-                        int kwStart = Math.Max(0, -iwStart), kwEnd = Math.Min(poolW, width - iwStart);
-                        int covered = Math.Max(0, khEnd - khStart) * Math.Max(0, kwEnd - kwStart);
-                        if (covered == 0) continue;
-                        float grad = fGradOut[outputBaseOffset + oh * outputWidth + ow]
-                            * (1f / (countIncludePad ? poolH * poolW : covered));
-                        for (int kh = khStart; kh < khEnd; kh++)
-                        {
-                            int row = inputBaseOffset + (ihStart + kh) * width + iwStart;
-                            for (int kw = kwStart; kw < kwEnd; kw++) fGradIn[row + kw] += grad;
-                        }
-                    }
-                }
-            }, deterministicSafe: true);
+            AvgPool2DBackwardFloat((float[])(object)gradOutputData, 0, fGradIn, 0, batch * channels, height, width,
+                outputHeight, outputWidth, poolH, poolW, strideH, strideW, padH, padW, countIncludePad);
             return result;
         }
 

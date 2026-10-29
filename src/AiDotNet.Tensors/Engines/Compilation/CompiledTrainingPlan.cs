@@ -236,6 +236,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
     }
 
+    /// <summary>Test hook: AvgPool2D backwards this thread ran straight into the gradient buffer.</summary>
+    [ThreadStatic] private static int t_directAvgPoolBackwards;
+    internal static int DirectAvgPoolBackwardsOnThisThread => t_directAvgPoolBackwards;
+
     // Outputs inside fused Conv2D/bias/ReLU chains whose storage the plan released (ReleaseFusedChainInternals).
     private List<Tensor<T>>? _releasedChainInternals;
 
@@ -13582,11 +13586,32 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var gradIn = gradMap[input];
             bool accum = UnaryAccumulates(input);
             var capInShape = (int[])input._shape.Clone();
+            bool direct = typeof(T) == typeof(float) && engine is CpuEngine && !engine.SupportsGpu
+                && input.Rank == 4 && output.Rank == 4;
             return eng =>
             {
-                var grad = eng.AvgPool2DBackward(gradOut, capInShape, poolSize, poolStride);
-                if (accum) eng.TensorAddInto(gradIn, gradIn, grad);
-                else grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                // A float plan on the CPU spreads the gradient straight into the input-gradient buffer. The eager op
+                // rented a fresh input-sized result every step (a large-object-heap array per transition layer) to
+                // copy or add in. The arrays are fetched each step: a pooled gradient's array is assigned after build.
+                if (direct && eng is CpuEngine && !eng.SupportsGpu && gradOut.IsContiguous && gradIn.IsContiguous
+                    && (object?)gradOut.GetCpuBackingForStridedRead(out int goOff) is float[] go
+                    && (object?)gradIn.GetCpuBackingForContiguousWrite(out int giOff) is float[] gi
+                    && go.Length - goOff >= gradOut.Length && gi.Length - giOff >= gradIn.Length)
+                {
+                    using var gradOutKeep = new KeepAliveScope(gradOut);
+                    using var gradInKeep = new KeepAliveScope(gradIn);
+                    t_directAvgPoolBackwards++;
+                    if (!accum) Array.Clear(gi, giOff, gradIn.Length);
+                    CpuEngine.AvgPool2DBackwardFloat(go, goOff, gi, giOff, capInShape[0] * capInShape[1],
+                        capInShape[2], capInShape[3], output._shape[2], output._shape[3], poolSize[0], poolSize[1],
+                        poolStride[0], poolStride[1], 0, 0, countIncludePad: false);
+                }
+                else
+                {
+                    var grad = eng.AvgPool2DBackward(gradOut, capInShape, poolSize, poolStride);
+                    if (accum) eng.TensorAddInto(gradIn, gradIn, grad);
+                    else grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                }
                 input.Grad = gradIn;
             };
         }
