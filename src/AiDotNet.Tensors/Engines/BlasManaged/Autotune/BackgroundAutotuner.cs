@@ -126,7 +126,7 @@ internal static class BackgroundAutotuner
             Priority = ThreadPriority.BelowNormal,
             Name = "AiDotNet-BlasAutotuner",
         };
-        t.Start();
+        DetachedThread.Start(t);
     }
 
     [MethodImpl(Hot)]
