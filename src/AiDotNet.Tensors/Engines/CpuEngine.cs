@@ -3565,6 +3565,15 @@ public partial class CpuEngine : ITensorLevelEngine
                 input._shape,
                 (engine, output) =>
                 {
+                    // A float add on the CPU writes the recorded output directly: the eager op's result was an
+                    // activation-sized temporary per convolution, garbage the moment it was copied in.
+                    if (typeof(T) == typeof(float) && engine is CpuEngine cpuEngine && !engine.SupportsGpu
+                        && capturedInput.IsContiguous && capturedBias.IsContiguous && output.IsContiguous)
+                    {
+                        cpuEngine.ChannelBiasActivationInto((Tensor<float>)(object)output,
+                            (Tensor<float>)(object)capturedInput, (Tensor<float>)(object)capturedBias, relu: false);
+                        return;
+                    }
                     var eager = engine.TensorChannelBiasAdd(capturedInput, capturedBias);
                     DirectGpuTensorEngine.CopyResultInto(engine, eager, output);
                 },
@@ -25946,6 +25955,9 @@ public partial class CpuEngine : ITensorLevelEngine
         // of every network with a training-mode BatchNorm (CUDA 900).
         var statistic = scope.RecordUnary(LazyNodeType.Custom, opName, batchNormOutput, refreshedStatistic._shape,
             (eng, output) => DirectGpuTensorEngine.CopyResultInto(eng, refreshedStatistic, output));
+        // A BatchNorm the trace left unrealized has no statistics yet: the statistic stays lazy too (a read realizes the
+        // BatchNorm, then copies). Writing it here would realize the statistic node, and through it the whole forward.
+        if (batchNormOutput.LazySource is { IsRealized: false }) return statistic;
         using var refreshedStatisticKeep2 = new KeepAliveScope(refreshedStatistic);
         using var statisticKeep1 = new KeepAliveScope(statistic);
         refreshedStatistic.AsSpanUnmarked().CopyTo(statistic.AsWritableSpanUnmarked());
@@ -26060,33 +26072,12 @@ public partial class CpuEngine : ITensorLevelEngine
                     },
                     BackwardFunctions<T>.BatchNormBackward, new object[] { mean, variance, epsilon });
                 using var lazyResultKeep1 = new KeepAliveScope(lazyResult);
-                if (eagerResult is null)
-                {
-                    var traceScope = GraphMode.Current;
-                    GraphMode.SetCurrent(null);
-                    try
-                    {
-                        if (TryBatchNormTrainingFloatInto(ci, cg, cb, ce, lazyResult, capturedMean, capturedVar))
-                        {
-                            // The values are in place: a read must not realize the node and normalize a second time.
-                            if (lazyResult.LazySource is LazyNode<T> recorded) recorded.IsRealized = true;
-                        }
-                        else
-                        {
-                            // A layout the direct kernel declines: the eager normalization, copied in.
-                            var fallback = BatchNorm(ci, cg, cb, ce, out var fallbackMean, out var fallbackVar);
-                            fallback.AsSpanUnmarked().CopyTo(lazyResult.AsWritableSpanUnmarked());
-                            fallbackMean.AsSpanUnmarked().CopyTo(capturedMean.AsWritableSpanUnmarked());
-                            fallbackVar.AsSpanUnmarked().CopyTo(capturedVar.AsWritableSpanUnmarked());
-                            Helpers.TensorAllocator.Return(fallback);
-                        }
-                    }
-                    finally
-                    {
-                        GraphMode.SetCurrent(traceScope);
-                    }
-                }
-                else
+                // The direct path leaves the node unrealized, like every other recorded op: a read realizes it (and its
+                // statistics outputs below realize it first). Normalizing here made the trace compute its whole forward,
+                // which wrote every recorded output - including the ones the compiled plan then drops (a fused
+                // BatchNorm's normalized output, a fused convolution chain's raw output): on DenseNet-121, 1.5 GB of
+                // arrays paged in at compile only to be freed, the training run's peak resident memory.
+                if (eagerResult is not null)
                 {
                     using var eagerResultKeep1 = new KeepAliveScope(eagerResult);
                     eagerResult.AsSpanUnmarked().CopyTo(lazyResult.AsWritableSpanUnmarked());
