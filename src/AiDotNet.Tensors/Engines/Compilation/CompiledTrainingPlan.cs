@@ -9225,7 +9225,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (!useGradPool && genericBackwardCount > 0 && genericBackwardSteps.Count > 0)
         {
             var genericConsumers = new Dictionary<Tensor<T>, int>();
-            foreach (var genericStep in genericBackwardSteps.Concat(firstWriteClaimingSteps))
+            // A consumer with no backward writes no gradient, so it cannot disturb a first write either: a BatchNorm's
+            // batch-statistic nodes read its output only to order themselves after it. Counting them as foreign
+            // writers kept every training BatchNorm output's gradient zeroed each step: 315M floats on DenseNet-121.
+            var nonWritingSteps = forwardSteps.Where(s => s.BackwardFn == null);
+            foreach (var genericStep in genericBackwardSteps.Concat(firstWriteClaimingSteps).Concat(nonWritingSteps))
             {
                 foreach (var inp in genericStep.Inputs)
                     genericConsumers[inp] = genericConsumers.TryGetValue(inp, out int seen) ? seen + 1 : 1;
@@ -12693,11 +12697,19 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var gradInput = gradMap[input];
             var gradGamma = gradMap[gammaT];
             var gradBeta = gradMap[betaT];
-            bool accumInput = consumerCount.ContainsKey(input) && consumerCount[input] > 1;
-            bool accumGamma = consumerCount.ContainsKey(gammaT) && consumerCount[gammaT] > 1;
-            bool accumBeta = consumerCount.ContainsKey(betaT) && consumerCount[betaT] > 1;
+            bool sharedInput = consumerCount.ContainsKey(input) && consumerCount[input] > 1;
+            bool sharedGamma = consumerCount.ContainsKey(gammaT) && consumerCount[gammaT] > 1;
+            bool sharedBeta = consumerCount.ContainsKey(betaT) && consumerCount[betaT] > 1;
+            // Claims each gradient's first write of the step, as the generic AccumulateGrad does, so a buffer this
+            // step shares with generic writers needs no per-step zeroing. DenseNet's running concatenation feeds both
+            // its layer's batch norm and the next concatenation; while this writer neither claimed nor respected
+            // first writes, every such buffer was zeroed each step: 505M floats (2 GB) per DenseNet-121 step.
+            if (claimsFirstWrite is not null) claimsFirstWrite.Value = true;
             return eng =>
             {
+                bool accumInput = AccumulatesInto(gradInput, sharedInput);
+                bool accumGamma = AccumulatesInto(gradGamma, sharedGamma);
+                bool accumBeta = AccumulatesInto(gradBeta, sharedBeta);
                 if (eng is CpuEngine cpu && !eng.SupportsGpu)
                 {
                     cpu.BatchNormBackwardInto(gradInput, gradGamma, gradBeta,
