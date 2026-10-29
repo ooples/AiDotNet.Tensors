@@ -12,8 +12,8 @@ name: GPU (CUDA, self-hosted)
 # Python 3 on the machine PATH; the job installs the .NET SDK into its workspace), with the labels `self-hosted, gpu, cuda`, then set the repository variable
 # CUDA_RUNNER_ENABLED=true. Until the variable is set every job is skipped, so nothing waits for a runner that does
 # not exist. Pull requests from forks never run here: a self-hosted runner must not execute untrusted code.
-# Until ooples/AiDotNet#2381 merges, also set AIDOTNET_HARNESS_REF to its branch: master's parity harness lacks most of
-# the model families, and the lane fails in its first minute saying so.
+# The model families come from AiDotNet master's parity harness; the repository variable AIDOTNET_HARNESS_REF points
+# the lane at another AiDotNet ref when a harness change needs testing before it merges.
 
 on:
   schedule:
@@ -96,7 +96,7 @@ jobs:
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         repository: ooples/AiDotNet
-        # The parity harness's model families come from ooples/AiDotNet#2381; until it merges, point this at its branch.
+        # The parity harness's model families (ooples/AiDotNet#2381); AIDOTNET_HARNESS_REF overrides master.
         ref: ${{ vars.AIDOTNET_HARNESS_REF || 'master' }}
         path: aidn
         persist-credentials: false
@@ -110,7 +110,7 @@ jobs:
         $families = 'mlp','cnn','lstm','transformer','gru','resnet18','resnet50','vgg11','mobilenetv2','densenet121','vit'
         $missing = $families | Where-Object { $program -notmatch ('"' + $_ + '"\s*=>') }
         if ($missing) {
-          Write-Output "::error::The AiDotNet parity harness at '${{ vars.AIDOTNET_HARNESS_REF || 'master' }}' does not define: $($missing -join ', '). Set the repository variable AIDOTNET_HARNESS_REF to a ref that does (ooples/AiDotNet#2381's branch until it merges)."
+          Write-Output "::error::The AiDotNet parity harness at '${{ vars.AIDOTNET_HARNESS_REF || 'master' }}' does not define: $($missing -join ', '). Set the repository variable AIDOTNET_HARNESS_REF to a ref that does, or unset it to use master."
           exit 1
         }
         "MODEL_FAMILIES=$($families -join ',')" | Out-File -Append -FilePath $env:GITHUB_ENV
