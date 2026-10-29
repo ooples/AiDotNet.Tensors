@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "package": "AiDotNet.Native.MoltenVK",
+  "description": "Inventory of every third-party native file this package redistributes: upstream version, licence and SHA-256. tools/Test-NativeManifest.ps1 checks it against the files on disk before release packing.",
+  "components": [
+    {
+      "name": "MoltenVK",
+      "supplier": "The Khronos Group (originally The Brenwill Workshop Ltd.)",
+      "version": "1.4.1",
+      "license": "Apache-2.0",
+      "licenseFile": "LICENSE.MoltenVK.txt",
+      "licenseSource": "https://raw.githubusercontent.com/KhronosGroup/MoltenVK/v1.4.1/LICENSE",
+      "upstream": "https://github.com/KhronosGroup/MoltenVK/releases/download/v1.4.1/MoltenVK-macos.tar",
+      "provenance": "libMoltenVK.dylib (a universal x86_64 + arm64 Mach-O binary, so the osx-x64 and osx-arm64 copies are identical) and MoltenVK_icd.json are byte-identical to MoltenVK/dynamic/dylib/macOS/ in the upstream v1.4.1 release archive (SHA-256 compared 2026-10-28).",
+      "files": [
+        {
+          "path": "runtimes/osx-arm64/native/libMoltenVK.dylib",
+          "size": 10645264,
+          "sha256": "d3ee87b2d98c0b7d5db7bcd1e51b010fe998f755f26c09a83768275499b7a398"
+        },
+        {
+          "path": "runtimes/osx-arm64/native/libvulkan.1.dylib",
+          "size": 10645264,
+          "sha256": "d3ee87b2d98c0b7d5db7bcd1e51b010fe998f755f26c09a83768275499b7a398",
+          "note": "Same bytes as libMoltenVK.dylib, installed under the Vulkan loader's library name so a Vulkan-loader lookup resolves to MoltenVK. It is not the Khronos Vulkan loader."
+        },
+        {
+          "path": "runtimes/osx-arm64/native/MoltenVK_icd.json",
+          "size": 179,
+          "sha256": "578ff08cd0d8734619357541771a5abc9c3470ca300030219a971a9e9dbbe466"
+        },
+        {
+          "path": "runtimes/osx-x64/native/libMoltenVK.dylib",
+          "size": 10645264,
+          "sha256": "d3ee87b2d98c0b7d5db7bcd1e51b010fe998f755f26c09a83768275499b7a398"
+        },
+        {
+          "path": "runtimes/osx-x64/native/libvulkan.1.dylib",
+          "size": 10645264,
+          "sha256": "d3ee87b2d98c0b7d5db7bcd1e51b010fe998f755f26c09a83768275499b7a398",
+          "note": "Same bytes as libMoltenVK.dylib, installed under the Vulkan loader's library name so a Vulkan-loader lookup resolves to MoltenVK. It is not the Khronos Vulkan loader."
+        },
+        {
+          "path": "runtimes/osx-x64/native/MoltenVK_icd.json",
+          "size": 179,
+          "sha256": "578ff08cd0d8734619357541771a5abc9c3470ca300030219a971a9e9dbbe466"
+        }
+      ]
+    }
+  ]
+}

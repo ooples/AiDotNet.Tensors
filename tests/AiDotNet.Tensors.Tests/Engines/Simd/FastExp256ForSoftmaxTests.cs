@@ -19,7 +19,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd;
 /// </summary>
 public class FastExp256ForSoftmaxTests
 {
-    [Theory]
+    [SkippableTheory]
     [InlineData(-5.0f)]
     [InlineData(-1.0f)]
     [InlineData(-0.1f)]
@@ -29,6 +29,9 @@ public class FastExp256ForSoftmaxTests
     [InlineData(5.0f)]
     public void MatchesMathFExpWithin1e3(float center)
     {
+        // The kernel is an AVX2+FMA intrinsic sequence with no portable form; every caller guards on both.
+        Skip.IfNot(System.Runtime.Intrinsics.X86.Avx2.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported,
+            "FastExp256ForSoftmax needs AVX2 and FMA");
         // Test 8 values clustered around center
         var values = new float[8];
         for (int i = 0; i < 8; i++) values[i] = center + (i - 4) * 0.05f;

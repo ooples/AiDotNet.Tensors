@@ -38,6 +38,14 @@
     <None Update="runtimes\**\*" CopyToOutputDirectory="PreserveNewest" Link="%(RecursiveDir)%(Filename)%(Extension)" />
   </ItemGroup>
 
+  <!-- Upstream licence text and the inventory (version, licence, SHA-256) of every redistributed
+       native file. No Exists() condition: a missing file must fail the pack, not ship a package
+       without its licence. -->
+  <ItemGroup>
+    <None Include="LICENSE.CLBlast.txt" Pack="true" PackagePath="\" />
+    <None Include="NATIVE-MANIFEST.json" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
   <!-- Build targets to copy native library -->
   <ItemGroup>
     <None Include="build\AiDotNet.Native.CLBlast.targets" Pack="true" PackagePath="build" />

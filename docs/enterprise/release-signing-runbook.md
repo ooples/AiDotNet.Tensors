@@ -1,7 +1,7 @@
 # Enterprise licensing — activation runbook (operator)
 
 The code is shipped and inert-by-default. This runbook is the **operator checklist**
-to turn each layer on. Everything here is done **once** by Ooples in a secure
+to turn each layer on. Everything here is done **once** by CrowdTrainer LLC in a secure
 environment; none of it can (or should) be automated by a code change, because it
 involves secrets and CA-issued certificates.
 
@@ -43,7 +43,7 @@ The release pipeline already has the signing step (`automated-release.yml` →
 
 ```bash
 # Acquire an OV (or EV) code-signing certificate from a CA (DigiCert, Sectigo, …)
-# issued to Ooples Finance LLC. Export it as a password-protected .pfx, then:
+# issued to CrowdTrainer LLC. Export it as a password-protected .pfx, then:
 base64 -w0 ooples-codesign.pfx > cert.b64          # macOS: base64 -i ooples-codesign.pfx | tr -d '\n'
 
 gh secret set CODE_SIGNING_CERT_BASE64    < cert.b64
