@@ -2604,10 +2604,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (variance == null) throw new ArgumentNullException(nameof(variance));
         // A float ReLU or ReLU6 clamps inside the batch-norm kernel: one pass over the activation instead of two
         // (MobileNetV2 and DenseNet run batch norm then an activation after almost every convolution).
-        if (typeof(T) == typeof(float) && !GraphMode.IsActive
-            && x.Rank == 4 && (activation == FusedActivationType.ReLU || activation == FusedActivationType.ReLU6)
-            && (x.Layout == LinearAlgebra.TensorLayout.Nchw
-                || (x.Layout == LinearAlgebra.TensorLayout.Nchwc8 && x._shape[1] % Simd.NchwcBatchNorm.CBlock == 0)))
+        bool clampable = activation == FusedActivationType.ReLU || activation == FusedActivationType.ReLU6;
+        bool fusedLayout = x.Rank == 4 && (x.Layout == LinearAlgebra.TensorLayout.Nchw
+            || (x.Layout == LinearAlgebra.TensorLayout.Nchwc8 && x._shape[1] % Simd.NchwcBatchNorm.CBlock == 0));
+        if (typeof(T) == typeof(float) && !GraphMode.IsActive && clampable && fusedLayout)
         {
             return (Tensor<T>)(object)BatchNormInferenceFloatClamped(
                 (Tensor<float>)(object)x, (Tensor<float>)(object)gamma, (Tensor<float>)(object)beta,
@@ -27064,7 +27064,7 @@ public partial class CpuEngine : ITensorLevelEngine
         float[] giF, int giOff, bool accumulateInput,
         float[] ggF, int ggOff, bool accumulateGamma, float[] gbF, int gbOff, bool accumulateBeta)
     {
-        float elemF = batch * spatialSize;
+        float elemF = (long)batch * spatialSize;
         CpuParallelSettings.ParallelForOrSerial(0, channels, (long)channels * batch * spatialSize, [MethodImpl(Hot)] (c) =>
         {
             float invStd = 1f / MathF.Sqrt(vaF[c] + epsF);
@@ -41123,11 +41123,6 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>
-    /// Writes the concatenation of contiguous, shape-validated <paramref name="tensors"/> along
-    /// <paramref name="axis"/> into <paramref name="destination"/> (row-major): for each index over the leading axes,
-    /// one block copy per input. Pure copies, bit-identical to the element-wise walk.
-    /// </summary>
-    /// <summary>
     /// <see cref="ConcatenateContiguousInto{T}"/> with the leading-index rows copied in parallel: each row of the output
     /// is the concatenation of one block per input, independent of every other row. DenseNet concatenates its growing
     /// feature map at every layer (a [32, 1024, 4, 4] map is 2 MB per call); the serial copy was 18% of a DenseNet-121
@@ -41170,6 +41165,11 @@ public partial class CpuEngine : ITensorLevelEngine
         return true;
     }
 
+    /// <summary>
+    /// Writes the concatenation of contiguous, shape-validated <paramref name="tensors"/> along
+    /// <paramref name="axis"/> into <paramref name="destination"/> (row-major): for each index over the leading axes,
+    /// one block copy per input. Pure copies, bit-identical to the element-wise walk.
+    /// </summary>
     private static void ConcatenateContiguousInto<T>(Tensor<T>[] tensors, int axis, Span<T> destination)
     {
         var firstShape = tensors[0]._shape;

@@ -8594,12 +8594,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // nodes, which read its output only to order themselves after it) write none. Only the backward's overwrite-or-
         // accumulate guards use this; forward fusion still sees every reader through consumerCount.
         var gradWriterCount = new Dictionary<Tensor<T>, int>();
-        foreach (var step in forwardSteps)
-        {
-            if (step.BackwardFn == null) continue;
+        foreach (var step in forwardSteps.Where(s => s.BackwardFn != null))
             foreach (var inp in step.Inputs)
                 gradWriterCount[inp] = gradWriterCount.TryGetValue(inp, out int writers) ? writers + 1 : 1;
-        }
 
         // Pre-allocate gradient buffers for all tensors
         var gradMap = new Dictionary<Tensor<T>, Tensor<T>>();
@@ -12715,9 +12712,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var gradInput = gradMap[input];
             var gradGamma = gradMap[gammaT];
             var gradBeta = gradMap[betaT];
-            bool sharedInput = consumerCount.ContainsKey(input) && consumerCount[input] > 1;
-            bool sharedGamma = consumerCount.ContainsKey(gammaT) && consumerCount[gammaT] > 1;
-            bool sharedBeta = consumerCount.ContainsKey(betaT) && consumerCount[betaT] > 1;
+            bool sharedInput = consumerCount.TryGetValue(input, out int inputConsumers) && inputConsumers > 1;
+            bool sharedGamma = consumerCount.TryGetValue(gammaT, out int gammaConsumers) && gammaConsumers > 1;
+            bool sharedBeta = consumerCount.TryGetValue(betaT, out int betaConsumers) && betaConsumers > 1;
             // Claims each gradient's first write of the step, as the generic AccumulateGrad does, so a buffer this
             // step shares with generic writers needs no per-step zeroing. DenseNet's running concatenation feeds both
             // its layer's batch norm and the next concatenation; while this writer neither claimed nor respected
