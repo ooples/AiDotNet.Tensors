@@ -8590,6 +8590,17 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             }
         }
 
+        // Consumers that can write a tensor's gradient: steps with no backward (a training BatchNorm's batch-statistic
+        // nodes, which read its output only to order themselves after it) write none. Only the backward's overwrite-or-
+        // accumulate guards use this; forward fusion still sees every reader through consumerCount.
+        var gradWriterCount = new Dictionary<Tensor<T>, int>();
+        foreach (var step in forwardSteps)
+        {
+            if (step.BackwardFn == null) continue;
+            foreach (var inp in step.Inputs)
+                gradWriterCount[inp] = gradWriterCount.TryGetValue(inp, out int writers) ? writers + 1 : 1;
+        }
+
         // Pre-allocate gradient buffers for all tensors
         var gradMap = new Dictionary<Tensor<T>, Tensor<T>>();
         var allGrads = new List<Tensor<T>>();
@@ -9004,7 +9015,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // runs on the GPU stream and the fixed sequence stays CUDA-graph-capturable.
             var claims = new System.Runtime.CompilerServices.StrongBox<bool>();
             var action = preferGenericForGpu ? null : BuildSpecializedBackward(step, gradMap, consumerCount, engine, pinnedHandles,
-                requiresGrad: requiresGradTensors, claimsFirstWrite: claims);
+                requiresGrad: requiresGradTensors, claimsFirstWrite: claims, gradWriterCount: gradWriterCount);
             if (action != null)
             {
                 backwardActions.Add(action);
@@ -11853,7 +11864,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         IEngine engine,
         List<GCHandle>? handleTracker = null,
         HashSet<Tensor<T>>? requiresGrad = null,
-        System.Runtime.CompilerServices.StrongBox<bool>? claimsFirstWrite = null)
+        System.Runtime.CompilerServices.StrongBox<bool>? claimsFirstWrite = null,
+        Dictionary<Tensor<T>, int>? gradWriterCount = null)
     {
         // claimsFirstWrite is set when the returned delegate writes each multi-consumer input's gradient through
         // AccumulatesInto (claiming the step's first write) rather than always adding into a zeroed buffer.
@@ -11871,8 +11883,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // takes several TensorSlices of one tensor, and the fused step kept only the last slice's gradient (conv
         // update cosine 0.25-0.5 against the eager tape and PyTorch). The generic backward accumulates, so a
         // multi-consumer unary step takes it.
+        // Readers with no backward do not count (gradWriterCount): a training BatchNorm's batch-statistic nodes read
+        // its output, which kept the ReLU after every training BatchNorm on the generic backward.
         if (step.Inputs.Length == 1
-            && consumerCount.TryGetValue(step.Inputs[0], out int unaryConsumers) && unaryConsumers > 1)
+            && (gradWriterCount ?? consumerCount).TryGetValue(step.Inputs[0], out int unaryConsumers) && unaryConsumers > 1)
             return null;
 
         // Specialized backward delegates capture raw zero-based arrays. Apply
@@ -12371,9 +12385,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             var gradOut = gradMap[output];
             var gradIn = gradMap[input];
+            // The sole gradient writer of its input (the guard above), so it overwrites and claims that write: the
+            // buffer then needs no per-step zeroing even when no-backward readers share the tensor.
+            if (claimsFirstWrite is not null) claimsFirstWrite.Value = true;
 
             return eng =>
             {
+                AccumulatesInto(gradIn, false);   // claims the first write; this backward always overwrites
                 var outputData = TryGetLiveFloatBacking(output) ?? throw new InvalidOperationException("ReLU backward: the forward output has no live host buffer.");
                 var gradOutData = TryGetLiveFloatBacking(gradOut) ?? throw new InvalidOperationException("ReLU backward: the output gradient has no live host buffer.");
                 var gradInData = TryGetLiveFloatBacking(gradIn) ?? throw new InvalidOperationException("ReLU backward: the input gradient has no live host buffer.");
