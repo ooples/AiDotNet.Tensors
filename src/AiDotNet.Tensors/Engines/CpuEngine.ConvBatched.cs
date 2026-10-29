@@ -70,8 +70,12 @@ public partial class CpuEngine
         var pool = ArrayPool<float>.Shared;
         var cols = pool.Rent(colH * colWAll);
         var packedGrad = pool.Rent(outChannels * colWAll);
-        var result = accumulate ? pool.Rent(totalLen) : destF;
-        int resultOff = accumulate ? 0 : destOff;
+        // dW is G . cols^T, both operands rows of batch*colW. GEMM materializes a transposed operand, so transpose the
+        // smaller one: with fewer output channels than column rows (every DenseNet/ResNet bottleneck), compute
+        // dW^T = cols . G^T with G packed straight into G^T, never a cols-sized copy (up to 64 MB the pool then kept).
+        bool transposedProduct = outChannels < colH;
+        var result = accumulate || transposedProduct ? pool.Rent(totalLen) : destF;
+        int resultOff = accumulate || transposedProduct ? 0 : destOff;
         try
         {
             CpuParallelSettings.ParallelForOrSerial(0, batch * inChannels, (long)colH * colWAll, bc =>
@@ -83,6 +87,25 @@ public partial class CpuEngine
                     c, c + 1, height, width, kernelHeight, kernelWidth,
                     strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
             }, deterministicSafe: true);
+            if (transposedProduct)
+            {
+                PackConvGradOutputTransposed(gradOutputF, packedGrad, batch, outChannels, colW);
+                // dW^T[colH, outC] = cols[colH, batch*colW] . G^T[batch*colW, outC] (Sgemm overwrites)
+                Simd.SimdGemm.Sgemm(
+                    new ReadOnlySpan<float>(cols, 0, colH * colWAll), colWAll, false,
+                    new ReadOnlySpan<float>(packedGrad, 0, colWAll * outChannels), outChannels, false,
+                    new Span<float>(result, 0, totalLen),
+                    colH, colWAll, outChannels);
+                for (int oc = 0; oc < outChannels; oc++)
+                {
+                    int row = destOff + oc * colH;
+                    if (accumulate)
+                        for (int h = 0; h < colH; h++) destF[row + h] += result[h * outChannels + oc];
+                    else
+                        for (int h = 0; h < colH; h++) destF[row + h] = result[h * outChannels + oc];
+                }
+                return;
+            }
             PackConvGradOutputByChannel(gradOutputF, packedGrad, batch, outChannels, colW);
 
             // dW[outC, colH] = G[outC, batch*colW] . cols[colH, batch*colW]^T (Sgemm overwrites, so no clear first)
@@ -98,8 +121,32 @@ public partial class CpuEngine
         {
             pool.Return(cols);
             pool.Return(packedGrad);
-            if (accumulate) pool.Return(result);
+            if (accumulate || transposedProduct) pool.Return(result);
         }
+    }
+
+    /// <summary>
+    /// Repacks a [batch, outChannels, colW] gradient as G^T, [batch * colW, outChannels]: each image's [outChannels, colW]
+    /// block transposed into its rows, in tiles so both sides stay in cache.
+    /// </summary>
+    private static void PackConvGradOutputTransposed(float[] gradOutput, float[] packedT, int batch, int outChannels, int colW)
+    {
+        const int Tile = 32;
+        int pTiles = (colW + Tile - 1) / Tile;
+        CpuParallelSettings.ParallelForOrSerial(0, batch * pTiles, (long)batch * outChannels * colW, item =>
+        {
+            int b = item / pTiles, p0 = (item % pTiles) * Tile, p1 = Math.Min(colW, p0 + Tile);
+            int src = b * outChannels * colW, dst = b * colW * outChannels;
+            for (int oc0 = 0; oc0 < outChannels; oc0 += Tile)
+            {
+                int oc1 = Math.Min(outChannels, oc0 + Tile);
+                for (int oc = oc0; oc < oc1; oc++)
+                {
+                    int row = src + oc * colW;
+                    for (int p = p0; p < p1; p++) packedT[dst + p * outChannels + oc] = gradOutput[row + p];
+                }
+            }
+        }, deterministicSafe: true);
     }
 
     /// <summary>
