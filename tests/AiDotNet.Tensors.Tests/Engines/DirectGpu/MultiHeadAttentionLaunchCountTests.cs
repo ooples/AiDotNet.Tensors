@@ -76,4 +76,41 @@ public sealed class MultiHeadAttentionLaunchCountTests : IClassFixture<DirectGpu
             Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-4f * Math.Max(1f, Math.Abs(expected[i])),
                 $"output[{i}]: gpu {actual[i]} vs cpu {expected[i]}");
     }
+
+    [SkippableFact]
+    public void Past_the_score_budget_the_fused_kernel_runs_and_matches_the_cpu()
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        var gpu = _fixture.Engine as DirectGpuTensorEngine;
+        Skip.If(gpu is null, "Not a DirectGpu engine.");
+        IEngine engine = gpu!;
+        var cpu = new CpuEngine();
+        var qW = Rand([Model, Model], 21, 0.2f);
+        var kW = Rand([Model, Model], 22, 0.2f);
+        var vW = Rand([Model, Model], 23, 0.2f);
+        var oW = Rand([Model, Model], 24, 0.2f);
+        var input = Rand([4, Seq, Model], 3, 1f);
+
+        long priorBudget = DirectGpuTensorEngine.MhaBatchedScoreElementBudget;
+        DirectGpuTensorEngine.MhaBatchedScoreElementBudget = 0;   // every shape is past it: the fused branch
+        try
+        {
+            engine.MultiHeadAttentionForward(input, qW, kW, vW, oW, Heads);   // warm
+            long before = GpuLaunchProbe.TotalEver;
+            var actual = engine.MultiHeadAttentionForward(input, qW, kW, vW, oW, Heads).ToArray();
+            long launches = GpuLaunchProbe.TotalEver - before;
+            _output.WriteLine($"fused branch, b4: {launches} launches");
+            // The per-head loop would take ~7 per (batch, head) pair: 112 here.
+            Assert.True(launches < 4 * Heads * 7, $"The fused branch took {launches} launches; it fell back to the loop.");
+
+            var expected = cpu.MultiHeadAttentionForward(input, qW, kW, vW, oW, Heads).ToArray();
+            for (int i = 0; i < expected.Length; i++)
+                Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-4f * Math.Max(1f, Math.Abs(expected[i])),
+                    $"output[{i}]: gpu {actual[i]} vs cpu {expected[i]}");
+        }
+        finally
+        {
+            DirectGpuTensorEngine.MhaBatchedScoreElementBudget = priorBudget;
+        }
+    }
 }
