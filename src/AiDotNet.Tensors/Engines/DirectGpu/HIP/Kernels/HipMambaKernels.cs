@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP kernel for the fused Mamba selective scan forward (#1464).
 // Mirrors CpuEngine.MambaScan / RecurrenceCpuKernels.MambaSelectiveScanForward. Per (channel di)
 // state h[di, 0..stateDim) is independent, so one thread owns (batch b, channel di). Backward via tape.

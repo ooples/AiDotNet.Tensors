@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Forward-mode AD rules (JVP) for the core differentiable ops.
 
 using System;

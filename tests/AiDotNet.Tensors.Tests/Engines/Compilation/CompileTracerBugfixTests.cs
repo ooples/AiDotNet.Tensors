@@ -72,53 +72,30 @@ public class CompileTracerBugfixTests
         Assert.NotEqual(0.0, span[0].Real);
     }
 
-    [Fact(Skip = "Pre-existing FFT-roundtrip-via-compile-cache numerical bug: " +
-                 "IFFTReal(NativeComplexMultiply(FFT(x), ones)) returns scaled-up " +
-                 "values (e.g. 1.5303 instead of 1.0 at index 0) when invoked through " +
-                 "GetOrCompileInference's lazy-chain realize path on T=double. The " +
-                 "primary 'no stack overflow' contract is met (Execute() returns without " +
-                 "throwing); the secondary numerical check fails. Tracked as a follow-up " +
-                 "to the eager-vs-lazy cross-type op parity work — the eager FFT/IFFT " +
-                 "roundtrip is bit-correct.")]
+    [Fact]
     public void Issue238_CompileInference_DoesNotStackOverflow_OnFftMultiplyIfft()
     {
-        // End-to-end version of the issue's repro: FFT → complex multiply →
-        // IFFTReal inside GetOrCompileInference. Before the fix this threw
-        // StackOverflowException during compile; after the fix compile
-        // completes cleanly and the lazy-chain realize returns correct
-        // values on first output read.
-        //
-        // Note on plan.StepCount: CompiledInferencePlan<T>.Compile currently
-        // only captures LazyNode<T> (not CrossTypeLazyNode<TIn,TOut> or
-        // LazyNode<OtherT>) so a pure cross-type chain typed at T=double
-        // compiles to 0 steps. The lazy nodes still execute correctly via
-        // auto-materialization on AsSpan — the reported StackOverflow was
-        // about that path crashing, which this test guards against.
-
+        // End-to-end version of the issue's repro: FFT, complex multiply and IFFTReal inside
+        // GetOrCompileInference. Before the fix the compile recursed until StackOverflowException.
+        // An inference plan holds one element type, so the chain (double -> Complex<double> -> double)
+        // is now refused up front with a typed capture limitation instead of being traced at all.
         var engine = new CpuEngine();
-        var realInput = new Tensor<double>(new double[] { 1, 2, 3, 4, 5, 6, 7, 8 },
-                                           new[] { 8 });
-        using var cache = new CompiledModelCache<double>();
-
-        // Identity filter: all-ones in complex — ensures the IFFT of
-        // (FFT(x) * 1) == x (up to floating-point rounding).
+        var realInput = new Tensor<double>(new double[] { 1, 2, 3, 4, 5, 6, 7, 8 }, new[] { 8 });
+        // Identity filter: all-ones in complex, so IFFT(FFT(x) * 1) == x up to rounding.
         var filter = new Tensor<Complex<double>>(new[] { 8 });
         for (int i = 0; i < 8; i++) filter[i] = new Complex<double>(1.0, 0.0);
+        Tensor<double> Forward() =>
+            engine.NativeComplexIFFTReal(engine.NativeComplexMultiply(filter, engine.NativeComplexFFT(realInput)));
 
-        var plan = cache.GetOrCompileInference(realInput, () =>
+        using (var cache = new CompiledModelCache<double>())
         {
-            var spectrum = engine.NativeComplexFFT(realInput);
-            var filtered = engine.NativeComplexMultiply(filter, spectrum);
-            return engine.NativeComplexIFFTReal(filtered);
-        });
+            var refused = Assert.Throws<GraphCaptureNotSupportedException>(
+                () => cache.GetOrCompileInference(realInput, Forward));
+            Assert.Equal(GraphCaptureLimitation.MixedElementTypes, refused.Limitation);
+        }
 
-        Assert.NotNull(plan);
-
-        // Plan.Execute returns the lazy final output; reading it via the
-        // indexer triggers the Realize cascade. Before the fix this was
-        // the path that recursed; after the fix each cross-type node
-        // realises exactly once.
-        var output = plan.Execute();
+        // The same chain eagerly is the identity.
+        var output = Forward();
         for (int i = 0; i < 8; i++)
             Assert.Equal(realInput[i], output[i], precision: 6);
     }

@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // An elementwise expression over a kernel's operands: the general form of a kernel body.
 //
 // The fixed body -- a product of operands, then one pre-bias, then exp or square -- covers

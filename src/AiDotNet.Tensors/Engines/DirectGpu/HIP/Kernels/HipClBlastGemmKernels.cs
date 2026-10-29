@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Portions of the kernel sources are derived from the CLBlast project (Apache 2.0): https://github.com/CNugteren/CLBlast
 using System;
 using System.Text;

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Shared contract for every codegen emitter — CPU (AVX-512 C#),
 // Triton, HIP, MSL, WGSL, GLSL compute. Each emitter consumes the
 // same CodegenGraph (see Codegen/Ir/) and produces a kernel

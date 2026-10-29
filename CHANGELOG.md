@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.144.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.144.1...v0.144.2) (2026-10-29)
+
+
+### Bug Fixes
+
+* v1 T-1 correctness (AVX2-off kernel parity, [#1570](https://github.com/ooples/AiDotNet.Tensors/issues/1570), CPU parity flakes, coverage baseline) ([#1578](https://github.com/ooples/AiDotNet.Tensors/issues/1578)) ([3680d3b](https://github.com/ooples/AiDotNet.Tensors/commit/3680d3b3d3a6a22db06042ced7981023a2760763))
+
 ## [0.144.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.144.0...v0.144.1) (2026-10-29)
 
 

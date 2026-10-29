@@ -10,10 +10,16 @@
     <Version>1.0.0-preview</Version>
     <Description>Command-line tool for converting between AI tensor checkpoint formats (PyTorch .pt → safetensors → GGUF).</Description>
     <RootNamespace>AiDotNet.Tensors.Cli</RootNamespace>
+    <PackageLicenseFile>LICENSE</PackageLicenseFile>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\AiDotNet.Tensors\AiDotNet.Tensors.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\..\LICENSE" Pack="true" PackagePath="\" />
+    <None Include="..\..\THIRD-PARTY-NOTICES.txt" Pack="true" PackagePath="\" />
   </ItemGroup>
 
   <ItemGroup>

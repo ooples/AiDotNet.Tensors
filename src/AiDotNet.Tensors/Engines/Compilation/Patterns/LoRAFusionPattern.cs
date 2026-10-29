@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Issue #301 — LoRA-forward chain detection for graph-mode auto-fusion.
 
 using System.Collections.Generic;

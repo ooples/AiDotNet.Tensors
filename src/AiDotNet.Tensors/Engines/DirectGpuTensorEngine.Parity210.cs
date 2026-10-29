@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // DirectGpuTensorEngine overrides that route the Parity-210 hot-path ops
 // through IParity210Backend when the active backend supports it. Fallback
 // is automatic: if the backend isn't a parity-210 backend, or the runtime

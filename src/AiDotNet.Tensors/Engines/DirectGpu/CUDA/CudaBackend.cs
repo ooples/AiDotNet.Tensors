@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Direct CUDA backend for NVIDIA GPUs (Driver API + NVRTC + cuBLAS fallback).
 using System;
 using System.Collections.Concurrent;
@@ -1401,6 +1401,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         // IGpuBatchExecution kernels shared with HIP (#1142).
         CompileKernelModule(device, BatchExecutionCudaKernels.GetSource(), "batch_execution_kernels", BatchExecutionCudaKernels.GetKernelNames());
+        // The GRU kernels again, without --use_fast_math; compiled second, so they replace the fast-math entries above.
+        CompileKernelModule(device, BatchExecutionCudaKernels.GruPreciseSource, "gru_precise_kernels",
+            BatchExecutionCudaKernels.GruKernelNames, useFastMath: false);
 
         // Self-contained FP16 kernels (#558 layer 7): manual IEEE-754 half<->float, NO cuda_fp16.h, so
         // they compile with the driver alone (the header-based CudaFp16Kernels below silently fails on
