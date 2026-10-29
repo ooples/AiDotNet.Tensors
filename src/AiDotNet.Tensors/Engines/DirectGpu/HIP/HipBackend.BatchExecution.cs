@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP IGpuBatchExecution (#1142): the shared CUDA C batch kernels, compiled by hiprtc.
 using K = AiDotNet.Tensors.Engines.DirectGpu.BatchExecutionCudaKernels;
 

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Backward kernels derived from the forward spec, not written a second time.
 //
 // A forward operator is

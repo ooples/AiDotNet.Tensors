@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Codegen observability — per-pass timing, autotune cache
 // hit/miss stats, compiled-kernel cache occupancy. Matches the
 // TelemetryConfig surface established by Wave 1 telemetry so

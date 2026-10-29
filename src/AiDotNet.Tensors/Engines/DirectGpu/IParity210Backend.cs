@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Secondary interface for backends that support the parity-210 hot-path
 // kernels. DirectGpuTensorEngine type-tests against this interface when
 // dispatching, so backends that don't implement it transparently fall

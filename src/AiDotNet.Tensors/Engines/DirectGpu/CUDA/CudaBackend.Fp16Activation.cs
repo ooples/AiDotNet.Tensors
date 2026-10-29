@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 // The FP16-native kernels live in CudaBackend.cs and CudaBackend.HalfPrecision.cs.

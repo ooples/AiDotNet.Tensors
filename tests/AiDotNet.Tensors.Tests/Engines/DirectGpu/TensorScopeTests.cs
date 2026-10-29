@@ -3,6 +3,7 @@
 using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -241,6 +242,10 @@ public sealed class TensorScopeTests
     {
         using var gpu = TryEngine(out string noGpu);
         Skip.If(gpu is null, noGpu);
+        // DeviceMemoryReclaim's byte count is how OpenCL, Vulkan and HIP decide to collect. CUDA does not keep it: it
+        // reclaims by free device memory (CudaBackend.ReclaimUnderPressure), so neither arm could reach the threshold.
+        Skip.If(gpu.TestBackend is CudaBackend,
+            "Not applicable: CUDA reclaims by free-memory pressure (ReclaimUnderPressure), not DeviceMemoryReclaim's byte count.");
         const int Length = 1 << 20;   // 4 MB per result
         // Two results per call; about twice the due threshold in all, and under CollectNowAfterDeviceBytes, past which a
         // collection runs on the spot and clears the due flag the control arm reads.

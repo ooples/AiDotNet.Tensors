@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA kernels for the parity-210 op surface. Covers the hot-path subset of
 // Issue #210's 90-op beat-PyTorch gate: movement (roll/flip/triu/tril/diag_embed/
 // rot90), cumulative (cumsum/cumprod/cummax/cummin/logcumsumexp), indexing

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Generated row/column kernel variants served through the tuned-kernel registry.
 
 using System.Globalization;

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA launcher shims for the parity-210 kernels. Each method resolves the
 // NVRTC-compiled kernel from _kernelCache (populated by CompileAllKernels)
 // and dispatches it with the standard 256-thread block / grid-ceil launch

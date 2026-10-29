@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Storage element type for the generic GPU FFT path.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu

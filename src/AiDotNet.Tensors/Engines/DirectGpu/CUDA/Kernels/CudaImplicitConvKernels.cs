@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA convolution as an implicit GEMM for narrow layers (few output channels): no im2col buffer.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels

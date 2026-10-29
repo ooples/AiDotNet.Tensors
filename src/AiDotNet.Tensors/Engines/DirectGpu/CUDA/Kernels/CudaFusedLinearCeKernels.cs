@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA kernels for the fused linear + cross-entropy loss (#1464). One thread per row; loss
 // atomic-added to a scalar accumulator (caller divides by N). Logits are never materialized.
 

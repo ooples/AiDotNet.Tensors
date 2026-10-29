@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Single-kernel emission of a row-fused program (CodegenRowFusion).
 //
 // HELD rows (up to 32 elements per thread) keep the row's sources in registers across every

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP kernels for deformable convolution operations (DCNv1/DCNv2).
 // Deformable convolution learns offsets to sample positions, enabling adaptive receptive fields.
 

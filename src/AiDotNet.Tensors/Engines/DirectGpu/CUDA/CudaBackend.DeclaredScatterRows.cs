@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The row-wise scatter mean and softmax through their declared programs (#890 phase 4e, #1441).
 
 using System;

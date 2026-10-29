@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The assembly line's input: every kernel the conveyor knows how to verify,
 // release and benchmark, declared once as a spec rather than as hand-written PTX.
 //

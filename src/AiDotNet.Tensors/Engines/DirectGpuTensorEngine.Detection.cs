@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // GPU dispatch for the vision detection ops added by Issue #217.
 // Pattern matches DirectGpuTensorEngine.Parity210.cs:
 //   - if active backend implements IDetectionBackend, dispatch to its

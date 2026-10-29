@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP kernels for attention operations - FlashAttention, GroupedQueryAttention, and standard attention.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels;

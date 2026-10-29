@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Shared host (CPU) reference implementations of the fused recurrence scans (#1464),
 // used as the correct fallback by GPU backends that do not yet ship a native compute
 // shader for these ops (Metal / Vulkan / WebGPU follow the same CPU-fallback precedent

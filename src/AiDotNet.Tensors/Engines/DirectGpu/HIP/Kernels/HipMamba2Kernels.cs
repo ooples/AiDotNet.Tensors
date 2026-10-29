@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP kernel for the fused Mamba-2 SSD scan forward (#1464).
 // Mirrors CpuEngine.Mamba2SsdScan / RecurrenceCpuKernels.Mamba2SsdScanForward. Per channel
 // flatD = head*headDim + di carries an independent state h[flatD, 0..stateDim), so one thread owns

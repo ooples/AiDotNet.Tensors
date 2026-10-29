@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA fused linear (MatMul + Bias + Activation) kernels for forward and backward passes.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
