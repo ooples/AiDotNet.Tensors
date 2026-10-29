@@ -10886,6 +10886,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         int hw = height * width;
         int inStride = inChannels * hw, outStride = outChannels * hw, kLen = outChannels * inChannels;
+#if NET5_0_OR_GREATER
         if (Simd.SimdGemm.PrefersSharedA(outChannels, inChannels, hw))
         {
             // The weight is packed once for the batch; a per-image GEMM that packs repacked it for every image.
@@ -10893,6 +10894,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 outChannels, inChannels, hw, batch);
             return true;
         }
+#endif
         long work = 2L * batch * outChannels * inChannels * hw;
         CpuParallelSettings.ParallelForOrSerial(0, batch, work, n =>
             Simd.SimdGemm.SgemmSequential(
@@ -18793,17 +18795,22 @@ public partial class CpuEngine : ITensorLevelEngine
         int outputWidth0 = (input._shape[3] + 2 * padding[1] - kernelWidth0) / stride[1] + 1;
         int outChannels0 = inChannels0 * multiplier0;
 
-        int outputLength0 = batch0 * outChannels0 * outputHeight0 * outputWidth0;
+        int[] outputShape0 = [batch0, outChannels0, outputHeight0, outputWidth0];
         // The float kernels write every output element (the row form clears each row before accumulating), so the float
-        // output need not be zero-filled first: a fresh multi-megabyte array per call was a second full pass.
-#if NET5_0_OR_GREATER
-        var outputData = typeof(T) == typeof(float) ? GC.AllocateUninitializedArray<T>(outputLength0) : new T[outputLength0];
-#else
-        var outputData = new T[outputLength0];
-#endif
-        DepthwiseConv2DComputeIntoOutput(input, kernel, stride, padding, outputData);
-
-        var dwConvResult = TensorAllocator.Rent<T>([batch0, outChannels0, outputHeight0, outputWidth0], outputData);
+        // output is rented uninitialized from the pool. A fresh multi-megabyte array per call faulted its pages in on
+        // every call: 960 channels at 4x4, batch 128 took 1.18 ms against 0.33 ms computing into a reused buffer.
+        Tensor<T> dwConvResult;
+        if (typeof(T) == typeof(float))
+        {
+            dwConvResult = TensorAllocator.RentUninitialized<T>(outputShape0);
+            DepthwiseConv2DComputeIntoOutput(input, kernel, stride, padding, dwConvResult.GetDataArray());
+        }
+        else
+        {
+            var outputData = new T[batch0 * outChannels0 * outputHeight0 * outputWidth0];
+            DepthwiseConv2DComputeIntoOutput(input, kernel, stride, padding, outputData);
+            dwConvResult = TensorAllocator.Rent<T>(outputShape0, outputData);
+        }
         DifferentiableOps.RecordBinary("DepthwiseConv2D", dwConvResult, input, kernel, BackwardFunctions<T>.DepthwiseConv2DBackward, new object[] { stride, padding });
         AutoTracer.RecordOp("DepthwiseConv2D", dwConvResult, eng => dwConvResult);
         return dwConvResult;
@@ -18972,6 +18979,17 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         int outChannels = inChannels * multiplier;
         int planes = batch * outChannels;
+        if (strideH == 1 && strideW == 1 && outW < 2 * System.Numerics.Vector<float>.Count
+            && kH == 2 * padH + 1 && kW == 2 * padW + 1 && System.Numerics.Vector.IsHardwareAccelerated)
+        {
+            int group = DepthwiseSameGroupPlanes(height, width, padH, padW);
+            int groups = (planes + group - 1) / group;
+            CpuParallelSettings.ParallelForOrSerial(0, groups, (long)planes * outH * outW * kH * kW, g =>
+                DepthwiseSameSmallPlanes(x, w, y, g * group, Math.Min(group, planes - g * group), inChannels, multiplier,
+                    height, width, kH, kW, padH, padW),
+                deterministicSafe: true);
+            return;
+        }
         CpuParallelSettings.ParallelForOrSerial(0, planes, (long)planes * outH * outW * kH * kW, idx =>
         {
             int b = idx / outChannels, oc = idx % outChannels, ic = oc / multiplier;
@@ -19031,6 +19049,31 @@ public partial class CpuEngine : ITensorLevelEngine
     // System.Numerics.Vector has no span constructor on netstandard2.0 and net471).
     [ThreadStatic] private static float[]? t_depthwiseTile;
     [ThreadStatic] private static float[]? t_depthwiseLanes;
+    [ThreadStatic] private static System.Numerics.Vector<int>[]? t_depthwiseSameMasks;
+    [ThreadStatic] private static long t_depthwiseSameMaskKey;
+    [ThreadStatic] private static float[]? t_depthwiseSameTile;
+    [ThreadStatic] private static long t_depthwiseSameTileKey;
+
+    private static unsafe void CopyPlanesIntoSlots(float[] x, float[] tile, int firstPlane, int planeCount,
+        int outChannels, int inChannels, int multiplier, int hw, int slot, int lead)
+    {
+        int vw = System.Numerics.Vector<float>.Count;
+        fixed (float* xp = x)
+        fixed (float* tp = tile)
+        {
+            for (int g = 0; g < planeCount; g++)
+            {
+                int plane = firstPlane + g, oc = plane % outChannels;
+                float* src = xp + (long)((plane / outChannels) * inChannels + oc / multiplier) * hw;
+                float* dst = tp + g * slot + lead;
+                int i = 0;
+                for (; i + vw <= hw; i += vw)
+                    System.Runtime.CompilerServices.Unsafe.WriteUnaligned(dst + i,
+                        System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Numerics.Vector<float>>(src + i));
+                for (; i < hw; i++) dst[i] = src[i];
+            }
+        }
+    }
 
     /// <summary>
     /// One depthwise plane at stride 1 whose output rows are shorter than two vectors (the 8x8 and 4x4 maps of a network's
@@ -19072,6 +19115,160 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
     }
+
+    /// <summary>
+    /// The 3x3 body of <see cref="DepthwiseSameSmallPlanes"/> over its copied tile: the nine weights held in registers
+    /// for the plane and the taps unrolled, in the same (kh, kw) order and the same multiply-then-add, so the result is
+    /// the general loop's to the bit. The general loop reloaded the weight and mask and re-checked bounds on every tap.
+    /// </summary>
+    private static unsafe void DepthwiseSame3x3Planes(float[] tile, int slot, int lead, float[] w, float[] y,
+        int firstPlane, int planeCount, int outChannels, int width, int hw, int vectors,
+        System.Numerics.Vector<int>[] masks)
+    {
+        int vw = System.Numerics.Vector<float>.Count;
+        fixed (float* tp = tile)
+        fixed (float* wp = w)
+        fixed (float* yp = y)
+        {
+            for (int g = 0; g < planeCount; g++)
+            {
+                int plane = firstPlane + g;
+                float* wk = wp + (plane % outChannels) * 9;
+                System.Numerics.Vector<float> w0 = new(wk[0]), w1 = new(wk[1]), w2 = new(wk[2]), w3 = new(wk[3]),
+                    w4 = new(wk[4]), w5 = new(wk[5]), w6 = new(wk[6]), w7 = new(wk[7]), w8 = new(wk[8]);
+                float* center = tp + g * slot + lead;
+                float* outPlane = yp + (long)plane * hw;
+                for (int v = 0; v < vectors; v++)
+                {
+                    int p = v * vw;
+                    // The middle column never leaves its row, so only the left and right taps are masked.
+                    var left = System.Numerics.Vector.AsVectorSingle(masks[v * 3]);
+                    var right = System.Numerics.Vector.AsVectorSingle(masks[v * 3 + 2]);
+                    float* c = center + p;
+                    var acc = System.Numerics.Vector<float>.Zero;
+                    acc += (Load(c - width - 1) & left) * w0;
+                    acc += Load(c - width) * w1;
+                    acc += (Load(c - width + 1) & right) * w2;
+                    acc += (Load(c - 1) & left) * w3;
+                    acc += Load(c) * w4;
+                    acc += (Load(c + 1) & right) * w5;
+                    acc += (Load(c + width - 1) & left) * w6;
+                    acc += Load(c + width) * w7;
+                    acc += (Load(c + width + 1) & right) * w8;
+                    int count = Math.Min(vw, hw - p);
+                    if (count == vw) System.Runtime.CompilerServices.Unsafe.WriteUnaligned(outPlane + p, acc);
+                    else
+                    {
+                        var lanes = t_depthwiseLanes ??= new float[vw];
+                        acc.CopyTo(lanes);
+                        for (int j = 0; j < count; j++) outPlane[p + j] = lanes[j];
+                    }
+                }
+            }
+        }
+
+        static System.Numerics.Vector<float> Load(float* at)
+            => System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Numerics.Vector<float>>(at);
+    }
+
+    /// <summary>
+    /// Planes per task for <see cref="DepthwiseSameSmallPlanes"/>: as many padded slots as fit about 16 KB, so a group's
+    /// tile stays in L1 between being written and being read.
+    /// </summary>
+    private static int DepthwiseSameGroupPlanes(int height, int width, int padH, int padW)
+    {
+        int vw = System.Numerics.Vector<float>.Count;
+        int hw = height * width, slot = 2 * (padH * width + padW) + ((hw + vw - 1) / vw) * vw;
+        return Math.Max(1, 4096 / slot);
+    }
+
+    /// <summary>
+    /// A run of "same"-padded (k = 2 * pad + 1) depthwise planes at stride 1 with rows shorter than two vectors. Each
+    /// plane is treated as one flat run of height * width outputs, so a 4x4 plane is two 8-lane vectors per tap instead
+    /// of four half-empty row vectors: output p reads input p + (kh - padH) * width + (kw - padW). Rows above and below
+    /// fall in zero margins around a copy of the plane; a tap whose column leaves the row is masked to zero on the
+    /// loaded input (never on the weight, so a non-finite neighbour cannot leak in). Taps sum in (kh, kw) order with
+    /// separate multiply and add, padded ones as 0 * w, exactly as <see cref="DepthwiseSmallPlaneStride1"/> does, so
+    /// the two agree bit for bit.
+    /// <para>Every plane of the run is copied before any is computed. Reading a tile straight after writing it made
+    /// each shifted vector load straddle the copy's pending stores, which cannot be forwarded: the per-plane form spent
+    /// about 50 cycles per tap there (960 channels at 4x4, batch 128: 2.4 ms, PyTorch 0.5).</para>
+    /// </summary>
+    private static void DepthwiseSameSmallPlanes(float[] x, float[] w, float[] y, int firstPlane, int planeCount,
+        int inChannels, int multiplier, int height, int width, int kH, int kW, int padH, int padW)
+    {
+        int vw = System.Numerics.Vector<float>.Count;
+        int outChannels = inChannels * multiplier;
+        int hw = height * width, vectors = (hw + vw - 1) / vw, lead = padH * width + padW;
+        int slot = 2 * lead + vectors * vw;
+        int tileLength = planeCount * slot;
+        // The tile is this route's alone and only [lead, lead + hw) of a slot is ever written, so the margins stay zero
+        // while the slot geometry is unchanged; clearing and copying each plane with Array calls cost more than its taps.
+        long tileKey = (uint)slot | ((long)lead << 32);
+        var tile = t_depthwiseSameTile;
+        if (tile is null || tile.Length < tileLength || t_depthwiseSameTileKey != tileKey)
+        {
+            t_depthwiseSameTile = tile = new float[Math.Max(tileLength, tile?.Length ?? 0)];
+            t_depthwiseSameTileKey = tileKey;
+        }
+        CopyPlanesIntoSlots(x, tile, firstPlane, planeCount, outChannels, inChannels, multiplier, hw, slot, lead);
+
+        long key = (uint)width | ((long)kW << 16) | ((long)padW << 24) | ((long)vectors << 32);
+        var masks = t_depthwiseSameMasks;
+        if (masks is null || t_depthwiseSameMaskKey != key)
+        {
+            // masks[v * kW + kw]: the lanes of vector v whose column stays in its row at kernel column kw.
+            masks = new System.Numerics.Vector<int>[vectors * kW];
+            var bits = new int[vw];
+            for (int v = 0; v < vectors; v++)
+                for (int kw = 0; kw < kW; kw++)
+                {
+                    for (int j = 0; j < vw; j++)
+                    {
+                        int column = (v * vw + j) % width + kw - padW;
+                        bits[j] = column >= 0 && column < width ? -1 : 0;
+                    }
+                    masks[v * kW + kw] = new System.Numerics.Vector<int>(bits);
+                }
+            t_depthwiseSameMasks = masks;
+            t_depthwiseSameMaskKey = key;
+        }
+
+        if (kH == 3 && kW == 3)
+        {
+            DepthwiseSame3x3Planes(tile, slot, lead, w, y, firstPlane, planeCount, outChannels, width, hw, vectors, masks);
+            return;
+        }
+        for (int g = 0; g < planeCount; g++)
+        {
+            int plane = firstPlane + g, wBase = (plane % outChannels) * kH * kW, yPlane = plane * hw, s = g * slot;
+            for (int v = 0; v < vectors; v++)
+            {
+                int p = v * vw;
+                var acc = System.Numerics.Vector<float>.Zero;
+                for (int kh = 0; kh < kH; kh++)
+                {
+                    int rowBase = s + lead + p + (kh - padH) * width - padW;
+                    int wRow = wBase + kh * kW;
+                    for (int kw = 0; kw < kW; kw++)
+                    {
+                        var input = System.Numerics.Vector.ConditionalSelect(masks[v * kW + kw],
+                            new System.Numerics.Vector<float>(tile, rowBase + kw), System.Numerics.Vector<float>.Zero);
+                        acc += input * new System.Numerics.Vector<float>(w[wRow + kw]);
+                    }
+                }
+                int count = Math.Min(vw, hw - p);
+                if (count == vw) acc.CopyTo(y, yPlane + p);
+                else
+                {
+                    var lanes = t_depthwiseLanes ??= new float[vw];
+                    acc.CopyTo(lanes);
+                    Array.Copy(lanes, 0, y, yPlane + p, count);
+                }
+            }
+        }
+    }
+
     /// <inheritdoc/>
     public Tensor<T> DepthwiseConv2DBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> kernel, int[] inputShape, int[] stride, int[] padding)
     {
