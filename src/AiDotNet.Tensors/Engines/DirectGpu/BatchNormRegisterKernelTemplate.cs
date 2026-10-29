@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The register-resident training BatchNorm of CudaNormalizationKernels (bn_fwd_reg / bn_bwd_reg, #1376, #1489), written
 // once in WinogradF23KernelTemplate's body conventions and emitted as OpenCL C, HIP C++, Vulkan GLSL and Metal Shading
 // Language. WGSL keeps its own copy (WebGpu/WebGpuBatchNormRegisterKernels.cs).

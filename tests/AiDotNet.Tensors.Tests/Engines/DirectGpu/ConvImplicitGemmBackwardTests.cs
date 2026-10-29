@@ -178,8 +178,16 @@ public sealed class ConvImplicitGemmBackwardTests
         for (int i = 0; i < poison.Length; i++) poison[i] = float.NaN;
         using var dX1 = backend.AllocateBuffer(poison);
         using var dX2 = backend.AllocateBuffer(poison);
-        // The engine's input gradient takes Cout % 8 == 0 only; #1323's kernels cover the rest.
-        Skip.If(route.StartsWith("engine") && outC % 8 != 0, "the engine input gradient needs Cout % 8 == 0");
+        // The engine's input gradient takes Cout % 8 == 0 only; #1323's kernels (and so the public route) cover the
+        // rest. For any other Cout its contract is to decline without writing, leaving the shape to them.
+        if (route.StartsWith("engine") && outC % 8 != 0)
+        {
+            var other = new TunedConv2DBackwardArgs(dDy, dWt, dX1, false, batch, inC, h, w, outC, outH, outW, kH, kW, sH, sW, pH, pW, dH, dW);
+            Assert.False(backend.Conv2DBackwardInputViaEngine(other, MainloopOf(route)), $"the {route} route took Cout = {outC}");
+            backend.Synchronize();
+            Assert.All(backend.DownloadBuffer(dX1), v => Assert.True(float.IsNaN(v), "the declining engine route wrote the gradient"));
+            return;
+        }
         foreach (var target in new[] { dX1, dX2 })
         {
             var a = new TunedConv2DBackwardArgs(dDy, dWt, target, false, batch, inC, h, w, outC, outH, outW, kH, kW, sH, sW, pH, pW, dH, dW);

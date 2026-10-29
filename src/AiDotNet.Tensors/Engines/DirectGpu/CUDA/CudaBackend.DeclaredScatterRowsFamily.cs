@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The rest of the row-wise scatter family through declared programs (#890 phase 4e, #1441): the scatter maximum with
 // its argmax, the backward passes, the row-wise add (the deterministic scatter-add's program), its backward (the
 // embedding's gather), and the activation-layout ScatterMean. They share the scatter rows' switch, cap and size limit.

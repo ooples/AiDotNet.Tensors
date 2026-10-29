@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // GPU dispatch for the RoI family (Issue #217 tail). Falls through to
 // CpuEngine via inherited base.* when the backend does not implement
 // IRoiBackend, T != float, or the shape isn't on the GPU surface

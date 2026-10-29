@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP kernels for hyperbolic (Poincare ball) neural network operations.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels;

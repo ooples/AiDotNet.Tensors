@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu;

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Tensor Core WMMA kernels for Volta+ GPUs (sm_70+).
 // Uses nvcuda::wmma for 16x16x16 FP16 matrix multiply with FP32 accumulation.
 // FP32 inputs are converted to FP16 in shared memory before tensor core execution.

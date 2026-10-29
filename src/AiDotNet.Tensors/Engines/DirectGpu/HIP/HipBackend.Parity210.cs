@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP launcher shims for the parity-210 kernels. The HIP launch API takes
 // the same void**-array as CUDA, so every method here is a direct port of
 // its CudaBackend.Parity210.cs counterpart — only the runtime API name

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // HIP kernel for the fused RG-LRU (real-gated linear recurrent unit) scan forward (#1464).
 // Mirrors CpuEngine.RgLruScan / RecurrenceCpuKernels.RgLruForward. Per-channel recurrence, so
 // one thread owns (batch b, channel c) and carries h[c] across time. Backward via CpuEngine tape.

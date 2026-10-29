@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA kernels for standard LSTM (Long Short-Term Memory) neural network operations.
 // Implements sequence-level forward and backward passes for efficient BPTT.
 

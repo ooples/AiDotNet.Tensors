@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA pooling kernels for neural network layers.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels

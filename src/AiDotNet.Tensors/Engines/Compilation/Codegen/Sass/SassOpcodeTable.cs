@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // What each Volta-family SASS opcode reads and writes, for the own SASS backend's register allocation and scheduling
 // (#1442). An instruction's bits 0-8 name the operation and bits 9-11 its operand form; --sass-learn measured, on the
 // catalog's kernels compiled for sm_75, where each form keeps its register sources:
