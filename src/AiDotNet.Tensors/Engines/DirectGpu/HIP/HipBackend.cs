@@ -827,6 +827,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             CompileTunedRowKernels();
             CompileWinogradKernels();
             CompileBatchNormRegisterKernels();
+            CompileFiniteGuardKernels();
 
             // Compile split-buffer complex kernels for native Tensor<Complex<T>> operations
             CompileKernelModule(Kernels.HipComplexKernels.GetSource(), "complex", ref _complexModule, Kernels.HipComplexKernels.GetKernelNames());
