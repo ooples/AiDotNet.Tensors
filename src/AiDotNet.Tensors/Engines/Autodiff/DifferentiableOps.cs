@@ -948,8 +948,8 @@ internal static class DifferentiableOps
         // to carry a full parameter-sized gradient.
         // First-write redirection (DirectGpuTensorEngine.FirstWriteRedirects) needs to know every buffer a contribution
         // reaches: one consumed twice must stay a separate buffer.
-        if (engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine { FirstWriteRedirects: { } redirectTable })
-            redirectTable.NoteContribution(grad.TryGetGpuBuffer());
+        if (engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine { FirstWriteRedirects: { } redirectTable } redirectEngine)
+            redirectTable.NoteContribution(grad.TryGetGpuBuffer(), redirectEngine.CurrentScratchAction);
         Tensor<T>? gradForInPlaceCache = null;
         Tensor<T> GradForInPlace() =>
             gradForInPlaceCache ??= (grad.IsContiguous ? grad : grad.Contiguous());

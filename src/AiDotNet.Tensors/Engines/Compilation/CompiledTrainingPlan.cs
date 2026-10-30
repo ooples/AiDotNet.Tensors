@@ -236,6 +236,79 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
     }
 
+    // GPU gradient pooling: the device buffer of each pooled gradient array, by that host array (every tenant is bound to
+    // it), and per gradient whether the step zeroes it when its lifetime starts. Null until an uncaptured run recorded
+    // which gradients the backward writes; until then every pooled gradient is zeroed there.
+    private Dictionary<object, Engines.DirectGpu.IGpuBuffer>? _pooledGradDeviceBuffers;
+    private bool[]? _pooledGradZeroAtStart;
+
+    /// <summary>
+    /// Binds every tenant of a pooled gradient array to one device buffer the size of the array, so the GPU step's
+    /// gradients take the device memory of the most that are live at once rather than one buffer per traced tensor.
+    /// </summary>
+    private void BindPooledGradientsResident(Engines.DirectGpuTensorEngine engine, Engines.DirectGpu.IDirectGpuBackend backend)
+    {
+        if (_pooledGradients is not { } pooled) return;
+        var buffers = _pooledGradDeviceBuffers ??= new Dictionary<object, Engines.DirectGpu.IGpuBuffer>();
+        for (int i = 0; i < pooled.Length; i++)
+        {
+            if (!pooled[i]) continue;
+            var grad = _preAllocatedGrads[i];
+            if (grad.GetBackingArrayForCacheLookupUnsafe() is not { } array) continue;
+            if (!buffers.TryGetValue(array, out var buffer) || buffer.Handle == IntPtr.Zero)
+            {
+                buffer = backend.AllocateBuffer(array.Length);
+                buffers[array] = buffer;
+            }
+            if (!ReferenceEquals(grad._gpuBuffer, buffer)) engine.BindResidentBuffer(grad, buffer, backend);
+        }
+    }
+
+    /// <summary>
+    /// Zeroes on the device, just before backward action <paramref name="actionIndex"/>, the pooled gradients whose
+    /// lifetime starts there and that need zeros: an earlier tenant left its values in the shared buffer, and a gradient
+    /// the backward writes takes its first contribution by copy, so only those no run has seen written are zeroed (all of
+    /// them before the first run).
+    /// </summary>
+    private void ZeroPooledGradientsStartingAt(int actionIndex, Engines.DirectGpu.IDirectGpuBackend backend,
+        Engines.DirectGpuTensorEngine? engine, int elementSize)
+    {
+        var schedule = _deferredZeroByAction;
+        if (schedule is null || actionIndex >= schedule.Length) return;
+        var zeroAtStart = _pooledGradZeroAtStart;
+        foreach (int g in schedule[actionIndex])
+        {
+            if (zeroAtStart is not null && !zeroAtStart[g]) continue;
+            var grad = _preAllocatedGrads[g];
+            if (grad.TryGetGpuBuffer() is not { } buffer) continue;
+            ZeroDeviceBuffer(backend, buffer, grad.Length, elementSize);
+            engine?.BindResidentBuffer(grad, buffer, backend);
+        }
+    }
+
+    /// <summary>
+    /// Gives every pooled gradient an array of its own again, for a GPU plan that runs the eager step: there device copies
+    /// are cached by host array with per-tensor versions, which tenants sharing an array would confuse.
+    /// </summary>
+    private void UnpoolGradients()
+    {
+        if (_pooledGradients is not { } pooled) return;
+        for (int i = 0; i < pooled.Length; i++)
+        {
+            if (!pooled[i]) continue;
+            var grad = _preAllocatedGrads[i];
+            DetachDeviceBinding(grad);
+            using (var own = new Tensor<T>((int[])grad._shape.Clone()))
+                grad.RebindStorageFrom(own);
+        }
+        _pooledGradients = null;
+        _deferredZeroByAction = null;
+        _deferredZeroPending = null;
+        _pooledGradDeviceBuffers = null;
+        _pooledGradZeroAtStart = null;
+        _cachedGradArrays = null;   // rebound, and the first eager step then zeroes every gradient
+    }
+
     // Forward outputs sharing arrays by forward liveness (PoolForwardOnlyOutputs).
     private int _pooledForwardOutputs;
 
@@ -4213,6 +4286,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         bool capturingNow = IsCapturing();
         if (residentEngine is not null && !capturingNow)
         {
+            BindPooledGradientsResident(residentEngine, backend);
             for (int i = 0; i < _preAllocatedGrads.Length; i++)
                 residentEngine.EnsureResidentBuffer(_preAllocatedGrads[i]);
             if (_aliasedGradViews is { } views)
@@ -4252,9 +4326,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var alwaysZeroed = _alwaysZeroedGrads ??= AlwaysZeroedGradients();
         var heldZero = _gradHeldZero ??= new Engines.DirectGpu.IGpuBuffer?[_preAllocatedGrads.Length];
         int zeroed = 0;
+        var pooledGrads = _pooledGradients;
         for (int z = 0; z < zeroCount; z++)
         {
             int i = zeroIndices is null ? z : zeroIndices[z];
+            // A pooled gradient shares its buffer with tenants that run in between: it is zeroed when its lifetime starts.
+            if (pooledGrads is not null && pooledGrads[i]) continue;
             if (_preAllocatedGrads[i].TryGetGpuBuffer() is { } gb)
             {
                 if (ReferenceEquals(heldZero[i], gb) && !alwaysZeroed.Contains(_preAllocatedGrads[i])) continue;
@@ -4296,6 +4373,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             for (int i = 0; i < bwd.Length; i++)
             {
+                if (pooledGrads is not null) ZeroPooledGradientsStartingAt(i, backend, residentEngine, esz);
                 de?.SetCurrentScratchAction(fwd.Length + i);   // backward actions keyed in a namespace above forward
                 bwd[i](engine);
                 if (bwdDiag && cb is not null && cb.StreamCaptureStatusRaw() == 2)
@@ -4323,6 +4401,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 else
                     heldZero[i] = null;   // written this step: no longer known zero
             _unwrittenGradIndices = unwritten.ToArray();
+            if (pooledGrads is not null)
+            {
+                var zeroAtStart = new bool[pooledGrads.Length];
+                foreach (int i in unwritten) zeroAtStart[i] = pooledGrads[i];
+                _pooledGradZeroAtStart = zeroAtStart;
+            }
         }
         de?.SetCurrentScratchAction(-1);   // grad clip + optimizer (run after) must NOT pool
         if (FailInsideNextCaptureForTesting && IsCapturing())
@@ -4554,6 +4638,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         long t1 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         if (stepTiming) StepTiming.RecordForward(Stopwatch.GetTimestamp() - fwdStart);
 
+        if (_pooledGradients is not null && engine is Engines.DirectGpuTensorEngine) UnpoolGradients();
         // Cache raw arrays on first call — avoids AsWritableSpan()/GetDataArray() per step
         var gradArrays = _cachedGradArrays;
         // The first step zeroes every gradient buffer; later steps zero only the accumulating ones (below).
@@ -8768,14 +8853,16 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // drift guard never needs a null-forgiving access.
         var decidedFusedSteps = new System.Collections.Generic.HashSet<int>();
         var decidedSkippableReduceSum = new System.Collections.Generic.HashSet<int>();
-        // Gradient pooling (CPU): every gradient starts as a placeholder view of one shared scratch array, so building
+        // Gradient pooling: every gradient starts as a placeholder view of one shared scratch array, so building
         // the backward does not materialize a buffer per traced tensor (the gradients were the largest part of a CPU
         // training plan's footprint). Once the backward is built, PoolGradientBuffers gives gradients with disjoint
         // lifetimes shared arrays and every other gradient an array of its own. Reshape-aliased gradients keep real
-        // buffers (an alias view could not follow a re-pointed target) and are never pooled.
+        // buffers (an alias view could not follow a re-pointed target) and are never pooled. On a GPU engine the
+        // tenants of one array share one device buffer too (BindPooledGradientsResident): a GPU DenseNet-121 step held
+        // 3.7 GB of per-tensor gradient buffers on the device, past the card, so the driver paged to host memory.
         // AIDOTNET_COMPILED_GRAD_VIEWS=0 turns it off.
-        bool useGradViews = !useGradPool && !engine.SupportsGpu && fp16HeteroOrder is null
-            && (typeof(T) == typeof(float) || typeof(T) == typeof(double))
+        bool useGradViews = !useGradPool && fp16HeteroOrder is null
+            && (engine.SupportsGpu ? typeof(T) == typeof(float) : typeof(T) == typeof(float) || typeof(T) == typeof(double))
             && Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_GRAD_VIEWS") != "0";
         HashSet<Tensor<T>>? gradPlaceholders = null;
         if (useGradPool)
@@ -9140,7 +9227,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 var shortcutStep = forwardSteps[shortcutPair.Shortcut];
                 backwardActions.Add(BuildShortcutPairBackward(mainStep, shortcutStep, shortcutPair.Shortcut > shortcutPair.Main,
                     gradMap, gradRequired, requiresGradTensors));
-                actionCoverage.Add(null);
+                // It reads both steps' output gradients and writes both steps' input gradients, as their two generic
+                // backwards would.
+                actionCoverage.Add(new[] { shortcutPair.Main, shortcutPair.Shortcut });
                 backwardStepNames.Add("generic:Conv2D+ShortcutPair");
                 // GPU-dispatched like the generic accumulator (graph-capturable), and it accumulates into both steps'
                 // inputs as their generic backwards would.

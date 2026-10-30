@@ -5389,6 +5389,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// capture determinism. Call before each fwd/bwd action; pass -1 to disable (pre-pass / optimizer / eval).</summary>
     internal void SetCurrentScratchAction(int action) => CurrentScratchPool?.Begin(action);
 
+    /// <summary>The compiled action whose scratch this thread is pooling, or -1 outside one.</summary>
+    internal int CurrentScratchAction => CurrentScratchPool?.Action ?? -1;
+
     /// <summary>True while inside a compiled action whose transient scratch should draw from its plan's pool, on the
     /// thread running that step.</summary>
     private bool ScratchPoolingActive => CurrentScratchPool is { Action: >= 0 } && ResidentStepActive;
