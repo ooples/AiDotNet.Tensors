@@ -72,6 +72,59 @@ inline void row_mlp_layer(__local const float* src, __local float* dst, __global
     }
 }
 
+// A layer whose width is a multiple of 4: work item (cg, s) accumulates four adjacent columns (one vload4 per weight
+// row) over K-slice s, unrolled four deep so each thread keeps four loads in flight; the slices' partials are summed in
+// local memory. The scalar form above had one 4-byte load in flight per thread, so a 512 x 128 layer took ~100 us.
+inline void row_mlp_layer4(__local const float* src, __local float* dst, __global float* y, int toGlobal,
+    __global const float* w, __global const float* b, int hasBias, int k, int n, int relu, __local float4* partial4)
+{
+    const int lid = get_local_id(0);
+    const int groups = n >> 2;
+    for (int base = 0; base < groups; base += RM_GROUP)
+    {
+        const int active = min(RM_GROUP, groups - base);
+        const int splits = RM_GROUP / active;
+        const int cg = base + lid % active, s = lid / active;
+        float4 a0 = (float4)(0.0f), a1 = (float4)(0.0f), a2 = (float4)(0.0f), a3 = (float4)(0.0f);
+        if (s < splits)
+        {
+            const int chunk = (k + splits - 1) / splits;
+            const int k0 = s * chunk, k1 = min(k, k0 + chunk);
+            __global const float* col = w + 4 * cg;
+            int kk = k0;
+            for (; kk + 3 < k1; kk += 4)
+            {
+                a0 += src[kk] * vload4(0, col + (long)kk * n);
+                a1 += src[kk + 1] * vload4(0, col + (long)(kk + 1) * n);
+                a2 += src[kk + 2] * vload4(0, col + (long)(kk + 2) * n);
+                a3 += src[kk + 3] * vload4(0, col + (long)(kk + 3) * n);
+            }
+            for (; kk < k1; kk++) a0 += src[kk] * vload4(0, col + (long)kk * n);
+        }
+        partial4[lid] = (a0 + a1) + (a2 + a3);
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (lid < active)
+        {
+            float4 v = (float4)(0.0f);
+            for (int t = 0; t < splits; t++) v += partial4[t * active + lid];
+            const int j = 4 * (base + lid);
+            float r[4] = { v.x, v.y, v.z, v.w };
+            for (int q = 0; q < 4; q++)
+            {
+                float o = r[q];
+                if (hasBias) o += b[j + q];
+                if (relu)
+                {
+                    uint bits = as_uint(o) & 0x7fffffffu;
+                    o = (bits > 0x7f800000u) ? o : fmax(0.0f, o);
+                }
+                if (toGlobal) y[j + q] = o; else dst[j + q] = o;
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+}
+
 __kernel __attribute__((reqd_work_group_size(RM_GROUP, 1, 1)))
 void row_mlp_forward(__global const float* x, __global float* y,
     __global const float* w0, __global const float* b0, __global const float* w1, __global const float* b1,
@@ -82,6 +135,7 @@ void row_mlp_forward(__global const float* x, __global float* y,
     __local float bufA[RM_MAXW];
     __local float bufB[RM_MAXW];
     __local float partial[RM_GROUP];
+    __local float4 partial4[RM_GROUP];
     const int lid = get_local_id(0);
     for (int i = lid; i < d0; i += RM_GROUP) bufA[i] = x[i];
     barrier(CLK_LOCAL_MEM_FENCE);
@@ -93,7 +147,14 @@ void row_mlp_forward(__global const float* x, __global float* y,
         const int n = l == 0 ? d1 : l == 1 ? d2 : l == 2 ? d3 : d4;
         const int last = l == layers - 1;
         // Even layers read bufA and write bufB; odd layers the reverse.
-        if ((l & 1) == 0)
+        if ((n & 3) == 0)
+        {
+            if ((l & 1) == 0)
+                row_mlp_layer4(bufA, bufB, y, last, w, b, (biasMask >> l) & 1, k, n, last ? outputRelu : hiddenRelu, partial4);
+            else
+                row_mlp_layer4(bufB, bufA, y, last, w, b, (biasMask >> l) & 1, k, n, last ? outputRelu : hiddenRelu, partial4);
+        }
+        else if ((l & 1) == 0)
             row_mlp_layer(bufA, bufB, y, last, w, b, (biasMask >> l) & 1, k, n, last ? outputRelu : hiddenRelu, partial);
         else
             row_mlp_layer(bufB, bufA, y, last, w, b, (biasMask >> l) & 1, k, n, last ? outputRelu : hiddenRelu, partial);

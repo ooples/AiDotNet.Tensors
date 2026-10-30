@@ -3,6 +3,7 @@ using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
+using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -102,6 +103,38 @@ public sealed class RowMlpForwardTests
         using var wideOut = backend.AllocateBuffer(new float[4096]);
         Assert.False(rowMlp.TryRowMlpForward(input, new[] { wide }, new IGpuBuffer?[] { null }, new[] { 8, 4096 },
             FusedActivationType.ReLU, FusedActivationType.None, wideOut));
+    }
+
+    // MlpForward at batch 1 on the GPU engine: the one-launch suffix (and, past its per-layer limit, the FusedLinear
+    // prefix before it) against the CPU engine's MLP.
+    [SkippableTheory]
+    [InlineData(new[] { 784, 512, 128, 10 })]
+    [InlineData(new[] { 1024, 1024, 64, 8 })]   // the first layer (1M weights) runs as FusedLinear, the rest in one launch
+    [InlineData(new[] { 96, 40 })]
+    public void Engine_MlpForward_AtBatchOne_MatchesCpu(int[] widths)
+    {
+        DirectGpuTensorEngine? engine = null;
+        try { engine = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException or TypeInitializationException) { }
+        Skip.If(engine is null || !engine.IsGpuAvailable, "No DirectGpu backend available.");
+        using (engine)
+        {
+            int layers = widths.Length - 1;
+            var weights = new Tensor<float>[layers];
+            var biases = new Tensor<float>?[layers];
+            for (int l = 0; l < layers; l++)
+            {
+                weights[l] = new Tensor<float>(Values(widths[l] * widths[l + 1], 3 + l, 0.01f), new[] { widths[l], widths[l + 1] });
+                biases[l] = new Tensor<float>(Values(widths[l + 1], 17 + l, 0.05f), new[] { widths[l + 1] });
+            }
+            var input = new Tensor<float>(Values(widths[0], 1, 0.02f), new[] { 1, widths[0] });
+            var expected = new CpuEngine().MlpForward(input, weights, biases, FusedActivationType.ReLU).ToArray();
+            var actual = ((IEngine)engine).MlpForward(input, weights, biases, FusedActivationType.ReLU).ToArray();
+            Assert.Equal(expected.Length, actual.Length);
+            for (int j = 0; j < expected.Length; j++)
+                Assert.True(Math.Abs(expected[j] - actual[j]) <= 1e-4 * (1 + Math.Abs(expected[j])),
+                    $"[{string.Join(",", widths)}] output {j}: CPU {expected[j]}, GPU {actual[j]}");
+        }
     }
 }
 #endif

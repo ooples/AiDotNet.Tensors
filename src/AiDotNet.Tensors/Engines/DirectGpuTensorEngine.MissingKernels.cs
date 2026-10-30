@@ -8134,11 +8134,13 @@ public partial class DirectGpuTensorEngine
 
         try
         {
-            if (TryRowMlpForward(input, weights, biases, hiddenActivation, outputActivation) is { } row) return row;
             int last = weights.Count - 1;
             var cur = input;
+            int rowFrom = RowMlpSuffixStart(input, weights);
             for (int i = 0; i < weights.Count; i++)
             {
+                if (i == rowFrom && TryRowMlpForward(cur, weights, biases, i, hiddenActivation, outputActivation) is { } row)
+                    return row;
                 var act = (i == last) ? outputActivation : hiddenActivation;
                 var ap = (i == last) ? outputActivationParams : hiddenActivationParams;
                 cur = FusedLinear(cur, weights[i], biases[i], act, ap);   // GPU-resident per layer
@@ -8151,24 +8153,40 @@ public partial class DirectGpuTensorEngine
         }
     }
 
-    // One input row through the whole MLP in one launch (IRowMlpForwardBackend), or null to run it layer by layer. At
-    // batch 1 each layer was about three launches around a few hundred thousand multiply-adds.
+    // The most weight elements a layer may have to run in the one-work-group batch-1 kernel. It reads every weight through
+    // one compute unit, about 23 GB/s on gfx1012: the parity MLP (784-512-128-10, 1.8 MB of weights) runs in ~70 us as
+    // one launch, 0.26-0.28 ms end to end against 0.26-0.34 ms with its first layer on the split-K GEMV (two launches)
+    // and 0.40 ms layer by layer. Past ~2 MB a layer reads faster across the whole device than it saves in launches.
+    private const int RowMlpMaxLayerWeights = 1 << 19;
+
+    // The first layer of the batch-1 suffix the one-launch kernel runs: every layer from it on is small enough
+    // (RowMlpMaxLayerWeights). weights.Count when there is none; the earlier layers run as FusedLinear.
+    private static int RowMlpSuffixStart<T>(Tensor<T> input, System.Collections.Generic.IReadOnlyList<Tensor<T>> weights)
+    {
+        if (input.Rank != 2 || input._shape[0] != 1) return weights.Count;
+        int start = weights.Count;
+        while (start > 0 && weights[start - 1] is { } w && w.Length <= RowMlpMaxLayerWeights) start--;
+        return start;
+    }
+
+    // One input row through layers [from, Count) of an MLP in one launch (IRowMlpForwardBackend), or null to run them
+    // layer by layer. At batch 1 each layer was about three launches around a few thousand multiply-adds.
     private Tensor<T>? TryRowMlpForward<T>(Tensor<T> input, System.Collections.Generic.IReadOnlyList<Tensor<T>> weights,
-        System.Collections.Generic.IReadOnlyList<Tensor<T>?> biases, FusedActivationType hiddenActivation,
+        System.Collections.Generic.IReadOnlyList<Tensor<T>?> biases, int from, FusedActivationType hiddenActivation,
         FusedActivationType outputActivation)
     {
-        if (typeof(T) != typeof(float) || IsTapeActive<T>() || input.Rank != 2 || input._shape[0] != 1
+        int layers = weights.Count - from;
+        if (typeof(T) != typeof(float) || IsTapeActive<T>() || layers < 1 || input.Rank != 2 || input._shape[0] != 1
             || !TryGetBackend(out var backend) || backend is not IRowMlpForwardBackend rowMlp)
             return null;
-        int layers = weights.Count;
         var widths = new int[layers + 1];
         widths[0] = input._shape[1];
         for (int i = 0; i < layers; i++)
         {
-            var w = weights[i];
+            var w = weights[from + i];
             if (w is null || w.Rank != 2 || w._shape[0] != widths[i]) return null;
             widths[i + 1] = w._shape[1];
-            if (biases[i] is { } b && b.Length != widths[i + 1]) return null;
+            if (biases[from + i] is { } b && b.Length != widths[i + 1]) return null;
         }
 
         var owned = new System.Collections.Generic.List<OwnedBuffer>(2 * layers + 1);
@@ -8180,10 +8198,10 @@ public partial class DirectGpuTensorEngine
             var biasBuffers = new IGpuBuffer?[layers];
             for (int i = 0; i < layers; i++)
             {
-                var wb = GetWeightBufferPreferResident(backend, weights[i], PersistentTensorRole.Weights);
+                var wb = GetWeightBufferPreferResident(backend, weights[from + i], PersistentTensorRole.Weights);
                 owned.Add(wb);
                 weightBuffers[i] = wb.Buffer;
-                if (biases[i] is { } bias)
+                if (biases[from + i] is { } bias)
                 {
                     var bb = GetWeightBufferPreferResident(backend, bias, PersistentTensorRole.Biases);
                     owned.Add(bb);
