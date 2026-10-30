@@ -144,5 +144,46 @@ public sealed class OpenClEpilogueFusionTests
                 AssertClose(sum, actual[i * n + j], $"{m}x{n}x{k} [{i},{j}]");
             }
     }
+
+    // A 1x1 convolution over a batch as one strided-batched GEMM with the filter shared across images, bias and ReLU in
+    // the in-place epilogue: against a direct double reference.
+    [SkippableTheory]
+    [InlineData(FusedActivationType.None)]
+    [InlineData(FusedActivationType.ReLU)]
+    public void OpenCl_PointwiseBatchedConvolution_MatchesReference(FusedActivationType activation)
+    {
+        using var backend = new OpenClBackend();
+        Skip.IfNot(backend.IsAvailable, "OpenCL is not available.");
+        // The route is CLBlast's strided-batched SGEMM; without the native library the slot never admits it.
+        Skip.IfNot(ClBlastNative.IsAvailable, "CLBlast is not available.");
+        var candidate = backend.Conv2DForwardSlot.Candidate("opencl.conv2d.pointwise_batched");
+        Skip.If(candidate is null, "The pointwise batched route is not registered.");
+        const int batch = 3, cin = 6, h = 4, w = 5, cout = 7;
+        var input = Values(batch * cin * h * w, 4, 0.03f);
+        var kernel = Values(cout * cin, 8, 0.05f);
+        var bias = Values(cout, 15, 0.1f);
+        using var inputBuffer = backend.AllocateBuffer(input);
+        using var kernelBuffer = backend.AllocateBuffer(kernel);
+        using var biasBuffer = backend.AllocateBuffer(bias);
+        using var output = backend.AllocateBuffer(new float[batch * cout * h * w]);
+        // The positive control: the shared-filter batched GEMM itself ran (a declined call falls back to the generic route,
+        // which this comparison alone could not tell apart).
+        using (var probe = backend.AllocateBuffer(new float[batch * cout * h * w]))
+            Assert.True(backend.Conv2DPointwiseBatched(new TunedConv2DArgs(inputBuffer, kernelBuffer, probe, batch, cin, h, w,
+                cout, h, w, 1, 1, 1, 1, 0, 0, 1, 1)), "CLBlast declined the shared-filter batched GEMM.");
+        candidate.Execute(new TunedConv2DArgs(inputBuffer, kernelBuffer, output, batch, cin, h, w, cout, h, w,
+            1, 1, 1, 1, 0, 0, 1, 1, biasBuffer, activation));
+        var actual = backend.DownloadBuffer(output);
+        int l = h * w;
+        for (int bi = 0; bi < batch; bi++)
+            for (int co = 0; co < cout; co++)
+                for (int p = 0; p < l; p++)
+                {
+                    double sum = bias[co];
+                    for (int ci = 0; ci < cin; ci++) sum += (double)kernel[co * cin + ci] * input[(bi * cin + ci) * l + p];
+                    double expected = activation == FusedActivationType.ReLU ? Math.Max(0.0, sum) : sum;
+                    AssertClose(expected, actual[(bi * cout + co) * l + p], $"{activation} b{bi} c{co} p{p}");
+                }
+    }
 }
 #endif

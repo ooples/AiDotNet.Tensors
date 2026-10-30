@@ -6180,8 +6180,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         // C[b] = alpha * A[b] * B[b] + beta * C[b] for each b, over row-major batches laid end to end (A[b] at b*M*K, B[b] at
         // b*K*N, C[b] at b*M*N), as one CLBlast strided-batched SGEMM.
+        // strideA: elements between consecutive A matrices, M * K when negative; 0 shares one A across the batch.
         private bool TryExecuteClBlastBatchedGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, int batchCount,
-            float alpha, float beta)
+            float alpha, float beta, long strideA = -1)
         {
             if (_context == null || !ClBlastNative.IsAvailable || K <= 0 || beta != 0f)
                 return false;
@@ -6212,7 +6213,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                             ClBlastNative.Transpose.No,
                             (UIntPtr)M, (UIntPtr)N, (UIntPtr)K,
                             alpha,
-                            bufferA.Handle, UIntPtr.Zero, (UIntPtr)K, (UIntPtr)((long)M * K),
+                            bufferA.Handle, UIntPtr.Zero, (UIntPtr)K, (UIntPtr)(strideA < 0 ? (long)M * K : strideA),
                             bufferB.Handle, UIntPtr.Zero, (UIntPtr)N, (UIntPtr)((long)K * N),
                             beta,
                             bufferC.Handle, UIntPtr.Zero, (UIntPtr)N, (UIntPtr)((long)M * N),
@@ -8625,7 +8626,28 @@ KERNEL VARIANTS (A/B testing):
             IGpuBuffer runningMean, IGpuBuffer runningVar, int batch, int channels, int spatialSize, float epsilon, int activation)
         {
             long total = (long)batch * channels * spatialSize;
-            if (total <= 0 || total > int.MaxValue || !_kernelCache.TryGetValue("batchnorm_inference", out var kernel))
+            if (total <= 0 || total > int.MaxValue) return false;
+            // Four elements of one channel plane per work item where the plane splits into whole float4s.
+            if ((spatialSize & 3) == 0 && (long)batch * channels <= int.MaxValue
+                && _kernelCache.TryGetValue("batchnorm_inference4", out var kernel4))
+            {
+                uint a4 = 0;
+                kernel4.SetArg(a4++, BufferHandle(input));
+                kernel4.SetArg(a4++, BufferHandle(output));
+                kernel4.SetArg(a4++, BufferHandle(gamma));
+                kernel4.SetArg(a4++, BufferHandle(beta));
+                kernel4.SetArg(a4++, BufferHandle(runningMean));
+                kernel4.SetArg(a4++, BufferHandle(runningVar));
+                kernel4.SetArg(a4++, channels);
+                kernel4.SetArg(a4++, spatialSize);
+                kernel4.SetArg(a4++, epsilon);
+                kernel4.SetArg(a4, activation);
+                int quads = spatialSize / 4;
+                int localX = quads >= 64 ? 64 : RoundUpToMultiple(quads, 8);
+                kernel4.Execute2D(RoundUpToMultiple(quads, localX), batch * channels, localX, 1);
+                return true;
+            }
+            if (!_kernelCache.TryGetValue("batchnorm_inference", out var kernel))
                 return false;
             uint arg = 0;
             kernel.SetArg(arg++, BufferHandle(input));

@@ -60,6 +60,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                                     && HasTunedKernel(Kernels.BatchedGemmKernels.Im2ColWide)
                                     && HasTunedKernel(Kernels.BatchedGemmKernels.Rb64SplitK),
                                 (in TunedConv2DArgs a) => Conv2DIm2ColRbGemm(a)),
+                            // A 1x1, stride-1, unpadded convolution over a batch: one strided-batched GEMM per image with
+                            // the filter shared (A stride 0), written straight into the NCHW output. im2col + GEMM copies the
+                            // whole input into a column buffer and permutes the whole output back, two passes over each,
+                            // and DenseNet-121 runs 58 such convolutions on its growing concatenations.
+                            new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.pointwise_batched", TunedKernelOrigin.Builtin, true,
+                                shape => shape[0] > 1 && shape[5] == 1 && shape[6] == 1 && shape[7] == 1 && shape[8] == 1
+                                    && shape[9] == 0 && shape[10] == 0 && ClBlastNative.IsAvailable,
+                                (in TunedConv2DArgs a) =>
+                                {
+                                    if (!Conv2DPointwiseBatched(a)) Conv2DGeneric(a);
+                                    ConvEpiloguePasses(a);
+                                }),
                         };
                         _conv2DForwardSlot = new TunedKernelSlot<TunedConv2DArgs>(TunedKernelOp.Conv2DForward, TunedDeviceKey,
                             new BackendTunedKernelHarness<TunedConv2DArgs>(this, ConvolutionTolerance, () => IsAvailable,
@@ -103,6 +115,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             if (!TryConvNchwEpilogue(a)) ConvEpilogue.RunPasses(this, a);
         }
+
+        // out[b] = W[Cout, Cin] * x[b][Cin, H * W] for every image b, the filter shared across the batch. False when CLBlast
+        // declined (the caller then runs the generic route).
+        internal bool Conv2DPointwiseBatched(in TunedConv2DArgs a)
+            => TryExecuteClBlastBatchedGemm(a.Kernel, a.Input, a.Output, a.OutChannels, a.OutHeight * a.OutWidth,
+                a.InChannels, a.Batch, 1f, 0f, strideA: 0);
 
         private void Conv2DGeneric(in TunedConv2DArgs a)
             => Conv2DGenericCore(a.Input, a.Kernel, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth, a.OutChannels,

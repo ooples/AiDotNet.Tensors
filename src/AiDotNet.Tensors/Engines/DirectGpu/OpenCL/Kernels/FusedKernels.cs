@@ -569,6 +569,36 @@ __kernel void batchnorm_inference(
     float r = gamma[c] * ((input[idx] - runningMean[c]) * invVar) + beta[c];
     output[idx] = activation == 1 ? fmax(0.0f, r) : activation == 2 ? fmin(fmax(0.0f, r), 6.0f) : r;
 }
+// batchnorm_inference over a spatial size that is a multiple of 4: work item (q, bc) takes elements 4q..4q+3 of plane bc
+// (= b * channels + c) with one vload4/vstore4, its channel's statistics read once. The one-element form paid an integer
+// division and modulo, four parameter loads and a square root per element: 3.3 ms for 8.4M elements of a batch-32
+// DenseNet-121 (~20 GB/s). Same per-element arithmetic, so the two agree up to multiply-add contraction.
+__kernel void batchnorm_inference4(
+    __global const float* input,
+    __global float* output,
+    __global const float* gamma,
+    __global const float* beta,
+    __global const float* runningMean,
+    __global const float* runningVar,
+    const int channels,
+    const int spatialSize,
+    const float epsilon,
+    const int activation)
+{
+    const int q = get_global_id(0);
+    const int bc = get_global_id(1);
+    if (4 * q >= spatialSize) return;
+    const int c = bc % channels;
+    const float invVar = 1.0f / sqrt(runningVar[c] + epsilon);
+    const float g = gamma[c], m = runningMean[c], b = beta[c];
+    const long at = (long)bc * spatialSize + 4 * q;
+    float4 x = vload4(0, input + at);
+    float4 r = g * ((x - m) * invVar) + b;
+    if (activation == 1) r = fmax((float4)(0.0f), r);
+    else if (activation == 2) r = fmin(fmax((float4)(0.0f), r), (float4)(6.0f));
+    vstore4(r, 0, output + at);
+}
+
 // Fused BatchNorm + GELU (Inference)
 __kernel void batchnorm_gelu(
     __global const float* input,
@@ -809,7 +839,7 @@ __kernel void reduce_variance_local(
                 "gemm_bias_sigmoid", "gemm_bias_tanh", "gemm_bias",
                 "layernorm_relu", "layernorm_gelu",
                 "residual_layernorm", "scaled_softmax", "bias_dropout",
-                "batchnorm_inference", "batchnorm_relu", "batchnorm_gelu",
+                "batchnorm_inference", "batchnorm_inference4", "batchnorm_relu", "batchnorm_gelu",
                 "batchnorm_sigmoid", "batchnorm_tanh", "residual_batchnorm_relu",
                 "lerp_fused", "add_scaled",
                 "reduce_sum_local", "reduce_variance_local"
