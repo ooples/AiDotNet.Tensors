@@ -116,6 +116,22 @@ public partial class CpuEngine
             }
         }
 
+        /// <summary>
+        /// Forgets the fold cached for <paramref name="kernel"/>, handing its folded tensors to
+        /// <paramref name="release"/>; nothing when there is none.
+        /// </summary>
+        internal static void Forget(Tensor<T> kernel, Action<Tensor<T>> release)
+        {
+            Entry? entry;
+            lock (s_entries)
+            {
+                if (!s_entries.TryGetValue(kernel, out entry)) return;
+                s_entries.Remove(kernel);
+            }
+            release(entry.Kernel);
+            release(entry.FoldedBias);
+        }
+
         internal static (Tensor<T> Kernel, Tensor<T> Bias) FoldOnHost(Tensor<T> kernel, Tensor<T>? bias, Tensor<T> gamma,
             Tensor<T> beta, Tensor<T> mean, Tensor<T> variance, double epsilon)
         {

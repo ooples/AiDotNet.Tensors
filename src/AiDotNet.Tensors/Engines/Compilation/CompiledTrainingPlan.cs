@@ -5657,7 +5657,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // the host update path: weights round-tripped every step and each host write retired the captured step
             // graph. Bound, the parity MLP trains in 3.42 ms/step instead of 6.81, with the graph replaying.
             if (_engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine rde)
-                rde.RegisterResidentParamBuffer(_parameters[p]);
+                rde.BindResidentParamBuffer(_parameters[p]);
             var paramGpuBuf = _parameters[p].TryGetGpuBuffer();
             var paramBackend = _parameters[p]._gpuBackend;
             if (paramGpuBuf is not null && paramBackend is not null
@@ -7089,7 +7089,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // the host update path: weights round-tripped every step and each host write retired the captured step
             // graph. Bound, the parity MLP trains in 3.42 ms/step instead of 6.81, with the graph replaying.
             if (_engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine rde)
-                rde.RegisterResidentParamBuffer(_parameters[p]);
+                rde.BindResidentParamBuffer(_parameters[p]);
             var paramGpuBuf = _parameters[p].TryGetGpuBuffer();
             var paramBackend = _parameters[p]._gpuBackend;
             if (paramGpuBuf is not null && paramBackend is not null
