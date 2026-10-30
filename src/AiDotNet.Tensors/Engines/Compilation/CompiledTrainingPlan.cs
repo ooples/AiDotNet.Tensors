@@ -4227,6 +4227,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             }
             // Only a whole executed run is evidence; a capture records, and a body that threw left its pairing unknown.
             _firstWriteRedirects.EndRun(executed && completed);
+            // A redirected slot's op writes its accumulator from now on, so the slot's own buffer is never used again
+            // (DenseNet-121 on OpenCL: ~1.8 GB of them). Without graph capture nothing has baked its address in: the pool
+            // forgets it, and its finalizer frees it once the last tensor bound to it is gone.
+            if (executed && completed && _scratchPool is { } scratchPool
+                && backend is not Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true })
+                foreach (long slot in _firstWriteRedirects.RedirectedSlots) scratchPool.Forget(slot);
         }
     }
 

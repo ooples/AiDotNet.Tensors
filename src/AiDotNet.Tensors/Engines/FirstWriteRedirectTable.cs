@@ -57,6 +57,9 @@ internal sealed class FirstWriteRedirectTable
         if (!_blocked.Contains(slot)) _offers[slot] = (contribution, accumulator);
     }
 
+    /// <summary>The redirected slots.</summary>
+    internal IEnumerable<long> RedirectedSlots => _redirects.Keys;
+
     internal bool TryGetTarget(long slot, out IGpuBuffer target) => _redirects.TryGetValue(slot, out target!);
 
     internal void Drop(long slot) => _redirects.Remove(slot);

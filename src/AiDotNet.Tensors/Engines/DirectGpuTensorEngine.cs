@@ -1690,6 +1690,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!Helpers.ResidentHostMirror.TryFindCovering(view, array, view._storageOffset, view.Length, backend,
                 out var memberBuffer, out int start) || memberBuffer is null)
             return false;
+        // Read the range in place where the member buffer can be addressed there: a copy per call was a whole input
+        // activation held in a step scratch slot per convolution backward (~1 GB on a GPU DenseNet-121 step).
+        if (start == 0 && memberBuffer.Size >= view.Length)
+        {
+            result = new OwnedBuffer(memberBuffer, ownsBuffer: false);
+            return true;
+        }
+        if (backend is IGpuBufferViews views && views.TryCreateView(memberBuffer, start, view.Length) is { } window)
+        {
+            result = new OwnedBuffer(window, ownsBuffer: true);
+            return true;
+        }
         var output = AllocateFullyWrittenOutputBuffer(backend, view.Length);
         try
         {
@@ -19117,6 +19129,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var permDims = new int[permArr.Length];
                 for (int i = 0; i < permArr.Length; i++) permDims[i] = inputShape[permArr[i]];
                 var permuted = new Tensor<T>(new T[input.Length], permDims);
+                // The permuted copy lives only for this reduction: it comes from the transient arena the plan's actions
+                // share, not an output slot of its own per action (a GPU DenseNet-121 step held ~0.5 GB of them for its
+                // convolution bias gradients).
+                if (ScratchPoolingActive)
+                {
+                    permuted._gpuBuffer = RentTransientScratch(backend, input.Length, fullyWritten: true);
+                    permuted._gpuBackend = backend;
+                    permuted._gpuBufferVersion = permuted.GpuCacheVersion;
+                }
                 try { TensorPermuteInto(permuted, input, permArr); input = permuted; }
                 catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("ReduceAxisGpu", capabilityGap); input = PermuteImpl(input, permArr); }
             }

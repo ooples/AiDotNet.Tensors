@@ -68,6 +68,18 @@ internal sealed class StepScratchPool
 
     internal static void Untrack(IGpuBuffer buffer) => s_pooled.Remove(buffer);
 
+    /// <summary>
+    /// Drops output slot <paramref name="key"/> without freeing its buffer: a tensor may still be bound to it, so its
+    /// finalizer frees it once nothing references it. The next rent at that key allocates afresh.
+    /// </summary>
+    internal void Forget(long key)
+    {
+        if (!Slots.TryGetValue(key, out var buffer)) return;
+        Slots.Remove(key);
+        Keys.Remove(buffer);
+        Untrack(buffer);
+    }
+
     /// <summary>Frees every buffer now. Only for a caller that knows no captured graph or tensor still uses them.</summary>
     internal void Release()
     {
