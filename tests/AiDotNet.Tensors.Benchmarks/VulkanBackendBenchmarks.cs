@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Comprehensive benchmarks for Vulkan GPU backend to identify performance bottlenecks.
 
 using System;

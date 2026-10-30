@@ -1,5 +1,5 @@
 #if NET8_0_OR_GREATER
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Issue #245 — transformer-FFN matmul benchmark coverage.
 //
 // Why this suite exists:
