@@ -219,7 +219,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             k.SetArg(arg++, a.KernelH); k.SetArg(arg++, a.KernelW); k.SetArg(arg++, a.StrideH); k.SetArg(arg++, a.StrideW);
             k.SetArg(arg++, a.PadH); k.SetArg(arg++, a.PadW); k.SetArg(arg++, a.DilationH); k.SetArg(arg++, a.DilationW);
             k.SetArg(arg++, a.OutHeight); k.SetArg(arg++, a.OutWidth);
-            k.Execute1D(RoundUpToMultiple(a.Batch * l, 64), 64);
+            k.Execute1D(RoundUpToMultiple(a.Batch * l * p, 64), 64);   // one work item per col element
             if (a.Batch == 1)
             {
                 Gemm(a.Kernel, col, a.Output, a.OutChannels, l, p);
