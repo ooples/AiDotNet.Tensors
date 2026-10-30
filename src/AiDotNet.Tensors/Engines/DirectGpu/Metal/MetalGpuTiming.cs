@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Device-clock timing for the tuned-kernel registry on Metal (#1116).
 using System;
 using static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings;

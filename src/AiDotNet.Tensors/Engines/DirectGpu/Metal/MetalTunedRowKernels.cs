@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Generated row / column kernel variants for Metal, served through the tuned-kernel registry (#1116).
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;

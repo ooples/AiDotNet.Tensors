@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Metal (MSL) compute shaders for the fused recurrence / LM-head ops (#1464). Real GPU kernels —
 // they mirror the HIP/CUDA/OpenCL kernels and the CpuEngine math exactly. One thread per the same
 // work-item as the other backends. The cross-entropy kernels write a per-row loss vector (the host

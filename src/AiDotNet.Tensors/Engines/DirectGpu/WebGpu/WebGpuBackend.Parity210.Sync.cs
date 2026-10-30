@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // #775: synchronous IParity210Backend for WebGPU. WebGPU's compute submission is
 // async (the *Async methods in WebGpuBackend.Parity210.cs); these members block on
 // them via GetAwaiter().GetResult() — the same sync-over-async pattern the extended-

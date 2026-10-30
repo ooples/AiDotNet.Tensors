@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // WebGPU (WGSL) compute shaders for the fused recurrence / LM-head ops (#1464). Real GPU kernels —
 // mirror the HIP/CUDA/OpenCL/MSL/GLSL kernels and the CpuEngine math exactly. Int params come in
 // via a uniform struct bound after the storage buffers. Forward only — the differentiable backward

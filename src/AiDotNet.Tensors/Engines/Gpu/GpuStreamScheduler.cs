@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // PR #333 / issue #335 — schedules independent kernel launches across the
 // streams in a GpuStreamPool. Solves the "every kernel serializes on
 // _defaultStream" perf gap by round-robining independent work across

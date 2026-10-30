@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Metal GPU backend - Trigonometric, Hyperbolic, and Additional Unary operations.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;

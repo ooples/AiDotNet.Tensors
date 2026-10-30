@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Fused convolution kernels - Conv2D + BatchNorm/Bias + Activation in single pass.
 // Eliminates memory round-trips for 30-60% performance gain in CNN pipelines.
 

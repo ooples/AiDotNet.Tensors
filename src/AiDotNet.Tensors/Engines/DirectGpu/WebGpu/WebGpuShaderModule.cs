@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // WebGPU shader module and compute pipeline management.
 // Only available in .NET 7+ with Blazor WebAssembly.
 

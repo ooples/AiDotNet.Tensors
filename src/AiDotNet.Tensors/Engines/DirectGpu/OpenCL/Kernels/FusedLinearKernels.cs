@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // OpenCL fused linear (MatMul + Bias + Activation) kernels.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels;
