@@ -116,6 +116,9 @@ jobs:
         # past the hang timeout under CI CPU contention). Excluding them drops that test to ~28s and
         # the whole suite by most of an hour. Line coverage of hand-emitted SIMD intrinsics is not
         # meaningful anyway, and those kernels are exercised by every numerical test regardless.
+        # Engines.CpuJit.* emits x64 machine code for the Windows calling convention only (CpuJitKernels.IsSupported
+        # is false off Windows), so this ubuntu run can never execute it: every line a PR changed there read 0%
+        # patch coverage (#1633). CpuJitTests runs it on Windows hosts.
         # PyTorchParity / PyTorchParityGpu measure the absolute distance to PyTorch parity (#1055). They are red
         # by design until parity is reached, so they run in parity.yml's nightly lane, not as a PR gate.
         dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-build --verbosity normal --framework net10.0 \
@@ -124,7 +127,7 @@ jobs:
           --collect:"XPlat Code Coverage" \
           --results-directory ./coverage \
           -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura \
-          DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Exclude="[*]AiDotNet.Tensors.Engines.DirectGpu.*,[*]AiDotNet.Tensors.Engines.DirectGpuTensorEngine*,[*]AiDotNet.Tensors.Engines.Cu*,[*]AiDotNet.Tensors.Engines.ClBlast*,[*]AiDotNet.Tensors.Engines.OpenCl*,[*]AiDotNet.Tensors.Engines.Simd.*,[*]AiDotNet.Tensors.Engines.BlasManaged.*"
+          DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Exclude="[*]AiDotNet.Tensors.Engines.DirectGpu.*,[*]AiDotNet.Tensors.Engines.DirectGpuTensorEngine*,[*]AiDotNet.Tensors.Engines.Cu*,[*]AiDotNet.Tensors.Engines.ClBlast*,[*]AiDotNet.Tensors.Engines.OpenCl*,[*]AiDotNet.Tensors.Engines.Simd.*,[*]AiDotNet.Tensors.Engines.BlasManaged.*,[*]AiDotNet.Tensors.Engines.CpuJit.*"
 
     - name: Test the AVX2/FMA fallbacks (DOTNET_EnableAVX2=0)
       env:
@@ -143,7 +146,7 @@ jobs:
           --collect:"XPlat Code Coverage" \
           --results-directory ./coverage/avx2-off \
           -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura \
-          DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Exclude="[*]AiDotNet.Tensors.Engines.DirectGpu.*,[*]AiDotNet.Tensors.Engines.DirectGpuTensorEngine*,[*]AiDotNet.Tensors.Engines.Cu*,[*]AiDotNet.Tensors.Engines.ClBlast*,[*]AiDotNet.Tensors.Engines.OpenCl*,[*]AiDotNet.Tensors.Engines.Simd.*,[*]AiDotNet.Tensors.Engines.BlasManaged.*"
+          DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Exclude="[*]AiDotNet.Tensors.Engines.DirectGpu.*,[*]AiDotNet.Tensors.Engines.DirectGpuTensorEngine*,[*]AiDotNet.Tensors.Engines.Cu*,[*]AiDotNet.Tensors.Engines.ClBlast*,[*]AiDotNet.Tensors.Engines.OpenCl*,[*]AiDotNet.Tensors.Engines.Simd.*,[*]AiDotNet.Tensors.Engines.BlasManaged.*,[*]AiDotNet.Tensors.Engines.CpuJit.*"
 
     # If --blame-hang-timeout (a test made no progress for 300s) or --blame-crash (test host
     # native-crashed, e.g. a CUDA-finalizer 0xC0000005) fired, the hang/crash dump + the
