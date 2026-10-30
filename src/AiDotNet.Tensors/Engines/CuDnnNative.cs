@@ -978,6 +978,13 @@ public sealed class CuDnnContext : IDisposable
     private static bool _checkedAvailability;
     private static readonly object _lock = new object();
 
+    /// <summary>
+    /// Held from <c>cudnnSetStream</c> through the launch it binds. The stream is a property of the shared handle, so
+    /// without this another thread can rebind it in between and the launch lands on that thread's stream — inside its
+    /// graph capture (CUDA 900 "operation not permitted when stream is capturing", then 901 for the capturer).
+    /// </summary>
+    internal object StreamBindingLock { get; } = new object();
+
     /// <summary>Gets whether cuDNN is available on this system.</summary>
     public static bool IsAvailable
     {

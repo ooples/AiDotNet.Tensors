@@ -68,10 +68,13 @@ public sealed partial class CudaBackend
         EnsureCudnnConv();
         var conv = _cudnnConv ?? throw new InvalidOperationException("cuDNN convolution is unavailable.");
         var context = _cudnnContext ?? throw new InvalidOperationException("cuDNN is unavailable.");
-        CuDnnContext.CheckStatus(CuDnnNative.cudnnSetStream(context.Handle, _stream), "cudnnSetStream");
-        conv.Conv2DForwardGpu(a.Input.Handle, a.Kernel.Handle, a.Output.Handle, a.Batch, a.InChannels, a.InHeight,
-            a.InWidth, a.OutChannels, a.KernelH, a.KernelW, a.OutHeight, a.OutWidth, a.PadH, a.PadW, a.StrideH,
-            a.StrideW, a.DilationH, a.DilationW, algorithm: algorithm, mathType: CudnnConvMath);
+        lock (context.StreamBindingLock)
+        {
+            CuDnnContext.CheckStatus(CuDnnNative.cudnnSetStream(context.Handle, _stream), "cudnnSetStream");
+            conv.Conv2DForwardGpu(a.Input.Handle, a.Kernel.Handle, a.Output.Handle, a.Batch, a.InChannels, a.InHeight,
+                a.InWidth, a.OutChannels, a.KernelH, a.KernelW, a.OutHeight, a.OutWidth, a.PadH, a.PadW, a.StrideH,
+                a.StrideW, a.DilationH, a.DilationW, algorithm: algorithm, mathType: CudnnConvMath);
+        }
         RunConvEpiloguePasses(a);
     }
 
@@ -81,16 +84,19 @@ public sealed partial class CudaBackend
         EnsureCudnnConv();
         var conv = _cudnnConv ?? throw new InvalidOperationException("cuDNN convolution is unavailable.");
         var context = _cudnnContext ?? throw new InvalidOperationException("cuDNN is unavailable.");
-        CuDnnContext.CheckStatus(CuDnnNative.cudnnSetStream(context.Handle, _stream), "cudnnSetStream");
-        // Weight gradient: First = input, Second = gradOutput. Data gradient: First = gradOutput, Second = kernel.
-        if (a.WeightGradient)
-            conv.Conv2DBackwardFilterGpu(a.First.Handle, a.Second.Handle, a.Output.Handle, a.Batch, a.InChannels,
-                a.InHeight, a.InWidth, a.OutChannels, a.KernelH, a.KernelW, a.OutHeight, a.OutWidth, a.PadH, a.PadW,
-                a.StrideH, a.StrideW, a.DilationH, a.DilationW, algorithm: algorithm, mathType: CudnnConvMath);
-        else
-            conv.Conv2DBackwardDataGpu(a.Second.Handle, a.First.Handle, a.Output.Handle, a.Batch, a.InChannels,
-                a.InHeight, a.InWidth, a.OutChannels, a.KernelH, a.KernelW, a.OutHeight, a.OutWidth, a.PadH, a.PadW,
-                a.StrideH, a.StrideW, a.DilationH, a.DilationW, algorithm: algorithm, mathType: CudnnConvMath);
+        lock (context.StreamBindingLock)
+        {
+            CuDnnContext.CheckStatus(CuDnnNative.cudnnSetStream(context.Handle, _stream), "cudnnSetStream");
+            // Weight gradient: First = input, Second = gradOutput. Data gradient: First = gradOutput, Second = kernel.
+            if (a.WeightGradient)
+                conv.Conv2DBackwardFilterGpu(a.First.Handle, a.Second.Handle, a.Output.Handle, a.Batch, a.InChannels,
+                    a.InHeight, a.InWidth, a.OutChannels, a.KernelH, a.KernelW, a.OutHeight, a.OutWidth, a.PadH, a.PadW,
+                    a.StrideH, a.StrideW, a.DilationH, a.DilationW, algorithm: algorithm, mathType: CudnnConvMath);
+            else
+                conv.Conv2DBackwardDataGpu(a.Second.Handle, a.First.Handle, a.Output.Handle, a.Batch, a.InChannels,
+                    a.InHeight, a.InWidth, a.OutChannels, a.KernelH, a.KernelW, a.OutHeight, a.OutWidth, a.PadH, a.PadW,
+                    a.StrideH, a.StrideW, a.DilationH, a.DilationW, algorithm: algorithm, mathType: CudnnConvMath);
+        }
     }
 
     /// <summary>The forward slot with cuDNN: cuDNN's default algorithm the reference, every route a candidate.</summary>
