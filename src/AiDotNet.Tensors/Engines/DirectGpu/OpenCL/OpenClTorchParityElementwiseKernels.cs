@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // OpenCL C port of the PyTorch-parity elementwise kernels (#1126), function for function with
 // CUDA/Kernels/CudaTorchParityElementwiseKernels: the same argument order, branches and NaN semantics.
 //

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CPU reference tests for the geometry / sampling ops added by Issue #217:
 // Interpolate (6 modes), PadNd (4 modes), GridSample (mode + padding +
 // align_corners matrix), AffineGrid3D. Ground-truth values are computed

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Every kernel name CudaBackend looks up must actually be defined in a CUDA kernel source (#775).
 //
 // WHY THIS EXISTS. CudaBackend.BroadcastMultiplyLastAxis asked the kernel cache for

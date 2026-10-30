@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Comprehensive benchmarks for Metal GPU backend to identify performance bottlenecks.
 // Metal is only available on macOS/iOS with Apple Silicon.
 

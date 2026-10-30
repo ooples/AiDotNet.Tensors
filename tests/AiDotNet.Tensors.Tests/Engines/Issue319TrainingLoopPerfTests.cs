@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Issue #319 — diagnostic harness for the *training* hot path
 // (forward + backward + optimizer), not the forward-only block
 // covered by Issue319TransformerBlockPerfTests.

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The declared-program route (#890 phase 4): CudaBackend.LayerNorm is served by the program
 // lowered from its spec, in the hand-written kernel's contract (y, the saved mean and rstd).
 //

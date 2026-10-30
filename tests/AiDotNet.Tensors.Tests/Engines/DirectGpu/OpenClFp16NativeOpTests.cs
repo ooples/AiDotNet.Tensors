@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Correctness tests for the OpenCL FP16-NATIVE op kernels (issue #558): GELU / ReLU / residual-add over
 // half-stored activations, computed in FP32 in-register. Validates the GPU counterpart of the CPU
 // FP16-native emit — the activation buffers the kernel reads AND writes are genuinely Half (2 bytes).

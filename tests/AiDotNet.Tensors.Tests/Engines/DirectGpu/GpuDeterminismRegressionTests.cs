@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Regression test for issue #382: GPU floating-point reductions must be bit-identical
 // across runs at the same seed when AiDotNetEngine.SetDeterministicMode(true) is in effect.
 

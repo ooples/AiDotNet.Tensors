@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Phase 1 of issue #214: InferenceMode scope, higher-order gradients,
 // TensorFunc.Grad / GradAndValue.
 //

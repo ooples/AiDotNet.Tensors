@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Feature-based Bayesian tuner with ARD kernel for GEMM configuration selection.
 
 using System;

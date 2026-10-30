@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Issue #285 — chunker integration tests using DispatchProxy mock.
 // Gated to non-Framework targets: DispatchProxy (.NET Core 5+) isn't
 // on .NET Framework, and the mock backend depends on it.

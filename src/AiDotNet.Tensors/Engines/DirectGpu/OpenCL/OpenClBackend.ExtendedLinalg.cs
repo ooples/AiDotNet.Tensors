@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // OpenCL IExtendedLinalgBackend (#1142): the portable solver family over the shared la_ kernels.
 using P = AiDotNet.Tensors.Engines.DirectGpu.PortableExtendedLinalg;
 

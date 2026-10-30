@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Tests for the image codec surface (Issue #217 tail). PNG is pure
 // managed so tested here; JPEG / WebP are native-bound and their
 // decode/encode paths throw PlatformNotSupportedException when

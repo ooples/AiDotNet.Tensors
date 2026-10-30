@@ -157,23 +157,30 @@ public sealed class Float32ConvGradientReferenceTests
         var dw = new double[outChannels * inChannels * kernel * kernel];
         var db = new double[outChannels];
         var dx = new double[batch * inChannels * size * size];
+        // Flat copies: the tensor indexer resolves host sync on every access, which under coverage on a 2-core runner
+        // took the largest shapes past the 10-minute hang timeout. Same NCHW / OIHW order as the indexer.
+        float[] xs = x.ToArray(), ws = w.ToArray(), gs = g.ToArray();
+        float[]? bs = bias?.ToArray();
+        int XAt(int b, int c, int h, int ww) => ((b * inChannels + c) * size + h) * size + ww;
+        int WAt(int o, int c, int h, int ww) => ((o * inChannels + c) * kernel + h) * kernel + ww;
         for (int b = 0; b < batch; b++)
         for (int o = 0; o < outChannels; o++)
         for (int oh = 0; oh < outSize; oh++)
         for (int ow = 0; ow < outSize; ow++)
         {
-            double pre = bias is null ? 0.0 : bias[o];
+            double pre = bs is null ? 0.0 : bs[o];
             for (int c = 0; c < inChannels; c++)
             for (int kh = 0; kh < kernel; kh++)
             for (int kw = 0; kw < kernel; kw++)
             {
                 int ih = oh * stride - pad + kh, iw = ow * stride - pad + kw;
                 if (ih < 0 || iw < 0 || ih >= size || iw >= size) continue;
-                pre += (double)x[b, c, ih, iw] * w[o, c, kh, kw];
+                pre += (double)xs[XAt(b, c, ih, iw)] * ws[WAt(o, c, kh, kw)];
             }
             bool pass = !relu || pre > 0;
-            y[((b * outChannels + o) * outSize + oh) * outSize + ow] = pass ? pre : 0.0;
-            double gv = pass ? g[b, o, oh, ow] : 0.0;
+            int yAt = ((b * outChannels + o) * outSize + oh) * outSize + ow;
+            y[yAt] = pass ? pre : 0.0;
+            double gv = pass ? gs[yAt] : 0.0;
             db[o] += gv;
             for (int c = 0; c < inChannels; c++)
             for (int kh = 0; kh < kernel; kh++)
@@ -181,8 +188,8 @@ public sealed class Float32ConvGradientReferenceTests
             {
                 int ih = oh * stride - pad + kh, iw = ow * stride - pad + kw;
                 if (ih < 0 || iw < 0 || ih >= size || iw >= size) continue;
-                dw[((o * inChannels + c) * kernel + kh) * kernel + kw] += gv * x[b, c, ih, iw];
-                dx[((b * inChannels + c) * size + ih) * size + iw] += gv * w[o, c, kh, kw];
+                dw[WAt(o, c, kh, kw)] += gv * xs[XAt(b, c, ih, iw)];
+                dx[XAt(b, c, ih, iw)] += gv * ws[WAt(o, c, kh, kw)];
             }
         }
         return (y, dw, db, dx);
@@ -194,9 +201,10 @@ public sealed class Float32ConvGradientReferenceTests
         double scale = 0.0, worst = 0.0;
         int worstIndex = -1;
         foreach (var e in expected) scale = Math.Max(scale, Math.Abs(e));
+        float[] values = actual.ToArray();
         for (int i = 0; i < expected.Length; i++)
         {
-            double err = Math.Abs(actual.GetFlat(i) - expected[i]);
+            double err = Math.Abs(values[i] - expected[i]);
             if (err > worst) { worst = err; worstIndex = i; }
         }
         double relative = worst / Math.Max(scale, 1e-12);

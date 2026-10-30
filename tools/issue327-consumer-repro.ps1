@@ -1,4 +1,4 @@
-# Copyright (c) AiDotNet. All rights reserved.
+# Copyright (c) CrowdTrainer LLC. All rights reserved.
 #
 # Issue #327 consumer-side repro driver. Clones HarmonicEngine,
 # points its NuGet feed at this repo's locally-built AiDotNet.Tensors

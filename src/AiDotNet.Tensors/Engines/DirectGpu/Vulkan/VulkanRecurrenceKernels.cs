@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Vulkan GLSL compute shaders for the fused recurrence / LM-head ops (#1464), compiled to SPIR-V
 // at runtime (libshaderc). Real GPU kernels — mirror the HIP/CUDA/OpenCL/MSL kernels and the
 // CpuEngine math exactly. Int params are passed as push constants. Forward only — the

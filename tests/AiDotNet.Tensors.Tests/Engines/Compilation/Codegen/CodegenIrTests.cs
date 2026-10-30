@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Phase A of issue #225: codegen IR definition — CodegenOpKind
 // taxonomy, CodegenElementType, CodegenNode/Graph construction +
 // invariants, and CodegenLowering helpers.

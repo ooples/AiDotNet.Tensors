@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The declared GEMM route (#890 phase 4c): Gemm, MatMulTransposed, MatMulTransposedA and BatchedGemm at alpha 1,
 // beta 0 offer declared schedules to the GEMM tuned slot, whose reference is each entry point's own path. Every
 // schedule is checked against an fp64 reference written out here, the entry points with the route on and off, the
