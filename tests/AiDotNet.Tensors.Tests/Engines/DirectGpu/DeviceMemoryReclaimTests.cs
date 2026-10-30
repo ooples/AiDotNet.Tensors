@@ -122,9 +122,9 @@ public sealed class DeviceMemoryReclaimTests
         // A TensorScope ending an inference call disposes its intermediates: they are back in the pool and credited, so
         // the collection their allocation asked for would recover nothing (#1432: it ran on every ResNet-50 predict).
         DeviceMemoryReclaim.ResetCountsForTests();
-        DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectAfterDeviceBytes);
+        long epoch = DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectAfterDeviceBytes);
         Assert.True(DeviceMemoryReclaim.CollectionDue);
-        DeviceMemoryReclaim.OnDeviceRelease(DeviceMemoryReclaim.CollectAfterDeviceBytes);
+        DeviceMemoryReclaim.OnDeviceRelease(DeviceMemoryReclaim.CollectAfterDeviceBytes, epoch);
         Assert.False(DeviceMemoryReclaim.CollectIfDueAtStepBoundary());
         Assert.False(DeviceMemoryReclaim.CollectionDue);
     }
@@ -133,10 +133,37 @@ public sealed class DeviceMemoryReclaimTests
     public void StepBoundary_Collects_WhenAbandonedBytesRemainPastTheThreshold()
     {
         DeviceMemoryReclaim.ResetCountsForTests();
-        DeviceMemoryReclaim.OnDeviceAllocation(2 * DeviceMemoryReclaim.CollectAfterDeviceBytes);
-        DeviceMemoryReclaim.OnDeviceRelease(DeviceMemoryReclaim.CollectAfterDeviceBytes / 2);   // some disposed, most abandoned
+        long epoch = DeviceMemoryReclaim.OnDeviceAllocation(2 * DeviceMemoryReclaim.CollectAfterDeviceBytes);
+        DeviceMemoryReclaim.OnDeviceRelease(DeviceMemoryReclaim.CollectAfterDeviceBytes / 2, epoch);   // some disposed, most abandoned
         Assert.True(DeviceMemoryReclaim.CollectIfDueAtStepBoundary());
         Assert.False(DeviceMemoryReclaim.CollectionDue);
+    }
+
+    [Fact]
+    public void ADisposeAfterACollection_DoesNotCreditTheChargeTheCollectionAlreadyDropped()
+    {
+        // A buffer whose charge was counted before a collection reset the count must not be credited against bytes
+        // charged after it: that would hide an abandoned allocation from the step-boundary collection.
+        DeviceMemoryReclaim.ResetCountsForTests();
+        long early = DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectAfterDeviceBytes);
+        Assert.True(DeviceMemoryReclaim.CollectIfDueAtStepBoundary());   // resets the count: a new epoch
+        DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectAfterDeviceBytes);   // abandoned
+        DeviceMemoryReclaim.OnDeviceRelease(DeviceMemoryReclaim.CollectAfterDeviceBytes, early);
+        Assert.True(DeviceMemoryReclaim.CollectionDue);
+        Assert.True(DeviceMemoryReclaim.CollectIfDueAtStepBoundary());
+    }
+
+    [Fact]
+    public void TheChargeThatSetsOffACollection_IsNotCreditedAfterIt()
+    {
+        // The allocation that pushes the count past CollectNowAfterDeviceBytes collects at once and zeroes the count;
+        // its later dispose has nothing left to credit.
+        DeviceMemoryReclaim.ResetCountsForTests();
+        long trigger = DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectNowAfterDeviceBytes);
+        Assert.False(DeviceMemoryReclaim.CollectionDue);
+        DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectAfterDeviceBytes);   // abandoned
+        DeviceMemoryReclaim.OnDeviceRelease(DeviceMemoryReclaim.CollectNowAfterDeviceBytes, trigger);
+        Assert.True(DeviceMemoryReclaim.CollectIfDueAtStepBoundary());
     }
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static void AbandonBuffer(IDirectGpuBackend backend) => backend.AllocateBuffer(1024);
