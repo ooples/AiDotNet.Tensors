@@ -88,6 +88,8 @@ internal static class GpuAutoDetectModuleInit
             // overrides AIDOTNET_VERBOSE_INIT for callers who want zero noise.
             var verboseInit = !string.IsNullOrEmpty(
                 Environment.GetEnvironmentVariable("AIDOTNET_VERBOSE_INIT"));
+            // Before the engine loads the OpenCL runtime, which reads these once.
+            DirectGpu.OpenCL.OpenClRuntimeDefaults.Apply();
             AiDotNetEngine.AutoDetectAndConfigureGpu(verbose: verboseInit);
         }
         catch

@@ -16,12 +16,15 @@ internal static class OpenClPlatformProbe
     // Windows ICD: "OpenCL.dll"; Linux ICD: "libOpenCL.so.1" / "libOpenCL.so"; macOS: framework path.
     private const string Lib = "OpenCL";
 
-#if NET5_0_OR_GREATER
     static OpenClPlatformProbe()
     {
+        OpenClRuntimeDefaults.Apply();
+#if NET5_0_OR_GREATER
         AiDotNet.Tensors.Engines.NativeLibraryResolverRegistry.Register(ResolveLib);
+#endif
     }
 
+#if NET5_0_OR_GREATER
     private static IntPtr ResolveLib(string name, System.Reflection.Assembly asm, DllImportSearchPath? path)
     {
         if (name != Lib) return IntPtr.Zero;
