@@ -556,7 +556,7 @@ __kernel void batchnorm_inference(
     const int channels,
     const int spatialSize,
     const float epsilon,
-    const int applyRelu)
+    const int activation)   // 0 none, 1 ReLU, 2 ReLU6
 {
     const int idx = get_global_id(0);
     const int totalSize = batch * channels * spatialSize;
@@ -567,7 +567,7 @@ __kernel void batchnorm_inference(
     // so the routes agree up to the compiler's multiply-add contraction.
     float invVar = 1.0f / sqrt(runningVar[c] + epsilon);
     float r = gamma[c] * ((input[idx] - runningMean[c]) * invVar) + beta[c];
-    output[idx] = applyRelu ? fmax(0.0f, r) : r;
+    output[idx] = activation == 1 ? fmax(0.0f, r) : activation == 2 ? fmin(fmax(0.0f, r), 6.0f) : r;
 }
 // Fused BatchNorm + GELU (Inference)
 __kernel void batchnorm_gelu(
