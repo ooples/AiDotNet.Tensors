@@ -45,21 +45,26 @@ inline void row_mlp_layer(__local const float* src, __local float* dst, __global
             }
             if (toGlobal) y[j] = v; else dst[j] = v;
         }
-        return;
     }
-    const int splits = RM_GROUP / n;
-    const int j = lid % n, s = lid / n;
-    float acc = 0.0f;
-    if (s < splits)
+    else
     {
-        const int chunk = (k + splits - 1) / splits;
-        const int k0 = s * chunk, k1 = min(k, k0 + chunk);
-        for (int kk = k0; kk < k1; kk++) acc += src[kk] * w[(long)kk * n + j];
+        const int splits = RM_GROUP / n;
+        const int j = lid % n, s = lid / n;
+        float acc = 0.0f;
+        if (s < splits)
+        {
+            const int chunk = (k + splits - 1) / splits;
+            const int k0 = s * chunk, k1 = min(k, k0 + chunk);
+            for (int kk = k0; kk < k1; kk++) acc += src[kk] * w[(long)kk * n + j];
+        }
+        partial[lid] = acc;
     }
-    partial[lid] = acc;
+    // Both paths reach this one barrier: POCL's work-group region formation aborts the process on a barrier that an
+    // early return lets some paths skip (Kernel.cc createParallelRegionBefore assertion).
     barrier(CLK_LOCAL_MEM_FENCE);
-    if (lid < n)
+    if (n < RM_GROUP && lid < n)
     {
+        const int splits = RM_GROUP / n;
         float v = 0.0f;
         for (int t = 0; t < splits; t++) v += partial[t * n + lid];
         if (hasBias) v += b[lid];
