@@ -8134,6 +8134,7 @@ public partial class DirectGpuTensorEngine
 
         try
         {
+            if (TryRowMlpForward(input, weights, biases, hiddenActivation, outputActivation) is { } row) return row;
             int last = weights.Count - 1;
             var cur = input;
             for (int i = 0; i < weights.Count; i++)
@@ -8147,6 +8148,63 @@ public partial class DirectGpuTensorEngine
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MlpForward", capabilityGap);
             return base.MlpForward(input, weights, biases, hiddenActivation, outputActivation,
                 hiddenActivationParams, outputActivationParams);
+        }
+    }
+
+    // One input row through the whole MLP in one launch (IRowMlpForwardBackend), or null to run it layer by layer. At
+    // batch 1 each layer was about three launches around a few hundred thousand multiply-adds.
+    private Tensor<T>? TryRowMlpForward<T>(Tensor<T> input, System.Collections.Generic.IReadOnlyList<Tensor<T>> weights,
+        System.Collections.Generic.IReadOnlyList<Tensor<T>?> biases, FusedActivationType hiddenActivation,
+        FusedActivationType outputActivation)
+    {
+        if (typeof(T) != typeof(float) || IsTapeActive<T>() || input.Rank != 2 || input._shape[0] != 1
+            || !TryGetBackend(out var backend) || backend is not IRowMlpForwardBackend rowMlp)
+            return null;
+        int layers = weights.Count;
+        var widths = new int[layers + 1];
+        widths[0] = input._shape[1];
+        for (int i = 0; i < layers; i++)
+        {
+            var w = weights[i];
+            if (w is null || w.Rank != 2 || w._shape[0] != widths[i]) return null;
+            widths[i + 1] = w._shape[1];
+            if (biases[i] is { } b && b.Length != widths[i + 1]) return null;
+        }
+
+        var owned = new System.Collections.Generic.List<OwnedBuffer>(2 * layers + 1);
+        try
+        {
+            var inputBuffer = GetOrAllocateBuffer(backend, input);
+            owned.Add(inputBuffer);
+            var weightBuffers = new IGpuBuffer[layers];
+            var biasBuffers = new IGpuBuffer?[layers];
+            for (int i = 0; i < layers; i++)
+            {
+                var wb = GetWeightBufferPreferResident(backend, weights[i], PersistentTensorRole.Weights);
+                owned.Add(wb);
+                weightBuffers[i] = wb.Buffer;
+                if (biases[i] is { } bias)
+                {
+                    var bb = GetWeightBufferPreferResident(backend, bias, PersistentTensorRole.Biases);
+                    owned.Add(bb);
+                    biasBuffers[i] = bb.Buffer;
+                }
+            }
+            int outputs = widths[layers];
+            var output = AllocateFullyWrittenOutputBuffer(backend, outputs);
+            if (!rowMlp.TryRowMlpForward(inputBuffer.Buffer, weightBuffers, biasBuffers, widths, hiddenActivation,
+                    outputActivation, output.Buffer))
+            {
+                output.Dispose();
+                return null;
+            }
+            var result = DeferTensorResult<T>(backend, output.Buffer, outputs, new[] { 1, outputs });
+            output.RelinquishOwnership();
+            return result;
+        }
+        finally
+        {
+            foreach (var buffer in owned) buffer.Dispose();
         }
     }
 

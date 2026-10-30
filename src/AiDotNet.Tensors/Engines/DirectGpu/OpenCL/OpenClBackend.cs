@@ -1193,6 +1193,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 ConvGemmEpilogueReady();
                 ShortAttentionReady();
                 StatisticConversionsReady();
+                RowMlpReady();
             }
             catch (Exception ex)
             {
