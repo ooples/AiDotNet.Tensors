@@ -6925,19 +6925,20 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // surrounding Cuda ops. Check the status — if stream binding
             // silently fails, subsequent cuDNN work runs with wrong
             // stream ordering and produces nondeterministic results.
-            CuDnnContext.CheckStatus(
-                CuDnnNative.cudnnSetStream(_cudnnContext!.Handle, _stream),
-                "cudnnSetStream");
-            _cudnnConv!.Conv2DForwardGpu(
-                inputDevPtr: input.Handle,
-                filterDevPtr: kernel.Handle,
-                outputDevPtr: output.Handle,
-                n: batch, c: inChannels, h: inHeight, w: inWidth,
-                k: outChannels, filterH: kernelH, filterW: kernelW,
-                outputHeight: outHeight, outputWidth: outWidth,
-                padH: padH, padW: padW,
-                strideH: strideH, strideW: strideW,
-                dilationH: dilationH, dilationW: dilationW);
+            lock (_cudnnContext!.StreamBindingLock)
+            {
+                _cudnnContext.BindStream(_stream);
+                _cudnnConv!.Conv2DForwardGpu(
+                    inputDevPtr: input.Handle,
+                    filterDevPtr: kernel.Handle,
+                    outputDevPtr: output.Handle,
+                    n: batch, c: inChannels, h: inHeight, w: inWidth,
+                    k: outChannels, filterH: kernelH, filterW: kernelW,
+                    outputHeight: outHeight, outputWidth: outWidth,
+                    padH: padH, padW: padW,
+                    strideH: strideH, strideW: strideW,
+                    dilationH: dilationH, dilationW: dilationW);
+            }
             return;
         }
 
@@ -8904,29 +8905,30 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // Stream affinity: bind cuDNN to this backend's stream so its
             // kernels order correctly against surrounding Cuda ops. A silent
             // bind failure would give nondeterministic results.
-            CuDnnContext.CheckStatus(
-                CuDnnNative.cudnnSetStream(_cudnnContext!.Handle, _stream),
-                "cudnnSetStream");
             // cuDNN requires epsilon >= CUDNN_BN_MIN_EPSILON (1e-5).
             double eps = epsilon < 1e-5 ? 1e-5 : epsilon;
-            if (training)
+            lock (_cudnnContext!.StreamBindingLock)
             {
-                _cudnnBn!.ForwardTrainingGpu(
-                    inputDevPtr: input.Handle, outputDevPtr: output.Handle,
-                    scaleDevPtr: gamma.Handle, biasDevPtr: beta.Handle,
-                    runningMeanDevPtr: runningMean.Handle, runningVarDevPtr: runningVar.Handle,
-                    saveMeanDevPtr: saveMean.Handle, saveInvVarDevPtr: saveInvVar.Handle,
-                    n: batch, c: channels, h: spatialSize, w: 1,
-                    epsilon: eps, momentum: momentum);
-            }
-            else
-            {
-                _cudnnBn!.ForwardInferenceGpu(
-                    inputDevPtr: input.Handle, outputDevPtr: output.Handle,
-                    scaleDevPtr: gamma.Handle, biasDevPtr: beta.Handle,
-                    runningMeanDevPtr: runningMean.Handle, runningVarDevPtr: runningVar.Handle,
-                    n: batch, c: channels, h: spatialSize, w: 1,
-                    epsilon: eps);
+                _cudnnContext.BindStream(_stream);
+                if (training)
+                {
+                    _cudnnBn!.ForwardTrainingGpu(
+                        inputDevPtr: input.Handle, outputDevPtr: output.Handle,
+                        scaleDevPtr: gamma.Handle, biasDevPtr: beta.Handle,
+                        runningMeanDevPtr: runningMean.Handle, runningVarDevPtr: runningVar.Handle,
+                        saveMeanDevPtr: saveMean.Handle, saveInvVarDevPtr: saveInvVar.Handle,
+                        n: batch, c: channels, h: spatialSize, w: 1,
+                        epsilon: eps, momentum: momentum);
+                }
+                else
+                {
+                    _cudnnBn!.ForwardInferenceGpu(
+                        inputDevPtr: input.Handle, outputDevPtr: output.Handle,
+                        scaleDevPtr: gamma.Handle, biasDevPtr: beta.Handle,
+                        runningMeanDevPtr: runningMean.Handle, runningVarDevPtr: runningVar.Handle,
+                        n: batch, c: channels, h: spatialSize, w: 1,
+                        epsilon: eps);
+                }
             }
             return;
         }
