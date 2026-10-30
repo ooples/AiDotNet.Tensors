@@ -9,6 +9,7 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation.Codegen;
+using AiDotNet.Tensors.Engines.DevicePrimitives;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels;
 using AiDotNet.Tensors.Engines.Gpu;
@@ -31,7 +32,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     /// <item>Bank-conflict-free shared memory</item>
     /// </list>
     /// </remarks>
-    public sealed partial class OpenClBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IExtendedConvKernels, IPixelShuffleBackend, INativeGpuCodegenExecutor
+    public sealed partial class OpenClBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IExtendedConvKernels, IPixelShuffleBackend, INativeGpuCodegenExecutor, IDeviceMemoryAccounted
     {
         /// <summary>
         /// OpenCL has no cuDNN-equivalent half/bfloat16 conv path —
@@ -123,6 +124,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private bool _tuningDbResetDone;
         private readonly ILogger? _logger;
         private readonly int _deviceIndex;
+        // This device's memory counters (GpuMemoryStats): every owning buffer charges them.
+        private readonly DeviceMemoryAccount _memoryAccount;
+        DeviceMemoryAccount IDeviceMemoryAccounted.MemoryAccount => _memoryAccount;
         private readonly object _clblastLock = new();
         private bool _clblastBaselineInitialized;
         private GemmConfig? _clblastBaselineConfig;
@@ -228,6 +232,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             _logger = logger;
             _deviceIndex = deviceIndex;
+            _memoryAccount = DeviceMemoryAccount.For("opencl", deviceIndex);
             _kernelCache = new OpenClKernelCache();
             _programs = new List<DirectOpenClProgram>();
             _maxWorkItemSizes = Array.Empty<ulong>();
@@ -1540,7 +1545,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var context = _context;
             var buffer = AllocateReclaiming(() => new DirectOpenClBuffer(context, data));
             DeviceMemoryReclaim.OnDeviceAllocation((long)data.Length * sizeof(float));
-            return new DirectOpenClGpuBuffer(buffer, ReturnOpenClBufferToPool);
+            return new DirectOpenClGpuBuffer(buffer, ReturnOpenClBufferToPool, _memoryAccount);
         }
 
         public IGpuBuffer AllocateBuffer(int size)
@@ -1571,7 +1576,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var context = _context;
             var buffer = AllocateReclaiming(() => new DirectOpenClBuffer(context, size));
             DeviceMemoryReclaim.OnDeviceAllocation((long)size * sizeof(float));
-            return new DirectOpenClGpuBuffer(buffer, ReturnOpenClBufferToPool);
+            return new DirectOpenClGpuBuffer(buffer, ReturnOpenClBufferToPool, _memoryAccount);
         }
 
         /// <summary>
@@ -4624,7 +4629,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             // Allocate as byte buffer (size in bytes, not floats)
             var context = _context;
             var buffer = AllocateReclaiming(() => new DirectOpenClByteBuffer(context, size));
-            return new DirectOpenClGpuByteBuffer(buffer);
+            return new DirectOpenClGpuByteBuffer(buffer, _memoryAccount);
         }
 
         public void Enforce2x4Sparsity(IGpuBuffer denseInput, IGpuBuffer sparseValues, IGpuBuffer sparseIndices, int M, int K)
@@ -9099,7 +9104,7 @@ KERNEL VARIANTS (A/B testing):
 
             var context = _context;
             var buffer = AllocateReclaiming(() => new DirectOpenClBuffer(context, size));
-            return new DirectOpenClGpuBuffer(buffer);
+            return new DirectOpenClGpuBuffer(buffer, account: _memoryAccount);
         }
 
         /// <inheritdoc/>
@@ -9176,7 +9181,7 @@ KERNEL VARIANTS (A/B testing):
 
             var context = _context;
             var buffer = AllocateReclaiming(() => new DirectOpenClBuffer(context, floatData));
-            return new DirectOpenClGpuBuffer(buffer);
+            return new DirectOpenClGpuBuffer(buffer, account: _memoryAccount);
         }
 
         #endregion
@@ -14459,16 +14464,23 @@ KERNEL VARIANTS (A/B testing):
         /// <summary>Frees of OpenCL buffers collected without Dispose, run by the backend's next allocation.</summary>
         internal static readonly DeviceFreeQueue PendingFrees = new();
 
-        public DirectOpenClGpuBuffer(DirectOpenClBuffer buffer, Action<DirectOpenClGpuBuffer>? returnToPool = null)
+        private DeviceMemoryHold _memory; // what GpuMemoryStats counts for this memory
+
+        /// <param name="account">The device's memory counters, for a fresh allocation; null for a view or a pool's new
+        /// wrapper of memory already counted.</param>
+        public DirectOpenClGpuBuffer(DirectOpenClBuffer buffer, Action<DirectOpenClGpuBuffer>? returnToPool = null,
+            DeviceMemoryAccount? account = null)
         {
             Buffer = buffer;
             _returnToPool = returnToPool;
             _size = buffer.Length;
+            _memory.OnAllocated(account, (long)buffer.Length * sizeof(float));
         }
 
         // A wrapper for a device buffer the GC collected: it enters the pool as pooled, like a disposed buffer.
-        private static DirectOpenClGpuBuffer Pooled(DirectOpenClBuffer buffer, Action<DirectOpenClGpuBuffer> returnToPool)
-            => new DirectOpenClGpuBuffer(buffer, returnToPool) { _poolState = 1 };
+        private static DirectOpenClGpuBuffer Pooled(DirectOpenClBuffer buffer, Action<DirectOpenClGpuBuffer> returnToPool,
+            DeviceMemoryHold memory)
+            => new DirectOpenClGpuBuffer(buffer, returnToPool) { _poolState = 1, _memory = memory };
 
         // An undisposed buffer (a result nothing references any more) goes back to its pool, like one disposed
         // explicitly: the pool hands it out again on the queue it last ran on, where in-order execution makes reuse
@@ -14484,10 +14496,12 @@ KERNEL VARIANTS (A/B testing):
             if (_returnToPool is { } returnToPool && Interlocked.CompareExchange(ref _poolState, 2, 0) == 0)
             {
                 var pooledBuffer = Buffer;
-                PendingFrees.Enqueue(() => returnToPool(Pooled(pooledBuffer, returnToPool)));
+                var memory = _memory.TransferToLease();
+                PendingFrees.Enqueue(() => returnToPool(Pooled(pooledBuffer, returnToPool, memory)));
                 return;
             }
             if (Interlocked.Exchange(ref _poolState, 2) == 2) return;
+            _memory.OnFreed();
             var inner = Buffer;
             PendingFrees.Enqueue(inner.Dispose);
         }
@@ -14508,6 +14522,7 @@ KERNEL VARIANTS (A/B testing):
                 throw new ArgumentOutOfRangeException(nameof(size));
             Volatile.Write(ref _size, size);
             Interlocked.Exchange(ref _poolState, 0);
+            _memory.OnRented();
         }
 
         public void Release()
@@ -14521,6 +14536,7 @@ KERNEL VARIANTS (A/B testing):
             if (Interlocked.Exchange(ref _poolState, 2) == 2)
                 return;
             GC.SuppressFinalize(this);
+            _memory.OnFreed();
 
             if (GpuBufferReleaseDeferral.TryDefer(Buffer.Dispose))
                 return;
@@ -14541,6 +14557,7 @@ KERNEL VARIANTS (A/B testing):
 
             // Disposed by its owner, not abandoned to the finalizer: no collection is needed to get it back.
             DeviceMemoryReclaim.OnDeviceRelease((long)Size * sizeof(float));
+            _memory.OnReturned();
 
             if (GpuBufferReleaseDeferral.TryDefer(() => _returnToPool(this)))
                 return;
@@ -14665,14 +14682,18 @@ KERNEL VARIANTS (A/B testing):
         public long SizeInBytes => Buffer.Length;
         public IntPtr Handle => Buffer.Handle;
 
-        public DirectOpenClGpuByteBuffer(DirectOpenClByteBuffer buffer)
+        private DeviceMemoryHold _memory; // see DirectOpenClGpuBuffer
+
+        public DirectOpenClGpuByteBuffer(DirectOpenClByteBuffer buffer, DeviceMemoryAccount? account = null)
         {
             Buffer = buffer;
+            _memory.OnAllocated(account, buffer.Length);
         }
 
         ~DirectOpenClGpuByteBuffer()
         {
             if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            _memory.OnFreed();
             var inner = Buffer;
             DirectOpenClGpuBuffer.PendingFrees.Enqueue(inner.Dispose);
         }
@@ -14697,6 +14718,7 @@ KERNEL VARIANTS (A/B testing):
             if (Interlocked.Exchange(ref _disposed, 1) != 0)
                 return;
             GC.SuppressFinalize(this);
+            _memory.OnFreed();
 
             if (GpuBufferReleaseDeferral.TryDefer(Buffer.Dispose))
                 return;

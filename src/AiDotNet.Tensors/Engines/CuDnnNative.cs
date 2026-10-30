@@ -2136,6 +2136,10 @@ public sealed class CuDnnConvolution : IDisposable
         return status == CuDnnNative.CudnnStatus.Success ? size : null;
     }
 
+    /// <summary>The device's memory counters, which count the workspace (PyTorch counts cuDNN's as allocated).</summary>
+    internal DevicePrimitives.DeviceMemoryAccount? MemoryAccount { get; set; }
+    private DevicePrimitives.DeviceMemoryHold _workspaceMemory;
+
     private void EnsureWorkspaceUnlocked(ulong requiredSize)
     {
         if (_workspaceSize >= requiredSize) return;
@@ -2144,6 +2148,7 @@ public sealed class CuDnnConvolution : IDisposable
         if (_workspace != IntPtr.Zero)
         {
             CuBlasNative.cuMemFree(_workspace);
+            _workspaceMemory.OnFreed();
             _workspace = IntPtr.Zero;
             _workspaceSize = 0;
         }
@@ -2155,6 +2160,8 @@ public sealed class CuDnnConvolution : IDisposable
             throw new InvalidOperationException($"Failed to allocate cuDNN workspace: {result}");
         }
         _workspaceSize = requiredSize;
+        _workspaceMemory = default;
+        _workspaceMemory.OnAllocated(MemoryAccount, (long)requiredSize);
     }
 
     public void Dispose()
@@ -2164,6 +2171,7 @@ public sealed class CuDnnConvolution : IDisposable
         if (_workspace != IntPtr.Zero)
         {
             CuBlasNative.cuMemFree(_workspace);
+            _workspaceMemory.OnFreed();
             _workspace = IntPtr.Zero;
         }
 

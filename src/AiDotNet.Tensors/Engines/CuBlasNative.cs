@@ -404,6 +404,11 @@ public static class CuBlasNative
     [DllImport(CudaLibrary, EntryPoint = "cuMemPoolSetAttribute")]
     public static extern CudaResult cuMemPoolSetAttribute(IntPtr pool, int attr, ref ulong value);
 
+    // CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT = 5, _RESERVED_MEM_HIGH = 6 (reset by setting 0): the device memory the
+    // stream-ordered pool holds, in use or cached.
+    [DllImport(CudaLibrary, EntryPoint = "cuMemPoolGetAttribute")]
+    public static extern CudaResult cuMemPoolGetAttribute(IntPtr pool, int attr, out ulong value);
+
     // Releases memory the stream-ordered pool is RETAINING (above the high release threshold) back to the
     // OS, keeping at least minBytesToKeep. Called on a SYNC-path cuMemAlloc OOM so the async pool's cached
     // bytes (which show up as device free=0) become available to the legacy cuMemAlloc allocator.

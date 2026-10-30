@@ -2,6 +2,7 @@
 
 using System;
 using System.Collections.Generic;
+using AiDotNet.Tensors.Engines.DirectGpu;
 
 namespace AiDotNet.Tensors.Engines.DevicePrimitives;
 
@@ -130,7 +131,8 @@ public static class GpuMemoryStats
         }
     }
 
-    /// <summary>Resets the peak-bytes counter to the current value.</summary>
+    /// <summary>Resets every peak counter to its current value: the labelled allocators', every device's and the
+    /// host-shadow peak.</summary>
     public static void ResetPeakStats()
     {
         lock (_lock)
@@ -139,6 +141,53 @@ public static class GpuMemoryStats
             foreach (var state in _byAllocator.Values)
                 state.PeakBytes = state.CurrentBytes;
         }
+        DeviceMemoryAccount.Total.ResetPeaks();
+        foreach (var device in DeviceMemoryAccount.Devices) device.ResetPeaks();
+        HostShadowMemory.ResetPeak();
+    }
+
+    /// <summary>Resets the peak counters of <paramref name="backend"/>'s device and the host-shadow peak, as
+    /// <c>torch.cuda.reset_peak_memory_stats(device)</c>.</summary>
+    public static void ResetPeakStats(IDirectGpuBackend backend)
+    {
+        AccountOf(backend).ResetPeaks();
+        HostShadowMemory.ResetPeak();
+    }
+
+    /// <summary>Device memory summed over every GPU device the process has used.</summary>
+    public static GpuMemorySnapshot Snapshot() => DeviceMemoryAccount.Total.Snapshot();
+
+    /// <summary>Device memory of <paramref name="backend"/>'s device. Backend instances on one device share it.</summary>
+    public static GpuMemorySnapshot Snapshot(IDirectGpuBackend backend) => AccountOf(backend).Snapshot();
+
+    /// <summary>Device memory of the named device (see <see cref="DeviceNames"/>), such as <c>cuda:0</c>.</summary>
+    public static GpuMemorySnapshot Snapshot(string device)
+    {
+        if (device is null) throw new ArgumentNullException(nameof(device));
+        if (!DeviceMemoryAccount.TryGet(device, out var account))
+            throw new ArgumentException($"No GPU device named '{device}' has memory counters in this process.", nameof(device));
+        return account.Snapshot();
+    }
+
+    /// <summary>The devices this process has allocated memory on, <c>backend:index</c> in lower case.</summary>
+    public static IReadOnlyList<string> DeviceNames
+    {
+        get
+        {
+            var names = new List<string>();
+            foreach (var device in DeviceMemoryAccount.Devices)
+                if (device.HasActivity) names.Add(device.Device);
+            names.Sort(StringComparer.Ordinal);
+            return names;
+        }
+    }
+
+    private static DeviceMemoryAccount AccountOf(IDirectGpuBackend backend)
+    {
+        if (backend is null) throw new ArgumentNullException(nameof(backend));
+        return backend is IDeviceMemoryAccounted accounted
+            ? accounted.MemoryAccount
+            : throw new NotSupportedException($"{backend.GetType().Name} does not report device memory.");
     }
 
     /// <summary>Drops every counter back to zero. Used for test
@@ -208,7 +257,31 @@ public static class GpuMemoryStats
                 ["allocated_bytes.peak"]    = _peakBytes,
                 ["allocated_bytes.total"]   = _totalBytes,
                 ["active.current"]          = _activeAllocations,
-            };
+            }.WithDevice(DeviceMemoryAccount.Total.Snapshot());
         }
     }
+
+    /// <summary>The device keys of <see cref="Stats()"/> for <paramref name="backend"/>'s device, named as
+    /// <c>torch.cuda.memory_stats(device)</c> names them.</summary>
+    public static IReadOnlyDictionary<string, long> Stats(IDirectGpuBackend backend)
+        => new Dictionary<string, long>().WithDevice(Snapshot(backend));
+
+    private static Dictionary<string, long> WithDevice(this Dictionary<string, long> stats, GpuMemorySnapshot device)
+    {
+        stats["allocated_bytes.all.current"] = device.AllocatedBytes;
+        stats["allocated_bytes.all.peak"] = device.PeakAllocatedBytes;
+        stats["reserved_bytes.all.current"] = device.ReservedBytes;
+        stats["reserved_bytes.all.peak"] = device.PeakReservedBytes;
+        stats["num_device_alloc"] = device.DeviceAllocations;
+        stats["num_device_free"] = device.DeviceFrees;
+        stats["host_shadow_bytes.current"] = device.HostShadowBytes;
+        stats["host_shadow_bytes.peak"] = device.PeakHostShadowBytes;
+        return stats;
+    }
+}
+
+/// <summary>A backend whose buffers feed the device counters of <see cref="GpuMemoryStats"/>.</summary>
+internal interface IDeviceMemoryAccounted
+{
+    DeviceMemoryAccount MemoryAccount { get; }
 }
