@@ -68,20 +68,21 @@ public sealed partial class CudaBackend : IGpuMixedPrecisionConvBackend
 
         using var _ctx = PushContext();
         EnsureCudnnConv();
-        CuDnnContext.CheckStatus(
-            CuDnnNative.cudnnSetStream(_cudnnContext!.Handle, _stream),
-            "cudnnSetStream");
-        _cudnnConv!.Conv2DForwardGpu(
-            inputDevPtr: input.Handle,
-            filterDevPtr: kernel.Handle,
-            outputDevPtr: output.Handle,
-            n: batch, c: inChannels, h: inHeight, w: inWidth,
-            k: outChannels, filterH: kernelH, filterW: kernelW,
-            outputHeight: outHeight, outputWidth: outWidth,
-            padH: padH, padW: padW,
-            strideH: strideH, strideW: strideW,
-            dilationH: dilationH, dilationW: dilationW,
-            dataType: cudnnDataType);
+        lock (_cudnnContext!.StreamBindingLock)
+        {
+            _cudnnContext.BindStream(_stream);
+            _cudnnConv!.Conv2DForwardGpu(
+                inputDevPtr: input.Handle,
+                filterDevPtr: kernel.Handle,
+                outputDevPtr: output.Handle,
+                n: batch, c: inChannels, h: inHeight, w: inWidth,
+                k: outChannels, filterH: kernelH, filterW: kernelW,
+                outputHeight: outHeight, outputWidth: outWidth,
+                padH: padH, padW: padW,
+                strideH: strideH, strideW: strideW,
+                dilationH: dilationH, dilationW: dilationW,
+                dataType: cudnnDataType);
+        }
     }
 
     void IGpuMixedPrecisionConvBackend.Conv2DBackwardDataMixed(
@@ -107,20 +108,21 @@ public sealed partial class CudaBackend : IGpuMixedPrecisionConvBackend
 
         using var _ctx = PushContext();
         EnsureCudnnConv();
-        CuDnnContext.CheckStatus(
-            CuDnnNative.cudnnSetStream(_cudnnContext!.Handle, _stream),
-            "cudnnSetStream");
-        _cudnnConv!.Conv2DBackwardDataGpu(
-            filterDevPtr: kernel.Handle,
-            gradOutputDevPtr: gradOutput.Handle,
-            gradInputDevPtr: gradInput.Handle,
-            n: batch, c: inChannels, h: inHeight, w: inWidth,
-            k: outChannels, filterH: kernelH, filterW: kernelW,
-            outputHeight: outHeight, outputWidth: outWidth,
-            padH: padH, padW: padW,
-            strideH: strideH, strideW: strideW,
-            dilationH: dilationH, dilationW: dilationW,
-            dataType: cudnnDataType);
+        lock (_cudnnContext!.StreamBindingLock)
+        {
+            _cudnnContext.BindStream(_stream);
+            _cudnnConv!.Conv2DBackwardDataGpu(
+                filterDevPtr: kernel.Handle,
+                gradOutputDevPtr: gradOutput.Handle,
+                gradInputDevPtr: gradInput.Handle,
+                n: batch, c: inChannels, h: inHeight, w: inWidth,
+                k: outChannels, filterH: kernelH, filterW: kernelW,
+                outputHeight: outHeight, outputWidth: outWidth,
+                padH: padH, padW: padW,
+                strideH: strideH, strideW: strideW,
+                dilationH: dilationH, dilationW: dilationW,
+                dataType: cudnnDataType);
+        }
     }
 
     void IGpuMixedPrecisionConvBackend.Conv2DBackwardFilterMixed(
@@ -146,19 +148,20 @@ public sealed partial class CudaBackend : IGpuMixedPrecisionConvBackend
 
         using var _ctx = PushContext();
         EnsureCudnnConv();
-        CuDnnContext.CheckStatus(
-            CuDnnNative.cudnnSetStream(_cudnnContext!.Handle, _stream),
-            "cudnnSetStream");
-        _cudnnConv!.Conv2DBackwardFilterGpu(
-            inputDevPtr: input.Handle,
-            gradOutputDevPtr: gradOutput.Handle,
-            gradFilterDevPtr: gradFilter.Handle,
-            n: batch, c: inChannels, h: inHeight, w: inWidth,
-            k: outChannels, filterH: kernelH, filterW: kernelW,
-            outputHeight: outHeight, outputWidth: outWidth,
-            padH: padH, padW: padW,
-            strideH: strideH, strideW: strideW,
-            dilationH: dilationH, dilationW: dilationW,
-            dataType: cudnnDataType);
+        lock (_cudnnContext!.StreamBindingLock)
+        {
+            _cudnnContext.BindStream(_stream);
+            _cudnnConv!.Conv2DBackwardFilterGpu(
+                inputDevPtr: input.Handle,
+                gradOutputDevPtr: gradOutput.Handle,
+                gradFilterDevPtr: gradFilter.Handle,
+                n: batch, c: inChannels, h: inHeight, w: inWidth,
+                k: outChannels, filterH: kernelH, filterW: kernelW,
+                outputHeight: outHeight, outputWidth: outWidth,
+                padH: padH, padW: padW,
+                strideH: strideH, strideW: strideW,
+                dilationH: dilationH, dilationW: dilationW,
+                dataType: cudnnDataType);
+        }
     }
 }
