@@ -109,6 +109,13 @@ public enum TunedKernelDecisionReason
     /// and the verdict is not persisted, so a later process measures the shape again.
     /// </summary>
     Inconclusive,
+
+    /// <summary>
+    /// The tuning budget was exhausted before this shape was measured, so the slot served its shape-aware default (an
+    /// ordered preference such as im2col + GEMM for a convolution) after one correctness check against the reference. Used
+    /// for this process and not persisted: a later process with budget left measures the shape.
+    /// </summary>
+    Heuristic,
 }
 
 /// <summary>

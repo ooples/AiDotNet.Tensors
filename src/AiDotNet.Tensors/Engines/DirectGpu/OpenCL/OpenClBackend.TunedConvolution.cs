@@ -61,11 +61,19 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                                 MeasureTunedKernelMilliseconds, a => new[] { (a.Output, a.OutputCount) },
                                 a => a.Output.Handle == a.Input.Handle || a.Output.Handle == a.Kernel.Handle),
                             () => GpuDeterminism.IsActive, candidates);
+                        // A shape the process has no tuning budget left for: the generic reference is a direct convolution,
+                        // tens of times slower than GEMM on large batches (ResNet-50 at batch 64: 42 s an epoch against 13.5 s
+                        // tuned). Each candidate's own applicability narrows this list: fused Winograd admits 3x3 stride-1
+                        // shapes, the register-blocked split-K GEMM batch 1, im2col + GEMM whatever its scratch fits.
+                        _conv2DForwardSlot.UntunedPreference = static _ => s_conv2DForwardUntunedPreference;
                     }
                     return _conv2DForwardSlot;
                 }
             }
         }
+
+        private static readonly string[] s_conv2DForwardUntunedPreference =
+            { "opencl.conv2d.winograd_fused", "opencl.conv2d.im2col_rb_gemm", "opencl.conv2d.im2col_gemm" };
 
         private static void ConvArgs(DirectOpenClKernel k, in TunedConv2DArgs a, bool withKernelGeometry)
         {
