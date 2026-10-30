@@ -376,6 +376,26 @@ internal sealed class LazyTensorScope : IDisposable
         }
     }
 
+    /// <summary>
+    /// The first traced node whose value the forward read on the host during this trace, or null. An inference plan
+    /// cannot represent what the forward computed from that read, so compiling refuses the trace.
+    /// </summary>
+    internal ILazyNode? HostEscape { get; private set; }
+
+    internal void MarkHostEscape(ILazyNode node)
+    {
+        HostEscape ??= node;
+    }
+
+    /// <summary>The engine the recorded nodes replay on.</summary>
+    internal IEngine Engine => _engine;
+
+    /// <summary>
+    /// Adds a node built from a recorded one rather than through a Record* call: a batch-polymorphic
+    /// template instantiates its trace at a new batch this way instead of tracing the forward again.
+    /// </summary>
+    internal void AddInstantiatedNode(ILazyNode node) => AddNode(node);
+
     /// <summary>Gets all recorded nodes (for graph compiler).</summary>
     internal IReadOnlyList<ILazyNode> Nodes => _nodes;
 
