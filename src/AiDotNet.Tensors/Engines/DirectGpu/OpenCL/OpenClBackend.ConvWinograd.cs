@@ -74,6 +74,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                                 (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardInputS2K1(a)) LaunchDxDirect(a); }),
                             new DelegateTunedKernelCandidate<TunedConv2DBackwardArgs>("opencl.conv2d_dx.pointwise_gemm", TunedKernelOrigin.Builtin,
                                 true, AdmitsPointwiseGemm, (in TunedConv2DBackwardArgs a) => Conv2DBackwardInputPointwiseGemm(a)),
+                            new DelegateTunedKernelCandidate<TunedConv2DBackwardArgs>("opencl.conv2d_dx.column_gemm", TunedKernelOrigin.Builtin,
+                                true, AdmitsColumnGemm, (in TunedConv2DBackwardArgs a) => Conv2DBackwardInputColumnGemm(a)),
                         });
                     _conv2DBackwardDataSlot.UntunedPreference ??= static _ => s_conv2DBackwardDataUntunedPreference;
                     return _conv2DBackwardDataSlot;
@@ -101,6 +103,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                                 (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardFilterWinogradFused(a)) LaunchDwDirect(a); }),
                             new DelegateTunedKernelCandidate<TunedConv2DBackwardArgs>("opencl.conv2d_dw.pointwise_gemm", TunedKernelOrigin.Builtin,
                                 true, AdmitsPointwiseGemm, (in TunedConv2DBackwardArgs a) => Conv2DBackwardFilterPointwiseGemm(a)),
+                            new DelegateTunedKernelCandidate<TunedConv2DBackwardArgs>("opencl.conv2d_dw.column_gemm", TunedKernelOrigin.Builtin,
+                                true, AdmitsColumnGemm, (in TunedConv2DBackwardArgs a) => Conv2DBackwardFilterColumnGemm(a)),
                         });
                     _conv2DBackwardFilterSlot.UntunedPreference ??= static _ => s_conv2DBackwardFilterUntunedPreference;
                     return _conv2DBackwardFilterSlot;

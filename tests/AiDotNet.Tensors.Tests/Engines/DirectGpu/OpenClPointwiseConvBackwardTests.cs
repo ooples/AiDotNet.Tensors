@@ -78,6 +78,63 @@ public sealed class OpenClPointwiseConvBackwardTests
             }
     }
 
+    // Any convolution through the column matrix (im2col / col2im around one GEMM per batch chunk). The last case has
+    // 576 x 1024 columns per image, so its 32 images run in two chunks.
+    [SkippableTheory]
+    [InlineData(3, 4, 6, 7, 5, 3, 1, 1, 1)]     // 3x3 stride 1, ragged sizes
+    [InlineData(2, 5, 4, 9, 9, 3, 2, 1, 1)]     // 3x3 stride 2
+    [InlineData(2, 3, 8, 12, 12, 7, 2, 3, 1)]   // a 7x7 stride-2 stem
+    [InlineData(2, 4, 4, 9, 9, 3, 1, 2, 2)]     // dilation 2
+    [InlineData(32, 64, 4, 32, 32, 3, 1, 1, 1)] // chunked
+    public void ColumnGemm_EqualsTheDirectSums(int batch, int ci, int co, int h, int w, int k, int stride, int pad, int dil)
+    {
+        Skip.IfNot(DirectOpenClContext.IsAvailable && DirectOpenClContext.GetDeviceCount() > 0, "No OpenCL device.");
+        using var backend = new OpenClBackend(deviceIndex: 0);
+        Skip.IfNot(backend.IsAvailable, "OpenCL backend did not initialize.");
+        int oh = (h + 2 * pad - dil * (k - 1) - 1) / stride + 1, ow = (w + 2 * pad - dil * (k - 1) - 1) / stride + 1;
+        var x = Rand(4, batch * ci * h * w);
+        var weights = Rand(5, co * ci * k * k);
+        var dy = Rand(6, batch * co * oh * ow);
+        using var xBuf = backend.AllocateBuffer(x);
+        using var wBuf = backend.AllocateBuffer(weights);
+        using var dyBuf = backend.AllocateBuffer(dy);
+        using var dxBuf = backend.AllocateBuffer(batch * ci * h * w);
+        using var dwBuf = backend.AllocateBuffer(co * ci * k * k);
+        var dataArgs = new TunedConv2DBackwardArgs(dyBuf, wBuf, dxBuf, false, batch, ci, h, w, co, oh, ow, k, k, stride, stride, pad, pad, dil, dil);
+        var filterArgs = new TunedConv2DBackwardArgs(xBuf, dyBuf, dwBuf, true, batch, ci, h, w, co, oh, ow, k, k, stride, stride, pad, pad, dil, dil);
+        Assert.True(OpenClBackend.AdmitsColumnGemm(dataArgs.Shape()));
+        backend.Conv2DBackwardInputColumnGemm(dataArgs);
+        backend.Conv2DBackwardFilterColumnGemm(filterArgs);
+        var dx = backend.DownloadBuffer(dxBuf);
+        var dw = backend.DownloadBuffer(dwBuf);
+
+        var refDx = new double[dx.Length];
+        var magDx = new double[dx.Length];
+        var refDw = new double[dw.Length];
+        var magDw = new double[dw.Length];
+        for (int b = 0; b < batch; b++)
+            for (int o = 0; o < co; o++)
+                for (int y = 0; y < oh; y++)
+                    for (int xo = 0; xo < ow; xo++)
+                    {
+                        double g = dy[((b * co + o) * oh + y) * ow + xo];
+                        for (int c = 0; c < ci; c++)
+                            for (int kh = 0; kh < k; kh++)
+                                for (int kw = 0; kw < k; kw++)
+                                {
+                                    int ih = y * stride - pad + kh * dil, iw = xo * stride - pad + kw * dil;
+                                    if (ih < 0 || ih >= h || iw < 0 || iw >= w) continue;
+                                    int xi = ((b * ci + c) * h + ih) * w + iw, wi = ((o * ci + c) * k + kh) * k + kw;
+                                    refDx[xi] += g * weights[wi]; magDx[xi] += Math.Abs(g * weights[wi]);
+                                    refDw[wi] += g * x[xi]; magDw[wi] += Math.Abs(g * x[xi]);
+                                }
+                    }
+        double ulp = Math.Pow(2, -23);
+        for (int i = 0; i < dx.Length; i++)
+            Assert.True(Math.Abs(refDx[i] - dx[i]) <= (co * k * k + 2) * ulp * magDx[i] + 1e-7, $"dX[{i}]: {dx[i]} vs {refDx[i]}");
+        for (int i = 0; i < dw.Length; i++)
+            Assert.True(Math.Abs(refDw[i] - dw[i]) <= (batch * oh * ow + 2) * ulp * magDw[i] + 1e-6, $"dW[{i}]: {dw[i]} vs {refDw[i]}");
+    }
     [Fact]
     public void Admits_OnlyPointwiseStrideOneUnpaddedShapes()
     {
