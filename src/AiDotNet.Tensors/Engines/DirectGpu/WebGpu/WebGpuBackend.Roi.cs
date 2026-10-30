@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // WebGPU RoI launcher shims — ASYNC-ONLY, matching the established
 // WebGPU pattern also used by Detection, Geometry, and Parity-210.
 //

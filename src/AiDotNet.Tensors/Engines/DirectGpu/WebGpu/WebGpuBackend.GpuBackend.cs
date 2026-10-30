@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // IDirectGpuBackend implementation for WebGpuBackend: helpers, memory, GEMM, fused GEMM, broadcast,
 // element-wise, capsule, trig, hyperbolic, unary, sparse, reduction, sync, transpose, random.
 

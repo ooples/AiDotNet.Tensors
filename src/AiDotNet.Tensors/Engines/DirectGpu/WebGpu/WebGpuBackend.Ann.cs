@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // WebGPU launcher shims for the native ANN kernels backing IAnnBackend
 // (IVF / PQ / IVFPQ / HNSW). Each WGSL source in WebGpuAnnKernels is a
 // self-contained compute shader (one pipeline per source), dispatched 1-D

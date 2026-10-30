@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // WebGPU launcher shims for the geometry / sampling kernels (Issue #217).
 // WebGPU's compute API is async (*Async methods below); the sync IGeometryBackend
 // members block on them via GetAwaiter().GetResult() — the same sync-over-async
