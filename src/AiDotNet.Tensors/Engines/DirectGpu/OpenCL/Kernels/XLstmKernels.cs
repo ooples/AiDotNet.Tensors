@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // OpenCL kernel for the fused xLSTM (mLSTM) matrix-memory scan forward (issue ooples/AiDotNet#1464).
 // Same design as HipXLstmKernels: one work-item per (batch, head) carries the full C + n state.
 

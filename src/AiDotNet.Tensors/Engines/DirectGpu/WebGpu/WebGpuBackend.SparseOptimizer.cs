@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // WebGPU backend - native sparse optimizer scatter updates.
 
 #if NET7_0_OR_GREATER

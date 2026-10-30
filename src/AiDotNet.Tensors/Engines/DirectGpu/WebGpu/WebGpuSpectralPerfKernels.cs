@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // WGSL compute shaders for Issue #160 spectral perf kernels.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu

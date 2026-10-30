@@ -88,12 +88,25 @@ internal static class DeviceMemoryReclaim
     /// <summary>Test hook: starts the byte and allocation counts from zero with no collection due.</summary>
     internal static void ResetCountsForTests()
     {
-        Interlocked.Exchange(ref s_driverBytesSinceCollection, 0);
+        ResetDeviceBytes();
         Interlocked.Exchange(ref s_allocationsSinceCollection, 0);
         Volatile.Write(ref s_collectionDue, 0);
     }
     // Device bytes handed out since the last collection, across every backend: one collection serves them all.
     private static long s_driverBytesSinceCollection;
+
+    // Bumped by every reset of s_driverBytesSinceCollection. A charge belongs to the epoch it was counted in; once a
+    // reset has dropped it, crediting it back would cancel bytes charged afterwards and hide an abandoned buffer.
+    private static long s_collectionEpoch;
+
+    /// <summary>Zeroes the byte count and starts a new epoch, so no charge counted before it is credited after it.</summary>
+    private static void ResetDeviceBytes()
+    {
+        // Epoch first: a credit that read the old epoch and the pre-reset count then fails its exchange, re-reads, and
+        // sees the new epoch.
+        Interlocked.Increment(ref s_collectionEpoch);
+        Interlocked.Exchange(ref s_driverBytesSinceCollection, 0);
+    }
 
     /// <summary>
     /// Counts <paramref name="bytes"/> handed out since the last collection, pool hits included: a warm loop's
@@ -103,20 +116,25 @@ internal static class DeviceMemoryReclaim
     /// <see cref="CollectAfterDeviceBytes"/> a gen-0 collection is due at the next step boundary
     /// (<see cref="CollectIfDueAtStepBoundary"/>); past <see cref="CollectNowAfterDeviceBytes"/> it runs now.
     /// </summary>
-    internal static void OnDeviceAllocation(long bytes)
+    /// <returns>The epoch the charge is counted in, for <see cref="OnDeviceRelease"/>. A charge that set off the
+    /// collection here gets the epoch that collection ended, so its credit is dropped; one that raced another reset may
+    /// too, which only brings a collection slightly earlier, never later.</returns>
+    internal static long OnDeviceAllocation(long bytes)
     {
+        long epoch = Volatile.Read(ref s_collectionEpoch);
         Interlocked.Increment(ref s_allocationsSinceCollection);
         long since = Interlocked.Add(ref s_driverBytesSinceCollection, bytes);
-        if (since < CollectAfterDeviceBytes) return;
+        if (since < CollectAfterDeviceBytes) return epoch;
         if (since < CollectNowAfterDeviceBytes)
         {
             Volatile.Write(ref s_collectionDue, 1);
-            return;
+            return epoch;
         }
-        Interlocked.Exchange(ref s_driverBytesSinceCollection, 0);
+        ResetDeviceBytes();
         Interlocked.Exchange(ref s_allocationsSinceCollection, 0);
         Volatile.Write(ref s_collectionDue, 0);
         GC.Collect(0, GCCollectionMode.Forced, blocking: true);
+        return epoch;
     }
 
     /// <summary>
@@ -125,12 +143,16 @@ internal static class DeviceMemoryReclaim
     /// split-K GEMM's partials) counted toward the collection threshold like an abandoned result: a ResNet-50 forward
     /// forced one blocking collection per call (about 1.5 ms) to recover nothing.
     /// </summary>
-    internal static void OnDeviceRelease(long bytes)
+    /// <param name="bytes">What the allocation charged.</param>
+    /// <param name="epoch">What <see cref="OnDeviceAllocation"/> returned for that charge: a reset since then already
+    /// dropped it, and the credit is skipped.</param>
+    internal static void OnDeviceRelease(long bytes, long epoch)
     {
         // Subtract and floor at zero in one atomic update: a negative counter would hide later allocations.
         long current = Volatile.Read(ref s_driverBytesSinceCollection);
         while (true)
         {
+            if (Volatile.Read(ref s_collectionEpoch) != epoch) return;
             long next = Math.Max(0, current - bytes);
             long observed = Interlocked.CompareExchange(ref s_driverBytesSinceCollection, next, current);
             if (observed == current) return;
@@ -163,7 +185,7 @@ internal static class DeviceMemoryReclaim
         if (Volatile.Read(ref s_allocationsSinceCollection) < CollectOnMissAfterAllocations) return false;
         if (TapeOpen()) return false;
         Interlocked.Exchange(ref s_allocationsSinceCollection, 0);
-        Interlocked.Exchange(ref s_driverBytesSinceCollection, 0);
+        ResetDeviceBytes();
         Volatile.Write(ref s_collectionDue, 0);
         GC.Collect(1, GCCollectionMode.Forced, blocking: true);
         // The collected buffers come back through their finalizers, which only queue a pool return.
@@ -186,7 +208,7 @@ internal static class DeviceMemoryReclaim
         // recover nothing. Measured on ResNet-50 predicts under a TensorScope (OpenCL): every intermediate came back
         // that way and no buffer was ever finalized, yet a blocking collection ran on every call.
         if (Volatile.Read(ref s_driverBytesSinceCollection) < CollectAfterDeviceBytes) return false;
-        Interlocked.Exchange(ref s_driverBytesSinceCollection, 0);
+        ResetDeviceBytes();
         Interlocked.Exchange(ref s_allocationsSinceCollection, 0);
         GC.Collect(0, GCCollectionMode.Forced, blocking: true);
         // The collected buffers come back through their finalizers. Waiting for them (they only queue a pool return)

@@ -46,6 +46,15 @@ jobs:
     steps:
     - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
+    # CrowdTrainer LLC holds the copyright (#1580). A file still carrying the pre-relicense header, usually one added
+    # by a branch that started before the rewrite, fails here with its path. ("[.]" keeps this line from matching.)
+    - name: Check file headers
+      run: |
+        if git grep -n -E '(//|#) Copyright \(c\) (2024 )?AiDotNet[.] All rights reserved' -- .; then
+          echo "::error::The files above still say 'Copyright (c) AiDotNet'; use '// Copyright (c) CrowdTrainer LLC. All rights reserved.'"
+          exit 1
+        fi
+
     - name: Setup .NET
       uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
       with:

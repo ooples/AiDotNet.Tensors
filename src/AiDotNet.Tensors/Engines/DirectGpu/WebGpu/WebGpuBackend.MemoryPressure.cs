@@ -1,5 +1,5 @@
 #if NET7_0_OR_GREATER
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
 // WebGPU exposes no device-memory query. Pressure-gated reclamation therefore never triggers; the unconditional sweep still runs.

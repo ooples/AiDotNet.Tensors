@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Metal Shading Language (MSL) kernels for the vision detection ops added by
 // Issue #217. Mirrors CudaDetectionKernels / HipDetectionKernels in coverage:
 // pairwise IoU family + per-box ops. fp32 only.

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // #1369: Winograd F(2x2, 3x3) forward and input gradient and F(3x3, 2x2) weight gradient on Metal, through the shared
 // WinogradF23Pipeline: the tile transforms (Metal Shading Language emitted from WinogradF23KernelTemplate) around
 // BatchedGemm. Backward convolution gets tuned slots here for the first time, with the direct kernels it always ran as

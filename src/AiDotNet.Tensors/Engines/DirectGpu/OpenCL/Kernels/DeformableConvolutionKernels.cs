@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // OpenCL kernels for deformable convolution operations.
 // Implements DCNv1 and DCNv2 (with modulation masks).
 

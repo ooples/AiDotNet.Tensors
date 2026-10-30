@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Metal GPU backend - Sparse, Comparison, and Statistics operations.
 
 using static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings;

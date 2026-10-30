@@ -1,5 +1,5 @@
 #if NET7_0_OR_GREATER
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // WebGPU IGpuBatchExecution (#1142): WGSL ports of the shared batch kernels. Like the other synchronous WebGPU
 // capabilities, each operation blocks on its async dispatch (safe on the native wgpu path; a single-threaded
 // JS event-loop host should call through the engine's async surface instead).

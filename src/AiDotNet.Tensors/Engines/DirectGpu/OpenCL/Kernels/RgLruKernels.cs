@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // OpenCL kernel for the fused RG-LRU scan forward (#1464). One work-item per (batch, channel).
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels;

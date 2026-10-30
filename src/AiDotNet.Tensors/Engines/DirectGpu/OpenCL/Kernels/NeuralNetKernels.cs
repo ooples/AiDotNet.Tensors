@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Neural network utility kernels for gradient computation, loss functions, and optimizers.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels

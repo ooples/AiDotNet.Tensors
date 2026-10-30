@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Metal GPU backend - Normalization, Dropout, and Embedding operations.
 
 using AiDotNet.Tensors.Engines;

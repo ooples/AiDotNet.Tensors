@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Paged-attention decode dispatch (P1) for the Metal backend.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;

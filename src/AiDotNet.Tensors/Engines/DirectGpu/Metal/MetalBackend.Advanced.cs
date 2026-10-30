@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Metal GPU backend - Hyperbolic Geometry, Octonion Algebra, and Quantum Computing operations.
 // All hyperbolic/octonion ops dispatch to MSL compute kernels on the GPU.
 

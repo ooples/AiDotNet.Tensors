@@ -93,9 +93,13 @@ internal static class CuDnnRnnNative
     {
         try
         {
-            var status = cudnnCreate(out var h);
-            if (status == Status.Success) { cudnnDestroy(h); return true; }
-            return false;
+            // No handle: cudnnDestroy synchronizes the whole device, and this type initializer can run mid-process
+            // while another thread captures a graph on the shared primary context (a sync then faults in the driver).
+            // A CUDA driver, the cuDNN libraries, and an RNN descriptor (host-only, resolves the RNN sub-library).
+            if (!CudaNativeBindings.IsAvailable || !CuDnnContext.IsAvailable) return false;
+            if (cudnnCreateRNNDescriptor(out var desc) != Status.Success) return false;
+            cudnnDestroyRNNDescriptor(desc);
+            return true;
         }
         catch (DllNotFoundException) { return false; }
         catch (EntryPointNotFoundException) { return false; }

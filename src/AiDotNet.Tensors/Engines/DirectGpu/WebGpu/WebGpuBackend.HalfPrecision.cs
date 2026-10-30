@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // IGpuHalfPrecisionBackend implementation for the WebGPU backend (issue #560):
 // FP16 GEMM so MatrixMultiply<Half> runs on the GPU instead of dropping to a
 // scalar CPU fallback.

@@ -297,9 +297,12 @@ internal sealed class DirectPtxRuntime : IDisposable
         {
             new Span<byte>((void*)errorLog, logBytes).Clear();
             new Span<byte>((void*)infoLog, logBytes).Clear();
-            int[] options = [3, 4, 5, 6];
-            IntPtr[] values = [infoLog, (IntPtr)logBytes, errorLog, (IntPtr)logBytes];
-            Check(CudaNativeBindings.cuLinkCreate((uint)options.Length, options, values, out state), "cuLinkCreate");
+            // Stack-allocated: the link state writes the log sizes back into values until cuLinkDestroy (see cuLinkCreate).
+            // The sized initializers make the compiler reject an option added without its count.
+            const int LinkOptionCount = 4;
+            int* options = stackalloc int[LinkOptionCount] { 3, 4, 5, 6 };
+            IntPtr* values = stackalloc IntPtr[LinkOptionCount] { infoLog, (IntPtr)logBytes, errorLog, (IntPtr)logBytes };
+            Check(CudaNativeBindings.cuLinkCreate(LinkOptionCount, options, values, out state), "cuLinkCreate");
             void Add(int inputType, byte[] data, string name)
             {
                 fixed (byte* bytes = data)

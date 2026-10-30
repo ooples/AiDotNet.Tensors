@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Dedicated OpenCL kernels for Issue #160 spectral/audio perf operations.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels

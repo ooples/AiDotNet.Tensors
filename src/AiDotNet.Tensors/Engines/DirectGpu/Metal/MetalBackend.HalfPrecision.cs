@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // IGpuHalfPrecisionBackend implementation for the Metal backend (issue #560):
 // FP16 GEMM on the GPU via an MSL compute kernel, so the backend-agnostic
 // DirectGpuTensorEngine FP16 matmul path runs on Apple-silicon / Metal devices.

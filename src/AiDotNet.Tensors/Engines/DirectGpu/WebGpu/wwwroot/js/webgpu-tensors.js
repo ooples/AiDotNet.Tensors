@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // WebGPU JavaScript interop for Blazor WebAssembly tensor operations.
 // Production-ready implementation with proper resource management.
 
