@@ -2876,6 +2876,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (TryExecuteRowVectorGemv(A, B, C, M, N, K, alpha, beta))
                 return;
 
+            // A few outputs over a long K (a classifier head: 32 x 10 x 4096) gave a tiled GEMM a handful of work groups
+            // each walking all of K: CLBlast's direct kernel took ~490 us on gfx1012 for 2.6 MFLOP. The register-blocked
+            // split-K GEMM spreads K over the device.
+            if (alpha == 1f && beta == 0f && K >= 1024 && (long)((M + 63) / 64) * ((N + 63) / 64) <= 4
+                && HasTunedKernel(Kernels.BatchedGemmKernels.Rb64SplitK) && HasTunedKernel(Kernels.BatchedGemmKernels.SplitKReduce))
+            {
+                RbSplitKGemm(A, B, C, M, N, K);
+                RecordGemmDispatch(OpenClGemmDispatchPath.BuiltInKernel);
+                return;
+            }
+
             // A deployment reaches this slot only after the first-party experiment scaffold has
             // compiled it, compared its output with the independent CPU oracle, and applied the
             // paired finalist gate. Give that exact typed deployment priority over generic vendor

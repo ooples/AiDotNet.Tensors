@@ -117,5 +117,32 @@ public sealed class OpenClEpilogueFusionTests
                         AssertClose(expected, actual[((bi * cout + co) * h + y) * w + x], $"{activation} b{bi} c{co} ({y},{x})");
                     }
     }
+
+    // Few outputs over a long K (a classifier head) run on the split-K GEMM: against a double reference, including
+    // shapes that are not tile multiples and one at the four-tile limit.
+    [SkippableTheory]
+    [InlineData(32, 10, 4096)]
+    [InlineData(5, 100, 2000)]
+    [InlineData(128, 128, 1024)]
+    [InlineData(1, 3, 5000)]
+    public void OpenCl_SkinnyLongKGemm_MatchesReference(int m, int n, int k)
+    {
+        using var backend = new OpenClBackend();
+        Skip.IfNot(backend.IsAvailable, "OpenCL is not available.");
+        var a = Values(m * k, 2, 0.01f);
+        var b = Values(k * n, 9, 0.01f);
+        using var aBuffer = backend.AllocateBuffer(a);
+        using var bBuffer = backend.AllocateBuffer(b);
+        using var cBuffer = backend.AllocateBuffer(new float[m * n]);
+        backend.Gemm(aBuffer, bBuffer, cBuffer, m, n, k);
+        var actual = backend.DownloadBuffer(cBuffer);
+        for (int i = 0; i < m; i++)
+            for (int j = 0; j < n; j++)
+            {
+                double sum = 0;
+                for (int p = 0; p < k; p++) sum += (double)a[i * k + p] * b[p * n + j];
+                AssertClose(sum, actual[i * n + j], $"{m}x{n}x{k} [{i},{j}]");
+            }
+    }
 }
 #endif
