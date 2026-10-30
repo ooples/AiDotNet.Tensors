@@ -5404,6 +5404,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <summary>The compiled action whose scratch this thread is pooling, or -1 outside one.</summary>
     internal int CurrentScratchAction => CurrentScratchPool?.Action ?? -1;
 
+    /// <summary>
+    /// Ends the running compiled action's leased output slots (<see cref="StepScratchPool.Lease"/>). A buffer still
+    /// referenced after the action - a gradient contribution parked for a later backward, or one adopted as a gradient
+    /// accumulator - stays its slot's for good; every other one is free for the next action's leases.
+    /// </summary>
+    internal void EndScratchAction()
+    {
+        var adopted = Autodiff.DifferentiableOps.TakeAdoptedAccumulators();
+        if (CurrentScratchPool is not { HasLeases: true } pool) return;
+        HashSet<IGpuBuffer>? escaped = null;
+        void Note(object? tensor)
+        {
+            if (tensor is Tensor<float> t && t.TryGetGpuBuffer() is { } buffer) (escaped ??= new HashSet<IGpuBuffer>()).Add(buffer);
+        }
+        if (DeferredGradients is { } deferral)
+            foreach (var parked in deferral.ParkedContributions) Note(parked);
+        if (adopted is not null)
+            foreach (var accumulator in adopted) Note(accumulator);
+        pool.EndLeases(escaped);
+    }
+
     /// <summary>True while inside a compiled action whose transient scratch should draw from its plan's pool, on the
     /// thread running that step.</summary>
     private bool ScratchPoolingActive => CurrentScratchPool is { Action: >= 0 } && ResidentStepActive;
@@ -5451,6 +5472,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             StepScratchPool.Untrack(b);
             pool.Keys.Remove(b);
             try { b.Dispose(); } catch (ObjectDisposedException) { }
+        }
+        if (pool.Leases(key))
+        {
+            // A backward output, consumed within its action: a buffer leased until the action ends (EndScratchAction).
+            var leased = pool.Lease(key, backend, length);
+            if (!fullyWritten)
+            {
+                if (backend is IDeviceZeroFill zeroLeased) zeroLeased.ZeroBuffer(leased, length);
+                else backend.Fill(leased, 0f, length);
+            }
+            return leased;
         }
         var nb = backend.AllocateBuffer(length);   // first pass at this (action,local): record the stable buffer
         pool.Slots[key] = nb;

@@ -4197,6 +4197,18 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         return true;
     }
 
+    /// <summary>
+    /// Whether a GPU plan leases its backward outputs' scratch for their action (StepScratchPool.Lease) instead of keeping
+    /// a slot per output for its life. AIDOTNET_GPU_SCRATCH_LEASES=0 turns it off; tests compare both.
+    /// </summary>
+    internal static bool LeaseBackwardScratch { get; set; } = Environment.GetEnvironmentVariable("AIDOTNET_GPU_SCRATCH_LEASES") != "0";
+
+    /// <summary>Test hook: the device buffers this plan's step scratch holds now (kept slots, transient arena, free leases).</summary>
+    internal int ScratchBufferCount => _scratchPool?.BufferCount ?? 0;
+
+    /// <summary>Test hook: the bytes of those buffers.</summary>
+    internal long ScratchBufferBytes => _scratchPool?.BufferBytes ?? 0;
+
     private void RunGpuStepBodyForCapture(Engines.DirectGpu.IDirectGpuBackend backend)
     {
         // Lend this plan's first-write redirects to the engine for the body only: the eager optimizer, evaluation and
@@ -4211,6 +4223,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var outerScratchPool = redirectEngine is not null
             ? Engines.DirectGpuTensorEngine.EnterScratchPool(_scratchPool ??= redirectEngine.CreateScratchPool())
             : null;
+        // Backward outputs are leased for their action only where no graph capture bakes in their addresses.
+        bool leaseBackwardOutputs = redirectEngine is not null && LeaseBackwardScratch
+            && backend is not Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true };
+        if (_scratchPool is { } leasingPool)
+            leasingPool.FirstLeasedAction = leaseBackwardOutputs ? _forwardActions.Length : int.MaxValue;
+        bool outerTrackAdoptions = Autodiff.DifferentiableOps.TrackAdoptedAccumulators;
+        if (leaseBackwardOutputs) Autodiff.DifferentiableOps.TrackAdoptedAccumulators = true;
         _gradientDeferral?.Reset();
         // Restored rather than cleared: this body can run nested inside another plan's on this thread, and clearing
         // would lose what the outer one parked.
@@ -4222,9 +4241,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (redirectEngine is not null) redirectEngine.DeferredGradients = outerDeferral;
             if (redirectEngine is not null)
             {
+                redirectEngine.EndScratchAction();   // a body that threw leaves its last action's leases out
                 redirectEngine.FirstWriteRedirects = null;
                 Engines.DirectGpuTensorEngine.RestoreScratchPool(outerScratchPool);
             }
+            if (leaseBackwardOutputs) Autodiff.DifferentiableOps.TrackAdoptedAccumulators = outerTrackAdoptions;
             // Only a whole executed run is evidence; a capture records, and a body that threw left its pairing unknown.
             _firstWriteRedirects.EndRun(executed && completed);
             // A redirected slot's op writes its accumulator from now on, so the slot's own buffer is never used again
@@ -4232,7 +4253,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // forgets it, and its finalizer frees it once the last tensor bound to it is gone.
             if (executed && completed && _scratchPool is { } scratchPool
                 && backend is not Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true })
+            {
                 foreach (long slot in _firstWriteRedirects.RedirectedSlots) scratchPool.Forget(slot);
+                scratchPool.TrimUnleased();
+            }
         }
     }
 
@@ -4382,6 +4406,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 if (pooledGrads is not null) ZeroPooledGradientsStartingAt(i, backend, residentEngine, esz);
                 de?.SetCurrentScratchAction(fwd.Length + i);   // backward actions keyed in a namespace above forward
                 bwd[i](engine);
+                de?.EndScratchAction();
                 if (bwdDiag && cb is not null && cb.StreamCaptureStatusRaw() == 2)
                 {
                     string nm = i < bwdNames.Length ? bwdNames[i] : "?";

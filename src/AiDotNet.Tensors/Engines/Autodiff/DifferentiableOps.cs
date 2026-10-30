@@ -1176,6 +1176,7 @@ internal static class DifferentiableOps
         if (!owners.ContainsKey(contribution))
         {
             owners[contribution] = destination;
+            NoteAdoptedAccumulator(contribution);
             return contribution;
         }
 
@@ -1199,7 +1200,38 @@ internal static class DifferentiableOps
             contribution.CopyTo(owned.AsWritableSpanUnmarked());
         }
         owners[owned] = destination;
+        NoteAdoptedAccumulator(owned);
         return owned;
+    }
+
+    // Accumulators a compiled GPU step's action adopted from storage it wrote (a donated contribution, a dedicated copy,
+    // a contiguous or out-of-place replacement): their device buffers outlive the action, so the step's leased output
+    // slots must not hand them on (StepScratchPool.EndLeases). Recorded only while the step tracks them.
+    [ThreadStatic] private static List<object>? t_adoptedAccumulators;
+    [ThreadStatic] private static bool t_trackAdoptedAccumulators;
+
+    /// <summary>Whether accumulators adopted on this thread are recorded for <see cref="TakeAdoptedAccumulators"/>.</summary>
+    internal static bool TrackAdoptedAccumulators
+    {
+        get => t_trackAdoptedAccumulators;
+        set
+        {
+            t_trackAdoptedAccumulators = value;
+            if (!value) t_adoptedAccumulators = null;
+        }
+    }
+
+    /// <summary>The accumulators adopted on this thread since the last call, or null.</summary>
+    internal static List<object>? TakeAdoptedAccumulators()
+    {
+        var adopted = t_adoptedAccumulators;
+        t_adoptedAccumulators = null;
+        return adopted;
+    }
+
+    private static void NoteAdoptedAccumulator(object accumulator)
+    {
+        if (t_trackAdoptedAccumulators) (t_adoptedAccumulators ??= new List<object>()).Add(accumulator);
     }
 
     private static void ReplaceAccumulatorBufferOwner<T>(
@@ -1210,6 +1242,7 @@ internal static class DifferentiableOps
         var owners = GetAccumulatorOwners<T>();
         owners.Remove(previous);
         owners[replacement] = destination;
+        NoteAdoptedAccumulator(replacement);
     }
 
     private static bool HasOverlappingStorage<T>(Tensor<T> left, Tensor<T> right)
