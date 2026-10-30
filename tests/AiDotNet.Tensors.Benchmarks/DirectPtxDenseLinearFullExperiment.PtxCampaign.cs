@@ -18,9 +18,12 @@ namespace AiDotNet.Tensors.Benchmarks;
 /// </summary>
 /// <remarks>
 /// <para>Run: <c>--ptx-campaign gemm-large [--m=2048 --n=2048 --k=2048] [--generations=8] [--islands=2]
-/// [--model=claude-opus-5-5] [--max-usd=50] [--max-usd-per-call=5] [--out=dir]</c>. <c>--max-usd</c> bounds the sum
-/// of the per-call caps the campaign reserves (<see cref="CampaignUsdBudgetChatClient"/>); each call is capped at
-/// <c>--max-usd-per-call</c>. The model is reached through the Claude Code CLI
+/// [--model=claude-opus-5-5] [--max-usd=50] [--max-usd-per-call=5] [--out=dir]</c>. <c>--max-usd</c> is the
+/// campaign's total budget (<see cref="ClaudeCodeChatClientOptions.TotalBudgetUsd"/>: each call reserves its cap out of
+/// what remains, and is charged what the CLI reports it cost); each call is capped at <c>--max-usd-per-call</c>. Once the
+/// budget is spent, further proposals fail without starting the CLI and the campaign finishes its generations and
+/// verdict. Neither limit is a hard cap: the CLI can run a turn past a call's cap, so spend can exceed
+/// <c>--max-usd</c> by about a turn per call in flight. The model is reached through the Claude Code CLI
 /// (<c>claude -p</c>) on PATH, so the run uses that login. Every proposal, verdict and the final comparison is written
 /// as JSON lines to stdout and to the output directory.</para>
 /// <para>Kernels win or lose per GPU: a campaign's verdict holds for the card it ran on. To confirm on another card
@@ -113,13 +116,27 @@ internal static partial class DirectPtxDenseLinearFullExperiment
             AllowPatches = true,
             AllowRewrites = true,
             IncumbentProfile = null,
+            // Every editable line is catalogued in the prompt, about 192 bytes with its source, and the parent is
+            // abandoned before the first call when its lines exceed MaxInputTokens / 192. The 128x128 incumbents run to
+            // about 3,250 lines, but the bound follows the incumbent actually tuned: a BlockK 32, 8x16 thread tile emits
+            // 4,096 FMA lines alone. Twice its line count (at least 4,096) leaves room for a rewrite that grows it.
+            MaxInputTokens = Math.Max(4_096, 2 * incumbent.Split('\n').Length) * 192,
         };
         var ledger = new EvolutionResourceLedger("ptx-campaign-" + target,
             new EvolutionResources(new[] { new KeyValuePair<string, decimal>("cost_units", 1_000_000m) }));
         var resources = new ProgramEvolutionResourceOptions(ledger, 1_000m, ptxOptions.CostUnitVersionHash);
-        // MaxBudgetUsd caps one claude -p process, and every call and retry starts another, so the campaign's budget is
-        // held across calls by the wrapper instead.
-        var client = new CampaignUsdBudgetChatClient(model, maxUsd, maxUsdPerCall);
+        // MaxBudgetUsd caps one claude -p process, and every call starts another, so the campaign's budget is the client's
+        // TotalBudgetUsd across calls. Retries are off: the evolution loop's next request is the retry, charged like any other.
+        // Neither is a hard cap: the client admits a call while any budget remains and clamps its cap to the remainder, and
+        // the CLI can run one turn past a cap, so spend can exceed --max-usd by about a turn per call in flight.
+        var claude = new ClaudeCodeChatClient(new ClaudeCodeChatClientOptions
+        {
+            Model = model,
+            MaxBudgetUsd = maxUsdPerCall,
+            TotalBudgetUsd = maxUsd,
+            MaxRetries = 0,
+        });
+        var client = new CountingChatClient(claude, maxUsd);
         var variation = PtxProgramVariation.Create(client, compiler, ptxOptions, resources);
         var correctnessGate = new DelegateProgramFitnessEvaluator((genome, _, token) =>
         {
@@ -150,10 +167,13 @@ internal static partial class DirectPtxDenseLinearFullExperiment
         {
             target, generations, islands, model,
             best_speedup_over_incumbent = best?.Evaluation.Quality,
-            proposals = usage.Proposals, calls = usage.ChatCalls, input_tokens = usage.InputTokens, output_tokens = usage.OutputTokens,
+            proposals = usage.Proposals, input_tokens = usage.InputTokens, output_tokens = usage.OutputTokens,
+            // Attempts include requests refused for budget, which never started the CLI; failures are calls that did.
+            call_attempts = client.Attempts, calls_refused_for_budget = client.RefusedForBudget,
+            calls_failed = client.Failed,
             max_usd = maxUsd, max_usd_per_call = maxUsdPerCall,
-            // Reserved caps, not spend: claude -p reports no spend back, and a call can run somewhat past its own cap.
-            usd_committed = client.CommittedUsd, calls_refused_for_budget = client.RefusedCalls,
+            // Charged: each call's reported total_cost_usd, or its whole cap when the CLI reported none.
+            usd_spent = claude.SpentUsd,
         });
         if (best is null || (best.Evaluation.Quality ?? 0) <= 1.0)
         {
@@ -239,5 +259,44 @@ internal static partial class DirectPtxDenseLinearFullExperiment
 
         static IReadOnlyDictionary<string, long> Shape(long mm, long nn, long kk) =>
             new Dictionary<string, long> { ["M"] = mm, ["N"] = nn, ["K"] = kk };
+    }
+
+    /// <summary>
+    /// Counts the campaign's model requests by outcome. The variation's ChatCalls counts every request, including the
+    /// ones the client refuses once the budget is spent, which never start the CLI. The client admits a call while any
+    /// budget remains, so a request that fails with nothing left was refused; any other failure is the provider's.
+    /// </summary>
+    private sealed class CountingChatClient : IProgramChatClient
+    {
+        private readonly ClaudeCodeChatClient _inner;
+        private readonly decimal _totalBudgetUsd;
+        private int _attempts, _refused, _failed;
+
+        public CountingChatClient(ClaudeCodeChatClient inner, decimal totalBudgetUsd)
+        {
+            _inner = inner;
+            _totalBudgetUsd = totalBudgetUsd;
+        }
+
+        public string ModelId => _inner.ModelId;
+        public int Attempts => Volatile.Read(ref _attempts);
+        public int RefusedForBudget => Volatile.Read(ref _refused);
+        public int Failed => Volatile.Read(ref _failed);
+
+        public async Task<ProgramChatResponse> GetResponseAsync(IReadOnlyList<ProgramChatMessage> messages,
+            ProgramChatOptions options, CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref _attempts);
+            bool exhausted = _inner.SpentUsd >= _totalBudgetUsd;
+            try
+            {
+                return await _inner.GetResponseAsync(messages, options, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception) when (!cancellationToken.IsCancellationRequested)
+            {
+                Interlocked.Increment(ref exhausted ? ref _refused : ref _failed);
+                throw;
+            }
+        }
     }
 }
