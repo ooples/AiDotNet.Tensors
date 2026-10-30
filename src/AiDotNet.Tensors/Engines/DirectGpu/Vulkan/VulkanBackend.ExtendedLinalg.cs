@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Vulkan IExtendedLinalgBackend (#1142): the portable solver family over the shared la_ kernels.
 using System.Collections.Generic;
 using P = AiDotNet.Tensors.Engines.DirectGpu.PortableExtendedLinalg;

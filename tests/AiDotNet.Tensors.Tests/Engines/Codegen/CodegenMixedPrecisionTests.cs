@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Narrow storage, wide arithmetic.
 //
 // The emitter hardcoded fp32 in 69 places and bindings carried no element type at all, so

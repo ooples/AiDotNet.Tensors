@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Vulkan launcher shims for the vision detection kernels (Issue #217).
 // Mirrors VulkanBackend.Parity210.cs — pipelines cached by GLSL source hash
 // via GetOrCreateGlslPipeline, so first call compiles SPIR-V, subsequent

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CPU-vs-GPU op-parity scaffold (Tensors #775). ULP-accurate comparison primitives.
 #if NETCOREAPP
 

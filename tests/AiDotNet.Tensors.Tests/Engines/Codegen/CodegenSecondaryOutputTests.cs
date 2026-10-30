@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // A max-pool that also reports WHERE the maximum was.
 //
 // CodegenKernelSpec had one output binding. Max-pool is promoted at 1.41x and its generated

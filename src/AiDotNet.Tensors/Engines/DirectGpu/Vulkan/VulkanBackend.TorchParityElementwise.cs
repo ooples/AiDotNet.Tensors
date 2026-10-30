@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Launches for the Vulkan PyTorch-parity elementwise kernels (VulkanTorchParityElementwiseKernels), #1127.
 using System;
 

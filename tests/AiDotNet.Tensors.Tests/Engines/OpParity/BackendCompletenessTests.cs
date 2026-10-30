@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CPU-vs-GPU op-parity scaffold (Tensors #775). Backend completeness guard.
 //
 // GOAL: every IEngine tensor operation must have a REAL implementation everywhere it can run —

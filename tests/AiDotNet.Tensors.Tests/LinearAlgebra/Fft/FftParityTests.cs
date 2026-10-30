@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Parity tests: compare our output against known analytical/reference values.
 // Every golden value here is hand-computed or pulled from numpy.fft / scipy —
 // citations are in each test's comment.

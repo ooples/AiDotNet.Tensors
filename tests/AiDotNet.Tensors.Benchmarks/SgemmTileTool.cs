@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // --sgemm-tile: the FP32 GEMM generator (PtxSgemmGenerator) at one square problem, any configurations by name, timed
 // paired against a baseline configuration and checked against its output. The FP32 GEMM gap to cuBLAS on sm_86
 // (cutlass_80_simt_sgemm_256x128_8x4: 800 us at 2048^3 against our 898) is a tile and pipeline question; this measures

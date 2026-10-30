@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // GLSL compute kernels for the torch.linalg decomposition surface (#211 moat #2).
 // One workgroup per batch slice, local_size = 256 threads. Matrices with n > 256
 // fall back to CPU through DirectGpuTensorEngine.

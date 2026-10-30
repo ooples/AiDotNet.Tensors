@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 //
 // Regression tests for issues #560 / #561 / #562:
 //   #560 — IEngine.MatrixMultiply<Half> was hitting a scalar CPU path

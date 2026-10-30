@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Complex and quaternion arithmetic in the code generator.
 //
 // A wrong sign in the multiplication table produces a kernel that assembles, runs, and

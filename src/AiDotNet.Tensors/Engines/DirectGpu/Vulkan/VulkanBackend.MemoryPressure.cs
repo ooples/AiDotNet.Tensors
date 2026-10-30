@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
 // Free memory needs VK_EXT_memory_budget, which this backend does not enable. Pressure-gated reclamation therefore never triggers; the unconditional sweep still runs.

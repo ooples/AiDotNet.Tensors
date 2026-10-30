@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // #653/#657 follow-up — forward caching allocator. A repeated inference forward run inside a
 // TensorArena (Reset() between forwards) must (a) produce BIT-IDENTICAL results to the
 // non-arena path on every iteration — the arena hands back RentUninitialized buffers holding

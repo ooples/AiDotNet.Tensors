@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Vulkan timestamp-query bindings: the device clock the tuned-kernel registry times candidates on.
 
 using System;

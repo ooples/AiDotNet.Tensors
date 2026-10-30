@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The row-wise scatter mean and softmax as declared programs (#890 phase 4e, #1441): the interpreter against the
 // hand-written resident_scatter_mean_rows_counts / resident_scatter_softmax_rows arithmetic, and the emitted PTX
 // against the determinism contract (no atomic).

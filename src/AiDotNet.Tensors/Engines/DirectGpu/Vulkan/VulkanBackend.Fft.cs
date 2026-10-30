@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Vulkan FFT dispatcher — implements IFftBackend by compiling and launching
 // VulkanFftKernels.Fft via the existing GlslUnaryOp compute pipeline. The
 // kernel is in-place algorithmically; we use a (readonly input, in-place

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // #1528: the hand-written FlashAttention backward as two tiled, atomic-free kernels. With the declared route off they
 // serve every FlashAttentionBackward call up to head dimension 128; checked here against an fp64 reference (the flash
 // kernels' causal rule, key <= query, and an optional additive bias) and for bit-identical repeats.

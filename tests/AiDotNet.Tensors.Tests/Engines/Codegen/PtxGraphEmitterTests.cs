@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Proves the front end exists: a graph built by the ORDINARY lowering path reaches the
 // PTX emitter and produces a kernel that computes the right answer.
 //

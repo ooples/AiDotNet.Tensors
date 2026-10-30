@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Stage 1/2 gate for the codegen bake-off: does a GENERATED kernel match the same
 // fp64 oracle the hand-written kernel is held to, and what does it cost?
 

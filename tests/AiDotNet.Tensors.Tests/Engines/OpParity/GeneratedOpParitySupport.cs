@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Runtime bridge for the generated per-op parity facts (#775). The source generator emits one
 // [SkippableFact] per tensor-returning IEngine op that calls into here; this looks up the
 // registered parity case(s) for that op and runs the harness, or skips with a visible NEEDS-SPEC

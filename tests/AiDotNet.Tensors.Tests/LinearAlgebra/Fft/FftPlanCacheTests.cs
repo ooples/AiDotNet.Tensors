@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // FftPlanCache contract tests: the cache memoizes Bluestein plans per
 // (n, inverse) key and returns bit-identical results across cold/warm calls.
 // Test strategy: probe GetOrCreateBluestein directly rather than counting

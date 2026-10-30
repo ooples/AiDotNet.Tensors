@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // GlobalMeanPoolBackwardGpu had NO test at all, which is why it shipped two distinct bugs:
 //   1. TileBatch(grad, out, reduceSize, 1) wrote only reduceSize elements into a buffer sized
 //      outerSize*reduceSize and then Scaled all of it — scaling UNINITIALISED memory for outerSize > 1.

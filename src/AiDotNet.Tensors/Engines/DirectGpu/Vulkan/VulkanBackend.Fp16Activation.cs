@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
 // No FP16-native activation kernels here apart from the direct convolution: every other capability reports false,
