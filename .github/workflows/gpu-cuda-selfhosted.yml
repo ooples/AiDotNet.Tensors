@@ -144,6 +144,10 @@ jobs:
         $gpu = nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv,noheader
         if ($LASTEXITCODE -ne 0) { Write-Output "::error::nvidia-smi failed: this runner has no usable NVIDIA driver."; exit 1 }
         "Runner GPU: $gpu" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
+        # The checked-in direct-PTX specializations are validated on GA10x (SM86) and admitted only there, so on another
+        # architecture their tests skip by design; on an SM86 runner such a skip is a failure (see the skip check).
+        $computeCap = ($gpu -split ',')[2].Trim()
+        if ($computeCap -ne '8.6') { "CUDA_ARCH_SKIP_ALLOW=|\bSM ?86\b|GA10[0-9x]" | Out-File -Append -Encoding utf8 -FilePath $env:GITHUB_ENV }
 
     # The cuDNN paths (convolution candidates, batch norm) need cudnn64_9.dll on the loader path, and the toolkit's
     # cuBLASLt for the CUDA it was built against: the CUDA 13 build pairs with a CUDA 13 toolkit's cublasLt64_13.dll.
@@ -197,7 +201,8 @@ jobs:
       # Allowed skip reasons:
       #   - another backend's device or toolchain (this runner has CUDA, not necessarily HIP, Metal, Vulkan, WebGPU, or a
       #     Python with numpy and torch);
-      #   - architecture requirements (an sm_ level, AVX-512 on the host CPU);
+      #   - architecture requirements (an sm_ level, AVX-512 on the host CPU; on a runner other than SM86, the SM86-only
+      #     specializations, via CUDA_ARCH_SKIP_ALLOW from the GPU step);
       #   - tracked baselines, each a listed gap with its own marker (NEEDS SPEC, TAPE-GRADIENT BASELINE, a forward with
       #     no differentiable leaf, the PTX transfer campaign's progress check);
       #   - opt-in benchmarks and probes, and wall-clock perf gates (they skip under CI=true);
@@ -206,7 +211,7 @@ jobs:
       # only that no backend is available. A CUDA test skipping for any other reason fails the lane.
       run: >-
         python AiDotNet.Tensors/scripts/ci/summarize-test-skips.py --title "CUDA" --fail-on-skip
-        --allowed-skip "(?i)(HIP|ROCm|Metal|MoltenVK|Vulkan|WebGPU|Dawn|AIDOTNET_WEBGPU_NODE_DIR|OpenCL|POCL|DirectML|macOS)|requires sm_|compute capability|torch|numpy|python|PARITY_PYTHON|AVX-512|^NEEDS SPEC:|TAPE-GRADIENT BASELINE|forward recorded no differentiable leaf|Full PTX transfer not complete|^Not applicable: CUDA |Requires a non-CUDA|benchmark|Wall-clock perf gate|run manually|manual perf harness|Manual CUDA|Diagnostic-only|Set (AIDOTNET|PARITY)_[A-Z0-9_]+=|AIDOTNET_GPU_MEMTRACK|AIDOTNET_KERNEL_REGISTRY_PERSIST"
+        --allowed-skip "(?i)(HIP|ROCm|Metal|MoltenVK|Vulkan|WebGPU|Dawn|AIDOTNET_WEBGPU_NODE_DIR|OpenCL|POCL|DirectML|macOS)|requires sm_|compute capability|torch|numpy|python|PARITY_PYTHON|AVX-512|^NEEDS SPEC:|TAPE-GRADIENT BASELINE|forward recorded no differentiable leaf|Full PTX transfer not complete|^Not applicable: CUDA |Requires a non-CUDA|benchmark|Wall-clock perf gate|run manually|manual perf harness|Manual CUDA|Diagnostic-only|Set (AIDOTNET|PARITY)_[A-Z0-9_]+=|AIDOTNET_GPU_MEMTRACK|AIDOTNET_KERNEL_REGISTRY_PERSIST${{ env.CUDA_ARCH_SKIP_ALLOW }}"
         --allowed-skip-test "(Hip|Rocm|Dawn|WebGpu|Vulkan|Metal|MoltenVk|OpenCl|Pocl|DirectMl)[A-Za-z0-9]*Tests\."
         "${{ runner.temp }}/trx/*.trx"
 
