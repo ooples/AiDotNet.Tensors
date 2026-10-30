@@ -180,6 +180,34 @@ public sealed class TensorScopeTests
         Assert.Throws<InvalidOperationException>(() => handedUp.ToArray());
     }
 
+    // A host tensor made inside the scope and filled on the device by TensorCopy (a layer copying into an output it
+    // allocated) is the scope's dead intermediate like any other: freed with no download, so a later host read throws.
+    // TensorCopy marks its destination caller-owned, which a tape's release keeps; inside a scope it was the forward's
+    // own output, and DenseNet-121 b16 downloaded 263 MB of them per predict.
+    [SkippableFact]
+    public void AHostTensorMadeInTheScope_AndCopiedIntoOnTheDevice_IsFreedWithoutADownload()
+    {
+        using var gpu = TryEngine(out string noGpu);
+        Skip.If(gpu is null, noGpu);
+        IEngine engine = gpu;
+        Tensor<float> written, kept;
+        long downloadsBefore;
+        using (var scope = TensorScope.Begin())
+        {
+            written = new Tensor<float>(new[] { 16 });
+            engine.TensorCopy(Resident(gpu, 16, 1f), written);
+            kept = new Tensor<float>(new[] { 16 });
+            engine.TensorCopy(Resident(gpu, 16, 50f), kept);
+            scope.Keep(kept);
+            downloadsBefore = AiDotNet.Tensors.Helpers.HostSync.MaterializeCount;
+        }
+
+        Assert.Equal(downloadsBefore, AiDotNet.Tensors.Helpers.HostSync.MaterializeCount);
+        Assert.Throws<InvalidOperationException>(() => written.ToArray());
+        Assert.Equal(50f, kept.ToArray()[0]);
+        Assert.Equal(65f, kept.ToArray()[15]);
+    }
+
     // A cache a model builds on its first forward is held past every scope open around the call: Detach takes it out of
     // all of them, where Keep in the inner scope only hands it to the enclosing one, which then frees it.
     [SkippableFact]

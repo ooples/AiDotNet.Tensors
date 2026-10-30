@@ -2852,8 +2852,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     {
                         // A caller-owned host tensor written in place on the device during the step (an optimizer
                         // moment, a parameter) is neither a step intermediate nor scratch: keep its values, as the
-                        // safe path does, whichever mode the caller asked for.
-                        var effectiveMode = entry.HostOrigin ? ActivationReleaseMode.MaterializeThenFree : mode;
+                        // safe path does, whichever mode the caller asked for. A TensorScope's release passes only the
+                        // storages created inside it (releasableOnly), so a host tensor there is the forward's own dead
+                        // output (a concatenation or normalization written Into a fresh host tensor): downloading it
+                        // made a DenseNet-121 b16 predict copy 263 MB of dead activations to the host on every call.
+                        var effectiveMode = entry.HostOrigin && releasableOnly is null ? ActivationReleaseMode.MaterializeThenFree : mode;
                         switch (effectiveMode)
                         {
                             case ActivationReleaseMode.MaterializeThenFree:
