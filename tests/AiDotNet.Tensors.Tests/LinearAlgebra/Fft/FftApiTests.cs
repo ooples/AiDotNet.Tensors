@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Tensor-level FFT API tests. The kernel is already covered by
 // FftKernelsInvariantsTests — these exercise the surface wiring:
 // batching, axis handling, real ↔ complex conversion, fftshift, fftfreq.

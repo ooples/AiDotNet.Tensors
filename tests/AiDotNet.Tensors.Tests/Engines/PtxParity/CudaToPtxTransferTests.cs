@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // PTX transfer tracking. Reports transfer progress and signals — via a single
 // gate that flips from skipped to passing — when every CUDA kernel has a
 // promoted PTX replacement and the CUDA kernels can be deleted.

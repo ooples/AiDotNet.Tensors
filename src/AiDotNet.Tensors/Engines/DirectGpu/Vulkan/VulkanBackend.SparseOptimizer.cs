@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Vulkan backend - deterministic resident sparse optimizer scatter updates.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;

@@ -2,6 +2,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using AiDotNet.Tensors.Engines.DirectGpu;
 
 namespace AiDotNet.Tensors.Engines.DevicePrimitives;
@@ -174,9 +175,7 @@ public static class GpuMemoryStats
     {
         get
         {
-            var names = new List<string>();
-            foreach (var device in DeviceMemoryAccount.Devices)
-                if (device.HasActivity) names.Add(device.Device);
+            var names = DeviceMemoryAccount.Devices.Where(device => device.HasActivity).Select(device => device.Device).ToList();
             names.Sort(StringComparer.Ordinal);
             return names;
         }

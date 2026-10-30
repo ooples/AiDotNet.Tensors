@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Tests for the offline aidn2 (Ed25519) license-token verification path and its PersistenceGuard wiring.
 
 #nullable disable

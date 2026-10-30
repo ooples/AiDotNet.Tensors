@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Phase 0.5 — calibrate the benchmark harness itself.
 //
 // Every performance claim downstream depends on the harness being able to resolve a

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // FFT-based convolution: RFFT → elementwise multiply → IRFFT.
 // Wins over direct convolution when kernel is large (K ≳ 31) because direct
 // cost is O(H·W·K²) whereas FFT cost is O(H·W·log(H·W)) + per-output-channel

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Backend dispatch wiring tests for issue #225 Phase C.5.
 
 #nullable disable

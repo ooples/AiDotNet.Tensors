@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Three or more outputs written from one iteration point.
 //
 // The generator could express exactly two: a primary and one argmax. That capped the whole

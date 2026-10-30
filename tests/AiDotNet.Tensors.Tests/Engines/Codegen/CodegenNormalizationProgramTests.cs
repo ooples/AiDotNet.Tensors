@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The normalisation family as declared programs (#890 phase 4a), held to hand-written fp64
 // references rather than to the spec interpreter alone: the programs and their passes are
 // built from the same IR, so agreeing with the interpreter would only prove the program

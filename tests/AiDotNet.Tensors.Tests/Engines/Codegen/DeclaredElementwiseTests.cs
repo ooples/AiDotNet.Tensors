@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The pointwise family on declared kernels (#890 phase 4a): a declared body that calls a library function derived
 // from the hand-written kernel's own source. The IR, the emitted kernel and the derivation rules are pinned here on
 // the CPU; the device half runs routed operators bit for bit against the hand-written kernels.

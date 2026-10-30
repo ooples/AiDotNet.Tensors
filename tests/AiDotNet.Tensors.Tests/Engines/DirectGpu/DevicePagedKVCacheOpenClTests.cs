@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // End-to-end correctness tests for the on-device paged KV cache (P1): append tokens across block
 // boundaries into the device pool, then run paged-attention through the uploaded block table and
 // compare to a standard-attention CPU oracle. Skips when no OpenCL device is available.

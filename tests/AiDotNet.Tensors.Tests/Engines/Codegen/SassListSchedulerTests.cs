@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // SassListScheduler (#1442): instruction reordering within straight-line blocks. Encodings are sm_86 driver cubins'.
 
 using System;

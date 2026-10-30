@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // PR #333 / issue #337 — mixed-precision routing policy for compute-bound
 // GPU ops. Distinct from the TF32 path (CudaDispatchPolicy.AllowTF32) which
 // stays on fp32 but rounds the multiply on the Tensor Cores; this enum

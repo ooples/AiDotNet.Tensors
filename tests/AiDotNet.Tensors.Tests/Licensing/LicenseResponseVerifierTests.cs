@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Tests for signed online-validation-response verification (anti-spoof / anti-replay).
 
 #nullable disable

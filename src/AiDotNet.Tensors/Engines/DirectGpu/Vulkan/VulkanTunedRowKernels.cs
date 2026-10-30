@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Generated row / column kernel variants for Vulkan (GLSL), served through the tuned-kernel registry (#1115).
 using System.Globalization;
 

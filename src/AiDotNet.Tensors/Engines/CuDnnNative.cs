@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 
 namespace AiDotNet.Tensors.Engines;
@@ -978,6 +979,17 @@ public sealed class CuDnnContext : IDisposable
     private static bool _checkedAvailability;
     private static readonly object _lock = new object();
 
+    /// <summary>
+    /// Held from <c>cudnnSetStream</c> through the launch it binds. The stream is a property of the shared handle, so
+    /// without this another thread can rebind it in between and the launch lands on that thread's stream — inside its
+    /// graph capture (CUDA 900 "operation not permitted when stream is capturing", then 901 for the capturer).
+    /// </summary>
+    internal object StreamBindingLock { get; } = new object();
+
+    /// <summary>Binds the handle to <paramref name="stream"/>. Call it holding <see cref="StreamBindingLock"/>, through the launch.</summary>
+    internal void BindStream(IntPtr stream) =>
+        CheckStatus(CuDnnNative.cudnnSetStream(Handle, stream), "cudnnSetStream");
+
     /// <summary>Gets whether cuDNN is available on this system.</summary>
     public static bool IsAvailable
     {
@@ -1595,12 +1607,14 @@ public sealed class CuDnnActivation : IDisposable
 
         float alpha = 1.0f;
         float beta = 0.0f;
-        var status = CuDnnNative.cudnnActivationForward(
-            _context.Handle, actDesc.Handle,
-            ref alpha,
-            inputDesc.Handle, inputDevPtr,
-            ref beta,
-            outputDesc.Handle, outputDevPtr);
+        CuDnnNative.CudnnStatus status;
+        lock (_context.StreamBindingLock)
+            status = CuDnnNative.cudnnActivationForward(
+                _context.Handle, actDesc.Handle,
+                ref alpha,
+                inputDesc.Handle, inputDevPtr,
+                ref beta,
+                outputDesc.Handle, outputDevPtr);
         CuDnnContext.CheckStatus(status, "ActivationForwardGpu");
         DirectGpu.GpuLaunchProbe.OnLaunch();   // a cuDNN dispatch is GPU work: count it, as the residency probe expects
     }
@@ -1629,14 +1643,16 @@ public sealed class CuDnnActivation : IDisposable
 
         float alpha = 1.0f;
         float beta = 0.0f;
-        var status = CuDnnNative.cudnnActivationBackward(
-            _context.Handle, actDesc.Handle,
-            ref alpha,
-            outputDesc.Handle, outputDevPtr,
-            outputDesc.Handle, gradOutputDevPtr,
-            inputDesc.Handle, inputDevPtr,
-            ref beta,
-            inputDesc.Handle, gradInputDevPtr);
+        CuDnnNative.CudnnStatus status;
+        lock (_context.StreamBindingLock)
+            status = CuDnnNative.cudnnActivationBackward(
+                _context.Handle, actDesc.Handle,
+                ref alpha,
+                outputDesc.Handle, outputDevPtr,
+                outputDesc.Handle, gradOutputDevPtr,
+                inputDesc.Handle, inputDevPtr,
+                ref beta,
+                inputDesc.Handle, gradInputDevPtr);
         CuDnnContext.CheckStatus(status, "ActivationBackwardGpu");
         DirectGpu.GpuLaunchProbe.OnLaunch();   // a cuDNN dispatch is GPU work: count it, as the residency probe expects
     }
@@ -1669,6 +1685,7 @@ public sealed class CuDnnConvolution : IDisposable
     // call can't reallocate the device buffer while another call still has
     // the pointer in flight inside cudnnConvolutionForward.
     private readonly object _workspaceLock = new();
+    private readonly List<(IntPtr Pointer, DevicePrimitives.DeviceMemoryHold Memory)> _retiredWorkspaces = new();
     private IntPtr _workspace;
     private ulong _workspaceSize;
     private bool _disposed;
@@ -1771,6 +1788,7 @@ public sealed class CuDnnConvolution : IDisposable
             // Without this, a concurrent Forward call on the same
             // CuDnnConvolution instance can realloc the workspace mid-
             // kernel and invalidate our workspace pointer.
+            lock (_context.StreamBindingLock)
             lock (_workspaceLock)
             {
                 IntPtr workspace = IntPtr.Zero;
@@ -1902,6 +1920,7 @@ public sealed class CuDnnConvolution : IDisposable
         // still using the pointer inside cuDNN. Future follow-up: per-call
         // workspace pool if contention on the shared buffer becomes a real
         // hot-path bottleneck.
+        lock (_context.StreamBindingLock)
         lock (_workspaceLock)
         {
             IntPtr workspace = IntPtr.Zero;
@@ -1983,6 +2002,7 @@ public sealed class CuDnnConvolution : IDisposable
             CuDnnContext.CheckStatus(status, "GetConvolutionBackwardDataWorkspaceSize");
         }
 
+        lock (_context.StreamBindingLock)
         lock (_workspaceLock)
         {
             IntPtr workspace = IntPtr.Zero;
@@ -2060,6 +2080,7 @@ public sealed class CuDnnConvolution : IDisposable
             CuDnnContext.CheckStatus(status, "GetConvolutionBackwardFilterWorkspaceSize");
         }
 
+        lock (_context.StreamBindingLock)
         lock (_workspaceLock)
         {
             IntPtr workspace = IntPtr.Zero;
@@ -2144,24 +2165,23 @@ public sealed class CuDnnConvolution : IDisposable
     {
         if (_workspaceSize >= requiredSize) return;
 
-        // Free old workspace
-        if (_workspace != IntPtr.Zero)
-        {
-            CuBlasNative.cuMemFree(_workspace);
-            _workspaceMemory.OnFreed();
-            _workspace = IntPtr.Zero;
-            _workspaceSize = 0;
-        }
-
-        // Allocate new workspace
-        var result = CuBlasNative.cuMemAlloc(out _workspace, requiredSize);
+        // Grow at least twofold, so the retired workspaces below add up to less than the live one.
+        ulong size = Math.Max(requiredSize, _workspaceSize * 2);
+        var result = CuBlasNative.cuMemAlloc(out IntPtr grown, size);
         if (result != CudaResult.Success)
         {
             throw new InvalidOperationException($"Failed to allocate cuDNN workspace: {result}");
         }
-        _workspaceSize = requiredSize;
+
+        // The old workspace is retired, not freed: a captured CUDA graph keeps the pointer of every convolution it
+        // recorded, so freeing it would have the graph's replays write into memory reused by something else. And a
+        // cuMemFree on a capturing thread is itself not permitted during the capture. It stays allocated, so it keeps
+        // its charge until Dispose frees it.
+        if (_workspace != IntPtr.Zero) _retiredWorkspaces.Add((_workspace, _workspaceMemory));
+        _workspace = grown;
+        _workspaceSize = size;
         _workspaceMemory = default;
-        _workspaceMemory.OnAllocated(MemoryAccount, (long)requiredSize);
+        _workspaceMemory.OnAllocated(MemoryAccount, (long)size);
     }
 
     public void Dispose()
@@ -2174,6 +2194,12 @@ public sealed class CuDnnConvolution : IDisposable
             _workspaceMemory.OnFreed();
             _workspace = IntPtr.Zero;
         }
+        foreach (var retired in _retiredWorkspaces)
+        {
+            CuBlasNative.cuMemFree(retired.Pointer);
+            retired.Memory.OnFreed();
+        }
+        _retiredWorkspaces.Clear();
 
         if (_ownsContext)
         {
@@ -2281,13 +2307,14 @@ public sealed class CuDnnPooling : IDisposable
             float alpha = 1.0f;
             float beta = 0.0f;
 
-            status = CuDnnNative.cudnnPoolingForward(
-                _context.Handle,
-                poolDesc.Handle,
-                ref alpha,
-                inputDesc.Handle, gpuInput.DevicePtr,
-                ref beta,
-                outputDesc.Handle, gpuOutput.DevicePtr);
+            lock (_context.StreamBindingLock)
+                status = CuDnnNative.cudnnPoolingForward(
+                    _context.Handle,
+                    poolDesc.Handle,
+                    ref alpha,
+                    inputDesc.Handle, gpuInput.DevicePtr,
+                    ref beta,
+                    outputDesc.Handle, gpuOutput.DevicePtr);
             CuDnnContext.CheckStatus(status, "PoolingForward");
 
             var output = new float[outputSize];
@@ -2329,13 +2356,15 @@ public sealed class CuDnnPooling : IDisposable
 
         float alpha = 1.0f;
         float beta = 0.0f;
-        var status = CuDnnNative.cudnnPoolingForward(
-            _context.Handle,
-            poolDesc.Handle,
-            ref alpha,
-            inputDesc.Handle, inputDevPtr,
-            ref beta,
-            outputDesc.Handle, outputDevPtr);
+        CuDnnNative.CudnnStatus status;
+        lock (_context.StreamBindingLock)
+            status = CuDnnNative.cudnnPoolingForward(
+                _context.Handle,
+                poolDesc.Handle,
+                ref alpha,
+                inputDesc.Handle, inputDevPtr,
+                ref beta,
+                outputDesc.Handle, outputDevPtr);
         CuDnnContext.CheckStatus(status, "PoolingForwardGpu");
         DirectGpu.GpuLaunchProbe.OnLaunch();   // a cuDNN dispatch is GPU work: count it, as the residency probe expects
     }
@@ -2367,15 +2396,17 @@ public sealed class CuDnnPooling : IDisposable
 
         float alpha = 1.0f;
         float beta = 0.0f;
-        var status = CuDnnNative.cudnnPoolingBackward(
-            _context.Handle,
-            poolDesc.Handle,
-            ref alpha,
-            outputDesc.Handle, outputDevPtr,
-            outputDesc.Handle, gradOutputDevPtr,
-            inputDesc.Handle, inputDevPtr,
-            ref beta,
-            inputDesc.Handle, gradInputDevPtr);
+        CuDnnNative.CudnnStatus status;
+        lock (_context.StreamBindingLock)
+            status = CuDnnNative.cudnnPoolingBackward(
+                _context.Handle,
+                poolDesc.Handle,
+                ref alpha,
+                outputDesc.Handle, outputDevPtr,
+                outputDesc.Handle, gradOutputDevPtr,
+                inputDesc.Handle, inputDevPtr,
+                ref beta,
+                inputDesc.Handle, gradInputDevPtr);
         CuDnnContext.CheckStatus(status, "PoolingBackwardGpu");
         DirectGpu.GpuLaunchProbe.OnLaunch();   // a cuDNN dispatch is GPU work: count it, as the residency probe expects
     }
@@ -2467,19 +2498,20 @@ public sealed class CuDnnBatchNorm : IDisposable
             float alpha = 1.0f;
             float beta = 0.0f;
 
-            status = CuDnnNative.cudnnBatchNormalizationForwardInference(
-                _context.Handle,
-                CuDnnNative.CudnnBatchNormMode.Spatial,
-                ref alpha,
-                ref beta,
-                inputDesc.Handle, gpuInput.DevicePtr,
-                outputDesc.Handle, gpuOutput.DevicePtr,
-                bnDesc.Handle,
-                gpuScale.DevicePtr,
-                gpuBias.DevicePtr,
-                gpuMean.DevicePtr,
-                gpuVariance.DevicePtr,
-                epsilon);
+            lock (_context.StreamBindingLock)
+                status = CuDnnNative.cudnnBatchNormalizationForwardInference(
+                    _context.Handle,
+                    CuDnnNative.CudnnBatchNormMode.Spatial,
+                    ref alpha,
+                    ref beta,
+                    inputDesc.Handle, gpuInput.DevicePtr,
+                    outputDesc.Handle, gpuOutput.DevicePtr,
+                    bnDesc.Handle,
+                    gpuScale.DevicePtr,
+                    gpuBias.DevicePtr,
+                    gpuMean.DevicePtr,
+                    gpuVariance.DevicePtr,
+                    epsilon);
             CuDnnContext.CheckStatus(status, "BatchNormalizationForwardInference");
 
             var output = new float[tensorSize];
@@ -2516,16 +2548,18 @@ public sealed class CuDnnBatchNorm : IDisposable
         CuDnnContext.CheckStatus(dStatus, "DeriveBNTensorDescriptor");
 
         float alpha = 1f, beta = 0f;
-        var status = CuDnnNative.cudnnBatchNormalizationForwardInference(
-            _context.Handle,
-            CuDnnNative.CudnnBatchNormMode.Spatial,
-            ref alpha, ref beta,
-            xDesc.Handle, inputDevPtr,
-            xDesc.Handle, outputDevPtr,
-            bnDesc.Handle,
-            scaleDevPtr, biasDevPtr,
-            runningMeanDevPtr, runningVarDevPtr,
-            epsilon);
+        CuDnnNative.CudnnStatus status;
+        lock (_context.StreamBindingLock)
+            status = CuDnnNative.cudnnBatchNormalizationForwardInference(
+                _context.Handle,
+                CuDnnNative.CudnnBatchNormMode.Spatial,
+                ref alpha, ref beta,
+                xDesc.Handle, inputDevPtr,
+                xDesc.Handle, outputDevPtr,
+                bnDesc.Handle,
+                scaleDevPtr, biasDevPtr,
+                runningMeanDevPtr, runningVarDevPtr,
+                epsilon);
         CuDnnContext.CheckStatus(status, "BatchNormalizationForwardInferenceGpu");
         DirectGpu.GpuLaunchProbe.OnLaunch();   // a cuDNN dispatch is GPU work: count it, as the residency probe expects
     }
@@ -2556,18 +2590,20 @@ public sealed class CuDnnBatchNorm : IDisposable
         CuDnnContext.CheckStatus(dStatus, "DeriveBNTensorDescriptor");
 
         float alpha = 1f, beta = 0f;
-        var status = CuDnnNative.cudnnBatchNormalizationForwardTraining(
-            _context.Handle,
-            CuDnnNative.CudnnBatchNormMode.Spatial,
-            ref alpha, ref beta,
-            xDesc.Handle, inputDevPtr,
-            xDesc.Handle, outputDevPtr,
-            bnDesc.Handle,
-            scaleDevPtr, biasDevPtr,
-            momentum,
-            runningMeanDevPtr, runningVarDevPtr,
-            epsilon,
-            saveMeanDevPtr, saveInvVarDevPtr);
+        CuDnnNative.CudnnStatus status;
+        lock (_context.StreamBindingLock)
+            status = CuDnnNative.cudnnBatchNormalizationForwardTraining(
+                _context.Handle,
+                CuDnnNative.CudnnBatchNormMode.Spatial,
+                ref alpha, ref beta,
+                xDesc.Handle, inputDevPtr,
+                xDesc.Handle, outputDevPtr,
+                bnDesc.Handle,
+                scaleDevPtr, biasDevPtr,
+                momentum,
+                runningMeanDevPtr, runningVarDevPtr,
+                epsilon,
+                saveMeanDevPtr, saveInvVarDevPtr);
         CuDnnContext.CheckStatus(status, "BatchNormalizationForwardTrainingGpu");
         DirectGpu.GpuLaunchProbe.OnLaunch();   // a cuDNN dispatch is GPU work: count it, as the residency probe expects
     }
@@ -2593,18 +2629,20 @@ public sealed class CuDnnBatchNorm : IDisposable
         CuDnnContext.CheckStatus(dStatus, "DeriveBNTensorDescriptor");
 
         float alphaD = 1f, betaD = 0f, alphaP = 1f, betaP = 0f;
-        var status = CuDnnNative.cudnnBatchNormalizationBackward(
-            _context.Handle,
-            CuDnnNative.CudnnBatchNormMode.Spatial,
-            ref alphaD, ref betaD, ref alphaP, ref betaP,
-            xDesc.Handle, inputDevPtr,
-            xDesc.Handle, gradOutputDevPtr,
-            xDesc.Handle, gradInputDevPtr,
-            bnDesc.Handle,
-            scaleDevPtr,
-            gradScaleDevPtr, gradBiasDevPtr,
-            epsilon,
-            savedMeanDevPtr, savedInvVarDevPtr);
+        CuDnnNative.CudnnStatus status;
+        lock (_context.StreamBindingLock)
+            status = CuDnnNative.cudnnBatchNormalizationBackward(
+                _context.Handle,
+                CuDnnNative.CudnnBatchNormMode.Spatial,
+                ref alphaD, ref betaD, ref alphaP, ref betaP,
+                xDesc.Handle, inputDevPtr,
+                xDesc.Handle, gradOutputDevPtr,
+                xDesc.Handle, gradInputDevPtr,
+                bnDesc.Handle,
+                scaleDevPtr,
+                gradScaleDevPtr, gradBiasDevPtr,
+                epsilon,
+                savedMeanDevPtr, savedInvVarDevPtr);
         CuDnnContext.CheckStatus(status, "BatchNormalizationBackwardGpu");
         DirectGpu.GpuLaunchProbe.OnLaunch();   // a cuDNN dispatch is GPU work: count it, as the residency probe expects
     }
@@ -2676,14 +2714,16 @@ public sealed class CuDnnSoftmax : IDisposable
             float alpha = 1.0f;
             float beta = 0.0f;
 
-            var status = CuDnnNative.cudnnSoftmaxForward(
-                _context.Handle,
-                CuDnnNative.CudnnSoftmaxAlgorithm.Accurate,
-                CuDnnNative.CudnnSoftmaxMode.Channel,
-                ref alpha,
-                inputDesc.Handle, gpuInput.DevicePtr,
-                ref beta,
-                outputDesc.Handle, gpuOutput.DevicePtr);
+            CuDnnNative.CudnnStatus status;
+            lock (_context.StreamBindingLock)
+                status = CuDnnNative.cudnnSoftmaxForward(
+                    _context.Handle,
+                    CuDnnNative.CudnnSoftmaxAlgorithm.Accurate,
+                    CuDnnNative.CudnnSoftmaxMode.Channel,
+                    ref alpha,
+                    inputDesc.Handle, gpuInput.DevicePtr,
+                    ref beta,
+                    outputDesc.Handle, gpuOutput.DevicePtr);
             CuDnnContext.CheckStatus(status, "SoftmaxForward");
 
             var output = new float[tensorSize];
@@ -2720,14 +2760,16 @@ public sealed class CuDnnSoftmax : IDisposable
 
         float alpha = 1.0f;
         float beta = 0.0f;
-        var status = CuDnnNative.cudnnSoftmaxForward(
-            _context.Handle,
-            CuDnnNative.CudnnSoftmaxAlgorithm.Accurate,
-            CuDnnNative.CudnnSoftmaxMode.Channel,
-            ref alpha,
-            inputDesc.Handle, inputDevPtr,
-            ref beta,
-            outputDesc.Handle, outputDevPtr);
+        CuDnnNative.CudnnStatus status;
+        lock (_context.StreamBindingLock)
+            status = CuDnnNative.cudnnSoftmaxForward(
+                _context.Handle,
+                CuDnnNative.CudnnSoftmaxAlgorithm.Accurate,
+                CuDnnNative.CudnnSoftmaxMode.Channel,
+                ref alpha,
+                inputDesc.Handle, inputDevPtr,
+                ref beta,
+                outputDesc.Handle, outputDevPtr);
         CuDnnContext.CheckStatus(status, "SoftmaxForwardGpu");
         DirectGpu.GpuLaunchProbe.OnLaunch();   // a cuDNN dispatch is GPU work: count it, as the residency probe expects
     }
@@ -2755,15 +2797,17 @@ public sealed class CuDnnSoftmax : IDisposable
 
         float alpha = 1.0f;
         float beta = 0.0f;
-        var status = CuDnnNative.cudnnSoftmaxBackward(
-            _context.Handle,
-            CuDnnNative.CudnnSoftmaxAlgorithm.Accurate,
-            CuDnnNative.CudnnSoftmaxMode.Channel,
-            ref alpha,
-            yDesc.Handle, outputDevPtr,
-            dyDesc.Handle, gradOutputDevPtr,
-            ref beta,
-            dxDesc.Handle, gradInputDevPtr);
+        CuDnnNative.CudnnStatus status;
+        lock (_context.StreamBindingLock)
+            status = CuDnnNative.cudnnSoftmaxBackward(
+                _context.Handle,
+                CuDnnNative.CudnnSoftmaxAlgorithm.Accurate,
+                CuDnnNative.CudnnSoftmaxMode.Channel,
+                ref alpha,
+                yDesc.Handle, outputDevPtr,
+                dyDesc.Handle, gradOutputDevPtr,
+                ref beta,
+                dxDesc.Handle, gradInputDevPtr);
         CuDnnContext.CheckStatus(status, "SoftmaxBackwardGpu");
         DirectGpu.GpuLaunchProbe.OnLaunch();   // a cuDNN dispatch is GPU work: count it, as the residency probe expects
     }

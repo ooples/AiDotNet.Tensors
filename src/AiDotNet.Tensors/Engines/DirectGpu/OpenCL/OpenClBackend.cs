@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // OpenCL backend using pure P/Invoke - no managed GPU runtime dependency.
 // Works on ALL .NET versions including .NET Framework 4.6.2.
 
@@ -14466,6 +14466,7 @@ KERNEL VARIANTS (A/B testing):
 
         private DeviceMemoryHold _memory; // what GpuMemoryStats counts for this memory
 
+        /// <summary>Wraps an OpenCL buffer as a GPU buffer that may return itself to a pool on dispose.</summary>
         /// <param name="account">The device's memory counters, for a fresh allocation; null for a view or a pool's new
         /// wrapper of memory already counted.</param>
         public DirectOpenClGpuBuffer(DirectOpenClBuffer buffer, Action<DirectOpenClGpuBuffer>? returnToPool = null,

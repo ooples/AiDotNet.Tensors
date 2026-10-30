@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Issue #319 — integration test that times a representative ViT
 // transformer-block forward pass and reports per-op breakdown.
 //

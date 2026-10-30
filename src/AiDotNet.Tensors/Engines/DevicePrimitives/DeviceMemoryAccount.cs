@@ -3,6 +3,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 
 namespace AiDotNet.Tensors.Engines.DevicePrimitives;
@@ -125,8 +126,11 @@ internal sealed class DeviceMemoryAccount
         long driverCurrent = 0, driverPeak = 0;
         if (_isTotal)
         {
-            foreach (var device in s_devices.Values)
-                if (device.ReadDriver() is { } d) { driverCurrent += d.Current; driverPeak += d.Peak; }
+            foreach (var d in s_devices.Values.Select(device => device.ReadDriver()).Where(d => d.HasValue))
+            {
+                driverCurrent += d!.Value.Current;
+                driverPeak += d.Value.Peak;
+            }
         }
         else if (ReadDriver() is { } d)
         {
@@ -151,7 +155,8 @@ internal sealed class DeviceMemoryAccount
         var read = _driverReserved;
         if (read is null) return null;
         try { return read(); }
-        catch { return null; }   // a statistics read never fails its caller
+        // A statistics read never fails its caller: whatever the driver query throws reads as "no driver figure".
+        catch (Exception ex) when (ex is not OutOfMemoryException) { return null; }
     }
 }
 

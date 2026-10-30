@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Blueprint #4: record WHICH hardware unit each kernel saturates.
 //
 // Release used to gate on static machine-code metrics -- SASS instructions, LDG,
