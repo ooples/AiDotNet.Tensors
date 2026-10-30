@@ -110,22 +110,13 @@ public partial class DirectGpuTensorEngine
                 using var q = gpu.GetOrAllocateBuffer(backend, query);
                 using var k = gpu.GetOrAllocateBuffer(backend, key);
                 using var v = gpu.GetOrAllocateBuffer(backend, value);
-                var result = AllocateFullyWrittenOutputBuffer(backend, outLength);
-                bool ownsResult = true;
-                try
-                {
-                    attention.FusedAttentionForward(q.Buffer, k.Buffer, v.Buffer, result.Buffer,
-                        node.Lse._gpuBuffer ?? throw new InvalidOperationException("The attention node lost its log-sum-exp buffer."),
-                        null, p, headDim);
-                    var tensor = gpu.DeferTensorResult<T>(backend, result.Buffer, outLength, outputShape);
-                    result.RelinquishOwnership();
-                    ownsResult = false;
-                    CopyResultInto(eng, tensor, output);
-                }
-                finally
-                {
-                    if (ownsResult) result.Dispose();
-                }
+                using var result = AllocateFullyWrittenOutputBuffer(backend, outLength);
+                attention.FusedAttentionForward(q.Buffer, k.Buffer, v.Buffer, result.Buffer,
+                    node.Lse._gpuBuffer ?? throw new InvalidOperationException("The attention node lost its log-sum-exp buffer."),
+                    null, p, headDim);
+                var tensor = gpu.DeferTensorResult<T>(backend, result.Buffer, outLength, outputShape);
+                result.RelinquishOwnership();
+                CopyResultInto(eng, tensor, output);
             },
             (gradOutput, inputs, output, savedState, engine, grads) =>
             {
@@ -380,8 +371,8 @@ public partial class DirectGpuTensorEngine
             || (long)batch * seqK * heads * headDim > int.MaxValue)
             return null;
         int outLength = batch * seqQ * heads * headDim;
-        var output = AllocateFullyWrittenOutputBuffer(backend, outLength);
-        bool ownsOutput = true;
+        // Disposed unless handed to the result (RelinquishOwnership makes the dispose a no-op).
+        using var output = AllocateFullyWrittenOutputBuffer(backend, outLength);
         try
         {
             using var q = GetOrAllocateBuffer(backend, query);
@@ -392,7 +383,6 @@ public partial class DirectGpuTensorEngine
                 return null;
             var result = DeferTensorResult<T>(backend, output.Buffer, outLength, outputShape);
             output.RelinquishOwnership();
-            ownsOutput = false;
             return result;
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)
@@ -400,10 +390,6 @@ public partial class DirectGpuTensorEngine
             GpuLaunchProbe.OnFallback("ShortAttentionForward", ex);
             if (ThrowOnGpuKernelFallback) throw;
             return null;
-        }
-        finally
-        {
-            if (ownsOutput) output.Dispose();
         }
     }
 
@@ -429,22 +415,14 @@ public partial class DirectGpuTensorEngine
                 using var q = gpu.GetOrAllocateBuffer(backend, query);
                 using var k = gpu.GetOrAllocateBuffer(backend, key);
                 using var v = gpu.GetOrAllocateBuffer(backend, value);
-                var result = AllocateFullyWrittenOutputBuffer(backend, outLength);
-                bool ownsResult = true;
-                try
-                {
-                    if (!kernel.TryShortAttentionForward(q.Buffer, k.Buffer, v.Buffer, result.Buffer, batch, heads, seqQ, seqK,
-                            headDim, (float)scale, causal, causalOffset))
-                        throw new InvalidOperationException("The recorded short attention declined at replay.");
-                    var tensor = gpu.DeferTensorResult<T>(backend, result.Buffer, outLength, outputShape);
-                    result.RelinquishOwnership();
-                    ownsResult = false;
-                    CopyResultInto(eng, tensor, output);
-                }
-                finally
-                {
-                    if (ownsResult) result.Dispose();
-                }
+                // Disposed unless handed to the result (RelinquishOwnership makes the dispose a no-op).
+                using var result = AllocateFullyWrittenOutputBuffer(backend, outLength);
+                if (!kernel.TryShortAttentionForward(q.Buffer, k.Buffer, v.Buffer, result.Buffer, batch, heads, seqQ, seqK,
+                        headDim, (float)scale, causal, causalOffset))
+                    throw new InvalidOperationException("The recorded short attention declined at replay.");
+                var tensor = gpu.DeferTensorResult<T>(backend, result.Buffer, outLength, outputShape);
+                result.RelinquishOwnership();
+                CopyResultInto(eng, tensor, output);
             },
             null, null);
     }
