@@ -101,6 +101,27 @@ public sealed class CompiledRecurrentCellTests
         AssertCompiledMatchesEager(input, Forward, "in-place");
     }
 
+    /// <summary>
+    /// A tensor whose last use passes while a reshape view of it is still live: its storage is not dead, so the
+    /// memory planner must not hand it to a later step of the same size.
+    /// </summary>
+    [Fact]
+    public void BaseDyingWhileItsViewLives_KeepsTheViewsValues()
+    {
+        var engine = new CpuEngine();
+        var input = Random(new[] { 4, 8 }, 1);
+        Tensor<float> Forward(Tensor<float> x)
+        {
+            var t = engine.Tanh(x);
+            var v = engine.Reshape(t, new[] { 2, 16 });
+            var u = engine.Sigmoid(t);              // t's last use as a tensor; v still reads its storage below
+            var w = engine.TensorExp(x);               // same size: a candidate for t's buffer
+            var vv = engine.Reshape(engine.TensorMultiply(v, v), new[] { 4, 8 });
+            return engine.TensorAdd(vv, engine.TensorAdd(u, w));
+        }
+        AssertCompiledMatchesEager(input, Forward, "view");
+    }
+
     [Theory]
     [InlineData(1024)]
     [InlineData(3072)]

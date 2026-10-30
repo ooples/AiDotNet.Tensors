@@ -102,99 +102,88 @@ internal sealed class MemoryPlanningPass : ICpuOptimizationPass
         // just ended (lastUse == current step). If so, add it to the dead
         // pool keyed by (element count, rank). When a future step needs an
         // output buffer, check the pool for a compatible dead tensor.
-        // Lifetimes are per tensor, so a tensor whose storage another plan tensor shares (a view, a reshape) is left
-        // alone: donating it would hand a live alias's memory to a later step, and rebinding it would cut it off from
-        // its alias. An in-place step's output is its target, a tensor an earlier step already wrote: rebinding it
-        // there moved the target onto a donor's storage between the write and the in-place update, which then read
-        // the donor's stale values (measured: MultiHeadAttentionForward + TensorBroadcastAddInPlace of its bias).
-        var storageUsers = new Dictionary<object, Tensor<T>?>(ReferenceEqualityComparer<object>.Instance);
-        void NoteStorage(Tensor<T> t)
+        // Lifetimes are per STORAGE: a view or reshape shares its base's storage, so the memory is dead only after
+        // the last use of every tensor on it, and a group holding a weight or graph input (a reshaped weight) is never
+        // donated. Only a tensor alone on its storage is rebound (rebinding one alias would cut it off from the
+        // others), and only where a step first writes it: an in-place step's output is its target, which an earlier
+        // step already wrote, and rebinding it there moved the target onto a donor's storage between the write and the
+        // update, which then read the donor's stale values (measured: MultiHeadAttentionForward +
+        // TensorBroadcastAddInPlace of its bias). Groups are decided before any rebind (a rebind replaces _storage).
+        var groupOf = new Dictionary<Tensor<T>, object>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        var groupSize = new Dictionary<object, int>(ReferenceEqualityComparer<object>.Instance);
+        var groupLastUse = new Dictionary<object, int>(ReferenceEqualityComparer<object>.Instance);
+        var groupHoldsExternal = new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
+        void Note(Tensor<T> t)
         {
-            object s = t._storage;
-            if (!storageUsers.TryGetValue(s, out var only)) storageUsers[s] = t;
-            else if (only is not null && !ReferenceEquals(only, t)) storageUsers[s] = null;
+            if (groupOf.ContainsKey(t)) return;
+            object g = t._storage;
+            groupOf[t] = g;
+            groupSize[g] = (groupSize.TryGetValue(g, out var n) ? n : 0) + 1;
+            if (!producedHere.Contains(t)) groupHoldsExternal.Add(g);
         }
         for (int i = 0; i < steps.Length; i++)
         {
-            NoteStorage(steps[i].OutputBuffer);
-            for (int j = 0; j < steps[i].Inputs.Length; j++) NoteStorage(steps[i].Inputs[j]);
+            Note(steps[i].OutputBuffer);
+            for (int j = 0; j < steps[i].Inputs.Length; j++) Note(steps[i].Inputs[j]);
         }
-        // Decided before any rebind (a rebind replaces _storage).
-        var ownsStorage = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
-        foreach (var only in storageUsers.Values)
-            if (only is not null) ownsStorage.Add(only);
-        bool OwnsItsStorage(Tensor<T> t) => ownsStorage.Contains(t);
+        foreach (var kv in lastUse)
+        {
+            object g = groupOf[kv.Key];
+            if (!groupLastUse.TryGetValue(g, out var lu) || kv.Value > lu) groupLastUse[g] = kv.Value;
+        }
         var written = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
-        // A tensor read twice by its last step (Multiply(g, g)) is donated once: twice put two later outputs on one buffer.
-        var donated = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        // A group is donated once (a tensor read twice by its last step, Multiply(g, g), put two later outputs on one buffer).
+        var donatedGroups = new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
 
         var deadPool = new Dictionary<long, List<Tensor<T>>>();
         var rebindMap = new Dictionary<Tensor<T>, Tensor<T>>(
             ReferenceEqualityComparer<Tensor<T>>.Instance);
         int reusedCount = 0;
 
+        void DonateIfDead(Tensor<T> t, int step)
+        {
+            // Graph inputs and initializer weights must stay intact across repeat Execute() calls; only intermediate
+            // activations are pool-eligible.
+            object g = groupOf[t];
+            if (groupHoldsExternal.Contains(g) || groupLastUse[g] != step || !donatedGroups.Add(g)) return;
+            long k = BufferKey(t);
+            if (!deadPool.TryGetValue(k, out var p))
+            {
+                p = new List<Tensor<T>>(4);
+                deadPool[k] = p;
+            }
+            p.Add(t);
+        }
+
         for (int i = 0; i < steps.Length; i++)
         {
             var step = steps[i];
             var output = step.OutputBuffer;
 
-            // Try to reuse a dead buffer for this step's output (only where the step first writes it)
+            // Try to reuse a dead buffer for this step's output
             long key = BufferKey(output);
             bool firstWrite = written.Add(output);
-            if (firstWrite && OwnsItsStorage(output) && deadPool.TryGetValue(key, out var pool) && pool.Count > 0)
+            if (firstWrite && groupSize[groupOf[output]] == 1 && deadPool.TryGetValue(key, out var pool) && pool.Count > 0)
             {
-                var donor = pool[pool.Count - 1];
-                pool.RemoveAt(pool.Count - 1);
-
-                // Rebind: make donor's storage point to output's storage
-                // (or vice versa — we want the step's output to write into
-                // the donor's backing array so memory is reused).
-                // Since the step's Execute writes to the output parameter,
-                // we rebind the OUTPUT to share the DONOR's storage. This
-                // way the donor's memory gets overwritten (it's dead), and
-                // the output tensor now shares that memory.
-                if (CanRebind(output, donor))
+                // Rebind: the step's Execute writes to its output parameter, so the OUTPUT is rebound to share the
+                // DONOR's storage: the donor's memory (dead) is overwritten and the output now lives in it. The most
+                // recently freed compatible donor wins (same element count and rank can still differ in shape).
+                for (int d = pool.Count - 1; d >= 0; d--)
                 {
+                    var donor = pool[d];
+                    if (!CanRebind(output, donor)) continue;
+                    pool.RemoveAt(d);
                     output.RebindStorageFromGraph(donor);
                     rebindMap[output] = donor;
                     reusedCount++;
+                    break;
                 }
             }
 
-            // After this step, check if any of its inputs are now dead
+            // After this step, its inputs' and its output's storage may be dead
             for (int j = 0; j < step.Inputs.Length; j++)
-            {
-                var inp = step.Inputs[j];
-                // Graph inputs and initializer weights aren't produced by
-                // any step in the plan — they must stay intact across
-                // repeat Execute() calls. Only intermediate activations
-                // are pool-eligible.
-                if (!producedHere.Contains(inp)) continue;
-                if (lastUse.TryGetValue(inp, out int lu) && lu == i && OwnsItsStorage(inp) && donated.Add(inp))
-                {
-                    // This input's lifetime just ended — add to dead pool
-                    long k = BufferKey(inp);
-                    if (!deadPool.TryGetValue(k, out var p))
-                    {
-                        p = new List<Tensor<T>>(4);
-                        deadPool[k] = p;
-                    }
-                    p.Add(inp);
-                }
-            }
-
-            // Also check if this step's output dies immediately (consumed
-            // only by the next step, which is common for element-wise chains)
-            if (lastUse.TryGetValue(output, out int outLu) && outLu == i && OwnsItsStorage(output) && donated.Add(output))
-            {
-                long k = BufferKey(output);
-                if (!deadPool.TryGetValue(k, out var p))
-                {
-                    p = new List<Tensor<T>>(4);
-                    deadPool[k] = p;
-                }
-                p.Add(output);
-            }
+                DonateIfDead(step.Inputs[j], i);
+            DonateIfDead(output, i);
         }
 
         // Return null if no reuse was possible (don't create unnecessary array copies)
