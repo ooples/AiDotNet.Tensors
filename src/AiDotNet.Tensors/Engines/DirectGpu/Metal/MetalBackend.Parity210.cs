@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Metal launcher shims for the parity-210 kernels. Uses the same
 // GetPipeline / encoder.SetBuffer / SetBytes / DispatchThreadgroups
 // pattern as the rest of MetalBackend — just threaded through the

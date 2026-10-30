@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Metal Shading Language (MSL) kernels for the geometry / sampling ops
 // added by Issue #217. Mirrors CudaGeometryKernels / OpenClGeometryKernels
 // in coverage and mode-int mapping.

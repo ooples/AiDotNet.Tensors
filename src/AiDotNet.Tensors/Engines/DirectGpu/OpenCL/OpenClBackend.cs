@@ -1528,7 +1528,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (_bufferPool.TryRent(data.Length, affinity, out var pooled) && pooled != null)
             {
                 pooled.Buffer.CopyFromHost(data);
-                DeviceMemoryReclaim.OnDeviceAllocation((long)data.Length * sizeof(float));
+                pooled.ReclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation((long)data.Length * sizeof(float));
                 return pooled;
             }
             if (DeviceMemoryReclaim.CollectOnPoolMiss())
@@ -1537,15 +1537,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 if (_bufferPool.TryRent(data.Length, affinity, out pooled) && pooled != null)
                 {
                     pooled.Buffer.CopyFromHost(data);
-                    DeviceMemoryReclaim.OnDeviceAllocation((long)data.Length * sizeof(float));
+                    pooled.ReclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation((long)data.Length * sizeof(float));
                     return pooled;
                 }
             }
 
             var context = _context;
             var buffer = AllocateReclaiming(() => new DirectOpenClBuffer(context, data));
-            DeviceMemoryReclaim.OnDeviceAllocation((long)data.Length * sizeof(float));
-            return new DirectOpenClGpuBuffer(buffer, ReturnOpenClBufferToPool, _memoryAccount);
+            long reclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation((long)data.Length * sizeof(float));
+            return new DirectOpenClGpuBuffer(buffer, ReturnOpenClBufferToPool, _memoryAccount) { ReclaimEpoch = reclaimEpoch };
         }
 
         public IGpuBuffer AllocateBuffer(int size)
@@ -1557,7 +1557,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var affinity = GpuBufferPoolAffinity.ForNativeQueue(_context.CommandQueue);
             if (_bufferPool.TryRent(size, affinity, out var pooled) && pooled != null)
             {
-                DeviceMemoryReclaim.OnDeviceAllocation((long)size * sizeof(float));
+                pooled.ReclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation((long)size * sizeof(float));
                 return pooled;
             }
             // A result nobody disposed returns to the pool only when the GC finalizes it, and a GPU forward allocates too
@@ -1568,15 +1568,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 DirectOpenClGpuBuffer.PendingFrees.Drain();
                 if (_bufferPool.TryRent(size, affinity, out pooled) && pooled != null)
                 {
-                    DeviceMemoryReclaim.OnDeviceAllocation((long)size * sizeof(float));
+                    pooled.ReclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation((long)size * sizeof(float));
                     return pooled;
                 }
             }
 
             var context = _context;
             var buffer = AllocateReclaiming(() => new DirectOpenClBuffer(context, size));
-            DeviceMemoryReclaim.OnDeviceAllocation((long)size * sizeof(float));
-            return new DirectOpenClGpuBuffer(buffer, ReturnOpenClBufferToPool, _memoryAccount);
+            long reclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation((long)size * sizeof(float));
+            return new DirectOpenClGpuBuffer(buffer, ReturnOpenClBufferToPool, _memoryAccount) { ReclaimEpoch = reclaimEpoch };
         }
 
         /// <summary>
@@ -14461,6 +14461,9 @@ KERNEL VARIANTS (A/B testing):
         public long SizeInBytes => (long)Size * sizeof(float);
         public IntPtr Handle => Buffer.Handle;
 
+        // The DeviceMemoryReclaim epoch of this buffer's current charge (set at each allocation or pool hit).
+        internal long ReclaimEpoch = -1;
+
         /// <summary>Frees of OpenCL buffers collected without Dispose, run by the backend's next allocation.</summary>
         internal static readonly DeviceFreeQueue PendingFrees = new();
 
@@ -14557,7 +14560,7 @@ KERNEL VARIANTS (A/B testing):
                 return;
 
             // Disposed by its owner, not abandoned to the finalizer: no collection is needed to get it back.
-            DeviceMemoryReclaim.OnDeviceRelease((long)Size * sizeof(float));
+            DeviceMemoryReclaim.OnDeviceRelease((long)Size * sizeof(float), ReclaimEpoch);
             _memory.OnReturned();
 
             if (GpuBufferReleaseDeferral.TryDefer(() => _returnToPool(this)))

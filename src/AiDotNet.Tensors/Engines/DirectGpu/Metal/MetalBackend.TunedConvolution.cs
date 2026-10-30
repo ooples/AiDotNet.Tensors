@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Convolution forward through the tuned-kernel registry on Metal (#1116).
 using AiDotNet.Tensors.Helpers.Autotune.TunedKernels;
 
