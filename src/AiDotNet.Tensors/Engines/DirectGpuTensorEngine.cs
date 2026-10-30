@@ -8383,8 +8383,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var biasBuffer = bias != null ? GetWeightBufferPreferResident(backend, bias, PersistentTensorRole.Biases) : default;
 
         // Execute the fused kernel and get result buffer
+        // Without a bias, biasBuffer is the default OwnedBuffer, whose Buffer throws; the kernel takes null instead.
         var resultBuffer = ExecuteFusedLinearKernel(backend, inputBuffer.Buffer, weightsBuffer.Buffer,
-            biasBuffer.Buffer, batchSize, outputFeatures, inputFeatures, activation);
+            bias != null ? biasBuffer.Buffer : null, batchSize, outputFeatures, inputFeatures, activation);
 
         // Return GPU-resident tensor - NO DOWNLOAD
         // IMPORTANT: Caller is responsible for disposing the returned tensor to free GPU memory
@@ -8443,8 +8444,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     break;
                 default:
                     // For other activations, use GemmBias + separate activation kernel
-                    resultBuffer = backend.GemmBias(inputBuffer, weightsBuffer, biasBuffer, batchSize, outputFeatures, inputFeatures);
-                    ApplyFusedLinearEpilogue(backend, resultBuffer, batchSize, outputFeatures, activation);
+                    resultBuffer = ActivateRows(backend,
+                        backend.GemmBias(inputBuffer, weightsBuffer, biasBuffer, batchSize, outputFeatures, inputFeatures),
+                        batchSize, outputFeatures, activation);
                     break;
             }
         }
@@ -8461,47 +8463,42 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         else
         {
             // MatMul + activation (no bias)
-            resultBuffer = backend.MatMul(inputBuffer, weightsBuffer, batchSize, outputFeatures, inputFeatures);
-            ApplyFusedLinearEpilogue(backend, resultBuffer, batchSize, outputFeatures, activation);
+            resultBuffer = ActivateRows(backend,
+                backend.MatMul(inputBuffer, weightsBuffer, batchSize, outputFeatures, inputFeatures),
+                batchSize, outputFeatures, activation);
         }
 
         return resultBuffer;
     }
 
     /// <summary>
-    /// Applies the fused-linear activation epilogue to a <c>[batchSize, features]</c> result buffer.
-    /// Most activations are pointwise and go through the size-only <see cref="ApplyGpuActivation(IDirectGpuBackend, IGpuBuffer, int, FusedActivationType)"/>.
-    /// Softmax is NOT pointwise — it normalizes across the feature dimension per row — so it must be
-    /// dispatched with the <c>(batchSize, features)</c> shape via <c>backend.Softmax</c>. Routing it
-    /// through the pointwise path made <c>FusedLinearGpu(..., Softmax)</c> throw
-    /// <c>ArgumentOutOfRangeException("Unsupported activation")</c> (the size-only switch has no Softmax
-    /// case), which broke GPU inference for any softmax-head dense layer.
+    /// The activation epilogue of a fused linear over its <c>[rows, features]</c> result. Pointwise activations run
+    /// in place on <paramref name="logits"/>. A softmax normalizes each row over its features, so it reads the whole
+    /// row and has no size-only form: it writes a new buffer, which is returned, and <paramref name="logits"/> is
+    /// released. (An in-place row kernel is not portable: WebGPU cannot bind one storage buffer as both read and
+    /// read_write.)
     /// </summary>
-    private static void ApplyFusedLinearEpilogue(
-        IDirectGpuBackend backend, IGpuBuffer buffer, int batchSize, int features, FusedActivationType activation)
+    private static IGpuBuffer ActivateRows(
+        IDirectGpuBackend backend, IGpuBuffer logits, int rows, int features, FusedActivationType activation)
     {
-        switch (activation)
+        if (activation != FusedActivationType.Softmax)
         {
-            case FusedActivationType.Softmax:
-                // Softmax normalizes across the feature dimension per row, so the kernel reads the whole
-                // row (max + sum) before writing. In-place (input buffer == output buffer) is NOT portable:
-                // WebGPU forbids binding one storage buffer as both `read` and `read_write`. Route through a
-                // scratch buffer and copy the normalized result back, so every backend behaves identically.
-                var softmaxScratch = backend.AllocateBuffer(batchSize * features);
-                try
-                {
-                    backend.Softmax(buffer, softmaxScratch, batchSize, features);
-                    backend.Copy(softmaxScratch, buffer, batchSize * features);
-                }
-                finally
-                {
-                    softmaxScratch.Dispose();
-                }
-                break;
-            default:
-                ApplyGpuActivation(backend, buffer, batchSize * features, activation);
-                break;
+            ApplyGpuActivation(backend, logits, rows * features, activation);
+            return logits;
         }
+
+        var probabilities = backend.AllocateBuffer(rows * features);
+        try
+        {
+            backend.Softmax(logits, probabilities, rows, features);
+        }
+        catch
+        {
+            probabilities.Dispose();
+            throw;
+        }
+        logits.Dispose();
+        return probabilities;
     }
 
     private static IGpuBuffer GemmBiasNoActivation(IDirectGpuBackend backend, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer bias, int M, int N, int K)

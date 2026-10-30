@@ -489,7 +489,7 @@ public static class ExecutionGraphBuilderExtensions
             if (activation.HasValue && activation.Value != FusedActivationType.None)
             {
                 builder.AddActivation(output, output, activation.Value,
-                    (b, s) => ApplyActivation(b, output.Buffer, output.Buffer, batchSize, outputFeatures, activation.Value));
+                    (b, s) => ApplyActivation(b, output.Buffer, output.Buffer, activation.Value, rows: batchSize, features: outputFeatures));
             }
 
             return builder;
@@ -523,9 +523,9 @@ public static class ExecutionGraphBuilderExtensions
         return builder;
     }
 
-    private static void ApplyActivation(IDirectGpuBackend backend, IGpuBuffer input, IGpuBuffer output, int batchSize, int features, FusedActivationType activation)
+    internal static void ApplyActivation(IDirectGpuBackend backend, IGpuBuffer input, IGpuBuffer output, FusedActivationType activation, int rows, int features)
     {
-        int size = batchSize * features;
+        int size = rows * features;
         switch (activation)
         {
             case FusedActivationType.None:
@@ -555,29 +555,25 @@ public static class ExecutionGraphBuilderExtensions
                 backend.Swish(input, output, size);
                 break;
             case FusedActivationType.Softmax:
-                // Per-row softmax: pass real (batchSize, features); the old (1, size) collapsed
-                // the whole batch into one row for batchSize > 1. Softmax reads the whole row before
-                // writing, and WebGPU forbids binding one storage buffer as both read and read_write —
-                // so when this is called in-place (input == output, as AddLinearLayer's separate-node
-                // path does) route through a scratch buffer and copy back instead of aliasing.
-                if (input == output)
-                {
-                    var softmaxScratch = backend.AllocateBuffer(size);
-                    try
-                    {
-                        backend.Softmax(input, softmaxScratch, batchSize, features);
-                        backend.Copy(softmaxScratch, output, size);
-                    }
-                    finally
-                    {
-                        softmaxScratch.Dispose();
-                    }
-                }
-                else
-                {
-                    backend.Softmax(input, output, batchSize, features);
-                }
+                SoftmaxRows(backend, input, output, rows, features);
                 break;
         }
+    }
+
+    /// <summary>
+    /// Softmax over each of <paramref name="rows"/> rows of <paramref name="features"/> elements. The kernel reads a
+    /// whole row (its max and sum) before writing it, and WebGPU cannot bind one storage buffer as both read and
+    /// read_write, so an in-place call (the linear layer's separate-node path) normalizes into scratch first.
+    /// </summary>
+    private static void SoftmaxRows(IDirectGpuBackend backend, IGpuBuffer input, IGpuBuffer output, int rows, int features)
+    {
+        if (!ReferenceEquals(input, output))
+        {
+            backend.Softmax(input, output, rows, features);
+            return;
+        }
+        using var normalized = backend.AllocateBuffer(rows * features);
+        backend.Softmax(input, normalized, rows, features);
+        backend.Copy(normalized, output, rows * features);
     }
 }
