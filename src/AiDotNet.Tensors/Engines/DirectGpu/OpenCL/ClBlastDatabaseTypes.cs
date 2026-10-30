@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CLBlast database types and search helpers (Apache 2.0 compatible data).
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 

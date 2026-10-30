@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // FP16-NATIVE elementwise / activation ops for the OpenCL backend (Tensors #558): GELU, ReLU and
 // residual add over half-stored activations, computed in FP32 in-register. These are the GPU
 // counterpart of the CPU FP16-native emit (MixedPrecisionEmit.Unary/Binary) — keeping the activation

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 {
     // #1432: IWinogradF43Transforms on OpenCL's own F(4x4, 3x3) kernels (WinogradF43Kernels, #1431), which have the
