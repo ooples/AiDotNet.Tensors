@@ -257,6 +257,7 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
             finally
             {
                 TunedKernelPolicy.Charge(Stopwatch.GetTimestamp() - start);
+                TunedKernelRegistry.NoteMeasurement();
             }
         }
     }

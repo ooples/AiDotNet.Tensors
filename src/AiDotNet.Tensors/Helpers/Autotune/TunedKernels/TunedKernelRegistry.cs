@@ -466,6 +466,17 @@ public static class TunedKernelRegistry
         }
     }
 
+    private static long s_measurements;
+
+    /// <summary>
+    /// Counts measurement sessions (a shape whose candidates were run to choose one). Their workspaces, each candidate's
+    /// own column buffers and transforms, go back to the GPU buffer pools at sizes the chosen kernel never asks for
+    /// again, so each pool releases what it holds the next time it is used after this changes.
+    /// </summary>
+    internal static long MeasurementGeneration => Interlocked.Read(ref s_measurements);
+
+    internal static void NoteMeasurement() => Interlocked.Increment(ref s_measurements);
+
     internal static void Record(TunedKernelDecision decision)
     {
         s_log.Enqueue(decision);
