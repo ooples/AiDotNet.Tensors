@@ -1,4 +1,3 @@
-using AiDotNet.Tensors.Helpers;
 using System;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -214,7 +213,7 @@ internal sealed class PersistentParallelExecutor
                 IsBackground = true,
                 Name = $"AiDotNet-Worker-{i}"
             };
-            DetachedThread.Start(_workers[i]);
+            _workers[i].Start();
         }
     }
 

@@ -97,7 +97,7 @@ internal static unsafe class CcxGemmPool
                 {
                     _go[i] = new ManualResetEventSlim(false);
                     int id = i;
-                    DetachedThread.Start(new Thread(() => WorkerLoop(id)) { IsBackground = true, Name = $"aidotnet-ccx-{id}" });
+                    new Thread(() => WorkerLoop(id)) { IsBackground = true, Name = $"aidotnet-ccx-{id}" }.Start();
                 }
                 Volatile.Write(ref _initState, 1);
             }
