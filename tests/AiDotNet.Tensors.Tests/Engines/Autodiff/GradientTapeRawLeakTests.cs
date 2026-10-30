@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Issue #312 — CI canary for the raw-tape + engine-ops use case
 // (distinct from the Transformer.Train path covered by #279/#283).
 // Asserts that 500 iterations of ComputeGradients through a multi-

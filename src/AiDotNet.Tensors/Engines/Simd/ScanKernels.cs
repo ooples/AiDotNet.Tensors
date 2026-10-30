@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // SIMD prefix-sum / prefix-product / running-max / running-min primitives.
 // Called from TensorCumSum / TensorCumProd / TensorCumMax / TensorCumMin
 // on the contiguous float32 fast path.

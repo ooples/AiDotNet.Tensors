@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Pins the deterministic-AND-parallel contract that ManagedBlas relies on to
 // exceed PyTorch (whose deterministic mode sacrifices parallelism). The audit
 // (ManagedBlas determinism plan, Phase 0) established that in deterministic mode

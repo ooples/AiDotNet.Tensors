@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Window functions for STFT, spectral analysis, filter design.
 // Parameters match torch.signal.windows / scipy.signal.windows.
 

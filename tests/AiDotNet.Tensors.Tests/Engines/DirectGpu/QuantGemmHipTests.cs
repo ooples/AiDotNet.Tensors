@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Correctness tests for the HIP/ROCm weight-only fused dequant-GEMM (P0), validated against a CPU
 // reference implementing the same contract as FusedDequantMatmulKernels. Skips when no HIP/ROCm
 // device is available (e.g. Windows/AMD-consumer dev box); runs on a ROCm host / CI.

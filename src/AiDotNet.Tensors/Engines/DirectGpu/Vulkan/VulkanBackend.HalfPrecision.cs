@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // IGpuHalfPrecisionBackend implementation for the Vulkan backend (issue #560):
 // FP16 GEMM on the GPU via a GLSL compute shader, built on the new real Vulkan
 // GPU GEMM (the previous Gemm was a CPU download/loop/upload fallback).

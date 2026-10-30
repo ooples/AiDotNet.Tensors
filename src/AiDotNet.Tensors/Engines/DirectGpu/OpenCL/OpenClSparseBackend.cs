@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // OpenCL host-array CSR·dense SpMM dispatch (AMD / Intel GPUs).
 
 using System;

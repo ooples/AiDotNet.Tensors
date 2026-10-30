@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CPU reference tests for the tail of Issue #217: RoI family + audio
 // primitives. Ground-truth values computed against torchvision 0.15 /
 // torchaudio 2.0 semantics.

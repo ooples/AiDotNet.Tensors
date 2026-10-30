@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The rest of the sparse kernels as declared programs (#1441) on the fp64 interpreter: CSR SpMM with a bias, SDDMM and
 // the graph edge scatter-add, each against the hand-written kernel's loop.
 

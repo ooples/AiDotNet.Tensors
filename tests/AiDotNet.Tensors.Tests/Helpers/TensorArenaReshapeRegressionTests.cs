@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 //
 // Regression + invariant suite for the TensorArena "zero-alloc training"
 // mechanism (Helpers/TensorArena.cs). These tests pin down the exact shape

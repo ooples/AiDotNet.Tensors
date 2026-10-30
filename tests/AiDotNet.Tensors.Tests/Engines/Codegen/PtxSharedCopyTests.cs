@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The tiled emitters' global->shared copy: cp.async on sm_80+, a synchronous register round trip on Turing (sm_75).
 // Ampere output must not change by a byte -- cubins and autotune identities are keyed on it -- and Turing output must
 // contain no cp.async, which its PTX target does not have.

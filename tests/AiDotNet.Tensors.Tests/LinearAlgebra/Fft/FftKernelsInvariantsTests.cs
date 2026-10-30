@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Algebraic / analytical invariants that MUST hold for any correct DFT kernel,
 // independent of implementation. Failures here mean the numeric core is wrong —
 // no amount of higher-level API polish can paper over them.

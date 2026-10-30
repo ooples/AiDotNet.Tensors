@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CSR SpMM as a declared program (#890 phase 4e, #1441): an inversion over the stored entries, each admitted only
 // inside its row's [rowPtr[r], rowPtr[r + 1]) range. The interpreter against csr_spmm's loop; the PTX for no atomic.
 

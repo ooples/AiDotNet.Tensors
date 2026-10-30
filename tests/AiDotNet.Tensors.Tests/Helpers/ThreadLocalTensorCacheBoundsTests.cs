@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // ThreadLocalTensorCache<T> caps buffers PER SIZE BUCKET and its doc used to call that "prevents
 // unbounded memory growth". It did not: the key is an exact element count, nothing capped how many
 // distinct sizes a thread accumulated, and this cache pools at ANY size. A process that keeps

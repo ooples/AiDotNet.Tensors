@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Reductions must reach the front end, and must mean what they said.
 //
 // The first front end handled elementwise chains only, so every reduction declined --

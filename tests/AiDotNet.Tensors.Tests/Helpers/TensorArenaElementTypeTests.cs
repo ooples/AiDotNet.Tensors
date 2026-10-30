@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The arena's tensor ring was keyed by element COUNT only, then cast the cached wrapper to Tensor<T>.
 // One arena serving both float and double operations of the same size (a float model whose pitch
 // preprocessing runs a double FFT, a mixed-precision step) handed a Tensor<double> to a Tensor<float>

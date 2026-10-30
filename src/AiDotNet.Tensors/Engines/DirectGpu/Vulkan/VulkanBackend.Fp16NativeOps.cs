@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // FP16-NATIVE elementwise / activation ops for the Vulkan backend (Tensors #558): GELU, ReLU and
 // residual add over packed-half activations, computed in FP32 in-register. GPU counterpart of the CPU
 // FP16-native emit — keeps the activation chain genuinely Half end-to-end. Runtime GLSL→SPIR-V via

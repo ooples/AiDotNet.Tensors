@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Vulkan IGpuBatchExecution operations backed by the shared batch-execution kernels (#1142). The per-op shaders
 // these replace left their outputs unwritten (no push constants reached them), read gated inputs in the wrong
 // layout, or ran whole-tensor reductions on one thread.

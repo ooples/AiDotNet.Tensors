@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // OpenCL launcher shims for the parity-210 kernels. Each method pulls the
 // compiled DirectOpenClKernel from _kernelCache (populated at backend init)
 // and dispatches via kernel.Execute1D with 256-thread workgroups.
