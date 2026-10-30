@@ -95,8 +95,9 @@ public sealed class BatchPolymorphicPlanTests
         var w2 = Random(new[] { 16, 4 }, 2);
         var (traces, built) = RunBatches(engine!, new[] { 8 }, new[] { 1, 4, 2, 3, 7, 16, 4, 1 },
             x => engine!.Softmax(engine.TensorMatMul(engine.ReLU(engine.TensorMatMul(x, w1)), w2)));
-        Assert.Equal(2, traces);
-        Assert.Equal(4, built);    // 2, 3, 7, 16; the repeats hit the cache
+        // Batch 1 is specialized (traced, as in torch); 4 is the base, 2 shows what scales; 3, 7, 16 are built.
+        Assert.Equal(3, traces);
+        Assert.Equal(3, built);
         (engine as IDisposable)?.Dispose();
     }
 
@@ -109,9 +110,9 @@ public sealed class BatchPolymorphicPlanTests
         var kernel = Random(new[] { 4, 3, 3, 3 }, 3);
         var head = Random(new[] { 4 * 6 * 6, 5 }, 4);
         // The reshape target names the batch, so it is the captured int[] that has to scale.
-        var (traces, built) = RunBatches(engine!, new[] { 3, 8, 8 }, new[] { 1, 2, 5, 9 },
+        var (traces, built) = RunBatches(engine!, new[] { 3, 8, 8 }, new[] { 1, 2, 5, 9, 4 },
             x => engine!.TensorMatMul(engine.Reshape(engine.ReLU(engine.Conv2D(x, kernel)), new[] { x.Shape[0], 4 * 6 * 6 }), head));
-        Assert.Equal(2, traces);
+        Assert.Equal(3, traces);
         Assert.Equal(2, built);
         (engine as IDisposable)?.Dispose();
     }
@@ -145,8 +146,39 @@ public sealed class BatchPolymorphicPlanTests
     public void ADelegateThatCapturedTheBatch_GetsItRescaled()
     {
         var engine = new CpuEngine();
-        var (traces, built) = RunBatches(engine, new[] { 3 }, new[] { 1, 2, 5, 8 },
+        var (traces, built) = RunBatches(engine, new[] { 3 }, new[] { 1, 2, 5, 8, 3 },
             x => engine.TensorAdd(RowIndexOp(x), x));
+        Assert.Equal(3, traces);
+        Assert.Equal(2, built);
+    }
+
+    /// <summary>An op whose delegate captured its input's backing array rather than the tensor.</summary>
+    private static Tensor<float> DoubleFromBackingOp(Tensor<float> x)
+    {
+        var src = x.GetBackingArrayForCacheLookupUnsafe()!;
+        int length = x.Length;
+        Action<Tensor<float>> fill = output =>
+        {
+            var span = output.AsWritableSpan();
+            for (int i = 0; i < length; i++) span[i] = 2 * src[i];
+        };
+        var scope = GraphMode.Current;
+        if (scope is null)
+        {
+            var eager = new Tensor<float>(x.Shape.ToArray());
+            fill(eager);
+            return eager;
+        }
+        return scope.RecordUnary(LazyNodeType.Custom, "DoubleFromBacking", x, x.Shape.ToArray(), (_, output) => fill(output));
+    }
+
+    [Fact]
+    public void ADelegateThatCapturedABackingArray_ReadsTheBuiltPlansBuffer()
+    {
+        var engine = new CpuEngine();
+        // Built plans must read their own input buffer, not the base trace's.
+        var (traces, built) = RunBatches(engine, new[] { 4 }, new[] { 2, 3, 6, 9 },
+            x => engine.TensorAdd(DoubleFromBackingOp(x), x));
         Assert.Equal(2, traces);
         Assert.Equal(2, built);
     }

@@ -193,11 +193,12 @@ public class MultiDimSymbolicShapeTests
         foreach (var (b, s) in combos)
             RegisterForward(b, s);
 
-        // Traced: the base (1,128); (1,512), the first change of seq alone; (2,64) and (2,256), which change
-        // batch before a batch-only change was seen; (4,128), the first change of batch alone. Every other
-        // combination is built from those traces, and every plan executes its own shape (checked above).
-        Assert.Equal(5, forwardInvocations);
-        Assert.Equal(11, cache.InstantiatedPlanCount);
+        // Traced: the three batch-1 shapes (size 1 is specialized, as in torch); the base (2,64); (2,256), the
+        // first change of seq alone; (4,128) and (4,1024), which change batch before a batch-only change was
+        // seen; (8,64), the first change of batch alone. The other eight are built from those traces, and every
+        // plan executes its own shape (checked above).
+        Assert.Equal(8, forwardInvocations);
+        Assert.Equal(8, cache.InstantiatedPlanCount);
         Assert.Equal(combos.Length, cache.InferencePlanCount);
     }
 

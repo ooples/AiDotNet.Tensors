@@ -25,6 +25,8 @@ internal sealed class InferenceTraceRecipe<T>
     internal readonly List<int[]> SlotShapes = new();
     internal readonly List<SlotKind> SlotKinds = new();
     internal readonly Dictionary<object, int> SlotOf = new(ReferenceEqualityComparer<object>.Instance);
+    // A slot's backing array, which a recorded delegate may capture in place of the tensor.
+    internal readonly Dictionary<object, int> BackingSlotOf = new(ReferenceEqualityComparer<object>.Instance);
     internal readonly Dictionary<ILazyNode, int> NodeIndex = new(ReferenceEqualityComparer<ILazyNode>.Instance);
     internal int InputSlot = -1;
     internal int OutputSlot = -1;
@@ -80,6 +82,8 @@ internal sealed class InferenceTraceRecipe<T>
     private void AddSlot(Tensor<T> tensor, SlotKind kind)
     {
         if (SlotOf.ContainsKey(tensor)) return;
+        if (tensor.GetBackingArrayForCacheLookupUnsafe() is { } backing && !BackingSlotOf.ContainsKey(backing))
+            BackingSlotOf[backing] = Slots.Count;
         SlotOf[tensor] = Slots.Count;
         Slots.Add(tensor);
         SlotShapes.Add((int[])tensor._shape.Clone());

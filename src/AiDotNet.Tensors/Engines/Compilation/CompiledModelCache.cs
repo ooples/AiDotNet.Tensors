@@ -280,7 +280,10 @@ public sealed class CompiledModelCache<T> : IDisposable
                 var explicitOutput = forward();
                 ThrowIfForwardRecordedNothing(scope, explicitOutput);
                 // Recorded before compiling: compilation clears the lazy links the recipe numbers.
-                var recipe = symbolDims.Length > 0 ? InferenceTraceRecipe<T>.Capture(scope, explicitOutput, inputShape) : null;
+                // A size-1 symbolic dim is specialized: that trace teaches the template nothing.
+                var recipe = symbolDims.Length > 0 && ShapePolymorphicTemplate<T>.IsGeneric(inputShape, symbolDims)
+                    ? InferenceTraceRecipe<T>.Capture(scope, explicitOutput, inputShape)
+                    : null;
                 plan = scope.CompileInference<T>(explicitOutput, inputShape);
                 if (recipe is not null)
                 {

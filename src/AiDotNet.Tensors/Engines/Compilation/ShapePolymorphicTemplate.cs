@@ -52,17 +52,29 @@ internal sealed class ShapePolymorphicTemplate<T>
         }
     }
 
+    /// <summary>
+    /// Whether every symbolic dim of <paramref name="shape"/> is at least 2. A size of 0 or 1 is specialized, as in
+    /// torch: a forward legitimately records a different graph there (a size-1 operand turns a broadcast into a plain
+    /// add, a kernel picks another path), so such a trace neither seeds a template nor is built from one.
+    /// </summary>
+    internal static bool IsGeneric(int[] shape, int[] symbolDims)
+    {
+        foreach (var d in symbolDims)
+            if (d >= shape.Length || shape[d] < 2) return false;
+        return true;
+    }
+
     /// <summary>Whether this template can build a plan for <paramref name="inputShape"/> without a trace.</summary>
     internal bool CanServe(int[] inputShape)
     {
-        if (_base.Failure is not null) return false;
+        if (_base.Failure is not null || !IsGeneric(inputShape, _symbolDims)) return false;
         var baseShape = _base.InputShape;
         if (inputShape.Length != baseShape.Length) return false;
         for (int d = 0; d < baseShape.Length; d++)
         {
             int j = Array.IndexOf(_symbolDims, d);
             if (inputShape[d] == baseShape[d]) continue;
-            if (j < 0 || _fits[j] is null || inputShape[d] < 1) return false;
+            if (j < 0 || _fits[j] is null) return false;
         }
         return true;
     }
@@ -73,7 +85,7 @@ internal sealed class ShapePolymorphicTemplate<T>
     /// </summary>
     internal void Observe(InferenceTraceRecipe<T> variant)
     {
-        if (_base.Failure is not null) return;
+        if (_base.Failure is not null || !IsGeneric(variant.InputShape, _symbolDims)) return;
         var a = _base.InputShape; var b = variant.InputShape;
         if (a.Length != b.Length) return;
         int changed = -1;
@@ -120,6 +132,14 @@ internal sealed class ShapePolymorphicTemplate<T>
                 replacement = TensorAllocator.RentUninitialized<T>(shape);
             }
             tensorMap[original] = replacement;
+        }
+        // A delegate that captured a replaced tensor's backing array gets the replacement's.
+        foreach (var pair in recipe.BackingSlotOf)
+        {
+            if (!tensorMap.TryGetValue(recipe.Slots[pair.Value], out var replaced)) continue;
+            if (((Tensor<T>)replaced).GetBackingArrayForCacheLookupUnsafe() is not { } backing)
+                throw new InvalidOperationException($"slot {pair.Value}'s replacement has no backing array for a delegate that captured one.");
+            tensorMap[pair.Key] = backing;
         }
 
         var cloner = new CaptureCloner(tensorMap, scale);
@@ -391,6 +411,11 @@ internal sealed class ShapePolymorphicTemplate<T>
                 if (da.Method != db.Method) return FailAt(path, "calls different methods");
                 return Match(da.Target, db.Target, path + "." + da.Method.Name);
             }
+            // A graph tensor's backing array, captured instead of the tensor: it is that slot, not a constant, even
+            // when the two traces' buffers happen to hold the same values.
+            bool ba = _first.BackingSlotOf.TryGetValue(a, out var backingA);
+            bool bb = _second.BackingSlotOf.TryGetValue(b, out var backingB);
+            if (ba || bb) return ba && bb && backingA == backingB || FailAt(path, "captures different graph buffers");
             if (a is Array arrA)
             {
                 var arrB = (Array)b;
