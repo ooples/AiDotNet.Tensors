@@ -7887,12 +7887,14 @@ public partial class DirectGpuTensorEngine
         return bhsd.Reshape(new[] { B * H, S, d });
     }
 
+    // Largest [B*H, S, S] score tensor (elements) the unmasked MHA forward materialises for its batched-GEMM route.
+    // Three tensors that size are live at once (scores, scaled scores, probabilities): 32M floats is 3 x 128 MB.
+    // Longer sequences take the fused kernel, which keeps O(S) state per row.
+    // Settable for tests, which drive the fused branch at small shapes.
+    internal static long MhaBatchedScoreElementBudget { get; set; } = 32L * 1024 * 1024;
+
     // PR #638 diag: pin the residual MHA leak source — count tape-active vs tapeless MHA-forward calls (the
     // tapeless ones get DropTransientActivationsCreatedAfter; tape-active are skipped). AIDOTNET_MHA_DIAG=1.
-    // Largest [B*H, S, S] score tensor (elements) the unmasked MHA forward materialises for its batched-GEMM route:
-    // 64M floats is 256 MB. Longer sequences take the fused kernel, which keeps O(S) state per row.
-    private const long MhaBatchedScoreElementBudget = 64L * 1024 * 1024;
-
     private static readonly bool s_mhaDiag = System.Environment.GetEnvironmentVariable("AIDOTNET_MHA_DIAG") == "1";
     private static long s_mhaTotal, s_mhaTapeActive;
     private const int MhaDiagDumpInterval = 500;                    // dump every N MHA calls
@@ -7967,8 +7969,10 @@ public partial class DirectGpuTensorEngine
             // softmax and one batched GEMM with V, on the tuned GEMM kernels. Past it: the fused FlashAttention kernel,
             // which never materialises the scores (the portable fused kernel recomputes each score per output column,
             // so it lost to the loop at head width 64 on OpenCL). The loop remains for masks (it zeroes fully masked
-            // rows explicitly) and for a backend that has neither.
-            if (mask is null)
+            // rows explicitly) and for a backend that has neither. Tapeless only: this is the inference route
+            // (MultiHeadAttentionLayer.TryFusedAttentionInference), and its softmax and permutes record no backward,
+            // so a recording tape keeps the path it had.
+            if (mask is null && !IsTapeActive<T>())
             {
                 Tensor<T>? headsOut = null;
                 if ((long)B * H * S * S <= MhaBatchedScoreElementBudget)
@@ -7994,10 +7998,8 @@ public partial class DirectGpuTensorEngine
                 {
                     var batchedProj = TensorMatMul(headsOut.Reshape(new[] { B * S, D }), outWeight);
                     var batchedResult = batchedProj.Reshape(new[] { B, S, D });
-                    bool batchedTapeActive = IsTapeActive<T>();
-                    if (!batchedTapeActive)
-                        DropTransientActivationsCreatedAfter(actSnapshot, batchedProj.DataVector, allThreads: true);
-                    if (s_mhaDiag) MhaDiag(batchedTapeActive);
+                    DropTransientActivationsCreatedAfter(actSnapshot, batchedProj.DataVector, allThreads: true);
+                    if (s_mhaDiag) MhaDiag(tapeActive: false);
                     return batchedResult;
                 }
             }
