@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The grouped-query attention backward (#1440) on the fp64 interpreter: equal to the per-head backward of the same
 // problem with every key/value head repeated for its query heads, dk and dv summed back over each group.
 

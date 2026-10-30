@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The one defect class a shared oracle cannot catch.
 //
 // Every other correctness gate on this project compares the emitted kernel against the fp64

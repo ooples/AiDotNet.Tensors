@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // General convolution (#890 phase 4b): stride, dilation and groups as index maps, and their
 // gradients DERIVED by the adjoint. Forward is held to a hand-written convolution; each
 // derived gradient to the adjoint identity <dy, F x> = <F^T dy, x> (data) and to a direct
