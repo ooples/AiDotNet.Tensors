@@ -360,6 +360,10 @@ public partial class DirectGpuTensorEngine
         }
     }
 
+    // Settable for tests, which drive the batched-GEMM and fused branches behind the short-sequence kernel at shapes
+    // it would take.
+    internal static bool ShortAttentionEnabled { get; set; } = true;
+
     // Inference only (nothing records a backward): the short-sequence forward where the backend would otherwise compose
     // the attention (permutes, two batched GEMMs, scale, softmax); a ViT-Tiny block's 65-token attention went from six
     // passes over memory to one kernel. Null wherever it does not apply, and the caller continues as before.
@@ -368,6 +372,7 @@ public partial class DirectGpuTensorEngine
     {
         // An inference trace (a compiled Predict) records the kernel as one node; a training or compatibility trace needs
         // the differentiable primitives, so it keeps them.
+        if (!ShortAttentionEnabled) return null;
         if (GraphMode.IsActive)
             return GraphMode.IsInferenceTrace
                 ? TryRecordShortAttention(query, key, value, batch, heads, seqQ, seqK, headDim, scale, causal, causalOffset, outputShape)

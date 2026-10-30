@@ -67,7 +67,12 @@ internal sealed class LinearFusionPattern : IFusionPattern
                     if (activation != FusedActivationType.None)
                     {
                         if (consumerCounts.TryGetValue(nodes[j], out var actFan) && actFan > 1)
-                            break; // shared activation — leave it standalone
+                        {
+                            // Shared activation: leave it standalone, and fuse no activation into the linear (it
+                            // writes the add's output, which the standalone activation then reads).
+                            activation = FusedActivationType.None;
+                            break;
+                        }
                         activationNode = nodes[j];
                         break;
                     }
