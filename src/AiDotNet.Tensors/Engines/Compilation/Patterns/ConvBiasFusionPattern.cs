@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Built-in fusion: Conv2D -> channel bias add [-> ReLU] as one op on the GPU engine.
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.Autodiff;
