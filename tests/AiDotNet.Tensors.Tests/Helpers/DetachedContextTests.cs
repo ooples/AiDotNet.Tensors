@@ -11,6 +11,9 @@ namespace AiDotNet.Tensors.Tests.Helpers;
 /// creates the worker pool inside a forward that runs under an AsyncLocal layer observer, which holds
 /// every activation of that forward.
 /// </summary>
+/// <remarks>Serialized with the pool-routing tests: one test sets the process-wide
+/// <see cref="CpuParallelSettings.UseCooperativePool"/>.</remarks>
+[Collection("BlasManaged-Pool-Serial")]
 public class DetachedContextTests
 {
     private static readonly AsyncLocal<object?> s_local = new();
@@ -69,6 +72,10 @@ public class DetachedContextTests
         // reads it there. Dispatch until a worker has run a chunk; the caller can claim every chunk of one dispatch.
         int caller = Environment.CurrentManagedThreadId;
         int workerChunks = 0, sawCreatorValue = 0;
+        // Execute dispatches through Parallel.For when the cooperative pool is off (AIDOTNET_COOP_POOL=0), and those
+        // callbacks are not the executor's workers: pin it on so the assertions are about the persistent pool.
+        bool savedCoop = CpuParallelSettings.UseCooperativePool;
+        CpuParallelSettings.UseCooperativePool = true;
         if (dispatchUnderAnother) s_local.Value = new object();
         try
         {
@@ -84,6 +91,7 @@ public class DetachedContextTests
         finally
         {
             s_local.Value = null;
+            CpuParallelSettings.UseCooperativePool = savedCoop;
         }
 
         Assert.True(workerChunks > 0, "no executor worker ran a chunk, so nothing was verified");
