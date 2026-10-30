@@ -527,8 +527,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
                 var optimizerProgram = CompileOrLoadCached(Kernels.OptimizerKernels.GetSource(), optimizationFlags, "Optimizer kernels");
                 _programs.Add(optimizerProgram);
+                var finiteGuardNames = new HashSet<string>(Kernels.OptimizerKernels.GetFiniteGuardKernelNames(), StringComparer.Ordinal);
                 foreach (var name in Kernels.OptimizerKernels.GetKernelNames())
                 {
+                    if (finiteGuardNames.Contains(name)) continue;   // registered once, from the NaN-preserving build below
                     _kernelCache[name] = new DirectOpenClKernel(_context, optimizerProgram, name);
                 }
                 // The global-norm clip and the device finiteness guard exist to see NaN and infinity, which
@@ -538,9 +540,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 var finiteGuardProgram = CompileOrLoadCached(Kernels.OptimizerKernels.GetSource(), OpenClBuildOptions.SafeMathFlags,
                     "Optimizer finiteness-guard kernels");
                 _programs.Add(finiteGuardProgram);
-                foreach (var name in Kernels.OptimizerKernels.GetFiniteGuardKernelNames())
+                foreach (var name in finiteGuardNames)
                 {
-                    _kernelCache[name].Dispose();
                     _kernelCache[name] = new DirectOpenClKernel(_context, finiteGuardProgram, name);
                 }
 
