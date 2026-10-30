@@ -22,13 +22,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 {
                     if (_conv2DForwardSlot is null)
                     {
+                        // The first applicable candidate is the slot's reference: every tuning run executes it once for the
+                        // correctness check and times it in every pair. im2col + GEMM comes first so that is a GEMM wherever
+                        // its scratch fits: the generic dispatch is a direct convolution there, up to 1.4 s a call on a batch-64
+                        // ResNet-50 layer, so measuring one shape spent the whole 2 s tuning budget and every other shape of a
+                        // process ran on its untuned default. The generic dispatch stays the reference where the scratch does not fit.
                         var candidates = new ITunedKernelCandidate<TunedConv2DArgs>[]
                         {
-                            new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.generic", TunedKernelOrigin.Builtin, true,
-                                _ => true, (in TunedConv2DArgs a) => { Conv2DGeneric(a); ConvEpiloguePasses(a); }),
                             new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.im2col_gemm", TunedKernelOrigin.Generated, true,
                                 shape => TunedConv2DArgs.GemmScratchFits(shape) && HasTunedKernel(Kernels.OpenClTunedRowKernels.Im2ColName),
                                 (in TunedConv2DArgs a) => { Conv2DIm2ColGemm(a); ConvEpiloguePasses(a); }),
+                            new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.generic", TunedKernelOrigin.Builtin, true,
+                                _ => true, (in TunedConv2DArgs a) => { Conv2DGeneric(a); ConvEpiloguePasses(a); }),
                             new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.tiled", TunedKernelOrigin.Builtin, true,
                                 shape => shape[5] <= 7 && shape[6] <= 7 && HasTunedKernel("conv2d_tiled"),
                                 (in TunedConv2DArgs a) => Conv2DTiled(a)),

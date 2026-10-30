@@ -150,6 +150,13 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
             RetireFailedCandidate(c, ex);
             return false;
         }
+        catch (Engines.DirectGpu.GpuOutOfMemoryException ex)
+        {
+            // The reference itself ran out of device memory (an im2col reference's column buffer): the caller's own path
+            // (a direct kernel with no scratch) still runs. Nothing is retired; a later call with memory free uses it.
+            System.Diagnostics.Trace.TraceWarning($"Tuned kernel reference {c.Id} for {Op} ran out of device memory: {ex.Message}");
+            return false;
+        }
     }
 
     private bool IsReference(ITunedKernelCandidate<TArgs> candidate) =>
