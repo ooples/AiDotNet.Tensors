@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Row fusion (#890 phase 4a): a row-shaped program runs as ONE warp-per-row kernel that reads
 // its sources once. These pin which programs are accepted, and the property fusion exists
 // for -- every source element is loaded once, however many passes read it.

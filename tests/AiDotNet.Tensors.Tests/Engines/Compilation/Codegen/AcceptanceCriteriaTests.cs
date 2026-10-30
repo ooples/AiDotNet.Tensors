@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Acceptance-criteria tests for issue #225.
 //
 // Each test maps to one of the bullet points in the issue's

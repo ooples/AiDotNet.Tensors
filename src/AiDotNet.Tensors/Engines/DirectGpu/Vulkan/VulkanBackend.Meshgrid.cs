@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Vulkan specialized two-vector Meshgrid2D (#923): one dispatch writes both grids.
 using System;
 using System.Collections.Concurrent;

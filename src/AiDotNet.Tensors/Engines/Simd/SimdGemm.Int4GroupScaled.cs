@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 //
 // Weight-only int4 GROUP-quant GEMM (Phase A / #1622, L5a + L2 batch=1).
 //

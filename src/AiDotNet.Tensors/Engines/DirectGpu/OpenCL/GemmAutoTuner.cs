@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Auto-tuning framework for GEMM kernel selection and parameter optimization.
 // Implements Bayesian optimization for efficient kernel parameter search.
 

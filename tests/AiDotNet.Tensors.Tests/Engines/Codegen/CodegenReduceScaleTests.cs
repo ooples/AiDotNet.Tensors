@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // A mean is a sum with a constant, and the constant belongs to the epilogue.
 //
 // CodegenReduceKind had Sum and Max only, so global average pooling and any loss

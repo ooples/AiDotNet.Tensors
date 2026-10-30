@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Dgemm (double-precision) SIMD kernel — FP64 companion to SimdGemm (FP32).
 //
 // Stage 1 of the docs/mkl-replacement/PLAN.md FP64 closure: ports the FP32

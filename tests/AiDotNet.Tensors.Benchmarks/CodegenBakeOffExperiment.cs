@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Wall-clock row of the codegen bake-off: the hand-written depthwise Conv2D 3x3
 // kernel against the one generated from a CodegenKernelSpec.
 //

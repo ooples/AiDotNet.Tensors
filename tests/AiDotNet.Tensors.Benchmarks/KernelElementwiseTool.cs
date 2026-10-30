@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // --kernel-elementwise: the pointwise family on declared kernels (#890 phase 4a), against the hand-written kernels.
 //
 //   --derive      every module's derived library functions, and why each other elementwise kernel is not derivable

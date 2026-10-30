@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // PTX-vs-CUDA-vs-CPU parity scaffold. Coverage audit: every direct-PTX kernel
 // must carry an explicit parity decision, so coverage is 100% auditable and a
 // new kernel cannot be added without one.

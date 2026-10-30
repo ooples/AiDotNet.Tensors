@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Phase B of issue #225: verify that CpuDotNetJitEmitter produces
 // compiled kernels whose numerical output matches the equivalent
 // engine-composed op sequence to within float tolerance.

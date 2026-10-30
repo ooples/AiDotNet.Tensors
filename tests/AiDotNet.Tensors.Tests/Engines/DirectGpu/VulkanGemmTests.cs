@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Tests for the real Vulkan GPU GEMM (replacing the CPU download/loop/upload
 // fallback) and the FP16 IGpuHalfPrecisionBackend path (issue #560).
 

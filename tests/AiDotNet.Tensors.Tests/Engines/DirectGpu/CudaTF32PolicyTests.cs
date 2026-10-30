@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // PR #333 / issue #337 — verify the user-facing TF32 policy surface
 // (AllowTF32 property + AIDOTNET_DISABLE_TF32 env var) before the
 // hardware-dependent cuBLAS-mode wiring runs. These tests don't require

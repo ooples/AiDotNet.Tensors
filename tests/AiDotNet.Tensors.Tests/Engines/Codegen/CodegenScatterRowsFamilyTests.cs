@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The rest of the row-wise scatter family as declared programs (#1441): each program on the fp64 interpreter against
 // the hand-written kernel's own loop, including empty groups, out-of-range indices, ties and non-finite values.
 

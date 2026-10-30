@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Promotion follows the measured evidence, per family.
 //
 // The bake-off result is mixed: six generated kernels beat cuDNN, four lose. Granting

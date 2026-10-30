@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Vulkan launcher shims for the geometry / sampling kernels (Issue #217).
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // #486 drift hunt: the PaddedBuffer/pre-pack drift passes in isolation but fails
 // intermittently under the parallel CI pool. This test deliberately reproduces the
 // concurrency pressure locally — many threads running the matmul→sigmoid→matmul chain

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Phase 3 spike: size the prize before building the compiler.
 //
 // The resident-program idea is that a chain of operators should run as ONE device

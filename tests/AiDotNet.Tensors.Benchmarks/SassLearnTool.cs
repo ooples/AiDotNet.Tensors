@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // --sass-learn: empirical SASS field layouts for the own SASS backend (#1442). Every catalog spec is emitted as PTX,
 // compiled by ptxas for the target arch and disassembled by nvdisasm -hex; each instruction's text is matched against
 // its 128-bit encoding to find, per opcode and operand slot, which bit field holds a register (an 8-bit R field), a
