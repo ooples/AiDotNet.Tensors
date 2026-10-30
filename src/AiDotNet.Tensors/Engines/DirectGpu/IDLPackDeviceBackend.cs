@@ -31,4 +31,11 @@ internal interface IDLPackDeviceBackend
     /// <summary>Wraps device memory another library owns; disposing the buffer waits for queued work, then runs
     /// <paramref name="release"/> once.</summary>
     IGpuBuffer WrapExternalDeviceMemory(IntPtr devicePointer, int elementCount, int elementByteSize, Action release);
+
+    /// <summary>
+    /// Runs <paramref name="release"/> once every operation queued on this backend so far has finished, without calling
+    /// the driver from the calling thread: the finalizer path of an imported buffer that was never disposed. The
+    /// release is queued and runs at this backend's next operation.
+    /// </summary>
+    void ReleaseAfterPendingWorkDeferred(Action release);
 }

@@ -23,7 +23,10 @@ namespace AiDotNet.Tensors.Interop;
 /// predate DLPack 0.8 (<c>torch.utils.dlpack.from_dlpack</c> on old PyTorch).</para>
 /// <para><b>Importing</b> (<see cref="Tensor{T}.FromDLPack"/>): the tensor aliases the producer's memory. Import takes
 /// ownership of the pointer in every case: the producer's deleter runs once when the tensor's storage is released
-/// (its last tensor or view disposed, or finalized), or before the exception if the import is refused.</para>
+/// (its last tensor or view disposed), or before the exception if the import is refused. Dispose imported tensors:
+/// host memory imported by a tensor that is only finalized is never released (a span over it can outlive the last
+/// tensor reference, so freeing it then is unsound), and device memory is released at the backend's next operation,
+/// after the work queued on it.</para>
 /// <para><b>Devices.</b> CPU memory (and CUDA/ROCm pinned host memory) in both directions. CUDA device memory for
 /// <c>float</c> tensors on the CUDA backend: an exported GPU-resident tensor hands out its device pointer, and an
 /// imported CUDA tensor becomes a GPU-resident tensor over the producer's allocation.</para>
@@ -66,6 +69,15 @@ public static class DLPack
     /// <summary>Deleter calls that matched no live export (a double call, or a foreign pointer).</summary>
     internal static long UnmatchedDeleterCalls => Interlocked.Read(ref s_unmatchedDeleterCalls);
     private static long s_unmatchedDeleterCalls;
+
+    /// <summary>
+    /// Host-memory imports whose tensor was finalized without being disposed. Their producer memory is never released
+    /// (see <see cref="DLPackDeleterHandle"/>), so a nonzero count is a leak to fix by disposing the tensors.
+    /// </summary>
+    internal static long LeakedHostImports => Interlocked.Read(ref s_leakedHostImports);
+    private static long s_leakedHostImports;
+
+    internal static void CountLeakedHostImport() => Interlocked.Increment(ref s_leakedHostImports);
 
     /// <summary>Releases that threw inside the deleter (a C callback cannot propagate them).</summary>
     internal static long FailedReleases => Interlocked.Read(ref s_failedReleases);
@@ -397,7 +409,9 @@ public static class DLPack
         if (dl.Data == IntPtr.Zero) throw new ArgumentException("DLPack tensor has elements but a NULL data pointer.");
 
         var pointer = new IntPtr(dl.Data.ToInt64() + (long)dl.ByteOffset);
-        // The deleter runs only after this backend's queued kernels have finished with the memory.
+        // The deleter runs only after this backend's queued kernels have finished with the memory: disposing the
+        // buffer waits for them, and a finalized import queues its release behind them on this backend.
+        owner.SetDeviceOwner(device);
         var buffer = device.WrapExternalDeviceMemory(pointer, (int)count, sizeof(float), owner.Release);
         try
         {

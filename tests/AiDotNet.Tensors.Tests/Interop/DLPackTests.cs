@@ -13,8 +13,9 @@ namespace AiDotNet.Tensors.Tests.Interop;
 
 /// <summary>
 /// DLPack exchange: CPU round trips (contiguous, strided, legacy layout, empty, scalar), ownership (the producer's
-/// deleter runs exactly once, on dispose or finalization; an export outlives its source; a repeated deleter call is
-/// not a double free), version and dtype refusal, the read-only flag, and a CUDA round trip on a CUDA machine.
+/// deleter runs exactly once on dispose, never under a live span on finalization, and after queued kernels for a
+/// finalized CUDA import; an export outlives its source; a repeated deleter call is not a double free), version and
+/// dtype refusal, the read-only flag, and a CUDA round trip on a CUDA machine.
 /// </summary>
 [Collection("DLPack")]
 public sealed class DLPackTests
@@ -279,23 +280,30 @@ public sealed class DLPackTests
     }
 
     [Fact]
-    public void Import_ThatIsNeverDisposed_RunsTheDeleterOnFinalization_Once()
+    public void Import_ThatIsNeverDisposed_KeepsTheMemory_ForASpanThatOutlivesTheTensor()
     {
+        // A span over imported host memory is a raw pointer the GC does not track, so it outlives the tensor's last
+        // reference. Finalization must not run the deleter under it: the import is leaked and counted instead.
         using var producer = new FakeProducer(new float[] { 1, 2, 3 }, new long[] { 3 }, new long[] { 1 });
-        ImportAndDrop(producer.Block);
-        for (int i = 0; i < 5 && producer.Calls == 0; i++)
+        long leakedBefore = DLPack.LeakedHostImports;
+        ReadOnlySpan<float> span = SpanOfADroppedImport(producer.Block);
+        for (int i = 0; i < 5; i++)
         {
             GC.Collect();
             GC.WaitForPendingFinalizers();
         }
-        Assert.Equal(1, producer.Calls);
+
+        Assert.True(DLPack.LeakedHostImports > leakedBefore, "the dropped import was never finalized");
+        Assert.Equal(0, producer.Calls);
+        Assert.Equal(new float[] { 1, 2, 3 }, span.ToArray());
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
-    private static void ImportAndDrop(IntPtr block)
+    private static ReadOnlySpan<float> SpanOfADroppedImport(IntPtr block)
     {
         var t = Tensor<float>.FromDLPack(block);
         Assert.Equal(2f, t[1]);
+        return t.AsSpan();
     }
 
     [Fact]
@@ -524,5 +532,51 @@ public sealed class DLPackTests
             AiDotNetEngine.Current = previous;
             gpu.Dispose();
         }
+    }
+
+    [SkippableFact]
+    public void Cuda_ImportThatIsNeverDisposed_IsReleasedByTheNextOperation()
+    {
+        Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA driver or NVRTC is unavailable.");
+        var previous = AiDotNetEngine.Current;
+        var gpu = new DirectGpuTensorEngine();
+        try
+        {
+            Skip.IfNot(gpu.IsGpuAvailable && gpu.PlacementBackend is CudaBackend, "The active GPU backend is not CUDA.");
+            AiDotNetEngine.Current = gpu;
+            var source = Iota(8, 16).Gpu();
+            int liveBefore = DLPack.LiveExportCount;
+            IntPtr capsule = source.ToDLPack();
+            Assert.Equal(liveBefore + 1, DLPack.LiveExportCount);
+
+            ImportUseAndDrop(capsule);
+            for (int i = 0; i < 5; i++)
+            {
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+            }
+            // The finalizer only queues the release (it never calls the driver); the next GPU operation (here, or
+            // one a concurrently running test issues) waits for the queued work and then runs the deleter, which is
+            // our own export's.
+            using var next = Iota(4).Gpu();
+            using var sum = gpu.TensorAdd(next, next);
+            Assert.Equal(new float[] { 0, 2, 4, 6 }, sum.ToArray());
+            Assert.Equal(liveBefore, DLPack.LiveExportCount);
+            Assert.Equal(Iota(8, 16).ToArray(), source.ToArray());   // the producer's tensor is untouched
+            source.Dispose();
+        }
+        finally
+        {
+            AiDotNetEngine.Current = previous;
+            gpu.Dispose();
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void ImportUseAndDrop(IntPtr capsule)
+    {
+        var imported = Tensor<float>.FromDLPack(capsule);
+        Assert.True(imported.IsGpuResident);
+        Assert.Equal(Iota(8, 16).ToArray(), imported.ToArray());
     }
 }

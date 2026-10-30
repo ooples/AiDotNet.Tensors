@@ -2,6 +2,7 @@ using System;
 using System.Buffers;
 using System.Runtime.CompilerServices;
 using System.Threading;
+using AiDotNet.Tensors.Engines.DirectGpu;
 
 namespace AiDotNet.Tensors.Interop;
 
@@ -10,54 +11,73 @@ namespace AiDotNet.Tensors.Interop;
 /// object using the memory lets go of it.
 /// </summary>
 /// <remarks>
-/// <para>The deleter runs on <see cref="Release"/>, which the owning storage calls when its last tensor or view is
-/// disposed. A tensor that is never disposed still releases the producer's memory: the finalizer runs the deleter
-/// once nothing references this object, and nothing can read the memory by then (every span, vector and device
-/// buffer over it holds this object). The interlocked exchange makes the deleter run once however release and
-/// finalization interleave.</para>
+/// <para>The deleter runs on <see cref="Release"/>, which the owner of the memory calls once nothing uses it any
+/// more: the tensor storage over host memory when its last tensor or view is disposed, and the device buffer over
+/// device memory when it is disposed, after it has waited for the kernels still queued on the memory.</para>
+/// <para><b>A tensor that is never disposed.</b> Host memory is then never released: the producer's memory stays
+/// allocated for the rest of the process, and <see cref="DLPack.LeakedHostImports"/> counts it. Running the deleter
+/// from the finalizer would be unsound. A <see cref="Span{T}"/> over the memory is a raw pointer the GC does not
+/// track, so code still reading through one (an engine kernel whose tensor argument the JIT already considers dead)
+/// does not keep this object alive, and the deleter would free the memory under it.</para>
+/// <para>Device memory has no span: kernels address it by the pointer captured at launch. A device import registers
+/// its backend (<see cref="SetDeviceOwner"/>), and the finalizer hands the deleter to
+/// <see cref="IDLPackDeviceBackend.ReleaseAfterPendingWorkDeferred"/>. That call never touches the driver on the
+/// finalizer thread. It queues the release, and the backend's next operation waits for the work queued on its
+/// stream before it runs the deleter. That is how the backend already frees its own buffers on finalization.</para>
+/// <para>The interlocked exchange makes the deleter run once however release and finalization interleave.</para>
 /// </remarks>
 internal sealed class DLPackDeleterHandle
 {
     private IntPtr _deleter;
     private readonly IntPtr _self;
-    private readonly Action? _beforeDelete;
+    private IDLPackDeviceBackend? _device;
 
     /// <param name="deleter">The producer's <c>deleter</c> function pointer (may be NULL: nothing to call).</param>
     /// <param name="self">The managed-tensor pointer the deleter is called with.</param>
-    /// <param name="beforeDelete">Runs before the deleter: for device memory, the wait for work still queued on it.</param>
-    internal DLPackDeleterHandle(IntPtr deleter, IntPtr self, Action? beforeDelete = null)
+    internal DLPackDeleterHandle(IntPtr deleter, IntPtr self)
     {
         _deleter = deleter;
         _self = self;
-        _beforeDelete = beforeDelete;
     }
 
-    /// <summary>Whether the deleter has run (or there was none to run).</summary>
+    /// <summary>Whether the deleter has run (or there was none to run), or has been queued to run.</summary>
     internal bool IsReleased => Volatile.Read(ref _deleter) == IntPtr.Zero;
 
-    /// <summary>Runs the deleter if it has not run yet.</summary>
+    /// <summary>
+    /// Marks the memory as device memory used by <paramref name="device"/>'s kernels, so finalization releases it
+    /// once the work queued on that backend has finished.
+    /// </summary>
+    internal void SetDeviceOwner(IDLPackDeviceBackend device) => Volatile.Write(ref _device, device);
+
+    /// <summary>Runs the deleter if it has not run yet. The caller has finished every use of the memory.</summary>
     internal void Release()
     {
         var deleter = Interlocked.Exchange(ref _deleter, IntPtr.Zero);
         if (deleter == IntPtr.Zero) return;
         GC.SuppressFinalize(this);
-        try
-        {
-            _beforeDelete?.Invoke();
-        }
-        finally
-        {
-            DLPackNative.InvokeDeleter(deleter, _self);
-        }
+        DLPackNative.InvokeDeleter(deleter, _self);
     }
 
     ~DLPackDeleterHandle()
     {
         var deleter = Interlocked.Exchange(ref _deleter, IntPtr.Zero);
         if (deleter == IntPtr.Zero) return;
-        try { _beforeDelete?.Invoke(); }
-        catch { /* a finalizer must not throw; the producer's memory is still released below */ }
-        DLPackNative.InvokeDeleter(deleter, _self);
+        var device = Volatile.Read(ref _device);
+        if (device is null)
+        {
+            // Host memory: a span over it may still be in use (see the remarks), so it is leaked, not freed.
+            DLPack.CountLeakedHostImport();
+            return;
+        }
+        IntPtr self = _self;
+        try
+        {
+            device.ReleaseAfterPendingWorkDeferred(() => DLPackNative.InvokeDeleter(deleter, self));
+        }
+        catch
+        {
+            // A finalizer must not throw. Queuing only fails when out of memory; the producer's memory then leaks.
+        }
     }
 }
 
@@ -105,8 +125,8 @@ internal sealed unsafe class DLPackHostMemory<T> : MemoryManager<T>
     protected override void Dispose(bool disposing)
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
-        // Not on the finalizer path: the deleter handle has its own finalizer, which covers a manager that was
-        // never disposed, and running a C callback from here while disposing=false would be the same call twice.
+        // Not on the finalizer path: a span over the memory can outlive this manager's last reference, so a manager
+        // that was never disposed leaves the memory allocated (the deleter handle counts it as a leak).
         if (disposing) _owner.Release();
     }
 }

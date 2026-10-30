@@ -6314,6 +6314,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (!CanRunDeferredFrees()) return;
         DrainPendingFinalizerFrees();
         DrainPendingGraphDestroys();
+        // Imported (DLPack) memory whose tensor was finalized: before the context destroys, so a release that still
+        // needs its backend's stream finds it alive.
+        DrainPendingExternalReleases();
         // Reclaim contexts leaked by undisposed engines (finalizer-deferred). Drain AFTER the buffer frees
         // so any pending free targeting one of these contexts runs first; whatever's left is reclaimed
         // wholesale by cuCtxDestroy. No-op fast path when the queue is empty (the common case).
@@ -6328,7 +6331,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     /// </summary>
     private bool CanRunDeferredFrees()
     {
-        if (PendingFinalizerFrees.IsEmpty && PendingGraphDestroys.IsEmpty && PendingContextDestroys.IsEmpty) return false;
+        if (PendingFinalizerFrees.IsEmpty && PendingGraphDestroys.IsEmpty && PendingContextDestroys.IsEmpty
+            && PendingExternalReleases.IsEmpty) return false;
         if (IsCapturingOnThisThread || CaptureMemoryPool.Current is not null) return false;
         return _cudaContext == IntPtr.Zero || !IsStreamCapturingCurrentContext();
     }
@@ -6342,7 +6346,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private void EnsureContextCurrentForBoundLaunch()
     {
         if (_threadCurrentContext == _cudaContext &&
-            PendingFinalizerFrees.IsEmpty && PendingContextDestroys.IsEmpty && PendingGraphDestroys.IsEmpty)
+            PendingFinalizerFrees.IsEmpty && PendingContextDestroys.IsEmpty && PendingGraphDestroys.IsEmpty &&
+            PendingExternalReleases.IsEmpty)
             return;
         EnsureContextCurrent();
     }
