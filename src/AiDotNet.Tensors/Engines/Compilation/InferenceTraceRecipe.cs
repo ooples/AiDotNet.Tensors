@@ -27,6 +27,8 @@ internal sealed class InferenceTraceRecipe<T>
     internal readonly Dictionary<object, int> SlotOf = new(ReferenceEqualityComparer<object>.Instance);
     // A slot's backing array, which a recorded delegate may capture in place of the tensor.
     internal readonly Dictionary<object, int> BackingSlotOf = new(ReferenceEqualityComparer<object>.Instance);
+    // Captured arrays still all default at trace time: per-call scratch (see FindScratch).
+    internal readonly HashSet<object> ScratchArrays = new(ReferenceEqualityComparer<object>.Instance);
     internal readonly Dictionary<ILazyNode, int> NodeIndex = new(ReferenceEqualityComparer<ILazyNode>.Instance);
     internal int InputSlot = -1;
     internal int OutputSlot = -1;
@@ -68,6 +70,15 @@ internal sealed class InferenceTraceRecipe<T>
         if (!recipe.SlotOf.TryGetValue(explicitOutput, out recipe.OutputSlot))
             return recipe.Fail("the forward's output is not a traced tensor");
 
+        // Now, before the plan runs: a scratch array the delegate writes on replay is still all default here.
+        var visited = new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
+        foreach (var node in recipe.Nodes)
+        {
+            recipe.FindScratch(node.Execute, visited);
+            recipe.FindScratch(node.SavedState, visited);
+            recipe.FindScratch(node.BackwardFn, visited);
+        }
+
         // The mutable input is the one leaf with the input's shape, as Compile selects it.
         for (int s = 0; s < recipe.Slots.Count; s++)
         {
@@ -77,6 +88,51 @@ internal sealed class InferenceTraceRecipe<T>
         }
         if (recipe.InputSlot < 0) return recipe.Fail("no traced leaf has the input's shape");
         return recipe;
+    }
+
+    /// <summary>
+    /// Records the arrays the recorded delegates captured that hold only default values at trace time: scratch made
+    /// per call (<c>new float[n]</c>) that the replay writes, which a built plan needs its own copy of.
+    /// </summary>
+    private void FindScratch(object? o, HashSet<object> visited)
+    {
+        if (o is null) return;
+        var type = o.GetType();
+        if (type.IsPrimitive || type.IsEnum || o is string || ShapePolymorphicTemplate<T>.CaptureCloner.IsTensor(type)) return;
+        if (!type.IsValueType && !visited.Add(o)) return;
+        switch (o)
+        {
+            case Delegate d:
+                foreach (var single in d.GetInvocationList()) FindScratch(single.Target, visited);
+                return;
+            case Array array:
+                var et = type.GetElementType()!;
+                if (et.IsPrimitive || et.IsEnum)
+                {
+                    if (!BackingSlotOf.ContainsKey(o) && IsAllDefault(array)) ScratchArrays.Add(o);
+                    return;
+                }
+                foreach (var e in array) FindScratch(e, visited);
+                return;
+        }
+        if (!ShapePolymorphicTemplate<T>.CaptureCloner.IsDescendable(type)) return;
+        foreach (var field in ShapePolymorphicTemplate<T>.CaptureCloner.FieldsOf(type)) FindScratch(field.GetValue(o), visited);
+    }
+
+    private static bool IsAllDefault(Array array)
+    {
+        switch (array)
+        {
+            case float[] f: foreach (var v in f) if (v != 0f) return false; return true;
+            case double[] f: foreach (var v in f) if (v != 0d) return false; return true;
+            case int[] f: foreach (var v in f) if (v != 0) return false; return true;
+            case long[] f: foreach (var v in f) if (v != 0) return false; return true;
+            case byte[] f: foreach (var v in f) if (v != 0) return false; return true;
+            case bool[] f: foreach (var v in f) if (v) return false; return true;
+        }
+        object zero = Activator.CreateInstance(array.GetType().GetElementType()!)!;
+        foreach (var v in array) if (!zero.Equals(v)) return false;
+        return true;
     }
 
     private void AddSlot(Tensor<T> tensor, SlotKind kind)

@@ -80,7 +80,18 @@ public sealed class BatchPolymorphicPlanTests
             if (expectFailure is not null)
                 Assert.Contains(expectFailure, cache.GetBatchPolymorphismFailure(symbolic) ?? "(polymorphic)");
         }
+        LastFailure = cache.GetBatchPolymorphismFailure(SymbolicShape.BatchDynamic(Shape(perSampleShape, 2)));
         return (traces, cache.InstantiatedPlanCount);
+    }
+
+    [ThreadStatic] private static string? LastFailure;
+
+    private static int[] Shape(int[] perSample, int batch)
+    {
+        var shape = new int[perSample.Length + 1];
+        shape[0] = batch;
+        Array.Copy(perSample, 0, shape, 1, perSample.Length);
+        return shape;
     }
 
     public static TheoryData<string> Engines => new() { "cpu", "gpu" };
@@ -96,7 +107,7 @@ public sealed class BatchPolymorphicPlanTests
         var (traces, built) = RunBatches(engine!, new[] { 8 }, new[] { 1, 4, 2, 3, 7, 16, 4, 1 },
             x => engine!.Softmax(engine.TensorMatMul(engine.ReLU(engine.TensorMatMul(x, w1)), w2)));
         // Batch 1 is specialized (traced, as in torch); 4 is the base, 2 shows what scales; 3, 7, 16 are built.
-        Assert.Equal(3, traces);
+        Assert.True(traces == 3, $"{traces} traces, expected 3: {LastFailure}");
         Assert.Equal(3, built);
         (engine as IDisposable)?.Dispose();
     }
@@ -112,7 +123,7 @@ public sealed class BatchPolymorphicPlanTests
         // The reshape target names the batch, so it is the captured int[] that has to scale.
         var (traces, built) = RunBatches(engine!, new[] { 3, 8, 8 }, new[] { 1, 2, 5, 9, 4 },
             x => engine!.TensorMatMul(engine.Reshape(engine.ReLU(engine.Conv2D(x, kernel)), new[] { x.Shape[0], 4 * 6 * 6 }), head));
-        Assert.Equal(3, traces);
+        Assert.True(traces == 3, $"{traces} traces, expected 3: {LastFailure}");
         Assert.Equal(2, built);
         (engine as IDisposable)?.Dispose();
     }
@@ -148,7 +159,7 @@ public sealed class BatchPolymorphicPlanTests
         var engine = new CpuEngine();
         var (traces, built) = RunBatches(engine, new[] { 3 }, new[] { 1, 2, 5, 8, 3 },
             x => engine.TensorAdd(RowIndexOp(x), x));
-        Assert.Equal(3, traces);
+        Assert.True(traces == 3, $"{traces} traces, expected 3: {LastFailure}");
         Assert.Equal(2, built);
     }
 
@@ -179,8 +190,26 @@ public sealed class BatchPolymorphicPlanTests
         // Built plans must read their own input buffer, not the base trace's.
         var (traces, built) = RunBatches(engine, new[] { 4 }, new[] { 2, 3, 6, 9 },
             x => engine.TensorAdd(DoubleFromBackingOp(x), x));
-        Assert.Equal(2, traces);
+        Assert.True(traces == 2, $"{traces} traces, expected 2: {LastFailure}");
         Assert.Equal(2, built);
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Engines))]
+    public void MultiHeadAttention_RescalesItsShapeDescriptor(string engineName)
+    {
+        var engine = TryEngine(engineName, out var skip);
+        Skip.If(engine is null, skip);
+        const int seq = 6, width = 8;
+        var wq = Random(new[] { width, width }, 11);
+        var wk = Random(new[] { width, width }, 12);
+        var wv = Random(new[] { width, width }, 13);
+        // MultiHeadAttentionCore records its batch in an AttentionCoreShape the delegate captures.
+        var (traces, built) = RunBatches(engine!, new[] { seq, width }, new[] { 1, 2, 3, 5, 4 },
+            x => engine!.MultiHeadAttentionCore(engine.TensorMatMul(x, wq), engine.TensorMatMul(x, wk), engine.TensorMatMul(x, wv), 2));
+        Assert.True(traces == 3, $"{traces} traces, expected 3: {LastFailure}");
+        Assert.Equal(2, built);
+        (engine as IDisposable)?.Dispose();
     }
 
     [Fact]
@@ -192,7 +221,7 @@ public sealed class BatchPolymorphicPlanTests
         var (traces, built) = RunBatches(engine, new[] { 6 }, new[] { 1, 2, 3, 4 },
             x => engine.TensorMultiplyScalar(engine.TensorMatMul(x, w), 1f / x.Shape[0]),
             expectFailure: null);
-        Assert.Equal(4, traces);
+        Assert.True(traces == 4, $"{traces} traces, expected 4: {LastFailure}");
         Assert.Equal(0, built);
     }
 }

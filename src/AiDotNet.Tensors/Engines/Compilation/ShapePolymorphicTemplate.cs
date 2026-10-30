@@ -198,7 +198,7 @@ internal sealed class ShapePolymorphicTemplate<T>
     /// The new value of every scaled site for one target shape: <c>base / prod(base symbols) * prod(new symbols)</c>
     /// over the symbols the site scales with.
     /// </summary>
-    private sealed class Scale
+    internal sealed class Scale
     {
         private readonly ShapePolymorphicTemplate<T> _t;
         private readonly long[] _baseSymbols;
@@ -238,6 +238,17 @@ internal sealed class ShapePolymorphicTemplate<T>
             int mask = 0;
             for (int j = 0; j < _t._fits.Length; j++)
                 if (_t._fits[j] is { } f && f.ElementScales(array, index)) mask |= 1 << j;
+            return mask;
+        }
+
+        /// <summary>A per-call scratch array of the base trace (all default when it was recorded).</summary>
+        internal bool IsScratch(object array) => _t._base.ScratchArrays.Contains(array);
+
+        internal int ScratchLengthMask(object array)
+        {
+            int mask = 0;
+            for (int j = 0; j < _t._fits.Length; j++)
+                if (_t._fits[j] is { } f && f.ScratchScales(array)) mask |= 1 << j;
             return mask;
         }
 
@@ -310,6 +321,9 @@ internal sealed class ShapePolymorphicTemplate<T>
         internal bool FieldScales(object owner, FieldInfo field) => _fields.Contains((owner, field));
         internal bool ElementScales(object array, int index) => _elements.TryGetValue(array, out var set) && set.Contains(index);
         internal bool HasScaledElements(object array) => _elements.ContainsKey(array);
+        internal bool ScratchScales(object array) => _scaledScratch.Contains(array);
+
+        private readonly HashSet<object> _scaledScratch = new(ReferenceEqualityComparer<object>.Instance);
 
         private bool Scales(long a, long b) => a % _s1 == 0 && b % _s2 == 0 && a / _s1 > 0 && a / _s1 == b / _s2;
 
@@ -416,6 +430,15 @@ internal sealed class ShapePolymorphicTemplate<T>
             bool ba = _first.BackingSlotOf.TryGetValue(a, out var backingA);
             bool bb = _second.BackingSlotOf.TryGetValue(b, out var backingB);
             if (ba || bb) return ba && bb && backingA == backingB || FailAt(path, "captures different graph buffers");
+            // Per-call scratch in both traces: a built plan gets a fresh one, as a trace would make.
+            if (_first.ScratchArrays.Contains(a) && _second.ScratchArrays.Contains(b))
+            {
+                int la = ((Array)a).Length, lb = ((Array)b).Length;
+                if (la == lb) return true;
+                if (!Scales(la, lb)) return FailAt(path, $"is scratch of {la} and {lb} elements, not a multiple of the dim");
+                _scaledScratch.Add(a);
+                return true;
+            }
             if (a is Array arrA)
             {
                 var arrB = (Array)b;
@@ -468,7 +491,7 @@ internal sealed class ShapePolymorphicTemplate<T>
     }
 
     /// <summary>Copies captured state for a new shape: graph tensors replaced, scaled integers rescaled.</summary>
-    private sealed class CaptureCloner
+    internal sealed class CaptureCloner
     {
         private static readonly MethodInfo s_memberwiseClone =
             typeof(object).GetMethod("MemberwiseClone", BindingFlags.Instance | BindingFlags.NonPublic)!;
@@ -490,12 +513,38 @@ internal sealed class ShapePolymorphicTemplate<T>
             return false;
         }
 
-        /// <summary>Closure classes, value types and tuples: copied field by field. Everything else is shared.</summary>
+        /// <summary>
+        /// Closure classes, value types, tuples, and plain data records (a sealed class straight off object holding
+        /// only primitives, such as an op's shape descriptor): copied field by field. Everything else is shared.
+        /// </summary>
+        /// <remarks>A data record that differs between the traces was made per trace, so a copy per built plan is
+        /// what another trace would have made.</remarks>
         internal static bool IsDescendable(Type type)
         {
             if (type.IsValueType) return true;
             if (type.IsDefined(typeof(CompilerGeneratedAttribute), false) || type.Name.Contains("<>")) return true;
-            return type.Namespace == "System" && type.Name.StartsWith("Tuple`", StringComparison.Ordinal);
+            if (type.Namespace == "System" && type.Name.StartsWith("Tuple`", StringComparison.Ordinal)) return true;
+            return IsPlainDataRecord(type);
+        }
+
+        private static readonly Dictionary<Type, bool> s_plainData = new();
+
+        private static bool IsPlainDataRecord(Type type)
+        {
+            lock (s_plainData)
+            {
+                if (s_plainData.TryGetValue(type, out var known)) return known;
+                bool plain = type.IsClass && type.IsSealed && type.BaseType == typeof(object) && !typeof(Delegate).IsAssignableFrom(type);
+                if (plain)
+                {
+                    var fields = type.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                    plain = fields.Length > 0;
+                    foreach (var f in fields)
+                        if (!(f.FieldType.IsPrimitive || f.FieldType.IsEnum || f.FieldType == typeof(string))) plain = false;
+                }
+                s_plainData[type] = plain;
+                return plain;
+            }
         }
 
         internal static FieldInfo[] FieldsOf(Type type)
@@ -530,6 +579,12 @@ internal sealed class ShapePolymorphicTemplate<T>
             if (o is Array array)
             {
                 var et = type.GetElementType()!;
+                if (_scale.IsScratch(o))
+                {
+                    var fresh = Array.CreateInstance(et, checked((int)_scale.Value(_scale.ScratchLengthMask(o), (long)array.Length)));
+                    _clones[o] = fresh;
+                    return fresh;
+                }
                 if (_scale.HasScaledElements(o))
                 {
                     var scaled = (Array)array.Clone();
