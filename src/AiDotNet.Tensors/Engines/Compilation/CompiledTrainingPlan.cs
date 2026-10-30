@@ -826,10 +826,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     {
         var saved = new List<(Tensor<T> State, T[] Values)>();
         if (_forwardSteps is null) return saved;
-        var seen = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
-        foreach (var step in _forwardSteps)
-            if (IsInPlaceState(step) && seen.Add(step.OutputBuffer))
-                saved.Add((step.OutputBuffer, step.OutputBuffer.ToArray()));
+        foreach (var state in _forwardSteps.Where(IsInPlaceState).Select(step => step.OutputBuffer)
+                     .Distinct(ReferenceEqualityComparer<Tensor<T>>.Instance))
+            saved.Add((state, state.ToArray()));
         return saved;
     }
 
@@ -842,10 +841,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     {
         foreach (var (state, values) in saved)
         {
-            if (typeof(T) == typeof(float) && state._gpuBuffer is { } buffer && buffer.Handle != IntPtr.Zero
+            if (values is float[] floatValues && state._gpuBuffer is { } buffer && buffer.Handle != IntPtr.Zero
                 && buffer.Size >= state.Length && state._gpuBackend is { } backend)
             {
-                backend.UploadBufferInPlace((float[])(object)values, buffer);
+                backend.UploadBufferInPlace(floatValues, buffer);
                 continue;
             }
             values.AsSpan().CopyTo(state.AsWritableSpan());
