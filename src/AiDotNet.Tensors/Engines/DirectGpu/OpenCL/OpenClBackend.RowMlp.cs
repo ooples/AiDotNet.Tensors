@@ -202,7 +202,8 @@ void row_mlp_forward(__global const float* x, __global float* y,
             }
         }
 
-        bool IRowMlpForwardBackend.TryRowMlpForward(IGpuBuffer input, IGpuBuffer[] weights, IGpuBuffer?[] biases,
+        // Whether the kernel takes this MLP: layer count, activations, widths and every buffer large enough.
+        private static bool RowMlpShapeSupported(IGpuBuffer input, IGpuBuffer[] weights, IGpuBuffer?[] biases,
             int[] widths, FusedActivationType hiddenActivation, FusedActivationType outputActivation, IGpuBuffer output)
         {
             int layers = weights.Length;
@@ -217,8 +218,15 @@ void row_mlp_forward(__global const float* x, __global float* y,
                 if (weights[l].Size < (long)widths[l] * widths[l + 1]) return false;
                 if (biases[l] is { } b && b.Size < widths[l + 1]) return false;
             }
-            if (input.Size < widths[0] || output.Size < widths[layers] || !RowMlpReady()
-                || _rowMlpKernel is not { } kernel) return false;
+            return input.Size >= widths[0] && output.Size >= widths[layers];
+        }
+
+        bool IRowMlpForwardBackend.TryRowMlpForward(IGpuBuffer input, IGpuBuffer[] weights, IGpuBuffer?[] biases,
+            int[] widths, FusedActivationType hiddenActivation, FusedActivationType outputActivation, IGpuBuffer output)
+        {
+            if (!RowMlpShapeSupported(input, weights, biases, widths, hiddenActivation, outputActivation, output)
+                || !RowMlpReady() || _rowMlpKernel is not { } kernel) return false;
+            int layers = weights.Length;
 
             uint arg = 0;
             kernel.SetArg(arg++, BufferHandle(input));

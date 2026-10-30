@@ -8189,11 +8189,10 @@ public partial class DirectGpuTensorEngine
             if (biases[from + i] is { } b && b.Length != widths[i + 1]) return null;
         }
 
-        var owned = new System.Collections.Generic.List<OwnedBuffer>(2 * layers + 1);
+        using var inputBuffer = GetOrAllocateBuffer(backend, input);
+        var owned = new System.Collections.Generic.List<OwnedBuffer>(2 * layers);
         try
         {
-            var inputBuffer = GetOrAllocateBuffer(backend, input);
-            owned.Add(inputBuffer);
             var weightBuffers = new IGpuBuffer[layers];
             var biasBuffers = new IGpuBuffer?[layers];
             for (int i = 0; i < layers; i++)
@@ -8209,13 +8208,11 @@ public partial class DirectGpuTensorEngine
                 }
             }
             int outputs = widths[layers];
-            var output = AllocateFullyWrittenOutputBuffer(backend, outputs);
+            // Disposed unless handed to the result (RelinquishOwnership makes the dispose a no-op).
+            using var output = AllocateFullyWrittenOutputBuffer(backend, outputs);
             if (!rowMlp.TryRowMlpForward(inputBuffer.Buffer, weightBuffers, biasBuffers, widths, hiddenActivation,
                     outputActivation, output.Buffer))
-            {
-                output.Dispose();
                 return null;
-            }
             var result = DeferTensorResult<T>(backend, output.Buffer, outputs, new[] { 1, outputs });
             output.RelinquishOwnership();
             return result;
