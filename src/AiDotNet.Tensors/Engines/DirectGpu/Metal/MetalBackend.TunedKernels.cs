@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Tuned-kernel registry dispatch on Metal (#1116).
 using System;
 using System.Collections.Generic;

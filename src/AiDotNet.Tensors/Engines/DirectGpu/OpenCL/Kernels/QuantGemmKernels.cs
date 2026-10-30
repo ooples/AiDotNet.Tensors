@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Weight-only fused dequant-GEMM kernels (P0: LLM-serving quantized inference hot path).
 // Works on ALL .NET versions including .NET Framework 4.6.2.
 

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CLBlast-style optimized GEMM kernel with proper register blocking and cooperative loading.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels

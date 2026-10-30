@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // OpenCL kernels for the fused linear + cross-entropy loss (#1464). One work-item per row; loss
 // atomic-added to a scalar accumulator via a CAS float-add (OpenCL 1.2 has no native float atomics).
 

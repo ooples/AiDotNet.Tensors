@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Metal Shading Language kernels for the torch.linalg decomposition surface.
 // One threadgroup per batch slice; threads cooperate via threadgroup memory
 // and threadgroup_barrier.

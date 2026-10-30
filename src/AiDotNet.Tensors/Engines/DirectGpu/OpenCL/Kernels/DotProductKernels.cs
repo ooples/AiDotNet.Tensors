@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // OpenCL C kernels for dot product operations with parallel reduction.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels;

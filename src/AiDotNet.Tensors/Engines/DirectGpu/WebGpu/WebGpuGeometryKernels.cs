@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // WebGPU WGSL compute shaders for the geometry / sampling ops added by
 // Issue #217. Mirrors the CUDA / OpenCL / Metal / Vulkan kernels.
 

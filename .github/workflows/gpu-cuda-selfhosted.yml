@@ -13,6 +13,10 @@ name: GPU (CUDA, self-hosted)
 # installs the .NET SDK and cuDNN into its workspace), with the labels `self-hosted, gpu, cuda`, then set the repository variable
 # CUDA_RUNNER_ENABLED=true. Until the variable is set every job is skipped, so nothing waits for a runner that does
 # not exist. Pull requests from forks never run here: a self-hosted runner must not execute untrusted code.
+# One runner serves every pull request and a run takes over an hour, so the lane skips draft pull requests and any
+# pull request labelled `skip-gpu-ci` (for a change that cannot affect the GPU, such as comment-only edits to the
+# paths below; a title rule would also skip a combined pull request that carries GPU work); the nightly schedule
+# still covers main.
 # The model families come from AiDotNet master's parity harness; the repository variable AIDOTNET_HARNESS_REF points
 # the lane at another AiDotNet ref when a harness change needs testing before it merges.
 
@@ -22,6 +26,8 @@ on:
   workflow_dispatch:
   pull_request:
     branches: [ main ]
+    # ready_for_review starts the lane when a draft is marked ready; draft pushes do not take the runner (see the job's if).
+    types: [ opened, synchronize, reopened, ready_for_review ]
     paths:
       - 'src/AiDotNet.Tensors/Engines/DirectGpu/**'
       - 'src/AiDotNet.Tensors/Engines/DirectGpuTensorEngine*.cs'
@@ -66,7 +72,10 @@ jobs:
   cuda:
     if: >-
       ${{ vars.CUDA_RUNNER_ENABLED == 'true' &&
-          (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+          (github.event_name != 'pull_request' ||
+           (github.event.pull_request.head.repo.full_name == github.repository &&
+            !github.event.pull_request.draft &&
+            !contains(github.event.pull_request.labels.*.name, 'skip-gpu-ci'))) }}
     # One job per runner architecture, chosen by the runner's sm label. The SM86 job is the lane's full gate (its check
     # keeps the name "cuda"). The SM75 job (a GTX 1660 Ti) runs the same GPU suites, where the GA10x/SM86-only
     # specializations skip by design, and leaves the AiDotNet model families to the SM86 job: they need its memory.

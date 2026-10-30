@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // GPU kernels for gradient-based optimizers.
 // Provides element-wise parameter updates for various optimization algorithms.
 

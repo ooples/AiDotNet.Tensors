@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // WGSL compute kernels for the torch.linalg decomposition surface (#211 moat #2).
 // Matches the pattern in WebGpuParity210Kernels: one static string per op, one
 // workgroup per batch slice, workgroup_size = 256. WGSL's subgroup + barrier

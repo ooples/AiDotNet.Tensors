@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Metal launcher shims for the fused ANN kernels (IAnnBackend). Mirrors
 // MetalBackend.Detection.cs — pipeline resolved via shader library handle,
 // dispatched with a 1-D thread grid sized to total output cells. One thread

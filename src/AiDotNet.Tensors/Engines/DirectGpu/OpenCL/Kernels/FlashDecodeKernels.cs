@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // GPU fused decode-attention kernels (P2): FlashDecoding-style single-query attention that splits the
 // KV sequence across work-items and combines the partials with an online-softmax reduction. This is the
 // autoregressive-decode hot path — one query token attending to the whole cached sequence — where the

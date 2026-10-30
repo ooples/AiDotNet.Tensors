@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Sparse GEMM kernels with 2:4 structured sparsity support.
 // Provides 2x compression and up to 2x speedup on compatible hardware.
 

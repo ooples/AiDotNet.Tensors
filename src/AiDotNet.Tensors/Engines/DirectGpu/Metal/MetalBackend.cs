@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Metal GPU backend for Apple Silicon - IDirectGpuBackend implementation.
 
 using System;

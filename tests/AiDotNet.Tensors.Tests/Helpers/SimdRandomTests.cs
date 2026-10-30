@@ -7,6 +7,93 @@ namespace AiDotNet.Tensors.Tests.Helpers;
 
 public class SimdRandomTests
 {
+    // An independent statement of SimdRandom's stream: four xoshiro256** lanes seeded with SplitMix64 in lane
+    // order; a call of L >= 4 values takes floor(L/4) rounds (value 4r + k from lane k) then a lane-0 tail, and a
+    // shorter call uses lane 0. The AVX2 path and the scalar path must both produce exactly this, so the same
+    // seed gives the same values whatever the instruction set (run this suite with DOTNET_EnableAVX2=0 too).
+    private sealed class ReferenceStream
+    {
+        private readonly ulong[,] _s = new ulong[4, 4];
+
+        public ReferenceStream(int seed)
+        {
+            ulong state = (ulong)seed;
+            for (int lane = 0; lane < 4; lane++)
+                for (int word = 0; word < 4; word++) _s[word, lane] = SplitMix64(ref state);
+        }
+
+        public double[] Take(int length)
+        {
+            var values = new double[length];
+            int rounds = length >= 4 ? length / 4 : 0, i = 0;
+            for (int r = 0; r < rounds; r++)
+                for (int lane = 0; lane < 4; lane++) values[i++] = Next(lane);
+            for (; i < length; i++) values[i] = Next(0);
+            return values;
+        }
+
+        private double Next(int lane)
+        {
+            ulong result = Rotl(_s[1, lane] * 5, 7) * 9;
+            ulong t = _s[1, lane] << 17;
+            _s[2, lane] ^= _s[0, lane];
+            _s[3, lane] ^= _s[1, lane];
+            _s[1, lane] ^= _s[2, lane];
+            _s[0, lane] ^= _s[3, lane];
+            _s[2, lane] ^= t;
+            _s[3, lane] = Rotl(_s[3, lane], 45);
+            return BitConverter.Int64BitsToDouble((long)((result >> 12) | 0x3FF0000000000000UL)) - 1.0;
+        }
+
+        private static ulong Rotl(ulong x, int k) => (x << k) | (x >> (64 - k));
+
+        private static ulong SplitMix64(ref ulong state)
+        {
+            ulong z = state += 0x9E3779B97F4A7C15UL;
+            z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9UL;
+            z = (z ^ (z >> 27)) * 0x94D049BB133111EBUL;
+            return z ^ (z >> 31);
+        }
+    }
+
+    [Theory]
+    [InlineData(new[] { 37 })]
+    [InlineData(new[] { 3, 4, 9, 1, 16, 2, 4097 })]
+    [InlineData(new[] { 1, 1, 1, 1, 1 })]
+    public void NextDoubles_IsTheFourLaneStream_OnEveryInstructionSet(int[] callLengths)
+    {
+        var rng = new SimdRandom(1234);
+        var reference = new ReferenceStream(1234);
+        foreach (int length in callLengths)
+        {
+            var actual = new double[length];
+            rng.NextDoubles(actual);
+            var expected = reference.Take(length);
+            for (int i = 0; i < length; i++)
+                Assert.True(expected[i] == actual[i],
+                    $"call of {length}: value {i} is {actual[i]:R}, the four-lane stream gives {expected[i]:R}.");
+        }
+    }
+
+    [Fact]
+    public void NextFloats_IsTheFourLaneStream_OnEveryInstructionSet()
+    {
+        var rng = new SimdRandom(99);
+        var reference = new ReferenceStream(99);
+        foreach (int length in new[] { 10, 3, 33 })
+        {
+            var actual = new float[length];
+            rng.NextFloats(actual);
+            // NextFloats draws one four-value round at a time, then a lane-0 tail, like NextDoubles.
+            int rounds = length / 4;
+            var expected = new System.Collections.Generic.List<double>();
+            for (int r = 0; r < rounds; r++) expected.AddRange(reference.Take(4));
+            for (int i = rounds * 4; i < length; i++) expected.AddRange(reference.Take(1));
+            for (int i = 0; i < length; i++)
+                Assert.Equal(Math.Min((float)expected[i], 0.99999994f), actual[i]);
+        }
+    }
+
     [Fact]
     public void NextDoubles_AllValuesInRange()
     {

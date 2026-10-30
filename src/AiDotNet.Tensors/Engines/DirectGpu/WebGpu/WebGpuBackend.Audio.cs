@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // WebGPU audio launchers. The *Async methods do the work; the synchronous
 // IAudioBackend members block on them (GetAwaiter().GetResult()) so the engine's
 // sync dispatch runs these on WebGPU instead of CPU-falling-back (#775). Caveat:

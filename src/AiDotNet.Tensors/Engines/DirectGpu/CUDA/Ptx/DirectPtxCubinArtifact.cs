@@ -538,12 +538,15 @@ internal static class DirectPtxCubinArtifactCache
             errorLog = Marshal.AllocHGlobal(LogBytes);
             new Span<byte>((void*)infoLog, LogBytes).Clear();
             new Span<byte>((void*)errorLog, LogBytes).Clear();
-            int[] options = [3, 4, 5, 6, 12]; // logs plus CU_JIT_LOG_VERBOSE
-            IntPtr[] values =
-                [infoLog, (IntPtr)LogBytes, errorLog, (IntPtr)LogBytes, (IntPtr)1];
+            // Stack-allocated: the link state writes the log sizes back into values until cuLinkDestroy (see cuLinkCreate).
+            // The sized initializers make the compiler reject an option added without its count.
+            const int LinkOptionCount = 5;
+            int* options = stackalloc int[LinkOptionCount] { 3, 4, 5, 6, 12 }; // logs plus CU_JIT_LOG_VERBOSE
+            IntPtr* values = stackalloc IntPtr[LinkOptionCount]
+                { infoLog, (IntPtr)LogBytes, errorLog, (IntPtr)LogBytes, (IntPtr)1 };
             DirectPtxRuntime.Check(
                 CudaNativeBindings.cuLinkCreate(
-                    (uint)options.Length, options, values, out linkState),
+                    LinkOptionCount, options, values, out linkState),
                 "cuLinkCreate(direct PTX)");
 
             byte[] ptxBytes = Encoding.ASCII.GetBytes(ptx + "\0");

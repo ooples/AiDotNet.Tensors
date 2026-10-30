@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // GPU paged-attention kernels (P1): attention that gathers K/V through a block table (vLLM-style),
 // so the KV cache need not be contiguous. Works on ALL .NET versions incl. .NET Framework 4.6.2.
 

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // IDirectGpuBackend implementation part 2: Convolution, Pooling, Spatial Transformer, Normalization, Dropout, Embedding.
 
 #if NET7_0_OR_GREATER

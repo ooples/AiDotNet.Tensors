@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Metal Shading Language (MSL) kernels backing the fused ANN primitives declared by
 // IAnnBackend. Supply-chain-clean: custom kernels (no FAISS / cuVS / MKL), numerically
 // mirroring the managed AnnPrimitives oracle function-for-function.

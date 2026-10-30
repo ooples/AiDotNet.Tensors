@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // WebGPU dispatchers for the torch.linalg decomposition kernels (#211 moat #2).
 // The *Async methods do the work; the synchronous ILinalgBackend members block on
 // them (GetAwaiter().GetResult()) so the engine's sync dispatch runs these on WebGPU

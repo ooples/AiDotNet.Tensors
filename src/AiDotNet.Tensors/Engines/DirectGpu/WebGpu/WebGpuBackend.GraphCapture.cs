@@ -1,5 +1,5 @@
 #if NET7_0_OR_GREATER
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
 // No device graphs on this backend: work runs eagerly, which is what a zero capture handle tells every caller.
