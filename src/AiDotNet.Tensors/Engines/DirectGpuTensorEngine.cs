@@ -7070,8 +7070,60 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
             catch (NotSupportedException rex) { GpuLaunchProbe.OnFallback("CreateTapeBailStats", rex); AliasDiag($"BCastAddInPlace-resident FELLBACK: {rex.GetType().Name}: {rex.Message}"); }
         }
+        // A bias over the trailing axes ([..., D] += [D], a projection's output bias): in place on the device. The CPU
+        // base downloaded `a` with a blocking read, added on the host and left it there; MultiHeadAttentionLayer's fused
+        // inference adds its output bias this way, which made the add 18% of a GPU ViT b32 forward.
+        // Only where `a` already has a current device buffer (resolved without an upload or a download); a host tensor
+        // keeps the host add.
+        if (typeof(T) == typeof(float) && !Gpu.AutocastScope.IsEnabled && a.IsContiguous && !IsPartialView(a)
+            && TryTrailingBroadcast(a, b, out int biasRows, out int biasCols) && TryGetBackend(out var beBias)
+            && ResolveResidentBufferNoUpload(beBias, a, a.Length, includePersistentWeightCache: false) is { } aResident
+            && aResident.Handle != System.IntPtr.Zero && aResident.Size >= a.Length)
+        {
+            OwnedBuffer biasBuffer = default;
+            try
+            {
+                var bContiguous = b.IsContiguous ? b : (Tensor<T>)b.Contiguous();
+                biasBuffer = GetOrAllocateBuffer(beBias, bContiguous);
+                beBias.BiasAdd(aResident, biasBuffer.Buffer, aResident, biasRows, biasCols);
+                a.IncrementVersion();
+                BindResidentBuffer(a, aResident, beBias);
+                if (!ResidentStepActive) StampInPlaceGpuBuffer(a, beBias, aResident);
+                return;
+            }
+            catch (NotSupportedException ex)
+            {
+                GpuLaunchProbe.OnFallback("TensorBroadcastAddInPlace", ex);
+            }
+            finally
+            {
+                biasBuffer.DisposeAfterQueuedUse(beBias);
+            }
+        }
         // Shapes differ — CPU handles broadcasting logic
         base.TensorBroadcastAddInPlace(a, b);
+    }
+
+    // b broadcasts over a's leading axes only: with b's leading 1s dropped, its shape is a's last dimensions.
+    private static bool TryTrailingBroadcast<T>(Tensor<T> a, Tensor<T> b, out int rows, out int cols)
+    {
+        rows = cols = 0;
+        var ad = a.Shape._dims;
+        var bd = b.Shape._dims;
+        int first = 0;
+        while (first < bd.Length && bd[first] == 1) first++;
+        int kept = bd.Length - first;
+        if (kept == 0 || kept > ad.Length) return false;
+        long width = 1;
+        for (int i = 0; i < kept; i++)
+        {
+            if (bd[first + i] != ad[ad.Length - kept + i]) return false;
+            width *= bd[first + i];
+        }
+        if (width <= 0 || a.Length % width != 0 || width > int.MaxValue) return false;
+        cols = (int)width;
+        rows = a.Length / cols;
+        return rows > 0;
     }
 
     void IEngine.SigmoidInPlace<T>(Tensor<T> tensor)

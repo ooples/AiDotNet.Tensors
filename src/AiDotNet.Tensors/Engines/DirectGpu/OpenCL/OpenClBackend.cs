@@ -8548,7 +8548,7 @@ KERNEL VARIANTS (A/B testing):
             // layers: 0.59 ms vs 0.19 ms for an element-wise pass over a [1,256,56,56] activation).
             // Neither route writes saveMean/saveInvVar in inference.
             if (!training && TryLaunchBatchNormInference(input, output, gamma, beta, runningMean, runningVar, batch,
-                    channels, spatialSize, epsilon, relu: false))
+                    channels, spatialSize, epsilon, activation: 0))
                 return;
 
             var k = _kernelCache["batchnorm_forward"];
@@ -8579,7 +8579,7 @@ KERNEL VARIANTS (A/B testing):
         // batchnorm_inference: one work item per element, the running statistics, ReLU when relu is set. False (nothing
         // launched) when the kernel did not compile or the element count does not fit an int.
         private bool TryLaunchBatchNormInference(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
-            IGpuBuffer runningMean, IGpuBuffer runningVar, int batch, int channels, int spatialSize, float epsilon, bool relu)
+            IGpuBuffer runningMean, IGpuBuffer runningVar, int batch, int channels, int spatialSize, float epsilon, int activation)
         {
             long total = (long)batch * channels * spatialSize;
             if (total <= 0 || total > int.MaxValue || !_kernelCache.TryGetValue("batchnorm_inference", out var kernel))
@@ -8595,7 +8595,7 @@ KERNEL VARIANTS (A/B testing):
             kernel.SetArg(arg++, channels);
             kernel.SetArg(arg++, spatialSize);
             kernel.SetArg(arg++, epsilon);
-            kernel.SetArg(arg++, relu ? 1 : 0);
+            kernel.SetArg(arg++, activation);   // 0 none, 1 ReLU, 2 ReLU6
             // The largest power of two within 256 and the device work-group limit.
             int local = (int)Math.Min(256UL, Math.Max(1UL, _maxWorkGroupSize));
             local = 1 << (int)Math.Floor(Math.Log(local, 2));
@@ -8614,7 +8614,12 @@ KERNEL VARIANTS (A/B testing):
             // ReLU through the element-wise inference kernel: batchnorm_relu measured slower than batch norm then a
             // separate ReLU (0.114 vs 0.096 ms on [1,256,56,56]), where this one-pass form beats both.
             if (activation == FusedActivationType.ReLU && TryLaunchBatchNormInference(input, output, gamma, beta, runningMean,
-                    runningVar, batch, channels, spatialSize, epsilon, relu: true))
+                    runningVar, batch, channels, spatialSize, epsilon, activation: 1))
+                return true;
+            // ReLU6 (MobileNet's every BatchNorm) the same way. It declined here, so the engine ran the whole op on the
+            // host: a blocking download and an upload per layer, most of a GPU MobileNetV2 b32 forward.
+            if (activation == FusedActivationType.ReLU6 && TryLaunchBatchNormInference(input, output, gamma, beta, runningMean,
+                    runningVar, batch, channels, spatialSize, epsilon, activation: 2))
                 return true;
 
             string kernelName = activation switch
