@@ -3184,44 +3184,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         #region Fused Operations
 
         public IGpuBuffer GemmBiasRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-        {
-            IGpuBuffer? temp = null;
-            IGpuBuffer? output = null;
-            try
-            {
-                temp = GemmBias(A, B, bias, M, N, K);
-                output = AllocateBuffer(M * N);
-                Relu(temp, output, M * N);
-                temp.Dispose();
-                return output;
-            }
-            catch
-            {
-                output?.Dispose();
-                temp?.Dispose();
-                throw;
-            }
-        }
+            => GemmBiasActivation(A, B, bias, M, N, K, mode: 1);
 
         public IGpuBuffer GemmBiasGelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-        {
-            IGpuBuffer? temp = null;
-            IGpuBuffer? output = null;
-            try
-            {
-                temp = GemmBias(A, B, bias, M, N, K);
-                output = AllocateBuffer(M * N);
-                Gelu(temp, output, M * N);
-                temp.Dispose();
-                return output;
-            }
-            catch
-            {
-                output?.Dispose();
-                temp?.Dispose();
-                throw;
-            }
-        }
+            => GemmBiasActivation(A, B, bias, M, N, K, mode: 2);
 
         /// <summary>
         /// Paged-attention decode for a single query token (P1): out[heads*headDim] =
@@ -3569,54 +3535,31 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
 
         public IGpuBuffer GemmBiasSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-        {
-            IGpuBuffer? temp = null;
-            IGpuBuffer? output = null;
-            try
-            {
-                temp = GemmBias(A, B, bias, M, N, K);
-                output = AllocateBuffer(M * N);
-                Sigmoid(temp, output, M * N);
-                temp.Dispose();
-                return output;
-            }
-            catch
-            {
-                output?.Dispose();
-                temp?.Dispose();
-                throw;
-            }
-        }
+            => GemmBiasActivation(A, B, bias, M, N, K, mode: 3);
 
         public IGpuBuffer GemmBiasTanh(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-        {
-            IGpuBuffer? temp = null;
-            IGpuBuffer? output = null;
-            try
-            {
-                temp = GemmBias(A, B, bias, M, N, K);
-                output = AllocateBuffer(M * N);
-                Tanh(temp, output, M * N);
-                temp.Dispose();
-                return output;
-            }
-            catch
-            {
-                output?.Dispose();
-                temp?.Dispose();
-                throw;
-            }
-        }
+            => GemmBiasActivation(A, B, bias, M, N, K, mode: 4);
 
-        public IGpuBuffer GemmBias(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
+// A dense layer's forward: C = act(A * B + bias) as the GEMM into C, then one in-place pass (bias_activation) for
+        // the bias and the activation. Each GemmBias* used to run the GEMM, a bias_add pass into C, and the activation
+        // into a second buffer: two more passes over the output and a temporary the size of it. mode is bias_activation's.
+        private IGpuBuffer GemmBiasActivation(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K, int mode,
+            float alpha = 0f)
         {
-            // Use optimized GEMM path (CLBlast/DynamicGemm) + separate bias add
-            // instead of the slow 16x16 fused kernel
             var C = AllocateBuffer(M * N);
             try
             {
                 Gemm(A, B, C, M, N, K);
-                BiasAdd(C, bias, C, M, N);
+                var kernel = _kernelCache["bias_activation"];
+                kernel.SetArg(0, BufferHandle(C));
+                kernel.SetArg(1, BufferHandle(bias));
+                kernel.SetArg(2, M);
+                kernel.SetArg(3, N);
+                kernel.SetArg(4, mode);
+                kernel.SetArg(5, alpha);
+                int total = M * N;
+                int local = (int)Math.Min(256UL, Math.Max(1UL, _maxWorkGroupSize));
+                kernel.Execute1D((total + local - 1) / local * local, local);
                 return C;
             }
             catch
@@ -3626,45 +3569,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             }
         }
 
+        public IGpuBuffer GemmBias(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
+            => GemmBiasActivation(A, B, bias, M, N, K, mode: 0);
+
         public IGpuBuffer GemmBiasSwish(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-        {
-            IGpuBuffer? temp = null;
-            IGpuBuffer? output = null;
-            try
-            {
-                temp = GemmBias(A, B, bias, M, N, K);
-                output = AllocateBuffer(M * N);
-                Silu(temp, output, M * N);
-                temp.Dispose();
-                return output;
-            }
-            catch
-            {
-                output?.Dispose();
-                temp?.Dispose();
-                throw;
-            }
-        }
+            => GemmBiasActivation(A, B, bias, M, N, K, mode: 5);
 
         public IGpuBuffer GemmBiasLeakyRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K, float alpha = 0.01f)
-        {
-            IGpuBuffer? temp = null;
-            IGpuBuffer? output = null;
-            try
-            {
-                temp = GemmBias(A, B, bias, M, N, K);
-                output = AllocateBuffer(M * N);
-                LeakyRelu(temp, output, alpha, M * N);
-                temp.Dispose();
-                return output;
-            }
-            catch
-            {
-                output?.Dispose();
-                temp?.Dispose();
-                throw;
-            }
-        }
+            => GemmBiasActivation(A, B, bias, M, N, K, mode: 6, alpha);
 
         /// <summary>
         /// The fused GEMM kernels stage 16 x 16 tiles in local memory and read every tile element, so the work-group
