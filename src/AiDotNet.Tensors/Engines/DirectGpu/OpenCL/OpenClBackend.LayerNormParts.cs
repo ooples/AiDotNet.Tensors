@@ -51,7 +51,7 @@ __kernel void norm_variance_from_inverse_std(__global float* values, int n, floa
                             new DirectOpenClKernel(context, program, "norm_variance_from_inverse_std");
                         ok = true;
                     }
-                    catch (Exception ex)
+                    catch (Exception ex) when (ex is not OutOfMemoryException)
                     {
                         System.Diagnostics.Trace.TraceWarning($"OpenCL normalization statistic conversions unavailable: {ex.Message}");
                     }

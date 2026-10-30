@@ -1,5 +1,6 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
 using System.Collections.Generic;
+using System.Linq;
 using AiDotNet.Tensors.Engines.DirectGpu;
 
 namespace AiDotNet.Tensors.Engines;
@@ -76,11 +77,11 @@ internal sealed class FirstWriteRedirectTable
             if (_uses.TryGetValue((kv.Value.Contribution, ActionOf(kv.Key)), out int n) && n == 1) _redirects[kv.Key] = kv.Value.Accumulator;
             else { _blocked.Add(kv.Key); _redirects.Remove(kv.Key); }
         }
-        List<long>? reused = null;
-        foreach (var kv in _redirects)
-            if (_uses.TryGetValue((kv.Value, ActionOf(kv.Key)), out int n) && n > 1) (reused ??= new()).Add(kv.Key);
-        if (reused is not null)
-            foreach (long slot in reused) { _blocked.Add(slot); _redirects.Remove(slot); }
+        var reused = _redirects
+            .Where(kv => _uses.TryGetValue((kv.Value, ActionOf(kv.Key)), out int n) && n > 1)
+            .Select(kv => kv.Key)
+            .ToList();
+        foreach (long slot in reused) { _blocked.Add(slot); _redirects.Remove(slot); }
     }
 
     /// <summary>Forgets every redirect (the eager step, or the pooled slots were freed). Blocked slots stay blocked.</summary>

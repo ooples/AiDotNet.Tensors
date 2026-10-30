@@ -292,7 +292,7 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
                 if (double.IsNaN(a) || double.IsInfinity(a)) return null;   // nothing to compare against
                 if (a > scale) scale = a;
             }
-            if (scale == 0) scale = 1;
+            if (scale <= 0) scale = 1;   // every |v| was zero
             _harness.PoisonOutput(args);
             using (Engines.DirectGpu.GpuLaunchProbe.TuningScope())
                 preferred.Execute(args);

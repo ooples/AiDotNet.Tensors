@@ -199,14 +199,25 @@ internal sealed class StepScratchPool
     internal void Release()
     {
         EndLeases(null);
-        foreach (var buffer in Slots.Values) { Untrack(buffer); try { buffer.Dispose(); } catch (ObjectDisposedException) { } }
-        foreach (var buffer in Transient.Values) { Untrack(buffer); try { buffer.Dispose(); } catch (ObjectDisposedException) { } }
-        foreach (var buffer in _free) { Untrack(buffer); try { buffer.Dispose(); } catch (ObjectDisposedException) { } }
+        foreach (var buffer in Slots.Values) DisposeReleased(buffer);
+        foreach (var buffer in Transient.Values) DisposeReleased(buffer);
+        foreach (var buffer in _free) DisposeReleased(buffer);
         Slots.Clear();
         Keys.Clear();
         Transient.Clear();
         _free.Clear();
         _leasedThisRun.Clear();
         Begin(-1);
+    }
+
+    private static void DisposeReleased(IGpuBuffer buffer)
+    {
+        Untrack(buffer);
+        try { buffer.Dispose(); }
+        catch (ObjectDisposedException ex)
+        {
+            // Released already, with its backend (an engine disposed before the plan): nothing is left to free.
+            System.Diagnostics.Trace.TraceInformation($"Step scratch buffer already released: {ex.ObjectName}");
+        }
     }
 }

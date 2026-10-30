@@ -132,7 +132,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             k.SetArg(arg++, a.StrideH); k.SetArg(arg++, a.StrideW);
             k.SetArg(arg++, a.PadH); k.SetArg(arg++, a.PadW);
             k.SetArg(arg++, a.DilationH); k.SetArg(arg++, a.DilationW);
-            k.SetArg(arg++, a.OutHeight); k.SetArg(arg++, a.OutWidth);
+            k.SetArg(arg++, a.OutHeight); k.SetArg(arg, a.OutWidth);
         }
         private static readonly string[] s_conv2DBackwardDataUntunedPreference =
             { "opencl.conv2d_dx.pointwise_gemm", "opencl.conv2d_dx.s2k1", "opencl.conv2d_dx.s2k3", "opencl.conv2d_dx.winograd_f23", "opencl.conv2d_dx.column_gemm" };

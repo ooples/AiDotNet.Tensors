@@ -8078,14 +8078,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // TryCreateDeviceStateTensor binds its state - so every later in-place op on it takes the resident branch
         // above. The host path below uploaded it and downloaded the result every call: 40 blocking round trips a
         // step on ResNet-18.
-        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float) && tensor.IsContiguous
+        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && tensor is Tensor<float> floatTensor && tensor.IsContiguous
             && !IsPartialView(tensor) && tensor._gpuBuffer is null)
         {
             IGpuBuffer? state = null;
             try
             {
                 var host = new float[tensor.Length];
-                ((Tensor<float>)(object)tensor).AsSpanUnmarked().CopyTo(host);
+                floatTensor.AsSpanUnmarked().CopyTo(host);
                 state = backend.AllocateBuffer(host);
                 op(backend, state, tensor.Length);
                 tensor.IncrementVersion();

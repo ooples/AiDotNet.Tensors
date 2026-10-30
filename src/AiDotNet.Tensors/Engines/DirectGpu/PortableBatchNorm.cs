@@ -85,12 +85,15 @@ internal static class PortableBatchNorm
             int unpackedMode = (reluOutput is not null ? 1 : 0) | (gradResidual is not null ? 2 : 0) | (rebuildMask ? 4 : 0)
                                | (gradOutput2 is not null ? 8 : 0);
             // A placeholder for an absent residual gradient: the kernel writes it only under mode bit 1.
-            using var absentResidual = gradResidual is null ? backend.AllocateBuffer(1) : null;
-            var residualBinding = gradResidual ?? absentResidual ?? gradInput;
-            launch(BatchNormRegisterKernelTemplate.BackwardUnpackedName(k), channels,
-                new[] { gradOutput, rebuildMask ? input : reluOutput ?? input, residualBinding, input, gamma, beta ?? gamma,
-                    saveMean, saveVariance, gradInput, gradGamma, gradBeta, gradOutput2 ?? gradOutput },
-                Ints(batch, channels, spatial, epsilon, count, unpackedMode));
+            IGpuBuffer? absentResidual = null;
+            IGpuBuffer residualBinding = gradResidual ?? (absentResidual = backend.AllocateBuffer(1));
+            using (absentResidual)
+            {
+                launch(BatchNormRegisterKernelTemplate.BackwardUnpackedName(k), channels,
+                    new[] { gradOutput, rebuildMask ? input : reluOutput ?? input, residualBinding, input, gamma, beta ?? gamma,
+                        saveMean, saveVariance, gradInput, gradGamma, gradBeta, gradOutput2 ?? gradOutput },
+                    Ints(batch, channels, spatial, epsilon, count, unpackedMode));
+            }
             return true;
         }
         using var prm = backend.AllocateBuffer(4 * channels);
