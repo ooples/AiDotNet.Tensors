@@ -986,6 +986,10 @@ public sealed class CuDnnContext : IDisposable
     /// </summary>
     internal object StreamBindingLock { get; } = new object();
 
+    /// <summary>Binds the handle to <paramref name="stream"/>. Call it holding <see cref="StreamBindingLock"/>, through the launch.</summary>
+    internal void BindStream(IntPtr stream) =>
+        CheckStatus(CuDnnNative.cudnnSetStream(Handle, stream), "cudnnSetStream");
+
     /// <summary>Gets whether cuDNN is available on this system.</summary>
     public static bool IsAvailable
     {

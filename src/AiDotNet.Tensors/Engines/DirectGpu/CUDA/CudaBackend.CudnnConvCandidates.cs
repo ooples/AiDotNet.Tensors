@@ -70,7 +70,7 @@ public sealed partial class CudaBackend
         var context = _cudnnContext ?? throw new InvalidOperationException("cuDNN is unavailable.");
         lock (context.StreamBindingLock)
         {
-            CuDnnContext.CheckStatus(CuDnnNative.cudnnSetStream(context.Handle, _stream), "cudnnSetStream");
+            context.BindStream(_stream);
             conv.Conv2DForwardGpu(a.Input.Handle, a.Kernel.Handle, a.Output.Handle, a.Batch, a.InChannels, a.InHeight,
                 a.InWidth, a.OutChannels, a.KernelH, a.KernelW, a.OutHeight, a.OutWidth, a.PadH, a.PadW, a.StrideH,
                 a.StrideW, a.DilationH, a.DilationW, algorithm: algorithm, mathType: CudnnConvMath);
@@ -86,7 +86,7 @@ public sealed partial class CudaBackend
         var context = _cudnnContext ?? throw new InvalidOperationException("cuDNN is unavailable.");
         lock (context.StreamBindingLock)
         {
-            CuDnnContext.CheckStatus(CuDnnNative.cudnnSetStream(context.Handle, _stream), "cudnnSetStream");
+            context.BindStream(_stream);
             // Weight gradient: First = input, Second = gradOutput. Data gradient: First = gradOutput, Second = kernel.
             if (a.WeightGradient)
                 conv.Conv2DBackwardFilterGpu(a.First.Handle, a.Second.Handle, a.Output.Handle, a.Batch, a.InChannels,

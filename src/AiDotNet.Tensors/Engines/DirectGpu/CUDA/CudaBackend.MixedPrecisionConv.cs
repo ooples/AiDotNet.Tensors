@@ -70,9 +70,7 @@ public sealed partial class CudaBackend : IGpuMixedPrecisionConvBackend
         EnsureCudnnConv();
         lock (_cudnnContext!.StreamBindingLock)
         {
-            CuDnnContext.CheckStatus(
-                CuDnnNative.cudnnSetStream(_cudnnContext.Handle, _stream),
-                "cudnnSetStream");
+            _cudnnContext.BindStream(_stream);
             _cudnnConv!.Conv2DForwardGpu(
                 inputDevPtr: input.Handle,
                 filterDevPtr: kernel.Handle,
@@ -112,9 +110,7 @@ public sealed partial class CudaBackend : IGpuMixedPrecisionConvBackend
         EnsureCudnnConv();
         lock (_cudnnContext!.StreamBindingLock)
         {
-            CuDnnContext.CheckStatus(
-                CuDnnNative.cudnnSetStream(_cudnnContext.Handle, _stream),
-                "cudnnSetStream");
+            _cudnnContext.BindStream(_stream);
             _cudnnConv!.Conv2DBackwardDataGpu(
                 filterDevPtr: kernel.Handle,
                 gradOutputDevPtr: gradOutput.Handle,
@@ -154,9 +150,7 @@ public sealed partial class CudaBackend : IGpuMixedPrecisionConvBackend
         EnsureCudnnConv();
         lock (_cudnnContext!.StreamBindingLock)
         {
-            CuDnnContext.CheckStatus(
-                CuDnnNative.cudnnSetStream(_cudnnContext.Handle, _stream),
-                "cudnnSetStream");
+            _cudnnContext.BindStream(_stream);
             _cudnnConv!.Conv2DBackwardFilterGpu(
                 inputDevPtr: input.Handle,
                 gradOutputDevPtr: gradOutput.Handle,

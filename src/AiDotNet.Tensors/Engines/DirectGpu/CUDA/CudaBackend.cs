@@ -6921,9 +6921,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // stream ordering and produces nondeterministic results.
             lock (_cudnnContext!.StreamBindingLock)
             {
-                CuDnnContext.CheckStatus(
-                    CuDnnNative.cudnnSetStream(_cudnnContext.Handle, _stream),
-                    "cudnnSetStream");
+                _cudnnContext.BindStream(_stream);
                 _cudnnConv!.Conv2DForwardGpu(
                     inputDevPtr: input.Handle,
                     filterDevPtr: kernel.Handle,
@@ -8905,9 +8903,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             double eps = epsilon < 1e-5 ? 1e-5 : epsilon;
             lock (_cudnnContext!.StreamBindingLock)
             {
-                CuDnnContext.CheckStatus(
-                    CuDnnNative.cudnnSetStream(_cudnnContext.Handle, _stream),
-                    "cudnnSetStream");
+                _cudnnContext.BindStream(_stream);
                 if (training)
                 {
                     _cudnnBn!.ForwardTrainingGpu(
