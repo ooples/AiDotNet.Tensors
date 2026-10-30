@@ -376,6 +376,15 @@ internal sealed class LazyTensorScope : IDisposable
         }
     }
 
+    /// <summary>The engine the recorded nodes replay on.</summary>
+    internal IEngine Engine => _engine;
+
+    /// <summary>
+    /// Adds a node built from a recorded one rather than through a Record* call: a batch-polymorphic
+    /// template instantiates its trace at a new batch this way instead of tracing the forward again.
+    /// </summary>
+    internal void AddInstantiatedNode(ILazyNode node) => AddNode(node);
+
     /// <summary>Gets all recorded nodes (for graph compiler).</summary>
     internal IReadOnlyList<ILazyNode> Nodes => _nodes;
 

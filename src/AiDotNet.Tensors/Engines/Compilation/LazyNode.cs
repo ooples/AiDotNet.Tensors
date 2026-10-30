@@ -188,6 +188,9 @@ internal sealed class LazyNode<T> : ILazyNode
                 if (inp.LazySource is ILazyNode n && !n.IsRealized && !ReferenceEquals(n, this)) n.Realize(engine);
     }
 
+    /// <summary>The prior producer of an in-place target (see <c>_externalPrerequisite</c>), or null.</summary>
+    internal ILazyNode? ExternalPrerequisite => _externalPrerequisite;
+
     /// <summary>Get input nodes for graph traversal.</summary>
     public ILazyNode[] GetInputNodes()
     {
