@@ -14,7 +14,7 @@ namespace AiDotNet.Tensors.Benchmarks;
 /// <see cref="DirectGpuTensorEngine.TensorMeshgrid{T}(Tensor{T}[], string)"/>) against the composed route it replaced,
 /// a reshape then a broadcast per grid, through the same engine so both sides pay the same allocation and dispatch
 /// overheads. A shape is promoted only when the 95% confidence interval of the median paired speedup lies wholly at or
-/// above 1.10x, kept composed when it lies wholly below, and reported as undecided otherwise. Exit 0 = every cell
+/// above 1.10x, kept composed when it lies wholly below, and re-measured with four times the brackets otherwise; a cell still undecided then is reported as such. Exit 0 = every cell
 /// promoted, 1 = some cell did not clear the gate, 2 = no Metal device.
 /// </summary>
 /// <remarks>
@@ -26,6 +26,9 @@ namespace AiDotNet.Tensors.Benchmarks;
 internal static class MetalMeshgrid2DExperiment
 {
     private const double PromotionSpeedup = 1.10;
+
+    // Brackets for a re-measurement of an undecided cell: 4x the default 41, so about half the interval width.
+    private const int EscalatedPairs = 161;
 
     public static int Run()
     {
@@ -81,6 +84,14 @@ internal static class MetalMeshgrid2DExperiment
                     }
                     // Ratio = composed / fused: above 1 means the fused route is faster.
                     var bound = StableTimer.MeasurePairedRatioBound(Composed, backend.Synchronize, Fused, backend.Synchronize);
+                    if (bound.Lower < PromotionSpeedup && bound.Upper >= PromotionSpeedup)
+                    {
+                        // Undecided: the interval straddles the bar, which on this runner is noise, not a verdict
+                        // (1024x256 has read [1.08x, 1.64x] around a 1.36x median). Four times the brackets halve the
+                        // interval's width; the verdict comes from that fresh sample alone.
+                        bound = StableTimer.MeasurePairedRatioBound(Composed, backend.Synchronize, Fused, backend.Synchronize,
+                            pairs: EscalatedPairs);
+                    }
                     bool promoted = bound.Lower >= PromotionSpeedup;
                     bool rejected = bound.Upper < PromotionSpeedup;
                     allPromoted &= promoted;
