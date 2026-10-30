@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Declared kernels composed into one resident (persistent cooperative) kernel (#890 phase 4 on #1430). These pin the
 // composition's structure -- what it renames, what it rewrites, where the grid barriers go, what it refuses -- on the
 // CPU; DeclaredProgramRouteTests runs the composed chains on a device against the stages launched separately.

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Correctness tests for the multi-backend fused FP16 matmul BACKWARD (#633):
 // IGpuHalfPrecisionBackend.MatMulBackwardFp16Fused computes both gradients of
 // C[M,N] = A[M,K]·B[K,N] — gradA[M,K] = gradC·Bᵀ and gradB[K,N] = Aᵀ·gradC — in

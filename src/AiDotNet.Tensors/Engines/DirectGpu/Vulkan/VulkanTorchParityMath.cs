@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Double-precision math for the Vulkan PyTorch-parity kernels (#1127).
 //
 // The CPU reference evaluates these ops in double (Helpers/SpecialFunctions and the Math calls around it) and rounds

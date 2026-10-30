@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Comprehensive integration tests for Metal GPU backend on Apple Silicon.
 
 using System;

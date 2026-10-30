@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // --kernel-family-gate: the wall-clock gate (protocol p15) for the families #1440 and #1441 declared -- the row-wise
 // scatter family, the sparse kernels, the index family and the attention family. Each case calls a CUDA backend entry
 // point with the declared route on and off (the incumbent hand-written kernel), INTERLEAVED sample by sample: every

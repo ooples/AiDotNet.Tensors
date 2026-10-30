@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 //
 // fp32 batch=1 / small-M N-parallel GEMM + fused-projection helper (Phase A / #1622, L2).
 //

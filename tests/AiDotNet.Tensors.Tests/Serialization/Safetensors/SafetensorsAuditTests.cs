@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Audit-driven tests for the issue #218 acceptance criteria additions:
 // mmap reader, appender, sharded write, HF presets, GGUF writer.
 

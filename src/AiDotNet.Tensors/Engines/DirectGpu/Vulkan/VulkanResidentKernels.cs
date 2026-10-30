@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Correctness-first resident Vulkan kernels for operations that do not yet have tuned SPIR-V.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;

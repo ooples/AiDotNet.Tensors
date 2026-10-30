@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Public FFT surface — mirrors torch.fft with C# naming conventions.
 //
 // Layout convention:

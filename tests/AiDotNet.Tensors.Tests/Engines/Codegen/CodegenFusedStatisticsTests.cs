@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Softmax and LayerNorm, and the numerical trap that makes them worth testing.
 //
 // These were blocked on the spec's BODY, not on the number of passes: the activation runs

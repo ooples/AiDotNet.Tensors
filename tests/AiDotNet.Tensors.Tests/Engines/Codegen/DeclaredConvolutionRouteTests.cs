@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The declared convolution route (#890 phase 4b): CudaBackend runs a convolution, its data gradient or its weight
 // gradient as an implicit-GEMM program (optionally split), in the tuned slots' argument contract. The bar is a direct
 // fp64 convolution written out here, independent of the spec and its interpreter, so the slots' operand roles

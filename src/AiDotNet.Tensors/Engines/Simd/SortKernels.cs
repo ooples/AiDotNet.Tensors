@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // SIMD-accelerated sort / top-k / search-sorted primitives for the
 // parity-210 op surface. Issue #210 lists `Engines/Simd/SortKernels.cs`
 // as the home for these; we land the canonical float32 fast paths

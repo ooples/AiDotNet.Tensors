@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Self-contained, allocation-lean FFT kernels:
 //   - IterativeRadix2 — Cooley-Tukey in-place for n = 2^k
 //   - Bluestein      — chirp-z for arbitrary n via a length-M ≥ 2n-1 power-of-2 FFT

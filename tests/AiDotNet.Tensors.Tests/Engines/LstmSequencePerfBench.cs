@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // #477 perf measurement for LstmSequenceForward at the AIsEval workload
 // ([128,32,32]->64, last-step output). Reports median / p95 wall-clock so the
 // fused-recurrent-kernel work can be measured against the torch ~2.78ms target

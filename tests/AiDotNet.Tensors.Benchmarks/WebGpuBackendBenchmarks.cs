@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Comprehensive benchmarks for WebGPU backend to identify performance bottlenecks.
 // WebGPU is designed for browser-based GPU compute in Blazor WebAssembly.
 

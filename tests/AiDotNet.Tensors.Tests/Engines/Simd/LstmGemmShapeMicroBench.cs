@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // #477: isolate the LSTM recurrent GEMM shape [M=128, K=64, N=256] and compare the
 // SimdGemm dispatch paths head-to-head, reporting MIN-of-many GF/s (the noise-robust
 // best-case estimator) so a routing/kernel win is measurable on a busy machine.

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // FE-4: measure what splitting a reduction actually buys, on the device.
 //
 // The interpreter tests prove the split computes the same thing. They cannot prove it is

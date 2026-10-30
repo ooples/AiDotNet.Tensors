@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The warp-per-output reduction lowering (#890 phase 4a): which specs take it, that the
 // lane-interleaved rewrite reads exactly the terms the original does, and that the split
 // planner counts the 32 threads per output it launches.

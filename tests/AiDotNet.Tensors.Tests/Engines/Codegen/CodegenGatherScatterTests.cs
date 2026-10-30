@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Data-dependent indexing: gather and scatter.
 //
 // The IR previously documented these as "deliberately not expressible ... out of scope for

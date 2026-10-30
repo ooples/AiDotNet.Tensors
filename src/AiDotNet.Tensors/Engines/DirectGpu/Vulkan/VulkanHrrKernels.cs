@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // GLSL 450 compute shaders for HRR binding primitives (issue #248).
 //
 // Each kernel keeps work on the GPU — no download/upload. Per-cell

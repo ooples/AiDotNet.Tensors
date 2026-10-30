@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Expression bodies and the normalisation backward programs (#890 phase 4a).
 //
 // The backward programs are held to gradients derived independently here -- by finite

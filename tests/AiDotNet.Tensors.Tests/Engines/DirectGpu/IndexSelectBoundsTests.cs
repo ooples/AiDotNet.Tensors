@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // resident_index_select used an index without checking it, so a negative or past-the-axis index read another row of
 // the source, or memory outside it. An index outside the source axis now yields zeros -- the contract #890's declared
 // gather (CodegenBackendPrograms.IndexSelect) has, so the call's result does not depend on which kernel serves it.

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Short-Time Fourier Transform + inverse (overlap-add reconstruction).
 // Mirrors torch.stft / torch.istft parameters and output shape.
 

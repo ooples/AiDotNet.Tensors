@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // PTX transfer tracking. The authoritative census of every CUDA kernel — the
 // full set that must be replaced by a promoted PTX kernel before the CUDA
 // kernels can be deleted. Reflected from the same GetKernelNames() registries

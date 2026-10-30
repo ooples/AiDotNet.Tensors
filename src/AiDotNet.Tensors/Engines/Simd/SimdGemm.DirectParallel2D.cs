@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 //
 // Small-M direct GEMM partitioned over BOTH output axes.
 //

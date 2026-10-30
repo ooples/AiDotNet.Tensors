@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Phase E of issue #225: joint forward+backward graph + passes
 // (DCE, min-cut partitioner, in-place candidate detection).
 

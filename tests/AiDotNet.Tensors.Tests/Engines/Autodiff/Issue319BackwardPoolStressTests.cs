@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Issue #319 — stress tests for the structural autograd refactor
 // (BackwardScratch thread-local pool, GradNodePool with owning-tape
 // stamping, TensorAllocator.Rent<T>(int[], T[]) adopt-not-copy).

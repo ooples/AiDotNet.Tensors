@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Vulkan GLSL compute shaders for the fused ANN primitives declared by IAnnBackend.
 // Numerically mirror AiDotNet.Tensors.Ann.AnnPrimitives function-for-function:
 //   * Metric 0 (L2)  = squared Euclidean sum((a-b)^2), smaller is nearer.

@@ -1,5 +1,5 @@
 using System.Linq;
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 
 using System;
 using System.Collections.Generic;
