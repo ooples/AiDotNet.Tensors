@@ -221,7 +221,7 @@ public sealed class CompiledModelCache<T> : IDisposable
             foreach (var plan in _trainingPlans.Values) plan.Dispose();
             _inferencePlans.Clear();
             _trainingPlans.Clear();
-            _families.Clear();
+            _templates.Clear();
         }
     }
 
@@ -254,26 +254,39 @@ public sealed class CompiledModelCache<T> : IDisposable
             if (_inferencePlans.TryGetValue(key, out cached) && cached.IsValid(inputShape))
                 return cached;
 
-            ICompiledPlan<T> plan;
-            int batchDim = symbolicShape.SymbolicDimensions.Length > 0 ? symbolicShape.SymbolicDimensions[0] : -1;
-            var family = batchDim < 0 ? null : GetFamily(symbolicShape.ComputeKey());
-            if (family?.Template is { } template && template.CanServe(inputShape))
+            ICompiledPlan<T>? plan = null;
+            var symbolDims = symbolicShape.SymbolicDimensions;
+            long familyKey = symbolicShape.ComputeKey();
+            _templates.TryGetValue(familyKey, out var template);
+            if (template is not null && template.CanServe(inputShape))
             {
-                // No trace: the template rebuilds the recorded graph at this batch.
-                plan = template.Instantiate(inputShape);
-                InstantiatedPlanCount++;
+                // No trace: the template rebuilds the recorded graph at this shape.
+                try
+                {
+                    plan = template.Instantiate(inputShape);
+                    InstantiatedPlanCount++;
+                }
+                catch (Exception ex) when (ex is ArithmeticException or InvalidOperationException or ArgumentException)
+                {
+                    // Not reachable after all (a rescaled value that does not divide evenly, or a graph the
+                    // compiler rejects at this shape): trace it like any other shape.
+                    System.Diagnostics.Trace.TraceWarning(
+                        $"CompiledModelCache: building [{string.Join(",", inputShape)}] from its template failed, tracing it: {ex.Message}");
+                }
             }
-            else
+            if (plan is null)
             {
                 using var scope = GraphMode.EnableInference();
                 var explicitOutput = forward();
                 ThrowIfForwardRecordedNothing(scope, explicitOutput);
                 // Recorded before compiling: compilation clears the lazy links the recipe numbers.
-                var recipe = family is not null && family.Template is null && family.Failure is null
-                    ? InferenceTraceRecipe<T>.Capture(scope, explicitOutput, inputShape)
-                    : null;
+                var recipe = symbolDims.Length > 0 ? InferenceTraceRecipe<T>.Capture(scope, explicitOutput, inputShape) : null;
                 plan = scope.CompileInference<T>(explicitOutput, inputShape);
-                if (recipe is not null) family!.Observe(recipe, batchDim);
+                if (recipe is not null)
+                {
+                    if (template is null) _templates[familyKey] = new ShapePolymorphicTemplate<T>(recipe, symbolDims);
+                    else template.Observe(recipe);
+                }
             }
 
             if (_inferencePlans.TryGetValue(key, out var old))
@@ -291,47 +304,10 @@ public sealed class CompiledModelCache<T> : IDisposable
 
     /// <summary>Why the symbolic family of <paramref name="symbolicShape"/> is not batch-polymorphic, or null.</summary>
     internal string? GetBatchPolymorphismFailure(SymbolicShape symbolicShape)
-        => _families.TryGetValue(symbolicShape.ComputeKey(), out var f) ? f.Failure ?? f.First?.Failure : null;
+        => _templates.TryGetValue(symbolicShape.ComputeKey(), out var t) ? t.Failure : null;
 
-    private readonly Dictionary<long, SymbolicFamily> _families = new();
-
-    private SymbolicFamily GetFamily(long symbolicKey)
-    {
-        if (!_families.TryGetValue(symbolicKey, out var family))
-            _families[symbolicKey] = family = new SymbolicFamily();
-        return family;
-    }
-
-    /// <summary>
-    /// The traces of one symbolic family: the first trace waits for a trace at another batch, and the pair
-    /// becomes the template (or the reason there is none).
-    /// </summary>
-    private sealed class SymbolicFamily
-    {
-        internal InferenceTraceRecipe<T>? First;
-        internal BatchPolymorphicTemplate<T>? Template;
-        internal string? Failure;
-
-        internal void Observe(InferenceTraceRecipe<T> recipe, int batchDim)
-        {
-            if (recipe.Failure is not null) { Failure = recipe.Failure; First = null; return; }
-            if (First is null || !DiffersOnlyIn(First.InputShape, recipe.InputShape, batchDim))
-            {
-                // A first trace, or one that changed another dynamic dim: it seeds the family instead.
-                First = recipe;
-                return;
-            }
-            Template = BatchPolymorphicTemplate<T>.TryCreate(First, recipe, batchDim, out Failure);
-            First = null;
-        }
-
-        private static bool DiffersOnlyIn(int[] a, int[] b, int dim)
-        {
-            if (a.Length != b.Length || a[dim] == b[dim]) return false;
-            for (int i = 0; i < a.Length; i++) if (i != dim && a[i] != b[i]) return false;
-            return true;
-        }
-    }
+    // Per symbolic family: its first trace, and what later traces showed scales with each symbolic dim.
+    private readonly Dictionary<long, ShapePolymorphicTemplate<T>> _templates = new();
 
     /// <summary>
     /// Issue #239 guard: surface a clear, actionable error when the traced
