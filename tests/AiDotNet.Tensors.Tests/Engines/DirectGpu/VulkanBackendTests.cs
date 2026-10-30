@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Comprehensive integration tests for Vulkan GPU backend.
 // Goal: Find as many bugs as possible through edge cases and stress testing.
 

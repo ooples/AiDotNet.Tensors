@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Correctness tests for the CUDA weight-only fused dequant-GEMM (P0), validated against a CPU
 // reference implementing the same contract as FusedDequantMatmulKernels. Skips when no CUDA device
 // is available (e.g. the AMD dev box); runs on NVIDIA / CI.

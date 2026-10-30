@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Every kernel name a backend resolves must be in its kernel cache once the backend is constructed.
 //
 // WHY THIS EXISTS. HipBackend looked up max_axis, copy_2d_strided, csr_segmented_{max,min,stddev}, four octonion
