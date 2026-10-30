@@ -2329,7 +2329,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// <summary>
     /// Allocates a reusable classification buffer and aggregate mask per distinct GPU backend,
     /// sized for that backend's largest parameter. Sharing keeps the guard's persistent memory
-    /// bounded by twice the largest tensor rather than the sum of every gradient tensor.
+    /// bounded by twice the largest tensor rather than the sum of every gradient tensor. Called
+    /// the first time the guard falls back to them (no multi-tensor finiteness kernel); a plan
+    /// whose backend has that kernel never holds them: about 16 MB on a GPU ResNet-50.
     /// </summary>
     private void AllocateGpuFinitenessScratch(
         Engines.DirectGpu.IDirectGpuBackend?[] gpuBackends,
@@ -2416,6 +2418,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
         else if (gradientsFinite)
         {
+            AllocateGpuFinitenessScratch(
+                gpuBackends, lengths, gpuFinitenessScratch,
+                gpuFinitenessAggregate, gpuFinitenessReductionLengths);
             // Aggregate every gradient mask on-device and synchronize only once per backend. The
             // accumulator begins as all ones; multiplying a 0/1 mask into its prefix preserves a
             // zero from any tensor while unused tail entries remain one.
@@ -5811,10 +5816,6 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             vMax[p] = optimizerType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL ? TensorArena.RentPersistentZeroed<float>(lengths[p]) : Array.Empty<float>();
         }
 
-        AllocateGpuFinitenessScratch(
-            gpuBackends, lengths, gpuFinitenessScratch,
-            gpuFinitenessAggregate, gpuFinitenessReductionLengths);
-
         _finitenessDeferred = false;
         _optimizerStep = 0;
         var b1 = beta1;
@@ -7230,10 +7231,6 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             }
             vMax[p] = optimizerType is OptimizerType.AMSGrad or OptimizerType.AdaDelta or OptimizerType.FTRL ? TensorArena.RentPersistentZeroed<float>(lengths[p]) : Array.Empty<float>();
         }
-
-        AllocateGpuFinitenessScratch(
-            gpuBackends, lengths, gpuFinitenessScratch,
-            gpuFinitenessAggregate, gpuFinitenessReductionLengths);
 
         _finitenessDeferred = false;
         _optimizerStep = 0;

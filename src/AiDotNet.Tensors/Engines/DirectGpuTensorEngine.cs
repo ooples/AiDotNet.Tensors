@@ -8839,6 +8839,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
+    /// Drops the persistent weight-cache copy of a tensor that has just been given its own resident buffer on this
+    /// engine's backend (<see cref="Tensor{T}.Gpu"/>). From then on the weight reads take the resident buffer
+    /// (<see cref="GetWeightBufferPreferResident{T}"/>), so the copy an earlier forward cached (the warm-up or
+    /// inference before training) was dead: a second device copy of every weight for the life of the process.
+    /// A later read that does need the cache (the resident buffer judged stale) uploads again.
+    /// </summary>
+    internal void DropPersistentCopy<T>(Tensor<T> tensor)
+    {
+        var backing = tensor.GetBackingArrayForCacheLookupUnsafe();
+        if (backing is null || !_persistentBufferCache.ContainsKey(backing)) return;
+        lock (_persistentBufferLock)
+        {
+            if (_persistentBufferCache.TryRemove(backing, out var entry)) entry.Dispose();
+            _tensorVersions.TryRemove(backing, out _);
+            _persistentWeightHostVersion.TryRemove(backing, out _);
+        }
+    }
+
+    /// <summary>
     /// Invalidates a cached weight buffer, forcing a re-upload on the next GetOrCacheWeightsGpu call.
     /// Thread-safe: Uses _persistentBufferLock to synchronize with GetOrCacheWeightBuffer.
     /// </summary>

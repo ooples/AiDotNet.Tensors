@@ -27,6 +27,8 @@ public static class OpenClNative
     // OpenCL library - standard name across platforms
     private const string OpenClLibrary = "OpenCL";
 
+    static OpenClNative() => DirectGpu.OpenCL.OpenClRuntimeDefaults.Apply();
+
     #region Enums and Constants
 
     /// <summary>OpenCL error codes.</summary>

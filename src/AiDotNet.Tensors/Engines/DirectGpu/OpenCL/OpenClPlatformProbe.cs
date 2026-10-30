@@ -16,12 +16,16 @@ internal static class OpenClPlatformProbe
     // Windows ICD: "OpenCL.dll"; Linux ICD: "libOpenCL.so.1" / "libOpenCL.so"; macOS: framework path.
     private const string Lib = "OpenCL";
 
-#if NET5_0_OR_GREATER
     static OpenClPlatformProbe()
     {
+        OpenClRuntimeDefaults.Apply();
+#if NET5_0_OR_GREATER
         AiDotNet.Tensors.Engines.NativeLibraryResolverRegistry.Register(ResolveLib);
+#endif
+        IsAvailable = Probe();
     }
 
+#if NET5_0_OR_GREATER
     private static IntPtr ResolveLib(string name, System.Reflection.Assembly asm, DllImportSearchPath? path)
     {
         if (name != Lib) return IntPtr.Zero;
@@ -68,7 +72,10 @@ internal static class OpenClPlatformProbe
     internal const ulong CL_MEM_SVM_FINE_GRAIN_BUFFER = 1UL << 10;
     internal const ulong CL_DEVICE_TYPE_GPU = 1UL << 2;
 
-    public static readonly bool IsAvailable = Probe();
+    // Assigned in the static constructor, not by an initializer: field initializers run BEFORE the constructor body,
+    // so the probe loaded the OpenCL runtime before the runtime defaults were set (it then reserved its 64 MB heap
+    // anyway) and before the library resolver was registered.
+    public static readonly bool IsAvailable;
 
     private static bool Probe()
     {
