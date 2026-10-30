@@ -26435,10 +26435,12 @@ public partial class CpuEngine : ITensorLevelEngine
         // kernel indexes them from 0); otherwise into scratch, copied over after.
         float[]? meanBacking = mean.GetCpuBackingForContiguousWrite(out int meanOffset);
         float[]? varBacking = variance.GetCpuBackingForContiguousWrite(out int varOffset);
-        bool meanDirect = meanBacking is not null && meanOffset == 0;
-        bool varDirect = varBacking is not null && varOffset == 0;
-        float[] meanF = meanDirect ? meanBacking! : new float[channels];
-        float[] varF = varDirect ? varBacking! : new float[channels];
+        float[]? meanDirectArray = meanOffset == 0 ? meanBacking : null;
+        float[]? varDirectArray = varOffset == 0 ? varBacking : null;
+        bool meanDirect = meanDirectArray is not null;
+        bool varDirect = varDirectArray is not null;
+        float[] meanF = meanDirectArray ?? new float[channels];
+        float[] varF = varDirectArray ?? new float[channels];
         BatchNorm4DFloat(input, gammaF, betaF, (float)epsilon, batch, channels, spatialSize, meanF, varF, output);
         ParallelElementwiseChunks(x.Length, (start, count) =>
         {

@@ -61,7 +61,8 @@ public class DetachedContextTests
         try
         {
             // A fresh pool: the process-wide Instance may already exist.
-            executor = (PersistentParallelExecutor)Activator.CreateInstance(typeof(PersistentParallelExecutor), nonPublic: true)!;
+            executor = Activator.CreateInstance(typeof(PersistentParallelExecutor), nonPublic: true) as PersistentParallelExecutor
+                ?? throw new InvalidOperationException("PersistentParallelExecutor has no non-public parameterless constructor.");
         }
         finally
         {

@@ -35,12 +35,14 @@ internal sealed class BatchNormAddReluFusionPattern : IFusionPattern
                 consumer => consumer is LazyNode<float> { OpType: LazyNodeType.Add },
                 out var bn, out var add, out var statistics, out var mean, out var variance, out var epsilon))
             return false;
+        // A successful match sets every output; checked here because net471 has no NotNullWhen to say so.
+        if (bn is null || add is null || statistics is null || mean is null || variance is null) return false;
         // GPU only: the CPU has no fused BatchNorm+Add+ReLU kernel, and the composed fallback would allocate the
         // normalized output and the sum on every replay.
-        if (BatchNormFusionMatch.IsCpuOnly(bn!.RecordingEngine)) return false;
+        if (BatchNormFusionMatch.IsCpuOnly(bn.RecordingEngine)) return false;
 
         // The add's other operand is the residual: same shape (no broadcasting), and not the normalized output again.
-        Tensor<float>? residual = ReferenceEquals(add!.Input0, bn!.Output) ? add.Input1
+        Tensor<float>? residual = ReferenceEquals(add.Input0, bn.Output) ? add.Input1
             : ReferenceEquals(add.Input1, bn.Output) ? add.Input0 : null;
         if (residual is null || ReferenceEquals(residual, bn.Output) || !SameShape(residual._shape, bn.Output._shape)
             || !SameShape(add.Output._shape, bn.Output._shape) || !PatternHelpers.FanOutAtMostOne(add, consumerCounts))
@@ -64,13 +66,13 @@ internal sealed class BatchNormAddReluFusionPattern : IFusionPattern
 
         var bnInputs = bn.GetInputsArray();
         var node = BatchNormFusionMatch.BuildFusedNode(bn, bnInputs[0], bnInputs[1], bnInputs[2], residual, relu.Output,
-            statistics!, mean!, variance!, epsilon, "BatchNormAddReLU", BackwardFunctions<float>.BatchNormAddReluBackward);
+            statistics, mean, variance, epsilon, "BatchNormAddReLU", BackwardFunctions<float>.BatchNormAddReluBackward);
         fused = node;
         PatternHelpers.SetLazySource(node);
         alreadyRemoved.Add(bn);
         alreadyRemoved.Add(add);
         alreadyRemoved.Add(relu);
-        foreach (var s in statistics!) alreadyRemoved.Add(s);
+        foreach (var s in statistics) alreadyRemoved.Add(s);
         return true;
     }
 

@@ -39,14 +39,16 @@ internal sealed class BatchNormReluFusionPattern : IFusionPattern
                 consumer => consumer is LazyNode<float> { OpType: LazyNodeType.ReLU },
                 out var bn, out var relu, out var statistics, out var mean, out var variance, out var epsilon))
             return false;
-        var bnInputs = bn!.GetInputsArray();
-        var node = BatchNormFusionMatch.BuildFusedNode(bn, bnInputs[0], bnInputs[1], bnInputs[2], null, relu!.Output,
-            statistics!, mean!, variance!, epsilon, "BatchNormReLU", BackwardFunctions<float>.BatchNormReluBackward);
+        // A successful match sets every output; checked here because net471 has no NotNullWhen to say so.
+        if (bn is null || relu is null || statistics is null || mean is null || variance is null) return false;
+        var bnInputs = bn.GetInputsArray();
+        var node = BatchNormFusionMatch.BuildFusedNode(bn, bnInputs[0], bnInputs[1], bnInputs[2], null, relu.Output,
+            statistics, mean, variance, epsilon, "BatchNormReLU", BackwardFunctions<float>.BatchNormReluBackward);
         fused = node;
         PatternHelpers.SetLazySource(node);
         alreadyRemoved.Add(bn);
         alreadyRemoved.Add(relu);
-        foreach (var s in statistics!) alreadyRemoved.Add(s);
+        foreach (var s in statistics) alreadyRemoved.Add(s);
         return true;
     }
 }

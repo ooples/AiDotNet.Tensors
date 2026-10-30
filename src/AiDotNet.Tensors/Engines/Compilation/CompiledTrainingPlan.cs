@@ -9757,7 +9757,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             scope.ReleaseStorageLeases();
             DropStorageOfRemovedOutputs(scope.Nodes, optimized, forwardSteps, parameters);
             plan.ReleaseFusedChainInternals(convEpilogueDeadInternals);
-        plan._pooledForwardOutputs = pooledForwardOutputs;
+            plan._pooledForwardOutputs = pooledForwardOutputs;
             return plan;
         }
         finally
@@ -9929,9 +9929,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var pooled = new bool[count];
         var schedule = new List<int>?[actions];
         bool anyPooled = false;
-        bool modeled = coverage.Count == actions;
-        for (int a = 0; a < coverage.Count && modeled; a++) modeled = coverage[a] is not null;
-        if (modeled)
+        // Pooling is modeled only when every action reports the forward steps it covers.
+        int[][]? covered = coverage.Count == actions && coverage.All(steps => steps is not null)
+            ? coverage.OfType<int[]>().ToArray()
+            : null;
+        if (covered is not null)
         {
             var indexOf = new Dictionary<Tensor<T>, int>(count);
             for (int g = 0; g < count; g++) indexOf[allGrads[g]] = g;
@@ -9949,14 +9951,14 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // one atomic action, so only a read that neither an earlier action nor this one writes is a read of a
                 // gradient nobody produced.
                 actionWrites.Clear();
-                foreach (int s in coverage[a]!)
+                foreach (int s in covered[a])
                     foreach (int w in forwardSteps[s].Inputs.Select(GradIndex).Where(i => i != None))
                     {
                         actionWrites.Add(w);
                         if (firstWrite[w] == None) firstWrite[w] = a;
                         lastUse[w] = Math.Max(lastUse[w], a);
                     }
-                foreach (int r in coverage[a]!.Select(s => GradIndex(forwardSteps[s].OutputBuffer)).Where(i => i != None))
+                foreach (int r in covered[a].Select(s => GradIndex(forwardSteps[s].OutputBuffer)).Where(i => i != None))
                 {
                     if (firstWrite[r] == None && !actionWrites.Contains(r)) readBeforeWrite[r] = true;
                     lastUse[r] = Math.Max(lastUse[r], a);
