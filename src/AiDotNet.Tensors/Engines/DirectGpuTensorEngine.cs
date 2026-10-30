@@ -22794,7 +22794,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     void IEngine.TensorCopy<T>(Tensor<T> source, Tensor<T> destination)
     {
         if (source is not null && destination is not null && typeof(T) == typeof(float)
-            && source.Length == destination.Length && destination.IsContiguous && destination.StorageOffset != 0
+            && source.Length == destination.Length && destination.Length > 0 && destination.IsContiguous && destination.StorageOffset != 0
             && !Compilation.GraphMode.IsActive && TryGetBackend(out var viewBackend))
         {
             destination.PrepareForInPlaceWrite();
@@ -22812,7 +22812,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return;
         }
         if (source is not null && destination is not null && typeof(T) == typeof(float)
-            && source.Length == destination.Length && destination.IsContiguous && destination._storageOffset == 0
+            && source.Length == destination.Length && destination.Length > 0 && destination.IsContiguous && destination._storageOffset == 0
             && !Compilation.GraphMode.IsActive && TryGetBackend(out var backend))
         {
             try
