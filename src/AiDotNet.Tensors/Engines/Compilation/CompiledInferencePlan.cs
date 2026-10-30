@@ -1304,6 +1304,14 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         int[]? requestedInputShape,
         Tensor<T>[]? explicitInputs = null)
     {
+        if (scope.HostEscape is { } escaped)
+            throw new GraphCaptureNotSupportedException(
+                nameof(Compile),
+                GraphCaptureLimitation.HostBoundary,
+                $"The forward read the value of traced operation {escaped.OpType} on the host while tracing, so " +
+                "whatever it computed from that value ran outside the graph and would replay as a stale constant. " +
+                "Express that computation with engine operations to make the forward compilable.");
+
         var compiler = new LazyGraphCompiler();
         var optimized = compiler.Compile(scope.Nodes);
 
