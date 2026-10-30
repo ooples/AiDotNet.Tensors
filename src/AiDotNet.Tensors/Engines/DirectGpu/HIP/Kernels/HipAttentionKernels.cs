@@ -1092,9 +1092,9 @@ extern ""C"" __global__ __launch_bounds__(256) void flash_attention_forward(
     if (bh >= batch * numHeads) return;
     if (headDim > MAX_HEAD_DIM) return;
 
-    extern __shared__ float smem[];
-    float* Ks = smem;
-    float* Vs = smem + ATTN_BC * headDim;
+    extern __shared__ float forwardSmem[];   // not smem: the device helpers above declare smem with C++ linkage, and this C-linkage kernel's would clash
+    float* Ks = forwardSmem;
+    float* Vs = forwardSmem + ATTN_BC * headDim;
 
     int kBase = bh * seqLen * headDim;
     int vBase = bh * seqLen * headDim;
