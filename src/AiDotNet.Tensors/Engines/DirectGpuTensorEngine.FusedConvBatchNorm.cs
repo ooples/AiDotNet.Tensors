@@ -42,7 +42,7 @@ public partial class DirectGpuTensorEngine
                 strideH, strideW, padH, padW, dilationH, dilationW, activation);
 
         var (foldedKernel, foldedBias) = ConvBatchNormFold<T>.Get(kernel, bias, gamma, beta, runningMean,
-            runningVariance, epsilon, FoldOnDevice, replaced => ReleaseDeadDeviceStorage(replaced, afterQueuedWork: true));
+            runningVariance, epsilon, FoldOnDevice, ReleaseFolded);
         return FusedConv2D(input, foldedKernel, foldedBias, strideH, strideW, padH, padW, dilationH, dilationW, activation);
     }
 

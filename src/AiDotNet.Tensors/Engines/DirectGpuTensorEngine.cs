@@ -3742,6 +3742,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return true;
     }
 
+    /// <summary>
+    /// Binds a float PARAMETER to a device buffer the on-device optimizer updates in place and the forward reads
+    /// (<see cref="GetWeightBufferPreferResident{T}"/>). A parameter already resident and current on this engine's
+    /// backend (<see cref="Tensor{T}.Gpu"/>) keeps its own buffer: registering it in the persistent cache allocated a
+    /// second device copy of it and orphaned the first, about 115 MB of a GPU ResNet-50's training peak.
+    /// </summary>
+    internal void BindResidentParamBuffer<T>(Tensor<T> param)
+    {
+        if (param is null) return;
+        if (param._gpuBuffer is not null && TryGetBackend(out var backend)
+            && ReferenceEquals(param._gpuBackend, backend) && param._gpuBufferVersion == param.GpuCacheVersion)
+            return;
+        RegisterResidentParamBuffer(param);
+    }
+
     /// <summary>Resident FP16 training (#633): register a PARAMETER's GPU buffer in the persistent weight cache
     /// (keyed on its backing array — the SAME key the forward param-cast looks up) and point _gpuBuffer at it, so
     /// the optimizer's in-place update and the next forward read the SAME buffer (survives the step-end discard).</summary>
@@ -8895,15 +8910,41 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// engine's backend (<see cref="Tensor{T}.Gpu"/>). From then on the weight reads take the resident buffer
     /// (<see cref="GetWeightBufferPreferResident{T}"/>), so the copy an earlier forward cached (the warm-up or
     /// inference before training) was dead: a second device copy of every weight for the life of the process.
-    /// A later read that does need the cache (the resident buffer judged stale) uploads again.
+    /// A later read that does need the cache (the resident buffer judged stale) uploads again. A convolution kernel's
+    /// BatchNorm fold made from its host weights goes too, with its folded tensors' device copies: the next evaluation
+    /// folds the resident weights on the device, so those were dead as well (78 MB of a GPU ResNet-50's training peak).
     /// </summary>
     internal void DropPersistentCopy<T>(Tensor<T> tensor)
     {
-        var backing = tensor.GetBackingArrayForCacheLookupUnsafe();
+        DropCachedCopy(tensor.GetBackingArrayForCacheLookupUnsafe());
+        ConvBatchNormFold<T>.Forget(tensor, ReleaseFolded);
+    }
+
+    /// <summary>
+    /// Frees a replaced or forgotten BatchNorm fold's tensor: its persistent-cache copy (a fold of host weights is
+    /// uploaded through the cache keyed by its array, which the cache holds, so no finalizer ever frees it) and its own
+    /// device storage (a fold made on the device).
+    /// </summary>
+    private void ReleaseFolded<T>(Tensor<T> folded)
+    {
+        DropCachedCopy(folded.GetBackingArrayForCacheLookupUnsafe());
+        ReleaseDeadDeviceStorage(folded, afterQueuedWork: true);
+    }
+
+    private void DropCachedCopy(object? backing)
+    {
         if (backing is null || !_persistentBufferCache.ContainsKey(backing)) return;
         lock (_persistentBufferLock)
         {
-            if (_persistentBufferCache.TryRemove(backing, out var entry)) entry.Dispose();
+            // Freed, not pooled: nothing rents this size again, so a pooled copy would hold the memory for the life of
+            // the process all the same. Safe with work still queued on it: OpenCL defers the free until the commands
+            // on it complete, CUDA and HIP synchronize the free, and Vulkan waits on every dispatch outside a batch
+            // (a weight is never made resident inside one).
+            if (_persistentBufferCache.TryRemove(backing, out var entry))
+            {
+                if (entry.Buffer is IPoolableGpuBuffer poolable) poolable.Release();
+                else entry.Dispose();
+            }
             _tensorVersions.TryRemove(backing, out _);
             _persistentWeightHostVersion.TryRemove(backing, out _);
         }
