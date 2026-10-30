@@ -18906,12 +18906,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         {
             var handles = _threadCublas.Values;
             lock (CaptureGateFor(_cudaContext))
-                foreach (var tc in handles)
-                    if (tc is not null && tc.Handle != IntPtr.Zero)
-                    {
-                        CuBlasNative.cublasDestroy(tc.Handle);
-                        tc.Handle = IntPtr.Zero;
-                    }
+                foreach (var tc in handles.Where(tc => tc is not null && tc.Handle != IntPtr.Zero))
+                {
+                    CuBlasNative.cublasDestroy(tc.Handle);
+                    tc.Handle = IntPtr.Zero;
+                }
             foreach (var tc in handles)
             {
                 if (tc is null) continue;
