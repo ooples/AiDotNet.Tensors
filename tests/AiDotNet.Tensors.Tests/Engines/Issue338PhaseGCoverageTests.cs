@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Issue #338 Phase G test coverage — exercises the new infrastructure
 // (StepTiming, BackwardParallel, BlasProvider MKL/BF16/batched paths,
 // CompiledTrainingPlan analytic backwards, slice-prefix fusion, etc.)

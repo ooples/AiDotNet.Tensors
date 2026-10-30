@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 #if NET5_0_OR_GREATER
 // These entry points and their block kernels are AVX2/FMA intrinsics, which SimdGemm declares
 // inside #if NET5_0_OR_GREATER.

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Integration tests for the transformer-FFN matmul fixes (issues
 // #242/#243/#244). These are correctness tests that also exercise the
 // code paths where the perf fixes live — a correctness regression here

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Issue #318 — diagnostic + integration tests for the Clone-after-
 // train forward-output drift on multi-layer models.
 //

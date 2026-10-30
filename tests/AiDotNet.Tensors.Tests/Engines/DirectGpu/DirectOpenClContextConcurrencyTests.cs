@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Regression coverage for issue #414 — per-thread cl_command_queue + the
 // driver-safety lock around clCreateCommandQueue.
 //

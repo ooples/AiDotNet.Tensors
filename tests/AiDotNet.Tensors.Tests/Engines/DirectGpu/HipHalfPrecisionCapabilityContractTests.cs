@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Hardware-independent capability-contract tests for HIP half-precision GEMM.
 
 using System;

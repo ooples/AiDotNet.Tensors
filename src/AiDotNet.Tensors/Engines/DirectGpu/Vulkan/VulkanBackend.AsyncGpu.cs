@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // IAsyncGpuBackend over this backend's single in-order queue (#1142).
 using AiDotNet.Tensors.Engines.Gpu;
 

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // OpenCL C kernels for the torch.linalg decomposition surface.
 // One work-group per batch slice; work-items cooperate via barriers + local memory.
 

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Phase C of issue #225: verify that each GPU source-emitter
 // produces syntactically valid source containing the expected
 // identifiers and op expressions. Backend hardware suites separately validate

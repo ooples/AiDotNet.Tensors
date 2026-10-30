@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 //
 // The 512-bit counterpart of the direct 6x16 kernel: a 6x32 output tile in twelve Vector512 accumulators. On a core
 // with two 512-bit FMA ports (Xeon Sapphire/Emerald/Granite Rapids) it does twice the 256-bit kernel's FLOPs per cycle;

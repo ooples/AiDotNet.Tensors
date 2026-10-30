@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // FftConv validation: output must match direct convolution to floating-point
 // roundoff. Tests cover 1D, 2D single-channel, and 2D multi-channel paths.
 

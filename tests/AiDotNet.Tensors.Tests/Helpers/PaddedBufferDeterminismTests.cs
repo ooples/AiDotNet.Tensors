@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Issue #311 regression — ensure pooled-padded tensors and freshly-
 // allocated tensors with identical logical content produce bit-
 // identical forward output. The original symptom was a 3-4% drift in

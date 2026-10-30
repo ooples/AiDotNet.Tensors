@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Issue #327 — synthetic Transformer Train regression gate. Locks in
 // the post-Phase-3 wall-clock floor so future PRs can't silently
 // regress the Train path. Skipped on hosts without 16+ logical cores

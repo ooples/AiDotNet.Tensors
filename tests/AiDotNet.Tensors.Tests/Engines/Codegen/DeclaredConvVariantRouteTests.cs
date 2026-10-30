@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Depthwise and transposed convolutions on declared programs (#890 phase 4b): each of the six operators as a grouped
 // or adjoint reading of the dense convolution's spec, under every schedule its slot registers, and each public entry
 // point end to end through its tuned slot (whose reference is the hand-written kernel). The bar is a direct fp64

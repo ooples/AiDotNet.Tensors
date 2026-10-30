@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // PTX-vs-CUDA-vs-CPU parity scaffold. Reflection inventory of the hand-emitted
 // direct-PTX kernel family, so parity coverage auto-syncs: add a Ptx*Kernel and
 // the coverage audit immediately requires a parity decision for it.

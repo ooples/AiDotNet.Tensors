@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // cuDNN as candidates of the tuned convolution slots: with cuDNN on, each pass's vendor slot measures every cuDNN
 // algorithm and backend route against the established path, and the entry point runs the winner.
 

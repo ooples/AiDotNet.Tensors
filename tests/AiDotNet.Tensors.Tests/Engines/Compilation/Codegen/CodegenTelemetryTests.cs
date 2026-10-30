@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Phase G of issue #225: codegen observability — per-pass timing,
 // emit outcomes, autotune cache stats, composite snapshot.
 

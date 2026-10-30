@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Correctness tests for the OpenCL weight-only fused dequant-GEMM (P0): the quantized
 // LLM-serving decode hot path. Validates OpenClBackend.DequantGemmInt8 against a CPU
 // reference implementing the EXACT contract of FusedDequantMatmulKernels.Q8MatMul.

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Shared-memory staging for the tensor-core GEMM.
 //
 // The naive lowering gives one warp one 16x16 tile and lets it stream its own operand bands
