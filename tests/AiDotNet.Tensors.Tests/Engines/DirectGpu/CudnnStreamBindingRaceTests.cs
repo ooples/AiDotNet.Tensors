@@ -95,13 +95,21 @@ public sealed class CudnnStreamBindingRaceTests : IClassFixture<DirectGpuTensorE
                     gpu.ReduceSum(gpu.TensorMultiply(o, o), new[] { 0, 1, 2, 3 }, keepDims: false);
                     plan = scope.CompileTraining(new[] { w0, w1 });
                 }
+                // No optimizer: the weights stay put, so every step - eager first, then captured and replayed - must
+                // produce the first step's gradients. A convolution that ran on the wrong stream would not.
                 using (plan)
+                {
+                    float[]? first = null;
                     for (int st = 0; st < 4; st++)
                     {
                         plan.Step();
-                        foreach (var g in plan.Gradients[1].ToArray())
-                            Assert.False(float.IsNaN(g) || float.IsInfinity(g), $"round {round} step {st}: non-finite gradient");
+                        var g = plan.Gradients[1].ToArray();
+                        first ??= g;
+                        for (int i = 0; i < g.Length; i++)
+                            Assert.True(Math.Abs(g[i] - first[i]) <= 1e-4f * Math.Max(1f, Math.Abs(first[i])),
+                                $"round {round} step {st}: dW1[{i}] {g[i]} != step 0's {first[i]}");
                     }
+                }
             }
         }
         finally
