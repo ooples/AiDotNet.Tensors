@@ -78,6 +78,53 @@ public sealed class CompiledRecurrentCellTests
         AssertCompiledMatchesEager(input, Forward, $"activation {activation}");
     }
 
+    /// <summary>
+    /// An in-place update of a step's output (TensorBroadcastAddInPlace of an attention's output bias) while a dead
+    /// buffer of the same shape sits in the memory planner's pool: the planner rebound the in-place target onto the
+    /// donor between the producing write and the update, so the update read the donor's stale values. Found by the
+    /// AiDotNet model sweep (BranchformerBlock: attention + cgMLP branches).
+    /// </summary>
+    [Fact]
+    public void InPlaceUpdateOfAStepOutput_KeepsTheProducedValues()
+    {
+        var engine = new CpuEngine();
+        var bias = Random(new[] { 8 }, 2);
+        var input = Random(new[] { 4, 8 }, 1);
+        Tensor<float> Forward(Tensor<float> x)
+        {
+            var p = engine.TensorMultiplyScalar(x, 2f);
+            var a = engine.Tanh(x);
+            var r = engine.TensorMultiply(p, p);   // p's last use: a dead [4, 8] buffer in the pool
+            engine.TensorBroadcastAddInPlace(a, bias);
+            return engine.TensorAdd(a, r);
+        }
+        AssertCompiledMatchesEager(input, Forward, "in-place");
+    }
+
+    [Theory]
+    [InlineData(1024)]
+    [InlineData(3072)]
+    public void AttentionWithInPlaceBias_BesideADepthwiseBranch_CompiledMatchesEager(int hidden)
+    {
+        var engine = new CpuEngine();
+        const int d = 512, seq = 64;
+        int half = hidden / 2;
+        var wq = Random(new[] { d, d }, 1); var wk = Random(new[] { d, d }, 2); var wv = Random(new[] { d, d }, 3); var wo = Random(new[] { d, d }, 4);
+        var we = Random(new[] { d, hidden }, 5);
+        var ob = Random(new[] { d }, 8);
+        var kernel = Random(new[] { half, 1, 31 }, 6);
+        var input = Random(new[] { 1, seq, d }, 7);
+        Tensor<float> Forward(Tensor<float> x)
+        {
+            var att = engine.MultiHeadAttentionForward(x, wq, wk, wv, wo, 8);
+            engine.TensorBroadcastAddInPlace(att, ob);
+            var e = engine.Reshape(engine.TensorMatMul(engine.Reshape(x, new[] { seq, d }), we), new[] { 1, seq, hidden });
+            var conv = engine.DepthwiseConv1D(engine.TensorPermute(engine.TensorNarrow(e, 2, half, half), new[] { 0, 2, 1 }), kernel, 1, 15);
+            return engine.TensorAdd(att, engine.TensorNarrow(engine.TensorPermute(conv, new[] { 0, 2, 1 }), 2, 0, d));
+        }
+        AssertCompiledMatchesEager(input, Forward, $"hidden {hidden}");
+    }
+
     [SkippableTheory]
     [InlineData(0)]
     [InlineData(1)]

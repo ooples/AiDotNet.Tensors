@@ -102,6 +102,32 @@ internal sealed class MemoryPlanningPass : ICpuOptimizationPass
         // just ended (lastUse == current step). If so, add it to the dead
         // pool keyed by (element count, rank). When a future step needs an
         // output buffer, check the pool for a compatible dead tensor.
+        // Lifetimes are per tensor, so a tensor whose storage another plan tensor shares (a view, a reshape) is left
+        // alone: donating it would hand a live alias's memory to a later step, and rebinding it would cut it off from
+        // its alias. An in-place step's output is its target, a tensor an earlier step already wrote: rebinding it
+        // there moved the target onto a donor's storage between the write and the in-place update, which then read
+        // the donor's stale values (measured: MultiHeadAttentionForward + TensorBroadcastAddInPlace of its bias).
+        var storageUsers = new Dictionary<object, Tensor<T>?>(ReferenceEqualityComparer<object>.Instance);
+        void NoteStorage(Tensor<T> t)
+        {
+            object s = t._storage;
+            if (!storageUsers.TryGetValue(s, out var only)) storageUsers[s] = t;
+            else if (only is not null && !ReferenceEquals(only, t)) storageUsers[s] = null;
+        }
+        for (int i = 0; i < steps.Length; i++)
+        {
+            NoteStorage(steps[i].OutputBuffer);
+            for (int j = 0; j < steps[i].Inputs.Length; j++) NoteStorage(steps[i].Inputs[j]);
+        }
+        // Decided before any rebind (a rebind replaces _storage).
+        var ownsStorage = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        foreach (var only in storageUsers.Values)
+            if (only is not null) ownsStorage.Add(only);
+        bool OwnsItsStorage(Tensor<T> t) => ownsStorage.Contains(t);
+        var written = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        // A tensor read twice by its last step (Multiply(g, g)) is donated once: twice put two later outputs on one buffer.
+        var donated = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+
         var deadPool = new Dictionary<long, List<Tensor<T>>>();
         var rebindMap = new Dictionary<Tensor<T>, Tensor<T>>(
             ReferenceEqualityComparer<Tensor<T>>.Instance);
@@ -112,9 +138,10 @@ internal sealed class MemoryPlanningPass : ICpuOptimizationPass
             var step = steps[i];
             var output = step.OutputBuffer;
 
-            // Try to reuse a dead buffer for this step's output
+            // Try to reuse a dead buffer for this step's output (only where the step first writes it)
             long key = BufferKey(output);
-            if (deadPool.TryGetValue(key, out var pool) && pool.Count > 0)
+            bool firstWrite = written.Add(output);
+            if (firstWrite && OwnsItsStorage(output) && deadPool.TryGetValue(key, out var pool) && pool.Count > 0)
             {
                 var donor = pool[pool.Count - 1];
                 pool.RemoveAt(pool.Count - 1);
@@ -143,7 +170,7 @@ internal sealed class MemoryPlanningPass : ICpuOptimizationPass
                 // repeat Execute() calls. Only intermediate activations
                 // are pool-eligible.
                 if (!producedHere.Contains(inp)) continue;
-                if (lastUse.TryGetValue(inp, out int lu) && lu == i)
+                if (lastUse.TryGetValue(inp, out int lu) && lu == i && OwnsItsStorage(inp) && donated.Add(inp))
                 {
                     // This input's lifetime just ended — add to dead pool
                     long k = BufferKey(inp);
@@ -158,7 +185,7 @@ internal sealed class MemoryPlanningPass : ICpuOptimizationPass
 
             // Also check if this step's output dies immediately (consumed
             // only by the next step, which is common for element-wise chains)
-            if (lastUse.TryGetValue(output, out int outLu) && outLu == i)
+            if (lastUse.TryGetValue(output, out int outLu) && outLu == i && OwnsItsStorage(output) && donated.Add(output))
             {
                 long k = BufferKey(output);
                 if (!deadPool.TryGetValue(k, out var p))
