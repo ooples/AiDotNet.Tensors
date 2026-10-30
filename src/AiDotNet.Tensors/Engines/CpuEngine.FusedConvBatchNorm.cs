@@ -80,7 +80,8 @@ public partial class CpuEngine
 
         internal static (Tensor<T> Kernel, Tensor<T> Bias) Get(Tensor<T> kernel, Tensor<T>? bias, Tensor<T> gamma,
             Tensor<T> beta, Tensor<T> mean, Tensor<T> variance, double epsilon,
-            Func<Tensor<T>, Tensor<T>?, Tensor<T>, Tensor<T>, Tensor<T>, Tensor<T>, double, (Tensor<T>, Tensor<T>)> fold)
+            Func<Tensor<T>, Tensor<T>?, Tensor<T>, Tensor<T>, Tensor<T>, Tensor<T>, double, (Tensor<T>, Tensor<T>)> fold,
+            Action<Tensor<T>>? releaseReplaced = null)
         {
             var versions = VersionsOf(kernel, bias, gamma, beta, mean, variance);
             lock (s_entries)
@@ -102,6 +103,13 @@ public partial class CpuEngine
                     Bias = bias, Gamma = gamma, Beta = beta, Mean = mean, Variance = variance,
                     Versions = versions, Epsilon = epsilon, Kernel = foldedKernel, FoldedBias = foldedBias,
                 };
+                // A fold made while the weights are training is replaced at every evaluation; its folded tensors are
+                // the cache's own, so the engine frees their device memory now rather than at their finalizers.
+                if (entry is not null && releaseReplaced is not null)
+                {
+                    releaseReplaced(entry.Kernel);
+                    releaseReplaced(entry.FoldedBias);
+                }
                 s_entries.Remove(kernel);
                 s_entries.Add(kernel, created);
                 return (foldedKernel, foldedBias);
