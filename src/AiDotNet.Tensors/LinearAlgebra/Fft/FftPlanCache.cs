@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Per-size plan cache: twiddle-step factors for radix-2 and chirp sequences for
 // Bluestein. Materialized once per (n, inverse) key, then reused on every
 // subsequent Transform1D call. Thread-safe via ConcurrentDictionary.

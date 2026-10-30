@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Every bound on generated code must announce itself.
 //
 // Three bugs in this project, hours each, came from constants written as generous

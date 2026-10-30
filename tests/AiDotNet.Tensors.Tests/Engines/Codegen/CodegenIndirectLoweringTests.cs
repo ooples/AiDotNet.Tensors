@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The PTX lowering of indirect indices (#1441), pinned where the device first disagreed with the interpreter: a shift
 // is a value (never range-checked), a tiled axis read only through an indirect index still gives each lane its own load
 // and range test, a vector load's guard reaches the term's identity select, and a rejected entry of a multi-operand

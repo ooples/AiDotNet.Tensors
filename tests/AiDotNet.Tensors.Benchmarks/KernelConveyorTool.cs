@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The conveyor: three stages every kernel passes through, in the same order, with
 // the same gates, driven by a loop over CodegenKernelCatalog rather than by
 // per-kernel code.

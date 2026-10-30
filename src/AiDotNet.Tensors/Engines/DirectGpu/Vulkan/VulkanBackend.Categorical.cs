@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Vulkan launcher for categorical sampling. Dispatches the GLSL twin of the OpenCL
 // categorical_sample kernel through the same GlslUnaryOp path the other softmax-family ops use.
 using System;

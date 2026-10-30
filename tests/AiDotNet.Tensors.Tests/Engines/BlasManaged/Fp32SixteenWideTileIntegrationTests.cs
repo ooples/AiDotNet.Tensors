@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // #409 S.3 integration: verify the 6×16 FP32 tile wired into the live PackBoth path
 // in FAST mode (a) produces correct results end-to-end through BlasManaged.Gemm and
 // (b) is at least as fast as the deterministic 8×8 tile at a wide-N compute-bound

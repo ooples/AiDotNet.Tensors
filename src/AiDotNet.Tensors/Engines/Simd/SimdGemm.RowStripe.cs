@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 //
 // Unpacked small-row GEMM with a fused bias + ReLU epilogue (#436).
 //

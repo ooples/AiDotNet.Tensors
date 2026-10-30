@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Vulkan host-array CSR·dense SpMM + SDDMM dispatch — mirrors OpenClSparseBackend
 // so any Vulkan-capable device (desktop GPU, mobile GPU via cross-vendor Vulkan,
 // Apple via MoltenVK) accelerates SparseOps.SpMM / SparseOps.SDDMM and, through

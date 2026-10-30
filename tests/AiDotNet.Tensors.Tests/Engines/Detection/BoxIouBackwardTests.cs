@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Numeric gradient check for the IoU-family backward pass (Issue #217).
 // Finite-difference each box coordinate on both input tensors and confirm
 // the analytic backward returns within 1e-3 of the numeric Jacobian

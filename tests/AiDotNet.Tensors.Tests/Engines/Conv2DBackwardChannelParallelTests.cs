@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // #403 small-batch channel-parallel conv-backward contract. At batch=1 (the CNN
 // model-family training shape [1,3,224,224]) Conv2DBackwardInputInto /
 // Conv2DBackwardKernelInto can no longer parallelize over the batch axis, so the

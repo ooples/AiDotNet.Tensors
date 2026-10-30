@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Roslyn incremental source generator (#775): emits one discoverable [SkippableFact] per
 // tensor-returning IEngine op, each calling the runtime op-parity harness. The generated tests
 // auto-sync with IEngine — add an op and it gets a parity test slot for free; ops without a

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Vulkan GLSL FP16-NATIVE op kernels (Tensors #558): GELU / ReLU / residual-add over half-stored
 // activations. Each kernel reads its activation DIRECTLY from a packed-half buffer (two halves per
 // 32-bit word — the layout VulkanBackend.ConvertToFp16 produces), up-casts to FP32 in-register with the

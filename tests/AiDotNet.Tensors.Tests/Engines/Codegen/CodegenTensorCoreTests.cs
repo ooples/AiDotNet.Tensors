@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The tensor-core lowering, and -- more importantly -- what it refuses.
 //
 // The emitter emitted no wmma at all, which is why "dense GEMM at large K" is recorded in

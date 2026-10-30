@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // OpenCL launcher shims for the fused ANN kernels (IVF / PQ / IVFPQ / HNSW).
 // Mirrors OpenClBackend.Detection.cs's pattern: each method pulls the compiled
 // DirectOpenClKernel from _kernelCache and dispatches via kernel.Execute1D with

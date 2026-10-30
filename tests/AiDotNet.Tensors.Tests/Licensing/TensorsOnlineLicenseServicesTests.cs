@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Tests for the auto-offline client glue (TensorsOnlineLicenseServices): sibling-URL derivation, the shared
 // per-key offline-token cache filename scheme, cached-token read → verified EntitlementResult, and CRL disk
 // round-trip. All disk I/O is redirected to a temp dir via OverrideCacheDirForTesting so the real user

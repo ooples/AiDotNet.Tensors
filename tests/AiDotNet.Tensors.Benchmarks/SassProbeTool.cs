@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // --sass-probe: the own SASS backend's passes on the device (#1442). For every catalog kernel the affine emitter
 // lowers (data-dependent indexing excepted), the PTX path's module and the module rewritten by the backend run on
 // the same inputs; their outputs must be bit-identical (the passes keep every instruction's arithmetic), and their

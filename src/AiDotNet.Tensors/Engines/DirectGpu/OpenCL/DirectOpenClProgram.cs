@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Pure P/Invoke OpenCL program - no managed GPU runtime dependency.
 // Works on ALL .NET versions including .NET Framework 4.6.2.
 

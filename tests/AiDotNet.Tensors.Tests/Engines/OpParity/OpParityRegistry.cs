@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CPU-vs-GPU op-parity scaffold (Tensors #775). OpInfo registry.
 // Phase 1 seeds the ViT-path ops implicated by #775 (patch-embed conv, matmul, softmax,
 // LayerNorm, GELU/Sigmoid) to localize the CPU/GPU divergence; expands to the full IEngine

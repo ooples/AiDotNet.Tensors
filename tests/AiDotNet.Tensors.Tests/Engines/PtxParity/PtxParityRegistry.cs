@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // PTX-vs-CUDA-vs-CPU parity scaffold. Per-kernel coverage decisions.
 #if NETCOREAPP
 

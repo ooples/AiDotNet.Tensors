@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Tests for ForwardAdRegistry — issue #214 acceptance gap.
 
 #nullable disable

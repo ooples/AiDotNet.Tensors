@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 //
 // Float-native, batch-vectorized radix-2 Cooley-Tukey FFT.
 //
