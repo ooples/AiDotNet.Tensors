@@ -1180,6 +1180,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                         $"[AiDotNet.Tensors][OpenCL] Parity-211 linalg kernels failed to compile; " +
                         $"routing to CPU. Reason: {ex.Message}");
                 }
+
+                // The modules an op used to compile on its first call are built here, so every kernel this backend
+                // looks up is in the cache once it is constructed (KernelLookupIntegrityTests). Each records itself as
+                // unavailable when it fails to compile, and its ops then decline to the general path.
+                SumAroundKeptReady();
+                ConvGemmEpilogueReady();
+                ShortAttentionReady();
+                StatisticConversionsReady();
             }
             catch (Exception ex)
             {
