@@ -3562,6 +3562,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var C = AllocateBuffer(M * N);
             try
             {
+                // Batch 1: the split-K GEMV applies the epilogue in its reduce, one launch fewer and no second pass.
+                if (TryExecuteRowVectorGemv(A, B, C, M, N, K, 1f, 0f, bias, mode, alpha))
+                    return C;
                 Gemm(A, B, C, M, N, K);
                 var kernel = _kernelCache["bias_activation"];
                 kernel.SetArg(0, BufferHandle(C));
@@ -6121,11 +6124,16 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         // C[1 x N] = alpha * A[1 x K] * B[K x N] through the split-K GEMV kernels. VGG-16's 25088 x 4096 classifier
         // took 4.7 ms through the tiled GEMM; its weights are 411 MB, so the bandwidth floor is under 2 ms. False (nothing
         // launched) unless M is 1, beta is 0, N is a multiple of 4 (vload4 alignment) and the kernels compiled.
-        private bool TryExecuteRowVectorGemv(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha, float beta)
+        // With epilogueBias, C = act(A * B + bias) in the reduce (alpha is then 1): epilogueMode is bias_activation's, and
+        // only 0, 1 and 6 are taken (see gemv_rowvec_reduce_epilogue).
+        private bool TryExecuteRowVectorGemv(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha, float beta,
+            IGpuBuffer? epilogueBias = null, int epilogueMode = 0, float epilogueSlope = 0f)
         {
+            string reduceName = epilogueBias is null ? Kernels.GemvKernels.Reduce : Kernels.GemvKernels.ReduceEpilogue;
             if (M != 1 || beta != 0f || N < 4 || (N & 3) != 0 || K < 256
+                || (epilogueBias is not null && (alpha != 1f || epilogueMode is not (0 or 1 or 6)))
                 || !_kernelCache.TryGetValue(Kernels.GemvKernels.Partial, out var partialKernel)
-                || !_kernelCache.TryGetValue(Kernels.GemvKernels.Reduce, out var reduceKernel))
+                || !_kernelCache.TryGetValue(reduceName, out var reduceKernel))
                 return false;
 
             // About 64K work items in flight: enough to cover the device's memory latency at any N.
@@ -6143,7 +6151,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             arg = 0;
             reduceKernel.SetArg(arg++, BufferHandle(partial)); reduceKernel.SetArg(arg++, BufferHandle(C));
-            reduceKernel.SetArg(arg++, N); reduceKernel.SetArg(arg++, splits); reduceKernel.SetArg(arg++, alpha);
+            reduceKernel.SetArg(arg++, N); reduceKernel.SetArg(arg++, splits);
+            if (epilogueBias is null)
+            {
+                reduceKernel.SetArg(arg, alpha);
+            }
+            else
+            {
+                reduceKernel.SetArg(arg++, BufferHandle(epilogueBias));
+                reduceKernel.SetArg(arg++, epilogueMode);
+                reduceKernel.SetArg(arg, epilogueSlope);
+            }
             reduceKernel.Execute1D(RoundUpToMultiple(N, 64), 64);
             return true;
         }

@@ -99,7 +99,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         // A bias buffer for the epilogue argument; the output stands in when there is none (the kernel never reads it).
         private static IntPtr ConvEpilogueBias(in TunedConv2DArgs a) => BufferHandle(a.Bias ?? a.Output);
 
-        private void ConvEpiloguePasses(in TunedConv2DArgs a) => ConvEpilogue.RunPasses(this, a);
+        private void ConvEpiloguePasses(in TunedConv2DArgs a)
+        {
+            if (!TryConvNchwEpilogue(a)) ConvEpilogue.RunPasses(this, a);
+        }
 
         private void Conv2DGeneric(in TunedConv2DArgs a)
             => Conv2DGenericCore(a.Input, a.Kernel, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth, a.OutChannels,
