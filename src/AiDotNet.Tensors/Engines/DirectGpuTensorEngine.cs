@@ -7098,7 +7098,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             OwnedBuffer biasBuffer = default;
             try
             {
-                var bContiguous = b.IsContiguous ? b : (Tensor<T>)b.Contiguous();
+                var bContiguous = b.IsContiguous ? b : b.Contiguous();
                 biasBuffer = GetOrAllocateBuffer(beBias, bContiguous);
                 beBias.BiasAdd(aResident, biasBuffer.Buffer, aResident, biasRows, biasCols);
                 a.IncrementVersion();

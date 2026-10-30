@@ -8595,7 +8595,7 @@ KERNEL VARIANTS (A/B testing):
             kernel.SetArg(arg++, channels);
             kernel.SetArg(arg++, spatialSize);
             kernel.SetArg(arg++, epsilon);
-            kernel.SetArg(arg++, activation);   // 0 none, 1 ReLU, 2 ReLU6
+            kernel.SetArg(arg, activation);   // 0 none, 1 ReLU, 2 ReLU6
             // The largest power of two within 256 and the device work-group limit.
             int local = (int)Math.Min(256UL, Math.Max(1UL, _maxWorkGroupSize));
             local = 1 << (int)Math.Floor(Math.Log(local, 2));
