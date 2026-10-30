@@ -13,9 +13,10 @@ name: GPU (CUDA, self-hosted)
 # installs the .NET SDK and cuDNN into its workspace), with the labels `self-hosted, gpu, cuda`, then set the repository variable
 # CUDA_RUNNER_ENABLED=true. Until the variable is set every job is skipped, so nothing waits for a runner that does
 # not exist. Pull requests from forks never run here: a self-hosted runner must not execute untrusted code.
-# One runner serves every pull request and a run takes over an hour, so the lane skips draft pull requests, license
-# header chores (title `chore(license)...`, comment-only edits to the paths below) and any pull request labelled
-# `skip-gpu-ci`; the nightly schedule still covers main.
+# One runner serves every pull request and a run takes over an hour, so the lane skips draft pull requests and any
+# pull request labelled `skip-gpu-ci` (for a change that cannot affect the GPU, such as comment-only edits to the
+# paths below; a title rule would also skip a combined pull request that carries GPU work); the nightly schedule
+# still covers main.
 # The model families come from AiDotNet master's parity harness; the repository variable AIDOTNET_HARNESS_REF points
 # the lane at another AiDotNet ref when a harness change needs testing before it merges.
 
@@ -74,7 +75,6 @@ jobs:
           (github.event_name != 'pull_request' ||
            (github.event.pull_request.head.repo.full_name == github.repository &&
             !github.event.pull_request.draft &&
-            !startsWith(github.event.pull_request.title, 'chore(license)') &&
             !contains(github.event.pull_request.labels.*.name, 'skip-gpu-ci'))) }}
     runs-on: [self-hosted, gpu, cuda]
     timeout-minutes: 150
