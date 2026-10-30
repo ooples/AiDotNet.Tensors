@@ -9653,9 +9653,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // A second writer (an in-place op) extends the lifetime past this model.
             if (producers.ContainsKey(step.OutputBuffer)) unsafeTensors.Add(step.OutputBuffer);
             else producers[step.OutputBuffer] = i;
-            foreach (var input in step.Inputs)
+            foreach (var input in step.Inputs.Where(x => x is not null))
             {
-                if (input is null) continue;
                 Count(input);
                 if (ReferenceEquals(input, step.OutputBuffer)) unsafeTensors.Add(input);
                 if (!readers.TryGetValue(input, out var list)) readers[input] = list = new List<int>();
