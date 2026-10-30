@@ -2,6 +2,7 @@
 // IGpuBuffer wrapper for Vulkan storage and staging buffer pairs.
 
 using System;
+using AiDotNet.Tensors.Engines.DevicePrimitives;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
@@ -15,6 +16,11 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     internal readonly VulkanBuffer Staging;
     private int _disposed;
     private readonly VulkanGpuBuffer? _viewParent;
+    // What GpuMemoryStats counts for the device-local storage buffer (the staging buffer is host-visible memory).
+    private DeviceMemoryHold _memory;
+
+    /// <summary>The device's memory counters. Every Vulkan backend shares one device (VulkanDevice.Instance).</summary>
+    internal static readonly DeviceMemoryAccount Account = DeviceMemoryAccount.For("vulkan", 0);
 
     // Creating and destroying a storage + staging pair costs about 0.7 ms for a small buffer and several
     // milliseconds for a large one, many times the ~80 microseconds a dispatch takes, so a released buffer is kept
@@ -55,6 +61,7 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     /// <inheritdoc/>
     void IPoolableGpuBuffer.Release()
     {
+        _memory.OnFreed();
         Storage.Dispose();
         Staging.Dispose();
     }
@@ -137,12 +144,12 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
         // paid a driver allocation per call). A new object is young, so the next young collection returns it.
         if (PoolingEnabled && Pool.TryRent(size, out var pooled) &&
             pooled is not null)
-            return new VulkanGpuBuffer(pooled.Storage, pooled.Staging, size);
+            return FromParked(pooled, size);
         if (PoolingEnabled && DeviceMemoryReclaim.CollectOnPoolMiss())
         {
             PendingFrees.Drain();
             if (Pool.TryRent(size, out pooled) && pooled is not null)
-                return new VulkanGpuBuffer(pooled.Storage, pooled.Staging, size);
+                return FromParked(pooled, size);
         }
         System.Threading.Interlocked.Increment(ref s_driverAllocations);
         // Out of memory: the parked buffers are the first thing to give back.
@@ -154,6 +161,15 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
                 PendingFrees.Drain();
                 Pool.DrainAll();
             });
+    }
+
+    // A rented allocation under its new object, which takes over the parked object's reservation.
+    private static VulkanGpuBuffer FromParked(VulkanGpuBuffer parked, int size)
+    {
+        var rented = new VulkanGpuBuffer(parked.Storage, parked.Staging, size);
+        rented._memory = parked._memory.TransferToLease();
+        rented._memory.OnRented();
+        return rented;
     }
 
     private static VulkanGpuBuffer CreateCore(int size)
@@ -173,7 +189,9 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
                 throw new InvalidOperationException("Failed to allocate Vulkan GPU buffer.");
             }
 
-            return new VulkanGpuBuffer(storage, staging, size);
+            var created = new VulkanGpuBuffer(storage, staging, size);
+            created._memory.OnAllocated(Account, (long)size * sizeof(float));
+            return created;
         }
         catch
         {
@@ -242,12 +260,14 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
 
     private static void ReleaseNow(VulkanGpuBuffer buffer)
     {
+        buffer._memory.OnReturned();
         if (PoolingEnabled)
         {
             EnsurePoolBudget();
             Pool.Return(buffer); // releases it when the pool is full
             return;
         }
+        buffer._memory.OnFreed();
         buffer.Storage.Dispose();
         buffer.Staging.Dispose();
     }
@@ -259,11 +279,12 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
         var storage = Storage;
         var staging = Staging;
         int size = Size;
+        var memory = _memory.TransferToLease();
         // This object is gone; its allocation goes back to the pool under a new wrapper, on the next allocation's
         // thread.
         PendingFrees.Enqueue(() =>
         {
-            var parked = new VulkanGpuBuffer(storage, staging, size);
+            var parked = new VulkanGpuBuffer(storage, staging, size) { _memory = memory };
             System.Threading.Volatile.Write(ref parked._disposed, 1);
             GC.SuppressFinalize(parked);
             ReleaseWhenIdle(parked);
