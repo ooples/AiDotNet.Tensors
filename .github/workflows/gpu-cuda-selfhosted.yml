@@ -82,7 +82,7 @@ jobs:
           - check: cuda-sm75
             arch: sm75
             artifact: gpu-cuda-results-sm75
-            arch-skips: '|SM86|GA10x'
+            arch-skips: '|\bSM ?86\b|GA10[0-9x]'
             model-families: false
     name: ${{ matrix.check }}
     runs-on: [self-hosted, gpu, cuda, '${{ matrix.arch }}']
