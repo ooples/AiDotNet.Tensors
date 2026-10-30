@@ -309,6 +309,19 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _cachedGradArrays = null;   // rebound, and the first eager step then zeroes every gradient
     }
 
+    /// <summary>Gives pooled gradient <paramref name="index"/> an array of its own, leaving the other tenants of its array
+    /// pooled: removing a tenant never makes two remaining lifetimes overlap.</summary>
+    private void UnpoolGradient(int index)
+    {
+        if (_pooledGradients is not { } pooled || !pooled[index]) return;
+        var grad = _preAllocatedGrads[index];
+        DetachDeviceBinding(grad);
+        using (var own = new Tensor<T>((int[])grad._shape.Clone()))
+            grad.RebindStorageFrom(own);
+        pooled[index] = false;
+        _cachedGradArrays = null;   // rebound
+    }
+
     // Forward outputs sharing arrays by forward liveness (PoolForwardOnlyOutputs).
     private int _pooledForwardOutputs;
 
@@ -3882,9 +3895,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // An in-place step's output is persistent state it updates (a BatchNorm running statistic), not a
                     // recomputed activation: its device buffer holds the only current value, so it stays bound.
                     if (_forwardSteps != null)
-                        foreach (var step in _forwardSteps)
-                            if (!ReferenceEquals(step.OutputBuffer, _lossGradDest) && !IsInPlaceState(step))
-                                DetachDeviceBinding(step.OutputBuffer);
+                        foreach (var step in _forwardSteps.Where(s => !ReferenceEquals(s.OutputBuffer, _lossGradDest) && !IsInPlaceState(s)))
+                            DetachDeviceBinding(step.OutputBuffer);
                     gte.EvictActivationsCreatedAfter(snapshot, BuildStepEvictionProtectSet(), materializePending: false);
                     gte.ReclaimGpuMemoryUnderPressure();
                     RearmUnreadLossReadback();
@@ -4443,6 +4455,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             _unwrittenGradIndices = unwritten.ToArray();
             if (pooledGrads is not null)
             {
+                // A pooled gradient no backward writes shares its buffer with tenants that do, so keeping it pooled means
+                // restoring its zeros at every step: one memset node per such gradient in the captured graph. Its own
+                // buffer is zeroed once and stays zero (the held-zero record), so it leaves the pool instead.
+                foreach (int i in unwritten)
+                    if (pooledGrads[i]) UnpoolGradient(i);
                 var zeroAtStart = new bool[pooledGrads.Length];
                 foreach (int i in unwritten) zeroAtStart[i] = pooledGrads[i];
                 _pooledGradZeroAtStart = zeroAtStart;
@@ -5052,8 +5069,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         AddActivationCacheKeys(protect, _lossGradSeed);
         // State an in-place step updates on the device lives across steps.
         if (_forwardSteps != null)
-            foreach (var step in _forwardSteps)
-                if (IsInPlaceState(step)) AddActivationCacheKeys(protect, step.OutputBuffer);
+            foreach (var step in _forwardSteps.Where(s => IsInPlaceState(s))) AddActivationCacheKeys(protect, step.OutputBuffer);
         return protect;
     }
 
