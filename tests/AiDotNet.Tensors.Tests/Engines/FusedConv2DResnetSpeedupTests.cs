@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Issue #251 — local validation that FusedConv2D produces a measurable
 // speedup on the ResNet50 bottleneck shape. The downstream
 // ooples/AiDotNet ResNet50 ModelFamily tests run in their own repo
