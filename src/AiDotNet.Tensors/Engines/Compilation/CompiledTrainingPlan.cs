@@ -708,7 +708,26 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         foreach (var g in _gradients) DetachDeviceBinding(g);
         DetachDeviceBinding(_lossGradSeed);
         if (_forwardSteps != null)
-            foreach (var step in _forwardSteps) DetachDeviceBinding(step.OutputBuffer);
+            foreach (var step in _forwardSteps)
+            {
+                // In-place state holds its only current value on the device (earlier steps updated it there): land it on
+                // the host, which the eager step updates from here, before dropping the binding.
+                if (IsInPlaceState(step) && step.OutputBuffer.GetBackingArrayForCacheLookupUnsafe() is { } stateArray)
+                    Helpers.HostSync.TryMaterialize(stateArray);
+                DetachDeviceBinding(step.OutputBuffer);
+            }
+    }
+
+    /// <summary>
+    /// Whether <paramref name="step"/> updates its output in place (its output is one of its inputs): persistent state such
+    /// as a BatchNorm running statistic, which a resident step keeps on the device across steps, not an activation the
+    /// next step recomputes.
+    /// </summary>
+    private static bool IsInPlaceState(CompiledStep<T> step)
+    {
+        foreach (var input in step.Inputs)
+            if (ReferenceEquals(input, step.OutputBuffer)) return true;
+        return false;
     }
 
     private static void DetachDeviceBinding(Tensor<T>? t)
@@ -3787,9 +3806,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // recomputed next step, and the loss is held by its readback), so nothing is left
                     // pointing at a released buffer. Gradients, seed and loss-gradient destination own their
                     // buffers and are protected.
+                    // An in-place step's output is persistent state it updates (a BatchNorm running statistic), not a
+                    // recomputed activation: its device buffer holds the only current value, so it stays bound.
                     if (_forwardSteps != null)
                         foreach (var step in _forwardSteps)
-                            if (!ReferenceEquals(step.OutputBuffer, _lossGradDest)) DetachDeviceBinding(step.OutputBuffer);
+                            if (!ReferenceEquals(step.OutputBuffer, _lossGradDest) && !IsInPlaceState(step))
+                                DetachDeviceBinding(step.OutputBuffer);
                     gte.EvictActivationsCreatedAfter(snapshot, BuildStepEvictionProtectSet(), materializePending: false);
                     gte.ReclaimGpuMemoryUnderPressure();
                     RearmUnreadLossReadback();
@@ -4903,6 +4925,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 AddActivationCacheKeys(protect, entry);
         AddActivationCacheKeys(protect, _lossGradDest);
         AddActivationCacheKeys(protect, _lossGradSeed);
+        // State an in-place step updates on the device lives across steps.
+        if (_forwardSteps != null)
+            foreach (var step in _forwardSteps)
+                if (IsInPlaceState(step)) AddActivationCacheKeys(protect, step.OutputBuffer);
         return protect;
     }
 

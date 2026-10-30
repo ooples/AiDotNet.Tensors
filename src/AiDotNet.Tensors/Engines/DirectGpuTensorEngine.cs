@@ -1,4 +1,4 @@
-﻿﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Linq;
 using System.Runtime.CompilerServices;
@@ -8000,6 +8000,58 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // original, unmodified device buffer."
         if (tensor.GetLiveBackingArrayOrNull() is null)
             return TryRunUnaryInPlaceResident(tensor, op);
+
+        // A host-backed tensor that already has a current device buffer (a compiled plan's leaf, which the step's
+        // pre-pass binds, such as a BatchNorm running statistic) runs in place on that buffer and stays resident, as
+        // TryRunBinaryInPlace does: the host path below uploaded it again and downloaded the result with a blocking
+        // read on every call - three transfers per op, the larger part of a GPU ResNet training step.
+        if (!Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float) && tensor.IsContiguous && !IsPartialView(tensor)
+            && ResolveResidentBufferNoUpload(backend, tensor, tensor.Length, includePersistentWeightCache: false) is { } resident
+            && resident.Handle != System.IntPtr.Zero && resident.Size >= tensor.Length)
+        {
+            try
+            {
+                op(backend, resident, tensor.Length);
+                ResidentSyncCheck("UnaryInPlace");
+                tensor.IncrementVersion();
+                BindResidentBuffer(tensor, resident, backend);
+                if (!ResidentStepActive) StampInPlaceGpuBuffer(tensor, backend, resident);
+                return true;
+            }
+            catch (NotSupportedException rex)
+            {
+                GpuLaunchProbe.OnFallback("TryRunUnaryInPlace", rex);
+                /* fall through to the host path below */
+            }
+        }
+
+        // Inside a compiled resident step, a host tensor the step updates in place with no device buffer yet (state
+        // the plan does not bind as an input: a BatchNorm running statistic, written by an in-place node) moves to
+        // the device once - one upload, then it is bound as authoritative with the host download armed, as
+        // TryCreateDeviceStateTensor binds its state - so every later in-place op on it takes the resident branch
+        // above. The host path below uploaded it and downloaded the result every call: 40 blocking round trips a
+        // step on ResNet-18.
+        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float) && tensor.IsContiguous
+            && !IsPartialView(tensor) && tensor._gpuBuffer is null)
+        {
+            IGpuBuffer? state = null;
+            try
+            {
+                var host = new float[tensor.Length];
+                ((Tensor<float>)(object)tensor).AsSpanUnmarked().CopyTo(host);
+                state = backend.AllocateBuffer(host);
+                op(backend, state, tensor.Length);
+                tensor.IncrementVersion();
+                BindResidentBuffer(tensor, state, backend);
+                return true;
+            }
+            catch (NotSupportedException rex)
+            {
+                GpuLaunchProbe.OnFallback("TryRunUnaryInPlace", rex);
+                state?.Dispose();
+                /* fall through to the host path below */
+            }
+        }
 
         using var dataLease = tensor.LeaseArray();
         var data = dataLease.Array;
