@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // #775: the CpuEngine had TWO float GELU kernels — the eager path (x·sigmoid, stable) and the
 // GELUInto / compiled-training path (previously 2·sigmoid(2z)−1, which cancels near zero). They
 // silently disagreed in the ViT flat region, and only the compiled one — the path CpuEngine

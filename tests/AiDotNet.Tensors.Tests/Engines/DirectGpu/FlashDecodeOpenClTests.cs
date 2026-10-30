@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Correctness tests for the OpenCL fused decode-attention kernel (P2, FlashDecoding): single-query
 // attention over contiguous K/V, sequence split across work-items and merged by online-softmax
 // reduction. Validated against a standard-attention CPU oracle. Skips when no OpenCL device is present.

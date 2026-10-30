@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Generates type-safe tests for tensor output and graph-capture signature contracts.
 
 using System.Collections.Generic;

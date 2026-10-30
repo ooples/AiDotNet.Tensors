@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Issue #302 — Vector-Symbolic-Architecture (VSA) primitives.
 //
 // These ops are general primitives that show up in:

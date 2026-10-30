@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Convolution reaches the front end, and means the same thing it always did.
 //
 // CodegenOpKind had no convolution at all, so a convolution arrived as Opaque or not at

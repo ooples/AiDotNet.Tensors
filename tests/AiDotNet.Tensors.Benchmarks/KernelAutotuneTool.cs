@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // FE-3: measure candidate lowerings instead of modelling them.
 //
 // Every lowering decision came from a static cost model with one fitted constant, and

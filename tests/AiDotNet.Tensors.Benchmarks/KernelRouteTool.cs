@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // --kernel-routes: the production A/B of the declared-program routes (#890 phase 4). Each case calls a CUDA BACKEND
 // entry point (what DirectGpuTensorEngine calls) twice on identical inputs -- with the declared route on, and off so
 // the incumbent (the hand-written kernel, or cuDNN where the backend prefers it) serves it -- and scores BOTH against

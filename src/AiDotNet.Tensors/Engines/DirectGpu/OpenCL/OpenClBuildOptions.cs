@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Shared OpenCL build options for consistent kernel compilation.
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 {

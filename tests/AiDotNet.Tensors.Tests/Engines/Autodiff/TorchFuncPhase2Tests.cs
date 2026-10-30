@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Phase 2 of issue #214: forward-mode AD (Dual<T>, DualOps<T>, Jvp).
 //
 // Nullable disabled for the ArgumentNullException-testing scenarios

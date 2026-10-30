@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // #890 phase 3 (CUDA) and #1448-#1452 (HIP, OpenCL, Vulkan, Metal, WebGPU): the resident program measured end to end.
 //
 // A declared three-stage chain - per-column affine + ReLU, row softmax, residual add - run two ways: as a resident

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Vulkan sparse compute pipeline (CSR SpMM + SDDMM) — mirrors the runtime-verified
 // OpenCL sparse backend so all Vulkan-capable devices (mobile / cross-vendor / MoltenVK)
 // get the same tape-aware sparse autograd acceleration.

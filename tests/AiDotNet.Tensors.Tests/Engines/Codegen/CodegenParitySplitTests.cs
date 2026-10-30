@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The parity split of exact-division windows (#890 phase 4b): a strided convolution's data gradient becomes one pass per
 // output parity class, each a plain affine reduction over only the taps that class keeps, and together they compute
 // exactly what the unsplit spec computes.

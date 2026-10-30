@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // --kernel-routes --static: the static-metric half of the #890 phase-4 gate. For each routed family, at its bench
 // shape, the declared program as the backend lowers it (PtxProgramLowering, compiled by ptxas) against the reference
 // hand-written kernels it replaces (their CUDA C, compiled by NVRTC with the backend's own source preparation and

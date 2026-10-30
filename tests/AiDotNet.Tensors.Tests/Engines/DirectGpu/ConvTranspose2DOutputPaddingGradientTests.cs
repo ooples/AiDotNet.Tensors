@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // A transposed convolution's output padding adds rows and columns at the far edge of its output, and the kernel taps
 // that reach them DO write them (PyTorch's semantics, and what the forward kernel does). Its gradients must therefore
 // read those rows too: the data gradient is a convolution over the WHOLE output gradient (as on the CPU engine), and

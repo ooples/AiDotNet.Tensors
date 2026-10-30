@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // OpenCL kernels for the geometry / sampling ops added by Issue #217.
 // Mirrors CudaGeometryKernels function-for-function. Same mode-int
 // mapping: InterpolateMode/PadMode/GridSampleMode/GridSamplePadding.

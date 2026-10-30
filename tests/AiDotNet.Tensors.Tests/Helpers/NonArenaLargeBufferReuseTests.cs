@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Issue #478 — Part 2 ("safety net for non-arena callers"). The arena-active
 // per-step churn is covered by TensorArenaPersistentPoolTests; this file pins
 // the complementary contract the issue called out for callers running WITHOUT

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Phase B+ of issue #225: validate the hand-emitted AVX-512 intrinsic
 // kernel emitter. Tests early-out on hardware where AVX-512F isn't
 // available — xUnit doesn't ship a built-in conditional-fact, so we

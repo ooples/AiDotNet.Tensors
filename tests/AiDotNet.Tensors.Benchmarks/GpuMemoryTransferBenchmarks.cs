@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Benchmarks specifically for GPU memory transfer overhead analysis.
 
 using System;

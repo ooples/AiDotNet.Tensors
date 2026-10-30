@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Pre-compiled SPIR-V compute shaders for tensor operations.
 
 using System;

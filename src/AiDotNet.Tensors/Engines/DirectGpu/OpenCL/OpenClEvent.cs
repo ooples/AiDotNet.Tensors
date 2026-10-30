@@ -1,5 +1,5 @@
 using System.Diagnostics;
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // OpenCL event implementation of IGpuEvent.
 
 using System;

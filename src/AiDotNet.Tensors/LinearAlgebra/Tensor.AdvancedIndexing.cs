@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Advanced indexing on Tensor<T> — boolean-mask indexing, tensor-of-indices
 // indexing, unsqueeze/squeeze aliases, and None-axis insertion. Landed as a
 // partial class alongside Tensor.cs so the existing numeric / shape API

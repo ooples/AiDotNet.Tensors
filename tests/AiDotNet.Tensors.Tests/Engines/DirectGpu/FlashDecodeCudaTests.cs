@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Correctness tests for the CUDA fused decode-attention kernel (P2, FlashDecoding), validated against a
 // standard-attention CPU oracle. Skips without a CUDA device (this dev box is AMD); runs on NVIDIA / CI.
 

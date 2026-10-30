@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Issue #285 — DispatchProxy-based mock IDirectGpuBackend for chunker tests.
 // Implements a tiny set of methods (the ones the chunker actually calls)
 // and throws NotImplementedException for everything else. Sidesteps the

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Tests for offline RSA-signed entitlement verification + its PersistenceGuard wiring.
 
 #nullable disable

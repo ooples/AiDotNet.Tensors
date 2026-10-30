@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Strided gather and scatter as declared programs (#890 phase 4e, #1441): the interpreter against the hand-written
 // kernels' contract, and the emitted PTX against what the contract allows it to touch.
 

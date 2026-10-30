@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // IDirectGpuBackend implementation for VulkanBackend using GPU-accelerated and CPU-fallback operations.
 
 using System;

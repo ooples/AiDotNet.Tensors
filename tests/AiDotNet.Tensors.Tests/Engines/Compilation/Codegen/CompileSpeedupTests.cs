@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Compile-vs-eager speedup test for issue #225 acceptance criterion:
 // "compiled training step ≥ 20% faster than eager".
 //

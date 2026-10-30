@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The activation set, and what each one costs in accuracy.
 //
 // Before this the emitter had exactly two activations, None and ReLU, and emitted zero
