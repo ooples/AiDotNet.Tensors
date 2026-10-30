@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The head-to-head's loss check decides which modes may compete for the gated best, so it must fail closed: a mode that
 // recorded fewer losses than the reference, or one whose loss went non-finite, is not the same training run.
 
