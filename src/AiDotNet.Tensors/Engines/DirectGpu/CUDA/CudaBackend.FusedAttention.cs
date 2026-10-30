@@ -40,8 +40,21 @@ internal interface IFusedAttentionBackend
         IGpuBuffer? dQSpan = null);
 }
 
-public sealed partial class CudaBackend : IFusedAttentionBackend
+/// <summary>
+/// A fused-attention backend whose kernels are not the faster path on every shape. The portable kernels on OpenCL ran a
+/// ViT's 65-token attention several times slower than the composed form (two batched GEMMs around a softmax), while the
+/// fused form's value is never materializing the score matrices, which only matters once they are large.
+/// </summary>
+internal interface IFusedAttentionPreference
 {
+    /// <summary>False when the composed attention is the better choice for this problem size.</summary>
+    bool PrefersFusedAttention(int batch, int heads, int seqQ, int seqK, int headDim);
+}
+public sealed partial class CudaBackend : IFusedAttentionBackend, IFusedAttentionPreference
+{
+    // Native fused kernels (not the portable ones): fused is the chosen path at every size.
+    bool IFusedAttentionPreference.PrefersFusedAttention(int batch, int heads, int seqQ, int seqK, int headDim) => true;
+
     private IntPtr _fusedAttentionModule;
 
     // Query rows per forward block: FA_BR in CudaFusedAttentionKernels (4 threads each).

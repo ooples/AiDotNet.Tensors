@@ -86,6 +86,7 @@ public partial class DirectGpuTensorEngine
         if (typeof(T) != typeof(float) || mask is not null || Gpu.AutocastScope.IsEnabled
             || GraphMode.Current is not { } scope
             || PlacementBackend is not IFusedAttentionBackend fused || !fused.SupportsFusedAttention(headDim)
+            || (fused is IFusedAttentionPreference preference && !preference.PrefersFusedAttention(batch, heads, seqQ, seqK, headDim))
             || !query.IsContiguous || !key.IsContiguous || !value.IsContiguous
             || batch <= 0 || heads <= 0 || seqQ <= 0 || seqK < 0
             || (long)batch * heads * Math.Max(seqQ, seqK) * headDim > int.MaxValue)
@@ -313,6 +314,7 @@ public partial class DirectGpuTensorEngine
         if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled
             || !TryGetBackend(out var backend) || backend is not IFusedAttentionBackend fused
             || !fused.SupportsFusedAttention(headDim) || batch <= 0 || heads <= 0 || seqQ <= 0 || seqK < 0
+            || (fused is IFusedAttentionPreference preference && !preference.PrefersFusedAttention(batch, heads, seqQ, seqK, headDim))
             || (long)batch * heads * Math.Max(seqQ, seqK) * headDim > int.MaxValue)
             return null;
         if (mask is not null && !TryMaskStrides(mask, batch, heads, seqQ, seqK, out _)) return null;
