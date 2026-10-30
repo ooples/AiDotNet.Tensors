@@ -213,7 +213,7 @@ internal sealed class PersistentParallelExecutor
                 IsBackground = true,
                 Name = $"AiDotNet-Worker-{i}"
             };
-            _workers[i].Start();
+            DetachedContext.Start(_workers[i]);
         }
     }
 
