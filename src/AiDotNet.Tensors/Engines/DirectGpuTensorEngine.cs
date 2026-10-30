@@ -27963,6 +27963,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorSlice<T>(Tensor<T> tensor, int[] start, int[] length)
     {
+        // An empty box needs no kernel on any backend; the base validates it and returns the empty tensor.
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (start == null) throw new ArgumentNullException(nameof(start));
+        if (length == null) throw new ArgumentNullException(nameof(length));
+        if (start.Length == tensor._shape.Length && length.Length == tensor._shape.Length
+            && IsEmptySlice(tensor._shape, start, length))
+            return base.TensorSlice(tensor, start, length);
         if (IsTapeActive<T>())
         {
             // Under a tape the slice used to take the host path, which downloads the whole input: an LSTM reads each
