@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // PR #333 — two-tier TensorArena (Pinned + Scratch). Pinned allocations
 // (model weights, optimizer state, BatchNorm running stats) must survive
 // Reset() and NEVER get re-issued as scratch on the next iteration.

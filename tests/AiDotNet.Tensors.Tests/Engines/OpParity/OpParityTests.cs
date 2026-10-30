@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CPU-vs-GPU op-parity scaffold (Tensors #775).
 // Auto-covers every registered op: one theory case per op (keyed by serializable op name).
 // The Roslyn generator (follow-up) will additionally emit a discoverable [Fact] per IEngine op
