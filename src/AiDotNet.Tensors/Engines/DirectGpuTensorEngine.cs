@@ -2743,10 +2743,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// FP16 parity tests gate correctness: a wrongful discard of a still-needed tensor would corrupt the grads.
     /// </summary>
     /// <returns>The device bytes released.</returns>
+    internal long EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect, bool materializePending)
+        => EvictActivationsCreatedAfter(snapshot, protect, materializePending, released: null);
+
+    /// <summary>As above, reporting the released buffers.</summary>
     /// <param name="released">Receives every device buffer released, so a caller holding tensors bound to them (a
     /// compiled plan's forward outputs and gradients, reused by the next replay) can drop those bindings.</param>
     internal long EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect, bool materializePending,
-        ICollection<IGpuBuffer>? released = null)
+        ICollection<IGpuBuffer>? released)
         => EvictActivationsCreatedAfter(snapshot, protect,
             materializePending ? ActivationReleaseMode.MaterializeThenFree : ActivationReleaseMode.DropScratch,
             released: released);
