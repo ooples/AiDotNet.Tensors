@@ -70,14 +70,15 @@ internal sealed class StepScratchPool
 
     /// <summary>
     /// Drops output slot <paramref name="key"/> without freeing its buffer: a tensor may still be bound to it, so its
-    /// finalizer frees it once nothing references it. The next rent at that key allocates afresh.
+    /// finalizer frees it once nothing references it. The next rent at that key allocates afresh. Returns its bytes.
     /// </summary>
-    internal void Forget(long key)
+    internal long Forget(long key)
     {
-        if (!Slots.TryGetValue(key, out var buffer)) return;
+        if (!Slots.TryGetValue(key, out var buffer)) return 0;
         Slots.Remove(key);
         Keys.Remove(buffer);
         Untrack(buffer);
+        return buffer.SizeInBytes;
     }
 
     /// <summary>
@@ -175,20 +176,23 @@ internal sealed class StepScratchPool
     /// <summary>
     /// After a whole executed run: drops the free buffers that run leased none of (the first run leases a buffer for
     /// every backward output, and the slots it then redirects into their accumulators never lease again). Like
-    /// <see cref="Forget"/>, a dropped buffer is freed by its finalizer once nothing references it.
+    /// <see cref="Forget"/>, a dropped buffer is freed by its finalizer once nothing references it. Returns their bytes.
     /// </summary>
-    internal void TrimUnleased()
+    internal long TrimUnleased()
     {
+        long dropped = 0;
         for (int i = _free.Count - 1; i >= 0; i--)
         {
             var buffer = _free[i];
             if (_leasedThisRun.Contains(buffer)) continue;
             Keys.Remove(buffer);
             Untrack(buffer);
+            dropped += buffer.SizeInBytes;
             _free[i] = _free[_free.Count - 1];
             _free.RemoveAt(_free.Count - 1);
         }
         _leasedThisRun.Clear();
+        return dropped;
     }
 
     /// <summary>Frees every buffer now. Only for a caller that knows no captured graph or tensor still uses them.</summary>

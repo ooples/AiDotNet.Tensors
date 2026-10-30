@@ -4206,6 +4206,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// <summary>Test hook: the device buffers this plan's step scratch holds now (kept slots, transient arena, free leases).</summary>
     internal int ScratchBufferCount => _scratchPool?.BufferCount ?? 0;
 
+    // Scratch dropped in one run (Forget, TrimUnleased) past which the plan collects so it is freed now.
+    private const long DroppedScratchCollectBytes = 16L << 20;
+
     /// <summary>Test hook: the bytes of those buffers.</summary>
     internal long ScratchBufferBytes => _scratchPool?.BufferBytes ?? 0;
 
@@ -4254,8 +4257,14 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (executed && completed && _scratchPool is { } scratchPool
                 && backend is not Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true })
             {
-                foreach (long slot in _firstWriteRedirects.RedirectedSlots) scratchPool.Forget(slot);
-                scratchPool.TrimUnleased();
+                long dropped = scratchPool.TrimUnleased();
+                foreach (long slot in _firstWriteRedirects.RedirectedSlots) dropped += scratchPool.Forget(slot);
+                // The dropped buffers are long-lived (allocated on the plan's first runs), so only a full collection
+                // returns them; without one a GPU DenseNet-121 step went on holding ~1.5 GB of them. This happens on the
+                // runs that settle the redirects and leases, not every step.
+                // Not waiting for the finalizers: they only queue the frees, which the next allocation drains, and a
+                // finalizer that needs a lock this step holds would deadlock a wait.
+                if (dropped >= DroppedScratchCollectBytes) GC.Collect();
             }
         }
     }
