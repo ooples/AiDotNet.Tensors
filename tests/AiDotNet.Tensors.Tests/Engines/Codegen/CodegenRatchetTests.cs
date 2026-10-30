@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Cross-cutting guarantees for the conveyor: a static-metric ratchet, byte-for-byte
 // determinism, and architecture parameterisation.
 //

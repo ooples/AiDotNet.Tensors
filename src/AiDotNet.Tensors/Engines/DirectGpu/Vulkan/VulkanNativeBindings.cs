@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Vulkan native P/Invoke bindings for cross-platform GPU compute.
 // Supports Windows (vulkan-1.dll), Linux (libvulkan.so.1), and macOS via MoltenVK.
 

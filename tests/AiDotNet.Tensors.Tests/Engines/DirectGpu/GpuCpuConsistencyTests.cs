@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Tests that verify GPU results match CPU reference implementation.
 // Goal: Find precision bugs and numerical inconsistencies between GPU and CPU.
 

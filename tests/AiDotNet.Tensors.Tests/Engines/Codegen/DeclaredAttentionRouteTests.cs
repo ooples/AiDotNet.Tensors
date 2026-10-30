@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The declared attention route (#890 phase 4d): CudaBackend.ScaledDotProductAttention runs a declared program -- the
 // scores as an implicit GEMM with the scale and mask bias in its epilogue, a row softmax, the weighted values as a
 // second implicit GEMM -- in the hand-written kernel's contract. Both routes are checked against an fp64 reference

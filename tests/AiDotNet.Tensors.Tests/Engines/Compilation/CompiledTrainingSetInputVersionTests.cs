@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // SetInputs / SetInput write the captured input through an unmarked span. The whole-step CUDA graph's step I/O
 // re-stages a device-resident input only when its version changes, so a setter that copied without advancing the
 // version would leave the next replay training on the previous input. These pin the version bump on both setters.

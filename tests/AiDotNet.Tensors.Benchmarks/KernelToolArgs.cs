@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Shared argument parsing for the kernel tools.
 //
 // Every one of them picked the kernel selector with

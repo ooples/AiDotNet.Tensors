@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // GLSL compute kernels for Vulkan sparse ops (CSR SpMM + SDDMM).
 // Mirrors the OpenCL csr_spmm / sddmm kernels bit-for-bit so the runtime-verified
 // OpenCL correctness carries over to the Vulkan tier.

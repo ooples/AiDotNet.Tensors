@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Correctness tests for the two GPU-resident decoder primitives added for LLM serving:
 //   * rope_interleaved            — fused interleaved (GPT-NeoX / LLaMA / GGML) RoPE
 //   * scaled_dot_product_attention with numKVHeads — Grouped-Query Attention (broadcast K/V)

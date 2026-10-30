@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CPU-vs-GPU op-parity scaffold (Tensors #775). Full-surface op enumeration.
 // Reflects the IEngine surface at runtime so the parity scaffold auto-syncs with it — every
 // tensor-producing op is enumerated, and coverage is measured against this ground truth. (A

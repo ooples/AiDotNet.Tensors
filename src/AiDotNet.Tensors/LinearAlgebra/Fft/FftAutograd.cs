@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Autograd wiring for the Fft module.
 //
 // Derivation (complex FFT, interleaved real/imag layout):

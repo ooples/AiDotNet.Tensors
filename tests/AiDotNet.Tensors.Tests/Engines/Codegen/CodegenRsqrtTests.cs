@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The reciprocal square root, which RMSNorm and Adam both need.
 //
 // Added alongside the extra-output model because both are prerequisites for the optimizer

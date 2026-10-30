@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // GLSL kernels for the Vulkan generic-precision, arbitrary-length FFT (#964), the peers of
 // CUDA/Kernels/CudaFFTGenericKernels.
 //

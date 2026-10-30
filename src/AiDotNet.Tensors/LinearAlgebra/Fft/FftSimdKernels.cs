@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Vectorized radix-2 butterfly stages for the iterative Cooley-Tukey FFT,
 // specialized per SIMD width. Each stage handles N/2 butterflies; we batch
 // the inner `k` loop into SIMD groups of (vector-width / sizeof(double))

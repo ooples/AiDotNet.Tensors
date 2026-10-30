@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Regression: the SIMD Tanh/Sigmoid backward kernels iterated to grad.Length (the PHYSICAL
 // backing-array length) while writing into a result buffer sized to the tensor's LOGICAL length.
 // Under a GradientTape the activation's forward output is POOL-allocated, and the pool hands back a

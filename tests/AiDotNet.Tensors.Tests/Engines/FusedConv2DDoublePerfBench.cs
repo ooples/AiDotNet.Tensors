@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Microbenchmark for issue #251 — compares the optimized double
 // FusedConv2D + 1×1 fast path to the pre-fix unfused sequence on a
 // ResNet50 BottleneckBlock shape. Not a correctness test; existence

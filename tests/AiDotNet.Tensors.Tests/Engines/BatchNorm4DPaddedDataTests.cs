@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Issue #310 regression — BatchNorm4D must accept input tensors whose
 // underlying data buffer is SIMD-padded beyond the logical extent (i.e.
 // every non-power-of-2 spatial chain in EfficientNet / MobileNetV2 /

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // #409 S.4 integration: verify the 6×8 FP64 tile wired into the live PackBoth path in
 // FAST mode produces correct results end-to-end through BlasManaged.Gemm, including the
 // M-tail (M % 6 != 0) and N-tail (N % 8 != 0, scalar fallback) paths and the strided

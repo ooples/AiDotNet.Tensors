@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // FE-1's gate: a graph built by the ORDINARY lowering path, emitted to PTX, executed on
 // the device, and compared against the CPU emitter running the SAME graph.
 //

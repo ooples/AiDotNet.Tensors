@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Phase 4 of issue #214: SavedTensorHooks recipes, AnomalyMode,
 // tensor backward hooks.
 //

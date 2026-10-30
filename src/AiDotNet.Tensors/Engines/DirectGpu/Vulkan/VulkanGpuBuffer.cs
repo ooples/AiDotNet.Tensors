@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // IGpuBuffer wrapper for Vulkan storage and staging buffer pairs.
 
 using System;
