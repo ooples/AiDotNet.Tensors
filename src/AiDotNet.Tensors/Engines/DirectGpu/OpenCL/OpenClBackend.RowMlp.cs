@@ -16,99 +16,85 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 #define RM_MAXW 2048
 #define RM_GROUP 256
 
-// One layer: dst[j] = act(sum_k src[k] * w[k * n + j] + b[j]) for j < n. With n >= the group each thread takes whole
-// columns; otherwise the group splits K into splits = group / n slices and sums the slices' partials in local memory.
+// One layer: dst[j] = act(sum_k src[k] * w[k * n + j] + b[j]) for j < n, in one of three forms:
+// - n a multiple of 4: work item (cg, s) accumulates four adjacent columns (one vload4 per weight row) over K-slice s,
+//   unrolled four deep so each thread keeps four loads in flight, RM_GROUP column groups per pass. The scalar form had
+//   one 4-byte load in flight per thread, so a 512 x 128 layer took ~100 us.
+// - otherwise, n >= the group: each thread takes whole columns.
+// - otherwise: the group splits K into splits = group / n slices and sums the slices' partials in local memory.
+// Every form runs the same passes of (accumulate, barrier, reduce, barrier), branching only around the work between
+// barriers: POCL aborts the process compiling a kernel whose branches choose between different barrier sequences
+// (Kernel.cc createParallelRegionBefore: region_entry_barrier != NULL).
 inline void row_mlp_layer(__local const float* src, __local float* dst, __global float* y, int toGlobal,
-    __global const float* w, __global const float* b, int hasBias, int k, int n, int relu, __local float* partial)
+    __global const float* w, __global const float* b, int hasBias, int k, int n, int relu,
+    __local float* partial, __local float4* partial4)
 {
     const int lid = get_local_id(0);
-    if (n >= RM_GROUP)
-    {
-        for (int j = lid; j < n; j += RM_GROUP)
-        {
-            float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
-            int kk = 0;
-            for (; kk + 3 < k; kk += 4)
-            {
-                a0 += src[kk] * w[(long)kk * n + j];
-                a1 += src[kk + 1] * w[(long)(kk + 1) * n + j];
-                a2 += src[kk + 2] * w[(long)(kk + 2) * n + j];
-                a3 += src[kk + 3] * w[(long)(kk + 3) * n + j];
-            }
-            for (; kk < k; kk++) a0 += src[kk] * w[(long)kk * n + j];
-            float v = (a0 + a1) + (a2 + a3);
-            if (hasBias) v += b[j];
-            if (relu)
-            {
-                uint bits = as_uint(v) & 0x7fffffffu;
-                v = (bits > 0x7f800000u) ? v : fmax(0.0f, v);
-            }
-            if (toGlobal) y[j] = v; else dst[j] = v;
-        }
-    }
-    else
-    {
-        const int splits = RM_GROUP / n;
-        const int j = lid % n, s = lid / n;
-        float acc = 0.0f;
-        if (s < splits)
-        {
-            const int chunk = (k + splits - 1) / splits;
-            const int k0 = s * chunk, k1 = min(k, k0 + chunk);
-            for (int kk = k0; kk < k1; kk++) acc += src[kk] * w[(long)kk * n + j];
-        }
-        partial[lid] = acc;
-    }
-    // Both paths reach this one barrier: POCL's work-group region formation aborts the process on a barrier that an
-    // early return lets some paths skip (Kernel.cc createParallelRegionBefore assertion).
-    barrier(CLK_LOCAL_MEM_FENCE);
-    if (n < RM_GROUP && lid < n)
-    {
-        const int splits = RM_GROUP / n;
-        float v = 0.0f;
-        for (int t = 0; t < splits; t++) v += partial[t * n + lid];
-        if (hasBias) v += b[lid];
-        if (relu)
-        {
-            uint bits = as_uint(v) & 0x7fffffffu;
-            v = (bits > 0x7f800000u) ? v : fmax(0.0f, v);
-        }
-        if (toGlobal) y[lid] = v; else dst[lid] = v;
-    }
-}
-
-// A layer whose width is a multiple of 4: work item (cg, s) accumulates four adjacent columns (one vload4 per weight
-// row) over K-slice s, unrolled four deep so each thread keeps four loads in flight; the slices' partials are summed in
-// local memory. The scalar form above had one 4-byte load in flight per thread, so a 512 x 128 layer took ~100 us.
-inline void row_mlp_layer4(__local const float* src, __local float* dst, __global float* y, int toGlobal,
-    __global const float* w, __global const float* b, int hasBias, int k, int n, int relu, __local float4* partial4)
-{
-    const int lid = get_local_id(0);
-    const int groups = n >> 2;
+    const int vec = (n & 3) == 0;
+    const int groups = vec ? n >> 2 : 1;
     for (int base = 0; base < groups; base += RM_GROUP)
     {
-        const int active = min(RM_GROUP, groups - base);
+        const int active = vec ? min(RM_GROUP, groups - base) : min(RM_GROUP, n);
         const int splits = RM_GROUP / active;
-        const int cg = base + lid % active, s = lid / active;
-        float4 a0 = (float4)(0.0f), a1 = (float4)(0.0f), a2 = (float4)(0.0f), a3 = (float4)(0.0f);
-        if (s < splits)
+        if (vec)
         {
-            const int chunk = (k + splits - 1) / splits;
-            const int k0 = s * chunk, k1 = min(k, k0 + chunk);
-            __global const float* col = w + 4 * cg;
-            int kk = k0;
-            for (; kk + 3 < k1; kk += 4)
+            const int cg = base + lid % active, s = lid / active;
+            float4 a0 = (float4)(0.0f), a1 = (float4)(0.0f), a2 = (float4)(0.0f), a3 = (float4)(0.0f);
+            if (s < splits)
             {
-                a0 += src[kk] * vload4(0, col + (long)kk * n);
-                a1 += src[kk + 1] * vload4(0, col + (long)(kk + 1) * n);
-                a2 += src[kk + 2] * vload4(0, col + (long)(kk + 2) * n);
-                a3 += src[kk + 3] * vload4(0, col + (long)(kk + 3) * n);
+                const int chunk = (k + splits - 1) / splits;
+                const int k0 = s * chunk, k1 = min(k, k0 + chunk);
+                __global const float* col = w + 4 * cg;
+                int kk = k0;
+                for (; kk + 3 < k1; kk += 4)
+                {
+                    a0 += src[kk] * vload4(0, col + (long)kk * n);
+                    a1 += src[kk + 1] * vload4(0, col + (long)(kk + 1) * n);
+                    a2 += src[kk + 2] * vload4(0, col + (long)(kk + 2) * n);
+                    a3 += src[kk + 3] * vload4(0, col + (long)(kk + 3) * n);
+                }
+                for (; kk < k1; kk++) a0 += src[kk] * vload4(0, col + (long)kk * n);
             }
-            for (; kk < k1; kk++) a0 += src[kk] * vload4(0, col + (long)kk * n);
+            partial4[lid] = (a0 + a1) + (a2 + a3);
         }
-        partial4[lid] = (a0 + a1) + (a2 + a3);
+        else if (n >= RM_GROUP)
+        {
+            for (int j = lid; j < n; j += RM_GROUP)
+            {
+                float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+                int kk = 0;
+                for (; kk + 3 < k; kk += 4)
+                {
+                    a0 += src[kk] * w[(long)kk * n + j];
+                    a1 += src[kk + 1] * w[(long)(kk + 1) * n + j];
+                    a2 += src[kk + 2] * w[(long)(kk + 2) * n + j];
+                    a3 += src[kk + 3] * w[(long)(kk + 3) * n + j];
+                }
+                for (; kk < k; kk++) a0 += src[kk] * w[(long)kk * n + j];
+                float v = (a0 + a1) + (a2 + a3);
+                if (hasBias) v += b[j];
+                if (relu)
+                {
+                    uint bits = as_uint(v) & 0x7fffffffu;
+                    v = (bits > 0x7f800000u) ? v : fmax(0.0f, v);
+                }
+                if (toGlobal) y[j] = v; else dst[j] = v;
+            }
+        }
+        else
+        {
+            const int j = lid % n, s = lid / n;
+            float acc = 0.0f;
+            if (s < splits)
+            {
+                const int chunk = (k + splits - 1) / splits;
+                const int k0 = s * chunk, k1 = min(k, k0 + chunk);
+                for (int kk = k0; kk < k1; kk++) acc += src[kk] * w[(long)kk * n + j];
+            }
+            partial[lid] = acc;
+        }
         barrier(CLK_LOCAL_MEM_FENCE);
-        if (lid < active)
+        if (vec && lid < active)
         {
             float4 v = (float4)(0.0f);
             for (int t = 0; t < splits; t++) v += partial4[t * active + lid];
@@ -125,6 +111,18 @@ inline void row_mlp_layer4(__local const float* src, __local float* dst, __globa
                 }
                 if (toGlobal) y[j + q] = o; else dst[j + q] = o;
             }
+        }
+        else if (!vec && n < RM_GROUP && lid < n)
+        {
+            float v = 0.0f;
+            for (int t = 0; t < splits; t++) v += partial[t * n + lid];
+            if (hasBias) v += b[lid];
+            if (relu)
+            {
+                uint bits = as_uint(v) & 0x7fffffffu;
+                v = (bits > 0x7f800000u) ? v : fmax(0.0f, v);
+            }
+            if (toGlobal) y[lid] = v; else dst[lid] = v;
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
@@ -151,19 +149,10 @@ void row_mlp_forward(__global const float* x, __global float* y,
         const int k = l == 0 ? d0 : l == 1 ? d1 : l == 2 ? d2 : d3;
         const int n = l == 0 ? d1 : l == 1 ? d2 : l == 2 ? d3 : d4;
         const int last = l == layers - 1;
-        // Even layers read bufA and write bufB; odd layers the reverse.
-        if ((n & 3) == 0)
-        {
-            if ((l & 1) == 0)
-                row_mlp_layer4(bufA, bufB, y, last, w, b, (biasMask >> l) & 1, k, n, last ? outputRelu : hiddenRelu, partial4);
-            else
-                row_mlp_layer4(bufB, bufA, y, last, w, b, (biasMask >> l) & 1, k, n, last ? outputRelu : hiddenRelu, partial4);
-        }
-        else if ((l & 1) == 0)
-            row_mlp_layer(bufA, bufB, y, last, w, b, (biasMask >> l) & 1, k, n, last ? outputRelu : hiddenRelu, partial);
-        else
-            row_mlp_layer(bufB, bufA, y, last, w, b, (biasMask >> l) & 1, k, n, last ? outputRelu : hiddenRelu, partial);
-        barrier(CLK_LOCAL_MEM_FENCE);
+        // Even layers read bufA and write bufB; odd layers the reverse. The layer ends on a barrier.
+        __local const float* src = (l & 1) == 0 ? bufA : bufB;
+        __local float* dst = (l & 1) == 0 ? bufB : bufA;
+        row_mlp_layer(src, dst, y, last, w, b, (biasMask >> l) & 1, k, n, last ? outputRelu : hiddenRelu, partial, partial4);
     }
 }
 ";
