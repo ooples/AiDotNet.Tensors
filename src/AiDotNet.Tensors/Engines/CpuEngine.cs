@@ -37073,9 +37073,10 @@ public partial class CpuEngine : ITensorLevelEngine
                         if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.PadInto(output, captured, capTop, capBottom, capLeft, capRight, capValue);
                         else { var r = eng.Pad(captured, capTop, capBottom, capLeft, capRight, capValue); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
-                    // [top, left] feed the backward; bottom, right and the fill value (as double) describe the op to
-                    // exporters (OnnxExporter), which have only the saved state to go on.
-                    BackwardFunctions<T>.PadBackward, new object[] { capTop, capLeft, capBottom, capRight, MathHelper.GetNumericOperations<T>().ToDouble(capValue) });
+                    // [top, left] feed the backward; bottom, right and the fill value describe the op to exporters
+                    // (OnnxExporter), which have only the saved state to go on. The fill value is kept as T: converting
+                    // it here would make capture throw for a value with no double form (a Complex with an imaginary part).
+                    BackwardFunctions<T>.PadBackward, new object[] { capTop, capLeft, capBottom, capRight, capValue! });
             }
         }
 

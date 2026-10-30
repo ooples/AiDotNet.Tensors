@@ -20139,6 +20139,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             }
         }
         internal bool IsAsyncFreed => _asyncFreeStream != IntPtr.Zero;
+
+        /// <summary>Pins this buffer to <paramref name="pool"/>: its releases are parked until the pool retires.</summary>
+        internal void PinTo(CaptureMemoryPool pool) => pool.Pin(ref _capturePins, this);
         internal IntPtr OwningContext => _context;
 
         public CudaGpuBuffer(IntPtr context, IntPtr devicePtr, int size, Action<CudaGpuBuffer>? returnToPool = null,

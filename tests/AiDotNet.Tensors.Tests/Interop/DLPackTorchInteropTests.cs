@@ -149,8 +149,10 @@ public class DLPackTorchInteropTests
         Call("drop", key);
     }
 
-    [SkippableFact]
-    public void Cuda_RoundTripsThroughTorch_OnTheDevice()
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Cuda_RoundTripsThroughTorch_OnTheDevice(bool versioned)
     {
         Skip.If(TorchPython.Unavailable is not null, TorchPython.Unavailable);
         Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA driver or NVRTC is unavailable.");
@@ -166,20 +168,26 @@ public class DLPackTorchInteropTests
 
             // Tensors -> torch: torch's legacy default stream (DLPack value 1) waits on the export.
             var source = new Tensor<float>(new[] { 4, 8 }, new Vector<float>(Iota(32))).Gpu();
-            Call("from_tensors_versioned", "cuda_in", source.ToDLPack(DLPackStream.LegacyDefault).ToInt64(), 2, device);
-            Assert.True(Call<bool>("is_cuda", "cuda_in"));
-            Assert.Equal(Iota(32), Call<float[]>("values", "cuda_in"));
-            Call("drop", "cuda_in");
+            string keyIn = "cuda_in_" + versioned;
+            if (versioned)
+                Call("from_tensors_versioned", keyIn, source.ToDLPack(DLPackStream.LegacyDefault).ToInt64(), 2, device);
+            else
+                Call("from_tensors_legacy", keyIn, source.ToDLPackLegacy(DLPackStream.LegacyDefault).ToInt64());
+            Assert.True(Call<bool>("is_cuda", keyIn));
+            Assert.Equal(Iota(32), Call<float[]>("values", keyIn));
+            Call("drop", keyIn);
             Assert.Equal(liveBefore, DLPack.LiveExportCount);
             source.Dispose();
 
             // torch -> Tensors: the import wraps torch's device pointer as a GPU buffer.
-            Call("make", "cuda_out", 16, true);
-            var imported = Tensor<float>.FromDLPack(new IntPtr(Call<long>("export", "cuda_out", true)));
+            string keyOut = "cuda_out_" + versioned;
+            Call("make", keyOut, 16, true);
+            var ptr = new IntPtr(Call<long>("export", keyOut, versioned));
+            var imported = versioned ? Tensor<float>.FromDLPack(ptr) : Tensor<float>.FromDLPackLegacy(ptr);
             Assert.True(imported.IsGpuResident);
             Assert.Equal(Iota(16), imported.ToArray());
             imported.Dispose();
-            Call("drop", "cuda_out");
+            Call("drop", keyOut);
         }
         finally
         {

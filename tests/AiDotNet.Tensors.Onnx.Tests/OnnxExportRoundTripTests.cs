@@ -90,6 +90,32 @@ public class OnnxExportRoundTripTests
     }
 
     [Fact]
+    public void Export_AboveTheMaximumOpset_Throws()
+    {
+        // An opset the translator was not verified against would be declared and then rejected (or misread) at load.
+        var c = RoundTripCases.Get("Relu");
+        using var stream = new MemoryStream(c.Bytes);
+        var imported = OnnxImporter.Import<float>(stream, new CpuEngine());
+        var options = new OnnxExportOptions { OpsetVersion = OnnxExportOptions.MaximumOpsetVersion + 1 };
+        Assert.Throws<ArgumentOutOfRangeException>(() => OnnxExporter.Export(imported, options));
+    }
+
+    [Theory]
+    [InlineData(17, 8)]
+    [InlineData(18, 8)]
+    [InlineData(19, 9)]
+    [InlineData(20, 9)]
+    public void Export_DeclaresTheIrVersionOfItsOpset(long opset, long irVersion)
+    {
+        var c = RoundTripCases.Get("Relu");
+        using var stream = new MemoryStream(c.Bytes);
+        var imported = OnnxImporter.Import<float>(stream, new CpuEngine());
+        var model = OnnxExporter.Export(imported, new OnnxExportOptions { OpsetVersion = opset });
+        Assert.Equal(irVersion, model.IrVersion);
+        AssertClose(RoundTrip.Execute(imported, c.Feeds), RoundTrip.Run(model.ToByteArray(), c.Feeds));
+    }
+
+    [Fact]
     public void Export_OpsetBelowTwenty_DecomposesGelu()
     {
         var c = RoundTripCases.Get("GeluTanh");
@@ -150,6 +176,25 @@ public class OnnxExportRoundTripTests
     }
 
     [Fact]
+    public void Export_APlanWhoseResultIsAView_RoundTrips()
+    {
+        // A forward that ends in a contiguous Reshape returns a view of the last step's buffer, not a tensor a step
+        // writes: the exporter must still find the producer and emit the reshape.
+        var (plan, input) = EnginePlans.LinearReluReshaped();
+        var data = RandomArray(seed: 81, n: input.Length);
+        data.AsSpan().CopyTo(input.AsWritableSpan());
+        input.MarkModified();
+        var result = plan.Execute();
+        var expected = result.ToArray();
+        Assert.Equal(new[] { 3, 2 }, result._shape);
+
+        var model = OnnxExporter.Export(plan);
+        Assert.Equal(new long[] { 3, 2 }, model.Graph.Output[0].Type.TensorType.Shape.Dim.Select(d => d.DimValue).ToArray());
+        var feeds = new[] { new RoundTripCases.Feed("input", input._shape, data) };
+        AssertClose(expected, RoundTrip.Run(model.ToByteArray(), feeds));
+    }
+
+    [Fact]
     public void Export_UnsupportedOperation_NamesIt()
     {
         var plan = EnginePlans.CumSum();
@@ -169,6 +214,16 @@ internal static class EnginePlans
         var b = new Tensor<float>(RandomArray(seed: 79, n: 3), new[] { 3 });
         var plan = new CompiledModelCache<float>().GetOrCompileInference(input, () =>
             engine.ReLU(engine.TensorBroadcastAdd(engine.TensorMatMul(input, w), b)));
+        return (plan, input);
+    }
+
+    internal static (ICompiledPlan<float> Plan, Tensor<float> Input) LinearReluReshaped()
+    {
+        var engine = new CpuEngine();
+        var input = new Tensor<float>(new[] { 2, 4 });
+        var w = new Tensor<float>(RandomArray(seed: 82, n: 12), new[] { 4, 3 });
+        var plan = new CompiledModelCache<float>().GetOrCompileInference(input, () =>
+            engine.ReLU(engine.TensorMatMul(input, w)).Reshape(3, 2));
         return (plan, input);
     }
 

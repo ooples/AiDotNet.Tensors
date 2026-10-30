@@ -34,7 +34,7 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
 
     /// <summary>Pads folded into the conv or pool that reads them: the padded tensor, its source and the padding.</summary>
     private readonly Dictionary<Tensor<T>, (string Source, int Top, int Left, int Bottom, int Right)> _foldedPads =
-        new(OnnxGraphWriter<T>.TensorIdentity.Instance);
+        new(OnnxGraphWriter<T>.ReferenceEqualityComparer<Tensor<T>>.Instance);
 
     internal bool CanTranslate(CompiledStep<T> step)
     {

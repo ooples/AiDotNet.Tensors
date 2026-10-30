@@ -275,6 +275,9 @@ public static class DLPack
                 DLPackNative.DeviceCpu or DLPackNative.DeviceCudaHost or DLPackNative.DeviceRocmHost
                     => ImportHost<T>(in dl, minor, readOnly, owner),
                 DLPackNative.DeviceCuda => ImportCuda<T>(in dl, minor, readOnly, owner, managed),
+                DLPackNative.DeviceRocm => throw new NotSupportedException(
+                    "DLPack ROCm device memory (kDLROCM) is not supported yet: the HIP backend has no zero-copy DLPack " +
+                    "exchange (issue #1621). Copy the tensor to the host on the producer side, or use CUDA."),
                 _ => throw new NotSupportedException(
                     $"DLPack device type {dl.Device.DeviceType} is not supported; AiDotNet.Tensors imports CPU and " +
                     "pinned host memory (kDLCPU, kDLCUDAHost, kDLROCMHost) and CUDA device memory (kDLCUDA)."),

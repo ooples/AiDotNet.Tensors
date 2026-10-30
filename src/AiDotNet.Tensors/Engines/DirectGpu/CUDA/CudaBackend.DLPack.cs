@@ -18,6 +18,77 @@ public sealed partial class CudaBackend : IDLPackDeviceBackend
     IGpuBuffer IDLPackDeviceBackend.WrapExternalDeviceMemory(IntPtr devicePointer, int elementCount, int elementByteSize, Action release)
         => WrapExternalDeviceMemory(devicePointer, elementCount, elementByteSize, release);
     void IDLPackDeviceBackend.ReleaseAfterPendingWorkDeferred(Action release) => ReleaseAfterPendingWorkDeferred(release);
+    IDisposable IDLPackDeviceBackend.HoldForExport(IGpuBuffer buffer, IntPtr consumerStream) => HoldForExport(buffer, consumerStream);
+
+    /// <summary>
+    /// Keeps <paramref name="buffer"/>'s device memory for a DLPack export: until the hold is disposed (the consumer's
+    /// deleter), no release of the buffer -- a TensorScope ending, an activation-cache eviction, a pool return, its
+    /// finalizer -- frees it or hands it to another allocation; each is parked instead. Disposing the hold first makes
+    /// this backend's stream wait for the work queued on <paramref name="consumerStream"/> (the consumer may still have
+    /// kernels using the memory when it calls the deleter), then runs the parked releases, which are stream-ordered.
+    /// </summary>
+    /// <param name="consumerStream">The stream the consumer works on, or zero when it synchronizes itself (NoSync).</param>
+    internal IDisposable HoldForExport(IGpuBuffer buffer, IntPtr consumerStream)
+    {
+        if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+        // The same mechanism keeps a captured graph's memory: a pinned buffer parks every release until retirement.
+        var pins = new CaptureMemoryPool();
+        if (buffer is CudaGpuBuffer cuda) cuda.PinTo(pins);
+        // Imported memory (ExternalDeviceBuffer) belongs to another library and is never freed here; re-exporting it
+        // needs only the stream ordering.
+        return new ExportHold(this, pins, consumerStream);
+    }
+
+    /// <summary>Makes this backend's stream wait for the work queued so far on <paramref name="consumerStream"/>.</summary>
+    private void OrderAfterStream(IntPtr consumerStream)
+    {
+        if (_disposed && _cudaContext == IntPtr.Zero) return;   // torn down: nothing of ours can run on the memory
+        using var _ = PushContext();
+        if (consumerStream == _stream) return;
+        CuBlasNative.CheckCudaResult(
+            CudaNativeBindings.cuEventCreate(out IntPtr done, CudaNativeBindings.CU_EVENT_DISABLE_TIMING),
+            "cuEventCreate(DLPack release)");
+        try
+        {
+            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventRecord(done, consumerStream), "cuEventRecord(DLPack release)");
+            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamWaitEvent(_stream, done, 0), "cuStreamWaitEvent(DLPack release)");
+        }
+        finally
+        {
+            CudaNativeBindings.cuEventDestroy(done);
+        }
+    }
+
+    private sealed class ExportHold : IDisposable
+    {
+        private readonly CudaBackend _backend;
+        private readonly IntPtr _consumerStream;
+        private CaptureMemoryPool? _pins;
+
+        public ExportHold(CudaBackend backend, CaptureMemoryPool pins, IntPtr consumerStream)
+        {
+            _backend = backend;
+            _pins = pins;
+            _consumerStream = consumerStream;
+        }
+
+        public void Dispose()
+        {
+            var pins = Interlocked.Exchange(ref _pins, null);
+            if (pins is null) return;
+            try
+            {
+                if (_consumerStream != IntPtr.Zero && !IsRuntimeTearingDown && !ProcessExiting)
+                    _backend.OrderAfterStream(_consumerStream);
+            }
+            finally
+            {
+                // Released even when the ordering failed (the consumer passed a stream it has since destroyed): the
+                // memory would otherwise leak for the life of the process.
+                pins.Retire();
+            }
+        }
+    }
 
     /// <summary>The CUDA device ordinal this backend was created for (<c>DLDevice.device_id</c>).</summary>
     internal int DeviceOrdinal { get; }
@@ -160,6 +231,9 @@ public sealed partial class CudaBackend : IDLPackDeviceBackend
         public int Size { get; }
         public long SizeInBytes { get; }
         public IntPtr Handle => Volatile.Read(ref _handle);
+
+        /// <summary>The backend the memory was imported for.</summary>
+        internal CudaBackend Owner => _backend;
 
         public void Dispose()
         {

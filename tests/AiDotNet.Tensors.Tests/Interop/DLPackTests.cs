@@ -395,6 +395,9 @@ public sealed class DLPackTests
         Assert.Throws<ArgumentException>(() => DLPackStream.FromHandle(IntPtr.Zero));
         Assert.Equal(DLPackStream.LegacyDefault, DLPackStream.FromHandle(new IntPtr(1)));
         Assert.Equal(DLPackStream.PerThreadDefault, DLPackStream.FromHandle(new IntPtr(2)));
+        Assert.Equal(DLPackStream.NoSync, DLPackStream.FromHandle(new IntPtr(-1)));
+        Assert.True(DLPackStream.FromHandle(new IntPtr(-1)).IsNoSync);
+        Assert.Throws<ArgumentException>(() => DLPackStream.FromHandle(new IntPtr(-2)));
         Assert.Equal(DLPackStream.LegacyDefault, DLPackStream.Default);   // stream=None means the legacy default
         Assert.True(DLPackStream.NoSync.IsNoSync);
     }
@@ -432,10 +435,12 @@ public sealed class DLPackTests
         Assert.Equal(Iota(1, 8, 2, 2).ToArray(), back.ToArray());
     }
 
-    [Fact]
-    public void Import_OfAnUnsupportedDevice_CallsTheDeleter_AndThrows()
+    [Theory]
+    [InlineData(4)]    // kDLOpenCL
+    [InlineData(10)]   // kDLROCM: no HIP device exchange yet (#1621)
+    public void Import_OfAnUnsupportedDevice_CallsTheDeleter_AndThrows(int deviceType)
     {
-        using var producer = new FakeProducer(new float[] { 1 }, new long[] { 1 }, new long[] { 1 }, deviceType: 4);   // kDLOpenCL
+        using var producer = new FakeProducer(new float[] { 1 }, new long[] { 1 }, new long[] { 1 }, deviceType: deviceType);
         Assert.Throws<NotSupportedException>(() => Tensor<float>.FromDLPack(producer.Block));
         Assert.Equal(1, producer.Calls);
     }
@@ -572,6 +577,86 @@ public sealed class DLPackTests
         }
     }
 
+    [SkippableFact]
+    public void Cuda_ExportedBuffer_SurvivesTheTensorReleasingIt_UntilTheDeleter()
+    {
+        // The capsule holds only the device address. Releasing the producer tensor's buffer (here as a TensorScope or a
+        // dropped gradient would) must not free it or hand it to the next allocation while the consumer can still read it.
+        Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA driver or NVRTC is unavailable.");
+        var previous = AiDotNetEngine.Current;
+        var gpu = new DirectGpuTensorEngine();
+        try
+        {
+            Skip.IfNot(gpu.IsGpuAvailable && gpu.PlacementBackend is CudaBackend, "The active GPU backend is not CUDA.");
+            AiDotNetEngine.Current = gpu;
+            var expected = Iota(64, 64).ToArray();
+            var source = Iota(64, 64).Gpu();
+            IntPtr address = source.TryGetGpuBuffer()!.Handle;
+            IntPtr capsule = source.ToDLPack(DLPackStream.LegacyDefault);
+
+            gpu.ReleaseDeadDeviceStorage(source);
+            Assert.Null(source.DataVector._deviceState?.Buffer);
+            // Same-size allocations: without the hold the pool hands the released memory straight back.
+            var fillers = Enumerable.Range(0, 8).Select(i => gpu.TensorAdd(Iota(64, 64).Gpu(), Iota(64, 64).Gpu())).ToList();
+            Assert.DoesNotContain(fillers, f => f.TryGetGpuBuffer()!.Handle == address);
+
+            var imported = Tensor<float>.FromDLPack(capsule);
+            Assert.Equal(expected, imported.ToArray());
+            imported.Dispose();   // the deleter: the hold ends and the parked release runs
+            foreach (var f in fillers) f.Dispose();
+            source.Dispose();
+        }
+        finally
+        {
+            AiDotNetEngine.Current = previous;
+            gpu.Dispose();
+        }
+    }
+
+    [SkippableFact]
+    public async System.Threading.Tasks.Task Cuda_ImportedTensor_RunsThroughGeneratedKernels_ElementwiseAndMatMul()
+    {
+        // An import wraps the producer's pointer in an ExternalDeviceBuffer, not a CudaGpuBuffer: every device path,
+        // the generated-kernel one included, must take it.
+        Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA driver or NVRTC is unavailable.");
+        var previous = AiDotNetEngine.Current;
+        var gpu = new DirectGpuTensorEngine();
+        try
+        {
+            Skip.IfNot(gpu.IsGpuAvailable && gpu.PlacementBackend is CudaBackend, "The active GPU backend is not CUDA.");
+            AiDotNetEngine.Current = gpu;
+            var backend = (CudaBackend)gpu.PlacementBackend!;
+            // Centered on zero so the ReLU kernel has both halves to get right.
+            var values = Iota(4, 8).ToArray().Select(v => v - 16f).ToArray();
+            using var source = new Tensor<float>(values, new[] { 4, 8 }).Gpu();
+            using var imported = Tensor<float>.FromDLPack(source.ToDLPack());
+
+            var graph = AiDotNet.Tensors.Engines.Compilation.Codegen.Ir.CodegenLowering.LowerUnaryPointwise<float>(
+                AiDotNet.Tensors.Engines.Compilation.Codegen.Ir.CodegenOpKind.ReLU, new[] { values.Length });
+            using var output = backend.AllocateBuffer(values.Length);
+            var result = await AiDotNet.Tensors.Engines.Compilation.Codegen.NativeGpuCodegenExecutorExtensions.EmitAndExecuteCodegenKernelAsync(
+                backend, graph, AiDotNet.Tensors.Engines.Compilation.Codegen.Ir.CodegenElementType.Float32,
+                new[] { imported.TryGetGpuBuffer()! }, new[] { output }, values.Length);
+            Skip.If(result.Declined, "The CUDA code generator declined the graph: " + result.DeclineReason);
+            Assert.Equal(values.Select(v => Math.Max(v, 0f)).ToArray(), backend.DownloadBuffer(output));
+
+            using var sum = gpu.TensorAdd(imported, imported);
+            Assert.Equal(values.Select(v => 2 * v).ToArray(), sum.ToArray());
+            using var weights = new Tensor<float>(Enumerable.Repeat(1f, 8 * 2).ToArray(), new[] { 8, 2 });
+            using var product = gpu.TensorMatMul(imported, weights);
+            for (int r = 0; r < 4; r++)
+            {
+                float rowSum = values.Skip(8 * r).Take(8).Sum();
+                Assert.Equal(rowSum, product.ToArray()[2 * r], 3);
+                Assert.Equal(rowSum, product.ToArray()[2 * r + 1], 3);
+            }
+        }
+        finally
+        {
+            AiDotNetEngine.Current = previous;
+            gpu.Dispose();
+        }
+    }
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static void ImportUseAndDrop(IntPtr capsule)
     {

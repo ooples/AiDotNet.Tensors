@@ -120,22 +120,47 @@ public partial class Tensor<T>
         if (buffer is null || buffer.Handle == IntPtr.Zero || buffer.Size < Length) return false;
 
         var view = CreateStorageView((int[])_shape.Clone(), (int[])_strides.Clone(), _storageOffset);
+        IDisposable? hold = null;
         try
         {
+            // The view keeps the storage, not the device memory: a TensorScope or the activation cache may release the
+            // buffer while the consumer still has its address. The hold parks every such release until the deleter,
+            // which also orders this backend's later work after the consumer's.
+            hold = device.HoldForExport(buffer, consumerStream.IsNoSync ? IntPtr.Zero : consumerStream.CudaStreamHandle);
             // The producer's half of the stream contract: the consumer's stream waits for the work that wrote the data.
             if (!consumerStream.IsNoSync) device.OrderStreamAfterPendingWork(consumerStream.CudaStreamHandle);
             exported = DLPack.CreateExport(
                 versioned, buffer.Handle, device.DLPackDeviceType, device.DeviceOrdinal, dtype,
-                view._shape, view._strides, readOnly: false, pin: default, keepAlive: view);
+                view._shape, view._strides, readOnly: false, pin: default, keepAlive: new DeviceExportLifetime(view, hold));
             return true;
         }
         catch
         {
             view.Dispose();
+            hold?.Dispose();
             throw;
         }
     }
 
+    /// <summary>What a device export keeps until its deleter: the storage view, then the device memory hold. The view
+    /// goes first, so a release it triggers is parked by the hold and runs when the hold ends.</summary>
+    private sealed class DeviceExportLifetime : IDisposable
+    {
+        private readonly IDisposable _view;
+        private readonly IDisposable _hold;
+
+        internal DeviceExportLifetime(IDisposable view, IDisposable hold)
+        {
+            _view = view;
+            _hold = hold;
+        }
+
+        public void Dispose()
+        {
+            try { _view.Dispose(); }
+            finally { _hold.Dispose(); }
+        }
+    }
     /// <summary>
     /// A host copy of a GPU-resident tensor with no device-pointer form, exported with the IS_COPIED flag (the consumer
     /// owns it outright). The legacy layout has no flags; the copy is still the consumer's alone.

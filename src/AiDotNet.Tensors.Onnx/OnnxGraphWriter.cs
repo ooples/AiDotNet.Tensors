@@ -88,7 +88,7 @@ internal sealed class OnnxGraphWriter<T> where T : unmanaged
         PruneUnusedInitializers();
         var model = new ModelProto
         {
-            IrVersion = 8,
+            IrVersion = IrVersionFor(Opset),
             ProducerName = _options.ProducerName ?? "AiDotNet.Tensors.Onnx",
             ProducerVersion = typeof(OnnxExporter).Assembly.GetName().Version?.ToString() ?? string.Empty,
             Graph = _graph,
@@ -245,15 +245,14 @@ internal sealed class OnnxGraphWriter<T> where T : unmanaged
         return new ValueInfoProto { Name = name, Type = new TypeProto { TensorType = tensorType } };
     }
 
-    /// <summary>Tensor identity (reference) equality.</summary>
-    internal sealed class TensorIdentity : IEqualityComparer<Tensor<T>>
-    {
-        public static readonly TensorIdentity Instance = new();
-        public bool Equals(Tensor<T>? x, Tensor<T>? y) => ReferenceEquals(x, y);
-        public int GetHashCode(Tensor<T> obj) => RuntimeHelpers.GetHashCode(obj);
-    }
+    /// <summary>
+    /// The IR version of the ONNX release that introduced <paramref name="opset"/>: opsets 17 and 18 shipped with IR 8
+    /// (ONNX 1.12, 1.13), 19 and 20 with IR 9 (ONNX 1.14, 1.15). A model declares the oldest IR its opset needs.
+    /// </summary>
+    internal static long IrVersionFor(long opset) => opset <= 18 ? 8 : 9;
 
-    private sealed class ReferenceEqualityComparer<TItem> : IEqualityComparer<TItem> where TItem : class
+    /// <summary>Reference equality, for tensors and storages alike.</summary>
+    internal sealed class ReferenceEqualityComparer<TItem> : IEqualityComparer<TItem> where TItem : class
     {
         public static readonly ReferenceEqualityComparer<TItem> Instance = new();
         public bool Equals(TItem? x, TItem? y) => ReferenceEquals(x, y);

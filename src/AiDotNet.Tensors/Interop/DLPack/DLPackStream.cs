@@ -42,11 +42,19 @@ public readonly struct DLPackStream : IEquatable<DLPackStream>
     /// A specific stream: a <c>cudaStream_t</c> / <c>CUstream</c> handle, such as
     /// <c>torch.cuda.current_stream().cuda_stream</c>.
     /// </summary>
-    /// <exception cref="ArgumentException">The handle is 0, 1 or 2: the array API reserves 0 as ambiguous, and 1 and
-    /// 2 are <see cref="LegacyDefault"/> and <see cref="PerThreadDefault"/>.</exception>
+    /// <remarks>The array API's reserved integers map to their named streams: -1 is <see cref="NoSync"/>, 1
+    /// <see cref="LegacyDefault"/> and 2 <see cref="PerThreadDefault"/>, so a binding may forward the raw
+    /// <c>__dlpack__(stream=...)</c> value.</remarks>
+    /// <exception cref="ArgumentException">The handle is 0, which the array API reserves as ambiguous, or negative
+    /// other than -1, which no CUDA stream is.</exception>
     public static DLPackStream FromHandle(IntPtr streamHandle)
     {
         long value = streamHandle.ToInt64();
+        if (value == -1) return NoSync;
+        if (value < 0)
+            throw new ArgumentException(
+                $"Stream {value} is not a CUDA stream handle; the only negative value the DLPack array API defines is -1 (no synchronization).",
+                nameof(streamHandle));
         if (value == 0)
             throw new ArgumentException(
                 "Stream 0 is ambiguous under the DLPack array API; pass LegacyDefault or PerThreadDefault instead.",

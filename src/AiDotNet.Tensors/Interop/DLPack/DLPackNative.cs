@@ -28,6 +28,7 @@ internal static class DLPackNative
     internal const int DeviceCpu = 1;
     internal const int DeviceCuda = 2;
     internal const int DeviceCudaHost = 3;
+    internal const int DeviceRocm = 10;
     internal const int DeviceRocmHost = 11;
     internal const int DeviceCudaManaged = 13;
 

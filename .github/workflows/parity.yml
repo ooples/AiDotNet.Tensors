@@ -88,7 +88,9 @@ jobs:
         run: |
           python -m pip install "onnx==1.23.2"
           python tools/parity/export_torch_onnx.py --out "$RUNNER_TEMP/torch-onnx"
-          export AIDOTNET_TORCH_PYTHON="$(python -c 'import sys; print(sys.executable)')"
+          # Assigned, then exported: `export X="$(cmd)"` would drop python's exit status.
+          AIDOTNET_TORCH_PYTHON="$(python -c 'import sys; print(sys.executable)')"
+          export AIDOTNET_TORCH_PYTHON
           export AIDOTNET_TORCH_ONNX_DIR="$RUNNER_TEMP/torch-onnx"
           dotnet build tests/AiDotNet.Tensors.Onnx.Tests/AiDotNet.Tensors.Onnx.Tests.csproj --configuration Release --framework net10.0
           set -o pipefail
