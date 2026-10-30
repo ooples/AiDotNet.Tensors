@@ -63,6 +63,32 @@ public sealed class CompiledRank3LinearTests
                 $"[{i}] eager {expected[i]} compiled {actual[i]}");
     }
 
+    /// <summary>
+    /// B a constant non-contiguous view (a permuted weight, as HippoMemoryCellLayer's A^T): a frozen-weight pack of B
+    /// must read it through its strides. Found by the AiDotNet model sweep (HiPPO layer diverging at layer 0).
+    /// </summary>
+    [Theory]
+    [InlineData(64, 8)]
+    [InlineData(64, 32)]
+    [InlineData(8, 8)]
+    [InlineData(256, 16)]
+    public void MatMulByAPermutedConstant_CompiledMatchesEager(int rows, int n)
+    {
+        var engine = new CpuEngine();
+        var a = Random(new[] { n, n }, 5);
+        var aT = engine.TensorPermute(a, new[] { 1, 0 });
+        var input = Random(new[] { rows, n }, 6);
+        Tensor<float> Forward(Tensor<float> x) => engine.TensorAdd(x, engine.TensorMatMul(x, aT));
+        var expected = Forward(input).AsSpan().ToArray();
+        using var cache = new CompiledModelCache<float>();
+        var plan = cache.GetOrCompileInference(input, () => Forward(input));
+        plan.SetInputs(new[] { input });
+        var actual = plan.Execute().AsSpan().ToArray();
+        for (int i = 0; i < expected.Length; i++)
+            Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-4f + 1e-4f * Math.Abs(expected[i]),
+                $"[{i}] eager {expected[i]} compiled {actual[i]}");
+    }
+
     [Theory]
     [MemberData(nameof(Shapes))]
     public void Rank3Linear_CompiledMatchesEager(int batch, int seq, int inF, int outF, int activation)
