@@ -7970,8 +7970,12 @@ public partial class DirectGpuTensorEngine
             // rows explicitly) and for a backend that has neither.
             if (mask is null)
             {
-                Tensor<T>? headsOut = null;
-                if ((long)B * H * S * S <= MhaBatchedScoreElementBudget)
+                // The short-sequence kernel reads the projections in place and writes [B, S, H*d]: no head permutes,
+                // no score tensor, one launch (see IShortAttentionForwardBackend).
+                Tensor<T>? headsOut = TryShortAttentionOnDevice(q2d.Reshape(new[] { B, S, D }), k2d.Reshape(new[] { B, S, D }),
+                    v2d.Reshape(new[] { B, S, D }), B, H, S, S, d, 1.0 / System.Math.Sqrt(d), causal: false, causalOffset: 0,
+                    new[] { B, S, D });
+                if (headsOut is null && (long)B * H * S * S <= MhaBatchedScoreElementBudget)
                 {
                     var qhB = ReshapePermuteHeads(backend, q2d, B, S, H, d);                                    // [B*H, S, d]
                     var khT = PermuteResidentGpu(backend, k2d.Reshape(new[] { B, S, H, d }), new[] { 0, 2, 3, 1 })
@@ -7982,7 +7986,7 @@ public partial class DirectGpuTensorEngine
                     headsOut = PermuteResidentGpu(backend, BatchMatMul(attnB, vhB).Reshape(new[] { B, H, S, d }),
                         new[] { 0, 2, 1, 3 });                                                                 // [B, S, H, d]
                 }
-                else
+                else if (headsOut is null)
                 {
                     headsOut = TryFusedAttentionOnDevice("MultiHeadAttentionForward", q2d.Reshape(new[] { B, S, D }),
                         k2d.Reshape(new[] { B, S, D }), v2d.Reshape(new[] { B, S, D }), null, B, H, S, S, d,
