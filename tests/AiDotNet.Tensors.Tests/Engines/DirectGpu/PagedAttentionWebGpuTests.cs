@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Correctness tests for the WebGPU paged-attention decode kernel (P1), validated against a standard-
 // attention CPU oracle. Skips when the WebGPU native runtime is unavailable; runs on a WebGPU host / CI.
 

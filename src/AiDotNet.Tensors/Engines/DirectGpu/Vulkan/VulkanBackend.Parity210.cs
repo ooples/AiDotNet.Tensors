@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Vulkan launcher shims for the parity-210 kernels. Uses VulkanBackend's
 // existing GlslUnaryOp / GlslBinaryOp helpers, which cache compiled SPIR-V
 // pipelines by source hash so repeated dispatches are O(1) after first call.

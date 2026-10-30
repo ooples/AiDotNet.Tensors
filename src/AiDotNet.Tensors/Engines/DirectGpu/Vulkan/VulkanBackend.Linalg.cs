@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Vulkan dispatchers for the torch.linalg decomposition kernels (#211 moat #2).
 // Reuses the GLSL compute-pipeline machinery already in place for Parity-210.
 

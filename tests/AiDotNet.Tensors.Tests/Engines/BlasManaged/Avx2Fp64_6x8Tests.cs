@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // #409 S.4: correctness gate for the new Avx2Fp64_6x8 microkernel (the higher-
 // arithmetic-intensity FP64 tile — the double analog of the S.3 FP32 6x16 win).
 // Validates Run and RunStridedB against a scalar reference across several Kc,

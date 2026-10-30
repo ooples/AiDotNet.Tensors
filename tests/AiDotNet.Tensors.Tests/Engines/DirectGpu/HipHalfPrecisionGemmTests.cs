@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Correctness tests for the HIP/ROCm IGpuHalfPrecisionBackend implementation
 // (issue #560): FP16 GEMM (C = A·B) on AMD GPUs instead of a scalar CPU fallback.
 

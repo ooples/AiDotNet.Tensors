@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Vulkan device kernels for the PyTorch-parity elementwise ops (#1127), the peers of
 // CUDA/Kernels/CudaTorchParityElementwiseKernels.
 //

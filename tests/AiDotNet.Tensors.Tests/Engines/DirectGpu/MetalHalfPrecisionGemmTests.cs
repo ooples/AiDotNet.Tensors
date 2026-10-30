@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Correctness tests for the Metal IGpuHalfPrecisionBackend implementation
 // (issue #560): FP16 GEMM (C = A·B) on Apple GPUs via an MSL compute kernel.
 

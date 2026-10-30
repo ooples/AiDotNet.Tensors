@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.Autodiff;

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // GPU↔CPU parity tests for the Issue #210 hot-path op surface. Each test
 // runs an op through DirectGpuTensorEngine (which routes to the active
 // GPU backend via IParity210Backend) and compares the result to the

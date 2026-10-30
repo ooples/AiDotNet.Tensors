@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // GLSL compute shader sources for Issue #160 spectral perf kernels.
 // Compiled at runtime to SPIR-V via shaderc.
 

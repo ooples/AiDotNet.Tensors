@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 //
 // int4-NATIVE VNNI GEMM (Phase A / #1622, L5a compute rung).
 //

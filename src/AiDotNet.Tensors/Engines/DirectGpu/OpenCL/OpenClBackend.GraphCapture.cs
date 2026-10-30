@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 
 // No device graphs on this backend: work runs eagerly, which is what a zero capture handle tells every caller.

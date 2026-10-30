@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The guarded-body half of the padding-identity contract (see CodegenPaddedMaxTests).
 //
 // CodegenKernelSpec.Interpret gives an out-of-range tap the identity OF THE REDUCTION and

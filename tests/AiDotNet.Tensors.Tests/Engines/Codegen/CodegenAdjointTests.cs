@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The adjoint test that matters: <forward(x), y> == <x, backward(y)>.
 //
 // Checking a derived backward kernel against its own interpreter proves only that the

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // OpenCL launcher for categorical sampling. Mirrors OpenClBackend.Ann.cs's pattern: pull the
 // compiled DirectOpenClKernel from _kernelCache and dispatch via kernel.Execute1D.
 using System;

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Validates the static bottleneck model against measured hardware.
 //
 // A performance model nobody checks is a decoration. These tests pin it to numbers

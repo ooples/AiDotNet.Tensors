@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Issue #478 — cross-arena persistent buffer pool. A caller that creates +
 // disposes a fresh TensorArena PER training step (e.g.
 // NeuralNetworkBase.TrainWithTape) must NOT re-allocate the large transient

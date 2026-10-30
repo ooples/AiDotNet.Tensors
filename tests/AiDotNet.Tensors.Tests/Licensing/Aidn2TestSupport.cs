@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Test support for the offline aidn2 (Ed25519) license-token path: an ephemeral test keypair whose PUBLIC
 // half is injected into TensorsLicensePublicKeyProvider and whose PRIVATE half signs real test tokens/CRLs,
 // so tests exercise the genuine cryptographic verification path.

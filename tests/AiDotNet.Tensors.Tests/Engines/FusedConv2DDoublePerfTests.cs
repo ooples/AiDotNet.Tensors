@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Correctness tests for issue #251 — the double-precision FusedConv2D
 // fast path (Conv + Bias fused in one SIMD pass) and the 1×1 Conv
 // fast path in Conv2DWithIm2ColDouble.

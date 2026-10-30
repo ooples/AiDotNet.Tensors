@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Tests for the Vulkan FP16-NATIVE op kernels (issue #558): GELU / ReLU / residual-add over packed-half
 // activations, computed in FP32 in-register. GPU counterpart of the CPU FP16-native emit.
 

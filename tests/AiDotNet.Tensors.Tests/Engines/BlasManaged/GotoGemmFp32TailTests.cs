@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // #653: the GotoBLAS-style FP32 GEMM runs a C block's M-tail rows (effMc % 6) on the microkernel through a zero-padded
 // A sub-panel. Validates RunSingle and RunTile (via RunParallel) against a double reference on every M-tail length,
 // an N-tail, K crossing the 256 K-block, and blocks that leave a tail in more than one M-block.
