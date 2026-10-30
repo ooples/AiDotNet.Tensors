@@ -39,6 +39,8 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
 
     // What Create charged DeviceMemoryReclaim for this buffer; zero for a view.
     private long _reclaimCharge;
+    // The DeviceMemoryReclaim epoch that charge is counted in: a collection reset since then already dropped it.
+    private long _reclaimEpoch = -1;
 
     /// <summary>Buffers created through the driver (pool misses) since the process started.</summary>
     internal static long DriverAllocations => System.Threading.Interlocked.Read(ref s_driverAllocations);
@@ -133,10 +135,11 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
         // is, so small results have to come back from the collector by count; charged by their bytes alone, sixteen
         // thousand 16 KB results would be created before the first collection returned any.
         long charge = Math.Max((long)size * sizeof(float), MinimumReclaimCharge);
-        DeviceMemoryReclaim.OnDeviceAllocation(charge);
+        long reclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation(charge);
         var buffer = Rent(size);
         // Its owner's Dispose credits the charge back (see Dispose); a view never carries one.
         buffer._reclaimCharge = charge;
+        buffer._reclaimEpoch = reclaimEpoch;
         return buffer;
     }
 
@@ -238,7 +241,7 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
         // Disposed by its owner, not abandoned to the finalizer: no collection is needed to get it back (as OpenCL credits
         // its buffers). Without the credit a TensorScope's frees still counted toward a forced collection.
         long charge = System.Threading.Interlocked.Exchange(ref _reclaimCharge, 0);
-        if (charge > 0) DeviceMemoryReclaim.OnDeviceRelease(charge);
+        if (charge > 0) DeviceMemoryReclaim.OnDeviceRelease(charge, _reclaimEpoch);
         ReleaseWhenIdle(this);
     }
 

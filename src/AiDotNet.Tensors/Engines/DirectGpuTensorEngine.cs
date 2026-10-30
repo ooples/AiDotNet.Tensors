@@ -1,4 +1,4 @@
-﻿﻿using System;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Linq;
 using System.Runtime.CompilerServices;
@@ -1989,6 +1989,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return _activationCache.TryGetValue(key, out var entry)
             && ReferenceEquals(entry.Buffer, tensor._gpuBuffer)
             && ReferenceEquals(entry.Backend, backend);
+    }
+    /// <summary>Whether <paramref name="tensor"/>'s data is held by the activation cache: a device op's result, where a
+    /// CPU fallback's result is not.</summary>
+    internal bool IsInActivationCache<T>(Tensor<T> tensor)
+    {
+        var key = (object?)tensor.GetBackingArrayForCacheLookupUnsafe() ?? tensor.DataVector;
+        return _activationCache.ContainsKey(key);
     }
 
     /// <summary>

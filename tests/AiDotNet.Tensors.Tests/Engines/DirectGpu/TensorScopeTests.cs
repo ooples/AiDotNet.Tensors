@@ -222,7 +222,11 @@ public sealed class TensorScopeTests
             using (var inner = TensorScope.Begin())
             {
                 owned = TensorScope.Detach(Resident(gpu, 8, 30f));         // owns its buffer
-                activation = TensorScope.Detach(gpu.TensorPower(source, 0.5f));   // lives in the activation cache
+                var power = gpu.TensorPower(source, 0.5f);
+                // TensorPower answers on the CPU when the device path fails, and that result is not in the activation
+                // cache: without this the value assertions below would pass without testing the cache's detach.
+                Assert.True(gpu.IsInActivationCache(power), "TensorPower fell back to the CPU; its result is not in the activation cache");
+                activation = TensorScope.Detach(power);   // lives in the activation cache
                 keptInner = inner.Keep(Resident(gpu, 8, 40f));
                 Assert.Equal(0, inner.TrackedCount);   // Detach forgot the owned result; Keep handed the other up
             }
