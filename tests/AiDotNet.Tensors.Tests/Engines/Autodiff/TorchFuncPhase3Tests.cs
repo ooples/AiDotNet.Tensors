@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Phase 3 of issue #214: Vjp, JacRev, JacFwd, Hessian, Vmap, FunctionalCall.
 //
 // Nullable disabled for the ArgumentNullException-testing scenarios

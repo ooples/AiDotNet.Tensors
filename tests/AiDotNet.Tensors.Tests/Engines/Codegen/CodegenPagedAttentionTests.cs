@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Paged attention as a declared program (#890 phase 4d). The reference here is the online-softmax loop that
 // paged_attention_decode runs -- read off that kernel, not off the declared program -- so the page indirection and
 // the k = page*blockSize + pos arithmetic have to agree with the kernel they replace rather than with themselves.

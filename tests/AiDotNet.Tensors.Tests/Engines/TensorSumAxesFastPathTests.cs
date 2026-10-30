@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Pins the allocation-free contiguous fast path added to Tensor<T>.Sum(int[] axes)
 // (Tensor.cs). Profiling found the old SumRecursive — a `new int[]` heap alloc +
 // multi-dim strided indexer + axes.Contains() scan PER ELEMENT — was ~40% of a

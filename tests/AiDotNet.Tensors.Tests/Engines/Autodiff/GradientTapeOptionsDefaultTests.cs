@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // PR #333 — GradientTapeOptions.Default now ships with Persistent=true,
 // which gates the AutoTrainingCompiler fast path that cut 65-73% of
 // ComputeGradients walltime on VGG / ResNet profile data. The change

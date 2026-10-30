@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Vulkan GLSL compute shaders for GEMM (C = A·B), compiled to SPIR-V at runtime
 // (libshaderc). These give the Vulkan backend a REAL on-device matmul — the
 // previous Gemm downloaded to the CPU, looped, and re-uploaded. Issue #560 (FP16)

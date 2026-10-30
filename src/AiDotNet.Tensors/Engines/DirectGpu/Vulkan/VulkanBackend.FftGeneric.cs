@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Generic-storage, arbitrary-length Vulkan FFT dispatch (#964).
 using System;
 

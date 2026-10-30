@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // #653: correctness gate for Avx2Fp32_6x16.RunPrefetch (the opt-in software-prefetch
 // variant wired behind AIDOTNET_GEMM_PREFETCH=1). The PR's central claim is that prefetch
 // is BIT-IDENTICAL to the non-prefetch Run (same FMA order — it only adds PREFETCHT0 hints).

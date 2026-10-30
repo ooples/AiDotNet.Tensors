@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // PTX transfer tracking. Which CUDA kernels have a PTX replacement, and how far
 // along it is — the ledger that answers "when can we delete the CUDA kernels?".
 #if NETCOREAPP

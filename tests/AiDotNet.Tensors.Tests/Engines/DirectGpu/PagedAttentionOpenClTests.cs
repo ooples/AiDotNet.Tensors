@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Correctness tests for the OpenCL paged-attention decode kernel (P1): attention that gathers K/V
 // through a block table, validated against a standard-attention CPU oracle. Skips when no OpenCL
 // device is available, unless AIDOTNET_REQUIRE_GPU_TESTS=1.

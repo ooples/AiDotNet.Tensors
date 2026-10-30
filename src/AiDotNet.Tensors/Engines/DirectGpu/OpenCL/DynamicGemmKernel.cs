@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Dynamic GEMM kernel generator - compiles kernels with parameters baked in like CLBlast.
 
 using System;

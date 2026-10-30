@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Issue #285 — buffer size cap + chunked fallback test coverage.
 // Pure-logic tests; integration tests gated on real GPU availability live elsewhere.
 

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CLBlast device info mapping (vendor/architecture/device name normalization).
 using System;
 

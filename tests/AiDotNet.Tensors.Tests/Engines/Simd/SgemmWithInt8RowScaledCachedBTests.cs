@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Tensors#401: regression coverage for the per-row-scaled INT8 weight-only
 // GEMM. The kernel mirrors SgemmWithInt8CachedB's tile pipeline but skips
 // the FP32→INT8 quantize step (consumer hands us pre-quantized sbyte[])

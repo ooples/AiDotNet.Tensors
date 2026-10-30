@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // #409 S.3: correctness gate for the new Avx2Fp32_6x16 microkernel (the higher-
 // arithmetic-intensity replacement for the load-bound 8x8). Validates Run and
 // RunStridedB against a scalar reference across several Kc, BEFORE the kernel is

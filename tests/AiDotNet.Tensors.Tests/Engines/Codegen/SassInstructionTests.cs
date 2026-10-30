@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // The own SASS backend's bit model (#1442) against a real ptxas cubin: k1 below is
 //   y[i] = fma(a[i], b[i], a[i]) for i < 1000, 256 threads a block
 // compiled by ptxas 13.1 for sm_75. Its instructions (nvdisasm -hex) are quoted where a test reads them.

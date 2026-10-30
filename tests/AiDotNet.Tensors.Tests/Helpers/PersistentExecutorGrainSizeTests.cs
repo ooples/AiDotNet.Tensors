@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Issue #313 regression — PersistentParallelExecutor must not dispatch
 // to its worker pool when the total elementwise work is below the
 // configured grain size. Below threshold, every call must run on the

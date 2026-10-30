@@ -39,7 +39,10 @@ public class Fp64ConvDirectTests
 
         // Reference: pad=0 & stride=1 means im2col(1×1) is identity, so we
         // can compare against a hand-rolled per-pixel matmul.
-        var expected = new Tensor<double>(new[] { batch, outC, hw, hw });
+        // Flat arrays: the tensor indexer resolves host sync on every access, which made the [1,2048,7,1000] case
+        // (about 10^8 accesses) outlast the 10-minute hang timeout under coverage.
+        double[] inputs = input.ToArray(), weights = kernel.ToArray(), actual = direct.ToArray();
+        var expected = new double[batch * outC * hw * hw];
         int spatial = hw * hw;
         for (int b = 0; b < batch; b++)
             for (int oc = 0; oc < outC; oc++)
@@ -47,13 +50,14 @@ public class Fp64ConvDirectTests
                 {
                     double sum = 0;
                     for (int ic = 0; ic < inC; ic++)
-                        sum += input[b * inC * spatial + ic * spatial + s] * kernel[oc * inC + ic];
+                        sum += inputs[b * inC * spatial + ic * spatial + s] * weights[oc * inC + ic];
                     expected[b * outC * spatial + oc * spatial + s] = sum;
                 }
 
+        Assert.Equal(expected.Length, actual.Length);
         for (int i = 0; i < expected.Length; i++)
-            Assert.True(Math.Abs(expected[i] - direct[i]) < 1e-10,
-                $"[{i}] expected={expected[i]:F12} actual={direct[i]:F12}");
+            Assert.True(Math.Abs(expected[i] - actual[i]) < 1e-10,
+                $"[{i}] expected={expected[i]:F12} actual={actual[i]:F12}");
     }
 
     [Theory]

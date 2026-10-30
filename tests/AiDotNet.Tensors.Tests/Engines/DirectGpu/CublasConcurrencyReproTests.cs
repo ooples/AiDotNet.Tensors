@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // #226 regression guard. Before the per-thread cuBLAS handle fix, N host threads shared ONE
 // non-thread-safe cublasHandle on the process-global GPU engine; concurrent GEMMs corrupted the
 // handle's internal state and faulted with a sticky CUDA-700 (illegal address), later misreported at

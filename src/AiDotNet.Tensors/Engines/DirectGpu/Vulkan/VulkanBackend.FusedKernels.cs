@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // IDirectGpuBackend fused kernel implementations for VulkanBackend.
 // Dispatches to runtime-compiled GLSL compute shaders via VulkanGlslCompiler (libshaderc).
 

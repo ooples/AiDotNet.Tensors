@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Correctness tests for the Vulkan weight-only fused dequant-GEMM (P0), validated against a CPU
 // reference implementing the same contract as FusedDequantMatmulKernels. Skips when the Vulkan
 // backend or its runtime GLSL compiler (libshaderc) is unavailable on this host.

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Vulkan launcher shims for the fused ANN kernels (IAnnBackend). Mirrors
 // VulkanBackend.Detection.cs — pipelines are cached by GLSL source hash via
 // GetOrCreateGlslPipeline, so the first call compiles SPIR-V and subsequent
