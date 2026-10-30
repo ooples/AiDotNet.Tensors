@@ -4463,8 +4463,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // A pooled gradient no backward writes shares its buffer with tenants that do, so keeping it pooled means
                 // restoring its zeros at every step: one memset node per such gradient in the captured graph. Its own
                 // buffer is zeroed once and stays zero (the held-zero record), so it leaves the pool instead.
-                foreach (int i in unwritten)
-                    if (pooledGrads[i]) UnpoolGradient(i);
+                foreach (int i in unwritten.Where(g => pooledGrads[g]).ToArray())
+                    UnpoolGradient(i);
                 var zeroAtStart = new bool[pooledGrads.Length];
                 foreach (int i in unwritten) zeroAtStart[i] = pooledGrads[i];
                 _pooledGradZeroAtStart = zeroAtStart;
