@@ -934,14 +934,20 @@ public sealed unsafe partial class VulkanBackend
         int stateSize = checked(batch * hiddenSize);
         Copy(hInit, 0, allH, 0, stateSize);
         Copy(cInit, 0, allC, 0, stateSize);
-        GlslNaryOp(VulkanResidentKernels.LstmForwardSequence,
-            new[] { input, weightsIh, weightsHh, biasIh, biasHh, output, allH, allC, cacheGates }, batch,
-            new[] { (uint)seqLen, (uint)batch, (uint)inputSize, (uint)hiddenSize });
+        GlslNaryOp(VulkanResidentKernels.LstmSequenceInputProjection,
+            new[] { input, weightsIh, biasIh, biasHh, cacheGates }, checked(seqLen * batch * 4 * hiddenSize),
+            RecurrentShape(seqLen, batch, inputSize, hiddenSize));
+        var step = new[] { weightsHh, cacheGates, allH, allC, output };
+        for (int t = 0; t < seqLen; t++)
+            GlslNaryOp(VulkanResidentKernels.LstmSequenceStep, step, stateSize,
+                RecurrentShape(seqLen, batch, inputSize, hiddenSize, (uint)t));
         Copy(allH, checked(seqLen * stateSize), hFinal, 0, stateSize);
         Copy(allC, checked(seqLen * stateSize), cFinal, 0, stateSize);
         return true;
     }
 
+    // Writes every gradient (LstmBackwardOverwritesGradients). The cell carry is gradCInit and the hidden carry gradHInit,
+    // so after step 0 they hold dL/dc0 and dL/dh0.
     private bool DispatchLstmBackwardSequence(
         IGpuBuffer gradOutput, IGpuBuffer allH, IGpuBuffer allC, IGpuBuffer cacheGates,
         IGpuBuffer weightsIh, IGpuBuffer weightsHh, IGpuBuffer input,
@@ -950,14 +956,34 @@ public sealed unsafe partial class VulkanBackend
         int seqLen, int batch, int inputSize, int hiddenSize)
     {
         if (seqLen <= 0 || batch <= 0 || inputSize <= 0 || hiddenSize <= 0) return true;
-        using var nextDh = AllocateBuffer(checked(batch * hiddenSize));
-        GlslNaryOp(VulkanResidentKernels.LstmBackwardSequence,
-            new[] { gradOutput, allH, allC, cacheGates, weightsIh, weightsHh, input,
-                gradInput, gradHInit, gradCInit, gradWeightsIh, gradWeightsHh, gradBiasIh, nextDh }, 1,
-            new[] { (uint)seqLen, (uint)batch, (uint)inputSize, (uint)hiddenSize });
-        Copy(gradBiasIh, gradBiasHh, checked(4 * hiddenSize));
+        int stateSize = checked(batch * hiddenSize), gates = checked(4 * hiddenSize);
+        using var dGates = AllocateBuffer(checked(seqLen * batch * gates));
+        Fill(gradHInit, 0f, stateSize);
+        Fill(gradCInit, 0f, stateSize);
+        var cell = new[] { gradOutput, allC, cacheGates, dGates, gradHInit, gradCInit };
+        var hidden = new[] { dGates, weightsHh, gradHInit };
+        for (int t = seqLen - 1; t >= 0; t--)
+        {
+            var shape = RecurrentShape(seqLen, batch, inputSize, hiddenSize, (uint)t);
+            GlslNaryOp(VulkanResidentKernels.LstmSequenceBackwardCell, cell, stateSize, shape);
+            GlslNaryOp(VulkanResidentKernels.LstmSequenceBackwardHidden, hidden, stateSize, shape);
+        }
+        GlslNaryOp(VulkanResidentKernels.LstmSequenceInputGradient, new[] { dGates, weightsIh, gradInput },
+            checked(batch * seqLen * inputSize), RecurrentShape(seqLen, batch, inputSize, hiddenSize));
+        GlslNaryOp(VulkanResidentKernels.LstmSequenceWeightGradient, new[] { dGates, input, gradWeightsIh },
+            checked(gates * inputSize), RecurrentShape(seqLen, batch, inputSize, hiddenSize, 0));
+        GlslNaryOp(VulkanResidentKernels.LstmSequenceWeightGradient, new[] { dGates, allH, gradWeightsHh },
+            checked(gates * hiddenSize), RecurrentShape(seqLen, batch, inputSize, hiddenSize, 1));
+        GlslNaryOp(VulkanResidentKernels.LstmSequenceBiasGradient, new[] { dGates, gradBiasIh, gradBiasHh }, gates,
+            RecurrentShape(seqLen, batch, inputSize, hiddenSize));
         return true;
     }
+
+    private static uint[] RecurrentShape(int seqLen, int batch, int inputSize, int hiddenSize) =>
+        new[] { (uint)seqLen, (uint)batch, (uint)inputSize, (uint)hiddenSize };
+
+    private static uint[] RecurrentShape(int seqLen, int batch, int inputSize, int hiddenSize, uint extra) =>
+        new[] { (uint)seqLen, (uint)batch, (uint)inputSize, (uint)hiddenSize, extra };
 
     private bool DispatchGruForwardSequence(
         IGpuBuffer input, IGpuBuffer hInit,
@@ -968,13 +994,18 @@ public sealed unsafe partial class VulkanBackend
         if (seqLen <= 0 || batch <= 0 || inputSize <= 0 || hiddenSize <= 0) return true;
         int stateSize = checked(batch * hiddenSize);
         Copy(hInit, 0, allH, 0, stateSize);
-        GlslNaryOp(VulkanResidentKernels.GruForwardSequence,
-            new[] { input, weightsIh, weightsHh, biasIh, biasHh, output, allH, cacheGates }, batch,
-            new[] { (uint)seqLen, (uint)batch, (uint)inputSize, (uint)hiddenSize });
+        GlslNaryOp(VulkanResidentKernels.GruSequenceInputProjection,
+            new[] { input, weightsIh, biasIh, cacheGates }, checked(seqLen * batch * 3 * hiddenSize),
+            RecurrentShape(seqLen, batch, inputSize, hiddenSize));
+        var step = new[] { weightsHh, biasHh, cacheGates, allH, output };
+        for (int t = 0; t < seqLen; t++)
+            GlslNaryOp(VulkanResidentKernels.GruSequenceStep, step, stateSize,
+                RecurrentShape(seqLen, batch, inputSize, hiddenSize, (uint)t));
         Copy(allH, checked(seqLen * stateSize), hFinal, 0, stateSize);
         return true;
     }
 
+    // Writes every gradient. dHBuffer carries dL/dh back through the steps; gradHInit receives its value after step 0.
     private bool DispatchGruBackwardSequence(
         IGpuBuffer gradOutput, IGpuBuffer allH, IGpuBuffer cacheGates,
         IGpuBuffer weightsIh, IGpuBuffer weightsHh, IGpuBuffer input,
@@ -984,13 +1015,26 @@ public sealed unsafe partial class VulkanBackend
     {
         if (seqLen <= 0 || batch <= 0 || inputSize <= 0 || hiddenSize <= 0) return true;
         int stateSize = checked(batch * hiddenSize);
-        using var nextDh = AllocateBuffer(stateSize);
-        GlslNaryOp(VulkanResidentKernels.GruBackwardSequence,
-            new[] { gradOutput, allH, cacheGates, weightsIh, weightsHh, input,
-                gradInput, gradHInit, gradWeightsIh, gradWeightsHh, gradBiasIh, nextDh }, 1,
-            new[] { (uint)seqLen, (uint)batch, (uint)inputSize, (uint)hiddenSize });
-        Copy(gradHInit, dHBuffer, stateSize);
-        Copy(gradBiasIh, gradBiasHh, checked(3 * hiddenSize));
+        // dr, dz, dn and dn * r for every step and row.
+        using var dGates = AllocateBuffer(checked(seqLen * batch * 4 * hiddenSize));
+        Fill(dHBuffer, 0f, stateSize);
+        var cell = new[] { gradOutput, allH, cacheGates, dGates, dHBuffer };
+        var hidden = new[] { dGates, weightsHh, dHBuffer };
+        for (int t = seqLen - 1; t >= 0; t--)
+        {
+            var shape = RecurrentShape(seqLen, batch, inputSize, hiddenSize, (uint)t);
+            GlslNaryOp(VulkanResidentKernels.GruSequenceBackwardCell, cell, stateSize, shape);
+            GlslNaryOp(VulkanResidentKernels.GruSequenceBackwardHidden, hidden, stateSize, shape);
+        }
+        GlslNaryOp(VulkanResidentKernels.GruSequenceInputGradient, new[] { dGates, weightsIh, gradInput },
+            checked(seqLen * batch * inputSize), RecurrentShape(seqLen, batch, inputSize, hiddenSize));
+        GlslNaryOp(VulkanResidentKernels.GruSequenceWeightGradient, new[] { dGates, input, gradWeightsIh },
+            checked(3 * hiddenSize * inputSize), RecurrentShape(seqLen, batch, inputSize, hiddenSize, 0));
+        GlslNaryOp(VulkanResidentKernels.GruSequenceWeightGradient, new[] { dGates, allH, gradWeightsHh },
+            checked(3 * hiddenSize * hiddenSize), RecurrentShape(seqLen, batch, inputSize, hiddenSize, 1));
+        GlslNaryOp(VulkanResidentKernels.GruSequenceBiasGradient, new[] { dGates, gradBiasIh, gradBiasHh },
+            checked(3 * hiddenSize), RecurrentShape(seqLen, batch, inputSize, hiddenSize));
+        Copy(dHBuffer, gradHInit, stateSize);
         return true;
     }
 
