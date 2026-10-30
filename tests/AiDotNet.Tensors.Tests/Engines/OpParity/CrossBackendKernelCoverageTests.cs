@@ -71,6 +71,7 @@ public sealed class CrossBackendKernelCoverageTests
         "bx_reduce_log_variance_backward",   // -> bx_reduce_backward mode 3
         "bx_sparsemax",                      // -> bx_row_map mode 5
         "add_gelu", "add_relu", "add_sigmoid",                 // fused bias+activation epilogue (CudaBackend.cs)
+        "bias_activation",                                     // OpenCL GemmBias* epilogue; CUDA/HIP run every GemmBias* op with their own gemm_bias_* / bias_add kernels (CudaBackend.cs, HipBackend.cs)
         "clip_by_value", "where_select", "max_axis", "var_axis", // elementwise/axis-reduce (CudaBackend.cs)
         "mixed_precision_forward", "mixed_precision_backward",  // CudaBackend.MixedPrecisionConv.cs
         "global_maxpool2d_with_indices",                       // -> global_maxpool2d (+backward)
