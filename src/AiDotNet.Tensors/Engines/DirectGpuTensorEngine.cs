@@ -8672,6 +8672,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             case FusedActivationType.HardTanh:
                 backend.Hardtanh(input, output, -1.0f, 1.0f, size);
                 break;
+            case FusedActivationType.ReLU6:
+                // MobileNetV2's activation: the fused conv + BatchNorm path threw here, so a GPU predict crashed.
+                backend.Relu6(input, output, size);
+                break;
             case FusedActivationType.None:
                 if (!ReferenceEquals(input, output))
                 {
