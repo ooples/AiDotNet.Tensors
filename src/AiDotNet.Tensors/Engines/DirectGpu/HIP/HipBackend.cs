@@ -1524,6 +1524,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         DrainCollectedBuffers();
         if (_bufferPool.TryRent(data.Length, out var pooled) && pooled != null)
         {
+            DeviceMemoryReclaim.OnDeviceAllocation((long)data.Length * sizeof(float));
             fixed (float* dataPtr = data)
             {
                 var result = HipNativeBindings.hipMemcpy(
@@ -1621,7 +1622,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
         DrainCollectedBuffers();
         if (_bufferPool.TryRent(size, out var pooled) && pooled != null)
+        {
+            DeviceMemoryReclaim.OnDeviceAllocation(sizeInBytes);
             return pooled;
+        }
 
         var allocResult = HipMallocReclaiming(ref devicePtr, sizeBytes); // lgtm[cs/call-to-unmanaged-code] HIP interop requires native driver calls.
         HipNativeBindings.CheckError(allocResult, "hipMalloc");
@@ -12564,6 +12568,10 @@ internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
         if (Interlocked.CompareExchange(ref _poolState, 1, 0) != 0)
             return;
 
+        // Disposed by its owner, not abandoned to the finalizer: no collection is needed to get it back. AllocateBuffer
+        // charged a pooled buffer its size (pool hit or hipMalloc); without the credit a TensorScope's frees still counted
+        // toward a forced collection.
+        DeviceMemoryReclaim.OnDeviceRelease(SizeInBytes);
         try
         {
             _returnToPool(this);

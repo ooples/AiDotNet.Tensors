@@ -180,6 +180,32 @@ public sealed class TensorScopeTests
         Assert.Throws<InvalidOperationException>(() => handedUp.ToArray());
     }
 
+    // A cache a model builds on its first forward is held past every scope open around the call: Detach takes it out of
+    // all of them, where Keep in the inner scope only hands it to the enclosing one, which then frees it.
+    [SkippableFact]
+    public void Detach_OutlivesEveryOpenScope_KeepOnlyTheInnerOne()
+    {
+        using var gpu = TryEngine(out string noGpu);
+        Skip.If(gpu is null, noGpu);
+        var source = new Tensor<float>(new[] { 1f, 4f, 9f, 16f }, new[] { 4 });
+        Tensor<float> owned, activation, keptInner;
+        using (TensorScope.Begin())
+        {
+            using (var inner = TensorScope.Begin())
+            {
+                owned = TensorScope.Detach(Resident(gpu, 8, 30f));         // owns its buffer
+                activation = TensorScope.Detach(gpu.TensorPower(source, 0.5f));   // lives in the activation cache
+                keptInner = inner.Keep(Resident(gpu, 8, 40f));
+                Assert.Equal(0, inner.TrackedCount);   // Detach forgot the owned result; Keep handed the other up
+            }
+        }
+
+        Assert.Equal(30f, owned.ToArray()[0]);
+        Assert.Equal(37f, owned.ToArray()[7]);
+        Assert.Equal(4f, activation.ToArray()[3], 4);
+        Assert.Throws<InvalidOperationException>(() => keptInner.ToArray());
+    }
+
     // Results that live in the activation cache rather than owning their buffer (TensorPower's FinishGpuOp path) are
     // freed by the engine's cache when the scope ends, like a finished tape's intermediates, unless kept.
     [SkippableFact]
