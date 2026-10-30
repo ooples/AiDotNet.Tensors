@@ -31,7 +31,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                         {
                             new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.im2col_gemm", TunedKernelOrigin.Generated, true,
                                 shape => TunedConv2DArgs.GemmScratchFits(shape) && HasTunedKernel(Kernels.OpenClTunedRowKernels.Im2ColName),
-                                (in TunedConv2DArgs a) => { Conv2DIm2ColGemm(a); ConvEpiloguePasses(a); }),
+                                (in TunedConv2DArgs a) => { if (!Conv2DIm2ColGemm(a)) ConvEpiloguePasses(a); }),
                             new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.generic", TunedKernelOrigin.Builtin, true,
                                 _ => true, (in TunedConv2DArgs a) => { Conv2DGeneric(a); ConvEpiloguePasses(a); }),
                             new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.tiled", TunedKernelOrigin.Builtin, true,
@@ -199,7 +199,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         // tmp[Cout, B * L] = W[Cout, P] * col[P, B * L] as ONE GEMM, then a permute to the output's [B, Cout, L] (none for
         // B = 1).
-        private void Conv2DIm2ColGemm(in TunedConv2DArgs a)
+        // True when the bias and ReLU were applied too (conv_gemm_epilogue); false when the caller still runs them.
+        private bool Conv2DIm2ColGemm(in TunedConv2DArgs a)
         {
             int l = a.OutHeight * a.OutWidth, p = a.InChannels * a.KernelH * a.KernelW;
             // A 1x1, stride-1, unpadded convolution's im2col is the input itself ([Cin, H*W] per batch item): multiply it
@@ -208,7 +209,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 && a.Batch == 1)
             {
                 Gemm(a.Kernel, a.Input, a.Output, a.OutChannels, l, p);
-                return;
+                return ConvEpilogueFlags(a) == 0 || TryConvGemmEpilogue(a.Output, a);
             }
             using var col = AllocateBuffer(checked(a.Batch * p * l));
             var k = _kernelCache[Kernels.OpenClTunedRowKernels.Im2ColName];
@@ -222,11 +223,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (a.Batch == 1)
             {
                 Gemm(a.Kernel, col, a.Output, a.OutChannels, l, p);
-                return;
+                return ConvEpilogueFlags(a) == 0 || TryConvGemmEpilogue(a.Output, a);
             }
             using var tmp = AllocateBuffer(checked(a.OutChannels * a.Batch * l));
             Gemm(a.Kernel, col, tmp, a.OutChannels, a.Batch * l, p);
+            // The permute back to NCHW and the epilogue in one pass.
+            if (TryConvGemmEpilogue(tmp, a)) return true;
             Permute(tmp, a.Output, new[] { a.OutChannels, a.Batch, l }, new[] { 1, 0, 2 });
+            return false;
         }
     }
 }
