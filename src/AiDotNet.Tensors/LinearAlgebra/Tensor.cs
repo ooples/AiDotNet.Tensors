@@ -5213,6 +5213,10 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // path for the TimeSeries family (AIDOTNET_GPU_RESIDENT_PARAMS != 0), so it silently mistrained on GPU.
         _gpuBufferVersion = GpuCacheVersion;
         _device = backend.DeviceType;   // the backend's typed device, not a match on its name
+        // The dispatcher's weight reads now take this buffer; a copy it cached earlier is dead weight.
+        if (Engines.AiDotNetEngine.Current is Engines.DirectGpuTensorEngine owner
+            && ReferenceEquals(owner.PlacementBackend, backend))
+            owner.DropPersistentCopy(this);
         // Device-owned from here on: a device-side write (MarkModified) arms a download into the host slice.
         Helpers.ResidentHostMirror.Attach(this);
 
