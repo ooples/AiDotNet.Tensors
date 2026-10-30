@@ -1,5 +1,6 @@
 // Copyright (c) AiDotNet. All rights reserved.
 using System.Collections.Generic;
+using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -74,10 +75,13 @@ int bx_gid() { return int(gl_GlobalInvocationID.x); }
                 RegexOptions.None, RegexTimeout);
             // A parameter named with a GLSL keyword (input, output, layout) is renamed in the declaration and the body.
             string parameters = kernel.Groups[2].Value;
-            foreach (Match name in Regex.Matches(parameters, @"(\w+)\s*(?:,|$)", RegexOptions.None, RegexTimeout))
+            var reserved = Regex.Matches(parameters, @"(\w+)\s*(?:,|$)", RegexOptions.None, RegexTimeout)
+                .Cast<Match>()
+                .Select(name => name.Groups[1].Value)
+                .Where(GlslReservedWords.Contains)
+                .ToList();
+            foreach (string identifier in reserved)
             {
-                string identifier = name.Groups[1].Value;
-                if (!GlslReservedWords.Contains(identifier)) continue;
                 string pattern = @"\b" + identifier + @"\b";
                 parameters = Regex.Replace(parameters, pattern, identifier + "_", RegexOptions.None, RegexTimeout);
                 body = Regex.Replace(body, pattern, identifier + "_", RegexOptions.None, RegexTimeout);
