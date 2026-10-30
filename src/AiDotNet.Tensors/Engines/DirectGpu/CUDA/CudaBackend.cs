@@ -18881,9 +18881,15 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             _cudnnBn.Dispose();
             _cudnnBn = null;
         }
+        // cudnnDestroy and cublasDestroy synchronize the whole device (both documented), and every backend shares the
+        // device's primary context: issued while another thread captures a graph on it, that sync faults inside the
+        // driver (a CUDA-lane dump: cublasDestroy -> cuCtxSynchronize, access violation, while a tuner captured on
+        // another backend). Hold the context's capture gate around just the native destroys, as
+        // SynchronizeContextOutsideCapture does, so no capture is open; the buffer frees stay outside it.
         if (_cudnnContext is not null)
         {
-            _cudnnContext.Dispose();
+            lock (CaptureGateFor(_cudaContext))
+                _cudnnContext.Dispose();
             _cudnnContext = null;
         }
 
@@ -18898,11 +18904,16 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // _cublasHandle property here would instead lazily create a fresh handle on the disposing thread.
         if (_threadCublas is not null)
         {
-            foreach (var tc in _threadCublas.Values)
+            var handles = _threadCublas.Values;
+            lock (CaptureGateFor(_cudaContext))
+                foreach (var tc in handles.Where(tc => tc is not null && tc.Handle != IntPtr.Zero))
+                {
+                    CuBlasNative.cublasDestroy(tc.Handle);
+                    tc.Handle = IntPtr.Zero;
+                }
+            foreach (var tc in handles)
             {
                 if (tc is null) continue;
-                if (tc.Handle != IntPtr.Zero)
-                    CuBlasNative.cublasDestroy(tc.Handle);
                 // The handle's 8 MiB workspace is the backend's allocation, not cuBLAS's: free it with the handle.
                 tc.Workspace?.Dispose();
                 tc.Workspace = null;
