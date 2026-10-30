@@ -34,6 +34,9 @@ __kernel void conv_gemm_epilogue(__global const float* tmp, __global float* out,
 
         // 0 not tried, 1 compiled, 2 unavailable.
         private int _convGemmEpilogueState;
+        // Set once state is 1. The launch reads this rather than _kernelCache: the kernel compiles on first use, not
+        // with the backend's modules, so a cache lookup is one the kernel-lookup integrity check cannot see compiled.
+        private DirectOpenClKernel? _convGemmEpilogueKernel;
         private readonly object _convGemmEpilogueLock = new object();
 
         private bool ConvGemmEpilogueReady()
@@ -52,7 +55,8 @@ __kernel void conv_gemm_epilogue(__global const float* tmp, __global float* out,
                         var program = CompileOrLoadCached(ConvGemmEpilogueSource, OpenClBuildOptions.SafeMathFlags,
                             "convolution GEMM epilogue");
                         _programs.Add(program);
-                        _kernelCache["conv_gemm_epilogue"] = new DirectOpenClKernel(context, program, "conv_gemm_epilogue");
+                        _convGemmEpilogueKernel = new DirectOpenClKernel(context, program, "conv_gemm_epilogue");
+                        _kernelCache["conv_gemm_epilogue"] = _convGemmEpilogueKernel;
                         ok = true;
                     }
                     catch (Exception ex) when (ex is not OutOfMemoryException)
@@ -73,7 +77,7 @@ __kernel void conv_gemm_epilogue(__global const float* tmp, __global float* out,
             int l = a.OutHeight * a.OutWidth;
             int total = a.OutputCount;
             if (total <= 0) return true;
-            var kernel = _kernelCache["conv_gemm_epilogue"];
+            var kernel = _convGemmEpilogueKernel!;
             kernel.SetArg(0, BufferHandle(tmp));
             kernel.SetArg(1, BufferHandle(a.Output));
             kernel.SetArg(2, ConvEpilogueBias(a));
