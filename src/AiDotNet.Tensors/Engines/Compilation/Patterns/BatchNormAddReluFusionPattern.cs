@@ -87,9 +87,10 @@ internal static class BatchNormFusionMatch
 {
     /// <summary>
     /// A float training BatchNorm recorded on the GPU or CPU engine at <paramref name="index"/> whose consumers are
-    /// exactly one node accepted by <paramref name="isDataConsumer"/> plus its batch-statistic nodes. On the GPU nothing may
-    /// read those statistics; on the CPU they may be read (a layer's running-statistics update reads them), because the fused
-    /// node writes them every replay and becomes their producer (<see cref="BuildFusedNode"/>).
+    /// exactly one node accepted by <paramref name="isDataConsumer"/> plus its batch-statistic nodes. The statistics may be
+    /// read (a layer's running-statistics update reads them): the fused node writes them every replay and becomes their
+    /// producer (<see cref="BuildFusedNode"/>). Refusing them on the GPU left every AiDotNet BatchNorm layer unfused there,
+    /// since each one updates its running statistics.
     /// </summary>
     internal static bool TryMatchBatchNorm(
         IReadOnlyList<ILazyNode> nodes, int index,
@@ -121,9 +122,7 @@ internal static class BatchNormFusionMatch
             if (alreadyRemoved.Contains(node) || !PatternHelpers.IsConsumerOf(node, candidateBn)) continue;
             consumersSeen++;
             if (consumer is null && node is LazyNode<float> typed && isDataConsumer(node)) consumer = typed;
-            else if (node is LazyNode<float> s && (s.OpName == "BatchNormBatchMean" || s.OpName == "BatchNormBatchVariance")
-                     && (cpuOnly
-                         || !(consumerCounts.TryGetValue(s, out int statConsumers) && statConsumers > 0)))
+            else if (node is LazyNode<float> s && (s.OpName == "BatchNormBatchMean" || s.OpName == "BatchNormBatchVariance"))
                 stats.Add(s);
             else return false;   // another reader of the normalized values, or a statistic something consumes
         }
