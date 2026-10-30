@@ -145,9 +145,10 @@ jobs:
         if ($LASTEXITCODE -ne 0) { Write-Output "::error::nvidia-smi failed: this runner has no usable NVIDIA driver."; exit 1 }
         "Runner GPU: $gpu" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
         # The checked-in direct-PTX specializations are validated on GA10x (SM86) and admitted only there, so on another
-        # architecture their tests skip by design; on an SM86 runner such a skip is a failure (see the skip check).
-        $computeCap = ($gpu -split ',')[2].Trim()
-        if ($computeCap -ne '8.6') { "CUDA_ARCH_SKIP_ALLOW=|\bSM ?86\b|GA10[0-9x]" | Out-File -Append -Encoding utf8 -FilePath $env:GITHUB_ENV }
+        # architecture their tests skip by design. The exemption holds only when no visible GPU is SM86: on a runner
+        # with one, whichever device the tests pick, such a skip still fails the lane (see the skip check).
+        $caps = @($gpu | ForEach-Object { ($_ -split ',')[2].Trim() })
+        if ($caps -notcontains '8.6') { "CUDA_ARCH_SKIP_ALLOW=|\bSM ?86\b" | Out-File -Append -Encoding utf8 -FilePath $env:GITHUB_ENV }
 
     # The cuDNN paths (convolution candidates, batch norm) need cudnn64_9.dll on the loader path, and the toolkit's
     # cuBLASLt for the CUDA it was built against: the CUDA 13 build pairs with a CUDA 13 toolkit's cublasLt64_13.dll.
