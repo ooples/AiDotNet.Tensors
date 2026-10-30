@@ -531,6 +531,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, optimizerProgram, name);
                 }
+                // The global-norm clip and the device finiteness guard exist to see NaN and infinity, which
+                // -cl-finite-math-only lets the compiler assume away (the bit tests and comparisons folded: a NaN element
+                // left the guard finite and a NaN norm gave a clip scale of 0). They come from the same source built with
+                // NaN-preserving flags; every update kernel keeps the aggressive build.
+                var finiteGuardProgram = CompileOrLoadCached(Kernels.OptimizerKernels.GetSource(), OpenClBuildOptions.SafeMathFlags,
+                    "Optimizer finiteness-guard kernels");
+                _programs.Add(finiteGuardProgram);
+                foreach (var name in Kernels.OptimizerKernels.GetFiniteGuardKernelNames())
+                {
+                    _kernelCache[name].Dispose();
+                    _kernelCache[name] = new DirectOpenClKernel(_context, finiteGuardProgram, name);
+                }
 
                 // Compile mixed precision kernels only if device actually supports FP16
                 // This is non-fatal - if compilation fails, we fall back to no FP16 support

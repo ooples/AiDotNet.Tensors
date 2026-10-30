@@ -1230,6 +1230,16 @@ __kernel void scale_by_device_scalar_inplace(__global float* x, const int n, __g
     }
 
     /// <summary>
+    /// The kernels that must see NaN and infinity in float data (the global-norm clip's sum of squares, its finish into
+    /// the guard's double and the clip scale), which the backend builds with NaN-preserving flags. The guarded updates
+    /// read the guard as integers and keep the aggressive build, so they match the unguarded updates bit for bit.
+    /// </summary>
+    public static string[] GetFiniteGuardKernelNames() => new[]
+    {
+        "tensor_sum_squares_accumulate", "sum_squares_finish_double", "clip_scale_from_sum_squares",
+    };
+
+    /// <summary>
     /// Gets the list of kernel names for compilation.
     /// </summary>
     public static string[] GetKernelNames()
