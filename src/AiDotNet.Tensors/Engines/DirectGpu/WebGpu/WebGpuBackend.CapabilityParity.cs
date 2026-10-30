@@ -1,5 +1,5 @@
 #if NET7_0_OR_GREATER
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Capability parity (#1142): seeded Gumbel-softmax (the IGpuBatchExecution kernel), uninitialized allocation and
 // multi-tensor Adam/AdamW (per-tensor native kernels).
 using System.Collections.Generic;

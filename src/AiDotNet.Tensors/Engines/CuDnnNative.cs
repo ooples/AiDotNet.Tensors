@@ -1685,7 +1685,7 @@ public sealed class CuDnnConvolution : IDisposable
     // call can't reallocate the device buffer while another call still has
     // the pointer in flight inside cudnnConvolutionForward.
     private readonly object _workspaceLock = new();
-    private readonly List<IntPtr> _retiredWorkspaces = new();
+    private readonly List<(IntPtr Pointer, DevicePrimitives.DeviceMemoryHold Memory)> _retiredWorkspaces = new();
     private IntPtr _workspace;
     private ulong _workspaceSize;
     private bool _disposed;
@@ -2157,6 +2157,10 @@ public sealed class CuDnnConvolution : IDisposable
         return status == CuDnnNative.CudnnStatus.Success ? size : null;
     }
 
+    /// <summary>The device's memory counters, which count the workspace (PyTorch counts cuDNN's as allocated).</summary>
+    internal DevicePrimitives.DeviceMemoryAccount? MemoryAccount { get; set; }
+    private DevicePrimitives.DeviceMemoryHold _workspaceMemory;
+
     private void EnsureWorkspaceUnlocked(ulong requiredSize)
     {
         if (_workspaceSize >= requiredSize) return;
@@ -2171,10 +2175,13 @@ public sealed class CuDnnConvolution : IDisposable
 
         // The old workspace is retired, not freed: a captured CUDA graph keeps the pointer of every convolution it
         // recorded, so freeing it would have the graph's replays write into memory reused by something else. And a
-        // cuMemFree on a capturing thread is itself not permitted during the capture.
-        if (_workspace != IntPtr.Zero) _retiredWorkspaces.Add(_workspace);
+        // cuMemFree on a capturing thread is itself not permitted during the capture. It stays allocated, so it keeps
+        // its charge until Dispose frees it.
+        if (_workspace != IntPtr.Zero) _retiredWorkspaces.Add((_workspace, _workspaceMemory));
         _workspace = grown;
         _workspaceSize = size;
+        _workspaceMemory = default;
+        _workspaceMemory.OnAllocated(MemoryAccount, (long)size);
     }
 
     public void Dispose()
@@ -2184,9 +2191,14 @@ public sealed class CuDnnConvolution : IDisposable
         if (_workspace != IntPtr.Zero)
         {
             CuBlasNative.cuMemFree(_workspace);
+            _workspaceMemory.OnFreed();
             _workspace = IntPtr.Zero;
         }
-        foreach (var retired in _retiredWorkspaces) CuBlasNative.cuMemFree(retired);
+        foreach (var retired in _retiredWorkspaces)
+        {
+            CuBlasNative.cuMemFree(retired.Pointer);
+            retired.Memory.OnFreed();
+        }
         _retiredWorkspaces.Clear();
 
         if (_ownsContext)

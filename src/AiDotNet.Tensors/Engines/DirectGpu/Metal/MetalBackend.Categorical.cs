@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Metal launcher shim for categorical sampling. Mirrors MetalBackend.Ann.cs — pipeline resolved via
 // the library handle compiled at init, dispatched with a 1-D thread grid of one thread per row.
 using System;

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Sparsity utilities for 2:4 structured sparsity pattern detection and enforcement.
 
 using System;

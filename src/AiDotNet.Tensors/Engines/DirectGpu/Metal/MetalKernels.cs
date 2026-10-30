@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Metal Shading Language (MSL) compute kernels for GPU-accelerated tensor operations.
 // These kernels are compiled at runtime and executed on Apple Silicon GPUs.
 

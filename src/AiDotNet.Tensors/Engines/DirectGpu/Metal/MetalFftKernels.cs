@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Metal Shading Language radix-2 Cooley-Tukey FFT kernel. One workgroup per
 // batch slice; threads cooperate on the log₂ n butterfly stages via
 // threadgroup memory. Works on interleaved float re/im pairs (same layout

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Metal GPU backend - Activation functions and gradients.
 
 using AiDotNet.Tensors.Helpers.Autotune.TunedKernels;

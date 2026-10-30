@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Metal IFusedDecodeLinearBackend (#974): the portable decode-linear routes over the shared dl_p_ kernels.
 using P = AiDotNet.Tensors.Engines.DirectGpu.PortableFusedDecodeLinear;
 

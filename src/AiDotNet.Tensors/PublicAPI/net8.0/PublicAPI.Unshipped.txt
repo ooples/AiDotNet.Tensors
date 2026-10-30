@@ -1,8 +1,9 @@
 #nullable enable
+AiDotNet.Tensors.Helpers.SecureSeededRandom.Dispose() -> void
 AiDotNet.Tensors.LinearAlgebra.Tensor<T>.ToDLPack(AiDotNet.Tensors.Interop.DLPackStream consumerStream = default(AiDotNet.Tensors.Interop.DLPackStream)) -> nint
 AiDotNet.Tensors.LinearAlgebra.Tensor<T>.ToDLPackLegacy(AiDotNet.Tensors.Interop.DLPackStream consumerStream = default(AiDotNet.Tensors.Interop.DLPackStream)) -> nint
 static AiDotNet.Tensors.Interop.DLPack.GetCudaConsumerStream(int deviceId = 0) -> nint
 static AiDotNet.Tensors.Interop.DLPackStream.FromHandle(nint streamHandle) -> AiDotNet.Tensors.Interop.DLPackStream
 static AiDotNet.Tensors.LinearAlgebra.Tensor<T>.FromDLPack(nint managedTensorVersioned) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
 static AiDotNet.Tensors.LinearAlgebra.Tensor<T>.FromDLPackLegacy(nint managedTensor) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
-AiDotNet.Tensors.Helpers.SecureSeededRandom.Dispose() -> void
+static extern AiDotNet.Tensors.Engines.CuBlasNative.cuMemPoolGetAttribute(nint pool, int attr, out ulong value) -> AiDotNet.Tensors.Engines.CudaResult

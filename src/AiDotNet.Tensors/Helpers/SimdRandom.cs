@@ -21,6 +21,14 @@ namespace AiDotNet.Tensors.Helpers;
 /// The SIMD implementation processes 4 independent xoshiro256** states in parallel
 /// using Vector256&lt;ulong&gt;, producing 4 uniform doubles in [0, 1) per iteration.
 /// </para>
+/// <para>
+/// <b>The stream is the same on every instruction set and target framework.</b> A call that fills
+/// L &gt;= 4 values takes floor(L/4) rounds in which value 4r + k comes from lane k, then a tail from
+/// lane 0; a shorter call uses lane 0. The AVX2 path computes that layout four lanes at a time and the
+/// scalar path computes it one lane at a time. The scalar path used to draw everything from lane 0, so
+/// with AVX2 disabled (or on net471 / netstandard2.0) a seed produced a different stream after its first
+/// value, and every layer initialized from it trained from different weights.
+/// </para>
 /// </remarks>
 public sealed class SimdRandom
 {
@@ -85,8 +93,10 @@ public sealed class SimdRandom
         int length = destination.Length;
         int i = 0;
 
+        int roundsEnd = length >= 4 ? length & ~3 : 0;
+
 #if NET5_0_OR_GREATER
-        if (Avx2.IsSupported && length >= 4)
+        if (Avx2.IsSupported && roundsEnd > 0)
         {
             var vs0 = Vector256.Create(_s0[0], _s0[1], _s0[2], _s0[3]);
             var vs1 = Vector256.Create(_s1[0], _s1[1], _s1[2], _s1[3]);
@@ -138,10 +148,19 @@ public sealed class SimdRandom
         }
 #endif
 
-        // Scalar tail
+        // The same four-lane rounds without AVX2, so a seed gives the same values on every ISA.
+        for (; i < roundsEnd; i += 4)
+        {
+            destination[i] = NextDoubleScalar(0);
+            destination[i + 1] = NextDoubleScalar(1);
+            destination[i + 2] = NextDoubleScalar(2);
+            destination[i + 3] = NextDoubleScalar(3);
+        }
+
+        // Tail (and calls shorter than one round) from lane 0.
         for (; i < length; i++)
         {
-            destination[i] = NextDoubleScalar();
+            destination[i] = NextDoubleScalar(0);
         }
     }
 
@@ -153,9 +172,9 @@ public sealed class SimdRandom
         int length = destination.Length;
         int i = 0;
 
-#if NET5_0_OR_GREATER
-        // Process 4 at a time: generate 4 doubles then convert to float
-        if (Avx2.IsSupported && length >= 4)
+        // Process 4 at a time: generate one round of 4 doubles then convert to float. This runs on every ISA,
+        // not only with AVX2, because NextDoubles produces the same four-lane round either way.
+        if (length >= 4)
         {
             Span<double> temp = stackalloc double[4];
             int simdLength = i + ((length - i) & ~3);
@@ -168,11 +187,10 @@ public sealed class SimdRandom
                 destination[i + 3] = Math.Min((float)temp[3], 0.99999994f);
             }
         }
-#endif
 
         for (; i < length; i++)
         {
-            destination[i] = Math.Min((float)NextDoubleScalar(), 0.99999994f);
+            destination[i] = Math.Min((float)NextDoubleScalar(0), 0.99999994f);
         }
     }
 
@@ -210,23 +228,23 @@ public sealed class SimdRandom
         }
     }
 
-    /// <summary>Scalar xoshiro256** for the tail.</summary>
+    /// <summary>One scalar xoshiro256** step of <paramref name="lane"/>: the value the AVX2 path computes for that lane.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private double NextDoubleScalar()
+    private double NextDoubleScalar(int lane)
     {
-        ulong result = RotateLeft64(_s1[0] * 5, 7) * 9;
+        ulong result = RotateLeft64(_s1[lane] * 5, 7) * 9;
 
         // Convert to [0, 1)
         double d = BitConverter.Int64BitsToDouble((long)((result >> 12) | 0x3FF0000000000000UL)) - 1.0;
 
-        // Advance lane 0 state
-        ulong t = _s1[0] << 17;
-        _s2[0] ^= _s0[0];
-        _s3[0] ^= _s1[0];
-        _s1[0] ^= _s2[0];
-        _s0[0] ^= _s3[0];
-        _s2[0] ^= t;
-        _s3[0] = RotateLeft64(_s3[0], 45);
+        // Advance this lane's state
+        ulong t = _s1[lane] << 17;
+        _s2[lane] ^= _s0[lane];
+        _s3[lane] ^= _s1[lane];
+        _s1[lane] ^= _s2[lane];
+        _s0[lane] ^= _s3[lane];
+        _s2[lane] ^= t;
+        _s3[lane] = RotateLeft64(_s3[lane], 45);
 
         return d;
     }

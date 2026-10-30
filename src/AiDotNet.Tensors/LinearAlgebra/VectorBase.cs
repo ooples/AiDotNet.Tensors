@@ -1,4 +1,4 @@
-﻿using System.Buffers;
+using System.Buffers;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Engines;
@@ -320,6 +320,8 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         _memory = data;
         _cachedArray = data;
+        // A downloaded copy of device data, kept beside it (GpuMemoryStats host_shadow_bytes).
+        AiDotNet.Tensors.Engines.DevicePrimitives.HostShadowMemory.Track(data);
         // _logicalLength stays the same
         // The state was keyed by this storage while it had no array; aliases of the new array must share it.
         if (_hostSync is { } sync) _hostSync = Helpers.HostSync.Adopt(data, sync);

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Mixed precision training kernels for GPU-resident training.
 // Provides mixed precision operations; the FP32/FP16 conversions are Fp16Kernels'.
 

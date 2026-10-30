@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.DevicePrimitives;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -75,6 +76,7 @@ internal static class ResidentHostMirror
         }
         tensor._gpuMaterializerKey = array;
         tensor._gpuMaterializerCallback = group.Callback;
+        HostShadowMemory.Track(array);   // a host copy kept beside the device value (GpuMemoryStats)
         return array;
     }
 

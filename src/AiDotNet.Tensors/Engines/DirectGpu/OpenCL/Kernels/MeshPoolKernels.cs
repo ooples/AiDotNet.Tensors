@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // OpenCL kernels for MeshPool (edge collapse pooling) neural network operations.
 // Implements graph-based edge pooling with importance scoring.
 

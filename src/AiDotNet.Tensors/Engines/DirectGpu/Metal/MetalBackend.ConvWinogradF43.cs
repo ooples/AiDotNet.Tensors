@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // NOTE: validated only on a Metal runner -- the dev box has no Apple GPU. The template's bodies run on Vulkan here
 // (GLSL), against the same fp64 reference.
 using System;

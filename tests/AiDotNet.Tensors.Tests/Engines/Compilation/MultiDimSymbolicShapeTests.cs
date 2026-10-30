@@ -154,22 +154,31 @@ public class MultiDimSymbolicShapeTests
         using var cache = new CompiledModelCache<float>();
 
         int forwardInvocations = 0;
+        // The model's weight is fixed; a plan bakes it in as a constant.
+        var weight = Tensor<float>.CreateRandom(new[] { dim, dim });
         void RegisterForward(int batch, int seq)
         {
             // Rebuild the forward closure for each call — matches how a real
             // serving loop would build fresh tensors per request.
             var input = Tensor<float>.CreateRandom(new[] { batch, seq, dim });
-            var weight = Tensor<float>.CreateRandom(new[] { dim, dim });
             Func<Tensor<float>> forward = () =>
             {
                 forwardInvocations++;
                 var output = engine.TensorMatMul(input, weight);
                 return engine.ReduceSum(output, null);
             };
-            cache.GetOrCompileInference(
+            var plan = cache.GetOrCompileInference(
                 input._shape,
                 forward,
                 SymbolicShape.BatchAndSeqDynamic(new[] { batch, seq, dim }));
+            // Each plan must execute its own shape: the trace count alone once passed while every
+            // plan after the first threw on SetInputs.
+            var request = Tensor<float>.CreateRandom(new[] { batch, seq, dim });
+            plan.SetInputs(new[] { request });
+            var expected = engine.ReduceSum(engine.TensorMatMul(request, weight), null).AsSpan()[0];
+            var actual = plan.Execute().AsSpan()[0];
+            Assert.True(Math.Abs(expected - actual) <= 1e-3f * Math.Max(1f, Math.Abs(expected)),
+                $"({batch},{seq}): eager {expected} plan {actual}");
         }
 
         // 16 distinct (batch, seq) combinations — covers typical serving pools
@@ -184,8 +193,13 @@ public class MultiDimSymbolicShapeTests
         foreach (var (b, s) in combos)
             RegisterForward(b, s);
 
-        Assert.Equal(1, forwardInvocations);
-        Assert.Equal(1, cache.InferencePlanCount);
+        // Traced: the three batch-1 shapes (size 1 is specialized, as in torch); the base (2,64); (2,256), the
+        // first change of seq alone; (4,128) and (4,1024), which change batch before a batch-only change was
+        // seen; (8,64), the first change of batch alone. The other eight are built from those traces, and every
+        // plan executes its own shape (checked above).
+        Assert.Equal(8, forwardInvocations);
+        Assert.Equal(8, cache.InstantiatedPlanCount);
+        Assert.Equal(combos.Length, cache.InferencePlanCount);
     }
 
     [Fact]

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // OpenCL kernels for LSTM (Long Short-Term Memory) sequence neural network operations.
 // Implements sequence-level forward and backward passes for efficient BPTT training.
 

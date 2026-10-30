@@ -116,11 +116,15 @@ internal static class CudaNativeBindings
         [In] int[] options,
         [In] IntPtr[] optionValues);
 
+    // The driver keeps optionValues and writes the logs' actual sizes back into it (as 32-bit values in the size
+    // slots) at cuLinkComplete, so both arrays must stay at a fixed address until cuLinkDestroy. A marshalled managed
+    // array is pinned only for this call; the GC can then move it, and cuLinkComplete's write-back lands in whatever
+    // object took its place (the CUDA lane's "Internal CLR error 0x80131506" heap corruption). Hence raw pointers.
     [DllImport(CudaLibrary, EntryPoint = "cuLinkCreate_v2")]
-    internal static extern CudaResult cuLinkCreate(
+    internal static extern unsafe CudaResult cuLinkCreate(
         uint numOptions,
-        [In] int[] options,
-        [In] IntPtr[] optionValues,
+        int* options,
+        IntPtr* optionValues,
         out IntPtr state);
 
     [DllImport(CudaLibrary, EntryPoint = "cuLinkAddData_v2")]

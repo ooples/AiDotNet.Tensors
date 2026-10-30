@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 using System;
 using System.Collections.Generic;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -86,6 +86,28 @@ public sealed class TensorScope : IDisposable
         {
             _results.Remove(storage);
             _outer?.Adopt(storage, release);
+        }
+        return tensor;
+    }
+
+    /// <summary>
+    /// Hands <paramref name="tensor"/> (and every view of its storage) back to its own lifetime: no scope open on the
+    /// calling thread frees it, the enclosing ones included, as TorchSharp's <c>DetachFromDisposeScope</c> does. For a
+    /// tensor something longer-lived than every open scope holds, such as a cache a layer builds on its first forward.
+    /// Returns <paramref name="tensor"/>.
+    /// </summary>
+    public static Tensor<T> Detach<T>(Tensor<T> tensor)
+    {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        object storage = tensor.DataVector;
+        var array = tensor.GetBackingArrayForCacheLookupUnsafe();
+        // A result kept in a nested scope was adopted by the enclosing one, and each scope's activation release spares
+        // only the storages kept in it or around it: every open scope forgets the result and spares it.
+        for (var scope = s_current; scope is not null; scope = scope._outer)
+        {
+            scope._results.Remove(storage);
+            scope._kept.Add(storage);
+            if (array is not null) scope._kept.Add(array);
         }
         return tensor;
     }

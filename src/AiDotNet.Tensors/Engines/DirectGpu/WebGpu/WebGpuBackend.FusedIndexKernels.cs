@@ -1,5 +1,5 @@
 #if NET7_0_OR_GREATER
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
 // No fused class-gather or float-id embedding kernels here: the engine composes them from the generic device ops,

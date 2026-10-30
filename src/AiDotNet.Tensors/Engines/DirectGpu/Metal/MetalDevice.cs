@@ -1,8 +1,9 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Metal device wrapper for Apple Silicon GPU management.
 
 using System;
 using System.Runtime.InteropServices;
+using AiDotNet.Tensors.Engines.DevicePrimitives;
 using static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
@@ -26,6 +27,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 /// </remarks>
 public sealed class MetalDevice : IDisposable
 {
+    /// <summary>This device's memory counters (GpuMemoryStats): every buffer the device allocates charges them.</summary>
+    internal DeviceMemoryAccount MemoryAccount { get; }
+
     private IntPtr _device;
     private bool _disposed;
     private readonly object _lock = new();
@@ -153,6 +157,7 @@ public sealed class MetalDevice : IDisposable
     /// <param name="deviceIndex">The device index (0 = default device).</param>
     public MetalDevice(int deviceIndex)
     {
+        MemoryAccount = DeviceMemoryAccount.For("metal", deviceIndex);
         if (!IsPlatformSupported)
         {
             DeviceName = "Not Available";

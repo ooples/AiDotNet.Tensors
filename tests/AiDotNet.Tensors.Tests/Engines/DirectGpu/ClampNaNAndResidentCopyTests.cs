@@ -87,4 +87,20 @@ public sealed class ClampNaNAndResidentCopyTests : IClassFixture<DirectGpuTensor
             AiDotNetEngine.Current = previous;
         }
     }
+
+    // Cloning a layer copies each of its tensors, an empty one included (a zero-width bias, an unused state): the device
+    // path asked the backend for a zero-length buffer and threw "Buffer size must be positive" (PICK's construction).
+    [SkippableFact]
+    public void TensorCopy_OfAnEmptyTensor_IsANoOp()
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        IEngine engine = _fixture.Engine!;
+        var source = new Tensor<float>(new[] { 0, 8 });
+        var destination = new Tensor<float>(new[] { 0, 8 });
+
+        engine.TensorCopy(source, destination);
+
+        Assert.Equal(0, destination.Length);
+        Assert.Empty(destination.ToArray());
+    }
 }

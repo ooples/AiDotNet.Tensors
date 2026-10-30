@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // WebGPU WGSL compute shaders for the native ANN (IVF / PQ / IVFPQ / HNSW)
 // kernels backing IAnnBackend. Supply-chain-clean: no FAISS / cuVS / MKL.
 // Each source mirrors AiDotNet.Tensors.Ann.AnnPrimitives function-for-function

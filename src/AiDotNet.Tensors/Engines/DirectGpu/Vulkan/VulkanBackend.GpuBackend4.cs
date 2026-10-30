@@ -923,42 +923,6 @@ public sealed unsafe partial class VulkanBackend
         Scale(meanLoss, meanLoss, 1f / n, 1);
     }
 
-    private bool DispatchLstmForwardSequence(
-        IGpuBuffer input, IGpuBuffer hInit, IGpuBuffer cInit,
-        IGpuBuffer weightsIh, IGpuBuffer weightsHh, IGpuBuffer biasIh, IGpuBuffer biasHh,
-        IGpuBuffer output, IGpuBuffer hFinal, IGpuBuffer cFinal,
-        IGpuBuffer allH, IGpuBuffer allC, IGpuBuffer cacheGates,
-        int seqLen, int batch, int inputSize, int hiddenSize)
-    {
-        if (seqLen <= 0 || batch <= 0 || inputSize <= 0 || hiddenSize <= 0) return true;
-        int stateSize = checked(batch * hiddenSize);
-        Copy(hInit, 0, allH, 0, stateSize);
-        Copy(cInit, 0, allC, 0, stateSize);
-        GlslNaryOp(VulkanResidentKernels.LstmForwardSequence,
-            new[] { input, weightsIh, weightsHh, biasIh, biasHh, output, allH, allC, cacheGates }, batch,
-            new[] { (uint)seqLen, (uint)batch, (uint)inputSize, (uint)hiddenSize });
-        Copy(allH, checked(seqLen * stateSize), hFinal, 0, stateSize);
-        Copy(allC, checked(seqLen * stateSize), cFinal, 0, stateSize);
-        return true;
-    }
-
-    private bool DispatchLstmBackwardSequence(
-        IGpuBuffer gradOutput, IGpuBuffer allH, IGpuBuffer allC, IGpuBuffer cacheGates,
-        IGpuBuffer weightsIh, IGpuBuffer weightsHh, IGpuBuffer input,
-        IGpuBuffer gradInput, IGpuBuffer gradHInit, IGpuBuffer gradCInit,
-        IGpuBuffer gradWeightsIh, IGpuBuffer gradWeightsHh, IGpuBuffer gradBiasIh, IGpuBuffer gradBiasHh,
-        int seqLen, int batch, int inputSize, int hiddenSize)
-    {
-        if (seqLen <= 0 || batch <= 0 || inputSize <= 0 || hiddenSize <= 0) return true;
-        using var nextDh = AllocateBuffer(checked(batch * hiddenSize));
-        GlslNaryOp(VulkanResidentKernels.LstmBackwardSequence,
-            new[] { gradOutput, allH, allC, cacheGates, weightsIh, weightsHh, input,
-                gradInput, gradHInit, gradCInit, gradWeightsIh, gradWeightsHh, gradBiasIh, nextDh }, 1,
-            new[] { (uint)seqLen, (uint)batch, (uint)inputSize, (uint)hiddenSize });
-        Copy(gradBiasIh, gradBiasHh, checked(4 * hiddenSize));
-        return true;
-    }
-
     private bool DispatchGruForwardSequence(
         IGpuBuffer input, IGpuBuffer hInit,
         IGpuBuffer weightsIh, IGpuBuffer weightsHh, IGpuBuffer biasIh, IGpuBuffer biasHh,
@@ -1013,7 +977,10 @@ public sealed unsafe partial class VulkanBackend
         int seqLen, int batch, int inputSize, int hiddenSize)
     {
         EnsureInitialized();
-        DispatchLstmForwardSequence(input, hInit, cInit, weightsIh, weightsHh, biasIh, biasHh,
+        // The shared lstm_p_ kernels, launched per step with every unit in parallel. The previous resident shaders ran
+        // a whole batch row (forward) or the whole BPTT (backward) in one invocation, which outlasts the Windows GPU
+        // timeout at T = 200 and loses the device (vkWaitForFences -4) for every later test in the process.
+        PortableLstmSequence.Forward(this, LaunchSolver, input, hInit, cInit, weightsIh, weightsHh, biasIh, biasHh,
             output, hFinal, cFinal, allH, allC, cacheGates, seqLen, batch, inputSize, hiddenSize);
     }
 
@@ -1026,7 +993,7 @@ public sealed unsafe partial class VulkanBackend
         int seqLen, int batch, int inputSize, int hiddenSize)
     {
         EnsureInitialized();
-        DispatchLstmBackwardSequence(gradOutput, allH, allC, cacheGates, weightsIh, weightsHh, input,
+        PortableLstmSequence.Backward(this, LaunchSolver, gradOutput, allH, allC, cacheGates, weightsIh, weightsHh, input,
             gradInput, gradHInit, gradCInit, gradWeightsIh, gradWeightsHh, gradBiasIh, gradBiasHh,
             seqLen, batch, inputSize, hiddenSize);
     }

@@ -1,4 +1,15 @@
 #nullable enable
+AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemorySnapshot
+AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemorySnapshot.AllocatedBytes.get -> long
+AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemorySnapshot.Device.get -> string!
+AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemorySnapshot.DeviceAllocations.get -> long
+AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemorySnapshot.DeviceFrees.get -> long
+AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemorySnapshot.GpuMemorySnapshot() -> void
+AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemorySnapshot.HostShadowBytes.get -> long
+AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemorySnapshot.PeakAllocatedBytes.get -> long
+AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemorySnapshot.PeakHostShadowBytes.get -> long
+AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemorySnapshot.PeakReservedBytes.get -> long
+AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemorySnapshot.ReservedBytes.get -> long
 AiDotNet.Tensors.Interop.DLPack
 AiDotNet.Tensors.Interop.DLPackStream
 AiDotNet.Tensors.Interop.DLPackStream.DLPackStream() -> void
@@ -6,12 +17,20 @@ AiDotNet.Tensors.Interop.DLPackStream.Equals(AiDotNet.Tensors.Interop.DLPackStre
 AiDotNet.Tensors.Interop.DLPackStream.IsNoSync.get -> bool
 const AiDotNet.Tensors.Interop.DLPack.MajorVersion = 1 -> int
 const AiDotNet.Tensors.Interop.DLPack.MinorVersion = 3 -> int
+override AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemorySnapshot.ToString() -> string!
 override AiDotNet.Tensors.Interop.DLPackStream.Equals(object? obj) -> bool
 override AiDotNet.Tensors.Interop.DLPackStream.GetHashCode() -> int
 override AiDotNet.Tensors.Interop.DLPackStream.ToString() -> string!
+static AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemoryStats.DeviceNames.get -> System.Collections.Generic.IReadOnlyList<string!>!
+static AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemoryStats.ResetPeakStats(AiDotNet.Tensors.Engines.DirectGpu.IDirectGpuBackend! backend) -> void
+static AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemoryStats.Snapshot() -> AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemorySnapshot
+static AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemoryStats.Snapshot(AiDotNet.Tensors.Engines.DirectGpu.IDirectGpuBackend! backend) -> AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemorySnapshot
+static AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemoryStats.Snapshot(string! device) -> AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemorySnapshot
+static AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemoryStats.Stats(AiDotNet.Tensors.Engines.DirectGpu.IDirectGpuBackend! backend) -> System.Collections.Generic.IReadOnlyDictionary<string!, long>!
+static AiDotNet.Tensors.Engines.TensorScope.Detach<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! tensor) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
 static AiDotNet.Tensors.Interop.DLPackStream.Default.get -> AiDotNet.Tensors.Interop.DLPackStream
 static AiDotNet.Tensors.Interop.DLPackStream.LegacyDefault.get -> AiDotNet.Tensors.Interop.DLPackStream
 static AiDotNet.Tensors.Interop.DLPackStream.NoSync.get -> AiDotNet.Tensors.Interop.DLPackStream
+static AiDotNet.Tensors.Interop.DLPackStream.PerThreadDefault.get -> AiDotNet.Tensors.Interop.DLPackStream
 static AiDotNet.Tensors.Interop.DLPackStream.operator !=(AiDotNet.Tensors.Interop.DLPackStream left, AiDotNet.Tensors.Interop.DLPackStream right) -> bool
 static AiDotNet.Tensors.Interop.DLPackStream.operator ==(AiDotNet.Tensors.Interop.DLPackStream left, AiDotNet.Tensors.Interop.DLPackStream right) -> bool
-static AiDotNet.Tensors.Interop.DLPackStream.PerThreadDefault.get -> AiDotNet.Tensors.Interop.DLPackStream

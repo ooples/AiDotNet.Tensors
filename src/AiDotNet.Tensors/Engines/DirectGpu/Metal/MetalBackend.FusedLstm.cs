@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
 // #1107: LstmForwardSequence / LstmBackwardSequence run the shared lstm_p_ kernels (PortableLstmSequence), whose

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // OpenCL kernels for the fused Gated Linear Attention (GLA) sequence scan (issue ooples/AiDotNet#1464).
 // Mirrors CpuEngine.GlaScan.cs / HipGlaKernels exactly:
 //   S_t[di,ki] = g_t * S_{t-1}[di,ki] + V_t[di] * K_t[ki]

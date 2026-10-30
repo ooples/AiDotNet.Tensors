@@ -149,6 +149,13 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
             // Vector is mutable. Attach the tensor owner's guard before exposing it so a direct
             // AsWritableSpan/indexer/in-place call cannot bypass streaming or COW safety.
             _data.SetBeforeWriteGuard(EnsureDataVectorWriteAllowed);
+            // A traced value not yet computed: the raw vector would be uninitialized memory. Realize it as every
+            // other host read does (and, in an inference trace, record that the forward escaped the graph).
+            if (LazySource is ILazyNode node && !node.IsRealized)
+            {
+                if (GraphMode.IsInferenceTrace) GraphMode.Current?.MarkHostEscape(node);
+                node.Realize(node.RecordingEngine);
+            }
             return _data;
         }
     }
@@ -2656,7 +2663,12 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     {
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (LazySource is ILazyNode node && !node.IsRealized)
+        {
+            // A host read of a traced value inside an inference trace: whatever the forward does with it next runs
+            // outside the graph, and a plan would replay its trace-time result as a constant.
+            if (GraphMode.IsInferenceTrace) GraphMode.Current?.MarkHostEscape(node);
             node.Realize(node.RecordingEngine);
+        }
 
         // Deferred storage: shape was known at construction, the buffer was not created. Gated on
         // the immutable _storageDeferred flag (NOT the mutable Lifetime hint, which a caller can

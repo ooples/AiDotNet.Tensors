@@ -228,10 +228,11 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         try
         {
             var specialized = new CompiledStep<T>[steps.Length];
+            var producedStorages = ProducedStorages(steps);
             for (int i = 0; i < steps.Length; i++)
             {
                 var step = steps[i];
-                bool allowCachedB = !IsMutableSecondMatMulInput(step, compiledInputTensors);
+                bool allowCachedB = !IsMutableSecondMatMulInput(step, compiledInputTensors, producedStorages);
                 MaybeRegisterFrozenMatMulWeight(step, allowCachedB);
                 var spec = CompiledTrainingPlan<T>.TryBuildSpecializedForward(step, pinnedHandles, allowCachedB);
                 if (spec != null)
@@ -1316,6 +1317,14 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         int[]? requestedInputShape,
         Tensor<T>[]? explicitInputs = null)
     {
+        if (scope.HostEscape is { } escaped)
+            throw new GraphCaptureNotSupportedException(
+                nameof(Compile),
+                GraphCaptureLimitation.HostBoundary,
+                $"The forward read the value of traced operation {escaped.OpType} on the host while tracing, so " +
+                "whatever it computed from that value ran outside the graph and would replay as a stale constant. " +
+                "Express that computation with engine operations to make the forward compilable.");
+
         var compiler = new LazyGraphCompiler();
         var optimized = compiler.Compile(scope.Nodes);
 
@@ -1428,6 +1437,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         var specializedSteps = new CompiledStep<T>[steps.Count];
         var mutableInputs = compiledInputTensors ??
             (inputTensor is null ? Array.Empty<Tensor<T>>() : new[] { inputTensor });
+        var producedStorages = ProducedStorages(steps);
         for (int i = 0; i < steps.Count; i++)
         {
             var step = steps[i];
@@ -1485,7 +1495,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                 continue;
             }
 
-            bool allowCachedB = !IsMutableSecondMatMulInput(step, mutableInputs);
+            bool allowCachedB = !IsMutableSecondMatMulInput(step, mutableInputs, producedStorages);
             MaybeRegisterFrozenMatMulWeight(step, allowCachedB);
             var specialized = CompiledTrainingPlan<T>.TryBuildSpecializedForward(step, pinnedHandles, allowCachedB);
             if (specialized != null)
@@ -1702,15 +1712,30 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         public int GetHashCode(TItem obj) => RuntimeHelpers.GetHashCode(obj);
     }
 
+    /// <summary>The storages the plan's steps write: none of them is a frozen constant.</summary>
+    private static HashSet<object> ProducedStorages(IEnumerable<CompiledStep<T>> steps)
+    {
+        var produced = new HashSet<object>(Autodiff.ReferenceEqualityComparer<object>.Instance);
+        foreach (var step in steps) produced.Add(step.OutputBuffer.StorageIdentity);
+        return produced;
+    }
+
     private static bool IsMutableSecondMatMulInput(
-        CompiledStep<T> step, Tensor<T>[] mutableInputs)
+        CompiledStep<T> step, Tensor<T>[] mutableInputs, HashSet<object> producedStorages)
     {
         if (step.OpType != OpType.TensorMatMul || step.Inputs.Length < 2)
             return false;
 
+        // B computed by the plan itself (a traced transpose of the weight, say) is rewritten on every replay and
+        // holds nothing yet at compile time: caching or registering it as a frozen weight packed that empty buffer
+        // once and replayed it forever. Storage, not tensor identity: a view of a step's output is just as live.
+        if (producedStorages.Contains(step.Inputs[1].StorageIdentity))
+            return true;
+
         for (int i = 0; i < mutableInputs.Length; i++)
         {
-            if (ReferenceEquals(step.Inputs[1], mutableInputs[i]))
+            if (ReferenceEquals(step.Inputs[1], mutableInputs[i])
+                || ReferenceEquals(step.Inputs[1].StorageIdentity, mutableInputs[i].StorageIdentity))
                 return true;
         }
 

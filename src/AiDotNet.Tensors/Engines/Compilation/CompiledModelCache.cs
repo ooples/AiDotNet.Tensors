@@ -221,6 +221,7 @@ public sealed class CompiledModelCache<T> : IDisposable
             foreach (var plan in _trainingPlans.Values) plan.Dispose();
             _inferencePlans.Clear();
             _trainingPlans.Clear();
+            _templates.Clear();
         }
     }
 
@@ -241,32 +242,75 @@ public sealed class CompiledModelCache<T> : IDisposable
     /// <returns>Compiled inference plan.</returns>
     public ICompiledPlan<T> GetOrCompileInference(int[] inputShape, Func<Tensor<T>> forward, SymbolicShape symbolicShape)
     {
-        // Use symbolic key (ignores dynamic dims like batch size)
-        long key = symbolicShape.ComputeKey();
-        if (_inferencePlans.TryGetValue(key, out var cached))
+        if (symbolicShape is null) throw new ArgumentNullException(nameof(symbolicShape));
+        // A plan executes exactly the shape it was built for, so plans stay keyed by the concrete shape;
+        // the symbolic key names the family whose batch-polymorphic template builds the others.
+        long key = ComputeShapeKey(inputShape);
+        if (_inferencePlans.TryGetValue(key, out var cached) && cached.IsValid(inputShape))
             return cached;
 
         lock (_compileLock)
         {
-            // Double-check after acquiring lock
-            if (_inferencePlans.TryGetValue(key, out cached))
+            if (_inferencePlans.TryGetValue(key, out cached) && cached.IsValid(inputShape))
                 return cached;
 
-            // Compile with the current concrete shape
-            using var scope = GraphMode.EnableInference();
-            var explicitOutput = forward();
-            ThrowIfForwardRecordedNothing(scope, explicitOutput);
-            var plan = scope.CompileInference<T>(explicitOutput, inputShape);
+            ICompiledPlan<T>? plan = null;
+            var symbolDims = symbolicShape.SymbolicDimensions;
+            long familyKey = symbolicShape.ComputeKey();
+            _templates.TryGetValue(familyKey, out var template);
+            if (template is not null && template.CanServe(inputShape))
+            {
+                // No trace: the template rebuilds the recorded graph at this shape.
+                try
+                {
+                    plan = template.Instantiate(inputShape);
+                    InstantiatedPlanCount++;
+                }
+                catch (Exception ex) when (ex is ArithmeticException or InvalidOperationException or ArgumentException)
+                {
+                    // Not reachable after all (a rescaled value that does not divide evenly, or a graph the
+                    // compiler rejects at this shape): trace it like any other shape.
+                    System.Diagnostics.Trace.TraceWarning(
+                        $"CompiledModelCache: building [{string.Join(",", inputShape)}] from its template failed, tracing it: {ex.Message}");
+                }
+            }
+            if (plan is null)
+            {
+                using var scope = GraphMode.EnableInference();
+                var explicitOutput = forward();
+                ThrowIfForwardRecordedNothing(scope, explicitOutput);
+                // Recorded before compiling: compilation clears the lazy links the recipe numbers.
+                // A size-1 symbolic dim is specialized: that trace teaches the template nothing.
+                var recipe = symbolDims.Length > 0 && ShapePolymorphicTemplate<T>.IsGeneric(inputShape, symbolDims)
+                    ? InferenceTraceRecipe<T>.Capture(scope, explicitOutput, inputShape)
+                    : null;
+                plan = scope.CompileInference<T>(explicitOutput, inputShape);
+                if (recipe is not null)
+                {
+                    if (template is null) _templates[familyKey] = new ShapePolymorphicTemplate<T>(recipe, symbolDims);
+                    else template.Observe(recipe);
+                }
+            }
 
             if (_inferencePlans.TryGetValue(key, out var old))
                 old.Dispose();
-
-            // Store under the symbolic key so future lookups with
-            // different batch sizes still hit the cache.
             _inferencePlans[key] = plan;
             return plan;
         }
     }
+
+    /// <summary>
+    /// Plans built from a batch-polymorphic template rather than a trace. Diagnostic: with a batch-polymorphic
+    /// forward, every batch after the first two lands here.
+    /// </summary>
+    internal int InstantiatedPlanCount { get; private set; }
+
+    /// <summary>Why the symbolic family of <paramref name="symbolicShape"/> is not batch-polymorphic, or null.</summary>
+    internal string? GetBatchPolymorphismFailure(SymbolicShape symbolicShape)
+        => _templates.TryGetValue(symbolicShape.ComputeKey(), out var t) ? t.Failure : null;
+
+    // Per symbolic family: its first trace, and what later traces showed scales with each symbolic dim.
+    private readonly Dictionary<long, ShapePolymorphicTemplate<T>> _templates = new();
 
     /// <summary>
     /// Issue #239 guard: surface a clear, actionable error when the traced

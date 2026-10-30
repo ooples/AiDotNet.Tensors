@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // OpenCL kernel for the fused Mamba-2 SSD scan forward (#1464). One work-item per (batch, channel flatD).
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels;

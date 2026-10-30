@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 using K = AiDotNet.Tensors.Engines.DirectGpu.BatchExecutionCudaKernels;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu;

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // WebGPU buffer implementation for browser GPU compute.
 // Only available in .NET 7+ with Blazor WebAssembly.
 
@@ -40,6 +40,11 @@ public sealed class WebGpuBuffer : IGpuBuffer, IDisposable
     private readonly int _offsetBytes;
     // A view keeps its parent reachable, so the parent's finalizer cannot destroy memory the view still addresses.
     private readonly WebGpuBuffer? _viewParent;
+    private AiDotNet.Tensors.Engines.DevicePrimitives.DeviceMemoryHold _memory; // what GpuMemoryStats counts (nothing for a view)
+
+    /// <summary>The device's memory counters. Every WebGPU backend shares one device (WebGpuDevice.Instance).</summary>
+    internal static readonly AiDotNet.Tensors.Engines.DevicePrimitives.DeviceMemoryAccount Account =
+        AiDotNet.Tensors.Engines.DevicePrimitives.DeviceMemoryAccount.For("webgpu", 0);
     private bool _disposed => System.Threading.Volatile.Read(ref _disposedFlag) != 0;
 
     /// <summary>Frees of WebGPU buffers collected without Dispose, run by the next allocation.</summary>
@@ -126,6 +131,7 @@ public sealed class WebGpuBuffer : IGpuBuffer, IDisposable
         {
             throw new InvalidOperationException("Failed to create WebGPU buffer");
         }
+        _memory.OnAllocated(Account, alignedSize);
     }
 
     /// <summary>
@@ -322,6 +328,7 @@ public sealed class WebGpuBuffer : IGpuBuffer, IDisposable
         }
 
         // A view owns no device memory: its parent destroys the buffer.
+        _memory.OnFreed();
         if (_bufferId >= 0 && _viewParent is null)
         {
             WebGpuNativeBindings.DestroyBuffer(_bufferId);
@@ -333,6 +340,7 @@ public sealed class WebGpuBuffer : IGpuBuffer, IDisposable
     ~WebGpuBuffer()
     {
         if (System.Threading.Interlocked.Exchange(ref _disposedFlag, 1) != 0 || _bufferId < 0 || _viewParent is not null) return;
+        _memory.OnFreed();
         int bufferId = _bufferId;
         PendingFrees.Enqueue(() => WebGpuNativeBindings.DestroyBuffer(bufferId));
     }

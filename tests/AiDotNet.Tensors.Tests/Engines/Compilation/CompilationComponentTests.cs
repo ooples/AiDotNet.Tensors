@@ -786,30 +786,29 @@ public class CompilationComponentTests : IDisposable
         var engine = new CpuEngine();
         var weights = CreateRandom(new[] { 8, 4 }, 43);
 
-        var input = CreateRandom(new[] { 4, 8 }, 42);
-        var symbolic = SymbolicShape.BatchDynamic(input._shape);
-
         int compileCount = 0;
-        cache.GetOrCompileInference(input._shape, () =>
+        void RunBatch(int batch, int seed, int expectedTraces)
         {
-            compileCount++;
-            return engine.TensorMatMul(input, weights);
-        }, symbolic);
+            var x = CreateRandom(new[] { batch, 8 }, seed);
+            var plan = cache.GetOrCompileInference(x._shape, () =>
+            {
+                compileCount++;
+                return engine.TensorMatMul(x, weights);
+            }, SymbolicShape.BatchDynamic(x._shape));
+            Assert.Equal(expectedTraces, compileCount);
+            // The plan returned must execute this batch, not the first one's.
+            Assert.True(plan.IsValid(x._shape));
+            plan.SetInputs(new[] { x });
+            Assert.Equal(engine.TensorMatMul(x, weights).AsSpan().ToArray(), plan.Execute().AsSpan().ToArray());
+        }
 
-        Assert.Equal(1, compileCount);
-
-        // Different batch size — should hit the symbolic cache
-        var input2 = CreateRandom(new[] { 8, 8 }, 99);
-        var symbolic2 = SymbolicShape.BatchDynamic(input2._shape);
-        cache.GetOrCompileInference(input2._shape, () =>
-        {
-            compileCount++;
-            return engine.TensorMatMul(input2, weights);
-        }, symbolic2);
-
-        // Both symbolic keys (ignoring dim 0) should be identical
-        // So compileCount should still be 1 (cache hit)
-        Assert.Equal(1, compileCount);
+        RunBatch(4, 42, expectedTraces: 1);
+        // The second batch is traced once more: that trace is what shows which dims scale with the batch.
+        RunBatch(8, 99, expectedTraces: 2);
+        // Every batch after that is built from the two traces without tracing.
+        RunBatch(16, 7, expectedTraces: 2);
+        RunBatch(3, 8, expectedTraces: 2);
+        Assert.Equal(2, cache.InstantiatedPlanCount);
     }
 
     #endregion

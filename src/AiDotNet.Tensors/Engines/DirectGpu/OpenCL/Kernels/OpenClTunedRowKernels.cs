@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Generated row / column kernel variants for OpenCL, served through the tuned-kernel registry (#1114).
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels
