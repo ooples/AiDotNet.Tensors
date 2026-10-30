@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // WebGPU WGSL compute shaders for the parity-210 op surface. Mirrors
 // CudaParity210Kernels / HipParity210Kernels / MetalParity210Kernels /
 // VulkanParity210Kernels / OpenClParity210Kernels function-for-function.

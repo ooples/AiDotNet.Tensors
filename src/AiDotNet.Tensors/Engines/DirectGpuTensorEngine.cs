@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Linq;
 using System.Runtime.CompilerServices;
@@ -2002,6 +2002,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             && ReferenceEquals(entry.Buffer, tensor._gpuBuffer)
             && ReferenceEquals(entry.Backend, backend);
     }
+    /// <summary>Whether <paramref name="tensor"/>'s data is held by the activation cache: a device op's result, where a
+    /// CPU fallback's result is not.</summary>
+    internal bool IsInActivationCache<T>(Tensor<T> tensor)
+    {
+        var key = (object?)tensor.GetBackingArrayForCacheLookupUnsafe() ?? tensor.DataVector;
+        return _activationCache.ContainsKey(key);
+    }
 
     /// <summary>
     /// Invalidates this tensor's activation-cache and pending deferred-
@@ -2872,8 +2879,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     {
                         // A caller-owned host tensor written in place on the device during the step (an optimizer
                         // moment, a parameter) is neither a step intermediate nor scratch: keep its values, as the
-                        // safe path does, whichever mode the caller asked for.
-                        var effectiveMode = entry.HostOrigin ? ActivationReleaseMode.MaterializeThenFree : mode;
+                        // safe path does, whichever mode the caller asked for. A TensorScope's release passes only the
+                        // storages created inside it (releasableOnly), so a host tensor there is the forward's own dead
+                        // output (a concatenation or normalization written Into a fresh host tensor): downloading it
+                        // made a DenseNet-121 b16 predict copy 263 MB of dead activations to the host on every call.
+                        var effectiveMode = entry.HostOrigin && releasableOnly is null ? ActivationReleaseMode.MaterializeThenFree : mode;
                         switch (effectiveMode)
                         {
                             case ActivationReleaseMode.MaterializeThenFree:
@@ -23031,7 +23041,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     void IEngine.TensorCopy<T>(Tensor<T> source, Tensor<T> destination)
     {
         if (source is not null && destination is not null && typeof(T) == typeof(float)
-            && source.Length == destination.Length && destination.IsContiguous && destination.StorageOffset != 0
+            && source.Length == destination.Length && destination.Length > 0 && destination.IsContiguous && destination.StorageOffset != 0
             && !Compilation.GraphMode.IsActive && TryGetBackend(out var viewBackend))
         {
             destination.PrepareForInPlaceWrite();
@@ -23049,7 +23059,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return;
         }
         if (source is not null && destination is not null && typeof(T) == typeof(float)
-            && source.Length == destination.Length && destination.IsContiguous && destination._storageOffset == 0
+            && source.Length == destination.Length && destination.Length > 0 && destination.IsContiguous && destination._storageOffset == 0
             && !Compilation.GraphMode.IsActive && TryGetBackend(out var backend))
         {
             try

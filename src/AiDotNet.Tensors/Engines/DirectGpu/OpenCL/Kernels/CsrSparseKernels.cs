@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // OpenCL CSR sparse matrix kernels for general sparsity patterns.
 // Supports SpMM and GNN message passing operations.
 

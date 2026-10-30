@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Deferred download handle for GPU execution graphs.
 
 using AiDotNet.Tensors.Engines.DirectGpu;

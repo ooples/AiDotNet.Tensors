@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Metal Shading Language (MSL) kernels for the parity-210 op surface.
 // Mirrors CudaParity210Kernels / HipParity210Kernels in function coverage.
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal

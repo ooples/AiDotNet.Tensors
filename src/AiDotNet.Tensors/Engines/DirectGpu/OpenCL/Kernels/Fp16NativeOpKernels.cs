@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // OpenCL FP16-NATIVE op kernels (Tensors #558): each kernel reads its activation DIRECTLY from a
 // half buffer, up-casts to FP32 in-register for the math, and writes a half result — no separate
 // FP32 buffer is materialized, so there is no convert transient (the failure mode that made the

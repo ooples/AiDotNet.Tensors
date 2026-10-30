@@ -1,8 +1,9 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Metal GPU buffer implementation for Apple Silicon.
 
 using System;
 using System.Runtime.InteropServices;
+using AiDotNet.Tensors.Engines.DevicePrimitives;
 using static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
@@ -37,6 +38,7 @@ public sealed class MetalGpuBuffer : IGpuBuffer
     private readonly long _byteOffset;
     // A view keeps its parent reachable, so the parent's finalizer cannot release memory the view still addresses.
     private readonly MetalGpuBuffer? _viewParent;
+    private DeviceMemoryHold _memory; // what GpuMemoryStats counts for this memory (nothing for a view)
 
     /// <summary>
     /// Gets the native Metal buffer handle.
@@ -129,6 +131,7 @@ public sealed class MetalGpuBuffer : IGpuBuffer
         {
             throw new OutOfMemoryException($"Failed to allocate Metal buffer of {sizeInBytes} bytes");
         }
+        _memory.OnAllocated(device.MemoryAccount, (long)sizeInBytes);
     }
 
     /// <summary>
@@ -176,6 +179,7 @@ public sealed class MetalGpuBuffer : IGpuBuffer
         {
             throw new OutOfMemoryException($"Failed to allocate Metal buffer of {sizeInBytes} bytes with data");
         }
+        _memory.OnAllocated(device.MemoryAccount, (long)sizeInBytes);
     }
 
     /// <summary>
@@ -559,6 +563,7 @@ public sealed class MetalGpuBuffer : IGpuBuffer
             }
 
             _disposed = true;
+            _memory.OnFreed();
 
             if (_buffer != IntPtr.Zero)
             {
@@ -586,6 +591,7 @@ public sealed class MetalGpuBuffer : IGpuBuffer
         {
             if (_disposed) return;
             _disposed = true;
+            _memory.OnFreed();
             buffer = _buffer;
             _buffer = IntPtr.Zero;
         }

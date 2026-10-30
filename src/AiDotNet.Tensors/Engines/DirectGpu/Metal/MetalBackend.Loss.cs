@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Metal GPU backend - Loss functions and gradients.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // FP16-NATIVE elementwise / activation ops for the WebGPU backend (Tensors #558): GELU / ReLU /
 // residual add. WebGPU has no native 16-bit storage by default (the optional shader-f16 feature is not
 // used), so this backend models FP16 as f32 with a truncated 10-bit mantissa (see ConvertToFp16). Under

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // GPU kernels for attention operations including standard attention, FlashAttention, and GQA.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels

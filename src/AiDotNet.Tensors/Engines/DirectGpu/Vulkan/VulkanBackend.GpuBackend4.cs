@@ -923,62 +923,6 @@ public sealed unsafe partial class VulkanBackend
         Scale(meanLoss, meanLoss, 1f / n, 1);
     }
 
-    private bool DispatchLstmForwardSequence(
-        IGpuBuffer input, IGpuBuffer hInit, IGpuBuffer cInit,
-        IGpuBuffer weightsIh, IGpuBuffer weightsHh, IGpuBuffer biasIh, IGpuBuffer biasHh,
-        IGpuBuffer output, IGpuBuffer hFinal, IGpuBuffer cFinal,
-        IGpuBuffer allH, IGpuBuffer allC, IGpuBuffer cacheGates,
-        int seqLen, int batch, int inputSize, int hiddenSize)
-    {
-        if (seqLen <= 0 || batch <= 0 || inputSize <= 0 || hiddenSize <= 0) return true;
-        int stateSize = checked(batch * hiddenSize);
-        Copy(hInit, 0, allH, 0, stateSize);
-        Copy(cInit, 0, allC, 0, stateSize);
-        GlslNaryOp(VulkanResidentKernels.LstmSequenceInputProjection,
-            new[] { input, weightsIh, biasIh, biasHh, cacheGates }, checked(seqLen * batch * 4 * hiddenSize),
-            RecurrentShape(seqLen, batch, inputSize, hiddenSize));
-        var step = new[] { weightsHh, cacheGates, allH, allC, output };
-        for (int t = 0; t < seqLen; t++)
-            GlslNaryOp(VulkanResidentKernels.LstmSequenceStep, step, stateSize,
-                RecurrentShape(seqLen, batch, inputSize, hiddenSize, (uint)t));
-        Copy(allH, checked(seqLen * stateSize), hFinal, 0, stateSize);
-        Copy(allC, checked(seqLen * stateSize), cFinal, 0, stateSize);
-        return true;
-    }
-
-    // Writes every gradient (LstmBackwardOverwritesGradients). The cell carry is gradCInit and the hidden carry gradHInit,
-    // so after step 0 they hold dL/dc0 and dL/dh0.
-    private bool DispatchLstmBackwardSequence(
-        IGpuBuffer gradOutput, IGpuBuffer allH, IGpuBuffer allC, IGpuBuffer cacheGates,
-        IGpuBuffer weightsIh, IGpuBuffer weightsHh, IGpuBuffer input,
-        IGpuBuffer gradInput, IGpuBuffer gradHInit, IGpuBuffer gradCInit,
-        IGpuBuffer gradWeightsIh, IGpuBuffer gradWeightsHh, IGpuBuffer gradBiasIh, IGpuBuffer gradBiasHh,
-        int seqLen, int batch, int inputSize, int hiddenSize)
-    {
-        if (seqLen <= 0 || batch <= 0 || inputSize <= 0 || hiddenSize <= 0) return true;
-        int stateSize = checked(batch * hiddenSize), gates = checked(4 * hiddenSize);
-        using var dGates = AllocateBuffer(checked(seqLen * batch * gates));
-        Fill(gradHInit, 0f, stateSize);
-        Fill(gradCInit, 0f, stateSize);
-        var cell = new[] { gradOutput, allC, cacheGates, dGates, gradHInit, gradCInit };
-        var hidden = new[] { dGates, weightsHh, gradHInit };
-        for (int t = seqLen - 1; t >= 0; t--)
-        {
-            var shape = RecurrentShape(seqLen, batch, inputSize, hiddenSize, (uint)t);
-            GlslNaryOp(VulkanResidentKernels.LstmSequenceBackwardCell, cell, stateSize, shape);
-            GlslNaryOp(VulkanResidentKernels.LstmSequenceBackwardHidden, hidden, stateSize, shape);
-        }
-        GlslNaryOp(VulkanResidentKernels.LstmSequenceInputGradient, new[] { dGates, weightsIh, gradInput },
-            checked(batch * seqLen * inputSize), RecurrentShape(seqLen, batch, inputSize, hiddenSize));
-        GlslNaryOp(VulkanResidentKernels.LstmSequenceWeightGradient, new[] { dGates, input, gradWeightsIh },
-            checked(gates * inputSize), RecurrentShape(seqLen, batch, inputSize, hiddenSize, 0));
-        GlslNaryOp(VulkanResidentKernels.LstmSequenceWeightGradient, new[] { dGates, allH, gradWeightsHh },
-            checked(gates * hiddenSize), RecurrentShape(seqLen, batch, inputSize, hiddenSize, 1));
-        GlslNaryOp(VulkanResidentKernels.LstmSequenceBiasGradient, new[] { dGates, gradBiasIh, gradBiasHh }, gates,
-            RecurrentShape(seqLen, batch, inputSize, hiddenSize));
-        return true;
-    }
-
     private static uint[] RecurrentShape(int seqLen, int batch, int inputSize, int hiddenSize) =>
         new[] { (uint)seqLen, (uint)batch, (uint)inputSize, (uint)hiddenSize };
 
@@ -1057,7 +1001,10 @@ public sealed unsafe partial class VulkanBackend
         int seqLen, int batch, int inputSize, int hiddenSize)
     {
         EnsureInitialized();
-        DispatchLstmForwardSequence(input, hInit, cInit, weightsIh, weightsHh, biasIh, biasHh,
+        // The shared lstm_p_ kernels, launched per step with every unit in parallel. The previous resident shaders ran
+        // a whole batch row (forward) or the whole BPTT (backward) in one invocation, which outlasts the Windows GPU
+        // timeout at T = 200 and loses the device (vkWaitForFences -4) for every later test in the process.
+        PortableLstmSequence.Forward(this, LaunchSolver, input, hInit, cInit, weightsIh, weightsHh, biasIh, biasHh,
             output, hFinal, cFinal, allH, allC, cacheGates, seqLen, batch, inputSize, hiddenSize);
     }
 
@@ -1070,7 +1017,7 @@ public sealed unsafe partial class VulkanBackend
         int seqLen, int batch, int inputSize, int hiddenSize)
     {
         EnsureInitialized();
-        DispatchLstmBackwardSequence(gradOutput, allH, allC, cacheGates, weightsIh, weightsHh, input,
+        PortableLstmSequence.Backward(this, LaunchSolver, gradOutput, allH, allC, cacheGates, weightsIh, weightsHh, input,
             gradInput, gradHInit, gradCInit, gradWeightsIh, gradWeightsHh, gradBiasIh, gradBiasHh,
             seqLen, batch, inputSize, hiddenSize);
     }

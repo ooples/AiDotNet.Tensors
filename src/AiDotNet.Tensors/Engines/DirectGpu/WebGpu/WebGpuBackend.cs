@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // WebGPU backend implementation for browser-based GPU compute.
 // Only available in .NET 7+ with Blazor WebAssembly.
 

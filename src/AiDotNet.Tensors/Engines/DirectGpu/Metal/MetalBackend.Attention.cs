@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Metal GPU backend - Attention and Spatial Transformer operations.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;

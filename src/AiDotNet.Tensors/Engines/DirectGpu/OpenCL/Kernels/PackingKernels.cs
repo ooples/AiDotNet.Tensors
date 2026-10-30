@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Padding and copy kernels for packed/indirect GEMM paths.
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels
 {

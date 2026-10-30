@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // NOTE: validated only on a Metal runner -- the dev box has no Apple GPU. The template emits the same bodies as the
 // OpenCL instance, whose BatchNormRegisterPortTests run on a real device.
 using System;

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Metal FFT dispatcher — implements IFftBackend via parity212_fft.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;

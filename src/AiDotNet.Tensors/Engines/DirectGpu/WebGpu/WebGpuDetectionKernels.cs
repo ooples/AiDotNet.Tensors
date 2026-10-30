@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // WebGPU WGSL compute shaders for the vision detection ops added by Issue
 // #217. Mirrors CudaDetectionKernels / HipDetectionKernels /
 // MetalDetectionKernels / VulkanDetectionKernels function-for-function.

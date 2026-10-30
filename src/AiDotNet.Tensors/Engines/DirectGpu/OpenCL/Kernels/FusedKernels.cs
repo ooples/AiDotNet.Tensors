@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Fused operation kernels - GEMM + Bias + Activation in single pass.
 // Eliminates memory round-trips for 20-50% performance gain.
 // Works on ALL .NET versions including .NET Framework 4.6.2.

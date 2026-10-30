@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // OpenCL kernels for locally connected convolution operations.
 // Unlike standard convolution, locally connected uses unique weights per spatial position.
 

@@ -9,6 +9,7 @@ using System.Text;
 using System.Threading;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation.Codegen;
+using AiDotNet.Tensors.Engines.DevicePrimitives;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
@@ -18,7 +19,7 @@ using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
-public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, IChannelBiasAddOutBackend, IUninitializedGpuAllocation, IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IMultiTensorGpuOptimizerBackend, AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend, IPixelShuffleBackend, INativeGpuCodegenExecutor, IBiasActivationBackend
+public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, IChannelBiasAddOutBackend, IUninitializedGpuAllocation, IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IMultiTensorGpuOptimizerBackend, AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend, IPixelShuffleBackend, INativeGpuCodegenExecutor, IBiasActivationBackend, IDeviceMemoryAccounted
 {
     // During teardown the CUDA driver/context may already be destroyed, so calling driver
     // APIs (cuCtxPushCurrent / cuMemFree / cuCtxPopCurrent / cuCtxDestroy / cuModuleUnload)
@@ -318,6 +319,14 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         catch { }
     }
 
+    // This device's memory counters (GpuMemoryStats): every owning buffer below charges them.
+    private readonly DeviceMemoryAccount _memoryAccount;
+    DeviceMemoryAccount
+        IDeviceMemoryAccounted.MemoryAccount => _memoryAccount;
+
+    private static long ReadMemPoolBytes(IntPtr pool, int attribute)
+        => CuBlasNative.cuMemPoolGetAttribute(pool, attribute, out ulong value) == CudaResult.Success ? (long)value : 0;
+
     private const int MaxPooledBufferElements = 16_777_216;
     private const int MaxPooledBuffersPerSize = 4;
     private readonly GpuBufferPool<CudaGpuBuffer> _bufferPool =
@@ -600,6 +609,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public CudaBackend(int deviceIndex)
     {
+        _memoryAccount = DeviceMemoryAccount.For("cuda", deviceIndex);
         _kernelCache = new ConcurrentDictionary<string, IntPtr>(StringComparer.Ordinal);
         // Resolve explicit configuration before native probing or the availability fallback. A
         // misspelled policy is a caller error, not evidence that CUDA is unavailable, and must not
@@ -700,6 +710,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 if (CuBlasNative.cuDeviceGetDefaultMemPool(out var memPool, device) == CudaResult.Success)
                 {
                     _asyncMemPool = memPool;
+                    // Stream-ordered buffers are not counted as reserved one by one: freed ones stay in this pool, so
+                    // the pool's own counter is the device memory they hold. It captures the handle, not the backend.
+                    _memoryAccount.SetDriverReserved(
+                        () => (ReadMemPoolBytes(memPool, 5), ReadMemPoolBytes(memPool, 6)),
+                        () => { ulong zero = 0; CuBlasNative.cuMemPoolSetAttribute(memPool, 6, ref zero); });
                     ulong threshold = ulong.MaxValue; // CU_MEMPOOL_ATTR_RELEASE_THRESHOLD = 4
                     var poolAttrStatus = CuBlasNative.cuMemPoolSetAttribute(memPool, 4, ref threshold);
                     if (poolAttrStatus != CudaResult.Success)
@@ -1748,7 +1763,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // Reuse a pooled stream-ordered buffer when one fits, and stage the copy so it does not block the host.
             var target = TryRentAsyncBuffer(size)
                 ?? new CudaGpuBuffer(_cudaContext, AllocDeviceMemoryAsync(byteSize), size,
-                    returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream);
+                    returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream, account: _memoryAccount);
             try
             {
                 if (TryStageUpload(target.Handle, data, byteSize))
@@ -1822,7 +1837,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw;
         }
 
-        return new CudaGpuBuffer(_cudaContext, devicePtr, size, ReturnPooledBuffer);
+        return new CudaGpuBuffer(_cudaContext, devicePtr, size, ReturnPooledBuffer, account: _memoryAccount);
     }
 
     /// <summary>
@@ -2079,7 +2094,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             CuBlasNative.CheckCudaResult(
                 CudaNativeBindings.cuMemsetD8Async(p, 0, (ulong)size * sizeof(float), _stream),
                 "cuMemsetD8Async");
-            return new CudaGpuBuffer(_cudaContext, p, size, returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream);
+            return new CudaGpuBuffer(_cudaContext, p, size, returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream, account: _memoryAccount);
         }
         if (CaptureMemoryPool.Current is null && _bufferPool.TryRent(size, out var pooled) && pooled != null) // a capture never takes shared-pool memory
         {
@@ -2094,7 +2109,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // Stream-ordered: a synchronous cuMemset runs on the legacy stream, which is illegal while _stream is being
         // captured (CUDA 906) and serializes the device everywhere else.
         CuBlasNative.CheckCudaResult(CudaNativeBindings.cuMemsetD32Async(devicePtr, 0, (ulong)size, _stream), "cuMemsetD32Async");
-        return new CudaGpuBuffer(_cudaContext, devicePtr, size, ReturnPooledBuffer);
+        return new CudaGpuBuffer(_cudaContext, devicePtr, size, ReturnPooledBuffer, account: _memoryAccount);
     }
 
     /// <inheritdoc/>
@@ -2113,7 +2128,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         using var _ = PushContext();
         var buffer = TryRentAsyncBuffer(size)
             ?? new CudaGpuBuffer(_cudaContext, AllocDeviceMemoryAsync((ulong)size * sizeof(float)), size,
-                returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream);
+                returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream, account: _memoryAccount);
         if (PoisonUninitializedBuffers)
         {
             try
@@ -2153,13 +2168,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (_asyncAlloc)
         {
             var pA = AllocDeviceMemoryAsync((ulong)size);
-            return new CudaGpuByteBuffer(_cudaContext, pA, size, asyncFreeStream: _mainStream);
+            return new CudaGpuByteBuffer(_cudaContext, pA, size, asyncFreeStream: _mainStream, account: _memoryAccount);
         }
         CuBlasNative.CheckCudaResult(
             CuBlasNative.cuMemAlloc(out IntPtr devicePtr, (ulong)size),
             "cuMemAlloc(byte)");
 
-        return new CudaGpuByteBuffer(_cudaContext, devicePtr, size);
+        return new CudaGpuByteBuffer(_cudaContext, devicePtr, size, account: _memoryAccount);
     }
 
     // Stream-ordered device allocation (#558 layer 6). On OOM, sync the context (lets pending
@@ -6472,6 +6487,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 try
                 {
                     CuBlasNative.cuCtxPushCurrent(f.Ctx);
+                    GpuMemoryTracker.OnFree(f.Ptr);
                     // #226 crash fix: stay stream-ordered while the stream is alive (the common case — a
                     // buffer finalized during a live engine), but fall back to a synchronous cuMemFree once
                     // the stream is gone. cuMemFreeAsync on a destroyed stream is an uncatchable 0xC0000005;
@@ -7237,7 +7253,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // CUDNN_STATUS_BAD_PARAM_STREAM_MISMATCH and cuDNN can't address our
             // device buffers. Callers MUST hold PushContext when they call this.
             _cudnnContext ??= CuDnnContext.ForCurrentContext();
-            _cudnnConv = new CuDnnConvolution(_cudnnContext);
+            _cudnnConv = new CuDnnConvolution(_cudnnContext) { MemoryAccount = _memoryAccount };
         }
     }
 
@@ -9675,7 +9691,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         ulong byteSize = (ulong)size * sizeof(int);
         CuBlasNative.CheckCudaResult(CuBlasNative.cuMemAlloc(out IntPtr devicePtr, byteSize), "cuMemAlloc(int)");
         CuBlasNative.CheckCudaResult(CudaNativeBindings.cuMemsetD32Async(devicePtr, 0, (ulong)size, _stream), "cuMemsetD32Async(int)");
-        return new CudaGpuBuffer(_cudaContext, devicePtr, size);
+        return new CudaGpuBuffer(_cudaContext, devicePtr, size, account: _memoryAccount);
     }
 
     public IGpuBuffer AllocateIntBuffer(int[] data)
@@ -9715,7 +9731,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw;
         }
 
-        return new CudaGpuBuffer(_cudaContext, devicePtr, size);
+        return new CudaGpuBuffer(_cudaContext, devicePtr, size, account: _memoryAccount);
     }
 
     #endregion
@@ -18881,9 +18897,15 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             _cudnnBn.Dispose();
             _cudnnBn = null;
         }
+        // cudnnDestroy and cublasDestroy synchronize the whole device (both documented), and every backend shares the
+        // device's primary context: issued while another thread captures a graph on it, that sync faults inside the
+        // driver (a CUDA-lane dump: cublasDestroy -> cuCtxSynchronize, access violation, while a tuner captured on
+        // another backend). Hold the context's capture gate around just the native destroys, as
+        // SynchronizeContextOutsideCapture does, so no capture is open; the buffer frees stay outside it.
         if (_cudnnContext is not null)
         {
-            _cudnnContext.Dispose();
+            lock (CaptureGateFor(_cudaContext))
+                _cudnnContext.Dispose();
             _cudnnContext = null;
         }
 
@@ -18898,11 +18920,16 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // _cublasHandle property here would instead lazily create a fresh handle on the disposing thread.
         if (_threadCublas is not null)
         {
-            foreach (var tc in _threadCublas.Values)
+            var handles = _threadCublas.Values;
+            lock (CaptureGateFor(_cudaContext))
+                foreach (var tc in handles.Where(tc => tc is not null && tc.Handle != IntPtr.Zero))
+                {
+                    CuBlasNative.cublasDestroy(tc.Handle);
+                    tc.Handle = IntPtr.Zero;
+                }
+            foreach (var tc in handles)
             {
                 if (tc is null) continue;
-                if (tc.Handle != IntPtr.Zero)
-                    CuBlasNative.cublasDestroy(tc.Handle);
                 // The handle's 8 MiB workspace is the backend's allocation, not cuBLAS's: free it with the handle.
                 tc.Workspace?.Dispose();
                 tc.Workspace = null;
@@ -20119,6 +20146,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         private int _poolState;
         private int _size;
         private CaptureMemoryPool[]? _capturePins; // live captures whose graphs use this buffer (CaptureMemoryPool)
+        private DeviceMemoryHold _memory; // what GpuMemoryStats counts for this memory
 
         public int Size => Volatile.Read(ref _size);
         public int Capacity { get; }
@@ -20135,9 +20163,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         internal bool IsAsyncFreed => _asyncFreeStream != IntPtr.Zero;
         internal IntPtr OwningContext => _context;
 
+        /// <param name="account">The device's memory counters, for a fresh allocation; null for a pool's new wrapper of
+        /// memory already counted.</param>
         public CudaGpuBuffer(IntPtr context, IntPtr devicePtr, int size, Action<CudaGpuBuffer>? returnToPool = null,
-            IntPtr asyncFreeStream = default)
+            IntPtr asyncFreeStream = default, DeviceMemoryAccount? account = null)
         {
+            // Stream-ordered memory is counted as reserved by the driver pool itself (see _memoryAccount).
+            _memory.OnAllocated(account, (long)size * sizeof(float), countReserved: asyncFreeStream == IntPtr.Zero);
             _context = context;
             _devicePtr = devicePtr;
             _size = size;
@@ -20163,6 +20195,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 throw new ArgumentOutOfRangeException(nameof(size));
             Volatile.Write(ref _size, size);
             Interlocked.Exchange(ref _poolState, 0);
+            _memory.OnRented();
         }
 
         /// <summary>
@@ -20179,6 +20212,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             if (ptr == IntPtr.Zero) return null;
             GC.SuppressFinalize(this);
             var lease = new CudaGpuBuffer(_context, ptr, Capacity, _returnToPool, _asyncFreeStream);
+            lease._memory = _memory.TransferToLease();
             Volatile.Write(ref lease._poolState, 1);   // pooled until the next MarkRented
             return lease;
         }
@@ -20209,6 +20243,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 GC.SuppressFinalize(this);
                 return;
             }
+            _memory.OnFreed();
 
             // During CLR/AppDomain teardown the CUDA context may already be gone;
             // calling the driver here raises an uncatchable, finalizer-fatal access
@@ -20296,6 +20331,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // Atomically CLAIM the pointer: if a concurrent ReleaseCore already took it we get Zero and
             // enqueue nothing, so the pointer is never freed twice (the double-free that crashed the host).
             var ptr = Interlocked.Exchange(ref _devicePtr, IntPtr.Zero);
+            if (ptr != IntPtr.Zero) _memory.OnFreed();
             if (ptr != IntPtr.Zero && !IsRuntimeTearingDown && !ProcessExiting)
                 PendingFinalizerFrees.Enqueue((ptr, _context, _contextGeneration, _asyncFreeStream));
             _context = IntPtr.Zero;
@@ -20323,9 +20359,12 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         internal bool IsAsyncFreed => _asyncFreeStream != IntPtr.Zero;
 
         private CaptureMemoryPool[]? _capturePins; // live captures whose graphs use this buffer (CaptureMemoryPool)
+        private DeviceMemoryHold _memory; // see CudaGpuBuffer
 
-        public CudaGpuByteBuffer(IntPtr context, IntPtr devicePtr, int size, IntPtr asyncFreeStream = default)
+        public CudaGpuByteBuffer(IntPtr context, IntPtr devicePtr, int size, IntPtr asyncFreeStream = default,
+            DeviceMemoryAccount? account = null)
         {
+            _memory.OnAllocated(account, size, countReserved: asyncFreeStream == IntPtr.Zero);
             _context = context;
             _devicePtr = devicePtr;
             Size = size;
@@ -20354,6 +20393,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 GC.SuppressFinalize(this);
                 return;
             }
+            _memory.OnFreed();
 
             // See CudaGpuBuffer.Release: skip native CUDA calls during teardown to
             // avoid a finalizer-fatal access violation on an already-destroyed context.
@@ -20403,6 +20443,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // Atomically CLAIM the pointer: if Dispose already took it we get Zero and enqueue nothing,
             // so it is never freed twice (the double-free that crashed the host).
             var ptr = Interlocked.Exchange(ref _devicePtr, IntPtr.Zero);
+            if (ptr != IntPtr.Zero) _memory.OnFreed();
             if (ptr != IntPtr.Zero && !IsRuntimeTearingDown && !ProcessExiting)
                 PendingFinalizerFrees.Enqueue((ptr, _context, _contextGeneration, _asyncFreeStream));
             _context = IntPtr.Zero;

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Metal host-array CSR·dense SpMM + SDDMM dispatch — Metal-native compute (MSL)
 // alternative to the MPS vendor path (MpsSparseBackend). Where MpsSparseBackend
 // wraps MPSSparseMatrixVectorMultiplication (requires an Apple-Silicon runner

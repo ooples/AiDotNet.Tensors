@@ -1,5 +1,5 @@
 #if NET7_0_OR_GREATER
-// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // WebGPU IFusedAttentionBackend (#1179): the portable fused attention over the shared fa_p_ kernels.
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using P = AiDotNet.Tensors.Engines.DirectGpu.PortableFusedAttention;

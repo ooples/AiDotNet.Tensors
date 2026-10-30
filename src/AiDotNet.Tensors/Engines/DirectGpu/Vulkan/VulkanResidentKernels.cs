@@ -195,91 +195,12 @@ layout(set=0,binding=2) writeonly buffer Mel { float mel[]; };
 layout(push_constant) uniform Params { uint frames; uint frequencies; uint bands; };
 void main(){uint idx=gl_GlobalInvocationID.x;if(idx>=frames*bands)return;uint frame=idx/bands,band=idx%bands;float sum=0.0;for(uint k=0u;k<frequencies;++k)sum+=power[frame*frequencies+k]*filterbank[band*frequencies+k];mel[idx]=sum;}";
 
-    // Recurrent sequences run as one dispatch per timestep (plus whole-sequence projections and gradient reductions), with
-    // an invocation per (batch row, hidden unit). They used to run each batch row's whole sequence in one invocation and
-    // the whole BPTT in ONE invocation: a 64-row, 32-step LSTM backward took 5.5 s, the driver's watchdog reset the
-    // device, and training failed with VK_ERROR_DEVICE_LOST at the next submission.
-    // Shared layout: LSTM input/output [B, T, *] (batch-major), GRU input/output [T, B, *] (time-major); allH/allC
-    // [T + 1, B, H]; push constants seqLen, batch, inputSize, hiddenSize, then the step t where a kernel takes one.
-
-    // LSTM gate pre-activations from the input and both biases, for every step at once: gates [T, B, 4H].
-    public static string LstmSequenceInputProjection => Header + @"
-layout(set=0,binding=0) readonly buffer Input { float inputData[]; };
-layout(set=0,binding=1) readonly buffer WeightsIh { float weightsIh[]; };
-layout(set=0,binding=2) readonly buffer BiasIh { float biasIh[]; };
-layout(set=0,binding=3) readonly buffer BiasHh { float biasHh[]; };
-layout(set=0,binding=4) writeonly buffer Gates { float gates[]; };
-layout(push_constant) uniform Params { uint seqLen; uint batch; uint inputSize; uint hiddenSize; };
-void main(){uint idx=gl_GlobalInvocationID.x,gateSize=4u*hiddenSize;if(idx>=seqLen*batch*gateSize)return;uint g=idx%gateSize,row=idx/gateSize,t=row/batch,b=row%batch,inputOffset=(b*seqLen+t)*inputSize;
-    float sum=biasIh[g]+biasHh[g];for(uint k=0u;k<inputSize;++k)sum+=inputData[inputOffset+k]*weightsIh[g*inputSize+k];gates[idx]=sum;}";
-
-    // One LSTM step: adds the recurrent term to unit i's four gate pre-activations, then writes c and h for step t + 1.
-    public static string LstmSequenceStep => Header + @"
-layout(set=0,binding=0) readonly buffer WeightsHh { float weightsHh[]; };
-layout(set=0,binding=1) buffer Gates { float gates[]; };
-layout(set=0,binding=2) buffer AllH { float allH[]; };
-layout(set=0,binding=3) buffer AllC { float allC[]; };
-layout(set=0,binding=4) writeonly buffer Output { float outputData[]; };
-layout(push_constant) uniform Params { uint seqLen; uint batch; uint inputSize; uint hiddenSize; uint t; };
-float sigmoid(float x){return 1.0/(1.0+exp(-x));}
-void main(){uint idx=gl_GlobalInvocationID.x;if(idx>=batch*hiddenSize)return;uint b=idx/hiddenSize,i=idx%hiddenSize,H=hiddenSize,cellSize=batch*H;
-    uint hPrev=t*cellSize+b*H,gateOffset=(t*batch+b)*4u*H;float pi=gates[gateOffset+i],pf=gates[gateOffset+H+i],pg=gates[gateOffset+2u*H+i],po=gates[gateOffset+3u*H+i];
-    for(uint k=0u;k<H;++k){float hk=allH[hPrev+k];pi+=hk*weightsHh[i*H+k];pf+=hk*weightsHh[(H+i)*H+k];pg+=hk*weightsHh[(2u*H+i)*H+k];po+=hk*weightsHh[(3u*H+i)*H+k];}
-    gates[gateOffset+i]=pi;gates[gateOffset+H+i]=pf;gates[gateOffset+2u*H+i]=pg;gates[gateOffset+3u*H+i]=po;
-    float ct=sigmoid(pf)*allC[hPrev+i]+sigmoid(pi)*tanh(pg),ht=sigmoid(po)*tanh(ct);allC[(t+1u)*cellSize+b*H+i]=ct;allH[(t+1u)*cellSize+b*H+i]=ht;outputData[(b*seqLen+t)*H+i]=ht;}";
-
-    // LSTM backward, step t: gate gradients into dGates [T, B, 4H] from dh = dy + dhCarry and the cell carry dcCarry,
-    // then dcCarry = dc * f. dhCarry is rewritten by LstmSequenceBackwardHidden.
-    public static string LstmSequenceBackwardCell => Header + @"
-layout(set=0,binding=0) readonly buffer GradOutput { float gradOutput[]; };
-layout(set=0,binding=1) readonly buffer AllC { float allC[]; };
-layout(set=0,binding=2) readonly buffer Gates { float gates[]; };
-layout(set=0,binding=3) writeonly buffer DGates { float dGates[]; };
-layout(set=0,binding=4) readonly buffer DhCarry { float dhCarry[]; };
-layout(set=0,binding=5) buffer DcCarry { float dcCarry[]; };
-layout(push_constant) uniform Params { uint seqLen; uint batch; uint inputSize; uint hiddenSize; uint t; };
-float sigmoid(float x){return 1.0/(1.0+exp(-x));}
-void main(){uint idx=gl_GlobalInvocationID.x;if(idx>=batch*hiddenSize)return;uint b=idx/hiddenSize,i=idx%hiddenSize,H=hiddenSize,cellSize=batch*H,state=b*H+i;
-    uint gateOffset=(t*batch+b)*4u*H;float ig=sigmoid(gates[gateOffset+i]),fg=sigmoid(gates[gateOffset+H+i]),gg=tanh(gates[gateOffset+2u*H+i]),og=sigmoid(gates[gateOffset+3u*H+i]);
-    float tanhCt=tanh(allC[(t+1u)*cellSize+state]),dh=gradOutput[(b*seqLen+t)*H+i]+dhCarry[state],dc=dh*og*(1.0-tanhCt*tanhCt)+dcCarry[state];
-    dGates[gateOffset+i]=dc*gg*ig*(1.0-ig);dGates[gateOffset+H+i]=dc*allC[t*cellSize+state]*fg*(1.0-fg);dGates[gateOffset+2u*H+i]=dc*ig*(1.0-gg*gg);dGates[gateOffset+3u*H+i]=dh*tanhCt*og*(1.0-og);
-    dcCarry[state]=dc*fg;}";
-
-    // LSTM backward, step t: dhCarry[b, k] = sum over the 4H gate rows of dGates * W_hh, the gradient reaching h(t - 1).
-    public static string LstmSequenceBackwardHidden => Header + @"
-layout(set=0,binding=0) readonly buffer DGates { float dGates[]; };
-layout(set=0,binding=1) readonly buffer WeightsHh { float weightsHh[]; };
-layout(set=0,binding=2) writeonly buffer DhCarry { float dhCarry[]; };
-layout(push_constant) uniform Params { uint seqLen; uint batch; uint inputSize; uint hiddenSize; uint t; };
-void main(){uint idx=gl_GlobalInvocationID.x;if(idx>=batch*hiddenSize)return;uint b=idx/hiddenSize,k=idx%hiddenSize,gateSize=4u*hiddenSize,gateOffset=(t*batch+b)*gateSize;
-    float sum=0.0;for(uint g=0u;g<gateSize;++g)sum+=dGates[gateOffset+g]*weightsHh[g*hiddenSize+k];dhCarry[idx]=sum;}";
-
-    // LSTM input gradient for every step at once: gradInput [B, T, In].
-    public static string LstmSequenceInputGradient => Header + @"
-layout(set=0,binding=0) readonly buffer DGates { float dGates[]; };
-layout(set=0,binding=1) readonly buffer WeightsIh { float weightsIh[]; };
-layout(set=0,binding=2) writeonly buffer GradInput { float gradInput[]; };
-layout(push_constant) uniform Params { uint seqLen; uint batch; uint inputSize; uint hiddenSize; };
-void main(){uint idx=gl_GlobalInvocationID.x;if(idx>=batch*seqLen*inputSize)return;uint k=idx%inputSize,row=idx/inputSize,b=row/seqLen,t=row%seqLen,gateSize=4u*hiddenSize,gateOffset=(t*batch+b)*gateSize;
-    float sum=0.0;for(uint g=0u;g<gateSize;++g)sum+=dGates[gateOffset+g]*weightsIh[g*inputSize+k];gradInput[idx]=sum;}";
-
-    // LSTM weight gradients over every step and batch row: gradWeightsIh [4H, In] from the input, gradWeightsHh [4H, H]
-    // from h(t - 1). mode 0 = input-hidden, 1 = hidden-hidden.
-    public static string LstmSequenceWeightGradient => Header + @"
-layout(set=0,binding=0) readonly buffer DGates { float dGates[]; };
-layout(set=0,binding=1) readonly buffer Source { float source[]; };
-layout(set=0,binding=2) writeonly buffer GradWeights { float gradWeights[]; };
-layout(push_constant) uniform Params { uint seqLen; uint batch; uint inputSize; uint hiddenSize; uint mode; };
-void main(){uint width=mode==0u?inputSize:hiddenSize,gateSize=4u*hiddenSize,idx=gl_GlobalInvocationID.x;if(idx>=gateSize*width)return;uint g=idx/width,k=idx%width;
-    float sum=0.0;for(uint t=0u;t<seqLen;++t)for(uint b=0u;b<batch;++b){uint src=mode==0u?(b*seqLen+t)*inputSize+k:(t*batch+b)*hiddenSize+k;sum+=dGates[(t*batch+b)*gateSize+g]*source[src];}gradWeights[idx]=sum;}";
-
-    // LSTM bias gradient (the same for both biases, which the forward sums): the gate gradients summed over steps and rows.
-    public static string LstmSequenceBiasGradient => Header + @"
-layout(set=0,binding=0) readonly buffer DGates { float dGates[]; };
-layout(set=0,binding=1) writeonly buffer GradBiasIh { float gradBiasIh[]; };
-layout(set=0,binding=2) writeonly buffer GradBiasHh { float gradBiasHh[]; };
-layout(push_constant) uniform Params { uint seqLen; uint batch; uint inputSize; uint hiddenSize; };
-void main(){uint gateSize=4u*hiddenSize,g=gl_GlobalInvocationID.x;if(g>=gateSize)return;float sum=0.0;for(uint row=0u;row<seqLen*batch;++row)sum+=dGates[row*gateSize+g];gradBiasIh[g]=sum;gradBiasHh[g]=sum;}";
+    // GRU sequences run as one dispatch per timestep (plus whole-sequence projections and gradient reductions), with an
+    // invocation per (batch row, hidden unit). They used to run each batch row's whole sequence in one invocation and the
+    // whole BPTT in ONE invocation, which tripped the driver's watchdog (VK_ERROR_DEVICE_LOST at the next submission).
+    // LSTM sequences run the shared lstm_p_ kernels instead (PortableLstmSequence).
+    // Layout: input/output [T, B, *] (time-major), allH [T + 1, B, H]; push constants seqLen, batch, inputSize,
+    // hiddenSize, then the step t where a kernel takes one.
 
     // GRU, PyTorch's formulation (the reset gate scales W_hn h + b_hn), as the other backends compute it:
     //   r = sigmoid(W_ir x + b_ir + W_hr h + b_hr), z = sigmoid(W_iz x + b_iz + W_hz h + b_hz)

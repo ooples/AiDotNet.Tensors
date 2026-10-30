@@ -1,4 +1,4 @@
-// Copyright (c) 2024 AiDotNet. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Profiling;
 
