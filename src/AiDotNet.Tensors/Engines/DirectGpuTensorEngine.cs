@@ -2743,9 +2743,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// FP16 parity tests gate correctness: a wrongful discard of a still-needed tensor would corrupt the grads.
     /// </summary>
     /// <returns>The device bytes released.</returns>
-    internal long EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect, bool materializePending)
+    /// <param name="released">Receives every device buffer released, so a caller holding tensors bound to them (a
+    /// compiled plan's forward outputs and gradients, reused by the next replay) can drop those bindings.</param>
+    internal long EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect, bool materializePending,
+        ICollection<IGpuBuffer>? released = null)
         => EvictActivationsCreatedAfter(snapshot, protect,
-            materializePending ? ActivationReleaseMode.MaterializeThenFree : ActivationReleaseMode.DropScratch);
+            materializePending ? ActivationReleaseMode.MaterializeThenFree : ActivationReleaseMode.DropScratch,
+            released: released);
 
     /// <summary>
     /// Message a host read of a released step intermediate throws (see <see cref="ActivationReleaseMode.Release"/>).
@@ -2837,7 +2841,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <see cref="TensorScope"/> passes the storages created inside it, so a tensor that predates it is never freed).
     /// </summary>
     internal long EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect, ActivationReleaseMode mode,
-        Func<object, bool>? releasableOnly = null, bool afterQueuedWork = false)
+        Func<object, bool>? releasableOnly = null, bool afterQueuedWork = false, ICollection<IGpuBuffer>? released = null)
     {
         // The activation timestamp counter is process-wide, so "created after my snapshot"
         // also matches a CONCURRENT tape's activations on another thread. Free only THIS
@@ -2888,16 +2892,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
             }
         }
-        long released = 0;
+        long releasedBytes = 0;
         foreach (var entry in toDispose)
         {
-            released += entry.Buffer.SizeInBytes;
+            // A step scratch pool's buffer leaves the cache but is not freed: the pool hands it out again (as
+            // ReleaseDeadDeviceStorage leaves it alone), and freeing it gave the GPU pool a buffer the scratch pool's
+            // next lease still wrote, under whatever the GPU pool had handed it to in the meantime.
+            if (StepScratchPool.IsPooled(entry.Buffer)) continue;
+            releasedBytes += entry.Buffer.SizeInBytes;
+            released?.Add(entry.Buffer);
             // A scope ends while work that reads its results can still be queued: each backend frees after that work (CUDA:
             // stream-ordered), as TryFreeActivationByKey does, so the pool cannot hand the buffer to a later kernel early.
             if (afterQueuedWork && entry.Backend is IQueuedBufferRelease queued) queued.ReleaseAfterQueuedWork(entry.Buffer);
             else entry.Dispose();
         }
-        return released;
+        return releasedBytes;
     }
 
     /// <summary>
