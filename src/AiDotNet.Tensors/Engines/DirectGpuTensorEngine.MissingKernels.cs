@@ -7975,6 +7975,7 @@ public partial class DirectGpuTensorEngine
                 Tensor<T>? headsOut = TryShortAttentionOnDevice(q2d.Reshape(new[] { B, S, D }), k2d.Reshape(new[] { B, S, D }),
                     v2d.Reshape(new[] { B, S, D }), B, H, S, S, d, 1.0 / System.Math.Sqrt(d), causal: false, causalOffset: 0,
                     new[] { B, S, D });
+                bool shortAttention = headsOut is not null;
                 if (headsOut is null && (long)B * H * S * S <= MhaBatchedScoreElementBudget)
                 {
                     var qhB = ReshapePermuteHeads(backend, q2d, B, S, H, d);                                    // [B*H, S, d]
@@ -7999,8 +8000,12 @@ public partial class DirectGpuTensorEngine
                     var batchedProj = TensorMatMul(headsOut.Reshape(new[] { B * S, D }), outWeight);
                     var batchedResult = batchedProj.Reshape(new[] { B, S, D });
                     bool batchedTapeActive = IsTapeActive<T>();
+                    // The composed attention leaves intermediates on BLAS pool threads, so it drops every thread's and
+                    // synchronizes the device first. The short kernel leaves only this thread's (the projections), which
+                    // the per-thread drop frees in queue order with no device sync: a sync per attention layer made the
+                    // drop 38% of a GPU ViT b32 forward.
                     if (!batchedTapeActive)
-                        DropTransientActivationsCreatedAfter(actSnapshot, batchedProj.DataVector, allThreads: true);
+                        DropTransientActivationsCreatedAfter(actSnapshot, batchedProj.DataVector, allThreads: !shortAttention);
                     if (s_mhaDiag) MhaDiag(batchedTapeActive);
                     return batchedResult;
                 }
