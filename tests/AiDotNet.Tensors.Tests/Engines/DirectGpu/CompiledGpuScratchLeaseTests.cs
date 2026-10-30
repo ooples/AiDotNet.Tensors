@@ -49,6 +49,9 @@ public class CompiledGpuScratchLeaseTests
         using (plan)
         {
             plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.001f);
+            // A captured step graph bakes in its scratch addresses, so a capturing plan keeps its slots (CUDA captures
+            // by default): both arms run uncaptured, where leasing applies on every backend.
+            if (plan is CompiledTrainingPlan<float> uncaptured) uncaptured.DisableGraphStep();
             for (int s = 0; s < steps; s++) plan.Step();
             long bytes = plan is CompiledTrainingPlan<float> compiled ? compiled.ScratchBufferBytes : -1;
             var all = new System.Collections.Generic.List<float>();

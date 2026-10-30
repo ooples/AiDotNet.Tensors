@@ -816,6 +816,43 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         return false;
     }
 
+    /// <summary>
+    /// The values of every in-place state tensor the forward updates (see <see cref="IsInPlaceState"/>), taken before
+    /// the capture step's uncaptured pre-pass. That step runs its body twice, once in the pre-pass and once in the graph
+    /// launch, and an in-place update is not idempotent: a BatchNorm running statistic took one extra update at the
+    /// capture step (after 4 steps it held the CPU's 5-step value; CompiledGpuRunningStatTests).
+    /// </summary>
+    private List<(Tensor<T> State, T[] Values)> SnapshotInPlaceState()
+    {
+        var saved = new List<(Tensor<T> State, T[] Values)>();
+        if (_forwardSteps is null) return saved;
+        var seen = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        foreach (var step in _forwardSteps)
+            if (IsInPlaceState(step) && seen.Add(step.OutputBuffer))
+                saved.Add((step.OutputBuffer, step.OutputBuffer.ToArray()));
+        return saved;
+    }
+
+    /// <summary>
+    /// Writes <see cref="SnapshotInPlaceState"/>'s values back. A state the pre-pass left bound to a device buffer gets
+    /// them in that same buffer (the graph about to be captured bakes in its address, and the host copy reads through it);
+    /// one left on the host gets them on the host.
+    /// </summary>
+    private static void RestoreInPlaceState(List<(Tensor<T> State, T[] Values)> saved)
+    {
+        foreach (var (state, values) in saved)
+        {
+            if (typeof(T) == typeof(float) && state._gpuBuffer is { } buffer && buffer.Handle != IntPtr.Zero
+                && buffer.Size >= state.Length && state._gpuBackend is { } backend)
+            {
+                backend.UploadBufferInPlace((float[])(object)values, buffer);
+                continue;
+            }
+            values.AsSpan().CopyTo(state.AsWritableSpan());
+            state.IncrementVersion();
+        }
+    }
+
     private static void DetachDeviceBinding(Tensor<T>? t)
     {
         if (t?._gpuBuffer is null) return;
@@ -3716,7 +3753,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         }
                         if (_graphHasEmbedding) gte.EmbeddingIndexExternallyManaged = false;
                         RefreshGraphInputInPlace(cb);
+                        // The pre-pass executes the step; the graph launch below executes it again. Recomputed outputs
+                        // do not mind, in-place state does: put it back so this step updates it once.
+                        var inPlaceState = SnapshotInPlaceState();
                         RunGpuStepBodyForCapture(cb);
+                        RestoreInPlaceState(inPlaceState);
                         if (_graphHasEmbedding) gte.EmbeddingIndexExternallyManaged = true;
                         _stepIo = TryCreateStepIo(cb);
                         if (_stepIo is not null && _capturedOptimizerFactory?.Invoke() is { } capturedOptimizer)
@@ -4229,6 +4270,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// <summary>Test hook: the bytes of those buffers.</summary>
     internal long ScratchBufferBytes => _scratchPool?.BufferBytes ?? 0;
 
+    // The gates of the whole-step capture in Step() that hold for the plan's life (not the shared-engine check, which
+    // acts): false means no graph of this plan bakes in a scratch address.
+    private bool MayCaptureStepGraph(Engines.DirectGpu.IDirectGpuBackend backend)
+        => s_graphStepEnabled && !_graphStepDisabled && _graphStepEligible && typeof(T) == typeof(float)
+           && _checkpointing is null && _fp16HeteroOrder is null
+           && backend is Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true };
+
     private void RunGpuStepBodyForCapture(Engines.DirectGpu.IDirectGpuBackend backend)
     {
         // Lend this plan's first-write redirects to the engine for the body only: the eager optimizer, evaluation and
@@ -4243,9 +4291,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var outerScratchPool = redirectEngine is not null
             ? Engines.DirectGpuTensorEngine.EnterScratchPool(_scratchPool ??= redirectEngine.CreateScratchPool())
             : null;
-        // Backward outputs are leased for their action only where no graph capture bakes in their addresses.
-        bool leaseBackwardOutputs = redirectEngine is not null && LeaseBackwardScratch
-            && backend is not Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true };
+        // Backward outputs are leased for their action only where no graph capture bakes in their addresses: on a
+        // backend without capture, or for a plan that does not capture its step (disabled, ineligible, or failed).
+        bool leaseBackwardOutputs = redirectEngine is not null && LeaseBackwardScratch && !MayCaptureStepGraph(backend);
         if (_scratchPool is { } leasingPool)
             leasingPool.FirstLeasedAction = leaseBackwardOutputs ? _forwardActions.Length : int.MaxValue;
         bool outerTrackAdoptions = Autodiff.DifferentiableOps.TrackAdoptedAccumulators;
