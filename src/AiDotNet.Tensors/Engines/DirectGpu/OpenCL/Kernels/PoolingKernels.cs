@@ -90,6 +90,46 @@ __kernel void maxpool2d(
     }
 }
 
+// maxpool2d for a 2x2 window at stride 2, unpadded, over rows whose width is a multiple of 4: each work item computes
+// two adjacent outputs of one row from one four-wide load of each of its two input rows (maxpool2d ran an item per
+// output, each reading its four inputs singly). The comparisons, their order and the saved index are maxpool2d's.
+__kernel void maxpool2d_2x2s2(
+    __global const float* input,
+    __global float* output,
+    __global int* indices,
+    const int planes,
+    const int inHeight,
+    const int inWidth,
+    const int outHeight,
+    const int outWidth,
+    const int saveIndices)
+{
+    const int pairs = outWidth >> 1;
+    const long gid = get_global_id(0);
+    if (gid >= (long)planes * outHeight * pairs) return;
+    const int pr = (int)(gid % pairs);
+    const long t = gid / pairs;
+    const int oh = (int)(t % outHeight);
+    const long plane = t / outHeight;
+    const int ih = 2 * oh, iw = 4 * pr;
+    __global const float* row = input + (plane * inHeight + ih) * inWidth + iw;
+    const float4 a = vload4(0, row), b = vload4(0, row + inWidth);
+    float m0 = -INFINITY, m1 = -INFINITY;
+    int i0 = 0, i1 = 0;
+    const int top = ih * inWidth + iw, bottom = top + inWidth;
+    if (a.x > m0) { m0 = a.x; i0 = top; }
+    if (a.y > m0) { m0 = a.y; i0 = top + 1; }
+    if (b.x > m0) { m0 = b.x; i0 = bottom; }
+    if (b.y > m0) { m0 = b.y; i0 = bottom + 1; }
+    if (a.z > m1) { m1 = a.z; i1 = top + 2; }
+    if (a.w > m1) { m1 = a.w; i1 = top + 3; }
+    if (b.z > m1) { m1 = b.z; i1 = bottom + 2; }
+    if (b.w > m1) { m1 = b.w; i1 = bottom + 3; }
+    const long o = (plane * outHeight + oh) * outWidth + 2 * pr;
+    vstore2((float2)(m0, m1), 0, output + o);
+    if (saveIndices) vstore2((int2)(i0, i1), 0, indices + o);
+}
+
 // Max Pooling 2D backward pass
 __kernel void maxpool2d_backward(
     __global const float* gradOutput,
@@ -860,6 +900,7 @@ __kernel void adaptive_max_pool2d(
             return new string[]
             {
                 "maxpool2d",
+                "maxpool2d_2x2s2",
                 "maxpool2d_backward",
                 "avgpool2d",
                 "avgpool2d_backward",

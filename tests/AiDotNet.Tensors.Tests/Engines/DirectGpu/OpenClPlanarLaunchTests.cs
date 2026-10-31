@@ -20,6 +20,9 @@ public sealed class OpenClPlanarLaunchTests
         { 1, 3, 3, 5, 3, 1, 1 },     // 3 x 5: a 4 x 8 group
         { 2, 3, 17, 9, 3, 2, 1 },    // 9 x 5
         { 2, 2, 20, 18, 2, 2, 0 },   // 10 x 9: two groups across each axis
+        // 2 x 2 at stride 2 over widths that are multiples of 4: max pooling's two-outputs-per-item kernel.
+        { 3, 5, 8, 12, 2, 2, 0 },
+        { 1, 1, 2, 4, 2, 2, 0 },
     };
 
     [SkippableTheory]

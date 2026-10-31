@@ -7849,6 +7849,24 @@ KERNEL VARIANTS (A/B testing):
             int kernelH, int kernelW,
             int strideH, int strideW, int padH, int padW)
         {
+            if (kernelH == 2 && kernelW == 2 && strideH == 2 && strideW == 2 && padH == 0 && padW == 0
+                && inWidth % 4 == 0 && inHeight % 2 == 0 && outHeight == inHeight / 2 && outWidth == inWidth / 2
+                && _kernelCache.TryGetValue("maxpool2d_2x2s2", out var pool2))
+            {
+                long pairs = (long)batch * channels * outHeight * (outWidth / 2);
+                uint a2 = 0;
+                pool2.SetArg(a2++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+                pool2.SetArg(a2++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+                pool2.SetArg(a2++, indices != null ? ((DirectOpenClGpuBuffer)indices).Buffer.Handle : IntPtr.Zero);
+                pool2.SetArg(a2++, batch * channels);
+                pool2.SetArg(a2++, inHeight);
+                pool2.SetArg(a2++, inWidth);
+                pool2.SetArg(a2++, outHeight);
+                pool2.SetArg(a2++, outWidth);
+                pool2.SetArg(a2++, indices != null ? 1 : 0);
+                pool2.Execute1D(RoundUpToMultiple(checked((int)pairs), 256), 256);
+                return;
+            }
             var k = _kernelCache["maxpool2d"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
