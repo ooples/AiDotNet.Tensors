@@ -86,7 +86,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             int rowTiles = (m + SkinnyRowTile - 1) / SkinnyRowTile, kLanes = SkinnyMaxRowTiles / rowTiles;
             int columnBlocks = (n / SkinnyVectorWidth + SkinnyVectorsPerGroup - 1) / SkinnyVectorsPerGroup;
-            int splits = SplitKFactor(columnBlocks, k, SkinnyMinSlice, SkinnyGroupsPerComputeUnit, ComputeUnits);
+            int splits = SplitKFactor(columnBlocks, k, SkinnyMinSlice, SkinnyGroupsPerComputeUnit, SplitComputeUnits);
             int kChunk = RoundUpToMultiple((k + splits - 1) / splits, SkinnyChunkAlign);
             splits = (k + kChunk - 1) / kChunk;
             int planes = splits * kLanes;

@@ -148,7 +148,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             int hw = a.OutHeight * a.OutWidth, m = a.OutChannels, k = a.InChannels;
             int n = checked(a.Batch * hw);
             int tiles = ((m + Rb128Tile - 1) / Rb128Tile) * ((n + Rb128Tile - 1) / Rb128Tile);
-            int splits = SplitKFactor(tiles, k, Rb128MinSlice, Rb128GroupsPerComputeUnit, ComputeUnits);
+            int splits = SplitKFactor(tiles, k, Rb128MinSlice, Rb128GroupsPerComputeUnit, SplitComputeUnits);
             int kChunk = RoundUpToMultiple((k + splits - 1) / splits, Rb128ChunkAlign);
             splits = (k + kChunk - 1) / kChunk;
             int count = checked(m * n);
@@ -178,10 +178,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             return Math.Max(1, Math.Min((target + tiles - 1) / tiles, depth / minSlice));
         }
 
-        // The device's compute units, DefaultComputeUnits before the context reports them.
-        private int ComputeUnits => (int)Math.Max(1u, _context?.MaxComputeUnits ?? DefaultComputeUnits);
+        // The compute units split-K sizes its grid for: ComputeUnits (detected, or AIDOTNET_GPU_COMPUTE_UNITS), or
+        // DefaultComputeUnits when the device reported none.
+        private int SplitComputeUnits => ComputeUnits > 0 ? ComputeUnits : DefaultComputeUnits;
 
-        private const uint DefaultComputeUnits = 8;
+        private const int DefaultComputeUnits = 8;
 
         // The work-group size of the split-K reduce kernels (wino_f23_split_reduce, gemm_splitk_reduce).
         private const int ReduceGroupSize = 256;
@@ -268,7 +269,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             int p = a.Batch * tilesH * tilesW;
             int tileGroups = (p + WinogradFusedBlock - 1) / WinogradFusedBlock;
             int channelGroups = (a.OutChannels + WinogradFusedBlock - 1) / WinogradFusedBlock;
-            int rChunk = WinogradFusedChannelChunk(tileGroups * channelGroups, a.InChannels, ComputeUnits);
+            int rChunk = WinogradFusedChannelChunk(tileGroups * channelGroups, a.InChannels, SplitComputeUnits);
             int splits = (a.InChannels + rChunk - 1) / rChunk;
             int count = a.Batch * a.OutChannels * a.OutHeight * a.OutWidth;
             using IGpuBuffer? partial = splits > 1 ? AllocateBuffer(checked(splits * count)) : null;
@@ -335,7 +336,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             int epilogue = 0)
         {
             int tiles = ((m + Rb64Tile - 1) / Rb64Tile) * ((n + Rb64Tile - 1) / Rb64Tile);
-            int splits = SplitKFactor(tiles, k, Rb64MinSlice, Rb64GroupsPerComputeUnit, ComputeUnits);
+            int splits = SplitKFactor(tiles, k, Rb64MinSlice, Rb64GroupsPerComputeUnit, SplitComputeUnits);
             int kChunk = RoundUpToMultiple((k + splits - 1) / splits, Rb64ChunkAlign);
             splits = (k + kChunk - 1) / kChunk;
             var gemm = _kernelCache[Kernels.BatchedGemmKernels.Rb64SplitK];
