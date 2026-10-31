@@ -21,4 +21,10 @@ internal interface IShortAttentionForwardBackend
     /// launched) when unavailable.</summary>
     bool TryShortAttentionForward(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value, IGpuBuffer output,
         int batch, int heads, int seqQ, int seqK, int headDim, float scale, bool causal, int causalOffset);
+
+    /// <summary>As <see cref="TryShortAttentionForward"/>, unmasked self-attention reading Q, K and V from one buffer
+    /// whose rows are [Q | K | V] (each heads * headDim wide), as one projection GEMM over the concatenated weights writes
+    /// them. False (nothing launched) when unavailable.</summary>
+    bool TryShortAttentionForwardPacked(IGpuBuffer qkv, IGpuBuffer output, int batch, int heads, int seq, int headDim,
+        float scale);
 }

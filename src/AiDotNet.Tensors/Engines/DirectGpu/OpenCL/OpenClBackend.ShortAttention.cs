@@ -18,7 +18,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 #define SA_D4 (SA_DMAX / 4)
 __kernel __attribute__((reqd_work_group_size(SA_ROWS, 1, 1)))
 void short_attention_forward(__global const float* q, __global const float* k, __global const float* v, __global float* o,
-    int batch, int heads, int seqQ, int seqK, int headDim, float scale, int causal, int causalOffset)
+    int batch, int heads, int seqQ, int seqK, int headDim, float scale, int causal, int causalOffset,
+    int ldq, int ldkv, int qOff, int kOff, int vOff)
 {
     // float4 tiles: each key costs a work item 2 * SA_D4 local reads instead of 2 * SA_DMAX.
     __local float4 ks[SA_KEYS][SA_D4];
@@ -37,7 +38,7 @@ void short_attention_forward(__global const float* q, __global const float* k, _
     for (int c = 0; c < SA_D4; c++) { qr[c] = (float4)(0.0f); acc[c] = (float4)(0.0f); }
     if (active)
     {
-        __global const float* qp = q + ((long)b * seqQ + row) * width + h * headDim;
+        __global const float* qp = q + qOff + ((long)b * seqQ + row) * ldq + h * headDim;
         #pragma unroll
         for (int c = 0; c < SA_D4; c++)
         {
@@ -58,9 +59,9 @@ void short_attention_forward(__global const float* q, __global const float* k, _
         {
             int j = e / SA_DMAX, d = e - j * SA_DMAX, key = k0 + j;
             bool inside = key < seqK && d < headDim;
-            long src = ((long)b * seqK + key) * width + h * headDim + d;
-            kf[e] = inside ? k[src] : 0.0f;
-            vf[e] = inside ? v[src] : 0.0f;
+            long src = ((long)b * seqK + key) * ldkv + h * headDim + d;
+            kf[e] = inside ? k[kOff + src] : 0.0f;
+            vf[e] = inside ? v[vOff + src] : 0.0f;
         }
         barrier(CLK_LOCAL_MEM_FENCE);
         if (!active) continue;
@@ -156,7 +157,44 @@ void short_attention_forward(__global const float* q, __global const float* k, _
             kernel.SetArg(9, scale);
             kernel.SetArg(10, causal ? 1 : 0);
             kernel.SetArg(11, causalOffset);
+            kernel.SetArg(12, (int)width);
+            kernel.SetArg(13, (int)width);
+            kernel.SetArg(14, 0);
+            kernel.SetArg(15, 0);
+            kernel.SetArg(16, 0);
             kernel.Execute2D((seqQ + 63) / 64 * 64, batch * heads, 64, 1);
+            return true;
+        }
+
+        bool IShortAttentionForwardBackend.TryShortAttentionForwardPacked(IGpuBuffer qkv, IGpuBuffer output, int batch,
+            int heads, int seq, int headDim, float scale)
+        {
+            if (batch <= 0 || heads <= 0 || seq <= 0 || headDim <= 0 || headDim > ShortAttentionMaxHeadDim
+                || (long)batch * heads > 65535 || !ShortAttentionReady())
+                return false;
+            long width = (long)heads * headDim;
+            if (3 * width > int.MaxValue || qkv.Size < batch * seq * 3 * width || output.Size < batch * seq * width)
+                return false;
+            var kernel = _kernelCache["short_attention_forward"];
+            kernel.SetArg(0, BufferHandle(qkv));
+            kernel.SetArg(1, BufferHandle(qkv));
+            kernel.SetArg(2, BufferHandle(qkv));
+            kernel.SetArg(3, BufferHandle(output));
+            kernel.SetArg(4, batch);
+            kernel.SetArg(5, heads);
+            kernel.SetArg(6, seq);
+            kernel.SetArg(7, seq);
+            kernel.SetArg(8, headDim);
+            kernel.SetArg(9, scale);
+            kernel.SetArg(10, 0);
+            kernel.SetArg(11, 0);
+            // Rows of [Q | K | V], each block width wide: one projection GEMM wrote all three.
+            kernel.SetArg(12, (int)(3 * width));
+            kernel.SetArg(13, (int)(3 * width));
+            kernel.SetArg(14, 0);
+            kernel.SetArg(15, (int)width);
+            kernel.SetArg(16, (int)(2 * width));
+            kernel.Execute2D((seq + 63) / 64 * 64, batch * heads, 64, 1);
             return true;
         }
     }

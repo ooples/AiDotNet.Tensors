@@ -7961,6 +7961,18 @@ public partial class DirectGpuTensorEngine
             float scale = (float)(1.0 / System.Math.Sqrt(d));
             T scaleT = (T)(object)scale;
             var input2d = (input.IsContiguous ? input : (Tensor<T>)input.Contiguous()).Reshape(new[] { B * S, D });
+            // Unmasked inference self-attention over a short sequence: the three projections as one GEMM over the cached
+            // [W_q | W_k | W_v], and the short-sequence kernel reading the packed rows in place.
+            if (mask is null && !IsTapeActive<T>()
+                && TryPackedShortSelfAttention(input2d, qWeight, kWeight, vWeight, B, H, S, d, 1.0 / System.Math.Sqrt(d)) is { } packedHeads)
+            {
+                var packedProj = TensorMatMul(packedHeads.Reshape(new[] { B * S, D }), outWeight);
+                var packedResult = packedProj.Reshape(new[] { B, S, D });
+                // As the short kernel's route below: only this thread's transients, in queue order, no device sync.
+                DropTransientActivationsCreatedAfter(actSnapshot, packedProj.DataVector, allThreads: false);
+                if (s_mhaDiag) MhaDiag(tapeActive: false);
+                return packedResult;
+            }
             // Q/K/V projections on the GPU (2-D GEMM), [B*S, D] each.
             var q2d = TensorMatMul(input2d, qWeight);
             var k2d = TensorMatMul(input2d, kWeight);

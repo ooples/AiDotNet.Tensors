@@ -131,5 +131,62 @@ public sealed class ShortAttentionForwardTests
                     $"[{i}]: expected {expected[i]}, got {actual[i]}");
         }
     }
+    // The packed route caches [W_q | W_k | W_v]: a weight written between calls must reach the next one.
+    [SkippableFact]
+    public void Engine_MultiHeadAttentionForward_FollowsAWeightChange()
+    {
+        DirectGpuTensorEngine? engine = null;
+        try { engine = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException or TypeInitializationException) { }
+        Skip.If(engine is null || !engine.IsGpuAvailable, "No DirectGpu backend available.");
+        using (engine)
+        {
+            Skip.IfNot(engine.GetBackend() is IShortAttentionForwardBackend, "The backend has no short-sequence attention.");
+            const int b = 2, s = 17, width = 48, heads = 4;
+            var x = new Tensor<float>(Values(b * s * width, 12), new[] { b, s, width });
+            var wq = new Tensor<float>(Values(width * width, 13), new[] { width, width });
+            var wk = new Tensor<float>(Values(width * width, 14), new[] { width, width });
+            var wv = new Tensor<float>(Values(width * width, 15), new[] { width, width });
+            var wo = new Tensor<float>(Values(width * width, 16), new[] { width, width });
+            var cpu = new CpuEngine();
+            engine.MultiHeadAttentionForward(x, wq, wk, wv, wo, heads).ToArray();
+            for (int i = 0; i < width; i++) wv[i, i] = wv[i, i] + 0.5f;
+            wk[0, 1] = wk[0, 1] - 0.25f;
+            var expected = cpu.MultiHeadAttentionForward(x, wq, wk, wv, wo, heads).ToArray();
+            var actual = engine.MultiHeadAttentionForward(x, wq, wk, wv, wo, heads).ToArray();
+            for (int i = 0; i < expected.Length; i++)
+                Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-3 * (1 + Math.Abs(expected[i])),
+                    $"after the weight change [{i}]: expected {expected[i]}, got {actual[i]}");
+        }
+    }
+
+    // The packed kernel directly: rows of [Q | K | V], against the separate-buffer kernel on the same values, at a head
+    // width that is not a multiple of 4.
+    [SkippableFact]
+    public void OpenCl_PackedShortAttention_MatchesSeparateBuffers()
+    {
+        using var backend = new OpenClBackend();
+        Skip.IfNot(backend.IsAvailable, "OpenCL is not available.");
+        var attention = (IShortAttentionForwardBackend)backend;
+        const int b = 2, s = 37, heads = 3, d = 17, width = heads * d;
+        float[] q = Values(b * s * width, 21), k = Values(b * s * width, 22), v = Values(b * s * width, 23);
+        var packed = new float[b * s * 3 * width];
+        for (int r = 0; r < b * s; r++)
+        {
+            Array.Copy(q, r * width, packed, r * 3 * width, width);
+            Array.Copy(k, r * width, packed, r * 3 * width + width, width);
+            Array.Copy(v, r * width, packed, r * 3 * width + 2 * width, width);
+        }
+        using var qb = backend.AllocateBuffer(q);
+        using var kb = backend.AllocateBuffer(k);
+        using var vb = backend.AllocateBuffer(v);
+        using var pb = backend.AllocateBuffer(packed);
+        using var separate = backend.AllocateBuffer(new float[b * s * width]);
+        using var fromPacked = backend.AllocateBuffer(new float[b * s * width]);
+        float scale = 1f / (float)Math.Sqrt(d);
+        Assert.True(attention.TryShortAttentionForward(qb, kb, vb, separate, b, heads, s, s, d, scale, false, 0));
+        Assert.True(attention.TryShortAttentionForwardPacked(pb, fromPacked, b, heads, s, d, scale));
+        Assert.Equal(backend.DownloadBuffer(separate), backend.DownloadBuffer(fromPacked));
+    }
 }
 #endif
