@@ -17,6 +17,12 @@ internal interface IDeviceMemoryPressure
     /// <summary>Runs the finalizer sweep unconditionally.</summary>
     void ReclaimNow();
 
+    /// <summary>
+    /// Frees the device buffers this backend's pool retains for reuse (torch.cuda.empty_cache): no tensor holds them,
+    /// so it is safe while other threads run ops. Returns how many were freed; a backend without a pool frees none.
+    /// </summary>
+    int ReleaseCachedBuffers();
+
     /// <summary>True when the backend's allocator already reclaims and retries on an out-of-memory failure.</summary>
     bool ReclaimsOnAllocationFailure { get; }
 }

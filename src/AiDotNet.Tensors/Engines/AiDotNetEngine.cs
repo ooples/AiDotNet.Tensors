@@ -411,11 +411,89 @@ public static class AiDotNetEngine
     /// </remarks>
     private static void SwitchToCpuEngine()
     {
+        DirectGpuTensorEngine? parked = null;
         lock (_adoptionLock)
         {
             var observed = Volatile.Read(ref _current);
             if (observed is not null && observed.GetType() == typeof(CpuEngine)) return;
             Volatile.Write(ref _current, new CpuEngine());
+            if (observed is DirectGpuTensorEngine gpu && ReferenceEquals(gpu, _adoptedGpu)) parked = gpu;
+        }
+
+        // The parked engine keeps its context for the next adoption, but not memory nothing uses: free the device
+        // buffers only unreachable objects hold and the pool's retained ones (torch.cuda.empty_cache). Never on a
+        // context the circuit breaker found corrupted, where any native call can fault.
+        if (parked is not null && !_gpuCircuitBroken)
+        {
+            try { parked.ReleaseUnusedDeviceMemory(); }
+            catch (Exception ex) { EmitLog($"[AiDotNet] Releasing unused GPU memory on reset failed: {ex.Message}", verbose: true); }
+        }
+    }
+
+    /// <summary>
+    /// Frees the GPU engine <see cref="AutoDetectAndConfigureGpu()"/> adopted, whether it is current or parked by
+    /// <see cref="ResetToCpu"/>: its CUDA (or other backend) context, kernel modules and device memory. Ops other
+    /// threads are running on it finish first; new ops take their CPU paths. Every pending device result is downloaded
+    /// before its buffer is freed, so no tensor loses its data. The next auto-detection builds a new engine.
+    /// </summary>
+    /// <remarks>
+    /// A reset alone keeps the engine (and frees only the memory nothing uses) because rebuilding a context costs
+    /// seconds; release when the process is done with the GPU. An engine a caller assigned to <see cref="Current"/> is
+    /// the caller's to dispose and is not touched. Waits up to 30 seconds; see <see cref="ReleaseGpu(TimeSpan)"/>.
+    /// </remarks>
+    /// <returns>True when an adopted engine was released; false when there was none.</returns>
+    public static bool ReleaseGpu() => ReleaseGpu(DirectGpuTensorEngine.DisposeDrainTimeout);
+
+    /// <summary>
+    /// <see cref="ReleaseGpu()"/>, waiting up to <paramref name="drainTimeout"/> for ops other threads are running on
+    /// the engine.
+    /// </summary>
+    /// <exception cref="TimeoutException">Ops were still running after <paramref name="drainTimeout"/>. Nothing was
+    /// freed and the engine is parked again (usable, and releasable later).</exception>
+    /// <exception cref="InvalidOperationException">Called from inside an op on the engine.</exception>
+    public static bool ReleaseGpu(TimeSpan drainTimeout)
+    {
+        DirectGpuTensorEngine? engine;
+        lock (_adoptionLock)
+        {
+            engine = _adoptedGpu;
+            if (engine is null) return false;
+            _adoptedGpu = null;
+            if (ReferenceEquals(Volatile.Read(ref _current), engine)) Volatile.Write(ref _current, new CpuEngine());
+        }
+
+        // A context the circuit breaker found corrupted is never torn down (a teardown on it can fault the process);
+        // the OS reclaims it at exit, as the breaker itself does.
+        if (_gpuCircuitBroken) return true;
+
+        bool released;
+        try
+        {
+            released = engine.TryCloseAndDispose(drainTimeout);
+        }
+        catch
+        {
+            Repark(engine);
+            throw;
+        }
+        if (!released)
+        {
+            engine.ReopenAfterTimedOutClose();
+            Repark(engine);
+            throw new TimeoutException(
+                $"GPU ops were still running after {drainTimeout.TotalSeconds:0.#} s, so the engine was not released " +
+                "(nothing was freed under them). It is parked again; release it when they finish.");
+        }
+        EmitLog("[AiDotNet] GPU engine released", verbose: true);
+        return true;
+    }
+
+    // Puts an engine whose release did not happen back in the parked slot, unless another adoption took it meanwhile.
+    private static void Repark(DirectGpuTensorEngine engine)
+    {
+        lock (_adoptionLock)
+        {
+            if (_adoptedGpu is null) _adoptedGpu = engine;
         }
     }
 

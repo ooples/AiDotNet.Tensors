@@ -35,6 +35,7 @@ public partial class DirectGpuTensorEngine
 
     private bool TryRandomBackend<T>(string opName, out IDirectGpuBackend backend, out ITorchParityElementwiseBackend kernels)
     {
+        using var __gpuOp = EnterGpuOp();
         kernels = null!;
         if (IsTapeActive<T>(opName) || !TryGetBackend(out backend) || DirectGpuEngine.ShouldFallbackForPrecision<T>())
         {

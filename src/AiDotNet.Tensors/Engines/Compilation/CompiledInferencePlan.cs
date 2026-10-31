@@ -782,6 +782,9 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Tensor<T> Execute()
     {
+        // The plan drives the engine's backend directly (graph capture and replay): lease it so a concurrent Dispose
+        // waits.
+        using var __gpuOp = (_engine as DirectGpuTensorEngine)?.EnterGpuOp() ?? default;
         if (_disposed) throw new ObjectDisposedException(nameof(CompiledInferencePlan<T>));
         using var recordingSuspension = GraphMode.SuspendRecording();
 

@@ -5108,10 +5108,10 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // Place onto the SAME backend the active dispatcher executes on, so placement and execution can't
         // diverge (a tensor moved here is used by ops running on AiDotNetEngine.Current). Fall back to the
         // global per-device backend registry only when the current engine is not a GPU dispatcher.
-        Engines.DirectGpu.IDirectGpuBackend? backend =
-            Engines.AiDotNetEngine.Current is Engines.DirectGpuTensorEngine dispatcher
-                ? dispatcher.PlacementBackend
-                : null;
+        var dispatcher = Engines.AiDotNetEngine.Current as Engines.DirectGpuTensorEngine;
+        // Leased: the upload below runs on the dispatcher's backend, so a concurrent Dispose waits for it.
+        using var __gpuOp = dispatcher?.EnterGpuOp() ?? default;
+        Engines.DirectGpu.IDirectGpuBackend? backend = dispatcher?.PlacementBackend;
         backend ??= Engines.DirectGpu.DirectGpuEngine.CreateBackendForDevice(deviceInfo.Index);
         if (backend is null)
             throw new InvalidOperationException($"No GPU backend available at device index {deviceInfo.Index}.");
@@ -5178,10 +5178,10 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // Place onto the SAME backend the active dispatcher executes on, as To() does. Engine.DirectGpu is a
         // separate lazily-created DirectGpuEngine with its own backend (context + stream), so a buffer placed there
         // was not the buffer the dispatcher's kernels and fused optimizers read and wrote.
-        Engines.DirectGpu.IDirectGpuBackend? backend =
-            Engines.AiDotNetEngine.Current is Engines.DirectGpuTensorEngine dispatcher
-                ? dispatcher.PlacementBackend
-                : null;
+        var dispatcher = Engines.AiDotNetEngine.Current as Engines.DirectGpuTensorEngine;
+        // Leased: the upload below runs on the dispatcher's backend, so a concurrent Dispose waits for it.
+        using var __gpuOp = dispatcher?.EnterGpuOp() ?? default;
+        Engines.DirectGpu.IDirectGpuBackend? backend = dispatcher?.PlacementBackend;
         if (backend is null)
         {
             var directGpu = Engines.Engine.DirectGpu;

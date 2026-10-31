@@ -21,6 +21,7 @@ public partial class DirectGpuTensorEngine
 
     private Tensor<T>? ComplexPart<T>(Tensor<Complex<T>> input, bool imaginary)
     {
+        using var __gpuOp = EnterGpuOp();
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HeterogeneousInput, imaginary ? "TensorImag" : "TensorReal");
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (input.Length == 0 || !TryGetBackend(out var backend) || DirectGpuEngine.ShouldFallbackForPrecision<T>()) return null;
@@ -44,6 +45,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorViewAsReal<T>(Tensor<Complex<T>> input)
     {
+        using var __gpuOp = EnterGpuOp();
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HeterogeneousInput);
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (input.Length == 0 || !TryGetBackend(out var backend) || DirectGpuEngine.ShouldFallbackForPrecision<T>())
@@ -100,6 +102,7 @@ public partial class DirectGpuTensorEngine
     // matrix and max-reduced along its rows. Returns null to fall back when no backend or an unsupported precision.
     private (Tensor<T> Output, Tensor<int> Indices)? DeviceWindowMax<T>(Tensor<T> x, PoolPlan plan, string opName)
     {
+        using var __gpuOp = EnterGpuOp();
         if (x.Length == 0 || !TryGetBackend(out _) || DirectGpuEngine.ShouldFallbackForPrecision<T>()) return null;
         try
         {
@@ -139,6 +142,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorMaxUnpool<T>(Tensor<T> input, Tensor<int> indices, int[] outputSize)
     {
+        using var __gpuOp = EnterGpuOp();
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HeterogeneousInput);
         if (IsTapeActive<T>() || input is null || input.Length == 0 || !TryGetBackend(out _) || DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return base.TensorMaxUnpool(input ?? throw new ArgumentNullException(nameof(input)), indices, outputSize);
