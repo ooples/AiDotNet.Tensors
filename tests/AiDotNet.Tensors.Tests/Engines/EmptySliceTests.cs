@@ -3,7 +3,9 @@
 using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Engines.DirectGpu;
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -53,6 +55,53 @@ public class EmptySliceTests
 
         Assert.Throws<ArgumentOutOfRangeException>(() => engine.TensorSlice(x, new[] { 1, 0 }, new[] { int.MaxValue, 0 }));
         Assert.Throws<ArgumentOutOfRangeException>(() => engine.TensorSlice(x, new[] { 1, 1 }, new[] { int.MaxValue, 1 }));
+    }
+
+    /// <summary>
+    /// The same step compiled: the zero-width input and the empty slice are recorded with the rest of the graph, and
+    /// the plan's gradient matches the tape's on every step.
+    /// </summary>
+    [Fact]
+    public void CompiledTrainingPlan_WithAZeroWidthInput_MatchesTheTape()
+    {
+        var priorEngine = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = new CpuEngine();
+        try
+        {
+            var a = new Tensor<float>(new float[] { 1, 2, 3, 4, 5, 6 }, new[] { 2, 3 });
+            var weights = new Tensor<float>(new float[] { 1, 2, 3, 4, 5, 6 }, new[] { 2, 3 });
+            var bias = new Tensor<float>(new float[] { 1, -1 }, new[] { 2, 1 });
+            Tensor<float> Forward(IEngine e)
+            {
+                var h = e.TensorMultiply(a, a);
+                var joined = e.TensorConcatenate(new[] { h, e.TensorSlice(h, new[] { 0, 3 }, new[] { 2, 0 }) }, axis: 1);
+                var condition = e.TensorSlice(joined, new[] { 0, 3 }, new[] { 2, 0 });
+                var withBias = e.TensorConcatenate(new[] { condition, bias }, axis: 1);
+                return e.TensorAdd(e.ReduceSum(e.TensorMultiply(joined, weights), null), e.ReduceSum(withBias, null));
+            }
+            float[] tape;
+            using (var t = new GradientTape<float>())
+                tape = t.ComputeGradients(Forward(new CpuEngine()), new[] { a })[a].GetFlattenedData();
+
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.Enable())
+            {
+                Forward(new CpuEngine());
+                plan = scope.CompileTraining(new[] { a });
+            }
+            using (plan)
+            {
+                for (int step = 0; step < 2; step++)
+                {
+                    plan.Step();
+                    Assert.Equal(tape, plan.Gradients[0].ToArray());
+                }
+            }
+        }
+        finally
+        {
+            AiDotNetEngine.Current = priorEngine;
+        }
     }
 
     [Fact]

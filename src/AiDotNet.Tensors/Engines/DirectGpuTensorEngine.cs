@@ -27400,6 +27400,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         int inner = 1;
                         for (int k = normAxis + 1; k < rank; k++) inner *= a.Shape._dims[k];
                         int total = outer * axisTotal * inner;
+                        if (total == 0)
+                        {
+                            // Nothing to copy, and no device buffer has zero length: the result is the empty tensor.
+                            int[] emptyShape = (int[])a.Shape._dims.Clone();
+                            emptyShape[normAxis] = axisTotal;
+                            var empty = new Tensor<T>(emptyShape);
+                            Autodiff.DifferentiableOps.RecordIfActive("Concat", empty, tensors,
+                                Autodiff.BackwardFunctions<T>.ConcatenateBackward, new object[] { normAxis });
+                            return empty;
+                        }
 
                         var outBuf = AllocateOutputBuffer(backend, total);
                         bool handedOff = false;
@@ -27411,6 +27421,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                                 var tensor = tensors[t];
                                 int tensorAxis = tensor.Shape._dims[normAxis];
                                 int slice = tensorAxis * inner;
+                                // A zero-width input (x[:, n:n]) adds nothing, and has no device buffer to read.
+                                if (tensorAxis == 0) continue;
                                 // A strided input comes back as an owned gather buffer. The copy below is only queued,
                                 // so the buffer returns to the pool after the queued work, not when this loop moves on.
                                 var input = GetOrAllocateBuffer(backend, tensor);

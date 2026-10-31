@@ -33,6 +33,11 @@ public static class AiDotNetEngine
 {
     private static IEngine _current;
 
+    // The GPU engine AutoDetectAndConfigureGpu created and installed. Only that one is the library's to dispose when it
+    // demotes to CPU; an engine a caller assigned to Current belongs to the caller, who may still be running work on it
+    // (a test fixture's engine, disposed under a convolution on another thread, faulted in cudnnSetStream).
+    private static DirectGpuTensorEngine? _adoptedGpu;
+
     /// <summary>
     /// Static constructor initializes with CPU engine by default.
     /// </summary>
@@ -220,6 +225,7 @@ public static class AiDotNetEngine
 
             if (supportsGpu && GpuPassesCorrectnessProbe(gpuEngine))
             {
+                Volatile.Write(ref _adoptedGpu, gpuEngine);
                 Current = gpuEngine;
                 TryRegisterGpuOffloadAllocator(gpuEngine, verbose);
                 EmitLog($"[AiDotNet] GPU acceleration enabled: {gpuEngine.Name}", verbose);
@@ -380,7 +386,10 @@ public static class AiDotNetEngine
             if (observed is not null && observed.GetType() == typeof(CpuEngine)) return;
             if (ReferenceEquals(Interlocked.CompareExchange(ref _current, new CpuEngine(), observed), observed))
             {
-                (observed as DirectGpuTensorEngine)?.Dispose();
+                // Dispose only the engine this class adopted; one the caller assigned is the caller's.
+                if (observed is DirectGpuTensorEngine gpu
+                    && ReferenceEquals(Interlocked.CompareExchange(ref _adoptedGpu, null, gpu), gpu))
+                    gpu.Dispose();
                 return;
             }
         }
