@@ -58,6 +58,12 @@
   <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
     <PackageReference Include="pythonnet" Version="3.2.1" />
   </ItemGroup>
+  <!-- The backend parity analyzer, referenced as a library so its rules can be run on test snippets (net10.0 only). -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
+    <ProjectReference Include="..\..\src\AiDotNet.Tensors.Analyzers\AiDotNet.Tensors.Analyzers.csproj" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.14.0" />
+  </ItemGroup>
+
   <ItemGroup Condition="'$(TargetFramework)' == 'net471' or '$(TargetFramework)' == 'net462'">
     <Compile Remove="Interop\DLPackTorchInteropTests.cs" />
   </ItemGroup>
