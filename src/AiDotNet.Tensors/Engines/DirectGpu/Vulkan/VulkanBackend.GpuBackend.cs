@@ -822,22 +822,6 @@ public sealed unsafe partial class VulkanBackend
             4 * sizeof(uint));
     }
 
-    public void BatchedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
-        int batchSize, int vecSize)
-    {
-        EnsureInitialized();
-        if (batchSize <= 0 || vecSize <= 0) return;
-        if ((long)batchSize * vecSize > a.Size) throw new ArgumentOutOfRangeException(nameof(batchSize), $"batchSize*vecSize ({(long)batchSize * vecSize}) exceeds buffer A length ({a.Size}).");
-        if ((long)batchSize * vecSize > b.Size) throw new ArgumentOutOfRangeException(nameof(batchSize), $"batchSize*vecSize ({(long)batchSize * vecSize}) exceeds buffer B length ({b.Size}).");
-
-        // Element-wise multiply all batches, then reduce each batch
-        using var temp = AllocateBuffer(batchSize * vecSize);
-        Multiply(a, b, temp, batchSize * vecSize);
-        // Synchronize to ensure Multiply completes before SumAxis reads temp
-        Synchronize();
-        SumAxis(temp, result, batchSize, vecSize);
-    }
-
     public void Scale(IGpuBuffer A, IGpuBuffer B, float scalar, int size)
     {
         EnsureInitialized();

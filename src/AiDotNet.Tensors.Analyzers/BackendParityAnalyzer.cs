@@ -263,8 +263,10 @@ public sealed class BackendParityAnalyzer : DiagnosticAnalyzer
 
     /// <summary>
     /// The own interface members a block body calls when it does nothing else -- each statement is a call on this
-    /// backend to a member that implements an interface member, or a guard (a <c>ThrowIf*</c> call, or an
-    /// <c>if</c> without a call in its condition that only throws or returns) -- and calls at least
+    /// backend to a member that implements an interface member, a guard (an <c>if</c> without a call in its condition
+    /// that only throws or returns, or a call to a <c>ThrowIf*</c>, <c>Ensure*</c>, <c>Validate*</c> or <c>Require*</c>
+    /// helper), a local whose initializer calls nothing but such members and helpers (a scratch buffer), or a
+    /// <c>lock</c> / <c>using</c> / plain block made of the same -- and calls at least
     /// <see cref="ComposedMinimumCallees"/> of them; otherwise null. A body that tries a fused kernel first
     /// (<c>if (TryFused(...)) return;</c>) calls something else in a condition, so it is not composed.
     /// </summary>
@@ -272,31 +274,68 @@ public sealed class BackendParityAnalyzer : DiagnosticAnalyzer
     {
         if (declaration.Body is null) return null;
         var callees = new List<string>();
-        foreach (var statement in declaration.Body.Statements)
-        {
-            if (IsGuard(statement)) continue;
-            // A temporary (using var scratch = AllocateBuffer(n);) between the calls is still a composition.
-            if (statement is LocalDeclarationStatementSyntax local)
-            {
-                if (!local.Declaration.DescendantNodes().OfType<InvocationExpressionSyntax>().All(call =>
-                        model.GetSymbolInfo(call).Symbol is IMethodSymbol callee
-                        && SymbolEqualityComparer.Default.Equals(callee.ContainingType, owner)
-                        && ImplementedInterfaceMember(owner, callee) is not null))
-                    return null;
-                continue;
-            }
-            if (statement is not ExpressionStatementSyntax { Expression: InvocationExpressionSyntax invocation }) return null;
-            if (model.GetSymbolInfo(invocation).Symbol is not IMethodSymbol target) return null;
-            if (target.Name.StartsWith("ThrowIf", StringComparison.Ordinal)) continue;
-            bool onThis = invocation.Expression is IdentifierNameSyntax
-                || invocation.Expression is MemberAccessExpressionSyntax { Expression: ThisExpressionSyntax };
-            if (!onThis || !SymbolEqualityComparer.Default.Equals(target.ContainingType, owner)
-                || ImplementedInterfaceMember(owner, target) is null)
-                return null;
-            callees.Add(target.Name);
-        }
-        return callees.Count >= ComposedMinimumCallees ? string.Join(" then ", callees) : null;
+        return CollectComposed(declaration.Body.Statements, model, owner, callees) && callees.Count >= ComposedMinimumCallees
+            ? string.Join(" then ", callees)
+            : null;
     }
+
+    private static bool CollectComposed(IEnumerable<StatementSyntax> statements, SemanticModel model, INamedTypeSymbol owner,
+        List<string> callees)
+    {
+        foreach (var statement in statements)
+        {
+            switch (statement)
+            {
+                case var guard when IsGuard(guard):
+                    continue;
+                case BlockSyntax block:
+                    if (!CollectComposed(block.Statements, model, owner, callees)) return false;
+                    continue;
+                case LockStatementSyntax locked:
+                    if (!CollectComposed(new[] { locked.Statement }, model, owner, callees)) return false;
+                    continue;
+                case UsingStatementSyntax scope:
+                    if (scope.Declaration is not null && !OnlyNeutralCalls(scope.Declaration, model, owner)) return false;
+                    if (scope.Expression is not null && !OnlyNeutralCalls(scope.Expression, model, owner)) return false;
+                    if (!CollectComposed(new[] { scope.Statement }, model, owner, callees)) return false;
+                    continue;
+                // A temporary (using var scratch = AllocateBuffer(n);) between the calls is still a composition.
+                case LocalDeclarationStatementSyntax local:
+                    if (!OnlyNeutralCalls(local.Declaration, model, owner)) return false;
+                    continue;
+                case ExpressionStatementSyntax { Expression: InvocationExpressionSyntax invocation }:
+                    if (model.GetSymbolInfo(invocation).Symbol is not IMethodSymbol target) return false;
+                    if (IsGuardHelper(target, owner)) continue;
+                    bool onThis = invocation.Expression is IdentifierNameSyntax
+                        || invocation.Expression is MemberAccessExpressionSyntax { Expression: ThisExpressionSyntax };
+                    if (!onThis || !SymbolEqualityComparer.Default.Equals(target.ContainingType, owner)
+                        || ImplementedInterfaceMember(owner, target) is null)
+                        return false;
+                    callees.Add(target.Name);
+                    continue;
+                default:
+                    return false;
+            }
+        }
+        return true;
+    }
+
+    /// <summary>Every call under <paramref name="node"/> is an own interface member or a guard helper.</summary>
+    private static bool OnlyNeutralCalls(SyntaxNode node, SemanticModel model, INamedTypeSymbol owner)
+        => node.DescendantNodesAndSelf().OfType<InvocationExpressionSyntax>().All(call =>
+            model.GetSymbolInfo(call).Symbol is IMethodSymbol callee
+            && (IsGuardHelper(callee, owner)
+                || (SymbolEqualityComparer.Default.Equals(callee.ContainingType, owner)
+                    && ImplementedInterfaceMember(owner, callee) is not null)));
+
+    /// <summary>A precondition or scratch-capacity helper: it launches nothing the caller asked for.</summary>
+    private static bool IsGuardHelper(IMethodSymbol target, INamedTypeSymbol owner)
+        => target.Name.StartsWith("ThrowIf", StringComparison.Ordinal)
+           || (SymbolEqualityComparer.Default.Equals(target.ContainingType, owner)
+               && ImplementedInterfaceMember(owner, target) is null
+               && (target.Name.StartsWith("Ensure", StringComparison.Ordinal)
+                   || target.Name.StartsWith("Validate", StringComparison.Ordinal)
+                   || target.Name.StartsWith("Require", StringComparison.Ordinal)));
 
     private static bool IsGuard(StatementSyntax statement)
     {

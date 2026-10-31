@@ -16,10 +16,6 @@ composed MetalBackend.Log2 #1638
 composed MetalBackend.MseBackward #1638
 composed MetalBackend.SoftplusBackward #1638
 composed OpenClBackend.ReduceMean #1638
-composed VulkanBackend.CsrSpMMBias #1638
-composed VulkanBackend.SplitComplexAdd #1638
-composed VulkanBackend.SplitComplexConjugate #1638
-composed VulkanBackend.SplitComplexScale #1638
 composed WebGpuBackend.ApplyMelFilterbank #1638
 composed WebGpuBackend.BatchedDotProduct #1638
 composed WebGpuBackend.CsrSpMMBias #1638
@@ -28,3 +24,9 @@ composed WebGpuBackend.RFFT #1638
 composed WebGpuBackend.SplitComplexAdd #1638
 composed WebGpuBackend.SplitComplexConjugate #1638
 composed WebGpuBackend.SplitComplexScale #1638
+composed MetalBackend.Hgemm #1638
+composed WebGpuBackend.Hgemm #1638
+composed WebGpuBackend.SparseGemm #1638
+composed WebGpuBackend.SplitComplexMultiply #1638
+composed WebGpuBackend.SplitComplexMagnitudeSquared #1638
+composed WebGpuBackend.SplitComplexCrossSpectral #1638

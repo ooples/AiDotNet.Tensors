@@ -12,9 +12,10 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 /// <summary>
-/// The fused element-wise members that used to be compositions of other backend members (TENS0008): AddRelu, AddSigmoid
-/// and AddGelu against the reference activation of the sum, and Fma with its output aliasing the addend -- the in-place
-/// accumulate the old Multiply-into-D-then-Add composition got wrong (2AB instead of AB + C). Runs on every backend this
+/// The members that used to be compositions of other backend members (TENS0008), each against a host reference: AddRelu,
+/// AddSigmoid and AddGelu; Fma with its output aliasing the addend -- the in-place accumulate the old
+/// Multiply-into-D-then-Add composition got wrong (2AB instead of AB + C); the split-complex element-wise family; the
+/// batched dot product; and the CSR SpMM with bias. Runs on every backend this
 /// machine has; each one absent is skipped by name.
 /// </summary>
 [Collection("DirectGpuSerial")]
@@ -34,10 +35,12 @@ public sealed class FusedElementwiseBackendTests
         yield return new object[] { "webgpu" };
     }
 
-    private static float[] Values(int salt)
+    private static float[] Values(int salt) => Values(salt, Length);
+
+    private static float[] Values(int salt, int length)
     {
         var rng = RandomHelper.CreateSeededRandom(1638 + salt);
-        var data = new float[Length];
+        var data = new float[length];
         for (int i = 0; i < data.Length; i++) data[i] = (float)(rng.NextDouble() * 8 - 4);
         return data;
     }
@@ -90,6 +93,103 @@ public sealed class FusedElementwiseBackendTests
 
         var d = backend.DownloadBuffer(bufC);
         for (int i = 0; i < Length; i++) AssertClose((double)a[i] * b[i] + c[i], d[i], i, "Fma");
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Backends))]
+    public void SplitComplexFamily_EqualsTheComplexArithmetic(string name)
+    {
+        using var lease = Create(name, out var backend);
+        Skip.If(backend is null, name + " is not available on this machine.");
+        var aR = Values(6); var aI = Values(7); var bR = Values(8); var bI = Values(9);
+        using var bufAR = backend.AllocateBuffer(aR);
+        using var bufAI = backend.AllocateBuffer(aI);
+        using var bufBR = backend.AllocateBuffer(bR);
+        using var bufBI = backend.AllocateBuffer(bI);
+        using var oR = backend.AllocateBuffer(Length);
+        using var oI = backend.AllocateBuffer(Length);
+
+        void Check(string op, Func<int, (double Re, double Im)> reference)
+        {
+            var re = backend.DownloadBuffer(oR);
+            var im = backend.DownloadBuffer(oI);
+            for (int i = 0; i < Length; i++)
+            {
+                var (er, ei) = reference(i);
+                AssertClose(er, re[i], i, op + ".re");
+                AssertClose(ei, im[i], i, op + ".im");
+            }
+        }
+
+        backend.SplitComplexMultiply(bufAR, bufAI, bufBR, bufBI, oR, oI, Length);
+        Check("Multiply", i => ((double)aR[i] * bR[i] - (double)aI[i] * bI[i], (double)aR[i] * bI[i] + (double)aI[i] * bR[i]));
+        backend.SplitComplexAdd(bufAR, bufAI, bufBR, bufBI, oR, oI, Length);
+        Check("Add", i => ((double)aR[i] + bR[i], (double)aI[i] + bI[i]));
+        backend.SplitComplexCrossSpectral(bufAR, bufAI, bufBR, bufBI, oR, oI, Length);
+        Check("CrossSpectral", i => ((double)aR[i] * bR[i] + (double)aI[i] * bI[i], (double)aI[i] * bR[i] - (double)aR[i] * bI[i]));
+        backend.SplitComplexConjugate(bufAR, bufAI, oR, oI, Length);
+        Check("Conjugate", i => (aR[i], -aI[i]));
+        backend.SplitComplexScale(bufAR, bufAI, oR, oI, -1.75f, Length);
+        Check("Scale", i => (aR[i] * -1.75, aI[i] * -1.75));
+
+        backend.SplitComplexMagnitudeSquared(bufAR, bufAI, oR, Length);
+        var mag = backend.DownloadBuffer(oR);
+        for (int i = 0; i < Length; i++) AssertClose((double)aR[i] * aR[i] + (double)aI[i] * aI[i], mag[i], i, "MagnitudeSquared");
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Backends))]
+    public void BatchedDotProduct_EqualsEachRowsDot(string name)
+    {
+        using var lease = Create(name, out var backend);
+        Skip.If(backend is null, name + " is not available on this machine.");
+        const int rows = 5, width = 1027;   // more columns than a 256-thread group, and not a multiple of it
+        var a = Values(10, rows * width); var b = Values(11, rows * width);
+        using var bufA = backend.AllocateBuffer(a);
+        using var bufB = backend.AllocateBuffer(b);
+        using var result = backend.AllocateBuffer(rows);
+
+        backend.BatchedDotProduct(bufA, bufB, result, rows, width);
+
+        var r = backend.DownloadBuffer(result);
+        for (int row = 0; row < rows; row++)
+        {
+            double expected = 0;
+            for (int i = 0; i < width; i++) expected += (double)a[row * width + i] * b[row * width + i];
+            Assert.True(Math.Abs(expected - r[row]) <= 1e-3 * (1 + Math.Abs(expected)), $"row {row}: expected {expected}, got {r[row]}");
+        }
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Backends))]
+    public void CsrSpMMBias_AddsTheColumnBiasToTheProduct(string name)
+    {
+        using var lease = Create(name, out var backend);
+        Skip.If(backend is null, name + " is not available on this machine.");
+        // A [3 x 4] in CSR: row 0 {0: 2, 3: -1}, row 1 empty, row 2 {1: 0.5, 2: 4}; B [4 x 5]; bias [5].
+        const int m = 3, k = 4, n = 5;
+        var values = new[] { 2f, -1f, 0.5f, 4f };
+        var columns = new[] { 0, 3, 1, 2 };
+        var rowPointers = new[] { 0, 2, 2, 4 };
+        var dense = Values(12);
+        var bias = new[] { 0.25f, -0.5f, 1f, 2f, -3f };
+        using var bufValues = backend.AllocateBuffer(values);
+        using var bufColumns = backend.AllocateIntBuffer(columns);
+        using var bufRows = backend.AllocateIntBuffer(rowPointers);
+        using var bufDense = backend.AllocateBuffer(dense);
+        using var bufBias = backend.AllocateBuffer(bias);
+        using var output = backend.AllocateBuffer(m * n);
+
+        backend.CsrSpMMBias(bufValues, bufColumns, bufRows, bufDense, bufBias, output, m, k, n, values.Length);
+
+        var c = backend.DownloadBuffer(output);
+        for (int row = 0; row < m; row++)
+            for (int col = 0; col < n; col++)
+            {
+                double expected = bias[col];
+                for (int e = rowPointers[row]; e < rowPointers[row + 1]; e++) expected += (double)values[e] * dense[columns[e] * n + col];
+                AssertClose(expected, c[row * n + col], row * n + col, "CsrSpMMBias");
+            }
     }
 
     // The backend, or null when unavailable; the returned disposable disposes a backend the test created.
