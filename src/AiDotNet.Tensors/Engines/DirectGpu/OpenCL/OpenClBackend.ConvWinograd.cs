@@ -193,8 +193,19 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, WinogradFilterEntry> _f43Filters = new();
         private readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, WinogradFilterEntry> _f23Filters = new();
 
+        // The small-map GEMM's gathered weights ((C x H x W) x (O x H x W), keyed as one "point"), in the same budget.
+        private readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, WinogradFilterEntry> _smallMapWeights = new();
+
+        // The point count the small-map GEMM files its gathered weights under (outC = its columns, inC = its rows).
+        internal const int SmallMapWeightPoints = 1;
+
         private System.Runtime.CompilerServices.ConditionalWeakTable<object, WinogradFilterEntry> WinogradFilterTable(int points)
-            => points == WinogradF43Points ? _f43Filters : _f23Filters;
+            => points switch
+            {
+                WinogradF43Points => _f43Filters,
+                SmallMapWeightPoints => _smallMapWeights,
+                _ => _f23Filters,
+            };
 
         IGpuBuffer? IWinogradForwardFilterCache.CachedForwardFilter(int points, int k, int c)
             => GetCachedWinogradFilter(points, k, c);

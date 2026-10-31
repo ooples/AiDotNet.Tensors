@@ -50,6 +50,62 @@ public sealed class OpenClWinogradFilterCacheTests
         AssertClose(Reference(x, w1), backend.DownloadBuffer(yb));
     }
 
+    [SkippableFact]
+    public void OpenCl_SmallMapGemm_ReusesTheGatheredWeightsUntilTheVersionChanges()
+    {
+        using var backend = new OpenClBackend();
+        Skip.IfNot(backend.IsAvailable, "OpenCL is not available.");
+        const int b = 3, c = 6, k = 5;
+        float[] x = Values(b * c * 4, 4), w1 = Values(k * c * 9, 5), w2 = Values(k * c * 9, 6);
+        using var xb = backend.AllocateBuffer(x);
+        using var wb = backend.AllocateBuffer(w1);
+        using var w1b = backend.AllocateBuffer(w1);
+        using var w2b = backend.AllocateBuffer(w2);
+        using var yb = backend.AllocateBuffer(b * k * 4);
+        var args = new TunedConv2DArgs(xb, wb, yb, b, c, 2, 2, k, 2, 2, 3, 3, 1, 1, 1, 1, 1, 1);
+        var route = (AiDotNet.Tensors.Helpers.Autotune.TunedKernels.ITunedKernelCandidate<TunedConv2DArgs>)
+            backend.Conv2DForwardSlot.Candidate("opencl.conv2d.small_map_gemm");
+        Skip.If(!route.IsApplicable(args.Shape()), "The small-map GEMM's kernels did not compile.");
+        var key = new object();
+
+        void RunAt(int version)
+        {
+            using (ConvWeightIdentity.Enter(key, version)) route.Execute(args);
+            backend.Synchronize();
+        }
+
+        RunAt(1);
+        AssertClose(Reference2x2(x, w1, b, c, k), backend.DownloadBuffer(yb));
+        // New weights at the same version: the cached gather of w1 is used (the positive control that it is cached).
+        backend.Copy(w2b, wb, w2.Length);
+        RunAt(1);
+        AssertClose(Reference2x2(x, w1, b, c, k), backend.DownloadBuffer(yb));
+        // A new version gathers again.
+        RunAt(2);
+        AssertClose(Reference2x2(x, w2, b, c, k), backend.DownloadBuffer(yb));
+    }
+
+    private static float[] Reference2x2(float[] x, float[] w, int b, int c, int k)
+    {
+        var y = new float[b * k * 4];
+        for (int n = 0; n < b; n++)
+            for (int o = 0; o < k; o++)
+                for (int i = 0; i < 2; i++)
+                    for (int j = 0; j < 2; j++)
+                    {
+                        double acc = 0;
+                        for (int ci = 0; ci < c; ci++)
+                            for (int u = 0; u < 3; u++)
+                                for (int v = 0; v < 3; v++)
+                                {
+                                    int ih = i - 1 + u, iw = j - 1 + v;
+                                    if (ih < 0 || ih >= 2 || iw < 0 || iw >= 2) continue;
+                                    acc += (double)x[((n * c + ci) * 2 + ih) * 2 + iw] * w[((o * c + ci) * 3 + u) * 3 + v];
+                                }
+                        y[((n * k + o) * 2 + i) * 2 + j] = (float)acc;
+                    }
+        return y;
+    }
     private static bool Run(OpenClBackend backend, in TunedConv2DArgs args, object key, int version)
     {
         bool ran;

@@ -25,6 +25,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels
         internal const string SmallChannel = "conv2d_smallc";
         internal const string SmallChannel3x3 = "conv2d_smallc3";
         internal const string CenterTapGather = "conv_center_tap_gather";
+        internal const string SmallMapWeights = "conv_small_map_weights";
+        internal const string SmallMapScatter = "conv_small_map_scatter";
 
         /// <summary>Output channels one conv2d_smallc work item computes (SC_OB in the source).</summary>
         internal const int SmallChannelBlock = 16;
@@ -41,7 +43,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels
         /// <summary>The small-channel kernels' work-group size (SC_WG in the source: their reqd_work_group_size).</summary>
         internal const int SmallChannelGroupSize = 64;
 
-        internal static string[] GetKernelNames() => new[] { Forward, SplitReduce, SmallChannel, SmallChannel3x3, CenterTapGather };
+        internal static string[] GetKernelNames() => new[] { Forward, SplitReduce, SmallChannel, SmallChannel3x3, CenterTapGather, SmallMapWeights, SmallMapScatter };
 
         internal const string Source = @"
 #define WF_BO 32
@@ -289,6 +291,35 @@ __kernel void conv_center_tap_gather(__global const float* restrict w, __global 
     if (i >= O * C) return;
     const int c = i / O, o = i - c * O;
     wcT[i] = w[((long)o * C + c) * taps + centre];
+}
+// A stride-1 convolution over a map so small that every output reads every input pixel through some tap (a 2 x 2 map
+// through a 3 x 3 filter padded by one) is one linear map per image: y[n][(p, o)] = sum over (c, q) of x[n][(c, q)] *
+// big[(c, q)][(p, o)], big = w[o][c][kh][kw] at kh = qh - ph + PH, kw = qw - pw + PW (zero off the filter).
+__kernel void conv_small_map_weights(__global const float* restrict w, __global float* restrict big, const int O,
+    const int C, const int KH, const int KW, const int H, const int W, const int OH, const int OW, const int PH,
+    const int PW)
+{
+    const long i = get_global_id(0);
+    const int hw = H * W, ohw = OH * OW;
+    const long cols = (long)ohw * O;
+    if (i >= (long)C * hw * cols) return;
+    const long row = i / cols;
+    const int col = (int)(i - row * cols);
+    const int c = (int)(row / hw), q = (int)(row - (long)c * hw);
+    const int p = col / O, o = col - p * O;
+    const int qh = q / W, qw = q - qh * W, ph = p / OW, pw = p - ph * OW;
+    const int kh = qh - ph + PH, kw = qw - pw + PW;
+    big[i] = (kh >= 0 && kh < KH && kw >= 0 && kw < KW) ? w[(((long)o * C + c) * KH + kh) * KW + kw] : 0.0f;
+}
+// y[n][o][p] = the epilogue of t[n][p][o]: the small-map GEMM's (output pixel, channel) columns back to NCHW.
+__kernel void conv_small_map_scatter(__global const float* restrict t, __global float* restrict y, const int N,
+    const int O, const int P, __global const float* bias, const int epi)
+{
+    const int i = get_global_id(0);
+    if (i >= N * O * P) return;
+    const int n = i / (O * P), r = i - n * (O * P);
+    const int o = r / P, p = r - o * P;
+    y[i] = conv_epilogue(t[((long)n * P + p) * O + o], bias, o, epi);
 }
 // conv2d_smallc for a 3 x 3 filter, unrolled: a channel's nine window values are loaded together, out-of-bounds taps
 // predicated to zero, before its products. In the general form each tap's load sat behind its bounds branches, so the

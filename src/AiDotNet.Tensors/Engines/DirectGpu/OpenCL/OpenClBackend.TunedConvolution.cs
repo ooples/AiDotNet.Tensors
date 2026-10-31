@@ -97,6 +97,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                             new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.center_tap", TunedKernelOrigin.Builtin, true,
                                 shape => AdmitsCenterTap(shape) && HasTunedKernel(Kernels.WinogradFusedKernels.CenterTapGather),
                                 (in TunedConv2DArgs a) => Conv2DCenterTap(a)),
+                            // A 2 x 2 map through a 3 x 3 filter padded by one: every output reads every input pixel, so the
+                            // layer is one GEMM per batch over gathered weights, the multiplies Winograd performs, at GEMM
+                            // speed (VGG-11's and ResNet's last 3 x 3 stages at a 32 x 32 input).
+                            new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.small_map_gemm", TunedKernelOrigin.Builtin, true,
+                                shape => AdmitsSmallMapGemm(shape) && HasTunedKernel(Kernels.WinogradFusedKernels.SmallMapWeights)
+                                    && HasTunedKernel(Kernels.WinogradFusedKernels.SmallMapScatter),
+                                (in TunedConv2DArgs a) => Conv2DSmallMapGemm(a)),
                         };
                         _conv2DForwardSlot = new TunedKernelSlot<TunedConv2DArgs>(TunedKernelOp.Conv2DForward, TunedDeviceKey,
                             new BackendTunedKernelHarness<TunedConv2DArgs>(this, ConvolutionTolerance, () => IsAvailable,
@@ -231,6 +238,66 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         // One work item per gathered weight.
         private const int CenterTapGatherGroupSize = 256;
+
+        // The largest map side the small-map GEMM takes: its gathered weights are (C x H x W) x (O x H x W), the filter's
+        // size times (H x W)^2 / (KH x KW), so a 2 x 2 map through a 3 x 3 filter costs 16 / 9 of the weights.
+        private const int SmallMapMaxSide = 2;
+
+        // (batch, C, H, W, O, kH, kW, sH, sW, pH, pW, dH, dW, OH, OW): a map of at most 2 x 2 (more than one pixel; one is
+        // the centre-tap route), stride 1, undilated, same-size output, padded so every (output, input) pixel pair falls on
+        // a filter tap: H - 1 <= pH <= kH - H, and likewise across.
+        private static bool AdmitsSmallMapGemm(TunedShape shape)
+            => shape[2] <= SmallMapMaxSide && shape[3] <= SmallMapMaxSide && shape[2] * shape[3] > 1
+                && shape[7] == 1 && shape[8] == 1 && shape[11] == 1 && shape[12] == 1
+                && shape[13] == shape[2] && shape[14] == shape[3]
+                && shape[9] >= shape[2] - 1 && shape[9] <= shape[5] - shape[2]
+                && shape[10] >= shape[3] - 1 && shape[10] <= shape[6] - shape[3];
+
+        // t[n][(p, o)] = x[n][(c, q)] * big[(c, q)][(p, o)] as one GEMM over the gathered weights, then the scatter to NCHW
+        // with the epilogue.
+        private void Conv2DSmallMapGemm(in TunedConv2DArgs a)
+        {
+            int hw = a.InHeight * a.InWidth, ohw = a.OutHeight * a.OutWidth;
+            int k = checked(a.InChannels * hw), cols = checked(ohw * a.OutChannels);
+            // Inference reuses the gathered weights by weight identity and version (the gather reads the filter scattered
+            // and writes (H x W)^2 / (KH x KW) of its size: 2.6 ms of a 3 ms call for 512 channels).
+            IGpuBuffer? owned = null;
+            IGpuBuffer big = GetCachedWinogradFilter(SmallMapWeightPoints, cols, k) ?? (owned = AllocateBuffer(checked(k * cols)));
+            try
+            {
+                if (owned is not null)
+                {
+                    var weights = _kernelCache[Kernels.WinogradFusedKernels.SmallMapWeights];
+                    uint arg = 0;
+                    weights.SetArg(arg++, BufferHandle(a.Kernel)); weights.SetArg(arg++, BufferHandle(owned));
+                    weights.SetArg(arg++, a.OutChannels); weights.SetArg(arg++, a.InChannels);
+                    weights.SetArg(arg++, a.KernelH); weights.SetArg(arg++, a.KernelW);
+                    weights.SetArg(arg++, a.InHeight); weights.SetArg(arg++, a.InWidth);
+                    weights.SetArg(arg++, a.OutHeight); weights.SetArg(arg++, a.OutWidth);
+                    weights.SetArg(arg++, a.PadH); weights.SetArg(arg, a.PadW);
+                    weights.Execute1D(RoundUpToMultiple(k * cols, CenterTapGatherGroupSize), CenterTapGatherGroupSize);
+                    if (StoreWinogradFilter(owned, SmallMapWeightPoints, cols, k)) owned = null;
+                }
+                SmallMapGemm(a, big, k, cols, ohw);
+            }
+            finally
+            {
+                // Ownership moves to the cache when it takes the buffer (owned is then null): a using would free it.
+                owned?.Dispose();
+            }
+        }
+
+        private void SmallMapGemm(in TunedConv2DArgs a, IGpuBuffer big, int k, int cols, int ohw)
+        {
+            using var t = AllocateBuffer(checked(a.Batch * cols));
+            Gemm(a.Input, big, t, a.Batch, cols, k);
+            var scatter = _kernelCache[Kernels.WinogradFusedKernels.SmallMapScatter];
+            scatter.SetArg(0, BufferHandle(t)); scatter.SetArg(1, BufferHandle(a.Output));
+            scatter.SetArg(2, a.Batch); scatter.SetArg(3, a.OutChannels); scatter.SetArg(4, ohw);
+            scatter.SetArg(5, ConvEpilogueBias(a)); scatter.SetArg(6, ConvEpilogueFlags(a));
+            int count = checked(a.Batch * cols);
+            scatter.Execute1D(RoundUpToMultiple(count, CenterTapGatherGroupSize), CenterTapGatherGroupSize);
+        }
 
         // y[n][o] = sum over c of x[n][c] * w[o][c][centre]: the centre column gathered transposed, then one GEMM.
         private void Conv2DCenterTap(in TunedConv2DArgs a)
