@@ -123,6 +123,7 @@ jobs:
         FullyQualifiedName~.TimeStretchStageDiffTests.|
         FullyQualifiedName~.EmptyBroadcastTests.|
         FullyQualifiedName~.GpuPinnedLifetimeTests.|
+        FullyQualifiedName~.Interop.DLPack|
         FullyQualifiedName~.EmptyBroadcastGpuTests.|
         FullyQualifiedName~.GridSampleBackwardAlignCornersTests.|
         FullyQualifiedName~.DirectGpuLinalgRoutingTests.|
