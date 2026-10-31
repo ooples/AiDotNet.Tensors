@@ -11,7 +11,7 @@ public sealed partial class MetalBackend
 {
     private const string AddActivationLibraryName = "AddActivation";
 
-    private const string AddActivationSource = @"
+    internal const string AddActivationSource = @"
 #include <metal_stdlib>
 using namespace metal;
 
