@@ -80,29 +80,17 @@ jobs:
     # keeps the name "cuda"). The SM75 job (a GTX 1660 Ti) runs the same GPU suites, where the GA10x/SM86-only
     # specializations skip by design, and leaves the AiDotNet model families to the SM86 job: they need its memory.
     # Pull requests are gated by the SM86 job alone: the suites take about 3 hours on the GTX 1660 Ti (about 1 on the
-    # RTX 3080), so the SM75 job runs on the nightly schedule and on manual dispatch.
+    # RTX 3080), so the SM75 job runs on the nightly schedule and on manual dispatch. The per-architecture settings
+    # (check name, timeout, allowed skips, model families, artifact) are derived from matrix.arch: matrix `include`
+    # entries cannot be used for them, because an entry left with no combination to extend is added as a new job,
+    # which would bring the SM75 job back on pull requests.
     strategy:
       fail-fast: false
       matrix:
-        arch: [sm86, sm75]
-        exclude:
-          - arch: ${{ github.event_name == 'pull_request' && 'sm75' || 'none' }}
-        include:
-          - arch: sm86
-            check: cuda
-            artifact: gpu-cuda-results
-            arch-skips: ''
-            model-families: true
-            timeout: 150
-          - arch: sm75
-            check: cuda-sm75
-            artifact: gpu-cuda-results-sm75
-            arch-skips: '|\bSM ?86\b|GA10[0-9x]'
-            model-families: false
-            timeout: 240
-    name: ${{ matrix.check }}
+        arch: ${{ fromJSON(github.event_name == 'pull_request' && '["sm86"]' || '["sm86","sm75"]') }}
+    name: ${{ matrix.arch == 'sm86' && 'cuda' || format('cuda-{0}', matrix.arch) }}
     runs-on: [self-hosted, gpu, cuda, '${{ matrix.arch }}']
-    timeout-minutes: ${{ matrix.timeout }}
+    timeout-minutes: ${{ matrix.arch == 'sm86' && 150 || 240 }}
     defaults:
       run:
         shell: pwsh
@@ -232,7 +220,7 @@ jobs:
       #   - another backend's device or toolchain (this runner has CUDA, not necessarily HIP, Metal, Vulkan, WebGPU, or a
       #     Python with numpy and torch);
       #   - architecture requirements (an sm_ level, AVX-512 on the host CPU; on the SM75 job, the SM86/GA10x-only
-      #     specializations, matrix.arch-skips);
+      #     specializations: the \bSM ?86\b|GA10[0-9x] reasons);
       #   - tracked baselines, each a listed gap with its own marker (NEEDS SPEC, TAPE-GRADIENT BASELINE, a forward with
       #     no differentiable leaf, the PTX transfer campaign's progress check);
       #   - opt-in benchmarks and probes, and wall-clock perf gates (they skip under CI=true);
@@ -241,13 +229,13 @@ jobs:
       # only that no backend is available. A CUDA test skipping for any other reason fails the lane.
       run: >-
         python AiDotNet.Tensors/scripts/ci/summarize-test-skips.py --title "CUDA (${{ matrix.arch }})" --fail-on-skip
-        --allowed-skip "(?i)(HIP|ROCm|Metal|MoltenVK|Vulkan|WebGPU|Dawn|AIDOTNET_WEBGPU_NODE_DIR|OpenCL|POCL|DirectML|macOS)|requires sm_|compute capability|torch|numpy|python|PARITY_PYTHON|AVX-512|^NEEDS SPEC:|TAPE-GRADIENT BASELINE|forward recorded no differentiable leaf|Full PTX transfer not complete|^Not applicable: CUDA |Requires a non-CUDA|benchmark|Wall-clock perf gate|run manually|manual perf harness|Manual CUDA|Diagnostic-only|Set (AIDOTNET|PARITY)_[A-Z0-9_]+=|AIDOTNET_GPU_MEMTRACK|AIDOTNET_KERNEL_REGISTRY_PERSIST${{ matrix.arch-skips }}"
+        --allowed-skip "(?i)(HIP|ROCm|Metal|MoltenVK|Vulkan|WebGPU|Dawn|AIDOTNET_WEBGPU_NODE_DIR|OpenCL|POCL|DirectML|macOS)|requires sm_|compute capability|torch|numpy|python|PARITY_PYTHON|AVX-512|^NEEDS SPEC:|TAPE-GRADIENT BASELINE|forward recorded no differentiable leaf|Full PTX transfer not complete|^Not applicable: CUDA |Requires a non-CUDA|benchmark|Wall-clock perf gate|run manually|manual perf harness|Manual CUDA|Diagnostic-only|Set (AIDOTNET|PARITY)_[A-Z0-9_]+=|AIDOTNET_GPU_MEMTRACK|AIDOTNET_KERNEL_REGISTRY_PERSIST${{ matrix.arch != 'sm86' && '|\bSM ?86\b|GA10[0-9x]' || '' }}"
         --allowed-skip-test "(Hip|Rocm|Dawn|WebGpu|Vulkan|Metal|MoltenVk|OpenCl|Pocl|DirectMl)[A-Za-z0-9]*Tests\."
         "${{ runner.temp }}/trx/*.trx"
 
 
     - name: AiDotNet model families on CUDA (2 training steps, inference up to batch 128)
-      if: matrix.model-families
+      if: matrix.arch == 'sm86'
       # Builds AiDotNet against this checkout (UseLocalTensors resolves ../../AiDotNet.Tensors from aidn/src), so the
       # model families exercise exactly this commit's kernels; the families were checked at the start of the job.
       run: |
@@ -273,7 +261,7 @@ jobs:
       if: always()
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       with:
-        name: ${{ matrix.artifact }}
+        name: ${{ matrix.arch == 'sm86' && 'gpu-cuda-results' || format('gpu-cuda-results-{0}', matrix.arch) }}
         path: |
           ${{ runner.temp }}/trx/**
           ${{ runner.temp }}/aidotnet-cuda.json
