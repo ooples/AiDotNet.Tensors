@@ -253,8 +253,14 @@ public partial class CpuEngine
         // elements on one worker: [seq, dModel] @ fusedW, each head's attention, @ outWeight. No barrier between the
         // stages and no [B*seq, 3*dModel] intermediate to round-trip through the caches; the three-phase path below
         // pays a fork/join and a pass over B*seq rows per phase.
+        // Fewer batch elements than workers leaves workers idle on the fused path, which the three-phase path's parallel
+        // GEMMs do not, once an element's projection is big enough to matter: a batch-8 ViT (65 x 192 tokens, 7.2M
+        // multiply-adds an element) took 14.5 ms fused against 13.6 three-phase on 32 threads, while a batch-8 transformer
+        // (32 x 64, 0.4M) took 0.66-0.73 fused against 1.04-1.10.
+        int mhaWorkers = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, PersistentParallelExecutor.Instance.MaxParticipants);
+        bool underfilledHeavyBatch = batch < mhaWorkers && (long)seqLen * dModel * dModel3 > MhaBatchFusedMaxElementMacsUnderfilled;
         bool batchFused = !hasQuantizedProjection && MhaBatchFusedEnabled && batch > 1
-            && (long)dModel * dModel3 <= MhaBatchFusedMaxWeightFloats;
+            && (long)dModel * dModel3 <= MhaBatchFusedMaxWeightFloats && !underfilledHeavyBatch;
         var qkvFlatBuf = batchFused ? System.Array.Empty<float>() : pool.Rent(totalRows * dModel3);
         // Quantized kernels produce one contiguous projection at a time; normal fp32
         // retains the faster single fused-QKV GEMM. Rent only the scratch each route uses.
@@ -631,6 +637,10 @@ public partial class CpuEngine
     // [dModel, 3*dModel] fused projection weight at most 3*256*256 floats (768 KB): a worker's per-element GEMMs read it
     // from L2/L3 once per element. Wider models keep the three-phase path, whose large GEMMs parallelize internally.
     private const long MhaBatchFusedMaxWeightFloats = 3L * 256 * 256;
+
+    // An element's projection multiply-adds (seq x dModel x 3 dModel) above which a batch smaller than the worker count
+    // takes the three-phase path (see the batchFused gate).
+    private const long MhaBatchFusedMaxElementMacsUnderfilled = 1_000_000;
 
     [MethodImpl(Hot)]
     internal static void MultiHeadAttentionBatchFused(
