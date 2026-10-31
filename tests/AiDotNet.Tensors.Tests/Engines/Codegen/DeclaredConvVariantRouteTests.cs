@@ -148,9 +148,16 @@ public class DeclaredConvVariantRouteTests
         {
             bool depthwise = v <= DeclaredConvVariant.DepthwiseBackwardWeights;
             int shapes = depthwise ? 3 : 2;
+            var schedules = CudaBackend.DeclaredConvVariantSchedules(v);
             for (int shape = 0; shape < shapes; shape++)
-                for (int schedule = 0; schedule < CudaBackend.DeclaredConvVariantSchedules(v).Count; schedule++)
-                    yield return new object[] { (int)v, shape, schedule };
+            {
+                var g = depthwise ? Depthwise(shape) : Transposed(shape);
+                var args = Args(v, g, null!, null!, null!);
+                // Only the shapes the schedule lowers: its slot never offers it the others, so there is nothing to run.
+                for (int schedule = 0; schedule < schedules.Count; schedule++)
+                    if (CudaBackend.DeclaredConvVariantLowers(v, args.Shape(), schedules[schedule]))
+                        yield return new object[] { (int)v, shape, schedule };
+            }
         }
     }
 
@@ -173,8 +180,8 @@ public class DeclaredConvVariantRouteTests
         using var bb = backend.AllocateBuffer(b);
         using var bo = backend.AllocateBuffer(Fill(expected.Length, 5));
         var args = Args(variant, g, ba, bb, bo);
-        Skip.IfNot(backend.DeclaredConvVariantAdmits(variant, args.Shape(), sc),
-            $"{variant} {sc.Suffix} does not lower shape {shape} (its slot never offers it there).");
+        Assert.True(backend.DeclaredConvVariantAdmits(variant, args.Shape(), sc),
+            $"{variant} {sc.Suffix} lowers shape {shape} but the released route does not admit it");
         long before = backend.DeclaredProgramLaunches;
         Assert.True(backend.TryDeclaredConvVariant(args, sc), $"{variant} {sc.Suffix} admitted shape {shape} but declined");
         backend.Synchronize();

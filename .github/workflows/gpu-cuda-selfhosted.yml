@@ -96,6 +96,39 @@ jobs:
     # the split carries no architecture label and picks up neither job until relabelled (see the header for how).
     runs-on: [self-hosted, gpu, cuda, '${{ matrix.arch }}']
     timeout-minutes: ${{ matrix.arch == 'sm86' && 150 || 240 }}
+    env:
+      # The tests this lane runs. It selects by name, so a GPU test outside these terms never runs on CUDA; the
+      # coverage check below fails the lane when a test class that drives the GPU engine is not selected. A term
+      # ending in "." matches one class. Folding joins the lines with spaces; the steps strip them.
+      CUDA_LANE_FILTER: >-
+        (FullyQualifiedName~GpuLaneBackend|
+        FullyQualifiedName~Engines.DirectGpu|
+        FullyQualifiedName~Engines.Autodiff|
+        FullyQualifiedName~Engines.Compilation|
+        FullyQualifiedName~Parity|
+        FullyQualifiedName~GruSequence|
+        FullyQualifiedName~FusedConv2DBatchNorm|
+        FullyQualifiedName~Engines.Gpu.|
+        FullyQualifiedName~Engines.Codegen.|
+        FullyQualifiedName~Engines.DevicePrimitives.|
+        FullyQualifiedName~.DeferredScopeReproTests.|
+        FullyQualifiedName~.CpuResidentDoublePrecisionTests.|
+        FullyQualifiedName~.GroupNormIntoTests.|
+        FullyQualifiedName~.LstmFinalStateGradientTests.|
+        FullyQualifiedName~.LstmGateKernelTests.|
+        FullyQualifiedName~.ResidentWeightInvalidationDeviceStateTests.|
+        FullyQualifiedName~.CpuDoubleReductionTests.|
+        FullyQualifiedName~.GpuEngineScalarReductionDispatchTests.|
+        FullyQualifiedName~.SoftmaxForwardGpuReproTests.|
+        FullyQualifiedName~.XLstmDeviceTrainingTests.|
+        FullyQualifiedName~.TimeStretchStageDiffTests.|
+        FullyQualifiedName~.EmptyBroadcastTests.|
+        FullyQualifiedName~.EmptyBroadcastGpuTests.|
+        FullyQualifiedName~.GridSampleBackwardAlignCornersTests.|
+        FullyQualifiedName~.DirectGpuLinalgRoutingTests.|
+        FullyQualifiedName~.StreamingTensorJournalTests.|
+        FullyQualifiedName~.TensorCowInferenceReadPathTests.|
+        FullyQualifiedName~.TensorGpuCachePhysicalTests.)&Category!=Benchmark&Category!=Performance
     defaults:
       run:
         shell: pwsh
@@ -203,6 +236,9 @@ jobs:
         $dll.DirectoryName | Out-File -Append -FilePath $env:GITHUB_PATH
         "cuDNN: $version (CUDA 13) at $($dll.DirectoryName)" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
 
+    - name: Check the lane selects every GPU test class
+      run: python AiDotNet.Tensors/scripts/ci/check-cuda-lane-coverage.py --filter ($env:CUDA_LANE_FILTER -replace "\s", "") AiDotNet.Tensors/tests
+
     - name: Build tests (net10.0)
       run: dotnet build AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --framework net10.0
 
@@ -216,7 +252,7 @@ jobs:
         New-Item -ItemType Directory -Force "${{ runner.temp }}/trx" | Out-Null
         dotnet test AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj `
           --configuration Release --no-build --framework net10.0 `
-          --filter "(FullyQualifiedName~GpuLaneBackend|FullyQualifiedName~Engines.DirectGpu|FullyQualifiedName~Engines.Autodiff|FullyQualifiedName~Engines.Compilation|FullyQualifiedName~Parity|FullyQualifiedName~GruSequence|FullyQualifiedName~FusedConv2DBatchNorm)&Category!=Benchmark&Category!=Performance" `
+          --filter ($env:CUDA_LANE_FILTER -replace "\s", "") `
           --results-directory "${{ runner.temp }}/trx" --logger "trx;LogFileName=cuda.trx" `
           --blame-hang --blame-hang-timeout 900s --blame-crash
       # With --blame the TRX logger ignores LogFilePath and writes under the project's TestResults; the results
