@@ -103,6 +103,14 @@ internal static class CpuJitKernels
     public static unsafe BinaryKernel GetBinaryKernel(JitBinaryOp op, int length, bool aligned = false)
     {
         long key = MakeKey(op.Id, aligned, length);
+        // A hit allocates nothing: the compiling lambdas live in the slow path (a lambda capturing a parameter
+        // allocates its closure at method entry, hit or miss).
+        if (_cache.TryGetValue(key, out var cached)) return (BinaryKernel)cached.Value.Kernel;
+        return GetBinaryKernelSlow(key, op, length, aligned);
+    }
+
+    private static unsafe BinaryKernel GetBinaryKernelSlow(long key, JitBinaryOp op, int length, bool aligned)
+    {
         var entry = _cache.GetOrAdd(key, _ => new Lazy<(ExecutableBuffer Buffer, Delegate Kernel)>(() =>
         {
             var buf = aligned
@@ -121,6 +129,14 @@ internal static class CpuJitKernels
     public static unsafe UnaryKernel GetReLUKernel(int length, bool aligned = false)
     {
         long key = MakeKey(OP_RELU, aligned, length);
+        // A hit allocates nothing: the compiling lambdas live in the slow path (a lambda capturing a parameter
+        // allocates its closure at method entry, hit or miss).
+        if (_cache.TryGetValue(key, out var cached)) return (UnaryKernel)cached.Value.Kernel;
+        return GetReLUKernelSlow(key, length, aligned);
+    }
+
+    private static unsafe UnaryKernel GetReLUKernelSlow(long key, int length, bool aligned)
+    {
         var entry = _cache.GetOrAdd(key, _ => new Lazy<(ExecutableBuffer Buffer, Delegate Kernel)>(() =>
         {
             var buf = aligned
@@ -138,6 +154,14 @@ internal static class CpuJitKernels
     public static unsafe BinaryKernel GetFusedAddReLUKernel(int length)
     {
         long key = MakeKey(OP_FUSED_ADD_RELU, false, length);
+        // A hit allocates nothing: the compiling lambdas live in the slow path (a lambda capturing a parameter
+        // allocates its closure at method entry, hit or miss).
+        if (_cache.TryGetValue(key, out var cached)) return (BinaryKernel)cached.Value.Kernel;
+        return GetFusedAddReLUKernelSlow(key, length);
+    }
+
+    private static unsafe BinaryKernel GetFusedAddReLUKernelSlow(long key, int length)
+    {
         var entry = _cache.GetOrAdd(key, _ => new Lazy<(ExecutableBuffer Buffer, Delegate Kernel)>(() =>
         {
             var buf = GenerateFusedAddReLUKernel(length);
@@ -153,6 +177,14 @@ internal static class CpuJitKernels
     public static unsafe UnaryKernel GetSigmoidKernel(int length)
     {
         long key = MakeKey(OP_SIGMOID, false, length);
+        // A hit allocates nothing: the compiling lambdas live in the slow path (a lambda capturing a parameter
+        // allocates its closure at method entry, hit or miss).
+        if (_cache.TryGetValue(key, out var cached)) return (UnaryKernel)cached.Value.Kernel;
+        return GetSigmoidKernelSlow(key, length);
+    }
+
+    private static unsafe UnaryKernel GetSigmoidKernelSlow(long key, int length)
+    {
         var entry = _cache.GetOrAdd(key, _ => new Lazy<(ExecutableBuffer Buffer, Delegate Kernel)>(() =>
         {
             var buf = GenerateSigmoidKernel(length);
@@ -168,21 +200,22 @@ internal static class CpuJitKernels
     /// </summary>
     public static unsafe GemmMicroKernel GetGemmMicroKernel(int kc, int ldc)
     {
-        // Pack ldc into the key: OP_GEMM_MICRO in opId, ldc in aligned flag area, kc in length
         long key = ((long)(OP_GEMM_MICRO + ldc) << 33) | (uint)kc;
-        // Looked up first, with the compiling factory in another method: a lambda here captures kc and ldc, and its
-        // closure was allocated on every call, hit or miss. Every GEMM macro-kernel call comes here (6.7% of
-        // MobileNetV2 inference's allocated bytes).
-        if (!_cache.TryGetValue(key, out var entry)) entry = AddGemmMicroKernel(key, kc, ldc);
-        return (GemmMicroKernel)entry.Value.Kernel;
+        // A hit allocates nothing: the compiling lambdas live in the slow path (a lambda capturing a parameter
+        // allocates its closure at method entry, hit or miss).
+        if (_cache.TryGetValue(key, out var cached)) return (GemmMicroKernel)cached.Value.Kernel;
+        return GetGemmMicroKernelSlow(key, kc, ldc);
     }
 
-    private static Lazy<(ExecutableBuffer Buffer, Delegate Kernel)> AddGemmMicroKernel(long key, int kc, int ldc)
-        => _cache.GetOrAdd(key, _ => new Lazy<(ExecutableBuffer Buffer, Delegate Kernel)>(() =>
+    private static unsafe GemmMicroKernel GetGemmMicroKernelSlow(long key, int kc, int ldc)
+    {
+        var entry = _cache.GetOrAdd(key, _ => new Lazy<(ExecutableBuffer Buffer, Delegate Kernel)>(() =>
         {
             var buf = GenerateGemmMicroKernel(kc, ldc);
             return (buf, (Delegate)buf.CreateDelegate<GemmMicroKernel>());
         }));
+        return (GemmMicroKernel)entry.Value.Kernel;
+    }
 
     /// <summary>
     /// Iter 42: get function pointer to a FAT kernel that JIT-emits the
@@ -208,8 +241,14 @@ internal static class CpuJitKernels
         if (mFull <= 0 || n <= 0) return IntPtr.Zero;
 
         var key = (mFull, n, k, lda, ldb, ldc);
-        var entry = _fatCache.GetOrAdd(key, _ => new Lazy<ExecutableBuffer>(() =>
-            GenerateFatKernel(mFull, n, k, lda, ldb, ldc)));
+        if (_fatCache.TryGetValue(key, out var cached)) return new IntPtr(cached.Value.GetFunctionPointer());
+        return GetFatKernelPtrSlow(key);
+    }
+
+    private static unsafe IntPtr GetFatKernelPtrSlow((int MFull, int N, int K, int Lda, int Ldb, int Ldc) key)
+    {
+        var entry = _fatCache.GetOrAdd(key, static k => new Lazy<ExecutableBuffer>(() =>
+            GenerateFatKernel(k.MFull, k.N, k.K, k.Lda, k.Ldb, k.Ldc)));
         return new IntPtr(entry.Value.GetFunctionPointer());
     }
 

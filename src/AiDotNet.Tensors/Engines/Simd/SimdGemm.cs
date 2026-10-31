@@ -563,7 +563,9 @@ internal static partial class SimdGemm
         int colSubRounded = ((colSubSize + Nr - 1) / Nr) * Nr;
         int lastColSubWidth = nc0 - (numColSubBlocks - 1) * colSubSize;
         int lastColSubRounded = ((lastColSubWidth + Nr - 1) / Nr) * Nr;
-        int packedBSizePerSub = Kc * System.Math.Max(colSubRounded, lastColSubRounded);
+        // Panels are laid out with the real depth (kc = min(Kc, k - pc)), so a weight shallower than Kc needs only
+        // k rows: sizing by Kc held 4x the memory for a k = 128 weight in every cached pack.
+        int packedBSizePerSub = System.Math.Min(Kc, k) * System.Math.Max(colSubRounded, lastColSubRounded);
 
         var packedSubs = new float[numPcIters * numColSubBlocks][];
         var bSpan = new System.ReadOnlySpan<float>(b);
@@ -907,7 +909,9 @@ internal static partial class SimdGemm
         int colSubRounded = ((colSubSize + Nr - 1) / Nr) * Nr;
         int lastColSubWidth = nc0 - (numColSubBlocks - 1) * colSubSize;
         int lastColSubRounded = ((lastColSubWidth + Nr - 1) / Nr) * Nr;
-        int packedBSizePerSub = Kc * System.Math.Max(colSubRounded, lastColSubRounded);
+        // Panels are laid out with the real depth (kc = min(Kc, k - pc)), so a weight shallower than Kc needs only
+        // k rows: sizing by Kc held 4x the memory for a k = 128 weight in every cached pack.
+        int packedBSizePerSub = System.Math.Min(Kc, k) * System.Math.Max(colSubRounded, lastColSubRounded);
 
         // Build a temporary float-packed sub then quantize. Allocates one
         // float buffer of packedBSizePerSub size (reused across tiles).
