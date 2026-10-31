@@ -53,13 +53,16 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             }
         }
 
-        private void GemmReference(in TunedGemmArgs a)
+        private void GemmReference(in TunedGemmArgs a) => RunGemmReference(this, a);
+
+        // Static: the flag is per thread, not per backend.
+        private static void RunGemmReference(OpenClBackend backend, in TunedGemmArgs a)
         {
             bool prior = t_inGemmReference;
             t_inGemmReference = true;
             try
             {
-                Gemm(a.A, a.B, a.C, a.M, a.N, a.K);
+                backend.Gemm(a.A, a.B, a.C, a.M, a.N, a.K);
             }
             finally
             {
