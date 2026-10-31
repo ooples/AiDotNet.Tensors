@@ -538,7 +538,17 @@ public static partial class BlasManaged
         int m, int n, int k,
         in BlasOptions<T> options = default) where T : unmanaged
     {
-        if (m <= 0 || n <= 0 || k <= 0) return;
+        if (m <= 0 || n <= 0) return;
+        if (k <= 0)
+        {
+            // An empty reduction is still C = A · B = 0: the overwrite contract holds, so a destination that held an
+            // earlier result (FusedLinearInto reuses its output) reads zeros plus the epilogue, not stale values.
+            if (ldc == n) c.Slice(0, m * n).Clear();
+            else for (int row = 0; row < m; row++) c.Slice(row * ldc, n).Clear();
+            var emptyEpilogue = options.Epilogue;
+            EpilogueChain.Apply<T>(c, ldc, m, n, in emptyEpilogue);
+            return;
+        }
 
         // An explicitly activated evolutionary result owns the whole execution decision. Re-enter
         // once with a concrete packing mode and the exact measured axis/block/thread configuration,
