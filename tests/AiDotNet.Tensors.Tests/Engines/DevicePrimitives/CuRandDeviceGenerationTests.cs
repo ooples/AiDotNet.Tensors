@@ -14,6 +14,19 @@ namespace AiDotNet.Tensors.Tests.Engines.DevicePrimitives;
 /// device tests skip (not fail) where there is no cuRAND library or no CUDA device; each one asserts the call really
 /// ran on the device, so a silent fallback to the CPU cannot pass them by comparing the CPU with itself.
 /// </summary>
+/// <summary>Serializes the cuRAND device tests against other GPU work in the process.</summary>
+[CollectionDefinition(Name, DisableParallelization = true)]
+public sealed class CuRandDeviceSerialCollection
+{
+    public const string Name = "CuRandDeviceSerial";
+}
+
+// These tests assert WHEN a call runs on the device (LastUniformUsedDevice), not only that its bits match. The
+// device path runs on the legacy stream and copies back with a synchronous cuMemcpyDtoH, which can fail while other
+// GPU work runs (a graph capture on a blocking stream, for one), and the call then falls back to the CPU: same bits,
+// device flag false. On the CUDA lane two of these asserts failed that way under the parallel suite, so the class
+// runs alone.
+[Collection(CuRandDeviceSerialCollection.Name)]
 public class CuRandDeviceGenerationTests
 {
     private static void SkipWithoutDevice()

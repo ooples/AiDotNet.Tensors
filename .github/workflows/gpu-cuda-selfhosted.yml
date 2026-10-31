@@ -10,8 +10,11 @@ name: GPU (CUDA, self-hosted)
 #
 # To enable it, register a self-hosted runner on a machine with an NVIDIA GPU and the CUDA driver and a CUDA 13
 # toolkit (its bin on the machine PATH, for NVRTC and cuBLAS), PowerShell 7 and Python 3 on the machine PATH; the job
-# installs the .NET SDK and cuDNN into its workspace), with the labels `self-hosted, gpu, cuda`, then set the repository variable
-# CUDA_RUNNER_ENABLED=true. Until the variable is set every job is skipped, so nothing waits for a runner that does
+# installs the .NET SDK and cuDNN into its workspace), with the labels `self-hosted, gpu, cuda` plus its architecture label,
+# `sm86` (RTX 30-series, the pull-request gate) or `sm75` (GTX 16-series / RTX 20-series), then set the repository variable
+# CUDA_RUNNER_ENABLED=true. A runner registered before the lane was split by architecture has only the first three labels and
+# matches no job: add its architecture label (Settings > Actions > Runners > the runner > Labels, or re-run config.cmd with
+# --labels self-hosted,gpu,cuda,sm86). Until the variable is set every job is skipped, so nothing waits for a runner that does
 # not exist. Pull requests from forks never run here: a self-hosted runner must not execute untrusted code.
 # One runner serves every pull request and a run takes over an hour, so the lane skips draft pull requests and any
 # pull request labelled `skip-gpu-ci` (for a change that cannot affect the GPU, such as comment-only edits to the
@@ -76,8 +79,57 @@ jobs:
            (github.event.pull_request.head.repo.full_name == github.repository &&
             !github.event.pull_request.draft &&
             !contains(github.event.pull_request.labels.*.name, 'skip-gpu-ci'))) }}
-    runs-on: [self-hosted, gpu, cuda]
-    timeout-minutes: 150
+    # One job per runner architecture, chosen by the runner's sm label. The SM86 job is the lane's full gate (its check
+    # keeps the name "cuda"). The SM75 job (a GTX 1660 Ti) runs the same GPU suites, where the GA10x/SM86-only
+    # specializations skip by design, and leaves the AiDotNet model families to the SM86 job: they need its memory.
+    # Pull requests are gated by the SM86 job alone: the suites take about 3 hours on the GTX 1660 Ti (about 1 on the
+    # RTX 3080), so the SM75 job runs on the nightly schedule and on manual dispatch. The per-architecture settings
+    # (check name, timeout, allowed skips, model families, artifact) are derived from matrix.arch: matrix `include`
+    # entries cannot be used for them, because an entry left with no combination to extend is added as a new job,
+    # which would bring the SM75 job back on pull requests.
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJSON(github.event_name == 'pull_request' && '["sm86"]' || '["sm86","sm75"]') }}
+    name: ${{ matrix.arch == 'sm86' && 'cuda' || format('cuda-{0}', matrix.arch) }}
+    # Each runner needs self-hosted, gpu, cuda AND its architecture label (sm86 or sm75); a runner registered before
+    # the split carries no architecture label and picks up neither job until relabelled (see the header for how).
+    runs-on: [self-hosted, gpu, cuda, '${{ matrix.arch }}']
+    timeout-minutes: ${{ matrix.arch == 'sm86' && 150 || 240 }}
+    env:
+      # The tests this lane runs. It selects by name, so a GPU test outside these terms never runs on CUDA; the
+      # coverage check below fails the lane when a test class that drives the GPU engine is not selected. A term
+      # ending in "." matches one class. Folding joins the lines with spaces; the steps strip them.
+      CUDA_LANE_FILTER: >-
+        (FullyQualifiedName~GpuLaneBackend|
+        FullyQualifiedName~Engines.DirectGpu|
+        FullyQualifiedName~Engines.Autodiff|
+        FullyQualifiedName~Engines.Compilation|
+        FullyQualifiedName~Parity|
+        FullyQualifiedName~GruSequence|
+        FullyQualifiedName~FusedConv2DBatchNorm|
+        FullyQualifiedName~Engines.Gpu.|
+        FullyQualifiedName~Engines.Codegen.|
+        FullyQualifiedName~Engines.DevicePrimitives.|
+        FullyQualifiedName~.DeferredScopeReproTests.|
+        FullyQualifiedName~.CpuResidentDoublePrecisionTests.|
+        FullyQualifiedName~.GroupNormIntoTests.|
+        FullyQualifiedName~.LstmFinalStateGradientTests.|
+        FullyQualifiedName~.LstmGateKernelTests.|
+        FullyQualifiedName~.ResidentWeightInvalidationDeviceStateTests.|
+        FullyQualifiedName~.CpuDoubleReductionTests.|
+        FullyQualifiedName~.GpuEngineScalarReductionDispatchTests.|
+        FullyQualifiedName~.SoftmaxForwardGpuReproTests.|
+        FullyQualifiedName~.TimeStretchStageDiffTests.|
+        FullyQualifiedName~.EmptyBroadcastTests.|
+        FullyQualifiedName~.GpuPinnedLifetimeTests.|
+        FullyQualifiedName~.Interop.DLPack|
+        FullyQualifiedName~.EmptyBroadcastGpuTests.|
+        FullyQualifiedName~.GridSampleBackwardAlignCornersTests.|
+        FullyQualifiedName~.DirectGpuLinalgRoutingTests.|
+        FullyQualifiedName~.StreamingTensorJournalTests.|
+        FullyQualifiedName~.TensorCowInferenceReadPathTests.|
+        FullyQualifiedName~.TensorGpuCachePhysicalTests.)&Category!=Benchmark&Category!=Performance&Category!=RequiresOpenCL
     defaults:
       run:
         shell: pwsh
@@ -124,7 +176,9 @@ jobs:
         "Python packages (numpy, torch): $(& $py -I -c 'import numpy, torch; print(numpy.__version__, torch.__version__)')" |
           Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
 
+    # The harness steps below serve only the model-family step, which runs on SM86; the SM75 job skips them all.
     - name: Check out AiDotNet beside this checkout
+      if: matrix.arch == 'sm86'
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         repository: ooples/AiDotNet
@@ -137,6 +191,7 @@ jobs:
     # and MobileNetV2 training. Checked first, so a lane enabled without a harness that defines them fails in its first
     # minute with the fix in the message, not after the GPU suites.
     - name: Check the AiDotNet harness defines every model family
+      if: matrix.arch == 'sm86'
       run: |
         $program = Get-Content aidn/benchmarks/AiDotNet.PyTorchParity/Program.cs -Raw
         $families = 'mlp','cnn','lstm','transformer','gru','resnet18','resnet50','vgg11','mobilenetv2','densenet121','vit'
@@ -182,6 +237,9 @@ jobs:
         $dll.DirectoryName | Out-File -Append -FilePath $env:GITHUB_PATH
         "cuDNN: $version (CUDA 13) at $($dll.DirectoryName)" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
 
+    - name: Check the lane selects every GPU test class
+      run: python AiDotNet.Tensors/scripts/ci/check-cuda-lane-coverage.py --filter ($env:CUDA_LANE_FILTER -replace "\s", "") AiDotNet.Tensors/tests
+
     - name: Build tests (net10.0)
       run: dotnet build AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --framework net10.0
 
@@ -195,7 +253,7 @@ jobs:
         New-Item -ItemType Directory -Force "${{ runner.temp }}/trx" | Out-Null
         dotnet test AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj `
           --configuration Release --no-build --framework net10.0 `
-          --filter "(FullyQualifiedName~GpuLaneBackend|FullyQualifiedName~Engines.DirectGpu|FullyQualifiedName~Engines.Autodiff|FullyQualifiedName~Engines.Compilation|FullyQualifiedName~Parity|FullyQualifiedName~GruSequence|FullyQualifiedName~FusedConv2DBatchNorm)&Category!=Benchmark&Category!=Performance" `
+          --filter ($env:CUDA_LANE_FILTER -replace "\s", "") `
           --results-directory "${{ runner.temp }}/trx" --logger "trx;LogFileName=cuda.trx" `
           --blame-hang --blame-hang-timeout 900s --blame-crash
       # With --blame the TRX logger ignores LogFilePath and writes under the project's TestResults; the results
@@ -206,7 +264,8 @@ jobs:
       # Allowed skip reasons:
       #   - another backend's device or toolchain (this runner has CUDA, not necessarily HIP, Metal, Vulkan, WebGPU, or a
       #     Python with numpy and torch);
-      #   - architecture requirements (an sm_ level, AVX-512 on the host CPU);
+      #   - architecture requirements (an sm_ level, AVX-512 on the host CPU; on the SM75 job, the SM86/GA10x-only
+      #     specializations: the \bSM ?86\b|GA10[0-9x] reasons);
       #   - tracked baselines, each a listed gap with its own marker (NEEDS SPEC, TAPE-GRADIENT BASELINE, a forward with
       #     no differentiable leaf, the PTX transfer campaign's progress check);
       #   - opt-in benchmarks and probes, and wall-clock perf gates (they skip under CI=true);
@@ -214,13 +273,14 @@ jobs:
       # Allowed test names: device classes of another backend (TorchParity*HipDeviceTests and the like), whose reasons say
       # only that no backend is available. A CUDA test skipping for any other reason fails the lane.
       run: >-
-        python AiDotNet.Tensors/scripts/ci/summarize-test-skips.py --title "CUDA" --fail-on-skip
-        --allowed-skip "(?i)(HIP|ROCm|Metal|MoltenVK|Vulkan|WebGPU|Dawn|AIDOTNET_WEBGPU_NODE_DIR|OpenCL|POCL|DirectML|macOS)|requires sm_|compute capability|torch|numpy|python|PARITY_PYTHON|AVX-512|^NEEDS SPEC:|TAPE-GRADIENT BASELINE|forward recorded no differentiable leaf|Full PTX transfer not complete|^Not applicable: CUDA |Requires a non-CUDA|benchmark|Wall-clock perf gate|run manually|manual perf harness|Manual CUDA|Diagnostic-only|Set (AIDOTNET|PARITY)_[A-Z0-9_]+=|AIDOTNET_GPU_MEMTRACK|AIDOTNET_KERNEL_REGISTRY_PERSIST"
+        python AiDotNet.Tensors/scripts/ci/summarize-test-skips.py --title "CUDA (${{ matrix.arch }})" --fail-on-skip
+        --allowed-skip "(?i)(HIP|ROCm|Metal|MoltenVK|Vulkan|WebGPU|Dawn|AIDOTNET_WEBGPU_NODE_DIR|OpenCL|POCL|DirectML|macOS)|requires sm_|compute capability|torch|numpy|python|PARITY_PYTHON|AVX-512|^NEEDS SPEC:|TAPE-GRADIENT BASELINE|forward recorded no differentiable leaf|Full PTX transfer not complete|^Not applicable: CUDA |Requires a non-CUDA|benchmark|Wall-clock perf gate|run manually|manual perf harness|Manual CUDA|Diagnostic-only|Set (AIDOTNET|PARITY)_[A-Z0-9_]+=|AIDOTNET_GPU_MEMTRACK|AIDOTNET_KERNEL_REGISTRY_PERSIST${{ matrix.arch != 'sm86' && '|\bSM ?86\b|GA10[0-9x]' || '' }}"
         --allowed-skip-test "(Hip|Rocm|Dawn|WebGpu|Vulkan|Metal|MoltenVk|OpenCl|Pocl|DirectMl)[A-Za-z0-9]*Tests\."
         "${{ runner.temp }}/trx/*.trx"
 
 
     - name: AiDotNet model families on CUDA (2 training steps, inference up to batch 128)
+      if: matrix.arch == 'sm86'
       # Builds AiDotNet against this checkout (UseLocalTensors resolves ../../AiDotNet.Tensors from aidn/src), so the
       # model families exercise exactly this commit's kernels; the families were checked at the start of the job.
       run: |
@@ -246,7 +306,7 @@ jobs:
       if: always()
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       with:
-        name: gpu-cuda-results
+        name: ${{ matrix.arch == 'sm86' && 'gpu-cuda-results' || format('gpu-cuda-results-{0}', matrix.arch) }}
         path: |
           ${{ runner.temp }}/trx/**
           ${{ runner.temp }}/aidotnet-cuda.json

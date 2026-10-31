@@ -91,12 +91,14 @@ public sealed class Fp16AccumulateRoutingTests
 
     // Deterministic mode (the library default): a measured verdict holds only if it is recorded, so every later process
     // applies the same one. When the cache refuses the record, the shape keeps cuBLAS under determinism; with
-    // determinism off the measured verdict stands.
+    // determinism off the measured verdict stands. The measurement itself is fixed to a win: which route times faster
+    // varies with the device and the runner's load, and is not what this checks.
     [SkippableFact]
     public void UnrecordableVerdict_KeepsCublasUnderDeterminism()
     {
         using var backend = RequireAmpereBackend();
         backend.Fp16AccumulateCacheUnavailableForTests = true;
+        backend.Fp16AccumulateMeasurementForTests = new(true, 1.3, 1.2, 0, 0, 8, "forced win for tests");
         backend.ForceMmaRateForTests(62, 123);
         AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(false);
         try
@@ -112,7 +114,7 @@ public sealed class Fp16AccumulateRoutingTests
             var measured = backend.Fp16AccumulateVerdict(m, n, k);
             Assert.True(measured.HasValue);
             _output.WriteLine($"non-deterministic: routed {measured!.Value.Routed}; {measured.Value.Reason}");
-            Skip.IfNot(measured.Value.Routed, $"No winning route on this device/run: {measured.Value.Reason}");
+            Assert.True(measured.Value.Routed, measured.Value.Reason);
             long routedCount = backend.Fp16AccumulateDispatchCount;
             Assert.True(routedCount > 0);
 

@@ -1,7 +1,9 @@
 #if NETCOREAPP
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 using Xunit;
 
@@ -62,13 +64,20 @@ public sealed class DirectPtxSgemmGeneratorTests
     {
         var space = PtxGemmConfiguration.SearchSpace().ToList();
         Assert.True(space.Count > 200, $"the search space shrank to {space.Count} configurations");
-        foreach (var config in space)
+        // About 27k configurations x 4 layouts, ~28 KB of PTX each: a minute on one core, and past the CUDA lane's
+        // 15-minute hang timeout on a laptop runner under load. Each emit is independent, so spread them over the cores.
+        var failures = new ConcurrentBag<string>();
+        Parallel.ForEach(space, config =>
+        {
             foreach (var layout in Layouts)
             {
                 string ptx = PtxSgemmGenerator.Emit(config, layout, 8, 6);
-                Assert.Contains(".entry " + PtxSgemmGenerator.EntryPoint, ptx);
-                Assert.Contains(".maxntid " + config.Threads + ", 1, 1", ptx);
+                if (!ptx.Contains(".entry " + PtxSgemmGenerator.EntryPoint) ||
+                    !ptx.Contains(".maxntid " + config.Threads + ", 1, 1"))
+                    failures.Add($"{config.Name} {layout}");
             }
+        });
+        Assert.True(failures.IsEmpty, $"{failures.Count} emits lack the entry or .maxntid: {string.Join("; ", failures.Take(10))}");
     }
 
     [Fact]

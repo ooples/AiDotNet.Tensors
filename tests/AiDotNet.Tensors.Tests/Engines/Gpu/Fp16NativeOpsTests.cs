@@ -2,6 +2,7 @@ using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Tests.Engines.DirectGpu;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.Gpu;
@@ -12,15 +13,22 @@ namespace AiDotNet.Tensors.Tests.Engines.Gpu;
 /// reduce in FP32, write FP16) — the missing kernels that forced every layer to re-inflate the Half activations
 /// to FP32 and negated the FP16 storage win. Verified in isolation against CPU FP32 references FIRST.
 /// </summary>
-public class Fp16NativeOpsTests
+[Collection("DirectGpuSerial")]
+public class Fp16NativeOpsTests : IClassFixture<DirectGpuTensorEngineTestFixture>
 {
-    private static (CudaBackend b, bool ok) Setup()
+    // The test's own engine: the process-wide current engine is shared and other tests reset it to the CPU,
+    // so reading it made these tests skip on a CUDA machine depending on test order.
+    private readonly DirectGpuTensorEngineTestFixture _fixture;
+
+    public Fp16NativeOpsTests(DirectGpuTensorEngineTestFixture fixture) => _fixture = fixture;
+
+    private (CudaBackend b, bool ok) Setup()
     {
-        var eng = AiDotNetEngine.Current;
-        if (eng is not DirectGpuTensorEngine) return (null!, false);
+        var eng = _fixture.Engine;
+        if (eng is null) return (null!, false);
         var warm = new Tensor<float>(new float[] { 1, 2, 3, 4 }, new[] { 2, 2 });
-        _ = eng.TensorMatMul(warm, warm);
-        var b = ((DirectGpuTensorEngine)eng).TestBackend as CudaBackend;
+        _ = eng!.TensorMatMul(warm, warm);
+        var b = eng!.TestBackend as CudaBackend;
         return (b!, b is not null && b.IsAvailable);
     }
 
