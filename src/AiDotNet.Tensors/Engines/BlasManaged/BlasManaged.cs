@@ -521,6 +521,16 @@ public static partial class BlasManaged
         return true;
     }
 
+    // The narrow-N transposition (GemmCore): narrower than the streaming kernel's 8-column vector block (which already
+    // runs n = 8 well: 52 us against 81 transposed on 256 x 8 x 2304) but not a single column (the GEMV
+    // routes keep n = 1: 234 us against 1604 transposed on 512 x 1 x 4608), deep enough that the dot-product kernel's
+    // vector loop pays for the transpose (512 x 4 x 4608: 3661 -> 202 us; at K = 512, 128 x 10 went 24 -> 33 us), and
+    // enough rows to amortize it.
+    private const int NarrowNTransposeMinN = 2;
+    private const int NarrowNTransposeMaxN = 8;
+    private const int NarrowNTransposeMinK = 1024;
+    private const int NarrowNTransposeMinM = 16;
+
     private static void GemmCore<T>(
         ReadOnlySpan<T> a, int lda, bool transA,
         ReadOnlySpan<T> b, int ldb, bool transB,
@@ -529,6 +539,29 @@ public static partial class BlasManaged
         in BlasOptions<T> options = default) where T : unmanaged
     {
         if (m <= 0 || n <= 0 || k <= 0) return;
+
+        // A float product with fewer columns than one 8-wide vector block (an im2col convolution on a 2 x 2 or
+        // 1 x 1 map at batch 1: n = OH x OW): every column fell into GotoGemm's scalar tail, and VGG-11's 512-channel
+        // 2 x 2 layers made a batch-1 CPU forward 13 ms against PyTorch's 9.7. B (K x n) is small, so transpose it once
+        // and take the transposed-B route, whose kernel is a vectorized dot product along K per output.
+        if (typeof(T) == typeof(float) && !transA && !transB && n >= NarrowNTransposeMinN && n < NarrowNTransposeMaxN
+            && k >= NarrowNTransposeMinK
+            && m >= NarrowNTransposeMinM && options.PackedB is null && options.PackingMode == PackingMode.Auto)
+        {
+            T[] bT = System.Buffers.ArrayPool<T>.Shared.Rent(n * k);
+            try
+            {
+                for (int kk = 0; kk < k; kk++)
+                    for (int j = 0; j < n; j++)
+                        bT[j * k + kk] = b[kk * ldb + j];
+                GemmCore(a, lda, false, new ReadOnlySpan<T>(bT, 0, n * k), k, true, c, ldc, m, n, k, in options);
+            }
+            finally
+            {
+                System.Buffers.ArrayPool<T>.Shared.Return(bT);
+            }
+            return;
+        }
 
         // An explicitly activated evolutionary result owns the whole execution decision. Re-enter
         // once with a concrete packing mode and the exact measured axis/block/thread configuration,
