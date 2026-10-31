@@ -57,6 +57,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                                 MeasureTunedKernelMilliseconds, a => new[] { (a.C, a.OutputCount) },
                                 a => a.C.Handle == a.A.Handle || a.C.Handle == a.B.Handle),
                             () => GpuDeterminism.IsActive, candidates);
+                        _gemmSlot.UntunedPreference = static shape => GemmUntunedPreference(shape[0], shape[1], shape[2]);
                     }
                     return _gemmSlot;
                 }
@@ -79,6 +80,21 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private const int SkinnyGroupsPerComputeUnit = 8;
         private const int SkinnyMinSlice = 256;
         private const int SkinnyChunkAlign = 64;
+
+        private static readonly string[] s_gemmPreferSplitK = { "opencl.gemm.rb_splitk" };
+        private static readonly string[] s_gemmPreferSkinny = { "opencl.gemm.skinny" };
+
+        // The route for a product the slot could not settle by measurement (no budget left, or a measurement left
+        // inconclusive by CLBlast's host-time noise), from paired timings on gfx1012: the split-K GEMM took a half to a
+        // quarter of CLBlast's time on a transformer's tall projections (8320 x {192, 576, 768} x {192, 768}: 283 vs 1028,
+        // 856 vs 1861, 1136 vs 2348, 1177 vs 2823 us), and the skinny GEMM half on a deep linear layer over a small batch
+        // (32 x 4096 x 4096: 432 vs 835 us). Anything else keeps the reference.
+        internal static IReadOnlyList<string>? GemmUntunedPreference(int m, int n, int k)
+        {
+            if (m <= SkinnyGemmMaxRows && n % SkinnyVectorWidth == 0 && k >= 1024) return s_gemmPreferSkinny;
+            if (m >= 1024 && n <= 1024 && k <= 1024) return s_gemmPreferSplitK;
+            return null;
+        }
 
         // C[M x N] = A[M x K] * B[K x N] through gemm_skinny_splitk (M <= SkinnyGemmMaxRows, N a multiple of
         // SkinnyVectorWidth), the planes summed by gemm_splitk_reduce.

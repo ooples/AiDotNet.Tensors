@@ -250,6 +250,39 @@ public sealed class TunedKernelRegistryTests : IDisposable
     }
 
     [Fact]
+    public void An_inconclusive_measurement_serves_the_shape_aware_default_when_it_matches_the_reference()
+    {
+        // The same undecidable measurement, on a slot whose shape-aware default names the faster candidate: the process
+        // uses it (after a correctness run) instead of the reference, still unpersisted, so a later process measures again.
+        var reference = new Fake("ref", 1f, 1.0);
+        var fast = new Fake("fast", 1f, 0.7);
+        var harness = new Harness();
+        foreach (int call in new[] { 3, 7, 13, 17, 23, 27, 32, 36 }) harness.Stalls[("fast", call)] = 10.0;
+        var slot = Slot(harness, false, reference, fast);
+        slot.UntunedPreference = _ => new[] { "fast" };
+
+        Assert.Same(fast, slot.Resolve(Shape(), NewArgs()));
+        var decision = Assert.Single(slot.CachedDecisions);
+        Assert.Equal(TunedKernelDecisionReason.Inconclusive, decision.Reason);
+        Assert.Equal("fast", decision.CandidateId);
+    }
+
+    [Fact]
+    public void An_inconclusive_measurement_keeps_the_reference_when_the_default_disagrees_with_it()
+    {
+        var reference = new Fake("ref", 1f, 1.0);
+        var wrong = new Fake("wrong", 2f, 0.7);
+        var fast = new Fake("fast", 1f, 0.7);
+        var harness = new Harness();
+        foreach (int call in new[] { 3, 7, 13, 17, 23, 27, 32, 36 }) harness.Stalls[("fast", call)] = 10.0;
+        var slot = Slot(harness, false, reference, fast, wrong);
+        slot.UntunedPreference = _ => new[] { "wrong" };
+
+        Assert.Same(reference, slot.Resolve(Shape(), NewArgs()));
+        Assert.Equal(TunedKernelDecisionReason.Inconclusive, Assert.Single(slot.CachedDecisions).Reason);
+    }
+
+    [Fact]
     public void An_inconclusive_measurement_is_retried_once_and_a_clean_retry_decides()
     {
         // Two stalled pairs only in the first measurement (a burst of device noise): the retry is clean and the

@@ -480,6 +480,25 @@ public sealed class OpenClTunedKernelTests
     // reference, on shapes that are not tile multiples. The skinny GEMM admits at most 32 rows over a multiple of 4
     // columns: one row tile over four K sub-lanes, two over two, three (a lane idle) and four over K slices, a partial
     // last column block.
+    // The GEMM slot's default for a product it could not settle by measurement: split-K for a transformer's tall
+    // projections, the skinny GEMM for a deep linear layer over a small batch, the reference otherwise.
+    [Theory]
+    [InlineData(8320, 768, 192, "opencl.gemm.rb_splitk")]
+    [InlineData(8320, 192, 768, "opencl.gemm.rb_splitk")]
+    [InlineData(1024, 1024, 1024, "opencl.gemm.rb_splitk")]
+    [InlineData(32, 4096, 4096, "opencl.gemm.skinny")]
+    [InlineData(8, 4096, 1024, "opencl.gemm.skinny")]
+    [InlineData(32, 4096, 512, null)]
+    [InlineData(32, 10, 4096, null)]
+    [InlineData(128, 4096, 4096, null)]
+    [InlineData(8320, 2048, 192, null)]
+    public void Gemm_UntunedPreference_FollowsTheMeasuredRegimes(int m, int n, int k, string? expected)
+    {
+        var preference = OpenClBackend.GemmUntunedPreference(m, n, k);
+        if (expected is null) Assert.Null(preference);
+        else Assert.Equal(expected, Assert.Single(preference ?? System.Array.Empty<string>()));
+    }
+
     [SkippableFact]
     public void Gemm_EveryCandidate_MatchesCpu()
     {

@@ -254,6 +254,16 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
                 // No decision: the reference output was not finite, so nothing could be compared. Serve the reference
                 // uncached and unpersisted, and tune this shape on a later call with usable data.
                 if (decision is null) return chosen;
+                // Still inconclusive: the slot's shape-aware default for this process when it has one that matches the
+                // reference (it encodes measured evidence; the reference is often the slowest route), else the reference.
+                if (decision.Reason == TunedKernelDecisionReason.Inconclusive
+                    && TryUntunedDefault(shape, args, reference, applicable, rejected) is { } fallback)
+                {
+                    chosen = fallback;
+                    decision = new TunedKernelDecision(Op, Device, shape, fallback.Id, fallback.Origin,
+                        TunedKernelDecisionReason.Inconclusive, reference.Id, noiseRatio: decision.NoiseRatio,
+                        rejected: rejected.ToArray());
+                }
                 map[shape] = new Entry(chosen, decision);
                 TunedKernelRegistry.Record(decision);
                 // Still inconclusive: the reference for this process, but a later process measures again.
