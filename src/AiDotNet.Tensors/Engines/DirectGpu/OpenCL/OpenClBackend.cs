@@ -7218,8 +7218,7 @@ KERNEL VARIANTS (A/B testing):
                 k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle); // no bias: the epilogue flags are 0
                 k.SetArg(arg++, 0);
 
-                int localX = 8, localY = 8, localZ = 1;
-                k.Execute3D(outWidth, outHeight, batch * outChannels, localX, localY, localZ);
+                k.ExecutePlanes(outWidth, outHeight, batch * outChannels);
             }
         }
 
@@ -7425,8 +7424,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, padH);
             k.SetArg(arg++, padW);
 
-            int localX = 8, localY = 8, localZ = 1;
-            k.Execute3D(outWidth, outHeight, batch * channels, localX, localY, localZ);
+            k.ExecutePlanes(outWidth, outHeight, batch * channels);
         }
 
         public void ConvTranspose2D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
@@ -7870,8 +7868,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, padW);
             k.SetArg(arg++, indices != null ? 1 : 0);
 
-            int localX = 8, localY = 8, localZ = 1;
-            k.Execute3D(outWidth, outHeight, batch * channels, localX, localY, localZ);
+            k.ExecutePlanes(outWidth, outHeight, batch * channels);
         }
 
         public void MaxPool2DBackward(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradInput,
@@ -7893,8 +7890,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, outHeight);
             k.SetArg(arg++, outWidth);
 
-            int localX = 8, localY = 8, localZ = 1;
-            k.Execute3D(outWidth, outHeight, batch * channels, localX, localY, localZ);
+            k.ExecutePlanes(outWidth, outHeight, batch * channels);
         }
 
         public void AvgPool2D(IGpuBuffer input, IGpuBuffer output,
@@ -7922,8 +7918,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, padW);
             k.SetArg(arg++, countIncludePad ? 1 : 0);
 
-            int localX = 8, localY = 8, localZ = 1;
-            k.Execute3D(outWidth, outHeight, batch * channels, localX, localY, localZ);
+            k.ExecutePlanes(outWidth, outHeight, batch * channels);
         }
 
         public void AvgPool2DBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput,
@@ -8048,8 +8043,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, outHeight);
             k.SetArg(arg++, outWidth);
 
-            int localX = 8, localY = 8, localZ = 1;
-            k.Execute3D(outWidth, outHeight, batch * channels, localX, localY, localZ);
+            k.ExecutePlanes(outWidth, outHeight, batch * channels);
         }
 
         // #775: adaptive max pooling 2D on the adaptive_max_pool2d kernel (same 3D dispatch as avg).
@@ -8066,8 +8060,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, outHeight);
             k.SetArg(arg++, outWidth);
 
-            int localX = 8, localY = 8, localZ = 1;
-            k.Execute3D(outWidth, outHeight, batch * channels, localX, localY, localZ);
+            k.ExecutePlanes(outWidth, outHeight, batch * channels);
         }
 
         public void MaxPool3D(IGpuBuffer input, IGpuBuffer output, IGpuBuffer? indices,

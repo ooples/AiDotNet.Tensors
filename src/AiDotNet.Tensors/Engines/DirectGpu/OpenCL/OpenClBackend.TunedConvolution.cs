@@ -131,7 +131,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var k = _kernelCache["conv2d_direct"];
             ConvArgs(k, a, withKernelGeometry: true);
             k.SetArg(18, ConvEpilogueBias(a)); k.SetArg(19, ConvEpilogueFlags(a));
-            k.Execute3D(a.OutWidth, a.OutHeight, a.Batch * a.OutChannels, 8, 8, 1);
+            k.ExecutePlanes(a.OutWidth, a.OutHeight, a.Batch * a.OutChannels);
         }
 
         private void Conv2DTiled(in TunedConv2DArgs a)

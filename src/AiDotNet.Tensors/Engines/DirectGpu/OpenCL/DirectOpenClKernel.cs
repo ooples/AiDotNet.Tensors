@@ -330,6 +330,25 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
 
         /// <summary>
+        /// Launches one work item per (x, y, plane) of a stack of <paramref name="width"/> x <paramref name="height"/>
+        /// planes, in 64-item work groups shaped to the plane. The kernel must return for x &gt;= width, y &gt;= height and
+        /// planes past the last. A fixed 8 x 8 group left 60 of its 64 items idle on a 2 x 2 map and 63 on a 1 x 1 one,
+        /// so a pool over VGG-11's last maps ran a work group per output.
+        /// </summary>
+        internal void ExecutePlanes(int width, int height, int planes)
+        {
+            int lx = Math.Min(8, PowerOfTwoAtLeast(width)), ly = Math.Min(8, PowerOfTwoAtLeast(height));
+            Execute3D(width, height, planes, lx, ly, 64 / (lx * ly));
+        }
+
+        private static int PowerOfTwoAtLeast(int n)
+        {
+            int p = 1;
+            while (p < n && p < 8) p <<= 1;
+            return p;
+        }
+
+        /// <summary>
         /// Executes kernel with 3D work distribution.
         /// </summary>
         public void Execute3D(int globalSizeX, int globalSizeY, int globalSizeZ, int localSizeX, int localSizeY, int localSizeZ)
