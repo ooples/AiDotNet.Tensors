@@ -77,6 +77,8 @@ public sealed class CrossBackendKernelCoverageTests
         "clip_by_value", "where_select", "max_axis", "var_axis", // elementwise/axis-reduce (CudaBackend.cs)
         "mixed_precision_forward", "mixed_precision_backward",  // CudaBackend.MixedPrecisionConv.cs
         "global_maxpool2d_with_indices",                       // -> global_maxpool2d (+backward)
+        "maxpool2d_2x2s2",                                     // -> maxpool2d (CUDA/HIP); OpenCL's two-outputs-per-item
+                                                               // perf variant for 2x2 stride-2 windows, same op
         "tk_im2col_pbl",                                       // -> im2col (CudaBackend.ConvGemm.cs); [P, B*L] layout for the registry
         // Device finite guard (#1502): CUDA/HIP read the guard inside the multi-tensor updates and their
         // multi_tensor_sum_squares writes the double directly (CudaOptimizerKernels.cs).
