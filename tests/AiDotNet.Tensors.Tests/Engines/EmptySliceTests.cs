@@ -4,7 +4,6 @@ using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
-using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
@@ -17,8 +16,6 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// so before this a concatenation with a zero-width input (a CTGAN-family conditional block over data with no discrete
 /// column) threw "Start index n out of range for axis 1 with size n" in the backward pass.
 /// </summary>
-// The GPU test sets the process-wide fallback switch, so it runs with the other DirectGpu tests, one at a time.
-[Collection("DirectGpuSerial")]
 public class EmptySliceTests
 {
     [Fact]
@@ -108,29 +105,7 @@ public class EmptySliceTests
     public void ConcatenateBackward_WithAZeroWidthInput_RoutesTheGradientToTheOthers()
         => AssertConcatenateBackward(new CpuEngine());
 
-    [SkippableFact]
-    public void ConcatenateBackward_WithAZeroWidthInput_OnTheGpuEngine()
-    {
-        using var gpu = new DirectGpuTensorEngine();
-        Skip.IfNot(gpu.IsGpuAvailable, "No DirectGpu backend available");
-
-        // A CPU fallback would pass the value checks while hiding a missing GPU path, so fallbacks throw here and
-        // the probe must record none.
-        bool savedThrowOnFallback = DirectGpuTensorEngine.ThrowOnGpuKernelFallback;
-        try
-        {
-            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = true;
-            GpuLaunchProbe.Reset();
-            AssertConcatenateBackward(gpu);
-            Assert.Empty(GpuLaunchProbe.Fallbacks);
-        }
-        finally
-        {
-            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = savedThrowOnFallback;
-        }
-    }
-
-    private static void AssertConcatenateBackward(IEngine engine)
+    internal static void AssertConcatenateBackward(IEngine engine)
     {
         var a = new Tensor<float>(new float[] { 1, 2, 3, 4, 5, 6 }, new[] { 2, 3 });
         var empty = new Tensor<float>(new[] { 2, 0 });
