@@ -134,17 +134,6 @@ public sealed partial class MetalBackend
     }
 
     /// <summary>
-    /// Base-10 logarithm: B = log10(A)
-    /// </summary>
-    public void Log10(IGpuBuffer A, IGpuBuffer B, int size)
-    {
-        ThrowIfDisposed();
-        // log10(x) = log(x) / log(10)
-        Log(A, B, size);
-        Scale(B, B, 1.0f / 2.302585092994046f, size);
-    }
-
-    /// <summary>
     /// Negate: B = -A
     /// </summary>
     public void Negate(IGpuBuffer A, IGpuBuffer B, int size)

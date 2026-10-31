@@ -55,6 +55,7 @@ public sealed class MetalShaderCompilationTests
         yield return ("FlashDecode", () => MetalKernels.FlashDecodeKernels, false);
         yield return ("IoULoss", () => MetalKernels.IoULossKernels, false);
         yield return ("AddActivation", () => MetalBackend.AddActivationSource, false);
+        yield return ("FusedComposites", () => MetalBackend.FusedCompositesSource, true);
         yield return ("Recurrence", () => MetalRecurrenceKernels.Source, false);
         yield return ("FusedAdvancedKernels", () => MetalFusedAdvancedKernels.Source, false);
         yield return ("Ann", () => MetalAnnKernels.Source, false);

@@ -391,17 +391,6 @@ public sealed partial class MetalBackend
     }
 
     /// <summary>
-    /// Softplus backward
-    /// </summary>
-    public void SoftplusBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
-    {
-        ThrowIfDisposed();
-        // d/dx softplus(x) = sigmoid(x)
-        Sigmoid(input, gradInput, size);
-        Multiply(gradOutput, gradInput, gradInput, size);
-    }
-
-    /// <summary>
     /// Hardswish backward
     /// </summary>
     public void HardswishBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)

@@ -5,16 +5,6 @@
 
 
 composed HipBackend.ScaledDotProductAttentionBackward #1638
-composed MetalBackend.CrossEntropyBackward #1638
-composed MetalBackend.CsrSpMMBias #1638
-composed MetalBackend.Exp10 #1638
-composed MetalBackend.Exp2 #1638
-composed MetalBackend.ExpM1 #1638
-composed MetalBackend.Log10 #1638
-composed MetalBackend.Log1P #1638
-composed MetalBackend.Log2 #1638
-composed MetalBackend.MseBackward #1638
-composed MetalBackend.SoftplusBackward #1638
 composed WebGpuBackend.ApplyMelFilterbank #1638
 composed WebGpuBackend.FFT2D #1638
 composed WebGpuBackend.RFFT #1638

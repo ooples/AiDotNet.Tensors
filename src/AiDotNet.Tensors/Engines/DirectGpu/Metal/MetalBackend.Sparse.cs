@@ -200,17 +200,6 @@ public sealed partial class MetalBackend
     }
 
     /// <summary>
-    /// Fused CSR SpMM with bias.
-    /// </summary>
-    public void CsrSpMMBias(IGpuBuffer csrValues, IGpuBuffer csrColIndices, IGpuBuffer csrRowPointers,
-        IGpuBuffer denseB, IGpuBuffer bias, IGpuBuffer output, int M, int K, int N, int nnz)
-    {
-        ThrowIfDisposed();
-        CsrSpMM(csrValues, csrColIndices, csrRowPointers, denseB, output, M, K, N, nnz);
-        BiasAdd(output, bias, output, M, N);
-    }
-
-    /// <summary>
     /// Scatter-add for graph edges.
     /// </summary>
     public void ScatterAddEdges(IGpuBuffer input, IGpuBuffer sourceIndices, IGpuBuffer targetIndices,

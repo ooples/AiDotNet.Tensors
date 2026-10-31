@@ -1409,66 +1409,12 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     }
 
     /// <summary>
-    /// Base-2 exponential: B = 2^A
-    /// </summary>
-    public void Exp2(IGpuBuffer A, IGpuBuffer B, int size)
-    {
-        ThrowIfDisposed();
-        // Use exp(A * ln(2))
-        var ln2 = 0.693147180559945f;
-        Scale(A, B, ln2, size);
-        Exp(B, B, size);
-    }
-
-    /// <summary>
-    /// Base-10 exponential: B = 10^A
-    /// </summary>
-    public void Exp10(IGpuBuffer A, IGpuBuffer B, int size)
-    {
-        ThrowIfDisposed();
-        // Use exp(A * ln(10))
-        var ln10 = 2.302585092994046f;
-        Scale(A, B, ln10, size);
-        Exp(B, B, size);
-    }
-
-    /// <summary>
-    /// Expm1: B = exp(A) - 1
-    /// </summary>
-    public void ExpM1(IGpuBuffer A, IGpuBuffer B, int size)
-    {
-        ThrowIfDisposed();
-        Exp(A, B, size);
-        AddScalar(B, B, -1.0f, size);
-    }
-
-    /// <summary>
     /// Natural log: B = log(A)
     /// </summary>
     public void Log(IGpuBuffer A, IGpuBuffer B, int size)
     {
         ThrowIfDisposed();
         ExecuteUnaryOp("log_kernel", A, B, size, _elementWiseLibrary);
-    }
-
-    /// <summary>
-    /// Base-2 log: B = log2(A)
-    /// </summary>
-    public void Log2(IGpuBuffer A, IGpuBuffer B, int size)
-    {
-        ThrowIfDisposed();
-        Log(A, B, size);
-        Scale(B, B, 1.0f / 0.693147180559945f, size);
-    }
-
-    /// <summary>
-    /// Log1p: B = log(1 + A)
-    /// </summary>
-    public void Log1P(IGpuBuffer A, IGpuBuffer B, int size)
-    {
-        ThrowIfDisposed();
-        AddScalar(A, B, 1.0f, size);
-        Log(B, B, size);
     }
 
     /// <summary>
