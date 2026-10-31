@@ -7869,7 +7869,10 @@ KERNEL VARIANTS (A/B testing):
                 pool2.SetArg(a2++, outWidth);
                 pool2.SetArg(a2, indices != null ? 1 : 0);
                 // No local memory and no reqd_work_group_size: any group the compiled kernel admits works.
-                int local = (int)Math.Max(1UL, Math.Min(256UL, pool2.MaxWorkGroupSize));
+                // Within the compiled kernel's group limit and the device's first-dimension limit.
+                ulong[] itemLimits = _context?.MaxWorkItemSizes ?? Array.Empty<ulong>();
+                ulong xLimit = itemLimits.Length > 0 && itemLimits[0] > 0 ? itemLimits[0] : 256UL;
+                int local = (int)Math.Max(1UL, Math.Min(Math.Min(256UL, pool2.MaxWorkGroupSize), xLimit));
                 pool2.Execute1D(RoundUpToMultiple(checked((int)pairs), local), local);
                 return;
             }

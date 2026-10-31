@@ -65,7 +65,8 @@ public sealed class OpenClWinogradFilterCacheTests
         var args = new TunedConv2DArgs(xb, wb, yb, b, c, 2, 2, k, 2, 2, 3, 3, 1, 1, 1, 1, 1, 1);
         var route = (AiDotNet.Tensors.Helpers.Autotune.TunedKernels.ITunedKernelCandidate<TunedConv2DArgs>)
             backend.Conv2DForwardSlot.Candidate("opencl.conv2d.small_map_gemm");
-        Skip.If(!route.IsApplicable(args.Shape()), "The small-map GEMM's kernels did not compile.");
+        // On an available backend the route's kernels must have compiled: a skip here would hide that failure.
+        Assert.True(route.IsApplicable(args.Shape()), "the small-map GEMM is not applicable: its kernels did not compile");
         var key = new object();
 
         void RunAt(int version)
@@ -83,6 +84,53 @@ public sealed class OpenClWinogradFilterCacheTests
         // A new version gathers again.
         RunAt(2);
         AssertClose(Reference2x2(x, w2, b, c, k), backend.DownloadBuffer(yb));
+    }
+
+    [SkippableFact]
+    public void OpenCl_SmallMapGemm_KeysTheGatheredWeightsByLayout()
+    {
+        // A 1 x 2 and a 2 x 1 map with the same weights and version gather to matrices of equal size but different
+        // contents; the second must not be served the first's.
+        using var backend = new OpenClBackend();
+        Skip.IfNot(backend.IsAvailable, "OpenCL is not available.");
+        const int b = 2, c = 4, k = 3;
+        float[] x = Values(b * c * 2, 7), w = Values(k * c * 9, 8);
+        using var xb = backend.AllocateBuffer(x);
+        using var wb = backend.AllocateBuffer(w);
+        using var yb = backend.AllocateBuffer(b * k * 2);
+        var route = (AiDotNet.Tensors.Helpers.Autotune.TunedKernels.ITunedKernelCandidate<TunedConv2DArgs>)
+            backend.Conv2DForwardSlot.Candidate("opencl.conv2d.small_map_gemm");
+        var key = new object();
+        foreach (var (h, wd) in new[] { (1, 2), (2, 1), (1, 2) })
+        {
+            var args = new TunedConv2DArgs(xb, wb, yb, b, c, h, wd, k, h, wd, 3, 3, 1, 1, 1, 1, 1, 1);
+            Assert.True(route.IsApplicable(args.Shape()), $"the small-map GEMM is not applicable to {h} x {wd}");
+            using (ConvWeightIdentity.Enter(key, 1)) route.Execute(args);
+            backend.Synchronize();
+            AssertClose(ReferenceSmall(x, w, b, c, k, h, wd), backend.DownloadBuffer(yb));
+        }
+    }
+
+    private static float[] ReferenceSmall(float[] x, float[] w, int b, int c, int k, int h, int wd)
+    {
+        var y = new float[b * k * h * wd];
+        for (int n = 0; n < b; n++)
+            for (int o = 0; o < k; o++)
+                for (int i = 0; i < h; i++)
+                    for (int j = 0; j < wd; j++)
+                    {
+                        double acc = 0;
+                        for (int ci = 0; ci < c; ci++)
+                            for (int u = 0; u < 3; u++)
+                                for (int v = 0; v < 3; v++)
+                                {
+                                    int ih = i - 1 + u, iw = j - 1 + v;
+                                    if (ih < 0 || ih >= h || iw < 0 || iw >= wd) continue;
+                                    acc += (double)x[((n * c + ci) * h + ih) * wd + iw] * w[((o * c + ci) * 3 + u) * 3 + v];
+                                }
+                        y[((n * k + o) * h + i) * wd + j] = (float)acc;
+                    }
+        return y;
     }
 
     private static float[] Reference2x2(float[] x, float[] w, int b, int c, int k)

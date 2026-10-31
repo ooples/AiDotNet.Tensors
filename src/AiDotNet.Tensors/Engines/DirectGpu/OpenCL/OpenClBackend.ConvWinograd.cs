@@ -220,10 +220,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         private sealed class WinogradFilterEntry
         {
-            internal WinogradFilterEntry(OpenClBackend owner, IGpuBuffer u, int version, int outC, int inC, long bytes)
+            internal WinogradFilterEntry(OpenClBackend owner, IGpuBuffer u, int version, int outC, int inC, long bytes,
+                string layout)
             {
-                Owner = owner; U = u; Version = version; OutC = outC; InC = inC; Bytes = bytes;
+                Owner = owner; U = u; Version = version; OutC = outC; InC = inC; Bytes = bytes; Layout = layout;
             }
+
+            // What else the transform depends on beyond the weights and their sizes ("" for a Winograd transform; the
+            // small-map gather's spatial geometry, which a 1 x 2 and a 2 x 1 map share sizes without sharing).
+            internal string Layout { get; }
 
             internal OpenClBackend Owner { get; }
             internal IGpuBuffer U { get; }
@@ -240,14 +245,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             }
         }
 
-        private IGpuBuffer? GetCachedWinogradFilter(int points, int outC, int inC)
+        private IGpuBuffer? GetCachedWinogradFilter(int points, int outC, int inC, string layout = "")
         {
             if (!ConvWeightIdentity.TryGet(out var key, out int version)) return null;
             lock (_winogradFilterLock)
             {
                 DrainRetiredWinogradFilters();
                 if (WinogradFilterTable(points).TryGetValue(key, out var entry) && entry.Version == version && entry.OutC == outC
-                    && entry.InC == inC)
+                    && entry.InC == inC && string.Equals(entry.Layout, layout, StringComparison.Ordinal))
                     return entry.U;
             }
             return null;
@@ -277,7 +282,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
 
         // True when the cache took ownership of u.
-        private bool StoreWinogradFilter(IGpuBuffer u, int points, int outC, int inC)
+        private bool StoreWinogradFilter(IGpuBuffer u, int points, int outC, int inC, string layout = "")
         {
             if (!ConvWeightIdentity.TryGet(out var key, out int version)) return false;
             long bytes = (long)points * outC * inC * sizeof(float);
@@ -293,7 +298,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     stale.U.Dispose();
                 }
                 if (System.Threading.Interlocked.Read(ref _winogradFilterBytes) + bytes > WinogradFilterCacheBudgetBytes) return false;
-                var added = new WinogradFilterEntry(this, u, version, outC, inC, bytes);
+                var added = new WinogradFilterEntry(this, u, version, outC, inC, bytes, layout);
                 table.Add(key, added);
                 _winogradFilterLive.Add(new WeakReference<WinogradFilterEntry>(added));
                 System.Threading.Interlocked.Add(ref _winogradFilterBytes, bytes);

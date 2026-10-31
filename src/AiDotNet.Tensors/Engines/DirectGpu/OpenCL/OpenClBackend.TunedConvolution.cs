@@ -272,7 +272,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             // Inference reuses the gathered weights by weight identity and version (the gather reads the filter scattered
             // and writes (H x W)^2 / (KH x KW) of its size: 2.6 ms of a 3 ms call for 512 channels).
             IGpuBuffer? owned = null;
-            IGpuBuffer big = GetCachedWinogradFilter(SmallMapWeightPoints, cols, k) ?? (owned = AllocateBuffer(checked(k * cols)));
+            // The gather depends on the spatial geometry too: a 1 x 2 and a 2 x 1 map have equal sizes, different matrices.
+            string layout = string.Join(",", a.InHeight, a.InWidth, a.OutHeight, a.OutWidth, a.KernelH, a.KernelW,
+                a.StrideH, a.StrideW, a.PadH, a.PadW);
+            IGpuBuffer big = GetCachedWinogradFilter(SmallMapWeightPoints, cols, k, layout)
+                ?? (owned = AllocateBuffer(checked(k * cols)));
             try
             {
                 if (owned is not null)
@@ -287,7 +291,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     weights.SetArg(arg++, a.PadH); weights.SetArg(arg++, a.PadW);
                     weights.SetArg(arg++, a.StrideH); weights.SetArg(arg, a.StrideW);
                     weights.Execute1D(RoundUpToMultiple(k * cols, CenterTapGatherGroupSize), CenterTapGatherGroupSize);
-                    if (StoreWinogradFilter(owned, SmallMapWeightPoints, cols, k)) owned = null;
+                    if (StoreWinogradFilter(owned, SmallMapWeightPoints, cols, k, layout)) owned = null;
                 }
                 SmallMapGemm(a, big, k, cols, ohw);
             }

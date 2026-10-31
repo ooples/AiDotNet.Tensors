@@ -88,13 +88,23 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         // inconclusive by CLBlast's host-time noise), from paired timings on gfx1012: the split-K GEMM took a half to a
         // quarter of CLBlast's time on a transformer's tall projections (8320 x {192, 576, 768} x {192, 768}: 283 vs 1028,
         // 856 vs 1861, 1136 vs 2348, 1177 vs 2823 us), and the skinny GEMM half on a deep linear layer over a small batch
-        // (32 x 4096 x 4096: 432 vs 835 us). Anything else keeps the reference.
+        // (32 x 4096 x 4096: 432 vs 835 us). Anything else keeps the reference, square products among them: split-K took
+        // 1.16-1.37x CLBlast's time on the large ones (1024 x 1024 x 1024 and up).
         internal static IReadOnlyList<string>? GemmUntunedPreference(int m, int n, int k)
         {
-            if (m <= SkinnyGemmMaxRows && n % SkinnyVectorWidth == 0 && k >= 1024) return s_gemmPreferSkinny;
-            if (m >= 1024 && n <= 1024 && k <= 1024) return s_gemmPreferSplitK;
+            if (m <= SkinnyGemmMaxRows && n % SkinnyVectorWidth == 0 && k >= SkinnyPreferredMinDepth) return s_gemmPreferSkinny;
+            if (m >= SplitKPreferredMinRows && n <= SplitKPreferredMaxColumns && k <= SplitKPreferredMaxDepth)
+                return s_gemmPreferSplitK;
             return null;
         }
+
+        // The skinny GEMM's regime: a deep K (32 x 4096 x 512 stayed CLBlast's, 118 vs 176 us).
+        private const int SkinnyPreferredMinDepth = 1024;
+
+        // The split-K regime: a tall product no wider and no deeper than the widest measured winner (768).
+        private const int SplitKPreferredMinRows = 1024;
+        private const int SplitKPreferredMaxColumns = 768;
+        private const int SplitKPreferredMaxDepth = 768;
 
         // C[M x N] = A[M x K] * B[K x N] through gemm_skinny_splitk (M <= SkinnyGemmMaxRows, N a multiple of
         // SkinnyVectorWidth), the planes summed by gemm_splitk_reduce.
