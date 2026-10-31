@@ -378,6 +378,9 @@ public sealed class OpenClTunedKernelTests
         (1, 3, 8, 8, 4, 3, 1, 1, 1), (2, 4, 9, 7, 5, 3, 1, 0, 1), (1, 8, 6, 6, 3, 1, 1, 0, 1),
         (2, 3, 11, 10, 2, 5, 2, 2, 1), (1, 2, 12, 12, 3, 3, 1, 2, 2), (3, 5, 7, 9, 6, 3, 2, 1, 1),
         (2, 6, 5, 4, 7, 1, 1, 0, 1),   // a 1x1 convolution over a batch: the batch-shared pointwise route
+        // Few (tile, output channel) groups over many channels: fused Winograd splits the channels (2 layers of 40 and
+        // 32; 3 layers of 40, 40 and 20) and sums the partial outputs before the epilogue.
+        (2, 72, 2, 2, 40, 3, 1, 1, 1), (3, 100, 3, 5, 9, 3, 1, 1, 1),
     };
 
     [SkippableFact]

@@ -19,7 +19,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels
     {
         internal const string Forward = "wino_f23_fused_forward";
 
-        internal static string[] GetKernelNames() => new[] { Forward };
+        internal const string SplitReduce = "wino_f23_split_reduce";
+
+        internal static string[] GetKernelNames() => new[] { Forward, SplitReduce };
 
         internal const string Source = @"
 #define WF_BO 32
@@ -37,8 +39,13 @@ float conv_epilogue(float v, __global const float* bias, int channel, int epi)
 __kernel __attribute__((reqd_work_group_size(256, 1, 1)))
 void wino_f23_fused_forward(__global const float* restrict in, __global const float* restrict wt,
     __global float* restrict out, const int N, const int R, const int IH, const int IW, const int O, const int OH,
-    const int OW, const int pad, const int tilesH, const int tilesW, __global const float* bias, const int epi)
+    const int OW, const int pad, const int tilesH, const int tilesW, __global const float* bias, const int epi,
+    const int rChunk)
 {
+    // Work-group layer z reduces channels [z * rChunk, z * rChunk + rChunk) and writes its partial output plane z
+    // (the host then sums the planes and applies the epilogue, passing epi = 0 here); one layer is the whole sum.
+    const int rBegin = get_group_id(2) * rChunk, rEnd = min(R, rBegin + rChunk);
+    out += (long)get_group_id(2) * N * O * OH * OW;
     // U | V during the reduction; the epilogue reuses the first 16 x 16 x 32 floats.
     __local float sm[16 * WF_CK * WF_ULD + 16 * WF_CK * 32];
     __local float* us = sm;
@@ -73,12 +80,12 @@ void wino_f23_fused_forward(__global const float* restrict in, __global const fl
     float acc[8][8];
     for (int i = 0; i < 8; i++) for (int j = 0; j < 8; j++) acc[i][j] = 0.0f;
 
-    const int steps = (R + WF_CK - 1) / WF_CK;
+    const int steps = (rEnd - rBegin + WF_CK - 1) / WF_CK;
     // The next step's patch and filter are read into registers before this step's products, so the global loads
     // overlap the arithmetic (one local buffer; the barriers order the stores against the reads).
     float d[16], g[9];
-    #define WF_LOAD(R0) {         const int r_ = (R0) + lc;         const uint m_ = r_ < R ? pm : 0u;         __global const float* src_ = in + inOff + (long)r_ * chanStride;         for (int i = 0; i < 4; i++)             for (int j = 0; j < 4; j++) d[i * 4 + j] = ((m_ >> (i * 4 + j)) & 1u) ? src_[i * IW + j] : 0.0f;         const int wr_ = (R0) + fr, wo_ = o0 + fo;         if (wr_ < R && wo_ < O) { __global const float* w_ = wt + ((long)wo_ * R + wr_) * 9; for (int q = 0; q < 9; q++) g[q] = w_[q]; }         else { for (int q = 0; q < 9; q++) g[q] = 0.0f; } }
-    if (steps > 0) WF_LOAD(0)
+    #define WF_LOAD(R0) {         const int r_ = (R0) + lc;         const uint m_ = r_ < rEnd ? pm : 0u;         __global const float* src_ = in + inOff + (long)r_ * chanStride;         for (int i = 0; i < 4; i++)             for (int j = 0; j < 4; j++) d[i * 4 + j] = ((m_ >> (i * 4 + j)) & 1u) ? src_[i * IW + j] : 0.0f;         const int wr_ = (R0) + fr, wo_ = o0 + fo;         if (wr_ < rEnd && wo_ < O) { __global const float* w_ = wt + ((long)wo_ * R + wr_) * 9; for (int q = 0; q < 9; q++) g[q] = w_[q]; }         else { for (int q = 0; q < 9; q++) g[q] = 0.0f; } }
+    if (steps > 0) WF_LOAD(rBegin)
     for (int step = 0; step < steps; step++)
     {
         // V = B^T d B, B^T = [[1,0,-1,0],[0,1,1,0],[0,-1,1,0],[0,1,0,-1]].
@@ -122,7 +129,7 @@ void wino_f23_fused_forward(__global const float* restrict in, __global const fl
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);
-        if (step + 1 < steps) WF_LOAD((step + 1) * WF_CK)
+        if (step + 1 < steps) WF_LOAD(rBegin + (step + 1) * WF_CK)
         __local const float* ub = us + x * WF_CK * WF_ULD + oo;
         __local const float* vb = vs + x * WF_CK * 32 + pp;
         for (int r = 0; r < WF_CK; r++)
@@ -178,6 +185,16 @@ void wino_f23_fused_forward(__global const float* restrict in, __global const fl
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
+}
+// out[i] = the epilogue of the sum over s of partial[s][i], i < count, in split order; channel (i / hw) % O.
+__kernel void wino_f23_split_reduce(__global const float* restrict partial, __global float* restrict out,
+    const int count, const int splits, __global const float* bias, const int epi, const int hw, const int O)
+{
+    int i = get_global_id(0);
+    if (i >= count) return;
+    float sum = 0.0f;
+    for (int s = 0; s < splits; s++) sum += partial[(long)s * count + i];
+    out[i] = conv_epilogue(sum, bias, (i / hw) % O, epi);
 }
 ";
     }

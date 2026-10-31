@@ -151,14 +151,46 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             int tilesH = (a.OutHeight + 1) / 2, tilesW = (a.OutWidth + 1) / 2;
             int p = a.Batch * tilesH * tilesW;
-            var k = _kernelCache[Kernels.WinogradFusedKernels.Forward];
-            uint arg = 0;
-            k.SetArg(arg++, BufferHandle(a.Input)); k.SetArg(arg++, BufferHandle(a.Kernel)); k.SetArg(arg++, BufferHandle(a.Output));
-            k.SetArg(arg++, a.Batch); k.SetArg(arg++, a.InChannels); k.SetArg(arg++, a.InHeight); k.SetArg(arg++, a.InWidth);
-            k.SetArg(arg++, a.OutChannels); k.SetArg(arg++, a.OutHeight); k.SetArg(arg++, a.OutWidth); k.SetArg(arg++, a.PadH);
-            k.SetArg(arg++, tilesH); k.SetArg(arg++, tilesW);
-            k.SetArg(arg++, ConvEpilogueBias(a)); k.SetArg(arg++, ConvEpilogueFlags(a));
-            k.Execute2D(RoundUpToMultiple(p, 32) / 32 * 256, (a.OutChannels + 31) / 32, 256, 1);
+            int groups = ((p + 31) / 32) * ((a.OutChannels + 31) / 32);
+            int rChunk = WinogradFusedChannelChunk(groups, a.InChannels, (int)Math.Max(1u, _context?.MaxComputeUnits ?? 8u));
+            int splits = (a.InChannels + rChunk - 1) / rChunk;
+            int count = a.Batch * a.OutChannels * a.OutHeight * a.OutWidth;
+            IGpuBuffer? partial = splits > 1 ? AllocateBuffer(checked(splits * count)) : null;
+            try
+            {
+                var k = _kernelCache[Kernels.WinogradFusedKernels.Forward];
+                uint arg = 0;
+                k.SetArg(arg++, BufferHandle(a.Input)); k.SetArg(arg++, BufferHandle(a.Kernel));
+                k.SetArg(arg++, BufferHandle(partial ?? a.Output));
+                k.SetArg(arg++, a.Batch); k.SetArg(arg++, a.InChannels); k.SetArg(arg++, a.InHeight); k.SetArg(arg++, a.InWidth);
+                k.SetArg(arg++, a.OutChannels); k.SetArg(arg++, a.OutHeight); k.SetArg(arg++, a.OutWidth); k.SetArg(arg++, a.PadH);
+                k.SetArg(arg++, tilesH); k.SetArg(arg++, tilesW);
+                k.SetArg(arg++, ConvEpilogueBias(a)); k.SetArg(arg++, partial is null ? ConvEpilogueFlags(a) : 0);
+                k.SetArg(arg++, rChunk);
+                k.Execute3D(RoundUpToMultiple(p, 32) / 32 * 256, (a.OutChannels + 31) / 32, splits, 256, 1, 1);
+                if (partial is null) return;
+                var reduce = _kernelCache[Kernels.WinogradFusedKernels.SplitReduce];
+                reduce.SetArg(0, BufferHandle(partial)); reduce.SetArg(1, BufferHandle(a.Output));
+                reduce.SetArg(2, count); reduce.SetArg(3, splits);
+                reduce.SetArg(4, ConvEpilogueBias(a)); reduce.SetArg(5, ConvEpilogueFlags(a));
+                reduce.SetArg(6, a.OutHeight * a.OutWidth); reduce.SetArg(7, a.OutChannels);
+                reduce.Execute1D(RoundUpToMultiple(count, 256), 256);
+            }
+            finally
+            {
+                partial?.Dispose();
+            }
+        }
+
+        // The channels each work-group layer of the fused Winograd reduces: all of them, unless the (tile, output channel)
+        // grid leaves the device underfilled, as VGG-11's 2 x 2 and 4 x 4 maps (16 and 64 groups at batch 32) and
+        // DenseNet-121's growth convolutions (4 and 16) did. Then the channels are split, at least 32 per layer, until
+        // the grid covers about four groups per compute unit. A multiple of the kernel's 8-channel step.
+        internal static int WinogradFusedChannelChunk(int groups, int channels, int computeUnits)
+        {
+            int target = 4 * computeUnits;
+            int splits = Math.Max(1, Math.Min((target + groups - 1) / groups, channels / 32));
+            return RoundUpToMultiple((channels + splits - 1) / splits, 8);
         }
 
         // Batch 1 only (the slot admits it only there): y[Cout, L] = W[Cout, P] * col[P, L], col the input itself for a
