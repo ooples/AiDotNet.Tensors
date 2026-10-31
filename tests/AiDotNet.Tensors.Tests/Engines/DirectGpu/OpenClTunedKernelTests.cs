@@ -387,6 +387,10 @@ public sealed class OpenClTunedKernelTests
             source.Replace("\r\n", "\n"));
         Assert.Contains("#define SC_MAX_KW " + AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels.WinogradFusedKernels.SmallChannelMaxKernelWidth + "\n",
             source.Replace("\r\n", "\n"));
+        Assert.Contains("#define SC_WG " + AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels.WinogradFusedKernels.SmallChannelGroupSize + "\n",
+            source.Replace("\r\n", "\n"));
+        // Both small-channel kernels take their group size and staging stride from the macro.
+        Assert.DoesNotContain("reqd_work_group_size(64, 1, 1)", source.Substring(source.IndexOf("#define SC_WG", System.StringComparison.Ordinal)));
     }
 
     // (batch, Cin, H, W, Cout, k, stride, pad, dilation): Winograd's 3x3/s1, 1x1, 5x5, strided, dilated, batched.

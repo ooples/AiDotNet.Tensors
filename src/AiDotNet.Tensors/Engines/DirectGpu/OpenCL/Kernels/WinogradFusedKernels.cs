@@ -38,6 +38,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels
         /// <summary>The widest filter row conv2d_smallc loads at once (SC_MAX_KW in the source); the dispatcher admits no wider.</summary>
         internal const int SmallChannelMaxKernelWidth = 7;
 
+        /// <summary>The small-channel kernels' work-group size (SC_WG in the source: their reqd_work_group_size).</summary>
+        internal const int SmallChannelGroupSize = 64;
+
         internal static string[] GetKernelNames() => new[] { Forward, SplitReduce, SmallChannel, SmallChannel3x3, CenterTapGather };
 
         internal const string Source = @"
@@ -219,8 +222,9 @@ __kernel void wino_f23_split_reduce(__global const float* restrict partial, __gl
 // the 16 x C x KH x KW weight reads per pixel are local broadcasts, not global loads; C x KH x KW is at most 196.
 #define SC_MAX_TAPS 196
 #define SC_MAX_KW 7
+#define SC_WG 64
 #define SC_OB 16
-__kernel __attribute__((reqd_work_group_size(64, 1, 1)))
+__kernel __attribute__((reqd_work_group_size(SC_WG, 1, 1)))
 void conv2d_smallc(__global const float* restrict in, __global const float* restrict wt, __global float* restrict out,
     const int N, const int C, const int IH, const int IW, const int O, const int OH, const int OW, const int KH,
     const int KW, const int SH, const int SW, const int PH, const int PW, const int DH, const int DW,
@@ -231,7 +235,7 @@ void conv2d_smallc(__global const float* restrict in, __global const float* rest
     const int pix = get_global_id(0);
     const int o0 = get_group_id(1) * SC_OB;
     const int taps = C * KH * KW;
-    for (int e = get_local_id(0); e < SC_OB * taps; e += 64)
+    for (int e = get_local_id(0); e < SC_OB * taps; e += SC_WG)
     {
         const int j = e / taps;
         ws[e] = o0 + j < O ? wt[(long)o0 * taps + e] : 0.0f;
@@ -289,7 +293,7 @@ __kernel void conv_center_tap_gather(__global const float* restrict w, __global 
 // conv2d_smallc for a 3 x 3 filter, unrolled: a channel's nine window values are loaded together, out-of-bounds taps
 // predicated to zero, before its products. In the general form each tap's load sat behind its bounds branches, so the
 // loads ran one at a time and the 3-channel stem took about three times its output's write time.
-__kernel __attribute__((reqd_work_group_size(64, 1, 1)))
+__kernel __attribute__((reqd_work_group_size(SC_WG, 1, 1)))
 void conv2d_smallc3(__global const float* restrict in, __global const float* restrict wt, __global float* restrict out,
     const int N, const int C, const int IH, const int IW, const int O, const int OH, const int OW, const int SH,
     const int SW, const int PH, const int PW, const int DH, const int DW, __global const float* bias, const int epi)
@@ -299,7 +303,7 @@ void conv2d_smallc3(__global const float* restrict in, __global const float* res
     const int pix = get_global_id(0);
     const int o0 = get_group_id(1) * SC_OB;
     const int taps = C * 9;
-    for (int e = get_local_id(0); e < SC_OB * taps; e += 64)
+    for (int e = get_local_id(0); e < SC_OB * taps; e += SC_WG)
     {
         const int j = e / taps;
         ws[e] = o0 + j < O ? wt[(long)o0 * taps + e] : 0.0f;

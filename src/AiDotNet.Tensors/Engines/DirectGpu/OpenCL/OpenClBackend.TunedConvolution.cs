@@ -266,8 +266,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 k.SetArg(18, ConvEpilogueBias(a)); k.SetArg(19, ConvEpilogueFlags(a));
             }
             const int block = Kernels.WinogradFusedKernels.SmallChannelBlock;
-            k.Execute2D(RoundUpToMultiple(checked(a.Batch * a.OutHeight * a.OutWidth), 64),
-                (a.OutChannels + block - 1) / block, 64, 1);
+            const int group = Kernels.WinogradFusedKernels.SmallChannelGroupSize;
+            k.Execute2D(RoundUpToMultiple(checked(a.Batch * a.OutHeight * a.OutWidth), group),
+                (a.OutChannels + block - 1) / block, group, 1);
         }
 
         private void Conv2DGeneric(in TunedConv2DArgs a)
