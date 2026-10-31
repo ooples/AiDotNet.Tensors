@@ -27634,6 +27634,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         int inner = 1;
                         for (int k = normAxis + 1; k < rank; k++) inner *= a.Shape._dims[k];
                         int total = outer * axisTotal * inner;
+                        if (total == 0)
+                        {
+                            // Nothing to copy, and no device buffer has zero length: the result is the empty tensor.
+                            int[] emptyShape = (int[])a.Shape._dims.Clone();
+                            emptyShape[normAxis] = axisTotal;
+                            var empty = new Tensor<T>(emptyShape);
+                            Autodiff.DifferentiableOps.RecordIfActive("Concat", empty, tensors,
+                                Autodiff.BackwardFunctions<T>.ConcatenateBackward, new object[] { normAxis });
+                            return empty;
+                        }
 
                         var outBuf = AllocateOutputBuffer(backend, total);
                         bool handedOff = false;
@@ -27645,6 +27655,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                                 var tensor = tensors[t];
                                 int tensorAxis = tensor.Shape._dims[normAxis];
                                 int slice = tensorAxis * inner;
+                                // A zero-width input (x[:, n:n]) adds nothing, and has no device buffer to read.
+                                if (tensorAxis == 0) continue;
                                 // A strided input comes back as an owned gather buffer. The copy below is only queued,
                                 // so the buffer returns to the pool after the queued work, not when this loop moves on.
                                 var input = GetOrAllocateBuffer(backend, tensor);
@@ -28197,6 +28209,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorSlice<T>(Tensor<T> tensor, int[] start, int[] length)
     {
+        // An empty box needs no kernel on any backend; the base validates it and returns the empty tensor.
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (start == null) throw new ArgumentNullException(nameof(start));
+        if (length == null) throw new ArgumentNullException(nameof(length));
+        if (start.Length == tensor._shape.Length && length.Length == tensor._shape.Length
+            && IsEmptySlice(tensor._shape, start, length))
+            return base.TensorSlice(tensor, start, length);
         if (IsTapeActive<T>())
         {
             // Under a tape the slice used to take the host path, which downloads the whole input: an LSTM reads each
