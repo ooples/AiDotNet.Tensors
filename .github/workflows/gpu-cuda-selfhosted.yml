@@ -10,8 +10,11 @@ name: GPU (CUDA, self-hosted)
 #
 # To enable it, register a self-hosted runner on a machine with an NVIDIA GPU and the CUDA driver and a CUDA 13
 # toolkit (its bin on the machine PATH, for NVRTC and cuBLAS), PowerShell 7 and Python 3 on the machine PATH; the job
-# installs the .NET SDK and cuDNN into its workspace), with the labels `self-hosted, gpu, cuda`, then set the repository variable
-# CUDA_RUNNER_ENABLED=true. Until the variable is set every job is skipped, so nothing waits for a runner that does
+# installs the .NET SDK and cuDNN into its workspace), with the labels `self-hosted, gpu, cuda` plus its architecture label,
+# `sm86` (RTX 30-series, the pull-request gate) or `sm75` (GTX 16-series / RTX 20-series), then set the repository variable
+# CUDA_RUNNER_ENABLED=true. A runner registered before the lane was split by architecture has only the first three labels and
+# matches no job: add its architecture label (Settings > Actions > Runners > the runner > Labels, or re-run config.cmd with
+# --labels self-hosted,gpu,cuda,sm86). Until the variable is set every job is skipped, so nothing waits for a runner that does
 # not exist. Pull requests from forks never run here: a self-hosted runner must not execute untrusted code.
 # One runner serves every pull request and a run takes over an hour, so the lane skips draft pull requests and any
 # pull request labelled `skip-gpu-ci` (for a change that cannot affect the GPU, such as comment-only edits to the
@@ -137,7 +140,9 @@ jobs:
         "Python packages (numpy, torch): $(& $py -I -c 'import numpy, torch; print(numpy.__version__, torch.__version__)')" |
           Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
 
+    # The harness steps below serve only the model-family step, which runs on SM86; the SM75 job skips them all.
     - name: Check out AiDotNet beside this checkout
+      if: matrix.arch == 'sm86'
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         repository: ooples/AiDotNet
@@ -150,6 +155,7 @@ jobs:
     # and MobileNetV2 training. Checked first, so a lane enabled without a harness that defines them fails in its first
     # minute with the fix in the message, not after the GPU suites.
     - name: Check the AiDotNet harness defines every model family
+      if: matrix.arch == 'sm86'
       run: |
         $program = Get-Content aidn/benchmarks/AiDotNet.PyTorchParity/Program.cs -Raw
         $families = 'mlp','cnn','lstm','transformer','gru','resnet18','resnet50','vgg11','mobilenetv2','densenet121','vit'
