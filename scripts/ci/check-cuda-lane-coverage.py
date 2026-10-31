@@ -13,14 +13,18 @@ import os
 import re
 import sys
 
-# A file that drives a GPU engine or backend directly.
-GPU_MARKER = re.compile(r"new DirectGpuTensorEngine\(|DirectGpuTensorEngineTestFixture|\bIsGpuAvailable\b|\bCudaBackend\b")
+# A file that drives a GPU engine or backend directly. Any reference to the engine type counts: a qualified, spaced
+# or target-typed construction ("new(...)" into a DirectGpuTensorEngine variable) drives it as much as "new X(".
+GPU_MARKER = re.compile(r"\bDirectGpuTensorEngine\b|DirectGpuTensorEngineTestFixture|\bIsGpuAvailable\b|\bCudaBackend\b")
 TEST_ATTRIBUTE = re.compile(r"\[(Fact|Theory|SkippableFact|SkippableTheory)\b")
 FILE_NAMESPACE = re.compile(r"^namespace\s+([\w.]+)\s*;", re.M)
-BLOCK_NAMESPACE = re.compile(r"^namespace\s+([\w.]+)\s*$", re.M)
+BLOCK_NAMESPACE = re.compile(r"^namespace\s+([\w.]+)\s*(?:\{|$)", re.M)
 CLASS = re.compile(r"^(?P<indent>[ \t]*)(?:(?:public|internal|sealed|static|partial|abstract)\s+)*class\s+(?P<name>\w+)", re.M)
-# Classes the filter excludes by category anyway (benchmarks and perf gates).
-EXCLUDED_CATEGORY = re.compile(r"\[Trait\(\s*\"Category\"\s*,\s*\"(Benchmark|Performance)\"\s*\)\]")
+# Classes the filter excludes by category: benchmarks and perf gates, and tests bound to another backend's lane
+# (RequiresOpenCL runs on the OpenCL lanes; counting it here would claim CUDA coverage it does not give).
+# Comments: a file that only mentions the engine in prose ("picked up by DirectGpuTensorEngine") does not drive it.
+COMMENT = re.compile(r"//[^\n]*|/\*.*?\*/", re.S)
+EXCLUDED_CATEGORY = re.compile(r"\[Trait\(\s*\"Category\"\s*,\s*\"(Benchmark|Performance|RequiresOpenCL)\"\s*\)\]")
 
 
 def top_level_classes(text):
@@ -59,7 +63,7 @@ def main():
                 path = os.path.join(directory, file)
                 with open(path, encoding="utf-8-sig") as handle:
                     text = handle.read()
-                if not GPU_MARKER.search(text) or not TEST_ATTRIBUTE.search(text):
+                if not GPU_MARKER.search(COMMENT.sub("", text)) or not TEST_ATTRIBUTE.search(text):
                     continue
                 for name, preamble, body in top_level_classes(text):
                     if not TEST_ATTRIBUTE.search(body) or EXCLUDED_CATEGORY.search(preamble.split("}")[-1]):

@@ -142,39 +142,48 @@ public class DeclaredConvVariantRouteTests
         }
     }
 
+    // The (variant, shape, schedule) cases a schedule does NOT lower: the depthwise weight gradient's split-4 schedule
+    // divides only shape 2's reduction. Every other case must lower. Declared here rather than read from the lowering
+    // predicate, so a lowering regression fails a case instead of silently removing it from the theory data.
+    private static readonly HashSet<(DeclaredConvVariant, int, int)> NotLowered = new()
+    {
+        (DeclaredConvVariant.DepthwiseBackwardWeights, 0, 1),
+        (DeclaredConvVariant.DepthwiseBackwardWeights, 1, 1),
+    };
+
     public static IEnumerable<object[]> ScheduleCases()
     {
         foreach (DeclaredConvVariant v in Enum.GetValues(typeof(DeclaredConvVariant)))
         {
-            bool depthwise = v <= DeclaredConvVariant.DepthwiseBackwardWeights;
-            int shapes = depthwise ? 3 : 2;
-            var schedules = CudaBackend.DeclaredConvVariantSchedules(v);
+            int shapes = v <= DeclaredConvVariant.DepthwiseBackwardWeights ? 3 : 2;
+            int schedules = CudaBackend.DeclaredConvVariantSchedules(v).Count;
             for (int shape = 0; shape < shapes; shape++)
-            {
-                var g = depthwise ? Depthwise(shape) : Transposed(shape);
-                var args = Args(v, g, null!, null!, null!);
-                // Only the shapes the schedule lowers: its slot never offers it the others, so there is nothing to run.
-                for (int schedule = 0; schedule < schedules.Count; schedule++)
-                    if (CudaBackend.DeclaredConvVariantLowers(v, args.Shape(), schedules[schedule]))
-                        yield return new object[] { (int)v, shape, schedule };
-            }
+                for (int schedule = 0; schedule < schedules; schedule++)
+                    yield return new object[] { (int)v, shape, schedule, !NotLowered.Contains((v, shape, schedule)) };
         }
     }
 
     /// <summary>
-    /// Every schedule the operator's slot registers, on every shape it admits, against the direct convolution. The
-    /// output starts filled, so an element the program fails to write cannot pass as a zero.
+    /// Every schedule the operator's slot registers, on every test shape: first that it lowers exactly the shapes it
+    /// is expected to (checked with or without a GPU), then, on each one it lowers, against the direct convolution.
+    /// The output starts filled, so an element the program fails to write cannot pass as a zero.
     /// </summary>
     [SkippableTheory]
     [MemberData(nameof(ScheduleCases))]
-    public void EveryAdmittedScheduleMatchesADirectConvolution(int variantIndex, int shape, int schedule)
+    public void EveryAdmittedScheduleMatchesADirectConvolution(int variantIndex, int shape, int schedule, bool lowers)
     {
         var variant = (DeclaredConvVariant)variantIndex;
+        var g = variant <= DeclaredConvVariant.DepthwiseBackwardWeights ? Depthwise(shape) : Transposed(shape);
+        var sc = CudaBackend.DeclaredConvVariantSchedules(variant)[schedule];
+        Assert.True(lowers == CudaBackend.DeclaredConvVariantLowers(variant,
+                Args(variant, g, NoBuffer, NoBuffer, NoBuffer).Shape(), sc),
+            $"{variant} {sc.Suffix} shape {shape}: expected the schedule {(lowers ? "to lower" : "not to lower")} it");
+        // A schedule that does not lower the shape is never offered it by the slot, so there is nothing to run.
+        if (!lowers) return;
+
         using var backend = OpenBackendOrSkip();
         Skip.IfNot(backend.DeclaredKernelsEnabled,
             "The declared route is not released on this architecture (see AIDOTNET_DECLARED_KERNELS_ARCH).");
-        var g = variant <= DeclaredConvVariant.DepthwiseBackwardWeights ? Depthwise(shape) : Transposed(shape);
-        var sc = CudaBackend.DeclaredConvVariantSchedules(variant)[schedule];
         var (a, b, expected) = Problem(variant, g);
         using var ba = backend.AllocateBuffer(a);
         using var bb = backend.AllocateBuffer(b);

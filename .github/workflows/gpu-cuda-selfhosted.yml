@@ -120,15 +120,15 @@ jobs:
         FullyQualifiedName~.CpuDoubleReductionTests.|
         FullyQualifiedName~.GpuEngineScalarReductionDispatchTests.|
         FullyQualifiedName~.SoftmaxForwardGpuReproTests.|
-        FullyQualifiedName~.XLstmDeviceTrainingTests.|
         FullyQualifiedName~.TimeStretchStageDiffTests.|
         FullyQualifiedName~.EmptyBroadcastTests.|
+        FullyQualifiedName~.GpuPinnedLifetimeTests.|
         FullyQualifiedName~.EmptyBroadcastGpuTests.|
         FullyQualifiedName~.GridSampleBackwardAlignCornersTests.|
         FullyQualifiedName~.DirectGpuLinalgRoutingTests.|
         FullyQualifiedName~.StreamingTensorJournalTests.|
         FullyQualifiedName~.TensorCowInferenceReadPathTests.|
-        FullyQualifiedName~.TensorGpuCachePhysicalTests.)&Category!=Benchmark&Category!=Performance
+        FullyQualifiedName~.TensorGpuCachePhysicalTests.)&Category!=Benchmark&Category!=Performance&Category!=RequiresOpenCL
     defaults:
       run:
         shell: pwsh
