@@ -292,12 +292,13 @@ __kernel void conv_center_tap_gather(__global const float* restrict w, __global 
     const int c = i / O, o = i - c * O;
     wcT[i] = w[((long)o * C + c) * taps + centre];
 }
-// A stride-1 convolution over a map so small that every output reads every input pixel through some tap (a 2 x 2 map
-// through a 3 x 3 filter padded by one) is one linear map per image: y[n][(p, o)] = sum over (c, q) of x[n][(c, q)] *
-// big[(c, q)][(p, o)], big = w[o][c][kh][kw] at kh = qh - ph + PH, kw = qw - pw + PW (zero off the filter).
+// A convolution over a map so small that every output reads every input pixel through some tap (a 2 x 2 map through a
+// 3 x 3 filter padded by one, at stride 1 or 2) is one linear map per image: y[n][(p, o)] = sum over (c, q) of
+// x[n][(c, q)] * big[(c, q)][(p, o)], big = w[o][c][kh][kw] at kh = qh - ph * SH + PH, kw = qw - pw * SW + PW (zero
+// off the filter).
 __kernel void conv_small_map_weights(__global const float* restrict w, __global float* restrict big, const int O,
     const int C, const int KH, const int KW, const int H, const int W, const int OH, const int OW, const int PH,
-    const int PW)
+    const int PW, const int SH, const int SW)
 {
     const long i = get_global_id(0);
     const int hw = H * W, ohw = OH * OW;
@@ -308,7 +309,7 @@ __kernel void conv_small_map_weights(__global const float* restrict w, __global 
     const int c = (int)(row / hw), q = (int)(row - (long)c * hw);
     const int p = col / O, o = col - p * O;
     const int qh = q / W, qw = q - qh * W, ph = p / OW, pw = p - ph * OW;
-    const int kh = qh - ph + PH, kw = qw - pw + PW;
+    const int kh = qh - ph * SH + PH, kw = qw - pw * SW + PW;
     big[i] = (kh >= 0 && kh < KH && kw >= 0 && kw < KW) ? w[(((long)o * C + c) * KH + kh) * KW + kw] : 0.0f;
 }
 // y[n][o][p] = the epilogue of t[n][p][o]: the small-map GEMM's (output pixel, channel) columns back to NCHW.

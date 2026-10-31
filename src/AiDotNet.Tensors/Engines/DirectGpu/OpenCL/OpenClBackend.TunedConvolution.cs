@@ -243,15 +243,25 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         // size times (H x W)^2 / (KH x KW), so a 2 x 2 map through a 3 x 3 filter costs 16 / 9 of the weights.
         private const int SmallMapMaxSide = 2;
 
-        // (batch, C, H, W, O, kH, kW, sH, sW, pH, pW, dH, dW, OH, OW): a map of at most 2 x 2 (more than one pixel; one is
-        // the centre-tap route), stride 1, undilated, same-size output, padded so every (output, input) pixel pair falls on
-        // a filter tap: H - 1 <= pH <= kH - H, and likewise across.
+        // (batch, C, H, W, O, kH, kW, sH, sW, pH, pW, dH, dW, OH, OW): an input map of at most 2 x 2 with more than one
+        // pixel (one is the centre-tap route), undilated, every (output, input) pixel pair on a filter tap:
+        // 0 <= qh - ph * sH + pH < kH for every input row qh and output row ph, and likewise across.
         private static bool AdmitsSmallMapGemm(TunedShape shape)
             => shape[2] <= SmallMapMaxSide && shape[3] <= SmallMapMaxSide && shape[2] * shape[3] > 1
-                && shape[7] == 1 && shape[8] == 1 && shape[11] == 1 && shape[12] == 1
-                && shape[13] == shape[2] && shape[14] == shape[3]
-                && shape[9] >= shape[2] - 1 && shape[9] <= shape[5] - shape[2]
-                && shape[10] >= shape[3] - 1 && shape[10] <= shape[6] - shape[3];
+                && shape[11] == 1 && shape[12] == 1
+                && EveryPairOnATap(shape[2], shape[13], shape[7], shape[9], shape[5])
+                && EveryPairOnATap(shape[3], shape[14], shape[8], shape[10], shape[6]);
+
+        private static bool EveryPairOnATap(int inSize, int outSize, int stride, int pad, int kernel)
+        {
+            for (int q = 0; q < inSize; q++)
+                for (int p = 0; p < outSize; p++)
+                {
+                    int tap = q - p * stride + pad;
+                    if (tap < 0 || tap >= kernel) return false;
+                }
+            return true;
+        }
 
         // t[n][(p, o)] = x[n][(c, q)] * big[(c, q)][(p, o)] as one GEMM over the gathered weights, then the scatter to NCHW
         // with the epilogue.
@@ -274,7 +284,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     weights.SetArg(arg++, a.KernelH); weights.SetArg(arg++, a.KernelW);
                     weights.SetArg(arg++, a.InHeight); weights.SetArg(arg++, a.InWidth);
                     weights.SetArg(arg++, a.OutHeight); weights.SetArg(arg++, a.OutWidth);
-                    weights.SetArg(arg++, a.PadH); weights.SetArg(arg, a.PadW);
+                    weights.SetArg(arg++, a.PadH); weights.SetArg(arg++, a.PadW);
+                    weights.SetArg(arg++, a.StrideH); weights.SetArg(arg, a.StrideW);
                     weights.Execute1D(RoundUpToMultiple(k * cols, CenterTapGatherGroupSize), CenterTapGatherGroupSize);
                     if (StoreWinogradFilter(owned, SmallMapWeightPoints, cols, k)) owned = null;
                 }

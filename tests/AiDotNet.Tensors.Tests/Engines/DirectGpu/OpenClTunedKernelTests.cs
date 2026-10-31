@@ -412,6 +412,8 @@ public sealed class OpenClTunedKernelTests
         (3, 20, 1, 1, 9, 3, 1, 1, 1), (2, 6, 1, 1, 5, 5, 1, 2, 1),
         // 2 x 2 and 2 x 1 maps through a half-padded 3 x 3 filter: every output reads every input (the small-map GEMM).
         (3, 7, 2, 2, 11, 3, 1, 1, 1), (2, 5, 2, 1, 6, 3, 1, 1, 1),
+        // The same at stride 2 into a 1 x 1 output (ResNet's last-stage downsampling 3 x 3 at a 32 x 32 input).
+        (2, 6, 2, 2, 7, 3, 2, 1, 1),
     };
 
     [SkippableFact]
@@ -485,8 +487,7 @@ public sealed class OpenClTunedKernelTests
             bool centerTap = h == 1 && w == 1 && oh == 1 && ow == 1 && k % 2 == 1 && p == k / 2 && d == 1;
             // The small-map GEMM admits a map of at most 2 x 2 (and more than one pixel) whose every output reads every
             // input through a tap: stride 1, undilated, same-size output, h - 1 <= p <= k - h and likewise across.
-            bool smallMap = h <= 2 && w <= 2 && h * w > 1 && s == 1 && d == 1 && oh == h && ow == w
-                && p >= h - 1 && p <= k - h && p >= w - 1 && p <= k - w;
+            bool smallMap = h <= 2 && w <= 2 && h * w > 1 && d == 1 && EveryPairOnATap(h, oh, s, p, k) && EveryPairOnATap(w, ow, s, p, k);
             Assert.Equal(backend.Conv2DForwardSlot.CandidateIds.Count, Applicable(backend.Conv2DForwardSlot, args.Shape()).Count
                 + (k > 7 ? 1 : 0) + (WinogradF23Pipeline.AdmitsShape(args.Shape()) ? 0 : 3) + (bt == 1 ? 0 : 1)
                 + (pointwise ? 0 : 1) + (pointwiseRb ? 0 : 1) + (smallChannel ? 0 : 1) + (centerTap ? 0 : 1) + (smallMap ? 0 : 1));
@@ -496,6 +497,14 @@ public sealed class OpenClTunedKernelTests
     // reference, on shapes that are not tile multiples. The skinny GEMM admits at most 32 rows over a multiple of 4
     // columns: one row tile over four K sub-lanes, two over two, three (a lane idle) and four over K slices, a partial
     // last column block.
+    private static bool EveryPairOnATap(int inSize, int outSize, int stride, int pad, int kernel)
+    {
+        for (int q = 0; q < inSize; q++)
+            for (int o = 0; o < outSize; o++)
+                if (q - o * stride + pad < 0 || q - o * stride + pad >= kernel) return false;
+        return true;
+    }
+
     // The GEMM slot's default for a product it could not settle by measurement: split-K for a transformer's tall
     // projections, the skinny GEMM for a deep linear layer over a small batch, the reference otherwise.
     [Theory]
