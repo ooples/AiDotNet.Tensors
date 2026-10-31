@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.145.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.144.2...v0.145.0) (2026-10-31)
+
+
+### ⚠ BREAKING CHANGES
+
+* on net462, net471 and netstandard2.0 the System.Runtime.Intrinsics Vector128/256/512 polyfill types (SimdCompat) are internal, and the Invoke(Vector128/256/512) overloads of AcoshOperatorDouble, AsinhOperatorDouble and AtanhOperatorDouble are removed from those targets. Both shipped publicly in 0.144.1.
+
+### Features
+
+* **compile:** batch-dynamic inference plans + compiled-vs-eager miscompile fixes (T-3) ([#1623](https://github.com/ooples/AiDotNet.Tensors/issues/1623)) ([f36f13e](https://github.com/ooples/AiDotNet.Tensors/commit/f36f13ef84ff5e551e0cc461f78e42bdc631c88b))
+* DLPack interop, ONNX exporter, public API tracking and package validation (T-4) (+1 combined) ([#1581](https://github.com/ooples/AiDotNet.Tensors/issues/1581)) ([94a333b](https://github.com/ooples/AiDotNet.Tensors/commit/94a333bb109b175b445a150b1b203956715b46ea))
+* **gpu:** device memory stats and TensorScope.Detach, with license headers 7, 9, 11/18 (combined) ([#1590](https://github.com/ooples/AiDotNet.Tensors/issues/1590)) ([88abbb4](https://github.com/ooples/AiDotNet.Tensors/commit/88abbb43f5905c1c939f9adace82037610c84542))
+
+
+### Bug Fixes
+
+* **api:** declare TunedKernelDecisionReason.Heuristic in the public API ([#1637](https://github.com/ooples/AiDotNet.Tensors/issues/1637)) ([e79ec80](https://github.com/ooples/AiDotNet.Tensors/commit/e79ec8031d2b776de08d11c91aadc63e4c075f27))
+* **cpu:** kernel-cache hits allocate nothing; weight packs sized to their depth ([#1633](https://github.com/ooples/AiDotNet.Tensors/issues/1633)) ([9a6d0b1](https://github.com/ooples/AiDotNet.Tensors/commit/9a6d0b1f744ad56f1f814b73356bf542e9a26dc5))
+* **cuda,vulkan:** CUDA-lane crashes and the Vulkan LSTM TDR — cuLinkCreate option lifetime, cublasDestroy sync during capture, LSTM sequence on parallel kernels ([#1628](https://github.com/ooples/AiDotNet.Tensors/issues/1628)) ([8686f7f](https://github.com/ooples/AiDotNet.Tensors/commit/8686f7ffcdeeb0b642a2ccb94871679281d6c82f))
+* **cuda:** hold the cuDNN handle from cudnnSetStream through its launch ([#1614](https://github.com/ooples/AiDotNet.Tensors/issues/1614)) ([3c3ac63](https://github.com/ooples/AiDotNet.Tensors/commit/3c3ac63df7c204d4974016cd30ae192abe237257))
+* **gpu:** batched attention route is tapeless only, smaller score budget, fused-branch test ([#1603](https://github.com/ooples/AiDotNet.Tensors/issues/1603)) ([e8b22ea](https://github.com/ooples/AiDotNet.Tensors/commit/e8b22eacc28c632994eb490e9fb5ff5bd09d76d9))
+* **tests:** CrowdTrainer header on the four compilation tests from [#1623](https://github.com/ooples/AiDotNet.Tensors/issues/1623) ([#1634](https://github.com/ooples/AiDotNet.Tensors/issues/1634)) ([2feb5a7](https://github.com/ooples/AiDotNet.Tensors/commit/2feb5a7938079aece84b2e5fc2bd28f0ea6abe32))
+* **vulkan:** run the LSTM sequence on the shared parallel kernels ([#1626](https://github.com/ooples/AiDotNet.Tensors/issues/1626)) ([818df93](https://github.com/ooples/AiDotNet.Tensors/commit/818df9399476525b33549699c139d91a013ad285)), closes [#1625](https://github.com/ooples/AiDotNet.Tensors/issues/1625)
+
 ## [0.144.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.144.1...v0.144.2) (2026-10-29)
 
 
