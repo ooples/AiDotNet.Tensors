@@ -43838,9 +43838,14 @@ public partial class CpuEngine : ITensorLevelEngine
     // shapes, where it beats native BLAS + copy by 1.3-2.8x. Fall back to native
     // BLAS only for large K·N·M, where native raw throughput wins. Thresholds from
     // InferenceGemmStrategyAbTests on the AIsEval MLP shapes; shape-based so it
-    // generalises beyond MLP (transformer projections, etc.).
+    // generalises beyond MLP (transformer projections, etc.). Many rows also go to BlasManaged: at 512 rows and more
+    // every transformer / ViT projection measured faster there on a 16-core Ryzen (4096 x 64 x 128: 260 against 393 us;
+    // 520 x 768 x 192: 476 against 555; 8320 x 768 x 192: 4.9 against 5.8 ms).
     private static bool PreferManagedInferenceGemm(int m, int k, int n)
-        => !((long)k * n > 200_000 && m >= 16);
+        => !((long)k * n > 200_000 && m >= 16) && m < ManagedInferenceGemmMaxRows;
+
+    // The rows from which an inference FusedLinear's GEMM leaves the cached-B route for BlasManaged.
+    private const int ManagedInferenceGemmMaxRows = 256;
 
     public virtual Tensor<T> FusedLinear<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, FusedActivationType activation, FusedActivationParams? activationParams = null)
     {
