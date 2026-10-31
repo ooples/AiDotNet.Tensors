@@ -100,12 +100,69 @@ public class GpuEngineReleaseTests
             Assert.True(AiDotNetEngine.ReleaseGpu());
             Assert.True(gpu.IsDisposed);
             Assert.IsType<CpuEngine>(AiDotNetEngine.Current);
+            Assert.Equal(0, gpu.LiveOwnedResultsForTest);
             AssertClose(expected, onDevice.ToArray(), "a device result read after the release");
             Assert.False(AiDotNetEngine.ReleaseGpu());
         }
         finally
         {
             AiDotNetEngine.Current = saved;
+        }
+    }
+
+    /// <summary>
+    /// Parameters a compiled training plan updated on the device keep the trained values through a release: the
+    /// weights read afterwards are those of a CPU run of the same steps, not their initial values.
+    /// </summary>
+    [SkippableFact]
+    public void Releasing_the_adopted_engine_keeps_the_trained_parameters()
+    {
+        var saved = AiDotNetEngine.Current;
+        try
+        {
+            AiDotNetEngine.ResetToCpu();
+            var expected = TrainThreeSteps(new CpuEngine());
+            Skip.IfNot(AiDotNetEngine.AutoDetectAndConfigureGpu(verbose: false), "No GPU was adopted");
+            var gpu = Assert.IsType<DirectGpuTensorEngine>(AiDotNetEngine.Current);
+            var w = TrainThreeSteps(gpu, readBack: false);
+
+            Assert.True(AiDotNetEngine.ReleaseGpu());
+            Assert.True(gpu.IsDisposed);
+            AssertClose(expected.ToArray(), w.ToArray(), "a trained weight read after the release");
+        }
+        finally
+        {
+            AiDotNetEngine.Current = saved;
+        }
+    }
+
+    // Three SGD steps of a compiled plan for loss = sum((a @ w) * b), on the given engine; returns w.
+    private static Tensor<float> TrainThreeSteps(IEngine engine, bool readBack = true)
+    {
+        var previous = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = engine;
+        try
+        {
+            var a = Matrix(11);
+            var b = Matrix(12);
+            var w = Matrix(13);
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.Enable())
+            {
+                engine.ReduceSum(engine.TensorMultiply(engine.TensorMatMul(a, w), b), null);
+                plan = scope.CompileTraining(new[] { w });
+            }
+            using (plan)
+            {
+                plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.01f);
+                for (int step = 0; step < 3; step++) plan.Step();
+            }
+            if (readBack) _ = w.ToArray();
+            return w;
+        }
+        finally
+        {
+            AiDotNetEngine.Current = previous;
         }
     }
 

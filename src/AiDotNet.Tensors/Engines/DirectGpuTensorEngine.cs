@@ -284,6 +284,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // Leases every op takes while it uses the backend, so Dispose (and AiDotNetEngine.ReleaseGpu) frees native
     // resources only after ops on other threads are done with them. See GpuOpGate.
     private readonly GpuOpGate _opGate = new();
+    // The results this engine handed out whose tensors own their buffers (weakly): its release downloads the live ones.
+    private readonly DeviceResultRegistry _ownedResults = new();
+    internal int LiveOwnedResultsForTest => _ownedResults.CountLive();
 
     /// <summary>How long <see cref="Dispose"/> waits for ops on other threads to finish before it frees.</summary>
     internal static TimeSpan DisposeDrainTimeout { get; set; } = TimeSpan.FromSeconds(30);
@@ -4493,6 +4496,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // #1302: say so on the tensor, or Dispose() leaves the buffer to the finalizer: a 64 MB device result behind a
         // few-hundred-byte object gives the GC no reason to run, so every call allocated a fresh buffer and none was freed.
         tensor._ownsGpuBuffer = true;
+        // A backend this engine frees when it is released: the result must reach the host first.
+        if (_ownsDirectGpu) _ownedResults.Add(vector, backend);
         NoteOwnedResultAllocation(outputBuffer.SizeInBytes);
         // Not released when the tape ends: a result the caller holds stays valid, as in PyTorch, and returns to the pool
         // when it is collected. The gradients backward computes but does not return are freed as soon as backward ends
@@ -28999,6 +29004,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         UnregisterAsBackendOwner();
         // Clear activation cache to free GPU memory from cached activations
         ClearActivationCache();
+
+        // Results callers still hold keep their values: each live one downloads (if its host copy is stale) and lets
+        // go of its device buffer while the backend can still do both. Only when this engine frees the backend; a
+        // shared backend keeps serving them.
+        if (_ownsDirectGpu) _ownedResults.EvacuateAll();
+
+        // Parameters an optimizer updated on the device (CommitParameterUpdatedOnDevice) are current only in these
+        // buffers: their host arrays download before the buffers are freed.
+        foreach (var key in _persistentBufferCache.Keys)
+        {
+            if (!Helpers.HostSync.IsPending(key)) continue;
+            try { Helpers.HostSync.TryMaterialize(key); }
+            catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException)
+            {
+                System.Diagnostics.Trace.TraceWarning(
+                    $"[DirectGpu] A device-updated parameter could not be downloaded before the engine was released: {ex.Message}");
+            }
+        }
 
         // Dispose all cached GPU buffers
         foreach (var entry in _persistentBufferCache.Values)
