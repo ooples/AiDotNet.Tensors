@@ -372,6 +372,21 @@ public sealed class OpenClTunedKernelTests
     }
 #endif
 
+    /// <summary>
+    /// conv2d_smallc's local filter array is ws[SC_OB * SC_MAX_TAPS] and its launch grid is SC_OB channels a group: the
+    /// C# limits the dispatcher admits and launches by must be the kernel's own, or a larger filter overflows local
+    /// memory and the grid stops matching the kernel.
+    /// </summary>
+    [Fact]
+    public void SmallChannelLimits_MatchTheKernelSource()
+    {
+        string source = AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels.WinogradFusedKernels.Source;
+        Assert.Contains("#define SC_OB " + AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels.WinogradFusedKernels.SmallChannelBlock + "\n",
+            source.Replace("\r\n", "\n"));
+        Assert.Contains("#define SC_MAX_TAPS " + AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels.WinogradFusedKernels.SmallChannelMaxTaps + "\n",
+            source.Replace("\r\n", "\n"));
+    }
+
     // (batch, Cin, H, W, Cout, k, stride, pad, dilation): Winograd's 3x3/s1, 1x1, 5x5, strided, dilated, batched.
     private static readonly (int B, int C, int H, int W, int O, int K, int S, int P, int D)[] ConvShapes =
     {
@@ -379,8 +394,9 @@ public sealed class OpenClTunedKernelTests
         (2, 3, 11, 10, 2, 5, 2, 2, 1), (1, 2, 12, 12, 3, 3, 1, 2, 2), (3, 5, 7, 9, 6, 3, 2, 1, 1),
         (2, 6, 5, 4, 7, 1, 1, 0, 1),   // a 1x1 convolution over a batch: the batch-shared pointwise route
         // Few (tile, output channel) groups over many channels: fused Winograd splits the channels (2 layers of 40 and
-        // 32; 3 layers of 40, 40 and 20) and sums the partial outputs before the epilogue.
-        (2, 72, 2, 2, 40, 3, 1, 1, 1), (3, 100, 3, 5, 9, 3, 1, 1, 1),
+        // 32; 3 layers of 40, 40 and 20) and sums the partial outputs before the epilogue. The first is a single group
+        // (32 output channels, one tile), so it splits in two on every device, one compute unit included.
+        (2, 72, 2, 2, 32, 3, 1, 1, 1), (3, 100, 3, 5, 9, 3, 1, 1, 1),
         // 1x1 through conv1x1_rb128v: K split three ways over a one-tile grid (72, 72 and 56 channels); a 2 x 2 tile grid
         // crossing image boundaries inside a tile; an odd pixel count (15), which the route declines.
         (2, 200, 2, 2, 5, 1, 1, 0, 1), (3, 20, 8, 8, 130, 1, 1, 0, 1), (2, 6, 5, 3, 4, 1, 1, 0, 1),

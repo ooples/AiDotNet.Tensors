@@ -25,8 +25,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels
         internal const string SmallChannel = "conv2d_smallc";
         internal const string SmallChannel3x3 = "conv2d_smallc3";
 
-        /// <summary>Output channels one conv2d_smallc work item computes.</summary>
+        /// <summary>Output channels one conv2d_smallc work item computes (SC_OB in the source).</summary>
         internal const int SmallChannelBlock = 16;
+
+        /// <summary>
+        /// The most filter taps (input channels x kernel height x kernel width) conv2d_smallc holds in local memory
+        /// (SC_MAX_TAPS in the source): its ws[SC_OB * SC_MAX_TAPS] array. The dispatcher admits no larger filter.
+        /// </summary>
+        internal const int SmallChannelMaxTaps = 196;
 
         internal static string[] GetKernelNames() => new[] { Forward, SplitReduce, SmallChannel, SmallChannel3x3 };
 

@@ -184,16 +184,16 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         // its own: inference reuses them, where every call re-transformed the weights (a 512x512 filter writes 37.7 MB of
         // U: 0.3 ms of a 1.9 ms convolution). Bounded, since U is up to four times the weights; past the budget a
         // convolution transforms into scratch as before.
-        // An eighth of device memory, at most 768 MiB: the buffer pool takes a quarter, and this cache is not drained on
-        // out-of-memory (an entry goes only with its weights).
-        private const long F43FilterCacheMaxBytes = 768L << 20;
-        private const int F43FilterCacheMemoryDivisor = 8;
-        private long F43FilterCacheBudgetBytes =>
-            Math.Min(F43FilterCacheMaxBytes, GlobalMemoryBytes / F43FilterCacheMemoryDivisor);
-        private readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, F43FilterEntry> _f43Filters = new();
-        private readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, F43FilterEntry> _f23Filters = new();
+        // An eighth of device memory, at most 768 MiB: the buffer pool takes half (PooledMemoryDivisor), and this cache
+        // is not drained on out-of-memory (an entry goes only with its weights). One cache serves F(2x2) and F(4x4).
+        private const long WinogradFilterCacheMaxBytes = 768L << 20;
+        private const int WinogradFilterCacheMemoryDivisor = 8;
+        private long WinogradFilterCacheBudgetBytes =>
+            Math.Min(WinogradFilterCacheMaxBytes, GlobalMemoryBytes / WinogradFilterCacheMemoryDivisor);
+        private readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, WinogradFilterEntry> _f43Filters = new();
+        private readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, WinogradFilterEntry> _f23Filters = new();
 
-        private System.Runtime.CompilerServices.ConditionalWeakTable<object, F43FilterEntry> WinogradFilterTable(int points)
+        private System.Runtime.CompilerServices.ConditionalWeakTable<object, WinogradFilterEntry> WinogradFilterTable(int points)
             => points == WinogradF43Points ? _f43Filters : _f23Filters;
 
         IGpuBuffer? IWinogradForwardFilterCache.CachedForwardFilter(int points, int k, int c)
@@ -201,15 +201,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         bool IWinogradForwardFilterCache.StoreForwardFilter(IGpuBuffer u, int points, int k, int c)
             => StoreWinogradFilter(u, points, k, c);
-        private readonly object _f43FilterLock = new();
-        private long _f43FilterBytes;
+        private readonly object _winogradFilterLock = new();
+        private long _winogradFilterBytes;
         // Buffers of entries whose weights were collected: freed by the next cache access, never on the finalizer thread.
-        private readonly System.Collections.Concurrent.ConcurrentQueue<IGpuBuffer> _f43Retired = new();
-        private readonly System.Collections.Generic.List<WeakReference<F43FilterEntry>> _f43Live = new();
+        private readonly System.Collections.Concurrent.ConcurrentQueue<IGpuBuffer> _winogradFilterRetired = new();
+        private readonly System.Collections.Generic.List<WeakReference<WinogradFilterEntry>> _winogradFilterLive = new();
 
-        private sealed class F43FilterEntry
+        private sealed class WinogradFilterEntry
         {
-            internal F43FilterEntry(OpenClBackend owner, IGpuBuffer u, int version, int outC, int inC, long bytes)
+            internal WinogradFilterEntry(OpenClBackend owner, IGpuBuffer u, int version, int outC, int inC, long bytes)
             {
                 Owner = owner; U = u; Version = version; OutC = outC; InC = inC; Bytes = bytes;
             }
@@ -222,19 +222,19 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             internal long Bytes { get; }
 
             // The key is a host weight array: when it is collected the entry goes, and its device buffer is retired.
-            ~F43FilterEntry()
+            ~WinogradFilterEntry()
             {
-                System.Threading.Interlocked.Add(ref Owner._f43FilterBytes, -Bytes);
-                Owner._f43Retired.Enqueue(U);
+                System.Threading.Interlocked.Add(ref Owner._winogradFilterBytes, -Bytes);
+                Owner._winogradFilterRetired.Enqueue(U);
             }
         }
 
         private IGpuBuffer? GetCachedWinogradFilter(int points, int outC, int inC)
         {
             if (!ConvWeightIdentity.TryGet(out var key, out int version)) return null;
-            lock (_f43FilterLock)
+            lock (_winogradFilterLock)
             {
-                DrainRetiredF43Filters();
+                DrainRetiredWinogradFilters();
                 if (WinogradFilterTable(points).TryGetValue(key, out var entry) && entry.Version == version && entry.OutC == outC
                     && entry.InC == inC)
                     return entry.U;
@@ -242,26 +242,26 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             return null;
         }
 
-        private void DrainRetiredF43Filters()
+        private void DrainRetiredWinogradFilters()
         {
-            while (_f43Retired.TryDequeue(out var retired)) retired.Dispose();
-            _f43Live.RemoveAll(w => !w.TryGetTarget(out _));
+            while (_winogradFilterRetired.TryDequeue(out var retired)) retired.Dispose();
+            _winogradFilterLive.RemoveAll(w => !w.TryGetTarget(out _));
         }
 
         // Frees every cached transform; called when the backend is disposed.
-        private void ReleaseF43FilterCache()
+        private void ReleaseWinogradFilterCache()
         {
-            lock (_f43FilterLock)
+            lock (_winogradFilterLock)
             {
-                foreach (var weak in _f43Live)
+                foreach (var weak in _winogradFilterLive)
                 {
                     if (!weak.TryGetTarget(out var entry)) continue;
                     GC.SuppressFinalize(entry);
                     entry.U.Dispose();
                 }
-                _f43Live.Clear();
-                while (_f43Retired.TryDequeue(out var retired)) retired.Dispose();
-                _f43FilterBytes = 0;
+                _winogradFilterLive.Clear();
+                while (_winogradFilterRetired.TryDequeue(out var retired)) retired.Dispose();
+                _winogradFilterBytes = 0;
             }
         }
 
@@ -271,21 +271,21 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (!ConvWeightIdentity.TryGet(out var key, out int version)) return false;
             long bytes = (long)points * outC * inC * sizeof(float);
             var table = WinogradFilterTable(points);
-            lock (_f43FilterLock)
+            lock (_winogradFilterLock)
             {
-                DrainRetiredF43Filters();
+                DrainRetiredWinogradFilters();
                 if (table.TryGetValue(key, out var stale))
                 {
                     table.Remove(key);
-                    System.Threading.Interlocked.Add(ref _f43FilterBytes, -stale.Bytes);
+                    System.Threading.Interlocked.Add(ref _winogradFilterBytes, -stale.Bytes);
                     GC.SuppressFinalize(stale);
                     stale.U.Dispose();
                 }
-                if (System.Threading.Interlocked.Read(ref _f43FilterBytes) + bytes > F43FilterCacheBudgetBytes) return false;
-                var added = new F43FilterEntry(this, u, version, outC, inC, bytes);
+                if (System.Threading.Interlocked.Read(ref _winogradFilterBytes) + bytes > WinogradFilterCacheBudgetBytes) return false;
+                var added = new WinogradFilterEntry(this, u, version, outC, inC, bytes);
                 table.Add(key, added);
-                _f43Live.Add(new WeakReference<F43FilterEntry>(added));
-                System.Threading.Interlocked.Add(ref _f43FilterBytes, bytes);
+                _winogradFilterLive.Add(new WeakReference<WinogradFilterEntry>(added));
+                System.Threading.Interlocked.Add(ref _winogradFilterBytes, bytes);
                 return true;
             }
         }

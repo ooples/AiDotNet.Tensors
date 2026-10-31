@@ -51,14 +51,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                             // Fused F(2x2, 3x3): transforms, per-point products and output transform in one launch, so
                             // the 16-plane V and M never reach global memory.
                             new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.winograd_fused", TunedKernelOrigin.Builtin, true,
-                                shape => WinogradF23Pipeline.AdmitsShape(shape) && HasTunedKernel(Kernels.WinogradFusedKernels.Forward),
+                                shape => WinogradF23Pipeline.AdmitsShape(shape)
+                                    && HasTunedKernel(Kernels.WinogradFusedKernels.Forward, WinogradFusedGroupSize),
                                 (in TunedConv2DArgs a) => Conv2DWinogradFused(a)),
                             // im2col (none for a 1x1 stride-1 unpadded batch-1 conv) + the register-blocked split-K GEMM,
                             // which keeps every CU busy on the small late-layer products CLBlast leaves underfilled.
                             new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.im2col_rb_gemm", TunedKernelOrigin.Builtin, true,
                                 shape => TunedConv2DArgs.GemmScratchFits(shape) && shape[0] == 1
                                     && HasTunedKernel(Kernels.BatchedGemmKernels.Im2ColWide)
-                                    && HasTunedKernel(Kernels.BatchedGemmKernels.Rb64SplitK),
+                                    && HasTunedKernel(Kernels.BatchedGemmKernels.Rb64SplitK, Rb64GroupSide * Rb64GroupSide),
                                 (in TunedConv2DArgs a) => Conv2DIm2ColRbGemm(a)),
                             // A 1x1, stride-1, unpadded convolution over a batch: one strided-batched GEMM per image with
                             // the filter shared (A stride 0), written straight into the NCHW output. im2col + GEMM copies the
@@ -79,13 +80,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                             new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.pointwise_rb", TunedKernelOrigin.Builtin, true,
                                 shape => shape[5] == 1 && shape[6] == 1 && shape[7] == 1 && shape[8] == 1
                                     && shape[9] == 0 && shape[10] == 0 && (long)shape[2] * shape[3] % 4 == 0
-                                    && HasTunedKernel(Kernels.BatchedGemmKernels.Conv1x1Rb128V)
+                                    && HasTunedKernel(Kernels.BatchedGemmKernels.Conv1x1Rb128V, Rb128GroupSide * Rb128GroupSide)
                                     && HasTunedKernel(Kernels.WinogradFusedKernels.SplitReduce),
                                 (in TunedConv2DArgs a) => Conv2DPointwiseRb(a)),
                             // A stem over at most four input channels: each work item reads a pixel's inputs once for 16
                             // output channels.
                             new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.small_channel", TunedKernelOrigin.Builtin, true,
-                                shape => shape[1] <= SmallChannelConvMaxChannels && shape[1] * shape[5] * shape[6] <= 196 && HasTunedKernel(Kernels.WinogradFusedKernels.SmallChannel),
+                                shape => shape[1] <= SmallChannelConvMaxChannels
+                                    && shape[1] * shape[5] * shape[6] <= Kernels.WinogradFusedKernels.SmallChannelMaxTaps
+                                    && HasTunedKernel(Kernels.WinogradFusedKernels.SmallChannel),
                                 (in TunedConv2DArgs a) => Conv2DSmallChannel(a)),
                         };
                         _conv2DForwardSlot = new TunedKernelSlot<TunedConv2DArgs>(TunedKernelOp.Conv2DForward, TunedDeviceKey,
@@ -144,34 +147,71 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             int hw = a.OutHeight * a.OutWidth, m = a.OutChannels, k = a.InChannels;
             int n = checked(a.Batch * hw);
-            int tiles = ((m + 127) / 128) * ((n + 127) / 128);
-            int target = 4 * (int)Math.Max(1u, _context?.MaxComputeUnits ?? 8u);
-            int splits = Math.Max(1, Math.Min((target + tiles - 1) / tiles, k / 64));
-            int kChunk = RoundUpToMultiple((k + splits - 1) / splits, 8);
+            int tiles = ((m + Rb128Tile - 1) / Rb128Tile) * ((n + Rb128Tile - 1) / Rb128Tile);
+            int splits = SplitKFactor(tiles, k, Rb128MinSlice, Rb128GroupsPerComputeUnit, ComputeUnits);
+            int kChunk = RoundUpToMultiple((k + splits - 1) / splits, Rb128ChunkAlign);
             splits = (k + kChunk - 1) / kChunk;
             int count = checked(m * n);
-            IGpuBuffer? partial = splits > 1 ? AllocateBuffer(checked(splits * count)) : null;
-            try
-            {
-                var gemm = _kernelCache[Kernels.BatchedGemmKernels.Conv1x1Rb128V];
-                gemm.SetArg(0, BufferHandle(a.Kernel)); gemm.SetArg(1, BufferHandle(a.Input));
-                gemm.SetArg(2, BufferHandle(partial ?? a.Output));
-                gemm.SetArg(3, m); gemm.SetArg(4, n); gemm.SetArg(5, k); gemm.SetArg(6, hw); gemm.SetArg(7, kChunk);
-                gemm.SetArg(8, ConvEpilogueBias(a)); gemm.SetArg(9, partial is null ? ConvEpilogueFlags(a) : 0);
-                gemm.Execute3D(RoundUpToMultiple(n, 128) / 8, RoundUpToMultiple(m, 128) / 8, splits, 16, 16, 1);
-                if (partial is null) return;
-                var reduce = _kernelCache[Kernels.WinogradFusedKernels.SplitReduce];
-                reduce.SetArg(0, BufferHandle(partial)); reduce.SetArg(1, BufferHandle(a.Output));
-                reduce.SetArg(2, count); reduce.SetArg(3, splits);
-                reduce.SetArg(4, ConvEpilogueBias(a)); reduce.SetArg(5, ConvEpilogueFlags(a));
-                reduce.SetArg(6, hw); reduce.SetArg(7, m);
-                reduce.Execute1D(RoundUpToMultiple(count, 256), 256);
-            }
-            finally
-            {
-                partial?.Dispose();
-            }
+            using IGpuBuffer? partial = splits > 1 ? AllocateBuffer(checked(splits * count)) : null;
+            var gemm = _kernelCache[Kernels.BatchedGemmKernels.Conv1x1Rb128V];
+            gemm.SetArg(0, BufferHandle(a.Kernel)); gemm.SetArg(1, BufferHandle(a.Input));
+            gemm.SetArg(2, BufferHandle(partial ?? a.Output));
+            gemm.SetArg(3, m); gemm.SetArg(4, n); gemm.SetArg(5, k); gemm.SetArg(6, hw); gemm.SetArg(7, kChunk);
+            gemm.SetArg(8, ConvEpilogueBias(a)); gemm.SetArg(9, partial is null ? ConvEpilogueFlags(a) : 0);
+            gemm.Execute3D(RoundUpToMultiple(n, Rb128Tile) / Rb128OutputsPerItem,
+                RoundUpToMultiple(m, Rb128Tile) / Rb128OutputsPerItem, splits, Rb128GroupSide, Rb128GroupSide, 1);
+            if (partial is null) return;
+            var reduce = _kernelCache[Kernels.WinogradFusedKernels.SplitReduce];
+            reduce.SetArg(0, BufferHandle(partial)); reduce.SetArg(1, BufferHandle(a.Output));
+            reduce.SetArg(2, count); reduce.SetArg(3, splits);
+            reduce.SetArg(4, ConvEpilogueBias(a)); reduce.SetArg(5, ConvEpilogueFlags(a));
+            reduce.SetArg(6, hw); reduce.SetArg(7, m);
+            reduce.Execute1D(RoundUpToMultiple(count, ReduceGroupSize), ReduceGroupSize);
         }
+
+        // Split-K sizing, shared by every split-K route: K is cut into slices, each at least minSlice deep, until the tile
+        // grid times the slices covers about groupsPerComputeUnit work groups per compute unit. At least one slice. Each
+        // caller then aligns the slice depth to its kernel's channel step.
+        internal static int SplitKFactor(int tiles, int depth, int minSlice, int groupsPerComputeUnit, int computeUnits)
+        {
+            int target = groupsPerComputeUnit * computeUnits;
+            return Math.Max(1, Math.Min((target + tiles - 1) / tiles, depth / minSlice));
+        }
+
+        // The device's compute units, DefaultComputeUnits before the context reports them.
+        private int ComputeUnits => (int)Math.Max(1u, _context?.MaxComputeUnits ?? DefaultComputeUnits);
+
+        private const uint DefaultComputeUnits = 8;
+
+        // The work-group size of the split-K reduce kernels (wino_f23_split_reduce, gemm_splitk_reduce).
+        private const int ReduceGroupSize = 256;
+
+        // conv1x1_rb128v: a 128 x 128 output tile per 16 x 16 group, 8 x 8 outputs per work item, K in 8-channel steps.
+        // Split while the grid covers fewer than about four groups per compute unit, each slice at least 64 channels.
+        private const int Rb128Tile = 128;
+        private const int Rb128OutputsPerItem = 8;
+        private const int Rb128GroupSide = Rb128Tile / Rb128OutputsPerItem;
+        private const int Rb128ChunkAlign = 8;
+        private const int Rb128MinSlice = 64;
+        private const int Rb128GroupsPerComputeUnit = 4;
+
+        // gemm_rb64_splitk: a 64 x 64 tile per 16 x 16 group, 4 x 4 outputs per work item, K in 16-deep steps. Split
+        // while the grid covers fewer than about four groups per compute unit, each slice at least 64 deep.
+        private const int Rb64Tile = 64;
+        private const int Rb64OutputsPerItem = 4;
+        private const int Rb64GroupSide = Rb64Tile / Rb64OutputsPerItem;
+        private const int Rb64ChunkAlign = 16;
+        private const int Rb64MinSlice = 64;
+        private const int Rb64GroupsPerComputeUnit = 4;
+
+        // wino_f23_fused_forward: 32 output channels x 32 tiles per 256-item group, channels in 8-channel steps (WF_BO,
+        // WF_BP and WF_CK in its source). Split while the grid covers fewer than about two groups per compute unit, each
+        // layer at least 32 channels.
+        private const int WinogradFusedBlock = 32;
+        private const int WinogradFusedGroupSize = 256;
+        private const int WinogradFusedChunkAlign = 8;
+        private const int WinogradFusedMinSlice = 32;
+        private const int WinogradFusedGroupsPerComputeUnit = 2;
 
         private const int SmallChannelConvMaxChannels = 4;
 
@@ -226,35 +266,29 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             int tilesH = (a.OutHeight + 1) / 2, tilesW = (a.OutWidth + 1) / 2;
             int p = a.Batch * tilesH * tilesW;
-            int groups = ((p + 31) / 32) * ((a.OutChannels + 31) / 32);
-            int rChunk = WinogradFusedChannelChunk(groups, a.InChannels, (int)Math.Max(1u, _context?.MaxComputeUnits ?? 8u));
+            int tileGroups = (p + WinogradFusedBlock - 1) / WinogradFusedBlock;
+            int channelGroups = (a.OutChannels + WinogradFusedBlock - 1) / WinogradFusedBlock;
+            int rChunk = WinogradFusedChannelChunk(tileGroups * channelGroups, a.InChannels, ComputeUnits);
             int splits = (a.InChannels + rChunk - 1) / rChunk;
             int count = a.Batch * a.OutChannels * a.OutHeight * a.OutWidth;
-            IGpuBuffer? partial = splits > 1 ? AllocateBuffer(checked(splits * count)) : null;
-            try
-            {
-                var k = _kernelCache[Kernels.WinogradFusedKernels.Forward];
-                uint arg = 0;
-                k.SetArg(arg++, BufferHandle(a.Input)); k.SetArg(arg++, BufferHandle(a.Kernel));
-                k.SetArg(arg++, BufferHandle(partial ?? a.Output));
-                k.SetArg(arg++, a.Batch); k.SetArg(arg++, a.InChannels); k.SetArg(arg++, a.InHeight); k.SetArg(arg++, a.InWidth);
-                k.SetArg(arg++, a.OutChannels); k.SetArg(arg++, a.OutHeight); k.SetArg(arg++, a.OutWidth); k.SetArg(arg++, a.PadH);
-                k.SetArg(arg++, tilesH); k.SetArg(arg++, tilesW);
-                k.SetArg(arg++, ConvEpilogueBias(a)); k.SetArg(arg++, partial is null ? ConvEpilogueFlags(a) : 0);
-                k.SetArg(arg++, rChunk);
-                k.Execute3D(RoundUpToMultiple(p, 32) / 32 * 256, (a.OutChannels + 31) / 32, splits, 256, 1, 1);
-                if (partial is null) return;
-                var reduce = _kernelCache[Kernels.WinogradFusedKernels.SplitReduce];
-                reduce.SetArg(0, BufferHandle(partial)); reduce.SetArg(1, BufferHandle(a.Output));
-                reduce.SetArg(2, count); reduce.SetArg(3, splits);
-                reduce.SetArg(4, ConvEpilogueBias(a)); reduce.SetArg(5, ConvEpilogueFlags(a));
-                reduce.SetArg(6, a.OutHeight * a.OutWidth); reduce.SetArg(7, a.OutChannels);
-                reduce.Execute1D(RoundUpToMultiple(count, 256), 256);
-            }
-            finally
-            {
-                partial?.Dispose();
-            }
+            using IGpuBuffer? partial = splits > 1 ? AllocateBuffer(checked(splits * count)) : null;
+            var k = _kernelCache[Kernels.WinogradFusedKernels.Forward];
+            uint arg = 0;
+            k.SetArg(arg++, BufferHandle(a.Input)); k.SetArg(arg++, BufferHandle(a.Kernel));
+            k.SetArg(arg++, BufferHandle(partial ?? a.Output));
+            k.SetArg(arg++, a.Batch); k.SetArg(arg++, a.InChannels); k.SetArg(arg++, a.InHeight); k.SetArg(arg++, a.InWidth);
+            k.SetArg(arg++, a.OutChannels); k.SetArg(arg++, a.OutHeight); k.SetArg(arg++, a.OutWidth); k.SetArg(arg++, a.PadH);
+            k.SetArg(arg++, tilesH); k.SetArg(arg++, tilesW);
+            k.SetArg(arg++, ConvEpilogueBias(a)); k.SetArg(arg++, partial is null ? ConvEpilogueFlags(a) : 0);
+            k.SetArg(arg, rChunk);
+            k.Execute3D(tileGroups * WinogradFusedGroupSize, channelGroups, splits, WinogradFusedGroupSize, 1, 1);
+            if (partial is null) return;
+            var reduce = _kernelCache[Kernels.WinogradFusedKernels.SplitReduce];
+            reduce.SetArg(0, BufferHandle(partial)); reduce.SetArg(1, BufferHandle(a.Output));
+            reduce.SetArg(2, count); reduce.SetArg(3, splits);
+            reduce.SetArg(4, ConvEpilogueBias(a)); reduce.SetArg(5, ConvEpilogueFlags(a));
+            reduce.SetArg(6, a.OutHeight * a.OutWidth); reduce.SetArg(7, a.OutChannels);
+            reduce.Execute1D(RoundUpToMultiple(count, ReduceGroupSize), ReduceGroupSize);
         }
 
         // The channels each work-group layer of the fused Winograd reduces: all of them, unless the (tile, output channel)
@@ -266,9 +300,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         // split was slower (587 us whole, 621 us in two).
         internal static int WinogradFusedChannelChunk(int groups, int channels, int computeUnits)
         {
-            int target = 2 * computeUnits;
-            int splits = Math.Max(1, Math.Min((target + groups - 1) / groups, channels / 32));
-            return RoundUpToMultiple((channels + splits - 1) / splits, 8);
+            int splits = SplitKFactor(groups, channels, WinogradFusedMinSlice, WinogradFusedGroupsPerComputeUnit, computeUnits);
+            return RoundUpToMultiple((channels + splits - 1) / splits, WinogradFusedChunkAlign);
         }
 
         // Batch 1 only (the slot admits it only there): y[Cout, L] = W[Cout, P] * col[P, L], col the input itself for a
@@ -301,31 +334,24 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         internal void RbSplitKGemm(IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, int m, int n, int k, IGpuBuffer? bias = null,
             int epilogue = 0)
         {
-            int tiles = ((m + 63) / 64) * ((n + 63) / 64);
-            int target = 4 * (int)Math.Max(1u, _context?.MaxComputeUnits ?? 8u);
-            int splits = Math.Max(1, Math.Min((target + tiles - 1) / tiles, k / 64));
-            int kChunk = RoundUpToMultiple((k + splits - 1) / splits, 16);
+            int tiles = ((m + Rb64Tile - 1) / Rb64Tile) * ((n + Rb64Tile - 1) / Rb64Tile);
+            int splits = SplitKFactor(tiles, k, Rb64MinSlice, Rb64GroupsPerComputeUnit, ComputeUnits);
+            int kChunk = RoundUpToMultiple((k + splits - 1) / splits, Rb64ChunkAlign);
             splits = (k + kChunk - 1) / kChunk;
             var gemm = _kernelCache[Kernels.BatchedGemmKernels.Rb64SplitK];
-            IGpuBuffer? partial = splits > 1 ? AllocateBuffer(checked(splits * m * n)) : null;
-            try
-            {
-                gemm.SetArg(0, BufferHandle(a)); gemm.SetArg(1, BufferHandle(b)); gemm.SetArg(2, BufferHandle(partial ?? c));
-                gemm.SetArg(3, m); gemm.SetArg(4, n); gemm.SetArg(5, k); gemm.SetArg(6, k); gemm.SetArg(7, n);
-                gemm.SetArg(8, kChunk);
-                gemm.SetArg(9, BufferHandle(bias ?? c)); gemm.SetArg(10, partial is null ? epilogue : 0);
-                gemm.Execute3D(RoundUpToMultiple(n, 64) / 4, RoundUpToMultiple(m, 64) / 4, splits, 16, 16, 1);
-                if (partial is null) return;
-                var reduce = _kernelCache[Kernels.BatchedGemmKernels.SplitKReduce];
-                reduce.SetArg(0, BufferHandle(partial)); reduce.SetArg(1, BufferHandle(c));
-                reduce.SetArg(2, m * n); reduce.SetArg(3, splits);
-                reduce.SetArg(4, BufferHandle(bias ?? c)); reduce.SetArg(5, epilogue); reduce.SetArg(6, n);
-                reduce.Execute1D(RoundUpToMultiple(m * n, 256), 256);
-            }
-            finally
-            {
-                partial?.Dispose();
-            }
+            using IGpuBuffer? partial = splits > 1 ? AllocateBuffer(checked(splits * m * n)) : null;
+            gemm.SetArg(0, BufferHandle(a)); gemm.SetArg(1, BufferHandle(b)); gemm.SetArg(2, BufferHandle(partial ?? c));
+            gemm.SetArg(3, m); gemm.SetArg(4, n); gemm.SetArg(5, k); gemm.SetArg(6, k); gemm.SetArg(7, n);
+            gemm.SetArg(8, kChunk);
+            gemm.SetArg(9, BufferHandle(bias ?? c)); gemm.SetArg(10, partial is null ? epilogue : 0);
+            gemm.Execute3D(RoundUpToMultiple(n, Rb64Tile) / Rb64OutputsPerItem, RoundUpToMultiple(m, Rb64Tile) / Rb64OutputsPerItem,
+                splits, Rb64GroupSide, Rb64GroupSide, 1);
+            if (partial is null) return;
+            var reduce = _kernelCache[Kernels.BatchedGemmKernels.SplitKReduce];
+            reduce.SetArg(0, BufferHandle(partial)); reduce.SetArg(1, BufferHandle(c));
+            reduce.SetArg(2, m * n); reduce.SetArg(3, splits);
+            reduce.SetArg(4, BufferHandle(bias ?? c)); reduce.SetArg(5, epilogue); reduce.SetArg(6, n);
+            reduce.Execute1D(RoundUpToMultiple(m * n, ReduceGroupSize), ReduceGroupSize);
         }
 
         // tmp[Cout, B * L] = W[Cout, P] * col[P, B * L] as ONE GEMM, then a permute to the output's [B, Cout, L] (none for

@@ -34,7 +34,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                             new DelegateTunedKernelCandidate<TunedGemmArgs>("opencl.gemm.entry", TunedKernelOrigin.Builtin, true,
                                 _ => true, (in TunedGemmArgs a) => GemmReference(a)),
                             new DelegateTunedKernelCandidate<TunedGemmArgs>("opencl.gemm.rb_splitk", TunedKernelOrigin.Builtin, true,
-                                _ => HasTunedKernel(Kernels.BatchedGemmKernels.Rb64SplitK)
+                                _ => HasTunedKernel(Kernels.BatchedGemmKernels.Rb64SplitK, Rb64GroupSide * Rb64GroupSide)
                                     && HasTunedKernel(Kernels.BatchedGemmKernels.SplitKReduce),
                                 (in TunedGemmArgs a) =>
                                 {
@@ -43,8 +43,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                                 }),
                             // A linear layer over a small batch: a read of B (the weights) at bandwidth.
                             new DelegateTunedKernelCandidate<TunedGemmArgs>("opencl.gemm.skinny", TunedKernelOrigin.Builtin, true,
-                                shape => shape[0] <= SkinnyGemmMaxRows && shape[1] % 4 == 0
-                                    && HasTunedKernel(Kernels.BatchedGemmKernels.SkinnySplitK)
+                                shape => shape[0] <= SkinnyGemmMaxRows && shape[1] % SkinnyVectorWidth == 0
+                                    && HasTunedKernel(Kernels.BatchedGemmKernels.SkinnySplitK, SkinnyGroupSize)
                                     && HasTunedKernel(Kernels.BatchedGemmKernels.SplitKReduce),
                                 (in TunedGemmArgs a) =>
                                 {
@@ -65,38 +65,42 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         private void GemmReference(in TunedGemmArgs a) => RunGemmReference(this, a);
 
-        private const int SkinnyGemmMaxRows = 32;
+        // gemm_skinny_splitk's layout: a work item reads SkinnyVectorWidth columns (one float4) for SkinnyRowTile rows,
+        // SkinnyVectorsPerGroup float4 columns per SkinnyGroupSize-item group, and the group's remaining items split K
+        // into lanes (SkinnyMaxRowTiles row tiles at most, so M <= SkinnyGemmMaxRows). K is split until the grid covers
+        // about SkinnyGroupsPerComputeUnit groups per compute unit, each slice at least SkinnyMinSlice deep and a multiple
+        // of SkinnyChunkAlign.
+        private const int SkinnyRowTile = 8;
+        private const int SkinnyMaxRowTiles = 4;
+        private const int SkinnyGemmMaxRows = SkinnyRowTile * SkinnyMaxRowTiles;
+        private const int SkinnyVectorWidth = 4;
+        private const int SkinnyVectorsPerGroup = 64;
+        private const int SkinnyGroupSize = 256;
+        private const int SkinnyGroupsPerComputeUnit = 8;
+        private const int SkinnyMinSlice = 256;
+        private const int SkinnyChunkAlign = 64;
 
-        // C[M x N] = A[M x K] * B[K x N] through gemm_skinny_splitk (M <= 32, N a multiple of 4): 256 columns per work
-        // group, K split until the grid covers about eight groups per compute unit (each slice at least 256 deep), and
-        // the planes summed by gemm_splitk_reduce.
+        // C[M x N] = A[M x K] * B[K x N] through gemm_skinny_splitk (M <= SkinnyGemmMaxRows, N a multiple of
+        // SkinnyVectorWidth), the planes summed by gemm_splitk_reduce.
         internal void SkinnyGemm(IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, int m, int n, int k)
         {
-            int rowTiles = (m + 7) / 8, kLanes = 4 / rowTiles;
-            int columnBlocks = (n / 4 + 63) / 64;
-            int target = 8 * (int)Math.Max(1u, _context?.MaxComputeUnits ?? 8u);
-            int splits = Math.Max(1, Math.Min((target + columnBlocks - 1) / columnBlocks, k / 256));
-            int kChunk = RoundUpToMultiple((k + splits - 1) / splits, 64);
+            int rowTiles = (m + SkinnyRowTile - 1) / SkinnyRowTile, kLanes = SkinnyMaxRowTiles / rowTiles;
+            int columnBlocks = (n / SkinnyVectorWidth + SkinnyVectorsPerGroup - 1) / SkinnyVectorsPerGroup;
+            int splits = SplitKFactor(columnBlocks, k, SkinnyMinSlice, SkinnyGroupsPerComputeUnit, ComputeUnits);
+            int kChunk = RoundUpToMultiple((k + splits - 1) / splits, SkinnyChunkAlign);
             splits = (k + kChunk - 1) / kChunk;
             int planes = splits * kLanes;
-            IGpuBuffer? partial = planes > 1 ? AllocateBuffer(checked(planes * m * n)) : null;
-            try
-            {
-                var gemm = _kernelCache[Kernels.BatchedGemmKernels.SkinnySplitK];
-                gemm.SetArg(0, BufferHandle(a)); gemm.SetArg(1, BufferHandle(b)); gemm.SetArg(2, BufferHandle(partial ?? c));
-                gemm.SetArg(3, m); gemm.SetArg(4, n); gemm.SetArg(5, k); gemm.SetArg(6, kChunk); gemm.SetArg(7, rowTiles);
-                gemm.Execute2D(columnBlocks * 256, splits, 256, 1);
-                if (partial is null) return;
-                var reduce = _kernelCache[Kernels.BatchedGemmKernels.SplitKReduce];
-                reduce.SetArg(0, BufferHandle(partial)); reduce.SetArg(1, BufferHandle(c));
-                reduce.SetArg(2, m * n); reduce.SetArg(3, planes);
-                reduce.SetArg(4, BufferHandle(c)); reduce.SetArg(5, 0); reduce.SetArg(6, n);
-                reduce.Execute1D(RoundUpToMultiple(m * n, 256), 256);
-            }
-            finally
-            {
-                partial?.Dispose();
-            }
+            using IGpuBuffer? partial = planes > 1 ? AllocateBuffer(checked(planes * m * n)) : null;
+            var gemm = _kernelCache[Kernels.BatchedGemmKernels.SkinnySplitK];
+            gemm.SetArg(0, BufferHandle(a)); gemm.SetArg(1, BufferHandle(b)); gemm.SetArg(2, BufferHandle(partial ?? c));
+            gemm.SetArg(3, m); gemm.SetArg(4, n); gemm.SetArg(5, k); gemm.SetArg(6, kChunk); gemm.SetArg(7, rowTiles);
+            gemm.Execute2D(columnBlocks * SkinnyGroupSize, splits, SkinnyGroupSize, 1);
+            if (partial is null) return;
+            var reduce = _kernelCache[Kernels.BatchedGemmKernels.SplitKReduce];
+            reduce.SetArg(0, BufferHandle(partial)); reduce.SetArg(1, BufferHandle(c));
+            reduce.SetArg(2, m * n); reduce.SetArg(3, planes);
+            reduce.SetArg(4, BufferHandle(c)); reduce.SetArg(5, 0); reduce.SetArg(6, n);
+            reduce.Execute1D(RoundUpToMultiple(m * n, ReduceGroupSize), ReduceGroupSize);
         }
 
         // Static: the flag is per thread, not per backend.

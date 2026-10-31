@@ -7867,7 +7867,7 @@ KERNEL VARIANTS (A/B testing):
                 pool2.SetArg(a2++, inWidth);
                 pool2.SetArg(a2++, outHeight);
                 pool2.SetArg(a2++, outWidth);
-                pool2.SetArg(a2++, indices != null ? 1 : 0);
+                pool2.SetArg(a2, indices != null ? 1 : 0);
                 pool2.Execute1D(RoundUpToMultiple(checked((int)pairs), 256), 256);
                 return;
             }
@@ -14370,7 +14370,7 @@ KERNEL VARIANTS (A/B testing):
 
             DisposeCompiledCodegenKernels();
             _dynamicGemm?.Dispose();
-            ReleaseF43FilterCache();
+            ReleaseWinogradFilterCache();
             _bufferPool.Dispose();
             lock (_constantIntTablesGate)
             {

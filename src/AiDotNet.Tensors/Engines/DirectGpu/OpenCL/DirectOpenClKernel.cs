@@ -338,7 +338,32 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         internal void ExecutePlanes(int width, int height, int planes)
         {
             int lx = Math.Min(8, PowerOfTwoAtLeast(width)), ly = Math.Min(8, PowerOfTwoAtLeast(height));
-            Execute3D(width, height, planes, lx, ly, 64 / (lx * ly));
+            // The plane axis takes the rest of the 64, capped at the device's z limit (OpenCL guarantees only 1) and at
+            // this kernel's group limit; the kernels launched here bound-check every item, so a smaller group is fine.
+            ulong[] itemLimits = _context.MaxWorkItemSizes;
+            ulong zLimit = itemLimits.Length > 2 && itemLimits[2] > 0 ? itemLimits[2] : 1;
+            ulong groupLimit = MaxWorkGroupSize / (ulong)(lx * ly);
+            int lz = (int)Math.Max(1, Math.Min((ulong)(64 / (lx * ly)), Math.Min(zLimit, groupLimit)));
+            Execute3D(width, height, planes, lx, ly, lz);
+        }
+
+        private ulong _maxWorkGroupSize;
+
+        /// <summary>
+        /// The most work items one group of this compiled kernel may hold (CL_KERNEL_WORK_GROUP_SIZE), or the device's
+        /// limit when the driver does not report it. Read once.
+        /// </summary>
+        internal ulong MaxWorkGroupSize
+        {
+            get
+            {
+                if (_maxWorkGroupSize != 0) return _maxWorkGroupSize;
+                ulong limit = (ulong)OpenClNativeBindings.GetKernelWorkGroupInfoSizeT(_kernel, _context.Device,
+                    OpenClNativeBindings.CL_KERNEL_WORK_GROUP_SIZE);
+                if (limit == 0) limit = _context.MaxWorkGroupSize;
+                _maxWorkGroupSize = limit;
+                return limit;
+            }
         }
 
         private static int PowerOfTwoAtLeast(int n)
