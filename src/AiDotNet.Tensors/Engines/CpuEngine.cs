@@ -27093,14 +27093,15 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsInferenceTrace)
         {
-            Tensor<T>[] outputs = CaptureInferenceKernelOutputs(
+            Tensor<T>[] outputs = CaptureInferenceKernelOutputsWithState(
                 new[] { input, gamma, beta },
                 engine =>
                 {
                     Tensor<T> result = engine.LayerNorm(
                         input, gamma, beta, epsilon, out Tensor<T> freshMean, out Tensor<T> freshVariance);
                     return new[] { result, freshMean, freshVariance };
-                });
+                },
+                savedState: new object[] { epsilon });
             mean = outputs[1];
             variance = outputs[2];
             return outputs[0];
@@ -37072,7 +37073,10 @@ public partial class CpuEngine : ITensorLevelEngine
                         if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.PadInto(output, captured, capTop, capBottom, capLeft, capRight, capValue);
                         else { var r = eng.Pad(captured, capTop, capBottom, capLeft, capRight, capValue); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
-                    BackwardFunctions<T>.PadBackward, new object[] { capTop, capLeft });
+                    // [top, left] feed the backward; bottom, right and the fill value describe the op to exporters
+                    // (OnnxExporter), which have only the saved state to go on. The fill value is kept as T: converting
+                    // it here would make capture throw for a value with no double form (a Complex with an imaginary part).
+                    BackwardFunctions<T>.PadBackward, new object[] { capTop, capLeft, capBottom, capRight, capValue! });
             }
         }
 

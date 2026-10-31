@@ -5331,23 +5331,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (_context == null)
                 throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
-            // Softmax is row-wise; it can't fuse into the pointwise GEMM epilogue (used to throw here).
-            // GEMM+bias then a per-row softmax over [M, N]. GemmBias + softmax run on the backend's
-            // default command queue, not `stream`, so drain the caller's stream first (prior writes to
-            // A/B/bias complete before GemmBias reads them), then Finish so the result in `output` is
-            // ready on return — a subsequent SynchronizeStream(stream) is then a safe no-op.
             if (activation == FusedActivationType.Softmax)
             {
-                SynchronizeStream(stream);
-                var gemmBias = GemmBias(A, B, bias, M, N, K);
-                try
-                {
-                    Softmax(gemmBias, output, M, N);
-                }
-                finally
-                {
-                    gemmBias.Dispose();   // release the temp even if Softmax throws
-                }
+                FusedGemmBiasRowSoftmax(A, B, bias, output, M, N, K, stream);
                 return;
             }
 
@@ -5379,6 +5365,23 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             var (globalX, globalY, tile) = FusedGemmLaunchShape(M, N);
             kernel.Execute2DOnQueue(stream.Handle, globalX, globalY, tile, tile);
+        }
+
+        /// <summary>
+        /// GEMM + bias followed by a softmax over each of the <paramref name="M"/> rows of length <paramref name="N"/>.
+        /// A softmax reads its whole row, so it has no per-element GEMM epilogue: the affine part is the plain
+        /// <c>gemm_bias</c> launch on the caller's <paramref name="stream"/>, into scratch logits. The row softmax
+        /// kernel runs on the backend queue, so the caller's queue is drained before it and the backend queue after
+        /// it; the result is complete in <paramref name="output"/> on return.
+        /// </summary>
+        private void FusedGemmBiasRowSoftmax(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, IGpuBuffer output,
+            int M, int N, int K, IGpuStream stream)
+        {
+            using var logits = AllocateBuffer(M * N);
+            FusedGemmBiasActivationAsync(A, B, bias, logits, M, N, K, FusedActivationType.None, stream);
+            SynchronizeStream(stream);
+            Softmax(logits, output, M, N);
+            Synchronize();
         }
 
         /// <inheritdoc/>

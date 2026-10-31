@@ -81,6 +81,29 @@ jobs:
             --logger "console;verbosity=detailed" | tee "$RUNNER_TEMP/ratchet.log"
           exit "${PIPESTATUS[0]}"
 
+      # #1574: DLPack round trips with the real torch in this process, and torch-exported ResNet-18 and BERT-style
+      # encoder through import -> ONNX export -> ONNX Runtime. Both test sets skip without their environment, so a
+      # skip here means the lane is misconfigured and fails it.
+      - name: Interop with PyTorch (DLPack, ONNX export)
+        run: |
+          python -m pip install "onnx==1.23.2"
+          python tools/parity/export_torch_onnx.py --out "$RUNNER_TEMP/torch-onnx"
+          # Assigned, then exported: `export X="$(cmd)"` would drop python's exit status.
+          AIDOTNET_TORCH_PYTHON="$(python -c 'import sys; print(sys.executable)')"
+          export AIDOTNET_TORCH_PYTHON
+          export AIDOTNET_TORCH_ONNX_DIR="$RUNNER_TEMP/torch-onnx"
+          dotnet build tests/AiDotNet.Tensors.Onnx.Tests/AiDotNet.Tensors.Onnx.Tests.csproj --configuration Release --framework net10.0
+          set -o pipefail
+          dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-build --framework net10.0 \
+            --filter "FullyQualifiedName~DLPackTorchInteropTests&FullyQualifiedName!~Cuda_" | tee "$RUNNER_TEMP/interop.log"
+          dotnet test tests/AiDotNet.Tensors.Onnx.Tests/AiDotNet.Tensors.Onnx.Tests.csproj --configuration Release --no-build --framework net10.0 \
+            --filter "FullyQualifiedName~OnnxTorchExportTests|FullyQualifiedName~OnnxExportRoundTripTests" | tee -a "$RUNNER_TEMP/interop.log"
+          # The CUDA case runs in the GPU lane; here every selected test must run.
+          if grep -E 'Skipped: +[1-9]' "$RUNNER_TEMP/interop.log"; then
+            echo "::error::An interop test skipped; AIDOTNET_TORCH_PYTHON / AIDOTNET_TORCH_ONNX_DIR or ONNX Runtime is not set up."
+            exit 1
+          fi
+
       - name: Summary
         if: always()
         run: |

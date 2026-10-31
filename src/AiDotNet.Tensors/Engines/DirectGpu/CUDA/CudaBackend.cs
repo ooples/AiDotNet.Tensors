@@ -609,6 +609,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public CudaBackend(int deviceIndex)
     {
+        DeviceOrdinal = deviceIndex;
         _memoryAccount = DeviceMemoryAccount.For("cuda", deviceIndex);
         _kernelCache = new ConcurrentDictionary<string, IntPtr>(StringComparer.Ordinal);
         // Resolve explicit configuration before native probing or the availability fallback. A
@@ -5891,25 +5892,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
-        // Softmax is row-wise; it can't fuse into the pointwise GEMM epilogue (used to throw here).
-        // GEMM+bias then per-row softmax over [M, N]. Verified on CUDA + OpenCL (RTX 2060).
         if (activation == FusedActivationType.Softmax)
         {
-            // GemmBias and the softmax kernel both run on the backend's DEFAULT stream, not `stream`.
-            // To preserve ordering w.r.t. the caller's stream, drain it first (so prior writes to
-            // A/B/bias complete before GemmBias reads them), then fully synchronize after so the result
-            // in `output` is ready on return — a subsequent SynchronizeStream(stream) is then a no-op.
-            SynchronizeStream(stream);
-            var gemmBias = GemmBias(A, B, bias, M, N, K);
-            try
-            {
-                Softmax(gemmBias, output, M, N);
-            }
-            finally
-            {
-                gemmBias.Dispose();   // release the temp even if Softmax throws
-            }
-            Synchronize();
+            FusedGemmBiasRowSoftmax(A, B, bias, output, M, N, K, stream);
             return;
         }
 
@@ -5939,6 +5924,23 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         };
 
         ExecuteFusedGemmOnStream(kernelName, A, B, bias, output, M, N, K, stream);
+    }
+
+    /// <summary>
+    /// GEMM + bias followed by a softmax over each of the <paramref name="M"/> rows of length <paramref name="N"/>.
+    /// A softmax reads its whole row, so it has no per-element GEMM epilogue: the affine part is the plain
+    /// <c>gemm_bias</c> launch on the caller's <paramref name="stream"/>, into scratch logits. The row softmax kernel
+    /// runs on the backend stream, so the caller's stream is drained before it and the backend stream after it; the
+    /// result is complete in <paramref name="output"/> on return.
+    /// </summary>
+    private void FusedGemmBiasRowSoftmax(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, IGpuBuffer output,
+        int M, int N, int K, IGpuStream stream)
+    {
+        using var logits = AllocateBuffer(M * N);
+        FusedGemmBiasActivationAsync(A, B, bias, logits, M, N, K, FusedActivationType.None, stream);
+        SynchronizeStream(stream);
+        Softmax(logits, output, M, N);
+        Synchronize();
     }
 
     /// <inheritdoc/>
@@ -6328,6 +6330,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (!CanRunDeferredFrees()) return;
         DrainPendingFinalizerFrees();
         DrainPendingGraphDestroys();
+        // Imported (DLPack) memory whose tensor was finalized: before the context destroys, so a release that still
+        // needs its backend's stream finds it alive.
+        DrainPendingExternalReleases();
         // Reclaim contexts leaked by undisposed engines (finalizer-deferred). Drain AFTER the buffer frees
         // so any pending free targeting one of these contexts runs first; whatever's left is reclaimed
         // wholesale by cuCtxDestroy. No-op fast path when the queue is empty (the common case).
@@ -6342,7 +6347,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     /// </summary>
     private bool CanRunDeferredFrees()
     {
-        if (PendingFinalizerFrees.IsEmpty && PendingGraphDestroys.IsEmpty && PendingContextDestroys.IsEmpty) return false;
+        if (PendingFinalizerFrees.IsEmpty && PendingGraphDestroys.IsEmpty && PendingContextDestroys.IsEmpty
+            && PendingExternalReleases.IsEmpty) return false;
         if (IsCapturingOnThisThread || CaptureMemoryPool.Current is not null) return false;
         return _cudaContext == IntPtr.Zero || !IsStreamCapturingCurrentContext();
     }
@@ -6356,7 +6362,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private void EnsureContextCurrentForBoundLaunch()
     {
         if (_threadCurrentContext == _cudaContext &&
-            PendingFinalizerFrees.IsEmpty && PendingContextDestroys.IsEmpty && PendingGraphDestroys.IsEmpty)
+            PendingFinalizerFrees.IsEmpty && PendingContextDestroys.IsEmpty && PendingGraphDestroys.IsEmpty &&
+            PendingExternalReleases.IsEmpty)
             return;
         EnsureContextCurrent();
     }
@@ -20161,6 +20168,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             }
         }
         internal bool IsAsyncFreed => _asyncFreeStream != IntPtr.Zero;
+
+        /// <summary>Pins this buffer to <paramref name="pool"/>: its releases are parked until the pool retires.</summary>
+        internal void PinTo(CaptureMemoryPool pool) => pool.Pin(ref _capturePins, this);
         internal IntPtr OwningContext => _context;
 
         /// <param name="account">The device's memory counters, for a fresh allocation; null for a pool's new wrapper of
