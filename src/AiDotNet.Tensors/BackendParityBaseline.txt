@@ -4,8 +4,6 @@
 
 
 
-composed CudaBackend.Fma #1638
-composed HipBackend.Fma #1638
 composed HipBackend.ScaledDotProductAttentionBackward #1638
 composed MetalBackend.CrossEntropyBackward #1638
 composed MetalBackend.CsrSpMMBias #1638

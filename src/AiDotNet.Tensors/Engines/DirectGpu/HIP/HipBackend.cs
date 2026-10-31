@@ -8287,9 +8287,16 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void Fma(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, IGpuBuffer D, int size)
     {
-        // D = A * B + C
-        Multiply(A, B, D, size);
-        Add(D, C, D, size);
+        // D = fma(A, B, C) in one kernel; D may alias C.
+        if (size <= 0) return;
+        if (!_kernelCache.TryGetValue("fma_vectors", out var kernel))
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: fma_vectors");
+        IntPtr pa = A.Handle, pb = B.Handle, pc = C.Handle, pd = D.Handle;
+        int n = size;
+        void** args = stackalloc void*[5];
+        args[0] = &pa; args[1] = &pb; args[2] = &pc; args[3] = &pd; args[4] = &n;
+        LaunchKernel(kernel, (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
+        Synchronize();
     }
 
     public unsafe void Lerp(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, float t, int size)

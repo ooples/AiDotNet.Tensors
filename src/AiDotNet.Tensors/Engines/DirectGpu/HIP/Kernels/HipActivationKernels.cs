@@ -174,6 +174,15 @@ extern ""C"" __global__ __launch_bounds__(256) void softmax(const float* input, 
     }
 }
 
+// D = fma(A, B, C), one rounding, in one pass. No __restrict__: D may be C (an in-place accumulate), which the
+// former Multiply-into-D-then-Add composition got wrong (it overwrote C before reading it).
+extern ""C"" __global__ __launch_bounds__(256) void fma_vectors(const float* A, const float* B, const float* C, float* D, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    D[idx] = fmaf(A[idx], B[idx], C[idx]);
+}
+
 extern ""C"" __global__ __launch_bounds__(256) void add_vectors(const float* A, const float* B, float* C, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1331,7 +1340,7 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
             "relu", "sigmoid", "tanh_activation", "gelu", "swish", "softmax",
             "leaky_relu", "leaky_relu_backward", "elu", "elu_backward", "swish_backward",
             "add_vectors", "subtract_vectors", "multiply_vectors", "divide_vectors",
-            "add_relu", "add_sigmoid", "add_gelu", "add_relu_vec4", "add_sigmoid_vec4", "add_gelu_vec4",
+            "fma_vectors", "add_relu", "add_sigmoid", "add_gelu", "add_relu_vec4", "add_sigmoid_vec4", "add_gelu_vec4",
             "min_vectors", "max_vectors", "scale_vector", "scale_by_device_scalar", "power_scalar",
             "squared_deviation_from_mean", "clip_by_norm_from_squared_sum", "scatter_add_accumulate_deterministic",
             "abs_vector", "exp_vector", "log_vector", "log2_vector", "exp2_vector",

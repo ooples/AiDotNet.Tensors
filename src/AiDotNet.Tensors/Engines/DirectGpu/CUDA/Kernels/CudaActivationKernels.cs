@@ -739,6 +739,15 @@ extern ""C"" __global__ __launch_bounds__(256) void softmax(const float* __restr
     }
 }
 
+// D = fma(A, B, C), one rounding, in one pass. No __restrict__: D may be C (an in-place accumulate), which the
+// former Multiply-into-D-then-Add composition got wrong (it overwrote C before reading it).
+extern ""C"" __global__ __launch_bounds__(256) void fma_vectors(const float* A, const float* B, const float* C, float* D, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    D[idx] = fmaf(A[idx], B[idx], C[idx]);
+}
+
 extern ""C"" __global__ __launch_bounds__(256) void add_vectors(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1580,7 +1589,7 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
                 "avg_pool1d", "max_pool1d", "bilinear_upsample2d",
                 "scatter_mean", "scatter_mean_activation_deterministic", "scatter_mean_divide",
                 // Element-wise binary
-                "add_vectors",
+                "add_vectors", "fma_vectors",
                 "subtract_vectors",
                 "multiply_vectors",
                 "divide_vectors",
