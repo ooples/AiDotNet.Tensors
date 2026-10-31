@@ -476,19 +476,6 @@ public sealed partial class WebGpuBackend
             a, b, result, uniforms, 1).GetAwaiter().GetResult();
     }
 
-    public void BatchedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
-        int batchSize, int vecSize)
-    {
-        if (batchSize <= 0 || vecSize <= 0) return;
-        long totalElements = (long)batchSize * vecSize;
-        if (totalElements > a.Size) throw new ArgumentOutOfRangeException(nameof(batchSize), $"batchSize*vecSize ({totalElements}) exceeds buffer A length ({a.Size}).");
-        if (totalElements > b.Size) throw new ArgumentOutOfRangeException(nameof(batchSize), $"batchSize*vecSize ({totalElements}) exceeds buffer B length ({b.Size}).");
-        if (totalElements > int.MaxValue) throw new ArgumentOutOfRangeException(nameof(batchSize), "batchSize*vecSize exceeds int.MaxValue.");
-
-        using var temp = AllocateBuffer((int)totalElements);
-        Multiply(a, b, temp, (int)totalElements);
-        SumAxis(temp, result, batchSize, vecSize);
-    }
     public void Power(IGpuBuffer A, IGpuBuffer B, float exponent, int size) => PowerAsync(A, B, exponent, size).GetAwaiter().GetResult();
     public void Abs(IGpuBuffer A, IGpuBuffer B, int size) => AbsAsync(A, B, size).GetAwaiter().GetResult();
     public void Exp(IGpuBuffer A, IGpuBuffer B, int size) => ExpAsync(A, B, size).GetAwaiter().GetResult();
@@ -778,13 +765,6 @@ public sealed partial class WebGpuBackend
         int total = M * N;
         Dispatch5BufferAsync("CsrSpMM", WebGpuKernels.CsrSpMMSource, "csr_spmm",
             csrValues, csrColIndices, csrRowPointers, denseB, output, uniforms, total).GetAwaiter().GetResult();
-    }
-
-    public void CsrSpMMBias(IGpuBuffer csrValues, IGpuBuffer csrColIndices, IGpuBuffer csrRowPointers,
-        IGpuBuffer denseB, IGpuBuffer bias, IGpuBuffer output, int M, int K, int N, int nnz)
-    {
-        CsrSpMM(csrValues, csrColIndices, csrRowPointers, denseB, output, M, K, N, nnz);
-        BiasAdd(output, bias, output, M, N);
     }
 
     public void ScatterAddEdges(IGpuBuffer input, IGpuBuffer sourceIndices, IGpuBuffer targetIndices,
