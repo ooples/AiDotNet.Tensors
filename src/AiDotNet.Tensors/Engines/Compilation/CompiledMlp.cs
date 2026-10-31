@@ -140,12 +140,8 @@ internal sealed class CompiledMlp
         }
         return plan;
 
-        static int maxIn(int[] features)
-        {
-            int max = 0;
-            foreach (int f in features) if (f > max) max = f;
-            return max;
-        }
+        // The widest layer input, or 0 for no layers.
+        static int maxIn(int[] features) => System.Linq.Enumerable.Aggregate(features, 0, Math.Max);
     }
 
     /// <summary>
