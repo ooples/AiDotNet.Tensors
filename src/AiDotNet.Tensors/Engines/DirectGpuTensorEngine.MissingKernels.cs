@@ -7983,7 +7983,12 @@ public partial class DirectGpuTensorEngine
                     v2d.Reshape(new[] { B, S, D }), B, H, S, S, d, 1.0 / System.Math.Sqrt(d), causal: false, causalOffset: 0,
                     new[] { B, S, D });
                 bool shortAttention = headsOut is not null;
-                if (headsOut is null && (long)B * H * S * S <= MhaBatchedScoreElementBudget)
+                // Composed when the scores fit the budget, and also past it when the backend declines its fused kernel
+                // for this size (IFusedAttentionPreference: the portable fused kernels lose to the composed form until
+                // the scores are 64M elements). Declining there sent the shape to the per-(batch, head) loop instead.
+                bool fusedDeclined = backend is DirectGpu.CUDA.IFusedAttentionPreference fusedPreference
+                    && !fusedPreference.PrefersFusedAttention(B, H, S, S, d);
+                if (headsOut is null && ((long)B * H * S * S <= MhaBatchedScoreElementBudget || fusedDeclined))
                 {
                     var qhB = ReshapePermuteHeads(backend, q2d, B, S, H, d);                                    // [B*H, S, d]
                     var khT = PermuteResidentGpu(backend, k2d.Reshape(new[] { B, S, H, d }), new[] { 0, 2, 3, 1 })
