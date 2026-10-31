@@ -2888,6 +2888,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 return;
             }
 
+            // Per shape, the faster of this established route and the split-K GEMM (OpenClBackend.TunedGemm). Not while
+            // offline tuning runs: that measures the route below.
+            if (!offlineEnabled && TryTunedGemm(A, B, C, M, N, K, alpha, beta))
+                return;
+
             // A deployment reaches this slot only after the first-party experiment scaffold has
             // compiled it, compared its output with the independent CPU oracle, and applied the
             // paired finalist gate. Give that exact typed deployment priority over generic vendor
