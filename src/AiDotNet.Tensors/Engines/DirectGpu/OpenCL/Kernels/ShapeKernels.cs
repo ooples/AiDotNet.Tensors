@@ -514,6 +514,14 @@ __kernel void copy_2d_strided(__global const float* src, __global float* dst, in
     if (col >= srcCols || row >= numRows) return;
     dst[row * destTotalCols + destColOffset + col] = src[row * srcCols + col];
 }
+// copy_2d_strided four columns at a time, where srcCols, destTotalCols and destColOffset are all multiples of 4 (every row
+// then starts 16-byte aligned). Launched 2D as (srcCols / 4, numRows) in groups along one row: a concatenation copies each
+// image's contiguous run into its slice, and the scalar kernel's square work-groups touched 16 short runs of 16 rows.
+__kernel void copy_2d_strided4(__global const float* src, __global float* dst, int numRows, int srcCols, int destTotalCols, int destColOffset) {
+    int q = get_global_id(0); int row = get_global_id(1);
+    if (4 * q >= srcCols || row >= numRows) return;
+    vstore4(vload4(0, src + (long)row * srcCols + 4 * q), 0, dst + (long)row * destTotalCols + destColOffset + 4 * q);
+}
 // Initialize padded index rows (stored as float): idx[r*P + i] = (i < L) ? i : -1.
 __kernel void iota_pad(__global float* idx, int L, int P, int numRows) {
     int gid = get_global_id(0); if (gid >= numRows * P) return;
@@ -715,7 +723,7 @@ __kernel void next_after(__global const float* a, __global const float* b, __glo
             "diag_kernel", "extract_diag_kernel", "triangular_mask",
             "masked_fill_kernel", "index_select", "take_along_dim",
             "cross3", "ldexp_kernel", "kron2d", "search_sorted", "next_after", "index_write", "cdist", "pdist",
-            "histc", "bitonic_step", "copy_rows", "copy_2d_strided", "iota_pad", "rwkv7_forward", "hsoftmax_paths",
+            "histc", "bitonic_step", "copy_rows", "copy_2d_strided", "copy_2d_strided4", "iota_pad", "rwkv7_forward", "hsoftmax_paths",
             "isin", "unfold", "copy_block_2d", "scatter_reduce", "zeta_kernel", "polygamma_kernel", "reflect_pad_1d", "stft_mag_phase", "phase_vocoder", "build_spectrum", "istft_from_spectrum", "istft_normalize", "shifted_diff", "histogramdd", "masks_to_boxes", "pairwise_iou", "logical_op", "logical_not", "gridsample_backward_input", "gridsample_backward_grid"
         };
     }

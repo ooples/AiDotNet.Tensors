@@ -59,6 +59,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     _conv2DBackwardDataSlot ??= new TunedKernelSlot<TunedConv2DBackwardArgs>(TunedKernelOp.Conv2DBackwardData,
                         TunedDeviceKey, BackwardHarness(), () => GpuDeterminism.IsActive, new ITunedKernelCandidate<TunedConv2DBackwardArgs>[]
                         {
+                            // The column GEMM first, as the reference wherever it applies: the direct kernel took up to 160 ms
+                            // a call on ResNet-50 shapes and was timed in every tuning pair (see Conv2DForwardSlot).
+                            new DelegateTunedKernelCandidate<TunedConv2DBackwardArgs>("opencl.conv2d_dx.column_gemm", TunedKernelOrigin.Builtin,
+                                true, AdmitsColumnGemm, (in TunedConv2DBackwardArgs a) => Conv2DBackwardInputColumnGemm(a)),
                             new DelegateTunedKernelCandidate<TunedConv2DBackwardArgs>("opencl.conv2d_dx.direct", TunedKernelOrigin.Builtin,
                                 true, _ => HasTunedKernel("conv2d_backward_input"), (in TunedConv2DBackwardArgs a) => LaunchDxDirect(a)),
                             new DelegateTunedKernelCandidate<TunedConv2DBackwardArgs>("opencl.conv2d_dx.winograd_f23", TunedKernelOrigin.Builtin,
@@ -72,7 +76,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                             new DelegateTunedKernelCandidate<TunedConv2DBackwardArgs>("opencl.conv2d_dx.s2k1", TunedKernelOrigin.Builtin,
                                 true, shape => PortableConvDgradS2.K1Enabled && PortableConvDgradS2.AdmitsK1Shape(shape) && DgradS2Ready,
                                 (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardInputS2K1(a)) LaunchDxDirect(a); }),
+                            new DelegateTunedKernelCandidate<TunedConv2DBackwardArgs>("opencl.conv2d_dx.pointwise_gemm", TunedKernelOrigin.Builtin,
+                                true, AdmitsPointwiseGemm, (in TunedConv2DBackwardArgs a) => Conv2DBackwardInputPointwiseGemm(a)),
                         });
+                    _conv2DBackwardDataSlot.UntunedPreference ??= static _ => s_conv2DBackwardDataUntunedPreference;
                     return _conv2DBackwardDataSlot;
                 }
             }
@@ -88,6 +95,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     _conv2DBackwardFilterSlot ??= new TunedKernelSlot<TunedConv2DBackwardArgs>(TunedKernelOp.Conv2DBackwardFilter,
                         TunedDeviceKey, BackwardHarness(), () => GpuDeterminism.IsActive, new ITunedKernelCandidate<TunedConv2DBackwardArgs>[]
                         {
+                            // The column GEMM first, as the reference wherever it applies: the direct kernel took up to 160 ms
+                            // a call on ResNet-50 shapes and was timed in every tuning pair (see Conv2DForwardSlot).
+                            new DelegateTunedKernelCandidate<TunedConv2DBackwardArgs>("opencl.conv2d_dw.column_gemm", TunedKernelOrigin.Builtin,
+                                true, AdmitsColumnGemm, (in TunedConv2DBackwardArgs a) => Conv2DBackwardFilterColumnGemm(a)),
                             new DelegateTunedKernelCandidate<TunedConv2DBackwardArgs>("opencl.conv2d_dw.direct", TunedKernelOrigin.Builtin,
                                 true, _ => HasTunedKernel("conv2d_backward_weights"), (in TunedConv2DBackwardArgs a) => LaunchDwDirect(a)),
                             new DelegateTunedKernelCandidate<TunedConv2DBackwardArgs>("opencl.conv2d_dw.winograd_f32", TunedKernelOrigin.Builtin,
@@ -96,7 +107,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                             new DelegateTunedKernelCandidate<TunedConv2DBackwardArgs>("opencl.conv2d_dw.winograd_fused", TunedKernelOrigin.Builtin,
                                 true, shape => WinogradF23Pipeline.AdmitsShape(shape) && FusedFilterGradientReady,
                                 (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardFilterWinogradFused(a)) LaunchDwDirect(a); }),
+                            new DelegateTunedKernelCandidate<TunedConv2DBackwardArgs>("opencl.conv2d_dw.pointwise_gemm", TunedKernelOrigin.Builtin,
+                                true, AdmitsPointwiseGemm, (in TunedConv2DBackwardArgs a) => Conv2DBackwardFilterPointwiseGemm(a)),
                         });
+                    _conv2DBackwardFilterSlot.UntunedPreference ??= static _ => s_conv2DBackwardFilterUntunedPreference;
                     return _conv2DBackwardFilterSlot;
                 }
             }

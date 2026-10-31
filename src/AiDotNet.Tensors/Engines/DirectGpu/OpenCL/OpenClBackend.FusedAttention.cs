@@ -5,9 +5,12 @@ using P = AiDotNet.Tensors.Engines.DirectGpu.PortableFusedAttention;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 
-public sealed partial class OpenClBackend : IFusedAttentionBackend
+public sealed partial class OpenClBackend : IFusedAttentionBackend, IFusedAttentionPreference
 {
     bool IFusedAttentionBackend.SupportsFusedAttention(int headDim) => P.Supports(headDim);
+
+    bool IFusedAttentionPreference.PrefersFusedAttention(int batch, int heads, int seqQ, int seqK, int headDim)
+        => P.PrefersFused(batch, heads, seqQ, seqK);
 
     void IFusedAttentionBackend.FusedAttentionForward(IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer o, IGpuBuffer lse,
         IGpuBuffer? mask, in FusedAttentionParams p, int headDim)

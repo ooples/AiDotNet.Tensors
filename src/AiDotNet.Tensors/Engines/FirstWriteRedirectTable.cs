@@ -1,5 +1,6 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
 using System.Collections.Generic;
+using System.Linq;
 using AiDotNet.Tensors.Engines.DirectGpu;
 
 namespace AiDotNet.Tensors.Engines;
@@ -25,7 +26,10 @@ internal sealed class FirstWriteRedirectTable
     private readonly Dictionary<long, IGpuBuffer> _redirects = new();
     private readonly HashSet<long> _blocked = new();
     private readonly Dictionary<long, (IGpuBuffer Contribution, IGpuBuffer Accumulator)> _offers = new();
-    private readonly Dictionary<IGpuBuffer, int> _uses = new();
+    // Uses by (buffer, backward action): pooled gradients share one device buffer across tenants whose lifetimes do not
+    // overlap, so one buffer is the accumulator of several redirected slots in different actions. Counted per buffer alone,
+    // every such slot looked consumed twice and was blocked. A contribution is consumed in the action that produced it.
+    private readonly Dictionary<(IGpuBuffer Buffer, int Action), int> _uses = new();
 
     /// <summary>Number of redirected slots (diagnostics and tests).</summary>
     internal int Count => _redirects.Count;
@@ -37,18 +41,25 @@ internal sealed class FirstWriteRedirectTable
         _uses.Clear();
     }
 
-    /// <summary>Counts one accumulation consuming <paramref name="contribution"/>'s device buffer.</summary>
-    internal void NoteContribution(IGpuBuffer? contribution)
+    /// <summary>Counts one accumulation in compiled action <paramref name="action"/> consuming <paramref name="contribution"/>'s
+    /// device buffer.</summary>
+    internal void NoteContribution(IGpuBuffer? contribution, int action)
     {
         if (contribution is null) return;
-        _uses[contribution] = _uses.TryGetValue(contribution, out int n) ? n + 1 : 1;
+        var key = (contribution, action);
+        _uses[key] = _uses.TryGetValue(key, out int n) ? n + 1 : 1;
     }
+
+    private static int ActionOf(long slot) => (int)(slot >> 32);
 
     /// <summary>A slot's output was just copied into an accumulator as its first write: a candidate for this run.</summary>
     internal void Offer(long slot, IGpuBuffer contribution, IGpuBuffer accumulator)
     {
         if (!_blocked.Contains(slot)) _offers[slot] = (contribution, accumulator);
     }
+
+    /// <summary>The redirected slots.</summary>
+    internal IEnumerable<long> RedirectedSlots => _redirects.Keys;
 
     internal bool TryGetTarget(long slot, out IGpuBuffer target) => _redirects.TryGetValue(slot, out target!);
 
@@ -63,14 +74,14 @@ internal sealed class FirstWriteRedirectTable
         if (!executed) return;
         foreach (var kv in _offers)
         {
-            if (_uses.TryGetValue(kv.Value.Contribution, out int n) && n == 1) _redirects[kv.Key] = kv.Value.Accumulator;
+            if (_uses.TryGetValue((kv.Value.Contribution, ActionOf(kv.Key)), out int n) && n == 1) _redirects[kv.Key] = kv.Value.Accumulator;
             else { _blocked.Add(kv.Key); _redirects.Remove(kv.Key); }
         }
-        List<long>? reused = null;
-        foreach (var kv in _redirects)
-            if (_uses.TryGetValue(kv.Value, out int n) && n > 1) (reused ??= new()).Add(kv.Key);
-        if (reused is not null)
-            foreach (long slot in reused) { _blocked.Add(slot); _redirects.Remove(slot); }
+        var reused = _redirects
+            .Where(kv => _uses.TryGetValue((kv.Value, ActionOf(kv.Key)), out int n) && n > 1)
+            .Select(kv => kv.Key)
+            .ToList();
+        foreach (long slot in reused) { _blocked.Add(slot); _redirects.Remove(slot); }
     }
 
     /// <summary>Forgets every redirect (the eager step, or the pooled slots were freed). Blocked slots stay blocked.</summary>

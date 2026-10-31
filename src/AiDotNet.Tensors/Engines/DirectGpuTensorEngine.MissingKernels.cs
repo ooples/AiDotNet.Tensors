@@ -1596,7 +1596,10 @@ public partial class DirectGpuTensorEngine
             {
                 bufOut.Dispose();
                 bufOut = default;
-                return base.BatchNormInference(x, gamma, beta, mean, variance, epsilon, activation);
+                // No fused kernel for this activation: the device batch norm, then the activation through this engine,
+                // so the value stays on the device. The base ran both on the host (a download and an upload per call).
+                var normalized = BatchNormInference(x, gamma, beta, mean, variance, epsilon);
+                return ActivationRegistry.Get(activation) is { } handler ? handler.Apply(this, normalized) : normalized;
             }
             var result = DeferTensorResult<T>(backend, bufOut.Buffer, x.Length, x.Shape.ToArray());
             bufOut.RelinquishOwnership();
@@ -7958,6 +7961,18 @@ public partial class DirectGpuTensorEngine
             float scale = (float)(1.0 / System.Math.Sqrt(d));
             T scaleT = (T)(object)scale;
             var input2d = (input.IsContiguous ? input : (Tensor<T>)input.Contiguous()).Reshape(new[] { B * S, D });
+            // Unmasked inference self-attention over a short sequence: the three projections as one GEMM over the cached
+            // [W_q | W_k | W_v], and the short-sequence kernel reading the packed rows in place.
+            if (mask is null && !IsTapeActive<T>()
+                && TryPackedShortSelfAttention(input2d, qWeight, kWeight, vWeight, B, H, S, d, 1.0 / System.Math.Sqrt(d)) is { } packedHeads)
+            {
+                var packedProj = TensorMatMul(packedHeads.Reshape(new[] { B * S, D }), outWeight);
+                var packedResult = packedProj.Reshape(new[] { B, S, D });
+                // As the short kernel's route below: only this thread's transients, in queue order, no device sync.
+                DropTransientActivationsCreatedAfter(actSnapshot, packedProj.DataVector, allThreads: false);
+                if (s_mhaDiag) MhaDiag(tapeActive: false);
+                return packedResult;
+            }
             // Q/K/V projections on the GPU (2-D GEMM), [B*S, D] each.
             var q2d = TensorMatMul(input2d, qWeight);
             var k2d = TensorMatMul(input2d, kWeight);
@@ -7974,8 +7989,18 @@ public partial class DirectGpuTensorEngine
             // so a recording tape keeps the path it had.
             if (mask is null && !IsTapeActive<T>())
             {
-                Tensor<T>? headsOut = null;
-                if ((long)B * H * S * S <= MhaBatchedScoreElementBudget)
+                // The short-sequence kernel reads the projections in place and writes [B, S, H*d]: no head permutes,
+                // no score tensor, one launch (see IShortAttentionForwardBackend).
+                Tensor<T>? headsOut = TryShortAttentionOnDevice(q2d.Reshape(new[] { B, S, D }), k2d.Reshape(new[] { B, S, D }),
+                    v2d.Reshape(new[] { B, S, D }), B, H, S, S, d, 1.0 / System.Math.Sqrt(d), causal: false, causalOffset: 0,
+                    new[] { B, S, D });
+                bool shortAttention = headsOut is not null;
+                // Composed when the scores fit the budget, and also past it when the backend declines its fused kernel
+                // for this size (IFusedAttentionPreference: the portable fused kernels lose to the composed form until
+                // the scores are 64M elements). Declining there sent the shape to the per-(batch, head) loop instead.
+                bool fusedDeclined = backend is DirectGpu.CUDA.IFusedAttentionPreference fusedPreference
+                    && !fusedPreference.PrefersFusedAttention(B, H, S, S, d);
+                if (headsOut is null && ((long)B * H * S * S <= MhaBatchedScoreElementBudget || fusedDeclined))
                 {
                     var qhB = ReshapePermuteHeads(backend, q2d, B, S, H, d);                                    // [B*H, S, d]
                     var khT = PermuteResidentGpu(backend, k2d.Reshape(new[] { B, S, H, d }), new[] { 0, 2, 3, 1 })
@@ -7986,7 +8011,7 @@ public partial class DirectGpuTensorEngine
                     headsOut = PermuteResidentGpu(backend, BatchMatMul(attnB, vhB).Reshape(new[] { B, H, S, d }),
                         new[] { 0, 2, 1, 3 });                                                                 // [B, S, H, d]
                 }
-                else
+                else if (headsOut is null)
                 {
                     headsOut = TryFusedAttentionOnDevice("MultiHeadAttentionForward", q2d.Reshape(new[] { B, S, D }),
                         k2d.Reshape(new[] { B, S, D }), v2d.Reshape(new[] { B, S, D }), null, B, H, S, S, d,
@@ -7998,7 +8023,11 @@ public partial class DirectGpuTensorEngine
                 {
                     var batchedProj = TensorMatMul(headsOut.Reshape(new[] { B * S, D }), outWeight);
                     var batchedResult = batchedProj.Reshape(new[] { B, S, D });
-                    DropTransientActivationsCreatedAfter(actSnapshot, batchedProj.DataVector, allThreads: true);
+                    // The route is tapeless. The composed attention leaves intermediates on BLAS pool threads, so
+                    // it drops every thread's and synchronizes the device first. The short kernel leaves only this
+                    // thread's (the projections), which the per-thread drop frees in queue order with no device
+                    // sync: a sync per attention layer made the drop 38% of a GPU ViT b32 forward.
+                    DropTransientActivationsCreatedAfter(actSnapshot, batchedProj.DataVector, allThreads: !shortAttention);
                     if (s_mhaDiag) MhaDiag(tapeActive: false);
                     return batchedResult;
                 }
@@ -8124,8 +8153,11 @@ public partial class DirectGpuTensorEngine
         {
             int last = weights.Count - 1;
             var cur = input;
+            int rowFrom = RowMlpSuffixStart(input, weights);
             for (int i = 0; i < weights.Count; i++)
             {
+                if (i == rowFrom && TryRowMlpForward(cur, weights, biases, i, hiddenActivation, outputActivation) is { } row)
+                    return row;
                 var act = (i == last) ? outputActivation : hiddenActivation;
                 var ap = (i == last) ? outputActivationParams : hiddenActivationParams;
                 cur = FusedLinear(cur, weights[i], biases[i], act, ap);   // GPU-resident per layer
@@ -8135,6 +8167,76 @@ public partial class DirectGpuTensorEngine
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MlpForward", capabilityGap);
             return base.MlpForward(input, weights, biases, hiddenActivation, outputActivation,
                 hiddenActivationParams, outputActivationParams);
+        }
+    }
+
+    // The most weight elements a layer may have to run in the one-work-group batch-1 kernel. It reads every weight through
+    // one compute unit, about 23 GB/s on gfx1012: the parity MLP (784-512-128-10, 1.8 MB of weights) runs in ~70 us as
+    // one launch, 0.26-0.28 ms end to end against 0.26-0.34 ms with its first layer on the split-K GEMV (two launches)
+    // and 0.40 ms layer by layer. Past ~2 MB a layer reads faster across the whole device than it saves in launches.
+    private const int RowMlpMaxLayerWeights = 1 << 19;
+
+    // The first layer of the batch-1 suffix the one-launch kernel runs: every layer from it on is small enough
+    // (RowMlpMaxLayerWeights). weights.Count when there is none; the earlier layers run as FusedLinear.
+    private static int RowMlpSuffixStart<T>(Tensor<T> input, System.Collections.Generic.IReadOnlyList<Tensor<T>> weights)
+    {
+        if (input.Rank != 2 || input._shape[0] != 1) return weights.Count;
+        int start = weights.Count;
+        while (start > 0 && weights[start - 1] is { } w && w.Length <= RowMlpMaxLayerWeights) start--;
+        return start;
+    }
+
+    // One input row through layers [from, Count) of an MLP in one launch (IRowMlpForwardBackend), or null to run them
+    // layer by layer. At batch 1 each layer was about three launches around a few thousand multiply-adds.
+    private Tensor<T>? TryRowMlpForward<T>(Tensor<T> input, System.Collections.Generic.IReadOnlyList<Tensor<T>> weights,
+        System.Collections.Generic.IReadOnlyList<Tensor<T>?> biases, int from, FusedActivationType hiddenActivation,
+        FusedActivationType outputActivation)
+    {
+        int layers = weights.Count - from;
+        if (typeof(T) != typeof(float) || IsTapeActive<T>() || layers < 1 || input.Rank != 2 || input._shape[0] != 1
+            || !TryGetBackend(out var backend) || backend is not IRowMlpForwardBackend rowMlp)
+            return null;
+        var widths = new int[layers + 1];
+        widths[0] = input._shape[1];
+        for (int i = 0; i < layers; i++)
+        {
+            var w = weights[from + i];
+            if (w is null || w.Rank != 2 || w._shape[0] != widths[i]) return null;
+            widths[i + 1] = w._shape[1];
+            if (biases[from + i] is { } b && b.Length != widths[i + 1]) return null;
+        }
+
+        using var inputBuffer = GetOrAllocateBuffer(backend, input);
+        var owned = new System.Collections.Generic.List<OwnedBuffer>(2 * layers);
+        try
+        {
+            var weightBuffers = new IGpuBuffer[layers];
+            var biasBuffers = new IGpuBuffer?[layers];
+            for (int i = 0; i < layers; i++)
+            {
+                var wb = GetWeightBufferPreferResident(backend, weights[from + i], PersistentTensorRole.Weights);
+                owned.Add(wb);
+                weightBuffers[i] = wb.Buffer;
+                if (biases[from + i] is { } bias)
+                {
+                    var bb = GetWeightBufferPreferResident(backend, bias, PersistentTensorRole.Biases);
+                    owned.Add(bb);
+                    biasBuffers[i] = bb.Buffer;
+                }
+            }
+            int outputs = widths[layers];
+            // Disposed unless handed to the result (RelinquishOwnership makes the dispose a no-op).
+            using var output = AllocateFullyWrittenOutputBuffer(backend, outputs);
+            if (!rowMlp.TryRowMlpForward(inputBuffer.Buffer, weightBuffers, biasBuffers, widths, hiddenActivation,
+                    outputActivation, output.Buffer))
+                return null;
+            var result = DeferTensorResult<T>(backend, output.Buffer, outputs, new[] { 1, outputs });
+            output.RelinquishOwnership();
+            return result;
+        }
+        finally
+        {
+            foreach (var buffer in owned) buffer.Dispose();
         }
     }
 

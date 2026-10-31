@@ -692,9 +692,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             CompileKernelModule(Kernels.HipFlashDecodeKernels.GetSource(), "flash_decode", ref _flashDecodeModule,
                 Kernels.HipFlashDecodeKernels.GetKernelNames());
 
-            // Compile Attention kernels (FlashAttention, GQA, ScaledDotProduct)
+            // Compile Attention kernels (FlashAttention, GQA, ScaledDotProduct). Without fast math: the online softmax
+            // starts its running max at -INFINITY and masks with it, which -ffast-math (finite-math-only) makes
+            // undefined, as OpenCL builds its attention kernels with NaN/Inf-preserving flags.
             CompileKernelModule(HipAttentionKernels.GetSource(), "attention", ref _attentionModule,
-                HipAttentionKernels.GetKernelNames());
+                HipAttentionKernels.GetKernelNames(), useFastMath: false);
 
             // Compile FFT kernels (Cooley-Tukey radix-2 FFT, STFT, Mel spectrogram)
             CompileKernelModule(HipFFTKernels.GetSource(), "fft", ref _fftModule,
@@ -833,6 +835,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             CompileTunedRowKernels();
             CompileWinogradKernels();
             CompileBatchNormRegisterKernels();
+            CompileFiniteGuardKernels();
 
             // Compile split-buffer complex kernels for native Tensor<Complex<T>> operations
             CompileKernelModule(Kernels.HipComplexKernels.GetSource(), "complex", ref _complexModule, Kernels.HipComplexKernels.GetKernelNames());

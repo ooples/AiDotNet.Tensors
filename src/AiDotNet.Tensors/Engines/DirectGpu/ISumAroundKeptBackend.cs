@@ -5,7 +5,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// gradient, dY [N, C, H, W] summed over N, H and W -- in two deterministic passes, without permuting the tensor so the
 /// kept axis comes last. Every backend forms it natively as a permute and a row sum.
 /// </summary>
-[BackendSpecificRoute("CUDA two-pass sum around a kept axis block; every backend permutes and row-sums natively",
+[BackendSpecificRoute("CUDA and OpenCL two-pass sum around a kept axis block; every backend permutes and row-sums natively",
     nameof(IDirectGpuBackend.Permute), nameof(IDirectGpuBackend.SumAxis))]
 internal interface ISumAroundKeptBackend
 {

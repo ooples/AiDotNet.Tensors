@@ -1690,6 +1690,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!Helpers.ResidentHostMirror.TryFindCovering(view, array, view._storageOffset, view.Length, backend,
                 out var memberBuffer, out int start) || memberBuffer is null)
             return false;
+        // Read the range in place where the member buffer can be addressed there: a copy per call was a whole input
+        // activation held in a step scratch slot per convolution backward (~1 GB on a GPU DenseNet-121 step).
+        if (start == 0 && memberBuffer.Size >= view.Length)
+        {
+            result = new OwnedBuffer(memberBuffer, ownsBuffer: false);
+            return true;
+        }
+        if (backend is IGpuBufferViews views && views.TryCreateView(memberBuffer, start, view.Length) is { } window)
+        {
+            result = new OwnedBuffer(window, ownsBuffer: true);
+            return true;
+        }
         var output = AllocateFullyWrittenOutputBuffer(backend, view.Length);
         try
         {
@@ -2739,8 +2751,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     /// <returns>The device bytes released.</returns>
     internal long EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect, bool materializePending)
+        => EvictActivationsCreatedAfter(snapshot, protect, materializePending, released: null);
+
+    /// <summary>As above, reporting the released buffers.</summary>
+    /// <param name="released">Receives every device buffer released, so a caller holding tensors bound to them (a
+    /// compiled plan's forward outputs and gradients, reused by the next replay) can drop those bindings.</param>
+    internal long EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect, bool materializePending,
+        ICollection<IGpuBuffer>? released)
         => EvictActivationsCreatedAfter(snapshot, protect,
-            materializePending ? ActivationReleaseMode.MaterializeThenFree : ActivationReleaseMode.DropScratch);
+            materializePending ? ActivationReleaseMode.MaterializeThenFree : ActivationReleaseMode.DropScratch,
+            released: released);
 
     /// <summary>
     /// Message a host read of a released step intermediate throws (see <see cref="ActivationReleaseMode.Release"/>).
@@ -2832,7 +2852,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <see cref="TensorScope"/> passes the storages created inside it, so a tensor that predates it is never freed).
     /// </summary>
     internal long EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect, ActivationReleaseMode mode,
-        Func<object, bool>? releasableOnly = null, bool afterQueuedWork = false)
+        Func<object, bool>? releasableOnly = null, bool afterQueuedWork = false, ICollection<IGpuBuffer>? released = null)
     {
         // The activation timestamp counter is process-wide, so "created after my snapshot"
         // also matches a CONCURRENT tape's activations on another thread. Free only THIS
@@ -2886,16 +2906,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
             }
         }
-        long released = 0;
+        long releasedBytes = 0;
         foreach (var entry in toDispose)
         {
-            released += entry.Buffer.SizeInBytes;
+            // A step scratch pool's buffer leaves the cache but is not freed: the pool hands it out again (as
+            // ReleaseDeadDeviceStorage leaves it alone), and freeing it gave the GPU pool a buffer the scratch pool's
+            // next lease still wrote, under whatever the GPU pool had handed it to in the meantime.
+            if (StepScratchPool.IsPooled(entry.Buffer)) continue;
+            releasedBytes += entry.Buffer.SizeInBytes;
+            released?.Add(entry.Buffer);
             // A scope ends while work that reads its results can still be queued: each backend frees after that work (CUDA:
             // stream-ordered), as TryFreeActivationByKey does, so the pool cannot hand the buffer to a later kernel early.
             if (afterQueuedWork && entry.Backend is IQueuedBufferRelease queued) queued.ReleaseAfterQueuedWork(entry.Buffer);
             else entry.Dispose();
         }
-        return released;
+        return releasedBytes;
     }
 
     /// <summary>
@@ -3738,6 +3763,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         view = copy;
         owned = true;
         return true;
+    }
+
+    /// <summary>
+    /// Binds a float PARAMETER to a device buffer the on-device optimizer updates in place and the forward reads
+    /// (<see cref="GetWeightBufferPreferResident{T}"/>). A parameter already resident and current on this engine's
+    /// backend (<see cref="Tensor{T}.Gpu"/>) keeps its own buffer: registering it in the persistent cache allocated a
+    /// second device copy of it and orphaned the first, about 115 MB of a GPU ResNet-50's training peak.
+    /// </summary>
+    internal void BindResidentParamBuffer<T>(Tensor<T> param)
+    {
+        if (param is null) return;
+        if (param._gpuBuffer is not null && TryGetBackend(out var backend)
+            && ReferenceEquals(param._gpuBackend, backend) && param._gpuBufferVersion == param.GpuCacheVersion)
+            return;
+        RegisterResidentParamBuffer(param);
     }
 
     /// <summary>Resident FP16 training (#633): register a PARAMETER's GPU buffer in the persistent weight cache
@@ -5399,6 +5439,30 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// capture determinism. Call before each fwd/bwd action; pass -1 to disable (pre-pass / optimizer / eval).</summary>
     internal void SetCurrentScratchAction(int action) => CurrentScratchPool?.Begin(action);
 
+    /// <summary>The compiled action whose scratch this thread is pooling, or -1 outside one.</summary>
+    internal int CurrentScratchAction => CurrentScratchPool?.Action ?? -1;
+
+    /// <summary>
+    /// Ends the running compiled action's leased output slots (<see cref="StepScratchPool.Lease"/>). A buffer still
+    /// referenced after the action - a gradient contribution parked for a later backward, or one adopted as a gradient
+    /// accumulator - stays its slot's for good; every other one is free for the next action's leases.
+    /// </summary>
+    internal void EndScratchAction()
+    {
+        var adopted = Autodiff.DifferentiableOps.TakeAdoptedAccumulators();
+        if (CurrentScratchPool is not { HasLeases: true } pool) return;
+        HashSet<IGpuBuffer>? escaped = null;
+        void Note(object? tensor)
+        {
+            if (tensor is Tensor<float> t && t.TryGetGpuBuffer() is { } buffer) (escaped ??= new HashSet<IGpuBuffer>()).Add(buffer);
+        }
+        if (DeferredGradients is { } deferral)
+            foreach (var parked in deferral.ParkedContributions) Note(parked);
+        if (adopted is not null)
+            foreach (var accumulator in adopted) Note(accumulator);
+        pool.EndLeases(escaped);
+    }
+
     /// <summary>True while inside a compiled action whose transient scratch should draw from its plan's pool, on the
     /// thread running that step.</summary>
     private bool ScratchPoolingActive => CurrentScratchPool is { Action: >= 0 } && ResidentStepActive;
@@ -5446,6 +5510,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             StepScratchPool.Untrack(b);
             pool.Keys.Remove(b);
             try { b.Dispose(); } catch (ObjectDisposedException) { }
+        }
+        if (pool.Leases(key))
+        {
+            // A backward output, consumed within its action: a buffer leased until the action ends (EndScratchAction).
+            var leased = pool.Lease(key, backend, length);
+            if (!fullyWritten)
+            {
+                if (backend is IDeviceZeroFill zeroLeased) zeroLeased.ZeroBuffer(leased, length);
+                else backend.Fill(leased, 0f, length);
+            }
+            return leased;
         }
         var nb = backend.AllocateBuffer(length);   // first pass at this (action,local): record the stable buffer
         pool.Slots[key] = nb;
@@ -7033,8 +7108,60 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
             catch (NotSupportedException rex) { GpuLaunchProbe.OnFallback("CreateTapeBailStats", rex); AliasDiag($"BCastAddInPlace-resident FELLBACK: {rex.GetType().Name}: {rex.Message}"); }
         }
+        // A bias over the trailing axes ([..., D] += [D], a projection's output bias): in place on the device. The CPU
+        // base downloaded `a` with a blocking read, added on the host and left it there; MultiHeadAttentionLayer's fused
+        // inference adds its output bias this way, which made the add 18% of a GPU ViT b32 forward.
+        // Only where `a` already has a current device buffer (resolved without an upload or a download); a host tensor
+        // keeps the host add.
+        if (typeof(T) == typeof(float) && !Gpu.AutocastScope.IsEnabled && a.IsContiguous && !IsPartialView(a)
+            && TryTrailingBroadcast(a, b, out int biasRows, out int biasCols) && TryGetBackend(out var beBias)
+            && ResolveResidentBufferNoUpload(beBias, a, a.Length, includePersistentWeightCache: false) is { } aResident
+            && aResident.Handle != System.IntPtr.Zero && aResident.Size >= a.Length)
+        {
+            OwnedBuffer biasBuffer = default;
+            try
+            {
+                var bContiguous = b.IsContiguous ? b : b.Contiguous();
+                biasBuffer = GetOrAllocateBuffer(beBias, bContiguous);
+                beBias.BiasAdd(aResident, biasBuffer.Buffer, aResident, biasRows, biasCols);
+                a.IncrementVersion();
+                BindResidentBuffer(a, aResident, beBias);
+                if (!ResidentStepActive) StampInPlaceGpuBuffer(a, beBias, aResident);
+                return;
+            }
+            catch (NotSupportedException ex)
+            {
+                GpuLaunchProbe.OnFallback("TensorBroadcastAddInPlace", ex);
+            }
+            finally
+            {
+                biasBuffer.DisposeAfterQueuedUse(beBias);
+            }
+        }
         // Shapes differ — CPU handles broadcasting logic
         base.TensorBroadcastAddInPlace(a, b);
+    }
+
+    // b broadcasts over a's leading axes only: with b's leading 1s dropped, its shape is a's last dimensions.
+    private static bool TryTrailingBroadcast<T>(Tensor<T> a, Tensor<T> b, out int rows, out int cols)
+    {
+        rows = cols = 0;
+        var ad = a.Shape._dims;
+        var bd = b.Shape._dims;
+        int first = 0;
+        while (first < bd.Length && bd[first] == 1) first++;
+        int kept = bd.Length - first;
+        if (kept == 0 || kept > ad.Length) return false;
+        long width = 1;
+        for (int i = 0; i < kept; i++)
+        {
+            if (bd[first + i] != ad[ad.Length - kept + i]) return false;
+            width *= bd[first + i];
+        }
+        if (width <= 0 || a.Length % width != 0 || width > int.MaxValue) return false;
+        cols = (int)width;
+        rows = a.Length / cols;
+        return rows > 0;
     }
 
     void IEngine.SigmoidInPlace<T>(Tensor<T> tensor)
@@ -8011,6 +8138,58 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (tensor.GetLiveBackingArrayOrNull() is null)
             return TryRunUnaryInPlaceResident(tensor, op);
 
+        // A host-backed tensor that already has a current device buffer (a compiled plan's leaf, which the step's
+        // pre-pass binds, such as a BatchNorm running statistic) runs in place on that buffer and stays resident, as
+        // TryRunBinaryInPlace does: the host path below uploaded it again and downloaded the result with a blocking
+        // read on every call - three transfers per op, the larger part of a GPU ResNet training step.
+        if (!Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float) && tensor.IsContiguous && !IsPartialView(tensor)
+            && ResolveResidentBufferNoUpload(backend, tensor, tensor.Length, includePersistentWeightCache: false) is { } resident
+            && resident.Handle != System.IntPtr.Zero && resident.Size >= tensor.Length)
+        {
+            try
+            {
+                op(backend, resident, tensor.Length);
+                ResidentSyncCheck("UnaryInPlace");
+                tensor.IncrementVersion();
+                BindResidentBuffer(tensor, resident, backend);
+                if (!ResidentStepActive) StampInPlaceGpuBuffer(tensor, backend, resident);
+                return true;
+            }
+            catch (NotSupportedException rex)
+            {
+                GpuLaunchProbe.OnFallback("TryRunUnaryInPlace", rex);
+                /* fall through to the host path below */
+            }
+        }
+
+        // Inside a compiled resident step, a host tensor the step updates in place with no device buffer yet (state
+        // the plan does not bind as an input: a BatchNorm running statistic, written by an in-place node) moves to
+        // the device once - one upload, then it is bound as authoritative with the host download armed, as
+        // TryCreateDeviceStateTensor binds its state - so every later in-place op on it takes the resident branch
+        // above. The host path below uploaded it and downloaded the result every call: 40 blocking round trips a
+        // step on ResNet-18.
+        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && tensor is Tensor<float> floatTensor && tensor.IsContiguous
+            && !IsPartialView(tensor) && tensor._gpuBuffer is null)
+        {
+            IGpuBuffer? state = null;
+            try
+            {
+                var host = new float[tensor.Length];
+                floatTensor.AsSpanUnmarked().CopyTo(host);
+                state = backend.AllocateBuffer(host);
+                op(backend, state, tensor.Length);
+                tensor.IncrementVersion();
+                BindResidentBuffer(tensor, state, backend);
+                return true;
+            }
+            catch (NotSupportedException rex)
+            {
+                GpuLaunchProbe.OnFallback("TryRunUnaryInPlace", rex);
+                state?.Dispose();
+                /* fall through to the host path below */
+            }
+        }
+
         using var dataLease = tensor.LeaseArray();
         var data = dataLease.Array;
         using var buffer = GetOrAllocateBuffer(backend, tensor);
@@ -8627,6 +8806,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             case FusedActivationType.HardTanh:
                 backend.Hardtanh(input, output, -1.0f, 1.0f, size);
                 break;
+            case FusedActivationType.ReLU6:
+                // MobileNetV2's activation: the fused conv + BatchNorm path threw here, so a GPU predict crashed.
+                backend.Relu6(input, output, size);
+                break;
             case FusedActivationType.None:
                 if (!ReferenceEquals(input, output))
                 {
@@ -8740,6 +8923,51 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Propagate ownership: if cache owns buffer, GpuTensor shouldn't dispose;
         // if we own buffer (race condition fallback), GpuTensor should take ownership
         return Tensor<T>.FromGpuBuffer(backend, ownedBuffer.Buffer, tensor.Shape.ToArray(), role, ownsBuffer: ownedBuffer.OwnsBuffer);
+    }
+
+    /// <summary>
+    /// Drops the persistent weight-cache copy of a tensor that has just been given its own resident buffer on this
+    /// engine's backend (<see cref="Tensor{T}.Gpu"/>). From then on the weight reads take the resident buffer
+    /// (<see cref="GetWeightBufferPreferResident{T}"/>), so the copy an earlier forward cached (the warm-up or
+    /// inference before training) was dead: a second device copy of every weight for the life of the process.
+    /// A later read that does need the cache (the resident buffer judged stale) uploads again. A convolution kernel's
+    /// BatchNorm fold made from its host weights goes too, with its folded tensors' device copies: the next evaluation
+    /// folds the resident weights on the device, so those were dead as well (78 MB of a GPU ResNet-50's training peak).
+    /// </summary>
+    internal void DropPersistentCopy<T>(Tensor<T> tensor)
+    {
+        DropCachedCopy(tensor.GetBackingArrayForCacheLookupUnsafe());
+        ConvBatchNormFold<T>.Forget(tensor, ReleaseFolded);
+    }
+
+    /// <summary>
+    /// Frees a replaced or forgotten BatchNorm fold's tensor: its persistent-cache copy (a fold of host weights is
+    /// uploaded through the cache keyed by its array, which the cache holds, so no finalizer ever frees it) and its own
+    /// device storage (a fold made on the device).
+    /// </summary>
+    private void ReleaseFolded<T>(Tensor<T> folded)
+    {
+        DropCachedCopy(folded.GetBackingArrayForCacheLookupUnsafe());
+        ReleaseDeadDeviceStorage(folded, afterQueuedWork: true);
+    }
+
+    private void DropCachedCopy(object? backing)
+    {
+        if (backing is null || !_persistentBufferCache.ContainsKey(backing)) return;
+        lock (_persistentBufferLock)
+        {
+            // Freed, not pooled: nothing rents this size again, so a pooled copy would hold the memory for the life of
+            // the process all the same. Safe with work still queued on it: OpenCL defers the free until the commands
+            // on it complete, CUDA and HIP synchronize the free, and Vulkan waits on every dispatch outside a batch
+            // (a weight is never made resident inside one).
+            if (_persistentBufferCache.TryRemove(backing, out var entry))
+            {
+                if (entry.Buffer is IPoolableGpuBuffer poolable) poolable.Release();
+                else entry.Dispose();
+            }
+            _tensorVersions.TryRemove(backing, out _);
+            _persistentWeightHostVersion.TryRemove(backing, out _);
+        }
     }
 
     /// <summary>
@@ -19065,6 +19293,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var permDims = new int[permArr.Length];
                 for (int i = 0; i < permArr.Length; i++) permDims[i] = inputShape[permArr[i]];
                 var permuted = new Tensor<T>(new T[input.Length], permDims);
+                // The permuted copy lives only for this reduction: it comes from the transient arena the plan's actions
+                // share, not an output slot of its own per action (a GPU DenseNet-121 step held ~0.5 GB of them for its
+                // convolution bias gradients).
+                if (ScratchPoolingActive)
+                {
+                    permuted._gpuBuffer = RentTransientScratch(backend, input.Length, fullyWritten: true);
+                    permuted._gpuBackend = backend;
+                    permuted._gpuBufferVersion = permuted.GpuCacheVersion;
+                }
                 try { TensorPermuteInto(permuted, input, permArr); input = permuted; }
                 catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("ReduceAxisGpu", capabilityGap); input = PermuteImpl(input, permArr); }
             }

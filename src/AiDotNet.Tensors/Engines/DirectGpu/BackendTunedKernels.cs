@@ -232,6 +232,26 @@ internal static class ConvEpilogue
     }
 }
 
+/// <summary>A row-major GEMM C[M, N] = A[M, K] B[K, N] at alpha 1, beta 0 (any backend).</summary>
+internal readonly struct TunedGemmArgs
+{
+    internal TunedGemmArgs(IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, int m, int n, int k)
+    {
+        A = a; B = b; C = c; M = m; N = n; K = k;
+    }
+
+    internal IGpuBuffer A { get; }
+    internal IGpuBuffer B { get; }
+    internal IGpuBuffer C { get; }
+    internal int M { get; }
+    internal int N { get; }
+    internal int K { get; }
+
+    internal int OutputCount => M * N;
+
+    internal TunedShape Shape() => TunedShape.Create(TunedKernelDType.Float32, new[] { M, N, K });
+}
+
 /// <summary>2-D convolution arguments (any backend): NCHW input, [Cout, Cin, kH, kW] filter.</summary>
 internal readonly struct TunedConv2DArgs
 {
