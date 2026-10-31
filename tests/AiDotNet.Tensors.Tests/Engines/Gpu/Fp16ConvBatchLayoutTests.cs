@@ -6,6 +6,7 @@ using System.Linq;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Tests.Engines.DirectGpu;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.Gpu;
@@ -17,8 +18,14 @@ namespace AiDotNet.Tensors.Tests.Engines.Gpu;
 /// <see cref="CpuEngine"/> at batch 1 and 4, with FP32 and FP16-resident output.
 /// </summary>
 [Collection("DirectGpuSerial")]
-public class Fp16ConvBatchLayoutTests
+public class Fp16ConvBatchLayoutTests : IClassFixture<DirectGpuTensorEngineTestFixture>
 {
+    // The test's own engine: the process-wide current engine is shared and other tests reset it to the CPU,
+    // so reading it made these tests skip on a CUDA machine depending on test order.
+    private readonly DirectGpuTensorEngineTestFixture _fixture;
+
+    public Fp16ConvBatchLayoutTests(DirectGpuTensorEngineTestFixture fixture) => _fixture = fixture;
+
     // The backend primitive alone: out[b][M][P] = W[M,K] @ col[K, b*P + p] against an fp64 reference, both outputs.
     [SkippableTheory]
     [InlineData(false)]
@@ -106,11 +113,11 @@ public class Fp16ConvBatchLayoutTests
     public void LargeBatchedFp16Conv_ReachesTheFp16AccumulateRoute_AndMatchesTheCpu()
     {
         Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver not available");
-        var eng = AiDotNetEngine.Current;
-        Skip.IfNot(eng is DirectGpuTensorEngine, "active engine is not the CUDA backend");
+        var eng = _fixture.Engine;
+        Skip.IfNot(eng is not null, "the DirectGpu engine did not initialize");
         var warm = new Tensor<float>(new float[] { 1, 2, 3, 4 }, new[] { 2, 2 });
-        _ = eng.TensorMatMul(warm, warm);
-        var backend = ((DirectGpuTensorEngine)eng).TestBackend as CudaBackend;
+        _ = eng!.TensorMatMul(warm, warm);
+        var backend = eng!.TestBackend as CudaBackend;
         Skip.IfNot(backend is not null && backend.IsAvailable && backend.SupportsHgemm && backend.Fp16Im2colAvailable
                    && backend.GetDirectPtxRuntime().ComputeCapabilityMajor >= 8, "Needs the CUDA FP16 im2col conv path on Ampere+.");
         const int batch = 8, inC = 128, h = 28, w = 28, outC = 128;
@@ -152,11 +159,11 @@ public class Fp16ConvBatchLayoutTests
     public void Fp16Im2colConv_WritesNchw_ForEveryBatch(int batch, bool fp16Activations)
     {
         Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver not available");
-        var eng = AiDotNetEngine.Current;
-        Skip.IfNot(eng is DirectGpuTensorEngine, "active engine is not the CUDA backend");
+        var eng = _fixture.Engine;
+        Skip.IfNot(eng is not null, "the DirectGpu engine did not initialize");
         var warm = new Tensor<float>(new float[] { 1, 2, 3, 4 }, new[] { 2, 2 });
-        _ = eng.TensorMatMul(warm, warm);
-        var backend = ((DirectGpuTensorEngine)eng).TestBackend as CudaBackend;
+        _ = eng!.TensorMatMul(warm, warm);
+        var backend = eng!.TestBackend as CudaBackend;
         Skip.IfNot(backend is not null && backend.IsAvailable && backend.SupportsHgemm && backend.Fp16Im2colAvailable,
             "Needs the CUDA FP16 im2col conv path.");
 
