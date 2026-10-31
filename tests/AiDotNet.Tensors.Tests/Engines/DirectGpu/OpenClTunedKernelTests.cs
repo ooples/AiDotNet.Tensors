@@ -402,6 +402,8 @@ public sealed class OpenClTunedKernelTests
         (2, 200, 2, 2, 5, 1, 1, 0, 1), (3, 20, 8, 8, 130, 1, 1, 0, 1), (2, 6, 5, 3, 4, 1, 1, 0, 1),
         // A strided stem over three channels into 37 outputs: three 16-channel blocks, the last partial.
         (2, 3, 9, 7, 37, 3, 2, 1, 1),
+        // 1 x 1 maps through half-padded odd filters: only the centre tap reads the image (the centre-tap GEMM route).
+        (3, 20, 1, 1, 9, 3, 1, 1, 1), (2, 6, 1, 1, 5, 5, 1, 2, 1),
     };
 
     [SkippableFact]
@@ -471,9 +473,11 @@ public sealed class OpenClTunedKernelTests
             bool pointwiseRb = k == 1 && s == 1 && p == 0 && oh * ow % 4 == 0;
             // The small-channel direct route admits at most four input channels.
             bool smallChannel = c <= 4;
+            // The centre-tap route admits a 1 x 1 input and output through an odd, undilated, half-padded filter.
+            bool centerTap = h == 1 && w == 1 && oh == 1 && ow == 1 && k % 2 == 1 && p == k / 2 && d == 1;
             Assert.Equal(backend.Conv2DForwardSlot.CandidateIds.Count, Applicable(backend.Conv2DForwardSlot, args.Shape()).Count
                 + (k > 7 ? 1 : 0) + (WinogradF23Pipeline.AdmitsShape(args.Shape()) ? 0 : 3) + (bt == 1 ? 0 : 1)
-                + (pointwise ? 0 : 1) + (pointwiseRb ? 0 : 1) + (smallChannel ? 0 : 1));
+                + (pointwise ? 0 : 1) + (pointwiseRb ? 0 : 1) + (smallChannel ? 0 : 1) + (centerTap ? 0 : 1));
         }
     }
     // The GEMM slot's candidates (the established route, the split-K GEMM and the skinny GEMM) each against a double

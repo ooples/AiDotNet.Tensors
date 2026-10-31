@@ -90,6 +90,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                                     && shape[1] * shape[5] * shape[6] <= Kernels.WinogradFusedKernels.SmallChannelMaxTaps
                                     && HasTunedKernel(Kernels.WinogradFusedKernels.SmallChannel),
                                 (in TunedConv2DArgs a) => Conv2DSmallChannel(a)),
+                            // A 1 x 1 input to a 1 x 1 output through an odd filter padded by half its size (ResNet's last
+                            // stage at a 32 x 32 input): only the centre tap reads the image, so it is one GEMM over the
+                            // filters' centre column, where Winograd computed sixteen products per output.
+                            new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.center_tap", TunedKernelOrigin.Builtin, true,
+                                shape => AdmitsCenterTap(shape) && HasTunedKernel(Kernels.WinogradFusedKernels.CenterTapGather),
+                                (in TunedConv2DArgs a) => Conv2DCenterTap(a)),
                         };
                         _conv2DForwardSlot = new TunedKernelSlot<TunedConv2DArgs>(TunedKernelOp.Conv2DForward, TunedDeviceKey,
                             new BackendTunedKernelHarness<TunedConv2DArgs>(this, ConvolutionTolerance, () => IsAvailable,
@@ -108,7 +114,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
 
         private static readonly string[] s_conv2DForwardUntunedPreference =
-            { "opencl.conv2d.winograd_fused", "opencl.conv2d.im2col_rb_gemm", "opencl.conv2d.pointwise_rb", "opencl.conv2d.im2col_gemm" };
+            {
+                "opencl.conv2d.center_tap", "opencl.conv2d.winograd_fused", "opencl.conv2d.im2col_rb_gemm",
+                "opencl.conv2d.pointwise_rb", "opencl.conv2d.im2col_gemm",
+            };
 
         private static void ConvArgs(DirectOpenClKernel k, in TunedConv2DArgs a, bool withKernelGeometry)
         {
@@ -213,6 +222,28 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private const int WinogradFusedChunkAlign = 8;
         private const int WinogradFusedMinSlice = 32;
         private const int WinogradFusedGroupsPerComputeUnit = 2;
+
+        // (batch, C, H, W, O, kH, kW, sH, sW, pH, pW, dH, dW, OH, OW): 1 x 1 in and out, odd undilated filter, half padding.
+        private static bool AdmitsCenterTap(TunedShape shape)
+            => shape[2] == 1 && shape[3] == 1 && shape[13] == 1 && shape[14] == 1 && shape[5] % 2 == 1 && shape[6] % 2 == 1
+                && shape[9] == shape[5] / 2 && shape[10] == shape[6] / 2 && shape[11] == 1 && shape[12] == 1;
+
+        // One work item per gathered weight.
+        private const int CenterTapGatherGroupSize = 256;
+
+        // y[n][o] = sum over c of x[n][c] * w[o][c][centre]: the centre column gathered transposed, then one GEMM.
+        private void Conv2DCenterTap(in TunedConv2DArgs a)
+        {
+            int c = a.InChannels, o = a.OutChannels;
+            using var wcT = AllocateBuffer(checked(c * o));
+            var gather = _kernelCache[Kernels.WinogradFusedKernels.CenterTapGather];
+            gather.SetArg(0, BufferHandle(a.Kernel)); gather.SetArg(1, BufferHandle(wcT));
+            gather.SetArg(2, o); gather.SetArg(3, c); gather.SetArg(4, a.KernelH * a.KernelW);
+            gather.SetArg(5, (a.KernelH / 2) * a.KernelW + a.KernelW / 2);
+            gather.Execute1D(RoundUpToMultiple(c * o, CenterTapGatherGroupSize), CenterTapGatherGroupSize);
+            Gemm(a.Input, wcT, a.Output, a.Batch, o, c);
+            ConvEpiloguePasses(a);
+        }
 
         private const int SmallChannelConvMaxChannels = 4;
 

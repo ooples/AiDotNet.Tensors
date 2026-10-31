@@ -24,6 +24,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels
         // Built with these kernels for their shared conv_epilogue: a direct convolution over few input channels.
         internal const string SmallChannel = "conv2d_smallc";
         internal const string SmallChannel3x3 = "conv2d_smallc3";
+        internal const string CenterTapGather = "conv_center_tap_gather";
 
         /// <summary>Output channels one conv2d_smallc work item computes (SC_OB in the source).</summary>
         internal const int SmallChannelBlock = 16;
@@ -34,7 +35,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels
         /// </summary>
         internal const int SmallChannelMaxTaps = 196;
 
-        internal static string[] GetKernelNames() => new[] { Forward, SplitReduce, SmallChannel, SmallChannel3x3 };
+        internal static string[] GetKernelNames() => new[] { Forward, SplitReduce, SmallChannel, SmallChannel3x3, CenterTapGather };
 
         internal const string Source = @"
 #define WF_BO 32
@@ -258,6 +259,16 @@ void conv2d_smallc(__global const float* restrict in, __global const float* rest
         const int o = o0 + j;
         if (o < O) out[(long)(n * O + o) * npix + q] = conv_epilogue(acc[j], bias, o, epi);
     }
+}
+// wcT[c][o] = w[o][c][centre]: the GEMM operand of a convolution whose 1 x 1 output reads a 1 x 1 input through its
+// filters' centre tap alone (an odd filter padded by half its size).
+__kernel void conv_center_tap_gather(__global const float* restrict w, __global float* restrict wcT, const int O,
+    const int C, const int taps, const int centre)
+{
+    const int i = get_global_id(0);
+    if (i >= O * C) return;
+    const int c = i / O, o = i - c * O;
+    wcT[i] = w[((long)o * C + c) * taps + centre];
 }
 // conv2d_smallc for a 3 x 3 filter, unrolled: a channel's nine window values are loaded together, out-of-bounds taps
 // predicated to zero, before its products. In the general form each tap's load sat behind its bounds branches, so the
