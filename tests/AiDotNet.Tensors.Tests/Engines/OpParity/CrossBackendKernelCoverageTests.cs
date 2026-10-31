@@ -62,6 +62,8 @@ public sealed class CrossBackendKernelCoverageTests
         // OpenCL's element-parallel batch-norm inference (optionally with ReLU): CUDA/HIP run the same op as
         // batchnorm_forward with training = 0, and batchnorm_relu for the ReLU form (CudaNormalizationKernels.cs).
         "batchnorm_inference",
+        "batchnorm_inference4",              // the same op four spatial elements at a time when the plane is a multiple of 4
+        "copy_2d_strided4",                  // OpenCL's float4 form of copy_2d_strided (CudaMissingLookupKernels.cs; HipBackend.cs)
         // OpenCL batch-execution kernels whose CUDA/HIP twin is a shared mode kernel (BatchExecutionCudaKernels.cs):
         "bx_crop_2d_backward",               // -> bx_window_2d mode 3
         "bx_mse_loss_rows",                  // -> bx_row_loss mode 1
