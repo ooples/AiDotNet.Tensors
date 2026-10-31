@@ -34,3 +34,4 @@ static AiDotNet.Tensors.Interop.DLPackStream.NoSync.get -> AiDotNet.Tensors.Inte
 static AiDotNet.Tensors.Interop.DLPackStream.PerThreadDefault.get -> AiDotNet.Tensors.Interop.DLPackStream
 static AiDotNet.Tensors.Interop.DLPackStream.operator !=(AiDotNet.Tensors.Interop.DLPackStream left, AiDotNet.Tensors.Interop.DLPackStream right) -> bool
 static AiDotNet.Tensors.Interop.DLPackStream.operator ==(AiDotNet.Tensors.Interop.DLPackStream left, AiDotNet.Tensors.Interop.DLPackStream right) -> bool
+AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelDecisionReason.Heuristic = 8 -> AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelDecisionReason
