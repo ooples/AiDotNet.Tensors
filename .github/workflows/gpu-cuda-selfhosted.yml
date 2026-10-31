@@ -79,23 +79,30 @@ jobs:
     # One job per runner architecture, chosen by the runner's sm label. The SM86 job is the lane's full gate (its check
     # keeps the name "cuda"). The SM75 job (a GTX 1660 Ti) runs the same GPU suites, where the GA10x/SM86-only
     # specializations skip by design, and leaves the AiDotNet model families to the SM86 job: they need its memory.
+    # Pull requests are gated by the SM86 job alone: the suites take about 3 hours on the GTX 1660 Ti (about 1 on the
+    # RTX 3080), so the SM75 job runs on the nightly schedule and on manual dispatch.
     strategy:
       fail-fast: false
       matrix:
+        arch: [sm86, sm75]
+        exclude:
+          - arch: ${{ github.event_name == 'pull_request' && 'sm75' || 'none' }}
         include:
-          - check: cuda
-            arch: sm86
+          - arch: sm86
+            check: cuda
             artifact: gpu-cuda-results
             arch-skips: ''
             model-families: true
-          - check: cuda-sm75
-            arch: sm75
+            timeout: 150
+          - arch: sm75
+            check: cuda-sm75
             artifact: gpu-cuda-results-sm75
             arch-skips: '|\bSM ?86\b|GA10[0-9x]'
             model-families: false
+            timeout: 240
     name: ${{ matrix.check }}
     runs-on: [self-hosted, gpu, cuda, '${{ matrix.arch }}']
-    timeout-minutes: 150
+    timeout-minutes: ${{ matrix.timeout }}
     defaults:
       run:
         shell: pwsh
