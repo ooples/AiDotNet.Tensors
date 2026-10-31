@@ -366,6 +366,7 @@ public partial class DirectGpuTensorEngine
     private Tensor<T>? TryShortAttentionOnDevice<T>(Tensor<T> query, Tensor<T> key, Tensor<T> value, int batch, int heads,
         int seqQ, int seqK, int headDim, double scale, bool causal, int causalOffset, int[] outputShape)
     {
+        using var __gpuOp = EnterGpuOp();
         // An inference trace (a compiled Predict) records the kernel as one node; a training or compatibility trace needs
         // the differentiable primitives, so it keeps them.
         if (!ShortAttentionEnabled) return null;
@@ -465,6 +466,7 @@ public partial class DirectGpuTensorEngine
     private Tensor<T>? TryPackedShortSelfAttention<T>(Tensor<T> input2d, Tensor<T> qWeight, Tensor<T> kWeight,
         Tensor<T> vWeight, int batch, int heads, int seq, int headDim, double scale)
     {
+        using var __gpuOp = EnterGpuOp();
         if (!ShortAttentionEnabled || GraphMode.IsActive || typeof(T) != typeof(float)
             || Autodiff.DifferentiableOps.IsRecording<T>() || Gpu.AutocastScope.IsEnabled || !TryGetBackend(out var backend)
             || backend is not IShortAttentionForwardBackend shortAttention || !shortAttention.SupportsShortAttention(headDim)
@@ -500,6 +502,7 @@ public partial class DirectGpuTensorEngine
     private Tensor<T>? TryRecordShortAttention<T>(Tensor<T> query, Tensor<T> key, Tensor<T> value, int batch, int heads,
         int seqQ, int seqK, int headDim, double scale, bool causal, int causalOffset, int[] outputShape)
     {
+        using var __gpuOp = EnterGpuOp();
         // PlacementBackend, not GetBackend: the latter refuses every backend while a graph is traced (#350).
         if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled || GraphMode.Current is not { } scope
             || PlacementBackend is not IShortAttentionForwardBackend shortAttention || !shortAttention.SupportsShortAttention(headDim)

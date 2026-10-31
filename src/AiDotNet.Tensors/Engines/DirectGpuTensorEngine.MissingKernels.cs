@@ -8322,6 +8322,7 @@ public partial class DirectGpuTensorEngine
         System.Collections.Generic.IReadOnlyList<Tensor<T>?> biases, int from, FusedActivationType hiddenActivation,
         FusedActivationType outputActivation)
     {
+        using var __gpuOp = EnterGpuOp();
         int layers = weights.Count - from;
         if (typeof(T) != typeof(float) || IsTapeActive<T>() || layers < 1 || input.Rank != 2 || input._shape[0] != 1
             || !TryGetBackend(out var backend) || backend is not IRowMlpForwardBackend rowMlp)

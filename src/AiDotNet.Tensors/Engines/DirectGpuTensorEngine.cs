@@ -3862,6 +3862,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     internal void BindResidentParamBuffer<T>(Tensor<T> param)
     {
+        using var __gpuOp = EnterGpuOp();
         if (param is null) return;
         if (param._gpuBuffer is not null && TryGetBackend(out var backend)
             && ReferenceEquals(param._gpuBackend, backend) && param._gpuBufferVersion == param.GpuCacheVersion)
