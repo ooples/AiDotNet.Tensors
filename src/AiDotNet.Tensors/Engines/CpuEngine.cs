@@ -46747,6 +46747,24 @@ public partial class CpuEngine : ITensorLevelEngine
         var iData = iDataLease.Array;
         using var oDataLease = output.LeaseArray();
         var oData = oDataLease.Array;
+        // float/double: the loop below without its three virtual NumOps calls per element. Same arithmetic in the same
+        // precision (the derivative and the product in double, one rounding to T), so bit-identical.
+        if (typeof(T) == typeof(float))
+        {
+            int n = result.Length;
+            Autodiff.ElementwiseBackwardKernels.EluBackwardFromInput(
+                new ReadOnlySpan<float>((float[])(object)gData, 0, n), new ReadOnlySpan<float>((float[])(object)iData, 0, n),
+                new ReadOnlySpan<float>((float[])(object)oData, 0, n), (float[])(object)result, alpha);
+            return new Tensor<T>(result, gradOutput.Shape.ToArray());
+        }
+        if (typeof(T) == typeof(double))
+        {
+            int n = result.Length;
+            Autodiff.ElementwiseBackwardKernels.EluBackwardFromInput(
+                new ReadOnlySpan<double>((double[])(object)gData, 0, n), new ReadOnlySpan<double>((double[])(object)iData, 0, n),
+                new ReadOnlySpan<double>((double[])(object)oData, 0, n), (double[])(object)result, alpha);
+            return new Tensor<T>(result, gradOutput.Shape.ToArray());
+        }
         for (int i = 0; i < result.Length; i++)
         {
             double x = numOps.ToDouble(iData[i]);

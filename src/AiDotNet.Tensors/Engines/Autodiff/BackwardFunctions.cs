@@ -682,6 +682,11 @@ internal static class BackwardFunctions<T>
             return;
         }
 
+        // Host float/double: one fused pass, no per-element GetFlat/SetFlat or NumOps dispatch (see TryEluBackwardHost).
+        if ((typeof(T) == typeof(float) || typeof(T) == typeof(double))
+            && TryEluBackwardHost(gradOutput, inputs[0], output, (double)savedState[0], engine, grads))
+            return;
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var alpha = numOps.FromDouble((double)savedState[0]);
         var derivative = TensorPool<T>.RentZeroed(output._shape);
@@ -712,6 +717,102 @@ internal static class BackwardFunctions<T>
         TensorPool<T>.Return(derivative);
         if (DifferentiableOps.AccumulateGradPoolable(grads, inputs[0], grad, engine))
             TensorPool<T>.Return(grad);
+    }
+
+    /// <summary>
+    /// Host float/double ELU backward in one fused pass: dx = g * (y &gt; 0 ? 1 : y + alpha), written straight into the
+    /// input's gradient accumulator when one exists (otherwise into a pooled contribution).
+    /// </summary>
+    /// <remarks>
+    /// The generic path above built a derivative tensor one element at a time through GetFlat/SetFlat - each paying a
+    /// keep-alive scope, a materialization/residency check, a bounds check, a COW ownership check and a version bump -
+    /// plus a virtual NumOps call per element, then multiplied it by the gradient in a second pass. PerfView on Dreamer
+    /// training put it at 50.9% inclusive CPU. This is the same arithmetic in the same order (derivative in T, then one
+    /// T multiply by the gradient, then the accumulator add), so results are bit-identical, including NaN propagation:
+    /// a NaN output fails <c>y &gt; 0</c> and takes <c>y + alpha</c>, as before. Returns false (the caller takes the
+    /// generic path) on a GPU engine, under create-graph (the multiply must be recorded), for strided or mismatched
+    /// layouts, or when there is no managed host backing.
+    /// </remarks>
+    private static bool TryEluBackwardHost(
+        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> output, double alpha, IEngine engine,
+        Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        if (engine.SupportsGpu || DifferentiableOps._isBackwardCreateGraph
+            || !gradOutput.IsContiguous || !output.IsContiguous
+            || !SameShape(gradOutput._shape, output._shape) || input.Length != output.Length)
+            return false;
+        int len = output.Length;
+        if (len == 0) return false;
+        if (!DifferentiableOps.IsGradientRequired(input)) return true;
+        var g = gradOutput.GetCpuBackingForStridedRead(out int gOff);
+        var y = output.GetCpuBackingForStridedRead(out int yOff);
+        if (g is null || y is null) return false;
+
+        var target = DifferentiableOps.TryGetDirectGradTarget(grads, input, engine, out bool overwrite);
+        int dOff = 0;
+        T[]? dst = target?.GetCpuBackingForContiguousWrite(out dOff);
+        Tensor<T>? contribution = null;
+        if (target is null || dst is null)
+        {
+            target = null;
+            // Every element is written below, so an unzeroed pooled buffer suffices.
+            contribution = TensorPool<T>.Rent(output._shape);
+            dst = contribution.GetCpuBackingForContiguousWrite(out dOff);
+            if (dst is null)
+            {
+                TensorPool<T>.Return(contribution);
+                return false;
+            }
+            overwrite = true;
+        }
+
+        var d = dst;
+        int chunkSize = Math.Max(1024, (len + 31) / 32);
+        int numChunks = (len + chunkSize - 1) / chunkSize;
+        if (typeof(T) == typeof(float))
+        {
+            var gf = (float[])(object)g;
+            var yf = (float[])(object)y;
+            var df = (float[])(object)d;
+            float alphaF = (float)alpha;   // FloatOperations.FromDouble
+            BackwardParallel.ForRows(numChunks, chunkSize * 2L, chunk =>
+            {
+                int start = chunk * chunkSize;
+                ElementwiseBackwardKernels.EluBackward(gf, gOff, yf, yOff, df, dOff, start,
+                    Math.Min(start + chunkSize, len), alphaF, overwrite);
+            });
+        }
+        else
+        {
+            var gd = (double[])(object)g;
+            var yd = (double[])(object)y;
+            var dd = (double[])(object)d;
+            BackwardParallel.ForRows(numChunks, chunkSize * 2L, chunk =>
+            {
+                int start = chunk * chunkSize;
+                ElementwiseBackwardKernels.EluBackward(gd, gOff, yd, yOff, dd, dOff, start,
+                    Math.Min(start + chunkSize, len), alpha, overwrite);
+            });
+        }
+
+        if (contribution is not null)
+        {
+            if (DifferentiableOps.AccumulateGradPoolable(grads, input, contribution, engine))
+                TensorPool<T>.Return(contribution);
+        }
+        else
+        {
+            target?.IncrementVersion();
+        }
+        return true;
+    }
+
+    private static bool SameShape(int[] a, int[] b)
+    {
+        if (a.Length != b.Length) return false;
+        for (int i = 0; i < a.Length; i++)
+            if (a[i] != b[i]) return false;
+        return true;
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -5731,37 +5832,67 @@ internal static class BackwardFunctions<T>
     {
         var a = inputs[0];
         var b = inputs[1];
-        var ops = MathHelper.GetNumericOperations<T>();
         int pairs = gradOutput.Length / 2;
 
-        // d(a*b)/da = conj(b), d(a*b)/db = conj(a) — applied via chain rule
+        // d(a*b)/da = conj(b), d(a*b)/db = conj(a) — applied via chain rule. One span pass per gradient (it was a
+        // GetFlat/SetFlat plus a virtual NumOps call per element); same products, same order, so bit-identical.
+        var gradA = new Tensor<T>(a._shape);
+        var gradB = new Tensor<T>(b._shape);
+        // Reads go through leased arrays (a copy for a strided or device-resident operand, the values GetFlat read);
+        // writes go straight into the fresh gradients' backing arrays.
+        var dAArr = gradA.GetCpuBackingForContiguousWrite(out int dAOff);
+        var dBArr = gradB.GetCpuBackingForContiguousWrite(out int dBOff);
+        int len = 2 * pairs;
+        using (var gLease = gradOutput.LeaseArray())
+        using (var aLease = a.LeaseArray())
+        using (var bLease = b.LeaseArray())
+        using (var gradALease = gradA.LeaseWritable())
+        using (var gradBLease = gradB.LeaseWritable())
         {
-            var gradA = new Tensor<T>(a._shape);
-            for (int i = 0; i < pairs; i++)
+            if (typeof(T) == typeof(float) && dAArr is not null && dBArr is not null)
             {
-                int idx = i * 2;
-                T gRe = gradOutput.GetFlat(idx), gIm = gradOutput.GetFlat(idx + 1);
-                T bRe = b.GetFlat(idx), bIm = b.GetFlat(idx + 1);
-                // grad_a = grad_out * conj(b)
-                gradA.SetFlat(idx, ops.Add(ops.Multiply(gRe, bRe), ops.Multiply(gIm, bIm)));
-                gradA.SetFlat(idx + 1, ops.Subtract(ops.Multiply(gIm, bRe), ops.Multiply(gRe, bIm)));
+                ElementwiseBackwardKernels.ComplexMultiplyBackward(
+                    (float[])(object)gLease.Array, (float[])(object)aLease.Array, (float[])(object)bLease.Array,
+                    new Span<float>((float[])(object)dAArr, dAOff, len), new Span<float>((float[])(object)dBArr, dBOff, len), pairs);
             }
-            DifferentiableOps.AccumulateGrad(grads, a, gradA, engine);
-        }
-
-        {
-            var gradB = new Tensor<T>(b._shape);
-            for (int i = 0; i < pairs; i++)
+            else if (typeof(T) == typeof(double) && dAArr is not null && dBArr is not null)
             {
-                int idx = i * 2;
-                T gRe = gradOutput.GetFlat(idx), gIm = gradOutput.GetFlat(idx + 1);
-                T aRe = a.GetFlat(idx), aIm = a.GetFlat(idx + 1);
-                // grad_b = conj(a) * grad_out
-                gradB.SetFlat(idx, ops.Add(ops.Multiply(aRe, gRe), ops.Multiply(aIm, gIm)));
-                gradB.SetFlat(idx + 1, ops.Subtract(ops.Multiply(aRe, gIm), ops.Multiply(aIm, gRe)));
+                ElementwiseBackwardKernels.ComplexMultiplyBackward(
+                    (double[])(object)gLease.Array, (double[])(object)aLease.Array, (double[])(object)bLease.Array,
+                    new Span<double>((double[])(object)dAArr, dAOff, len), new Span<double>((double[])(object)dBArr, dBOff, len), pairs);
             }
-            DifferentiableOps.AccumulateGrad(grads, b, gradB, engine);
+            else
+            {
+                var ops = MathHelper.GetNumericOperations<T>();
+                var g = gLease.Array;
+                var av = aLease.Array;
+                var bv = bLease.Array;
+                var dA = gradALease.Span;
+                var dB = gradBLease.Span;
+                for (int i = 0; i < pairs; i++)
+                {
+                    int idx = i * 2;
+                    T gRe = g[idx], gIm = g[idx + 1];
+                    T bRe = bv[idx], bIm = bv[idx + 1];
+                    // grad_a = grad_out * conj(b)
+                    dA[idx] = ops.Add(ops.Multiply(gRe, bRe), ops.Multiply(gIm, bIm));
+                    dA[idx + 1] = ops.Subtract(ops.Multiply(gIm, bRe), ops.Multiply(gRe, bIm));
+                }
+                for (int i = 0; i < pairs; i++)
+                {
+                    int idx = i * 2;
+                    T gRe = g[idx], gIm = g[idx + 1];
+                    T aRe = av[idx], aIm = av[idx + 1];
+                    // grad_b = conj(a) * grad_out
+                    dB[idx] = ops.Add(ops.Multiply(aRe, gRe), ops.Multiply(aIm, gIm));
+                    dB[idx + 1] = ops.Subtract(ops.Multiply(aRe, gIm), ops.Multiply(aIm, gRe));
+                }
+            }
         }
+        gradA.IncrementVersion();
+        gradB.IncrementVersion();
+        DifferentiableOps.AccumulateGrad(grads, a, gradA, engine);
+        DifferentiableOps.AccumulateGrad(grads, b, gradB, engine);
     }
 
     internal static void ComplexConjugateBackward(
@@ -5782,18 +5913,46 @@ internal static class BackwardFunctions<T>
         var ops = MathHelper.GetNumericOperations<T>();
         int pairs = a.Length / 2;
 
+        T eps = ops.FromDouble(1e-8);
+
+        // One array pass (it was a GetFlat/SetFlat plus a virtual NumOps call per element); same operations in the same
+        // order, so bit-identical.
         var gradA = new Tensor<T>(a._shape);
-        for (int i = 0; i < pairs; i++)
+        var dAArr = gradA.GetCpuBackingForContiguousWrite(out int dAOff);
+        using (var aLease = a.LeaseArray())
+        using (var magLease = output.LeaseArray())
+        using (var gLease = gradOutput.LeaseArray())
+        using (var gradALease = gradA.LeaseWritable())
         {
-            int idx = i * 2;
-            T re = a.GetFlat(idx), im = a.GetFlat(idx + 1);
-            T mag = output.GetFlat(i);
-            T gOut = gradOutput.GetFlat(i);
-            T eps = ops.FromDouble(1e-8);
-            T safeMag = ops.Add(mag, eps);
-            gradA.SetFlat(idx, ops.Multiply(gOut, ops.Divide(re, safeMag)));
-            gradA.SetFlat(idx + 1, ops.Multiply(gOut, ops.Divide(im, safeMag)));
+            if (typeof(T) == typeof(float) && dAArr is not null)
+            {
+                ElementwiseBackwardKernels.ComplexMagnitudeBackward(
+                    (float[])(object)gLease.Array, (float[])(object)aLease.Array, (float[])(object)magLease.Array,
+                    new Span<float>((float[])(object)dAArr, dAOff, 2 * pairs), pairs, (float)1e-8);   // FloatOperations.FromDouble(1e-8)
+            }
+            else if (typeof(T) == typeof(double) && dAArr is not null)
+            {
+                ElementwiseBackwardKernels.ComplexMagnitudeBackward(
+                    (double[])(object)gLease.Array, (double[])(object)aLease.Array, (double[])(object)magLease.Array,
+                    new Span<double>((double[])(object)dAArr, dAOff, 2 * pairs), pairs, 1e-8);
+            }
+            else
+            {
+                var av = aLease.Array;
+                var mag = magLease.Array;
+                var g = gLease.Array;
+                var dA = gradALease.Span;
+                for (int i = 0; i < pairs; i++)
+                {
+                    int idx = i * 2;
+                    T safeMag = ops.Add(mag[i], eps);
+                    T gOut = g[i];
+                    dA[idx] = ops.Multiply(gOut, ops.Divide(av[idx], safeMag));
+                    dA[idx + 1] = ops.Multiply(gOut, ops.Divide(av[idx + 1], safeMag));
+                }
+            }
         }
+        gradA.IncrementVersion();
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
     }
 
@@ -5817,6 +5976,13 @@ internal static class BackwardFunctions<T>
         int numClasses = logProbs._shape[2];
 
         var grad = new Tensor<T>(logProbs._shape);
+        // Flat [T, N, C] reads and writes: the multi-index indexer per element paid a materialization/residency check
+        // and (writes) a COW check plus a version bump each time. Same values, same order, so bit-identical.
+        using var logProbsLease = logProbs.LeaseArray();
+        var lpData = logProbsLease.Array;
+        using var gradLease = grad.LeaseWritable();
+        var gradData = gradLease.Span;
+        int timeStride = batchSize * numClasses;
 
         int targetOffset = 0;
         for (int n = 0; n < batchSize; n++)
@@ -5836,13 +6002,13 @@ internal static class BackwardFunctions<T>
             for (int t = 0; t < T_n; t++)
                 for (int s = 0; s < S; s++)
                     alpha[t, s] = negInf;
-            alpha[0, 0] = ops.ToDouble(logProbs[0, n, expandedLabels[0]]);
-            if (S > 1) alpha[0, 1] = ops.ToDouble(logProbs[0, n, expandedLabels[1]]);
+            alpha[0, 0] = ops.ToDouble(lpData[n * numClasses + expandedLabels[0]]);
+            if (S > 1) alpha[0, 1] = ops.ToDouble(lpData[n * numClasses + expandedLabels[1]]);
             for (int t = 1; t < T_n; t++)
             {
                 for (int s = 0; s < S; s++)
                 {
-                    double lp = ops.ToDouble(logProbs[t, n, expandedLabels[s]]);
+                    double lp = ops.ToDouble(lpData[t * timeStride + n * numClasses + expandedLabels[s]]);
                     double prev = alpha[t - 1, s];
                     if (s >= 1) prev = LogSumExpHelper(prev, alpha[t - 1, s - 1]);
                     if (s >= 2 && expandedLabels[s] != blank && expandedLabels[s] != expandedLabels[s - 2])
@@ -5862,11 +6028,11 @@ internal static class BackwardFunctions<T>
             {
                 for (int s = S - 1; s >= 0; s--)
                 {
-                    double next = beta[t + 1, s] + ops.ToDouble(logProbs[t + 1, n, expandedLabels[s]]);
+                    double next = beta[t + 1, s] + ops.ToDouble(lpData[(t + 1) * timeStride + n * numClasses + expandedLabels[s]]);
                     if (s + 1 < S)
-                        next = LogSumExpHelper(next, beta[t + 1, s + 1] + ops.ToDouble(logProbs[t + 1, n, expandedLabels[s + 1]]));
+                        next = LogSumExpHelper(next, beta[t + 1, s + 1] + ops.ToDouble(lpData[(t + 1) * timeStride + n * numClasses + expandedLabels[s + 1]]));
                     if (s + 2 < S && expandedLabels[s + 2] != blank && expandedLabels[s + 2] != expandedLabels[s])
-                        next = LogSumExpHelper(next, beta[t + 1, s + 2] + ops.ToDouble(logProbs[t + 1, n, expandedLabels[s + 2]]));
+                        next = LogSumExpHelper(next, beta[t + 1, s + 2] + ops.ToDouble(lpData[(t + 1) * timeStride + n * numClasses + expandedLabels[s + 2]]));
                     beta[t, s] = next;
                 }
             }
@@ -5905,13 +6071,14 @@ internal static class BackwardFunctions<T>
                 for (int k = 0; k < numClasses; k++)
                 {
                     double gradVal = -Math.Exp(abSum[k] - logProbTotal);
-                    grad[t, n, k] = ops.FromDouble(gOut * gradVal);
+                    gradData[t * timeStride + n * numClasses + k] = ops.FromDouble(gOut * gradVal);
                 }
             }
 
             targetOffset += U_n;
         }
 
+        grad.IncrementVersion();
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
