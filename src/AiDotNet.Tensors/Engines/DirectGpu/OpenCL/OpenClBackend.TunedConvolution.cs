@@ -82,6 +82,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                                     && HasTunedKernel(Kernels.BatchedGemmKernels.Conv1x1Rb128V)
                                     && HasTunedKernel(Kernels.WinogradFusedKernels.SplitReduce),
                                 (in TunedConv2DArgs a) => Conv2DPointwiseRb(a)),
+                            // A stem over at most four input channels: each work item reads a pixel's inputs once for 16
+                            // output channels.
+                            new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.small_channel", TunedKernelOrigin.Builtin, true,
+                                shape => shape[1] <= SmallChannelConvMaxChannels && shape[1] * shape[5] * shape[6] <= 196 && HasTunedKernel(Kernels.WinogradFusedKernels.SmallChannel),
+                                (in TunedConv2DArgs a) => Conv2DSmallChannel(a)),
                         };
                         _conv2DForwardSlot = new TunedKernelSlot<TunedConv2DArgs>(TunedKernelOp.Conv2DForward, TunedDeviceKey,
                             new BackendTunedKernelHarness<TunedConv2DArgs>(this, ConvolutionTolerance, () => IsAvailable,
@@ -166,6 +171,30 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             {
                 partial?.Dispose();
             }
+        }
+
+        private const int SmallChannelConvMaxChannels = 4;
+
+        private void Conv2DSmallChannel(in TunedConv2DArgs a)
+        {
+            DirectOpenClKernel k;
+            if (a.KernelH == 3 && a.KernelW == 3 && _kernelCache.TryGetValue(Kernels.WinogradFusedKernels.SmallChannel3x3, out var k3))
+            {
+                k = k3;
+                ConvArgs(k, a, withKernelGeometry: false);
+                k.SetArg(10, a.StrideH); k.SetArg(11, a.StrideW); k.SetArg(12, a.PadH); k.SetArg(13, a.PadW);
+                k.SetArg(14, a.DilationH); k.SetArg(15, a.DilationW);
+                k.SetArg(16, ConvEpilogueBias(a)); k.SetArg(17, ConvEpilogueFlags(a));
+            }
+            else
+            {
+                k = _kernelCache[Kernels.WinogradFusedKernels.SmallChannel];
+                ConvArgs(k, a, withKernelGeometry: true);
+                k.SetArg(18, ConvEpilogueBias(a)); k.SetArg(19, ConvEpilogueFlags(a));
+            }
+            const int block = Kernels.WinogradFusedKernels.SmallChannelBlock;
+            k.Execute2D(RoundUpToMultiple(checked(a.Batch * a.OutHeight * a.OutWidth), 64),
+                (a.OutChannels + block - 1) / block, 64, 1);
         }
 
         private void Conv2DGeneric(in TunedConv2DArgs a)

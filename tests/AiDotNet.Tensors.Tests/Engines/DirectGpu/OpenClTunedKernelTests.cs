@@ -384,6 +384,8 @@ public sealed class OpenClTunedKernelTests
         // 1x1 through conv1x1_rb128v: K split three ways over a one-tile grid (72, 72 and 56 channels); a 2 x 2 tile grid
         // crossing image boundaries inside a tile; an odd pixel count (15), which the route declines.
         (2, 200, 2, 2, 5, 1, 1, 0, 1), (3, 20, 8, 8, 130, 1, 1, 0, 1), (2, 6, 5, 3, 4, 1, 1, 0, 1),
+        // A strided stem over three channels into 37 outputs: three 16-channel blocks, the last partial.
+        (2, 3, 9, 7, 37, 3, 2, 1, 1),
     };
 
     [SkippableFact]
@@ -451,9 +453,11 @@ public sealed class OpenClTunedKernelTests
             // its built-in form, which admits a 1x1 stride-1 unpadded convolution whose pixel count is a multiple of 4.
             bool pointwise = bt > 1 && k == 1 && s == 1 && p == 0 && OpenClBackend.IsClBlastAvailable;
             bool pointwiseRb = k == 1 && s == 1 && p == 0 && oh * ow % 4 == 0;
+            // The small-channel direct route admits at most four input channels.
+            bool smallChannel = c <= 4;
             Assert.Equal(backend.Conv2DForwardSlot.CandidateIds.Count, Applicable(backend.Conv2DForwardSlot, args.Shape()).Count
                 + (k > 7 ? 1 : 0) + (WinogradF23Pipeline.AdmitsShape(args.Shape()) ? 0 : 3) + (bt == 1 ? 0 : 1)
-                + (pointwise ? 0 : 1) + (pointwiseRb ? 0 : 1));
+                + (pointwise ? 0 : 1) + (pointwiseRb ? 0 : 1) + (smallChannel ? 0 : 1));
         }
     }
     // The GEMM slot's candidates (the established route and the split-K GEMM) each against a double reference, on shapes
