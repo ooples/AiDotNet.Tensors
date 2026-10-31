@@ -92,6 +92,8 @@ jobs:
       matrix:
         arch: ${{ fromJSON(github.event_name == 'pull_request' && '["sm86"]' || '["sm86","sm75"]') }}
     name: ${{ matrix.arch == 'sm86' && 'cuda' || format('cuda-{0}', matrix.arch) }}
+    # Each runner needs self-hosted, gpu, cuda AND its architecture label (sm86 or sm75); a runner registered before
+    # the split carries no architecture label and picks up neither job until relabelled (see the header for how).
     runs-on: [self-hosted, gpu, cuda, '${{ matrix.arch }}']
     timeout-minutes: ${{ matrix.arch == 'sm86' && 150 || 240 }}
     defaults:
