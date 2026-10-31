@@ -9708,7 +9708,12 @@ KERNEL VARIANTS (A/B testing):
             if (_context == null)
                 throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
-            var kernel = _kernelCache["copy_2d_strided"];
+            if (numRows <= 0 || srcCols <= 0) return;
+            // Groups run along one row (a concatenation's rows are whole images, each one contiguous run), four columns per
+            // work item where every row starts 16-byte aligned.
+            bool vector = (srcCols & 3) == 0 && (destTotalCols & 3) == 0 && (destColOffset & 3) == 0
+                && _kernelCache.ContainsKey("copy_2d_strided4");
+            var kernel = _kernelCache[vector ? "copy_2d_strided4" : "copy_2d_strided"];
             var bufferSrc = ((DirectOpenClGpuBuffer)source).Buffer;
             var bufferDst = ((DirectOpenClGpuBuffer)destination).Buffer;
 
@@ -9719,8 +9724,10 @@ KERNEL VARIANTS (A/B testing):
             kernel.SetArg(4, destTotalCols);
             kernel.SetArg(5, destColOffset);
 
-            var (localSizeX, localSizeY) = CalculateOptimalWorkGroupSize(srcCols, numRows);
-            kernel.Execute2D(srcCols, numRows, localSizeX, localSizeY);
+            int columns = vector ? srcCols / 4 : srcCols;
+            int local = (int)Math.Min(256UL, Math.Max(1UL, _maxWorkGroupSize));
+            local = Math.Min(local, RoundUpToMultiple(columns, 64));
+            kernel.Execute2D(RoundUpToMultiple(columns, local), numRows, local, 1);
         }
 
         /// <inheritdoc/>
