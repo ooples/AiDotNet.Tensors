@@ -381,6 +381,9 @@ public sealed class OpenClTunedKernelTests
         // Few (tile, output channel) groups over many channels: fused Winograd splits the channels (2 layers of 40 and
         // 32; 3 layers of 40, 40 and 20) and sums the partial outputs before the epilogue.
         (2, 72, 2, 2, 40, 3, 1, 1, 1), (3, 100, 3, 5, 9, 3, 1, 1, 1),
+        // 1x1 through conv1x1_rb128v: K split three ways over a one-tile grid (72, 72 and 56 channels); a 2 x 2 tile grid
+        // crossing image boundaries inside a tile; an odd pixel count (15), which the route declines.
+        (2, 200, 2, 2, 5, 1, 1, 0, 1), (3, 20, 8, 8, 130, 1, 1, 0, 1), (2, 6, 5, 3, 4, 1, 1, 0, 1),
     };
 
     [SkippableFact]
@@ -444,11 +447,13 @@ public sealed class OpenClTunedKernelTests
             // Every candidate applies to these small shapes, so a variant that silently dropped out fails here --
             // except the three Winograd routes (F(2x2,3x3) unfused and fused, F(4x4,3x3)), which admit only 3x3 stride-1
             // undilated shapes (WinogradF23Pipeline), the split-K GEMM route, which admits only batch 1, and the batch-shared
-            // pointwise route, which admits only a 1x1 stride-1 unpadded convolution over a batch, through CLBlast.
+            // pointwise route, which admits only a 1x1 stride-1 unpadded convolution over a batch, through CLBlast, and
+            // its built-in form, which admits a 1x1 stride-1 unpadded convolution whose pixel count is a multiple of 4.
             bool pointwise = bt > 1 && k == 1 && s == 1 && p == 0 && OpenClBackend.IsClBlastAvailable;
+            bool pointwiseRb = k == 1 && s == 1 && p == 0 && oh * ow % 4 == 0;
             Assert.Equal(backend.Conv2DForwardSlot.CandidateIds.Count, Applicable(backend.Conv2DForwardSlot, args.Shape()).Count
                 + (k > 7 ? 1 : 0) + (WinogradF23Pipeline.AdmitsShape(args.Shape()) ? 0 : 3) + (bt == 1 ? 0 : 1)
-                + (pointwise ? 0 : 1));
+                + (pointwise ? 0 : 1) + (pointwiseRb ? 0 : 1));
         }
     }
     // The GEMM slot's candidates (the established route and the split-K GEMM) each against a double reference, on shapes

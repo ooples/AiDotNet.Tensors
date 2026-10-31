@@ -16,8 +16,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels
         internal const string Im2ColWide = "im2col_wide";
         internal const string Rb128V = "gemm_batched_rb128v";
         internal const string Rb64Prefetch = "gemm_batched_rb64p";
+        internal const string Conv1x1Rb128V = "conv1x1_rb128v";
 
-        internal static string[] GetKernelNames() => new[] { Rb64, Rb64SplitK, SplitKReduce, Im2ColWide, Rb128V, Rb64Prefetch };
+        internal static string[] GetKernelNames() => new[] { Rb64, Rb64SplitK, SplitKReduce, Im2ColWide, Rb128V, Rb64Prefetch, Conv1x1Rb128V };
 
         internal const string Source = @"
 #define RB_BM 64
@@ -82,7 +83,69 @@ void gemm_batched_rb64(__global const float* restrict A, __global const float* r
         }
     }
 }
-// One matrix, C = A * B (A is M x K with row stride lda, B is K x N with row stride ldb), with K split into slices: work
+// A 1x1, stride-1, unpadded convolution over a batch as gemm_batched_rb128v's 128 x 128 tiles, reading the NCHW input and
+// writing the NCHW output in place of a column matrix: y[n][o][s] = sum over c of w[o][c] * x[n][c][s]. GEMM column
+// j = n * hw + s; hw is a multiple of 4, so each four-wide load stays inside one image. Work-group layer z sums channels
+// [z * kChunk, min(K, z * kChunk + kChunk)) into partial output plane z (the epilogue then runs where the planes are
+// summed, epi = 0 here); with one layer the plane is y itself and the bias / ReLU epilogue is applied here.
+__kernel __attribute__((reqd_work_group_size(16, 16, 1)))
+void conv1x1_rb128v(__global const float* restrict A, __global const float* restrict X, __global float* restrict Y,
+    const int M, const int N, const int K, const int hw, const int kChunk, __global const float* bias, const int epi)
+{
+    const int tx = get_local_id(0), ty = get_local_id(1);
+    const int bn0 = get_group_id(0) * 128, bm0 = get_group_id(1) * 128;
+    const int kBegin = get_group_id(2) * kChunk, kEnd = min(K, kBegin + kChunk);
+    Y += (long)get_group_id(2) * M * N;
+    __local float As3[8][128 + 4];
+    __local float Bs3[8][128 + 4];
+    float acc[8][8];
+    for (int i = 0; i < 8; i++) for (int j = 0; j < 8; j++) acc[i][j] = 0.0f;
+    const int tid = ty * 16 + tx;
+    const int ar = tid >> 1, ac = (tid & 1) * 4;
+    const int br = tid >> 5, bc = (tid & 31) * 4;
+    const int hc = bn0 + bc;
+    const int img = hc / hw, pix = hc - img * hw;
+    __global const float* xcol = X + (long)img * K * hw + pix;
+    float4 av, bv;
+    #define C1_LOAD(K0) { \
+        const int gr = bm0 + ar, gc = (K0) + ac; \
+        if (gr < M && gc + 3 < kEnd) av = vload4(0, A + (long)gr * K + gc); \
+        else { av.x = (gr < M && gc < kEnd) ? A[(long)gr * K + gc] : 0.0f; \
+               av.y = (gr < M && gc + 1 < kEnd) ? A[(long)gr * K + gc + 1] : 0.0f; \
+               av.z = (gr < M && gc + 2 < kEnd) ? A[(long)gr * K + gc + 2] : 0.0f; av.w = 0.0f; } \
+        const int hr = (K0) + br; \
+        if (hr < kEnd && hc < N) bv = vload4(0, xcol + (long)hr * hw); else bv = (float4)(0.0f); }
+    if (kBegin < kEnd) C1_LOAD(kBegin)
+    for (int k0 = kBegin; k0 < kEnd; k0 += 8)
+    {
+        As3[ac][ar] = av.x; As3[ac + 1][ar] = av.y; As3[ac + 2][ar] = av.z; As3[ac + 3][ar] = av.w;
+        vstore4(bv, 0, &Bs3[br][bc]);
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (k0 + 8 < kEnd) C1_LOAD(k0 + 8)
+        for (int kk = 0; kk < 8; kk++)
+        {
+            float a[8], bb[8];
+            for (int i = 0; i < 8; i++) a[i] = As3[kk][ty + 16 * i];
+            for (int j = 0; j < 8; j++) bb[j] = Bs3[kk][tx + 16 * j];
+            for (int i = 0; i < 8; i++)
+                for (int j = 0; j < 8; j++) acc[i][j] = mad(a[i], bb[j], acc[i][j]);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    #undef C1_LOAD
+    for (int j = 0; j < 8; j++)
+    {
+        int c = bn0 + tx + 16 * j;
+        if (c >= N) continue;
+        int n = c / hw, s = c - n * hw;
+        __global float* dst = Y + (long)n * M * hw + s;
+        for (int i = 0; i < 8; i++)
+        {
+            int r = bm0 + ty + 16 * i;
+            if (r < M) dst[(long)r * hw] = conv_epilogue(acc[i][j], bias, r, epi);
+        }
+    }
+}// One matrix, C = A * B (A is M x K with row stride lda, B is K x N with row stride ldb), with K split into slices: work
 // group z sums K range [z*kChunk, min(K, (z+1)*kChunk)) into partial plane z of C (M x N each). A 64 x 64 tile grid
 // gives a small product (512 x 49) only eight work groups on an eleven-CU device; the slices put every CU to work.
 // With one slice the plane is C itself.

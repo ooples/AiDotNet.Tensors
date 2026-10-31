@@ -72,6 +72,16 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                                     if (!Conv2DPointwiseBatched(a)) Conv2DGeneric(a);
                                     ConvEpiloguePasses(a);
                                 }),
+                            // The same 1x1 convolution through conv1x1_rb128v: no vendor call (CLBlast's strided-batched
+                            // and plain SGEMM cost 20-170 us of host time a call, so DenseNet-121's 58 of them held the
+                            // host behind the device), the bias and ReLU in the output kernel, and K split where the
+                            // tile grid underfills the device (the 4 x 4 maps).
+                            new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.pointwise_rb", TunedKernelOrigin.Builtin, true,
+                                shape => shape[5] == 1 && shape[6] == 1 && shape[7] == 1 && shape[8] == 1
+                                    && shape[9] == 0 && shape[10] == 0 && (long)shape[2] * shape[3] % 4 == 0
+                                    && HasTunedKernel(Kernels.BatchedGemmKernels.Conv1x1Rb128V)
+                                    && HasTunedKernel(Kernels.WinogradFusedKernels.SplitReduce),
+                                (in TunedConv2DArgs a) => Conv2DPointwiseRb(a)),
                         };
                         _conv2DForwardSlot = new TunedKernelSlot<TunedConv2DArgs>(TunedKernelOp.Conv2DForward, TunedDeviceKey,
                             new BackendTunedKernelHarness<TunedConv2DArgs>(this, ConvolutionTolerance, () => IsAvailable,
@@ -90,7 +100,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
 
         private static readonly string[] s_conv2DForwardUntunedPreference =
-            { "opencl.conv2d.winograd_fused", "opencl.conv2d.im2col_rb_gemm", "opencl.conv2d.im2col_gemm" };
+            { "opencl.conv2d.winograd_fused", "opencl.conv2d.im2col_rb_gemm", "opencl.conv2d.pointwise_rb", "opencl.conv2d.im2col_gemm" };
 
         private static void ConvArgs(DirectOpenClKernel k, in TunedConv2DArgs a, bool withKernelGeometry)
         {
@@ -121,6 +131,42 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         internal bool Conv2DPointwiseBatched(in TunedConv2DArgs a)
             => TryExecuteClBlastBatchedGemm(a.Kernel, a.Input, a.Output, a.OutChannels, a.OutHeight * a.OutWidth,
                 a.InChannels, a.Batch, 1f, 0f, strideA: 0);
+
+        // y[n] = W * x[n] for every image n by conv1x1_rb128v, K split into partial planes summed by wino_f23_split_reduce
+        // (which applies the epilogue) when the 128 x 128 tile grid alone covers fewer than about four groups per compute
+        // unit; each slice keeps at least 64 channels.
+        private void Conv2DPointwiseRb(in TunedConv2DArgs a)
+        {
+            int hw = a.OutHeight * a.OutWidth, m = a.OutChannels, k = a.InChannels;
+            int n = checked(a.Batch * hw);
+            int tiles = ((m + 127) / 128) * ((n + 127) / 128);
+            int target = 4 * (int)Math.Max(1u, _context?.MaxComputeUnits ?? 8u);
+            int splits = Math.Max(1, Math.Min((target + tiles - 1) / tiles, k / 64));
+            int kChunk = RoundUpToMultiple((k + splits - 1) / splits, 8);
+            splits = (k + kChunk - 1) / kChunk;
+            int count = checked(m * n);
+            IGpuBuffer? partial = splits > 1 ? AllocateBuffer(checked(splits * count)) : null;
+            try
+            {
+                var gemm = _kernelCache[Kernels.BatchedGemmKernels.Conv1x1Rb128V];
+                gemm.SetArg(0, BufferHandle(a.Kernel)); gemm.SetArg(1, BufferHandle(a.Input));
+                gemm.SetArg(2, BufferHandle(partial ?? a.Output));
+                gemm.SetArg(3, m); gemm.SetArg(4, n); gemm.SetArg(5, k); gemm.SetArg(6, hw); gemm.SetArg(7, kChunk);
+                gemm.SetArg(8, ConvEpilogueBias(a)); gemm.SetArg(9, partial is null ? ConvEpilogueFlags(a) : 0);
+                gemm.Execute3D(RoundUpToMultiple(n, 128) / 8, RoundUpToMultiple(m, 128) / 8, splits, 16, 16, 1);
+                if (partial is null) return;
+                var reduce = _kernelCache[Kernels.WinogradFusedKernels.SplitReduce];
+                reduce.SetArg(0, BufferHandle(partial)); reduce.SetArg(1, BufferHandle(a.Output));
+                reduce.SetArg(2, count); reduce.SetArg(3, splits);
+                reduce.SetArg(4, ConvEpilogueBias(a)); reduce.SetArg(5, ConvEpilogueFlags(a));
+                reduce.SetArg(6, hw); reduce.SetArg(7, m);
+                reduce.Execute1D(RoundUpToMultiple(count, 256), 256);
+            }
+            finally
+            {
+                partial?.Dispose();
+            }
+        }
 
         private void Conv2DGeneric(in TunedConv2DArgs a)
             => Conv2DGenericCore(a.Input, a.Kernel, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth, a.OutChannels,
@@ -185,10 +231,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         // The channels each work-group layer of the fused Winograd reduces: all of them, unless the (tile, output channel)
         // grid leaves the device underfilled, as VGG-11's 2 x 2 and 4 x 4 maps (16 and 64 groups at batch 32) and
         // DenseNet-121's growth convolutions (4 and 16) did. Then the channels are split, at least 32 per layer, until
-        // the grid covers about four groups per compute unit. A multiple of the kernel's 8-channel step.
+        // the grid covers about two groups per compute unit. A multiple of the kernel's 8-channel step. Measured at batch
+        // 32 on gfx1012 (11 reported units): 512 channels on a 2 x 2 map 246 us whole, 204 us in two layers, 274 us in
+        // four; 128 channels into 32 on 4 x 4 maps 48 us whole, 30-32 us in two to four; on the 64-group 4 x 4 maps every
+        // split was slower (587 us whole, 621 us in two).
         internal static int WinogradFusedChannelChunk(int groups, int channels, int computeUnits)
         {
-            int target = 4 * computeUnits;
+            int target = 2 * computeUnits;
             int splits = Math.Max(1, Math.Min((target + groups - 1) / groups, channels / 32));
             return RoundUpToMultiple((channels + splits - 1) / splits, 8);
         }
