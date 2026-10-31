@@ -7868,7 +7868,9 @@ KERNEL VARIANTS (A/B testing):
                 pool2.SetArg(a2++, outHeight);
                 pool2.SetArg(a2++, outWidth);
                 pool2.SetArg(a2, indices != null ? 1 : 0);
-                pool2.Execute1D(RoundUpToMultiple(checked((int)pairs), 256), 256);
+                // No local memory and no reqd_work_group_size: any group the compiled kernel admits works.
+                int local = (int)Math.Max(1UL, Math.Min(256UL, pool2.MaxWorkGroupSize));
+                pool2.Execute1D(RoundUpToMultiple(checked((int)pairs), local), local);
                 return;
             }
             var k = _kernelCache["maxpool2d"];
