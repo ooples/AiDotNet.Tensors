@@ -15,7 +15,6 @@ composed MetalBackend.Log1P #1638
 composed MetalBackend.Log2 #1638
 composed MetalBackend.MseBackward #1638
 composed MetalBackend.SoftplusBackward #1638
-composed OpenClBackend.ReduceMean #1638
 composed WebGpuBackend.ApplyMelFilterbank #1638
 composed WebGpuBackend.BatchedDotProduct #1638
 composed WebGpuBackend.CsrSpMMBias #1638

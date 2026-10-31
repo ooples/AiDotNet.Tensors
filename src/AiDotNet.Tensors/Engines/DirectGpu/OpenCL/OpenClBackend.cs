@@ -14409,9 +14409,55 @@ KERNEL VARIANTS (A/B testing):
             _context?.Dispose();
         }
 
-        // o[0] = mean(i[0 .. sz)). This went through ExecuteActivation("reduce_mean"), a kernel no OpenCL program defines, so
-        // it threw and ran on the CPU; the row sum (split across compute units for one long row) and a scale do it.
-        public void ReduceMean(IGpuBuffer i, IGpuBuffer o, int sz) { if (sz <= 0) return; SumAxis(i, o, 1, sz); Scale(o, o, 1f / sz, 1); }
+        // o[0] = mean(i[0 .. sz)): the row sum times 1 / sz in the reduction's last launch. A row long enough to split is
+        // summed in chunks across the compute units first (as SumAxis does), then the chunk partials are reduced and scaled.
+        public void ReduceMean(IGpuBuffer i, IGpuBuffer o, int sz)
+        {
+            if (sz <= 0) return;
+            if (_context == null)
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
+            int rowGroup = SumAxisRowGroupSize();
+            if (rowGroup > 0 && _kernelCache.TryGetValue("sum_axis_rows_scaled", out var scaled)
+                && _kernelCache.TryGetValue("sum_axis_rows_split", out var splitKernel))
+            {
+                var input = ((DirectOpenClGpuBuffer)i).Buffer;
+                DirectOpenClGpuBuffer? partial = null;
+                int length = sz;
+                try
+                {
+                    if (sz >= SumAxisSplitMinReduce)
+                    {
+                        int chunks = (int)Math.Max(2, Math.Min(((long)sz + SumAxisSplitChunkMin - 1) / SumAxisSplitChunkMin,
+                            4L * Math.Max(1, ComputeUnits)));
+                        int chunkLen = (int)(((long)sz + chunks - 1) / chunks);
+                        chunks = (int)(((long)sz + chunkLen - 1) / chunkLen);
+                        partial = (DirectOpenClGpuBuffer)AllocateBuffer(chunks);
+                        splitKernel.SetArg(0, input.Handle);
+                        splitKernel.SetArg(1, partial.Buffer.Handle);
+                        splitKernel.SetArg(2, sz);
+                        splitKernel.SetArg(3, chunks);
+                        splitKernel.SetArg(4, chunkLen);
+                        splitKernel.Execute2D(chunks * rowGroup, 1, rowGroup, 1);
+                        System.Threading.Interlocked.Increment(ref _sumAxisSplitLaunches);
+                        input = partial.Buffer;
+                        length = chunks;
+                    }
+                    scaled.SetArg(0, input.Handle);
+                    scaled.SetArg(1, ((DirectOpenClGpuBuffer)o).Buffer.Handle);
+                    scaled.SetArg(2, 1);
+                    scaled.SetArg(3, length);
+                    scaled.SetArg(4, 1f / sz);
+                    scaled.Execute1D(rowGroup, rowGroup);
+                }
+                finally
+                {
+                    partial?.Dispose();
+                }
+                return;
+            }
+            SumAxis(i, o, 1, sz);
+            Scale(o, o, 1f / sz, 1);
+        }
         public void ClipKernel(IGpuBuffer i, IGpuBuffer o, float mn, float mx, int sz) { if (_context == null) return; var k = _kernelCache["clip_kernel"]; k.SetArg(0, ((DirectOpenClGpuBuffer)i).Buffer.Handle); k.SetArg(1, ((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(2, mn); k.SetArg(3, mx); k.SetArg(4, sz); k.Execute1D(sz, CalculateOptimalWorkGroupSize1D(sz)); }
         public void PowScalar(IGpuBuffer i, IGpuBuffer o, float ex, int sz) { if (_context == null) return; var k = _kernelCache["pow_scalar"]; k.SetArg(0, ((DirectOpenClGpuBuffer)i).Buffer.Handle); k.SetArg(1, ((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(2, ex); k.SetArg(3, sz); k.Execute1D(sz, CalculateOptimalWorkGroupSize1D(sz)); }
         public void FracKernel(IGpuBuffer i, IGpuBuffer o, int sz) { ExecuteActivation("frac_kernel", i, o, sz); }
