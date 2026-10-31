@@ -385,6 +385,8 @@ public sealed class OpenClTunedKernelTests
             source.Replace("\r\n", "\n"));
         Assert.Contains("#define SC_MAX_TAPS " + AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels.WinogradFusedKernels.SmallChannelMaxTaps + "\n",
             source.Replace("\r\n", "\n"));
+        Assert.Contains("#define SC_MAX_KW " + AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels.WinogradFusedKernels.SmallChannelMaxKernelWidth + "\n",
+            source.Replace("\r\n", "\n"));
     }
 
     // (batch, Cin, H, W, Cout, k, stride, pad, dilation): Winograd's 3x3/s1, 1x1, 5x5, strided, dilated, batched.

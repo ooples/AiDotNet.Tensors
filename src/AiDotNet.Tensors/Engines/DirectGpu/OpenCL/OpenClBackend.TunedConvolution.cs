@@ -88,6 +88,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                             new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.small_channel", TunedKernelOrigin.Builtin, true,
                                 shape => shape[1] <= SmallChannelConvMaxChannels
                                     && shape[1] * shape[5] * shape[6] <= Kernels.WinogradFusedKernels.SmallChannelMaxTaps
+                                    && shape[6] <= Kernels.WinogradFusedKernels.SmallChannelMaxKernelWidth
                                     && HasTunedKernel(Kernels.WinogradFusedKernels.SmallChannel),
                                 (in TunedConv2DArgs a) => Conv2DSmallChannel(a)),
                             // A 1 x 1 input to a 1 x 1 output through an odd filter padded by half its size (ResNet's last

@@ -35,6 +35,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels
         /// </summary>
         internal const int SmallChannelMaxTaps = 196;
 
+        /// <summary>The widest filter row conv2d_smallc loads at once (SC_MAX_KW in the source); the dispatcher admits no wider.</summary>
+        internal const int SmallChannelMaxKernelWidth = 7;
+
         internal static string[] GetKernelNames() => new[] { Forward, SplitReduce, SmallChannel, SmallChannel3x3, CenterTapGather };
 
         internal const string Source = @"
@@ -215,6 +218,7 @@ __kernel void wino_f23_split_reduce(__global const float* restrict partial, __gl
 // output channel. The group's 16 filters (output channel block get_group_id(1)) are staged in local memory first, so
 // the 16 x C x KH x KW weight reads per pixel are local broadcasts, not global loads; C x KH x KW is at most 196.
 #define SC_MAX_TAPS 196
+#define SC_MAX_KW 7
 #define SC_OB 16
 __kernel __attribute__((reqd_work_group_size(64, 1, 1)))
 void conv2d_smallc(__global const float* restrict in, __global const float* restrict wt, __global float* restrict out,
@@ -238,19 +242,31 @@ void conv2d_smallc(__global const float* restrict in, __global const float* rest
     const int oh = q / OW, ow = q - oh * OW;
     float acc[SC_OB];
     for (int j = 0; j < SC_OB; j++) acc[j] = 0.0f;
+    // A filter row's window (KW <= SC_MAX_KW) is loaded at once, out-of-bounds taps predicated to zero, so the loads
+    // are in flight together; behind per-tap bounds branches they ran one at a time (a 7 x 7 stem at batch 128 took
+    // 1.1 ms; 0.85 ms this way). Two or four pixels per work item, to reuse each weight read, measured slower still.
+    const int ih0 = oh * SH - PH, iw0 = ow * SW - PW;
     for (int c = 0; c < C; c++)
     {
+        __global const float* src = in + (long)(n * C + c) * IH * IW;
         for (int kh = 0; kh < KH; kh++)
         {
-            const int ih = oh * SH - PH + kh * DH;
-            if (ih < 0 || ih >= IH) continue;
-            for (int kw = 0; kw < KW; kw++)
+            const int ih = ih0 + kh * DH;
+            const bool rowInside = ih >= 0 && ih < IH;
+            float v[SC_MAX_KW];
+            #pragma unroll
+            for (int kw = 0; kw < SC_MAX_KW; kw++)
             {
-                const int iw = ow * SW - PW + kw * DW;
-                if (iw < 0 || iw >= IW) continue;
-                const float v = in[((long)(n * C + c) * IH + ih) * IW + iw];
-                __local const float* w = ws + (c * KH + kh) * KW + kw;
-                for (int j = 0; j < SC_OB; j++) acc[j] = mad(v, w[j * taps], acc[j]);
+                const int iw = iw0 + kw * DW;
+                const bool inside = rowInside && kw < KW && iw >= 0 && iw < IW;
+                v[kw] = inside ? src[inside ? ih * IW + iw : 0] : 0.0f;
+            }
+            __local const float* w = ws + (c * KH + kh) * KW;
+            #pragma unroll
+            for (int kw = 0; kw < SC_MAX_KW; kw++)
+            {
+                if (kw >= KW) break;
+                for (int j = 0; j < SC_OB; j++) acc[j] = mad(v[kw], w[j * taps + kw], acc[j]);
             }
         }
     }
