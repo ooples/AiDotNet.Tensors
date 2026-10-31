@@ -38215,7 +38215,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (length.Length != tensor._shape.Length)
             throw new ArgumentException($"Length length ({length.Length}) must match tensor dimensions ({tensor._shape.Length})");
 
-        if (IsEmptySlice(tensor._shape, start, length)) return new Tensor<T>((int[])length.Clone());
+        // Validates an empty box; the empty result is returned below, after graph mode records it so it stays a
+        // graph output like any other slice.
+        bool emptySlice = IsEmptySlice(tensor._shape, start, length);
 
         if (GraphMode.IsActive)
         {
@@ -38231,14 +38233,17 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        if (emptySlice) return new Tensor<T>((int[])length.Clone());
+
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorSlice", tensor._shape); if (ac is not null) return ac.Execute(); }
 
-        // Validate bounds
+        // Validate bounds. The length is compared with the room left after the start, never start + length, which
+        // overflows for a length near int.MaxValue and would let an out-of-range slice through.
         for (int i = 0; i < tensor._shape.Length; i++)
         {
             if (start[i] < 0 || start[i] >= tensor._shape[i])
                 throw new ArgumentOutOfRangeException(nameof(start), $"Start index {start[i]} out of range for axis {i} with size {tensor._shape[i]}");
-            if (length[i] < 1 || start[i] + length[i] > tensor._shape[i])
+            if (length[i] < 1 || length[i] > tensor._shape[i] - start[i])
                 throw new ArgumentOutOfRangeException(nameof(length), $"Slice length {length[i]} starting at {start[i]} exceeds axis {i} size {tensor._shape[i]}");
         }
 
@@ -38294,7 +38299,8 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!empty) return false;
         for (int i = 0; i < shape.Length; i++)
         {
-            if (start[i] < 0 || start[i] > shape[i] || start[i] + length[i] > shape[i])
+            // length[i] > shape[i] - start[i], not start[i] + length[i] > shape[i]: the sum overflows.
+            if (start[i] < 0 || start[i] > shape[i] || length[i] > shape[i] - start[i])
                 throw new ArgumentOutOfRangeException(nameof(start), $"Slice [{start[i]}, {start[i] + length[i]}) is outside axis {i} of size {shape[i]}");
         }
         return true;

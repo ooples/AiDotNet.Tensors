@@ -3,6 +3,7 @@
 using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -14,6 +15,8 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// so before this a concatenation with a zero-width input (a CTGAN-family conditional block over data with no discrete
 /// column) threw "Start index n out of range for axis 1 with size n" in the backward pass.
 /// </summary>
+// The GPU test sets the process-wide fallback switch, so it runs with the other DirectGpu tests, one at a time.
+[Collection("DirectGpuSerial")]
 public class EmptySliceTests
 {
     [Fact]
@@ -41,6 +44,17 @@ public class EmptySliceTests
         Assert.Throws<ArgumentOutOfRangeException>(() => engine.TensorSlice(x, new[] { 0, 0 }, new[] { 2, -1 }));
     }
 
+    // start + length overflows int for these lengths, so a sum-based bounds check would accept them.
+    [Fact]
+    public void Slice_LengthThatOverflowsTheEndIndex_Throws()
+    {
+        var engine = new CpuEngine();
+        var x = new Tensor<float>(new[] { 2, 3 });
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => engine.TensorSlice(x, new[] { 1, 0 }, new[] { int.MaxValue, 0 }));
+        Assert.Throws<ArgumentOutOfRangeException>(() => engine.TensorSlice(x, new[] { 1, 1 }, new[] { int.MaxValue, 1 }));
+    }
+
     [Fact]
     public void ConcatenateBackward_WithAZeroWidthInput_RoutesTheGradientToTheOthers()
         => AssertConcatenateBackward(new CpuEngine());
@@ -50,7 +64,21 @@ public class EmptySliceTests
     {
         using var gpu = new DirectGpuTensorEngine();
         Skip.IfNot(gpu.IsGpuAvailable, "No DirectGpu backend available");
-        AssertConcatenateBackward(gpu);
+
+        // A CPU fallback would pass the value checks while hiding a missing GPU path, so fallbacks throw here and
+        // the probe must record none.
+        bool savedThrowOnFallback = DirectGpuTensorEngine.ThrowOnGpuKernelFallback;
+        try
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = true;
+            GpuLaunchProbe.Reset();
+            AssertConcatenateBackward(gpu);
+            Assert.Empty(GpuLaunchProbe.Fallbacks);
+        }
+        finally
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = savedThrowOnFallback;
+        }
     }
 
     private static void AssertConcatenateBackward(IEngine engine)
