@@ -10812,6 +10812,22 @@ public partial class CpuEngine : ITensorLevelEngine
         // A test scope that pins the full-im2col or implicit-GEMM route must reach it: the direct and batched routes
         // below are chosen first, so a pinned comparison would otherwise compare one of them with itself.
         bool routePinned = t_forceFullIm2Col || t_forceImplicitGemmForTest;
+#if NET5_0_OR_GREATER
+        if (!routePinned && (strideH > 1 || strideW > 1) && input.Layout == LinearAlgebra.TensorLayout.Nchw
+            && Simd.Conv1x1Gemm.Applies(batch, kernelHeight, kernelWidth, padH, padW, dilationH, dilationW))
+        {
+            int inOff1 = 0, kOff1 = 0, outOff1 = 0;
+            float[]? inArr1 = inputData ?? (input.IsContiguous ? input.GetCpuBackingForStridedRead(out inOff1) : null);
+            float[]? kArr1 = kernelData ?? (kernel.IsContiguous ? kernel.GetCpuBackingForStridedRead(out kOff1) : null);
+            float[]? outArr1 = outputData ?? output.GetCpuBackingForContiguousWrite(out outOff1);
+            if (inArr1 is not null && kArr1 is not null && outArr1 is not null)
+            {
+                Simd.Conv1x1Gemm.Forward(inArr1, inOff1, kArr1, kOff1, outArr1, outOff1, batch, inChannels, height, width,
+                    outChannels, strideH, strideW, outputHeight, outputWidth);
+                return;
+            }
+        }
+#endif
         if (!routePinned && TryConv1x1PerImageGemm(input, kernel, output, inputData, kernelData, outputData,
                 batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
                 strideH, strideW, padH, padW, dilationH, dilationW))
@@ -16384,6 +16400,18 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float))
         {
 #if NET5_0_OR_GREATER
+            if (Simd.Conv1x1Gemm.Applies(batch, kernelHeight, kernelWidth, padH, padW, dilationH, dilationW))
+            {
+                var gArr1 = (float[]?)(object?)gradOutput.GetCpuBackingForStridedRead(out int gOff1);
+                var kArr1 = (float[]?)(object?)kernel.GetCpuBackingForStridedRead(out int kOff1);
+                var dArr1 = (float[]?)(object?)dest.GetCpuBackingForContiguousWrite(out int dOff1);
+                if (gArr1 is not null && kArr1 is not null && dArr1 is not null)
+                {
+                    Simd.Conv1x1Gemm.BackwardInput(gArr1, gOff1, kArr1, kOff1, dArr1, dOff1, accumulate, batch, inChannels,
+                        height, width, outChannels, strideH, strideW, outputHeight, outputWidth);
+                    return;
+                }
+            }
             if (Simd.DirectConvAvx2.TryChoose(new Simd.DirectConvShape(Simd.DirectConvPass.BackwardInput, batch, inChannels, outChannels,
                     height, width, kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW), out int directTasks))
             {
@@ -17507,6 +17535,18 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float))
         {
 #if NET5_0_OR_GREATER
+            if (Simd.Conv1x1Gemm.Applies(batch, kernelHeight, kernelWidth, padH, padW, dilationH, dilationW))
+            {
+                var xArr1 = (float[]?)(object?)input.GetCpuBackingForStridedRead(out int xOff1);
+                var gArr1 = (float[]?)(object?)gradOutput.GetCpuBackingForStridedRead(out int gOff1);
+                var dArr1 = (float[]?)(object?)dest.GetCpuBackingForContiguousWrite(out int dOff1);
+                if (xArr1 is not null && gArr1 is not null && dArr1 is not null)
+                {
+                    Simd.Conv1x1Gemm.BackwardKernel(xArr1, xOff1, gArr1, gOff1, dArr1, dOff1, accumulate, batch, inChannels,
+                        height, width, outChannels, strideH, strideW, outputHeight, outputWidth);
+                    return;
+                }
+            }
             if (Simd.DirectConvAvx2.TryChoose(new Simd.DirectConvShape(Simd.DirectConvPass.BackwardKernel, batch, inChannels, outChannels,
                     height, width, kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW), out int directTasks))
             {

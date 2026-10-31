@@ -6,6 +6,7 @@ and weight gradient at 1, 2 and 4 threads (median of 31 after 5 warm-ups). Convo
 channels_last, since the parity harness lets PyTorch run at its best and channels_last is often that.
 Prints lines of the form: OPBREAKDOWN torch | <op> | <shape> | t<threads> | <median ms>
 """
+import os
 import time
 
 import torch
@@ -24,6 +25,9 @@ CONVS = [
     ("resnet18", 8, 256, 512, 8, 3, 2, 1),
     ("resnet18", 8, 256, 512, 8, 1, 2, 0),
     ("resnet18", 8, 512, 512, 4, 3, 1, 1),
+    ("probe", 8, 64, 128, 16, 1, 1, 0),
+    ("probe", 8, 128, 256, 8, 1, 1, 0),
+    ("probe", 8, 256, 512, 4, 1, 1, 0),
 ]
 
 LINEARS = [
@@ -36,11 +40,17 @@ LINEARS = [
 ]
 
 
+# Same profiling filters as the C# bench: a substring of "<op> | <shape>", the thread counts, the timed runs per row.
+FILTER = os.environ.get("AIDOTNET_OP_FILTER", "")
+THREADS = tuple(int(t) for t in os.environ.get("AIDOTNET_OP_THREADS", "1,2,4").split(","))
+SAMPLES = int(os.environ.get("AIDOTNET_OP_SAMPLES", "31"))
+
+
 def median_ms(fn) -> float:
     for _ in range(5):
         fn()
     samples = []
-    for _ in range(31):
+    for _ in range(SAMPLES):
         t0 = time.perf_counter()
         fn()
         samples.append((time.perf_counter() - t0) * 1000.0)
@@ -49,13 +59,15 @@ def median_ms(fn) -> float:
 
 
 def row(op: str, shape: str, threads: int, fn) -> None:
+    if FILTER and FILTER not in f"{op.replace('+cl', '')} | {shape}":
+        return
     print(f"OPBREAKDOWN torch | {op} | {shape} | t{threads} | {median_ms(fn):.4f}", flush=True)
 
 
 def main() -> None:
     torch.manual_seed(7)
     with torch.no_grad():
-        for threads in (1, 2, 4):
+        for threads in THREADS:
             torch.set_num_threads(threads)
             for net, b, cin, cout, hw, k, s, p in CONVS:
                 shape = f"{net} b{b} {cin}->{cout} {hw}x{hw} k{k} s{s}"

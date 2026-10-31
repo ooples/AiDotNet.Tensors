@@ -41,6 +41,10 @@ public class CpuOpBreakdownBench
         ("resnet18", 8, 256, 512, 8, 3, 2, 1),
         ("resnet18", 8, 256, 512, 8, 1, 2, 0),
         ("resnet18", 8, 512, 512, 4, 3, 1, 1),
+        // The stride-1 equivalents of the 1x1 stride-2 downsample convolutions (on the subsampled input).
+        ("probe", 8, 64, 128, 16, 1, 1, 0),
+        ("probe", 8, 128, 256, 8, 1, 1, 0),
+        ("probe", 8, 256, 512, 4, 1, 1, 0),
     };
 
     // (network, batch, in, out)
