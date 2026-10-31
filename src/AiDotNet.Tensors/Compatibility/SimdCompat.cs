@@ -14,7 +14,7 @@ namespace System.Runtime.Intrinsics
     /// Polyfill for Vector128&lt;T&gt; on .NET Framework.
     /// Properly stores all vector lanes for correct scalar fallback behavior.
     /// </summary>
-    public readonly struct Vector128<T>
+    internal readonly struct Vector128<T>
     {
         private readonly T[] _elements;
 
@@ -67,7 +67,7 @@ namespace System.Runtime.Intrinsics
     /// Polyfill for Vector256&lt;T&gt; on .NET Framework.
     /// Properly stores all vector lanes for correct scalar fallback behavior.
     /// </summary>
-    public readonly struct Vector256<T>
+    internal readonly struct Vector256<T>
     {
         private readonly T[] _elements;
 
@@ -120,7 +120,7 @@ namespace System.Runtime.Intrinsics
     /// Polyfill for Vector512&lt;T&gt; on .NET Framework.
     /// Properly stores all vector lanes for correct scalar fallback behavior.
     /// </summary>
-    public readonly struct Vector512<T>
+    internal readonly struct Vector512<T>
     {
         private readonly T[] _elements;
 
@@ -172,7 +172,7 @@ namespace System.Runtime.Intrinsics
     /// <summary>
     /// Static helper class for Vector128 operations.
     /// </summary>
-    public static class Vector128
+    internal static class Vector128
     {
         /// <summary>
         /// Indicates whether hardware acceleration is available.
@@ -219,7 +219,7 @@ namespace System.Runtime.Intrinsics
     /// <summary>
     /// Static helper class for Vector256 operations.
     /// </summary>
-    public static class Vector256
+    internal static class Vector256
     {
         public static bool IsHardwareAccelerated => Vector.IsHardwareAccelerated;
 
@@ -257,7 +257,7 @@ namespace System.Runtime.Intrinsics
     /// <summary>
     /// Static helper class for Vector512 operations.
     /// </summary>
-    public static class Vector512
+    internal static class Vector512
     {
         public static bool IsHardwareAccelerated => Vector.IsHardwareAccelerated;
 

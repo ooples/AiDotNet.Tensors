@@ -1053,10 +1053,13 @@ public partial class CpuEngine
         double[]? h0Arr = h0?.GetFlattenedData();
         double[]? c0Arr = c0?.GetFlattenedData();
 
-        // Saved state (captured by the backward closure). Layout matches the float path.
-        var gates = new double[totalRows * G];
-        var cells = new double[batch * (seqLen + 1) * hidden];
-        var hiddens = new double[batch * (seqLen + 1) * hidden];
+        // Saved state (captured by the backward closure). Layout matches the float path. With no tape recording nothing
+        // keeps it, so it is pooled scratch: inference used to allocate the gates, cells and hiddens every call.
+        bool recording = DifferentiableOps.IsRecording<double>();
+        var pool = System.Buffers.ArrayPool<double>.Shared;
+        var gates = recording ? new double[totalRows * G] : pool.Rent(totalRows * G);
+        var cells = recording ? new double[batch * (seqLen + 1) * hidden] : pool.Rent(batch * (seqLen + 1) * hidden);
+        var hiddens = recording ? new double[batch * (seqLen + 1) * hidden] : pool.Rent(batch * (seqLen + 1) * hidden);
 
         var output = new Tensor<double>(LstmTrainingOutputShape(batch, seqLen, hidden, returnSequences, wantState));
         using var outSpanLease = output.LeaseWritable();
@@ -1065,6 +1068,15 @@ public partial class CpuEngine
             bIhArr, bHhArr, h0Arr, c0Arr, batch, seqLen, inFeatures, hidden,
             returnSequences, gates, cells, hiddens, outSpan);
         if (wantState) WriteLstmFinalStates(outSpan, hiddens, cells, batch, seqLen, hidden, returnSequences);
+
+        if (!recording)
+        {
+            pool.Return(gates);
+            pool.Return(cells);
+            pool.Return(hiddens);
+            return UnpackLstmTrainingOutput(this, output, batch, seqLen, hidden, returnSequences, wantState,
+                out finalHidden, out finalCell);
+        }
 
         int nInputs = 3 + (bIh is not null ? 1 : 0) + (bHh is not null ? 1 : 0)
                         + (h0 is not null ? 1 : 0) + (c0 is not null ? 1 : 0);
@@ -1107,7 +1119,8 @@ public partial class CpuEngine
         }
 
         // Wx[b,t,:] = wIh @ x[b,t] (+ bIh): one big GEMM x[totalRows, inF] @ wIh^T[inF, G].
-        var wx = new double[totalRows * G];
+        var pool = System.Buffers.ArrayPool<double>.Shared;
+        var wx = pool.Rent(totalRows * G);
         GemmBigD(inSpan, inFeatures, false, wIhSpan, inFeatures, true,
                  wx.AsSpan(0, totalRows * G), totalRows, inFeatures, G);
         if (bIhArr is not null)
@@ -1118,19 +1131,19 @@ public partial class CpuEngine
             }
 
         // Pre-transpose wHh [G, hidden] → wHhT [hidden, G] for the per-step recurrent GEMM.
-        var wHhT = new double[hidden * G];
+        var wHhT = pool.Rent(hidden * G);
         for (int g = 0; g < G; g++)
             for (int h = 0; h < hidden; h++)
                 wHhT[h * G + g] = wHhSpan[g * hidden + h];
 
-        var hPrev = new double[batch * hidden];
-        var hh = new double[batch * G];
+        var hPrev = pool.Rent(batch * hidden);
+        var hh = pool.Rent(batch * G);
         for (int b = 0; b < batch; b++)
             Array.Copy(hiddens, b * (seqLen + 1) * hidden, hPrev, b * hidden, hidden);
 
         int bh = batch * hidden;
-        var act = new double[4 * bh];
-        var cbuf = new double[bh];
+        var act = pool.Rent(4 * bh);
+        var cbuf = pool.Rent(bh);
 
         for (int t = 0; t < seqLen; t++)
         {
@@ -1200,6 +1213,13 @@ public partial class CpuEngine
                 Array.Copy(hiddens, (b * (seqLen + 1) + t + 1) * hidden, hPrev, b * hidden, hidden);
         }
 
+        // Per-call scratch, pooled: the projection, the transposed weight and the per-step buffers.
+        pool.Return(wx);
+        pool.Return(wHhT);
+        pool.Return(hPrev);
+        pool.Return(hh);
+        pool.Return(act);
+        pool.Return(cbuf);
     }
 
     /// <summary>

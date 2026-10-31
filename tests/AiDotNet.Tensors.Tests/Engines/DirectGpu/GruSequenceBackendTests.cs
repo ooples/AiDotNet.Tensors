@@ -97,7 +97,25 @@ public class GruSequenceBackendTests
         Skip.If(engine is null || !engine.IsGpuAvailable, "No DirectGpu backend available.");
         using (engine)
         {
-            var backend = engine!.GetBackend()!;
+            var backend = engine.GetBackend();
+            Skip.If(backend is null, "No DirectGpu backend available.");
+            Check(backend);
+        }
+    }
+
+    // Vulkan is not the default backend where OpenCL is present, so the engine-backed check above never reached it: its
+    // kernels computed the reset gate before the hidden matmul and ran the whole BPTT in one invocation.
+    [SkippableFact]
+    public void Vulkan_ForwardAndBackwardSequence_MatchCpuGruAndNumericGradients()
+    {
+        var backend = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Instance;
+        Skip.IfNot(backend.Initialize() && backend.IsGlslCompilerAvailable, "Vulkan with a GLSL compiler is not available.");
+        Check(backend);
+    }
+
+    private static void Check(IDirectGpuBackend backend)
+    {
+        {
             var rng = new Random(11);
             var p = new Params();
             foreach (var arr in new[] { p.X, p.H0, p.Wih, p.Whh, p.Bih, p.Bhh })

@@ -68,6 +68,9 @@ internal sealed class GradientDeferral
         return (Tensor<T>)parked;
     }
 
+    /// <summary>The contributions parked now.</summary>
+    internal IEnumerable<object> ParkedContributions => _parked.Values;
+
     /// <summary>Drops anything a previous run left parked (a step that threw part way).</summary>
     internal void Reset() => _parked.Clear();
 

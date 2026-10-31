@@ -1,5 +1,6 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
 using System;
+using System.Linq;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 
@@ -15,6 +16,8 @@ public sealed partial class HipBackend : IBatchNormVarianceBackend
         {
             foreach (var name in BatchNormRegisterKernelTemplate.GetKernelNames())
                 if (!HasTunedKernel(name)) return false;
+            foreach (var name in BatchNormRegisterKernelTemplate.GetUnpackedKernelNames())
+                if (!HasTunedKernel(name)) return false;
             return true;
         }
     }
@@ -22,8 +25,10 @@ public sealed partial class HipBackend : IBatchNormVarianceBackend
     // Strict math, as the Winograd modules: the mask the backward rebuilds must round as the forward's value did.
     private void CompileBatchNormRegisterKernels()
     {
-        var failure = CompileKernelModule(BatchNormRegisterKernelTemplate.GetModuleSource(WinogradKernelDialect.Hip),
-            "bn_register", ref _batchNormRegisterModule, BatchNormRegisterKernelTemplate.GetKernelNames(), useFastMath: false);
+        var failure = CompileKernelModule(BatchNormRegisterKernelTemplate.GetModuleSourceWithUnpacked(WinogradKernelDialect.Hip),
+            "bn_register", ref _batchNormRegisterModule,
+            BatchNormRegisterKernelTemplate.GetKernelNames().Concat(BatchNormRegisterKernelTemplate.GetUnpackedKernelNames()).ToArray(),
+            useFastMath: false);
         if (failure is not null)
             System.Diagnostics.Trace.TraceWarning($"HIP register-resident BatchNorm kernels unavailable: {failure.Message}");
     }
@@ -43,7 +48,7 @@ public sealed partial class HipBackend : IBatchNormVarianceBackend
         IGpuBuffer gamma, IGpuBuffer beta, IGpuBuffer saveMean, IGpuBuffer saveVariance,
         int batch, int channels, int spatial, float epsilon, bool relu, IGpuBuffer? residual)
         => BatchNormRegisterReady && PortableBatchNorm.TryForward(this, LaunchBatchNormRegister, input, output, gamma, beta,
-            saveMean, saveVariance, batch, channels, spatial, epsilon, relu, residual);
+            saveMean, saveVariance, batch, channels, spatial, epsilon, relu, residual, unpacked: true);
 
     bool IBatchNormVarianceBackend.TryBatchNormBackwardFromVariance(IGpuBuffer gradOutput, IGpuBuffer input,
         IGpuBuffer gamma, IGpuBuffer saveMean, IGpuBuffer saveVariance, IGpuBuffer gradInput, IGpuBuffer gradGamma,
@@ -51,5 +56,5 @@ public sealed partial class HipBackend : IBatchNormVarianceBackend
         IGpuBuffer? gradResidual, IGpuBuffer? beta, IGpuBuffer? gradOutput2)
         => BatchNormRegisterReady && PortableBatchNorm.TryBackward(this, LaunchBatchNormRegister, gradOutput, input, gamma,
             saveMean, saveVariance, gradInput, gradGamma, gradBeta, batch, channels, spatial, epsilon, reluOutput,
-            gradResidual, beta, gradOutput2);
+            gradResidual, beta, gradOutput2, unpacked: true);
 }

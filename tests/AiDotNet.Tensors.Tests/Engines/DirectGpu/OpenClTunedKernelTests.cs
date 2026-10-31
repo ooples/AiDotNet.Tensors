@@ -377,6 +377,7 @@ public sealed class OpenClTunedKernelTests
     {
         (1, 3, 8, 8, 4, 3, 1, 1, 1), (2, 4, 9, 7, 5, 3, 1, 0, 1), (1, 8, 6, 6, 3, 1, 1, 0, 1),
         (2, 3, 11, 10, 2, 5, 2, 2, 1), (1, 2, 12, 12, 3, 3, 1, 2, 2), (3, 5, 7, 9, 6, 3, 2, 1, 1),
+        (2, 6, 5, 4, 7, 1, 1, 0, 1),   // a 1x1 convolution over a batch: the batch-shared pointwise route
     };
 
     [SkippableFact]
@@ -439,9 +440,43 @@ public sealed class OpenClTunedKernelTests
             }
             // Every candidate applies to these small shapes, so a variant that silently dropped out fails here --
             // except the three Winograd routes (F(2x2,3x3) unfused and fused, F(4x4,3x3)), which admit only 3x3 stride-1
-            // undilated shapes (WinogradF23Pipeline), and the split-K GEMM route, which admits only batch 1.
+            // undilated shapes (WinogradF23Pipeline), the split-K GEMM route, which admits only batch 1, and the batch-shared
+            // pointwise route, which admits only a 1x1 stride-1 unpadded convolution over a batch, through CLBlast.
+            bool pointwise = bt > 1 && k == 1 && s == 1 && p == 0 && OpenClBackend.IsClBlastAvailable;
             Assert.Equal(backend.Conv2DForwardSlot.CandidateIds.Count, Applicable(backend.Conv2DForwardSlot, args.Shape()).Count
-                + (k > 7 ? 1 : 0) + (WinogradF23Pipeline.AdmitsShape(args.Shape()) ? 0 : 3) + (bt == 1 ? 0 : 1));
+                + (k > 7 ? 1 : 0) + (WinogradF23Pipeline.AdmitsShape(args.Shape()) ? 0 : 3) + (bt == 1 ? 0 : 1)
+                + (pointwise ? 0 : 1));
+        }
+    }
+    // The GEMM slot's candidates (the established route and the split-K GEMM) each against a double reference, on shapes
+    // that are not tile multiples, both candidates applying to every one.
+    [SkippableFact]
+    public void Gemm_EveryCandidate_MatchesCpu()
+    {
+        using var backend = RequireBackend();
+        foreach (var (m, n, k) in new[] { (1, 7, 300), (65, 192, 192), (33, 70, 129), (130, 257, 64), (3, 5, 2000) })
+        {
+            float[] a = Values(m * k, m + k), b = Values(k * n, n + 3);
+            var expected = new float[m * n];
+            for (int i = 0; i < m; i++)
+                for (int j = 0; j < n; j++)
+                {
+                    double acc = 0;
+                    for (int p = 0; p < k; p++) acc += (double)a[i * k + p] * b[p * n + j];
+                    expected[i * n + j] = (float)acc;
+                }
+            using var ab = backend.AllocateBuffer(a);
+            using var bb = backend.AllocateBuffer(b);
+            using var cb = backend.AllocateBuffer(m * n);
+            var args = new TunedGemmArgs(ab, bb, cb, m, n, k);
+            var candidates = Applicable(backend.GemmSlot, args.Shape());
+            Assert.Equal(backend.GemmSlot.CandidateIds.Count, candidates.Count);
+            foreach (var cand in candidates)
+            {
+                cand.Execute(args);
+                backend.Synchronize();
+                AssertClose(expected, backend.DownloadBuffer(cb), expected.Length, $"{cand.Id} gemm {m}x{n}x{k}", termScale: 1.0);
+            }
         }
     }
 }

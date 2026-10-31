@@ -13,6 +13,14 @@ internal static class PortableFusedAttention
 {
     public static bool Supports(int headDim) => headDim > 0;
 
+    // The score elements (batch x heads x seqQ x seqK) the composed form materializes, above which these kernels are worth
+    // their speed: 64M floats, 256 MB. Below it two batched GEMMs around a softmax win - a ViT's 65-token attention on
+    // OpenCL trained at 3.98 s an epoch fused against 0.70 s composed, with the same loss.
+    private const long ComposedMaxScores = 64L * 1024 * 1024;
+
+    /// <summary>Whether the portable fused kernels should run rather than the composed attention for this size.</summary>
+    public static bool PrefersFused(int batch, int heads, int seqQ, int seqK) => (long)batch * heads * seqQ * seqK > ComposedMaxScores;
+
     private static int Narrow(long value, string name)
         => value >= int.MinValue && value <= int.MaxValue
             ? (int)value

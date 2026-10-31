@@ -133,13 +133,17 @@ public sealed partial class CudaBackend
 
     private void ValidateCodegenBuffer(IGpuBuffer buffer, long requiredBytes, string parameterName)
     {
-        if (buffer is not CudaGpuBuffer cudaBuffer ||
-            cudaBuffer.Handle == IntPtr.Zero ||
-            cudaBuffer.OwningContext != _cudaContext)
+        // Native memory this backend allocated in its context, or memory imported through DLPack and wrapped for this
+        // backend (a producer's device pointer in the same primary context).
+        bool ours = buffer switch
         {
+            CudaGpuBuffer cuda => cuda.Handle != IntPtr.Zero && cuda.OwningContext == _cudaContext,
+            ExternalDeviceBuffer external => external.Handle != IntPtr.Zero && ReferenceEquals(external.Owner, this),
+            _ => false,
+        };
+        if (!ours)
             throw new ArgumentException("Every buffer must belong to this CUDA backend.", parameterName);
-        }
-        if (cudaBuffer.SizeInBytes < requiredBytes)
+        if (buffer.SizeInBytes < requiredBytes)
             throw new ArgumentException("A generated-kernel buffer is smaller than its emitted shape.", parameterName);
     }
 

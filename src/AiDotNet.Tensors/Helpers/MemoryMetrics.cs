@@ -128,7 +128,7 @@ public static class MemoryMetrics
         {
             if (sampleIntervalMs < 1) sampleIntervalMs = 1;
             _peakBytes = CurrentProcessRssBytes;
-            _timer = new Timer(_ => Sample(), state: null, dueTime: 0, period: sampleIntervalMs);
+            _timer = DetachedContext.Run(() => new Timer(_ => Sample(), state: null, dueTime: 0, period: sampleIntervalMs));
         }
 
         private void Sample()

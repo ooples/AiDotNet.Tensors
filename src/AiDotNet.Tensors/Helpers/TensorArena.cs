@@ -733,13 +733,16 @@ public sealed class TensorArena : IDisposable
         }
 
         // Warmup path: reuse a buffer from the cross-arena persistent pool if
-        // one is available for this (type,size), else allocate fresh. Both
-        // sources yield ZEROED memory — RentPersistent clears recycled buffers,
-        // and `new T[]` is CLR-zeroed — so the `clear` contract is already
-        // satisfied without an extra Array.Clear here. (The within-arena reuse
+        // one is available for this (type,size), else allocate fresh. A zeroing
+        // rent gets ZEROED memory from both sources — RentPersistent clears
+        // recycled buffers, and `new T[]` is CLR-zeroed — so the `clear` contract
+        // is satisfied without an extra Array.Clear here. (The within-arena reuse
         // path above still clears, because those buffers were handed out earlier
-        // THIS lifetime and may hold stale data the caller wrote.)
-        var arr = RentPersistent(typeof(T), elementCount) as T[] ?? new T[elementCount];
+        // THIS lifetime and may hold stale data the caller wrote.) An uninitialized
+        // rent skips the clear, as the tensor ring does: the ring overflows into
+        // here for models with many distinct sizes, and zeroing each recycled
+        // buffer was 17% of DenseNet-121 training's main-thread zeroing.
+        var arr = RentPersistent(typeof(T), elementCount, zero: clear) as T[] ?? new T[elementCount];
         MarkIssued(arr);
         bucket.Add(arr);
         TrackBackingBytes<T>(elementCount);

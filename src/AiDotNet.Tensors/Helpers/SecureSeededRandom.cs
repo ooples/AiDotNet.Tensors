@@ -26,10 +26,7 @@ namespace AiDotNet.Tensors.Helpers;
 /// (System.Random-based, faster) is sufficient.
 /// </para>
 /// </remarks>
-public sealed class SecureSeededRandom : Random
-#if !NET6_0_OR_GREATER
-    , IDisposable
-#endif
+public sealed class SecureSeededRandom : Random, IDisposable
 {
     private readonly byte[] _seedBytes;
     private readonly byte[] _buffer = new byte[32]; // SHA-256 output size.
@@ -83,19 +80,19 @@ public sealed class SecureSeededRandom : Random
         dst[offset + 7] = (byte)value;
     }
 
-#if !NET6_0_OR_GREATER
     /// <summary>
-    /// Disposes the underlying <see cref="SHA256"/> hasher on .NET Framework.
-    /// On modern .NET this type holds no disposable state (SHA256.HashData is
-    /// a stateless static).
+    /// Disposes the underlying <see cref="SHA256"/> hasher on .NET Framework and .NET Standard. On .NET 6+ this type
+    /// holds no disposable state (SHA256.HashData is a stateless static) and this does nothing; it is
+    /// <see cref="IDisposable"/> on every target so code built against one asset runs against another.
     /// </summary>
     public void Dispose()
     {
+#if !NET6_0_OR_GREATER
         if (_disposed) return;
         _disposed = true;
         _sha256.Dispose();
-    }
 #endif
+    }
 
     private byte NextByte()
     {

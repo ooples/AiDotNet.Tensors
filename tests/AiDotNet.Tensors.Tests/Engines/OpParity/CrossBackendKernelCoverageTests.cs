@@ -62,6 +62,8 @@ public sealed class CrossBackendKernelCoverageTests
         // OpenCL's element-parallel batch-norm inference (optionally with ReLU): CUDA/HIP run the same op as
         // batchnorm_forward with training = 0, and batchnorm_relu for the ReLU form (CudaNormalizationKernels.cs).
         "batchnorm_inference",
+        "batchnorm_inference4",              // the same op four spatial elements at a time when the plane is a multiple of 4
+        "copy_2d_strided4",                  // OpenCL's float4 form of copy_2d_strided (CudaMissingLookupKernels.cs; HipBackend.cs)
         // OpenCL batch-execution kernels whose CUDA/HIP twin is a shared mode kernel (BatchExecutionCudaKernels.cs):
         "bx_crop_2d_backward",               // -> bx_window_2d mode 3
         "bx_mse_loss_rows",                  // -> bx_row_loss mode 1
@@ -71,6 +73,7 @@ public sealed class CrossBackendKernelCoverageTests
         "bx_reduce_log_variance_backward",   // -> bx_reduce_backward mode 3
         "bx_sparsemax",                      // -> bx_row_map mode 5
         "add_gelu", "add_relu", "add_sigmoid",                 // fused bias+activation epilogue (CudaBackend.cs)
+        "bias_activation",                                     // OpenCL GemmBias* epilogue; CUDA/HIP run every GemmBias* op with their own gemm_bias_* / bias_add kernels (CudaBackend.cs, HipBackend.cs)
         "clip_by_value", "where_select", "max_axis", "var_axis", // elementwise/axis-reduce (CudaBackend.cs)
         "mixed_precision_forward", "mixed_precision_backward",  // CudaBackend.MixedPrecisionConv.cs
         "global_maxpool2d_with_indices",                       // -> global_maxpool2d (+backward)

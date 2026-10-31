@@ -120,6 +120,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void SetArg(uint index, int value)
             => Stage(this, index).Add(new PendingArg(index, ArgKind.Int32, value));
 
+        /// <summary>
+        /// A <c>uint</c> kernel argument, 4 bytes. Without this overload a <c>uint</c> bound to <see cref="SetArg(uint, ulong)"/>
+        /// and was set as 8 bytes, which OpenCL rejects with CL_INVALID_ARG_SIZE (-51): every kernel taking a uint (the
+        /// stateless dropout mask among them) failed to launch.
+        /// </summary>
+        public void SetArg(uint index, uint value)
+            => Stage(this, index).Add(new PendingArg(index, ArgKind.Int32, unchecked((int)value)));
+
         public void SetArg(uint index, float value)
             => Stage(this, index).Add(new PendingArg(index, ArgKind.Float, BitConverter.ToInt32(BitConverter.GetBytes(value), 0)));
 

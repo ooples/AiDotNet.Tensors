@@ -5,8 +5,11 @@ using P = AiDotNet.Tensors.Engines.DirectGpu.PortableFusedAttention;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
-public sealed partial class VulkanBackend : IFusedAttentionBackend
+public sealed partial class VulkanBackend : IFusedAttentionBackend, IFusedAttentionPreference
 {
+    bool IFusedAttentionPreference.PrefersFusedAttention(int batch, int heads, int seqQ, int seqK, int headDim)
+        => P.PrefersFused(batch, heads, seqQ, seqK);
+
     bool IFusedAttentionBackend.SupportsFusedAttention(int headDim) => P.Supports(headDim);
 
     void IFusedAttentionBackend.FusedAttentionForward(IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer o, IGpuBuffer lse,

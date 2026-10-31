@@ -186,4 +186,21 @@ public class CompileTracerBugfixTests
         Assert.Equal(6.0, output[1], precision: 6);
     }
 
+    [Fact]
+    public void Pad_WithAComplexFillValue_CompilesAndFillsWithIt()
+    {
+        // The recorded Pad keeps its fill value as T: converting it to double (as an exporter's saved state once did)
+        // threw for a Complex with an imaginary part, so the whole capture failed although Pad only copies the value.
+        var engine = new CpuEngine();
+        var input = new Tensor<Complex<double>>(new[] { 1, 2, 2 });
+        for (int i = 0; i < input.Length; i++) input[i] = new Complex<double>(i + 1, -(i + 1));
+        var fill = new Complex<double>(0.5, 2.0);
+        using var cache = new CompiledModelCache<Complex<double>>();
+        var plan = cache.GetOrCompileInference(input, () => engine.Pad(input, 1, 0, 0, 1, fill));
+        var padded = plan.Execute();
+        Assert.Equal(new[] { 1, 3, 3 }, padded._shape);
+        Assert.Equal(fill, padded[0]);                                 // the added top row
+        Assert.Equal(new Complex<double>(1, -1), padded[3]);           // the first input value
+        Assert.Equal(fill, padded[5]);                                 // the added right column
+    }
 }

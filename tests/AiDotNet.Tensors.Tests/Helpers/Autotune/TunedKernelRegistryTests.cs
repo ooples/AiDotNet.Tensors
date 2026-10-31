@@ -463,6 +463,33 @@ public sealed class TunedKernelRegistryTests : IDisposable
     }
 
     [Fact]
+    public void ExhaustedBudget_ServesTheUntunedDefault_WhenItMatchesTheReference()
+    {
+        // An unmeasured shape gets the slot's shape-aware default, after one correctness run and no timing.
+        TunedKernelPolicy.BudgetMilliseconds = 0;
+        var harness = new Harness();
+        var slot = Slot(harness, false, new Fake("ref", 1f, 1.0), new Fake("other", 1f, 0.7), new Fake("fast", 1f, 0.5));
+        slot.UntunedPreference = _ => new[] { "missing", "fast", "other" };
+
+        Assert.Equal("fast", slot.Resolve(Shape(), NewArgs())?.Id);
+        Assert.Equal(0, harness.Measurements);
+        Assert.Equal(TunedKernelDecisionReason.Heuristic, Assert.Single(slot.CachedDecisions).Reason);
+    }
+
+    [Fact]
+    public void ExhaustedBudget_RejectsAnUntunedDefault_ThatDisagreesWithTheReference()
+    {
+        TunedKernelPolicy.BudgetMilliseconds = 0;
+        var harness = new Harness();
+        var slot = Slot(harness, false, new Fake("ref", 1f, 1.0), new Fake("wrong", 2f, 0.5));
+        slot.UntunedPreference = _ => new[] { "wrong" };
+
+        Assert.Equal("ref", slot.Resolve(Shape(), NewArgs())?.Id);
+        var decision = Assert.Single(slot.CachedDecisions);
+        Assert.Equal(TunedKernelDecisionReason.BudgetExhausted, decision.Reason);
+        Assert.Contains(decision.Rejected, r => r.StartsWith("wrong: untuned default error", System.StringComparison.Ordinal));
+    }
+    [Fact]
     public void AddCandidate_InvalidatesDecisions_AndCannotReplaceTheReference()
     {
         var reference = new Fake("ref", 1f, 1.0);

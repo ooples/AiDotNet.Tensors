@@ -11,8 +11,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels
     {
         internal const string Partial = "gemv_rowvec_partial";
         internal const string Reduce = "gemv_rowvec_reduce";
+        internal const string ReduceEpilogue = "gemv_rowvec_reduce_epilogue";
 
-        internal static string[] GetKernelNames() => new[] { Partial, Reduce };
+        internal static string[] GetKernelNames() => new[] { Partial, Reduce, ReduceEpilogue };
 
         internal const string Source = @"
 __kernel void gemv_rowvec_partial(__global const float* restrict x, __global const float* restrict b,
@@ -38,6 +39,26 @@ __kernel void gemv_rowvec_reduce(__global const float* restrict partial, __globa
     float sum = 0.0f;
     for (int s = 0; s < splits; s++) sum += partial[(long)s * N + n];
     y[n] = alpha * sum;
+}
+
+// The reduce with a dense layer's epilogue: y[n] = act(sum + bias[n]), saving the bias_activation pass (a launch, and a
+// read and write of y) at batch 1. Only the activations exact without transcendentals, each as bias_activation computes
+// it: mode 0 none, 1 ReLU (NaN passes through), 6 leaky ReLU with slope.
+__kernel void gemv_rowvec_reduce_epilogue(__global const float* restrict partial, __global float* restrict y,
+    const int N, const int splits, __global const float* restrict bias, const int mode, const float slope)
+{
+    int n = (int)get_global_id(0);
+    if (n >= N) return;
+    float sum = 0.0f;
+    for (int s = 0; s < splits; s++) sum += partial[(long)s * N + n];
+    float x = sum + bias[n];
+    if (mode == 1) {
+        uint bits = as_uint(x) & 0x7fffffffu;
+        x = (bits > 0x7f800000u) ? x : fmax(0.0f, x);
+    } else if (mode == 6) {
+        x = x > 0.0f ? x : slope * x;
+    }
+    y[n] = x;
 }
 ";
     }

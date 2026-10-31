@@ -20,7 +20,8 @@ public class FirstWriteRedirectTableTests
         public void Dispose() { }
     }
 
-    private const long Slot = (3L << 32) | 1;
+    private const int SlotAction = 3;
+    private const long Slot = ((long)SlotAction << 32) | 1;
 
     [Fact]
     public void A_single_use_first_write_is_redirected_after_an_executed_run()
@@ -29,7 +30,7 @@ public class FirstWriteRedirectTableTests
         var scratch = new Buffer();
         var accumulator = new Buffer();
         table.BeginRun();
-        table.NoteContribution(scratch);
+        table.NoteContribution(scratch, SlotAction);
         table.Offer(Slot, scratch, accumulator);
         Assert.False(table.TryGetTarget(Slot, out _));   // nothing is redirected mid-run
         table.EndRun(executed: true);
@@ -45,15 +46,15 @@ public class FirstWriteRedirectTableTests
         var scratch = new Buffer();
         var accumulatorA = new Buffer();
         table.BeginRun();
-        table.NoteContribution(scratch);                 // first write of A
+        table.NoteContribution(scratch, SlotAction);                 // first write of A
         table.Offer(Slot, scratch, accumulatorA);
-        table.NoteContribution(scratch);                 // the same contribution also reaches B
+        table.NoteContribution(scratch, SlotAction);                 // the same contribution also reaches B
         table.EndRun(executed: true);
         Assert.False(table.TryGetTarget(Slot, out _));
 
         // Blocked for good: a later run in which the second consumer happens not to show up does not lift it.
         table.BeginRun();
-        table.NoteContribution(scratch);
+        table.NoteContribution(scratch, SlotAction);
         table.Offer(Slot, scratch, accumulatorA);
         table.EndRun(executed: true);
         Assert.False(table.TryGetTarget(Slot, out _));
@@ -66,17 +67,47 @@ public class FirstWriteRedirectTableTests
         var scratch = new Buffer();
         var accumulator = new Buffer();
         table.BeginRun();
-        table.NoteContribution(scratch);
+        table.NoteContribution(scratch, SlotAction);
         table.Offer(Slot, scratch, accumulator);
         table.EndRun(executed: true);
         Assert.True(table.TryGetTarget(Slot, out _));
 
         // Redirected: the contribution is the accumulator's own buffer, consumed twice this run.
         table.BeginRun();
-        table.NoteContribution(accumulator);
-        table.NoteContribution(accumulator);
+        table.NoteContribution(accumulator, SlotAction);
+        table.NoteContribution(accumulator, SlotAction);
         table.EndRun(executed: true);
         Assert.False(table.TryGetTarget(Slot, out _));
+    }
+
+    [Fact]
+    public void One_pooled_accumulator_redirected_in_two_actions_stays_redirected()
+    {
+        // Pooled gradients with disjoint lifetimes share one device buffer, so it is the accumulator of a slot in each of
+        // their first-writing actions; each slot's output is still consumed once.
+        var table = new FirstWriteRedirectTable();
+        var scratchA = new Buffer();
+        var scratchB = new Buffer();
+        var shared = new Buffer();
+        const long slotB = (7L << 32) | 0;
+        table.BeginRun();
+        table.NoteContribution(scratchA, SlotAction);
+        table.Offer(Slot, scratchA, shared);
+        table.NoteContribution(scratchB, 7);
+        table.Offer(slotB, scratchB, shared);
+        table.EndRun(executed: true);
+        Assert.True(table.TryGetTarget(Slot, out _));
+        Assert.True(table.TryGetTarget(slotB, out _));
+
+        // Redirected: both slots now write the shared buffer, once in each action.
+        table.BeginRun();
+        table.NoteContribution(shared, SlotAction);
+        table.NoteContribution(shared, 7);
+        table.EndRun(executed: true);
+        Assert.True(table.TryGetTarget(Slot, out var a));
+        Assert.True(table.TryGetTarget(slotB, out var b));
+        Assert.Same(shared, a);
+        Assert.Same(shared, b);
     }
 
     [Fact]
@@ -86,7 +117,7 @@ public class FirstWriteRedirectTableTests
         var scratch = new Buffer();
         var accumulator = new Buffer();
         table.BeginRun();
-        table.NoteContribution(scratch);
+        table.NoteContribution(scratch, SlotAction);
         table.Offer(Slot, scratch, accumulator);
         table.EndRun(executed: false);
         Assert.False(table.TryGetTarget(Slot, out _));

@@ -195,50 +195,90 @@ layout(set=0,binding=2) writeonly buffer Mel { float mel[]; };
 layout(push_constant) uniform Params { uint frames; uint frequencies; uint bands; };
 void main(){uint idx=gl_GlobalInvocationID.x;if(idx>=frames*bands)return;uint frame=idx/bands,band=idx%bands;float sum=0.0;for(uint k=0u;k<frequencies;++k)sum+=power[frame*frequencies+k]*filterbank[band*frequencies+k];mel[idx]=sum;}";
 
-    public static string GruForwardSequence => Header + @"
+    // GRU sequences run as one dispatch per timestep (plus whole-sequence projections and gradient reductions), with an
+    // invocation per (batch row, hidden unit). They used to run each batch row's whole sequence in one invocation and the
+    // whole BPTT in ONE invocation, which tripped the driver's watchdog (VK_ERROR_DEVICE_LOST at the next submission).
+    // LSTM sequences run the shared lstm_p_ kernels instead (PortableLstmSequence).
+    // Layout: input/output [T, B, *] (time-major), allH [T + 1, B, H]; push constants seqLen, batch, inputSize,
+    // hiddenSize, then the step t where a kernel takes one.
+
+    // GRU, PyTorch's formulation (the reset gate scales W_hn h + b_hn), as the other backends compute it:
+    //   r = sigmoid(W_ir x + b_ir + W_hr h + b_hr), z = sigmoid(W_iz x + b_iz + W_hz h + b_hz)
+    //   n = tanh(W_in x + b_in + r * (W_hn h + b_hn)), h' = (1 - z) * n + z * h
+    // cacheGates [T, B, 3H] holds r, z and W_hn h + b_hn. The projection first stores W_i* x + b_i* there.
+    public static string GruSequenceInputProjection => Header + @"
 layout(set=0,binding=0) readonly buffer Input { float inputData[]; };
 layout(set=0,binding=1) readonly buffer WeightsIh { float weightsIh[]; };
-layout(set=0,binding=2) readonly buffer WeightsHh { float weightsHh[]; };
-layout(set=0,binding=3) readonly buffer BiasIh { float biasIh[]; };
-layout(set=0,binding=4) readonly buffer BiasHh { float biasHh[]; };
-layout(set=0,binding=5) buffer Output { float outputData[]; };
-layout(set=0,binding=6) buffer AllH { float allH[]; };
-layout(set=0,binding=7) buffer CacheGates { float cacheGates[]; };
+layout(set=0,binding=2) readonly buffer BiasIh { float biasIh[]; };
+layout(set=0,binding=3) writeonly buffer Gates { float gates[]; };
 layout(push_constant) uniform Params { uint seqLen; uint batch; uint inputSize; uint hiddenSize; };
-float sigmoid(float x){return 1.0/(1.0+exp(-x));}
-void main(){uint b=gl_GlobalInvocationID.x;if(b>=batch)return;uint gateSize=3u*hiddenSize,cellSize=batch*hiddenSize;
-    for(uint t=0u;t<seqLen;++t){uint hOffset=t*cellSize,nextOffset=(t+1u)*cellSize,gateOffset=(t*batch+b)*gateSize,inputOffset=(t*batch+b)*inputSize;
-        for(uint g=0u;g<2u*hiddenSize;++g){float sum=biasIh[g]+biasHh[g];for(uint k=0u;k<inputSize;++k)sum+=inputData[inputOffset+k]*weightsIh[g*inputSize+k];for(uint k=0u;k<hiddenSize;++k)sum+=allH[hOffset+b*hiddenSize+k]*weightsHh[g*hiddenSize+k];cacheGates[gateOffset+g]=sigmoid(sum);}
-        for(uint i=0u;i<hiddenSize;++i){uint gate=2u*hiddenSize+i;float sum=biasIh[gate]+biasHh[gate];for(uint k=0u;k<inputSize;++k)sum+=inputData[inputOffset+k]*weightsIh[gate*inputSize+k];for(uint k=0u;k<hiddenSize;++k)sum+=cacheGates[gateOffset+k]*allH[hOffset+b*hiddenSize+k]*weightsHh[gate*hiddenSize+k];cacheGates[gateOffset+gate]=tanh(sum);}
-        for(uint i=0u;i<hiddenSize;++i){float z=cacheGates[gateOffset+hiddenSize+i],n=cacheGates[gateOffset+2u*hiddenSize+i],previous=allH[hOffset+b*hiddenSize+i],value=(1.0-z)*n+z*previous;allH[nextOffset+b*hiddenSize+i]=value;outputData[t*cellSize+b*hiddenSize+i]=value;}
-    }
-}";
+void main(){uint idx=gl_GlobalInvocationID.x,gateSize=3u*hiddenSize;if(idx>=seqLen*batch*gateSize)return;uint g=idx%gateSize,row=idx/gateSize;
+    float sum=biasIh[g];for(uint k=0u;k<inputSize;++k)sum+=inputData[row*inputSize+k]*weightsIh[g*inputSize+k];gates[idx]=sum;}";
 
-    public static string GruBackwardSequence => Header + @"
+    // One GRU step for unit j of batch row b; replaces the projected input terms in cacheGates with r, z, W_hn h + b_hn.
+    public static string GruSequenceStep => Header + @"
+layout(set=0,binding=0) readonly buffer WeightsHh { float weightsHh[]; };
+layout(set=0,binding=1) readonly buffer BiasHh { float biasHh[]; };
+layout(set=0,binding=2) buffer Gates { float gates[]; };
+layout(set=0,binding=3) buffer AllH { float allH[]; };
+layout(set=0,binding=4) writeonly buffer Output { float outputData[]; };
+layout(push_constant) uniform Params { uint seqLen; uint batch; uint inputSize; uint hiddenSize; uint t; };
+float sigmoid(float x){return 1.0/(1.0+exp(-x));}
+void main(){uint idx=gl_GlobalInvocationID.x;if(idx>=batch*hiddenSize)return;uint b=idx/hiddenSize,j=idx%hiddenSize,H=hiddenSize,cellSize=batch*H,row=t*batch+b,gateOffset=row*3u*H,hPrev=t*cellSize+b*H;
+    float hr=biasHh[j],hz=biasHh[H+j],hn=biasHh[2u*H+j];for(uint k=0u;k<H;++k){float hk=allH[hPrev+k];hr+=weightsHh[j*H+k]*hk;hz+=weightsHh[(H+j)*H+k]*hk;hn+=weightsHh[(2u*H+j)*H+k]*hk;}
+    float r=sigmoid(gates[gateOffset+j]+hr),z=sigmoid(gates[gateOffset+H+j]+hz),n=tanh(gates[gateOffset+2u*H+j]+r*hn),hNew=(1.0-z)*n+z*allH[hPrev+j];
+    gates[gateOffset+j]=r;gates[gateOffset+H+j]=z;gates[gateOffset+2u*H+j]=hn;allH[(t+1u)*cellSize+b*H+j]=hNew;outputData[row*H+j]=hNew;}";
+
+    // GRU backward, step t: dGates [T, B, 4H] gets dr, dz, dn (pre-activation) and dn * r (the W_hn h + b_hn term's
+    // gradient) from dh = dy + carry; carry becomes dh * z, the direct path. n is recovered through (1 - z) * n = h' - z h.
+    public static string GruSequenceBackwardCell => Header + @"
 layout(set=0,binding=0) readonly buffer GradOutput { float gradOutput[]; };
 layout(set=0,binding=1) readonly buffer AllH { float allH[]; };
-layout(set=0,binding=2) readonly buffer CacheGates { float cacheGates[]; };
-layout(set=0,binding=3) readonly buffer WeightsIh { float weightsIh[]; };
-layout(set=0,binding=4) readonly buffer WeightsHh { float weightsHh[]; };
-layout(set=0,binding=5) readonly buffer Input { float inputData[]; };
-layout(set=0,binding=6) buffer GradInput { float gradInput[]; };
-layout(set=0,binding=7) buffer GradHInit { float gradHInit[]; };
-layout(set=0,binding=8) buffer GradWeightsIh { float gradWeightsIh[]; };
-layout(set=0,binding=9) buffer GradWeightsHh { float gradWeightsHh[]; };
-layout(set=0,binding=10) buffer GradBias { float gradBias[]; };
-layout(set=0,binding=11) buffer NextDh { float nextDh[]; };
+layout(set=0,binding=2) readonly buffer Gates { float gates[]; };
+layout(set=0,binding=3) writeonly buffer DGates { float dGates[]; };
+layout(set=0,binding=4) buffer Carry { float carry[]; };
+layout(push_constant) uniform Params { uint seqLen; uint batch; uint inputSize; uint hiddenSize; uint t; };
+void main(){uint idx=gl_GlobalInvocationID.x;if(idx>=batch*hiddenSize)return;uint b=idx/hiddenSize,j=idx%hiddenSize,H=hiddenSize,cellSize=batch*H,row=t*batch+b,gateOffset=row*3u*H,dOffset=row*4u*H;
+    float r=gates[gateOffset+j],z=gates[gateOffset+H+j],hn=gates[gateOffset+2u*H+j],hPrev=allH[t*cellSize+b*H+j],hCur=allH[(t+1u)*cellSize+b*H+j];
+    float dh=gradOutput[row*H+j]+carry[idx],oneMinusZ=1.0-z,nScaled=hCur-z*hPrev,dn=oneMinusZ>1e-12?dh*(oneMinusZ-nScaled*nScaled/oneMinusZ):0.0;
+    dGates[dOffset+j]=dn*hn*r*(1.0-r);dGates[dOffset+H+j]=dh*z*(hPrev-hCur);dGates[dOffset+2u*H+j]=dn;dGates[dOffset+3u*H+j]=dn*r;carry[idx]=dh*z;}";
+
+    // GRU backward, step t: carry[b, j] += the matrix paths into h(t - 1) through W_hr, W_hz and W_hn.
+    public static string GruSequenceBackwardHidden => Header + @"
+layout(set=0,binding=0) readonly buffer DGates { float dGates[]; };
+layout(set=0,binding=1) readonly buffer WeightsHh { float weightsHh[]; };
+layout(set=0,binding=2) buffer Carry { float carry[]; };
+layout(push_constant) uniform Params { uint seqLen; uint batch; uint inputSize; uint hiddenSize; uint t; };
+void main(){uint idx=gl_GlobalInvocationID.x;if(idx>=batch*hiddenSize)return;uint b=idx/hiddenSize,j=idx%hiddenSize,H=hiddenSize,dOffset=(t*batch+b)*4u*H;
+    float sum=0.0;for(uint m=0u;m<H;++m)sum+=weightsHh[m*H+j]*dGates[dOffset+m]+weightsHh[(H+m)*H+j]*dGates[dOffset+H+m]+weightsHh[(2u*H+m)*H+j]*dGates[dOffset+3u*H+m];carry[idx]+=sum;}";
+
+    // GRU input gradient for every step at once: gradInput [T, B, In].
+    public static string GruSequenceInputGradient => Header + @"
+layout(set=0,binding=0) readonly buffer DGates { float dGates[]; };
+layout(set=0,binding=1) readonly buffer WeightsIh { float weightsIh[]; };
+layout(set=0,binding=2) writeonly buffer GradInput { float gradInput[]; };
 layout(push_constant) uniform Params { uint seqLen; uint batch; uint inputSize; uint hiddenSize; };
-void main(){if(gl_GlobalInvocationID.x!=0u)return;uint gateSize=3u*hiddenSize,cellSize=batch*hiddenSize;
-    for(uint i=0u;i<seqLen*batch*inputSize;++i)gradInput[i]=0.0;for(uint i=0u;i<cellSize;++i){gradHInit[i]=0.0;nextDh[i]=0.0;}for(uint i=0u;i<gateSize*inputSize;++i)gradWeightsIh[i]=0.0;for(uint i=0u;i<gateSize*hiddenSize;++i)gradWeightsHh[i]=0.0;for(uint i=0u;i<gateSize;++i)gradBias[i]=0.0;
-    for(int ti=int(seqLen)-1;ti>=0;--ti){uint t=uint(ti),hOffset=t*cellSize;
-        for(uint b=0u;b<batch;++b){uint stateOffset=b*hiddenSize,gateOffset=(t*batch+b)*gateSize,inputOffset=(t*batch+b)*inputSize;for(uint i=0u;i<hiddenSize;++i)gradHInit[stateOffset+i]+=gradOutput[t*cellSize+stateOffset+i];for(uint i=0u;i<hiddenSize;++i){float z=cacheGates[gateOffset+hiddenSize+i];nextDh[stateOffset+i]=gradHInit[stateOffset+i]*z;}
-            for(uint i=0u;i<hiddenSize;++i){float r=cacheGates[gateOffset+i],z=cacheGates[gateOffset+hiddenSize+i],n=cacheGates[gateOffset+2u*hiddenSize+i],previous=allH[hOffset+stateOffset+i],localDh=gradHInit[stateOffset+i],dN=localDh*(1.0-z)*(1.0-n*n),dZ=localDh*(previous-n)*z*(1.0-z),dRPre=0.0;for(uint j=0u;j<hiddenSize;++j){float zj=cacheGates[gateOffset+hiddenSize+j],nj=cacheGates[gateOffset+2u*hiddenSize+j],dNj=gradHInit[stateOffset+j]*(1.0-zj)*(1.0-nj*nj);dRPre+=dNj*weightsHh[(2u*hiddenSize+j)*hiddenSize+i]*previous;}float dR=dRPre*r*(1.0-r);
-                for(uint gi=0u;gi<3u;++gi){float dg=gi==0u?dR:(gi==1u?dZ:dN);uint gate=gi*hiddenSize+i;gradBias[gate]+=dg;for(uint k=0u;k<inputSize;++k)gradWeightsIh[gate*inputSize+k]+=dg*inputData[inputOffset+k];for(uint k=0u;k<hiddenSize;++k)gradWeightsHh[gate*hiddenSize+k]+=dg*allH[hOffset+stateOffset+k];}
-                for(uint k=0u;k<inputSize;++k)gradInput[inputOffset+k]+=dR*weightsIh[i*inputSize+k]+dZ*weightsIh[(hiddenSize+i)*inputSize+k]+dN*weightsIh[(2u*hiddenSize+i)*inputSize+k];for(uint k=0u;k<hiddenSize;++k)nextDh[stateOffset+k]+=dR*weightsHh[i*hiddenSize+k]+dZ*weightsHh[(hiddenSize+i)*hiddenSize+k]+dN*weightsHh[(2u*hiddenSize+i)*hiddenSize+k];
-            }for(uint k=0u;k<hiddenSize;++k)gradHInit[stateOffset+k]=nextDh[stateOffset+k];
-        }
-    }
-}";
+void main(){uint idx=gl_GlobalInvocationID.x;if(idx>=seqLen*batch*inputSize)return;uint i=idx%inputSize,row=idx/inputSize,H=hiddenSize,dOffset=row*4u*H;
+    float sum=0.0;for(uint m=0u;m<H;++m)sum+=weightsIh[m*inputSize+i]*dGates[dOffset+m]+weightsIh[(H+m)*inputSize+i]*dGates[dOffset+H+m]+weightsIh[(2u*H+m)*inputSize+i]*dGates[dOffset+2u*H+m];gradInput[idx]=sum;}";
+
+    // GRU weight gradients over every step and batch row. mode 0: gradWeightsIh [3H, In] from the input with dr, dz, dn;
+    // mode 1: gradWeightsHh [3H, H] from h(t - 1) with dr, dz, dn * r.
+    public static string GruSequenceWeightGradient => Header + @"
+layout(set=0,binding=0) readonly buffer DGates { float dGates[]; };
+layout(set=0,binding=1) readonly buffer Source { float source[]; };
+layout(set=0,binding=2) writeonly buffer GradWeights { float gradWeights[]; };
+layout(push_constant) uniform Params { uint seqLen; uint batch; uint inputSize; uint hiddenSize; uint mode; };
+void main(){uint H=hiddenSize,width=mode==0u?inputSize:H,idx=gl_GlobalInvocationID.x;if(idx>=3u*H*width)return;uint gate=idx/width,k=idx%width,gi=gate/H,j=gate%H,slot=(mode==1u&&gi==2u)?3u:gi;
+    float sum=0.0;for(uint row=0u;row<seqLen*batch;++row)sum+=dGates[row*4u*H+slot*H+j]*source[row*width+k];gradWeights[idx]=sum;}";
+
+    // GRU bias gradients: b_i* takes dr, dz, dn; b_h* takes dr, dz, dn * r.
+    public static string GruSequenceBiasGradient => Header + @"
+layout(set=0,binding=0) readonly buffer DGates { float dGates[]; };
+layout(set=0,binding=1) writeonly buffer GradBiasIh { float gradBiasIh[]; };
+layout(set=0,binding=2) writeonly buffer GradBiasHh { float gradBiasHh[]; };
+layout(push_constant) uniform Params { uint seqLen; uint batch; uint inputSize; uint hiddenSize; };
+void main(){uint H=hiddenSize,g=gl_GlobalInvocationID.x;if(g>=3u*H)return;uint gi=g/H,j=g%H;float sumIh=0.0,sumHh=0.0;
+    for(uint row=0u;row<seqLen*batch;++row){uint o=row*4u*H;sumIh+=dGates[o+gi*H+j];sumHh+=dGates[o+(gi==2u?3u:gi)*H+j];}gradBiasIh[g]=sumIh;gradBiasHh[g]=sumHh;}";
 
     public static string GruCellBackward => Header + @"
 layout(set=0,binding=0) readonly buffer GradH { float gradH[]; };

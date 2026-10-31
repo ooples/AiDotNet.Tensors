@@ -17,6 +17,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         // OpenCL library name varies by platform
         private const string OpenClLibrary = "OpenCL";
 
+        static OpenClNativeBindings() => OpenClRuntimeDefaults.Apply();
+
         // Some AMD OpenCL drivers do not safely tolerate clCreateCommandQueue entering from
         // multiple host threads, even when the calls target different contexts. Keep the gate
         // process-wide so per-context queues, profiling probes, and explicit streams all obey

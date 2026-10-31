@@ -14,7 +14,11 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// same output as <c>CpuEngine.MlpForward</c> and (2) steady-state <c>Run</c> is
 /// allocation-free (the serving-grade property torch.compile can't offer without
 /// a compiler + warmup).
+/// <para>Serial with the tests that invalidate every cached weight pack process-wide (InferenceWeightCache.InvalidateAll):
+/// one concurrent invalidation re-packed this plan's weights inside the measured window (one 131 KB pack, 1536 B/run
+/// averaged over 100 runs, against 224 B/run steady).</para>
 /// </summary>
+[Collection("BlasManaged-Stats-Serial")]
 public class CompiledMlpTests
 {
     private readonly ITestOutputHelper _output;

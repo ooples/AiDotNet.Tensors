@@ -121,6 +121,19 @@ public partial class CpuEngine
         Tensor<T>[] inputs,
         Func<IEngine, Tensor<T>[]> execute,
         [CallerMemberName] string operationName = "")
+        => CaptureInferenceKernelOutputsWithState(inputs, execute, savedState: null, operationName);
+
+    /// <summary>
+    /// <see cref="CaptureInferenceKernelOutputs{T}"/> that also records <paramref name="savedState"/> (the kernel's
+    /// scalar parameters) on every output's step, for readers of the plan such as the ONNX exporter; replay does not
+    /// use it.
+    /// </summary>
+    [MethodImpl(Hot)]
+    private protected Tensor<T>[] CaptureInferenceKernelOutputsWithState<T>(
+        Tensor<T>[] inputs,
+        Func<IEngine, Tensor<T>[]> execute,
+        object[]? savedState,
+        [CallerMemberName] string operationName = "")
     {
         var scope = GraphMode.Current
             ?? throw new InvalidOperationException("Inference kernel capture requires an active graph scope.");
@@ -160,7 +173,8 @@ public partial class CpuEngine
                         throw new InvalidOperationException(
                             $"{operationName} changed its output count between trace and replay.");
                     DirectGpuTensorEngine.CopyResultInto(engine, results[selectedOutput], output);
-                });
+                },
+                savedState: savedState);
         }
 
         return captured;

@@ -37,6 +37,10 @@ internal static class BatchNormRegisterKernelTemplate
 
     internal static string BackwardName(int perThread) => "bn_reg_bwd_k" + perThread;
 
+    internal static string ForwardUnpackedName(int perThread) => "bn_reg_fwdu_k" + perThread;
+
+    internal static string BackwardUnpackedName(int perThread) => "bn_reg_bwdu_k" + perThread;
+
     /// <summary>The smallest variant whose 256 x k values cover <paramref name="count"/>, or 0 when none does.</summary>
     internal static int VariantFor(long count)
     {
@@ -164,6 +168,37 @@ internal static class BatchNormRegisterKernelTemplate
     /// </summary>
     internal static readonly WinogradF23KernelTemplate.Spec[] Kernels = BuildKernels();
 
+    /// <summary>
+    /// The same kernels with every per-channel parameter in a buffer of its own, for backends that bind more than eight
+    /// storage buffers (OpenCL, HIP, Metal): the packed form costs four device copies each way to pack the parameters and
+    /// unpack the statistics or parameter gradients, launches beside the one kernel, per BatchNorm per step.
+    /// Forward buffers: x, residual, y (written), gamma, beta, mean (written), variance (written). Backward buffers: dY, mask
+    /// source, the residual's gradient (written), x, gamma, beta, mean, variance, dX (written), dGamma (written), dBeta
+    /// (written), the second output gradient.
+    /// </summary>
+    internal static readonly WinogradF23KernelTemplate.Spec[] UnpackedKernels = BuildUnpackedKernels();
+
+    private static WinogradF23KernelTemplate.Spec[] BuildUnpackedKernels()
+    {
+        var specs = new List<WinogradF23KernelTemplate.Spec>();
+        foreach (int k in PerThread)
+        {
+            string forward = ForwardBody(k)
+                .Replace("stats[channels + c]", "svar[c]").Replace("stats[c]", "smean[c]")
+                .Replace("prm[channels + c]", "bet[c]").Replace("prm[c]", "gam[c]");
+            specs.Add(new WinogradF23KernelTemplate.Spec(ForwardUnpackedName(k),
+                new[] { "xin", "res", "yout", "gam", "bet", "smean", "svar" }, Ints, forward, GroupSize, new[] { 2, 5, 6 }));
+            string backward = BackwardBody(k)
+                .Replace("dprm[channels + c]", "dbet[c]").Replace("dprm[c]", "dgam[c]")
+                .Replace("prm[3 * channels + c]", "svar[c]").Replace("prm[2 * channels + c]", "smean[c]")
+                .Replace("prm[channels + c]", "bet[c]").Replace("prm[c]", "gam[c]");
+            specs.Add(new WinogradF23KernelTemplate.Spec(BackwardUnpackedName(k),
+                new[] { "dyin", "msk", "dres", "xin", "gam", "bet", "smean", "svar", "dxout", "dgam", "dbet", "dy2" }, Ints,
+                backward, GroupSize, new[] { 2, 8, 9, 10 }));
+        }
+        return specs.ToArray();
+    }
+
     private static WinogradF23KernelTemplate.Spec[] BuildKernels()
     {
         var specs = new List<WinogradF23KernelTemplate.Spec>();
@@ -185,7 +220,23 @@ internal static class BatchNormRegisterKernelTemplate
         return names;
     }
 
+    internal static string[] GetUnpackedKernelNames()
+    {
+        var names = new string[UnpackedKernels.Length];
+        for (int i = 0; i < UnpackedKernels.Length; i++) names[i] = UnpackedKernels[i].Name;
+        return names;
+    }
+
     internal static string GetModuleSource(WinogradKernelDialect dialect) => WinogradF23KernelTemplate.EmitModule(Kernels, dialect);
+
+    /// <summary>The packed and the unpacked kernels in one module.</summary>
+    internal static string GetModuleSourceWithUnpacked(WinogradKernelDialect dialect)
+    {
+        var all = new WinogradF23KernelTemplate.Spec[Kernels.Length + UnpackedKernels.Length];
+        Kernels.CopyTo(all, 0);
+        UnpackedKernels.CopyTo(all, Kernels.Length);
+        return WinogradF23KernelTemplate.EmitModule(all, dialect);
+    }
 
     internal static string GetGlslSource(string name)
     {

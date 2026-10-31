@@ -121,7 +121,7 @@ public sealed partial class HipBackend : IConvBiasActivationBackend
         args[0] = &x; args[1] = &c; args[2] = &batch; args[3] = &cin; args[4] = &h; args[5] = &w;
         args[6] = &kh; args[7] = &kw; args[8] = &sh; args[9] = &sw; args[10] = &ph; args[11] = &pw;
         args[12] = &dh; args[13] = &dw; args[14] = &oh; args[15] = &ow;
-        LaunchKernel(kernel, (uint)((batch * l + 63) / 64), 64, args);
+        LaunchKernel(kernel, (uint)((batch * l * p + 63) / 64), 64, args);   // one thread per col element
         if (a.Batch == 1)
         {
             Gemm(a.Kernel, col, a.Output, a.OutChannels, l, p);

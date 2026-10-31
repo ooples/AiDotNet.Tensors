@@ -60,6 +60,7 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
     /// </summary>
     internal long MaxPooledElements { get; set; } = long.MaxValue;
     private readonly object _lifecycleGate = new();
+    private long _drainedAtMeasurement;
     private int _disposed;
 
     /// <summary>Buffers currently parked in the pool (returned and not yet rented again): device memory the pool holds.</summary>
@@ -120,6 +121,13 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
         {
             return false;
         }
+
+        // Kernel tuning measured candidates since this pool was last used: what it parked meanwhile is mostly their
+        // workspaces, at sizes nothing asks for again (44 MB idle at a CNN's peak). Release it all once.
+        long measurements = Helpers.Autotune.TunedKernels.TunedKernelRegistry.MeasurementGeneration;
+        if (measurements != Volatile.Read(ref _drainedAtMeasurement)
+            && Interlocked.Exchange(ref _drainedAtMeasurement, measurements) != measurements)
+            DrainAll();
 
         // Use power-of-two bucket key for higher cache hit rate
         int bucketKey = BucketKey(size);

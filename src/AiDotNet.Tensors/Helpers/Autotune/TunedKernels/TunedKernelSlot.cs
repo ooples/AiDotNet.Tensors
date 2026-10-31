@@ -150,6 +150,13 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
             RetireFailedCandidate(c, ex);
             return false;
         }
+        catch (Engines.DirectGpu.GpuOutOfMemoryException ex)
+        {
+            // The reference itself ran out of device memory (an im2col reference's column buffer): the caller's own path
+            // (a direct kernel with no scratch) still runs. Nothing is retired; a later call with memory free uses it.
+            System.Diagnostics.Trace.TraceWarning($"Tuned kernel reference {c.Id} for {Op} ran out of device memory: {ex.Message}");
+            return false;
+        }
     }
 
     private bool IsReference(ITunedKernelCandidate<TArgs> candidate) =>
@@ -226,7 +233,13 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
             if (!_harness.CanMeasure(args)) return reference;
 
             if (!TunedKernelPolicy.BudgetRemaining)
+            {
+                // An unmeasured shape gets the slot's shape-aware default when it matches the reference, not the reference
+                // itself: the reference is the established, always-correct path, often the slowest (a direct convolution).
+                if (TryUntunedDefault(shape, args, reference, applicable, rejected) is { } preferred)
+                    return Decide(map, shape, preferred, TunedKernelDecisionReason.Heuristic, reference, rejected);
                 return Decide(map, shape, reference, TunedKernelDecisionReason.BudgetExhausted, reference, rejected);
+            }
 
             long start = Stopwatch.GetTimestamp();
             try
@@ -251,10 +264,56 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
             finally
             {
                 TunedKernelPolicy.Charge(Stopwatch.GetTimestamp() - start);
+                TunedKernelRegistry.NoteMeasurement();
             }
         }
     }
 
+    /// <summary>
+    /// Candidate ids, most preferred first, for a shape the process has no budget left to measure: the first applicable
+    /// one other than the reference is used if one run of it matches the reference within the harness tolerance. Null
+    /// (the default) serves the reference, as before.
+    /// </summary>
+    internal Func<TunedShape, IReadOnlyList<string>?>? UntunedPreference { get; set; }
+
+    private ITunedKernelCandidate<TArgs>? TryUntunedDefault(in TunedShape shape, in TArgs args,
+        ITunedKernelCandidate<TArgs> reference, List<ITunedKernelCandidate<TArgs>> applicable, List<string> rejected)
+    {
+        var preference = UntunedPreference?.Invoke(shape);
+        if (preference is null) return null;
+        ITunedKernelCandidate<TArgs>? preferred = null;
+        foreach (var id in preference)
+        {
+            preferred = applicable.FirstOrDefault(c => string.Equals(c.Id, id, StringComparison.Ordinal));
+            if (preferred is not null) break;
+        }
+        if (preferred is null || ReferenceEquals(preferred, reference)) return null;
+        try
+        {
+            using (Engines.DirectGpu.GpuLaunchProbe.TuningScope())
+                reference.Execute(args);
+            float[] expected = _harness.SnapshotOutput(args);
+            double scale = 0;
+            foreach (float v in expected)
+            {
+                double a = Math.Abs(v);
+                if (double.IsNaN(a) || double.IsInfinity(a)) return null;   // nothing to compare against
+                if (a > scale) scale = a;
+            }
+            if (scale <= 0) scale = 1;   // every |v| was zero
+            _harness.PoisonOutput(args);
+            using (Engines.DirectGpu.GpuLaunchProbe.TuningScope())
+                preferred.Execute(args);
+            double error = MaxRelativeError(expected, _harness.SnapshotOutput(args), scale);
+            if (error <= _harness.RelativeTolerance) return preferred;
+            rejected.Add($"{preferred.Id}: untuned default error {error:E2} exceeds {_harness.RelativeTolerance:E1}");
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            rejected.Add($"{preferred.Id}: untuned default threw {ex.GetType().Name}: {ex.Message}");
+        }
+        return null;
+    }
     private ITunedKernelCandidate<TArgs> Decide(ConcurrentDictionary<TunedShape, Entry> map, in TunedShape shape,
         ITunedKernelCandidate<TArgs> chosen, TunedKernelDecisionReason reason, ITunedKernelCandidate<TArgs> reference,
         List<string> rejected)

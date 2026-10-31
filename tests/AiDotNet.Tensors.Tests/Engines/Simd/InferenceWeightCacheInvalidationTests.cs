@@ -14,7 +14,10 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd;
 /// on every subsequent inference GEMM. <see cref="InferenceWeightCache.InvalidateAll"/>
 /// bumps a global epoch that every hit path (ConditionalWeakTable AND the
 /// per-thread MRU slots) checks, forcing a re-pack from live contents.
+/// <para>Serial: InvalidateAll evicts EVERY live pack in the process, so a concurrent test measuring a cached path
+/// (CompiledMlp's steady-state allocation) re-packed mid-measurement.</para>
 /// </summary>
+[Collection("BlasManaged-Stats-Serial")]
 public class InferenceWeightCacheInvalidationTests
 {
     [Fact]

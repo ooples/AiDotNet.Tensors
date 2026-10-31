@@ -32,18 +32,15 @@ extern ""C"" __global__ __launch_bounds__(64) void tk_im2col_pbl(const float* __
     int batch, int channels, int height, int width, int kernelH, int kernelW, int strideH, int strideW,
     int padH, int padW, int dilationH, int dilationW, int outH, int outW)
 {
+    // One thread per element of col [P, B * L], in col's order (see TunedRowKernelTemplate's tk_im2col_body).
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int l = outH * outW;
-    if (idx >= batch * l) return;
-    int b = idx / l, s = idx % l, oh = s / outW, ow = s % outW;
-    for (int c = 0; c < channels; c++)
-        for (int kh = 0; kh < kernelH; kh++)
-            for (int kw = 0; kw < kernelW; kw++)
-            {
-                int ih = oh * strideH - padH + kh * dilationH, iw = ow * strideW - padW + kw * dilationW;
-                float v = (ih >= 0 && ih < height && iw >= 0 && iw < width) ? input[((b * channels + c) * height + ih) * width + iw] : 0.0f;
-                col[(size_t)((c * kernelH + kh) * kernelW + kw) * batch * l + (size_t)b * l + s] = v;
-            }
+    int l = outH * outW, n = batch * l;
+    if (idx >= channels * kernelH * kernelW * n) return;
+    int p = idx / n, j = idx - p * n;
+    int b = j / l, s = j - b * l, oh = s / outW, ow = s - oh * outW;
+    int kw = p % kernelW, ckh = p / kernelW, kh = ckh % kernelH, c = ckh / kernelH;
+    int ih = oh * strideH - padH + kh * dilationH, iw = ow * strideW - padW + kw * dilationW;
+    col[idx] = (ih >= 0 && ih < height && iw >= 0 && iw < width) ? input[((b * channels + c) * height + ih) * width + iw] : 0.0f;
 }
 ";
 

@@ -31,6 +31,9 @@ internal static class MathOperators
         r.Register(new Reciprocal<T>());
         r.Register(new ConstantOfShape<T>());
         r.Register(new Equal<T>());
+        r.Register(new Mod<T>());
+        r.Register(new Floor<T>());
+        r.Register(new Ceil<T>());
         r.Register(new Expand<T>());
     }
 
@@ -116,6 +119,22 @@ internal static class MathOperators
         public string? Domain => null;
         public void Translate(OnnxTranslationContext<T> ctx, NodeProto node) =>
             ctx.PutTensor(node.Output[0], ctx.Engine.TensorNegate(ctx.GetTensor(node.Input[0])));
+    }
+
+    internal sealed class Floor<T> : IOnnxOpTranslator<T> where T : unmanaged
+    {
+        public string OpType => "Floor";
+        public string? Domain => null;
+        public void Translate(OnnxTranslationContext<T> ctx, NodeProto node) =>
+            ctx.PutTensor(node.Output[0], ctx.Engine.TensorFloor(ctx.GetTensor(node.Input[0])));
+    }
+
+    internal sealed class Ceil<T> : IOnnxOpTranslator<T> where T : unmanaged
+    {
+        public string OpType => "Ceil";
+        public string? Domain => null;
+        public void Translate(OnnxTranslationContext<T> ctx, NodeProto node) =>
+            ctx.PutTensor(node.Output[0], ctx.Engine.TensorCeiling(ctx.GetTensor(node.Input[0])));
     }
 
     internal sealed class Exp<T> : IOnnxOpTranslator<T> where T : unmanaged
@@ -553,6 +572,57 @@ internal static class MathOperators
             var one = ops.One;
             for (int i = 0; i < dstSpan.Length; i++)
                 dstSpan[i] = ops.Equals(srcSpan[i], zero) ? one : zero;
+            return result;
+        }
+    }
+
+    /// <summary>
+    /// ONNX Mod — elementwise remainder with NumPy broadcasting. <c>fmod = 0</c> (the default, integer inputs) takes
+    /// the divisor's sign, as Python's <c>%</c>; <c>fmod = 1</c> takes the dividend's sign, as C's <c>fmod</c>.
+    /// PyTorch's attention export emits it on shape constants. The plan holds integers in the element type, so the
+    /// remainder is computed in double and is exact for the integer values ONNX shape arithmetic produces.
+    /// </summary>
+    internal sealed class Mod<T> : IOnnxOpTranslator<T> where T : unmanaged
+    {
+        public string OpType => "Mod";
+        public string? Domain => null;
+        public void Translate(OnnxTranslationContext<T> ctx, NodeProto node)
+        {
+            var a = ctx.GetTensor(node.Input[0]);
+            var b = ctx.GetTensor(node.Input[1]);
+            bool fmod = ctx.GetIntAttr(node, "fmod", 0) != 0;
+            var outShape = ShapesEqual(a._shape, b._shape) ? a._shape : ComputeBroadcastShape(a._shape, b._shape);
+            // Deferred read, as Equal: a value read at trace time would freeze the placeholder state.
+            var scope = Engines.Compilation.GraphMode.Current;
+            if (scope is null)
+            {
+                ctx.PutTensor(node.Output[0], Remainder(ctx.Engine, a, b, outShape, fmod));
+                return;
+            }
+            var lazy = scope.RecordBinary(Engines.Compilation.LazyNodeType.Custom, "Mod", a, b, outShape,
+                (eng, output) => Remainder(eng, a, b, outShape, fmod).AsSpan().CopyTo(output.AsWritableSpan()),
+                savedState: new object[] { fmod });
+            ctx.PutTensor(node.Output[0], lazy);
+        }
+
+        internal static Tensor<T> Remainder(AiDotNet.Tensors.Engines.IEngine engine, Tensor<T> a, Tensor<T> b, int[] outShape, bool fmod)
+        {
+            // Broadcast both operands to the output shape with the Expand idiom, then take the remainder per element.
+            var zero = new Tensor<T>(outShape);
+            var ab = ShapesEqual(a._shape, outShape) ? a : engine.TensorAdd(a, zero);
+            var bb = ShapesEqual(b._shape, outShape) ? b : engine.TensorAdd(b, zero);
+            var ops = MathHelper.GetNumericOperations<T>();
+            var result = new Tensor<T>(outShape);
+            var x = ab.AsSpan();
+            var y = bb.AsSpan();
+            var dst = result.AsWritableSpan();
+            for (int i = 0; i < dst.Length; i++)
+            {
+                double n = ops.ToDouble(x[i]), d = ops.ToDouble(y[i]);
+                double r = n % d;
+                if (!fmod && r != 0 && (r < 0) != (d < 0)) r += d;
+                dst[i] = ops.FromDouble(r);
+            }
             return result;
         }
     }

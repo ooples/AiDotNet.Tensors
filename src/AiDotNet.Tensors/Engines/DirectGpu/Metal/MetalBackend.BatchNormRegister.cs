@@ -2,6 +2,7 @@
 // NOTE: validated only on a Metal runner -- the dev box has no Apple GPU. The template emits the same bodies as the
 // OpenCL instance, whose BatchNormRegisterPortTests run on a real device.
 using System;
+using System.Linq;
 using static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
@@ -29,10 +30,11 @@ public sealed partial class MetalBackend : IBatchNormVarianceBackend
                     try
                     {
                         _batchNormRegisterLibrary = _shaderLibrary.CompileLibrary(BatchNormRegisterLibraryName,
-                            BatchNormRegisterKernelTemplate.GetModuleSource(WinogradKernelDialect.Metal));
+                            BatchNormRegisterKernelTemplate.GetModuleSourceWithUnpacked(WinogradKernelDialect.Metal));
                         ok = _batchNormRegisterLibrary != IntPtr.Zero;
                         if (ok)
-                            foreach (var name in BatchNormRegisterKernelTemplate.GetKernelNames())
+                            foreach (var name in BatchNormRegisterKernelTemplate.GetKernelNames()
+                                         .Concat(BatchNormRegisterKernelTemplate.GetUnpackedKernelNames()))
                                 ok &= GetPipeline(BatchNormRegisterLibraryName, _batchNormRegisterLibrary, name)
                                     .MaxTotalThreadsPerThreadgroup >= BatchNormRegisterKernelTemplate.GroupSize;
                     }
@@ -63,7 +65,7 @@ public sealed partial class MetalBackend : IBatchNormVarianceBackend
         IGpuBuffer gamma, IGpuBuffer beta, IGpuBuffer saveMean, IGpuBuffer saveVariance,
         int batch, int channels, int spatial, float epsilon, bool relu, IGpuBuffer? residual)
         => BatchNormRegisterReady && PortableBatchNorm.TryForward(this, LaunchBatchNormRegister, input, output, gamma, beta,
-            saveMean, saveVariance, batch, channels, spatial, epsilon, relu, residual);
+            saveMean, saveVariance, batch, channels, spatial, epsilon, relu, residual, unpacked: true);
 
     bool IBatchNormVarianceBackend.TryBatchNormBackwardFromVariance(IGpuBuffer gradOutput, IGpuBuffer input,
         IGpuBuffer gamma, IGpuBuffer saveMean, IGpuBuffer saveVariance, IGpuBuffer gradInput, IGpuBuffer gradGamma,
@@ -71,5 +73,5 @@ public sealed partial class MetalBackend : IBatchNormVarianceBackend
         IGpuBuffer? gradResidual, IGpuBuffer? beta, IGpuBuffer? gradOutput2)
         => BatchNormRegisterReady && PortableBatchNorm.TryBackward(this, LaunchBatchNormRegister, gradOutput, input, gamma,
             saveMean, saveVariance, gradInput, gradGamma, gradBeta, batch, channels, spatial, epsilon, reluOutput,
-            gradResidual, beta, gradOutput2);
+            gradResidual, beta, gradOutput2, unpacked: true);
 }

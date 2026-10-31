@@ -761,6 +761,41 @@ __kernel void bias_add(
     C[idx] = A[idx] + bias[col];
 }
 
+// A dense layer's epilogue in place, one pass: C[i, j] = act(C[i, j] + bias[j]) over row-major [M, N], one element per
+// work item in order (coalesced; bias_add's 2D grid put consecutive work items a row apart). Each activation is the
+// scalar form of its own kernel above (relu, gelu, sigmoid, tanh_activation, swish, leaky_relu), so the result is the
+// bias add then the activation, bit for bit. mode: 0 none, 1 ReLU, 2 GELU, 3 sigmoid, 4 tanh, 5 swish, 6 leaky ReLU.
+__kernel void bias_activation(
+    __global float* C,
+    __global const float* bias,
+    const int M,
+    const int N,
+    const int mode,
+    const float alpha)
+{
+    const int idx = get_global_id(0);
+    if (idx >= M * N) return;
+    float x = C[idx] + bias[idx % N];
+    if (mode == 1) {
+        uint bits = as_uint(x) & 0x7fffffffu;
+        x = (bits > 0x7f800000u) ? x : fmax(0.0f, x);
+    } else if (mode == 2) {
+        const float SQRT_2_OVER_PI = 0.7978845608f;
+        const float COEFF = 0.044715f;
+        float x3 = x * x * x;
+        x = 0.5f * x * (1.0f + tanh(SQRT_2_OVER_PI * (x + COEFF * x3)));
+    } else if (mode == 3) {
+        x = 1.0f / (1.0f + fast_exp1(-x));
+    } else if (mode == 4) {
+        x = tanh(clamp(x, -20.0f, 20.0f));
+    } else if (mode == 5) {
+        x = x / (1.0f + fast_exp1(-x));
+    } else if (mode == 6) {
+        x = x > 0.0f ? x : alpha * x;
+    }
+    C[idx] = x;
+}
+
 // Conv2D bias add in NCHW format: output[b,c,h,w] += bias[c]
 // Memory layout: output is [batch, channels, height, width] in row-major order
 __kernel void conv2d_bias_add(
@@ -1504,7 +1539,7 @@ __kernel void clip_by_norm_from_squared_sum(
                 "negate_vector", "floor_vector", "ceil_vector",
                 "round_vector", "trunc_vector",
                 // Broadcast operations
-                "bias_add",
+                "bias_add", "bias_activation",
                 // Conv2D operations
                 "conv2d_bias_add"
             };

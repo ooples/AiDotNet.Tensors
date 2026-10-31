@@ -1,5 +1,6 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
 using System.Collections.Generic;
+using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -28,6 +29,18 @@ int bx_gid() { return int(gl_GlobalInvocationID.x); }
 
     private static readonly TimeSpan RegexTimeout = TimeSpan.FromSeconds(2);
 
+    // GLSL keywords and reserved words a C parameter name can collide with. Declared before Solvers, whose initialiser
+    // reads it.
+    private static readonly HashSet<string> GlslReservedWords = new(StringComparer.Ordinal)
+    {
+        "input", "output", "layout", "filter", "sample", "common", "partition", "active", "buffer", "shared", "coherent",
+        "patch", "precise", "smooth", "flat", "uniform", "varying", "attribute", "in", "out", "inout", "texture", "image",
+        "resource", "interface", "half", "fixed", "cast", "union", "enum", "class", "default", "readonly", "writeonly",
+        "restrict", "volatile", "lowp", "mediump", "highp", "precision", "invariant", "discard", "subroutine", "centroid",
+        "noperspective", "superp", "namespace", "using", "template", "this", "goto", "inline", "noinline", "public",
+        "static", "extern", "external", "long", "short", "sizeof", "typedef", "asm", "unsigned",
+    };
+
     /// <summary>
     /// GLSL for the IExtendedLinalgBackend solvers, translated mechanically from the shared CUDA C (#1142) so Vulkan
     /// runs the same code as HIP, OpenCL and Metal: each pointer parameter becomes a storage buffer of the same name
@@ -44,6 +57,8 @@ int bx_gid() { return int(gl_GlobalInvocationID.x); }
             m => m.Groups[1].Value == "fabs" ? "abs(" : m.Groups[1].Value == "fmax" ? "max(" : m.Groups[1].Value + "(",
             RegexOptions.None, RegexTimeout);
         cuda = cuda.Replace("__int_as_float(", "intBitsToFloat(");
+        // A C cast of a name, (float)D, is float(D) in GLSL.
+        cuda = Regex.Replace(cuda, @"\((float|int)\)\s*(\w+)", "$1($2)", RegexOptions.None, RegexTimeout);
         var defines = new StringBuilder();
         foreach (Match d in Regex.Matches(cuda, @"^#define [^\n]*\n", RegexOptions.Multiline, RegexTimeout)) defines.Append(d.Value);
         var kernels = Regex.Matches(cuda, @"extern ""C"" __global__ __launch_bounds__\(256\) void (\w+)\(([^)]*)\) \{",
@@ -58,9 +73,22 @@ int bx_gid() { return int(gl_GlobalInvocationID.x); }
             body = Regex.Replace(body, @"\b(sqrt|fabs|fmax|exp|log|tanh)f\(",
                 m => m.Groups[1].Value == "fabs" ? "abs(" : m.Groups[1].Value == "fmax" ? "max(" : m.Groups[1].Value + "(",
                 RegexOptions.None, RegexTimeout);
+            // A parameter named with a GLSL keyword (input, output, layout) is renamed in the declaration and the body.
+            string parameters = kernel.Groups[2].Value;
+            var reserved = Regex.Matches(parameters, @"(\w+)\s*(?:,|$)", RegexOptions.None, RegexTimeout)
+                .Cast<Match>()
+                .Select(name => name.Groups[1].Value)
+                .Where(GlslReservedWords.Contains)
+                .ToList();
+            foreach (string identifier in reserved)
+            {
+                string pattern = @"\b" + identifier + @"\b";
+                parameters = Regex.Replace(parameters, pattern, identifier + "_", RegexOptions.None, RegexTimeout);
+                body = Regex.Replace(body, pattern, identifier + "_", RegexOptions.None, RegexTimeout);
+            }
             var buffers = new List<string>();
             var push = new StringBuilder();
-            foreach (string raw in kernel.Groups[2].Value.Split(','))
+            foreach (string raw in parameters.Split(','))
             {
                 string p = Regex.Replace(raw.Trim(), @"\s+", " ", RegexOptions.None, RegexTimeout);
                 Match pointer = Regex.Match(p, @"^(const )?(float|int)\* (\w+)$", RegexOptions.None, RegexTimeout);

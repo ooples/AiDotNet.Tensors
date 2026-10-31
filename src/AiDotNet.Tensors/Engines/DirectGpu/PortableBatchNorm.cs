@@ -34,7 +34,7 @@ internal static class PortableBatchNorm
     /// <summary>As <see cref="IBatchNormVarianceBackend.TryBatchNormTrainingWithVariance"/>.</summary>
     internal static bool TryForward(IDirectGpuBackend backend, Launcher launch, IGpuBuffer input, IGpuBuffer output,
         IGpuBuffer gamma, IGpuBuffer beta, IGpuBuffer saveMean, IGpuBuffer saveVariance,
-        int batch, int channels, int spatial, float epsilon, bool relu, IGpuBuffer? residual)
+        int batch, int channels, int spatial, float epsilon, bool relu, IGpuBuffer? residual, bool unpacked = false)
     {
         long count = (long)batch * spatial, n = count * channels;
         int k = BatchNormRegisterKernelTemplate.VariantFor(count);
@@ -43,11 +43,18 @@ internal static class PortableBatchNorm
             || saveMean.Size < channels || saveVariance.Size < channels
             || (residual is not null && (!relu || residual.Size < n)))
             return false;
+        int mode = (relu ? 1 : 0) | (residual is not null ? 2 : 0);
+        if (unpacked)
+        {
+            launch(BatchNormRegisterKernelTemplate.ForwardUnpackedName(k), channels,
+                new[] { input, residual ?? input, output, gamma, beta, saveMean, saveVariance },
+                Ints(batch, channels, spatial, epsilon, count, mode));
+            return true;
+        }
         using var prm = backend.AllocateBuffer(2 * channels);
         using var stats = backend.AllocateBuffer(2 * channels);
         backend.Copy(gamma, 0, prm, 0, channels);
         backend.Copy(beta, 0, prm, channels, channels);
-        int mode = (relu ? 1 : 0) | (residual is not null ? 2 : 0);
         launch(BatchNormRegisterKernelTemplate.ForwardName(k), channels,
             new[] { input, residual ?? input, output, prm, stats }, Ints(batch, channels, spatial, epsilon, count, mode));
         backend.Copy(stats, 0, saveMean, 0, channels);
@@ -59,7 +66,7 @@ internal static class PortableBatchNorm
     internal static bool TryBackward(IDirectGpuBackend backend, Launcher launch, IGpuBuffer gradOutput, IGpuBuffer input,
         IGpuBuffer gamma, IGpuBuffer saveMean, IGpuBuffer saveVariance, IGpuBuffer gradInput, IGpuBuffer gradGamma,
         IGpuBuffer gradBeta, int batch, int channels, int spatial, float epsilon, IGpuBuffer? reluOutput,
-        IGpuBuffer? gradResidual, IGpuBuffer? beta, IGpuBuffer? gradOutput2, bool canRebuildMask = true)
+        IGpuBuffer? gradResidual, IGpuBuffer? beta, IGpuBuffer? gradOutput2, bool canRebuildMask = true, bool unpacked = false)
     {
         long count = (long)batch * spatial, n = count * channels;
         int k = BatchNormRegisterKernelTemplate.VariantFor(count);
@@ -73,6 +80,22 @@ internal static class PortableBatchNorm
         // The mask is rebuilt from x (one activation read fewer) when beta is supplied for a ReLU without a residual, on a
         // backend whose fma rounds once (canRebuildMask; see BatchNormRegisterKernelTemplate), else the ReLU output is read.
         bool rebuildMask = canRebuildMask && beta is not null && reluOutput is not null && gradResidual is null;
+        if (unpacked)
+        {
+            int unpackedMode = (reluOutput is not null ? 1 : 0) | (gradResidual is not null ? 2 : 0) | (rebuildMask ? 4 : 0)
+                               | (gradOutput2 is not null ? 8 : 0);
+            // A placeholder for an absent residual gradient: the kernel writes it only under mode bit 1.
+            IGpuBuffer? absentResidual = null;
+            IGpuBuffer residualBinding = gradResidual ?? (absentResidual = backend.AllocateBuffer(1));
+            using (absentResidual)
+            {
+                launch(BatchNormRegisterKernelTemplate.BackwardUnpackedName(k), channels,
+                    new[] { gradOutput, rebuildMask ? input : reluOutput ?? input, residualBinding, input, gamma, beta ?? gamma,
+                        saveMean, saveVariance, gradInput, gradGamma, gradBeta, gradOutput2 ?? gradOutput },
+                    Ints(batch, channels, spatial, epsilon, count, unpackedMode));
+            }
+            return true;
+        }
         using var prm = backend.AllocateBuffer(4 * channels);
         using var dprm = backend.AllocateBuffer(2 * channels);
         using var noResidual = gradResidual is null ? backend.AllocateBuffer(1) : null;

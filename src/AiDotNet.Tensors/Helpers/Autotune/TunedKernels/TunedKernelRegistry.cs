@@ -109,6 +109,13 @@ public enum TunedKernelDecisionReason
     /// and the verdict is not persisted, so a later process measures the shape again.
     /// </summary>
     Inconclusive,
+
+    /// <summary>
+    /// The tuning budget was exhausted before this shape was measured, so the slot served its shape-aware default (an
+    /// ordered preference such as im2col + GEMM for a convolution) after one correctness check against the reference. Used
+    /// for this process and not persisted: a later process with budget left measures the shape.
+    /// </summary>
+    Heuristic,
 }
 
 /// <summary>
@@ -458,6 +465,17 @@ public static class TunedKernelRegistry
             }
         }
     }
+
+    private static long s_measurements;
+
+    /// <summary>
+    /// Counts measurement sessions (a shape whose candidates were run to choose one). Their workspaces, each candidate's
+    /// own column buffers and transforms, go back to the GPU buffer pools at sizes the chosen kernel never asks for
+    /// again, so each pool releases what it holds the next time it is used after this changes.
+    /// </summary>
+    internal static long MeasurementGeneration => Interlocked.Read(ref s_measurements);
+
+    internal static void NoteMeasurement() => Interlocked.Increment(ref s_measurements);
 
     internal static void Record(TunedKernelDecision decision)
     {

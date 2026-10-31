@@ -22,13 +22,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 {
                     if (_conv2DForwardSlot is null)
                     {
+                        // The first applicable candidate is the slot's reference: every tuning run executes it once for the
+                        // correctness check and times it in every pair. im2col + GEMM comes first so that is a GEMM wherever
+                        // its scratch fits: the generic dispatch is a direct convolution there, up to 1.4 s a call on a batch-64
+                        // ResNet-50 layer, so measuring one shape spent the whole 2 s tuning budget and every other shape of a
+                        // process ran on its untuned default. The generic dispatch stays the reference where the scratch does not fit.
                         var candidates = new ITunedKernelCandidate<TunedConv2DArgs>[]
                         {
-                            new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.generic", TunedKernelOrigin.Builtin, true,
-                                _ => true, (in TunedConv2DArgs a) => { Conv2DGeneric(a); ConvEpiloguePasses(a); }),
                             new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.im2col_gemm", TunedKernelOrigin.Generated, true,
                                 shape => TunedConv2DArgs.GemmScratchFits(shape) && HasTunedKernel(Kernels.OpenClTunedRowKernels.Im2ColName),
-                                (in TunedConv2DArgs a) => { Conv2DIm2ColGemm(a); ConvEpiloguePasses(a); }),
+                                (in TunedConv2DArgs a) => { if (!Conv2DIm2ColGemm(a)) ConvEpiloguePasses(a); }),
+                            new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.generic", TunedKernelOrigin.Builtin, true,
+                                _ => true, (in TunedConv2DArgs a) => { Conv2DGeneric(a); ConvEpiloguePasses(a); }),
                             new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.tiled", TunedKernelOrigin.Builtin, true,
                                 shape => shape[5] <= 7 && shape[6] <= 7 && HasTunedKernel("conv2d_tiled"),
                                 (in TunedConv2DArgs a) => Conv2DTiled(a)),
@@ -55,17 +60,37 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                                     && HasTunedKernel(Kernels.BatchedGemmKernels.Im2ColWide)
                                     && HasTunedKernel(Kernels.BatchedGemmKernels.Rb64SplitK),
                                 (in TunedConv2DArgs a) => Conv2DIm2ColRbGemm(a)),
+                            // A 1x1, stride-1, unpadded convolution over a batch: one strided-batched GEMM per image with
+                            // the filter shared (A stride 0), written straight into the NCHW output. im2col + GEMM copies the
+                            // whole input into a column buffer and permutes the whole output back, two passes over each,
+                            // and DenseNet-121 runs 58 such convolutions on its growing concatenations.
+                            new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.pointwise_batched", TunedKernelOrigin.Builtin, true,
+                                shape => shape[0] > 1 && shape[5] == 1 && shape[6] == 1 && shape[7] == 1 && shape[8] == 1
+                                    && shape[9] == 0 && shape[10] == 0 && ClBlastNative.IsAvailable,
+                                (in TunedConv2DArgs a) =>
+                                {
+                                    if (!Conv2DPointwiseBatched(a)) Conv2DGeneric(a);
+                                    ConvEpiloguePasses(a);
+                                }),
                         };
                         _conv2DForwardSlot = new TunedKernelSlot<TunedConv2DArgs>(TunedKernelOp.Conv2DForward, TunedDeviceKey,
                             new BackendTunedKernelHarness<TunedConv2DArgs>(this, ConvolutionTolerance, () => IsAvailable,
                                 MeasureTunedKernelMilliseconds, a => new[] { (a.Output, a.OutputCount) },
                                 a => a.Output.Handle == a.Input.Handle || a.Output.Handle == a.Kernel.Handle),
                             () => GpuDeterminism.IsActive, candidates);
+                        // A shape the process has no tuning budget left for: the generic reference is a direct convolution,
+                        // tens of times slower than GEMM on large batches (ResNet-50 at batch 64: 42 s an epoch against 13.5 s
+                        // tuned). Each candidate's own applicability narrows this list: fused Winograd admits 3x3 stride-1
+                        // shapes, the register-blocked split-K GEMM batch 1, im2col + GEMM whatever its scratch fits.
+                        _conv2DForwardSlot.UntunedPreference = static _ => s_conv2DForwardUntunedPreference;
                     }
                     return _conv2DForwardSlot;
                 }
             }
         }
+
+        private static readonly string[] s_conv2DForwardUntunedPreference =
+            { "opencl.conv2d.winograd_fused", "opencl.conv2d.im2col_rb_gemm", "opencl.conv2d.im2col_gemm" };
 
         private static void ConvArgs(DirectOpenClKernel k, in TunedConv2DArgs a, bool withKernelGeometry)
         {
@@ -86,7 +111,16 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         // A bias buffer for the epilogue argument; the output stands in when there is none (the kernel never reads it).
         private static IntPtr ConvEpilogueBias(in TunedConv2DArgs a) => BufferHandle(a.Bias ?? a.Output);
 
-        private void ConvEpiloguePasses(in TunedConv2DArgs a) => ConvEpilogue.RunPasses(this, a);
+        private void ConvEpiloguePasses(in TunedConv2DArgs a)
+        {
+            if (!TryConvNchwEpilogue(a)) ConvEpilogue.RunPasses(this, a);
+        }
+
+        // out[b] = W[Cout, Cin] * x[b][Cin, H * W] for every image b, the filter shared across the batch. False when CLBlast
+        // declined (the caller then runs the generic route).
+        internal bool Conv2DPointwiseBatched(in TunedConv2DArgs a)
+            => TryExecuteClBlastBatchedGemm(a.Kernel, a.Input, a.Output, a.OutChannels, a.OutHeight * a.OutWidth,
+                a.InChannels, a.Batch, 1f, 0f, strideA: 0);
 
         private void Conv2DGeneric(in TunedConv2DArgs a)
             => Conv2DGenericCore(a.Input, a.Kernel, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth, a.OutChannels,
@@ -186,7 +220,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         // tmp[Cout, B * L] = W[Cout, P] * col[P, B * L] as ONE GEMM, then a permute to the output's [B, Cout, L] (none for
         // B = 1).
-        private void Conv2DIm2ColGemm(in TunedConv2DArgs a)
+        // True when the bias and ReLU were applied too (conv_gemm_epilogue); false when the caller still runs them.
+        private bool Conv2DIm2ColGemm(in TunedConv2DArgs a)
         {
             int l = a.OutHeight * a.OutWidth, p = a.InChannels * a.KernelH * a.KernelW;
             // A 1x1, stride-1, unpadded convolution's im2col is the input itself ([Cin, H*W] per batch item): multiply it
@@ -195,7 +230,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 && a.Batch == 1)
             {
                 Gemm(a.Kernel, a.Input, a.Output, a.OutChannels, l, p);
-                return;
+                return ConvEpilogueFlags(a) == 0 || TryConvGemmEpilogue(a.Output, a);
             }
             using var col = AllocateBuffer(checked(a.Batch * p * l));
             var k = _kernelCache[Kernels.OpenClTunedRowKernels.Im2ColName];
@@ -205,15 +240,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             k.SetArg(arg++, a.KernelH); k.SetArg(arg++, a.KernelW); k.SetArg(arg++, a.StrideH); k.SetArg(arg++, a.StrideW);
             k.SetArg(arg++, a.PadH); k.SetArg(arg++, a.PadW); k.SetArg(arg++, a.DilationH); k.SetArg(arg++, a.DilationW);
             k.SetArg(arg++, a.OutHeight); k.SetArg(arg++, a.OutWidth);
-            k.Execute1D(RoundUpToMultiple(a.Batch * l, 64), 64);
+            k.Execute1D(RoundUpToMultiple(a.Batch * l * p, 64), 64);   // one work item per col element
             if (a.Batch == 1)
             {
                 Gemm(a.Kernel, col, a.Output, a.OutChannels, l, p);
-                return;
+                return ConvEpilogueFlags(a) == 0 || TryConvGemmEpilogue(a.Output, a);
             }
             using var tmp = AllocateBuffer(checked(a.OutChannels * a.Batch * l));
             Gemm(a.Kernel, col, tmp, a.OutChannels, a.Batch * l, p);
+            // The permute back to NCHW and the epilogue in one pass.
+            if (TryConvGemmEpilogue(tmp, a)) return true;
             Permute(tmp, a.Output, new[] { a.OutChannels, a.Batch, l }, new[] { 1, 0, 2 });
+            return false;
         }
     }
 }

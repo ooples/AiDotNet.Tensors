@@ -96,6 +96,8 @@ public sealed class MultiHeadAttentionLaunchCountTests : IClassFixture<DirectGpu
 
         long priorBudget = DirectGpuTensorEngine.MhaBatchedScoreElementBudget;
         DirectGpuTensorEngine.MhaBatchedScoreElementBudget = 0;   // every shape is past it: the fused branch
+        bool priorShort = DirectGpuTensorEngine.ShortAttentionEnabled;
+        DirectGpuTensorEngine.ShortAttentionEnabled = false;      // and the short-sequence kernel would take this shape first
         try
         {
             var fallbacksBefore = GpuLaunchProbe.Fallbacks;
@@ -116,6 +118,7 @@ public sealed class MultiHeadAttentionLaunchCountTests : IClassFixture<DirectGpu
         finally
         {
             DirectGpuTensorEngine.MhaBatchedScoreElementBudget = priorBudget;
+            DirectGpuTensorEngine.ShortAttentionEnabled = priorShort;
         }
     }
 }
