@@ -17,8 +17,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels
         internal const string Rb128V = "gemm_batched_rb128v";
         internal const string Rb64Prefetch = "gemm_batched_rb64p";
         internal const string Conv1x1Rb128V = "conv1x1_rb128v";
+        internal const string SkinnySplitK = "gemm_skinny_splitk";
 
-        internal static string[] GetKernelNames() => new[] { Rb64, Rb64SplitK, SplitKReduce, Im2ColWide, Rb128V, Rb64Prefetch, Conv1x1Rb128V };
+        internal static string[] GetKernelNames() => new[] { Rb64, Rb64SplitK, SplitKReduce, Im2ColWide, Rb128V, Rb64Prefetch, Conv1x1Rb128V, SkinnySplitK };
 
         internal const string Source = @"
 #define RB_BM 64
@@ -144,6 +145,56 @@ void conv1x1_rb128v(__global const float* restrict A, __global const float* rest
             int r = bm0 + ty + 16 * i;
             if (r < M) dst[(long)r * hw] = conv_epilogue(acc[i][j], bias, r, epi);
         }
+    }
+}// C = A * B for a short A (M <= 32 rows; a linear layer's batch) and a wide B (N a multiple of 4): bound by reading B
+// once, which the square-tile kernels and CLBlast did at about 80 GB/s (VGG-11's 4096 x 4096 classifier layer, 67 MB,
+// 849 us at batch 32). A work group owns 256 columns (64 four-wide column groups) of one K slice and stages A's slice in
+// local memory 64 columns at a time; its four 64-thread lanes take rowTiles row tiles of 8 rows and 4 / rowTiles
+// interleaved K sub-lanes. Each (slice, sub-lane) writes its own partial plane of C, plane 0 being C itself when there
+// is one; gemm_splitk_reduce sums more in plane order.
+#define SK_KSUB 64
+__kernel __attribute__((reqd_work_group_size(256, 1, 1)))
+void gemm_skinny_splitk(__global const float* restrict A, __global const float* restrict B, __global float* restrict P,
+    const int M, const int N, const int K, const int kChunk, const int rowTiles)
+{
+    __local float xs[32 * SK_KSUB];
+    const int lid = get_local_id(0);
+    const int cg = lid & 63, lane = lid >> 6;
+    const int kLanes = 4 / rowTiles;
+    const int rt = lane % rowTiles, kl = lane / rowTiles;
+    const bool active = lane < rowTiles * kLanes;
+    const int col = (get_group_id(0) * 64 + cg) * 4;
+    const int kBegin = get_group_id(1) * kChunk, kEnd = min(K, kBegin + kChunk);
+    float4 acc[8];
+    for (int i = 0; i < 8; i++) acc[i] = (float4)(0.0f);
+    for (int k0 = kBegin; k0 < kEnd; k0 += SK_KSUB)
+    {
+        for (int e = lid; e < M * SK_KSUB; e += 256)
+        {
+            const int m = e / SK_KSUB, kk = e - m * SK_KSUB;
+            xs[e] = k0 + kk < kEnd ? A[(long)m * K + k0 + kk] : 0.0f;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (active && col < N)
+        {
+            const int kn = min(SK_KSUB, kEnd - k0);
+            __global const float* bp = B + (long)k0 * N + col;
+            __local const float* xr = xs + rt * 8 * SK_KSUB;
+            #pragma unroll 4
+            for (int kk = kl; kk < kn; kk += kLanes)
+            {
+                const float4 w = vload4(0, bp + (long)kk * N);
+                for (int i = 0; i < 8; i++) acc[i] = mad((float4)(xr[i * SK_KSUB + kk]), w, acc[i]);
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (!active || col >= N) return;
+    __global float* plane = P + (long)(get_group_id(1) * kLanes + kl) * M * N;
+    for (int i = 0; i < 8; i++)
+    {
+        const int m = rt * 8 + i;
+        if (m < M) vstore4(acc[i], 0, plane + (long)m * N + col);
     }
 }// One matrix, C = A * B (A is M x K with row stride lda, B is K x N with row stride ldb), with K split into slices: work
 // group z sums K range [z*kChunk, min(K, (z+1)*kChunk)) into partial plane z of C (M x N each). A 64 x 64 tile grid

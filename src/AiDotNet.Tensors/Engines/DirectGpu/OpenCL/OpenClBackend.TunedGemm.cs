@@ -41,6 +41,16 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                                     RbSplitKGemm(a.A, a.B, a.C, a.M, a.N, a.K);
                                     RecordGemmDispatch(OpenClGemmDispatchPath.BuiltInKernel);
                                 }),
+                            // A linear layer over a small batch: a read of B (the weights) at bandwidth.
+                            new DelegateTunedKernelCandidate<TunedGemmArgs>("opencl.gemm.skinny", TunedKernelOrigin.Builtin, true,
+                                shape => shape[0] <= SkinnyGemmMaxRows && shape[1] % 4 == 0
+                                    && HasTunedKernel(Kernels.BatchedGemmKernels.SkinnySplitK)
+                                    && HasTunedKernel(Kernels.BatchedGemmKernels.SplitKReduce),
+                                (in TunedGemmArgs a) =>
+                                {
+                                    SkinnyGemm(a.A, a.B, a.C, a.M, a.N, a.K);
+                                    RecordGemmDispatch(OpenClGemmDispatchPath.BuiltInKernel);
+                                }),
                         };
                         _gemmSlot = new TunedKernelSlot<TunedGemmArgs>(TunedKernelOp.Gemm, TunedDeviceKey,
                             new BackendTunedKernelHarness<TunedGemmArgs>(this, GemmTolerance, () => IsAvailable,
@@ -54,6 +64,40 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
 
         private void GemmReference(in TunedGemmArgs a) => RunGemmReference(this, a);
+
+        private const int SkinnyGemmMaxRows = 32;
+
+        // C[M x N] = A[M x K] * B[K x N] through gemm_skinny_splitk (M <= 32, N a multiple of 4): 256 columns per work
+        // group, K split until the grid covers about eight groups per compute unit (each slice at least 256 deep), and
+        // the planes summed by gemm_splitk_reduce.
+        internal void SkinnyGemm(IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, int m, int n, int k)
+        {
+            int rowTiles = (m + 7) / 8, kLanes = 4 / rowTiles;
+            int columnBlocks = (n / 4 + 63) / 64;
+            int target = 8 * (int)Math.Max(1u, _context?.MaxComputeUnits ?? 8u);
+            int splits = Math.Max(1, Math.Min((target + columnBlocks - 1) / columnBlocks, k / 256));
+            int kChunk = RoundUpToMultiple((k + splits - 1) / splits, 64);
+            splits = (k + kChunk - 1) / kChunk;
+            int planes = splits * kLanes;
+            IGpuBuffer? partial = planes > 1 ? AllocateBuffer(checked(planes * m * n)) : null;
+            try
+            {
+                var gemm = _kernelCache[Kernels.BatchedGemmKernels.SkinnySplitK];
+                gemm.SetArg(0, BufferHandle(a)); gemm.SetArg(1, BufferHandle(b)); gemm.SetArg(2, BufferHandle(partial ?? c));
+                gemm.SetArg(3, m); gemm.SetArg(4, n); gemm.SetArg(5, k); gemm.SetArg(6, kChunk); gemm.SetArg(7, rowTiles);
+                gemm.Execute2D(columnBlocks * 256, splits, 256, 1);
+                if (partial is null) return;
+                var reduce = _kernelCache[Kernels.BatchedGemmKernels.SplitKReduce];
+                reduce.SetArg(0, BufferHandle(partial)); reduce.SetArg(1, BufferHandle(c));
+                reduce.SetArg(2, m * n); reduce.SetArg(3, planes);
+                reduce.SetArg(4, BufferHandle(c)); reduce.SetArg(5, 0); reduce.SetArg(6, n);
+                reduce.Execute1D(RoundUpToMultiple(m * n, 256), 256);
+            }
+            finally
+            {
+                partial?.Dispose();
+            }
+        }
 
         // Static: the flag is per thread, not per backend.
         private static void RunGemmReference(OpenClBackend backend, in TunedGemmArgs a)

@@ -460,13 +460,19 @@ public sealed class OpenClTunedKernelTests
                 + (pointwise ? 0 : 1) + (pointwiseRb ? 0 : 1) + (smallChannel ? 0 : 1));
         }
     }
-    // The GEMM slot's candidates (the established route and the split-K GEMM) each against a double reference, on shapes
-    // that are not tile multiples, both candidates applying to every one.
+    // The GEMM slot's candidates (the established route, the split-K GEMM and the skinny GEMM) each against a double
+    // reference, on shapes that are not tile multiples. The skinny GEMM admits at most 32 rows over a multiple of 4
+    // columns: one row tile over four K sub-lanes, two over two, three (a lane idle) and four over K slices, a partial
+    // last column block.
     [SkippableFact]
     public void Gemm_EveryCandidate_MatchesCpu()
     {
         using var backend = RequireBackend();
-        foreach (var (m, n, k) in new[] { (1, 7, 300), (65, 192, 192), (33, 70, 129), (130, 257, 64), (3, 5, 2000) })
+        foreach (var (m, n, k) in new[]
+        {
+            (1, 7, 300), (65, 192, 192), (33, 70, 129), (130, 257, 64), (3, 5, 2000),
+            (1, 12, 300), (9, 8, 64), (19, 1028, 700), (32, 260, 1500),
+        })
         {
             float[] a = Values(m * k, m + k), b = Values(k * n, n + 3);
             var expected = new float[m * n];
@@ -482,7 +488,8 @@ public sealed class OpenClTunedKernelTests
             using var cb = backend.AllocateBuffer(m * n);
             var args = new TunedGemmArgs(ab, bb, cb, m, n, k);
             var candidates = Applicable(backend.GemmSlot, args.Shape());
-            Assert.Equal(backend.GemmSlot.CandidateIds.Count, candidates.Count);
+            bool skinny = m <= 32 && n % 4 == 0;
+            Assert.Equal(backend.GemmSlot.CandidateIds.Count, candidates.Count + (skinny ? 0 : 1));
             foreach (var cand in candidates)
             {
                 cand.Execute(args);
