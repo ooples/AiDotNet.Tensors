@@ -118,8 +118,12 @@ public class Fp16ConvBatchLayoutTests : IClassFixture<DirectGpuTensorEngineTestF
         var warm = new Tensor<float>(new float[] { 1, 2, 3, 4 }, new[] { 2, 2 });
         _ = eng!.TensorMatMul(warm, warm);
         var backend = eng!.TestBackend as CudaBackend;
-        Skip.IfNot(backend is not null && backend.IsAvailable && backend.SupportsHgemm && backend.Fp16Im2colAvailable
-                   && backend.GetDirectPtxRuntime().ComputeCapabilityMajor >= 8, "Needs the CUDA FP16 im2col conv path on Ampere+.");
+        // Three separate guards, so the lane's skip check can tell them apart: only the architecture skip is exempt; a
+        // backend that failed to initialize, or an Ampere+ device without the FP16 conv path, still fails the lane.
+        Skip.IfNot(backend is not null && backend.IsAvailable, "the CUDA backend did not initialize");
+        Skip.IfNot(backend.GetDirectPtxRuntime().ComputeCapabilityMajor >= 8,
+            "requires sm_80+ (Ampere): the FP16-accumulate conv route is Ampere-only.");
+        Skip.IfNot(backend.SupportsHgemm && backend.Fp16Im2colAvailable, "the CUDA FP16 im2col conv path is unavailable on this Ampere+ device");
         const int batch = 8, inC = 128, h = 28, w = 28, outC = 128;
         var rng = new Random(15490);
         var input = new Tensor<float>(Enumerable.Range(0, batch * inC * h * w).Select(_ => (float)(rng.NextDouble() * 2 - 1)).ToArray(),
