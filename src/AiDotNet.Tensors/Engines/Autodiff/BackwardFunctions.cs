@@ -116,6 +116,19 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradOutput, engine);
     }
 
+    /// <summary>
+    /// y = relu(a + b): dy/da = dy/db = 1 where y &gt; 0. The mask comes from the output (y &gt; 0 exactly where the sum
+    /// is), so the forward keeps no pre-activation; one masked gradient serves both inputs.
+    /// </summary>
+    internal static void AddReluBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var masked = engine.ReluBackward(gradOutput, output);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], masked, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], masked, engine);
+    }
+
     /// <summary>d(a-b)/da = 1, d(a-b)/db = -1</summary>
     internal static void SubtractBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,

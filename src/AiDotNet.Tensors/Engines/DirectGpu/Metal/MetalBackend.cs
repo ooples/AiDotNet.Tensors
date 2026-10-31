@@ -1249,10 +1249,6 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         ThrowIfDisposed();
         ExecuteElementWiseOp("scale_by_device_scalar", buffer, scalar, buffer, size);
     }
-    public void AddRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Relu(C, C, size); }
-    public void AddSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Sigmoid(C, C, size); }
-    public void AddGelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Gelu(C, C, size); }
-
     /// <summary>
     /// Element-wise subtraction: C = A - B
     /// </summary>

@@ -270,7 +270,12 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         await DispatchBinaryOpAsync("minimum", A, B, C, size);
     }
 
-    private async Task DispatchBinaryOpAsync(string kernelName, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
+    private Task DispatchBinaryOpAsync(string kernelName, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
+        => DispatchBinaryOpAsync("ElementWise", WebGpuKernels.ElementWiseSource, kernelName, A, B, C, size);
+
+    /// <summary>An element-wise C = f(A, B) entry point of <paramref name="source"/>, a module with ElementWiseSource's
+    /// bindings (A, B, C, then a uniform holding the size).</summary>
+    private async Task DispatchBinaryOpAsync(string moduleName, string source, string kernelName, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
         ThrowIfNotInitialized();
 
@@ -278,7 +283,7 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         var bBuffer = (WebGpuBuffer)B;
         var cBuffer = (WebGpuBuffer)C;
 
-        var pipelineId = await GetOrCreatePipelineAsync("ElementWise", WebGpuKernels.ElementWiseSource, kernelName);
+        var pipelineId = await GetOrCreatePipelineAsync(moduleName, source, kernelName);
 
         // Create uniform buffer for params
         var paramsData = new float[] { BitConverter.Int32BitsToSingle(size), 0, 0, 0 };

@@ -108,6 +108,27 @@ void main() {
     b[idx] = y;
 }";
 
+    /// <summary>
+    /// <c>c = act(a + b)</c> in one pass (the residual join of a ResNet block), <c>op</c> selecting the activation:
+    /// 0 = ReLU (<c>max(sum, 0)</c>), 1 = sigmoid, 2 = tanh-approximated GELU. The tanh argument is clamped where
+    /// tanh has already saturated in float, so a driver's exp-based tanh cannot overflow to NaN.
+    /// </summary>
+    public static string AddActivation => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint size; uint op; };
+const float SQRT_2_OVER_PI = 0.7978845608;
+const float GELU_COEF = 0.044715;
+const float TANH_SATURATION = 10.0;
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= size) return;
+    float x = a[idx] + bdata[idx];
+    float y;
+    if (op == 0u) y = x > 0.0 ? x : 0.0;
+    else if (op == 1u) y = 1.0 / (1.0 + exp(-x));
+    else y = 0.5 * x * (1.0 + tanh(clamp(SQRT_2_OVER_PI * (x + GELU_COEF * x * x * x), -TANH_SATURATION, TANH_SATURATION)));
+    c[idx] = y;
+}";
+
     public static string BinaryElementwise => Header + ThreeBufferLayout + @"
 layout(push_constant) uniform Params { uint size; uint op; uint p0; uint p1; uint p2; };
 void main() {

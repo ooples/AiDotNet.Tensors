@@ -21820,6 +21820,35 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return base.TensorAdd(a, b);
     }
 
+    /// <inheritdoc/>
+    /// <remarks>A ReLU over two same-shape float operands is the backend's one-kernel <c>AddRelu</c>; anything else
+    /// takes the CPU base, which composes the recorded add and activation.</remarks>
+    public override Tensor<T> TensorAddActivation<T>(Tensor<T> a, Tensor<T> b, FusedActivationType activation)
+    {
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (b is null) throw new ArgumentNullException(nameof(b));
+        if (activation != FusedActivationType.ReLU || typeof(T) != typeof(float) || !ShapesMatch(a.Shape._dims, b.Shape._dims))
+            return base.TensorAddActivation(a, b, activation);
+        DeviceDispatch.EnforceStrict(a, b);
+        if (TryBinaryResidentOutOfPlace(a, b, static (be, ia, ib, o, n) => be.AddRelu(ia, ib, o, n)) is { } resident)
+        {
+            Autodiff.DifferentiableOps.RecordBinary("TensorAddRelu", resident, a, b, Autodiff.BackwardFunctions<T>.AddReluBackward);
+            return resident;
+        }
+        try
+        {
+            var result = TryRunBinary(a, b, static (backend, ia, ib, o, size) => backend.AddRelu(ia, ib, o, size));
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, a.Shape._dims);
+                Autodiff.DifferentiableOps.RecordBinary("TensorAddRelu", output, a, b, Autodiff.BackwardFunctions<T>.AddReluBackward);
+                return output;
+            }
+        }
+        catch (NotSupportedException ex) { GpuLaunchProbe.OnFallback("TensorAddActivation", ex); }
+        return base.TensorAddActivation(a, b, activation);
+    }
+
     public override Tensor<T> TensorSubtract<T>(Tensor<T> a, Tensor<T> b)
     {
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
