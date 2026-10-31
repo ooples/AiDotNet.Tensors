@@ -330,6 +330,50 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
 
         /// <summary>
+        /// Launches one work item per (x, y, plane) of a stack of <paramref name="width"/> x <paramref name="height"/>
+        /// planes, in 64-item work groups shaped to the plane. The kernel must return for x &gt;= width, y &gt;= height and
+        /// planes past the last. A fixed 8 x 8 group left 60 of its 64 items idle on a 2 x 2 map and 63 on a 1 x 1 one,
+        /// so a pool over VGG-11's last maps ran a work group per output.
+        /// </summary>
+        internal void ExecutePlanes(int width, int height, int planes)
+        {
+            int lx = Math.Min(8, PowerOfTwoAtLeast(width)), ly = Math.Min(8, PowerOfTwoAtLeast(height));
+            // The plane axis takes the rest of the 64, capped at the device's z limit (OpenCL guarantees only 1) and at
+            // this kernel's group limit; the kernels launched here bound-check every item, so a smaller group is fine.
+            ulong[] itemLimits = _context.MaxWorkItemSizes;
+            ulong zLimit = itemLimits.Length > 2 && itemLimits[2] > 0 ? itemLimits[2] : 1;
+            ulong groupLimit = MaxWorkGroupSize / (ulong)(lx * ly);
+            int lz = (int)Math.Max(1, Math.Min((ulong)(64 / (lx * ly)), Math.Min(zLimit, groupLimit)));
+            Execute3D(width, height, planes, lx, ly, lz);
+        }
+
+        private ulong _maxWorkGroupSize;
+
+        /// <summary>
+        /// The most work items one group of this compiled kernel may hold (CL_KERNEL_WORK_GROUP_SIZE), or the device's
+        /// limit when the driver does not report it. Read once.
+        /// </summary>
+        internal ulong MaxWorkGroupSize
+        {
+            get
+            {
+                if (_maxWorkGroupSize != 0) return _maxWorkGroupSize;
+                ulong limit = (ulong)OpenClNativeBindings.GetKernelWorkGroupInfoSizeT(_kernel, _context.Device,
+                    OpenClNativeBindings.CL_KERNEL_WORK_GROUP_SIZE);
+                if (limit == 0) limit = _context.MaxWorkGroupSize;
+                _maxWorkGroupSize = limit;
+                return limit;
+            }
+        }
+
+        private static int PowerOfTwoAtLeast(int n)
+        {
+            int p = 1;
+            while (p < n && p < 8) p <<= 1;
+            return p;
+        }
+
+        /// <summary>
         /// Executes kernel with 3D work distribution.
         /// </summary>
         public void Execute3D(int globalSizeX, int globalSizeY, int globalSizeZ, int localSizeX, int localSizeY, int localSizeZ)

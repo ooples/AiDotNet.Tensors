@@ -84,12 +84,16 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         // error instead of crashing inside Execute1D.
         private bool _fusedAdvancedKernelsAvailable;
         private OpenClCommandQueue? _defaultStream;
-        // The pool is a caching allocator bounded by bytes (a quarter of device memory, set once the device is known),
-        // not by a count per size: a steady training loop frees many buffers of one size per step, and each one the
-        // pool refused went back to the driver behind a completion marker while the host ran steps ahead of the device.
-        // An allocation that runs out of memory drains the pool and retries (AllocateReclaiming).
+        // The pool is a caching allocator bounded by bytes (half of device memory, set once the device is known), not by
+        // a count per size: a steady training loop frees many buffers of one size per step, and each one the pool refused
+        // went back to the driver behind a completion marker while the host ran steps ahead of the device. Half, not a
+        // quarter: a batch-128 DenseNet-121 inference re-requests over a gigabyte of exactly-sized results every call
+        // (each concatenation 50-134 MB), and with a quarter they did not all fit, so every call went back to the driver
+        // for them: 421-460 ms a call, 270-285 ms at half, 246-265 ms at all of device memory (gfx1012, 4 GB). Training
+        // peaks did not move (MobileNetV2 295-302 MB, ResNet-50 955-984 MB at all three). An allocation that runs out of
+        // memory drains the pool and retries (AllocateReclaiming).
         private const int MaxPooledBufferElements = int.MaxValue;
-        private const int PooledMemoryDivisor = 4;
+        private const int PooledMemoryDivisor = 2;
         private const int MaxPooledBuffersPerSize = 4096;
         private readonly GpuBufferPool<DirectOpenClGpuBuffer> _bufferPool =
             new GpuBufferPool<DirectOpenClGpuBuffer>(MaxPooledBuffersPerSize, MaxPooledBufferElements);
@@ -7218,8 +7222,7 @@ KERNEL VARIANTS (A/B testing):
                 k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle); // no bias: the epilogue flags are 0
                 k.SetArg(arg++, 0);
 
-                int localX = 8, localY = 8, localZ = 1;
-                k.Execute3D(outWidth, outHeight, batch * outChannels, localX, localY, localZ);
+                k.ExecutePlanes(outWidth, outHeight, batch * outChannels);
             }
         }
 
@@ -7425,8 +7428,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, padH);
             k.SetArg(arg++, padW);
 
-            int localX = 8, localY = 8, localZ = 1;
-            k.Execute3D(outWidth, outHeight, batch * channels, localX, localY, localZ);
+            k.ExecutePlanes(outWidth, outHeight, batch * channels);
         }
 
         public void ConvTranspose2D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
@@ -7851,6 +7853,29 @@ KERNEL VARIANTS (A/B testing):
             int kernelH, int kernelW,
             int strideH, int strideW, int padH, int padW)
         {
+            if (kernelH == 2 && kernelW == 2 && strideH == 2 && strideW == 2 && padH == 0 && padW == 0
+                && inWidth % 4 == 0 && inHeight % 2 == 0 && outHeight == inHeight / 2 && outWidth == inWidth / 2
+                && _kernelCache.TryGetValue("maxpool2d_2x2s2", out var pool2))
+            {
+                long pairs = (long)batch * channels * outHeight * (outWidth / 2);
+                uint a2 = 0;
+                pool2.SetArg(a2++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+                pool2.SetArg(a2++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+                pool2.SetArg(a2++, indices != null ? ((DirectOpenClGpuBuffer)indices).Buffer.Handle : IntPtr.Zero);
+                pool2.SetArg(a2++, batch * channels);
+                pool2.SetArg(a2++, inHeight);
+                pool2.SetArg(a2++, inWidth);
+                pool2.SetArg(a2++, outHeight);
+                pool2.SetArg(a2++, outWidth);
+                pool2.SetArg(a2, indices != null ? 1 : 0);
+                // No local memory and no reqd_work_group_size: any group the compiled kernel admits works.
+                // Within the compiled kernel's group limit and the device's first-dimension limit.
+                ulong[] itemLimits = _context?.MaxWorkItemSizes ?? Array.Empty<ulong>();
+                ulong xLimit = itemLimits.Length > 0 && itemLimits[0] > 0 ? itemLimits[0] : 256UL;
+                int local = (int)Math.Max(1UL, Math.Min(Math.Min(256UL, pool2.MaxWorkGroupSize), xLimit));
+                pool2.Execute1D(RoundUpToMultiple(checked((int)pairs), local), local);
+                return;
+            }
             var k = _kernelCache["maxpool2d"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
@@ -7870,8 +7895,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, padW);
             k.SetArg(arg++, indices != null ? 1 : 0);
 
-            int localX = 8, localY = 8, localZ = 1;
-            k.Execute3D(outWidth, outHeight, batch * channels, localX, localY, localZ);
+            k.ExecutePlanes(outWidth, outHeight, batch * channels);
         }
 
         public void MaxPool2DBackward(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradInput,
@@ -7893,8 +7917,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, outHeight);
             k.SetArg(arg++, outWidth);
 
-            int localX = 8, localY = 8, localZ = 1;
-            k.Execute3D(outWidth, outHeight, batch * channels, localX, localY, localZ);
+            k.ExecutePlanes(outWidth, outHeight, batch * channels);
         }
 
         public void AvgPool2D(IGpuBuffer input, IGpuBuffer output,
@@ -7922,8 +7945,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, padW);
             k.SetArg(arg++, countIncludePad ? 1 : 0);
 
-            int localX = 8, localY = 8, localZ = 1;
-            k.Execute3D(outWidth, outHeight, batch * channels, localX, localY, localZ);
+            k.ExecutePlanes(outWidth, outHeight, batch * channels);
         }
 
         public void AvgPool2DBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput,
@@ -8048,8 +8070,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, outHeight);
             k.SetArg(arg++, outWidth);
 
-            int localX = 8, localY = 8, localZ = 1;
-            k.Execute3D(outWidth, outHeight, batch * channels, localX, localY, localZ);
+            k.ExecutePlanes(outWidth, outHeight, batch * channels);
         }
 
         // #775: adaptive max pooling 2D on the adaptive_max_pool2d kernel (same 3D dispatch as avg).
@@ -8066,8 +8087,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, outHeight);
             k.SetArg(arg++, outWidth);
 
-            int localX = 8, localY = 8, localZ = 1;
-            k.Execute3D(outWidth, outHeight, batch * channels, localX, localY, localZ);
+            k.ExecutePlanes(outWidth, outHeight, batch * channels);
         }
 
         public void MaxPool3D(IGpuBuffer input, IGpuBuffer output, IGpuBuffer? indices,
@@ -14355,7 +14375,7 @@ KERNEL VARIANTS (A/B testing):
 
             DisposeCompiledCodegenKernels();
             _dynamicGemm?.Dispose();
-            ReleaseF43FilterCache();
+            ReleaseWinogradFilterCache();
             _bufferPool.Dispose();
             lock (_constantIntTablesGate)
             {

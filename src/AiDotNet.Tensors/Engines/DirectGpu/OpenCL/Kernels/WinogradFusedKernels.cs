@@ -19,7 +19,31 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels
     {
         internal const string Forward = "wino_f23_fused_forward";
 
-        internal static string[] GetKernelNames() => new[] { Forward };
+        internal const string SplitReduce = "wino_f23_split_reduce";
+
+        // Built with these kernels for their shared conv_epilogue: a direct convolution over few input channels.
+        internal const string SmallChannel = "conv2d_smallc";
+        internal const string SmallChannel3x3 = "conv2d_smallc3";
+        internal const string CenterTapGather = "conv_center_tap_gather";
+        internal const string SmallMapWeights = "conv_small_map_weights";
+        internal const string SmallMapScatter = "conv_small_map_scatter";
+
+        /// <summary>Output channels one conv2d_smallc work item computes (SC_OB in the source).</summary>
+        internal const int SmallChannelBlock = 16;
+
+        /// <summary>
+        /// The most filter taps (input channels x kernel height x kernel width) conv2d_smallc holds in local memory
+        /// (SC_MAX_TAPS in the source): its ws[SC_OB * SC_MAX_TAPS] array. The dispatcher admits no larger filter.
+        /// </summary>
+        internal const int SmallChannelMaxTaps = 196;
+
+        /// <summary>The widest filter row conv2d_smallc loads at once (SC_MAX_KW in the source); the dispatcher admits no wider.</summary>
+        internal const int SmallChannelMaxKernelWidth = 7;
+
+        /// <summary>The small-channel kernels' work-group size (SC_WG in the source: their reqd_work_group_size).</summary>
+        internal const int SmallChannelGroupSize = 64;
+
+        internal static string[] GetKernelNames() => new[] { Forward, SplitReduce, SmallChannel, SmallChannel3x3, CenterTapGather, SmallMapWeights, SmallMapScatter };
 
         internal const string Source = @"
 #define WF_BO 32
@@ -37,8 +61,13 @@ float conv_epilogue(float v, __global const float* bias, int channel, int epi)
 __kernel __attribute__((reqd_work_group_size(256, 1, 1)))
 void wino_f23_fused_forward(__global const float* restrict in, __global const float* restrict wt,
     __global float* restrict out, const int N, const int R, const int IH, const int IW, const int O, const int OH,
-    const int OW, const int pad, const int tilesH, const int tilesW, __global const float* bias, const int epi)
+    const int OW, const int pad, const int tilesH, const int tilesW, __global const float* bias, const int epi,
+    const int rChunk)
 {
+    // Work-group layer z reduces channels [z * rChunk, z * rChunk + rChunk) and writes its partial output plane z
+    // (the host then sums the planes and applies the epilogue, passing epi = 0 here); one layer is the whole sum.
+    const int rBegin = get_group_id(2) * rChunk, rEnd = min(R, rBegin + rChunk);
+    out += (long)get_group_id(2) * N * O * OH * OW;
     // U | V during the reduction; the epilogue reuses the first 16 x 16 x 32 floats.
     __local float sm[16 * WF_CK * WF_ULD + 16 * WF_CK * 32];
     __local float* us = sm;
@@ -73,12 +102,12 @@ void wino_f23_fused_forward(__global const float* restrict in, __global const fl
     float acc[8][8];
     for (int i = 0; i < 8; i++) for (int j = 0; j < 8; j++) acc[i][j] = 0.0f;
 
-    const int steps = (R + WF_CK - 1) / WF_CK;
+    const int steps = (rEnd - rBegin + WF_CK - 1) / WF_CK;
     // The next step's patch and filter are read into registers before this step's products, so the global loads
     // overlap the arithmetic (one local buffer; the barriers order the stores against the reads).
     float d[16], g[9];
-    #define WF_LOAD(R0) {         const int r_ = (R0) + lc;         const uint m_ = r_ < R ? pm : 0u;         __global const float* src_ = in + inOff + (long)r_ * chanStride;         for (int i = 0; i < 4; i++)             for (int j = 0; j < 4; j++) d[i * 4 + j] = ((m_ >> (i * 4 + j)) & 1u) ? src_[i * IW + j] : 0.0f;         const int wr_ = (R0) + fr, wo_ = o0 + fo;         if (wr_ < R && wo_ < O) { __global const float* w_ = wt + ((long)wo_ * R + wr_) * 9; for (int q = 0; q < 9; q++) g[q] = w_[q]; }         else { for (int q = 0; q < 9; q++) g[q] = 0.0f; } }
-    if (steps > 0) WF_LOAD(0)
+    #define WF_LOAD(R0) {         const int r_ = (R0) + lc;         const uint m_ = r_ < rEnd ? pm : 0u;         __global const float* src_ = in + inOff + (long)r_ * chanStride;         for (int i = 0; i < 4; i++)             for (int j = 0; j < 4; j++) d[i * 4 + j] = ((m_ >> (i * 4 + j)) & 1u) ? src_[i * IW + j] : 0.0f;         const int wr_ = (R0) + fr, wo_ = o0 + fo;         if (wr_ < rEnd && wo_ < O) { __global const float* w_ = wt + ((long)wo_ * R + wr_) * 9; for (int q = 0; q < 9; q++) g[q] = w_[q]; }         else { for (int q = 0; q < 9; q++) g[q] = 0.0f; } }
+    if (steps > 0) WF_LOAD(rBegin)
     for (int step = 0; step < steps; step++)
     {
         // V = B^T d B, B^T = [[1,0,-1,0],[0,1,1,0],[0,-1,1,0],[0,1,0,-1]].
@@ -122,7 +151,7 @@ void wino_f23_fused_forward(__global const float* restrict in, __global const fl
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);
-        if (step + 1 < steps) WF_LOAD((step + 1) * WF_CK)
+        if (step + 1 < steps) WF_LOAD(rBegin + (step + 1) * WF_CK)
         __local const float* ub = us + x * WF_CK * WF_ULD + oo;
         __local const float* vb = vs + x * WF_CK * 32 + pp;
         for (int r = 0; r < WF_CK; r++)
@@ -177,6 +206,172 @@ void wino_f23_fused_forward(__global const float* restrict in, __global const fl
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);
+    }
+}
+// out[i] = the epilogue of the sum over s of partial[s][i], i < count, in split order; channel (i / hw) % O.
+__kernel void wino_f23_split_reduce(__global const float* restrict partial, __global float* restrict out,
+    const int count, const int splits, __global const float* bias, const int epi, const int hw, const int O)
+{
+    int i = get_global_id(0);
+    if (i >= count) return;
+    float sum = 0.0f;
+    for (int s = 0; s < splits; s++) sum += partial[(long)s * count + i];
+    out[i] = conv_epilogue(sum, bias, (i / hw) % O, epi);
+}
+// A convolution over few input channels (a network's stem on 3 RGB channels), one work item per output pixel and 16
+// output channels: the pixel's C x KH x KW inputs are read once for all 16, where the direct kernel reads them once per
+// output channel. The group's 16 filters (output channel block get_group_id(1)) are staged in local memory first, so
+// the 16 x C x KH x KW weight reads per pixel are local broadcasts, not global loads; C x KH x KW is at most 196.
+#define SC_MAX_TAPS 196
+#define SC_MAX_KW 7
+#define SC_WG 64
+#define SC_OB 16
+__kernel __attribute__((reqd_work_group_size(SC_WG, 1, 1)))
+void conv2d_smallc(__global const float* restrict in, __global const float* restrict wt, __global float* restrict out,
+    const int N, const int C, const int IH, const int IW, const int O, const int OH, const int OW, const int KH,
+    const int KW, const int SH, const int SW, const int PH, const int PW, const int DH, const int DW,
+    __global const float* bias, const int epi)
+{
+    __local float ws[SC_OB * SC_MAX_TAPS];
+    const int npix = OH * OW;
+    const int pix = get_global_id(0);
+    const int o0 = get_group_id(1) * SC_OB;
+    const int taps = C * KH * KW;
+    for (int e = get_local_id(0); e < SC_OB * taps; e += SC_WG)
+    {
+        const int j = e / taps;
+        ws[e] = o0 + j < O ? wt[(long)o0 * taps + e] : 0.0f;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (pix >= N * npix) return;
+    const int n = pix / npix, q = pix - n * npix;
+    const int oh = q / OW, ow = q - oh * OW;
+    float acc[SC_OB];
+    for (int j = 0; j < SC_OB; j++) acc[j] = 0.0f;
+    // A filter row's window (KW <= SC_MAX_KW) is loaded at once, out-of-bounds taps predicated to zero, so the loads
+    // are in flight together; behind per-tap bounds branches they ran one at a time (a 7 x 7 stem at batch 128 took
+    // 1.1 ms; 0.85 ms this way). Two or four pixels per work item, to reuse each weight read, measured slower still.
+    const int ih0 = oh * SH - PH, iw0 = ow * SW - PW;
+    for (int c = 0; c < C; c++)
+    {
+        __global const float* src = in + (long)(n * C + c) * IH * IW;
+        for (int kh = 0; kh < KH; kh++)
+        {
+            const int ih = ih0 + kh * DH;
+            const bool rowInside = ih >= 0 && ih < IH;
+            float v[SC_MAX_KW];
+            #pragma unroll
+            for (int kw = 0; kw < SC_MAX_KW; kw++)
+            {
+                const int iw = iw0 + kw * DW;
+                const bool inside = rowInside && kw < KW && iw >= 0 && iw < IW;
+                v[kw] = inside ? src[inside ? ih * IW + iw : 0] : 0.0f;
+            }
+            __local const float* w = ws + (c * KH + kh) * KW;
+            #pragma unroll
+            for (int kw = 0; kw < SC_MAX_KW; kw++)
+            {
+                if (kw >= KW) break;
+                for (int j = 0; j < SC_OB; j++) acc[j] = mad(v[kw], w[j * taps + kw], acc[j]);
+            }
+        }
+    }
+    for (int j = 0; j < SC_OB; j++)
+    {
+        const int o = o0 + j;
+        if (o < O) out[(long)(n * O + o) * npix + q] = conv_epilogue(acc[j], bias, o, epi);
+    }
+}
+// wcT[c][o] = w[o][c][centre]: the GEMM operand of a convolution whose 1 x 1 output reads a 1 x 1 input through its
+// filters' centre tap alone (an odd filter padded by half its size).
+__kernel void conv_center_tap_gather(__global const float* restrict w, __global float* restrict wcT, const int O,
+    const int C, const int taps, const int centre)
+{
+    const int i = get_global_id(0);
+    if (i >= O * C) return;
+    const int c = i / O, o = i - c * O;
+    wcT[i] = w[((long)o * C + c) * taps + centre];
+}
+// A convolution over a map so small that every output reads every input pixel through some tap (a 2 x 2 map through a
+// 3 x 3 filter padded by one, at stride 1 or 2) is one linear map per image: y[n][(p, o)] = sum over (c, q) of
+// x[n][(c, q)] * big[(c, q)][(p, o)], big = w[o][c][kh][kw] at kh = qh - ph * SH + PH, kw = qw - pw * SW + PW (zero
+// off the filter).
+__kernel void conv_small_map_weights(__global const float* restrict w, __global float* restrict big, const int O,
+    const int C, const int KH, const int KW, const int H, const int W, const int OH, const int OW, const int PH,
+    const int PW, const int SH, const int SW)
+{
+    const long i = get_global_id(0);
+    const int hw = H * W, ohw = OH * OW;
+    const long cols = (long)ohw * O;
+    if (i >= (long)C * hw * cols) return;
+    const long row = i / cols;
+    const int col = (int)(i - row * cols);
+    const int c = (int)(row / hw), q = (int)(row - (long)c * hw);
+    const int p = col / O, o = col - p * O;
+    const int qh = q / W, qw = q - qh * W, ph = p / OW, pw = p - ph * OW;
+    const int kh = qh - ph * SH + PH, kw = qw - pw * SW + PW;
+    big[i] = (kh >= 0 && kh < KH && kw >= 0 && kw < KW) ? w[(((long)o * C + c) * KH + kh) * KW + kw] : 0.0f;
+}
+// y[n][o][p] = the epilogue of t[n][p][o]: the small-map GEMM's (output pixel, channel) columns back to NCHW.
+__kernel void conv_small_map_scatter(__global const float* restrict t, __global float* restrict y, const int N,
+    const int O, const int P, __global const float* bias, const int epi)
+{
+    const int i = get_global_id(0);
+    if (i >= N * O * P) return;
+    const int n = i / (O * P), r = i - n * (O * P);
+    const int o = r / P, p = r - o * P;
+    y[i] = conv_epilogue(t[((long)n * P + p) * O + o], bias, o, epi);
+}
+// conv2d_smallc for a 3 x 3 filter, unrolled: a channel's nine window values are loaded together, out-of-bounds taps
+// predicated to zero, before its products. In the general form each tap's load sat behind its bounds branches, so the
+// loads ran one at a time and the 3-channel stem took about three times its output's write time.
+__kernel __attribute__((reqd_work_group_size(SC_WG, 1, 1)))
+void conv2d_smallc3(__global const float* restrict in, __global const float* restrict wt, __global float* restrict out,
+    const int N, const int C, const int IH, const int IW, const int O, const int OH, const int OW, const int SH,
+    const int SW, const int PH, const int PW, const int DH, const int DW, __global const float* bias, const int epi)
+{
+    __local float ws[SC_OB * SC_MAX_TAPS];
+    const int npix = OH * OW;
+    const int pix = get_global_id(0);
+    const int o0 = get_group_id(1) * SC_OB;
+    const int taps = C * 9;
+    for (int e = get_local_id(0); e < SC_OB * taps; e += SC_WG)
+    {
+        const int j = e / taps;
+        ws[e] = o0 + j < O ? wt[(long)o0 * taps + e] : 0.0f;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (pix >= N * npix) return;
+    const int n = pix / npix, q = pix - n * npix;
+    const int oh = q / OW, ow = q - oh * OW;
+    const int ih0 = oh * SH - PH, iw0 = ow * SW - PW;
+    float acc[SC_OB];
+    for (int j = 0; j < SC_OB; j++) acc[j] = 0.0f;
+    for (int c = 0; c < C; c++)
+    {
+        __global const float* src = in + (long)(n * C + c) * IH * IW;
+        float v[9];
+        #pragma unroll
+        for (int kh = 0; kh < 3; kh++)
+        {
+            const int ih = ih0 + kh * DH;
+            #pragma unroll
+            for (int kw = 0; kw < 3; kw++)
+            {
+                const int iw = iw0 + kw * DW;
+                const bool inside = ih >= 0 && ih < IH && iw >= 0 && iw < IW;
+                v[kh * 3 + kw] = inside ? src[inside ? ih * IW + iw : 0] : 0.0f;
+            }
+        }
+        __local const float* w = ws + c * 9;
+        #pragma unroll
+        for (int t = 0; t < 9; t++)
+            for (int j = 0; j < SC_OB; j++) acc[j] = mad(v[t], w[j * taps + t], acc[j]);
+    }
+    for (int j = 0; j < SC_OB; j++)
+    {
+        const int o = o0 + j;
+        if (o < O) out[(long)(n * O + o) * npix + q] = conv_epilogue(acc[j], bias, o, epi);
     }
 }
 ";

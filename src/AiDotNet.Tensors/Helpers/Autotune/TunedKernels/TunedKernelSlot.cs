@@ -244,16 +244,29 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
             long start = Stopwatch.GetTimestamp();
             try
             {
-                var (chosen, decision) = Gate(shape, args, reference, applicable, rejected);
+                // Candidates measured slower than the reference by median in either measurement: never the fallback below.
+                var lost = new HashSet<string>(StringComparer.Ordinal);
+                var (chosen, decision) = Gate(shape, args, reference, applicable, rejected, lost);
                 // An inconclusive measurement (noise, not a loss) gets one fresh measurement before it is accepted.
                 if (decision?.Reason == TunedKernelDecisionReason.Inconclusive)
                 {
                     var retryRejected = new List<string>(rejected.Count);
-                    (chosen, decision) = Gate(shape, args, reference, applicable, retryRejected);
+                    (chosen, decision) = Gate(shape, args, reference, applicable, retryRejected, lost);
                 }
                 // No decision: the reference output was not finite, so nothing could be compared. Serve the reference
                 // uncached and unpersisted, and tune this shape on a later call with usable data.
                 if (decision is null) return chosen;
+                // Still inconclusive: the slot's shape-aware default for this process when it has one that matches the
+                // reference and did not measure slower than it here (the default encodes measured evidence; the reference
+                // is often the slowest route), else the reference.
+                if (decision.Reason == TunedKernelDecisionReason.Inconclusive
+                    && TryUntunedDefault(shape, args, reference, applicable, rejected, lost) is { } fallback)
+                {
+                    chosen = fallback;
+                    decision = new TunedKernelDecision(Op, Device, shape, fallback.Id, fallback.Origin,
+                        TunedKernelDecisionReason.Inconclusive, reference.Id, noiseRatio: decision.NoiseRatio,
+                        rejected: rejected.ToArray());
+                }
                 map[shape] = new Entry(chosen, decision);
                 TunedKernelRegistry.Record(decision);
                 // Still inconclusive: the reference for this process, but a later process measures again.
@@ -276,14 +289,17 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
     /// </summary>
     internal Func<TunedShape, IReadOnlyList<string>?>? UntunedPreference { get; set; }
 
+    // excluded: candidates that measured slower than the reference for this shape; the next preference is tried instead.
     private ITunedKernelCandidate<TArgs>? TryUntunedDefault(in TunedShape shape, in TArgs args,
-        ITunedKernelCandidate<TArgs> reference, List<ITunedKernelCandidate<TArgs>> applicable, List<string> rejected)
+        ITunedKernelCandidate<TArgs> reference, List<ITunedKernelCandidate<TArgs>> applicable, List<string> rejected,
+        ISet<string>? excluded = null)
     {
         var preference = UntunedPreference?.Invoke(shape);
         if (preference is null) return null;
         ITunedKernelCandidate<TArgs>? preferred = null;
         foreach (var id in preference)
         {
+            if (excluded is not null && excluded.Contains(id)) continue;
             preferred = applicable.FirstOrDefault(c => string.Equals(c.Id, id, StringComparison.Ordinal));
             if (preferred is not null) break;
         }
@@ -325,8 +341,10 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
         return chosen;
     }
 
+    // lost, when given, collects the candidates whose median timing was slower than the reference's.
     private (ITunedKernelCandidate<TArgs> Chosen, TunedKernelDecision? Decision) Gate(in TunedShape shape, in TArgs args,
-        ITunedKernelCandidate<TArgs> reference, List<ITunedKernelCandidate<TArgs>> applicable, List<string> rejected)
+        ITunedKernelCandidate<TArgs> reference, List<ITunedKernelCandidate<TArgs>> applicable, List<string> rejected,
+        ISet<string>? lost = null)
     {
         // The correctness runs below are the registry's evidence, like its snapshots and timings: TryExecute runs the
         // chosen candidate again for the caller's result. Their transfers (an im2col candidate's shape-table upload)
@@ -431,6 +449,7 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
             {
                 // Faster by median, refused only for consistency or for the noise floor: undecided, not a loss.
                 if (evidence.MedianSpeedup >= MinimumSpeedup) inconclusive = true;
+                else if (evidence.MedianSpeedup < 1.0) lost?.Add(c.Id);
                 rejected.Add($"{c.Id}: {evidence.MedianSpeedup:F3}x median, {evidence.LowerSpeedupBound:F3}x min pair, " +
                              $"{secondLowest:F3}x second-lowest pair (noise {noise:F3})");
                 continue;

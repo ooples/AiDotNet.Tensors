@@ -372,12 +372,48 @@ public sealed class OpenClTunedKernelTests
     }
 #endif
 
+    /// <summary>
+    /// conv2d_smallc's local filter array is ws[SC_OB * SC_MAX_TAPS] and its launch grid is SC_OB channels a group: the
+    /// C# limits the dispatcher admits and launches by must be the kernel's own, or a larger filter overflows local
+    /// memory and the grid stops matching the kernel.
+    /// </summary>
+    [Fact]
+    public void SmallChannelLimits_MatchTheKernelSource()
+    {
+        string source = AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels.WinogradFusedKernels.Source;
+        Assert.Contains("#define SC_OB " + AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels.WinogradFusedKernels.SmallChannelBlock + "\n",
+            source.Replace("\r\n", "\n"));
+        Assert.Contains("#define SC_MAX_TAPS " + AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels.WinogradFusedKernels.SmallChannelMaxTaps + "\n",
+            source.Replace("\r\n", "\n"));
+        Assert.Contains("#define SC_MAX_KW " + AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels.WinogradFusedKernels.SmallChannelMaxKernelWidth + "\n",
+            source.Replace("\r\n", "\n"));
+        Assert.Contains("#define SC_WG " + AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels.WinogradFusedKernels.SmallChannelGroupSize + "\n",
+            source.Replace("\r\n", "\n"));
+        // Both small-channel kernels take their group size and staging stride from the macro.
+        Assert.DoesNotContain("reqd_work_group_size(64, 1, 1)", source.Substring(source.IndexOf("#define SC_WG", System.StringComparison.Ordinal)));
+    }
+
     // (batch, Cin, H, W, Cout, k, stride, pad, dilation): Winograd's 3x3/s1, 1x1, 5x5, strided, dilated, batched.
     private static readonly (int B, int C, int H, int W, int O, int K, int S, int P, int D)[] ConvShapes =
     {
         (1, 3, 8, 8, 4, 3, 1, 1, 1), (2, 4, 9, 7, 5, 3, 1, 0, 1), (1, 8, 6, 6, 3, 1, 1, 0, 1),
         (2, 3, 11, 10, 2, 5, 2, 2, 1), (1, 2, 12, 12, 3, 3, 1, 2, 2), (3, 5, 7, 9, 6, 3, 2, 1, 1),
         (2, 6, 5, 4, 7, 1, 1, 0, 1),   // a 1x1 convolution over a batch: the batch-shared pointwise route
+        // Few (tile, output channel) groups over many channels: fused Winograd splits the channels (2 layers of 40 and
+        // 32; 3 layers of 40, 40 and 20) and sums the partial outputs before the epilogue. The first is a single group
+        // (32 output channels, one tile), so it splits in two on every device, one compute unit included.
+        (2, 72, 2, 2, 32, 3, 1, 1, 1), (3, 100, 3, 5, 9, 3, 1, 1, 1),
+        // 1x1 through conv1x1_rb128v: K split three ways over a one-tile grid (72, 72 and 56 channels); a 2 x 2 tile grid
+        // crossing image boundaries inside a tile; an odd pixel count (15), which the route declines.
+        (2, 200, 2, 2, 5, 1, 1, 0, 1), (3, 20, 8, 8, 130, 1, 1, 0, 1), (2, 6, 5, 3, 4, 1, 1, 0, 1),
+        // A strided stem over three channels into 37 outputs: three 16-channel blocks, the last partial.
+        (2, 3, 9, 7, 37, 3, 2, 1, 1),
+        // 1 x 1 maps through half-padded odd filters: only the centre tap reads the image (the centre-tap GEMM route).
+        (3, 20, 1, 1, 9, 3, 1, 1, 1), (2, 6, 1, 1, 5, 5, 1, 2, 1),
+        // 2 x 2 and 2 x 1 maps through a half-padded 3 x 3 filter: every output reads every input (the small-map GEMM).
+        (3, 7, 2, 2, 11, 3, 1, 1, 1), (2, 5, 2, 1, 6, 3, 1, 1, 1),
+        // The same at stride 2 into a 1 x 1 output (ResNet's last-stage downsampling 3 x 3 at a 32 x 32 input).
+        (2, 6, 2, 2, 7, 3, 2, 1, 1),
     };
 
     [SkippableFact]
@@ -441,20 +477,64 @@ public sealed class OpenClTunedKernelTests
             // Every candidate applies to these small shapes, so a variant that silently dropped out fails here --
             // except the three Winograd routes (F(2x2,3x3) unfused and fused, F(4x4,3x3)), which admit only 3x3 stride-1
             // undilated shapes (WinogradF23Pipeline), the split-K GEMM route, which admits only batch 1, and the batch-shared
-            // pointwise route, which admits only a 1x1 stride-1 unpadded convolution over a batch, through CLBlast.
+            // pointwise route, which admits only a 1x1 stride-1 unpadded convolution over a batch, through CLBlast, and
+            // its built-in form, which admits a 1x1 stride-1 unpadded convolution whose pixel count is a multiple of 4.
             bool pointwise = bt > 1 && k == 1 && s == 1 && p == 0 && OpenClBackend.IsClBlastAvailable;
+            bool pointwiseRb = k == 1 && s == 1 && p == 0 && oh * ow % 4 == 0;
+            // The small-channel direct route admits at most four input channels.
+            bool smallChannel = c <= 4;
+            // The centre-tap route admits a 1 x 1 input and output through an odd, undilated, half-padded filter.
+            bool centerTap = h == 1 && w == 1 && oh == 1 && ow == 1 && k % 2 == 1 && p == k / 2 && d == 1;
+            // The small-map GEMM admits a map of at most 2 x 2 (and more than one pixel) whose every output reads every
+            // input through a tap: stride 1, undilated, same-size output, h - 1 <= p <= k - h and likewise across.
+            bool smallMap = h <= 2 && w <= 2 && h * w > 1 && d == 1 && EveryPairOnATap(h, oh, s, p, k) && EveryPairOnATap(w, ow, s, p, k);
             Assert.Equal(backend.Conv2DForwardSlot.CandidateIds.Count, Applicable(backend.Conv2DForwardSlot, args.Shape()).Count
                 + (k > 7 ? 1 : 0) + (WinogradF23Pipeline.AdmitsShape(args.Shape()) ? 0 : 3) + (bt == 1 ? 0 : 1)
-                + (pointwise ? 0 : 1));
+                + (pointwise ? 0 : 1) + (pointwiseRb ? 0 : 1) + (smallChannel ? 0 : 1) + (centerTap ? 0 : 1) + (smallMap ? 0 : 1));
         }
     }
-    // The GEMM slot's candidates (the established route and the split-K GEMM) each against a double reference, on shapes
-    // that are not tile multiples, both candidates applying to every one.
+    // The GEMM slot's candidates (the established route, the split-K GEMM and the skinny GEMM) each against a double
+    // reference, on shapes that are not tile multiples. The skinny GEMM admits at most 32 rows over a multiple of 4
+    // columns: one row tile over four K sub-lanes, two over two, three (a lane idle) and four over K slices, a partial
+    // last column block.
+    private static bool EveryPairOnATap(int inSize, int outSize, int stride, int pad, int kernel)
+    {
+        for (int q = 0; q < inSize; q++)
+            for (int o = 0; o < outSize; o++)
+                if (q - o * stride + pad < 0 || q - o * stride + pad >= kernel) return false;
+        return true;
+    }
+
+    // The GEMM slot's default for a product it could not settle by measurement: split-K for a transformer's tall
+    // projections, the skinny GEMM for a deep linear layer over a small batch, the reference otherwise.
+    [Theory]
+    [InlineData(8320, 768, 192, "opencl.gemm.rb_splitk")]
+    [InlineData(8320, 192, 768, "opencl.gemm.rb_splitk")]
+    [InlineData(2080, 576, 192, "opencl.gemm.rb_splitk")]
+    [InlineData(1024, 1024, 1024, null)]
+    [InlineData(8320, 1024, 192, null)]
+    [InlineData(32, 4096, 4096, "opencl.gemm.skinny")]
+    [InlineData(8, 4096, 1024, "opencl.gemm.skinny")]
+    [InlineData(32, 4096, 512, null)]
+    [InlineData(32, 10, 4096, null)]
+    [InlineData(128, 4096, 4096, null)]
+    [InlineData(8320, 2048, 192, null)]
+    public void Gemm_UntunedPreference_FollowsTheMeasuredRegimes(int m, int n, int k, string? expected)
+    {
+        var preference = OpenClBackend.GemmUntunedPreference(m, n, k);
+        if (expected is null) Assert.Null(preference);
+        else Assert.Equal(expected, Assert.Single(preference ?? System.Array.Empty<string>()));
+    }
+
     [SkippableFact]
     public void Gemm_EveryCandidate_MatchesCpu()
     {
         using var backend = RequireBackend();
-        foreach (var (m, n, k) in new[] { (1, 7, 300), (65, 192, 192), (33, 70, 129), (130, 257, 64), (3, 5, 2000) })
+        foreach (var (m, n, k) in new[]
+        {
+            (1, 7, 300), (65, 192, 192), (33, 70, 129), (130, 257, 64), (3, 5, 2000),
+            (1, 12, 300), (9, 8, 64), (19, 1028, 700), (32, 260, 1500),
+        })
         {
             float[] a = Values(m * k, m + k), b = Values(k * n, n + 3);
             var expected = new float[m * n];
@@ -470,7 +550,8 @@ public sealed class OpenClTunedKernelTests
             using var cb = backend.AllocateBuffer(m * n);
             var args = new TunedGemmArgs(ab, bb, cb, m, n, k);
             var candidates = Applicable(backend.GemmSlot, args.Shape());
-            Assert.Equal(backend.GemmSlot.CandidateIds.Count, candidates.Count);
+            bool skinny = m <= 32 && n % 4 == 0;
+            Assert.Equal(backend.GemmSlot.CandidateIds.Count, candidates.Count + (skinny ? 0 : 1));
             foreach (var cand in candidates)
             {
                 cand.Execute(args);

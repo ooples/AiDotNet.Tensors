@@ -176,6 +176,10 @@ internal sealed class CompiledMlp
         }
     }
 
+    // The batch from which a layer's GEMM goes through BlasManaged rather than the cached-B route (RunLayerGemm).
+    private const int BlasManagedMinRows = 128;
+    private const int BlasManagedMaxSmallRows = 8;
+
     private static void RunLayerGemm(float[] src, float[] weight, float[] dst, int m, int k, int n)
     {
 #if NETCOREAPP
@@ -185,6 +189,16 @@ internal sealed class CompiledMlp
         if (Simd.JitGemmAvx2.TryMultiply(src.AsSpan(0, m * k), weight.AsSpan(0, k * n), dst.AsSpan(0, m * n), m, n, k))
             return;
 #endif
+        // From 128 rows, and up to 8, BlasManaged's dispatcher: the cached-B route took about twice as long there on a
+        // 16-core Ryzen (128 x 784 x 512: 389 against 169 us; a batch-1 MLP forward 0.088 against 0.043 ms; 8 x 784 x 512
+        // 41 against 31 us). In between the cached-B route wins (32 x 784 x 512: 56 against 277 us; 64 x 512 x 128: 25
+        // against 46).
+        if (m >= BlasManagedMinRows || m <= BlasManagedMaxSmallRows)
+        {
+            BlasManaged.BlasManaged.Gemm<float>(src.AsSpan(0, m * k), k, false, weight.AsSpan(0, k * n), n, false,
+                dst.AsSpan(0, m * n), n, m, n, k);
+            return;
+        }
         // Managed cached-B (prepacked, low dispatch overhead).
         SimdGemm.SgemmWithCachedB(src.AsSpan(0, m * k), weight, dst.AsSpan(0, m * n), m, k, n);
     }
