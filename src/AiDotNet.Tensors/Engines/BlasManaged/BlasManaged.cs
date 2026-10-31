@@ -540,29 +540,6 @@ public static partial class BlasManaged
     {
         if (m <= 0 || n <= 0 || k <= 0) return;
 
-        // A float product with fewer columns than one 8-wide vector block (an im2col convolution on a 2 x 2 or
-        // 1 x 1 map at batch 1: n = OH x OW): every column fell into GotoGemm's scalar tail, and VGG-11's 512-channel
-        // 2 x 2 layers made a batch-1 CPU forward 13 ms against PyTorch's 9.7. B (K x n) is small, so transpose it once
-        // and take the transposed-B route, whose kernel is a vectorized dot product along K per output.
-        if (typeof(T) == typeof(float) && !transA && !transB && n >= NarrowNTransposeMinN && n < NarrowNTransposeMaxN
-            && k >= NarrowNTransposeMinK
-            && m >= NarrowNTransposeMinM && options.PackedB is null && options.PackingMode == PackingMode.Auto)
-        {
-            T[] bT = System.Buffers.ArrayPool<T>.Shared.Rent(n * k);
-            try
-            {
-                for (int kk = 0; kk < k; kk++)
-                    for (int j = 0; j < n; j++)
-                        bT[j * k + kk] = b[kk * ldb + j];
-                GemmCore(a, lda, false, new ReadOnlySpan<T>(bT, 0, n * k), k, true, c, ldc, m, n, k, in options);
-            }
-            finally
-            {
-                System.Buffers.ArrayPool<T>.Shared.Return(bT);
-            }
-            return;
-        }
-
         // An explicitly activated evolutionary result owns the whole execution decision. Re-enter
         // once with a concrete packing mode and the exact measured axis/block/thread configuration,
         // which also prevents an earlier Auto-only JIT/GEMV/Goto shortcut from silently bypassing
@@ -591,6 +568,29 @@ public static partial class BlasManaged
                 BetaZero = options.BetaZero,
             };
             GemmCore(a, lda, transA, b, ldb, transB, c, ldc, m, n, k, in evolvedOptions);
+            return;
+        }
+
+        // A float product with fewer columns than one 8-wide vector block (an im2col convolution on a 2 x 2 or
+        // 1 x 1 map at batch 1: n = OH x OW): every column fell into GotoGemm's scalar tail, and VGG-11's 512-channel
+        // 2 x 2 layers made a batch-1 CPU forward 13 ms against PyTorch's 9.7. B (K x n) is small, so transpose it once
+        // and take the transposed-B route, whose kernel is a vectorized dot product along K per output.
+        if (typeof(T) == typeof(float) && !transA && !transB && n >= NarrowNTransposeMinN && n < NarrowNTransposeMaxN
+            && k >= NarrowNTransposeMinK
+            && m >= NarrowNTransposeMinM && options.PackedB is null && options.PackingMode == PackingMode.Auto)
+        {
+            T[] bT = System.Buffers.ArrayPool<T>.Shared.Rent(n * k);
+            try
+            {
+                for (int kk = 0; kk < k; kk++)
+                    for (int j = 0; j < n; j++)
+                        bT[j * k + kk] = b[kk * ldb + j];
+                GemmCore(a, lda, false, new ReadOnlySpan<T>(bT, 0, n * k), k, true, c, ldc, m, n, k, in options);
+            }
+            finally
+            {
+                System.Buffers.ArrayPool<T>.Shared.Return(bT);
+            }
             return;
         }
 
