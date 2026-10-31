@@ -7,7 +7,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     // shared WinogradF23Pipeline: the transforms below (emitted from WinogradF23KernelTemplate) around BatchedGemm.
     // Backward convolution gets a tuned slot here for the first time, with the direct kernels it always ran as the
     // reference, so Winograd is served only on the shape classes where it measures faster.
-    public sealed partial class OpenClBackend : IWinogradF23Transforms, IWinogradFusedFilterGradient
+    public sealed partial class OpenClBackend : IWinogradF23Transforms, IWinogradFusedFilterGradient, IWinogradForwardFilterCache
     {
         private TunedKernelSlot<TunedConv2DBackwardArgs>? _conv2DBackwardDataSlot, _conv2DBackwardFilterSlot;
 
@@ -145,7 +145,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (uCount > int.MaxValue || vCount > int.MaxValue || mCount > int.MaxValue) return false;
             int pi = (int)p;
             IGpuBuffer? owned = null;
-            IGpuBuffer u = GetCachedF43Filter(outC, inC) ?? (owned = AllocateBuffer((int)uCount));
+            IGpuBuffer u = GetCachedWinogradFilter(WinogradF43Points, outC, inC) ?? (owned = AllocateBuffer((int)uCount));
             using var v = AllocateBuffer((int)vCount);
             using var m = AllocateBuffer((int)mCount);
             try
@@ -155,7 +155,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     var filter = WinogradKernel(Kernels.WinogradF43Kernels.Filter, a.Kernel, owned);
                     filter.SetArg(2, outC); filter.SetArg(3, inC);
                     RunWinograd(filter, (long)outC * inC);
-                    if (StoreF43Filter(owned, outC, inC)) owned = null;
+                    if (StoreWinogradFilter(owned, WinogradF43Points, outC, inC)) owned = null;
                 }
 
                 var input = WinogradKernel(Kernels.WinogradF43Kernels.Input, a.Input, v);
@@ -180,9 +180,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             }
         }
 
-        // Transformed filters by weight identity (ConvWeightIdentity): inference reuses them, where every call
-        // re-transformed the weights (a 512x512 filter writes 37.7 MB of U: 0.3 ms of a 1.9 ms convolution). Bounded,
-        // since U is four times the weights; past the budget a convolution transforms into scratch as before.
+        // Transformed filters by weight identity (ConvWeightIdentity), F(4x4, 3x3) and F(2x2, 3x3) forward each in a table of
+        // its own: inference reuses them, where every call re-transformed the weights (a 512x512 filter writes 37.7 MB of
+        // U: 0.3 ms of a 1.9 ms convolution). Bounded, since U is up to four times the weights; past the budget a
+        // convolution transforms into scratch as before.
         // An eighth of device memory, at most 768 MiB: the buffer pool takes a quarter, and this cache is not drained on
         // out-of-memory (an entry goes only with its weights).
         private const long F43FilterCacheMaxBytes = 768L << 20;
@@ -190,6 +191,16 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private long F43FilterCacheBudgetBytes =>
             Math.Min(F43FilterCacheMaxBytes, GlobalMemoryBytes / F43FilterCacheMemoryDivisor);
         private readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, F43FilterEntry> _f43Filters = new();
+        private readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, F43FilterEntry> _f23Filters = new();
+
+        private System.Runtime.CompilerServices.ConditionalWeakTable<object, F43FilterEntry> WinogradFilterTable(int points)
+            => points == WinogradF43Points ? _f43Filters : _f23Filters;
+
+        IGpuBuffer? IWinogradForwardFilterCache.CachedForwardFilter(int points, int k, int c)
+            => GetCachedWinogradFilter(points, k, c);
+
+        bool IWinogradForwardFilterCache.StoreForwardFilter(IGpuBuffer u, int points, int k, int c)
+            => StoreWinogradFilter(u, points, k, c);
         private readonly object _f43FilterLock = new();
         private long _f43FilterBytes;
         // Buffers of entries whose weights were collected: freed by the next cache access, never on the finalizer thread.
@@ -218,13 +229,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             }
         }
 
-        private IGpuBuffer? GetCachedF43Filter(int outC, int inC)
+        private IGpuBuffer? GetCachedWinogradFilter(int points, int outC, int inC)
         {
             if (!ConvWeightIdentity.TryGet(out var key, out int version)) return null;
             lock (_f43FilterLock)
             {
                 DrainRetiredF43Filters();
-                if (_f43Filters.TryGetValue(key, out var entry) && entry.Version == version && entry.OutC == outC
+                if (WinogradFilterTable(points).TryGetValue(key, out var entry) && entry.Version == version && entry.OutC == outC
                     && entry.InC == inC)
                     return entry.U;
             }
@@ -255,23 +266,24 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
 
         // True when the cache took ownership of u.
-        private bool StoreF43Filter(IGpuBuffer u, int outC, int inC)
+        private bool StoreWinogradFilter(IGpuBuffer u, int points, int outC, int inC)
         {
             if (!ConvWeightIdentity.TryGet(out var key, out int version)) return false;
-            long bytes = (long)WinogradF43Points * outC * inC * sizeof(float);
+            long bytes = (long)points * outC * inC * sizeof(float);
+            var table = WinogradFilterTable(points);
             lock (_f43FilterLock)
             {
                 DrainRetiredF43Filters();
-                if (_f43Filters.TryGetValue(key, out var stale))
+                if (table.TryGetValue(key, out var stale))
                 {
-                    _f43Filters.Remove(key);
+                    table.Remove(key);
                     System.Threading.Interlocked.Add(ref _f43FilterBytes, -stale.Bytes);
                     GC.SuppressFinalize(stale);
                     stale.U.Dispose();
                 }
                 if (System.Threading.Interlocked.Read(ref _f43FilterBytes) + bytes > F43FilterCacheBudgetBytes) return false;
                 var added = new F43FilterEntry(this, u, version, outC, inC, bytes);
-                _f43Filters.Add(key, added);
+                table.Add(key, added);
                 _f43Live.Add(new WeakReference<F43FilterEntry>(added));
                 System.Threading.Interlocked.Add(ref _f43FilterBytes, bytes);
                 return true;
