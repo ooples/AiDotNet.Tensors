@@ -140,9 +140,9 @@ public sealed class TensorAddActivationTests
             var fallbacks = GpuLaunchProbe.Fallbacks;
             long launches = GpuLaunchProbe.Count;
 
-            AssertBitEqual(new CpuEngine().TensorAddActivation(a, b, FusedActivationType.ReLU), fused);
             Assert.Empty(fallbacks);
             Assert.Equal(1, launches);   // one fused kernel, not an add launch and a relu launch
+            AssertBitEqual(new CpuEngine().TensorAddActivation(a, b, FusedActivationType.ReLU), fused);
         }
     }
 }
