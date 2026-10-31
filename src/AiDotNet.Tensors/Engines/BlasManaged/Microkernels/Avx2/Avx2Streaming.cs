@@ -121,6 +121,88 @@ internal static class Avx2Streaming
         }
     }
 
+    /// <summary>The fewest rows <see cref="RunFp32NnBlocked"/> takes; fewer stream B row by row.</summary>
+    internal const int NnBlockedMinRows = 4;
+
+    // K depth and column width of the B tile the blocked path keeps in L1: 256 x 16 floats, 16 KB.
+    private const int NnBlockK = 256;
+    private const int NnBlockCols = 16;
+    private const int NnBlockRows = 4;
+
+    // C[m, n] += A[m, k] * B[k, n] (B row-major, n a multiple of 8): K in NnBlockK slices, then 16-column (or a last
+    // 8-column) blocks of B, then 4-row blocks of A, each a register tile of 4 rows x 2 vectors that starts from C and
+    // adds k in ascending order, so each output sees exactly the row loop's sequence of operations.
+    [MethodImpl(Hot)]
+    private static unsafe void RunFp32NnBlocked(
+        ReadOnlySpan<float> a, int lda, bool transA,
+        ReadOnlySpan<float> b, int ldb,
+        Span<float> c, int ldc,
+        int m, int n, int k)
+    {
+        fixed (float* aPtr = a)
+        fixed (float* bPtr = b)
+        fixed (float* cPtr = c)
+        {
+            for (int k0 = 0; k0 < k; k0 += NnBlockK)
+            {
+                int k1 = Math.Min(k, k0 + NnBlockK);
+                for (int j = 0; j < n; j += NnBlockCols)
+                {
+                    bool pair = j + NnBlockCols <= n;
+                    int i = 0;
+                    for (; i + NnBlockRows <= m; i += NnBlockRows)
+                    {
+                        float* c0 = cPtr + i * ldc + j, c1 = c0 + ldc, c2 = c1 + ldc, c3 = c2 + ldc;
+                        Vector256<float> r0a = Avx.LoadVector256(c0), r1a = Avx.LoadVector256(c1);
+                        Vector256<float> r2a = Avx.LoadVector256(c2), r3a = Avx.LoadVector256(c3);
+                        Vector256<float> r0b = default, r1b = default, r2b = default, r3b = default;
+                        if (pair)
+                        {
+                            r0b = Avx.LoadVector256(c0 + 8); r1b = Avx.LoadVector256(c1 + 8);
+                            r2b = Avx.LoadVector256(c2 + 8); r3b = Avx.LoadVector256(c3 + 8);
+                        }
+                        for (int kk = k0; kk < k1; kk++)
+                        {
+                            float* bRow = bPtr + kk * ldb + j;
+                            Vector256<float> bA = Avx.LoadVector256(bRow);
+                            Vector256<float> a0 = Vector256.Create(transA ? aPtr[kk * lda + i] : aPtr[i * lda + kk]);
+                            Vector256<float> a1 = Vector256.Create(transA ? aPtr[kk * lda + i + 1] : aPtr[(i + 1) * lda + kk]);
+                            Vector256<float> a2 = Vector256.Create(transA ? aPtr[kk * lda + i + 2] : aPtr[(i + 2) * lda + kk]);
+                            Vector256<float> a3 = Vector256.Create(transA ? aPtr[kk * lda + i + 3] : aPtr[(i + 3) * lda + kk]);
+                            r0a = Fma.MultiplyAdd(a0, bA, r0a); r1a = Fma.MultiplyAdd(a1, bA, r1a);
+                            r2a = Fma.MultiplyAdd(a2, bA, r2a); r3a = Fma.MultiplyAdd(a3, bA, r3a);
+                            if (pair)
+                            {
+                                Vector256<float> bB = Avx.LoadVector256(bRow + 8);
+                                r0b = Fma.MultiplyAdd(a0, bB, r0b); r1b = Fma.MultiplyAdd(a1, bB, r1b);
+                                r2b = Fma.MultiplyAdd(a2, bB, r2b); r3b = Fma.MultiplyAdd(a3, bB, r3b);
+                            }
+                        }
+                        Avx.Store(c0, r0a); Avx.Store(c1, r1a); Avx.Store(c2, r2a); Avx.Store(c3, r3a);
+                        if (pair)
+                        {
+                            Avx.Store(c0 + 8, r0b); Avx.Store(c1 + 8, r1b); Avx.Store(c2 + 8, r2b); Avx.Store(c3 + 8, r3b);
+                        }
+                    }
+                    for (; i < m; i++)
+                    {
+                        float* cr = cPtr + i * ldc + j;
+                        Vector256<float> ra = Avx.LoadVector256(cr);
+                        Vector256<float> rb = pair ? Avx.LoadVector256(cr + 8) : default;
+                        for (int kk = k0; kk < k1; kk++)
+                        {
+                            float* bRow = bPtr + kk * ldb + j;
+                            Vector256<float> av = Vector256.Create(transA ? aPtr[kk * lda + i] : aPtr[i * lda + kk]);
+                            ra = Fma.MultiplyAdd(av, Avx.LoadVector256(bRow), ra);
+                            if (pair) rb = Fma.MultiplyAdd(av, Avx.LoadVector256(bRow + 8), rb);
+                        }
+                        Avx.Store(cr, ra);
+                        if (pair) Avx.Store(cr + 8, rb);
+                    }
+                }
+            }
+        }
+    }
     /// <summary>
     /// FP32 mirror of <see cref="RunFp64"/>. Uses Vector256&lt;float&gt; (8 lanes).
     ///
@@ -158,6 +240,20 @@ internal static class Avx2Streaming
             // frame on an AVX2 box). Vectorize it as an 8-wide FMA dot product, 4 output
             // columns per inner pass so one A-row load feeds four B-row FMAs.
             RunFp32Nt(a, lda, b, ldb, c, ldc, m, n, k);
+            return;
+        }
+
+        // Several rows over B[K, N]: block K and N so a 256 x 16 tile of B stays in L1 while every 4-row block of A
+        // reuses it. Row by row below, each row streamed all of B again: a 32 x 4096 x 4096 product (VGG-11's classifier
+        // at batch 32) read its 67 MB of weights 32 times and took 98 ms. The 8-wide column blocks go here; the last
+        // n % 8 columns go through the row loop below. Bit-identical to it: every output still starts from C and adds its
+        // products in ascending k.
+        if (m >= NnBlockedMinRows && n >= Fp32ColumnTileWidth)
+        {
+            int n8 = n - n % Fp32ColumnTileWidth;
+            RunFp32NnBlocked(a, lda, transA, b, ldb, c, ldc, m, n8, k);
+            if (n8 == n) return;
+            RunFp32(a, lda, transA, b.Slice(n8), ldb, false, c.Slice(n8), ldc, m, n - n8, k);
             return;
         }
 
