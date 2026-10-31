@@ -1,6 +1,7 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
 
 using System;
+using System.Linq;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
@@ -59,6 +60,21 @@ public class EmptySliceTests
     /// the plan's gradient matches the tape's on every step.
     /// </summary>
     [Fact]
+    public void Slice_EmptyOnTheTape_GivesTheInputAZeroGradient()
+    {
+        var engine = new CpuEngine();
+        var x = new Tensor<float>(new float[] { 1, 2, 3, 4, 5, 6 }, new[] { 2, 3 });
+        using var tape = new GradientTape<float>();
+        var loss = engine.ReduceSum(engine.TensorSlice(x, new[] { 0, 3 }, new[] { 2, 0 }), null);
+
+        var grads = tape.ComputeGradients(loss, new[] { x });
+
+        Assert.True(grads.ContainsKey(x), "the empty slice was not recorded, so its input has no gradient");
+        Assert.Equal(new[] { 2, 3 }, grads[x]._shape);
+        Assert.All(grads[x].GetFlattenedData(), g => Assert.Equal(0f, g));
+    }
+
+    [Fact]
     public void CompiledTrainingPlan_WithAZeroWidthInput_MatchesTheTape()
     {
         var priorEngine = AiDotNetEngine.Current;
@@ -84,6 +100,8 @@ public class EmptySliceTests
             using (var scope = GraphMode.Enable())
             {
                 Forward(new CpuEngine());
+                // Both empty slices are graph nodes, not eager tensors the plan would bake in as constants.
+                Assert.Equal(2, scope.Nodes.OfType<LazyNode<float>>().Count(n => n.OpName == "TensorSlice"));
                 plan = scope.CompileTraining(new[] { a });
             }
             using (plan)

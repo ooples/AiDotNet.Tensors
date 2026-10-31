@@ -38233,7 +38233,19 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        if (emptySlice) return new Tensor<T>((int[])length.Clone());
+        if (emptySlice)
+        {
+            var empty = new Tensor<T>((int[])length.Clone());
+            // Recorded like any slice, so the input stays on the tape and its gradient is a zero tensor rather than
+            // missing. IsRecording honours a suspended tape and create-graph, as for the non-empty path below.
+            if (DifferentiableOps.IsRecording<T>())
+            {
+                DifferentiableOps.RecordUnary(
+                    "TensorSlice", empty, tensor, BackwardFunctions<T>.SliceBackward,
+                    new object[] { (int[])start.Clone() });
+            }
+            return empty;
+        }
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorSlice", tensor._shape); if (ac is not null) return ac.Execute(); }
 
@@ -38283,7 +38295,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// That is a valid slice wherever the start lies in [0, size] on that axis (x[:, n:n] in PyTorch and NumPy), even
     /// at the end of the axis. Concatenate's backward slices every input's gradient out of the output's, so a
     /// zero-width input (a GAN's conditional block over all-continuous data) depends on it. The result holds no element,
-    /// so it carries no gradient and is not recorded.
+    /// so its recorded backward hands the input a zero gradient.
     /// </summary>
     /// <exception cref="ArgumentOutOfRangeException">A length is negative, or an empty axis starts outside [0, size],
     /// or a non-empty axis of an empty box lies outside the tensor.</exception>

@@ -26,9 +26,38 @@ public class ResetToCpuGpuEngineTests
             AiDotNetEngine.Current = gpu;
             AiDotNetEngine.ResetToCpu();
             Assert.NotSame(gpu, AiDotNetEngine.Current);
+            // Vulkan's engine borrows its backend, so TensorAdd below can still succeed on a disposed engine.
+            Assert.False(gpu.IsDisposed);
 
             var a = new Tensor<float>(new float[] { 1, 2, 3, 4 }, new[] { 2, 2 });
             Assert.Equal(new float[] { 2, 4, 6, 8 }, gpu.TensorAdd(a, a).ToArray());
+        }
+        finally
+        {
+            AiDotNetEngine.Current = saved;
+        }
+    }
+
+    /// <summary>
+    /// The engine auto-detection adopted is parked by a reset, not disposed (an op on another thread may still hold
+    /// it), and the next auto-detection reinstalls that same engine instead of building a second CUDA context.
+    /// </summary>
+    [SkippableFact]
+    public void A_reset_parks_the_adopted_engine_and_the_next_adoption_reinstalls_it()
+    {
+        var saved = AiDotNetEngine.Current;
+        try
+        {
+            AiDotNetEngine.ResetToCpu();
+            Skip.IfNot(AiDotNetEngine.AutoDetectAndConfigureGpu(verbose: false), "No GPU was adopted");
+            var adopted = Assert.IsType<DirectGpuTensorEngine>(AiDotNetEngine.Current);
+
+            AiDotNetEngine.ResetToCpu();
+            Assert.IsType<CpuEngine>(AiDotNetEngine.Current);
+            Assert.False(adopted.IsDisposed);
+
+            Assert.True(AiDotNetEngine.AutoDetectAndConfigureGpu(verbose: false));
+            Assert.Same(adopted, AiDotNetEngine.Current);
         }
         finally
         {
