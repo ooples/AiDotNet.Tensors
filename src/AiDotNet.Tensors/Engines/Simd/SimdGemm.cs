@@ -705,8 +705,14 @@ internal static partial class SimdGemm
         int expectedMc = ChooseAdaptiveMc(m, k, n);
         var cached = GetOrBuildPrePackedB(b, k, n, m, expectedMc);
 
+        t_cachedBTiledCalls++;
         SgemmTiledWithCached(a, cached, c, m, k, n);
     }
+
+    [ThreadStatic] private static int t_cachedBTiledCalls;
+
+    /// <summary>How many SgemmWithCachedB calls on this thread reached the prepacked-B tiled path (tests: which route ran).</summary>
+    internal static int CachedBTiledCallsOnThisThread => t_cachedBTiledCalls;
 
     private static PrePackedB GetOrBuildPrePackedB(float[] b, int k, int n, int m, int expectedMc)
     {
@@ -1045,7 +1051,10 @@ internal static partial class SimdGemm
             && maxThreads > 1
             && numRowBlocks >= 1
             && (long)m * k * n >= ParallelWorkThreshold;
-        bool useParallel2D = canParallelize && cached.NumColSubBlocks >= 2;
+        // Row blocks alone are enough to split: a prepacked B with one column sub-block (a narrow output, as ViT's
+        // 192- and 768-wide feed-forward projections) ran the whole product on one thread however many rows it had,
+        // 71% of a ViT predict. The tile loop below handles a single column sub-block; the tiles stay disjoint.
+        bool useParallel2D = canParallelize && (cached.NumColSubBlocks >= 2 || numRowBlocks >= 2);
 
         int mcRounded = ((Mc + Mr - 1) / Mr) * Mr;
         int packedASizePerRow = mcRounded * Kc;
@@ -1198,6 +1207,53 @@ internal static partial class SimdGemm
         }
     }
 
+    /// <summary>Products up to this many FMAs take <see cref="SgemmTiledWithCachedOneDispatch"/>.</summary>
+    private const long CachedOneDispatchMaxWork = 32L * 1024 * 1024;
+
+    /// <summary>Below this many FMAs a prepacked-B product runs on the calling thread.</summary>
+    private const long CachedParallelMinWork = 512L * 1024;
+
+    [ThreadStatic] private static float[]? t_cachedTilePackedA;
+
+    /// <summary>
+    /// A small product against a prepacked B in one parallel dispatch: each (row block, column sub-block) tile packs
+    /// its own rows of A and runs every K panel itself, where the general path dispatched twice per K panel (pack A,
+    /// then compute). At batch-1 transformer sizes the dispatches cost more than the multiply. Each output still sums
+    /// the K panels in order, so the result is the general path's.
+    /// </summary>
+    private static unsafe void SgemmTiledWithCachedOneDispatch(
+        System.ReadOnlySpan<float> a, PrePackedB cached, System.Span<float> c, int m, int k, int n, int mc, int numRowBlocks)
+    {
+        int numColSubs = cached.NumColSubBlocks, colSubSize = cached.ColSubSize, numPc = cached.NumPcIters;
+        int nc = System.Math.Min(Nc, n);
+        int packedSize = ((mc + Mr - 1) / Mr) * Mr * Kc;
+        var subs = cached.PackedSubs;
+        fixed (float* aPtr = a)
+        fixed (float* cPtr = c)
+        {
+            float* ap = aPtr, cp = cPtr;
+            int aLen = a.Length, cLen = c.Length;
+            Helpers.CpuParallelSettings.LightweightParallel(numRowBlocks * numColSubs, tile =>
+            {
+                int r = tile / numColSubs, cs = tile % numColSubs;
+                int ic = r * mc, mcLocal = System.Math.Min(mc, m - ic);
+                int jStart = cs * colSubSize;
+                int subNc = cs == numColSubs - 1 ? nc - jStart : colSubSize;
+                if (mcLocal <= 0 || subNc <= 0) return;
+                var packedA = t_cachedTilePackedA;
+                if (packedA is null || packedA.Length < packedSize) t_cachedTilePackedA = packedA = new float[packedSize];
+                var aSpan = new System.ReadOnlySpan<float>(ap, aLen);
+                var cSpan = new System.Span<float>(cp, cLen);
+                for (int p = 0; p < numPc; p++)
+                {
+                    int pc = p * Kc, kc = System.Math.Min(Kc, k - pc);
+                    PackA(aSpan, packedA, k, ic, mcLocal, pc, kc);
+                    MacroKernel(packedA, subs[p * numColSubs + cs], cSpan, mcLocal, subNc, kc, n, ic, jStart);
+                }
+            });
+        }
+    }
+
     /// <summary>
     /// Tiled SGEMM using a pre-packed B. Mirrors SgemmTiled's jc/pc outer
     /// loop but reuses <see cref="PrePackedB.PackedSubs"/> instead of
@@ -1217,9 +1273,32 @@ internal static partial class SimdGemm
         bool canParallelize = UseParallelGemm
             && maxThreads > 1
             && numRowBlocks >= 1
-            && (long)m * k * n >= ParallelWorkThreshold;
-        bool useParallel2D = canParallelize && cached.NumColSubBlocks >= 2;
+            // Lower than the general threshold: a small product here is one dispatch (SgemmTiledWithCachedOneDispatch).
+            && (long)m * k * n >= CachedParallelMinWork;
+        // Too few tiles for the threads: split the rows finer. A narrow output has few column sub-blocks (3 at n = 192),
+        // so a batch-1 ViT's [65, 768] x [768, 192] projection ran on 3 threads: 182 us against PyTorch's 66. B's
+        // packing does not depend on the row-block height, and each output still sums K in the same order, so the
+        // result is unchanged.
+        if (canParallelize && numRowBlocks * cached.NumColSubBlocks < maxThreads)
+        {
+            int rowBlocksWanted = (maxThreads + cached.NumColSubBlocks - 1) / cached.NumColSubBlocks;
+            int splitMc = Math.Max(2 * Mr, ((m + rowBlocksWanted - 1) / rowBlocksWanted + Mr - 1) / Mr * Mr);
+            if (splitMc < Mc)
+            {
+                Mc = splitMc;
+                numRowBlocks = (m + Mc - 1) / Mc;
+            }
+        }
+        // Row blocks alone are enough to split: a prepacked B with one column sub-block (a narrow output, as ViT's
+        // 192- and 768-wide feed-forward projections) ran the whole product on one thread however many rows it had,
+        // 71% of a ViT predict. The tile loop below handles a single column sub-block; the tiles stay disjoint.
+        bool useParallel2D = canParallelize && (cached.NumColSubBlocks >= 2 || numRowBlocks >= 2);
 
+        if (useParallel2D && (long)m * k * n <= CachedOneDispatchMaxWork)
+        {
+            SgemmTiledWithCachedOneDispatch(a, cached, c, m, k, n, Mc, numRowBlocks);
+            return;
+        }
         int mcRounded = ((Mc + Mr - 1) / Mr) * Mr;
         int packedASizePerRow = mcRounded * Kc;
         float[] packedABuf = useParallel2D
@@ -1545,6 +1624,181 @@ internal static partial class SimdGemm
         c.Clear();
         SgemmAddInternal(a, k, false, b, n, false, c, m, k, n, allowParallel: false, clearedOutput: true);
     }
+
+#if NET5_0_OR_GREATER
+    // The packing kernels these share are .NET 5+ only.
+    /// <summary>
+    /// Whether <see cref="SgemmSharedA"/> beats one <see cref="SgemmSequential"/> per pair: when the per-pair GEMM
+    /// would pack A (it misses the unpacked direct kernel), since that packing is what sharing saves. Where the direct
+    /// kernel applies it won, e.g. b128 [960,160]x[160,16] 0.82 ms against 0.97 shared; [320,960]x[960,16] took
+    /// 1.77 ms shared against 3.42 per pair.
+    /// </summary>
+    internal static bool PrefersSharedA(int m, int k, int n)
+        => n <= Nc && !(n >= Nr && n % 8 == 0 && k <= SmallMatmulKThreshold && (long)m * k * n <= SmallMatmulWorkThreshold);
+
+    /// <summary>Column-tile width of <see cref="SgemmSharedAColumns"/>: four micro-kernel panels.</summary>
+    private const int SharedAColumnTile = 4 * Nr;
+
+    /// <summary>
+    /// A 1x1 convolution over small maps as one GEMM across the batch: out[b, o, p] = sum_i A[o, i] * x[b, i, p], with
+    /// the batch's (image, pixel) pairs as one run of <c>count * hw</c> columns. Per image there are only hw columns
+    /// (1 at 1x1, 4 at 2x2), so a per-image GEMM filled 1/16 or 1/4 of each 16-wide micro-tile. A and every column tile
+    /// of the input are packed once, in parallel; then each (column tile, row block) task runs the micro-kernels into a
+    /// private tile and scatters it to the images' outputs. Every output is summed by one task in one order, so the
+    /// result does not depend on the thread count.
+    /// </summary>
+    internal static void SgemmSharedAColumns(
+        float[] a, int aOffset, float[] x, int xOffset, int xImageStride, float[] c, int cOffset, int cImageStride,
+        int m, int k, int hw, int count)
+    {
+        int columns = count * hw;
+        int tiles = (columns + SharedAColumnTile - 1) / SharedAColumnTile;
+        int depthBlocks = (k + Kc - 1) / Kc;
+        // Enough row blocks that tiles x row blocks keeps every thread busy, each still several micro-panels tall.
+        int wantedTasks = 2 * Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism);
+        int rowBlocksWanted = Math.Max(1, (wantedTasks + tiles - 1) / tiles);
+        int mc = Math.Min(SmallMc, Math.Max(4 * Mr, (((m + rowBlocksWanted - 1) / rowBlocksWanted + Mr - 1) / Mr) * Mr));
+        int rowBlocks = (m + mc - 1) / mc;
+
+        var packedA = new float[depthBlocks * rowBlocks][];
+        var packedX = new float[depthBlocks * tiles][];
+        var aSource = new ReadOnlyMemory<float>(a, aOffset, m * k);
+        try
+        {
+            // PackA pads a block to whole Mr-row panels (SmallMc is not a multiple of Mr).
+            for (int i = 0; i < packedA.Length; i++) packedA[i] = ArrayPool<float>.Shared.Rent((mc + Mr - 1) / Mr * Mr * Kc);
+            for (int i = 0; i < packedX.Length; i++) packedX[i] = ArrayPool<float>.Shared.Rent(Kc * SharedAColumnTile);
+            Helpers.CpuParallelSettings.ParallelForOrSerial(0, packedA.Length + packedX.Length, (long)(m + columns) * k, job =>
+            {
+                if (job < packedA.Length)
+                {
+                    int pc = (job / rowBlocks) * Kc, ic = (job % rowBlocks) * mc;
+                    PackA(aSource.Span, packedA[job], k, false, ic, Math.Min(mc, m - ic), pc, Math.Min(Kc, k - pc));
+                }
+                else
+                {
+                    int block = job - packedA.Length;
+                    int pBlock = block / tiles, tile = block % tiles;
+                    PackColumnTile(x, xOffset, xImageStride, hw, pBlock * Kc, Math.Min(Kc, k - pBlock * Kc),
+                        tile * SharedAColumnTile, Math.Min(SharedAColumnTile, columns - tile * SharedAColumnTile),
+                        packedX[block]);
+                }
+            }, deterministicSafe: true);
+
+            Helpers.CpuParallelSettings.ParallelForOrSerial(0, tiles * rowBlocks, 2L * m * k * columns, task =>
+            {
+                int tile = task / rowBlocks, rBlock = task % rowBlocks;
+                int col0 = tile * SharedAColumnTile, cols = Math.Min(SharedAColumnTile, columns - col0);
+                int ic = rBlock * mc, rows = Math.Min(mc, m - ic);
+                var local = t_sharedAColumnTile;
+                if (local is null || local.Length < SmallMc * SharedAColumnTile)
+                    t_sharedAColumnTile = local = new float[SmallMc * SharedAColumnTile];
+                var tileSpan = new Span<float>(local, 0, rows * cols);
+                tileSpan.Clear();
+                for (int pBlock = 0; pBlock < depthBlocks; pBlock++)
+                    MacroKernel(packedA[pBlock * rowBlocks + rBlock], packedX[pBlock * tiles + tile], tileSpan,
+                        rows, cols, Math.Min(Kc, k - pBlock * Kc), cols, 0, 0);
+                for (int j = 0; j < cols; j++)
+                {
+                    int column = col0 + j, image = column / hw, pixel = column - image * hw;
+                    int dst = cOffset + image * cImageStride + ic * hw + pixel;
+                    for (int r = 0; r < rows; r++) c[dst + r * hw] = local[r * cols + j];
+                }
+            }, deterministicSafe: true);
+        }
+        finally
+        {
+            foreach (var block in packedA) if (block is not null) ArrayPool<float>.Shared.Return(block);
+            foreach (var block in packedX) if (block is not null) ArrayPool<float>.Shared.Return(block);
+        }
+    }
+
+    [ThreadStatic] private static float[]? t_sharedAColumnTile;
+
+    /// <summary>
+    /// Packs input rows [pc, pc + kc) of columns [col0, col0 + cols) of the batch-as-columns view (column = image * hw +
+    /// pixel) into the micro-kernel's B layout: Nr-wide panels, each kc x Nr, columns past the end zero.
+    /// </summary>
+    private static void PackColumnTile(float[] x, int xOffset, int xImageStride, int hw, int pc, int kc, int col0,
+        int cols, float[] packed)
+    {
+        Span<int> source = stackalloc int[Nr];
+        int panels = (cols + Nr - 1) / Nr;
+        for (int panel = 0; panel < panels; panel++)
+        {
+            int width = Math.Min(Nr, cols - panel * Nr);
+            for (int j = 0; j < width; j++)
+            {
+                int column = col0 + panel * Nr + j, image = column / hw;
+                source[j] = xOffset + image * xImageStride + (column - image * hw) + pc * hw;
+            }
+            int baseIndex = panel * kc * Nr;
+            for (int kk = 0; kk < kc; kk++)
+            {
+                int row = baseIndex + kk * Nr, step = kk * hw;
+                for (int j = 0; j < width; j++) packed[row + j] = x[source[j] + step];
+                for (int j = width; j < Nr; j++) packed[row + j] = 0f;
+            }
+        }
+    }
+
+    // Per-thread packing buffer for one pair's B panel.
+    [ThreadStatic] private static float[]? t_sharedAPackedB;
+
+    /// <summary>
+    /// Computes C_i = A · B_i for <paramref name="count"/> independent [k, n] / [m, n] pairs that share one [m, k] A,
+    /// as a 1x1 convolution does with its weight over a batch of images. A is packed once, not once per pair: with a
+    /// small n (a 4x4 or 8x8 map) repacking the weight for every image cost more than the multiply. Pairs run in
+    /// parallel, each written by one sequential pass in a fixed order, so the result does not depend on the thread
+    /// count and matches <see cref="SgemmSequential"/> on each pair.
+    /// </summary>
+    internal static void SgemmSharedA(
+        float[] a, int aOffset, float[] b, int bOffset, int bStride, float[] c, int cOffset, int cStride,
+        int m, int k, int n, int count)
+    {
+        if (n > Nc) throw new ArgumentOutOfRangeException(nameof(n), $"n must be at most {Nc}.");
+        int mc0 = SmallMc;
+        int rowBlocks = (m + mc0 - 1) / mc0, depthBlocks = (k + Kc - 1) / Kc;
+        int packedASize = ((mc0 + Mr - 1) / Mr) * Mr * Kc;
+        var packedA = new float[rowBlocks * depthBlocks][];
+        var aSpanSource = new ReadOnlyMemory<float>(a, aOffset, m * k);
+        try
+        {
+            for (int i = 0; i < packedA.Length; i++) packedA[i] = ArrayPool<float>.Shared.Rent(packedASize);
+            Helpers.CpuParallelSettings.ParallelForOrSerial(0, packedA.Length, (long)m * k, block =>
+            {
+                int pc = (block / rowBlocks) * Kc, ic = (block % rowBlocks) * mc0;
+                PackA(aSpanSource.Span, packedA[block], k, false, ic, Math.Min(mc0, m - ic), pc, Math.Min(Kc, k - pc));
+            }, deterministicSafe: true);
+
+            int packedBSize = Math.Min(Kc, k) * (((n + Nr - 1) / Nr) * Nr);   // one panel: at most Kc deep
+            Helpers.CpuParallelSettings.ParallelForOrSerial(0, count, 2L * count * m * k * n, pair =>
+            {
+                var packedB = t_sharedAPackedB;
+                if (packedB is null || packedB.Length < packedBSize) t_sharedAPackedB = packedB = new float[packedBSize];
+                var bPair = new ReadOnlySpan<float>(b, bOffset + pair * bStride, k * n);
+                var cPair = new Span<float>(c, cOffset + pair * cStride, m * n);
+                cPair.Clear();
+                for (int pBlock = 0; pBlock < depthBlocks; pBlock++)
+                {
+                    int pc = pBlock * Kc, kc = Math.Min(Kc, k - pc);
+                    PackB(bPair, packedB, n, false, pc, kc, 0, n);
+                    for (int rBlock = 0; rBlock < rowBlocks; rBlock++)
+                    {
+                        int ic = rBlock * mc0;
+                        MacroKernel(packedA[pBlock * rowBlocks + rBlock], packedB, cPair, Math.Min(mc0, m - ic), n, kc, n, ic, 0);
+                    }
+                }
+            }, deterministicSafe: true);
+        }
+        finally
+        {
+            foreach (var block in packedA)
+                if (block is not null) ArrayPool<float>.Shared.Return(block);
+        }
+    }
+
+#endif
 
     /// <summary>Sequential recurrent projection with a write-first direct kernel.
     /// Only the store-only route skips clearing; other shapes retain normal dispatch.</summary>

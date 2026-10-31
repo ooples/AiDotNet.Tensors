@@ -532,9 +532,22 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
                 var optimizerProgram = CompileOrLoadCached(Kernels.OptimizerKernels.GetSource(), optimizationFlags, "Optimizer kernels");
                 _programs.Add(optimizerProgram);
+                var finiteGuardNames = new HashSet<string>(Kernels.OptimizerKernels.GetFiniteGuardKernelNames(), StringComparer.Ordinal);
                 foreach (var name in Kernels.OptimizerKernels.GetKernelNames())
                 {
+                    if (finiteGuardNames.Contains(name)) continue;   // registered once, from the NaN-preserving build below
                     _kernelCache[name] = new DirectOpenClKernel(_context, optimizerProgram, name);
+                }
+                // The global-norm clip and the device finiteness guard exist to see NaN and infinity, which
+                // -cl-finite-math-only lets the compiler assume away (the bit tests and comparisons folded: a NaN element
+                // left the guard finite and a NaN norm gave a clip scale of 0). They come from the same source built with
+                // NaN-preserving flags; every update kernel keeps the aggressive build.
+                var finiteGuardProgram = CompileOrLoadCached(Kernels.OptimizerKernels.GetSource(), OpenClBuildOptions.SafeMathFlags,
+                    "Optimizer finiteness-guard kernels");
+                _programs.Add(finiteGuardProgram);
+                foreach (var name in finiteGuardNames)
+                {
+                    _kernelCache[name] = new DirectOpenClKernel(_context, finiteGuardProgram, name);
                 }
 
                 // Compile mixed precision kernels only if device actually supports FP16
@@ -1172,6 +1185,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                         $"[AiDotNet.Tensors][OpenCL] Parity-211 linalg kernels failed to compile; " +
                         $"routing to CPU. Reason: {ex.Message}");
                 }
+
+                // The modules an op used to compile on its first call are built here, so every kernel this backend
+                // looks up is in the cache once it is constructed (KernelLookupIntegrityTests). Each records itself as
+                // unavailable when it fails to compile, and its ops then decline to the general path.
+                SumAroundKeptReady();
+                ConvGemmEpilogueReady();
+                ShortAttentionReady();
+                StatisticConversionsReady();
+                RowMlpReady();
             }
             catch (Exception ex)
             {
@@ -2854,6 +2876,23 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (TryExecuteRowVectorGemv(A, B, C, M, N, K, alpha, beta))
                 return;
 
+            // A few outputs over a long K (a classifier head: 32 x 10 x 4096) gave a tiled GEMM a handful of work groups
+            // each walking all of K: CLBlast's direct kernel took ~490 us on gfx1012 for 2.6 MFLOP. The register-blocked
+            // split-K GEMM spreads K over the device.
+            // alpha and beta are exactly the defaults (constant patterns: an exact compare, which is the intent here).
+            if (alpha is 1f && beta is 0f && K >= 1024 && (long)((M + 63) / 64) * ((N + 63) / 64) <= 4
+                && HasTunedKernel(Kernels.BatchedGemmKernels.Rb64SplitK) && HasTunedKernel(Kernels.BatchedGemmKernels.SplitKReduce))
+            {
+                RbSplitKGemm(A, B, C, M, N, K);
+                RecordGemmDispatch(OpenClGemmDispatchPath.BuiltInKernel);
+                return;
+            }
+
+            // Per shape, the faster of this established route and the split-K GEMM (OpenClBackend.TunedGemm). Not while
+            // offline tuning runs: that measures the route below.
+            if (!offlineEnabled && TryTunedGemm(A, B, C, M, N, K, alpha, beta))
+                return;
+
             // A deployment reaches this slot only after the first-party experiment scaffold has
             // compiled it, compared its output with the independent CPU oracle, and applied the
             // paired finalist gate. Give that exact typed deployment priority over generic vendor
@@ -3176,44 +3215,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         #region Fused Operations
 
         public IGpuBuffer GemmBiasRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-        {
-            IGpuBuffer? temp = null;
-            IGpuBuffer? output = null;
-            try
-            {
-                temp = GemmBias(A, B, bias, M, N, K);
-                output = AllocateBuffer(M * N);
-                Relu(temp, output, M * N);
-                temp.Dispose();
-                return output;
-            }
-            catch
-            {
-                output?.Dispose();
-                temp?.Dispose();
-                throw;
-            }
-        }
+            => GemmBiasActivation(A, B, bias, M, N, K, mode: 1);
 
         public IGpuBuffer GemmBiasGelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-        {
-            IGpuBuffer? temp = null;
-            IGpuBuffer? output = null;
-            try
-            {
-                temp = GemmBias(A, B, bias, M, N, K);
-                output = AllocateBuffer(M * N);
-                Gelu(temp, output, M * N);
-                temp.Dispose();
-                return output;
-            }
-            catch
-            {
-                output?.Dispose();
-                temp?.Dispose();
-                throw;
-            }
-        }
+            => GemmBiasActivation(A, B, bias, M, N, K, mode: 2);
 
         /// <summary>
         /// Paged-attention decode for a single query token (P1): out[heads*headDim] =
@@ -3561,54 +3566,34 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
 
         public IGpuBuffer GemmBiasSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-        {
-            IGpuBuffer? temp = null;
-            IGpuBuffer? output = null;
-            try
-            {
-                temp = GemmBias(A, B, bias, M, N, K);
-                output = AllocateBuffer(M * N);
-                Sigmoid(temp, output, M * N);
-                temp.Dispose();
-                return output;
-            }
-            catch
-            {
-                output?.Dispose();
-                temp?.Dispose();
-                throw;
-            }
-        }
+            => GemmBiasActivation(A, B, bias, M, N, K, mode: 3);
 
         public IGpuBuffer GemmBiasTanh(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-        {
-            IGpuBuffer? temp = null;
-            IGpuBuffer? output = null;
-            try
-            {
-                temp = GemmBias(A, B, bias, M, N, K);
-                output = AllocateBuffer(M * N);
-                Tanh(temp, output, M * N);
-                temp.Dispose();
-                return output;
-            }
-            catch
-            {
-                output?.Dispose();
-                temp?.Dispose();
-                throw;
-            }
-        }
+            => GemmBiasActivation(A, B, bias, M, N, K, mode: 4);
 
-        public IGpuBuffer GemmBias(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
+// A dense layer's forward: C = act(A * B + bias) as the GEMM into C, then one in-place pass (bias_activation) for
+        // the bias and the activation. Each GemmBias* used to run the GEMM, a bias_add pass into C, and the activation
+        // into a second buffer: two more passes over the output and a temporary the size of it. mode is bias_activation's.
+        private IGpuBuffer GemmBiasActivation(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K, int mode,
+            float alpha = 0f)
         {
-            // Use optimized GEMM path (CLBlast/DynamicGemm) + separate bias add
-            // instead of the slow 16x16 fused kernel
             var C = AllocateBuffer(M * N);
             try
             {
+                // Batch 1: the split-K GEMV applies the epilogue in its reduce, one launch fewer and no second pass.
+                if (TryExecuteRowVectorGemv(A, B, C, M, N, K, 1f, 0f, bias, mode, alpha))
+                    return C;
                 Gemm(A, B, C, M, N, K);
-                BiasAdd(C, bias, C, M, N);
+                var kernel = _kernelCache["bias_activation"];
+                kernel.SetArg(0, BufferHandle(C));
+                kernel.SetArg(1, BufferHandle(bias));
+                kernel.SetArg(2, M);
+                kernel.SetArg(3, N);
+                kernel.SetArg(4, mode);
+                kernel.SetArg(5, alpha);
+                int total = M * N;
+                int local = (int)Math.Min(256UL, Math.Max(1UL, _maxWorkGroupSize));
+                kernel.Execute1D((total + local - 1) / local * local, local);
                 return C;
             }
             catch
@@ -3618,45 +3603,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             }
         }
 
+        public IGpuBuffer GemmBias(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
+            => GemmBiasActivation(A, B, bias, M, N, K, mode: 0);
+
         public IGpuBuffer GemmBiasSwish(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-        {
-            IGpuBuffer? temp = null;
-            IGpuBuffer? output = null;
-            try
-            {
-                temp = GemmBias(A, B, bias, M, N, K);
-                output = AllocateBuffer(M * N);
-                Silu(temp, output, M * N);
-                temp.Dispose();
-                return output;
-            }
-            catch
-            {
-                output?.Dispose();
-                temp?.Dispose();
-                throw;
-            }
-        }
+            => GemmBiasActivation(A, B, bias, M, N, K, mode: 5);
 
         public IGpuBuffer GemmBiasLeakyRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K, float alpha = 0.01f)
-        {
-            IGpuBuffer? temp = null;
-            IGpuBuffer? output = null;
-            try
-            {
-                temp = GemmBias(A, B, bias, M, N, K);
-                output = AllocateBuffer(M * N);
-                LeakyRelu(temp, output, alpha, M * N);
-                temp.Dispose();
-                return output;
-            }
-            catch
-            {
-                output?.Dispose();
-                temp?.Dispose();
-                throw;
-            }
-        }
+            => GemmBiasActivation(A, B, bias, M, N, K, mode: 6, alpha);
 
         /// <summary>
         /// The fused GEMM kernels stage 16 x 16 tiles in local memory and read every tile element, so the work-group
@@ -5331,23 +5285,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (_context == null)
                 throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
-            // Softmax is row-wise; it can't fuse into the pointwise GEMM epilogue (used to throw here).
-            // GEMM+bias then a per-row softmax over [M, N]. GemmBias + softmax run on the backend's
-            // default command queue, not `stream`, so drain the caller's stream first (prior writes to
-            // A/B/bias complete before GemmBias reads them), then Finish so the result in `output` is
-            // ready on return — a subsequent SynchronizeStream(stream) is then a safe no-op.
             if (activation == FusedActivationType.Softmax)
             {
-                SynchronizeStream(stream);
-                var gemmBias = GemmBias(A, B, bias, M, N, K);
-                try
-                {
-                    Softmax(gemmBias, output, M, N);
-                }
-                finally
-                {
-                    gemmBias.Dispose();   // release the temp even if Softmax throws
-                }
+                FusedGemmBiasRowSoftmax(A, B, bias, output, M, N, K, stream);
                 return;
             }
 
@@ -5379,6 +5319,23 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             var (globalX, globalY, tile) = FusedGemmLaunchShape(M, N);
             kernel.Execute2DOnQueue(stream.Handle, globalX, globalY, tile, tile);
+        }
+
+        /// <summary>
+        /// GEMM + bias followed by a softmax over each of the <paramref name="M"/> rows of length <paramref name="N"/>.
+        /// A softmax reads its whole row, so it has no per-element GEMM epilogue: the affine part is the plain
+        /// <c>gemm_bias</c> launch on the caller's <paramref name="stream"/>, into scratch logits. The row softmax
+        /// kernel runs on the backend queue, so the caller's queue is drained before it and the backend queue after
+        /// it; the result is complete in <paramref name="output"/> on return.
+        /// </summary>
+        private void FusedGemmBiasRowSoftmax(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, IGpuBuffer output,
+            int M, int N, int K, IGpuStream stream)
+        {
+            using var logits = AllocateBuffer(M * N);
+            FusedGemmBiasActivationAsync(A, B, bias, logits, M, N, K, FusedActivationType.None, stream);
+            SynchronizeStream(stream);
+            Softmax(logits, output, M, N);
+            Synchronize();
         }
 
         /// <inheritdoc/>
@@ -6188,11 +6145,16 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         // C[1 x N] = alpha * A[1 x K] * B[K x N] through the split-K GEMV kernels. VGG-16's 25088 x 4096 classifier
         // took 4.7 ms through the tiled GEMM; its weights are 411 MB, so the bandwidth floor is under 2 ms. False (nothing
         // launched) unless M is 1, beta is 0, N is a multiple of 4 (vload4 alignment) and the kernels compiled.
-        private bool TryExecuteRowVectorGemv(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha, float beta)
+        // With epilogueBias, C = act(A * B + bias) in the reduce (alpha is then 1): epilogueMode is bias_activation's, and
+        // only 0, 1 and 6 are taken (see gemv_rowvec_reduce_epilogue).
+        private bool TryExecuteRowVectorGemv(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha, float beta,
+            IGpuBuffer? epilogueBias = null, int epilogueMode = 0, float epilogueSlope = 0f)
         {
+            string reduceName = epilogueBias is null ? Kernels.GemvKernels.Reduce : Kernels.GemvKernels.ReduceEpilogue;
             if (M != 1 || beta != 0f || N < 4 || (N & 3) != 0 || K < 256
+                || (epilogueBias is not null && (alpha != 1f || epilogueMode is not (0 or 1 or 6)))
                 || !_kernelCache.TryGetValue(Kernels.GemvKernels.Partial, out var partialKernel)
-                || !_kernelCache.TryGetValue(Kernels.GemvKernels.Reduce, out var reduceKernel))
+                || !_kernelCache.TryGetValue(reduceName, out var reduceKernel))
                 return false;
 
             // About 64K work items in flight: enough to cover the device's memory latency at any N.
@@ -6210,15 +6172,26 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             arg = 0;
             reduceKernel.SetArg(arg++, BufferHandle(partial)); reduceKernel.SetArg(arg++, BufferHandle(C));
-            reduceKernel.SetArg(arg++, N); reduceKernel.SetArg(arg++, splits); reduceKernel.SetArg(arg++, alpha);
+            reduceKernel.SetArg(arg++, N); reduceKernel.SetArg(arg++, splits);
+            if (epilogueBias is null)
+            {
+                reduceKernel.SetArg(arg, alpha);
+            }
+            else
+            {
+                reduceKernel.SetArg(arg++, BufferHandle(epilogueBias));
+                reduceKernel.SetArg(arg++, epilogueMode);
+                reduceKernel.SetArg(arg, epilogueSlope);
+            }
             reduceKernel.Execute1D(RoundUpToMultiple(N, 64), 64);
             return true;
         }
 
         // C[b] = alpha * A[b] * B[b] + beta * C[b] for each b, over row-major batches laid end to end (A[b] at b*M*K, B[b] at
         // b*K*N, C[b] at b*M*N), as one CLBlast strided-batched SGEMM.
+        // strideA: elements between consecutive A matrices, M * K when negative; 0 shares one A across the batch.
         private bool TryExecuteClBlastBatchedGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, int batchCount,
-            float alpha, float beta)
+            float alpha, float beta, long strideA = -1)
         {
             if (_context == null || !ClBlastNative.IsAvailable || K <= 0 || beta != 0f)
                 return false;
@@ -6249,7 +6222,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                             ClBlastNative.Transpose.No,
                             (UIntPtr)M, (UIntPtr)N, (UIntPtr)K,
                             alpha,
-                            bufferA.Handle, UIntPtr.Zero, (UIntPtr)K, (UIntPtr)((long)M * K),
+                            bufferA.Handle, UIntPtr.Zero, (UIntPtr)K, (UIntPtr)(strideA < 0 ? (long)M * K : strideA),
                             bufferB.Handle, UIntPtr.Zero, (UIntPtr)N, (UIntPtr)((long)K * N),
                             beta,
                             bufferC.Handle, UIntPtr.Zero, (UIntPtr)N, (UIntPtr)((long)M * N),
@@ -8628,7 +8601,7 @@ KERNEL VARIANTS (A/B testing):
             // layers: 0.59 ms vs 0.19 ms for an element-wise pass over a [1,256,56,56] activation).
             // Neither route writes saveMean/saveInvVar in inference.
             if (!training && TryLaunchBatchNormInference(input, output, gamma, beta, runningMean, runningVar, batch,
-                    channels, spatialSize, epsilon, relu: false))
+                    channels, spatialSize, epsilon, activation: 0))
                 return;
 
             var k = _kernelCache["batchnorm_forward"];
@@ -8659,10 +8632,31 @@ KERNEL VARIANTS (A/B testing):
         // batchnorm_inference: one work item per element, the running statistics, ReLU when relu is set. False (nothing
         // launched) when the kernel did not compile or the element count does not fit an int.
         private bool TryLaunchBatchNormInference(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
-            IGpuBuffer runningMean, IGpuBuffer runningVar, int batch, int channels, int spatialSize, float epsilon, bool relu)
+            IGpuBuffer runningMean, IGpuBuffer runningVar, int batch, int channels, int spatialSize, float epsilon, int activation)
         {
             long total = (long)batch * channels * spatialSize;
-            if (total <= 0 || total > int.MaxValue || !_kernelCache.TryGetValue("batchnorm_inference", out var kernel))
+            if (total <= 0 || total > int.MaxValue) return false;
+            // Four elements of one channel plane per work item where the plane splits into whole float4s.
+            if ((spatialSize & 3) == 0 && (long)batch * channels <= int.MaxValue
+                && _kernelCache.TryGetValue("batchnorm_inference4", out var kernel4))
+            {
+                uint a4 = 0;
+                kernel4.SetArg(a4++, BufferHandle(input));
+                kernel4.SetArg(a4++, BufferHandle(output));
+                kernel4.SetArg(a4++, BufferHandle(gamma));
+                kernel4.SetArg(a4++, BufferHandle(beta));
+                kernel4.SetArg(a4++, BufferHandle(runningMean));
+                kernel4.SetArg(a4++, BufferHandle(runningVar));
+                kernel4.SetArg(a4++, channels);
+                kernel4.SetArg(a4++, spatialSize);
+                kernel4.SetArg(a4++, epsilon);
+                kernel4.SetArg(a4, activation);
+                int quads = spatialSize / 4;
+                int localX = quads >= 64 ? 64 : RoundUpToMultiple(quads, 8);
+                kernel4.Execute2D(RoundUpToMultiple(quads, localX), batch * channels, localX, 1);
+                return true;
+            }
+            if (!_kernelCache.TryGetValue("batchnorm_inference", out var kernel))
                 return false;
             uint arg = 0;
             kernel.SetArg(arg++, BufferHandle(input));
@@ -8675,7 +8669,7 @@ KERNEL VARIANTS (A/B testing):
             kernel.SetArg(arg++, channels);
             kernel.SetArg(arg++, spatialSize);
             kernel.SetArg(arg++, epsilon);
-            kernel.SetArg(arg++, relu ? 1 : 0);
+            kernel.SetArg(arg, activation);   // 0 none, 1 ReLU, 2 ReLU6
             // The largest power of two within 256 and the device work-group limit.
             int local = (int)Math.Min(256UL, Math.Max(1UL, _maxWorkGroupSize));
             local = 1 << (int)Math.Floor(Math.Log(local, 2));
@@ -8694,7 +8688,12 @@ KERNEL VARIANTS (A/B testing):
             // ReLU through the element-wise inference kernel: batchnorm_relu measured slower than batch norm then a
             // separate ReLU (0.114 vs 0.096 ms on [1,256,56,56]), where this one-pass form beats both.
             if (activation == FusedActivationType.ReLU && TryLaunchBatchNormInference(input, output, gamma, beta, runningMean,
-                    runningVar, batch, channels, spatialSize, epsilon, relu: true))
+                    runningVar, batch, channels, spatialSize, epsilon, activation: 1))
+                return true;
+            // ReLU6 (MobileNet's every BatchNorm) the same way. It declined here, so the engine ran the whole op on the
+            // host: a blocking download and an upload per layer, most of a GPU MobileNetV2 b32 forward.
+            if (activation == FusedActivationType.ReLU6 && TryLaunchBatchNormInference(input, output, gamma, beta, runningMean,
+                    runningVar, batch, channels, spatialSize, epsilon, activation: 2))
                 return true;
 
             string kernelName = activation switch
@@ -9717,7 +9716,12 @@ KERNEL VARIANTS (A/B testing):
             if (_context == null)
                 throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
-            var kernel = _kernelCache["copy_2d_strided"];
+            if (numRows <= 0 || srcCols <= 0) return;
+            // Groups run along one row (a concatenation's rows are whole images, each one contiguous run), four columns per
+            // work item where every row starts 16-byte aligned.
+            bool vector = (srcCols & 3) == 0 && (destTotalCols & 3) == 0 && (destColOffset & 3) == 0
+                && _kernelCache.ContainsKey("copy_2d_strided4");
+            var kernel = _kernelCache[vector ? "copy_2d_strided4" : "copy_2d_strided"];
             var bufferSrc = ((DirectOpenClGpuBuffer)source).Buffer;
             var bufferDst = ((DirectOpenClGpuBuffer)destination).Buffer;
 
@@ -9728,8 +9732,10 @@ KERNEL VARIANTS (A/B testing):
             kernel.SetArg(4, destTotalCols);
             kernel.SetArg(5, destColOffset);
 
-            var (localSizeX, localSizeY) = CalculateOptimalWorkGroupSize(srcCols, numRows);
-            kernel.Execute2D(srcCols, numRows, localSizeX, localSizeY);
+            int columns = vector ? srcCols / 4 : srcCols;
+            int local = (int)Math.Min(256UL, Math.Max(1UL, _maxWorkGroupSize));
+            local = Math.Min(local, RoundUpToMultiple(columns, 64));
+            kernel.Execute2D(RoundUpToMultiple(columns, local), numRows, local, 1);
         }
 
         /// <inheritdoc/>

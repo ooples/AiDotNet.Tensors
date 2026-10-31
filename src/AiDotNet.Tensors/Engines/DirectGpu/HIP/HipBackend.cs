@@ -692,9 +692,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             CompileKernelModule(Kernels.HipFlashDecodeKernels.GetSource(), "flash_decode", ref _flashDecodeModule,
                 Kernels.HipFlashDecodeKernels.GetKernelNames());
 
-            // Compile Attention kernels (FlashAttention, GQA, ScaledDotProduct)
+            // Compile Attention kernels (FlashAttention, GQA, ScaledDotProduct). Without fast math: the online softmax
+            // starts its running max at -INFINITY and masks with it, which -ffast-math (finite-math-only) makes
+            // undefined, as OpenCL builds its attention kernels with NaN/Inf-preserving flags.
             CompileKernelModule(HipAttentionKernels.GetSource(), "attention", ref _attentionModule,
-                HipAttentionKernels.GetKernelNames());
+                HipAttentionKernels.GetKernelNames(), useFastMath: false);
 
             // Compile FFT kernels (Cooley-Tukey radix-2 FFT, STFT, Mel spectrogram)
             CompileKernelModule(HipFFTKernels.GetSource(), "fft", ref _fftModule,
@@ -833,6 +835,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             CompileTunedRowKernels();
             CompileWinogradKernels();
             CompileBatchNormRegisterKernels();
+            CompileFiniteGuardKernels();
 
             // Compile split-buffer complex kernels for native Tensor<Complex<T>> operations
             CompileKernelModule(Kernels.HipComplexKernels.GetSource(), "complex", ref _complexModule, Kernels.HipComplexKernels.GetKernelNames());
@@ -10143,25 +10146,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void FusedGemmBiasActivationAsync(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, IGpuBuffer output,
         int M, int N, int K, FusedActivationType activation, IGpuStream stream)
     {
-        // Softmax is row-wise; the old default SILENTLY applied ReLU instead (wrong distribution).
-        // GEMM+bias then per-row softmax over [M, N]. Parity fix from OpenCL; unverified on ROCm hardware.
         if (activation == FusedActivationType.Softmax)
         {
-            // GemmBias and the softmax kernel both run on the backend's DEFAULT stream, not `stream`.
-            // To preserve ordering w.r.t. the caller's stream, drain it first (so prior writes to
-            // A/B/bias complete before GemmBias reads them), then fully synchronize after so the result
-            // in `output` is ready on return — a subsequent SynchronizeStream(stream) is then a no-op.
-            SynchronizeStream(stream);
-            var gemmBias = GemmBias(A, B, bias, M, N, K);
-            try
-            {
-                Softmax(gemmBias, output, M, N);
-            }
-            finally
-            {
-                gemmBias.Dispose();   // release the temp even if Softmax throws
-            }
-            Synchronize();
+            FusedGemmBiasRowSoftmax(A, B, bias, output, M, N, K, stream);
             return;
         }
 
@@ -10172,10 +10159,27 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             FusedActivationType.Sigmoid => "gemm_bias_sigmoid",
             FusedActivationType.Tanh => "gemm_bias_tanh",
             FusedActivationType.None => "gemm_bias",
-            _ => "gemm_bias_relu" // Default to ReLU
+            _ => throw new NotSupportedException($"Activation type {activation} not supported for fused GEMM")
         };
 
         ExecuteFusedGemmOnStream(kernelName, A, B, bias, output, M, N, K, stream.Handle, synchronize: false);
+    }
+
+    /// <summary>
+    /// GEMM + bias followed by a softmax over each of the <paramref name="M"/> rows of length <paramref name="N"/>.
+    /// A softmax reads its whole row, so it has no per-element GEMM epilogue: the affine part is the plain
+    /// <c>gemm_bias</c> launch on the caller's <paramref name="stream"/>, into scratch logits. The row softmax kernel
+    /// runs on the backend stream, so the caller's stream is drained before it and the backend stream after it; the
+    /// result is complete in <paramref name="output"/> on return.
+    /// </summary>
+    private void FusedGemmBiasRowSoftmax(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, IGpuBuffer output,
+        int M, int N, int K, IGpuStream stream)
+    {
+        using var logits = AllocateBuffer(M * N);
+        FusedGemmBiasActivationAsync(A, B, bias, logits, M, N, K, FusedActivationType.None, stream);
+        SynchronizeStream(stream);
+        Softmax(logits, output, M, N);
+        Synchronize();
     }
 
     /// <summary>

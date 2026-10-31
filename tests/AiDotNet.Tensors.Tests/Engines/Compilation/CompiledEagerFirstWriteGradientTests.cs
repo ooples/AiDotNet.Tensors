@@ -173,6 +173,149 @@ public class CompiledEagerFirstWriteGradientTests
         }
     }
 
+    /// <summary>
+    /// DenseNet's pattern: a training BatchNorm whose input a later concatenation also reads, so the BatchNorm's
+    /// specialized backward and a generic backward both write that input's gradient. The BatchNorm backward claims its
+    /// first write, and the BatchNorm's batch-statistic nodes (no backward) do not count as writers, so after the
+    /// verification step nothing is zeroed and every step still reproduces step 0's gradients bit for bit. A tanh follows
+    /// the BatchNorm so it is not fused with a ReLU.
+    /// </summary>
+    [Fact]
+    public void TrainingBatchNorm_SharedInput_NeedsNoZeroing_AndStaysBitExact()
+        => AssertSharedInputBatchNorm(useRelu: false, "specialized:BatchNorm");
+
+    /// <summary>
+    /// The same graph with a ReLU after the BatchNorm: on the CPU the pair fuses (BatchNormReluFusionPattern), so the
+    /// BatchNorm output and its gradient have no buffer, and the fused backward masks the gradient inside the batch-norm
+    /// kernel. Its gradients must match the eager tape, need no zeroing, and repeat bit for bit.
+    /// </summary>
+    [Fact]
+    public void FusedTrainingBatchNormRelu_SharedInput_MatchesEager_NeedsNoZeroing()
+        => AssertSharedInputBatchNorm(useRelu: true, "specialized:BatchNormReLU");
+
+    private static void AssertSharedInputBatchNorm(bool useRelu, string expectedKind)
+    {
+        var engine = new CpuEngine();
+        var input = Filled(new[] { 2, 4, 3, 3 }, 21, 2f);
+        Tensor<float>[] MakeParams() => new[]
+        {
+            Filled(new[] { 2, 4, 3, 3 }, 22, 1f), Filled(new[] { 4 }, 23, 1f), Filled(new[] { 4 }, 24, 1f),
+        };
+        string[] names = { "scale", "gamma", "beta" };
+        Tensor<float> Forward(Tensor<float>[] p)
+        {
+            var x = engine.TensorMultiply(input, p[0]);
+            var y = engine.BatchNorm(x, p[1], p[2], 1e-5, out _, out _);
+            var a = useRelu ? engine.ReLU(y) : engine.Tanh(y);
+            var z = engine.TensorConcatenate(new[] { a, x }, 1);   // x: read by the BatchNorm and this concat
+            return engine.ReduceSum(engine.TensorMultiply(z, z), null);
+        }
+
+        var eagerParams = MakeParams();
+        var eager = new Tensor<float>[eagerParams.Length];
+        using (var tape = new GradientTape<float>())
+        {
+            var grads = tape.ComputeGradients(Forward(eagerParams), sources: eagerParams);
+            for (int i = 0; i < eagerParams.Length; i++) eager[i] = grads[eagerParams[i]];
+        }
+
+        var ps = MakeParams();
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            Forward(ps);
+            plan = scope.CompileTraining(ps);
+        }
+        using (plan)
+        {
+            var concrete = Assert.IsType<CompiledTrainingPlan<float>>(plan);
+            Assert.Contains(expectedKind, concrete.BackwardStepKinds);
+
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);
+            plan.Step();
+            var step0 = new float[ps.Length][];
+            for (int i = 0; i < ps.Length; i++)
+            {
+                step0[i] = Snapshot(ps[i].Grad, names[i]);
+                AssertClose(eager[i], step0[i], $"{names[i]} step 0 vs eager");
+            }
+
+            for (int step = 1; step < 5; step++)
+            {
+                plan.Step();
+                for (int i = 0; i < ps.Length; i++)
+                    AssertBitEqual(step0[i], ps[i].Grad, $"{names[i]} step {step}");
+                if (step >= 2)
+                    Assert.Equal(0L, concrete.LastClearedGradElements);
+            }
+        }
+    }
+    /// <summary>
+    /// A training BatchNorm followed by a pool: the pool is the sole writer of the BatchNorm output's gradient, but the
+    /// BatchNorm's batch-statistic nodes also read that output. The pool's specialized backward claims the gradient's
+    /// first write, so it must overwrite it: counting the statistic readers as consumers made it add into a buffer nobody
+    /// zeroed, and the gradients grew every step.
+    /// </summary>
+    [Theory]
+    [InlineData("MaxPool2D")]
+    [InlineData("AvgPool2D")]
+    public void PoolAfterTrainingBatchNorm_OverwritesItsClaimedGradient_BitExact(string pool)
+    {
+        var engine = new CpuEngine();
+        var input = Filled(new[] { 2, 4, 4, 4 }, 31, 2f);
+        Tensor<float>[] MakeParams() => new[]
+        {
+            Filled(new[] { 2, 4, 4, 4 }, 32, 1f), Filled(new[] { 4 }, 33, 1f), Filled(new[] { 4 }, 34, 1f),
+        };
+        string[] names = { "scale", "gamma", "beta" };
+        Tensor<float> Forward(Tensor<float>[] p)
+        {
+            var x = engine.TensorMultiply(input, p[0]);
+            var y = engine.BatchNorm(x, p[1], p[2], 1e-5, out _, out _);
+            var z = pool == "MaxPool2D" ? engine.MaxPool2D(y, 2, 2) : engine.AvgPool2D(y, 2, 2);
+            return engine.ReduceSum(engine.TensorMultiply(z, z), null);
+        }
+
+        var eagerParams = MakeParams();
+        var eager = new Tensor<float>[eagerParams.Length];
+        using (var tape = new GradientTape<float>())
+        {
+            var grads = tape.ComputeGradients(Forward(eagerParams), sources: eagerParams);
+            for (int i = 0; i < eagerParams.Length; i++) eager[i] = grads[eagerParams[i]];
+        }
+
+        var ps = MakeParams();
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            Forward(ps);
+            plan = scope.CompileTraining(ps);
+        }
+        using (plan)
+        {
+            var concrete = Assert.IsType<CompiledTrainingPlan<float>>(plan);
+            Assert.Contains("specialized:" + pool, concrete.BackwardStepKinds);
+
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);
+            plan.Step();
+            var step0 = new float[ps.Length][];
+            for (int i = 0; i < ps.Length; i++)
+            {
+                step0[i] = Snapshot(ps[i].Grad, names[i]);
+                AssertClose(eager[i], step0[i], $"{names[i]} step 0 vs eager");
+            }
+
+            for (int step = 1; step < 5; step++)
+            {
+                plan.Step();
+                for (int i = 0; i < ps.Length; i++)
+                    AssertBitEqual(step0[i], ps[i].Grad, $"{names[i]} step {step}");
+                if (step >= 2)
+                    Assert.Equal(0L, concrete.LastClearedGradElements);
+            }
+        }
+    }
+
     private static float[] Snapshot(Tensor<float>? grad, string what)
     {
         Assert.True(grad is not null, $"{what}.Grad is null");

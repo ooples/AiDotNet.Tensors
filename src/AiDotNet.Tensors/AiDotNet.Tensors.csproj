@@ -43,6 +43,35 @@
                       OutputItemType="Analyzer" ReferenceOutputAssembly="false" PrivateAssets="all" />
     <AdditionalFiles Include="BackendParityBaseline.txt" />
   </ItemGroup>
+
+  <!-- Public API contract (#1574): PublicAPI.Shipped.txt is the API of the last release, PublicAPI.Unshipped.txt what
+       has been added since. RS0016 (public API missing from the files) and RS0017 (declared API that no longer exists)
+       are warnings, which TreatWarningsAsErrors turns into errors. The root files hold the API common to every target
+       framework; PublicAPI/<tfm>/ holds what exists on one framework only (the analyzer's layout for multi-targeted
+       projects). The package's own targets add the root files as AdditionalFiles. The IDE code fix writes new API to
+       the root Unshipped file; create PublicAPI/<tfm>/PublicAPI.Unshipped.txt only for an addition that exists on one
+       framework. After a release, move the Unshipped entries into Shipped. RS0041 (public API using oblivious
+       reference types) is off: members in #nullable disable code are recorded with the '~' marker instead, so a
+       change to their signatures is still caught by RS0016/RS0017; annotating them is a separate change. -->
+  <PropertyGroup>
+    <NoWarn>$(NoWarn);RS0041</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.CodeAnalysis.PublicApiAnalyzers" Version="5.3.0" PrivateAssets="all"
+                      IncludeAssets="runtime; build; native; contentfiles; analyzers; buildtransitive" />
+    <AdditionalFiles Include="PublicAPI\$(TargetFramework)\PublicAPI.Shipped.txt" Condition="Exists('PublicAPI\$(TargetFramework)\PublicAPI.Shipped.txt')" />
+    <AdditionalFiles Include="PublicAPI\$(TargetFramework)\PublicAPI.Unshipped.txt" Condition="Exists('PublicAPI\$(TargetFramework)\PublicAPI.Unshipped.txt')" />
+  </ItemGroup>
+
+  <!-- Package validation (#1574): packing compares the package with the baseline release on nuget.org and fails on a
+       binary or source break, and checks the target frameworks' assets against each other. GeneratePackageOnBuild
+       packs on every multi-framework build (a single-framework `-f` build is an inner build and does not pack).
+       Accepted breaks go in CompatibilitySuppressions.xml (regenerate with
+       -p:GenerateCompatibilitySuppressionFile=true and review the diff). Bump the baseline after each release. -->
+  <PropertyGroup>
+    <EnablePackageValidation>true</EnablePackageValidation>
+    <PackageValidationBaselineVersion>0.144.1</PackageValidationBaselineVersion>
+  </PropertyGroup>
   <ItemGroup Condition="'$(UseLocalEvolution)' == 'true'">
     <ProjectReference Include="$(EvolutionProjectPath)" />
   </ItemGroup>

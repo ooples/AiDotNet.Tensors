@@ -237,17 +237,16 @@ void tk_im2col_body(TK_GLOBAL const float* input, TK_GLOBAL float* col, int batc
     int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW, int outH, int outW,
     int idx)
 {
-    int l = outH * outW;
-    if (idx >= batch * l) return;
-    int b = idx / l, s = idx % l, oh = s / outW, ow = s % outW;
-    for (int c = 0; c < channels; c++)
-        for (int kh = 0; kh < kernelH; kh++)
-            for (int kw = 0; kw < kernelW; kw++)
-            {
-                int ih = oh * strideH - padH + kh * dilationH, iw = ow * strideW - padW + kw * dilationW;
-                float v = (ih >= 0 && ih < height && iw >= 0 && iw < width) ? input[((b * channels + c) * height + ih) * width + iw] : 0.0f;
-                col[(long)((c * kernelH + kh) * kernelW + kw) * (batch * l) + b * l + s] = v;
-            }
+    // One work item per element of col [P, B * L] (P = channels * kernelH * kernelW), in col's order, so writes are
+    // consecutive. One work item per output position, looping over every channel and tap, left a 2x2-output layer of
+    // a batch-32 ResNet-50 128 work items each copying over a thousand values in sequence.
+    int l = outH * outW, n = batch * l;
+    if (idx >= channels * kernelH * kernelW * n) return;
+    int p = idx / n, j = idx - p * n;
+    int b = j / l, s = j - b * l, oh = s / outW, ow = s - oh * outW;
+    int kw = p % kernelW, ckh = p / kernelW, kh = ckh % kernelH, c = ckh / kernelH;
+    int ih = oh * strideH - padH + kh * dilationH, iw = ow * strideW - padW + kw * dilationW;
+    col[idx] = (ih >= 0 && ih < height && iw >= 0 && iw < width) ? input[((b * channels + c) * height + ih) * width + iw] : 0.0f;
 }
 ";
 

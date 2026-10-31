@@ -53,6 +53,15 @@
     <ProjectReference Include="..\..\src\AiDotNet.Tensors.Cli\AiDotNet.Tensors.Cli.csproj" />
   </ItemGroup>
 
+  <!-- #1574 DLPack interop with real PyTorch: the test embeds the CPython named by AIDOTNET_TORCH_PYTHON (DLPack
+       shares a pointer, so torch must live in this process). net10.0 only, like the other interop harnesses. -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
+    <PackageReference Include="pythonnet" Version="3.2.1" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(TargetFramework)' == 'net471' or '$(TargetFramework)' == 'net462'">
+    <Compile Remove="Interop\DLPackTorchInteropTests.cs" />
+  </ItemGroup>
+
   <!-- #775 op-parity source generator: emits a discoverable [Fact] per tensor-returning IEngine
        op (net-core only; the harness it drives is #if !NETFRAMEWORK). -->
   <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">

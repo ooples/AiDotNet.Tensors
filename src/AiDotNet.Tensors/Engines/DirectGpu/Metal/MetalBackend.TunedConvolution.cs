@@ -67,7 +67,7 @@ public sealed partial class MetalBackend : IConvBiasActivationBackend
         int l = a.OutHeight * a.OutWidth, p = a.InChannels * a.KernelH * a.KernelW;
         using var col = AllocateBuffer(checked(a.Batch * p * l));
         var pipeline = GetPipeline(TunedRowLibraryName, _tunedRowLibrary, TunedRowKernelTemplate.Im2ColName);
-        var (groups, threads) = pipeline.Calculate1DDispatch(a.Batch * l);
+        var (groups, threads) = pipeline.Calculate1DDispatch(a.Batch * l * p);   // one thread per col element
         using (var encoder = _commandQueue.CreateScopedComputeEncoder())
         {
             encoder.SetPipelineState(pipeline.Handle);

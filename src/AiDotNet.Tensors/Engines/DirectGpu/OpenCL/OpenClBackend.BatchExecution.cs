@@ -30,6 +30,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 {
                     case IGpuBuffer buffer: kernel.SetArg(index, BatchHandle(buffer)); break;
                     case int value: kernel.SetArg(index, value); break;
+                    case uint value: kernel.SetArg(index, value); break;
                     case float value: kernel.SetArg(index, value); break;
                     case ulong value: kernel.SetArg(index, value); break;
                     default:

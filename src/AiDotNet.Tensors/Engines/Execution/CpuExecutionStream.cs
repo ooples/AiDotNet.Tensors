@@ -94,11 +94,12 @@ internal sealed class CpuExecutionStream<T> : IExecutionStream<T>
             // and not run kernel work on the caller.
             AllowSynchronousContinuations = false,
         });
-        _workerTask = Task.Factory.StartNew(
+        // Without the creator's ExecutionContext: the worker lives as long as the stream (see DetachedContext).
+        _workerTask = AiDotNet.Tensors.Helpers.DetachedContext.Run(() => Task.Factory.StartNew(
             WorkerLoopAsync,
             CancellationToken.None,
             TaskCreationOptions.LongRunning,
-            TaskScheduler.Default).Unwrap();
+            TaskScheduler.Default)).Unwrap();
     }
 
     /// <inheritdoc/>

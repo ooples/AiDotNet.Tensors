@@ -24,6 +24,7 @@ public readonly struct AcoshOperatorDouble : IUnaryOperator<double, double>
 #endif
     }
 
+#if NET5_0_OR_GREATER
     /// <summary>
     /// Computes acosh(x) for a Vector128 of doubles (2 values).
     /// </summary>
@@ -74,6 +75,7 @@ public readonly struct AcoshOperatorDouble : IUnaryOperator<double, double>
 
         return Vector512.Create(values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7]);
     }
+#endif
 }
 
 /// <summary>

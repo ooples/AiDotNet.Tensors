@@ -82,7 +82,9 @@ public sealed class BatchNormLaunchCountTests : IClassFixture<DirectGpuTensorEng
 
     // Register-resident training batch norm on mean + variance (IBatchNormVarianceBackend): one launch each way for a
     // channel slice of at most 8192 elements with spatial % 4 == 0 -- every register width ResNet-18 uses (8 float4s per
-    // thread at 32x32, 2 at 16x16, 1 below) plus an odd channel count -- and the two-launch kernels otherwise.
+    // thread at 32x32, 2 at 16x16, 1 below) plus an odd channel count -- and the two-launch kernels otherwise. That is
+    // CUDA's float4 kernel; the portable kernel (OpenCL, HIP, Metal, Vulkan, WebGPU) reads scalars, so on those backends
+    // any slice a variant covers is one launch, the float4 condition included.
     [SkippableTheory]
     [InlineData(8, 64, 32, true)]
     [InlineData(8, 128, 16, true)]
@@ -114,8 +116,11 @@ public sealed class BatchNormLaunchCountTests : IClassFixture<DirectGpuTensorEng
         var gradIn = engine.BatchNormBackward(gradOut, x, gamma, mean, variance, eps, out var gradGamma, out var gradBeta);
         long backwardLaunches = GpuLaunchProbe.TotalEver - before;
         _output.WriteLine($"[{batch},{channels},{size}x{size}] forward {forwardLaunches} launches, backward {backwardLaunches}");
-        Assert.Equal(resident ? 1 : 2, forwardLaunches);
-        Assert.Equal(resident ? 1 : 2, backwardLaunches);
+        bool residentHere = gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend
+            ? resident
+            : BatchNormRegisterKernelTemplate.VariantFor((long)batch * size * size) != 0;
+        Assert.Equal(residentHere ? 1 : 2, forwardLaunches);
+        Assert.Equal(residentHere ? 1 : 2, backwardLaunches);
 
         var yRef = cpu.BatchNorm(x, gamma, beta, eps, out var meanRef, out var varRef);
         var gradInRef = cpu.BatchNormBackward(gradOut, x, gamma, meanRef, varRef, eps, out var gradGammaRef, out var gradBetaRef);

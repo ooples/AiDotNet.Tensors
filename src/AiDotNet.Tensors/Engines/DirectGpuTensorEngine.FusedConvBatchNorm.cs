@@ -42,7 +42,7 @@ public partial class DirectGpuTensorEngine
                 strideH, strideW, padH, padW, dilationH, dilationW, activation);
 
         var (foldedKernel, foldedBias) = ConvBatchNormFold<T>.Get(kernel, bias, gamma, beta, runningMean,
-            runningVariance, epsilon, FoldOnDevice);
+            runningVariance, epsilon, FoldOnDevice, ReleaseFolded);
         return FusedConv2D(input, foldedKernel, foldedBias, strideH, strideW, padH, padW, dilationH, dilationW, activation);
     }
 
@@ -57,8 +57,9 @@ public partial class DirectGpuTensorEngine
         using var noGrad = new NoGradScope<T>();
         int outChannels = kernel.Shape[0];
         var scale = TensorDivide(gamma, TensorSqrt(TensorAddScalar(variance, ops.FromDouble(epsilon))));
-        var perChannel = TensorBroadcastTo(Reshape(scale, new[] { outChannels, 1, 1, 1 }), kernel.Shape.ToArray());
-        var foldedKernel = TensorMultiply(kernel, perChannel);
+        // The multiply broadcasts the [O, 1, 1, 1] scale; materializing it at the kernel's shape first held a second
+        // kernel-sized buffer per folded layer until it was finalized.
+        var foldedKernel = TensorMultiply(kernel, Reshape(scale, new[] { outChannels, 1, 1, 1 }));
         var shifted = bias is null ? TensorMultiplyScalar(mean, ops.FromDouble(-1.0)) : TensorSubtract(bias, mean);
         var foldedBias = TensorAdd(beta, TensorMultiply(shifted, scale));
         return (foldedKernel, foldedBias);

@@ -53,6 +53,9 @@ public partial class DirectGpuTensorEngine
             if (consistent)
             {
                 int headDim = width / numHeads;
+                if (TryShortAttentionOnDevice(query, key, value, batch, numHeads, seqQ, seqK, headDim,
+                        scale ?? 1.0 / Math.Sqrt(headDim), causal, seqK - seqQ, new[] { batch, seqQ, width }) is { } shortForward)
+                    return shortForward;
                 if (TryFusedAttentionOnDevice("MultiHeadAttentionCore", query, key, value, null, batch, numHeads, seqQ, seqK,
                         headDim, interleaved: true, scale ?? 1.0 / Math.Sqrt(headDim), 0.0, causal,
                         causalOffset: seqK - seqQ, new[] { batch, seqQ, width }) is { } onDevice)
@@ -86,6 +89,7 @@ public partial class DirectGpuTensorEngine
         if (typeof(T) != typeof(float) || mask is not null || Gpu.AutocastScope.IsEnabled
             || GraphMode.Current is not { } scope
             || PlacementBackend is not IFusedAttentionBackend fused || !fused.SupportsFusedAttention(headDim)
+            || (fused is IFusedAttentionPreference preference && !preference.PrefersFusedAttention(batch, heads, seqQ, seqK, headDim))
             || !query.IsContiguous || !key.IsContiguous || !value.IsContiguous
             || batch <= 0 || heads <= 0 || seqQ <= 0 || seqK < 0
             || (long)batch * heads * Math.Max(seqQ, seqK) * headDim > int.MaxValue)
@@ -106,22 +110,13 @@ public partial class DirectGpuTensorEngine
                 using var q = gpu.GetOrAllocateBuffer(backend, query);
                 using var k = gpu.GetOrAllocateBuffer(backend, key);
                 using var v = gpu.GetOrAllocateBuffer(backend, value);
-                var result = AllocateFullyWrittenOutputBuffer(backend, outLength);
-                bool ownsResult = true;
-                try
-                {
-                    attention.FusedAttentionForward(q.Buffer, k.Buffer, v.Buffer, result.Buffer,
-                        node.Lse._gpuBuffer ?? throw new InvalidOperationException("The attention node lost its log-sum-exp buffer."),
-                        null, p, headDim);
-                    var tensor = gpu.DeferTensorResult<T>(backend, result.Buffer, outLength, outputShape);
-                    result.RelinquishOwnership();
-                    ownsResult = false;
-                    CopyResultInto(eng, tensor, output);
-                }
-                finally
-                {
-                    if (ownsResult) result.Dispose();
-                }
+                using var result = AllocateFullyWrittenOutputBuffer(backend, outLength);
+                attention.FusedAttentionForward(q.Buffer, k.Buffer, v.Buffer, result.Buffer,
+                    node.Lse._gpuBuffer ?? throw new InvalidOperationException("The attention node lost its log-sum-exp buffer."),
+                    null, p, headDim);
+                var tensor = gpu.DeferTensorResult<T>(backend, result.Buffer, outLength, outputShape);
+                result.RelinquishOwnership();
+                CopyResultInto(eng, tensor, output);
             },
             (gradOutput, inputs, output, savedState, engine, grads) =>
             {
@@ -313,6 +308,7 @@ public partial class DirectGpuTensorEngine
         if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled
             || !TryGetBackend(out var backend) || backend is not IFusedAttentionBackend fused
             || !fused.SupportsFusedAttention(headDim) || batch <= 0 || heads <= 0 || seqQ <= 0 || seqK < 0
+            || (fused is IFusedAttentionPreference preference && !preference.PrefersFusedAttention(batch, heads, seqQ, seqK, headDim))
             || (long)batch * heads * Math.Max(seqQ, seqK) * headDim > int.MaxValue)
             return null;
         if (mask is not null && !TryMaskStrides(mask, batch, heads, seqQ, seqK, out _)) return null;
@@ -353,6 +349,181 @@ public partial class DirectGpuTensorEngine
             if (ownsOutput) output.Dispose();
             if (ownsLse) lse.Dispose();
         }
+    }
+
+    // Settable for tests, which drive the batched-GEMM and fused branches behind the short-sequence kernel at shapes
+    // it would take.
+    internal static bool ShortAttentionEnabled { get; set; } = true;
+
+    // Inference only (nothing records a backward): the short-sequence forward where the backend would otherwise compose
+    // the attention (permutes, two batched GEMMs, scale, softmax); a ViT-Tiny block's 65-token attention went from six
+    // passes over memory to one kernel. Null wherever it does not apply, and the caller continues as before.
+    private Tensor<T>? TryShortAttentionOnDevice<T>(Tensor<T> query, Tensor<T> key, Tensor<T> value, int batch, int heads,
+        int seqQ, int seqK, int headDim, double scale, bool causal, int causalOffset, int[] outputShape)
+    {
+        // An inference trace (a compiled Predict) records the kernel as one node; a training or compatibility trace needs
+        // the differentiable primitives, so it keeps them.
+        if (!ShortAttentionEnabled) return null;
+        if (GraphMode.IsActive)
+            return GraphMode.IsInferenceTrace
+                ? TryRecordShortAttention(query, key, value, batch, heads, seqQ, seqK, headDim, scale, causal, causalOffset, outputShape)
+                : null;
+        if (typeof(T) != typeof(float) || Autodiff.DifferentiableOps.IsRecording<T>()
+            || Gpu.AutocastScope.IsEnabled || !TryGetBackend(out var backend)
+            || backend is not IShortAttentionForwardBackend shortAttention || !shortAttention.SupportsShortAttention(headDim)
+            || (backend is IFusedAttentionPreference preference && preference.PrefersFusedAttention(batch, heads, seqQ, seqK, headDim))
+            || seqK <= 0 || (long)batch * seqQ * heads * headDim > int.MaxValue
+            || (long)batch * seqK * heads * headDim > int.MaxValue)
+            return null;
+        int outLength = batch * seqQ * heads * headDim;
+        // Disposed unless handed to the result (RelinquishOwnership makes the dispose a no-op).
+        using var output = AllocateFullyWrittenOutputBuffer(backend, outLength);
+        try
+        {
+            using var q = GetOrAllocateBuffer(backend, query);
+            using var k = GetOrAllocateBuffer(backend, key);
+            using var v = GetOrAllocateBuffer(backend, value);
+            if (!shortAttention.TryShortAttentionForward(q.Buffer, k.Buffer, v.Buffer, output.Buffer, batch, heads, seqQ, seqK,
+                    headDim, (float)scale, causal, causalOffset))
+                return null;
+            var result = DeferTensorResult<T>(backend, output.Buffer, outLength, outputShape);
+            output.RelinquishOwnership();
+            return result;
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            GpuLaunchProbe.OnFallback("ShortAttentionForward", ex);
+            if (ThrowOnGpuKernelFallback) throw;
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// The concatenated [D, 3D] projection weight [W_q | W_k | W_v] for one attention layer, cached by its query weight
+    /// and rebuilt when any of the three changes (their host or device versions), as ConvBatchNormFold caches folds. One
+    /// GEMM against it replaces three: on a GPU ViT-Tiny forward the three 2080 x 192 x 192 products cost more than one
+    /// 2080 x 576 x 192 (the weights are read once and the device runs one launch).
+    /// </summary>
+    private static class FusedQkvWeight<T>
+    {
+        private sealed class Entry
+        {
+            internal Tensor<T>? K, V;
+            internal int[] Versions = Array.Empty<int>();
+            internal Tensor<T> Fused = new(new[] { 0 });
+        }
+
+        private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Tensor<T>, Entry> s_entries = new();
+
+        private static int[] VersionsOf(Tensor<T> q, Tensor<T> k, Tensor<T> v) => new[]
+        {
+            q.Version, q.GpuCacheVersion, k.Version, k.GpuCacheVersion, v.Version, v.GpuCacheVersion,
+        };
+
+        internal static Tensor<T> Get(DirectGpuTensorEngine engine, Tensor<T> q, Tensor<T> k, Tensor<T> v)
+        {
+            var versions = VersionsOf(q, k, v);
+            lock (s_entries)
+            {
+                if (s_entries.TryGetValue(q, out var entry) && ReferenceEquals(entry.K, k) && ReferenceEquals(entry.V, v)
+                    && entry.Versions.AsSpan().SequenceEqual(versions))
+                    return entry.Fused;
+                // Built on the host and served through the persistent weight cache (keyed by its array), never as an
+                // activation: the attention call drops the activations it created, which would free a cached weight.
+                // Reading device-resident weights downloads them once per version.
+                int rows = q._shape[0], cols = q._shape[1];
+                var fused = new Tensor<T>(new[] { rows, 3 * cols });
+                var dst = fused.AsWritableSpan();
+                var qs = (q.IsContiguous ? q : q.Contiguous()).AsSpan();
+                var ks = (k.IsContiguous ? k : k.Contiguous()).AsSpan();
+                var vs = (v.IsContiguous ? v : v.Contiguous()).AsSpan();
+                for (int r = 0; r < rows; r++)
+                {
+                    qs.Slice(r * cols, cols).CopyTo(dst.Slice(r * 3 * cols, cols));
+                    ks.Slice(r * cols, cols).CopyTo(dst.Slice(r * 3 * cols + cols, cols));
+                    vs.Slice(r * cols, cols).CopyTo(dst.Slice(r * 3 * cols + 2 * cols, cols));
+                }
+                if (entry is not null) engine.DropCachedCopy(entry.Fused.GetBackingArrayForCacheLookupUnsafe());
+                s_entries.Remove(q);
+                s_entries.Add(q, new Entry { K = k, V = v, Versions = versions, Fused = fused });
+                return fused;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Unmasked inference self-attention from the input in two GEMMs and one kernel: the Q, K and V projections as one GEMM
+    /// over the cached concatenated weight, then the short-sequence kernel reading the packed [Q | K | V] rows in place.
+    /// Returns the heads' output [B, S, D] before the output projection, or null where it does not apply (the caller
+    /// then projects Q, K and V separately). Eager only: an inference trace records the separate projections.
+    /// </summary>
+    private Tensor<T>? TryPackedShortSelfAttention<T>(Tensor<T> input2d, Tensor<T> qWeight, Tensor<T> kWeight,
+        Tensor<T> vWeight, int batch, int heads, int seq, int headDim, double scale)
+    {
+        if (!ShortAttentionEnabled || GraphMode.IsActive || typeof(T) != typeof(float)
+            || Autodiff.DifferentiableOps.IsRecording<T>() || Gpu.AutocastScope.IsEnabled || !TryGetBackend(out var backend)
+            || backend is not IShortAttentionForwardBackend shortAttention || !shortAttention.SupportsShortAttention(headDim)
+            || (backend is IFusedAttentionPreference preference && preference.PrefersFusedAttention(batch, heads, seq, seq, headDim))
+            || (long)batch * seq * 3 * heads * headDim > int.MaxValue)
+            return null;
+        int width = heads * headDim, rows = batch * seq;
+        try
+        {
+            var fusedWeight = FusedQkvWeight<T>.Get(this, qWeight, kWeight, vWeight);                    // [D, 3D]
+            int outLength = rows * width;
+            using var output = AllocateFullyWrittenOutputBuffer(backend, outLength);
+            using var x = GetOrAllocateBuffer(backend, input2d);
+            using var w = GetWeightBufferPreferResident(backend, fusedWeight, PersistentTensorRole.Weights);
+            // The packed projections live only for this call, in a buffer it owns.
+            using var packed = AllocateFullyWrittenOutputBuffer(backend, rows * 3 * width);
+            backend.Gemm(x.Buffer, w.Buffer, packed.Buffer, rows, 3 * width, width);                     // [B*S, 3D]
+            if (!shortAttention.TryShortAttentionForwardPacked(packed.Buffer, output.Buffer, batch, heads, seq, headDim,
+                    (float)scale))
+                return null;
+            var result = DeferTensorResult<T>(backend, output.Buffer, outLength, new[] { batch, seq, width });
+            output.RelinquishOwnership();
+            return result;
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            GpuLaunchProbe.OnFallback("PackedShortSelfAttention", ex);
+            if (ThrowOnGpuKernelFallback) throw;
+            return null;
+        }
+    }
+
+    private Tensor<T>? TryRecordShortAttention<T>(Tensor<T> query, Tensor<T> key, Tensor<T> value, int batch, int heads,
+        int seqQ, int seqK, int headDim, double scale, bool causal, int causalOffset, int[] outputShape)
+    {
+        // PlacementBackend, not GetBackend: the latter refuses every backend while a graph is traced (#350).
+        if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled || GraphMode.Current is not { } scope
+            || PlacementBackend is not IShortAttentionForwardBackend shortAttention || !shortAttention.SupportsShortAttention(headDim)
+            || (PlacementBackend is IFusedAttentionPreference preference
+                && preference.PrefersFusedAttention(batch, heads, seqQ, seqK, headDim))
+            || seqK <= 0 || (long)batch * Math.Max(seqQ, seqK) * heads * headDim > int.MaxValue)
+            return null;
+        if (!scope.BindEngine(this)) return null;
+        int outLength = batch * seqQ * heads * headDim;
+        return scope.RecordVariadic(LazyNodeType.Custom, "ShortAttentionForward", new[] { query, key, value }, outputShape,
+            (eng, output) =>
+            {
+                var gpu = (DirectGpuTensorEngine)eng;
+                var backend = gpu.GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
+                var kernel = backend as IShortAttentionForwardBackend
+                    ?? throw new InvalidOperationException("The recorded short attention's backend lost the kernel.");
+                using var q = gpu.GetOrAllocateBuffer(backend, query);
+                using var k = gpu.GetOrAllocateBuffer(backend, key);
+                using var v = gpu.GetOrAllocateBuffer(backend, value);
+                // Disposed unless handed to the result (RelinquishOwnership makes the dispose a no-op).
+                using var result = AllocateFullyWrittenOutputBuffer(backend, outLength);
+                if (!kernel.TryShortAttentionForward(q.Buffer, k.Buffer, v.Buffer, result.Buffer, batch, heads, seqQ, seqK,
+                        headDim, (float)scale, causal, causalOffset))
+                    throw new InvalidOperationException("The recorded short attention declined at replay.");
+                var tensor = gpu.DeferTensorResult<T>(backend, result.Buffer, outLength, outputShape);
+                result.RelinquishOwnership();
+                CopyResultInto(eng, tensor, output);
+            },
+            null, null);
     }
 
     private static FusedAttentionParams FusedParams(int batch, int heads, int seqQ, int seqK, int headDim, bool interleaved,

@@ -154,7 +154,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
                 // So the journal is also flushed PERIODICALLY, which means a hard kill loses at most
                 // one interval instead of everything. The cost is one small text write every two
                 // seconds, and only when the caller has explicitly named a dump path.
-                _periodicFlush = new Timer(_ => DumpTo(path), null, FlushInterval, FlushInterval);
+                _periodicFlush = AiDotNet.Tensors.Helpers.DetachedContext.Run(() => new Timer(_ => DumpTo(path), null, FlushInterval, FlushInterval));
 
                 AppDomain.CurrentDomain.ProcessExit += (_, __) => DumpTo(path);
                 AppDomain.CurrentDomain.DomainUnload += (_, __) => DumpTo(path);

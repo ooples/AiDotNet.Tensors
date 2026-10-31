@@ -35,9 +35,14 @@ internal sealed class BatchNormAddReluFusionPattern : IFusionPattern
                 consumer => consumer is LazyNode<float> { OpType: LazyNodeType.Add },
                 out var bn, out var add, out var statistics, out var mean, out var variance, out var epsilon))
             return false;
+        // A successful match sets every output; checked here because net471 has no NotNullWhen to say so.
+        if (bn is null || add is null || statistics is null || mean is null || variance is null) return false;
+        // GPU only: the CPU has no fused BatchNorm+Add+ReLU kernel, and the composed fallback would allocate the
+        // normalized output and the sum on every replay.
+        if (BatchNormFusionMatch.IsCpuOnly(bn.RecordingEngine)) return false;
 
         // The add's other operand is the residual: same shape (no broadcasting), and not the normalized output again.
-        Tensor<float>? residual = ReferenceEquals(add!.Input0, bn!.Output) ? add.Input1
+        Tensor<float>? residual = ReferenceEquals(add.Input0, bn.Output) ? add.Input1
             : ReferenceEquals(add.Input1, bn.Output) ? add.Input0 : null;
         if (residual is null || ReferenceEquals(residual, bn.Output) || !SameShape(residual._shape, bn.Output._shape)
             || !SameShape(add.Output._shape, bn.Output._shape) || !PatternHelpers.FanOutAtMostOne(add, consumerCounts))
@@ -61,13 +66,13 @@ internal sealed class BatchNormAddReluFusionPattern : IFusionPattern
 
         var bnInputs = bn.GetInputsArray();
         var node = BatchNormFusionMatch.BuildFusedNode(bn, bnInputs[0], bnInputs[1], bnInputs[2], residual, relu.Output,
-            statistics!, mean!, variance!, epsilon, "BatchNormAddReLU", BackwardFunctions<float>.BatchNormAddReluBackward);
+            statistics, mean, variance, epsilon, "BatchNormAddReLU", BackwardFunctions<float>.BatchNormAddReluBackward);
         fused = node;
         PatternHelpers.SetLazySource(node);
         alreadyRemoved.Add(bn);
         alreadyRemoved.Add(add);
         alreadyRemoved.Add(relu);
-        foreach (var s in statistics!) alreadyRemoved.Add(s);
+        foreach (var s in statistics) alreadyRemoved.Add(s);
         return true;
     }
 
@@ -83,8 +88,11 @@ internal sealed class BatchNormAddReluFusionPattern : IFusionPattern
 internal static class BatchNormFusionMatch
 {
     /// <summary>
-    /// A float training BatchNorm recorded on the GPU engine at <paramref name="index"/> whose consumers are exactly one
-    /// node accepted by <paramref name="isDataConsumer"/> plus its batch-statistic nodes, none of which anything reads.
+    /// A float training BatchNorm recorded on the GPU or CPU engine at <paramref name="index"/> whose consumers are
+    /// exactly one node accepted by <paramref name="isDataConsumer"/> plus its batch-statistic nodes. The statistics may be
+    /// read (a layer's running-statistics update reads them): the fused node writes them every replay and becomes their
+    /// producer (<see cref="BuildFusedNode"/>). Refusing them on the GPU left every AiDotNet BatchNorm layer unfused there,
+    /// since each one updates its running statistics.
     /// </summary>
     internal static bool TryMatchBatchNorm(
         IReadOnlyList<ILazyNode> nodes, int index,
@@ -96,12 +104,16 @@ internal static class BatchNormFusionMatch
     {
         bn = null; dataConsumer = null; statistics = null; mean = null; variance = null; epsilon = 0;
         if (nodes[index] is not LazyNode<float> candidateBn || candidateBn.OpName != "BatchNorm"
-            || candidateBn.RecordingEngine is not DirectGpuTensorEngine
+            || !(candidateBn.RecordingEngine is DirectGpuTensorEngine || candidateBn.RecordingEngine is CpuEngine)
             || candidateBn.BackwardFn is null || candidateBn.SavedState is not { Length: 3 } saved
             || saved[0] is not Tensor<float> savedMean || saved[1] is not Tensor<float> savedVariance
             || saved[2] is not double savedEpsilon
-            || candidateBn.GetInputsArray() is not { Length: 3 })
+            || candidateBn.GetInputsArray() is not { Length: 3 } bnInputs)
             return false;
+        // The CPU's fused forward and backward kernels take 4D inputs only; a 2D or 3D BatchNorm stays unfused there
+        // rather than reaching a backward that cannot run it.
+        bool cpuOnly = IsCpuOnly(candidateBn.RecordingEngine);
+        if (cpuOnly && bnInputs[0].Rank != 4) return false;
 
         var stats = new List<LazyNode<float>>(2);
         LazyNode<float>? consumer = null;
@@ -112,8 +124,7 @@ internal static class BatchNormFusionMatch
             if (alreadyRemoved.Contains(node) || !PatternHelpers.IsConsumerOf(node, candidateBn)) continue;
             consumersSeen++;
             if (consumer is null && node is LazyNode<float> typed && isDataConsumer(node)) consumer = typed;
-            else if (node is LazyNode<float> s && (s.OpName == "BatchNormBatchMean" || s.OpName == "BatchNormBatchVariance")
-                     && !(consumerCounts.TryGetValue(s, out int statConsumers) && statConsumers > 0))
+            else if (node is LazyNode<float> s && (s.OpName == "BatchNormBatchMean" || s.OpName == "BatchNormBatchVariance"))
                 stats.Add(s);
             else return false;   // another reader of the normalized values, or a statistic something consumes
         }
@@ -123,6 +134,12 @@ internal static class BatchNormFusionMatch
         mean = savedMean; variance = savedVariance; epsilon = savedEpsilon;
         return true;
     }
+
+    /// <summary>
+    /// The CPU engine itself, not <see cref="DirectGpuTensorEngine"/>, which derives from it: GPU-recorded graphs keep
+    /// their own fusion rules.
+    /// </summary>
+    internal static bool IsCpuOnly(IEngine? engine) => engine is CpuEngine && engine is not DirectGpuTensorEngine;
 
     /// <summary>
     /// The fused node: ReLU(BN(x) [+ residual]) into <paramref name="output"/>, refreshing the BatchNorm's saved mean and
@@ -140,11 +157,20 @@ internal static class BatchNormFusionMatch
         // from x (BackwardFunctions.MaskFromInput), since the composed fallback rounds the normalized value its own way.
         // A one-element bool[] rather than a box: SavedStateSerializer writes bool[] (training-plan save).
         var forwardUsedKernel = new bool[1];
-        return new LazyNode<float>(LazyNodeType.Custom, opName, inputs, output,
+        var fused = new LazyNode<float>(LazyNodeType.Custom, opName, inputs, output,
             (eng, result) =>
             {
                 Tensor<float> fusedOutput, freshMean, freshVar;
                 Tensor<float>? kernelOutput = null, kernelMean = null, kernelVar = null;
+                // CPU: BatchNorm and ReLU written straight into the plan's output, the BatchNorm output never stored.
+                if (residual is null && eng is CpuEngine cpu && !eng.SupportsGpu
+                    && cpu.TryBatchNormReluTrainingInto(x, gamma, beta, epsilon, result, mean, variance))
+                {
+                    forwardUsedKernel[0] = false;
+                    foreach (var (statisticOutput, source) in statisticOutputs)
+                        source.AsSpan().CopyTo(statisticOutput.AsWritableSpan());
+                    return;
+                }
                 if (eng is DirectGpuTensorEngine gpu)
                     kernelOutput = gpu.TryBatchNormReluForward(x, gamma, beta, epsilon, out kernelMean, out kernelVar, residual);
                 forwardUsedKernel[0] = kernelOutput is not null && kernelMean is not null && kernelVar is not null;
@@ -185,5 +211,10 @@ internal static class BatchNormFusionMatch
         {
             RecordingEngine = bn.RecordingEngine,
         };
+        // The fused node writes the absorbed statistic outputs, so it is their producer: a reader of them (a CPU layer's
+        // running-statistics update) is ordered after it.
+        foreach (var statistic in statistics)
+            statistic.Output.LazySource = fused;
+        return fused;
     }
 }
