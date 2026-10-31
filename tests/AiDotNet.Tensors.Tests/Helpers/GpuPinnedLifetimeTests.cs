@@ -25,7 +25,7 @@ public class GpuPinnedLifetimeTests
     /// reliable detection: WeightRegistry.OffloadAllocator type-checking misses cases
     /// where TryGetGpuBuffer returns a non-allocator-backed buffer.
     /// </summary>
-    private static bool HasZeroCopyPinnedMapping()
+    private static bool HasCoherentPinnedMapping()
     {
         Tensor<float>? probeP = null, probeG = null;
         try
@@ -49,6 +49,49 @@ public class GpuPinnedLifetimeTests
         {
             if (probeP is not null) WeightRegistry.UnregisterWeight(probeP);
             if (probeG is not null) WeightRegistry.UnregisterWeight(probeG);
+        }
+    }
+
+    [SkippableFact]
+    public void GpuPinned_HostWriteAfterADeviceStep_ReachesTheNextStep()
+    {
+        // The managed array and the pinned buffer the kernel updates are two copies. A kernel result has to reach the
+        // next host read, and a host write made after that read has to reach the next kernel: an optimizer state loaded
+        // into a moment tensor mid-training is exactly that write.
+        var priorEngine = AiDotNet.Tensors.Engines.AiDotNetEngine.Current;
+        var gpu = new AiDotNet.Tensors.Engines.DirectGpuTensorEngine();
+        AiDotNet.Tensors.Engines.AiDotNetEngine.Current = gpu;
+        try
+        {
+            Skip.If(gpu.GetBackend() is null, "DirectGpu backend is not available.");
+            Skip.If(!HasCoherentPinnedMapping(),
+                "The GPU pinned allocator cannot hand the kernels a device view of the host data on this backend.");
+            var p = TensorAllocator.RentPinnedOnGpu<float>(new[] { 2 });
+            var g = TensorAllocator.RentPinnedOnGpu<float>(new[] { 2 });
+            try
+            {
+                p.GetDataArray()[0] = 10f; p.GetDataArray()[1] = -4f;
+                g.GetDataArray()[0] = 2f; g.GetDataArray()[1] = 1f;
+                Assert.True(AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TrySgdStep(p, g, learningRate: 1f));
+                Assert.Equal(8f, p.GetDataArray()[0], 4);
+                Assert.Equal(-5f, p.GetDataArray()[1], 4);
+
+                p.GetDataArray()[0] = 20f;
+                g.GetDataArray()[1] = 3f;
+                Assert.True(AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TrySgdStep(p, g, learningRate: 1f));
+                Assert.Equal(18f, p.GetDataArray()[0], 4);
+                Assert.Equal(-8f, p.GetDataArray()[1], 4);
+            }
+            finally
+            {
+                WeightRegistry.UnregisterWeight(p);
+                WeightRegistry.UnregisterWeight(g);
+            }
+        }
+        finally
+        {
+            AiDotNet.Tensors.Engines.AiDotNetEngine.Current = priorEngine;
+            gpu.Dispose();
         }
     }
 
@@ -173,8 +216,8 @@ public class GpuPinnedLifetimeTests
                 // do NOT provide zero-copy host↔device mapping — the optimizer kernel
                 // runs against a separate buffer the host never sees written. Skip
                 // in that case; this gate is independent of the no-GPU skip above.
-                Skip.If(!HasZeroCopyPinnedMapping(),
-                    "GPU pinned allocator does not expose a zero-copy host mapping on this backend.");
+                Skip.If(!HasCoherentPinnedMapping(),
+                    "The GPU pinned allocator cannot hand the kernels a device view of the host data on this backend.");
 
                 // Initialize values via flat-data span.
                 var pData = p.GetDataArray();
@@ -324,8 +367,8 @@ public class GpuPinnedLifetimeTests
                 // do NOT provide zero-copy host↔device mapping — the optimizer kernel
                 // runs against a separate buffer the host never sees written. Skip
                 // in that case; this gate is independent of the no-GPU skip above.
-                Skip.If(!HasZeroCopyPinnedMapping(),
-                    "GPU pinned allocator does not expose a zero-copy host mapping on this backend.");
+                Skip.If(!HasCoherentPinnedMapping(),
+                    "The GPU pinned allocator cannot hand the kernels a device view of the host data on this backend.");
 
                 var pData = p.GetDataArray();
                 var gData = g.GetDataArray();
@@ -383,8 +426,8 @@ public class GpuPinnedLifetimeTests
                 // do NOT provide zero-copy host↔device mapping — the optimizer kernel
                 // runs against a separate buffer the host never sees written. Skip
                 // in that case; this gate is independent of the no-GPU skip above.
-                Skip.If(!HasZeroCopyPinnedMapping(),
-                    "GPU pinned allocator does not expose a zero-copy host mapping on this backend.");
+                Skip.If(!HasCoherentPinnedMapping(),
+                    "The GPU pinned allocator cannot hand the kernels a device view of the host data on this backend.");
 
                 var pData = p.GetDataArray();
                 var initial = new float[] { 1.0f, 2.0f, 3.0f, 4.0f };

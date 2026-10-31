@@ -1419,6 +1419,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
             // until they wire their own non-owning buffer types.
             if (allocator is Engines.DirectGpu.IGpuDevicePointerWrapper wrapper)
             {
+                UploadHostToOffload();
                 return wrapper.WrapDevicePointerAsBuffer(
                     OffloadDevicePointer, Length, ElementByteSize());
             }
@@ -1726,6 +1727,61 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         // Re-register deferred materializer so next CPU read downloads fresh GPU data
         if (_gpuMaterializerCallback is not null && _gpuMaterializerKey is not null)
             Helpers.HostSync.Register(_gpuMaterializerKey, _gpuMaterializerCallback);
+        else if (_gpuBuffer is null)
+            ArmOffloadDownload();
+    }
+
+    // A GpuPinned / GpuOffload / GpuManaged tensor keeps its managed array beside the pinned (device-mapped) buffer the
+    // kernels read and write through TryGetGpuBuffer. The two were never reconciled: a host write never reached the
+    // kernel, and a kernel's result never reached a host read, so an optimizer moment read back as its initial zeros and a
+    // loaded state was never seen by the device. The host array is the copy until a device write; from then the pinned
+    // buffer is, until a host read downloads it.
+    private bool _offloadDeviceAhead;
+
+    // Raw-byte mirroring needs the pinned buffer to hold this tensor's elements in their own layout: a whole, unsliced
+    // tensor registered in the native encoding (bf16 / int8 stores re-encode, and their byte count differs).
+    private bool OffloadMirrorsHostArray(out T[]? array)
+    {
+        array = null;
+        if (OffloadHostPointer == IntPtr.Zero || _storageOffset != 0) return false;
+        if (OffloadByteCount != (long)Length * ElementByteSize()) return false;
+        array = GetBackingArrayForCacheLookupUnsafe();
+        return array is not null && array.Length == Length;
+    }
+
+    private unsafe void UploadHostToOffload()
+    {
+        if (Volatile.Read(ref _offloadDeviceAhead) || !OffloadMirrorsHostArray(out var array) || array is null) return;
+        Unsafe.CopyBlockUnaligned(
+            ref Unsafe.AsRef<byte>((void*)OffloadHostPointer),
+            ref Unsafe.As<T, byte>(ref array[0]),
+            checked((uint)OffloadByteCount));
+    }
+
+    private void ArmOffloadDownload()
+    {
+        if (!OffloadMirrorsHostArray(out var array) || array is null) return;
+        Volatile.Write(ref _offloadDeviceAhead, true);
+        var owner = new WeakReference<TensorBase<T>>(this);
+        Helpers.HostSync.Register(array, key =>
+        {
+            if (owner.TryGetTarget(out var tensor)) tensor.DownloadOffloadToHost((T[])key);
+        });
+    }
+
+    private unsafe void DownloadOffloadToHost(T[] array)
+    {
+        // The kernel that wrote the pinned buffer may still be running.
+        Synchronize();
+        if (OffloadHostPointer != IntPtr.Zero && array.Length == Length
+            && OffloadByteCount == (long)Length * ElementByteSize())
+        {
+            Unsafe.CopyBlockUnaligned(
+                ref Unsafe.As<T, byte>(ref array[0]),
+                ref Unsafe.AsRef<byte>((void*)OffloadHostPointer),
+                checked((uint)OffloadByteCount));
+        }
+        Volatile.Write(ref _offloadDeviceAhead, false);
     }
 
     /// <summary>
