@@ -240,6 +240,8 @@ public class GpuPinnedLifetimeTests
                 // regression, not a host-capability skip. Fail loudly.
                 Assert.True(ran,
                     "GpuOptimizer.TryAdamStep returned false after GPU preconditions were met — kernel-dispatch regression.");
+                // The step wrote the pinned buffer; the host array sees it at the next host read.
+                pData = p.GetDataArray();
 
                 // Closed-form expected post-step values.
                 for (int i = 0; i < 4; i++)
@@ -379,6 +381,8 @@ public class GpuPinnedLifetimeTests
                 bool ran = AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TrySgdStep(p, g, learningRate: lr);
                 Assert.True(ran,
                     "GpuOptimizer.TrySgdStep returned false after GPU preconditions were met — kernel-dispatch regression.");
+                // The step wrote the pinned buffer; the host array sees it at the next host read.
+                pData = p.GetDataArray();
 
                 for (int i = 0; i < 4; i++)
                 {
@@ -440,6 +444,8 @@ public class GpuPinnedLifetimeTests
                     epsilon: 1e-8f, weightDecay: 0.01f, step: 1);
                 Assert.True(ran,
                     "GpuOptimizer.TryAdamWStep returned false after GPU preconditions were met — kernel-dispatch regression.");
+                // The step wrote the pinned buffer; the host array sees it at the next host read.
+                pData = p.GetDataArray();
 
                 // AdamW's decoupled weight decay updates `p -= lr * wd * p`
                 // BEFORE the Adam moment update. With grad=0, the only thing
