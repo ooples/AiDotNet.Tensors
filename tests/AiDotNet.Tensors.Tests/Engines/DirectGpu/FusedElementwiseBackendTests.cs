@@ -18,22 +18,14 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// batched dot product; and the CSR SpMM with bias. Runs on every backend this
 /// machine has; each one absent is skipped by name.
 /// </summary>
-[Collection("DirectGpuSerial")]
-public sealed class FusedElementwiseBackendTests
+public abstract class FusedElementwiseBackendTestsBase
 {
+    private readonly string _name;
+
+    protected FusedElementwiseBackendTestsBase(string name) => _name = name;
     private const int Length = 4099;          // a float4 body and a scalar tail
     private const double RelativeTolerance = 2e-6;
     private const double AbsoluteTolerance = 1e-6;
-
-    public static IEnumerable<object[]> Backends()
-    {
-        yield return new object[] { "cuda" };
-        yield return new object[] { "hip" };
-        yield return new object[] { "opencl" };
-        yield return new object[] { "vulkan" };
-        yield return new object[] { "metal" };
-        yield return new object[] { "webgpu" };
-    }
 
     private static float[] Values(int salt) => Values(salt, Length);
 
@@ -49,12 +41,11 @@ public sealed class FusedElementwiseBackendTests
         => Assert.True(Math.Abs(expected - actual) <= AbsoluteTolerance + RelativeTolerance * Math.Abs(expected),
             $"{op}[{index}]: expected {expected}, got {actual}");
 
-    [SkippableTheory]
-    [MemberData(nameof(Backends))]
-    public void AddActivations_EqualTheActivatedSum(string name)
+    [SkippableFact]
+    public void AddActivations_EqualTheActivatedSum()
     {
-        using var lease = Create(name, out var backend);
-        Skip.If(backend is null, name + " is not available on this machine.");
+        using var lease = Create(_name, out var backend);
+        Skip.If(backend is null, _name + " is not available on this machine.");
         var a = Values(1);
         var b = Values(2);
         using var bufA = backend.AllocateBuffer(a);
@@ -76,12 +67,11 @@ public sealed class FusedElementwiseBackendTests
         }
     }
 
-    [SkippableTheory]
-    [MemberData(nameof(Backends))]
-    public void Fma_IntoItsAddend_IsAProductPlusTheAddend(string name)
+    [SkippableFact]
+    public void Fma_IntoItsAddend_IsAProductPlusTheAddend()
     {
-        using var lease = Create(name, out var backend);
-        Skip.If(backend is null, name + " is not available on this machine.");
+        using var lease = Create(_name, out var backend);
+        Skip.If(backend is null, _name + " is not available on this machine.");
         var a = Values(3);
         var b = Values(4);
         var c = Values(5);
@@ -95,12 +85,11 @@ public sealed class FusedElementwiseBackendTests
         for (int i = 0; i < Length; i++) AssertClose((double)a[i] * b[i] + c[i], d[i], i, "Fma");
     }
 
-    [SkippableTheory]
-    [MemberData(nameof(Backends))]
-    public void SplitComplexFamily_EqualsTheComplexArithmetic(string name)
+    [SkippableFact]
+    public void SplitComplexFamily_EqualsTheComplexArithmetic()
     {
-        using var lease = Create(name, out var backend);
-        Skip.If(backend is null, name + " is not available on this machine.");
+        using var lease = Create(_name, out var backend);
+        Skip.If(backend is null, _name + " is not available on this machine.");
         var aR = Values(6); var aI = Values(7); var bR = Values(8); var bI = Values(9);
         using var bufAR = backend.AllocateBuffer(aR);
         using var bufAI = backend.AllocateBuffer(aI);
@@ -137,12 +126,11 @@ public sealed class FusedElementwiseBackendTests
         for (int i = 0; i < Length; i++) AssertClose((double)aR[i] * aR[i] + (double)aI[i] * aI[i], mag[i], i, "MagnitudeSquared");
     }
 
-    [SkippableTheory]
-    [MemberData(nameof(Backends))]
-    public void BatchedDotProduct_EqualsEachRowsDot(string name)
+    [SkippableFact]
+    public void BatchedDotProduct_EqualsEachRowsDot()
     {
-        using var lease = Create(name, out var backend);
-        Skip.If(backend is null, name + " is not available on this machine.");
+        using var lease = Create(_name, out var backend);
+        Skip.If(backend is null, _name + " is not available on this machine.");
         const int rows = 5, width = 1027;   // more columns than a 256-thread group, and not a multiple of it
         var a = Values(10, rows * width); var b = Values(11, rows * width);
         using var bufA = backend.AllocateBuffer(a);
@@ -160,12 +148,11 @@ public sealed class FusedElementwiseBackendTests
         }
     }
 
-    [SkippableTheory]
-    [MemberData(nameof(Backends))]
-    public void CsrSpMMBias_AddsTheColumnBiasToTheProduct(string name)
+    [SkippableFact]
+    public void CsrSpMMBias_AddsTheColumnBiasToTheProduct()
     {
-        using var lease = Create(name, out var backend);
-        Skip.If(backend is null, name + " is not available on this machine.");
+        using var lease = Create(_name, out var backend);
+        Skip.If(backend is null, _name + " is not available on this machine.");
         // A [3 x 4] in CSR: row 0 {0: 2, 3: -1}, row 1 empty, row 2 {1: 0.5, 2: 4}; B [4 x 5]; bias [5].
         const int m = 3, k = 4, n = 5;
         var values = new[] { 2f, -1f, 0.5f, 4f };
@@ -206,18 +193,20 @@ public sealed class FusedElementwiseBackendTests
                 "vulkan" => VulkanBackend.Instance,   // the process-wide instance; never disposed here
                 "metal" => new MetalBackend(),
 #if NET7_0_OR_GREATER
-                "webgpu" => new AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuBackend(),
+                "webgpu" => DawnHostedWebGpu.BackendOrNull()
+                            ?? throw new PlatformNotSupportedException("Dawn is not set up (AIDOTNET_WEBGPU_NODE_DIR)."),
 #endif
                 _ => throw new PlatformNotSupportedException(name),
             };
             if (candidate is VulkanBackend vulkan && !vulkan.IsAvailable) vulkan.Initialize();
+            bool shared = name is "vulkan" or "webgpu";
             if (!candidate.IsAvailable)
             {
-                if (name != "vulkan") (candidate as IDisposable)?.Dispose();
+                if (!shared) (candidate as IDisposable)?.Dispose();
                 return null;
             }
             backend = candidate;
-            return name == "vulkan" ? null : candidate as IDisposable;
+            return shared ? null : candidate as IDisposable;
         }
         catch (Exception ex) when (ex is not Xunit.Sdk.XunitException)
         {
@@ -225,3 +214,22 @@ public sealed class FusedElementwiseBackendTests
         }
     }
 }
+
+// One class per backend, so each backend's CI lane selects its own (the Metal lane runs FullyQualifiedName~Metal).
+[Collection("DirectGpuSerial")]
+public sealed class CudaFusedElementwiseTests : FusedElementwiseBackendTestsBase { public CudaFusedElementwiseTests() : base("cuda") { } }
+
+[Collection("DirectGpuSerial")]
+public sealed class HipFusedElementwiseTests : FusedElementwiseBackendTestsBase { public HipFusedElementwiseTests() : base("hip") { } }
+
+[Collection("DirectGpuSerial")]
+public sealed class OpenClFusedElementwiseTests : FusedElementwiseBackendTestsBase { public OpenClFusedElementwiseTests() : base("opencl") { } }
+
+[Collection("DirectGpuSerial")]
+public sealed class VulkanFusedElementwiseTests : FusedElementwiseBackendTestsBase { public VulkanFusedElementwiseTests() : base("vulkan") { } }
+
+[Collection("DirectGpuSerial")]
+public sealed class MetalFusedElementwiseTests : FusedElementwiseBackendTestsBase { public MetalFusedElementwiseTests() : base("metal") { } }
+
+[Collection("DirectGpuSerial")]
+public sealed class WebGpuFusedElementwiseTests : FusedElementwiseBackendTestsBase { public WebGpuFusedElementwiseTests() : base("webgpu") { } }
