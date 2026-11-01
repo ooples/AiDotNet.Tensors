@@ -1,6 +1,7 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
 #if NET9_0_OR_GREATER
 using System;
+using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using AiDotNet.Tensors.Helpers;
@@ -24,6 +25,7 @@ internal static unsafe partial class DepthwiseConv3x3
             && (Vector512.IsHardwareAccelerated || s_forceAvx512ForTest);
 
     /// <summary>Sixteen planes [hw] (plane stride hw) into d [hw, 16].</summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static void Pack16(float* s, int hw, float* d)
     {
         int q = 0;
@@ -36,15 +38,22 @@ internal static unsafe partial class DepthwiseConv3x3
             for (int l = 0; l < 16; l++) d[q * 16 + l] = s[(long)l * hw + q];
     }
 
-    /// <summary>Sixteen planes [h, wd] into the interior of the zero-bordered tile [(h + 2), (wd + 2), 16].</summary>
-    private static void PackPadded16(float* s, int h, int wd, float* tile, float* scratch)
+    /// <summary>Sixteen planes [h, wd] into the interior of the zero-bordered tile [(h + 2), (wd + 2), 16], row by row.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void PackPadded16(float* s, int h, int wd, float* tile)
     {
-        Pack16(s, h * wd, scratch);
-        int tw = wd + 2;
+        int hw = h * wd, tw = wd + 2;
         for (int i = 0; i < h; i++)
         {
-            float* src = scratch + i * wd * 16, dst = tile + ((i + 1) * tw + 1) * 16;
-            for (int j = 0; j < wd; j++) Vector512.Store(Vector512.Load(src + j * 16), dst + j * 16);
+            float* src = s + i * wd, dst = tile + ((i + 1) * tw + 1) * 16;
+            int q = 0;
+            for (; q + 8 <= wd; q += 8)
+            {
+                Transpose8x8(src + q, hw, dst + q * 16, 16);
+                Transpose8x8(src + 8L * hw + q, hw, dst + q * 16 + 8, 16);
+            }
+            for (; q < wd; q++)
+                for (int l = 0; l < 16; l++) dst[q * 16 + l] = src[(long)l * hw + q];
         }
     }
 
@@ -54,21 +63,21 @@ internal static unsafe partial class DepthwiseConv3x3
     {
         int oH = (h - 1) / stride + 1, oW = (wd - 1) / stride + 1;
         int blocks = channels / 16;
-        CpuParallelSettings.ParallelForOrSerial(0, blocks, (long)batch * channels * oH * oW * 9, blk =>
+        CpuParallelSettings.ParallelForOrSerial(0, blocks, (long)batch * channels * oH * oW * 9,
+            [MethodImpl(MethodImplOptions.AggressiveOptimization)] (blk) =>
         {
             int tw = wd + 2, tileLen = (h + 2) * tw * 16;
             var tile = Tile(ref t_tile, tileLen);
-            var packScratch = Tile(ref t_tileOut, h * wd * 16 + 64);
             var gTile = Tile(ref t_scratch, oH * oW * 16 + 64);
             int c0 = blk * 16;
             Vector512<float> a0 = Vector512<float>.Zero, a1 = a0, a2 = a0, a3 = a0, a4 = a0, a5 = a0, a6 = a0, a7 = a0, a8 = a0;
-            fixed (float* px = x, pdy = dy, tp = tile, gp = gTile, sp = packScratch)
+            fixed (float* px = x, pdy = dy, tp = tile, gp = gTile)
             {
                 new Span<float>(tp, tileLen).Clear();
                 int rowStep = tw * 16;
                 for (int b = 0; b < batch; b++)
                 {
-                    PackPadded16(px + ((long)b * channels + c0) * h * wd, h, wd, tp, sp);
+                    PackPadded16(px + ((long)b * channels + c0) * h * wd, h, wd, tp);
                     Pack16(pdy + ((long)b * channels + c0) * oH * oW, oH * oW, gp);
                     for (int i = 0; i < oH; i++)
                     {
