@@ -20,6 +20,11 @@ internal static partial class SimdGemm
     /// <summary>Output columns of the 512-bit direct tile.</summary>
     internal const int Nr512 = 32;
 
+    // Keep small-k calls from repeatedly growing the thread-local strip buffer.
+    private const int MinPackedStripRows = 64;
+    // 256 rows of 32 floats occupy 32 KB, leaving the packed tile in L1.
+    private const int DefaultPackedStripRows = 256;
+
     /// <summary>
     /// Whether the direct GEMM paths run full 32-column strips on <see cref="DirectKernel6x32Store"/>: the runtime
     /// accelerates 512-bit vectors here (it reports false on CPUs where they downclock the core).
@@ -146,7 +151,7 @@ internal static partial class SimdGemm
     /// block, and the A panel's lines with it. AIDOTNET_GEMM_KC overrides (0 = no blocking).
     /// </summary>
     internal static readonly int s_stripKc =
-        int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_KC"), out int kc) && kc >= 0 ? kc : 256;
+        int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_KC"), out int kc) && kc >= 0 ? kc : DefaultPackedStripRows;
 
     /// <summary>The 512-bit <see cref="TransAKernel6x16"/>: six rows x 32 columns of C = At*B, overwriting C; pA points at
     /// row i0 of At (A + i0), lda = m; C's rows are <paramref name="ldc"/> apart (B may be a packed strip, ldb = 32).</summary>
@@ -203,7 +208,7 @@ internal static partial class SimdGemm
     internal static float[] PackedStripBuffer(int k)
     {
         var buffer = t_packedStrip;
-        if (buffer is null || buffer.Length < k * Nr512) t_packedStrip = buffer = new float[Math.Max(k, 64) * Nr512];
+        if (buffer is null || buffer.Length < k * Nr512) t_packedStrip = buffer = new float[Math.Max(k, MinPackedStripRows) * Nr512];
         return buffer;
     }
 

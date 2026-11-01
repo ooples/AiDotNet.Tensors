@@ -110,6 +110,42 @@ public sealed class GotoGemmRoutingTests
     }
 
 #if NET9_0_OR_GREATER
+    [SkippableFact]
+    public void ThinMDeepK_ProductionGemmHonorsPackedRouteOverride()
+    {
+        Skip.IfNot(System.Runtime.Intrinsics.X86.Fma.IsSupported && GotoGemmFp32.IsAvailable,
+            "Both direct FMA and packed GotoGemm routes must be available.");
+        const int m = 128, k = 784, n = 512;
+        var a = new float[m * k];
+        var b = new float[k * n];
+        var c = new float[m * n];
+        var rng = RandomHelper.CreateSeededRandom(1644);
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() - 0.5);
+        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() - 0.5);
+        bool? beforeForce = AiDotNet.Tensors.Engines.Simd.SimdGemm.s_forceVector512Direct;
+        bool beforeGoto = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.s_thinMGotoOn512;
+        bool beforeDirect = AiDotNet.Tensors.Engines.Simd.SimdGemm.UseDirectParallel2D;
+        try
+        {
+            AiDotNet.Tensors.Engines.Simd.SimdGemm.s_forceVector512Direct = true;
+            AiDotNet.Tensors.Engines.Simd.SimdGemm.UseDirectParallel2D = true;
+            foreach (bool packed in new[] { false, true })
+            {
+                AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.s_thinMGotoOn512 = packed;
+                int before = AiDotNet.Tensors.Engines.Simd.SimdGemm.t_directParallel2DRuns;
+                AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(a, k, false, b, n, false, c, n, m, n, k,
+                    new BlasOptions<float> { PackingMode = PackingMode.DisableAutotune });
+                Assert.Equal(before + (packed ? 0 : 1), AiDotNet.Tensors.Engines.Simd.SimdGemm.t_directParallel2DRuns);
+            }
+        }
+        finally
+        {
+            AiDotNet.Tensors.Engines.Simd.SimdGemm.s_forceVector512Direct = beforeForce;
+            AiDotNet.Tensors.Engines.Simd.SimdGemm.UseDirectParallel2D = beforeDirect;
+            AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.s_thinMGotoOn512 = beforeGoto;
+        }
+    }
+
     // The packed route's microkernel is 256-bit: where the 512-bit direct tile runs, a deep-K thin-M product takes
     // that tile instead, unless AIDOTNET_THINM_GOTO_512 keeps the packed route.
     [Fact]
