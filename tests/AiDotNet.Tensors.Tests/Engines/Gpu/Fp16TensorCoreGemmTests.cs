@@ -2,6 +2,7 @@ using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Tests.Engines.DirectGpu;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.Gpu;
@@ -14,18 +15,25 @@ namespace AiDotNet.Tensors.Tests.Engines.Gpu;
 /// path is correct, not just fast. Inputs are produced by the driver-only <c>ConvertToFp16Native</c> kernel,
 /// so the whole chain works without the CUDA Toolkit (no cuda_fp16.h).
 /// </summary>
-public class Fp16TensorCoreGemmTests
+[Collection("DirectGpuSerial")]
+public class Fp16TensorCoreGemmTests : IClassFixture<DirectGpuTensorEngineTestFixture>
 {
+    // The test's own engine: the process-wide current engine is shared and other tests reset it to the CPU,
+    // so reading it made these tests skip on a CUDA machine depending on test order.
+    private readonly DirectGpuTensorEngineTestFixture _fixture;
+
+    public Fp16TensorCoreGemmTests(DirectGpuTensorEngineTestFixture fixture) => _fixture = fixture;
+
     [SkippableFact]
     public void GemmFp16_matches_fp32_reference_within_fp16_tolerance()
     {
         Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver not available");
-        var eng = AiDotNetEngine.Current;
-        Skip.IfNot(eng is DirectGpuTensorEngine, "active engine is not the CUDA backend");
+        var eng = _fixture.Engine;
+        Skip.IfNot(eng is not null, "the DirectGpu engine did not initialize");
         // Warm up: a real GPU op forces the engine's kernel modules (incl. the FP16 module) to compile.
         var warm = new Tensor<float>(new float[] { 1, 2, 3, 4 }, new[] { 2, 2 });
-        _ = eng.TensorMatMul(warm, warm);
-        var b = ((DirectGpuTensorEngine)eng).TestBackend as CudaBackend;
+        _ = eng!.TensorMatMul(warm, warm);
+        var b = eng!.TestBackend as CudaBackend;
         Skip.IfNot(b is not null && b.IsAvailable, "CudaBackend not available");
 
         const int M = 64, K = 128, N = 48;
@@ -102,11 +110,11 @@ public class Fp16TensorCoreGemmTests
         // keep the matmul activation resident as Half instead of up-casting to FP32. FP16 in, FP32 accumulate,
         // Half stored output; up-cast back to FP32 (ConvertToFp32Native) to compare against the CPU reference.
         Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver not available");
-        var eng = AiDotNetEngine.Current;
-        Skip.IfNot(eng is DirectGpuTensorEngine, "active engine is not the CUDA backend");
+        var eng = _fixture.Engine;
+        Skip.IfNot(eng is not null, "the DirectGpu engine did not initialize");
         var warm = new Tensor<float>(new float[] { 1, 2, 3, 4 }, new[] { 2, 2 });
-        _ = eng.TensorMatMul(warm, warm);
-        var b = ((DirectGpuTensorEngine)eng).TestBackend as CudaBackend;
+        _ = eng!.TensorMatMul(warm, warm);
+        var b = eng!.TestBackend as CudaBackend;
         Skip.IfNot(b is not null && b.IsAvailable, "CudaBackend not available");
 
         const int M = 64, K = 96, N = 48; // non-square, distinct dims
