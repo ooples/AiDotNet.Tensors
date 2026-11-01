@@ -22,9 +22,29 @@ on:
         description: 'Skip the full parity run; time the CPU networks and the per-op breakdown with AVX-512 on and off'
         type: boolean
         default: false
+      probe_modes:
+        description: 'AVX-512 probe (exits on an AVX2 runner): space-separated NAME=VAR=VALUE[,VAR=VALUE] modes, NAME= for the default'
+        type: string
+        default: ''
+      probe_filter:
+        description: 'AIDOTNET_OP_FILTER for the probe breakdown'
+        type: string
+        default: ''
+      probe_threads:
+        description: 'AIDOTNET_OP_THREADS for the probe'
+        type: string
+        default: '1,2,4'
+      probe_perf:
+        description: 'perf-profile the probe breakdown rows matching this filter (default mode)'
+        type: string
+        default: ''
+      probe_perf_threads:
+        description: 'threads for the perf profile'
+        type: string
+        default: '4'
 
 concurrency:
-  group: parity-${{ github.ref }}-${{ github.event_name }}
+  group: parity-${{ github.ref }}-${{ github.event_name }}-${{ inputs.probe_modes != '' && github.run_id || 'main' }}
   cancel-in-progress: true
 
 permissions:
@@ -37,7 +57,7 @@ env:
 
 jobs:
   ratchet:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && inputs.probe_modes == ''
     runs-on: ubuntu-latest
     # PyTorch is timed at its best: every execution mode, torch.compile included (see the parity job).
     timeout-minutes: 120
@@ -131,8 +151,107 @@ jobs:
             /tmp/aidotnet-parity/*-latest.json
           if-no-files-found: warn
 
+  probe:
+    if: github.event_name == 'workflow_dispatch' && inputs.probe_modes != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Require AVX-512
+        id: isa
+        run: |
+          lscpu | grep -E 'Model name|^CPU\(s\)|Thread'
+          if grep -q avx512f /proc/cpuinfo; then echo "run=1" >> "$GITHUB_OUTPUT"; else echo "AVX2 runner: nothing to probe"; fi
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        if: steps.isa.outputs.run == '1'
+
+      - name: Setup .NET
+        if: steps.isa.outputs.run == '1'
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Setup Python
+        if: steps.isa.outputs.run == '1'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+
+      - name: Install PyTorch (CPU) and perf
+        if: steps.isa.outputs.run == '1'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "torch==${TORCH_VERSION}" --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install numpy
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq linux-tools-common "linux-tools-$(uname -r)" || sudo apt-get install -y -qq linux-tools-azure || true
+          sudo sysctl -w kernel.perf_event_paranoid=-1 || true
+
+      - name: Build
+        if: steps.isa.outputs.run == '1'
+        run: |
+          dotnet restore tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj
+          dotnet build tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-restore --framework net10.0
+
+      - name: Probe
+        if: steps.isa.outputs.run == '1'
+        env:
+          AIDOTNET_OP_BREAKDOWN: '1'
+          AIDOTNET_OP_FILTER: ${{ inputs.probe_filter }}
+          AIDOTNET_OP_THREADS: ${{ inputs.probe_threads }}
+          MODES: ${{ inputs.probe_modes }}
+        run: |
+          out="$RUNNER_TEMP/probe.md"
+          lscpu | grep -E 'Model name|^CPU\(s\)|Thread' > "$out"
+          python tools/parity/cpu_op_breakdown_torch.py > "$RUNNER_TEMP/ops-torch.log"
+          for spec in $MODES; do
+            name="${spec%%=*}"; settings="${spec#*=}"
+            (
+              IFS=','
+              for kv in $settings; do [ -n "$kv" ] && export "$kv"; done
+              unset IFS
+              dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-build --framework net10.0 \
+                --filter "FullyQualifiedName~CpuOpBreakdownBench" --logger "console;verbosity=detailed" \
+                | grep OPBREAKDOWN | sed 's/^\s*//' > "$RUNNER_TEMP/ops-$name.log"
+            )
+            {
+              echo "## mode ${name} ${settings}"
+              echo '```'
+              python tools/parity/join_op_breakdown.py "$RUNNER_TEMP/ops-$name.log" "$RUNNER_TEMP/ops-torch.log"
+              echo '```'
+            } >> "$out"
+          done
+          cat "$out"
+
+      - name: Perf profile
+        if: steps.isa.outputs.run == '1' && inputs.probe_perf != ''
+        continue-on-error: true
+        env:
+          AIDOTNET_OP_BREAKDOWN: '1'
+          AIDOTNET_OP_FILTER: ${{ inputs.probe_perf }}
+          AIDOTNET_OP_THREADS: ${{ inputs.probe_perf_threads }}
+          AIDOTNET_OP_SAMPLES: '2000'
+          DOTNET_PerfMapEnabled: '1'
+          DOTNET_EnableWriteXorExecute: '0'
+        run: |
+          PERF=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1)
+          PERF=${PERF:-perf}
+          $PERF record -F 2000 -o "$RUNNER_TEMP/row.perf" -- dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj \
+            --configuration Release --no-build --framework net10.0 --filter "FullyQualifiedName~CpuOpBreakdownBench" \
+            --logger "console;verbosity=detailed" 2>&1 | grep OPBREAKDOWN
+          {
+            echo "## perf ${AIDOTNET_OP_FILTER} t${AIDOTNET_OP_THREADS}"
+            echo '```'
+            $PERF report -i "$RUNNER_TEMP/row.perf" --sort dso,sym --stdio 2>/dev/null | grep -E '^ +[0-9]' | head -40 | cut -c1-240
+            echo '```'
+          } | tee -a "$RUNNER_TEMP/probe.md"
+
+      - name: Summary
+        if: always() && steps.isa.outputs.run == '1'
+        run: cat "$RUNNER_TEMP/probe.md" >> "$GITHUB_STEP_SUMMARY"
+
   parity:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.probe_modes == '')
     runs-on: ubuntu-latest
     # Every case times PyTorch in each mode it offers, torch.compile (default and max-autotune, with and without
     # channels_last) at both thread counts included, so a run compiles each network several times.
