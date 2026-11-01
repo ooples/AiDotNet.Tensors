@@ -35,6 +35,11 @@ public class DirectConvAvx512Tests
         { 2, 64, 64, 9, 1, 2, 5, 1 },
         { 3, 32, 64, 11, 2, 2, 5, 1 },
         { 2, 64, 64, 9, 1, 2, 3, 2 },
+        // Rows of twelve or more positions take the row kernel (twelve positions from one pointer): rows of 30 (two
+        // row runs and a six-position remainder), a dilated row, and 256 input channels (several seeded passes).
+        { 2, 64, 64, 30, 1, 1, 3, 1 },
+        { 1, 32, 32, 17, 1, 2, 3, 2 },
+        { 1, 256, 32, 14, 1, 1, 3, 1 },
     };
 
     [SkippableTheory]
