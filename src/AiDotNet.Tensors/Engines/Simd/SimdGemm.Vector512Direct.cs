@@ -28,7 +28,8 @@ internal static partial class SimdGemm
 
     /// <summary>Test override of <see cref="UseVector512Direct"/>: true runs the 512-bit tiles in software on any CPU (same
     /// results, slowly), false keeps them off. Null follows the hardware.</summary>
-    internal static bool? s_forceVector512Direct;
+    internal static bool? s_forceVector512Direct =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_V512_DIRECT") == "0" ? false : null;   // A/B switch on AVX-512 hosts
 
     /// <summary><c>C[6,32] = A[6,k] · B[k,32]</c> (row-major, C overwritten): the 6x16 direct kernel at twice the width.</summary>
     [MethodImpl(HotInline)]

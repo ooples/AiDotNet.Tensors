@@ -1698,6 +1698,9 @@ public static partial class BlasManaged
     /// This selection drives the layout of packed-A and packed-B, so it must
     /// match the microkernel the strategy ultimately dispatches to.
     /// </summary>
+    /// <summary>A/B switch (AIDOTNET_AVX512_GEMM_TILE=0): AVX-512 hosts pack for the AVX2 tiles instead of 16x16.</summary>
+    internal static readonly bool s_avx512Fp32Tile = Environment.GetEnvironmentVariable("AIDOTNET_AVX512_GEMM_TILE") != "0";
+
     private static (int Mr, int Nr) PickMicrokernelTile<T>() where T : unmanaged =>
         PickMicrokernelTile<T>(Helpers.BlasProvider.IsDeterministicMode);
 
@@ -1719,7 +1722,7 @@ public static partial class BlasManaged
         }
         if (typeof(T) == typeof(float))
         {
-            if (Avx512Fp32_16x16.IsSupported) return (16, 16);
+            if (Avx512Fp32_16x16.IsSupported && s_avx512Fp32Tile) return (16, 16);
             // #409 S.3: the higher-arithmetic-intensity 6×16 kernel (1.5 FMA/load, ~66% of
             // peak vs the load-bound 8×8's ~0.89 / ~49-59%) is used in FAST (non-deterministic)
             // mode only. Deterministic mode keeps 8×8 because 6×16's Mr=6 leaves an M-tail on
@@ -1760,7 +1763,7 @@ public static partial class BlasManaged
     private static (int Mr, int Nr) PickMicrokernelTilePrePack<T>() where T : unmanaged
     {
         if (typeof(T) == typeof(float)
-            && !Avx512Fp32_16x16.IsSupported   // AVX-512 FP32 already uses 16×16 (unchanged)
+            && !(Avx512Fp32_16x16.IsSupported && s_avx512Fp32Tile)   // AVX-512 FP32 already uses 16×16 (unchanged)
             && Avx2Fp32_8x8.IsSupported)
             return (8, 8);
         // #409 S.4: FP64 pre-pack stays on the legacy 4×8 tile regardless of Fast/

@@ -185,9 +185,12 @@ public class CpuOpBreakdownBench
     private void Row(string op, string shape, int threads, Action run)
     {
         if (Filter is { Length: > 0 } && $"{op} | {shape}".IndexOf(Filter, StringComparison.Ordinal) < 0) return;
-        for (int i = 0; i < 5; i++) run();
+        // Warm up for at least 5 calls and 250 ms: tiered compilation promotes a method after 30 calls plus a 100 ms
+        // delay, so five calls timed the small operations' kernels unoptimized (a 28x28 depthwise forward read 1.5 ms
+        // against 0.18 fully compiled). A training run reaches the optimized code within its first steps.
+        var sw = Stopwatch.StartNew();
+        for (int i = 0; i < 5 || sw.ElapsedMilliseconds < 250; i++) run();
         var samples = new List<double>(Samples);
-        var sw = new Stopwatch();
         for (int i = 0; i < Samples; i++)
         {
             sw.Restart();

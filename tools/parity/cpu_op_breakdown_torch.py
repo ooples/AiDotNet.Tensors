@@ -60,8 +60,12 @@ SAMPLES = int(os.environ.get("AIDOTNET_OP_SAMPLES", "31"))
 
 
 def median_ms(fn) -> float:
-    for _ in range(5):
+    # The same warm-up as the C# side: at least 5 calls and 250 ms.
+    start = time.perf_counter()
+    calls = 0
+    while calls < 5 or time.perf_counter() - start < 0.25:
         fn()
+        calls += 1
     samples = []
     for _ in range(SAMPLES):
         t0 = time.perf_counter()
