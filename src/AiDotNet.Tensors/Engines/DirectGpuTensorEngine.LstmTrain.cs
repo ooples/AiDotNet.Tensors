@@ -110,6 +110,7 @@ public partial class DirectGpuTensorEngine
     /// </remarks>
     public Tensor<T>? TryLstmSequenceTrain<T>(Tensor<T> input, Tensor<T> wIh, Tensor<T> wHh, Tensor<T> bias)
     {
+        using var __gpuOp = EnterGpuOp();
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)
             || backend is not IFusedLstmSequenceTraining fused
             || input.Rank != 3 || wIh.Rank != 2 || wHh.Rank != 2 || bias.Length != wIh._shape[0])
@@ -157,6 +158,7 @@ public partial class DirectGpuTensorEngine
     private Tensor<T>? TryRecordLstmSequenceTrain<T>(Compilation.LazyTensorScope scope, Tensor<T> input,
         Tensor<T> wIh, Tensor<T> wHh, Tensor<T>? bIh, Tensor<T>? bHh, bool lastStepOnly = false)
     {
+        using var __gpuOp = EnterGpuOp();
         // PlacementBackend, not GetBackend: the latter refuses every backend while a graph is traced (#350),
         // which is exactly when this records. The kernels run later, when the node executes.
         if (typeof(T) != typeof(float) || PlacementBackend is not IFusedLstmSequenceTraining fused
@@ -180,6 +182,7 @@ public partial class DirectGpuTensorEngine
             (eng, output) =>
             {
                 var gpu = (DirectGpuTensorEngine)eng;
+                using var __gpuOp = gpu.EnterGpuOp();
                 var backend = gpu.GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
                 // The cache is resolved when the node runs, with the backend live; it is per layer (keyed by the
                 // weight tensor) and stable across steps, so a captured graph keeps valid pointers.
@@ -214,6 +217,7 @@ public partial class DirectGpuTensorEngine
     private Tensor<T> RunLstmForward<T>(Tensor<T> input, Tensor<T> wIh, Tensor<T> wHh, Tensor<T> bias, LstmTrainCache c,
         Tensor<T>? secondBias = null, bool lastStepOnly = false)
     {
+        using var __gpuOp = EnterGpuOp();
         var backend = GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
         var inputC = input.IsContiguous ? input : (Tensor<T>)input.Contiguous();
         using var bufInput = GetOrAllocateBuffer(backend, inputC);
@@ -253,6 +257,7 @@ public partial class DirectGpuTensorEngine
                 + "one set of activation buffers, so these gradients would come from the later call. Run one forward "
                 + "per layer per step on this path, or train the layer through the per-timestep ops.");
         }
+        using var __gpuOp = gpu.EnterGpuOp();
         var backend = gpu.GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
         var input = inputs[0]; var wIh = inputs[1]; var wHh = inputs[2];
 

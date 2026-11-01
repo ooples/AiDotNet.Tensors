@@ -14,7 +14,7 @@ public class TensorCodecOptionsCurrentTests
     [Fact]
     public void An_assignment_through_Current_is_seen_by_the_next_read_on_the_same_thread()
     {
-        var prior = TensorCodecOptions.Current;
+        var prior = TensorCodecOptions.Save();   // restores the options AND the thread\'s determinism override
         try
         {
             TensorCodecOptions.SetCurrent(null);   // a thread with nothing configured
@@ -23,14 +23,14 @@ public class TensorCodecOptionsCurrentTests
         }
         finally
         {
-            TensorCodecOptions.SetCurrent(prior);
+            prior.Dispose();
         }
     }
 
     [Fact]
     public void An_assignment_through_Current_stays_on_its_own_thread()
     {
-        var prior = TensorCodecOptions.Current;
+        var prior = TensorCodecOptions.Save();   // restores the options AND the thread\'s determinism override
         try
         {
             TensorCodecOptions.SetCurrent(null);
@@ -43,7 +43,7 @@ public class TensorCodecOptionsCurrentTests
         }
         finally
         {
-            TensorCodecOptions.SetCurrent(prior);
+            prior.Dispose();
         }
     }
 }

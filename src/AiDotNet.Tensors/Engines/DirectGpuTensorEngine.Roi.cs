@@ -20,6 +20,7 @@ public partial class DirectGpuTensorEngine
             && input.Rank == 4
             && boxes.Rank == 2 && boxes._shape[1] == 5)
         {
+            using var __gpuOp = EnterGpuOp();
             if (TryGetBackend(out var backend) && backend is IRoiBackend roi)
             {
                 int N = input._shape[0], C = input._shape[1];
@@ -76,6 +77,7 @@ public partial class DirectGpuTensorEngine
         if (typeof(T) == typeof(float) && input.Rank == 4
             && boxes.Rank == 2 && boxes._shape[1] == 5)
         {
+            using var __gpuOp = EnterGpuOp();
             if (TryGetBackend(out var backend) && backend is IRoiBackend roi)
             {
                 int N = input._shape[0], C = input._shape[1];
@@ -107,6 +109,7 @@ public partial class DirectGpuTensorEngine
         if (typeof(T) == typeof(float) && input.Rank == 4
             && boxes.Rank == 2 && boxes._shape[1] == 5)
         {
+            using var __gpuOp = EnterGpuOp();
             if (TryGetBackend(out var backend) && backend is IRoiBackend roi)
             {
                 int N = input._shape[0], C = input._shape[1];
@@ -138,6 +141,7 @@ public partial class DirectGpuTensorEngine
             && input.Rank == 4
             && boxes.Rank == 2 && boxes._shape[1] == 5)
         {
+            using var __gpuOp = EnterGpuOp();
             if (TryGetBackend(out var backend) && backend is IRoiBackend roi)
             {
                 int N = input._shape[0], C = input._shape[1];

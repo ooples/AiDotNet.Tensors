@@ -86,8 +86,25 @@ internal sealed class HostSync
     /// <summary>The state shared by every storage over <paramref name="array"/>, created on demand.</summary>
     internal static HostSync ForArray(object array)
     {
-        Volatile.Write(ref s_any, 1);
+        MarkAny();
         return s_byKey.GetValue(array, static _ => new HostSync());
+    }
+
+    /// <summary>
+    /// A state for a storage nothing else can alias (it has no host array yet), held only by that storage: no table
+    /// entry, so its lifetime is the storage's at no per-entry cost. <see cref="Adopt"/> enters it in the table when
+    /// the storage's array appears.
+    /// </summary>
+    internal static HostSync CreateUnshared()
+    {
+        MarkAny();
+        return new HostSync();
+    }
+
+    // Read first: an unconditional write from every thread would bounce this line between their caches.
+    private static void MarkAny()
+    {
+        if (Volatile.Read(ref s_any) == 0) Volatile.Write(ref s_any, 1);
     }
 
     /// <summary>The state of <paramref name="array"/> if one exists.</summary>
@@ -110,7 +127,7 @@ internal sealed class HostSync
     /// </summary>
     internal static HostSync Adopt(object array, HostSync sync)
     {
-        Volatile.Write(ref s_any, 1);
+        MarkAny();
         return s_byKey.GetValue(array, _ => sync);
     }
 

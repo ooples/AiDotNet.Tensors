@@ -41,7 +41,7 @@ public sealed class CudaDispatchPolicyTests
     [Fact]
     public void UseCublasForMatMul_ReflectsFlag()
     {
-        var prev = TensorCodecOptions.Current;
+        var prev = TensorCodecOptions.Save();   // restores the options AND the thread\'s determinism override
         try
         {
             TensorCodecOptions.SetCurrent(new TensorCodecOptions { UseCublas = true });
@@ -52,14 +52,14 @@ public sealed class CudaDispatchPolicyTests
         }
         finally
         {
-            TensorCodecOptions.SetCurrent(prev);
+            prev.Dispose();
         }
     }
 
     [Fact]
     public void UseCudnnForConv_FalseWhenFlagOff_RegardlessOfAvailability()
     {
-        var prev = TensorCodecOptions.Current;
+        var prev = TensorCodecOptions.Save();   // restores the options AND the thread\'s determinism override
         try
         {
             TensorCodecOptions.SetCurrent(new TensorCodecOptions { UseCudnn = false });
@@ -67,14 +67,14 @@ public sealed class CudaDispatchPolicyTests
         }
         finally
         {
-            TensorCodecOptions.SetCurrent(prev);
+            prev.Dispose();
         }
     }
 
     [Fact]
     public void UseCudnnForBatchNorm_FalseWhenFlagOff_RegardlessOfAvailability()
     {
-        var prev = TensorCodecOptions.Current;
+        var prev = TensorCodecOptions.Save();   // restores the options AND the thread\'s determinism override
         try
         {
             TensorCodecOptions.SetCurrent(new TensorCodecOptions { UseCudnnBatchNorm = false });
@@ -82,7 +82,7 @@ public sealed class CudaDispatchPolicyTests
         }
         finally
         {
-            TensorCodecOptions.SetCurrent(prev);
+            prev.Dispose();
         }
     }
 

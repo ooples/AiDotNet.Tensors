@@ -117,11 +117,11 @@ public class CudnnConvCandidateTests
         TunedKernelMode? previousMode = TunedKernelPolicy.ModeOverride;
         bool previousPersist = TunedKernelPolicy.PersistDecisions;
         double previousBudget = TunedKernelPolicy.BudgetMilliseconds;
-        bool previousDeterminism = AiDotNetEngine.DeterministicMode;
+        bool? previousDeterminism = AiDotNet.Tensors.Helpers.BlasProvider.GetThreadLocalDeterministicMode();
         TunedKernelPolicy.ModeOverride = TunedKernelMode.Tune;
         TunedKernelPolicy.PersistDecisions = false;
         TunedKernelPolicy.BudgetMilliseconds = 120_000;
-        AiDotNetEngine.SetDeterministicMode(true);
+        AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(true);
         try
         {
             int oh = (h + 2 * pad - r) / stride + 1, ow = oh;
@@ -158,7 +158,7 @@ public class CudnnConvCandidateTests
             TunedKernelPolicy.ModeOverride = previousMode;
             TunedKernelPolicy.PersistDecisions = previousPersist;
             TunedKernelPolicy.BudgetMilliseconds = previousBudget;
-            AiDotNetEngine.SetDeterministicMode(previousDeterminism);
+            AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(previousDeterminism);
         }
     }
 }

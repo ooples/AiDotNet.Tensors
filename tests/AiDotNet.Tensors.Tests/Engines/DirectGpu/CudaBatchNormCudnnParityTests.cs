@@ -67,7 +67,7 @@ public sealed class CudaBatchNormCudnnParityTests : IDisposable
         float[] runInMean, float[] runInVar,
         int batch, int channels, int spatialSize)
     {
-        var prev = TensorCodecOptions.Current;
+        var prev = TensorCodecOptions.Save();   // restores the options AND the thread\'s determinism override
         var prevDeclared = cb.DeclaredKernelsSwitch;
         TensorCodecOptions.SetCurrent(new TensorCodecOptions { UseCudnnBatchNorm = useCudnn });
         // The declared training program is tried before cuDNN and the hand-written kernel, so with it on both
@@ -119,7 +119,7 @@ public sealed class CudaBatchNormCudnnParityTests : IDisposable
         finally
         {
             cb.DeclaredKernelsSwitch = prevDeclared;
-            TensorCodecOptions.SetCurrent(prev);
+            prev.Dispose();
         }
     }
 
@@ -276,7 +276,7 @@ public sealed class CudaBatchNormCudnnParityTests : IDisposable
 
         var profiler = PerformanceProfiler.Instance;
         bool prevEnabled = profiler.Enabled;
-        var prevOpts = TensorCodecOptions.Current;
+        var prevOpts = TensorCodecOptions.Save();   // restores the options AND the thread\'s determinism override
         profiler.Enabled = true;
         profiler.Clear();
         try
@@ -302,7 +302,7 @@ public sealed class CudaBatchNormCudnnParityTests : IDisposable
         }
         finally
         {
-            TensorCodecOptions.SetCurrent(prevOpts);
+            prevOpts.Dispose();
             profiler.Enabled = prevEnabled;
             profiler.Clear();
         }

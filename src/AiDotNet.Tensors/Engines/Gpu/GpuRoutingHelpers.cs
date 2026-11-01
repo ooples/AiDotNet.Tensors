@@ -78,7 +78,9 @@ public static class GpuRoutingHelpers
     public static IAsyncGpuBackend? TryGetAsyncBackend(IEngine? engine)
     {
         if (engine is not DirectGpuTensorEngine gpu) return null;
-        return gpu.GetAsyncBackend();
+        // A query: the caller gets the backend for capability checks and scheduling. Work it launches on the
+        // backend outside the engine's ops is not leased against a concurrent Dispose.
+        return gpu.QueryBackend as IAsyncGpuBackend;
     }
 
     /// <summary>
@@ -138,6 +140,8 @@ public static class GpuRoutingHelpers
             cpuFallback();
             return false;
         }
+        // The deferred scope runs on the backend for the rest of this call: lease it so a concurrent Dispose waits.
+        using var __gpuOp = gpu.EnterGpuOp();
         // Align with IsGpuActive(): a GPU engine whose backend can't run
         // a deferred scope (cuGraph-incapable driver, missing runtime
         // library, etc.) is NOT "GPU active" — fall back to CPU even if

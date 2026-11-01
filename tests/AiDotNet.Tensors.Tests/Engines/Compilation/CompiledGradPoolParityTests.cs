@@ -153,7 +153,7 @@ public class CompiledGradPoolParityTests
         // The production API is the TensorCodecOptions flag (not just the env var).
         var (control, ctrlBuffers) = RunDeep(pool: false, layers: 5, rows: 4, dim: 8, seedBase: 400);
 
-        var prev = AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.Current;
+        var prev = AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.Save();   // restores the options AND the thread\'s determinism override
         var opts = AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.Default;
         opts.EnableBackwardGradientPooling = true;
         AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.SetCurrent(opts);
@@ -171,7 +171,7 @@ public class CompiledGradPoolParityTests
         }
         finally
         {
-            AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.SetCurrent(prev);
+            prev.Dispose();
         }
     }
 }

@@ -40,12 +40,25 @@ public class DepthwiseConvFloatPathTests
     }
 
     [Theory]
+    [InlineData(2, 2, 5, 2, 0)]   // span -3: the old check let this through as a zero-size output
+    [InlineData(4, 4, 5, 2, 0)]   // span -1 at stride 2: truncating division would give an output size of 1
+    [InlineData(3, 3, 7, 1, 1)]
+    public void KernelLargerThanThePaddedInput_IsRejected(int h, int w, int k, int s, int p)
+    {
+        var x = new Tensor<float>(new float[2 * h * w], new[] { 1, 2, h, w });
+        var kernel = new Tensor<float>(new float[2 * k * k], new[] { 2, 1, k, k });
+        var error = Assert.Throws<ArgumentException>(() => new CpuEngine().DepthwiseConv2D(x, kernel, new[] { s, s }, new[] { p, p }));
+        Assert.Contains("larger than", error.Message);
+    }
+
+    [Theory]
     [InlineData(1, 16, 16, 16, 1, 3, 1, 1)]
     [InlineData(2, 64, 16, 16, 1, 3, 2, 1)]
+    [InlineData(2, 12, 33, 33, 1, 3, 1, 1)]    // the vector width kernels: 12 channels, rows of four vectors and a tail
+    [InlineData(1, 24, 40, 40, 1, 3, 2, 1)]    // the width kernels at stride 2 (40 is past the channel-block width)
     [InlineData(1, 72, 8, 8, 1, 5, 2, 2)]
     [InlineData(1, 120, 4, 4, 1, 5, 1, 2)]
     [InlineData(1, 960, 1, 1, 1, 5, 1, 2)]    // a 1x1 plane under a 5x5 kernel: most taps outside
-    [InlineData(1, 8, 2, 2, 1, 5, 2, 0)]      // kernel wider than the padded plane's reach
     [InlineData(1, 4, 3, 3, 1, 5, 2, 1)]      // stride 2: a tap past the right edge (reach -1) must not wrap to the next row
     [InlineData(2, 6, 13, 11, 2, 3, 1, 1)]    // channel multiplier 2, odd sizes
     [InlineData(1, 5, 17, 23, 1, 7, 3, 3)]

@@ -182,17 +182,66 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         => _data.GetBackingArrayIdentity();   // identity for cache lookups; does not escape the array
 
     /// <summary>
+    /// Per-tensor state almost no tensor sets: the streaming and GPU-offload bookkeeping, a partial view's own device
+    /// copy, and the uniform-fill marker. Allocated on the first non-default write, so an ordinary tensor carries one
+    /// null reference instead of these fields. Every tensor an op returns pays its object size in allocation and GC
+    /// work, so the size is on the hot path of every op.
+    /// </summary>
+    private sealed class ColdState
+    {
+        internal StreamingInt8Weight? StreamingInt8;
+        internal StreamingInt4Weight? StreamingInt4;
+        internal IDisposable? StreamingMmapOwner;
+        internal object? StreamingTransitionGate;
+        internal long StreamingPoolHandle = -1;
+        internal long StreamingReservedBytes;
+        internal bool StreamingDropDeferred;
+        internal byte StreamingStoreEncoding;
+        internal IntPtr OffloadDevicePointer;
+        internal IntPtr OffloadHostPointer;
+        internal object? OffloadOpaqueHandle;
+        internal long OffloadByteCount;
+        internal long OffloadRegistryHandle = -1;
+        internal double? UniformFillValue;
+        internal Engines.DirectGpu.IGpuBuffer? ViewGpuBuffer;
+        internal Engines.DirectGpu.IDirectGpuBackend? ViewGpuBackend;
+        internal int ViewGpuBufferVersion = -1;
+        internal bool ViewGpuBufferIsSplitComplex;
+        internal bool ViewGpuBufferContainsRawInt32;
+        internal bool ViewGpuBufferContainsRawInt64;
+    }
+
+    private ColdState? _cold;
+
+    /// <summary>The cold state, created on first use (racing creators agree on one instance).</summary>
+    private ColdState Cold()
+    {
+        var cold = System.Threading.Volatile.Read(ref _cold);
+        if (cold is not null) return cold;
+        var created = new ColdState();
+        return System.Threading.Interlocked.CompareExchange(ref _cold, created, null) ?? created;
+    }
+
+    /// <summary>
     /// The no-upcast resident form of a streaming int8 weight (int8 + per-row scales). Non-null
     /// only between materializing an int8-stored weight for inference and dropping it. The engine
     /// matmul fast path reads this directly (feeds the int8 GEMM, no dequant); any fp32 access
     /// lazily dequantizes it into <see cref="_data"/> via <see cref="EnsureMaterialized"/>. Null
     /// for every normal tensor → the matmul/ensure hooks are a single null-check for them.
     /// </summary>
-    internal StreamingInt8Weight? StreamingInt8 { get; private set; }
+    internal StreamingInt8Weight? StreamingInt8
+    {
+        get => _cold?.StreamingInt8;
+        private set { if (value is null && _cold is null) return; Cold().StreamingInt8 = value; }
+    }
 
     /// <summary>No-upcast int4 group-quant form, attached for int4-stored streaming weights in
     /// inference (see <see cref="AttachStreamingInt4"/>); null otherwise.</summary>
-    internal StreamingInt4Weight? StreamingInt4 { get; private set; }
+    internal StreamingInt4Weight? StreamingInt4
+    {
+        get => _cold?.StreamingInt4;
+        private set { if (value is null && _cold is null) return; Cold().StreamingInt4 = value; }
+    }
 
     /// <summary>
     /// Installs <paramref name="encoded"/> (a per-row int8 streaming buffer) as this tensor's
@@ -390,7 +439,11 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// storage. Disposed (and nulled) by <see cref="DisposeStreamingMmapOwner"/>, which
     /// every storage-swap path calls before installing the new <see cref="_data"/>.
     /// </summary>
-    private IDisposable? _streamingMmapOwner;
+    private IDisposable? _streamingMmapOwner
+    {
+        get => _cold?.StreamingMmapOwner;
+        set { if (value is null && _cold is null) return; Cold().StreamingMmapOwner = value; }
+    }
 
     /// <summary>
     /// Releases the zero-copy mmap mapping (if any) backing the current <see cref="_data"/>.
@@ -650,17 +703,17 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     // saw the emptied array, or, once dropped arrays are recycled (#2322), another tensor's restored values. Nothing
     // that holds this gate acquires the registry lock, so the registry may take it with Monitor.TryEnter while
     // holding its own lock.
-    private object? _streamingTransitionGate;
     private object StreamingTransitionGate
     {
         get
         {
             // Allocated on first streaming use only; ordinary tensors never pay for it. Explicit CAS rather than
             // LazyInitializer, whose net471 signature carries no nullable annotations.
-            object? gate = System.Threading.Volatile.Read(ref _streamingTransitionGate);
+            var cold = Cold();
+            object? gate = System.Threading.Volatile.Read(ref cold.StreamingTransitionGate);
             if (gate is not null) return gate;
             var created = new object();
-            return System.Threading.Interlocked.CompareExchange(ref _streamingTransitionGate, created, null) ?? created;
+            return System.Threading.Interlocked.CompareExchange(ref cold.StreamingTransitionGate, created, null) ?? created;
         }
     }
 
@@ -1185,12 +1238,37 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
 
     // A strided/offset view's own contiguous device copy. Such a view does not share the vector's layout, so its
     // device buffer can't be the shared one (see VectorDeviceState).
-    private Engines.DirectGpu.IGpuBuffer? _viewGpuBuffer;
-    private Engines.DirectGpu.IDirectGpuBackend? _viewGpuBackend;
-    private int _viewGpuBufferVersion = -1;
-    private bool _viewGpuBufferIsSplitComplex;
-    private bool _viewGpuBufferContainsRawInt32;
-    private bool _viewGpuBufferContainsRawInt64;
+    // In the cold state: only a partial view bound to its own device copy sets these.
+    private Engines.DirectGpu.IGpuBuffer? _viewGpuBuffer
+    {
+        get => _cold?.ViewGpuBuffer;
+        set { if (value is null && _cold is null) return; Cold().ViewGpuBuffer = value; }
+    }
+    private Engines.DirectGpu.IDirectGpuBackend? _viewGpuBackend
+    {
+        get => _cold?.ViewGpuBackend;
+        set { if (value is null && _cold is null) return; Cold().ViewGpuBackend = value; }
+    }
+    private int _viewGpuBufferVersion
+    {
+        get => _cold?.ViewGpuBufferVersion ?? -1;
+        set { if (value == -1 && _cold is null) return; Cold().ViewGpuBufferVersion = value; }
+    }
+    private bool _viewGpuBufferIsSplitComplex
+    {
+        get => _cold?.ViewGpuBufferIsSplitComplex ?? false;
+        set { if (!value && _cold is null) return; Cold().ViewGpuBufferIsSplitComplex = value; }
+    }
+    private bool _viewGpuBufferContainsRawInt32
+    {
+        get => _cold?.ViewGpuBufferContainsRawInt32 ?? false;
+        set { if (!value && _cold is null) return; Cold().ViewGpuBufferContainsRawInt32 = value; }
+    }
+    private bool _viewGpuBufferContainsRawInt64
+    {
+        get => _cold?.ViewGpuBufferContainsRawInt64 ?? false;
+        set { if (!value && _cold is null) return; Cold().ViewGpuBufferContainsRawInt64 = value; }
+    }
 
     /// <summary>
     /// True when this tensor covers its whole data vector in the vector's own layout (contiguous, offset 0, same
@@ -1710,7 +1788,11 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// of reading N identical elements from memory (saves bandwidth for fused backward paths).
     /// Reset to null by any non-fill mutation.
     /// </summary>
-    internal double? UniformFillValue { get; set; }
+    internal double? UniformFillValue
+    {
+        get => _cold?.UniformFillValue;
+        set { if (value is null && _cold is null) return; Cold().UniformFillValue = value; }
+    }
 
 
     /// <summary>
@@ -1866,7 +1948,11 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// mutate (the setter is internal so external code can't unilaterally
     /// invalidate the pool's bookkeeping).
     /// </summary>
-    public long StreamingPoolHandle { get; internal set; } = -1;
+    public long StreamingPoolHandle
+    {
+        get => _cold?.StreamingPoolHandle ?? -1;
+        internal set { if (value == -1 && _cold is null) return; Cold().StreamingPoolHandle = value; }
+    }
 
     /// <summary>
     /// Bytes the streaming pool has pre-reserved against its budget on
@@ -1878,7 +1964,11 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// <see cref="WeightRegistry"/>; setter is internal so external code
     /// can't desync the pool's <c>_reservedBytes</c> bookkeeping.
     /// </summary>
-    internal long StreamingReservedBytes { get; set; }
+    internal long StreamingReservedBytes
+    {
+        get => _cold?.StreamingReservedBytes ?? 0;
+        set { if (value == 0 && _cold is null) return; Cold().StreamingReservedBytes = value; }
+    }
 
     /// <summary>
     /// Issue #430: indicates that <see cref="WeightRegistry.RegisterWeight{T}"/>
@@ -1902,7 +1992,11 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// </list>
     /// </para>
     /// </summary>
-    internal bool StreamingDropDeferred { get; set; }
+    internal bool StreamingDropDeferred
+    {
+        get => _cold?.StreamingDropDeferred ?? false;
+        set { if (!value && _cold is null) return; Cold().StreamingDropDeferred = value; }
+    }
 
     /// <summary>
     /// How this tensor's bytes are encoded in the streaming pool's backing store:
@@ -1911,7 +2005,11 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// resolved <see cref="StreamingStoreDtype"/> policy; read by
     /// <see cref="RestoreStorageFromBytes"/> so it knows whether to widen bf16 → T.
     /// </summary>
-    internal byte StreamingStoreEncoding { get; set; }
+    internal byte StreamingStoreEncoding
+    {
+        get => _cold?.StreamingStoreEncoding ?? 0;
+        set { if (value == 0 && _cold is null) return; Cold().StreamingStoreEncoding = value; }
+    }
 
     /// <summary>
     /// GPU offload allocation handle when <see cref="Lifetime"/> is
@@ -1919,7 +2017,11 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// <see cref="WeightLifetime.GpuManaged"/>. Owned by
     /// <see cref="WeightRegistry"/>; setter is internal.
     /// </summary>
-    public IntPtr OffloadDevicePointer { get; internal set; } = IntPtr.Zero;
+    public IntPtr OffloadDevicePointer
+    {
+        get => _cold?.OffloadDevicePointer ?? IntPtr.Zero;
+        internal set { if (value == IntPtr.Zero && _cold is null) return; Cold().OffloadDevicePointer = value; }
+    }
 
     /// <summary>Host-visible pointer for the offload allocation. Some
     /// backends (CUDA pinned, HIP HostMalloc) return host==device while
@@ -1929,25 +2031,41 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// full <see cref="Engines.DirectGpu.GpuOffloadHandle"/> at free time
     /// — using DevicePointer as the host arg silently fails the
     /// allocator's TryRemove and leaks the allocation.</summary>
-    public IntPtr OffloadHostPointer { get; internal set; } = IntPtr.Zero;
+    public IntPtr OffloadHostPointer
+    {
+        get => _cold?.OffloadHostPointer ?? IntPtr.Zero;
+        internal set { if (value == IntPtr.Zero && _cold is null) return; Cold().OffloadHostPointer = value; }
+    }
 
     /// <summary>Backend-specific opaque handle paired with
     /// <see cref="OffloadDevicePointer"/> (e.g. cl_mem for OpenCL,
     /// VkDeviceMemory for Vulkan). Owned by <see cref="WeightRegistry"/>.</summary>
-    public object? OffloadOpaqueHandle { get; internal set; }
+    public object? OffloadOpaqueHandle
+    {
+        get => _cold?.OffloadOpaqueHandle;
+        internal set { if (value is null && _cold is null) return; Cold().OffloadOpaqueHandle = value; }
+    }
 
     /// <summary>Total bytes of the offload allocation. Used by
     /// <see cref="WeightRegistry.UnregisterWeight"/> when reconstructing
     /// the <see cref="Engines.DirectGpu.GpuOffloadHandle"/> for the free
     /// path — element-size × Length is unsafe when T is a managed type
     /// without a stable Marshal.SizeOf.</summary>
-    public long OffloadByteCount { get; internal set; }
+    public long OffloadByteCount
+    {
+        get => _cold?.OffloadByteCount ?? 0;
+        internal set { if (value == 0 && _cold is null) return; Cold().OffloadByteCount = value; }
+    }
 
     /// <summary>
     /// Registry-owned identity for the allocator/handle pair that created this tensor's offload
     /// allocation. The registry, rather than the current process-wide allocator, owns the free path.
     /// </summary>
-    internal long OffloadRegistryHandle { get; set; } = -1;
+    internal long OffloadRegistryHandle
+    {
+        get => _cold?.OffloadRegistryHandle ?? -1;
+        set { if (value == -1 && _cold is null) return; Cold().OffloadRegistryHandle = value; }
+    }
 
     /// <summary>
     /// Whether this tensor is a view into another tensor's storage.
@@ -2195,8 +2313,11 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// <summary>Fill to run when deferred storage is first created; cleared once applied.</summary>
     private Action<TensorBase<T>>? _deferredInitializer;
 
-    /// <summary>Guards the one-time deferred allocation against concurrent first access.</summary>
-    private readonly object _deferredLock = new();
+    /// <summary>
+    /// Guards the one-time deferred allocation against concurrent first access. Created on first use: only deferred
+    /// weights take it, and every tensor (each op result) would otherwise allocate one.
+    /// </summary>
+    private object? _deferredLock;
 
     /// <summary>
     /// Set only once the buffer exists AND the initializer has finished. Storage presence alone is
@@ -2241,7 +2362,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     private void MaterializeDeferredStorage()
     {
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
-        lock (_deferredLock)
+        lock (System.Threading.LazyInitializer.EnsureInitialized(ref _deferredLock)!)
         {
             // Re-check inside the lock: another thread may have finished while we waited.
             if (_deferredReady) return;
@@ -3204,6 +3325,9 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         }
         if (_storage.TryGetBackingArraySegmentForReadOnlyAccess(out var array, out int baseOffset))
         {
+            // The caller reads the array directly: run a pending device download first (a no-op field read when
+            // nothing is pending), as GetReadOnlyDataArray does.
+            _storage.GetVector().SyncHostFromDevice();
             storageOffset = checked(baseOffset + _storageOffset);
             return array;
         }
@@ -3235,6 +3359,9 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
 
         if (_storage.TryGetBackingArraySegment(out var array, out int baseOffset))
         {
+            // Make the host copy current before it escapes: an accumulating caller reads it, and a pending download
+            // left behind an overwrite would later run and replace the caller's result with the stale device data.
+            _storage.GetVector().SyncHostFromDevice();
             storageOffset = checked(baseOffset + _storageOffset);
             return array;
         }

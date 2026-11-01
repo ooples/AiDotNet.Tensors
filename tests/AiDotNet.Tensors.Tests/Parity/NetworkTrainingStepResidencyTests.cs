@@ -18,10 +18,13 @@ public sealed class NetworkTrainingStepResidencyTests
     private const int WarmupSteps = 5;
     private const string ExplicitUpload = "HostToDevice DirectGpuTensorEngine.UploadToGpu";
 
+    // The GPU lane's gate (tools/parity/run-gpu.ps1) selects Category=PyTorchParityGpu.
     [SkippableTheory]
+    [Trait("Category", "PyTorchParityGpu")]
     [InlineData("mlp")]
     [InlineData("cnn")]
     [InlineData("lstm")]
+    [InlineData("gru")]
     [InlineData("transformer")]
     [InlineData("resnet18")]
     public void WarmTrainingStep_StaysOnTheDevice(string network)

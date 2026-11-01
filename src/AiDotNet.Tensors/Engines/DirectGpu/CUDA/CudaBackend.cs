@@ -1984,9 +1984,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     internal void ReclaimNow()
     {
         if (!IsAvailable) return;
-        GC.Collect();
-        GC.WaitForPendingFinalizers();
-        GC.Collect();
+        // A collected result's buffer finalizer only queues its free; run the queue so the memory actually returns.
+        ReclaimUnreachableForRetry();
         DrainDeferredFrees(blockOldest: false);
     }
 

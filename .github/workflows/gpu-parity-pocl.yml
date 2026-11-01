@@ -59,7 +59,7 @@ jobs:
         include:
           - { name: recurrent-foundations, required: true, coverage: true, filter: "FullyQualifiedName~LstmGateKernelTests|FullyQualifiedName~LstmFinalStateGradientTests|FullyQualifiedName~XLstmDeviceTrainingTests" }
           - { name: lstm,            filter: "FullyQualifiedName~GpuMissingKernelsParityTests.LstmSequence" }
-          - { name: missing-kernels, filter: "FullyQualifiedName~GpuMissingKernelsParityTests&FullyQualifiedName!~LstmSequence" }
+          - { name: missing-kernels, coverage: true, filter: "FullyQualifiedName~GpuMissingKernelsParityTests&FullyQualifiedName!~LstmSequence" }
           - { name: scan-kernels,    filter: "FullyQualifiedName~ScanGpuParityTests|FullyQualifiedName~Rwkv4WkvGpuParityTests" }
           # The GPU matmul backward for a single needed gradient (a constant basis or a data batch) has no other CI device;
           # its coverage is uploaded from here.
@@ -71,6 +71,10 @@ jobs:
           # The resident program on OpenCL (#1449): a row-local chain as one kernel, any other as ordinary enqueues, against a double-precision
           # reference. Metal's runs on metal.yml; Vulkan, WebGPU (Dawn) and HIP have no CI device.
           - { name: resident-program, coverage: true, filter: "FullyQualifiedName~OpenClResidentProgramTests" }
+          # The engine lifecycle on a real non-CUDA device: releasing the adopted engine (live results and trained weights
+          # downloaded first, cached device memory freed), ResetToCpu, empty slices and concat backward, and deferred-output
+          # disposal. The coverage job has no GPU, so this shard's upload is what measures that code.
+          - { name: engine-lifecycle, coverage: true, filter: "FullyQualifiedName~GpuEngineReleaseTests|FullyQualifiedName~ResetToCpuGpuEngineTests|FullyQualifiedName~EmptySliceGpuTests|FullyQualifiedName~DeferredOutputFailureDisposalTests|FullyQualifiedName~EvictActivationsCreatedAfterLifetimeTests" }
           # Model scale (#1569): ResNet-18 inference at batch 1 and 128 against the CPU (a batch-derived launch dimension
           # past a device limit only appears at model scale), warm training steps of five networks with no host crossing,
           # and the fused GRU, folded conv batch norm and TensorScope on a real OpenCL device.

@@ -104,11 +104,11 @@ public sealed class CublasOptionalTests
     public void Fp32Entries_ReproduceCublas_WithoutIt()
     {
         using var backend = RequireBackend();
-        bool previous = AiDotNetEngine.DeterministicMode;
+        bool? previous = AiDotNet.Tensors.Helpers.BlasProvider.GetThreadLocalDeterministicMode();
         try
         {
             // Strict FP32 on both sides, so the fallback is compared like for like.
-            AiDotNetEngine.SetDeterministicMode(true);
+            AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(true);
             foreach (var (m, n, k) in new[] { (67, 129, 95), (128, 256, 64), (1, 300, 33) })
             {
                 float[] hostC = Values(m * n, 9);
@@ -149,7 +149,7 @@ public sealed class CublasOptionalTests
         }
         finally
         {
-            AiDotNetEngine.SetDeterministicMode(previous);
+            AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(previous);
         }
     }
 

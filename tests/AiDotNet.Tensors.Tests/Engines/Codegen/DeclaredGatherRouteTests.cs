@@ -245,8 +245,8 @@ public class DeclaredGatherRouteTests
         // Below the crossover the declared scatter-add takes these calls ahead of both kernels compared here (it is
         // checked against the ordered sum in DeclaredScatterAddRouteTests); off, the sorted and scanning kernels serve.
         backend.DeclaredKernelsSwitch = false;
-        bool previous = AiDotNetEngine.DeterministicMode;
-        AiDotNetEngine.SetDeterministicMode(true);
+        bool? previous = AiDotNet.Tensors.Helpers.BlasProvider.GetThreadLocalDeterministicMode();
+        AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(true);
         try
         {
             int[] ids = Ids(tokens, vocabulary);
@@ -295,7 +295,7 @@ public class DeclaredGatherRouteTests
         }
         finally
         {
-            AiDotNetEngine.SetDeterministicMode(previous);
+            AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(previous);
         }
     }
 
@@ -314,8 +314,8 @@ public class DeclaredGatherRouteTests
         // The declared edge scatter and ScatterMean (#1441) take small graphs ahead of both kernels compared here; they
         // have their own route tests (DeclaredSparseFamilyRouteTests, DeclaredScatterRowsFamilyRouteTests).
         backend.DeclaredKernelsSwitch = false;
-        bool previous = AiDotNetEngine.DeterministicMode;
-        AiDotNetEngine.SetDeterministicMode(true);
+        bool? previous = AiDotNet.Tensors.Helpers.BlasProvider.GetThreadLocalDeterministicMode();
+        AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(true);
         try
         {
             int[] targets = Ids(edges, nodes);
@@ -354,7 +354,7 @@ public class DeclaredGatherRouteTests
         }
         finally
         {
-            AiDotNetEngine.SetDeterministicMode(previous);
+            AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(previous);
         }
     }
 
@@ -370,8 +370,8 @@ public class DeclaredGatherRouteTests
         int inWidth, int outHeight, int outWidth, int paddingMode, bool alignCorners)
     {
         using var backend = OpenBackendOrSkip();
-        bool previous = AiDotNetEngine.DeterministicMode;
-        AiDotNetEngine.SetDeterministicMode(true);
+        bool? previous = AiDotNet.Tensors.Helpers.BlasProvider.GetThreadLocalDeterministicMode();
+        AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(true);
         try
         {
             var grid = new float[batch * outHeight * outWidth * 2];
@@ -405,7 +405,7 @@ public class DeclaredGatherRouteTests
         }
         finally
         {
-            AiDotNetEngine.SetDeterministicMode(previous);
+            AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(previous);
         }
     }
 
@@ -417,8 +417,8 @@ public class DeclaredGatherRouteTests
     public void TheSortedScatterCapturesAndReplaysBitIdentically()
     {
         using var backend = OpenBackendOrSkip();
-        bool previous = AiDotNetEngine.DeterministicMode;
-        AiDotNetEngine.SetDeterministicMode(true);
+        bool? previous = AiDotNet.Tensors.Helpers.BlasProvider.GetThreadLocalDeterministicMode();
+        AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(true);
         try
         {
             const int tokens = 2048, vocabulary = 5000, width = 16;
@@ -451,7 +451,7 @@ public class DeclaredGatherRouteTests
         }
         finally
         {
-            AiDotNetEngine.SetDeterministicMode(previous);
+            AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(previous);
         }
     }
 

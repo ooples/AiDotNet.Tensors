@@ -37,5 +37,12 @@ public sealed partial class HipBackend : IDeviceMemoryPressure
     void IDeviceMemoryPressure.ReclaimNow() => DeviceMemorySweep.Run();
 
     /// <inheritdoc/>
+    int IDeviceMemoryPressure.ReleaseCachedBuffers()
+    {
+        DrainCollectedBuffers();
+        return _bufferPool.DrainAll();
+    }
+
+    /// <inheritdoc/>
     bool IDeviceMemoryPressure.ReclaimsOnAllocationFailure => false;
 }
