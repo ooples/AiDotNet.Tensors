@@ -64,6 +64,9 @@ public sealed class GotoGemmRoutingTests
         // kernel, covering nothing it claims to.
         Skip.IfNot(GotoGemmFp32.IsAvailable, "The packed GotoGemm route is unavailable on this CPU/OS/runtime.");
         int before = CpuParallelSettings.MaxDegreeOfParallelism;
+        // Where the 512-bit direct tile runs, deep-K thin-M products leave the packed route; keep them on it here.
+        bool beforeGoto512 = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.s_thinMGotoOn512;
+        AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.s_thinMGotoOn512 = true;
         var rng = RandomHelper.CreateSeededRandom(1055);
         var a = new float[m * k];
         var b = new float[k * n];
@@ -102,8 +105,36 @@ public sealed class GotoGemmRoutingTests
         finally
         {
             CpuParallelSettings.MaxDegreeOfParallelism = before;
+            AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.s_thinMGotoOn512 = beforeGoto512;
         }
     }
+
+#if NET9_0_OR_GREATER
+    // The packed route's microkernel is 256-bit: where the 512-bit direct tile runs, a deep-K thin-M product takes
+    // that tile instead, unless AIDOTNET_THINM_GOTO_512 keeps the packed route.
+    [Fact]
+    public void ThinMDeepK_LeavesThePackedRoute_WhereThe512BitTileRuns()
+    {
+        bool? beforeForce = AiDotNet.Tensors.Engines.Simd.SimdGemm.s_forceVector512Direct;
+        bool beforeGoto512 = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.s_thinMGotoOn512;
+        try
+        {
+            AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.s_thinMGotoOn512 = false;
+            AiDotNet.Tensors.Engines.Simd.SimdGemm.s_forceVector512Direct = true;
+            Assert.False(AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.ThinMDeepKTakesGoto);
+            AiDotNet.Tensors.Engines.Simd.SimdGemm.s_forceVector512Direct = false;
+            Assert.True(AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.ThinMDeepKTakesGoto);
+            AiDotNet.Tensors.Engines.Simd.SimdGemm.s_forceVector512Direct = true;
+            AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.s_thinMGotoOn512 = true;
+            Assert.True(AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.ThinMDeepKTakesGoto);
+        }
+        finally
+        {
+            AiDotNet.Tensors.Engines.Simd.SimdGemm.s_forceVector512Direct = beforeForce;
+            AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.s_thinMGotoOn512 = beforeGoto512;
+        }
+    }
+#endif
     // M from 64: a 77-token cross-attention context's K/V projection (M77 K1024 N2304) left PackBoth on 2 threads.
     // Thin-M very-wide-N with M a multiple of the 6-row microkernel stays on PackBoth's N-axis path.
     [Theory]
