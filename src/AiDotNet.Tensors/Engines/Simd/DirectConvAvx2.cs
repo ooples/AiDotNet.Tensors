@@ -862,18 +862,6 @@ internal static partial class DirectConvAvx2
                     float* passKernel = tileKernel + (long)cb0 * taps * Block * Block;
                     if (wide)
                     {
-#if NET9_0_OR_GREATER
-                        if (s_probeSix)
-                        {
-                            for (int q = runStart; q < runEnd; q += 6)
-                            {
-                                int count6 = Math.Min(6, runEnd - q), i6 = q - runStart;
-                                ForwardSextetRunOld512(px, origin + i6, passKernel, blockStride, cbEnd - cb0, cb0 * planeIn, planeIn,
-                                    kernelHeight, kernelWidth, rowStep, colStep, stage + i6 * 32, cb0 > 0, count6);
-                            }
-                            continue;
-                        }
-#endif
                         for (int q = runStart; q < runEnd; q += Avx512Positions)
                         {
                             int count = Math.Min(Avx512Positions, runEnd - q), i = q - runStart;
@@ -1040,132 +1028,6 @@ internal static partial class DirectConvAvx2
                     int tapOffset = rowOffset + x * colStep;
                     float* p0 = x0 + tapOffset, p1 = x1 + tapOffset, p2 = x2 + tapOffset;
                     float* p3 = x3 + tapOffset, p4 = x4 + tapOffset, p5 = x5 + tapOffset;
-                    // The eight channels unrolled (the loop counter, branch and indexed addressing were a share of the
-                    // uops). Output channels 0-15 of the tile are packed blocks 0 and 1, 16-31 blocks 2 and 3.
-                    Vector512<float> wl, wh, b;
-                    wl = Vector512.Create(Vector256.Load(w), Vector256.Load(w + blockStride));
-                    wh = Vector512.Create(Vector256.Load(w + stride2), Vector256.Load(w + stride3));
-                    b = Vector512.Create(p0[0]); a0l = Vector512.FusedMultiplyAdd(b, wl, a0l); a0h = Vector512.FusedMultiplyAdd(b, wh, a0h);
-                    b = Vector512.Create(p1[0]); a1l = Vector512.FusedMultiplyAdd(b, wl, a1l); a1h = Vector512.FusedMultiplyAdd(b, wh, a1h);
-                    b = Vector512.Create(p2[0]); a2l = Vector512.FusedMultiplyAdd(b, wl, a2l); a2h = Vector512.FusedMultiplyAdd(b, wh, a2h);
-                    b = Vector512.Create(p3[0]); a3l = Vector512.FusedMultiplyAdd(b, wl, a3l); a3h = Vector512.FusedMultiplyAdd(b, wh, a3h);
-                    b = Vector512.Create(p4[0]); a4l = Vector512.FusedMultiplyAdd(b, wl, a4l); a4h = Vector512.FusedMultiplyAdd(b, wh, a4h);
-                    b = Vector512.Create(p5[0]); a5l = Vector512.FusedMultiplyAdd(b, wl, a5l); a5h = Vector512.FusedMultiplyAdd(b, wh, a5h);
-                    wl = Vector512.Create(Vector256.Load(w + 8), Vector256.Load(w + blockStride + 8));
-                    wh = Vector512.Create(Vector256.Load(w + stride2 + 8), Vector256.Load(w + stride3 + 8));
-                    b = Vector512.Create(p0[1]); a0l = Vector512.FusedMultiplyAdd(b, wl, a0l); a0h = Vector512.FusedMultiplyAdd(b, wh, a0h);
-                    b = Vector512.Create(p1[1]); a1l = Vector512.FusedMultiplyAdd(b, wl, a1l); a1h = Vector512.FusedMultiplyAdd(b, wh, a1h);
-                    b = Vector512.Create(p2[1]); a2l = Vector512.FusedMultiplyAdd(b, wl, a2l); a2h = Vector512.FusedMultiplyAdd(b, wh, a2h);
-                    b = Vector512.Create(p3[1]); a3l = Vector512.FusedMultiplyAdd(b, wl, a3l); a3h = Vector512.FusedMultiplyAdd(b, wh, a3h);
-                    b = Vector512.Create(p4[1]); a4l = Vector512.FusedMultiplyAdd(b, wl, a4l); a4h = Vector512.FusedMultiplyAdd(b, wh, a4h);
-                    b = Vector512.Create(p5[1]); a5l = Vector512.FusedMultiplyAdd(b, wl, a5l); a5h = Vector512.FusedMultiplyAdd(b, wh, a5h);
-                    wl = Vector512.Create(Vector256.Load(w + 16), Vector256.Load(w + blockStride + 16));
-                    wh = Vector512.Create(Vector256.Load(w + stride2 + 16), Vector256.Load(w + stride3 + 16));
-                    b = Vector512.Create(p0[2]); a0l = Vector512.FusedMultiplyAdd(b, wl, a0l); a0h = Vector512.FusedMultiplyAdd(b, wh, a0h);
-                    b = Vector512.Create(p1[2]); a1l = Vector512.FusedMultiplyAdd(b, wl, a1l); a1h = Vector512.FusedMultiplyAdd(b, wh, a1h);
-                    b = Vector512.Create(p2[2]); a2l = Vector512.FusedMultiplyAdd(b, wl, a2l); a2h = Vector512.FusedMultiplyAdd(b, wh, a2h);
-                    b = Vector512.Create(p3[2]); a3l = Vector512.FusedMultiplyAdd(b, wl, a3l); a3h = Vector512.FusedMultiplyAdd(b, wh, a3h);
-                    b = Vector512.Create(p4[2]); a4l = Vector512.FusedMultiplyAdd(b, wl, a4l); a4h = Vector512.FusedMultiplyAdd(b, wh, a4h);
-                    b = Vector512.Create(p5[2]); a5l = Vector512.FusedMultiplyAdd(b, wl, a5l); a5h = Vector512.FusedMultiplyAdd(b, wh, a5h);
-                    wl = Vector512.Create(Vector256.Load(w + 24), Vector256.Load(w + blockStride + 24));
-                    wh = Vector512.Create(Vector256.Load(w + stride2 + 24), Vector256.Load(w + stride3 + 24));
-                    b = Vector512.Create(p0[3]); a0l = Vector512.FusedMultiplyAdd(b, wl, a0l); a0h = Vector512.FusedMultiplyAdd(b, wh, a0h);
-                    b = Vector512.Create(p1[3]); a1l = Vector512.FusedMultiplyAdd(b, wl, a1l); a1h = Vector512.FusedMultiplyAdd(b, wh, a1h);
-                    b = Vector512.Create(p2[3]); a2l = Vector512.FusedMultiplyAdd(b, wl, a2l); a2h = Vector512.FusedMultiplyAdd(b, wh, a2h);
-                    b = Vector512.Create(p3[3]); a3l = Vector512.FusedMultiplyAdd(b, wl, a3l); a3h = Vector512.FusedMultiplyAdd(b, wh, a3h);
-                    b = Vector512.Create(p4[3]); a4l = Vector512.FusedMultiplyAdd(b, wl, a4l); a4h = Vector512.FusedMultiplyAdd(b, wh, a4h);
-                    b = Vector512.Create(p5[3]); a5l = Vector512.FusedMultiplyAdd(b, wl, a5l); a5h = Vector512.FusedMultiplyAdd(b, wh, a5h);
-                    wl = Vector512.Create(Vector256.Load(w + 32), Vector256.Load(w + blockStride + 32));
-                    wh = Vector512.Create(Vector256.Load(w + stride2 + 32), Vector256.Load(w + stride3 + 32));
-                    b = Vector512.Create(p0[4]); a0l = Vector512.FusedMultiplyAdd(b, wl, a0l); a0h = Vector512.FusedMultiplyAdd(b, wh, a0h);
-                    b = Vector512.Create(p1[4]); a1l = Vector512.FusedMultiplyAdd(b, wl, a1l); a1h = Vector512.FusedMultiplyAdd(b, wh, a1h);
-                    b = Vector512.Create(p2[4]); a2l = Vector512.FusedMultiplyAdd(b, wl, a2l); a2h = Vector512.FusedMultiplyAdd(b, wh, a2h);
-                    b = Vector512.Create(p3[4]); a3l = Vector512.FusedMultiplyAdd(b, wl, a3l); a3h = Vector512.FusedMultiplyAdd(b, wh, a3h);
-                    b = Vector512.Create(p4[4]); a4l = Vector512.FusedMultiplyAdd(b, wl, a4l); a4h = Vector512.FusedMultiplyAdd(b, wh, a4h);
-                    b = Vector512.Create(p5[4]); a5l = Vector512.FusedMultiplyAdd(b, wl, a5l); a5h = Vector512.FusedMultiplyAdd(b, wh, a5h);
-                    wl = Vector512.Create(Vector256.Load(w + 40), Vector256.Load(w + blockStride + 40));
-                    wh = Vector512.Create(Vector256.Load(w + stride2 + 40), Vector256.Load(w + stride3 + 40));
-                    b = Vector512.Create(p0[5]); a0l = Vector512.FusedMultiplyAdd(b, wl, a0l); a0h = Vector512.FusedMultiplyAdd(b, wh, a0h);
-                    b = Vector512.Create(p1[5]); a1l = Vector512.FusedMultiplyAdd(b, wl, a1l); a1h = Vector512.FusedMultiplyAdd(b, wh, a1h);
-                    b = Vector512.Create(p2[5]); a2l = Vector512.FusedMultiplyAdd(b, wl, a2l); a2h = Vector512.FusedMultiplyAdd(b, wh, a2h);
-                    b = Vector512.Create(p3[5]); a3l = Vector512.FusedMultiplyAdd(b, wl, a3l); a3h = Vector512.FusedMultiplyAdd(b, wh, a3h);
-                    b = Vector512.Create(p4[5]); a4l = Vector512.FusedMultiplyAdd(b, wl, a4l); a4h = Vector512.FusedMultiplyAdd(b, wh, a4h);
-                    b = Vector512.Create(p5[5]); a5l = Vector512.FusedMultiplyAdd(b, wl, a5l); a5h = Vector512.FusedMultiplyAdd(b, wh, a5h);
-                    wl = Vector512.Create(Vector256.Load(w + 48), Vector256.Load(w + blockStride + 48));
-                    wh = Vector512.Create(Vector256.Load(w + stride2 + 48), Vector256.Load(w + stride3 + 48));
-                    b = Vector512.Create(p0[6]); a0l = Vector512.FusedMultiplyAdd(b, wl, a0l); a0h = Vector512.FusedMultiplyAdd(b, wh, a0h);
-                    b = Vector512.Create(p1[6]); a1l = Vector512.FusedMultiplyAdd(b, wl, a1l); a1h = Vector512.FusedMultiplyAdd(b, wh, a1h);
-                    b = Vector512.Create(p2[6]); a2l = Vector512.FusedMultiplyAdd(b, wl, a2l); a2h = Vector512.FusedMultiplyAdd(b, wh, a2h);
-                    b = Vector512.Create(p3[6]); a3l = Vector512.FusedMultiplyAdd(b, wl, a3l); a3h = Vector512.FusedMultiplyAdd(b, wh, a3h);
-                    b = Vector512.Create(p4[6]); a4l = Vector512.FusedMultiplyAdd(b, wl, a4l); a4h = Vector512.FusedMultiplyAdd(b, wh, a4h);
-                    b = Vector512.Create(p5[6]); a5l = Vector512.FusedMultiplyAdd(b, wl, a5l); a5h = Vector512.FusedMultiplyAdd(b, wh, a5h);
-                    wl = Vector512.Create(Vector256.Load(w + 56), Vector256.Load(w + blockStride + 56));
-                    wh = Vector512.Create(Vector256.Load(w + stride2 + 56), Vector256.Load(w + stride3 + 56));
-                    b = Vector512.Create(p0[7]); a0l = Vector512.FusedMultiplyAdd(b, wl, a0l); a0h = Vector512.FusedMultiplyAdd(b, wh, a0h);
-                    b = Vector512.Create(p1[7]); a1l = Vector512.FusedMultiplyAdd(b, wl, a1l); a1h = Vector512.FusedMultiplyAdd(b, wh, a1h);
-                    b = Vector512.Create(p2[7]); a2l = Vector512.FusedMultiplyAdd(b, wl, a2l); a2h = Vector512.FusedMultiplyAdd(b, wh, a2h);
-                    b = Vector512.Create(p3[7]); a3l = Vector512.FusedMultiplyAdd(b, wl, a3l); a3h = Vector512.FusedMultiplyAdd(b, wh, a3h);
-                    b = Vector512.Create(p4[7]); a4l = Vector512.FusedMultiplyAdd(b, wl, a4l); a4h = Vector512.FusedMultiplyAdd(b, wh, a4h);
-                    b = Vector512.Create(p5[7]); a5l = Vector512.FusedMultiplyAdd(b, wl, a5l); a5h = Vector512.FusedMultiplyAdd(b, wh, a5h);
-                    w += Block * Block;
-                }
-            }
-        }
-        a0l.Store(slot); a0h.Store(slot + 16);
-        if (count > 1) { a1l.Store(slot + 32); a1h.Store(slot + 48); }
-        if (count > 2) { a2l.Store(slot + 64); a2h.Store(slot + 80); }
-        if (count > 3) { a3l.Store(slot + 96); a3h.Store(slot + 112); }
-        if (count > 4) { a4l.Store(slot + 128); a4h.Store(slot + 144); }
-        if (count > 5) { a5l.Store(slot + 160); a5h.Store(slot + 176); }
-    }
-#else
-    private static unsafe void ForwardSextetRun512(float* px, int* origin, float* w, long blockStride, int blocks,
-        int firstBlockOffset, int planeIn, int kernelHeight, int kernelWidth, int rowStep, int colStep,
-        float* slot, bool seeded, int count) => throw new PlatformNotSupportedException();
-#endif
-
-#if NET9_0_OR_GREATER
-    [MethodImpl(Hot)]
-    private static unsafe void ForwardSextetRunOld512(float* px, int* origin, float* w, long blockStride, int blocks,
-        int firstBlockOffset, int planeIn, int kernelHeight, int kernelWidth, int rowStep, int colStep,
-        float* slot, bool seeded, int count)
-    {
-        float* x0 = px + origin[0], x1 = px + origin[1], x2 = px + origin[2];
-        float* x3 = px + origin[3], x4 = px + origin[4], x5 = px + origin[5];
-        Vector512<float> a0l, a0h, a1l, a1h, a2l, a2h, a3l, a3h, a4l, a4h, a5l, a5h;
-        if (seeded)
-        {
-            // Slots past the real positions repeat the last real one (their origins do too), so their sums are discarded.
-            float* s0 = slot;
-            float* s1 = slot + 32 * Math.Min(1, count - 1);
-            float* s2 = slot + 32 * Math.Min(2, count - 1);
-            float* s3 = slot + 32 * Math.Min(3, count - 1);
-            float* s4 = slot + 32 * Math.Min(4, count - 1);
-            float* s5 = slot + 32 * Math.Min(5, count - 1);
-            a0l = Vector512.Load(s0); a0h = Vector512.Load(s0 + 16);
-            a1l = Vector512.Load(s1); a1h = Vector512.Load(s1 + 16);
-            a2l = Vector512.Load(s2); a2h = Vector512.Load(s2 + 16);
-            a3l = Vector512.Load(s3); a3h = Vector512.Load(s3 + 16);
-            a4l = Vector512.Load(s4); a4h = Vector512.Load(s4 + 16);
-            a5l = Vector512.Load(s5); a5h = Vector512.Load(s5 + 16);
-        }
-        else
-        {
-            a0l = Vector512<float>.Zero; a0h = a0l; a1l = a0l; a1h = a0l; a2l = a0l; a2h = a0l;
-            a3l = a0l; a3h = a0l; a4l = a0l; a4h = a0l; a5l = a0l; a5h = a0l;
-        }
-        long stride2 = 2 * blockStride, stride3 = 3 * blockStride;
-        for (int cb = 0; cb < blocks; cb++)
-        {
-            int blockOffset = firstBlockOffset + cb * planeIn;
-            for (int y = 0; y < kernelHeight; y++)
-            {
-                int rowOffset = blockOffset + y * rowStep;
-                for (int x = 0; x < kernelWidth; x++)
-                {
-                    int tapOffset = rowOffset + x * colStep;
-                    float* p0 = x0 + tapOffset, p1 = x1 + tapOffset, p2 = x2 + tapOffset;
-                    float* p3 = x3 + tapOffset, p4 = x4 + tapOffset, p5 = x5 + tapOffset;
                     for (int c = 0; c < Block; c++)
                     {
                         // Output channels 0-15 of the tile are packed blocks 0 and 1, 16-31 blocks 2 and 3.
@@ -1195,8 +1057,12 @@ internal static partial class DirectConvAvx2
         if (count > 4) { a4l.Store(slot + 128); a4h.Store(slot + 144); }
         if (count > 5) { a5l.Store(slot + 160); a5h.Store(slot + 176); }
     }
+#else
+    private static unsafe void ForwardSextetRun512(float* px, int* origin, float* w, long blockStride, int blocks,
+        int firstBlockOffset, int planeIn, int kernelHeight, int kernelWidth, int rowStep, int colStep,
+        float* slot, bool seeded, int count) => throw new PlatformNotSupportedException();
 #endif
-    internal static readonly bool s_probeSix = Environment.GetEnvironmentVariable("AIDOTNET_PROBE_DC512_SIX") == "1";
+
     /// <summary>Positions per <see cref="ForwardSextetRun512"/> call.</summary>
     private const int Avx512Positions = 6;
 
