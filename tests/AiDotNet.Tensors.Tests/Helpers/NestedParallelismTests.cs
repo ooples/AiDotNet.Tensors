@@ -54,9 +54,15 @@ public class NestedParallelismTests
         bool outerSawRegion = false;
         int outerIterations = Math.Max(4, Environment.ProcessorCount * 4);
 
+        // deterministicSafe: a concurrent test class turning DeterministicReductions on must not push the outer loop
+        // onto its serial path, where no iteration is a parallel region.
         CpuParallelSettings.ParallelForOrSerial(0, outerIterations, long.MaxValue / 4, _ =>
         {
-            if (CpuParallelSettings.IsInParallelRegion) outerSawRegion = true;
+            // Only an iteration running as a parallel worker is evidence: one the outer loop ran serially (a
+            // concurrent test pinned MaxDegreeOfParallelism to 1 for a moment) is not in a region, and its nested
+            // loop may rightly fan out.
+            if (!CpuParallelSettings.IsInParallelRegion) return;
+            outerSawRegion = true;
 
             // A nested loop that, unguarded, would fan out across many threads.
             var threadIds = new ConcurrentDictionary<int, byte>();
@@ -65,7 +71,7 @@ public class NestedParallelismTests
 
             // Serialized → exactly one distinct thread serviced the nested loop.
             if (threadIds.Count != 1) everyNestedRanSerial = false;
-        });
+        }, deterministicSafe: true);
 
         Assert.True(everyNestedRanSerial,
             "a nested ParallelForRegion fanned out across multiple threads — nesting did not collapse to serial.");
