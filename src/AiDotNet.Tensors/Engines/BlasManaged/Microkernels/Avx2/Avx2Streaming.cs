@@ -168,9 +168,6 @@ internal static class Avx2Streaming
         // in the D6 baseline for these shapes (ResNet50_fc, MobileNetV2_fc).
         int nBig = m == 1 ? 0 : (n / 64) * 64;       // M=1: skip 8-acc loop entirely
         int nBig32 = (n / 32) * 32;     // largest multiple of 32 ≤ n
-        int nBlocks = n / Fp32ColumnTileWidth;             // 8-col blocks for the trailing tail
-        int nBig64_blocks = nBig / Fp32ColumnTileWidth;    // covered by the 8-acc loop
-        int nBig32_blocks = nBig32 / Fp32ColumnTileWidth;  // covered by either 8-acc or 4-acc
 
         fixed (float* aPtr = a)
         fixed (float* bPtr = b)
@@ -234,34 +231,96 @@ internal static class Avx2Streaming
                     Avx.Store(cPtr + i * ldc + jStart + 16, acc2);
                     Avx.Store(cPtr + i * ldc + jStart + 24, acc3);
                 }
-                // ── 1-acc SIMD path: remaining 8-col blocks ──────
-                for (int jb = nBig32_blocks; jb < nBlocks; jb++)
+            }
+            // Columns past the last 32-wide block (all of them when n < 32: a classifier head's 10 outputs).
+            if (nBig32 < n) RemainderColumnsFp32(aPtr, lda, transA, bPtr, ldb, cPtr, ldc, m, nBig32, n, k);
+        }
+    }
+
+    /// <summary>
+    /// C[:, j0..n) += op(A) B[:, j0..n) for fewer than 32 columns, four rows at a time over 16-column pairs of vectors
+    /// (masked at the edge): eight independent FMA chains per K step against one per row and vector before, when this
+    /// tail ran one 8-wide accumulator per row (latency-bound) and scalar columns for n % 8. A 128 x 256 x 10 product
+    /// spent ~0.09 ms there. Every element is the same K-ordered FMA chain from C whichever rows share its block, so the
+    /// result does not depend on how M or N is partitioned.
+    /// </summary>
+    [MethodImpl(Hot)]
+    private static unsafe void RemainderColumnsFp32(float* aPtr, int lda, bool transA, float* bPtr, int ldb, float* cPtr,
+        int ldc, int m, int j0, int n, int k)
+    {
+        // Row step of A along K and between rows.
+        int aK = transA ? lda : 1, aRow = transA ? 1 : lda;
+        var iota = Vector256.Create(0, 1, 2, 3, 4, 5, 6, 7);
+        for (int j = j0; j < n; j += 16)
+        {
+            int w = Math.Min(16, n - j);
+            var m0 = Avx2.CompareGreaterThan(Vector256.Create(w), iota).AsSingle();
+            var m1 = Avx2.CompareGreaterThan(Vector256.Create(w - 8), iota).AsSingle();
+            bool two = w > 8;
+            float* bCol = bPtr + j;
+            int i = 0;
+            for (; i + 4 <= m; i += 4)
+            {
+                float* a0 = aPtr + i * aRow;
+                float* c0 = cPtr + i * ldc + j, c1 = c0 + ldc, c2 = c1 + ldc, c3 = c2 + ldc;
+                var x0 = Avx.MaskLoad(c0, m0); var x1 = Avx.MaskLoad(c1, m0);
+                var x2 = Avx.MaskLoad(c2, m0); var x3 = Avx.MaskLoad(c3, m0);
+                if (two)
                 {
-                    int jStart = jb * Fp32ColumnTileWidth;
-                    Vector256<float> acc = Avx.LoadVector256(cPtr + i * ldc + jStart);
+                    var y0 = Avx.MaskLoad(c0 + 8, m1); var y1 = Avx.MaskLoad(c1 + 8, m1);
+                    var y2 = Avx.MaskLoad(c2 + 8, m1); var y3 = Avx.MaskLoad(c3 + 8, m1);
                     for (int kk = 0; kk < k; kk++)
                     {
-                        float aval = transA ? aPtr[kk * lda + i] : aPtr[i * lda + kk];
-                        Vector256<float> aVec = Vector256.Create(aval);
-                        Vector256<float> bVec = Avx.LoadVector256(bPtr + kk * ldb + jStart);
-                        acc = Fma.MultiplyAdd(aVec, bVec, acc);
+                        float* ak = a0 + kk * aK;
+                        float* bRow = bCol + kk * ldb;
+                        var b0 = Avx.MaskLoad(bRow, m0);
+                        var b1 = Avx.MaskLoad(bRow + 8, m1);
+                        var v0 = Vector256.Create(ak[0]);
+                        var v1 = Vector256.Create(ak[aRow]);
+                        var v2 = Vector256.Create(ak[2 * aRow]);
+                        var v3 = Vector256.Create(ak[3 * aRow]);
+                        x0 = Fma.MultiplyAdd(v0, b0, x0); y0 = Fma.MultiplyAdd(v0, b1, y0);
+                        x1 = Fma.MultiplyAdd(v1, b0, x1); y1 = Fma.MultiplyAdd(v1, b1, y1);
+                        x2 = Fma.MultiplyAdd(v2, b0, x2); y2 = Fma.MultiplyAdd(v2, b1, y2);
+                        x3 = Fma.MultiplyAdd(v3, b0, x3); y3 = Fma.MultiplyAdd(v3, b1, y3);
                     }
-                    Avx.Store(cPtr + i * ldc + jStart, acc);
+                    Avx.MaskStore(c0 + 8, m1, y0); Avx.MaskStore(c1 + 8, m1, y1);
+                    Avx.MaskStore(c2 + 8, m1, y2); Avx.MaskStore(c3 + 8, m1, y3);
                 }
-                // ── Scalar n tail (n % 8) ──────────────────────────────────────
-                for (int j = nBlocks * Fp32ColumnTileWidth; j < n; j++)
+                else
                 {
-                    float sum = cPtr[i * ldc + j];
                     for (int kk = 0; kk < k; kk++)
                     {
-                        float aval = transA ? aPtr[kk * lda + i] : aPtr[i * lda + kk];
-                        sum += aval * bPtr[kk * ldb + j];
+                        float* ak = a0 + kk * aK;
+                        var b0 = Avx.MaskLoad(bCol + kk * ldb, m0);
+                        x0 = Fma.MultiplyAdd(Vector256.Create(ak[0]), b0, x0);
+                        x1 = Fma.MultiplyAdd(Vector256.Create(ak[aRow]), b0, x1);
+                        x2 = Fma.MultiplyAdd(Vector256.Create(ak[2 * aRow]), b0, x2);
+                        x3 = Fma.MultiplyAdd(Vector256.Create(ak[3 * aRow]), b0, x3);
                     }
-                    cPtr[i * ldc + j] = sum;
                 }
+                Avx.MaskStore(c0, m0, x0); Avx.MaskStore(c1, m0, x1);
+                Avx.MaskStore(c2, m0, x2); Avx.MaskStore(c3, m0, x3);
+            }
+            for (; i < m; i++)
+            {
+                float* a0 = aPtr + i * aRow;
+                float* c0 = cPtr + i * ldc + j;
+                var x0 = Avx.MaskLoad(c0, m0);
+                var y0 = two ? Avx.MaskLoad(c0 + 8, m1) : Vector256<float>.Zero;
+                for (int kk = 0; kk < k; kk++)
+                {
+                    var v0 = Vector256.Create(a0[kk * aK]);
+                    float* bRow = bCol + kk * ldb;
+                    x0 = Fma.MultiplyAdd(v0, Avx.MaskLoad(bRow, m0), x0);
+                    if (two) y0 = Fma.MultiplyAdd(v0, Avx.MaskLoad(bRow + 8, m1), y0);
+                }
+                Avx.MaskStore(c0, m0, x0);
+                if (two) Avx.MaskStore(c0 + 8, m1, y0);
             }
         }
     }
+
     /// <summary>
     /// #639 NT microkernel (transB=true, transA=false): C[i,j] += Σ_k A[i,k]·B[j,k].
     /// Both A row i and B row j are contiguous along K, so each output is a vectorized
