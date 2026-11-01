@@ -46,6 +46,14 @@ on:
         description: 'probe on AVX2 runners too'
         type: boolean
         default: false
+      probe_h2h:
+        description: 'probe: per mode, also run these network head-to-heads (test-name filter), interleaved over probe_h2h_rounds'
+        type: string
+        default: ''
+      probe_h2h_rounds:
+        description: 'probe: interleaved rounds of the network head-to-heads'
+        type: string
+        default: '2'
 
 concurrency:
   group: parity-${{ github.ref }}-${{ github.event_name }}-${{ inputs.probe_modes != '' && github.run_id || 'main' }}
@@ -204,9 +212,28 @@ jobs:
           AIDOTNET_OP_FILTER: ${{ inputs.probe_filter }}
           AIDOTNET_OP_THREADS: ${{ inputs.probe_threads }}
           MODES: ${{ inputs.probe_modes }}
+          H2H: ${{ inputs.probe_h2h }}
+          H2H_ROUNDS: ${{ inputs.probe_h2h_rounds }}
+          PARITY_PYTHON: python
         run: |
           out="$RUNNER_TEMP/probe.md"
           lscpu | grep -E 'Model name|^CPU\(s\)|Thread' > "$out"
+          if [ -n "$H2H" ]; then
+            echo "## network head-to-heads, modes interleaved" >> "$out"
+            echo '```' >> "$out"
+            for r in $(seq "$H2H_ROUNDS"); do
+              for spec in $MODES; do
+                name="${spec%%=*}"; settings="${spec#*=}"
+                (
+                  IFS=','
+                  for kv in $settings; do [ -n "$kv" ] && export "$kv"; done
+                  unset IFS
+                  dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-build --framework net10.0                     --filter "$H2H" --logger "console;verbosity=detailed" 2>&1                     | grep -E 'step ratio|IsAsFastAsPyTorch' | grep -vE '^\s*$' | sed "s/^\s*/r$r $name /" | cut -c1-220 >> "$out" || true
+                )
+              done
+            done
+            echo '```' >> "$out"
+          fi
           python tools/parity/cpu_op_breakdown_torch.py > "$RUNNER_TEMP/ops-torch.log"
           for spec in $MODES; do
             name="${spec%%=*}"; settings="${spec#*=}"
