@@ -29,7 +29,12 @@ public class DeviceResultRegistryTests
 
     // Any backend object will do: the registry only hands it back.
     private static IDirectGpuBackend Backend() =>
+#if NETFRAMEWORK
+        // RuntimeHelpers.GetUninitializedObject is .NET 5+; the formatter one is the net471 equivalent.
+        (IDirectGpuBackend)System.Runtime.Serialization.FormatterServices.GetUninitializedObject(typeof(AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend));
+#else
         (IDirectGpuBackend)RuntimeHelpers.GetUninitializedObject(typeof(AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend));
+#endif
 
     [Fact]
     public void A_release_moves_every_live_result_from_the_backend_it_was_bound_on()
