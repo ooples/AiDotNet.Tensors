@@ -252,9 +252,12 @@ public sealed class GruSequenceTests
         var w = ToFloat(MakeDouble());
         var expected = Run(new CpuEngine(), w, true, true, sequences: true, out _, resetAfter).ToArray();
         AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Reset();
+        long fused = AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.FusedGruForwardRuns;
         var actual = Run(gpu, w, true, true, sequences: true, out var final, resetAfter);
-        Assert.True(AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Count >= 2 * T,
-            "the GPU engine did not launch the GRU kernels (two per step).");
+        // The portable kernels launch two per step; CUDA's fused forward (CudaFusedGruTests) one GEMM and one recurrence.
+        Assert.True(AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Count >= 2 * T
+                    || AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.FusedGruForwardRuns > fused,
+            "the GPU engine did not launch the GRU kernels.");
         var values = actual.ToArray();
         for (int i = 0; i < expected.Length; i++) Assert.Equal(expected[i], values[i], 4);
         Assert.Equal(new[] { B, H }, final.Shape.ToArray());
@@ -273,8 +276,13 @@ public sealed class GruSequenceTests
         // The device path must have run, forward and backward: two launches per step each way, then four for the input,
         // weight and bias gradients. A host fallback would pass the value checks below without launching any of them.
         AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Reset();
+        long fusedForward = AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.FusedGruForwardRuns;
+        long fusedBackward = AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.FusedGruBackwardRuns;
         var device = TapeGradients(gpu, w, projection, resetAfter);
-        Assert.True(AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Count >= 4 * T + 4,
+        // CUDA's fused kernels count their runs instead (one recurrence launch per direction).
+        bool fused = AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.FusedGruForwardRuns > fusedForward
+                     && AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.FusedGruBackwardRuns > fusedBackward;
+        Assert.True(fused || AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Count >= 4 * T + 4,
             $"the GRU device kernels did not run (launches {AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Count}).");
         foreach (var name in cpu.Keys)
         {

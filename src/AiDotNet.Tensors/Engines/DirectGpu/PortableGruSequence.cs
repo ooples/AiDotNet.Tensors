@@ -58,6 +58,25 @@ internal static class PortableGruSequence
     }
 
     /// <summary>
+    /// <see cref="IFusedGruSequence.GruForwardSequence"/> on the portable kernels, for a backend whose
+    /// <see cref="IFusedLstmSequenceTraining.StatefulLstmLauncher"/> runs them.
+    /// </summary>
+    public static void ForwardResetAfter(IDirectGpuBackend backend, IGpuBuffer input, IGpuBuffer hInit, IGpuBuffer weightsIh, IGpuBuffer weightsHh,
+        IGpuBuffer biasIh, IGpuBuffer biasHh, IGpuBuffer output, IGpuBuffer allH, IGpuBuffer gates, IGpuBuffer ghn,
+        int seqLen, int batch, int inputSize, int hiddenSize)
+        => Forward(backend, ((IFusedLstmSequenceTraining)backend).StatefulLstmLauncher, input, hInit, weightsIh, weightsHh,
+            biasIh, biasHh, output, allH, gates, ghn, null, seqLen, batch, inputSize, hiddenSize, resetAfter: true);
+
+    /// <summary><see cref="IFusedGruSequence.GruBackwardSequence"/> on the portable kernels.</summary>
+    public static void BackwardResetAfter(IDirectGpuBackend backend, IGpuBuffer gradOutput, IGpuBuffer allH, IGpuBuffer gates, IGpuBuffer ghn,
+        IGpuBuffer weightsIh, IGpuBuffer weightsHh, IGpuBuffer input, IGpuBuffer gradInput, IGpuBuffer gradHInit,
+        IGpuBuffer gradWeightsIh, IGpuBuffer gradWeightsHh, IGpuBuffer gradBiasIh, IGpuBuffer gradBiasHh,
+        int seqLen, int batch, int inputSize, int hiddenSize)
+        => Backward(backend, ((IFusedLstmSequenceTraining)backend).StatefulLstmLauncher, gradOutput, allH, gates, ghn, null,
+            weightsIh, weightsHh, input, gradInput, gradHInit, gradWeightsIh, gradWeightsHh, gradBiasIh, gradBiasHh,
+            seqLen, batch, inputSize, hiddenSize, resetAfter: true);
+
+    /// <summary>
     /// Backpropagation through time. <paramref name="gradOutput"/> is the gradient of every step's output [B, T, H]
     /// (zeros where a step's output was not used); <paramref name="gradHFinal"/>, when given, adds the final state's.
     /// </summary>

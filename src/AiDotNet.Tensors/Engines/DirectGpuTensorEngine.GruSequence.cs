@@ -52,9 +52,14 @@ public partial class DirectGpuTensorEngine
             gates = AllocateFullyWrittenOutputBuffer(backend, gatesSize);
             ghn = AllocateFullyWrittenOutputBuffer(backend, ghnSize);
             if (!resetAfter) rh = AllocateFullyWrittenOutputBuffer(backend, rhSize);
-            PortableGruSequence.Forward(backend, fused.StatefulLstmLauncher, x.Buffer, hInit.Buffer, wi.Buffer, wh.Buffer,
-                bi.Buffer, bh.Buffer, y.Buffer, allH.Buffer, gates.Buffer, ghn.Buffer, resetAfter ? null : rh.Buffer,
-                seqLen, batch, inFeatures, hidden, resetAfter);
+            // The backend's GRU sequence (CUDA's fused kernels; the portable ones elsewhere); the caches are the same.
+            if (resetAfter && backend is IFusedGruSequence fusedGru)
+                fusedGru.GruForwardSequence(x.Buffer, hInit.Buffer, wi.Buffer, wh.Buffer, bi.Buffer, bh.Buffer, y.Buffer,
+                    allH.Buffer, gates.Buffer, ghn.Buffer, seqLen, batch, inFeatures, hidden);
+            else
+                PortableGruSequence.Forward(backend, fused.StatefulLstmLauncher, x.Buffer, hInit.Buffer, wi.Buffer, wh.Buffer,
+                    bi.Buffer, bh.Buffer, y.Buffer, allH.Buffer, gates.Buffer, ghn.Buffer, resetAfter ? null : rh.Buffer,
+                    seqLen, batch, inFeatures, hidden, resetAfter);
 
             var sequence = DeferTensorResult<T>(backend, y.Buffer, batch * seqLen * hidden, new[] { batch, seqLen, hidden });
             y.RelinquishOwnership();
@@ -136,9 +141,13 @@ public partial class DirectGpuTensorEngine
         var owned = new[] { dx, dh0, dwi, dwh, dbi, dbh };
         try
         {
-            PortableGruSequence.Backward(backend, fused.StatefulLstmLauncher, gy.Buffer, cH.Buffer, cG.Buffer, cN.Buffer,
-                rhTensor is null ? null : cR.Buffer, wi.Buffer, wh.Buffer, x.Buffer, dx.Buffer, dh0.Buffer, dwi.Buffer,
-                dwh.Buffer, dbi.Buffer, dbh.Buffer, seqLen, batch, inFeatures, hidden, resetAfter: resetAfter);
+            if (resetAfter && backend is IFusedGruSequence fusedGru)
+                fusedGru.GruBackwardSequence(gy.Buffer, cH.Buffer, cG.Buffer, cN.Buffer, wi.Buffer, wh.Buffer, x.Buffer,
+                    dx.Buffer, dh0.Buffer, dwi.Buffer, dwh.Buffer, dbi.Buffer, dbh.Buffer, seqLen, batch, inFeatures, hidden);
+            else
+                PortableGruSequence.Backward(backend, fused.StatefulLstmLauncher, gy.Buffer, cH.Buffer, cG.Buffer, cN.Buffer,
+                    rhTensor is null ? null : cR.Buffer, wi.Buffer, wh.Buffer, x.Buffer, dx.Buffer, dh0.Buffer, dwi.Buffer,
+                    dwh.Buffer, dbi.Buffer, dbh.Buffer, seqLen, batch, inFeatures, hidden, resetAfter: resetAfter);
             Tensor<T> Result(int index, int length, int[] shape)
             {
                 var tensor = gpu.DeferTensorResult<T>(backend, owned[index].Buffer, length, shape);
