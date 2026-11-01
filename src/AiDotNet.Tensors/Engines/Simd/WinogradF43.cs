@@ -81,6 +81,168 @@ internal static unsafe class WinogradF43
         int batch, int inChannels, int height, int width, int outChannels)
         => Run(dy, dyOff, w, wOff, dx, dxOff, accumulate, batch, outChannels, height, width, inChannels, inputGradient: true);
 
+    /// <summary>
+    /// dw [K, C, 3, 3] (=, or += when accumulate) = the weight gradient of that convolution from x [N, C, H, W] and
+    /// dy [N, K, H, W]. The forward is linear in w through U = G w G^T, so its adjoint is dw = G^T [ sum over patches of
+    /// (B^T d B) . (A dy_tile A^T) ] G: the input transform of the forward, the output gradient's 4x4 tiles taken to 6x6
+    /// by A, 36 GEMMs over the patches (K^T x P times P x C), and G^T . G per channel pair.
+    /// </summary>
+    internal static void BackwardKernel(float[] x, int xOff, float[] dy, int dyOff, float[] dw, int dwOff, bool accumulate,
+        int batch, int inChannels, int height, int width, int outChannels)
+    {
+        int tilesH = (height + Tile - 1) / Tile, tilesW = (width + Tile - 1) / Tile;
+        int patches = batch * tilesH * tilesW;
+        float[] v = ArrayPool<float>.Shared.Rent(Points * patches * inChannels);
+        float[] d = ArrayPool<float>.Shared.Rent(Points * patches * outChannels);
+        float[] m = ArrayPool<float>.Shared.Rent(Points * inChannels * outChannels);
+        try
+        {
+            TransformInput(x, xOff, v, batch, inChannels, height, width, tilesH, tilesW);
+            TransformOutputGradient(dy, dyOff, d, batch, outChannels, height, width, tilesH, tilesW);
+            MultiplyOverPatches(d, v, m, patches, inChannels, outChannels);
+            TransformWeightGradient(m, dw, dwOff, accumulate, inChannels, outChannels);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(v);
+            ArrayPool<float>.Shared.Return(d);
+            ArrayPool<float>.Shared.Return(m);
+        }
+    }
+
+    // D [36][P][cOut] = A t A^T per patch and output channel, t the 4x4 output-gradient tile (zero past the plane);
+    // one job per (image, block of eight output channels).
+    private static void TransformOutputGradient(float[] dy, int dyOff, float[] d, int batch, int cOut, int height, int width,
+        int tilesH, int tilesW)
+    {
+        int blocks = cOut / 8, tiles = tilesH * tilesW, patches = batch * tiles;
+        int outW = tilesW * Tile, outH = tilesH * Tile;
+        int tileFloats = outH * outW * 8;
+        int hw = height * width;
+        CpuParallelSettings.ParallelForOrSerial(0, batch * blocks, (long)batch * cOut * hw * 12, [MethodImpl(MethodImplOptions.AggressiveOptimization)] (job) =>
+        {
+            int n = job / blocks, kb = job - n * blocks;
+            float[] scratch = Scratch(tileFloats);
+            fixed (float* gp = dy)
+            fixed (float* dp = d)
+            fixed (float* tp = scratch)
+            {
+                new Span<float>(tp, tileFloats).Clear();
+                float* planes = gp + dyOff + ((long)n * cOut + kb * 8) * hw;
+                for (int h = 0; h < height; h++)
+                {
+                    float* src = planes + h * width;
+                    float* dst = tp + h * outW * 8;
+                    int q = 0;
+                    for (; q + 8 <= width; q += 8) Transpose8x8(src + q, hw, dst + q * 8, 8);
+                    for (; q < width; q++)
+                        for (int l = 0; l < 8; l++) dst[q * 8 + l] = src[(long)l * hw + q];
+                }
+                var g = stackalloc Vector256<float>[16];
+                var t = stackalloc Vector256<float>[24];
+                var r = stackalloc Vector256<float>[36];
+                long pointStride = (long)patches * cOut;
+                for (int th = 0; th < tilesH; th++)
+                    for (int tw = 0; tw < tilesW; tw++)
+                    {
+                        float* tile = tp + (th * Tile * outW + tw * Tile) * 8;
+                        for (int a = 0; a < 4; a++)
+                            for (int b = 0; b < 4; b++)
+                                g[a * 4 + b] = Avx.LoadVector256(tile + (a * outW + b) * 8);
+                        // Columns: t[., b] = A g[., b] (6 x 4); rows: r[i, .] = t[i, .] A^T (6 x 6).
+                        for (int b = 0; b < 4; b++) GradientTransform(g, b, 4, t, b, 4);
+                        for (int i = 0; i < 6; i++) GradientTransform(t, i * 4, 1, r, i * 6, 1);
+                        int p = n * tiles + th * tilesW + tw;
+                        float* dstPatch = dp + (long)p * cOut + kb * 8;
+                        for (int xi = 0; xi < Points; xi++) Avx.Store(dstPatch + xi * pointStride, r[xi]);
+                    }
+            }
+        }, deterministicSafe: true);
+    }
+
+    // A (6 x 4) applied to the four vectors src[s + r * ss], written as six to dst[o + r * os]: A is the transpose of
+    // the output transform's A^T.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void GradientTransform(Vector256<float>* src, int s, int ss, Vector256<float>* dst, int o, int os)
+    {
+        var r0 = src[s]; var r1 = src[s + ss]; var r2 = src[s + 2 * ss]; var r3 = src[s + 3 * ss];
+        var e = Avx.Add(r0, r2); var od = Avx.Add(r1, r3);
+        var e4 = Fma.MultiplyAdd(r2, Vector256.Create(4f), r0);
+        var o8 = Fma.MultiplyAdd(r3, Vector256.Create(4f), r1);   // r1 + 4 r3; doubled below
+        dst[o] = r0;
+        dst[o + os] = Avx.Add(e, od);
+        dst[o + 2 * os] = Avx.Subtract(e, od);
+        dst[o + 3 * os] = Fma.MultiplyAdd(o8, Vector256.Create(2f), e4);
+        dst[o + 4 * os] = Fma.MultiplyAddNegated(o8, Vector256.Create(2f), e4);
+        dst[o + 5 * os] = r3;
+    }
+
+    // M_xi [cOut x cIn] = D_xi^T [cOut x P] V_xi [P x cIn]: 36 single-threaded GEMMs in parallel, each summing every
+    // patch in one order (deterministic whatever the thread count).
+    private static void MultiplyOverPatches(float[] d, float[] v, float[] m, int patches, int cIn, int cOut)
+    {
+        CpuParallelSettings.ParallelForOrSerial(0, Points, (long)Points * patches * cIn * cOut, (xi) =>
+        {
+            var a = new ReadOnlySpan<float>(d, (int)((long)xi * patches * cOut), patches * cOut);
+            var b = new ReadOnlySpan<float>(v, (int)((long)xi * patches * cIn), patches * cIn);
+            var c = new Span<float>(m, xi * cOut * cIn, cOut * cIn);
+            var options = new BlasManaged.BlasOptions<float> { NumThreads = -1, BetaZero = true };
+            BlasManaged.BlasManaged.Gemm(a, cOut, true, b, cIn, false, c, cIn, cOut, cIn, patches, in options);
+        }, deterministicSafe: true);
+    }
+
+    // dw[o][i] (3 x 3) = G^T M[., o, i] G, eight input channels per vector; one job per output channel.
+    private static void TransformWeightGradient(float[] m, float[] dw, int dwOff, bool accumulate, int cIn, int cOut)
+    {
+        CpuParallelSettings.ParallelForOrSerial(0, cOut, (long)cOut * cIn * 60, [MethodImpl(MethodImplOptions.AggressiveOptimization)] (o) =>
+        {
+            var mm = stackalloc Vector256<float>[36];
+            var t = stackalloc Vector256<float>[18];
+            var r = stackalloc Vector256<float>[9];
+            float* lanes = stackalloc float[72];
+            long pointStride = (long)cOut * cIn;
+            fixed (float* mp = m)
+            fixed (float* wp = dw)
+            {
+                for (int i0 = 0; i0 < cIn; i0 += 8)
+                {
+                    float* src = mp + (long)o * cIn + i0;
+                    for (int xi = 0; xi < Points; xi++) mm[xi] = Avx.LoadVector256(src + xi * pointStride);
+                    // Columns: t[., j] = G^T mm[., j] (3 x 6); rows: r[a, .] = t[a, .] G (3 x 3).
+                    for (int j = 0; j < 6; j++) KernelGradientTransform(mm, j, 6, t, j, 6);
+                    for (int a = 0; a < 3; a++) KernelGradientTransform(t, a * 6, 1, r, a * 3, 1);
+                    for (int e = 0; e < 9; e++) Avx.Store(lanes + e * 8, r[e]);
+                    float* dst = wp + dwOff + ((long)o * cIn + i0) * 9;
+                    for (int l = 0; l < 8; l++)
+                        for (int e = 0; e < 9; e++)
+                        {
+                            float value = lanes[e * 8 + l];
+                            if (accumulate) dst[l * 9 + e] += value;
+                            else dst[l * 9 + e] = value;
+                        }
+                }
+            }
+        }, deterministicSafe: true);
+    }
+
+    // G^T (3 x 6) applied to the six vectors src[s + r * ss], written as three to dst[o + r * os].
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void KernelGradientTransform(Vector256<float>* src, int s, int ss, Vector256<float>* dst, int o, int os)
+    {
+        var m0 = src[s]; var m1 = src[s + ss]; var m2 = src[s + 2 * ss];
+        var m3 = src[s + 3 * ss]; var m4 = src[s + 4 * ss]; var m5 = src[s + 5 * ss];
+        var p12 = Avx.Add(m1, m2); var n12 = Avx.Subtract(m2, m1);
+        var p34 = Avx.Add(m3, m4); var n34 = Avx.Subtract(m3, m4);
+        var sixth = Vector256.Create(1f / 6f);
+        // m0/4 - (m1 + m2)/6 + (m3 + m4)/24
+        dst[o] = Fma.MultiplyAdd(m0, Vector256.Create(0.25f),
+            Fma.MultiplyAdd(p34, Vector256.Create(1f / 24f), Avx.Multiply(p12, Vector256.Create(-1f / 6f))));
+        // (m2 - m1)/6 + (m3 - m4)/12
+        dst[o + os] = Fma.MultiplyAdd(n12, sixth, Avx.Multiply(n34, Vector256.Create(1f / 12f)));
+        // (m3 + m4 - m1 - m2)/6 + m5
+        dst[o + 2 * os] = Fma.MultiplyAdd(Avx.Subtract(p34, p12), sixth, m5);
+    }
+
     // A convolution with cIn input and cOut output channels. inputGradient: w is [cIn][cOut][3][3] (the forward weights,
     // whose output channels are this pass's inputs) and is read turned 180 degrees; otherwise [cOut][cIn][3][3].
     private static void Run(float[] x, int xOff, float[] w, int wOff, float[] y, int yOff, bool accumulate,
