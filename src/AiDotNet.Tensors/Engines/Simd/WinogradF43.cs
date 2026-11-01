@@ -70,6 +70,18 @@ internal static unsafe class WinogradF43
             && (long)Points * inChannels * outChannels <= int.MaxValue;
     }
 
+    /// <summary>
+    /// Whether <see cref="BackwardKernel"/> takes the weight gradient: <see cref="Applies"/>, and channel counts with
+    /// C K >= 64 (C + K). Its transforms stream V and D (36 values per patch and channel, C + K channels) beside GEMMs
+    /// that save work in proportion to C K: at 64 -> 64 channels on 32x32 planes the transforms made it 1.5x slower than
+    /// the direct kernel, at 128 -> 128 on 16x16 it ran in 0.4x the direct kernel's time.
+    /// </summary>
+    internal static bool AppliesToWeightGradient(int batch, int inChannels, int outChannels, int height, int width,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
+        => Applies(batch, inChannels, outChannels, height, width, kernelH, kernelW, strideH, strideW, padH, padW,
+               dilationH, dilationW)
+           && (long)inChannels * outChannels >= 64L * (inChannels + outChannels);
+
     /// <summary>y [N, K, H, W] (=, or += when accumulate) = the 3x3 padding-1 convolution of x [N, C, H, W] with w [K, C, 3, 3].</summary>
     internal static void Forward(float[] x, int xOff, float[] w, int wOff, float[] y, int yOff, bool accumulate,
         int batch, int inChannels, int height, int width, int outChannels)
