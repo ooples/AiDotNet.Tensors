@@ -1385,7 +1385,7 @@ internal static class SimdConvHelper
     /// This replaces, for small per-image work, an im2col plus one native GEMM PER IMAGE fanned across the pool:
     /// the native calls serialise on the process-wide native compute gate, and every image's partial result was
     /// copied into a fresh array and summed on one thread. Here each dK element is produced by exactly one task in
-    /// a fixed order (lane-wise over the images, rows and chunks; then lanes 0..7; then taps), so the result does
+    /// a fixed order (lane-wise over the images, row pairs, chunks and the pair's two rows; then lanes 0..7; then taps), so the result does
     /// not depend on the thread count and is identical from run to run.
     /// </remarks>
     internal static unsafe void Conv3x3KernelGradStride1(
@@ -1461,7 +1461,46 @@ internal static class SimdConvHelper
                                 var a0 = s[0]; var a1 = s[1]; var a2 = s[2];
                                 var a3 = s[3]; var a4 = s[4]; var a5 = s[5];
                                 var a6 = s[6]; var a7 = s[7]; var a8 = s[8];
-                                for (int oh = 0; oh < outHeight; oh++)
+                                // Two output rows per pass share input rows 1 and 2 of their windows: 14 loads feed
+                                // 18 FMAs (one row alone: 10 loads for 9).
+                                int oh = 0;
+                                for (; oh + 2 <= outHeight; oh += 2)
+                                {
+                                    float* gRow = gPlane + oh * outWidth;
+                                    float* gRow1 = gRow + outWidth;
+                                    float* r0 = xPlane + oh * paddedW;
+                                    float* r1 = r0 + paddedW;
+                                    float* r2 = r1 + paddedW;
+                                    float* r3 = r2 + paddedW;
+                                    for (int c = 0; c < colChunks; c++)
+                                    {
+                                        int ow = c * 8;
+                                        Vector256<float> g, h;
+                                        if (c < colChunks - 1 || tailValid == 8)
+                                        {
+                                            g = Avx.LoadVector256(gRow + ow);
+                                            h = Avx.LoadVector256(gRow1 + ow);
+                                        }
+                                        else
+                                        {
+                                            g = Avx.MaskLoad(gRow + ow, tailMask);
+                                            h = Avx.MaskLoad(gRow1 + ow, tailMask);
+                                        }
+                                        var x = Avx.LoadVector256(r0 + ow); a0 = Fma.MultiplyAdd(g, x, a0);
+                                        x = Avx.LoadVector256(r0 + ow + 1); a1 = Fma.MultiplyAdd(g, x, a1);
+                                        x = Avx.LoadVector256(r0 + ow + 2); a2 = Fma.MultiplyAdd(g, x, a2);
+                                        x = Avx.LoadVector256(r1 + ow); a3 = Fma.MultiplyAdd(g, x, a3); a0 = Fma.MultiplyAdd(h, x, a0);
+                                        x = Avx.LoadVector256(r1 + ow + 1); a4 = Fma.MultiplyAdd(g, x, a4); a1 = Fma.MultiplyAdd(h, x, a1);
+                                        x = Avx.LoadVector256(r1 + ow + 2); a5 = Fma.MultiplyAdd(g, x, a5); a2 = Fma.MultiplyAdd(h, x, a2);
+                                        x = Avx.LoadVector256(r2 + ow); a6 = Fma.MultiplyAdd(g, x, a6); a3 = Fma.MultiplyAdd(h, x, a3);
+                                        x = Avx.LoadVector256(r2 + ow + 1); a7 = Fma.MultiplyAdd(g, x, a7); a4 = Fma.MultiplyAdd(h, x, a4);
+                                        x = Avx.LoadVector256(r2 + ow + 2); a8 = Fma.MultiplyAdd(g, x, a8); a5 = Fma.MultiplyAdd(h, x, a5);
+                                        x = Avx.LoadVector256(r3 + ow); a6 = Fma.MultiplyAdd(h, x, a6);
+                                        x = Avx.LoadVector256(r3 + ow + 1); a7 = Fma.MultiplyAdd(h, x, a7);
+                                        x = Avx.LoadVector256(r3 + ow + 2); a8 = Fma.MultiplyAdd(h, x, a8);
+                                    }
+                                }
+                                for (; oh < outHeight; oh++)
                                 {
                                     float* gRow = gPlane + oh * outWidth;
                                     float* r0 = xPlane + oh * paddedW;
