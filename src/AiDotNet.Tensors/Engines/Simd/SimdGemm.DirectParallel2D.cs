@@ -32,7 +32,7 @@ internal static partial class SimdGemm
 
     /// <summary>A/B and test toggle (like <see cref="UseParallelGemm"/>): false sends these GEMMs back to the
     /// paths below the 2D gate. Not a production setting.</summary>
-    internal static bool UseDirectParallel2D = true;
+    internal static bool UseDirectParallel2D = Environment.GetEnvironmentVariable("AIDOTNET_GEMM_DIRECT2D") != "0";
 
     /// <summary>GEMMs the 2D path computed on this thread; a test probe that a gated shape actually took it.</summary>
     [ThreadStatic] internal static int t_directParallel2DRuns;
