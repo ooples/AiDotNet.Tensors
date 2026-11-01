@@ -98,6 +98,74 @@ public class WinogradF43Tests
         }
     }
 
+    [Theory]
+    [MemberData(nameof(Shapes))]
+    public void BackwardKernel_MatchesTheDirectSum(int n, int c, int k, int h, int w)
+    {
+        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported) return;
+        var rng = new Random(n * 17 + c * 3 + k + h + w * 5);
+        float[] x = Fill(rng, n * c * h * w), dy = Fill(rng, n * k * h * w);
+        foreach (bool accumulate in new[] { false, true })
+        {
+            float[] dw = Fill(new Random(13), k * c * 9);
+            float[] dw0 = (float[])dw.Clone();
+            WinogradF43.BackwardKernel(x, 0, dy, 0, dw, 0, accumulate, n, c, h, w, k);
+            for (int o = 0; o < k; o++)
+                for (int ic = 0; ic < c; ic++)
+                    for (int di = 0; di < 3; di++)
+                        for (int dj = 0; dj < 3; dj++)
+                        {
+                            // dW[o][ic][di][dj] = sum over b, i, j of dY[b][o][i][j] x[b][ic][i - 1 + di][j - 1 + dj].
+                            double sum = 0, mag = 0;
+                            for (int b = 0; b < n; b++)
+                                for (int i = 0; i < h; i++)
+                                    for (int j = 0; j < w; j++)
+                                    {
+                                        int yi = i - 1 + di, xj = j - 1 + dj;
+                                        if (yi < 0 || yi >= h || xj < 0 || xj >= w) continue;
+                                        double p = (double)dy[((b * k + o) * h + i) * w + j] * x[((b * c + ic) * h + yi) * w + xj];
+                                        sum += p; mag += Math.Abs(p);
+                                    }
+                            int at = (o * c + ic) * 9 + di * 3 + dj;
+                            double expected = (accumulate ? dw0[at] : 0) + sum;
+                            Assert.True(Math.Abs(dw[at] - expected) <= 2e-6 * (mag + 1) * 8,
+                                $"n={n} c={c} k={k} {h}x{w} acc={accumulate} [{o},{ic},{di},{dj}]: expected {expected}, got {dw[at]}");
+                        }
+        }
+    }
+
+    [Fact]
+    public void Engine_WeightGradient_TakesTheKernel_AndAgreesWithTheDirectRoute()
+    {
+        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported) return;
+        const int n = 8, c = 64, k = 72, h = 16, w = 16;
+        var rng = new Random(78);
+        var x = new Tensor<float>(Fill(rng, n * c * h * w), new[] { n, c, h, w });
+        var dy = new Tensor<float>(Fill(rng, n * k * h * w), new[] { n, k, h, w });
+        var engine = new CpuEngine();
+        int[] stride = { 1, 1 }, pad = { 1, 1 }, dil = { 1, 1 }, kernelShape = { k, c, 3, 3 };
+        float[] allocWino = engine.Conv2DBackwardKernel(dy, x, kernelShape, stride, pad, dil).ToArray();
+        var intoWino = new Tensor<float>(kernelShape);
+        engine.Conv2DBackwardKernelInto(intoWino, dy, x, kernelShape, stride, pad, dil, false);
+        float[] allocDirect;
+        var intoDirect = new Tensor<float>(kernelShape);
+        WinogradF43.s_disable = true;
+        try
+        {
+            allocDirect = engine.Conv2DBackwardKernel(dy, x, kernelShape, stride, pad, dil).ToArray();
+            engine.Conv2DBackwardKernelInto(intoDirect, dy, x, kernelShape, stride, pad, dil, false);
+        }
+        finally
+        {
+            WinogradF43.s_disable = false;
+        }
+        // 2048 products per weight (~0.25 each): allow 1e-3 of their typical sum.
+        AssertClose(allocDirect, allocWino, "weight gradient", 2e-2);
+        AssertClose(intoDirect.ToArray(), intoWino.ToArray(), "weight gradient (into)", 2e-2);
+        Assert.NotEqual(allocDirect, allocWino);
+        Assert.NotEqual(intoDirect.ToArray(), intoWino.ToArray());
+    }
+
     [Fact]
     public void Applies_OnlyTo3x3Stride1Padding1_WithChannelMultiplesOfEight()
     {
@@ -146,12 +214,12 @@ public class WinogradF43Tests
         Assert.NotEqual(dxDirect, dxWino);
     }
 
-    private static void AssertClose(float[] expected, float[] actual, string what)
+    private static void AssertClose(float[] expected, float[] actual, string what, double absolute = 1e-3)
     {
         Assert.Equal(expected.Length, actual.Length);
         for (int i = 0; i < expected.Length; i++)
             // 576 products per output: F(4x4)'s rounding is about 2e-6 of their summed magnitude (~0.25 each here).
-            Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-3 * (1 + Math.Abs(expected[i])),
+            Assert.True(Math.Abs(expected[i] - actual[i]) <= absolute * (1 + Math.Abs(expected[i])),
                 $"{what} [{i}]: direct {expected[i]}, Winograd {actual[i]}");
     }
 

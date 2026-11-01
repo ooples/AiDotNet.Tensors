@@ -17180,6 +17180,27 @@ public partial class CpuEngine : ITensorLevelEngine
             return RentFloatResult<T>(kernelShape, gradKernelF);
         }
 
+#if NET5_0_OR_GREATER
+        // 3x3 stride-1 padding-1: the Winograd F(4x4, 3x3) weight gradient, as Conv2DBackwardKernelInto.
+        if (typeof(T) == typeof(float) && input.Layout == LinearAlgebra.TensorLayout.Nchw
+            && input.IsContiguous && gradOutput.IsContiguous && kernelShape[1] == inChannels
+            && gradOutput._shape[0] == batch && gradOutput._shape[1] == outChannels
+            && outputHeight == height && outputWidth == width
+            && Simd.WinogradF43.Applies(batch, inChannels, outChannels, height, width, kernelHeight, kernelWidth,
+                strideH, strideW, padH, padW, dilationH, dilationW))
+        {
+            var xArrW = input.GetCpuBackingForStridedRead(out int xOffW) as float[];
+            var gArrW = gradOutput.GetCpuBackingForStridedRead(out int gOffW) as float[];
+            if (xArrW is not null && gArrW is not null)
+            {
+                var dWW = new float[outChannels * inChannels * 9];
+                Simd.WinogradF43.BackwardKernel(xArrW, xOffW, gArrW, gOffW, dWW, 0, accumulate: false,
+                    batch, inChannels, height, width, outChannels);
+                return RentFloatResult<T>(kernelShape, dWW);
+            }
+        }
+#endif
+
         if (typeof(T) == typeof(float))
         {
             int colH = inChannels * kernelHeight * kernelWidth;
@@ -17628,6 +17649,21 @@ public partial class CpuEngine : ITensorLevelEngine
                 {
                     Simd.Conv1x1Gemm.BackwardKernel(xArr1, xOff1, gArr1, gOff1, dArr1, dOff1, accumulate, batch, inChannels,
                         height, width, outChannels, strideH, strideW, outputHeight, outputWidth);
+                    return;
+                }
+            }
+            // 3x3 stride-1 padding-1: the Winograd F(4x4, 3x3) weight gradient (the forward's adjoint).
+            if (input.Layout == LinearAlgebra.TensorLayout.Nchw
+                && Simd.WinogradF43.Applies(batch, inChannels, outChannels, height, width, kernelHeight, kernelWidth,
+                    strideH, strideW, padH, padW, dilationH, dilationW))
+            {
+                var xArrW = input.GetCpuBackingForStridedRead(out int xOffW) as float[];
+                var gArrW = gradOutput.GetCpuBackingForStridedRead(out int gOffW) as float[];
+                var dArrW = dest.GetCpuBackingForContiguousWrite(out int dOffW) as float[];
+                if (xArrW is not null && gArrW is not null && dArrW is not null)
+                {
+                    Simd.WinogradF43.BackwardKernel(xArrW, xOffW, gArrW, gOffW, dArrW, dOffW, accumulate,
+                        batch, inChannels, height, width, outChannels);
                     return;
                 }
             }
