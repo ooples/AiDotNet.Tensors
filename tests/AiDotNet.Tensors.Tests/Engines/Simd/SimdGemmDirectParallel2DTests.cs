@@ -132,6 +132,7 @@ public class SimdGemmDirectParallel2DTests
     [InlineData(784, 128, 512)]   // the same at batch 128
     [InlineData(30, 17, 80)]      // 2 full 32-column steps, then a 16-column step
     [InlineData(29, 9, 70)]       // a 4-row remainder block, a scalar row, and a 6-column tail (mFull = 28)
+    [InlineData(36, 9, 64)]       // the last panel ends at the row end: its final packed step is copied by element
     public void Vector512TransATile_IsBitIdenticalTo256BitTiles(int m, int k, int n)
     {
         // The direct kernels are register FMA chains with no portable form; production reaches them only behind an FMA gate.
