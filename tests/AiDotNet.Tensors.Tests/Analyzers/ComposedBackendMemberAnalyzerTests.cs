@@ -30,6 +30,10 @@ public sealed class ComposedBackendMemberAnalyzerTests
     [InlineData("if (size <= 0) return; ThrowIfDisposed(); Add(a, b, c, size); Relu(c, c, size);")]
     [InlineData("var scratch = AllocateBuffer(size); Add(a, b, scratch, size); Relu(scratch, c, size);")]
     [InlineData("this.Add(a, b, c, size); this.Relu(c, c, size);")]
+    [InlineData("Add(a, b, c, size); Relu(c, c, size); return;")]
+    [InlineData("var s = AllocateBuffer(size); Add(a, b, s, size); Relu(s, c, size); s.Dispose();")]           // a released scratch
+    [InlineData("var s = AllocateBuffer(size); try { Add(a, b, s, size); Relu(s, c, size); } finally { s.Dispose(); }")]
+    [InlineData("var sum = AddNew(a, b, size); Relu(sum, c, size);")]                                         // a launch in a local
     public void Composition_IsReported(string hipBody)
     {
         var diagnostics = Analyze(hipBody, baseline: null);
@@ -44,6 +48,8 @@ public sealed class ComposedBackendMemberAnalyzerTests
     [InlineData("if (TryFused(a, b, c, size)) return; Add(a, b, c, size); Relu(c, c, size);")] // a real kernel first
     [InlineData("Add(a, b, c, size);")]                                                      // one call is a delegation
     [InlineData("Add(a, b, c, size); Launch(\"relu\");")]                                     // a launch of its own
+    [InlineData("var s = AllocateBuffer(size); Add(a, b, s, size); s.Dispose();")]            // allocation is not a launch
+    [InlineData("var s = AllocateBuffer(size); try { Add(a, b, s, size); Launch(\"relu\"); } finally { s.Dispose(); }")]
     public void NonComposition_IsNotReported(string hipBody)
     {
         var diagnostics = Analyze(hipBody, baseline: null);
@@ -70,13 +76,14 @@ public sealed class ComposedBackendMemberAnalyzerTests
         var source = new System.Text.StringBuilder(@"
 namespace AiDotNet.Tensors.Engines.DirectGpu
 {
-    public interface IGpuBuffer { }
+    public interface IGpuBuffer : System.IDisposable { }
     public interface IDirectGpuBackend
     {
         void Add(IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, int size);
         void Relu(IGpuBuffer a, IGpuBuffer b, int size);
         void AddRelu(IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, int size);
         IGpuBuffer AllocateBuffer(int size);
+        IGpuBuffer AddNew(IGpuBuffer a, IGpuBuffer b, int size);
     }
 }
 ");
@@ -93,6 +100,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.{ns}
         public void Relu(IGpuBuffer a, IGpuBuffer b, int size) {{ Launch(""relu""); }}
         public void AddRelu(IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, int size) {{ {body} }}
         public IGpuBuffer AllocateBuffer(int size) {{ Launch(""alloc""); return null; }}
+        public IGpuBuffer AddNew(IGpuBuffer a, IGpuBuffer b, int size) {{ Launch(""add""); return null; }}
         private bool TryFused(IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, int size) {{ Launch(""fused""); return true; }}
         private void ThrowIfDisposed() {{ }}
         private void Launch(string kernel) {{ }}

@@ -302,16 +302,26 @@ public sealed class BackendParityAnalyzer : DiagnosticAnalyzer
                 // A temporary (using var scratch = AllocateBuffer(n);) between the calls is still a composition.
                 case LocalDeclarationStatementSyntax local:
                     if (!OnlyNeutralCalls(local.Declaration, model, owner)) return false;
+                    // var result = GemmBiasRelu(...); is a launch of the composition; an allocation is only its scratch.
+                    foreach (var call in local.Declaration.DescendantNodes().OfType<InvocationExpressionSyntax>())
+                        if (model.GetSymbolInfo(call).Symbol is IMethodSymbol made && !IsGuardHelper(made, owner)
+                            && !made.Name.StartsWith("Allocate", StringComparison.Ordinal))
+                            callees.Add(made.Name);
+                    continue;
+                // try { ... } finally { scratch.Dispose(); } releases the temporaries of the same composition.
+                case TryStatementSyntax { Catches.Count: 0 } attempt:
+                    if (!CollectComposed(attempt.Block.Statements, model, owner, callees)) return false;
+                    if (attempt.Finally is not null && !CollectComposed(attempt.Finally.Block.Statements, model, owner, callees))
+                        return false;
                     continue;
                 case ExpressionStatementSyntax { Expression: InvocationExpressionSyntax invocation }:
-                    if (model.GetSymbolInfo(invocation).Symbol is not IMethodSymbol target) return false;
-                    if (IsGuardHelper(target, owner)) continue;
-                    bool onThis = invocation.Expression is IdentifierNameSyntax
-                        || invocation.Expression is MemberAccessExpressionSyntax { Expression: ThisExpressionSyntax };
-                    if (!onThis || !SymbolEqualityComparer.Default.Equals(target.ContainingType, owner)
-                        || ImplementedInterfaceMember(owner, target) is null)
-                        return false;
-                    callees.Add(target.Name);
+                    if (!CollectCall(invocation, model, owner, callees)) return false;
+                    continue;
+                // return Member(...); or return scratch; ends the composition with its result.
+                case ReturnStatementSyntax { Expression: null or IdentifierNameSyntax }:
+                    continue;
+                case ReturnStatementSyntax { Expression: InvocationExpressionSyntax returned }:
+                    if (!CollectCall(returned, model, owner, callees)) return false;
                     continue;
                 default:
                     return false;
@@ -319,6 +329,29 @@ public sealed class BackendParityAnalyzer : DiagnosticAnalyzer
         }
         return true;
     }
+
+    /// <summary>
+    /// Records a call on this backend to a member that implements an interface member; a guard helper or the release of a
+    /// temporary (<c>scratch.Dispose()</c>) is neutral. Anything else ends the composition.
+    /// </summary>
+    private static bool CollectCall(InvocationExpressionSyntax invocation, SemanticModel model, INamedTypeSymbol owner,
+        List<string> callees)
+    {
+        if (model.GetSymbolInfo(invocation).Symbol is not IMethodSymbol target) return false;
+        if (IsGuardHelper(target, owner) || IsRelease(invocation, target)) return true;
+        bool onThis = invocation.Expression is IdentifierNameSyntax
+            || invocation.Expression is MemberAccessExpressionSyntax { Expression: ThisExpressionSyntax };
+        if (!onThis || !SymbolEqualityComparer.Default.Equals(target.ContainingType, owner)
+            || ImplementedInterfaceMember(owner, target) is null)
+            return false;
+        callees.Add(target.Name);
+        return true;
+    }
+
+    /// <summary><c>local.Dispose()</c> on a local: freeing a scratch buffer launches nothing.</summary>
+    private static bool IsRelease(InvocationExpressionSyntax invocation, IMethodSymbol target)
+        => target.Name == "Dispose" && target.Parameters.Length == 0
+           && invocation.Expression is MemberAccessExpressionSyntax { Expression: IdentifierNameSyntax };
 
     /// <summary>Every call under <paramref name="node"/> is an own interface member or a guard helper.</summary>
     private static bool OnlyNeutralCalls(SyntaxNode node, SemanticModel model, INamedTypeSymbol owner)
