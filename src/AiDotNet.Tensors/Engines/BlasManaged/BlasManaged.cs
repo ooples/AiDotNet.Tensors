@@ -132,12 +132,13 @@ public static partial class BlasManaged
 
     /// <summary>
     /// Whether a deep-K thin-M GEMM takes the packed GotoBLAS route below. Its machine-code microkernel is 256-bit
-    /// (ymm), measured as the winner on AVX2 hosts; where the 512-bit direct tile runs (packed, k-blocked B strips),
-    /// that tile takes the product instead. AIDOTNET_THINM_GOTO_512=1 keeps the packed route there too.
+    /// (ymm), measured as the winner on AVX2 hosts; where the 512-bit direct tile runs (packed, k-blocked B strips)
+    /// and serves the shape, that tile takes the product instead. AIDOTNET_THINM_GOTO_512=1 keeps the packed route.
     /// </summary>
-    internal static bool ThinMDeepKTakesGoto =>
+    internal static bool ThinMDeepKTakesGoto(int m, int k) =>
 #if NET9_0_OR_GREATER
-        !Simd.SimdGemm.UseVector512Direct || s_thinMGotoOn512;
+        !Simd.SimdGemm.UseVector512Direct || s_thinMGotoOn512 || !Simd.SimdGemm.UseDirectParallel2D
+        || m > Simd.SimdGemm.DirectParallel2DMaxM || k > Simd.SimdGemm.DirectParallel2DMaxK;
 #else
         true;
 #endif
@@ -201,7 +202,7 @@ public static partial class BlasManaged
                     MemoryMarshal.Cast<T, double>(c), m, k, n);
         }
         else if (isFloat && k > ThinMDirectPackedMinK && m >= ThinMDirectPackedMinM && (n & 15) == 0
-            && ThinMDeepKTakesGoto
+            && ThinMDeepKTakesGoto(m, k)
             && (long)m * n * k >= GotoGemmFp32.ParallelMinWork && GotoGemmFp32.IsAvailable)
         {
             // Deep K: the packed GotoBLAS kernel (machine-code microkernel on L2-resident panels) beats the unpacked

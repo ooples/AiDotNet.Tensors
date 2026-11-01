@@ -121,12 +121,15 @@ public sealed class GotoGemmRoutingTests
         {
             AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.s_thinMGotoOn512 = false;
             AiDotNet.Tensors.Engines.Simd.SimdGemm.s_forceVector512Direct = true;
-            Assert.False(AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.ThinMDeepKTakesGoto);
+            Assert.False(AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.ThinMDeepKTakesGoto(128, 784));
             AiDotNet.Tensors.Engines.Simd.SimdGemm.s_forceVector512Direct = false;
-            Assert.True(AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.ThinMDeepKTakesGoto);
+            Assert.True(AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.ThinMDeepKTakesGoto(128, 784));
             AiDotNet.Tensors.Engines.Simd.SimdGemm.s_forceVector512Direct = true;
+            // More rows than the direct tile serves keep the packed route.
+            Assert.True(AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.ThinMDeepKTakesGoto(
+                AiDotNet.Tensors.Engines.Simd.SimdGemm.DirectParallel2DMaxM + 1, 784));
             AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.s_thinMGotoOn512 = true;
-            Assert.True(AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.ThinMDeepKTakesGoto);
+            Assert.True(AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.ThinMDeepKTakesGoto(128, 784));
         }
         finally
         {
