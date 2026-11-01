@@ -30,15 +30,18 @@ public partial class CpuEngine
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
         if (activation == FusedActivationType.None) return TensorAdd(a, b);
-        if (typeof(T) == typeof(float) && activation == FusedActivationType.ReLU && !GraphMode.IsActive
-            && ShapesMatch(a._shape, b._shape) && a.IsContiguous && b.IsContiguous && a.Layout == b.Layout)
+        if (activation == FusedActivationType.ReLU && a is Tensor<float> af && b is Tensor<float> bf
+            && !GraphMode.IsActive && ShapesMatch(a._shape, b._shape) && a.IsContiguous && b.IsContiguous
+            && a.Layout == b.Layout)
         {
-            var result = TensorAllocator.RentUninitialized<float>(a._shape);
-            result.Layout = a.Layout;
-            AddReluFloat((Tensor<float>)(object)a, (Tensor<float>)(object)b, result);
-            var output = (Tensor<T>)(object)result;
-            DifferentiableOps.RecordBinary("TensorAddRelu", output, a, b, BackwardFunctions<T>.AddReluBackward);
-            return output;
+            var output = TensorAllocator.RentUninitialized<T>(a._shape);
+            output.Layout = a.Layout;
+            if (output is Tensor<float> result)
+            {
+                AddReluFloat(af, bf, result);
+                DifferentiableOps.RecordBinary("TensorAddRelu", output, a, b, BackwardFunctions<T>.AddReluBackward);
+                return output;
+            }
         }
         return ApplyActivationRecorded(TensorAdd(a, b), activation);
     }

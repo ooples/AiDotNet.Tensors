@@ -303,10 +303,13 @@ public sealed class BackendParityAnalyzer : DiagnosticAnalyzer
                 case LocalDeclarationStatementSyntax local:
                     if (!OnlyNeutralCalls(local.Declaration, model, owner)) return false;
                     // var result = GemmBiasRelu(...); is a launch of the composition; an allocation is only its scratch.
-                    foreach (var call in local.Declaration.DescendantNodes().OfType<InvocationExpressionSyntax>())
-                        if (model.GetSymbolInfo(call).Symbol is IMethodSymbol made && !IsGuardHelper(made, owner)
-                            && !made.Name.StartsWith("Allocate", StringComparison.Ordinal))
-                            callees.Add(made.Name);
+                    var launched = local.Declaration.DescendantNodes().OfType<InvocationExpressionSyntax>()
+                        .Select(call => model.GetSymbolInfo(call).Symbol)
+                        .OfType<IMethodSymbol>()
+                        .Where(made => !IsGuardHelper(made, owner)
+                            && !made.Name.StartsWith("Allocate", StringComparison.Ordinal));
+                    foreach (var made in launched)
+                        callees.Add(made.Name);
                     continue;
                 // try { ... } finally { scratch.Dispose(); } releases the temporaries of the same composition.
                 case TryStatementSyntax { Catches.Count: 0 } attempt:

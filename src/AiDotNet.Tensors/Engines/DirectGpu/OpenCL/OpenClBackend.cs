@@ -14455,38 +14455,34 @@ KERNEL VARIANTS (A/B testing):
                 && _kernelCache.TryGetValue("sum_axis_rows_split", out var splitKernel))
             {
                 var input = ((DirectOpenClGpuBuffer)i).Buffer;
-                DirectOpenClGpuBuffer? partial = null;
                 int length = sz;
-                try
+                int chunks = 0, chunkLen = 0;
+                if (sz >= SumAxisSplitMinReduce)
                 {
-                    if (sz >= SumAxisSplitMinReduce)
-                    {
-                        int chunks = (int)Math.Max(2, Math.Min(((long)sz + SumAxisSplitChunkMin - 1) / SumAxisSplitChunkMin,
-                            4L * Math.Max(1, ComputeUnits)));
-                        int chunkLen = (int)(((long)sz + chunks - 1) / chunks);
-                        chunks = (int)(((long)sz + chunkLen - 1) / chunkLen);
-                        partial = (DirectOpenClGpuBuffer)AllocateBuffer(chunks);
-                        splitKernel.SetArg(0, input.Handle);
-                        splitKernel.SetArg(1, partial.Buffer.Handle);
-                        splitKernel.SetArg(2, sz);
-                        splitKernel.SetArg(3, chunks);
-                        splitKernel.SetArg(4, chunkLen);
-                        splitKernel.Execute2D(chunks * rowGroup, 1, rowGroup, 1);
-                        System.Threading.Interlocked.Increment(ref _sumAxisSplitLaunches);
-                        input = partial.Buffer;
-                        length = chunks;
-                    }
-                    scaled.SetArg(0, input.Handle);
-                    scaled.SetArg(1, ((DirectOpenClGpuBuffer)o).Buffer.Handle);
-                    scaled.SetArg(2, 1);
-                    scaled.SetArg(3, length);
-                    scaled.SetArg(4, 1f / sz);
-                    scaled.Execute1D(rowGroup, rowGroup);
+                    chunks = (int)Math.Max(2, Math.Min(((long)sz + SumAxisSplitChunkMin - 1) / SumAxisSplitChunkMin,
+                        4L * Math.Max(1, ComputeUnits)));
+                    chunkLen = (int)(((long)sz + chunks - 1) / chunks);
+                    chunks = (int)(((long)sz + chunkLen - 1) / chunkLen);
                 }
-                finally
+                using var partial = chunks > 0 ? (DirectOpenClGpuBuffer)AllocateBuffer(chunks) : null;
+                if (partial is not null)
                 {
-                    partial?.Dispose();
+                    splitKernel.SetArg(0, input.Handle);
+                    splitKernel.SetArg(1, partial.Buffer.Handle);
+                    splitKernel.SetArg(2, sz);
+                    splitKernel.SetArg(3, chunks);
+                    splitKernel.SetArg(4, chunkLen);
+                    splitKernel.Execute2D(chunks * rowGroup, 1, rowGroup, 1);
+                    System.Threading.Interlocked.Increment(ref _sumAxisSplitLaunches);
+                    input = partial.Buffer;
+                    length = chunks;
                 }
+                scaled.SetArg(0, input.Handle);
+                scaled.SetArg(1, ((DirectOpenClGpuBuffer)o).Buffer.Handle);
+                scaled.SetArg(2, 1);
+                scaled.SetArg(3, length);
+                scaled.SetArg(4, 1f / sz);
+                scaled.Execute1D(rowGroup, rowGroup);
                 return;
             }
             SumAxis(i, o, 1, sz);
