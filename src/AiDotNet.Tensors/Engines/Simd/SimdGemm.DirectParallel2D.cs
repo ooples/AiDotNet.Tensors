@@ -103,19 +103,33 @@ internal static partial class SimdGemm
                     {
                         fixed (float* ps = stripBuffer)
                         {
-                            PackStrip32(pB + stripStart, ldbCap, ps, kCap);
+                            // k in blocks of s_stripKc rows: each block's strip (kc x 32) stays in L1 across the row
+                            // blocks, which park their partial sums in C and resume the same FMA chains on the next block.
+                            int kc = s_stripKc > 0 ? Math.Min(s_stripKc, kCap) : kCap;
+                            for (int k0 = 0; k0 < kCap; k0 += kc)
+                            {
+                                int kb = Math.Min(kc, kCap - k0);
+                                PackStrip32(pB + (long)k0 * ldbCap + stripStart, ldbCap, ps, kb);
+                                for (int rbIdx = rb0; rbIdx < rb1; rbIdx++)
+                                {
+                                    int i = rbIdx * Mr;
+                                    if (mCap - i < Mr) continue;
+                                    float* pARow = pA + (long)i * ldaCap + k0;
+                                    float* pCRow = pC + (long)i * nCap + stripStart;
+                                    if (k0 == 0) DirectKernel6x32Store(pARow, ldaCap, ps, Nr512, pCRow, nCap, kb);
+                                    else DirectKernel6x32Resume(pARow, ldaCap, ps, Nr512, pCRow, nCap, kb);
+                                }
+                            }
                             for (int rbIdx = rb0; rbIdx < rb1; rbIdx++)
                             {
                                 int i = rbIdx * Mr;
                                 int mc = Math.Min(Mr, mCap - i);
+                                if (mc == Mr) continue;
                                 float* pARow = pA + (long)i * ldaCap;
                                 float* pCRow = pC + (long)i * nCap;
-                                if (mc == Mr)
-                                    DirectKernel6x32Store(pARow, ldaCap, ps, Nr512, pCRow + stripStart, nCap, kCap);
-                                else
-                                    for (int j = stripStart; j < stripEnd; j += Nr)
-                                        DirectKernelMxNMaskedStore(pARow, ldaCap, pB + j, ldbCap, pCRow + j, nCap,
-                                            kCap, mcActual: mc, ncActual: Nr);
+                                for (int j = stripStart; j < stripEnd; j += Nr)
+                                    DirectKernelMxNMaskedStore(pARow, ldaCap, pB + j, ldbCap, pCRow + j, nCap,
+                                        kCap, mcActual: mc, ncActual: Nr);
                             }
                         }
                         continue;

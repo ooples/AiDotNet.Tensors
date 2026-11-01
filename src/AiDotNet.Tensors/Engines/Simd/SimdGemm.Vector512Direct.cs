@@ -83,6 +83,71 @@ internal static partial class SimdGemm
         c50.Store(pC); c51.Store(pC + 16);
     }
 
+    /// <summary>
+    /// <see cref="DirectKernel6x32Store"/> resuming each element's FMA chain from the value C holds: the accumulators
+    /// start at C instead of zero, so splitting k into blocks (each block's partial sums parked in C) runs exactly the
+    /// chain the unsplit kernel runs, bit for bit.
+    /// </summary>
+    [MethodImpl(HotInline)]
+    internal static unsafe void DirectKernel6x32Resume(float* pA, int lda, float* pB, int ldb, float* pC, int ldc, int k)
+    {
+        float* r0 = pC, r1 = pC + ldc, r2 = pC + 2 * ldc, r3 = pC + 3 * ldc, r4 = pC + 4 * ldc, r5 = pC + 5 * ldc;
+        var c00 = Vector512.Load(r0); var c01 = Vector512.Load(r0 + 16);
+        var c10 = Vector512.Load(r1); var c11 = Vector512.Load(r1 + 16);
+        var c20 = Vector512.Load(r2); var c21 = Vector512.Load(r2 + 16);
+        var c30 = Vector512.Load(r3); var c31 = Vector512.Load(r3 + 16);
+        var c40 = Vector512.Load(r4); var c41 = Vector512.Load(r4 + 16);
+        var c50 = Vector512.Load(r5); var c51 = Vector512.Load(r5 + 16);
+
+        float* pA0 = pA;
+        float* pA1 = pA + lda;
+        float* pA2 = pA + lda * 2;
+        float* pA3 = pA + lda * 3;
+        float* pA4 = pA + lda * 4;
+        float* pA5 = pA + lda * 5;
+
+        for (int p = 0; p < k; p++)
+        {
+            var b0 = Vector512.Load(pB);
+            var b1 = Vector512.Load(pB + 16);
+
+            var a0 = Vector512.Create(pA0[p]);
+            c00 = Vector512.FusedMultiplyAdd(a0, b0, c00); c01 = Vector512.FusedMultiplyAdd(a0, b1, c01);
+
+            var a1 = Vector512.Create(pA1[p]);
+            c10 = Vector512.FusedMultiplyAdd(a1, b0, c10); c11 = Vector512.FusedMultiplyAdd(a1, b1, c11);
+
+            var a2 = Vector512.Create(pA2[p]);
+            c20 = Vector512.FusedMultiplyAdd(a2, b0, c20); c21 = Vector512.FusedMultiplyAdd(a2, b1, c21);
+
+            var a3 = Vector512.Create(pA3[p]);
+            c30 = Vector512.FusedMultiplyAdd(a3, b0, c30); c31 = Vector512.FusedMultiplyAdd(a3, b1, c31);
+
+            var a4 = Vector512.Create(pA4[p]);
+            c40 = Vector512.FusedMultiplyAdd(a4, b0, c40); c41 = Vector512.FusedMultiplyAdd(a4, b1, c41);
+
+            var a5 = Vector512.Create(pA5[p]);
+            c50 = Vector512.FusedMultiplyAdd(a5, b0, c50); c51 = Vector512.FusedMultiplyAdd(a5, b1, c51);
+
+            pB += ldb;
+        }
+
+        c00.Store(r0); c01.Store(r0 + 16);
+        c10.Store(r1); c11.Store(r1 + 16);
+        c20.Store(r2); c21.Store(r2 + 16);
+        c30.Store(r3); c31.Store(r3 + 16);
+        c40.Store(r4); c41.Store(r4 + 16);
+        c50.Store(r5); c51.Store(r5 + 16);
+    }
+
+    /// <summary>
+    /// Rows of k per block when the 512-bit direct tile reads a packed strip: 256 x 32 floats (32 KB) stays in L1 across
+    /// the chunk's row blocks, where the whole strip (784 x 32 at a dense layer's input) streamed from L2 for every row
+    /// block, and the A panel's lines with it. AIDOTNET_GEMM_KC overrides (0 = no blocking).
+    /// </summary>
+    internal static readonly int s_stripKc =
+        int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_KC"), out int kc) && kc >= 0 ? kc : 256;
+
     /// <summary>The 512-bit <see cref="TransAKernel6x16"/>: six rows x 32 columns of C = At*B, overwriting C; pA points at
     /// row i0 of At (A + i0), lda = m; C's rows are <paramref name="ldc"/> apart (B may be a packed strip, ldb = 32).</summary>
     [MethodImpl(HotInline)]
