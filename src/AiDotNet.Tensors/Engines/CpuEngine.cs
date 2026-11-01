@@ -10867,6 +10867,23 @@ public partial class CpuEngine : ITensorLevelEngine
                 return;
             }
         }
+        // One to three output channels at stride 1 (the input gradient of an RGB or grey first layer, as a forward
+        // convolution): the direct small-output kernel instead of an M = 1..3 GEMM per image.
+        if (!routePinned && input.Layout == LinearAlgebra.TensorLayout.Nchw
+            && Simd.SmallOutConv.Applies(inChannels, outChannels, kernelHeight, kernelWidth, strideH, strideW,
+                dilationH, dilationW, padH, padW))
+        {
+            int inOffS = 0, kOffS = 0, outOffS = 0;
+            float[]? inArrS = inputData ?? (input.IsContiguous ? input.GetCpuBackingForStridedRead(out inOffS) : null);
+            float[]? kArrS = kernelData ?? (kernel.IsContiguous ? kernel.GetCpuBackingForStridedRead(out kOffS) : null);
+            float[]? outArrS = outputData ?? output.GetCpuBackingForContiguousWrite(out outOffS);
+            if (inArrS is not null && kArrS is not null && outArrS is not null)
+            {
+                Simd.SmallOutConv.Forward(inArrS, inOffS, kArrS, kOffS, outArrS, outOffS, batch, inChannels, height, width,
+                    outChannels, kernelHeight, kernelWidth, padH, padW);
+                return;
+            }
+        }
 #endif
         if (!routePinned && input.Layout == LinearAlgebra.TensorLayout.Nchw
             && UseBatchedConvForward(batch, inChannels, kernelHeight, kernelWidth, strideH, strideW, outputHeight, outputWidth, outChannels))
