@@ -600,10 +600,15 @@ internal static partial class DirectConvAvx2
             {
                 float* d = pd + (long)task * positions * Block;
                 float* s = ps + sourceOffset + (long)task * Block * positions;
+                // Eight positions x eight channels per register transpose (the scalar scatter was 5-10% of the AVX-512
+                // weight gradient at 32 -> 64 channels).
+                int q0 = 0;
+                for (; q0 + Block <= positions; q0 += Block)
+                    Transpose8(s + q0, positions, d + q0 * Block, Block, accumulate: false);
                 for (int lane = 0; lane < Block; lane++)
                 {
                     float* sl = s + lane * positions;
-                    for (int q = 0; q < positions; q++) d[q * Block + lane] = sl[q];
+                    for (int q = q0; q < positions; q++) d[q * Block + lane] = sl[q];
                 }
             }
         }, deterministicSafe: true);
