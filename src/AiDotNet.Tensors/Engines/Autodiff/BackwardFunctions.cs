@@ -3075,6 +3075,15 @@ internal static class BackwardFunctions<T>
             var length = (int[])gradShape.Clone();
             start[axis] = offset;
             length[axis] = size;
+            // In a resident step a first contribution is gathered straight into the input's gradient accumulator.
+            if (engine is DirectGpuTensorEngine gpu && !DifferentiableOps.IsRecording<T>() && !Compilation.GraphMode.IsActive
+                && DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[i], engine, out bool add) is { } into && !add
+                && gpu.TryRectSliceInto(gradOutput, start, length, into))
+            {
+                DifferentiableOps.CommitDirectGradWrite(grads, inputs[i], into);
+                offset += size;
+                continue;
+            }
             var sliced = engine.TensorSlice(gradOutput, start, length);
             DifferentiableOps.AccumulateGrad(grads, inputs[i], sliced, engine);
             offset += size;

@@ -21453,6 +21453,44 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
+    /// A rectangular slice of <paramref name="source"/> gathered straight into a gradient accumulator receiving its first
+    /// contribution of a resident step (the kernel overwrites every element): a concatenation's backward. Through
+    /// TensorSlice every piece was a fresh device tensor, released only when its finalizer ran, so DenseNet-121's
+    /// concatenation backwards held 1.9 GB of them at once. False -- nothing launched -- when the target does not qualify.
+    /// </summary>
+    internal bool TryRectSliceInto<T>(Tensor<T> source, int[] start, int[] length, Tensor<T> into)
+    {
+        if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled || !ResidentStepActive) return false;
+        if (!source.IsContiguous || source.Rank == 0 || source.Rank > RectSliceLimits.MaxRank
+            || start.Length != source.Rank || length.Length != source.Rank) return false;
+        if (!TryGetBackend(out var backend) || backend is not IRectSliceKernels rect) return false;
+        long n = 1;
+        for (int d = 0; d < source.Rank; d++)
+        {
+            if (start[d] < 0 || length[d] < 1 || start[d] + length[d] > source._shape[d]) return false;
+            n *= length[d];
+        }
+        if (n != into.Length) return false;
+        var sR = ResolveResidentBufferNoUpload(backend, source, source.Length);
+        if (sR is null) return false;
+        var target = ResolveDirectGradTarget(backend, into, (int)n, sR, sR, null);
+        if (target is null) return false;
+        try
+        {
+            rect.RectSlice(sR, target, source._shape, start, length, scatter: false);
+        }
+        catch (NotSupportedException ex)
+        {
+            GpuLaunchProbe.OnFallback("TryRectSliceInto", ex);
+            return false;
+        }
+        ResidentSyncCheck("RectSliceInto");
+        into.IncrementVersion();
+        BindResidentBuffer(into, target, backend);
+        return true;
+    }
+
+    /// <summary>
     /// The device buffer a resident-step kernel may write a gradient straight into: <paramref name="target"/>'s own
     /// bound buffer (never a persistent weight-cache copy, see <see cref="TryRunBinaryInPlace"/>), whole and dense, and
     /// distinct from every buffer the kernel reads. Null when there is no target or it does not qualify.
