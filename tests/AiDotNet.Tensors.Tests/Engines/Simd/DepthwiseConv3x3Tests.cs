@@ -31,6 +31,8 @@ public class DepthwiseConv3x3Tests
         { 2, 3, 17, 1 },
         { 2, 3, 17, 2 },
         { 1, 2, 34, 2 },
+        { 1, 2, 47, 2 },
+        { 2, 3, 64, 2 },
         { 4, 8, 14, 1 },
         { 2, 3, 13, 2 },
         // Multiples of eight channels: the channel-blocked kernels where the host has AVX2.
