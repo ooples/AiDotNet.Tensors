@@ -1697,6 +1697,392 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_compute_gate_gradients
     // Gradient to previous cell state
     dPrevC[gid] = dC * f;
 }
+
+// ===========================================================================
+// FUSED GRU SEQUENCE (#1568 / #1573): the CUDA form of the LSTM recurrence design above
+// ===========================================================================
+// PyTorch nn.GRU semantics, as CpuEngine.GruSequence and the portable gru_p_ kernels define them: gate rows (r, z, n),
+//   r = sigmoid(xr + bir + Whr h + bhr), z = sigmoid(xz + biz + Whz h + bhz), n = tanh(xn + bin + r * (Whn h + bhn)),
+//   h' = (1 - z) n + z h.
+// The input projection xProj = X Wih^T ([batch*T, 3H], row b*T + t) is one GEMM over the whole sequence; these kernels
+// run only the sequential part, one batch row per block and 3H threads, each thread holding a row (forward) or a column
+// block (backward) of Whh in registers, as lstm_*_recurrence_reg. The forward caches keep the portable layout (allH
+// [(T + 1), B, H] with h0 at 0, gates [T, B, 3H], ghn [T, B, H] = Whn h + bhn), so either backward reads them. The
+// backward writes dgi / dgh and hPrev batch-major (row b*T + t), the layout the dense products then take as plain GEMMs:
+//   dX = dgi Wih, dWih = dgi^T X, dWhh = dgh^T hPrev, biases = column sums of dgi and dgh.
+// Accurate expf / tanhf (this module is compiled without --use_fast_math): BPTT compounds approximation error.
+__device__ __forceinline__ float gru_sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
+
+template <int HP>
+__device__ __forceinline__ void gru_forward_recurrence_reg_body(
+    const float* __restrict__ xProj,   // [batch*T, 3H], row b*T + t, without bias
+    const float* __restrict__ h_init,  // [batch, H]
+    const float* __restrict__ Wh,      // [3H, H]
+    const float* __restrict__ biasIh, const float* __restrict__ biasHh,
+    float* __restrict__ output, float* __restrict__ allH, float* __restrict__ gates, float* __restrict__ ghn,
+    int batch, int timeSteps, int H,
+    float* __restrict__ hFinal)        // [batch, H], h_T; may be null
+{
+    __shared__ __align__(16) float hs[HP];
+    __shared__ float pi[3 * HP];
+    __shared__ float ph[3 * HP];
+    const int G = 3 * H;
+    const int k = threadIdx.x;   // blockDim.x == G
+    const int b = blockIdx.x;
+
+    // Row k of Wh, staged through shared memory 32 columns at a time (coalesced loads), as the LSTM reg kernel does.
+    constexpr int CW = 32;
+    __shared__ float stage[3 * HP][CW + 1];
+    float w[HP];
+#pragma unroll
+    for (int c0 = 0; c0 < HP; c0 += CW) {
+        float tmp[CW];
+#pragma unroll
+        for (int n = 0; n < CW; n++) {
+            int i = n * G + k, row = i / CW, col = i % CW;
+            tmp[n] = c0 + col < H ? Wh[row * H + c0 + col] : 0.0f;
+        }
+#pragma unroll
+        for (int n = 0; n < CW; n++) {
+            int i = n * G + k;
+            stage[i / CW][i % CW] = tmp[n];
+        }
+        __syncthreads();
+#pragma unroll
+        for (int col = 0; col < CW; col++) w[c0 + col] = stage[k][col];
+        __syncthreads();
+    }
+    const float bi = biasIh[k], bh = biasHh[k];
+
+    for (int i = k; i < HP; i += blockDim.x) hs[i] = 0.0f;
+    __syncthreads();
+    if (k < H) {
+        float h0 = h_init[b * H + k];
+        hs[k] = h0;
+        allH[b * H + k] = h0;
+    }
+    float xp = xProj[(b * timeSteps) * G + k];
+    __syncthreads();
+
+    for (int t = 0; t < timeSteps; t++) {
+        float a0 = bh, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        float xi = xp + bi;
+        if (t + 1 < timeSteps) xp = xProj[(b * timeSteps + t + 1) * G + k];
+#pragma unroll
+        for (int m = 0; m < HP; m += 16) {
+            float4 h0 = *reinterpret_cast<const float4*>(&hs[m]);
+            float4 h1 = *reinterpret_cast<const float4*>(&hs[m + 4]);
+            float4 h2 = *reinterpret_cast<const float4*>(&hs[m + 8]);
+            float4 h3 = *reinterpret_cast<const float4*>(&hs[m + 12]);
+            a0 = fmaf(w[m], h0.x, a0); a0 = fmaf(w[m + 1], h0.y, a0); a0 = fmaf(w[m + 2], h0.z, a0); a0 = fmaf(w[m + 3], h0.w, a0);
+            a1 = fmaf(w[m + 4], h1.x, a1); a1 = fmaf(w[m + 5], h1.y, a1); a1 = fmaf(w[m + 6], h1.z, a1); a1 = fmaf(w[m + 7], h1.w, a1);
+            a2 = fmaf(w[m + 8], h2.x, a2); a2 = fmaf(w[m + 9], h2.y, a2); a2 = fmaf(w[m + 10], h2.z, a2); a2 = fmaf(w[m + 11], h2.w, a2);
+            a3 = fmaf(w[m + 12], h3.x, a3); a3 = fmaf(w[m + 13], h3.y, a3); a3 = fmaf(w[m + 14], h3.z, a3); a3 = fmaf(w[m + 15], h3.w, a3);
+        }
+        ph[k] = (a0 + a1) + (a2 + a3);
+        pi[k] = xi;
+        __syncthreads();   // every sum is staged, and every thread has read hs for this step
+
+        if (k < H) {
+            float r = gru_sigmoid(pi[k] + ph[k]);
+            float z = gru_sigmoid(pi[H + k] + ph[H + k]);
+            float hn = ph[2 * H + k];
+            float n = tanhf(pi[2 * H + k] + r * hn);
+            float hv = (1.0f - z) * n + z * hs[k];
+            hs[k] = hv;
+            int gb = (t * batch + b) * G;
+            gates[gb + k] = r; gates[gb + H + k] = z; gates[gb + 2 * H + k] = n;
+            ghn[(t * batch + b) * H + k] = hn;
+            allH[((t + 1) * batch + b) * H + k] = hv;
+            output[(b * timeSteps + t) * H + k] = hv;
+            if (hFinal != nullptr && t == timeSteps - 1) hFinal[b * H + k] = hv;
+        }
+        __syncthreads();   // the next step reads the new hs, and pi / ph are rewritten
+    }
+}
+
+// LAST: only the final hidden state carries a gradient (a model that reads h_T alone), so gradOutput is [batch, H] and
+// is read once, at t = T - 1, instead of a [batch, T, H] gradient that is zero elsewhere.
+template <int HP, bool LAST>
+__device__ __forceinline__ void gru_backward_recurrence_reg_body(
+    const float* __restrict__ gradOutput,  // [batch, T, H] ([batch, H] when LAST)
+    const float* __restrict__ allH, const float* __restrict__ gates, const float* __restrict__ ghn,
+    const float* __restrict__ Wh,          // [3H, H]
+    float* __restrict__ dgi, float* __restrict__ dgh,   // [batch*T, 3H], row b*T + t
+    float* __restrict__ hPrev,             // [batch*T, H], row b*T + t: h_{t-1}
+    float* __restrict__ dH_init,           // [batch, H]
+    int batch, int timeSteps, int H)
+{
+    __shared__ __align__(16) float dg[3][HP];   // this step's recurrent-sum gradients; padding stays zero
+    __shared__ float part[3][HP];
+    const int G = 3 * H;
+    const int tid = threadIdx.x;   // blockDim.x == G
+    const int q = tid / H, j = tid - q * H;
+
+    // Thread (q, j) owns column j of gate block q of Wh and forms that block's share of dh_prev[j].
+    float w[HP];
+#pragma unroll
+    for (int m = 0; m < HP; m++) w[m] = m < H ? Wh[(q * H + m) * H + j] : 0.0f;
+    for (int i = tid; i < 3 * HP; i += blockDim.x) (&dg[0][0])[i] = 0.0f;
+
+    const int b = blockIdx.x;
+    const bool cell = tid < H;
+    const int cj = tid;
+    float dHnext = 0.0f, direct = 0.0f;
+    // Step t's cell inputs, loaded during step t + 1 (off the serial chain).
+    float go = 0.0f, r = 0.0f, z = 0.0f, n = 0.0f, hn = 0.0f, hp = 0.0f;
+    if (cell) {
+        int t0 = timeSteps - 1, gb = (t0 * batch + b) * G, sb = (t0 * batch + b) * H;
+        go = LAST ? gradOutput[b * H + cj] : gradOutput[(b * timeSteps + t0) * H + cj];
+        r = gates[gb + cj]; z = gates[gb + H + cj]; n = gates[gb + 2 * H + cj];
+        hn = ghn[sb + cj]; hp = allH[sb + cj];
+    }
+    __syncthreads();
+
+    for (int t = timeSteps - 1; t >= 0; t--) {
+        if (cell) {
+            float dhv = go + dHnext;
+            float dnp = dhv * (1.0f - z) * (1.0f - n * n);
+            float drp = dnp * hn * r * (1.0f - r);
+            float dzp = dhv * (hp - n) * z * (1.0f - z);
+            float dnr = dnp * r;
+            int row = (b * timeSteps + t) * G;
+            dgi[row + cj] = drp; dgi[row + H + cj] = dzp; dgi[row + 2 * H + cj] = dnp;
+            dgh[row + cj] = drp; dgh[row + H + cj] = dzp; dgh[row + 2 * H + cj] = dnr;
+            hPrev[(b * timeSteps + t) * H + cj] = hp;
+            dg[0][cj] = drp; dg[1][cj] = dzp; dg[2][cj] = dnr;
+            direct = dhv * z;
+            if (t > 0) {
+                int tn = t - 1, gb = (tn * batch + b) * G, sb = (tn * batch + b) * H;
+                go = LAST ? 0.0f : gradOutput[(b * timeSteps + tn) * H + cj];
+                r = gates[gb + cj]; z = gates[gb + H + cj]; n = gates[gb + 2 * H + cj];
+                hn = ghn[sb + cj]; hp = allH[sb + cj];
+            }
+        }
+        __syncthreads();   // dg holds this step's gradients
+
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+#pragma unroll
+        for (int m = 0; m < HP; m += 16) {
+            float4 d0 = *reinterpret_cast<const float4*>(&dg[q][m]);
+            float4 d1 = *reinterpret_cast<const float4*>(&dg[q][m + 4]);
+            float4 d2 = *reinterpret_cast<const float4*>(&dg[q][m + 8]);
+            float4 d3 = *reinterpret_cast<const float4*>(&dg[q][m + 12]);
+            a0 = fmaf(w[m], d0.x, a0); a0 = fmaf(w[m + 1], d0.y, a0); a0 = fmaf(w[m + 2], d0.z, a0); a0 = fmaf(w[m + 3], d0.w, a0);
+            a1 = fmaf(w[m + 4], d1.x, a1); a1 = fmaf(w[m + 5], d1.y, a1); a1 = fmaf(w[m + 6], d1.z, a1); a1 = fmaf(w[m + 7], d1.w, a1);
+            a2 = fmaf(w[m + 8], d2.x, a2); a2 = fmaf(w[m + 9], d2.y, a2); a2 = fmaf(w[m + 10], d2.z, a2); a2 = fmaf(w[m + 11], d2.w, a2);
+            a3 = fmaf(w[m + 12], d3.x, a3); a3 = fmaf(w[m + 13], d3.y, a3); a3 = fmaf(w[m + 14], d3.z, a3); a3 = fmaf(w[m + 15], d3.w, a3);
+        }
+        part[q][j] = (a0 + a1) + (a2 + a3);
+        __syncthreads();   // every share is in part, and every thread has read dg
+
+        if (cell) dHnext = direct + part[0][cj] + part[1][cj] + part[2][cj];
+    }
+    if (cell) dH_init[b * H + cj] = dHnext;
+}
+
+#define GRU_REG_KERNELS(HP) \
+extern ""C"" __global__ __launch_bounds__(3 * HP) void gru_forward_recurrence_reg_h##HP( \
+    const float* xProj, const float* h_init, const float* Wh, const float* biasIh, const float* biasHh, \
+    float* output, float* allH, float* gates, float* ghn, int batch, int timeSteps, int hiddenSize, float* hFinal) \
+{ \
+    gru_forward_recurrence_reg_body<HP>(xProj, h_init, Wh, biasIh, biasHh, output, allH, gates, ghn, \
+        batch, timeSteps, hiddenSize, hFinal); \
+} \
+extern ""C"" __global__ __launch_bounds__(3 * HP) void gru_backward_recurrence_reg_h##HP( \
+    const float* gradOutput, const float* allH, const float* gates, const float* ghn, const float* Wh, \
+    float* dgi, float* dgh, float* hPrev, float* dH_init, int batch, int timeSteps, int hiddenSize) \
+{ \
+    gru_backward_recurrence_reg_body<HP, false>(gradOutput, allH, gates, ghn, Wh, dgi, dgh, hPrev, dH_init, \
+        batch, timeSteps, hiddenSize); \
+} \
+extern ""C"" __global__ __launch_bounds__(3 * HP) void gru_backward_last_recurrence_reg_h##HP( \
+    const float* gradLast, const float* allH, const float* gates, const float* ghn, const float* Wh, \
+    float* dgi, float* dgh, float* hPrev, float* dH_init, int batch, int timeSteps, int hiddenSize) \
+{ \
+    gru_backward_recurrence_reg_body<HP, true>(gradLast, allH, gates, ghn, Wh, dgi, dgh, hPrev, dH_init, \
+        batch, timeSteps, hiddenSize); \
+}
+GRU_REG_KERNELS(32)
+GRU_REG_KERNELS(64)
+
+// Every dense product of the GRU backward over all R = batch*T rows, in one launch, after gru_backward_recurrence has
+// written dgi, dgh and hPrev (lstm_backward_gemms' tiling and split scheme, with two left operands):
+//   dWih = dgi^T X ([G, In], G = 3H),  dWhh = dgh^T hPrev ([G, H]),  dBiasIh / dBiasHh = column sums of dgi / dgh,
+//   dX   = dgi Wih ([R, In]).
+// The weight-gradient column tiles are split by side, X's (wTilesX tiles, left operand dgi) then hPrev's (left operand
+// dgh), so a block's left operand is uniform; each side's first column tile also sums its left operand's rows (that
+// side's bias). Fixed-order sums throughout (deterministic); every output is written, not accumulated into.
+#define GBG_KC 64
+#define GBG_LD 36
+#define GBG_GROUPS 8
+#define GBG_THREADS (64 * GBG_GROUPS)
+extern ""C"" __global__ __launch_bounds__(GBG_THREADS) void gru_backward_gemms(
+    const float* __restrict__ dgi,      // [R, G]
+    const float* __restrict__ dgh,      // [R, G]
+    const float* __restrict__ X,        // [R, In]
+    const float* __restrict__ Hprev,    // [R, H]
+    const float* __restrict__ Wi,       // [G, In]
+    float* __restrict__ dWi,            // [G, In]
+    float* __restrict__ dWh,            // [G, H]
+    float* __restrict__ dBiasIh,        // [G]
+    float* __restrict__ dBiasHh,        // [G]
+    float* __restrict__ dX,             // [R, In]
+    int R, int In, int H, int wTilesX, int wTilesJ, int nW,
+    int splits, int rowsPerSplit,
+    float* __restrict__ partial,        // [splits][nW][32 * 32], then [splits][2][G / 32][32] bias slots (splits > 1)
+    unsigned int* __restrict__ counters) // [nW], zero between launches (splits > 1)
+{
+    __shared__ int isLastSplit;
+    __shared__ float biasPart[GBG_GROUPS][32];
+    __shared__ __align__(16) float smem[GBG_GROUPS * 32 * 32 > 2 * GBG_KC * GBG_LD ? GBG_GROUPS * 32 * 32 : 2 * GBG_KC * GBG_LD];
+    float (*sA)[GBG_LD] = reinterpret_cast<float (*)[GBG_LD]>(smem);
+    float (*sB)[GBG_LD] = reinterpret_cast<float (*)[GBG_LD]>(smem + GBG_KC * GBG_LD);
+    const int G = 3 * H;
+    const int tid = threadIdx.x;
+    const int grp = tid >> 6, lane = tid & 63, lr = (lane >> 3) * 4, lc = (lane & 7) * 4;
+    const bool weights = (int)blockIdx.x < nW * splits;
+    int row0, col0, kBegin, kEnd, tile = 0, split = 0;
+    bool hSide = false;
+    if (weights) {
+        tile = (int)blockIdx.x % nW;
+        split = (int)blockIdx.x / nW;
+        row0 = (tile / wTilesJ) * 32;              // gate row g
+        int ct = tile % wTilesJ;
+        hSide = ct >= wTilesX;
+        col0 = (hSide ? ct - wTilesX : ct) * 32;   // column of X, or of hPrev
+        kBegin = split * rowsPerSplit;
+        kEnd = min(R, kBegin + rowsPerSplit);
+    } else {
+        int b = (int)blockIdx.x - nW * splits, tilesI = (In + 31) / 32;
+        row0 = (b / tilesI) * 32;                  // row r of dX
+        col0 = (b % tilesI) * 32;                  // input feature i
+        kBegin = 0;
+        kEnd = G;
+    }
+    const float* __restrict__ left = hSide ? dgh : dgi;
+    const float* __restrict__ right = hSide ? Hprev : X;
+    const int rightCols = hSide ? H : In;
+
+    float acc[4][4];
+#pragma unroll
+    for (int i = 0; i < 4; i++)
+#pragma unroll
+        for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
+    const bool biasTile = weights && col0 == 0;
+    const bool biasLane = biasTile && lc == 0;
+    float bacc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+    constexpr int PER = GBG_KC * 32 / GBG_THREADS;
+    float la[PER], lb[PER];
+    auto load = [&](int k0) {
+#pragma unroll
+        for (int u = 0; u < PER; u++) {
+            int i = tid + u * GBG_THREADS;
+            if (weights) {
+                int a = i >> 5, c = i & 31, r = k0 + a, g = row0 + c, j = col0 + c;
+                la[u] = r < kEnd && g < G ? left[(size_t)r * G + g] : 0.0f;
+                lb[u] = r < kEnd && j < rightCols ? right[(size_t)r * rightCols + j] : 0.0f;
+            } else {
+                int rr = i >> 6, kk = i & 63, r = row0 + rr, k = k0 + kk;
+                la[u] = r < R && k < G ? dgi[(size_t)r * G + k] : 0.0f;
+                int kb = k0 + (i >> 5), ii = col0 + (i & 31);
+                lb[u] = kb < G && ii < In ? Wi[(size_t)kb * In + ii] : 0.0f;
+            }
+        }
+    };
+    load(kBegin);
+    for (int k0 = kBegin; k0 < kEnd; k0 += GBG_KC) {
+#pragma unroll
+        for (int u = 0; u < PER; u++) {
+            int i = tid + u * GBG_THREADS;
+            if (weights) sA[i >> 5][i & 31] = la[u];
+            else sA[i & 63][i >> 6] = la[u];
+            sB[i >> 5][i & 31] = lb[u];
+        }
+        __syncthreads();
+        if (k0 + GBG_KC < kEnd) load(k0 + GBG_KC);
+#pragma unroll
+        for (int q = 0; q < GBG_KC / GBG_GROUPS; q++) {
+            int kk = grp * (GBG_KC / GBG_GROUPS) + q;
+            float4 a = *reinterpret_cast<const float4*>(&sA[kk][lr]);
+            float4 b = *reinterpret_cast<const float4*>(&sB[kk][lc]);
+            float av[4] = { a.x, a.y, a.z, a.w }, bv[4] = { b.x, b.y, b.z, b.w };
+#pragma unroll
+            for (int i = 0; i < 4; i++)
+#pragma unroll
+                for (int j = 0; j < 4; j++) acc[i][j] = fmaf(av[i], bv[j], acc[i][j]);
+            if (biasLane) {
+#pragma unroll
+                for (int i = 0; i < 4; i++) bacc[i] += av[i];
+            }
+        }
+        __syncthreads();
+    }
+
+    float* part = smem;
+#pragma unroll
+    for (int i = 0; i < 4; i++)
+#pragma unroll
+        for (int j = 0; j < 4; j++) part[(grp * 32 + lr + i) * 32 + lc + j] = acc[i][j];
+    if (biasLane) {
+#pragma unroll
+        for (int i = 0; i < 4; i++) biasPart[grp][lr + i] = bacc[i];
+    }
+    __syncthreads();
+    const int rowTiles = (G + 31) / 32, rowTile = row0 >> 5, side = hSide ? 1 : 0;
+    float* biasSlots = partial + (size_t)splits * nW * 1024;   // [splits][2][rowTiles][32]
+    float* __restrict__ dBias = hSide ? dBiasHh : dBiasIh;
+    float* __restrict__ dW = hSide ? dWh : dWi;
+    if (biasTile && tid < 32) {
+        float b = 0.0f;
+#pragma unroll
+        for (int g = 0; g < GBG_GROUPS; g++) b += biasPart[g][tid];
+        int row = row0 + tid;
+        if (splits > 1) biasSlots[(((size_t)split * 2 + side) * rowTiles + rowTile) * 32 + tid] = b;
+        else if (row < G) dBias[row] = b;
+    }
+#pragma unroll
+    for (int u = 0; u < 1024 / GBG_THREADS; u++) {
+        int e = tid + u * GBG_THREADS, rowL = e >> 5, colL = e & 31;
+        float v = 0.0f;
+#pragma unroll
+        for (int g = 0; g < GBG_GROUPS; g++) v += part[(g * 32 + rowL) * 32 + colL];
+        int row = row0 + rowL, col = col0 + colL;
+        if (weights && splits > 1) {
+            partial[((size_t)split * nW + tile) * 1024 + e] = v;
+        } else if (weights) {
+            if (row < G && col < rightCols) dW[(size_t)row * rightCols + col] = v;
+        } else if (row < R && col < In) {
+            dX[(size_t)row * In + col] = v;
+        }
+    }
+    if (!(weights && splits > 1)) return;
+    // The last of the tile's split blocks to arrive sums every slot in split order and writes the tile.
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) isLastSplit = atomicAdd(&counters[tile], 1u) == (unsigned int)(splits - 1);
+    __syncthreads();
+    if (!isLastSplit) return;
+    __threadfence();
+#pragma unroll
+    for (int u = 0; u < 1024 / GBG_THREADS; u++) {
+        int e = tid + u * GBG_THREADS, row = row0 + (e >> 5), col = col0 + (e & 31);
+        float v = 0.0f;
+        for (int s = 0; s < splits; s++) v += __ldcg(partial + ((size_t)s * nW + tile) * 1024 + e);
+        if (row < G && col < rightCols) dW[(size_t)row * rightCols + col] = v;
+    }
+    if (biasTile && tid < 32 && row0 + tid < G) {
+        float b = 0.0f;
+        for (int s = 0; s < splits; s++) b += __ldcg(biasSlots + (((size_t)s * 2 + side) * rowTiles + rowTile) * 32 + tid);
+        dBias[row0 + tid] = b;
+    }
+    if (tid == 0) counters[tile] = 0u;
+}
+#undef GBG_KC
+#undef GBG_LD
+#undef GBG_GROUPS
+#undef GBG_THREADS
 ";
     }
 
@@ -1730,7 +2116,14 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_compute_gate_gradients
             "lstm_backward_recurrence_reg_h64_b1",
             "lstm_accumulate_weight_gradients",
             "lstm_accumulate_weight_gradients_deterministic",
-            "lstm_compute_gate_gradients"
+            "lstm_compute_gate_gradients",
+            "gru_forward_recurrence_reg_h32",
+            "gru_backward_recurrence_reg_h32",
+            "gru_forward_recurrence_reg_h64",
+            "gru_backward_recurrence_reg_h64",
+            "gru_backward_last_recurrence_reg_h32",
+            "gru_backward_last_recurrence_reg_h64",
+            "gru_backward_gemms"
         };
     }
 }

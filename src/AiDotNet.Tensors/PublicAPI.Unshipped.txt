@@ -40,3 +40,5 @@ virtual AiDotNet.Tensors.Engines.CpuEngine.TensorAddActivation<T>(AiDotNet.Tenso
 static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanGlslKernels.AddActivation.get -> string!
 AiDotNet.Tensors.Engines.TensorAddActivationEngineExtensions
 static AiDotNet.Tensors.Engines.TensorAddActivationEngineExtensions.TensorAddActivation<T>(this AiDotNet.Tensors.Engines.IEngine! engine, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! a, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! b, AiDotNet.Tensors.Engines.FusedActivationType activation) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+static AiDotNet.Tensors.Engines.AiDotNetEngine.ReleaseGpu() -> bool
+static AiDotNet.Tensors.Engines.AiDotNetEngine.ReleaseGpu(System.TimeSpan drainTimeout) -> bool

@@ -71,8 +71,8 @@ public sealed class Conv3x3KernelGradDirectTests
 
     /// <summary>
     /// The kernel's documented order, emulated in scalar code: for each (oc, ic) and tap, eight lane accumulators
-    /// each take one fused multiply-add per image, row and 8-wide chunk (lanes past the row multiply a zero gradient),
-    /// then the lanes are summed 0..7. The task split groups (oc, ic) pairs into blocks whose shape depends on the
+    /// each take one fused multiply-add per image, pair of output rows, 8-wide chunk and row of the pair (an odd last
+    /// row alone; lanes past the row multiply a zero gradient), then the lanes are summed 0..7. The task split groups (oc, ic) pairs into blocks whose shape depends on the
     /// thread count; whatever the blocks, every dK element must come out bit-identical to this.
     /// </summary>
     [SkippableTheory]
@@ -95,8 +95,9 @@ public sealed class Conv3x3KernelGradDirectTests
         {
             var lanes = new float[8];
             for (int b = 0; b < batch; b++)
-            for (int r = 0; r < oh; r++)
+            for (int r0 = 0; r0 < oh; r0 += 2)
             for (int c = 0; c < chunks; c++)
+            for (int r = r0; r < Math.Min(r0 + 2, oh); r++)
             for (int l = 0; l < 8; l++)
             {
                 int col = c * 8 + l;

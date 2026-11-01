@@ -12,6 +12,7 @@ public partial class DirectGpuTensorEngine
 
     protected override Tensor<T> RunLstmGatePacket<T>(Tensor<T> gates, Tensor<T> previousCell)
     {
+        using var __gpuOp = EnterGpuOp();
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)
             || backend is not IFusedLstmSequenceTraining fused)
             return base.RunLstmGatePacket(gates, previousCell);
@@ -36,6 +37,7 @@ public partial class DirectGpuTensorEngine
     internal bool TryLstmGateBackward<T>(Tensor<T> gradient, Tensor<T>[] inputs, Tensor<T> output,
         Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        using var __gpuOp = EnterGpuOp();
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)
             || backend is not IFusedLstmSequenceTraining fused) return false;
         int count = inputs[1].Length, hidden = inputs[1].Shape[inputs[1].Rank - 1];

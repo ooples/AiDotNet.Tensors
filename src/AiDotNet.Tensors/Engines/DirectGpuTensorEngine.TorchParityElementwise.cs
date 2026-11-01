@@ -17,6 +17,7 @@ public partial class DirectGpuTensorEngine
 {
     private Tensor<T>? TryParityUnaryOnDevice<T>(Tensor<T> input, TorchParityUnaryOp op, float p0, float p1)
     {
+        using var __gpuOp = EnterGpuOp();
         if (input is null || input.Length == 0 || IsTapeActive<T>(op.ToString()) || !TryGetBackend(out var backend)
             || backend is not ITorchParityElementwiseBackend kernels || DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return null;
@@ -35,6 +36,7 @@ public partial class DirectGpuTensorEngine
 
     private Tensor<T>? TryParityBinaryOnDevice<T>(Tensor<T> a, Tensor<T> b, TorchParityBinaryOp op)
     {
+        using var __gpuOp = EnterGpuOp();
         if (a is null || b is null || a.Length == 0 || !a._shape.AsSpan().SequenceEqual(b._shape) || IsTapeActive<T>(op.ToString())
             || !TryGetBackend(out var backend) || backend is not ITorchParityElementwiseBackend kernels
             || DirectGpuEngine.ShouldFallbackForPrecision<T>())
@@ -58,6 +60,7 @@ public partial class DirectGpuTensorEngine
     // small host-side tensor) and such a call stays on the CPU path so it throws the same exception.
     private Tensor<T>? TryPolynomialOnDevice<T>(Tensor<T> x, Tensor<T> degree, int kind, bool shifted, string opName)
     {
+        using var __gpuOp = EnterGpuOp();
         if (x is null || degree is null || x.Length == 0 || !x._shape.AsSpan().SequenceEqual(degree._shape) || IsTapeActive<T>(opName)
             || !TryGetBackend(out var backend) || backend is not ITorchParityElementwiseBackend kernels
             || DirectGpuEngine.ShouldFallbackForPrecision<T>())
@@ -91,6 +94,7 @@ public partial class DirectGpuTensorEngine
     private Tensor<T>? TryGenerateOnDevice<T>(string opName, int[] shape, int n,
         Action<ITorchParityElementwiseBackend, IDirectGpuBackend, IGpuBuffer> generate)
     {
+        using var __gpuOp = EnterGpuOp();
         if (n == 0) return new Tensor<T>(shape);
         if (IsTapeActive<T>(opName) || !TryGetBackend(out var backend) || backend is not ITorchParityElementwiseBackend kernels
             || DirectGpuEngine.ShouldFallbackForPrecision<T>())
@@ -154,6 +158,7 @@ public partial class DirectGpuTensorEngine
 
     private Tensor<T>? TryDiagflatOnDevice<T>(Tensor<T> tensor, int offset)
     {
+        using var __gpuOp = EnterGpuOp();
         if (tensor is null || IsTapeActive<T>("TensorDiagflat")) return null;
         int n = tensor.Length;
         long sizeLong = (long)n + Math.Abs((long)offset);
@@ -178,6 +183,7 @@ public partial class DirectGpuTensorEngine
     // Invalid arguments return null so the CPU implementation raises its exception.
     private Tensor<T>? TryDiagonalScatterOnDevice<T>(Tensor<T> input, Tensor<T> src, int offset, int dim1, int dim2)
     {
+        using var __gpuOp = EnterGpuOp();
         if (input is null || src is null || input.Rank < 2 || IsTapeActive<T>("TensorDiagonalScatter")) return null;
         int rank = input.Rank;
         int d1 = dim1 < 0 ? dim1 + rank : dim1, d2 = dim2 < 0 ? dim2 + rank : dim2;
@@ -218,6 +224,7 @@ public partial class DirectGpuTensorEngine
     // msort: transpose [extent, inner] to rows, bitonic-sort each row (torch order, NaN last), transpose back.
     private Tensor<T>? TryMsortOnDevice<T>(Tensor<T> tensor)
     {
+        using var __gpuOp = EnterGpuOp();
         if (tensor is null || tensor.Rank == 0 || tensor.Length == 0 || typeof(T) != typeof(float)
             || IsTapeActive<T>("TensorMsort") || !TryGetBackend(out var backend))
             return null;
@@ -245,6 +252,7 @@ public partial class DirectGpuTensorEngine
     private Tensor<T>? TryQuantileOnDevice<T>(string opName, Tensor<T> tensor, double q, int? dim, bool keepDim,
         QuantileInterpolation interpolation, bool ignoreNan)
     {
+        using var __gpuOp = EnterGpuOp();
         if (tensor is null || tensor.Length == 0 || double.IsNaN(q) || q < 0 || q > 1 || typeof(T) != typeof(float)
             || IsTapeActive<T>(opName) || !TryGetBackend(out var backend) || backend is not ITorchParityElementwiseBackend kernels)
             return null;

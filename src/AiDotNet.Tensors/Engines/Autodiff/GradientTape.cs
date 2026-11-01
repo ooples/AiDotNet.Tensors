@@ -240,7 +240,7 @@ public sealed class GradientTape<T> : IDisposable
             // default when it drives that backend (several engines can share one); otherwise the registry's newest
             // live owner. Never a disposed engine.
             var engine = _defaultEngine is DirectGpuTensorEngine own && !own.IsDisposed
-                         && ReferenceEquals(own.GetBackend(), _dataBackend)
+                         && ReferenceEquals(own.QueryBackend, _dataBackend)
                 ? own
                 : DirectGpuTensorEngine.EngineOwning(_dataBackend);
             if (engine is not null) _engine = engine;

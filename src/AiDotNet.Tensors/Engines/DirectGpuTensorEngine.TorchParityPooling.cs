@@ -81,6 +81,7 @@ public partial class DirectGpuTensorEngine
     // zero appended to the input, which contributes nothing to either sum.
     private Tensor<T>? WindowSumOnDevice<T>(Tensor<T> x, PoolPlan plan, string opName, double? power)
     {
+        using var __gpuOp = EnterGpuOp();
         if (x.Length == 0 || IsTapeActive<T>(opName) || !TryGetBackend(out _) || DirectGpuEngine.ShouldFallbackForPrecision<T>()) return null;
         try
         {

@@ -139,7 +139,7 @@ public class PassRegressionABTest
     private double CompileAndMeasure(CpuEngine engine, Tensor<float> input,
         Tensor<float> w1, Tensor<float> w2, TensorCodecOptions? opts, int warmup, int iters)
     {
-        var prev = TensorCodecOptions.Current;
+        var prev = TensorCodecOptions.Save();   // restores the options AND the thread\'s determinism override
         if (opts is not null) TensorCodecOptions.SetCurrent(opts);
         try
         {
@@ -157,7 +157,7 @@ public class PassRegressionABTest
         }
         finally
         {
-            TensorCodecOptions.SetCurrent(prev);
+            prev.Dispose();
         }
     }
 

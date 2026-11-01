@@ -14,6 +14,7 @@ public partial class DirectGpuTensorEngine
     /// </summary>
     internal Tensor<T>? TryFusedMseLoss<T>(Tensor<T> predictions, Tensor<T> targets, int[] outputShape)
     {
+        using var __gpuOp = EnterGpuOp();
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend) || backend is not IFusedMseLossBackend mse
             || predictions.Length != targets.Length || predictions.Length == 0
             || !predictions.IsContiguous || !targets.IsContiguous)
@@ -36,6 +37,7 @@ public partial class DirectGpuTensorEngine
     internal Tensor<T>? TryFusedMseLossBackward<T>(Tensor<T> gradLoss, Tensor<T> predictions, Tensor<T> targets,
         bool targetGradient, out Tensor<T>? gradTargets)
     {
+        using var __gpuOp = EnterGpuOp();
         gradTargets = null;
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend) || backend is not IFusedMseLossBackend mse
             || predictions.Length != targets.Length || predictions.Length == 0 || gradLoss.Length < 1
@@ -74,7 +76,12 @@ public partial class DirectGpuTensorEngine
     /// compiled plan fuses only those).
     /// </summary>
     internal bool SupportsFusedLinearMseLoss(int m, int k, int n)
-        => TryGetBackend(out var backend) && backend is IFusedLinearMseLossBackend head && head.SupportsLinearMseLoss(m, k, n);
+    {
+        // Leased: answering may load the head's kernel module.
+        using var __gpuOp = EnterGpuOp();
+        return TryGetBackend(out var backend) && backend is IFusedLinearMseLossBackend head
+            && head.SupportsLinearMseLoss(m, k, n);
+    }
 
     /// <summary>
     /// <c>mean((x w + b - y)^2)</c> in one launch, shaped <paramref name="outputShape"/>: the compiled plan's fused linear
@@ -83,6 +90,7 @@ public partial class DirectGpuTensorEngine
     /// </summary>
     internal Tensor<T>? TryFusedLinearMseLoss<T>(Tensor<T> x, Tensor<T> w, Tensor<T>? b, Tensor<T> y, int[] outputShape)
     {
+        using var __gpuOp = EnterGpuOp();
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend) || backend is not IFusedLinearMseLossBackend head
             || !TryGetLinearMseShape(x, w, b, y, out int m, out int k, out int n))
             return null;
@@ -108,6 +116,7 @@ public partial class DirectGpuTensorEngine
     internal bool TryFusedLinearMseLossBackward<T>(Tensor<T> gradLoss, Tensor<T> x, Tensor<T> w, Tensor<T>? b,
         Tensor<T> y, out Tensor<T>? gradX, out Tensor<T>? gradW, out Tensor<T>? gradB)
     {
+        using var __gpuOp = EnterGpuOp();
         gradX = gradW = gradB = null;
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend) || backend is not IFusedLinearMseLossBackend head
             || gradLoss.Length < 1 || !gradLoss.IsContiguous || !TryGetLinearMseShape(x, w, b, y, out int m, out int k, out int n))

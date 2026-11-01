@@ -30,7 +30,7 @@ internal enum DirectConvPasses
 /// registers for the whole reduction. On ResNet-sized small planes the im2col route spent as long building and
 /// scattering its column matrix as in the GEMM; this removes that traffic.
 /// </summary>
-internal static class DirectConvAvx2
+internal static partial class DirectConvAvx2
 {
     private const int Block = 8;
 
@@ -60,6 +60,9 @@ internal static class DirectConvAvx2
     /// <summary>Keeps this thread's convolutions off the direct kernels until disposed (restores the previous state).</summary>
     internal static IDisposable SuppressOnThisThread() => new Suppression();
 
+    /// <summary>Whether <see cref="SuppressOnThisThread"/> is in force (the Winograd kernel honours it too).</summary>
+    internal static bool SuppressedOnThisThread => t_suppressed;
+
     private sealed class Suppression : IDisposable
     {
         private readonly bool _previous;
@@ -83,8 +86,10 @@ internal static class DirectConvAvx2
     // Larger planes stay on the Winograd / implicit-GEMM routes until measured.
     private const int MaxStride1PlanePositions = 1024;
     // A strided input gradient runs one stride-1 conv per phase over a grid of (H/stride) x (W/stride); below this
-    // many grid positions per image the tiles are too short (256->512 stride 2 on 8x8, a 4x4 grid: 1.2 ms -> 1.4).
-    private const int MinStridedPhasePositions = 64;
+    // many grid positions per image the tiles are too short. It was 64 (256->512 stride 2 on 8x8, a 4x4 grid, measured
+    // 1.2 ms -> 1.4); with runs that cross grid rows and a destination-ordered phase pack, that shape takes 5.3 ms direct
+    // against 12.2 ms on the im2col route (one thread, emulated CI runner; PyTorch 4.7-6.6 ms).
+    internal static int MinStridedPhasePositions = 16;
 
     /// <summary>
     /// Whether <paramref name="shape"/>'s pass runs on the direct kernel, and with what forward task target (0 = the
@@ -277,8 +282,8 @@ internal static class DirectConvAvx2
         int tiles = inChannels / (Block * OutputBlocksPerTile);
 
         // The phases that receive a tap. Their sub-kernels partition the kernel, so they pack into one kernel-sized buffer.
-        var phases = new List<(ForwardGeometry Geometry, int KernelOffset, int FirstH, int TapsH, int FirstW, int TapsW, int Chunks, int ChunksPerTask, int Tasks)>();
-        int packedOffset = 0, totalTasks = 0;
+        var phases = new List<(ForwardGeometry Geometry, int KernelOffset, int FirstH, int TapsH, int FirstW, int TapsW, int Chunks)>();
+        int packedOffset = 0;
         for (int ry = 0; ry < strideH; ry++)
         {
             for (int rx = 0; rx < strideW; rx++)
@@ -301,11 +306,8 @@ internal static class DirectConvAvx2
                     tapsH, tapsW, 1, 1, 1, 1, gridH, gridW, (originRow * paddedW + originCol) * Block,
                     height, width, strideH, strideW, ry, rx);
                 int chunks = (geometry.TotalPositions + PositionUnroll - 1) / PositionUnroll;
-                int chunksPerTask = Math.Max(1, (int)(((long)chunks * tiles * strideH * strideW + taskTarget - 1) / taskTarget));
-                int tasks = tiles * ((chunks + chunksPerTask - 1) / chunksPerTask);
-                phases.Add((geometry, packedOffset, firstH, tapsH, firstW, tapsW, chunks, chunksPerTask, tasks));
+                phases.Add((geometry, packedOffset, firstH, tapsH, firstW, tapsW, chunks));
                 packedOffset += outChannels * inChannels * tapsH * tapsW;
-                totalTasks += tasks;
             }
         }
         if (phases.Count == 0) return;
@@ -324,22 +326,28 @@ internal static class DirectConvAvx2
                     kernelHeight, kernelWidth, phase.FirstH, strideH, phase.TapsH, phase.FirstW, strideW, phase.TapsW);
             }, deterministicSafe: true);
 
-            // One dispatch over every phase's tiles: the phases write disjoint dX positions.
-            var taskStart = new int[phases.Count + 1];
-            for (int p = 0; p < phases.Count; p++) taskStart[p + 1] = taskStart[p] + phases[p].Tasks;
-            CpuParallelSettings.ParallelForOrSerial(0, totalTasks,
+            // Each task runs EVERY phase over the same share of the grid (the same fraction of each phase's positions,
+            // so the same images and rows): the phases interleave in dX (stride 2: alternate columns), and as separate
+            // tasks up to four cores wrote each dX cache line at different times. The phases write disjoint positions.
+            int minChunks = int.MaxValue;
+            foreach (var phase in phases) minChunks = Math.Min(minChunks, phase.Chunks);
+            // At least four position triples per phase in a share: shorter runs cost more in setup than they save.
+            int sharesPerTile = Math.Max(1, Math.Min(minChunks / 4, (taskTarget + tiles - 1) / tiles));
+            CpuParallelSettings.ParallelForOrSerial(0, tiles * sharesPerTile,
                 (long)batch * height * width * inChannels * outChannels * kernelHeight * kernelWidth / (strideH * strideW),
                 [MethodImpl(Hot)] (task) =>
                 {
-                    int p = 0;
-                    while (taskStart[p + 1] <= task) p++;
-                    var phase = phases[p];
-                    int local = task - taskStart[p];
-                    int tasksPerTile = phase.Tasks / tiles;
-                    int tile = local / tasksPerTile, part = local % tasksPerTile;
-                    int first = part * phase.ChunksPerTask * PositionUnroll;
-                    int last = Math.Min(phase.Geometry.TotalPositions, first + phase.ChunksPerTask * PositionUnroll);
-                    ForwardTile(packedGrad, packedKernel, phase.KernelOffset, dest, destOffset, accumulate, phase.Geometry, tile, first, last);
+                    int tile = task / sharesPerTile, share = task % sharesPerTile;
+                    foreach (var phase in phases)
+                    {
+                        int total = phase.Geometry.TotalPositions;
+                        int first = ShareBound(total, share, sharesPerTile), last = ShareBound(total, share + 1, sharesPerTile);
+                        if (first >= last) continue;
+                        if (s_stagedStore)
+                            ForwardTileRuns(packedGrad, packedKernel, phase.KernelOffset, dest, destOffset, accumulate, phase.Geometry, tile, first, last);
+                        else
+                            ForwardTile(packedGrad, packedKernel, phase.KernelOffset, dest, destOffset, accumulate, phase.Geometry, tile, first, last);
+                    }
                 },
                 deterministicSafe: true);
         }
@@ -349,6 +357,10 @@ internal static class DirectConvAvx2
             pool.Return(packedKernel);
         }
     }
+    // Start of share `share` of `shares` over `total` positions, on a PositionUnroll boundary (the last ends at total).
+    private static int ShareBound(int total, int share, int shares)
+        => share >= shares ? total : Math.Min(total, (int)((long)total * share / shares) / PositionUnroll * PositionUnroll);
+
     /// <summary>Zeroes phase (ry, rx) of every plane: the input positions no kernel tap reaches (a 1x1 stride-2 conv's odd rows).</summary>
     [MethodImpl(Hot)]
     private static void ClearPhase(float[] dest, int destOffset, int planes, int height, int width, int ry, int rx, int strideH, int strideW)
@@ -377,24 +389,43 @@ internal static class DirectConvAvx2
         fixed (float* ps = source)
         fixed (float* pd = packed)
         {
-            float* d0 = pd + packedOffset + (long)ib * outBlocks * taps * Block * Block;
-            for (int lane = 0; lane < Block; lane++)
-            {
-                int i = ib * Block + lane;
-                for (int o = 0; o < outChannels; o++)
+            // Destination order (each 8x8 block written contiguously); the lane-outer order it replaces revisited every
+            // destination line eight times, and was 46% of a 256->512 8x8 stride-2 input gradient (one thread).
+            float* d = pd + packedOffset + (long)ib * outBlocks * taps * Block * Block;
+            int kernelPlane = kernelHeight * kernelWidth;
+            for (int ob = 0; ob < outBlocks; ob++)
+                for (int y = 0; y < tapsH; y++)
                 {
-                    float* s = ps + sourceOffset + ((long)o * inChannels + i) * kernelHeight * kernelWidth;
-                    float* d = d0 + (long)(o / Block) * taps * Block * Block + (o % Block) * Block + lane;
-                    for (int y = 0; y < tapsH; y++)
+                    int kh = firstH + strideH * (tapsH - 1 - y);
+                    for (int x = 0; x < tapsW; x++)
                     {
-                        int kh = firstH + strideH * (tapsH - 1 - y);
-                        for (int x = 0; x < tapsW; x++)
-                            d[(y * tapsW + x) * Block * Block] = s[kh * kernelWidth + firstW + strideW * (tapsW - 1 - x)];
+                        int tap = kh * kernelWidth + firstW + strideW * (tapsW - 1 - x);
+                        for (int oo = 0; oo < Block; oo++)
+                        {
+                            float* s = ps + sourceOffset + ((long)(ob * Block + oo) * inChannels + ib * Block) * kernelPlane + tap;
+                            for (int lane = 0; lane < Block; lane++) *d++ = s[lane * kernelPlane];
+                        }
                     }
                 }
-            }
         }
     }
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void RunBackwardKernelTile(bool wide, float[] packedInput, float[] packedGrad, int[] offsets, float[] dest,
+        int destOffset, bool accumulate, int ob, int it, int batchBegin, int batchEnd, int inChannels, int outBlocks,
+        int paddedW, int planeIn, int kernelHeight, int kernelWidth, int dilationH, int dilationW, int positions)
+    {
+#if NET9_0_OR_GREATER
+        if (wide)
+        {
+            BackwardKernelTile512(packedInput, packedGrad, offsets, dest, destOffset, accumulate, ob, it, batchBegin, batchEnd,
+                inChannels, outBlocks, paddedW, planeIn, kernelHeight, kernelWidth, dilationH, dilationW, positions);
+            return;
+        }
+#endif
+        BackwardKernelTile(packedInput, packedGrad, offsets, dest, destOffset, accumulate, ob, it, batchBegin, batchEnd,
+            inChannels, outBlocks, paddedW, planeIn, kernelHeight, kernelWidth, dilationH, dilationW, positions);
+    }
+
     /// <summary>dW[oc, ic, kh, kw] (=, or += when <paramref name="accumulate"/>) for the conv of input with kernel.</summary>
     [MethodImpl(Hot)]
     public static void BackwardKernel(
@@ -407,11 +438,21 @@ internal static class DirectConvAvx2
         int inBlocks = inChannels / Block, outBlocks = outChannels / Block;
         int positions = outputHeight * outputWidth;
         int planeIn = paddedH * paddedW * Block;
-        int pairs = outBlocks * inBlocks;
+#if NET9_0_OR_GREATER
+        // AVX-512: one task per output block x pair of input blocks (sixteen input channels per vector).
+        bool wide = UseAvx512BackwardKernel(inChannels);
+#else
+        const bool wide = false;
+#endif
+        int inTiles = wide ? inBlocks / 2 : inBlocks;
+        int pairs = outBlocks * inTiles;
         int kernelSize = outChannels * inChannels * kernelHeight * kernelWidth;
         // Few block pairs leave cores idle (32 pairs for 32->64 channels), so the batch is split too: each slice
         // sums into its own partial gradient and the partials are reduced in a fixed order afterwards.
-        int splits = Math.Max(1, Math.Min(batch, ((targetTasks > 0 ? targetTasks : TargetBackwardKernelTasks) + pairs - 1) / pairs));
+        // The split count follows the 8-lane block pairs whichever tile runs, so both sum the same partials in the same
+        // order (the AVX-512 tile's results are bit-identical to the AVX2 tile's).
+        int blockPairs = outBlocks * inBlocks;
+        int splits = Math.Max(1, Math.Min(batch, ((targetTasks > 0 ? targetTasks : TargetBackwardKernelTasks) + blockPairs - 1) / blockPairs));
         // Each split adds a kernel-sized partial that ReducePartials reads back, so bound the partials' total size.
         splits = Math.Max(1, Math.Min(splits, (int)Math.Min(int.MaxValue, MaxBackwardKernelPartialFloats / Math.Max(1, kernelSize))));
         int imagesPerSplit = (batch + splits - 1) / splits;
@@ -433,8 +474,8 @@ internal static class DirectConvAvx2
             if (partials is null)
             {
                 CpuParallelSettings.ParallelForOrSerial(0, pairs, (long)kernelSize * batch * positions,
-                    [MethodImpl(Hot)] (task) => BackwardKernelTile(packedInput, packedGrad, offsets, dest, destOffset, accumulate,
-                        task / inBlocks, task % inBlocks, 0, batch, inChannels, outBlocks, paddedW, planeIn,
+                    [MethodImpl(Hot)] (task) => RunBackwardKernelTile(wide, packedInput, packedGrad, offsets, dest, destOffset,
+                        accumulate, task / inTiles, task % inTiles, 0, batch, inChannels, outBlocks, paddedW, planeIn,
                         kernelHeight, kernelWidth, dilationH, dilationW, positions),
                     deterministicSafe: true);
             }
@@ -444,8 +485,8 @@ internal static class DirectConvAvx2
                 {
                     int split = task / pairs, pair = task % pairs;
                     int b0 = split * imagesPerSplit;
-                    BackwardKernelTile(packedInput, packedGrad, offsets, partials, split * kernelSize, false,
-                        pair / inBlocks, pair % inBlocks, b0, Math.Min(batch, b0 + imagesPerSplit), inChannels, outBlocks,
+                    RunBackwardKernelTile(wide, packedInput, packedGrad, offsets, partials, split * kernelSize, false,
+                        pair / inTiles, pair % inTiles, b0, Math.Min(batch, b0 + imagesPerSplit), inChannels, outBlocks,
                         paddedW, planeIn, kernelHeight, kernelWidth, dilationH, dilationW, positions);
                 }, deterministicSafe: true);
                 ReducePartials(partials, splits, kernelSize, dest, destOffset, accumulate);
@@ -526,14 +567,21 @@ internal static class DirectConvAvx2
                 {
                     new Span<float>(d, plane).Clear();   // lanes past the last channel stay zero
                 }
-                for (int c = 0; c < blockChannels; c++)
+                long channelPlane = (long)height * width;
+                float* s0 = ps + sourceOffset + ((long)b * channels + blk * Block) * channelPlane;
+                // A full block goes 8 pixels x 8 channels at a time through a register transpose; the strided scalar
+                // scatter it replaces was 7% of a 64-channel forward.
+                int vectorWidth = blockChannels == Block ? width & ~(Block - 1) : 0;
+                for (int y = 0; y < height; y++)
                 {
-                    float* s = ps + sourceOffset + ((long)b * channels + blk * Block + c) * height * width;
-                    for (int y = 0; y < height; y++)
+                    float* drow = d + ((y + padH) * paddedW + padW) * Block;
+                    float* srow = s0 + y * width;
+                    for (int x = 0; x < vectorWidth; x += Block)
+                        Transpose8(srow + x, channelPlane, drow + x * Block, Block, accumulate: false);
+                    for (int c = 0; c < blockChannels; c++)
                     {
-                        float* drow = d + ((y + padH) * paddedW + padW) * Block + c;
-                        float* srow = s + y * width;
-                        for (int x = 0; x < width; x++) drow[x * Block] = srow[x];
+                        float* sc = srow + c * channelPlane;
+                        for (int x = vectorWidth; x < width; x++) drow[x * Block + c] = sc[x];
                     }
                 }
             }
@@ -552,10 +600,15 @@ internal static class DirectConvAvx2
             {
                 float* d = pd + (long)task * positions * Block;
                 float* s = ps + sourceOffset + (long)task * Block * positions;
+                // Eight positions x eight channels per register transpose (the scalar scatter was 5-10% of the AVX-512
+                // weight gradient at 32 -> 64 channels).
+                int q0 = 0;
+                for (; q0 + Block <= positions; q0 += Block)
+                    Transpose8(s + q0, positions, d + q0 * Block, Block, accumulate: false);
                 for (int lane = 0; lane < Block; lane++)
                 {
                     float* sl = s + lane * positions;
-                    for (int q = 0; q < positions; q++) d[q * Block + lane] = sl[q];
+                    for (int q = q0; q < positions; q++) d[q * Block + lane] = sl[q];
                 }
             }
         }, deterministicSafe: true);
@@ -585,6 +638,50 @@ internal static class DirectConvAvx2
             {
                 float* d = pd + ((long)ob * packedInBlocks + ib) * taps * Block * Block;
                 float* src = ps + sourceOffset;
+                // The eight output lanes of one (tap, input lane) sit a fixed stride apart in the source, so a full input
+                // block gathers them in one instruction; the scalar walk below (index arithmetic per element) was a
+                // third of a 512-channel 4x4 forward (one thread).
+                long laneStride = transposeAndFlip ? taps : (long)inChannels * taps;
+                if (!transposeAndFlip && (ib + 1) * Block <= packedIn)
+                {
+                    // Forward packing: the block's 8 output rows each hold [8 input lanes][taps] contiguously, so an 8x8
+                    // transpose of columns c..c+7 of that 8 x 8*taps matrix yields, for each column c = il*taps + tap,
+                    // the 8 output lanes of (tap, il) -- the destination vector.
+                    float* rows = src + ((long)ob * Block * inChannels + (long)ib * Block) * taps;
+                    float* d0 = d;
+                    for (int c0 = 0; c0 < Block * taps; c0 += Block)
+                        TransposeScatter(rows + c0, laneStride, d0, c0, taps);
+                    return;
+                }
+                if (transposeAndFlip && (ib + 1) * Block <= packedIn && taps <= MaxTransposePackTaps)
+                {
+                    // Input-gradient packing: input lane il's row holds [8 output lanes][taps] contiguously. A first
+                    // transpose (columns c = lane*taps + tap of the 8 rows) gives tile[c] = the 8 input lanes of
+                    // (lane, tap); a second, of tile[tap], tile[taps + tap], ..., gives each (tap, il)'s 8 output lanes.
+                    float* tile = stackalloc float[MaxTransposePackTaps * Block * Block];
+                    float* rows = src + ((long)ib * Block * inChannels + (long)ob * Block) * taps;
+                    for (int c0 = 0; c0 < Block * taps; c0 += Block)
+                        Transpose8(rows + c0, (long)inChannels * taps, tile + c0 * Block, Block, accumulate: false);
+                    for (int t = 0; t < taps; t++)
+                        Transpose8(tile + (taps - 1 - t) * Block, (long)taps * Block, d + t * Block * Block, Block, accumulate: false);
+                    return;
+                }
+                if (Avx2.IsSupported && (ib + 1) * Block <= packedIn && 7 * laneStride <= int.MaxValue)
+                {
+                    int ls = (int)laneStride;
+                    var lanes = Vector256.Create(0, ls, 2 * ls, 3 * ls, 4 * ls, 5 * ls, 6 * ls, 7 * ls);
+                    for (int t = 0; t < taps; t++)
+                    {
+                        int tap = transposeAndFlip ? taps - 1 - t : t;
+                        for (int il = 0; il < Block; il++, d += Block)
+                        {
+                            int pi = ib * Block + il, po = ob * Block;
+                            long row = transposeAndFlip ? (long)pi * inChannels + po : (long)po * inChannels + pi;
+                            Avx.Store(d, Avx2.GatherVector256(src + row * taps + tap, lanes, 4));
+                        }
+                    }
+                    return;
+                }
                 for (int t = 0; t < taps; t++)
                 {
                     int tap = transposeAndFlip ? taps - 1 - t : t;
@@ -628,7 +725,10 @@ internal static class DirectConvAvx2
                 int tile = task / tasksPerTile, part = task % tasksPerTile;
                 int first = part * chunksPerTask * PositionUnroll;
                 int last = Math.Min(totalPositions, first + chunksPerTask * PositionUnroll);
-                ForwardTile(packedInput, packedKernel, 0, output, outputOffset, accumulate, geometry, tile, first, last);
+                if (s_stagedStore)
+                    ForwardTileRuns(packedInput, packedKernel, 0, output, outputOffset, accumulate, geometry, tile, first, last);
+                else
+                    ForwardTile(packedInput, packedKernel, 0, output, outputOffset, accumulate, geometry, tile, first, last);
             },
             deterministicSafe: true);
     }
@@ -700,6 +800,411 @@ internal static class DirectConvAvx2
         }
     }
 
+    /// <summary>
+    /// The forward tile for a plain output grid (consecutive positions are consecutive output floats), at any batch. The
+    /// positions run in runs of up to <see cref="s_forwardRunPositions"/> within one image; for each run the input channels
+    /// go in passes whose kernel slice fits L1 (<see cref="s_forwardRunPassKernelBytes"/>), every position triple carrying
+    /// its accumulators from pass to pass in the run's stage ([position][32 channels], vector loads and stores), and the
+    /// run is written to the NCHW output once, as contiguous per-channel runs.
+    /// </summary>
+    /// <remarks>
+    /// Every position triple used to walk the tile's whole kernel slice (4 output blocks x all input blocks x taps: 73 KB
+    /// at 64 channels, 3x3), past the 32 KB L1, so each 12 FMAs pulled two weight lines from L2: 15% of loads missed L1
+    /// and the kernel ran at L2 bandwidth (64ch@32 b8, one thread: 9.1 ms, 66 GFLOP/s, against PyTorch's 5.2 ms). A pass
+    /// now streams its slice from L2 once per run instead of once per triple. A batch above one also used to store each
+    /// position's 32 channels as scattered scalars (the stage was single-image only); runs now stop at image boundaries.
+    /// Each output's FMA chain is unchanged (from zero, input blocks, taps and channels in order), so the result is
+    /// bit-identical to the single-pass tile; an accumulating call adds the finished sum to the output, as that tile did.
+    /// </remarks>
+    [MethodImpl(Hot)]
+    private static unsafe void ForwardTileRuns(float[] packedInput, float[] packedKernel, int kernelOffset, float[] output, int outputOffset,
+        bool accumulate, in ForwardGeometry g, int tile, int first, int last)
+    {
+        int kernelHeight = g.KernelHeight, kernelWidth = g.KernelWidth, inBlocks = g.InBlocks, planeIn = g.PlaneIn;
+        int rowStep = g.DilationH * g.PaddedW * Block, colStep = g.DilationW * Block;
+        int taps = kernelHeight * kernelWidth;
+        long blockStride = (long)inBlocks * taps * Block * Block;
+        int gridPositions = g.GridPositions;
+        int runLength = Math.Max(PositionUnroll, Math.Min(s_forwardRunPositions, MaxForwardRunPositions));
+        int pass = ForwardRunInputBlocksPerPass(inBlocks, taps);
+        int channelBase = tile * OutputBlocksPerTile * Block;
+        float* stage = stackalloc float[(MaxForwardRunPositions + RowPositions512) * 32];
+        // The run's receptive-field origins, computed once per run (InputOrigin divides; per triple and pass it was a
+        // tenth of the forward's time) and stepped along a grid row; the tail repeats the last real position.
+        int* origin = stackalloc int[MaxForwardRunPositions + RowPositions512];
+        bool wide = UseAvx512Forward;
+        bool rowKernel = wide && s_useRowKernel512 && g.StrideW == 1;
+        int gridWidth = g.GridWidth, columnStep = g.StrideW * Block;
+        bool plain = g.PlainContiguous;
+        fixed (float* px = packedInput)
+        fixed (float* pw = packedKernel)
+        fixed (float* po = output)
+        {
+            float* tileKernel = pw + kernelOffset + tile * OutputBlocksPerTile * blockStride;
+            float* o = po + outputOffset;
+            for (int runStart = first; runStart < last;)
+            {
+                // A run may span images (the packed input addresses any position), so a small plane (512 channels at
+                // 4x4: 16 positions an image) still streams each pass's kernel slice once per run, not once per image;
+                // only the flush splits it per image.
+                int runEnd = Math.Min(last, runStart + runLength);
+                int run = runEnd - runStart;
+                for (int i = 0, column = gridWidth; i < run; i++)
+                {
+                    int q = runStart + i;
+                    if (column >= gridWidth) { origin[i] = g.InputOrigin(q); column = q % gridPositions % gridWidth; }
+                    else origin[i] = origin[i - 1] + columnStep;
+                    column++;
+                }
+                for (int i = run; i < run + Avx512Positions; i++) origin[i] = origin[run - 1];
+                for (int cb0 = 0; cb0 < inBlocks; cb0 += pass)
+                {
+                    int cbEnd = Math.Min(inBlocks, cb0 + pass);
+                    float* passKernel = tileKernel + (long)cb0 * taps * Block * Block;
+                    if (wide)
+                    {
+                        for (int q = runStart; q < runEnd;)
+                        {
+                            int i = q - runStart;
+                            // Twelve positions along one grid row of a stride-1 conv sit Block floats apart: one pointer
+                            // addresses them all, and the row kernel keeps 24 accumulators.
+                            if (rowKernel && runEnd - q >= RowPositions512
+                                && origin[i + RowPositions512 - 1] == origin[i] + (RowPositions512 - 1) * Block)
+                            {
+                                ForwardRowRun512(px + origin[i], passKernel, blockStride, cbEnd - cb0, cb0 * planeIn, planeIn,
+                                    kernelHeight, kernelWidth, rowStep, colStep, stage + i * 32, cb0 > 0);
+                                q += RowPositions512;
+                                continue;
+                            }
+                            int count = Math.Min(Avx512Positions, runEnd - q);
+                            ForwardSextetRun512(px, origin + i, passKernel, blockStride, cbEnd - cb0, cb0 * planeIn, planeIn,
+                                kernelHeight, kernelWidth, rowStep, colStep, stage + i * 32, cb0 > 0, count);
+                            q += Avx512Positions;
+                        }
+                        continue;
+                    }
+                    for (int q = runStart; q < runEnd; q += PositionUnroll)
+                    {
+                        int count = Math.Min(PositionUnroll, runEnd - q), i = q - runStart;
+                        // A short final triple repeats its last position; only the real positions are stored.
+                        ForwardTripleRun(px + origin[i], px + origin[i + 1], px + origin[i + 2],
+                            passKernel, blockStride, cbEnd - cb0, cb0 * planeIn, planeIn, kernelHeight, kernelWidth, rowStep, colStep,
+                            stage + (q - runStart) * 32, cb0 > 0, count);
+                    }
+                }
+                for (int segment = runStart; segment < runEnd;)
+                {
+                    int segmentEnd = Math.Min(runEnd, (segment / gridPositions + 1) * gridPositions);
+                    float* segmentStage = stage + (segment - runStart) * 32;
+                    if (plain) FlushStage(o, accumulate, g, channelBase, segment, segmentEnd - segment, segmentStage);
+                    else FlushStageStrided(o, accumulate, g, channelBase, segment, segmentEnd - segment, segmentStage);
+                    segment = segmentEnd;
+                }
+                runStart = runEnd;
+            }
+        }
+    }
+
+    /// <summary>
+    /// One input-channel pass for a position triple: the 3 x 32 accumulators from <paramref name="slot"/> (or zero on the
+    /// first pass), the pass's FMAs, and the <paramref name="count"/> real positions stored back. A method of its own so
+    /// the twelve accumulators, three broadcasts and the weight register get all sixteen ymm registers with nothing live
+    /// across a call.
+    /// </summary>
+    [MethodImpl(Hot)]
+    private static unsafe void ForwardTripleRun(float* x0, float* x1, float* x2, float* w, long blockStride, int blocks,
+        int firstBlockOffset, int planeIn, int kernelHeight, int kernelWidth, int rowStep, int colStep,
+        float* slot, bool seeded, int count)
+    {
+        Vector256<float> a00, a01, a02, a03, a10, a11, a12, a13, a20, a21, a22, a23;
+        if (seeded)
+        {
+            // Slots past the real positions hold no position; a short triple reloads its last real one there.
+            float* s1 = count > 1 ? slot + 32 : slot, s2 = count > 2 ? slot + 64 : s1;
+            a00 = Avx.LoadVector256(slot); a01 = Avx.LoadVector256(slot + 8); a02 = Avx.LoadVector256(slot + 16); a03 = Avx.LoadVector256(slot + 24);
+            a10 = Avx.LoadVector256(s1); a11 = Avx.LoadVector256(s1 + 8); a12 = Avx.LoadVector256(s1 + 16); a13 = Avx.LoadVector256(s1 + 24);
+            a20 = Avx.LoadVector256(s2); a21 = Avx.LoadVector256(s2 + 8); a22 = Avx.LoadVector256(s2 + 16); a23 = Avx.LoadVector256(s2 + 24);
+        }
+        else
+        {
+            a00 = Vector256<float>.Zero; a01 = a00; a02 = a00; a03 = a00;
+            a10 = a00; a11 = a00; a12 = a00; a13 = a00;
+            a20 = a00; a21 = a00; a22 = a00; a23 = a00;
+        }
+        long stride2 = 2 * blockStride, stride3 = 3 * blockStride;
+        for (int cb = 0; cb < blocks; cb++)
+        {
+            int blockOffset = firstBlockOffset + cb * planeIn;
+            for (int y = 0; y < kernelHeight; y++)
+            {
+                int rowOffset = blockOffset + y * rowStep;
+                for (int x = 0; x < kernelWidth; x++)
+                {
+                    int tapOffset = rowOffset + x * colStep;
+                    float* p0 = x0 + tapOffset, p1 = x1 + tapOffset, p2 = x2 + tapOffset;
+                    // The eight channels unrolled: the loop counter and branch were a sixth of the uops.
+                    Vector256<float> b0, b1, b2, wv;
+                    b0 = Vector256.Create(p0[0]); b1 = Vector256.Create(p1[0]); b2 = Vector256.Create(p2[0]);
+                    wv = Avx.LoadVector256(w); a00 = Fma.MultiplyAdd(b0, wv, a00); a10 = Fma.MultiplyAdd(b1, wv, a10); a20 = Fma.MultiplyAdd(b2, wv, a20);
+                    wv = Avx.LoadVector256(w + blockStride); a01 = Fma.MultiplyAdd(b0, wv, a01); a11 = Fma.MultiplyAdd(b1, wv, a11); a21 = Fma.MultiplyAdd(b2, wv, a21);
+                    wv = Avx.LoadVector256(w + stride2); a02 = Fma.MultiplyAdd(b0, wv, a02); a12 = Fma.MultiplyAdd(b1, wv, a12); a22 = Fma.MultiplyAdd(b2, wv, a22);
+                    wv = Avx.LoadVector256(w + stride3); a03 = Fma.MultiplyAdd(b0, wv, a03); a13 = Fma.MultiplyAdd(b1, wv, a13); a23 = Fma.MultiplyAdd(b2, wv, a23);
+                    b0 = Vector256.Create(p0[1]); b1 = Vector256.Create(p1[1]); b2 = Vector256.Create(p2[1]);
+                    wv = Avx.LoadVector256(w + 8); a00 = Fma.MultiplyAdd(b0, wv, a00); a10 = Fma.MultiplyAdd(b1, wv, a10); a20 = Fma.MultiplyAdd(b2, wv, a20);
+                    wv = Avx.LoadVector256(w + blockStride + 8); a01 = Fma.MultiplyAdd(b0, wv, a01); a11 = Fma.MultiplyAdd(b1, wv, a11); a21 = Fma.MultiplyAdd(b2, wv, a21);
+                    wv = Avx.LoadVector256(w + stride2 + 8); a02 = Fma.MultiplyAdd(b0, wv, a02); a12 = Fma.MultiplyAdd(b1, wv, a12); a22 = Fma.MultiplyAdd(b2, wv, a22);
+                    wv = Avx.LoadVector256(w + stride3 + 8); a03 = Fma.MultiplyAdd(b0, wv, a03); a13 = Fma.MultiplyAdd(b1, wv, a13); a23 = Fma.MultiplyAdd(b2, wv, a23);
+                    b0 = Vector256.Create(p0[2]); b1 = Vector256.Create(p1[2]); b2 = Vector256.Create(p2[2]);
+                    wv = Avx.LoadVector256(w + 16); a00 = Fma.MultiplyAdd(b0, wv, a00); a10 = Fma.MultiplyAdd(b1, wv, a10); a20 = Fma.MultiplyAdd(b2, wv, a20);
+                    wv = Avx.LoadVector256(w + blockStride + 16); a01 = Fma.MultiplyAdd(b0, wv, a01); a11 = Fma.MultiplyAdd(b1, wv, a11); a21 = Fma.MultiplyAdd(b2, wv, a21);
+                    wv = Avx.LoadVector256(w + stride2 + 16); a02 = Fma.MultiplyAdd(b0, wv, a02); a12 = Fma.MultiplyAdd(b1, wv, a12); a22 = Fma.MultiplyAdd(b2, wv, a22);
+                    wv = Avx.LoadVector256(w + stride3 + 16); a03 = Fma.MultiplyAdd(b0, wv, a03); a13 = Fma.MultiplyAdd(b1, wv, a13); a23 = Fma.MultiplyAdd(b2, wv, a23);
+                    b0 = Vector256.Create(p0[3]); b1 = Vector256.Create(p1[3]); b2 = Vector256.Create(p2[3]);
+                    wv = Avx.LoadVector256(w + 24); a00 = Fma.MultiplyAdd(b0, wv, a00); a10 = Fma.MultiplyAdd(b1, wv, a10); a20 = Fma.MultiplyAdd(b2, wv, a20);
+                    wv = Avx.LoadVector256(w + blockStride + 24); a01 = Fma.MultiplyAdd(b0, wv, a01); a11 = Fma.MultiplyAdd(b1, wv, a11); a21 = Fma.MultiplyAdd(b2, wv, a21);
+                    wv = Avx.LoadVector256(w + stride2 + 24); a02 = Fma.MultiplyAdd(b0, wv, a02); a12 = Fma.MultiplyAdd(b1, wv, a12); a22 = Fma.MultiplyAdd(b2, wv, a22);
+                    wv = Avx.LoadVector256(w + stride3 + 24); a03 = Fma.MultiplyAdd(b0, wv, a03); a13 = Fma.MultiplyAdd(b1, wv, a13); a23 = Fma.MultiplyAdd(b2, wv, a23);
+                    b0 = Vector256.Create(p0[4]); b1 = Vector256.Create(p1[4]); b2 = Vector256.Create(p2[4]);
+                    wv = Avx.LoadVector256(w + 32); a00 = Fma.MultiplyAdd(b0, wv, a00); a10 = Fma.MultiplyAdd(b1, wv, a10); a20 = Fma.MultiplyAdd(b2, wv, a20);
+                    wv = Avx.LoadVector256(w + blockStride + 32); a01 = Fma.MultiplyAdd(b0, wv, a01); a11 = Fma.MultiplyAdd(b1, wv, a11); a21 = Fma.MultiplyAdd(b2, wv, a21);
+                    wv = Avx.LoadVector256(w + stride2 + 32); a02 = Fma.MultiplyAdd(b0, wv, a02); a12 = Fma.MultiplyAdd(b1, wv, a12); a22 = Fma.MultiplyAdd(b2, wv, a22);
+                    wv = Avx.LoadVector256(w + stride3 + 32); a03 = Fma.MultiplyAdd(b0, wv, a03); a13 = Fma.MultiplyAdd(b1, wv, a13); a23 = Fma.MultiplyAdd(b2, wv, a23);
+                    b0 = Vector256.Create(p0[5]); b1 = Vector256.Create(p1[5]); b2 = Vector256.Create(p2[5]);
+                    wv = Avx.LoadVector256(w + 40); a00 = Fma.MultiplyAdd(b0, wv, a00); a10 = Fma.MultiplyAdd(b1, wv, a10); a20 = Fma.MultiplyAdd(b2, wv, a20);
+                    wv = Avx.LoadVector256(w + blockStride + 40); a01 = Fma.MultiplyAdd(b0, wv, a01); a11 = Fma.MultiplyAdd(b1, wv, a11); a21 = Fma.MultiplyAdd(b2, wv, a21);
+                    wv = Avx.LoadVector256(w + stride2 + 40); a02 = Fma.MultiplyAdd(b0, wv, a02); a12 = Fma.MultiplyAdd(b1, wv, a12); a22 = Fma.MultiplyAdd(b2, wv, a22);
+                    wv = Avx.LoadVector256(w + stride3 + 40); a03 = Fma.MultiplyAdd(b0, wv, a03); a13 = Fma.MultiplyAdd(b1, wv, a13); a23 = Fma.MultiplyAdd(b2, wv, a23);
+                    b0 = Vector256.Create(p0[6]); b1 = Vector256.Create(p1[6]); b2 = Vector256.Create(p2[6]);
+                    wv = Avx.LoadVector256(w + 48); a00 = Fma.MultiplyAdd(b0, wv, a00); a10 = Fma.MultiplyAdd(b1, wv, a10); a20 = Fma.MultiplyAdd(b2, wv, a20);
+                    wv = Avx.LoadVector256(w + blockStride + 48); a01 = Fma.MultiplyAdd(b0, wv, a01); a11 = Fma.MultiplyAdd(b1, wv, a11); a21 = Fma.MultiplyAdd(b2, wv, a21);
+                    wv = Avx.LoadVector256(w + stride2 + 48); a02 = Fma.MultiplyAdd(b0, wv, a02); a12 = Fma.MultiplyAdd(b1, wv, a12); a22 = Fma.MultiplyAdd(b2, wv, a22);
+                    wv = Avx.LoadVector256(w + stride3 + 48); a03 = Fma.MultiplyAdd(b0, wv, a03); a13 = Fma.MultiplyAdd(b1, wv, a13); a23 = Fma.MultiplyAdd(b2, wv, a23);
+                    b0 = Vector256.Create(p0[7]); b1 = Vector256.Create(p1[7]); b2 = Vector256.Create(p2[7]);
+                    wv = Avx.LoadVector256(w + 56); a00 = Fma.MultiplyAdd(b0, wv, a00); a10 = Fma.MultiplyAdd(b1, wv, a10); a20 = Fma.MultiplyAdd(b2, wv, a20);
+                    wv = Avx.LoadVector256(w + blockStride + 56); a01 = Fma.MultiplyAdd(b0, wv, a01); a11 = Fma.MultiplyAdd(b1, wv, a11); a21 = Fma.MultiplyAdd(b2, wv, a21);
+                    wv = Avx.LoadVector256(w + stride2 + 56); a02 = Fma.MultiplyAdd(b0, wv, a02); a12 = Fma.MultiplyAdd(b1, wv, a12); a22 = Fma.MultiplyAdd(b2, wv, a22);
+                    wv = Avx.LoadVector256(w + stride3 + 56); a03 = Fma.MultiplyAdd(b0, wv, a03); a13 = Fma.MultiplyAdd(b1, wv, a13); a23 = Fma.MultiplyAdd(b2, wv, a23);
+                    w += Block * Block;
+                }
+            }
+        }
+        Avx.Store(slot, a00); Avx.Store(slot + 8, a01); Avx.Store(slot + 16, a02); Avx.Store(slot + 24, a03);
+        if (count > 1) { Avx.Store(slot + 32, a10); Avx.Store(slot + 40, a11); Avx.Store(slot + 48, a12); Avx.Store(slot + 56, a13); }
+        if (count > 2) { Avx.Store(slot + 64, a20); Avx.Store(slot + 72, a21); Avx.Store(slot + 80, a22); Avx.Store(slot + 88, a23); }
+    }
+
+    /// <summary>
+    /// The AVX-512 form of <see cref="ForwardTripleRun"/>: six positions x the tile's 32 output channels as two 16-lane
+    /// registers (each joined from two of the packed 8-lane output blocks), twelve accumulators. Each output's FMA chain
+    /// is the AVX2 kernel's (same order, one rounding per FMA), so the results are bit-identical; the hosted CI runners
+    /// that lost to PyTorch were AVX-512 machines, where PyTorch's oneDNN kernels run 16-wide.
+    /// </summary>
+#if NET9_0_OR_GREATER
+    [MethodImpl(Hot)]
+    private static unsafe void ForwardSextetRun512(float* px, int* origin, float* w, long blockStride, int blocks,
+        int firstBlockOffset, int planeIn, int kernelHeight, int kernelWidth, int rowStep, int colStep,
+        float* slot, bool seeded, int count)
+    {
+        float* x0 = px + origin[0], x1 = px + origin[1], x2 = px + origin[2];
+        float* x3 = px + origin[3], x4 = px + origin[4], x5 = px + origin[5];
+        Vector512<float> a0l, a0h, a1l, a1h, a2l, a2h, a3l, a3h, a4l, a4h, a5l, a5h;
+        if (seeded)
+        {
+            // Slots past the real positions repeat the last real one (their origins do too), so their sums are discarded.
+            float* s0 = slot;
+            float* s1 = slot + 32 * Math.Min(1, count - 1);
+            float* s2 = slot + 32 * Math.Min(2, count - 1);
+            float* s3 = slot + 32 * Math.Min(3, count - 1);
+            float* s4 = slot + 32 * Math.Min(4, count - 1);
+            float* s5 = slot + 32 * Math.Min(5, count - 1);
+            a0l = Vector512.Load(s0); a0h = Vector512.Load(s0 + 16);
+            a1l = Vector512.Load(s1); a1h = Vector512.Load(s1 + 16);
+            a2l = Vector512.Load(s2); a2h = Vector512.Load(s2 + 16);
+            a3l = Vector512.Load(s3); a3h = Vector512.Load(s3 + 16);
+            a4l = Vector512.Load(s4); a4h = Vector512.Load(s4 + 16);
+            a5l = Vector512.Load(s5); a5h = Vector512.Load(s5 + 16);
+        }
+        else
+        {
+            a0l = Vector512<float>.Zero; a0h = a0l; a1l = a0l; a1h = a0l; a2l = a0l; a2h = a0l;
+            a3l = a0l; a3h = a0l; a4l = a0l; a4h = a0l; a5l = a0l; a5h = a0l;
+        }
+        long stride2 = 2 * blockStride, stride3 = 3 * blockStride;
+        for (int cb = 0; cb < blocks; cb++)
+        {
+            int blockOffset = firstBlockOffset + cb * planeIn;
+            for (int y = 0; y < kernelHeight; y++)
+            {
+                int rowOffset = blockOffset + y * rowStep;
+                for (int x = 0; x < kernelWidth; x++)
+                {
+                    int tapOffset = rowOffset + x * colStep;
+                    float* p0 = x0 + tapOffset, p1 = x1 + tapOffset, p2 = x2 + tapOffset;
+                    float* p3 = x3 + tapOffset, p4 = x4 + tapOffset, p5 = x5 + tapOffset;
+                    for (int c = 0; c < Block; c++)
+                    {
+                        // Output channels 0-15 of the tile are packed blocks 0 and 1, 16-31 blocks 2 and 3.
+                        var wl = Vector512.Create(Vector256.Load(w), Vector256.Load(w + blockStride));
+                        var wh = Vector512.Create(Vector256.Load(w + stride2), Vector256.Load(w + stride3));
+                        var b = Vector512.Create(p0[c]);
+                        a0l = Vector512.FusedMultiplyAdd(b, wl, a0l); a0h = Vector512.FusedMultiplyAdd(b, wh, a0h);
+                        b = Vector512.Create(p1[c]);
+                        a1l = Vector512.FusedMultiplyAdd(b, wl, a1l); a1h = Vector512.FusedMultiplyAdd(b, wh, a1h);
+                        b = Vector512.Create(p2[c]);
+                        a2l = Vector512.FusedMultiplyAdd(b, wl, a2l); a2h = Vector512.FusedMultiplyAdd(b, wh, a2h);
+                        b = Vector512.Create(p3[c]);
+                        a3l = Vector512.FusedMultiplyAdd(b, wl, a3l); a3h = Vector512.FusedMultiplyAdd(b, wh, a3h);
+                        b = Vector512.Create(p4[c]);
+                        a4l = Vector512.FusedMultiplyAdd(b, wl, a4l); a4h = Vector512.FusedMultiplyAdd(b, wh, a4h);
+                        b = Vector512.Create(p5[c]);
+                        a5l = Vector512.FusedMultiplyAdd(b, wl, a5l); a5h = Vector512.FusedMultiplyAdd(b, wh, a5h);
+                        w += Block;
+                    }
+                }
+            }
+        }
+        a0l.Store(slot); a0h.Store(slot + 16);
+        if (count > 1) { a1l.Store(slot + 32); a1h.Store(slot + 48); }
+        if (count > 2) { a2l.Store(slot + 64); a2h.Store(slot + 80); }
+        if (count > 3) { a3l.Store(slot + 96); a3h.Store(slot + 112); }
+        if (count > 4) { a4l.Store(slot + 128); a4h.Store(slot + 144); }
+        if (count > 5) { a5l.Store(slot + 160); a5h.Store(slot + 176); }
+    }
+#else
+    private static unsafe void ForwardSextetRun512(float* px, int* origin, float* w, long blockStride, int blocks,
+        int firstBlockOffset, int planeIn, int kernelHeight, int kernelWidth, int rowStep, int colStep,
+        float* slot, bool seeded, int count) => throw new PlatformNotSupportedException();
+#endif
+
+#if NET9_0_OR_GREATER
+    /// <summary>Positions per <see cref="ForwardRowRun512"/> call.</summary>
+    private const int RowPositions512 = 12;
+
+    /// <summary>Whether the AVX-512 forward takes <see cref="ForwardRowRun512"/> for row-contiguous positions (A/B switch,
+    /// AIDOTNET_DIRECT_CONV_ROW512=0 turns it off; tests).</summary>
+    internal static bool s_useRowKernel512 = Environment.GetEnvironmentVariable("AIDOTNET_DIRECT_CONV_ROW512") != "0";
+
+    /// <summary>
+    /// <see cref="ForwardSextetRun512"/> for twelve positions consecutive along a grid row of a stride-1 conv: position k
+    /// reads the packed input at <paramref name="x"/> + k Block, so one pointer with constant offsets addresses all twelve
+    /// (twelve separate pointers spilled the general registers), and the 24 accumulators fill the zmm file. Each output's
+    /// FMA chain is the AVX2 kernel's: bit-identical results.
+    /// </summary>
+    [MethodImpl(Hot)]
+    private static unsafe void ForwardRowRun512(float* x, float* w, long blockStride, int blocks,
+        int firstBlockOffset, int planeIn, int kernelHeight, int kernelWidth, int rowStep, int colStep,
+        float* slot, bool seeded)
+    {
+        Vector512<float> a0l, a0h, a1l, a1h, a2l, a2h, a3l, a3h, a4l, a4h, a5l, a5h, a6l, a6h, a7l, a7h, a8l, a8h, a9l, a9h, a10l, a10h, a11l, a11h;
+        if (seeded)
+        {
+            a0l = Vector512.Load(slot + 0); a0h = Vector512.Load(slot + 16);
+            a1l = Vector512.Load(slot + 32); a1h = Vector512.Load(slot + 48);
+            a2l = Vector512.Load(slot + 64); a2h = Vector512.Load(slot + 80);
+            a3l = Vector512.Load(slot + 96); a3h = Vector512.Load(slot + 112);
+            a4l = Vector512.Load(slot + 128); a4h = Vector512.Load(slot + 144);
+            a5l = Vector512.Load(slot + 160); a5h = Vector512.Load(slot + 176);
+            a6l = Vector512.Load(slot + 192); a6h = Vector512.Load(slot + 208);
+            a7l = Vector512.Load(slot + 224); a7h = Vector512.Load(slot + 240);
+            a8l = Vector512.Load(slot + 256); a8h = Vector512.Load(slot + 272);
+            a9l = Vector512.Load(slot + 288); a9h = Vector512.Load(slot + 304);
+            a10l = Vector512.Load(slot + 320); a10h = Vector512.Load(slot + 336);
+            a11l = Vector512.Load(slot + 352); a11h = Vector512.Load(slot + 368);
+        }
+        else
+        {
+            a0l = Vector512<float>.Zero; a0h = a0l;
+            a1l = a0l; a1h = a0l; a2l = a0l; a2h = a0l; a3l = a0l; a3h = a0l; a4l = a0l; a4h = a0l; a5l = a0l; a5h = a0l; a6l = a0l; a6h = a0l; a7l = a0l; a7h = a0l; a8l = a0l; a8h = a0l; a9l = a0l; a9h = a0l; a10l = a0l; a10h = a0l; a11l = a0l; a11h = a0l;
+        }
+        long stride2 = 2 * blockStride, stride3 = 3 * blockStride;
+        for (int cb = 0; cb < blocks; cb++)
+        {
+            int blockOffset = firstBlockOffset + cb * planeIn;
+            for (int y = 0; y < kernelHeight; y++)
+            {
+                int rowOffset = blockOffset + y * rowStep;
+                for (int t = 0; t < kernelWidth; t++)
+                {
+                    float* p = x + rowOffset + t * colStep;
+                    for (int c = 0; c < Block; c++)
+                    {
+                        // Output channels 0-15 of the tile are packed blocks 0 and 1, 16-31 blocks 2 and 3.
+                        var wl = Vector512.Create(Vector256.Load(w), Vector256.Load(w + blockStride));
+                        var wh = Vector512.Create(Vector256.Load(w + stride2), Vector256.Load(w + stride3));
+                        Vector512<float> b;
+                        b = Vector512.Create(p[c]); a0l = Vector512.FusedMultiplyAdd(b, wl, a0l); a0h = Vector512.FusedMultiplyAdd(b, wh, a0h);
+                        b = Vector512.Create(p[8 + c]); a1l = Vector512.FusedMultiplyAdd(b, wl, a1l); a1h = Vector512.FusedMultiplyAdd(b, wh, a1h);
+                        b = Vector512.Create(p[16 + c]); a2l = Vector512.FusedMultiplyAdd(b, wl, a2l); a2h = Vector512.FusedMultiplyAdd(b, wh, a2h);
+                        b = Vector512.Create(p[24 + c]); a3l = Vector512.FusedMultiplyAdd(b, wl, a3l); a3h = Vector512.FusedMultiplyAdd(b, wh, a3h);
+                        b = Vector512.Create(p[32 + c]); a4l = Vector512.FusedMultiplyAdd(b, wl, a4l); a4h = Vector512.FusedMultiplyAdd(b, wh, a4h);
+                        b = Vector512.Create(p[40 + c]); a5l = Vector512.FusedMultiplyAdd(b, wl, a5l); a5h = Vector512.FusedMultiplyAdd(b, wh, a5h);
+                        b = Vector512.Create(p[48 + c]); a6l = Vector512.FusedMultiplyAdd(b, wl, a6l); a6h = Vector512.FusedMultiplyAdd(b, wh, a6h);
+                        b = Vector512.Create(p[56 + c]); a7l = Vector512.FusedMultiplyAdd(b, wl, a7l); a7h = Vector512.FusedMultiplyAdd(b, wh, a7h);
+                        b = Vector512.Create(p[64 + c]); a8l = Vector512.FusedMultiplyAdd(b, wl, a8l); a8h = Vector512.FusedMultiplyAdd(b, wh, a8h);
+                        b = Vector512.Create(p[72 + c]); a9l = Vector512.FusedMultiplyAdd(b, wl, a9l); a9h = Vector512.FusedMultiplyAdd(b, wh, a9h);
+                        b = Vector512.Create(p[80 + c]); a10l = Vector512.FusedMultiplyAdd(b, wl, a10l); a10h = Vector512.FusedMultiplyAdd(b, wh, a10h);
+                        b = Vector512.Create(p[88 + c]); a11l = Vector512.FusedMultiplyAdd(b, wl, a11l); a11h = Vector512.FusedMultiplyAdd(b, wh, a11h);
+                        w += Block;
+                    }
+                }
+            }
+        }
+        a0l.Store(slot + 0); a0h.Store(slot + 16);
+        a1l.Store(slot + 32); a1h.Store(slot + 48);
+        a2l.Store(slot + 64); a2h.Store(slot + 80);
+        a3l.Store(slot + 96); a3h.Store(slot + 112);
+        a4l.Store(slot + 128); a4h.Store(slot + 144);
+        a5l.Store(slot + 160); a5h.Store(slot + 176);
+        a6l.Store(slot + 192); a6h.Store(slot + 208);
+        a7l.Store(slot + 224); a7h.Store(slot + 240);
+        a8l.Store(slot + 256); a8h.Store(slot + 272);
+        a9l.Store(slot + 288); a9h.Store(slot + 304);
+        a10l.Store(slot + 320); a10h.Store(slot + 336);
+        a11l.Store(slot + 352); a11h.Store(slot + 368);
+    }
+#else
+    private const int RowPositions512 = 12;
+    internal static bool s_useRowKernel512;
+    private static unsafe void ForwardRowRun512(float* x, float* w, long blockStride, int blocks,
+        int firstBlockOffset, int planeIn, int kernelHeight, int kernelWidth, int rowStep, int colStep,
+        float* slot, bool seeded) => throw new PlatformNotSupportedException();
+#endif
+
+    /// <summary>Positions per <see cref="ForwardSextetRun512"/> call.</summary>
+    private const int Avx512Positions = 6;
+
+    /// <summary>Whether <see cref="ForwardTileRuns"/> runs the AVX-512 kernel (switch for A/B and tests).</summary>
+    internal static bool s_useAvx512 = Environment.GetEnvironmentVariable("AIDOTNET_DIRECT_CONV_AVX512") != "0";
+
+    // Vector512.FusedMultiplyAdd (one rounding, like Fma.MultiplyAdd) is .NET 9+. Written with the cross-platform
+    // Vector512 API, the kernel is AVX-512 where the hardware accelerates it and a correct software fallback elsewhere,
+    // which s_forceAvx512ForTest uses to test it on AVX2-only hosts.
+#if NET9_0_OR_GREATER
+    private static bool UseAvx512Forward => s_useAvx512 && (Vector512.IsHardwareAccelerated || s_forceAvx512ForTest);
+#else
+    private static bool UseAvx512Forward => false;
+#endif
+
+    /// <summary>Test hook: run the AVX-512 kernel on hosts without AVX-512 (software Vector512, slow but exact).</summary>
+    internal static bool s_forceAvx512ForTest;
+
+    /// <summary>Positions per run of <see cref="ForwardTileRuns"/> (tuning; capped at <see cref="MaxForwardRunPositions"/>).</summary>
+    internal static int s_forwardRunPositions = 48;
+    private const int MaxForwardRunPositions = 192;
+
+    /// <summary>Bytes of kernel slice one <see cref="ForwardTileRuns"/> pass may span: what stays in L1 beside the run's input rows.</summary>
+    internal static int s_forwardRunPassKernelBytes = 16 * 1024;
+
+    /// <summary>Input blocks per <see cref="ForwardTileRuns"/> pass: the most whose tile kernel slice fits the L1 budget.</summary>
+    internal static int ForwardRunInputBlocksPerPass(int inBlocks, int taps)
+    {
+        int perBlock = taps * Block * Block * OutputBlocksPerTile * sizeof(float);
+        int fit = Math.Max(1, s_forwardRunPassKernelBytes / Math.Max(1, perBlock));
+        if (fit >= inBlocks) return inBlocks;
+        int passes = (inBlocks + fit - 1) / fit;
+        return (inBlocks + passes - 1) / passes;
+    }
+
     [MethodImpl(Hot)]
     private static unsafe void ForwardTile(float[] packedInput, float[] packedKernel, int kernelOffset, float[] output, int outputOffset,
         bool accumulate, in ForwardGeometry g, int tile, int first, int last)
@@ -741,6 +1246,14 @@ internal static class DirectConvAvx2
                 float* x0 = px + g.InputOrigin(q);
                 float* x1 = px + g.InputOrigin(count > 1 ? q + 1 : q);
                 float* x2 = px + g.InputOrigin(count > 2 ? q + 2 : q);
+                // Each position's output base, computed before any accumulator is live: in a method this size the JIT
+                // leaves OutputIndex a call, and a call while the accumulators were live (all ymm registers are
+                // caller-saved on Unix) made RyuJIT keep all twelve on the stack through the FMA loop.
+                float* o = po + outputOffset;
+                long outPlane = g.OutPlane;
+                float* d0 = PositionBase(o, g, channelBase, q);
+                float* d1 = PositionBase(o, g, channelBase, count > 1 ? q + 1 : q);
+                float* d2 = PositionBase(o, g, channelBase, count > 2 ? q + 2 : q);
                 Vector256<float> a00, a01, a02, a03, a10, a11, a12, a13, a20, a21, a22, a23;
                 if (!seeded)
                 {
@@ -760,9 +1273,13 @@ internal static class DirectConvAvx2
                 }
                 else
                 {
-                    LoadPosition(po + outputOffset, g, channelBase, q, out a00, out a01, out a02, out a03);
-                    LoadPosition(po + outputOffset, g, channelBase, count > 1 ? q + 1 : q, out a10, out a11, out a12, out a13);
-                    LoadPosition(po + outputOffset, g, channelBase, count > 2 ? q + 2 : q, out a20, out a21, out a22, out a23);
+                    long blockStep = Block * outPlane;
+                    a00 = LoadLanes(d0, outPlane); a01 = LoadLanes(d0 + blockStep, outPlane);
+                    a02 = LoadLanes(d0 + 2 * blockStep, outPlane); a03 = LoadLanes(d0 + 3 * blockStep, outPlane);
+                    a10 = LoadLanes(d1, outPlane); a11 = LoadLanes(d1 + blockStep, outPlane);
+                    a12 = LoadLanes(d1 + 2 * blockStep, outPlane); a13 = LoadLanes(d1 + 3 * blockStep, outPlane);
+                    a20 = LoadLanes(d2, outPlane); a21 = LoadLanes(d2 + blockStep, outPlane);
+                    a22 = LoadLanes(d2 + 2 * blockStep, outPlane); a23 = LoadLanes(d2 + 3 * blockStep, outPlane);
                 }
                 float* w = passKernel;
                 for (int cb = cb0; cb < cbEnd; cb++)
@@ -775,10 +1292,12 @@ internal static class DirectConvAvx2
                         {
                             int tapOffset = rowOffset + x * colStep;
                             float* s0 = x0 + tapOffset, s1 = x1 + tapOffset, s2 = x2 + tapOffset;
-                            // The tap's 8 input channels, two per iteration, addressed by pointer bumps.
-                            for (int c = 0; c < Block; c += 2)
+                            // The tap's 8 input channels, one per iteration, addressed by pointer bumps. Two per
+                            // iteration made RyuJIT spill eight accumulators to the stack and reload them on every
+                            // iteration (all 16 ymm registers live across the hand-unrolled halves).
+                            for (int c = 0; c < Block; c++)
                             {
-                                var b0 = Vector256.Create(s0[0]); var b1 = Vector256.Create(s1[0]); var b2 = Vector256.Create(s2[0]);
+                                var b0 = Vector256.Create(s0[c]); var b1 = Vector256.Create(s1[c]); var b2 = Vector256.Create(s2[c]);
                                 var wv = Avx.LoadVector256(w);
                                 a00 = Fma.MultiplyAdd(b0, wv, a00); a10 = Fma.MultiplyAdd(b1, wv, a10); a20 = Fma.MultiplyAdd(b2, wv, a20);
                                 wv = Avx.LoadVector256(w + blockStride);
@@ -787,18 +1306,7 @@ internal static class DirectConvAvx2
                                 a02 = Fma.MultiplyAdd(b0, wv, a02); a12 = Fma.MultiplyAdd(b1, wv, a12); a22 = Fma.MultiplyAdd(b2, wv, a22);
                                 wv = Avx.LoadVector256(w + 3 * blockStride);
                                 a03 = Fma.MultiplyAdd(b0, wv, a03); a13 = Fma.MultiplyAdd(b1, wv, a13); a23 = Fma.MultiplyAdd(b2, wv, a23);
-
-                                b0 = Vector256.Create(s0[1]); b1 = Vector256.Create(s1[1]); b2 = Vector256.Create(s2[1]);
-                                wv = Avx.LoadVector256(w + Block);
-                                a00 = Fma.MultiplyAdd(b0, wv, a00); a10 = Fma.MultiplyAdd(b1, wv, a10); a20 = Fma.MultiplyAdd(b2, wv, a20);
-                                wv = Avx.LoadVector256(w + Block + blockStride);
-                                a01 = Fma.MultiplyAdd(b0, wv, a01); a11 = Fma.MultiplyAdd(b1, wv, a11); a21 = Fma.MultiplyAdd(b2, wv, a21);
-                                wv = Avx.LoadVector256(w + Block + 2 * blockStride);
-                                a02 = Fma.MultiplyAdd(b0, wv, a02); a12 = Fma.MultiplyAdd(b1, wv, a12); a22 = Fma.MultiplyAdd(b2, wv, a22);
-                                wv = Avx.LoadVector256(w + Block + 3 * blockStride);
-                                a03 = Fma.MultiplyAdd(b0, wv, a03); a13 = Fma.MultiplyAdd(b1, wv, a13); a23 = Fma.MultiplyAdd(b2, wv, a23);
-
-                                s0 += 2; s1 += 2; s2 += 2; w += 2 * Block;
+                                w += Block;
                             }
                         }
                     }
@@ -820,9 +1328,9 @@ internal static class DirectConvAvx2
                 }
                 else
                 {
-                StorePosition(po + outputOffset, accumulatePass, g, channelBase, q, a00, a01, a02, a03);
-                if (count > 1) StorePosition(po + outputOffset, accumulatePass, g, channelBase, q + 1, a10, a11, a12, a13);
-                if (count > 2) StorePosition(po + outputOffset, accumulatePass, g, channelBase, q + 2, a20, a21, a22, a23);
+                StorePosition(d0, outPlane, accumulatePass, a00, a01, a02, a03);
+                if (count > 1) StorePosition(d1, outPlane, accumulatePass, a10, a11, a12, a13);
+                if (count > 2) StorePosition(d2, outPlane, accumulatePass, a20, a21, a22, a23);
                 }
             }
             }
@@ -849,14 +1357,112 @@ internal static class DirectConvAvx2
     private static unsafe void FlushStage(float* output, bool accumulate, in ForwardGeometry g, int channelBase, int q0, int run, float* stage)
     {
         int index = g.OutputIndex(q0, out int b);
-        float* d = output + ((long)b * g.OutChannels + channelBase) * g.OutPlane + index;
+        long plane = g.OutPlane;
+        float* d = output + ((long)b * g.OutChannels + channelBase) * plane + index;
+        // Eight positions x eight channels at a time through a register transpose (the scalar walk was 8% of a forward).
+        int vectorRun = run & ~(Block - 1);
+        for (int i = 0; i < vectorRun; i += Block)
+            for (int cb = 0; cb < 32; cb += Block)
+                Transpose8(stage + i * 32 + cb, 32, d + cb * plane + i, plane, accumulate);
+        if (vectorRun == run) return;
         for (int ch = 0; ch < 32; ch++)
         {
-            float* dst = d + (long)ch * g.OutPlane;
-            if (accumulate) for (int i = 0; i < run; i++) dst[i] += stage[i * 32 + ch];
-            else for (int i = 0; i < run; i++) dst[i] = stage[i * 32 + ch];
+            float* dst = d + ch * plane;
+            if (accumulate) for (int i = vectorRun; i < run; i++) dst[i] += stage[i * 32 + ch];
+            else for (int i = vectorRun; i < run; i++) dst[i] = stage[i * 32 + ch];
         }
     }
+
+    // FlushStage for a run of a non-plain grid (a strided input gradient's phase), within one image: consecutive
+    // positions are StepW apart within a grid row, and a row wrap moves StepH output rows down. Phase grids are a few
+    // positions wide (4 at 8x8 stride 2), so runs that stopped at row ends were too short to amortize the passes.
+    [MethodImpl(Hot)]
+    private static unsafe void FlushStageStrided(float* output, bool accumulate, in ForwardGeometry g, int channelBase, int q0, int run, float* stage)
+    {
+        g.OutputIndex(q0, out int b);
+        long plane = g.OutPlane;
+        int* index = stackalloc int[MaxForwardRunPositions];
+        int gridWidth = g.GridWidth, column = q0 % g.GridPositions % gridWidth;
+        index[0] = g.OutputIndex(q0, out _);
+        for (int i = 1; i < run; i++)
+        {
+            if (++column == gridWidth) { column = 0; index[i] = g.OutputIndex(q0 + i, out _); }
+            else index[i] = index[i - 1] + g.StepW;
+        }
+        float* d = output + ((long)b * g.OutChannels + channelBase) * plane;
+        for (int ch = 0; ch < 32; ch++)
+        {
+            float* dst = d + ch * plane;
+            if (accumulate) for (int i = 0; i < run; i++) dst[index[i]] += stage[i * 32 + ch];
+            else for (int i = 0; i < run; i++) dst[index[i]] = stage[i * 32 + ch];
+        }
+    }
+
+    /// <summary>
+    /// Transposes an 8x8 float block: row r of the source (<paramref name="s"/> + r * <paramref name="sStride"/>) becomes
+    /// column r of the destination, stored over (or added to) the destination rows.
+    /// </summary>
+    [MethodImpl(HotInline)]
+    private static unsafe void Transpose8(float* s, long sStride, float* d, long dStride, bool accumulate)
+    {
+        var r0 = Avx.LoadVector256(s); var r1 = Avx.LoadVector256(s + sStride);
+        var r2 = Avx.LoadVector256(s + 2 * sStride); var r3 = Avx.LoadVector256(s + 3 * sStride);
+        var r4 = Avx.LoadVector256(s + 4 * sStride); var r5 = Avx.LoadVector256(s + 5 * sStride);
+        var r6 = Avx.LoadVector256(s + 6 * sStride); var r7 = Avx.LoadVector256(s + 7 * sStride);
+        var t0 = Avx.UnpackLow(r0, r1); var t1 = Avx.UnpackHigh(r0, r1);
+        var t2 = Avx.UnpackLow(r2, r3); var t3 = Avx.UnpackHigh(r2, r3);
+        var t4 = Avx.UnpackLow(r4, r5); var t5 = Avx.UnpackHigh(r4, r5);
+        var t6 = Avx.UnpackLow(r6, r7); var t7 = Avx.UnpackHigh(r6, r7);
+        var u0 = Avx.Shuffle(t0, t2, 0x44); var u1 = Avx.Shuffle(t0, t2, 0xEE);
+        var u2 = Avx.Shuffle(t1, t3, 0x44); var u3 = Avx.Shuffle(t1, t3, 0xEE);
+        var u4 = Avx.Shuffle(t4, t6, 0x44); var u5 = Avx.Shuffle(t4, t6, 0xEE);
+        var u6 = Avx.Shuffle(t5, t7, 0x44); var u7 = Avx.Shuffle(t5, t7, 0xEE);
+        StoreRow(d, accumulate, Avx.Permute2x128(u0, u4, 0x20));
+        StoreRow(d + dStride, accumulate, Avx.Permute2x128(u1, u5, 0x20));
+        StoreRow(d + 2 * dStride, accumulate, Avx.Permute2x128(u2, u6, 0x20));
+        StoreRow(d + 3 * dStride, accumulate, Avx.Permute2x128(u3, u7, 0x20));
+        StoreRow(d + 4 * dStride, accumulate, Avx.Permute2x128(u0, u4, 0x31));
+        StoreRow(d + 5 * dStride, accumulate, Avx.Permute2x128(u1, u5, 0x31));
+        StoreRow(d + 6 * dStride, accumulate, Avx.Permute2x128(u2, u6, 0x31));
+        StoreRow(d + 7 * dStride, accumulate, Avx.Permute2x128(u3, u7, 0x31));
+    }
+
+    // Transposes the 8x8 block at s (rows sStride apart); column c0 + j's 8 values go to the packed forward kernel's
+    // (tap, input lane) slot d[(tap * 8 + il) * 8], where c0 + j = il * taps + tap.
+    [MethodImpl(HotInline)]
+    private static unsafe void TransposeScatter(float* s, long sStride, float* d, int c0, int taps)
+    {
+        var r0 = Avx.LoadVector256(s); var r1 = Avx.LoadVector256(s + sStride);
+        var r2 = Avx.LoadVector256(s + 2 * sStride); var r3 = Avx.LoadVector256(s + 3 * sStride);
+        var r4 = Avx.LoadVector256(s + 4 * sStride); var r5 = Avx.LoadVector256(s + 5 * sStride);
+        var r6 = Avx.LoadVector256(s + 6 * sStride); var r7 = Avx.LoadVector256(s + 7 * sStride);
+        var t0 = Avx.UnpackLow(r0, r1); var t1 = Avx.UnpackHigh(r0, r1);
+        var t2 = Avx.UnpackLow(r2, r3); var t3 = Avx.UnpackHigh(r2, r3);
+        var t4 = Avx.UnpackLow(r4, r5); var t5 = Avx.UnpackHigh(r4, r5);
+        var t6 = Avx.UnpackLow(r6, r7); var t7 = Avx.UnpackHigh(r6, r7);
+        var u0 = Avx.Shuffle(t0, t2, 0x44); var u1 = Avx.Shuffle(t0, t2, 0xEE);
+        var u2 = Avx.Shuffle(t1, t3, 0x44); var u3 = Avx.Shuffle(t1, t3, 0xEE);
+        var u4 = Avx.Shuffle(t4, t6, 0x44); var u5 = Avx.Shuffle(t4, t6, 0xEE);
+        var u6 = Avx.Shuffle(t5, t7, 0x44); var u7 = Avx.Shuffle(t5, t7, 0xEE);
+        Avx.Store(d + PackedSlot(c0, taps), Avx.Permute2x128(u0, u4, 0x20));
+        Avx.Store(d + PackedSlot(c0 + 1, taps), Avx.Permute2x128(u1, u5, 0x20));
+        Avx.Store(d + PackedSlot(c0 + 2, taps), Avx.Permute2x128(u2, u6, 0x20));
+        Avx.Store(d + PackedSlot(c0 + 3, taps), Avx.Permute2x128(u3, u7, 0x20));
+        Avx.Store(d + PackedSlot(c0 + 4, taps), Avx.Permute2x128(u0, u4, 0x31));
+        Avx.Store(d + PackedSlot(c0 + 5, taps), Avx.Permute2x128(u1, u5, 0x31));
+        Avx.Store(d + PackedSlot(c0 + 6, taps), Avx.Permute2x128(u2, u6, 0x31));
+        Avx.Store(d + PackedSlot(c0 + 7, taps), Avx.Permute2x128(u3, u7, 0x31));
+    }
+
+    // Largest kernel (taps) the two-transpose input-gradient pack stages on the stack (7x7).
+    private const int MaxTransposePackTaps = 49;
+
+    [MethodImpl(HotInline)]
+    private static int PackedSlot(int column, int taps) => ((column % taps) * Block + column / taps) * Block;
+
+    [MethodImpl(HotInline)]
+    private static unsafe void StoreRow(float* d, bool accumulate, Vector256<float> v)
+        => Avx.Store(d, accumulate ? Avx.Add(Avx.LoadVector256(d), v) : v);
 
     // The reverse of FlushStage: `run` consecutive positions x 32 channels of the output into the stage.
     [MethodImpl(Hot)]
@@ -871,36 +1477,28 @@ internal static class DirectConvAvx2
         }
     }
 
-    // The reverse of StorePosition: position q's 32 output channels as four 8-channel vectors.
+    // Where position q's first channel (channelBase) sits in the NCHW output; its other channels follow a plane apart.
     [MethodImpl(HotInline)]
-    private static unsafe void LoadPosition(float* output, in ForwardGeometry g, int channelBase, int q,
-        out Vector256<float> v0, out Vector256<float> v1, out Vector256<float> v2, out Vector256<float> v3)
+    private static unsafe float* PositionBase(float* output, in ForwardGeometry g, int channelBase, int q)
     {
         int index = g.OutputIndex(q, out int b);
-        float* d = output + ((long)b * g.OutChannels + channelBase) * g.OutPlane + index;
-        long stride = g.OutPlane;
-        v0 = LoadLanes(d, stride);
-        v1 = LoadLanes(d + Block * stride, stride);
-        v2 = LoadLanes(d + 2 * Block * stride, stride);
-        v3 = LoadLanes(d + 3 * Block * stride, stride);
+        return output + ((long)b * g.OutChannels + channelBase) * g.OutPlane + index;
     }
     [MethodImpl(HotInline)]
     private static unsafe Vector256<float> LoadLanes(float* d, long stride)
         => Vector256.Create(d[0], d[stride], d[2 * stride], d[3 * stride], d[4 * stride], d[5 * stride], d[6 * stride], d[7 * stride]);
 
     [MethodImpl(HotInline)]
-    private static unsafe void StorePosition(float* output, bool accumulate, in ForwardGeometry g, int channelBase, int q,
+    private static unsafe void StorePosition(float* d, long outPlane, bool accumulate,
         Vector256<float> v0, Vector256<float> v1, Vector256<float> v2, Vector256<float> v3)
     {
-        int index = g.OutputIndex(q, out int b);
-        float* d = output + ((long)b * g.OutChannels + channelBase) * g.OutPlane + index;
-        StoreLanes(d, g.OutPlane, accumulate, v0);
-        StoreLanes(d + (long)Block * g.OutPlane, g.OutPlane, accumulate, v1);
-        StoreLanes(d + (long)2 * Block * g.OutPlane, g.OutPlane, accumulate, v2);
-        StoreLanes(d + (long)3 * Block * g.OutPlane, g.OutPlane, accumulate, v3);
+        StoreLanes(d, outPlane, accumulate, v0);
+        StoreLanes(d + Block * outPlane, outPlane, accumulate, v1);
+        StoreLanes(d + 2 * Block * outPlane, outPlane, accumulate, v2);
+        StoreLanes(d + 3 * Block * outPlane, outPlane, accumulate, v3);
     }
     [MethodImpl(HotInline)]
-    private static unsafe void StoreLanes(float* d, int stride, bool accumulate, Vector256<float> v)
+    private static unsafe void StoreLanes(float* d, long stride, bool accumulate, Vector256<float> v)
     {
         if (accumulate)
             for (int lane = 0; lane < Block; lane++) d[(long)lane * stride] += v.GetElement(lane);

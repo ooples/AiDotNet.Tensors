@@ -120,17 +120,18 @@ public class DeterministicParallelGemmContractTests
     [Fact]
     public void StreamingColumnTileWidth_MatchesActiveKernel()
     {
-        int expectedFloat = Avx512Streaming.IsSupported
-            ? Avx512Streaming.Fp32ColumnTileWidth
-            : Avx2Streaming.IsSupported
-                ? Avx2Streaming.Fp32ColumnTileWidth
+        // AVX2 ahead of AVX-512 (StreamingStrategy.RunSerial).
+        int expectedFloat = Avx2Streaming.IsSupported
+            ? Avx2Streaming.Fp32ColumnTileWidth
+            : Avx512Streaming.IsSupported
+                ? Avx512Streaming.Fp32ColumnTileWidth
                 : NeonStreaming.IsSupported
                     ? NeonStreaming.Fp32ColumnTileWidth
                     : 1;
-        int expectedDouble = Avx512Streaming.IsSupported
-            ? Avx512Streaming.Fp64ColumnTileWidth
-            : Avx2Streaming.IsSupported
-                ? Avx2Streaming.Fp64ColumnTileWidth
+        int expectedDouble = Avx2Streaming.IsSupported
+            ? Avx2Streaming.Fp64ColumnTileWidth
+            : Avx512Streaming.IsSupported
+                ? Avx512Streaming.Fp64ColumnTileWidth
                 : NeonStreaming.IsSupported
                     ? NeonStreaming.Fp64ColumnTileWidth
                     : PortableSimdStreaming.IsSupported

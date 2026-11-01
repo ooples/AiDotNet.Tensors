@@ -2200,8 +2200,11 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// <summary>Fill to run when deferred storage is first created; cleared once applied.</summary>
     private Action<TensorBase<T>>? _deferredInitializer;
 
-    /// <summary>Guards the one-time deferred allocation against concurrent first access.</summary>
-    private readonly object _deferredLock = new();
+    /// <summary>
+    /// Guards the one-time deferred allocation against concurrent first access. Created on first use: only deferred
+    /// weights take it, and every tensor (each op result) would otherwise allocate one.
+    /// </summary>
+    private object? _deferredLock;
 
     /// <summary>
     /// Set only once the buffer exists AND the initializer has finished. Storage presence alone is
@@ -2246,7 +2249,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     private void MaterializeDeferredStorage()
     {
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
-        lock (_deferredLock)
+        lock (System.Threading.LazyInitializer.EnsureInitialized(ref _deferredLock)!)
         {
             // Re-check inside the lock: another thread may have finished while we waited.
             if (_deferredReady) return;
@@ -3209,6 +3212,9 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         }
         if (_storage.TryGetBackingArraySegmentForReadOnlyAccess(out var array, out int baseOffset))
         {
+            // The caller reads the array directly: run a pending device download first (a no-op field read when
+            // nothing is pending), as GetReadOnlyDataArray does.
+            _storage.GetVector().SyncHostFromDevice();
             storageOffset = checked(baseOffset + _storageOffset);
             return array;
         }
@@ -3240,6 +3246,9 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
 
         if (_storage.TryGetBackingArraySegment(out var array, out int baseOffset))
         {
+            // Make the host copy current before it escapes: an accumulating caller reads it, and a pending download
+            // left behind an overwrite would later run and replace the caller's result with the stale device data.
+            _storage.GetVector().SyncHostFromDevice();
             storageOffset = checked(baseOffset + _storageOffset);
             return array;
         }

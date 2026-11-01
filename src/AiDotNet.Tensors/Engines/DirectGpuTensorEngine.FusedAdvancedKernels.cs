@@ -35,6 +35,7 @@ public partial class DirectGpuTensorEngine
         Tensor<float> loraB,
         float scaling)
     {
+        using var __gpuOp = EnterGpuOp();
         if (output is null) throw new ArgumentNullException(nameof(output));
         ValidateLoRA(input, baseOutput, loraA, loraB, out int batch, out int inFeat, out int rank, out int outFeat);
         if (output.Rank != 2 || output.Shape[0] != batch || output.Shape[1] != outFeat)
@@ -85,6 +86,7 @@ public partial class DirectGpuTensorEngine
         float alphaBarT,
         float alphaBarTMinus1)
     {
+        using var __gpuOp = EnterGpuOp();
         if (output is null) throw new ArgumentNullException(nameof(output));
         ValidateDDIM(xT, epsilonTheta, alphaBarT, alphaBarTMinus1);
         // Shape-preserving op: output's shape must exactly match xT, not just
@@ -148,6 +150,7 @@ public partial class DirectGpuTensorEngine
         Tensor<float>? bias,
         FusedActivationType activation)
     {
+        using var __gpuOp = EnterGpuOp();
         if (output is null) throw new ArgumentNullException(nameof(output));
         ValidateSparseLinear(input, sparseRowOffsets, sparseColIndices, sparseValues, bias,
             out int batch, out int inFeat, out int outFeat, out int nnz);
