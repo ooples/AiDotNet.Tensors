@@ -129,6 +129,7 @@ public class SimdGemmDirectParallel2DTests
     // The transposed-A GEMM (a dense layer's dW = Xt*dY): full 6-row blocks take 32-column steps on the 512-bit tile.
     [SkippableTheory]
     [InlineData(784, 64, 512)]    // the parity MLP's first-layer dW
+    [InlineData(784, 128, 512)]   // the same at batch 128
     [InlineData(30, 17, 80)]      // 2 full 32-column steps, then a 16-column step
     [InlineData(29, 9, 70)]       // a 4-row remainder block, a scalar row, and a 6-column tail (mFull = 28)
     public void Vector512TransATile_IsBitIdenticalTo256BitTiles(int m, int k, int n)
@@ -140,16 +141,30 @@ public class SimdGemmDirectParallel2DTests
         var narrow = new float[m * n];
         var wide = new float[m * n];
         bool? before = SimdGemm.s_forceVector512Direct;
+        int beforeOrder = SimdGemm.s_transAOrder;
         try
         {
             SimdGemm.s_forceVector512Direct = false;
             SimdGemm.SgemmDirectParallelMIntoTransA(a, b, narrow, m, k, n);
             SimdGemm.s_forceVector512Direct = true;
+            // Every loop order of the 512-bit tile (strip outer, packed A panels, row outer over packed B) runs the
+            // same chains; the last one run is checked against the reference below.
+            for (int order = 1; order <= 2; order++)
+            {
+                SimdGemm.s_transAOrder = order;
+                var ordered = new float[m * n];
+                SimdGemm.SgemmDirectParallelMIntoTransA(a, b, ordered, m, k, n);
+                for (int i = 0; i < narrow.Length; i++)
+                    Assert.True(BitConverter.SingleToInt32Bits(narrow[i]) == BitConverter.SingleToInt32Bits(ordered[i]),
+                        $"order {order} C[{i / n},{i % n}]: 256-bit {narrow[i]:G9}, 512-bit {ordered[i]:G9}");
+            }
+            SimdGemm.s_transAOrder = 0;
             SimdGemm.SgemmDirectParallelMIntoTransA(a, b, wide, m, k, n);
         }
         finally
         {
             SimdGemm.s_forceVector512Direct = before;
+            SimdGemm.s_transAOrder = beforeOrder;
         }
         for (int i = 0; i < narrow.Length; i++)
             Assert.True(BitConverter.SingleToInt32Bits(narrow[i]) == BitConverter.SingleToInt32Bits(wide[i]),
