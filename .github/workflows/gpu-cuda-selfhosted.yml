@@ -130,6 +130,7 @@ jobs:
         FullyQualifiedName~.DirectGpuLinalgRoutingTests.|
         FullyQualifiedName~.StreamingTensorJournalTests.|
         FullyQualifiedName~.TensorCowInferenceReadPathTests.|
+        FullyQualifiedName~.TensorAddActivationTests.|
         FullyQualifiedName~.TensorGpuCachePhysicalTests.)&Category!=Benchmark&Category!=Performance&Category!=RequiresOpenCL
     defaults:
       run:
