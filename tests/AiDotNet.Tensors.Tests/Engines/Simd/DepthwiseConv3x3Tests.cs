@@ -59,6 +59,7 @@ public class DepthwiseConv3x3Tests
     [MemberData(nameof(ShapesAndKernels))]
     public void TheVectorKernelsMatchTheGenericLoops(int batch, int channels, int size, int stride, bool channelBlocks)
     {
+#if NET5_0_OR_GREATER
         int previousMaxWidth = DepthwiseConv3x3.s_channelBlockMaxWidth;
         int previousMaxWidth1 = DepthwiseConv3x3.s_channelBlockMaxWidthStride1;
         DepthwiseConv3x3.s_channelBlockMaxWidth = channelBlocks ? int.MaxValue : 0;
@@ -72,6 +73,10 @@ public class DepthwiseConv3x3Tests
             DepthwiseConv3x3.s_channelBlockMaxWidth = previousMaxWidth;
             DepthwiseConv3x3.s_channelBlockMaxWidthStride1 = previousMaxWidth1;
         }
+#else
+        // The channel-blocked kernels are .NET 5+ (AVX2 intrinsics): only the width kernels exist here.
+        Compare(batch, channels, size, stride);
+#endif
     }
 
     private static void Compare(int batch, int channels, int size, int stride)

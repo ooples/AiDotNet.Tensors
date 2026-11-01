@@ -1,4 +1,6 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
+// The kernel switches it sets are .NET 5+ (the nightly runs it on net10.0).
+#if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -208,3 +210,4 @@ public class CpuOpBreakdownBench
         return new Tensor<float>(data, shape);
     }
 }
+#endif
