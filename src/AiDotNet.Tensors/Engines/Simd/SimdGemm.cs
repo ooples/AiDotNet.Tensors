@@ -663,10 +663,12 @@ internal static partial class SimdGemm
 #endif
 
         // Cache-eligibility gate: if n > Nc, the outer loop iterates jc multiple
-        // times and our single-jc assumption breaks. Also skip if AVX-512 path is
-        // eligible (the specialised kernel's layout differs), and when this machine
+        // times and our single-jc assumption breaks. Also skip when this machine
         // cannot run the packed kernels at all (see PackedKernelsSupported).
-        if (n > Nc || Avx512Sgemm.CanUse || !PackedKernelsSupported)
+        // AVX-512 hosts take this path too: the gate once also skipped it there for "the AVX-512 kernel's layout",
+        // but SgemmAddInternal never runs an AVX-512 kernel, so it only cost those hosts the cached B pack and the
+        // direct small/medium kernels below (the same AVX2 kernels every AVX-512 CPU runs).
+        if (n > Nc || !PackedKernelsSupported)
         {
             c.Clear();
             SgemmAddInternal(a, k, false, b.AsSpan(), n, false, c, m, k, n,
@@ -982,7 +984,7 @@ internal static partial class SimdGemm
 
         // The same gate as the float cached-B entry above, including the machine that cannot run the
         // packed kernels: the int8 path dequantises into the very same MacroKernel.
-        if (n > Nc || Avx512Sgemm.CanUse || !PackedKernelsSupported)
+        if (n > Nc || !PackedKernelsSupported)
         {
             SgemmAddInternal(a, k, false, b.AsSpan(), n, false, c, m, k, n,
                 allowParallel: UseParallelGemm, clearedOutput: true);

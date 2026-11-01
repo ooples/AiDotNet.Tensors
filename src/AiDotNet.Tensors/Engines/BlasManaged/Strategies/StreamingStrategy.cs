@@ -370,8 +370,9 @@ internal static class StreamingStrategy
 
         if (typeof(T) == typeof(double))
         {
-            if (Avx512Streaming.IsSupported) return Avx512Streaming.Fp64ColumnTileWidth;
+            // AVX2 ahead of AVX-512: see RunSerial.
             if (Avx2Streaming.IsSupported) return Avx2Streaming.Fp64ColumnTileWidth;
+            if (Avx512Streaming.IsSupported) return Avx512Streaming.Fp64ColumnTileWidth;
             if (NeonStreaming.IsSupported) return NeonStreaming.Fp64ColumnTileWidth;
             if (PortableSimdStreaming.IsSupported) return PortableSimdStreaming.Fp64ColumnTileWidth;
             return ScalarColumnTileWidth;
@@ -379,8 +380,8 @@ internal static class StreamingStrategy
 
         if (typeof(T) == typeof(float))
         {
-            if (Avx512Streaming.IsSupported) return Avx512Streaming.Fp32ColumnTileWidth;
             if (Avx2Streaming.IsSupported) return Avx2Streaming.Fp32ColumnTileWidth;
+            if (Avx512Streaming.IsSupported) return Avx512Streaming.Fp32ColumnTileWidth;
             if (NeonStreaming.IsSupported) return NeonStreaming.Fp32ColumnTileWidth;
             return ScalarColumnTileWidth;
         }
@@ -405,8 +406,14 @@ internal static class StreamingStrategy
     }
 
     /// <summary>
-    /// Serial microkernel dispatch: AVX-512 → AVX2 → Neon → BCL <see cref="System.Numerics.Vector{T}"/>
+    /// Serial microkernel dispatch: AVX2 → AVX-512 → Neon → BCL <see cref="System.Numerics.Vector{T}"/>
     /// (FP64) → scalar.
+    /// <para>
+    /// AVX2 first on AVX-512 hosts too: <see cref="Avx2Streaming"/> has the multi-accumulator loops and a vectorized
+    /// NT (B transposed) kernel, while <see cref="Avx512Streaming"/> runs one accumulator per tile (bound by FMA latency),
+    /// leaves n &lt; 16 entirely scalar and sends every B-transposed product (a linear or convolution input gradient,
+    /// dY·Wᵀ) to the scalar kernel. On the nightly Xeon 8573C a 256→10 linear ran 25x PyTorch's time that way.
+    /// </para>
     /// </summary>
     private static void RunSerial<T>(
         ReadOnlySpan<T> a, int lda, bool transA,
@@ -416,18 +423,18 @@ internal static class StreamingStrategy
     {
         if (typeof(T) == typeof(double))
         {
-            if (Avx512Streaming.IsSupported)
+            if (Avx2Streaming.IsSupported)
             {
-                Avx512Streaming.RunFp64(
+                Avx2Streaming.RunFp64(
                     MemoryMarshal.Cast<T, double>(a), lda, transA,
                     MemoryMarshal.Cast<T, double>(b), ldb, transB,
                     MemoryMarshal.Cast<T, double>(c), ldc,
                     m, n, k);
                 return;
             }
-            if (Avx2Streaming.IsSupported)
+            if (Avx512Streaming.IsSupported)
             {
-                Avx2Streaming.RunFp64(
+                Avx512Streaming.RunFp64(
                     MemoryMarshal.Cast<T, double>(a), lda, transA,
                     MemoryMarshal.Cast<T, double>(b), ldb, transB,
                     MemoryMarshal.Cast<T, double>(c), ldc,
@@ -465,18 +472,18 @@ internal static class StreamingStrategy
         }
         if (typeof(T) == typeof(float))
         {
-            if (Avx512Streaming.IsSupported)
+            if (Avx2Streaming.IsSupported)
             {
-                Avx512Streaming.RunFp32(
+                Avx2Streaming.RunFp32(
                     MemoryMarshal.Cast<T, float>(a), lda, transA,
                     MemoryMarshal.Cast<T, float>(b), ldb, transB,
                     MemoryMarshal.Cast<T, float>(c), ldc,
                     m, n, k);
                 return;
             }
-            if (Avx2Streaming.IsSupported)
+            if (Avx512Streaming.IsSupported)
             {
-                Avx2Streaming.RunFp32(
+                Avx512Streaming.RunFp32(
                     MemoryMarshal.Cast<T, float>(a), lda, transA,
                     MemoryMarshal.Cast<T, float>(b), ldb, transB,
                     MemoryMarshal.Cast<T, float>(c), ldc,
