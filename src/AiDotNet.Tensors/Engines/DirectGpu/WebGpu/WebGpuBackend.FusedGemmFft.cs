@@ -2,8 +2,7 @@
 // One kernel each for GEMM and FFT members that were compositions of other backend members (TENS0008, #1638): the
 // swish and leaky-ReLU GEMM epilogues (a GEMM into a temporary, then the activation), the 2:4 sparse GEMMs (a dense
 // decompression of A, then a dense GEMM), the real FFT (a zero-filled imaginary buffer, then a complex transform that
-// wrote n bins into buffers sized for n/2 + 1), the 2-D FFT (row transforms, four transposes and four temporaries) and
-// the FP16 GEMM (an FP32 GEMM into a temporary, then a rounding pass).
+// wrote n bins into buffers sized for n/2 + 1), the 2-D FFT (row transforms, four transposes and four temporaries).
 
 #if NET7_0_OR_GREATER
 using System;
@@ -16,8 +15,6 @@ public sealed partial class WebGpuBackend
 
     /// <summary>Selector of the gemm_bias_epilogue entry point's activation.</summary>
     private enum GemmEpilogue { Swish = 0, LeakyRelu = 1 }
-
-    private const int HgemmTile = 16;
 
     // WebGpuKernels.FusedGemmBiasSource with the two activations it lacks; swish is its silu, leaky ReLU its leaky_relu.
     private const string GemmBiasEpilogueSource = @"
@@ -47,12 +44,11 @@ fn gemm_bias_epilogue(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 ";
 
-    // C = alpha * A * B + beta * C with A in the 2:4 layout of WebGpuKernels.Sparse2x4Source: per row, K / 2 kept values,
-    // each with its offset inside its block of four (u32 bits). Only the kept values are multiplied; C is not read when
-    // beta is zero, as in a BLAS GEMM.
+    // C = alpha * A * B + beta * C with A in the interface's 2:4 layout (Sparse24LayoutSource). Only the kept values are
+    // multiplied; C is not read when beta is zero, as in a BLAS GEMM.
     private const string Sparse24GemmSource = @"
 @group(0) @binding(0) var<storage, read> values: array<f32>;
-@group(0) @binding(1) var<storage, read> offsets: array<f32>;
+@group(0) @binding(1) var<storage, read> packed: array<u32>;
 @group(0) @binding(2) var<storage, read> B: array<f32>;
 @group(0) @binding(3) var<storage, read_write> C: array<f32>;
 struct SparseParams { M: u32, N: u32, K: u32, _p0: u32, alpha: f32, beta: f32, _p1: u32, _p2: u32, }
@@ -64,12 +60,13 @@ fn sparse24_gemm(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (idx >= params.M * params.N) { return; }
     let row = idx / params.N;
     let col = idx % params.N;
-    let kept = params.K / 2u;
+    let blocks = params.K / 4u;
     var acc: f32 = 0.0;
-    for (var s: u32 = 0u; s < kept; s = s + 1u) {
-        let v = row * kept + s;
-        let k = (s / 2u) * 4u + bitcast<u32>(offsets[v]);
-        acc = acc + values[v] * B[k * params.N + col];
+    for (var blk: u32 = 0u; blk < blocks; blk = blk + 1u) {
+        let g = row * blocks + blk;
+        let offsets = (packed[g / 4u] >> ((g % 4u) * 8u)) & 255u;
+        acc = acc + values[g * 2u] * B[(blk * 4u + (offsets & 3u)) * params.N + col];
+        acc = acc + values[g * 2u + 1u] * B[(blk * 4u + ((offsets >> 2u) & 3u)) * params.N + col];
     }
     if (params.beta == 0.0) {
         C[idx] = params.alpha * acc;
@@ -79,10 +76,72 @@ fn sparse24_gemm(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 ";
 
+    // The interface's 2:4 layout: per block of four, the two largest magnitudes (values, K / 2 per row) and one byte whose
+    // low two bit pairs are their offsets, lower offset first -- four blocks to a u32 word of the byte buffer. The
+    // selection is OpenCL's enforce_2_4_sparsity. (WebGpuKernels.Sparse2x4Source wrote one u32 per kept value, eight
+    // times the M * K / 4 bytes the contract allocates.) One invocation per word, so no two write the same word.
+    private const string Sparse24LayoutSource = @"
+@group(0) @binding(0) var<storage, read> dense: array<f32>;
+@group(0) @binding(1) var<storage, read_write> values: array<f32>;
+@group(0) @binding(2) var<storage, read_write> packed: array<u32>;
+struct LayoutParams { groups: u32, _p0: u32, _p1: u32, _p2: u32, }
+@group(0) @binding(3) var<uniform> params: LayoutParams;
+
+@compute @workgroup_size(256)
+fn sparse24_enforce(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let w = gid.x;
+    let first = w * 4u;
+    if (first >= params.groups) { return; }
+    var word = 0u;
+    for (var q: u32 = 0u; q < 4u; q = q + 1u) {
+        let g = first + q;
+        if (g >= params.groups) { break; }
+        var v: array<f32, 4>;
+        for (var i: u32 = 0u; i < 4u; i = i + 1u) { v[i] = dense[g * 4u + i]; }
+        var i0 = 0u;
+        var i1 = 1u;
+        var m0 = abs(v[0]);
+        var m1 = abs(v[1]);
+        if (m1 > m0) { i0 = 1u; i1 = 0u; let t = m0; m0 = m1; m1 = t; }
+        for (var i: u32 = 2u; i < 4u; i = i + 1u) {
+            let a = abs(v[i]);
+            if (a > m0) { i1 = i0; m1 = m0; i0 = i; m0 = a; }
+            else if (a > m1) { i1 = i; m1 = a; }
+        }
+        if (i0 > i1) { let t = i0; i0 = i1; i1 = t; }
+        values[g * 2u] = v[i0];
+        values[g * 2u + 1u] = v[i1];
+        word = word | (((i1 << 2u) | i0) << (q * 8u));
+    }
+    packed[w] = word;
+}
+";
+
+    private const string Sparse24DecompressSource = @"
+@group(0) @binding(0) var<storage, read> values: array<f32>;
+@group(0) @binding(1) var<storage, read> packed: array<u32>;
+@group(0) @binding(2) var<storage, read_write> dense: array<f32>;
+struct LayoutParams { count: u32, _p0: u32, _p1: u32, _p2: u32, }
+@group(0) @binding(3) var<uniform> params: LayoutParams;
+
+@compute @workgroup_size(256)
+fn sparse24_decompress(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.count) { return; }
+    let g = idx / 4u;
+    let lane = idx % 4u;
+    let offsets = (packed[g / 4u] >> ((g % 4u) * 8u)) & 255u;
+    var x: f32 = 0.0;
+    if (lane == (offsets & 3u)) { x = values[g * 2u]; }
+    else if (lane == ((offsets >> 2u) & 3u)) { x = values[g * 2u + 1u]; }
+    dense[idx] = x;
+}
+";
+
     // max(0, A * B + bias) with A in the same 2:4 layout.
     private const string Sparse24GemmBiasReluSource = @"
 @group(0) @binding(0) var<storage, read> values: array<f32>;
-@group(0) @binding(1) var<storage, read> offsets: array<f32>;
+@group(0) @binding(1) var<storage, read> packed: array<u32>;
 @group(0) @binding(2) var<storage, read> B: array<f32>;
 @group(0) @binding(3) var<storage, read> bias: array<f32>;
 @group(0) @binding(4) var<storage, read_write> output: array<f32>;
@@ -95,12 +154,13 @@ fn sparse24_gemm_bias_relu(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (idx >= params.M * params.N) { return; }
     let row = idx / params.N;
     let col = idx % params.N;
-    let kept = params.K / 2u;
+    let blocks = params.K / 4u;
     var acc: f32 = 0.0;
-    for (var s: u32 = 0u; s < kept; s = s + 1u) {
-        let v = row * kept + s;
-        let k = (s / 2u) * 4u + bitcast<u32>(offsets[v]);
-        acc = acc + values[v] * B[k * params.N + col];
+    for (var blk: u32 = 0u; blk < blocks; blk = blk + 1u) {
+        let g = row * blocks + blk;
+        let offsets = (packed[g / 4u] >> ((g % 4u) * 8u)) & 255u;
+        acc = acc + values[g * 2u] * B[(blk * 4u + (offsets & 3u)) * params.N + col];
+        acc = acc + values[g * 2u + 1u] * B[(blk * 4u + ((offsets >> 2u) & 3u)) * params.N + col];
     }
     output[idx] = max(0.0, acc + bias[col]);
 }
@@ -262,52 +322,6 @@ fn strided_dft(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 ";
 
-    // FP16 GEMM: 16 x 16 output tiles staged through workgroup memory, accumulated in f32, rounded once to FP16 precision
-    // with WebGpuKernels' f16_trunc (the rounding of ConvertToFp16). One workgroup per tile.
-    private const string HgemmSource = @"
-@group(0) @binding(0) var<storage, read> A: array<f32>;
-@group(0) @binding(1) var<storage, read> B: array<f32>;
-@group(0) @binding(2) var<storage, read_write> C: array<f32>;
-struct HgemmParams { M: u32, N: u32, K: u32, tiles_n: u32, }
-@group(0) @binding(3) var<uniform> params: HgemmParams;
-var<workgroup> a_tile: array<f32, 256>;
-var<workgroup> b_tile: array<f32, 256>;
-
-fn f16_trunc(val: f32) -> f32 {
-    let bits = bitcast<u32>(val);
-    let sign = (bits >> 31u) & 1u;
-    let exp_bits = (bits >> 23u) & 0xFFu;
-    let mantissa = bits & 0x7FFFFFu;
-    if (exp_bits == 0xFFu) { return val; }
-    let exp_val: i32 = i32(exp_bits) - 127;
-    if (exp_val < -14) { return select(-0.0, 0.0, sign == 0u); }
-    if (exp_val > 15) { return bitcast<f32>((sign << 31u) | 0x7F800000u); }
-    return bitcast<f32>((sign << 31u) | (exp_bits << 23u) | (mantissa & 0x7FE000u));
-}
-
-@compute @workgroup_size(256)
-fn hgemm_tiled(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let tile_row = wid.x / params.tiles_n;
-    let tile_col = wid.x % params.tiles_n;
-    let ly = lid.x / 16u;
-    let lx = lid.x % 16u;
-    let row = tile_row * 16u + ly;
-    let col = tile_col * 16u + lx;
-    var acc: f32 = 0.0;
-    let steps = (params.K + 15u) / 16u;
-    for (var t: u32 = 0u; t < steps; t = t + 1u) {
-        let ak = t * 16u + lx;
-        let bk = t * 16u + ly;
-        a_tile[lid.x] = select(0.0, A[row * params.K + ak], row < params.M && ak < params.K);
-        b_tile[lid.x] = select(0.0, B[bk * params.N + col], bk < params.K && col < params.N);
-        workgroupBarrier();
-        for (var i: u32 = 0u; i < 16u; i = i + 1u) { acc = acc + a_tile[ly * 16u + i] * b_tile[i * 16u + lx]; }
-        workgroupBarrier();
-    }
-    if (row < params.M && col < params.N) { C[row * params.N + col] = f16_trunc(acc); }
-}
-";
-
     public IGpuBuffer GemmBiasSwish(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
         => GemmBiasEpilogueKernel(A, B, bias, M, N, K, GemmEpilogue.Swish, 0f);
 
@@ -322,6 +336,24 @@ fn hgemm_tiled(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_
             new[] { A, B, bias, output }, new[] { Bits(M), Bits(N), Bits(K), Bits((int)epilogue), alpha, 0f, 0f, 0f },
             M * N).GetAwaiter().GetResult();
         return output;
+    }
+
+    public void Enforce2x4Sparsity(IGpuBuffer denseInput, IGpuBuffer sparseValues, IGpuBuffer sparseIndices, int M, int K)
+    {
+        ValidateSparse24(M, 1, K);
+        int groups = checked(M * (K / 4));
+        DispatchNBufferAsync(FusedGemmFftModuleName + ".Sparse24Layout", Sparse24LayoutSource, "sparse24_enforce",
+            new[] { denseInput, sparseValues, sparseIndices }, new[] { Bits(groups), 0f, 0f, 0f }, (groups + 3) / 4)
+            .GetAwaiter().GetResult();
+    }
+
+    public void Decompress2x4Sparse(IGpuBuffer sparseValues, IGpuBuffer sparseIndices, IGpuBuffer denseOutput, int M, int K)
+    {
+        ValidateSparse24(M, 1, K);
+        int count = checked(M * K);
+        DispatchNBufferAsync(FusedGemmFftModuleName + ".Sparse24Decompress", Sparse24DecompressSource, "sparse24_decompress",
+            new[] { sparseValues, sparseIndices, denseOutput }, new[] { Bits(count), 0f, 0f, 0f }, count)
+            .GetAwaiter().GetResult();
     }
 
     public void SparseGemm(IGpuBuffer sparseAValues, IGpuBuffer sparseAIndices, IGpuBuffer B, IGpuBuffer C,
@@ -449,11 +481,7 @@ fn hgemm_tiled(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_
     public void Hgemm(IGpuBuffer aFp16, IGpuBuffer bFp16, IGpuBuffer cFp16, int m, int n, int k)
     {
         ValidateHalfGemmArgs(aFp16, bFp16, cFp16, m, n, k);
-        int tilesN = (n + HgemmTile - 1) / HgemmTile;
-        int tiles = checked(((m + HgemmTile - 1) / HgemmTile) * tilesN);
-        DispatchNBufferAsync(FusedGemmFftModuleName + ".Hgemm", HgemmSource, "hgemm_tiled",
-            new[] { aFp16, bFp16, cFp16 }, new[] { Bits(m), Bits(n), Bits(k), Bits(tilesN) },
-            checked(tiles * HgemmTile * HgemmTile)).GetAwaiter().GetResult();
+        HalfGemm(aFp16, bFp16, cFp16, m, n, k, transA: false, transB: false, HalfGemmOutput.Half);
     }
 }
 #endif

@@ -209,34 +209,6 @@ public sealed partial class WebGpuBackend
             param, gradient, z, n, uniforms, size).GetAwaiter().GetResult();
     }
 
-    public void ConvertToFp16(IGpuBuffer input, IGpuBuffer output, int size)
-    {
-        // FP32 -> FP16 emulation: truncate mantissa to 10 bits via GPU kernel.
-        // WebGPU buffers are always f32, so we emulate FP16 by reducing precision
-        // (zeroing the bottom 13 mantissa bits). This matches IEEE 754 half-precision
-        // rounding behavior (round-toward-zero) and handles overflow/underflow.
-        var uniforms = new float[]
-        {
-            BitConverter.Int32BitsToSingle(size),
-            BitConverter.Int32BitsToSingle(0) // direction=0: to_fp16
-        };
-        Dispatch2BufferAsync("Fp16Convert", WebGpuKernels.Fp16ConvertSource, "fp16_convert",
-            input, output, uniforms, size).GetAwaiter().GetResult();
-    }
-
-    public void ConvertToFp32(IGpuBuffer input, IGpuBuffer output, int size)
-    {
-        // FP16 -> FP32: data is already stored as f32 with FP16-truncated precision.
-        // Simply copy the values through (they are valid f32 representations of FP16 values).
-        var uniforms = new float[]
-        {
-            BitConverter.Int32BitsToSingle(size),
-            BitConverter.Int32BitsToSingle(1) // direction=1: from_fp16
-        };
-        Dispatch2BufferAsync("Fp16Convert", WebGpuKernels.Fp16ConvertSource, "fp16_convert",
-            input, output, uniforms, size).GetAwaiter().GetResult();
-    }
-
     #endregion
 
     #region Specialized Layer Operations

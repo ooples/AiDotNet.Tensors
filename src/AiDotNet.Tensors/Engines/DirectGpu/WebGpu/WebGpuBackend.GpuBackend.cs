@@ -681,37 +681,6 @@ public sealed partial class WebGpuBackend
 
     #region Sparse Operations
 
-    public void Enforce2x4Sparsity(IGpuBuffer denseInput, IGpuBuffer sparseValues, IGpuBuffer sparseIndices, int M, int K)
-    {
-        int sparseK = K / 2;
-        var uniforms = new float[]
-        {
-            BitConverter.Int32BitsToSingle(M),
-            BitConverter.Int32BitsToSingle(K),
-            BitConverter.Int32BitsToSingle(sparseK),
-            0
-        };
-        int totalBlocks = M * (K / 4);
-        Dispatch3BufferAsync("Sparse2x4", WebGpuKernels.Sparse2x4Source, "enforce_2x4_sparsity",
-            denseInput, sparseValues, sparseIndices, uniforms, totalBlocks).GetAwaiter().GetResult();
-    }
-
-    public void Decompress2x4Sparse(IGpuBuffer sparseValues, IGpuBuffer sparseIndices, IGpuBuffer denseOutput, int M, int K)
-    {
-        int sparseK = K / 2;
-        Fill(denseOutput, 0f, M * K);
-        var uniforms = new float[]
-        {
-            BitConverter.Int32BitsToSingle(M),
-            BitConverter.Int32BitsToSingle(K),
-            BitConverter.Int32BitsToSingle(sparseK),
-            0
-        };
-        int totalBlocks = M * (K / 4);
-        Dispatch3BufferAsync("Sparse2x4", WebGpuKernels.Sparse2x4Source, "decompress_2x4_sparse",
-            sparseValues, sparseIndices, denseOutput, uniforms, totalBlocks).GetAwaiter().GetResult();
-    }
-
     public void CsrSpMM(IGpuBuffer csrValues, IGpuBuffer csrColIndices, IGpuBuffer csrRowPointers,
         IGpuBuffer denseB, IGpuBuffer output, int M, int K, int N, int nnz)
     {

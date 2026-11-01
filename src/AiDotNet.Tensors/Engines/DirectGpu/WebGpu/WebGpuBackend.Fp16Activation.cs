@@ -4,10 +4,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
 // No FP16-native activation kernels here: those capabilities report false, so the engine keeps activations in FP32.
 // The operations still work: PortableFp16Activation widens, runs the FP32 kernel and narrows back.
-// That includes the direct FP16 convolution. This backend models FP16 as f32 values with a 10-bit mantissa
-// (ConvertToFp16 writes one f32 per element, not packed halves), so the shared dc_p_conv2d_direct_fp16hw kernel,
-// which reads packed halves, does not apply to the buffers the engine would hand it. Running the real backend on
-// Dawn showed it returning garbage for them; the widened FP32 convolution below is correct for this layout.
+// That includes the direct FP16 convolution: it widens the packed FP16 weights (WebGpuBackend.PackedHalf) and runs
+// the FP32 convolution.
 public sealed partial class WebGpuBackend : IFp16ActivationBackend
 {
     bool IFp16ActivationBackend.SupportsFp16ActivationStorage => false;
