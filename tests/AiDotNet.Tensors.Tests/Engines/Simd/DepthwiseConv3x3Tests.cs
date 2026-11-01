@@ -57,6 +57,34 @@ public class DepthwiseConv3x3Tests
         return data;
     }
 
+#if NET9_0_OR_GREATER
+    [Theory]
+    [InlineData(2, 16, 7, 1)]
+    [InlineData(2, 16, 7, 2)]
+    [InlineData(1, 32, 14, 1)]
+    [InlineData(3, 16, 14, 2)]
+    [InlineData(2, 48, 9, 2)]
+    [InlineData(1, 16, 28, 1)]
+    [InlineData(2, 32, 1, 1)]
+    public void TheSixteenChannelKernelsMatchTheGenericLoops(int batch, int channels, int size, int stride)
+    {
+        // Forced on hosts without AVX-512: Vector512 is emulated there, so the arithmetic is the same.
+        bool previousForce = DepthwiseConv3x3.s_forceAvx512ForTest;
+        int previousMaxWidth = DepthwiseConv3x3.s_channelBlockMaxWidth;
+        DepthwiseConv3x3.s_forceAvx512ForTest = true;
+        DepthwiseConv3x3.s_channelBlockMaxWidth = int.MaxValue;
+        try
+        {
+            Compare(batch, channels, size, stride);
+        }
+        finally
+        {
+            DepthwiseConv3x3.s_forceAvx512ForTest = previousForce;
+            DepthwiseConv3x3.s_channelBlockMaxWidth = previousMaxWidth;
+        }
+    }
+#endif
+
     [Theory]
     [MemberData(nameof(ShapesAndKernels))]
     public void TheVectorKernelsMatchTheGenericLoops(int batch, int channels, int size, int stride, bool channelBlocks)

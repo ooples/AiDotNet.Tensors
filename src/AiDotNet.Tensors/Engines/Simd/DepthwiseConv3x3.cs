@@ -238,6 +238,13 @@ internal static unsafe partial class DepthwiseConv3x3
     /// <summary>dw [C, 1, 3, 3] from dy [B, C, oH, oW] and x [B, C, H, W]; summed over the batch per channel.</summary>
     internal static void BackwardKernel(float[] dy, float[] x, float[] dw, int batch, int channels, int h, int wd, int stride)
     {
+#if NET9_0_OR_GREATER
+        if (UseAvx512Blocks(channels, wd))
+        {
+            BackwardKernelChannelBlocks16(dy, x, dw, batch, channels, h, wd, stride);
+            return;
+        }
+#endif
 #if NET5_0_OR_GREATER
         if (UseChannelBlocks(channels, wd))
         {
