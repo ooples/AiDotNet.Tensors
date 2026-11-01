@@ -96,6 +96,7 @@ public class SimdGemmDirectParallel2DTests
     [InlineData(37, 300, 77)]     // 2 full strips, then a 13-column strip on the masked 16-wide kernel
     [InlineData(66, 96, 48)]      // a full strip and a 16-column remainder on the 6x16 kernel
     [InlineData(7, 40, 32)]       // one full row block (6x32 tile) and a 1-row masked block
+    [InlineData(25, 513, 64)]     // packed strips over k blocks of 256, 256 and 1 (partial sums resumed from C)
     public void Vector512Tile_IsBitIdenticalTo256BitTiles(int m, int k, int n)
     {
         // The direct kernels are register FMA chains with no portable form; production reaches them only behind an FMA gate.
