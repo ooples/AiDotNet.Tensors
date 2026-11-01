@@ -2270,6 +2270,16 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         /// problems, such as 32x1024x1024 or 1024x64x1024 (both direct in CLBlast at a threshold of 448), through
         /// padding and packing kernels sized for the long side, at 0.34x and 0.40x the native library's speed.
         /// </remarks>
+        /// <summary>
+        /// True when the CLBlast library multiplies this problem with its direct kernel. False past the packed-kernel
+        /// threshold, or when the device has no threshold entry and the library's choice is not known.
+        /// </summary>
+        internal bool UsesClBlastDirectKernel(int m, int n, int k)
+        {
+            TryGetClBlastBaselineConfig(out _);
+            return _clblastMinIndirectSize > 0 && !UsesClBlastIndirectKernel(m, n, k, _clblastMinIndirectSize);
+        }
+
         internal static bool UsesClBlastIndirectKernel(int m, int n, int k, int minIndirectSize)
         {
             if (minIndirectSize <= 0) return false;
@@ -2808,57 +2818,42 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if ((long)C.Size < (long)M * N)
                 throw new ArgumentException($"C.Size {C.Size} < M*N = {(long)M * N}.", nameof(C));
 
-            var bufferA = ((DirectOpenClGpuBuffer)A).Buffer;
-            var bufferB = ((DirectOpenClGpuBuffer)B).Buffer;
-            var bufferC = ((DirectOpenClGpuBuffer)C).Buffer;
-
-            if (ClBlastNative.IsAvailable)
+            // CLBlast's direct kernel reads the operands in place, in one launch. Past its packed-kernel threshold the
+            // library first copies and pads the operands into buffers it allocates itself, outside the pool (VGG-11's
+            // classifier input gradient, 64 x 4096 x 4096, held a 64 MB copy of the weight at every step, which set the
+            // model's training memory peak), so those take transposed copies from the pool and an on-device GEMM.
+            if (UsesClBlastDirectKernel(M, N, K)
+                && TryExecuteClBlastLibraryGemm(ClBlastNative.Transpose.No, ClBlastNative.Transpose.Yes, A, K, B, K, C, M, N, K, alpha, beta))
             {
-                EnsureNativeClBlastTuned();
-                IntPtr queue = _context.CommandQueue;
-                var memories = DirectOpenClSubmission.GetDirectSubmissionMemories(bufferA, bufferB, bufferC);
-
-                // CLBlast row-major: C[M,N] = A[M,K] · Bᵀ where B is stored as
-                // [N, K] row-major. We pass transA=No, transB=Yes; ldA=K (row
-                // stride of A), ldB=K (row stride of B as stored), ldC=N.
-                ClBlastNative.StatusCode status;
-                try
-                {
-                    lock (DirectOpenClSubmission.Gate)
-                    {
-                        using var waits = DirectOpenClSubmission.PrepareLocked(queue, memories);
-                        waits.EnqueueBridgeMarker(queue);
-                        status = ClBlastNative.Sgemm(
-                            ClBlastNative.Layout.RowMajor,
-                            ClBlastNative.Transpose.No,
-                            ClBlastNative.Transpose.Yes,
-                            (UIntPtr)M, (UIntPtr)N, (UIntPtr)K,
-                            alpha,
-                            bufferA.Handle, UIntPtr.Zero, (UIntPtr)K,
-                            bufferB.Handle, UIntPtr.Zero, (UIntPtr)K,
-                            beta,
-                            bufferC.Handle, UIntPtr.Zero, (UIntPtr)N,
-                            ref queue,
-                            IntPtr.Zero);
-                        if (status == ClBlastNative.StatusCode.Success)
-                            DirectOpenClSubmission.CommitLocked(queue, memories);
-                    }
-                }
-                finally
-                {
-                    DirectOpenClSubmission.ReleaseDirectSubmissionMemories(memories);
-                }
-                if (status == ClBlastNative.StatusCode.Success)
-                {
-                    // CLBlast enqueues directly through the native OpenCL command queue,
-                    // bypassing DirectOpenClKernel's dispatch hook.
-                    GpuLaunchProbe.OnLaunch();
-                    return;
-                }
+                // CLBlast enqueues directly through the native OpenCL command queue, bypassing DirectOpenClKernel's
+                // dispatch hook.
+                GpuLaunchProbe.OnLaunch();
+                RecordGemmDispatch(OpenClGemmDispatchPath.ClBlastLibrary);
+                return;
             }
 
-            // CLBlast is optional. Keep the fallback fully resident by materializing Bᵀ
-            // with the existing transpose kernel and feeding the normal on-device GEMM path.
+            if ((long)M * K + (long)M * N < (long)N * K)
+            {
+                // B is the largest operand (a weight against a small batch): Cᵀ[N,M] = B[N,K] · Aᵀ[K,M] reads it as
+                // stored, so only A and C, the smaller ones, are transposed.
+                using var transposedA = AllocateBuffer(K * M);
+                using var transposedC = AllocateBuffer(N * M);
+                Transpose(A, transposedA, M, K);
+                if (beta != 0f) Transpose(C, transposedC, M, N);
+                // The register-blocked split-K GEMM, not Gemm: B is large here, and for this shape Gemm's route is
+                // CLBlast's packed kernel, which copies a row-major A operand (B) before multiplying.
+                if (alpha is 1f && beta is 0f
+                    && HasTunedKernel(Kernels.BatchedGemmKernels.Rb64SplitK) && HasTunedKernel(Kernels.BatchedGemmKernels.SplitKReduce))
+                {
+                    RbSplitKGemm(B, transposedA, transposedC, N, M, K);
+                    RecordGemmDispatch(OpenClGemmDispatchPath.BuiltInKernel);
+                }
+                else
+                    Gemm(B, transposedA, transposedC, N, M, K, alpha, beta);
+                Transpose(transposedC, C, N, M);
+                return;
+            }
+
             using var transposedB = AllocateBuffer(N * K);
             Transpose(B, transposedB, N, K);
             Gemm(A, transposedB, C, M, N, K, alpha, beta);
@@ -6266,6 +6261,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         private bool TryExecuteClBlastLibraryGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha, float beta)
         {
+            return TryExecuteClBlastLibraryGemm(ClBlastNative.Transpose.No, ClBlastNative.Transpose.No, A, K, B, N, C, M, N, K, alpha, beta);
+        }
+
+        /// <summary>Row-major C[M,N] = alpha · op(A) · op(B) + beta · C through the CLBlast library.</summary>
+        private bool TryExecuteClBlastLibraryGemm(
+            ClBlastNative.Transpose transA, ClBlastNative.Transpose transB, IGpuBuffer A, int lda, IGpuBuffer B, int ldb,
+            IGpuBuffer C, int M, int N, int K, float alpha, float beta)
+        {
             if (_context == null || !ClBlastNative.IsAvailable)
                 return false;
 
@@ -6286,12 +6289,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     waits.EnqueueBridgeMarker(queue);
                     status = ClBlastNative.Sgemm(
                         ClBlastNative.Layout.RowMajor,
-                        ClBlastNative.Transpose.No,
-                        ClBlastNative.Transpose.No,
+                        transA,
+                        transB,
                         (UIntPtr)M, (UIntPtr)N, (UIntPtr)K,
                         alpha,
-                        bufferA.Handle, UIntPtr.Zero, (UIntPtr)K,
-                        bufferB.Handle, UIntPtr.Zero, (UIntPtr)N,
+                        bufferA.Handle, UIntPtr.Zero, (UIntPtr)lda,
+                        bufferB.Handle, UIntPtr.Zero, (UIntPtr)ldb,
                         beta,
                         bufferC.Handle, UIntPtr.Zero, (UIntPtr)N,
                         ref queue,
