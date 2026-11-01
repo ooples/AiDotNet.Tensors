@@ -162,6 +162,21 @@ jobs:
             --filter "Category=PyTorchParity" --logger "console;verbosity=detailed" | tee "$RUNNER_TEMP/parity.log"
           exit "${PIPESTATUS[0]}"
 
+      - name: Per-operation breakdown (runner CPU)
+        # Which convolution / linear pass loses on THIS night's CPU (the hosted runner's model and ISA vary: AVX2 or
+        # AVX-512, AMD or Intel). Diagnostic only; it never fails the job.
+        if: always()
+        continue-on-error: true
+        env:
+          AIDOTNET_OP_BREAKDOWN: '1'
+        run: |
+          { lscpu | grep -E 'Model name|^CPU\(s\)|Thread'; grep -q avx512f /proc/cpuinfo && echo 'ISA: avx512f' || echo 'ISA: avx2'; } | tee "$RUNNER_TEMP/cpu.txt"
+          dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-build --framework net10.0 \
+            --filter "FullyQualifiedName~CpuOpBreakdownBench" --logger "console;verbosity=detailed" \
+            | grep OPBREAKDOWN | sed 's/^\s*//' > "$RUNNER_TEMP/ops-tensors.log"
+          python tools/parity/cpu_op_breakdown_torch.py > "$RUNNER_TEMP/ops-torch.log"
+          python tools/parity/join_op_breakdown.py "$RUNNER_TEMP/ops-tensors.log" "$RUNNER_TEMP/ops-torch.log" | tee "$RUNNER_TEMP/ops.txt"
+
       - name: Summary
         if: always()
         run: |
@@ -170,6 +185,12 @@ jobs:
             echo '```'
             grep -E 'Tensors is missing|^\s+[a-zA-Z.]+ \([0-9]+\):|PyTorch [0-9]|mapped |takes [0-9.]+x|step ratio|Slowest phase' "$RUNNER_TEMP/parity.log" | sed 's/^\s*\[xUnit[^]]*\]\s*//' | cut -c1-400 | head -80 || true
             echo '```'
+            if [ -f "$RUNNER_TEMP/ops.txt" ]; then
+              echo '## Per-operation breakdown'
+              echo '```'
+              cat "$RUNNER_TEMP/cpu.txt" "$RUNNER_TEMP/ops.txt"
+              echo '```'
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload results
@@ -179,5 +200,7 @@ jobs:
           name: pytorch-parity-${{ github.run_id }}
           path: |
             ${{ runner.temp }}/parity.log
+            ${{ runner.temp }}/ops-*.log
+            ${{ runner.temp }}/cpu.txt
             /tmp/aidotnet-parity/*-latest.json
           if-no-files-found: warn
