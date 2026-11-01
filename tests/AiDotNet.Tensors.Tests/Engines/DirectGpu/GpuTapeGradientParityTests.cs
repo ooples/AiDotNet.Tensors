@@ -732,10 +732,13 @@ public class GpuTapeGradientParityTests : IDisposable
 
     // [6,10] viewed as [1,2,5,6]; stride 2 with padding exercises the overlap and cropping in the transpose.
     [SkippableFact]
+    // The input gradient is a 27-term product per element, which the CPU GEMM's remainder columns and the device kernel
+    // both accumulate as one fused multiply-add per term in order: the results can match bit for bit, so engagement is
+    // read from the residency counter.
     public void ConvTranspose2D_gradients_match_cpu() =>
         AssertGradientParity("ConvTranspose2D", Rand([6, 10], seed: 349),
             static (e, t) => e.ConvTranspose2D(t.Reshape(new[] { 1, 2, 5, 6 }), ConvTransposeKernel,
-                new[] { 2, 2 }, new[] { 1, 1 }, new[] { 0, 0 }));
+                new[] { 2, 2 }, new[] { 1, 1 }, new[] { 0, 0 }), probe: Engagement.UseResidencyCounter);
 
     [SkippableFact]
     public void ConvTranspose2D_stays_on_the_device_while_a_tape_records() =>
