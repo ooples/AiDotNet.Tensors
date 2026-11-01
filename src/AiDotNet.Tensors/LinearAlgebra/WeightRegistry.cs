@@ -2221,10 +2221,22 @@ public static partial class WeightRegistry
                 bool live = registration.Owner.TryGetTarget(out IStreamingDroppable? owner);
                 if (live && owner is not null)
                 {
-                    try { owner.PreserveOffloadedResults(); }
-                    catch (Exception error)
+                    // Reset frees every allocation regardless, so results that cannot be copied back are marked lost
+                    // rather than left to read as current: a later host read of that tensor throws. Any other failure
+                    // (a device sync error) still marks them before it propagates.
+                    bool preserved = false;
+                    try
+                    {
+                        owner.PreserveOffloadedResults();
+                        preserved = true;
+                    }
+                    catch (InvalidOperationException error)
                     {
                         TraceOffloadCleanupFailure(error);
+                    }
+                    finally
+                    {
+                        if (!preserved) owner.ReleaseUnpreservedOffloadResults();
                     }
                 }
                 try { registration.Allocator.Free(registration.Handle); }

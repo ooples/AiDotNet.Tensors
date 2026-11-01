@@ -151,6 +151,34 @@ public class GpuPinnedLifetimeTests
         Assert.Null(t.TryGetGpuBuffer());
     }
 
+    /// <summary>
+    /// WeightRegistry.Reset frees every offload allocation even when the device results could not be copied back;
+    /// the tensor's host values must then fail to read rather than read as current.
+    /// </summary>
+    [Fact]
+    public void UnpreservedOffloadResults_MakeTheNextHostReadThrow()
+    {
+        var t = new Tensor<float>(new[] { 4 });
+        var deviceAhead = typeof(TensorBase<float>).GetField("_offloadDeviceAhead",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(deviceAhead);
+        deviceAhead.SetValue(t, true);
+
+        ((IStreamingDroppable)t).ReleaseUnpreservedOffloadResults();
+
+        var error = Assert.Throws<InvalidOperationException>(() => t.ToArray());
+        Assert.Equal(TensorBase<float>.OffloadResultsLostMessage, error.Message);
+    }
+
+    [Fact]
+    public void UnpreservedOffloadResults_WithNothingPending_LeaveTheTensorReadable()
+    {
+        var t = new Tensor<float>(new[] { 4 });
+        t[1] = 3f;
+        ((IStreamingDroppable)t).ReleaseUnpreservedOffloadResults();
+        Assert.Equal(3f, t.ToArray()[1]);
+    }
+
     [Fact]
     public void TryGetGpuBuffer_GpuPinnedTagWithoutPointer_ReturnsNull()
     {

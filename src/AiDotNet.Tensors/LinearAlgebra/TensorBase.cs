@@ -60,6 +60,11 @@ internal interface IStreamingDroppable
     /// <summary>Forgets this tensor's offload allocation after the registry freed it, so nothing reads the freed
     /// buffer: the managed array is the copy from then on.</summary>
     void DetachOffload();
+
+    /// <summary>For a free that must go ahead although <see cref="PreserveOffloadedResults"/> could not copy the
+    /// device results back: marks the host copy released, so a later host read throws instead of returning values
+    /// older than the device's. Does nothing when no device results were pending.</summary>
+    void ReleaseUnpreservedOffloadResults();
 }
 
 /// <summary>What <see cref="IStreamingDroppable.TryWriteBackAndDropForStreaming"/> did.</summary>
@@ -1785,6 +1790,21 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
             "A GPU-offloaded tensor holds device results that cannot be copied back to its host array, so freeing its " +
             "offload buffer would lose them. Read the tensor before unregistering it.");
     }
+
+    /// <inheritdoc/>
+    void IStreamingDroppable.ReleaseUnpreservedOffloadResults()
+    {
+        if (!Volatile.Read(ref _offloadDeviceAhead)) return;
+        // The same two keys a released step intermediate marks (see DirectGpuTensorEngine): host reads reach the
+        // data through either, and Release also drops the armed download so nothing reads the freed buffer.
+        if (GetBackingArrayForCacheLookupUnsafe() is { } array) Helpers.HostSync.Release(array, OffloadResultsLostMessage);
+        Helpers.HostSync.Release(_data, OffloadResultsLostMessage);
+        Volatile.Write(ref _offloadDeviceAhead, false);
+    }
+
+    internal const string OffloadResultsLostMessage =
+        "This GPU-offloaded tensor's device results were freed by WeightRegistry.Reset before they could be copied " +
+        "back to its host array, so its host values are stale. Read the tensor before resetting the registry.";
 
     private unsafe void UploadHostToOffload()
     {
