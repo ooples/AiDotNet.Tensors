@@ -90,6 +90,9 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
         _maxPerSize = maxPerSize > 0 ? maxPerSize : 1;
         _maxSize = maxSize > 0 ? maxSize : int.MaxValue;
         _exactSizes = exactSizes;
+        // Measurements before this pool existed parked nothing in it: starting from generation 0 drained the first
+        // buffers returned to any pool created after kernel tuning had run once in the process.
+        _drainedAtMeasurement = Helpers.Autotune.TunedKernels.TunedKernelRegistry.MeasurementGeneration;
     }
 
     private int BucketKey(int size) => _exactSizes ? size : NextPowerOfTwo(size);
