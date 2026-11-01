@@ -599,6 +599,37 @@ internal static class DirectConvAvx2
             {
                 float* d = pd + ((long)ob * packedInBlocks + ib) * taps * Block * Block;
                 float* src = ps + sourceOffset;
+                // The eight output lanes of one (tap, input lane) sit a fixed stride apart in the source, so a full input
+                // block gathers them in one instruction; the scalar walk below (index arithmetic per element) was a
+                // third of a 512-channel 4x4 forward (one thread).
+                long laneStride = transposeAndFlip ? taps : (long)inChannels * taps;
+                if (!transposeAndFlip && (ib + 1) * Block <= packedIn)
+                {
+                    // Forward packing: the block's 8 output rows each hold [8 input lanes][taps] contiguously, so an 8x8
+                    // transpose of columns c..c+7 of that 8 x 8*taps matrix yields, for each column c = il*taps + tap,
+                    // the 8 output lanes of (tap, il) -- the destination vector.
+                    float* rows = src + ((long)ob * Block * inChannels + (long)ib * Block) * taps;
+                    float* d0 = d;
+                    for (int c0 = 0; c0 < Block * taps; c0 += Block)
+                        TransposeScatter(rows + c0, laneStride, d0, c0, taps);
+                    return;
+                }
+                if (Avx2.IsSupported && (ib + 1) * Block <= packedIn && 7 * laneStride <= int.MaxValue)
+                {
+                    int ls = (int)laneStride;
+                    var lanes = Vector256.Create(0, ls, 2 * ls, 3 * ls, 4 * ls, 5 * ls, 6 * ls, 7 * ls);
+                    for (int t = 0; t < taps; t++)
+                    {
+                        int tap = transposeAndFlip ? taps - 1 - t : t;
+                        for (int il = 0; il < Block; il++, d += Block)
+                        {
+                            int pi = ib * Block + il, po = ob * Block;
+                            long row = transposeAndFlip ? (long)pi * inChannels + po : (long)po * inChannels + pi;
+                            Avx.Store(d, Avx2.GatherVector256(src + row * taps + tap, lanes, 4));
+                        }
+                    }
+                    return;
+                }
                 for (int t = 0; t < taps; t++)
                 {
                     int tap = transposeAndFlip ? taps - 1 - t : t;
@@ -759,8 +790,10 @@ internal static class DirectConvAvx2
             float* o = po + outputOffset;
             for (int runStart = first; runStart < last;)
             {
-                int imageEnd = (runStart / gridPositions + 1) * gridPositions;
-                int runEnd = Math.Min(Math.Min(last, imageEnd), runStart + runLength);
+                // A run may span images (the packed input addresses any position), so a small plane (512 channels at
+                // 4x4: 16 positions an image) still streams each pass's kernel slice once per run, not once per image;
+                // only the flush splits it per image.
+                int runEnd = Math.Min(last, runStart + runLength);
                 int run = runEnd - runStart;
                 for (int i = 0, column = gridWidth; i < run; i++)
                 {
@@ -783,8 +816,14 @@ internal static class DirectConvAvx2
                             stage + (q - runStart) * 32, cb0 > 0, count);
                     }
                 }
-                if (plain) FlushStage(o, accumulate, g, channelBase, runStart, run, stage);
-                else FlushStageStrided(o, accumulate, g, channelBase, runStart, run, stage);
+                for (int segment = runStart; segment < runEnd;)
+                {
+                    int segmentEnd = Math.Min(runEnd, (segment / gridPositions + 1) * gridPositions);
+                    float* segmentStage = stage + (segment - runStart) * 32;
+                    if (plain) FlushStage(o, accumulate, g, channelBase, segment, segmentEnd - segment, segmentStage);
+                    else FlushStageStrided(o, accumulate, g, channelBase, segment, segmentEnd - segment, segmentStage);
+                    segment = segmentEnd;
+                }
                 runStart = runEnd;
             }
         }
@@ -1116,6 +1155,36 @@ internal static class DirectConvAvx2
         StoreRow(d + 6 * dStride, accumulate, Avx.Permute2x128(u2, u6, 0x31));
         StoreRow(d + 7 * dStride, accumulate, Avx.Permute2x128(u3, u7, 0x31));
     }
+
+    // Transposes the 8x8 block at s (rows sStride apart); column c0 + j's 8 values go to the packed forward kernel's
+    // (tap, input lane) slot d[(tap * 8 + il) * 8], where c0 + j = il * taps + tap.
+    [MethodImpl(HotInline)]
+    private static unsafe void TransposeScatter(float* s, long sStride, float* d, int c0, int taps)
+    {
+        var r0 = Avx.LoadVector256(s); var r1 = Avx.LoadVector256(s + sStride);
+        var r2 = Avx.LoadVector256(s + 2 * sStride); var r3 = Avx.LoadVector256(s + 3 * sStride);
+        var r4 = Avx.LoadVector256(s + 4 * sStride); var r5 = Avx.LoadVector256(s + 5 * sStride);
+        var r6 = Avx.LoadVector256(s + 6 * sStride); var r7 = Avx.LoadVector256(s + 7 * sStride);
+        var t0 = Avx.UnpackLow(r0, r1); var t1 = Avx.UnpackHigh(r0, r1);
+        var t2 = Avx.UnpackLow(r2, r3); var t3 = Avx.UnpackHigh(r2, r3);
+        var t4 = Avx.UnpackLow(r4, r5); var t5 = Avx.UnpackHigh(r4, r5);
+        var t6 = Avx.UnpackLow(r6, r7); var t7 = Avx.UnpackHigh(r6, r7);
+        var u0 = Avx.Shuffle(t0, t2, 0x44); var u1 = Avx.Shuffle(t0, t2, 0xEE);
+        var u2 = Avx.Shuffle(t1, t3, 0x44); var u3 = Avx.Shuffle(t1, t3, 0xEE);
+        var u4 = Avx.Shuffle(t4, t6, 0x44); var u5 = Avx.Shuffle(t4, t6, 0xEE);
+        var u6 = Avx.Shuffle(t5, t7, 0x44); var u7 = Avx.Shuffle(t5, t7, 0xEE);
+        Avx.Store(d + PackedSlot(c0, taps), Avx.Permute2x128(u0, u4, 0x20));
+        Avx.Store(d + PackedSlot(c0 + 1, taps), Avx.Permute2x128(u1, u5, 0x20));
+        Avx.Store(d + PackedSlot(c0 + 2, taps), Avx.Permute2x128(u2, u6, 0x20));
+        Avx.Store(d + PackedSlot(c0 + 3, taps), Avx.Permute2x128(u3, u7, 0x20));
+        Avx.Store(d + PackedSlot(c0 + 4, taps), Avx.Permute2x128(u0, u4, 0x31));
+        Avx.Store(d + PackedSlot(c0 + 5, taps), Avx.Permute2x128(u1, u5, 0x31));
+        Avx.Store(d + PackedSlot(c0 + 6, taps), Avx.Permute2x128(u2, u6, 0x31));
+        Avx.Store(d + PackedSlot(c0 + 7, taps), Avx.Permute2x128(u3, u7, 0x31));
+    }
+
+    [MethodImpl(HotInline)]
+    private static int PackedSlot(int column, int taps) => ((column % taps) * Block + column / taps) * Block;
 
     [MethodImpl(HotInline)]
     private static unsafe void StoreRow(float* d, bool accumulate, Vector256<float> v)
