@@ -614,6 +614,19 @@ internal static class DirectConvAvx2
                         TransposeScatter(rows + c0, laneStride, d0, c0, taps);
                     return;
                 }
+                if (transposeAndFlip && (ib + 1) * Block <= packedIn && taps <= MaxTransposePackTaps)
+                {
+                    // Input-gradient packing: input lane il's row holds [8 output lanes][taps] contiguously. A first
+                    // transpose (columns c = lane*taps + tap of the 8 rows) gives tile[c] = the 8 input lanes of
+                    // (lane, tap); a second, of tile[tap], tile[taps + tap], ..., gives each (tap, il)'s 8 output lanes.
+                    float* tile = stackalloc float[MaxTransposePackTaps * Block * Block];
+                    float* rows = src + ((long)ib * Block * inChannels + (long)ob * Block) * taps;
+                    for (int c0 = 0; c0 < Block * taps; c0 += Block)
+                        Transpose8(rows + c0, (long)inChannels * taps, tile + c0 * Block, Block, accumulate: false);
+                    for (int t = 0; t < taps; t++)
+                        Transpose8(tile + (taps - 1 - t) * Block, (long)taps * Block, d + t * Block * Block, Block, accumulate: false);
+                    return;
+                }
                 if (Avx2.IsSupported && (ib + 1) * Block <= packedIn && 7 * laneStride <= int.MaxValue)
                 {
                     int ls = (int)laneStride;
@@ -1182,6 +1195,9 @@ internal static class DirectConvAvx2
         Avx.Store(d + PackedSlot(c0 + 6, taps), Avx.Permute2x128(u2, u6, 0x31));
         Avx.Store(d + PackedSlot(c0 + 7, taps), Avx.Permute2x128(u3, u7, 0x31));
     }
+
+    // Largest kernel (taps) the two-transpose input-gradient pack stages on the stack (7x7).
+    private const int MaxTransposePackTaps = 49;
 
     [MethodImpl(HotInline)]
     private static int PackedSlot(int column, int taps) => ((column % taps) * Block + column / taps) * Block;
