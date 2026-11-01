@@ -31,7 +31,7 @@ namespace AiDotNet.Tensors.Engines.Simd;
 /// rounding (the transforms scale by up to 8 and 1/24): about 1e-6 relative to the output's magnitude at these shapes.
 /// </para>
 /// </summary>
-internal static unsafe class WinogradF43
+internal static unsafe partial class WinogradF43
 {
     private const int Alpha = 6;              // patch side
     private const int Points = Alpha * Alpha; // 36 transformed points
@@ -47,9 +47,9 @@ internal static unsafe class WinogradF43
     /// values) outweighs the multiplies saved, and the direct kernel stays.</summary>
     internal static readonly int s_minPatches = 128;
 
-    /// <summary>Fewest input and output channels: with fewer the transformed operands (36 values per patch and channel)
-    /// cost more memory traffic than the multiplies they save (a 32 -> 64 channel 14x14 layer at batch 64 ran 2.6x slower
-    /// than the direct kernel).</summary>
+    /// <summary>Fewest input and output channels of the batch-wide passes: with fewer the transformed operands (36 values
+    /// per patch and channel) cost more memory traffic than the multiplies they save (a 32 -> 64 channel 14x14 layer at
+    /// batch 64 ran 2.6x slower than the direct kernel). Narrower layers run blocked (WinogradF43.Blocked.cs).</summary>
     internal static readonly int s_minChannels = 64;
 
     /// <summary>Whether this kernel takes the convolution: 3x3, stride 1, padding 1, undilated, channel counts multiples
@@ -60,7 +60,8 @@ internal static unsafe class WinogradF43
         if (s_disable || !s_env || DirectConvAvx2.SuppressedOnThisThread || !Avx2.IsSupported || !Fma.IsSupported) return false;
         if (kernelH != 3 || kernelW != 3 || strideH != 1 || strideW != 1 || padH != 1 || padW != 1
             || dilationH != 1 || dilationW != 1) return false;
-        if (inChannels % 8 != 0 || outChannels % 8 != 0 || inChannels < s_minChannels || outChannels < s_minChannels
+        int minChannels = s_blockedNarrow || s_forceBlockedForTest ? MinBlockedChannels : s_minChannels;
+        if (inChannels % 8 != 0 || outChannels % 8 != 0 || inChannels < minChannels || outChannels < minChannels
             || batch <= 0) return false;
         if (height < 8 || width < 8) return false;
         long patches = (long)batch * ((height + 3) / 4) * ((width + 3) / 4);
@@ -284,9 +285,22 @@ internal static unsafe class WinogradF43
         int tilesH = (height + Tile - 1) / Tile, tilesW = (width + Tile - 1) / Tile;
         int tiles = tilesH * tilesW, patches = batch * tiles;
         int vLength = Points * patches * cIn, mLength = Points * patches * cOut, uLength = Points * cIn * cOut;
+        float[] u = ArrayPool<float>.Shared.Rent(uLength);
+        if (UseBlocked(cIn, cOut))
+        {
+            try
+            {
+                TransformWeights(w, wOff, u, cIn, cOut, inputGradient);
+                RunBlocked(x, xOff, u, y, yOff, accumulate, batch, cIn, height, width, cOut);
+            }
+            finally
+            {
+                ArrayPool<float>.Shared.Return(u);
+            }
+            return;
+        }
         float[] v = ArrayPool<float>.Shared.Rent(vLength);
         float[] m = ArrayPool<float>.Shared.Rent(mLength);
-        float[] u = ArrayPool<float>.Shared.Rent(uLength);
         try
         {
             TransformWeights(w, wOff, u, cIn, cOut, inputGradient);
