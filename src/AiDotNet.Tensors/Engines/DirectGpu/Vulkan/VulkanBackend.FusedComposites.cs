@@ -90,6 +90,43 @@ void main() {
     if (t == 0u && row < batchSize) r[row] = partial[0];
 }";
 
+    // -sum(target * log_softmax(row)) per row.
+    private const string DenseCrossEntropyRowsSource = FusedCompositeHeader + @"
+layout(std430, binding = 0) readonly buffer P { float logits[]; };
+layout(std430, binding = 1) readonly buffer T { float targets[]; };
+layout(std430, binding = 2) writeonly buffer L { float rowLoss[]; };
+layout(push_constant) uniform Params { uint batchSize; uint numClasses; };
+void main() {
+    uint b = gl_GlobalInvocationID.x;
+    if (b >= batchSize) return;
+    uint row = b * numClasses;
+    float maxVal = -3.402823466e+38;
+    for (uint i = 0u; i < numClasses; i++) maxVal = max(maxVal, logits[row + i]);
+    float sumExp = 0.0;
+    for (uint i = 0u; i < numClasses; i++) sumExp += exp(logits[row + i] - maxVal);
+    float logSum = maxVal + log(sumExp);
+    float loss = 0.0;
+    for (uint i = 0u; i < numClasses; i++) loss -= targets[row + i] * (logits[row + i] - logSum);
+    rowLoss[b] = loss;
+}";
+
+    // (softmax(logits) - target) / batch per element, the row's max and sum recomputed by each element (as CUDA and OpenCL).
+    private const string DenseCrossEntropyBackwardSource = FusedCompositeHeader + @"
+layout(std430, binding = 0) readonly buffer P { float logits[]; };
+layout(std430, binding = 1) readonly buffer T { float targets[]; };
+layout(std430, binding = 2) writeonly buffer G { float grad[]; };
+layout(push_constant) uniform Params { uint batchSize; uint numClasses; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= batchSize * numClasses) return;
+    uint row = (idx / numClasses) * numClasses;
+    float maxVal = -3.402823466e+38;
+    for (uint i = 0u; i < numClasses; i++) maxVal = max(maxVal, logits[row + i]);
+    float sumExp = 0.0;
+    for (uint i = 0u; i < numClasses; i++) sumExp += exp(logits[row + i] - maxVal);
+    grad[idx] = (exp(logits[idx] - maxVal) / sumExp - targets[idx]) / float(batchSize);
+}";
+
     // VulkanSparseKernels.CsrSpMM with the bias of the output column added before the store.
     private const string CsrSpMMBiasSource = FusedCompositeHeader + @"
 layout(std430, binding = 0) readonly buffer CsrValues { float csrValues[]; };

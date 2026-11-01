@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Linq;
 using System.Runtime.CompilerServices;
@@ -18158,7 +18158,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
-            if (predictions.Rank != 2)
+            // The backends take logits and DENSE targets of the same shape; class-index targets (rank 1), which the CPU
+            // base also accepts, go there.
+            if (predictions.Rank != 2 || !ShapesMatch(predictions.Shape._dims, targets.Shape._dims))
                 return base.CrossEntropyBackward(predictions, targets);
 
             int batchSize = predictions.Shape._dims[0];

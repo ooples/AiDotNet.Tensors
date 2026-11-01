@@ -619,22 +619,12 @@ public sealed partial class WebGpuBackend
             throw new ArgumentOutOfRangeException(nameof(batchSize), "Batch size must be positive.");
         if (numClasses <= 0)
             throw new ArgumentOutOfRangeException(nameof(numClasses), "Number of classes must be positive.");
-        // Convert integer-encoded targets to one-hot via GPU kernel
+        // CONTRACT (CUDA, OpenCL and CpuEngine.CrossEntropyBackward): `predictions` are logits and `targets` is dense [batch, classes]; the gradient is (softmax(predictions) - targets) / batchSize.
+        // The targets went through a one-hot conversion first, which read them as class indices.
         int total = batchSize * numClasses;
-        using var oneHotBuf = (WebGpuBuffer)AllocateBuffer(total);
-        Fill(oneHotBuf, 0f, total);
-        var ohUniforms = new float[]
-        {
-            BitConverter.Int32BitsToSingle(batchSize),
-            BitConverter.Int32BitsToSingle(numClasses),
-            0, 0
-        };
-        Dispatch2BufferAsync("OneHot", WebGpuKernels.OneHotSource, "one_hot_encode",
-            targets, oneHotBuf, ohUniforms, total).GetAwaiter().GetResult();
-        // CrossEntropySource cross_entropy_backward: softmax(predictions) - targets (one-hot)
         var uniforms = MakeUniformInts2(batchSize, numClasses);
         Dispatch3BufferAsync("CrossEntropy", WebGpuKernels.CrossEntropySource, "cross_entropy_backward",
-            predictions, oneHotBuf, gradInput, uniforms, total).GetAwaiter().GetResult();
+            predictions, targets, gradInput, uniforms, total).GetAwaiter().GetResult();
     }
 
     public float BinaryCrossEntropyLoss(IGpuBuffer predictions, IGpuBuffer targets, int size) =>

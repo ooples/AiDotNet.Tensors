@@ -187,8 +187,19 @@ extern ""C"" __global__ __launch_bounds__(256) void cross_entropy_backward(
     int total = batchSize * numClasses;
     if (idx >= total) return;
 
-    float pred = fmaxf(predictions[idx], 1e-7f);
-    gradInput[idx] = (-targets[idx] / pred) / (float)batchSize;
+    // CONTRACT (as CUDA, OpenCL and CpuEngine.CrossEntropyBackward): `predictions` are LOGITS and `targets` is dense
+    // [batch, classes]; the gradient is (softmax - target) / batchSize. This was (-target / pred) / batchSize, the
+    // probability-input derivative CUDA had already corrected (#775).
+    int b = idx / numClasses;
+    int rowOffset = b * numClasses;
+    float maxVal = -INFINITY;
+    for (int i = 0; i < numClasses; i++)
+        maxVal = fmaxf(maxVal, predictions[rowOffset + i]);
+    float sumExp = 0.0f;
+    for (int i = 0; i < numClasses; i++)
+        sumExp += expf(predictions[rowOffset + i] - maxVal);
+    float softmax = expf(predictions[idx] - maxVal) / sumExp;
+    gradInput[idx] = (softmax - targets[idx]) / (float)batchSize;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void bce_loss(

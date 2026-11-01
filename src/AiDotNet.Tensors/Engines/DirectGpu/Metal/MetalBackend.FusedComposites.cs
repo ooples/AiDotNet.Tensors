@@ -60,7 +60,7 @@ kernel void unary_math(
     B[gid] = y;
 }
 
-// G = (P - T) * scale: the MSE gradient (scale 2 / n) and the softmax cross-entropy gradient (scale 1 / batch).
+// G = (P - T) * scale: the MSE gradient (scale 2 / n).
 kernel void scaled_difference(
     device const float* P [[buffer(0)]],
     device const float* T [[buffer(1)]],
@@ -70,6 +70,24 @@ kernel void scaled_difference(
     uint gid [[thread_position_in_grid]])
 {
     if (gid < size) G[gid] = (P[gid] - T[gid]) * scale;
+}
+
+// (softmax(logits) - target) / batch per element: the cross-entropy gradient from logits (as CUDA and OpenCL).
+kernel void cross_entropy_backward_logits(
+    device const float* logits [[buffer(0)]],
+    device const float* targets [[buffer(1)]],
+    device float* grad [[buffer(2)]],
+    constant uint& batchSize [[buffer(3)]],
+    constant uint& numClasses [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= batchSize * numClasses) return;
+    uint row = (gid / numClasses) * numClasses;
+    float maxVal = -INFINITY;
+    for (uint i = 0; i < numClasses; i++) maxVal = max(maxVal, logits[row + i]);
+    float sumExp = 0.0f;
+    for (uint i = 0; i < numClasses; i++) sumExp += exp(logits[row + i] - maxVal);
+    grad[gid] = (exp(logits[gid] - maxVal) / sumExp - targets[gid]) / (float)batchSize;
 }
 
 // dX = dY * sigmoid(X), the activation library's numerically stable sigmoid. dX may be dY.
@@ -160,8 +178,24 @@ kernel void csr_spmm_bias(
     public void MseBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size)
         => ScaledDifference(predictions, targets, gradInput, size, 2.0f / size);
 
+    // CONTRACT (CUDA, OpenCL and CpuEngine.CrossEntropyBackward): `predictions` are logits and `targets` is dense [batch, classes]; the gradient is (softmax(predictions) - targets) / batchSize.
+    // This was (predictions - targets) / batch, the gradient for probabilities, not logits.
     public void CrossEntropyBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int batchSize, int numClasses)
-        => ScaledDifference(predictions, targets, gradInput, batchSize * numClasses, 1.0f / batchSize);
+    {
+        ThrowIfDisposed();
+        if (batchSize <= 0 || numClasses <= 0) return;
+        int total = checked(batchSize * numClasses);
+        var pipeline = FusedCompositesPipeline("cross_entropy_backward_logits");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(total);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer((MetalGpuBuffer)predictions, 0);
+        encoder.SetBuffer((MetalGpuBuffer)targets, 1);
+        encoder.SetBuffer((MetalGpuBuffer)gradInput, 2);
+        encoder.SetBytes((uint)batchSize, 3);
+        encoder.SetBytes((uint)numClasses, 4);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
 
     private void ScaledDifference(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float scale)
     {
