@@ -54,6 +54,10 @@ on:
         description: 'probe: interleaved rounds of the network head-to-heads'
         type: string
         default: '2'
+      probe_perf_test:
+        description: 'probe: perf-record this test filter (default mode) and report the top symbols'
+        type: string
+        default: ''
 
 concurrency:
   group: parity-${{ github.ref }}-${{ github.event_name }}-${{ inputs.probe_modes != '' && github.run_id || 'main' }}
@@ -274,6 +278,25 @@ jobs:
             echo "## perf ${AIDOTNET_OP_FILTER} t${AIDOTNET_OP_THREADS}"
             echo '```'
             $PERF report -i "$RUNNER_TEMP/row.perf" --sort dso,sym --stdio 2>/dev/null | grep -E '^ +[0-9]' | head -40 | cut -c1-240
+            echo '```'
+          } | tee -a "$RUNNER_TEMP/probe.md"
+
+      - name: Perf profile of a test
+        if: steps.isa.outputs.run == '1' && inputs.probe_perf_test != ''
+        continue-on-error: true
+        env:
+          DOTNET_PerfMapEnabled: '1'
+          DOTNET_EnableWriteXorExecute: '0'
+          PARITY_PYTHON: python
+          TESTF: ${{ inputs.probe_perf_test }}
+        run: |
+          PERF=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1)
+          PERF=${PERF:-perf}
+          $PERF record -F 1000 -g -o "$RUNNER_TEMP/test.perf" -- dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj             --configuration Release --no-build --framework net10.0 --filter "$TESTF" --logger "console;verbosity=detailed" 2>&1 | grep -E 'step ratio' || true
+          {
+            echo "## perf test ${TESTF}"
+            echo '```'
+            $PERF report -i "$RUNNER_TEMP/test.perf" --no-children --comm dotnet --sort sym --stdio -g none 2>/dev/null | grep -E '^ +[0-9]' | head -45 | cut -c1-230
             echo '```'
           } | tee -a "$RUNNER_TEMP/probe.md"
 
