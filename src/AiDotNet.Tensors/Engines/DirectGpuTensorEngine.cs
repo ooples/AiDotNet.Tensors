@@ -2145,6 +2145,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         InvalidateActivationCacheEntry(tensor.DataVector);
     }
 
+    /// <summary>
+    /// Frees <paramref name="key"/>'s activation-cache buffer without downloading it: its tensor now borrows
+    /// <paramref name="replacement"/>, so the cached contents are stale and nothing reads them. A step-pool buffer stays.
+    /// </summary>
+    private void ReleaseSupersededActivation(object key, IGpuBuffer replacement)
+    {
+        ActivationCacheEntry? removed = null;
+        lock (_activationCacheLock)
+        {
+            if (_activationCache.TryGetValue(key, out var entry) && !ReferenceEquals(entry.Buffer, replacement)
+                && !StepScratchPool.IsPooled(entry.Buffer) && _activationCache.TryRemove(key, out var taken))
+                removed = taken;
+        }
+        removed?.Dispose();
+    }
+
     private void InvalidateActivationCacheEntry(object key)
     {
         // #226 / #1468: NEVER free a GPU buffer that still backs a pending deferred
@@ -4235,6 +4251,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // dest needs a backing array as the deferred-materializer key (for any host read of dest).
         var destArr = dest.GetBackingArrayForCacheLookupUnsafe();
         if (destArr is null) { AliasDiag("skip: dest has no backing array"); return false; }
+
+        // dest's own device copy from before the plan took it over (its trace-time result, an activation-cache entry
+        // keyed by its storage) is never read again: from here dest borrows srcBuf every step. Left in the cache it
+        // lived as long as dest's storage, the plan's lifetime: 3 GB of trace-time results on DenseNet-121. Released
+        // only outside a stream capture, so the pre-residency pass frees them and a capture frees nothing.
+        if (!(backend is IGpuGraphCapture graphCapture && graphCapture.IsStreamCapturing()))
+        {
+            ReleaseSupersededActivation(destArr, srcBuf);
+            ReleaseSupersededActivation(dest.DataVector, srcBuf);
+        }
 
         // Borrow src's buffer: consumers resolve dest via the _gpuBuffer fast path. We do NOT add a second
         // activation-cache entry under destArr — aliasing one buffer under two keys would double-free on
