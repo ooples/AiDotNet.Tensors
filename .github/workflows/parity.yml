@@ -298,6 +298,7 @@ jobs:
           DOTNET_PerfMapEnabled: '1'
           DOTNET_EnableWriteXorExecute: '0'
           PARITY_PYTHON: python
+          DOTNET_ReadyToRun: '0'
           TESTF: ${{ inputs.probe_perf_test }}
         run: |
           PERF=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1)
