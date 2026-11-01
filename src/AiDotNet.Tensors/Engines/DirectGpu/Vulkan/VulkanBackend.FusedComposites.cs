@@ -104,11 +104,11 @@ void main() {
     for (uint i = 0u; i < numClasses; i++) maxVal = max(maxVal, logits[row + i]);
     float sumExp = 0.0;
     for (uint i = 0u; i < numClasses; i++) sumExp += exp(logits[row + i] - maxVal);
-    // Shifted logits minus log(sumExp): adding maxVal back first rounds the normalizer away for large logits.
-    float logSumExp = log(sumExp);
-    float loss = 0.0;
-    for (uint i = 0u; i < numClasses; i++) loss -= targets[row + i] * ((logits[row + i] - maxVal) - logSumExp);
-    rowLoss[b] = loss;
+    // -sum(t * (logit - max)) + log(sumExp) * sum(t): adding maxVal back first rounds the normalizer away for large
+    // logits, and summing the two terms apart keeps a compiler from folding them back together.
+    float shifted = 0.0, targetSum = 0.0;
+    for (uint i = 0u; i < numClasses; i++) { shifted += targets[row + i] * (logits[row + i] - maxVal); targetSum += targets[row + i]; }
+    rowLoss[b] = log(sumExp) * targetSum - shifted;
 }";
 
     // (softmax(logits) - target) / batch per element, the row's max and sum recomputed by each element (as CUDA and OpenCL).

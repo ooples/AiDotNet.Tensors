@@ -177,11 +177,13 @@ extern ""C"" __global__ __launch_bounds__(256) void cross_entropy_loss(
     for (int c = 0; c < numClasses; c++) maxVal = fmaxf(maxVal, predictions[baseIdx + c]);
     float sumExp = 0.0f;
     for (int c = 0; c < numClasses; c++) sumExp += expf(predictions[baseIdx + c] - maxVal);
-    float logSumExp = logf(sumExp);
-    float sampleLoss = 0.0f;
-    for (int c = 0; c < numClasses; c++)
-        sampleLoss -= targets[baseIdx + c] * ((predictions[baseIdx + c] - maxVal) - logSumExp);
-    loss[batch] = sampleLoss;
+    // -sum(t * (logit - max)) + log(sumExp) * sum(t): fast math may fold (logit - max) - log(sumExp) back into logit - (max + log(sumExp)); summing t * (logit - max) and t apart keeps the normalizer.
+    float shifted = 0.0f, targetSum = 0.0f;
+    for (int c = 0; c < numClasses; c++) {
+        shifted += targets[baseIdx + c] * (predictions[baseIdx + c] - maxVal);
+        targetSum += targets[baseIdx + c];
+    }
+    loss[batch] = logf(sumExp) * targetSum - shifted;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void cross_entropy_backward(

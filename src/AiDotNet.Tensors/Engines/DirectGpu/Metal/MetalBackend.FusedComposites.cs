@@ -105,10 +105,10 @@ kernel void cross_entropy_rows(
     for (uint i = 0; i < numClasses; i++) maxVal = max(maxVal, logits[row + i]);
     float sumExp = 0.0f;
     for (uint i = 0; i < numClasses; i++) sumExp += exp(logits[row + i] - maxVal);
-    float logSumExp = log(sumExp);
-    float loss = 0.0f;
-    for (uint i = 0; i < numClasses; i++) loss -= targets[row + i] * ((logits[row + i] - maxVal) - logSumExp);
-    rowLoss[gid] = loss;
+    // -sum(t * (logit - max)) + log(sumExp) * sum(t), the two sums kept apart so fast math cannot fold them together.
+    float shifted = 0.0f, targetSum = 0.0f;
+    for (uint i = 0; i < numClasses; i++) { shifted += targets[row + i] * (logits[row + i] - maxVal); targetSum += targets[row + i]; }
+    rowLoss[gid] = log(sumExp) * targetSum - shifted;
 }
 
 // dX = dY * sigmoid(X), the activation library's numerically stable sigmoid. dX may be dY.

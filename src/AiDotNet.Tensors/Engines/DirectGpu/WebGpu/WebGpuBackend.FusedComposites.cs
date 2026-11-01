@@ -189,12 +189,13 @@ fn cross_entropy_rows(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var c: u32 = 0u; c < params.num_classes; c = c + 1u) { max_val = max(max_val, logits[base + c]); }
     var sum_exp: f32 = 0.0;
     for (var c: u32 = 0u; c < params.num_classes; c = c + 1u) { sum_exp = sum_exp + exp(logits[base + c] - max_val); }
-    let log_sum = log(sum_exp);
-    var loss: f32 = 0.0;
+    var shifted: f32 = 0.0;
+    var target_sum: f32 = 0.0;
     for (var c: u32 = 0u; c < params.num_classes; c = c + 1u) {
-        loss = loss - targets[base + c] * ((logits[base + c] - max_val) - log_sum);
+        shifted = shifted + targets[base + c] * (logits[base + c] - max_val);
+        target_sum = target_sum + targets[base + c];
     }
-    rowLoss[b] = loss;
+    rowLoss[b] = log(sum_exp) * target_sum - shifted;
 }
 ";
 
