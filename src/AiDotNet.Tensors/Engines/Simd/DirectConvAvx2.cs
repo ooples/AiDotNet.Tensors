@@ -30,7 +30,7 @@ internal enum DirectConvPasses
 /// registers for the whole reduction. On ResNet-sized small planes the im2col route spent as long building and
 /// scattering its column matrix as in the GEMM; this removes that traffic.
 /// </summary>
-internal static class DirectConvAvx2
+internal static partial class DirectConvAvx2
 {
     private const int Block = 8;
 
@@ -409,6 +409,23 @@ internal static class DirectConvAvx2
                 }
         }
     }
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void RunBackwardKernelTile(bool wide, float[] packedInput, float[] packedGrad, int[] offsets, float[] dest,
+        int destOffset, bool accumulate, int ob, int it, int batchBegin, int batchEnd, int inChannels, int outBlocks,
+        int paddedW, int planeIn, int kernelHeight, int kernelWidth, int dilationH, int dilationW, int positions)
+    {
+#if NET9_0_OR_GREATER
+        if (wide)
+        {
+            BackwardKernelTile512(packedInput, packedGrad, offsets, dest, destOffset, accumulate, ob, it, batchBegin, batchEnd,
+                inChannels, outBlocks, paddedW, planeIn, kernelHeight, kernelWidth, dilationH, dilationW, positions);
+            return;
+        }
+#endif
+        BackwardKernelTile(packedInput, packedGrad, offsets, dest, destOffset, accumulate, ob, it, batchBegin, batchEnd,
+            inChannels, outBlocks, paddedW, planeIn, kernelHeight, kernelWidth, dilationH, dilationW, positions);
+    }
+
     /// <summary>dW[oc, ic, kh, kw] (=, or += when <paramref name="accumulate"/>) for the conv of input with kernel.</summary>
     [MethodImpl(Hot)]
     public static void BackwardKernel(
@@ -421,11 +438,21 @@ internal static class DirectConvAvx2
         int inBlocks = inChannels / Block, outBlocks = outChannels / Block;
         int positions = outputHeight * outputWidth;
         int planeIn = paddedH * paddedW * Block;
-        int pairs = outBlocks * inBlocks;
+#if NET9_0_OR_GREATER
+        // AVX-512: one task per output block x pair of input blocks (sixteen input channels per vector).
+        bool wide = UseAvx512BackwardKernel(inChannels);
+#else
+        const bool wide = false;
+#endif
+        int inTiles = wide ? inBlocks / 2 : inBlocks;
+        int pairs = outBlocks * inTiles;
         int kernelSize = outChannels * inChannels * kernelHeight * kernelWidth;
         // Few block pairs leave cores idle (32 pairs for 32->64 channels), so the batch is split too: each slice
         // sums into its own partial gradient and the partials are reduced in a fixed order afterwards.
-        int splits = Math.Max(1, Math.Min(batch, ((targetTasks > 0 ? targetTasks : TargetBackwardKernelTasks) + pairs - 1) / pairs));
+        // The split count follows the 8-lane block pairs whichever tile runs, so both sum the same partials in the same
+        // order (the AVX-512 tile's results are bit-identical to the AVX2 tile's).
+        int blockPairs = outBlocks * inBlocks;
+        int splits = Math.Max(1, Math.Min(batch, ((targetTasks > 0 ? targetTasks : TargetBackwardKernelTasks) + blockPairs - 1) / blockPairs));
         // Each split adds a kernel-sized partial that ReducePartials reads back, so bound the partials' total size.
         splits = Math.Max(1, Math.Min(splits, (int)Math.Min(int.MaxValue, MaxBackwardKernelPartialFloats / Math.Max(1, kernelSize))));
         int imagesPerSplit = (batch + splits - 1) / splits;
@@ -447,8 +474,8 @@ internal static class DirectConvAvx2
             if (partials is null)
             {
                 CpuParallelSettings.ParallelForOrSerial(0, pairs, (long)kernelSize * batch * positions,
-                    [MethodImpl(Hot)] (task) => BackwardKernelTile(packedInput, packedGrad, offsets, dest, destOffset, accumulate,
-                        task / inBlocks, task % inBlocks, 0, batch, inChannels, outBlocks, paddedW, planeIn,
+                    [MethodImpl(Hot)] (task) => RunBackwardKernelTile(wide, packedInput, packedGrad, offsets, dest, destOffset,
+                        accumulate, task / inTiles, task % inTiles, 0, batch, inChannels, outBlocks, paddedW, planeIn,
                         kernelHeight, kernelWidth, dilationH, dilationW, positions),
                     deterministicSafe: true);
             }
@@ -458,8 +485,8 @@ internal static class DirectConvAvx2
                 {
                     int split = task / pairs, pair = task % pairs;
                     int b0 = split * imagesPerSplit;
-                    BackwardKernelTile(packedInput, packedGrad, offsets, partials, split * kernelSize, false,
-                        pair / inBlocks, pair % inBlocks, b0, Math.Min(batch, b0 + imagesPerSplit), inChannels, outBlocks,
+                    RunBackwardKernelTile(wide, packedInput, packedGrad, offsets, partials, split * kernelSize, false,
+                        pair / inTiles, pair % inTiles, b0, Math.Min(batch, b0 + imagesPerSplit), inChannels, outBlocks,
                         paddedW, planeIn, kernelHeight, kernelWidth, dilationH, dilationW, positions);
                 }, deterministicSafe: true);
                 ReducePartials(partials, splits, kernelSize, dest, destOffset, accumulate);

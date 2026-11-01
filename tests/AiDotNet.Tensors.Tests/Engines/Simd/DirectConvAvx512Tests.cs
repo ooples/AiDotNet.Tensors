@@ -11,7 +11,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd;
 
 /// <summary>
 /// The direct convolution's AVX-512 kernel (<c>ForwardSextetRun512</c>) against its AVX2 kernel: every output's FMA
-/// chain is the same, so forward and input-gradient results must be bit-identical, over plain and strided grids, run
+/// chain is the same, so forward, input-gradient and weight-gradient results must be bit-identical, over plain and strided grids, run
 /// tails that are not a multiple of six, several input-channel passes, and batches whose runs span images.
 /// On hosts without AVX-512 the kernel runs on the software Vector512 fallback (the same arithmetic), so it is tested
 /// everywhere; the hosted CI runners are often AVX-512 Xeons or Zen 4/5, where it runs natively.
@@ -28,6 +28,7 @@ public class DirectConvAvx512Tests
         { 2, 64, 128, 8, 2, 1 },
         { 4, 32, 32, 5, 1, 1 },
         { 8, 512, 64, 4, 1, 1 },
+        { 16, 32, 64, 6, 1, 1 },   // weight gradient split into partials over the batch
     };
 
     [SkippableTheory]
@@ -46,11 +47,12 @@ public class DirectConvAvx512Tests
         {
             DirectConvAvx2.s_useAvx512 = true;
             DirectConvAvx2.s_forceAvx512ForTest = !System.Runtime.Intrinsics.Vector512.IsHardwareAccelerated;
-            var (y512, dx512) = Run(x, w, dy, batch, inChannels, outChannels, size, stride, padding, o);
+            var (y512, dx512, dw512) = Run(x, w, dy, batch, inChannels, outChannels, size, stride, padding, o);
             DirectConvAvx2.s_useAvx512 = false;
-            var (y256, dx256) = Run(x, w, dy, batch, inChannels, outChannels, size, stride, padding, o);
+            var (y256, dx256, dw256) = Run(x, w, dy, batch, inChannels, outChannels, size, stride, padding, o);
             Assert.Equal(y256, y512);
             Assert.Equal(dx256, dx512);
+            Assert.Equal(dw256, dw512);
         }
         finally
         {
@@ -60,7 +62,7 @@ public class DirectConvAvx512Tests
     }
 
     // Straight through the direct kernel (no route choice), so the comparison cannot land on another implementation.
-    private static (float[] Y, float[] Dx) Run(Tensor<float> x, Tensor<float> w, Tensor<float> dy,
+    private static (float[] Y, float[] Dx, float[] Dw) Run(Tensor<float> x, Tensor<float> w, Tensor<float> dy,
         int batch, int inChannels, int outChannels, int size, int stride, int padding, int o)
     {
         var y = new float[batch * outChannels * o * o];
@@ -69,7 +71,13 @@ public class DirectConvAvx512Tests
         var dx = new float[batch * inChannels * size * size];
         DirectConvAvx2.BackwardInput(dy.ToArray(), 0, w.ToArray(), 0, dx, 0, accumulate: false, batch, inChannels, size, size,
             outChannels, 3, 3, stride, stride, padding, padding, o, o);
-        return (y, dx);
+        // The weight gradient accumulated onto a seeded buffer (the += path), with a target task count that splits the
+        // batch into partial gradients.
+        var dw = new float[outChannels * inChannels * 9];
+        for (int i = 0; i < dw.Length; i++) dw[i] = (i % 7) * 0.125f;
+        DirectConvAvx2.BackwardKernel(x.ToArray(), 0, dy.ToArray(), 0, dw, 0, accumulate: true, batch, inChannels, size, size,
+            outChannels, 3, 3, stride, stride, padding, padding, 1, 1, o, o, targetTasks: 4 * outChannels);
+        return (y, dx, dw);
     }
 
     private static Tensor<float> Random(Random rng, params int[] shape)
