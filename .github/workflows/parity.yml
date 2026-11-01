@@ -258,6 +258,16 @@ jobs:
           done
           cat "$out"
 
+      - name: JIT disassembly
+        if: steps.isa.outputs.run == '1'
+        continue-on-error: true
+        run: |
+          for f in /tmp/jit*.txt; do
+            [ -f "$f" ] || continue
+            echo "## $f"
+            grep -n "; Assembly listing for method\|; Tier\|; FullOpts\|; optimized" "$f" | head -40
+            awk '/; Assembly listing for method/{n++} n>0' "$f" | grep -vE '^\s*$' | head -1500
+          done
       - name: Perf profile
         if: steps.isa.outputs.run == '1' && inputs.probe_perf != ''
         continue-on-error: true
