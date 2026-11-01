@@ -228,7 +228,7 @@ jobs:
                   IFS=','
                   for kv in $settings; do [ -n "$kv" ] && export "$kv"; done
                   unset IFS
-                  dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-build --framework net10.0                     --filter "$H2H" --logger "console;verbosity=detailed" 2>&1                     | grep -E 'step ratio|IsAsFastAsPyTorch' | grep -vE '^\s*$' | sed "s/^\s*/r$r $name /" | cut -c1-220 >> "$out" || true
+                  dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-build --framework net10.0                     --filter "$H2H" --logger "console;verbosity=detailed" 2>&1                     | grep -E 'step ratio|IsAsFastAsPyTorch|forward  |backward  |optimizer  |step  |best vs best| modes' | grep -vE '^\s*$' | sed "s/^\s*/r$r $name /" | cut -c1-220 >> "$out" || true
                 )
               done
             done
