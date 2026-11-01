@@ -734,11 +734,50 @@ public class GpuTapeGradientParityTests : IDisposable
     [SkippableFact]
     // The input gradient is a 27-term product per element, which the CPU GEMM's remainder columns and the device kernel
     // both accumulate as one fused multiply-add per term in order: the results can match bit for bit, so engagement is
-    // read from the residency counter.
+    // read from the residency counter. That counter is process-wide (the loss and the gradient reads touch it too), so
+    // the op's own device engagement is asserted per operation by the stays-on-device test (forward) and
+    // ConvTranspose2D_backward_runs_on_the_device (both gradients).
     public void ConvTranspose2D_gradients_match_cpu() =>
         AssertGradientParity("ConvTranspose2D", Rand([6, 10], seed: 349),
             static (e, t) => e.ConvTranspose2D(t.Reshape(new[] { 1, 2, 5, 6 }), ConvTransposeKernel,
                 new[] { 2, 2 }, new[] { 1, 1 }, new[] { 0, 0 }), probe: Engagement.UseResidencyCounter);
+
+    // Each backward operation alone, launch-counted around just that call: at least one kernel launch and no recorded
+    // fallback for it. The parity test above cannot show this, since its residency counter sees every op of the step.
+    [SkippableFact]
+    public void ConvTranspose2D_backward_runs_on_the_device()
+    {
+        var gpu = TryGpu(out var resolved) && resolved is not null
+            ? resolved
+            : throw new SkipException("GPU backend did not resolve.");
+        using (gpu)
+        {
+            IEngine engine = gpu;
+            AiDotNetEngine.Current = engine;
+            var x = Rand([1, 2, 5, 6], seed: 383);
+            var dy = Rand([1, 3, 9, 11], seed: 389);
+            int[] stride = { 2, 2 }, padding = { 1, 1 };
+            _ = engine.TensorAdd(dy, dy);                      // warm the device path outside the counts
+
+            AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Reset();
+            var dx = engine.ConvTranspose2DBackwardInput(dy, ConvTransposeKernel, x.Shape.ToArray(), stride, padding);
+            long inputLaunches = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Count;
+            string[] inputFallbacks = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Fallbacks;
+
+            AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Reset();
+            var dk = engine.ConvTranspose2DBackwardKernel(dy, x, ConvTransposeKernel.Shape.ToArray(), stride, padding);
+            long kernelLaunches = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Count;
+            string[] kernelFallbacks = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Fallbacks;
+
+            _out.WriteLine($"ConvTranspose2D backward: input launches={inputLaunches}, kernel launches={kernelLaunches}");
+            Assert.True(inputLaunches >= 1, "ConvTranspose2DBackwardInput launched no GPU kernel — it ran on the CPU.");
+            Assert.True(kernelLaunches >= 1, "ConvTranspose2DBackwardKernel launched no GPU kernel — it ran on the CPU.");
+            Assert.DoesNotContain(inputFallbacks, f => f.Contains("ConvTranspose2DBackwardInput"));
+            Assert.DoesNotContain(kernelFallbacks, f => f.Contains("ConvTranspose2DBackwardKernel"));
+            Assert.Equal(new[] { 1, 2, 5, 6 }, dx.Shape.ToArray());
+            Assert.Equal(ConvTransposeKernel.Shape.ToArray(), dk.Shape.ToArray());
+        }
+    }
 
     [SkippableFact]
     public void ConvTranspose2D_stays_on_the_device_while_a_tape_records() =>

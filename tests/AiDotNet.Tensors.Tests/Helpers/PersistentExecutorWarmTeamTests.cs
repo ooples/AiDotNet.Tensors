@@ -17,11 +17,21 @@ public sealed class PersistentExecutorWarmTeamTests
 {
     private static PersistentParallelExecutor Pool => PersistentParallelExecutor.Instance;
 
+    // AIDOTNET_COOP_POOL=0 sends every dispatch to Parallel.For, so the persistent workers never run or warm-spin.
+    private static bool PoolDisabled => Environment.GetEnvironmentVariable("AIDOTNET_COOP_POOL") == "0";
+
+    // AIDOTNET_PPE_WARM_FULL_WIDTH=0 parks a team that, with the dispatching thread, fills the machine.
+    private static bool FullWidthParks => Environment.GetEnvironmentVariable("AIDOTNET_PPE_WARM_FULL_WIDTH") == "0";
+
+    // The widest team (workers plus the dispatching thread) that may warm-spin in the configured mode.
+    private static int WidestWarmTeam => FullWidthParks ? Environment.ProcessorCount - 1 : Environment.ProcessorCount;
+
     [SkippableFact]
     public void WorkersLeftOutOfSmallerDispatches_ParkWhileThePoolStaysBusy()
     {
-        int dop = Math.Min(8, Math.Min(Environment.ProcessorCount, Pool.WorkerCount + 1));
-        Skip.If(dop < 3, "Needs a team of at least two workers.");
+        Skip.If(PoolDisabled, "AIDOTNET_COOP_POOL=0: dispatches never reach the persistent workers.");
+        int dop = Math.Min(8, Math.Min(WidestWarmTeam, Pool.WorkerCount + 1));
+        Skip.If(dop < 3, "Needs a team of at least two workers that may warm-spin.");
         int priorDop = CpuParallelSettings.MaxDegreeOfParallelism;
         var priorWarm = PersistentParallelExecutor.WarmWindow;
         try
@@ -51,7 +61,8 @@ public sealed class PersistentExecutorWarmTeamTests
     [SkippableFact]
     public void AHotLoopOfDispatches_WaitsOnItsWarmWorkers()
     {
-        Skip.If(Math.Min(Environment.ProcessorCount, Pool.WorkerCount + 1) < 4, "Needs a team of three workers.");
+        Skip.If(PoolDisabled, "AIDOTNET_COOP_POOL=0: dispatches never reach the persistent workers.");
+        Skip.If(Math.Min(WidestWarmTeam, Pool.WorkerCount + 1) < 4, "Needs a team of three workers that may warm-spin.");
         int priorDop = CpuParallelSettings.MaxDegreeOfParallelism;
         var priorWarm = PersistentParallelExecutor.WarmWindow;
         try

@@ -186,7 +186,8 @@ jobs:
 
       - name: ISA A/B (AVX-512 on, off, and each AVX-512 route off alone)
         # Which losses come from this library's AVX-512 dispatch: the same networks and operations with the runtime's
-        # AVX-512 support hidden (DOTNET_EnableAVX512F=0), then with one AVX-512 route at a time switched to its AVX2
+        # AVX-512 support hidden (DOTNET_EnableAVX512=0, the .NET 10 switch for the whole AVX-512 group; .NET 10 no longer reads
+        # the per-ISA DOTNET_EnableAVX512F), then with one AVX-512 route at a time switched to its AVX2
         # counterpart (the direct convolution kernel, the 6x32 direct GEMM tile, the packed GEMM's 16x16 tile), against
         # the same PyTorch. An AVX2 runner runs the default mode only.
         if: ${{ inputs.isa_ab }}
@@ -198,7 +199,7 @@ jobs:
           python tools/parity/cpu_op_breakdown_torch.py > "$RUNNER_TEMP/ops-torch.log"
           modes="on="
           if grep -q avx512f /proc/cpuinfo; then
-            modes="$modes off=DOTNET_EnableAVX512F=0 conv-avx2=AIDOTNET_DIRECT_CONV_AVX512=0 direct-gemm-avx2=AIDOTNET_V512_DIRECT=0 packed-gemm-avx2=AIDOTNET_AVX512_GEMM_TILE=0"
+            modes="$modes off=DOTNET_EnableAVX512=0 conv-avx2=AIDOTNET_DIRECT_CONV_AVX512=0 direct-gemm-avx2=AIDOTNET_V512_DIRECT=0 packed-gemm-avx2=AIDOTNET_AVX512_GEMM_TILE=0 streaming-avx512=AIDOTNET_AVX512_STREAMING=1"
           fi
           for spec in $modes; do
             mode="${spec%%=*}"; setting="${spec#*=}"

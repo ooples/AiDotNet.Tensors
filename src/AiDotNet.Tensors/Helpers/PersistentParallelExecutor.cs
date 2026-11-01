@@ -690,7 +690,6 @@ internal sealed class PersistentParallelExecutor
     private void WorkerLoop(int slot)
     {
         long lastJobId = 0;
-        long lastWokenTicks = 0;
         while (true)
         {
             // Adaptive cooperative warm-spin: stay hot while the pool is actively
@@ -713,6 +712,10 @@ internal sealed class PersistentParallelExecutor
             if (warm > 0 && slot < lastWorkers && TeamLeavesWarmRoom(lastWorkers) && !_workReady[slot].IsSet)
             {
                 int spins = 0;
+                // When this slot was first seen left out of the team (0 = it is in the team). The grace period runs
+                // from here, not from the last wake-up: a slot woken long ago would otherwise park on its first
+                // left-out check, which is the premature parking the grace period exists to prevent.
+                long leftOutSinceTicks = 0;
                 while (!_workReady[slot].IsSet)
                 {
                     // Tight, responsive spin on EVERY iteration so an imminent dispatch is
@@ -737,9 +740,16 @@ internal sealed class PersistentParallelExecutor
                         // compete with the active team. A shorter lapse stays warm: ops interleave narrow and wide
                         // dispatches, and parking on the first narrow one put a wake-up on the next wide one.
                         int teamNow = System.Threading.Volatile.Read(ref _lastWorkersNeeded);
-                        if ((slot >= teamNow || !TeamLeavesWarmRoom(teamNow))
-                            && System.Diagnostics.Stopwatch.GetTimestamp() - lastWokenTicks >= s_leftOutTicks)
-                            break;
+                        if (slot >= teamNow || !TeamLeavesWarmRoom(teamNow))
+                        {
+                            long now = System.Diagnostics.Stopwatch.GetTimestamp();
+                            if (leftOutSinceTicks == 0) leftOutSinceTicks = now;
+                            else if (now - leftOutSinceTicks >= s_leftOutTicks) break;
+                        }
+                        else
+                        {
+                            leftOutSinceTicks = 0;
+                        }
                     }
                 }
             }
@@ -750,7 +760,6 @@ internal sealed class PersistentParallelExecutor
                 _workReady[slot].Wait();
             }
             System.Threading.Volatile.Write(ref _parked[slot], 0);
-            lastWokenTicks = System.Diagnostics.Stopwatch.GetTimestamp();
             _workReady[slot].Reset();
 #if NET5_0_OR_GREATER
             ApplyPinning(slot);

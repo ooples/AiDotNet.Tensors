@@ -18952,7 +18952,45 @@ public partial class CpuEngine : ITensorLevelEngine
         if (output == null) throw new ArgumentNullException(nameof(output));
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
+        ValidateDepthwiseGeometry(input._shape, kernel._shape, output._shape, stride, padding, nameof(output));
         DepthwiseConv2DComputeIntoOutput(input, kernel, stride, padding, output.GetDataArray());
+    }
+
+    /// <summary>
+    /// Rejects depthwise geometry the unchecked kernels (the typed loops and <c>Simd.DepthwiseConv3x3</c>) would index out
+    /// of bounds with: the kernel must be [inChannels, multiplier, kH, kW], and an output or output gradient must be
+    /// [batch, inChannels * multiplier, outH, outW] for this input, stride and padding.
+    /// </summary>
+    private static void ValidateDepthwiseGeometry(int[] inputShape, int[] kernelShape, int[]? outputShape, int[] stride,
+        int[] padding, string outputName)
+    {
+        if (inputShape.Length != 4)
+            throw new ArgumentException($"Depthwise convolution needs a 4D [batch, channels, height, width] input; got rank {inputShape.Length}.");
+        if (kernelShape.Length != 4)
+            throw new ArgumentException($"Depthwise convolution needs a 4D [inChannels, multiplier, kH, kW] kernel; got rank {kernelShape.Length}.");
+        if (stride == null || stride.Length < 2 || stride[0] <= 0 || stride[1] <= 0)
+            throw new ArgumentException("Depthwise convolution needs two positive strides.", nameof(stride));
+        if (padding == null || padding.Length < 2 || padding[0] < 0 || padding[1] < 0)
+            throw new ArgumentException("Depthwise convolution needs two non-negative paddings.", nameof(padding));
+        if (kernelShape[0] != inputShape[1])
+            throw new ArgumentException(
+                $"Depthwise kernel has {kernelShape[0]} input channels but the input has {inputShape[1]}.");
+        if (kernelShape[1] <= 0 || kernelShape[2] <= 0 || kernelShape[3] <= 0)
+            throw new ArgumentException("Depthwise kernel multiplier and spatial size must be positive.");
+
+        int outH = (inputShape[2] + 2 * padding[0] - kernelShape[2]) / stride[0] + 1;
+        int outW = (inputShape[3] + 2 * padding[1] - kernelShape[3]) / stride[1] + 1;
+        if (outH <= 0 || outW <= 0)
+            throw new ArgumentException(
+                $"Depthwise kernel {kernelShape[2]}x{kernelShape[3]} does not fit the padded {inputShape[2]}x{inputShape[3]} input.");
+        if (outputShape is null) return;
+
+        int outChannels = inputShape[1] * kernelShape[1];
+        if (outputShape.Length != 4 || outputShape[0] != inputShape[0] || outputShape[1] != outChannels
+            || outputShape[2] != outH || outputShape[3] != outW)
+            throw new ArgumentException(
+                $"{outputName} shape [{string.Join(", ", outputShape)}] does not match the depthwise output " +
+                $"[{inputShape[0]}, {outChannels}, {outH}, {outW}].", outputName);
     }
 
     /// <inheritdoc/>
@@ -18960,6 +18998,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
+        ValidateDepthwiseGeometry(input._shape, kernel._shape, null, stride, padding, "output");
 
         if (GraphMode.IsActive)
         {
@@ -19487,6 +19526,8 @@ public partial class CpuEngine : ITensorLevelEngine
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
         var kernelOrig = kernel;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!kernel.IsContiguous) kernel = kernel.Contiguous();
+        if (inputShape == null) throw new ArgumentNullException(nameof(inputShape));
+        ValidateDepthwiseGeometry(inputShape, kernel._shape, gradOutput._shape, stride, padding, nameof(gradOutput));
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
@@ -19660,6 +19701,8 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         var gradOutputOrig = gradOutput;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (kernelShape == null) throw new ArgumentNullException(nameof(kernelShape));
+        ValidateDepthwiseGeometry(input._shape, kernelShape, gradOutput._shape, stride, padding, nameof(gradOutput));
 
         var numOps = MathHelper.GetNumericOperations<T>();
 

@@ -134,40 +134,43 @@ internal static unsafe class WinogradF43
         CpuParallelSettings.ParallelForOrSerial(0, batch * blocks, (long)batch * cOut * hw * 12, [MethodImpl(MethodImplOptions.AggressiveOptimization)] (job) =>
         {
             int n = job / blocks, kb = job - n * blocks;
-            float[] scratch = Scratch(tileFloats);
-            fixed (float* gp = dy)
-            fixed (float* dp = d)
-            fixed (float* tp = scratch)
+            float[] scratch = RentScratch(tileFloats);
+            try
             {
-                new Span<float>(tp, tileFloats).Clear();
-                float* planes = gp + dyOff + ((long)n * cOut + kb * 8) * hw;
-                for (int h = 0; h < height; h++)
+                fixed (float* gp = dy)
+                fixed (float* dp = d)
+                fixed (float* tp = scratch)
                 {
-                    float* src = planes + h * width;
-                    float* dst = tp + h * outW * 8;
-                    int q = 0;
-                    for (; q + 8 <= width; q += 8) Transpose8x8(src + q, hw, dst + q * 8, 8);
-                    for (; q < width; q++)
-                        for (int l = 0; l < 8; l++) dst[q * 8 + l] = src[(long)l * hw + q];
-                }
-                var g = stackalloc Vector256<float>[16];
-                var t = stackalloc Vector256<float>[24];
-                var r = stackalloc Vector256<float>[36];
-                long pointStride = (long)patches * cOut;
-                for (int th = 0; th < tilesH; th++)
-                    for (int tw = 0; tw < tilesW; tw++)
+                    new Span<float>(tp, tileFloats).Clear();
+                    float* planes = gp + dyOff + ((long)n * cOut + kb * 8) * hw;
+                    for (int h = 0; h < height; h++)
                     {
-                        float* tile = tp + (th * Tile * outW + tw * Tile) * 8;
-                        for (int a = 0; a < 4; a++)
-                            for (int b = 0; b < 4; b++)
-                                g[a * 4 + b] = Avx.LoadVector256(tile + (a * outW + b) * 8);
-                        // Columns: t[., b] = A g[., b] (6 x 4); rows: r[i, .] = t[i, .] A^T (6 x 6).
-                        for (int b = 0; b < 4; b++) GradientTransform(g, b, 4, t, b, 4);
-                        for (int i = 0; i < 6; i++) GradientTransform(t, i * 4, 1, r, i * 6, 1);
-                        int p = n * tiles + th * tilesW + tw;
-                        float* dstPatch = dp + (long)p * cOut + kb * 8;
-                        for (int xi = 0; xi < Points; xi++) Avx.Store(dstPatch + xi * pointStride, r[xi]);
+                        float* src = planes + h * width;
+                        float* dst = tp + h * outW * 8;
+                        int q = 0;
+                        for (; q + 8 <= width; q += 8) Transpose8x8(src + q, hw, dst + q * 8, 8);
+                        for (; q < width; q++)
+                            for (int l = 0; l < 8; l++) dst[q * 8 + l] = src[(long)l * hw + q];
                     }
+                    var g = stackalloc Vector256<float>[16];
+                    var t = stackalloc Vector256<float>[24];
+                    var r = stackalloc Vector256<float>[36];
+                    long pointStride = (long)patches * cOut;
+                    for (int th = 0; th < tilesH; th++)
+                        for (int tw = 0; tw < tilesW; tw++)
+                        {
+                            LoadTile(tp + (th * Tile * outW + tw * Tile) * 8, outW * 8, 4, 4, g);
+                            // Columns: t[., b] = A g[., b] (6 x 4); rows: r[i, .] = t[i, .] A^T (6 x 6).
+                            for (int b = 0; b < 4; b++) GradientTransform(g, b, 4, t, b, 4);
+                            for (int i = 0; i < 6; i++) GradientTransform(t, i * 4, 1, r, i * 6, 1);
+                            int p = n * tiles + th * tilesW + tw;
+                            StorePoints(r, dp + (long)p * cOut + kb * 8, pointStride);
+                        }
+                }
+            }
+            finally
+            {
+                ReturnScratch(scratch, tileFloats);
             }
         }, deterministicSafe: true);
     }
@@ -283,12 +286,52 @@ internal static unsafe class WinogradF43
 
     [ThreadStatic] private static float[]? t_scratch;
 
-    // A task's tile scratch: one per thread, grown on demand (the input and output transforms never overlap on a thread).
-    private static float[] Scratch(int length)
+    // Largest tile scratch a thread keeps between jobs (1 MB): a 112x112 plane's eight channels (~400 KB) stay reused,
+    // while a larger plane's buffer goes back to the pool after its job instead of living on every persistent worker.
+    private const int MaxRetainedScratchFloats = 1 << 18;
+
+    // A job's tile scratch (the input and output transforms never overlap on a thread). Pair with ReturnScratch.
+    private static float[] RentScratch(int length)
     {
+        if (length > MaxRetainedScratchFloats) return ArrayPool<float>.Shared.Rent(length);
         var s = t_scratch;
         if (s is null || s.Length < length) t_scratch = s = new float[length];
         return s;
+    }
+
+    private static void ReturnScratch(float[] scratch, int length)
+    {
+        if (length > MaxRetainedScratchFloats) ArrayPool<float>.Shared.Return(scratch);
+    }
+
+    // The 36 transform-domain points of one patch, stride floats apart, to and from 36 vectors.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void StorePoints(Vector256<float>* src, float* dst, long stride)
+    {
+        for (int xi = 0; xi < Points; xi++) Avx.Store(dst + xi * stride, src[xi]);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void LoadPoints(float* src, long stride, Vector256<float>* dst)
+    {
+        for (int xi = 0; xi < Points; xi++) dst[xi] = Avx.LoadVector256(src + xi * stride);
+    }
+
+    // A rows x cols tile of eight-channel vectors, rowFloats floats between rows, to and from dst[r * cols + c].
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void LoadTile(float* src, int rowFloats, int rows, int cols, Vector256<float>* dst)
+    {
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < cols; c++)
+                dst[r * cols + c] = Avx.LoadVector256(src + r * rowFloats + c * 8);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void StoreTile(Vector256<float>* src, int rows, int cols, float* dst, int rowFloats)
+    {
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < cols; c++)
+                Avx.Store(dst + r * rowFloats + c * 8, src[r * cols + c]);
     }
 
     // U [36][cIn][cOut] = G g G^T per (input channel, output channel), eight output channels per vector.
@@ -316,8 +359,7 @@ internal static unsafe class WinogradF43
                 // U = t G^T (6 x 6), row by row.
                 var uu = stackalloc Vector256<float>[36];
                 for (int i = 0; i < 6; i++) TransformKernelColumn(t[i * 3], t[i * 3 + 1], t[i * 3 + 2], uu, i * 6, 1);
-                for (int xi = 0; xi < Points; xi++)
-                    Avx.Store(up + ((long)xi * cIn + ic) * cOut + o0, uu[xi]);
+                StorePoints(uu, up + (long)ic * cOut + o0, (long)cIn * cOut);
             }
         }, deterministicSafe: true);
     }
@@ -353,7 +395,8 @@ internal static unsafe class WinogradF43
         CpuParallelSettings.ParallelForOrSerial(0, batch * blocks, (long)batch * cIn * hw * 12, [MethodImpl(MethodImplOptions.AggressiveOptimization)] (job) =>
         {
             int n = job / blocks, cb = job - n * blocks;
-            float[] scratch = Scratch(tileFloats);
+            float[] scratch = RentScratch(tileFloats);
+            try
             {
                 fixed (float* xp = x)
                 fixed (float* vp = v)
@@ -376,18 +419,18 @@ internal static unsafe class WinogradF43
                     for (int th = 0; th < tilesH; th++)
                         for (int tw = 0; tw < tilesW; tw++)
                         {
-                            float* patch = tp + (th * Tile * padW + tw * Tile) * 8;
-                            for (int i = 0; i < 6; i++)
-                                for (int j = 0; j < 6; j++)
-                                    d[i * 6 + j] = Avx.LoadVector256(patch + (i * padW + j) * 8);
+                            LoadTile(tp + (th * Tile * padW + tw * Tile) * 8, padW * 8, 6, 6, d);
                             // Rows: t[., j] = B^T d[., j]; then columns: V[i, .] = t[i, .] B.
                             for (int j = 0; j < 6; j++) InputTransform(d, j, 6, t, j, 6);
                             for (int i = 0; i < 6; i++) InputTransform(t, i * 6, 1, d, i * 6, 1);
                             int p = n * tiles + th * tilesW + tw;
-                            float* dstPatch = vp + (long)p * cIn + cb * 8;
-                            for (int xi = 0; xi < Points; xi++) Avx.Store(dstPatch + xi * pointStride, d[xi]);
+                            StorePoints(d, vp + (long)p * cIn + cb * 8, pointStride);
                         }
                 }
+            }
+            finally
+            {
+                ReturnScratch(scratch, tileFloats);
             }
         }, deterministicSafe: true);
     }
@@ -445,7 +488,8 @@ internal static unsafe class WinogradF43
         CpuParallelSettings.ParallelForOrSerial(0, batch * blocks, (long)batch * cOut * hw * 12, [MethodImpl(MethodImplOptions.AggressiveOptimization)] (job) =>
         {
             int n = job / blocks, kb = job - n * blocks;
-            float[] scratch = Scratch(tileFloats + 64);
+            float[] scratch = RentScratch(tileFloats + 64);
+            try
             {
                 fixed (float* mp = m)
                 fixed (float* yp = y)
@@ -459,15 +503,11 @@ internal static unsafe class WinogradF43
                         for (int tw = 0; tw < tilesW; tw++)
                         {
                             int p = n * tiles + th * tilesW + tw;
-                            float* srcPatch = mp + (long)p * cOut + kb * 8;
-                            for (int xi = 0; xi < Points; xi++) mm[xi] = Avx.LoadVector256(srcPatch + xi * pointStride);
+                            LoadPoints(mp + (long)p * cOut + kb * 8, pointStride, mm);
                             // Rows: t[a, j] = A^T m[., j] (4 x 6); columns: r[a, b] = t[a, .] A (4 x 4).
                             for (int j = 0; j < 6; j++) OutputTransform(mm, j, 6, t, j, 6);
                             for (int a = 0; a < 4; a++) OutputTransform(t, a * 6, 1, r, a * 4, 1);
-                            float* dst = op + (th * Tile * outW + tw * Tile) * 8;
-                            for (int a = 0; a < 4; a++)
-                                for (int b = 0; b < 4; b++)
-                                    Avx.Store(dst + (a * outW + b) * 8, r[a * 4 + b]);
+                            StoreTile(r, 4, 4, op + (th * Tile * outW + tw * Tile) * 8, outW * 8);
                         }
                     float* planes = yp + yOff + ((long)n * cOut + kb * 8) * hw;
                     float* tmp = op + tileFloats;   // 64 floats
@@ -498,6 +538,10 @@ internal static unsafe class WinogradF43
                         }
                     }
                 }
+            }
+            finally
+            {
+                ReturnScratch(scratch, tileFloats + 64);
             }
         }, deterministicSafe: true);
     }
