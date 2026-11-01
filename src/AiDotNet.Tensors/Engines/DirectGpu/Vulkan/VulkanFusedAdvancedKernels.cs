@@ -183,10 +183,10 @@ float fused_apply_activation(float x)
     if (p.activation == 2u)
     {
         float k = sqrt(2.0 / 3.14159265358979323846);
-        return 0.5 * x * (1.0 + tanh(k * (x + 0.044715 * x * x * x)));
+        return 0.5 * x * (1.0 + tanh(clamp(k * (x + 0.044715 * x * x * x), -10.0, 10.0)));
     }
     if (p.activation == 3u) return 1.0 / (1.0 + exp(-x));
-    if (p.activation == 4u) return tanh(x);
+    if (p.activation == 4u) return tanh(clamp(x, -10.0, 10.0));
     if (p.activation == 5u) return x > 0.0 ? x : 0.01 * x;
     if (p.activation == 6u)
     {
