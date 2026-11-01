@@ -26264,8 +26264,11 @@ public partial class CpuEngine : ITensorLevelEngine
                 // A 4D float input on the CPU is normalized straight into the recorded output below, reading the input's
                 // live array: the eager path copied a pool-padded input whole (GetReadOnlyDataArray) and normalized into
                 // a fresh result it then copied into the recorded output -- two activation-sized temporaries per BatchNorm,
-                // over a quarter of everything a DenseNet-121 training trace allocated.
-                bool directIntoRecorded = typeof(T) == typeof(float) && !SupportsGpu && input.Rank == 4
+                // over a quarter of everything a DenseNet-121 training trace allocated. A GPU engine defers the same way:
+                // the eager path normalized on the device, then the copy realized the node (normalizing again, and
+                // realizing every unrealized producer above it) and downloaded the result; the pooled eager result kept
+                // its device buffer, 1.1 GB of trace-time BatchNorm outputs held all run on DenseNet-121.
+                bool directIntoRecorded = typeof(T) == typeof(float) && input.Rank == 4
                     && input.IsContiguous && gamma.IsContiguous && beta.IsContiguous
                     && gamma.Length == input._shape[1] && beta.Length == input._shape[1];
                 var savedScope = GraphMode.Current;
