@@ -17,6 +17,9 @@ public class DeterministicModeTests
     [Fact]
     public void BlasProvider_SetDeterministicMode_Toggles()
     {
+        // The process-wide switch: a thread-local override (TensorCodecOptions) on this xunit worker would take precedence.
+        bool? priorOverride = BlasProvider.GetThreadLocalDeterministicMode();
+        BlasProvider.SetThreadLocalDeterministicMode(null);
         bool before = BlasProvider.IsDeterministicMode;
         try
         {
@@ -29,6 +32,7 @@ public class DeterministicModeTests
         finally
         {
             BlasProvider.SetDeterministicMode(before);  // restore
+            BlasProvider.SetThreadLocalDeterministicMode(priorOverride);
         }
     }
 

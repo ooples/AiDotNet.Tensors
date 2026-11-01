@@ -427,7 +427,7 @@ public class Issue327TransformerTrainPerfTests
         var priorEngine = AiDotNetEngine.Current;
         var engine = new CpuEngine();
         AiDotNetEngine.Current = engine;
-        var prevOpts = AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.Current;
+        var prevOpts = AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.Save();   // restores the options AND the thread\'s determinism override
         AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.SetCurrent(new AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions
         {
             EnableDataflowFusion = true,
@@ -464,7 +464,7 @@ public class Issue327TransformerTrainPerfTests
         }
         finally
         {
-            AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.SetCurrent(prevOpts);
+            prevOpts.Dispose();
             AiDotNetEngine.Current = priorEngine;
         }
     }

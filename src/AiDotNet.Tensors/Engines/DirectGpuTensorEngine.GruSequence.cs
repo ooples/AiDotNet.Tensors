@@ -21,6 +21,15 @@ public partial class DirectGpuTensorEngine
     {
         using var __gpuOp = EnterGpuOp();
         var (batch, seqLen, inputSize, hidden) = ValidateGruSequence(input, h0, wIh, wHh, bIh, bHh);
+        // Compiled training: one device node with a direct backward (TryRecordGruSequenceTrain); a model that reads only
+        // the final state gets a node whose output is h_T and whose backward takes that gradient alone.
+        if (GraphMode.IsActive && !GraphMode.IsInferenceTrace && resetAfter && seqLen > 0 && batch > 0 && inputSize > 0
+            && GraphMode.Current is { } trainScope
+            && TryRecordGruSequenceTrain(trainScope, input, h0, wIh, wHh, bIh, bHh, lastStepOnly: !returnSequences) is { } recorded)
+        {
+            finalHidden = returnSequences ? Reshape(TensorNarrow(recorded, 1, seqLen - 1, 1), new[] { batch, hidden }) : recorded;
+            return recorded;
+        }
         // Graph capture records the host op's lazy node, whose replay runs this engine eagerly. An empty extent has
         // nothing to launch and the kernels require positive ones: the host path returns the empty result.
         if (seqLen == 0 || batch == 0 || inputSize == 0 || GraphMode.IsActive || typeof(T) != typeof(float)
@@ -53,9 +62,14 @@ public partial class DirectGpuTensorEngine
             gates = AllocateFullyWrittenOutputBuffer(backend, gatesSize);
             ghn = AllocateFullyWrittenOutputBuffer(backend, ghnSize);
             if (!resetAfter) rh = AllocateFullyWrittenOutputBuffer(backend, rhSize);
-            PortableGruSequence.Forward(backend, fused.StatefulLstmLauncher, x.Buffer, hInit.Buffer, wi.Buffer, wh.Buffer,
-                bi.Buffer, bh.Buffer, y.Buffer, allH.Buffer, gates.Buffer, ghn.Buffer, resetAfter ? null : rh.Buffer,
-                seqLen, batch, inFeatures, hidden, resetAfter);
+            // The backend's GRU sequence (CUDA's fused kernels; the portable ones elsewhere); the caches are the same.
+            if (resetAfter && backend is IFusedGruSequence fusedGru)
+                fusedGru.GruForwardSequence(x.Buffer, hInit.Buffer, wi.Buffer, wh.Buffer, bi.Buffer, bh.Buffer, y.Buffer,
+                    allH.Buffer, gates.Buffer, ghn.Buffer, seqLen, batch, inFeatures, hidden, hFinal: null);
+            else
+                PortableGruSequence.Forward(backend, fused.StatefulLstmLauncher, x.Buffer, hInit.Buffer, wi.Buffer, wh.Buffer,
+                    bi.Buffer, bh.Buffer, y.Buffer, allH.Buffer, gates.Buffer, ghn.Buffer, resetAfter ? null : rh.Buffer,
+                    seqLen, batch, inFeatures, hidden, resetAfter);
 
             var sequence = DeferTensorResult<T>(backend, y.Buffer, batch * seqLen * hidden, new[] { batch, seqLen, hidden });
             y.RelinquishOwnership();
@@ -137,9 +151,13 @@ public partial class DirectGpuTensorEngine
         var owned = new[] { dx, dh0, dwi, dwh, dbi, dbh };
         try
         {
-            PortableGruSequence.Backward(backend, fused.StatefulLstmLauncher, gy.Buffer, cH.Buffer, cG.Buffer, cN.Buffer,
-                rhTensor is null ? null : cR.Buffer, wi.Buffer, wh.Buffer, x.Buffer, dx.Buffer, dh0.Buffer, dwi.Buffer,
-                dwh.Buffer, dbi.Buffer, dbh.Buffer, seqLen, batch, inFeatures, hidden, resetAfter: resetAfter);
+            if (resetAfter && backend is IFusedGruSequence fusedGru)
+                fusedGru.GruBackwardSequence(gy.Buffer, cH.Buffer, cG.Buffer, cN.Buffer, wi.Buffer, wh.Buffer, x.Buffer,
+                    dx.Buffer, dh0.Buffer, dwi.Buffer, dwh.Buffer, dbi.Buffer, dbh.Buffer, seqLen, batch, inFeatures, hidden, lastStepOnly: false);
+            else
+                PortableGruSequence.Backward(backend, fused.StatefulLstmLauncher, gy.Buffer, cH.Buffer, cG.Buffer, cN.Buffer,
+                    rhTensor is null ? null : cR.Buffer, wi.Buffer, wh.Buffer, x.Buffer, dx.Buffer, dh0.Buffer, dwi.Buffer,
+                    dwh.Buffer, dbi.Buffer, dbh.Buffer, seqLen, batch, inFeatures, hidden, resetAfter: resetAfter);
             Tensor<T> Result(int index, int length, int[] shape)
             {
                 var tensor = gpu.DeferTensorResult<T>(backend, owned[index].Buffer, length, shape);

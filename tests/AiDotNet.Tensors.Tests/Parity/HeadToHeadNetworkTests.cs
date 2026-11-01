@@ -106,11 +106,11 @@ public abstract class HeadToHeadTestBase
                               $"{BaselineFile} so the gain is locked in.");
     }
 
-    private protected static void AssertParity(HeadToHeadNetworkHarness.CaseResult r)
+    private protected static void AssertParity(HeadToHeadNetworkHarness.CaseResult r, double target = 1.0)
     {
         const double band = 0.05;
-        Assert.True(r.StepRatio <= 1 + band,
-            $"{r.Network} on {r.Device}: Tensors takes {r.StepRatio:F3}x PyTorch's step time at its best " +
+        Assert.True(r.StepRatio <= target * (1 + band),
+            $"{r.Network} on {r.Device}: Tensors takes {r.StepRatio:F3}x PyTorch's step time at its best (target {target:F2}x) " +
             $"(ours {r.Tensors.Best.MinMs:F3} ms {r.Tensors.BestMode}, torch {r.Torch.Best.MinMs:F3} ms {r.Torch.BestMode}). " +
             "Slowest eager phase: " + r.Tensors.Phases.Where(p => p.Key != "step")
                 .OrderByDescending(p => p.Value.MinMs / r.Torch.Phases[p.Key].MinMs)
@@ -144,6 +144,14 @@ public sealed class HeadToHeadNetworkTests : HeadToHeadTestBase
     [SkippableFact]
     [Trait("Category", "PyTorchParity")]
     public void Lstm_Cpu_IsAsFastAsPyTorch() => AssertParity(RunCase("lstm", "cpu"));
+
+    [SkippableFact]
+    public void Gru_Cpu_DoesNotRegress() => AssertRatchet(RunCase("gru", "cpu"));
+
+    // #1573: GRU training at most 0.6x PyTorch's step time on CPU.
+    [SkippableFact]
+    [Trait("Category", "PyTorchParity")]
+    public void Gru_Cpu_IsAsFastAsPyTorch() => AssertParity(RunCase("gru", "cpu"), target: 0.6);
 
     [SkippableFact]
     public void Transformer_Cpu_DoesNotRegress() => AssertRatchet(RunCase("transformer", "cpu"));
@@ -192,6 +200,14 @@ public sealed class HeadToHeadGpuNetworkTests : HeadToHeadTestBase
     [SkippableFact]
     [Trait("Category", "PyTorchParityGpuTarget")]
     public void Lstm_Cuda_IsAsFastAsPyTorch() => AssertParity(RunCase("lstm", "cuda"));
+
+    [SkippableFact]
+    [Trait("Category", "PyTorchParityGpu")]
+    public void Gru_Cuda_DoesNotRegress() => AssertRatchet(RunCase("gru", "cuda"));
+
+    [SkippableFact]
+    [Trait("Category", "PyTorchParityGpuTarget")]
+    public void Gru_Cuda_IsAsFastAsPyTorch() => AssertParity(RunCase("gru", "cuda"));
 
     [SkippableFact]
     [Trait("Category", "PyTorchParityGpu")]
