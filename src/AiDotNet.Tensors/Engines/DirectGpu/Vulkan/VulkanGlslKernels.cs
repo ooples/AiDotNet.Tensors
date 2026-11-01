@@ -75,7 +75,7 @@ void main() {
                 float s2 = s * s;
                 y = 2.0 * s * (1.0 + s2 * (1.0 / 3.0 + s2 * (1.0 / 5.0 + s2 * (1.0 / 7.0 + s2 * (1.0 / 9.0 + s2 / 11.0)))));
             } else {
-                y = log(1.0 + x);
+                y = x == -1.0 ? uintBitsToFloat(0xff800000u) : (x < -1.0 ? uintBitsToFloat(0x7fc00000u) : log(1.0 + x));
             }
             break; }
         case 9u: y = sqrt(x); break;

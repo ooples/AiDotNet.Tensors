@@ -47,14 +47,15 @@ public partial class CpuEngine
     {
         int length = a.Length;
         if (length == 0) return;
-        var srcA = a.GetCpuBackingForStridedRead(out int offA);
-        var srcB = b.GetCpuBackingForStridedRead(out int offB);
-        var dst = result.GetCpuBackingForContiguousWrite(out int offR);
-        if (srcA is null || srcB is null || dst is null)
-            throw new InvalidOperationException("TensorAddActivation needs CPU-backed tensors.");
         using var aKeep = new KeepAliveScope(a);
         using var bKeep = new KeepAliveScope(b);
         using var rKeep = new KeepAliveScope(result);
+        // The logical memory, pinned (as TensorAdd does): a contiguous tensor need not have a managed backing array (a
+        // DLPack import lives in native memory).
+        using var pinA = AsFloatReadOnlyMemory(a.ReadOnlyDataUnmarked).Pin();
+        using var pinB = AsFloatReadOnlyMemory(b.ReadOnlyDataUnmarked).Pin();
+        using var pinR = AsFloatMemory(result.DataUnmarked).Pin();
+        IntPtr ipA = (IntPtr)pinA.Pointer, ipB = (IntPtr)pinB.Pointer, ipR = (IntPtr)pinR.Pointer;
         int chunks = Math.Max(1, CpuParallelSettings.ElementwiseChunkCount(length));
         int chunkSize = ((length + chunks - 1) / chunks + AddReluChunkAlignment - 1) & ~(AddReluChunkAlignment - 1);
         CpuParallelSettings.ParallelForOrSerial(0, chunks, length, [MethodImpl(Compatibility.MethodImplHelper.Hot)] (int chunk) =>
@@ -62,10 +63,8 @@ public partial class CpuEngine
             int start = chunk * chunkSize;
             int count = Math.Min(chunkSize, length - start);
             if (count <= 0) return;
-            fixed (float* pa = &srcA[offA + start])
-            fixed (float* pb = &srcB[offB + start])
-            fixed (float* pr = &dst[offR + start])
-                AddReluSpan(pa, pb, pr, count);
+            AddReluSpan((float*)ipA + start, (float*)ipB + start, (float*)ipR + start, count);
+
         });
     }
 

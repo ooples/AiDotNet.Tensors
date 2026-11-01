@@ -104,9 +104,10 @@ void main() {
     for (uint i = 0u; i < numClasses; i++) maxVal = max(maxVal, logits[row + i]);
     float sumExp = 0.0;
     for (uint i = 0u; i < numClasses; i++) sumExp += exp(logits[row + i] - maxVal);
-    float logSum = maxVal + log(sumExp);
+    // Shifted logits minus log(sumExp): adding maxVal back first rounds the normalizer away for large logits.
+    float logSumExp = log(sumExp);
     float loss = 0.0;
-    for (uint i = 0u; i < numClasses; i++) loss -= targets[row + i] * (logits[row + i] - logSum);
+    for (uint i = 0u; i < numClasses; i++) loss -= targets[row + i] * ((logits[row + i] - maxVal) - logSumExp);
     rowLoss[b] = loss;
 }";
 

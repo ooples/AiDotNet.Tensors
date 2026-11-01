@@ -166,6 +166,8 @@ fn log1p_accurate(@builtin(global_invocation_id) gid: vec3<u32>) {
         let s2 = s * s;
         y = 2.0 * s * (1.0 + s2 * (1.0 / 3.0 + s2 * (1.0 / 5.0 + s2 * (1.0 / 7.0 + s2 * (1.0 / 9.0 + s2 / 11.0)))));
     }
+    if (x == -1.0) { y = wgsl_f32_bits(0xff800000u); }        // log1p(-1) = -inf
+    if (x < -1.0) { y = wgsl_f32_bits(0x7fc00000u); }         // outside the domain (and -inf): NaN
     B[i] = y;
 }
 ";

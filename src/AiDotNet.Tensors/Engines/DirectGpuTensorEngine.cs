@@ -21832,6 +21832,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (activation != FusedActivationType.ReLU || typeof(T) != typeof(float) || !ShapesMatch(a.Shape._dims, b.Shape._dims))
             return base.TensorAddActivation(a, b, activation);
         DeviceDispatch.EnforceStrict(a, b);
+        // Under FP16 storage (autocast) the binary route runs its typed FP16 add, which has no ReLU: compose instead.
+        if (TryGetBackend(out var planBackend)
+            && Gpu.GpuPrecisionPlanner.CreatePlan<T>(planBackend, Gpu.GpuPrecisionOperation.Add, nameof(TensorAddActivation)).InputStorage
+               == Gpu.GpuScalarType.Float16)
+            return base.TensorAddActivation(a, b, activation);
         if (TryBinaryResidentOutOfPlace(a, b, static (be, ia, ib, o, n) => be.AddRelu(ia, ib, o, n)) is { } resident)
         {
             Autodiff.DifferentiableOps.RecordBinary("TensorAddRelu", resident, a, b, Autodiff.BackwardFunctions<T>.AddReluBackward);

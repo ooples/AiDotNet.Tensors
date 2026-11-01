@@ -6456,6 +6456,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         Synchronize();
     }
 
+    /// <summary>MAX_HEAD_DIM of HipAttentionKernels: the widest head the attention kernels hold in registers.</summary>
+    private const int AttentionKernelMaxHeadDim = 128;
+
     public void ScaledDotProductAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer attentionWeights, IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
         int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
@@ -6473,11 +6476,31 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             attentionWeights.Size < weightsSize)
             throw new ArgumentException("Attention backward buffers are smaller than the requested dimensions.");
 
-        // Multi-head attention is grouped-query attention with one query head per KV head: its backward kernels compute
-        // the value, score and query/key gradients directly (as OpenCL routes it), where this was four batched GEMMs,
-        // three transposes, a softmax backward and a scale through five temporaries.
-        GroupedQueryAttentionBackward(gradOutput, query, key, value, attentionWeights, gradQuery, gradKey, gradValue,
-            batch, numHeads, numHeads, seqQ, seqK, headDim, scale, numQueriesPerKV: 1);
+        // Multi-head attention is grouped-query attention with one query head per KV head: up to the kernels' head-dim
+        // limit its backward kernels compute the value, score and query/key gradients directly (as OpenCL routes it).
+        if (headDim <= AttentionKernelMaxHeadDim)
+        {
+            GroupedQueryAttentionBackward(gradOutput, query, key, value, attentionWeights, gradQuery, gradKey, gradValue,
+                batch, numHeads, numHeads, seqQ, seqK, headDim, scale, numQueriesPerKV: 1);
+            return;
+        }
+
+        // Wider heads: four batched GEMMs, three transposes, a softmax backward and a scale.
+        using var gradScores = AllocateBuffer(weightsSize);
+        using var softmaxGrad = AllocateBuffer(weightsSize);
+        using var attentionTransposed = AllocateBuffer(weightsSize);
+        using var valueTransposed = AllocateBuffer(keySize);
+        using var gradScoresTransposed = AllocateBuffer(weightsSize);
+
+        BatchedTranspose(attentionWeights, attentionTransposed, batchHeads, seqQ, seqK);
+        BatchedGemm(attentionTransposed, gradOutput, gradValue, seqK, headDim, seqQ, batchHeads);
+        BatchedTranspose(value, valueTransposed, batchHeads, seqK, headDim);
+        BatchedGemm(gradOutput, valueTransposed, gradScores, seqQ, seqK, headDim, batchHeads);
+        SoftmaxBackward(gradScores, attentionWeights, softmaxGrad, batchHeads * seqQ, seqK);
+        Scale(softmaxGrad, gradScores, scale, weightsSize);
+        BatchedGemm(gradScores, key, gradQuery, seqQ, headDim, seqK, batchHeads);
+        BatchedTranspose(gradScores, gradScoresTransposed, batchHeads, seqQ, seqK);
+        BatchedGemm(gradScoresTransposed, query, gradKey, seqK, headDim, seqQ, batchHeads);
     }
 
     public void FlashAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
@@ -6710,6 +6733,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 $"numQueriesPerKV={numQueriesPerKV} maps {numQHeads} query heads across {mappedKvHeads} KV heads, " +
                 $"but only {numKVHeads} KV heads were provided.", nameof(numQueriesPerKV));
 
+        // The kernels hold a head in registers and return without writing above MAX_HEAD_DIM: refuse rather than leave the
+        // gradients untouched.
+        if (headDim > AttentionKernelMaxHeadDim)
+            throw new GpuCapabilityUnavailableException(
+                $"HIP grouped-query attention backward supports head dims up to {AttentionKernelMaxHeadDim}, not {headDim}.");
+
         // #628: honor the explicit numQueriesPerKV (matches the CPU's kvh = qh / numQueriesPerKV).
         int queriesPerKV = numQueriesPerKV;
 
@@ -6774,6 +6803,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
         if (!_kernelCache.TryGetValue("grouped_query_attention_backward", out var krnl))
             throw new GpuCapabilityUnavailableException("HIP kernel not found: grouped_query_attention_backward");
+
+        // This kernel adds into gradQuery (+=) and gradKey / gradValue (atomicAdd): start them at zero, as OpenCL does, or
+        // a reused or uninitialized destination keeps its old contents under the new gradient.
+        Fill(gradQuery, 0f, checked(batch * numQHeads * seqQ * headDim));
+        Fill(gradKey, 0f, checked(batch * numKVHeads * seqK * headDim));
+        Fill(gradValue, 0f, checked(batch * numKVHeads * seqK * headDim));
 
         void** args = stackalloc void*[16];
         args[0] = &_p0;

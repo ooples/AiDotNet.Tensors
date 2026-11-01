@@ -28,15 +28,15 @@ inline float fc_expm1(float x)
     if (isinf(u)) return u;
     float um1 = u - 1.0f;
     if (um1 == -1.0f) return -1.0f;
-    return um1 * x / log(u);
+    return um1 * (x / log(u));   // the ratio first: um1 * x overflows near x = 86 while the result is finite
 }
 
 inline float fc_log1p(float x)
 {
     float u = 1.0f + x;
     if (u == 1.0f) return x;
-    if (isinf(u)) return u;
-    return log(u) * x / (u - 1.0f);
+    if (isinf(u) && u > 0.0f) return u;   // -inf is outside log1p's domain: let it reach log (NaN)
+    return log(u) * (x / (u - 1.0f));   // the ratio first: log(u) * x overflows for x near FLT_MAX
 }
 
 kernel void unary_math(
