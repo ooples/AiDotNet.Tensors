@@ -10,6 +10,7 @@ public partial class DirectGpuTensorEngine
     public override Tensor<T> XLstmScanForward<T>(Tensor<T> qProj, Tensor<T> kProj, Tensor<T> vProj,
         Tensor<T> iGate, Tensor<T> fGate, Tensor<T> oGate, int numHeads)
     {
+        using var __gpuOp = EnterGpuOp();
         if (qProj is null || kProj is null || vProj is null || iGate is null || fGate is null || oGate is null)
             throw new ArgumentNullException(nameof(qProj));
         if (qProj.Rank != 3 || numHeads < 1 || qProj.Shape[2] < 1 || qProj.Shape[2] % numHeads != 0)
@@ -48,6 +49,7 @@ public partial class DirectGpuTensorEngine
     internal void XLstmDeviceBackward<T>(Tensor<T> gradient, Tensor<T>[] inputs, int heads,
         Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend))
             throw new NotSupportedException("DirectGpuTensorEngine xLSTM backward requires an available GPU backend.");
         if (typeof(T) != typeof(float) || backend is not IFusedLstmSequenceTraining fused)

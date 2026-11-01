@@ -16,5 +16,7 @@ public sealed partial class OpenClBackend : IDeviceMemoryPressure
 
     void IDeviceMemoryPressure.ReclaimNow() => DeviceMemorySweep.Run();
 
+    int IDeviceMemoryPressure.ReleaseCachedBuffers() => _bufferPool.DrainAll();
+
     bool IDeviceMemoryPressure.ReclaimsOnAllocationFailure => false;
 }

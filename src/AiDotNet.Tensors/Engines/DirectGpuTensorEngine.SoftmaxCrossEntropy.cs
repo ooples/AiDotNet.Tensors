@@ -28,6 +28,7 @@ public partial class DirectGpuTensorEngine
 
     private Tensor<T>? TryRecordSoftmaxCrossEntropy<T>(Tensor<T> logits, Tensor<T> target)
     {
+        using var __gpuOp = EnterGpuOp();
         // PlacementBackend, not GetBackend: the latter refuses every backend while a graph is traced (#350).
         if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled
             || GraphMode.Current is not { } scope
@@ -44,6 +45,7 @@ public partial class DirectGpuTensorEngine
             (eng, output) =>
             {
                 var gpu = (DirectGpuTensorEngine)eng;
+                using var __gpuOp = gpu.EnterGpuOp();
                 var backend = gpu.GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
                 var fused = (ISoftmaxCrossEntropyBackend)backend;
                 node.RowStats ??= Tensor<float>.FromGpuBuffer(backend, backend.AllocateBuffer(4 * rows), new[] { 4 * rows },
@@ -73,6 +75,7 @@ public partial class DirectGpuTensorEngine
             (gradOutput, inputs, output, savedState, engine, grads) =>
             {
                 var gpu = (DirectGpuTensorEngine)engine;
+                using var __gpuOp = gpu.EnterGpuOp();
                 var backend = gpu.GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
                 var fused = (ISoftmaxCrossEntropyBackend)backend;
                 var stats = node.RowStats?._gpuBuffer ?? throw new InvalidOperationException("The loss node's backward ran before its forward.");

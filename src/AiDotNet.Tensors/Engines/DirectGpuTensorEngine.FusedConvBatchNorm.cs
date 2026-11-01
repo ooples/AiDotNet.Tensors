@@ -20,6 +20,7 @@ public partial class DirectGpuTensorEngine
         int strideH, int strideW, int padH, int padW, int dilationH, int dilationW,
         FusedActivationType activation)
     {
+        using var __gpuOp = EnterGpuOp();
         // The CPU path's argument contract, before anything below dereferences them.
         if (input is null) throw new System.ArgumentNullException(nameof(input));
         if (kernel is null) throw new System.ArgumentNullException(nameof(kernel));

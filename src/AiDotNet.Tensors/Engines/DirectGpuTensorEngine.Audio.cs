@@ -18,6 +18,7 @@ public partial class DirectGpuTensorEngine
     {
         if (typeof(T) == typeof(float) && !topDb.HasValue)
         {
+            using var __gpuOp = EnterGpuOp();
             // topDb=null has no reduction dependency so the GPU path is
             // safe. topDb path needs a global peak; we leave it to CPU.
             if (TryGetBackend(out var backend) && backend is IAudioBackend audio)
@@ -61,6 +62,7 @@ public partial class DirectGpuTensorEngine
                 nameof(quantizationChannels));
         if (typeof(T) == typeof(float))
         {
+            using var __gpuOp = EnterGpuOp();
             if (TryGetBackend(out var backend) && backend is IAudioBackend audio)
             {
                 int len = input.Length;
@@ -90,6 +92,7 @@ public partial class DirectGpuTensorEngine
             throw new ArgumentException("quantizationChannels must be > 1.", nameof(quantizationChannels));
         if (typeof(T) == typeof(float))
         {
+            using var __gpuOp = EnterGpuOp();
             if (TryGetBackend(out var backend) && backend is IAudioBackend audio)
             {
                 int len = input.Length;
@@ -128,6 +131,7 @@ public partial class DirectGpuTensorEngine
                 nameof(winLength));
         if (typeof(T) == typeof(float) && input.Rank >= 1)
         {
+            using var __gpuOp = EnterGpuOp();
             if (TryGetBackend(out var backend) && backend is IAudioBackend audio)
             {
                 int timeAxis = input._shape[input.Rank - 1];
@@ -157,6 +161,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> Resample<T>(Tensor<T> waveform, int origRate, int newRate)
     {
+        using var __gpuOp = EnterGpuOp();
         if (waveform is null) throw new ArgumentNullException(nameof(waveform));
         if (typeof(T) == typeof(float) && origRate > 0 && newRate == origRate
             && TryGetBackend(out var copyBackend))

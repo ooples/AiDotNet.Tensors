@@ -2652,6 +2652,14 @@ internal static class BackwardFunctions<T>
         var start = (int[])savedState[0];
         var inputShape = inputs[0]._shape;
 
+        // An empty slice selected no element, so the input's gradient from it is zero everywhere. Handled here so no
+        // device or region path is handed a zero-element gradient.
+        if (gradOutput.Length == 0)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], new Tensor<T>((int[])inputShape.Clone()), engine);
+            return;
+        }
+
         if (engine is DirectGpuTensorEngine gpu && gpu.TrySliceBackwardOnDevice(gradOutput, inputShape, start) is { } deviceGrad)
         {
             DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);

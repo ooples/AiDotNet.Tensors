@@ -17,6 +17,7 @@ public partial class DirectGpuTensorEngine
     public override Tensor<T> PartialCorrelationVolume<T>(
         Tensor<T> first, Tensor<T> second, int radius = 4)
     {
+        using var __gpuOp = EnterGpuOp();
         if (first is null) throw new ArgumentNullException(nameof(first));
         if (second is null) throw new ArgumentNullException(nameof(second));
         if (first.Rank != 4 || second.Rank != 4 || first.Shape != second.Shape)
@@ -66,6 +67,7 @@ public partial class DirectGpuTensorEngine
     public override Tensor<T> ForwardSplat<T>(
         Tensor<T> input, Tensor<T> flow, bool normalize = true)
     {
+        using var __gpuOp = EnterGpuOp();
         ValidateForwardSplat(input, flow);
         if (typeof(T) == typeof(float) && IsGpuAvailable && Compilation.GraphMode.IsActive)
         {
@@ -103,6 +105,7 @@ public partial class DirectGpuTensorEngine
         Tensor<T> gradOutput, Tensor<T> input, Tensor<T> flow,
         bool normalize, Tensor<T>? normalizationWeights)
     {
+        using var __gpuOp = EnterGpuOp();
         ValidateForwardSplat(input, flow);
         ValidateSameShape(gradOutput, input, nameof(gradOutput));
         ValidateNormalizationWeights(normalizationWeights, input);
@@ -138,6 +141,7 @@ public partial class DirectGpuTensorEngine
         Tensor<T> gradOutput, Tensor<T> input, Tensor<T> flow, Tensor<T>? output,
         bool normalize, Tensor<T>? normalizationWeights)
     {
+        using var __gpuOp = EnterGpuOp();
         ValidateForwardSplat(input, flow);
         ValidateSameShape(gradOutput, input, nameof(gradOutput));
         if (normalize) ValidateSameShape(output, input, nameof(output));
@@ -194,6 +198,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc />
     internal override Tensor<T> GetForwardSplatNormalizationWeights<T>(Tensor<T> flow)
     {
+        using var __gpuOp = EnterGpuOp();
         ValidateSplatFlow(flow);
         if (typeof(T) != typeof(float) || !TryGetBackend(out _))
             return base.GetForwardSplatNormalizationWeights(flow);

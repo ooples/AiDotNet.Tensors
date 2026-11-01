@@ -16,6 +16,7 @@ public partial class DirectGpuTensorEngine
     // complex(real, imag): the two planes copied into one split-complex device buffer.
     private Tensor<Complex<T>>? TryComplexOnDevice<T>(Tensor<T> real, Tensor<T> imag)
     {
+        using var __gpuOp = EnterGpuOp();
         if (real is null || imag is null || real.Length == 0 || !real._shape.AsSpan().SequenceEqual(imag._shape)
             || IsTapeActive<T>("TensorComplex") || !TryGetBackend(out var backend) || DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return null;
@@ -34,6 +35,7 @@ public partial class DirectGpuTensorEngine
     // view_as_complex: the interleaved [..., 2] pairs deinterleaved on the device into a split-complex buffer.
     private Tensor<Complex<T>>? TryViewAsComplexOnDevice<T>(Tensor<T> input)
     {
+        using var __gpuOp = EnterGpuOp();
         if (input is null || input.Rank == 0 || input._shape[input.Rank - 1] != 2 || input.Length == 0
             || IsTapeActive<T>("TensorViewAsComplex") || !TryGetBackend(out var backend) || DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return null;
@@ -58,6 +60,7 @@ public partial class DirectGpuTensorEngine
     // scatter of the first `size` coordinates into a fill-valued [size, rank] result.
     private Tensor<int>? TryNonzeroStaticOnDevice<T>(Tensor<T> tensor, int size, int fillValue)
     {
+        using var __gpuOp = EnterGpuOp();
         if (tensor is null || tensor.Rank == 0 || tensor.Rank > 8 || size <= 0 || tensor.Length == 0 || tensor.Length >= (1 << 24)
             || Math.Abs((long)fillValue) >= (1 << 24) || !TryGetBackend(out var backend) || backend is not ITorchParityElementwiseBackend kernels
             || DirectGpuEngine.ShouldFallbackForPrecision<T>())
@@ -94,6 +97,7 @@ public partial class DirectGpuTensorEngine
 
     private Tensor<T>[]? TryUnravelIndexOnDevice<T>(Tensor<T> indices, int[] shape)
     {
+        using var __gpuOp = EnterGpuOp();
         if (indices is null || shape is null || indices.Length == 0 || shape.Length == 0) return null;
         long total = 1;
         foreach (int d in shape) { if (d <= 0) return null; total *= d; }
@@ -135,6 +139,7 @@ public partial class DirectGpuTensorEngine
     // output rows, the unique slices gathered in sorted order, and the axis moved back.
     private Tensor<T>? TryUniqueDimOnDevice<T>(Tensor<T> tensor, int dim)
     {
+        using var __gpuOp = EnterGpuOp();
         if (tensor is null || tensor.Rank == 0 || tensor.Length == 0) return null;
         int d = dim < 0 ? dim + tensor.Rank : dim;
         if (d < 0 || d >= tensor.Rank || typeof(T) != typeof(float) || IsTapeActive<T>("TensorUniqueDim")
@@ -182,6 +187,7 @@ public partial class DirectGpuTensorEngine
 
     private Tensor<T>? TryGridSample3DOnDevice<T>(Tensor<T> input, Tensor<T> grid, GridSampleMode mode, GridSamplePadding padding, bool alignCorners)
     {
+        using var __gpuOp = EnterGpuOp();
         if (input is null || grid is null || mode == GridSampleMode.Bicubic || input.Rank != 5 || grid.Rank != 5 || grid._shape[4] != 3
             || grid._shape[0] != input._shape[0] || input.Length == 0 || grid.Length == 0
             || Compilation.GraphMode.IsActive || !TryGetBackend(out var backend) || backend is not ITorchParityElementwiseBackend kernels
@@ -228,6 +234,7 @@ public partial class DirectGpuTensorEngine
     private (Tensor<T> Input, Tensor<T> Grid)? TryGridSample3DAdjointsOnDevice<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> grid,
         GridSampleMode mode, GridSamplePadding padding, bool alignCorners)
     {
+        using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend) || backend is not ITorchParityElementwiseBackend kernels || DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return null;
         OwnedBuffer dx = default, dg = default;
@@ -270,6 +277,7 @@ public partial class DirectGpuTensorEngine
     // integer ops never leaves the device; the host sees it narrowed back to the element type.
     private Tensor<T>? TryInt64OnDevice<T>(string opName, Tensor<T> a, Tensor<T>? b, int op)
     {
+        using var __gpuOp = EnterGpuOp();
         int typeCode = Int64TypeCode<T>();
         if (typeCode < 0 || a is null || a.Length == 0 || (b is not null && !a._shape.AsSpan().SequenceEqual(b._shape))
             || (op >= 0 && b is null) || IsTapeActive<T>(opName) || !TryGetBackend(out var backend)
@@ -346,6 +354,7 @@ public partial class DirectGpuTensorEngine
     // other integer widths keep the CPU path. op as in ITorchParityElementwiseBackend.TorchParityIntBinary; -1 is not.
     private Tensor<T>? TryInt32OnDevice<T>(string opName, Tensor<T> a, Tensor<T>? b, int op)
     {
+        using var __gpuOp = EnterGpuOp();
         if (typeof(T) != typeof(int) || a is null || a.Length == 0 || (b is not null && !a._shape.AsSpan().SequenceEqual(b._shape))
             || (op >= 0 && b is null) || IsTapeActive<T>(opName) || !TryGetBackend(out var backend)
             || backend is not ITorchParityElementwiseBackend kernels)

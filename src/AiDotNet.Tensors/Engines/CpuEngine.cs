@@ -38826,6 +38826,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (length.Length != tensor._shape.Length)
             throw new ArgumentException($"Length length ({length.Length}) must match tensor dimensions ({tensor._shape.Length})");
 
+        // Validates an empty box; the empty result is returned below, after graph mode records it so it stays a
+        // graph output like any other slice.
+        bool emptySlice = IsEmptySlice(tensor._shape, start, length);
+
         if (GraphMode.IsActive)
         {
             var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
@@ -38840,14 +38844,29 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        if (emptySlice)
+        {
+            var empty = new Tensor<T>((int[])length.Clone());
+            // Recorded like any slice, so the input stays on the tape and its gradient is a zero tensor rather than
+            // missing. IsRecording honours a suspended tape and create-graph, as for the non-empty path below.
+            if (DifferentiableOps.IsRecording<T>())
+            {
+                DifferentiableOps.RecordUnary(
+                    "TensorSlice", empty, tensor, BackwardFunctions<T>.SliceBackward,
+                    new object[] { (int[])start.Clone() });
+            }
+            return empty;
+        }
+
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorSlice", tensor._shape); if (ac is not null) return ac.Execute(); }
 
-        // Validate bounds
+        // Validate bounds. The length is compared with the room left after the start, never start + length, which
+        // overflows for a length near int.MaxValue and would let an out-of-range slice through.
         for (int i = 0; i < tensor._shape.Length; i++)
         {
             if (start[i] < 0 || start[i] >= tensor._shape[i])
                 throw new ArgumentOutOfRangeException(nameof(start), $"Start index {start[i]} out of range for axis {i} with size {tensor._shape[i]}");
-            if (length[i] < 1 || start[i] + length[i] > tensor._shape[i])
+            if (length[i] < 1 || length[i] > tensor._shape[i] - start[i])
                 throw new ArgumentOutOfRangeException(nameof(length), $"Slice length {length[i]} starting at {start[i]} exceeds axis {i} size {tensor._shape[i]}");
         }
 
@@ -38880,6 +38899,34 @@ public partial class CpuEngine : ITensorLevelEngine
                 eng => eng.TensorSlice(tensor, tracedStart, tracedLength));
         }
         return result;
+    }
+
+    /// <summary>
+    /// True when the box <paramref name="start"/> + <paramref name="length"/> is empty: some axis takes zero elements.
+    /// That is a valid slice wherever the start lies in [0, size] on that axis (x[:, n:n] in PyTorch and NumPy), even
+    /// at the end of the axis. Concatenate's backward slices every input's gradient out of the output's, so a
+    /// zero-width input (a GAN's conditional block over all-continuous data) depends on it. The result holds no element,
+    /// so its recorded backward hands the input a zero gradient.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">A length is negative, or an empty axis starts outside [0, size],
+    /// or a non-empty axis of an empty box lies outside the tensor.</exception>
+    internal static bool IsEmptySlice(int[] shape, int[] start, int[] length)
+    {
+        bool empty = false;
+        for (int i = 0; i < length.Length; i++)
+        {
+            if (length[i] < 0)
+                throw new ArgumentOutOfRangeException(nameof(length), $"Slice length {length[i]} on axis {i} is negative");
+            if (length[i] == 0) empty = true;
+        }
+        if (!empty) return false;
+        for (int i = 0; i < shape.Length; i++)
+        {
+            // length[i] > shape[i] - start[i], not start[i] + length[i] > shape[i]: the sum overflows.
+            if (start[i] < 0 || start[i] > shape[i] || length[i] > shape[i] - start[i])
+                throw new ArgumentOutOfRangeException(nameof(start), $"Slice [{start[i]}, {start[i] + length[i]}) is outside axis {i} of size {shape[i]}");
+        }
+        return true;
     }
 
     /// <summary>

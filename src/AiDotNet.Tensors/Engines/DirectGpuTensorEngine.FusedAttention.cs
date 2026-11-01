@@ -85,6 +85,7 @@ public partial class DirectGpuTensorEngine
         Tensor<bool>? mask, int batch, int heads, int seqQ, int seqK, int headDim, bool interleaved, double scale,
         double softcap, bool causal, int causalOffset, int[] outputShape)
     {
+        using var __gpuOp = EnterGpuOp();
         // PlacementBackend, not GetBackend: the latter refuses every backend while a graph is traced (#350).
         if (typeof(T) != typeof(float) || mask is not null || Gpu.AutocastScope.IsEnabled
             || GraphMode.Current is not { } scope
@@ -103,6 +104,7 @@ public partial class DirectGpuTensorEngine
             (eng, output) =>
             {
                 var gpu = (DirectGpuTensorEngine)eng;
+                using var __gpuOp = gpu.EnterGpuOp();
                 var backend = gpu.GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
                 var attention = (IFusedAttentionBackend)backend;
                 node.Lse ??= Tensor<float>.FromGpuBuffer(backend, backend.AllocateBuffer(rows), new[] { rows },
@@ -206,6 +208,7 @@ public partial class DirectGpuTensorEngine
             (eng, output) =>
             {
                 var gpu = (DirectGpuTensorEngine)eng;
+                using var __gpuOp = gpu.EnterGpuOp();
                 var backend = gpu.GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
                 var fused = (IFusedAttentionBackend)backend;
                 node.Lse ??= Tensor<float>.FromGpuBuffer(backend, backend.AllocateBuffer(rows), new[] { rows },
@@ -257,6 +260,7 @@ public partial class DirectGpuTensorEngine
         Tensor<float> lse, FusedAttentionParams p, int headDim,
         Func<IDirectGpuBackend, IGpuBuffer, (IGpuBuffer Q, IGpuBuffer K, IGpuBuffer V)> blocks, Tensor<float>? into)
     {
+        using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend) || backend is not IFusedAttentionBackend fused)
             throw new InvalidOperationException("The GPU backend that recorded a packed attention node is no longer available.");
         using var x = GetOrAllocateBuffer(backend, packed);
@@ -302,6 +306,7 @@ public partial class DirectGpuTensorEngine
         Tensor<bool>? mask, int batch, int heads, int seqQ, int seqK, int headDim, bool interleaved, double scale,
         double softcap, bool causal, int causalOffset, int[] outputShape)
     {
+        using var __gpuOp = EnterGpuOp();
         if (GraphMode.IsActive)
             return TryRecordFusedAttention(opName, query, key, value, mask, batch, heads, seqQ, seqK, headDim, interleaved,
                 scale, softcap, causal, causalOffset, outputShape);
@@ -361,6 +366,7 @@ public partial class DirectGpuTensorEngine
     private Tensor<T>? TryShortAttentionOnDevice<T>(Tensor<T> query, Tensor<T> key, Tensor<T> value, int batch, int heads,
         int seqQ, int seqK, int headDim, double scale, bool causal, int causalOffset, int[] outputShape)
     {
+        using var __gpuOp = EnterGpuOp();
         // An inference trace (a compiled Predict) records the kernel as one node; a training or compatibility trace needs
         // the differentiable primitives, so it keeps them.
         if (!ShortAttentionEnabled) return null;
@@ -460,6 +466,7 @@ public partial class DirectGpuTensorEngine
     private Tensor<T>? TryPackedShortSelfAttention<T>(Tensor<T> input2d, Tensor<T> qWeight, Tensor<T> kWeight,
         Tensor<T> vWeight, int batch, int heads, int seq, int headDim, double scale)
     {
+        using var __gpuOp = EnterGpuOp();
         if (!ShortAttentionEnabled || GraphMode.IsActive || typeof(T) != typeof(float)
             || Autodiff.DifferentiableOps.IsRecording<T>() || Gpu.AutocastScope.IsEnabled || !TryGetBackend(out var backend)
             || backend is not IShortAttentionForwardBackend shortAttention || !shortAttention.SupportsShortAttention(headDim)
@@ -495,6 +502,7 @@ public partial class DirectGpuTensorEngine
     private Tensor<T>? TryRecordShortAttention<T>(Tensor<T> query, Tensor<T> key, Tensor<T> value, int batch, int heads,
         int seqQ, int seqK, int headDim, double scale, bool causal, int causalOffset, int[] outputShape)
     {
+        using var __gpuOp = EnterGpuOp();
         // PlacementBackend, not GetBackend: the latter refuses every backend while a graph is traced (#350).
         if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled || GraphMode.Current is not { } scope
             || PlacementBackend is not IShortAttentionForwardBackend shortAttention || !shortAttention.SupportsShortAttention(headDim)
@@ -609,6 +617,7 @@ public partial class DirectGpuTensorEngine
         Tensor<T> query, Tensor<T> key, Tensor<T> value, Tensor<T> output, Tensor<float> lse, Tensor<int>? mask,
         FusedAttentionParams p, int headDim, Tensor<T>? intoQ = null, Tensor<T>? intoK = null, Tensor<T>? intoV = null)
     {
+        using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend) || backend is not IFusedAttentionBackend fused)
             throw new InvalidOperationException("The GPU backend that recorded a fused attention node is no longer available.");
         OwnedBuffer dq = default, dk = default, dv = default;

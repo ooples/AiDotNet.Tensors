@@ -50,12 +50,26 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     }
 
     Helpers.HostSync Helpers.IHostSyncOwner.GetOrCreateHostSync()
-        => _hostSync ??= Helpers.HostSync.ForArray(HostSyncKey());
+    {
+        if (_hostSync is { } cached) return cached;
+        var key = HostSyncKey();
+        // No host array yet (a GPU-resident result): nothing can alias this storage until its array appears and the
+        // state is adopted into that array's entry, so the state lives on this object alone. No weak-table entry: that
+        // dependent handle was the dominant cost of every GPU result (3.2 us on one thread, 45+ us at eight).
+        if (ReferenceEquals(key, this))
+        {
+            var created = Helpers.HostSync.CreateUnshared();
+            return Interlocked.CompareExchange(ref _hostSync, created, null) ?? created;
+        }
+        return _hostSync = Helpers.HostSync.ForArray(key);
+    }
 
     Helpers.HostSync? Helpers.IHostSyncOwner.FindHostSync()
     {
         if (_hostSync is { } cached) return cached;
-        var found = Helpers.HostSync.FindForArray(HostSyncKey());
+        var key = HostSyncKey();
+        if (ReferenceEquals(key, this)) return null;   // an unshared state is always cached on its owner
+        var found = Helpers.HostSync.FindForArray(key);
         if (found is not null) _hostSync = found;
         return found;
     }

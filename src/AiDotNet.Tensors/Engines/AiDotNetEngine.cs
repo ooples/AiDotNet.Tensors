@@ -33,6 +33,15 @@ public static class AiDotNetEngine
 {
     private static IEngine _current;
 
+    // The GPU engine AutoDetectAndConfigureGpu created. It is never disposed by a demotion: an op that read Current
+    // before the swap still holds the engine (each of its GPU paths borrows the backend through TryGetBackend with no
+    // release point), so disposing it under that op frees native handles mid-kernel (a cudnnSetStream access
+    // violation on the CUDA lane). A demotion parks it instead and the next adoption reinstalls the same engine, so
+    // repeated reset/adopt cycles reuse one CUDA context rather than leaking one per cycle. An engine a caller
+    // assigned to Current is the caller's and is never touched. Guarded by _adoptionLock with every write of Current.
+    private static DirectGpuTensorEngine? _adoptedGpu;
+    private static readonly object _adoptionLock = new object();
+
     /// <summary>
     /// Static constructor initializes with CPU engine by default.
     /// </summary>
@@ -79,7 +88,10 @@ public static class AiDotNetEngine
                 throw new ArgumentNullException(nameof(value), "Engine cannot be null");
             }
 
-            Volatile.Write(ref _current, value);
+            lock (_adoptionLock)
+            {
+                Volatile.Write(ref _current, value);
+            }
         }
     }
 
@@ -213,6 +225,17 @@ public static class AiDotNetEngine
             return true;
         }
 
+        // A demotion parked the engine this class adopted earlier: reinstall it rather than build a second context.
+        lock (_adoptionLock)
+        {
+            var parked = _adoptedGpu;
+            if (parked is not null && !parked.IsDisposed && parked.SupportsGpu)
+            {
+                Volatile.Write(ref _current, parked);
+                return true;
+            }
+        }
+
         try
         {
             var gpuEngine = new DirectGpuTensorEngine();
@@ -220,7 +243,20 @@ public static class AiDotNetEngine
 
             if (supportsGpu && GpuPassesCorrectnessProbe(gpuEngine))
             {
-                Current = gpuEngine;
+                lock (_adoptionLock)
+                {
+                    // Another thread adopted while this one probed: keep its engine. This one was never published,
+                    // so no other thread can hold it and disposing it here is safe.
+                    if (_adoptedGpu is { IsDisposed: false } winner && winner.SupportsGpu)
+                    {
+                        gpuEngine.Dispose();
+                        Volatile.Write(ref _current, winner);
+                        return true;
+                    }
+
+                    _adoptedGpu = gpuEngine;
+                    Volatile.Write(ref _current, gpuEngine);
+                }
                 TryRegisterGpuOffloadAllocator(gpuEngine, verbose);
                 EmitLog($"[AiDotNet] GPU acceleration enabled: {gpuEngine.Name}", verbose);
                 return true;
@@ -359,30 +395,109 @@ public static class AiDotNetEngine
     }
 
     /// <summary>
-    /// Swaps <see cref="Current"/> to a fresh <see cref="CpuEngine"/> and disposes the GPU engine
-    /// being demoted, so forcing CPU (the AIDOTNET_DISABLE_GPU opt-out, the circuit-breaker check, or
-    /// an explicit reset) does not leak the previous <see cref="DirectGpuTensorEngine"/>'s CUDA
-    /// context, cuBLAS handle, and kernel modules. Swaps FIRST then disposes, so a concurrent reader
-    /// of <see cref="Current"/> never observes a disposed engine.
+    /// Swaps <see cref="Current"/> to a fresh <see cref="CpuEngine"/> when forcing CPU (the AIDOTNET_DISABLE_GPU
+    /// opt-out, the circuit-breaker check, or an explicit reset). The engine this class adopted is parked, not
+    /// disposed, and the next adoption reinstalls it, so a reset/adopt cycle neither leaks a CUDA context nor frees
+    /// one under an op still running on it.
     /// </summary>
     /// <remarks>
     /// A plain <see cref="CpuEngine"/> that is already current is kept. <see cref="Current"/> is process-wide and read
     /// on every operation, so replacing it swaps the engine under work running on other threads; a training step that
     /// straddled the swap lost its update (measured in AiDotNet: 3 of 20 steps while another thread reset to CPU). A
-    /// CPU engine carries no state a reset would clear, so the swap bought nothing. The swap is a compare-exchange, so
-    /// two concurrent resets demote (and dispose) a GPU engine once and install one CPU engine.
+    /// CPU engine carries no state a reset would clear, so the swap bought nothing. The swap runs under the same lock
+    /// as adoption, so a demotion and an adoption cannot interleave and two concurrent resets install one CPU engine.
+    /// A demoted GPU engine is not disposed: an op on another thread may still be running on it. The engine this class
+    /// adopted is parked for the next adoption; one a caller assigned stays the caller's.
     /// </remarks>
     private static void SwitchToCpuEngine()
     {
-        while (true)
+        DirectGpuTensorEngine? parked = null;
+        lock (_adoptionLock)
         {
             var observed = Volatile.Read(ref _current);
             if (observed is not null && observed.GetType() == typeof(CpuEngine)) return;
-            if (ReferenceEquals(Interlocked.CompareExchange(ref _current, new CpuEngine(), observed), observed))
+            Volatile.Write(ref _current, new CpuEngine());
+            if (observed is DirectGpuTensorEngine gpu && ReferenceEquals(gpu, _adoptedGpu)) parked = gpu;
+        }
+
+        // The parked engine keeps its context for the next adoption, but not memory nothing uses: free the device
+        // buffers only unreachable objects hold and the pool's retained ones (torch.cuda.empty_cache). Never on a
+        // context the circuit breaker found corrupted, where any native call can fault.
+        if (parked is not null && !_gpuCircuitBroken)
+        {
+            try { parked.ReleaseUnusedDeviceMemory(); }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
             {
-                (observed as DirectGpuTensorEngine)?.Dispose();
-                return;
+                // Best effort: memory not freed here is freed with the engine, so a native failure only costs the trim.
+                EmitLog($"[AiDotNet] Releasing unused GPU memory on reset failed: {ex.Message}", verbose: true);
             }
+        }
+    }
+
+    /// <summary>
+    /// Frees the GPU engine <see cref="AutoDetectAndConfigureGpu()"/> adopted, whether it is current or parked by
+    /// <see cref="ResetToCpu"/>: its CUDA (or other backend) context, kernel modules and device memory. Ops other
+    /// threads are running on it finish first; new ops take their CPU paths. Every pending device result is downloaded
+    /// before its buffer is freed, so no tensor loses its data. The next auto-detection builds a new engine.
+    /// </summary>
+    /// <remarks>
+    /// A reset alone keeps the engine (and frees only the memory nothing uses) because rebuilding a context costs
+    /// seconds; release when the process is done with the GPU. An engine a caller assigned to <see cref="Current"/> is
+    /// the caller's to dispose and is not touched. Waits up to 30 seconds; see <see cref="ReleaseGpu(TimeSpan)"/>.
+    /// </remarks>
+    /// <returns>True when an adopted engine was released; false when there was none.</returns>
+    public static bool ReleaseGpu() => ReleaseGpu(DirectGpuTensorEngine.DisposeDrainTimeout);
+
+    /// <summary>
+    /// <see cref="ReleaseGpu()"/>, waiting up to <paramref name="drainTimeout"/> for ops other threads are running on
+    /// the engine.
+    /// </summary>
+    /// <exception cref="TimeoutException">Ops were still running after <paramref name="drainTimeout"/>. Nothing was
+    /// freed and the engine is parked again (usable, and releasable later).</exception>
+    /// <exception cref="InvalidOperationException">Called from inside an op on the engine.</exception>
+    public static bool ReleaseGpu(TimeSpan drainTimeout)
+    {
+        DirectGpuTensorEngine? engine;
+        lock (_adoptionLock)
+        {
+            engine = _adoptedGpu;
+            if (engine is null) return false;
+            _adoptedGpu = null;
+            if (ReferenceEquals(Volatile.Read(ref _current), engine)) Volatile.Write(ref _current, new CpuEngine());
+        }
+
+        // A context the circuit breaker found corrupted is never torn down (a teardown on it can fault the process);
+        // the OS reclaims it at exit, as the breaker itself does.
+        if (_gpuCircuitBroken) return true;
+
+        bool released;
+        try
+        {
+            released = engine.TryCloseAndDispose(drainTimeout);
+        }
+        catch
+        {
+            Repark(engine);
+            throw;
+        }
+        if (!released)
+        {
+            engine.ReopenAfterTimedOutClose();
+            Repark(engine);
+            throw new TimeoutException(
+                $"GPU ops were still running after {drainTimeout.TotalSeconds:0.#} s, so the engine was not released " +
+                "(nothing was freed under them). It is parked again; release it when they finish.");
+        }
+        EmitLog("[AiDotNet] GPU engine released", verbose: true);
+        return true;
+    }
+
+    // Puts an engine whose release did not happen back in the parked slot, unless another adoption took it meanwhile.
+    private static void Repark(DirectGpuTensorEngine engine)
+    {
+        lock (_adoptionLock)
+        {
+            if (_adoptedGpu is null) _adoptedGpu = engine;
         }
     }
 

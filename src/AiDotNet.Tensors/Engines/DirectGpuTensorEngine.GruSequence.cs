@@ -19,6 +19,7 @@ public partial class DirectGpuTensorEngine
     public override Tensor<T> GruSequenceForward<T>(Tensor<T> input, Tensor<T>? h0, Tensor<T> wIh, Tensor<T> wHh,
         Tensor<T>? bIh, Tensor<T>? bHh, out Tensor<T> finalHidden, bool returnSequences = false, bool resetAfter = true)
     {
+        using var __gpuOp = EnterGpuOp();
         var (batch, seqLen, inputSize, hidden) = ValidateGruSequence(input, h0, wIh, wHh, bIh, bHh);
         // Graph capture records the host op's lazy node, whose replay runs this engine eagerly. An empty extent has
         // nothing to launch and the kernels require positive ones: the host path returns the empty result.

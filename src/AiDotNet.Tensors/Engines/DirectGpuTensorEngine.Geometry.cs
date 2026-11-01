@@ -28,6 +28,7 @@ public partial class DirectGpuTensorEngine
         {
             try
             {
+                using var __gpuOp = EnterGpuOp();
                 if (TryGetBackend(out var backend) && backend is IGeometryBackend geom)
                 {
                     int N = input._shape[0], C = input._shape[1];
@@ -59,6 +60,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> PadNd<T>(Tensor<T> input, int[] pad, PadMode mode, T value = default!)
     {
+        using var __gpuOp = EnterGpuOp();
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (pad is null) throw new ArgumentNullException(nameof(pad));
         if ((pad.Length & 1) != 0)
@@ -197,6 +199,7 @@ public partial class DirectGpuTensorEngine
         {
             try
             {
+                using var __gpuOp = EnterGpuOp();
                 if (TryGetBackend(out var backend) && backend is IGeometryBackend geom)
                 {
                     int N = input._shape[0], C = input._shape[1], H = input._shape[2], W = input._shape[3];
@@ -229,6 +232,7 @@ public partial class DirectGpuTensorEngine
         {
             try
             {
+                using var __gpuOp = EnterGpuOp();
                 if (TryGetBackend(out var backend) && backend is IGeometryBackend geom)
                 {
                     int N = theta._shape[0];

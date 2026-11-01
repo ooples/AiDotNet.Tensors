@@ -47,6 +47,7 @@ public partial class DirectGpuTensorEngine
             return base.BoxArea(boxes);
         try
         {
+            using var __gpuOp = EnterGpuOp();
             if (TryGetBackend(out var backend) && backend is IDetectionBackend det)
             {
                 int n = boxes._shape[0];
@@ -74,6 +75,7 @@ public partial class DirectGpuTensorEngine
             return base.BoxConvert(boxes, from, to);
         try
         {
+            using var __gpuOp = EnterGpuOp();
             if (TryGetBackend(out var backend) && backend is IDetectionBackend det)
             {
                 int n = boxes.Length / 4;
@@ -131,6 +133,7 @@ public partial class DirectGpuTensorEngine
         if (n == 0 || m == 0) return null;
         try
         {
+            using var __gpuOp = EnterGpuOp();
             if (TryGetBackend(out var backend) && backend is IDetectionBackend det)
             {
                 using var goBuf = GetOrAllocateBuffer(backend, gradOutput);
@@ -169,6 +172,7 @@ public partial class DirectGpuTensorEngine
         if (boxesB.Rank != 2 || boxesB._shape[1] != 4) return null;
         try
         {
+            using var __gpuOp = EnterGpuOp();
             if (TryGetBackend(out var backend) && backend is IDetectionBackend det)
             {
                 int n = boxesA._shape[0];

@@ -18,7 +18,7 @@ namespace AiDotNet.Tensors.LinearAlgebra;
 /// Think of it as a row or column of values that you can add, subtract, multiply, etc. Vectors are fundamental
 /// building blocks in machine learning for representing data points and model parameters.</para>
 /// </remarks>
-public abstract class VectorBase<T> : Helpers.IHostSyncOwner
+public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.IDeviceResultStorage
 {
     /// <summary>
     /// The internal memory that stores the vector's elements.
@@ -87,12 +87,26 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     }
 
     Helpers.HostSync Helpers.IHostSyncOwner.GetOrCreateHostSync()
-        => _hostSync ??= Helpers.HostSync.ForArray(HostSyncKey());
+    {
+        if (_hostSync is { } cached) return cached;
+        var key = HostSyncKey();
+        // No host array yet (a GPU-resident result): nothing can alias this storage until its array appears and the
+        // state is adopted into that array's entry, so the state lives on this object alone. No weak-table entry: that
+        // dependent handle was the dominant cost of every GPU result (3.2 us on one thread, 45+ us at eight).
+        if (ReferenceEquals(key, this))
+        {
+            var created = Helpers.HostSync.CreateUnshared();
+            return System.Threading.Interlocked.CompareExchange(ref _hostSync, created, null) ?? created;
+        }
+        return _hostSync = Helpers.HostSync.ForArray(key);
+    }
 
     Helpers.HostSync? Helpers.IHostSyncOwner.FindHostSync()
     {
         if (_hostSync is { } cached) return cached;
-        var found = Helpers.HostSync.FindForArray(HostSyncKey());
+        var key = HostSyncKey();
+        if (ReferenceEquals(key, this)) return null;   // an unshared state is always cached on its owner
+        var found = Helpers.HostSync.FindForArray(key);
         if (found is not null) _hostSync = found;
         return found;
     }
@@ -105,6 +119,19 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     {
         if (!Helpers.HostSync.AnyExists) return;
         ((Helpers.IHostSyncOwner)this).FindHostSync()?.MakeHostCurrent();
+    }
+
+    /// <inheritdoc/>
+    void Engines.DirectGpu.IDeviceResultStorage.EvacuateToHost(Engines.DirectGpu.IDirectGpuBackend backend)
+    {
+        if (_deviceState is not { Buffer: { } buffer } state || !ReferenceEquals(state.Backend, backend)) return;
+        // The same download a host read runs; it throws when the result was released without a host copy, which
+        // leaves the binding (and that error) for the read.
+        SyncHostFromDevice();
+        state.Buffer = null;
+        state.Backend = null;
+        state.DeviceValid = false;
+        buffer.Dispose();
     }
 
     /// <summary>Installs the owner validation that must run before mutable storage is exposed.</summary>
