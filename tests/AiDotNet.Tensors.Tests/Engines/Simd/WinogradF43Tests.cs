@@ -33,6 +33,8 @@ public class WinogradF43Tests
         { 2, 64, 64, 16, 16 },
         { 1, 8, 8, 13, 8 },
         { 8, 32, 16, 8, 8 },
+        { 1, 16, 24, 30, 33 },   // blocked: 9 tiles a row -> bands of 3 tile rows, the last one partial
+        { 2, 32, 64, 32, 32 },   // blocked: two bands of 4 tile rows
     };
 
     [SkippableTheory]
@@ -68,6 +70,31 @@ public class WinogradF43Tests
                                 $"n={n} c={c} k={k} {h}x{w} acc={accumulate} [{b},{o},{i},{j}]: expected {expected}, got {y[at]}");
                         }
         }
+    }
+
+    // A wide layer forced through the blocked form agrees with the batch-wide passes (both are F(4x4); only the GEMMs
+    // sum in different orders).
+    [SkippableFact]
+    public void Blocked_AgreesWithTheBatchWidePasses_OnAWideLayer()
+    {
+        Skip.IfNot(KernelRuns, "The Winograd kernel needs AVX2 + FMA.");
+        const int n = 3, c = 64, k = 72, h = 20, w = 18;
+        var rng = new Random(91);
+        float[] x = Fill(rng, n * c * h * w), wt = Fill(rng, k * c * 9);
+        float[] wide = new float[n * k * h * w], blocked = new float[wide.Length];
+        WinogradF43.Forward(x, 0, wt, 0, wide, 0, false, n, c, h, w, k);
+        bool previous = WinogradF43.s_forceBlockedForTest;
+        try
+        {
+            WinogradF43.s_forceBlockedForTest = true;
+            WinogradF43.Forward(x, 0, wt, 0, blocked, 0, false, n, c, h, w, k);
+        }
+        finally
+        {
+            WinogradF43.s_forceBlockedForTest = previous;
+        }
+        for (int i = 0; i < wide.Length; i++)
+            Assert.True(Math.Abs(wide[i] - blocked[i]) <= 1e-4 * (1 + Math.Abs(wide[i])), $"[{i}] {wide[i]} vs {blocked[i]}");
     }
 
     [SkippableTheory]
@@ -183,7 +210,8 @@ public class WinogradF43Tests
         Assert.False(WinogradF43.Applies(8, 64, 64, 32, 32, 3, 3, 1, 1, 0, 0, 1, 1));   // padding 0
         Assert.False(WinogradF43.Applies(8, 64, 64, 32, 32, 3, 3, 1, 1, 2, 2, 2, 2));   // dilated
         Assert.False(WinogradF43.Applies(8, 3, 64, 32, 32, 3, 3, 1, 1, 1, 1, 1, 1));    // 3 input channels
-        Assert.False(WinogradF43.Applies(64, 32, 64, 14, 14, 3, 3, 1, 1, 1, 1, 1, 1));  // 32 input channels
+        Assert.True(WinogradF43.Applies(64, 32, 64, 14, 14, 3, 3, 1, 1, 1, 1, 1, 1));   // 32 input channels: blocked
+        Assert.False(WinogradF43.Applies(64, 8, 64, 14, 14, 3, 3, 1, 1, 1, 1, 1, 1));   // 8 input channels
         Assert.False(WinogradF43.Applies(8, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));   // 32 patches
         Assert.False(WinogradF43.Applies(8, 64, 60, 32, 32, 3, 3, 1, 1, 1, 1, 1, 1));   // 60 output channels
         Assert.False(WinogradF43.Applies(8, 64, 64, 4, 4, 3, 3, 1, 1, 1, 1, 1, 1));     // 4x4 plane
@@ -193,6 +221,18 @@ public class WinogradF43Tests
         Assert.True(WinogradF43.AppliesToWeightGradient(8, 128, 128, 16, 16, 3, 3, 1, 1, 1, 1, 1, 1));
         Assert.False(WinogradF43.AppliesToWeightGradient(8, 64, 64, 32, 32, 3, 3, 1, 1, 1, 1, 1, 1));
         Assert.False(WinogradF43.AppliesToWeightGradient(8, 64, 128, 32, 32, 3, 3, 1, 1, 1, 1, 1, 1));
+    }
+
+    [SkippableFact]
+    public void WeightGradient_FallsBackPastItsWorkspaceCap()
+    {
+        Skip.IfNot(WinogradRoutes, "The Winograd kernel needs AVX2 + FMA and must not be opted out.");
+        // A ResNet 64 -> 64 layer at 56x56, batch 128, fits the cap; 128 -> 128 at batch 256 does not, though its
+        // forward still applies.
+        Assert.True(WinogradF43.WeightGradientWorkspaceFloats(128, 64, 64, 56, 56) <= WinogradF43.MaxWeightGradientWorkspaceFloats);
+        Assert.True(WinogradF43.WeightGradientWorkspaceFloats(256, 128, 128, 56, 56) > WinogradF43.MaxWeightGradientWorkspaceFloats);
+        Assert.True(WinogradF43.Applies(256, 128, 128, 56, 56, 3, 3, 1, 1, 1, 1, 1, 1));
+        Assert.False(WinogradF43.AppliesToWeightGradient(256, 128, 128, 56, 56, 3, 3, 1, 1, 1, 1, 1, 1));
     }
 
     [SkippableFact]

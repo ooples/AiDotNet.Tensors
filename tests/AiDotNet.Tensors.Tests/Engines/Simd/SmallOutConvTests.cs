@@ -21,6 +21,9 @@ public class SmallOutConvTests
     [InlineData(1, 16, 2, 9, 13, 5, 5, 2, 2)]
     [InlineData(2, 24, 3, 7, 5, 3, 3, 0, 0)]
     [InlineData(1, 70, 1, 3, 70, 1, 3, 0, 1)]
+    [InlineData(2, 3, 64, 32, 32, 3, 3, 1, 1)]    // RGB first layer: 22 groups of three outputs, the last one short
+    [InlineData(3, 1, 32, 28, 28, 3, 3, 1, 1)]    // grey first layer
+    [InlineData(1, 2, 5, 6, 7, 3, 3, 1, 1)]
     public void Forward_MatchesThePlainSum(int batch, int inC, int outC, int h, int w, int kh, int kw, int ph, int pw)
     {
         Skip.IfNot(SmallOutConv.Applies(inC, outC, kh, kw, 1, 1, 1, 1, ph, pw), "AVX2 + FMA, shape in range");
@@ -50,6 +53,35 @@ public class SmallOutConvTests
         // Nothing written past the output.
         for (int i = batch * outC * oh * ow; i < y.Length; i++) Assert.True(float.IsNaN(y[i]));
     }
+
+#if NET9_0_OR_GREATER
+    [SkippableTheory]
+    [InlineData(2, 3, 64, 32, 32)]
+    [InlineData(1, 2, 7, 9, 21)]
+    public void Avx512Run_IsBitIdenticalToTheAvx2Run(int batch, int inC, int outC, int h, int w)
+    {
+        Skip.IfNot(SmallOutConv.Applies(inC, outC, 3, 3, 1, 1, 1, 1, 1, 1), "AVX2 + FMA");
+        var rng = new Random(h * 5 + w);
+        float[] x = Fill(rng, batch * inC * h * w), wt = Fill(rng, outC * inC * 9);
+        var y512 = new float[batch * outC * h * w];
+        var y256 = new float[y512.Length];
+        bool previous = SmallOutConv.s_forceAvx512ForTest, previousUse = SmallOutConv.s_useAvx512;
+        try
+        {
+            SmallOutConv.s_forceAvx512ForTest = true;
+            SmallOutConv.s_useAvx512 = true;
+            SmallOutConv.Forward(x, 0, wt, 0, y512, 0, batch, inC, h, w, outC, 3, 3, 1, 1);
+            SmallOutConv.s_useAvx512 = false;
+            SmallOutConv.Forward(x, 0, wt, 0, y256, 0, batch, inC, h, w, outC, 3, 3, 1, 1);
+        }
+        finally
+        {
+            SmallOutConv.s_forceAvx512ForTest = previous;
+            SmallOutConv.s_useAvx512 = previousUse;
+        }
+        Assert.Equal(y256, y512);
+    }
+#endif
 
     [SkippableFact]
     public void Engine_RgbFirstLayerInputGradient_TakesTheKernel_AndAgreesWithTheOtherRoute()
