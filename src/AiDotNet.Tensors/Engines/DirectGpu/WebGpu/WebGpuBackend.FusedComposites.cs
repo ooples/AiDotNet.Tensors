@@ -198,6 +198,37 @@ fn cross_entropy_rows(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 ";
 
+    // melSpec[b, m] = sum_f powerSpec[b, f] * filterbank[m, f]: one thread per output, reading the filterbank row in place
+    // (this was a transposed copy of the filterbank and a GEMM).
+    private const string MelFilterbankSource = @"
+@group(0) @binding(0) var<storage, read> power_spec: array<f32>;
+@group(0) @binding(1) var<storage, read> filterbank: array<f32>;
+@group(0) @binding(2) var<storage, read_write> mel_spec: array<f32>;
+struct Params { num_frames: u32, num_freqs: u32, n_mels: u32, _pad: u32, }
+@group(0) @binding(3) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn mel_filterbank(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.num_frames * params.n_mels) { return; }
+    let b = idx / params.n_mels;
+    let m = idx % params.n_mels;
+    var sum: f32 = 0.0;
+    for (var f: u32 = 0u; f < params.num_freqs; f = f + 1u) {
+        sum = sum + power_spec[b * params.num_freqs + f] * filterbank[m * params.num_freqs + f];
+    }
+    mel_spec[idx] = sum;
+}
+";
+
+    public void ApplyMelFilterbank(IGpuBuffer powerSpec, IGpuBuffer filterbank, IGpuBuffer melSpec,
+        int numFrames, int numFreqs, int nMels)
+    {
+        if (numFrames <= 0 || numFreqs <= 0 || nMels <= 0) return;
+        Dispatch3BufferAsync(FusedCompositesModuleName + ".Mel", MelFilterbankSource, "mel_filterbank",
+            powerSpec, filterbank, melSpec, new[] { Bits(numFrames), Bits(numFreqs), Bits(nMels), 0f },
+            checked(numFrames * nMels)).GetAwaiter().GetResult();
+    }
     public void ExpM1(IGpuBuffer A, IGpuBuffer B, int size)
     {
         if (size <= 0) return;

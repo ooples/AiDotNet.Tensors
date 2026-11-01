@@ -805,18 +805,6 @@ public sealed partial class WebGpuBackend
             magnitude, phase, real, imag, uniforms, n).GetAwaiter().GetResult();
     }
 
-    public void ApplyMelFilterbank(IGpuBuffer powerSpec, IGpuBuffer filterbank, IGpuBuffer melSpec,
-        int numFrames, int numFreqs, int nMels)
-    {
-        // melSpec[b,m] = sum_f(powerSpec[b,f] * filterbank[m,f])
-        // This is powerSpec (numFrames x numFreqs) * filterbank^T (numFreqs x nMels)
-        // = Gemm(powerSpec, filterbank^T, melSpec, M=numFrames, N=nMels, K=numFreqs)
-        // filterbank is (nMels x numFreqs), so transpose it
-        using var filterbankT = (WebGpuBuffer)AllocateBuffer(numFreqs * nMels);
-        BatchedTranspose(filterbank, filterbankT, 1, nMels, numFreqs);
-        Gemm(powerSpec, filterbankT, melSpec, numFrames, nMels, numFreqs);
-    }
-
     public void PowerToDb(IGpuBuffer power, IGpuBuffer db, int n, float refValue, float minDb)
     {
         // PowerDbSource power_to_db: binding(0)=A(power), binding(1)=B(db), uniform: size, ref_value, min_db

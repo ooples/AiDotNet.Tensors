@@ -4,7 +4,6 @@
 
 
 
-composed WebGpuBackend.ApplyMelFilterbank #1638
 composed WebGpuBackend.FFT2D #1638
 composed WebGpuBackend.RFFT #1638
 composed MetalBackend.Hgemm #1638
