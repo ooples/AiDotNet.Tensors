@@ -141,30 +141,27 @@ public class SimdGemmDirectParallel2DTests
         var narrow = new float[m * n];
         var wide = new float[m * n];
         bool? before = SimdGemm.s_forceVector512Direct;
-        int beforeOrder = SimdGemm.s_transAOrder;
+        bool beforePackA = SimdGemm.s_transAPackA;
         try
         {
             SimdGemm.s_forceVector512Direct = false;
             SimdGemm.SgemmDirectParallelMIntoTransA(a, b, narrow, m, k, n);
             SimdGemm.s_forceVector512Direct = true;
-            // Every loop order of the 512-bit tile (strip outer, packed A panels, row outer over packed B) runs the
-            // same chains; the last one run is checked against the reference below.
-            for (int order = 1; order <= 2; order++)
-            {
-                SimdGemm.s_transAOrder = order;
-                var ordered = new float[m * n];
-                SimdGemm.SgemmDirectParallelMIntoTransA(a, b, ordered, m, k, n);
-                for (int i = 0; i < narrow.Length; i++)
-                    Assert.True(BitConverter.SingleToInt32Bits(narrow[i]) == BitConverter.SingleToInt32Bits(ordered[i]),
-                        $"order {order} C[{i / n},{i % n}]: 256-bit {narrow[i]:G9}, 512-bit {ordered[i]:G9}");
-            }
-            SimdGemm.s_transAOrder = 0;
+            // At's panels read in place, then from the packed copy (the default): the same chains, so both match the
+            // 256-bit tiles bit for bit; the packed run is also checked against the reference below.
+            SimdGemm.s_transAPackA = false;
+            var inPlace = new float[m * n];
+            SimdGemm.SgemmDirectParallelMIntoTransA(a, b, inPlace, m, k, n);
+            for (int i = 0; i < narrow.Length; i++)
+                Assert.True(BitConverter.SingleToInt32Bits(narrow[i]) == BitConverter.SingleToInt32Bits(inPlace[i]),
+                    $"in place C[{i / n},{i % n}]: 256-bit {narrow[i]:G9}, 512-bit {inPlace[i]:G9}");
+            SimdGemm.s_transAPackA = true;
             SimdGemm.SgemmDirectParallelMIntoTransA(a, b, wide, m, k, n);
         }
         finally
         {
             SimdGemm.s_forceVector512Direct = before;
-            SimdGemm.s_transAOrder = beforeOrder;
+            SimdGemm.s_transAPackA = beforePackA;
         }
         for (int i = 0; i < narrow.Length; i++)
             Assert.True(BitConverter.SingleToInt32Bits(narrow[i]) == BitConverter.SingleToInt32Bits(wide[i]),
