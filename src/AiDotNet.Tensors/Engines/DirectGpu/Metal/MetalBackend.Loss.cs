@@ -27,15 +27,6 @@ public sealed partial class MetalBackend
     }
 
     /// <summary>
-    /// Cross-entropy loss for multi-class classification.
-    /// </summary>
-    public float CrossEntropyLoss(IGpuBuffer predictions, IGpuBuffer targets, int batchSize, int numClasses)
-    {
-        ThrowIfDisposed();
-        return ResidentLossScalar(predictions, targets, checked(batchSize * numClasses), batchSize, 0);
-    }
-
-    /// <summary>
     /// Binary cross-entropy loss.
     /// </summary>
     public float BinaryCrossEntropyLoss(IGpuBuffer predictions, IGpuBuffer targets, int size)

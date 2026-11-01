@@ -172,6 +172,32 @@ fn log1p_accurate(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 ";
 
+    // -sum(target * log_softmax(row)) per row, from logits and dense targets: the shifted logits minus log(sumExp).
+    private const string DenseCrossEntropyRowsSource = @"
+@group(0) @binding(0) var<storage, read> logits: array<f32>;
+@group(0) @binding(1) var<storage, read> targets: array<f32>;
+@group(0) @binding(2) var<storage, read_write> rowLoss: array<f32>;
+struct Params { batch_size: u32, num_classes: u32, _pad1: u32, _pad2: u32, }
+@group(0) @binding(3) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn cross_entropy_rows(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let b = gid.x;
+    if (b >= params.batch_size) { return; }
+    let base = b * params.num_classes;
+    var max_val: f32 = -3.402823e+38;
+    for (var c: u32 = 0u; c < params.num_classes; c = c + 1u) { max_val = max(max_val, logits[base + c]); }
+    var sum_exp: f32 = 0.0;
+    for (var c: u32 = 0u; c < params.num_classes; c = c + 1u) { sum_exp = sum_exp + exp(logits[base + c] - max_val); }
+    let log_sum = log(sum_exp);
+    var loss: f32 = 0.0;
+    for (var c: u32 = 0u; c < params.num_classes; c = c + 1u) {
+        loss = loss - targets[base + c] * ((logits[base + c] - max_val) - log_sum);
+    }
+    rowLoss[b] = loss;
+}
+";
+
     public void ExpM1(IGpuBuffer A, IGpuBuffer B, int size)
     {
         if (size <= 0) return;

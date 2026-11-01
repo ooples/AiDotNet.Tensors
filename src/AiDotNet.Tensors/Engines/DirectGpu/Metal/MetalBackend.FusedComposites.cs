@@ -90,6 +90,27 @@ kernel void cross_entropy_backward_logits(
     grad[gid] = (exp(logits[gid] - maxVal) / sumExp - targets[gid]) / (float)batchSize;
 }
 
+// -sum(target * log_softmax(row)) per row, from logits and dense targets: the shifted logits minus log(sumExp).
+kernel void cross_entropy_rows(
+    device const float* logits [[buffer(0)]],
+    device const float* targets [[buffer(1)]],
+    device float* rowLoss [[buffer(2)]],
+    constant uint& batchSize [[buffer(3)]],
+    constant uint& numClasses [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= batchSize) return;
+    uint row = gid * numClasses;
+    float maxVal = -INFINITY;
+    for (uint i = 0; i < numClasses; i++) maxVal = max(maxVal, logits[row + i]);
+    float sumExp = 0.0f;
+    for (uint i = 0; i < numClasses; i++) sumExp += exp(logits[row + i] - maxVal);
+    float logSumExp = log(sumExp);
+    float loss = 0.0f;
+    for (uint i = 0; i < numClasses; i++) loss -= targets[row + i] * ((logits[row + i] - maxVal) - logSumExp);
+    rowLoss[gid] = loss;
+}
+
 // dX = dY * sigmoid(X), the activation library's numerically stable sigmoid. dX may be dY.
 kernel void softplus_backward(
     device const float* gradOutput [[buffer(0)]],
@@ -211,6 +232,28 @@ kernel void csr_spmm_bias(
         encoder.SetBytes((uint)size, 3);
         encoder.SetBytes(scale, 4);
         encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
+    // CONTRACT (CUDA, OpenCL and CpuEngine): logits and dense targets; the batch mean of -sum(t * log_softmax(row)).
+    // This was ResidentLossScalar mode 0, -sum(t * log(p)), the loss for probabilities.
+    public float CrossEntropyLoss(IGpuBuffer predictions, IGpuBuffer targets, int batchSize, int numClasses)
+    {
+        ThrowIfDisposed();
+        if (batchSize <= 0 || numClasses <= 0) return 0f;
+        using var rowLoss = AllocateBuffer(batchSize);
+        var pipeline = FusedCompositesPipeline("cross_entropy_rows");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(batchSize);
+        using (var encoder = _commandQueue.CreateScopedComputeEncoder())
+        {
+            encoder.SetPipelineState(pipeline.Handle);
+            encoder.SetBuffer((MetalGpuBuffer)predictions, 0);
+            encoder.SetBuffer((MetalGpuBuffer)targets, 1);
+            encoder.SetBuffer((MetalGpuBuffer)rowLoss, 2);
+            encoder.SetBytes((uint)batchSize, 3);
+            encoder.SetBytes((uint)numClasses, 4);
+            encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+        }
+        return Sum(rowLoss, batchSize) / batchSize;
     }
 
     public void SoftplusBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)

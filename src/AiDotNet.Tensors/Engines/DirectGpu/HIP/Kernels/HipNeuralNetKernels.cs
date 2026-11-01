@@ -170,12 +170,17 @@ extern ""C"" __global__ __launch_bounds__(256) void cross_entropy_loss(
     int batch = blockIdx.x * blockDim.x + threadIdx.x;
     if (batch >= batchSize) return;
 
+    // CONTRACT (as CUDA, OpenCL and CpuEngine): `predictions` are logits and `targets` dense; the row loss is
+    // -sum(t * log_softmax(row)). This was -sum(t * log(pred)), the probability-input loss CUDA had already corrected.
     int baseIdx = batch * numClasses;
+    float maxVal = -INFINITY;
+    for (int c = 0; c < numClasses; c++) maxVal = fmaxf(maxVal, predictions[baseIdx + c]);
+    float sumExp = 0.0f;
+    for (int c = 0; c < numClasses; c++) sumExp += expf(predictions[baseIdx + c] - maxVal);
+    float logSumExp = logf(sumExp);
     float sampleLoss = 0.0f;
-    for (int c = 0; c < numClasses; c++) {
-        float pred = fmaxf(predictions[baseIdx + c], 1e-7f);
-        sampleLoss -= targets[baseIdx + c] * logf(pred);
-    }
+    for (int c = 0; c < numClasses; c++)
+        sampleLoss -= targets[baseIdx + c] * ((predictions[baseIdx + c] - maxVal) - logSumExp);
     loss[batch] = sampleLoss;
 }
 

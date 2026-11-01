@@ -607,7 +607,8 @@ public sealed partial class WebGpuBackend
             BitConverter.Int32BitsToSingle(numClasses),
             0, 0
         };
-        Dispatch3BufferAsync("CrossEntropyForward", WebGpuKernels.CrossEntropyForwardSource, "cross_entropy_forward",
+        // Dense targets (the contract CUDA, OpenCL and CpuEngine share). CrossEntropyForwardSource read them as class indices.
+        Dispatch3BufferAsync(FusedCompositesModuleName + ".CrossEntropyRows", DenseCrossEntropyRowsSource, "cross_entropy_rows",
             predictions, targets, temp, uniforms, batchSize).GetAwaiter().GetResult();
         float total = SumAsync(temp, batchSize).GetAwaiter().GetResult();
         return total / batchSize;

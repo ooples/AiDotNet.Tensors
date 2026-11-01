@@ -47,13 +47,14 @@ extern ""C"" __global__ __launch_bounds__(256) void cross_entropy_loss(
     float sumExp = 0.0f;
     for (int c = 0; c < numClasses; c++)
         sumExp += expf(predictions[b * numClasses + c] - maxVal);
-    float logSumExp = maxVal + logf(sumExp);
+    // Shifted logits minus log(sumExp): maxVal + logf(sumExp) rounds the normalizer away for large logits.
+    float logSumExp = logf(sumExp);
 
     float sample_loss = 0.0f;
     for (int c = 0; c < numClasses; c++) {
         float t = targets[b * numClasses + c];
         if (t > 0.0f)
-            sample_loss -= t * (predictions[b * numClasses + c] - logSumExp);
+            sample_loss -= t * ((predictions[b * numClasses + c] - maxVal) - logSumExp);
     }
     loss[b] = sample_loss;
 }
