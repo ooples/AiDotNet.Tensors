@@ -729,17 +729,26 @@ public sealed class DirectPtxTensorCoreGemmTests
             backend.Synchronize();
             return backend.DownloadBuffer(c);
         }
-        Phase("as-created");
-        float[] created = Output();
-        AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(true);
-        Phase("strict-fp32");
-        float[] strict = Output();
-        AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(false);
-        for (int i = 0; i < 5; i++) cublas();
-        backend.Synchronize();
-        Phase("after-toggle");
-        float[] toggled = Output();
-        AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(null);
+        // The probe toggles the thread's mode; whatever override the worker had going in comes back however it ends.
+        bool? previousMode = AiDotNet.Tensors.Helpers.BlasProvider.GetThreadLocalDeterministicMode();
+        float[] created, strict, toggled;
+        try
+        {
+            Phase("as-created");
+            created = Output();
+            AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(true);
+            Phase("strict-fp32");
+            strict = Output();
+            AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(false);
+            for (int i = 0; i < 5; i++) cublas();
+            backend.Synchronize();
+            Phase("after-toggle");
+            toggled = Output();
+        }
+        finally
+        {
+            AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(previousMode);
+        }
         double MaxDiff(float[] x, float[] y)
         {
             double worst = 0;

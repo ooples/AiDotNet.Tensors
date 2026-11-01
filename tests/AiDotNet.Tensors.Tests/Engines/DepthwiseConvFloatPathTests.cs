@@ -47,7 +47,7 @@ public class DepthwiseConvFloatPathTests
     [InlineData(1, 72, 8, 8, 1, 5, 2, 2)]
     [InlineData(1, 120, 4, 4, 1, 5, 1, 2)]
     [InlineData(1, 960, 1, 1, 1, 5, 1, 2)]    // a 1x1 plane under a 5x5 kernel: most taps outside
-    [InlineData(1, 8, 2, 2, 1, 5, 2, 0)]      // kernel wider than the padded plane's reach
+    [InlineData(1, 8, 3, 3, 1, 5, 2, 1)]      // the kernel spans the whole padded plane (one output)
     [InlineData(1, 4, 3, 3, 1, 5, 2, 1)]      // stride 2: a tap past the right edge (reach -1) must not wrap to the next row
     [InlineData(2, 6, 13, 11, 2, 3, 1, 1)]    // channel multiplier 2, odd sizes
     [InlineData(1, 5, 17, 23, 1, 7, 3, 3)]
@@ -76,6 +76,15 @@ public class DepthwiseConvFloatPathTests
                 CpuParallelSettings.MaxDegreeOfParallelism = previous;
             }
         }
+    }
+
+    // A kernel the padded plane cannot hold has no output: rejected (as PyTorch does) before the kernels index it.
+    [Fact]
+    public void KernelWiderThanThePaddedPlane_IsRejected()
+    {
+        var x = new Tensor<float>(new float[8 * 2 * 2], new[] { 1, 8, 2, 2 });
+        var kernel = new Tensor<float>(new float[8 * 25], new[] { 8, 1, 5, 5 });
+        Assert.Throws<ArgumentException>(() => new CpuEngine().DepthwiseConv2D(x, kernel, new[] { 2, 2 }, new[] { 0, 0 }));
     }
 
     // #639: a pointwise conv's weight gradient at a tiny spatial size takes a direct outer-product path; it must equal

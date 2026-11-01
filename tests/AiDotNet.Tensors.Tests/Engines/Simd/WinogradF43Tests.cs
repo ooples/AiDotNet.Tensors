@@ -17,6 +17,14 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd;
 [Collection("BlasManaged-Stats-Serial")]
 public class WinogradF43Tests
 {
+    /// <summary>Whether the kernel itself can run on this host.</summary>
+    private static bool KernelRuns =>
+        System.Runtime.Intrinsics.X86.Avx2.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported;
+
+    /// <summary>Whether the engine may route a convolution to the kernel: it runs, and the operator opt-out is not set.</summary>
+    private static bool WinogradRoutes =>
+        KernelRuns && Environment.GetEnvironmentVariable("AIDOTNET_CONV_WINOGRAD") != "0";
+
     public static TheoryData<int, int, int, int, int> Shapes => new()
     {
         { 2, 8, 16, 8, 8 },
@@ -27,11 +35,11 @@ public class WinogradF43Tests
         { 8, 32, 16, 8, 8 },
     };
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(Shapes))]
     public void Forward_MatchesTheDirectSum(int n, int c, int k, int h, int w)
     {
-        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported) return;
+        Skip.IfNot(KernelRuns, "The Winograd kernel needs AVX2 + FMA.");
         var rng = new Random(n * 100 + c + k + h * 7 + w);
         float[] x = Fill(rng, n * c * h * w), wt = Fill(rng, k * c * 9);
         foreach (bool accumulate in new[] { false, true })
@@ -62,11 +70,11 @@ public class WinogradF43Tests
         }
     }
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(Shapes))]
     public void BackwardInput_MatchesTheDirectSum(int n, int c, int k, int h, int w)
     {
-        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported) return;
+        Skip.IfNot(KernelRuns, "The Winograd kernel needs AVX2 + FMA.");
         var rng = new Random(n * 31 + c + k + h + w * 3);
         float[] dy = Fill(rng, n * k * h * w), wt = Fill(rng, k * c * 9);
         foreach (bool accumulate in new[] { false, true })
@@ -98,11 +106,11 @@ public class WinogradF43Tests
         }
     }
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(Shapes))]
     public void BackwardKernel_MatchesTheDirectSum(int n, int c, int k, int h, int w)
     {
-        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported) return;
+        Skip.IfNot(KernelRuns, "The Winograd kernel needs AVX2 + FMA.");
         var rng = new Random(n * 17 + c * 3 + k + h + w * 5);
         float[] x = Fill(rng, n * c * h * w), dy = Fill(rng, n * k * h * w);
         foreach (bool accumulate in new[] { false, true })
@@ -134,10 +142,10 @@ public class WinogradF43Tests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Engine_WeightGradient_TakesTheKernel_AndAgreesWithTheDirectRoute()
     {
-        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported) return;
+        Skip.IfNot(WinogradRoutes, "Winograd routing needs AVX2 + FMA and AIDOTNET_CONV_WINOGRAD not set to 0.");
         const int n = 8, c = 128, k = 136, h = 16, w = 16;
         var rng = new Random(78);
         var x = new Tensor<float>(Fill(rng, n * c * h * w), new[] { n, c, h, w });
@@ -166,10 +174,10 @@ public class WinogradF43Tests
         Assert.NotEqual(intoDirect.ToArray(), intoWino.ToArray());
     }
 
-    [Fact]
+    [SkippableFact]
     public void Applies_OnlyTo3x3Stride1Padding1_WithChannelMultiplesOfEight()
     {
-        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported) return;
+        Skip.IfNot(WinogradRoutes, "Winograd routing needs AVX2 + FMA and AIDOTNET_CONV_WINOGRAD not set to 0.");
         Assert.True(WinogradF43.Applies(8, 64, 64, 32, 32, 3, 3, 1, 1, 1, 1, 1, 1));
         Assert.False(WinogradF43.Applies(8, 64, 64, 32, 32, 3, 3, 2, 2, 1, 1, 1, 1));   // stride 2
         Assert.False(WinogradF43.Applies(8, 64, 64, 32, 32, 3, 3, 1, 1, 0, 0, 1, 1));   // padding 0
@@ -187,10 +195,10 @@ public class WinogradF43Tests
         Assert.False(WinogradF43.AppliesToWeightGradient(8, 64, 128, 32, 32, 3, 3, 1, 1, 1, 1, 1, 1));
     }
 
-    [Fact]
+    [SkippableFact]
     public void Engine_ForwardAndInputGradient_TakeTheKernel_AndAgreeWithTheDirectRoute()
     {
-        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported) return;
+        Skip.IfNot(WinogradRoutes, "Winograd routing needs AVX2 + FMA and AIDOTNET_CONV_WINOGRAD not set to 0.");
         const int n = 8, c = 64, k = 72, h = 16, w = 16;
         var rng = new Random(77);
         var x = new Tensor<float>(Fill(rng, n * c * h * w), new[] { n, c, h, w });

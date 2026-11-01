@@ -1680,6 +1680,9 @@ public static partial class BlasManaged
         // Future: clear weight pre-pack cache entries that are still in memory.
     }
 
+    /// <summary>A/B switch (AIDOTNET_AVX512_GEMM_TILE=0): AVX-512 hosts pack for the AVX2 tiles instead of 16x16.</summary>
+    internal static readonly bool s_avx512Fp32Tile = Environment.GetEnvironmentVariable("AIDOTNET_AVX512_GEMM_TILE") != "0";
+
     /// <summary>
     /// Pick the microkernel (mr, nr) tile widths based on element type and
     /// runtime SIMD availability. The selection follows a four-tier hierarchy
@@ -1698,9 +1701,6 @@ public static partial class BlasManaged
     /// This selection drives the layout of packed-A and packed-B, so it must
     /// match the microkernel the strategy ultimately dispatches to.
     /// </summary>
-    /// <summary>A/B switch (AIDOTNET_AVX512_GEMM_TILE=0): AVX-512 hosts pack for the AVX2 tiles instead of 16x16.</summary>
-    internal static readonly bool s_avx512Fp32Tile = Environment.GetEnvironmentVariable("AIDOTNET_AVX512_GEMM_TILE") != "0";
-
     private static (int Mr, int Nr) PickMicrokernelTile<T>() where T : unmanaged =>
         PickMicrokernelTile<T>(Helpers.BlasProvider.IsDeterministicMode);
 

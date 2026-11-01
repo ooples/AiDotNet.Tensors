@@ -19,12 +19,12 @@ public class Avx2StreamingRemainderTests
     private const int Pad = 3;
     private const float Guard = 12345f;
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(false)]
     [InlineData(true)]
     public void MatchesTheReference_AndLeavesThePaddingAlone(bool transA)
     {
-        if (!Avx2Streaming.IsSupported) return;
+        Skip.IfNot(Avx2Streaming.IsSupported, "AVX2 + FMA are unavailable, so the AVX2 streaming kernel cannot run.");
         foreach (int m in Ms)
             foreach (int n in Ns)
                 foreach (int k in Ks)
@@ -49,12 +49,12 @@ public class Avx2StreamingRemainderTests
                 }
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(false)]
     [InlineData(true)]
     public void IsBitIdentical_WhenRowsOrColumnsAreSplit(bool transA)
     {
-        if (!Avx2Streaming.IsSupported) return;
+        Skip.IfNot(Avx2Streaming.IsSupported, "AVX2 + FMA are unavailable, so the AVX2 streaming kernel cannot run.");
         foreach (int m in new[] { 5, 9, 128 })
             foreach (int n in new[] { 10, 17, 42 })
             {
@@ -62,6 +62,8 @@ public class Avx2StreamingRemainderTests
                 var (a, lda, b, c0, ldc) = Operands(m, n, k, transA, seed: m + n);
                 var whole = (float[])c0.Clone();
                 Avx2Streaming.RunFp32(a, lda, transA, b, n, false, whole, ldc, m, n, k);
+                // The split runs below start from c0 too, so they match a kernel that wrote nothing unless this holds.
+                Assert.NotEqual(c0, whole);
 
                 // Rows [0, r) and [r, m): r = 3 puts rows in different four-row blocks than the whole call does.
                 const int r = 3;

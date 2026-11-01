@@ -9937,7 +9937,7 @@ public partial class DirectGpuTensorEngine
             }
             finally { idxBuf.Dispose(); }
         }
-        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.MaxPool3DWithIndices(input, poolSize, stride, out maxIndices); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DWithIndices", capabilityGap); return base.MaxPool3DWithIndices(input, poolSize, stride, out maxIndices); }
     }
 
     // #775: AvgPool3D (NCDHW, no-padding). Scalar overload routes to the int[] one through the interface
@@ -9979,7 +9979,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { outBuf.Dispose(); throw; }
         }
-        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.AvgPool3D(input, poolSize, stride, padding); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("AvgPool3D", capabilityGap); return base.AvgPool3D(input, poolSize, stride, padding); }
     }
 
     // #775: AvgPool3D backward (NCDHW, no-padding). The avgpool3d_backward kernel parallelizes over input
@@ -10010,7 +10010,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { gradInBuf.Dispose(); throw; }
         }
-        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.AvgPool3DBackward(gradOutput, inputShape, poolSize, stride, padding); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("AvgPool3DBackward", capabilityGap); return base.AvgPool3DBackward(gradOutput, inputShape, poolSize, stride, padding); }
     }
 
     // #775: ConvTranspose2D backward w.r.t. input. Backend kernel gathers per gradInput element (1D over
@@ -10041,7 +10041,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { gradInBuf.Dispose(); throw; }
         }
-        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.ConvTranspose2DBackwardInput(gradOutput, kernel, inputShape, stride, padding); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("ConvTranspose2DBackwardInput", capabilityGap); return base.ConvTranspose2DBackwardInput(gradOutput, kernel, inputShape, stride, padding); }
     }
 
     // #775: ConvTranspose2D backward w.r.t. the kernel. Backend zeroes gradKernel + atomic-accumulates.
@@ -10072,7 +10072,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { gradKBuf.Dispose(); throw; }
         }
-        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.ConvTranspose2DBackwardKernel(gradOutput, input, kernelShape, stride, padding); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("ConvTranspose2DBackwardKernel", capabilityGap); return base.ConvTranspose2DBackwardKernel(gradOutput, input, kernelShape, stride, padding); }
     }
 
     // #775: Conv3D backward w.r.t. input (no dilation). weights=[outC,inC,kD,kH,kW]; inputShape=[N,inC,D,H,W];
@@ -10104,7 +10104,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { gradInBuf.Dispose(); throw; }
         }
-        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.Conv3DBackwardInput(gradOutput, kernel, inputShape, stride, padding, dilation); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("Conv3DBackwardInput", capabilityGap); return base.Conv3DBackwardInput(gradOutput, kernel, inputShape, stride, padding, dilation); }
     }
 
     // #775: Conv3D backward w.r.t. weights (no dilation). kernelShape=[outC,inC,kD,kH,kW]; input=[N,inC,D,H,W].
@@ -10136,7 +10136,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { gradKBuf.Dispose(); throw; }
         }
-        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.Conv3DBackwardKernel(gradOutput, input, kernelShape, stride, padding, dilation); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("Conv3DBackwardKernel", capabilityGap); return base.Conv3DBackwardKernel(gradOutput, input, kernelShape, stride, padding, dilation); }
     }
 
     // #775: Conv1D backward == Conv2D backward with a singleton height (exactly how CpuEngine implements
@@ -10198,7 +10198,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { gradInBuf.Dispose(); throw; }
         }
-        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.DepthwiseConv2DBackwardInput(gradOutput, kernel, inputShape, stride, padding); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("DepthwiseConv2DBackwardInput", capabilityGap); return base.DepthwiseConv2DBackwardInput(gradOutput, kernel, inputShape, stride, padding); }
     }
 
     Tensor<T> IEngine.DepthwiseConv2DBackwardKernel<T>(Tensor<T> gradOutput, Tensor<T> input, int[] kernelShape, int[] stride, int[] padding)
@@ -10225,7 +10225,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { gradKBuf.Dispose(); throw; }
         }
-        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.DepthwiseConv2DBackwardKernel(gradOutput, input, kernelShape, stride, padding); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("DepthwiseConv2DBackwardKernel", capabilityGap); return base.DepthwiseConv2DBackwardKernel(gradOutput, input, kernelShape, stride, padding); }
     }
 
     // #775: DepthwiseConv1D backward == 2D with a singleton height (mirrors CpuEngine). Route to the 2D path.
@@ -10280,7 +10280,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { outBuf.Dispose(); throw; }
         }
-        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.TensorTrilinearInterpolate(grid, positions); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorTrilinearInterpolate", capabilityGap); return base.TensorTrilinearInterpolate(grid, positions); }
     }
 
     // #775: trilinear-interpolate backward w.r.t. the grid -> gradGrid [D,H,W,C], via the gather-form kernel.
@@ -10305,7 +10305,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { gradGridBuf.Dispose(); throw; }
         }
-        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.TensorTrilinearInterpolateBackward(gradOutput, grid, positions); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorTrilinearInterpolateBackward", capabilityGap); return base.TensorTrilinearInterpolateBackward(gradOutput, grid, positions); }
     }
 
     // #775: ConvTranspose3D forward on the new conv_transpose3d kernel. weights=[inC,outC,kD,kH,kW];
@@ -10339,7 +10339,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { outBuf.Dispose(); throw; }
         }
-        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.ConvTranspose3D(input, kernel, stride, padding, outputPadding); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("ConvTranspose3D", capabilityGap); return base.ConvTranspose3D(input, kernel, stride, padding, outputPadding); }
     }
 
     // #775: ConvTranspose3D backward w.r.t. input. weights=[inC,outC,kD,kH,kW]; inputShape=[N,inC,iD,iH,iW];
@@ -10369,7 +10369,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { gradInBuf.Dispose(); throw; }
         }
-        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.ConvTranspose3DBackwardInput(gradOutput, kernel, inputShape, stride, padding); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("ConvTranspose3DBackwardInput", capabilityGap); return base.ConvTranspose3DBackwardInput(gradOutput, kernel, inputShape, stride, padding); }
     }
 
     // #775: ConvTranspose3D backward w.r.t. weights. kernelShape=[inC,outC,kD,kH,kW]; input=[N,inC,iD,iH,iW].
@@ -10398,7 +10398,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { gradKBuf.Dispose(); throw; }
         }
-        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.ConvTranspose3DBackwardKernel(gradOutput, input, kernelShape, stride, padding); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("ConvTranspose3DBackwardKernel", capabilityGap); return base.ConvTranspose3DBackwardKernel(gradOutput, input, kernelShape, stride, padding); }
     }
 
     // #775: SpiralConv (mesh conv) on the new spiral_conv kernel. vertexFeatures=[V,inC],
@@ -10430,7 +10430,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { outBuf.Dispose(); throw; }
         }
-        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.SpiralConv(vertexFeatures, spiralIndices, weights, biases); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("SpiralConv", capabilityGap); return base.SpiralConv(vertexFeatures, spiralIndices, weights, biases); }
     }
 
     // #775: SpiralConv backward w.r.t. vertex features on the spiral_conv_backward_input kernel.
@@ -10459,7 +10459,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { outBuf.Dispose(); throw; }
         }
-        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.SpiralConvBackwardInput(outputGradient, spiralIndices, weights, inputChannels); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("SpiralConvBackwardInput", capabilityGap); return base.SpiralConvBackwardInput(outputGradient, spiralIndices, weights, inputChannels); }
     }
 
     // #775: SpiralConv backward w.r.t. weights on the spiral_conv_backward_weights kernel.
@@ -10489,7 +10489,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { outBuf.Dispose(); throw; }
         }
-        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.SpiralConvBackwardWeights(outputGradient, vertexFeatures, spiralIndices); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("SpiralConvBackwardWeights", capabilityGap); return base.SpiralConvBackwardWeights(outputGradient, vertexFeatures, spiralIndices); }
     }
 
     // #775: SpiralConv backward w.r.t. bias = sum of outputGradient[V,outC] over vertices -> [outC].
@@ -10539,7 +10539,7 @@ public partial class DirectGpuTensorEngine
             var dw = e.TensorMatMul(diffused, e.TensorTranspose(weights));
             return e.TensorAdd(dw, biases);
         }
-        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.DiffusionConv(vertexFeatures, laplacian, weights, biases, diffusionTime); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("DiffusionConv", capabilityGap); return base.DiffusionConv(vertexFeatures, laplacian, weights, biases, diffusionTime); }
     }
 
     // #775: AffineGrid (spatial-transformer sampling grid). theta [batch,2,3] -> grid
@@ -10576,7 +10576,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { gridBuf.Dispose(); throw; }
         }
-        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.AffineGrid(theta, outputHeight, outputWidth); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("AffineGrid", capabilityGap); return base.AffineGrid(theta, outputHeight, outputWidth); }
     }
 
     // NOTE: PairwiseDistanceSquared was reverted to the CPU base. Its GPU compose (even a single
@@ -10605,7 +10605,7 @@ public partial class DirectGpuTensorEngine
             }
             return base.TensorCosh(tensor);
         }
-        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.TensorCosh(tensor); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorCosh", capabilityGap); return base.TensorCosh(tensor); }
     }
 
     // #775: TensorSinh on the existing backend.Sinh (sinh_vector) unary kernel — same as TensorCosh.
@@ -10627,7 +10627,7 @@ public partial class DirectGpuTensorEngine
             }
             return base.TensorSinh(tensor);
         }
-        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.TensorSinh(tensor); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorSinh", capabilityGap); return base.TensorSinh(tensor); }
     }
 
     // #775: TensorReciprocal on the existing backend.Reciprocal (reciprocal_vector = 1/x) unary kernel.
@@ -10642,7 +10642,7 @@ public partial class DirectGpuTensorEngine
                 return new Tensor<T>(result, tensor.Shape._dims);
             return base.TensorReciprocal(tensor);
         }
-        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.TensorReciprocal(tensor); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorReciprocal", capabilityGap); return base.TensorReciprocal(tensor); }
     }
 
     /// <inheritdoc/>
