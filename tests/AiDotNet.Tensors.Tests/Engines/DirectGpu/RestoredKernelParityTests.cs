@@ -217,10 +217,10 @@ public abstract class RestoredKernelParityTestsBase
         using var da = backend.AllocateBuffer(a);
         using var db = backend.AllocateBuffer(b);
         using var dOut = Filled(backend, 1, Sentinel);
-        bool previous = AiDotNet.Tensors.Engines.AiDotNetEngine.DeterministicMode;
-        AiDotNet.Tensors.Engines.AiDotNetEngine.SetDeterministicMode(deterministic);
+        bool? previous = AiDotNet.Tensors.Helpers.BlasProvider.GetThreadLocalDeterministicMode();
+        AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(deterministic);
         try { backend.DotProduct(da, db, dOut, size); }
-        finally { AiDotNet.Tensors.Engines.AiDotNetEngine.SetDeterministicMode(previous); }
+        finally { AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(previous); }
         float actual = backend.DownloadBuffer(dOut)[0];
         Assert.True(Math.Abs(expected - actual) <= 1e-4 * Math.Sqrt(size) * 4, $"DotProduct({size}, deterministic={deterministic}): expected {expected:R}, got {actual:R}");
     }
@@ -241,10 +241,10 @@ public abstract class RestoredKernelParityTestsBase
         using var da = backend.AllocateBuffer(a);
         using var db = backend.AllocateBuffer(b);
         using var dOut = Filled(backend, 1, Sentinel);
-        bool previous = AiDotNet.Tensors.Engines.AiDotNetEngine.DeterministicMode;
-        AiDotNet.Tensors.Engines.AiDotNetEngine.SetDeterministicMode(deterministic);
+        bool? previous = AiDotNet.Tensors.Helpers.BlasProvider.GetThreadLocalDeterministicMode();
+        AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(deterministic);
         try { backend.StridedDotProduct(da, db, dOut, aSize, bSize, bOffset, bStride); }
-        finally { AiDotNet.Tensors.Engines.AiDotNetEngine.SetDeterministicMode(previous); }
+        finally { AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(previous); }
         float actual = backend.DownloadBuffer(dOut)[0];
         Assert.True(Math.Abs(expected - actual) <= 1e-4 * Math.Sqrt(aSize) * 4,
             $"StridedDotProduct({aSize}, +{bOffset}, x{bStride}, deterministic={deterministic}): expected {expected:R}, got {actual:R}");

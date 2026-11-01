@@ -637,7 +637,7 @@ public sealed class DirectPtxTensorCoreGemmTests
             end.Synchronize();
             return backend.GetEventElapsedTime(start, end) * 1000.0 / reps;
         }
-        bool previous = AiDotNet.Tensors.Engines.AiDotNetEngine.DeterministicMode;
+        bool? previous = AiDotNet.Tensors.Helpers.BlasProvider.GetThreadLocalDeterministicMode();
         try
         {
             foreach (var (name, m, k, n) in shapes)
@@ -647,7 +647,7 @@ public sealed class DirectPtxTensorCoreGemmTests
                 using var b = backend.AllocateBuffer(Values(k * n, 2));
                 using var c = backend.AllocateBuffer(m * n);
                 string line = $"{name,-11} M{m} K{k} N{n}: ";
-                AiDotNet.Tensors.Engines.AiDotNetEngine.SetDeterministicMode(false);
+                AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(false);
                 double tf32 = Time(() => backend.Gemm(a, b, c, m, n, k), work);
                 if (PtxTensorCoreGemmEvolution.Admits(new PtxTensorCoreGemmConfiguration(64, 64, 16, 32, 32, 3, 4), layout, m, n, k, PtxTensorCorePrecision.Tf32))
                 {
@@ -660,7 +660,7 @@ public sealed class DirectPtxTensorCoreGemmTests
                 {
                     line += $"TF32 cuBLAS {tf32,9:F1} us / PTX n/a (unaligned)   ";
                 }
-                AiDotNet.Tensors.Engines.AiDotNetEngine.SetDeterministicMode(true);
+                AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(true);
                 double strict = Time(() => backend.Gemm(a, b, c, m, n, k), work);
                 var sconfig = PtxGemmEvolution.Seeds(layout, m, n, k, sms)[0];
                 using var skernel = new PtxSgemmKernel(runtime, sconfig, layout);
@@ -671,7 +671,7 @@ public sealed class DirectPtxTensorCoreGemmTests
         }
         finally
         {
-            AiDotNet.Tensors.Engines.AiDotNetEngine.SetDeterministicMode(previous);
+            AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(previous);
         }
     }
 
@@ -731,14 +731,15 @@ public sealed class DirectPtxTensorCoreGemmTests
         }
         Phase("as-created");
         float[] created = Output();
-        AiDotNet.Tensors.Engines.AiDotNetEngine.SetDeterministicMode(true);
+        AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(true);
         Phase("strict-fp32");
         float[] strict = Output();
-        AiDotNet.Tensors.Engines.AiDotNetEngine.SetDeterministicMode(false);
+        AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(false);
         for (int i = 0; i < 5; i++) cublas();
         backend.Synchronize();
         Phase("after-toggle");
         float[] toggled = Output();
+        AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(null);
         double MaxDiff(float[] x, float[] y)
         {
             double worst = 0;
@@ -784,8 +785,8 @@ public sealed class DirectPtxTensorCoreGemmTests
             end.Synchronize();
             return backend.GetEventElapsedTime(start, end) * 1000.0 / reps;
         }
-        bool previous = AiDotNet.Tensors.Engines.AiDotNetEngine.DeterministicMode;
-        AiDotNet.Tensors.Engines.AiDotNetEngine.SetDeterministicMode(true);
+        bool? previous = AiDotNet.Tensors.Helpers.BlasProvider.GetThreadLocalDeterministicMode();
+        AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(true);
         try
         {
             foreach (var (m, n, k) in shapes)
@@ -830,7 +831,7 @@ public sealed class DirectPtxTensorCoreGemmTests
         }
         finally
         {
-            AiDotNet.Tensors.Engines.AiDotNetEngine.SetDeterministicMode(previous);
+            AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(previous);
         }
     }
 }

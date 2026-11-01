@@ -60,10 +60,10 @@ public sealed class DirectPtxGemmRoutingTests
     public void InstalledRoute_RunsTheGeneratedKernel_OnlyInItsMathMode_AndMatchesCublas()
     {
         using var backend = RequireAmpereBackend();
-        bool previous = AiDotNetEngine.DeterministicMode;
+        bool? previous = AiDotNet.Tensors.Helpers.BlasProvider.GetThreadLocalDeterministicMode();
         try
         {
-            AiDotNetEngine.SetDeterministicMode(true);
+            AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(true);
             const int m = 192, n = 256, k = 320;
             float[] hostC = Values(m * n, 3);
             using var a = backend.AllocateBuffer(Values(m * k, 1));
@@ -91,11 +91,11 @@ public sealed class DirectPtxGemmRoutingTests
             Assert.Equal(CudaGemmDispatchPath.Cublas, backend.LastGemmDispatchPath);
 
             // The route was measured in strict FP32: with determinism off (TF32 cuBLAS) it must not be used.
-            AiDotNetEngine.SetDeterministicMode(false);
+            AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(false);
             backend.Gemm(a, b, c2, m, n, k);
             Assert.Equal(CudaGemmDispatchPath.Cublas, backend.LastGemmDispatchPath);
 
-            AiDotNetEngine.SetDeterministicMode(true);
+            AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(true);
             backend.ClearGemmRoutes();
             backend.Gemm(a, b, c2, m, n, k);
             Assert.Equal(CudaGemmDispatchPath.Cublas, backend.LastGemmDispatchPath);
@@ -103,7 +103,7 @@ public sealed class DirectPtxGemmRoutingTests
         }
         finally
         {
-            AiDotNetEngine.SetDeterministicMode(previous);
+            AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(previous);
         }
     }
 
@@ -114,11 +114,11 @@ public sealed class DirectPtxGemmRoutingTests
         const string cacheVariable = "AIDOTNET_AUTOTUNE_CACHE_PATH";
         string? priorCache = Environment.GetEnvironmentVariable(cacheVariable);
         string cache = Path.Combine(Path.GetTempPath(), "aidotnet-gemm-route-" + Guid.NewGuid().ToString("N"));
-        bool previous = AiDotNetEngine.DeterministicMode;
+        bool? previous = AiDotNet.Tensors.Helpers.BlasProvider.GetThreadLocalDeterministicMode();
         Environment.SetEnvironmentVariable(cacheVariable, cache);
         try
         {
-            AiDotNetEngine.SetDeterministicMode(true);
+            AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(true);
             const int m = 256, n = 256, k = 256;
             Assert.False(backend.TryActivatePersistedGemmRoute(m, n, k));   // nothing persisted yet
 
@@ -164,13 +164,13 @@ public sealed class DirectPtxGemmRoutingTests
                 Assert.Equal(decision.UsesDirectPtx ? CudaGemmDispatchPath.DirectPtxSgemm : untuned, fresh.LastGemmDispatchPath);
             }
 
-            AiDotNetEngine.SetDeterministicMode(false);
+            AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(false);
             Assert.False(backend.TryActivatePersistedGemmRoute(m, n, k));   // no TF32 verdict was measured
             Assert.False(backend.TryActivatePersistedGemmRoute(m, n, 2 * k));
         }
         finally
         {
-            AiDotNetEngine.SetDeterministicMode(previous);
+            AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(previous);
             Environment.SetEnvironmentVariable(cacheVariable, priorCache);
             try { Directory.Delete(cache, recursive: true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
         }
@@ -187,10 +187,10 @@ public sealed class DirectPtxGemmRoutingTests
     public void InstalledRoute_FollowsItsOwnVerdict_ForEagerLaunchesAndGraphCaptures()
     {
         using var backend = RequireAmpereBackend();
-        bool previous = AiDotNetEngine.DeterministicMode;
+        bool? previous = AiDotNet.Tensors.Helpers.BlasProvider.GetThreadLocalDeterministicMode();
         try
         {
-            AiDotNetEngine.SetDeterministicMode(true);
+            AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(true);
             const int m = 128, n = 128, k = 128;
             using var a = backend.AllocateBuffer(Values(m * k, 1));
             using var b = backend.AllocateBuffer(Values(k * n, 2));
@@ -244,7 +244,7 @@ public sealed class DirectPtxGemmRoutingTests
         finally
         {
             backend.ClearGemmRoutes();
-            AiDotNetEngine.SetDeterministicMode(previous);
+            AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(previous);
         }
     }
 }
