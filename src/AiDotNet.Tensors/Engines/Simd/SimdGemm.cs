@@ -3598,6 +3598,22 @@ internal static partial class SimdGemm
     /// <summary>Rows per register block of the transposed-A kernel below.</summary>
     private const int TransAMr = 6;
 
+    /// <summary>Probe: the transposed-A tile's loop order (AIDOTNET_TRANSA_ORDER: 0 strip outer, 1 packed A panels,
+    /// 2 row outer over all of B packed).</summary>
+    internal static int s_transAOrder =
+        int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_TRANSA_ORDER"), out int tao) ? tao : 0;
+
+    private const long TransAPackMaxFloats = 1L << 20;
+
+    [ThreadStatic] private static float[]? t_transAPack;
+
+    private static float[] TransAPackABuffer(int floats)
+    {
+        var buffer = t_transAPack;
+        if (buffer is null || buffer.Length < floats) t_transAPack = buffer = new float[floats];
+        return buffer;
+    }
+
     /// <summary>
     /// C[i, :] = sum over p of At[i, p] * B[p, :] for the 6-row blocks [blockStart, blockEnd) of rows [0, mFull), with
     /// A stored [k, m] (lda = m), B [k, n] and C [m, n]. Each block is swept in 16-column strips (12 accumulators; the
@@ -3628,6 +3644,53 @@ internal static partial class SimdGemm
         if (UseVector512Direct && s_packStrip512 && k <= MaxPackedStripK && nFull >= Nr512 && blockEnd - blockStart >= 2)
         {
             packedColumns = (nFull / Nr512) * Nr512;
+            int order = s_transAOrder;
+            int fullEnd = Math.Min(blockEnd, mFull / TransAMr);
+            int fullBlocks = fullEnd - blockStart;
+            if (order == 1 && fullBlocks > 0 && (long)fullBlocks * k * TransAMr <= TransAPackMaxFloats)
+            {
+                // Each six-row panel of At copied contiguous ([p][6]), so a tile's broadcasts stream sequentially.
+                float[] aBuf = TransAPackABuffer(fullBlocks * k * TransAMr);
+                fixed (float* ap = aBuf)
+                fixed (float* strip = PackedStripBuffer(k))
+                {
+                    for (int b = 0; b < fullBlocks; b++)
+                    {
+                        float* src = A + (blockStart + b) * TransAMr;
+                        float* dst = ap + (long)b * k * TransAMr;
+                        for (int p = 0; p < k; p++, src += m, dst += TransAMr)
+                        {
+                            dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2];
+                            dst[3] = src[3]; dst[4] = src[4]; dst[5] = src[5];
+                        }
+                    }
+                    for (int j = 0; j < packedColumns; j += Nr512)
+                    {
+                        PackStrip32(B + j, n, strip, k);
+                        for (int b = 0; b < fullBlocks; b++)
+                            TransAKernel6x32(ap + (long)b * k * TransAMr, TransAMr, strip, Nr512,
+                                C + (long)(blockStart + b) * TransAMr * n + j, n, k);
+                    }
+                }
+            }
+            else if (order == 2 && fullBlocks > 0 && (long)packedColumns * k <= TransAPackMaxFloats)
+            {
+                // All of B's full strips packed once ([strip][p][32]); row blocks outer, so a panel of At stays in L1
+                // across every strip.
+                float[] bBuf = TransAPackABuffer(packedColumns * k);
+                fixed (float* bp = bBuf)
+                {
+                    for (int j = 0; j < packedColumns; j += Nr512)
+                        PackStrip32(B + j, n, bp + (long)j * k, k);
+                    for (int b = 0; b < fullBlocks; b++)
+                    {
+                        int i0 = (blockStart + b) * TransAMr;
+                        for (int j = 0; j < packedColumns; j += Nr512)
+                            TransAKernel6x32(A + i0, m, bp + (long)j * k, Nr512, C + (long)i0 * n + j, n, k);
+                    }
+                }
+            }
+            else
             fixed (float* strip = PackedStripBuffer(k))
             {
                 for (int j = 0; j < packedColumns; j += Nr512)
