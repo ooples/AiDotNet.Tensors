@@ -37,13 +37,18 @@ internal static class Conv1x1Gemm
             && dilationH == 1 && dilationW == 1 && Avx2.IsSupported && Fma.IsSupported;
 
     /// <summary>Switch for A/B measurement and tests.</summary>
-    internal static bool s_enabled = true;
+    internal static readonly bool s_enabled = Environment.GetEnvironmentVariable("AIDOTNET_CONV1X1_GEMM") != "0";
+
+    /// <summary>Passes this thread has run here (forward, input gradient, weight gradient): tests check the route ran.</summary>
+    [ThreadStatic]
+    internal static int t_runs;
 
     /// <summary>y = conv1x1(x, w) at the stride (overwrites y).</summary>
     [MethodImpl(Hot)]
     public static void Forward(float[] x, int xOffset, float[] w, int wOffset, float[] y, int yOffset,
         int batch, int inChannels, int height, int width, int outChannels, int strideH, int strideW, int outputHeight, int outputWidth)
     {
+        t_runs++;
         int pixels = outputHeight * outputWidth;
         if (strideH == 1 && strideW == 1)
         {
@@ -68,6 +73,7 @@ internal static class Conv1x1Gemm
     public static void BackwardInput(float[] dy, int dyOffset, float[] w, int wOffset, float[] dx, int dxOffset, bool accumulate,
         int batch, int inChannels, int height, int width, int outChannels, int strideH, int strideW, int outputHeight, int outputWidth)
     {
+        t_runs++;
         int pixels = outputHeight * outputWidth;
         bool strided = strideH > 1 || strideW > 1;
         var pool = ArrayPool<float>.Shared;
@@ -97,6 +103,7 @@ internal static class Conv1x1Gemm
     public static void BackwardKernel(float[] x, int xOffset, float[] dy, int dyOffset, float[] dw, int dwOffset, bool accumulate,
         int batch, int inChannels, int height, int width, int outChannels, int strideH, int strideW, int outputHeight, int outputWidth)
     {
+        t_runs++;
         int pixels = outputHeight * outputWidth;
         int depth = batch * pixels;
         var pool = ArrayPool<float>.Shared;

@@ -45,8 +45,11 @@ public class Conv1x1GemmTests
         var (yRef, dxRef, dwRef) = Reference(x, w, dy, batch, inChannels, outChannels, height, width, stride, oh, ow);
 
         var y = new Tensor<float>(new[] { batch, outChannels, oh, ow });
+        int runs = Conv1x1Gemm.t_runs;
         engine.Conv2DInto(y, x, w, s, p, d);
         AssertClose(yRef, y.ToArray(), "forward");
+        // The engine sends strided 1x1 forwards here; a stride-1 forward is a plain GEMM elsewhere.
+        Assert.Equal(stride > 1 ? runs + 1 : runs, Conv1x1Gemm.t_runs);
 
         foreach (bool accumulate in new[] { false, true })
         {
@@ -54,13 +57,51 @@ public class Conv1x1GemmTests
             var seedDw = Random(rng, outChannels, inChannels, 1, 1);
             var dx = new Tensor<float>(seedDx.ToArray(), seedDx.Shape.ToArray());
             var dw = new Tensor<float>(seedDw.ToArray(), seedDw.Shape.ToArray());
+            runs = Conv1x1Gemm.t_runs;
             engine.Conv2DBackwardInputInto(dx, dy, w, x.Shape.ToArray(), s, p, d, accumulate);
+            Assert.Equal(runs + 1, Conv1x1Gemm.t_runs);
             engine.Conv2DBackwardKernelInto(dw, dy, x, w.Shape.ToArray(), s, p, d, accumulate);
+            Assert.Equal(runs + 2, Conv1x1Gemm.t_runs);
             var expectDx = accumulate ? dxRef.Zip(seedDx.ToArray(), (a, b) => a + b).ToArray() : dxRef;
             var expectDw = accumulate ? dwRef.Zip(seedDw.ToArray(), (a, b) => a + b).ToArray() : dwRef;
             AssertClose(expectDx, dx.ToArray(), $"input gradient (accumulate {accumulate})");
             AssertClose(expectDw, dw.ToArray(), $"weight gradient (accumulate {accumulate})");
         }
+    }
+
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void PendingDeviceDownloadsRunBeforeTheRouteTouchesTheBuffers(bool accumulate)
+    {
+        Skip.IfNot(Avx2.IsSupported && Fma.IsSupported, "The 1x1 GEMM route needs AVX2 and FMA.");
+        const int batch = 2, inChannels = 16, outChannels = 32, height = 16, width = 16, stride = 2;
+        int oh = (height - 1) / stride + 1, ow = (width - 1) / stride + 1;
+        var rng = new Random(11);
+        var x = Random(rng, batch, inChannels, height, width);
+        var w = Random(rng, outChannels, inChannels, 1, 1);
+        var source = Random(rng, batch, outChannels, oh, ow);
+        var seed = Random(rng, batch, inChannels, height, width);
+        var (_, dxRef, _) = Reference(x, w, source, batch, inChannels, outChannels, height, width, stride, oh, ow);
+
+        // dY's host array is stale (zeros) until its pending download copies the device data in. dX's pending download
+        // holds its current device value: the accumulating pass adds to it, the overwriting pass replaces it (a download
+        // left pending would later run and put it back over the result).
+        var dy = new Tensor<float>(new[] { batch, outChannels, oh, ow });
+        float[] dyHost = dy.GetCpuBackingForStridedRead(out _)!;
+        float[] sourceData = source.ToArray();
+        AiDotNet.Tensors.Helpers.HostSync.Register(dyHost, _ => sourceData.CopyTo(dyHost, 0));
+        var dx = new Tensor<float>(new[] { batch, inChannels, height, width });
+        float[] dxHost = dx.GetCpuBackingForStridedRead(out _)!;
+        float[] seedData = seed.ToArray();
+        AiDotNet.Tensors.Helpers.HostSync.Register(dxHost, _ => seedData.CopyTo(dxHost, 0));
+
+        int runs = Conv1x1Gemm.t_runs;
+        new CpuEngine().Conv2DBackwardInputInto(dx, dy, w, x.Shape.ToArray(), new[] { stride, stride }, new[] { 0, 0 },
+            new[] { 1, 1 }, accumulate);
+        Assert.Equal(runs + 1, Conv1x1Gemm.t_runs);
+        var expect = accumulate ? dxRef.Zip(seedData, (p, q) => p + q).ToArray() : dxRef;
+        AssertClose(expect, dx.ToArray(), $"input gradient over pending downloads (accumulate {accumulate})");
     }
 
     private static (float[] Y, float[] Dx, float[] Dw) Reference(Tensor<float> xt, Tensor<float> wt, Tensor<float> dyt,

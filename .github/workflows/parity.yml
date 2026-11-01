@@ -289,8 +289,9 @@ jobs:
 
       - name: Per-operation breakdown (runner CPU)
         # Which convolution / linear pass loses on THIS night's CPU (the hosted runner's model and ISA vary: AVX2 or
-        # AVX-512, AMD or Intel). Diagnostic only; it never fails the job.
-        if: always()
+        # AVX-512, AMD or Intel). Diagnostic only; it never fails the job. Under isa_ab the A/B step's default pass
+        # produces the same table, so this one is skipped.
+        if: ${{ always() && !inputs.isa_ab }}
         continue-on-error: true
         env:
           AIDOTNET_OP_BREAKDOWN: '1'
@@ -312,6 +313,7 @@ jobs:
         env:
           AIDOTNET_OP_BREAKDOWN: '1'
         run: |
+          { lscpu | grep -E 'Model name|^CPU\(s\)|Thread'; grep -q avx512f /proc/cpuinfo && echo 'ISA: avx512f' || echo 'ISA: avx2'; } | tee "$RUNNER_TEMP/cpu.txt"
           python tools/parity/cpu_op_breakdown_torch.py > "$RUNNER_TEMP/ops-torch.log"
           modes="on="
           if grep -q avx512f /proc/cpuinfo; then
@@ -362,6 +364,9 @@ jobs:
           path: |
             ${{ runner.temp }}/parity.log
             ${{ runner.temp }}/ops-*.log
+            ${{ runner.temp }}/ops-*.txt
+            ${{ runner.temp }}/isa-*.log
+            ${{ runner.temp }}/isa.md
             ${{ runner.temp }}/cpu.txt
             /tmp/aidotnet-parity/*-latest.json
           if-no-files-found: warn

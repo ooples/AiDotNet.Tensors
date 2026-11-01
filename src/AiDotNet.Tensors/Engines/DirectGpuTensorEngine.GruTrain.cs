@@ -102,8 +102,10 @@ public partial class DirectGpuTensorEngine
             {
                 var gpu = (DirectGpuTensorEngine)eng;
                 var backend = gpu.GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
-                // Resolved when the node runs, with the backend live; per layer and stable across steps.
-                var cache = gpu.GetGruTrainCache(backend, wIh, b, t, inSize, h);
+                // Resolved when the node runs, with the backend live; keyed by this recorded node (stable across
+                // steps), so two calls of one GRU in a step (a siamese encoder, a weight-tied decoder) keep separate
+                // activations rather than the second overwriting the first's before its backward.
+                var cache = gpu.GetGruTrainCache(backend, node, b, t, inSize, h);
                 node.Cache = cache;
                 var result = gpu.RunGruTrainForward(backend, inputs, present, cache, lastStepOnly);
                 node.Generation = ++cache.Generation;
@@ -116,7 +118,7 @@ public partial class DirectGpuTensorEngine
         GruTrainCache c, bool lastStepOnly)
     {
         var (x, h0, wIh, wHh, bIh, bHh) = UnpackGruSequenceInputs(inputs, present);
-        var xc = x.IsContiguous ? x : (Tensor<T>)x.Contiguous();
+        var xc = x.IsContiguous ? x : x.Contiguous();
         using var bufX = GetOrAllocateBuffer(backend, xc);
         using var bufWih = GetOrAllocateBuffer(backend, wIh);
         using var bufWhh = GetOrAllocateBuffer(backend, wHh);
@@ -146,16 +148,15 @@ public partial class DirectGpuTensorEngine
         var c = node.Cache ?? throw new InvalidOperationException("The fused GPU GRU node's backward ran before its forward.");
         if (node.Generation != c.Generation)
             throw new InvalidOperationException(
-                "The fused GPU GRU ran this layer's forward again before this call's backward, and both calls share one "
-                + "set of activation buffers, so these gradients would come from the later call. Run one forward per layer "
-                + "per step on this path.");
+                "The fused GPU GRU node ran its forward again before its backward, so its activation buffers hold the "
+                + "later call's state and these gradients would come from it.");
         var gpu = (DirectGpuTensorEngine)engine;
         var backend = gpu.GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
         var (x, h0, wIh, wHh, bIh, bHh) = UnpackGruSequenceInputs(inputs, node.Present);
 
-        var gy = gradOutput.IsContiguous ? gradOutput : (Tensor<T>)gradOutput.Contiguous();
+        var gy = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
         using var bufGy = gpu.GetOrAllocateBuffer(backend, gy);
-        var xc = x.IsContiguous ? x : (Tensor<T>)x.Contiguous();
+        var xc = x.IsContiguous ? x : x.Contiguous();
         using var bufX = gpu.GetOrAllocateBuffer(backend, xc);
         using var bufWih = gpu.GetOrAllocateBuffer(backend, wIh);
         using var bufWhh = gpu.GetOrAllocateBuffer(backend, wHh);

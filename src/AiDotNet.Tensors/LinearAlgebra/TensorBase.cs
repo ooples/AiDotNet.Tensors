@@ -3091,6 +3091,9 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         }
         if (_storage.TryGetBackingArraySegmentForReadOnlyAccess(out var array, out int baseOffset))
         {
+            // The caller reads the array directly: run a pending device download first (a no-op field read when
+            // nothing is pending), as GetReadOnlyDataArray does.
+            _storage.GetVector().SyncHostFromDevice();
             storageOffset = checked(baseOffset + _storageOffset);
             return array;
         }
@@ -3122,6 +3125,9 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
 
         if (_storage.TryGetBackingArraySegment(out var array, out int baseOffset))
         {
+            // Make the host copy current before it escapes: an accumulating caller reads it, and a pending download
+            // left behind an overwrite would later run and replace the caller's result with the stale device data.
+            _storage.GetVector().SyncHostFromDevice();
             storageOffset = checked(baseOffset + _storageOffset);
             return array;
         }

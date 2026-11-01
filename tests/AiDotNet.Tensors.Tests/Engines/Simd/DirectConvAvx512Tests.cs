@@ -30,10 +30,12 @@ public class DirectConvAvx512Tests
         { 8, 512, 64, 4, 1, 1 },
     };
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(Shapes))]
     public void TheAvx512KernelMatchesTheAvx2KernelBitForBit(int batch, int inChannels, int outChannels, int size, int stride, int padding)
     {
+        Skip.IfNot(System.Runtime.Intrinsics.X86.Avx2.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported,
+            "The AVX2 side of the comparison needs AVX2 and FMA.");
         var rng = new Random(batch * 131 + inChannels);
         int o = (size + 2 * padding - 3) / stride + 1;
         var x = Random(rng, batch, inChannels, size, size);

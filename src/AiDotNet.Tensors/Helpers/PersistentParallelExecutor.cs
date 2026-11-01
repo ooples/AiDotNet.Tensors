@@ -56,6 +56,9 @@ internal sealed class PersistentParallelExecutor
     // Per-worker signaling: workers wait on these to receive work
     private readonly ManualResetEventSlim[] _workReady;
 
+    // Per-worker: 1 while the worker is parked (blocked in its wait), 0 while it runs chunks or warm-spins.
+    private readonly int[] _parked;
+
     // Per-dispatch work — ONE immutable Job published atomically via _job before any worker is woken.
     // A worker reads _job once and takes everything (body, chunk count, stride) from that single
     // reference, so it can never observe a partially-updated or cross-dispatch-contaminated field set
@@ -75,6 +78,13 @@ internal sealed class PersistentParallelExecutor
     /// <summary>Tests only: runs on a worker after it wakes for a plain dispatch and before it claims its set, to stand
     /// in for a worker the OS has not scheduled yet.</summary>
     internal static Action<int>? TestWorkerStartDelay;
+
+    /// <summary>Tests only: whether the latest plain dispatch let the caller steal unstarted chunks without a grace period.</summary>
+    internal bool LastDispatchStoleEagerly => Volatile.Read(ref _lastStoleEagerly);
+    private bool _lastStoleEagerly;
+
+    /// <summary>Tests only: whether worker <paramref name="slot"/> is parked.</summary>
+    internal bool IsParked(int slot) => Volatile.Read(ref _parked[slot]) != 0;
     private long[] _cursors = Array.Empty<long>();
 
     /// <summary>
@@ -196,6 +206,7 @@ internal sealed class PersistentParallelExecutor
         _numWorkers = Math.Max(1, Math.Min(Environment.ProcessorCount - 1, ceiling));
         _workers = new Thread[_numWorkers];
         _workReady = new ManualResetEventSlim[_numWorkers];
+        _parked = new int[_numWorkers];
 
         for (int i = 0; i < _numWorkers; i++)
         {
@@ -207,6 +218,7 @@ internal sealed class PersistentParallelExecutor
             // libtorch/OpenMP busy-wait for the same reason. Workers still PARK
             // after the spin window when the workload truly ends.
             _workReady[i] = new ManualResetEventSlim(false, spinCount: _mresSpinCount);
+            _parked[i] = 1;
             int workerSlot = i;
             _workers[i] = new Thread(() => WorkerLoop(workerSlot))
             {
@@ -318,6 +330,9 @@ internal sealed class PersistentParallelExecutor
     // warm). The spin keeps its periodic yield for other runnable threads. AIDOTNET_PPE_WARM_FULL_WIDTH=0 restores parking.
     private static readonly bool s_warmAtFullWidth =
         Environment.GetEnvironmentVariable("AIDOTNET_PPE_WARM_FULL_WIDTH") != "0";
+
+    // How long a warm-spinning worker that the latest dispatches no longer wake keeps spinning before it parks (20 ms).
+    private static readonly long s_leftOutTicks = System.Diagnostics.Stopwatch.Frequency / 50;
 
     // Whether a dispatch team of lastWorkers workers plus the dispatching thread may warm-spin (see s_warmAtFullWidth).
     private static bool TeamLeavesWarmRoom(int lastWorkers)
@@ -675,6 +690,7 @@ internal sealed class PersistentParallelExecutor
     private void WorkerLoop(int slot)
     {
         long lastJobId = 0;
+        long lastWokenTicks = 0;
         while (true)
         {
             // Adaptive cooperative warm-spin: stay hot while the pool is actively
@@ -716,11 +732,25 @@ internal sealed class PersistentParallelExecutor
                         System.Threading.Thread.Yield();
                         if (System.Diagnostics.Stopwatch.GetTimestamp() - System.Threading.Volatile.Read(ref _lastDispatchTicks) >= warm)
                             break;
+                        // A stream of smaller dispatches keeps the pool recent but no longer wakes this slot (or no
+                        // longer leaves the team room to spin): once that has lasted s_leftOutTicks, park rather than
+                        // compete with the active team. A shorter lapse stays warm: ops interleave narrow and wide
+                        // dispatches, and parking on the first narrow one put a wake-up on the next wide one.
+                        int teamNow = System.Threading.Volatile.Read(ref _lastWorkersNeeded);
+                        if ((slot >= teamNow || !TeamLeavesWarmRoom(teamNow))
+                            && System.Diagnostics.Stopwatch.GetTimestamp() - lastWokenTicks >= s_leftOutTicks)
+                            break;
                     }
                 }
             }
             // Wait for work signal (returns immediately if the warm-spin already saw it).
-            _workReady[slot].Wait();
+            if (!_workReady[slot].IsSet)
+            {
+                System.Threading.Volatile.Write(ref _parked[slot], 1);
+                _workReady[slot].Wait();
+            }
+            System.Threading.Volatile.Write(ref _parked[slot], 0);
+            lastWokenTicks = System.Diagnostics.Stopwatch.GetTimestamp();
             _workReady[slot].Reset();
 #if NET5_0_OR_GREATER
             ApplyPinning(slot);
@@ -959,6 +989,7 @@ internal sealed class PersistentParallelExecutor
                 _workerException = null;
                 _allDone.Reset();
                 var job = new Job(action, null, null, null, numChunks, stride, stealEagerly: !workersWarm);
+                _lastStoleEagerly = !workersWarm;
                 if (_cursors.Length < stride * CursorStride)
                     _cursors = new long[(_numWorkers + 1) * CursorStride];
                 _job = job; // publish BEFORE waking any worker (the volatile write also publishes the cursors)

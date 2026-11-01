@@ -1,6 +1,9 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
 using System;
 using System.Numerics;
+#if NET5_0_OR_GREATER
+using System.Runtime.Intrinsics;
+#endif
 using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Engines.Simd;
@@ -235,6 +238,24 @@ internal static unsafe partial class DepthwiseConv3x3
             float* ev = dst + (r + 1) * rowLen, od = odd + (r + 1) * rowLen;
             // P column c holds src column c - 1: even P columns 2j take src 2j - 1, odd ones 2j + 1 take src 2j.
             int j = 0;
+#if NET5_0_OR_GREATER
+            if (System.Runtime.Intrinsics.X86.Avx2.IsSupported)
+            {
+                // 16 source columns per pass: in-lane shuffles pick the even and odd columns of each 128-bit half, and a
+                // 64-bit permute puts the halves in order.
+                for (; 2 * j + 16 <= wd; j += 8)
+                {
+                    var a = System.Runtime.Intrinsics.X86.Avx.LoadVector256(s + 2 * j);
+                    var b = System.Runtime.Intrinsics.X86.Avx.LoadVector256(s + 2 * j + 8);
+                    var evens = System.Runtime.Intrinsics.X86.Avx.Shuffle(a, b, 0b10_00_10_00);
+                    var odds = System.Runtime.Intrinsics.X86.Avx.Shuffle(a, b, 0b11_01_11_01);
+                    evens = System.Runtime.Intrinsics.X86.Avx2.Permute4x64(evens.AsDouble(), 0b11_01_10_00).AsSingle();
+                    odds = System.Runtime.Intrinsics.X86.Avx2.Permute4x64(odds.AsDouble(), 0b11_01_10_00).AsSingle();
+                    System.Runtime.Intrinsics.X86.Avx.Store(od + j, evens);
+                    System.Runtime.Intrinsics.X86.Avx.Store(ev + j + 1, odds);
+                }
+            }
+#endif
             for (; 2 * j < wd; j++)
             {
                 od[j] = s[2 * j];
