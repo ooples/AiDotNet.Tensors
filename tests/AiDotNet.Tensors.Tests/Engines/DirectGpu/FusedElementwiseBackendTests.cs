@@ -302,6 +302,159 @@ public abstract class FusedElementwiseBackendTestsBase
         for (int i = 0; i < Length; i++) AssertClose(gradient[i] / (1 + Math.Exp(-input[i])), result[i], i, "SoftplusBackward");
     }
 
+    [SkippableFact]
+    public void ExpM1AndLog1P_EdgeCases_MatchTheMathLibrary()
+    {
+        using var lease = Create(_name, out var backend);
+        Skip.If(backend is null, _name + " is not available on this machine.");
+        // 86: exp is finite (2.2e37) but um1 * x overflows; 1e38: log(u) * x overflows; -1 and -inf are log1p's edge
+        // and outside its domain.
+        var x = new[] { 86f, 1e38f, -1f, float.NegativeInfinity, -2f, 0f, -0.5f };
+        using var input = backend.AllocateBuffer(x);
+        using var output = backend.AllocateBuffer(x.Length);
+
+        backend.ExpM1(input, output, 1);
+        float expm1At86 = backend.DownloadBuffer(output)[0];
+        Assert.True(!float.IsInfinity(expm1At86) && Math.Abs(expm1At86 / Math.Exp(86) - 1) < 1e-5, $"ExpM1(86) = {expm1At86}");
+
+        backend.Log1P(input, output, x.Length);
+        var y = backend.DownloadBuffer(output);
+        AssertClose(Math.Log(1 + 1e38), y[1], 1, "Log1P(1e38)");
+        Assert.True(float.IsNegativeInfinity(y[2]), $"Log1P(-1) = {y[2]}, expected -inf");
+        Assert.True(float.IsNaN(y[3]), $"Log1P(-inf) = {y[3]}, expected NaN");
+        Assert.True(float.IsNaN(y[4]), $"Log1P(-2) = {y[4]}, expected NaN");
+        Assert.Equal(0f, y[5]);
+        AssertClose(Math.Log(0.5), y[6], 6, "Log1P(-0.5)");
+    }
+
+    [SkippableFact]
+    public void CrossEntropyLoss_IsInvariantToAHugeCommonLogit()
+    {
+        using var lease = Create(_name, out var backend);
+        Skip.If(backend is null, _name + " is not available on this machine.");
+        const int batch = 3, classes = 4, n = batch * classes;
+        var logits = new float[n];
+        var targets = new float[n];
+        for (int i = 0; i < n; i++)
+        {
+            logits[i] = 1e8f;                                  // equal logits: softmax is uniform whatever the offset
+            targets[i] = (i % classes == i / classes) ? 1f : 0f;
+        }
+        using var bufLogits = backend.AllocateBuffer(logits);
+        using var bufTargets = backend.AllocateBuffer(targets);
+
+        float loss = backend.CrossEntropyLoss(bufLogits, bufTargets, batch, classes);
+
+        AssertClose(Math.Log(classes), loss, 0, "CrossEntropyLoss(1e8 logits)");
+    }
+
+    [SkippableTheory]
+    [InlineData(32)]
+    [InlineData(160)]   // wider than the HIP attention kernels hold in registers (128)
+    public void AttentionBackward_IntoUsedDestinations_EqualsTheReference(int headDim)
+    {
+        using var lease = Create(_name, out var backend);
+        Skip.If(backend is null, _name + " is not available on this machine.");
+        const int batch = 1, heads = 2, seqQ = 4, seqK = 5;
+        float scale = 1f / (float)Math.Sqrt(headDim);
+        int bh = batch * heads;
+        var q = Values(20, bh * seqQ * headDim);
+        var k = Values(21, bh * seqK * headDim);
+        var v = Values(22, bh * seqK * headDim);
+        var dO = Values(23, bh * seqQ * headDim);
+        var p = new float[bh * seqQ * seqK];                   // softmax(q k^T * scale), the forward's weights
+        for (int h = 0; h < bh; h++)
+            for (int i = 0; i < seqQ; i++)
+            {
+                double max = double.NegativeInfinity;
+                var s = new double[seqK];
+                for (int j = 0; j < seqK; j++)
+                {
+                    for (int d = 0; d < headDim; d++) s[j] += (double)q[(h * seqQ + i) * headDim + d] * k[(h * seqK + j) * headDim + d];
+                    s[j] *= scale;
+                    max = Math.Max(max, s[j]);
+                }
+                double sum = 0;
+                for (int j = 0; j < seqK; j++) sum += Math.Exp(s[j] - max);
+                for (int j = 0; j < seqK; j++) p[(h * seqQ + i) * seqK + j] = (float)(Math.Exp(s[j] - max) / sum);
+            }
+
+        // Reference: dV = P^T dO; dS = P o (dO V^T - rowsum(P o dO V^T)) * scale; dQ = dS K; dK = dS^T Q.
+        var dQ = new double[q.Length];
+        var dK = new double[k.Length];
+        var dV = new double[v.Length];
+        for (int h = 0; h < bh; h++)
+            for (int i = 0; i < seqQ; i++)
+            {
+                var dp = new double[seqK];
+                double dot = 0;
+                for (int j = 0; j < seqK; j++)
+                {
+                    for (int d = 0; d < headDim; d++) dp[j] += (double)dO[(h * seqQ + i) * headDim + d] * v[(h * seqK + j) * headDim + d];
+                    dot += dp[j] * p[(h * seqQ + i) * seqK + j];
+                }
+                for (int j = 0; j < seqK; j++)
+                {
+                    double pij = p[(h * seqQ + i) * seqK + j];
+                    double ds = pij * (dp[j] - dot) * scale;
+                    for (int d = 0; d < headDim; d++)
+                    {
+                        dQ[(h * seqQ + i) * headDim + d] += ds * k[(h * seqK + j) * headDim + d];
+                        dK[(h * seqK + j) * headDim + d] += ds * q[(h * seqQ + i) * headDim + d];
+                        dV[(h * seqK + j) * headDim + d] += pij * dO[(h * seqQ + i) * headDim + d];
+                    }
+                }
+            }
+
+        using var bQ = backend.AllocateBuffer(q);
+        using var bK = backend.AllocateBuffer(k);
+        using var bV = backend.AllocateBuffer(v);
+        using var bDO = backend.AllocateBuffer(dO);
+        using var bP = backend.AllocateBuffer(p);
+        // Destinations already holding values: a backward must overwrite them, not add to them.
+        var stale = new float[q.Length + k.Length];
+        for (int i = 0; i < stale.Length; i++) stale[i] = 7f;
+        using var gQ = backend.AllocateBuffer(stale.AsSpan(0, q.Length).ToArray());
+        using var gK = backend.AllocateBuffer(stale.AsSpan(0, k.Length).ToArray());
+        using var gV = backend.AllocateBuffer(stale.AsSpan(0, v.Length).ToArray());
+
+        backend.ScaledDotProductAttentionBackward(bDO, bQ, bK, bV, bP, gQ, gK, gV, batch, heads, seqQ, seqK, headDim, scale, false);
+
+        void Check(string name, double[] expected, float[] actual)
+        {
+            for (int i = 0; i < expected.Length; i++)
+                Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-4 + 1e-3 * Math.Abs(expected[i]),
+                    $"{name}[{i}] (headDim {headDim}): expected {expected[i]}, got {actual[i]}");
+        }
+        Check("dQ", dQ, backend.DownloadBuffer(gQ));
+        Check("dK", dK, backend.DownloadBuffer(gK));
+        Check("dV", dV, backend.DownloadBuffer(gV));
+    }
+
+    [SkippableFact]
+    public void ApplyMelFilterbank_IsThePowerSpectrumTimesTheFilterbankTransposed()
+    {
+        using var lease = Create(_name, out var backend);
+        Skip.If(backend is null, _name + " is not available on this machine.");
+        const int frames = 6, freqs = 33, mels = 10;
+        var power = Values(40, frames * freqs);
+        var filters = Values(41, mels * freqs);
+        using var bufPower = backend.AllocateBuffer(power);
+        using var bufFilters = backend.AllocateBuffer(filters);
+        using var mel = backend.AllocateBuffer(frames * mels);
+
+        backend.ApplyMelFilterbank(bufPower, bufFilters, mel, frames, freqs, mels);
+
+        var y = backend.DownloadBuffer(mel);
+        for (int b = 0; b < frames; b++)
+            for (int m = 0; m < mels; m++)
+            {
+                double expected = 0;
+                for (int f = 0; f < freqs; f++) expected += (double)power[b * freqs + f] * filters[m * freqs + f];
+                Assert.True(Math.Abs(expected - y[b * mels + m]) <= 1e-4 * (1 + Math.Abs(expected)),
+                    $"mel[{b},{m}]: expected {expected}, got {y[b * mels + m]}");
+            }
+    }
     // The backend, or null when unavailable; the returned disposable disposes a backend the test created.
     private static IDisposable? Create(string name, out IDirectGpuBackend? backend)
     {

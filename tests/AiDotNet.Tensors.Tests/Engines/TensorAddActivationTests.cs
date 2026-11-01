@@ -117,6 +117,51 @@ public sealed class TensorAddActivationTests
         AssertBitEqual(refGradB, fusedGradB);
     }
 
+    [Fact]
+    public void CpuRelu_OnDLPackImportedOperands_EqualsAddThenRelu()
+    {
+        // A CPU DLPack import lives in native memory, not a managed array: the fused kernel must pin the logical memory.
+        var engine = new CpuEngine();
+        var a = Values(1031, 30);
+        var b = Values(1031, 31);
+        var importedA = Tensor<float>.FromDLPack(a.ToDLPack());
+        var importedB = Tensor<float>.FromDLPack(b.ToDLPack());
+
+        var fused = engine.TensorAddActivation(importedA, importedB, FusedActivationType.ReLU);
+
+        AssertBitEqual(engine.ReLU(engine.TensorAdd(a, b)), fused);
+    }
+
+    [SkippableFact]
+    public void GpuRelu_UnderFp16Autocast_StillClampsAtZero()
+    {
+        DirectGpuTensorEngine gpu;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException or DllNotFoundException or TypeInitializationException)
+        {
+            Skip.If(true, "No GPU backend: " + ex.GetType().Name);
+            return;
+        }
+        using (gpu)
+        {
+            Skip.IfNot(gpu.IsGpuAvailable, "No GPU available");
+            var a = Values(4096, 32);
+            var b = Values(4096, 33);
+            Tensor<float> fused;
+            using (new AiDotNet.Tensors.Engines.Gpu.AutocastScope(AiDotNet.Tensors.Engines.Gpu.PrecisionMode.Float16))
+                fused = gpu.TensorAddActivation(a, b, FusedActivationType.ReLU);
+
+            var reference = new CpuEngine().ReLU(new CpuEngine().TensorAdd(a, b)).AsSpan();
+            var actual = fused.Contiguous().AsSpan();
+            for (int i = 0; i < actual.Length; i++)
+            {
+                if (!IsFinite(reference[i])) continue;
+                Assert.True(actual[i] >= 0f, $"[{i}] {actual[i]} < 0: the FP16 route added without the ReLU");
+                Assert.True(Math.Abs(reference[i] - actual[i]) <= 1e-2 * (1 + Math.Abs(reference[i])), $"[{i}] expected {reference[i]} got {actual[i]}");
+            }
+        }
+    }
+
     [SkippableTheory]
     [InlineData(4096)]      // the float4 route where the backend has one
     [InlineData(4099)]      // the scalar route
