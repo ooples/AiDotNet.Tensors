@@ -22,6 +22,7 @@ public sealed class NetworkTrainingStepResidencyTests
     [InlineData("mlp")]
     [InlineData("cnn")]
     [InlineData("lstm")]
+    [InlineData("gru")]
     [InlineData("transformer")]
     [InlineData("resnet18")]
     public void WarmTrainingStep_StaysOnTheDevice(string network)

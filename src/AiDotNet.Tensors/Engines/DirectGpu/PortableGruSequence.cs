@@ -63,18 +63,34 @@ internal static class PortableGruSequence
     /// </summary>
     public static void ForwardResetAfter(IDirectGpuBackend backend, IGpuBuffer input, IGpuBuffer hInit, IGpuBuffer weightsIh, IGpuBuffer weightsHh,
         IGpuBuffer biasIh, IGpuBuffer biasHh, IGpuBuffer output, IGpuBuffer allH, IGpuBuffer gates, IGpuBuffer ghn,
-        int seqLen, int batch, int inputSize, int hiddenSize)
-        => Forward(backend, ((IFusedLstmSequenceTraining)backend).StatefulLstmLauncher, input, hInit, weightsIh, weightsHh,
+        int seqLen, int batch, int inputSize, int hiddenSize, IGpuBuffer? hFinal)
+    {
+        Forward(backend, ((IFusedLstmSequenceTraining)backend).StatefulLstmLauncher, input, hInit, weightsIh, weightsHh,
             biasIh, biasHh, output, allH, gates, ghn, null, seqLen, batch, inputSize, hiddenSize, resetAfter: true);
+        // h_T is allH's last slot.
+        if (hFinal is not null) backend.Copy(allH, seqLen * batch * hiddenSize, hFinal, 0, batch * hiddenSize);
+    }
 
     /// <summary><see cref="IFusedGruSequence.GruBackwardSequence"/> on the portable kernels.</summary>
     public static void BackwardResetAfter(IDirectGpuBackend backend, IGpuBuffer gradOutput, IGpuBuffer allH, IGpuBuffer gates, IGpuBuffer ghn,
         IGpuBuffer weightsIh, IGpuBuffer weightsHh, IGpuBuffer input, IGpuBuffer gradInput, IGpuBuffer gradHInit,
         IGpuBuffer gradWeightsIh, IGpuBuffer gradWeightsHh, IGpuBuffer gradBiasIh, IGpuBuffer gradBiasHh,
-        int seqLen, int batch, int inputSize, int hiddenSize)
-        => Backward(backend, ((IFusedLstmSequenceTraining)backend).StatefulLstmLauncher, gradOutput, allH, gates, ghn, null,
-            weightsIh, weightsHh, input, gradInput, gradHInit, gradWeightsIh, gradWeightsHh, gradBiasIh, gradBiasHh,
-            seqLen, batch, inputSize, hiddenSize, resetAfter: true);
+        int seqLen, int batch, int inputSize, int hiddenSize, bool lastStepOnly)
+    {
+        var launch = ((IFusedLstmSequenceTraining)backend).StatefulLstmLauncher;
+        if (!lastStepOnly)
+        {
+            Backward(backend, launch, gradOutput, allH, gates, ghn, null, weightsIh, weightsHh, input, gradInput, gradHInit,
+                gradWeightsIh, gradWeightsHh, gradBiasIh, gradBiasHh, seqLen, batch, inputSize, hiddenSize, resetAfter: true);
+            return;
+        }
+        // The final state's gradient alone: zero per-step output gradients, and gradOutput as the final state's.
+        int sequence = checked(batch * seqLen * hiddenSize);
+        using var zeros = backend.AllocateBuffer(sequence);
+        backend.Fill(zeros, 0f, sequence);
+        Backward(backend, launch, zeros, allH, gates, ghn, null, weightsIh, weightsHh, input, gradInput, gradHInit,
+            gradWeightsIh, gradWeightsHh, gradBiasIh, gradBiasHh, seqLen, batch, inputSize, hiddenSize, gradOutput, resetAfter: true);
+    }
 
     /// <summary>
     /// Backpropagation through time. <paramref name="gradOutput"/> is the gradient of every step's output [B, T, H]

@@ -10,14 +10,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// </summary>
 internal interface IFusedGruSequence
 {
-    /// <summary>The forward, writing the output and the three caches.</summary>
+    /// <summary>The forward, writing the output and the three caches; and the final hidden state [B, H] into
+    /// <paramref name="hFinal"/> when given.</summary>
     void GruForwardSequence(IGpuBuffer input, IGpuBuffer hInit, IGpuBuffer weightsIh, IGpuBuffer weightsHh,
         IGpuBuffer biasIh, IGpuBuffer biasHh, IGpuBuffer output, IGpuBuffer allH, IGpuBuffer gates, IGpuBuffer ghn,
-        int seqLen, int batch, int inputSize, int hiddenSize);
+        int seqLen, int batch, int inputSize, int hiddenSize, IGpuBuffer? hFinal);
 
-    /// <summary>BPTT over the caches; every gradient output is written, not accumulated into.</summary>
+    /// <summary>BPTT over the caches; every gradient output is written, not accumulated into. With
+    /// <paramref name="lastStepOnly"/>, <paramref name="gradOutput"/> is the final hidden state's gradient [B, H] alone (a
+    /// model that reads h_T only); otherwise every step's output gradient [B, T, H].</summary>
     void GruBackwardSequence(IGpuBuffer gradOutput, IGpuBuffer allH, IGpuBuffer gates, IGpuBuffer ghn,
         IGpuBuffer weightsIh, IGpuBuffer weightsHh, IGpuBuffer input, IGpuBuffer gradInput, IGpuBuffer gradHInit,
         IGpuBuffer gradWeightsIh, IGpuBuffer gradWeightsHh, IGpuBuffer gradBiasIh, IGpuBuffer gradBiasHh,
-        int seqLen, int batch, int inputSize, int hiddenSize);
+        int seqLen, int batch, int inputSize, int hiddenSize, bool lastStepOnly);
 }
