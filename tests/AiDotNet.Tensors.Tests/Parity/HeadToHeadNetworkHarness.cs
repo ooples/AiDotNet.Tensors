@@ -691,6 +691,20 @@ internal static class HeadToHeadNetworkHarness
                         shape = new[] { hidden };
                         break;
                     }
+                    case "gru":
+                    {
+                        int features = shape[1], hidden = layer.GetProperty("hidden").GetInt32();
+                        // PyTorch's layout and gate order (r, z, n): weight_ih, weight_hh, bias_ih, bias_hh.
+                        var weightIh = Parameter(new[] { 3 * hidden, features });
+                        var weightHh = Parameter(new[] { 3 * hidden, hidden });
+                        var biasIh = Parameter(new[] { 3 * hidden });
+                        var biasHh = Parameter(new[] { 3 * hidden });
+                        // nn.GRU on PyTorch's side, the engine's fused sequence op here (reset gate on the candidate's
+                        // recurrent sum, as PyTorch); the last step's hidden state goes on.
+                        layers.Add(input => engine.GruSequenceForward(input, null, weightIh, weightHh, biasIh, biasHh));
+                        shape = new[] { hidden };
+                        break;
+                    }
                     case "transformer":
                     {
                         int seq = shape[0], model = shape[1];

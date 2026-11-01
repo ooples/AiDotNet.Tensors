@@ -789,10 +789,11 @@ internal static class DirectConvAvx2
         int runLength = Math.Max(PositionUnroll, Math.Min(s_forwardRunPositions, MaxForwardRunPositions));
         int pass = ForwardRunInputBlocksPerPass(inBlocks, taps);
         int channelBase = tile * OutputBlocksPerTile * Block;
-        float* stage = stackalloc float[(MaxForwardRunPositions + PositionUnroll) * 32];
+        float* stage = stackalloc float[(MaxForwardRunPositions + Avx512Positions) * 32];
         // The run's receptive-field origins, computed once per run (InputOrigin divides; per triple and pass it was a
         // tenth of the forward's time) and stepped along a grid row; the tail repeats the last real position.
-        int* origin = stackalloc int[MaxForwardRunPositions + PositionUnroll];
+        int* origin = stackalloc int[MaxForwardRunPositions + Avx512Positions];
+        bool wide = UseAvx512Forward;
         int gridWidth = g.GridWidth, columnStep = g.StrideW * Block;
         bool plain = g.PlainContiguous;
         fixed (float* px = packedInput)
@@ -815,11 +816,21 @@ internal static class DirectConvAvx2
                     else origin[i] = origin[i - 1] + columnStep;
                     column++;
                 }
-                origin[run] = origin[run + 1] = origin[run - 1];
+                for (int i = run; i < run + Avx512Positions; i++) origin[i] = origin[run - 1];
                 for (int cb0 = 0; cb0 < inBlocks; cb0 += pass)
                 {
                     int cbEnd = Math.Min(inBlocks, cb0 + pass);
                     float* passKernel = tileKernel + (long)cb0 * taps * Block * Block;
+                    if (wide)
+                    {
+                        for (int q = runStart; q < runEnd; q += Avx512Positions)
+                        {
+                            int count = Math.Min(Avx512Positions, runEnd - q), i = q - runStart;
+                            ForwardSextetRun512(px, origin + i, passKernel, blockStride, cbEnd - cb0, cb0 * planeIn, planeIn,
+                                kernelHeight, kernelWidth, rowStep, colStep, stage + i * 32, cb0 > 0, count);
+                        }
+                        continue;
+                    }
                     for (int q = runStart; q < runEnd; q += PositionUnroll)
                     {
                         int count = Math.Min(PositionUnroll, runEnd - q), i = q - runStart;
@@ -929,6 +940,107 @@ internal static class DirectConvAvx2
         if (count > 1) { Avx.Store(slot + 32, a10); Avx.Store(slot + 40, a11); Avx.Store(slot + 48, a12); Avx.Store(slot + 56, a13); }
         if (count > 2) { Avx.Store(slot + 64, a20); Avx.Store(slot + 72, a21); Avx.Store(slot + 80, a22); Avx.Store(slot + 88, a23); }
     }
+
+    /// <summary>
+    /// The AVX-512 form of <see cref="ForwardTripleRun"/>: six positions x the tile's 32 output channels as two 16-lane
+    /// registers (each joined from two of the packed 8-lane output blocks), twelve accumulators. Each output's FMA chain
+    /// is the AVX2 kernel's (same order, one rounding per FMA), so the results are bit-identical; the hosted CI runners
+    /// that lost to PyTorch were AVX-512 machines, where PyTorch's oneDNN kernels run 16-wide.
+    /// </summary>
+#if NET9_0_OR_GREATER
+    [MethodImpl(Hot)]
+    private static unsafe void ForwardSextetRun512(float* px, int* origin, float* w, long blockStride, int blocks,
+        int firstBlockOffset, int planeIn, int kernelHeight, int kernelWidth, int rowStep, int colStep,
+        float* slot, bool seeded, int count)
+    {
+        float* x0 = px + origin[0], x1 = px + origin[1], x2 = px + origin[2];
+        float* x3 = px + origin[3], x4 = px + origin[4], x5 = px + origin[5];
+        Vector512<float> a0l, a0h, a1l, a1h, a2l, a2h, a3l, a3h, a4l, a4h, a5l, a5h;
+        if (seeded)
+        {
+            // Slots past the real positions repeat the last real one (their origins do too), so their sums are discarded.
+            float* s0 = slot;
+            float* s1 = slot + 32 * Math.Min(1, count - 1);
+            float* s2 = slot + 32 * Math.Min(2, count - 1);
+            float* s3 = slot + 32 * Math.Min(3, count - 1);
+            float* s4 = slot + 32 * Math.Min(4, count - 1);
+            float* s5 = slot + 32 * Math.Min(5, count - 1);
+            a0l = Vector512.Load(s0); a0h = Vector512.Load(s0 + 16);
+            a1l = Vector512.Load(s1); a1h = Vector512.Load(s1 + 16);
+            a2l = Vector512.Load(s2); a2h = Vector512.Load(s2 + 16);
+            a3l = Vector512.Load(s3); a3h = Vector512.Load(s3 + 16);
+            a4l = Vector512.Load(s4); a4h = Vector512.Load(s4 + 16);
+            a5l = Vector512.Load(s5); a5h = Vector512.Load(s5 + 16);
+        }
+        else
+        {
+            a0l = Vector512<float>.Zero; a0h = a0l; a1l = a0l; a1h = a0l; a2l = a0l; a2h = a0l;
+            a3l = a0l; a3h = a0l; a4l = a0l; a4h = a0l; a5l = a0l; a5h = a0l;
+        }
+        long stride2 = 2 * blockStride, stride3 = 3 * blockStride;
+        for (int cb = 0; cb < blocks; cb++)
+        {
+            int blockOffset = firstBlockOffset + cb * planeIn;
+            for (int y = 0; y < kernelHeight; y++)
+            {
+                int rowOffset = blockOffset + y * rowStep;
+                for (int x = 0; x < kernelWidth; x++)
+                {
+                    int tapOffset = rowOffset + x * colStep;
+                    float* p0 = x0 + tapOffset, p1 = x1 + tapOffset, p2 = x2 + tapOffset;
+                    float* p3 = x3 + tapOffset, p4 = x4 + tapOffset, p5 = x5 + tapOffset;
+                    for (int c = 0; c < Block; c++)
+                    {
+                        // Output channels 0-15 of the tile are packed blocks 0 and 1, 16-31 blocks 2 and 3.
+                        var wl = Vector512.Create(Vector256.Load(w), Vector256.Load(w + blockStride));
+                        var wh = Vector512.Create(Vector256.Load(w + stride2), Vector256.Load(w + stride3));
+                        var b = Vector512.Create(p0[c]);
+                        a0l = Vector512.FusedMultiplyAdd(b, wl, a0l); a0h = Vector512.FusedMultiplyAdd(b, wh, a0h);
+                        b = Vector512.Create(p1[c]);
+                        a1l = Vector512.FusedMultiplyAdd(b, wl, a1l); a1h = Vector512.FusedMultiplyAdd(b, wh, a1h);
+                        b = Vector512.Create(p2[c]);
+                        a2l = Vector512.FusedMultiplyAdd(b, wl, a2l); a2h = Vector512.FusedMultiplyAdd(b, wh, a2h);
+                        b = Vector512.Create(p3[c]);
+                        a3l = Vector512.FusedMultiplyAdd(b, wl, a3l); a3h = Vector512.FusedMultiplyAdd(b, wh, a3h);
+                        b = Vector512.Create(p4[c]);
+                        a4l = Vector512.FusedMultiplyAdd(b, wl, a4l); a4h = Vector512.FusedMultiplyAdd(b, wh, a4h);
+                        b = Vector512.Create(p5[c]);
+                        a5l = Vector512.FusedMultiplyAdd(b, wl, a5l); a5h = Vector512.FusedMultiplyAdd(b, wh, a5h);
+                        w += Block;
+                    }
+                }
+            }
+        }
+        a0l.Store(slot); a0h.Store(slot + 16);
+        if (count > 1) { a1l.Store(slot + 32); a1h.Store(slot + 48); }
+        if (count > 2) { a2l.Store(slot + 64); a2h.Store(slot + 80); }
+        if (count > 3) { a3l.Store(slot + 96); a3h.Store(slot + 112); }
+        if (count > 4) { a4l.Store(slot + 128); a4h.Store(slot + 144); }
+        if (count > 5) { a5l.Store(slot + 160); a5h.Store(slot + 176); }
+    }
+#else
+    private static unsafe void ForwardSextetRun512(float* px, int* origin, float* w, long blockStride, int blocks,
+        int firstBlockOffset, int planeIn, int kernelHeight, int kernelWidth, int rowStep, int colStep,
+        float* slot, bool seeded, int count) => throw new PlatformNotSupportedException();
+#endif
+
+    /// <summary>Positions per <see cref="ForwardSextetRun512"/> call.</summary>
+    private const int Avx512Positions = 6;
+
+    /// <summary>Whether <see cref="ForwardTileRuns"/> runs the AVX-512 kernel (switch for A/B and tests).</summary>
+    internal static bool s_useAvx512 = Environment.GetEnvironmentVariable("AIDOTNET_DIRECT_CONV_AVX512") != "0";
+
+    // Vector512.FusedMultiplyAdd (one rounding, like Fma.MultiplyAdd) is .NET 9+. Written with the cross-platform
+    // Vector512 API, the kernel is AVX-512 where the hardware accelerates it and a correct software fallback elsewhere,
+    // which s_forceAvx512ForTest uses to test it on AVX2-only hosts.
+#if NET9_0_OR_GREATER
+    private static bool UseAvx512Forward => s_useAvx512 && (Vector512.IsHardwareAccelerated || s_forceAvx512ForTest);
+#else
+    private static bool UseAvx512Forward => false;
+#endif
+
+    /// <summary>Test hook: run the AVX-512 kernel on hosts without AVX-512 (software Vector512, slow but exact).</summary>
+    internal static bool s_forceAvx512ForTest;
 
     /// <summary>Positions per run of <see cref="ForwardTileRuns"/> (tuning; capped at <see cref="MaxForwardRunPositions"/>).</summary>
     internal static int s_forwardRunPositions = 48;

@@ -27,6 +27,8 @@ Spec layers (a layer without "type" is linear):
         ResNet's basic block: conv3x3(S) -> BN -> ReLU -> conv3x3 -> BN, plus the shortcut (identity, or a strided
         1x1 conv -> BN when the shape changes), then ReLU. Writes conv1, bn1, conv2, bn2[, shortcut conv, shortcut bn].
     {"type": "globalavgpool"}                 [C, H, W] -> [C]
+    {"type": "gru", "hidden": H}              [T, F] -> the last step's hidden state [H]; one nn.GRU layer, gate order
+                                              r, z, n (PyTorch's reset-after candidate)
     {"type": "lstm", "hidden": H}             [T, F] -> the last step's hidden state [H]; one layer, gate order
         i, f, g, o. Writes weight_ih [4H, F], weight_hh [4H, H], bias_ih [4H], bias_hh [4H], PyTorch's layout.
     {"type": "transformer", "heads": N, "ffn": F}
@@ -161,6 +163,20 @@ def main() -> int:
             def forward(self, t):
                 return self.lstm(t)[0][:, -1, :]
 
+        class LastStepGru(torch.nn.Module):
+            def __init__(self, features: int, hidden: int):
+                super().__init__()
+                self.gru = torch.nn.GRU(features, hidden, batch_first=True)
+                bound = 1.0 / np.sqrt(hidden)
+                with torch.no_grad():
+                    self.gru.weight_ih_l0.copy_(torch.from_numpy(uniform(bound, (3 * hidden, features))))
+                    self.gru.weight_hh_l0.copy_(torch.from_numpy(uniform(bound, (3 * hidden, hidden))))
+                    self.gru.bias_ih_l0.copy_(torch.from_numpy(uniform(bound, (3 * hidden,))))
+                    self.gru.bias_hh_l0.copy_(torch.from_numpy(uniform(bound, (3 * hidden,))))
+
+            def forward(self, t):
+                return self.gru(t)[0][:, -1, :]
+
         def transformer(d: int, heads: int, ffn: int):
             m = torch.nn.TransformerEncoderLayer(d, heads, dim_feedforward=ffn, dropout=0.0, activation="relu",
                                                  layer_norm_eps=1e-5, batch_first=True, norm_first=False)
@@ -217,6 +233,10 @@ def main() -> int:
             elif kind == "lstm":
                 steps, features = shape
                 modules.append(LastStepLstm(features, layer["hidden"]))
+                shape = [layer["hidden"]]
+            elif kind == "gru":
+                steps, features = shape
+                modules.append(LastStepGru(features, layer["hidden"]))
                 shape = [layer["hidden"]]
             elif kind == "transformer":
                 seq, d = shape

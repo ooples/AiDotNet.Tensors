@@ -82,16 +82,19 @@ internal static partial class SimdGemm
                 int cs0 = (int)((long)cc * colStripsCap / colChunksCap), cs1 = (int)((long)(cc + 1) * colStripsCap / colChunksCap);
                 float* pA = (float*)ipA, pB = (float*)ipB, pC = (float*)ipC;
 
-                for (int rbIdx = rb0; rbIdx < rb1; rbIdx++)
+                // Column strip outer: one strip of B (k x strip floats) stays in L2 across the chunk's row blocks. Row
+                // blocks outer re-streamed the chunk's whole B slice from L3 per row block (mlp 128x784x512: 1.12x
+                // scaling at 2 threads against PyTorch's 1.84x).
+                for (int cs = cs0; cs < cs1; cs++)
                 {
-                    int i = rbIdx * Mr;
-                    int mc = Math.Min(Mr, mCap - i);
-                    float* pARow = pA + (long)i * ldaCap;
-                    float* pCRow = pC + (long)i * nCap;
-                    for (int cs = cs0; cs < cs1; cs++)
+                    int stripStart = cs * stripCap;
+                    int stripEnd = Math.Min(nCap, stripStart + stripCap);
+                    for (int rbIdx = rb0; rbIdx < rb1; rbIdx++)
                     {
-                        int stripStart = cs * stripCap;
-                        int stripEnd = Math.Min(nCap, stripStart + stripCap);
+                        int i = rbIdx * Mr;
+                        int mc = Math.Min(Mr, mCap - i);
+                        float* pARow = pA + (long)i * ldaCap;
+                        float* pCRow = pC + (long)i * nCap;
 #if NET9_0_OR_GREATER
                         if (mc == Mr && stripCap == Nr512 && stripEnd - stripStart == Nr512)
                         {
