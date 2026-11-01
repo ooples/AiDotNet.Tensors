@@ -306,7 +306,7 @@ jobs:
           {
             echo "## perf test ${TESTF}"
             echo '```'
-            $PERF report -i "$RUNNER_TEMP/test.perf" --no-children --sort comm,sym --stdio -g none 2>/dev/null | grep -E '^ +[0-9]' | head -45 | cut -c1-230
+            $PERF report -i "$RUNNER_TEMP/test.perf" --no-children --sort comm,sym --stdio -g none 2>/dev/null | grep -E "^ +[0-9]" | head -90 | cut -c1-230
             echo '```'
           } | tee -a "$RUNNER_TEMP/probe.md"
 
