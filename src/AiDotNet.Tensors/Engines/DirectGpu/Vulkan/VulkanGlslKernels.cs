@@ -58,10 +58,26 @@ void main() {
         case 2u: y = exp(x); break;
         case 3u: y = exp2(x); break;
         case 4u: y = pow(10.0, x); break;
-        case 5u: y = exp(x) - 1.0; break;
+        case 5u: { // expm1: exp(x) - 1.0 keeps only a few digits of a small x, and GLSL's log is too coarse near 1 for
+            // Kahan's correction, so a small x takes the Taylor series (degree 8, below 1e-9 relative for |x| < 0.35)
+            if (abs(x) < 0.35) {
+                y = x * (1.0 + x / 2.0 * (1.0 + x / 3.0 * (1.0 + x / 4.0 * (1.0 + x / 5.0 * (1.0 + x / 6.0
+                    * (1.0 + x / 7.0 * (1.0 + x / 8.0)))))));
+            } else {
+                y = exp(x) - 1.0;
+            }
+            break; }
         case 6u: y = log(x); break;
         case 7u: y = log2(x); break;
-        case 8u: y = log(1.0 + x); break;
+        case 8u: { // log1p: a small x takes 2 atanh(x / (2 + x)) as its odd series (|s| <= 0.12, below 1e-9 relative)
+            if (abs(x) < 0.25) {
+                float s = x / (2.0 + x);
+                float s2 = s * s;
+                y = 2.0 * s * (1.0 + s2 * (1.0 / 3.0 + s2 * (1.0 / 5.0 + s2 * (1.0 / 7.0 + s2 * (1.0 / 9.0 + s2 / 11.0)))));
+            } else {
+                y = log(1.0 + x);
+            }
+            break; }
         case 9u: y = sqrt(x); break;
         case 10u: y = sign(x); break;
         case 11u: y = 0.5*x*(1.0+tanh(0.7978845608*(x+0.044715*x*x*x))); break;

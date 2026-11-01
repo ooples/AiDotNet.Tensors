@@ -483,13 +483,9 @@ public sealed partial class WebGpuBackend
         => Dispatch2BufferAsync("AdditionalUnary", WebGpuKernels.AdditionalUnarySource, "exp2_op", A, B, MakeUniform1(size), size).GetAwaiter().GetResult();
     public void Exp10(IGpuBuffer A, IGpuBuffer B, int size)
         => Dispatch2BufferAsync("AdditionalUnary", WebGpuKernels.AdditionalUnarySource, "exp10_op", A, B, MakeUniform1(size), size).GetAwaiter().GetResult();
-    public void ExpM1(IGpuBuffer A, IGpuBuffer B, int size)
-        => Dispatch2BufferAsync("AdditionalUnary", WebGpuKernels.AdditionalUnarySource, "expm1_op", A, B, MakeUniform1(size), size).GetAwaiter().GetResult();
     public void Log(IGpuBuffer A, IGpuBuffer B, int size) => LogAsync(A, B, size).GetAwaiter().GetResult();
     public void Log2(IGpuBuffer A, IGpuBuffer B, int size)
         => Dispatch2BufferAsync("AdditionalUnary", WebGpuKernels.AdditionalUnarySource, "log2_op", A, B, MakeUniform1(size), size).GetAwaiter().GetResult();
-    public void Log1P(IGpuBuffer A, IGpuBuffer B, int size)
-        => Dispatch2BufferAsync("AdditionalUnary", WebGpuKernels.AdditionalUnarySource, "log1p_op", A, B, MakeUniform1(size), size).GetAwaiter().GetResult();
     public void Sqrt(IGpuBuffer A, IGpuBuffer B, int size) => SqrtAsync(A, B, size).GetAwaiter().GetResult();
     public void Sign(IGpuBuffer A, IGpuBuffer B, int size) => SignAsync(A, B, size).GetAwaiter().GetResult();
     public void Relu(IGpuBuffer A, IGpuBuffer B, int size) => ReLUAsync(A, B, size).GetAwaiter().GetResult();

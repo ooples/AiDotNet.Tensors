@@ -133,6 +133,57 @@ fn csr_spmm_bias(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 ";
 
+    // expm1 and log1p accurate for a small x: AdditionalUnarySource's exp(x) - 1.0 and log(1.0 + x) keep only a few of its
+    // digits (that source is a public constant, so these live here). WGSL's log is too coarse near 1 for Kahan's
+    // correction, so a small x takes a series: Taylor for expm1, 2 atanh(x / (2 + x)) for log1p (both below 1e-9 relative).
+    private const string AccurateExpLogSource = @"
+@group(0) @binding(0) var<storage, read> A: array<f32>;
+@group(0) @binding(1) var<storage, read_write> B: array<f32>;
+struct Params { size: u32, }
+@group(0) @binding(2) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn expm1_accurate(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.size) { return; }
+    let x = A[i];
+    var y = exp(x) - 1.0;
+    if (abs(x) < 0.35) {
+        y = x * (1.0 + x / 2.0 * (1.0 + x / 3.0 * (1.0 + x / 4.0 * (1.0 + x / 5.0 * (1.0 + x / 6.0
+            * (1.0 + x / 7.0 * (1.0 + x / 8.0)))))));
+    }
+    B[i] = y;
+}
+
+@compute @workgroup_size(256)
+fn log1p_accurate(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.size) { return; }
+    let x = A[i];
+    var y = log(1.0 + x);
+    if (abs(x) < 0.25) {
+        let s = x / (2.0 + x);
+        let s2 = s * s;
+        y = 2.0 * s * (1.0 + s2 * (1.0 / 3.0 + s2 * (1.0 / 5.0 + s2 * (1.0 / 7.0 + s2 * (1.0 / 9.0 + s2 / 11.0)))));
+    }
+    B[i] = y;
+}
+";
+
+    public void ExpM1(IGpuBuffer A, IGpuBuffer B, int size)
+    {
+        if (size <= 0) return;
+        Dispatch2BufferAsync(FusedCompositesModuleName + ".ExpLog", AccurateExpLogSource, "expm1_accurate", A, B,
+            MakeUniform1(size), size).GetAwaiter().GetResult();
+    }
+
+    public void Log1P(IGpuBuffer A, IGpuBuffer B, int size)
+    {
+        if (size <= 0) return;
+        Dispatch2BufferAsync(FusedCompositesModuleName + ".ExpLog", AccurateExpLogSource, "log1p_accurate", A, B,
+            MakeUniform1(size), size).GetAwaiter().GetResult();
+    }
+
     public void SplitComplexMultiply(IGpuBuffer aR, IGpuBuffer aI, IGpuBuffer bR, IGpuBuffer bI, IGpuBuffer oR, IGpuBuffer oI, int n)
         => SplitComplexBinary(aR, aI, bR, bI, oR, oI, n, SplitComplexBinaryOp.Multiply);
 

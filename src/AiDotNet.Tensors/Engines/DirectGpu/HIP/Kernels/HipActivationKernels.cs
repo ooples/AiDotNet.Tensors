@@ -333,7 +333,7 @@ extern ""C"" __global__ __launch_bounds__(256) void log1p_vector(const float* A,
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    B[idx] = logf(1.0f + A[idx]);
+    B[idx] = log1pf(A[idx]);   // logf(1 + x) keeps only a few digits of a small x
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void sqrt_vector(const float* A, float* B, int size)
