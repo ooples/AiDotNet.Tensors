@@ -37,26 +37,32 @@ public class NestedParallelismTests
         Assert.False(CpuParallelSettings.IsInParallelRegion);
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task NestedParallelLoop_RunsSerially_WhenInsideParallelRegion()
     {
         await Task.Yield();
+        // Without parallel workers no iteration is a parallel region, so nothing nested would be exercised.
+        Skip.If(Environment.ProcessorCount < 2 || CpuParallelSettings.MaxDegreeOfParallelism < 2,
+            "Parallel execution is unavailable, so there is no parallel region to nest a loop in.");
 
         // Force the OUTER loop to dispatch in parallel: huge totalWork + many
         // iterations. On a multi-core box this runs the body on several workers,
         // each of which sets IsInParallelRegion. A NESTED parallel loop must then
-        // run on exactly one thread (serial) — proving nesting collapsed. On a
-        // single-core box the outer loop is serial (no region) and the nested loop
-        // is also serial, so the assertion (one thread) holds either way.
+        // run on exactly one thread (serial) — proving nesting collapsed.
         Assert.False(CpuParallelSettings.IsInParallelRegion);
 
         bool everyNestedRanSerial = true;
-        bool outerSawRegion = false;
+        int nestedLoopsRun = 0;
         int outerIterations = Math.Max(4, Environment.ProcessorCount * 4);
 
+        // deterministicSafe: a concurrent test class turning DeterministicReductions on must not push the outer loop
+        // onto its serial path, where no iteration is a parallel region.
         CpuParallelSettings.ParallelForOrSerial(0, outerIterations, long.MaxValue / 4, _ =>
         {
-            if (CpuParallelSettings.IsInParallelRegion) outerSawRegion = true;
+            // Only an iteration running as a parallel worker is evidence: one the outer loop ran serially (a
+            // concurrent test pinned MaxDegreeOfParallelism to 1 for a moment) is not in a region, and its nested
+            // loop may rightly fan out.
+            if (!CpuParallelSettings.IsInParallelRegion) return;
 
             // A nested loop that, unguarded, would fan out across many threads.
             var threadIds = new ConcurrentDictionary<int, byte>();
@@ -65,15 +71,17 @@ public class NestedParallelismTests
 
             // Serialized → exactly one distinct thread serviced the nested loop.
             if (threadIds.Count != 1) everyNestedRanSerial = false;
-        });
+            System.Threading.Interlocked.Increment(ref nestedLoopsRun);
+        }, deterministicSafe: true);
+
+        // Unconditional: a run where no iteration was a parallel worker exercised no nested loop and proves nothing.
+        Assert.True(nestedLoopsRun > 0, "the outer loop never ran an iteration as a parallel worker, so no nested loop ran.");
 
         Assert.True(everyNestedRanSerial,
             "a nested ParallelForRegion fanned out across multiple threads — nesting did not collapse to serial.");
         // The flag must not leak past the loop on the calling thread.
         Assert.False(CpuParallelSettings.IsInParallelRegion);
 
-        if (Environment.ProcessorCount > 1)
-            Assert.True(outerSawRegion, "outer parallel loop never marked its workers in-region.");
     }
 
     [Fact]
