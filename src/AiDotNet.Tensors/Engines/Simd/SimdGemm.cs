@@ -3621,6 +3621,28 @@ internal static partial class SimdGemm
         var mask0 = _partialNrMasks[lane0N].AsSingle();
         var mask1 = _partialNrMasks[lane1N].AsSingle();
 
+        // Full six-row blocks with full 32-column strips: strip outer, each strip of B copied once into a contiguous
+        // buffer the chunk's row blocks all read (see s_packStrip512). The loop below then starts past those strips.
+        int packedColumns = 0;
+#if NET9_0_OR_GREATER
+        if (UseVector512Direct && s_packStrip512 && k <= MaxPackedStripK && nFull >= Nr512 && blockEnd - blockStart >= 2)
+        {
+            packedColumns = (nFull / Nr512) * Nr512;
+            fixed (float* strip = PackedStripBuffer(k))
+            {
+                for (int j = 0; j < packedColumns; j += Nr512)
+                {
+                    PackStrip32(B + j, n, strip, k);
+                    for (int blk = blockStart; blk < blockEnd; blk++)
+                    {
+                        int i0 = blk * TransAMr;
+                        if (mFull - i0 < TransAMr) continue;
+                        TransAKernel6x32(A + i0, m, strip, Nr512, C + (long)i0 * n + j, n, k);
+                    }
+                }
+            }
+        }
+#endif
         for (int blk = blockStart; blk < blockEnd; blk++)
         {
             int i0 = blk * TransAMr;
@@ -3628,12 +3650,12 @@ internal static partial class SimdGemm
             float* cRow = C + (long)i0 * n;
             if (mc == TransAMr)
             {
-                int j = 0;
+                int j = packedColumns;
 #if NET9_0_OR_GREATER
                 // 32-column steps on the 512-bit tile where the host accelerates it (the same FMA chain per element).
                 if (UseVector512Direct)
                     for (; j + Nr512 <= nFull; j += Nr512)
-                        TransAKernel6x32(A + i0, m, B + j, n, cRow + j, k);
+                        TransAKernel6x32(A + i0, m, B + j, n, cRow + j, n, k);
 #endif
                 for (; j < nFull; j += 16)
                     TransAKernel6x16(A + i0, m, B + j, n, cRow + j, k);

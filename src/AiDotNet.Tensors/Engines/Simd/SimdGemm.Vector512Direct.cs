@@ -84,9 +84,9 @@ internal static partial class SimdGemm
     }
 
     /// <summary>The 512-bit <see cref="TransAKernel6x16"/>: six rows x 32 columns of C = At*B, overwriting C; pA points at
-    /// row i0 of At (A + i0), lda = m, and C's row stride equals B's (n).</summary>
+    /// row i0 of At (A + i0), lda = m; C's rows are <paramref name="ldc"/> apart (B may be a packed strip, ldb = 32).</summary>
     [MethodImpl(HotInline)]
-    internal static unsafe void TransAKernel6x32(float* pA, int lda, float* pB, int ldb, float* pC, int k)
+    internal static unsafe void TransAKernel6x32(float* pA, int lda, float* pB, int ldb, float* pC, int ldc, int k)
     {
         var c00 = Vector512<float>.Zero; var c01 = Vector512<float>.Zero;
         var c10 = Vector512<float>.Zero; var c11 = Vector512<float>.Zero;
@@ -113,12 +113,44 @@ internal static partial class SimdGemm
             pA += lda;
             pB += ldb;
         }
-        c00.Store(pC); c01.Store(pC + 16); pC += ldb;
-        c10.Store(pC); c11.Store(pC + 16); pC += ldb;
-        c20.Store(pC); c21.Store(pC + 16); pC += ldb;
-        c30.Store(pC); c31.Store(pC + 16); pC += ldb;
-        c40.Store(pC); c41.Store(pC + 16); pC += ldb;
+        c00.Store(pC); c01.Store(pC + 16); pC += ldc;
+        c10.Store(pC); c11.Store(pC + 16); pC += ldc;
+        c20.Store(pC); c21.Store(pC + 16); pC += ldc;
+        c30.Store(pC); c31.Store(pC + 16); pC += ldc;
+        c40.Store(pC); c41.Store(pC + 16); pC += ldc;
         c50.Store(pC); c51.Store(pC + 16);
+    }
+
+    /// <summary>
+    /// Whether the 512-bit direct tiles read a 32-column strip of B from a contiguous copy (AIDOTNET_GEMM_PACK_STRIP=0
+    /// turns it off). B's rows sit ldb floats apart, and at a power-of-two row length (n = 512: 2 KB) every row of a strip
+    /// lands in the same few L1 sets, so the strip evicts itself and streams from L2 for each row block; the copy (k x 32
+    /// floats) spreads over every set and is reused by all the row blocks of a chunk. Same FMA chains: bit-identical.
+    /// </summary>
+    internal static bool s_packStrip512 = System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_PACK_STRIP") != "0";
+
+    /// <summary>Most rows (k) a packed strip takes: 1024 x 32 floats, 128 KB.</summary>
+    internal const int MaxPackedStripK = 1024;
+
+    [ThreadStatic] private static float[]? t_packedStrip;
+
+    /// <summary>A thread's strip buffer, at least <paramref name="k"/> x 32 floats.</summary>
+    internal static float[] PackedStripBuffer(int k)
+    {
+        var buffer = t_packedStrip;
+        if (buffer is null || buffer.Length < k * Nr512) t_packedStrip = buffer = new float[Math.Max(k, 64) * Nr512];
+        return buffer;
+    }
+
+    /// <summary>Copies B's columns [0, 32) of rows [0, k) (rows ldb apart) to <paramref name="dst"/>, 32 floats a row.</summary>
+    [MethodImpl(HotInline)]
+    internal static unsafe void PackStrip32(float* src, int ldb, float* dst, int k)
+    {
+        for (int p = 0; p < k; p++, src += ldb, dst += Nr512)
+        {
+            Vector512.Store(Vector512.Load(src), dst);
+            Vector512.Store(Vector512.Load(src + 16), dst + 16);
+        }
     }
 }
 #endif
