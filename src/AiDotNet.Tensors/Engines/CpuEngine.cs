@@ -10833,6 +10833,22 @@ public partial class CpuEngine : ITensorLevelEngine
                 strideH, strideW, padH, padW, dilationH, dilationW))
             return;
 #if NET5_0_OR_GREATER
+        // 3x3 stride-1 padding-1: Winograd F(4x4, 3x3), a quarter of the direct form's multiplies.
+        if (!routePinned && input.Layout == LinearAlgebra.TensorLayout.Nchw
+            && Simd.WinogradF43.Applies(batch, inChannels, outChannels, height, width, kernelHeight, kernelWidth,
+                strideH, strideW, padH, padW, dilationH, dilationW))
+        {
+            int inOffW = 0, kOffW = 0, outOffW = 0;
+            float[]? inArrW = inputData ?? (input.IsContiguous ? input.GetCpuBackingForStridedRead(out inOffW) : null);
+            float[]? kArrW = kernelData ?? (kernel.IsContiguous ? kernel.GetCpuBackingForStridedRead(out kOffW) : null);
+            float[]? outArrW = outputData ?? output.GetCpuBackingForContiguousWrite(out outOffW);
+            if (inArrW is not null && kArrW is not null && outArrW is not null)
+            {
+                Simd.WinogradF43.Forward(inArrW, inOffW, kArrW, kOffW, outArrW, outOffW, accumulate: false,
+                    batch, inChannels, height, width, outChannels);
+                return;
+            }
+        }
         if (!routePinned && input.Layout == LinearAlgebra.TensorLayout.Nchw
             && Simd.DirectConvAvx2.TryChoose(new Simd.DirectConvShape(Simd.DirectConvPass.Forward, batch, inChannels, outChannels,
                 height, width, kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW), out int directTasks))
@@ -15908,6 +15924,26 @@ public partial class CpuEngine : ITensorLevelEngine
 
         int outputHeight = gradOutput._shape[2];
         int outputWidth = gradOutput._shape[3];
+        ValidateConv2DGradientGeometry(gradOutput._shape, batch, inChannels, height, width, outChannels, kernel._shape[1],
+            kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW);
+
+#if NET5_0_OR_GREATER
+        // 3x3 stride-1 padding-1: Winograd F(4x4, 3x3), as Conv2DBackwardInputInto.
+        if (typeof(T) == typeof(float) && outputHeight == height && outputWidth == width
+            && Simd.WinogradF43.Applies(batch, outChannels, inChannels, height, width, kernelHeight, kernelWidth,
+                strideH, strideW, padH, padW, dilationH, dilationW))
+        {
+            var gW = gradOutput.GetCpuBackingForStridedRead(out int gOffW) as float[];
+            var kW = kernel.GetCpuBackingForStridedRead(out int kOffW) as float[];
+            if (gW is not null && kW is not null)
+            {
+                var dXW = new float[batch * inChannels * height * width];
+                Simd.WinogradF43.BackwardInput(gW, gOffW, kW, kOffW, dXW, 0, accumulate: false,
+                    batch, inChannels, height, width, outChannels);
+                return RentFloatResult<T>(inputShape, dXW);
+            }
+        }
+#endif
 
         if (typeof(T) == typeof(float) && kernelHeight == 1 && kernelWidth == 1 && strideH == 1 && strideW == 1
             && padH == 0 && padW == 0 && batch * height * width <= PointwiseDirectMaxPositions)
@@ -16365,6 +16401,34 @@ public partial class CpuEngine : ITensorLevelEngine
     /// </para>
     /// </summary>
     [MethodImpl(Hot)]
+    /// <summary>
+    /// Throws unless dY's shape is the forward output of a convolution of the given input and kernel geometry: the
+    /// fast input- and weight-gradient kernels index the input from dY's extent (an inconsistent dY would read or write
+    /// past the input's buffer).
+    /// </summary>
+    private static void ValidateConv2DGradientGeometry(int[] gradShape, int batch, int inChannels, int height, int width,
+        int outChannels, int kernelInChannels, int kernelHeight, int kernelWidth, int strideH, int strideW,
+        int padH, int padW, int dilationH, int dilationW)
+    {
+        if (strideH <= 0 || strideW <= 0) throw new ArgumentException("Stride elements must be positive.");
+        if (dilationH <= 0 || dilationW <= 0) throw new ArgumentException("Dilation elements must be positive.");
+        if (padH < 0 || padW < 0) throw new ArgumentException("Padding elements must be non-negative.");
+        if (kernelHeight <= 0 || kernelWidth <= 0) throw new ArgumentException("Kernel dimensions must be positive.");
+        if (kernelInChannels != inChannels)
+            throw new ArgumentException($"Kernel input channels ({kernelInChannels}) must match the input's ({inChannels}).");
+        if (gradShape[0] != batch)
+            throw new ArgumentException($"gradOutput batch ({gradShape[0]}) must match the input's ({batch}).");
+        if (gradShape[1] != outChannels)
+            throw new ArgumentException($"gradOutput channels ({gradShape[1]}) must match the kernel's output channels ({outChannels}).");
+        int expectedH = (height + 2 * padH - dilationH * (kernelHeight - 1) - 1) / strideH + 1;
+        int expectedW = (width + 2 * padW - dilationW * (kernelWidth - 1) - 1) / strideW + 1;
+        if (expectedH <= 0 || expectedW <= 0 || gradShape[2] != expectedH || gradShape[3] != expectedW)
+            throw new ArgumentException(
+                $"gradOutput spatial shape [{gradShape[2]}, {gradShape[3]}] is not the forward output [{expectedH}, {expectedW}] of a "
+                + $"{height}x{width} input under kernel {kernelHeight}x{kernelWidth}, stride [{strideH}, {strideW}], "
+                + $"padding [{padH}, {padW}], dilation [{dilationH}, {dilationW}].");
+    }
+
     public void Conv2DBackwardInputInto<T>(
         Tensor<T> dest, Tensor<T> gradOutput, Tensor<T> kernel,
         int[] inputShape, int[] stride, int[] padding, int[] dilation,
@@ -16396,19 +16460,37 @@ public partial class CpuEngine : ITensorLevelEngine
         int dilationH = dilation[0], dilationW = dilation[1];
         int outputHeight = gradOutput._shape[2];
         int outputWidth = gradOutput._shape[3];
+        ValidateConv2DGradientGeometry(gradOutput._shape, batch, inChannels, height, width, outChannels, kernel._shape[1],
+            kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW);
 
         if (typeof(T) == typeof(float))
         {
 #if NET5_0_OR_GREATER
             if (Simd.Conv1x1Gemm.Applies(batch, kernelHeight, kernelWidth, padH, padW, dilationH, dilationW))
             {
-                var gArr1 = (float[]?)(object?)gradOutput.GetCpuBackingForStridedRead(out int gOff1);
-                var kArr1 = (float[]?)(object?)kernel.GetCpuBackingForStridedRead(out int kOff1);
-                var dArr1 = (float[]?)(object?)dest.GetCpuBackingForContiguousWrite(out int dOff1);
+                var gArr1 = gradOutput.GetCpuBackingForStridedRead(out int gOff1) as float[];
+                var kArr1 = kernel.GetCpuBackingForStridedRead(out int kOff1) as float[];
+                var dArr1 = dest.GetCpuBackingForContiguousWrite(out int dOff1) as float[];
                 if (gArr1 is not null && kArr1 is not null && dArr1 is not null)
                 {
                     Simd.Conv1x1Gemm.BackwardInput(gArr1, gOff1, kArr1, kOff1, dArr1, dOff1, accumulate, batch, inChannels,
                         height, width, outChannels, strideH, strideW, outputHeight, outputWidth);
+                    return;
+                }
+            }
+            // The input gradient of a 3x3 stride-1 padding-1 convolution is the same convolution of dY with the kernel turned
+            // 180 degrees and its channel axes swapped: Winograd F(4x4, 3x3) as the forward.
+            if (Simd.WinogradF43.Applies(batch, outChannels, inChannels, height, width, kernelHeight, kernelWidth,
+                    strideH, strideW, padH, padW, dilationH, dilationW)
+                && outputHeight == height && outputWidth == width)
+            {
+                var gArrW = gradOutput.GetCpuBackingForStridedRead(out int gOffW) as float[];
+                var kArrW = kernel.GetCpuBackingForStridedRead(out int kOffW) as float[];
+                var dArrW = dest.GetCpuBackingForContiguousWrite(out int dOffW) as float[];
+                if (gArrW is not null && kArrW is not null && dArrW is not null)
+                {
+                    Simd.WinogradF43.BackwardInput(gArrW, gOffW, kArrW, kOffW, dArrW, dOffW, accumulate,
+                        batch, inChannels, height, width, outChannels);
                     return;
                 }
             }
@@ -16417,9 +16499,9 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 // Both operands were made contiguous above; read them in place at their storage offsets (an arena
                 // buffer is usually longer than the tensor, and GetFlattenedData would copy it every step).
-                var gArr = (float[]?)(object?)gradOutput.GetCpuBackingForStridedRead(out int gOff);
-                var kArr = (float[]?)(object?)kernel.GetCpuBackingForStridedRead(out int kOff);
-                var dArr = (float[]?)(object?)dest.GetCpuBackingForContiguousWrite(out int dOff);
+                var gArr = gradOutput.GetCpuBackingForStridedRead(out int gOff) as float[];
+                var kArr = kernel.GetCpuBackingForStridedRead(out int kOff) as float[];
+                var dArr = dest.GetCpuBackingForContiguousWrite(out int dOff) as float[];
                 if (gArr is not null && kArr is not null && dArr is not null)
                 {
                     Simd.DirectConvAvx2.BackwardInput(gArr, gOff, kArr, kOff, dArr, dOff, accumulate,
@@ -17531,15 +17613,17 @@ public partial class CpuEngine : ITensorLevelEngine
         int dilationH = dilation[0], dilationW = dilation[1];
         int outputHeight = gradOutput._shape[2];
         int outputWidth = gradOutput._shape[3];
+        ValidateConv2DGradientGeometry(gradOutput._shape, batch, inChannels, height, width, outChannels, kernelShape[1],
+            kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW);
 
         if (typeof(T) == typeof(float))
         {
 #if NET5_0_OR_GREATER
             if (Simd.Conv1x1Gemm.Applies(batch, kernelHeight, kernelWidth, padH, padW, dilationH, dilationW))
             {
-                var xArr1 = (float[]?)(object?)input.GetCpuBackingForStridedRead(out int xOff1);
-                var gArr1 = (float[]?)(object?)gradOutput.GetCpuBackingForStridedRead(out int gOff1);
-                var dArr1 = (float[]?)(object?)dest.GetCpuBackingForContiguousWrite(out int dOff1);
+                var xArr1 = input.GetCpuBackingForStridedRead(out int xOff1) as float[];
+                var gArr1 = gradOutput.GetCpuBackingForStridedRead(out int gOff1) as float[];
+                var dArr1 = dest.GetCpuBackingForContiguousWrite(out int dOff1) as float[];
                 if (xArr1 is not null && gArr1 is not null && dArr1 is not null)
                 {
                     Simd.Conv1x1Gemm.BackwardKernel(xArr1, xOff1, gArr1, gOff1, dArr1, dOff1, accumulate, batch, inChannels,
@@ -17551,9 +17635,9 @@ public partial class CpuEngine : ITensorLevelEngine
                     height, width, kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW), out int directTasks))
             {
                 // Both operands were made contiguous above; read them in place (see the input-gradient route).
-                var xArr = (float[]?)(object?)input.GetCpuBackingForStridedRead(out int xOff);
-                var gArr = (float[]?)(object?)gradOutput.GetCpuBackingForStridedRead(out int gOff);
-                var dArr = (float[]?)(object?)dest.GetCpuBackingForContiguousWrite(out int dOff);
+                var xArr = input.GetCpuBackingForStridedRead(out int xOff) as float[];
+                var gArr = gradOutput.GetCpuBackingForStridedRead(out int gOff) as float[];
+                var dArr = dest.GetCpuBackingForContiguousWrite(out int dOff) as float[];
                 if (xArr is not null && gArr is not null && dArr is not null)
                 {
                     Simd.DirectConvAvx2.BackwardKernel(xArr, xOff, gArr, gOff, dArr, dOff, accumulate,
@@ -19402,7 +19486,7 @@ public partial class CpuEngine : ITensorLevelEngine
             if (Simd.DepthwiseConv3x3.Applies(multiplier, kernelHeight, kernelWidth, strideH, strideW, padH, padW))
             {
                 var dx = TensorAllocator.RentUninitialized<T>(inputShape);
-                Simd.DepthwiseConv3x3.BackwardInput(goF, kF, (float[])(object)dx.GetDataArray(), batch, inChannels, height,
+                Simd.DepthwiseConv3x3.BackwardInput(goF, kF, (dx.GetDataArray() as float[])!, batch, inChannels, height,
                     width, strideH);
                 return dx;
             }
@@ -19570,7 +19654,7 @@ public partial class CpuEngine : ITensorLevelEngine
             if (Simd.DepthwiseConv3x3.Applies(multiplier, kernelHeight, kernelWidth, strideH, strideW, padH, padW))
             {
                 var dw = TensorAllocator.RentUninitialized<T>(kernelShape);
-                Simd.DepthwiseConv3x3.BackwardKernel(goF, inF, (float[])(object)dw.GetDataArray(), batch, inChannels, height,
+                Simd.DepthwiseConv3x3.BackwardKernel(goF, inF, (dw.GetDataArray() as float[])!, batch, inChannels, height,
                     width, strideH);
                 return dw;
             }

@@ -27,10 +27,13 @@ def main() -> None:
                 if cur is None or ms < cur[0]:
                     best[key][side] = (ms, threads)
     total = {"tensors": 0.0, "torch": 0.0}
+    unpaired = []
     print(f"{'op':<13} {'shape':<38} {'tensors ms':>11} {'torch ms':>10} {'ratio':>7}")
     for (op, shape), sides in sorted(best.items(), key=lambda kv: (kv[0][1], kv[0][0])):
         t, p = sides["tensors"], sides["torch"]
         if t is None or p is None:
+            # An operation or shape name that drifted between the two benches, or one side's run that failed.
+            unpaired.append(f"{op} {shape} ({'tensors' if t is not None else 'torch'} only)")
             continue
         total["tensors"] += t[0]
         total["torch"] += p[0]
@@ -38,6 +41,10 @@ def main() -> None:
         print(f"{op:<13} {shape:<38} {t[0]:>8.3f}@{t[1]} {p[0]:>7.3f}@{p[1]} {t[0] / p[0]:>7.2f}{flag}")
     if total["torch"]:
         print(f"sum: tensors {total['tensors']:.2f} ms, torch {total['torch']:.2f} ms, ratio {total['tensors'] / total['torch']:.2f}")
+    else:
+        print("no paired rows: one side's log is empty or the two benches name their rows differently")
+    for row in unpaired:
+        print(f"unpaired: {row}")
 
 
 if __name__ == "__main__":

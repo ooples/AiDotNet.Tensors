@@ -60,6 +60,9 @@ internal static class DirectConvAvx2
     /// <summary>Keeps this thread's convolutions off the direct kernels until disposed (restores the previous state).</summary>
     internal static IDisposable SuppressOnThisThread() => new Suppression();
 
+    /// <summary>Whether <see cref="SuppressOnThisThread"/> is in force (the Winograd kernel honours it too).</summary>
+    internal static bool SuppressedOnThisThread => t_suppressed;
+
     private sealed class Suppression : IDisposable
     {
         private readonly bool _previous;

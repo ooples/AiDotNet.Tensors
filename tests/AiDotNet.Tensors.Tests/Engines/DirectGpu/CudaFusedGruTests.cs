@@ -190,6 +190,75 @@ public sealed class CudaFusedGruTests
     }
 
     /// <summary>
+    /// One GRU applied to two sequences in a step (a siamese encoder): the two recorded nodes share the weights but not
+    /// their activation buffers, so both backwards see their own forward's state. Keyed by the weights, the second
+    /// forward overwrote the first's activations and the first backward threw.
+    /// </summary>
+    [SkippableFact]
+    public void CompiledTraining_TwoCallsOfOneGru_KeepSeparateActivations()
+    {
+        using var gpu = TryCuda();
+        Skip.If(gpu is null, "No CUDA backend.");
+        const int batch = 4, steps = 5, inputs = 6, hidden = 16;
+        double scale = 1.0 / Math.Sqrt(hidden);
+        Tensor<float>[] Make() => new[]
+        {
+            Rand(new Random(11), 1.0, batch, steps, inputs), Rand(new Random(12), 1.0, batch, steps, inputs),
+            Rand(new Random(13), scale, 3 * hidden, inputs), Rand(new Random(14), scale, 3 * hidden, hidden),
+            Rand(new Random(15), scale, 3 * hidden), Rand(new Random(16), scale, 3 * hidden),
+        };
+        static Tensor<float> Siamese(IEngine e, Tensor<float>[] p)
+        {
+            Tensor<float> Branch(Tensor<float> x)
+            {
+                var y = e.GruSequenceForward(x, null, p[2], p[3], p[4], p[5], returnSequences: true, resetAfter: true);
+                var z = e.Tanh(y);
+                return e.ReduceSum(e.TensorMultiply(z, z), null);
+            }
+            // Unequal weights on the branches, so each branch's gradient matters to the total.
+            return e.TensorAdd(Branch(p[0]), e.TensorMultiplyScalar(Branch(p[1]), 0.5f));
+        }
+        var cpu = Make();
+        var cpuSources = new[] { cpu[0], cpu[1], cpu[2], cpu[3], cpu[4], cpu[5] };
+        float cpuLoss;
+        var cpuGrads = new double[cpuSources.Length][];
+        using (var tape = new GradientTape<float>())
+        {
+            var loss = Siamese(new CpuEngine(), cpu);
+            cpuLoss = loss[0];
+            var g = tape.ComputeGradients(loss, cpuSources);
+            for (int i = 0; i < cpuSources.Length; i++) cpuGrads[i] = Array.ConvertAll(g[cpuSources[i]].ToArray(), v => (double)v);
+        }
+
+        var p = Make();
+        var sources = new[] { p[0], p[1], p[2], p[3], p[4], p[5] };
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            Siamese(gpu!, p);
+            plan = scope.CompileTraining(sources);
+        }
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);
+            for (int step = 0; step < 2; step++)
+            {
+                long forward = CudaBackend.FusedGruForwardRuns, backward = CudaBackend.FusedGruBackwardRuns;
+                var loss = plan.Step();
+                Assert.Equal(2, CudaBackend.FusedGruForwardRuns - forward);
+                Assert.Equal(2, CudaBackend.FusedGruBackwardRuns - backward);
+                Assert.True(Math.Abs(loss[0] - cpuLoss) <= 1e-4 + 1e-4 * Math.Abs(cpuLoss), $"step {step}: loss {loss[0]}, CPU {cpuLoss}.");
+                for (int i = 0; i < sources.Length; i++)
+                {
+                    var g = sources[i].Grad;
+                    Assert.True(g is not null, $"source {i} has no gradient at step {step}.");
+                    AssertClose($"step {step} source {i}", cpuGrads[i], Array.ConvertAll(g!.ToArray(), v => (double)v));
+                }
+            }
+        }
+    }
+
+    /// <summary>
     /// The backend's last-step-only backward (the gradient of h_T alone, [B, H]) is the full backward given a [B, T, H]
     /// gradient that is zero except at the last step, bit for bit; and the forward's h_T output is the last step of its
     /// sequence output.
