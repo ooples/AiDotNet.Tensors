@@ -3,6 +3,7 @@ using System;
 using System.Numerics;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 #endif
 using AiDotNet.Tensors.Helpers;
 
@@ -102,6 +103,11 @@ internal static unsafe partial class DepthwiseConv3x3
             BackwardInputStride2ChannelBlocks(dy, w, dx, batch, channels, h, wd);
             return;
         }
+        if (stride == 2 && Avx2.IsSupported)
+        {
+            BackwardInputStride2Parity(dy, w, dx, batch, channels, h, wd);
+            return;
+        }
 #endif
         int oH = (h - 1) / stride + 1, oW = (wd - 1) / stride + 1;
         int planes = batch * channels;
@@ -142,6 +148,88 @@ internal static unsafe partial class DepthwiseConv3x3
             }
         }, deterministicSafe: true);
     }
+
+#if NET5_0_OR_GREATER
+    /// <summary>
+    /// Stride-2 input gradient by input parity. With y[i][j] = sum w[a][b] x[2i - 1 + a][2j - 1 + b], each input
+    /// position takes only the taps of its row and column parity: dx[2i][2j] = w11 D[i][j];
+    /// dx[2i][2j+1] = w10 D[i][j+1] + w12 D[i][j]; dx[2i+1][2j] = w01 D[i+1][j] + w21 D[i][j];
+    /// dx[2i+1][2j+1] = w00 D[i+1][j+1] + w02 D[i+1][j] + w20 D[i][j+1] + w22 D[i][j], D the output gradient with a zero
+    /// row and column past its end. Nine products per four inputs, against thirty-six for the stride-1 product over the
+    /// output gradient spread with zeros. Even and odd columns are vectors over D's rows, interleaved on store.
+    /// </summary>
+    private static void BackwardInputStride2Parity(float[] dy, float[] w, float[] dx, int batch, int channels, int h, int wd)
+    {
+        int oH = (h - 1) / 2 + 1, oW = (wd - 1) / 2 + 1;
+        int planes = batch * channels;
+        int group = GroupSize(h * wd), tasks = (planes + group - 1) / group;
+        CpuParallelSettings.ParallelForOrSerial(0, tasks, (long)planes * h * wd * 3, t =>
+        {
+            int pairs = (wd + 1) / 2;                   // column pairs (2j, 2j + 1) per dx row
+            int rowLen = (pairs + 7) / 8 * 8 + 8;       // D row: each 8-pair pass reads D[.][j .. j + 8]
+            int planeLen = (oH + 1) * rowLen;
+            var scratch = Scratch(planeLen + 16);
+            fixed (float* pdy = dy, pw = w, pdx = dx, sp = scratch)
+            {
+                float* tail = sp + planeLen;
+                // Every plane writes the same positions, so the zero row and columns survive from this one clear.
+                new Span<float>(sp, planeLen).Clear();
+                for (int p = t * group, end = Math.Min(planes, p + group); p < end; p++)
+                {
+                    float* wc = pw + (p % channels) * 9;
+                    var w00 = Vector256.Create(wc[0]); var w01 = Vector256.Create(wc[1]); var w02 = Vector256.Create(wc[2]);
+                    var w10 = Vector256.Create(wc[3]); var w11 = Vector256.Create(wc[4]); var w12 = Vector256.Create(wc[5]);
+                    var w20 = Vector256.Create(wc[6]); var w21 = Vector256.Create(wc[7]); var w22 = Vector256.Create(wc[8]);
+                    float* src = pdy + (long)p * oH * oW;
+                    for (int i = 0; i < oH; i++)
+                        Buffer.MemoryCopy(src + i * oW, sp + i * rowLen, (long)oW * 4, (long)oW * 4);
+                    float* plane = pdx + (long)p * h * wd;
+                    for (int r = 0; r < h; r++)
+                    {
+                        float* d0 = sp + (r >> 1) * rowLen, d1 = d0 + rowLen;
+                        float* row = plane + (long)r * wd;
+                        bool oddRow = (r & 1) != 0;
+                        for (int j = 0; j < pairs; j += 8)
+                        {
+                            var a = Avx.LoadVector256(d0 + j);
+                            var b = Avx.LoadVector256(d0 + j + 1);
+                            Vector256<float> even, odd;
+                            if (!oddRow)
+                            {
+                                even = Avx.Multiply(w11, a);
+                                odd = Avx.Add(Avx.Multiply(w10, b), Avx.Multiply(w12, a));
+                            }
+                            else
+                            {
+                                var c = Avx.LoadVector256(d1 + j);
+                                var e = Avx.LoadVector256(d1 + j + 1);
+                                even = Avx.Add(Avx.Multiply(w01, c), Avx.Multiply(w21, a));
+                                odd = Avx.Add(Avx.Add(Avx.Multiply(w00, e), Avx.Multiply(w02, c)),
+                                    Avx.Add(Avx.Multiply(w20, b), Avx.Multiply(w22, a)));
+                            }
+                            var lo = Avx.UnpackLow(even, odd);    // e0 o0 e1 o1 | e4 o4 e5 o5
+                            var hi = Avx.UnpackHigh(even, odd);   // e2 o2 e3 o3 | e6 o6 e7 o7
+                            var first = Avx.Permute2x128(lo, hi, 0x20);
+                            var second = Avx.Permute2x128(lo, hi, 0x31);
+                            int col = 2 * j;
+                            if (col + 16 <= wd)
+                            {
+                                Avx.Store(row + col, first);
+                                Avx.Store(row + col + 8, second);
+                            }
+                            else
+                            {
+                                Avx.Store(tail, first);
+                                Avx.Store(tail + 8, second);
+                                for (int k = 0; col + k < wd; k++) row[col + k] = tail[k];
+                            }
+                        }
+                    }
+                }
+            }
+        }, deterministicSafe: true);
+    }
+#endif
 
     /// <summary>Row length of the zero-bordered scratch plane(s) for an output row of oW at the stride: room for the
     /// last vector's three taps.</summary>
