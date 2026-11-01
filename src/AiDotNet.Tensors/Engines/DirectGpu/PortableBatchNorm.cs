@@ -32,6 +32,12 @@ internal static class PortableBatchNorm
 #endif
 
     /// <summary>As <see cref="IBatchNormVarianceBackend.TryBatchNormTrainingWithVariance"/>.</summary>
+    /// <summary>Whether the register kernels take a [batch, channels, spatial] input.</summary>
+    internal static bool AcceptsShape(int batch, int channels, int spatial)
+        => batch > 0 && spatial > 0 && channels > 0 && channels <= MaxGroups
+            && BatchNormRegisterKernelTemplate.VariantFor((long)batch * spatial) != 0
+            && (long)batch * spatial * channels <= int.MaxValue;
+
     internal static bool TryForward(IDirectGpuBackend backend, Launcher launch, IGpuBuffer input, IGpuBuffer output,
         IGpuBuffer gamma, IGpuBuffer beta, IGpuBuffer saveMean, IGpuBuffer saveVariance,
         int batch, int channels, int spatial, float epsilon, bool relu, IGpuBuffer? residual, bool unpacked = false)

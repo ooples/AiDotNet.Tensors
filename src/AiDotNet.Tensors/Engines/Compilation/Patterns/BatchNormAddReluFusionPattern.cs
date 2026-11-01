@@ -192,9 +192,11 @@ internal static class BatchNormFusionMatch
                         Helpers.TensorAllocator.Return(normalized);
                         normalized = sum;
                     }
-                    // ReLU6 runs in place on the normalized values where the device can: a compiled step keeps one buffer
-                    // per output an action allocates, so a second output would hold the BatchNorm values all step.
-                    if (capAtSix && eng is DirectGpuTensorEngine device && device.TryReLU6InPlace(normalized))
+                    // The activation runs in place on the normalized values where the device can: a compiled step keeps one
+                    // buffer per output an action allocates, so a second output would hold the BatchNorm values all step
+                    // (DenseNet-121's first two blocks, past the register kernel's channel size: 0.8 GB).
+                    if (eng is DirectGpuTensorEngine device
+                        && (capAtSix ? device.TryReLU6InPlace(normalized) : device.TryReLUInPlace(normalized)))
                     {
                         fusedOutput = normalized;
                     }

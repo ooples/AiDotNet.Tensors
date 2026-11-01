@@ -7356,7 +7356,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// path re-resolved a device result through its host values, a blocking download per call that doubled a
     /// MobileNetV2 training step.
     /// </summary>
-    internal bool TryReLU6InPlace<T>(Tensor<T> tensor)
+    internal bool TryReLU6InPlace<T>(Tensor<T> tensor) => TryResidentActivationInPlace(tensor, capAtSix: true);
+
+    /// <summary>As <see cref="TryReLU6InPlace{T}"/>, for ReLU.</summary>
+    internal bool TryReLUInPlace<T>(Tensor<T> tensor) => TryResidentActivationInPlace(tensor, capAtSix: false);
+
+    private bool TryResidentActivationInPlace<T>(Tensor<T> tensor, bool capAtSix)
     {
         if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled || !tensor.IsContiguous || IsPartialView(tensor)
             || !TryGetBackend(out var backend))
@@ -7364,7 +7369,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (ResolveResidentBufferNoUpload(backend, tensor, tensor.Length, includePersistentWeightCache: false) is not { } resident
             || resident.Handle == IntPtr.Zero || resident.Size < tensor.Length)
             return false;
-        backend.Relu6(resident, resident, tensor.Length);
+        if (capAtSix) backend.Relu6(resident, resident, tensor.Length);
+        else backend.Relu(resident, resident, tensor.Length);
         tensor.IncrementVersion();
         BindResidentBuffer(tensor, resident, backend);
         return true;
@@ -16950,12 +16956,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         variance = null;
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)
             || backend is not DirectGpu.IBatchNormVarianceBackend varianceBackend
-            || !TryBatchNormLayout(input._shape, gamma.Length, out int batch, out int channels, out int spatial))
+            || !TryBatchNormLayout(input._shape, gamma.Length, out int batch, out int channels, out int spatial)
+            // Asked before anything is allocated: a compiled step keeps every buffer an action rents, so outputs rented
+            // for a launch the backend then declined stayed as dead slots (an activation per fused node, every step).
+            || !varianceBackend.AcceptsTrainingShape(batch, channels, spatial)
+            || (residual is not null && residual.Length != input.Length))
             return null;
         using var bufIn = GetOrAllocateBuffer(backend, input);
         using var bufGamma = GetOrAllocateBuffer(backend, gamma);
         using var bufBeta = GetOrAllocateBuffer(backend, beta);
-        if (residual is not null && residual.Length != input.Length) return null;
         using var bufResidual = residual is null ? default : GetOrAllocateBuffer(backend, residual);
         var bufOut = AllocateFullyWrittenOutputBuffer(backend, input.Length);
         var bufMean = AllocateFullyWrittenOutputBuffer(backend, channels);
@@ -16998,7 +17007,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         gradResidual = null;
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)
             || backend is not DirectGpu.IBatchNormVarianceBackend varianceBackend
-            || !TryBatchNormLayout(input._shape, gamma.Length, out int batch, out int channels, out int spatial))
+            || !TryBatchNormLayout(input._shape, gamma.Length, out int batch, out int channels, out int spatial)
+            || !varianceBackend.AcceptsTrainingShape(batch, channels, spatial))
             return null;
         using var bufDy = GetOrAllocateBuffer(backend, gradOutput);
         using var bufOut = GetOrAllocateBuffer(backend, reluOutput);
