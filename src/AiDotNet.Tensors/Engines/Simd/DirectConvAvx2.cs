@@ -877,7 +877,7 @@ internal static partial class DirectConvAvx2
                         for (int q = runStart; q < runEnd; q += Avx512Positions)
                         {
                             int count = Math.Min(Avx512Positions, runEnd - q), i = q - runStart;
-                            ForwardDozenRun512(px, origin + i, passKernel, blockStride, cbEnd - cb0, cb0 * planeIn, planeIn,
+                            ForwardSextetRun512(px, origin + i, passKernel, blockStride, cbEnd - cb0, cb0 * planeIn, planeIn,
                                 kernelHeight, kernelWidth, rowStep, colStep, stage + i * 32, cb0 > 0, count);
                         }
                         continue;
@@ -993,42 +993,40 @@ internal static partial class DirectConvAvx2
     }
 
     /// <summary>
-    /// The AVX-512 form of <see cref="ForwardTripleRun"/>: twelve positions x the tile's 32 output channels as two 16-lane
-    /// registers (each joined from two of the packed 8-lane output blocks), 24 accumulators, the eight channels of a block
-    /// unrolled. Each output's FMA chain is the AVX2 kernel's (same order, one rounding per FMA), so the results are
-    /// bit-identical; the hosted CI runners that lost to PyTorch were AVX-512 machines, where PyTorch's oneDNN kernels run
-    /// 16-wide. (Six positions with a channel loop left two thirds of the zmm file idle and paid two weight joins and the
-    /// loop's uops per twelve FMAs; twelve positions pay them per 24.)
+    /// The AVX-512 form of <see cref="ForwardTripleRun"/>: six positions x the tile's 32 output channels as two 16-lane
+    /// registers (each joined from two of the packed 8-lane output blocks), twelve accumulators. Each output's FMA chain
+    /// is the AVX2 kernel's (same order, one rounding per FMA), so the results are bit-identical; the hosted CI runners
+    /// that lost to PyTorch were AVX-512 machines, where PyTorch's oneDNN kernels run 16-wide.
     /// </summary>
 #if NET9_0_OR_GREATER
     [MethodImpl(Hot)]
-    private static unsafe void ForwardDozenRun512(float* px, int* origin, float* w, long blockStride, int blocks,
+    private static unsafe void ForwardSextetRun512(float* px, int* origin, float* w, long blockStride, int blocks,
         int firstBlockOffset, int planeIn, int kernelHeight, int kernelWidth, int rowStep, int colStep,
         float* slot, bool seeded, int count)
     {
-        float* x0 = px + origin[0], x1 = px + origin[1], x2 = px + origin[2], x3 = px + origin[3], x4 = px + origin[4], x5 = px + origin[5], x6 = px + origin[6], x7 = px + origin[7], x8 = px + origin[8], x9 = px + origin[9], x10 = px + origin[10], x11 = px + origin[11];
-        Vector512<float> a0l, a0h, a1l, a1h, a2l, a2h, a3l, a3h, a4l, a4h, a5l, a5h, a6l, a6h, a7l, a7h, a8l, a8h, a9l, a9h, a10l, a10h, a11l, a11h;
+        float* x0 = px + origin[0], x1 = px + origin[1], x2 = px + origin[2];
+        float* x3 = px + origin[3], x4 = px + origin[4], x5 = px + origin[5];
+        Vector512<float> a0l, a0h, a1l, a1h, a2l, a2h, a3l, a3h, a4l, a4h, a5l, a5h;
         if (seeded)
         {
             // Slots past the real positions repeat the last real one (their origins do too), so their sums are discarded.
-            int last = count - 1;
-            float* s0 = slot; a0l = Vector512.Load(s0); a0h = Vector512.Load(s0 + 16);
-            float* s1 = slot + 32 * Math.Min(1, last); a1l = Vector512.Load(s1); a1h = Vector512.Load(s1 + 16);
-            float* s2 = slot + 32 * Math.Min(2, last); a2l = Vector512.Load(s2); a2h = Vector512.Load(s2 + 16);
-            float* s3 = slot + 32 * Math.Min(3, last); a3l = Vector512.Load(s3); a3h = Vector512.Load(s3 + 16);
-            float* s4 = slot + 32 * Math.Min(4, last); a4l = Vector512.Load(s4); a4h = Vector512.Load(s4 + 16);
-            float* s5 = slot + 32 * Math.Min(5, last); a5l = Vector512.Load(s5); a5h = Vector512.Load(s5 + 16);
-            float* s6 = slot + 32 * Math.Min(6, last); a6l = Vector512.Load(s6); a6h = Vector512.Load(s6 + 16);
-            float* s7 = slot + 32 * Math.Min(7, last); a7l = Vector512.Load(s7); a7h = Vector512.Load(s7 + 16);
-            float* s8 = slot + 32 * Math.Min(8, last); a8l = Vector512.Load(s8); a8h = Vector512.Load(s8 + 16);
-            float* s9 = slot + 32 * Math.Min(9, last); a9l = Vector512.Load(s9); a9h = Vector512.Load(s9 + 16);
-            float* s10 = slot + 32 * Math.Min(10, last); a10l = Vector512.Load(s10); a10h = Vector512.Load(s10 + 16);
-            float* s11 = slot + 32 * Math.Min(11, last); a11l = Vector512.Load(s11); a11h = Vector512.Load(s11 + 16);
+            float* s0 = slot;
+            float* s1 = slot + 32 * Math.Min(1, count - 1);
+            float* s2 = slot + 32 * Math.Min(2, count - 1);
+            float* s3 = slot + 32 * Math.Min(3, count - 1);
+            float* s4 = slot + 32 * Math.Min(4, count - 1);
+            float* s5 = slot + 32 * Math.Min(5, count - 1);
+            a0l = Vector512.Load(s0); a0h = Vector512.Load(s0 + 16);
+            a1l = Vector512.Load(s1); a1h = Vector512.Load(s1 + 16);
+            a2l = Vector512.Load(s2); a2h = Vector512.Load(s2 + 16);
+            a3l = Vector512.Load(s3); a3h = Vector512.Load(s3 + 16);
+            a4l = Vector512.Load(s4); a4h = Vector512.Load(s4 + 16);
+            a5l = Vector512.Load(s5); a5h = Vector512.Load(s5 + 16);
         }
         else
         {
-            a0l = Vector512<float>.Zero; a0h = a0l;
-            a1l = a0l; a1h = a0l; a2l = a0l; a2h = a0l; a3l = a0l; a3h = a0l; a4l = a0l; a4h = a0l; a5l = a0l; a5h = a0l; a6l = a0l; a6h = a0l; a7l = a0l; a7h = a0l; a8l = a0l; a8h = a0l; a9l = a0l; a9h = a0l; a10l = a0l; a10h = a0l; a11l = a0l; a11h = a0l;
+            a0l = Vector512<float>.Zero; a0h = a0l; a1l = a0l; a1h = a0l; a2l = a0l; a2h = a0l;
+            a3l = a0l; a3h = a0l; a4l = a0l; a4h = a0l; a5l = a0l; a5h = a0l;
         }
         long stride2 = 2 * blockStride, stride3 = 3 * blockStride;
         for (int cb = 0; cb < blocks; cb++)
@@ -1040,8 +1038,10 @@ internal static partial class DirectConvAvx2
                 for (int x = 0; x < kernelWidth; x++)
                 {
                     int tapOffset = rowOffset + x * colStep;
-                    float* p0 = x0 + tapOffset, p1 = x1 + tapOffset, p2 = x2 + tapOffset, p3 = x3 + tapOffset, p4 = x4 + tapOffset, p5 = x5 + tapOffset, p6 = x6 + tapOffset, p7 = x7 + tapOffset, p8 = x8 + tapOffset, p9 = x9 + tapOffset, p10 = x10 + tapOffset, p11 = x11 + tapOffset;
-                    // Output channels 0-15 of the tile are packed blocks 0 and 1, 16-31 blocks 2 and 3.
+                    float* p0 = x0 + tapOffset, p1 = x1 + tapOffset, p2 = x2 + tapOffset;
+                    float* p3 = x3 + tapOffset, p4 = x4 + tapOffset, p5 = x5 + tapOffset;
+                    // The eight channels unrolled (the loop counter, branch and indexed addressing were a share of the
+                    // uops). Output channels 0-15 of the tile are packed blocks 0 and 1, 16-31 blocks 2 and 3.
                     Vector512<float> wl, wh, b;
                     wl = Vector512.Create(Vector256.Load(w), Vector256.Load(w + blockStride));
                     wh = Vector512.Create(Vector256.Load(w + stride2), Vector256.Load(w + stride3));
@@ -1051,12 +1051,6 @@ internal static partial class DirectConvAvx2
                     b = Vector512.Create(p3[0]); a3l = Vector512.FusedMultiplyAdd(b, wl, a3l); a3h = Vector512.FusedMultiplyAdd(b, wh, a3h);
                     b = Vector512.Create(p4[0]); a4l = Vector512.FusedMultiplyAdd(b, wl, a4l); a4h = Vector512.FusedMultiplyAdd(b, wh, a4h);
                     b = Vector512.Create(p5[0]); a5l = Vector512.FusedMultiplyAdd(b, wl, a5l); a5h = Vector512.FusedMultiplyAdd(b, wh, a5h);
-                    b = Vector512.Create(p6[0]); a6l = Vector512.FusedMultiplyAdd(b, wl, a6l); a6h = Vector512.FusedMultiplyAdd(b, wh, a6h);
-                    b = Vector512.Create(p7[0]); a7l = Vector512.FusedMultiplyAdd(b, wl, a7l); a7h = Vector512.FusedMultiplyAdd(b, wh, a7h);
-                    b = Vector512.Create(p8[0]); a8l = Vector512.FusedMultiplyAdd(b, wl, a8l); a8h = Vector512.FusedMultiplyAdd(b, wh, a8h);
-                    b = Vector512.Create(p9[0]); a9l = Vector512.FusedMultiplyAdd(b, wl, a9l); a9h = Vector512.FusedMultiplyAdd(b, wh, a9h);
-                    b = Vector512.Create(p10[0]); a10l = Vector512.FusedMultiplyAdd(b, wl, a10l); a10h = Vector512.FusedMultiplyAdd(b, wh, a10h);
-                    b = Vector512.Create(p11[0]); a11l = Vector512.FusedMultiplyAdd(b, wl, a11l); a11h = Vector512.FusedMultiplyAdd(b, wh, a11h);
                     wl = Vector512.Create(Vector256.Load(w + 8), Vector256.Load(w + blockStride + 8));
                     wh = Vector512.Create(Vector256.Load(w + stride2 + 8), Vector256.Load(w + stride3 + 8));
                     b = Vector512.Create(p0[1]); a0l = Vector512.FusedMultiplyAdd(b, wl, a0l); a0h = Vector512.FusedMultiplyAdd(b, wh, a0h);
@@ -1065,12 +1059,6 @@ internal static partial class DirectConvAvx2
                     b = Vector512.Create(p3[1]); a3l = Vector512.FusedMultiplyAdd(b, wl, a3l); a3h = Vector512.FusedMultiplyAdd(b, wh, a3h);
                     b = Vector512.Create(p4[1]); a4l = Vector512.FusedMultiplyAdd(b, wl, a4l); a4h = Vector512.FusedMultiplyAdd(b, wh, a4h);
                     b = Vector512.Create(p5[1]); a5l = Vector512.FusedMultiplyAdd(b, wl, a5l); a5h = Vector512.FusedMultiplyAdd(b, wh, a5h);
-                    b = Vector512.Create(p6[1]); a6l = Vector512.FusedMultiplyAdd(b, wl, a6l); a6h = Vector512.FusedMultiplyAdd(b, wh, a6h);
-                    b = Vector512.Create(p7[1]); a7l = Vector512.FusedMultiplyAdd(b, wl, a7l); a7h = Vector512.FusedMultiplyAdd(b, wh, a7h);
-                    b = Vector512.Create(p8[1]); a8l = Vector512.FusedMultiplyAdd(b, wl, a8l); a8h = Vector512.FusedMultiplyAdd(b, wh, a8h);
-                    b = Vector512.Create(p9[1]); a9l = Vector512.FusedMultiplyAdd(b, wl, a9l); a9h = Vector512.FusedMultiplyAdd(b, wh, a9h);
-                    b = Vector512.Create(p10[1]); a10l = Vector512.FusedMultiplyAdd(b, wl, a10l); a10h = Vector512.FusedMultiplyAdd(b, wh, a10h);
-                    b = Vector512.Create(p11[1]); a11l = Vector512.FusedMultiplyAdd(b, wl, a11l); a11h = Vector512.FusedMultiplyAdd(b, wh, a11h);
                     wl = Vector512.Create(Vector256.Load(w + 16), Vector256.Load(w + blockStride + 16));
                     wh = Vector512.Create(Vector256.Load(w + stride2 + 16), Vector256.Load(w + stride3 + 16));
                     b = Vector512.Create(p0[2]); a0l = Vector512.FusedMultiplyAdd(b, wl, a0l); a0h = Vector512.FusedMultiplyAdd(b, wh, a0h);
@@ -1079,12 +1067,6 @@ internal static partial class DirectConvAvx2
                     b = Vector512.Create(p3[2]); a3l = Vector512.FusedMultiplyAdd(b, wl, a3l); a3h = Vector512.FusedMultiplyAdd(b, wh, a3h);
                     b = Vector512.Create(p4[2]); a4l = Vector512.FusedMultiplyAdd(b, wl, a4l); a4h = Vector512.FusedMultiplyAdd(b, wh, a4h);
                     b = Vector512.Create(p5[2]); a5l = Vector512.FusedMultiplyAdd(b, wl, a5l); a5h = Vector512.FusedMultiplyAdd(b, wh, a5h);
-                    b = Vector512.Create(p6[2]); a6l = Vector512.FusedMultiplyAdd(b, wl, a6l); a6h = Vector512.FusedMultiplyAdd(b, wh, a6h);
-                    b = Vector512.Create(p7[2]); a7l = Vector512.FusedMultiplyAdd(b, wl, a7l); a7h = Vector512.FusedMultiplyAdd(b, wh, a7h);
-                    b = Vector512.Create(p8[2]); a8l = Vector512.FusedMultiplyAdd(b, wl, a8l); a8h = Vector512.FusedMultiplyAdd(b, wh, a8h);
-                    b = Vector512.Create(p9[2]); a9l = Vector512.FusedMultiplyAdd(b, wl, a9l); a9h = Vector512.FusedMultiplyAdd(b, wh, a9h);
-                    b = Vector512.Create(p10[2]); a10l = Vector512.FusedMultiplyAdd(b, wl, a10l); a10h = Vector512.FusedMultiplyAdd(b, wh, a10h);
-                    b = Vector512.Create(p11[2]); a11l = Vector512.FusedMultiplyAdd(b, wl, a11l); a11h = Vector512.FusedMultiplyAdd(b, wh, a11h);
                     wl = Vector512.Create(Vector256.Load(w + 24), Vector256.Load(w + blockStride + 24));
                     wh = Vector512.Create(Vector256.Load(w + stride2 + 24), Vector256.Load(w + stride3 + 24));
                     b = Vector512.Create(p0[3]); a0l = Vector512.FusedMultiplyAdd(b, wl, a0l); a0h = Vector512.FusedMultiplyAdd(b, wh, a0h);
@@ -1093,12 +1075,6 @@ internal static partial class DirectConvAvx2
                     b = Vector512.Create(p3[3]); a3l = Vector512.FusedMultiplyAdd(b, wl, a3l); a3h = Vector512.FusedMultiplyAdd(b, wh, a3h);
                     b = Vector512.Create(p4[3]); a4l = Vector512.FusedMultiplyAdd(b, wl, a4l); a4h = Vector512.FusedMultiplyAdd(b, wh, a4h);
                     b = Vector512.Create(p5[3]); a5l = Vector512.FusedMultiplyAdd(b, wl, a5l); a5h = Vector512.FusedMultiplyAdd(b, wh, a5h);
-                    b = Vector512.Create(p6[3]); a6l = Vector512.FusedMultiplyAdd(b, wl, a6l); a6h = Vector512.FusedMultiplyAdd(b, wh, a6h);
-                    b = Vector512.Create(p7[3]); a7l = Vector512.FusedMultiplyAdd(b, wl, a7l); a7h = Vector512.FusedMultiplyAdd(b, wh, a7h);
-                    b = Vector512.Create(p8[3]); a8l = Vector512.FusedMultiplyAdd(b, wl, a8l); a8h = Vector512.FusedMultiplyAdd(b, wh, a8h);
-                    b = Vector512.Create(p9[3]); a9l = Vector512.FusedMultiplyAdd(b, wl, a9l); a9h = Vector512.FusedMultiplyAdd(b, wh, a9h);
-                    b = Vector512.Create(p10[3]); a10l = Vector512.FusedMultiplyAdd(b, wl, a10l); a10h = Vector512.FusedMultiplyAdd(b, wh, a10h);
-                    b = Vector512.Create(p11[3]); a11l = Vector512.FusedMultiplyAdd(b, wl, a11l); a11h = Vector512.FusedMultiplyAdd(b, wh, a11h);
                     wl = Vector512.Create(Vector256.Load(w + 32), Vector256.Load(w + blockStride + 32));
                     wh = Vector512.Create(Vector256.Load(w + stride2 + 32), Vector256.Load(w + stride3 + 32));
                     b = Vector512.Create(p0[4]); a0l = Vector512.FusedMultiplyAdd(b, wl, a0l); a0h = Vector512.FusedMultiplyAdd(b, wh, a0h);
@@ -1107,12 +1083,6 @@ internal static partial class DirectConvAvx2
                     b = Vector512.Create(p3[4]); a3l = Vector512.FusedMultiplyAdd(b, wl, a3l); a3h = Vector512.FusedMultiplyAdd(b, wh, a3h);
                     b = Vector512.Create(p4[4]); a4l = Vector512.FusedMultiplyAdd(b, wl, a4l); a4h = Vector512.FusedMultiplyAdd(b, wh, a4h);
                     b = Vector512.Create(p5[4]); a5l = Vector512.FusedMultiplyAdd(b, wl, a5l); a5h = Vector512.FusedMultiplyAdd(b, wh, a5h);
-                    b = Vector512.Create(p6[4]); a6l = Vector512.FusedMultiplyAdd(b, wl, a6l); a6h = Vector512.FusedMultiplyAdd(b, wh, a6h);
-                    b = Vector512.Create(p7[4]); a7l = Vector512.FusedMultiplyAdd(b, wl, a7l); a7h = Vector512.FusedMultiplyAdd(b, wh, a7h);
-                    b = Vector512.Create(p8[4]); a8l = Vector512.FusedMultiplyAdd(b, wl, a8l); a8h = Vector512.FusedMultiplyAdd(b, wh, a8h);
-                    b = Vector512.Create(p9[4]); a9l = Vector512.FusedMultiplyAdd(b, wl, a9l); a9h = Vector512.FusedMultiplyAdd(b, wh, a9h);
-                    b = Vector512.Create(p10[4]); a10l = Vector512.FusedMultiplyAdd(b, wl, a10l); a10h = Vector512.FusedMultiplyAdd(b, wh, a10h);
-                    b = Vector512.Create(p11[4]); a11l = Vector512.FusedMultiplyAdd(b, wl, a11l); a11h = Vector512.FusedMultiplyAdd(b, wh, a11h);
                     wl = Vector512.Create(Vector256.Load(w + 40), Vector256.Load(w + blockStride + 40));
                     wh = Vector512.Create(Vector256.Load(w + stride2 + 40), Vector256.Load(w + stride3 + 40));
                     b = Vector512.Create(p0[5]); a0l = Vector512.FusedMultiplyAdd(b, wl, a0l); a0h = Vector512.FusedMultiplyAdd(b, wh, a0h);
@@ -1121,12 +1091,6 @@ internal static partial class DirectConvAvx2
                     b = Vector512.Create(p3[5]); a3l = Vector512.FusedMultiplyAdd(b, wl, a3l); a3h = Vector512.FusedMultiplyAdd(b, wh, a3h);
                     b = Vector512.Create(p4[5]); a4l = Vector512.FusedMultiplyAdd(b, wl, a4l); a4h = Vector512.FusedMultiplyAdd(b, wh, a4h);
                     b = Vector512.Create(p5[5]); a5l = Vector512.FusedMultiplyAdd(b, wl, a5l); a5h = Vector512.FusedMultiplyAdd(b, wh, a5h);
-                    b = Vector512.Create(p6[5]); a6l = Vector512.FusedMultiplyAdd(b, wl, a6l); a6h = Vector512.FusedMultiplyAdd(b, wh, a6h);
-                    b = Vector512.Create(p7[5]); a7l = Vector512.FusedMultiplyAdd(b, wl, a7l); a7h = Vector512.FusedMultiplyAdd(b, wh, a7h);
-                    b = Vector512.Create(p8[5]); a8l = Vector512.FusedMultiplyAdd(b, wl, a8l); a8h = Vector512.FusedMultiplyAdd(b, wh, a8h);
-                    b = Vector512.Create(p9[5]); a9l = Vector512.FusedMultiplyAdd(b, wl, a9l); a9h = Vector512.FusedMultiplyAdd(b, wh, a9h);
-                    b = Vector512.Create(p10[5]); a10l = Vector512.FusedMultiplyAdd(b, wl, a10l); a10h = Vector512.FusedMultiplyAdd(b, wh, a10h);
-                    b = Vector512.Create(p11[5]); a11l = Vector512.FusedMultiplyAdd(b, wl, a11l); a11h = Vector512.FusedMultiplyAdd(b, wh, a11h);
                     wl = Vector512.Create(Vector256.Load(w + 48), Vector256.Load(w + blockStride + 48));
                     wh = Vector512.Create(Vector256.Load(w + stride2 + 48), Vector256.Load(w + stride3 + 48));
                     b = Vector512.Create(p0[6]); a0l = Vector512.FusedMultiplyAdd(b, wl, a0l); a0h = Vector512.FusedMultiplyAdd(b, wh, a0h);
@@ -1135,12 +1099,6 @@ internal static partial class DirectConvAvx2
                     b = Vector512.Create(p3[6]); a3l = Vector512.FusedMultiplyAdd(b, wl, a3l); a3h = Vector512.FusedMultiplyAdd(b, wh, a3h);
                     b = Vector512.Create(p4[6]); a4l = Vector512.FusedMultiplyAdd(b, wl, a4l); a4h = Vector512.FusedMultiplyAdd(b, wh, a4h);
                     b = Vector512.Create(p5[6]); a5l = Vector512.FusedMultiplyAdd(b, wl, a5l); a5h = Vector512.FusedMultiplyAdd(b, wh, a5h);
-                    b = Vector512.Create(p6[6]); a6l = Vector512.FusedMultiplyAdd(b, wl, a6l); a6h = Vector512.FusedMultiplyAdd(b, wh, a6h);
-                    b = Vector512.Create(p7[6]); a7l = Vector512.FusedMultiplyAdd(b, wl, a7l); a7h = Vector512.FusedMultiplyAdd(b, wh, a7h);
-                    b = Vector512.Create(p8[6]); a8l = Vector512.FusedMultiplyAdd(b, wl, a8l); a8h = Vector512.FusedMultiplyAdd(b, wh, a8h);
-                    b = Vector512.Create(p9[6]); a9l = Vector512.FusedMultiplyAdd(b, wl, a9l); a9h = Vector512.FusedMultiplyAdd(b, wh, a9h);
-                    b = Vector512.Create(p10[6]); a10l = Vector512.FusedMultiplyAdd(b, wl, a10l); a10h = Vector512.FusedMultiplyAdd(b, wh, a10h);
-                    b = Vector512.Create(p11[6]); a11l = Vector512.FusedMultiplyAdd(b, wl, a11l); a11h = Vector512.FusedMultiplyAdd(b, wh, a11h);
                     wl = Vector512.Create(Vector256.Load(w + 56), Vector256.Load(w + blockStride + 56));
                     wh = Vector512.Create(Vector256.Load(w + stride2 + 56), Vector256.Load(w + stride3 + 56));
                     b = Vector512.Create(p0[7]); a0l = Vector512.FusedMultiplyAdd(b, wl, a0l); a0h = Vector512.FusedMultiplyAdd(b, wh, a0h);
@@ -1149,12 +1107,6 @@ internal static partial class DirectConvAvx2
                     b = Vector512.Create(p3[7]); a3l = Vector512.FusedMultiplyAdd(b, wl, a3l); a3h = Vector512.FusedMultiplyAdd(b, wh, a3h);
                     b = Vector512.Create(p4[7]); a4l = Vector512.FusedMultiplyAdd(b, wl, a4l); a4h = Vector512.FusedMultiplyAdd(b, wh, a4h);
                     b = Vector512.Create(p5[7]); a5l = Vector512.FusedMultiplyAdd(b, wl, a5l); a5h = Vector512.FusedMultiplyAdd(b, wh, a5h);
-                    b = Vector512.Create(p6[7]); a6l = Vector512.FusedMultiplyAdd(b, wl, a6l); a6h = Vector512.FusedMultiplyAdd(b, wh, a6h);
-                    b = Vector512.Create(p7[7]); a7l = Vector512.FusedMultiplyAdd(b, wl, a7l); a7h = Vector512.FusedMultiplyAdd(b, wh, a7h);
-                    b = Vector512.Create(p8[7]); a8l = Vector512.FusedMultiplyAdd(b, wl, a8l); a8h = Vector512.FusedMultiplyAdd(b, wh, a8h);
-                    b = Vector512.Create(p9[7]); a9l = Vector512.FusedMultiplyAdd(b, wl, a9l); a9h = Vector512.FusedMultiplyAdd(b, wh, a9h);
-                    b = Vector512.Create(p10[7]); a10l = Vector512.FusedMultiplyAdd(b, wl, a10l); a10h = Vector512.FusedMultiplyAdd(b, wh, a10h);
-                    b = Vector512.Create(p11[7]); a11l = Vector512.FusedMultiplyAdd(b, wl, a11l); a11h = Vector512.FusedMultiplyAdd(b, wh, a11h);
                     w += Block * Block;
                 }
             }
@@ -1165,15 +1117,9 @@ internal static partial class DirectConvAvx2
         if (count > 3) { a3l.Store(slot + 96); a3h.Store(slot + 112); }
         if (count > 4) { a4l.Store(slot + 128); a4h.Store(slot + 144); }
         if (count > 5) { a5l.Store(slot + 160); a5h.Store(slot + 176); }
-        if (count > 6) { a6l.Store(slot + 192); a6h.Store(slot + 208); }
-        if (count > 7) { a7l.Store(slot + 224); a7h.Store(slot + 240); }
-        if (count > 8) { a8l.Store(slot + 256); a8h.Store(slot + 272); }
-        if (count > 9) { a9l.Store(slot + 288); a9h.Store(slot + 304); }
-        if (count > 10) { a10l.Store(slot + 320); a10h.Store(slot + 336); }
-        if (count > 11) { a11l.Store(slot + 352); a11h.Store(slot + 368); }
     }
 #else
-    private static unsafe void ForwardDozenRun512(float* px, int* origin, float* w, long blockStride, int blocks,
+    private static unsafe void ForwardSextetRun512(float* px, int* origin, float* w, long blockStride, int blocks,
         int firstBlockOffset, int planeIn, int kernelHeight, int kernelWidth, int rowStep, int colStep,
         float* slot, bool seeded, int count) => throw new PlatformNotSupportedException();
 #endif
@@ -1251,8 +1197,8 @@ internal static partial class DirectConvAvx2
     }
 #endif
     internal static readonly bool s_probeSix = Environment.GetEnvironmentVariable("AIDOTNET_PROBE_DC512_SIX") == "1";
-    /// <summary>Positions per <see cref="ForwardDozenRun512"/> call.</summary>
-    private const int Avx512Positions = 12;
+    /// <summary>Positions per <see cref="ForwardSextetRun512"/> call.</summary>
+    private const int Avx512Positions = 6;
 
     /// <summary>Whether <see cref="ForwardTileRuns"/> runs the AVX-512 kernel (switch for A/B and tests).</summary>
     internal static bool s_useAvx512 = Environment.GetEnvironmentVariable("AIDOTNET_DIRECT_CONV_AVX512") != "0";
