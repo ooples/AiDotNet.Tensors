@@ -2,6 +2,7 @@ using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Tests.Engines.DirectGpu;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.Gpu;
@@ -15,19 +16,26 @@ namespace AiDotNet.Tensors.Tests.Engines.Gpu;
 /// launcher (CudaBackend.Fp16Gelu) and confirms it (1) runs correctly on genuinely HALF buffers and
 /// (2) matches the FP32 GELU within FP16 tolerance — validating the rewrite path end-to-end on the GPU.
 /// </summary>
-public class Fp16NativeGeluPilotTests
+[Collection("DirectGpuSerial")]
+public class Fp16NativeGeluPilotTests : IClassFixture<DirectGpuTensorEngineTestFixture>
 {
+    // The test's own engine: the process-wide current engine is shared and other tests reset it to the CPU,
+    // so reading it made these tests skip on a CUDA machine depending on test order.
+    private readonly DirectGpuTensorEngineTestFixture _fixture;
+
+    public Fp16NativeGeluPilotTests(DirectGpuTensorEngineTestFixture fixture) => _fixture = fixture;
+
     [SkippableFact]
     public void Fp16NativeGelu_OnHalfBuffers_MatchesFp32Gelu()
     {
         Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver not available");
         // Use the engine's fully-initialized backend (kernel modules compiled), not a bare CudaBackend.
-        var eng = AiDotNetEngine.Current;
-        Skip.IfNot(eng is DirectGpuTensorEngine, "active engine is not the CUDA backend");
+        var eng = _fixture.Engine;
+        Skip.IfNot(eng is not null, "the DirectGpu engine did not initialize");
         // Warm up: a real GPU op forces the engine's kernel modules (incl. the FP16 module) to compile.
         var warm = new Tensor<float>(new float[] { 1, 2, 3, 4 }, new[] { 2, 2 });
-        _ = eng.TensorMatMul(warm, warm);
-        var b = ((DirectGpuTensorEngine)eng).TestBackend as CudaBackend;
+        _ = eng!.TensorMatMul(warm, warm);
+        var b = eng!.TestBackend as CudaBackend;
         Skip.IfNot(b is not null && b.IsAvailable, "CudaBackend not available");
         // The header-based FP16 module (cuda_fp16.h) is EXPECTED to fail on a driver-only box — that is
         // the bug this pilot exposes. The self-contained native kernels below must work regardless.

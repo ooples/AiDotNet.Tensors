@@ -257,6 +257,12 @@ public sealed partial class CudaBackend
     /// <summary>Tests: the verdict cache is unavailable (nothing loads, every record is refused).</summary>
     internal bool Fp16AccumulateCacheUnavailableForTests { get; set; }
 
+    /// <summary>
+    /// Tests: the cuBLAS-vs-kernel measurement's verdict, in place of timing it, so what follows a measured verdict
+    /// (recording it, deterministic mode) can be checked whichever route measures faster on the device.
+    /// </summary>
+    internal GemmRouteVerdict? Fp16AccumulateMeasurementForTests { get; set; }
+
     // Records a verdict (the kernel's genome when it routes) for this device and MMA rate; false when the cache refuses.
     private bool PersistFp16AccumulateRoute(Fp16AccumulateProblem problem, Fp16AccumulateRoute route,
         PtxTensorCoreGemmConfiguration? configuration)
@@ -386,7 +392,7 @@ public sealed partial class CudaBackend
         GemmRouteVerdict verdict;
         try
         {
-            verdict = ConfirmFp16AccumulateVerdict(() => PairedRounds(
+            verdict = Fp16AccumulateMeasurementForTests ?? ConfirmFp16AccumulateVerdict(() => PairedRounds(
                 () => { for (int i = 0; i < reps; i++) CublasFp16Accumulate(a, b, c, problem); },
                 () => { for (int i = 0; i < reps; i++) LaunchFp16Accumulate(kernel, a, b, c, problem); },
                 reps));

@@ -52,6 +52,19 @@ internal interface IStreamingDroppable
     /// encoding before a model enters training. Implemented on the closed generic owner so
     /// the non-generic registry can migrate mixed element types one tensor at a time.</summary>
     void PromoteStreamingStoreForTraining();
+
+    /// <summary>Copies device results still pending in this tensor's pinned offload buffer into its managed array, so
+    /// freeing the buffer cannot lose them. Call before the offload allocation is freed.</summary>
+    void PreserveOffloadedResults();
+
+    /// <summary>Forgets this tensor's offload allocation after the registry freed it, so nothing reads the freed
+    /// buffer: the managed array is the copy from then on.</summary>
+    void DetachOffload();
+
+    /// <summary>For a free that must go ahead although <see cref="PreserveOffloadedResults"/> could not copy the
+    /// device results back: marks the host copy released, so a later host read throws instead of returning values
+    /// older than the device's. Does nothing when no device results were pending.</summary>
+    void ReleaseUnpreservedOffloadResults();
 }
 
 /// <summary>What <see cref="IStreamingDroppable.TryWriteBackAndDropForStreaming"/> did.</summary>
@@ -1497,6 +1510,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
             // until they wire their own non-owning buffer types.
             if (allocator is Engines.DirectGpu.IGpuDevicePointerWrapper wrapper)
             {
+                UploadHostToOffload();
                 return wrapper.WrapDevicePointerAsBuffer(
                     OffloadDevicePointer, Length, ElementByteSize());
             }
@@ -1808,6 +1822,105 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         // Re-register deferred materializer so next CPU read downloads fresh GPU data
         if (_gpuMaterializerCallback is not null && _gpuMaterializerKey is not null)
             Helpers.HostSync.Register(_gpuMaterializerKey, _gpuMaterializerCallback);
+        else if (_gpuBuffer is null)
+            ArmOffloadDownload();
+    }
+
+    // A GpuPinned / GpuOffload / GpuManaged tensor keeps its managed array beside the pinned (device-mapped) buffer the
+    // kernels read and write through TryGetGpuBuffer. The two were never reconciled: a host write never reached the
+    // kernel, and a kernel's result never reached a host read, so an optimizer moment read back as its initial zeros and a
+    // loaded state was never seen by the device. The host array is the copy until a device write; from then the pinned
+    // buffer is, until a host read downloads it.
+    private bool _offloadDeviceAhead;
+
+    // Raw-byte mirroring needs the pinned buffer to hold this tensor's elements in their own layout: a whole, unsliced
+    // tensor registered in the native encoding (bf16 / int8 stores re-encode, and their byte count differs).
+    private bool OffloadMirrorsHostArray(out T[]? array)
+    {
+        array = null;
+        if (OffloadHostPointer == IntPtr.Zero || _storageOffset != 0 || !IsContiguous) return false;
+        if (OffloadByteCount != (long)Length * ElementByteSize()) return false;
+        array = GetBackingArrayForCacheLookupUnsafe();
+        return array is not null && array.Length == Length;
+    }
+
+    /// <inheritdoc/>
+    void IStreamingDroppable.DetachOffload()
+    {
+        OffloadHostPointer = IntPtr.Zero;
+        OffloadDevicePointer = IntPtr.Zero;
+        OffloadOpaqueHandle = null;
+        OffloadByteCount = 0;
+        OffloadRegistryHandle = -1;
+        Volatile.Write(ref _offloadDeviceAhead, false);
+    }
+
+    /// <inheritdoc/>
+    void IStreamingDroppable.PreserveOffloadedResults()
+    {
+        if (!Volatile.Read(ref _offloadDeviceAhead)) return;
+        if (OffloadMirrorsHostArray(out var array) && array is not null)
+        {
+            // The armed HostSync callback then finds the buffer gone and does nothing.
+            DownloadOffloadToHost(array);
+            return;
+        }
+
+        // A device write was armed against a layout this tensor no longer mirrors: nothing safe to copy back, and a
+        // host read would return values older than the device's. Fail that read instead of answering it stale.
+        throw new InvalidOperationException(
+            "A GPU-offloaded tensor holds device results that cannot be copied back to its host array, so freeing its " +
+            "offload buffer would lose them. Read the tensor before unregistering it.");
+    }
+
+    /// <inheritdoc/>
+    void IStreamingDroppable.ReleaseUnpreservedOffloadResults()
+    {
+        if (!Volatile.Read(ref _offloadDeviceAhead)) return;
+        // The same two keys a released step intermediate marks (see DirectGpuTensorEngine): host reads reach the
+        // data through either, and Release also drops the armed download so nothing reads the freed buffer.
+        if (GetBackingArrayForCacheLookupUnsafe() is { } array) Helpers.HostSync.Release(array, OffloadResultsLostMessage);
+        Helpers.HostSync.Release(_data, OffloadResultsLostMessage);
+        Volatile.Write(ref _offloadDeviceAhead, false);
+    }
+
+    internal const string OffloadResultsLostMessage =
+        "This GPU-offloaded tensor's device results were freed by WeightRegistry.Reset before they could be copied " +
+        "back to its host array, so its host values are stale. Read the tensor before resetting the registry.";
+
+    private unsafe void UploadHostToOffload()
+    {
+        if (Volatile.Read(ref _offloadDeviceAhead) || !OffloadMirrorsHostArray(out var array) || array is null) return;
+        Unsafe.CopyBlockUnaligned(
+            ref Unsafe.AsRef<byte>((void*)OffloadHostPointer),
+            ref Unsafe.As<T, byte>(ref array[0]),
+            checked((uint)OffloadByteCount));
+    }
+
+    private void ArmOffloadDownload()
+    {
+        if (!OffloadMirrorsHostArray(out var array) || array is null) return;
+        Volatile.Write(ref _offloadDeviceAhead, true);
+        var owner = new WeakReference<TensorBase<T>>(this);
+        Helpers.HostSync.Register(array, key =>
+        {
+            if (owner.TryGetTarget(out var tensor)) tensor.DownloadOffloadToHost((T[])key);
+        });
+    }
+
+    private unsafe void DownloadOffloadToHost(T[] array)
+    {
+        // The kernel that wrote the pinned buffer may still be running.
+        Synchronize();
+        if (OffloadHostPointer != IntPtr.Zero && array.Length == Length
+            && OffloadByteCount == (long)Length * ElementByteSize())
+        {
+            Unsafe.CopyBlockUnaligned(
+                ref Unsafe.As<T, byte>(ref array[0]),
+                ref Unsafe.AsRef<byte>((void*)OffloadHostPointer),
+                checked((uint)OffloadByteCount));
+        }
+        Volatile.Write(ref _offloadDeviceAhead, false);
     }
 
     /// <summary>

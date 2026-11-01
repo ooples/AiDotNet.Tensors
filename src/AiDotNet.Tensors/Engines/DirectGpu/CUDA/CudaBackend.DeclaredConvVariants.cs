@@ -171,8 +171,12 @@ public sealed partial class CudaBackend
     // Whether a schedule can lower a variant's shape class (the slot asks before it measures a candidate).
     internal bool DeclaredConvVariantAdmits(DeclaredConvVariant variant, in TunedShape shape,
         DeclaredConvSchedule schedule)
+        => DeclaredKernelsEnabled && DeclaredConvVariantLowers(variant, shape, schedule);
+
+    // Whether the schedule lowers the shape at all, on any device: the admission test without the release gate.
+    internal static bool DeclaredConvVariantLowers(DeclaredConvVariant variant, in TunedShape shape,
+        DeclaredConvSchedule schedule)
     {
-        if (!DeclaredKernelsEnabled) return false;
         if (ConvVariantEquivalent(variant, shape) is not { } e) return false;
         var spec = DeclaredConvSpec(e.Pass, e.Batch, e.InChannels, e.OutChannels, e.Height, e.Width, e.Kernel,
             e.Kernel, e.Stride, e.Stride, e.Pad, e.Pad, 1, 1, e.OutHeight, e.OutWidth, biasRelu: false, e.Groups);

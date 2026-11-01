@@ -14,41 +14,71 @@ namespace AiDotNet.Tensors.Tests.Helpers;
 public class GpuPinnedLifetimeTests
 {
     /// <summary>
-    /// End-to-end probe: runs an actual <c>GpuOptimizer.TrySgdStep</c> against a tiny
-    /// pinned-on-GPU tensor with a known input/expected-output pair, and reports whether
-    /// the host array reflects the kernel's writes. This is the contract the
-    /// <c>GpuOptimizer.Try*Step</c> tests assert; backends whose offload allocator can't
-    /// honor it (e.g. the current OpenCL allocator: separate AllocHGlobal hostBuf +
-    /// CL_MEM_ALLOC_HOST_PTR cl_mem with no map/unmap pair) cause the actual tests to
-    /// fail on stale host reads. Treat such hosts the same way as the no-GPU CI hosts —
-    /// skip cleanly. Probing through the same code path the tests use is the only
-    /// reliable detection: WeightRegistry.OffloadAllocator type-checking misses cases
-    /// where TryGetGpuBuffer returns a non-allocator-backed buffer.
+    /// Whether this backend hands the kernels a device view of a pinned tensor's host buffer: its offload allocator can
+    /// wrap the device pointer (<see cref="AiDotNet.Tensors.Engines.DirectGpu.IGpuDevicePointerWrapper"/>), and a
+    /// pinned tensor does get a GPU buffer. Backends without that (the OpenCL allocator keeps a separate host buffer and
+    /// cl_mem with no map/unmap pair) skip like the no-GPU hosts.
     /// </summary>
-    private static bool HasZeroCopyPinnedMapping()
+    /// <remarks>
+    /// A capability check only: it never runs a kernel or reads a result back, so a backend that has the mapping but
+    /// computes or mirrors wrongly fails the tests' own assertions instead of being skipped.
+    /// </remarks>
+    private static bool HasCoherentPinnedMapping()
     {
-        Tensor<float>? probeP = null, probeG = null;
+        if (WeightRegistry.OffloadAllocator is not AiDotNet.Tensors.Engines.DirectGpu.IGpuDevicePointerWrapper)
+            return false;
+        Tensor<float>? probe = null;
         try
         {
-            probeP = TensorAllocator.RentPinnedOnGpu<float>(new[] { 1 });
-            probeG = TensorAllocator.RentPinnedOnGpu<float>(new[] { 1 });
-            if (probeP.TryGetGpuBuffer() is null || probeG.TryGetGpuBuffer() is null)
-                return false;
-            // Closed-form SGD: p1 = p0 - lr * g = 10 - 1 * 2 = 8.
-            probeP.GetDataArray()[0] = 10.0f;
-            probeG.GetDataArray()[0] = 2.0f;
-            bool ran = AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TrySgdStep(probeP, probeG, learningRate: 1.0f);
-            if (!ran) return false;
-            return System.Math.Abs(probeP.GetDataArray()[0] - 8.0f) < 1e-4f;
-        }
-        catch
-        {
-            return false;
+            probe = TensorAllocator.RentPinnedOnGpu<float>(new[] { 1 });
+            return probe.TryGetGpuBuffer() is not null;
         }
         finally
         {
-            if (probeP is not null) WeightRegistry.UnregisterWeight(probeP);
-            if (probeG is not null) WeightRegistry.UnregisterWeight(probeG);
+            if (probe is not null) WeightRegistry.UnregisterWeight(probe);
+        }
+    }
+
+    [SkippableFact]
+    public void GpuPinned_HostWriteAfterADeviceStep_ReachesTheNextStep()
+    {
+        // The managed array and the pinned buffer the kernel updates are two copies. A kernel result has to reach the
+        // next host read, and a host write made after that read has to reach the next kernel: an optimizer state loaded
+        // into a moment tensor mid-training is exactly that write.
+        var priorEngine = AiDotNet.Tensors.Engines.AiDotNetEngine.Current;
+        var gpu = new AiDotNet.Tensors.Engines.DirectGpuTensorEngine();
+        AiDotNet.Tensors.Engines.AiDotNetEngine.Current = gpu;
+        try
+        {
+            Skip.If(gpu.GetBackend() is null, "DirectGpu backend is not available.");
+            Skip.If(!HasCoherentPinnedMapping(),
+                "The GPU pinned allocator cannot hand the kernels a device view of the host data on this backend.");
+            var p = TensorAllocator.RentPinnedOnGpu<float>(new[] { 2 });
+            var g = TensorAllocator.RentPinnedOnGpu<float>(new[] { 2 });
+            try
+            {
+                p.GetDataArray()[0] = 10f; p.GetDataArray()[1] = -4f;
+                g.GetDataArray()[0] = 2f; g.GetDataArray()[1] = 1f;
+                Assert.True(AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TrySgdStep(p, g, learningRate: 1f));
+                Assert.Equal(8f, p.GetDataArray()[0], 4);
+                Assert.Equal(-5f, p.GetDataArray()[1], 4);
+
+                p.GetDataArray()[0] = 20f;
+                g.GetDataArray()[1] = 3f;
+                Assert.True(AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TrySgdStep(p, g, learningRate: 1f));
+                Assert.Equal(18f, p.GetDataArray()[0], 4);
+                Assert.Equal(-8f, p.GetDataArray()[1], 4);
+            }
+            finally
+            {
+                WeightRegistry.UnregisterWeight(p);
+                WeightRegistry.UnregisterWeight(g);
+            }
+        }
+        finally
+        {
+            AiDotNet.Tensors.Engines.AiDotNetEngine.Current = priorEngine;
+            gpu.Dispose();
         }
     }
 
@@ -121,6 +151,34 @@ public class GpuPinnedLifetimeTests
         Assert.Null(t.TryGetGpuBuffer());
     }
 
+    /// <summary>
+    /// WeightRegistry.Reset frees every offload allocation even when the device results could not be copied back;
+    /// the tensor's host values must then fail to read rather than read as current.
+    /// </summary>
+    [Fact]
+    public void UnpreservedOffloadResults_MakeTheNextHostReadThrow()
+    {
+        var t = new Tensor<float>(new[] { 4 });
+        var deviceAhead = typeof(TensorBase<float>).GetField("_offloadDeviceAhead",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(deviceAhead);
+        deviceAhead.SetValue(t, true);
+
+        ((IStreamingDroppable)t).ReleaseUnpreservedOffloadResults();
+
+        var error = Assert.Throws<InvalidOperationException>(() => t.ToArray());
+        Assert.Equal(TensorBase<float>.OffloadResultsLostMessage, error.Message);
+    }
+
+    [Fact]
+    public void UnpreservedOffloadResults_WithNothingPending_LeaveTheTensorReadable()
+    {
+        var t = new Tensor<float>(new[] { 4 });
+        t[1] = 3f;
+        ((IStreamingDroppable)t).ReleaseUnpreservedOffloadResults();
+        Assert.Equal(3f, t.ToArray()[1]);
+    }
+
     [Fact]
     public void TryGetGpuBuffer_GpuPinnedTagWithoutPointer_ReturnsNull()
     {
@@ -173,8 +231,8 @@ public class GpuPinnedLifetimeTests
                 // do NOT provide zero-copy host↔device mapping — the optimizer kernel
                 // runs against a separate buffer the host never sees written. Skip
                 // in that case; this gate is independent of the no-GPU skip above.
-                Skip.If(!HasZeroCopyPinnedMapping(),
-                    "GPU pinned allocator does not expose a zero-copy host mapping on this backend.");
+                Skip.If(!HasCoherentPinnedMapping(),
+                    "The GPU pinned allocator cannot hand the kernels a device view of the host data on this backend.");
 
                 // Initialize values via flat-data span.
                 var pData = p.GetDataArray();
@@ -197,6 +255,8 @@ public class GpuPinnedLifetimeTests
                 // regression, not a host-capability skip. Fail loudly.
                 Assert.True(ran,
                     "GpuOptimizer.TryAdamStep returned false after GPU preconditions were met — kernel-dispatch regression.");
+                // The step wrote the pinned buffer; the host array sees it at the next host read.
+                pData = p.GetDataArray();
 
                 // Closed-form expected post-step values.
                 for (int i = 0; i < 4; i++)
@@ -324,8 +384,8 @@ public class GpuPinnedLifetimeTests
                 // do NOT provide zero-copy host↔device mapping — the optimizer kernel
                 // runs against a separate buffer the host never sees written. Skip
                 // in that case; this gate is independent of the no-GPU skip above.
-                Skip.If(!HasZeroCopyPinnedMapping(),
-                    "GPU pinned allocator does not expose a zero-copy host mapping on this backend.");
+                Skip.If(!HasCoherentPinnedMapping(),
+                    "The GPU pinned allocator cannot hand the kernels a device view of the host data on this backend.");
 
                 var pData = p.GetDataArray();
                 var gData = g.GetDataArray();
@@ -336,6 +396,8 @@ public class GpuPinnedLifetimeTests
                 bool ran = AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TrySgdStep(p, g, learningRate: lr);
                 Assert.True(ran,
                     "GpuOptimizer.TrySgdStep returned false after GPU preconditions were met — kernel-dispatch regression.");
+                // The step wrote the pinned buffer; the host array sees it at the next host read.
+                pData = p.GetDataArray();
 
                 for (int i = 0; i < 4; i++)
                 {
@@ -383,8 +445,8 @@ public class GpuPinnedLifetimeTests
                 // do NOT provide zero-copy host↔device mapping — the optimizer kernel
                 // runs against a separate buffer the host never sees written. Skip
                 // in that case; this gate is independent of the no-GPU skip above.
-                Skip.If(!HasZeroCopyPinnedMapping(),
-                    "GPU pinned allocator does not expose a zero-copy host mapping on this backend.");
+                Skip.If(!HasCoherentPinnedMapping(),
+                    "The GPU pinned allocator cannot hand the kernels a device view of the host data on this backend.");
 
                 var pData = p.GetDataArray();
                 var initial = new float[] { 1.0f, 2.0f, 3.0f, 4.0f };
@@ -397,6 +459,8 @@ public class GpuPinnedLifetimeTests
                     epsilon: 1e-8f, weightDecay: 0.01f, step: 1);
                 Assert.True(ran,
                     "GpuOptimizer.TryAdamWStep returned false after GPU preconditions were met — kernel-dispatch regression.");
+                // The step wrote the pinned buffer; the host array sees it at the next host read.
+                pData = p.GetDataArray();
 
                 // AdamW's decoupled weight decay updates `p -= lr * wd * p`
                 // BEFORE the Adam moment update. With grad=0, the only thing

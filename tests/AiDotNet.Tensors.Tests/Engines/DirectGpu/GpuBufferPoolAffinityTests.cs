@@ -5,6 +5,17 @@ using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
+/// <summary>Serializes the pool tests against kernel tuning elsewhere in the process.</summary>
+[CollectionDefinition(Name, DisableParallelization = true)]
+public sealed class GpuBufferPoolSerialCollection
+{
+    public const string Name = "GpuBufferPoolSerial";
+}
+
+// A pool drains everything it holds on the first rent after any kernel-tuning measurement in the process
+// (TunedKernelRegistry.MeasurementGeneration). GPU tests tuning in parallel therefore emptied these pools between a
+// Return and the TryRent that expects it back (measured on the CUDA lane), so they run alone.
+[Collection(GpuBufferPoolSerialCollection.Name)]
 public sealed class GpuBufferPoolAffinityTests
 {
     [Fact]
@@ -20,6 +31,21 @@ public sealed class GpuBufferPoolAffinityTests
         Assert.False(pool.TryRent(64, queueB, out _));
         Assert.True(pool.TryRent(64, queueA, out var rented));
         Assert.Same(buffer, rented);
+    }
+
+    // A pool created after kernel tuning ran holds nothing tuning parked, so its first rent must not drain it.
+    [Fact]
+    public void Rent_AfterEarlierTuning_KeepsWhatWasJustReturned()
+    {
+        AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelRegistry.NoteMeasurement();
+        using var pool = new GpuBufferPool<FakeBuffer>(maxPerSize: 4, maxSize: 1024);
+        var buffer = new FakeBuffer(64);
+
+        pool.Return(buffer);
+
+        Assert.True(pool.TryRent(64, out var rented));
+        Assert.Same(buffer, rented);
+        Assert.Equal(0, buffer.ReleaseCount);
     }
 
     [Fact]

@@ -78,7 +78,7 @@ jobs:
           # Model scale (#1569): ResNet-18 inference at batch 1 and 128 against the CPU (a batch-derived launch dimension
           # past a device limit only appears at model scale), warm training steps of five networks with no host crossing,
           # and the fused GRU, folded conv batch norm and TensorScope on a real OpenCL device.
-          - { name: model-smoke, filter: "FullyQualifiedName~ModelInferenceSmokeTests|FullyQualifiedName~NetworkTrainingStepResidencyTests|FullyQualifiedName~GruSequenceTests|FullyQualifiedName~GruSequenceBackendParityTests.OpenCl|FullyQualifiedName~FusedConv2DBatchNormTests|FullyQualifiedName~TensorScopeTests" }
+          - { name: model-smoke, filter: "FullyQualifiedName~ModelInferenceSmokeTests|FullyQualifiedName~NetworkTrainingStepResidencyTests|FullyQualifiedName~GruSequenceTests|FullyQualifiedName~GruSequenceBackendParityTests.OpenCl|FullyQualifiedName~FusedConv2DBatchNormTests|FullyQualifiedName~TensorScopeTests|FullyQualifiedName~ShortAttentionForwardTests" }
           - { name: op-forward-1, filter: "FullyQualifiedName~Engines.OpParity.OpParityTests", shard: "1/6" }
           - { name: op-forward-2, filter: "FullyQualifiedName~Engines.OpParity.OpParityTests", shard: "2/6" }
           - { name: op-forward-3, filter: "FullyQualifiedName~Engines.OpParity.OpParityTests", shard: "3/6" }

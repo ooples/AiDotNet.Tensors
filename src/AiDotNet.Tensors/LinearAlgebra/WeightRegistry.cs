@@ -482,6 +482,8 @@ public static partial class WeightRegistry
                     weight.OffloadRegistryHandle,
                     out OffloadRegistration? registration))
             {
+                // Device results not yet read back live only in the pinned buffer about to be freed.
+                ((IStreamingDroppable)weight).PreserveOffloadedResults();
                 registration.Allocator.Free(registration.Handle);
                 _offloadRegistrations.Remove(weight.OffloadRegistryHandle);
                 weight.OffloadRegistryHandle = -1;
@@ -492,6 +494,7 @@ public static partial class WeightRegistry
                 // Compatibility for tensors registered by an older assembly before allocator
                 // ownership records existed. New registrations always take the branch above.
                 IGpuOffloadAllocator? allocator = _offloadAllocator;
+                ((IStreamingDroppable)weight).PreserveOffloadedResults();
                 if (allocator is not null)
                     allocator.Free(CreateOffloadHandle(weight));
                 weight.OffloadRegistryHandle = -1;
@@ -2213,11 +2216,35 @@ public static partial class WeightRegistry
         {
             foreach (OffloadRegistration registration in _offloadRegistrations.Values)
             {
+                // A live owner keeps its values: pending device results come back to its array, and it forgets the
+                // buffer so no later read touches freed memory.
+                bool live = registration.Owner.TryGetTarget(out IStreamingDroppable? owner);
+                if (live && owner is not null)
+                {
+                    // Reset frees every allocation regardless, so results that cannot be copied back are marked lost
+                    // rather than left to read as current: a later host read of that tensor throws. Any other failure
+                    // (a device sync error) still marks them before it propagates.
+                    bool preserved = false;
+                    try
+                    {
+                        owner.PreserveOffloadedResults();
+                        preserved = true;
+                    }
+                    catch (InvalidOperationException error)
+                    {
+                        TraceOffloadCleanupFailure(error);
+                    }
+                    finally
+                    {
+                        if (!preserved) owner.ReleaseUnpreservedOffloadResults();
+                    }
+                }
                 try { registration.Allocator.Free(registration.Handle); }
                 catch (Exception error)
                 {
                     TraceOffloadCleanupFailure(error);
                 }
+                if (live && owner is not null) owner.DetachOffload();
             }
             _offloadRegistrations.Clear();
             _nextOffloadRegistrationHandle = 0;
