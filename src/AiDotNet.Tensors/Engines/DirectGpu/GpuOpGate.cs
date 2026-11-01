@@ -83,7 +83,7 @@ internal sealed class GpuOpGate
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Lease Enter()
     {
-        var counter = ReferenceEquals(t_lastGate, this) ? t_lastCounter! : CounterForThisThread();
+        var counter = ReferenceEquals(t_lastGate, this) ? t_lastCounter! : CounterForThisThread(this);
         // Full fence: the increment is visible before the state is read, the order the drain relies on.
         Interlocked.Increment(ref counter.Depth);
         if (Volatile.Read(ref _state) != Open)
@@ -94,11 +94,12 @@ internal sealed class GpuOpGate
         return new Lease(counter);
     }
 
+    // Static: it fills the thread's one-entry cache, which is per thread rather than per gate.
     [MethodImpl(MethodImplOptions.NoInlining)]
-    private Counter CounterForThisThread()
+    private static Counter CounterForThisThread(GpuOpGate gate)
     {
-        var counter = _counters.Value!;
-        t_lastGate = this;
+        var counter = gate._counters.Value!;
+        t_lastGate = gate;
         t_lastCounter = counter;
         return counter;
     }

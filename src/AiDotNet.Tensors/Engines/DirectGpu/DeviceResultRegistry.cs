@@ -56,7 +56,7 @@ internal sealed class DeviceResultRegistry
     /// <summary>Records <paramref name="storage"/>, whose device copy was just bound on <paramref name="backend"/>.</summary>
     public void Add(IDeviceResultStorage storage, IDirectGpuBackend backend)
     {
-        var shard = ReferenceEquals(t_lastRegistry, this) ? t_lastShard! : ShardForThisThread();
+        var shard = ReferenceEquals(t_lastRegistry, this) ? t_lastShard! : ShardForThisThread(this);
         lock (shard)
         {
             if (shard.Count == shard.CompactAt) Compact(shard);
@@ -71,10 +71,11 @@ internal sealed class DeviceResultRegistry
         }
     }
 
-    private Shard ShardForThisThread()
+    // Static: it fills the thread's one-entry cache, which is per thread rather than per registry.
+    private static Shard ShardForThisThread(DeviceResultRegistry registry)
     {
-        var shard = _shards.Value!;
-        t_lastRegistry = this;
+        var shard = registry._shards.Value!;
+        t_lastRegistry = registry;
         t_lastShard = shard;
         return shard;
     }

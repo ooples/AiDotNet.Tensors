@@ -426,7 +426,11 @@ public static class AiDotNetEngine
         if (parked is not null && !_gpuCircuitBroken)
         {
             try { parked.ReleaseUnusedDeviceMemory(); }
-            catch (Exception ex) { EmitLog($"[AiDotNet] Releasing unused GPU memory on reset failed: {ex.Message}", verbose: true); }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                // Best effort: memory not freed here is freed with the engine, so a native failure only costs the trim.
+                EmitLog($"[AiDotNet] Releasing unused GPU memory on reset failed: {ex.Message}", verbose: true);
+            }
         }
     }
 

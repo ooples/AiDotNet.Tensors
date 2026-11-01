@@ -27,7 +27,7 @@ public sealed partial class CudaBackend : IDeviceMemoryPressure
             SynchronizeOwnStreams("stream sync (release cached device memory)");
             using (PushContext())
             {
-                var status = CuBlasNative.cuMemPoolTrimTo(_asyncMemPool, 0);
+                var status = CuBlasNative.cuMemPoolTrimTo(_asyncMemPool, 0); // lgtm[cs/call-to-unmanaged-code] CUDA memory pools have no managed API.
                 if (status != CudaResult.Success)
                     System.Diagnostics.Trace.TraceWarning(
                         $"[CudaBackend] cuMemPoolTrimTo failed while releasing cached device memory: {status}.");
