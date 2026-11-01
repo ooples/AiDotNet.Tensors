@@ -375,6 +375,13 @@ jobs:
         dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-build --framework net10.0 \
           --filter "FullyQualifiedName~MachineCodeKernelTests|FullyQualifiedName~MachineKernelGemmTests|FullyQualifiedName~MicrokernelCorrectnessTests|FullyQualifiedName~Avx512"
 
+    - name: Verify deterministic streaming with default and AVX-512 opt-in dispatch
+      run: |
+        for enabled in 0 1; do
+          AIDOTNET_AVX512_STREAMING=$enabled dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-build --framework net10.0 \
+            --filter "FullyQualifiedName~DeterministicParallelGemmContractTests"
+        done
+
     # Sub-S (#409) S.4: VERIFY the AVX-512 microkernels under Intel SDE emulation.
     # SDE emulates AVX-512 on ANY x86-64 host (incl. the AMD ubuntu-latest runner), and
     # on Linux .NET's Avx512F.IsSupported is satisfied under it — so this checks the
