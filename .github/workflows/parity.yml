@@ -17,6 +17,11 @@ on:
   schedule:
     - cron: '0 7 * * *'
   workflow_dispatch:
+    inputs:
+      isa_ab:
+        description: 'Skip the full parity run; time the CPU networks and the per-op breakdown with AVX-512 on and off'
+        type: boolean
+        default: false
 
 concurrency:
   group: parity-${{ github.ref }}-${{ github.event_name }}
@@ -157,6 +162,7 @@ jobs:
           dotnet build tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-restore --framework net10.0
 
       - name: Distance to parity
+        if: ${{ !inputs.isa_ab }}
         run: |
           dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-build --framework net10.0 \
             --filter "Category=PyTorchParity" --logger "console;verbosity=detailed" | tee "$RUNNER_TEMP/parity.log"
@@ -177,10 +183,38 @@ jobs:
           python tools/parity/cpu_op_breakdown_torch.py > "$RUNNER_TEMP/ops-torch.log"
           python tools/parity/join_op_breakdown.py "$RUNNER_TEMP/ops-tensors.log" "$RUNNER_TEMP/ops-torch.log" | tee "$RUNNER_TEMP/ops.txt"
 
+      - name: ISA A/B (AVX-512 on, then off through DOTNET_EnableAVX512F=0)
+        # Which losses come from this library's AVX-512 dispatch: the same networks and operations with the runtime's
+        # AVX-512 support hidden (Vector512 and Avx512F report unsupported), against the same PyTorch.
+        if: ${{ inputs.isa_ab }}
+        continue-on-error: true
+        env:
+          AIDOTNET_OP_BREAKDOWN: '1'
+        run: |
+          python tools/parity/cpu_op_breakdown_torch.py > "$RUNNER_TEMP/ops-torch.log"
+          for mode in on off; do
+            if [ "$mode" = off ]; then export DOTNET_EnableAVX512F=0; fi
+            dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-build --framework net10.0 \
+              --filter "FullyQualifiedName~Mlp_Cpu_IsAsFastAsPyTorch|FullyQualifiedName~Cnn_Cpu_IsAsFastAsPyTorch|FullyQualifiedName~Resnet18_Cpu_IsAsFastAsPyTorch" \
+              --logger "console;verbosity=detailed" > "$RUNNER_TEMP/isa-$mode.log" || true
+            dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-build --framework net10.0 \
+              --filter "FullyQualifiedName~CpuOpBreakdownBench" --logger "console;verbosity=detailed" \
+              | grep OPBREAKDOWN | sed 's/^\s*//' > "$RUNNER_TEMP/ops-tensors-$mode.log"
+            python tools/parity/join_op_breakdown.py "$RUNNER_TEMP/ops-tensors-$mode.log" "$RUNNER_TEMP/ops-torch.log" > "$RUNNER_TEMP/ops-$mode.txt"
+            {
+              echo "## AVX-512 $mode"
+              echo '```'
+              grep -E 'PyTorch [0-9]|takes [0-9.]+x|step ratio|Slowest phase' "$RUNNER_TEMP/isa-$mode.log" | sed 's/^\s*\[xUnit[^]]*\]\s*//' | cut -c1-400 | head -40 || true
+              cat "$RUNNER_TEMP/ops-$mode.txt"
+              echo '```'
+            } | tee -a "$RUNNER_TEMP/isa.md"
+          done
+
       - name: Summary
         if: always()
         run: |
           {
+            if [ -f "$RUNNER_TEMP/isa.md" ]; then cat "$RUNNER_TEMP/cpu.txt" "$RUNNER_TEMP/isa.md"; fi
             echo '## Distance to PyTorch parity'
             echo '```'
             grep -E 'Tensors is missing|^\s+[a-zA-Z.]+ \([0-9]+\):|PyTorch [0-9]|mapped |takes [0-9.]+x|step ratio|Slowest phase' "$RUNNER_TEMP/parity.log" | sed 's/^\s*\[xUnit[^]]*\]\s*//' | cut -c1-400 | head -80 || true
