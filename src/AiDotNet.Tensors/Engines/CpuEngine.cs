@@ -17186,7 +17186,7 @@ public partial class CpuEngine : ITensorLevelEngine
             && input.IsContiguous && gradOutput.IsContiguous && kernelShape[1] == inChannels
             && gradOutput._shape[0] == batch && gradOutput._shape[1] == outChannels
             && outputHeight == height && outputWidth == width
-            && Simd.WinogradF43.Applies(batch, inChannels, outChannels, height, width, kernelHeight, kernelWidth,
+            && Simd.WinogradF43.AppliesToWeightGradient(batch, inChannels, outChannels, height, width, kernelHeight, kernelWidth,
                 strideH, strideW, padH, padW, dilationH, dilationW))
         {
             var xArrW = input.GetCpuBackingForStridedRead(out int xOffW) as float[];
@@ -17654,7 +17654,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             // 3x3 stride-1 padding-1: the Winograd F(4x4, 3x3) weight gradient (the forward's adjoint).
             if (input.Layout == LinearAlgebra.TensorLayout.Nchw
-                && Simd.WinogradF43.Applies(batch, inChannels, outChannels, height, width, kernelHeight, kernelWidth,
+                && Simd.WinogradF43.AppliesToWeightGradient(batch, inChannels, outChannels, height, width, kernelHeight, kernelWidth,
                     strideH, strideW, padH, padW, dilationH, dilationW))
             {
                 var xArrW = input.GetCpuBackingForStridedRead(out int xOffW) as float[];

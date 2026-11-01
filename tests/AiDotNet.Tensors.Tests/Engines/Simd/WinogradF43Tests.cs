@@ -138,7 +138,7 @@ public class WinogradF43Tests
     public void Engine_WeightGradient_TakesTheKernel_AndAgreesWithTheDirectRoute()
     {
         if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported) return;
-        const int n = 8, c = 64, k = 72, h = 16, w = 16;
+        const int n = 8, c = 128, k = 136, h = 16, w = 16;
         var rng = new Random(78);
         var x = new Tensor<float>(Fill(rng, n * c * h * w), new[] { n, c, h, w });
         var dy = new Tensor<float>(Fill(rng, n * k * h * w), new[] { n, k, h, w });
@@ -181,6 +181,10 @@ public class WinogradF43Tests
         Assert.False(WinogradF43.Applies(8, 64, 64, 4, 4, 3, 3, 1, 1, 1, 1, 1, 1));     // 4x4 plane
         Assert.False(WinogradF43.Applies(1, 64, 64, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));     // 4 patches
         Assert.False(WinogradF43.Applies(8, 64, 64, 32, 32, 5, 5, 1, 1, 2, 2, 1, 1));   // 5x5
+        // The weight gradient wants wider layers (C K >= 64 (C + K)).
+        Assert.True(WinogradF43.AppliesToWeightGradient(8, 128, 128, 16, 16, 3, 3, 1, 1, 1, 1, 1, 1));
+        Assert.False(WinogradF43.AppliesToWeightGradient(8, 64, 64, 32, 32, 3, 3, 1, 1, 1, 1, 1, 1));
+        Assert.False(WinogradF43.AppliesToWeightGradient(8, 64, 128, 32, 32, 3, 3, 1, 1, 1, 1, 1, 1));
     }
 
     [Fact]
