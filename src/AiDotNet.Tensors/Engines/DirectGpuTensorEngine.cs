@@ -7361,6 +7361,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <summary>As <see cref="TryReLU6InPlace{T}"/>, for ReLU.</summary>
     internal bool TryReLUInPlace<T>(Tensor<T> tensor) => TryResidentActivationInPlace(tensor, capAtSix: false);
 
+    /// <summary>
+    /// Adds the rank-1 channel bias to a device-resident [N, C, ...] tensor in place (<c>x += bias[c]</c>, the one add
+    /// <see cref="TensorChannelBiasAdd{T}"/> computes). Returns false, changing nothing, when the tensor is not resident.
+    /// </summary>
+    internal bool TryChannelBiasAddInPlace<T>(Tensor<T> tensor, Tensor<T> bias)
+    {
+        if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled || tensor.Rank < 2 || tensor.Length == 0
+            || !tensor.IsContiguous || IsPartialView(tensor) || bias.Rank != 1 || bias.Length != tensor._shape[1]
+            || !TryGetBackend(out var backend))
+            return false;
+        if (ResolveResidentBufferNoUpload(backend, tensor, tensor.Length, includePersistentWeightCache: false) is not { } resident
+            || resident.Handle == IntPtr.Zero || resident.Size < tensor.Length)
+            return false;
+        int batch = tensor._shape[0], channels = tensor._shape[1];
+        using var biasBuffer = GetWeightBufferPreferResident(backend, bias, PersistentTensorRole.Biases);
+        backend.Conv2DBiasAdd(resident, biasBuffer.Buffer, batch, channels, tensor.Length / (batch * channels));
+        tensor.IncrementVersion();
+        BindResidentBuffer(tensor, resident, backend);
+        return true;
+    }
+
     private bool TryResidentActivationInPlace<T>(Tensor<T> tensor, bool capAtSix)
     {
         if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled || !tensor.IsContiguous || IsPartialView(tensor)

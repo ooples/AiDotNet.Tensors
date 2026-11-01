@@ -39,6 +39,7 @@ internal static class FusionPatternRegistry
         Register(new BatchNormReluFusionPattern());
         Register(new BatchNormRelu6FusionPattern());
         Register(new ConvBiasFusionPattern());
+        Register(new DepthwiseConvBiasFusionPattern());
         Register(new MultiHeadAttentionPackedFusionPattern());
         Register(new LinearMseLossFusionPattern());
         Register(new MseLossFusionPattern());

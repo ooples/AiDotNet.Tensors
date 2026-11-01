@@ -6092,6 +6092,19 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[1], kernelGrad, engine);
     }
 
+    /// <summary>
+    /// Backward of a depthwise convolution with its channel bias added (inputs: x, kernel, bias): the bias gradient as
+    /// <see cref="ChannelBiasAddBackward"/> reduces it, then <see cref="DepthwiseConv2DBackward"/> on the same gradient.
+    /// </summary>
+    internal static void DepthwiseConv2DBiasBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        if (DifferentiableOps.IsGradientRequired(inputs[2]))
+            DifferentiableOps.AccumulateGrad(grads, inputs[2], engine.ReduceSum(gradOutput, new[] { 0, 2, 3 }), engine);
+        DepthwiseConv2DBackward(gradOutput, new[] { inputs[0], inputs[1] }, output, savedState, engine, grads);
+    }
+
     /// <summary>ConvTranspose3D backward via engine backward helpers</summary>
     internal static void ConvTranspose3DBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
