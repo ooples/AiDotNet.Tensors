@@ -97,8 +97,6 @@ internal static partial class SimdGemm
                     int stripStart = cs * stripCap;
                     int stripEnd = Math.Min(nCap, stripStart + stripCap);
 #if NET9_0_OR_GREATER
-                    float* pBStrip = pB + stripStart;
-                    int ldbStrip = ldbCap;
                     if (stripBuffer is not null && stripEnd - stripStart == Nr512)
                     {
                         fixed (float* ps = stripBuffer)
