@@ -15,7 +15,8 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// The members that used to be compositions of other backend members (TENS0008), each against a host reference: AddRelu,
 /// AddSigmoid and AddGelu; Fma with its output aliasing the addend -- the in-place accumulate the old
 /// Multiply-into-D-then-Add composition got wrong (2AB instead of AB + C); the split-complex element-wise family; the
-/// batched dot product; and the CSR SpMM with bias. Runs on every backend this
+/// batched dot product; the CSR SpMM with bias; the base-2/base-10 exponentials and logarithms, expm1 and log1p; the
+/// MSE and cross-entropy gradients; and the softplus gradient written over its incoming gradient. Runs on every backend this
 /// machine has; each one absent is skipped by name.
 /// </summary>
 public abstract class FusedElementwiseBackendTestsBase
@@ -177,6 +178,128 @@ public abstract class FusedElementwiseBackendTestsBase
                 for (int e = rowPointers[row]; e < rowPointers[row + 1]; e++) expected += (double)values[e] * dense[columns[e] * n + col];
                 AssertClose(expected, c[row * n + col], row * n + col, "CsrSpMMBias");
             }
+    }
+
+    [SkippableFact]
+    public void ExponentialsAndLogarithms_EqualTheReference()
+    {
+        using var lease = Create(_name, out var backend);
+        Skip.If(backend is null, _name + " is not available on this machine.");
+        var x = Values(13);                                // [-4, 4): exponentials
+        var positive = new float[Length];                  // (0, 8]: logarithms
+        var small = new float[Length];                     // |x| < 1e-4: where expm1 and log1p differ from exp - 1, log(1 + x)
+        for (int i = 0; i < Length; i++)
+        {
+            positive[i] = Math.Abs(x[i]) * 2 + 1e-3f;
+            small[i] = x[i] * 2.5e-5f;
+        }
+        using var bufX = backend.AllocateBuffer(x);
+        using var bufPositive = backend.AllocateBuffer(positive);
+        using var bufSmall = backend.AllocateBuffer(small);
+        using var output = backend.AllocateBuffer(Length);
+
+        void Check(string op, Action run, float[] input, Func<double, double> reference, double relative)
+        {
+            run();
+            var y = backend.DownloadBuffer(output);
+            for (int i = 0; i < Length; i++)
+            {
+                double expected = reference(input[i]);
+                Assert.True(Math.Abs(expected - y[i]) <= 1e-30 + relative * Math.Abs(expected),
+                    $"{op}[{i}]({input[i]:R}): expected {expected:R}, got {y[i]:R}");
+            }
+        }
+
+        Check("Exp2", () => backend.Exp2(bufX, output, Length), x, v => Math.Pow(2, v), 1e-5);
+        Check("Exp10", () => backend.Exp10(bufX, output, Length), x, v => Math.Pow(10, v), 1e-5);
+        Check("ExpM1", () => backend.ExpM1(bufX, output, Length), x, v => Math.Exp(v) - 1, 1e-5);
+        Check("Log2", () => backend.Log2(bufPositive, output, Length), positive, v => Math.Log(v, 2), 1e-5);
+        Check("Log10", () => backend.Log10(bufPositive, output, Length), positive, v => Math.Log10(v), 1e-5);
+        Check("Log1P", () => backend.Log1P(bufPositive, output, Length), positive, v => Math.Log(1 + v), 1e-5);
+        // Near zero the answer is about x itself; exp(x) - 1 or log(1 + x) in float keeps only a few digits of it.
+        Check("ExpM1(small)", () => backend.ExpM1(bufSmall, output, Length), small, v => v + v * v / 2, 1e-4);
+        Check("Log1P(small)", () => backend.Log1P(bufSmall, output, Length), small, v => v - v * v / 2, 1e-4);
+    }
+
+    [SkippableFact]
+    public void LossGradients_EqualTheReference()
+    {
+        using var lease = Create(_name, out var backend);
+        Skip.If(backend is null, _name + " is not available on this machine.");
+        const int batch = 7, classes = 11, n = batch * classes;
+        var predictions = Values(14, n);
+        var targets = Values(15, n);
+        using var bufP = backend.AllocateBuffer(predictions);
+        using var bufT = backend.AllocateBuffer(targets);
+        using var grad = backend.AllocateBuffer(n);
+
+        backend.MseBackward(bufP, bufT, grad, n);
+        var mse = backend.DownloadBuffer(grad);
+        for (int i = 0; i < n; i++) AssertClose(2.0 * (predictions[i] - targets[i]) / n, mse[i], i, "MseBackward");
+
+        backend.CrossEntropyBackward(bufP, bufT, grad, batch, classes);
+        var ce = backend.DownloadBuffer(grad);
+        // Logits and dense targets (the contract CUDA, OpenCL and CpuEngine share): (softmax(row) - target) / batch.
+        for (int b = 0; b < batch; b++)
+        {
+            double max = double.NegativeInfinity, sum = 0;
+            for (int c = 0; c < classes; c++) max = Math.Max(max, predictions[b * classes + c]);
+            for (int c = 0; c < classes; c++) sum += Math.Exp(predictions[b * classes + c] - max);
+            for (int c = 0; c < classes; c++)
+            {
+                int i = b * classes + c;
+                AssertClose((Math.Exp(predictions[i] - max) / sum - targets[i]) / batch, ce[i], i, "CrossEntropyBackward");
+            }
+        }
+    }
+
+    [SkippableFact]
+    public void CrossEntropyLoss_IsTheMeanNegativeLogSoftmaxOfTheTargets()
+    {
+        using var lease = Create(_name, out var backend);
+        Skip.If(backend is null, _name + " is not available on this machine.");
+        const int batch = 7, classes = 11, n = batch * classes;
+        var logits = Values(18, n);
+        var targets = new float[n];   // dense, soft rows summing to 1
+        var rng = RandomHelper.CreateSeededRandom(1657);
+        for (int b = 0; b < batch; b++)
+        {
+            double rowSum = 0;
+            for (int c = 0; c < classes; c++) rowSum += targets[b * classes + c] = (float)rng.NextDouble();
+            for (int c = 0; c < classes; c++) targets[b * classes + c] = (float)(targets[b * classes + c] / rowSum);
+        }
+        using var bufLogits = backend.AllocateBuffer(logits);
+        using var bufTargets = backend.AllocateBuffer(targets);
+
+        float loss = backend.CrossEntropyLoss(bufLogits, bufTargets, batch, classes);
+
+        double expected = 0;
+        for (int b = 0; b < batch; b++)
+        {
+            double max = double.NegativeInfinity, sum = 0;
+            for (int c = 0; c < classes; c++) max = Math.Max(max, logits[b * classes + c]);
+            for (int c = 0; c < classes; c++) sum += Math.Exp(logits[b * classes + c] - max);
+            double logSum = max + Math.Log(sum);
+            for (int c = 0; c < classes; c++) expected -= targets[b * classes + c] * (logits[b * classes + c] - logSum);
+        }
+        expected /= batch;
+        AssertClose(expected, loss, 0, "CrossEntropyLoss");
+    }
+    [SkippableFact]
+    public void SoftplusBackward_IntoItsIncomingGradient_IsTheGradientTimesTheSigmoid()
+    {
+        using var lease = Create(_name, out var backend);
+        Skip.If(backend is null, _name + " is not available on this machine.");
+        var gradient = Values(16);
+        var input = Values(17);
+        for (int i = 0; i < Length; i++) input[i] *= 5;   // [-20, 20): both branches of the stable sigmoid
+        using var bufGrad = backend.AllocateBuffer(gradient);
+        using var bufInput = backend.AllocateBuffer(input);
+
+        backend.SoftplusBackward(bufGrad, bufInput, bufGrad, Length);   // the result overwrites its own input gradient
+
+        var result = backend.DownloadBuffer(bufGrad);
+        for (int i = 0; i < Length; i++) AssertClose(gradient[i] / (1 + Math.Exp(-input[i])), result[i], i, "SoftplusBackward");
     }
 
     // The backend, or null when unavailable; the returned disposable disposes a backend the test created.
