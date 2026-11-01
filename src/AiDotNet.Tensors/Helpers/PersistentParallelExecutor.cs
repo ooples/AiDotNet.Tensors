@@ -310,6 +310,19 @@ internal sealed class PersistentParallelExecutor
 
     private static readonly int s_hardwareThreads = Environment.ProcessorCount;
 
+    // Whether a team that fills the machine exactly (the caller plus every worker, one per hardware thread) still keeps
+    // its workers warm between dispatches. Every participant is then this pool's own thread on its own hardware thread,
+    // so a spinning worker takes no core from the dispatcher; parking instead put an OS wake-up (tens of microseconds,
+    // more in a VM) on every parallel region. On the 4-vCPU CI runner, where the default team is the whole machine, a
+    // 1x1 convolution took 0.30-0.46 ms at 4 threads against 0.18 ms at 3 (whose team left a thread free and so stayed
+    // warm). The spin keeps its periodic yield for other runnable threads. AIDOTNET_PPE_WARM_FULL_WIDTH=0 restores parking.
+    private static readonly bool s_warmAtFullWidth =
+        Environment.GetEnvironmentVariable("AIDOTNET_PPE_WARM_FULL_WIDTH") != "0";
+
+    // Whether a dispatch team of lastWorkers workers plus the dispatching thread may warm-spin (see s_warmAtFullWidth).
+    private static bool TeamLeavesWarmRoom(int lastWorkers)
+        => s_warmAtFullWidth ? lastWorkers + 1 <= s_hardwareThreads : lastWorkers + 1 < s_hardwareThreads;
+
 #if NET5_0_OR_GREATER
     private static readonly Lazy<(ushort Group, byte Number)[]> s_workerCores =
         new(AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.UsableCoresInCurrentGroup);
@@ -681,7 +694,7 @@ internal sealed class PersistentParallelExecutor
             // Only a slot the last dispatch actually used keeps warm: dispatches of a hot loop wake the same
             // first slots, and a slot outside them would spin for a wake-up that is not coming.
             int lastWorkers = System.Threading.Volatile.Read(ref _lastWorkersNeeded);
-            if (warm > 0 && slot < lastWorkers && lastWorkers + 1 < s_hardwareThreads && !_workReady[slot].IsSet)
+            if (warm > 0 && slot < lastWorkers && TeamLeavesWarmRoom(lastWorkers) && !_workReady[slot].IsSet)
             {
                 int spins = 0;
                 while (!_workReady[slot].IsSet)
@@ -931,7 +944,7 @@ internal sealed class PersistentParallelExecutor
                 long nowTicks = System.Diagnostics.Stopwatch.GetTimestamp();
                 int prevWorkers = System.Threading.Volatile.Read(ref _lastWorkersNeeded);
                 long warmTicks = System.Threading.Volatile.Read(ref _warmWindowTicks);
-                bool workersWarm = warmTicks > 0 && workersNeeded <= prevWorkers && prevWorkers + 1 < s_hardwareThreads
+                bool workersWarm = warmTicks > 0 && workersNeeded <= prevWorkers && TeamLeavesWarmRoom(prevWorkers)
                     && nowTicks - System.Threading.Volatile.Read(ref _lastDispatchTicks) < warmTicks;
 
                 // Publish dispatch time + worker count so warm-spinning workers know the

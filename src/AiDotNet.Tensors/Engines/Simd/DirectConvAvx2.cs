@@ -339,7 +339,10 @@ internal static class DirectConvAvx2
                     int tile = local / tasksPerTile, part = local % tasksPerTile;
                     int first = part * phase.ChunksPerTask * PositionUnroll;
                     int last = Math.Min(phase.Geometry.TotalPositions, first + phase.ChunksPerTask * PositionUnroll);
-                    ForwardTile(packedGrad, packedKernel, phase.KernelOffset, dest, destOffset, accumulate, phase.Geometry, tile, first, last);
+                    if (s_stagedStore)
+                        ForwardTileRuns(packedGrad, packedKernel, phase.KernelOffset, dest, destOffset, accumulate, phase.Geometry, tile, first, last);
+                    else
+                        ForwardTile(packedGrad, packedKernel, phase.KernelOffset, dest, destOffset, accumulate, phase.Geometry, tile, first, last);
                 },
                 deterministicSafe: true);
         }
@@ -635,7 +638,7 @@ internal static class DirectConvAvx2
                 int tile = task / tasksPerTile, part = task % tasksPerTile;
                 int first = part * chunksPerTask * PositionUnroll;
                 int last = Math.Min(totalPositions, first + chunksPerTask * PositionUnroll);
-                if (s_stagedStore && geometry.PlainContiguous)
+                if (s_stagedStore)
                     ForwardTileRuns(packedInput, packedKernel, 0, output, outputOffset, accumulate, geometry, tile, first, last);
                 else
                     ForwardTile(packedInput, packedKernel, 0, output, outputOffset, accumulate, geometry, tile, first, last);
@@ -743,6 +746,7 @@ internal static class DirectConvAvx2
         // tenth of the forward's time) and stepped along a grid row; the tail repeats the last real position.
         int* origin = stackalloc int[MaxForwardRunPositions + PositionUnroll];
         int gridWidth = g.GridWidth, columnStep = g.StrideW * Block;
+        bool plain = g.PlainContiguous;
         fixed (float* px = packedInput)
         fixed (float* pw = packedKernel)
         fixed (float* po = output)
@@ -752,7 +756,10 @@ internal static class DirectConvAvx2
             for (int runStart = first; runStart < last;)
             {
                 int imageEnd = (runStart / gridPositions + 1) * gridPositions;
-                int runEnd = Math.Min(Math.Min(last, imageEnd), runStart + runLength);
+                // A plain grid's rows are contiguous in the output, so a run may cross them; otherwise (a strided input
+                // gradient's phase) consecutive positions are StepW apart only within a grid row.
+                int rowEnd = plain ? imageEnd : runStart - runStart % gridPositions % gridWidth + gridWidth;
+                int runEnd = Math.Min(Math.Min(last, rowEnd), runStart + runLength);
                 int run = runEnd - runStart;
                 for (int i = 0, column = gridWidth; i < run; i++)
                 {
@@ -775,7 +782,8 @@ internal static class DirectConvAvx2
                             stage + (q - runStart) * 32, cb0 > 0, count);
                     }
                 }
-                FlushStage(o, accumulate, g, channelBase, runStart, runEnd - runStart, stage);
+                if (plain) FlushStage(o, accumulate, g, channelBase, runStart, run, stage);
+                else FlushStageStrided(o, accumulate, g, channelBase, runStart, run, stage);
                 runStart = runEnd;
             }
         }
@@ -1051,6 +1059,22 @@ internal static class DirectConvAvx2
             float* dst = d + ch * plane;
             if (accumulate) for (int i = vectorRun; i < run; i++) dst[i] += stage[i * 32 + ch];
             else for (int i = vectorRun; i < run; i++) dst[i] = stage[i * 32 + ch];
+        }
+    }
+
+    // FlushStage for a run within one row of a non-plain grid: consecutive positions are StepW apart in the plane.
+    [MethodImpl(Hot)]
+    private static unsafe void FlushStageStrided(float* output, bool accumulate, in ForwardGeometry g, int channelBase, int q0, int run, float* stage)
+    {
+        int index = g.OutputIndex(q0, out int b);
+        long plane = g.OutPlane;
+        int step = g.StepW;
+        float* d = output + ((long)b * g.OutChannels + channelBase) * plane + index;
+        for (int ch = 0; ch < 32; ch++)
+        {
+            float* dst = d + ch * plane;
+            if (accumulate) for (int i = 0; i < run; i++) dst[(long)i * step] += stage[i * 32 + ch];
+            else for (int i = 0; i < run; i++) dst[(long)i * step] = stage[i * 32 + ch];
         }
     }
 
