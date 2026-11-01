@@ -42,6 +42,8 @@ public class DepthwiseConvFloatPathTests
     [Theory]
     [InlineData(1, 16, 16, 16, 1, 3, 1, 1)]
     [InlineData(2, 64, 16, 16, 1, 3, 2, 1)]
+    [InlineData(2, 12, 33, 33, 1, 3, 1, 1)]    // the vector width kernels: 12 channels, rows of four vectors and a tail
+    [InlineData(1, 24, 40, 40, 1, 3, 2, 1)]    // the width kernels at stride 2 (40 is past the channel-block width)
     [InlineData(1, 72, 8, 8, 1, 5, 2, 2)]
     [InlineData(1, 120, 4, 4, 1, 5, 1, 2)]
     [InlineData(1, 960, 1, 1, 1, 5, 1, 2)]    // a 1x1 plane under a 5x5 kernel: most taps outside

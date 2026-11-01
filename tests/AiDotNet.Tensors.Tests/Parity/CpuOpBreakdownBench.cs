@@ -47,6 +47,21 @@ public class CpuOpBreakdownBench
         ("probe", 8, 256, 512, 4, 1, 1, 0),
     };
 
+    // MobileNetV2's 3x3 depthwise convolutions at 224 (network, batch, channels, height/width, stride), padding 1.
+    private static readonly (string Net, int B, int C, int Hw, int S)[] Depthwise =
+    {
+        ("mobilenetv2", 16, 32, 112, 1),
+        ("mobilenetv2", 16, 96, 112, 2),
+        ("mobilenetv2", 16, 144, 56, 1),
+        ("mobilenetv2", 16, 144, 56, 2),
+        ("mobilenetv2", 16, 192, 28, 1),
+        ("mobilenetv2", 16, 192, 28, 2),
+        ("mobilenetv2", 16, 384, 14, 1),
+        ("mobilenetv2", 16, 576, 14, 1),
+        ("mobilenetv2", 16, 576, 14, 2),
+        ("mobilenetv2", 16, 960, 7, 1),
+    };
+
     // (network, batch, in, out)
     private static readonly (string Net, int B, int In, int Out)[] Linears =
     {
@@ -84,6 +99,9 @@ public class CpuOpBreakdownBench
         bool previous2D = AiDotNet.Tensors.Engines.Simd.SimdGemm.UseDirectParallel2D;
         if (Environment.GetEnvironmentVariable("AIDOTNET_OP_NO_2D") == "1")
             AiDotNet.Tensors.Engines.Simd.SimdGemm.UseDirectParallel2D = false;
+        int previousDwMaxWidth = AiDotNet.Tensors.Engines.Simd.DepthwiseConv3x3.s_channelBlockMaxWidth;
+        if (int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_OP_DW_CB_MAXW"), out int dwMaxWidth))
+            AiDotNet.Tensors.Engines.Simd.DepthwiseConv3x3.s_channelBlockMaxWidth = dwMaxWidth;
         var rng = new Random(7);
         try
         {
@@ -105,6 +123,24 @@ public class CpuOpBreakdownBench
                     Row("conv.fwd", shape, threads, () => engine.Conv2DInto(y, x, w, stride, pad, dil));
                     Row("conv.dgrad", shape, threads, () => engine.Conv2DBackwardInputInto(dx, dy, w, x.Shape.ToArray(), stride, pad, dil, accumulate: false));
                     Row("conv.wgrad", shape, threads, () => engine.Conv2DBackwardKernelInto(dw, dy, x, w.Shape.ToArray(), stride, pad, dil, accumulate: false));
+                }
+                foreach (var d in Depthwise)
+                {
+                    var x = Random(rng, d.B, d.C, d.Hw, d.Hw);
+                    var w = Random(rng, d.C, 1, 3, 3);
+                    int o = (d.Hw + 2 - 3) / d.S + 1;
+                    var dy = Random(rng, d.B, d.C, o, o);
+                    int[] stride = { d.S, d.S }, pad = { 1, 1 };
+                    string shape = $"{d.Net} b{d.B} dw{d.C} {d.Hw}x{d.Hw} k3 s{d.S}";
+                    var dwY = new Tensor<float>(new[] { d.B, d.C, o, o });
+                    Row("dwconv.fwd", shape, threads, () => engine.DepthwiseConv2DInto(dwY, x, w, stride, pad));
+                    // The gradients into preallocated outputs, as the forward (the engine entry points rent a fresh
+                    // multi-megabyte result per call, which this bench's loop never returns, so they timed the GC).
+                    var dwDx = new float[x.Length];
+                    var dwDw = new float[w.Length];
+                    float[] dyA = dy.ToArray(), wA = w.ToArray(), xA = x.ToArray();
+                    Row("dwconv.dgrad", shape, threads, () => AiDotNet.Tensors.Engines.Simd.DepthwiseConv3x3.BackwardInput(dyA, wA, dwDx, d.B, d.C, d.Hw, d.Hw, d.S));
+                    Row("dwconv.wgrad", shape, threads, () => AiDotNet.Tensors.Engines.Simd.DepthwiseConv3x3.BackwardKernel(dyA, xA, dwDw, d.B, d.C, d.Hw, d.Hw, d.S));
                 }
                 foreach (var l in Linears)
                 {
@@ -128,6 +164,7 @@ public class CpuOpBreakdownBench
             AiDotNet.Tensors.Engines.Simd.DirectConvAvx2.s_forwardRunPositions = previousRunPositions;
             AiDotNet.Tensors.Engines.Simd.DirectConvAvx2.MinStridedPhasePositions = previousMinPhase;
             AiDotNet.Tensors.Engines.Simd.SimdGemm.UseDirectParallel2D = previous2D;
+            AiDotNet.Tensors.Engines.Simd.DepthwiseConv3x3.s_channelBlockMaxWidth = previousDwMaxWidth;
             AiDotNetEngine.Current = previousEngine;
         }
     }

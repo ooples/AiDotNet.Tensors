@@ -19057,6 +19057,11 @@ public partial class CpuEngine : ITensorLevelEngine
     private static void DepthwiseConv2DFloat(float[] x, float[] w, float[] y, int batch, int inChannels, int height,
         int width, int multiplier, int kH, int kW, int strideH, int strideW, int padH, int padW, int outH, int outW)
     {
+        if (Simd.DepthwiseConv3x3.Applies(multiplier, kH, kW, strideH, strideW, padH, padW))
+        {
+            Simd.DepthwiseConv3x3.Forward(x, w, y, batch, inChannels, height, width, strideH);
+            return;
+        }
         int outChannels = inChannels * multiplier;
         int planes = batch * outChannels;
         if (strideH == 1 && strideW == 1 && outW < 2 * System.Numerics.Vector<float>.Count
@@ -19394,6 +19399,13 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var goF = (float[])(object)gradOutput.GetFlattenedData();
             var kF = (float[])(object)kernel.GetFlattenedData();
+            if (Simd.DepthwiseConv3x3.Applies(multiplier, kernelHeight, kernelWidth, strideH, strideW, padH, padW))
+            {
+                var dx = TensorAllocator.RentUninitialized<T>(inputShape);
+                Simd.DepthwiseConv3x3.BackwardInput(goF, kF, (float[])(object)dx.GetDataArray(), batch, inChannels, height,
+                    width, strideH);
+                return dx;
+            }
             var giF = new float[batch * inChannels * height * width];
             for (int ic = 0; ic < inChannels; ic++)
             {
@@ -19555,6 +19567,13 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var goF = (float[])(object)gradOutput.GetFlattenedData();
             var inF = (float[])(object)input.GetFlattenedData();
+            if (Simd.DepthwiseConv3x3.Applies(multiplier, kernelHeight, kernelWidth, strideH, strideW, padH, padW))
+            {
+                var dw = TensorAllocator.RentUninitialized<T>(kernelShape);
+                Simd.DepthwiseConv3x3.BackwardKernel(goF, inF, (float[])(object)dw.GetDataArray(), batch, inChannels, height,
+                    width, strideH);
+                return dw;
+            }
             var gkF = new float[inChannels * multiplier * kernelHeight * kernelWidth];
             for (int ic = 0; ic < inChannels; ic++)
             {

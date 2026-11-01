@@ -30,6 +30,19 @@ CONVS = [
     ("probe", 8, 256, 512, 4, 1, 1, 0),
 ]
 
+DEPTHWISE = [
+    ("mobilenetv2", 16, 32, 112, 1),
+    ("mobilenetv2", 16, 96, 112, 2),
+    ("mobilenetv2", 16, 144, 56, 1),
+    ("mobilenetv2", 16, 144, 56, 2),
+    ("mobilenetv2", 16, 192, 28, 1),
+    ("mobilenetv2", 16, 192, 28, 2),
+    ("mobilenetv2", 16, 384, 14, 1),
+    ("mobilenetv2", 16, 576, 14, 1),
+    ("mobilenetv2", 16, 576, 14, 2),
+    ("mobilenetv2", 16, 960, 7, 1),
+]
+
 LINEARS = [
     ("mlp", 128, 784, 512),
     ("mlp", 128, 512, 256),
@@ -83,6 +96,20 @@ def main() -> None:
                         lambda: torch.ops.aten.convolution_backward(dy, x, w, None, *conv_args, [True, False, False]))
                     row("conv.wgrad" + layout, shape, threads,
                         lambda: torch.ops.aten.convolution_backward(dy, x, w, None, *conv_args, [False, True, False]))
+            for net, b, ch, hw, s in DEPTHWISE:
+                shape = f"{net} b{b} dw{ch} {hw}x{hw} k3 s{s}"
+                o = (hw + 2 - 3) // s + 1
+                for layout, fmt in (("", torch.contiguous_format), ("+cl", torch.channels_last)):
+                    x = torch.randn(b, ch, hw, hw).contiguous(memory_format=fmt)
+                    w = torch.randn(ch, 1, 3, 3).contiguous(memory_format=fmt)
+                    dy = torch.randn(b, ch, o, o).contiguous(memory_format=fmt)
+                    dw_args = ([s, s], [1, 1], [1, 1], False, [0, 0], ch)
+                    row("dwconv.fwd" + layout, shape, threads,
+                        lambda: torch.nn.functional.conv2d(x, w, None, s, 1, 1, ch))
+                    row("dwconv.dgrad" + layout, shape, threads,
+                        lambda: torch.ops.aten.convolution_backward(dy, x, w, None, *dw_args, [True, False, False]))
+                    row("dwconv.wgrad" + layout, shape, threads,
+                        lambda: torch.ops.aten.convolution_backward(dy, x, w, None, *dw_args, [False, True, False]))
             for net, b, fin, fout in LINEARS:
                 shape = f"{net} b{b} {fin}->{fout}"
                 x = torch.randn(b, fin)
