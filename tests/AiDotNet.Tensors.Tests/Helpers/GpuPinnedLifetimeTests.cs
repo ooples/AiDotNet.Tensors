@@ -14,41 +14,28 @@ namespace AiDotNet.Tensors.Tests.Helpers;
 public class GpuPinnedLifetimeTests
 {
     /// <summary>
-    /// End-to-end probe: runs an actual <c>GpuOptimizer.TrySgdStep</c> against a tiny
-    /// pinned-on-GPU tensor with a known input/expected-output pair, and reports whether
-    /// the host array reflects the kernel's writes. This is the contract the
-    /// <c>GpuOptimizer.Try*Step</c> tests assert; backends whose offload allocator can't
-    /// honor it (e.g. the current OpenCL allocator: separate AllocHGlobal hostBuf +
-    /// CL_MEM_ALLOC_HOST_PTR cl_mem with no map/unmap pair) cause the actual tests to
-    /// fail on stale host reads. Treat such hosts the same way as the no-GPU CI hosts —
-    /// skip cleanly. Probing through the same code path the tests use is the only
-    /// reliable detection: WeightRegistry.OffloadAllocator type-checking misses cases
-    /// where TryGetGpuBuffer returns a non-allocator-backed buffer.
+    /// Whether this backend hands the kernels a device view of a pinned tensor's host buffer: its offload allocator can
+    /// wrap the device pointer (<see cref="AiDotNet.Tensors.Engines.DirectGpu.IGpuDevicePointerWrapper"/>), and a
+    /// pinned tensor does get a GPU buffer. Backends without that (the OpenCL allocator keeps a separate host buffer and
+    /// cl_mem with no map/unmap pair) skip like the no-GPU hosts.
     /// </summary>
+    /// <remarks>
+    /// A capability check only: it never runs a kernel or reads a result back, so a backend that has the mapping but
+    /// computes or mirrors wrongly fails the tests' own assertions instead of being skipped.
+    /// </remarks>
     private static bool HasCoherentPinnedMapping()
     {
-        Tensor<float>? probeP = null, probeG = null;
+        if (WeightRegistry.OffloadAllocator is not AiDotNet.Tensors.Engines.DirectGpu.IGpuDevicePointerWrapper)
+            return false;
+        Tensor<float>? probe = null;
         try
         {
-            probeP = TensorAllocator.RentPinnedOnGpu<float>(new[] { 1 });
-            probeG = TensorAllocator.RentPinnedOnGpu<float>(new[] { 1 });
-            if (probeP.TryGetGpuBuffer() is null || probeG.TryGetGpuBuffer() is null)
-                return false;
-            // Closed-form SGD: p1 = p0 - lr * g = 10 - 1 * 2 = 8.
-            probeP.GetDataArray()[0] = 10.0f;
-            probeG.GetDataArray()[0] = 2.0f;
-            bool ran = AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TrySgdStep(probeP, probeG, learningRate: 1.0f);
-            if (!ran) return false;
-            return System.Math.Abs(probeP.GetDataArray()[0] - 8.0f) < 1e-4f;
-        }
-        catch
-        {
-            return false;
+            probe = TensorAllocator.RentPinnedOnGpu<float>(new[] { 1 });
+            return probe.TryGetGpuBuffer() is not null;
         }
         finally
         {
-            if (probeP is not null) WeightRegistry.UnregisterWeight(probeP);
-            if (probeG is not null) WeightRegistry.UnregisterWeight(probeG);
+            if (probe is not null) WeightRegistry.UnregisterWeight(probe);
         }
     }
 

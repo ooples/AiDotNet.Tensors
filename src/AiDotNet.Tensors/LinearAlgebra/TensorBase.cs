@@ -52,6 +52,14 @@ internal interface IStreamingDroppable
     /// encoding before a model enters training. Implemented on the closed generic owner so
     /// the non-generic registry can migrate mixed element types one tensor at a time.</summary>
     void PromoteStreamingStoreForTraining();
+
+    /// <summary>Copies device results still pending in this tensor's pinned offload buffer into its managed array, so
+    /// freeing the buffer cannot lose them. Call before the offload allocation is freed.</summary>
+    void PreserveOffloadedResults();
+
+    /// <summary>Forgets this tensor's offload allocation after the registry freed it, so nothing reads the freed
+    /// buffer: the managed array is the copy from then on.</summary>
+    void DetachOffload();
 }
 
 /// <summary>What <see cref="IStreamingDroppable.TryWriteBackAndDropForStreaming"/> did.</summary>
@@ -1743,10 +1751,39 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     private bool OffloadMirrorsHostArray(out T[]? array)
     {
         array = null;
-        if (OffloadHostPointer == IntPtr.Zero || _storageOffset != 0) return false;
+        if (OffloadHostPointer == IntPtr.Zero || _storageOffset != 0 || !IsContiguous) return false;
         if (OffloadByteCount != (long)Length * ElementByteSize()) return false;
         array = GetBackingArrayForCacheLookupUnsafe();
         return array is not null && array.Length == Length;
+    }
+
+    /// <inheritdoc/>
+    void IStreamingDroppable.DetachOffload()
+    {
+        OffloadHostPointer = IntPtr.Zero;
+        OffloadDevicePointer = IntPtr.Zero;
+        OffloadOpaqueHandle = null;
+        OffloadByteCount = 0;
+        OffloadRegistryHandle = -1;
+        Volatile.Write(ref _offloadDeviceAhead, false);
+    }
+
+    /// <inheritdoc/>
+    void IStreamingDroppable.PreserveOffloadedResults()
+    {
+        if (!Volatile.Read(ref _offloadDeviceAhead)) return;
+        if (OffloadMirrorsHostArray(out var array) && array is not null)
+        {
+            // The armed HostSync callback then finds the buffer gone and does nothing.
+            DownloadOffloadToHost(array);
+            return;
+        }
+
+        // A device write was armed against a layout this tensor no longer mirrors: nothing safe to copy back, and a
+        // host read would return values older than the device's. Fail that read instead of answering it stale.
+        throw new InvalidOperationException(
+            "A GPU-offloaded tensor holds device results that cannot be copied back to its host array, so freeing its " +
+            "offload buffer would lose them. Read the tensor before unregistering it.");
     }
 
     private unsafe void UploadHostToOffload()
