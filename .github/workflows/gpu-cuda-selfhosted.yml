@@ -122,6 +122,7 @@ jobs:
         FullyQualifiedName~.SoftmaxForwardGpuReproTests.|
         FullyQualifiedName~.TimeStretchStageDiffTests.|
         FullyQualifiedName~.EmptyBroadcastTests.|
+        FullyQualifiedName~.DeviceResultRegistryTests.|
         FullyQualifiedName~.GpuPinnedLifetimeTests.|
         FullyQualifiedName~.Interop.DLPack|
         FullyQualifiedName~.EmptyBroadcastGpuTests.|
