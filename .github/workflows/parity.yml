@@ -42,6 +42,10 @@ on:
         description: 'threads for the perf profile'
         type: string
         default: '4'
+      probe_any_isa:
+        description: 'probe on AVX2 runners too'
+        type: boolean
+        default: false
 
 concurrency:
   group: parity-${{ github.ref }}-${{ github.event_name }}-${{ inputs.probe_modes != '' && github.run_id || 'main' }}
@@ -160,7 +164,7 @@ jobs:
         id: isa
         run: |
           lscpu | grep -E 'Model name|^CPU\(s\)|Thread'
-          if grep -q avx512f /proc/cpuinfo; then echo "run=1" >> "$GITHUB_OUTPUT"; else echo "AVX2 runner: nothing to probe"; fi
+          if [ "${{ inputs.probe_any_isa }}" = "true" ] || grep -q avx512f /proc/cpuinfo; then echo "run=1" >> "$GITHUB_OUTPUT"; else echo "AVX2 runner: nothing to probe"; fi
 
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         if: steps.isa.outputs.run == '1'
