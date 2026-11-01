@@ -18978,11 +18978,16 @@ public partial class CpuEngine : ITensorLevelEngine
         if (kernelShape[1] <= 0 || kernelShape[2] <= 0 || kernelShape[3] <= 0)
             throw new ArgumentException("Depthwise kernel multiplier and spatial size must be positive.");
 
-        int outH = (inputShape[2] + 2 * padding[0] - kernelShape[2]) / stride[0] + 1;
-        int outW = (inputShape[3] + 2 * padding[1] - kernelShape[3]) / stride[1] + 1;
-        if (outH <= 0 || outW <= 0)
+        // Checked before dividing: C# division truncates toward zero, so a span of -1 at stride 2 would give an
+        // output size of 1 for a kernel that does not fit at all.
+        int spanH = inputShape[2] + 2 * padding[0] - kernelShape[2];
+        int spanW = inputShape[3] + 2 * padding[1] - kernelShape[3];
+        if (spanH < 0 || spanW < 0)
             throw new ArgumentException(
-                $"Depthwise kernel {kernelShape[2]}x{kernelShape[3]} does not fit the padded {inputShape[2]}x{inputShape[3]} input.");
+                $"Depthwise kernel {kernelShape[2]}x{kernelShape[3]} is larger than the {inputShape[2]}x{inputShape[3]} input "
+                + $"padded by {padding[0]}x{padding[1]}.");
+        int outH = spanH / stride[0] + 1;
+        int outW = spanW / stride[1] + 1;
         if (outputShape is null) return;
 
         int outChannels = inputShape[1] * kernelShape[1];
