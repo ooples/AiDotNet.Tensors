@@ -279,8 +279,8 @@ internal static class DirectConvAvx2
         int tiles = inChannels / (Block * OutputBlocksPerTile);
 
         // The phases that receive a tap. Their sub-kernels partition the kernel, so they pack into one kernel-sized buffer.
-        var phases = new List<(ForwardGeometry Geometry, int KernelOffset, int FirstH, int TapsH, int FirstW, int TapsW, int Chunks, int ChunksPerTask, int Tasks)>();
-        int packedOffset = 0, totalTasks = 0;
+        var phases = new List<(ForwardGeometry Geometry, int KernelOffset, int FirstH, int TapsH, int FirstW, int TapsW, int Chunks)>();
+        int packedOffset = 0;
         for (int ry = 0; ry < strideH; ry++)
         {
             for (int rx = 0; rx < strideW; rx++)
@@ -303,11 +303,8 @@ internal static class DirectConvAvx2
                     tapsH, tapsW, 1, 1, 1, 1, gridH, gridW, (originRow * paddedW + originCol) * Block,
                     height, width, strideH, strideW, ry, rx);
                 int chunks = (geometry.TotalPositions + PositionUnroll - 1) / PositionUnroll;
-                int chunksPerTask = Math.Max(1, (int)(((long)chunks * tiles * strideH * strideW + taskTarget - 1) / taskTarget));
-                int tasks = tiles * ((chunks + chunksPerTask - 1) / chunksPerTask);
-                phases.Add((geometry, packedOffset, firstH, tapsH, firstW, tapsW, chunks, chunksPerTask, tasks));
+                phases.Add((geometry, packedOffset, firstH, tapsH, firstW, tapsW, chunks));
                 packedOffset += outChannels * inChannels * tapsH * tapsW;
-                totalTasks += tasks;
             }
         }
         if (phases.Count == 0) return;
@@ -326,25 +323,28 @@ internal static class DirectConvAvx2
                     kernelHeight, kernelWidth, phase.FirstH, strideH, phase.TapsH, phase.FirstW, strideW, phase.TapsW);
             }, deterministicSafe: true);
 
-            // One dispatch over every phase's tiles: the phases write disjoint dX positions.
-            var taskStart = new int[phases.Count + 1];
-            for (int p = 0; p < phases.Count; p++) taskStart[p + 1] = taskStart[p] + phases[p].Tasks;
-            CpuParallelSettings.ParallelForOrSerial(0, totalTasks,
+            // Each task runs EVERY phase over the same share of the grid (the same fraction of each phase's positions,
+            // so the same images and rows): the phases interleave in dX (stride 2: alternate columns), and as separate
+            // tasks up to four cores wrote each dX cache line at different times. The phases write disjoint positions.
+            int minChunks = int.MaxValue;
+            foreach (var phase in phases) minChunks = Math.Min(minChunks, phase.Chunks);
+            // At least four position triples per phase in a share: shorter runs cost more in setup than they save.
+            int sharesPerTile = Math.Max(1, Math.Min(minChunks / 4, (taskTarget + tiles - 1) / tiles));
+            CpuParallelSettings.ParallelForOrSerial(0, tiles * sharesPerTile,
                 (long)batch * height * width * inChannels * outChannels * kernelHeight * kernelWidth / (strideH * strideW),
                 [MethodImpl(Hot)] (task) =>
                 {
-                    int p = 0;
-                    while (taskStart[p + 1] <= task) p++;
-                    var phase = phases[p];
-                    int local = task - taskStart[p];
-                    int tasksPerTile = phase.Tasks / tiles;
-                    int tile = local / tasksPerTile, part = local % tasksPerTile;
-                    int first = part * phase.ChunksPerTask * PositionUnroll;
-                    int last = Math.Min(phase.Geometry.TotalPositions, first + phase.ChunksPerTask * PositionUnroll);
-                    if (s_stagedStore)
-                        ForwardTileRuns(packedGrad, packedKernel, phase.KernelOffset, dest, destOffset, accumulate, phase.Geometry, tile, first, last);
-                    else
-                        ForwardTile(packedGrad, packedKernel, phase.KernelOffset, dest, destOffset, accumulate, phase.Geometry, tile, first, last);
+                    int tile = task / sharesPerTile, share = task % sharesPerTile;
+                    foreach (var phase in phases)
+                    {
+                        int total = phase.Geometry.TotalPositions;
+                        int first = ShareBound(total, share, sharesPerTile), last = ShareBound(total, share + 1, sharesPerTile);
+                        if (first >= last) continue;
+                        if (s_stagedStore)
+                            ForwardTileRuns(packedGrad, packedKernel, phase.KernelOffset, dest, destOffset, accumulate, phase.Geometry, tile, first, last);
+                        else
+                            ForwardTile(packedGrad, packedKernel, phase.KernelOffset, dest, destOffset, accumulate, phase.Geometry, tile, first, last);
+                    }
                 },
                 deterministicSafe: true);
         }
@@ -354,6 +354,10 @@ internal static class DirectConvAvx2
             pool.Return(packedKernel);
         }
     }
+    // Start of share `share` of `shares` over `total` positions, on a PositionUnroll boundary (the last ends at total).
+    private static int ShareBound(int total, int share, int shares)
+        => share >= shares ? total : Math.Min(total, (int)((long)total * share / shares) / PositionUnroll * PositionUnroll);
+
     /// <summary>Zeroes phase (ry, rx) of every plane: the input positions no kernel tap reaches (a 1x1 stride-2 conv's odd rows).</summary>
     [MethodImpl(Hot)]
     private static void ClearPhase(float[] dest, int destOffset, int planes, int height, int width, int ry, int rx, int strideH, int strideW)
