@@ -64,9 +64,17 @@ kernel void gemm_epilogue(
     if (beta != 0.0f) x += beta * C[idx];
     switch (activation) {
         case 1: x = max(x, 0.0f); break;
-        case 2: x = 0.5f * x * (1.0f + tanh(FUSED_GEMM_SQRT_2_OVER_PI * (x + FUSED_GEMM_GELU_COEF * x * x * x))); break;
+        case 2: {
+            // GELU is saturated at these tails in FP32. Avoid overflowing the cubic,
+            // and keep Metal's fast tanh implementation within its finite range.
+            if (x >= 10.0f) break;
+            if (x <= -10.0f) { x = 0.0f; break; }
+            float inner = FUSED_GEMM_SQRT_2_OVER_PI * (x + FUSED_GEMM_GELU_COEF * x * x * x);
+            x = 0.5f * x * (1.0f + tanh(clamp(inner, -20.0f, 20.0f)));
+            break;
+        }
         case 3: x = 1.0f / (1.0f + exp(-x)); break;
-        case 4: x = tanh(x); break;
+        case 4: x = tanh(clamp(x, -20.0f, 20.0f)); break;
         case 5: x = x * (1.0f / (1.0f + exp(-x))); break;
         case 6: x = x > 0.0f ? x : slope * x; break;
         default: break;

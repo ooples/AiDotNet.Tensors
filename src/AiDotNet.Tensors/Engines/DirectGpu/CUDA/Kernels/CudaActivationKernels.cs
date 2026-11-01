@@ -56,7 +56,10 @@ extern ""C"" __global__ __launch_bounds__(256) void gelu(const float* __restrict
     float x = input[idx];
     float x3 = x * x * x;
     float inner = sqrt2OverPi * (x + coeff * x3);
-    output[idx] = 0.5f * x * (1.0f + tanhf(inner));
+    // GELU(x) = x * sigmoid(2 * inner). Avoid cancellation in 1 + tanh(inner)
+    // on the negative tail and the architecture-dependent tanh.approx error.
+    float e = expf(-fabsf(2.0f * inner));
+    output[idx] = x * (inner >= 0.0f ? 1.0f / (1.0f + e) : e / (1.0f + e));
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void swish(const float* __restrict__ input, float* __restrict__ output, int size)
@@ -839,7 +842,11 @@ extern ""C"" __global__ __launch_bounds__(256) void log2_vector(const float* __r
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    B[idx] = log2f(A[idx]);
+    float x = A[idx];
+    // log2.approx has absolute error that dominates the small result near one.
+    B[idx] = fabsf(x - 1.0f) < 0.25f
+        ? log1pf(x - 1.0f) * 1.4426950408889634f
+        : log2f(x);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void exp2_vector(const float* __restrict__ A, float* __restrict__ B, int size)
@@ -1285,7 +1292,10 @@ extern ""C"" __global__ __launch_bounds__(256) void log10_vector(const float* __
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    B[idx] = log10f(A[idx]);
+    float x = A[idx];
+    B[idx] = fabsf(x - 1.0f) < 0.25f
+        ? log1pf(x - 1.0f) * 0.4342944819032518f
+        : log10f(x);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void negate_vector(const float* __restrict__ A, float* __restrict__ B, int size)

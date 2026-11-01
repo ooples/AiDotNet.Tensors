@@ -823,6 +823,33 @@ kernel void topk_axis_serial(
     }
 }
 
+// Arbitrary-length split-complex DFT. Inputs and outputs must not alias.
+kernel void split_dft_strided(
+    device const float* inputReal [[buffer(0)]], device const float* inputImag [[buffer(1)]],
+    device float* outputReal [[buffer(2)]], device float* outputImag [[buffer(3)]],
+    constant uint& sequences [[buffer(4)]], constant uint& length [[buffer(5)]],
+    constant uint& baseStride [[buffer(6)]], constant uint& elementStride [[buffer(7)]],
+    constant uint& inverse [[buffer(8)]], uint gid [[thread_position_in_grid]])
+{
+    if (gid >= sequences * length) return;
+    uint sequence = gid / length, frequency = gid % length;
+    uint offset = sequence * baseStride;
+    float realSum = 0.0f, imagSum = 0.0f;
+    float direction = inverse != 0u ? 1.0f : -1.0f;
+    for (uint sample = 0u; sample < length; ++sample) {
+        float angle = direction * 6.283185307179586f * float(frequency) * float(sample) / float(length);
+        float c = cos(angle), s = sin(angle);
+        uint index = offset + sample * elementStride;
+        float r = inputReal[index], i = inputImag[index];
+        realSum += r * c - i * s;
+        imagSum += r * s + i * c;
+    }
+    float scale = inverse != 0u ? 1.0f / float(length) : 1.0f;
+    outputReal[offset + frequency * elementStride] = realSum * scale;
+    outputImag[offset + frequency * elementStride] = imagSum * scale;
+}
+
+
 kernel void split_fft_strided_serial(
     device const float* inputReal [[buffer(0)]], device const float* inputImag [[buffer(1)]],
     device float* outputReal [[buffer(2)]], device float* outputImag [[buffer(3)]],

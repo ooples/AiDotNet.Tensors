@@ -68,7 +68,20 @@ void main() {
             }
             break; }
         case 6u: y = log(x); break;
-        case 7u: y = log2(x); break;
+        case 7u:
+        case 25u: {
+            // Near one, log2's hardware absolute error dominates its tiny result.
+            // Sterbenz subtraction is exact here; use the convergent atanh series.
+            if (abs(x - 1.0) < 0.25) {
+                float s = (x - 1.0) / (x + 1.0);
+                float s2 = s * s;
+                y = 2.8853900817779268 * s * (1.0 + s2 * (1.0 / 3.0 + s2 * (1.0 / 5.0 + s2 * (1.0 / 7.0 + s2 * (1.0 / 9.0 + s2 / 11.0)))));
+            } else {
+                y = log2(x);
+            }
+            if (op == 25u) y *= 0.3010299956639812;
+            break;
+        }
         case 8u: { // log1p: a small x takes 2 atanh(x / (2 + x)) as its odd series (|s| <= 0.12, below 1e-9 relative)
             if (abs(x) < 0.25) {
                 float s = x / (2.0 + x);
@@ -94,7 +107,6 @@ void main() {
         case 22u: y = atanh(x); break;
         case 23u: y = 1.0 / x; break;
         case 24u: y = sign(x) * pow(abs(x), 0.3333333333333333); break;
-        case 25u: y = log(x) * 0.4342944819032518; break;
         case 26u: y = -x; break;
         case 27u: y = floor(x); break;
         case 28u: y = ceil(x); break;

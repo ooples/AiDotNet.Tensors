@@ -646,16 +646,29 @@ public abstract class FusedElementwiseBackendTestsBase
             }
     }
 
-    [SkippableFact]
-    public void Hgemm_IsTheProductRoundedToHalfPrecision()
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void HalfGemm_RespectsAccumulationPrecision(bool accumulateFp32)
     {
         using var lease = Create(_name, out var backend);
         Skip.If(backend is null, _name + " is not available on this machine.");
         var half = backend as IGpuHalfPrecisionBackend;
         Skip.If(half is null || !half.SupportsHgemm, _name + " has no half-precision GEMM.");
         const int M = 19, K = 23, N = 17;   // not multiples of a tile
-        using var a32 = backend.AllocateBuffer(Values(90, M * K));
-        using var b32 = backend.AllocateBuffer(Values(91, K * N));
+        float[] Inputs(int seed, int count)
+        {
+            if (accumulateFp32) return Values(seed, count);
+            // HGEMM promises FP16 accumulation, not a single rounding after an FP32 dot.
+            // Integers in [-4,4] keep every product and partial sum exactly representable
+            // in FP16 (at most 23 * 16), independently of the kernel's reduction order.
+            var random = new Random(seed);
+            var values = new float[count];
+            for (int index = 0; index < count; index++) values[index] = random.Next(-4, 5);
+            return values;
+        }
+        using var a32 = backend.AllocateBuffer(Inputs(90, M * K));
+        using var b32 = backend.AllocateBuffer(Inputs(91, K * N));
         using var a16 = backend.AllocateByteBuffer(M * K * 2);
         using var b16 = backend.AllocateByteBuffer(K * N * 2);
         using var c16 = backend.AllocateByteBuffer(M * N * 2);
@@ -669,17 +682,24 @@ public abstract class FusedElementwiseBackendTestsBase
         var ah = backend.DownloadBuffer(aBack);
         var bh = backend.DownloadBuffer(bBack);
 
-        half.Hgemm(a16, b16, c16, M, N, K);
-        backend.ConvertToFp32(c16, c32, M * N);
+        if (accumulateFp32)
+            half.GemmFp16In32fOut(a16, b16, c32, M, N, K);
+        else
+        {
+            half.Hgemm(a16, b16, c16, M, N, K);
+            backend.ConvertToFp32(c16, c32, M * N);
+        }
 
         var y = backend.DownloadBuffer(c32);
         for (int i = 0; i < M; i++)
             for (int j = 0; j < N; j++)
             {
-                // The product of the half-precision inputs, accumulated in FP32 and rounded once: within one FP16 ulp.
                 double expected = Dot(ah, bh, i, j, K, N);
-                Assert.True(Math.Abs(expected - y[i * N + j]) <= 2e-3 * Math.Abs(expected) + 1e-3,
-                    $"C[{i},{j}]: expected {expected}, got {y[i * N + j]}");
+                if (accumulateFp32)
+                    Assert.True(Math.Abs(expected - y[i * N + j]) <= 1e-5 * Math.Abs(expected) + 1e-5,
+                        $"C[{i},{j}]: expected {expected}, got {y[i * N + j]}");
+                else
+                    Assert.Equal((float)expected, y[i * N + j]);
             }
     }
 

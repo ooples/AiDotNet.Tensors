@@ -87,11 +87,23 @@ public sealed partial class MetalBackend
     {
         ThrowIfDisposed();
         if (height <= 0 || width <= 0) return;
-        if ((height & (height - 1)) != 0 || (width & (width - 1)) != 0)
-            throw new ArgumentException("FFT dimensions must be powers of two.");
+        if (ReferenceEquals(outputReal, outputImag))
+            throw new ArgumentException("Real and imaginary FFT outputs must use distinct buffers.");
         int count = checked(height * width);
         using var rowReal = AllocateBuffer(count);
         using var rowImaginary = AllocateBuffer(count);
+        if ((height & (height - 1)) != 0 || (width & (width - 1)) != 0)
+        {
+            // Separable DFT for arbitrary dimensions, with distinct row storage so in-place
+            // callers cannot overwrite values another frequency still needs to read.
+            DispatchResidentMetal("split_dft_strided", count,
+                new[] { inputReal, inputImag, rowReal, rowImaginary },
+                (uint)height, (uint)width, (uint)width, 1u, inverse ? 1u : 0u);
+            DispatchResidentMetal("split_dft_strided", count,
+                new[] { rowReal, rowImaginary, outputReal, outputImag },
+                (uint)width, (uint)height, 1u, (uint)width, inverse ? 1u : 0u);
+            return;
+        }
         DispatchSplitFftMetal(inputReal, inputImag, rowReal, rowImaginary,
             height, width, width, 1, inverse);
         DispatchSplitFftMetal(rowReal, rowImaginary, outputReal, outputImag,
