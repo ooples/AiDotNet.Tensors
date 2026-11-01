@@ -16,8 +16,10 @@ public sealed class GpuMemoryStatsGlobalStateCollection
 
 /// <summary>
 /// GpuMemoryStats is process-wide, and the engine records into it too (CudaPinnedBufferPool records every pinned
-/// host allocation). These tests assert exact counter values after a Reset, so they must not run alongside tests
-/// that use a GPU: measured, a concurrent pinned allocation made allocated_bytes.current 528 instead of 512.
+/// host allocation). These tests run alone (the collection disables parallelization) and assert DELTAS on their own
+/// allocator label. They never call <see cref="GpuMemoryStats.Reset"/>: it zeroes every allocator's live counters,
+/// and a live CUDA backend's pinned pool then freed more than its zeroed counter held ("Mismatched free for
+/// allocator 'cuda_pinned_host'") when a later test released the engine.
 /// </summary>
 [Collection(GpuMemoryStatsGlobalStateCollection.Name)]
 public class GpuMemoryStatsTests
@@ -25,38 +27,52 @@ public class GpuMemoryStatsTests
     [Fact]
     public void GpuMemoryStats_RecordAllocFree_ReflectInCounters()
     {
-        GpuMemoryStats.Reset();
-        GpuMemoryStats.RecordAllocation("test_alloc", 1024);
-        GpuMemoryStats.RecordAllocation("test_alloc", 2048);
-        Assert.Equal(3072, GpuMemoryStats.CurrentBytes);
-        Assert.Equal(3072, GpuMemoryStats.PeakBytes);
-        Assert.Equal(3072, GpuMemoryStats.TotalAllocatedBytes);
-        Assert.Equal(2, GpuMemoryStats.ActiveAllocations);
-
-        GpuMemoryStats.RecordFree("test_alloc", 1024);
-        Assert.Equal(2048, GpuMemoryStats.CurrentBytes);
-        Assert.Equal(3072, GpuMemoryStats.PeakBytes); // peak is sticky
-        Assert.Equal(1, GpuMemoryStats.ActiveAllocations);
-
+        string label = "test_alloc_" + Guid.NewGuid().ToString("N");
         GpuMemoryStats.ResetPeakStats();
-        Assert.Equal(2048, GpuMemoryStats.PeakBytes);
+        long current0 = GpuMemoryStats.CurrentBytes, total0 = GpuMemoryStats.TotalAllocatedBytes;
+        long peak0 = GpuMemoryStats.PeakBytes, active0 = GpuMemoryStats.ActiveAllocations;
+        GpuMemoryStats.RecordAllocation(label, 1024);
+        GpuMemoryStats.RecordAllocation(label, 2048);
+        try
+        {
+            Assert.Equal(3072, GpuMemoryStats.CurrentBytes - current0);
+            Assert.Equal(3072, GpuMemoryStats.PeakBytes - peak0);
+            Assert.Equal(3072, GpuMemoryStats.TotalAllocatedBytes - total0);
+            Assert.Equal(2, GpuMemoryStats.ActiveAllocations - active0);
 
-        GpuMemoryStats.Reset();
+            GpuMemoryStats.RecordFree(label, 1024);
+            Assert.Equal(2048, GpuMemoryStats.CurrentBytes - current0);
+            Assert.Equal(3072, GpuMemoryStats.PeakBytes - peak0); // peak is sticky
+            Assert.Equal(1, GpuMemoryStats.ActiveAllocations - active0);
+
+            GpuMemoryStats.ResetPeakStats();
+            Assert.Equal(2048, GpuMemoryStats.PeakBytes - current0);
+        }
+        finally
+        {
+            GpuMemoryStats.RecordFree(label, 2048);
+        }
     }
 
     [Fact]
     public void GpuMemoryStats_Stats_ExposesTorchParityKeys()
     {
-        GpuMemoryStats.Reset();
-        GpuMemoryStats.RecordAllocation("test_alloc", 512);
-        var stats = GpuMemoryStats.Stats();
-
-        Assert.Equal(512L, stats["allocated_bytes.current"]);
-        Assert.Equal(512L, stats["allocated_bytes.peak"]);
-        Assert.Equal(512L, stats["allocated_bytes.total"]);
-        Assert.Equal(1L, stats["active.current"]);
-
-        GpuMemoryStats.Reset();
+        string label = "test_alloc_" + Guid.NewGuid().ToString("N");
+        GpuMemoryStats.ResetPeakStats();
+        var before = GpuMemoryStats.Stats();
+        GpuMemoryStats.RecordAllocation(label, 512);
+        try
+        {
+            var stats = GpuMemoryStats.Stats();
+            Assert.Equal(512L, stats["allocated_bytes.current"] - before["allocated_bytes.current"]);
+            Assert.Equal(512L, stats["allocated_bytes.peak"] - before["allocated_bytes.peak"]);
+            Assert.Equal(512L, stats["allocated_bytes.total"] - before["allocated_bytes.total"]);
+            Assert.Equal(1L, stats["active.current"] - before["active.current"]);
+        }
+        finally
+        {
+            GpuMemoryStats.RecordFree(label, 512);
+        }
     }
 
 }
