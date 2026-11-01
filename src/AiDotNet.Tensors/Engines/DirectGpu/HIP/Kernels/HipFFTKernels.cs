@@ -26,6 +26,7 @@ internal static class HipFFTKernels
         "fft_rows_butterfly",
         "fft_cols_butterfly",
         "scale_inverse",
+        "strided_dft",
         "batched_bit_reverse",
         "batched_fft_butterfly"
     };
@@ -254,6 +255,33 @@ extern ""C"" __global__ __launch_bounds__(256) void apply_window(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
     output[idx] = input[idx] * window[idx];
+}
+
+// A direct DFT of strided lines (a row: element stride 1, line stride width; a column: element stride width, line
+// stride 1), out of place in the input's layout, scaled by 1/n for the inverse: FFT2D's path for a side that is not a
+// power of two, which the radix-2 kernels cannot transform. The twiddle index k * j is kept modulo n as it advances.
+extern ""C"" __global__ __launch_bounds__(256) void strided_dft(
+    const float* inRe, const float* inIm, float* outRe, float* outIm,
+    int lines, int n, int elemStride, int lineStride, int inverse)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= lines * n) return;
+    int line = i / n, k = i % n, base = line * lineStride;
+    float step = (inverse ? 6.283185307179586f : -6.283185307179586f) / (float)n;
+    float re = 0.0f, im = 0.0f;
+    int phase = 0;
+    for (int j = 0; j < n; j++) {
+        float s, c;
+        sincosf(step * (float)phase, &s, &c);
+        int src = base + j * elemStride;
+        re += inRe[src] * c - inIm[src] * s;
+        im += inRe[src] * s + inIm[src] * c;
+        phase += k;
+        if (phase >= n) phase -= n;
+    }
+    float scale = inverse ? 1.0f / (float)n : 1.0f;
+    outRe[base + k * elemStride] = re * scale;
+    outIm[base + k * elemStride] = im * scale;
 }
 
 // 2D FFT row-wise bit-reversal (permute each row of length `width`, OUT OF PLACE into `dst`; `src` and

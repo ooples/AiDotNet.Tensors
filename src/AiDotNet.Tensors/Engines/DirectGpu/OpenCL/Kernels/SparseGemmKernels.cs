@@ -144,7 +144,7 @@ __kernel void sparse_gemm_2_4(
     // Write result
     if (row < M && col < N) {
         int idx = row * N + col;
-        C[idx] = alpha * sum + beta * C[idx];
+        C[idx] = beta == 0.0f ? alpha * sum : alpha * sum + beta * C[idx];   // as in a BLAS GEMM, beta 0 never reads C
     }
 }
 

@@ -9573,10 +9573,33 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     /// <summary>
     /// 2D FFT using row-column decomposition.
     /// </summary>
+    private unsafe void StridedDft(IGpuBuffer inRe, IGpuBuffer inIm, IGpuBuffer outRe, IGpuBuffer outIm,
+        int lines, int n, int elemStride, int lineStride, bool inverse)
+    {
+        IntPtr kernel = GetRequiredFftKernel("strided_dft");
+        IntPtr p0 = inRe.Handle, p1 = inIm.Handle, p2 = outRe.Handle, p3 = outIm.Handle;
+        int inv = inverse ? 1 : 0;
+        void** args = stackalloc void*[9];
+        args[0] = &p0; args[1] = &p1; args[2] = &p2; args[3] = &p3;
+        args[4] = &lines; args[5] = &n; args[6] = &elemStride; args[7] = &lineStride; args[8] = &inv;
+        int total = lines * n;
+        LaunchKernel(kernel, (uint)((total + 255) / 256), 256, args);
+    }
+
     public unsafe void FFT2D(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag, int height, int width, bool inverse)
     {
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("HIP backend not available");
+
+        if ((height & (height - 1)) != 0 || (width & (width - 1)) != 0)
+        {
+            // The radix-2 kernels need power-of-two sides: rows into a temporary, then columns into the output.
+            using var rowsReal = AllocateBuffer(height * width);
+            using var rowsImag = AllocateBuffer(height * width);
+            StridedDft(inputReal, inputImag, rowsReal, rowsImag, height, width, 1, width, inverse);
+            StridedDft(rowsReal, rowsImag, outputReal, outputImag, width, height, width, 1, inverse);
+            return;
+        }
 
         IntPtr rowsBitRevKernel = GetRequiredFftKernel("fft_rows_bit_reverse");
         IntPtr rowsButterflyKernel = GetRequiredFftKernel("fft_rows_butterfly");

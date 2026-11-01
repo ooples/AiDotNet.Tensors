@@ -4640,6 +4640,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             // No sync - can be chained asynchronously
         }
 
+        /// <summary>TILE_SIZE of SparseGemmKernels: the side of the local B tile and of the work-group.</summary>
+        private const int SparseGemmTile = 16;
+
+        private static int RoundUpToSparseTile(int extent) => (extent + SparseGemmTile - 1) / SparseGemmTile * SparseGemmTile;
+
         public void SparseGemm(
             IGpuBuffer sparseAValues, IGpuBuffer sparseAIndices,
             IGpuBuffer B, IGpuBuffer C,
@@ -4668,8 +4673,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             kernel.SetArg(7, alpha);
             kernel.SetArg(8, beta);
 
-            var (localSizeX, localSizeY) = CalculateOptimalWorkGroupSize(M, N);
-            kernel.Execute2D(M, N, localSizeX, localSizeY);
+            // The kernel stages B through a TILE_SIZE x TILE_SIZE local tile indexed by the local ids, so the work-group
+            // is exactly that tile (a smaller one left most of each tile unloaded) and the range is rounded up to it.
+            kernel.Execute2D(RoundUpToSparseTile(M), RoundUpToSparseTile(N), SparseGemmTile, SparseGemmTile);
             // No sync - can be chained asynchronously
         }
 
@@ -4701,8 +4707,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             kernel.SetArg(6, N);
             kernel.SetArg(7, K);
 
-            var (localSizeX, localSizeY) = CalculateOptimalWorkGroupSize(M, N);
-            kernel.Execute2D(M, N, localSizeX, localSizeY);
+            // The kernel stages B through a TILE_SIZE x TILE_SIZE local tile indexed by the local ids, so the work-group
+            // is exactly that tile (a smaller one left most of each tile unloaded) and the range is rounded up to it.
+            kernel.Execute2D(RoundUpToSparseTile(M), RoundUpToSparseTile(N), SparseGemmTile, SparseGemmTile);
 
             return C;
         }
@@ -12350,6 +12357,23 @@ KERNEL VARIANTS (A/B testing):
         }
 
         /// <inheritdoc/>
+        private void StridedDft(IGpuBuffer inRe, IGpuBuffer inIm, IGpuBuffer outRe, IGpuBuffer outIm,
+            int lines, int n, int elemStride, int lineStride, bool inverse)
+        {
+            var kernel = _kernelCache["strided_dft"];
+            kernel.SetArg(0, ((DirectOpenClGpuBuffer)inRe).Buffer.Handle);
+            kernel.SetArg(1, ((DirectOpenClGpuBuffer)inIm).Buffer.Handle);
+            kernel.SetArg(2, ((DirectOpenClGpuBuffer)outRe).Buffer.Handle);
+            kernel.SetArg(3, ((DirectOpenClGpuBuffer)outIm).Buffer.Handle);
+            kernel.SetArg(4, lines);
+            kernel.SetArg(5, n);
+            kernel.SetArg(6, elemStride);
+            kernel.SetArg(7, lineStride);
+            kernel.SetArg(8, inverse ? 1 : 0);
+            int total = lines * n;
+            kernel.Execute1D(total, Math.Min(256, total));
+        }
+
         public void FFT2D(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag, int height, int width, bool inverse)
         {
             if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
@@ -12358,10 +12382,20 @@ KERNEL VARIANTS (A/B testing):
             var inImag = ((DirectOpenClGpuBuffer)inputImag).Buffer;
             var outReal = ((DirectOpenClGpuBuffer)outputReal).Buffer;
             var outImag = ((DirectOpenClGpuBuffer)outputImag).Buffer;
+            if ((height & (height - 1)) != 0 || (width & (width - 1)) != 0)
+            {
+                // The radix-2 kernels need power-of-two sides: rows into a temporary, then columns into the output.
+                using var rowsReal = AllocateBuffer(height * width);
+                using var rowsImag = AllocateBuffer(height * width);
+                StridedDft(inputReal, inputImag, rowsReal, rowsImag, height, width, 1, width, inverse);
+                StridedDft(rowsReal, rowsImag, outputReal, outputImag, width, height, width, 1, inverse);
+                return;
+            }
 
-            // Copy input to output for in-place FFT
-            CopyBuffer(inputReal, outputReal, height * width);
-            CopyBuffer(inputImag, outputImag, height * width);
+            // Copy input to output for in-place FFT (an in-place call already has it there: a self-copy is
+            // CL_MEM_COPY_OVERLAP)
+            if (!ReferenceEquals(inputReal, outputReal)) CopyBuffer(inputReal, outputReal, height * width);
+            if (!ReferenceEquals(inputImag, outputImag)) CopyBuffer(inputImag, outputImag, height * width);
 
             int log2Width = (int)MathHelper.Log2(width);
             int log2Height = (int)MathHelper.Log2(height);
