@@ -6,6 +6,7 @@ using AiDotNet.Tensors.Engines.DirectGpu.HIP;
 using AiDotNet.Tensors.Engines.DirectGpu.Metal;
 using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 using AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
+using AiDotNet.Tensors.Engines.Gpu;
 using AiDotNet.Tensors.Helpers;
 using Xunit;
 
@@ -455,6 +456,233 @@ public abstract class FusedElementwiseBackendTestsBase
                     $"mel[{b},{m}]: expected {expected}, got {y[b * mels + m]}");
             }
     }
+    [SkippableTheory]
+    [InlineData(1f, 0f)]
+    [InlineData(0.5f, 2f)]
+    public void SparseGemm24_EqualsThePrunedDenseProduct(float alpha, float beta)
+    {
+        using var lease = Create(_name, out var backend);
+        Skip.If(backend is null, _name + " is not available on this machine.");
+        const int M = 5, K = 12, N = 7;
+        var dense = Values(50, M * K);
+        var b = Values(51, K * N);
+        var c0 = Values(52, M * N);
+        var pruned = PruneTwoOfFour(dense, M, K);
+        using var bufDense = backend.AllocateBuffer(dense);
+        using var values = backend.AllocateBuffer(M * K / 2);
+        using var indices = backend.AllocateByteBuffer(M * K / 4);   // the contract: one byte of offsets per block of four
+        using var bufB = backend.AllocateBuffer(b);
+        using var bufC = backend.AllocateBuffer(c0);
+        backend.Enforce2x4Sparsity(bufDense, values, indices, M, K);
+
+        backend.SparseGemm(values, indices, bufB, bufC, M, N, K, alpha, beta);
+
+        var y = backend.DownloadBuffer(bufC);
+        for (int i = 0; i < M; i++)
+            for (int j = 0; j < N; j++)
+            {
+                double expected = alpha * Dot(pruned, b, i, j, K, N) + beta * c0[i * N + j];
+                Assert.True(Math.Abs(expected - y[i * N + j]) <= 1e-4 * (1 + Math.Abs(expected)),
+                    $"C[{i},{j}]: expected {expected}, got {y[i * N + j]}");
+            }
+
+        var biasValues = Values(53, N);
+        using var bias = backend.AllocateBuffer(biasValues);
+        using var relu = backend.SparseGemmBiasRelu(values, indices, bufB, bias, M, N, K);
+        var r = backend.DownloadBuffer(relu);
+        for (int i = 0; i < M; i++)
+            for (int j = 0; j < N; j++)
+            {
+                double expected = Math.Max(0, Dot(pruned, b, i, j, K, N) + biasValues[j]);
+                Assert.True(Math.Abs(expected - r[i * N + j]) <= 1e-4 * (1 + Math.Abs(expected)),
+                    $"relu[{i},{j}]: expected {expected}, got {r[i * N + j]}");
+            }
+    }
+
+    private static float[] PruneTwoOfFour(float[] dense, int rows, int cols)
+    {
+        var pruned = new float[dense.Length];
+        for (int block = 0; block < rows * cols / 4; block++)
+        {
+            int at = block * 4;
+            var order = new[] { 0, 1, 2, 3 };
+            Array.Sort(order, (x, y) => Math.Abs(dense[at + y]).CompareTo(Math.Abs(dense[at + x])));
+            pruned[at + order[0]] = dense[at + order[0]];
+            pruned[at + order[1]] = dense[at + order[1]];
+        }
+        return pruned;
+    }
+
+    private static double Dot(float[] a, float[] b, int i, int j, int k, int n)
+    {
+        double sum = 0;
+        for (int t = 0; t < k; t++) sum += (double)a[i * k + t] * b[t * n + j];
+        return sum;
+    }
+
+    [SkippableFact]
+    public void GemmBiasEpilogues_EqualTheActivatedProduct()
+    {
+        using var lease = Create(_name, out var backend);
+        Skip.If(backend is null, _name + " is not available on this machine.");
+        const int M = 9, K = 13, N = 11;
+        var a = Values(60, M * K);
+        var b = Values(61, K * N);
+        var bias = Values(62, N);
+        using var bufA = backend.AllocateBuffer(a);
+        using var bufB = backend.AllocateBuffer(b);
+        using var bufBias = backend.AllocateBuffer(bias);
+        var epilogues = new (string Name, Func<IGpuBuffer> Run, Func<double, double> Activation)[]
+        {
+            ("GemmBias", () => backend.GemmBias(bufA, bufB, bufBias, M, N, K), x => x),
+            ("GemmBiasRelu", () => backend.GemmBiasRelu(bufA, bufB, bufBias, M, N, K), x => Math.Max(0, x)),
+            ("GemmBiasGelu", () => backend.GemmBiasGelu(bufA, bufB, bufBias, M, N, K),
+                x => 0.5 * x * (1 + Math.Tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)))),
+            ("GemmBiasSigmoid", () => backend.GemmBiasSigmoid(bufA, bufB, bufBias, M, N, K), x => 1 / (1 + Math.Exp(-x))),
+            ("GemmBiasTanh", () => backend.GemmBiasTanh(bufA, bufB, bufBias, M, N, K), Math.Tanh),
+            ("GemmBiasSwish", () => backend.GemmBiasSwish(bufA, bufB, bufBias, M, N, K), x => x / (1 + Math.Exp(-x))),
+            ("GemmBiasLeakyRelu", () => backend.GemmBiasLeakyRelu(bufA, bufB, bufBias, M, N, K, 0.2f), x => x > 0 ? x : 0.2 * x),
+        };
+        foreach (var (name, run, activation) in epilogues)
+        {
+            using var output = run();
+            var y = backend.DownloadBuffer(output);
+            for (int i = 0; i < M; i++)
+                for (int j = 0; j < N; j++)
+                {
+                    double expected = activation(Dot(a, b, i, j, K, N) + bias[j]);
+                    Assert.True(Math.Abs(expected - y[i * N + j]) <= 1e-4 * (1 + Math.Abs(expected)),
+                        $"{name}[{i},{j}]: expected {expected}, got {y[i * N + j]}");
+                }
+        }
+    }
+
+    [SkippableTheory]
+    [InlineData(16)]
+    [InlineData(64)]
+    public void Rfft_WritesOnlyTheNonNegativeFrequencyBins(int n)
+    {
+        using var lease = Create(_name, out var backend);
+        Skip.If(backend is null, _name + " is not available on this machine.");
+        var x = Values(70, n);
+        const float Sentinel = 7f;
+        using var input = backend.AllocateBuffer(x);
+        // n slots, so a transform that writes past the n / 2 + 1 bins of the contract shows up in the slots after them.
+        using var re = backend.AllocateBuffer(Filled(n, Sentinel));
+        using var im = backend.AllocateBuffer(Filled(n, Sentinel));
+
+        backend.RFFT(input, re, im, n);
+
+        var yr = backend.DownloadBuffer(re);
+        var yi = backend.DownloadBuffer(im);
+        for (int k = 0; k <= n / 2; k++)
+        {
+            double sr = 0, si = 0;
+            for (int j = 0; j < n; j++)
+            {
+                double angle = -2 * Math.PI * ((long)k * j % n) / n;
+                sr += x[j] * Math.Cos(angle);
+                si += x[j] * Math.Sin(angle);
+            }
+            Assert.True(Math.Abs(sr - yr[k]) <= 1e-3 * (1 + Math.Abs(sr)), $"re[{k}]: expected {sr}, got {yr[k]}");
+            Assert.True(Math.Abs(si - yi[k]) <= 1e-3 * (1 + Math.Abs(si)), $"im[{k}]: expected {si}, got {yi[k]}");
+        }
+        for (int k = n / 2 + 1; k < n; k++)
+        {
+            Assert.Equal(Sentinel, yr[k]);
+            Assert.Equal(Sentinel, yi[k]);
+        }
+    }
+
+    private static float[] Filled(int length, float value)
+    {
+        var data = new float[length];
+        for (int i = 0; i < length; i++) data[i] = value;
+        return data;
+    }
+
+    [SkippableTheory]
+    [InlineData(8, 16, false, false)]
+    [InlineData(8, 16, true, false)]
+    [InlineData(8, 16, false, true)]   // in place
+    [InlineData(6, 10, false, false)]  // not a power of two
+    [InlineData(6, 10, true, true)]
+    public void Fft2D_EqualsTheTwoDimensionalDft(int height, int width, bool inverse, bool inPlace)
+    {
+        using var lease = Create(_name, out var backend);
+        Skip.If(backend is null, _name + " is not available on this machine.");
+        int count = height * width;
+        var xr = Values(80, count);
+        var xi = Values(81, count);
+        using var inRe = backend.AllocateBuffer(xr);
+        using var inIm = backend.AllocateBuffer(xi);
+        using var outRe = backend.AllocateBuffer(count);
+        using var outIm = backend.AllocateBuffer(count);
+        var re = inPlace ? inRe : outRe;
+        var im = inPlace ? inIm : outIm;
+
+        backend.FFT2D(inRe, inIm, re, im, height, width, inverse);
+
+        var yr = backend.DownloadBuffer(re);
+        var yi = backend.DownloadBuffer(im);
+        double sign = inverse ? 1 : -1, scale = inverse ? 1.0 / count : 1.0;
+        for (int ky = 0; ky < height; ky++)
+            for (int kx = 0; kx < width; kx++)
+            {
+                double sr = 0, si = 0;
+                for (int y = 0; y < height; y++)
+                    for (int x = 0; x < width; x++)
+                    {
+                        double angle = sign * 2 * Math.PI * ((double)(ky * y % height) / height + (double)(kx * x % width) / width);
+                        double c = Math.Cos(angle), s = Math.Sin(angle);
+                        sr += xr[y * width + x] * c - xi[y * width + x] * s;
+                        si += xr[y * width + x] * s + xi[y * width + x] * c;
+                    }
+                sr *= scale;
+                si *= scale;
+                int at = ky * width + kx;
+                Assert.True(Math.Abs(sr - yr[at]) <= 1e-3 * (1 + Math.Abs(sr)), $"re[{ky},{kx}]: expected {sr}, got {yr[at]}");
+                Assert.True(Math.Abs(si - yi[at]) <= 1e-3 * (1 + Math.Abs(si)), $"im[{ky},{kx}]: expected {si}, got {yi[at]}");
+            }
+    }
+
+    [SkippableFact]
+    public void Hgemm_IsTheProductRoundedToHalfPrecision()
+    {
+        using var lease = Create(_name, out var backend);
+        Skip.If(backend is null, _name + " is not available on this machine.");
+        var half = backend as IGpuHalfPrecisionBackend;
+        Skip.If(half is null || !half.SupportsHgemm, _name + " has no half-precision GEMM.");
+        const int M = 19, K = 23, N = 17;   // not multiples of a tile
+        using var a32 = backend.AllocateBuffer(Values(90, M * K));
+        using var b32 = backend.AllocateBuffer(Values(91, K * N));
+        using var a16 = backend.AllocateByteBuffer(M * K * 2);
+        using var b16 = backend.AllocateByteBuffer(K * N * 2);
+        using var c16 = backend.AllocateByteBuffer(M * N * 2);
+        using var c32 = backend.AllocateBuffer(M * N);
+        using var aBack = backend.AllocateBuffer(M * K);
+        using var bBack = backend.AllocateBuffer(K * N);
+        backend.ConvertToFp16(a32, a16, M * K);
+        backend.ConvertToFp16(b32, b16, K * N);
+        backend.ConvertToFp32(a16, aBack, M * K);
+        backend.ConvertToFp32(b16, bBack, K * N);
+        var ah = backend.DownloadBuffer(aBack);
+        var bh = backend.DownloadBuffer(bBack);
+
+        half.Hgemm(a16, b16, c16, M, N, K);
+        backend.ConvertToFp32(c16, c32, M * N);
+
+        var y = backend.DownloadBuffer(c32);
+        for (int i = 0; i < M; i++)
+            for (int j = 0; j < N; j++)
+            {
+                // The product of the half-precision inputs, accumulated in FP32 and rounded once: within one FP16 ulp.
+                double expected = Dot(ah, bh, i, j, K, N);
+                Assert.True(Math.Abs(expected - y[i * N + j]) <= 2e-3 * Math.Abs(expected) + 1e-3,
+                    $"C[{i},{j}]: expected {expected}, got {y[i * N + j]}");
+            }
+    }
+
     // The backend, or null when unavailable; the returned disposable disposes a backend the test created.
     private static IDisposable? Create(string name, out IDirectGpuBackend? backend)
     {

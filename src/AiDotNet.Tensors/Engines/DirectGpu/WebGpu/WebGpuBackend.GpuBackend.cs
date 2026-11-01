@@ -372,24 +372,6 @@ public sealed partial class WebGpuBackend
         return output;
     }
 
-    public IGpuBuffer GemmBiasSwish(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-    {
-        var temp = GemmBias(A, B, bias, M, N, K);
-        var output = AllocateBuffer(M * N);
-        Silu(temp, output, M * N);
-        temp.Dispose();
-        return output;
-    }
-
-    public IGpuBuffer GemmBiasLeakyRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K, float alpha = 0.01f)
-    {
-        var temp = GemmBias(A, B, bias, M, N, K);
-        var output = AllocateBuffer(M * N);
-        LeakyRelu(temp, output, alpha, M * N);
-        temp.Dispose();
-        return output;
-    }
-
     #endregion
 
     #region Broadcast Operations
@@ -728,24 +710,6 @@ public sealed partial class WebGpuBackend
         int totalBlocks = M * (K / 4);
         Dispatch3BufferAsync("Sparse2x4", WebGpuKernels.Sparse2x4Source, "decompress_2x4_sparse",
             sparseValues, sparseIndices, denseOutput, uniforms, totalBlocks).GetAwaiter().GetResult();
-    }
-
-    public void SparseGemm(IGpuBuffer sparseAValues, IGpuBuffer sparseAIndices, IGpuBuffer B, IGpuBuffer C,
-        int M, int N, int K, float alpha = 1f, float beta = 0f)
-    {
-        EnsureInitialized();
-        using var denseA = AllocateBuffer(M * K);
-        Decompress2x4Sparse(sparseAValues, sparseAIndices, denseA, M, K);
-        Gemm(denseA, B, C, M, N, K, alpha, beta);
-    }
-
-    public IGpuBuffer SparseGemmBiasRelu(IGpuBuffer sparseAValues, IGpuBuffer sparseAIndices, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-    {
-        EnsureInitialized();
-        using var denseA = AllocateBuffer(M * K);
-        Decompress2x4Sparse(sparseAValues, sparseAIndices, denseA, M, K);
-        var result = GemmBiasRelu(denseA, B, bias, M, N, K);
-        return result;
     }
 
     public void CsrSpMM(IGpuBuffer csrValues, IGpuBuffer csrColIndices, IGpuBuffer csrRowPointers,

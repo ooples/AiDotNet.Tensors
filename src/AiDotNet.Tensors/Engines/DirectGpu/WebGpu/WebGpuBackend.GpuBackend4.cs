@@ -669,13 +669,6 @@ public sealed partial class WebGpuBackend
         // For inverse FFT, the kernel already handles 1/N normalization
     }
 
-    public void RFFT(IGpuBuffer input, IGpuBuffer outputReal, IGpuBuffer outputImag, int n)
-    {
-        using var zeros = (WebGpuBuffer)AllocateBuffer(n);
-        Fill(zeros, 0f, n);
-        FFT(input, zeros, outputReal, outputImag, n, false);
-    }
-
     public void IRFFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer output, int n)
     {
         using var tempImag = (WebGpuBuffer)AllocateBuffer(n);
@@ -703,29 +696,6 @@ public sealed partial class WebGpuBackend
         int total = batch * n;
         Dispatch4BufferAsync("FFT", WebGpuKernels.FFTSource, "fft_1d",
             inputReal, inputImag, outputReal, outputImag, uniforms, total).GetAwaiter().GetResult();
-    }
-
-    public void FFT2D(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag,
-        int height, int width, bool inverse)
-    {
-        // 2D FFT = row-wise 1D FFT (batch=height, n=width) then column-wise 1D FFT (batch=width, n=height)
-        // Pass 1: Row-wise FFT - data is already in row-major order, so batch=height works directly
-        using var tempR = (WebGpuBuffer)AllocateBuffer(height * width);
-        using var tempI = (WebGpuBuffer)AllocateBuffer(height * width);
-        BatchedFFT(inputReal, inputImag, tempR, tempI, height, width, inverse);
-        // Pass 2: Column-wise FFT - need to transpose, FFT, then transpose back
-        using var transR = (WebGpuBuffer)AllocateBuffer(height * width);
-        using var transI = (WebGpuBuffer)AllocateBuffer(height * width);
-        // Transpose from (height x width) to (width x height)
-        BatchedTranspose(tempR, transR, 1, height, width);
-        BatchedTranspose(tempI, transI, 1, height, width);
-        // FFT columns: now batch=width, n=height
-        using var fftR = (WebGpuBuffer)AllocateBuffer(height * width);
-        using var fftI = (WebGpuBuffer)AllocateBuffer(height * width);
-        BatchedFFT(transR, transI, fftR, fftI, width, height, inverse);
-        // Transpose back from (width x height) to (height x width)
-        BatchedTranspose(fftR, outputReal, 1, width, height);
-        BatchedTranspose(fftI, outputImag, 1, width, height);
     }
 
     /// <inheritdoc/>

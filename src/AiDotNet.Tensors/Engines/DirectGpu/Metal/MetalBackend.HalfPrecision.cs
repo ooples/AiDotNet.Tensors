@@ -166,23 +166,6 @@ public sealed partial class MetalBackend : IGpuHalfPrecisionBackend, IFp16ConvBa
         encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
 
-    /// <inheritdoc/>
-    public void Hgemm(IGpuBuffer aFp16, IGpuBuffer bFp16, IGpuBuffer cFp16,
-        int m, int n, int k)
-    {
-        ThrowIfDisposed();
-        ValidateHalfGemmArgs(aFp16, bFp16, cFp16, m, n, k);
-
-        // Accumulate in FP32 into a scratch buffer, then round the result down to
-        // FP16 (matches cublasHgemm's FP16 output). Keeping the accumulation in
-        // FP32 avoids the worst half-precision drift; ConvertToFp16 then packs
-        // the result to halves. A separate scratch avoids reading and writing the
-        // same buffer in one pass.
-        using var scratch = AllocateBuffer(m * n);
-        GemmFp16In32fOut(aFp16, bFp16, scratch, m, n, k);
-        ConvertToFp16(scratch, cFp16, m * n);
-    }
-
     /// <summary>
     /// True when the FP16-native op kernels are available — they live in the same matrix MSL library as
     /// the FP16 GEMM, so they compile whenever the backend does.

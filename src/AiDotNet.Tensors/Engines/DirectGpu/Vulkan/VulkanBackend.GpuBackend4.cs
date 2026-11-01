@@ -235,26 +235,6 @@ public sealed unsafe partial class VulkanBackend
             new[] { (uint)M, (uint)K });
     }
 
-    public void SparseGemm(IGpuBuffer sparseAValues, IGpuBuffer sparseAIndices, IGpuBuffer B, IGpuBuffer C,
-        int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
-    {
-        EnsureInitialized();
-        var denseA = AllocateBuffer(M * K);
-        Decompress2x4Sparse(sparseAValues, sparseAIndices, denseA, M, K);
-        Gemm(denseA, B, C, M, N, K, alpha, beta);
-        denseA.Dispose();
-    }
-
-    public IGpuBuffer SparseGemmBiasRelu(IGpuBuffer sparseAValues, IGpuBuffer sparseAIndices, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-    {
-        EnsureInitialized();
-        var denseA = AllocateBuffer(M * K);
-        Decompress2x4Sparse(sparseAValues, sparseAIndices, denseA, M, K);
-        var result = GemmBiasRelu(denseA, B, bias, M, N, K);
-        denseA.Dispose();
-        return result;
-    }
-
     // NOTE: CsrSpMM moved to VulkanBackend.Sparse.cs and re-implemented as a real
     // GPU compute dispatch (GLSL csr_spmm via GlslQuintOp) — the previous
     // download-compute-upload stub here would defeat the point of routing SparseOps'
@@ -689,14 +669,6 @@ public sealed unsafe partial class VulkanBackend
             if (inverse) { sumR /= n; sumI /= n; }
             outR[k] = sumR; outI[k] = sumI;
         }
-    }
-
-    public void RFFT(IGpuBuffer input, IGpuBuffer outputReal, IGpuBuffer outputImag, int n)
-    {
-        var zeroImag = AllocateBuffer(n);
-        Fill(zeroImag, 0f, n);
-        FFT(input, zeroImag, outputReal, outputImag, n, false);
-        zeroImag.Dispose();
     }
 
     public void IRFFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer output, int n)

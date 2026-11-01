@@ -125,20 +125,6 @@ public sealed partial class WebGpuBackend : IGpuHalfPrecisionBackend, IFp16ConvB
             weightsFp16, colFp16, output, uniforms, checked(m * n)).GetAwaiter().GetResult();
     }
 
-    /// <inheritdoc/>
-    public void Hgemm(IGpuBuffer aFp16, IGpuBuffer bFp16, IGpuBuffer cFp16,
-        int m, int n, int k)
-    {
-        ValidateHalfGemmArgs(aFp16, bFp16, cFp16, m, n, k);
-        // Accumulate in f32 into a scratch buffer, then round the result down to
-        // FP16 precision so the output buffer carries half-precision values
-        // (matches cublasHgemm's FP16 output). A separate scratch avoids binding
-        // the same buffer as both GEMM output and convert input.
-        using var scratch = AllocateBuffer(m * n);
-        Gemm(aFp16, bFp16, scratch, m, n, k);
-        ConvertToFp16(scratch, cFp16, m * n);
-    }
-
     private static void ValidateHalfGemmArgs(IGpuBuffer a, IGpuBuffer b, IGpuBuffer c,
         int m, int n, int k)
     {

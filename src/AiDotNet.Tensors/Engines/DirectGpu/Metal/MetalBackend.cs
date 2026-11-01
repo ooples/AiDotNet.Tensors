@@ -825,18 +825,11 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
             throw new ArgumentException("Buffers must be MetalGpuBuffer");
         }
 
-        DispatchTiledMatmul("matmul_tiled", aBuffer, bBuffer, cBuffer, M, N, K);
-
-        // Handle alpha/beta if not default
-        if (Math.Abs(alpha - 1.0f) > 1e-7f || Math.Abs(beta) > 1e-7f)
-        {
-            // Scale result by alpha and add beta*C_old
-            // This is simplified - full implementation would handle beta * C_old
-            if (Math.Abs(alpha - 1.0f) > 1e-7f)
-            {
-                Scale(cBuffer, cBuffer, alpha, M * N);
-            }
-        }
+        // C = alpha * A * B + beta * C in one pass (FusedGemm's gemm_epilogue); the plain product keeps matmul_tiled.
+        if (alpha == 1.0f && beta == 0.0f)
+            DispatchTiledMatmul("matmul_tiled", aBuffer, bBuffer, cBuffer, M, N, K);
+        else
+            DispatchGemmEpilogue(aBuffer, bBuffer, null, cBuffer, M, N, K, GemmActivation.None, alpha, beta, 0f);
     }
 
     /// <summary>Edge of the square tile <c>matmul_tiled</c> and <c>matmul_tiled_transposed</c> use (TILE_SIZE in the MSL).</summary>
@@ -910,99 +903,6 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         encoder.SetBytes((uint)N, 5);
         encoder.SetBytes((uint)K, 6);
         encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
-    }
-
-    #endregion
-
-    #region Fused Operations
-
-    /// <summary>
-    /// Fused GEMM + Bias + ReLU: output = ReLU(A * B + bias)
-    /// </summary>
-    public IGpuBuffer GemmBiasRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-    {
-        ThrowIfDisposed();
-
-        var C = AllocateBuffer(M * N);
-        Gemm(A, B, C, M, N, K);
-        BiasAdd(C, bias, C, M, N);
-        Relu(C, C, M * N);
-        return C;
-    }
-
-    /// <summary>
-    /// Fused GEMM + Bias + GELU: output = GELU(A * B + bias)
-    /// </summary>
-    public IGpuBuffer GemmBiasGelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-    {
-        ThrowIfDisposed();
-
-        var C = AllocateBuffer(M * N);
-        Gemm(A, B, C, M, N, K);
-        BiasAdd(C, bias, C, M, N);
-        Gelu(C, C, M * N);
-        return C;
-    }
-
-    /// <summary>
-    /// Fused GEMM + Bias + Sigmoid: output = Sigmoid(A * B + bias)
-    /// </summary>
-    public IGpuBuffer GemmBiasSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-    {
-        ThrowIfDisposed();
-
-        var C = AllocateBuffer(M * N);
-        Gemm(A, B, C, M, N, K);
-        BiasAdd(C, bias, C, M, N);
-        Sigmoid(C, C, M * N);
-        return C;
-    }
-
-    /// <summary>
-    /// Fused GEMM + Bias + Tanh: output = Tanh(A * B + bias)
-    /// </summary>
-    public IGpuBuffer GemmBiasTanh(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-    {
-        ThrowIfDisposed();
-
-        var C = AllocateBuffer(M * N);
-        Gemm(A, B, C, M, N, K);
-        BiasAdd(C, bias, C, M, N);
-        Tanh(C, C, M * N);
-        return C;
-    }
-
-    /// <summary>
-    /// Fused GEMM + Bias (no activation): output = A * B + bias
-    /// </summary>
-    public IGpuBuffer GemmBias(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-    {
-        ThrowIfDisposed();
-
-        var C = AllocateBuffer(M * N);
-        Gemm(A, B, C, M, N, K);
-        BiasAdd(C, bias, C, M, N);
-        return C;
-    }
-
-    public IGpuBuffer GemmBiasSwish(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-    {
-        ThrowIfDisposed();
-        var temp = GemmBias(A, B, bias, M, N, K);
-        var output = AllocateBuffer(M * N);
-        Silu(temp, output, M * N);
-        temp.Dispose();
-        return output;
-    }
-
-    public IGpuBuffer GemmBiasLeakyRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K, float alpha = 0.01f)
-    {
-        ThrowIfDisposed();
-        var temp = GemmBias(A, B, bias, M, N, K);
-        var output = AllocateBuffer(M * N);
-        LeakyRelu(temp, output, alpha, M * N);
-        temp.Dispose();
-        return output;
     }
 
     #endregion

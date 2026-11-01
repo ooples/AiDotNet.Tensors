@@ -204,4 +204,112 @@ void main() {
         GlslNaryOp(CsrSpMMBiasSource, new[] { csrValues, csrColIndices, csrRowPointers, denseB, bias, output }, (int)total,
             new[] { (uint)M, (uint)K, (uint)N, (uint)nnz });
     }
+
+    // C = alpha * A * B + beta * C with A in the 2:4 layout of VulkanResidentKernels.Decompress2x4: two kept values per
+    // block of four, and one byte per block whose low two bit pairs are the kept offsets. Only the kept values are
+    // multiplied; C is not read when beta is zero, as in a BLAS GEMM.
+    private const string Sparse24GemmSource = FusedCompositeHeader + @"
+layout(std430, binding = 0) readonly buffer Values  { float values[]; };
+layout(std430, binding = 1) readonly buffer Offsets { uint offsets[]; };
+layout(std430, binding = 2) readonly buffer DenseB  { float denseB[]; };
+layout(std430, binding = 3) buffer Output           { float outC[]; };
+layout(push_constant) uniform PC { uint M; uint N; uint K; uint alphaBits; uint betaBits; } pc;
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.M * pc.N) return;
+    uint row = gid / pc.N;
+    uint col = gid - row * pc.N;
+    uint blocks = pc.K / 4u;
+    float acc = 0.0;
+    for (uint blk = 0u; blk < blocks; blk++) {
+        uint group = row * blocks + blk;
+        uint packed = (offsets[group / 4u] >> ((group % 4u) * 8u)) & 255u;
+        acc += values[group * 2u] * denseB[(blk * 4u + (packed & 3u)) * pc.N + col];
+        acc += values[group * 2u + 1u] * denseB[(blk * 4u + ((packed >> 2u) & 3u)) * pc.N + col];
+    }
+    float alpha = uintBitsToFloat(pc.alphaBits), beta = uintBitsToFloat(pc.betaBits);
+    outC[gid] = beta == 0.0 ? alpha * acc : alpha * acc + beta * outC[gid];
+}";
+
+    // max(0, A * B + bias) with A in the same 2:4 layout.
+    private const string Sparse24GemmBiasReluSource = FusedCompositeHeader + @"
+layout(std430, binding = 0) readonly buffer Values  { float values[]; };
+layout(std430, binding = 1) readonly buffer Offsets { uint offsets[]; };
+layout(std430, binding = 2) readonly buffer DenseB  { float denseB[]; };
+layout(std430, binding = 3) readonly buffer Bias    { float bias[]; };
+layout(std430, binding = 4) writeonly buffer Output { float outC[]; };
+layout(push_constant) uniform PC { uint M; uint N; uint K; } pc;
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.M * pc.N) return;
+    uint row = gid / pc.N;
+    uint col = gid - row * pc.N;
+    uint blocks = pc.K / 4u;
+    float acc = 0.0;
+    for (uint blk = 0u; blk < blocks; blk++) {
+        uint group = row * blocks + blk;
+        uint packed = (offsets[group / 4u] >> ((group % 4u) * 8u)) & 255u;
+        acc += values[group * 2u] * denseB[(blk * 4u + (packed & 3u)) * pc.N + col];
+        acc += values[group * 2u + 1u] * denseB[(blk * 4u + ((packed >> 2u) & 3u)) * pc.N + col];
+    }
+    outC[gid] = max(0.0, acc + bias[col]);
+}";
+
+    // The n / 2 + 1 non-negative-frequency bins of a real input (the interface's RFFT contract; the composed version wrote
+    // all n bins). The twiddle index k * j is kept modulo n as it advances, so it neither overflows nor loses precision.
+    private const string RealDftSource = FusedCompositeHeader + @"
+layout(std430, binding = 0) readonly buffer Input   { float inputData[]; };
+layout(std430, binding = 1) writeonly buffer OutRe  { float outRe[]; };
+layout(std430, binding = 2) writeonly buffer OutIm  { float outIm[]; };
+layout(push_constant) uniform PC { uint n; } pc;
+void main() {
+    uint k = gl_GlobalInvocationID.x;
+    if (k > pc.n / 2u) return;
+    float step = -6.283185307179586 / float(pc.n);
+    float re = 0.0, im = 0.0;
+    uint phase = 0u;
+    for (uint j = 0u; j < pc.n; j++) {
+        float a = step * float(phase);
+        re += inputData[j] * cos(a);
+        im += inputData[j] * sin(a);
+        phase += k;
+        if (phase >= pc.n) phase -= pc.n;
+    }
+    outRe[k] = re;
+    outIm[k] = im;
+}";
+
+    public void SparseGemm(IGpuBuffer sparseAValues, IGpuBuffer sparseAIndices, IGpuBuffer B, IGpuBuffer C,
+        int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
+    {
+        EnsureInitialized();
+        ValidateSparse24(M, N, K);
+        GlslNaryOp(Sparse24GemmSource, new[] { sparseAValues, sparseAIndices, B, C }, checked(M * N),
+            new[] { (uint)M, (uint)N, (uint)K, FloatBits(alpha), FloatBits(beta) });
+    }
+
+    public IGpuBuffer SparseGemmBiasRelu(IGpuBuffer sparseAValues, IGpuBuffer sparseAIndices, IGpuBuffer B, IGpuBuffer bias,
+        int M, int N, int K)
+    {
+        EnsureInitialized();
+        ValidateSparse24(M, N, K);
+        var output = AllocateBuffer(checked(M * N));
+        GlslNaryOp(Sparse24GemmBiasReluSource, new[] { sparseAValues, sparseAIndices, B, bias, output }, M * N,
+            new[] { (uint)M, (uint)N, (uint)K });
+        return output;
+    }
+
+    private static void ValidateSparse24(int M, int N, int K)
+    {
+        if (M <= 0) throw new ArgumentOutOfRangeException(nameof(M), "M must be positive.");
+        if (N <= 0) throw new ArgumentOutOfRangeException(nameof(N), "N must be positive.");
+        if (K <= 0 || K % 4 != 0) throw new ArgumentException($"K ({K}) must be a positive multiple of 4 for 2:4 sparsity.", nameof(K));
+    }
+
+    public void RFFT(IGpuBuffer input, IGpuBuffer outputReal, IGpuBuffer outputImag, int n)
+    {
+        EnsureInitialized();
+        if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n), "n must be positive.");
+        GlslNaryOp(RealDftSource, new[] { input, outputReal, outputImag }, n / 2 + 1, new[] { (uint)n });
+    }
 }
