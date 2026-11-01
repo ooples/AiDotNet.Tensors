@@ -10783,6 +10783,37 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>
+    /// Whether <see cref="DispatchFloatConv2D"/> sends an NCHW float convolution to one of the kernels it tries before
+    /// the adaptive chain (the 1x1 GEMMs, Winograd, the direct blocked kernel, the small-output kernel, the batch-wide
+    /// GEMM). A fused conv + epilogue entry must then run the convolution through <c>Conv2DInto</c> to compute it bit for
+    /// bit as the unfused plan does; the adaptive chain's 3x3 kernels sum in another order.
+    /// </summary>
+    private static bool DispatchTakesDedicatedFloatRoute(int batch, int inChannels, int height, int width, int outChannels,
+        int kernelHeight, int kernelWidth, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW,
+        int outputHeight, int outputWidth)
+    {
+        if (t_forceFullIm2Col || t_forceImplicitGemmForTest) return false;
+#if NET5_0_OR_GREATER
+        if ((strideH > 1 || strideW > 1)
+            && Simd.Conv1x1Gemm.Applies(batch, kernelHeight, kernelWidth, padH, padW, dilationH, dilationW))
+            return true;
+#endif
+        if (IsConv1x1PerImageGemmShape(batch, kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW))
+            return true;
+#if NET5_0_OR_GREATER
+        if (Simd.WinogradF43.Applies(batch, inChannels, outChannels, height, width, kernelHeight, kernelWidth,
+                strideH, strideW, padH, padW, dilationH, dilationW)
+            || Simd.DirectConvAvx2.TryChoose(new Simd.DirectConvShape(Simd.DirectConvPass.Forward, batch, inChannels,
+                outChannels, height, width, kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW), out _)
+            || Simd.SmallOutConv.Applies(inChannels, outChannels, kernelHeight, kernelWidth, strideH, strideW,
+                dilationH, dilationW, padH, padW))
+            return true;
+#endif
+        return UseBatchedConvForward(batch, inChannels, kernelHeight, kernelWidth, strideH, strideW, outputHeight,
+            outputWidth, outChannels);
+    }
+
+    /// <summary>
     /// Dispatches every float Conv2D entry point through the same platform/geometry policy.
     /// The supplied arrays may already be unpacked for a packed-layout fallback.
     /// </summary>
