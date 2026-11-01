@@ -20,7 +20,9 @@ internal static unsafe partial class DepthwiseConv3x3
     // Operator opt-out (A/B switch).
     private static readonly bool s_avx512Env = Environment.GetEnvironmentVariable("AIDOTNET_DW_AVX512") != "0";
 
-    private static bool UseAvx512Blocks(int channels, int wd)
+    /// <summary>Whether the sixteen-channel kernels take a plane of <paramref name="wd"/> columns (internal so tests
+    /// can prove they ran).</summary>
+    internal static bool UseAvx512Blocks(int channels, int wd)
         => UseChannelBlocks(channels, wd) && (channels & 15) == 0 && s_avx512Env
             && (Vector512.IsHardwareAccelerated || s_forceAvx512ForTest);
 

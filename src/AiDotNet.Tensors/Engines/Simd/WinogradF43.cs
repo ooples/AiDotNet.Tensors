@@ -76,11 +76,29 @@ internal static unsafe class WinogradF43
     /// that save work in proportion to C K: at 64 -> 64 channels on 32x32 planes the transforms made it 1.5x slower than
     /// the direct kernel, at 128 -> 128 on 16x16 it ran in 0.4x the direct kernel's time.
     /// </summary>
+    /// <remarks>
+    /// Also refuses a shape whose workspace passes <see cref="MaxWeightGradientWorkspaceFloats"/>: unlike the forward,
+    /// which works tile by tile in a small scratch, <see cref="BackwardKernel"/> holds V, D and M for the whole batch at
+    /// once, so its memory grows with batch x plane x channels. Past the cap the direct route takes it.
+    /// </remarks>
     internal static bool AppliesToWeightGradient(int batch, int inChannels, int outChannels, int height, int width,
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
         => Applies(batch, inChannels, outChannels, height, width, kernelH, kernelW, strideH, strideW, padH, padW,
                dilationH, dilationW)
-           && (long)inChannels * outChannels >= 64L * (inChannels + outChannels);
+           && (long)inChannels * outChannels >= 64L * (inChannels + outChannels)
+           && WeightGradientWorkspaceFloats(batch, inChannels, outChannels, height, width) <= MaxWeightGradientWorkspaceFloats;
+
+    /// <summary>The most floats <see cref="BackwardKernel"/> may hold at once: 2^27, 512 MiB. A ResNet 64 -> 64 layer on
+    /// 56x56 planes at batch 128 needs 116M and stays under it.</summary>
+    internal const long MaxWeightGradientWorkspaceFloats = 1L << 27;
+
+    /// <summary>The floats <see cref="BackwardKernel"/> rents together: V (36 per patch and input channel), D (36 per
+    /// patch and output channel) and M (36 per channel pair).</summary>
+    internal static long WeightGradientWorkspaceFloats(int batch, int inChannels, int outChannels, int height, int width)
+    {
+        long patches = (long)batch * ((height + Tile - 1) / Tile) * ((width + Tile - 1) / Tile);
+        return Points * (patches * ((long)inChannels + outChannels) + (long)inChannels * outChannels);
+    }
 
     /// <summary>y [N, K, H, W] (=, or += when accumulate) = the 3x3 padding-1 convolution of x [N, C, H, W] with w [K, C, 3, 3].</summary>
     internal static void Forward(float[] x, int xOff, float[] w, int wOff, float[] y, int yOff, bool accumulate,

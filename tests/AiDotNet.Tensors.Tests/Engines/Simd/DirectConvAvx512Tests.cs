@@ -19,37 +19,44 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd;
 [Collection("ConvPerfSerial")]
 public class DirectConvAvx512Tests
 {
-    public static TheoryData<int, int, int, int, int, int> Shapes => new()
+    public static TheoryData<int, int, int, int, int, int, int, int> Shapes => new()
     {
-        // batch, inChannels, outChannels, size, stride, padding
-        { 2, 64, 64, 9, 1, 1 },
-        { 3, 32, 64, 7, 2, 1 },
-        { 2, 128, 128, 4, 1, 1 },
-        { 2, 64, 128, 8, 2, 1 },
-        { 4, 32, 32, 5, 1, 1 },
-        { 8, 512, 64, 4, 1, 1 },
-        { 16, 32, 64, 6, 1, 1 },   // weight gradient split into partials over the batch
+        // batch, inChannels, outChannels, size, stride, padding, kernel, dilation
+        { 2, 64, 64, 9, 1, 1, 3, 1 },
+        { 3, 32, 64, 7, 2, 1, 3, 1 },
+        { 2, 128, 128, 4, 1, 1, 3, 1 },
+        { 2, 64, 128, 8, 2, 1, 3, 1 },
+        { 4, 32, 32, 5, 1, 1, 3, 1 },
+        { 8, 512, 64, 4, 1, 1, 3, 1 },
+        { 16, 32, 64, 6, 1, 1, 3, 1 },   // weight gradient split into partials over the batch
+        // The weight-gradient tile's other column cases: one column (no zero-fill branch), five columns (a full group
+        // of three and a partial last group of two), and dilation 2 (the column step is dilationW * Block).
+        { 2, 64, 64, 9, 1, 0, 1, 1 },
+        { 2, 64, 64, 9, 1, 2, 5, 1 },
+        { 3, 32, 64, 11, 2, 2, 5, 1 },
+        { 2, 64, 64, 9, 1, 2, 3, 2 },
     };
 
     [SkippableTheory]
     [MemberData(nameof(Shapes))]
-    public void TheAvx512KernelMatchesTheAvx2KernelBitForBit(int batch, int inChannels, int outChannels, int size, int stride, int padding)
+    public void TheAvx512KernelMatchesTheAvx2KernelBitForBit(int batch, int inChannels, int outChannels, int size, int stride,
+        int padding, int kernel, int dilation)
     {
         Skip.IfNot(System.Runtime.Intrinsics.X86.Avx2.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported,
             "The AVX2 side of the comparison needs AVX2 and FMA.");
-        var rng = new Random(batch * 131 + inChannels);
-        int o = (size + 2 * padding - 3) / stride + 1;
+        var rng = new Random(batch * 131 + inChannels + kernel * 7 + dilation);
+        int o = (size + 2 * padding - dilation * (kernel - 1) - 1) / stride + 1;
         var x = Random(rng, batch, inChannels, size, size);
-        var w = Random(rng, outChannels, inChannels, 3, 3);
+        var w = Random(rng, outChannels, inChannels, kernel, kernel);
         var dy = Random(rng, batch, outChannels, o, o);
         bool previous = DirectConvAvx2.s_useAvx512, previousForce = DirectConvAvx2.s_forceAvx512ForTest;
         try
         {
             DirectConvAvx2.s_useAvx512 = true;
             DirectConvAvx2.s_forceAvx512ForTest = !System.Runtime.Intrinsics.Vector512.IsHardwareAccelerated;
-            var (y512, dx512, dw512) = Run(x, w, dy, batch, inChannels, outChannels, size, stride, padding, o);
+            var (y512, dx512, dw512) = Run(x, w, dy, batch, inChannels, outChannels, size, stride, padding, kernel, dilation, o);
             DirectConvAvx2.s_useAvx512 = false;
-            var (y256, dx256, dw256) = Run(x, w, dy, batch, inChannels, outChannels, size, stride, padding, o);
+            var (y256, dx256, dw256) = Run(x, w, dy, batch, inChannels, outChannels, size, stride, padding, kernel, dilation, o);
             Assert.Equal(y256, y512);
             Assert.Equal(dx256, dx512);
             Assert.Equal(dw256, dw512);
@@ -62,21 +69,24 @@ public class DirectConvAvx512Tests
     }
 
     // Straight through the direct kernel (no route choice), so the comparison cannot land on another implementation.
+    // BackwardInput has no dilation parameter (its callers route dilated convolutions elsewhere), so a dilated shape
+    // compares an empty input gradient on both sides and is checked through the forward and the weight gradient.
     private static (float[] Y, float[] Dx, float[] Dw) Run(Tensor<float> x, Tensor<float> w, Tensor<float> dy,
-        int batch, int inChannels, int outChannels, int size, int stride, int padding, int o)
+        int batch, int inChannels, int outChannels, int size, int stride, int padding, int kernel, int dilation, int o)
     {
         var y = new float[batch * outChannels * o * o];
         DirectConvAvx2.Forward(x.ToArray(), 0, w.ToArray(), 0, y, 0, accumulate: false, batch, inChannels, size, size,
-            outChannels, 3, 3, stride, stride, padding, padding, 1, 1, o, o);
-        var dx = new float[batch * inChannels * size * size];
-        DirectConvAvx2.BackwardInput(dy.ToArray(), 0, w.ToArray(), 0, dx, 0, accumulate: false, batch, inChannels, size, size,
-            outChannels, 3, 3, stride, stride, padding, padding, o, o);
+            outChannels, kernel, kernel, stride, stride, padding, padding, dilation, dilation, o, o);
+        var dx = new float[dilation == 1 ? batch * inChannels * size * size : 0];
+        if (dilation == 1)
+            DirectConvAvx2.BackwardInput(dy.ToArray(), 0, w.ToArray(), 0, dx, 0, accumulate: false, batch, inChannels, size, size,
+                outChannels, kernel, kernel, stride, stride, padding, padding, o, o);
         // The weight gradient accumulated onto a seeded buffer (the += path), with a target task count that splits the
         // batch into partial gradients.
-        var dw = new float[outChannels * inChannels * 9];
+        var dw = new float[outChannels * inChannels * kernel * kernel];
         for (int i = 0; i < dw.Length; i++) dw[i] = (i % 7) * 0.125f;
         DirectConvAvx2.BackwardKernel(x.ToArray(), 0, dy.ToArray(), 0, dw, 0, accumulate: true, batch, inChannels, size, size,
-            outChannels, 3, 3, stride, stride, padding, padding, 1, 1, o, o, targetTasks: 4 * outChannels);
+            outChannels, kernel, kernel, stride, stride, padding, padding, dilation, dilation, o, o, targetTasks: 4 * outChannels);
         return (y, dx, dw);
     }
 

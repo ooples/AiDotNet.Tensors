@@ -58,7 +58,7 @@ public class DepthwiseConv3x3Tests
     }
 
 #if NET9_0_OR_GREATER
-    [Theory]
+    [SkippableTheory]
     [InlineData(2, 16, 7, 1)]
     [InlineData(2, 16, 7, 2)]
     [InlineData(1, 32, 14, 1)]
@@ -68,6 +68,11 @@ public class DepthwiseConv3x3Tests
     [InlineData(2, 32, 1, 1)]
     public void TheSixteenChannelKernelsMatchTheGenericLoops(int batch, int channels, int size, int stride)
     {
+        // The sixteen-channel kernels sit behind the eight-channel gate (AVX2 + FMA) and the operator opt-out; without
+        // either, Compare would check another route and pass without running them.
+        Skip.IfNot(System.Runtime.Intrinsics.X86.Avx2.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported,
+            "The channel-blocked kernels need AVX2 + FMA.");
+        Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_DW_AVX512") == "0", "AIDOTNET_DW_AVX512=0 opts them out.");
         // Forced on hosts without AVX-512: Vector512 is emulated there, so the arithmetic is the same.
         bool previousForce = DepthwiseConv3x3.s_forceAvx512ForTest;
         int previousMaxWidth = DepthwiseConv3x3.s_channelBlockMaxWidth;
@@ -75,6 +80,7 @@ public class DepthwiseConv3x3Tests
         DepthwiseConv3x3.s_channelBlockMaxWidth = int.MaxValue;
         try
         {
+            Assert.True(DepthwiseConv3x3.UseAvx512Blocks(channels, size), "the sixteen-channel kernels would not run");
             Compare(batch, channels, size, stride);
         }
         finally

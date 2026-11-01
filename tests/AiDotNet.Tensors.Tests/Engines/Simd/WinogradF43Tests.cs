@@ -196,6 +196,18 @@ public class WinogradF43Tests
     }
 
     [SkippableFact]
+    public void WeightGradient_FallsBackPastItsWorkspaceCap()
+    {
+        Skip.IfNot(WinogradRoutes, "The Winograd kernel needs AVX2 + FMA and must not be opted out.");
+        // A ResNet 64 -> 64 layer at 56x56, batch 128, fits the cap; 128 -> 128 at batch 256 does not, though its
+        // forward still applies.
+        Assert.True(WinogradF43.WeightGradientWorkspaceFloats(128, 64, 64, 56, 56) <= WinogradF43.MaxWeightGradientWorkspaceFloats);
+        Assert.True(WinogradF43.WeightGradientWorkspaceFloats(256, 128, 128, 56, 56) > WinogradF43.MaxWeightGradientWorkspaceFloats);
+        Assert.True(WinogradF43.Applies(256, 128, 128, 56, 56, 3, 3, 1, 1, 1, 1, 1, 1));
+        Assert.False(WinogradF43.AppliesToWeightGradient(256, 128, 128, 56, 56, 3, 3, 1, 1, 1, 1, 1, 1));
+    }
+
+    [SkippableFact]
     public void Engine_ForwardAndInputGradient_TakeTheKernel_AndAgreeWithTheDirectRoute()
     {
         Skip.IfNot(WinogradRoutes, "Winograd routing needs AVX2 + FMA and AIDOTNET_CONV_WINOGRAD not set to 0.");
