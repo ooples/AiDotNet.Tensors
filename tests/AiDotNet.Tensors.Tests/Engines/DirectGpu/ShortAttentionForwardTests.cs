@@ -93,7 +93,7 @@ public sealed class ShortAttentionForwardTests
         Skip.If(engine is null || !engine.IsGpuAvailable, "No DirectGpu backend available.");
         using (engine)
         {
-            Skip.IfNot(engine.GetBackend() is IShortAttentionForwardBackend, "The backend has no short-sequence attention.");
+            // Every backend must match the CPU: OpenCL through the short-sequence kernel, CUDA through its fused kernels.
             const int b = 2, s = 65, heads = 3, d = 64;
             var q = new Tensor<float>(Values(b * s * heads * d, 4), new[] { b, s, heads * d });
             var k = new Tensor<float>(Values(b * s * heads * d, 5), new[] { b, s, heads * d });
@@ -117,7 +117,7 @@ public sealed class ShortAttentionForwardTests
         Skip.If(engine is null || !engine.IsGpuAvailable, "No DirectGpu backend available.");
         using (engine)
         {
-            Skip.IfNot(engine.GetBackend() is IShortAttentionForwardBackend, "The backend has no short-sequence attention.");
+            // Every backend must match the CPU: OpenCL through the short-sequence kernel, CUDA through its fused kernels.
             const int b = 3, s = 65, width = 192, heads = 3;
             var x = new Tensor<float>(Values(b * s * width, 7), new[] { b, s, width });
             var wq = new Tensor<float>(Values(width * width, 8), new[] { width, width });
@@ -141,7 +141,7 @@ public sealed class ShortAttentionForwardTests
         Skip.If(engine is null || !engine.IsGpuAvailable, "No DirectGpu backend available.");
         using (engine)
         {
-            Skip.IfNot(engine.GetBackend() is IShortAttentionForwardBackend, "The backend has no short-sequence attention.");
+            // Every backend must match the CPU: OpenCL through the short-sequence kernel, CUDA through its fused kernels.
             const int b = 2, s = 17, width = 48, heads = 4;
             var x = new Tensor<float>(Values(b * s * width, 12), new[] { b, s, width });
             var wq = new Tensor<float>(Values(width * width, 13), new[] { width, width });
