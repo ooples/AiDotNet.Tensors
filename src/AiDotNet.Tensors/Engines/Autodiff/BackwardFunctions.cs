@@ -1716,6 +1716,29 @@ internal static class BackwardFunctions<T>
     }
 
     /// <summary>
+    /// Backward of a training BatchNorm whose output feeds a ReLU6 -- fused by the compiled plan
+    /// (<see cref="Compilation.BatchNormRelu6FusionPattern"/>). inputs = x, gamma, beta; <paramref name="output"/> is the
+    /// ReLU6's output. Its mask comes from the output: 0 &lt; ReLU6(z) &lt; 6 exactly when 0 &lt; z &lt; 6, so the
+    /// BatchNorm output is never kept for it.
+    /// </summary>
+    internal static void BatchNormRelu6Backward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var mean = (Tensor<T>)savedState[0];
+        var variance = (Tensor<T>)savedState[1];
+        var epsilon = (double)savedState[2];
+        var parked = TakeParkedGradient(engine, output);
+        if (parked is not null) gradOutput = AddParked(engine, gradOutput, parked);
+        var masked = engine.Relu6Backward(gradOutput, output);
+        var gradInput = engine.BatchNormBackward(masked, inputs[0], inputs[1], mean, variance, epsilon,
+            out var gradGamma, out var gradBeta);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradGamma, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[2], gradBeta, engine);
+    }
+
+    /// <summary>
     /// Backward of a training BatchNorm whose output, plus a residual, feeds a ReLU -- fused by the compiled plan
     /// (<see cref="Compilation.BatchNormAddReluFusionPattern"/>). inputs = x, gamma, beta, residual; <paramref name="output"/>
     /// is the ReLU's output. The masked gradient is the residual's gradient and the BatchNorm output's. One launch on a

@@ -7164,6 +7164,26 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return rows > 0;
     }
 
+    /// <summary>
+    /// ReLU6 in place on the device buffer a float tensor already has, recording nothing (a fused node's own
+    /// temporary); false, with the tensor untouched, when it has none. Never reads the host copy: the generic in-place
+    /// path re-resolved a device result through its host values, a blocking download per call that doubled a
+    /// MobileNetV2 training step.
+    /// </summary>
+    internal bool TryReLU6InPlace<T>(Tensor<T> tensor)
+    {
+        if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled || !tensor.IsContiguous || IsPartialView(tensor)
+            || !TryGetBackend(out var backend))
+            return false;
+        if (ResolveResidentBufferNoUpload(backend, tensor, tensor.Length, includePersistentWeightCache: false) is not { } resident
+            || resident.Handle == IntPtr.Zero || resident.Size < tensor.Length)
+            return false;
+        backend.Relu6(resident, resident, tensor.Length);
+        tensor.IncrementVersion();
+        BindResidentBuffer(tensor, resident, backend);
+        return true;
+    }
+
     void IEngine.SigmoidInPlace<T>(Tensor<T> tensor)
     {
         // Under a gradient tape the device kernels below would skip the derivative; the base records the write.
