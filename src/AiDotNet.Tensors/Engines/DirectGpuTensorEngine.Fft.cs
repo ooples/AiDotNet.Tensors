@@ -17,6 +17,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override bool SupportsFftElementType(FftElementType type)
     {
+        using var __gpuOp = EnterGpuOp();
         _ = type.ByteSize();
         return TryGetBackend(out var backend)
             && backend is IGenericFftBackend generic
@@ -29,6 +30,7 @@ public partial class DirectGpuTensorEngine
         bool inverse = false,
         FftElementType elementType = FftElementType.Float32)
     {
+        using var __gpuOp = EnterGpuOp();
         ValidateGenericFftInput(input);
         _ = elementType.ByteSize();
 
@@ -64,6 +66,7 @@ public partial class DirectGpuTensorEngine
     /// <param name="inverse">Inverse transform when true.</param>
     internal Tensor<float>? TryBackendFft(Tensor<float> interleaved, bool inverse)
     {
+        using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend)) return null;
 
         int rank = interleaved.Rank;

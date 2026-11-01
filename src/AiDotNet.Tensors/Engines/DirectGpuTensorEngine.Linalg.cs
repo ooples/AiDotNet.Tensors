@@ -46,6 +46,7 @@ public partial class DirectGpuTensorEngine
     internal (Tensor<float>? Factor, Tensor<int>? Info) TryGpuCholesky(
         Tensor<float> input, bool upper)
     {
+        using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend)) return (null, null);
         if (backend is not ILinalgBackend lin) return (null, null);
         if (!BackendLinalgReady(backend)) return (null, null);
@@ -95,6 +96,7 @@ public partial class DirectGpuTensorEngine
     /// <summary>GPU-accelerated LU factor. See <see cref="TryGpuCholesky"/> for semantics.</summary>
     internal (Tensor<float>? LU, Tensor<int>? Pivots) TryGpuLuFactor(Tensor<float> input)
     {
+        using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend)) return (null, null);
         if (backend is not ILinalgBackend lin) return (null, null);
         if (!BackendLinalgReady(backend)) return (null, null);
@@ -145,6 +147,7 @@ public partial class DirectGpuTensorEngine
     internal (Tensor<float>? Q, Tensor<float>? R) TryGpuQrReduced(
         Tensor<float> input, bool directOnly = false)
     {
+        using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend)) return (null, null);
         if (backend is not ILinalgBackend lin) return (null, null);
         if (!BackendLinalgReady(backend)) return (null, null);
@@ -223,6 +226,7 @@ public partial class DirectGpuTensorEngine
     internal (Tensor<float>? Eigenvalues, Tensor<float>? Eigenvectors) TryGpuEigh(
         Tensor<float> input, bool upper)
     {
+        using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend)) return (null, null);
         if (backend is not ILinalgBackend lin) return (null, null);
         if (!BackendLinalgReady(backend)) return (null, null);
@@ -292,6 +296,7 @@ public partial class DirectGpuTensorEngine
         Tensor<float> input,
         bool fullMatrices)
     {
+        using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend) || backend is not IExtendedLinalgBackend lin)
             return (null, null, null);
         int rank = input.Rank;
@@ -343,6 +348,7 @@ public partial class DirectGpuTensorEngine
         Tensor<int> pivots,
         Tensor<float> rhs)
     {
+        using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend) || backend is not IExtendedLinalgBackend lin)
             return null;
         int rank = lu.Rank;
@@ -385,6 +391,7 @@ public partial class DirectGpuTensorEngine
     internal (Tensor<float>? LD, Tensor<int>? Pivots) TryGpuLdlFactor(
         Tensor<float> input, bool upper)
     {
+        using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend) || backend is not IExtendedLinalgBackend lin)
             return (null, null);
         int rank = input.Rank;
@@ -422,6 +429,7 @@ public partial class DirectGpuTensorEngine
     internal Tensor<float>? TryGpuLdlSolve(
         Tensor<float> ld, Tensor<int> pivots, Tensor<float> rhs, bool upper)
     {
+        using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend) || backend is not IExtendedLinalgBackend lin)
             return null;
         int rank = ld.Rank;
@@ -452,6 +460,7 @@ public partial class DirectGpuTensorEngine
     internal (Tensor<float>? Solution, Tensor<int>? Info) TryGpuSolveVector(
         Tensor<float> input, Tensor<float> rhs)
     {
+        using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend) || backend is not IExtendedLinalgBackend lin)
             return (null, null);
         int rank = input.Rank;
@@ -486,6 +495,7 @@ public partial class DirectGpuTensorEngine
     internal Tensor<float>? TryGpuTriangularSolveVector(
         Tensor<float> input, Tensor<float> rhs, bool upper, bool unitDiagonal)
     {
+        using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend) || backend is not IExtendedLinalgBackend lin)
             return null;
         int rank = input.Rank;
@@ -515,6 +525,7 @@ public partial class DirectGpuTensorEngine
     internal Tensor<float>? TryGpuCholeskyBackwardLower(
         Tensor<float> factor, Tensor<float> gradOutput)
     {
+        using var __gpuOp = EnterGpuOp();
         if (!SameExactMatrix4x4Shape(factor, gradOutput, out int batch) ||
             !TryGetBackend(out var backend) || backend is not IExtendedLinalgBackend lin)
             return null;
@@ -540,6 +551,7 @@ public partial class DirectGpuTensorEngine
     internal (Tensor<float>? GradInput, Tensor<float>? GradRhs) TryGpuSolveBackwardVector(
         Tensor<float> input, Tensor<float> solution, Tensor<float> gradOutput)
     {
+        using var __gpuOp = EnterGpuOp();
         int rank = input.Rank;
         int batch = Batch4x4(input);
         if (batch == 0 || solution.Rank != rank - 1 || gradOutput.Rank != rank - 1 ||

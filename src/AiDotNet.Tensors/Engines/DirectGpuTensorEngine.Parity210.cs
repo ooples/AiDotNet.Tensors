@@ -21,6 +21,7 @@ public partial class DirectGpuTensorEngine
         Tensor<T> input, int[] outputShape,
         Action<IParity210Backend, IGpuBuffer, IGpuBuffer, int> launch)
     {
+        using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend))
             return null;
         if (backend is not IParity210Backend p210)
@@ -47,6 +48,7 @@ public partial class DirectGpuTensorEngine
         Tensor<T> a, Tensor<T> b, int[] outputShape,
         Action<IParity210Backend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> launch)
     {
+        using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend))
             return null;
         if (backend is not IParity210Backend p210)
@@ -258,6 +260,7 @@ public partial class DirectGpuTensorEngine
     {
         try
         {
+            using var __gpuOp = EnterGpuOp();
             if (TryGetBackend(out var backend) && backend is IParity210Backend p210
                 && tensor.Rank >= 2)
             {
@@ -293,6 +296,7 @@ public partial class DirectGpuTensorEngine
     {
         try
         {
+            using var __gpuOp = EnterGpuOp();
             if (TryGetBackend(out var backend) && backend is IParity210Backend p210
                 && tensor.Rank >= 2)
             {
@@ -332,6 +336,7 @@ public partial class DirectGpuTensorEngine
     {
         try
         {
+            using var __gpuOp = EnterGpuOp();
             if (TryGetBackend(out var backend) && backend is IParity210Backend p210)
             {
                 int rank = tensor.Rank;
@@ -375,6 +380,7 @@ public partial class DirectGpuTensorEngine
     private Tensor<T>? TryRunCumulative<T>(Tensor<T> tensor, int axis,
         System.Action<IParity210Backend, IGpuBuffer, IGpuBuffer, int, int, int> launch)
     {
+        using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend)) return null;
         if (backend is not IParity210Backend p210) return null;
         int rank = tensor.Rank;
@@ -472,6 +478,7 @@ public partial class DirectGpuTensorEngine
 
     public override Tensor<T> TensorRoll<T>(Tensor<T> tensor, int[] shifts, int[] axes)
     {
+        using var __gpuOp = EnterGpuOp();
         // GPU path only supports single-axis roll; composite rolls compose
         // in CPU via the base class.
         if (shifts.Length == 1 && axes.Length == 1
@@ -513,6 +520,7 @@ public partial class DirectGpuTensorEngine
 
     public override Tensor<T> TensorFlip<T>(Tensor<T> tensor, int[] axes)
     {
+        using var __gpuOp = EnterGpuOp();
         // Single-axis flip → GPU; multi-axis composes in CPU.
         if (axes.Length == 1
             && TryGetBackend(out var backend) && backend is IParity210Backend p210)
@@ -553,6 +561,7 @@ public partial class DirectGpuTensorEngine
 
     public override Tensor<T> TensorDiagEmbed<T>(Tensor<T> tensor, int offset = 0)
     {
+        using var __gpuOp = EnterGpuOp();
         if (TryGetBackend(out var backend) && backend is IParity210Backend p210
             && tensor.Rank >= 1)
         {
@@ -720,6 +729,7 @@ public partial class DirectGpuTensorEngine
     public override Tensor<T> TensorNanToNum<T>(
         Tensor<T> tensor, double? nan = null, double? posinf = null, double? neginf = null)
     {
+        using var __gpuOp = EnterGpuOp();
         // The GPU kernel operates on fp32; anything wider (e.g. double) would
         // lose replacement-scalar precision on downcast. Send those to the
         // CpuEngine reference path instead of silently clipping.

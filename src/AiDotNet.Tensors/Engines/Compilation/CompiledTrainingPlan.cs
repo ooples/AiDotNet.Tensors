@@ -559,6 +559,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// </param>
     private void RollBackCaptureResidency(Engines.DirectGpuTensorEngine engine, bool deviceHoldsResults = false)
     {
+        using var __gpuOp = engine.EnterGpuOp();
         // A disposed engine's context is gone: nothing can be downloaded, and nothing can read the results anyway.
         bool landResults = deviceHoldsResults && engine.GetBackend() is Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true, ContextIsLive: true };
         // isResult: the loss and gradient state the host reads after this. A forward intermediate is not one: the next
@@ -1159,6 +1160,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     private void DisposeStepIo()
     {
+        // The plan drives the engine's backend directly here: lease it so a concurrent Dispose waits.
+        using var __gpuOp = (_engine as Engines.DirectGpuTensorEngine)?.EnterGpuOp() ?? default;
         ReleasePingPong();
         // A disposed engine's context took the page-locked results with it: nothing in them can be read any more.
         bool live = _engine is Engines.DirectGpuTensorEngine gte
@@ -1209,6 +1212,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// </summary>
     private bool TryDeferLossReadback(Engines.DirectGpuTensorEngine gte)
     {
+        using var __gpuOp = gte.EnterGpuOp();
         if (gte.GetBackend() is not { } backend || backend is not Engines.DirectGpu.IDeviceReadbackFactory factory)
             return false;
         var buffer = _lossOutput._gpuBuffer;
@@ -1252,6 +1256,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// </summary>
     private void LandGradientsOnHost()
     {
+        // The plan drives the engine's backend directly here: lease it so a concurrent Dispose waits.
+        using var __gpuOp = (_engine as Engines.DirectGpuTensorEngine)?.EnterGpuOp() ?? default;
         if (_engine is not Engines.DirectGpuTensorEngine gte
             || gte.GetBackend() is not Engines.DirectGpu.IGpuGraphCapture { ContextIsLive: true })
             return;
@@ -1330,6 +1336,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     private void InvalidateCapturedStepGraph()
     {
+        // The plan drives the engine's backend directly here: lease it so a concurrent Dispose waits.
+        using var __gpuOp = (_engine as Engines.DirectGpuTensorEngine)?.EnterGpuOp() ?? default;
         // The current weights back in the buffers the plan's other paths update (stream-ordered after every replay),
         // while the graphs that pin the second buffers still keep them alive.
         ReleasePingPong();
@@ -1778,7 +1786,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // Only where the step is captured into a device graph (CUDA): the pass exists to cut that graph's copy nodes, and
         // on Vulkan, which replays no graph, merged multi-consumer gradients gave the permute and spectral (RFFT/IRFFT)
         // ops a wrong first-step gradient in CompiledTrainingOpStalenessProbeTests while the per-tensor buffers do not.
-        if (staticReverseBackward && (engine as Engines.DirectGpuTensorEngine)?.GetBackend() is Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true })
+        if (staticReverseBackward && (engine as Engines.DirectGpuTensorEngine)?.QueryBackend is Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true })
             AliasMultiConsumerPassThroughs(forwardSteps, parameterSet, device, gradMap, dropped, rootOf, ref deviceAliases);
         if (dropped.Count > 0)
             allGrads.RemoveAll(g => dropped.Contains(g));
@@ -3211,6 +3219,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     {
         if (_l2Regularization == 0f) return;
         var engine = _engine as Engines.DirectGpuTensorEngine;
+        using var __gpuOp = engine?.EnterGpuOp() ?? default;
         var backend = engine?.GetBackend();
         var numOps = MathHelper.GetNumericOperations<T>();
         var strength = numOps.FromDouble(_l2Regularization);
@@ -3677,6 +3686,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     private Tensor<T> StepCore()
     {
+        // The plan drives the engine's backend directly here: lease it so a concurrent Dispose waits.
+        using var __gpuOp = (_engine as Engines.DirectGpuTensorEngine)?.EnterGpuOp() ?? default;
         using var graphModeSuspension = GraphMode.SuspendRecording();
 
         // Opt-in CUDA-graph replay of the whole compiled step. Narrowly gated:
@@ -3895,6 +3906,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// </remarks>
     private Tensor<T> StepResidentOrEager()
     {
+        // The plan drives the engine's backend directly here: lease it so a concurrent Dispose waits.
+        using var __gpuOp = (_engine as Engines.DirectGpuTensorEngine)?.EnterGpuOp() ?? default;
         // The uncaptured resident body needs only fills and device copies, so it runs on every DirectGpu backend
         // (OpenCL, Vulkan, Metal, HIP as well as CUDA). The host-array eager step downloads every device gradient to
         // accumulate it; only the graph capture above is CUDA's.

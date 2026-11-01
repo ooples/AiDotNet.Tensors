@@ -19,12 +19,16 @@ public partial class DirectGpuTensorEngine : IConvShortcutPairEngine
     /// <paramref name="inputShape"/> input.
     /// </summary>
     internal bool SupportsConv2DBackwardInputShortcutPair(int[] inputShape, int[] kernel3, int[] kernel1, int outH, int outW)
-        => TryGetBackend(out var backend) && backend is IConvShortcutPairBackend pair
+    {
+        // Leased: a backend may build the pair's kernel to answer.
+        using var __gpuOp = EnterGpuOp();
+        return TryGetBackend(out var backend) && backend is IConvShortcutPairBackend pair
            && inputShape.Length == 4 && kernel3.Length == 4 && kernel1.Length == 4
            && pair.SupportsConv2DBackwardInputShortcutPair(inputShape[0], inputShape[1], inputShape[2], inputShape[3],
                kernel3[0], kernel1[0], outH, outW)
            && kernel3[1] == inputShape[1] && kernel3[2] == 3 && kernel3[3] == 3
            && kernel1[1] == inputShape[1] && kernel1[2] == 1 && kernel1[3] == 1;
+    }
 
     /// <summary>
     /// The input gradient of a 3 x 3 stride-2 convolution plus that of the 1 x 1 stride-2 projection shortcut reading the
@@ -35,6 +39,7 @@ public partial class DirectGpuTensorEngine : IConvShortcutPairEngine
     internal Tensor<float>? TryConv2DBackwardInputShortcutPair(Tensor<float> gradOutput3, Tensor<float> kernel3,
         Tensor<float> gradOutput1, Tensor<float> kernel1, int[] inputShape)
     {
+        using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend) || backend is not IConvShortcutPairBackend pair
             || gradOutput3.Rank != 4 || gradOutput1.Rank != 4
             || !SupportsConv2DBackwardInputShortcutPair(inputShape, kernel3._shape, kernel1._shape,

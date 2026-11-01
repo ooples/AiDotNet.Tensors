@@ -403,7 +403,10 @@ public static class DLPack
             throw new NotSupportedException(
                 "CUDA DLPack import of a read-only tensor is not supported: GPU-resident tensors have no read-only mode.");
 
-        var (backend, device) = GetCudaBackend(dl.Device.DeviceId);
+        // Leased: the import wraps the memory on the dispatcher's backend, so a concurrent Dispose waits for it.
+        var dispatcher = AiDotNetEngine.Current as DirectGpuTensorEngine;
+        using var __gpuOp = dispatcher?.EnterGpuOp() ?? default;
+        var (backend, device) = GetCudaBackend(dispatcher, dl.Device.DeviceId);
         if (count == 0)
         {
             owner.Release();
@@ -432,8 +435,13 @@ public static class DLPack
     /// <summary>The GPU backend tensors are placed on, as <see cref="Tensor{T}.Gpu"/> chooses it, when it exchanges
     /// CUDA device memory for <paramref name="deviceId"/>.</summary>
     internal static (IDirectGpuBackend Backend, IDLPackDeviceBackend Device) GetCudaBackend(int deviceId)
+        => GetCudaBackend(AiDotNetEngine.Current as DirectGpuTensorEngine, deviceId);
+
+    // The same, for the dispatcher the caller already read (and leased).
+    private static (IDirectGpuBackend Backend, IDLPackDeviceBackend Device) GetCudaBackend(
+        DirectGpuTensorEngine? dispatcher, int deviceId)
     {
-        var backend = AiDotNetEngine.Current is DirectGpuTensorEngine dispatcher
+        var backend = dispatcher is not null
             ? dispatcher.PlacementBackend
             : Engine.DirectGpu is { IsAvailable: true } directGpu ? directGpu.Backend : null;
         if (backend is not IDLPackDeviceBackend { DLPackDeviceType: DLPackNative.DeviceCuda } device)

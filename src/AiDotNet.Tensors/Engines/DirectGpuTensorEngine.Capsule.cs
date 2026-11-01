@@ -28,6 +28,7 @@ public partial class DirectGpuTensorEngine
     /// </remarks>
     public Tensor<T> SquashGpu<T>(Tensor<T> input, int axis = -1, float epsilon = 1e-8f)
     {
+        using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SquashGpu");
 
@@ -101,6 +102,7 @@ public partial class DirectGpuTensorEngine
         int axis = -1,
         float epsilon = 1e-8f)
     {
+        using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SquashBackwardGpu");
 
@@ -175,6 +177,7 @@ public partial class DirectGpuTensorEngine
         int numIterations = 3,
         float epsilon = 1e-8f)
     {
+        using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for DynamicRoutingGpu");
 
@@ -266,6 +269,7 @@ public partial class DirectGpuTensorEngine
     /// </remarks>
     public Tensor<T> CapsulePredictionsGpu<T>(Tensor<T> input, Tensor<T> weights)
     {
+        using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for CapsulePredictionsGpu");
 
@@ -322,6 +326,7 @@ public partial class DirectGpuTensorEngine
     /// <returns>GPU-resident predictions tensor [batch, inputCapsules, outputCapsules, outputDim].</returns>
     public Tensor<T> CapsulePredictionsGpu<T>(Tensor<T> input, IGpuBuffer weightsBuffer, int outputCapsules, int outputDim)
     {
+        using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for CapsulePredictionsGpu");
 
@@ -361,6 +366,7 @@ public partial class DirectGpuTensorEngine
     /// </remarks>
     public Tensor<T> CapsuleTransformGpu<T>(Tensor<T> input, Tensor<T> weights)
     {
+        using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for CapsuleTransformGpu");
 
@@ -417,6 +423,7 @@ public partial class DirectGpuTensorEngine
     /// <returns>GPU-resident transformed tensor [batch, inputCapsules, numCapsules, capsuleDim].</returns>
     public Tensor<T> CapsuleTransformGpu<T>(Tensor<T> input, IGpuBuffer weightsBuffer, int numCapsules, int capsuleDim)
     {
+        using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for CapsuleTransformGpu");
 
@@ -456,6 +463,7 @@ public partial class DirectGpuTensorEngine
         int numIterations = 3,
         float epsilon = 1e-8f)
     {
+        using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for CapsuleRoutingGpu");
 
@@ -551,6 +559,7 @@ public partial class DirectGpuTensorEngine
     /// </summary>
     private Tensor<T> SoftmaxAxisGpu<T>(Tensor<T> input, int axis)
     {
+        using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SoftmaxAxisGpu");
 

@@ -19,6 +19,7 @@ public partial class DirectGpuTensorEngine
     public override Tensor<T> GruSequenceForward<T>(Tensor<T> input, Tensor<T>? h0, Tensor<T> wIh, Tensor<T> wHh,
         Tensor<T>? bIh, Tensor<T>? bHh, out Tensor<T> finalHidden, bool returnSequences = false, bool resetAfter = true)
     {
+        using var __gpuOp = EnterGpuOp();
         var (batch, seqLen, inputSize, hidden) = ValidateGruSequence(input, h0, wIh, wHh, bIh, bHh);
         // Compiled training: one device node with a direct backward (TryRecordGruSequenceTrain); a model that reads only
         // the final state gets a node whose output is h_T and whose backward takes that gradient alone.

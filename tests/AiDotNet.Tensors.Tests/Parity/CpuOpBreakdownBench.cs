@@ -163,6 +163,13 @@ public class CpuOpBreakdownBench
                     Row("linear.fwd", shape, threads, () => engine.TensorMatMul(x, w));
                     Row("linear.dgrad", shape, threads, () => engine.TensorMatMul(dy, wT));
                     Row("linear.wgrad", shape, threads, () => engine.TensorMatMul(xT, dy));
+                    // The kernels a dense layer's backward actually runs (dX = dY·Wᵀ, dW = Xᵀ·dY, both transposes
+                    // read in place), into preallocated outputs.
+                    float[] xL = x.ToArray(), wL = w.ToArray(), dyL = dy.ToArray();
+                    var dxL = new float[l.B * l.In];
+                    var dwL = new float[l.In * l.Out];
+                    Row("linear.dgrad[kernel]", shape, threads, () => AiDotNet.Tensors.Engines.Autodiff.BackwardFunctions<float>.BackwardGemmInputGradient(dyL, wL, dxL, l.B, l.In, l.Out));
+                    Row("linear.wgrad[kernel]", shape, threads, () => AiDotNet.Tensors.Engines.Autodiff.BackwardFunctions<float>.BackwardGemmWeightGradient(xL, dyL, dwL, l.B, l.In, l.Out));
                 }
             }
         }

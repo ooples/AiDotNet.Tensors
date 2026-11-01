@@ -726,7 +726,7 @@ internal static class BackwardFunctions<T>
     // LM head's vocabulary-wide weight gradient, so dW takes SimdGemm only where that split applies.
     private const int BackwardInputGradientSimdMaxN = 4096;
 
-    private static void BackwardGemmInputGradient(float[] dY, float[] w, float[] dX, int m, int k, int n)
+    internal static void BackwardGemmInputGradient(float[] dY, float[] w, float[] dX, int m, int k, int n)
     {
         if (n <= BackwardInputGradientSimdMaxN)
         {
@@ -745,7 +745,7 @@ internal static class BackwardFunctions<T>
     private const int BackwardNarrowWeightGradientMaxN = 16;
     private const long BackwardNarrowWeightGradientMaxWork = 8L << 20;
 
-    private static void BackwardGemmWeightGradient(float[] x, float[] dY, float[] dW, int m, int k, int n)
+    internal static void BackwardGemmWeightGradient(float[] x, float[] dY, float[] dW, int m, int k, int n)
     {
 #if NET5_0_OR_GREATER
         if (n <= BackwardNarrowWeightGradientMaxN && (long)m * k * n <= BackwardNarrowWeightGradientMaxWork)
@@ -2651,6 +2651,14 @@ internal static class BackwardFunctions<T>
     {
         var start = (int[])savedState[0];
         var inputShape = inputs[0]._shape;
+
+        // An empty slice selected no element, so the input's gradient from it is zero everywhere. Handled here so no
+        // device or region path is handed a zero-element gradient.
+        if (gradOutput.Length == 0)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], new Tensor<T>((int[])inputShape.Clone()), engine);
+            return;
+        }
 
         if (engine is DirectGpuTensorEngine gpu && gpu.TrySliceBackwardOnDevice(gradOutput, inputShape, start) is { } deviceGrad)
         {

@@ -13,6 +13,7 @@ public partial class DirectGpuTensorEngine
         Tensor<T> wIh, Tensor<T> wHh, Tensor<T>? bIh, Tensor<T>? bHh, bool sequence,
         out Tensor<T>? finalHidden, out Tensor<T>? finalCell)
     {
+        using var __gpuOp = EnterGpuOp();
         finalHidden = finalCell = null;
         if (typeof(T) != typeof(float) || PlacementBackend is not IFusedLstmSequenceTraining
             || !(DifferentiableOps.IsRecording<T>() || (GraphMode.IsActive && !GraphMode.IsInferenceTrace))
@@ -59,6 +60,7 @@ public partial class DirectGpuTensorEngine
 
     private Tensor<float> RunStatefulLstm(Tensor<float>[] inputs, object[] saved)
     {
+        using var __gpuOp = EnterGpuOp();
         var backend = GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
         var meta = (int[])saved[3];
         int b = meta[0], t = meta[1], n = meta[2], h = meta[3], state = b * h;
