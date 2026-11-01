@@ -48,6 +48,13 @@ internal static unsafe partial class WinogradF43
     internal static readonly int s_minPatches =
         int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_WINOGRAD_MIN_PATCHES"), out int minPatches) && minPatches > 0 ? minPatches : 128;
 
+    /// <summary>Fewest patches the input and weight gradients take. Lower than the forward's: the direct backward kernels
+    /// cost more than the direct forward, so the transforms pay off sooner (ResNet-18 256 -> 256 on 8x8 planes at batch 8,
+    /// 32 patches, ran the input gradient in 0.55-0.85x and the weight gradient in 0.5-0.7x the direct kernels' time on
+    /// four EPYC hosts, where the forward ran up to 1.8x slower).</summary>
+    internal static readonly int s_minBackwardPatches =
+        int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_WINOGRAD_MIN_BACKWARD_PATCHES"), out int minBackward) && minBackward > 0 ? minBackward : 32;
+
     /// <summary>Fewest input and output channels of the batch-wide passes: with fewer the transformed operands (36 values
     /// per patch and channel) cost more memory traffic than the multiplies they save (a 32 -> 64 channel 14x14 layer at
     /// batch 64 ran 2.6x slower than the direct kernel). Narrower layers run blocked (WinogradF43.Blocked.cs).</summary>
@@ -57,6 +64,18 @@ internal static unsafe partial class WinogradF43
     /// of eight, planes at least 8x8, and enough patches (<see cref="s_minPatches"/>).</summary>
     internal static bool Applies(int batch, int inChannels, int outChannels, int height, int width, int kernelH, int kernelW,
         int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
+        => Applies(batch, inChannels, outChannels, height, width, kernelH, kernelW, strideH, strideW, padH, padW,
+            dilationH, dilationW, s_minPatches);
+
+    /// <summary>Whether this kernel takes the input gradient (dY convolved with the turned kernel, dY's channels as the
+    /// input's): <see cref="Applies"/> with <see cref="s_minBackwardPatches"/> as the patch floor.</summary>
+    internal static bool AppliesToInputGradient(int batch, int inChannels, int outChannels, int height, int width,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
+        => Applies(batch, inChannels, outChannels, height, width, kernelH, kernelW, strideH, strideW, padH, padW,
+            dilationH, dilationW, s_minBackwardPatches);
+
+    private static bool Applies(int batch, int inChannels, int outChannels, int height, int width, int kernelH, int kernelW,
+        int strideH, int strideW, int padH, int padW, int dilationH, int dilationW, int minPatches)
     {
         if (s_disable || !s_env || DirectConvAvx2.SuppressedOnThisThread || !Avx2.IsSupported || !Fma.IsSupported) return false;
         if (kernelH != 3 || kernelW != 3 || strideH != 1 || strideW != 1 || padH != 1 || padW != 1
@@ -66,14 +85,15 @@ internal static unsafe partial class WinogradF43
             || batch <= 0) return false;
         if (height < 8 || width < 8) return false;
         long patches = (long)batch * ((height + 3) / 4) * ((width + 3) / 4);
-        if (patches < s_minPatches) return false;
+        if (patches < minPatches) return false;
         // V and M stay addressable with int offsets.
         return (long)Points * patches * Math.Max(inChannels, outChannels) <= int.MaxValue
             && (long)Points * inChannels * outChannels <= int.MaxValue;
     }
 
     /// <summary>
-    /// Whether <see cref="BackwardKernel"/> takes the weight gradient: <see cref="Applies"/>, and channel counts with
+    /// Whether <see cref="BackwardKernel"/> takes the weight gradient: <see cref="Applies"/> with
+    /// <see cref="s_minBackwardPatches"/> as the patch floor, and channel counts with
     /// C K >= 64 (C + K). Its transforms stream V and D (36 values per patch and channel, C + K channels) beside GEMMs
     /// that save work in proportion to C K: at 64 -> 64 channels on 32x32 planes the transforms made it 1.5x slower than
     /// the direct kernel, at 128 -> 128 on 16x16 it ran in 0.4x the direct kernel's time.
@@ -86,7 +106,7 @@ internal static unsafe partial class WinogradF43
     internal static bool AppliesToWeightGradient(int batch, int inChannels, int outChannels, int height, int width,
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
         => Applies(batch, inChannels, outChannels, height, width, kernelH, kernelW, strideH, strideW, padH, padW,
-               dilationH, dilationW)
+               dilationH, dilationW, s_minBackwardPatches)
            && (long)inChannels * outChannels >= 64L * (inChannels + outChannels)
            && WeightGradientWorkspaceFloats(batch, inChannels, outChannels, height, width) <= MaxWeightGradientWorkspaceFloats;
 

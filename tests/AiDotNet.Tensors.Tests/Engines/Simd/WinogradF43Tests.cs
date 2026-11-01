@@ -224,6 +224,22 @@ public class WinogradF43Tests
     }
 
     [SkippableFact]
+    public void Gradients_TakeFewerPatchesThanTheForward()
+    {
+        Skip.IfNot(WinogradRoutes, "Winograd routing needs AVX2 + FMA and AIDOTNET_CONV_WINOGRAD not set to 0.");
+        Skip.IfNot(WinogradF43.s_minPatches == 128 && WinogradF43.s_minBackwardPatches == 32, "Default patch floors only.");
+        // ResNet-18 256 -> 256 on 8x8 planes at batch 8: 32 patches. The gradients take it, the forward does not.
+        Assert.False(WinogradF43.Applies(8, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));
+        Assert.True(WinogradF43.AppliesToInputGradient(8, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));
+        Assert.True(WinogradF43.AppliesToWeightGradient(8, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));
+        // 16 patches stay direct in every pass.
+        Assert.False(WinogradF43.AppliesToInputGradient(4, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));
+        Assert.False(WinogradF43.AppliesToWeightGradient(4, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));
+        // The input gradient keeps the forward's other rules.
+        Assert.False(WinogradF43.AppliesToInputGradient(8, 256, 256, 8, 8, 3, 3, 2, 2, 1, 1, 1, 1));
+    }
+
+    [SkippableFact]
     public void WeightGradient_FallsBackPastItsWorkspaceCap()
     {
         Skip.IfNot(WinogradRoutes, "The Winograd kernel needs AVX2 + FMA and must not be opted out.");

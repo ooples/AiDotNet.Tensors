@@ -15947,7 +15947,7 @@ public partial class CpuEngine : ITensorLevelEngine
 #if NET5_0_OR_GREATER
         // 3x3 stride-1 padding-1: Winograd F(4x4, 3x3), as Conv2DBackwardInputInto.
         if (typeof(T) == typeof(float) && outputHeight == height && outputWidth == width
-            && Simd.WinogradF43.Applies(batch, outChannels, inChannels, height, width, kernelHeight, kernelWidth,
+            && Simd.WinogradF43.AppliesToInputGradient(batch, outChannels, inChannels, height, width, kernelHeight, kernelWidth,
                 strideH, strideW, padH, padW, dilationH, dilationW))
         {
             var gW = gradOutput.GetCpuBackingForStridedRead(out int gOffW) as float[];
@@ -16497,8 +16497,8 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             // The input gradient of a 3x3 stride-1 padding-1 convolution is the same convolution of dY with the kernel turned
             // 180 degrees and its channel axes swapped: Winograd F(4x4, 3x3) as the forward.
-            if (Simd.WinogradF43.Applies(batch, outChannels, inChannels, height, width, kernelHeight, kernelWidth,
-                    strideH, strideW, padH, padW, dilationH, dilationW)
+            if (Simd.WinogradF43.AppliesToInputGradient(batch, outChannels, inChannels, height, width, kernelHeight,
+                    kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW)
                 && outputHeight == height && outputWidth == width)
             {
                 var gArrW = gradOutput.GetCpuBackingForStridedRead(out int gOffW) as float[];
