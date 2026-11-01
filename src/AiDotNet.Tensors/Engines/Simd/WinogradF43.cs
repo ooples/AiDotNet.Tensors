@@ -45,12 +45,12 @@ internal static unsafe class WinogradF43
 
     /// <summary>Fewest patches (batch x tiles) the transform-domain GEMMs take: below it the weight transform (36 x C x K
     /// values) outweighs the multiplies saved, and the direct kernel stays.</summary>
-    internal static int s_minPatches = 128;
+    internal static readonly int s_minPatches = 128;
 
     /// <summary>Fewest input and output channels: with fewer the transformed operands (36 values per patch and channel)
     /// cost more memory traffic than the multiplies they save (a 32 -> 64 channel 14x14 layer at batch 64 ran 2.6x slower
     /// than the direct kernel).</summary>
-    internal static int s_minChannels = 64;
+    internal static readonly int s_minChannels = 64;
 
     /// <summary>Whether this kernel takes the convolution: 3x3, stride 1, padding 1, undilated, channel counts multiples
     /// of eight, planes at least 8x8, and enough patches (<see cref="s_minPatches"/>).</summary>
@@ -105,6 +105,16 @@ internal static unsafe class WinogradF43
             ArrayPool<float>.Shared.Return(m);
             ArrayPool<float>.Shared.Return(u);
         }
+    }
+
+    [ThreadStatic] private static float[]? t_scratch;
+
+    // A task's tile scratch: one per thread, grown on demand (the input and output transforms never overlap on a thread).
+    private static float[] Scratch(int length)
+    {
+        var s = t_scratch;
+        if (s is null || s.Length < length) t_scratch = s = new float[length];
+        return s;
     }
 
     // U [36][cIn][cOut] = G g G^T per (input channel, output channel), eight output channels per vector.
@@ -169,8 +179,7 @@ internal static unsafe class WinogradF43
         CpuParallelSettings.ParallelForOrSerial(0, batch * blocks, (long)batch * cIn * hw * 12, [MethodImpl(MethodImplOptions.AggressiveOptimization)] (job) =>
         {
             int n = job / blocks, cb = job - n * blocks;
-            float[] scratch = ArrayPool<float>.Shared.Rent(tileFloats);
-            try
+            float[] scratch = Scratch(tileFloats);
             {
                 fixed (float* xp = x)
                 fixed (float* vp = v)
@@ -205,10 +214,6 @@ internal static unsafe class WinogradF43
                             for (int xi = 0; xi < Points; xi++) Avx.Store(dstPatch + xi * pointStride, d[xi]);
                         }
                 }
-            }
-            finally
-            {
-                ArrayPool<float>.Shared.Return(scratch);
             }
         }, deterministicSafe: true);
     }
@@ -266,8 +271,7 @@ internal static unsafe class WinogradF43
         CpuParallelSettings.ParallelForOrSerial(0, batch * blocks, (long)batch * cOut * hw * 12, [MethodImpl(MethodImplOptions.AggressiveOptimization)] (job) =>
         {
             int n = job / blocks, kb = job - n * blocks;
-            float[] scratch = ArrayPool<float>.Shared.Rent(tileFloats + 64);
-            try
+            float[] scratch = Scratch(tileFloats + 64);
             {
                 fixed (float* mp = m)
                 fixed (float* yp = y)
@@ -320,10 +324,6 @@ internal static unsafe class WinogradF43
                         }
                     }
                 }
-            }
-            finally
-            {
-                ArrayPool<float>.Shared.Return(scratch);
             }
         }, deterministicSafe: true);
     }
