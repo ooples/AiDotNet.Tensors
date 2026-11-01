@@ -85,10 +85,42 @@ internal static partial class SimdGemm
                 // Column strip outer: one strip of B (k x strip floats) stays in L2 across the chunk's row blocks. Row
                 // blocks outer re-streamed the chunk's whole B slice from L3 per row block (mlp 128x784x512: 1.12x
                 // scaling at 2 threads against PyTorch's 1.84x).
+#if NET9_0_OR_GREATER
+                // A full 32-column strip read by two or more full row blocks is copied once into a contiguous buffer
+                // (see s_packStrip512): B's rows ldb apart thrash a few L1 sets at power-of-two row lengths.
+                bool pack = stripCap == Nr512 && s_packStrip512 && kCap <= MaxPackedStripK
+                    && Math.Min(rb1, mCap / Mr) - rb0 >= 2;
+                float[]? stripBuffer = pack ? PackedStripBuffer(kCap) : null;
+#endif
                 for (int cs = cs0; cs < cs1; cs++)
                 {
                     int stripStart = cs * stripCap;
                     int stripEnd = Math.Min(nCap, stripStart + stripCap);
+#if NET9_0_OR_GREATER
+                    float* pBStrip = pB + stripStart;
+                    int ldbStrip = ldbCap;
+                    if (stripBuffer is not null && stripEnd - stripStart == Nr512)
+                    {
+                        fixed (float* ps = stripBuffer)
+                        {
+                            PackStrip32(pB + stripStart, ldbCap, ps, kCap);
+                            for (int rbIdx = rb0; rbIdx < rb1; rbIdx++)
+                            {
+                                int i = rbIdx * Mr;
+                                int mc = Math.Min(Mr, mCap - i);
+                                float* pARow = pA + (long)i * ldaCap;
+                                float* pCRow = pC + (long)i * nCap;
+                                if (mc == Mr)
+                                    DirectKernel6x32Store(pARow, ldaCap, ps, Nr512, pCRow + stripStart, nCap, kCap);
+                                else
+                                    for (int j = stripStart; j < stripEnd; j += Nr)
+                                        DirectKernelMxNMaskedStore(pARow, ldaCap, pB + j, ldbCap, pCRow + j, nCap,
+                                            kCap, mcActual: mc, ncActual: Nr);
+                            }
+                        }
+                        continue;
+                    }
+#endif
                     for (int rbIdx = rb0; rbIdx < rb1; rbIdx++)
                     {
                         int i = rbIdx * Mr;
