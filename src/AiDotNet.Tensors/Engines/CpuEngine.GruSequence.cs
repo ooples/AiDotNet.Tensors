@@ -606,27 +606,8 @@ public partial class CpuEngine
                 for (int b = b0; b < b1; b++)
                 {
                     int gRow = (t * batch + b) * g3, sRow = (t * batch + b) * hidden, c = (b - b0);
-                    for (int j = 0; j < hidden; j++)
-                    {
-                        float r = cache.Gates[gRow + j], z = cache.Gates[gRow + hidden + j], n = cache.Gates[gRow + 2 * hidden + j];
-                        float hp = cache.AllH[sRow + j];
-                        float dhv = gy[(b * seqLen + t) * hidden + j] + dh[b * hidden + j];
-                        float dnp = dhv * (1f - z) * (1f - n * n);
-                        float dzp = dhv * (hp - n) * z * (1f - z);
-                        dgi[gRow + hidden + j] = dzp; dgh[gRow + hidden + j] = dzp; hSums[c * hRows + hidden + j] = dzp;
-                        dgi[gRow + 2 * hidden + j] = dnp;
-                        if (resetAfter)
-                        {
-                            float drp = dnp * cache.Ghn[sRow + j] * r * (1f - r);
-                            dgi[gRow + j] = drp; dgh[gRow + j] = drp; hSums[c * hRows + j] = drp;
-                            dgh[gRow + 2 * hidden + j] = dnp * r; hSums[c * hRows + 2 * hidden + j] = dnp * r;
-                        }
-                        else
-                        {
-                            dgh[gRow + 2 * hidden + j] = dnp; dn[c * hidden + j] = dnp;
-                        }
-                        dh[b * hidden + j] = dhv * z;   // the direct term; the recurrent ones are added below
-                    }
+                    GruBackwardRow(cache.Gates, gRow, cache.AllH, cache.Ghn, sRow, gy, (b * seqLen + t) * hidden, dh, b * hidden,
+                        dgi, dgh, hSums, c * hRows, dn, c * hidden, hidden, resetAfter);
                 }
                 if (!resetAfter)
                 {
@@ -646,7 +627,7 @@ public partial class CpuEngine
                     }
                 }
                 Simd.SimdGemm.SgemmSequential(hSums, whh.AsSpan(0, hRows * hidden), rec, chunk, hRows, hidden);
-                for (int k = 0; k < rec.Length; k++) dh[b0 * hidden + k] += rec[k];
+                AddInto(dh, b0 * hidden, rec, rec.Length);
             }
         });
 
@@ -675,7 +656,10 @@ public partial class CpuEngine
             var sbi = new float[g3];
             var sbh = new float[g3];
             for (int r = 0; r < rows; r++)
-                for (int c = 0; c < g3; c++) { sbi[c] += dgi[r * g3 + c]; sbh[c] += dgh[r * g3 + c]; }
+            {
+                AddInto(sbi, 0, dgi.AsSpan(r * g3, g3), g3);
+                AddInto(sbh, 0, dgh.AsSpan(r * g3, g3), g3);
+            }
             if (bIh is not null) DifferentiableOps.AccumulateGrad(grads, bIh, Wrap(sbi, g3), engine);
             if (bHh is not null) DifferentiableOps.AccumulateGrad(grads, bHh, Wrap(sbh, g3), engine);
         }
@@ -686,6 +670,83 @@ public partial class CpuEngine
             pool.Return(dgh);
             pool.Return(gxTimeMajor);
         }
+    }
+
+    /// <summary>
+    /// One row of the GRU backward's gate gradients (see <see cref="GruSequenceBackwardFloat{T}"/>), SIMD-wide: each
+    /// element's arithmetic is the scalar form's, in the same order, so the results are unchanged. dh enters as the
+    /// row's carried gradient and leaves as its direct term dhv * z.
+    /// </summary>
+    private static void GruBackwardRow(float[] gates, int gRow, float[] allH, float[] ghn, int sRow, float[] gy, int yRow,
+        float[] dh, int dhRow, float[] dgi, float[] dgh, float[] hSums, int hRow, float[] dn, int dnRow, int hidden, bool resetAfter)
+    {
+        int j = 0;
+        int width = System.Numerics.Vector<float>.Count;
+        if (System.Numerics.Vector.IsHardwareAccelerated)
+        {
+            var one = System.Numerics.Vector<float>.One;
+            for (; j <= hidden - width; j += width)
+            {
+                var r = new System.Numerics.Vector<float>(gates, gRow + j);
+                var z = new System.Numerics.Vector<float>(gates, gRow + hidden + j);
+                var n = new System.Numerics.Vector<float>(gates, gRow + 2 * hidden + j);
+                var hp = new System.Numerics.Vector<float>(allH, sRow + j);
+                var dhv = new System.Numerics.Vector<float>(gy, yRow + j) + new System.Numerics.Vector<float>(dh, dhRow + j);
+                var dnp = dhv * (one - z) * (one - n * n);
+                var dzp = dhv * (hp - n) * z * (one - z);
+                dzp.CopyTo(dgi, gRow + hidden + j); dzp.CopyTo(dgh, gRow + hidden + j); dzp.CopyTo(hSums, hRow + hidden + j);
+                dnp.CopyTo(dgi, gRow + 2 * hidden + j);
+                if (resetAfter)
+                {
+                    var drp = dnp * new System.Numerics.Vector<float>(ghn, sRow + j) * r * (one - r);
+                    drp.CopyTo(dgi, gRow + j); drp.CopyTo(dgh, gRow + j); drp.CopyTo(hSums, hRow + j);
+                    var dnr = dnp * r;
+                    dnr.CopyTo(dgh, gRow + 2 * hidden + j); dnr.CopyTo(hSums, hRow + 2 * hidden + j);
+                }
+                else
+                {
+                    dnp.CopyTo(dgh, gRow + 2 * hidden + j); dnp.CopyTo(dn, dnRow + j);
+                }
+                (dhv * z).CopyTo(dh, dhRow + j);   // the direct term; the recurrent ones are added after the row
+            }
+        }
+        for (; j < hidden; j++)
+        {
+            float r = gates[gRow + j], z = gates[gRow + hidden + j], n = gates[gRow + 2 * hidden + j];
+            float hp = allH[sRow + j];
+            float dhv = gy[yRow + j] + dh[dhRow + j];
+            float dnp = dhv * (1f - z) * (1f - n * n);
+            float dzp = dhv * (hp - n) * z * (1f - z);
+            dgi[gRow + hidden + j] = dzp; dgh[gRow + hidden + j] = dzp; hSums[hRow + hidden + j] = dzp;
+            dgi[gRow + 2 * hidden + j] = dnp;
+            if (resetAfter)
+            {
+                float drp = dnp * ghn[sRow + j] * r * (1f - r);
+                dgi[gRow + j] = drp; dgh[gRow + j] = drp; hSums[hRow + j] = drp;
+                dgh[gRow + 2 * hidden + j] = dnp * r; hSums[hRow + 2 * hidden + j] = dnp * r;
+            }
+            else
+            {
+                dgh[gRow + 2 * hidden + j] = dnp; dn[dnRow + j] = dnp;
+            }
+            dh[dhRow + j] = dhv * z;
+        }
+    }
+
+    // destination[offset + k] += source[k] for k < count, SIMD-wide.
+    private static void AddInto(float[] destination, int offset, ReadOnlySpan<float> source, int count)
+    {
+        var d = destination.AsSpan(offset, count);
+        int k = 0;
+        if (System.Numerics.Vector.IsHardwareAccelerated)
+        {
+            int width = System.Numerics.Vector<float>.Count;
+            var dv = System.Runtime.InteropServices.MemoryMarshal.Cast<float, System.Numerics.Vector<float>>(d);
+            var sv = System.Runtime.InteropServices.MemoryMarshal.Cast<float, System.Numerics.Vector<float>>(source.Slice(0, count));
+            for (int v = 0; v < dv.Length; v++) dv[v] += sv[v];
+            k = dv.Length * width;
+        }
+        for (; k < count; k++) d[k] += source[k];
     }
 
     // Splits the batch into contiguous chunks, one per worker, once a step's work is worth a thread (the LSTM path's
