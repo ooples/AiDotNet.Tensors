@@ -78,6 +78,9 @@ public class CpuOpBreakdownBench
             AiDotNet.Tensors.Engines.Simd.DirectConvAvx2.s_forwardRunPassKernelBytes = runPassBytes;
         if (int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_OP_RUN_POSITIONS"), out int runPositions) && runPositions > 0)
             AiDotNet.Tensors.Engines.Simd.DirectConvAvx2.s_forwardRunPositions = runPositions;
+        int previousMinPhase = AiDotNet.Tensors.Engines.Simd.DirectConvAvx2.MinStridedPhasePositions;
+        if (int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_OP_MIN_PHASE"), out int minPhase) && minPhase > 0)
+            AiDotNet.Tensors.Engines.Simd.DirectConvAvx2.MinStridedPhasePositions = minPhase;
         var rng = new Random(7);
         try
         {
@@ -120,6 +123,7 @@ public class CpuOpBreakdownBench
             AiDotNet.Tensors.Engines.Simd.DirectConvAvx2.s_forwardPassKernelBytes = previousPassBytes;
             AiDotNet.Tensors.Engines.Simd.DirectConvAvx2.s_forwardRunPassKernelBytes = previousRunPassBytes;
             AiDotNet.Tensors.Engines.Simd.DirectConvAvx2.s_forwardRunPositions = previousRunPositions;
+            AiDotNet.Tensors.Engines.Simd.DirectConvAvx2.MinStridedPhasePositions = previousMinPhase;
             AiDotNetEngine.Current = previousEngine;
         }
     }

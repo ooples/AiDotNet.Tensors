@@ -83,8 +83,10 @@ internal static class DirectConvAvx2
     // Larger planes stay on the Winograd / implicit-GEMM routes until measured.
     private const int MaxStride1PlanePositions = 1024;
     // A strided input gradient runs one stride-1 conv per phase over a grid of (H/stride) x (W/stride); below this
-    // many grid positions per image the tiles are too short (256->512 stride 2 on 8x8, a 4x4 grid: 1.2 ms -> 1.4).
-    private const int MinStridedPhasePositions = 64;
+    // many grid positions per image the tiles are too short. It was 64 (256->512 stride 2 on 8x8, a 4x4 grid, measured
+    // 1.2 ms -> 1.4); with runs that cross grid rows and a destination-ordered phase pack, that shape takes 5.3 ms direct
+    // against 12.2 ms on the im2col route (one thread, emulated CI runner; PyTorch 4.7-6.6 ms).
+    internal static int MinStridedPhasePositions = 16;
 
     /// <summary>
     /// Whether <paramref name="shape"/>'s pass runs on the direct kernel, and with what forward task target (0 = the
@@ -380,22 +382,24 @@ internal static class DirectConvAvx2
         fixed (float* ps = source)
         fixed (float* pd = packed)
         {
-            float* d0 = pd + packedOffset + (long)ib * outBlocks * taps * Block * Block;
-            for (int lane = 0; lane < Block; lane++)
-            {
-                int i = ib * Block + lane;
-                for (int o = 0; o < outChannels; o++)
+            // Destination order (each 8x8 block written contiguously); the lane-outer order it replaces revisited every
+            // destination line eight times, and was 46% of a 256->512 8x8 stride-2 input gradient (one thread).
+            float* d = pd + packedOffset + (long)ib * outBlocks * taps * Block * Block;
+            int kernelPlane = kernelHeight * kernelWidth;
+            for (int ob = 0; ob < outBlocks; ob++)
+                for (int y = 0; y < tapsH; y++)
                 {
-                    float* s = ps + sourceOffset + ((long)o * inChannels + i) * kernelHeight * kernelWidth;
-                    float* d = d0 + (long)(o / Block) * taps * Block * Block + (o % Block) * Block + lane;
-                    for (int y = 0; y < tapsH; y++)
+                    int kh = firstH + strideH * (tapsH - 1 - y);
+                    for (int x = 0; x < tapsW; x++)
                     {
-                        int kh = firstH + strideH * (tapsH - 1 - y);
-                        for (int x = 0; x < tapsW; x++)
-                            d[(y * tapsW + x) * Block * Block] = s[kh * kernelWidth + firstW + strideW * (tapsW - 1 - x)];
+                        int tap = kh * kernelWidth + firstW + strideW * (tapsW - 1 - x);
+                        for (int oo = 0; oo < Block; oo++)
+                        {
+                            float* s = ps + sourceOffset + ((long)(ob * Block + oo) * inChannels + ib * Block) * kernelPlane + tap;
+                            for (int lane = 0; lane < Block; lane++) *d++ = s[lane * kernelPlane];
+                        }
                     }
                 }
-            }
         }
     }
     /// <summary>dW[oc, ic, kh, kw] (=, or += when <paramref name="accumulate"/>) for the conv of input with kernel.</summary>
@@ -756,10 +760,7 @@ internal static class DirectConvAvx2
             for (int runStart = first; runStart < last;)
             {
                 int imageEnd = (runStart / gridPositions + 1) * gridPositions;
-                // A plain grid's rows are contiguous in the output, so a run may cross them; otherwise (a strided input
-                // gradient's phase) consecutive positions are StepW apart only within a grid row.
-                int rowEnd = plain ? imageEnd : runStart - runStart % gridPositions % gridWidth + gridWidth;
-                int runEnd = Math.Min(Math.Min(last, rowEnd), runStart + runLength);
+                int runEnd = Math.Min(Math.Min(last, imageEnd), runStart + runLength);
                 int run = runEnd - runStart;
                 for (int i = 0, column = gridWidth; i < run; i++)
                 {
@@ -1062,19 +1063,28 @@ internal static class DirectConvAvx2
         }
     }
 
-    // FlushStage for a run within one row of a non-plain grid: consecutive positions are StepW apart in the plane.
+    // FlushStage for a run of a non-plain grid (a strided input gradient's phase), within one image: consecutive
+    // positions are StepW apart within a grid row, and a row wrap moves StepH output rows down. Phase grids are a few
+    // positions wide (4 at 8x8 stride 2), so runs that stopped at row ends were too short to amortize the passes.
     [MethodImpl(Hot)]
     private static unsafe void FlushStageStrided(float* output, bool accumulate, in ForwardGeometry g, int channelBase, int q0, int run, float* stage)
     {
-        int index = g.OutputIndex(q0, out int b);
+        g.OutputIndex(q0, out int b);
         long plane = g.OutPlane;
-        int step = g.StepW;
-        float* d = output + ((long)b * g.OutChannels + channelBase) * plane + index;
+        int* index = stackalloc int[MaxForwardRunPositions];
+        int gridWidth = g.GridWidth, column = q0 % g.GridPositions % gridWidth;
+        index[0] = g.OutputIndex(q0, out _);
+        for (int i = 1; i < run; i++)
+        {
+            if (++column == gridWidth) { column = 0; index[i] = g.OutputIndex(q0 + i, out _); }
+            else index[i] = index[i - 1] + g.StepW;
+        }
+        float* d = output + ((long)b * g.OutChannels + channelBase) * plane;
         for (int ch = 0; ch < 32; ch++)
         {
             float* dst = d + ch * plane;
-            if (accumulate) for (int i = 0; i < run; i++) dst[(long)i * step] += stage[i * 32 + ch];
-            else for (int i = 0; i < run; i++) dst[(long)i * step] = stage[i * 32 + ch];
+            if (accumulate) for (int i = 0; i < run; i++) dst[index[i]] += stage[i * 32 + ch];
+            else for (int i = 0; i < run; i++) dst[index[i]] = stage[i * 32 + ch];
         }
     }
 
