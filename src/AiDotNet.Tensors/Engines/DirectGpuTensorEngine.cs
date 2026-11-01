@@ -202,8 +202,59 @@ internal sealed class ActivationCacheEntry : IDisposable
 /// </summary>
 public sealed class GpuScope : IDisposable
 {
+    /// <summary>
+    /// This thread's open-scope depth per engine. A thread almost always drives one engine, so a short linear map
+    /// beats hashing; it is thread-static, so no access needs a lock.
+    /// </summary>
+    private sealed class DepthMap
+    {
+        private int[] _engineIds = new int[2];
+        private int[] _depths = new int[2];
+        private int _count;
+
+        internal bool AnyOpen
+        {
+            get
+            {
+                for (int i = 0; i < _count; i++)
+                    if (_depths[i] > 0) return true;
+                return false;
+            }
+        }
+
+        internal void Enter(int engineId)
+        {
+            int i = IndexOf(engineId);
+            if (i < 0)
+            {
+                if (_count == _engineIds.Length)
+                {
+                    Array.Resize(ref _engineIds, _count * 2);
+                    Array.Resize(ref _depths, _count * 2);
+                }
+                i = _count++;
+                _engineIds[i] = engineId;
+                _depths[i] = 0;
+            }
+            _depths[i]++;
+        }
+
+        internal void Exit(int engineId)
+        {
+            int i = IndexOf(engineId);
+            if (i >= 0 && _depths[i] > 0) _depths[i]--;
+        }
+
+        private int IndexOf(int engineId)
+        {
+            for (int i = 0; i < _count; i++)
+                if (_engineIds[i] == engineId) return i;
+            return -1;
+        }
+    }
+
     [ThreadStatic]
-    private static Dictionary<int, int>? _depthPerEngine;
+    private static DepthMap? _depthPerEngine;
 
     private readonly DirectGpuTensorEngine? _engine;
     private readonly int _engineId;
@@ -215,12 +266,7 @@ public sealed class GpuScope : IDisposable
     {
         get
         {
-            if (_depthPerEngine is null) return false;
-            foreach (var kvp in _depthPerEngine)
-            {
-                if (kvp.Value > 0) return true;
-            }
-            return false;
+            return _depthPerEngine?.AnyOpen ?? false;
         }
     }
 
@@ -228,35 +274,20 @@ public sealed class GpuScope : IDisposable
     {
         _engine = engine;
         _engineId = engine?.GetHashCode() ?? 0;
-        _depthPerEngine ??= new Dictionary<int, int>();
-        _depthPerEngine.TryGetValue(_engineId, out int depth);
-        _depthPerEngine[_engineId] = depth + 1;
+        (_depthPerEngine ??= new DepthMap()).Enter(_engineId);
     }
 
     /// <inheritdoc />
     public void Dispose()
     {
-        if (_depthPerEngine is null) return;
-        _depthPerEngine.TryGetValue(_engineId, out int depth);
-        if (depth > 0)
-        {
-            depth--;
-            _depthPerEngine[_engineId] = depth;
-            // Issue #561: previously this called _engine.MaterializeAllDeferred()
-            // which forced a host download of EVERY intermediate produced inside
-            // the scope. For an 8-step chained GEMM that's 8 downloads at scope
-            // exit when the user only reads the final value — a 1.63× slowdown
-            // vs running the same chain outside the scope. That directly
-            // contradicted GpuScope's documented contract ("Downloads of
-            // intermediate results are deferred until CPU data is actually
-            // needed"). Buffer-lifetime safety is already covered by
-            // EvictOldestActivationsUnsafe / EvictActivationsCreatedAfter,
-            // which materialize-before-free any deferred entry they evict.
-            // So scope exit can drop straight back to the deferred-lazy
-            // model: a host read of an intermediate materializes it at the
-            // read point; an intermediate the user never reads never pays for
-            // a download.
-        }
+        // A Dispose on another thread than the constructor finds no entry and does nothing, as before.
+        // Issue #561: scope exit used to call _engine.MaterializeAllDeferred(), which forced a host download of EVERY
+        // intermediate produced inside the scope (an 8-step chained GEMM paid 8 downloads, 1.63x slower than the same
+        // chain outside the scope), contradicting GpuScope's contract that downloads wait until CPU data is needed.
+        // Buffer-lifetime safety is covered by EvictOldestActivationsUnsafe / EvictActivationsCreatedAfter, which
+        // materialize-before-free any deferred entry they evict, so a host read materializes an intermediate at the
+        // read point and an intermediate nobody reads never pays for a download.
+        _depthPerEngine?.Exit(_engineId);
     }
 }
 
@@ -31885,7 +31916,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         for (int k = 0; k < numMfcc; k++)
             for (int m = 0; m < melBins; m++)
                 dctTransposed[m * numMfcc + k] =
-                    (float)(norm * Math.Cos(Math.PI * k * (2 * m + 1) / (2 * melBins)));
+                    (float)(norm * Math.Cos(Math.PI * k * (2.0 * m + 1.0) / (2.0 * melBins)));
 
         using var inputBuffer = GetOrAllocateBuffer(backend, waveforms);
         using var segmentReal = new OwnedBuffer(backend.AllocateBuffer(fftElementCount), true);
