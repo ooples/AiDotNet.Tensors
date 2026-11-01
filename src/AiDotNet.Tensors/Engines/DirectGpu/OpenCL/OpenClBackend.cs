@@ -14417,7 +14417,7 @@ KERNEL VARIANTS (A/B testing):
             if (_context == null)
                 throw new GpuCapabilityUnavailableException("OpenCL context not available");
             int rowGroup = SumAxisRowGroupSize();
-            if (rowGroup > 0 && _kernelCache.TryGetValue("sum_axis_rows_scaled", out var scaled)
+            if (rowGroup > 0 && _kernelCache.TryGetValue("reduce_mean", out var scaled)
                 && _kernelCache.TryGetValue("sum_axis_rows_split", out var splitKernel))
             {
                 var input = ((DirectOpenClGpuBuffer)i).Buffer;

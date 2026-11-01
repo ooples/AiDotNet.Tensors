@@ -164,9 +164,10 @@ __kernel void sum_axis_rows(
     if (lid == 0) output[row] = scratch[0];
 }
 
-// sum_axis_rows times `scale` before the store: a row mean (scale = 1 / reduceSize) in the reduction's own launch
-// instead of a sum then a separate Scale launch.
-__kernel void sum_axis_rows_scaled(
+// sum_axis_rows times `scale` before the store: a row mean in the reduction's own launch instead of a sum then a
+// separate Scale launch. scale is 1 / (elements averaged), which for the last pass over split partials is not
+// 1 / reduceSize. CUDA and HIP name their mean kernel the same.
+__kernel void reduce_mean(
     __global const float* input,
     __global float* output,
     const int outerSize,
@@ -382,7 +383,7 @@ __kernel void reduce_sum_of_squares(
             return new string[]
             {
                 "reduce_sum", "reduce_max", "reduce_min",
-                "sum_axis", "sum_axis_rows", "sum_axis_rows_scaled", "sum_axis_rows_split", "max_axis", "variance_axis", "std_axis",
+                "sum_axis", "sum_axis_rows", "reduce_mean", "sum_axis_rows_split", "max_axis", "variance_axis", "std_axis",
                 "product_axis", "norm_axis", "logsumexp_axis",
                 "cumsum_axis", "scalar_minus_tensor", "normalize_l2",
                 "reduce_sum_backward", "reduce_mean_backward",

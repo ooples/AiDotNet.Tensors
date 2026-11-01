@@ -6473,21 +6473,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             attentionWeights.Size < weightsSize)
             throw new ArgumentException("Attention backward buffers are smaller than the requested dimensions.");
 
-        using var gradScores = AllocateBuffer(weightsSize);
-        using var softmaxGrad = AllocateBuffer(weightsSize);
-        using var attentionTransposed = AllocateBuffer(weightsSize);
-        using var valueTransposed = AllocateBuffer(keySize);
-        using var gradScoresTransposed = AllocateBuffer(weightsSize);
-
-        BatchedTranspose(attentionWeights, attentionTransposed, batchHeads, seqQ, seqK);
-        BatchedGemm(attentionTransposed, gradOutput, gradValue, seqK, headDim, seqQ, batchHeads);
-        BatchedTranspose(value, valueTransposed, batchHeads, seqK, headDim);
-        BatchedGemm(gradOutput, valueTransposed, gradScores, seqQ, seqK, headDim, batchHeads);
-        SoftmaxBackward(gradScores, attentionWeights, softmaxGrad, batchHeads * seqQ, seqK);
-        Scale(softmaxGrad, gradScores, scale, weightsSize);
-        BatchedGemm(gradScores, key, gradQuery, seqQ, headDim, seqK, batchHeads);
-        BatchedTranspose(gradScores, gradScoresTransposed, batchHeads, seqQ, seqK);
-        BatchedGemm(gradScoresTransposed, query, gradKey, seqK, headDim, seqQ, batchHeads);
+        // Multi-head attention is grouped-query attention with one query head per KV head: its backward kernels compute
+        // the value, score and query/key gradients directly (as OpenCL routes it), where this was four batched GEMMs,
+        // three transposes, a softmax backward and a scale through five temporaries.
+        GroupedQueryAttentionBackward(gradOutput, query, key, value, attentionWeights, gradQuery, gradKey, gradValue,
+            batch, numHeads, numHeads, seqQ, seqK, headDim, scale, numQueriesPerKV: 1);
     }
 
     public void FlashAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
