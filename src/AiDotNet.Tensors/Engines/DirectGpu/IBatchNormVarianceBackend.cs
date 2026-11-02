@@ -10,6 +10,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
     nameof(IDirectGpuBackend.BatchNorm), nameof(IDirectGpuBackend.BatchNormBackward))]
 internal interface IBatchNormVarianceBackend
 {
+    /// <summary>Whether <see cref="TryBatchNormTrainingWithVariance"/> and <see cref="TryBatchNormBackwardFromVariance"/>
+    /// take a [batch, channels, spatial] input, so a
+    /// caller allocates its outputs only for a launch that happens (a compiled step keeps every buffer an action rents).
+    /// </summary>
+    bool AcceptsTrainingShape(int batch, int channels, int spatial);
+
     /// <summary>Training forward over [batch, channels, spatial]: every element of <paramref name="output"/> and of
     /// <paramref name="saveMean"/> / <paramref name="saveVariance"/> (biased variance) is written. With
     /// <paramref name="relu"/> the output is ReLU of the normalized values (a BatchNorm followed by a ReLU); with a

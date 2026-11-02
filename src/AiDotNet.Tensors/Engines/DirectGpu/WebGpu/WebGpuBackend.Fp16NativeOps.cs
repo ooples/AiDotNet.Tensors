@@ -1,10 +1,7 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
 // FP16-NATIVE elementwise / activation ops for the WebGPU backend (Tensors #558): GELU / ReLU /
-// residual add. WebGPU has no native 16-bit storage by default (the optional shader-f16 feature is not
-// used), so this backend models FP16 as f32 with a truncated 10-bit mantissa (see ConvertToFp16). Under
-// that model an FP16-native op is exactly the existing real WGSL f32 op run on the FP16-precision inputs,
-// with the result re-truncated to FP16 precision — same contract the FP16 GEMM (Hgemm) uses. No separate
-// FP16 kernel is needed because the data is already f32.
+// residual add. The halves are packed binary16 (WebGpuBackend.PackedHalf): the element-wise ops read and write them
+// in one pass, computing in f32; softmax and layernorm widen their operands, run the f32 row kernels and narrow back.
 
 #if NET7_0_OR_GREATER
 using System;
@@ -23,18 +20,14 @@ public sealed partial class WebGpuBackend
     public void Fp16Gelu(IGpuBuffer input, IGpuBuffer output, int n)
     {
         ValidateUnary(input, output, n);
-        using var scratch = AllocateBuffer(n);
-        GeLUAsync(input, scratch, n).GetAwaiter().GetResult();
-        ConvertToFp16(scratch, output, n); // re-truncate the result to FP16 precision
+        HalfElementwise(HalfElementwiseOp.Gelu, input, input, output, n);
     }
 
     /// <summary>ReLU over an FP16 buffer (truncated-f32): out = round16(max(in, 0)).</summary>
     public void Fp16Relu(IGpuBuffer input, IGpuBuffer output, int n)
     {
         ValidateUnary(input, output, n);
-        using var scratch = AllocateBuffer(n);
-        ReLUAsync(input, scratch, n).GetAwaiter().GetResult();
-        ConvertToFp16(scratch, output, n);
+        HalfElementwise(HalfElementwiseOp.Relu, input, input, output, n);
     }
 
     /// <summary>Residual add over FP16 buffers (truncated-f32): out = round16(a + b).</summary>
@@ -44,9 +37,7 @@ public sealed partial class WebGpuBackend
         if (b is null) throw new ArgumentNullException(nameof(b));
         if (output is null) throw new ArgumentNullException(nameof(output));
         if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n), "Element count must be positive.");
-        using var scratch = AllocateBuffer(n);
-        AddAsync(a, b, scratch, n).GetAwaiter().GetResult();
-        ConvertToFp16(scratch, output, n);
+        HalfElementwise(HalfElementwiseOp.Add, a, b, output, n);
     }
 
     /// <summary>Row softmax over the last axis (truncated-f32 FP16 model): runs the real f32 WGSL softmax
@@ -57,9 +48,12 @@ public sealed partial class WebGpuBackend
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (output is null) throw new ArgumentNullException(nameof(output));
         if (rows <= 0 || cols <= 0) throw new ArgumentException($"rows/cols must be positive (rows={rows}, cols={cols}).");
-        using var scratch = AllocateBuffer(rows * cols);
-        SoftmaxAsync(input, scratch, rows, cols).GetAwaiter().GetResult();
-        ConvertToFp16(scratch, output, rows * cols); // re-truncate to FP16 precision
+        int count = checked(rows * cols);
+        using var wide = AllocateBuffer(count);
+        using var scratch = AllocateBuffer(count);
+        ConvertToFp32(input, wide, count);
+        SoftmaxAsync(wide, scratch, rows, cols).GetAwaiter().GetResult();
+        ConvertToFp16(scratch, output, count);
     }
 
     /// <summary>Row layernorm over the last axis with FP16 gamma/beta (truncated-f32 model): real f32 WGSL
@@ -76,7 +70,14 @@ public sealed partial class WebGpuBackend
         if (eps <= 0f || float.IsNaN(eps) || float.IsInfinity(eps))
             throw new ArgumentOutOfRangeException(nameof(eps), eps, "eps must be finite and positive.");
 
-        using var scratch = AllocateBuffer(rows * cols);
+        int count = checked(rows * cols);
+        using var wideInput = AllocateBuffer(count);
+        using var wideGamma = AllocateBuffer(cols);
+        using var wideBeta = AllocateBuffer(cols);
+        ConvertToFp32(input, wideInput, count);
+        ConvertToFp32(gamma, wideGamma, cols);
+        ConvertToFp32(beta, wideBeta, cols);
+        using var scratch = AllocateBuffer(count);
         IGpuBuffer? tmpMean = null, tmpVar = null;
         var meanBuf = meanFp32 ?? (tmpMean = AllocateBuffer(rows));
         var varBuf = varFp32 ?? (tmpVar = AllocateBuffer(rows));
@@ -84,8 +85,8 @@ public sealed partial class WebGpuBackend
         {
             var prm = new float[] { BitConverter.Int32BitsToSingle(rows), BitConverter.Int32BitsToSingle(cols), eps, 0 };
             Dispatch6BufferAsync("Fp16LayerNorm", WebGpuKernels.Fp16LayerNormSource, "fp16_layernorm",
-                input, gamma, beta, scratch, meanBuf, varBuf, prm, rows * 256).GetAwaiter().GetResult();
-            ConvertToFp16(scratch, output, rows * cols); // re-truncate to FP16 precision
+                wideInput, wideGamma, wideBeta, scratch, meanBuf, varBuf, prm, rows * 256).GetAwaiter().GetResult();
+            ConvertToFp16(scratch, output, count);
         }
         finally
         {

@@ -13,7 +13,10 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// including key counts that are not a multiple of the kernel's 32-key block, causal masks with positive and negative
 /// offsets (a row that sees no key outputs zero), and the engine's inference path through MultiHeadAttentionCore.
 /// </summary>
+// IShortAttentionForwardBackend is an OpenCL-only route (BackendSpecificRoute); every other backend composes the
+// same attention and skips here, so the class belongs to the OpenCL lanes.
 [Collection("DirectGpuSerial")]
+[Trait("Category", "RequiresOpenCL")]
 public sealed class ShortAttentionForwardTests
 {
     private static float[] Values(int n, int seed)

@@ -2246,9 +2246,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
         LaunchBinaryOpAutoVec4("add_vectors", A, B, C, size);
     }
-    public void AddRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Relu(C, C, size); }
-    public void AddSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Sigmoid(C, C, size); }
-    public void AddGelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Gelu(C, C, size); }
+    public void AddRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => LaunchBinaryOpAutoVec4("add_relu", A, B, C, size);
+    public void AddSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => LaunchBinaryOpAutoVec4("add_sigmoid", A, B, C, size);
+    public void AddGelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => LaunchBinaryOpAutoVec4("add_gelu", A, B, C, size);
 
     public void Subtract(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
@@ -6456,6 +6456,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         Synchronize();
     }
 
+    /// <summary>MAX_HEAD_DIM of HipAttentionKernels: the widest head the attention kernels hold in registers.</summary>
+    private const int AttentionKernelMaxHeadDim = 128;
+
     public void ScaledDotProductAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer attentionWeights, IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
         int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
@@ -6473,6 +6476,16 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             attentionWeights.Size < weightsSize)
             throw new ArgumentException("Attention backward buffers are smaller than the requested dimensions.");
 
+        // Multi-head attention is grouped-query attention with one query head per KV head: up to the kernels' head-dim
+        // limit its backward kernels compute the value, score and query/key gradients directly (as OpenCL routes it).
+        if (headDim <= AttentionKernelMaxHeadDim)
+        {
+            GroupedQueryAttentionBackward(gradOutput, query, key, value, attentionWeights, gradQuery, gradKey, gradValue,
+                batch, numHeads, numHeads, seqQ, seqK, headDim, scale, numQueriesPerKV: 1);
+            return;
+        }
+
+        // Wider heads: four batched GEMMs, three transposes, a softmax backward and a scale.
         using var gradScores = AllocateBuffer(weightsSize);
         using var softmaxGrad = AllocateBuffer(weightsSize);
         using var attentionTransposed = AllocateBuffer(weightsSize);
@@ -6720,6 +6733,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 $"numQueriesPerKV={numQueriesPerKV} maps {numQHeads} query heads across {mappedKvHeads} KV heads, " +
                 $"but only {numKVHeads} KV heads were provided.", nameof(numQueriesPerKV));
 
+        // The kernels hold a head in registers and return without writing above MAX_HEAD_DIM: refuse rather than leave the
+        // gradients untouched.
+        if (headDim > AttentionKernelMaxHeadDim)
+            throw new GpuCapabilityUnavailableException(
+                $"HIP grouped-query attention backward supports head dims up to {AttentionKernelMaxHeadDim}, not {headDim}.");
+
         // #628: honor the explicit numQueriesPerKV (matches the CPU's kvh = qh / numQueriesPerKV).
         int queriesPerKV = numQueriesPerKV;
 
@@ -6784,6 +6803,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
         if (!_kernelCache.TryGetValue("grouped_query_attention_backward", out var krnl))
             throw new GpuCapabilityUnavailableException("HIP kernel not found: grouped_query_attention_backward");
+
+        // This kernel adds into gradQuery (+=) and gradKey / gradValue (atomicAdd): start them at zero, as OpenCL does, or
+        // a reused or uninitialized destination keeps its old contents under the new gradient.
+        Fill(gradQuery, 0f, checked(batch * numQHeads * seqQ * headDim));
+        Fill(gradKey, 0f, checked(batch * numKVHeads * seqK * headDim));
+        Fill(gradValue, 0f, checked(batch * numKVHeads * seqK * headDim));
 
         void** args = stackalloc void*[16];
         args[0] = &_p0;
@@ -8287,9 +8312,16 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void Fma(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, IGpuBuffer D, int size)
     {
-        // D = A * B + C
-        Multiply(A, B, D, size);
-        Add(D, C, D, size);
+        // D = fma(A, B, C) in one kernel; D may alias C.
+        if (size <= 0) return;
+        if (!_kernelCache.TryGetValue("fma_vectors", out var kernel))
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: fma_vectors");
+        IntPtr pa = A.Handle, pb = B.Handle, pc = C.Handle, pd = D.Handle;
+        int n = size;
+        void** args = stackalloc void*[5];
+        args[0] = &pa; args[1] = &pb; args[2] = &pc; args[3] = &pd; args[4] = &n;
+        LaunchKernel(kernel, (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
+        Synchronize();
     }
 
     public unsafe void Lerp(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, float t, int size)
@@ -9541,10 +9573,33 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     /// <summary>
     /// 2D FFT using row-column decomposition.
     /// </summary>
+    private unsafe void StridedDft(IGpuBuffer inRe, IGpuBuffer inIm, IGpuBuffer outRe, IGpuBuffer outIm,
+        int lines, int n, int elemStride, int lineStride, bool inverse)
+    {
+        IntPtr kernel = GetRequiredFftKernel("strided_dft");
+        IntPtr p0 = inRe.Handle, p1 = inIm.Handle, p2 = outRe.Handle, p3 = outIm.Handle;
+        int inv = inverse ? 1 : 0;
+        void** args = stackalloc void*[9];
+        args[0] = &p0; args[1] = &p1; args[2] = &p2; args[3] = &p3;
+        args[4] = &lines; args[5] = &n; args[6] = &elemStride; args[7] = &lineStride; args[8] = &inv;
+        int total = lines * n;
+        LaunchKernel(kernel, (uint)((total + 255) / 256), 256, args);
+    }
+
     public unsafe void FFT2D(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag, int height, int width, bool inverse)
     {
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("HIP backend not available");
+
+        if ((height & (height - 1)) != 0 || (width & (width - 1)) != 0)
+        {
+            // The radix-2 kernels need power-of-two sides: rows into a temporary, then columns into the output.
+            using var rowsReal = AllocateBuffer(height * width);
+            using var rowsImag = AllocateBuffer(height * width);
+            StridedDft(inputReal, inputImag, rowsReal, rowsImag, height, width, 1, width, inverse);
+            StridedDft(rowsReal, rowsImag, outputReal, outputImag, width, height, width, 1, inverse);
+            return;
+        }
 
         IntPtr rowsBitRevKernel = GetRequiredFftKernel("fft_rows_bit_reverse");
         IntPtr rowsButterflyKernel = GetRequiredFftKernel("fft_rows_butterfly");

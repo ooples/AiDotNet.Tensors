@@ -122,13 +122,26 @@ internal sealed class CompiledMlp
         var bufB = new float[(int)bufLen];
         var plan = new CompiledMlp(w, b, inF, outF, act, ap, maxBatch, bufA, bufB);
 
-        // Warm the persistent prepacked-B cache (keyed by weight-array identity)
-        // for every layer at batch 1, so the first real Run hits the cache and
-        // pays no PackB. Output discarded.
+        // Warm the batch-1 route (BlasManaged), then the persistent prepacked-B cache (keyed by weight-array identity)
+        // that RunLayerGemm uses between BlasManagedMaxSmallRows and BlasManagedMinRows. Batch 1 no longer reaches the
+        // cached-B route, so without the second warmup the first intermediate batch paid every layer's PackB. Outputs
+        // discarded.
         var dummyIn = new float[inF[0]];
         var dummyOut = new float[plan.OutputFeatures];
         plan.Run(dummyIn, 1, dummyOut);
+        int warmRows = BlasManagedMaxSmallRows + 1;
+        if (maxBatch >= warmRows)
+        {
+            var warmA = new float[warmRows * maxIn(inF)];
+            var warmC = new float[warmRows * maxN];
+            for (int i = 0; i < layers; i++)
+                SimdGemm.SgemmWithCachedB(warmA.AsSpan(0, warmRows * inF[i]), w[i], warmC.AsSpan(0, warmRows * outF[i]),
+                    warmRows, inF[i], outF[i]);
+        }
         return plan;
+
+        // The widest layer input, or 0 for no layers.
+        static int maxIn(int[] features) => System.Linq.Enumerable.Aggregate(features, 0, Math.Max);
     }
 
     /// <summary>
@@ -176,6 +189,10 @@ internal sealed class CompiledMlp
         }
     }
 
+    // The batch from which a layer's GEMM goes through BlasManaged rather than the cached-B route (RunLayerGemm).
+    private const int BlasManagedMinRows = 128;
+    private const int BlasManagedMaxSmallRows = 8;
+
     private static void RunLayerGemm(float[] src, float[] weight, float[] dst, int m, int k, int n)
     {
 #if NETCOREAPP
@@ -185,6 +202,16 @@ internal sealed class CompiledMlp
         if (Simd.JitGemmAvx2.TryMultiply(src.AsSpan(0, m * k), weight.AsSpan(0, k * n), dst.AsSpan(0, m * n), m, n, k))
             return;
 #endif
+        // From 128 rows, and up to 8, BlasManaged's dispatcher: the cached-B route took about twice as long there on a
+        // 16-core Ryzen (128 x 784 x 512: 389 against 169 us; a batch-1 MLP forward 0.088 against 0.043 ms; 8 x 784 x 512
+        // 41 against 31 us). In between the cached-B route wins (32 x 784 x 512: 56 against 277 us; 64 x 512 x 128: 25
+        // against 46).
+        if (m >= BlasManagedMinRows || m <= BlasManagedMaxSmallRows)
+        {
+            BlasManaged.BlasManaged.Gemm<float>(src.AsSpan(0, m * k), k, false, weight.AsSpan(0, k * n), n, false,
+                dst.AsSpan(0, m * n), n, m, n, k);
+            return;
+        }
         // Managed cached-B (prepacked, low dispatch overhead).
         SimdGemm.SgemmWithCachedB(src.AsSpan(0, m * k), weight, dst.AsSpan(0, m * n), m, k, n);
     }

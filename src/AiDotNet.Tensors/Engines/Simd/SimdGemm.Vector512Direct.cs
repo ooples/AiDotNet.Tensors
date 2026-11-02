@@ -11,6 +11,7 @@
 #if NET9_0_OR_GREATER
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.Simd;
@@ -19,6 +20,11 @@ internal static partial class SimdGemm
 {
     /// <summary>Output columns of the 512-bit direct tile.</summary>
     internal const int Nr512 = 32;
+
+    // Keep small-k calls from repeatedly growing the thread-local strip buffer.
+    private const int MinPackedStripRows = 64;
+    // 256 rows of 32 floats occupy 32 KB, leaving the packed tile in L1.
+    private const int DefaultPackedStripRows = 256;
 
     /// <summary>
     /// Whether the direct GEMM paths run full 32-column strips on <see cref="DirectKernel6x32Store"/>: the runtime
@@ -146,7 +152,7 @@ internal static partial class SimdGemm
     /// block, and the A panel's lines with it. AIDOTNET_GEMM_KC overrides (0 = no blocking).
     /// </summary>
     internal static readonly int s_stripKc =
-        int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_KC"), out int kc) && kc >= 0 ? kc : 256;
+        int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_KC"), out int kc) && kc >= 0 ? kc : DefaultPackedStripRows;
 
     /// <summary>The 512-bit <see cref="TransAKernel6x16"/>: six rows x 32 columns of C = At*B, overwriting C; pA points at
     /// row i0 of At (A + i0), lda = m; C's rows are <paramref name="ldc"/> apart (B may be a packed strip, ldb = 32).</summary>
@@ -186,6 +192,92 @@ internal static partial class SimdGemm
         c50.Store(pC); c51.Store(pC + 16);
     }
 
+    /// <summary><see cref="TransAKernel6x32"/> resuming each element's FMA chain from the value C holds (accumulators
+    /// start at C), so k split into blocks runs exactly the unsplit kernel's chains.</summary>
+    [MethodImpl(HotInline)]
+    internal static unsafe void TransAKernel6x32Resume(float* pA, int lda, float* pB, int ldb, float* pC, int ldc, int k)
+    {
+        float* r0 = pC, r1 = pC + ldc, r2 = pC + 2 * ldc, r3 = pC + 3 * ldc, r4 = pC + 4 * ldc, r5 = pC + 5 * ldc;
+        var c00 = Vector512.Load(r0); var c01 = Vector512.Load(r0 + 16);
+        var c10 = Vector512.Load(r1); var c11 = Vector512.Load(r1 + 16);
+        var c20 = Vector512.Load(r2); var c21 = Vector512.Load(r2 + 16);
+        var c30 = Vector512.Load(r3); var c31 = Vector512.Load(r3 + 16);
+        var c40 = Vector512.Load(r4); var c41 = Vector512.Load(r4 + 16);
+        var c50 = Vector512.Load(r5); var c51 = Vector512.Load(r5 + 16);
+        for (int p = 0; p < k; p++)
+        {
+            var b0 = Vector512.Load(pB);
+            var b1 = Vector512.Load(pB + 16);
+            var a0 = Vector512.Create(pA[0]);
+            c00 = Vector512.FusedMultiplyAdd(a0, b0, c00); c01 = Vector512.FusedMultiplyAdd(a0, b1, c01);
+            var a1 = Vector512.Create(pA[1]);
+            c10 = Vector512.FusedMultiplyAdd(a1, b0, c10); c11 = Vector512.FusedMultiplyAdd(a1, b1, c11);
+            var a2 = Vector512.Create(pA[2]);
+            c20 = Vector512.FusedMultiplyAdd(a2, b0, c20); c21 = Vector512.FusedMultiplyAdd(a2, b1, c21);
+            var a3 = Vector512.Create(pA[3]);
+            c30 = Vector512.FusedMultiplyAdd(a3, b0, c30); c31 = Vector512.FusedMultiplyAdd(a3, b1, c31);
+            var a4 = Vector512.Create(pA[4]);
+            c40 = Vector512.FusedMultiplyAdd(a4, b0, c40); c41 = Vector512.FusedMultiplyAdd(a4, b1, c41);
+            var a5 = Vector512.Create(pA[5]);
+            c50 = Vector512.FusedMultiplyAdd(a5, b0, c50); c51 = Vector512.FusedMultiplyAdd(a5, b1, c51);
+            pA += lda;
+            pB += ldb;
+        }
+        c00.Store(r0); c01.Store(r0 + 16);
+        c10.Store(r1); c11.Store(r1 + 16);
+        c20.Store(r2); c21.Store(r2 + 16);
+        c30.Store(r3); c31.Store(r3 + 16);
+        c40.Store(r4); c41.Store(r4 + 16);
+        c50.Store(r5); c51.Store(r5 + 16);
+    }
+
+    /// <summary>
+    /// Whether the 512-bit 2-D direct tile reads its six-row panels of A from a contiguous copy ([p][6], one
+    /// broadcast stream) instead of six rows lda apart (AIDOTNET_GEMM_PACK_A=0 reads them in place). Same chains.
+    /// </summary>
+    internal static bool s_packA2D = System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_PACK_A") != "0";
+
+    /// <summary>
+    /// Copies rows [0, 6) x columns [0, k) of A (rows lda apart) to <paramref name="dst"/> as [k][6]: eight columns a
+    /// step through an 8x8 transpose with two zero rows. Each eight-float store spills two floats into the next
+    /// column's slot (written next) or, after the last, into two floats of slack the caller provides.
+    /// </summary>
+    internal static unsafe void PackRows6(float* a, int lda, float* dst, int k)
+    {
+        float* a1 = a + lda, a2 = a + 2L * lda, a3 = a + 3L * lda, a4 = a + 4L * lda, a5 = a + 5L * lda;
+        var zero = Vector256<float>.Zero;
+        int p = 0;
+        for (; p + 8 <= k; p += 8, dst += 8 * 6)
+        {
+            var t0 = Avx.UnpackLow(Vector256.Load(a + p), Vector256.Load(a1 + p));
+            var t1 = Avx.UnpackHigh(Vector256.Load(a + p), Vector256.Load(a1 + p));
+            var t2 = Avx.UnpackLow(Vector256.Load(a2 + p), Vector256.Load(a3 + p));
+            var t3 = Avx.UnpackHigh(Vector256.Load(a2 + p), Vector256.Load(a3 + p));
+            var t4 = Avx.UnpackLow(Vector256.Load(a4 + p), Vector256.Load(a5 + p));
+            var t5 = Avx.UnpackHigh(Vector256.Load(a4 + p), Vector256.Load(a5 + p));
+            var u0 = Avx.Shuffle(t0, t2, 0x44);
+            var u1 = Avx.Shuffle(t0, t2, 0xEE);
+            var u2 = Avx.Shuffle(t1, t3, 0x44);
+            var u3 = Avx.Shuffle(t1, t3, 0xEE);
+            var u4 = Avx.Shuffle(t4, zero, 0x44);
+            var u5 = Avx.Shuffle(t4, zero, 0xEE);
+            var u6 = Avx.Shuffle(t5, zero, 0x44);
+            var u7 = Avx.Shuffle(t5, zero, 0xEE);
+            Avx.Store(dst, Avx.Permute2x128(u0, u4, 0x20));
+            Avx.Store(dst + 6, Avx.Permute2x128(u1, u5, 0x20));
+            Avx.Store(dst + 12, Avx.Permute2x128(u2, u6, 0x20));
+            Avx.Store(dst + 18, Avx.Permute2x128(u3, u7, 0x20));
+            Avx.Store(dst + 24, Avx.Permute2x128(u0, u4, 0x31));
+            Avx.Store(dst + 30, Avx.Permute2x128(u1, u5, 0x31));
+            Avx.Store(dst + 36, Avx.Permute2x128(u2, u6, 0x31));
+            Avx.Store(dst + 42, Avx.Permute2x128(u3, u7, 0x31));
+        }
+        for (; p < k; p++, dst += 6)
+        {
+            dst[0] = a[p]; dst[1] = a1[p]; dst[2] = a2[p]; dst[3] = a3[p]; dst[4] = a4[p]; dst[5] = a5[p];
+        }
+    }
+
     /// <summary>
     /// Whether the 512-bit direct tiles read a 32-column strip of B from a contiguous copy (AIDOTNET_GEMM_PACK_STRIP=0
     /// turns it off). B's rows sit ldb floats apart, and at a power-of-two row length (n = 512: 2 KB) every row of a strip
@@ -203,7 +295,7 @@ internal static partial class SimdGemm
     internal static float[] PackedStripBuffer(int k)
     {
         var buffer = t_packedStrip;
-        if (buffer is null || buffer.Length < k * Nr512) t_packedStrip = buffer = new float[Math.Max(k, 64) * Nr512];
+        if (buffer is null || buffer.Length < k * Nr512) t_packedStrip = buffer = new float[Math.Max(k, MinPackedStripRows) * Nr512];
         return buffer;
     }
 

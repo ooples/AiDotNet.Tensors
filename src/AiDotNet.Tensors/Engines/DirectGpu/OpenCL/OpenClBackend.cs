@@ -84,12 +84,16 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         // error instead of crashing inside Execute1D.
         private bool _fusedAdvancedKernelsAvailable;
         private OpenClCommandQueue? _defaultStream;
-        // The pool is a caching allocator bounded by bytes (a quarter of device memory, set once the device is known),
-        // not by a count per size: a steady training loop frees many buffers of one size per step, and each one the
-        // pool refused went back to the driver behind a completion marker while the host ran steps ahead of the device.
-        // An allocation that runs out of memory drains the pool and retries (AllocateReclaiming).
+        // The pool is a caching allocator bounded by bytes (half of device memory, set once the device is known), not by
+        // a count per size: a steady training loop frees many buffers of one size per step, and each one the pool refused
+        // went back to the driver behind a completion marker while the host ran steps ahead of the device. Half, not a
+        // quarter: a batch-128 DenseNet-121 inference re-requests over a gigabyte of exactly-sized results every call
+        // (each concatenation 50-134 MB), and with a quarter they did not all fit, so every call went back to the driver
+        // for them: 421-460 ms a call, 270-285 ms at half, 246-265 ms at all of device memory (gfx1012, 4 GB). Training
+        // peaks did not move (MobileNetV2 295-302 MB, ResNet-50 955-984 MB at all three). An allocation that runs out of
+        // memory drains the pool and retries (AllocateReclaiming).
         private const int MaxPooledBufferElements = int.MaxValue;
-        private const int PooledMemoryDivisor = 4;
+        private const int PooledMemoryDivisor = 2;
         private const int MaxPooledBuffersPerSize = 4096;
         private readonly GpuBufferPool<DirectOpenClGpuBuffer> _bufferPool =
             new GpuBufferPool<DirectOpenClGpuBuffer>(MaxPooledBuffersPerSize, MaxPooledBufferElements);
@@ -2266,6 +2270,16 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         /// problems, such as 32x1024x1024 or 1024x64x1024 (both direct in CLBlast at a threshold of 448), through
         /// padding and packing kernels sized for the long side, at 0.34x and 0.40x the native library's speed.
         /// </remarks>
+        /// <summary>
+        /// True when the CLBlast library multiplies this problem with its direct kernel. False past the packed-kernel
+        /// threshold, or when the device has no threshold entry and the library's choice is not known.
+        /// </summary>
+        internal bool UsesClBlastDirectKernel(int m, int n, int k)
+        {
+            TryGetClBlastBaselineConfig(out _);
+            return _clblastMinIndirectSize > 0 && !UsesClBlastIndirectKernel(m, n, k, _clblastMinIndirectSize);
+        }
+
         internal static bool UsesClBlastIndirectKernel(int m, int n, int k, int minIndirectSize)
         {
             if (minIndirectSize <= 0) return false;
@@ -2804,57 +2818,42 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if ((long)C.Size < (long)M * N)
                 throw new ArgumentException($"C.Size {C.Size} < M*N = {(long)M * N}.", nameof(C));
 
-            var bufferA = ((DirectOpenClGpuBuffer)A).Buffer;
-            var bufferB = ((DirectOpenClGpuBuffer)B).Buffer;
-            var bufferC = ((DirectOpenClGpuBuffer)C).Buffer;
-
-            if (ClBlastNative.IsAvailable)
+            // CLBlast's direct kernel reads the operands in place, in one launch. Past its packed-kernel threshold the
+            // library first copies and pads the operands into buffers it allocates itself, outside the pool (VGG-11's
+            // classifier input gradient, 64 x 4096 x 4096, held a 64 MB copy of the weight at every step, which set the
+            // model's training memory peak), so those take transposed copies from the pool and an on-device GEMM.
+            if (UsesClBlastDirectKernel(M, N, K)
+                && TryExecuteClBlastLibraryGemm(ClBlastNative.Transpose.No, ClBlastNative.Transpose.Yes, A, K, B, K, C, M, N, K, alpha, beta))
             {
-                EnsureNativeClBlastTuned();
-                IntPtr queue = _context.CommandQueue;
-                var memories = DirectOpenClSubmission.GetDirectSubmissionMemories(bufferA, bufferB, bufferC);
-
-                // CLBlast row-major: C[M,N] = A[M,K] · Bᵀ where B is stored as
-                // [N, K] row-major. We pass transA=No, transB=Yes; ldA=K (row
-                // stride of A), ldB=K (row stride of B as stored), ldC=N.
-                ClBlastNative.StatusCode status;
-                try
-                {
-                    lock (DirectOpenClSubmission.Gate)
-                    {
-                        using var waits = DirectOpenClSubmission.PrepareLocked(queue, memories);
-                        waits.EnqueueBridgeMarker(queue);
-                        status = ClBlastNative.Sgemm(
-                            ClBlastNative.Layout.RowMajor,
-                            ClBlastNative.Transpose.No,
-                            ClBlastNative.Transpose.Yes,
-                            (UIntPtr)M, (UIntPtr)N, (UIntPtr)K,
-                            alpha,
-                            bufferA.Handle, UIntPtr.Zero, (UIntPtr)K,
-                            bufferB.Handle, UIntPtr.Zero, (UIntPtr)K,
-                            beta,
-                            bufferC.Handle, UIntPtr.Zero, (UIntPtr)N,
-                            ref queue,
-                            IntPtr.Zero);
-                        if (status == ClBlastNative.StatusCode.Success)
-                            DirectOpenClSubmission.CommitLocked(queue, memories);
-                    }
-                }
-                finally
-                {
-                    DirectOpenClSubmission.ReleaseDirectSubmissionMemories(memories);
-                }
-                if (status == ClBlastNative.StatusCode.Success)
-                {
-                    // CLBlast enqueues directly through the native OpenCL command queue,
-                    // bypassing DirectOpenClKernel's dispatch hook.
-                    GpuLaunchProbe.OnLaunch();
-                    return;
-                }
+                // CLBlast enqueues directly through the native OpenCL command queue, bypassing DirectOpenClKernel's
+                // dispatch hook.
+                GpuLaunchProbe.OnLaunch();
+                RecordGemmDispatch(OpenClGemmDispatchPath.ClBlastLibrary);
+                return;
             }
 
-            // CLBlast is optional. Keep the fallback fully resident by materializing Bᵀ
-            // with the existing transpose kernel and feeding the normal on-device GEMM path.
+            if ((long)M * K + (long)M * N < (long)N * K)
+            {
+                // B is the largest operand (a weight against a small batch): Cᵀ[N,M] = B[N,K] · Aᵀ[K,M] reads it as
+                // stored, so only A and C, the smaller ones, are transposed.
+                using var transposedA = AllocateBuffer(K * M);
+                using var transposedC = AllocateBuffer(N * M);
+                Transpose(A, transposedA, M, K);
+                if (beta != 0f) Transpose(C, transposedC, M, N);
+                // The register-blocked split-K GEMM, not Gemm: B is large here, and for this shape Gemm's route is
+                // CLBlast's packed kernel, which copies a row-major A operand (B) before multiplying.
+                if (alpha is 1f && beta is 0f
+                    && HasTunedKernel(Kernels.BatchedGemmKernels.Rb64SplitK) && HasTunedKernel(Kernels.BatchedGemmKernels.SplitKReduce))
+                {
+                    RbSplitKGemm(B, transposedA, transposedC, N, M, K);
+                    RecordGemmDispatch(OpenClGemmDispatchPath.BuiltInKernel);
+                }
+                else
+                    Gemm(B, transposedA, transposedC, N, M, K, alpha, beta);
+                Transpose(transposedC, C, N, M);
+                return;
+            }
+
             using var transposedB = AllocateBuffer(N * K);
             Transpose(B, transposedB, N, K);
             Gemm(A, transposedB, C, M, N, K, alpha, beta);
@@ -4636,6 +4635,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             // No sync - can be chained asynchronously
         }
 
+        /// <summary>TILE_SIZE of SparseGemmKernels: the side of the local B tile and of the work-group.</summary>
+        private const int SparseGemmTile = 16;
+
+        private static int RoundUpToSparseTile(int extent) => (extent + SparseGemmTile - 1) / SparseGemmTile * SparseGemmTile;
+
         public void SparseGemm(
             IGpuBuffer sparseAValues, IGpuBuffer sparseAIndices,
             IGpuBuffer B, IGpuBuffer C,
@@ -4664,8 +4668,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             kernel.SetArg(7, alpha);
             kernel.SetArg(8, beta);
 
-            var (localSizeX, localSizeY) = CalculateOptimalWorkGroupSize(M, N);
-            kernel.Execute2D(M, N, localSizeX, localSizeY);
+            // The kernel stages B through a TILE_SIZE x TILE_SIZE local tile indexed by the local ids, so the work-group
+            // is exactly that tile (a smaller one left most of each tile unloaded) and the range is rounded up to it.
+            kernel.Execute2D(RoundUpToSparseTile(M), RoundUpToSparseTile(N), SparseGemmTile, SparseGemmTile);
             // No sync - can be chained asynchronously
         }
 
@@ -4697,8 +4702,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             kernel.SetArg(6, N);
             kernel.SetArg(7, K);
 
-            var (localSizeX, localSizeY) = CalculateOptimalWorkGroupSize(M, N);
-            kernel.Execute2D(M, N, localSizeX, localSizeY);
+            // The kernel stages B through a TILE_SIZE x TILE_SIZE local tile indexed by the local ids, so the work-group
+            // is exactly that tile (a smaller one left most of each tile unloaded) and the range is rounded up to it.
+            kernel.Execute2D(RoundUpToSparseTile(M), RoundUpToSparseTile(N), SparseGemmTile, SparseGemmTile);
 
             return C;
         }
@@ -6255,6 +6261,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         private bool TryExecuteClBlastLibraryGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha, float beta)
         {
+            return TryExecuteClBlastLibraryGemm(ClBlastNative.Transpose.No, ClBlastNative.Transpose.No, A, K, B, N, C, M, N, K, alpha, beta);
+        }
+
+        /// <summary>Row-major C[M,N] = alpha · op(A) · op(B) + beta · C through the CLBlast library.</summary>
+        private bool TryExecuteClBlastLibraryGemm(
+            ClBlastNative.Transpose transA, ClBlastNative.Transpose transB, IGpuBuffer A, int lda, IGpuBuffer B, int ldb,
+            IGpuBuffer C, int M, int N, int K, float alpha, float beta)
+        {
             if (_context == null || !ClBlastNative.IsAvailable)
                 return false;
 
@@ -6275,12 +6289,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     waits.EnqueueBridgeMarker(queue);
                     status = ClBlastNative.Sgemm(
                         ClBlastNative.Layout.RowMajor,
-                        ClBlastNative.Transpose.No,
-                        ClBlastNative.Transpose.No,
+                        transA,
+                        transB,
                         (UIntPtr)M, (UIntPtr)N, (UIntPtr)K,
                         alpha,
-                        bufferA.Handle, UIntPtr.Zero, (UIntPtr)K,
-                        bufferB.Handle, UIntPtr.Zero, (UIntPtr)N,
+                        bufferA.Handle, UIntPtr.Zero, (UIntPtr)lda,
+                        bufferB.Handle, UIntPtr.Zero, (UIntPtr)ldb,
                         beta,
                         bufferC.Handle, UIntPtr.Zero, (UIntPtr)N,
                         ref queue,
@@ -7218,8 +7232,7 @@ KERNEL VARIANTS (A/B testing):
                 k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle); // no bias: the epilogue flags are 0
                 k.SetArg(arg++, 0);
 
-                int localX = 8, localY = 8, localZ = 1;
-                k.Execute3D(outWidth, outHeight, batch * outChannels, localX, localY, localZ);
+                k.ExecutePlanes(outWidth, outHeight, batch * outChannels);
             }
         }
 
@@ -7425,8 +7438,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, padH);
             k.SetArg(arg++, padW);
 
-            int localX = 8, localY = 8, localZ = 1;
-            k.Execute3D(outWidth, outHeight, batch * channels, localX, localY, localZ);
+            k.ExecutePlanes(outWidth, outHeight, batch * channels);
         }
 
         public void ConvTranspose2D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
@@ -7851,6 +7863,29 @@ KERNEL VARIANTS (A/B testing):
             int kernelH, int kernelW,
             int strideH, int strideW, int padH, int padW)
         {
+            if (kernelH == 2 && kernelW == 2 && strideH == 2 && strideW == 2 && padH == 0 && padW == 0
+                && inWidth % 4 == 0 && inHeight % 2 == 0 && outHeight == inHeight / 2 && outWidth == inWidth / 2
+                && _kernelCache.TryGetValue("maxpool2d_2x2s2", out var pool2))
+            {
+                long pairs = (long)batch * channels * outHeight * (outWidth / 2);
+                uint a2 = 0;
+                pool2.SetArg(a2++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+                pool2.SetArg(a2++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+                pool2.SetArg(a2++, indices != null ? ((DirectOpenClGpuBuffer)indices).Buffer.Handle : IntPtr.Zero);
+                pool2.SetArg(a2++, batch * channels);
+                pool2.SetArg(a2++, inHeight);
+                pool2.SetArg(a2++, inWidth);
+                pool2.SetArg(a2++, outHeight);
+                pool2.SetArg(a2++, outWidth);
+                pool2.SetArg(a2, indices != null ? 1 : 0);
+                // No local memory and no reqd_work_group_size: any group the compiled kernel admits works.
+                // Within the compiled kernel's group limit and the device's first-dimension limit.
+                ulong[] itemLimits = _context?.MaxWorkItemSizes ?? Array.Empty<ulong>();
+                ulong xLimit = itemLimits.Length > 0 && itemLimits[0] > 0 ? itemLimits[0] : 256UL;
+                int local = (int)Math.Max(1UL, Math.Min(Math.Min(256UL, pool2.MaxWorkGroupSize), xLimit));
+                pool2.Execute1D(RoundUpToMultiple(checked((int)pairs), local), local);
+                return;
+            }
             var k = _kernelCache["maxpool2d"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
@@ -7870,8 +7905,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, padW);
             k.SetArg(arg++, indices != null ? 1 : 0);
 
-            int localX = 8, localY = 8, localZ = 1;
-            k.Execute3D(outWidth, outHeight, batch * channels, localX, localY, localZ);
+            k.ExecutePlanes(outWidth, outHeight, batch * channels);
         }
 
         public void MaxPool2DBackward(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradInput,
@@ -7893,8 +7927,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, outHeight);
             k.SetArg(arg++, outWidth);
 
-            int localX = 8, localY = 8, localZ = 1;
-            k.Execute3D(outWidth, outHeight, batch * channels, localX, localY, localZ);
+            k.ExecutePlanes(outWidth, outHeight, batch * channels);
         }
 
         public void AvgPool2D(IGpuBuffer input, IGpuBuffer output,
@@ -7922,8 +7955,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, padW);
             k.SetArg(arg++, countIncludePad ? 1 : 0);
 
-            int localX = 8, localY = 8, localZ = 1;
-            k.Execute3D(outWidth, outHeight, batch * channels, localX, localY, localZ);
+            k.ExecutePlanes(outWidth, outHeight, batch * channels);
         }
 
         public void AvgPool2DBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput,
@@ -8048,8 +8080,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, outHeight);
             k.SetArg(arg++, outWidth);
 
-            int localX = 8, localY = 8, localZ = 1;
-            k.Execute3D(outWidth, outHeight, batch * channels, localX, localY, localZ);
+            k.ExecutePlanes(outWidth, outHeight, batch * channels);
         }
 
         // #775: adaptive max pooling 2D on the adaptive_max_pool2d kernel (same 3D dispatch as avg).
@@ -8066,8 +8097,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, outHeight);
             k.SetArg(arg++, outWidth);
 
-            int localX = 8, localY = 8, localZ = 1;
-            k.Execute3D(outWidth, outHeight, batch * channels, localX, localY, localZ);
+            k.ExecutePlanes(outWidth, outHeight, batch * channels);
         }
 
         public void MaxPool3D(IGpuBuffer input, IGpuBuffer output, IGpuBuffer? indices,
@@ -12330,6 +12360,23 @@ KERNEL VARIANTS (A/B testing):
         }
 
         /// <inheritdoc/>
+        private void StridedDft(IGpuBuffer inRe, IGpuBuffer inIm, IGpuBuffer outRe, IGpuBuffer outIm,
+            int lines, int n, int elemStride, int lineStride, bool inverse)
+        {
+            var kernel = _kernelCache["strided_dft"];
+            kernel.SetArg(0, ((DirectOpenClGpuBuffer)inRe).Buffer.Handle);
+            kernel.SetArg(1, ((DirectOpenClGpuBuffer)inIm).Buffer.Handle);
+            kernel.SetArg(2, ((DirectOpenClGpuBuffer)outRe).Buffer.Handle);
+            kernel.SetArg(3, ((DirectOpenClGpuBuffer)outIm).Buffer.Handle);
+            kernel.SetArg(4, lines);
+            kernel.SetArg(5, n);
+            kernel.SetArg(6, elemStride);
+            kernel.SetArg(7, lineStride);
+            kernel.SetArg(8, inverse ? 1 : 0);
+            int total = lines * n;
+            kernel.Execute1D(total, Math.Min(256, total));
+        }
+
         public void FFT2D(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag, int height, int width, bool inverse)
         {
             if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
@@ -12338,10 +12385,20 @@ KERNEL VARIANTS (A/B testing):
             var inImag = ((DirectOpenClGpuBuffer)inputImag).Buffer;
             var outReal = ((DirectOpenClGpuBuffer)outputReal).Buffer;
             var outImag = ((DirectOpenClGpuBuffer)outputImag).Buffer;
+            if ((height & (height - 1)) != 0 || (width & (width - 1)) != 0)
+            {
+                // The radix-2 kernels need power-of-two sides: rows into a temporary, then columns into the output.
+                using var rowsReal = AllocateBuffer(height * width);
+                using var rowsImag = AllocateBuffer(height * width);
+                StridedDft(inputReal, inputImag, rowsReal, rowsImag, height, width, 1, width, inverse);
+                StridedDft(rowsReal, rowsImag, outputReal, outputImag, width, height, width, 1, inverse);
+                return;
+            }
 
-            // Copy input to output for in-place FFT
-            CopyBuffer(inputReal, outputReal, height * width);
-            CopyBuffer(inputImag, outputImag, height * width);
+            // Copy input to output for in-place FFT (an in-place call already has it there: a self-copy is
+            // CL_MEM_COPY_OVERLAP)
+            if (!ReferenceEquals(inputReal, outputReal)) CopyBuffer(inputReal, outputReal, height * width);
+            if (!ReferenceEquals(inputImag, outputImag)) CopyBuffer(inputImag, outputImag, height * width);
 
             int log2Width = (int)MathHelper.Log2(width);
             int log2Height = (int)MathHelper.Log2(height);
@@ -14355,7 +14412,7 @@ KERNEL VARIANTS (A/B testing):
 
             DisposeCompiledCodegenKernels();
             _dynamicGemm?.Dispose();
-            ReleaseF43FilterCache();
+            ReleaseWinogradFilterCache();
             _bufferPool.Dispose();
             lock (_constantIntTablesGate)
             {
@@ -14389,9 +14446,51 @@ KERNEL VARIANTS (A/B testing):
             _context?.Dispose();
         }
 
-        // o[0] = mean(i[0 .. sz)). This went through ExecuteActivation("reduce_mean"), a kernel no OpenCL program defines, so
-        // it threw and ran on the CPU; the row sum (split across compute units for one long row) and a scale do it.
-        public void ReduceMean(IGpuBuffer i, IGpuBuffer o, int sz) { if (sz <= 0) return; SumAxis(i, o, 1, sz); Scale(o, o, 1f / sz, 1); }
+        // o[0] = mean(i[0 .. sz)): the row sum times 1 / sz in the reduction's last launch. A row long enough to split is
+        // summed in chunks across the compute units first (as SumAxis does), then the chunk partials are reduced and scaled.
+        public void ReduceMean(IGpuBuffer i, IGpuBuffer o, int sz)
+        {
+            if (sz <= 0) return;
+            if (_context == null)
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
+            int rowGroup = SumAxisRowGroupSize();
+            if (rowGroup > 0 && _kernelCache.TryGetValue("reduce_mean", out var scaled)
+                && _kernelCache.TryGetValue("sum_axis_rows_split", out var splitKernel))
+            {
+                var input = ((DirectOpenClGpuBuffer)i).Buffer;
+                int length = sz;
+                int chunks = 0, chunkLen = 0;
+                if (sz >= SumAxisSplitMinReduce)
+                {
+                    chunks = (int)Math.Max(2, Math.Min(((long)sz + SumAxisSplitChunkMin - 1) / SumAxisSplitChunkMin,
+                        4L * Math.Max(1, ComputeUnits)));
+                    chunkLen = (int)(((long)sz + chunks - 1) / chunks);
+                    chunks = (int)(((long)sz + chunkLen - 1) / chunkLen);
+                }
+                using var partial = chunks > 0 ? (DirectOpenClGpuBuffer)AllocateBuffer(chunks) : null;
+                if (partial is not null)
+                {
+                    splitKernel.SetArg(0, input.Handle);
+                    splitKernel.SetArg(1, partial.Buffer.Handle);
+                    splitKernel.SetArg(2, sz);
+                    splitKernel.SetArg(3, chunks);
+                    splitKernel.SetArg(4, chunkLen);
+                    splitKernel.Execute2D(chunks * rowGroup, 1, rowGroup, 1);
+                    System.Threading.Interlocked.Increment(ref _sumAxisSplitLaunches);
+                    input = partial.Buffer;
+                    length = chunks;
+                }
+                scaled.SetArg(0, input.Handle);
+                scaled.SetArg(1, ((DirectOpenClGpuBuffer)o).Buffer.Handle);
+                scaled.SetArg(2, 1);
+                scaled.SetArg(3, length);
+                scaled.SetArg(4, 1f / sz);
+                scaled.Execute1D(rowGroup, rowGroup);
+                return;
+            }
+            SumAxis(i, o, 1, sz);
+            Scale(o, o, 1f / sz, 1);
+        }
         public void ClipKernel(IGpuBuffer i, IGpuBuffer o, float mn, float mx, int sz) { if (_context == null) return; var k = _kernelCache["clip_kernel"]; k.SetArg(0, ((DirectOpenClGpuBuffer)i).Buffer.Handle); k.SetArg(1, ((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(2, mn); k.SetArg(3, mx); k.SetArg(4, sz); k.Execute1D(sz, CalculateOptimalWorkGroupSize1D(sz)); }
         public void PowScalar(IGpuBuffer i, IGpuBuffer o, float ex, int sz) { if (_context == null) return; var k = _kernelCache["pow_scalar"]; k.SetArg(0, ((DirectOpenClGpuBuffer)i).Buffer.Handle); k.SetArg(1, ((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(2, ex); k.SetArg(3, sz); k.Execute1D(sz, CalculateOptimalWorkGroupSize1D(sz)); }
         public void FracKernel(IGpuBuffer i, IGpuBuffer o, int sz) { ExecuteActivation("frac_kernel", i, o, sz); }

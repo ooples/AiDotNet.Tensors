@@ -372,24 +372,6 @@ public sealed partial class WebGpuBackend
         return output;
     }
 
-    public IGpuBuffer GemmBiasSwish(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-    {
-        var temp = GemmBias(A, B, bias, M, N, K);
-        var output = AllocateBuffer(M * N);
-        Silu(temp, output, M * N);
-        temp.Dispose();
-        return output;
-    }
-
-    public IGpuBuffer GemmBiasLeakyRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K, float alpha = 0.01f)
-    {
-        var temp = GemmBias(A, B, bias, M, N, K);
-        var output = AllocateBuffer(M * N);
-        LeakyRelu(temp, output, alpha, M * N);
-        temp.Dispose();
-        return output;
-    }
-
     #endregion
 
     #region Broadcast Operations
@@ -429,9 +411,6 @@ public sealed partial class WebGpuBackend
         DispatchBinaryOpAsync("scale_by_device_scalar", buffer, scalar, scratch, size).GetAwaiter().GetResult();
         Copy(scratch, buffer, size);
     }
-    public void AddRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Relu(C, C, size); }
-    public void AddSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Sigmoid(C, C, size); }
-    public void AddGelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Gelu(C, C, size); }
     public void Subtract(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => SubAsync(A, B, C, size).GetAwaiter().GetResult();
     public void Multiply(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => MulAsync(A, B, C, size).GetAwaiter().GetResult();
     public void Divide(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => DivAsync(A, B, C, size).GetAwaiter().GetResult();
@@ -479,19 +458,6 @@ public sealed partial class WebGpuBackend
             a, b, result, uniforms, 1).GetAwaiter().GetResult();
     }
 
-    public void BatchedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
-        int batchSize, int vecSize)
-    {
-        if (batchSize <= 0 || vecSize <= 0) return;
-        long totalElements = (long)batchSize * vecSize;
-        if (totalElements > a.Size) throw new ArgumentOutOfRangeException(nameof(batchSize), $"batchSize*vecSize ({totalElements}) exceeds buffer A length ({a.Size}).");
-        if (totalElements > b.Size) throw new ArgumentOutOfRangeException(nameof(batchSize), $"batchSize*vecSize ({totalElements}) exceeds buffer B length ({b.Size}).");
-        if (totalElements > int.MaxValue) throw new ArgumentOutOfRangeException(nameof(batchSize), "batchSize*vecSize exceeds int.MaxValue.");
-
-        using var temp = AllocateBuffer((int)totalElements);
-        Multiply(a, b, temp, (int)totalElements);
-        SumAxis(temp, result, batchSize, vecSize);
-    }
     public void Power(IGpuBuffer A, IGpuBuffer B, float exponent, int size) => PowerAsync(A, B, exponent, size).GetAwaiter().GetResult();
     public void Abs(IGpuBuffer A, IGpuBuffer B, int size) => AbsAsync(A, B, size).GetAwaiter().GetResult();
     public void Exp(IGpuBuffer A, IGpuBuffer B, int size) => ExpAsync(A, B, size).GetAwaiter().GetResult();
@@ -499,13 +465,9 @@ public sealed partial class WebGpuBackend
         => Dispatch2BufferAsync("AdditionalUnary", WebGpuKernels.AdditionalUnarySource, "exp2_op", A, B, MakeUniform1(size), size).GetAwaiter().GetResult();
     public void Exp10(IGpuBuffer A, IGpuBuffer B, int size)
         => Dispatch2BufferAsync("AdditionalUnary", WebGpuKernels.AdditionalUnarySource, "exp10_op", A, B, MakeUniform1(size), size).GetAwaiter().GetResult();
-    public void ExpM1(IGpuBuffer A, IGpuBuffer B, int size)
-        => Dispatch2BufferAsync("AdditionalUnary", WebGpuKernels.AdditionalUnarySource, "expm1_op", A, B, MakeUniform1(size), size).GetAwaiter().GetResult();
     public void Log(IGpuBuffer A, IGpuBuffer B, int size) => LogAsync(A, B, size).GetAwaiter().GetResult();
     public void Log2(IGpuBuffer A, IGpuBuffer B, int size)
         => Dispatch2BufferAsync("AdditionalUnary", WebGpuKernels.AdditionalUnarySource, "log2_op", A, B, MakeUniform1(size), size).GetAwaiter().GetResult();
-    public void Log1P(IGpuBuffer A, IGpuBuffer B, int size)
-        => Dispatch2BufferAsync("AdditionalUnary", WebGpuKernels.AdditionalUnarySource, "log1p_op", A, B, MakeUniform1(size), size).GetAwaiter().GetResult();
     public void Sqrt(IGpuBuffer A, IGpuBuffer B, int size) => SqrtAsync(A, B, size).GetAwaiter().GetResult();
     public void Sign(IGpuBuffer A, IGpuBuffer B, int size) => SignAsync(A, B, size).GetAwaiter().GetResult();
     public void Relu(IGpuBuffer A, IGpuBuffer B, int size) => ReLUAsync(A, B, size).GetAwaiter().GetResult();
@@ -719,55 +681,6 @@ public sealed partial class WebGpuBackend
 
     #region Sparse Operations
 
-    public void Enforce2x4Sparsity(IGpuBuffer denseInput, IGpuBuffer sparseValues, IGpuBuffer sparseIndices, int M, int K)
-    {
-        int sparseK = K / 2;
-        var uniforms = new float[]
-        {
-            BitConverter.Int32BitsToSingle(M),
-            BitConverter.Int32BitsToSingle(K),
-            BitConverter.Int32BitsToSingle(sparseK),
-            0
-        };
-        int totalBlocks = M * (K / 4);
-        Dispatch3BufferAsync("Sparse2x4", WebGpuKernels.Sparse2x4Source, "enforce_2x4_sparsity",
-            denseInput, sparseValues, sparseIndices, uniforms, totalBlocks).GetAwaiter().GetResult();
-    }
-
-    public void Decompress2x4Sparse(IGpuBuffer sparseValues, IGpuBuffer sparseIndices, IGpuBuffer denseOutput, int M, int K)
-    {
-        int sparseK = K / 2;
-        Fill(denseOutput, 0f, M * K);
-        var uniforms = new float[]
-        {
-            BitConverter.Int32BitsToSingle(M),
-            BitConverter.Int32BitsToSingle(K),
-            BitConverter.Int32BitsToSingle(sparseK),
-            0
-        };
-        int totalBlocks = M * (K / 4);
-        Dispatch3BufferAsync("Sparse2x4", WebGpuKernels.Sparse2x4Source, "decompress_2x4_sparse",
-            sparseValues, sparseIndices, denseOutput, uniforms, totalBlocks).GetAwaiter().GetResult();
-    }
-
-    public void SparseGemm(IGpuBuffer sparseAValues, IGpuBuffer sparseAIndices, IGpuBuffer B, IGpuBuffer C,
-        int M, int N, int K, float alpha = 1f, float beta = 0f)
-    {
-        EnsureInitialized();
-        using var denseA = AllocateBuffer(M * K);
-        Decompress2x4Sparse(sparseAValues, sparseAIndices, denseA, M, K);
-        Gemm(denseA, B, C, M, N, K, alpha, beta);
-    }
-
-    public IGpuBuffer SparseGemmBiasRelu(IGpuBuffer sparseAValues, IGpuBuffer sparseAIndices, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-    {
-        EnsureInitialized();
-        using var denseA = AllocateBuffer(M * K);
-        Decompress2x4Sparse(sparseAValues, sparseAIndices, denseA, M, K);
-        var result = GemmBiasRelu(denseA, B, bias, M, N, K);
-        return result;
-    }
-
     public void CsrSpMM(IGpuBuffer csrValues, IGpuBuffer csrColIndices, IGpuBuffer csrRowPointers,
         IGpuBuffer denseB, IGpuBuffer output, int M, int K, int N, int nnz)
     {
@@ -781,13 +694,6 @@ public sealed partial class WebGpuBackend
         int total = M * N;
         Dispatch5BufferAsync("CsrSpMM", WebGpuKernels.CsrSpMMSource, "csr_spmm",
             csrValues, csrColIndices, csrRowPointers, denseB, output, uniforms, total).GetAwaiter().GetResult();
-    }
-
-    public void CsrSpMMBias(IGpuBuffer csrValues, IGpuBuffer csrColIndices, IGpuBuffer csrRowPointers,
-        IGpuBuffer denseB, IGpuBuffer bias, IGpuBuffer output, int M, int K, int N, int nnz)
-    {
-        CsrSpMM(csrValues, csrColIndices, csrRowPointers, denseB, output, M, K, N, nnz);
-        BiasAdd(output, bias, output, M, N);
     }
 
     public void ScatterAddEdges(IGpuBuffer input, IGpuBuffer sourceIndices, IGpuBuffer targetIndices,

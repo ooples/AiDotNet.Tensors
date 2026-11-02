@@ -120,24 +120,24 @@ public class DeterministicParallelGemmContractTests
     [Fact]
     public void StreamingColumnTileWidth_MatchesActiveKernel()
     {
-        // AVX2 ahead of AVX-512 (StreamingStrategy.RunSerial).
-        int expectedFloat = Avx2Streaming.IsSupported
-            ? Avx2Streaming.Fp32ColumnTileWidth
-            : Avx512Streaming.IsSupported
-                ? Avx512Streaming.Fp32ColumnTileWidth
+        // The opt-in switch changes dispatch priority on supported AVX-512 hosts.
+        bool useAvx512 = StreamingStrategy.s_avx512Streaming && Avx512Streaming.IsSupported;
+        int expectedFloat = useAvx512
+            ? Avx512Streaming.Fp32ColumnTileWidth
+            : Avx2Streaming.IsSupported
+                ? Avx2Streaming.Fp32ColumnTileWidth
                 : NeonStreaming.IsSupported
                     ? NeonStreaming.Fp32ColumnTileWidth
                     : 1;
-        int expectedDouble = Avx2Streaming.IsSupported
-            ? Avx2Streaming.Fp64ColumnTileWidth
-            : Avx512Streaming.IsSupported
-                ? Avx512Streaming.Fp64ColumnTileWidth
+        int expectedDouble = useAvx512
+            ? Avx512Streaming.Fp64ColumnTileWidth
+            : Avx2Streaming.IsSupported
+                ? Avx2Streaming.Fp64ColumnTileWidth
                 : NeonStreaming.IsSupported
                     ? NeonStreaming.Fp64ColumnTileWidth
                     : PortableSimdStreaming.IsSupported
                         ? PortableSimdStreaming.Fp64ColumnTileWidth
                         : 1;
-
         Assert.Equal(expectedFloat, StreamingStrategy.GetColumnTileWidth<float>(transB: false));
         Assert.Equal(expectedDouble, StreamingStrategy.GetColumnTileWidth<double>(transB: false));
         Assert.Equal(1, StreamingStrategy.GetColumnTileWidth<float>(transB: true));

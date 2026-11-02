@@ -471,18 +471,23 @@ public sealed unsafe partial class VulkanBackend
     public void BinaryCrossEntropyBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size)
         => ResidentLossBackward(predictions, targets, gradInput, size, 2);
 
+    // CONTRACT (CUDA, OpenCL and CpuEngine): `predictions` are logits and `targets` is dense [batch, classes]. The loss is
+    // the batch mean of -sum(target * log_softmax(row)); the gradient is (softmax(predictions) - targets) / batchSize.
+    // Both ran the Sparse* kernels, which read the targets as class indices (a NaN loss on dense targets).
     public float CrossEntropyLoss(IGpuBuffer predictions, IGpuBuffer targets, int batchSize, int numClasses)
     {
+        if (batchSize <= 0 || numClasses <= 0) return 0f;
         using var rowLoss = AllocateBuffer(batchSize);
-        GlslBinaryOp(VulkanGlslKernels.SparseCrossEntropyRows, predictions, targets, rowLoss, batchSize,
-            new uint[] { (uint)batchSize, (uint)numClasses }, 2 * sizeof(uint));
+        GlslNaryOp(DenseCrossEntropyRowsSource, new[] { predictions, targets, rowLoss }, batchSize,
+            new[] { (uint)batchSize, (uint)numClasses });
         return Sum(rowLoss, batchSize) / batchSize;
     }
 
     public void CrossEntropyBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int batchSize, int numClasses)
     {
-        GlslBinaryOp(VulkanGlslKernels.SparseCrossEntropyBackward, predictions, targets, gradInput,
-            batchSize * numClasses, new uint[] { (uint)batchSize, (uint)numClasses }, 2 * sizeof(uint));
+        if (batchSize <= 0 || numClasses <= 0) return;
+        GlslNaryOp(DenseCrossEntropyBackwardSource, new[] { predictions, targets, gradInput }, checked(batchSize * numClasses),
+            new[] { (uint)batchSize, (uint)numClasses });
     }
 
     public float SmoothL1Loss(IGpuBuffer predictions, IGpuBuffer targets, int size, float beta)

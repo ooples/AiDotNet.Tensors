@@ -276,10 +276,8 @@ public sealed class Conv2dDirectFp16BackendParityTests
     [SkippableFact]
     public void WebGpu_ReportsNoDirectFp16Conv_AndItsRouteIsTheConvolutionOverItsOwnFp16Weights()
     {
-        // The real backend, executing on Dawn (see DawnHostedWebGpu). WebGPU models FP16 as f32 values with a 10-bit
-        // mantissa, one per element, so the shared kernel (packed halves) does not apply: the capability is false and
-        // the route is the FP32 convolution over the weights its own ConvertToFp16 produced. Running the backend on
-        // Dawn is what showed the shared kernel returning garbage for those buffers.
+        // The real backend, executing on Dawn (see DawnHostedWebGpu). The capability is false and the route is the FP32
+        // convolution over the weights its own ConvertToFp16 produced, read back through ConvertToFp32.
         var backend = DawnHostedWebGpu.BackendOrSkip();
         var route = (IFp16ActivationBackend)backend;
         Assert.False(route.Fp16DirectConvAvailable);
@@ -293,9 +291,11 @@ public sealed class Conv2dDirectFp16BackendParityTests
         for (int i = 0; i < weights.Length; i++) weights[i] = (float)(rng.NextDouble() * 2 - 1);
         using var dInput = backend.AllocateBuffer(input);
         using var dWeights = backend.AllocateBuffer(weights);
-        using var dWeightsHalf = backend.AllocateBuffer(weights.Length);   // one f32 per element on this backend
+        using var dWeightsHalf = backend.AllocateByteBuffer(weights.Length * 2);   // two bytes per element
         backend.ConvertToFp16(dWeights, dWeightsHalf, weights.Length);
-        float[] stored = backend.DownloadBuffer(dWeightsHalf);
+        using var dStored = backend.AllocateBuffer(weights.Length);
+        backend.ConvertToFp32(dWeightsHalf, dStored, weights.Length);
+        float[] stored = backend.DownloadBuffer(dStored);
         // Each stored weight is a value FP16 can hold, within one FP16 step of the original.
         for (int i = 0; i < weights.Length; i++)
         {

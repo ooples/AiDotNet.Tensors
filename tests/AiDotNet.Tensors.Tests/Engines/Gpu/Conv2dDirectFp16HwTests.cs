@@ -2,6 +2,7 @@ using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Tests.Engines.DirectGpu;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.Gpu;
@@ -15,18 +16,25 @@ namespace AiDotNet.Tensors.Tests.Engines.Gpu;
 /// for the other backends is a tracked follow-up). Skips on a box without a CUDA toolkit (the kernel needs
 /// cuda_fp16.h, gated by <see cref="CudaBackend.Fp16DirectConvAvailable"/>).
 /// </summary>
-public class Conv2dDirectFp16HwTests
+[Collection("DirectGpuSerial")]
+public class Conv2dDirectFp16HwTests : IClassFixture<DirectGpuTensorEngineTestFixture>
 {
+    // The test's own engine: the process-wide current engine is shared and other tests reset it to the CPU,
+    // so reading it made these tests skip on a CUDA machine depending on test order.
+    private readonly DirectGpuTensorEngineTestFixture _fixture;
+
+    public Conv2dDirectFp16HwTests(DirectGpuTensorEngineTestFixture fixture) => _fixture = fixture;
+
     [SkippableFact]
     public void Conv2dDirectFp16_matches_fp32_reference_within_fp16_tolerance()
     {
         Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver not available");
-        var eng = AiDotNetEngine.Current;
-        Skip.IfNot(eng is DirectGpuTensorEngine, "active engine is not the CUDA backend");
+        var eng = _fixture.Engine;
+        Skip.IfNot(eng is not null, "the DirectGpu engine did not initialize");
         // Warm up so the engine compiles its kernel modules (incl. the FP16 module that owns conv2d_direct_fp16hw).
         var warm = new Tensor<float>(new float[] { 1, 2, 3, 4 }, new[] { 2, 2 });
-        _ = eng.TensorMatMul(warm, warm);
-        var b = ((DirectGpuTensorEngine)eng).TestBackend as CudaBackend;
+        _ = eng!.TensorMatMul(warm, warm);
+        var b = eng!.TestBackend as CudaBackend;
         Skip.IfNot(b is not null && b.IsAvailable, "CudaBackend not available");
         Skip.IfNot(b!.Fp16DirectConvAvailable, "conv2d_direct_fp16hw not compiled (needs the CUDA toolkit / cuda_fp16.h)");
 

@@ -16,7 +16,8 @@ public class PackedDirectStripStrideTests
     public void PackedKBlocksRespectInputStridesAndOverwriteRaggedOutput(bool parallel)
     {
         Skip.IfNot(System.Runtime.Intrinsics.X86.Fma.IsSupported, "direct GEMM requires FMA");
-        const int m = 25, k = 513, n = 77, lda = k + 5, ldb = n + 7;
+        // Exceeds three chunks' work floor while retaining ragged rows, columns and K blocks.
+        const int m = 121, k = 513, n = 77, lda = k + 5, ldb = n + 7;
         var a = new float[m * lda];
         var b = new float[k * ldb];
         var actual = new float[m * n];

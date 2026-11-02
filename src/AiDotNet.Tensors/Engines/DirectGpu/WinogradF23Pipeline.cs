@@ -10,6 +10,21 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// CUDA routes (<c>CUDA/Kernels/CudaConvWinogradKernels.cs</c>): every transformed operand is sixteen contiguous planes,
 /// one per Winograd point, which is exactly <c>BatchedGemm</c>'s concatenated-batch layout.
 /// </summary>
+/// <summary>
+/// A backend that keeps forward Winograd filter transforms across calls, keyed by the convolution's weight identity
+/// (ConvWeightIdentity) and version: inference transforms each layer's weights once.
+/// </summary>
+[BackendSpecificRoute("OpenCL keeps forward Winograd filter transforms across calls; every backend convolves without",
+    nameof(IDirectGpuBackend.Conv2D))]
+internal interface IWinogradForwardFilterCache
+{
+    /// <summary>The cached U for the weights being convolved, or null.</summary>
+    IGpuBuffer? CachedForwardFilter(int points, int k, int c);
+
+    /// <summary>Caches <paramref name="u"/> for the weights being convolved; true when the cache took ownership of it.</summary>
+    bool StoreForwardFilter(IGpuBuffer u, int points, int k, int c);
+}
+
 internal interface IWinogradF23Transforms
 {
     /// <summary>
@@ -202,14 +217,29 @@ internal static class WinogradF23Pipeline
         if (Planes(inC, p) > int.MaxValue || Planes(outC, p) > int.MaxValue || Planes(outC, inC) > int.MaxValue)
             return false;
         int pi = (int)p;
-        using var u = backend.AllocateBuffer((int)Planes(outC, inC));
-        using var v = backend.AllocateBuffer((int)Planes(inC, p));
-        using var m = backend.AllocateBuffer((int)Planes(outC, p));
-        transforms.Filter(weights, u, fwdK, fwdC, flip);
-        transforms.Input(x, v, n, inC, h, w, pad, tilesH, tilesW);
-        // M[x] (outC x P) = U[x] (outC x inC) * V[x] (inC x P), one GEMM per Winograd point.
-        backend.BatchedGemm(u, v, m, outC, pi, inC, WinogradPoints);
-        transforms.Output(m, y, n, outC, outH, outW, tilesH, tilesW, bias, epilogue);
-        return true;
+        // The forward filter transform from the backend's cache where it keeps one (inference: the same weights each call).
+        var cache = flip ? null : transforms as IWinogradForwardFilterCache;
+        IGpuBuffer? owned = null;
+        IGpuBuffer u = cache?.CachedForwardFilter(WinogradPoints, outC, inC)
+            ?? (owned = backend.AllocateBuffer((int)Planes(outC, inC)));
+        try
+        {
+            using var v = backend.AllocateBuffer((int)Planes(inC, p));
+            using var m = backend.AllocateBuffer((int)Planes(outC, p));
+            if (owned is not null)
+            {
+                transforms.Filter(weights, owned, fwdK, fwdC, flip);
+                if (cache is not null && cache.StoreForwardFilter(owned, WinogradPoints, outC, inC)) owned = null;
+            }
+            transforms.Input(x, v, n, inC, h, w, pad, tilesH, tilesW);
+            // M[x] (outC x P) = U[x] (outC x inC) * V[x] (inC x P), one GEMM per Winograd point.
+            backend.BatchedGemm(u, v, m, outC, pi, inC, WinogradPoints);
+            transforms.Output(m, y, n, outC, outH, outW, tilesH, tilesW, bias, epilogue);
+            return true;
+        }
+        finally
+        {
+            owned?.Dispose();
+        }
     }
 }

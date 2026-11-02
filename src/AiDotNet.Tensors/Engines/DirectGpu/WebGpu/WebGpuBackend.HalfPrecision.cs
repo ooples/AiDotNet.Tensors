@@ -66,26 +66,11 @@ public sealed partial class WebGpuBackend : IGpuHalfPrecisionBackend, IFp16ConvB
         if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n), "Dimensions must be positive.");
         if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k), "Dimensions must be positive.");
 
-        // gradA[M,K] = gradC[M,N] · Bᵀ  (b stored [K,N] → read transposed as [N,K]).
-        DispatchBackward(scratchElems: m * k, gradOutHalf, gradAOut, dest =>
-            MatMulTransposed(gradCFp16, bFp16, dest, m, k, n));
-        // gradB[K,N] = Aᵀ · gradC  (a stored [M,K] → contraction over leading dim M).
-        DispatchBackward(scratchElems: k * n, gradOutHalf, gradBOut, dest =>
-            MatMulLhsTransposedAsync(aFp16, gradCFp16, dest, k, n, m).GetAwaiter().GetResult());
-    }
-
-    /// <summary>Runs one backward GEMM into <paramref name="gradOut"/> (FP32) or, when
-    /// <paramref name="gradOutHalf"/>, into an f32 scratch then packs to FP16 via <c>ConvertToFp16</c>.</summary>
-    private void DispatchBackward(int scratchElems, bool gradOutHalf, IGpuBuffer gradOut, Action<IGpuBuffer> gemm)
-    {
-        if (!gradOutHalf)
-        {
-            gemm(gradOut);
-            return;
-        }
-        using var scratch = AllocateBuffer(scratchElems);
-        gemm(scratch);
-        ConvertToFp16(scratch, gradOut, scratchElems);
+        var output = gradOutHalf ? HalfGemmOutput.Half : HalfGemmOutput.Float32;
+        // gradA[M,K] = gradC[M,N] · Bᵀ  (b stored [K,N], read transposed).
+        HalfGemm(gradCFp16, bFp16, gradAOut, m, k, n, transA: false, transB: true, output);
+        // gradB[K,N] = Aᵀ · gradC  (a stored [M,K], read transposed; contraction over M).
+        HalfGemm(aFp16, gradCFp16, gradBOut, k, n, m, transA: true, transB: false, output);
     }
 
     /// <inheritdoc/>
@@ -93,9 +78,7 @@ public sealed partial class WebGpuBackend : IGpuHalfPrecisionBackend, IFp16ConvB
         int m, int n, int k)
     {
         ValidateHalfGemmArgs(aFp16, bFp16, cFp32, m, n, k);
-        // Inputs already carry FP16 precision (f32 storage, truncated mantissa);
-        // the WGSL GEMM accumulates in f32 and writes an f32 result.
-        Gemm(aFp16, bFp16, cFp32, m, n, k);
+        HalfGemm(aFp16, bFp16, cFp32, m, n, k, transA: false, transB: false, HalfGemmOutput.Float32);
     }
 
     /// <inheritdoc/>
@@ -114,29 +97,7 @@ public sealed partial class WebGpuBackend : IGpuHalfPrecisionBackend, IFp16ConvB
                 scratch => GemmFp16ConvBatched(weightsFp16, colFp16, scratch, m, pixels, k, batch, halfOutput: false));
             return;
         }
-        var uniforms = new float[]
-        {
-            BitConverter.Int32BitsToSingle(m),
-            BitConverter.Int32BitsToSingle(n),
-            BitConverter.Int32BitsToSingle(k),
-            BitConverter.Int32BitsToSingle(pixels),
-        };
-        Dispatch3BufferAsync("ConvGemmNchw", WebGpuKernels.ConvGemmNchwSource, "conv_gemm_nchw",
-            weightsFp16, colFp16, output, uniforms, checked(m * n)).GetAwaiter().GetResult();
-    }
-
-    /// <inheritdoc/>
-    public void Hgemm(IGpuBuffer aFp16, IGpuBuffer bFp16, IGpuBuffer cFp16,
-        int m, int n, int k)
-    {
-        ValidateHalfGemmArgs(aFp16, bFp16, cFp16, m, n, k);
-        // Accumulate in f32 into a scratch buffer, then round the result down to
-        // FP16 precision so the output buffer carries half-precision values
-        // (matches cublasHgemm's FP16 output). A separate scratch avoids binding
-        // the same buffer as both GEMM output and convert input.
-        using var scratch = AllocateBuffer(m * n);
-        Gemm(aFp16, bFp16, scratch, m, n, k);
-        ConvertToFp16(scratch, cFp16, m * n);
+        HalfGemm(weightsFp16, colFp16, output, m, n, k, transA: false, transB: false, HalfGemmOutput.Float32Nchw, pixels);
     }
 
     private static void ValidateHalfGemmArgs(IGpuBuffer a, IGpuBuffer b, IGpuBuffer c,
@@ -270,10 +231,9 @@ public sealed partial class WebGpuBackend : IGpuHalfPrecisionBackend, IFp16ConvB
         uniforms[13] = BitConverter.Int32BitsToSingle(outW);
         // uniforms[14], [15] = 0 (padding to 16 floats / 64 bytes)
 
-        // One thread per col element (t in [0, N*K)); workgroup_size(256), dispatch = ceil(N*K/256).
-        // outputHalf is the truncated-f32 half buffer GemmFp16In32fOut consumes.
-        Dispatch2BufferAsync("Im2colKnFp16", WebGpuKernels.Im2colKnFp16Source, "im2col_kn_fp16hw",
-            input, outputHalf, uniforms, (int)total).GetAwaiter().GetResult();
+        // Two col elements (one packed word) per invocation.
+        DispatchNBufferAsync(PackedHalfModuleName + ".Im2col", HalfIm2colSource, "half_im2col_kn",
+            new[] { input, outputHalf }, uniforms, HalfWords((int)total)).GetAwaiter().GetResult();
     }
 
 }

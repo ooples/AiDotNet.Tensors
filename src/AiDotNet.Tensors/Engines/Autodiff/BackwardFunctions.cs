@@ -116,6 +116,19 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradOutput, engine);
     }
 
+    /// <summary>
+    /// y = relu(a + b): dy/da = dy/db = 1 where y &gt; 0. The mask comes from the output (y &gt; 0 exactly where the sum
+    /// is), so the forward keeps no pre-activation; one masked gradient serves both inputs.
+    /// </summary>
+    internal static void AddReluBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var masked = engine.ReluBackward(gradOutput, output);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], masked, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], masked, engine);
+    }
+
     /// <summary>d(a-b)/da = 1, d(a-b)/db = -1</summary>
     internal static void SubtractBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
@@ -1703,6 +1716,29 @@ internal static class BackwardFunctions<T>
     }
 
     /// <summary>
+    /// Backward of a training BatchNorm whose output feeds a ReLU6 -- fused by the compiled plan
+    /// (<see cref="Compilation.BatchNormRelu6FusionPattern"/>). inputs = x, gamma, beta; <paramref name="output"/> is the
+    /// ReLU6's output. Its mask comes from the output: 0 &lt; ReLU6(z) &lt; 6 exactly when 0 &lt; z &lt; 6, so the
+    /// BatchNorm output is never kept for it.
+    /// </summary>
+    internal static void BatchNormRelu6Backward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var mean = (Tensor<T>)savedState[0];
+        var variance = (Tensor<T>)savedState[1];
+        var epsilon = (double)savedState[2];
+        var parked = TakeParkedGradient(engine, output);
+        if (parked is not null) gradOutput = AddParked(engine, gradOutput, parked);
+        var masked = engine.Relu6Backward(gradOutput, output);
+        var gradInput = engine.BatchNormBackward(masked, inputs[0], inputs[1], mean, variance, epsilon,
+            out var gradGamma, out var gradBeta);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradGamma, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[2], gradBeta, engine);
+    }
+
+    /// <summary>
     /// Backward of a training BatchNorm whose output, plus a residual, feeds a ReLU -- fused by the compiled plan
     /// (<see cref="Compilation.BatchNormAddReluFusionPattern"/>). inputs = x, gamma, beta, residual; <paramref name="output"/>
     /// is the ReLU's output. The masked gradient is the residual's gradient and the BatchNorm output's. One launch on a
@@ -3047,6 +3083,15 @@ internal static class BackwardFunctions<T>
             var length = (int[])gradShape.Clone();
             start[axis] = offset;
             length[axis] = size;
+            // In a resident step a first contribution is gathered straight into the input's gradient accumulator.
+            if (engine is DirectGpuTensorEngine gpu && !DifferentiableOps.IsRecording<T>() && !Compilation.GraphMode.IsActive
+                && DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[i], engine, out bool add) is { } into && !add
+                && gpu.TryRectSliceInto(gradOutput, start, length, into))
+            {
+                DifferentiableOps.CommitDirectGradWrite(grads, inputs[i], into);
+                offset += size;
+                continue;
+            }
             var sliced = engine.TensorSlice(gradOutput, start, length);
             DifferentiableOps.AccumulateGrad(grads, inputs[i], sliced, engine);
             offset += size;
@@ -6045,6 +6090,19 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
         var kernelGrad = engine.DepthwiseConv2DBackwardKernel(gradOutput, inputs[0], inputs[1]._shape, stride, padding);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], kernelGrad, engine);
+    }
+
+    /// <summary>
+    /// Backward of a depthwise convolution with its channel bias added (inputs: x, kernel, bias): the bias gradient as
+    /// <see cref="ChannelBiasAddBackward"/> reduces it, then <see cref="DepthwiseConv2DBackward"/> on the same gradient.
+    /// </summary>
+    internal static void DepthwiseConv2DBiasBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        if (DifferentiableOps.IsGradientRequired(inputs[2]))
+            DifferentiableOps.AccumulateGrad(grads, inputs[2], engine.ReduceSum(gradOutput, new[] { 0, 2, 3 }), engine);
+        DepthwiseConv2DBackward(gradOutput, new[] { inputs[0], inputs[1] }, output, savedState, engine, grads);
     }
 
     /// <summary>ConvTranspose3D backward via engine backward helpers</summary>

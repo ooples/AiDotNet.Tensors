@@ -34,11 +34,21 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                             new DelegateTunedKernelCandidate<TunedGemmArgs>("opencl.gemm.entry", TunedKernelOrigin.Builtin, true,
                                 _ => true, (in TunedGemmArgs a) => GemmReference(a)),
                             new DelegateTunedKernelCandidate<TunedGemmArgs>("opencl.gemm.rb_splitk", TunedKernelOrigin.Builtin, true,
-                                _ => HasTunedKernel(Kernels.BatchedGemmKernels.Rb64SplitK)
+                                _ => HasTunedKernel(Kernels.BatchedGemmKernels.Rb64SplitK, Rb64GroupSide * Rb64GroupSide)
                                     && HasTunedKernel(Kernels.BatchedGemmKernels.SplitKReduce),
                                 (in TunedGemmArgs a) =>
                                 {
                                     RbSplitKGemm(a.A, a.B, a.C, a.M, a.N, a.K);
+                                    RecordGemmDispatch(OpenClGemmDispatchPath.BuiltInKernel);
+                                }),
+                            // A linear layer over a small batch: a read of B (the weights) at bandwidth.
+                            new DelegateTunedKernelCandidate<TunedGemmArgs>("opencl.gemm.skinny", TunedKernelOrigin.Builtin, true,
+                                shape => shape[0] <= SkinnyGemmMaxRows && shape[1] % SkinnyVectorWidth == 0
+                                    && HasTunedKernel(Kernels.BatchedGemmKernels.SkinnySplitK, SkinnyGroupSize)
+                                    && HasTunedKernel(Kernels.BatchedGemmKernels.SplitKReduce),
+                                (in TunedGemmArgs a) =>
+                                {
+                                    SkinnyGemm(a.A, a.B, a.C, a.M, a.N, a.K);
                                     RecordGemmDispatch(OpenClGemmDispatchPath.BuiltInKernel);
                                 }),
                         };
@@ -47,6 +57,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                                 MeasureTunedKernelMilliseconds, a => new[] { (a.C, a.OutputCount) },
                                 a => a.C.Handle == a.A.Handle || a.C.Handle == a.B.Handle),
                             () => GpuDeterminism.IsActive, candidates);
+                        _gemmSlot.UntunedPreference = static shape => GemmUntunedPreference(shape[0], shape[1], shape[2]);
                     }
                     return _gemmSlot;
                 }
@@ -54,6 +65,69 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
 
         private void GemmReference(in TunedGemmArgs a) => RunGemmReference(this, a);
+
+        // gemm_skinny_splitk's layout: a work item reads SkinnyVectorWidth columns (one float4) for SkinnyRowTile rows,
+        // SkinnyVectorsPerGroup float4 columns per SkinnyGroupSize-item group, and the group's remaining items split K
+        // into lanes (SkinnyMaxRowTiles row tiles at most, so M <= SkinnyGemmMaxRows). K is split until the grid covers
+        // about SkinnyGroupsPerComputeUnit groups per compute unit, each slice at least SkinnyMinSlice deep and a multiple
+        // of SkinnyChunkAlign.
+        private const int SkinnyRowTile = 8;
+        private const int SkinnyMaxRowTiles = 4;
+        private const int SkinnyGemmMaxRows = SkinnyRowTile * SkinnyMaxRowTiles;
+        private const int SkinnyVectorWidth = 4;
+        private const int SkinnyVectorsPerGroup = 64;
+        private const int SkinnyGroupSize = 256;
+        private const int SkinnyGroupsPerComputeUnit = 8;
+        private const int SkinnyMinSlice = 256;
+        private const int SkinnyChunkAlign = 64;
+
+        private static readonly string[] s_gemmPreferSplitK = { "opencl.gemm.rb_splitk" };
+        private static readonly string[] s_gemmPreferSkinny = { "opencl.gemm.skinny" };
+
+        // The route for a product the slot could not settle by measurement (no budget left, or a measurement left
+        // inconclusive by CLBlast's host-time noise), from paired timings on gfx1012: the split-K GEMM took a half to a
+        // quarter of CLBlast's time on a transformer's tall projections (8320 x {192, 576, 768} x {192, 768}: 283 vs 1028,
+        // 856 vs 1861, 1136 vs 2348, 1177 vs 2823 us), and the skinny GEMM half on a deep linear layer over a small batch
+        // (32 x 4096 x 4096: 432 vs 835 us). Anything else keeps the reference, square products among them: split-K took
+        // 1.16-1.37x CLBlast's time on the large ones (1024 x 1024 x 1024 and up).
+        internal static IReadOnlyList<string>? GemmUntunedPreference(int m, int n, int k)
+        {
+            if (m <= SkinnyGemmMaxRows && n % SkinnyVectorWidth == 0 && k >= SkinnyPreferredMinDepth) return s_gemmPreferSkinny;
+            if (m >= SplitKPreferredMinRows && n <= SplitKPreferredMaxColumns && k <= SplitKPreferredMaxDepth)
+                return s_gemmPreferSplitK;
+            return null;
+        }
+
+        // The skinny GEMM's regime: a deep K (32 x 4096 x 512 stayed CLBlast's, 118 vs 176 us).
+        private const int SkinnyPreferredMinDepth = 1024;
+
+        // The split-K regime: a tall product no wider and no deeper than the widest measured winner (768).
+        private const int SplitKPreferredMinRows = 1024;
+        private const int SplitKPreferredMaxColumns = 768;
+        private const int SplitKPreferredMaxDepth = 768;
+
+        // C[M x N] = A[M x K] * B[K x N] through gemm_skinny_splitk (M <= SkinnyGemmMaxRows, N a multiple of
+        // SkinnyVectorWidth), the planes summed by gemm_splitk_reduce.
+        internal void SkinnyGemm(IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, int m, int n, int k)
+        {
+            int rowTiles = (m + SkinnyRowTile - 1) / SkinnyRowTile, kLanes = SkinnyMaxRowTiles / rowTiles;
+            int columnBlocks = (n / SkinnyVectorWidth + SkinnyVectorsPerGroup - 1) / SkinnyVectorsPerGroup;
+            int splits = SplitKFactor(columnBlocks, k, SkinnyMinSlice, SkinnyGroupsPerComputeUnit, SplitComputeUnits);
+            int kChunk = RoundUpToMultiple((k + splits - 1) / splits, SkinnyChunkAlign);
+            splits = (k + kChunk - 1) / kChunk;
+            int planes = splits * kLanes;
+            using IGpuBuffer? partial = planes > 1 ? AllocateBuffer(checked(planes * m * n)) : null;
+            var gemm = _kernelCache[Kernels.BatchedGemmKernels.SkinnySplitK];
+            gemm.SetArg(0, BufferHandle(a)); gemm.SetArg(1, BufferHandle(b)); gemm.SetArg(2, BufferHandle(partial ?? c));
+            gemm.SetArg(3, m); gemm.SetArg(4, n); gemm.SetArg(5, k); gemm.SetArg(6, kChunk); gemm.SetArg(7, rowTiles);
+            gemm.Execute2D(columnBlocks * SkinnyGroupSize, splits, SkinnyGroupSize, 1);
+            if (partial is null) return;
+            var reduce = _kernelCache[Kernels.BatchedGemmKernels.SplitKReduce];
+            reduce.SetArg(0, BufferHandle(partial)); reduce.SetArg(1, BufferHandle(c));
+            reduce.SetArg(2, m * n); reduce.SetArg(3, planes);
+            reduce.SetArg(4, BufferHandle(c)); reduce.SetArg(5, 0); reduce.SetArg(6, n);
+            reduce.Execute1D(RoundUpToMultiple(m * n, ReduceGroupSize), ReduceGroupSize);
+        }
 
         // Static: the flag is per thread, not per backend.
         private static void RunGemmReference(OpenClBackend backend, in TunedGemmArgs a)

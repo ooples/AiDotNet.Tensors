@@ -266,7 +266,7 @@ void main() {
     float act; float dact;
     if (mode == 0) { float s = 1.0 / (1.0 + exp(-g)); act = s; dact = s * (1.0 - s); }
     else if (mode == 1) {
-        float t = tanh(0.7978845608 * (g + 0.044715 * g * g * g));
+        float t = tanh(clamp(0.7978845608 * (g + 0.044715 * g * g * g), -10.0, 10.0));
         act = 0.5 * g * (1.0 + t);
         dact = 0.5 * (1.0 + t) + 0.5 * g * (1.0 - t * t) * 0.7978845608 * (1.0 + 0.134145 * g * g);
     }

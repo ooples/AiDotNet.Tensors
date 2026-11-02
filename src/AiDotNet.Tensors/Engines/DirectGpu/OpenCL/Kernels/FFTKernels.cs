@@ -467,6 +467,33 @@ __kernel void fft_cols_butterfly(
     imag[j] = uImag - tImag;
 }
 
+// A direct DFT of strided lines (a row: element stride 1, line stride width; a column: element stride width, line
+// stride 1), out of place in the input's layout, scaled by 1/n for the inverse: FFT2D's path for a side that is not a
+// power of two, which the radix-2 kernels cannot transform. The twiddle index k * j is kept modulo n as it advances.
+__kernel void strided_dft(
+    __global const float* inRe, __global const float* inIm, __global float* outRe, __global float* outIm,
+    const int lines, const int n, const int elemStride, const int lineStride, const int inverse)
+{
+    int i = get_global_id(0);
+    if (i >= lines * n) return;
+    int line = i / n, k = i % n, base = line * lineStride;
+    float step = (inverse ? 6.283185307179586f : -6.283185307179586f) / (float)n;
+    float re = 0.0f, im = 0.0f;
+    int phase = 0;
+    for (int j = 0; j < n; j++) {
+        float a = step * (float)phase;
+        float c = cos(a), s = sin(a);
+        int src = base + j * elemStride;
+        re += inRe[src] * c - inIm[src] * s;
+        im += inRe[src] * s + inIm[src] * c;
+        phase += k;
+        if (phase >= n) phase -= n;
+    }
+    float scale = inverse ? 1.0f / (float)n : 1.0f;
+    outRe[base + k * elemStride] = re * scale;
+    outIm[base + k * elemStride] = im * scale;
+}
+
 // Row-wise bit reversal for 2D FFT
 __kernel void bit_reverse_rows(
     __global const float* srcReal,
@@ -552,6 +579,7 @@ __kernel void bit_reverse_cols(
         "fft_rows_butterfly",
         "fft_cols_butterfly",
         "bit_reverse_rows",
-        "bit_reverse_cols"
+        "bit_reverse_cols",
+        "strided_dft"
     };
 }

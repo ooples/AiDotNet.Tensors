@@ -97,6 +97,7 @@ public class SimdGemmDirectParallel2DTests
     [InlineData(66, 96, 48)]      // a full strip and a 16-column remainder on the 6x16 kernel
     [InlineData(7, 40, 32)]       // one full row block (6x32 tile) and a 1-row masked block
     [InlineData(25, 513, 64)]     // packed strips over k blocks of 256, 256 and 1 (partial sums resumed from C)
+    [InlineData(20, 13, 64)]      // packed A panels with a 5-column tail after one 8-column transpose step
     public void Vector512Tile_IsBitIdenticalTo256BitTiles(int m, int k, int n)
     {
         // The direct kernels are register FMA chains with no portable form; production reaches them only behind an FMA gate.
@@ -106,6 +107,7 @@ public class SimdGemmDirectParallel2DTests
         var narrow = new float[m * n];
         var wide = new float[m * n];
         bool? before = SimdGemm.s_forceVector512Direct;
+        bool beforePackA = SimdGemm.s_packA2D;
         int threads = CpuParallelSettings.MaxDegreeOfParallelism;
         try
         {
@@ -113,11 +115,20 @@ public class SimdGemmDirectParallel2DTests
             SimdGemm.s_forceVector512Direct = false;
             Assert.True(SimdGemm.TrySgemmDirectParallel2D(a, k, b, n, narrow, m, k, n, allowParallel: true));
             SimdGemm.s_forceVector512Direct = true;
+            // A's six-row panels read in place, then from the packed copy (the default): the same chains either way.
+            SimdGemm.s_packA2D = false;
+            var inPlace = new float[m * n];
+            Assert.True(SimdGemm.TrySgemmDirectParallel2D(a, k, b, n, inPlace, m, k, n, allowParallel: true));
+            for (int i = 0; i < narrow.Length; i++)
+                Assert.True(BitConverter.SingleToInt32Bits(narrow[i]) == BitConverter.SingleToInt32Bits(inPlace[i]),
+                    $"in place C[{i / n},{i % n}]: 256-bit {narrow[i]:G9}, 512-bit {inPlace[i]:G9}");
+            SimdGemm.s_packA2D = true;
             Assert.True(SimdGemm.TrySgemmDirectParallel2D(a, k, b, n, wide, m, k, n, allowParallel: true));
         }
         finally
         {
             SimdGemm.s_forceVector512Direct = before;
+            SimdGemm.s_packA2D = beforePackA;
             CpuParallelSettings.MaxDegreeOfParallelism = threads;
         }
         for (int i = 0; i < narrow.Length; i++)

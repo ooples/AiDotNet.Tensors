@@ -35,5 +35,10 @@ static AiDotNet.Tensors.Interop.DLPackStream.PerThreadDefault.get -> AiDotNet.Te
 static AiDotNet.Tensors.Interop.DLPackStream.operator !=(AiDotNet.Tensors.Interop.DLPackStream left, AiDotNet.Tensors.Interop.DLPackStream right) -> bool
 static AiDotNet.Tensors.Interop.DLPackStream.operator ==(AiDotNet.Tensors.Interop.DLPackStream left, AiDotNet.Tensors.Interop.DLPackStream right) -> bool
 AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelDecisionReason.Heuristic = 8 -> AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelDecisionReason
+override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorAddActivation<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! a, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! b, AiDotNet.Tensors.Engines.FusedActivationType activation) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+virtual AiDotNet.Tensors.Engines.CpuEngine.TensorAddActivation<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! a, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! b, AiDotNet.Tensors.Engines.FusedActivationType activation) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanGlslKernels.AddActivation.get -> string!
+AiDotNet.Tensors.Engines.TensorAddActivationEngineExtensions
+static AiDotNet.Tensors.Engines.TensorAddActivationEngineExtensions.TensorAddActivation<T>(this AiDotNet.Tensors.Engines.IEngine! engine, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! a, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! b, AiDotNet.Tensors.Engines.FusedActivationType activation) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
 static AiDotNet.Tensors.Engines.AiDotNetEngine.ReleaseGpu() -> bool
 static AiDotNet.Tensors.Engines.AiDotNetEngine.ReleaseGpu(System.TimeSpan drainTimeout) -> bool

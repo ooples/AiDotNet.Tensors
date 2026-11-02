@@ -2,6 +2,7 @@ using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Tests.Engines.DirectGpu;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.Gpu;
@@ -14,19 +15,26 @@ namespace AiDotNet.Tensors.Tests.Engines.Gpu;
 /// cuBLAS's column-major convention (a layout/transpose-flag bug would silently emit WRONG gradients), this
 /// parity test runs FIRST — before the kernel is wired into training — to catch any convention error.
 /// </summary>
-public class Fp16FusedBackwardGemmTests
+[Collection("DirectGpuSerial")]
+public class Fp16FusedBackwardGemmTests : IClassFixture<DirectGpuTensorEngineTestFixture>
 {
+    // The test's own engine: the process-wide current engine is shared and other tests reset it to the CPU,
+    // so reading it made these tests skip on a CUDA machine depending on test order.
+    private readonly DirectGpuTensorEngineTestFixture _fixture;
+
+    public Fp16FusedBackwardGemmTests(DirectGpuTensorEngineTestFixture fixture) => _fixture = fixture;
+
     [SkippableTheory]
     [InlineData(false)] // FP32 gradient outputs
     [InlineData(true)]  // FP16 gradient outputs (FP32 accumulate) — the dtype the hetero backward needs
     public void MatMulBackwardFp16Fused_matches_fp32_reference(bool gradOutHalf)
     {
         Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver not available");
-        var eng = AiDotNetEngine.Current;
-        Skip.IfNot(eng is DirectGpuTensorEngine, "active engine is not the CUDA backend");
+        var eng = _fixture.Engine;
+        Skip.IfNot(eng is not null, "the DirectGpu engine did not initialize");
         var warm = new Tensor<float>(new float[] { 1, 2, 3, 4 }, new[] { 2, 2 });
-        _ = eng.TensorMatMul(warm, warm); // force kernel-module compile
-        var b = ((DirectGpuTensorEngine)eng).TestBackend as CudaBackend;
+        _ = eng!.TensorMatMul(warm, warm); // force kernel-module compile
+        var b = eng!.TestBackend as CudaBackend;
         Skip.IfNot(b is not null && b.IsAvailable, "CudaBackend not available");
 
         // Forward: C[M,N] = A[M,K] · B[K,N]. Non-square + all dims distinct so a transpose/layout bug can't

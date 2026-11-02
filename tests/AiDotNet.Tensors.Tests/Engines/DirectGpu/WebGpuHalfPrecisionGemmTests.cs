@@ -17,8 +17,8 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// Exercises <see cref="IGpuHalfPrecisionBackend.GemmFp16In32fOut"/> and
 /// <see cref="IGpuHalfPrecisionBackend.Hgemm"/> on the WebGPU backend.
 /// <para>
-/// WebGPU models FP16 as f32 with a truncated mantissa, so the oracle downloads
-/// the exact truncated f32 operands the GPU multiplies and recomputes the
+/// The FP16 buffers are packed binary16, so the oracle widens the exact half
+/// operands the GPU multiplies (ConvertToFp32) and recomputes the
 /// reference from those — the only residual error is f32 accumulation order,
 /// proving the GPU FP16 GEMM is numerically correct rather than just
 /// non-crashing. Honors <c>AIDOTNET_REQUIRE_GPU_TESTS=1</c> (throws instead of
@@ -75,7 +75,7 @@ public sealed class WebGpuHalfPrecisionGemmTests : IDisposable
         return data;
     }
 
-    // C = A·B in f32 from the EXACT (FP16-truncated) operands the GPU used.
+    // C = A·B in f32 from the EXACT (FP16-rounded) operands the GPU used.
     private static float[] CpuReference(float[] a, float[] b, int m, int n, int k)
     {
         var c = new float[m * n];
@@ -106,21 +106,26 @@ public sealed class WebGpuHalfPrecisionGemmTests : IDisposable
         }
     }
 
-    // Upload FP32, truncate to FP16 precision on the device, and return both the
-    // FP16 buffers and the EXACT truncated host values the GPU will multiply.
+    // Upload FP32, convert to FP16 on the device (the interface layout: two bytes per element), and return both the
+    // FP16 buffers and the EXACT half values the GPU will multiply, read back through ConvertToFp32.
     private (IGpuBuffer aFp16, IGpuBuffer bFp16, float[] aTrunc, float[] bTrunc) PrepareFp16Inputs(
         float[] a, float[] b, int m, int n, int k)
     {
         using var aFp32 = _backend.AllocateBuffer(a);
         using var bFp32 = _backend.AllocateBuffer(b);
-        var aFp16 = _backend.AllocateBuffer(m * k);
-        var bFp16 = _backend.AllocateBuffer(k * n);
+        var aFp16 = _backend.AllocateByteBuffer(m * k * 2);
+        var bFp16 = _backend.AllocateByteBuffer(k * n * 2);
         _backend.ConvertToFp16(aFp32, aFp16, m * k);
         _backend.ConvertToFp16(bFp32, bFp16, k * n);
 
-        var aTrunc = _backend.DownloadBuffer(aFp16);
-        var bTrunc = _backend.DownloadBuffer(bFp16);
-        return (aFp16, bFp16, aTrunc, bTrunc);
+        return (aFp16, bFp16, Widen(aFp16, m * k), Widen(bFp16, k * n));
+    }
+
+    private float[] Widen(IGpuBuffer half, int count)
+    {
+        using var wide = _backend.AllocateBuffer(count);
+        _backend.ConvertToFp32(half, wide, count);
+        return _backend.DownloadBuffer(wide);
     }
 
     [SkippableTheory]
@@ -161,15 +166,14 @@ public sealed class WebGpuHalfPrecisionGemmTests : IDisposable
         var b = RandomMatrix(k, n, seed: 42);
 
         var (aFp16, bFp16, aTrunc, bTrunc) = PrepareFp16Inputs(a, b, m, n, k);
-        using var cFp16 = _backend.AllocateBuffer(m * n);
+        using var cFp16 = _backend.AllocateByteBuffer(m * n * 2);
         try
         {
             ((IGpuHalfPrecisionBackend)_backend).Hgemm(aFp16, bFp16, cFp16, m, n, k);
-            // WebGPU FP16 output is already f32-storage (truncated), so download directly.
-            var actual = _backend.DownloadBuffer(cFp16);
+            var actual = Widen(cFp16, m * n);
             var expected = CpuReference(aTrunc, bTrunc, m, n, k);
             // The result is rounded to FP16 precision, so the dominant error is the
-            // final mantissa truncation of the accumulated value.
+            // final rounding of the accumulated value.
             AssertClose(expected, actual, absTol: 5e-2, relTol: 3e-2);
         }
         finally

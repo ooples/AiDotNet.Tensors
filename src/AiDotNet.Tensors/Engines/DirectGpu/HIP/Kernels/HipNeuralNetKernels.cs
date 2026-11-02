@@ -170,13 +170,20 @@ extern ""C"" __global__ __launch_bounds__(256) void cross_entropy_loss(
     int batch = blockIdx.x * blockDim.x + threadIdx.x;
     if (batch >= batchSize) return;
 
+    // CONTRACT (as CUDA, OpenCL and CpuEngine): `predictions` are logits and `targets` dense; the row loss is
+    // -sum(t * log_softmax(row)). This was -sum(t * log(pred)), the probability-input loss CUDA had already corrected.
     int baseIdx = batch * numClasses;
-    float sampleLoss = 0.0f;
+    float maxVal = -INFINITY;
+    for (int c = 0; c < numClasses; c++) maxVal = fmaxf(maxVal, predictions[baseIdx + c]);
+    float sumExp = 0.0f;
+    for (int c = 0; c < numClasses; c++) sumExp += expf(predictions[baseIdx + c] - maxVal);
+    // -sum(t * (logit - max)) + log(sumExp) * sum(t): fast math may fold (logit - max) - log(sumExp) back into logit - (max + log(sumExp)); summing t * (logit - max) and t apart keeps the normalizer.
+    float shifted = 0.0f, targetSum = 0.0f;
     for (int c = 0; c < numClasses; c++) {
-        float pred = fmaxf(predictions[baseIdx + c], 1e-7f);
-        sampleLoss -= targets[baseIdx + c] * logf(pred);
+        shifted += targets[baseIdx + c] * (predictions[baseIdx + c] - maxVal);
+        targetSum += targets[baseIdx + c];
     }
-    loss[batch] = sampleLoss;
+    loss[batch] = logf(sumExp) * targetSum - shifted;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void cross_entropy_backward(
@@ -187,8 +194,19 @@ extern ""C"" __global__ __launch_bounds__(256) void cross_entropy_backward(
     int total = batchSize * numClasses;
     if (idx >= total) return;
 
-    float pred = fmaxf(predictions[idx], 1e-7f);
-    gradInput[idx] = (-targets[idx] / pred) / (float)batchSize;
+    // CONTRACT (as CUDA, OpenCL and CpuEngine.CrossEntropyBackward): `predictions` are LOGITS and `targets` is dense
+    // [batch, classes]; the gradient is (softmax - target) / batchSize. This was (-target / pred) / batchSize, the
+    // probability-input derivative CUDA had already corrected (#775).
+    int b = idx / numClasses;
+    int rowOffset = b * numClasses;
+    float maxVal = -INFINITY;
+    for (int i = 0; i < numClasses; i++)
+        maxVal = fmaxf(maxVal, predictions[rowOffset + i]);
+    float sumExp = 0.0f;
+    for (int i = 0; i < numClasses; i++)
+        sumExp += expf(predictions[rowOffset + i] - maxVal);
+    float softmax = expf(predictions[idx] - maxVal) / sumExp;
+    gradInput[idx] = (softmax - targets[idx]) / (float)batchSize;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void bce_loss(

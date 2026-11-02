@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -54,6 +54,9 @@ public sealed class MetalShaderCompilationTests
         yield return ("PagedAttention", () => MetalKernels.PagedAttentionKernels, false);
         yield return ("FlashDecode", () => MetalKernels.FlashDecodeKernels, false);
         yield return ("IoULoss", () => MetalKernels.IoULossKernels, false);
+        yield return ("AddActivation", () => MetalBackend.AddActivationSource, false);
+        yield return ("FusedComposites", () => MetalBackend.FusedCompositesSource, true);
+        yield return ("FusedGemm", () => MetalBackend.FusedGemmSource, false);
         yield return ("Recurrence", () => MetalRecurrenceKernels.Source, false);
         yield return ("FusedAdvancedKernels", () => MetalFusedAdvancedKernels.Source, false);
         yield return ("Ann", () => MetalAnnKernels.Source, false);

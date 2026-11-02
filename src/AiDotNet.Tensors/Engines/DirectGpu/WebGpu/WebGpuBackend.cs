@@ -270,7 +270,12 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         await DispatchBinaryOpAsync("minimum", A, B, C, size);
     }
 
-    private async Task DispatchBinaryOpAsync(string kernelName, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
+    private Task DispatchBinaryOpAsync(string kernelName, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
+        => DispatchBinaryOpAsync("ElementWise", WebGpuKernels.ElementWiseSource, kernelName, A, B, C, size);
+
+    /// <summary>An element-wise C = f(A, B) entry point of <paramref name="source"/>, a module with ElementWiseSource's
+    /// bindings (A, B, C, then a uniform holding the size).</summary>
+    private async Task DispatchBinaryOpAsync(string moduleName, string source, string kernelName, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
         ThrowIfNotInitialized();
 
@@ -278,7 +283,7 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         var bBuffer = (WebGpuBuffer)B;
         var cBuffer = (WebGpuBuffer)C;
 
-        var pipelineId = await GetOrCreatePipelineAsync("ElementWise", WebGpuKernels.ElementWiseSource, kernelName);
+        var pipelineId = await GetOrCreatePipelineAsync(moduleName, source, kernelName);
 
         // Create uniform buffer for params
         var paramsData = new float[] { BitConverter.Int32BitsToSingle(size), 0, 0, 0 };
@@ -1247,19 +1252,6 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         _complexScratch = new[] { AllocateBuffer(n), AllocateBuffer(n), AllocateBuffer(n), AllocateBuffer(n) };
     }
 
-    public void SplitComplexMultiply(IGpuBuffer aR, IGpuBuffer aI, IGpuBuffer bR, IGpuBuffer bI, IGpuBuffer oR, IGpuBuffer oI, int n)
-    {
-        if (n <= 0) return;
-        lock (_complexScratchLock)
-        {
-            EnsureComplexScratch(n);
-            var t1 = _complexScratch![0]; var t2 = _complexScratch[1];
-            var t3 = _complexScratch[2]; var t4 = _complexScratch[3];
-            Multiply(aR, bR, t1, n); Multiply(aI, bI, t2, n); Subtract(t1, t2, oR, n);
-            Multiply(aR, bI, t3, n); Multiply(aI, bR, t4, n); Add(t3, t4, oI, n);
-        }
-    }
-
     public void InterleaveComplex(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer interleaved, int n)
     {
         if (n <= 0) return;
@@ -1290,51 +1282,9 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
                 $"{opName}: n ({n}) requires real/imag buffers of at least {n} elements and an interleaved buffer of at least {requiredInterleaved} elements; sizes are real={real.Size}, imag={imag.Size}, interleaved={interleaved.Size}.");
     }
 
-    public void SplitComplexConjugate(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer oR, IGpuBuffer oI, int n)
-    {
-        if (n <= 0) return;
-        Copy(iR, 0, oR, 0, n);
-        Negate(iI, oI, n);
-    }
-
     public void SplitComplexMagnitude(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer o, int n) => ComplexMagnitude(iR, iI, o, n);
-    public void SplitComplexMagnitudeSquared(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer o, int n)
-    {
-        if (n <= 0) return;
-        lock (_complexScratchLock)
-        {
-            EnsureComplexScratch(n);
-            Multiply(iR, iR, _complexScratch![0], n); Multiply(iI, iI, _complexScratch[1], n);
-            Add(_complexScratch[0], _complexScratch[1], o, n);
-        }
-    }
     public void SplitComplexPhase(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer o, int n) => ComplexPhase(iR, iI, o, n);
     public void SplitComplexFromPolar(IGpuBuffer m, IGpuBuffer p, IGpuBuffer oR, IGpuBuffer oI, int n) => PolarToComplex(m, p, oR, oI, n);
-
-    public void SplitComplexScale(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer oR, IGpuBuffer oI, float s, int n)
-    {
-        if (n <= 0) return;
-        Scale(iR, oR, s, n); Scale(iI, oI, s, n);
-    }
-
-    public void SplitComplexAdd(IGpuBuffer aR, IGpuBuffer aI, IGpuBuffer bR, IGpuBuffer bI, IGpuBuffer oR, IGpuBuffer oI, int n)
-    {
-        if (n <= 0) return;
-        Add(aR, bR, oR, n); Add(aI, bI, oI, n);
-    }
-
-    public void SplitComplexCrossSpectral(IGpuBuffer xR, IGpuBuffer xI, IGpuBuffer yR, IGpuBuffer yI, IGpuBuffer oR, IGpuBuffer oI, int n)
-    {
-        if (n <= 0) return;
-        lock (_complexScratchLock)
-        {
-            EnsureComplexScratch(n);
-            var t1 = _complexScratch![0]; var t2 = _complexScratch[1];
-            var t3 = _complexScratch[2]; var t4 = _complexScratch[3];
-            Multiply(xR, yR, t1, n); Multiply(xI, yI, t2, n); Add(t1, t2, oR, n);
-            Multiply(xI, yR, t3, n); Multiply(xR, yI, t4, n); Subtract(t3, t4, oI, n);
-        }
-    }
 
     public void SplitComplexTopK(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n, int k)
     {

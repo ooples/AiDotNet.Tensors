@@ -91,6 +91,15 @@ internal static partial class SimdGemm
                 bool pack = stripCap == Nr512 && s_packStrip512 && kCap <= MaxPackedStripK
                     && Math.Min(rb1, mCap / Mr) - rb0 >= 2;
                 float[]? stripBuffer = pack ? PackedStripBuffer(kCap) : null;
+                // The chunk's full six-row panels of A, each copied once as [k][6]: the tile then broadcasts from one
+                // sequential stream instead of six rows lda apart, for every strip of the chunk.
+                int fullRb1 = Math.Min(rb1, mCap / Mr);
+                float[]? aPanels = pack && s_packA2D && fullRb1 > rb0
+                    ? TransAPackABuffer((fullRb1 - rb0) * kCap * Mr + 8) : null;
+                if (aPanels is not null)
+                    fixed (float* pap = aPanels)
+                        for (int rbIdx = rb0; rbIdx < fullRb1; rbIdx++)
+                            PackRows6(pA + (long)rbIdx * Mr * ldaCap, ldaCap, pap + (long)(rbIdx - rb0) * kCap * Mr, kCap);
 #endif
                 for (int cs = cs0; cs < cs1; cs++)
                 {
@@ -100,6 +109,7 @@ internal static partial class SimdGemm
                     if (stripBuffer is not null && stripEnd - stripStart == Nr512)
                     {
                         fixed (float* ps = stripBuffer)
+                        fixed (float* pap = aPanels)
                         {
                             // k in blocks of s_stripKc rows: each block's strip (kc x 32) stays in L1 across the row
                             // blocks, which park their partial sums in C and resume the same FMA chains on the next block.
@@ -114,7 +124,13 @@ internal static partial class SimdGemm
                                     if (mCap - i < Mr) continue;
                                     float* pARow = pA + (long)i * ldaCap + k0;
                                     float* pCRow = pC + (long)i * nCap + stripStart;
-                                    if (k0 == 0) DirectKernel6x32Store(pARow, ldaCap, ps, Nr512, pCRow, nCap, kb);
+                                    if (pap != null)
+                                    {
+                                        float* pPanel = pap + ((long)(rbIdx - rb0) * kCap + k0) * Mr;
+                                        if (k0 == 0) TransAKernel6x32(pPanel, Mr, ps, Nr512, pCRow, nCap, kb);
+                                        else TransAKernel6x32Resume(pPanel, Mr, ps, Nr512, pCRow, nCap, kb);
+                                    }
+                                    else if (k0 == 0) DirectKernel6x32Store(pARow, ldaCap, ps, Nr512, pCRow, nCap, kb);
                                     else DirectKernel6x32Resume(pARow, ldaCap, ps, Nr512, pCRow, nCap, kb);
                                 }
                             }
