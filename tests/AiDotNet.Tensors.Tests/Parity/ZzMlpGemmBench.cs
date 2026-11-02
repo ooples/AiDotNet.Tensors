@@ -70,6 +70,18 @@ public class ZzMlpGemmBench
             var dwCur = Measure(() => BackwardFunctions<float>.BackwardGemmWeightGradient(x, dyR, dwR, mm, k, n));
             var dwSimd = Measure(() => AiDotNet.Tensors.Engines.Simd.SimdGemm.Sgemm(x.AsSpan(0, mm * k), k, true, dyR.AsSpan(0, mm * n), n, false, dwR.AsSpan(0, k * n), k, mm, n));
             var dwAuto = Measure(() => AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(x, k, true, dyR, n, false, dwR.AsSpan(0, k * n), n, k, n, mm));
+            {
+                var o2 = new AiDotNet.Tensors.Engines.BlasManaged.BlasOptions<float>();
+                string strat = "";
+                foreach (var pm in new[] { AiDotNet.Tensors.Engines.BlasManaged.PackingMode.ForcePackBoth, AiDotNet.Tensors.Engines.BlasManaged.PackingMode.ForcePackAOnly, AiDotNet.Tensors.Engines.BlasManaged.PackingMode.ForceStreaming })
+                {
+                    var pmc = pm;
+                    var r = Measure(() => AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(x, k, true, dyR, n, false, dwR.AsSpan(0, k * n), n, k, n, mm,
+                        new AiDotNet.Tensors.Engines.BlasManaged.BlasOptions<float> { PackingMode = pmc }));
+                    strat += $"  {pm} {r.Min:F4}/{r.Med:F4}";
+                }
+                Line($"ZM dWstrat m{mm} {k}->{n} sel {AiDotNet.Tensors.Engines.BlasManaged.Dispatcher.SelectStrategy<float>(k, n, mm, true, false, in o2)}{strat}");
+            }
             Line($"ZM dWroute m{mm} {k}->{n} current {dwCur.Min:F4}/{dwCur.Med:F4}  sgemmT {dwSimd.Min:F4}/{dwSimd.Med:F4}  blasAuto {dwAuto.Min:F4}/{dwAuto.Med:F4}");
             float[] dxR = new float[mm * k];
             var dxCur = Measure(() => BackwardFunctions<float>.BackwardGemmInputGradient(dyR, w, dxR, mm, k, n));
