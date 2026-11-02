@@ -39,6 +39,7 @@ internal static unsafe partial class WinogradF43
 
     /// <summary>Test switch: false routes every convolution away from this kernel.</summary>
     internal static bool s_disable;
+    internal static bool s_wgradAny;
 
     // Operator opt-out (A/B switch).
     private static readonly bool s_env = Environment.GetEnvironmentVariable("AIDOTNET_CONV_WINOGRAD") != "0";
@@ -107,7 +108,7 @@ internal static unsafe partial class WinogradF43
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
         => Applies(batch, inChannels, outChannels, height, width, kernelH, kernelW, strideH, strideW, padH, padW,
                dilationH, dilationW, s_minBackwardPatches)
-           && (long)inChannels * outChannels >= 64L * (inChannels + outChannels)
+           && (s_wgradAny || (long)inChannels * outChannels >= 64L * (inChannels + outChannels))
            && WeightGradientWorkspaceFloats(batch, inChannels, outChannels, height, width) <= MaxWeightGradientWorkspaceFloats;
 
     /// <summary>The most floats <see cref="BackwardKernel"/> may hold at once: 2^27, 512 MiB. A ResNet 64 -> 64 layer on

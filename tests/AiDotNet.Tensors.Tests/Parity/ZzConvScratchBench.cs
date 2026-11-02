@@ -33,9 +33,10 @@ public class ZzConvScratchBench
         var rng = new Random(3);
         var variants = new (string Name, Action Set)[]
         {
-            ("wino", () => { WinogradF43.s_disable = false; WinogradF43.s_forceBlockedForTest = false; }),
-            ("direct", () => { WinogradF43.s_disable = true; WinogradF43.s_forceBlockedForTest = false; }),
-            ("blocked", () => { WinogradF43.s_disable = false; WinogradF43.s_forceBlockedForTest = true; }),
+            ("wino", () => { WinogradF43.s_disable = false; WinogradF43.s_forceBlockedForTest = false; WinogradF43.s_wgradAny = false; }),
+            ("wgAny", () => { WinogradF43.s_disable = false; WinogradF43.s_forceBlockedForTest = false; WinogradF43.s_wgradAny = true; }),
+            ("direct", () => { WinogradF43.s_wgradAny = false; WinogradF43.s_disable = true; WinogradF43.s_forceBlockedForTest = false; }),
+            ("blocked", () => { WinogradF43.s_wgradAny = false; WinogradF43.s_disable = false; WinogradF43.s_forceBlockedForTest = true; }),
         };
         foreach (var (c, hw) in new[] { (64, 32), (128, 16), (256, 8) })
         {
