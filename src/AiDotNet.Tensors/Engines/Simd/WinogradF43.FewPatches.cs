@@ -101,7 +101,7 @@ internal static unsafe partial class WinogradF43
                 {
                     float* slab = tp, stage = tp + slabFloats, band = stage + stageFloats;
                     var g = stackalloc Vector256<float>[9];
-                    var t = stackalloc Vector256<float>[36];
+                    var t = stackalloc Vector256<float>[36];   // the tap transform's 18, then the output transform's 36
                     var uu = stackalloc Vector256<float>[36];
                     var rows = stackalloc float*[FewPatchGroup];
                     long vStride = (long)patches * cIn;
@@ -112,18 +112,16 @@ internal static unsafe partial class WinogradF43
                         // U slab [36][cCount][kb]: G g G^T per (input channel, eight or sixteen output channels).
 #if NET9_0_OR_GREATER
                         if (wide)
+                        {
                             TransformSlab512(stage, slab, cCount, cb, kb);
+                        }
                         else
 #endif
-                        for (int c = 0; c < cCount; c++)
-                            for (int grp = 0; grp < groups; grp++)
-                            {
-                                float* gs = stage + (grp * cb * 9 + c * 9) * 8;
-                                for (int e = 0; e < 9; e++) g[e] = Avx.LoadVector256(gs + e * 8);
-                                for (int j = 0; j < 3; j++) TransformKernelColumn(g[j], g[3 + j], g[6 + j], t, j, 3);
-                                for (int i = 0; i < 6; i++) TransformKernelColumn(t[i * 3], t[i * 3 + 1], t[i * 3 + 2], uu, i * 6, 1);
-                                for (int xi = 0; xi < Points; xi++) Avx.Store(slab + (xi * cb + c) * kb + grp * 8, uu[xi]);
-                            }
+                        {
+                            for (int c = 0; c < cCount; c++)
+                                for (int grp = 0; grp < groups; grp++)
+                                    TransformTaps(stage + (grp * cb * 9 + c * 9) * 8, slab + c * kb + grp * 8, cb * kb, g, t, uu);
+                        }
                         for (int xi = 0; xi < Points; xi++)
                             for (int p0 = 0; p0 < paddedPatches; p0 += FewPatchGroup)
                             {
@@ -131,10 +129,15 @@ internal static unsafe partial class WinogradF43
                                     rows[r] = vp + xi * vStride + (long)Math.Min(p0 + r, patches - 1) * cIn + c0;
                                 float* mBlock = mp + ((long)xi * paddedPatches + p0) * kb;
 #if NET9_0_OR_GREATER
-                                if (wide) MultiplyFew512(slab + xi * cb * kb, rows, cCount, mBlock, accumulate: c0 != 0);
+                                if (wide)
+                                {
+                                    MultiplyFew512(slab + xi * cb * kb, rows, cCount, mBlock, accumulate: c0 != 0);
+                                }
                                 else
 #endif
-                                MultiplyFew(slab + xi * cb * kb, rows, cCount, mBlock, accumulate: c0 != 0);
+                                {
+                                    MultiplyFew(slab + xi * cb * kb, rows, cCount, mBlock, accumulate: c0 != 0);
+                                }
                             }
                     }
                     // Output transform: y = A^T m A per patch, eight output channels at a time through a whole-image band.
@@ -163,6 +166,18 @@ internal static unsafe partial class WinogradF43
         {
             System.Buffers.ArrayPool<float>.Shared.Return(v);
         }
+    }
+
+    // U = G g G^T for eight output channels: taps [9][8] in, the 36 points at dst + xi * pointStride out (g, t, uu: 9, 18
+    // and 36 vectors of scratch).
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void TransformTaps(float* taps, float* dst, int pointStride, Vector256<float>* g, Vector256<float>* t,
+        Vector256<float>* uu)
+    {
+        for (int e = 0; e < 9; e++) g[e] = Avx.LoadVector256(taps + e * 8);
+        for (int j = 0; j < 3; j++) TransformKernelColumn(g[j], g[3 + j], g[6 + j], t, j, 3);
+        for (int i = 0; i < 6; i++) TransformKernelColumn(t[i * 3], t[i * 3 + 1], t[i * 3 + 2], uu, i * 6, 1);
+        for (int xi = 0; xi < Points; xi++) Avx.Store(dst + xi * pointStride, uu[xi]);
     }
 
     // stage [groups][cb][9][8]: the 3x3 taps of input channels c0..c0+cCount for output channels k0..k0+8 groups, eight
@@ -207,13 +222,20 @@ internal static unsafe partial class WinogradF43
         for (int c = 0; c < cCount; c++)
             for (int pair = 0; pair < kb / 16; pair++)
             {
-                float* lo = stage + (2 * pair * cb * 9 + c * 9) * 8, hi = lo + cb * 9 * 8;
-                for (int e = 0; e < 9; e++)
-                    g[e] = Vector512.Create(Vector256.Load(lo + e * 8), Vector256.Load(hi + e * 8));
-                for (int j = 0; j < 3; j++) TransformKernelColumn512(g[j], g[3 + j], g[6 + j], t, j, 3);
-                for (int i = 0; i < 6; i++) TransformKernelColumn512(t[i * 3], t[i * 3 + 1], t[i * 3 + 2], uu, i * 6, 1);
-                for (int xi = 0; xi < Points; xi++) uu[xi].Store(slab + (xi * cb + c) * kb + pair * 16);
+                float* lo = stage + (2 * pair * cb * 9 + c * 9) * 8;
+                TransformTaps512(lo, lo + cb * 9 * 8, slab + c * kb + pair * 16, cb * kb, g, t, uu);
             }
+    }
+
+    // TransformTaps on sixteen output channels: taps lo [9][8] (channels 0..7) and hi [9][8] (8..15).
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void TransformTaps512(float* lo, float* hi, float* dst, int pointStride, Vector512<float>* g,
+        Vector512<float>* t, Vector512<float>* uu)
+    {
+        for (int e = 0; e < 9; e++) g[e] = Vector512.Create(Vector256.Load(lo + e * 8), Vector256.Load(hi + e * 8));
+        for (int j = 0; j < 3; j++) TransformKernelColumn512(g[j], g[3 + j], g[6 + j], t, j, 3);
+        for (int i = 0; i < 6; i++) TransformKernelColumn512(t[i * 3], t[i * 3 + 1], t[i * 3 + 2], uu, i * 6, 1);
+        for (int xi = 0; xi < Points; xi++) uu[xi].Store(dst + xi * pointStride);
     }
 
     // TransformKernelColumn on sixteen lanes (the same operations in the same order).
