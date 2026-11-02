@@ -145,7 +145,7 @@ public class MediumMGemmAndRowBlockConvTests
     // Every platform: the row-block pin only moves a convolution onto another route of the adaptive chain, so its result
     // must match the default dispatch, and nested scopes must restore the outer state.
     [Theory]
-    [InlineData(1, 16, 64, 64, 32, 1, 1)]   // 3x3 stride 1 pad 1: the direct kernel's shape by default
+    [InlineData(1, 16, 64, 64, 32, 1, 1)]   // 3x3 stride 1 pad 1: adaptive dispatch may itself choose row-block
     [InlineData(2, 8, 33, 29, 12, 2, 0)]    // stride 2, no padding
     public void ForceRowBlockConvScope_MatchesDefaultDispatchAndNests(int batch, int cin, int h, int w, int cout, int stride, int pad)
     {
@@ -155,7 +155,7 @@ public class MediumMGemmAndRowBlockConvTests
         var engine = new CpuEngine();
 
         // Where the row-block route can take the shape (AVX2/FMA, a short-wide GEMM), the pin is observable on its run
-        // counter: one run per pinned call, none without the pin. Elsewhere only the results are compared.
+        // counter: one run per pinned call. Default dispatch may also choose row-block.
         int oh = (h + 2 * pad - 3) / stride + 1, ow = (w + 2 * pad - 3) / stride + 1;
         bool observable = System.Runtime.Intrinsics.X86.Avx2.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported
             && SimdGemm.PrefersParallelN(cout, cin * 9, oh * ow, requireAlignedN: false)
@@ -169,20 +169,26 @@ public class MediumMGemmAndRowBlockConvTests
 
         float[] reference = engine.Conv2D(x, k, stride, pad, 1).ToArray();
         runs = CpuEngine.RowBlockConvRunsOnThisThread;   // the default dispatch may take any route
+        var pin = typeof(CpuEngine).GetField("t_forceRowBlockForTest", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
+        Assert.False((bool)pin.GetValue(null)!);
         float[] pinned, nested, afterInner;
         using (CpuEngine.ForceRowBlockConvScope())
         {
+            Assert.True((bool)pin.GetValue(null)!);
             pinned = engine.Conv2D(x, k, stride, pad, 1).ToArray();
             ExpectRuns(1);
             using (CpuEngine.ForceRowBlockConvScope())
+            {
                 nested = engine.Conv2D(x, k, stride, pad, 1).ToArray();
+                Assert.True((bool)pin.GetValue(null)!);
+            }
             ExpectRuns(1);
+            Assert.True((bool)pin.GetValue(null)!);
             afterInner = engine.Conv2D(x, k, stride, pad, 1).ToArray();   // the outer pin still holds
             ExpectRuns(1);
         }
+        Assert.False((bool)pin.GetValue(null)!);
         float[] released = engine.Conv2D(x, k, stride, pad, 1).ToArray();
-        if (observable && stride == 1 && pad == 1)
-            ExpectRuns(0);   // released: the direct 3x3 kernel takes stride 1 / pad 1 again
 
         foreach (var got in new[] { pinned, nested, afterInner, released })
         {

@@ -31,7 +31,7 @@ internal static class CpuTopology
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool SetThreadIdealProcessorEx(IntPtr hThread, ref PROCESSOR_NUMBER ideal, IntPtr previous);
     [DllImport("kernel32.dll")]
-    private static extern void GetCurrentProcessorNumberEx(out PROCESSOR_NUMBER number);
+    private static extern bool GetThreadGroupAffinity(IntPtr hThread, out GROUP_AFFINITY affinity);
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool GetProcessAffinityMask(IntPtr hProcess, out nuint processMask, out nuint systemMask);
     [DllImport("kernel32.dll")]
@@ -148,7 +148,7 @@ internal static class CpuTopology
     }
 
     /// <summary>
-    /// The first logical processor of each physical core in the calling thread's processor group that the
+    /// The first logical processor of each physical core in the calling thread's primary processor group that the
     /// process may run on, in core order. Empty on non-Windows or on failure.
     /// </summary>
     [MethodImpl(Hot)]
@@ -157,15 +157,16 @@ internal static class CpuTopology
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return Array.Empty<(ushort, byte)>();
         try
         {
-            GetCurrentProcessorNumberEx(out var here);
+            if (!GetThreadGroupAffinity(GetCurrentThread(), out var primary)) return Array.Empty<(ushort, byte)>();
             ulong allowed = ulong.MaxValue;
-            // The process mask describes the primary group only; elsewhere every processor is allowed.
+            // With the current-process pseudo-handle, the mask describes the calling thread's
+            // primary group, which can differ from the group where it is currently running.
             if (GetProcessAffinityMask(GetCurrentProcess(), out var processMask, out _) && processMask != 0)
                 allowed = (ulong)processMask;
             var list = new List<(ushort, byte)>();
             foreach (var core in DetectPhysicalCores())
             {
-                if (core.Group != here.Group) continue;
+                if (core.Group != primary.Group) continue;
                 ulong usable = core.Mask & allowed;
                 if (usable == 0) continue;
                 list.Add((core.Group, (byte)System.Numerics.BitOperations.TrailingZeroCount(usable)));
@@ -212,19 +213,23 @@ internal static class CpuTopology
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return false;
         try
         {
-            GetCurrentProcessorNumberEx(out var here);
+            if (!GetThreadGroupAffinity(GetCurrentThread(), out var primary)) return false;
             ulong groupMask = 0;
-            foreach (var core in DetectPhysicalCores().Where(c => c.Group == here.Group))
+            foreach (var core in DetectPhysicalCores().Where(c => c.Group == primary.Group))
                 groupMask |= core.Mask;
-            if (groupMask == 0 || !GetProcessAffinityMask(GetCurrentProcess(), out var processMask, out _)) return false;
+            if (groupMask == 0 || !GetProcessAffinityMask(GetCurrentProcess(), out var processMask, out var systemMask)) return false;
             // Zero: the process already has threads in more than one group (documented for GetProcessAffinityMask).
-            return processMask == 0 || ((ulong)processMask & groupMask) == groupMask;
+            return IsUnrestrictedAffinity((ulong)processMask, (ulong)systemMask, groupMask);
         }
         catch (Exception ex) when (ex is DllNotFoundException || ex is EntryPointNotFoundException)
         {
             return false;
         }
     }
+
+    // Both zero masks mean the process already spans groups; a failed native call is rejected above.
+    internal static bool IsUnrestrictedAffinity(ulong processMask, ulong systemMask, ulong groupMask) =>
+        (processMask == 0 && systemMask == 0) || (groupMask != 0 && (processMask & groupMask) == groupMask);
 
     /// <summary>
     /// Sets the calling thread's ideal processor: a scheduling hint, not a restriction. The scheduler

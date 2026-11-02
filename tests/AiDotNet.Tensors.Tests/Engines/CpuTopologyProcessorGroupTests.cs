@@ -41,6 +41,17 @@ public class CpuTopologyProcessorGroupTests
         Assert.Equal(spans ? own.Length + otherGroupCores : own.Length, all.Length);
     }
 
+    [Theory]
+    [InlineData(0UL, 0UL, 255UL, true)]
+    [InlineData(255UL, 255UL, 255UL, true)]
+    [InlineData(85UL, 255UL, 255UL, false)]
+    [InlineData(0UL, 255UL, 255UL, false)]
+    [InlineData(255UL, 255UL, 0UL, false)]
+    public void AffinityRequiresAllLogicalProcessorsOrMultiGroupZeroMasks(ulong process, ulong system, ulong group, bool expected)
+    {
+        Assert.Equal(expected, CpuTopology.IsUnrestrictedAffinity(process, system, group));
+    }
+
     [Fact]
     public void SpanGroupsKillSwitchKeepsTheOwnGroup()
     {
