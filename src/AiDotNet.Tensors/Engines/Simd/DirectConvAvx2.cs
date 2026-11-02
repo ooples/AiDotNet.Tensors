@@ -40,9 +40,12 @@ internal static partial class DirectConvAvx2
     private const int OutputBlocksPerTile = 4;
 
     // Enough tasks to keep the pool busy without splitting a tile's weight stream into slivers.
+    private const int DefaultForwardTasks = 128;
+
     // Forward tasks when the caller names none (AIDOTNET_DIRECT_CONV_FWD_TASKS overrides, for A/B).
     private static readonly int TargetForwardTasks =
-        int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_DIRECT_CONV_FWD_TASKS"), out int fwdTasks) && fwdTasks > 0 ? fwdTasks : 128;
+        int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_DIRECT_CONV_FWD_TASKS"), out int fwdTasks) && fwdTasks > 0
+            ? fwdTasks : DefaultForwardTasks;
 
     // Backward weights needs one (output block, input block) pair per task; fewer pairs than this starve the pool.
     private const int MinBackwardKernelTasks = 16;

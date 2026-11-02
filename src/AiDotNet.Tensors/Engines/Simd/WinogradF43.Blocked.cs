@@ -28,7 +28,8 @@ internal static unsafe partial class WinogradF43
     /// <summary>Whether narrow layers run blocked (AIDOTNET_WINOGRAD_BLOCKED=0 turns it off).</summary>
     internal static bool s_blockedNarrow = s_blockedEnv != "0";
 
-    /// <summary>Fewest input and output channels the batch-wide passes take; narrower layers run blocked.</summary>
+    /// <summary>Channel bound of the batch-wide passes: with narrow blocking on, a layer with fewer than this many channels
+    /// on either side, or no more than this many on both (64 -> 64), runs blocked; wider layers run batch-wide.</summary>
     private const int MinUnblockedChannels = 64;
 
     /// <summary>Fewest input and output channels the blocked form takes (fewer: the transforms outweigh the saving).</summary>
@@ -48,7 +49,8 @@ internal static unsafe partial class WinogradF43
     internal static bool s_old = Environment.GetEnvironmentVariable("AIDOTNET_WINOGRAD_OLD") == "1";
     internal static bool UseBlocked(int cIn, int cOut)
         => s_forceBlockedForTest || (s_blockedNarrow && (Math.Min(cIn, cOut) < MinUnblockedChannels
-                                                        || (!s_old && Math.Max(cIn, cOut) <= MinUnblockedChannels)));
+                                                        || (s_old ? false : false)
+                                                        || Math.Max(cIn, cOut) <= MinUnblockedChannels));
 
     /// <summary>y [N, cOut, H, W] (=, or +=) from x [N, cIn, H, W] through the transformed weights u [36][cIn][cOut].</summary>
     private static void RunBlocked(float[] x, int xOff, float[] u, float[] y, int yOff, bool accumulate,
@@ -263,6 +265,13 @@ internal static unsafe partial class WinogradF43
     private static void BlockGemm(float* a, int aRow, int aStep, float* b, float* c, int rows, int depth, int cols,
         bool accumulate)
     {
+#if NET9_0_OR_GREATER
+        if (UseBlockGemm512)
+        {
+            BlockGemm512(a, aRow, aStep, b, c, rows, depth, cols, accumulate);
+            return;
+        }
+#endif
         for (int i = 0; i < rows; i += 3)
         {
             int live = Math.Min(3, rows - i);

@@ -108,16 +108,28 @@ internal static unsafe partial class WinogradF43
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
         => Applies(batch, inChannels, outChannels, height, width, kernelH, kernelW, strideH, strideW, padH, padW,
                dilationH, dilationW, s_minBackwardPatches)
-           && (UsesBlockedWeightGradient(inChannels, outChannels)
+           && ((UsesBlockedWeightGradient(inChannels, outChannels)
+                && (long)batch * ((height + Tile - 1) / Tile) * ((width + Tile - 1) / Tile) >= BlockedWeightGradientMinPatches)
                || ((long)inChannels * outChannels >= 64L * (inChannels + outChannels)
                    && WeightGradientWorkspaceFloats(batch, inChannels, outChannels, height, width) <= MaxWeightGradientWorkspaceFloats));
 
     /// <summary>Whether the weight gradient runs patch-blocked (<see cref="BackwardKernelBlocked"/>): layers the blocked
     /// forward takes with at least 32 channels each side. Its workspace is a fixed number of 36 x C x K partials, not
-    /// the batch-wide V and D, so neither the C K rule nor the workspace cap applies. In-process A/B (four threads, batch
-    /// 8, 64 -> 64): on 32x32 planes 1.0-1.5 ms against the direct kernel's 1.2-2.3 on Xeon 6973P, 8573C and EPYC 9V45.</summary>
+    /// the batch-wide V and D, so neither the C K rule nor the workspace cap applies. In-process A/B against the direct
+    /// kernel (four threads, 64 -> 64, ms): batch 8 on 32x32 planes 1.57 vs 2.14 on Xeon 8573C, 1.67 vs 2.35 on 6975P,
+    /// 1.62 vs 2.94 on EPYC 9V74, 1.25 vs 1.25 on 9V45; batch 8 on 56x56 3.9 vs 11.0 (8573C) and 2.65 vs 9.25 (9V45);
+    /// batch 32 on 56x56 15.3 vs 142 (8573C).</summary>
     internal static bool UsesBlockedWeightGradient(int inChannels, int outChannels)
-        => !s_old && UseBlocked(inChannels, outChannels) && Math.Min(inChannels, outChannels) >= 32;
+        => !s_old && UseBlocked(inChannels, outChannels) && Math.Min(inChannels, outChannels) >= BlockedWeightGradientMinChannels;
+
+    /// <summary>Fewest channels on either side the blocked weight gradient takes (32 -> 64 on 32x32 planes ran 0.87-0.92
+    /// ms against the direct kernel's 1.06-1.48 on Xeon 8573C, 6975P and EPYC 9V74); narrower layers stay direct.</summary>
+    internal const int BlockedWeightGradientMinChannels = 32;
+
+    /// <summary>Fewest patches the blocked weight gradient takes: at 128 (64 -> 64 on 16x16 planes, batch 8) each split
+    /// holds one band and its partial costs as much as the band's multiplies; it ran 0.39 ms against the direct kernel's
+    /// 0.32 on EPYC 9V45 and 0.55 against 0.52 on Xeon 8573C.</summary>
+    internal const int BlockedWeightGradientMinPatches = 256;
 
     /// <summary>The most floats <see cref="BackwardKernel"/> may hold at once: 2^27, 512 MiB. A ResNet 64 -> 64 layer on
     /// 56x56 planes at batch 128 needs 116M and stays under it.</summary>

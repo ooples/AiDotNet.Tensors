@@ -28,7 +28,11 @@ public class IntoOpsWriteThroughTests
     private static void AssertSame(Tensor<float> expected, Tensor<float> actual)
     {
         Assert.Equal(expected.Shape.ToArray(), actual.Shape.ToArray());
-        for (int i = 0; i < expected.Length; i++) Assert.Equal(expected[i], actual[i], 4);
+        // A tolerance, not Assert.Equal's rounding to 4 places: the two routes may sum in different orders, and
+        // 0.548149943 vs 0.548150003 round to different fourth decimals.
+        for (int i = 0; i < expected.Length; i++)
+            Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-5f * (1 + Math.Abs(expected[i])),
+                $"[{i}] expected {expected[i]}, got {actual[i]}");
     }
 
     [Fact]
