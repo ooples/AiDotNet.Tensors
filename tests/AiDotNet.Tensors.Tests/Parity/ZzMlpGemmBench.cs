@@ -26,7 +26,7 @@ public class ZzMlpGemmBench
 
     private void Line(string s) { _o.WriteLine(s); Console.WriteLine(s); }
 
-    private static (double Min, double Med) Time(Action run)
+    private static (double Min, double Med) Measure(Action run)
     {
         var sw0 = Stopwatch.StartNew(); while (sw0.ElapsedMilliseconds < 250) run();
         var t = new List<double>();
@@ -56,9 +56,9 @@ public class ZzMlpGemmBench
             float[] x = Rand(rng, m * k), w = Rand(rng, k * n), dy = Rand(rng, m * n), b = Rand(rng, n);
             float[] dw = new float[k * n], dx = new float[m * k];
             var xt = new Tensor<float>(x, new[] { m, k }); var wt = new Tensor<float>(w, new[] { k, n }); var bt = new Tensor<float>(b, new[] { n });
-            var f = Time(() => engine.FusedLinear(xt, wt, bt, FusedActivationType.ReLU));
-            var gw = Time(() => BackwardFunctions<float>.BackwardGemmWeightGradient(x, dy, dw, m, k, n));
-            var gx = Time(() => BackwardFunctions<float>.BackwardGemmInputGradient(dy, w, dx, m, k, n));
+            var f = Measure(() => engine.FusedLinear(xt, wt, bt, FusedActivationType.ReLU));
+            var gw = Measure(() => BackwardFunctions<float>.BackwardGemmWeightGradient(x, dy, dw, m, k, n));
+            var gx = Measure(() => BackwardFunctions<float>.BackwardGemmInputGradient(dy, w, dx, m, k, n));
             Line($"ZM {k}->{n} fwd {f.Min:F4}/{f.Med:F4}  dW {gw.Min:F4}/{gw.Med:F4}  dX {gx.Min:F4}/{gx.Med:F4}");
         }
         ZzDeepConvBenchTorch.Run(_o, "tools/parity/zz_mlp_torch.py", threads);
