@@ -43,30 +43,52 @@ internal static unsafe partial class WinogradF43
     // Operator opt-out (A/B switch).
     private static readonly bool s_env = Environment.GetEnvironmentVariable("AIDOTNET_CONV_WINOGRAD") != "0";
 
-    /// <summary>Fewest patches (batch x tiles) the transform-domain GEMMs take: below it the weight transform (36 x C x K
-    /// values) outweighs the multiplies saved, and the direct kernel stays.</summary>
-    internal static int s_minPlane = 8;
+    /// <summary>
+    /// Fewest patches (batch x tiles) the forward's transform-domain GEMMs take: below it the direct kernel stays. 128
+    /// where a full-rate 512-bit unit runs the direct kernel (<see cref="DirectKernelIsFullRate512"/>), 32 elsewhere
+    /// (AIDOTNET_WINOGRAD_MIN_PATCHES overrides). ResNet-18 256 -> 256 on 8x8 planes at batch 8 (32 patches), in-process
+    /// A/B at four threads, F(4x4) vs direct: EPYC 7763 (256-bit) 2.47-2.55 vs 3.54-3.72 ms, EPYC 9V74 (Zen 4, half-rate
+    /// 512-bit) 2.09-2.10 vs 2.87, but EPYC 9V45 (Zen 5, full-rate) 1.38-1.46 vs 1.29-1.33.
+    /// </summary>
     internal static int s_minPatches =
-        int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_WINOGRAD_MIN_PATCHES"), out int minPatches) && minPatches > 0 ? minPatches : 128;
+        int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_WINOGRAD_MIN_PATCHES"), out int minPatches) && minPatches > 0
+            ? minPatches : DirectKernelIsFullRate512 ? FullRateMinPatches : s_minBackwardPatchesDefault;
+
+    /// <summary>The forward's patch floor where <see cref="DirectKernelIsFullRate512"/>.</summary>
+    internal const int FullRateMinPatches = 128;
+
+    private const int s_minBackwardPatchesDefault = 32;
+
+    /// <summary>Whether every patch floor is at its default (no AIDOTNET_WINOGRAD_MIN_PATCHES or
+    /// AIDOTNET_WINOGRAD_MIN_BACKWARD_PATCHES).</summary>
+    internal static bool PatchFloorsAreDefault
+        => Environment.GetEnvironmentVariable("AIDOTNET_WINOGRAD_MIN_PATCHES") is null
+           && Environment.GetEnvironmentVariable("AIDOTNET_WINOGRAD_MIN_BACKWARD_PATCHES") is null;
 
     /// <summary>Fewest patches the input and weight gradients take. Lower than the forward's: the direct backward kernels
     /// cost more than the direct forward, so the transforms pay off sooner (ResNet-18 256 -> 256 on 8x8 planes at batch 8,
     /// 32 patches, ran the input gradient in 0.55-0.85x and the weight gradient in 0.5-0.7x the direct kernels' time on
     /// four EPYC hosts, where the forward ran up to 1.8x slower).</summary>
     internal static readonly int s_minBackwardPatches =
-        int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_WINOGRAD_MIN_BACKWARD_PATCHES"), out int minBackward) && minBackward > 0 ? minBackward : 32;
+        int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_WINOGRAD_MIN_BACKWARD_PATCHES"), out int minBackward) && minBackward > 0 ? minBackward : s_minBackwardPatchesDefault;
 
     /// <summary>
     /// Fewest patches the input gradient takes: <see cref="s_minBackwardPatches"/>, except 64 where a full-rate 512-bit
-    /// unit runs the direct kernel (<see cref="CpuMicroarchitecture.FullRateVector512"/>). Its 12-position forward tile
+    /// unit runs the direct kernel (<see cref="DirectKernelIsFullRate512"/>). Its 12-position forward tile
     /// runs the turned-kernel convolution faster than F(4x4) at 32 patches (ResNet-18 256 -> 256 on 8x8 planes, batch 8,
     /// in-process A/B at four threads: 1.76 ms direct against 2.12 Winograd on Xeon 8573C, 2.02 against 2.16 on 6973P,
     /// 1.28 against 1.39 on EPYC 9V45), but not on Zen 4's half-rate unit (2.89 against 2.08 on EPYC 9V74) or the 256-bit
     /// kernel. An explicit AIDOTNET_WINOGRAD_MIN_BACKWARD_PATCHES keeps both gradients on one floor.
     /// </summary>
     internal static int s_minInputGradientPatches =
-        Environment.GetEnvironmentVariable("AIDOTNET_WINOGRAD_MIN_BACKWARD_PATCHES") is null && CpuMicroarchitecture.FullRateVector512
+        Environment.GetEnvironmentVariable("AIDOTNET_WINOGRAD_MIN_BACKWARD_PATCHES") is null && DirectKernelIsFullRate512
             ? FullRateInputGradientMinPatches : s_minBackwardPatches;
+
+    /// <summary>Whether the direct forward and input gradient run their 512-bit tile on a full-rate unit: the host is
+    /// <see cref="CpuMicroarchitecture.FullRateVector512"/> and <see cref="DirectConvAvx2.UsesAvx512Kernel"/> (.NET 9+,
+    /// AIDOTNET_DIRECT_CONV_AVX512 not 0). Otherwise the direct kernel runs 256-bit or half-rate and F(4x4) takes
+    /// fewer patches.</summary>
+    internal static bool DirectKernelIsFullRate512 => CpuMicroarchitecture.FullRateVector512 && DirectConvAvx2.UsesAvx512Kernel;
 
     /// <summary>The input gradient's patch floor where <see cref="CpuMicroarchitecture.FullRateVector512"/>.</summary>
     internal const int FullRateInputGradientMinPatches = 64;
@@ -81,17 +103,17 @@ internal static unsafe partial class WinogradF43
     internal static bool Applies(int batch, int inChannels, int outChannels, int height, int width, int kernelH, int kernelW,
         int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
         => Applies(batch, inChannels, outChannels, height, width, kernelH, kernelW, strideH, strideW, padH, padW,
-            dilationH, dilationW, s_minPatches);
+            dilationH, dilationW, s_minPatches, allowFewPatches: true);
 
     /// <summary>Whether this kernel takes the input gradient (dY convolved with the turned kernel, dY's channels as the
     /// input's): <see cref="Applies"/> with <see cref="s_minInputGradientPatches"/> as the patch floor.</summary>
     internal static bool AppliesToInputGradient(int batch, int inChannels, int outChannels, int height, int width,
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
         => Applies(batch, inChannels, outChannels, height, width, kernelH, kernelW, strideH, strideW, padH, padW,
-            dilationH, dilationW, s_minInputGradientPatches);
+            dilationH, dilationW, s_minInputGradientPatches, allowFewPatches: true);
 
     private static bool Applies(int batch, int inChannels, int outChannels, int height, int width, int kernelH, int kernelW,
-        int strideH, int strideW, int padH, int padW, int dilationH, int dilationW, int minPatches)
+        int strideH, int strideW, int padH, int padW, int dilationH, int dilationW, int minPatches, bool allowFewPatches)
     {
         if (s_disable || !s_env || DirectConvAvx2.SuppressedOnThisThread || !Avx2.IsSupported || !Fma.IsSupported) return false;
         if (kernelH != 3 || kernelW != 3 || strideH != 1 || strideW != 1 || padH != 1 || padW != 1
@@ -99,9 +121,10 @@ internal static unsafe partial class WinogradF43
         int minChannels = s_blockedNarrow || s_forceBlockedForTest ? MinBlockedChannels : s_minChannels;
         if (inChannels % 8 != 0 || outChannels % 8 != 0 || inChannels < minChannels || outChannels < minChannels
             || batch <= 0) return false;
-        if (height < s_minPlane || width < s_minPlane) return false;
         long patches = (long)batch * ((height + 3) / 4) * ((width + 3) / 4);
-        if (patches < minPatches) return false;
+        // Below the floors only the few-patch form (RunFewPatches) takes it.
+        if ((height < 8 || width < 8 || patches < minPatches)
+            && !(allowFewPatches && UsesFewPatches(inChannels, outChannels, height, width, patches))) return false;
         // V and M stay addressable with int offsets.
         return (long)Points * patches * Math.Max(inChannels, outChannels) <= int.MaxValue
             && (long)Points * inChannels * outChannels <= int.MaxValue;
@@ -123,7 +146,7 @@ internal static unsafe partial class WinogradF43
     internal static bool AppliesToWeightGradient(int batch, int inChannels, int outChannels, int height, int width,
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
         => Applies(batch, inChannels, outChannels, height, width, kernelH, kernelW, strideH, strideW, padH, padW,
-               dilationH, dilationW, s_minBackwardPatches)
+               dilationH, dilationW, s_minBackwardPatches, allowFewPatches: false)
            && ((UsesBlockedWeightGradient(inChannels, outChannels)
                 && (long)batch * ((height + Tile - 1) / Tile) * ((width + Tile - 1) / Tile) >= BlockedWeightGradientMinPatches)
                || ((long)inChannels * outChannels >= 64L * (inChannels + outChannels)
@@ -136,7 +159,7 @@ internal static unsafe partial class WinogradF43
     /// 1.62 vs 2.94 on EPYC 9V74, 1.25 vs 1.25 on 9V45; batch 8 on 56x56 3.9 vs 11.0 (8573C) and 2.65 vs 9.25 (9V45);
     /// batch 32 on 56x56 15.3 vs 142 (8573C).</summary>
     internal static bool UsesBlockedWeightGradient(int inChannels, int outChannels)
-        => !s_old && UseBlocked(inChannels, outChannels) && Math.Min(inChannels, outChannels) >= BlockedWeightGradientMinChannels;
+        => UseBlocked(inChannels, outChannels) && Math.Min(inChannels, outChannels) >= BlockedWeightGradientMinChannels;
 
     /// <summary>Fewest channels on either side the blocked weight gradient takes (32 -> 64 on 32x32 planes ran 0.87-0.92
     /// ms against the direct kernel's 1.06-1.48 on Xeon 8573C, 6975P and EPYC 9V74); narrower layers stay direct.</summary>
@@ -354,6 +377,11 @@ internal static unsafe partial class WinogradF43
     {
         int tilesH = (height + Tile - 1) / Tile, tilesW = (width + Tile - 1) / Tile;
         int tiles = tilesH * tilesW, patches = batch * tiles;
+        if (UsesFewPatches(cIn, cOut, height, width, patches))
+        {
+            RunFewPatches(x, xOff, w, wOff, y, yOff, accumulate, batch, cIn, height, width, cOut, inputGradient);
+            return;
+        }
         int vLength = Points * patches * cIn, mLength = Points * patches * cOut, uLength = Points * cIn * cOut;
         float[] u = ArrayPool<float>.Shared.Rent(uLength);
         if (UseBlocked(cIn, cOut))
