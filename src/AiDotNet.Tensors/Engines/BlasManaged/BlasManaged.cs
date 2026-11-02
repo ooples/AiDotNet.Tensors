@@ -932,12 +932,16 @@ public static partial class BlasManaged
 
         // A new default must not invalidate an Auto caller's PackAOnly-compatible constraints.
         // PackBoth needs Nc when blocking is explicit, and its FP64 path cannot split over N.
-        if (strategy == PackingMode.ForcePackBoth
-            && (options.PackingMode == PackingMode.Auto || options.PackingMode == PackingMode.DisableAutotune)
-            && options.PackedA is null && options.PackedB is null && !transB && options.Nc == 0
-            && ((options.Mc > 0 && options.Kc > 0)
-                || (typeof(T) == typeof(double) && options.ParallelismAxis == ParallelismAxis.N)))
-            strategy = PackingMode.ForcePackAOnly;
+        bool usesDefaultStrategy = options.PackingMode is PackingMode.Auto or PackingMode.DisableAutotune;
+        if (strategy == PackingMode.ForcePackBoth && usesDefaultStrategy && !transB)
+        {
+            bool hasPrePack = options.PackedA is not null || options.PackedB is not null;
+            bool packAOnlyBlocking = options.Nc == 0 && options.Mc > 0 && options.Kc > 0;
+            bool fp64NAxis = options.Nc == 0 && typeof(T) == typeof(double)
+                && options.ParallelismAxis == ParallelismAxis.N;
+            if (!hasPrePack && (packAOnlyBlocking || fp64NAxis))
+                strategy = PackingMode.ForcePackAOnly;
+        }
 
 
         // beta=0 fallback for the tuned-strategy family (Streaming / PackAOnly / PackBoth and
