@@ -4121,6 +4121,10 @@ internal static partial class SimdGemm
 
         fixed (float* pAroot = a, pBroot = b, pCroot = c)
         {
+#if NET9_0_OR_GREATER
+            // Where the 512-bit tile runs, one zmm holds every column: half the FMAs, the same chains.
+            if (TrySgemmNarrowN512(pAroot, lda, pBroot, ldb, pCroot, n, m, k, n, clearedOutput)) return;
+#endif
             for (int i = 0; i < mFull; i += Mr)
             {
                 DirectKernelMxNarrow(
