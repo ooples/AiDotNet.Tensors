@@ -312,7 +312,7 @@ internal static partial class DirectConvAvx2
                 var geometry = new ForwardGeometry(batch, gradBlocks, paddedH * paddedW * Block, paddedW, inChannels,
                     tapsH, tapsW, 1, 1, 1, 1, gridH, gridW, (originRow * paddedW + originCol) * Block,
                     height, width, strideH, strideW, ry, rx);
-                int chunks = (geometry.TotalPositions + PositionUnroll - 1) / PositionUnroll;
+                int chunks = (geometry.TotalPositions + StridedShareUnit - 1) / StridedShareUnit;
                 phases.Add((geometry, packedOffset, firstH, tapsH, firstW, tapsW, chunks));
                 packedOffset += outChannels * inChannels * tapsH * tapsW;
             }
@@ -326,20 +326,39 @@ internal static partial class DirectConvAvx2
         {
             PackInput(gradOutput, gradOutputOffset, packedGrad, batch, outChannels, outputHeight, outputWidth, borderH, borderW, paddedH, paddedW);
             int inBlocks = inChannels / Block;
-            CpuParallelSettings.ParallelForOrSerial(0, phases.Count * inBlocks, (long)outChannels * inChannels * kernelHeight * kernelWidth, [MethodImpl(Hot)] (task) =>
-            {
-                var phase = phases[task / inBlocks];
-                PackKernelPhase(kernel, kernelOffset, packedKernel, phase.KernelOffset, task % inBlocks, outChannels, inChannels,
-                    kernelHeight, kernelWidth, phase.FirstH, strideH, phase.TapsH, phase.FirstW, strideW, phase.TapsW);
-            }, deterministicSafe: true);
+            // Every phase's taps, in phase order: source tap, the phase's packed offset, its tap count and the tap's index.
+            int tapEntries = 0;
+            foreach (var phase in phases) tapEntries += phase.TapsH * phase.TapsW;
+            var tapSource = new int[tapEntries];
+            var tapBase = new int[tapEntries];
+            var tapCount = new int[tapEntries];
+            var tapIndex = new int[tapEntries];
+            int entry = 0;
+            foreach (var phase in phases)
+                for (int y = 0; y < phase.TapsH; y++)
+                    for (int x = 0; x < phase.TapsW; x++, entry++)
+                    {
+                        int kh = phase.FirstH + strideH * (phase.TapsH - 1 - y);
+                        tapSource[entry] = kh * kernelWidth + phase.FirstW + strideW * (phase.TapsW - 1 - x);
+                        tapBase[entry] = phase.KernelOffset;
+                        tapCount[entry] = phase.TapsH * phase.TapsW;
+                        tapIndex[entry] = y * phase.TapsW + x;
+                    }
+            CpuParallelSettings.ParallelForOrSerial(0, inBlocks, (long)outChannels * inChannels * kernelHeight * kernelWidth, [MethodImpl(Hot)] (ib) =>
+                PackKernelPhases(kernel, kernelOffset, packedKernel, ib, outChannels, inChannels, kernelHeight * kernelWidth,
+                    tapSource, tapBase, tapCount, tapIndex), deterministicSafe: true);
 
             // Each task runs EVERY phase over the same share of the grid (the same fraction of each phase's positions,
             // so the same images and rows): the phases interleave in dX (stride 2: alternate columns), and as separate
             // tasks up to four cores wrote each dX cache line at different times. The phases write disjoint positions.
             int minChunks = int.MaxValue;
             foreach (var phase in phases) minChunks = Math.Min(minChunks, phase.Chunks);
-            // At least four position triples per phase in a share: shorter runs cost more in setup than they save.
-            int sharesPerTile = Math.Max(1, Math.Min(minChunks / 4, (taskTarget + tiles - 1) / tiles));
+            // At least four position triples per phase in a share: shorter runs cost more in setup than they save. Where
+            // the 512-bit row kernel runs a share holds whole twelves, so no share ends on six-position stubs (a 256 -> 512
+            // 8x8 stride-2 phase has 128 positions; triples cut it into shares the row kernel mostly skipped).
+            int sharesPerTile = StridedShareUnit == PositionUnroll
+                ? Math.Max(1, Math.Min(minChunks / 4, (taskTarget + tiles - 1) / tiles))
+                : Math.Max(1, Math.Min(minChunks, (taskTarget + tiles - 1) / tiles));
             CpuParallelSettings.ParallelForOrSerial(0, tiles * sharesPerTile,
                 (long)batch * height * width * inChannels * outChannels * kernelHeight * kernelWidth / (strideH * strideW),
                 [MethodImpl(Hot)] (task) =>
@@ -364,9 +383,12 @@ internal static partial class DirectConvAvx2
             pool.Return(packedKernel);
         }
     }
-    // Start of share `share` of `shares` over `total` positions, on a PositionUnroll boundary (the last ends at total).
+    // Start of share `share` of `shares` over `total` positions, on a StridedShareUnit boundary (the last ends at total).
     private static int ShareBound(int total, int share, int shares)
-        => share >= shares ? total : Math.Min(total, (int)((long)total * share / shares) / PositionUnroll * PositionUnroll);
+        => share >= shares ? total : Math.Min(total, (int)((long)total * share / shares) / StridedShareUnit * StridedShareUnit);
+
+    // Positions a strided input-gradient share is a multiple of: the 512-bit row kernel's twelve where it runs.
+    private static int StridedShareUnit => UseAvx512Forward && s_useRowKernel512 ? RowPositions512 : PositionUnroll;
 
     /// <summary>Zeroes phase (ry, rx) of every plane: the input positions no kernel tap reaches (a 1x1 stride-2 conv's odd rows).</summary>
     [MethodImpl(Hot)]
@@ -382,36 +404,31 @@ internal static partial class DirectConvAvx2
     }
 
     /// <summary>
-    /// One input block of one strided-dX phase's packed kernel, at <paramref name="packedOffset"/>:
-    /// [I/8][O/8][tapsH][tapsW][8 out][8 in] with sub-kernel tap (y, x)
-    /// = W[o, i, firstH + strideH*(tapsH-1-y), firstW + strideW*(tapsW-1-x)].
+    /// One input block of every strided-dX phase's packed kernel. Phase p's block lies at its packed offset as
+    /// [I/8][O/8][tapsH][tapsW][8 out][8 in], sub-kernel tap (y, x) = W[o, i, firstH + strideH*(tapsH-1-y),
+    /// firstW + strideW*(tapsW-1-x)]. One pass over the kernel: an output channel's eight input channels are 8 x kH x kW
+    /// consecutive floats, read once (into L1) and written to every phase's taps; one phase at a time read the whole
+    /// kernel once per phase (15% of a 256 -> 512 8x8 stride-2 input gradient on a Xeon 8370C).
     /// </summary>
     [MethodImpl(Hot)]
-    private static unsafe void PackKernelPhase(float[] source, int sourceOffset, float[] packed, int packedOffset, int ib,
-        int outChannels, int inChannels, int kernelHeight, int kernelWidth,
-        int firstH, int strideH, int tapsH, int firstW, int strideW, int tapsW)
+    private static unsafe void PackKernelPhases(float[] source, int sourceOffset, float[] packed, int ib,
+        int outChannels, int inChannels, int kernelPlane, int[] tapSource, int[] tapBase, int[] tapCount, int[] tapIndex)
     {
-        int taps = tapsH * tapsW;
         int outBlocks = outChannels / Block;
+        var lanes = Vector256.Create(0, 1, 2, 3, 4, 5, 6, 7) * kernelPlane;
         fixed (float* ps = source)
         fixed (float* pd = packed)
+        fixed (int* src = tapSource, bases = tapBase, counts = tapCount, index = tapIndex)
         {
-            // Destination order (each 8x8 block written contiguously); the lane-outer order it replaces revisited every
-            // destination line eight times, and was 46% of a 256->512 8x8 stride-2 input gradient (one thread).
-            float* d = pd + packedOffset + (long)ib * outBlocks * taps * Block * Block;
-            int kernelPlane = kernelHeight * kernelWidth;
             for (int ob = 0; ob < outBlocks; ob++)
-                for (int y = 0; y < tapsH; y++)
+                for (int oo = 0; oo < Block; oo++)
                 {
-                    int kh = firstH + strideH * (tapsH - 1 - y);
-                    for (int x = 0; x < tapsW; x++)
+                    float* row = ps + sourceOffset + ((long)(ob * Block + oo) * inChannels + ib * Block) * kernelPlane;
+                    for (int e = 0; e < tapSource.Length; e++)
                     {
-                        int tap = kh * kernelWidth + firstW + strideW * (tapsW - 1 - x);
-                        for (int oo = 0; oo < Block; oo++)
-                        {
-                            float* s = ps + sourceOffset + ((long)(ob * Block + oo) * inChannels + ib * Block) * kernelPlane + tap;
-                            for (int lane = 0; lane < Block; lane++) *d++ = s[lane * kernelPlane];
-                        }
+                        long block = ((long)ib * outBlocks + ob) * counts[e] + index[e];
+                        float* d = pd + bases[e] + block * Block * Block + oo * Block;
+                        Avx.Store(d, Avx2.GatherVector256(row + src[e], lanes, 4));
                     }
                 }
         }
