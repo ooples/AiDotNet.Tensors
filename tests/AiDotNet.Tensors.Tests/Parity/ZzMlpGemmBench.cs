@@ -66,6 +66,11 @@ public class ZzMlpGemmBench
             var cached = Measure(() => AiDotNet.Tensors.Engines.Simd.SimdGemm.SgemmWithCachedB(x, w, o, mm, k, n));
             var blas = Measure(() => AiDotNet.Tensors.Helpers.BlasProvider.Gemm(mm, n, k, x, 0, k, w, 0, n, o, 0, n));
             var simd = Measure(() => { o.AsSpan().Clear(); AiDotNet.Tensors.Engines.Simd.SimdGemm.Sgemm(x.AsSpan(0, mm * k), k, false, w.AsSpan(0, k * n), n, false, o.AsSpan(0, mm * n), mm, k, n); });
+            float[] dyR = Rand(rng, mm * n), dwR = new float[k * n];
+            var dwCur = Measure(() => BackwardFunctions<float>.BackwardGemmWeightGradient(x, dyR, dwR, mm, k, n));
+            var dwSimd = Measure(() => AiDotNet.Tensors.Engines.Simd.SimdGemm.Sgemm(x.AsSpan(0, mm * k), k, true, dyR.AsSpan(0, mm * n), n, false, dwR.AsSpan(0, k * n), k, mm, n));
+            var dwAuto = Measure(() => AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(x, k, true, dyR, n, false, dwR.AsSpan(0, k * n), n, k, n, mm));
+            Line($"ZM dWroute m{mm} {k}->{n} current {dwCur.Min:F4}/{dwCur.Med:F4}  sgemmT {dwSimd.Min:F4}/{dwSimd.Med:F4}  blasAuto {dwAuto.Min:F4}/{dwAuto.Med:F4}");
             Line($"ZM route m{mm} {k}->{n} cachedB {cached.Min:F4}/{cached.Med:F4}  blas {blas.Min:F4}/{blas.Med:F4}  sgemm {simd.Min:F4}/{simd.Med:F4}");
         }
         ZzDeepConvBenchTorch.Run(_o, "tools/parity/zz_mlp_torch.py", threads);
