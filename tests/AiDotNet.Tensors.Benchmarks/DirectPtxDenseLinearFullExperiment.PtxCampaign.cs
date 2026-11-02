@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 #pragma warning disable AIDEVO005 // AiDotNet.Evolution.Ptx is experimental; this campaign driver is its consumer.
 using System.Text.Json;
 using AiDotNet.Evolution;
@@ -156,6 +157,10 @@ internal static partial class DirectPtxDenseLinearFullExperiment
             // about 3,250 lines, but the bound follows the incumbent actually tuned: a BlockK 32, 8x16 thread tile emits
             // 4,096 FMA lines alone. Twice its line count (at least 4,096) leaves room for a rewrite that grows it.
             MaxInputTokens = Math.Max(4_096, 2 * incumbent.Split('\n').Length) * 192,
+            // The CLI reports the model's reasoning as output tokens: on the 2048^3 campaign three of four parsed
+            // replies ran to 16.5k-21.5k tokens and were discarded at the 16,384 default after they had been paid for.
+            // The dollar caps bound the spend; this bound only has to admit a full reply.
+            MaxOutputTokens = session.Arg("max-output-tokens", 65_536),
         };
         var ledger = new EvolutionResourceLedger("ptx-campaign-" + session.Target,
             new EvolutionResources(new[] { new KeyValuePair<string, decimal>("cost_units", 1_000_000m) }));
@@ -206,6 +211,7 @@ internal static partial class DirectPtxDenseLinearFullExperiment
             // Attempts include requests refused for budget, which never started the CLI; failures are calls that did.
             call_attempts = client.Attempts, calls_refused_for_budget = client.RefusedForBudget,
             calls_failed = client.Failed,
+            call_failures = client.FailureMessages,
             max_usd = maxUsd, max_usd_per_call = maxUsdPerCall,
             // Charged: each call's reported total_cost_usd, or its whole cap when the CLI reported none.
             usd_spent = claude.SpentUsd,
@@ -574,6 +580,7 @@ internal static partial class DirectPtxDenseLinearFullExperiment
         private readonly ClaudeCodeChatClient _inner;
         private readonly decimal _totalBudgetUsd;
         private int _attempts, _refused, _failed;
+        private readonly ConcurrentQueue<string> _failures = new();
 
         public CountingChatClient(ClaudeCodeChatClient inner, decimal totalBudgetUsd)
         {
@@ -585,6 +592,8 @@ internal static partial class DirectPtxDenseLinearFullExperiment
         public int Attempts => Volatile.Read(ref _attempts);
         public int RefusedForBudget => Volatile.Read(ref _refused);
         public int Failed => Volatile.Read(ref _failed);
+        /// <summary>Type and message of every call that threw, in order, so a campaign record says why a paid call failed.</summary>
+        public string[] FailureMessages => _failures.ToArray();
 
         public async Task<ProgramChatResponse> GetResponseAsync(IReadOnlyList<ProgramChatMessage> messages,
             ProgramChatOptions options, CancellationToken cancellationToken)
@@ -595,9 +604,11 @@ internal static partial class DirectPtxDenseLinearFullExperiment
             {
                 return await _inner.GetResponseAsync(messages, options, cancellationToken).ConfigureAwait(false);
             }
-            catch (Exception) when (!cancellationToken.IsCancellationRequested)
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
             {
                 Interlocked.Increment(ref exhausted ? ref _refused : ref _failed);
+                string message = ex.GetType().Name + ": " + ex.Message;
+                _failures.Enqueue(message.Length > 2_000 ? message.Substring(0, 2_000) : message);
                 throw;
             }
         }
