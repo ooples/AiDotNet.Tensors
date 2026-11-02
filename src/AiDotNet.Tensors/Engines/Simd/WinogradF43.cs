@@ -45,7 +45,7 @@ internal static unsafe partial class WinogradF43
 
     /// <summary>Fewest patches (batch x tiles) the transform-domain GEMMs take: below it the weight transform (36 x C x K
     /// values) outweighs the multiplies saved, and the direct kernel stays.</summary>
-    internal static readonly int s_minPatches =
+    internal static int s_minPatches =
         int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_WINOGRAD_MIN_PATCHES"), out int minPatches) && minPatches > 0 ? minPatches : 128;
 
     /// <summary>Fewest patches the input and weight gradients take. Lower than the forward's: the direct backward kernels

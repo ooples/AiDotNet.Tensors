@@ -32,10 +32,26 @@ public class ZzDeepConvBench
         var engine = new CpuEngine();
         var rng = new Random(5);
         var all = DirectConvAvx2.EnabledPasses;
+        int minP = WinogradF43.s_minPatches;
+        foreach (var (m, k, n) in new[] { (512, 4608, 128), (256, 2304, 512), (512, 2304, 128), (128, 1152, 2048) })
+        {
+            var a = Rand(rng, m, k); var bb = Rand(rng, k, n); var c = new Tensor<float>(new[] { m, n });
+            var sw0 = Stopwatch.StartNew(); while (sw0.ElapsedMilliseconds < 250) engine.MatMulInto(c, a, bb);
+            var t = new List<double>();
+            for (int round = 0; round < 15; round++)
+            {
+                double best = double.MaxValue;
+                for (int i = 0; i < 3; i++) { var sw = Stopwatch.StartNew(); engine.MatMulInto(c, a, bb); best = Math.Min(best, sw.Elapsed.TotalMilliseconds); }
+                t.Add(best);
+            }
+            t.Sort();
+            var ml = $"ZM {m}x{k}x{n}  ours {t[0]:F3}/{t[t.Count / 2]:F3}"; _o.WriteLine(ml); Console.WriteLine(ml);
+        }
         var variants = new (string Name, Action Set)[]
         {
-            ("cur", () => { DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = false; }),
-            ("nowino", () => { DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = true; }),
+            ("cur", () => { DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = false; WinogradF43.s_minPatches = minP; }),
+            ("wino32", () => { DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = false; WinogradF43.s_minPatches = 32; }),
+            ("nowino", () => { DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = true; WinogradF43.s_minPatches = minP; }),
             ("gemm", () => { DirectConvAvx2.EnabledPasses = DirectConvPasses.None; WinogradF43.s_disable = true; }),
         };
         var convs = new (int Cin, int Cout, int Hw, int S)[]
@@ -76,7 +92,7 @@ public class ZzDeepConvBench
                 _o.WriteLine(line); Console.WriteLine(line);
             }
         }
-        DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = false;
+        DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = false; WinogradF43.s_minPatches = minP;
         Torch();
     }
 
