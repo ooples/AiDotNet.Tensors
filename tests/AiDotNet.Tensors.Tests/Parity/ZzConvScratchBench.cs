@@ -38,12 +38,11 @@ public class ZzConvScratchBench
             ("direct", () => { WinogradF43.s_wgradAny = false; WinogradF43.s_disable = true; WinogradF43.s_forceBlockedForTest = false; }),
             ("blocked", () => { WinogradF43.s_wgradAny = false; WinogradF43.s_disable = false; WinogradF43.s_forceBlockedForTest = true; }),
         };
-        foreach (var (c, hw) in new[] { (64, 32), (128, 16), (256, 8) })
+        foreach (var (c, k, hw, b) in new[] { (64, 64, 32, 8), (64, 64, 32, 32), (64, 128, 32, 8), (128, 64, 32, 8), (64, 64, 56, 8), (96, 96, 16, 8), (64, 64, 16, 8) })
         {
-            int b = 8;
-            var x = Rand(rng, b, c, hw, hw); var w = Rand(rng, c, c, 3, 3); var dy = Rand(rng, b, c, hw, hw);
-            var y = new Tensor<float>(new[] { b, c, hw, hw }); var dx = new Tensor<float>(new[] { b, c, hw, hw });
-            var dw = new Tensor<float>(new[] { c, c, 3, 3 });
+            var x = Rand(rng, b, c, hw, hw); var w = Rand(rng, k, c, 3, 3); var dy = Rand(rng, b, k, hw, hw);
+            var y = new Tensor<float>(new[] { b, k, hw, hw }); var dx = new Tensor<float>(new[] { b, c, hw, hw });
+            var dw = new Tensor<float>(new[] { k, c, 3, 3 });
             int[] s = { 1, 1 }, p = { 1, 1 }, d = { 1, 1 };
             var ops = new (string Name, Action Run)[]
             {
@@ -55,7 +54,7 @@ public class ZzConvScratchBench
             {
                 var times = variants.ToDictionary(v => v.Name, _ => new List<double>());
                 foreach (var v in variants) { v.Set(); var sw0 = Stopwatch.StartNew(); while (sw0.ElapsedMilliseconds < 300) op.Run(); }
-                for (int round = 0; round < 25; round++)
+                for (int round = 0; round < 15; round++)
                     foreach (var v in variants)
                     {
                         v.Set(); op.Run();
@@ -63,7 +62,7 @@ public class ZzConvScratchBench
                         for (int i = 0; i < 5; i++) { var sw = Stopwatch.StartNew(); op.Run(); best = Math.Min(best, sw.Elapsed.TotalMilliseconds); }
                         times[v.Name].Add(best);
                     }
-                string line = $"ZZ {c}->{c} {hw}x{hw} {op.Name,-5}";
+                string line = $"ZZ b{b} {c}->{k} {hw}x{hw} {op.Name,-5}";
                 foreach (var v in variants) { var t = times[v.Name]; t.Sort(); line += $"  {v.Name} {t[0]:F3}/{t[t.Count / 2]:F3}"; }
                 _o.WriteLine(line); Console.WriteLine(line);
             }
