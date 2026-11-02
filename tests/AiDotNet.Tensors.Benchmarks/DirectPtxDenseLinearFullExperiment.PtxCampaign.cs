@@ -133,6 +133,15 @@ internal static partial class DirectPtxDenseLinearFullExperiment
         decimal maxUsdPerCall = Math.Min(session.Usd("max-usd-per-call", "5"), maxUsd);
         if (maxUsdPerCall <= 0) throw new ArgumentOutOfRangeException(nameof(session), "--max-usd-per-call must be positive.");
 
+        // The incumbent must pass its own contract, or the search has no parent and ends before its first proposal.
+        PtxCorrectnessReport seed = correctness.Evaluate(incumbent);
+        session.Emit("seed_check", new
+        {
+            target = session.Target, passed = seed.Passed, verdict = seed.Verdict.ToString(), message = seed.Message,
+            max_abs_error = seed.MaxAbsoluteError, max_rel_error = seed.MaxRelativeError,
+        });
+        if (!seed.Passed) return new CampaignSearch(null, null);
+
         // Proposals: the model rewrites or patches the PTX; every proposal is JIT-checked before it is evaluated.
         var ptxOptions = new PtxProgramEvolutionOptions
         {
@@ -200,6 +209,11 @@ internal static partial class DirectPtxDenseLinearFullExperiment
             max_usd = maxUsd, max_usd_per_call = maxUsdPerCall,
             // Charged: each call's reported total_cost_usd, or its whole cap when the CLI reported none.
             usd_spent = claude.SpentUsd,
+            // Why the run ended, and the failures it kept: a search that made no proposals says why here.
+            stop_reason = run.StopReason.ToString(),
+            counters = JsonSerializer.Serialize(run.Counters),
+            island_statuses = JsonSerializer.Serialize(run.IslandStatuses),
+            retained_failures = run.RetainedFailures.Take(10).Select(f => JsonSerializer.Serialize(f)).ToArray(),
         });
         return new CampaignSearch(best, best?.Evaluation.Quality);
     }
@@ -347,8 +361,10 @@ internal static partial class DirectPtxDenseLinearFullExperiment
             {
                 new PtxShapeSymbol("M", 1, 8192, lattice), new PtxShapeSymbol("N", 1, 8192, lattice), new PtxShapeSymbol("K", 1, 8192, lattice),
             },
+            // An async-copy configuration stages its tiles in dynamic shared memory, sized as PtxSgemmKernel launches it;
+            // launched with none, its first tile store runs past the allocation (CUDA_ERROR_ILLEGAL_ADDRESS).
             new PtxLaunchConfiguration(PtxExtent.Of("N").CeilDiv(config.BlockN), PtxExtent.Of("M").CeilDiv(config.BlockM), null,
-                config.Threads, 1, 1, null),
+                config.Threads, 1, 1, config.IsAsync ? PtxExtent.Constant(config.SharedBytes) : null),
             // Fp32GridTolerance: a different summation order than the fp64-accumulated reference.
             new PtxTolerance(1e-3, Fp32GridTolerance), Shape(m, n, k), validation, fuzzCases: 0, seed: 1159);
 
