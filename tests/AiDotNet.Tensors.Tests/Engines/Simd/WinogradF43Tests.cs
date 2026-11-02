@@ -304,7 +304,7 @@ public class WinogradF43Tests
         Assert.False(WinogradF43.Applies(8, 3, 64, 32, 32, 3, 3, 1, 1, 1, 1, 1, 1));    // 3 input channels
         Assert.True(WinogradF43.Applies(64, 32, 64, 14, 14, 3, 3, 1, 1, 1, 1, 1, 1));   // 32 input channels: blocked
         Assert.False(WinogradF43.Applies(64, 8, 64, 14, 14, 3, 3, 1, 1, 1, 1, 1, 1));   // 8 input channels
-        Assert.Equal(WinogradF43.s_fewMaxPatches >= 32, WinogradF43.Applies(8, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));  // 32 patches: few-patch form
+        Assert.Equal(!fullRate || WinogradF43.s_fewMaxPatches >= 32, WinogradF43.Applies(8, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));  // 32 patches: the normal floor or few-patch form
         Assert.Equal(!fullRate, WinogradF43.Applies(8, 96, 96, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));     // 32 patches, 96 channels: the floor
         Assert.Equal(!fullRate, WinogradF43.Applies(16, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));  // 64 patches
         Assert.False(WinogradF43.Applies(8, 64, 60, 32, 32, 3, 3, 1, 1, 1, 1, 1, 1));   // 60 output channels
@@ -343,8 +343,8 @@ public class WinogradF43Tests
         bool fullRate = WinogradF43.DirectKernelIsFullRate512;
         Assert.Equal(fullRate ? WinogradF43.FullRateInputGradientMinPatches : 32, WinogradF43.s_minInputGradientPatches);
         Assert.Equal(!fullRate, WinogradF43.AppliesToInputGradient(8, 96, 96, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));
-        // 256 channels: the few-patch form takes 32 patches on every host.
-        Assert.Equal(WinogradF43.s_fewMaxPatches >= 32, WinogradF43.AppliesToInputGradient(8, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));
+        // 256 channels: either the normal floor or the few-patch form admits 32 patches.
+        Assert.Equal(!fullRate || WinogradF43.s_fewMaxPatches >= 32, WinogradF43.AppliesToInputGradient(8, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));
         Assert.True(WinogradF43.AppliesToInputGradient(16, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));   // 64 patches
         Assert.True(WinogradF43.AppliesToWeightGradient(8, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));
         // 16 patches: the weight gradient stays direct; the input gradient takes only the few-patch form (wide layers).
@@ -415,6 +415,8 @@ public class WinogradF43Tests
     [InlineData(2, 128, 160, 5, 6, false)]
     [InlineData(3, 160, 128, 4, 4, true)]
     [InlineData(4, 128, 128, 8, 8, true)]
+    [InlineData(3, 136, 128, 4, 4, false)]  // Forward: 16-deep input slabs end in an 8-channel tail.
+    [InlineData(3, 128, 136, 4, 4, true)]   // Input gradient: runtime input channels = 136.
     public void FewPatches512_IsBitIdenticalTo256BitTiles(int n, int c, int k, int h, int w, bool inputGradient)
     {
         Skip.IfNot(KernelRuns, "The Winograd kernel needs AVX2 + FMA.");

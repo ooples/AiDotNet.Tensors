@@ -69,7 +69,7 @@ internal static unsafe partial class WinogradF43
             int patches = (r1 - r0) * tilesW;
             float[] vb = ThreadBuffer(ref t_blockV, Points * maxPatches * cIn);
             float[] mb = ThreadBuffer(ref t_blockM, Points * maxPatches * cOut);
-            float[] tb = ThreadBuffer(ref t_blockTile, Math.Max(inTileFloats, outTileFloats + 64));
+            float[] tb = ThreadBuffer(ref t_blockTile, Math.Max(inTileFloats, outTileFloats + TransposeScratchFloats));
             fixed (float* xp = x, up = u, yp = y, vp = vb, mp = mb, tp = tb)
             {
                 var d = stackalloc Vector256<float>[36];
@@ -103,7 +103,7 @@ internal static unsafe partial class WinogradF43
     }
 
     // Rows rowLo..rowHi of eight output planes (planes, hw floats apart) from a band tp of [rows][outW][8 channels]
-    // (row 0 = rowLo), written or added (accumulate); tmp holds 64 floats.
+    // (row 0 = rowLo), written or added (accumulate); tmp holds TransposeScratchFloats floats.
     private static void StoreOutputRows(float* tp, int outW, float* planes, int rowLo, int rowHi, int width, int hw,
         bool accumulate, float* tmp)
     {

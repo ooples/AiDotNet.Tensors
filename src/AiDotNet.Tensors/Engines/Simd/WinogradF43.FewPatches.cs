@@ -20,6 +20,9 @@ internal static unsafe partial class WinogradF43
     /// <summary>Output channels per few-patch job (two vectors).</summary>
     private const int FewKBlock = 16;
 
+    /// <summary>Floats in the 8x8 transpose scratch shared by the blocked and few-patch output stores.</summary>
+    private const int TransposeScratchFloats = 64;
+
     /// <summary>
     /// Input channels per transformed-weight slab (a multiple of 8): 16 for the 512-bit tiles and 32 for the 256-bit
     /// ones at eight patches (one patch group), twice that past it. A deeper slab spends fewer accumulator loads and
@@ -96,7 +99,7 @@ internal static unsafe partial class WinogradF43
             {
                 int k0 = job * kb;
                 float[] mb = ThreadBuffer(ref t_blockM, mFloats);
-                float[] tb = ThreadBuffer(ref t_blockTile, slabFloats + stageFloats + Math.Max(bandFloats + 64, 0));
+                float[] tb = ThreadBuffer(ref t_blockTile, slabFloats + stageFloats + bandFloats + TransposeScratchFloats);
                 fixed (float* vp = v, wp = w, yp = y, mp = mb, tp = tb)
                 {
                     float* slab = tp, stage = tp + slabFloats, band = stage + stageFloats;
@@ -174,10 +177,16 @@ internal static unsafe partial class WinogradF43
     private static void TransformTaps(float* taps, float* dst, int pointStride, Vector256<float>* g, Vector256<float>* t,
         Vector256<float>* uu)
     {
-        for (int e = 0; e < 9; e++) g[e] = Avx.LoadVector256(taps + e * 8);
+        LoadTaps(taps, g);
         for (int j = 0; j < 3; j++) TransformKernelColumn(g[j], g[3 + j], g[6 + j], t, j, 3);
         for (int i = 0; i < 6; i++) TransformKernelColumn(t[i * 3], t[i * 3 + 1], t[i * 3 + 2], uu, i * 6, 1);
         for (int xi = 0; xi < Points; xi++) Avx.Store(dst + xi * pointStride, uu[xi]);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void LoadTaps(float* taps, Vector256<float>* destination)
+    {
+        for (int e = 0; e < 9; e++) destination[e] = Avx.LoadVector256(taps + e * 8);
     }
 
     // stage [groups][cb][9][8]: the 3x3 taps of input channels c0..c0+cCount for output channels k0..k0+8 groups, eight
@@ -232,10 +241,16 @@ internal static unsafe partial class WinogradF43
     private static void TransformTaps512(float* lo, float* hi, float* dst, int pointStride, Vector512<float>* g,
         Vector512<float>* t, Vector512<float>* uu)
     {
-        for (int e = 0; e < 9; e++) g[e] = Vector512.Create(Vector256.Load(lo + e * 8), Vector256.Load(hi + e * 8));
+        LoadTaps512(lo, hi, g);
         for (int j = 0; j < 3; j++) TransformKernelColumn512(g[j], g[3 + j], g[6 + j], t, j, 3);
         for (int i = 0; i < 6; i++) TransformKernelColumn512(t[i * 3], t[i * 3 + 1], t[i * 3 + 2], uu, i * 6, 1);
         for (int xi = 0; xi < Points; xi++) uu[xi].Store(dst + xi * pointStride);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void LoadTaps512(float* lo, float* hi, Vector512<float>* destination)
+    {
+        for (int e = 0; e < 9; e++) destination[e] = Vector512.Create(Vector256.Load(lo + e * 8), Vector256.Load(hi + e * 8));
     }
 
     // TransformKernelColumn on sixteen lanes (the same operations in the same order).
