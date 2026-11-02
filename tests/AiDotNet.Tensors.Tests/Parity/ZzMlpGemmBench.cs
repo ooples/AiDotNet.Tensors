@@ -71,6 +71,16 @@ public class ZzMlpGemmBench
             var dwSimd = Measure(() => AiDotNet.Tensors.Engines.Simd.SimdGemm.Sgemm(x.AsSpan(0, mm * k), k, true, dyR.AsSpan(0, mm * n), n, false, dwR.AsSpan(0, k * n), k, mm, n));
             var dwAuto = Measure(() => AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(x, k, true, dyR, n, false, dwR.AsSpan(0, k * n), n, k, n, mm));
             Line($"ZM dWroute m{mm} {k}->{n} current {dwCur.Min:F4}/{dwCur.Med:F4}  sgemmT {dwSimd.Min:F4}/{dwSimd.Med:F4}  blasAuto {dwAuto.Min:F4}/{dwAuto.Med:F4}");
+            float[] dxR = new float[mm * k];
+            var dxCur = Measure(() => BackwardFunctions<float>.BackwardGemmInputGradient(dyR, w, dxR, mm, k, n));
+            var dxDis = Measure(() => AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(dyR, n, false, w, n, true, dxR.AsSpan(0, mm * k), k, mm, k, n,
+                new AiDotNet.Tensors.Engines.BlasManaged.BlasOptions<float> { PackingMode = AiDotNet.Tensors.Engines.BlasManaged.PackingMode.DisableAutotune }));
+            var dxAuto = Measure(() => AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(dyR, n, false, w, n, true, dxR.AsSpan(0, mm * k), k, mm, k, n));
+            var wT = new float[n * k];
+            for (int r = 0; r < k; r++) for (int cc = 0; cc < n; cc++) wT[cc * k + r] = w[r * n + cc];
+            var dxPreT = Measure(() => AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(dyR, n, false, wT, k, false, dxR.AsSpan(0, mm * k), k, mm, k, n,
+                new AiDotNet.Tensors.Engines.BlasManaged.BlasOptions<float> { PackingMode = AiDotNet.Tensors.Engines.BlasManaged.PackingMode.DisableAutotune }));
+            Line($"ZM dXroute m{mm} {k}->{n} current {dxCur.Min:F4}/{dxCur.Med:F4}  blasDis {dxDis.Min:F4}/{dxDis.Med:F4}  blasAuto {dxAuto.Min:F4}/{dxAuto.Med:F4}  blasWT {dxPreT.Min:F4}/{dxPreT.Med:F4}");
             Line($"ZM route m{mm} {k}->{n} cachedB {cached.Min:F4}/{cached.Med:F4}  blas {blas.Min:F4}/{blas.Med:F4}  sgemm {simd.Min:F4}/{simd.Med:F4}");
         }
         ZzDeepConvBenchTorch.Run(_o, "tools/parity/zz_mlp_torch.py", threads);
