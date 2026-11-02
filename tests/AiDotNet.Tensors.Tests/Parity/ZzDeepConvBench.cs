@@ -41,15 +41,18 @@ public class ZzDeepConvBench
         var convs = new (int Cin, int Cout, int Hw, int S)[]
         {
             (512, 512, 4, 1), (256, 256, 8, 1), (256, 512, 8, 2), (128, 256, 16, 2), (64, 128, 32, 2), (128, 128, 16, 1),
+            (3, 64, 224, 2), (64, 64, 56, 1), (64, 64, 32, 1),
         };
         const int b = 8;
+        Torch();
         foreach (var c in convs)
         {
-            int o = (c.Hw + 2 - 3) / c.S + 1;
-            var x = Rand(rng, b, c.Cin, c.Hw, c.Hw); var w = Rand(rng, c.Cout, c.Cin, 3, 3); var dy = Rand(rng, b, c.Cout, o, o);
+            int k = c.Cin == 3 ? 7 : 3, pad = c.Cin == 3 ? 3 : 1;
+            int o = (c.Hw + 2 * pad - k) / c.S + 1;
+            var x = Rand(rng, b, c.Cin, c.Hw, c.Hw); var w = Rand(rng, c.Cout, c.Cin, k, k); var dy = Rand(rng, b, c.Cout, o, o);
             var y = new Tensor<float>(new[] { b, c.Cout, o, o }); var dx = new Tensor<float>(x.Shape.ToArray());
             var dw = new Tensor<float>(w.Shape.ToArray());
-            int[] s = { c.S, c.S }, p = { 1, 1 }, d = { 1, 1 };
+            int[] s = { c.S, c.S }, p = { pad, pad }, d = { 1, 1 };
             var ops = new (string Name, Action Run)[]
             {
                 ("fwd", () => engine.Conv2DInto(y, x, w, s, p, d)),
@@ -74,5 +77,20 @@ public class ZzDeepConvBench
             }
         }
         DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = false;
+        Torch();
+    }
+
+    private void Torch()
+    {
+        var py = Environment.GetEnvironmentVariable("PARITY_PYTHON");
+        if (string.IsNullOrEmpty(py)) return;
+        var dir = AppContext.BaseDirectory;
+        while (dir != null && !System.IO.File.Exists(System.IO.Path.Combine(dir, "tools/parity/zz_deep_torch.py"))) dir = System.IO.Path.GetDirectoryName(dir);
+        if (dir == null) return;
+        var psi = new ProcessStartInfo(py, System.IO.Path.Combine(dir, "tools/parity/zz_deep_torch.py")) { RedirectStandardOutput = true, UseShellExecute = false };
+        using var proc = Process.Start(psi)!;
+        string? l;
+        while ((l = proc.StandardOutput.ReadLine()) != null) { _o.WriteLine(l); Console.WriteLine(l); }
+        proc.WaitForExit();
     }
 }

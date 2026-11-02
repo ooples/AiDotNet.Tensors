@@ -303,7 +303,7 @@ jobs:
         run: |
           PERF=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1)
           PERF=${PERF:-perf}
-          $PERF record -F 1000 -g -o "$RUNNER_TEMP/test.perf" -- dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj             --configuration Release --no-build --framework net10.0 --filter "$TESTF" --logger "console;verbosity=detailed" 2>&1 | grep -E 'step ratio|ZZ ' || true
+          $PERF record -F 1000 -g -o "$RUNNER_TEMP/test.perf" -- dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj             --configuration Release --no-build --framework net10.0 --filter "$TESTF" --logger "console;verbosity=detailed" 2>&1 | grep -E 'step ratio|ZZ |ZT ' || true
           {
             echo "## perf test ${TESTF}"
             echo '```'
