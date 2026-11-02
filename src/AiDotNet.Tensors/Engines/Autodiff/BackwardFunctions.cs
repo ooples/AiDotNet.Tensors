@@ -739,10 +739,60 @@ internal static class BackwardFunctions<T>
     // LM head's vocabulary-wide weight gradient, so dW takes SimdGemm only where that split applies.
     private const int BackwardInputGradientSimdMaxN = 4096;
 
+    // dX = dY·Wᵀ through SimdGemm's transposed-B path is a dot-product kernel on AVX2 lanes. Transposing W once
+    // (k·n floats, 1/m of the product) and running the plain NN product reaches the direct kernels instead, which
+    // are 512-bit where the host has AVX-512. In-process on 4-thread runners, min of 25 (ms, current vs
+    // transpose+NN, PyTorch's dY.mm(W.t())):
+    // (layers named in -> out, so n is the out width; m = 128, 64 for 3136 -> 128):
+    //   EPYC 9V45   784->512 0.458 vs 0.261 (0.530), 512->256 0.163 vs 0.108 (0.179), 3136->128 0.239 vs 0.155 (0.283)
+    //   EPYC 9V74   784->512 0.683 vs 0.522 (0.675), 512->256 0.225 vs 0.183 (0.222), 3136->128 0.382 vs 0.332 (0.348)
+    //   EPYC 7763 (AVX2) wins only at reduction depth 512 (0.82-0.90 vs 0.61-0.63, PyTorch 0.78) and on narrow
+    //   heads (n = 10: 0.0128 vs 0.0114); at depth 128 and 256 it loses (0.355 vs 0.41, 0.235 vs 0.27).
+    // The transpose is amortised only over enough rows, hence the m floor.
+    private const int BackwardInputGradientTransposeMinM = 64;
+
+    /// <summary>Test observable: input gradients this thread formed through the transposed-W NN product.</summary>
+    [ThreadStatic] internal static long t_transposedWInputGradientRuns;
+
+    internal static bool BackwardInputGradientPrefersTransposedW(int m, int n)
+    {
+#if NET9_0_OR_GREATER
+        bool vector512 = SimdGemm.UseVector512Direct;
+#else
+        const bool vector512 = false;
+#endif
+        return m >= BackwardInputGradientTransposeMinM
+            && (vector512 || n >= 512 || n <= BackwardNarrowWeightGradientMaxN);
+    }
+
     internal static void BackwardGemmInputGradient(float[] dY, float[] w, float[] dX, int m, int k, int n)
     {
         if (n <= BackwardInputGradientSimdMaxN)
         {
+#if NET9_0_OR_GREATER
+            // AVX-512: the transpose fused into the direct tiles' strip packing (no serial pass over W first).
+            if (m >= BackwardInputGradientTransposeMinM
+                && SimdGemm.TrySgemmDirectParallel2DTransB(dY.AsSpan(0, m * n), w.AsSpan(0, k * n), dX.AsSpan(0, m * k),
+                    m, n, k, allowParallel: SimdGemm.UseParallelGemm))
+                return;
+#endif
+#if NET5_0_OR_GREATER
+            if (BackwardInputGradientPrefersTransposedW(m, n))
+            {
+                t_transposedWInputGradientRuns++;
+                float[] wT = System.Buffers.ArrayPool<float>.Shared.Rent(n * k);
+                try
+                {
+                    SimdTranspose.Transpose(w.AsSpan(0, k * n), wT.AsSpan(0, n * k), k, n);
+                    SimdGemm.Sgemm(dY.AsSpan(0, m * n), n, false, wT.AsSpan(0, n * k), k, false, dX.AsSpan(0, m * k), m, n, k);
+                }
+                finally
+                {
+                    System.Buffers.ArrayPool<float>.Shared.Return(wT);
+                }
+                return;
+            }
+#endif
             SimdGemm.Sgemm(dY.AsSpan(0, m * n), n, false, w.AsSpan(0, k * n), n, true, dX.AsSpan(0, m * k), m, n, k);
             return;
         }
