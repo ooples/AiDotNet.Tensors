@@ -21,6 +21,19 @@ internal static partial class SimdGemm
 
     [ThreadStatic] private static float[]? t_narrowPaddedB;
 
+    // Single-threaded narrow products above this many FMAs leave for the row-parallel dispatcher.
+    private const long NarrowRouteMaxWork = 4L * 1024 * 1024;
+
+    /// <summary>
+    /// Whether a plain row-major <c>[m, k]·[k, n]</c> product with fewer output columns than one 8-wide vector block
+    /// past a multiple of eight (a classifier head's n = 10) should take <see cref="Sgemm(ReadOnlySpan{float}, int, bool, ReadOnlySpan{float}, int, bool, Span{float}, int, int, int)"/>,
+    /// whose narrow route runs <see cref="TrySgemmNarrowN512"/>, instead of the general dispatcher (no JIT or
+    /// direct-tile route for n % 8 != 0). Only where the 512-bit tile runs.
+    /// </summary>
+    internal static bool PrefersNarrowN512(int m, int k, int n)
+        => s_narrow512 && UseVector512Direct && n > 0 && n < Nr && (n & 7) != 0
+           && m >= NarrowRows512 && k <= SmallMatmulKThreshold && (long)m * k * n <= NarrowRouteMaxWork;
+
     /// <summary>
     /// <c>C[m, n] (=|+=) A[m, k] · B[k, n]</c> for n &lt;= 16 on the 512-bit tile: B copied once into a zero-padded
     /// [k][16] buffer (every load unmasked), eight rows of A per block, each element the same FMA chain over k the

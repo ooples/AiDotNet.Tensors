@@ -14665,6 +14665,16 @@ public partial class CpuEngine : ITensorLevelEngine
                                     rArrF.AsSpan(0, m * p), m, n, p);
                 return result;
             }
+#if NET9_0_OR_GREATER
+            // A narrow output (a classifier head's [128x256]·[256x10]) on the 512-bit tile: one zmm per row
+            // instead of the dispatcher's general route for n % 8 != 0.
+            if (Simd.SimdGemm.PrefersNarrowN512(m, n, p))
+            {
+                Simd.SimdGemm.Sgemm(aArrF.Slice(0, m * n), n, false, bArrF.Slice(0, n * p), p, false,
+                                    rArrF.AsSpan(0, m * p), m, n, p);
+                return result;
+            }
+#endif
 #endif
             if (m >= BlasManagedParallelMinM)
             {
