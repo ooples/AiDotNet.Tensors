@@ -245,6 +245,9 @@ public class WinogradF43Tests
     public void Applies_OnlyTo3x3Stride1Padding1_WithChannelMultiplesOfEight()
     {
         Skip.IfNot(WinogradRoutes, "Winograd routing needs AVX2 + FMA and AIDOTNET_CONV_WINOGRAD not set to 0.");
+        Skip.IfNot(WinogradF43.s_blockedNarrow && !WinogradF43.s_forceBlockedForTest
+                   && WinogradF43.s_minPatches == 128 && WinogradF43.s_minBackwardPatches == 32,
+            "Default routing only (AIDOTNET_WINOGRAD_BLOCKED and the patch floors unset).");
         Assert.True(WinogradF43.Applies(8, 64, 64, 32, 32, 3, 3, 1, 1, 1, 1, 1, 1));
         Assert.False(WinogradF43.Applies(8, 64, 64, 32, 32, 3, 3, 2, 2, 1, 1, 1, 1));   // stride 2
         Assert.False(WinogradF43.Applies(8, 64, 64, 32, 32, 3, 3, 1, 1, 0, 0, 1, 1));   // padding 0

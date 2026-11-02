@@ -120,7 +120,11 @@ internal static unsafe partial class WinogradF43
     /// 1.62 vs 2.94 on EPYC 9V74, 1.25 vs 1.25 on 9V45; batch 8 on 56x56 3.9 vs 11.0 (8573C) and 2.65 vs 9.25 (9V45);
     /// batch 32 on 56x56 15.3 vs 142 (8573C).</summary>
     internal static bool UsesBlockedWeightGradient(int inChannels, int outChannels)
-        => UseBlocked(inChannels, outChannels) && Math.Min(inChannels, outChannels) >= 32;
+        => UseBlocked(inChannels, outChannels) && Math.Min(inChannels, outChannels) >= BlockedWeightGradientMinChannels;
+
+    /// <summary>Fewest channels on either side the blocked weight gradient takes (32 -> 64 on 32x32 planes ran 0.87-0.92
+    /// ms against the direct kernel's 1.06-1.48 on Xeon 8573C, 6975P and EPYC 9V74); narrower layers stay direct.</summary>
+    internal const int BlockedWeightGradientMinChannels = 32;
 
     /// <summary>Fewest patches the blocked weight gradient takes: at 128 (64 -> 64 on 16x16 planes, batch 8) each split
     /// holds one band and its partial costs as much as the band's multiplies; it ran 0.39 ms against the direct kernel's

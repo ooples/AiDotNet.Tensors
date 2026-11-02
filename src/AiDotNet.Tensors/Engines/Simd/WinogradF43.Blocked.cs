@@ -28,7 +28,8 @@ internal static unsafe partial class WinogradF43
     /// <summary>Whether narrow layers run blocked (AIDOTNET_WINOGRAD_BLOCKED=0 turns it off).</summary>
     internal static bool s_blockedNarrow = s_blockedEnv != "0";
 
-    /// <summary>Fewest input and output channels the batch-wide passes take; narrower layers run blocked.</summary>
+    /// <summary>Channel bound of the batch-wide passes: with narrow blocking on, a layer with fewer than this many channels
+    /// on either side, or no more than this many on both (64 -> 64), runs blocked; wider layers run batch-wide.</summary>
     private const int MinUnblockedChannels = 64;
 
     /// <summary>Fewest input and output channels the blocked form takes (fewer: the transforms outweigh the saving).</summary>
