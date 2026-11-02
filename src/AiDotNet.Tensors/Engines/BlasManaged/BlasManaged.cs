@@ -510,7 +510,7 @@ public static partial class BlasManaged
     /// only these route out, and only for plain products: no pre-packed operand, no epilogue, a dense output.
     /// Both SimdGemm routes sum in a fixed order that does not follow the thread budget.
     /// </summary>
-    private static bool TryRouteToSimdGemm<T>(
+    internal static bool TryRouteToSimdGemm<T>(
         ReadOnlySpan<T> a, int lda, bool transA, ReadOnlySpan<T> b, int ldb, bool transB,
         Span<T> c, int ldc, int m, int n, int k, in BlasOptions<T> options) where T : unmanaged
     {
@@ -534,6 +534,8 @@ public static partial class BlasManaged
         // BlasManaged overwrites C whatever BetaZero says (it only promises a write-first kernel may skip the clear);
         // the overwriting entry also unlocks SimdGemm's write-first paths.
         Simd.SimdGemm.Sgemm(af, lda, transA, bf, ldb, transB, cf, m, k, n);
+        var epilogue = options.Epilogue;
+        EpilogueChain.Apply<T>(c, ldc, m, n, in epilogue);
         return true;
     }
 
@@ -814,7 +816,8 @@ public static partial class BlasManaged
         if (typeof(T) == typeof(float) && !s_disableGotoGemm && !transA && !transB
             && options.PackedA is null && options.PackedB is null
             && options.NumThreads == 0 // only the default (all-core) budget; explicit -1/>0 requests honored below
-            && (options.PackingMode == PackingMode.Auto || options.PackingMode == PackingMode.DisableAutotune)
+            // A deterministic DisableAutotune call must use the same reduction at every explicit thread count.
+            && (options.PackingMode == PackingMode.Auto || (options.PackingMode == PackingMode.DisableAutotune && !deterministic))
             && (GotoGemmFp32.IsPreferredForThreadBudget(gotoThreadBudget)
                 || GotoGemmFp32.PackBothUnderOccupies(m, gotoThreadBudget)
                 // #653: an M PackBoth would tail-split (to Streaming on a many-core host), at any thread budget.
@@ -917,6 +920,29 @@ public static partial class BlasManaged
         // actual call (the shapes reaching strategy selection are typically transposed —
         // Sub-S already handled non-transposed aligned GEMM above).
         PackingMode strategy = Dispatcher.SelectStrategy(m, n, k, transA, transB, in options);
+
+        // DisableAutotune runs the strategy the default (Auto) selection picks. Resolved here rather than at dispatch, so the
+        // tile choice and the tail split below see the concrete strategy: resolved late, a PackAOnly product kept the 6-row
+        // PackBoth tile, tail-split on it, and ran its aligned rows through PackAOnly on the scalar 4x4 tile. That was the
+        // linear layers' A^T weight gradient (which asks for DisableAutotune) on hardware whose default table picks
+        // PackAOnly: the CNN classifier's 3136 x 64 x 128 took 6.0-8.1 ms on Zen 4 and Sapphire/Granite Rapids runners
+        // against PyTorch's 0.12-0.46. Same options as the dispatch-time fallback (no pre-pack), so the choice is unchanged.
+        if (strategy == PackingMode.DisableAutotune)
+            strategy = Dispatcher.SelectStrategy(m, n, k, transA, transB, new BlasOptions<T> { PackingMode = PackingMode.Auto });
+
+        // A new default must not invalidate an Auto caller's PackAOnly-compatible constraints.
+        // PackBoth needs Nc when blocking is explicit, and its FP64 path cannot split over N.
+        bool usesDefaultStrategy = options.PackingMode is PackingMode.Auto or PackingMode.DisableAutotune;
+        if (strategy == PackingMode.ForcePackBoth && usesDefaultStrategy && !transB)
+        {
+            bool hasPrePack = options.PackedA is not null || options.PackedB is not null;
+            bool packAOnlyBlocking = options.Nc == 0 && options.Mc > 0 && options.Kc > 0;
+            bool fp64NAxis = options.Nc == 0 && typeof(T) == typeof(double)
+                && options.ParallelismAxis == ParallelismAxis.N;
+            if (!hasPrePack && (packAOnlyBlocking || fp64NAxis))
+                strategy = PackingMode.ForcePackAOnly;
+        }
+
 
         // beta=0 fallback for the tuned-strategy family (Streaming / PackAOnly / PackBoth and
         // the partial-M/N tail decomposition): these all read-modify-write C (Streaming loads
@@ -1055,7 +1081,8 @@ public static partial class BlasManaged
             // Strip epilogue for sub-calls; apply once at the end on full (m, n).
             var innerOptions = new BlasOptions<T>
             {
-                PackingMode = options.PackingMode,
+                // Keep the outer plan when DisableAutotune resolves before tail splitting.
+                PackingMode = options.PackingMode == PackingMode.DisableAutotune ? strategy : options.PackingMode,
                 Workspace = options.Workspace,
                 PackedA = options.PackedA,
                 PackedB = options.PackedB,
@@ -1209,17 +1236,10 @@ public static partial class BlasManaged
         // forward GEMM uses (CpuEngine.BatchMatMul -> 6-arg SimdGemm.Sgemm -> Gemm{DisableAutotune}).
         // That left the FFN/QKV forward matmuls at the autotuner's cache-sized mc (e.g. the FFN
         // 512×1024×4096 -> mc=60/nc=512 -> numMB=9, ~9 of 16 cores busy). Resolve the EFFECTIVE
-        // PackBoth decision (the same fallback the DisableAutotune switch case computes at dispatch
-        // time) so these blocking optimizations fire on that path too — the DisableAutotune case
-        // reads the mcFromAutotune/ncFromAutotune we adjust here.
-        bool effectivePackBoth = strategy == PackingMode.ForcePackBoth;
-        if (s_forwardPackBothBlocking && strategy == PackingMode.DisableAutotune)
-        {
-            var packBothProbe = new BlasOptions<T> { PackingMode = PackingMode.Auto };
-            PackingMode effStrategy = Dispatcher.SelectStrategy(m, n, k, transA, transB, packBothProbe);
-            if (effStrategy == PackingMode.ForcePackAOnly && transB) effStrategy = PackingMode.ForcePackBoth;
-            effectivePackBoth = effStrategy == PackingMode.ForcePackBoth;
-        }
+        // PackBoth decision (strategy, which a DisableAutotune request has already resolved to its default above) so these
+        // blocking optimizations fire on that path too, unless s_forwardPackBothBlocking turns them off for it.
+        bool effectivePackBoth = strategy == PackingMode.ForcePackBoth
+            && (options.PackingMode != PackingMode.DisableAutotune || s_forwardPackBothBlocking);
 
         // Parallelism floor (PackBoth, no pre-pack): the autotuner sizes mc/nc for cache, but
         // on high core counts a shape can yield fewer (m/mc)×(n/nc) blocks than cores, leaving
@@ -1372,33 +1392,7 @@ public static partial class BlasManaged
                     in options);
                 break;
             case PackingMode.DisableAutotune:
-                // DisableAutotune is a power-user override that bypasses the
-                // autotune cache. The autotune dispatcher already returns the
-                // heuristic decision when DisableAutotune is set, so mc/nc/kc
-                // are already populated from the heuristic above.
-                {
-                    var defaultedOptions = new BlasOptions<T> { PackingMode = PackingMode.Auto };
-                    PackingMode fallback = Dispatcher.SelectStrategy(m, n, k, transA, transB, defaultedOptions);
-                    if (fallback == PackingMode.ForcePackAOnly && transB)
-                        fallback = PackingMode.ForcePackBoth;
-                    switch (fallback)
-                    {
-                        case PackingMode.ForcePackBoth:
-                            PackBothStrategy.Run<T>(a, lda, transA, b, ldb, transB, c, ldc, m, n, k, mcFromAutotune, ncFromAutotune, kcFromAutotune, mr, nr, options);
-                            break;
-                        case PackingMode.ForcePackAOnly:
-                            PackAOnlyStrategy.Run<T>(a, lda, transA, b, ldb, c, ldc, m, n, k, mcFromAutotune, kcFromAutotune, 4, 4, options);
-                            break;
-                        case PackingMode.ForceStreaming:
-                            // PR #402 CodeRabbit fix: pass caller options through so
-                            // NumThreads / Mode / Epilogue stays honored on this fallback
-                            // path. Pre-fix this used the parameterless overload which
-                            // silently dropped all caller-provided execution settings.
-                            StreamingStrategy.Run<T>(a, lda, transA, b, ldb, transB, c, ldc, m, n, k, in options);
-                            break;
-                    }
-                }
-                break;
+                throw new InvalidOperationException("A DisableAutotune request is resolved to its default strategy above.");
             case PackingMode.Auto:
                 throw new InvalidOperationException("Dispatcher.SelectStrategy should never return Auto.");
             default:

@@ -30,6 +30,20 @@ public class StrategyDefaultTableTests
     }
 
     [Theory]
+    // AVX-512 thin-K A^T products (the linear layers' weight gradients) go to PackBoth: its AVX-512 tile ran them 3.4-4.8x
+    // faster than PackAOnly's AVX2 8x8 strided-B kernel on Zen 4 and Granite Rapids runners (3136x128x64: 0.16-0.29 against
+    // 0.73-1.04 ms), and PackAOnly left the CNN's classifier weight gradient 2.5-6x behind PyTorch.
+    [InlineData(3136, 128, 64, "amd")]
+    [InlineData(784, 512, 128, "intel")]
+    [InlineData(512, 256, 128, "amd")]
+    public void Route_Avx512_ThinK_PrefersPackBoth(int m, int n, int k, string vendor)
+    {
+        Assert.Equal(StrategyDefaultTable.ShapeBucket.ThinK, StrategyDefaultTable.Bucket(m, n, k));
+        var key = new HardwareFingerprint.HwKey("avx512", vendor, 0);
+        Assert.Equal(PackingMode.ForcePackBoth, StrategyDefaultTable.Route(key, m, n, k, transA: true, transB: false));
+    }
+
+    [Theory]
     // Band 3 (>64T) avx2 with a TRANSPOSED B routes to Streaming. Measured on
     // x64-amd-avx2-cpu128: Streaming won all 17 transposed shapes swept, by 1.12x-3.22x.
     [InlineData(512, 512, 64)]
