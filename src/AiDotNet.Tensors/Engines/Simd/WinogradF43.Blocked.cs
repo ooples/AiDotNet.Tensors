@@ -69,7 +69,7 @@ internal static unsafe partial class WinogradF43
             int patches = (r1 - r0) * tilesW;
             float[] vb = ThreadBuffer(ref t_blockV, Points * maxPatches * cIn);
             float[] mb = ThreadBuffer(ref t_blockM, Points * maxPatches * cOut);
-            float[] tb = ThreadBuffer(ref t_blockTile, Math.Max(inTileFloats, outTileFloats + 64));
+            float[] tb = ThreadBuffer(ref t_blockTile, Math.Max(inTileFloats, outTileFloats + TransposeScratchFloats));
             fixed (float* xp = x, up = u, yp = y, vp = vb, mp = mb, tp = tb)
             {
                 var d = stackalloc Vector256<float>[36];
@@ -96,36 +96,43 @@ internal static unsafe partial class WinogradF43
                             for (int a = 0; a < 4; a++) OutputTransform(t, a * 6, 1, r, a * 4, 1);
                             StoreTile(r, 4, 4, tp + (th * Tile * outW + tw * Tile) * 8, outW * 8);
                         }
-                    float* planes = yp + yOff + ((long)n * cOut + kb * 8) * hw;
-                    for (int h = rowLo; h < rowHi; h++)
-                    {
-                        float* src = tp + (h - rowLo) * outW * 8;
-                        float* dstRow = planes + h * width;
-                        int q = 0;
-                        if (accumulate)
-                        {
-                            for (; q + 8 <= width; q += 8)
-                            {
-                                Transpose8x8(src + q * 8, 8, tmp, 8);
-                                for (int l = 0; l < 8; l++)
-                                {
-                                    float* row = dstRow + (long)l * hw + q;
-                                    Avx.Store(row, Avx.Add(Avx.LoadVector256(row), Avx.LoadVector256(tmp + l * 8)));
-                                }
-                            }
-                            for (; q < width; q++)
-                                for (int l = 0; l < 8; l++) dstRow[(long)l * hw + q] += src[q * 8 + l];
-                        }
-                        else
-                        {
-                            for (; q + 8 <= width; q += 8) Transpose8x8(src + q * 8, 8, dstRow + q, hw);
-                            for (; q < width; q++)
-                                for (int l = 0; l < 8; l++) dstRow[(long)l * hw + q] = src[q * 8 + l];
-                        }
-                    }
+                    StoreOutputRows(tp, outW, yp + yOff + ((long)n * cOut + kb * 8) * hw, rowLo, rowHi, width, hw, accumulate, tmp);
                 }
             }
         }, deterministicSafe: true);
+    }
+
+    // Rows rowLo..rowHi of eight output planes (planes, hw floats apart) from a band tp of [rows][outW][8 channels]
+    // (row 0 = rowLo), written or added (accumulate); tmp holds TransposeScratchFloats floats.
+    private static void StoreOutputRows(float* tp, int outW, float* planes, int rowLo, int rowHi, int width, int hw,
+        bool accumulate, float* tmp)
+    {
+        for (int h = rowLo; h < rowHi; h++)
+        {
+            float* src = tp + (h - rowLo) * outW * 8;
+            float* dstRow = planes + h * width;
+            int q = 0;
+            if (accumulate)
+            {
+                for (; q + 8 <= width; q += 8)
+                {
+                    Transpose8x8(src + q * 8, 8, tmp, 8);
+                    for (int l = 0; l < 8; l++)
+                    {
+                        float* row = dstRow + (long)l * hw + q;
+                        Avx.Store(row, Avx.Add(Avx.LoadVector256(row), Avx.LoadVector256(tmp + l * 8)));
+                    }
+                }
+                for (; q < width; q++)
+                    for (int l = 0; l < 8; l++) dstRow[(long)l * hw + q] += src[q * 8 + l];
+            }
+            else
+            {
+                for (; q + 8 <= width; q += 8) Transpose8x8(src + q * 8, 8, dstRow + q, hw);
+                for (; q < width; q++)
+                    for (int l = 0; l < 8; l++) dstRow[(long)l * hw + q] = src[q * 8 + l];
+            }
+        }
     }
 
     // V [36][patches][cIn] for tile rows r0..r1 of image n: eight channels at a time through a padded band of the image
