@@ -1,0 +1,78 @@
+// SCRATCH (probe branch only): ResNet-18 deep-layer convs, direct vs GEMM routes vs Winograd, interleaved in one process.
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Simd;
+using AiDotNet.Tensors.Helpers;
+using AiDotNet.Tensors.LinearAlgebra;
+using Xunit;
+using Xunit.Abstractions;
+
+namespace AiDotNet.Tensors.Tests.Parity;
+
+public class ZzDeepConvBench
+{
+    private readonly ITestOutputHelper _o;
+    public ZzDeepConvBench(ITestOutputHelper o) => _o = o;
+
+    private static Tensor<float> Rand(Random r, params int[] s)
+    {
+        var d = new float[s.Aggregate(1, (a, b) => a * b)];
+        for (int i = 0; i < d.Length; i++) d[i] = (float)(r.NextDouble() * 2 - 1);
+        return new Tensor<float>(d, s);
+    }
+
+    [Fact]
+    public void Time()
+    {
+        if (Environment.GetEnvironmentVariable("GITHUB_ACTIONS") != "true" && Environment.GetEnvironmentVariable("ZZ_CONV") != "1") return;
+        CpuParallelSettings.MaxDegreeOfParallelism = 4;
+        var engine = new CpuEngine();
+        var rng = new Random(5);
+        var all = DirectConvAvx2.EnabledPasses;
+        var variants = new (string Name, Action Set)[]
+        {
+            ("cur", () => { DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = false; }),
+            ("nowino", () => { DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = true; }),
+            ("gemm", () => { DirectConvAvx2.EnabledPasses = DirectConvPasses.None; WinogradF43.s_disable = true; }),
+        };
+        var convs = new (int Cin, int Cout, int Hw, int S)[]
+        {
+            (512, 512, 4, 1), (256, 256, 8, 1), (256, 512, 8, 2), (128, 256, 16, 2), (64, 128, 32, 2), (128, 128, 16, 1),
+        };
+        const int b = 8;
+        foreach (var c in convs)
+        {
+            int o = (c.Hw + 2 - 3) / c.S + 1;
+            var x = Rand(rng, b, c.Cin, c.Hw, c.Hw); var w = Rand(rng, c.Cout, c.Cin, 3, 3); var dy = Rand(rng, b, c.Cout, o, o);
+            var y = new Tensor<float>(new[] { b, c.Cout, o, o }); var dx = new Tensor<float>(x.Shape.ToArray());
+            var dw = new Tensor<float>(w.Shape.ToArray());
+            int[] s = { c.S, c.S }, p = { 1, 1 }, d = { 1, 1 };
+            var ops = new (string Name, Action Run)[]
+            {
+                ("fwd", () => engine.Conv2DInto(y, x, w, s, p, d)),
+                ("dgrad", () => engine.Conv2DBackwardInputInto(dx, dy, w, x.Shape.ToArray(), s, p, d, accumulate: false)),
+                ("wgrad", () => engine.Conv2DBackwardKernelInto(dw, dy, x, w.Shape.ToArray(), s, p, d, accumulate: false)),
+            };
+            foreach (var op in ops)
+            {
+                var times = variants.ToDictionary(v => v.Name, _ => new List<double>());
+                foreach (var v in variants) { v.Set(); var sw0 = Stopwatch.StartNew(); while (sw0.ElapsedMilliseconds < 250) op.Run(); }
+                for (int round = 0; round < 15; round++)
+                    foreach (var v in variants)
+                    {
+                        v.Set(); op.Run();
+                        double best = double.MaxValue;
+                        for (int i = 0; i < 3; i++) { var sw = Stopwatch.StartNew(); op.Run(); best = Math.Min(best, sw.Elapsed.TotalMilliseconds); }
+                        times[v.Name].Add(best);
+                    }
+                string line = $"ZZ {c.Cin}->{c.Cout} {c.Hw}x{c.Hw} s{c.S} {op.Name,-5}";
+                foreach (var v in variants) { var t = times[v.Name]; t.Sort(); line += $"  {v.Name} {t[0]:F3}/{t[t.Count / 2]:F3}"; }
+                _o.WriteLine(line); Console.WriteLine(line);
+            }
+        }
+        DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = false;
+    }
+}
