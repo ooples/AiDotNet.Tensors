@@ -42,9 +42,13 @@ public class DirectConvAvx512Tests
         { 1, 256, 32, 14, 1, 1, 3, 1 },
         // Groups of four consecutive positions that wrap rows: 8-wide planes (8 + 4), 4-wide (4 + 4 + 4), runs spanning
         // images, and a 6-wide plane where only some twelves split into aligned groups.
-        { 2, 64, 64, 8, 1, 1, 3, 1 },
-        { 3, 64, 32, 4, 1, 1, 3, 1 },
+        { 8, 64, 128, 8, 1, 1, 3, 1 },
+        { 24, 32, 128, 4, 1, 1, 3, 1 },
         { 2, 32, 64, 6, 1, 1, 3, 1 },
+        // Stride 2: groups of four positions 2 Block apart, on 8-wide (16 -> 8) and 12-wide (24 -> 12) outputs. Enough
+        // positions per forward task (the default 128-task split) for a task to hold twelve.
+        { 6, 32, 128, 16, 2, 1, 3, 1 },
+        { 4, 64, 128, 24, 2, 1, 3, 1 },
     };
 
     [SkippableTheory]
