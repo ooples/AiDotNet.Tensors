@@ -50,6 +50,7 @@ public class ZzResnetOpsBench
                 ("conv.fwd", () => engine.Conv2DInto(y, x, w, s, p, d)),
                 ("conv.dgrad", () => engine.Conv2DBackwardInputInto(dx, dy, w, x.Shape.ToArray(), s, p, d, accumulate: false)),
                 ("conv.wgrad", () => engine.Conv2DBackwardKernelInto(dw, dy, x, w.Shape.ToArray(), s, p, d, accumulate: false)),
+                ("conv.fwd2", () => engine.Conv2DInto(y, x, w, s, p, d)),
             };
             foreach (var op in ops)
             {
