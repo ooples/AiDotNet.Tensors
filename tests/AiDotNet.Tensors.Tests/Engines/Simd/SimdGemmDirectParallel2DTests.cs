@@ -126,12 +126,51 @@ public class SimdGemmDirectParallel2DTests
         AssertMatchesReference(Reference(a, b, m, k, n), wide, k, "512-bit");
     }
 
+    // Fewer than 16 output columns (a classifier head): the 512-bit narrow kernel takes 16-lane dot products against B
+    // transposed (four rows by five columns a step, then k's last k % 16 terms in order). Both C = A*B and C += A*B must
+    // match a double reference, and a repeated call must give the same bits.
+    [SkippableTheory]
+    [InlineData(128, 256, 10)]    // the parity MLP's head: 32 four-row blocks, two five-column groups
+    [InlineData(21, 37, 3)]       // a 1-row remainder, 3 columns (two spare slots on the zero row), a 5-term k tail
+    [InlineData(15, 40, 15)]      // a 3-row remainder, three full groups, an 8-term k tail
+    [InlineData(8, 64, 8)]        // exactly two blocks, eight columns (a full group and a 3-column group)
+    [InlineData(10, 9, 7)]        // k below the dot kernel's floor: the 256-bit narrow kernel
+    public void NarrowN512_MatchesTheReference(int m, int k, int n)
+    {
+        Skip.IfNot(System.Runtime.Intrinsics.X86.Fma.IsSupported, "the direct GEMM kernels need FMA");
+        var a = Rand(m * k, m * 3 + k);
+        var b = Rand(k * n, n * 11 + k);
+        var seed = Rand(m * n, m + n);
+        var reference = Reference(a, b, m, k, n);
+        bool? before = SimdGemm.s_forceVector512Direct;
+        try
+        {
+            SimdGemm.s_forceVector512Direct = true;
+            foreach (bool accumulate in new[] { false, true })
+            {
+                var first = (float[])seed.Clone();
+                var again = (float[])seed.Clone();
+                if (accumulate) SimdGemm.SgemmAdd(a, b, first, m, k, n); else SimdGemm.Sgemm(a, b, first, m, k, n);
+                if (accumulate) SimdGemm.SgemmAdd(a, b, again, m, k, n); else SimdGemm.Sgemm(a, b, again, m, k, n);
+                Assert.Equal(first, again);
+                var expected = new double[m * n];
+                for (int i = 0; i < expected.Length; i++) expected[i] = reference[i] + (accumulate ? seed[i] : 0);
+                AssertMatchesReference(expected, first, k, accumulate ? "512-bit narrow C +=" : "512-bit narrow C =");
+            }
+        }
+        finally
+        {
+            SimdGemm.s_forceVector512Direct = before;
+        }
+    }
+
     // The transposed-A GEMM (a dense layer's dW = Xt*dY): full 6-row blocks take 32-column steps on the 512-bit tile.
     [SkippableTheory]
     [InlineData(784, 64, 512)]    // the parity MLP's first-layer dW
     [InlineData(784, 128, 512)]   // the same at batch 128
     [InlineData(30, 17, 80)]      // 2 full 32-column steps, then a 16-column step
     [InlineData(29, 9, 70)]       // a 4-row remainder block, a scalar row, and a 6-column tail (mFull = 28)
+    [InlineData(36, 9, 64)]       // the last panel ends at the row end: its final packed step is copied by element
     public void Vector512TransATile_IsBitIdenticalTo256BitTiles(int m, int k, int n)
     {
         // The direct kernels are register FMA chains with no portable form; production reaches them only behind an FMA gate.

@@ -3651,15 +3651,24 @@ internal static partial class SimdGemm
                 // per step sit m floats apart (3 KB at a 784-wide layer), past the L1 stride prefetcher's reach, and
                 // every strip re-reads them. Measured on the dense dW (784x128 . 128x512): Xeon 6973P 0.373 -> 0.299 ms,
                 // MLP step ratio on Xeon 8370C 1.44-1.55 -> 1.29-1.34; EPYC 9V45/9V74 within 1%.
-                float[] aBuf = TransAPackABuffer(fullBlocks * k * TransAMr);
+                float[] aBuf = TransAPackABuffer(fullBlocks * k * TransAMr + 8);
                 fixed (float* ap = aBuf)
                 fixed (float* strip = PackedStripBuffer(k))
                 {
                     for (int b = 0; b < fullBlocks; b++)
                     {
-                        float* src = A + (blockStart + b) * TransAMr;
+                        // Six floats a step as one eight-float copy: the two extra floats land in the next step's
+                        // slot (or the next panel's first, written after) and in the buffer's slack after the last.
+                        // The read runs two floats past the panel; only on A's last row can that leave A, so a panel
+                        // ending within two floats of the row end copies its last step by element.
+                        int i0 = (blockStart + b) * TransAMr;
+                        float* src = A + i0;
                         float* dst = ap + (long)b * k * TransAMr;
-                        for (int p = 0; p < k; p++, src += m, dst += TransAMr)
+                        int wide = i0 + 8 <= m ? k : k - 1;
+                        int p = 0;
+                        for (; p < wide; p++, src += m, dst += TransAMr)
+                            Vector256.Store(Vector256.Load(src), dst);
+                        for (; p < k; p++, src += m, dst += TransAMr)
                         {
                             dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2];
                             dst[3] = src[3]; dst[4] = src[4]; dst[5] = src[5];
@@ -4112,6 +4121,10 @@ internal static partial class SimdGemm
 
         fixed (float* pAroot = a, pBroot = b, pCroot = c)
         {
+#if NET9_0_OR_GREATER
+            // Where the 512-bit tile runs: 16-lane dot products against B transposed, every lane busy.
+            if (TrySgemmNarrowN512(pAroot, lda, pBroot, ldb, pCroot, n, m, k, n, clearedOutput)) return;
+#endif
             for (int i = 0; i < mFull; i += Mr)
             {
                 DirectKernelMxNarrow(
