@@ -97,7 +97,6 @@ public class SimdGemmDirectParallel2DTests
     [InlineData(66, 96, 48)]      // a full strip and a 16-column remainder on the 6x16 kernel
     [InlineData(7, 40, 32)]       // one full row block (6x32 tile) and a 1-row masked block
     [InlineData(25, 513, 64)]     // packed strips over k blocks of 256, 256 and 1 (partial sums resumed from C)
-    [InlineData(20, 13, 64)]      // packed A panels with a 5-column tail after one 8-column transpose step
     public void Vector512Tile_IsBitIdenticalTo256BitTiles(int m, int k, int n)
     {
         // The direct kernels are register FMA chains with no portable form; production reaches them only behind an FMA gate.
@@ -107,7 +106,6 @@ public class SimdGemmDirectParallel2DTests
         var narrow = new float[m * n];
         var wide = new float[m * n];
         bool? before = SimdGemm.s_forceVector512Direct;
-        bool beforePackA = SimdGemm.s_packA2D;
         int threads = CpuParallelSettings.MaxDegreeOfParallelism;
         try
         {
@@ -115,26 +113,53 @@ public class SimdGemmDirectParallel2DTests
             SimdGemm.s_forceVector512Direct = false;
             Assert.True(SimdGemm.TrySgemmDirectParallel2D(a, k, b, n, narrow, m, k, n, allowParallel: true));
             SimdGemm.s_forceVector512Direct = true;
-            // A's six-row panels read in place, then from the packed copy (the default): the same chains either way.
-            SimdGemm.s_packA2D = false;
-            var inPlace = new float[m * n];
-            Assert.True(SimdGemm.TrySgemmDirectParallel2D(a, k, b, n, inPlace, m, k, n, allowParallel: true));
-            for (int i = 0; i < narrow.Length; i++)
-                Assert.True(BitConverter.SingleToInt32Bits(narrow[i]) == BitConverter.SingleToInt32Bits(inPlace[i]),
-                    $"in place C[{i / n},{i % n}]: 256-bit {narrow[i]:G9}, 512-bit {inPlace[i]:G9}");
-            SimdGemm.s_packA2D = true;
             Assert.True(SimdGemm.TrySgemmDirectParallel2D(a, k, b, n, wide, m, k, n, allowParallel: true));
         }
         finally
         {
             SimdGemm.s_forceVector512Direct = before;
-            SimdGemm.s_packA2D = beforePackA;
             CpuParallelSettings.MaxDegreeOfParallelism = threads;
         }
         for (int i = 0; i < narrow.Length; i++)
             Assert.True(BitConverter.SingleToInt32Bits(narrow[i]) == BitConverter.SingleToInt32Bits(wide[i]),
                 $"C[{i / n},{i % n}]: 256-bit {narrow[i]:G9}, 512-bit {wide[i]:G9}");
         AssertMatchesReference(Reference(a, b, m, k, n), wide, k, "512-bit");
+    }
+
+    // Fewer than 16 output columns (a classifier head): the 512-bit narrow kernel holds every column in one register,
+    // eight rows a block, and runs the 256-bit narrow kernel's chains, so both C = A*B and C += A*B match it bit for bit.
+    [SkippableTheory]
+    [InlineData(128, 256, 10)]    // the parity MLP's head: 16 blocks of eight rows
+    [InlineData(21, 37, 3)]       // 2 blocks, a 5-row remainder on the 256-bit kernel, 3 columns (no upper lane)
+    [InlineData(15, 9, 15)]       // 1 block, a 7-row remainder (6 + 1 on the 256-bit kernel), 15 columns
+    [InlineData(8, 64, 8)]        // exactly one block, exactly the lower eight lanes
+    public void NarrowN512_IsBitIdenticalTo256BitKernel(int m, int k, int n)
+    {
+        Skip.IfNot(System.Runtime.Intrinsics.X86.Fma.IsSupported, "the direct GEMM kernels need FMA");
+        var a = Rand(m * k, m * 3 + k);
+        var b = Rand(k * n, n * 11 + k);
+        var seed = Rand(m * n, m + n);
+        bool? before = SimdGemm.s_forceVector512Direct;
+        try
+        {
+            foreach (bool accumulate in new[] { false, true })
+            {
+                var narrow = (float[])seed.Clone();
+                var wide = (float[])seed.Clone();
+                SimdGemm.s_forceVector512Direct = false;
+                if (accumulate) SimdGemm.SgemmAdd(a, b, narrow, m, k, n); else SimdGemm.Sgemm(a, b, narrow, m, k, n);
+                SimdGemm.s_forceVector512Direct = true;
+                if (accumulate) SimdGemm.SgemmAdd(a, b, wide, m, k, n); else SimdGemm.Sgemm(a, b, wide, m, k, n);
+                for (int i = 0; i < narrow.Length; i++)
+                    Assert.True(BitConverter.SingleToInt32Bits(narrow[i]) == BitConverter.SingleToInt32Bits(wide[i]),
+                        $"{(accumulate ? "C +=" : "C =")} [{i / n},{i % n}]: 256-bit {narrow[i]:G9}, 512-bit {wide[i]:G9}");
+                if (!accumulate) AssertMatchesReference(Reference(a, b, m, k, n), wide, k, "512-bit narrow");
+            }
+        }
+        finally
+        {
+            SimdGemm.s_forceVector512Direct = before;
+        }
     }
 
     // The transposed-A GEMM (a dense layer's dW = Xt*dY): full 6-row blocks take 32-column steps on the 512-bit tile.
