@@ -133,7 +133,10 @@ internal static class StrategyDefaultTable
             ShapeBucket.TinyCube => PackingMode.ForceStreaming,
             ShapeBucket.SmallLowK => PackingMode.ForceStreaming,
             ShapeBucket.TallThin => PackingMode.ForceStreaming,
-            ShapeBucket.ThinK => PackingMode.ForcePackAOnly,
+            // A^T thin-K products (the linear layers' weight gradients) on 4-thread AVX-512 runners, interleaved min of 25:
+            // PackBoth's AVX-512 tile against PackAOnly's AVX2 8x8 strided-B kernel, 3136x128x64 0.16 against 0.73 ms,
+            // 784x512x128 0.33 against 1.46, 512x256x128 0.10 against 0.47 (Zen 4; PyTorch 0.27 on the first).
+            ShapeBucket.ThinK => PackingMode.ForcePackBoth,
             ShapeBucket.MediumSquare => PackingMode.ForcePackAOnly,
             ShapeBucket.MediumMWide => PackingMode.ForcePackBoth, // #653: see cpu≤1 note — PackAOnly is pathological for non-transposed MediumMWide
             _ => PackingMode.ForcePackBoth,
