@@ -192,7 +192,11 @@ extern ""C"" __global__ __launch_bounds__(256) void add_vectors(const float* A, 
 
 // Add then activation in one pass (the residual join of a ResNet block): the same arithmetic as add_vectors followed
 // by relu / sigmoid / gelu, without writing and re-reading the sum.
-__device__ __forceinline__ float add_act_relu(float v) { return v > 0.0f ? v : 0.0f; }
+// relu's contract: a NaN sum stays NaN (tested on the bits, which fast math cannot fold), -0 becomes +0.
+__device__ __forceinline__ float add_act_relu(float v)
+{
+    return ((__float_as_uint(v) & 0x7fffffffu) > 0x7f800000u) ? v : (v > 0.0f ? v : 0.0f);
+}
 __device__ __forceinline__ float add_act_sigmoid(float v) { return 1.0f / (1.0f + expf(-v)); }
 __device__ __forceinline__ float add_act_gelu(float v)
 {

@@ -25,7 +25,10 @@ kernel void add_relu(
     constant uint& size [[buffer(3)]],
     uint gid [[thread_position_in_grid]])
 {
-    if (gid < size) C[gid] = max(0.0f, A[gid] + B[gid]);
+    // relu's contract: a NaN sum stays NaN (tested on the bits, which fast math cannot fold), -0 becomes +0.
+    if (gid >= size) return;
+    float s = A[gid] + B[gid];
+    C[gid] = ((as_type<uint>(s) & 0x7fffffffu) > 0x7f800000u) ? s : (s > 0.0f ? s : 0.0f);
 }
 
 kernel void add_sigmoid(

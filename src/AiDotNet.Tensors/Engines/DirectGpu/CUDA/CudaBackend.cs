@@ -3912,7 +3912,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         }
     }
 
-    public unsafe IGpuBuffer GemmBiasLeakyRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K, float alpha = 0.01f)
+    public IGpuBuffer GemmBiasLeakyRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K, float alpha = 0.01f)
     {
         ValidateBiasBuffer(bias, N);
         if (alpha == 0.01f)
@@ -3921,55 +3921,21 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 A, B, bias, M, K, N, DirectPtxLinearActivation.LeakyRelu);
             if (directPtx is not null) return directPtx;
         }
-        var output = AllocateBuffer(M * N);
 
-        // LeakyReLU kernel has an extra alpha parameter
-        string wmmaName = "gemm_bias_leaky_relu_wmma";
-        string scalarName = "gemm_bias_leaky_relu";
-        bool useWmma = _hasWmmaSupport && _kernelCache.TryGetValue(wmmaName, out var wmmaKernel);
-        string kernelName = useWmma ? wmmaName : scalarName;
-
-        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new GpuCapabilityUnavailableException($"CUDA fused kernel not found: {kernelName}");
-
-        using var _ = PushContext();
-        IntPtr aPtr = A.Handle;
-        IntPtr bPtr = B.Handle;
-        IntPtr biasPtr = bias.Handle;
-        IntPtr outPtr = output.Handle;
-        int m = M, n = N, k = K;
-
-        void** args = stackalloc void*[8];
-        args[0] = &aPtr;
-        args[1] = &bPtr;
-        args[2] = &biasPtr;
-        args[3] = &outPtr;
-        args[4] = &m;
-        args[5] = &n;
-        args[6] = &k;
-        args[7] = &alpha;
-
-        if (useWmma)
+        // Every fallback must retain FP32 precision, including alpha=0.01 when direct PTX is unavailable.
+        // The WMMA epilogue silently rounded both operands to FP16.
+        using var product = GemmBias(A, B, bias, M, N, K);
+        var output = AllocateBuffer(checked(M * N));
+        try
         {
-            const int WMMA_TILE = 32;
-            uint gridX = (uint)((N + WMMA_TILE - 1) / WMMA_TILE);
-            uint gridY = (uint)((M + WMMA_TILE - 1) / WMMA_TILE);
-            CuBlasNative.CheckCudaResult(
-                CudaNativeBindings.cuLaunchKernel(kernel, gridX, gridY, 1, 128, 1, 1,
-                    0, _stream, (IntPtr)args, IntPtr.Zero),
-                "cuLaunchKernel(WMMA LeakyReLU)");
-                GpuLaunchProbe.OnLaunch();
+            LeakyRelu(product, output, alpha, M * N);
+            return output;
         }
-        else
+        catch
         {
-            const int BM = 128;
-            const int BN = 128;
-            uint gridX = (uint)((N + BN - 1) / BN);
-            uint gridY = (uint)((M + BM - 1) / BM);
-            LaunchKernel2D(kernel, gridX, gridY, 1, 16, 16, args);
+            output.Dispose();
+            throw;
         }
-
-        return output;
     }
 
     public void BiasAdd(IGpuBuffer A, IGpuBuffer bias, IGpuBuffer C, int M, int N) => LaunchBiasAdd(A, bias, C, M, N, relu: false);

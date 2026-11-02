@@ -151,7 +151,8 @@ void main() {
     if (idx >= size) return;
     float x = a[idx] + bdata[idx];
     float y;
-    if (op == 0u) y = x > 0.0 ? x : 0.0;
+    // relu's contract: a NaN sum stays NaN (tested on the bits), -0 becomes +0.
+    if (op == 0u) y = (floatBitsToUint(x) & 0x7fffffffu) > 0x7f800000u ? x : (x > 0.0 ? x : 0.0);
     else if (op == 1u) y = 1.0 / (1.0 + exp(-x));
     else y = 0.5 * x * (1.0 + tanh(clamp(SQRT_2_OVER_PI * (x + GELU_COEF * x * x * x), -TANH_SATURATION, TANH_SATURATION)));
     c[idx] = y;

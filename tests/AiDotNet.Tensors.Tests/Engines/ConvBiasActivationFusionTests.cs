@@ -88,7 +88,7 @@ public class ConvBiasActivationFusionTests
     /// <summary>
     /// The one-pass conv + bias [+ ReLU] (the epilogue applied in the 3x3 kernel's stores) against the convolution
     /// into a separate buffer followed by the separate epilogue, bit for bit: odd output-channel counts (the pair
-    /// kernel's discarded partner), widths with a masked column tail, a NaN input (NaN sums become +0 under ReLU),
+    /// kernel's discarded partner), widths with a masked column tail, a NaN input (NaN sums stay NaN under ReLU),
     /// a kernel the 3x3 route does not take (two-pass fallback inside the entry), and padding 0 and 2.
     /// </summary>
     [Theory]

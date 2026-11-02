@@ -1624,9 +1624,9 @@ internal static class SimdConvHelper
     {
         if (epilogue.Active)
         {
-            // value + bias, then max(value, +0): the channel-bias add's operand order and the ReLU kernel's maxps.
+            // value + bias, then ReLU: the channel-bias add's operand order and the ReLU kernel's NaN-keeping form.
             v = Avx.Add(v, second ? epilogue.Bias1 : epilogue.Bias0);
-            if (epilogue.Relu) v = Avx.Max(v, Vector256<float>.Zero);
+            if (epilogue.Relu) v = SimdKernels.ReluNaN256(v);
         }
         if (full) Avx.Store(dst, v);
         else Avx.MaskStore(dst, mask, v);

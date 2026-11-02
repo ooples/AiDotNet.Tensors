@@ -144,7 +144,9 @@ internal static partial class SimdGemm
                 c0 = Avx.Add(c0, Avx.LoadVector256(bias + j));
                 c1 = Avx.Add(c1, Avx.LoadVector256(bias + j + 8));
             }
-            if (relu) { c0 = Avx.Max(c0, zero); c1 = Avx.Max(c1, zero); }
+            // max(+0, x): MAXPS returns its second operand on NaN, so a NaN sum passes through as it does in the
+            // scalar tail and the JIT kernel.
+            if (relu) { c0 = Avx.Max(zero, c0); c1 = Avx.Max(zero, c1); }
             Avx.Store(c + j, c0); Avx.Store(c + j + 8, c1);
         }
         for (; j + 8 <= n; j += 8)
@@ -154,7 +156,7 @@ internal static partial class SimdGemm
             for (int p = 0; p < k; p++, bp += ldb)
                 c0 = Fma.MultiplyAdd(Vector256.Create(a[p]), Avx.LoadVector256(bp), c0);
             if (bias is not null) c0 = Avx.Add(c0, Avx.LoadVector256(bias + j));
-            if (relu) c0 = Avx.Max(c0, zero);
+            if (relu) c0 = Avx.Max(zero, c0);
             Avx.Store(c + j, c0);
         }
         if (j < n) RowStripeScalarTail(a, b, ldb, c, k, j, n, bias, relu);

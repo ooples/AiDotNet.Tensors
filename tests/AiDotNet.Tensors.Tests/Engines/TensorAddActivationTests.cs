@@ -10,7 +10,8 @@ namespace AiDotNet.Tensors.Tests.Engines;
 
 /// <summary>
 /// TensorAddActivation (the fused residual join) must equal TensorAdd followed by the activation: bit for bit for ReLU on
-/// the CPU and on the GPU kernel, including NaN, signed zero and infinities and lengths off every vector width, and its
+/// the CPU and on the GPU kernel for finite values, signed zero and infinities. NaNs must propagate, but their
+/// payload/sign may be canonicalized by GPU arithmetic. Lengths cover every vector width, and the
 /// gradient must equal the composed ops' gradient for both inputs.
 /// </summary>
 [Collection("DirectGpuSerial")]
@@ -34,8 +35,8 @@ public sealed class TensorAddActivationTests
         var a = actual.Contiguous().AsSpan();
         Assert.Equal(e.Length, a.Length);
         for (int i = 0; i < e.Length; i++)
-            Assert.True(Bits(e[i]) == Bits(a[i]),
-                $"[{i}] expected {e[i]} got {a[i]}");
+            Assert.True(float.IsNaN(e[i]) ? float.IsNaN(a[i]) : Bits(e[i]) == Bits(a[i]),
+                $"[{i}] expected {e[i]} (0x{Bits(e[i]):X8}) got {a[i]} (0x{Bits(a[i]):X8})");
     }
 
     private static int Bits(float value) => BitConverter.ToInt32(BitConverter.GetBytes(value), 0);
@@ -160,6 +161,41 @@ public sealed class TensorAddActivationTests
                 Assert.True(Math.Abs(reference[i] - actual[i]) <= 1e-2 * (1 + Math.Abs(reference[i])), $"[{i}] expected {reference[i]} got {actual[i]}");
             }
         }
+    }
+
+    // ReLU keeps NaN and turns -0 into +0, as PyTorch, CpuFusedOperations and every GPU relu kernel (relu_nan_safe) do.
+    // The CPU ReLU and fused add + ReLU used max(x, +0), which turns NaN into +0: the CUDA lane's
+    // GpuRelu_EqualsTheCpuResult read NaN on the GPU against 0 on the CPU. The lengths reach the scalar tail and the
+    // AVX and AVX-512 loops.
+    [Theory]
+    [InlineData(5)]
+    [InlineData(37)]
+    [InlineData(4099)]
+    [InlineData(100003)]
+    public void CpuRelu_KeepsNaN_AndZeroesNegativeZero(int length)
+    {
+        var a = Values(length, 8);
+        var b = Values(length, 9);
+        var cpu = new CpuEngine();
+        var fused = cpu.TensorAddActivation(a, b, FusedActivationType.ReLU).ToArray();
+        var composed = cpu.ReLU(cpu.TensorAdd(a, b)).ToArray();
+        var single = cpu.ReLU(a).ToArray();
+        var av = a.ToArray();
+        var bv = b.ToArray();
+        int nan = 0, negativeZero = 0;
+        for (int i = 0; i < length; i++)
+        {
+            float sum = av[i] + bv[i];
+            float expected = float.IsNaN(sum) ? sum : (sum > 0 ? sum : 0f);
+            Assert.True(Bits(expected) == Bits(fused[i]), $"fused [{i}] relu({sum}): expected {expected} got {fused[i]}");
+            Assert.True(Bits(expected) == Bits(composed[i]), $"composed [{i}] relu({sum}): expected {expected} got {composed[i]}");
+            float expectedA = float.IsNaN(av[i]) ? av[i] : (av[i] > 0 ? av[i] : 0f);
+            Assert.True(Bits(expectedA) == Bits(single[i]), $"relu [{i}] relu({av[i]}): expected {expectedA} got {single[i]}");
+            if (float.IsNaN(sum)) nan++;
+            if (Bits(av[i]) == Bits(-0f)) negativeZero++;
+        }
+        Assert.True(nan > 0, "no NaN sum in the inputs: NaN propagation went unchecked");
+        Assert.True(negativeZero > 0, "no -0 in the inputs: -0 -> +0 went unchecked");
     }
 
     [SkippableTheory]

@@ -19,7 +19,7 @@ public partial class CpuEngine
     /// </summary>
     /// <remarks>
     /// Bit-identical to the two separate ops: the sum is <c>input + bias</c> (the channel-bias add's operand order),
-    /// and ReLU is <c>max(x, +0)</c> exactly as the ReLU kernel computes it, so a NaN or -0 sum becomes +0.
+    /// and ReLU is the ReLU kernel's own <c>ReluNaN</c>, so a NaN sum stays NaN and a -0 sum becomes +0.
     /// </remarks>
     internal unsafe void ChannelBiasActivationInto(Tensor<float> output, Tensor<float> input, Tensor<float> bias, bool relu)
     {
@@ -48,18 +48,17 @@ public partial class CpuEngine
                 if (Avx.IsSupported)
                 {
                     var vb = Vector256.Create(bc);
-                    var zero = Vector256<float>.Zero;
                     for (; i + 8 <= spatial; i += 8)
                     {
                         var v = Avx.Add(Avx.LoadVector256(ps + i), vb);
-                        Avx.Store(pd + i, relu ? Avx.Max(v, zero) : v);
+                        Avx.Store(pd + i, relu ? Simd.SimdKernels.ReluNaN256(v) : v);
                     }
                 }
 #endif
                 for (; i < spatial; i++)
                 {
                     float v = ps[i] + bc;
-                    pd[i] = relu ? (v > 0 ? v : 0) : v;
+                    pd[i] = relu ? Simd.SimdKernels.ReluNaN(v) : v;
                 }
             }
         });
@@ -75,7 +74,7 @@ public partial class CpuEngine
     /// <remarks>
     /// Bit-identical to <c>Conv2DInto</c> into a separate buffer followed by <see cref="ChannelBiasActivationInto"/>:
     /// the convolution takes the same route and summation either way, and the fused store applies
-    /// <c>sum + bias</c> then <c>max(x, +0)</c> exactly as the separate epilogue does.
+    /// <c>sum + bias</c> then the NaN-keeping ReLU exactly as the separate epilogue does.
     /// </remarks>
     internal void Conv2DBiasActivationInto(
         Tensor<float> output, Tensor<float> input, Tensor<float> kernel, Tensor<float> bias, bool relu,
