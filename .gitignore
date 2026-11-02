@@ -100,3 +100,8 @@ __pycache__/
 
 # token-optimizer plugin state: machine-local agent output, never committed (ooples/token-optimizer-mcp#500)
 .token-optimizer/
+
+# Profiler traces (PerfView, dotnet-trace): local measurement output, never source.
+*.nettrace
+*.etl
+*.etlx
