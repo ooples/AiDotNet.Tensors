@@ -35,6 +35,8 @@ public class WinogradF43Tests
         { 8, 32, 16, 8, 8 },
         { 1, 16, 24, 30, 33 },   // blocked: 9 tiles a row -> bands of 3 tile rows, the last one partial
         { 2, 32, 64, 32, 32 },   // blocked: two bands of 4 tile rows
+        { 3, 32, 32, 30, 33 },   // blocked weight gradient: nine bands over eight splits, the last split adds two
+        { 9, 40, 64, 16, 12 },   // blocked weight gradient: 40 columns (32 + an 8-wide tail), 64 rows (21 three-row tiles + 1)
     };
 
     [SkippableTheory]
@@ -81,13 +83,17 @@ public class WinogradF43Tests
         const int n = 3, c = 64, k = 72, h = 20, w = 18;
         var rng = new Random(91);
         float[] x = Fill(rng, n * c * h * w), wt = Fill(rng, k * c * 9);
+        float[] dy = Fill(rng, n * k * h * w);
         float[] wide = new float[n * k * h * w], blocked = new float[wide.Length];
+        float[] wideDw = new float[k * c * 9], blockedDw = new float[wideDw.Length];
         WinogradF43.Forward(x, 0, wt, 0, wide, 0, false, n, c, h, w, k);
+        WinogradF43.BackwardKernel(x, 0, dy, 0, wideDw, 0, false, n, c, h, w, k);
         bool previous = WinogradF43.s_forceBlockedForTest;
         try
         {
             WinogradF43.s_forceBlockedForTest = true;
             WinogradF43.Forward(x, 0, wt, 0, blocked, 0, false, n, c, h, w, k);
+            WinogradF43.BackwardKernel(x, 0, dy, 0, blockedDw, 0, false, n, c, h, w, k);
         }
         finally
         {
@@ -95,6 +101,9 @@ public class WinogradF43Tests
         }
         for (int i = 0; i < wide.Length; i++)
             Assert.True(Math.Abs(wide[i] - blocked[i]) <= 1e-4 * (1 + Math.Abs(wide[i])), $"[{i}] {wide[i]} vs {blocked[i]}");
+        // About a thousand products per weight gradient (~0.25 each).
+        for (int i = 0; i < wideDw.Length; i++)
+            Assert.True(Math.Abs(wideDw[i] - blockedDw[i]) <= 1e-3 * (1 + Math.Abs(wideDw[i])), $"dw[{i}] {wideDw[i]} vs {blockedDw[i]}");
     }
 
     [SkippableTheory]
@@ -201,6 +210,37 @@ public class WinogradF43Tests
         Assert.NotEqual(intoDirect.ToArray(), intoWino.ToArray());
     }
 
+    // The first ResNet stage (64 -> 64 on 32x32 planes) takes the blocked weight gradient through the engine and agrees
+    // with the direct route.
+    [SkippableFact]
+    public void Engine_NarrowWeightGradient_TakesTheBlockedKernel_AndAgreesWithTheDirectRoute()
+    {
+        Skip.IfNot(WinogradRoutes, "Winograd routing needs AVX2 + FMA and AIDOTNET_CONV_WINOGRAD not set to 0.");
+        Skip.IfNot(WinogradF43.s_blockedNarrow && WinogradF43.s_minBackwardPatches <= 512, "Default blocked routing only.");
+        const int n = 8, c = 64, k = 64, h = 32, w = 32;
+        var rng = new Random(79);
+        var x = new Tensor<float>(Fill(rng, n * c * h * w), new[] { n, c, h, w });
+        var dy = new Tensor<float>(Fill(rng, n * k * h * w), new[] { n, k, h, w });
+        var engine = new CpuEngine();
+        int[] stride = { 1, 1 }, pad = { 1, 1 }, dil = { 1, 1 }, kernelShape = { k, c, 3, 3 };
+        Assert.True(WinogradF43.UsesBlockedWeightGradient(c, k));
+        var wino = new Tensor<float>(kernelShape);
+        engine.Conv2DBackwardKernelInto(wino, dy, x, kernelShape, stride, pad, dil, false);
+        var direct = new Tensor<float>(kernelShape);
+        WinogradF43.s_disable = true;
+        try
+        {
+            engine.Conv2DBackwardKernelInto(direct, dy, x, kernelShape, stride, pad, dil, false);
+        }
+        finally
+        {
+            WinogradF43.s_disable = false;
+        }
+        // 8192 products per weight (~0.25 each).
+        AssertClose(direct.ToArray(), wino.ToArray(), "narrow weight gradient", 4e-2);
+        Assert.NotEqual(direct.ToArray(), wino.ToArray());
+    }
+
     [SkippableFact]
     public void Applies_OnlyTo3x3Stride1Padding1_WithChannelMultiplesOfEight()
     {
@@ -217,10 +257,17 @@ public class WinogradF43Tests
         Assert.False(WinogradF43.Applies(8, 64, 64, 4, 4, 3, 3, 1, 1, 1, 1, 1, 1));     // 4x4 plane
         Assert.False(WinogradF43.Applies(1, 64, 64, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));     // 4 patches
         Assert.False(WinogradF43.Applies(8, 64, 64, 32, 32, 5, 5, 1, 1, 2, 2, 1, 1));   // 5x5
-        // The weight gradient wants wider layers (C K >= 64 (C + K)).
+        // The batch-wide weight gradient wants wider layers (C K >= 64 (C + K)); layers of 32 to 64 channels run blocked.
         Assert.True(WinogradF43.AppliesToWeightGradient(8, 128, 128, 16, 16, 3, 3, 1, 1, 1, 1, 1, 1));
-        Assert.False(WinogradF43.AppliesToWeightGradient(8, 64, 64, 32, 32, 3, 3, 1, 1, 1, 1, 1, 1));
+        Assert.True(WinogradF43.AppliesToWeightGradient(8, 64, 64, 32, 32, 3, 3, 1, 1, 1, 1, 1, 1));
+        Assert.True(WinogradF43.AppliesToWeightGradient(8, 32, 64, 32, 32, 3, 3, 1, 1, 1, 1, 1, 1));
+        Assert.False(WinogradF43.AppliesToWeightGradient(8, 16, 64, 32, 32, 3, 3, 1, 1, 1, 1, 1, 1));
         Assert.False(WinogradF43.AppliesToWeightGradient(8, 64, 128, 32, 32, 3, 3, 1, 1, 1, 1, 1, 1));
+        // The forward and input gradient run blocked up to 64 channels each side, batch-wide past it.
+        Assert.True(WinogradF43.UseBlocked(64, 64));
+        Assert.True(WinogradF43.UseBlocked(32, 128));
+        Assert.False(WinogradF43.UseBlocked(64, 128));
+        Assert.False(WinogradF43.UseBlocked(96, 96));
     }
 
     [SkippableFact]

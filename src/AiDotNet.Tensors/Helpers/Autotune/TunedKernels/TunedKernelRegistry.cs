@@ -477,6 +477,22 @@ public static class TunedKernelRegistry
 
     internal static void NoteMeasurement() => Interlocked.Increment(ref s_measurements);
 
+    [ThreadStatic] private static int t_measuring;
+
+    /// <summary>
+    /// True while this thread runs a measurement session: a buffer returned to a GPU pool now is a candidate's workspace,
+    /// the only kind the next drain releases. Buffers other threads return meanwhile are their own and stay pooled.
+    /// </summary>
+    internal static bool MeasuringOnThisThread => t_measuring > 0;
+
+    internal static void BeginMeasurement() => t_measuring++;
+
+    internal static void EndMeasurement()
+    {
+        t_measuring--;
+        NoteMeasurement();
+    }
+
     internal static void Record(TunedKernelDecision decision)
     {
         s_log.Enqueue(decision);

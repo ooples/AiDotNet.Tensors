@@ -33,12 +33,11 @@ public class ZzConvScratchBench
         var rng = new Random(3);
         var variants = new (string Name, Action Set)[]
         {
-            ("wino", () => { WinogradF43.s_disable = false; WinogradF43.s_forceBlockedForTest = false; WinogradF43.s_wgradAny = false; }),
-            ("wgAny", () => { WinogradF43.s_disable = false; WinogradF43.s_forceBlockedForTest = false; WinogradF43.s_wgradAny = true; }),
-            ("direct", () => { WinogradF43.s_wgradAny = false; WinogradF43.s_disable = true; WinogradF43.s_forceBlockedForTest = false; }),
-            ("blocked", () => { WinogradF43.s_wgradAny = false; WinogradF43.s_disable = false; WinogradF43.s_forceBlockedForTest = true; }),
+            ("new", () => { WinogradF43.s_disable = false; WinogradF43.s_old = false; }),
+            ("old", () => { WinogradF43.s_disable = false; WinogradF43.s_old = true; }),
+            ("direct", () => { WinogradF43.s_disable = true; WinogradF43.s_old = false; }),
         };
-        foreach (var (c, k, hw, b) in new[] { (64, 64, 32, 8), (64, 64, 32, 32), (64, 128, 32, 8), (128, 64, 32, 8), (64, 64, 56, 8), (96, 96, 16, 8), (64, 64, 16, 8) })
+        foreach (var (c, k, hw, b) in new[] { (64, 64, 32, 8), (64, 64, 32, 32), (64, 64, 56, 8), (64, 64, 16, 8), (32, 64, 32, 8), (32, 32, 32, 8), (64, 64, 56, 32) })
         {
             var x = Rand(rng, b, c, hw, hw); var w = Rand(rng, k, c, 3, 3); var dy = Rand(rng, b, k, hw, hw);
             var y = new Tensor<float>(new[] { b, k, hw, hw }); var dx = new Tensor<float>(new[] { b, c, hw, hw });
@@ -67,6 +66,6 @@ public class ZzConvScratchBench
                 _o.WriteLine(line); Console.WriteLine(line);
             }
         }
-        WinogradF43.s_disable = false; WinogradF43.s_forceBlockedForTest = false;
+        WinogradF43.s_disable = false; WinogradF43.s_old = false;
     }
 }

@@ -242,6 +242,7 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
             }
 
             long start = Stopwatch.GetTimestamp();
+            TunedKernelRegistry.BeginMeasurement();
             try
             {
                 // Candidates measured slower than the reference by median in either measurement: never the fallback below.
@@ -277,7 +278,7 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
             finally
             {
                 TunedKernelPolicy.Charge(Stopwatch.GetTimestamp() - start);
-                TunedKernelRegistry.NoteMeasurement();
+                TunedKernelRegistry.EndMeasurement();
             }
         }
     }
