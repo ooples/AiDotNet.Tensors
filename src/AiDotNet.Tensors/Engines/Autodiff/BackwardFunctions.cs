@@ -1341,6 +1341,20 @@ internal static class BackwardFunctions<T>
 
         if (!needsInputGradient && !needsKernelGradient) return;
 
+        // Under create-graph the gradients are themselves differentiated, so they have to come from recorded ops.
+        // The kernels below record nothing, so a WGAN-GP gradient penalty through a convolution reached none of the
+        // critic's weights: the penalty's coefficient changed nothing about training.
+        if (DifferentiableOps._isBackwardCreateGraph)
+        {
+            if (needsInputGradient)
+                DifferentiableOps.AccumulateGrad(grads, inputs[0],
+                    Conv2DInputGradRecorded(gradOutput, inputs[1], inputs[0]._shape, savedState, engine), engine);
+            if (needsKernelGradient)
+                DifferentiableOps.AccumulateGrad(grads, inputs[1],
+                    Conv2DKernelGradRecorded(gradOutput, inputs[0], inputs[1]._shape, savedState, engine), engine);
+            return;
+        }
+
         // #1662 lever #4: route the conv backward OUTPUT gradients through the per-step arena
         // (AutoTensorCache -> TensorAllocator -> TensorArena) instead of the raw `new float[]`
         // the allocating Conv2DBackwardInput/Kernel entries use, which bypassed the arena
@@ -1382,6 +1396,66 @@ internal static class BackwardFunctions<T>
                 DifferentiableOps.AccumulateGrad(grads, inputs[1], gradKernel, engine);
             }
         }
+    }
+
+    /// <summary>
+    /// The convolution's input gradient <c>dX = conv2d_backward_input(dY, W)</c> as a recorded op. It is linear in each
+    /// argument: for an upstream <c>U</c> shaped like <c>X</c>, <c>&lt;U, dX&gt; = &lt;conv2d(U, W), dY&gt;</c>, so its
+    /// gradients are <c>conv2d(U, W)</c> for <c>dY</c> and <c>conv2d_backward_kernel(dY, U)</c> for <c>W</c>.
+    /// </summary>
+    private static Tensor<T> Conv2DInputGradRecorded(
+        Tensor<T> gradOutput, Tensor<T> kernel, int[] inputShape, object[] savedState, IEngine engine)
+    {
+        var gradInput = engine.Conv2DBackwardInput(
+            gradOutput, kernel, inputShape, (int[])savedState[0], (int[])savedState[1], (int[])savedState[2]);
+        DifferentiableOps.RecordBinary("Conv2DBackwardInput", gradInput, gradOutput, kernel, Conv2DInputGradBackward, savedState);
+        return gradInput;
+    }
+
+    /// <summary>
+    /// The convolution's kernel gradient <c>dW = conv2d_backward_kernel(dY, X)</c> as a recorded op. For an upstream
+    /// <c>V</c> shaped like <c>W</c>, <c>&lt;V, dW&gt; = &lt;conv2d(X, V), dY&gt;</c>, so its gradients are
+    /// <c>conv2d(X, V)</c> for <c>dY</c> and <c>conv2d_backward_input(dY, V)</c> for <c>X</c>.
+    /// </summary>
+    private static Tensor<T> Conv2DKernelGradRecorded(
+        Tensor<T> gradOutput, Tensor<T> input, int[] kernelShape, object[] savedState, IEngine engine)
+    {
+        var gradKernel = engine.Conv2DBackwardKernel(
+            gradOutput, input, kernelShape, (int[])savedState[0], (int[])savedState[1], (int[])savedState[2]);
+        DifferentiableOps.RecordBinary("Conv2DBackwardKernel", gradKernel, gradOutput, input, Conv2DKernelGradBackward, savedState);
+        return gradKernel;
+    }
+
+    // Inputs: dY, W; output: dX. Each gradient is itself recorded under create-graph, so any order differentiates.
+    internal static void Conv2DInputGradBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        if (DifferentiableOps.IsGradientRequired(inputs[0]))
+            DifferentiableOps.AccumulateGrad(grads, inputs[0],
+                engine.Conv2D(gradOutput, inputs[1], (int[])savedState[0], (int[])savedState[1], (int[])savedState[2]), engine);
+        if (DifferentiableOps.IsGradientRequired(inputs[1]))
+            DifferentiableOps.AccumulateGrad(grads, inputs[1],
+                DifferentiableOps._isBackwardCreateGraph
+                    ? Conv2DKernelGradRecorded(inputs[0], gradOutput, inputs[1]._shape, savedState, engine)
+                    : engine.Conv2DBackwardKernel(inputs[0], gradOutput, inputs[1]._shape,
+                        (int[])savedState[0], (int[])savedState[1], (int[])savedState[2]), engine);
+    }
+
+    // Inputs: dY, X; output: dW.
+    internal static void Conv2DKernelGradBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        if (DifferentiableOps.IsGradientRequired(inputs[0]))
+            DifferentiableOps.AccumulateGrad(grads, inputs[0],
+                engine.Conv2D(inputs[1], gradOutput, (int[])savedState[0], (int[])savedState[1], (int[])savedState[2]), engine);
+        if (DifferentiableOps.IsGradientRequired(inputs[1]))
+            DifferentiableOps.AccumulateGrad(grads, inputs[1],
+                DifferentiableOps._isBackwardCreateGraph
+                    ? Conv2DInputGradRecorded(inputs[0], gradOutput, inputs[1]._shape, savedState, engine)
+                    : engine.Conv2DBackwardInput(inputs[0], gradOutput, inputs[1]._shape,
+                        (int[])savedState[0], (int[])savedState[1], (int[])savedState[2]), engine);
     }
 
     /// <summary>
