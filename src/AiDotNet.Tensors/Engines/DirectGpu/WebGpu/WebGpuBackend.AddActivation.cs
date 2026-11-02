@@ -27,7 +27,9 @@ const GELU_COEF: f32 = 0.044715;
 fn add_relu(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < params.size) {
-        C[idx] = max(0.0, A[idx] + B[idx]);
+        // relu's contract: a NaN sum stays NaN (tested on the bits; WGSL may assume no NaN), -0 becomes +0.
+        let s = A[idx] + B[idx];
+        C[idx] = select(select(0.0, s, s > 0.0), s, (bitcast<u32>(s) & 0x7fffffffu) > 0x7f800000u);
     }
 }
 

@@ -3921,6 +3921,28 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 A, B, bias, M, K, N, DirectPtxLinearActivation.LeakyRelu);
             if (directPtx is not null) return directPtx;
         }
+        else
+        {
+            // The direct PTX epilogue fixes alpha at 0.01. Any other slope took the WMMA kernel, whose reduced-precision
+            // product read GemmBiasLeakyRelu[0,0] 6e-4 off the fp32 result that every other GemmBias epilogue matches
+            // (CUDA lane, sm86). The fp32 GemmBias and the LeakyRelu kernel give that result, as GemmBiasSwish falls back.
+            IGpuBuffer? temp = null;
+            IGpuBuffer? result = null;
+            try
+            {
+                temp = GemmBias(A, B, bias, M, N, K);
+                result = AllocateBuffer(M * N);
+                LeakyRelu(temp, result, alpha, M * N);
+                temp.Dispose();
+                return result;
+            }
+            catch
+            {
+                result?.Dispose();
+                temp?.Dispose();
+                throw;
+            }
+        }
         var output = AllocateBuffer(M * N);
 
         // LeakyReLU kernel has an extra alpha parameter

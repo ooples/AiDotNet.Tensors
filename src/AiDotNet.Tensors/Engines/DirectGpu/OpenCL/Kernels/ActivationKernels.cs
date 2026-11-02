@@ -1422,13 +1422,18 @@ __kernel void softmax_div_scalar(
 // These eliminate one full memory round-trip by combining two ops in one pass.
 // ===========================================================================
 
-// Fused Add + ReLU: C = max(0, A + B) — saves 8MB memory traffic at 1M floats
+// Fused Add + ReLU: C = relu(A + B) with relu's contract (a NaN sum stays NaN, -0 becomes +0), where
+// fmax(0, NaN) returned 0. NaN is tested on the bits, as relu does, because of -cl-finite-math-only.
+inline float add_relu_keep_nan(float s) {
+    return ((as_uint(s) & 0x7fffffffu) > 0x7f800000u) ? s : (s > 0.0f ? s : 0.0f);
+}
 __kernel void add_relu(__global const float* A, __global const float* B, __global float* C, const int size) {
     const int idx = get_global_id(0); const int idx4 = idx * 4;
     if (idx4 + 3 < size) {
-        float4 a = vload4(idx, A); float4 b = vload4(idx, B);
-        vstore4(fmax((float4)(0.0f), a + b), idx, C);
-    } else { for (int i = idx4; i < size; i++) C[i] = fmax(0.0f, A[i] + B[i]); }
+        float4 s = vload4(idx, A) + vload4(idx, B);
+        vstore4((float4)(add_relu_keep_nan(s.x), add_relu_keep_nan(s.y), add_relu_keep_nan(s.z), add_relu_keep_nan(s.w)),
+                idx, C);
+    } else { for (int i = idx4; i < size; i++) C[i] = add_relu_keep_nan(A[i] + B[i]); }
 }
 
 // Fused Add + Sigmoid: C = sigmoid(A + B)
