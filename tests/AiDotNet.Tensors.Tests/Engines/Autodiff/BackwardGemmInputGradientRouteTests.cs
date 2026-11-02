@@ -9,8 +9,9 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 
 /// <summary>
-/// dX = dY·Wᵀ for a linear layer: where the route prefers it, W is transposed once and the product runs as a plain
-/// NN GEMM (the direct kernels, 512-bit on AVX-512) instead of the transposed-B dot-product path.
+/// dX = dY·Wᵀ for a linear layer: on AVX-512 the 512-bit direct tiles read strips of W transposed as they are packed;
+/// elsewhere, where the route prefers it, W is transposed once and the product runs as a plain NN GEMM, instead of the
+/// transposed-B dot-product path.
 /// </summary>
 [Collection("BlasManaged-Stats-Serial")]
 public class BackwardGemmInputGradientRouteTests
@@ -44,7 +45,7 @@ public class BackwardGemmInputGradientRouteTests
     [InlineData(false, 128, 784, 512)]
     [InlineData(false, 128, 256, 10)]
     [InlineData(false, 128, 512, 256)]   // not routed: the transposed-B path, still correct
-    public void InputGradient_MatchesReference_AndOnlyRoutedShapesTransposeW(bool vector512, int m, int k, int n)
+    public void InputGradient_MatchesReference_AndTakesTheExpectedRoute(bool vector512, int m, int k, int n)
     {
         Skip.IfNot(System.Runtime.Intrinsics.X86.Fma.IsSupported, "direct GEMM requires FMA");
         var random = RandomHelper.CreateSeededRandom(1573);
@@ -60,10 +61,14 @@ public class BackwardGemmInputGradientRouteTests
         try
         {
             SimdGemm.s_forceVector512Direct = vector512;
-            routed = BackwardFunctions<float>.BackwardInputGradientPrefersTransposedW(m, n);
-            long runsBefore = BackwardFunctions<float>.t_transposedWInputGradientRuns;
+            // AVX-512 takes the fused transposed-strip kernel; otherwise the explicit transpose where preferred.
+            bool fused = vector512 && m >= 64 && n <= SimdGemm.MaxPackedStripK;
+            routed = fused || BackwardFunctions<float>.BackwardInputGradientPrefersTransposedW(m, n);
+            long transposedBefore = BackwardFunctions<float>.t_transposedWInputGradientRuns;
+            int fusedBefore = SimdGemm.t_directParallel2DTransBRuns;
             BackwardFunctions<float>.BackwardGemmInputGradient(dY, w, dX, m, k, n);
-            Assert.Equal(routed ? runsBefore + 1 : runsBefore,
+            Assert.Equal(fused ? fusedBefore + 1 : fusedBefore, SimdGemm.t_directParallel2DTransBRuns);
+            Assert.Equal(routed && !fused ? transposedBefore + 1 : transposedBefore,
                 BackwardFunctions<float>.t_transposedWInputGradientRuns);
 
             var wT = new float[n * k];

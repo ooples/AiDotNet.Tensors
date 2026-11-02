@@ -769,6 +769,13 @@ internal static class BackwardFunctions<T>
     {
         if (n <= BackwardInputGradientSimdMaxN)
         {
+#if NET9_0_OR_GREATER
+            // AVX-512: the transpose fused into the direct tiles' strip packing (no serial pass over W first).
+            if (m >= BackwardInputGradientTransposeMinM
+                && SimdGemm.TrySgemmDirectParallel2DTransB(dY.AsSpan(0, m * n), w.AsSpan(0, k * n), dX.AsSpan(0, m * k),
+                    m, n, k, allowParallel: SimdGemm.UseParallelGemm))
+                return;
+#endif
 #if NET5_0_OR_GREATER
             if (BackwardInputGradientPrefersTransposedW(m, n))
             {
