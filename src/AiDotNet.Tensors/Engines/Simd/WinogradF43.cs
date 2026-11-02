@@ -45,6 +45,7 @@ internal static unsafe partial class WinogradF43
 
     /// <summary>Fewest patches (batch x tiles) the transform-domain GEMMs take: below it the weight transform (36 x C x K
     /// values) outweighs the multiplies saved, and the direct kernel stays.</summary>
+    internal static int s_minPlane = 8;
     internal static int s_minPatches =
         int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_WINOGRAD_MIN_PATCHES"), out int minPatches) && minPatches > 0 ? minPatches : 128;
 
@@ -63,7 +64,7 @@ internal static unsafe partial class WinogradF43
     /// 1.28 against 1.39 on EPYC 9V45), but not on Zen 4's half-rate unit (2.89 against 2.08 on EPYC 9V74) or the 256-bit
     /// kernel. An explicit AIDOTNET_WINOGRAD_MIN_BACKWARD_PATCHES keeps both gradients on one floor.
     /// </summary>
-    internal static readonly int s_minInputGradientPatches =
+    internal static int s_minInputGradientPatches =
         Environment.GetEnvironmentVariable("AIDOTNET_WINOGRAD_MIN_BACKWARD_PATCHES") is null && CpuMicroarchitecture.FullRateVector512
             ? FullRateInputGradientMinPatches : s_minBackwardPatches;
 
@@ -98,7 +99,7 @@ internal static unsafe partial class WinogradF43
         int minChannels = s_blockedNarrow || s_forceBlockedForTest ? MinBlockedChannels : s_minChannels;
         if (inChannels % 8 != 0 || outChannels % 8 != 0 || inChannels < minChannels || outChannels < minChannels
             || batch <= 0) return false;
-        if (height < 8 || width < 8) return false;
+        if (height < s_minPlane || width < s_minPlane) return false;
         long patches = (long)batch * ((height + 3) / 4) * ((width + 3) / 4);
         if (patches < minPatches) return false;
         // V and M stay addressable with int offsets.

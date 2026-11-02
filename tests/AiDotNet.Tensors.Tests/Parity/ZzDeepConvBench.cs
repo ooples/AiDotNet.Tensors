@@ -32,7 +32,7 @@ public class ZzDeepConvBench
         var engine = new CpuEngine();
         var rng = new Random(5);
         var all = DirectConvAvx2.EnabledPasses;
-        int minP = WinogradF43.s_minPatches;
+        int minP = WinogradF43.s_minPatches, minIg = WinogradF43.s_minInputGradientPatches;
         foreach (var (m, k, n) in new[] { (512, 4608, 128), (256, 2304, 512), (512, 2304, 128), (128, 1152, 2048) })
         {
             var a = Rand(rng, m, k); var bb = Rand(rng, k, n); var c = new Tensor<float>(new[] { m, n });
@@ -49,9 +49,10 @@ public class ZzDeepConvBench
         }
         var variants = new (string Name, Action Set)[]
         {
-            ("cur", () => { DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = false; WinogradF43.s_minPatches = minP; }),
-            ("wino32", () => { DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = false; WinogradF43.s_minPatches = 32; }),
-            ("nowino", () => { DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = true; WinogradF43.s_minPatches = minP; }),
+            ("cur", () => { DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = false; WinogradF43.s_minPatches = minP; WinogradF43.s_minPlane = 8; WinogradF43.s_minInputGradientPatches = minIg; }),
+            ("wino4", () => { DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = false; WinogradF43.s_minPatches = 8; WinogradF43.s_minPlane = 4; WinogradF43.s_minInputGradientPatches = 8; }),
+            ("wino32", () => { DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = false; WinogradF43.s_minPatches = 32; WinogradF43.s_minPlane = 8; WinogradF43.s_minInputGradientPatches = minIg; }),
+            ("nowino", () => { DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = true; WinogradF43.s_minPatches = minP; WinogradF43.s_minPlane = 8; WinogradF43.s_minInputGradientPatches = minIg; }),
             ("gemm", () => { DirectConvAvx2.EnabledPasses = DirectConvPasses.None; WinogradF43.s_disable = true; }),
         };
         var convs = new (int Cin, int Cout, int Hw, int S)[]
@@ -77,6 +78,13 @@ public class ZzDeepConvBench
             };
             foreach (var op in ops)
             {
+                {
+                    var outT = op.Name == "fwd" ? y : op.Name == "dgrad" ? dx : dw;
+                    variants[0].Set(); op.Run(); var refv = outT.ToArray();
+                    variants[1].Set(); op.Run(); var got = outT.ToArray();
+                    double md = 0, mx = 0; for (int i = 0; i < refv.Length; i++) { md = Math.Max(md, Math.Abs(refv[i] - got[i])); mx = Math.Max(mx, Math.Abs(refv[i])); }
+                    var dl = $"ZZ {c.Cin}->{c.Cout} {c.Hw}x{c.Hw} s{c.S} {op.Name,-5} wino4 maxdiff {md:G3} of {mx:G3}"; _o.WriteLine(dl); Console.WriteLine(dl);
+                }
                 var times = variants.ToDictionary(v => v.Name, _ => new List<double>());
                 foreach (var v in variants) { v.Set(); var sw0 = Stopwatch.StartNew(); while (sw0.ElapsedMilliseconds < 250) op.Run(); }
                 for (int round = 0; round < 15; round++)
