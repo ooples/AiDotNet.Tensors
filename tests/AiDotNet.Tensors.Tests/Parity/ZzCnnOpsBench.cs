@@ -13,6 +13,7 @@ using Xunit.Abstractions;
 
 namespace AiDotNet.Tensors.Tests.Parity;
 
+[Collection("ZzSerial")]
 public class ZzCnnOpsBench
 {
     private readonly ITestOutputHelper _o;
