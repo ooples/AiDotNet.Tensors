@@ -61,6 +61,14 @@ public class ZzMlpGemmBench
             var gx = Measure(() => BackwardFunctions<float>.BackwardGemmInputGradient(dy, w, dx, m, k, n));
             Line($"ZM {k}->{n} fwd {f.Min:F4}/{f.Med:F4}  dW {gw.Min:F4}/{gw.Med:F4}  dX {gx.Min:F4}/{gx.Med:F4}");
         }
+        foreach (var (mm, k, n) in new[] { (128, 784, 512), (128, 512, 256), (128, 256, 10), (64, 3136, 128), (64, 128, 10) })
+        {
+            float[] x = Rand(rng, mm * k), w = Rand(rng, k * n), o = new float[mm * n];
+            var cached = Measure(() => AiDotNet.Tensors.Engines.Simd.SimdGemm.SgemmWithCachedB(x, w, o, mm, k, n));
+            var blas = Measure(() => AiDotNet.Tensors.Helpers.BlasProvider.Gemm(mm, n, k, x, 0, k, w, 0, n, o, 0, n));
+            var simd = Measure(() => { o.AsSpan().Clear(); AiDotNet.Tensors.Engines.Simd.SimdGemm.Sgemm(x.AsSpan(0, mm * k), k, false, w.AsSpan(0, k * n), n, false, o.AsSpan(0, mm * n), mm, k, n); });
+            Line($"ZM route m{mm} {k}->{n} cachedB {cached.Min:F4}/{cached.Med:F4}  blas {blas.Min:F4}/{blas.Med:F4}  sgemm {simd.Min:F4}/{simd.Med:F4}");
+        }
         ZzDeepConvBenchTorch.Run(_o, "tools/parity/zz_mlp_torch.py", threads);
     }
 }
