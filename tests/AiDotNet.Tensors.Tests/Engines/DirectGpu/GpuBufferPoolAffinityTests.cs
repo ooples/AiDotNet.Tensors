@@ -63,6 +63,47 @@ public sealed class GpuBufferPoolAffinityTests
         Assert.Same(buffer, rented);
         Assert.Equal(0, buffer.ReleaseCount);
     }
+    // Tuning on another thread parked nothing in this pool: a buffer returned here survives the drain that follows it.
+    [Fact]
+    public void MeasurementOnAnotherThread_KeepsABufferReturnedOutsideIt()
+    {
+        using var pool = new GpuBufferPool<FakeBuffer>(maxPerSize: 4, maxSize: 1024);
+        var buffer = new FakeBuffer(64);
+        pool.Return(buffer);
+
+        var tuning = new Thread(() =>
+        {
+            AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelRegistry.BeginMeasurement();
+            AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelRegistry.EndMeasurement();
+        });
+        tuning.Start();
+        tuning.Join();
+
+        Assert.True(pool.TryRent(64, out var rented));
+        Assert.Same(buffer, rented);
+        Assert.Equal(0, buffer.ReleaseCount);
+    }
+
+    // What a measurement returned is its candidates' workspaces: the first rent after it ends releases them, and only them.
+    [Fact]
+    public void MeasurementWorkspaces_AreReleasedOnTheNextRent_AndNothingElse()
+    {
+        using var pool = new GpuBufferPool<FakeBuffer>(maxPerSize: 4, maxSize: 1024);
+        var kept = new FakeBuffer(64);
+        var workspace = new FakeBuffer(256);
+        pool.Return(kept);
+
+        AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelRegistry.BeginMeasurement();
+        try { pool.Return(workspace); }
+        finally { AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelRegistry.EndMeasurement(); }
+
+        Assert.True(pool.TryRent(64, out var rented));
+        Assert.Same(kept, rented);
+        Assert.Equal(1, workspace.ReleaseCount);
+        Assert.Equal(0, kept.ReleaseCount);
+        Assert.False(pool.TryRent(256, out _));
+    }
+
     [Fact]
     public void Capacity_RemainsSharedAcrossAffinityDomains()
     {

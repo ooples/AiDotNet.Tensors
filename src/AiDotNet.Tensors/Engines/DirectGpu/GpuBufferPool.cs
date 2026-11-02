@@ -61,6 +61,10 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
     internal long MaxPooledElements { get; set; } = long.MaxValue;
     private readonly object _lifecycleGate = new();
     private long _drainedAtMeasurement;
+    // Buffers a thread returned while it measured kernel candidates (their workspaces), until they are rented again or
+    // released. The drain after a measurement releases only these.
+    private readonly ConcurrentDictionary<TBuffer, byte> _measurementParked =
+        new(Autodiff.ReferenceEqualityComparer<TBuffer>.Instance);
     private int _disposed;
 
     /// <summary>Buffers currently parked in the pool (returned and not yet rented again): device memory the pool holds.</summary>
@@ -125,12 +129,13 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
             return false;
         }
 
-        // Kernel tuning measured candidates since this pool was last used: what it parked meanwhile is mostly their
-        // workspaces, at sizes nothing asks for again (44 MB idle at a CNN's peak). Release it all once.
+        // Kernel tuning measured candidates since this pool was last used: their workspaces, parked at sizes nothing
+        // asks for again (44 MB idle at a CNN's peak), are released once. Only those: draining everything let tuning on
+        // one thread empty the pool between another thread's Return and the TryRent expecting the buffer back.
         long measurements = Helpers.Autotune.TunedKernels.TunedKernelRegistry.MeasurementGeneration;
         if (measurements != Volatile.Read(ref _drainedAtMeasurement)
             && Interlocked.Exchange(ref _drainedAtMeasurement, measurements) != measurements)
-            DrainAll();
+            DrainMeasurementParked();
 
         // Use power-of-two bucket key for higher cache hit rate
         int bucketKey = BucketKey(size);
@@ -155,6 +160,7 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
                 }
 
                 RestoreUndersizedCandidates(undersized, affinity);
+                _measurementParked.TryRemove(candidate, out _);
                 candidate.MarkRented(size);
                 buffer = candidate;
                 return true;
@@ -213,8 +219,47 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
                 return;
             }
 
+            // Marked before it is visible to a rent, which clears the mark.
+            if (Helpers.Autotune.TunedKernels.TunedKernelRegistry.MeasuringOnThisThread)
+                _measurementParked[buffer] = 0;
             bucket.Buffers.GetOrAdd(affinity, _ => new ConcurrentBag<TBuffer>()).Add(buffer);
         }
+    }
+
+    /// <summary>
+    /// Releases the buffers returned during a kernel-tuning measurement and keeps every other pooled buffer. Returns the
+    /// number released.
+    /// </summary>
+    internal int DrainMeasurementParked()
+    {
+        if (_measurementParked.IsEmpty) return 0;
+        int released = 0;
+        lock (_lifecycleGate)
+        {
+            if (Volatile.Read(ref _disposed) != 0) return 0;
+            var kept = new List<TBuffer>();
+            foreach (var bucket in _buckets.Values)
+            {
+                foreach (var affinityBuffers in bucket.Buffers.Values)
+                {
+                    kept.Clear();
+                    while (affinityBuffers.TryTake(out var buffer))
+                    {
+                        if (!_measurementParked.TryRemove(buffer, out _))
+                        {
+                            kept.Add(buffer);
+                            continue;
+                        }
+                        Interlocked.Decrement(ref bucket.Count);
+                        Interlocked.Add(ref _pooledElements, -buffer.Capacity);
+                        buffer.Release();
+                        released++;
+                    }
+                    foreach (var buffer in kept) affinityBuffers.Add(buffer);
+                }
+            }
+        }
+        return released;
     }
 
     /// <summary>
@@ -241,6 +286,7 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
                 {
                     Interlocked.Decrement(ref bucket.Count);
                     Interlocked.Add(ref _pooledElements, -buffer.Capacity);
+                    _measurementParked.TryRemove(buffer, out _);
                     buffer.Release();
                     released++;
                 }
@@ -281,6 +327,7 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
                 }
 
                 _buckets.Clear();
+                _measurementParked.Clear();
             }
             catch (ObjectDisposedException)
             {
