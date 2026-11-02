@@ -89,8 +89,10 @@ public class ZzMlpStepBench
             var a512 = engine.FusedLinear(x, w1, b1, FusedActivationType.ReLU);
             var a256 = engine.FusedLinear(a512, w2, b2, FusedActivationType.ReLU);
             var g512 = Rand(rng, 1f, 128, 512); var g256 = Rand(rng, 1f, 128, 256);
-            var r512 = Measure(() => engine.ApplyFusedActivationBackward(g512, a512, FusedActivationType.ReLU, null));
-            var r256 = Measure(() => engine.ApplyFusedActivationBackward(g256, a256, FusedActivationType.ReLU, null));
+            var r512 = Measure(() => { using var tp = new GradientTape<float>(); engine.ApplyFusedActivationBackward(g512, a512, FusedActivationType.ReLU, null); });
+            var r256 = Measure(() => { using var tp = new GradientTape<float>(); engine.ApplyFusedActivationBackward(g256, a256, FusedActivationType.ReLU, null); });
+            var n512 = Measure(() => { using var tp = new GradientTape<float>(); });
+            Line($"ZS empty-tape {n512.Min:F4}/{n512.Med:F4}");
             var out10 = engine.FusedLinear(a256, w3, b3, FusedActivationType.None);
             var mse = Measure(() =>
             {
