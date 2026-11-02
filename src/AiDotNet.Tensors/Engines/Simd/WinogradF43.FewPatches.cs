@@ -20,7 +20,10 @@ internal static unsafe partial class WinogradF43
     private const int FewKBlock = 16;
 
     /// <summary>Input channels per transformed-weight slab: 36 x 16 x 16 floats (36 KB) stay in L1.</summary>
-    private const int FewCBlock = 16;
+    internal static int s_fewCBlock = 16;
+
+    /// <summary>Input channels per transformed-weight slab of the 512-bit tiles (multiple of 8).</summary>
+    internal static int s_fewCBlock512 = 8;
 
     /// <summary>Patches per multiply group (the microkernel's rows); the patch count is padded up to it.</summary>
     private const int FewPatchGroup = 8;
@@ -67,7 +70,7 @@ internal static unsafe partial class WinogradF43
             int outW = tilesW * Tile, hw = height * width;
             // 512-bit hosts: jobs of 32 output channels (two zmm) over slabs of 8 input channels (36 x 8 x 32 floats, 36 KB).
             bool wide = UseFewPatches512 && cOut % (2 * FewKBlock) == 0;
-            int kb = wide ? 2 * FewKBlock : FewKBlock, cb = wide ? FewCBlock / 2 : FewCBlock, groups = kb / 8;
+            int kb = wide ? 2 * FewKBlock : FewKBlock, cb = wide ? s_fewCBlock512 : s_fewCBlock, groups = kb / 8;
             int mFloats = Points * paddedPatches * kb;
             int slabFloats = Points * cb * kb, stageFloats = 9 * cb * kb;
             int bandFloats = tilesH * Tile * outW * 8;

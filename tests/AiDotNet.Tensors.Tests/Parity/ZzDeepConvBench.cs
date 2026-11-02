@@ -49,16 +49,15 @@ public class ZzDeepConvBench
         }
         var variants = new (string Name, Action Set)[]
         {
-            ("cur", () => { DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = false; WinogradF43.s_fewMaxPatches = fewP; WinogradF43.s_fewPatches512 = true; }),
-            ("nofew", () => { DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = false; WinogradF43.s_fewMaxPatches = 0; WinogradF43.s_fewPatches512 = true; }),
-            ("few256", () => { DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = false; WinogradF43.s_fewMaxPatches = fewP; WinogradF43.s_fewPatches512 = false; }),
-            ("nowino", () => { DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = true; WinogradF43.s_fewMaxPatches = fewP; WinogradF43.s_fewPatches512 = true; }),
-            ("gemm", () => { DirectConvAvx2.EnabledPasses = DirectConvPasses.None; WinogradF43.s_disable = true; WinogradF43.s_fewMaxPatches = fewP; WinogradF43.s_fewPatches512 = true; }),
+            ("cur", () => { DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = false; WinogradF43.s_fewMaxPatches = fewP; WinogradF43.s_fewCBlock512 = 8; WinogradF43.s_fewCBlock = 16; }),
+            ("nofew", () => { DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = false; WinogradF43.s_fewMaxPatches = 0; }),
+            ("c16", () => { DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = false; WinogradF43.s_fewMaxPatches = fewP; WinogradF43.s_fewCBlock512 = 16; WinogradF43.s_fewCBlock = 32; }),
+            ("c32", () => { DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = false; WinogradF43.s_fewMaxPatches = fewP; WinogradF43.s_fewCBlock512 = 32; WinogradF43.s_fewCBlock = 64; }),
+            ("c64", () => { DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = false; WinogradF43.s_fewMaxPatches = fewP; WinogradF43.s_fewCBlock512 = 64; WinogradF43.s_fewCBlock = 128; }),
         };
         var convs = new (int Cin, int Cout, int Hw, int S)[]
         {
-            (512, 512, 4, 1), (256, 256, 8, 1), (256, 512, 8, 2), (128, 256, 16, 2), (64, 128, 32, 2), (128, 128, 16, 1),
-            (3, 64, 224, 2), (64, 64, 56, 1), (64, 64, 32, 1),
+            (512, 512, 4, 1), (256, 256, 8, 1),
         };
         const int b = 8;
         Torch();
@@ -100,7 +99,7 @@ public class ZzDeepConvBench
                 _o.WriteLine(line); Console.WriteLine(line);
             }
         }
-        DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = false; WinogradF43.s_fewMaxPatches = fewP;
+        DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = false; WinogradF43.s_fewMaxPatches = fewP; WinogradF43.s_fewCBlock512 = 8; WinogradF43.s_fewCBlock = 16;
         Torch();
     }
 
