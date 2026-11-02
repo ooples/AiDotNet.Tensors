@@ -750,6 +750,7 @@ internal static class BackwardFunctions<T>
     //   heads (n = 10: 0.0128 vs 0.0114); at depth 128 and 256 it loses (0.355 vs 0.41, 0.235 vs 0.27).
     // The transpose is amortised only over enough rows, hence the m floor.
     private const int BackwardInputGradientTransposeMinM = 64;
+    private static readonly bool s_zzDxOld = Environment.GetEnvironmentVariable("ZZ_DX_OLD") == "1"; // probe A/B only
 
     /// <summary>Test observable: input gradients this thread formed through the transposed-W NN product.</summary>
     [ThreadStatic] internal static long t_transposedWInputGradientRuns;
@@ -771,13 +772,13 @@ internal static class BackwardFunctions<T>
         {
 #if NET9_0_OR_GREATER
             // AVX-512: the transpose fused into the direct tiles' strip packing (no serial pass over W first).
-            if (m >= BackwardInputGradientTransposeMinM
+            if (!s_zzDxOld && m >= BackwardInputGradientTransposeMinM
                 && SimdGemm.TrySgemmDirectParallel2DTransB(dY.AsSpan(0, m * n), w.AsSpan(0, k * n), dX.AsSpan(0, m * k),
                     m, n, k, allowParallel: SimdGemm.UseParallelGemm))
                 return;
 #endif
 #if NET5_0_OR_GREATER
-            if (BackwardInputGradientPrefersTransposedW(m, n))
+            if (!s_zzDxOld && BackwardInputGradientPrefersTransposedW(m, n))
             {
                 t_transposedWInputGradientRuns++;
                 float[] wT = System.Buffers.ArrayPool<float>.Shared.Rent(n * k);
