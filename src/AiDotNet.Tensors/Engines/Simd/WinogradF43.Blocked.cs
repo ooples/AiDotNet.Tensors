@@ -263,6 +263,13 @@ internal static unsafe partial class WinogradF43
     private static void BlockGemm(float* a, int aRow, int aStep, float* b, float* c, int rows, int depth, int cols,
         bool accumulate)
     {
+#if NET9_0_OR_GREATER
+        if (UseBlockGemm512)
+        {
+            BlockGemm512(a, aRow, aStep, b, c, rows, depth, cols, accumulate);
+            return;
+        }
+#endif
         for (int i = 0; i < rows; i += 3)
         {
             int live = Math.Min(3, rows - i);

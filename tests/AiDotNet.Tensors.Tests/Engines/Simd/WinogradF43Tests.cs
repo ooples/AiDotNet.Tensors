@@ -106,6 +106,49 @@ public class WinogradF43Tests
             Assert.True(Math.Abs(wideDw[i] - blockedDw[i]) <= 1e-3 * (1 + Math.Abs(wideDw[i])), $"dw[{i}] {wideDw[i]} vs {blockedDw[i]}");
     }
 
+#if NET9_0_OR_GREATER
+    // The blocked passes' 512-bit GEMM tile (eight rows x 32 columns, then 16- and 8-wide column tails) sums every output's
+    // depth terms in the same order as the 256-bit tile: bit-identical forward, input and weight gradients. Forced on
+    // hosts without AVX-512 (Vector512 then runs in software).
+    [SkippableTheory]
+    [InlineData(2, 64, 64, 16, 16)]    // 32 patches a band: four 8-row tiles; 64 columns: two 32-wide tiles
+    [InlineData(3, 40, 56, 30, 33)]    // 40 and 56 columns: a 32-wide tile and an 8- or a 16 + 8-wide tail; partial bands
+    [InlineData(9, 48, 64, 16, 12)]    // weight gradient rows 64, columns 48 (32 + 16); bands of 12 patches (8 + 4 rows)
+    public void BlockedGemm512_IsBitIdenticalTo256BitTile(int n, int c, int k, int h, int w)
+    {
+        Skip.IfNot(KernelRuns, "The Winograd kernel needs AVX2 + FMA.");
+        var rng = new Random(n * 7 + c + k + h + w);
+        float[] x = Fill(rng, n * c * h * w), wt = Fill(rng, k * c * 9), dy = Fill(rng, n * k * h * w);
+        bool previousForce = WinogradF43.s_forceBlockedForTest, previous512 = WinogradF43.s_blockGemm512;
+        bool? previousVector = SimdGemm.s_forceVector512Direct;
+        (float[] Y, float[] Dx, float[] Dw) Run(bool wide)
+        {
+            WinogradF43.s_blockGemm512 = wide;
+            SimdGemm.s_forceVector512Direct = wide ? true : previousVector;
+            float[] y = Fill(new Random(1), n * k * h * w), dx = Fill(new Random(2), n * c * h * w), dw = Fill(new Random(3), k * c * 9);
+            WinogradF43.Forward(x, 0, wt, 0, y, 0, true, n, c, h, w, k);
+            WinogradF43.BackwardInput(dy, 0, wt, 0, dx, 0, true, n, c, h, w, k);
+            WinogradF43.BackwardKernel(x, 0, dy, 0, dw, 0, true, n, c, h, w, k);
+            return (y, dx, dw);
+        }
+        try
+        {
+            WinogradF43.s_forceBlockedForTest = true;
+            var narrow = Run(false);
+            var wide = Run(true);
+            Assert.Equal(narrow.Y, wide.Y);
+            Assert.Equal(narrow.Dx, wide.Dx);
+            Assert.Equal(narrow.Dw, wide.Dw);
+        }
+        finally
+        {
+            WinogradF43.s_forceBlockedForTest = previousForce;
+            WinogradF43.s_blockGemm512 = previous512;
+            SimdGemm.s_forceVector512Direct = previousVector;
+        }
+    }
+#endif
+
     [SkippableTheory]
     [MemberData(nameof(Shapes))]
     public void BackwardInput_MatchesTheDirectSum(int n, int c, int k, int h, int w)
