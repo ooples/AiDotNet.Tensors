@@ -40,7 +40,12 @@ internal static partial class DirectConvAvx2
     private const int OutputBlocksPerTile = 4;
 
     // Enough tasks to keep the pool busy without splitting a tile's weight stream into slivers.
-    private const int TargetForwardTasks = 128;
+    private const int DefaultForwardTasks = 128;
+
+    // Forward tasks when the caller names none (AIDOTNET_DIRECT_CONV_FWD_TASKS overrides, for A/B).
+    private static readonly int TargetForwardTasks =
+        int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_DIRECT_CONV_FWD_TASKS"), out int fwdTasks) && fwdTasks > 0
+            ? fwdTasks : DefaultForwardTasks;
 
     // Backward weights needs one (output block, input block) pair per task; fewer pairs than this starve the pool.
     private const int MinBackwardKernelTasks = 16;
@@ -307,7 +312,7 @@ internal static partial class DirectConvAvx2
                 var geometry = new ForwardGeometry(batch, gradBlocks, paddedH * paddedW * Block, paddedW, inChannels,
                     tapsH, tapsW, 1, 1, 1, 1, gridH, gridW, (originRow * paddedW + originCol) * Block,
                     height, width, strideH, strideW, ry, rx);
-                int chunks = (geometry.TotalPositions + PositionUnroll - 1) / PositionUnroll;
+                int chunks = (geometry.TotalPositions + StridedShareUnit - 1) / StridedShareUnit;
                 phases.Add((geometry, packedOffset, firstH, tapsH, firstW, tapsW, chunks));
                 packedOffset += outChannels * inChannels * tapsH * tapsW;
             }
@@ -321,20 +326,39 @@ internal static partial class DirectConvAvx2
         {
             PackInput(gradOutput, gradOutputOffset, packedGrad, batch, outChannels, outputHeight, outputWidth, borderH, borderW, paddedH, paddedW);
             int inBlocks = inChannels / Block;
-            CpuParallelSettings.ParallelForOrSerial(0, phases.Count * inBlocks, (long)outChannels * inChannels * kernelHeight * kernelWidth, [MethodImpl(Hot)] (task) =>
-            {
-                var phase = phases[task / inBlocks];
-                PackKernelPhase(kernel, kernelOffset, packedKernel, phase.KernelOffset, task % inBlocks, outChannels, inChannels,
-                    kernelHeight, kernelWidth, phase.FirstH, strideH, phase.TapsH, phase.FirstW, strideW, phase.TapsW);
-            }, deterministicSafe: true);
+            // Every phase's taps, in phase order: source tap, the phase's packed offset, its tap count and the tap's index.
+            int tapEntries = 0;
+            foreach (var phase in phases) tapEntries += phase.TapsH * phase.TapsW;
+            var tapSource = new int[tapEntries];
+            var tapBase = new int[tapEntries];
+            var tapCount = new int[tapEntries];
+            var tapIndex = new int[tapEntries];
+            int entry = 0;
+            foreach (var phase in phases)
+                for (int y = 0; y < phase.TapsH; y++)
+                    for (int x = 0; x < phase.TapsW; x++, entry++)
+                    {
+                        int kh = phase.FirstH + strideH * (phase.TapsH - 1 - y);
+                        tapSource[entry] = kh * kernelWidth + phase.FirstW + strideW * (phase.TapsW - 1 - x);
+                        tapBase[entry] = phase.KernelOffset;
+                        tapCount[entry] = phase.TapsH * phase.TapsW;
+                        tapIndex[entry] = y * phase.TapsW + x;
+                    }
+            CpuParallelSettings.ParallelForOrSerial(0, inBlocks, (long)outChannels * inChannels * kernelHeight * kernelWidth, [MethodImpl(Hot)] (ib) =>
+                PackKernelPhases(kernel, kernelOffset, packedKernel, ib, outChannels, inChannels, kernelHeight * kernelWidth,
+                    tapSource, tapBase, tapCount, tapIndex), deterministicSafe: true);
 
             // Each task runs EVERY phase over the same share of the grid (the same fraction of each phase's positions,
             // so the same images and rows): the phases interleave in dX (stride 2: alternate columns), and as separate
             // tasks up to four cores wrote each dX cache line at different times. The phases write disjoint positions.
             int minChunks = int.MaxValue;
             foreach (var phase in phases) minChunks = Math.Min(minChunks, phase.Chunks);
-            // At least four position triples per phase in a share: shorter runs cost more in setup than they save.
-            int sharesPerTile = Math.Max(1, Math.Min(minChunks / 4, (taskTarget + tiles - 1) / tiles));
+            // At least four position triples per phase in a share: shorter runs cost more in setup than they save. Where
+            // the 512-bit row kernel runs a share holds whole twelves, so no share ends on six-position stubs (a 256 -> 512
+            // 8x8 stride-2 phase has 128 positions; triples cut it into shares the row kernel mostly skipped).
+            int sharesPerTile = StridedShareUnit == PositionUnroll
+                ? Math.Max(1, Math.Min(minChunks / 4, (taskTarget + tiles - 1) / tiles))
+                : Math.Max(1, Math.Min(minChunks, (taskTarget + tiles - 1) / tiles));
             CpuParallelSettings.ParallelForOrSerial(0, tiles * sharesPerTile,
                 (long)batch * height * width * inChannels * outChannels * kernelHeight * kernelWidth / (strideH * strideW),
                 [MethodImpl(Hot)] (task) =>
@@ -359,9 +383,12 @@ internal static partial class DirectConvAvx2
             pool.Return(packedKernel);
         }
     }
-    // Start of share `share` of `shares` over `total` positions, on a PositionUnroll boundary (the last ends at total).
+    // Start of share `share` of `shares` over `total` positions, on a StridedShareUnit boundary (the last ends at total).
     private static int ShareBound(int total, int share, int shares)
-        => share >= shares ? total : Math.Min(total, (int)((long)total * share / shares) / PositionUnroll * PositionUnroll);
+        => share >= shares ? total : Math.Min(total, (int)((long)total * share / shares) / StridedShareUnit * StridedShareUnit);
+
+    // Positions a strided input-gradient share is a multiple of: the 512-bit row kernel's twelve where it runs.
+    private static int StridedShareUnit => UseAvx512Forward && s_useRowKernel512 ? RowPositions512 : PositionUnroll;
 
     /// <summary>Zeroes phase (ry, rx) of every plane: the input positions no kernel tap reaches (a 1x1 stride-2 conv's odd rows).</summary>
     [MethodImpl(Hot)]
@@ -377,36 +404,31 @@ internal static partial class DirectConvAvx2
     }
 
     /// <summary>
-    /// One input block of one strided-dX phase's packed kernel, at <paramref name="packedOffset"/>:
-    /// [I/8][O/8][tapsH][tapsW][8 out][8 in] with sub-kernel tap (y, x)
-    /// = W[o, i, firstH + strideH*(tapsH-1-y), firstW + strideW*(tapsW-1-x)].
+    /// One input block of every strided-dX phase's packed kernel. Phase p's block lies at its packed offset as
+    /// [I/8][O/8][tapsH][tapsW][8 out][8 in], sub-kernel tap (y, x) = W[o, i, firstH + strideH*(tapsH-1-y),
+    /// firstW + strideW*(tapsW-1-x)]. One pass over the kernel: an output channel's eight input channels are 8 x kH x kW
+    /// consecutive floats, read once (into L1) and written to every phase's taps; one phase at a time read the whole
+    /// kernel once per phase (15% of a 256 -> 512 8x8 stride-2 input gradient on a Xeon 8370C).
     /// </summary>
     [MethodImpl(Hot)]
-    private static unsafe void PackKernelPhase(float[] source, int sourceOffset, float[] packed, int packedOffset, int ib,
-        int outChannels, int inChannels, int kernelHeight, int kernelWidth,
-        int firstH, int strideH, int tapsH, int firstW, int strideW, int tapsW)
+    private static unsafe void PackKernelPhases(float[] source, int sourceOffset, float[] packed, int ib,
+        int outChannels, int inChannels, int kernelPlane, int[] tapSource, int[] tapBase, int[] tapCount, int[] tapIndex)
     {
-        int taps = tapsH * tapsW;
         int outBlocks = outChannels / Block;
+        var lanes = Vector256.Create(0, 1, 2, 3, 4, 5, 6, 7) * kernelPlane;
         fixed (float* ps = source)
         fixed (float* pd = packed)
+        fixed (int* src = tapSource, bases = tapBase, counts = tapCount, index = tapIndex)
         {
-            // Destination order (each 8x8 block written contiguously); the lane-outer order it replaces revisited every
-            // destination line eight times, and was 46% of a 256->512 8x8 stride-2 input gradient (one thread).
-            float* d = pd + packedOffset + (long)ib * outBlocks * taps * Block * Block;
-            int kernelPlane = kernelHeight * kernelWidth;
             for (int ob = 0; ob < outBlocks; ob++)
-                for (int y = 0; y < tapsH; y++)
+                for (int oo = 0; oo < Block; oo++)
                 {
-                    int kh = firstH + strideH * (tapsH - 1 - y);
-                    for (int x = 0; x < tapsW; x++)
+                    float* row = ps + sourceOffset + ((long)(ob * Block + oo) * inChannels + ib * Block) * kernelPlane;
+                    for (int e = 0; e < tapSource.Length; e++)
                     {
-                        int tap = kh * kernelWidth + firstW + strideW * (tapsW - 1 - x);
-                        for (int oo = 0; oo < Block; oo++)
-                        {
-                            float* s = ps + sourceOffset + ((long)(ob * Block + oo) * inChannels + ib * Block) * kernelPlane + tap;
-                            for (int lane = 0; lane < Block; lane++) *d++ = s[lane * kernelPlane];
-                        }
+                        long block = ((long)ib * outBlocks + ob) * counts[e] + index[e];
+                        float* d = pd + bases[e] + block * Block * Block + oo * Block;
+                        Avx.Store(d, Avx2.GatherVector256(row + src[e], lanes, 4));
                     }
                 }
         }
@@ -722,7 +744,11 @@ internal static partial class DirectConvAvx2
         int taskTarget = targetTasks > 0 ? targetTasks : TargetForwardTasks;
         int tiles = geometry.OutChannels / (Block * OutputBlocksPerTile);
         int totalPositions = geometry.TotalPositions;
-        int chunks = (totalPositions + PositionUnroll - 1) / PositionUnroll;
+        // On the 512-bit tile a task holds whole twelves: starting at a multiple of twelve, every group of four of a
+        // plane whose width is a multiple of four is aligned, so the twelve-position kernel takes all of them (task
+        // starts mid-row sent the groups that straddled rows to the six-position kernel).
+        int unit = interleaved || UseAvx512Forward ? RowPositions512 : PositionUnroll;
+        int chunks = (totalPositions + unit - 1) / unit;
         int chunksPerTask = Math.Max(1, (int)(((long)chunks * tiles + taskTarget - 1) / taskTarget));
         int tasksPerTile = (chunks + chunksPerTask - 1) / chunksPerTask;
         CpuParallelSettings.ParallelForOrSerial(0, tiles * tasksPerTile,
@@ -730,8 +756,8 @@ internal static partial class DirectConvAvx2
             [MethodImpl(Hot)] (task) =>
             {
                 int tile = task / tasksPerTile, part = task % tasksPerTile;
-                int first = part * chunksPerTask * PositionUnroll;
-                int last = Math.Min(totalPositions, first + chunksPerTask * PositionUnroll);
+                int first = part * chunksPerTask * unit;
+                int last = Math.Min(totalPositions, first + chunksPerTask * unit);
                 if (s_stagedStore)
                     ForwardTileRuns(packedInput, packedKernel, 0, output, outputOffset, accumulate, geometry, tile, first, last, interleaved);
                 else
@@ -841,7 +867,7 @@ internal static partial class DirectConvAvx2
         int* origin = stackalloc int[MaxForwardRunPositions + RowPositions512];
         // An interleaved kernel (packed for the 512-bit tile) is only ever read by it.
         bool wide = interleaved || UseAvx512Forward;
-        bool rowKernel = wide && s_useRowKernel512 && g.StrideW == 1;
+        bool rowKernel = wide && s_useRowKernel512 && (g.StrideW == 1 || g.StrideW == 2);
         int gridWidth = g.GridWidth, columnStep = g.StrideW * Block;
         bool plain = g.PlainContiguous;
         fixed (float* px = packedInput)
@@ -878,14 +904,27 @@ internal static partial class DirectConvAvx2
                             // (a row of twelve, or 8 + 4 on an 8-wide plane, or three rows of a 4-wide one): a pointer per
                             // group, 24 accumulators, each weight load feeding twelve positions instead of the sextet's six.
                             if (rowKernel && runEnd - q >= RowPositions512
-                                && QuadGroup(origin + i) && QuadGroup(origin + i + 4) && QuadGroup(origin + i + 8))
+                                && QuadGroup(origin + i, columnStep) && QuadGroup(origin + i + 4, columnStep) && QuadGroup(origin + i + 8, columnStep))
                             {
-                                if (interleaved)
-                                    ForwardRowRun512<Interleaved512>(px + origin[i], px + origin[i + 4], px + origin[i + 8], passKernel, blockStride, cbEnd - cb0, cb0 * planeIn, planeIn,
-                                        kernelHeight, kernelWidth, rowStep, colStep, stage + i * 32, cb0 > 0);
+                                float* g0 = px + origin[i], g1 = px + origin[i + 4], g2 = px + origin[i + 8];
+                                int cbs = cbEnd - cb0, firstOff = cb0 * planeIn;
+                                float* st = stage + i * 32;
+                                bool seededPass = cb0 > 0;
+                                if (columnStep == Block)
+                                {
+                                    if (interleaved)
+                                        ForwardRowRun512<Interleaved512, Step1Pos>(g0, g1, g2, passKernel, blockStride, cbs, firstOff, planeIn,
+                                            kernelHeight, kernelWidth, rowStep, colStep, st, seededPass);
+                                    else
+                                        ForwardRowRun512<Blocked512, Step1Pos>(g0, g1, g2, passKernel, blockStride, cbs, firstOff, planeIn,
+                                            kernelHeight, kernelWidth, rowStep, colStep, st, seededPass);
+                                }
+                                else if (interleaved)
+                                    ForwardRowRun512<Interleaved512, Step2Pos>(g0, g1, g2, passKernel, blockStride, cbs, firstOff, planeIn,
+                                        kernelHeight, kernelWidth, rowStep, colStep, st, seededPass);
                                 else
-                                    ForwardRowRun512<Blocked512>(px + origin[i], px + origin[i + 4], px + origin[i + 8], passKernel, blockStride, cbEnd - cb0, cb0 * planeIn, planeIn,
-                                        kernelHeight, kernelWidth, rowStep, colStep, stage + i * 32, cb0 > 0);
+                                    ForwardRowRun512<Blocked512, Step2Pos>(g0, g1, g2, passKernel, blockStride, cbs, firstOff, planeIn,
+                                        kernelHeight, kernelWidth, rowStep, colStep, st, seededPass);
                                 q += RowPositions512;
                                 continue;
                             }
@@ -1108,10 +1147,12 @@ internal static partial class DirectConvAvx2
     /// FMA chain is the AVX2 kernel's: bit-identical results.
     /// </summary>
     [MethodImpl(Hot)]
-    private static unsafe void ForwardRowRun512<TLayout>(float* x, float* x4, float* x8, float* w, long blockStride, int blocks,
+    private static unsafe void ForwardRowRun512<TLayout, TPos>(float* x, float* x4, float* x8, float* w, long blockStride, int blocks,
         int firstBlockOffset, int planeIn, int kernelHeight, int kernelWidth, int rowStep, int colStep,
-        float* slot, bool seeded) where TLayout : struct, IWeightLayout512
+        float* slot, bool seeded) where TLayout : struct, IWeightLayout512 where TPos : struct, IPositionStep512
     {
+        // Floats between consecutive positions of a group: a constant once the struct argument is known.
+        int S = default(TPos).Step;
         Vector512<float> a0l, a0h, a1l, a1h, a2l, a2h, a3l, a3h, a4l, a4h, a5l, a5h, a6l, a6h, a7l, a7h, a8l, a8h, a9l, a9h, a10l, a10h, a11l, a11h;
         if (seeded)
         {
@@ -1151,17 +1192,17 @@ internal static partial class DirectConvAvx2
                         var wh = default(TLayout).High(w, stride2, stride3);
                         Vector512<float> b;
                         b = Vector512.Create(p[c]); a0l = Vector512.FusedMultiplyAdd(b, wl, a0l); a0h = Vector512.FusedMultiplyAdd(b, wh, a0h);
-                        b = Vector512.Create(p[8 + c]); a1l = Vector512.FusedMultiplyAdd(b, wl, a1l); a1h = Vector512.FusedMultiplyAdd(b, wh, a1h);
-                        b = Vector512.Create(p[16 + c]); a2l = Vector512.FusedMultiplyAdd(b, wl, a2l); a2h = Vector512.FusedMultiplyAdd(b, wh, a2h);
-                        b = Vector512.Create(p[24 + c]); a3l = Vector512.FusedMultiplyAdd(b, wl, a3l); a3h = Vector512.FusedMultiplyAdd(b, wh, a3h);
+                        b = Vector512.Create(p[S + c]); a1l = Vector512.FusedMultiplyAdd(b, wl, a1l); a1h = Vector512.FusedMultiplyAdd(b, wh, a1h);
+                        b = Vector512.Create(p[2 * S + c]); a2l = Vector512.FusedMultiplyAdd(b, wl, a2l); a2h = Vector512.FusedMultiplyAdd(b, wh, a2h);
+                        b = Vector512.Create(p[3 * S + c]); a3l = Vector512.FusedMultiplyAdd(b, wl, a3l); a3h = Vector512.FusedMultiplyAdd(b, wh, a3h);
                         b = Vector512.Create(q[c]); a4l = Vector512.FusedMultiplyAdd(b, wl, a4l); a4h = Vector512.FusedMultiplyAdd(b, wh, a4h);
-                        b = Vector512.Create(q[8 + c]); a5l = Vector512.FusedMultiplyAdd(b, wl, a5l); a5h = Vector512.FusedMultiplyAdd(b, wh, a5h);
-                        b = Vector512.Create(q[16 + c]); a6l = Vector512.FusedMultiplyAdd(b, wl, a6l); a6h = Vector512.FusedMultiplyAdd(b, wh, a6h);
-                        b = Vector512.Create(q[24 + c]); a7l = Vector512.FusedMultiplyAdd(b, wl, a7l); a7h = Vector512.FusedMultiplyAdd(b, wh, a7h);
+                        b = Vector512.Create(q[S + c]); a5l = Vector512.FusedMultiplyAdd(b, wl, a5l); a5h = Vector512.FusedMultiplyAdd(b, wh, a5h);
+                        b = Vector512.Create(q[2 * S + c]); a6l = Vector512.FusedMultiplyAdd(b, wl, a6l); a6h = Vector512.FusedMultiplyAdd(b, wh, a6h);
+                        b = Vector512.Create(q[3 * S + c]); a7l = Vector512.FusedMultiplyAdd(b, wl, a7l); a7h = Vector512.FusedMultiplyAdd(b, wh, a7h);
                         b = Vector512.Create(r[c]); a8l = Vector512.FusedMultiplyAdd(b, wl, a8l); a8h = Vector512.FusedMultiplyAdd(b, wh, a8h);
-                        b = Vector512.Create(r[8 + c]); a9l = Vector512.FusedMultiplyAdd(b, wl, a9l); a9h = Vector512.FusedMultiplyAdd(b, wh, a9h);
-                        b = Vector512.Create(r[16 + c]); a10l = Vector512.FusedMultiplyAdd(b, wl, a10l); a10h = Vector512.FusedMultiplyAdd(b, wh, a10h);
-                        b = Vector512.Create(r[24 + c]); a11l = Vector512.FusedMultiplyAdd(b, wl, a11l); a11h = Vector512.FusedMultiplyAdd(b, wh, a11h);
+                        b = Vector512.Create(r[S + c]); a9l = Vector512.FusedMultiplyAdd(b, wl, a9l); a9h = Vector512.FusedMultiplyAdd(b, wh, a9h);
+                        b = Vector512.Create(r[2 * S + c]); a10l = Vector512.FusedMultiplyAdd(b, wl, a10l); a10h = Vector512.FusedMultiplyAdd(b, wh, a10h);
+                        b = Vector512.Create(r[3 * S + c]); a11l = Vector512.FusedMultiplyAdd(b, wl, a11l); a11h = Vector512.FusedMultiplyAdd(b, wh, a11h);
                         w += default(TLayout).Step;
                     }
                 }
@@ -1183,9 +1224,9 @@ internal static partial class DirectConvAvx2
 #else
     private const int RowPositions512 = 12;
     internal static bool s_useRowKernel512;
-    private static unsafe void ForwardRowRun512<TLayout>(float* x, float* x4, float* x8, float* w, long blockStride, int blocks,
+    private static unsafe void ForwardRowRun512<TLayout, TPos>(float* x, float* x4, float* x8, float* w, long blockStride, int blocks,
         int firstBlockOffset, int planeIn, int kernelHeight, int kernelWidth, int rowStep, int colStep,
-        float* slot, bool seeded) where TLayout : struct, IWeightLayout512 => throw new PlatformNotSupportedException();
+        float* slot, bool seeded) where TLayout : struct, IWeightLayout512 where TPos : struct, IPositionStep512 => throw new PlatformNotSupportedException();
 #endif
 
     /// <summary>
@@ -1234,10 +1275,21 @@ internal static partial class DirectConvAvx2
     private static bool Interleave512(int packedOut)
         => s_interleave512 && UseAvx512Forward && s_stagedStore && packedOut % (Block * OutputBlocksPerTile) == 0;
 
-    /// <summary>Whether the four positions at <paramref name="origin"/> are consecutive along one grid row (Block apart).</summary>
+    /// <summary>Whether the four positions at <paramref name="origin"/> are consecutive along one grid row
+    /// (<paramref name="step"/> floats apart: Block times the column stride).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static unsafe bool QuadGroup(int* origin)
-        => origin[1] == origin[0] + Block && origin[2] == origin[0] + 2 * Block && origin[3] == origin[0] + 3 * Block;
+    private static unsafe bool QuadGroup(int* origin, int step)
+        => origin[1] == origin[0] + step && origin[2] == origin[0] + 2 * step && origin[3] == origin[0] + 3 * step;
+
+    /// <summary>Floats between consecutive positions of a <see cref="ForwardRowRun512"/> group (a struct type argument,
+    /// so the offsets compile to constants).</summary>
+    private interface IPositionStep512 { int Step { get; } }
+
+    /// <summary>Stride-1 columns: positions Block floats apart.</summary>
+    private readonly struct Step1Pos : IPositionStep512 { public int Step => Block; }
+
+    /// <summary>Stride-2 columns: positions 2 Block floats apart.</summary>
+    private readonly struct Step2Pos : IPositionStep512 { public int Step => 2 * Block; }
 
     /// <summary>Positions per <see cref="ForwardSextetRun512"/> call.</summary>
     private const int Avx512Positions = 6;
@@ -1253,6 +1305,10 @@ internal static partial class DirectConvAvx2
 #else
     private static bool UseAvx512Forward => false;
 #endif
+
+    /// <summary>Whether the direct kernels run their 512-bit tiles: .NET 9+, Vector512 accelerated (or the test hook),
+    /// and AIDOTNET_DIRECT_CONV_AVX512 not 0.</summary>
+    internal static bool UsesAvx512Kernel => UseAvx512Forward;
 
     /// <summary>Test hook: run the AVX-512 kernel on hosts without AVX-512 (software Vector512, slow but exact).</summary>
     internal static bool s_forceAvx512ForTest;
