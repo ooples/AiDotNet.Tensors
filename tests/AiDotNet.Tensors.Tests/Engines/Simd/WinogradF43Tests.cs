@@ -322,11 +322,13 @@ public class WinogradF43Tests
     public void Gradients_TakeFewerPatchesThanTheForward()
     {
         Skip.IfNot(WinogradRoutes, "Winograd routing needs AVX2 + FMA and AIDOTNET_CONV_WINOGRAD not set to 0.");
-        Skip.IfNot(WinogradF43.s_minPatches == 128 && WinogradF43.s_minBackwardPatches == 32, "Default patch floors only.");
+        Skip.IfNot(WinogradF43.s_minPatches == 128 && WinogradF43.s_minBackwardPatches == 32
+            && Environment.GetEnvironmentVariable("AIDOTNET_WINOGRAD_MIN_BACKWARD_PATCHES") is null,
+            "Default patch floors only (AIDOTNET_WINOGRAD_MIN_BACKWARD_PATCHES unset).");
         // ResNet-18 256 -> 256 on 8x8 planes at batch 8: 32 patches. The weight gradient takes it, the forward does not;
         // the input gradient does unless a full-rate 512-bit unit runs the direct kernel (floor 64).
         Assert.False(WinogradF43.Applies(8, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));
-        bool fullRate = CpuMicroarchitecture.FullRateVector512;
+        bool fullRate = WinogradF43.DirectInputGradientIsFullRate512;
         Assert.Equal(fullRate ? WinogradF43.FullRateInputGradientMinPatches : 32, WinogradF43.s_minInputGradientPatches);
         Assert.Equal(!fullRate, WinogradF43.AppliesToInputGradient(8, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));
         Assert.True(WinogradF43.AppliesToInputGradient(16, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));   // 64 patches

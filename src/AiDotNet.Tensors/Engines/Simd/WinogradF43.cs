@@ -57,15 +57,20 @@ internal static unsafe partial class WinogradF43
 
     /// <summary>
     /// Fewest patches the input gradient takes: <see cref="s_minBackwardPatches"/>, except 64 where a full-rate 512-bit
-    /// unit runs the direct kernel (<see cref="CpuMicroarchitecture.FullRateVector512"/>). Its 12-position forward tile
+    /// unit runs the direct kernel (<see cref="DirectInputGradientIsFullRate512"/>). Its 12-position forward tile
     /// runs the turned-kernel convolution faster than F(4x4) at 32 patches (ResNet-18 256 -> 256 on 8x8 planes, batch 8,
     /// in-process A/B at four threads: 1.76 ms direct against 2.12 Winograd on Xeon 8573C, 2.02 against 2.16 on 6973P,
     /// 1.28 against 1.39 on EPYC 9V45), but not on Zen 4's half-rate unit (2.89 against 2.08 on EPYC 9V74) or the 256-bit
     /// kernel. An explicit AIDOTNET_WINOGRAD_MIN_BACKWARD_PATCHES keeps both gradients on one floor.
     /// </summary>
     internal static readonly int s_minInputGradientPatches =
-        Environment.GetEnvironmentVariable("AIDOTNET_WINOGRAD_MIN_BACKWARD_PATCHES") is null && CpuMicroarchitecture.FullRateVector512
+        Environment.GetEnvironmentVariable("AIDOTNET_WINOGRAD_MIN_BACKWARD_PATCHES") is null && DirectInputGradientIsFullRate512
             ? FullRateInputGradientMinPatches : s_minBackwardPatches;
+
+    /// <summary>Whether the direct input gradient runs its 512-bit tile on a full-rate unit: the host is
+    /// <see cref="CpuMicroarchitecture.FullRateVector512"/> and <see cref="DirectConvAvx2.UsesAvx512Kernel"/> (.NET 9+,
+    /// AIDOTNET_DIRECT_CONV_AVX512 not 0). Otherwise the direct kernel runs 256-bit and the backward floor stays.</summary>
+    internal static bool DirectInputGradientIsFullRate512 => CpuMicroarchitecture.FullRateVector512 && DirectConvAvx2.UsesAvx512Kernel;
 
     /// <summary>The input gradient's patch floor where <see cref="CpuMicroarchitecture.FullRateVector512"/>.</summary>
     internal const int FullRateInputGradientMinPatches = 64;

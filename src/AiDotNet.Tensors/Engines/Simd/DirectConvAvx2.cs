@@ -1306,6 +1306,10 @@ internal static partial class DirectConvAvx2
     private static bool UseAvx512Forward => false;
 #endif
 
+    /// <summary>Whether the direct kernels run their 512-bit tiles: .NET 9+, Vector512 accelerated (or the test hook),
+    /// and AIDOTNET_DIRECT_CONV_AVX512 not 0.</summary>
+    internal static bool UsesAvx512Kernel => UseAvx512Forward;
+
     /// <summary>Test hook: run the AVX-512 kernel on hosts without AVX-512 (software Vector512, slow but exact).</summary>
     internal static bool s_forceAvx512ForTest;
 
