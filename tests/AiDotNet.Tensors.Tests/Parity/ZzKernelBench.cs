@@ -60,12 +60,17 @@ public class ZzKernelBench
             {
                 CpuParallelSettings.MaxDegreeOfParallelism = th;
                 var parts = new List<string>();
-                foreach (var (kcv, pk) in new[] { (256, true), (128, true), (96, true), (64, true), (0, true), (256, false) })
+                var refC = new float[m * n];
+                SimdGemm.s_zzPackA2D = false; SimdGemm.s_stripKc = 256;
+                SimdGemm.Sgemm(A, kk, false, B, n, false, refC, m, kk, n);
+                foreach (var (kcv, pk, pa) in new[] { (256, true, false), (128, true, false), (256, true, true), (0, true, false) })
                 {
-                    SimdGemm.s_stripKc = kcv; SimdGemm.s_packStrip512 = pk;
+                    SimdGemm.s_stripKc = kcv; SimdGemm.s_packStrip512 = pk; SimdGemm.s_zzPackA2D = pa;
                     var tm = Measure(() => SimdGemm.Sgemm(A, kk, false, B, n, false, C, m, kk, n));
-                    parts.Add($"kc{kcv}{(pk ? "" : "-nopack")} {tm.Min:F4} ({f / (tm.Min * 1e6):F0})");
+                    int diff = 0; for (int q = 0; q < C.Length; q++) if (BitConverter.SingleToInt32Bits(C[q]) != BitConverter.SingleToInt32Bits(refC[q])) diff++;
+                    parts.Add($"kc{kcv}{(pk ? "" : "-nopack")}{(pa ? "-packA" : "")} {tm.Min:F4} ({f / (tm.Min * 1e6):F0}) d{diff}");
                 }
+                SimdGemm.s_zzPackA2D = false;
                 Line($"ZZ kern kcsweep {m}x{kk}x{n} t{th}: {string.Join("  ", parts)}");
             }
         }

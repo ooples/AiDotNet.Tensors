@@ -36,6 +36,7 @@ internal static partial class SimdGemm
 
     /// <summary>GEMMs the 2D path computed on this thread; a test probe that a gated shape actually took it.</summary>
     [ThreadStatic] internal static int t_directParallel2DRuns;
+    internal static bool s_zzPackA2D; // probe A/B only
 
     /// <summary>
     /// <c>C[m,n] = A[m,k] · B[k,n]</c> (row-major, no transpose, ldc = n, C overwritten) over disjoint output
@@ -97,6 +98,43 @@ internal static partial class SimdGemm
                     int stripStart = cs * stripCap;
                     int stripEnd = Math.Min(nCap, stripStart + stripCap);
 #if NET9_0_OR_GREATER
+                    if (stripBuffer is not null && stripEnd - stripStart == Nr512 && s_zzPackA2D)
+                    {
+                        int fullEnd = Math.Min(rb1, mCap / Mr);
+                        int fullBlocks = fullEnd - rb0;
+                        float[] aBuf = TransAPackABuffer(Math.Max(1, fullBlocks) * kCap * Mr + 8);
+                        fixed (float* ps = stripBuffer)
+                        fixed (float* ap = aBuf)
+                        {
+                            if (cs == cs0)
+                                for (int b = 0; b < fullBlocks; b++)
+                                {
+                                    float* src = pA + (long)(rb0 + b) * Mr * ldaCap;
+                                    float* dst = ap + (long)b * kCap * Mr;
+                                    for (int pp = 0; pp < kCap; pp++, dst += Mr)
+                                    {
+                                        dst[0] = src[pp]; dst[1] = src[ldaCap + pp]; dst[2] = src[2 * ldaCap + pp];
+                                        dst[3] = src[3 * ldaCap + pp]; dst[4] = src[4 * ldaCap + pp]; dst[5] = src[5 * ldaCap + pp];
+                                    }
+                                }
+                            PackStrip32(pB + stripStart, ldbCap, ps, kCap);
+                            for (int b = 0; b < fullBlocks; b++)
+                                TransAKernel6x32(ap + (long)b * kCap * Mr, Mr, ps, Nr512,
+                                    pC + (long)(rb0 + b) * Mr * nCap + stripStart, nCap, kCap);
+                            for (int rbIdx = rb0; rbIdx < rb1; rbIdx++)
+                            {
+                                int i = rbIdx * Mr;
+                                int mc = Math.Min(Mr, mCap - i);
+                                if (mc == Mr) continue;
+                                float* pARow = pA + (long)i * ldaCap;
+                                float* pCRow = pC + (long)i * nCap;
+                                for (int j = stripStart; j < stripEnd; j += Nr)
+                                    DirectKernelMxNMaskedStore(pARow, ldaCap, pB + j, ldbCap, pCRow + j, nCap,
+                                        kCap, mcActual: mc, ncActual: Nr);
+                            }
+                        }
+                        continue;
+                    }
                     if (stripBuffer is not null && stripEnd - stripStart == Nr512)
                     {
                         fixed (float* ps = stripBuffer)
