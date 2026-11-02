@@ -45,7 +45,7 @@ public class ZzMlpGemmBench
     public void Time()
     {
         if (Environment.GetEnvironmentVariable("GITHUB_ACTIONS") != "true" && Environment.GetEnvironmentVariable("ZZ_CONV") != "1") return;
-        int threads = int.TryParse(Environment.GetEnvironmentVariable("ZZ_THREADS"), out int t) ? t : Environment.ProcessorCount;
+        int threads = int.TryParse(Environment.GetEnvironmentVariable("ZZ_THREADS"), out int t) ? t : Math.Max(1, Environment.ProcessorCount / 2);
         CpuParallelSettings.MaxDegreeOfParallelism = threads;
         Line($"ZM threads {threads}");
         ZzDeepConvBenchTorch.Run(_o, "tools/parity/zz_mlp_torch.py", threads);
