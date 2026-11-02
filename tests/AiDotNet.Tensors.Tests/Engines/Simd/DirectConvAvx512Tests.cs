@@ -40,6 +40,11 @@ public class DirectConvAvx512Tests
         { 2, 64, 64, 30, 1, 1, 3, 1 },
         { 1, 32, 32, 17, 1, 2, 3, 2 },
         { 1, 256, 32, 14, 1, 1, 3, 1 },
+        // Groups of four consecutive positions that wrap rows: 8-wide planes (8 + 4), 4-wide (4 + 4 + 4), runs spanning
+        // images, and a 6-wide plane where only some twelves split into aligned groups.
+        { 2, 64, 64, 8, 1, 1, 3, 1 },
+        { 3, 64, 32, 4, 1, 1, 3, 1 },
+        { 2, 32, 64, 6, 1, 1, 3, 1 },
     };
 
     [SkippableTheory]
