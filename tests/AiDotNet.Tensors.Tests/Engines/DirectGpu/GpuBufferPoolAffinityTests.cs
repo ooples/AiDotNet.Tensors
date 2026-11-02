@@ -1,5 +1,6 @@
 using System;
 using System.Threading;
+using System.Runtime.CompilerServices;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using Xunit;
 
@@ -18,6 +19,35 @@ public sealed class GpuBufferPoolSerialCollection
 [Collection(GpuBufferPoolSerialCollection.Name)]
 public sealed class GpuBufferPoolAffinityTests
 {
+    [Fact]
+    public void MeasurementWorkspaceReleasedDuringRestore_IsNotRetainedByThePool()
+    {
+        using var pool = new GpuBufferPool<FakeBuffer>(maxPerSize: 1, maxSize: 8192);
+        var released = ParkAndRejectUndersizedWorkspace(pool);
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+        Assert.False(released.IsAlive, "A released measurement workspace must not remain strongly referenced by the pool.");
+        Assert.Equal(0, pool.PooledCount);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static WeakReference ParkAndRejectUndersizedWorkspace(GpuBufferPool<FakeBuffer> pool)
+    {
+        var workspace = new FakeBuffer(6272);
+        AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelRegistry.BeginMeasurement();
+        try
+        {
+            pool.Return(workspace);
+            pool.MaxPooledElements = 0;
+            // Both sizes map to the same bucket. Restoring the undersized buffer now rejects it.
+            Assert.False(pool.TryRent(8192, out _));
+            Assert.Equal(1, workspace.ReleaseCount);
+            return new WeakReference(workspace);
+        }
+        finally { AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelRegistry.EndMeasurement(); }
+    }
+
     [Fact]
     public void Rent_DoesNotCrossAffinityDomains()
     {
