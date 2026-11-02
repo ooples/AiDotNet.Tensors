@@ -10792,7 +10792,7 @@ public partial class CpuEngine : ITensorLevelEngine
         int kernelHeight, int kernelWidth, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW,
         int outputHeight, int outputWidth)
     {
-        if (t_forceFullIm2Col || t_forceImplicitGemmForTest) return false;
+        if (t_forceFullIm2Col || t_forceImplicitGemmForTest || t_forceRowBlockForTest) return false;
 #if NET5_0_OR_GREATER
         if ((strideH > 1 || strideW > 1)
             && Simd.Conv1x1Gemm.Applies(batch, kernelHeight, kernelWidth, padH, padW, dilationH, dilationW))
@@ -10842,7 +10842,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         // A test scope that pins the full-im2col or implicit-GEMM route must reach it: the direct and batched routes
         // below are chosen first, so a pinned comparison would otherwise compare one of them with itself.
-        bool routePinned = t_forceFullIm2Col || t_forceImplicitGemmForTest;
+        bool routePinned = t_forceFullIm2Col || t_forceImplicitGemmForTest || t_forceRowBlockForTest;
 #if NET5_0_OR_GREATER
         if (!routePinned && (strideH > 1 || strideW > 1) && input.Layout == LinearAlgebra.TensorLayout.Nchw
             && Simd.Conv1x1Gemm.Applies(batch, kernelHeight, kernelWidth, padH, padW, dilationH, dilationW))
@@ -11044,7 +11044,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Strategy 1: Try oneDNN for best performance (uses optimized CPU kernels)
         // A pinned route (ForceFullIm2ColScope / ForceImplicitGemmScope) must reach that route: oneDNN, where installed (the
         // Linux CI runners), would otherwise take the conv first and the pinned comparison would test oneDNN against itself.
-        if (!t_forceFullIm2Col && !t_forceImplicitGemmForTest && TryConv2DOneDnn(input, kernel, result, batch, inChannels, height, width,
+        if (!t_forceFullIm2Col && !t_forceImplicitGemmForTest && !t_forceRowBlockForTest && TryConv2DOneDnn(input, kernel, result, batch, inChannels, height, width,
             outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth))
         {
             return false;
@@ -11530,6 +11530,21 @@ public partial class CpuEngine : ITensorLevelEngine
     private static bool t_forceImplicitGemmForTest;
 
     internal static IDisposable ForceImplicitGemmScope() => new ForceImplicitGemmOverride();
+
+    // Test-only: sends the CURRENT thread's convolutions past the direct and small-output kernels into the adaptive
+    // chain, so the row-block route is reachable for shapes those kernels now take first (3x3 stride 1 pad 1, whose
+    // DirectConvAvx2 route lands ahead of it). The row-block route keeps its own shape gate.
+    [ThreadStatic]
+    private static bool t_forceRowBlockForTest;
+
+    internal static IDisposable ForceRowBlockConvScope() => new ForceRowBlockOverride();
+
+    private sealed class ForceRowBlockOverride : IDisposable
+    {
+        private readonly bool _prev;
+        internal ForceRowBlockOverride() { _prev = t_forceRowBlockForTest; t_forceRowBlockForTest = true; }
+        public void Dispose() => t_forceRowBlockForTest = _prev;
+    }
 
     private sealed class ForceImplicitGemmOverride : IDisposable
     {

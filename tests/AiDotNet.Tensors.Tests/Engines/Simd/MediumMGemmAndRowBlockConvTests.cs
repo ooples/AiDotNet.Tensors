@@ -82,7 +82,10 @@ public class MediumMGemmAndRowBlockConvTests
             var engine = new CpuEngine();
 
             int runsBefore = CpuEngine.RowBlockConvRunsOnThisThread;
-            float[] rowBlock = engine.Conv2D(x, k, stride, pad, dil).ToArray();
+            float[] rowBlock;
+            // The direct 3x3 kernel takes stride 1 / pad 1 ahead of the adaptive chain; pin past it to reach the route.
+            using (CpuEngine.ForceRowBlockConvScope())
+                rowBlock = engine.Conv2D(x, k, stride, pad, dil).ToArray();
             Assert.Equal(runsBefore + 1, CpuEngine.RowBlockConvRunsOnThisThread);
             float[] full;
             using (CpuEngine.ForceFullIm2ColScope())

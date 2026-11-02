@@ -340,7 +340,7 @@ internal sealed class PersistentParallelExecutor
 
 #if NET5_0_OR_GREATER
     private static readonly Lazy<(ushort Group, byte Number)[]> s_workerCores =
-        new(AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.UsableCoresInCurrentGroup);
+        new(AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.UsableCores);
 
 
     private static readonly Lazy<AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.Domain[]> s_physicalCores =

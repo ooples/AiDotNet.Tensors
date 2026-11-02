@@ -175,6 +175,41 @@ internal static class CpuTopology
     }
 
     /// <summary>
+    /// <see cref="UsableCoresInCurrentGroup"/> followed by the physical cores of every other processor group, when
+    /// the process's affinity is unrestricted in its own group. A Windows host with more than 64 logical processors
+    /// splits them into groups (a 64-core / 128-thread Threadripper 3990X: two groups of 32 cores), and a process
+    /// starts in one of them; binding workers only there capped the pool at 32 cores, so a 64-thread budget stacked
+    /// two FMA-bound workers on each core's SMT pair (#653: 256x1152x1152 GEMM 897 us at 32 threads, 1926 us at 64).
+    /// A process restricted by affinity (start /affinity, a job object) keeps its own group's allowed cores only.
+    /// </summary>
+    [MethodImpl(Hot)]
+    internal static (ushort Group, byte Number)[] UsableCores()
+    {
+        var own = UsableCoresInCurrentGroup();
+        // AIDOTNET_CPU_SPAN_GROUPS=0 keeps the pool in the process's own group (the pre-#653 placement).
+        if (own.Length == 0 || Environment.GetEnvironmentVariable("AIDOTNET_CPU_SPAN_GROUPS") == "0") return own;
+        try
+        {
+            var physical = DetectPhysicalCores();
+            ushort home = own[0].Group;
+            ulong groupMask = 0;
+            foreach (var core in physical)
+                if (core.Group == home) groupMask |= core.Mask;
+            if (!GetProcessAffinityMask(GetCurrentProcess(), out var processMask, out _)
+                || ((ulong)processMask & groupMask) != groupMask)
+                return own;
+            var list = new List<(ushort, byte)>(own);
+            foreach (var core in physical)
+            {
+                if (core.Group == home || core.Mask == 0) continue;
+                list.Add((core.Group, (byte)System.Numerics.BitOperations.TrailingZeroCount(core.Mask)));
+            }
+            return list.ToArray();
+        }
+        catch { return own; }
+    }
+
+    /// <summary>
     /// Sets the calling thread's ideal processor: a scheduling hint, not a restriction. The scheduler
     /// prefers that processor whenever the thread becomes ready, so a thread that is suspended and
     /// resumed comes back to the core whose caches hold its working set.
