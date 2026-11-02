@@ -11,19 +11,27 @@ namespace AiDotNet.Tensors.Engines.Simd;
 // The few-patch form of Run, for wide layers on small planes (ResNet-18's 512 -> 512 on 4x4 planes: one tile per image,
 // eight patches at batch 8). Run transforms the weights into U [36][C][K] before its 36 GEMMs: at 512 -> 512 that is 37.7
 // MB written and read back for GEMMs eight rows tall, so F(4x4) ran 2.5x slower than the direct kernel. Here each job
-// owns sixteen output channels and transforms their weights sixteen input channels at a time into an L1 slab, which the
-// 36 multiplies use at once; U never exists whole. Per (input channel, eight output channels) the transform costs about
-// 80 vector operations against 36 x patches multiply-adds, so it pays where patches are few and channels many.
+// owns 16 output channels (32 on 512-bit hosts) and transforms their weights a slab of input channels at a time
+// (FewInputBlock), which the 36 multiplies use at once; U never exists whole. Per (input channel, eight output channels)
+// the transform costs about 80 vector operations against 36 x patches multiply-adds, so it pays where patches are few and
+// channels many.
 internal static unsafe partial class WinogradF43
 {
     /// <summary>Output channels per few-patch job (two vectors).</summary>
     private const int FewKBlock = 16;
 
-    /// <summary>Input channels per transformed-weight slab: 36 x 16 x 16 floats (36 KB) stay in L1.</summary>
-    internal static int s_fewCBlock = 16;
-
-    /// <summary>Input channels per transformed-weight slab of the 512-bit tiles (multiple of 8).</summary>
-    internal static int s_fewCBlock512 = 8;
+    /// <summary>
+    /// Input channels per transformed-weight slab (a multiple of 8): 16 for the 512-bit tiles and 32 for the 256-bit
+    /// ones at eight patches (one patch group), twice that past it. A deeper slab spends fewer accumulator loads and
+    /// stores per multiply-add, but at eight patches each slab is used once, and past L1 its loads cost more than they
+    /// save. In-process sweep at four threads (8, 16, 32 and 64 input channels per 512-bit slab, twice that per 256-bit
+    /// one), ms, ResNet-18 at batch 8: 512 -> 512 on 4x4 planes (8 patches), forward, best at 16 on EPYC 9V45 (1.15 vs
+    /// 1.28 at 8 and 1.64 at 32), 9V74 and Xeon 6973P, and at 32 on the 256-bit EPYC 7763 (3.16-3.30 vs 3.26-3.51 at 16);
+    /// 256 -> 256 on 8x8 (32 patches) best at 32 / 64 on 9V74 and 6973P (0.99 vs 1.06 at 16 on 6973P) and at 64 / 128 on
+    /// the 7763 (1.84-1.95 vs 1.91-2.00 at 64).
+    /// </summary>
+    private static int FewInputBlock(bool wide, int paddedPatches)
+        => (wide ? 16 : 32) * (paddedPatches <= FewPatchGroup ? 1 : 2);
 
     /// <summary>Patches per multiply group (the microkernel's rows); the patch count is padded up to it.</summary>
     private const int FewPatchGroup = 8;
@@ -41,7 +49,16 @@ internal static unsafe partial class WinogradF43
     /// <summary>Test hook: run the 512-bit few-patch tiles in software Vector512 on hosts without AVX-512.</summary>
     internal static bool s_forceFewPatches512ForTest;
 
-    /// <summary>Most patches the few-patch form takes.</summary>
+    /// <summary>
+    /// Most patches the few-patch form takes (AIDOTNET_WINOGRAD_FEW_MAX_PATCHES overrides). In-process A/B at four
+    /// threads, ms, forward / input gradient, against the route each shape took before and PyTorch 2.x on the same host:
+    /// ResNet-18 512 -> 512 on 4x4 planes at batch 8 (8 patches, before: direct) EPYC 9V45 1.15 / 1.19 vs 1.65 / 1.63
+    /// (PyTorch 1.44 / 1.15), Xeon 6973P 1.91 / 1.99 vs 2.35 / 2.59 (2.07 / 2.34), EPYC 9V74 2.18 / 2.31 vs 3.35 / 3.47
+    /// (2.29 / 2.25), EPYC 7763 3.16-3.30 / 3.25-3.36 vs 4.19 / 4.30 (3.96 / 3.77); 256 -> 256 on 8x8 at batch 8 (32
+    /// patches, before: direct or batch-wide F(4x4)) 9V45 0.71 / 0.71 vs 1.29 / 1.29 (1.20 / 1.21), 6973P 0.99 / 1.05 vs
+    /// 1.84 / 1.85 (1.77 / 1.90), 9V74 1.23-1.25 / 1.25 vs 2.08-2.14 / 2.05-2.09 (2.35 / 2.37), 7763 1.91 / 1.92 vs
+    /// 2.44-2.51 / 2.54-2.55 (3.38 / 3.16).
+    /// </summary>
     internal static int s_fewMaxPatches =
         int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_WINOGRAD_FEW_MAX_PATCHES"), out int fewMax) && fewMax >= 0 ? fewMax : 32;
 
@@ -68,9 +85,9 @@ internal static unsafe partial class WinogradF43
         {
             TransformInput(x, xOff, v, batch, cIn, height, width, tilesH, tilesW);
             int outW = tilesW * Tile, hw = height * width;
-            // 512-bit hosts: jobs of 32 output channels (two zmm) over slabs of 8 input channels (36 x 8 x 32 floats, 36 KB).
+            // 512-bit hosts: jobs of 32 output channels (two zmm).
             bool wide = UseFewPatches512 && cOut % (2 * FewKBlock) == 0;
-            int kb = wide ? 2 * FewKBlock : FewKBlock, cb = wide ? s_fewCBlock512 : s_fewCBlock, groups = kb / 8;
+            int kb = wide ? 2 * FewKBlock : FewKBlock, cb = FewInputBlock(wide, paddedPatches), groups = kb / 8;
             int mFloats = Points * paddedPatches * kb;
             int slabFloats = Points * cb * kb, stageFloats = 9 * cb * kb;
             int bandFloats = tilesH * Tile * outW * 8;

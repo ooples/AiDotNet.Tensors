@@ -408,8 +408,8 @@ public class WinogradF43Tests
     }
 
 #if NET9_0_OR_GREATER
-    // The 512-bit few-patch tiles (32 output channels per job, slabs of 8 input channels) run the 256-bit tiles'
-    // multiply-adds in the same order per lane, so they agree bit for bit.
+    // The 512-bit few-patch tiles (32 output channels per job, slabs half as deep) run the same multiply-adds as the
+    // 256-bit tiles in the same order per lane, so they agree bit for bit.
     [SkippableTheory]
     [InlineData(8, 128, 128, 4, 4, false)]
     [InlineData(2, 128, 160, 5, 6, false)]

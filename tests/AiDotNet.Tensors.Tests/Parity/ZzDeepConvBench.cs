@@ -49,11 +49,9 @@ public class ZzDeepConvBench
         }
         var variants = new (string Name, Action Set)[]
         {
-            ("cur", () => { DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = false; WinogradF43.s_fewMaxPatches = fewP; WinogradF43.s_fewCBlock512 = 8; WinogradF43.s_fewCBlock = 16; }),
+            ("cur", () => { DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = false; WinogradF43.s_fewMaxPatches = fewP; }),
             ("nofew", () => { DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = false; WinogradF43.s_fewMaxPatches = 0; }),
-            ("c16", () => { DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = false; WinogradF43.s_fewMaxPatches = fewP; WinogradF43.s_fewCBlock512 = 16; WinogradF43.s_fewCBlock = 32; }),
-            ("c32", () => { DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = false; WinogradF43.s_fewMaxPatches = fewP; WinogradF43.s_fewCBlock512 = 32; WinogradF43.s_fewCBlock = 64; }),
-            ("c64", () => { DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = false; WinogradF43.s_fewMaxPatches = fewP; WinogradF43.s_fewCBlock512 = 64; WinogradF43.s_fewCBlock = 128; }),
+            ("nowino", () => { DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = true; WinogradF43.s_fewMaxPatches = fewP; }),
         };
         var convs = new (int Cin, int Cout, int Hw, int S)[]
         {
@@ -99,7 +97,7 @@ public class ZzDeepConvBench
                 _o.WriteLine(line); Console.WriteLine(line);
             }
         }
-        DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = false; WinogradF43.s_fewMaxPatches = fewP; WinogradF43.s_fewCBlock512 = 8; WinogradF43.s_fewCBlock = 16;
+        DirectConvAvx2.EnabledPasses = all; WinogradF43.s_disable = false; WinogradF43.s_fewMaxPatches = fewP;
         Torch();
     }
 
