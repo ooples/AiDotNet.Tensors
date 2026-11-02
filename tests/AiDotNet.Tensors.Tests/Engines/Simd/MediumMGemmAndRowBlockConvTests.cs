@@ -142,6 +142,38 @@ public class MediumMGemmAndRowBlockConvTests
         }
     }
 
+    // Every platform: the row-block pin only moves a convolution onto another route of the adaptive chain, so its result
+    // must match the default dispatch, and nested scopes must restore the outer state.
+    [Theory]
+    [InlineData(1, 16, 64, 64, 32, 1, 1)]   // 3x3 stride 1 pad 1: the direct kernel's shape by default
+    [InlineData(2, 8, 33, 29, 12, 2, 0)]    // stride 2, no padding
+    public void ForceRowBlockConvScope_MatchesDefaultDispatchAndNests(int batch, int cin, int h, int w, int cout, int stride, int pad)
+    {
+        var rnd = RandomHelper.CreateSeededRandom(batch * 31 + cin + h);
+        var x = new Tensor<float>(Rand(rnd, batch * cin * h * w), new[] { batch, cin, h, w });
+        var k = new Tensor<float>(Rand(rnd, cout * cin * 9), new[] { cout, cin, 3, 3 });
+        var engine = new CpuEngine();
+
+        float[] reference = engine.Conv2D(x, k, stride, pad, 1).ToArray();
+        float[] pinned, nested, afterInner;
+        using (CpuEngine.ForceRowBlockConvScope())
+        {
+            pinned = engine.Conv2D(x, k, stride, pad, 1).ToArray();
+            using (CpuEngine.ForceRowBlockConvScope())
+                nested = engine.Conv2D(x, k, stride, pad, 1).ToArray();
+            afterInner = engine.Conv2D(x, k, stride, pad, 1).ToArray();   // the outer pin still holds
+        }
+        float[] released = engine.Conv2D(x, k, stride, pad, 1).ToArray();
+
+        foreach (var got in new[] { pinned, nested, afterInner, released })
+        {
+            Assert.Equal(reference.Length, got.Length);
+            for (int i = 0; i < reference.Length; i++)
+                Assert.True(Math.Abs(reference[i] - got[i]) <= 1e-4f * (1 + Math.Abs(reference[i])),
+                    $"[{i}] default {reference[i]} pinned {got[i]}");
+        }
+    }
+
     private static float[] Rand(Random rnd, int n)
     {
         var a = new float[n];
