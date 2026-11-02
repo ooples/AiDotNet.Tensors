@@ -10,7 +10,8 @@ namespace AiDotNet.Tensors.Tests.Engines;
 
 /// <summary>
 /// TensorAddActivation (the fused residual join) must equal TensorAdd followed by the activation: bit for bit for ReLU on
-/// the CPU and on the GPU kernel, including NaN, signed zero and infinities and lengths off every vector width, and its
+/// the CPU and on the GPU kernel for finite values, signed zero and infinities. NaNs must propagate, but their
+/// payload/sign may be canonicalized by GPU arithmetic. Lengths cover every vector width, and the
 /// gradient must equal the composed ops' gradient for both inputs.
 /// </summary>
 [Collection("DirectGpuSerial")]
@@ -34,8 +35,8 @@ public sealed class TensorAddActivationTests
         var a = actual.Contiguous().AsSpan();
         Assert.Equal(e.Length, a.Length);
         for (int i = 0; i < e.Length; i++)
-            Assert.True(Bits(e[i]) == Bits(a[i]),
-                $"[{i}] expected {e[i]} got {a[i]}");
+            Assert.True(float.IsNaN(e[i]) ? float.IsNaN(a[i]) : Bits(e[i]) == Bits(a[i]),
+                $"[{i}] expected {e[i]} (0x{Bits(e[i]):X8}) got {a[i]} (0x{Bits(a[i]):X8})");
     }
 
     private static int Bits(float value) => BitConverter.ToInt32(BitConverter.GetBytes(value), 0);

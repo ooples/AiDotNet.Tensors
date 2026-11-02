@@ -12600,7 +12600,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var idxBuf = new int[tensor.Length];
                 tensor.FillStorageIndices(idxBuf);
                 for (int i = 0; i < tensor.Length; i++)
-                    { T v = srcRaw[idxBuf[i]]; dstArr[i] = ops.GreaterThan(v, ops.Zero) ? v : ops.Zero; }
+                    { T v = srcRaw[idxBuf[i]]; dstArr[i] = ops.IsNaN(v) || ops.GreaterThan(v, ops.Zero) ? v : ops.Zero; }
                 DifferentiableOps.RecordUnary("ReLU", resultS, tensor, BackwardFunctions<T>.ReLUBackward);
                 { var c = tensor; AutoTracer.RecordOp("ReLU", resultS, eng => eng.ReLU(c)); }
                 return resultS;
