@@ -323,15 +323,28 @@ public class WinogradF43Tests
     {
         Skip.IfNot(WinogradRoutes, "Winograd routing needs AVX2 + FMA and AIDOTNET_CONV_WINOGRAD not set to 0.");
         Skip.IfNot(WinogradF43.s_minPatches == 128 && WinogradF43.s_minBackwardPatches == 32, "Default patch floors only.");
-        // ResNet-18 256 -> 256 on 8x8 planes at batch 8: 32 patches. The gradients take it, the forward does not.
+        // ResNet-18 256 -> 256 on 8x8 planes at batch 8: 32 patches. The weight gradient takes it, the forward does not;
+        // the input gradient does unless a full-rate 512-bit unit runs the direct kernel (floor 64).
         Assert.False(WinogradF43.Applies(8, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));
-        Assert.True(WinogradF43.AppliesToInputGradient(8, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));
+        bool fullRate = CpuMicroarchitecture.FullRateVector512;
+        Assert.Equal(fullRate ? WinogradF43.FullRateInputGradientMinPatches : 32, WinogradF43.s_minInputGradientPatches);
+        Assert.Equal(!fullRate, WinogradF43.AppliesToInputGradient(8, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));
+        Assert.True(WinogradF43.AppliesToInputGradient(16, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));   // 64 patches
         Assert.True(WinogradF43.AppliesToWeightGradient(8, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));
         // 16 patches stay direct in every pass.
         Assert.False(WinogradF43.AppliesToInputGradient(4, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));
         Assert.False(WinogradF43.AppliesToWeightGradient(4, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));
         // The input gradient keeps the forward's other rules.
         Assert.False(WinogradF43.AppliesToInputGradient(8, 256, 256, 8, 8, 3, 3, 2, 2, 1, 1, 1, 1));
+    }
+
+    [Fact]
+    public void HalfRateVector512_IsZen4Only()
+    {
+        Assert.True(CpuMicroarchitecture.IsHalfRateVector512("AuthenticAMD", 0x19, avx512: true));    // Zen 4
+        Assert.False(CpuMicroarchitecture.IsHalfRateVector512("AuthenticAMD", 0x19, avx512: false));  // Zen 3
+        Assert.False(CpuMicroarchitecture.IsHalfRateVector512("AuthenticAMD", 0x1A, avx512: true));   // Zen 5
+        Assert.False(CpuMicroarchitecture.IsHalfRateVector512("GenuineIntel", 0x6, avx512: true));
     }
 
     [SkippableFact]
