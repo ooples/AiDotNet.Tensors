@@ -50,8 +50,7 @@ public class ZzMlpGemmBench
         ZzDeepConvBenchTorch.Run(_o, "tools/parity/zz_mlp_torch.py", threads);
         var engine = new CpuEngine();
         var rng = new Random(7);
-        const int m = 128;
-        foreach (var (k, n) in new[] { (784, 512), (512, 256), (256, 10) })
+        foreach (var (m, k, n) in new[] { (128, 784, 512), (128, 512, 256), (128, 256, 10), (64, 3136, 128), (64, 128, 10) })
         {
             float[] x = Rand(rng, m * k), w = Rand(rng, k * n), dy = Rand(rng, m * n), b = Rand(rng, n);
             float[] dw = new float[k * n], dx = new float[m * k];
@@ -59,7 +58,7 @@ public class ZzMlpGemmBench
             var f = Measure(() => engine.FusedLinear(xt, wt, bt, FusedActivationType.ReLU));
             var gw = Measure(() => BackwardFunctions<float>.BackwardGemmWeightGradient(x, dy, dw, m, k, n));
             var gx = Measure(() => BackwardFunctions<float>.BackwardGemmInputGradient(dy, w, dx, m, k, n));
-            Line($"ZM {k}->{n} fwd {f.Min:F4}/{f.Med:F4}  dW {gw.Min:F4}/{gw.Med:F4}  dX {gx.Min:F4}/{gx.Med:F4}");
+            Line($"ZM m{m} {k}->{n} fwd {f.Min:F4}/{f.Med:F4}  dW {gw.Min:F4}/{gw.Med:F4}  dX {gx.Min:F4}/{gx.Med:F4}");
         }
         foreach (var (mm, k, n) in new[] { (128, 784, 512), (128, 512, 256), (128, 256, 10), (64, 3136, 128), (64, 128, 10) })
         {
