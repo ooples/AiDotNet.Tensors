@@ -57,7 +57,7 @@ public sealed class BlasManagedDisableAutotuneTests
             var disabled = Run(a, b, m, n, k, PackingMode.DisableAutotune);
 
             for (int i = 0; i < named.Length; i++)
-                Assert.True(BitConverter.SingleToInt32Bits(named[i]) == BitConverter.SingleToInt32Bits(disabled[i]),
+                Assert.True(BitConverter.ToInt32(BitConverter.GetBytes(named[i]), 0) == BitConverter.ToInt32(BitConverter.GetBytes(disabled[i]), 0),
                     $"C[{i / n},{i % n}]: DisableAutotune {disabled[i]:R}, {defaultStrategy} {named[i]:R}");
             for (int row = 0; row < m; row += 97)
                 for (int col = 0; col < n; col += 13)
