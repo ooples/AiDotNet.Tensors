@@ -175,6 +175,9 @@ internal static partial class DirectPtxDenseLinearFullExperiment
             MaxBudgetUsd = maxUsdPerCall,
             TotalBudgetUsd = maxUsd,
             MaxRetries = 0,
+            // A reply admitted at 65,536 output tokens runs past the 5-minute default: on the in-graph campaign 9 of 16
+            // paid calls ended in "did not finish within 300 seconds".
+            Timeout = TimeSpan.FromMinutes(session.Arg("call-timeout-min", 20)),
         });
         var client = new CountingChatClient(claude, maxUsd);
         var variation = PtxProgramVariation.Create(client, compiler, ptxOptions, resources);
@@ -278,6 +281,18 @@ internal static partial class DirectPtxDenseLinearFullExperiment
             gflops = tuning.ProposedWinner.Measurement.ThroughputGflops,
         });
 
+        // --vendor-check-only=1: the incumbent against cuBLAS and nothing else, so the measurement is checked without a
+        // model call.
+        if (session.Arg("vendor-check-only", 0) == 1)
+        {
+            session.Emit("vendor_check", new
+            {
+                target = session.Target, m, n, k, sm, incumbent_kernel = incumbentConfig.Name,
+                incumbent_vs_cublas = MeasureGemmAgainstCublas(backend, runtime, incumbentConfig, incumbent, m, n, k),
+            });
+            return;
+        }
+
         // 2. The contract: the incumbent's exact signature and launch geometry, so a rewrite is a drop-in for it.
         bool vector = incumbentConfig.VectorWidth > 1;
         var contract = SgemmContract(incumbentConfig, sm, m, n, k, vector);
@@ -305,30 +320,90 @@ internal static partial class DirectPtxDenseLinearFullExperiment
         string? winner = CheckCampaignWinner(session, search, compiler, correctness, timing, incumbent, out PtxTimingReport? measured);
         if (winner is null || measured is null) return;
 
-        // 5. Against cuBLAS the way production routing decides (strict FP32: the process is in deterministic mode).
-        CudaGemmRouteDecision vendor = backend.TuneGemmRouteAsync(m, n, k, EvolutionOptions("campaign-cublas-" + session.Target),
-                persist: false)
-            .GetAwaiter().GetResult();
-        // Production routing re-tunes on its own, so its paired cuBLAS measurement describes the campaign's incumbent
-        // only when that tune chose the same kernel. Otherwise the comparison is reported as unavailable, never as a
-        // product of two measurements of different kernels.
-        bool sameKernel = string.Equals(vendor.Kernel, incumbentConfig.Name, StringComparison.Ordinal);
-        double? incumbentVsCublas = sameKernel ? (inGraph ? vendor.GraphMedianSpeedup : vendor.MedianSpeedup) : null;
+        // 5. The campaign's own incumbent and winner, each timed against cuBLAS on the same buffers (strict FP32: the
+        // process is in deterministic mode), eager and as graph replays. Production routing re-tunes on its own and can
+        // pick another kernel (128x4096x4096: b128x64x32 split against the campaign's b128x64x16), so its verdict does
+        // not describe these two kernels.
+        var vsIncumbent = MeasureGemmAgainstCublas(backend, runtime, incumbentConfig, incumbent, m, n, k);
+        var vsWinner = MeasureGemmAgainstCublas(backend, runtime, incumbentConfig, winner, m, n, k);
         session.Emit("verdict", new
         {
             target = session.Target, m, n, k, sm,
             correct = true,
             qualifies_over_incumbent = measured.QualifiesForPromotion,
             timing = measured.Message,
-            route_kernel = vendor.Kernel,
             incumbent_kernel = incumbentConfig.Name,
             vendor_mode = inGraph ? "graph-replay" : "eager",
-            incumbent_vs_cublas_median = incumbentVsCublas,
-            cublas_us = inGraph ? vendor.GraphCublasMicroseconds : vendor.CublasMicroseconds,
-            incumbent_us = sameKernel ? (inGraph ? vendor.GraphDirectPtxMicroseconds : vendor.DirectPtxMicroseconds) : (double?)null,
-            estimated_rewrite_vs_cublas = incumbentVsCublas * search.BestSpeedupOverIncumbent,
+            incumbent_vs_cublas = vsIncumbent,
+            winner_vs_cublas = vsWinner,
             output = session.Output,
         });
+    }
+
+    /// <summary>
+    /// <paramref name="ptx"/>, launched with <paramref name="config"/>'s geometry, against strict cuBLAS on the same
+    /// buffers after checking both write the same C: paired rounds, eager and as graph replays.
+    /// </summary>
+    private static unsafe object MeasureGemmAgainstCublas(CudaBackend backend, DirectPtxRuntime runtime,
+        PtxGemmConfiguration config, string ptx, int m, int n, int k)
+    {
+        var random = new Random(1265);
+        float[] hostA = Values(random, checked(m * k));
+        float[] hostB = Values(random, checked(k * n));
+        using IGpuBuffer a = backend.AllocateBuffer(hostA);
+        using IGpuBuffer b = backend.AllocateBuffer(hostB);
+        using IGpuBuffer c = backend.AllocateBuffer(checked(m * n));
+        using IGpuBuffer check = backend.AllocateBuffer(checked(m * n));
+        using DirectPtxModule module = runtime.LoadModule(ptx);
+        IntPtr function = module.GetFunction(PtxSgemmGenerator.EntryPoint);
+        uint gridX = (uint)((n + config.BlockN - 1) / config.BlockN), gridY = (uint)((m + config.BlockM - 1) / config.BlockM);
+        uint dynamicShared = config.IsAsync ? (uint)config.SharedBytes : 0;
+
+        Action cublas = () => backend.CublasGemm(a, b, c, m, n, k, 1f, 0f);
+        void Launch(IGpuBuffer output)
+        {
+            IntPtr pa = a.Handle, pb = b.Handle, pc = output.Handle;
+            uint mu = (uint)m, nu = (uint)n, ku = (uint)k, lda = (uint)k, ldb = (uint)n, ldc = (uint)n;
+            float alpha = 1f, beta = 0f;
+            long sa = 0, sb = 0, sc = 0;
+            void** arguments = stackalloc void*[14];
+            arguments[0] = &pa; arguments[1] = &pb; arguments[2] = &pc;
+            arguments[3] = &mu; arguments[4] = &nu; arguments[5] = &ku;
+            arguments[6] = &lda; arguments[7] = &ldb; arguments[8] = &ldc;
+            arguments[9] = &alpha; arguments[10] = &beta;
+            arguments[11] = &sa; arguments[12] = &sb; arguments[13] = &sc;
+            module.Launch(function, gridX, gridY, 1, (uint)config.Threads, 1, 1, dynamicShared, arguments);
+        }
+        Action generated = () => Launch(c);
+
+        // The generated kernel writes a buffer of its own: into cuBLAS's, a kernel that wrote nothing would match.
+        cublas();
+        float[] expected = backend.DownloadBuffer(c);
+        Launch(check);
+        float[] actual = backend.DownloadBuffer(check);
+        double largest = 1e-30, worst = 0;
+        for (int j = 0; j < expected.Length; j++)
+        {
+            largest = Math.Max(largest, Math.Abs(expected[j]));
+            double difference = Math.Abs((double)actual[j] - expected[j]);
+            worst = Math.Max(worst, double.IsNaN(difference) ? double.PositiveInfinity : difference);
+        }
+        double relative = worst / largest;
+        if (!(relative <= 1e-4))
+            return new { comparable = false, max_relative_difference = relative };
+
+        // About 50 ms of work per round arm at ~20 TFLOP/s.
+        int reps = (int)Math.Clamp(1e12 / (2.0 * m * n * k), 10, 500);
+        var (eager, graph) = backend.MeasureAgainstVendor(cublas, generated, reps);
+        return new
+        {
+            comparable = true, max_relative_difference = relative, reps,
+            eager_median_speedup = eager.MedianSpeedup, eager_minimum_speedup = eager.MinimumSpeedup,
+            eager_cublas_us = eager.CublasMicroseconds, eager_ptx_us = eager.DirectPtxMicroseconds,
+            graph_median_speedup = graph.MedianSpeedup, graph_minimum_speedup = graph.MinimumSpeedup,
+            graph_cublas_us = graph.CublasMicroseconds, graph_ptx_us = graph.DirectPtxMicroseconds,
+            graph_note = graph.Rounds == 0 ? graph.Reason : null,
+        };
     }
 
     private static PtxKernelContract SgemmContract(PtxGemmConfiguration config, int sm, int m, int n, int k, bool vector)
@@ -494,25 +569,28 @@ internal static partial class DirectPtxDenseLinearFullExperiment
         using IGpuBuffer input = backend.AllocateBuffer(inputHost);
         using IGpuBuffer weights = backend.AllocateBuffer(weightHost);
         using IGpuBuffer output = backend.AllocateBuffer(ConvCo * ConvH * ConvW);
+        using IGpuBuffer check = backend.AllocateBuffer(ConvCo * ConvH * ConvW);
         using DirectPtxModule module = runtime.LoadModule(ptx);
         IntPtr function = module.GetFunction(PtxConv2DNchw3x3ForwardF32Kernel.EntryPoint);
 
         Action cudnn = () => backend.Conv2D(input, weights, output, 1, ConvCi, ConvH, ConvW, ConvCo, ConvH, ConvW,
             3, 3, 1, 1, 1, 1, 1, 1);
-        Action generated = () =>
+        void Launch(IGpuBuffer destination)
         {
-            IntPtr i = input.Handle, w = weights.Handle, o = output.Handle;
+            IntPtr i = input.Handle, w = weights.Handle, o = destination.Handle;
             void** arguments = stackalloc void*[3];
             arguments[0] = &i;
             arguments[1] = &w;
             arguments[2] = &o;
             module.Launch(function, (uint)(ConvCo * ConvH * ConvW / ConvBlock), 1, 1, ConvBlock, 1, 1, 0, arguments);
-        };
+        }
+        Action generated = () => Launch(output);
 
+        // The generated kernel writes a buffer of its own: into cuDNN's, a kernel that wrote nothing would match.
         cudnn();
         float[] expected = backend.DownloadBuffer(output);
-        generated();
-        float[] actual = backend.DownloadBuffer(output);
+        Launch(check);
+        float[] actual = backend.DownloadBuffer(check);
         double largest = 1e-30, worst = 0;
         for (int j = 0; j < expected.Length; j++)
         {
