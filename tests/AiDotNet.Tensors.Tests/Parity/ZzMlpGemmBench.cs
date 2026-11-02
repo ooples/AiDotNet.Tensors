@@ -92,6 +92,14 @@ public class ZzMlpGemmBench
             for (int r = 0; r < k; r++) for (int cc = 0; cc < n; cc++) wT[cc * k + r] = w[r * n + cc];
             var dxPreT = Measure(() => AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(dyR, n, false, wT, k, false, dxR.AsSpan(0, mm * k), k, mm, k, n,
                 new AiDotNet.Tensors.Engines.BlasManaged.BlasOptions<float> { PackingMode = AiDotNet.Tensors.Engines.BlasManaged.PackingMode.DisableAutotune }));
+            var wT2 = new float[n * k];
+            var dxTn = Measure(() =>
+            {
+                AiDotNet.Tensors.Engines.Simd.SimdTranspose.Transpose(w.AsSpan(0, k * n), wT2.AsSpan(0, n * k), k, n);
+                AiDotNet.Tensors.Engines.Simd.SimdGemm.Sgemm(dyR.AsSpan(0, mm * n), n, false, wT2.AsSpan(0, n * k), k, false, dxR.AsSpan(0, mm * k), mm, n, k);
+            });
+            var dxNn = Measure(() => AiDotNet.Tensors.Engines.Simd.SimdGemm.Sgemm(dyR.AsSpan(0, mm * n), n, false, wT2.AsSpan(0, n * k), k, false, dxR.AsSpan(0, mm * k), mm, n, k));
+            Line($"ZM dXnn m{mm} {k}->{n} transpose+nn {dxTn.Min:F4}/{dxTn.Med:F4}  nn-only {dxNn.Min:F4}/{dxNn.Med:F4}  vec512 {AiDotNet.Tensors.Engines.Simd.SimdGemm.UseVector512Direct}");
             Line($"ZM dXroute m{mm} {k}->{n} current {dxCur.Min:F4}/{dxCur.Med:F4}  blasDis {dxDis.Min:F4}/{dxDis.Med:F4}  blasAuto {dxAuto.Min:F4}/{dxAuto.Med:F4}  blasWT {dxPreT.Min:F4}/{dxPreT.Med:F4}");
             Line($"ZM route m{mm} {k}->{n} cachedB {cached.Min:F4}/{cached.Med:F4}  blas {blas.Min:F4}/{blas.Med:F4}  sgemm {simd.Min:F4}/{simd.Med:F4}");
         }
