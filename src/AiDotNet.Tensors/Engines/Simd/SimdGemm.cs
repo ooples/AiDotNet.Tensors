@@ -3598,6 +3598,21 @@ internal static partial class SimdGemm
     /// <summary>Rows per register block of the transposed-A kernel below.</summary>
     private const int TransAMr = 6;
 
+    /// <summary>Whether the 512-bit transposed-A tile reads its six-row panels of At from a contiguous copy
+    /// (AIDOTNET_TRANSA_PACK_A=0 reads them in place). Same FMA chains either way: bit-identical.</summary>
+    internal static bool s_transAPackA = System.Environment.GetEnvironmentVariable("AIDOTNET_TRANSA_PACK_A") != "0";
+
+    private const long TransAPackMaxFloats = 1L << 20;
+
+    [ThreadStatic] private static float[]? t_transAPack;
+
+    private static float[] TransAPackABuffer(int floats)
+    {
+        var buffer = t_transAPack;
+        if (buffer is null || buffer.Length < floats) t_transAPack = buffer = new float[floats];
+        return buffer;
+    }
+
     /// <summary>
     /// C[i, :] = sum over p of At[i, p] * B[p, :] for the 6-row blocks [blockStart, blockEnd) of rows [0, mFull), with
     /// A stored [k, m] (lda = m), B [k, n] and C [m, n]. Each block is swept in 16-column strips (12 accumulators; the
@@ -3621,6 +3636,60 @@ internal static partial class SimdGemm
         var mask0 = _partialNrMasks[lane0N].AsSingle();
         var mask1 = _partialNrMasks[lane1N].AsSingle();
 
+        // Full six-row blocks with full 32-column strips: strip outer, each strip of B copied once into a contiguous
+        // buffer the chunk's row blocks all read (see s_packStrip512). The loop below then starts past those strips.
+        int packedColumns = 0;
+#if NET9_0_OR_GREATER
+        if (UseVector512Direct && s_packStrip512 && k <= MaxPackedStripK && nFull >= Nr512 && blockEnd - blockStart >= 2)
+        {
+            packedColumns = (nFull / Nr512) * Nr512;
+            int fullEnd = Math.Min(blockEnd, mFull / TransAMr);
+            int fullBlocks = fullEnd - blockStart;
+            if (s_transAPackA && fullBlocks > 0 && (long)fullBlocks * k * TransAMr <= TransAPackMaxFloats)
+            {
+                // Each six-row panel of At copied once, contiguous ([p][6]): read in place, a tile's six broadcasts
+                // per step sit m floats apart (3 KB at a 784-wide layer), past the L1 stride prefetcher's reach, and
+                // every strip re-reads them. Measured on the dense dW (784x128 . 128x512): Xeon 6973P 0.373 -> 0.299 ms,
+                // MLP step ratio on Xeon 8370C 1.44-1.55 -> 1.29-1.34; EPYC 9V45/9V74 within 1%.
+                float[] aBuf = TransAPackABuffer(fullBlocks * k * TransAMr);
+                fixed (float* ap = aBuf)
+                fixed (float* strip = PackedStripBuffer(k))
+                {
+                    for (int b = 0; b < fullBlocks; b++)
+                    {
+                        float* src = A + (blockStart + b) * TransAMr;
+                        float* dst = ap + (long)b * k * TransAMr;
+                        for (int p = 0; p < k; p++, src += m, dst += TransAMr)
+                        {
+                            dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2];
+                            dst[3] = src[3]; dst[4] = src[4]; dst[5] = src[5];
+                        }
+                    }
+                    for (int j = 0; j < packedColumns; j += Nr512)
+                    {
+                        PackStrip32(B + j, n, strip, k);
+                        for (int b = 0; b < fullBlocks; b++)
+                            TransAKernel6x32(ap + (long)b * k * TransAMr, TransAMr, strip, Nr512,
+                                C + (long)(blockStart + b) * TransAMr * n + j, n, k);
+                    }
+                }
+            }
+            else
+            fixed (float* strip = PackedStripBuffer(k))
+            {
+                for (int j = 0; j < packedColumns; j += Nr512)
+                {
+                    PackStrip32(B + j, n, strip, k);
+                    for (int blk = blockStart; blk < blockEnd; blk++)
+                    {
+                        int i0 = blk * TransAMr;
+                        if (mFull - i0 < TransAMr) continue;
+                        TransAKernel6x32(A + i0, m, strip, Nr512, C + (long)i0 * n + j, n, k);
+                    }
+                }
+            }
+        }
+#endif
         for (int blk = blockStart; blk < blockEnd; blk++)
         {
             int i0 = blk * TransAMr;
@@ -3628,12 +3697,12 @@ internal static partial class SimdGemm
             float* cRow = C + (long)i0 * n;
             if (mc == TransAMr)
             {
-                int j = 0;
+                int j = packedColumns;
 #if NET9_0_OR_GREATER
                 // 32-column steps on the 512-bit tile where the host accelerates it (the same FMA chain per element).
                 if (UseVector512Direct)
                     for (; j + Nr512 <= nFull; j += Nr512)
-                        TransAKernel6x32(A + i0, m, B + j, n, cRow + j, k);
+                        TransAKernel6x32(A + i0, m, B + j, n, cRow + j, n, k);
 #endif
                 for (; j < nFull; j += 16)
                     TransAKernel6x16(A + i0, m, B + j, n, cRow + j, k);

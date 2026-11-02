@@ -96,6 +96,7 @@ public class SimdGemmDirectParallel2DTests
     [InlineData(37, 300, 77)]     // 2 full strips, then a 13-column strip on the masked 16-wide kernel
     [InlineData(66, 96, 48)]      // a full strip and a 16-column remainder on the 6x16 kernel
     [InlineData(7, 40, 32)]       // one full row block (6x32 tile) and a 1-row masked block
+    [InlineData(25, 513, 64)]     // packed strips over k blocks of 256, 256 and 1 (partial sums resumed from C)
     public void Vector512Tile_IsBitIdenticalTo256BitTiles(int m, int k, int n)
     {
         // The direct kernels are register FMA chains with no portable form; production reaches them only behind an FMA gate.
@@ -128,6 +129,7 @@ public class SimdGemmDirectParallel2DTests
     // The transposed-A GEMM (a dense layer's dW = Xt*dY): full 6-row blocks take 32-column steps on the 512-bit tile.
     [SkippableTheory]
     [InlineData(784, 64, 512)]    // the parity MLP's first-layer dW
+    [InlineData(784, 128, 512)]   // the same at batch 128
     [InlineData(30, 17, 80)]      // 2 full 32-column steps, then a 16-column step
     [InlineData(29, 9, 70)]       // a 4-row remainder block, a scalar row, and a 6-column tail (mFull = 28)
     public void Vector512TransATile_IsBitIdenticalTo256BitTiles(int m, int k, int n)
@@ -139,16 +141,27 @@ public class SimdGemmDirectParallel2DTests
         var narrow = new float[m * n];
         var wide = new float[m * n];
         bool? before = SimdGemm.s_forceVector512Direct;
+        bool beforePackA = SimdGemm.s_transAPackA;
         try
         {
             SimdGemm.s_forceVector512Direct = false;
             SimdGemm.SgemmDirectParallelMIntoTransA(a, b, narrow, m, k, n);
             SimdGemm.s_forceVector512Direct = true;
+            // At's panels read in place, then from the packed copy (the default): the same chains, so both match the
+            // 256-bit tiles bit for bit; the packed run is also checked against the reference below.
+            SimdGemm.s_transAPackA = false;
+            var inPlace = new float[m * n];
+            SimdGemm.SgemmDirectParallelMIntoTransA(a, b, inPlace, m, k, n);
+            for (int i = 0; i < narrow.Length; i++)
+                Assert.True(BitConverter.SingleToInt32Bits(narrow[i]) == BitConverter.SingleToInt32Bits(inPlace[i]),
+                    $"in place C[{i / n},{i % n}]: 256-bit {narrow[i]:G9}, 512-bit {inPlace[i]:G9}");
+            SimdGemm.s_transAPackA = true;
             SimdGemm.SgemmDirectParallelMIntoTransA(a, b, wide, m, k, n);
         }
         finally
         {
             SimdGemm.s_forceVector512Direct = before;
+            SimdGemm.s_transAPackA = beforePackA;
         }
         for (int i = 0; i < narrow.Length; i++)
             Assert.True(BitConverter.SingleToInt32Bits(narrow[i]) == BitConverter.SingleToInt32Bits(wide[i]),

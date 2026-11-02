@@ -739,7 +739,7 @@ internal static class BackwardFunctions<T>
     // LM head's vocabulary-wide weight gradient, so dW takes SimdGemm only where that split applies.
     private const int BackwardInputGradientSimdMaxN = 4096;
 
-    private static void BackwardGemmInputGradient(float[] dY, float[] w, float[] dX, int m, int k, int n)
+    internal static void BackwardGemmInputGradient(float[] dY, float[] w, float[] dX, int m, int k, int n)
     {
         if (n <= BackwardInputGradientSimdMaxN)
         {
@@ -758,7 +758,7 @@ internal static class BackwardFunctions<T>
     private const int BackwardNarrowWeightGradientMaxN = 16;
     private const long BackwardNarrowWeightGradientMaxWork = 8L << 20;
 
-    private static void BackwardGemmWeightGradient(float[] x, float[] dY, float[] dW, int m, int k, int n)
+    internal static void BackwardGemmWeightGradient(float[] x, float[] dY, float[] dW, int m, int k, int n)
     {
 #if NET5_0_OR_GREATER
         if (n <= BackwardNarrowWeightGradientMaxN && (long)m * k * n <= BackwardNarrowWeightGradientMaxWork)
