@@ -60,7 +60,14 @@ LINEARS = [
 # Same profiling filters as the C# bench: a substring of "<op> | <shape>", the thread counts, the timed runs per row.
 FILTER = os.environ.get("AIDOTNET_OP_FILTER", "")
 THREADS = tuple(int(t) for t in os.environ.get("AIDOTNET_OP_THREADS", "1,2,4").split(","))
-SAMPLES = int(os.environ.get("AIDOTNET_OP_SAMPLES", "31"))
+SAMPLES = int(os.environ.get("AIDOTNET_OP_SAMPLES", "75"))
+
+
+def robust_ms(samples) -> float:
+    """Probe branch: median over groups of three consecutive samples of each group's minimum (preemption-robust)."""
+    groups = [min(samples[i:i + 3]) for i in range(0, len(samples) - 2, 3)]
+    groups.sort()
+    return groups[len(groups) // 2]
 
 
 def median_ms(fn) -> float:
@@ -75,8 +82,7 @@ def median_ms(fn) -> float:
         t0 = time.perf_counter()
         fn()
         samples.append((time.perf_counter() - t0) * 1000.0)
-    samples.sort()
-    return samples[len(samples) // 2]
+    return robust_ms(samples)
 
 
 def row(op: str, shape: str, threads: int, fn) -> None:
@@ -110,8 +116,7 @@ def layout_rows(op: str, shape: str, threads: int, contiguous, channels_last) ->
             sample.append(f"{layout}:{ms:.4f}")
         order.append(",".join(sample))
     for layout, suffix in (("nchw", ""), ("cl", "+cl")):
-        ordered = sorted(times[layout])
-        print(f"OPBREAKDOWN torch | {op}{suffix} | {shape} | t{threads} | {ordered[len(ordered) // 2]:.4f}", flush=True)
+        print(f"OPBREAKDOWN torch | {op}{suffix} | {shape} | t{threads} | {robust_ms(times[layout]):.4f}", flush=True)
     print(f"OPSAMPLES torch | {op} | {shape} | t{threads} | {' '.join(order)}", flush=True)
 
 
