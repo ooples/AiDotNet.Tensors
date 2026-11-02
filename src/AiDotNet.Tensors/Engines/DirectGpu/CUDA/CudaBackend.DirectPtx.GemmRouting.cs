@@ -458,6 +458,28 @@ public sealed partial class CudaBackend
         return new CudaGemmRouteDecision(m, n, k, strict, name, relative, eager, graph);
     }
 
+    /// <summary>
+    /// Times a generated kernel against the vendor library's call for the same work the way GEMM routing decides:
+    /// paired ABBA rounds of <paramref name="reps"/> launches on CUDA events, eager and as captured-graph replays.
+    /// Both actions must enqueue on this backend's stream and leave the same output. Used by the kernel campaigns
+    /// for operations that have no routing decision of their own (a convolution against cuDNN).
+    /// </summary>
+    internal (GemmRouteVerdict Eager, GemmRouteVerdict Graph) MeasureAgainstVendor(Action vendor, Action generated, int reps)
+    {
+        if (vendor is null) throw new ArgumentNullException(nameof(vendor));
+        if (generated is null) throw new ArgumentNullException(nameof(generated));
+        if (reps <= 0) throw new ArgumentOutOfRangeException(nameof(reps));
+        for (int i = 0; i < 3; i++)
+        {
+            vendor();
+            generated();
+        }
+        Synchronize();
+        GemmRouteVerdict eager = PairedRounds(() => { for (int i = 0; i < reps; i++) vendor(); },
+            () => { for (int i = 0; i < reps; i++) generated(); }, reps);
+        return (eager, GraphRounds(vendor, generated, reps));
+    }
+
     // Each arm captured as one graph of `reps` launches; the replays are then compared in paired rounds.
     private GemmRouteVerdict GraphRounds(Action cublas, Action ptx, int reps)
     {

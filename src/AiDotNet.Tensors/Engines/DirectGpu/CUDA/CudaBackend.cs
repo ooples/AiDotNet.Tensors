@@ -2436,7 +2436,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     }
 
     // Row-major C = alpha * A @ B + beta * C on cuBLAS in the backend's current math mode (the caller pushed the context).
-    private void CublasGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha, float beta)
+    internal void CublasGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha, float beta)
     {
         // Record the route that actually runs: BlasSgemm serves this slot with the generated GEMM when cuBLAS is not in
         // use, and reporting Cublas then told a caller checking the route that a library ran which was never loaded.
