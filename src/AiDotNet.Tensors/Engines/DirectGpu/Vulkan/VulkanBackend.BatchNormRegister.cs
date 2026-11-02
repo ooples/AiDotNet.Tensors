@@ -64,6 +64,9 @@ public sealed unsafe partial class VulkanBackend : IBatchNormVarianceBackend
             groups * BatchNormRegisterKernelTemplate.GroupSize, buffers);
     }
 
+    bool IBatchNormVarianceBackend.AcceptsTrainingShape(int batch, int channels, int spatial)
+        => BatchNormRegisterReady && PortableBatchNorm.AcceptsShape(batch, channels, spatial);
+
     bool IBatchNormVarianceBackend.TryBatchNormTrainingWithVariance(IGpuBuffer input, IGpuBuffer output,
         IGpuBuffer gamma, IGpuBuffer beta, IGpuBuffer saveMean, IGpuBuffer saveVariance,
         int batch, int channels, int spatial, float epsilon, bool relu, IGpuBuffer? residual)

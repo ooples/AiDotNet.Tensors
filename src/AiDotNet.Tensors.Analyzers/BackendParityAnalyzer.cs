@@ -30,13 +30,16 @@ namespace AiDotNet.Tensors.Analyzers;
 /// <item><b>TENS0004</b> a baseline line is malformed or does not name a tracking issue.</item>
 /// <item><b>TENS0006</b> a backend implements an interface member by reading device memory back to the
 /// host (a direct <c>Download*</c> call), which hides a host round-trip behind a GPU capability.</item>
+/// <item><b>TENS0008</b> a backend implements an interface member only by calling two or more of its own other
+/// interface members (a fused <c>AddRelu</c> as <c>Add</c> then <c>Relu</c>): it compiles, reports the capability and
+/// runs, but launches the unfused kernels, so the fusion the caller asked for silently never happens.</item>
 /// <item><b>TENS0005</b> a <c>[BackendSpecificRoute]</c> exemption has no reason, or names a
 /// cross-backend operation that is not present on all six backends.</item>
 /// </list>
 /// <para>
 /// Existing gaps live in <c>BackendParityBaseline.txt</c> (an AdditionalFiles item), one per line:
 /// <c>capability &lt;Interface&gt; &lt;Backend&gt; #issue</c>, <c>stub &lt;Backend&gt;.&lt;Member&gt; #issue</c> or
-/// <c>host &lt;Backend&gt;.&lt;Member&gt; #issue</c>.
+/// <c>host &lt;Backend&gt;.&lt;Member&gt; #issue</c> or <c>composed &lt;Backend&gt;.&lt;Member&gt; #issue</c>.
 /// </para>
 /// </remarks>
 [DiagnosticAnalyzer(LanguageNames.CSharp)]
@@ -72,7 +75,7 @@ public sealed class BackendParityAnalyzer : DiagnosticAnalyzer
 
     internal static readonly DiagnosticDescriptor MalformedBaselineEntry = new(
         "TENS0004", "Backend parity baseline entry is malformed",
-        "Baseline line '{0}' must be 'capability <Interface> <Backend> #issue', 'stub <Backend>.<Member> #issue' or 'host <Backend>.<Member> #issue'",
+        "Baseline line '{0}' must be 'capability <Interface> <Backend> #issue', 'stub <Backend>.<Member> #issue', 'host <Backend>.<Member> #issue' or 'composed <Backend>.<Member> #issue'",
         Category, DiagnosticSeverity.Error, isEnabledByDefault: true);
 
     internal static readonly DiagnosticDescriptor InvalidRouteExemption = new(
@@ -90,9 +93,17 @@ public sealed class BackendParityAnalyzer : DiagnosticAnalyzer
         "'{0}.{1}' reaches '{2}' through the concrete class, so no other backend can provide it; put the capability behind an interface every backend implements, or add a tracked baseline entry",
         Category, DiagnosticSeverity.Error, isEnabledByDefault: true);
 
+    internal static readonly DiagnosticDescriptor ComposedImplementation = new(
+        "TENS0008", "Backend member is a composition of other backend members",
+        "'{0}.{1}' implements '{2}' only by calling {3}; that launches the unfused kernels, so write one kernel for it",
+        Category, DiagnosticSeverity.Error, isEnabledByDefault: true);
+
+    /// <summary>The fewest own interface members a body must call, and nothing else, to count as composed.</summary>
+    private const int ComposedMinimumCallees = 2;
+
     public override ImmutableArray<DiagnosticDescriptor> SupportedDiagnostics { get; } = ImmutableArray.Create(
         CapabilityNotOnAllBackends, StubImplementation, StaleBaselineEntry, MalformedBaselineEntry, InvalidRouteExemption,
-        HostRoundTrip, ConcreteBackendDispatch);
+        HostRoundTrip, ConcreteBackendDispatch, ComposedImplementation);
 
     public override void Initialize(AnalysisContext context)
     {
@@ -119,16 +130,18 @@ public sealed class BackendParityAnalyzer : DiagnosticAnalyzer
 
         var stubs = new ConcurrentBag<StubCandidate>();
         var hostReads = new ConcurrentBag<StubCandidate>();
-        context.RegisterSymbolAction(c => CollectStub(c, backends, stubs), SymbolKind.Method);
+        var composed = new ConcurrentBag<StubCandidate>();
+        context.RegisterSymbolAction(c => CollectStub(c, backends, stubs, composed), SymbolKind.Method);
         context.RegisterSyntaxNodeAction(c => CollectHostRead(c, backends, hostReads), SyntaxKind.InvocationExpression);
         var casts = new ConcurrentBag<StubCandidate>();
         context.RegisterOperationAction(c => CollectConcreteCast(c, backends, casts),
             OperationKind.IsType, OperationKind.DeclarationPattern, OperationKind.TypePattern, OperationKind.RecursivePattern,
             OperationKind.Conversion);
-        context.RegisterCompilationEndAction(c => Finish(c, backends, stubs, hostReads, casts));
+        context.RegisterCompilationEndAction(c => Finish(c, backends, stubs, hostReads, casts, composed));
     }
 
-    private static void CollectStub(SymbolAnalysisContext context, List<INamedTypeSymbol> backends, ConcurrentBag<StubCandidate> stubs)
+    private static void CollectStub(SymbolAnalysisContext context, List<INamedTypeSymbol> backends, ConcurrentBag<StubCandidate> stubs,
+        ConcurrentBag<StubCandidate> composed)
     {
         var method = (IMethodSymbol)context.Symbol;
         var owner = method.ContainingType;
@@ -137,11 +150,19 @@ public sealed class BackendParityAnalyzer : DiagnosticAnalyzer
         foreach (var reference in method.DeclaringSyntaxReferences)
         {
             if (reference.GetSyntax(context.CancellationToken) is not BaseMethodDeclarationSyntax declaration) continue;
-            string? thrown = OnlyThrownType(declaration, context.Compilation.GetSemanticModel(declaration.SyntaxTree));
-            if (thrown is null) continue;
+            var model = context.Compilation.GetSemanticModel(declaration.SyntaxTree);
+            string? thrown = OnlyThrownType(declaration, model);
+            string? callees = thrown is null ? ComposedCallees(declaration, model, owner) : null;
+            if (thrown is null && callees is null) continue;
 
             var implemented = ImplementedInterfaceMember(owner, method);
             if (implemented is null) continue;
+            if (callees is not null)
+            {
+                composed.Add(new StubCandidate(owner.Name, implemented.Name,
+                    implemented.ContainingType.Name + "." + implemented.Name, callees, declaration.GetLocation()));
+                continue;
+            }
 
             stubs.Add(new StubCandidate(owner.Name, implemented.Name, implemented.ContainingType.Name + "." + implemented.Name,
                 thrown, declaration.GetLocation()));
@@ -240,6 +261,126 @@ public sealed class BackendParityAnalyzer : DiagnosticAnalyzer
         return null;
     }
 
+    /// <summary>
+    /// The own interface members a block body calls when it does nothing else -- each statement is a call on this
+    /// backend to a member that implements an interface member, a guard (an <c>if</c> without a call in its condition
+    /// that only throws or returns, or a call to a <c>ThrowIf*</c>, <c>Ensure*</c>, <c>Validate*</c> or <c>Require*</c>
+    /// helper), a local whose initializer calls nothing but such members and helpers (a scratch buffer), or a
+    /// <c>lock</c> / <c>using</c> / plain block made of the same -- and calls at least
+    /// <see cref="ComposedMinimumCallees"/> of them; otherwise null. A body that tries a fused kernel first
+    /// (<c>if (TryFused(...)) return;</c>) calls something else in a condition, so it is not composed.
+    /// </summary>
+    private static string? ComposedCallees(BaseMethodDeclarationSyntax declaration, SemanticModel model, INamedTypeSymbol owner)
+    {
+        if (declaration.Body is null) return null;
+        var callees = new List<string>();
+        return CollectComposed(declaration.Body.Statements, model, owner, callees) && callees.Count >= ComposedMinimumCallees
+            ? string.Join(" then ", callees)
+            : null;
+    }
+
+    private static bool CollectComposed(IEnumerable<StatementSyntax> statements, SemanticModel model, INamedTypeSymbol owner,
+        List<string> callees)
+    {
+        foreach (var statement in statements)
+        {
+            switch (statement)
+            {
+                case var guard when IsGuard(guard):
+                    continue;
+                case BlockSyntax block:
+                    if (!CollectComposed(block.Statements, model, owner, callees)) return false;
+                    continue;
+                case LockStatementSyntax locked:
+                    if (!CollectComposed(new[] { locked.Statement }, model, owner, callees)) return false;
+                    continue;
+                case UsingStatementSyntax scope:
+                    if (scope.Declaration is not null && !OnlyNeutralCalls(scope.Declaration, model, owner)) return false;
+                    if (scope.Expression is not null && !OnlyNeutralCalls(scope.Expression, model, owner)) return false;
+                    if (!CollectComposed(new[] { scope.Statement }, model, owner, callees)) return false;
+                    continue;
+                // A temporary (using var scratch = AllocateBuffer(n);) between the calls is still a composition.
+                case LocalDeclarationStatementSyntax local:
+                    if (!OnlyNeutralCalls(local.Declaration, model, owner)) return false;
+                    // var result = GemmBiasRelu(...); is a launch of the composition; an allocation is only its scratch.
+                    var launched = local.Declaration.DescendantNodes().OfType<InvocationExpressionSyntax>()
+                        .Select(call => model.GetSymbolInfo(call).Symbol)
+                        .OfType<IMethodSymbol>()
+                        .Where(made => !IsGuardHelper(made, owner)
+                            && !made.Name.StartsWith("Allocate", StringComparison.Ordinal));
+                    foreach (var made in launched)
+                        callees.Add(made.Name);
+                    continue;
+                // try { ... } finally { scratch.Dispose(); } releases the temporaries of the same composition.
+                case TryStatementSyntax { Catches.Count: 0 } attempt:
+                    if (!CollectComposed(attempt.Block.Statements, model, owner, callees)) return false;
+                    if (attempt.Finally is not null && !CollectComposed(attempt.Finally.Block.Statements, model, owner, callees))
+                        return false;
+                    continue;
+                case ExpressionStatementSyntax { Expression: InvocationExpressionSyntax invocation }:
+                    if (!CollectCall(invocation, model, owner, callees)) return false;
+                    continue;
+                // return Member(...); or return scratch; ends the composition with its result.
+                case ReturnStatementSyntax { Expression: null or IdentifierNameSyntax }:
+                    continue;
+                case ReturnStatementSyntax { Expression: InvocationExpressionSyntax returned }:
+                    if (!CollectCall(returned, model, owner, callees)) return false;
+                    continue;
+                default:
+                    return false;
+            }
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Records a call on this backend to a member that implements an interface member; a guard helper or the release of a
+    /// temporary (<c>scratch.Dispose()</c>) is neutral. Anything else ends the composition.
+    /// </summary>
+    private static bool CollectCall(InvocationExpressionSyntax invocation, SemanticModel model, INamedTypeSymbol owner,
+        List<string> callees)
+    {
+        if (model.GetSymbolInfo(invocation).Symbol is not IMethodSymbol target) return false;
+        if (IsGuardHelper(target, owner) || IsRelease(invocation, target)) return true;
+        bool onThis = invocation.Expression is IdentifierNameSyntax
+            || invocation.Expression is MemberAccessExpressionSyntax { Expression: ThisExpressionSyntax };
+        if (!onThis || !SymbolEqualityComparer.Default.Equals(target.ContainingType, owner)
+            || ImplementedInterfaceMember(owner, target) is null)
+            return false;
+        callees.Add(target.Name);
+        return true;
+    }
+
+    /// <summary><c>local.Dispose()</c> on a local: freeing a scratch buffer launches nothing.</summary>
+    private static bool IsRelease(InvocationExpressionSyntax invocation, IMethodSymbol target)
+        => target.Name == "Dispose" && target.Parameters.Length == 0
+           && invocation.Expression is MemberAccessExpressionSyntax { Expression: IdentifierNameSyntax };
+
+    /// <summary>Every call under <paramref name="node"/> is an own interface member or a guard helper.</summary>
+    private static bool OnlyNeutralCalls(SyntaxNode node, SemanticModel model, INamedTypeSymbol owner)
+        => node.DescendantNodesAndSelf().OfType<InvocationExpressionSyntax>().All(call =>
+            model.GetSymbolInfo(call).Symbol is IMethodSymbol callee
+            && (IsGuardHelper(callee, owner)
+                || (SymbolEqualityComparer.Default.Equals(callee.ContainingType, owner)
+                    && ImplementedInterfaceMember(owner, callee) is not null)));
+
+    /// <summary>A precondition or scratch-capacity helper: it launches nothing the caller asked for.</summary>
+    private static bool IsGuardHelper(IMethodSymbol target, INamedTypeSymbol owner)
+        => target.Name.StartsWith("ThrowIf", StringComparison.Ordinal)
+           || (SymbolEqualityComparer.Default.Equals(target.ContainingType, owner)
+               && ImplementedInterfaceMember(owner, target) is null
+               && (target.Name.StartsWith("Ensure", StringComparison.Ordinal)
+                   || target.Name.StartsWith("Validate", StringComparison.Ordinal)
+                   || target.Name.StartsWith("Require", StringComparison.Ordinal)));
+
+    private static bool IsGuard(StatementSyntax statement)
+    {
+        if (statement is not IfStatementSyntax { Else: null } branch) return false;
+        if (branch.Condition.DescendantNodesAndSelf().OfType<InvocationExpressionSyntax>().Any()) return false;
+        var body = branch.Statement is BlockSyntax { Statements.Count: 1 } block ? block.Statements[0] : branch.Statement;
+        return body is ThrowStatementSyntax || body is ReturnStatementSyntax { Expression: null };
+    }
+
     private static ISymbol? ImplementedInterfaceMember(INamedTypeSymbol owner, IMethodSymbol method)
     {
         foreach (var candidate in method.ExplicitInterfaceImplementations)
@@ -256,7 +397,7 @@ public sealed class BackendParityAnalyzer : DiagnosticAnalyzer
     }
 
     private static void Finish(CompilationAnalysisContext context, List<INamedTypeSymbol> backends, ConcurrentBag<StubCandidate> stubs,
-        ConcurrentBag<StubCandidate> hostReads, ConcurrentBag<StubCandidate> casts)
+        ConcurrentBag<StubCandidate> hostReads, ConcurrentBag<StubCandidate> casts, ConcurrentBag<StubCandidate> composed)
     {
         var baseline = Baseline.Load(context);
         var assembly = context.Compilation.Assembly;
@@ -292,6 +433,13 @@ public sealed class BackendParityAnalyzer : DiagnosticAnalyzer
             if (baseline.Consume("stub " + stub.Backend + "." + stub.Member)) continue;
             context.ReportDiagnostic(Diagnostic.Create(StubImplementation, stub.Location,
                 stub.Backend, stub.Member, stub.Implements, stub.Thrown));
+        }
+
+        foreach (var item in composed.OrderBy(s => s.Backend, StringComparer.Ordinal).ThenBy(s => s.Member, StringComparer.Ordinal))
+        {
+            if (baseline.Consume("composed " + item.Backend + "." + item.Member)) continue;
+            context.ReportDiagnostic(Diagnostic.Create(ComposedImplementation, item.Location,
+                item.Backend, item.Member, item.Implements, item.Thrown));
         }
 
         var reportedHost = new HashSet<string>(StringComparer.Ordinal);
@@ -408,7 +556,7 @@ public sealed class BackendParityAnalyzer : DiagnosticAnalyzer
             bool valid = parts.Length >= 3 && parts[parts.Length - 1].Length > 1 && parts[parts.Length - 1][0] == '#'
                 && parts[parts.Length - 1].Skip(1).All(char.IsDigit)
                 && (((parts[0] == "capability" || parts[0] == "cast") && parts.Length == 4)
-                    || ((parts[0] == "stub" || parts[0] == "host") && parts.Length == 3 && parts[1].Contains('.')));
+                    || ((parts[0] == "stub" || parts[0] == "host" || parts[0] == "composed") && parts.Length == 3 && parts[1].Contains('.')));
             if (!valid)
             {
                 _problems.Add(Diagnostic.Create(MalformedBaselineEntry, location, content));

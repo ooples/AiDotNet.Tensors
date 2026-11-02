@@ -4028,10 +4028,16 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             foreach (var step in _forwardSteps)
                 foreach (var input in step.Inputs)
                     if (input is not null && input.IsContiguous && input.Length > 0
-                        && !produced.Contains(input) && !owned.Contains(input) && seen.Add(input))
+                        && !produced.Contains(input) && !owned.Contains(input) && !WrittenByCompiledNode(input)
+                        && seen.Add(input))
                         leaves.Add(input);
         return _graphExternalLeaves = leaves.ToArray();
     }
+
+    // A fused node also writes the outputs of the nodes it absorbed (a fused BatchNorm+ReLU writes the batch mean and
+    // variance), and those keep the fused node as their producer. Taken for caller-fed leaves, they were downloaded,
+    // unbound and re-uploaded by every pre-pass: a quarter of MobileNetV2's step once BatchNorm+ReLU6 fused.
+    private static bool WrittenByCompiledNode(Tensor<T> tensor) => tensor.LazySource is LazyNode<T> { IsRealized: true };
 
     /// <summary>Refresh the persistent graph-input tensor's GPU buffer IN PLACE (stable pointer) with
     /// its current host contents, OUTSIDE capture, and sync its buffer-version so a captured read is a

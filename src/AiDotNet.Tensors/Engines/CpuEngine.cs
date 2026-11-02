@@ -10783,6 +10783,37 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>
+    /// Whether <see cref="DispatchFloatConv2D"/> sends an NCHW float convolution to one of the kernels it tries before
+    /// the adaptive chain (the 1x1 GEMMs, Winograd, the direct blocked kernel, the small-output kernel, the batch-wide
+    /// GEMM). A fused conv + epilogue entry must then run the convolution through <c>Conv2DInto</c> to compute it bit for
+    /// bit as the unfused plan does; the adaptive chain's 3x3 kernels sum in another order.
+    /// </summary>
+    private static bool DispatchTakesDedicatedFloatRoute(int batch, int inChannels, int height, int width, int outChannels,
+        int kernelHeight, int kernelWidth, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW,
+        int outputHeight, int outputWidth)
+    {
+        if (t_forceFullIm2Col || t_forceImplicitGemmForTest) return false;
+#if NET5_0_OR_GREATER
+        if ((strideH > 1 || strideW > 1)
+            && Simd.Conv1x1Gemm.Applies(batch, kernelHeight, kernelWidth, padH, padW, dilationH, dilationW))
+            return true;
+#endif
+        if (IsConv1x1PerImageGemmShape(batch, kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW))
+            return true;
+#if NET5_0_OR_GREATER
+        if (Simd.WinogradF43.Applies(batch, inChannels, outChannels, height, width, kernelHeight, kernelWidth,
+                strideH, strideW, padH, padW, dilationH, dilationW)
+            || Simd.DirectConvAvx2.TryChoose(new Simd.DirectConvShape(Simd.DirectConvPass.Forward, batch, inChannels,
+                outChannels, height, width, kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW), out _)
+            || Simd.SmallOutConv.Applies(inChannels, outChannels, kernelHeight, kernelWidth, strideH, strideW,
+                dilationH, dilationW, padH, padW))
+            return true;
+#endif
+        return UseBatchedConvForward(batch, inChannels, kernelHeight, kernelWidth, strideH, strideW, outputHeight,
+            outputWidth, outChannels);
+    }
+
+    /// <summary>
     /// Dispatches every float Conv2D entry point through the same platform/geometry policy.
     /// The supplied arrays may already be unpacked for a packed-layout fallback.
     /// </summary>
@@ -26264,8 +26295,11 @@ public partial class CpuEngine : ITensorLevelEngine
                 // A 4D float input on the CPU is normalized straight into the recorded output below, reading the input's
                 // live array: the eager path copied a pool-padded input whole (GetReadOnlyDataArray) and normalized into
                 // a fresh result it then copied into the recorded output -- two activation-sized temporaries per BatchNorm,
-                // over a quarter of everything a DenseNet-121 training trace allocated.
-                bool directIntoRecorded = typeof(T) == typeof(float) && !SupportsGpu && input.Rank == 4
+                // over a quarter of everything a DenseNet-121 training trace allocated. A GPU engine defers the same way:
+                // the eager path normalized on the device, then the copy realized the node (normalizing again, and
+                // realizing every unrealized producer above it) and downloaded the result; the pooled eager result kept
+                // its device buffer, 1.1 GB of trace-time BatchNorm outputs held all run on DenseNet-121.
+                bool directIntoRecorded = typeof(T) == typeof(float) && input.Rank == 4
                     && input.IsContiguous && gamma.IsContiguous && beta.IsContiguous
                     && gamma.Length == input._shape[1] && beta.Length == input._shape[1];
                 var savedScope = GraphMode.Current;
@@ -44129,9 +44163,14 @@ public partial class CpuEngine : ITensorLevelEngine
     // shapes, where it beats native BLAS + copy by 1.3-2.8x. Fall back to native
     // BLAS only for large K·N·M, where native raw throughput wins. Thresholds from
     // InferenceGemmStrategyAbTests on the AIsEval MLP shapes; shape-based so it
-    // generalises beyond MLP (transformer projections, etc.).
+    // generalises beyond MLP (transformer projections, etc.). Many rows also go to BlasManaged: at 512 rows and more
+    // every transformer / ViT projection measured faster there on a 16-core Ryzen (4096 x 64 x 128: 260 against 393 us;
+    // 520 x 768 x 192: 476 against 555; 8320 x 768 x 192: 4.9 against 5.8 ms).
     private static bool PreferManagedInferenceGemm(int m, int k, int n)
-        => !((long)k * n > 200_000 && m >= 16);
+        => !((long)k * n > 200_000 && m >= 16) && m < ManagedInferenceGemmMaxRows;
+
+    // The rows from which an inference FusedLinear's GEMM leaves the cached-B route for BlasManaged.
+    private const int ManagedInferenceGemmMaxRows = 256;
 
     public virtual Tensor<T> FusedLinear<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, FusedActivationType activation, FusedActivationParams? activationParams = null)
     {

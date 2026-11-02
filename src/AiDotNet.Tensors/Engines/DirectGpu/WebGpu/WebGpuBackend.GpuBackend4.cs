@@ -209,34 +209,6 @@ public sealed partial class WebGpuBackend
             param, gradient, z, n, uniforms, size).GetAwaiter().GetResult();
     }
 
-    public void ConvertToFp16(IGpuBuffer input, IGpuBuffer output, int size)
-    {
-        // FP32 -> FP16 emulation: truncate mantissa to 10 bits via GPU kernel.
-        // WebGPU buffers are always f32, so we emulate FP16 by reducing precision
-        // (zeroing the bottom 13 mantissa bits). This matches IEEE 754 half-precision
-        // rounding behavior (round-toward-zero) and handles overflow/underflow.
-        var uniforms = new float[]
-        {
-            BitConverter.Int32BitsToSingle(size),
-            BitConverter.Int32BitsToSingle(0) // direction=0: to_fp16
-        };
-        Dispatch2BufferAsync("Fp16Convert", WebGpuKernels.Fp16ConvertSource, "fp16_convert",
-            input, output, uniforms, size).GetAwaiter().GetResult();
-    }
-
-    public void ConvertToFp32(IGpuBuffer input, IGpuBuffer output, int size)
-    {
-        // FP16 -> FP32: data is already stored as f32 with FP16-truncated precision.
-        // Simply copy the values through (they are valid f32 representations of FP16 values).
-        var uniforms = new float[]
-        {
-            BitConverter.Int32BitsToSingle(size),
-            BitConverter.Int32BitsToSingle(1) // direction=1: from_fp16
-        };
-        Dispatch2BufferAsync("Fp16Convert", WebGpuKernels.Fp16ConvertSource, "fp16_convert",
-            input, output, uniforms, size).GetAwaiter().GetResult();
-    }
-
     #endregion
 
     #region Specialized Layer Operations
@@ -669,13 +641,6 @@ public sealed partial class WebGpuBackend
         // For inverse FFT, the kernel already handles 1/N normalization
     }
 
-    public void RFFT(IGpuBuffer input, IGpuBuffer outputReal, IGpuBuffer outputImag, int n)
-    {
-        using var zeros = (WebGpuBuffer)AllocateBuffer(n);
-        Fill(zeros, 0f, n);
-        FFT(input, zeros, outputReal, outputImag, n, false);
-    }
-
     public void IRFFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer output, int n)
     {
         using var tempImag = (WebGpuBuffer)AllocateBuffer(n);
@@ -703,29 +668,6 @@ public sealed partial class WebGpuBackend
         int total = batch * n;
         Dispatch4BufferAsync("FFT", WebGpuKernels.FFTSource, "fft_1d",
             inputReal, inputImag, outputReal, outputImag, uniforms, total).GetAwaiter().GetResult();
-    }
-
-    public void FFT2D(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag,
-        int height, int width, bool inverse)
-    {
-        // 2D FFT = row-wise 1D FFT (batch=height, n=width) then column-wise 1D FFT (batch=width, n=height)
-        // Pass 1: Row-wise FFT - data is already in row-major order, so batch=height works directly
-        using var tempR = (WebGpuBuffer)AllocateBuffer(height * width);
-        using var tempI = (WebGpuBuffer)AllocateBuffer(height * width);
-        BatchedFFT(inputReal, inputImag, tempR, tempI, height, width, inverse);
-        // Pass 2: Column-wise FFT - need to transpose, FFT, then transpose back
-        using var transR = (WebGpuBuffer)AllocateBuffer(height * width);
-        using var transI = (WebGpuBuffer)AllocateBuffer(height * width);
-        // Transpose from (height x width) to (width x height)
-        BatchedTranspose(tempR, transR, 1, height, width);
-        BatchedTranspose(tempI, transI, 1, height, width);
-        // FFT columns: now batch=width, n=height
-        using var fftR = (WebGpuBuffer)AllocateBuffer(height * width);
-        using var fftI = (WebGpuBuffer)AllocateBuffer(height * width);
-        BatchedFFT(transR, transI, fftR, fftI, width, height, inverse);
-        // Transpose back from (width x height) to (height x width)
-        BatchedTranspose(fftR, outputReal, 1, width, height);
-        BatchedTranspose(fftI, outputImag, 1, width, height);
     }
 
     /// <inheritdoc/>
@@ -803,18 +745,6 @@ public sealed partial class WebGpuBackend
         var uniforms = new float[] { BitConverter.Int32BitsToSingle(n), 0, 0, 0 };
         Dispatch4BufferAsync("ComplexOps", WebGpuKernels.ComplexOpsSource, "polar_to_complex",
             magnitude, phase, real, imag, uniforms, n).GetAwaiter().GetResult();
-    }
-
-    public void ApplyMelFilterbank(IGpuBuffer powerSpec, IGpuBuffer filterbank, IGpuBuffer melSpec,
-        int numFrames, int numFreqs, int nMels)
-    {
-        // melSpec[b,m] = sum_f(powerSpec[b,f] * filterbank[m,f])
-        // This is powerSpec (numFrames x numFreqs) * filterbank^T (numFreqs x nMels)
-        // = Gemm(powerSpec, filterbank^T, melSpec, M=numFrames, N=nMels, K=numFreqs)
-        // filterbank is (nMels x numFreqs), so transpose it
-        using var filterbankT = (WebGpuBuffer)AllocateBuffer(numFreqs * nMels);
-        BatchedTranspose(filterbank, filterbankT, 1, nMels, numFreqs);
-        Gemm(powerSpec, filterbankT, melSpec, numFrames, nMels, numFreqs);
     }
 
     public void PowerToDb(IGpuBuffer power, IGpuBuffer db, int n, float refValue, float minDb)

@@ -445,18 +445,18 @@ __kernel void exp10_vector(__global const float* A, __global float* B, const int
     else { for (int i = idx4; i < size; i++) B[i] = exp(A[i] * 2.302585093f); }
 }
 
-// exp(x) - 1
+// exp(x) - 1 through the built-in, which keeps a small x's digits (exp(x) - 1.0f keeps only a few of them)
 __kernel void expm1_vector(__global const float* A, __global float* B, const int size) {
     const int idx = get_global_id(0); const int idx4 = idx * 4;
-    if (idx4 + 3 < size) { vstore4(exp(vload4(idx, A)) - (float4)(1.0f), idx, B); }
-    else { for (int i = idx4; i < size; i++) B[i] = exp(A[i]) - 1.0f; }
+    if (idx4 + 3 < size) { vstore4(expm1(vload4(idx, A)), idx, B); }
+    else { for (int i = idx4; i < size; i++) B[i] = expm1(A[i]); }
 }
 
 // log(1 + x)
 __kernel void log1p_vector(__global const float* A, __global float* B, const int size) {
     const int idx = get_global_id(0); const int idx4 = idx * 4;
-    if (idx4 + 3 < size) { vstore4(log((float4)(1.0f) + vload4(idx, A)), idx, B); }
-    else { for (int i = idx4; i < size; i++) B[i] = log(1.0f + A[i]); }
+    if (idx4 + 3 < size) { vstore4(log1p(vload4(idx, A)), idx, B); }
+    else { for (int i = idx4; i < size; i++) B[i] = log1p(A[i]); }
 }
 
 // Square root

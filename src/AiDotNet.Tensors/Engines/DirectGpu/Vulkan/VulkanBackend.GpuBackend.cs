@@ -748,9 +748,18 @@ public sealed unsafe partial class VulkanBackend
 
     public void Add(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
         => GpuBinaryOp(A, B, C, size, VulkanKernelType.VectorAdd);
-    public void AddRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Relu(C, C, size); }
-    public void AddSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Sigmoid(C, C, size); }
-    public void AddGelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Gelu(C, C, size); }
+    public void AddRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => AddActivation(A, B, C, size, AddActivationOp.Relu);
+    public void AddSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => AddActivation(A, B, C, size, AddActivationOp.Sigmoid);
+    public void AddGelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => AddActivation(A, B, C, size, AddActivationOp.Gelu);
+
+    /// <summary>The activation selector of <see cref="VulkanGlslKernels.AddActivation"/>.</summary>
+    private enum AddActivationOp : uint { Relu = 0, Sigmoid = 1, Gelu = 2 }
+
+    private void AddActivation(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size, AddActivationOp op)
+    {
+        if (size <= 0) return;
+        GlslBinaryOp(VulkanGlslKernels.AddActivation, A, B, C, size, new uint[] { (uint)size, (uint)op }, 2 * sizeof(uint));
+    }
 
     public void Subtract(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
         => GpuBinaryOp(A, B, C, size, VulkanKernelType.VectorSubtract);
@@ -811,22 +820,6 @@ public sealed unsafe partial class VulkanBackend
         GlslBinaryOp(VulkanGlslKernels.StridedDot, a, b, result, 1,
             new uint[] { (uint)aSize, (uint)bSize, unchecked((uint)bOffset), unchecked((uint)bStride) },
             4 * sizeof(uint));
-    }
-
-    public void BatchedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
-        int batchSize, int vecSize)
-    {
-        EnsureInitialized();
-        if (batchSize <= 0 || vecSize <= 0) return;
-        if ((long)batchSize * vecSize > a.Size) throw new ArgumentOutOfRangeException(nameof(batchSize), $"batchSize*vecSize ({(long)batchSize * vecSize}) exceeds buffer A length ({a.Size}).");
-        if ((long)batchSize * vecSize > b.Size) throw new ArgumentOutOfRangeException(nameof(batchSize), $"batchSize*vecSize ({(long)batchSize * vecSize}) exceeds buffer B length ({b.Size}).");
-
-        // Element-wise multiply all batches, then reduce each batch
-        using var temp = AllocateBuffer(batchSize * vecSize);
-        Multiply(a, b, temp, batchSize * vecSize);
-        // Synchronize to ensure Multiply completes before SumAxis reads temp
-        Synchronize();
-        SumAxis(temp, result, batchSize, vecSize);
     }
 
     public void Scale(IGpuBuffer A, IGpuBuffer B, float scalar, int size)

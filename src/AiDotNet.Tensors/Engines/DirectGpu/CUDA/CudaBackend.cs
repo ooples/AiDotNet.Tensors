@@ -13148,9 +13148,16 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public unsafe void Fma(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, IGpuBuffer D, int size)
     {
-        // D = A * B + C
-        Multiply(A, B, D, size);
-        Add(D, C, D, size);
+        // D = fma(A, B, C) in one kernel; D may alias C.
+        if (size <= 0) return;
+        if (!_kernelCache.TryGetValue("fma_vectors", out var kernel))
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fma_vectors");
+        using var _ = PushContext();
+        IntPtr pa = A.Handle, pb = B.Handle, pc = C.Handle, pd = D.Handle;
+        int n = size;
+        void** args = stackalloc void*[5];
+        args[0] = &pa; args[1] = &pb; args[2] = &pc; args[3] = &pd; args[4] = &n;
+        LaunchKernel(kernel, (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
     }
 
     public unsafe void Lerp(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, float t, int size)
@@ -16306,15 +16313,38 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     }
 
     /// <inheritdoc/>
+    private unsafe void StridedDft(IGpuBuffer inRe, IGpuBuffer inIm, IGpuBuffer outRe, IGpuBuffer outIm,
+        int lines, int n, int elemStride, int lineStride, bool inverse)
+    {
+        if (!_kernelCache.TryGetValue("strided_dft", out var kernel))
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: strided_dft.");
+        IntPtr p0 = inRe.Handle, p1 = inIm.Handle, p2 = outRe.Handle, p3 = outIm.Handle;
+        int inv = inverse ? 1 : 0;
+        void** args = stackalloc void*[9];
+        args[0] = &p0; args[1] = &p1; args[2] = &p2; args[3] = &p3;
+        args[4] = &lines; args[5] = &n; args[6] = &elemStride; args[7] = &lineStride; args[8] = &inv;
+        int total = lines * n;
+        LaunchKernel(kernel, (uint)((total + 255) / 256), 256, args);
+    }
+
     public unsafe void FFT2D(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag, int height, int width, bool inverse)
     {
         if (!IsAvailable) throw new GpuCapabilityUnavailableException("CUDA backend not available");
 
         using var _ = PushContext();
+        if ((height & (height - 1)) != 0 || (width & (width - 1)) != 0)
+        {
+            // The radix-2 kernels need power-of-two sides: rows into a temporary, then columns into the output.
+            using var rowsReal = AllocateBuffer(height * width);
+            using var rowsImag = AllocateBuffer(height * width);
+            StridedDft(inputReal, inputImag, rowsReal, rowsImag, height, width, 1, width, inverse);
+            StridedDft(rowsReal, rowsImag, outputReal, outputImag, width, height, width, 1, inverse);
+            return;
+        }
 
-        // Copy input to output for in-place FFT
-        CudaCopyBuffer(inputReal, outputReal, height * width);
-        CudaCopyBuffer(inputImag, outputImag, height * width);
+        // Copy input to output for in-place FFT (an in-place call already has it there)
+        if (!ReferenceEquals(inputReal, outputReal)) CudaCopyBuffer(inputReal, outputReal, height * width);
+        if (!ReferenceEquals(inputImag, outputImag)) CudaCopyBuffer(inputImag, outputImag, height * width);
 
         int log2Width = (int)MathHelper.Log2(width);
         int log2Height = (int)MathHelper.Log2(height);

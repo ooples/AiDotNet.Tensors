@@ -1,6 +1,6 @@
 // Backend parity baseline (TENS0001-TENS0005): known gaps, each with a tracking issue.
 // The analyzer fails the build on a stale entry, so this file may only shrink.
-// Format: capability <Interface> <Backend> #issue   |   stub <Backend>.<Member> #issue
+// Format: capability <Interface> <Backend> #issue   |   stub <Backend>.<Member> #issue   |   composed <Backend>.<Member> #issue
 
 
 

@@ -27,26 +27,6 @@ public sealed partial class MetalBackend
     }
 
     /// <summary>
-    /// Cross-entropy loss for multi-class classification.
-    /// </summary>
-    public float CrossEntropyLoss(IGpuBuffer predictions, IGpuBuffer targets, int batchSize, int numClasses)
-    {
-        ThrowIfDisposed();
-        return ResidentLossScalar(predictions, targets, checked(batchSize * numClasses), batchSize, 0);
-    }
-
-    /// <summary>
-    /// Cross-entropy backward.
-    /// </summary>
-    public void CrossEntropyBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int batchSize, int numClasses)
-    {
-        ThrowIfDisposed();
-        // gradInput = (predictions - targets) / batchSize
-        Subtract(predictions, targets, gradInput, batchSize * numClasses);
-        Scale(gradInput, gradInput, 1.0f / batchSize, batchSize * numClasses);
-    }
-
-    /// <summary>
     /// Binary cross-entropy loss.
     /// </summary>
     public float BinaryCrossEntropyLoss(IGpuBuffer predictions, IGpuBuffer targets, int size)
@@ -71,16 +51,6 @@ public sealed partial class MetalBackend
     {
         ThrowIfDisposed();
         return ResidentLossScalar(predictions, targets, size, size, 2);
-    }
-
-    /// <summary>
-    /// MSE backward.
-    /// </summary>
-    public void MseBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size)
-    {
-        ThrowIfDisposed();
-        Subtract(predictions, targets, gradInput, size);
-        Scale(gradInput, gradInput, 2.0f / size, size);
     }
 
     /// <summary>

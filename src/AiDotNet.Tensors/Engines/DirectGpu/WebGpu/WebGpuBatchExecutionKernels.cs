@@ -1402,12 +1402,12 @@ fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
     y[i] = og * bx_tanh(c); y[p.N + i] = c;
 }");
     public static readonly string StridedViewCopy = Shader(
-        new[] { "r:input", "rw:output", "r:layout" }, "rank: i32, offset: i32, count: i32", Main + @"
+        new[] { "r:input", "rw:output", "r:view_layout" }, "rank: i32, offset: i32, count: i32", Main + @"
     if (i >= p.count) { return; }
     var remaining = i; var source = p.offset;
     for (var d = p.rank - 1; d >= 0; d--) {
-        let extent = bitcast<i32>(layout[d]);
-        source += (remaining % extent) * bitcast<i32>(layout[p.rank + d]);
+        let extent = bitcast<i32>(view_layout[d]);
+        source += (remaining % extent) * bitcast<i32>(view_layout[p.rank + d]);
         remaining /= extent;
     }
     output[i] = input[source];

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Linq;
 using System.Runtime.CompilerServices;
@@ -2262,6 +2262,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         InvalidateActivationCacheEntry(tensor.DataVector);
     }
 
+    /// <summary>
+    /// Frees <paramref name="key"/>'s activation-cache buffer without downloading it: its tensor now borrows
+    /// <paramref name="replacement"/>, so the cached contents are stale and nothing reads them. A step-pool buffer stays.
+    /// </summary>
+    private void ReleaseSupersededActivation(object key, IGpuBuffer replacement)
+    {
+        ActivationCacheEntry? removed = null;
+        lock (_activationCacheLock)
+        {
+            if (_activationCache.TryGetValue(key, out var entry) && !ReferenceEquals(entry.Buffer, replacement)
+                && !StepScratchPool.IsPooled(entry.Buffer) && _activationCache.TryRemove(key, out var taken))
+                removed = taken;
+        }
+        removed?.Dispose();
+    }
+
     private void InvalidateActivationCacheEntry(object key)
     {
         // #226 / #1468: NEVER free a GPU buffer that still backs a pending deferred
@@ -4365,6 +4381,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // dest needs a backing array as the deferred-materializer key (for any host read of dest).
         var destArr = dest.GetBackingArrayForCacheLookupUnsafe();
         if (destArr is null) { AliasDiag("skip: dest has no backing array"); return false; }
+
+        // dest's own device copy from before the plan took it over (its trace-time result, an activation-cache entry
+        // keyed by its storage) is never read again: from here dest borrows srcBuf every step. Left in the cache it
+        // lived as long as dest's storage, the plan's lifetime: 3 GB of trace-time results on DenseNet-121. Released
+        // only outside a stream capture, so the pre-residency pass frees them and a capture frees nothing.
+        if (!(backend is IGpuGraphCapture graphCapture && graphCapture.IsStreamCapturing()))
+        {
+            ReleaseSupersededActivation(destArr, srcBuf);
+            ReleaseSupersededActivation(dest.DataVector, srcBuf);
+        }
 
         // Borrow src's buffer: consumers resolve dest via the _gpuBuffer fast path. We do NOT add a second
         // activation-cache entry under destArr — aliasing one buffer under two keys would double-free on
@@ -7322,6 +7348,53 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         cols = (int)width;
         rows = a.Length / cols;
         return rows > 0;
+    }
+
+    /// <summary>
+    /// ReLU6 in place on the device buffer a float tensor already has, recording nothing (a fused node's own
+    /// temporary); false, with the tensor untouched, when it has none. Never reads the host copy: the generic in-place
+    /// path re-resolved a device result through its host values, a blocking download per call that doubled a
+    /// MobileNetV2 training step.
+    /// </summary>
+    internal bool TryReLU6InPlace<T>(Tensor<T> tensor) => TryResidentActivationInPlace(tensor, capAtSix: true);
+
+    /// <summary>As <see cref="TryReLU6InPlace{T}"/>, for ReLU.</summary>
+    internal bool TryReLUInPlace<T>(Tensor<T> tensor) => TryResidentActivationInPlace(tensor, capAtSix: false);
+
+    /// <summary>
+    /// Adds the rank-1 channel bias to a device-resident [N, C, ...] tensor in place (<c>x += bias[c]</c>, the one add
+    /// <see cref="TensorChannelBiasAdd{T}"/> computes). Returns false, changing nothing, when the tensor is not resident.
+    /// </summary>
+    internal bool TryChannelBiasAddInPlace<T>(Tensor<T> tensor, Tensor<T> bias)
+    {
+        if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled || tensor.Rank < 2 || tensor.Length == 0
+            || !tensor.IsContiguous || IsPartialView(tensor) || bias.Rank != 1 || bias.Length != tensor._shape[1]
+            || !TryGetBackend(out var backend))
+            return false;
+        if (ResolveResidentBufferNoUpload(backend, tensor, tensor.Length, includePersistentWeightCache: false) is not { } resident
+            || resident.Handle == IntPtr.Zero || resident.Size < tensor.Length)
+            return false;
+        int batch = tensor._shape[0], channels = tensor._shape[1];
+        using var biasBuffer = GetWeightBufferPreferResident(backend, bias, PersistentTensorRole.Biases);
+        backend.Conv2DBiasAdd(resident, biasBuffer.Buffer, batch, channels, tensor.Length / (batch * channels));
+        tensor.IncrementVersion();
+        BindResidentBuffer(tensor, resident, backend);
+        return true;
+    }
+
+    private bool TryResidentActivationInPlace<T>(Tensor<T> tensor, bool capAtSix)
+    {
+        if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled || !tensor.IsContiguous || IsPartialView(tensor)
+            || !TryGetBackend(out var backend))
+            return false;
+        if (ResolveResidentBufferNoUpload(backend, tensor, tensor.Length, includePersistentWeightCache: false) is not { } resident
+            || resident.Handle == IntPtr.Zero || resident.Size < tensor.Length)
+            return false;
+        if (capAtSix) backend.Relu6(resident, resident, tensor.Length);
+        else backend.Relu(resident, resident, tensor.Length);
+        tensor.IncrementVersion();
+        BindResidentBuffer(tensor, resident, backend);
+        return true;
     }
 
     void IEngine.SigmoidInPlace<T>(Tensor<T> tensor)
@@ -16904,12 +16977,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         variance = null;
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)
             || backend is not DirectGpu.IBatchNormVarianceBackend varianceBackend
-            || !TryBatchNormLayout(input._shape, gamma.Length, out int batch, out int channels, out int spatial))
+            || !TryBatchNormLayout(input._shape, gamma.Length, out int batch, out int channels, out int spatial)
+            // Asked before anything is allocated: a compiled step keeps every buffer an action rents, so outputs rented
+            // for a launch the backend then declined stayed as dead slots (an activation per fused node, every step).
+            || !varianceBackend.AcceptsTrainingShape(batch, channels, spatial)
+            || (residual is not null && residual.Length != input.Length))
             return null;
         using var bufIn = GetOrAllocateBuffer(backend, input);
         using var bufGamma = GetOrAllocateBuffer(backend, gamma);
         using var bufBeta = GetOrAllocateBuffer(backend, beta);
-        if (residual is not null && residual.Length != input.Length) return null;
         using var bufResidual = residual is null ? default : GetOrAllocateBuffer(backend, residual);
         var bufOut = AllocateFullyWrittenOutputBuffer(backend, input.Length);
         var bufMean = AllocateFullyWrittenOutputBuffer(backend, channels);
@@ -16952,7 +17028,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         gradResidual = null;
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)
             || backend is not DirectGpu.IBatchNormVarianceBackend varianceBackend
-            || !TryBatchNormLayout(input._shape, gamma.Length, out int batch, out int channels, out int spatial))
+            || !TryBatchNormLayout(input._shape, gamma.Length, out int batch, out int channels, out int spatial)
+            || !varianceBackend.AcceptsTrainingShape(batch, channels, spatial))
             return null;
         using var bufDy = GetOrAllocateBuffer(backend, gradOutput);
         using var bufOut = GetOrAllocateBuffer(backend, reluOutput);
@@ -18499,7 +18576,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
-            if (predictions.Rank != 2)
+            // The backends take logits and DENSE targets of the same shape; class-index targets (rank 1), which the CPU
+            // base also accepts, go there.
+            if (predictions.Rank != 2 || !ShapesMatch(predictions.Shape._dims, targets.Shape._dims))
                 return base.CrossEntropyBackward(predictions, targets);
 
             int batchSize = predictions.Shape._dims[0];
@@ -21829,6 +21908,44 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
+    /// A rectangular slice of <paramref name="source"/> gathered straight into a gradient accumulator receiving its first
+    /// contribution of a resident step (the kernel overwrites every element): a concatenation's backward. Through
+    /// TensorSlice every piece was a fresh device tensor, released only when its finalizer ran, so DenseNet-121's
+    /// concatenation backwards held 1.9 GB of them at once. False -- nothing launched -- when the target does not qualify.
+    /// </summary>
+    internal bool TryRectSliceInto<T>(Tensor<T> source, int[] start, int[] length, Tensor<T> into)
+    {
+        if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled || !ResidentStepActive) return false;
+        if (!source.IsContiguous || source.Rank == 0 || source.Rank > RectSliceLimits.MaxRank
+            || start.Length != source.Rank || length.Length != source.Rank) return false;
+        if (!TryGetBackend(out var backend) || backend is not IRectSliceKernels rect) return false;
+        long n = 1;
+        for (int d = 0; d < source.Rank; d++)
+        {
+            if (start[d] < 0 || length[d] < 1 || start[d] + length[d] > source._shape[d]) return false;
+            n *= length[d];
+        }
+        if (n != into.Length) return false;
+        var sR = ResolveResidentBufferNoUpload(backend, source, source.Length);
+        if (sR is null) return false;
+        var target = ResolveDirectGradTarget(backend, into, (int)n, sR, sR, null);
+        if (target is null) return false;
+        try
+        {
+            rect.RectSlice(sR, target, source._shape, start, length, scatter: false);
+        }
+        catch (NotSupportedException ex)
+        {
+            GpuLaunchProbe.OnFallback("TryRectSliceInto", ex);
+            return false;
+        }
+        ResidentSyncCheck("RectSliceInto");
+        into.IncrementVersion();
+        BindResidentBuffer(into, target, backend);
+        return true;
+    }
+
+    /// <summary>
     /// The device buffer a resident-step kernel may write a gradient straight into: <paramref name="target"/>'s own
     /// bound buffer (never a persistent weight-cache copy, see <see cref="TryRunBinaryInPlace"/>), whole and dense, and
     /// distinct from every buffer the kernel reads. Null when there is no target or it does not qualify.
@@ -22221,6 +22338,40 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (ThrowOnGpuKernelFallback)
             throw new NotSupportedException("TensorAdd has no eligible GPU route for the selected inputs and precision policy.");
         return base.TensorAdd(a, b);
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>A ReLU over two same-shape float operands is the backend's one-kernel <c>AddRelu</c>; anything else
+    /// takes the CPU base, which composes the recorded add and activation.</remarks>
+    public override Tensor<T> TensorAddActivation<T>(Tensor<T> a, Tensor<T> b, FusedActivationType activation)
+    {
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (b is null) throw new ArgumentNullException(nameof(b));
+        if (activation != FusedActivationType.ReLU || typeof(T) != typeof(float) || !ShapesMatch(a.Shape._dims, b.Shape._dims))
+            return base.TensorAddActivation(a, b, activation);
+        DeviceDispatch.EnforceStrict(a, b);
+        // Under FP16 storage (autocast) the binary route runs its typed FP16 add, which has no ReLU: compose instead.
+        if (TryGetBackend(out var planBackend)
+            && Gpu.GpuPrecisionPlanner.CreatePlan<T>(planBackend, Gpu.GpuPrecisionOperation.Add, nameof(TensorAddActivation)).InputStorage
+               == Gpu.GpuScalarType.Float16)
+            return base.TensorAddActivation(a, b, activation);
+        if (TryBinaryResidentOutOfPlace(a, b, static (be, ia, ib, o, n) => be.AddRelu(ia, ib, o, n)) is { } resident)
+        {
+            Autodiff.DifferentiableOps.RecordBinary("TensorAddRelu", resident, a, b, Autodiff.BackwardFunctions<T>.AddReluBackward);
+            return resident;
+        }
+        try
+        {
+            var result = TryRunBinary(a, b, static (backend, ia, ib, o, size) => backend.AddRelu(ia, ib, o, size));
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, a.Shape._dims);
+                Autodiff.DifferentiableOps.RecordBinary("TensorAddRelu", output, a, b, Autodiff.BackwardFunctions<T>.AddReluBackward);
+                return output;
+            }
+        }
+        catch (NotSupportedException ex) { GpuLaunchProbe.OnFallback("TensorAddActivation", ex); }
+        return base.TensorAddActivation(a, b, activation);
     }
 
     public override Tensor<T> TensorSubtract<T>(Tensor<T> a, Tensor<T> b)

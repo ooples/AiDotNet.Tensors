@@ -235,38 +235,12 @@ public sealed unsafe partial class VulkanBackend
             new[] { (uint)M, (uint)K });
     }
 
-    public void SparseGemm(IGpuBuffer sparseAValues, IGpuBuffer sparseAIndices, IGpuBuffer B, IGpuBuffer C,
-        int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
-    {
-        EnsureInitialized();
-        var denseA = AllocateBuffer(M * K);
-        Decompress2x4Sparse(sparseAValues, sparseAIndices, denseA, M, K);
-        Gemm(denseA, B, C, M, N, K, alpha, beta);
-        denseA.Dispose();
-    }
-
-    public IGpuBuffer SparseGemmBiasRelu(IGpuBuffer sparseAValues, IGpuBuffer sparseAIndices, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-    {
-        EnsureInitialized();
-        var denseA = AllocateBuffer(M * K);
-        Decompress2x4Sparse(sparseAValues, sparseAIndices, denseA, M, K);
-        var result = GemmBiasRelu(denseA, B, bias, M, N, K);
-        denseA.Dispose();
-        return result;
-    }
-
     // NOTE: CsrSpMM moved to VulkanBackend.Sparse.cs and re-implemented as a real
     // GPU compute dispatch (GLSL csr_spmm via GlslQuintOp) — the previous
     // download-compute-upload stub here would defeat the point of routing SparseOps'
     // GPU tier through Vulkan. CsrSpMMBias below still uses that CsrSpMM as its
     // base then adds bias on host; that's a follow-up to fuse into an MSL bias
     // variant, but the SpMM itself now stays on-device.
-
-    public void CsrSpMMBias(IGpuBuffer csrValues, IGpuBuffer csrColIndices, IGpuBuffer csrRowPointers, IGpuBuffer denseB, IGpuBuffer bias, IGpuBuffer output, int M, int K, int N, int nnz)
-    {
-        CsrSpMM(csrValues, csrColIndices, csrRowPointers, denseB, output, M, K, N, nnz);
-        BiasAdd(output, bias, output, M, N);
-    }
 
     public void ScatterAddEdges(IGpuBuffer input, IGpuBuffer sourceIndices, IGpuBuffer targetIndices, IGpuBuffer? edgeValues, IGpuBuffer output, int numNodes, int numEdges, int features)
     {
@@ -697,14 +671,6 @@ public sealed unsafe partial class VulkanBackend
         }
     }
 
-    public void RFFT(IGpuBuffer input, IGpuBuffer outputReal, IGpuBuffer outputImag, int n)
-    {
-        var zeroImag = AllocateBuffer(n);
-        Fill(zeroImag, 0f, n);
-        FFT(input, zeroImag, outputReal, outputImag, n, false);
-        zeroImag.Dispose();
-    }
-
     public void IRFFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer output, int n)
     {
         var outImag = AllocateBuffer(n);
@@ -1076,19 +1042,6 @@ public sealed unsafe partial class VulkanBackend
         _complexScratch = new[] { AllocateBuffer(n), AllocateBuffer(n), AllocateBuffer(n), AllocateBuffer(n) };
     }
 
-    public void SplitComplexMultiply(IGpuBuffer aR, IGpuBuffer aI, IGpuBuffer bR, IGpuBuffer bI, IGpuBuffer oR, IGpuBuffer oI, int n)
-    {
-        if (n <= 0) return;
-        lock (_complexScratchLock)
-        {
-            EnsureComplexScratch(n);
-            var t1 = _complexScratch![0]; var t2 = _complexScratch[1];
-            var t3 = _complexScratch[2]; var t4 = _complexScratch[3];
-            Multiply(aR, bR, t1, n); Multiply(aI, bI, t2, n); Subtract(t1, t2, oR, n);
-            Multiply(aR, bI, t3, n); Multiply(aI, bR, t4, n); Add(t3, t4, oI, n);
-        }
-    }
-
     public void InterleaveComplex(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer interleaved, int n)
     {
         if (n <= 0) return;
@@ -1117,51 +1070,9 @@ public sealed unsafe partial class VulkanBackend
                 $"{opName}: n ({n}) requires real/imag buffers of at least {n} elements and an interleaved buffer of at least {requiredInterleaved} elements; sizes are real={real.Size}, imag={imag.Size}, interleaved={interleaved.Size}.");
     }
 
-    public void SplitComplexConjugate(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer oR, IGpuBuffer oI, int n)
-    {
-        if (n <= 0) return;
-        Copy(iR, 0, oR, 0, n);
-        Negate(iI, oI, n);
-    }
-
     public void SplitComplexMagnitude(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer o, int n) => ComplexMagnitude(iR, iI, o, n);
-    public void SplitComplexMagnitudeSquared(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer o, int n)
-    {
-        if (n <= 0) return;
-        lock (_complexScratchLock)
-        {
-            EnsureComplexScratch(n);
-            Multiply(iR, iR, _complexScratch![0], n); Multiply(iI, iI, _complexScratch[1], n);
-            Add(_complexScratch[0], _complexScratch[1], o, n);
-        }
-    }
     public void SplitComplexPhase(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer o, int n) => ComplexPhase(iR, iI, o, n);
     public void SplitComplexFromPolar(IGpuBuffer m, IGpuBuffer p, IGpuBuffer oR, IGpuBuffer oI, int n) => PolarToComplex(m, p, oR, oI, n);
-
-    public void SplitComplexScale(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer oR, IGpuBuffer oI, float s, int n)
-    {
-        if (n <= 0) return;
-        Scale(iR, oR, s, n); Scale(iI, oI, s, n);
-    }
-
-    public void SplitComplexAdd(IGpuBuffer aR, IGpuBuffer aI, IGpuBuffer bR, IGpuBuffer bI, IGpuBuffer oR, IGpuBuffer oI, int n)
-    {
-        if (n <= 0) return;
-        Add(aR, bR, oR, n); Add(aI, bI, oI, n);
-    }
-
-    public void SplitComplexCrossSpectral(IGpuBuffer xR, IGpuBuffer xI, IGpuBuffer yR, IGpuBuffer yI, IGpuBuffer oR, IGpuBuffer oI, int n)
-    {
-        if (n <= 0) return;
-        lock (_complexScratchLock)
-        {
-            EnsureComplexScratch(n);
-            var t1 = _complexScratch![0]; var t2 = _complexScratch[1];
-            var t3 = _complexScratch[2]; var t4 = _complexScratch[3];
-            Multiply(xR, yR, t1, n); Multiply(xI, yI, t2, n); Add(t1, t2, oR, n);
-            Multiply(xI, yR, t3, n); Multiply(xR, yI, t4, n); Subtract(t3, t4, oI, n);
-        }
-    }
 
     public void SplitComplexTopK(IGpuBuffer inReal, IGpuBuffer inImag, IGpuBuffer outReal, IGpuBuffer outImag, int n, int k)
     {

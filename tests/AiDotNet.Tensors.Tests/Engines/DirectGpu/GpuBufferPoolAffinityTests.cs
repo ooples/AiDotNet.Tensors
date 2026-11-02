@@ -49,6 +49,21 @@ public sealed class GpuBufferPoolAffinityTests
     }
 
     [Fact]
+    public void PoolCreatedAfterAMeasurement_KeepsWhatIsReturnedToIt()
+    {
+        // A measurement that happened before the pool existed parked nothing in it. The pool used to start from
+        // generation 0, so once any kernel had been tuned in the process, its first rent drained what it held.
+        AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelRegistry.NoteMeasurement();
+        using var pool = new GpuBufferPool<FakeBuffer>(maxPerSize: 4, maxSize: 1024);
+        var buffer = new FakeBuffer(64);
+
+        pool.Return(buffer);
+
+        Assert.True(pool.TryRent(64, out var rented));
+        Assert.Same(buffer, rented);
+        Assert.Equal(0, buffer.ReleaseCount);
+    }
+    [Fact]
     public void Capacity_RemainsSharedAcrossAffinityDomains()
     {
         using var pool = new GpuBufferPool<FakeBuffer>(maxPerSize: 1, maxSize: 1024);

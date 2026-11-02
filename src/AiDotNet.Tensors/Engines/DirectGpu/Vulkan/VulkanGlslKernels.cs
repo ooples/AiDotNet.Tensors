@@ -58,13 +58,42 @@ void main() {
         case 2u: y = exp(x); break;
         case 3u: y = exp2(x); break;
         case 4u: y = pow(10.0, x); break;
-        case 5u: y = exp(x) - 1.0; break;
+        case 5u: { // expm1: exp(x) - 1.0 keeps only a few digits of a small x, and GLSL's log is too coarse near 1 for
+            // Kahan's correction, so a small x takes the Taylor series (degree 8, below 1e-9 relative for |x| < 0.35)
+            if (abs(x) < 0.35) {
+                y = x * (1.0 + x / 2.0 * (1.0 + x / 3.0 * (1.0 + x / 4.0 * (1.0 + x / 5.0 * (1.0 + x / 6.0
+                    * (1.0 + x / 7.0 * (1.0 + x / 8.0)))))));
+            } else {
+                y = exp(x) - 1.0;
+            }
+            break; }
         case 6u: y = log(x); break;
-        case 7u: y = log2(x); break;
-        case 8u: y = log(1.0 + x); break;
+        case 7u:
+        case 25u: {
+            // Near one, log2's hardware absolute error dominates its tiny result.
+            // Sterbenz subtraction is exact here; use the convergent atanh series.
+            if (abs(x - 1.0) < 0.25) {
+                float s = (x - 1.0) / (x + 1.0);
+                float s2 = s * s;
+                y = 2.8853900817779268 * s * (1.0 + s2 * (1.0 / 3.0 + s2 * (1.0 / 5.0 + s2 * (1.0 / 7.0 + s2 * (1.0 / 9.0 + s2 / 11.0)))));
+            } else {
+                y = log2(x);
+            }
+            if (op == 25u) y *= 0.3010299956639812;
+            break;
+        }
+        case 8u: { // log1p: a small x takes 2 atanh(x / (2 + x)) as its odd series (|s| <= 0.12, below 1e-9 relative)
+            if (abs(x) < 0.25) {
+                float s = x / (2.0 + x);
+                float s2 = s * s;
+                y = 2.0 * s * (1.0 + s2 * (1.0 / 3.0 + s2 * (1.0 / 5.0 + s2 * (1.0 / 7.0 + s2 * (1.0 / 9.0 + s2 / 11.0)))));
+            } else {
+                y = x == -1.0 ? uintBitsToFloat(0xff800000u) : (x < -1.0 ? uintBitsToFloat(0x7fc00000u) : log(1.0 + x));
+            }
+            break; }
         case 9u: y = sqrt(x); break;
         case 10u: y = sign(x); break;
-        case 11u: y = 0.5*x*(1.0+tanh(0.7978845608*(x+0.044715*x*x*x))); break;
+        case 11u: y = 0.5*x*(1.0+tanh(clamp(0.7978845608*(x+0.044715*x*x*x), -10.0, 10.0))); break;
         case 12u: y = sin(x); break;
         case 13u: y = cos(x); break;
         case 14u: y = tan(x); break;
@@ -78,7 +107,6 @@ void main() {
         case 22u: y = atanh(x); break;
         case 23u: y = 1.0 / x; break;
         case 24u: y = sign(x) * pow(abs(x), 0.3333333333333333); break;
-        case 25u: y = log(x) * 0.4342944819032518; break;
         case 26u: y = -x; break;
         case 27u: y = floor(x); break;
         case 28u: y = ceil(x); break;
@@ -87,7 +115,7 @@ void main() {
         case 31u: y = x >= 0.0 ? x : v0 * x; break;
         case 32u: y = x >= 0.0 ? x : v0 * (exp(x) - 1.0); break;
         case 33u: y = x / (1.0 + exp(-x)); break;
-        case 34u: y = x * tanh(log(1.0 + exp(x))); break;
+        case 34u: y = x * tanh(clamp(log(1.0 + exp(x)), -10.0, 10.0)); break;
         case 35u: y = log(1.0 + exp(x)); break;
         case 36u: y = x <= -3.0 ? 0.0 : (x >= 3.0 ? x : x * (x + 3.0) / 6.0); break;
         case 37u: y = v1 * (x >= 0.0 ? x : v0 * (exp(x) - 1.0)); break;
@@ -106,6 +134,27 @@ void main() {
         default: y = x; break;
     }
     b[idx] = y;
+}";
+
+    /// <summary>
+    /// <c>c = act(a + b)</c> in one pass (the residual join of a ResNet block), <c>op</c> selecting the activation:
+    /// 0 = ReLU (<c>max(sum, 0)</c>), 1 = sigmoid, 2 = tanh-approximated GELU. The tanh argument is clamped where
+    /// tanh has already saturated in float, so a driver's exp-based tanh cannot overflow to NaN.
+    /// </summary>
+    public static string AddActivation => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint size; uint op; };
+const float SQRT_2_OVER_PI = 0.7978845608;
+const float GELU_COEF = 0.044715;
+const float TANH_SATURATION = 10.0;
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= size) return;
+    float x = a[idx] + bdata[idx];
+    float y;
+    if (op == 0u) y = x > 0.0 ? x : 0.0;
+    else if (op == 1u) y = 1.0 / (1.0 + exp(-x));
+    else y = 0.5 * x * (1.0 + tanh(clamp(SQRT_2_OVER_PI * (x + GELU_COEF * x * x * x), -TANH_SATURATION, TANH_SATURATION)));
+    c[idx] = y;
 }";
 
     public static string BinaryElementwise => Header + ThreeBufferLayout + @"
@@ -149,14 +198,14 @@ void main() {
             break;
         }
         case 20u: {
-            float t = tanh(0.7978845608 * (y + 0.044715 * y*y*y));
+            float t = tanh(clamp(0.7978845608 * (y + 0.044715 * y*y*y), -10.0, 10.0));
             float dtdy = 0.7978845608 * (1.0 + 0.134145 * y*y) * (1.0 - t*t);
             z = x * (0.5 * (1.0 + t) + 0.5 * y * dtdy);
             break;
         }
         case 21u: {
             float sp = log(1.0 + exp(y));
-            float tsp = tanh(sp);
+            float tsp = tanh(clamp(sp, -10.0, 10.0));
             float sig = 1.0 / (1.0 + exp(-y));
             z = x * (tsp + y * sig * (1.0 - tsp*tsp));
             break;
@@ -473,7 +522,7 @@ float attentionScore(uint batchIndex, uint queryHead, uint kvHead, uint queryInd
     for (uint d0 = 0u; d0 < headDim; ++d0) score += queryData[queryOffset + d0] * keyData[keyOffset + d0];
     float logit = score * scale;
     // Attention-logit soft-cap (Gemma-2): softcap * tanh(logit / softcap); softcap<=0 disables.
-    return softcap > 0.0 ? softcap * tanh(logit / softcap) : logit;
+    return softcap > 0.0 ? softcap * tanh(clamp(logit / softcap, -10.0, 10.0)) : logit;
 }
 bool attentionMasked(uint batchIndex, uint queryHead, uint queryIndex, uint keyIndex) {
     if (maskMode == 0u) return false;
@@ -682,7 +731,7 @@ float lossGradient(float prediction, float target) {
     if(operation==2u){float cp=clamp(prediction,1e-7,1.0-1e-7);return -target/cp+(1.0-target)/(1.0-cp);}
     if(operation==3u)return abs(difference)<p0?difference/p0:sign(difference);
     if(operation==4u){float cp=clamp(prediction,1e-7,1.0-1e-7);bool positive=target>0.5;float pt=positive?cp:1.0-cp;float direction=positive?-1.0:1.0;return -p0*direction*pow(1.0-pt,p1)*(p1*log(pt)+1.0/pt);}
-    if(operation==5u)return tanh(difference);
+    if(operation==5u)return tanh(clamp(difference, -10.0, 10.0));
     if(operation==6u)return target-prediction>=0.0?-p0:1.0-p0;
     if(operation==7u)return target*prediction<1.0?-target:0.0;
     if(operation==8u){float h=max(0.0,1.0-target*prediction);return h>0.0?-2.0*h*target:0.0;}
@@ -1016,7 +1065,7 @@ void main() {
     float value = a[outer * fullDim + d];
     float gate = a[outer * fullDim + halfDim + d];
     float x3 = value * value * value;
-    float gelu = 0.5 * value * (1.0 + tanh(0.7978845608 * (value + 0.044715 * x3)));
+    float gelu = 0.5 * value * (1.0 + tanh(clamp(0.7978845608 * (value + 0.044715 * x3), -10.0, 10.0)));
     b[idx] = gelu * gate;
 }";
 
@@ -1078,7 +1127,7 @@ void main() {
     float gate = bdata[outer * fullDim + halfDim + d];
     float x3 = value * value * value;
     float z = 0.7978845608 * (value + 0.044715 * x3);
-    float tanh_z = tanh(z);
+    float tanh_z = tanh(clamp(z, -10.0, 10.0));
     float gelu = 0.5 * value * (1.0 + tanh_z);
     // GELU derivative: 0.5*(1+tanh(z)) + 0.5*x*sech^2(z)*z'
     // where z' = 0.7978845608 * (1 + 3*0.044715*x^2)
@@ -2571,7 +2620,7 @@ void main() {
     }
     // GLSL tanh of a large argument can evaluate inf / inf = NaN near the boundary, where lambda is huge; tanh(20)
     // is already 1 in float, so the argument is clamped there, as the CPU engine does.
-    float t = tanh(min(sqrtC * lambda * tvNorm / 2.0, 20.0)) / (sqrtC * tvNorm);
+    float t = tanh(clamp(min(sqrtC * lambda * tvNorm / 2.0, 20.0), -10.0, 10.0)) / (sqrtC * tvNorm);
     // scaled = t * tangentVec, then Mobius add base + scaled
     float sSq = 0.0, bs = 0.0;
     for (uint d = 0; d < dim; d++) {
@@ -3141,8 +3190,8 @@ void main() {
 
     public static string FusedLinearReLU => Header + FusedLinearLayout + @"void main() { uint idx=gl_GlobalInvocationID.x; if(idx>=batchSize*outFeatures)return; uint b=idx/outFeatures,j=idx%outFeatures; float sum=bias[j]; for(uint k=0;k<inFeatures;k++)sum+=inp[b*inFeatures+k]*wt[k*outFeatures+j]; outp[idx]=max(sum,0.0); }";
     public static string FusedLinearSigmoid => Header + FusedLinearLayout + @"void main() { uint idx=gl_GlobalInvocationID.x; if(idx>=batchSize*outFeatures)return; uint b=idx/outFeatures,j=idx%outFeatures; float sum=bias[j]; for(uint k=0;k<inFeatures;k++)sum+=inp[b*inFeatures+k]*wt[k*outFeatures+j]; outp[idx]=1.0/(1.0+exp(-sum)); }";
-    public static string FusedLinearTanh => Header + FusedLinearLayout + @"void main() { uint idx=gl_GlobalInvocationID.x; if(idx>=batchSize*outFeatures)return; uint b=idx/outFeatures,j=idx%outFeatures; float sum=bias[j]; for(uint k=0;k<inFeatures;k++)sum+=inp[b*inFeatures+k]*wt[k*outFeatures+j]; outp[idx]=tanh(sum); }";
-    public static string FusedLinearGELU => Header + FusedLinearLayout + @"void main() { uint idx=gl_GlobalInvocationID.x; if(idx>=batchSize*outFeatures)return; uint b=idx/outFeatures,j=idx%outFeatures; float sum=bias[j]; for(uint k=0;k<inFeatures;k++)sum+=inp[b*inFeatures+k]*wt[k*outFeatures+j]; outp[idx]=0.5*sum*(1.0+tanh(0.7978845608*(sum+0.044715*sum*sum*sum))); }";
+    public static string FusedLinearTanh => Header + FusedLinearLayout + @"void main() { uint idx=gl_GlobalInvocationID.x; if(idx>=batchSize*outFeatures)return; uint b=idx/outFeatures,j=idx%outFeatures; float sum=bias[j]; for(uint k=0;k<inFeatures;k++)sum+=inp[b*inFeatures+k]*wt[k*outFeatures+j]; outp[idx]=tanh(clamp(sum, -10.0, 10.0)); }";
+    public static string FusedLinearGELU => Header + FusedLinearLayout + @"void main() { uint idx=gl_GlobalInvocationID.x; if(idx>=batchSize*outFeatures)return; uint b=idx/outFeatures,j=idx%outFeatures; float sum=bias[j]; for(uint k=0;k<inFeatures;k++)sum+=inp[b*inFeatures+k]*wt[k*outFeatures+j]; outp[idx]=0.5*sum*(1.0+tanh(clamp(0.7978845608*(sum+0.044715*sum*sum*sum), -10.0, 10.0))); }";
     public static string FusedLinearSwish => Header + FusedLinearLayout + @"void main() { uint idx=gl_GlobalInvocationID.x; if(idx>=batchSize*outFeatures)return; uint b=idx/outFeatures,j=idx%outFeatures; float sum=bias[j]; for(uint k=0;k<inFeatures;k++)sum+=inp[b*inFeatures+k]*wt[k*outFeatures+j]; outp[idx]=sum/(1.0+exp(-sum)); }";
     public static string FusedLinearIdentity => Header + FusedLinearLayout + @"void main() { uint idx=gl_GlobalInvocationID.x; if(idx>=batchSize*outFeatures)return; uint b=idx/outFeatures,j=idx%outFeatures; float sum=bias[j]; for(uint k=0;k<inFeatures;k++)sum+=inp[b*inFeatures+k]*wt[k*outFeatures+j]; outp[idx]=sum; }";
 
@@ -3180,7 +3229,7 @@ layout(push_constant) uniform Params { uint batchSize; uint inFeatures; uint out
     public static string FusedLinearReLUBackwardGradInput => Header + FusedLinearBackwardGradInputLayout + @"void main() { uint idx=gl_GlobalInvocationID.x; if(idx>=batchSize*inFeatures)return; uint b=idx/inFeatures,i=idx%inFeatures; float s=0.0; for(uint j=0;j<outFeatures;j++){float g=go[b*outFeatures+j]; float masked=saved[b*outFeatures+j]>0.0?g:0.0; s+=masked*wt[i*outFeatures+j];} gi[idx]=s; }";
     public static string FusedLinearSigmoidBackwardGradInput => Header + FusedLinearBackwardGradInputLayout + @"void main() { uint idx=gl_GlobalInvocationID.x; if(idx>=batchSize*inFeatures)return; uint b=idx/inFeatures,i=idx%inFeatures; float s=0.0; for(uint j=0;j<outFeatures;j++){float g=go[b*outFeatures+j]; float o=saved[b*outFeatures+j]; float masked=g*o*(1.0-o); s+=masked*wt[i*outFeatures+j];} gi[idx]=s; }";
     public static string FusedLinearTanhBackwardGradInput => Header + FusedLinearBackwardGradInputLayout + @"void main() { uint idx=gl_GlobalInvocationID.x; if(idx>=batchSize*inFeatures)return; uint b=idx/inFeatures,i=idx%inFeatures; float s=0.0; for(uint j=0;j<outFeatures;j++){float g=go[b*outFeatures+j]; float o=saved[b*outFeatures+j]; float masked=g*(1.0-o*o); s+=masked*wt[i*outFeatures+j];} gi[idx]=s; }";
-    public static string FusedLinearGELUBackwardGradInput => Header + FusedLinearBackwardGradInputLayout + @"void main() { uint idx=gl_GlobalInvocationID.x; if(idx>=batchSize*inFeatures)return; uint b=idx/inFeatures,i=idx%inFeatures; float s=0.0; for(uint j=0;j<outFeatures;j++){float g=go[b*outFeatures+j]; float p=saved[b*outFeatures+j]; float t=tanh(0.7978845608*(p+0.044715*p*p*p)); float dt=0.7978845608*(1.0+3.0*0.044715*p*p)*(1.0-t*t); float masked=g*(0.5*(1.0+t)+0.5*p*dt); s+=masked*wt[i*outFeatures+j];} gi[idx]=s; }";
+    public static string FusedLinearGELUBackwardGradInput => Header + FusedLinearBackwardGradInputLayout + @"void main() { uint idx=gl_GlobalInvocationID.x; if(idx>=batchSize*inFeatures)return; uint b=idx/inFeatures,i=idx%inFeatures; float s=0.0; for(uint j=0;j<outFeatures;j++){float g=go[b*outFeatures+j]; float p=saved[b*outFeatures+j]; float t=tanh(clamp(0.7978845608*(p+0.044715*p*p*p), -10.0, 10.0)); float dt=0.7978845608*(1.0+3.0*0.044715*p*p)*(1.0-t*t); float masked=g*(0.5*(1.0+t)+0.5*p*dt); s+=masked*wt[i*outFeatures+j];} gi[idx]=s; }";
     public static string FusedLinearSwishBackwardGradInput => Header + FusedLinearBackwardGradInputLayout + @"void main() { uint idx=gl_GlobalInvocationID.x; if(idx>=batchSize*inFeatures)return; uint b=idx/inFeatures,i=idx%inFeatures; float s=0.0; for(uint j=0;j<outFeatures;j++){float g=go[b*outFeatures+j]; float p=saved[b*outFeatures+j]; float sig=1.0/(1.0+exp(-p)); float masked=g*(sig+p*sig*(1.0-sig)); s+=masked*wt[i*outFeatures+j];} gi[idx]=s; }";
 
     // Fused Linear Backward — Weight Gradient kernel (4 buffers: gradOutput, input, saved, gradWeight)
@@ -3198,7 +3247,7 @@ float applyBackward(float g, float s, uint act) {
     if(act==0u) return s>0.0?g:0.0;
     if(act==1u) return g*s*(1.0-s);
     if(act==2u) return g*(1.0-s*s);
-    if(act==3u){float t=tanh(0.7978845608*(s+0.044715*s*s*s)); float dt=0.7978845608*(1.0+3.0*0.044715*s*s)*(1.0-t*t); return g*(0.5*(1.0+t)+0.5*s*dt);}
+    if(act==3u){float t=tanh(clamp(0.7978845608*(s+0.044715*s*s*s), -10.0, 10.0)); float dt=0.7978845608*(1.0+3.0*0.044715*s*s)*(1.0-t*t); return g*(0.5*(1.0+t)+0.5*s*dt);}
     if(act==4u){float sig=1.0/(1.0+exp(-s)); return g*(sig+s*sig*(1.0-sig));}
     return g;
 }
@@ -3217,7 +3266,7 @@ float applyBackwardBias(float g, float s, uint act) {
     if(act==0u) return s>0.0?g:0.0;
     if(act==1u) return g*s*(1.0-s);
     if(act==2u) return g*(1.0-s*s);
-    if(act==3u){float t=tanh(0.7978845608*(s+0.044715*s*s*s)); float dt=0.7978845608*(1.0+3.0*0.044715*s*s)*(1.0-t*t); return g*(0.5*(1.0+t)+0.5*s*dt);}
+    if(act==3u){float t=tanh(clamp(0.7978845608*(s+0.044715*s*s*s), -10.0, 10.0)); float dt=0.7978845608*(1.0+3.0*0.044715*s*s)*(1.0-t*t); return g*(0.5*(1.0+t)+0.5*s*dt);}
     if(act==4u){float sig=1.0/(1.0+exp(-s)); return g*(sig+s*sig*(1.0-sig));}
     return g;
 }

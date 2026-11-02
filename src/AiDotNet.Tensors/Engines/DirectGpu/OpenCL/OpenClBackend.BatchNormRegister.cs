@@ -73,6 +73,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             kernel.Execute1D(groups * BatchNormRegisterKernelTemplate.GroupSize, BatchNormRegisterKernelTemplate.GroupSize);
         }
 
+        bool IBatchNormVarianceBackend.AcceptsTrainingShape(int batch, int channels, int spatial)
+            => BatchNormRegisterReady && PortableBatchNorm.AcceptsShape(batch, channels, spatial);
+
         bool IBatchNormVarianceBackend.TryBatchNormTrainingWithVariance(IGpuBuffer input, IGpuBuffer output,
             IGpuBuffer gamma, IGpuBuffer beta, IGpuBuffer saveMean, IGpuBuffer saveVariance,
             int batch, int channels, int spatial, float epsilon, bool relu, IGpuBuffer? residual)

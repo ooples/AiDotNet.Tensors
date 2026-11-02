@@ -27,6 +27,9 @@ public sealed partial class CudaBackend : IBatchNormVarianceBackend
         return k4;
     }
 
+    bool IBatchNormVarianceBackend.AcceptsTrainingShape(int batch, int channels, int spatial)
+        => IsAvailable && channels > 0 && BatchNormRegisterVariant(batch, spatial, out _) != 0;
+
     unsafe bool IBatchNormVarianceBackend.TryBatchNormTrainingWithVariance(IGpuBuffer input, IGpuBuffer output,
         IGpuBuffer gamma, IGpuBuffer beta, IGpuBuffer saveMean, IGpuBuffer saveVariance,
         int batch, int channels, int spatial, float epsilon, bool relu, IGpuBuffer? residual)

@@ -825,18 +825,11 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
             throw new ArgumentException("Buffers must be MetalGpuBuffer");
         }
 
-        DispatchTiledMatmul("matmul_tiled", aBuffer, bBuffer, cBuffer, M, N, K);
-
-        // Handle alpha/beta if not default
-        if (Math.Abs(alpha - 1.0f) > 1e-7f || Math.Abs(beta) > 1e-7f)
-        {
-            // Scale result by alpha and add beta*C_old
-            // This is simplified - full implementation would handle beta * C_old
-            if (Math.Abs(alpha - 1.0f) > 1e-7f)
-            {
-                Scale(cBuffer, cBuffer, alpha, M * N);
-            }
-        }
+        // C = alpha * A * B + beta * C in one pass (FusedGemm's gemm_epilogue); the plain product keeps matmul_tiled.
+        if (alpha == 1.0f && beta == 0.0f)
+            DispatchTiledMatmul("matmul_tiled", aBuffer, bBuffer, cBuffer, M, N, K);
+        else
+            DispatchGemmEpilogue(aBuffer, bBuffer, null, cBuffer, M, N, K, GemmActivation.None, alpha, beta, 0f);
     }
 
     /// <summary>Edge of the square tile <c>matmul_tiled</c> and <c>matmul_tiled_transposed</c> use (TILE_SIZE in the MSL).</summary>
@@ -910,99 +903,6 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         encoder.SetBytes((uint)N, 5);
         encoder.SetBytes((uint)K, 6);
         encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
-    }
-
-    #endregion
-
-    #region Fused Operations
-
-    /// <summary>
-    /// Fused GEMM + Bias + ReLU: output = ReLU(A * B + bias)
-    /// </summary>
-    public IGpuBuffer GemmBiasRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-    {
-        ThrowIfDisposed();
-
-        var C = AllocateBuffer(M * N);
-        Gemm(A, B, C, M, N, K);
-        BiasAdd(C, bias, C, M, N);
-        Relu(C, C, M * N);
-        return C;
-    }
-
-    /// <summary>
-    /// Fused GEMM + Bias + GELU: output = GELU(A * B + bias)
-    /// </summary>
-    public IGpuBuffer GemmBiasGelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-    {
-        ThrowIfDisposed();
-
-        var C = AllocateBuffer(M * N);
-        Gemm(A, B, C, M, N, K);
-        BiasAdd(C, bias, C, M, N);
-        Gelu(C, C, M * N);
-        return C;
-    }
-
-    /// <summary>
-    /// Fused GEMM + Bias + Sigmoid: output = Sigmoid(A * B + bias)
-    /// </summary>
-    public IGpuBuffer GemmBiasSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-    {
-        ThrowIfDisposed();
-
-        var C = AllocateBuffer(M * N);
-        Gemm(A, B, C, M, N, K);
-        BiasAdd(C, bias, C, M, N);
-        Sigmoid(C, C, M * N);
-        return C;
-    }
-
-    /// <summary>
-    /// Fused GEMM + Bias + Tanh: output = Tanh(A * B + bias)
-    /// </summary>
-    public IGpuBuffer GemmBiasTanh(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-    {
-        ThrowIfDisposed();
-
-        var C = AllocateBuffer(M * N);
-        Gemm(A, B, C, M, N, K);
-        BiasAdd(C, bias, C, M, N);
-        Tanh(C, C, M * N);
-        return C;
-    }
-
-    /// <summary>
-    /// Fused GEMM + Bias (no activation): output = A * B + bias
-    /// </summary>
-    public IGpuBuffer GemmBias(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-    {
-        ThrowIfDisposed();
-
-        var C = AllocateBuffer(M * N);
-        Gemm(A, B, C, M, N, K);
-        BiasAdd(C, bias, C, M, N);
-        return C;
-    }
-
-    public IGpuBuffer GemmBiasSwish(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-    {
-        ThrowIfDisposed();
-        var temp = GemmBias(A, B, bias, M, N, K);
-        var output = AllocateBuffer(M * N);
-        Silu(temp, output, M * N);
-        temp.Dispose();
-        return output;
-    }
-
-    public IGpuBuffer GemmBiasLeakyRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K, float alpha = 0.01f)
-    {
-        ThrowIfDisposed();
-        var temp = GemmBias(A, B, bias, M, N, K);
-        var output = AllocateBuffer(M * N);
-        LeakyRelu(temp, output, alpha, M * N);
-        temp.Dispose();
-        return output;
     }
 
     #endregion
@@ -1249,10 +1149,6 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         ThrowIfDisposed();
         ExecuteElementWiseOp("scale_by_device_scalar", buffer, scalar, buffer, size);
     }
-    public void AddRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Relu(C, C, size); }
-    public void AddSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Sigmoid(C, C, size); }
-    public void AddGelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Gelu(C, C, size); }
-
     /// <summary>
     /// Element-wise subtraction: C = A - B
     /// </summary>
@@ -1413,66 +1309,12 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     }
 
     /// <summary>
-    /// Base-2 exponential: B = 2^A
-    /// </summary>
-    public void Exp2(IGpuBuffer A, IGpuBuffer B, int size)
-    {
-        ThrowIfDisposed();
-        // Use exp(A * ln(2))
-        var ln2 = 0.693147180559945f;
-        Scale(A, B, ln2, size);
-        Exp(B, B, size);
-    }
-
-    /// <summary>
-    /// Base-10 exponential: B = 10^A
-    /// </summary>
-    public void Exp10(IGpuBuffer A, IGpuBuffer B, int size)
-    {
-        ThrowIfDisposed();
-        // Use exp(A * ln(10))
-        var ln10 = 2.302585092994046f;
-        Scale(A, B, ln10, size);
-        Exp(B, B, size);
-    }
-
-    /// <summary>
-    /// Expm1: B = exp(A) - 1
-    /// </summary>
-    public void ExpM1(IGpuBuffer A, IGpuBuffer B, int size)
-    {
-        ThrowIfDisposed();
-        Exp(A, B, size);
-        AddScalar(B, B, -1.0f, size);
-    }
-
-    /// <summary>
     /// Natural log: B = log(A)
     /// </summary>
     public void Log(IGpuBuffer A, IGpuBuffer B, int size)
     {
         ThrowIfDisposed();
         ExecuteUnaryOp("log_kernel", A, B, size, _elementWiseLibrary);
-    }
-
-    /// <summary>
-    /// Base-2 log: B = log2(A)
-    /// </summary>
-    public void Log2(IGpuBuffer A, IGpuBuffer B, int size)
-    {
-        ThrowIfDisposed();
-        Log(A, B, size);
-        Scale(B, B, 1.0f / 0.693147180559945f, size);
-    }
-
-    /// <summary>
-    /// Log1p: B = log(1 + A)
-    /// </summary>
-    public void Log1P(IGpuBuffer A, IGpuBuffer B, int size)
-    {
-        ThrowIfDisposed();
-        AddScalar(A, B, 1.0f, size);
-        Log(B, B, size);
     }
 
     /// <summary>

@@ -61,6 +61,9 @@ public sealed partial class MetalBackend : IBatchNormVarianceBackend
             new MTLSize((ulong)BatchNormRegisterKernelTemplate.GroupSize, 1, 1));
     }
 
+    bool IBatchNormVarianceBackend.AcceptsTrainingShape(int batch, int channels, int spatial)
+        => BatchNormRegisterReady && PortableBatchNorm.AcceptsShape(batch, channels, spatial);
+
     bool IBatchNormVarianceBackend.TryBatchNormTrainingWithVariance(IGpuBuffer input, IGpuBuffer output,
         IGpuBuffer gamma, IGpuBuffer beta, IGpuBuffer saveMean, IGpuBuffer saveVariance,
         int batch, int channels, int spatial, float epsilon, bool relu, IGpuBuffer? residual)
