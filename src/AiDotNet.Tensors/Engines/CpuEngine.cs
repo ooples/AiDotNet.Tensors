@@ -44181,6 +44181,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
     // The rows from which an inference FusedLinear's GEMM leaves the cached-B route for BlasManaged.
     private const int ManagedInferenceGemmMaxRows = 256;
+    private static readonly bool s_zzFwdOld = Environment.GetEnvironmentVariable("ZZ_FWD_OLD") == "1"; // probe A/B only
 
     public virtual Tensor<T> FusedLinear<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, FusedActivationType activation, FusedActivationParams? activationParams = null)
     {
@@ -44427,7 +44428,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 // managed kernel (verified: InferenceGemmStrategyAbTests). Gate is
                 // shape-based so it generalises beyond MLP. Skipped under a tape (the
                 // tape path returns earlier) — this is the pure-inference fast path.
-                if (PreferManagedInferenceGemm(M, K, N))
+                if ((s_zzFwdOld || Autodiff.GradientTape<T>.Current is null) && PreferManagedInferenceGemm(M, K, N))
                 {
                     Simd.SimdGemm.SgemmWithCachedB(
                         inArr.AsSpan(0, M * K), wArr, outArr.AsSpan(0, M * N), M, K, N);
@@ -44617,7 +44618,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
 #endif
 
-                if (PreferManagedInferenceGemm(M, K, N))
+                if ((s_zzFwdOld || Autodiff.GradientTape<T>.Current is null) && PreferManagedInferenceGemm(M, K, N))
                 {
                     Simd.SimdGemm.SgemmWithCachedB(
                         inArr.AsSpan(0, M * K), wArr, outArr.AsSpan(0, M * N), M, K, N);
