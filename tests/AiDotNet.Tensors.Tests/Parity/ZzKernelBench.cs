@@ -49,6 +49,27 @@ public class ZzKernelBench
         Line($"ZZ kern 6x32 zmm k{k} L1: {flops / (t512.Min * 1e6):F1} GFLOP/s (min {t512.Min:F3} ms, med {t512.Med:F3})  vec512 {SimdGemm.UseVector512Direct}");
 
         int threads0 = CpuParallelSettings.MaxDegreeOfParallelism;
+        int kc0 = SimdGemm.s_stripKc; bool pack0 = SimdGemm.s_packStrip512;
+        foreach (var (m, kk, n) in new[] { (128, 784, 512), (128, 512, 256) })
+        {
+            var A = new float[m * kk]; var B = new float[kk * n]; var C = new float[m * n];
+            for (int i = 0; i < A.Length; i++) A[i] = (float)r.NextDouble();
+            for (int i = 0; i < B.Length; i++) B[i] = (float)r.NextDouble();
+            double f = 2.0 * m * kk * n;
+            foreach (int th in new[] { 1, 2 })
+            {
+                CpuParallelSettings.MaxDegreeOfParallelism = th;
+                var parts = new List<string>();
+                foreach (var (kcv, pk) in new[] { (256, true), (128, true), (96, true), (64, true), (0, true), (256, false) })
+                {
+                    SimdGemm.s_stripKc = kcv; SimdGemm.s_packStrip512 = pk;
+                    var tm = Measure(() => SimdGemm.Sgemm(A, kk, false, B, n, false, C, m, kk, n));
+                    parts.Add($"kc{kcv}{(pk ? "" : "-nopack")} {tm.Min:F4} ({f / (tm.Min * 1e6):F0})");
+                }
+                Line($"ZZ kern kcsweep {m}x{kk}x{n} t{th}: {string.Join("  ", parts)}");
+            }
+        }
+        SimdGemm.s_stripKc = kc0; SimdGemm.s_packStrip512 = pack0;
         foreach (var (m, kk, n) in new[] { (128, 784, 512), (128, 512, 256), (64, 128, 3136) })
         {
             var A = new float[m * kk]; var B = new float[kk * n]; var C = new float[m * n];

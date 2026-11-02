@@ -150,7 +150,7 @@ internal static partial class SimdGemm
     /// the chunk's row blocks, where the whole strip (784 x 32 at a dense layer's input) streamed from L2 for every row
     /// block, and the A panel's lines with it. AIDOTNET_GEMM_KC overrides (0 = no blocking).
     /// </summary>
-    internal static readonly int s_stripKc =
+    internal static int s_stripKc =
         int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_KC"), out int kc) && kc >= 0 ? kc : DefaultPackedStripRows;
 
     /// <summary>The 512-bit <see cref="TransAKernel6x16"/>: six rows x 32 columns of C = At*B, overwriting C; pA points at
