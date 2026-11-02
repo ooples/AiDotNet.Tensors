@@ -510,7 +510,7 @@ public static partial class BlasManaged
     /// only these route out, and only for plain products: no pre-packed operand, no epilogue, a dense output.
     /// Both SimdGemm routes sum in a fixed order that does not follow the thread budget.
     /// </summary>
-    private static bool TryRouteToSimdGemm<T>(
+    internal static bool TryRouteToSimdGemm<T>(
         ReadOnlySpan<T> a, int lda, bool transA, ReadOnlySpan<T> b, int ldb, bool transB,
         Span<T> c, int ldc, int m, int n, int k, in BlasOptions<T> options) where T : unmanaged
     {
@@ -534,6 +534,8 @@ public static partial class BlasManaged
         // BlasManaged overwrites C whatever BetaZero says (it only promises a write-first kernel may skip the clear);
         // the overwriting entry also unlocks SimdGemm's write-first paths.
         Simd.SimdGemm.Sgemm(af, lda, transA, bf, ldb, transB, cf, m, k, n);
+        var epilogue = options.Epilogue;
+        EpilogueChain.Apply<T>(c, ldc, m, n, in epilogue);
         return true;
     }
 
@@ -814,7 +816,8 @@ public static partial class BlasManaged
         if (typeof(T) == typeof(float) && !s_disableGotoGemm && !transA && !transB
             && options.PackedA is null && options.PackedB is null
             && options.NumThreads == 0 // only the default (all-core) budget; explicit -1/>0 requests honored below
-            && (options.PackingMode == PackingMode.Auto || options.PackingMode == PackingMode.DisableAutotune)
+            // A deterministic DisableAutotune call must use the same reduction at every explicit thread count.
+            && (options.PackingMode == PackingMode.Auto || (options.PackingMode == PackingMode.DisableAutotune && !deterministic))
             && (GotoGemmFp32.IsPreferredForThreadBudget(gotoThreadBudget)
                 || GotoGemmFp32.PackBothUnderOccupies(m, gotoThreadBudget)
                 // #653: an M PackBoth would tail-split (to Streaming on a many-core host), at any thread budget.
@@ -1064,7 +1067,8 @@ public static partial class BlasManaged
             // Strip epilogue for sub-calls; apply once at the end on full (m, n).
             var innerOptions = new BlasOptions<T>
             {
-                PackingMode = options.PackingMode,
+                // Keep the outer plan when DisableAutotune resolves before tail splitting.
+                PackingMode = options.PackingMode == PackingMode.DisableAutotune ? strategy : options.PackingMode,
                 Workspace = options.Workspace,
                 PackedA = options.PackedA,
                 PackedB = options.PackedB,
