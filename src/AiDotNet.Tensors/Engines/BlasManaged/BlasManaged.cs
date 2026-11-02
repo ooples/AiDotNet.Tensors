@@ -930,6 +930,16 @@ public static partial class BlasManaged
         if (strategy == PackingMode.DisableAutotune)
             strategy = Dispatcher.SelectStrategy(m, n, k, transA, transB, new BlasOptions<T> { PackingMode = PackingMode.Auto });
 
+        // A new default must not invalidate an Auto caller's PackAOnly-compatible constraints.
+        // PackBoth needs Nc when blocking is explicit, and its FP64 path cannot split over N.
+        if (strategy == PackingMode.ForcePackBoth
+            && (options.PackingMode == PackingMode.Auto || options.PackingMode == PackingMode.DisableAutotune)
+            && options.PackedA is null && options.PackedB is null && !transB && options.Nc == 0
+            && ((options.Mc > 0 && options.Kc > 0)
+                || (typeof(T) == typeof(double) && options.ParallelismAxis == ParallelismAxis.N)))
+            strategy = PackingMode.ForcePackAOnly;
+
+
         // beta=0 fallback for the tuned-strategy family (Streaming / PackAOnly / PackBoth and
         // the partial-M/N tail decomposition): these all read-modify-write C (Streaming loads
         // the C accumulator; PackBoth accumulates C across K-panels; the tail-split relies on a
