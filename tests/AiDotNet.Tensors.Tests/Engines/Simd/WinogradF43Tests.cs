@@ -37,6 +37,10 @@ public class WinogradF43Tests
         { 2, 32, 64, 32, 32 },   // blocked: two bands of 4 tile rows
         { 3, 32, 32, 30, 33 },   // blocked weight gradient: nine bands over eight splits, the last split adds two
         { 9, 40, 64, 16, 12 },   // blocked weight gradient: 40 columns (32 + an 8-wide tail), 64 rows (21 three-row tiles + 1)
+        { 8, 128, 128, 4, 4 },   // few patches: one tile per image, eight patches
+        { 3, 128, 144, 4, 4 },   // few patches: three patches padded to a group of eight; nine output-channel blocks
+        { 2, 128, 128, 5, 6 },   // few patches: 2x2 partial tiles per image
+        { 3, 128, 136, 4, 4 },   // input gradient few-patch (136 input channels: a 16 + 8 slab tail); forward batch-wide
     };
 
     [SkippableTheory]
@@ -289,8 +293,10 @@ public class WinogradF43Tests
     {
         Skip.IfNot(WinogradRoutes, "Winograd routing needs AVX2 + FMA and AIDOTNET_CONV_WINOGRAD not set to 0.");
         Skip.IfNot(WinogradF43.s_blockedNarrow && !WinogradF43.s_forceBlockedForTest
-                   && WinogradF43.s_minPatches == 128 && WinogradF43.s_minBackwardPatches == 32,
+                   && WinogradF43.PatchFloorsAreDefault,
             "Default routing only (AIDOTNET_WINOGRAD_BLOCKED and the patch floors unset).");
+        bool fullRate = WinogradF43.DirectKernelIsFullRate512;
+        Assert.Equal(fullRate ? WinogradF43.FullRateMinPatches : 32, WinogradF43.s_minPatches);
         Assert.True(WinogradF43.Applies(8, 64, 64, 32, 32, 3, 3, 1, 1, 1, 1, 1, 1));
         Assert.False(WinogradF43.Applies(8, 64, 64, 32, 32, 3, 3, 2, 2, 1, 1, 1, 1));   // stride 2
         Assert.False(WinogradF43.Applies(8, 64, 64, 32, 32, 3, 3, 1, 1, 0, 0, 1, 1));   // padding 0
@@ -298,10 +304,19 @@ public class WinogradF43Tests
         Assert.False(WinogradF43.Applies(8, 3, 64, 32, 32, 3, 3, 1, 1, 1, 1, 1, 1));    // 3 input channels
         Assert.True(WinogradF43.Applies(64, 32, 64, 14, 14, 3, 3, 1, 1, 1, 1, 1, 1));   // 32 input channels: blocked
         Assert.False(WinogradF43.Applies(64, 8, 64, 14, 14, 3, 3, 1, 1, 1, 1, 1, 1));   // 8 input channels
-        Assert.False(WinogradF43.Applies(8, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));   // 32 patches
+        Assert.Equal(WinogradF43.s_fewMaxPatches >= 32, WinogradF43.Applies(8, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));  // 32 patches: few-patch form
+        Assert.Equal(!fullRate, WinogradF43.Applies(8, 96, 96, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));     // 32 patches, 96 channels: the floor
+        Assert.Equal(!fullRate, WinogradF43.Applies(16, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));  // 64 patches
         Assert.False(WinogradF43.Applies(8, 64, 60, 32, 32, 3, 3, 1, 1, 1, 1, 1, 1));   // 60 output channels
         Assert.False(WinogradF43.Applies(8, 64, 64, 4, 4, 3, 3, 1, 1, 1, 1, 1, 1));     // 4x4 plane
+        // Wide layers with few patches take the few-patch form, on planes down to 4x4; not the weight gradient.
+        Assert.Equal(WinogradF43.s_fewMaxPatches >= 8, WinogradF43.Applies(8, 512, 512, 4, 4, 3, 3, 1, 1, 1, 1, 1, 1));
+        Assert.Equal(WinogradF43.s_fewMaxPatches >= 8, WinogradF43.AppliesToInputGradient(8, 512, 512, 4, 4, 3, 3, 1, 1, 1, 1, 1, 1));
+        Assert.False(WinogradF43.AppliesToWeightGradient(8, 512, 512, 4, 4, 3, 3, 1, 1, 1, 1, 1, 1));
+        Assert.False(WinogradF43.Applies(8, 512, 512, 3, 3, 3, 3, 1, 1, 1, 1, 1, 1));    // 3x3 plane
+        Assert.False(WinogradF43.Applies(8, 512, 520, 4, 4, 3, 3, 1, 1, 1, 1, 1, 1));    // 520 output channels
         Assert.False(WinogradF43.Applies(1, 64, 64, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));     // 4 patches
+        Assert.False(WinogradF43.Applies(4, 96, 96, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));     // 16 patches, 96 channels
         Assert.False(WinogradF43.Applies(8, 64, 64, 32, 32, 5, 5, 1, 1, 2, 2, 1, 1));   // 5x5
         // The batch-wide weight gradient wants wider layers (C K >= 64 (C + K)); layers of 32 to 64 channels run blocked.
         Assert.True(WinogradF43.AppliesToWeightGradient(8, 128, 128, 16, 16, 3, 3, 1, 1, 1, 1, 1, 1));
@@ -322,20 +337,20 @@ public class WinogradF43Tests
     public void Gradients_TakeFewerPatchesThanTheForward()
     {
         Skip.IfNot(WinogradRoutes, "Winograd routing needs AVX2 + FMA and AIDOTNET_CONV_WINOGRAD not set to 0.");
-        Skip.IfNot(WinogradF43.s_minPatches == 128 && WinogradF43.s_minBackwardPatches == 32
-            && Environment.GetEnvironmentVariable("AIDOTNET_WINOGRAD_MIN_BACKWARD_PATCHES") is null,
-            "Default patch floors only (AIDOTNET_WINOGRAD_MIN_BACKWARD_PATCHES unset).");
-        // ResNet-18 256 -> 256 on 8x8 planes at batch 8: 32 patches. The weight gradient takes it, the forward does not;
-        // the input gradient does unless a full-rate 512-bit unit runs the direct kernel (floor 64).
-        Assert.False(WinogradF43.Applies(8, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));
-        bool fullRate = WinogradF43.DirectInputGradientIsFullRate512;
+        Skip.IfNot(WinogradF43.PatchFloorsAreDefault, "Default patch floors only (AIDOTNET_WINOGRAD_MIN_*PATCHES unset).");
+        // ResNet-18 256 -> 256 on 8x8 planes at batch 8: 32 patches. The weight gradient takes it; the forward and input
+        // gradient do unless a full-rate 512-bit unit runs the direct kernel (floors 128 and 64).
+        bool fullRate = WinogradF43.DirectKernelIsFullRate512;
         Assert.Equal(fullRate ? WinogradF43.FullRateInputGradientMinPatches : 32, WinogradF43.s_minInputGradientPatches);
-        Assert.Equal(!fullRate, WinogradF43.AppliesToInputGradient(8, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));
+        Assert.Equal(!fullRate, WinogradF43.AppliesToInputGradient(8, 96, 96, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));
+        // 256 channels: the few-patch form takes 32 patches on every host.
+        Assert.Equal(WinogradF43.s_fewMaxPatches >= 32, WinogradF43.AppliesToInputGradient(8, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));
         Assert.True(WinogradF43.AppliesToInputGradient(16, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));   // 64 patches
         Assert.True(WinogradF43.AppliesToWeightGradient(8, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));
-        // 16 patches stay direct in every pass.
-        Assert.False(WinogradF43.AppliesToInputGradient(4, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));
+        // 16 patches: the weight gradient stays direct; the input gradient takes only the few-patch form (wide layers).
         Assert.False(WinogradF43.AppliesToWeightGradient(4, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));
+        Assert.Equal(WinogradF43.s_fewMaxPatches >= 16, WinogradF43.AppliesToInputGradient(4, 256, 256, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));
+        Assert.False(WinogradF43.AppliesToInputGradient(4, 96, 96, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1));
         // The input gradient keeps the forward's other rules.
         Assert.False(WinogradF43.AppliesToInputGradient(8, 256, 256, 8, 8, 3, 3, 2, 2, 1, 1, 1, 1));
     }
@@ -388,6 +403,80 @@ public class WinogradF43Tests
         AssertClose(yDirect, yWino, "forward");
         AssertClose(dxDirect, dxWino, "input gradient");
         // The two routes round differently: equal arrays would mean the engine never reached the kernel.
+        Assert.NotEqual(yDirect, yWino);
+        Assert.NotEqual(dxDirect, dxWino);
+    }
+
+#if NET9_0_OR_GREATER
+    // The 512-bit few-patch tiles (32 output channels per job, slabs half as deep) run the same multiply-adds as the
+    // 256-bit tiles in the same order per lane, so they agree bit for bit.
+    [SkippableTheory]
+    [InlineData(8, 128, 128, 4, 4, false)]
+    [InlineData(2, 128, 160, 5, 6, false)]
+    [InlineData(3, 160, 128, 4, 4, true)]
+    [InlineData(4, 128, 128, 8, 8, true)]
+    public void FewPatches512_IsBitIdenticalTo256BitTiles(int n, int c, int k, int h, int w, bool inputGradient)
+    {
+        Skip.IfNot(KernelRuns, "The Winograd kernel needs AVX2 + FMA.");
+        var rng = new Random(n + c + k + h * w);
+        float[] x = Fill(rng, n * (inputGradient ? k : c) * h * w), wt = Fill(rng, k * c * 9);
+        int outLength = n * (inputGradient ? c : k) * h * w;
+        float[] Run()
+        {
+            var y = new float[outLength];
+            if (inputGradient) WinogradF43.BackwardInput(x, 0, wt, 0, y, 0, false, n, c, h, w, k);
+            else WinogradF43.Forward(x, 0, wt, 0, y, 0, false, n, c, h, w, k);
+            return y;
+        }
+        bool previous512 = WinogradF43.s_fewPatches512, previousForce = WinogradF43.s_forceFewPatches512ForTest;
+        int previousMax = WinogradF43.s_fewMaxPatches;
+        try
+        {
+            WinogradF43.s_fewMaxPatches = 32;
+            WinogradF43.s_fewPatches512 = false;
+            float[] narrow = Run();
+            WinogradF43.s_fewPatches512 = true;
+            WinogradF43.s_forceFewPatches512ForTest = true;
+            Assert.Equal(narrow, Run());
+        }
+        finally
+        {
+            WinogradF43.s_fewPatches512 = previous512;
+            WinogradF43.s_forceFewPatches512ForTest = previousForce;
+            WinogradF43.s_fewMaxPatches = previousMax;
+        }
+    }
+#endif
+
+    [SkippableFact]
+    public void Engine_FewPatchLayer_TakesTheKernel_AndAgreesWithTheDirectRoute()
+    {
+        Skip.IfNot(WinogradRoutes, "Winograd routing needs AVX2 + FMA and AIDOTNET_CONV_WINOGRAD not set to 0.");
+        Skip.IfNot(WinogradF43.s_fewMaxPatches >= 8, "AIDOTNET_WINOGRAD_FEW_MAX_PATCHES below 8.");
+        // ResNet-18's last stage at batch 8: 512 -> 512 on 4x4 planes, one tile per image.
+        const int n = 8, c = 512, k = 512, h = 4, w = 4;
+        var rng = new Random(78);
+        var x = new Tensor<float>(Fill(rng, n * c * h * w), new[] { n, c, h, w });
+        var wt = new Tensor<float>(Fill(rng, k * c * 9), new[] { k, c, 3, 3 });
+        var dy = new Tensor<float>(Fill(rng, n * k * h * w), new[] { n, k, h, w });
+        var engine = new CpuEngine();
+        int[] stride = { 1, 1 }, pad = { 1, 1 }, dil = { 1, 1 };
+        float[] yWino = engine.Conv2D(x, wt, stride, pad, dil).ToArray();
+        float[] dxWino = engine.Conv2DBackwardInput(dy, wt, x._shape, stride, pad, dil).ToArray();
+        float[] yDirect, dxDirect;
+        WinogradF43.s_disable = true;
+        try
+        {
+            yDirect = engine.Conv2D(x, wt, stride, pad, dil).ToArray();
+            dxDirect = engine.Conv2DBackwardInput(dy, wt, x._shape, stride, pad, dil).ToArray();
+        }
+        finally
+        {
+            WinogradF43.s_disable = false;
+        }
+        // 4608 products per output (~0.25 each).
+        AssertClose(yDirect, yWino, "forward", 5e-3);
+        AssertClose(dxDirect, dxWino, "input gradient", 5e-3);
         Assert.NotEqual(yDirect, yWino);
         Assert.NotEqual(dxDirect, dxWino);
     }
