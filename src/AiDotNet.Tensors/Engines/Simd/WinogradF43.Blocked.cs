@@ -49,8 +49,7 @@ internal static unsafe partial class WinogradF43
     internal static bool s_old = Environment.GetEnvironmentVariable("AIDOTNET_WINOGRAD_OLD") == "1";
     internal static bool UseBlocked(int cIn, int cOut)
         => s_forceBlockedForTest || (s_blockedNarrow && (Math.Min(cIn, cOut) < MinUnblockedChannels
-                                                        || (s_old ? false : false)
-                                                        || Math.Max(cIn, cOut) <= MinUnblockedChannels));
+                                                        || (!s_old && Math.Max(cIn, cOut) <= MinUnblockedChannels)));
 
     /// <summary>y [N, cOut, H, W] (=, or +=) from x [N, cIn, H, W] through the transformed weights u [36][cIn][cOut].</summary>
     private static void RunBlocked(float[] x, int xOff, float[] u, float[] y, int yOff, bool accumulate,
