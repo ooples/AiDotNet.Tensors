@@ -518,8 +518,13 @@ public static partial class BlasManaged
         // or blocking gets that plan. It used to take explicit ForcePackBoth / NumThreads=-1 calls to SimdGemm's parallel
         // split-K kernel whenever ldc == n, so the same product summed K in a different order depending on whether the call
         // covered the full width (the implicit and full-matrix conv routes disagreed in the last bits at M=128, K=2304).
-        if (options.PackingMode != PackingMode.Auto || options.NumThreads != 0
-            || options.Mc != 0 || options.Nc != 0 || options.Kc != 0)
+        // DisableAutotune asks for the default plan without the timing-driven one, not for a particular plan, so it routes
+        // as Auto does (as the Goto path below treats the two). Skipping it here sent the engine's DisableAutotune callers
+        // (the linear layers' weight gradients, TensorMatMul2D) past both routes: the CNN's 3136x64x128 A^T weight
+        // gradient then tail-split on the 6-row AVX-512 tile and took 6.0-7.7 ms on Zen 4 and Granite Rapids hosts
+        // against 0.39 here (PyTorch 0.12-0.36).
+        if ((options.PackingMode != PackingMode.Auto && options.PackingMode != PackingMode.DisableAutotune)
+            || options.NumThreads != 0 || options.Mc != 0 || options.Nc != 0 || options.Kc != 0)
             return false;
         if (ldc != n || options.PackedA is not null || options.PackedB is not null
             || !options.Epilogue.BiasN.IsEmpty || options.Epilogue.Activation != FusedActivationType.None
