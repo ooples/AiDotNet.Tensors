@@ -162,6 +162,41 @@ public sealed class TensorAddActivationTests
         }
     }
 
+    // ReLU keeps NaN and turns -0 into +0, as PyTorch, CpuFusedOperations and every GPU relu kernel (relu_nan_safe) do.
+    // The CPU ReLU and fused add + ReLU used max(x, +0), which turns NaN into +0: the CUDA lane's
+    // GpuRelu_EqualsTheCpuResult read NaN on the GPU against 0 on the CPU. The lengths reach the scalar tail and the
+    // AVX and AVX-512 loops.
+    [Theory]
+    [InlineData(5)]
+    [InlineData(37)]
+    [InlineData(4099)]
+    [InlineData(100003)]
+    public void CpuRelu_KeepsNaN_AndZeroesNegativeZero(int length)
+    {
+        var a = Values(length, 8);
+        var b = Values(length, 9);
+        var cpu = new CpuEngine();
+        var fused = cpu.TensorAddActivation(a, b, FusedActivationType.ReLU).ToArray();
+        var composed = cpu.ReLU(cpu.TensorAdd(a, b)).ToArray();
+        var single = cpu.ReLU(a).ToArray();
+        var av = a.ToArray();
+        var bv = b.ToArray();
+        int nan = 0, negativeZero = 0;
+        for (int i = 0; i < length; i++)
+        {
+            float sum = av[i] + bv[i];
+            float expected = float.IsNaN(sum) ? sum : (sum > 0 ? sum : 0f);
+            Assert.True(Bits(expected) == Bits(fused[i]), $"fused [{i}] relu({sum}): expected {expected} got {fused[i]}");
+            Assert.True(Bits(expected) == Bits(composed[i]), $"composed [{i}] relu({sum}): expected {expected} got {composed[i]}");
+            float expectedA = float.IsNaN(av[i]) ? av[i] : (av[i] > 0 ? av[i] : 0f);
+            Assert.True(Bits(expectedA) == Bits(single[i]), $"relu [{i}] relu({av[i]}): expected {expectedA} got {single[i]}");
+            if (float.IsNaN(sum)) nan++;
+            if (Bits(av[i]) == Bits(-0f)) negativeZero++;
+        }
+        Assert.True(nan > 0, "no NaN sum in the inputs: NaN propagation went unchecked");
+        Assert.True(negativeZero > 0, "no -0 in the inputs: -0 -> +0 went unchecked");
+    }
+
     [SkippableTheory]
     [InlineData(4096)]      // the float4 route where the backend has one
     [InlineData(4099)]      // the scalar route

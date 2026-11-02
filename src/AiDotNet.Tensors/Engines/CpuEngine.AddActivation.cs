@@ -20,8 +20,8 @@ public partial class CpuEngine
     /// <see cref="TensorAddActivationEngineExtensions.TensorAddActivation{T}"/>.</summary>
     /// <remarks>
     /// A float ReLU over two contiguous tensors of one shape and layout runs in one pass: <c>max(a + b, +0)</c>, the
-    /// same arithmetic as <see cref="TensorAdd{T}"/> followed by <see cref="ReLU{T}(Tensor{T})"/> (a NaN or -0 sum
-    /// becomes +0), without writing and re-reading the sum. The tape keeps only the output, which the ReLU mask is
+    /// same arithmetic as <see cref="TensorAdd{T}"/> followed by <see cref="ReLU{T}(Tensor{T})"/> (a NaN sum stays
+    /// NaN, a -0 sum becomes +0, as on every GPU backend), without writing and re-reading the sum. The tape keeps only the output, which the ReLU mask is
     /// rebuilt from in the backward, so training holds one activation per residual join instead of two. Any other
     /// type, activation, shape pairing or a lazy graph composes the two recorded ops.
     /// </remarks>
@@ -71,8 +71,8 @@ public partial class CpuEngine
         });
     }
 
-    /// <summary><c>r[i] = max(a[i] + b[i], +0)</c>; the second operand of the max is zero, so a NaN sum yields +0
-    /// exactly as the ReLU kernel does.</summary>
+    /// <summary><c>r[i] = relu(a[i] + b[i])</c> with the ReLU kernel's NaN contract: a NaN sum stays NaN (it read +0
+    /// here while every GPU backend propagated it), a -0 sum becomes +0.</summary>
     [MethodImpl(Compatibility.MethodImplHelper.Hot)]
     private static unsafe void AddReluSpan(float* a, float* b, float* r, int count)
     {
@@ -80,22 +80,20 @@ public partial class CpuEngine
 #if NET5_0_OR_GREATER
         if (Avx.IsSupported)
         {
-            var zero = Vector256<float>.Zero;
             for (; i + 32 <= count; i += 32)
             {
-                Avx.Store(r + i, Avx.Max(Avx.Add(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)), zero));
-                Avx.Store(r + i + 8, Avx.Max(Avx.Add(Avx.LoadVector256(a + i + 8), Avx.LoadVector256(b + i + 8)), zero));
-                Avx.Store(r + i + 16, Avx.Max(Avx.Add(Avx.LoadVector256(a + i + 16), Avx.LoadVector256(b + i + 16)), zero));
-                Avx.Store(r + i + 24, Avx.Max(Avx.Add(Avx.LoadVector256(a + i + 24), Avx.LoadVector256(b + i + 24)), zero));
+                Avx.Store(r + i, Simd.SimdKernels.ReluNaN256(Avx.Add(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i))));
+                Avx.Store(r + i + 8, Simd.SimdKernels.ReluNaN256(Avx.Add(Avx.LoadVector256(a + i + 8), Avx.LoadVector256(b + i + 8))));
+                Avx.Store(r + i + 16, Simd.SimdKernels.ReluNaN256(Avx.Add(Avx.LoadVector256(a + i + 16), Avx.LoadVector256(b + i + 16))));
+                Avx.Store(r + i + 24, Simd.SimdKernels.ReluNaN256(Avx.Add(Avx.LoadVector256(a + i + 24), Avx.LoadVector256(b + i + 24))));
             }
             for (; i + 8 <= count; i += 8)
-                Avx.Store(r + i, Avx.Max(Avx.Add(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)), zero));
+                Avx.Store(r + i, Simd.SimdKernels.ReluNaN256(Avx.Add(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i))));
         }
 #endif
         for (; i < count; i++)
         {
-            float v = a[i] + b[i];
-            r[i] = v > 0 ? v : 0;
+            r[i] = Simd.SimdKernels.ReluNaN(a[i] + b[i]);
         }
     }
 }

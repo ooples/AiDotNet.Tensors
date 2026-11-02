@@ -429,6 +429,31 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
         }
 
+        // ReLU with the library's NaN contract (CpuFusedOperations' ReluNaNSafe*, the GPU kernels' relu_nan_safe, and
+        // PyTorch): a NaN input stays NaN, a negative or -0 input becomes +0. max(x, +0) alone turns NaN into +0, since
+        // MAXPS returns its second operand when either is NaN, so the NaN lanes are blended back.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static float ReluNaN(float x) => float.IsNaN(x) ? x : (x > 0 ? x : 0);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static double ReluNaN(double x) => double.IsNaN(x) ? x : (x > 0 ? x : 0);
+#if NET5_0_OR_GREATER
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static Vector256<float> ReluNaN256(Vector256<float> v)
+            => Avx.BlendVariable(Avx.Max(v, Vector256<float>.Zero), v, Avx.Compare(v, v, FloatComparisonMode.UnorderedNonSignaling));
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static Vector256<double> ReluNaN256(Vector256<double> v)
+            => Avx.BlendVariable(Avx.Max(v, Vector256<double>.Zero), v, Avx.Compare(v, v, FloatComparisonMode.UnorderedNonSignaling));
+#endif
+#if NET8_0_OR_GREATER
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static Vector512<float> ReluNaN512(Vector512<float> v)
+            => Vector512.ConditionalSelect(Vector512.Equals(v, v), Avx512F.Max(v, Vector512<float>.Zero), v);
+#endif
+
         /// <summary>
         /// Pointer-based ReLU — zero bounds-checking overhead for hot paths.
         /// </summary>
@@ -439,52 +464,48 @@ namespace AiDotNet.Tensors.Engines.Simd
 #if NET8_0_OR_GREATER
             if (Avx512F.IsSupported && length >= 64)
             {
-                var vzero = Vector512<float>.Zero;
                 int simdLength = length & ~63;
                 for (; i < simdLength; i += 64)
                 {
-                    Avx512F.Store(output + i, Avx512F.Max(Avx512F.LoadVector512(input + i), vzero));
-                    Avx512F.Store(output + i + 16, Avx512F.Max(Avx512F.LoadVector512(input + i + 16), vzero));
-                    Avx512F.Store(output + i + 32, Avx512F.Max(Avx512F.LoadVector512(input + i + 32), vzero));
-                    Avx512F.Store(output + i + 48, Avx512F.Max(Avx512F.LoadVector512(input + i + 48), vzero));
+                    Avx512F.Store(output + i, ReluNaN512(Avx512F.LoadVector512(input + i)));
+                    Avx512F.Store(output + i + 16, ReluNaN512(Avx512F.LoadVector512(input + i + 16)));
+                    Avx512F.Store(output + i + 32, ReluNaN512(Avx512F.LoadVector512(input + i + 32)));
+                    Avx512F.Store(output + i + 48, ReluNaN512(Avx512F.LoadVector512(input + i + 48)));
                 }
             }
             if (Avx512F.IsSupported && length - i >= 16)
             {
-                var vzero = Vector512<float>.Zero;
                 int simdLength = i + ((length - i) & ~15);
                 for (; i < simdLength; i += 16)
                 {
-                    Avx512F.Store(output + i, Avx512F.Max(Avx512F.LoadVector512(input + i), vzero));
+                    Avx512F.Store(output + i, ReluNaN512(Avx512F.LoadVector512(input + i)));
                 }
             }
 #endif
 #if NET5_0_OR_GREATER
             if (Avx.IsSupported && length - i >= 32)
             {
-                var vzero = Vector256<float>.Zero;
                 int simdLength = i + ((length - i) & ~31);
                 for (; i < simdLength; i += 32)
                 {
-                    Avx.Store(output + i, Avx.Max(Avx.LoadVector256(input + i), vzero));
-                    Avx.Store(output + i + 8, Avx.Max(Avx.LoadVector256(input + i + 8), vzero));
-                    Avx.Store(output + i + 16, Avx.Max(Avx.LoadVector256(input + i + 16), vzero));
-                    Avx.Store(output + i + 24, Avx.Max(Avx.LoadVector256(input + i + 24), vzero));
+                    Avx.Store(output + i, ReluNaN256(Avx.LoadVector256(input + i)));
+                    Avx.Store(output + i + 8, ReluNaN256(Avx.LoadVector256(input + i + 8)));
+                    Avx.Store(output + i + 16, ReluNaN256(Avx.LoadVector256(input + i + 16)));
+                    Avx.Store(output + i + 24, ReluNaN256(Avx.LoadVector256(input + i + 24)));
                 }
             }
             if (Avx.IsSupported && length - i >= 8)
             {
-                var vzero = Vector256<float>.Zero;
                 int simdLength = i + ((length - i) & ~7);
                 for (; i < simdLength; i += 8)
                 {
-                    Avx.Store(output + i, Avx.Max(Avx.LoadVector256(input + i), vzero));
+                    Avx.Store(output + i, ReluNaN256(Avx.LoadVector256(input + i)));
                 }
             }
 #endif
             for (; i < length; i++)
             {
-                output[i] = input[i] > 0 ? input[i] : 0;
+                output[i] = ReluNaN(input[i]);
             }
         }
 
@@ -499,29 +520,27 @@ namespace AiDotNet.Tensors.Engines.Simd
 #if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 16)
             {
-                var vzero = Vector256<double>.Zero;
                 int simdLength = length & ~15;
                 for (; i < simdLength; i += 16)
                 {
-                    Avx.Store(output + i,      Avx.Max(Avx.LoadVector256(input + i),      vzero));
-                    Avx.Store(output + i + 4,  Avx.Max(Avx.LoadVector256(input + i + 4),  vzero));
-                    Avx.Store(output + i + 8,  Avx.Max(Avx.LoadVector256(input + i + 8),  vzero));
-                    Avx.Store(output + i + 12, Avx.Max(Avx.LoadVector256(input + i + 12), vzero));
+                    Avx.Store(output + i,      ReluNaN256(Avx.LoadVector256(input + i)));
+                    Avx.Store(output + i + 4,  ReluNaN256(Avx.LoadVector256(input + i + 4)));
+                    Avx.Store(output + i + 8,  ReluNaN256(Avx.LoadVector256(input + i + 8)));
+                    Avx.Store(output + i + 12, ReluNaN256(Avx.LoadVector256(input + i + 12)));
                 }
             }
             if (Avx.IsSupported && length - i >= 4)
             {
-                var vzero = Vector256<double>.Zero;
                 int simdLength = i + ((length - i) & ~3);
                 for (; i < simdLength; i += 4)
                 {
-                    Avx.Store(output + i, Avx.Max(Avx.LoadVector256(input + i), vzero));
+                    Avx.Store(output + i, ReluNaN256(Avx.LoadVector256(input + i)));
                 }
             }
 #endif
             for (; i < length; i++)
             {
-                output[i] = input[i] > 0 ? input[i] : 0;
+                output[i] = ReluNaN(input[i]);
             }
         }
 
