@@ -3,6 +3,7 @@ using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Runtime.InteropServices;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
@@ -187,26 +188,42 @@ internal static class CpuTopology
     {
         var own = UsableCoresInCurrentGroup();
         // AIDOTNET_CPU_SPAN_GROUPS=0 keeps the pool in the process's own group (the pre-#653 placement).
-        if (own.Length == 0 || Environment.GetEnvironmentVariable("AIDOTNET_CPU_SPAN_GROUPS") == "0") return own;
+        if (own.Length == 0 || Environment.GetEnvironmentVariable("AIDOTNET_CPU_SPAN_GROUPS") == "0"
+            || !AffinityAllowsOtherGroups)
+            return own;
+        ushort home = own[0].Group;
+        var list = new List<(ushort, byte)>(own);
+        foreach (var core in DetectPhysicalCores().Where(c => c.Group != home && c.Mask != 0))
+            list.Add((core.Group, (byte)System.Numerics.BitOperations.TrailingZeroCount(core.Mask)));
+        return list.ToArray();
+    }
+
+    private static readonly Lazy<bool> s_affinityAllowsOtherGroups = new(ComputeAffinityAllowsOtherGroups);
+
+    /// <summary>
+    /// Whether the process may run on other processor groups: its affinity covers every processor of its own group
+    /// (nothing restricted it), or it already runs threads in several groups. Decided once: binding a worker to another
+    /// group turns the process multi-group, after which <c>GetProcessAffinityMask</c> succeeds with a zero mask.
+    /// </summary>
+    internal static bool AffinityAllowsOtherGroups => s_affinityAllowsOtherGroups.Value;
+
+    private static bool ComputeAffinityAllowsOtherGroups()
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return false;
         try
         {
-            var physical = DetectPhysicalCores();
-            ushort home = own[0].Group;
+            GetCurrentProcessorNumberEx(out var here);
             ulong groupMask = 0;
-            foreach (var core in physical)
-                if (core.Group == home) groupMask |= core.Mask;
-            if (!GetProcessAffinityMask(GetCurrentProcess(), out var processMask, out _)
-                || ((ulong)processMask & groupMask) != groupMask)
-                return own;
-            var list = new List<(ushort, byte)>(own);
-            foreach (var core in physical)
-            {
-                if (core.Group == home || core.Mask == 0) continue;
-                list.Add((core.Group, (byte)System.Numerics.BitOperations.TrailingZeroCount(core.Mask)));
-            }
-            return list.ToArray();
+            foreach (var core in DetectPhysicalCores().Where(c => c.Group == here.Group))
+                groupMask |= core.Mask;
+            if (groupMask == 0 || !GetProcessAffinityMask(GetCurrentProcess(), out var processMask, out _)) return false;
+            // Zero: the process already has threads in more than one group (documented for GetProcessAffinityMask).
+            return processMask == 0 || ((ulong)processMask & groupMask) == groupMask;
         }
-        catch { return own; }
+        catch (Exception ex) when (ex is DllNotFoundException || ex is EntryPointNotFoundException)
+        {
+            return false;
+        }
     }
 
     /// <summary>

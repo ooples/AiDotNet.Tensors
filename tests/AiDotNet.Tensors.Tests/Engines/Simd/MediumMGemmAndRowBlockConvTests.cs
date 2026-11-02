@@ -154,16 +154,35 @@ public class MediumMGemmAndRowBlockConvTests
         var k = new Tensor<float>(Rand(rnd, cout * cin * 9), new[] { cout, cin, 3, 3 });
         var engine = new CpuEngine();
 
+        // Where the row-block route can take the shape (AVX2/FMA, a short-wide GEMM), the pin is observable on its run
+        // counter: one run per pinned call, none without the pin. Elsewhere only the results are compared.
+        int oh = (h + 2 * pad - 3) / stride + 1, ow = (w + 2 * pad - 3) / stride + 1;
+        bool observable = System.Runtime.Intrinsics.X86.Avx2.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported
+            && SimdGemm.PrefersParallelN(cout, cin * 9, oh * ow, requireAlignedN: false)
+            && CpuParallelSettings.MaxDegreeOfParallelism > 1;
+        int runs = CpuEngine.RowBlockConvRunsOnThisThread;
+        void ExpectRuns(int added)
+        {
+            if (observable) Assert.Equal(runs + added, CpuEngine.RowBlockConvRunsOnThisThread);
+            runs = CpuEngine.RowBlockConvRunsOnThisThread;
+        }
+
         float[] reference = engine.Conv2D(x, k, stride, pad, 1).ToArray();
+        runs = CpuEngine.RowBlockConvRunsOnThisThread;   // the default dispatch may take any route
         float[] pinned, nested, afterInner;
         using (CpuEngine.ForceRowBlockConvScope())
         {
             pinned = engine.Conv2D(x, k, stride, pad, 1).ToArray();
+            ExpectRuns(1);
             using (CpuEngine.ForceRowBlockConvScope())
                 nested = engine.Conv2D(x, k, stride, pad, 1).ToArray();
+            ExpectRuns(1);
             afterInner = engine.Conv2D(x, k, stride, pad, 1).ToArray();   // the outer pin still holds
+            ExpectRuns(1);
         }
         float[] released = engine.Conv2D(x, k, stride, pad, 1).ToArray();
+        if (observable && stride == 1 && pad == 1)
+            ExpectRuns(0);   // released: the direct 3x3 kernel takes stride 1 / pad 1 again
 
         foreach (var got in new[] { pinned, nested, afterInner, released })
         {
