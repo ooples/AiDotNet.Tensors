@@ -212,8 +212,9 @@ internal static partial class DirectConvAvx2
         try
         {
             PackInput(input, inputOffset, packedInput, batch, inChannels, height, width, padH, padW, paddedH, paddedW);
-            PackKernel(kernel, kernelOffset, packedKernel, outChannels, inChannels, kernelHeight, kernelWidth, transposeAndFlip: false);
-            ForwardPacked(packedInput, packedKernel, output, outputOffset, accumulate,
+            bool interleave = Interleave512(outChannels);
+            PackKernel(kernel, kernelOffset, packedKernel, outChannels, inChannels, kernelHeight, kernelWidth, transposeAndFlip: false, interleave);
+            ForwardPacked(packedInput, packedKernel, interleave, output, outputOffset, accumulate,
                 ForwardGeometry.Plain(batch, inBlocks, paddedH, paddedW, outChannels, kernelHeight, kernelWidth,
                     strideH, strideW, dilationH, dilationW, outputHeight, outputWidth), targetTasks);
         }
@@ -250,8 +251,9 @@ internal static partial class DirectConvAvx2
         try
         {
             PackInput(gradOutput, gradOutputOffset, packedGrad, batch, outChannels, outputHeight, outputWidth, padHt, padWt, paddedH, paddedW);
-            PackKernel(kernel, kernelOffset, packedKernel, outChannels, inChannels, kernelHeight, kernelWidth, transposeAndFlip: true);
-            ForwardPacked(packedGrad, packedKernel, dest, destOffset, accumulate,
+            bool interleave = Interleave512(inChannels);
+            PackKernel(kernel, kernelOffset, packedKernel, outChannels, inChannels, kernelHeight, kernelWidth, transposeAndFlip: true, interleave);
+            ForwardPacked(packedGrad, packedKernel, interleave, dest, destOffset, accumulate,
                 ForwardGeometry.Plain(batch, gradBlocks, paddedH, paddedW, inChannels, kernelHeight, kernelWidth,
                     1, 1, 1, 1, height, width), targetTasks);
         }
@@ -344,7 +346,7 @@ internal static partial class DirectConvAvx2
                         int first = ShareBound(total, share, sharesPerTile), last = ShareBound(total, share + 1, sharesPerTile);
                         if (first >= last) continue;
                         if (s_stagedStore)
-                            ForwardTileRuns(packedGrad, packedKernel, phase.KernelOffset, dest, destOffset, accumulate, phase.Geometry, tile, first, last);
+                            ForwardTileRuns(packedGrad, packedKernel, phase.KernelOffset, dest, destOffset, accumulate, phase.Geometry, tile, first, last, interleaved: false);
                         else
                             ForwardTile(packedGrad, packedKernel, phase.KernelOffset, dest, destOffset, accumulate, phase.Geometry, tile, first, last);
                     }
@@ -620,7 +622,7 @@ internal static partial class DirectConvAvx2
     /// </summary>
     [MethodImpl(Hot)]
     private static unsafe void PackKernel(float[] source, int sourceOffset, float[] packed,
-        int outChannels, int inChannels, int kernelHeight, int kernelWidth, bool transposeAndFlip)
+        int outChannels, int inChannels, int kernelHeight, int kernelWidth, bool transposeAndFlip, bool interleave = false)
     {
         int taps = kernelHeight * kernelWidth;
         int packedOut = transposeAndFlip ? inChannels : outChannels;
@@ -636,7 +638,12 @@ internal static partial class DirectConvAvx2
             fixed (float* ps = source)
             fixed (float* pd = packed)
             {
-                float* d = pd + ((long)ob * packedInBlocks + ib) * taps * Block * Block;
+                // Interleaved (see Interleave512): a tile's four output blocks share one [ib][tap][il][32] run, block
+                // ob % 4 at lanes 8 (ob % 4) .. +8, so consecutive 8-vectors of this block sit vecStride floats apart.
+                int vecStride = interleave ? Block * OutputBlocksPerTile : Block;
+                float* d = interleave
+                    ? pd + ((long)(ob / OutputBlocksPerTile) * packedInBlocks + ib) * taps * Block * vecStride + (ob % OutputBlocksPerTile) * Block
+                    : pd + ((long)ob * packedInBlocks + ib) * taps * Block * Block;
                 float* src = ps + sourceOffset;
                 // The eight output lanes of one (tap, input lane) sit a fixed stride apart in the source, so a full input
                 // block gathers them in one instruction; the scalar walk below (index arithmetic per element) was a
@@ -650,7 +657,7 @@ internal static partial class DirectConvAvx2
                     float* rows = src + ((long)ob * Block * inChannels + (long)ib * Block) * taps;
                     float* d0 = d;
                     for (int c0 = 0; c0 < Block * taps; c0 += Block)
-                        TransposeScatter(rows + c0, laneStride, d0, c0, taps);
+                        TransposeScatter(rows + c0, laneStride, d0, c0, taps, vecStride);
                     return;
                 }
                 if (transposeAndFlip && (ib + 1) * Block <= packedIn && taps <= MaxTransposePackTaps)
@@ -663,7 +670,7 @@ internal static partial class DirectConvAvx2
                     for (int c0 = 0; c0 < Block * taps; c0 += Block)
                         Transpose8(rows + c0, (long)inChannels * taps, tile + c0 * Block, Block, accumulate: false);
                     for (int t = 0; t < taps; t++)
-                        Transpose8(tile + (taps - 1 - t) * Block, (long)taps * Block, d + t * Block * Block, Block, accumulate: false);
+                        Transpose8(tile + (taps - 1 - t) * Block, (long)taps * Block, d + (long)t * Block * vecStride, vecStride, accumulate: false);
                     return;
                 }
                 if (Avx2.IsSupported && (ib + 1) * Block <= packedIn && 7 * laneStride <= int.MaxValue)
@@ -673,7 +680,7 @@ internal static partial class DirectConvAvx2
                     for (int t = 0; t < taps; t++)
                     {
                         int tap = transposeAndFlip ? taps - 1 - t : t;
-                        for (int il = 0; il < Block; il++, d += Block)
+                        for (int il = 0; il < Block; il++, d += vecStride)
                         {
                             int pi = ib * Block + il, po = ob * Block;
                             long row = transposeAndFlip ? (long)pi * inChannels + po : (long)po * inChannels + pi;
@@ -685,7 +692,7 @@ internal static partial class DirectConvAvx2
                 for (int t = 0; t < taps; t++)
                 {
                     int tap = transposeAndFlip ? taps - 1 - t : t;
-                    for (int il = 0; il < Block; il++, d += Block)
+                    for (int il = 0; il < Block; il++, d += vecStride)
                     {
                         int pi = ib * Block + il;
                         if (pi >= packedIn)
@@ -709,7 +716,7 @@ internal static partial class DirectConvAvx2
     internal static bool s_stagedStore = true;
 
     [MethodImpl(Hot)]
-    private static void ForwardPacked(float[] packedInput, float[] packedKernel, float[] output, int outputOffset, bool accumulate,
+    private static void ForwardPacked(float[] packedInput, float[] packedKernel, bool interleaved, float[] output, int outputOffset, bool accumulate,
         ForwardGeometry geometry, int targetTasks)
     {
         int taskTarget = targetTasks > 0 ? targetTasks : TargetForwardTasks;
@@ -726,7 +733,7 @@ internal static partial class DirectConvAvx2
                 int first = part * chunksPerTask * PositionUnroll;
                 int last = Math.Min(totalPositions, first + chunksPerTask * PositionUnroll);
                 if (s_stagedStore)
-                    ForwardTileRuns(packedInput, packedKernel, 0, output, outputOffset, accumulate, geometry, tile, first, last);
+                    ForwardTileRuns(packedInput, packedKernel, 0, output, outputOffset, accumulate, geometry, tile, first, last, interleaved);
                 else
                     ForwardTile(packedInput, packedKernel, 0, output, outputOffset, accumulate, geometry, tile, first, last);
             },
@@ -818,7 +825,7 @@ internal static partial class DirectConvAvx2
     /// </remarks>
     [MethodImpl(Hot)]
     private static unsafe void ForwardTileRuns(float[] packedInput, float[] packedKernel, int kernelOffset, float[] output, int outputOffset,
-        bool accumulate, in ForwardGeometry g, int tile, int first, int last)
+        bool accumulate, in ForwardGeometry g, int tile, int first, int last, bool interleaved)
     {
         int kernelHeight = g.KernelHeight, kernelWidth = g.KernelWidth, inBlocks = g.InBlocks, planeIn = g.PlaneIn;
         int rowStep = g.DilationH * g.PaddedW * Block, colStep = g.DilationW * Block;
@@ -832,7 +839,8 @@ internal static partial class DirectConvAvx2
         // The run's receptive-field origins, computed once per run (InputOrigin divides; per triple and pass it was a
         // tenth of the forward's time) and stepped along a grid row; the tail repeats the last real position.
         int* origin = stackalloc int[MaxForwardRunPositions + RowPositions512];
-        bool wide = UseAvx512Forward;
+        // An interleaved kernel (packed for the 512-bit tile) is only ever read by it.
+        bool wide = interleaved || UseAvx512Forward;
         bool rowKernel = wide && s_useRowKernel512 && g.StrideW == 1;
         int gridWidth = g.GridWidth, columnStep = g.StrideW * Block;
         bool plain = g.PlainContiguous;
@@ -860,7 +868,7 @@ internal static partial class DirectConvAvx2
                 for (int cb0 = 0; cb0 < inBlocks; cb0 += pass)
                 {
                     int cbEnd = Math.Min(inBlocks, cb0 + pass);
-                    float* passKernel = tileKernel + (long)cb0 * taps * Block * Block;
+                    float* passKernel = tileKernel + (long)cb0 * taps * Block * Block * (interleaved ? OutputBlocksPerTile : 1);
                     if (wide)
                     {
                         for (int q = runStart; q < runEnd;)
@@ -871,14 +879,22 @@ internal static partial class DirectConvAvx2
                             if (rowKernel && runEnd - q >= RowPositions512
                                 && origin[i + RowPositions512 - 1] == origin[i] + (RowPositions512 - 1) * Block)
                             {
-                                ForwardRowRun512(px + origin[i], passKernel, blockStride, cbEnd - cb0, cb0 * planeIn, planeIn,
-                                    kernelHeight, kernelWidth, rowStep, colStep, stage + i * 32, cb0 > 0);
+                                if (interleaved)
+                                    ForwardRowRun512<Interleaved512>(px + origin[i], passKernel, blockStride, cbEnd - cb0, cb0 * planeIn, planeIn,
+                                        kernelHeight, kernelWidth, rowStep, colStep, stage + i * 32, cb0 > 0);
+                                else
+                                    ForwardRowRun512<Blocked512>(px + origin[i], passKernel, blockStride, cbEnd - cb0, cb0 * planeIn, planeIn,
+                                        kernelHeight, kernelWidth, rowStep, colStep, stage + i * 32, cb0 > 0);
                                 q += RowPositions512;
                                 continue;
                             }
                             int count = Math.Min(Avx512Positions, runEnd - q);
-                            ForwardSextetRun512(px, origin + i, passKernel, blockStride, cbEnd - cb0, cb0 * planeIn, planeIn,
-                                kernelHeight, kernelWidth, rowStep, colStep, stage + i * 32, cb0 > 0, count);
+                            if (interleaved)
+                                ForwardSextetRun512<Interleaved512>(px, origin + i, passKernel, blockStride, cbEnd - cb0, cb0 * planeIn, planeIn,
+                                    kernelHeight, kernelWidth, rowStep, colStep, stage + i * 32, cb0 > 0, count);
+                            else
+                                ForwardSextetRun512<Blocked512>(px, origin + i, passKernel, blockStride, cbEnd - cb0, cb0 * planeIn, planeIn,
+                                    kernelHeight, kernelWidth, rowStep, colStep, stage + i * 32, cb0 > 0, count);
                             q += Avx512Positions;
                         }
                         continue;
@@ -1001,9 +1017,9 @@ internal static partial class DirectConvAvx2
     /// </summary>
 #if NET9_0_OR_GREATER
     [MethodImpl(Hot)]
-    private static unsafe void ForwardSextetRun512(float* px, int* origin, float* w, long blockStride, int blocks,
+    private static unsafe void ForwardSextetRun512<TLayout>(float* px, int* origin, float* w, long blockStride, int blocks,
         int firstBlockOffset, int planeIn, int kernelHeight, int kernelWidth, int rowStep, int colStep,
-        float* slot, bool seeded, int count)
+        float* slot, bool seeded, int count) where TLayout : struct, IWeightLayout512
     {
         float* x0 = px + origin[0], x1 = px + origin[1], x2 = px + origin[2];
         float* x3 = px + origin[3], x4 = px + origin[4], x5 = px + origin[5];
@@ -1043,9 +1059,9 @@ internal static partial class DirectConvAvx2
                     float* p3 = x3 + tapOffset, p4 = x4 + tapOffset, p5 = x5 + tapOffset;
                     for (int c = 0; c < Block; c++)
                     {
-                        // Output channels 0-15 of the tile are packed blocks 0 and 1, 16-31 blocks 2 and 3.
-                        var wl = Vector512.Create(Vector256.Load(w), Vector256.Load(w + blockStride));
-                        var wh = Vector512.Create(Vector256.Load(w + stride2), Vector256.Load(w + stride3));
+                        // Output channels 0-15 of the tile, then 16-31 (see IWeightLayout512).
+                        var wl = default(TLayout).Low(w, blockStride);
+                        var wh = default(TLayout).High(w, stride2, stride3);
                         var b = Vector512.Create(p0[c]);
                         a0l = Vector512.FusedMultiplyAdd(b, wl, a0l); a0h = Vector512.FusedMultiplyAdd(b, wh, a0h);
                         b = Vector512.Create(p1[c]);
@@ -1058,7 +1074,7 @@ internal static partial class DirectConvAvx2
                         a4l = Vector512.FusedMultiplyAdd(b, wl, a4l); a4h = Vector512.FusedMultiplyAdd(b, wh, a4h);
                         b = Vector512.Create(p5[c]);
                         a5l = Vector512.FusedMultiplyAdd(b, wl, a5l); a5h = Vector512.FusedMultiplyAdd(b, wh, a5h);
-                        w += Block;
+                        w += default(TLayout).Step;
                     }
                 }
             }
@@ -1071,9 +1087,9 @@ internal static partial class DirectConvAvx2
         if (count > 5) { a5l.Store(slot + 160); a5h.Store(slot + 176); }
     }
 #else
-    private static unsafe void ForwardSextetRun512(float* px, int* origin, float* w, long blockStride, int blocks,
+    private static unsafe void ForwardSextetRun512<TLayout>(float* px, int* origin, float* w, long blockStride, int blocks,
         int firstBlockOffset, int planeIn, int kernelHeight, int kernelWidth, int rowStep, int colStep,
-        float* slot, bool seeded, int count) => throw new PlatformNotSupportedException();
+        float* slot, bool seeded, int count) where TLayout : struct, IWeightLayout512 => throw new PlatformNotSupportedException();
 #endif
 
 #if NET9_0_OR_GREATER
@@ -1091,9 +1107,9 @@ internal static partial class DirectConvAvx2
     /// FMA chain is the AVX2 kernel's: bit-identical results.
     /// </summary>
     [MethodImpl(Hot)]
-    private static unsafe void ForwardRowRun512(float* x, float* w, long blockStride, int blocks,
+    private static unsafe void ForwardRowRun512<TLayout>(float* x, float* w, long blockStride, int blocks,
         int firstBlockOffset, int planeIn, int kernelHeight, int kernelWidth, int rowStep, int colStep,
-        float* slot, bool seeded)
+        float* slot, bool seeded) where TLayout : struct, IWeightLayout512
     {
         Vector512<float> a0l, a0h, a1l, a1h, a2l, a2h, a3l, a3h, a4l, a4h, a5l, a5h, a6l, a6h, a7l, a7h, a8l, a8h, a9l, a9h, a10l, a10h, a11l, a11h;
         if (seeded)
@@ -1128,9 +1144,9 @@ internal static partial class DirectConvAvx2
                     float* p = x + rowOffset + t * colStep;
                     for (int c = 0; c < Block; c++)
                     {
-                        // Output channels 0-15 of the tile are packed blocks 0 and 1, 16-31 blocks 2 and 3.
-                        var wl = Vector512.Create(Vector256.Load(w), Vector256.Load(w + blockStride));
-                        var wh = Vector512.Create(Vector256.Load(w + stride2), Vector256.Load(w + stride3));
+                        // Output channels 0-15 of the tile, then 16-31 (see IWeightLayout512).
+                        var wl = default(TLayout).Low(w, blockStride);
+                        var wh = default(TLayout).High(w, stride2, stride3);
                         Vector512<float> b;
                         b = Vector512.Create(p[c]); a0l = Vector512.FusedMultiplyAdd(b, wl, a0l); a0h = Vector512.FusedMultiplyAdd(b, wh, a0h);
                         b = Vector512.Create(p[8 + c]); a1l = Vector512.FusedMultiplyAdd(b, wl, a1l); a1h = Vector512.FusedMultiplyAdd(b, wh, a1h);
@@ -1144,7 +1160,7 @@ internal static partial class DirectConvAvx2
                         b = Vector512.Create(p[72 + c]); a9l = Vector512.FusedMultiplyAdd(b, wl, a9l); a9h = Vector512.FusedMultiplyAdd(b, wh, a9h);
                         b = Vector512.Create(p[80 + c]); a10l = Vector512.FusedMultiplyAdd(b, wl, a10l); a10h = Vector512.FusedMultiplyAdd(b, wh, a10h);
                         b = Vector512.Create(p[88 + c]); a11l = Vector512.FusedMultiplyAdd(b, wl, a11l); a11h = Vector512.FusedMultiplyAdd(b, wh, a11h);
-                        w += Block;
+                        w += default(TLayout).Step;
                     }
                 }
             }
@@ -1165,10 +1181,56 @@ internal static partial class DirectConvAvx2
 #else
     private const int RowPositions512 = 12;
     internal static bool s_useRowKernel512;
-    private static unsafe void ForwardRowRun512(float* x, float* w, long blockStride, int blocks,
+    private static unsafe void ForwardRowRun512<TLayout>(float* x, float* w, long blockStride, int blocks,
         int firstBlockOffset, int planeIn, int kernelHeight, int kernelWidth, int rowStep, int colStep,
-        float* slot, bool seeded) => throw new PlatformNotSupportedException();
+        float* slot, bool seeded) where TLayout : struct, IWeightLayout512 => throw new PlatformNotSupportedException();
 #endif
+
+    /// <summary>
+    /// How the 512-bit forward tiles read a packed weight vector: output channels 0-15 of the tile (<see cref="Low"/>)
+    /// and 16-31 (<see cref="High"/>) for one input lane, and the floats to the next input lane (<see cref="Step"/>).
+    /// A struct type argument, so each layout gets its own compiled kernel with nothing branching inside.
+    /// </summary>
+    private interface IWeightLayout512
+    {
+        unsafe Vector512<float> Low(float* w, long blockStride);
+        unsafe Vector512<float> High(float* w, long stride2, long stride3);
+        int Step { get; }
+    }
+
+    /// <summary>The AVX2 layout ([O/8][I/8][tap][8 in][8 out]): each 16-lane vector joined from two blocks.</summary>
+    private readonly struct Blocked512 : IWeightLayout512
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public unsafe Vector512<float> Low(float* w, long blockStride) => Vector512.Create(Vector256.Load(w), Vector256.Load(w + blockStride));
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public unsafe Vector512<float> High(float* w, long stride2, long stride3) => Vector512.Create(Vector256.Load(w + stride2), Vector256.Load(w + stride3));
+        public int Step => Block;
+    }
+
+    /// <summary>
+    /// The tile-interleaved layout ([O/32][I/8][tap][8 in][32 out]): each 16-lane vector one load. The join above is a
+    /// 256-bit load plus an insert, a shuffle-port uop, and on Intel the 512-bit FMAs issue on that port too: two per
+    /// twelve or 24 FMAs. Same values in the same lanes, so the same FMA chains and bit-identical results.
+    /// </summary>
+    private readonly struct Interleaved512 : IWeightLayout512
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public unsafe Vector512<float> Low(float* w, long blockStride) => Vector512.Load(w);
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public unsafe Vector512<float> High(float* w, long stride2, long stride3) => Vector512.Load(w + 2 * Block);
+        public int Step => Block * OutputBlocksPerTile;
+    }
+
+    /// <summary>A/B switch: AIDOTNET_DIRECT_CONV_IL512=0 packs the 512-bit forward's weights in the AVX2 layout.</summary>
+    internal static bool s_interleave512 = Environment.GetEnvironmentVariable("AIDOTNET_DIRECT_CONV_IL512") != "0";
+
+    /// <summary>
+    /// Whether a forward (or stride-1 input-gradient) conv with <paramref name="packedOut"/> output channels packs its
+    /// weights tile-interleaved: only where the staged 512-bit tile reads them, and every tile is full.
+    /// </summary>
+    private static bool Interleave512(int packedOut)
+        => s_interleave512 && UseAvx512Forward && s_stagedStore && packedOut % (Block * OutputBlocksPerTile) == 0;
 
     /// <summary>Positions per <see cref="ForwardSextetRun512"/> call.</summary>
     private const int Avx512Positions = 6;
@@ -1430,7 +1492,7 @@ internal static partial class DirectConvAvx2
     // Transposes the 8x8 block at s (rows sStride apart); column c0 + j's 8 values go to the packed forward kernel's
     // (tap, input lane) slot d[(tap * 8 + il) * 8], where c0 + j = il * taps + tap.
     [MethodImpl(HotInline)]
-    private static unsafe void TransposeScatter(float* s, long sStride, float* d, int c0, int taps)
+    private static unsafe void TransposeScatter(float* s, long sStride, float* d, int c0, int taps, int vecStride)
     {
         var r0 = Avx.LoadVector256(s); var r1 = Avx.LoadVector256(s + sStride);
         var r2 = Avx.LoadVector256(s + 2 * sStride); var r3 = Avx.LoadVector256(s + 3 * sStride);
@@ -1444,21 +1506,21 @@ internal static partial class DirectConvAvx2
         var u2 = Avx.Shuffle(t1, t3, 0x44); var u3 = Avx.Shuffle(t1, t3, 0xEE);
         var u4 = Avx.Shuffle(t4, t6, 0x44); var u5 = Avx.Shuffle(t4, t6, 0xEE);
         var u6 = Avx.Shuffle(t5, t7, 0x44); var u7 = Avx.Shuffle(t5, t7, 0xEE);
-        Avx.Store(d + PackedSlot(c0, taps), Avx.Permute2x128(u0, u4, 0x20));
-        Avx.Store(d + PackedSlot(c0 + 1, taps), Avx.Permute2x128(u1, u5, 0x20));
-        Avx.Store(d + PackedSlot(c0 + 2, taps), Avx.Permute2x128(u2, u6, 0x20));
-        Avx.Store(d + PackedSlot(c0 + 3, taps), Avx.Permute2x128(u3, u7, 0x20));
-        Avx.Store(d + PackedSlot(c0 + 4, taps), Avx.Permute2x128(u0, u4, 0x31));
-        Avx.Store(d + PackedSlot(c0 + 5, taps), Avx.Permute2x128(u1, u5, 0x31));
-        Avx.Store(d + PackedSlot(c0 + 6, taps), Avx.Permute2x128(u2, u6, 0x31));
-        Avx.Store(d + PackedSlot(c0 + 7, taps), Avx.Permute2x128(u3, u7, 0x31));
+        Avx.Store(d + PackedSlot(c0, taps, vecStride), Avx.Permute2x128(u0, u4, 0x20));
+        Avx.Store(d + PackedSlot(c0 + 1, taps, vecStride), Avx.Permute2x128(u1, u5, 0x20));
+        Avx.Store(d + PackedSlot(c0 + 2, taps, vecStride), Avx.Permute2x128(u2, u6, 0x20));
+        Avx.Store(d + PackedSlot(c0 + 3, taps, vecStride), Avx.Permute2x128(u3, u7, 0x20));
+        Avx.Store(d + PackedSlot(c0 + 4, taps, vecStride), Avx.Permute2x128(u0, u4, 0x31));
+        Avx.Store(d + PackedSlot(c0 + 5, taps, vecStride), Avx.Permute2x128(u1, u5, 0x31));
+        Avx.Store(d + PackedSlot(c0 + 6, taps, vecStride), Avx.Permute2x128(u2, u6, 0x31));
+        Avx.Store(d + PackedSlot(c0 + 7, taps, vecStride), Avx.Permute2x128(u3, u7, 0x31));
     }
 
     // Largest kernel (taps) the two-transpose input-gradient pack stages on the stack (7x7).
     private const int MaxTransposePackTaps = 49;
 
     [MethodImpl(HotInline)]
-    private static int PackedSlot(int column, int taps) => ((column % taps) * Block + column / taps) * Block;
+    private static int PackedSlot(int column, int taps, int vecStride) => ((column % taps) * Block + column / taps) * vecStride;
 
     [MethodImpl(HotInline)]
     private static unsafe void StoreRow(float* d, bool accumulate, Vector256<float> v)

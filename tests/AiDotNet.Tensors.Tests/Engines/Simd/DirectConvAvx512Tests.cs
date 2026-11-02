@@ -55,21 +55,29 @@ public class DirectConvAvx512Tests
         var w = Random(rng, outChannels, inChannels, kernel, kernel);
         var dy = Random(rng, batch, outChannels, o, o);
         bool previous = DirectConvAvx2.s_useAvx512, previousForce = DirectConvAvx2.s_forceAvx512ForTest;
+        bool previousInterleave = DirectConvAvx2.s_interleave512;
         try
         {
             DirectConvAvx2.s_useAvx512 = true;
             DirectConvAvx2.s_forceAvx512ForTest = !System.Runtime.Intrinsics.Vector512.IsHardwareAccelerated;
+            DirectConvAvx2.s_interleave512 = true;
             var (y512, dx512, dw512) = Run(x, w, dy, batch, inChannels, outChannels, size, stride, padding, kernel, dilation, o);
+            // The 512-bit tile over the AVX2 weight layout (each 16-lane vector joined from two 8-lane blocks).
+            DirectConvAvx2.s_interleave512 = false;
+            var (y512b, dx512b, _) = Run(x, w, dy, batch, inChannels, outChannels, size, stride, padding, kernel, dilation, o);
             DirectConvAvx2.s_useAvx512 = false;
             var (y256, dx256, dw256) = Run(x, w, dy, batch, inChannels, outChannels, size, stride, padding, kernel, dilation, o);
             Assert.Equal(y256, y512);
             Assert.Equal(dx256, dx512);
             Assert.Equal(dw256, dw512);
+            Assert.Equal(y256, y512b);
+            Assert.Equal(dx256, dx512b);
         }
         finally
         {
             DirectConvAvx2.s_useAvx512 = previous;
             DirectConvAvx2.s_forceAvx512ForTest = previousForce;
+            DirectConvAvx2.s_interleave512 = previousInterleave;
         }
     }
 
