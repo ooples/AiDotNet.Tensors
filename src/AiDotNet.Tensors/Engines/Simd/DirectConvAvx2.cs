@@ -874,16 +874,17 @@ internal static partial class DirectConvAvx2
                         for (int q = runStart; q < runEnd;)
                         {
                             int i = q - runStart;
-                            // Twelve positions along one grid row of a stride-1 conv sit Block floats apart: one pointer
-                            // addresses them all, and the row kernel keeps 24 accumulators.
+                            // Twelve positions of a stride-1 conv as three groups of four consecutive along a grid row
+                            // (a row of twelve, or 8 + 4 on an 8-wide plane, or three rows of a 4-wide one): a pointer per
+                            // group, 24 accumulators, each weight load feeding twelve positions instead of the sextet's six.
                             if (rowKernel && runEnd - q >= RowPositions512
-                                && origin[i + RowPositions512 - 1] == origin[i] + (RowPositions512 - 1) * Block)
+                                && QuadGroup(origin + i) && QuadGroup(origin + i + 4) && QuadGroup(origin + i + 8))
                             {
                                 if (interleaved)
-                                    ForwardRowRun512<Interleaved512>(px + origin[i], passKernel, blockStride, cbEnd - cb0, cb0 * planeIn, planeIn,
+                                    ForwardRowRun512<Interleaved512>(px + origin[i], px + origin[i + 4], px + origin[i + 8], passKernel, blockStride, cbEnd - cb0, cb0 * planeIn, planeIn,
                                         kernelHeight, kernelWidth, rowStep, colStep, stage + i * 32, cb0 > 0);
                                 else
-                                    ForwardRowRun512<Blocked512>(px + origin[i], passKernel, blockStride, cbEnd - cb0, cb0 * planeIn, planeIn,
+                                    ForwardRowRun512<Blocked512>(px + origin[i], px + origin[i + 4], px + origin[i + 8], passKernel, blockStride, cbEnd - cb0, cb0 * planeIn, planeIn,
                                         kernelHeight, kernelWidth, rowStep, colStep, stage + i * 32, cb0 > 0);
                                 q += RowPositions512;
                                 continue;
@@ -1107,7 +1108,7 @@ internal static partial class DirectConvAvx2
     /// FMA chain is the AVX2 kernel's: bit-identical results.
     /// </summary>
     [MethodImpl(Hot)]
-    private static unsafe void ForwardRowRun512<TLayout>(float* x, float* w, long blockStride, int blocks,
+    private static unsafe void ForwardRowRun512<TLayout>(float* x, float* x4, float* x8, float* w, long blockStride, int blocks,
         int firstBlockOffset, int planeIn, int kernelHeight, int kernelWidth, int rowStep, int colStep,
         float* slot, bool seeded) where TLayout : struct, IWeightLayout512
     {
@@ -1141,7 +1142,8 @@ internal static partial class DirectConvAvx2
                 int rowOffset = blockOffset + y * rowStep;
                 for (int t = 0; t < kernelWidth; t++)
                 {
-                    float* p = x + rowOffset + t * colStep;
+                    int tapOffset = rowOffset + t * colStep;
+                    float* p = x + tapOffset, q = x4 + tapOffset, r = x8 + tapOffset;
                     for (int c = 0; c < Block; c++)
                     {
                         // Output channels 0-15 of the tile, then 16-31 (see IWeightLayout512).
@@ -1152,14 +1154,14 @@ internal static partial class DirectConvAvx2
                         b = Vector512.Create(p[8 + c]); a1l = Vector512.FusedMultiplyAdd(b, wl, a1l); a1h = Vector512.FusedMultiplyAdd(b, wh, a1h);
                         b = Vector512.Create(p[16 + c]); a2l = Vector512.FusedMultiplyAdd(b, wl, a2l); a2h = Vector512.FusedMultiplyAdd(b, wh, a2h);
                         b = Vector512.Create(p[24 + c]); a3l = Vector512.FusedMultiplyAdd(b, wl, a3l); a3h = Vector512.FusedMultiplyAdd(b, wh, a3h);
-                        b = Vector512.Create(p[32 + c]); a4l = Vector512.FusedMultiplyAdd(b, wl, a4l); a4h = Vector512.FusedMultiplyAdd(b, wh, a4h);
-                        b = Vector512.Create(p[40 + c]); a5l = Vector512.FusedMultiplyAdd(b, wl, a5l); a5h = Vector512.FusedMultiplyAdd(b, wh, a5h);
-                        b = Vector512.Create(p[48 + c]); a6l = Vector512.FusedMultiplyAdd(b, wl, a6l); a6h = Vector512.FusedMultiplyAdd(b, wh, a6h);
-                        b = Vector512.Create(p[56 + c]); a7l = Vector512.FusedMultiplyAdd(b, wl, a7l); a7h = Vector512.FusedMultiplyAdd(b, wh, a7h);
-                        b = Vector512.Create(p[64 + c]); a8l = Vector512.FusedMultiplyAdd(b, wl, a8l); a8h = Vector512.FusedMultiplyAdd(b, wh, a8h);
-                        b = Vector512.Create(p[72 + c]); a9l = Vector512.FusedMultiplyAdd(b, wl, a9l); a9h = Vector512.FusedMultiplyAdd(b, wh, a9h);
-                        b = Vector512.Create(p[80 + c]); a10l = Vector512.FusedMultiplyAdd(b, wl, a10l); a10h = Vector512.FusedMultiplyAdd(b, wh, a10h);
-                        b = Vector512.Create(p[88 + c]); a11l = Vector512.FusedMultiplyAdd(b, wl, a11l); a11h = Vector512.FusedMultiplyAdd(b, wh, a11h);
+                        b = Vector512.Create(q[c]); a4l = Vector512.FusedMultiplyAdd(b, wl, a4l); a4h = Vector512.FusedMultiplyAdd(b, wh, a4h);
+                        b = Vector512.Create(q[8 + c]); a5l = Vector512.FusedMultiplyAdd(b, wl, a5l); a5h = Vector512.FusedMultiplyAdd(b, wh, a5h);
+                        b = Vector512.Create(q[16 + c]); a6l = Vector512.FusedMultiplyAdd(b, wl, a6l); a6h = Vector512.FusedMultiplyAdd(b, wh, a6h);
+                        b = Vector512.Create(q[24 + c]); a7l = Vector512.FusedMultiplyAdd(b, wl, a7l); a7h = Vector512.FusedMultiplyAdd(b, wh, a7h);
+                        b = Vector512.Create(r[c]); a8l = Vector512.FusedMultiplyAdd(b, wl, a8l); a8h = Vector512.FusedMultiplyAdd(b, wh, a8h);
+                        b = Vector512.Create(r[8 + c]); a9l = Vector512.FusedMultiplyAdd(b, wl, a9l); a9h = Vector512.FusedMultiplyAdd(b, wh, a9h);
+                        b = Vector512.Create(r[16 + c]); a10l = Vector512.FusedMultiplyAdd(b, wl, a10l); a10h = Vector512.FusedMultiplyAdd(b, wh, a10h);
+                        b = Vector512.Create(r[24 + c]); a11l = Vector512.FusedMultiplyAdd(b, wl, a11l); a11h = Vector512.FusedMultiplyAdd(b, wh, a11h);
                         w += default(TLayout).Step;
                     }
                 }
@@ -1181,7 +1183,7 @@ internal static partial class DirectConvAvx2
 #else
     private const int RowPositions512 = 12;
     internal static bool s_useRowKernel512;
-    private static unsafe void ForwardRowRun512<TLayout>(float* x, float* w, long blockStride, int blocks,
+    private static unsafe void ForwardRowRun512<TLayout>(float* x, float* x4, float* x8, float* w, long blockStride, int blocks,
         int firstBlockOffset, int planeIn, int kernelHeight, int kernelWidth, int rowStep, int colStep,
         float* slot, bool seeded) where TLayout : struct, IWeightLayout512 => throw new PlatformNotSupportedException();
 #endif
@@ -1231,6 +1233,11 @@ internal static partial class DirectConvAvx2
     /// </summary>
     private static bool Interleave512(int packedOut)
         => s_interleave512 && UseAvx512Forward && s_stagedStore && packedOut % (Block * OutputBlocksPerTile) == 0;
+
+    /// <summary>Whether the four positions at <paramref name="origin"/> are consecutive along one grid row (Block apart).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe bool QuadGroup(int* origin)
+        => origin[1] == origin[0] + Block && origin[2] == origin[0] + 2 * Block && origin[3] == origin[0] + 3 * Block;
 
     /// <summary>Positions per <see cref="ForwardSextetRun512"/> call.</summary>
     private const int Avx512Positions = 6;
