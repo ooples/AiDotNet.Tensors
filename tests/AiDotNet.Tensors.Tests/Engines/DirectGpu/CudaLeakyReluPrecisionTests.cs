@@ -20,11 +20,12 @@ public sealed class CudaLeakyReluPrecisionTests
             return;
         }
         using (backend)
-        using (var a = backend.AllocateBuffer(new[] { 1.0003f }))
-        using (var b = backend.AllocateBuffer(new[] { -1.0003f }))
-        using (var bias = backend.AllocateBuffer(new[] { 0f }))
-        using (var output = backend.GemmBiasLeakyRelu(a, b, bias, 1, 1, 1, alpha))
         {
+            Skip.IfNot(backend.IsAvailable, "CUDA backend is not available on this host.");
+            using var a = backend.AllocateBuffer(new[] { 1.0003f });
+            using var b = backend.AllocateBuffer(new[] { -1.0003f });
+            using var bias = backend.AllocateBuffer(new[] { 0f });
+            using var output = backend.GemmBiasLeakyRelu(a, b, bias, 1, 1, 1, alpha);
             float expected = 1.0003f * -1.0003f * alpha;
             float actual = backend.DownloadBuffer(output)[0];
             Assert.True(Math.Abs(actual - expected) <= 1e-6f,
