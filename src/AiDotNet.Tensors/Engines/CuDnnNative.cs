@@ -418,6 +418,22 @@ public static class CuDnnNative
         out int returnedAlgoCount,
         IntPtr perfResults);
 
+    /// <summary>
+    /// One result of <see cref="cudnnGetConvolutionForwardAlgorithm_v7"/>: cudnnConvolutionFwdAlgoPerf_t, 48 bytes
+    /// (algo, status, time, then size_t memory at offset 16, determinism, mathType, three reserved ints).
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct CudnnConvolutionFwdAlgoPerf
+    {
+        public CudnnConvolutionFwdAlgo Algo;
+        public CudnnStatus Status;
+        public float Time;
+        public UIntPtr Memory;
+        public int Determinism;
+        public CudnnMathType MathType;
+        private int _reserved0, _reserved1, _reserved2;
+    }
+
     /// <summary>Gets workspace size for convolution forward.</summary>
     [DllImport(CudnnLibrary, EntryPoint = "cudnnGetConvolutionForwardWorkspaceSize")]
     public static extern CudnnStatus cudnnGetConvolutionForwardWorkspaceSize(
@@ -1685,6 +1701,86 @@ public sealed class CuDnnConvolution : IDisposable
     // call can't reallocate the device buffer while another call still has
     // the pointer in flight inside cudnnConvolutionForward.
     private readonly object _workspaceLock = new();
+
+    // cuDNN's heuristic forward algorithm per (n, c, h, w, k, r, s, pads, strides, dilations, data type, math type).
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<
+        (int, int, int, int, int, int, int, int, int, int, int, int, int, int, int), CuDnnNative.CudnnConvolutionFwdAlgo>
+        _heuristicForward = new();
+
+    // AIDOTNET_CUDNN_FWD_HEURISTIC=0 restores the fixed implicit-precomp GEMM default. Settable for tests.
+    internal static bool HeuristicForwardEnabled { get; set; } =
+        Environment.GetEnvironmentVariable("AIDOTNET_CUDNN_FWD_HEURISTIC") != "0";
+
+    /// <summary>
+    /// The algorithm <see cref="Conv2DForwardGpu"/> runs for this shape when no algorithm is given (a host-side query;
+    /// no device memory is touched).
+    /// </summary>
+    internal CuDnnNative.CudnnConvolutionFwdAlgo DefaultForwardAlgorithm(int n, int c, int h, int w, int k, int filterH,
+        int filterW, int padH, int padW, int strideH, int strideW, int dilationH, int dilationW,
+        CuDnnNative.CudnnDataType dataType, CuDnnNative.CudnnMathType mathType)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CuDnnConvolution));
+        using var inputDesc = new CuDnnTensorDescriptor();
+        using var filterDesc = new CuDnnFilterDescriptor();
+        using var convDesc = new CuDnnConvolutionDescriptor();
+        using var outputDesc = new CuDnnTensorDescriptor();
+        inputDesc.Set4D(dataType, n, c, h, w);
+        filterDesc.Set4D(dataType, k, c, filterH, filterW);
+        SetConvolution(convDesc, padH, padW, strideH, strideW, dilationH, dilationW, mathType);
+        CuDnnContext.CheckStatus(CuDnnNative.cudnnGetConvolution2dForwardOutputDim(convDesc.Handle, inputDesc.Handle,
+            filterDesc.Handle, out int on, out int oc, out int oh, out int ow), "GetConvolution2dForwardOutputDim");
+        outputDesc.Set4D(dataType, on, oc, oh, ow);
+        return HeuristicForwardAlgorithm(inputDesc.Handle, filterDesc.Handle, convDesc.Handle, outputDesc.Handle, mathType,
+            (n, c, h, w, k, filterH, filterW, padH, padW, strideH, strideW, dilationH, dilationW, (int)dataType, (int)mathType));
+    }
+
+    // The bound the backend's convolution slots put on a cuDNN algorithm's workspace (CudnnCandidateMaxWorkspace).
+    internal const ulong HeuristicMaxWorkspace = 256UL << 20;
+
+    /// <summary>
+    /// cuDNN's ranked heuristic for the shape (cudnnGetConvolutionForwardAlgorithm_v7, a host-side query): the first
+    /// supported result in the requested math type within <see cref="HeuristicMaxWorkspace"/>. Under FMA (strict fp32)
+    /// a tensor-op result is never taken. Falls back to implicit-precomp GEMM, the previous fixed default.
+    /// </summary>
+    private CuDnnNative.CudnnConvolutionFwdAlgo HeuristicForwardAlgorithm(IntPtr x, IntPtr wDesc, IntPtr conv, IntPtr y,
+        CuDnnNative.CudnnMathType mathType,
+        (int, int, int, int, int, int, int, int, int, int, int, int, int, int, int) key)
+    {
+        if (!HeuristicForwardEnabled) return CuDnnNative.CudnnConvolutionFwdAlgo.ImplicitPrecompGemm;
+        if (_heuristicForward.TryGetValue(key, out var cached)) return cached;
+        var chosen = CuDnnNative.CudnnConvolutionFwdAlgo.ImplicitPrecompGemm;
+        const int requested = (int)CuDnnNative.CudnnConvolutionFwdAlgo.Count * 2;
+        int size = Marshal.SizeOf<CuDnnNative.CudnnConvolutionFwdAlgoPerf>();
+        IntPtr results = Marshal.AllocHGlobal(size * requested);
+        try
+        {
+            var status = CuDnnNative.cudnnGetConvolutionForwardAlgorithm_v7(_context.Handle, x, wDesc, conv, y, requested,
+                out int returned, results);
+            if (status == CuDnnNative.CudnnStatus.Success)
+                for (int i = 0; i < Math.Min(returned, requested); i++)
+                {
+                    var perf = Marshal.PtrToStructure<CuDnnNative.CudnnConvolutionFwdAlgoPerf>(results + i * size);
+                    if (perf.Status != CuDnnNative.CudnnStatus.Success) continue;
+                    if ((ulong)perf.Memory > HeuristicMaxWorkspace) continue;
+                    bool tensorOp = perf.MathType == CuDnnNative.CudnnMathType.TensorOp
+                        || perf.MathType == CuDnnNative.CudnnMathType.TensorOpAllowConversion;
+                    if (tensorOp && mathType != CuDnnNative.CudnnMathType.TensorOp
+                        && mathType != CuDnnNative.CudnnMathType.TensorOpAllowConversion) continue;
+                    chosen = perf.Algo;
+                    break;
+                }
+        }
+        catch (EntryPointNotFoundException)
+        {
+            // A cuDNN without the v7 heuristic: keep the fixed default.
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(results);
+        }
+        _heuristicForward[key] = chosen;
+        return chosen;
+    }
     private readonly List<(IntPtr Pointer, DevicePrimitives.DeviceMemoryHold Memory)> _retiredWorkspaces = new();
     private IntPtr _workspace;
     private ulong _workspaceSize;
@@ -1891,15 +1987,15 @@ public sealed class CuDnnConvolution : IDisposable
 
         outputDesc.Set4D(dataType, cudnnOutN, cudnnOutC, cudnnOutH, cudnnOutW);
 
-        // Algorithm selection — use ImplicitPrecompGemm as a stable default;
-        // fall back to Gemm if workspace query fails on this size. A future
-        // autotune hook picks the per-shape winner via
-        // cudnnGetConvolutionForwardAlgorithm_v7, caches it in
-        // AutotuneCache, and reuses. Tracked separately; this hot path
-        // is correct today with the default algorithm.
+        // Algorithm selection: an explicit algorithm as asked; otherwise cuDNN's own heuristic choice for the shape and
+        // math type (what PyTorch runs with cudnn.benchmark off), cached per shape. This is the convolution slots'
+        // reference and the route served once the online tuning budget is spent, so a fixed implicit-precomp GEMM there
+        // cost 1.7-3.2x against the heuristic's pick on shapes the budget never reached (RTX 3080, #1649).
+        // If the workspace query fails on this size, fall back to Gemm.
         var algo = algorithm >= 0
             ? (CuDnnNative.CudnnConvolutionFwdAlgo)algorithm
-            : CuDnnNative.CudnnConvolutionFwdAlgo.ImplicitPrecompGemm;
+            : HeuristicForwardAlgorithm(inputDesc.Handle, filterDesc.Handle, convDesc.Handle, outputDesc.Handle, mathType,
+                (n, c, h, w, k, filterH, filterW, padH, padW, strideH, strideW, dilationH, dilationW, (int)dataType, (int)mathType));
         ulong workspaceSize;
         status = CuDnnNative.cudnnGetConvolutionForwardWorkspaceSize(
             _context.Handle, inputDesc.Handle, filterDesc.Handle,
