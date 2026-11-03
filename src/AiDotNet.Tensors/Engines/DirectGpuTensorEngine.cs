@@ -29380,7 +29380,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 int rows = indices.Length;
                 int elementCount = checked(rows * depth);
-                var contiguousIndices = indices.IsContiguous ? indices : (Tensor<int>)indices.Contiguous();
+                var contiguousIndices = indices.IsContiguous ? indices : indices.Contiguous();
                 using var indicesBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices);
                 return DispatchDeferredGpuOp<T>(backend, elementCount, new[] { rows, depth },
                     output => oneHotBackend.OneHotInt32(indicesBuffer.Buffer, output, rows, depth));
