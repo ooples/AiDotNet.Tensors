@@ -15038,6 +15038,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new ArgumentNullException(nameof(mQuant));
         if (paramLength <= 0 || blockSize <= 0 || numBlocks <= 0)
             throw new ArgumentOutOfRangeException(nameof(paramLength));
+        if (numBlocks != (int)(((long)paramLength + blockSize - 1) / blockSize))
+            throw new ArgumentException("numBlocks must match the parameter length and block size.", nameof(numBlocks));
 
         if (!_kernelCache.TryGetValue("adam8bit_update", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: adam8bit_update");

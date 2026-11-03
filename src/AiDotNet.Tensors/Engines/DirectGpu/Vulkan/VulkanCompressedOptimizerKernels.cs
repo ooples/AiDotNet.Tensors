@@ -159,7 +159,7 @@ void main() {
     for (uint i = start + lid; i < end; i += 256u) {
         float oldM = firstStep ? 0.0 : adam8_dec_s(load_byte(m_quant[i >> 2u], i)) * oldMScale;
         float oldV = firstStep ? 0.0 : adam8_dec_u(load_byte(v_quant[i >> 2u], i)) * oldVScale;
-        float g = pc.decoupled != 0u ? grad[i] : grad[i] + pc.weightDecay * param[i];
+        float g = (pc.decoupled != 0u || pc.weightDecay == 0.0) ? grad[i] : grad[i] + pc.weightDecay * param[i];
         float newM = pc.beta1 * oldM + pc.oneMinusBeta1 * g;
         float newV = pc.beta2 * oldV + pc.oneMinusBeta2 * g * g;
         localMaxM = max(localMaxM, abs(newM));
@@ -188,7 +188,7 @@ void main() {
     for (uint i = start + lid; i < end; i += 256u) {
         float oldM = firstStep ? 0.0 : adam8_dec_s(load_byte(m_quant[i >> 2u], i)) * oldMScale;
         float oldV = firstStep ? 0.0 : adam8_dec_u(load_byte(v_quant[i >> 2u], i)) * oldVScale;
-        float g = pc.decoupled != 0u ? grad[i] : grad[i] + pc.weightDecay * param[i];
+        float g = (pc.decoupled != 0u || pc.weightDecay == 0.0) ? grad[i] : grad[i] + pc.weightDecay * param[i];
         float newM = pc.beta1 * oldM + pc.oneMinusBeta1 * g;
         float newV = pc.beta2 * oldV + pc.oneMinusBeta2 * g * g;
 

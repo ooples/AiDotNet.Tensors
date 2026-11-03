@@ -346,6 +346,8 @@ public static class GpuOptimizer
     {
         if (p is null) throw new ArgumentNullException(nameof(p));
         if (g is null) throw new ArgumentNullException(nameof(g));
+        if (p.Length != g.Length)
+            throw new ArgumentException("param and grad must have the same length.", nameof(g));
         if (blockSize <= 0) throw new ArgumentOutOfRangeException(nameof(blockSize));
         // The four state buffers are optional inputs: a null one means the caller
         // hasn't allocated GPU-resident 8-bit Adam state, so signal CPU fallback
@@ -353,12 +355,16 @@ public static class GpuOptimizer
         if (mQ is null || vQ is null || mScales is null || vScales is null) return false;
         if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; using var __gpuOp = e.EnterGpuOp();
         if (e.GetBackend() is not ICompressedMomentGpuOptimizerBackend cb) return false;
-        var pb = p.TryGetGpuBuffer(); var gb = g.TryGetGpuBuffer();
+        var gb = g.TryGetGpuBuffer();
+        if (gb is null) return false;
+        bool flatView = DirectGpuTensorEngine.IsFlatParameterView(p);
+        var pb = flatView ? e.AcquireParameterBuffer(p, out _) : p.TryGetGpuBuffer();
         if (pb is null || gb is null) return false;
-        int nb = (p.Length + blockSize - 1) / blockSize;
+        int nb = HostCompressedMomentAdam.BlockCount(p.Length, blockSize);
         cb.Adam8BitUpdate(pb, gb, mQ, vQ, mScales, vScales,
             lr, beta1, beta2, epsilon, 1f - beta1, 1f - beta2, biasCorrection1, biasCorrection2, blockSize, p.Length, nb);
-        MarkGpuUpdated(cb, p);
+        if (flatView) MarkParameterUpdated(e, cb, p, pb);
+        else MarkGpuUpdated(cb, p);
         return true;
     }
 
@@ -376,6 +382,8 @@ public static class GpuOptimizer
     {
         if (p is null) throw new ArgumentNullException(nameof(p));
         if (g is null) throw new ArgumentNullException(nameof(g));
+        if (p.Length != g.Length)
+            throw new ArgumentException("param and grad must have the same length.", nameof(g));
         if (blockSize <= 0) throw new ArgumentOutOfRangeException(nameof(blockSize));
         if (mQ is null || vQ is null || mScales is null || vScales is null) return false;
         if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; using var __gpuOp = e.EnterGpuOp();
@@ -383,13 +391,17 @@ public static class GpuOptimizer
         if (backend is not IAdam8BitWeightDecayBackend db)
             return weightDecay == 0f
                 && TryAdam8BitStep(p, g, mQ, vQ, mScales, vScales, lr, beta1, beta2, epsilon, biasCorrection1, biasCorrection2, blockSize);
-        var pb = p.TryGetGpuBuffer(); var gb = g.TryGetGpuBuffer();
+        var gb = g.TryGetGpuBuffer();
+        if (gb is null) return false;
+        bool flatView = DirectGpuTensorEngine.IsFlatParameterView(p);
+        var pb = flatView ? e.AcquireParameterBuffer(p, out _) : p.TryGetGpuBuffer();
         if (pb is null || gb is null) return false;
-        int nb = (p.Length + blockSize - 1) / blockSize;
+        int nb = HostCompressedMomentAdam.BlockCount(p.Length, blockSize);
         db.Adam8BitUpdate(pb, gb, mQ, vQ, mScales, vScales,
             lr, beta1, beta2, epsilon, 1f - beta1, 1f - beta2, biasCorrection1, biasCorrection2, blockSize, p.Length, nb,
             weightDecay, decoupledWeightDecay);
-        MarkGpuUpdated(db, p);
+        if (flatView) MarkParameterUpdated(e, db, p, pb);
+        else MarkGpuUpdated(db, p);
         return true;
     }
 
@@ -432,17 +444,23 @@ public static class GpuOptimizer
     {
         if (p is null) throw new ArgumentNullException(nameof(p));
         if (g is null) throw new ArgumentNullException(nameof(g));
+        if (p.Length != g.Length)
+            throw new ArgumentException("param and grad must have the same length.", nameof(g));
         if (step < 1) throw new ArgumentOutOfRangeException(nameof(step), step, "The Adam step is 1-based.");
         if (m is null || v is null) return false;
         if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; using var __gpuOp = e.EnterGpuOp();
         if (e.GetBackend() is not ICompressedMomentGpuOptimizerBackend cb) return false;
-        var pb = p.TryGetGpuBuffer(); var gb = g.TryGetGpuBuffer();
+        var gb = g.TryGetGpuBuffer();
+        if (gb is null) return false;
+        bool flatView = DirectGpuTensorEngine.IsFlatParameterView(p);
+        var pb = flatView ? e.AcquireParameterBuffer(p, out _) : p.TryGetGpuBuffer();
         if (pb is null || gb is null) return false;
         if (decoupledWeightDecay)
             cb.AdamWUpdateBf16(pb, gb, m, v, lr, beta1, beta2, epsilon, weightDecay, step, p.Length);
         else
             cb.AdamUpdateBf16(pb, gb, m, v, lr, beta1, beta2, epsilon, weightDecay, step, p.Length);
-        MarkGpuUpdated(cb, p);
+        if (flatView) MarkParameterUpdated(e, cb, p, pb);
+        else MarkGpuUpdated(cb, p);
         return true;
     }
 
