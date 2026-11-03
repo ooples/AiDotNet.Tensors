@@ -25,8 +25,9 @@ These numbers come from `--ptx-campaign measure`, which uses production routing'
 | GEMM-large | 2048³ | $21.83 | 4 / 4 | 1.0005x | not promoted; median 1.000x, lower 5% 0.949x |
 | GEMM in-graph | 128x4096x4096 | $50.00 | 7 / 9 | 1.017x | not promoted; median 1.018x, lower 5% 1.012x |
 | conv 3x3 | 64->64 ch, 16x16 | $7.27 | 16 / 0 | 1.441x | **qualifies**: median 1.299x, lower 5% 1.161x |
+| conv 3x3, continuation | 64->64 ch, 16x16, seeded from the first winner | $42.96 | 58 / 1 (+38 refused for budget) | 1.516x | not promoted by the verdict rule: median 1.376x, lower 5% 0.983x; per-route timing below |
 
-Total spend: $79.10 of the $150 approved.
+Total spend: $122.06. The first three campaigns spent $79.10 of the $150 approved. The continuation was approved for the remaining $42.73 of the conv budget and spent $42.96: calls already in flight when the cap was reached charged $0.23 over it.
 
 ### Conv 3x3 winner against `backend.Conv2D` (same buffers, output checked first)
 
@@ -65,3 +66,22 @@ The verdict's re-tune picked a different kernel (`b128x64x32` split), so the cam
 5. **The vendor comparison could be empty or vacuous.** The GEMM verdict went through production routing's own re-tune, so it described a different kernel, or nothing. The verdict now times the campaign's incumbent and winner directly. The output check writes the generated kernel into its own buffer: a kernel that wrote nothing into the vendor's buffer would otherwise match.
 
 GEMM-large ran before fixes 2-5, and GEMM in-graph before 3-5. Both stopped at their generation limit (8 and 16).
+
+## Conv 3x3 continuation (2026-11-02)
+
+Command: `--ptx-campaign conv3x3 --seed-ptx=conv3x3-winner.ptx --generations=96 --islands=2 --max-usd=42.73 --max-usd-per-call=5`, with a `--hint` naming the fused Winograd F(2,3) kernel (7.1 us in graph) as the route to beat. Binaries: main 205d6464 plus this branch's driver changes. Records: `conv3x3-2.campaign.jsonl`. Winner: `conv3x3-winner-2.ptx`.
+
+- Calls: 97 attempts. 58 were evaluated (57 completed) and 1 failed (the CLI exited with code 1). The last 38 were refused once the budget was reached. The stop reason is the generation limit (96).
+- Search fitness, best: 1.516x over the seed. The verdict re-measurement gave a median of 1.376x but a lower 5% of 0.983x (noise 1.383x), so the promotion rule did not pass.
+- The winner computes the same 576 FMAs per output. It splits the input channels across the block's warps and merges partial sums through 7.5 KB of shared memory (`merge_cache`). The last step (generation 52) retires warps 1-3 after the first barrier and uses a warp-scoped barrier for warp 0's merge. Resources: 96 registers, 7680 B static shared, no local memory.
+- Correctness: it matches the fp64 reference, and matches every route below to 1.7e-7 relative.
+
+Each route timed separately against the seed and the winner (paired rounds on the same buffers, RTX 3080, fp32; graph replay us, eager us in parentheses):
+
+| route | route | seed | winner | winner vs route (graph) |
+|---|---|---|---|---|
+| `nvrtc.conv2d.winograd_f23_fused` (what `backend.Conv2D` serves) | 7.13 (16.2) | 8.49 (10.2) | 4.42 (8.3) | **1.61x** |
+| `cudnn.conv2d.algo6` (best cuDNN algorithm) | 13.98 (120) | 8.57 (10.1) | 4.42 (8.0) | 3.15x |
+| `cudnn.conv2d.default` (implicit-precomp on main) | 22.77 (118) | 8.49 (10.1) | 4.43 (8.1) | 5.14x |
+
+The winner is shape-specialised (batch 1, 64 to 64 channels, 16x16) and is not wired into routing.
