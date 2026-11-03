@@ -314,6 +314,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
             }
             for (; i < length; i++)
                 dArr[i] *= Unsafe.As<T, double>(ref scalar);
+            NotifyWritten(); // the fast path writes the array directly; the base fallback notifies itself
             return;
         }
         if (arr is not null && typeof(T) == typeof(float) && Avx.IsSupported)
@@ -346,6 +347,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
             }
             for (; i < length; i++)
                 fArr[i] *= Unsafe.As<T, float>(ref scalar);
+            NotifyWritten();
             return;
         }
 #endif
@@ -399,6 +401,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
             }
             for (; i < length; i++)
                 dArr[i] += dOther[i];
+            NotifyWritten();
             return;
         }
 #endif
@@ -452,6 +455,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
             }
             for (; i < length; i++)
                 dArr[i] -= dOther[i];
+            NotifyWritten();
             return;
         }
 #endif

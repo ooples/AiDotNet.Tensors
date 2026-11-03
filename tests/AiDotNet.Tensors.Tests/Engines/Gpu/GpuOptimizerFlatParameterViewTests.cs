@@ -103,4 +103,52 @@ public sealed class GpuOptimizerFlatParameterViewTests : IClassFixture<DirectGpu
         // The flat vector reflects the same values (views and buffer share storage).
         Assert.Equal(views[1][0], buffer.AsVector()[shapes[0][0] * shapes[0][1]]);
     }
+
+    /// <summary>
+    /// A write through the vector <see cref="ParameterBuffer{T}.AsVector"/> returned, made after a GPU read uploaded
+    /// the flat array, must reach the next GPU read. The version was advanced only when AsVector returned, so the
+    /// device copy uploaded in between was reused with the old element.
+    /// </summary>
+    [SkippableFact]
+    public void WriteThroughAsVector_AfterAGpuRead_ReachesTheNextGpuRead()
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        var gpu = _fixture.Engine!;
+        int[][] shapes = { new[] { 4, 8 }, new[] { 8, 2 } };
+        var buffer = new ParameterBuffer<float>(shapes);
+        var views = buffer.CreateAllViews();
+        buffer.CopyFrom(new[] { Rand(shapes[0], 4), Rand(shapes[1], 5) });
+
+        var flat = buffer.AsVector();
+        Assert.Equal(views[1][3], gpu.TensorMultiplyScalar(views[1], 1f).ToArray()[3]);
+        int at = shapes[0][0] * shapes[0][1] + 3;
+        flat[at] = 42f;
+        Assert.Equal(42f, gpu.TensorMultiplyScalar(views[1], 1f).ToArray()[3]);
+        flat.MultiplyInPlace(2f);
+        Assert.Equal(84f, gpu.TensorMultiplyScalar(views[1], 1f).ToArray()[3]);
+    }
+
+    /// <summary>
+    /// The resident FP16 forward casts a ParameterBuffer parameter on the device, from its offset in the flat device
+    /// buffer. Views are never bound to a device buffer, so the cast declined every one and the caller cast on the
+    /// host each step.
+    /// </summary>
+    [SkippableFact]
+    public void ResidentHalfCast_OfAParameterBufferView_RunsOnTheDevice()
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        var gpu = _fixture.Engine!;
+        int[][] shapes = { new[] { 4, 8 }, new[] { 8, 2 } };
+        var buffer = new ParameterBuffer<float>(shapes);
+        var views = buffer.CreateAllViews();
+        buffer.CopyFrom(new[] { Rand(shapes[0], 6), Rand(shapes[1], 7) });
+
+        var half = new Tensor<Half>(shapes[1]);
+        Assert.True(gpu.TryCastResidentForwardHalf(views[1], half),
+            "the resident FP16 cast declined a ParameterBuffer view: " + string.Join("; ", GpuLaunchProbe.Fallbacks));
+        var got = half.ToArray();
+        var expected = views[1].ToArray();
+        for (int i = 0; i < got.Length; i++)
+            Assert.Equal((float)(Half)expected[i], (float)got[i]);
+    }
 }

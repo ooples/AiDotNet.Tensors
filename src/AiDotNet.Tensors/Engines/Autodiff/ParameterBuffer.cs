@@ -167,6 +167,7 @@ public sealed class ParameterBuffer<T>
         _totalSize = offset;
         _data = new Vector<T>(_totalSize);
         _storage = new TensorStorage<T>(_data) { IsParameterBuffer = true };
+        _data.SetWriteObserver(MarkHostWritten);
     }
 
     private static IReadOnlyList<ParameterLayout> WrapAsDenseLayouts(IReadOnlyList<int[]> shapes)
@@ -194,8 +195,9 @@ public sealed class ParameterBuffer<T>
     /// </summary>
     public Vector<T> AsVector()
     {
-        // The vector is mutable and writes through it bypass the views: treat the device copy as stale.
-        MarkHostWritten();
+        // The vector is mutable and writes through it bypass the views; its write observer (installed with the
+        // storage) advances the GPU-cache version on each write, so a write after a GPU read is not lost to the
+        // device copy uploaded before it.
         return _data;
     }
 
@@ -439,8 +441,10 @@ public sealed class ParameterBuffer<T>
         // now stale — callers must re-create views after a Resize. The
         // buffer's own read paths (CreateView, GetSparseValuesSpan, ...)
         // use _data which we update here.
+        _data.SetWriteObserver(null); // the old vector no longer backs this buffer
         _data = newData;
         _storage = new TensorStorage<T>(newData) { IsParameterBuffer = true };
+        newData.SetWriteObserver(MarkHostWritten);
         _totalSize = newTotal;
 
         _sparseLayouts[index] = newLayout;
@@ -476,92 +480,100 @@ public sealed class ParameterBuffer<T>
                 nameof(parameters));
 
         var bufferSpan = _data.AsWritableSpan();
-        // Before the copy, so a parameter that throws part-way still leaves the device copy marked stale.
+        // Before the copy, so a parameter that throws part-way still leaves the device copy marked stale, and again
+        // after it: a GPU read during the loop uploads a partly copied array under the first new version.
         MarkHostWritten();
-        for (int i = 0; i < parameters.Count; i++)
+        try
         {
-            var param = parameters[i];
-            var sparseLayout = _sparseLayouts[i];
-
-            if (sparseLayout is not null)
+            for (int i = 0; i < parameters.Count; i++)
             {
-                // Sparse leaf: source must be a SparseTensor<T> with the
-                // same pattern. Copy only the Values vector into the slot
-                // — the buffer slot was sized at NonZeroCount, not the
-                // full dense shape.
-                if (param is not SparseTensor<T> sparseParam)
-                    throw new ArgumentException(
-                        $"Parameter {i} is registered as sparse but the source tensor is dense. " +
-                        "Convert to SparseTensor with the matching COO pattern before copying.",
-                        nameof(parameters));
-                if (sparseParam.Rows != sparseLayout.Rows || sparseParam.Columns != sparseLayout.Columns)
-                    throw new ArgumentException(
-                        $"Parameter {i} sparse shape [{sparseParam.Rows}, {sparseParam.Columns}] " +
-                        $"does not match layout [{sparseLayout.Rows}, {sparseLayout.Columns}].",
-                        nameof(parameters));
-                // Validate the source's COO pattern matches our layout.
-                // Pattern is fixed at layer init; a mismatch here means the
-                // caller passed a different sparse tensor than the layer
-                // registered — fail loudly rather than silently copying
-                // values into wrong-pattern positions.
-                var coo = sparseParam.ToCoo();
-                if (coo.RowIndices.Length != sparseLayout.NonZeroCount)
-                    throw new ArgumentException(
-                        $"Parameter {i} non-zero count ({coo.RowIndices.Length}) does not match " +
-                        $"layout NonZeroCount ({sparseLayout.NonZeroCount}). The sparsity pattern " +
-                        "is fixed at construction time.",
-                        nameof(parameters));
-                // Hoist the no-alloc internal spans once so each k
-                // iteration is span-bounded indexing — using the public
-                // RowIndices.Span path would allocate a fresh int[]
-                // copy on every property access.
-                var layoutRows = sparseLayout.RowIndicesSpan;
-                var layoutCols = sparseLayout.ColumnIndicesSpan;
-                for (int k = 0; k < sparseLayout.NonZeroCount; k++)
+                var param = parameters[i];
+                var sparseLayout = _sparseLayouts[i];
+
+                if (sparseLayout is not null)
                 {
-                    if (coo.RowIndices[k] != layoutRows[k]
-                        || coo.ColumnIndices[k] != layoutCols[k])
-                    {
+                    // Sparse leaf: source must be a SparseTensor<T> with the
+                    // same pattern. Copy only the Values vector into the slot
+                    // — the buffer slot was sized at NonZeroCount, not the
+                    // full dense shape.
+                    if (param is not SparseTensor<T> sparseParam)
                         throw new ArgumentException(
-                            $"Parameter {i} COO pattern at index {k} differs from layout " +
-                            $"(source [{coo.RowIndices[k]}, {coo.ColumnIndices[k]}] vs layout " +
-                            $"[{layoutRows[k]}, {layoutCols[k]}]). " +
-                            "Sparsity pattern is fixed.",
+                            $"Parameter {i} is registered as sparse but the source tensor is dense. " +
+                            "Convert to SparseTensor with the matching COO pattern before copying.",
                             nameof(parameters));
+                    if (sparseParam.Rows != sparseLayout.Rows || sparseParam.Columns != sparseLayout.Columns)
+                        throw new ArgumentException(
+                            $"Parameter {i} sparse shape [{sparseParam.Rows}, {sparseParam.Columns}] " +
+                            $"does not match layout [{sparseLayout.Rows}, {sparseLayout.Columns}].",
+                            nameof(parameters));
+                    // Validate the source's COO pattern matches our layout.
+                    // Pattern is fixed at layer init; a mismatch here means the
+                    // caller passed a different sparse tensor than the layer
+                    // registered — fail loudly rather than silently copying
+                    // values into wrong-pattern positions.
+                    var coo = sparseParam.ToCoo();
+                    if (coo.RowIndices.Length != sparseLayout.NonZeroCount)
+                        throw new ArgumentException(
+                            $"Parameter {i} non-zero count ({coo.RowIndices.Length}) does not match " +
+                            $"layout NonZeroCount ({sparseLayout.NonZeroCount}). The sparsity pattern " +
+                            "is fixed at construction time.",
+                            nameof(parameters));
+                    // Hoist the no-alloc internal spans once so each k
+                    // iteration is span-bounded indexing — using the public
+                    // RowIndices.Span path would allocate a fresh int[]
+                    // copy on every property access.
+                    var layoutRows = sparseLayout.RowIndicesSpan;
+                    var layoutCols = sparseLayout.ColumnIndicesSpan;
+                    for (int k = 0; k < sparseLayout.NonZeroCount; k++)
+                    {
+                        if (coo.RowIndices[k] != layoutRows[k]
+                            || coo.ColumnIndices[k] != layoutCols[k])
+                        {
+                            throw new ArgumentException(
+                                $"Parameter {i} COO pattern at index {k} differs from layout " +
+                                $"(source [{coo.RowIndices[k]}, {coo.ColumnIndices[k]}] vs layout " +
+                                $"[{layoutRows[k]}, {layoutCols[k]}]). " +
+                                "Sparsity pattern is fixed.",
+                                nameof(parameters));
+                        }
                     }
+
+                    // Copy Values into the buffer slot.
+                    var valuesSrc = coo.DataVector.AsSpan()
+                        .Slice(coo._storageOffset, sparseLayout.NonZeroCount);
+                    var dst = bufferSpan.Slice(_offsets[i], sparseLayout.NonZeroCount);
+                    valuesSrc.CopyTo(dst);
+                    continue;
                 }
 
-                // Copy Values into the buffer slot.
-                var valuesSrc = coo.DataVector.AsSpan()
-                    .Slice(coo._storageOffset, sparseLayout.NonZeroCount);
-                var dst = bufferSpan.Slice(_offsets[i], sparseLayout.NonZeroCount);
-                valuesSrc.CopyTo(dst);
-                continue;
+                // Dense leaf — original path.
+                Tensor<T> contiguous;
+                if (param.IsSparse)
+                {
+                    // Caller registered this leaf as dense but is passing a
+                    // sparse tensor. Densify so the dense slot fills correctly.
+                    contiguous = ((SparseTensor<T>)param).ToDense();
+                }
+                else
+                {
+                    contiguous = param.IsContiguous ? param : param.Contiguous();
+                }
+                int expectedSize = 1;
+                foreach (int d in _shapes[i]) expectedSize *= d;
+                if (contiguous.Length != expectedSize)
+                    throw new ArgumentException(
+                        $"Parameter {i} length ({contiguous.Length}) does not match expected shape size. " +
+                        "Ensure parameter tensors match the shapes provided at buffer construction.");
+                var denseDst = bufferSpan.Slice(_offsets[i], expectedSize);
+                // Tensor.CopyTo owns logical-offset and streaming-materialization semantics. Reading
+                // DataVector and then applying _storageOffset again breaks when a streaming provider
+                // returns a vector already scoped to the logical tensor.
+                contiguous.CopyTo(denseDst);
             }
-
-            // Dense leaf — original path.
-            Tensor<T> contiguous;
-            if (param.IsSparse)
-            {
-                // Caller registered this leaf as dense but is passing a
-                // sparse tensor. Densify so the dense slot fills correctly.
-                contiguous = ((SparseTensor<T>)param).ToDense();
-            }
-            else
-            {
-                contiguous = param.IsContiguous ? param : param.Contiguous();
-            }
-            int expectedSize = 1;
-            foreach (int d in _shapes[i]) expectedSize *= d;
-            if (contiguous.Length != expectedSize)
-                throw new ArgumentException(
-                    $"Parameter {i} length ({contiguous.Length}) does not match expected shape size. " +
-                    "Ensure parameter tensors match the shapes provided at buffer construction.");
-            var denseDst = bufferSpan.Slice(_offsets[i], expectedSize);
-            // Tensor.CopyTo owns logical-offset and streaming-materialization semantics. Reading
-            // DataVector and then applying _storageOffset again breaks when a streaming provider
-            // returns a vector already scoped to the logical tensor.
-            contiguous.CopyTo(denseDst);
+        }
+        finally
+        {
+            MarkHostWritten();
         }
     }
 

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Linq;
 using System.Runtime.CompilerServices;
@@ -3933,15 +3933,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             flatBuffer = AcquireFlatDeviceBuffer(flat, backend, ft.GpuCacheVersion);
         }
         if (flatBuffer is null) return false;
-        if (backend is IGpuBufferViews views)
+        if (backend is IGpuBufferViews views && views.TryCreateView(flatBuffer, offset, t.Length) is { } v)
         {
-            var v = views.TryCreateView(flatBuffer, offset, t.Length);
-            if (v is null) return false;
             view = v;
             return true;
         }
-        // No sub-buffer views: copy the view's elements out of the flat buffer on the device, rather than downloading
-        // the whole flat array to slice it on the host.
+        // No sub-buffer view (none on this backend, or the offset is not aligned as OpenCL sub-buffers require): copy
+        // the view's elements out of the flat buffer on the device, rather than downloading the whole flat array to
+        // slice it on the host.
         var copy = backend.AllocateBuffer(t.Length);
         backend.Copy(flatBuffer, offset, copy, 0, t.Length);
         view = copy;
@@ -3980,7 +3979,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // elements. Views stay unbound and resolve from the flat buffer at their offset (TryResolveDeviceParameterView);
         // see CommitParameterUpdatedOnDevice for why a bound alias is not kept either.
         if (!param.IsContiguous || param._storage.IsParameterBuffer
-            || (TryGetFlatParameterView((Tensor<float>)(object)param, out _, out int viewOffset) && viewOffset != 0)) return;
+            || (param is Tensor<float> floatParam && TryGetFlatParameterView(floatParam, out _, out int viewOffset) && viewOffset != 0)) return;
 
         int hostVersion = param.GpuCacheVersion;
         PersistentTensorRole role = _persistentBufferCache.TryGetValue(arr, out var current)
@@ -4010,6 +4009,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (x is null || o is null || !TryGetBackend(out var backend)) return false;
         int n = x.Length;
         if (n == 0 || o.Length != n) return false;
+        IGpuBuffer? ownedX = null;
         try
         {
             IGpuBuffer? xbuf = null;
@@ -4028,6 +4028,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if ((persistent is not null && ReferenceEquals(persistent, x._gpuBuffer))
                     || IsCachedGpuBufferLive(x, backend))
                     xbuf = x._gpuBuffer;
+            }
+            // A ParameterBuffer parameter (or another view into a flat parameter array) is never bound: read it at its
+            // offset in the flat device buffer, which AcquireFlatDeviceBuffer keeps current against host writes, rather
+            // than taking the host cast every step.
+            if (xbuf is null && TryResolveDeviceParameterView(backend, x, out var parameterView, out bool parameterViewOwned))
+            {
+                xbuf = parameterView;
+                if (parameterViewOwned) ownedX = parameterView;
             }
             if (xbuf is null) return false;
             // Allocate the Half buffer via AllocateBuffer (a standard float-typed device buffer, over-allocated:
@@ -4076,6 +4084,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return true;
         }
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TryCastResidentForwardHalf", capabilityGap); return false; }
+        finally { ownedX?.Dispose(); }
     }
 
     /// <summary>Resident FP16 training (#633): device-copy gradient <paramref name="g"/> into a stable per-param
