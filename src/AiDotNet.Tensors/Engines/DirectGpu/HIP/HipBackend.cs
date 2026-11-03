@@ -11891,6 +11891,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2,
         int blockSize, int paramLength, int numBlocks, float weightDecay, bool decoupledWeightDecay)
     {
+        CompressedMomentBufferValidation.ValidateInt8(paramLength, blockSize, numBlocks,
+            param, gradient, mQuant, vQuant, mScales, vScales);
         if (!_kernelCache.TryGetValue("adam8bit_update", out var krnl))
             throw new GpuCapabilityUnavailableException("HIP kernel not found: adam8bit_update");
 

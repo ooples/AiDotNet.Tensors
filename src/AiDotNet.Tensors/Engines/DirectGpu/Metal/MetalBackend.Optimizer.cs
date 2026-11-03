@@ -171,6 +171,9 @@ public sealed partial class MetalBackend
         if (blockSize <= 0) throw new ArgumentOutOfRangeException(nameof(blockSize));
         if (numBlocks != (int)(((long)paramLength + blockSize - 1) / blockSize))
             throw new ArgumentException("numBlocks must match the parameter length and block size.", nameof(numBlocks));
+        CompressedMomentBufferValidation.ValidateInt8(paramLength, blockSize, numBlocks,
+            param, gradient, mQuant, vQuant, mScales, vScales);
+
         IntPtr library = GetCompressedOptLibrary();
         if (library == IntPtr.Zero)
             throw new GpuCapabilityUnavailableException("Metal compressed optimizer kernels are unavailable.");

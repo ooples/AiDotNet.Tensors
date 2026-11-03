@@ -97,6 +97,8 @@ public sealed unsafe partial class VulkanBackend
     {
         EnsureInitialized();
         if (paramLength <= 0 || numBlocks <= 0) return;
+        CompressedMomentBufferValidation.ValidateInt8(paramLength, blockSize, numBlocks,
+            param, gradient, mQuant, vQuant, mScales, vScales);
         GlslDispatchN(VulkanCompressedOptimizerKernels.Adam8Bit, checked(numBlocks * 256),
             new[] { param, gradient, mQuant, vQuant, mScales, vScales },
             new[] { (uint)paramLength, (uint)blockSize, (uint)numBlocks,

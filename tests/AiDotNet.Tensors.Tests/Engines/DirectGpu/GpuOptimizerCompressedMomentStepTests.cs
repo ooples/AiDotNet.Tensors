@@ -21,6 +21,50 @@ public class GpuOptimizerCompressedMomentStepTests
     private const int Length = 300;
     private const float Lr = 1e-2f, Beta1 = 0.9f, Beta2 = 0.99f, Eps = 1e-8f, WeightDecay = 0.1f;
 
+    private sealed class CapacityOnlyBuffer : IGpuBuffer
+    {
+        public CapacityOnlyBuffer(long bytes) => SizeInBytes = bytes;
+        public long SizeInBytes { get; }
+        public int Size => 1024;
+        public IntPtr Handle => IntPtr.Zero;
+        public void Dispose() { }
+    }
+
+    [Theory]
+    [InlineData("mQ")]
+    [InlineData("vQ")]
+    [InlineData("mScales")]
+    [InlineData("vScales")]
+    [InlineData("m")]
+    [InlineData("v")]
+    public void CompressedSteps_RejectUndersizedStateBeforeAnyDeviceAccess(string shortBuffer)
+    {
+        var p = new Tensor<float>(new[] { 4 });
+        var g = new Tensor<float>(new[] { 4 });
+        IGpuBuffer State(string name, long bytes) => new CapacityOnlyBuffer(bytes - (name == shortBuffer ? 1 : 0));
+        if (shortBuffer == "m" || shortBuffer == "v")
+        {
+            var error = Assert.Throws<ArgumentException>(() => GpuOptimizer.TryAdamBf16Step(p, g,
+                State("m", 8), State("v", 8), Lr, Beta1, Beta2, Eps, WeightDecay, 1, true));
+            Assert.Equal(shortBuffer, error.ParamName);
+        }
+        else
+        {
+            foreach (bool decayOverload in new[] { false, true })
+            {
+                var error = Assert.Throws<ArgumentException>(() =>
+                {
+                    if (decayOverload) GpuOptimizer.TryAdam8BitStep(p, g, State("mQ", 4), State("vQ", 4),
+                        State("mScales", 8), State("vScales", 8), Lr, Beta1, Beta2, Eps, 0.1f, 0.01f, 2, WeightDecay, true);
+                    else GpuOptimizer.TryAdam8BitStep(p, g, State("mQ", 4), State("vQ", 4),
+                        State("mScales", 8), State("vScales", 8), Lr, Beta1, Beta2, Eps, 0.1f, 0.01f, 2);
+                });
+                Assert.Equal(shortBuffer, error.ParamName);
+            }
+        }
+        Assert.Equal(new float[4], p.ToArray());
+    }
+
     private static float[] Rand(int n, int seed, double scale = 1.0)
     {
         var rng = new Random(seed);
@@ -57,6 +101,50 @@ public class GpuOptimizerCompressedMomentStepTests
     /// <summary>Puts a host array on the device as a GPU-resident tensor (the result of a device op).</summary>
     private static Tensor<float> OnDevice(DirectGpuTensorEngine gpu, float[] values)
         => gpu.TensorMultiplyScalar(new Tensor<float>(new[] { values.Length }, new Vector<float>(values)), 1f);
+
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void NonFlatHostParameter_ReadsBackTheCompressedDeviceUpdate(bool bf16)
+    {
+        using var gpu = TryGpu();
+        Skip.If(gpu is null, "GPU engine unavailable.");
+        var saved = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = gpu!;
+        try
+        {
+            var p = new Tensor<float>(new[] { 2 }, new Vector<float>(new[] { 3f, 4f }));
+            Assert.NotNull(gpu!.AcquireParameterBuffer(p, out _));
+            var g = OnDevice(gpu, new[] { 0.5f, -0.25f });
+            IGpuBuffer? m = null, v = null, ms = null, vs = null;
+            try
+            {
+                Assert.True(bf16 ? GpuOptimizer.TryAllocBf16MomentState(2, out m, out v)
+                    : GpuOptimizer.TryAllocAdam8BitState(2, 64, out m, out v, out ms, out vs));
+                long before = GpuLaunchProbe.Readbacks;
+                Assert.True(bf16
+                    ? GpuOptimizer.TryAdamBf16Step(p, g, m, v, Lr, Beta1, Beta2, Eps, WeightDecay, 1, true)
+                    : GpuOptimizer.TryAdam8BitStep(p, g, m, v, ms, vs, Lr, Beta1, Beta2, Eps,
+                        1f - Beta1, 1f - Beta2, 64, WeightDecay, true));
+                Assert.Equal(before, GpuLaunchProbe.Readbacks);
+                Assert.True(gpu.IsDeviceAuthoritative(p));
+                var expected = new[] { 3f, 4f }; var hm = new byte[4]; var hv = new byte[4];
+                if (bf16) HostCompressedMomentAdam.Bf16Step(expected, new[] { 0.5f, -0.25f }, hm, hv,
+                    2, Lr, Beta1, Beta2, Eps, WeightDecay, 1, true);
+                else HostCompressedMomentAdam.Int8Step(expected, new[] { 0.5f, -0.25f }, hm, hv,
+                    new float[1], new float[1], 2, 64, Lr, Beta1, Beta2, Eps, WeightDecay, 1, true);
+                var actual = p.ToArray();
+                for (int i = 0; i < 2; i++) Assert.True(Math.Abs(expected[i] - actual[i]) < 1e-5f,
+                    $"host read returned {actual[i]} instead of the device update {expected[i]}");
+            }
+            finally
+            {
+                GpuOptimizer.FreeGpuBuffer(m); GpuOptimizer.FreeGpuBuffer(v);
+                GpuOptimizer.FreeGpuBuffer(ms); GpuOptimizer.FreeGpuBuffer(vs);
+            }
+        }
+        finally { AiDotNetEngine.Current = saved; }
+    }
 
     [SkippableTheory]
     [InlineData(true, true)]

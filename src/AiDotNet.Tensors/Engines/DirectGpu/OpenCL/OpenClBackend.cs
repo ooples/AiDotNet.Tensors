@@ -11925,6 +11925,8 @@ KERNEL VARIANTS (A/B testing):
             float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2,
             int blockSize, int paramLength, int numBlocks, float weightDecay, bool decoupledWeightDecay)
         {
+            CompressedMomentBufferValidation.ValidateInt8(paramLength, blockSize, numBlocks,
+                param, gradient, mQuant, vQuant, mScales, vScales);
             var k = _kernelCache["adam8bit_update"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)param).Buffer.Handle);
