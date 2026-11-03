@@ -9,6 +9,7 @@ using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 using AiDotNet.Tensors.Helpers.Autotune;
+using AiDotNet.Tensors.Helpers.Autotune.TunedKernels;
 
 namespace AiDotNet.Tensors.Benchmarks;
 
@@ -466,14 +467,26 @@ internal static partial class DirectPtxDenseLinearFullExperiment
         using var backend = new CudaBackend();
         DirectPtxRuntime runtime = backend.GetDirectPtxRuntime();
         int sm = runtime.ComputeCapabilityMajor * 10 + runtime.ComputeCapabilityMinor;
-        string incumbent = PtxConv2DNchw3x3ForwardF32Kernel.EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+        // --seed-ptx=<file> continues a campaign from an earlier winner (same entry point, parameters and geometry)
+        // instead of the emitted kernel.
+        string seedPath = session.Text("seed-ptx", "");
+        string incumbent = seedPath.Length > 0
+            ? File.ReadAllText(seedPath)
+            : PtxConv2DNchw3x3ForwardF32Kernel.EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
         session.Emit("incumbent", new
         {
             target = session.Target, sm, kernel = PtxConv2DNchw3x3ForwardF32Kernel.EntryPoint,
+            seed = seedPath.Length > 0 ? Path.GetFullPath(seedPath) : "emitted",
             batch = 1, in_channels = ConvCi, out_channels = ConvCo, height = ConvH, width = ConvW,
         });
+        if (session.Arg("vendor-check-only", 0) == 1)
+        {
+            // No model calls: the incumbent (or seed) against every route, then stop.
+            session.Emit("vendor_check", new { target = session.Target, sm, incumbent_vs_routes = MeasureConv3x3AgainstRoutes(backend, runtime, incumbent) });
+            return;
+        }
 
-        var contract = Conv3x3Contract(sm);
+        var contract = Conv3x3Contract(sm, session.Text("hint", ""));
         var compiler = new PtxProgramCompiler(contract);
         IPtxKernelReference reference = PtxKernelReference.Create("cpu-conv2d-nchw-3x3-s1-p1-fp64-accumulate", invocation =>
         {
@@ -490,21 +503,19 @@ internal static partial class DirectPtxDenseLinearFullExperiment
         string? winner = CheckCampaignWinner(session, search, compiler, correctness, timing, incumbent, out PtxTimingReport? measured);
         if (winner is null || measured is null) return;
 
-        var vsIncumbent = MeasureConv3x3AgainstCudnn(backend, runtime, incumbent);
-        var vsWinner = MeasureConv3x3AgainstCudnn(backend, runtime, winner);
         session.Emit("verdict", new
         {
             target = session.Target, sm,
             correct = true,
             qualifies_over_incumbent = measured.QualifiesForPromotion,
             timing = measured.Message,
-            incumbent_vs_cudnn = vsIncumbent,
-            winner_vs_cudnn = vsWinner,
+            incumbent_vs_routes = MeasureConv3x3AgainstRoutes(backend, runtime, incumbent),
+            winner_vs_routes = MeasureConv3x3AgainstRoutes(backend, runtime, winner),
             output = session.Output,
         });
     }
 
-    private static PtxKernelContract Conv3x3Contract(int sm)
+    private static PtxKernelContract Conv3x3Contract(int sm, string hint = "")
     {
         var shape = new Dictionary<string, long> { ["CI"] = ConvCi, ["CO"] = ConvCo, ["H"] = ConvH, ["W"] = ConvW, ["R"] = 3, ["S"] = 3 };
         return new PtxKernelContract("conv2d-nchw-3x3-s1-p1-f32", PtxConv2DNchw3x3ForwardF32Kernel.EntryPoint,
@@ -512,7 +523,7 @@ internal static partial class DirectPtxDenseLinearFullExperiment
             ", 3x3 kernel, stride 1, zero padding 1, no bias: output[co,y,x] = sum over ci, ky, kx of " +
             "input[ci, y+ky-1, x+kx-1] * weights[co,ci,ky,kx], out-of-range inputs read as 0. The shape is fixed. " +
             "Keep the parameter list, entry point and launch geometry (grid " + ConvCo * ConvH * ConvW / ConvBlock + " blocks of " +
-            ConvBlock + " threads); every output element must be written.",
+            ConvBlock + " threads); every output element must be written." + (hint.Length > 0 ? " " + hint : ""),
             PtxTargetLimits.ForSm(sm),
             new[]
             {
@@ -558,10 +569,42 @@ internal static partial class DirectPtxDenseLinearFullExperiment
     }
 
     /// <summary>
-    /// <paramref name="ptx"/> against cuDNN (the backend's vendor slot: cuDNN's default algorithm, or a faster measured
-    /// one) on the same buffers, after checking both write the same output: paired rounds, eager and as graph replays.
+    /// <paramref name="ptx"/> against each named route of the backend's conv forward slot at this shape: what
+    /// <c>backend.Conv2D</c> serves (the slot's pick, named), the NVRTC fused Winograd F(2,3) kernel, cuDNN's default
+    /// algorithm, and every cuDNN algorithm 0..7 that runs. Each comparison is paired rounds, eager and as graph replays.
     /// </summary>
-    private static unsafe object MeasureConv3x3AgainstCudnn(CudaBackend backend, DirectPtxRuntime runtime, string ptx)
+    private static object MeasureConv3x3AgainstRoutes(CudaBackend backend, DirectPtxRuntime runtime, string ptx)
+    {
+        // Enough tuning budget that the slot decides this one shape by measurement, not by running out.
+        TunedKernelPolicy.BudgetMilliseconds = Math.Max(TunedKernelPolicy.BudgetMilliseconds, 120_000);
+        var routes = new List<object>();
+        var slot = backend.Conv2DForwardVendorSlot;
+        object Against(string route, Func<IGpuBuffer, IGpuBuffer, IGpuBuffer, Action> make)
+            => new { route, result = MeasureConv3x3Against(backend, runtime, ptx, make) };
+        routes.Add(Against("backend.Conv2D", (i, w, o) => () => backend.Conv2D(i, w, o, 1, ConvCi, ConvH, ConvW, ConvCo,
+            ConvH, ConvW, 3, 3, 1, 1, 1, 1, 1, 1)));
+        var decision = slot.CachedDecisions.FirstOrDefault();
+        string served = decision is null ? "unknown" : decision.CandidateId + " (" + decision.Reason + ")";
+        foreach (string id in new[] { "nvrtc.conv2d.winograd_f23_fused", "cudnn.conv2d.default" }
+            .Concat(Enumerable.Range(0, 8).Select(a => "cudnn.conv2d.algo" + a)))
+        {
+            var candidate = slot.Candidate(id);
+            if (candidate is null) { routes.Add(new { route = id, result = (object)new { comparable = false, note = "not a candidate" } }); continue; }
+            routes.Add(Against(id, (i, w, o) =>
+            {
+                var a = new CudaConv2DArgs(i, w, o, 1, ConvCi, ConvH, ConvW, ConvCo, ConvH, ConvW, 3, 3, 1, 1, 1, 1, 1, 1);
+                return () => candidate.Execute(a);
+            }));
+        }
+        return new { backend_conv2d_serves = served, routes };
+    }
+
+    /// <summary>
+    /// <paramref name="ptx"/> against one route on the same buffers, after checking both write the same output: paired
+    /// rounds, eager and as graph replays. A route that throws or disagrees is reported, not timed.
+    /// </summary>
+    private static unsafe object MeasureConv3x3Against(CudaBackend backend, DirectPtxRuntime runtime, string ptx,
+        Func<IGpuBuffer, IGpuBuffer, IGpuBuffer, Action> makeRoute)
     {
         var random = new Random(1159);
         float[] inputHost = Values(random, ConvCi * ConvH * ConvW);
@@ -573,8 +616,7 @@ internal static partial class DirectPtxDenseLinearFullExperiment
         using DirectPtxModule module = runtime.LoadModule(ptx);
         IntPtr function = module.GetFunction(PtxConv2DNchw3x3ForwardF32Kernel.EntryPoint);
 
-        Action cudnn = () => backend.Conv2D(input, weights, output, 1, ConvCi, ConvH, ConvW, ConvCo, ConvH, ConvW,
-            3, 3, 1, 1, 1, 1, 1, 1);
+        Action cudnn = makeRoute(input, weights, output);
         void Launch(IGpuBuffer destination)
         {
             IntPtr i = input.Handle, w = weights.Handle, o = destination.Handle;
@@ -587,7 +629,8 @@ internal static partial class DirectPtxDenseLinearFullExperiment
         Action generated = () => Launch(output);
 
         // The generated kernel writes a buffer of its own: into cuDNN's, a kernel that wrote nothing would match.
-        cudnn();
+        try { cudnn(); backend.Synchronize(); }
+        catch (Exception e) { return new { comparable = false, note = e.GetType().Name + ": " + e.Message }; }
         float[] expected = backend.DownloadBuffer(output);
         Launch(check);
         float[] actual = backend.DownloadBuffer(check);
@@ -645,7 +688,7 @@ internal static partial class DirectPtxDenseLinearFullExperiment
             });
         }
         string conv = PtxConv2DNchw3x3ForwardF32Kernel.EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
-        session.Emit("measure_conv3x3", new { sm, versus_cudnn = MeasureConv3x3AgainstCudnn(backend, runtime, conv) });
+        session.Emit("measure_conv3x3", new { sm, versus_routes = MeasureConv3x3AgainstRoutes(backend, runtime, conv) });
     }
 
     /// <summary>
