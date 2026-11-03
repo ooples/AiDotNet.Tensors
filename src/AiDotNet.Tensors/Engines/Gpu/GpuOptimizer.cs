@@ -477,6 +477,8 @@ public static class GpuOptimizer
         // hasn't allocated GPU-resident 8-bit Adam state, so signal CPU fallback
         // (matching the documented contract) rather than throwing.
         if (mQ is null || vQ is null || mScales is null || vScales is null) return false;
+        CompressedMomentHyperparameters.Validate(lr, beta1, beta2, epsilon, 0f);
+        CompressedMomentHyperparameters.ValidateInt8Factors(1f - beta1, 1f - beta2, biasCorrection1, biasCorrection2);
         int stateBlocks = HostCompressedMomentAdam.BlockCount(p.Length, blockSize);
         CompressedMomentBufferValidation.RequireCapacity(mQ, p.Length, nameof(mQ));
         CompressedMomentBufferValidation.RequireCapacity(vQ, p.Length, nameof(vQ));
@@ -509,6 +511,8 @@ public static class GpuOptimizer
             throw new ArgumentException("param and grad must have the same length.", nameof(g));
         if (blockSize <= 0) throw new ArgumentOutOfRangeException(nameof(blockSize));
         if (mQ is null || vQ is null || mScales is null || vScales is null) return false;
+        CompressedMomentHyperparameters.Validate(lr, beta1, beta2, epsilon, weightDecay);
+        CompressedMomentHyperparameters.ValidateInt8Factors(1f - beta1, 1f - beta2, biasCorrection1, biasCorrection2);
         int stateBlocks = HostCompressedMomentAdam.BlockCount(p.Length, blockSize);
         CompressedMomentBufferValidation.RequireCapacity(mQ, p.Length, nameof(mQ));
         CompressedMomentBufferValidation.RequireCapacity(vQ, p.Length, nameof(vQ));
@@ -570,6 +574,7 @@ public static class GpuOptimizer
             throw new ArgumentException("param and grad must have the same length.", nameof(g));
         if (step < 1) throw new ArgumentOutOfRangeException(nameof(step), step, "The Adam step is 1-based.");
         if (m is null || v is null) return false;
+        CompressedMomentHyperparameters.Validate(lr, beta1, beta2, epsilon, weightDecay);
         CompressedMomentBufferValidation.RequireCapacity(m, (long)p.Length * sizeof(ushort), nameof(m));
         CompressedMomentBufferValidation.RequireCapacity(v, (long)p.Length * sizeof(ushort), nameof(v));
         if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; using var __gpuOp = e.EnterGpuOp();

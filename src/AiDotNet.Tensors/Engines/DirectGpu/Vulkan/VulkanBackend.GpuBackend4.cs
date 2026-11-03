@@ -96,10 +96,12 @@ public sealed unsafe partial class VulkanBackend
         int blockSize, int paramLength, int numBlocks, float weightDecay, bool decoupledWeightDecay)
     {
         EnsureInitialized();
-        if (paramLength <= 0 || numBlocks <= 0) return;
+        if (paramLength == 0) return;
+        CompressedMomentHyperparameters.Validate(learningRate, beta1, beta2, epsilon, weightDecay, nameof(learningRate));
+        CompressedMomentHyperparameters.ValidateInt8Factors(oneMinusBeta1, oneMinusBeta2, biasCorrection1, biasCorrection2);
         CompressedMomentBufferValidation.ValidateInt8(paramLength, blockSize, numBlocks,
             param, gradient, mQuant, vQuant, mScales, vScales);
-        GlslDispatchN(VulkanCompressedOptimizerKernels.Adam8Bit, checked(numBlocks * 256),
+        GlslDispatchN(VulkanCompressedOptimizerKernels.Adam8Bit, CompressedMomentBufferValidation.CheckedInt8WorkSize(numBlocks),
             new[] { param, gradient, mQuant, vQuant, mScales, vScales },
             new[] { (uint)paramLength, (uint)blockSize, (uint)numBlocks,
                 FBits(learningRate), FBits(beta1), FBits(beta2), FBits(epsilon),

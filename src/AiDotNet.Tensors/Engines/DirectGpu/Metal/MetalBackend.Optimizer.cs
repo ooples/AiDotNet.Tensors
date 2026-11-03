@@ -167,10 +167,12 @@ public sealed partial class MetalBackend
         int blockSize, int paramLength, int numBlocks, float weightDecay, bool decoupledWeightDecay)
     {
         ThrowIfDisposed();
-        if (paramLength <= 0 || numBlocks <= 0) return;
+        if (paramLength == 0) return;
         if (blockSize <= 0) throw new ArgumentOutOfRangeException(nameof(blockSize));
         if (numBlocks != (int)(((long)paramLength + blockSize - 1) / blockSize))
             throw new ArgumentException("numBlocks must match the parameter length and block size.", nameof(numBlocks));
+        CompressedMomentHyperparameters.Validate(learningRate, beta1, beta2, epsilon, weightDecay, nameof(learningRate));
+        CompressedMomentHyperparameters.ValidateInt8Factors(oneMinusBeta1, oneMinusBeta2, biasCorrection1, biasCorrection2);
         CompressedMomentBufferValidation.ValidateInt8(paramLength, blockSize, numBlocks,
             param, gradient, mQuant, vQuant, mScales, vScales);
 
@@ -183,7 +185,7 @@ public sealed partial class MetalBackend
             throw new ArgumentException("Buffers must be MetalGpuBuffer.");
 
         var pipeline = GetPipeline("CompressedOptimizer", library, "adam8bit");
-        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(checked(numBlocks * 256));
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(CompressedMomentBufferValidation.CheckedInt8WorkSize(numBlocks));
         using var encoder = _commandQueue.CreateScopedComputeEncoder();
         encoder.SetPipelineState(pipeline.Handle);
         encoder.SetBuffer(parameter, 0);

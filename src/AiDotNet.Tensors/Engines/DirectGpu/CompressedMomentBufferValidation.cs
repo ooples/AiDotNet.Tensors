@@ -6,6 +6,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 
 internal static class CompressedMomentBufferValidation
 {
+    internal static int CheckedInt8WorkSize(int numBlocks)
+    {
+        long workSize = (long)numBlocks * 256;
+        if (numBlocks < 0 || workSize > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(numBlocks), "The int8 optimizer dispatch is too large.");
+        return (int)workSize;
+    }
+
     internal static void ValidateInt8(int paramLength, int blockSize, int numBlocks,
         IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer mQuant, IGpuBuffer vQuant, IGpuBuffer mScales, IGpuBuffer vScales)
     {

@@ -90,6 +90,9 @@ public sealed partial class WebGpuBackend
         float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2,
         int blockSize, int paramLength, int numBlocks, float weightDecay, bool decoupledWeightDecay)
     {
+        if (paramLength == 0) return;
+        CompressedMomentHyperparameters.Validate(learningRate, beta1, beta2, epsilon, weightDecay, nameof(learningRate));
+        CompressedMomentHyperparameters.ValidateInt8Factors(oneMinusBeta1, oneMinusBeta2, biasCorrection1, biasCorrection2);
         CompressedMomentBufferValidation.ValidateInt8(paramLength, blockSize, numBlocks,
             param, gradient, mQuant, vQuant, mScales, vScales);
         var uniforms = new[]
@@ -112,7 +115,7 @@ public sealed partial class WebGpuBackend
             0f
         };
         Dispatch6BufferAsync("CompressedOptimizerInt8", WebGpuKernels.CompressedOptimizerInt8Source, "adam8bit",
-            param, gradient, mQuant, vQuant, mScales, vScales, uniforms, numBlocks * 256).GetAwaiter().GetResult();
+            param, gradient, mQuant, vQuant, mScales, vScales, uniforms, CompressedMomentBufferValidation.CheckedInt8WorkSize(numBlocks)).GetAwaiter().GetResult();
     }
 
     public void RmspropUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer squaredAvg,

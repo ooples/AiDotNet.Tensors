@@ -11891,6 +11891,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2,
         int blockSize, int paramLength, int numBlocks, float weightDecay, bool decoupledWeightDecay)
     {
+        if (paramLength == 0) return;
+        CompressedMomentHyperparameters.Validate(learningRate, beta1, beta2, epsilon, weightDecay, nameof(learningRate));
+        CompressedMomentHyperparameters.ValidateInt8Factors(oneMinusBeta1, oneMinusBeta2, biasCorrection1, biasCorrection2);
         CompressedMomentBufferValidation.ValidateInt8(paramLength, blockSize, numBlocks,
             param, gradient, mQuant, vQuant, mScales, vScales);
         if (!_kernelCache.TryGetValue("adam8bit_update", out var krnl))

@@ -11925,6 +11925,9 @@ KERNEL VARIANTS (A/B testing):
             float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2,
             int blockSize, int paramLength, int numBlocks, float weightDecay, bool decoupledWeightDecay)
         {
+            if (paramLength == 0) return;
+            CompressedMomentHyperparameters.Validate(learningRate, beta1, beta2, epsilon, weightDecay, nameof(learningRate));
+            CompressedMomentHyperparameters.ValidateInt8Factors(oneMinusBeta1, oneMinusBeta2, biasCorrection1, biasCorrection2);
             CompressedMomentBufferValidation.ValidateInt8(paramLength, blockSize, numBlocks,
                 param, gradient, mQuant, vQuant, mScales, vScales);
             var k = _kernelCache["adam8bit_update"];
@@ -11958,7 +11961,7 @@ KERNEL VARIANTS (A/B testing):
                 throw new NotSupportedException(
                     $"int8 block-quantized Adam requires a device max workgroup size >= 256; this device " +
                     $"reports {_maxWorkGroupSize}. Use bf16 moments or the CPU optimizer path on this device.");
-            k.Execute1D(numBlocks * 256, 256);
+            k.Execute1D(CompressedMomentBufferValidation.CheckedInt8WorkSize(numBlocks), 256);
         }
 
         /// <inheritdoc/>

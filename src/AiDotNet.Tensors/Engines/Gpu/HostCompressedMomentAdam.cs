@@ -33,7 +33,7 @@ public static class HostCompressedMomentAdam
         if (m.Length < 2L * length || v.Length < 2L * length)
             throw new ArgumentException("bf16 moments need 2 bytes per element.");
         if (step < 1) throw new ArgumentOutOfRangeException(nameof(step), step, "The Adam step is 1-based.");
-        ValidateHyperparameters(lr, beta1, beta2, epsilon, weightDecay);
+        CompressedMomentHyperparameters.Validate(lr, beta1, beta2, epsilon, weightDecay);
         CompressedMomentHostFallback.AdamBf16(param, grad, m, v, lr, beta1, beta2, epsilon, weightDecay, step, length,
             decoupledWeightDecay);
     }
@@ -50,7 +50,7 @@ public static class HostCompressedMomentAdam
         if (vScales is null) throw new ArgumentNullException(nameof(vScales));
         if (blockSize <= 0) throw new ArgumentOutOfRangeException(nameof(blockSize));
         if (step < 1) throw new ArgumentOutOfRangeException(nameof(step), step, "The Adam step is 1-based.");
-        ValidateHyperparameters(lr, beta1, beta2, epsilon, weightDecay);
+        CompressedMomentHyperparameters.Validate(lr, beta1, beta2, epsilon, weightDecay);
         int blocks = BlockCount(length, blockSize);
         if (mQuant.Length < length || vQuant.Length < length) throw new ArgumentException("int8 moments need 1 byte per element.");
         if (mScales.Length < blocks || vScales.Length < blocks) throw new ArgumentException("int8 moments need one scale per block.");
@@ -65,20 +65,6 @@ public static class HostCompressedMomentAdam
         if (length < 0) throw new ArgumentOutOfRangeException(nameof(length));
         if (blockSize <= 0) throw new ArgumentOutOfRangeException(nameof(blockSize));
         return (int)(((long)length + blockSize - 1) / blockSize);
-    }
-
-    private static void ValidateHyperparameters(float lr, float beta1, float beta2, float epsilon, float weightDecay)
-    {
-        if (float.IsNaN(lr) || float.IsInfinity(lr))
-            throw new ArgumentOutOfRangeException(nameof(lr), lr, "Learning rate must be finite.");
-        if (float.IsNaN(beta1) || float.IsInfinity(beta1) || beta1 < 0f || beta1 >= 1f)
-            throw new ArgumentOutOfRangeException(nameof(beta1), beta1, "Beta1 must be finite and in [0, 1).");
-        if (float.IsNaN(beta2) || float.IsInfinity(beta2) || beta2 < 0f || beta2 >= 1f)
-            throw new ArgumentOutOfRangeException(nameof(beta2), beta2, "Beta2 must be finite and in [0, 1).");
-        if (float.IsNaN(epsilon) || float.IsInfinity(epsilon) || epsilon < 0f)
-            throw new ArgumentOutOfRangeException(nameof(epsilon), epsilon, "Epsilon must be nonnegative and finite.");
-        if (float.IsNaN(weightDecay) || float.IsInfinity(weightDecay) || weightDecay < 0f)
-            throw new ArgumentOutOfRangeException(nameof(weightDecay), weightDecay, "Weight decay must be nonnegative and finite.");
     }
 
     private static void Validate(float[] param, float[] grad, int length)

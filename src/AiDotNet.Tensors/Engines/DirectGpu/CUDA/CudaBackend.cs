@@ -15032,14 +15032,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2,
         int blockSize, int paramLength, int numBlocks, float weightDecay, bool decoupledWeightDecay)
     {
-        if (param is null) throw new ArgumentNullException(nameof(param));
-        if (gradient is null) throw new ArgumentNullException(nameof(gradient));
-        if (mQuant is null || vQuant is null || mScales is null || vScales is null)
-            throw new ArgumentNullException(nameof(mQuant));
-        if (paramLength <= 0 || blockSize <= 0 || numBlocks <= 0)
-            throw new ArgumentOutOfRangeException(nameof(paramLength));
-        if (numBlocks != (int)(((long)paramLength + blockSize - 1) / blockSize))
-            throw new ArgumentException("numBlocks must match the parameter length and block size.", nameof(numBlocks));
+        if (paramLength == 0) return;
+        CompressedMomentHyperparameters.Validate(learningRate, beta1, beta2, epsilon, weightDecay, nameof(learningRate));
+        CompressedMomentHyperparameters.ValidateInt8Factors(oneMinusBeta1, oneMinusBeta2, biasCorrection1, biasCorrection2);
         CompressedMomentBufferValidation.ValidateInt8(paramLength, blockSize, numBlocks,
             param, gradient, mQuant, vQuant, mScales, vScales);
 

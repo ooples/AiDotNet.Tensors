@@ -6,6 +6,7 @@ public class HostCompressedMomentAdamTests
 {
     private const float Lr = 1e-2f, Beta1 = 0.9f, Beta2 = 0.99f, Eps = 1e-8f, WeightDecay = 0.1f;
     [Theory]
+    [InlineData(-0.1f)]
     [InlineData(float.NaN)]
     [InlineData(float.PositiveInfinity)]
     [InlineData(float.NegativeInfinity)]
