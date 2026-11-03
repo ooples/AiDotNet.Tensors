@@ -67,9 +67,13 @@ public class GpuOptimizerCompressedMomentStepTests
                     var g = OnDevice(gpu!, grad);
                     Assert.True(GpuOptimizer.TryAdamBf16Step(p, g, m, v, Lr, Beta1, Beta2, Eps, WeightDecay, step, decoupled),
                         "the bf16 step fell back to the host");
-                    CompressedMomentHostFallback.AdamBf16(refP, grad, refM, refV, Lr, Beta1, Beta2, Eps, WeightDecay,
-                        step, Length, decoupled);
+                    HostCompressedMomentAdam.Bf16Step(refP, grad, refM, refV, Length, Lr, Beta1, Beta2, Eps, WeightDecay,
+                        step, decoupled);
                 }
+                // The host API keeps the device's exact state layout, so state moves between them by upload/download.
+                var backend = gpu!.GetBackend()!;
+                Assert.Equal(refM, backend.DownloadByteBuffer(m!, Length * 2));
+                Assert.Equal(refV, backend.DownloadByteBuffer(v!, Length * 2));
                 var got = p.ToArray();
                 for (int i = 0; i < Length; i++)
                     Assert.True(Math.Abs(refP[i] - got[i]) < 1e-5f,
@@ -113,6 +117,22 @@ public class GpuOptimizerCompressedMomentStepTests
                             Assert.True(GpuOptimizer.TryAdam8BitStep(p, g, mQ, vQ, mS, vS, Lr, Beta1, Beta2, Eps,
                                 1f - MathF.Pow(Beta1, step), 1f - MathF.Pow(Beta2, step), blockSize, weightDecay, decoupled),
                                 "the int8 step fell back to the host");
+                        }
+                        if (weightDecay != 0f)
+                        {
+                            // The public host twin reproduces the device state byte for byte.
+                            var hp = Rand(Length, 2);
+                            var hmQ = new byte[Length]; var hvQ = new byte[Length];
+                            var hmS = new float[blocks]; var hvS = new float[blocks];
+                            for (int step = 1; step <= 3; step++)
+                                HostCompressedMomentAdam.Int8Step(hp, Rand(Length, 20 + step, 0.5), hmQ, hvQ, hmS, hvS, Length, blockSize,
+                                    Lr, Beta1, Beta2, Eps, weightDecay, step, decoupled);
+                            var backend = gpu!.GetBackend()!;
+                            Assert.Equal(hmQ, backend.DownloadByteBuffer(mQ!, Length));
+                            Assert.Equal(hvQ, backend.DownloadByteBuffer(vQ!, Length));
+                            var dev = p.ToArray();
+                            for (int i = 0; i < Length; i++)
+                                Assert.True(Math.Abs(hp[i] - dev[i]) < 1e-6f, $"host twin element {i}: {hp[i]} vs device {dev[i]}");
                         }
                         return p.ToArray();
                     }
