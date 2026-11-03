@@ -4,7 +4,9 @@
 // route served once the tuning budget is spent.
 
 using System;
+using System.Collections;
 using System.Linq;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
@@ -17,6 +19,30 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 [Collection("DirectGpuSerial")]
 public class CudnnForwardHeuristicTests
 {
+    [SkippableFact]
+    public void DistinctShapesDoNotGrowTheHeuristicCacheWithoutLimit()
+    {
+        using var backend = RequireCudnnBackend();
+        using var conv = new CuDnnConvolution();
+        bool previous = CuDnnConvolution.HeuristicForwardEnabled;
+        try
+        {
+            CuDnnConvolution.HeuristicForwardEnabled = true;
+            // These are descriptor-only queries; no device tensor or workspace is allocated.
+            for (int batch = 1; batch <= 4097; batch++)
+                conv.DefaultForwardAlgorithm(batch, 1, 2, 2, 1, 1, 1, 0, 0, 1, 1, 1, 1,
+                    CuDnnNative.CudnnDataType.Float, CuDnnNative.CudnnMathType.Fma);
+
+            var cache = (IDictionary)typeof(CuDnnConvolution)
+                .GetField("_heuristicForward", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(conv)!;
+            Assert.InRange(cache.Count, 1, 4096);
+        }
+        finally
+        {
+            CuDnnConvolution.HeuristicForwardEnabled = previous;
+        }
+    }
+
     /// <summary>cudnnConvolutionFwdAlgoPerf_t is 48 bytes with the size_t workspace at offset 16 on 64-bit hosts.</summary>
     [SkippableFact]
     public void AlgoPerfMatchesTheNativeLayout()

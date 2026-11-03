@@ -1754,8 +1754,11 @@ public sealed class CuDnnConvolution : IDisposable
         IntPtr results = Marshal.AllocHGlobal(size * requested);
         try
         {
-            var status = CuDnnNative.cudnnGetConvolutionForwardAlgorithm_v7(_context.Handle, x, wDesc, conv, y, requested,
-                out int returned, results);
+            CuDnnNative.CudnnStatus status;
+            int returned;
+            lock (_context.StreamBindingLock)
+                status = CuDnnNative.cudnnGetConvolutionForwardAlgorithm_v7(_context.Handle, x, wDesc, conv, y, requested,
+                    out returned, results);
             if (status == CuDnnNative.CudnnStatus.Success)
                 for (int i = 0; i < Math.Min(returned, requested); i++)
                 {
@@ -1778,7 +1781,13 @@ public sealed class CuDnnConvolution : IDisposable
         {
             Marshal.FreeHGlobal(results);
         }
-        _heuristicForward[key] = chosen;
+        lock (_heuristicForward)
+        {
+            // Keep streams of distinct shapes bounded, including concurrent insertions.
+            const int MaxHeuristicForwardEntries = 4096;
+            if (_heuristicForward.Count >= MaxHeuristicForwardEntries) _heuristicForward.Clear();
+            _heuristicForward[key] = chosen;
+        }
         return chosen;
     }
     private readonly List<(IntPtr Pointer, DevicePrimitives.DeviceMemoryHold Memory)> _retiredWorkspaces = new();
@@ -2022,8 +2031,22 @@ public sealed class CuDnnConvolution : IDisposable
             IntPtr workspace = IntPtr.Zero;
             if (workspaceSize > 0)
             {
-                EnsureWorkspaceUnlocked(workspaceSize);
-                workspace = _workspace;
+                try
+                {
+                    EnsureWorkspaceUnlocked(workspaceSize);
+                }
+                catch (InvalidOperationException) when (algorithm < 0 && algo != CuDnnNative.CudnnConvolutionFwdAlgo.ImplicitPrecompGemm)
+                {
+                    // Retry the prior default when the heuristic's larger workspace cannot be allocated.
+                    // Explicit algorithm requests retain their allocation failure behavior.
+                    algo = CuDnnNative.CudnnConvolutionFwdAlgo.ImplicitPrecompGemm;
+                    status = CuDnnNative.cudnnGetConvolutionForwardWorkspaceSize(
+                        _context.Handle, inputDesc.Handle, filterDesc.Handle,
+                        convDesc.Handle, outputDesc.Handle, algo, out workspaceSize);
+                    CuDnnContext.CheckStatus(status, "GetConvolutionForwardWorkspaceSize");
+                    EnsureWorkspaceUnlocked(workspaceSize, exactSize: true);
+                }
+                workspace = workspaceSize > 0 ? _workspace : IntPtr.Zero;
             }
 
             float alpha = 1.0f;
@@ -2257,12 +2280,13 @@ public sealed class CuDnnConvolution : IDisposable
     internal DevicePrimitives.DeviceMemoryAccount? MemoryAccount { get; set; }
     private DevicePrimitives.DeviceMemoryHold _workspaceMemory;
 
-    private void EnsureWorkspaceUnlocked(ulong requiredSize)
+    private void EnsureWorkspaceUnlocked(ulong requiredSize, bool exactSize = false)
     {
         if (_workspaceSize >= requiredSize) return;
 
         // Grow at least twofold, so the retired workspaces below add up to less than the live one.
-        ulong size = Math.Max(requiredSize, _workspaceSize * 2);
+        // A low-memory fallback must request only its required size.
+        ulong size = exactSize ? requiredSize : Math.Max(requiredSize, _workspaceSize * 2);
         var result = CuBlasNative.cuMemAlloc(out IntPtr grown, size);
         if (result != CudaResult.Success)
         {
