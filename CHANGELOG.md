@@ -1,5 +1,47 @@
 # Changelog
 
+## [0.145.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.144.2...v0.145.0) (2026-11-03)
+
+
+### ⚠ BREAKING CHANGES
+
+* on net462, net471 and netstandard2.0 the System.Runtime.Intrinsics Vector128/256/512 polyfill types (SimdCompat) are internal, and the Invoke(Vector128/256/512) overloads of AcoshOperatorDouble, AsinhOperatorDouble and AtanhOperatorDouble are removed from those targets. Both shipped publicly in 0.144.1.
+
+### Features
+
+* **compile:** batch-dynamic inference plans + compiled-vs-eager miscompile fixes (T-3) ([#1623](https://github.com/ooples/AiDotNet.Tensors/issues/1623)) ([f36f13e](https://github.com/ooples/AiDotNet.Tensors/commit/f36f13ef84ff5e551e0cc461f78e42bdc631c88b))
+* DLPack interop, ONNX exporter, public API tracking and package validation (T-4) (+1 combined) ([#1581](https://github.com/ooples/AiDotNet.Tensors/issues/1581)) ([94a333b](https://github.com/ooples/AiDotNet.Tensors/commit/94a333bb109b175b445a150b1b203956715b46ea))
+* **gpu:** device memory stats and TensorScope.Detach, with license headers 7, 9, 11/18 (combined) ([#1590](https://github.com/ooples/AiDotNet.Tensors/issues/1590)) ([88abbb4](https://github.com/ooples/AiDotNet.Tensors/commit/88abbb43f5905c1c939f9adace82037610c84542))
+
+
+### Bug Fixes
+
+* **api:** declare TunedKernelDecisionReason.Heuristic in the public API ([#1637](https://github.com/ooples/AiDotNet.Tensors/issues/1637)) ([e79ec80](https://github.com/ooples/AiDotNet.Tensors/commit/e79ec8031d2b776de08d11c91aadc63e4c075f27))
+* **autodiff:** record conv2d gradients under create-graph ([#1655](https://github.com/ooples/AiDotNet.Tensors/issues/1655)) ([986f21c](https://github.com/ooples/AiDotNet.Tensors/commit/986f21cd603b75490961b4d5e8f53eb7c3fe72c8))
+* **cpu:** kernel-cache hits allocate nothing; weight packs sized to their depth ([#1633](https://github.com/ooples/AiDotNet.Tensors/issues/1633)) ([9a6d0b1](https://github.com/ooples/AiDotNet.Tensors/commit/9a6d0b1f744ad56f1f814b73356bf542e9a26dc5))
+* **cuda,vulkan:** CUDA-lane crashes and the Vulkan LSTM TDR — cuLinkCreate option lifetime, cublasDestroy sync during capture, LSTM sequence on parallel kernels ([#1628](https://github.com/ooples/AiDotNet.Tensors/issues/1628)) ([8686f7f](https://github.com/ooples/AiDotNet.Tensors/commit/8686f7ffcdeeb0b642a2ccb94871679281d6c82f))
+* **cuda:** hold the cuDNN handle from cudnnSetStream through its launch ([#1614](https://github.com/ooples/AiDotNet.Tensors/issues/1614)) ([3c3ac63](https://github.com/ooples/AiDotNet.Tensors/commit/3c3ac63df7c204d4974016cd30ae192abe237257))
+* **engines:** empty slices are valid, so concatenate backward handles zero-width inputs ([#1635](https://github.com/ooples/AiDotNet.Tensors/issues/1635)) ([92c320b](https://github.com/ooples/AiDotNet.Tensors/commit/92c320b345c14755171da056257d0560e3678f0e))
+* **gpu:** batched attention route is tapeless only, smaller score budget, fused-branch test ([#1603](https://github.com/ooples/AiDotNet.Tensors/issues/1603)) ([e8b22ea](https://github.com/ooples/AiDotNet.Tensors/commit/e8b22eacc28c632994eb490e9fb5ff5bd09d76d9))
+* relu keeps nan on every cpu and gpu path; cuda leaky relu honours alpha ([#1646](https://github.com/ooples/AiDotNet.Tensors/issues/1646)) ([0ee348e](https://github.com/ooples/AiDotNet.Tensors/commit/0ee348e26b1b03396325c842c2a0bc146109ab5f))
+* **tests:** CrowdTrainer header on the four compilation tests from [#1623](https://github.com/ooples/AiDotNet.Tensors/issues/1623) ([#1634](https://github.com/ooples/AiDotNet.Tensors/issues/1634)) ([2feb5a7](https://github.com/ooples/AiDotNet.Tensors/commit/2feb5a7938079aece84b2e5fc2bd28f0ea6abe32))
+* v1 gaps on main - tuning drains only its own pool buffers; drop committed trace ([#1645](https://github.com/ooples/AiDotNet.Tensors/issues/1645)) ([f951440](https://github.com/ooples/AiDotNet.Tensors/commit/f9514408690d1594db9162c18f6ca0eb384616f0))
+
+
+### Performance
+
+* **conv:** blocked Winograd weight gradient, 512-bit blocked GEMM, stride-2 12-position forward ([#1573](https://github.com/ooples/AiDotNet.Tensors/issues/1573)) ([#1651](https://github.com/ooples/AiDotNet.Tensors/issues/1651)) ([aaa6979](https://github.com/ooples/AiDotNet.Tensors/commit/aaa6979cc4ef54f88da9aebaf21d359e45a006e9))
+* **conv:** few-patch Winograd F(4x4) for wide small-plane layers; forward floor 32 off full-rate AVX-512 ([#1573](https://github.com/ooples/AiDotNet.Tensors/issues/1573)) ([#1652](https://github.com/ooples/AiDotNet.Tensors/issues/1652)) ([30e3e4a](https://github.com/ooples/AiDotNet.Tensors/commit/30e3e4a1bc4a6e5a4a98f02c805bbd9eee1105ae))
+* **cpu-gemm:** packed, k-blocked B strips for the 512-bit direct GEMM tiles ([#1644](https://github.com/ooples/AiDotNet.Tensors/issues/1644)) ([0c410e1](https://github.com/ooples/AiDotNet.Tensors/commit/0c410e15d9d56bb7bd551103e293fcb3edc8ab8a))
+* **cpu:** AVX-512 narrow GEMM, 12-position conv on small planes, packed-A copy ([#1573](https://github.com/ooples/AiDotNet.Tensors/issues/1573)) ([#1648](https://github.com/ooples/AiDotNet.Tensors/issues/1648)) ([c4ff1a9](https://github.com/ooples/AiDotNet.Tensors/commit/c4ff1a96d2e52ce0d277e4ffe895a38279d85a9f))
+* **cpu:** bind pool workers across every processor group ([#653](https://github.com/ooples/AiDotNet.Tensors/issues/653)) ([#1647](https://github.com/ooples/AiDotNet.Tensors/issues/1647)) ([e6f5c02](https://github.com/ooples/AiDotNet.Tensors/commit/e6f5c028cf83dfebf672405368876b6ce4416a79))
+* **cuda:** PTX campaigns recorded with spend; conv 3x3 winner 1.92x cuDNN eager ([#1649](https://github.com/ooples/AiDotNet.Tensors/issues/1649)) ([#1650](https://github.com/ooples/AiDotNet.Tensors/issues/1650)) ([e8a498e](https://github.com/ooples/AiDotNet.Tensors/commit/e8a498e7ef8e79594bc7299d025358628fdb184e))
+* **gemm:** A·Bᵀ on the 512-bit direct tiles with the transpose fused into strip packing; linear dX takes it ([#1573](https://github.com/ooples/AiDotNet.Tensors/issues/1573)) ([#1654](https://github.com/ooples/AiDotNet.Tensors/issues/1654)) ([d0614f2](https://github.com/ooples/AiDotNet.Tensors/commit/d0614f286f201e0ba1a9f3fc354a5b501180567f))
+* **gemm:** resolve DisableAutotune before the tile choice; AVX-512 thin-K A^T to PackBoth ([#1573](https://github.com/ooples/AiDotNet.Tensors/issues/1573)) ([#1653](https://github.com/ooples/AiDotNet.Tensors/issues/1653)) ([438d943](https://github.com/ooples/AiDotNet.Tensors/commit/438d94368d132217de4fe575d555a961fee67fbe))
+* gpu and cpu inference ahead of pytorch on every parity model and batch size ([#1636](https://github.com/ooples/AiDotNet.Tensors/issues/1636)) ([5806593](https://github.com/ooples/AiDotNet.Tensors/commit/58065936269eaa7aa4fb0c882312f7864ae5ad1f))
+* **tensors:** move rarely-set tensor fields into a side object allocated on first use ([#1641](https://github.com/ooples/AiDotNet.Tensors/issues/1641)) ([503b5fa](https://github.com/ooples/AiDotNet.Tensors/commit/503b5fa1501bf2cd6fc3a064371ccf0181143d69))
+* v1 T-3 CPU training and GRU (CUDA 0.61x, CPU 0.38x torch) ([#1639](https://github.com/ooples/AiDotNet.Tensors/issues/1639)) ([172dea1](https://github.com/ooples/AiDotNet.Tensors/commit/172dea12ce2cc9b62bc51a59cb3eef6497181513))
+
 ## [0.144.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.144.1...v0.144.2) (2026-10-29)
 
 
