@@ -26,7 +26,7 @@ internal static unsafe partial class WinogradF43
     internal static bool s_forceBlockedForTest = s_blockedEnv == "1";
 
     /// <summary>Whether narrow layers run blocked (AIDOTNET_WINOGRAD_BLOCKED=0 turns it off).</summary>
-    internal static bool s_blockedNarrow = s_blockedEnv != "0";
+    internal static readonly bool s_blockedNarrow = s_blockedEnv != "0";
 
     /// <summary>Channel bound of the batch-wide passes: with narrow blocking on, a layer with fewer than this many channels
     /// on either side, or no more than this many on both (64 -> 64), runs blocked; wider layers run batch-wide.</summary>
