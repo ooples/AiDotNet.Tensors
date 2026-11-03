@@ -166,7 +166,7 @@ public sealed class ParameterBuffer<T>
 
         _totalSize = offset;
         _data = new Vector<T>(_totalSize);
-        _storage = new TensorStorage<T>(_data) { IsParameterBuffer = true };
+        _storage = new TensorStorage<T>(_data, shareExternalGpuCacheEpoch: true) { IsParameterBuffer = true };
         _data.SetWriteObserver(MarkHostWritten);
     }
 
@@ -195,9 +195,9 @@ public sealed class ParameterBuffer<T>
     /// </summary>
     public Vector<T> AsVector()
     {
-        // The vector is mutable and writes through it bypass the views; its write observer (installed with the
-        // storage) advances the GPU-cache version on each write, so a write after a GPU read is not lost to the
-        // device copy uploaded before it.
+        // Indexed and in-place writes advance the GPU-cache version. Acquiring writable memory or a span also
+        // advances it, but later writes through that retained memory cannot be observed: reacquire it after GPU
+        // work and before writing. Vector slices inherit the observer; tensor aliases share the array's epoch.
         return _data;
     }
 

@@ -17,6 +17,30 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 public class SparseAwareParameterBufferTests
 {
     private readonly IEngine _engine = AiDotNetEngine.Current;
+
+    [Theory]
+    [InlineData("slice")]
+    [InlineData("nested-slice")]
+    [InlineData("tensor")]
+    [InlineData("slice-tensor")]
+    public void AliasWrites_AdvanceTheFlatParameterCacheVersion(string kind)
+    {
+        var buffer = new ParameterBuffer<float>(new[] { new[] { 2 }, new[] { 2 } });
+        var view = buffer.CreateAllViews()[1];
+        var flat = buffer.AsVector();
+        var slice = flat.CreateSlice(2, 2);
+        var nested = slice.CreateSlice(0, 1);
+        var tensor = (kind == "slice-tensor" ? slice : flat).AsTensor();
+        // Acquire aliases BEFORE starting cache tracking: their construction must not be the invalidation.
+        int uploadedAt = view.GpuCacheVersion;
+        if (kind == "slice") slice[0] = 9f;
+        else if (kind == "nested-slice") nested[0] = 9f;
+        else tensor[kind == "tensor" ? 2 : 0] = 9f;
+        Assert.True(view.GpuCacheVersion > uploadedAt, "an alias write must invalidate the flat GPU upload");
+        Assert.Equal(9f, view[0]);
+        Assert.Equal(new[] { 0f, 0f, 9f, 0f }, flat.ToArray());
+    }
+
     [Theory]
     [InlineData("dense-for-sparse")]
     [InlineData("sparse-shape")]

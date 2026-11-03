@@ -153,6 +153,9 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.
     {
         _onWrite = onWrite;
     }
+    /// <summary>Preserves write tracking when another vector aliases this vector's memory.</summary>
+    private protected void ShareWriteObserver(VectorBase<T> alias) => alias._onWrite = _onWrite;
+
 
     /// <summary>
     /// Runs the write notification when disposed, so an in-place operation notifies after its write on every return

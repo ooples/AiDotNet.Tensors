@@ -102,7 +102,10 @@ public sealed class DeviceClipGradNormTests
     public void ClipsDeviceGradients_LikeClipGradNorm_WithoutReadback(double maxNorm)
     {
         DirectGpuTensorEngine? gpu = null;
-        try { gpu = new DirectGpuTensorEngine(); } catch { }
+        bool required = Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS") == "1";
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (!required && (ex is PlatformNotSupportedException or DllNotFoundException)) { }
+        if (required) Assert.True(gpu is not null && gpu.IsGpuAvailable, "The required GPU backend failed to initialize.");
         Skip.If(gpu is null || !gpu.IsGpuAvailable, "GPU engine unavailable.");
         var saved = AiDotNetEngine.Current;
         AiDotNetEngine.Current = gpu!;
@@ -158,7 +161,10 @@ public sealed class DeviceClipGradNormTests
     public void NonFiniteGradient_LeavesGradientsUnscaled_AndReportsIt()
     {
         DirectGpuTensorEngine? gpu = null;
-        try { gpu = new DirectGpuTensorEngine(); } catch { }
+        bool required = Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS") == "1";
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (!required && (ex is PlatformNotSupportedException or DllNotFoundException)) { }
+        if (required) Assert.True(gpu is not null && gpu.IsGpuAvailable, "The required GPU backend failed to initialize.");
         Skip.If(gpu is null || !gpu.IsGpuAvailable, "GPU engine unavailable.");
         var saved = AiDotNetEngine.Current;
         AiDotNetEngine.Current = gpu!;
@@ -195,7 +201,10 @@ public sealed class DeviceClipGradNormTests
     public void NormPastTheFloatRange_IsStillClipped_AndReportedFinite()
     {
         DirectGpuTensorEngine? gpu = null;
-        try { gpu = new DirectGpuTensorEngine(); } catch { }
+        bool required = Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS") == "1";
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (!required && (ex is PlatformNotSupportedException or DllNotFoundException)) { }
+        if (required) Assert.True(gpu is not null && gpu.IsGpuAvailable, "The required GPU backend failed to initialize.");
         Skip.If(gpu is null || !gpu.IsGpuAvailable, "GPU engine unavailable.");
         var saved = AiDotNetEngine.Current;
         AiDotNetEngine.Current = gpu!;
@@ -229,7 +238,10 @@ public sealed class DeviceClipGradNormTests
     public void BoundPastTheFloatRange_ClipsOnTheHost()
     {
         DirectGpuTensorEngine? gpu = null;
-        try { gpu = new DirectGpuTensorEngine(); } catch { }
+        bool required = Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS") == "1";
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (!required && (ex is PlatformNotSupportedException or DllNotFoundException)) { }
+        if (required) Assert.True(gpu is not null && gpu.IsGpuAvailable, "The required GPU backend failed to initialize.");
         Skip.If(gpu is null || !gpu.IsGpuAvailable, "GPU engine unavailable.");
         var saved = AiDotNetEngine.Current;
         AiDotNetEngine.Current = gpu!;

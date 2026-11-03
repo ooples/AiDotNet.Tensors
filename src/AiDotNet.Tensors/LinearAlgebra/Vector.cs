@@ -253,7 +253,9 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
         // materialisation through AsWritableMemory() so the slice is
         // backed by real CPU storage. Mirrors the behaviour AsSpan() /
         // AsMemory() use on the same lazy-allocation path.
-        return new Vector<T>(AsWritableMemory().Slice(offset, length), false);
+        var slice = new Vector<T>(AsWritableMemory().Slice(offset, length), false);
+        ShareWriteObserver(slice);
+        return slice;
     }
 
     /// <summary>

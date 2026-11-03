@@ -299,6 +299,9 @@ public static class GpuOptimizer
     /// A non-finite result means some element is NaN or infinite. Returns null under the same conditions as
     /// <see cref="TryClipGradNorm"/>.
     /// </summary>
+    /// <remarks>The reduction accumulates squares in float. Squared magnitudes below the backend's float
+    /// subnormal range can underflow to zero (and devices that flush subnormals may underflow earlier).
+    /// A zero result therefore does not distinguish exactly zero gradients from underflowed tiny gradients.</remarks>
     public static DeviceGradientNorm? TryGradientSumOfSquares(IReadOnlyList<Tensor<float>> gradients)
     {
         if (gradients is null) throw new ArgumentNullException(nameof(gradients));
