@@ -145,6 +145,32 @@ public static partial class BlasManaged
 
     internal static bool s_thinMGotoOn512 = System.Environment.GetEnvironmentVariable("AIDOTNET_THINM_GOTO_512") == "1";
 
+    /// <summary>GEMMs on this thread that the thin-M route handed to PackBoth via <see cref="ThinMTransAYieldsToPackBoth"/>; a test probe.</summary>
+    [ThreadStatic] internal static int t_thinMTransAYieldRuns;
+    internal static bool s_zzDwOld = System.Environment.GetEnvironmentVariable("ZZ_DW_OLD") == "1";
+
+    /// <summary>
+    /// Whether an FP32 Aᵀ·B (a linear layer's weight gradient Xᵀ·dY) inside the thin-M box runs on PackBoth rather than the
+    /// strided-A thin-M kernel. Only where that kernel runs its 256-bit tile: on AVX2 the unpacked kernel re-reads the
+    /// strided A panel and the [k, 16] B column strip for every six-row block, while PackBoth reads both packed. Measured
+    /// (ms, thin-M vs PackBoth, 2 threads): EPYC 7763 784x512x128 1.04-1.25 vs 0.64, 512x256x128 0.24-0.25 vs 0.22-0.23,
+    /// 1024x256x512 2.9 vs 1.7, 512x128x1024 1.26-1.33 vs 0.93-0.95; Threadripper 3990X 0.83 vs 0.69, 0.27 vs 0.27,
+    /// 2.8 vs 2.0, 0.90 vs 0.81. The thin-M kernel keeps the rest: fewer rows or columns (128x512x256 0.29 vs 0.39,
+    /// 784x128x64 0.07 vs 0.11 on the 7763), a 64-row reduction (512x512x64 0.18 vs 0.30 on the 3990X), and k up to 128
+    /// past two threads, where it scales across real cores and PackBoth does not (784x512x128 on four 3990X cores 0.28
+    /// vs 0.46). On 512-bit hosts its packed-strip tile beats PackBoth on every shape (EPYC 9V74 784x512x128 0.54-0.64
+    /// vs 0.69).
+    /// </summary>
+    internal static bool ThinMTransAYieldsToPackBoth(int m, int n, int k)
+    {
+#if NET9_0_OR_GREATER
+        if (Simd.SimdGemm.UseVector512Direct) return false;
+#endif
+        if (s_zzDwOld) return false;
+        if (m < 512 || k < 128) return false;
+        return k >= 512 || (n >= 256 && CpuParallelSettings.MaxDegreeOfParallelism <= 2);
+    }
+
 #if NET5_0_OR_GREATER
     /// <summary>
     /// #368 thin-M fast path (see the call site in <see cref="Gemm{T}"/>). Routes the
@@ -162,8 +188,9 @@ public static partial class BlasManaged
         ReadOnlySpan<T> a, int lda, bool transA,
         ReadOnlySpan<T> b, int ldb, bool transB,
         Span<T> c, int ldc, int m, int n, int k,
-        in BlasOptions<T> options, bool betaZero) where T : unmanaged
+        in BlasOptions<T> options, bool betaZero, out bool yieldedToPackBoth) where T : unmanaged
     {
+        yieldedToPackBoth = false;
         if (!(typeof(T) == typeof(float) || typeof(T) == typeof(double))) return false;
         if (!System.Runtime.Intrinsics.X86.Fma.IsSupported) return false;
         if (options.PackingMode != PackingMode.Auto && options.PackingMode != PackingMode.DisableAutotune) return false;
@@ -177,6 +204,11 @@ public static partial class BlasManaged
         if (ldb != (transB ? k : n)) return false;
 
         bool isFloat = typeof(T) == typeof(float);
+        if (transA && isFloat && ThinMTransAYieldsToPackBoth(m, n, k))
+        {
+            yieldedToPackBoth = true;
+            return false;
+        }
         if (transA)
         {
             // Aᵀ·B via the strided-A kernel (no transpose materialised).
@@ -744,8 +776,11 @@ public static partial class BlasManaged
         // through to the tuned strategy paths (see TryThinMDirect). Disjoint rows →
         // bit-deterministic across thread counts. A fused bias/activation epilogue is applied
         // after the GEMM so thin-M FusedLinear hits the fast kernel too.
-        if (TryThinMDirect<T>(a, lda, transA, b, ldb, transB, c, ldc, m, n, k, in options, betaZero))
+        bool thinMYieldedToPackBoth;
+        if (TryThinMDirect<T>(a, lda, transA, b, ldb, transB, c, ldc, m, n, k, in options, betaZero, out thinMYieldedToPackBoth))
             return;
+#else
+        const bool thinMYieldedToPackBoth = false;
 #endif
 
         // Strategies do read-modify-write on C; zero it here so the first call produces
@@ -926,6 +961,14 @@ public static partial class BlasManaged
         // against PyTorch's 0.12-0.46. Same options as the dispatch-time fallback (no pre-pack), so the choice is unchanged.
         if (strategy == PackingMode.DisableAutotune)
             strategy = Dispatcher.SelectStrategy(m, n, k, transA, transB, new BlasOptions<T> { PackingMode = PackingMode.Auto });
+
+        // An Aᵀ·B the thin-M route declined in favour of PackBoth (see ThinMTransAYieldsToPackBoth) runs there, whatever
+        // the default table would have picked.
+        if (thinMYieldedToPackBoth)
+        {
+            strategy = PackingMode.ForcePackBoth;
+            t_thinMTransAYieldRuns++;
+        }
 
         // beta=0 fallback for the tuned-strategy family (Streaming / PackAOnly / PackBoth and
         // the partial-M/N tail decomposition): these all read-modify-write C (Streaming loads
