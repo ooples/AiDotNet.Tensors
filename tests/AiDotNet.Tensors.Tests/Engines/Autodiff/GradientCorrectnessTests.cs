@@ -1391,6 +1391,65 @@ public class GradientCorrectnessTests : IDisposable
     }
 
     /// <summary>
+    /// A WGAN-GP style penalty through a convolution: P = sum((dL/dX)^2) for L = sum(conv2d(X, W)^2), differentiated
+    /// into W, and the mirror sum((dL/dW)^2) differentiated into X. Conv2DBackward ran untracked kernels, so under
+    /// create-graph the first gradient recorded nothing and the second backward found no path to W or X at all.
+    /// Checked against central differences of the penalty itself.
+    /// </summary>
+    [Theory]
+    [InlineData(1, 0)]
+    [InlineData(2, 1)]
+    public void Conv2D_DoubleBackward_MatchesFiniteDifferences(int stride, int padding)
+    {
+        var rng = RandomHelper.CreateSeededRandom(17);
+        var x = new Tensor<double>([1, 2, 5, 5]);
+        var w = new Tensor<double>([3, 2, 3, 3]);
+        for (int i = 0; i < x.Length; i++) x[i] = rng.NextDouble() * 2 - 1;
+        for (int i = 0; i < w.Length; i++) w[i] = rng.NextDouble() * 2 - 1;
+        var engine = new CpuEngine();
+        int[] strides = [stride, stride], pads = [padding, padding], dilations = [1, 1];
+
+        double Penalty(Tensor<double> input, Tensor<double> kernel, bool ofInputGradient)
+        {
+            using var tape = new GradientTape<double>();
+            var y = engine.Conv2D(input, kernel, strides, pads, dilations);
+            var loss = engine.ReduceSum(engine.TensorMultiply(y, y), axes: null);
+            var source = ofInputGradient ? input : kernel;
+            var g = tape.ComputeGradients(loss, sources: new[] { source }, createGraph: false)[source];
+            double sum = 0;
+            for (int i = 0; i < g.Length; i++) sum += g[i] * g[i];
+            return sum;
+        }
+
+        foreach (bool ofInputGradient in new[] { true, false })
+        {
+            using var tape = new GradientTape<double>();
+            var y = engine.Conv2D(x, w, strides, pads, dilations);
+            var loss = engine.ReduceSum(engine.TensorMultiply(y, y), axes: null);
+            var first = ofInputGradient ? x : w;
+            var g = tape.ComputeGradients(loss, sources: new[] { first }, createGraph: true)[first];
+            var penalty = engine.ReduceSum(engine.TensorMultiply(g, g), axes: null);
+            var target = ofInputGradient ? w : x;
+            var grads = tape.ComputeGradients(penalty, sources: new[] { target }, createGraph: false);
+            Assert.True(grads.ContainsKey(target), "The penalty has no recorded path to " + (ofInputGradient ? "W" : "X") + ".");
+            var analytic = grads[target].Contiguous();
+
+            for (int i = 0; i < target.Length; i++)
+            {
+                double saved = target[i];
+                target[i] = saved + 1e-5;
+                double plus = Penalty(x, w, ofInputGradient);
+                target[i] = saved - 1e-5;
+                double minus = Penalty(x, w, ofInputGradient);
+                target[i] = saved;
+                double numeric = (plus - minus) / 2e-5;
+                Assert.True(Math.Abs(analytic[i] - numeric) <= 1e-6 * Math.Max(1, Math.Abs(numeric)),
+                    $"{(ofInputGradient ? "dP/dW" : "dP/dX")}[{i}]: analytic {analytic[i]} vs numeric {numeric}.");
+            }
+        }
+    }
+
+    /// <summary>
     /// An infinite upstream gradient under create-graph: the selected class gets it and every other class stays exactly
     /// 0, as the scatter kernel of the plain backward writes. A mask * gradient formulation turned 0 * Inf into NaN at
     /// every unselected class.
