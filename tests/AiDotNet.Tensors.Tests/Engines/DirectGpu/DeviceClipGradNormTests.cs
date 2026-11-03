@@ -15,6 +15,81 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 [Collection("DirectGpuSerial")]
 public sealed class DeviceClipGradNormTests
 {
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void SumOfSquares_DoesNotScaleGradients_AndCachesItsReadback(bool empty)
+    {
+        using var gpu = new DirectGpuTensorEngine();
+        if (Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS") == "1")
+            Assert.True(gpu.IsGpuAvailable, "The required GPU backend failed to initialize.");
+        Skip.If(!gpu.IsGpuAvailable, "GPU engine unavailable.");
+        var saved = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = gpu;
+        try
+        {
+            var gradients = empty ? new Tensor<float>[2] : new Tensor<float>[1];
+            // An empty tensor and a default null slot must both be ignored by the reduction.
+            if (empty) gradients[1] = new Tensor<float>(new[] { 0 });
+            else gradients[0] = gpu.TensorMultiplyScalar(
+                new Tensor<float>(new[] { 2 }, new Vector<float>(new[] { 3f, 4f })), 1f);
+
+            long before = GpuLaunchProbe.Readbacks;
+            using var norm = GpuOptimizer.TryGradientSumOfSquares(gradients);
+            Assert.NotNull(norm);
+            Assert.Equal(before, GpuLaunchProbe.Readbacks);
+            Assert.Equal(empty ? 0.0 : 25.0, norm!.TotalNormSquared, 6);
+            long afterFirstRead = GpuLaunchProbe.Readbacks;
+            Assert.Equal(empty ? 0.0 : 5.0, norm.TotalNorm, 6);
+            Assert.True(norm.IsFinite);
+            Assert.Equal(afterFirstRead, GpuLaunchProbe.Readbacks);
+            if (!empty) Assert.Equal(new[] { 3f, 4f }, gradients[0].ToArray());
+        }
+        finally { AiDotNetEngine.Current = saved; }
+    }
+
+    [SkippableFact]
+    public void HostGradient_DeclinesWithoutPartiallyClippingDeviceGradients()
+    {
+        using var gpu = new DirectGpuTensorEngine();
+        if (Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS") == "1")
+            Assert.True(gpu.IsGpuAvailable, "The required GPU backend failed to initialize.");
+        Skip.If(!gpu.IsGpuAvailable, "GPU engine unavailable.");
+        var saved = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = gpu;
+        try
+        {
+            var resident = gpu.TensorMultiplyScalar(
+                new Tensor<float>(new[] { 2 }, new Vector<float>(new[] { 3f, 4f })), 1f);
+            var host = new Tensor<float>(new[] { 2 }, new Vector<float>(new[] { 12f, 5f }));
+            Assert.Null(GpuOptimizer.TryClipGradNorm(new[] { resident, host }, 1));
+            Assert.Null(GpuOptimizer.TryGradientSumOfSquares(new[] { resident, host }));
+            Assert.Equal(new[] { 3f, 4f }, resident.ToArray());
+            Assert.Equal(new[] { 12f, 5f }, host.ToArray());
+        }
+        finally { AiDotNetEngine.Current = saved; }
+    }
+
+    [Theory]
+    [InlineData(0.0)]
+    [InlineData(-1.0)]
+    [InlineData(double.NaN)]
+    [InlineData(double.PositiveInfinity)]
+    [InlineData(double.NegativeInfinity)]
+    public void InvalidNormBound_IsRejected(double bound)
+    {
+        var error = Assert.Throws<ArgumentOutOfRangeException>(() =>
+            GpuOptimizer.TryClipGradNorm(Array.Empty<Tensor<float>>(), bound));
+        Assert.Equal("maxNorm", error.ParamName);
+    }
+
+    [Fact]
+    public void NullGradientList_IsRejectedByBothOperations()
+    {
+        Assert.Throws<ArgumentNullException>(() => GpuOptimizer.TryClipGradNorm(null!, 1));
+        Assert.Throws<ArgumentNullException>(() => GpuOptimizer.TryGradientSumOfSquares(null!));
+    }
+
     private static float[] Rand(int n, int seed, double scale)
     {
         var r = new Random(seed);

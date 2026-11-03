@@ -17,6 +17,35 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 public class SparseAwareParameterBufferTests
 {
     private readonly IEngine _engine = AiDotNetEngine.Current;
+    [Theory]
+    [InlineData("dense-for-sparse")]
+    [InlineData("sparse-shape")]
+    [InlineData("sparse-count")]
+    [InlineData("dense-length")]
+    public void CopyFrom_InvalidSlotIsRejected_AndBufferRemainsUsable(string kind)
+    {
+        var pattern = new SparsityLayout(3, 3, new[] { 0, 1 }, new[] { 0, 1 });
+        var buffer = kind == "dense-length"
+            ? new ParameterBuffer<float>(new[] { new[] { 2 } })
+            : new ParameterBuffer<float>(new[] { new ParameterLayout(new[] { 3, 3 }, pattern) });
+        buffer.CopyFrom(new Vector<float>(new[] { 41f, 42f }));
+        Tensor<float> invalid = kind switch
+        {
+            "dense-for-sparse" => new Tensor<float>(new[] { 3, 3 }),
+            "sparse-shape" => new SparseTensor<float>(4, 4, new[] { 0, 1 }, new[] { 0, 1 }, new Vector<float>(new[] { 7f, 8f })),
+            "sparse-count" => new SparseTensor<float>(3, 3, new[] { 0 }, new[] { 0 }, new Vector<float>(new[] { 7f })),
+            _ => new Tensor<float>(new[] { 3 }),
+        };
+        Assert.Throws<ArgumentException>(() => buffer.CopyFrom(new[] { invalid }));
+        Assert.Equal(new[] { 41f, 42f }, buffer.AsVector().ToArray());
+
+        Tensor<float> valid = kind == "dense-length"
+            ? new Tensor<float>(new[] { 2 }, new Vector<float>(new[] { 5f, 6f }))
+            : new SparseTensor<float>(3, 3, new[] { 0, 1 }, new[] { 0, 1 }, new Vector<float>(new[] { 5f, 6f }));
+        buffer.CopyFrom(new[] { valid });
+        Assert.Equal(new[] { 5f, 6f }, buffer.AsVector().ToArray());
+    }
+
 
     private static SparsityLayout PatternFor(SparseTensor<float> source) =>
         SparsityLayout.FromSparseTensor(source);
