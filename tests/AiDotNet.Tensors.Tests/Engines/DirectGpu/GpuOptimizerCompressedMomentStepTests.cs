@@ -30,6 +30,53 @@ public class GpuOptimizerCompressedMomentStepTests
         public void Dispose() { }
     }
 
+    private sealed class NoAccessBuffer : IGpuBuffer
+    {
+        public long SizeInBytes => throw new InvalidOperationException("Empty steps must not access buffers.");
+        public int Size => throw new InvalidOperationException("Empty steps must not access buffers.");
+        public IntPtr Handle => throw new InvalidOperationException("Empty steps must not access buffers.");
+        public void Dispose() { }
+    }
+
+    [SkippableFact]
+    public void RawInt8EmptyStep_DoesNotAccessBuffers()
+    {
+        using var gpu = TryGpu();
+        Skip.If(gpu is null, "No GPU available.");
+        var backend = gpu!.GetBackend() as IAdam8BitWeightDecayBackend;
+        Skip.If(backend is null, "Backend has no int8 decay step.");
+        var buffer = new NoAccessBuffer();
+        backend!.Adam8BitUpdate(buffer, buffer, buffer, buffer, buffer, buffer,
+            Lr, Beta1, Beta2, Eps, 0.1f, 0.01f, 0.1f, 0.01f, 256, 0, 0, WeightDecay, true);
+    }
+
+    [Theory]
+    [InlineData(float.NaN)]
+    [InlineData(float.PositiveInfinity)]
+    [InlineData(float.NegativeInfinity)]
+    [InlineData(-0.1f)]
+    public void EagerSteps_RejectInvalidScalarsBeforeDeviceAccess(float invalid)
+    {
+        var p = new Tensor<float>(new[] { 4 });
+        var g = new Tensor<float>(new[] { 4 });
+        var state = new NoAccessBuffer();
+        foreach (string target in new[] { "lr", "beta1", "beta2", "epsilon", "weightDecay" })
+        {
+            float lr = target == "lr" ? invalid : Lr;
+            float b1 = target == "beta1" ? invalid : Beta1;
+            float b2 = target == "beta2" ? invalid : Beta2;
+            float eps = target == "epsilon" ? invalid : Eps;
+            float wd = target == "weightDecay" ? invalid : WeightDecay;
+            var bf16 = Assert.Throws<ArgumentOutOfRangeException>(() => GpuOptimizer.TryAdamBf16Step(
+                p, g, state, state, lr, b1, b2, eps, wd, 1, true));
+            var int8 = Assert.Throws<ArgumentOutOfRangeException>(() => GpuOptimizer.TryAdam8BitStep(
+                p, g, state, state, state, state, lr, b1, b2, eps, 0.1f, 0.01f, 2, wd, true));
+            Assert.Equal(target, bf16.ParamName);
+            Assert.Equal(target, int8.ParamName);
+        }
+        Assert.Equal(new float[4], p.ToArray());
+    }
+
     [Theory]
     [InlineData("mQ")]
     [InlineData("vQ")]
