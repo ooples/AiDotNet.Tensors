@@ -166,7 +166,7 @@ public sealed class ParameterBuffer<T>
 
         _totalSize = offset;
         _data = new Vector<T>(_totalSize);
-        _storage = new TensorStorage<T>(_data);
+        _storage = new TensorStorage<T>(_data) { IsParameterBuffer = true };
     }
 
     private static IReadOnlyList<ParameterLayout> WrapAsDenseLayouts(IReadOnlyList<int[]> shapes)
@@ -435,7 +435,7 @@ public sealed class ParameterBuffer<T>
         // buffer's own read paths (CreateView, GetSparseValuesSpan, ...)
         // use _data which we update here.
         _data = newData;
-        _storage = new TensorStorage<T>(newData);
+        _storage = new TensorStorage<T>(newData) { IsParameterBuffer = true };
         _totalSize = newTotal;
 
         _sparseLayouts[index] = newLayout;
