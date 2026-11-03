@@ -340,6 +340,29 @@ public static class GpuOptimizer
     /// GPU-resident, any state buffer is null, or the active backend does not
     /// implement compressed optimizer moments.
     /// </summary>
+    private static bool TryUpdateCompressedParameter(DirectGpuTensorEngine engine, IDirectGpuBackend backend,
+        Tensor<float> param, Action<IGpuBuffer> update)
+    {
+        bool flat = DirectGpuTensorEngine.IsFlatParameterView(param);
+        var buffer = flat ? engine.AcquireParameterBuffer(param, out _) : param.TryGetGpuBuffer();
+        if (buffer is null && flat && engine.TryStageFlatParameter(param) is { } staged)
+        {
+            using (staged)
+            {
+                update(staged.Staged);
+                backend.Copy(staged.Staged, 0, staged.FlatBuffer, staged.Offset, param.Length);
+            }
+            MarkParameterUpdated(engine, backend, param, staged.FlatBuffer);
+            return true;
+        }
+        if (buffer is null) return false;
+        update(buffer);
+        if (flat) MarkParameterUpdated(engine, backend, param, buffer);
+        else MarkGpuUpdated(backend, param);
+        return true;
+    }
+
+
     public static bool TryAdam8BitStep(Tensor<float> p, Tensor<float> g,
         DirectGpu.IGpuBuffer? mQ, DirectGpu.IGpuBuffer? vQ, DirectGpu.IGpuBuffer? mScales, DirectGpu.IGpuBuffer? vScales,
         float lr, float beta1, float beta2, float epsilon, float biasCorrection1, float biasCorrection2, int blockSize)
@@ -357,15 +380,9 @@ public static class GpuOptimizer
         if (e.GetBackend() is not ICompressedMomentGpuOptimizerBackend cb) return false;
         var gb = g.TryGetGpuBuffer();
         if (gb is null) return false;
-        bool flatView = DirectGpuTensorEngine.IsFlatParameterView(p);
-        var pb = flatView ? e.AcquireParameterBuffer(p, out _) : p.TryGetGpuBuffer();
-        if (pb is null || gb is null) return false;
         int nb = HostCompressedMomentAdam.BlockCount(p.Length, blockSize);
-        cb.Adam8BitUpdate(pb, gb, mQ, vQ, mScales, vScales,
-            lr, beta1, beta2, epsilon, 1f - beta1, 1f - beta2, biasCorrection1, biasCorrection2, blockSize, p.Length, nb);
-        if (flatView) MarkParameterUpdated(e, cb, p, pb);
-        else MarkGpuUpdated(cb, p);
-        return true;
+        return TryUpdateCompressedParameter(e, cb, p, pb => cb.Adam8BitUpdate(pb, gb, mQ, vQ, mScales, vScales,
+            lr, beta1, beta2, epsilon, 1f - beta1, 1f - beta2, biasCorrection1, biasCorrection2, blockSize, p.Length, nb));
     }
 
     /// <summary>
@@ -393,16 +410,10 @@ public static class GpuOptimizer
                 && TryAdam8BitStep(p, g, mQ, vQ, mScales, vScales, lr, beta1, beta2, epsilon, biasCorrection1, biasCorrection2, blockSize);
         var gb = g.TryGetGpuBuffer();
         if (gb is null) return false;
-        bool flatView = DirectGpuTensorEngine.IsFlatParameterView(p);
-        var pb = flatView ? e.AcquireParameterBuffer(p, out _) : p.TryGetGpuBuffer();
-        if (pb is null || gb is null) return false;
         int nb = HostCompressedMomentAdam.BlockCount(p.Length, blockSize);
-        db.Adam8BitUpdate(pb, gb, mQ, vQ, mScales, vScales,
+        return TryUpdateCompressedParameter(e, db, p, pb => db.Adam8BitUpdate(pb, gb, mQ, vQ, mScales, vScales,
             lr, beta1, beta2, epsilon, 1f - beta1, 1f - beta2, biasCorrection1, biasCorrection2, blockSize, p.Length, nb,
-            weightDecay, decoupledWeightDecay);
-        if (flatView) MarkParameterUpdated(e, db, p, pb);
-        else MarkGpuUpdated(db, p);
-        return true;
+            weightDecay, decoupledWeightDecay));
     }
 
     /// <summary>
@@ -452,16 +463,13 @@ public static class GpuOptimizer
         if (e.GetBackend() is not ICompressedMomentGpuOptimizerBackend cb) return false;
         var gb = g.TryGetGpuBuffer();
         if (gb is null) return false;
-        bool flatView = DirectGpuTensorEngine.IsFlatParameterView(p);
-        var pb = flatView ? e.AcquireParameterBuffer(p, out _) : p.TryGetGpuBuffer();
-        if (pb is null || gb is null) return false;
-        if (decoupledWeightDecay)
-            cb.AdamWUpdateBf16(pb, gb, m, v, lr, beta1, beta2, epsilon, weightDecay, step, p.Length);
-        else
-            cb.AdamUpdateBf16(pb, gb, m, v, lr, beta1, beta2, epsilon, weightDecay, step, p.Length);
-        if (flatView) MarkParameterUpdated(e, cb, p, pb);
-        else MarkGpuUpdated(cb, p);
-        return true;
+        return TryUpdateCompressedParameter(e, cb, p, pb =>
+        {
+            if (decoupledWeightDecay)
+                cb.AdamWUpdateBf16(pb, gb, m, v, lr, beta1, beta2, epsilon, weightDecay, step, p.Length);
+            else
+                cb.AdamUpdateBf16(pb, gb, m, v, lr, beta1, beta2, epsilon, weightDecay, step, p.Length);
+        });
     }
 
     // ---- GPU-resident steps for the rest of the backend optimizer kernels (same contract as TryAdamStep:
