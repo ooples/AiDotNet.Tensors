@@ -222,9 +222,12 @@ kernel void rect_slice_nd(
     else slice[gid] = full[offset];
 }
 // Global-norm clip, one threadgroup reduction per tensor (no address tables): only threadgroup 0 runs, whatever size
-// the pipeline picked; thread 0 adds the partials in order to acc[0] and marks acc[1] (as bits) when any element was not
-// finite, and dispatches on one queue run in order, so no atomics. Finiteness is read from the exponent bits: Metal
-// compiles with fast math, which may fold isfinite() to true.
+// the pipeline picked; thread 0 adds the partials in order to acc[0] (the sum of squares) and acc[1] (the sum of
+// (x * 2^-80)^2), or sets acc[1] to NaN bits when any element was not finite, and dispatches on one queue run in order,
+// so no atomics. Finiteness is read from the exponent bits and the NaN mark is kept by its bits: Metal compiles with
+// fast math, which may fold isfinite() to true and need not propagate NaN.
+// The scaled sum carries a norm past the float range: when acc[0] overflows (the sum is at least 2^128) the scaled sum
+// is at least 2^-32, a normal float, and it cannot itself overflow below ~4e9 elements at FLT_MAX.
 kernel void tensor_sum_squares_accumulate(
     device const float* x [[buffer(0)]],
     device float* acc [[buffer(1)]],
@@ -236,32 +239,41 @@ kernel void tensor_sum_squares_accumulate(
     // 1024 is Metal's per-threadgroup thread ceiling (maxTotalThreadsPerThreadgroup), so lid < 1024 always; the host
     // dispatches MultiTensorArgs.ReductionGroupSize (256).
     threadgroup float partial[1024];
+    threadgroup float scaled[1024];
     threadgroup uint flags[1024];
     if (group != 0) return;
-    float v = 0.0f;
+    const float down = as_type<float>(0x17800000u); // 2^-80, exact
+    float v = 0.0f, w = 0.0f;
     uint bad = 0u;
     for (uint i = lid; i < n; i += groupSize)
     {
         float e = x[i];
+        float d = e * down;
         v += e * e;
+        w += d * d;
         bad |= (as_type<uint>(e) & 0x7f800000u) == 0x7f800000u ? 1u : 0u;
     }
     partial[lid] = v;
+    scaled[lid] = w;
     flags[lid] = bad;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lid == 0)
     {
-        float s = 0.0f;
+        float s = 0.0f, t = 0.0f;
         uint f = 0u;
-        for (uint j = 0; j < groupSize; ++j) { s += partial[j]; f |= flags[j]; }
+        for (uint j = 0; j < groupSize; ++j) { s += partial[j]; t += scaled[j]; f |= flags[j]; }
         acc[0] += s;
-        if (f != 0u) reinterpret_cast<device uint*>(acc)[1] = 1u;
+        device uint* bits = reinterpret_cast<device uint*>(acc);
+        uint prev = bits[1];
+        bits[1] = (f != 0u || (prev & 0x7f800000u) == 0x7f800000u)
+            ? 0x7fc00000u : as_type<uint>(as_type<float>(prev) + t);
     }
 }
 
-// #1520: the accumulated (float sum, non-finite mark) as the double IDeviceScalarOps and the guarded updates read: NaN
-// when any element was not finite, DBL_MAX when only the float sum overflowed, else the float sum exactly. Built from
-// bits: Metal has no double.
+// #1520: the accumulated (float sum, scaled sum) as the double IDeviceScalarOps and the guarded updates read: NaN when
+// the scaled sum is NaN (an element was not finite), the scaled sum times 2^160 when only the float sum overflowed (the
+// finite value CUDA's double accumulation gives), else the float sum exactly. Built from bits: Metal has no double.
+// Writing DBL_MAX for an overflow made the clip coefficient ~0 and erased the gradients.
 kernel void sum_squares_finish_double(
     device uint* acc [[buffer(0)]],
     uint gid [[thread_position_in_grid]])
@@ -270,8 +282,15 @@ kernel void sum_squares_finish_double(
     uint u = acc[0];
     uint e = (u >> 23) & 0xffu, mant = u & 0x7fffffu;
     uint hi, lo;
-    if (acc[1] != 0u) { hi = 0x7ff80000u; lo = 0u; }
-    else if (e == 0xffu) { hi = 0x7fefffffu; lo = 0xffffffffu; }
+    uint su = acc[1];
+    uint se = (su >> 23) & 0xffu, smant = su & 0x7fffffu;
+    if (se == 0xffu) { hi = 0x7ff80000u; lo = 0u; }
+    else if (e == 0xffu)
+    {
+        // The scaled sum is >= 2^-32 here, so normal; re-bias its exponent by the 2^160 the scaling removed.
+        hi = se == 0u ? 0x7fefffffu : ((se + 896u + 160u) << 20) | (smant >> 3);
+        lo = se == 0u ? 0xffffffffu : smant << 29;
+    }
     else if (e == 0u && mant == 0u) { hi = 0u; lo = 0u; }
     else if (e == 0u)
     {
@@ -286,9 +305,9 @@ kernel void sum_squares_finish_double(
     acc[1] = hi;
 }
 
-// min(1, maxNorm / (norm + 1e-6)) from the double sum_squares_finish_double wrote (narrowed back to a float: it came
-// from one); a non-finite norm, or a sum past the float range, leaves the gradients unscaled. Tested on the exponent
-// bits: Metal compiles with fast math, which may fold isfinite() to true.
+// min(1, maxNorm / (norm + 1e-6)) from the double sum_squares_finish_double wrote, the norm taken from the double's
+// exponent and mantissa (sum = m * 2^k, norm = sqrt(m) * 2^(k/2)) so a sum past the float range, carried by the finish
+// from the scaled sum, gets the coefficient CUDA's double norm gives. A non-finite norm leaves the gradients unscaled. Tested on the exponent bits: Metal compiles with fast math, which may fold isfinite() to true.
 kernel void clip_scale_from_sum_squares(
     device const uint* acc [[buffer(0)]],
     device float* scale [[buffer(1)]],
@@ -297,13 +316,18 @@ kernel void clip_scale_from_sum_squares(
 {
     if (gid != 0) return;
     uint lo = acc[0], hi = acc[1];
-    int e = int((hi >> 20) & 0x7ffu) - 1023;
+    uint ef = (hi >> 20) & 0x7ffu;
+    float maxNorm = as_type<float>(maxNormBits);
     float c = 1.0f;
-    if (e <= 127)
+    if (ef == 0u) c = maxNorm / 1e-6f;
+    else if (ef != 0x7ffu)
     {
-        float sum = e < -126 ? 0.0f : as_type<float>((uint(e + 127) << 23) | ((hi & 0xfffffu) << 3) | (lo >> 29));
-        float norm = sqrt(sum);
-        if ((as_type<uint>(norm) & 0x7f800000u) != 0x7f800000u) c = as_type<float>(maxNormBits) / (norm + 1e-6f);
+        int k = int(ef) - 1023;
+        float m = as_type<float>(0x3f800000u | ((hi & 0xfffffu) << 3) | (lo >> 29));
+        if ((k & 1) != 0) { m *= 2.0f; k -= 1; }
+        int h = k / 2;
+        float root = sqrt(m);
+        c = h < 64 ? maxNorm / (ldexp(root, h) + 1e-6f) : ldexp(maxNorm / root, -h);
     }
     scale[0] = c < 1.0f ? c : 1.0f;
 }

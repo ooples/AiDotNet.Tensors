@@ -1150,46 +1150,64 @@ __kernel void sparse_proximal_l1_update(
 
 // Global-norm clip, the OpenCL port of CUDA's multi-tensor kernels: one work-group of 256 per tensor (the host
 // launches global = local = 256). Each work-item strides the tensor; work-item 0 then adds the group's partials, in
-// order, to acc[0], and marks acc[1] (as bits) when any element was not finite. Launches on one queue run in order,
-// so the accumulation needs no atomics and is deterministic. Finiteness is tested on the exponent bits:
-// fast-relaxed-math may fold isfinite() to true.
+// order, to acc[0] (the sum of squares) and acc[1] (the sum of (x * 2^-80)^2), or sets acc[1] to NaN when any element
+// was not finite. Launches on one queue run in order, so the accumulation needs no atomics and is deterministic.
+// Finiteness is tested on the exponent bits: fast-relaxed-math may fold isfinite() to true.
+// The scaled sum carries a norm past the float range: when acc[0] overflows (the sum is at least 2^128) the scaled sum
+// is at least 2^-32, a normal float, and it cannot itself overflow below ~4e9 elements at FLT_MAX. Squares of elements
+// under 2^17 vanish from it: at most n * 2^34 against a sum of at least 2^128.
 __kernel void tensor_sum_squares_accumulate(__global const float* x, const int n, __global float* acc)
 {
     __local float partial[256];
+    __local float scaled[256];
     __local uint flags[256];
     const int lid = get_local_id(0);
-    float v = 0.0f;
+    const float down = as_float(0x17800000u); // 2^-80, exact
+    float v = 0.0f, w = 0.0f;
     uint bad = 0u;
     for (int i = lid; i < n; i += 256)
     {
         const float e = x[i];
+        const float d = e * down;
         v += e * e;
+        w += d * d;
         bad |= (as_uint(e) & 0x7f800000u) == 0x7f800000u ? 1u : 0u;
     }
     partial[lid] = v;
+    scaled[lid] = w;
     flags[lid] = bad;
     barrier(CLK_LOCAL_MEM_FENCE);
     if (lid == 0)
     {
-        float s = 0.0f;
+        float s = 0.0f, t = 0.0f;
         uint f = 0u;
-        for (int j = 0; j < 256; j++) { s += partial[j]; f |= flags[j]; }
+        for (int j = 0; j < 256; j++) { s += partial[j]; t += scaled[j]; f |= flags[j]; }
         acc[0] += s;
-        if (f != 0u) acc[1] = as_float(1u);
+        // NaN stays NaN by its bits, not by arithmetic propagation.
+        acc[1] = (f != 0u || (as_uint(acc[1]) & 0x7f800000u) == 0x7f800000u) ? as_float(0x7fc00000u) : acc[1] + t;
     }
 }
 
-// The accumulated (float sum, non-finite mark) as the double IDeviceScalarOps and the guarded updates read: NaN when
-// any element was not finite, DBL_MAX when only the float sum overflowed (every element finite, as CUDA's double
-// accumulation would say), else the float sum exactly. Built from bits, so the device needs no double support.
+// The accumulated (float sum, scaled sum) as the double IDeviceScalarOps and the guarded updates read: NaN when any
+// element was not finite (the scaled sum is NaN), the scaled sum times 2^160 when only the float sum overflowed (every
+// element finite: the finite value CUDA's double accumulation gives), else the float sum exactly. Built from bits, so
+// the device needs no double support. Writing DBL_MAX for an overflow made the clip coefficient ~0 and erased the
+// gradients, where CUDA scales a 3e19 element to ~0.7.
 __kernel void sum_squares_finish_double(__global float* acc)
 {
     if (get_global_id(0) != 0) return;
     const uint u = as_uint(acc[0]);
     const uint e = (u >> 23) & 0xffu, mant = u & 0x7fffffu;
+    const uint su = as_uint(acc[1]);
+    const uint se = (su >> 23) & 0xffu, smant = su & 0x7fffffu;
     uint hi, lo;
-    if (as_uint(acc[1]) != 0u) { hi = 0x7ff80000u; lo = 0u; }
-    else if (e == 0xffu) { hi = 0x7fefffffu; lo = 0xffffffffu; }
+    if (se == 0xffu) { hi = 0x7ff80000u; lo = 0u; }
+    else if (e == 0xffu)
+    {
+        // The scaled sum is >= 2^-32 here, so normal; re-bias its exponent by the 2^160 the scaling removed.
+        hi = se == 0u ? 0x7fefffffu : ((se + 896u + 160u) << 20) | (smant >> 3);
+        lo = se == 0u ? 0xffffffffu : smant << 29;
+    }
     else if (e == 0u && mant == 0u) { hi = 0u; lo = 0u; }
     else if (e == 0u)
     {
@@ -1205,19 +1223,25 @@ __kernel void sum_squares_finish_double(__global float* acc)
 }
 
 // PyTorch clip_grad_norm_ coefficient: min(1, maxNorm / (norm + 1e-6)), from the double sum_squares_finish_double
-// wrote (narrowed back to a float: it came from one). A non-finite norm -- or a sum past the float range, as before --
-// leaves the gradients unscaled (1).
+// wrote. The norm is taken from the double's exponent and mantissa (sum = m * 2^k, norm = sqrt(m) * 2^(k/2)), so a sum
+// past the float range -- carried by the finish from the scaled sum -- gives the coefficient CUDA's double norm does.
+// Narrowing the sum to a float made it infinite and left those gradients unscaled. A non-finite norm (any element NaN or infinite) leaves the gradients unscaled (1).
 __kernel void clip_scale_from_sum_squares(__global const float* acc, const float maxNorm, __global float* scale)
 {
     if (get_global_id(0) != 0) return;
     const uint lo = as_uint(acc[0]), hi = as_uint(acc[1]);
-    const int e = (int)((hi >> 20) & 0x7ffu) - 1023;
-    float sum;
-    if (e > 127) sum = as_float(0x7f800000u);
-    else if (e < -126) sum = 0.0f;
-    else sum = as_float(((uint)(e + 127) << 23) | ((hi & 0xfffffu) << 3) | (lo >> 29));
-    const float norm = sqrt(sum);
-    const float c = (as_uint(norm) & 0x7f800000u) != 0x7f800000u ? maxNorm / (norm + 1e-6f) : 1.0f;
+    const uint ef = (hi >> 20) & 0x7ffu;
+    float c = 1.0f;
+    if (ef == 0u) c = maxNorm / 1e-6f;
+    else if (ef != 0x7ffu)
+    {
+        int k = (int)ef - 1023;
+        float m = as_float(0x3f800000u | ((hi & 0xfffffu) << 3) | (lo >> 29));
+        if ((k & 1) != 0) { m *= 2.0f; k -= 1; }
+        const int h = k / 2;
+        const float root = sqrt(m);
+        c = h < 64 ? maxNorm / (ldexp(root, h) + 1e-6f) : ldexp(maxNorm / root, -h);
+    }
     scale[0] = c < 1.0f ? c : 1.0f;
 }
 

@@ -42,6 +42,13 @@ AiDotNet.Tensors.Engines.TensorAddActivationEngineExtensions
 static AiDotNet.Tensors.Engines.TensorAddActivationEngineExtensions.TensorAddActivation<T>(this AiDotNet.Tensors.Engines.IEngine! engine, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! a, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! b, AiDotNet.Tensors.Engines.FusedActivationType activation) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
 static AiDotNet.Tensors.Engines.AiDotNetEngine.ReleaseGpu() -> bool
 static AiDotNet.Tensors.Engines.AiDotNetEngine.ReleaseGpu(System.TimeSpan drainTimeout) -> bool
+AiDotNet.Tensors.Engines.Gpu.DeviceGradientNorm
+AiDotNet.Tensors.Engines.Gpu.DeviceGradientNorm.Dispose() -> void
+AiDotNet.Tensors.Engines.Gpu.DeviceGradientNorm.IsFinite.get -> bool
+AiDotNet.Tensors.Engines.Gpu.DeviceGradientNorm.TotalNorm.get -> double
+AiDotNet.Tensors.Engines.Gpu.DeviceGradientNorm.TotalNormSquared.get -> double
+static AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TryClipGradNorm(System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.LinearAlgebra.Tensor<float>!>! gradients, double maxNorm) -> AiDotNet.Tensors.Engines.Gpu.DeviceGradientNorm?
+static AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TryGradientSumOfSquares(System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.LinearAlgebra.Tensor<float>!>! gradients) -> AiDotNet.Tensors.Engines.Gpu.DeviceGradientNorm?
 AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.OneHotInt32(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! int32Indices, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int rows, int depth) -> void
 AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend.OneHotInt32(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! int32Indices, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int rows, int depth) -> void
 AiDotNet.Tensors.Engines.DirectGpu.IOneHotIndexBackend.OneHotInt32(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! int32Indices, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int rows, int depth) -> void

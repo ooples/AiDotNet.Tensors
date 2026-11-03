@@ -1585,7 +1585,14 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         {
             if (_device != TensorDevice.CPU) return true;
             var live = GetLiveBackingArrayOrNull();
-            return live is not null && Helpers.HostSync.IsPending(live);
+            if (live is not null) return Helpers.HostSync.IsPending(live);
+            // A view (offset into a larger array, e.g. a ParameterBuffer parameter) has no live backing array of its
+            // own, but its data is the shared array's: when that array has a pending device download -- an optimizer
+            // updated the flat parameter buffer on the device -- the view's authoritative copy is on the device too.
+            // Reporting false here made callers treat such a parameter as host-current and invalidate it, which
+            // dropped the device update for every parameter in the buffer.
+            var identity = GetBackingArrayForCacheLookupUnsafe();
+            return identity is not null && Helpers.HostSync.IsPending(identity);
         }
     }
 

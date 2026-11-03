@@ -101,17 +101,20 @@ public abstract class DeviceFiniteGuardTestBase
     }
 
     [SkippableFact]
-    public void The_finish_turns_a_float_overflow_into_the_largest_double_and_a_mark_into_nan()
+    public void The_finish_carries_a_float_overflow_on_the_scaled_sum_and_a_nan_mark_into_nan()
     {
+        // The second slot is the sum of (x * 2^-80)^2. When the float sum overflowed, the finish must rebuild the true
+        // sum from it (scaled sum * 2^160), the finite value CUDA's double accumulation gives. It used to write
+        // DBL_MAX, which made the clip coefficient ~0 and erased the gradients.
         Skip.IfNot(HasFinishKernel, "This backend sums in double; there is no float-to-double finish.");
         using var lease = Lease();
         var backend = lease.Backend;
-        using var overflow = backend.AllocateBuffer(new[] { float.PositiveInfinity, 0f });
-        using var marked = backend.AllocateBuffer(new[] { 1f, BitConverter.ToSingle(BitConverter.GetBytes(1u), 0) });
+        using var overflow = backend.AllocateBuffer(new[] { float.PositiveInfinity, 1.5f });
+        using var marked = backend.AllocateBuffer(new[] { 1f, float.NaN });
         Finish(backend, overflow);
         Finish(backend, marked);
         backend.Synchronize();
-        Assert.Equal(double.MaxValue, ReadDouble(backend, overflow));
+        Assert.Equal(1.5 * Math.Pow(2, 160), ReadDouble(backend, overflow));
         Assert.True(double.IsNaN(ReadDouble(backend, marked)));
     }
 
@@ -127,8 +130,10 @@ public abstract class DeviceFiniteGuardTestBase
         withInf[7] = float.NegativeInfinity;
         Assert.True(double.IsNaN(SumOfSquares(backend, withInf)));
         // Every element finite, but their float sum of squares overflows: CUDA's double sum is finite, and so is this.
+        // Finite and the right value: a placeholder such as DBL_MAX is finite too.
         double overflow = SumOfSquares(backend, Enumerable.Repeat(1e30f, 8).ToArray());
-        Assert.False(double.IsNaN(overflow) || double.IsInfinity(overflow), $"{overflow}");
+        double exact = 8.0 * (double)1e30f * 1e30f;
+        Assert.True(Math.Abs(overflow - exact) <= 1e-6 * exact, $"sum of squares {overflow:E6}, expected {exact:E6}");
     }
 
     [SkippableTheory]

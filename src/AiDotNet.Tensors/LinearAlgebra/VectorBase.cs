@@ -47,6 +47,14 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.
     private System.Action? _beforeWrite;
 
     /// <summary>
+    /// Optional notification that this vector's elements were written (or handed out writable), installed by an
+    /// owner that caches a copy of the elements elsewhere -- a <see cref="Engines.Autodiff.ParameterBuffer{T}"/>
+    /// advances its GPU-cache version with it, so a device copy uploaded before the write is not reused after it.
+    /// Separate from <see cref="_beforeWrite"/>, which a tensor sharing the vector replaces with its own guard.
+    /// </summary>
+    private System.Action? _onWrite;
+
+    /// <summary>
     /// The device side of this data holder, shared by every tensor view of it; null until something binds a device
     /// copy. See <see cref="VectorDeviceState"/>.
     /// </summary>
@@ -139,6 +147,29 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.
     {
         _beforeWrite = beforeWrite;
     }
+
+    /// <summary>Installs the notification run on every write through this vector; see <see cref="_onWrite"/>.</summary>
+    internal void SetWriteObserver(System.Action? onWrite)
+    {
+        _onWrite = onWrite;
+    }
+    /// <summary>Preserves write tracking when another vector aliases this vector's memory.</summary>
+    private protected void ShareWriteObserver(VectorBase<T> alias) => alias._onWrite = _onWrite;
+
+
+    /// <summary>
+    /// Runs the write notification when disposed, so an in-place operation notifies after its write on every return
+    /// path: notified before it, a reader between the two would cache the old elements under the new version.
+    /// </summary>
+    private protected readonly struct WriteNotice : IDisposable
+    {
+        private readonly System.Action? _onWrite;
+        internal WriteNotice(VectorBase<T> vector) => _onWrite = vector._onWrite;
+        public void Dispose() => _onWrite?.Invoke();
+    }
+
+    /// <summary>Runs the write notification, if any, after a write that bypasses this class's write paths.</summary>
+    private protected void NotifyWritten() => _onWrite?.Invoke();
 
     /// <summary>
     /// Optional memory owner for pooled memory management.
@@ -395,6 +426,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.
             _beforeWrite?.Invoke();
             EnsureMaterialized();
             _memory.Span[index] = value;
+            _onWrite?.Invoke();
         }
     }
 
@@ -521,6 +553,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.
     {
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         _beforeWrite?.Invoke();
+        _onWrite?.Invoke();
         EnsureMaterialized();
         return _memory.Span;
     }
@@ -735,6 +768,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.
     {
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         _beforeWrite?.Invoke();
+        _onWrite?.Invoke();
         EnsureMaterialized();
         return _memory;
     }
@@ -746,6 +780,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.
         // (if it is a tracked result buffer) is never recycled. Leases (Lease/LeaseWritable) keep the vector alive instead.
         ResultOwner?.MarkEscaped();
         _beforeWrite?.Invoke();
+        _onWrite?.Invoke();
         EnsureMaterialized();
         return _memory;
     }
@@ -1116,6 +1151,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.
     /// </remarks>
     public virtual void AddInPlace(VectorBase<T> other)
     {
+        using var written = new WriteNotice(this);
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         _beforeWrite?.Invoke();
@@ -1235,6 +1271,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.
     /// </remarks>
     public virtual void SubtractInPlace(VectorBase<T> other)
     {
+        using var written = new WriteNotice(this);
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         _beforeWrite?.Invoke();
@@ -1345,6 +1382,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.
     /// </remarks>
     public virtual void MultiplyInPlace(T scalar)
     {
+        using var written = new WriteNotice(this);
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         _beforeWrite?.Invoke();
 #if NET5_0_OR_GREATER
@@ -1444,6 +1482,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.
     /// </remarks>
     public virtual void DivideInPlace(T scalar)
     {
+        using var written = new WriteNotice(this);
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         _beforeWrite?.Invoke();
         EnsureMaterialized();

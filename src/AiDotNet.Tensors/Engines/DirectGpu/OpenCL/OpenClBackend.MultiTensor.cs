@@ -3,7 +3,7 @@ using System.Collections.Generic;
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 {
     // The global-norm clip as one work-group reduction per tensor (no device address tables on OpenCL), the OpenCL
-    // port of CudaBackend's IMultiTensorKernels. The per-tensor launches accumulate a float sum and a non-finite mark;
+    // port of CudaBackend's IMultiTensorKernels. The per-tensor launches accumulate a float sum and a 2^-80-scaled sum;
     // a last launch finishes them as the double CUDA writes (NaN when any element was not finite), so the same buffer
     // also serves IDeviceScalarOps and the device-guarded optimizer updates (#1502).
     public sealed partial class OpenClBackend : IMultiTensorKernels
@@ -25,7 +25,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             FinishSumOfSquaresDouble(sumOfSquares);
         }
 
-        // Turns the float sum and non-finite mark in the buffer's two slots into the double they stand for.
+        // Turns the float sum and scaled sum in the buffer's two slots into the double they stand for.
         internal void FinishSumOfSquaresDouble(IGpuBuffer accumulator)
         {
             var finish = _kernelCache["sum_squares_finish_double"];
@@ -58,5 +58,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 kernel.Execute1D(sizes[t], CalculateOptimalWorkGroupSize1D(sizes[t]));
             }
         }
-    }
+    
+
+        /// <inheritdoc />
+        double IMultiTensorKernels.ReadSumOfSquares(IGpuBuffer sumOfSquares)
+        {
+            MultiTensorArgs.ValidateSumBuffer(sumOfSquares);
+            return MultiTensorArgs.DoubleFromSlots(DownloadBuffer(sumOfSquares));
+        }
+}
 }

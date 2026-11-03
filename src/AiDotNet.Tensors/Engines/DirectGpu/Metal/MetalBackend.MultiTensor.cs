@@ -42,4 +42,11 @@ public sealed partial class MetalBackend : IMultiTensorKernels
         for (int t = 0; t < tensors.Count; t++)
             DispatchResidentMetal("scale_by_device_scalar_inplace", sizes[t], new[] { tensors[t], scale }, (uint)sizes[t]);
     }
+
+    /// <inheritdoc />
+    double IMultiTensorKernels.ReadSumOfSquares(IGpuBuffer sumOfSquares)
+    {
+        MultiTensorArgs.ValidateSumBuffer(sumOfSquares);
+        return MultiTensorArgs.DoubleFromSlots(DownloadBuffer(sumOfSquares));
+    }
 }

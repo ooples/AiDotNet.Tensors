@@ -19,6 +19,13 @@ namespace AiDotNet.Tensors.LinearAlgebra;
 internal sealed class TensorStorage<T>
 {
     private readonly Vector<T> _data;
+
+    /// <summary>
+    /// True for the flat storage of a <see cref="Engines.Autodiff.ParameterBuffer{T}"/>: every parameter of a model is
+    /// a view into it at its own offset. A device cache keyed on the shared array must resolve such a view at its
+    /// offset, never hand it the buffer cached for the whole array (that buffer starts at the FIRST parameter).
+    /// </summary>
+    internal bool IsParameterBuffer;
     private int _refCount;
     private int _gpuCacheVersion;
     private bool _trackGpuCacheVersion;
