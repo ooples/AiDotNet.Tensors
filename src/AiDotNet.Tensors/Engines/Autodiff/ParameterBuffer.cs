@@ -192,7 +192,12 @@ public sealed class ParameterBuffer<T>
     /// Returns the flat parameter vector. This is the actual backing data — zero copy.
     /// Second-order optimizers can operate directly on this vector.
     /// </summary>
-    public Vector<T> AsVector() => _data;
+    public Vector<T> AsVector()
+    {
+        // The vector is mutable and writes through it bypass the views: treat the device copy as stale.
+        MarkHostWritten();
+        return _data;
+    }
 
     /// <summary>
     /// Returns the underlying storage for creating tensor views.
@@ -572,7 +577,15 @@ public sealed class ParameterBuffer<T>
 
         using var sourceKeep1 = new KeepAliveScope(source);
         source.AsSpanUnmarked().CopyTo(_data.AsWritableSpan());
+        MarkHostWritten();
     }
+
+    /// <summary>
+    /// Advances the storage's GPU-cache version after a write to the flat array that bypasses the views (a bulk copy,
+    /// or a caller writing through <see cref="AsVector"/>). The device copy of the flat array is uploaded once per
+    /// version and every view resolves from it, so without the bump a GPU read after the write kept the old values.
+    /// </summary>
+    private void MarkHostWritten() => _storage.IncrementGpuCacheVersionIfTracked();
 
     /// <summary>
     /// Creates a flat gradient vector with the same layout as this buffer.

@@ -3974,6 +3974,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (param is null || typeof(T) != typeof(float) || !TryGetBackend(out var backend)) return;
         var arr = param.GetBackingArrayForCacheLookupUnsafe();
         if (arr is not float[] farr) return;
+        // A view (a ParameterBuffer parameter, a tensor at an offset into its array, or a strided one): the buffer
+        // cached for the array starts at element 0, not at the view, so binding it made every reader of the binding
+        // (the resident forward, GetWeightBufferPreferResident, the compiled step's optimizer) use another parameter's
+        // elements. Views stay unbound and resolve from the flat buffer at their offset (TryResolveDeviceParameterView);
+        // see CommitParameterUpdatedOnDevice for why a bound alias is not kept either.
+        if (!param.IsContiguous || param._storage.IsParameterBuffer
+            || (TryGetFlatParameterView((Tensor<float>)(object)param, out _, out int viewOffset) && viewOffset != 0)) return;
 
         int hostVersion = param.GpuCacheVersion;
         PersistentTensorRole role = _persistentBufferCache.TryGetValue(arr, out var current)

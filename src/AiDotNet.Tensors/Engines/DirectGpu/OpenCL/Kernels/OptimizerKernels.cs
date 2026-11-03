@@ -1205,19 +1205,26 @@ __kernel void sum_squares_finish_double(__global float* acc)
 }
 
 // PyTorch clip_grad_norm_ coefficient: min(1, maxNorm / (norm + 1e-6)), from the double sum_squares_finish_double
-// wrote (narrowed back to a float: it came from one). A non-finite norm -- or a sum past the float range, as before --
-// leaves the gradients unscaled (1).
+// wrote. The norm is taken from the double's exponent and mantissa (sum = m * 2^k, norm = sqrt(m) * 2^(k/2)), so a sum
+// past the float range -- the finish writes DBL_MAX when the float accumulator overflowed -- still clips: the
+// coefficient goes to ~0, as PyTorch's float32 norm (inf) gives 0. Narrowing the sum to a float made it infinite and
+// left those gradients unscaled. A non-finite norm (any element NaN or infinite) leaves the gradients unscaled (1).
 __kernel void clip_scale_from_sum_squares(__global const float* acc, const float maxNorm, __global float* scale)
 {
     if (get_global_id(0) != 0) return;
     const uint lo = as_uint(acc[0]), hi = as_uint(acc[1]);
-    const int e = (int)((hi >> 20) & 0x7ffu) - 1023;
-    float sum;
-    if (e > 127) sum = as_float(0x7f800000u);
-    else if (e < -126) sum = 0.0f;
-    else sum = as_float(((uint)(e + 127) << 23) | ((hi & 0xfffffu) << 3) | (lo >> 29));
-    const float norm = sqrt(sum);
-    const float c = (as_uint(norm) & 0x7f800000u) != 0x7f800000u ? maxNorm / (norm + 1e-6f) : 1.0f;
+    const uint ef = (hi >> 20) & 0x7ffu;
+    float c = 1.0f;
+    if (ef == 0u) c = maxNorm / 1e-6f;
+    else if (ef != 0x7ffu)
+    {
+        int k = (int)ef - 1023;
+        float m = as_float(0x3f800000u | ((hi & 0xfffffu) << 3) | (lo >> 29));
+        if ((k & 1) != 0) { m *= 2.0f; k -= 1; }
+        const int h = k / 2;
+        const float root = sqrt(m);
+        c = h < 64 ? maxNorm / (ldexp(root, h) + 1e-6f) : ldexp(maxNorm / root, -h);
+    }
     scale[0] = c < 1.0f ? c : 1.0f;
 }
 

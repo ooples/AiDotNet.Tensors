@@ -70,21 +70,25 @@ fn guard_sum_squares_finish(@builtin(global_invocation_id) gid: vec3<u32>) {
     acc[1] = hi;
 }
 
-// a = scale: min(1, maxNorm / (norm + 1e-6)) from the finished double (narrowed back to a float: it came from one);
-// a non-finite norm, or a sum past the float range, leaves the gradients unscaled.
+// a = scale: min(1, maxNorm / (norm + 1e-6)) from the finished double, the norm taken from the double's exponent and
+// mantissa (sum = m * 2^k, norm = sqrt(m) * 2^(k/2)) so a sum past the float range (DBL_MAX: the float accumulator
+// overflowed) still clips, to ~0 as PyTorch's float32 norm (inf) does. A non-finite norm leaves the gradients unscaled.
 @compute @workgroup_size(256)
 fn guard_clip_scale(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x != 0u) { return; }
     let lo = acc[0];
     let hi = acc[1];
-    let e = i32((hi >> 20u) & 0x7ffu) - 1023;
+    let ef = (hi >> 20u) & 0x7ffu;
     var c: f32 = 1.0;
-    // Past the float range (NaN and infinity included) the norm is not finite: c stays 1.
-    if (e <= 127) {
-        var sum: f32 = 0.0;
-        if (e >= -126) { sum = bitcast<f32>((u32(e + 127) << 23u) | ((hi & 0xfffffu) << 3u) | (lo >> 29u)); }
-        let norm = sqrt(sum);
-        if ((bitcast<u32>(norm) & 0x7f800000u) != 0x7f800000u) { c = params.maxNorm / (norm + 1e-6); }
+    if (ef == 0u) {
+        c = params.maxNorm / 1e-6;
+    } else if (ef != 0x7ffu) {
+        var k = i32(ef) - 1023;
+        var m = bitcast<f32>(0x3f800000u | ((hi & 0xfffffu) << 3u) | (lo >> 29u));
+        if ((k & 1) != 0) { m = m * 2.0; k = k - 1; }
+        let h = k / 2;
+        let root = sqrt(m);
+        if (h < 64) { c = params.maxNorm / (ldexp(root, h) + 1e-6); } else { c = ldexp(params.maxNorm / root, -h); }
     }
     a[0] = min(c, 1.0);
 }

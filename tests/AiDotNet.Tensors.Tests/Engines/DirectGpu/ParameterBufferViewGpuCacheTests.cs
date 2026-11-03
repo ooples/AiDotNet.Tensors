@@ -99,6 +99,68 @@ public sealed class ParameterBufferViewGpuCacheTests
         Close("d table", expected.Dtable, actual.Dtable);
     }
 
+    /// <summary>
+    /// A bulk write to the flat array (CopyFrom -- a functional call swapping parameters in and out, a second-order
+    /// optimizer's SetFlatParameters) bypasses the views. The flat array's device copy is uploaded once per storage
+    /// version, so the write must advance the version or every later GPU read keeps the old weights.
+    /// </summary>
+    [SkippableFact]
+    public void CopyFrom_IsSeenByTheNextGpuRead()
+    {
+        var gpu = TryGpu();
+        Skip.If(gpu is null, "GPU engine unavailable.");
+        using var gpuScope = gpu;
+        const int dim = 128;
+        var pb = new ParameterBuffer<float>(new[] { new[] { dim }, new[] { dim } });
+        Tensor<float> T(int seed) => new Tensor<float>(new[] { dim }, new Vector<float>(Rand(dim, seed)));
+        pb.CopyFrom(new[] { T(1), T(2) });
+        var views = pb.CreateAllViews();
+        var x0 = new Tensor<float>(new[] { 4, dim }, new Vector<float>(Rand(4 * dim, 3)));
+        var x = gpu!.TensorAdd(x0, x0);
+        var cpu = new CpuEngine();
+        var xHost = cpu.TensorAdd(x0, x0);
+        foreach (var v in views) gpu.RMSNorm(x, v, 1e-6, out _);   // uploads and caches the flat array
+
+        pb.CopyFrom(new[] { T(11), T(12) });
+        for (int i = 0; i < 2; i++)
+        {
+            var want = cpu.RMSNorm(xHost, new Tensor<float>(new[] { dim }, new Vector<float>(views[i].ToArray())), 1e-6, out _).ToArray();
+            var got = gpu.RMSNorm(x, views[i], 1e-6, out _).ToArray();
+            for (int j = 0; j < want.Length; j++)
+                Assert.True(Math.Abs(want[j] - got[j]) < 1e-4, $"after CopyFrom, view {i} element {j}: GPU {got[j]} vs {want[j]}");
+        }
+    }
+
+    /// <summary>
+    /// Binding a parameter for the resident step (the compiled plan's BindResidentParamBuffer) must not hand a view at
+    /// a nonzero offset the buffer cached for the whole flat array: it starts at the FIRST parameter, so the view's
+    /// reads (and the optimizer's in-place update) addressed another parameter's elements.
+    /// </summary>
+    [SkippableFact]
+    public void ResidentBinding_OfAViewAtAnOffset_ReadsTheViewsOwnElements()
+    {
+        var gpu = TryGpu();
+        Skip.If(gpu is null, "GPU engine unavailable.");
+        using var gpuScope = gpu;
+        const int dim = 96;
+        var pb = new ParameterBuffer<float>(new[] { new[] { 3 * dim }, new[] { dim } });
+        pb.CopyFrom(new[]
+        {
+            new Tensor<float>(new[] { 3 * dim }, new Vector<float>(Rand(3 * dim, 21))),
+            new Tensor<float>(new[] { dim }, new Vector<float>(Rand(dim, 22, 0.5).Select(v => v + 1f).ToArray())),
+        });
+        var views = pb.CreateAllViews();
+        var gamma = views[1];
+        gpu!.BindResidentParamBuffer(gamma);
+
+        var x0 = new Tensor<float>(new[] { 4, dim }, new Vector<float>(Rand(4 * dim, 23)));
+        var cpu = new CpuEngine();
+        var want = cpu.RMSNorm(cpu.TensorAdd(x0, x0), new Tensor<float>(new[] { dim }, new Vector<float>(gamma.ToArray())), 1e-6, out _).ToArray();
+        var got = gpu.RMSNorm(gpu.TensorAdd(x0, x0), gamma, 1e-6, out _).ToArray();
+        for (int j = 0; j < want.Length; j++)
+            Assert.True(Math.Abs(want[j] - got[j]) < 1e-4, $"element {j}: GPU {got[j]} vs {want[j]}");
+    }
+
     [SkippableFact]
     public void ViewLookups_UploadTheFlatArrayOncePerVersion()
     {

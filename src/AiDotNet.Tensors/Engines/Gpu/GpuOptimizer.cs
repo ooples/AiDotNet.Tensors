@@ -265,7 +265,8 @@ public static class GpuOptimizer
     /// the coefficient <c>min(1, maxNorm / (norm + 1e-6))</c> and the in-place scale of every gradient, with no host
     /// read. A non-finite norm leaves the gradients unscaled (the kernels' coefficient is 1), so a poisoned step keeps
     /// its evidence. Returns null when the current engine is not a GPU engine, its backend has no multi-tensor kernels,
-    /// or a gradient is not device-resident; the caller then clips on the host.
+    /// a gradient is not device-resident, or <paramref name="maxNorm"/> exceeds <see cref="float.MaxValue"/>; the caller
+    /// then clips on the host.
     /// </summary>
     /// <param name="gradients">The gradients, scaled in place.</param>
     /// <param name="maxNorm">The norm bound (positive).</param>
@@ -274,6 +275,9 @@ public static class GpuOptimizer
     {
         if (gradients is null) throw new ArgumentNullException(nameof(gradients));
         if (!(maxNorm > 0) || double.IsInfinity(maxNorm)) throw new ArgumentOutOfRangeException(nameof(maxNorm), "The norm bound must be positive and finite.");
+        // The device kernels take the bound as a float: past float.MaxValue it would narrow to infinity and the
+        // coefficient to 1, leaving a norm above the bound unclipped. Such a bound is clipped on the host, in double.
+        if (maxNorm > float.MaxValue) return null;
         return DeviceSumOfSquares(gradients, (float)maxNorm);
     }
 

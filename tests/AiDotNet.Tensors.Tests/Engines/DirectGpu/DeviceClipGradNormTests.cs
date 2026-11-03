@@ -111,6 +111,64 @@ public sealed class DeviceClipGradNormTests
         }
     }
 
+    /// <summary>
+    /// A total norm past the float range (squares of 3e19 overflow a float sum) still clips. The float-accumulating
+    /// backends narrowed the sum to an infinite float and left such gradients unscaled -- an exploding gradient passed
+    /// the clip -- and Vulkan reported them as non-finite. Every element is finite, so the norm is reported finite.
+    /// </summary>
+    [SkippableFact]
+    public void NormPastTheFloatRange_IsStillClipped_AndReportedFinite()
+    {
+        DirectGpuTensorEngine? gpu = null;
+        try { gpu = new DirectGpuTensorEngine(); } catch { }
+        Skip.If(gpu is null || !gpu.IsGpuAvailable, "GPU engine unavailable.");
+        var saved = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = gpu!;
+        try
+        {
+            var a = Rand(300, 3, 1);
+            a[5] = 3e19f; a[200] = -2.5e19f;
+            var b = Rand(64, 4, 1);
+            b[0] = 3e19f;
+            var grads = new[] { a, b }
+                .Select(h => gpu!.TensorMultiplyScalar(new Tensor<float>(new[] { h.Length }, new Vector<float>(h)), 1f))
+                .ToList();
+            const double maxNorm = 1.0;
+            using var norm = GpuOptimizer.TryClipGradNorm(grads, maxNorm);
+            Assert.NotNull(norm);
+            Assert.True(norm!.IsFinite, $"finite gradients reported non-finite (sum of squares {norm.TotalNormSquared})");
+            double after = Math.Sqrt(grads.Sum(g => g.ToArray().Sum(v => (double)v * v)));
+            Assert.True(grads.All(g => g.ToArray().All(v => !float.IsNaN(v) && !float.IsInfinity(v))), "clipped gradients not finite");
+            Assert.True(after <= maxNorm * (1 + 1e-4), $"norm after the clip {after:E3} exceeds the bound {maxNorm}");
+        }
+        finally
+        {
+            AiDotNetEngine.Current = saved;
+            gpu!.Dispose();
+        }
+    }
+
+    [SkippableFact]
+    public void BoundPastTheFloatRange_ClipsOnTheHost()
+    {
+        DirectGpuTensorEngine? gpu = null;
+        try { gpu = new DirectGpuTensorEngine(); } catch { }
+        Skip.If(gpu is null || !gpu.IsGpuAvailable, "GPU engine unavailable.");
+        var saved = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = gpu!;
+        try
+        {
+            var g = gpu!.TensorMultiplyScalar(new Tensor<float>(new[] { 4 }, new Vector<float>(new float[] { 1, 2, 3, 4 })), 1f);
+            // Narrowed to a float the bound is infinite and the coefficient 1, whatever the norm.
+            Assert.Null(GpuOptimizer.TryClipGradNorm(new[] { g }, 1e39));
+        }
+        finally
+        {
+            AiDotNetEngine.Current = saved;
+            gpu!.Dispose();
+        }
+    }
+
     [Fact]
     public void CpuEngine_ReturnsNull_SoTheCallerClipsOnTheHost()
     {

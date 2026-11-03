@@ -286,9 +286,10 @@ kernel void sum_squares_finish_double(
     acc[1] = hi;
 }
 
-// min(1, maxNorm / (norm + 1e-6)) from the double sum_squares_finish_double wrote (narrowed back to a float: it came
-// from one); a non-finite norm, or a sum past the float range, leaves the gradients unscaled. Tested on the exponent
-// bits: Metal compiles with fast math, which may fold isfinite() to true.
+// min(1, maxNorm / (norm + 1e-6)) from the double sum_squares_finish_double wrote, the norm taken from the double's
+// exponent and mantissa (sum = m * 2^k, norm = sqrt(m) * 2^(k/2)) so a sum past the float range (DBL_MAX: the float
+// accumulator overflowed) still clips, to ~0 as PyTorch's float32 norm (inf) does. A non-finite norm leaves the
+// gradients unscaled. Tested on the exponent bits: Metal compiles with fast math, which may fold isfinite() to true.
 kernel void clip_scale_from_sum_squares(
     device const uint* acc [[buffer(0)]],
     device float* scale [[buffer(1)]],
@@ -297,13 +298,18 @@ kernel void clip_scale_from_sum_squares(
 {
     if (gid != 0) return;
     uint lo = acc[0], hi = acc[1];
-    int e = int((hi >> 20) & 0x7ffu) - 1023;
+    uint ef = (hi >> 20) & 0x7ffu;
+    float maxNorm = as_type<float>(maxNormBits);
     float c = 1.0f;
-    if (e <= 127)
+    if (ef == 0u) c = maxNorm / 1e-6f;
+    else if (ef != 0x7ffu)
     {
-        float sum = e < -126 ? 0.0f : as_type<float>((uint(e + 127) << 23) | ((hi & 0xfffffu) << 3) | (lo >> 29));
-        float norm = sqrt(sum);
-        if ((as_type<uint>(norm) & 0x7f800000u) != 0x7f800000u) c = as_type<float>(maxNormBits) / (norm + 1e-6f);
+        int k = int(ef) - 1023;
+        float m = as_type<float>(0x3f800000u | ((hi & 0xfffffu) << 3) | (lo >> 29));
+        if ((k & 1) != 0) { m *= 2.0f; k -= 1; }
+        int h = k / 2;
+        float root = sqrt(m);
+        c = h < 64 ? maxNorm / (ldexp(root, h) + 1e-6f) : ldexp(maxNorm / root, -h);
     }
     scale[0] = c < 1.0f ? c : 1.0f;
 }
