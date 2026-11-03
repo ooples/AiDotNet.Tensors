@@ -668,7 +668,7 @@ extern ""C"" __global__ __launch_bounds__(256) void adam8bit_update(
     float* __restrict__ mScales, float* __restrict__ vScales,
     float learningRate, float beta1, float beta2, float epsilon,
     float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2,
-    int blockSize, int paramLength, int numBlocks)
+    int blockSize, int paramLength, int numBlocks, float weightDecay, int decoupled)
 {
     int blk = blockIdx.x;
     if (blk >= numBlocks) return;
@@ -686,7 +686,7 @@ extern ""C"" __global__ __launch_bounds__(256) void adam8bit_update(
     for (int i = start + threadIdx.x; i < endIdx; i += blockDim.x) {
         float m_i = firstStep ? 0.0f : adam8_dec_s(mQ[i]) * mScale;
         float v_i = firstStep ? 0.0f : adam8_dec_u(vQ[i]) * vScale;
-        float g = gradient[i];
+        float g = decoupled ? gradient[i] : gradient[i] + weightDecay * param[i];
         float newM = beta1 * m_i + oneMinusBeta1 * g;
         float newV = beta2 * v_i + oneMinusBeta2 * (g * g);
         locM = fmaxf(locM, fabsf(newM));
@@ -712,13 +712,14 @@ extern ""C"" __global__ __launch_bounds__(256) void adam8bit_update(
     for (int i = start + threadIdx.x; i < endIdx; i += blockDim.x) {
         float m_i = firstStep ? 0.0f : adam8_dec_s(mQ[i]) * mScale;
         float v_i = firstStep ? 0.0f : adam8_dec_u(vQ[i]) * vScale;
-        float g = gradient[i];
+        float g = decoupled ? gradient[i] : gradient[i] + weightDecay * param[i];
         float newM = beta1 * m_i + oneMinusBeta1 * g;
         float newV = beta2 * v_i + oneMinusBeta2 * (g * g);
 
         float mHat = newM / biasCorrection1;
         float vHat = newV / biasCorrection2;
-        param[i] = param[i] - learningRate * mHat / (sqrtf(vHat) + epsilon);
+        param[i] = (decoupled ? param[i] * (1.0f - learningRate * weightDecay) : param[i])
+            - learningRate * mHat / (sqrtf(vHat) + epsilon);
 
         mQ[i] = (unsigned char)adam8_enc_s(newM / newMScale);
         vQ[i] = (unsigned char)adam8_enc_u(newV / newVScale);

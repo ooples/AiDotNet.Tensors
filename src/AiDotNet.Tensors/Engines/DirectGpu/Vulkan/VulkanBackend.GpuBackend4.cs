@@ -84,14 +84,29 @@ public sealed unsafe partial class VulkanBackend
         float learningRate, float beta1, float beta2, float epsilon,
         float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2,
         int blockSize, int paramLength, int numBlocks)
+        => Adam8BitUpdate(param, gradient, mQuant, vQuant, mScales, vScales, learningRate, beta1, beta2, epsilon,
+            oneMinusBeta1, oneMinusBeta2, biasCorrection1, biasCorrection2, blockSize, paramLength, numBlocks,
+            weightDecay: 0f, decoupledWeightDecay: false);
+
+    /// <inheritdoc/>
+    public void Adam8BitUpdate(IGpuBuffer param, IGpuBuffer gradient,
+        IGpuBuffer mQuant, IGpuBuffer vQuant, IGpuBuffer mScales, IGpuBuffer vScales,
+        float learningRate, float beta1, float beta2, float epsilon,
+        float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2,
+        int blockSize, int paramLength, int numBlocks, float weightDecay, bool decoupledWeightDecay)
     {
         EnsureInitialized();
-        if (paramLength <= 0 || numBlocks <= 0) return;
-        GlslDispatchN(VulkanCompressedOptimizerKernels.Adam8Bit, checked(numBlocks * 256),
+        if (paramLength == 0) return;
+        CompressedMomentHyperparameters.Validate(learningRate, beta1, beta2, epsilon, weightDecay, nameof(learningRate));
+        CompressedMomentHyperparameters.ValidateInt8Factors(oneMinusBeta1, oneMinusBeta2, biasCorrection1, biasCorrection2);
+        CompressedMomentBufferValidation.ValidateInt8(paramLength, blockSize, numBlocks,
+            param, gradient, mQuant, vQuant, mScales, vScales);
+        GlslDispatchN(VulkanCompressedOptimizerKernels.Adam8Bit, CompressedMomentBufferValidation.CheckedInt8WorkSize(numBlocks),
             new[] { param, gradient, mQuant, vQuant, mScales, vScales },
             new[] { (uint)paramLength, (uint)blockSize, (uint)numBlocks,
                 FBits(learningRate), FBits(beta1), FBits(beta2), FBits(epsilon),
-                FBits(oneMinusBeta1), FBits(oneMinusBeta2), FBits(biasCorrection1), FBits(biasCorrection2) });
+                FBits(oneMinusBeta1), FBits(oneMinusBeta2), FBits(biasCorrection1), FBits(biasCorrection2),
+                FBits(weightDecay), decoupledWeightDecay ? 1u : 0u });
     }
 
     public void RmspropUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer squaredAvg,

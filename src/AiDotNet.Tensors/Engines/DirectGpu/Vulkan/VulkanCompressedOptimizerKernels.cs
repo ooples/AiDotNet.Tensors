@@ -116,6 +116,8 @@ layout(push_constant) uniform PC {
     float oneMinusBeta2;
     float biasCorrection1;
     float biasCorrection2;
+    float weightDecay;
+    uint decoupled;
 } pc;
 
 shared float s_maxM[256];
@@ -157,7 +159,7 @@ void main() {
     for (uint i = start + lid; i < end; i += 256u) {
         float oldM = firstStep ? 0.0 : adam8_dec_s(load_byte(m_quant[i >> 2u], i)) * oldMScale;
         float oldV = firstStep ? 0.0 : adam8_dec_u(load_byte(v_quant[i >> 2u], i)) * oldVScale;
-        float g = grad[i];
+        float g = (pc.decoupled != 0u || pc.weightDecay == 0.0) ? grad[i] : grad[i] + pc.weightDecay * param[i];
         float newM = pc.beta1 * oldM + pc.oneMinusBeta1 * g;
         float newV = pc.beta2 * oldV + pc.oneMinusBeta2 * g * g;
         localMaxM = max(localMaxM, abs(newM));
@@ -186,13 +188,14 @@ void main() {
     for (uint i = start + lid; i < end; i += 256u) {
         float oldM = firstStep ? 0.0 : adam8_dec_s(load_byte(m_quant[i >> 2u], i)) * oldMScale;
         float oldV = firstStep ? 0.0 : adam8_dec_u(load_byte(v_quant[i >> 2u], i)) * oldVScale;
-        float g = grad[i];
+        float g = (pc.decoupled != 0u || pc.weightDecay == 0.0) ? grad[i] : grad[i] + pc.weightDecay * param[i];
         float newM = pc.beta1 * oldM + pc.oneMinusBeta1 * g;
         float newV = pc.beta2 * oldV + pc.oneMinusBeta2 * g * g;
 
         float mHat = newM / pc.biasCorrection1;
         float vHat = newV / pc.biasCorrection2;
-        param[i] -= pc.lr * mHat / (sqrt(vHat) + pc.epsilon);
+        param[i] = (pc.decoupled != 0u ? param[i] * (1.0 - pc.lr * pc.weightDecay) : param[i])
+            - pc.lr * mHat / (sqrt(vHat) + pc.epsilon);
 
         store_byte(0u, i, adam8_enc_s(newM / newMScale));
         store_byte(1u, i, adam8_enc_u(newV / newVScale));

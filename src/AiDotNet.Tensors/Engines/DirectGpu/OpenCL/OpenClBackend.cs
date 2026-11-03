@@ -32,7 +32,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     /// <item>Bank-conflict-free shared memory</item>
     /// </list>
     /// </remarks>
-    public sealed partial class OpenClBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IExtendedConvKernels, IPixelShuffleBackend, INativeGpuCodegenExecutor, IDeviceMemoryAccounted
+    public sealed partial class OpenClBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IAdam8BitWeightDecayBackend, IExtendedConvKernels, IPixelShuffleBackend, INativeGpuCodegenExecutor, IDeviceMemoryAccounted
     {
         /// <summary>
         /// OpenCL has no cuDNN-equivalent half/bfloat16 conv path —
@@ -11914,7 +11914,22 @@ KERNEL VARIANTS (A/B testing):
             float learningRate, float beta1, float beta2, float epsilon,
             float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2,
             int blockSize, int paramLength, int numBlocks)
+            => Adam8BitUpdate(param, gradient, mQuant, vQuant, mScales, vScales, learningRate, beta1, beta2, epsilon,
+                oneMinusBeta1, oneMinusBeta2, biasCorrection1, biasCorrection2, blockSize, paramLength, numBlocks,
+                weightDecay: 0f, decoupledWeightDecay: false);
+
+        /// <inheritdoc/>
+        public void Adam8BitUpdate(IGpuBuffer param, IGpuBuffer gradient,
+            IGpuBuffer mQuant, IGpuBuffer vQuant, IGpuBuffer mScales, IGpuBuffer vScales,
+            float learningRate, float beta1, float beta2, float epsilon,
+            float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2,
+            int blockSize, int paramLength, int numBlocks, float weightDecay, bool decoupledWeightDecay)
         {
+            if (paramLength == 0) return;
+            CompressedMomentHyperparameters.Validate(learningRate, beta1, beta2, epsilon, weightDecay, nameof(learningRate));
+            CompressedMomentHyperparameters.ValidateInt8Factors(oneMinusBeta1, oneMinusBeta2, biasCorrection1, biasCorrection2);
+            CompressedMomentBufferValidation.ValidateInt8(paramLength, blockSize, numBlocks,
+                param, gradient, mQuant, vQuant, mScales, vScales);
             var k = _kernelCache["adam8bit_update"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)param).Buffer.Handle);
@@ -11934,6 +11949,8 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, blockSize);
             k.SetArg(arg++, paramLength);
             k.SetArg(arg++, numBlocks);
+            k.SetArg(arg++, weightDecay);
+            k.SetArg(arg++, decoupledWeightDecay ? 1 : 0);
 
             // The adam8bit kernel does a FIXED 256-wide per-block workgroup reduction (its __local
             // arrays are sized [256]), so the local size must be exactly 256 — it cannot be clamped
@@ -11944,7 +11961,7 @@ KERNEL VARIANTS (A/B testing):
                 throw new NotSupportedException(
                     $"int8 block-quantized Adam requires a device max workgroup size >= 256; this device " +
                     $"reports {_maxWorkGroupSize}. Use bf16 moments or the CPU optimizer path on this device.");
-            k.Execute1D(numBlocks * 256, 256);
+            k.Execute1D(CompressedMomentBufferValidation.CheckedInt8WorkSize(numBlocks), 256);
         }
 
         /// <inheritdoc/>

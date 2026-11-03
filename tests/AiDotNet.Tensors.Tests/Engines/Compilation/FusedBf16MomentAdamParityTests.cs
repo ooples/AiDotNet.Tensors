@@ -304,15 +304,26 @@ public class FusedBf16MomentAdamParityTests
             large.GetDataArray().AsSpan().ToArray(), tolerance: 1e-5);
     }
 
+    /// <summary>
+    /// Int8 moments accept AdamW (decoupled decay inside the kernel, FusedInt8AdamWeightDecayTests checks the
+    /// numbers) and still refuse an optimizer with no int8 kernel.
+    /// </summary>
     [Fact]
-    public void Int8BlockQuantizedMoments_RejectAdamW()
+    public void Int8BlockQuantizedMoments_AcceptAdamW_AndRejectOptimizersWithoutAnInt8Kernel()
     {
         var (plan, _, _) = BuildPlan();
         using (plan)
         {
             plan.RequestInt8MomentStorage(true, blockSize: 8, minQuantizedLength: 0);
+            plan.ConfigureOptimizer(OptimizerType.AdamW, learningRate: 0.01f, weightDecay: 0.01f);
+            plan.Step();
+        }
+        var (other, _, _) = BuildPlan();
+        using (other)
+        {
+            other.RequestInt8MomentStorage(true, blockSize: 8, minQuantizedLength: 0);
             Assert.Throws<System.NotSupportedException>(() =>
-                plan.ConfigureOptimizer(OptimizerType.AdamW, learningRate: 0.01f));
+                other.ConfigureOptimizer(OptimizerType.Lion, learningRate: 0.01f));
         }
     }
 

@@ -79,7 +79,22 @@ public sealed partial class WebGpuBackend
         float learningRate, float beta1, float beta2, float epsilon,
         float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2,
         int blockSize, int paramLength, int numBlocks)
+        => Adam8BitUpdate(param, gradient, mQuant, vQuant, mScales, vScales, learningRate, beta1, beta2, epsilon,
+            oneMinusBeta1, oneMinusBeta2, biasCorrection1, biasCorrection2, blockSize, paramLength, numBlocks,
+            weightDecay: 0f, decoupledWeightDecay: false);
+
+    /// <inheritdoc/>
+    public void Adam8BitUpdate(IGpuBuffer param, IGpuBuffer gradient,
+        IGpuBuffer mQuant, IGpuBuffer vQuant, IGpuBuffer mScales, IGpuBuffer vScales,
+        float learningRate, float beta1, float beta2, float epsilon,
+        float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2,
+        int blockSize, int paramLength, int numBlocks, float weightDecay, bool decoupledWeightDecay)
     {
+        if (paramLength == 0) return;
+        CompressedMomentHyperparameters.Validate(learningRate, beta1, beta2, epsilon, weightDecay, nameof(learningRate));
+        CompressedMomentHyperparameters.ValidateInt8Factors(oneMinusBeta1, oneMinusBeta2, biasCorrection1, biasCorrection2);
+        CompressedMomentBufferValidation.ValidateInt8(paramLength, blockSize, numBlocks,
+            param, gradient, mQuant, vQuant, mScales, vScales);
         var uniforms = new[]
         {
             BitConverter.Int32BitsToSingle(paramLength),
@@ -93,10 +108,14 @@ public sealed partial class WebGpuBackend
             oneMinusBeta1,
             oneMinusBeta2,
             biasCorrection1,
-            biasCorrection2
+            biasCorrection2,
+            weightDecay,
+            BitConverter.Int32BitsToSingle(decoupledWeightDecay ? 1 : 0),
+            0f,
+            0f
         };
         Dispatch6BufferAsync("CompressedOptimizerInt8", WebGpuKernels.CompressedOptimizerInt8Source, "adam8bit",
-            param, gradient, mQuant, vQuant, mScales, vScales, uniforms, numBlocks * 256).GetAwaiter().GetResult();
+            param, gradient, mQuant, vQuant, mScales, vScales, uniforms, CompressedMomentBufferValidation.CheckedInt8WorkSize(numBlocks)).GetAwaiter().GetResult();
     }
 
     public void RmspropUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer squaredAvg,

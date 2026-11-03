@@ -425,7 +425,9 @@ internal static class FusedOptimizer
         float beta1,
         float beta2,
         float eps,
-        int step)
+        int step,
+        float weightDecay = 0f,
+        bool decoupledWeightDecay = false)
     {
         // blockSize == 0 makes `start += blockSize` spin forever; a negative value walks `start`
         // backwards and grows `block` unbounded → out-of-bounds scale access. Reject up front.
@@ -458,7 +460,8 @@ internal static class FusedOptimizer
             {
                 float oldM = mHasHistory ? DynamicQuantizationCodebook.Signed[mQuant[i]] * oldMScale : 0f;
                 float oldV = vHasHistory ? DynamicQuantizationCodebook.Unsigned[vQuant[i]] * oldVScale : 0f;
-                float g = grad[i];
+                // L2 decay joins the gradient (Adam); AdamW's decoupled decay scales the parameter below.
+                float g = decoupledWeightDecay ? grad[i] : grad[i] + weightDecay * param[i];
                 float newM = beta1 * oldM + oneMinusBeta1 * g;
                 float newV = beta2 * oldV + oneMinusBeta2 * g * g;
                 maxAbsM = MathF.Max(maxAbsM, MathF.Abs(newM));
@@ -476,12 +479,13 @@ internal static class FusedOptimizer
             {
                 float oldM = mHasHistory ? DynamicQuantizationCodebook.Signed[mQuant[i]] * oldMScale : 0f;
                 float oldV = vHasHistory ? DynamicQuantizationCodebook.Unsigned[vQuant[i]] * oldVScale : 0f;
-                float g = grad[i];
+                float g = decoupledWeightDecay ? grad[i] : grad[i] + weightDecay * param[i];
                 float newM = beta1 * oldM + oneMinusBeta1 * g;
                 float newV = beta2 * oldV + oneMinusBeta2 * g * g;
                 float mHat = newM / bc1;
                 float vHat = newV / bc2;
-                param[i] -= lr * mHat / (MathF.Sqrt(vHat) + eps);
+                param[i] = (decoupledWeightDecay ? param[i] * (1f - lr * weightDecay) : param[i])
+                    - lr * mHat / (MathF.Sqrt(vHat) + eps);
 
                 mQuant[i] = DynamicQuantizationCodebook.Encode(newM / newMScale, DynamicQuantizationCodebook.Signed);
                 vQuant[i] = DynamicQuantizationCodebook.Encode(newV / newVScale, DynamicQuantizationCodebook.Unsigned);

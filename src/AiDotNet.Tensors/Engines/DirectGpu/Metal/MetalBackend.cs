@@ -28,7 +28,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 /// The MPS library provides hand-tuned implementations of common operations.
 /// </para>
 /// </remarks>
-public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IPixelShuffleBackend, INativeGpuCodegenExecutor
+public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IAdam8BitWeightDecayBackend, IPixelShuffleBackend, INativeGpuCodegenExecutor
 {
     /// <summary>
     /// Metal MPSGraph has half/bfloat conv support but it's not wired

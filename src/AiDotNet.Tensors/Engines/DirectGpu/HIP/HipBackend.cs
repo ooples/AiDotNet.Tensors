@@ -32,7 +32,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 /// <item>RX 6800 XT: 8,000+ GFLOPS (optimized scalar)</item>
 /// </list>
 /// </remarks>
-public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IPixelShuffleBackend, INativeGpuCodegenExecutor, IDeviceMemoryAccounted
+public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IAdam8BitWeightDecayBackend, IPixelShuffleBackend, INativeGpuCodegenExecutor, IDeviceMemoryAccounted
 {
     /// <summary>
     /// HIP has no cuDNN-equivalent half/bfloat16 conv path yet — returns
@@ -11875,12 +11875,27 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             }
     }
 
-    public unsafe void Adam8BitUpdate(IGpuBuffer param, IGpuBuffer gradient,
+    public void Adam8BitUpdate(IGpuBuffer param, IGpuBuffer gradient,
         IGpuBuffer mQuant, IGpuBuffer vQuant, IGpuBuffer mScales, IGpuBuffer vScales,
         float learningRate, float beta1, float beta2, float epsilon,
         float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2,
         int blockSize, int paramLength, int numBlocks)
+        => Adam8BitUpdate(param, gradient, mQuant, vQuant, mScales, vScales, learningRate, beta1, beta2, epsilon,
+            oneMinusBeta1, oneMinusBeta2, biasCorrection1, biasCorrection2, blockSize, paramLength, numBlocks,
+            weightDecay: 0f, decoupledWeightDecay: false);
+
+    /// <inheritdoc/>
+    public unsafe void Adam8BitUpdate(IGpuBuffer param, IGpuBuffer gradient,
+        IGpuBuffer mQuant, IGpuBuffer vQuant, IGpuBuffer mScales, IGpuBuffer vScales,
+        float learningRate, float beta1, float beta2, float epsilon,
+        float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2,
+        int blockSize, int paramLength, int numBlocks, float weightDecay, bool decoupledWeightDecay)
     {
+        if (paramLength == 0) return;
+        CompressedMomentHyperparameters.Validate(learningRate, beta1, beta2, epsilon, weightDecay, nameof(learningRate));
+        CompressedMomentHyperparameters.ValidateInt8Factors(oneMinusBeta1, oneMinusBeta2, biasCorrection1, biasCorrection2);
+        CompressedMomentBufferValidation.ValidateInt8(paramLength, blockSize, numBlocks,
+            param, gradient, mQuant, vQuant, mScales, vScales);
         if (!_kernelCache.TryGetValue("adam8bit_update", out var krnl))
             throw new GpuCapabilityUnavailableException("HIP kernel not found: adam8bit_update");
 
@@ -11891,7 +11906,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             IntPtr _p3 = vQuant.Handle;
             IntPtr _p4 = mScales.Handle;
             IntPtr _p5 = vScales.Handle;
-            void** args = stackalloc void*[17];
+            int decoupled = decoupledWeightDecay ? 1 : 0;
+            void** args = stackalloc void*[19];
             args[0] = &_p0;
             args[1] = &_p1;
             args[2] = &_p2;
@@ -11909,6 +11925,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             args[14] = &blockSize;
             args[15] = &paramLength;
             args[16] = &numBlocks;
+            args[17] = &weightDecay;
+            args[18] = &decoupled;
 
             LaunchKernel(krnl, (uint)numBlocks, 256u, args);
             Synchronize();

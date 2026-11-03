@@ -155,9 +155,27 @@ public sealed partial class MetalBackend
         float learningRate, float beta1, float beta2, float epsilon,
         float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2,
         int blockSize, int paramLength, int numBlocks)
+        => Adam8BitUpdate(param, gradient, mQuant, vQuant, mScales, vScales, learningRate, beta1, beta2, epsilon,
+            oneMinusBeta1, oneMinusBeta2, biasCorrection1, biasCorrection2, blockSize, paramLength, numBlocks,
+            weightDecay: 0f, decoupledWeightDecay: false);
+
+    /// <inheritdoc/>
+    public void Adam8BitUpdate(IGpuBuffer param, IGpuBuffer gradient,
+        IGpuBuffer mQuant, IGpuBuffer vQuant, IGpuBuffer mScales, IGpuBuffer vScales,
+        float learningRate, float beta1, float beta2, float epsilon,
+        float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2,
+        int blockSize, int paramLength, int numBlocks, float weightDecay, bool decoupledWeightDecay)
     {
         ThrowIfDisposed();
-        if (paramLength <= 0 || numBlocks <= 0) return;
+        if (paramLength == 0) return;
+        if (blockSize <= 0) throw new ArgumentOutOfRangeException(nameof(blockSize));
+        if (numBlocks != (int)(((long)paramLength + blockSize - 1) / blockSize))
+            throw new ArgumentException("numBlocks must match the parameter length and block size.", nameof(numBlocks));
+        CompressedMomentHyperparameters.Validate(learningRate, beta1, beta2, epsilon, weightDecay, nameof(learningRate));
+        CompressedMomentHyperparameters.ValidateInt8Factors(oneMinusBeta1, oneMinusBeta2, biasCorrection1, biasCorrection2);
+        CompressedMomentBufferValidation.ValidateInt8(paramLength, blockSize, numBlocks,
+            param, gradient, mQuant, vQuant, mScales, vScales);
+
         IntPtr library = GetCompressedOptLibrary();
         if (library == IntPtr.Zero)
             throw new GpuCapabilityUnavailableException("Metal compressed optimizer kernels are unavailable.");
@@ -167,7 +185,7 @@ public sealed partial class MetalBackend
             throw new ArgumentException("Buffers must be MetalGpuBuffer.");
 
         var pipeline = GetPipeline("CompressedOptimizer", library, "adam8bit");
-        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(checked(numBlocks * 256));
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(CompressedMomentBufferValidation.CheckedInt8WorkSize(numBlocks));
         using var encoder = _commandQueue.CreateScopedComputeEncoder();
         encoder.SetPipelineState(pipeline.Handle);
         encoder.SetBuffer(parameter, 0);
@@ -187,6 +205,8 @@ public sealed partial class MetalBackend
         encoder.SetBytes(oneMinusBeta2, 14);
         encoder.SetBytes(biasCorrection1, 15);
         encoder.SetBytes(biasCorrection2, 16);
+        encoder.SetBytes(weightDecay, 17);
+        encoder.SetBytes(decoupledWeightDecay ? 1u : 0u, 18);
         encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
 

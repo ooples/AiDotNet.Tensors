@@ -353,7 +353,9 @@ __kernel void adam8bit_update(
     const float biasCorrection2,
     const int blockSize,
     const int paramLength,
-    const int numBlocks)
+    const int numBlocks,
+    const float weightDecay,
+    const int decoupled)
 {
     const int blk = get_group_id(0);
     const int tid = get_local_id(0);
@@ -374,7 +376,7 @@ __kernel void adam8bit_update(
     for (int i = start + tid; i < endIdx; i += 256) {
         float m_i = firstStep ? 0.0f : adam8_dec_s(mQ[i]) * mScale;
         float v_i = firstStep ? 0.0f : adam8_dec_u(vQ[i]) * vScale;
-        float g = gradient[i];
+        float g = decoupled ? gradient[i] : gradient[i] + weightDecay * param[i];
         float newM = beta1 * m_i + oneMinusBeta1 * g;
         float newV = beta2 * v_i + oneMinusBeta2 * (g * g);
         locM = fmax(locM, fabs(newM));
@@ -406,13 +408,14 @@ __kernel void adam8bit_update(
     for (int i = start + tid; i < endIdx; i += 256) {
         float m_i = firstStep ? 0.0f : adam8_dec_s(mQ[i]) * mScale;
         float v_i = firstStep ? 0.0f : adam8_dec_u(vQ[i]) * vScale;
-        float g = gradient[i];
+        float g = decoupled ? gradient[i] : gradient[i] + weightDecay * param[i];
         float newM = beta1 * m_i + oneMinusBeta1 * g;
         float newV = beta2 * v_i + oneMinusBeta2 * (g * g);
 
         float mHat = newM / biasCorrection1;
         float vHat = newV / biasCorrection2;
-        param[i] = param[i] - learningRate * mHat / (sqrt(vHat) + epsilon);
+        param[i] = (decoupled ? param[i] * (1.0f - learningRate * weightDecay) : param[i])
+            - learningRate * mHat / (sqrt(vHat) + epsilon);
 
         mQ[i] = (uchar)adam8_enc_s(newM / newMScale);
         vQ[i] = (uchar)adam8_enc_u(newV / newVScale);

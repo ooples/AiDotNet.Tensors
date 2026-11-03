@@ -120,6 +120,8 @@ kernel void adam8bit(
     constant float& oneMinusBeta2 [[buffer(14)]],
     constant float& biasCorrection1 [[buffer(15)]],
     constant float& biasCorrection2 [[buffer(16)]],
+    constant float& weightDecay [[buffer(17)]],
+    constant uint& decoupled    [[buffer(18)]],
     uint block [[threadgroup_position_in_grid]],
     uint lid   [[thread_position_in_threadgroup]])
 {
@@ -140,7 +142,7 @@ kernel void adam8bit(
     for (uint i = start + lid; i < endIdx; i += 256u) {
         float oldM = firstStep ? 0.0f : adam8_dec_s(load_byte(atomic_load_explicit(&m_quant[i >> 2u], memory_order_relaxed), i)) * oldMScale;
         float oldV = firstStep ? 0.0f : adam8_dec_u(load_byte(atomic_load_explicit(&v_quant[i >> 2u], memory_order_relaxed), i)) * oldVScale;
-        float g = grad[i];
+        float g = decoupled != 0u ? grad[i] : grad[i] + weightDecay * param[i];
         float newM = beta1 * oldM + oneMinusBeta1 * g;
         float newV = beta2 * oldV + oneMinusBeta2 * g * g;
         localMaxM = max(localMaxM, fabs(newM));
@@ -168,13 +170,14 @@ kernel void adam8bit(
     for (uint i = start + lid; i < endIdx; i += 256u) {
         float oldM = firstStep ? 0.0f : adam8_dec_s(load_byte(atomic_load_explicit(&m_quant[i >> 2u], memory_order_relaxed), i)) * oldMScale;
         float oldV = firstStep ? 0.0f : adam8_dec_u(load_byte(atomic_load_explicit(&v_quant[i >> 2u], memory_order_relaxed), i)) * oldVScale;
-        float g = grad[i];
+        float g = decoupled != 0u ? grad[i] : grad[i] + weightDecay * param[i];
         float newM = beta1 * oldM + oneMinusBeta1 * g;
         float newV = beta2 * oldV + oneMinusBeta2 * g * g;
 
         float mHat = newM / biasCorrection1;
         float vHat = newV / biasCorrection2;
-        param[i] -= lr * mHat / (sqrt(vHat) + epsilon);
+        param[i] = (decoupled != 0u ? param[i] * (1.0f - lr * weightDecay) : param[i])
+            - lr * mHat / (sqrt(vHat) + epsilon);
 
         store_byte(m_quant, i, adam8_enc_s(newM / newMScale));
         store_byte(v_quant, i, adam8_enc_u(newV / newVScale));
