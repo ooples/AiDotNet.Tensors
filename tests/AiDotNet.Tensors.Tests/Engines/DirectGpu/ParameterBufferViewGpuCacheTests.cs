@@ -133,8 +133,8 @@ public sealed class ParameterBufferViewGpuCacheTests
 
     /// <summary>
     /// Binding a parameter for the resident step (the compiled plan's BindResidentParamBuffer) must not hand a view at
-    /// a nonzero offset the buffer cached for the whole flat array: it starts at the FIRST parameter, so the view's
-    /// reads (and the optimizer's in-place update) addressed another parameter's elements.
+    /// a nonzero offset the buffer cached for the whole flat array: it starts at the FIRST parameter, so a reader of the
+    /// binding (FusedLinear's weight operand, through GetWeightBufferPreferResident) used another parameter's elements.
     /// </summary>
     [SkippableFact]
     public void ResidentBinding_OfAViewAtAnOffset_ReadsTheViewsOwnElements()
@@ -142,21 +142,20 @@ public sealed class ParameterBufferViewGpuCacheTests
         var gpu = TryGpu();
         Skip.If(gpu is null, "GPU engine unavailable.");
         using var gpuScope = gpu;
-        const int dim = 96;
-        var pb = new ParameterBuffer<float>(new[] { new[] { 3 * dim }, new[] { dim } });
+        const int inF = 16, outF = 8;
+        var pb = new ParameterBuffer<float>(new[] { new[] { inF, inF }, new[] { inF, outF } });
         pb.CopyFrom(new[]
         {
-            new Tensor<float>(new[] { 3 * dim }, new Vector<float>(Rand(3 * dim, 21))),
-            new Tensor<float>(new[] { dim }, new Vector<float>(Rand(dim, 22, 0.5).Select(v => v + 1f).ToArray())),
+            new Tensor<float>(new[] { inF, inF }, new Vector<float>(Rand(inF * inF, 21))),
+            new Tensor<float>(new[] { inF, outF }, new Vector<float>(Rand(inF * outF, 22))),
         });
-        var views = pb.CreateAllViews();
-        var gamma = views[1];
-        gpu!.BindResidentParamBuffer(gamma);
+        var weight = pb.CreateAllViews()[1];   // offset inF * inF into the flat array
+        gpu!.BindResidentParamBuffer(weight);
 
-        var x0 = new Tensor<float>(new[] { 4, dim }, new Vector<float>(Rand(4 * dim, 23)));
+        var x = new Tensor<float>(new[] { 4, inF }, new Vector<float>(Rand(4 * inF, 23)));
         var cpu = new CpuEngine();
-        var want = cpu.RMSNorm(cpu.TensorAdd(x0, x0), new Tensor<float>(new[] { dim }, new Vector<float>(gamma.ToArray())), 1e-6, out _).ToArray();
-        var got = gpu.RMSNorm(gpu.TensorAdd(x0, x0), gamma, 1e-6, out _).ToArray();
+        var want = cpu.TensorMatMul(x, new Tensor<float>(new[] { inF, outF }, new Vector<float>(weight.ToArray()))).ToArray();
+        var got = gpu.FusedLinear(x, weight, null, FusedActivationType.None).ToArray();
         for (int j = 0; j < want.Length; j++)
             Assert.True(Math.Abs(want[j] - got[j]) < 1e-4, $"element {j}: GPU {got[j]} vs {want[j]}");
     }
