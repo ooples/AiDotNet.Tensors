@@ -1,6 +1,6 @@
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
-public sealed partial class MetalBackend : IInstantNgpBackend, IFrexpBackend, IRenderingGeometryBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
+public sealed partial class MetalBackend : IInstantNgpBackend, IFrexpBackend, IRenderingGeometryBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, IOneHotIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
 {
     private void DispatchInstantNgp(
         string kernelName,
@@ -222,6 +222,22 @@ public sealed partial class MetalBackend : IInstantNgpBackend, IFrexpBackend, IR
         encoder.SetBuffer((MetalGpuBuffer)numericIndices, 0);
         encoder.SetBuffer((MetalGpuBuffer)int32Indices, 1);
         encoder.SetBytes(length, 2);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
+    public void OneHotInt32(IGpuBuffer int32Indices, IGpuBuffer output, int rows, int depth)
+    {
+        int total = checked(rows * depth);
+        if (total <= 0) return;
+        ThrowIfDisposed();
+        var pipeline = GetPipeline(AudioLibName, _audioLibrary, "resident_one_hot_int32");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(total);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer((MetalGpuBuffer)int32Indices, 0);
+        encoder.SetBuffer((MetalGpuBuffer)output, 1);
+        encoder.SetBytes(rows, 2);
+        encoder.SetBytes(depth, 3);
         encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
 

@@ -357,6 +357,19 @@ kernel void resident_indices_to_int32(
     if (int(gid) < length) output[gid] = int(input[gid]);
 }
 
+kernel void resident_one_hot_int32(
+    device const int* indices [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant int& rows [[buffer(2)]],
+    constant int& depth [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= uint(rows) * uint(depth)) return;
+    uint row = gid / uint(depth);
+    int column = int(gid - row * uint(depth));
+    output[gid] = indices[row] == column ? 1.0f : 0.0f;
+}
+
 kernel void resident_index_add(
     device const float* destination [[buffer(0)]],
     device const int* indices [[buffer(1)]],

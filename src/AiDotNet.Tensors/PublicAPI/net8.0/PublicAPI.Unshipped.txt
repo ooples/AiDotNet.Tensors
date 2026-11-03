@@ -7,3 +7,5 @@ static AiDotNet.Tensors.Interop.DLPackStream.FromHandle(nint streamHandle) -> Ai
 static AiDotNet.Tensors.LinearAlgebra.Tensor<T>.FromDLPack(nint managedTensorVersioned) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
 static AiDotNet.Tensors.LinearAlgebra.Tensor<T>.FromDLPackLegacy(nint managedTensor) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
 static extern AiDotNet.Tensors.Engines.CuBlasNative.cuMemPoolGetAttribute(nint pool, int attr, out ulong value) -> AiDotNet.Tensors.Engines.CudaResult
+AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuBackend.OneHotInt32(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! int32Indices, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int rows, int depth) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuInstantNgpKernels.OneHotInt32.get -> string!

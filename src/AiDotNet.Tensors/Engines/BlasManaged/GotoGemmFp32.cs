@@ -77,6 +77,13 @@ internal static class GotoGemmFp32
     /// path handles the M and N tails itself and gives the same bits at every thread count.
     /// </summary>
     internal static bool PackBothNeedsTailSplit(int m) => m % Mr != 0;
+
+    /// <summary>
+    /// True when <see cref="RunParallel"/> gives bit-identical results at every thread count for an n-column product:
+    /// with n a multiple of the 16-column panel there is no scalar N-tail, mc follows m and kc is fixed, so only the
+    /// thread-count-dependent nc changes, and it only regroups whole panels.
+    /// </summary>
+    internal static bool IsThreadCountInvariant(int n) => n > 0 && (n & 15) == 0;
     /// <summary>Shape regime where the per-tile GotoBLAS path beats the PackBoth strategy (measured on the
     /// 3990X via --ab-prod): large/balanced (M≥512) OR wide-K (K≥2N, e.g. MLP-fc2). PackBoth's wide-N
     /// N-axis path wins the small-M wide-N shapes (DiT QKV M256×N3456, MLP-fc1 M256×N4608 — GotoGemm was
@@ -355,9 +362,11 @@ internal static class GotoGemmFp32
     /// ic dimension is the trade for L2-resident, contention-free compute. Each tile runs its full
     /// K-loop independently (disjoint C writes ⇒ no races, no reduction).
     /// </summary>
+    /// <param name="maxWorkers">0: the pool's full budget. Otherwise at most this many tiles run at once (1: on the
+    /// calling thread). Every tile is the same RunTile whichever worker runs it, so the result does not change.</param>
     internal static unsafe void RunParallel(
         float* a, int lda, float* b, int ldb, float* c, int ldc,
-        int m, int n, int k, int mc, int nc, int kc)
+        int m, int n, int k, int mc, int nc, int kc, int maxWorkers = 0)
     {
         if (k <= 0) { ZeroCBlock(c, ldc, 0, 0, m, n); return; } // C = A·B with K=0 is the zero matrix
         int numIc = (m + mc - 1) / mc;
@@ -377,7 +386,7 @@ internal static class GotoGemmFp32
         bool timing = s_timing;
         long enter = timing ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         long callMax = 0, callMin = long.MaxValue;
-        CpuParallelSettings.ParallelForOrSerial(0, totalTiles, (long)m * n * k, tileIdx =>
+        void Tile(int tileIdx)
         {
             int ic = (int)(tileIdx % numIcL) * mcL;
             int jc = (int)(tileIdx / numIcL) * ncL;
@@ -395,7 +404,23 @@ internal static class GotoGemmFp32
                 Interlocked.Add(ref s_tileLagTicks, start - enter);
                 Interlocked.Increment(ref s_tileCount);
             }
-        }, deterministicSafe: true);
+        }
+        if (maxWorkers == 1)
+        {
+            for (int t = 0; t < totalTiles; t++) Tile(t);
+        }
+        else if (maxWorkers > 1 && maxWorkers < totalTiles)
+        {
+            int workers = maxWorkers;
+            CpuParallelSettings.ParallelForOrSerial(0, workers, (long)m * n * k, w =>
+            {
+                for (int t = w; t < totalTiles; t += workers) Tile(t);
+            }, deterministicSafe: true);
+        }
+        else
+        {
+            CpuParallelSettings.ParallelForOrSerial(0, totalTiles, (long)m * n * k, Tile, deterministicSafe: true);
+        }
         if (timing)
         {
             Interlocked.Add(ref s_runParallelTicks, System.Diagnostics.Stopwatch.GetTimestamp() - enter);
@@ -1139,7 +1164,8 @@ internal static class GotoGemmFp32
         => throw new NotSupportedException("GotoGemmFp32 requires the net5.0+ machine-code JIT path; gate on IsAvailable.");
 
     internal static unsafe void RunParallel(
-        float* a, int lda, float* b, int ldb, float* c, int ldc, int m, int n, int k, int mc, int nc, int kc)
+        float* a, int lda, float* b, int ldb, float* c, int ldc, int m, int n, int k, int mc, int nc, int kc,
+        int maxWorkers = 0)
         => throw new NotSupportedException("GotoGemmFp32 requires the net5.0+ machine-code JIT path; gate on IsAvailable.");
 #endif
 }

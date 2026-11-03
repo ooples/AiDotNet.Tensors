@@ -16230,17 +16230,28 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         using var brScratchImag = AllocateBuffer(batch * n);
         IntPtr brRealPtr = brScratchReal.Handle;
         IntPtr brImagPtr = brScratchImag.Handle;
+        // Both kernels put the transform index on gridDim.y, which the hardware caps at 65535 (MaxGridDimY): a batch
+        // past that (e.g. a K-filter mixture over N*K token rows) threw at launch. Run the batch in slices of at most
+        // MaxGridDimY transforms, offsetting the device pointers -- the kernels index each transform from its own
+        // base, so a slice is an independent batch and no kernel changes.
+        int sliceMax = (int)MaxGridDimY;
         if (_kernelCache.TryGetValue("batched_bit_reverse", out var bitRevKernel))
         {
             void** args = stackalloc void*[7];
-            args[0] = &outRealPtr;
-            args[1] = &outImagPtr;
-            args[2] = &brRealPtr;
-            args[3] = &brImagPtr;
-            args[4] = &batch;
-            args[5] = &n;
-            args[6] = &log2n;
-            LaunchKernel2D(bitRevKernel, (uint)((n + 15) / 16), (uint)batch, 1, 16, 1, args);
+            for (int b0 = 0; b0 < batch; b0 += sliceMax)
+            {
+                int slice = Math.Min(sliceMax, batch - b0);
+                long off = (long)b0 * n * sizeof(float);
+                IntPtr oR = outRealPtr + (nint)off, oI = outImagPtr + (nint)off, sR = brRealPtr + (nint)off, sI = brImagPtr + (nint)off;
+                args[0] = &oR;
+                args[1] = &oI;
+                args[2] = &sR;
+                args[3] = &sI;
+                args[4] = &slice;
+                args[5] = &n;
+                args[6] = &log2n;
+                LaunchKernel2D(bitRevKernel, (uint)((n + 15) / 16), (uint)slice, 1, 16, 1, args);
+            }
             CudaCopyBuffer(brScratchReal, outputReal, batch * n);
             CudaCopyBuffer(brScratchImag, outputImag, batch * n);
         }
@@ -16250,16 +16261,25 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         {
             // Pre-allocate args outside the loop to avoid CA2014
             void** butterflyArgs = stackalloc void*[6];
-            butterflyArgs[0] = &outRealPtr;
-            butterflyArgs[1] = &outImagPtr;
-            butterflyArgs[2] = &batch;
+            IntPtr bR = outRealPtr, bI = outImagPtr;
+            int slice = 0;
+            butterflyArgs[0] = &bR;
+            butterflyArgs[1] = &bI;
+            butterflyArgs[2] = &slice;
             butterflyArgs[3] = &n;
             butterflyArgs[5] = &inv;
 
-            for (int stride = 2; stride <= n; stride *= 2)
+            for (int b0 = 0; b0 < batch; b0 += sliceMax)
             {
-                butterflyArgs[4] = &stride;
-                LaunchKernel2D(butterflyKernel, (uint)((n / 2 + 15) / 16), (uint)batch, 1, 16, 1, butterflyArgs);
+                slice = Math.Min(sliceMax, batch - b0);
+                long off = (long)b0 * n * sizeof(float);
+                bR = outRealPtr + (nint)off;
+                bI = outImagPtr + (nint)off;
+                for (int stride = 2; stride <= n; stride *= 2)
+                {
+                    butterflyArgs[4] = &stride;
+                    LaunchKernel2D(butterflyKernel, (uint)((n / 2 + 15) / 16), (uint)slice, 1, 16, 1, butterflyArgs);
+                }
             }
         }
 

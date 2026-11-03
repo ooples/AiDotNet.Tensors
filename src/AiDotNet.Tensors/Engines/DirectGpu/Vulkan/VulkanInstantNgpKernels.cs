@@ -375,6 +375,20 @@ void main() {
 }
 ";
 
+    public static string OneHotInt32 => @"#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer Indices { int indices[]; };
+layout(set = 0, binding = 1) writeonly buffer Output { float output_[]; };
+layout(push_constant) uniform P { int rows; int depth; };
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= uint(rows) * uint(depth)) return;
+    uint row = gid / uint(depth);
+    int column = int(gid - row * uint(depth));
+    output_[gid] = indices[row] == column ? 1.0 : 0.0;
+}
+";
+
     public static string IndexAdd => @"#version 450
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer Destination { float destination[]; };

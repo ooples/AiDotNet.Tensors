@@ -1,6 +1,6 @@
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 
-public sealed partial class HipBackend : IInstantNgpBackend, IFrexpBackend, IRenderingGeometryBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
+public sealed partial class HipBackend : IInstantNgpBackend, IFrexpBackend, IRenderingGeometryBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, IOneHotIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
 {
     private IntPtr ResolveInstantNgpKernel(string name)
     {
@@ -198,6 +198,20 @@ public sealed partial class HipBackend : IInstantNgpBackend, IFrexpBackend, IRen
         void** args = stackalloc void*[3];
         args[0] = &i; args[1] = &o; args[2] = &n;
         LaunchKernel(kernel, (uint)((length + DefaultBlockSize - 1) / DefaultBlockSize),
+            DefaultBlockSize, args);
+        Synchronize();
+    }
+
+    public unsafe void OneHotInt32(IGpuBuffer int32Indices, IGpuBuffer output, int rows, int depth)
+    {
+        int total = checked(rows * depth);
+        if (total <= 0) return;
+        var kernel = ResolveInstantNgpKernel("resident_one_hot_int32");
+        IntPtr i = int32Indices.Handle, o = output.Handle;
+        int r = rows, d = depth;
+        void** args = stackalloc void*[4];
+        args[0] = &i; args[1] = &o; args[2] = &r; args[3] = &d;
+        LaunchKernel(kernel, (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize),
             DefaultBlockSize, args);
         Synchronize();
     }
