@@ -16,7 +16,7 @@ These numbers come from `--ptx-campaign measure`, which uses production routing'
 | 2048x4096x11008 | 1.085 | 1.079 |
 | 128x4096x4096 | 0.874 | 0.852 |
 | 3136x64x576 | 0.765 | 0.734 |
-| conv 3x3, 64->64 ch, 16x16, vs cuDNN | 1.60 | 0.528 |
+| conv 3x3, 64->64 ch, 16x16, vs `backend.Conv2D` (serves NVRTC fused Winograd F(2,3), not cuDNN; see correction below) | 1.60 | 0.528 |
 
 ## Results
 
@@ -28,9 +28,9 @@ These numbers come from `--ptx-campaign measure`, which uses production routing'
 
 Total spend: $79.10 of the $150 approved.
 
-### Conv 3x3 winner against cuDNN (same buffers, output checked first)
+### Conv 3x3 winner against `backend.Conv2D` (same buffers, output checked first)
 
-| | incumbent | winner | cuDNN |
+| | incumbent | winner | `backend.Conv2D` |
 |---|---|---|---|
 | eager | 14.98 us (1.57x cuDNN) | 10.13 us (1.92x) | 19.05 us |
 | CUDA graph | 13.60 us (0.52x) | 8.48 us (0.83x) | 7.08 us |
@@ -40,7 +40,17 @@ The winner is `conv3x3-winner.ptx`, from generation 14. Its stated changes:
 - It rotates the FMAs across 6 accumulators instead of one serial chain.
 - It predicates the out-of-range taps instead of zeroing them.
 
-Block geometry and shared memory are unchanged. Its maximum relative difference from cuDNN is 2.5e-7. As a graph replay, cuDNN still wins at this shape.
+Block geometry and shared memory are unchanged. Its maximum relative difference from `backend.Conv2D` is 2.5e-7. As a graph replay, `backend.Conv2D` still wins at this shape.
+
+**Correction.** This section originally labeled the baseline "cuDNN". In fact the driver timed `backend.Conv2D`, and the conv forward slot serves `nvrtc.conv2d.winograd_f23_fused` at this shape, not cuDNN. Each route timed separately against the winner (same run, `--vendor-check-only=1 --seed-ptx=conv3x3-winner.ptx`, RTX 3080, fp32, graph replay; eager in parentheses):
+
+| route | route us | winner us | winner speedup |
+|---|---|---|---|
+| `nvrtc.conv2d.winograd_f23_fused` (the slot's pick) | 7.08 (18.2) | 8.47 (10.2) | 0.84x (1.81x) |
+| `cudnn.conv2d.default` (fixed implicit-precomp GEMM on main) | 22.6 (124) | 8.48 (10.4) | 2.64x (11.6x) |
+| `cudnn.conv2d.algo1` | 22.6 (120) | 8.48 (10.1) | 2.66x (11.8x) |
+
+For reference, the best cuDNN algorithm (algo6, Winograd) runs 13.9 us in graph. #1657 makes the cuDNN default use cuDNN's own heuristic pick (14.1 us here).
 
 ### GEMM in-graph: the campaign's own kernels against cuBLAS
 
