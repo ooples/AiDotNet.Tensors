@@ -333,13 +333,6 @@ public static class GpuOptimizer
         if (buffer is IDisposable d) d.Dispose();
     }
 
-    /// <summary>
-    /// GPU-resident 8-bit Adam step: dequantize → Adam → param update → requantize,
-    /// in place on the GPU backend (no host download of moments where native kernels
-    /// are available). Returns false (→ CPU fallback) when param/grad aren't
-    /// GPU-resident, any state buffer is null, or the active backend does not
-    /// implement compressed optimizer moments.
-    /// </summary>
     private static bool TryUpdateCompressedParameter(DirectGpuTensorEngine engine, IDirectGpuBackend backend,
         Tensor<float> param, Action<IGpuBuffer> update)
     {
@@ -364,6 +357,10 @@ public static class GpuOptimizer
 
 
     public static bool TryAdam8BitStep(Tensor<float> p, Tensor<float> g,
+    /// <summary>
+    /// GPU-resident 8-bit Adam step: dequantize, update and requantize without host moment downloads.
+    /// Returns false when parameters or gradients are not resident, state is missing, or the backend lacks support.
+    /// </summary>
         DirectGpu.IGpuBuffer? mQ, DirectGpu.IGpuBuffer? vQ, DirectGpu.IGpuBuffer? mScales, DirectGpu.IGpuBuffer? vScales,
         float lr, float beta1, float beta2, float epsilon, float biasCorrection1, float biasCorrection2, int blockSize)
     {
