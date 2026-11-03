@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.146.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.145.0...v0.146.0) (2026-11-03)
+
+
+### Features
+
+* **optimizers:** int8 and bf16 moments for AdamW, eager and fused ([#1670](https://github.com/ooples/AiDotNet.Tensors/issues/1670)) ([242ea7b](https://github.com/ooples/AiDotNet.Tensors/commit/242ea7bb3ac0937e4027b8edfb18bc65da05af87))
+
+
+### Bug Fixes
+
+* **gpu:** device scatter for IndexSelect backward; slice CUDA BatchedFFT past gridDim.y ([#1663](https://github.com/ooples/AiDotNet.Tensors/issues/1663)) ([b3d1664](https://github.com/ooples/AiDotNet.Tensors/commit/b3d1664098902a5a0a091c7e9ff884625c1c8e06)), closes [#1661](https://github.com/ooples/AiDotNet.Tensors/issues/1661) [#1662](https://github.com/ooples/AiDotNet.Tensors/issues/1662)
+* **gpu:** one-hot from device int32 indices in one launch, no host read ([#1668](https://github.com/ooples/AiDotNet.Tensors/issues/1668)) ([b98e352](https://github.com/ooples/AiDotNet.Tensors/commit/b98e352bdef5e9cea3351403b5ae9c400d86de70)), closes [#1664](https://github.com/ooples/AiDotNet.Tensors/issues/1664)
+* **gpu:** ParameterBuffer views resolved at their offset (wrong eager GPU gradients); device clip_grad_norm_ ([#1666](https://github.com/ooples/AiDotNet.Tensors/issues/1666)) ([acee008](https://github.com/ooples/AiDotNet.Tensors/commit/acee008c418569f0fb2c133776b4f3aea71cd3d0))
+* **review:** make startup-only SIMD flags readonly ([#1660](https://github.com/ooples/AiDotNet.Tensors/issues/1660)) ([383c7dd](https://github.com/ooples/AiDotNet.Tensors/commit/383c7dd1e541c0c3f5fd2c18141106b9ffbd5bad))
+
+
+### Performance
+
+* **blas:** route AVX2 thin-M weight gradients to PackBoth where it measured faster ([#1658](https://github.com/ooples/AiDotNet.Tensors/issues/1658)) ([1f00a2c](https://github.com/ooples/AiDotNet.Tensors/commit/1f00a2c4e84d52923dc83c922f1f10826c3cf5bd))
+* **cudnn:** forward default runs cuDNN's heuristic pick (1.5-4x on budget-exhausted 3x3 shapes) ([#1657](https://github.com/ooples/AiDotNet.Tensors/issues/1657)) ([0cd1a9c](https://github.com/ooples/AiDotNet.Tensors/commit/0cd1a9c8f7fc27a145c83f3f2669092579642198))
+* **gemm:** deterministic engine matmul takes GotoGemm where it is thread-count invariant ([#653](https://github.com/ooples/AiDotNet.Tensors/issues/653)) ([#1659](https://github.com/ooples/AiDotNet.Tensors/issues/1659)) ([2e174af](https://github.com/ooples/AiDotNet.Tensors/commit/2e174afd0136e92b010fc5355770fb27c74bde3c))
+
+
+### Documentation
+
+* **ptx-campaigns:** conv 3x3 continuation ($42.96): winner 1.61x fused Winograd in graph; correct [#1650](https://github.com/ooples/AiDotNet.Tensors/issues/1650) baseline ([#1667](https://github.com/ooples/AiDotNet.Tensors/issues/1667)) ([96ad9f3](https://github.com/ooples/AiDotNet.Tensors/commit/96ad9f384227e4e5a1ba8126230c3539634ab299))
+
 ## [0.145.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.144.2...v0.145.0) (2026-11-03)
 
 
