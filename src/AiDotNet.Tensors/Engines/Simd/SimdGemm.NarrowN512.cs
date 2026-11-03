@@ -20,7 +20,7 @@ internal static partial class SimdGemm
     private const int NarrowDotMinK = 32;
 
     /// <summary>A/B switch: AIDOTNET_NARROW512=0 keeps narrow products on the 256-bit kernel.</summary>
-    internal static bool s_narrow512 = System.Environment.GetEnvironmentVariable("AIDOTNET_NARROW512") != "0";
+    internal static readonly bool s_narrow512 = System.Environment.GetEnvironmentVariable("AIDOTNET_NARROW512") != "0";
 
     [ThreadStatic] private static float[]? t_narrowBt;
 

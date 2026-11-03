@@ -1138,7 +1138,7 @@ internal static partial class DirectConvAvx2
 
     /// <summary>Whether the AVX-512 forward takes <see cref="ForwardRowRun512"/> for row-contiguous positions (A/B switch,
     /// AIDOTNET_DIRECT_CONV_ROW512=0 turns it off; tests).</summary>
-    internal static bool s_useRowKernel512 = Environment.GetEnvironmentVariable("AIDOTNET_DIRECT_CONV_ROW512") != "0";
+    internal static readonly bool s_useRowKernel512 = Environment.GetEnvironmentVariable("AIDOTNET_DIRECT_CONV_ROW512") != "0";
 
     /// <summary>
     /// <see cref="ForwardSextetRun512"/> for twelve positions consecutive along a grid row of a stride-1 conv: position k
@@ -1223,7 +1223,7 @@ internal static partial class DirectConvAvx2
     }
 #else
     private const int RowPositions512 = 12;
-    internal static bool s_useRowKernel512;
+    internal static readonly bool s_useRowKernel512;
     private static unsafe void ForwardRowRun512<TLayout, TPos>(float* x, float* x4, float* x8, float* w, long blockStride, int blocks,
         int firstBlockOffset, int planeIn, int kernelHeight, int kernelWidth, int rowStep, int colStep,
         float* slot, bool seeded) where TLayout : struct, IWeightLayout512 where TPos : struct, IPositionStep512 => throw new PlatformNotSupportedException();
