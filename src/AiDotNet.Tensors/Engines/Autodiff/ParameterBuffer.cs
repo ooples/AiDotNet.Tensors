@@ -476,6 +476,8 @@ public sealed class ParameterBuffer<T>
                 nameof(parameters));
 
         var bufferSpan = _data.AsWritableSpan();
+        // Before the copy, so a parameter that throws part-way still leaves the device copy marked stale.
+        MarkHostWritten();
         for (int i = 0; i < parameters.Count; i++)
         {
             var param = parameters[i];
