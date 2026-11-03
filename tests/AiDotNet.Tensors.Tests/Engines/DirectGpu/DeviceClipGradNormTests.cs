@@ -139,7 +139,9 @@ public sealed class DeviceClipGradNormTests
             Assert.True(norm!.IsFinite, $"finite gradients reported non-finite (sum of squares {norm.TotalNormSquared})");
             double after = Math.Sqrt(grads.Sum(g => g.ToArray().Sum(v => (double)v * v)));
             Assert.True(grads.All(g => g.ToArray().All(v => !float.IsNaN(v) && !float.IsInfinity(v))), "clipped gradients not finite");
-            Assert.True(after <= maxNorm * (1 + 1e-4), $"norm after the clip {after:E3} exceeds the bound {maxNorm}");
+            // The clip scales to the bound, not merely under it: a coefficient that underflowed to zero erases the
+            // gradients and would pass an upper bound alone.
+            Assert.True(Math.Abs(after - maxNorm) <= maxNorm * 1e-3, $"norm after the clip {after:E3}, expected {maxNorm}");
         }
         finally
         {

@@ -19,7 +19,7 @@ public sealed class MultiTensorBackendParityTests
 {
     private static readonly int[] Sizes = { 1, 255, 256, 257, 1000 };
 
-    private static float[][] MakeTensors(bool poisonWithNaN)
+    private static float[][] MakeTensors(bool poisonWithNaN, bool pastFloatRange = false)
     {
         var data = new float[Sizes.Length][];
         for (int t = 0; t < Sizes.Length; t++)
@@ -28,13 +28,15 @@ public sealed class MultiTensorBackendParityTests
             for (int i = 0; i < Sizes[t]; i++) data[t][i] = (((t * 131 + i * 17) % 29) - 14) * 0.0625f;
         }
         if (poisonWithNaN) data[3][100] = float.NaN;
+        // Finite elements whose squares overflow a float sum: the norm (~3.9e19) is past what a float accumulator holds.
+        if (pastFloatRange) { data[1][7] = 3e19f; data[4][500] = -2.5e19f; }
         return data;
     }
 
-    private static float ClipAndCheck(IDirectGpuBackend backend, float maxNorm, bool poisonWithNaN)
+    private static float ClipAndCheck(IDirectGpuBackend backend, float maxNorm, bool poisonWithNaN, bool pastFloatRange = false)
     {
         var multi = (IMultiTensorKernels)backend;
-        var data = MakeTensors(poisonWithNaN);
+        var data = MakeTensors(poisonWithNaN, pastFloatRange);
         double sumSq = 0;
         foreach (var tensor in data)
             foreach (float v in tensor) sumSq += (double)v * v;
@@ -52,7 +54,9 @@ public sealed class MultiTensorBackendParityTests
             multi.MultiTensorSumOfSquares(buffers, Sizes, sum);
             multi.ClipScaleFromSumOfSquares(sum, maxNorm, scale);
             float actualScale = backend.DownloadBuffer(scale)[0];
-            Assert.True(Math.Abs(actualScale - expectedScale) <= 1e-5f * Math.Max(1f, expectedScale),
+            // Relative for a tiny scale: an absolute bound would accept a coefficient that underflowed to zero.
+            float tolerance = expectedScale < 1e-3f ? 1e-4f * expectedScale : 1e-5f * Math.Max(1f, expectedScale);
+            Assert.True(Math.Abs(actualScale - expectedScale) <= tolerance,
                 $"scale: expected {expectedScale}, got {actualScale}");
 
             multi.MultiTensorScaleByDeviceScalar(buffers, Sizes, scale);
@@ -79,6 +83,9 @@ public sealed class MultiTensorBackendParityTests
         Assert.True(ClipAndCheck(backend, maxNorm: 1f, poisonWithNaN: false) < 1f, "maxNorm 1 must clip");
         Assert.Equal(1f, ClipAndCheck(backend, maxNorm: 1e6f, poisonWithNaN: false));
         Assert.Equal(1f, ClipAndCheck(backend, maxNorm: 1f, poisonWithNaN: true));
+        // A norm past the float range clips like CUDA's double norm, to a nonzero scale.
+        Assert.True(ClipAndCheck(backend, maxNorm: 1f, poisonWithNaN: false, pastFloatRange: true) > 0f,
+            "a norm past the float range must clip, not erase the gradients");
     }
 
     [SkippableFact]

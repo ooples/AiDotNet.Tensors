@@ -5,15 +5,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
 // The global-norm clip as one work-group reduction per tensor (no device address tables in core Vulkan compute), the
 // Vulkan port of CudaBackend's IMultiTensorKernels. The sum of squares is the finite guard's (VulkanFiniteGuardKernels):
-// a float accumulation and non-finite mark finished as the double the other backends write, so the clip, the guarded
+// a float accumulation and a 2^-80-scaled one finished as the double the other backends write, so the clip, the guarded
 // optimizer updates and ReadSumOfSquares share one layout. (The clip used to read its own raw float sum, which became
 // infinite past the float range -- an L2 norm above ~1.8e19 -- and left those gradients unclipped and reported as
 // non-finite.)
 public sealed partial class VulkanBackend : IMultiTensorKernels
 {
     // min(1, maxNorm / (norm + 1e-6)) from the finished double, the norm taken from its exponent and mantissa
-    // (sum = m * 2^k, norm = sqrt(m) * 2^(k/2)) so a sum past the float range (DBL_MAX: the float accumulator overflowed)
-    // still clips, to ~0 as PyTorch's float32 norm (inf) does. A non-finite norm leaves the gradients unscaled.
+    // (sum = m * 2^k, norm = sqrt(m) * 2^(k/2)) so a sum past the float range, carried by the finish from the scaled
+    // sum, gets the coefficient CUDA's double norm gives. A non-finite norm leaves the gradients unscaled.
     private const string ClipScaleFromSumSquaresGlsl = @"#version 450
 layout(local_size_x = 1) in;
 layout(set=0,binding=0) readonly buffer Accb { uint acc[]; };
