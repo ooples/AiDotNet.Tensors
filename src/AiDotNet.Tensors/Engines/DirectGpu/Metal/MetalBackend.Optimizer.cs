@@ -155,6 +155,16 @@ public sealed partial class MetalBackend
         float learningRate, float beta1, float beta2, float epsilon,
         float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2,
         int blockSize, int paramLength, int numBlocks)
+        => Adam8BitUpdate(param, gradient, mQuant, vQuant, mScales, vScales, learningRate, beta1, beta2, epsilon,
+            oneMinusBeta1, oneMinusBeta2, biasCorrection1, biasCorrection2, blockSize, paramLength, numBlocks,
+            weightDecay: 0f, decoupledWeightDecay: false);
+
+    /// <inheritdoc/>
+    public void Adam8BitUpdate(IGpuBuffer param, IGpuBuffer gradient,
+        IGpuBuffer mQuant, IGpuBuffer vQuant, IGpuBuffer mScales, IGpuBuffer vScales,
+        float learningRate, float beta1, float beta2, float epsilon,
+        float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2,
+        int blockSize, int paramLength, int numBlocks, float weightDecay, bool decoupledWeightDecay)
     {
         ThrowIfDisposed();
         if (paramLength <= 0 || numBlocks <= 0) return;
@@ -187,6 +197,8 @@ public sealed partial class MetalBackend
         encoder.SetBytes(oneMinusBeta2, 14);
         encoder.SetBytes(biasCorrection1, 15);
         encoder.SetBytes(biasCorrection2, 16);
+        encoder.SetBytes(weightDecay, 17);
+        encoder.SetBytes(decoupledWeightDecay ? 1u : 0u, 18);
         encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
 

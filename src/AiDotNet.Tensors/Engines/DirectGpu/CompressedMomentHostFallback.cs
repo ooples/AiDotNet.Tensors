@@ -98,7 +98,9 @@ internal static class CompressedMomentHostFallback
         float biasCorrection2,
         int blockSize,
         int paramLength,
-        int numBlocks)
+        int numBlocks,
+        float weightDecay = 0f,
+        bool decoupledWeightDecay = false)
     {
         // Both corrections must indicate step 1: bc1 <= (1-beta1) alone is ALWAYS true when beta1==0
         // (bc1 stays 1 for every step), which would wrongly discard v history each step for a
@@ -117,7 +119,7 @@ internal static class CompressedMomentHostFallback
             {
                 float oldM = firstStep ? 0f : Compilation.DynamicQuantizationCodebook.Signed[mQuant[i]] * oldMScale;
                 float oldV = firstStep ? 0f : Compilation.DynamicQuantizationCodebook.Unsigned[vQuant[i]] * oldVScale;
-                float g = grad[i];
+                float g = decoupledWeightDecay ? grad[i] : grad[i] + weightDecay * param[i];
                 float newM = beta1 * oldM + oneMinusBeta1 * g;
                 float newV = beta2 * oldV + oneMinusBeta2 * g * g;
                 maxM = MathF.Max(maxM, MathF.Abs(newM));
@@ -135,13 +137,14 @@ internal static class CompressedMomentHostFallback
             {
                 float oldM = firstStep ? 0f : Compilation.DynamicQuantizationCodebook.Signed[mQuant[i]] * oldMScale;
                 float oldV = firstStep ? 0f : Compilation.DynamicQuantizationCodebook.Unsigned[vQuant[i]] * oldVScale;
-                float g = grad[i];
+                float g = decoupledWeightDecay ? grad[i] : grad[i] + weightDecay * param[i];
                 float newM = beta1 * oldM + oneMinusBeta1 * g;
                 float newV = beta2 * oldV + oneMinusBeta2 * g * g;
 
                 float mHat = newM / biasCorrection1;
                 float vHat = newV / biasCorrection2;
-                param[i] -= learningRate * mHat / (MathF.Sqrt(vHat) + epsilon);
+                param[i] = (decoupledWeightDecay ? param[i] * (1f - learningRate * weightDecay) : param[i])
+                    - learningRate * mHat / (MathF.Sqrt(vHat) + epsilon);
 
                 mQuant[i] = Compilation.DynamicQuantizationCodebook.Encode(newM / newMScale, Compilation.DynamicQuantizationCodebook.Signed);
                 vQuant[i] = Compilation.DynamicQuantizationCodebook.Encode(newV / newVScale, Compilation.DynamicQuantizationCodebook.Unsigned);

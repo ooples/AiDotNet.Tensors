@@ -19,7 +19,7 @@ using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
-public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, IChannelBiasAddOutBackend, IUninitializedGpuAllocation, IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IMultiTensorGpuOptimizerBackend, AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend, IPixelShuffleBackend, INativeGpuCodegenExecutor, IBiasActivationBackend, IDeviceMemoryAccounted
+public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, IChannelBiasAddOutBackend, IUninitializedGpuAllocation, IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IAdam8BitWeightDecayBackend, IMultiTensorGpuOptimizerBackend, AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend, IPixelShuffleBackend, INativeGpuCodegenExecutor, IBiasActivationBackend, IDeviceMemoryAccounted
 {
     // During teardown the CUDA driver/context may already be destroyed, so calling driver
     // APIs (cuCtxPushCurrent / cuMemFree / cuCtxPopCurrent / cuCtxDestroy / cuModuleUnload)
@@ -15016,11 +15016,21 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     /// Matches the CPU Adam8BitOptimizer's CompressBothMoments / percentile>=100 /
     /// deterministic-rounding path.
     /// </summary>
-    public unsafe void Adam8BitUpdate(IGpuBuffer param, IGpuBuffer gradient,
+    public void Adam8BitUpdate(IGpuBuffer param, IGpuBuffer gradient,
         IGpuBuffer mQuant, IGpuBuffer vQuant, IGpuBuffer mScales, IGpuBuffer vScales,
         float learningRate, float beta1, float beta2, float epsilon,
         float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2,
         int blockSize, int paramLength, int numBlocks)
+        => Adam8BitUpdate(param, gradient, mQuant, vQuant, mScales, vScales, learningRate, beta1, beta2, epsilon,
+            oneMinusBeta1, oneMinusBeta2, biasCorrection1, biasCorrection2, blockSize, paramLength, numBlocks,
+            weightDecay: 0f, decoupledWeightDecay: false);
+
+    /// <inheritdoc/>
+    public unsafe void Adam8BitUpdate(IGpuBuffer param, IGpuBuffer gradient,
+        IGpuBuffer mQuant, IGpuBuffer vQuant, IGpuBuffer mScales, IGpuBuffer vScales,
+        float learningRate, float beta1, float beta2, float epsilon,
+        float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2,
+        int blockSize, int paramLength, int numBlocks, float weightDecay, bool decoupledWeightDecay)
     {
         if (param is null) throw new ArgumentNullException(nameof(param));
         if (gradient is null) throw new ArgumentNullException(nameof(gradient));
@@ -15035,11 +15045,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         using var _ = PushContext();
         IntPtr pPtr = param.Handle, gPtr = gradient.Handle;
         IntPtr mqPtr = mQuant.Handle, vqPtr = vQuant.Handle, msPtr = mScales.Handle, vsPtr = vScales.Handle;
-        void** args = stackalloc void*[17];
+        int decoupled = decoupledWeightDecay ? 1 : 0;
+        void** args = stackalloc void*[19];
         args[0] = &pPtr; args[1] = &gPtr; args[2] = &mqPtr; args[3] = &vqPtr; args[4] = &msPtr; args[5] = &vsPtr;
         args[6] = &learningRate; args[7] = &beta1; args[8] = &beta2; args[9] = &epsilon;
         args[10] = &oneMinusBeta1; args[11] = &oneMinusBeta2; args[12] = &biasCorrection1; args[13] = &biasCorrection2;
         args[14] = &blockSize; args[15] = &paramLength; args[16] = &numBlocks;
+        args[17] = &weightDecay; args[18] = &decoupled;
         // One CUDA block per quant block (256 threads); the kernel grid-strides within each.
         LaunchKernel(kernel, (uint)numBlocks, 256u, args);
     }

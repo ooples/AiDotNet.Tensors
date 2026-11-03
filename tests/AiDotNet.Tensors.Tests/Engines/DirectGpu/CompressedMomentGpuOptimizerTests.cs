@@ -507,6 +507,73 @@ public sealed class CompressedMomentGpuOptimizerTests :
         Assert.Equal(refV, backend.DownloadByteBuffer(vQuant, length));
     }
 
+    /// <summary>
+    /// Int8 Adam with weight decay inside the kernel (<see cref="IAdam8BitWeightDecayBackend"/>): AdamW's decoupled
+    /// decay and Adam's L2 decay. The reference applies the decay outside the decay-free host kernel, the way each
+    /// optimizer defines it -- AdamW scales the parameters by 1 - lr*wd before the step (torch.optim.AdamW), Adam adds
+    /// wd*param to the gradient -- so it is independent of the new kernel code. Parameters, scales and every stored
+    /// byte must agree.
+    /// </summary>
+    [SkippableTheory]
+    [MemberData(nameof(Backends))]
+    public void Int8AdamWithWeightDecay_MatchesTheDecayAppliedOutsideTheKernel(BackendKind kind)
+    {
+        var acquired = _backends.Get(kind);
+        var backend = RequireReady(kind, acquired, requiresGlslCompiler: true);
+        var decayBackend = Assert.IsAssignableFrom<IAdam8BitWeightDecayBackend>(backend);
+
+        const int length = 67;
+        const int blockSize = 16;
+        const float lr = 0.00625f;
+        const float beta1 = 0.91f;
+        const float beta2 = 0.995f;
+        const float eps = 1e-7f;
+        const float weightDecay = 0.4f;
+        int numBlocks = (length + blockSize - 1) / blockSize;
+        var initial = Vector(length, 0.5f, -0.006f);
+        var grad = Gradient(length);
+
+        foreach (bool decoupled in new[] { true, false })
+        {
+            string label = $"{kind} int8 {(decoupled ? "AdamW" : "Adam + L2")}";
+            using var param = backend.AllocateBuffer((float[])initial.Clone());
+            using var gradBuffer = backend.AllocateBuffer(grad);
+            using var mQuant = backend.AllocateByteBuffer(length);
+            using var vQuant = backend.AllocateByteBuffer(length);
+            using var mScales = backend.AllocateBuffer(new float[numBlocks]);
+            using var vScales = backend.AllocateBuffer(new float[numBlocks]);
+            var refParam = (float[])initial.Clone();
+            var refM = new byte[length];
+            var refV = new byte[length];
+            var refMScales = new float[numBlocks];
+            var refVScales = new float[numBlocks];
+            for (int step = 1; step <= 4; step++)
+            {
+                float bc1 = 1f - MathF.Pow(beta1, step);
+                float bc2 = 1f - MathF.Pow(beta2, step);
+                decayBackend.Adam8BitUpdate(
+                    param, gradBuffer, mQuant, vQuant, mScales, vScales,
+                    lr, beta1, beta2, eps, 1f - beta1, 1f - beta2,
+                    bc1, bc2, blockSize, length, numBlocks, weightDecay, decoupled);
+
+                var refGrad = new float[length];
+                for (int i = 0; i < length; i++)
+                {
+                    refGrad[i] = decoupled ? grad[i] : grad[i] + weightDecay * refParam[i];
+                    if (decoupled) refParam[i] *= 1f - lr * weightDecay;
+                }
+                CompressedMomentHostFallback.Adam8Bit(refParam, refGrad, refM, refV, refMScales, refVScales,
+                    lr, beta1, beta2, eps, 1f - beta1, 1f - beta2, bc1, bc2, blockSize, length, numBlocks);
+            }
+
+            AssertClose(refParam, backend.DownloadBuffer(param), length, 1e-6f, label + " parameters");
+            AssertClose(refMScales, backend.DownloadBuffer(mScales), numBlocks, 1e-6f, label + " m scales");
+            AssertClose(refVScales, backend.DownloadBuffer(vScales), numBlocks, 1e-6f, label + " v scales");
+            Assert.Equal(refM, backend.DownloadByteBuffer(mQuant, length));
+            Assert.Equal(refV, backend.DownloadByteBuffer(vQuant, length));
+        }
+    }
+
     [SkippableTheory]
     [MemberData(nameof(Backends))]
     public void Lamb_MatchesCpuKernel_WithTrustRatioClipAndBiasCorrectionSwitch(BackendKind kind)

@@ -2900,8 +2900,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     /// <summary>
     /// Requests true block-quantized int8 Adam moment storage for the float fused
-    /// path. Supported only for Adam without weight decay. Last request wins
-    /// against <see cref="RequestBf16MomentStorage"/>.
+    /// path (bitsandbytes-style dynamic block quantization). Supported for Adam (L2
+    /// weight decay) and AdamW (decoupled weight decay), on the CPU and every direct GPU
+    /// backend. Last request wins against <see cref="RequestBf16MomentStorage"/>.
     /// </summary>
     public void RequestInt8MomentStorage(bool enabled, int blockSize = 2048,
         int minQuantizedLength = DefaultInt8MinQuantizedLength)
@@ -2922,6 +2923,33 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     private static int Adam8BitBlockCount(int length, int blockSize)
         => (length + blockSize - 1) / blockSize;
+
+    /// <summary>
+    /// One int8 block-quantized Adam/AdamW step on the device, weight decay inside the kernel. A backend that has
+    /// only the decay-free kernel can still run a step with no decay.
+    /// </summary>
+    private static void LaunchAdam8Bit(Engines.DirectGpu.IDirectGpuBackend gpuBe,
+        Engines.DirectGpu.IGpuBuffer param, Engines.DirectGpu.IGpuBuffer gradient,
+        Engines.DirectGpu.IGpuBuffer mQuant, Engines.DirectGpu.IGpuBuffer vQuant,
+        Engines.DirectGpu.IGpuBuffer mScales, Engines.DirectGpu.IGpuBuffer vScales,
+        float lr, float beta1, float beta2, float epsilon, int step, float weightDecay, bool decoupled,
+        int blockSize, int length)
+    {
+        float bc1 = 1f - MathF.Pow(beta1, step);
+        float bc2 = 1f - MathF.Pow(beta2, step);
+        int blocks = Adam8BitBlockCount(length, blockSize);
+        if (gpuBe is Engines.DirectGpu.IAdam8BitWeightDecayBackend decayBe)
+            decayBe.Adam8BitUpdate(param, gradient, mQuant, vQuant, mScales, vScales,
+                lr, beta1, beta2, epsilon, 1f - beta1, 1f - beta2, bc1, bc2, blockSize, length, blocks,
+                weightDecay, decoupled);
+        else if (weightDecay == 0f && gpuBe is Engines.DirectGpu.ICompressedMomentGpuOptimizerBackend compressedBe)
+            compressedBe.Adam8BitUpdate(param, gradient, mQuant, vQuant, mScales, vScales,
+                lr, beta1, beta2, epsilon, 1f - beta1, 1f - beta2, bc1, bc2, blockSize, length, blocks);
+        else
+            throw new NotSupportedException(
+                "Int8 block-quantized fused optimizer moments" + (weightDecay != 0f ? " with weight decay" : "") +
+                " are not implemented by GPU backend '" + gpuBe.BackendName + "'.");
+    }
 
     private static void InitializeAdam8BitCpuState(
         byte[] mQuant, byte[] vQuant, double[] mScales, double[] vScales)
@@ -5684,10 +5712,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         bool useBf16Moments = _momentStorageMode == FusedMomentStorageMode.BFloat16
             && (optimizerType is OptimizerType.Adam or OptimizerType.AdamW);
         bool useInt8Moments = _momentStorageMode == FusedMomentStorageMode.Int8BlockQuantized;
-        if (useInt8Moments && optimizerType != OptimizerType.Adam)
-            throw new NotSupportedException("Int8 block-quantized fused moments are supported only for Adam.");
-        if (useInt8Moments && weightDecay != 0f)
-            throw new NotSupportedException("Int8 block-quantized fused Adam moments do not support weight decay.");
+        // Int8 moments: Adam (L2 decay joins the gradient) and AdamW (decoupled decay), as bitsandbytes' Adam8bit /
+        // AdamW8bit; the decay is applied inside the same kernel.
+        if (useInt8Moments && optimizerType is not (OptimizerType.Adam or OptimizerType.AdamW))
+            throw new NotSupportedException("Int8 block-quantized fused moments are supported only for Adam and AdamW.");
 
         var mB = new ushort[paramCount][];
         var vB = new ushort[paramCount][];
@@ -6606,15 +6634,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                 }
                                 else if (gpuMomentStorage[p] == FusedMomentStorageMode.Int8BlockQuantized)
                                 {
-                                    float bc1 = 1f - MathF.Pow(b1, _optimizerStep);
-                                    float bc2 = 1f - MathF.Pow(b2, _optimizerStep);
-                                    if (gpuBe is not Engines.DirectGpu.ICompressedMomentGpuOptimizerBackend compressedGpuBe)
-                                        throw new NotSupportedException(
-                                            $"Int8 block-quantized fused optimizer moments are not implemented by GPU backend '{gpuBe.BackendName}'.");
-                                    compressedGpuBe.Adam8BitUpdate(
-                                        gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuMScales[p]!, gpuVScales[p]!,
-                                        lr, b1, b2, epsVal, 1f - b1, 1f - b2, bc1, bc2,
-                                        _int8MomentBlockSize, len, Adam8BitBlockCount(len, _int8MomentBlockSize));
+                                    LaunchAdam8Bit(gpuBe, gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuMScales[p]!, gpuVScales[p]!,
+                                        lr, b1, b2, epsVal, _optimizerStep, wd, decoupled: false, _int8MomentBlockSize, len);
                                 }
                                 else
                                 {
@@ -6631,6 +6652,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                     compressedGpuBe.AdamWUpdateBf16(
                                         gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
                                         lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                }
+                                else if (gpuMomentStorage[p] == FusedMomentStorageMode.Int8BlockQuantized)
+                                {
+                                    LaunchAdam8Bit(gpuBe, gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuMScales[p]!, gpuVScales[p]!,
+                                        lr, b1, b2, epsVal, _optimizerStep, wd, decoupled: true, _int8MomentBlockSize, len);
                                 }
                                 else
                                 {
@@ -6778,6 +6804,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                 fixed (ushort* pMb = mB[p], pVb = vB[p])
                                     FusedOptimizer.AdamWUpdateBf16Simd(pParam, pGrad, pMb, pVb, len,
                                         lr, b1, b2, epsVal, wd, _optimizerStep);
+                            else if (useInt8Moments && mQuant[p].Length != 0)
+                                fixed (byte* pMq = mQuant[p], pVq = vQuant[p])
+                                fixed (double* pMs = mScales[p], pVs = vScales[p])
+                                    FusedOptimizer.AdamUpdateInt8BlockQuantized(
+                                        pParam, pGrad, pMq, pVq, pMs, pVs, len, _int8MomentBlockSize,
+                                        lr, b1, b2, epsVal, _optimizerStep, wd, decoupledWeightDecay: true);
                             else
                                 FusedOptimizer.AdamWUpdateSimd(pParam, pGrad, pM, pV, len,
                                     lr, b1, b2, epsVal, wd, stepBc1, stepBc2);
@@ -7129,10 +7161,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         bool useBf16Moments = _momentStorageMode == FusedMomentStorageMode.BFloat16
             && (optimizerType is OptimizerType.Adam or OptimizerType.AdamW);
         bool useInt8Moments = _momentStorageMode == FusedMomentStorageMode.Int8BlockQuantized;
-        if (useInt8Moments && optimizerType != OptimizerType.Adam)
-            throw new NotSupportedException("Int8 block-quantized fused moments are supported only for Adam.");
-        if (useInt8Moments && weightDecay != 0f)
-            throw new NotSupportedException("Int8 block-quantized fused Adam moments do not support weight decay.");
+        // Int8 moments: Adam (L2 decay joins the gradient) and AdamW (decoupled decay), as bitsandbytes' Adam8bit /
+        // AdamW8bit; the decay is applied inside the same kernel.
+        if (useInt8Moments && optimizerType is not (OptimizerType.Adam or OptimizerType.AdamW))
+            throw new NotSupportedException("Int8 block-quantized fused moments are supported only for Adam and AdamW.");
         var mB = new ushort[paramCount][];
         var vB = new ushort[paramCount][];
         var mQuant = new byte[paramCount][];
@@ -7465,15 +7497,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                 }
                                 else if (gpuMomentStorage[p] == FusedMomentStorageMode.Int8BlockQuantized)
                                 {
-                                    float bc1 = 1f - MathF.Pow(b1, _optimizerStep);
-                                    float bc2 = 1f - MathF.Pow(b2, _optimizerStep);
-                                    if (gpuBe is not Engines.DirectGpu.ICompressedMomentGpuOptimizerBackend compressedGpuBe)
-                                        throw new NotSupportedException(
-                                            $"Int8 block-quantized fused optimizer moments are not implemented by GPU backend '{gpuBe.BackendName}'.");
-                                    compressedGpuBe.Adam8BitUpdate(
-                                        gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuMScales[p]!, gpuVScales[p]!,
-                                        lr, b1, b2, epsVal, 1f - b1, 1f - b2, bc1, bc2,
-                                        _int8MomentBlockSize, len, Adam8BitBlockCount(len, _int8MomentBlockSize));
+                                    LaunchAdam8Bit(gpuBe, gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuMScales[p]!, gpuVScales[p]!,
+                                        lr, b1, b2, epsVal, _optimizerStep, wd, decoupled: false, _int8MomentBlockSize, len);
                                 }
                                 else
                                 {
@@ -7490,6 +7515,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                     compressedGpuBe.AdamWUpdateBf16(
                                         gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
                                         lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                }
+                                else if (gpuMomentStorage[p] == FusedMomentStorageMode.Int8BlockQuantized)
+                                {
+                                    LaunchAdam8Bit(gpuBe, gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuMScales[p]!, gpuVScales[p]!,
+                                        lr, b1, b2, epsVal, _optimizerStep, wd, decoupled: true, _int8MomentBlockSize, len);
                                 }
                                 else
                                 {
@@ -7610,6 +7640,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                 fixed (ushort* pMb = mB[p], pVb = vB[p])
                                     FusedOptimizer.AdamWUpdateBf16Simd(pParam, pGrad, pMb, pVb, len,
                                         lr, b1, b2, epsVal, wd, _optimizerStep);
+                            else if (useInt8Moments && mQuant[p].Length != 0)
+                                fixed (byte* pMq = mQuant[p], pVq = vQuant[p])
+                                fixed (double* pMs = mScales[p], pVs = vScales[p])
+                                    FusedOptimizer.AdamUpdateInt8BlockQuantized(
+                                        pParam, pGrad, pMq, pVq, pMs, pVs, len, _int8MomentBlockSize,
+                                        lr, b1, b2, epsVal, _optimizerStep, wd, decoupledWeightDecay: true);
                             else
                                 FusedOptimizer.AdamWUpdateSimd(pParam, pGrad, pM, pV, len,
                                     lr, b1, b2, epsVal, wd, stepBc1, stepBc2);

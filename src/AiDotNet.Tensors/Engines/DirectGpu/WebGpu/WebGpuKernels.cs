@@ -1491,6 +1491,10 @@ struct Adam8Params {
     one_minus_beta2: f32,
     bias_correction1: f32,
     bias_correction2: f32,
+    weight_decay: f32,
+    decoupled: u32,
+    reserved1: u32,
+    reserved2: u32,
 }
 @group(0) @binding(6) var<uniform> opt_params: Adam8Params;
 
@@ -1576,7 +1580,7 @@ fn adam8bit(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id)
         }
         let old_m = select((adam8_dec_s(load_m_byte(i)) * m_scale), 0.0, first_step);
         let old_v = select((adam8_dec_u(load_v_byte(i)) * v_scale), 0.0, first_step);
-        let g = gradients[i];
+        let g = select(gradients[i] + opt_params.weight_decay * params_arr[i], gradients[i], opt_params.decoupled != 0u);
         let new_m = opt_params.beta1 * old_m + opt_params.one_minus_beta1 * g;
         let new_v = opt_params.beta2 * old_v + opt_params.one_minus_beta2 * (g * g);
         loc_m = max(loc_m, abs(new_m));
@@ -1617,13 +1621,14 @@ fn adam8bit(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id)
         }
         let old_m = select((adam8_dec_s(load_m_byte(j)) * m_scale), 0.0, first_step);
         let old_v = select((adam8_dec_u(load_v_byte(j)) * v_scale), 0.0, first_step);
-        let g = gradients[j];
+        let g = select(gradients[j] + opt_params.weight_decay * params_arr[j], gradients[j], opt_params.decoupled != 0u);
         let new_m = opt_params.beta1 * old_m + opt_params.one_minus_beta1 * g;
         let new_v = opt_params.beta2 * old_v + opt_params.one_minus_beta2 * (g * g);
 
         let m_hat = new_m / opt_params.bias_correction1;
         let v_hat = new_v / opt_params.bias_correction2;
-        params_arr[j] = params_arr[j] - opt_params.lr * m_hat / (sqrt(v_hat) + opt_params.epsilon);
+        params_arr[j] = select(params_arr[j], params_arr[j] * (1.0 - opt_params.lr * opt_params.weight_decay), opt_params.decoupled != 0u)
+            - opt_params.lr * m_hat / (sqrt(v_hat) + opt_params.epsilon);
 
         store_m_byte(j, adam8_enc_s(new_m / new_m_scale));
         store_v_byte(j, adam8_enc_u(new_v / new_v_scale));
