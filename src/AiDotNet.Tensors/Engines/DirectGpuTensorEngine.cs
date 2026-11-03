@@ -29507,10 +29507,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return base.TensorNotEquals(tensor, value);
     }
 
+    // The comparisons (Equals, NotEquals, GreaterThan, LessThan) have no gradient and record nothing on a tape on any
+    // engine, so a live tape is no reason to leave the device: the CPU fallback downloaded the input (a cross-entropy
+    // step read its targets back every step to build the in-range mask).
     Tensor<T> IEngine.TensorEquals<T>(Tensor<T> a, Tensor<T> b2)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!IsTapeActive<T>() && !Compilation.GraphMode.IsActive && typeof(T) == typeof(float)
+        if (!Compilation.GraphMode.IsActive && typeof(T) == typeof(float)
             && TryGetBackend(out var b) && ShapesMatch(a.Shape._dims, b2.Shape._dims))
         {
             try
@@ -29529,7 +29532,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.TensorNotEquals<T>(Tensor<T> a, Tensor<T> b2)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!IsTapeActive<T>() && !Compilation.GraphMode.IsActive && typeof(T) == typeof(float)
+        if (!Compilation.GraphMode.IsActive && typeof(T) == typeof(float)
             && TryGetBackend(out var b) && ShapesMatch(a.Shape._dims, b2.Shape._dims))
         {
             try
@@ -29551,7 +29554,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.TensorGreaterThan<T>(Tensor<T> a, Tensor<T> b2)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!IsTapeActive<T>() && !Compilation.GraphMode.IsActive && typeof(T) == typeof(float)
+        if (!Compilation.GraphMode.IsActive && typeof(T) == typeof(float)
             && TryGetBackend(out var b) && ShapesMatch(a.Shape._dims, b2.Shape._dims))
         {
             try
@@ -29570,7 +29573,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.TensorGreaterThan<T>(Tensor<T> tensor, T value)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!IsTapeActive<T>() && !Compilation.GraphMode.IsActive && typeof(T) == typeof(float)
+        if (!Compilation.GraphMode.IsActive && typeof(T) == typeof(float)
             && TryGetBackend(out var backend))
         {
             try
@@ -29592,7 +29595,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.TensorLessThan<T>(Tensor<T> a, Tensor<T> b2)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!IsTapeActive<T>() && !Compilation.GraphMode.IsActive && typeof(T) == typeof(float)
+        if (!Compilation.GraphMode.IsActive && typeof(T) == typeof(float)
             && TryGetBackend(out var b) && ShapesMatch(a.Shape._dims, b2.Shape._dims))
         {
             try
@@ -29611,7 +29614,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.TensorLessThan<T>(Tensor<T> tensor, T value)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!IsTapeActive<T>() && !Compilation.GraphMode.IsActive && typeof(T) == typeof(float)
+        if (!Compilation.GraphMode.IsActive && typeof(T) == typeof(float)
             && TryGetBackend(out var backend))
         {
             try
