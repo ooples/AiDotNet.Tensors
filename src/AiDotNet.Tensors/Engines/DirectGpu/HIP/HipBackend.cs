@@ -11920,6 +11920,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             args[14] = &blockSize;
             args[15] = &paramLength;
             args[16] = &numBlocks;
+            args[17] = &weightDecay;
+            args[18] = &decoupled;
 
             LaunchKernel(krnl, (uint)numBlocks, 256u, args);
             Synchronize();
