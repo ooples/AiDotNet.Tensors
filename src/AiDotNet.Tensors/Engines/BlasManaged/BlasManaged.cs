@@ -63,8 +63,12 @@ public static partial class BlasManaged
         System.Environment.GetEnvironmentVariable("AIDOTNET_DISABLE_GOTO") == "1";
 
     // AIDOTNET_GEMM_DETERMINISTIC_GOTO=0 keeps deterministic DisableAutotune calls off GotoGemm (the previous routing).
-    internal static bool s_disableDeterministicGoto =
+    internal static readonly bool s_disableDeterministicGoto =
         System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_DETERMINISTIC_GOTO") == "0";
+
+    // The same switch for the calling thread only, so a test can take the previous routing without rerouting
+    // deterministic products that other tests run in parallel. The routing decision is made on the calling thread.
+    [ThreadStatic] internal static bool t_disableDeterministicGoto;
 
     // Deterministic DisableAutotune products run on GotoGemm on this thread (test observable).
     [ThreadStatic] internal static int t_deterministicGotoRuns;
@@ -828,7 +832,7 @@ public static partial class BlasManaged
         // count like the tail split below, and the busy-dependent CCX pool and the precision-changing bf16 route are
         // skipped. Before, these calls fell to PackBoth: 1.6-3.1x slower at 8-32 threads on the DiT M=256 linears (#653).
         bool deterministicGoto = options.PackingMode == PackingMode.DisableAutotune && deterministic
-            && !s_disableDeterministicGoto && GotoGemmFp32.IsThreadCountInvariant(n);
+            && !s_disableDeterministicGoto && !t_disableDeterministicGoto && GotoGemmFp32.IsThreadCountInvariant(n);
         if (deterministicGoto) gotoThreadBudget = Environment.ProcessorCount;
         // The deterministic route also serves an explicit thread count (-1 or 1: on this thread; N: at most N tiles at
         // once): the same shape must give the same bits whatever count is asked for.

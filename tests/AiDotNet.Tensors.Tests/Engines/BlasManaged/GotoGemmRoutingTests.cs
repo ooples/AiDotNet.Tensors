@@ -412,7 +412,7 @@ public sealed class GotoGemmRoutingTests
     {
         Skip.IfNot(GotoGemmFp32.IsAvailable, "The packed GotoGemm route is unavailable on this CPU/OS/runtime.");
         bool? beforeDeterministic = BlasProvider.GetThreadLocalDeterministicMode();
-        bool beforeSwitch = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.s_disableDeterministicGoto;
+        bool beforeSwitch = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.t_disableDeterministicGoto;
         var engine = new CpuEngine();
         var rng = RandomHelper.CreateSeededRandom(6531);
         Tensor<float> Rand(params int[] shape)
@@ -430,7 +430,7 @@ public sealed class GotoGemmRoutingTests
             float[] viaGoto = engine.BatchMatMul(x, w).ToArray();
             Assert.Equal(runs + 1, AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.t_deterministicGotoRuns);
 
-            AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.s_disableDeterministicGoto = true;
+            AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.t_disableDeterministicGoto = true;
             runs = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.t_deterministicGotoRuns;
             float[] viaOld = engine.BatchMatMul(x, w).ToArray();
             Assert.Equal(runs, AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.t_deterministicGotoRuns);
@@ -440,7 +440,7 @@ public sealed class GotoGemmRoutingTests
         }
         finally
         {
-            AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.s_disableDeterministicGoto = beforeSwitch;
+            AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.t_disableDeterministicGoto = beforeSwitch;
             BlasProvider.SetThreadLocalDeterministicMode(beforeDeterministic);
         }
     }
