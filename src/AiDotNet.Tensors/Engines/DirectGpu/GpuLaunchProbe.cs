@@ -45,6 +45,11 @@ internal static class GpuLaunchProbe
     /// <summary>DIAGNOSTIC: launches since process start; <see cref="Reset"/> does NOT clear it.</summary>
     public static long TotalEver => Interlocked.Read(ref _totalEver);
 
+    private static long _adamWDispatches;
+    /// <summary>Successful eager AdamW device dispatches since process start; general GPU work does not count.</summary>
+    public static long AdamWDispatches => Interlocked.Read(ref _adamWDispatches);
+    internal static void OnAdamWDispatch() => Interlocked.Increment(ref _adamWDispatches);
+
     /// <summary>Device-to-host transfers observed since the last <see cref="Reset"/>.</summary>
     public static long Readbacks => Interlocked.Read(ref _readbacks);
 

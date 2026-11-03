@@ -168,6 +168,7 @@ public static class GpuOptimizer
         // AdamW mutates param, m and v on the GPU — mark all three current so a later read
         // doesn't serve stale host data (TryUpdateParameter marks the parameter).
         MarkGpuUpdated(backend, m, v);
+        GpuLaunchProbe.OnAdamWDispatch();
         return true;
     }
 
