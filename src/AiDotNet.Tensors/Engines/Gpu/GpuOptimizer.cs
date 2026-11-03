@@ -356,11 +356,11 @@ public static class GpuOptimizer
     }
 
 
-    public static bool TryAdam8BitStep(Tensor<float> p, Tensor<float> g,
     /// <summary>
     /// GPU-resident 8-bit Adam step: dequantize, update and requantize without host moment downloads.
     /// Returns false when parameters or gradients are not resident, state is missing, or the backend lacks support.
     /// </summary>
+    public static bool TryAdam8BitStep(Tensor<float> p, Tensor<float> g,
         DirectGpu.IGpuBuffer? mQ, DirectGpu.IGpuBuffer? vQ, DirectGpu.IGpuBuffer? mScales, DirectGpu.IGpuBuffer? vScales,
         float lr, float beta1, float beta2, float epsilon, float biasCorrection1, float biasCorrection2, int blockSize)
     {
