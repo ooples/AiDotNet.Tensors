@@ -102,7 +102,10 @@ public class ZzMlpGemmBench
             var dxNn = Measure(() => AiDotNet.Tensors.Engines.Simd.SimdGemm.Sgemm(dyR.AsSpan(0, mm * n), n, false, wT2.AsSpan(0, n * k), k, false, dxR.AsSpan(0, mm * k), mm, n, k));
             Line($"ZM dXnn m{mm} {k}->{n} transpose+nn {dxTn.Min:F4}/{dxTn.Med:F4}  nn-only {dxNn.Min:F4}/{dxNn.Med:F4}  vec512 {AiDotNet.Tensors.Engines.Simd.SimdGemm.UseVector512Direct}");
             Line($"ZM dXroute m{mm} {k}->{n} current {dxCur.Min:F4}/{dxCur.Med:F4}  blasDis {dxDis.Min:F4}/{dxDis.Med:F4}  blasAuto {dxAuto.Min:F4}/{dxAuto.Med:F4}  blasWT {dxPreT.Min:F4}/{dxPreT.Med:F4}");
-            Line($"ZM route m{mm} {k}->{n} cachedB {cached.Min:F4}/{cached.Med:F4}  blas {blas.Min:F4}/{blas.Med:F4}  sgemm {simd.Min:F4}/{simd.Med:F4}");
+            AiDotNet.Tensors.Engines.Simd.SimdGemm.s_zzPack16 = true;
+            var simd16 = Measure(() => { o.AsSpan().Clear(); AiDotNet.Tensors.Engines.Simd.SimdGemm.Sgemm(x.AsSpan(0, mm * k), k, false, w.AsSpan(0, k * n), n, false, o.AsSpan(0, mm * n), mm, k, n); });
+            AiDotNet.Tensors.Engines.Simd.SimdGemm.s_zzPack16 = false;
+            Line($"ZM route m{mm} {k}->{n} cachedB {cached.Min:F4}/{cached.Med:F4}  blas {blas.Min:F4}/{blas.Med:F4}  sgemm {simd.Min:F4}/{simd.Med:F4}  sgemm16 {simd16.Min:F4}/{simd16.Med:F4}");
         }
         ZzDeepConvBenchTorch.Run(_o, "tools/parity/zz_mlp_torch.py", threads);
     }

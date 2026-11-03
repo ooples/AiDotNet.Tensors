@@ -3698,6 +3698,29 @@ internal static partial class SimdGemm
                 }
             }
         }
+        // probe: AVX2 16-column strips of B packed contiguously, strip outer.
+        if (packedColumns == 0 && s_zzPack16 && k <= MaxPackedStripK && nFull >= 16 && blockEnd - blockStart >= 2)
+        {
+            packedColumns = nFull;
+            fixed (float* ps = PackedStripBuffer(k))
+            {
+                for (int j = 0; j < nFull; j += 16)
+                {
+                    float* src = B + j; float* dst = ps;
+                    for (int pp = 0; pp < k; pp++, src += n, dst += 16)
+                    {
+                        Vector256.Store(Vector256.Load(src), dst);
+                        Vector256.Store(Vector256.Load(src + 8), dst + 8);
+                    }
+                    for (int blk = blockStart; blk < blockEnd; blk++)
+                    {
+                        int i0 = blk * TransAMr;
+                        if (mFull - i0 < TransAMr) continue;
+                        TransAKernel6x16(A + i0, m, ps, 16, C + (long)i0 * n + j, n, k);
+                    }
+                }
+            }
+        }
 #endif
         for (int blk = blockStart; blk < blockEnd; blk++)
         {
@@ -3714,7 +3737,7 @@ internal static partial class SimdGemm
                         TransAKernel6x32(A + i0, m, B + j, n, cRow + j, n, k);
 #endif
                 for (; j < nFull; j += 16)
-                    TransAKernel6x16(A + i0, m, B + j, n, cRow + j, k);
+                    TransAKernel6x16(A + i0, m, B + j, n, cRow + j, n, k);
             }
             else
             {
@@ -3730,7 +3753,7 @@ internal static partial class SimdGemm
     /// <summary>Six rows x sixteen columns of C = At*B, overwriting C; pA points at row i0 of At (A + i0), lda = m,
     /// and C's row stride equals B's (n).</summary>
     [MethodImpl(HotInline)]
-    private static unsafe void TransAKernel6x16(float* pA, int lda, float* pB, int ldb, float* pC, int k)
+    private static unsafe void TransAKernel6x16(float* pA, int lda, float* pB, int ldb, float* pC, int ldc, int k)
     {
         var c00 = Vector256<float>.Zero; var c01 = Vector256<float>.Zero;
         var c10 = Vector256<float>.Zero; var c11 = Vector256<float>.Zero;
@@ -3757,11 +3780,11 @@ internal static partial class SimdGemm
             pA += lda;
             pB += ldb;
         }
-        Avx.Store(pC + 0, c00); Avx.Store(pC + 8, c01); pC += ldb;
-        Avx.Store(pC + 0, c10); Avx.Store(pC + 8, c11); pC += ldb;
-        Avx.Store(pC + 0, c20); Avx.Store(pC + 8, c21); pC += ldb;
-        Avx.Store(pC + 0, c30); Avx.Store(pC + 8, c31); pC += ldb;
-        Avx.Store(pC + 0, c40); Avx.Store(pC + 8, c41); pC += ldb;
+        Avx.Store(pC + 0, c00); Avx.Store(pC + 8, c01); pC += ldc;
+        Avx.Store(pC + 0, c10); Avx.Store(pC + 8, c11); pC += ldc;
+        Avx.Store(pC + 0, c20); Avx.Store(pC + 8, c21); pC += ldc;
+        Avx.Store(pC + 0, c30); Avx.Store(pC + 8, c31); pC += ldc;
+        Avx.Store(pC + 0, c40); Avx.Store(pC + 8, c41); pC += ldc;
         Avx.Store(pC + 0, c50); Avx.Store(pC + 8, c51);
     }
 

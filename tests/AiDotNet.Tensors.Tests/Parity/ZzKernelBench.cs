@@ -63,18 +63,43 @@ public class ZzKernelBench
                 var refC = new float[m * n];
                 SimdGemm.s_zzPackA2D = false; SimdGemm.s_stripKc = 256;
                 SimdGemm.Sgemm(A, kk, false, B, n, false, refC, m, kk, n);
-                foreach (var (kcv, pk, pa) in new[] { (256, true, false), (128, true, false), (256, true, true), (0, true, false) })
+                foreach (var (kcv, pk, pa, p16) in new[] { (256, true, false, false), (256, true, false, true), (256, true, true, false), (0, true, false, false) })
                 {
-                    SimdGemm.s_stripKc = kcv; SimdGemm.s_packStrip512 = pk; SimdGemm.s_zzPackA2D = pa;
+                    SimdGemm.s_stripKc = kcv; SimdGemm.s_packStrip512 = pk; SimdGemm.s_zzPackA2D = pa; SimdGemm.s_zzPack16 = p16;
                     var tm = Measure(() => SimdGemm.Sgemm(A, kk, false, B, n, false, C, m, kk, n));
                     int diff = 0; for (int q = 0; q < C.Length; q++) if (BitConverter.SingleToInt32Bits(C[q]) != BitConverter.SingleToInt32Bits(refC[q])) diff++;
-                    parts.Add($"kc{kcv}{(pk ? "" : "-nopack")}{(pa ? "-packA" : "")} {tm.Min:F4} ({f / (tm.Min * 1e6):F0}) d{diff}");
+                    parts.Add($"kc{kcv}{(pk ? "" : "-nopack")}{(pa ? "-packA" : "")}{(p16 ? "-pack16" : "")} {tm.Min:F4} ({f / (tm.Min * 1e6):F0}) d{diff}");
                 }
-                SimdGemm.s_zzPackA2D = false;
+                SimdGemm.s_zzPackA2D = false; SimdGemm.s_zzPack16 = false;
                 Line($"ZZ kern kcsweep {m}x{kk}x{n} t{th}: {string.Join("  ", parts)}");
             }
         }
         SimdGemm.s_stripKc = kc0; SimdGemm.s_packStrip512 = pack0;
+        // dW = Xᵀ·dY through the transposed-A path, with and without AVX2 strip packing.
+        foreach (var (m, kk, n) in new[] { (784, 128, 512), (512, 128, 256) })
+        {
+            var X = new float[kk * m]; var D = new float[kk * n]; var W = new float[m * n]; var Wref = new float[m * n];
+            for (int i = 0; i < X.Length; i++) X[i] = (float)r.NextDouble();
+            for (int i = 0; i < D.Length; i++) D[i] = (float)r.NextDouble();
+            double f = 2.0 * m * kk * n;
+            SimdGemm.s_zzPack16 = false;
+            SimdGemm.Sgemm(X, m, true, D, n, false, Wref, m, kk, n);
+            foreach (int th in new[] { 1, 2 })
+            {
+                CpuParallelSettings.MaxDegreeOfParallelism = th;
+                var parts = new List<string>();
+                foreach (bool p16 in new[] { false, true })
+                {
+                    SimdGemm.s_zzPack16 = p16;
+                    var tm = Measure(() => SimdGemm.Sgemm(X, m, true, D, n, false, W, m, kk, n));
+                    int diff = 0; for (int q = 0; q < W.Length; q++) if (BitConverter.SingleToInt32Bits(W[q]) != BitConverter.SingleToInt32Bits(Wref[q])) diff++;
+                    parts.Add($"{(p16 ? "pack16" : "base")} {tm.Min:F4} ({f / (tm.Min * 1e6):F0}) d{diff}");
+                }
+                SimdGemm.s_zzPack16 = false;
+                Line($"ZZ kern dW {m}x{kk}x{n} t{th}: {string.Join("  ", parts)}");
+            }
+        }
+        CpuParallelSettings.MaxDegreeOfParallelism = threads0;
         foreach (var (m, kk, n) in new[] { (128, 784, 512), (128, 512, 256), (64, 128, 3136) })
         {
             var A = new float[m * kk]; var B = new float[kk * n]; var C = new float[m * n];

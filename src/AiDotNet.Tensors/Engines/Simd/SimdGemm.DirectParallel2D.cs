@@ -37,6 +37,7 @@ internal static partial class SimdGemm
     /// <summary>GEMMs the 2D path computed on this thread; a test probe that a gated shape actually took it.</summary>
     [ThreadStatic] internal static int t_directParallel2DRuns;
     internal static bool s_zzPackA2D; // probe A/B only
+    internal static bool s_zzPack16; // probe A/B only
 
     /// <summary>
     /// <c>C[m,n] = A[m,k] · B[k,n]</c> (row-major, no transpose, ldc = n, C overwritten) over disjoint output
@@ -166,6 +167,30 @@ internal static partial class SimdGemm
                                 for (int j = stripStart; j < stripEnd; j += Nr)
                                     DirectKernelMxNMaskedStore(pARow, ldaCap, pB + j, ldbCap, pCRow + j, nCap,
                                         kCap, mcActual: mc, ncActual: Nr);
+                            }
+                        }
+                        continue;
+                    }
+                    // probe: AVX2 16-column strips packed contiguously (rows ldb apart thrash L1 sets at power-of-two n).
+                    if (s_zzPack16 && stripCap == Nr && stripEnd - stripStart == Nr && kCap <= MaxPackedStripK
+                        && Math.Min(rb1, mCap / Mr) - rb0 >= 2)
+                    {
+                        fixed (float* ps = PackedStripBuffer(kCap))
+                        {
+                            float* src = pB + stripStart; float* dst = ps;
+                            for (int pp = 0; pp < kCap; pp++, src += ldbCap, dst += Nr)
+                            {
+                                System.Runtime.Intrinsics.Vector256.Store(System.Runtime.Intrinsics.Vector256.Load(src), dst);
+                                System.Runtime.Intrinsics.Vector256.Store(System.Runtime.Intrinsics.Vector256.Load(src + 8), dst + 8);
+                            }
+                            for (int rbIdx = rb0; rbIdx < rb1; rbIdx++)
+                            {
+                                int i = rbIdx * Mr;
+                                int mc = Math.Min(Mr, mCap - i);
+                                float* pARow = pA + (long)i * ldaCap;
+                                float* pCRow = pC + (long)i * nCap + stripStart;
+                                if (mc == Mr) DirectKernel6x16Store(pARow, ldaCap, ps, Nr, pCRow, nCap, kCap);
+                                else DirectKernelMxNMaskedStore(pARow, ldaCap, ps, Nr, pCRow, nCap, kCap, mcActual: mc, ncActual: Nr);
                             }
                         }
                         continue;
