@@ -32,6 +32,9 @@ on:
     # ready_for_review starts the lane when a draft is marked ready; draft pushes do not take the runner (see the job's if).
     types: [ opened, synchronize, reopened, ready_for_review ]
     paths:
+      - 'src/AiDotNet.Tensors/Engines/CuDnnNative.cs'
+      - 'tests/AiDotNet.Tensors.Tests/Engines/DirectGpu/Cudnn*.cs'
+      - 'tests/AiDotNet.Tensors.Tests/Engines/Gpu/CuDnn*.cs'
       - 'src/AiDotNet.Tensors/Engines/DirectGpu/**'
       - 'src/AiDotNet.Tensors/Engines/DirectGpuTensorEngine*.cs'
       - 'src/AiDotNet.Tensors/Engines/Gpu/**'

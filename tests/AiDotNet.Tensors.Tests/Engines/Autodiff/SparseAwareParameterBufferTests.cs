@@ -18,6 +18,59 @@ public class SparseAwareParameterBufferTests
 {
     private readonly IEngine _engine = AiDotNetEngine.Current;
 
+    [Theory]
+    [InlineData("slice")]
+    [InlineData("nested-slice")]
+    [InlineData("tensor")]
+    [InlineData("slice-tensor")]
+    public void AliasWrites_AdvanceTheFlatParameterCacheVersion(string kind)
+    {
+        var buffer = new ParameterBuffer<float>(new[] { new[] { 2 }, new[] { 2 } });
+        var view = buffer.CreateAllViews()[1];
+        var flat = buffer.AsVector();
+        var slice = flat.CreateSlice(2, 2);
+        var nested = slice.CreateSlice(0, 1);
+        var tensor = (kind == "slice-tensor" ? slice : flat).AsTensor();
+        // Acquire aliases BEFORE starting cache tracking: their construction must not be the invalidation.
+        int uploadedAt = view.GpuCacheVersion;
+        if (kind == "slice") slice[0] = 9f;
+        else if (kind == "nested-slice") nested[0] = 9f;
+        else tensor[kind == "tensor" ? 2 : 0] = 9f;
+        Assert.True(view.GpuCacheVersion > uploadedAt, "an alias write must invalidate the flat GPU upload");
+        Assert.Equal(9f, view[0]);
+        Assert.Equal(new[] { 0f, 0f, 9f, 0f }, flat.ToArray());
+    }
+
+    [Theory]
+    [InlineData("dense-for-sparse")]
+    [InlineData("sparse-shape")]
+    [InlineData("sparse-count")]
+    [InlineData("dense-length")]
+    public void CopyFrom_InvalidSlotIsRejected_AndBufferRemainsUsable(string kind)
+    {
+        var pattern = new SparsityLayout(3, 3, new[] { 0, 1 }, new[] { 0, 1 });
+        var buffer = kind == "dense-length"
+            ? new ParameterBuffer<float>(new[] { new[] { 2 } })
+            : new ParameterBuffer<float>(new[] { new ParameterLayout(new[] { 3, 3 }, pattern) });
+        buffer.CopyFrom(new Vector<float>(new[] { 41f, 42f }));
+        Tensor<float> invalid = kind switch
+        {
+            "dense-for-sparse" => new Tensor<float>(new[] { 3, 3 }),
+            "sparse-shape" => new SparseTensor<float>(4, 4, new[] { 0, 1 }, new[] { 0, 1 }, new Vector<float>(new[] { 7f, 8f })),
+            "sparse-count" => new SparseTensor<float>(3, 3, new[] { 0 }, new[] { 0 }, new Vector<float>(new[] { 7f })),
+            _ => new Tensor<float>(new[] { 3 }),
+        };
+        Assert.Throws<ArgumentException>(() => buffer.CopyFrom(new[] { invalid }));
+        Assert.Equal(new[] { 41f, 42f }, buffer.AsVector().ToArray());
+
+        Tensor<float> valid = kind == "dense-length"
+            ? new Tensor<float>(new[] { 2 }, new Vector<float>(new[] { 5f, 6f }))
+            : new SparseTensor<float>(3, 3, new[] { 0, 1 }, new[] { 0, 1 }, new Vector<float>(new[] { 5f, 6f }));
+        buffer.CopyFrom(new[] { valid });
+        Assert.Equal(new[] { 5f, 6f }, buffer.AsVector().ToArray());
+    }
+
+
     private static SparsityLayout PatternFor(SparseTensor<float> source) =>
         SparsityLayout.FromSparseTensor(source);
 

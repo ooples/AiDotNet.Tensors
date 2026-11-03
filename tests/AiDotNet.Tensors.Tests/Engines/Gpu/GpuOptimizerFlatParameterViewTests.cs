@@ -103,4 +103,112 @@ public sealed class GpuOptimizerFlatParameterViewTests : IClassFixture<DirectGpu
         // The flat vector reflects the same values (views and buffer share storage).
         Assert.Equal(views[1][0], buffer.AsVector()[shapes[0][0] * shapes[0][1]]);
     }
+
+    /// <summary>
+    /// Every fused step, not only AdamW, places an eager model's parameter on the device: a ParameterBuffer view (at an
+    /// offset OpenCL cannot address as a sub-buffer, so through a staged copy) and a standalone host-authoritative
+    /// tensor. They took only a parameter already bound to a device buffer, so both declined and the step ran on the
+    /// host. Both placements must run the same kernel on the same values and leave the parameter device-authoritative.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData("Adam")]
+    [InlineData("Sgd")]
+    [InlineData("SgdMomentum")]
+    [InlineData("Rmsprop")]
+    [InlineData("Adagrad")]
+    [InlineData("Lion")]
+    [InlineData("Nadam")]
+    [InlineData("Amsgrad")]
+    public void FusedStep_PlacesViewAndHostParameters_OnTheDevice(string kind)
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        var gpu = _fixture.Engine!;
+        int[][] shapes = { new[] { 3, 5 }, new[] { 7, 3 } };
+        var w = Rand(shapes[1], 8);
+        var buffer = new ParameterBuffer<float>(shapes);
+        var views = buffer.CreateAllViews();
+        buffer.CopyFrom(new[] { Rand(shapes[0], 9), w });
+        var standalone = new Tensor<float>(shapes[1]);
+        for (int i = 0; i < w.Length; i++) standalone[i] = w[i];
+
+        bool Step(Tensor<float> p)
+        {
+            var g = gpu.TensorMultiplyScalar(Rand(shapes[1], 10), 1f);   // a device-resident gradient
+            Tensor<float> S() => GpuOptimizer.CreateStateTensor(shapes[1]);
+            return kind switch
+            {
+                "Adam" => GpuOptimizer.TryAdamStep(p, g, S(), S(), 0.01f, 0.9f, 0.999f, 1e-8f, 0f, 1),
+                "Sgd" => GpuOptimizer.TrySgdStep(p, g, 0.1f),
+                "SgdMomentum" => GpuOptimizer.TrySgdMomentumStep(p, g, S(), 0.1f, 0.9f, 0f),
+                "Rmsprop" => GpuOptimizer.TryRmspropStep(p, g, S(), 0.01f, 0.99f, 1e-8f, 0f),
+                "Adagrad" => GpuOptimizer.TryAdagradStep(p, g, S(), 0.1f, 1e-10f, 0f),
+                "Lion" => GpuOptimizer.TryLionStep(p, g, S(), 0.01f, 0.9f, 0.99f, 0f),
+                "Nadam" => GpuOptimizer.TryNadamStep(p, g, S(), S(), 0.01f, 0.9f, 0.999f, 1e-8f, 0f, 1),
+                "Amsgrad" => GpuOptimizer.TryAmsgradStep(p, g, S(), S(), S(), 0.01f, 0.9f, 0.999f, 1e-8f, 0f, 1),
+                _ => throw new ArgumentOutOfRangeException(nameof(kind)),
+            };
+        }
+
+        GpuLaunchProbe.Reset();
+        Assert.True(Step(views[1]), $"{kind} declined a ParameterBuffer view: " + string.Join("; ", GpuLaunchProbe.Fallbacks));
+        Assert.True(Step(standalone), $"{kind} declined a host parameter: " + string.Join("; ", GpuLaunchProbe.Fallbacks));
+        Assert.True(gpu.IsDeviceAuthoritative(views[1]) && gpu.IsDeviceAuthoritative(standalone),
+            $"{kind}: the updated parameters are not device-authoritative");
+
+        var got = views[1].ToArray();
+        var expected = standalone.ToArray();
+        Assert.NotEqual(w.ToArray(), got);
+        for (int i = 0; i < got.Length; i++)
+            Assert.Equal(expected[i], got[i]);
+        // The neighbouring parameter in the flat array is untouched by the staged write-back.
+        Assert.Equal(Rand(shapes[0], 9).ToArray(), views[0].ToArray());
+    }
+
+    /// <summary>
+    /// A write through the vector <see cref="ParameterBuffer{T}.AsVector"/> returned, made after a GPU read uploaded
+    /// the flat array, must reach the next GPU read. The version was advanced only when AsVector returned, so the
+    /// device copy uploaded in between was reused with the old element.
+    /// </summary>
+    [SkippableFact]
+    public void WriteThroughAsVector_AfterAGpuRead_ReachesTheNextGpuRead()
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        var gpu = _fixture.Engine!;
+        int[][] shapes = { new[] { 4, 8 }, new[] { 8, 2 } };
+        var buffer = new ParameterBuffer<float>(shapes);
+        var views = buffer.CreateAllViews();
+        buffer.CopyFrom(new[] { Rand(shapes[0], 4), Rand(shapes[1], 5) });
+
+        var flat = buffer.AsVector();
+        Assert.Equal(views[1][3], gpu.TensorMultiplyScalar(views[1], 1f).ToArray()[3]);
+        int at = shapes[0][0] * shapes[0][1] + 3;
+        flat[at] = 42f;
+        Assert.Equal(42f, gpu.TensorMultiplyScalar(views[1], 1f).ToArray()[3]);
+        flat.MultiplyInPlace(2f);
+        Assert.Equal(84f, gpu.TensorMultiplyScalar(views[1], 1f).ToArray()[3]);
+    }
+
+    /// <summary>
+    /// The resident FP16 forward casts a ParameterBuffer parameter on the device, from its offset in the flat device
+    /// buffer. Views are never bound to a device buffer, so the cast declined every one and the caller cast on the
+    /// host each step.
+    /// </summary>
+    [SkippableFact]
+    public void ResidentHalfCast_OfAParameterBufferView_RunsOnTheDevice()
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        var gpu = _fixture.Engine!;
+        int[][] shapes = { new[] { 4, 8 }, new[] { 8, 2 } };
+        var buffer = new ParameterBuffer<float>(shapes);
+        var views = buffer.CreateAllViews();
+        buffer.CopyFrom(new[] { Rand(shapes[0], 6), Rand(shapes[1], 7) });
+
+        var half = new Tensor<Half>(shapes[1]);
+        Assert.True(gpu.TryCastResidentForwardHalf(views[1], half),
+            "the resident FP16 cast declined a ParameterBuffer view: " + string.Join("; ", GpuLaunchProbe.Fallbacks));
+        var got = half.ToArray();
+        var expected = views[1].ToArray();
+        for (int i = 0; i < got.Length; i++)
+            Assert.Equal((float)(Half)expected[i], (float)got[i]);
+    }
 }
