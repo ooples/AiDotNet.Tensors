@@ -131,4 +131,91 @@ public class CudnnForwardHeuristicTests
             CuDnnConvolution.HeuristicForwardEnabled = previous;
         }
     }
+
+    /// <summary>
+    /// The default forward first seen inside a CUDA graph capture (#1612's path: the slot's reference, served uncached
+    /// while measurement is off): the heuristic query and the workspace growth for its pick both happen during the
+    /// capture. The replay must match an eager implicit-precomp run, also after a later eager call regrows the
+    /// workspace (the graph keeps the retired pointer).
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(1, 64, 64, 56)]
+    [InlineData(8, 256, 256, 14)]
+    [InlineData(1, 512, 512, 7)]
+    public void TheHeuristicDefaultCapturesAndReplays(int n, int c, int k, int h)
+    {
+        bool previous = CuDnnConvolution.HeuristicForwardEnabled;
+        CuDnnConvolution.HeuristicForwardEnabled = true;
+        // A fresh backend: an empty memo and no workspace yet, so both first happen inside the capture.
+        using var backend = RequireCudnnBackend();
+        try
+        {
+            const int r = 3, pad = 1, stride = 1;
+            int oh = h;
+            using (var query = new CuDnnConvolution())
+            {
+                var chosen = query.DefaultForwardAlgorithm(n, c, h, h, k, r, r, pad, pad, stride, stride, 1, 1,
+                    CuDnnNative.CudnnDataType.Float, CuDnnNative.CudnnMathType.Fma);
+                Skip.If(chosen == CuDnnNative.CudnnConvolutionFwdAlgo.ImplicitPrecompGemm,
+                    "cuDNN's heuristic picks the previous fixed default here, so the new path is not exercised.");
+            }
+            float[] x = Fill(n * c * h * h, 3), w = Fill(k * c * r * r, 4);
+            using var bx = backend.AllocateBuffer(x);
+            using var bw = backend.AllocateBuffer(w);
+            using var byGraph = backend.AllocateBuffer(Enumerable.Repeat(float.NaN, n * k * oh * oh).ToArray());
+            using var byFixed = backend.AllocateBuffer(n * k * oh * oh);
+            var slot = backend.Conv2DForwardVendorSlot;
+            var defaultForward = slot.Candidate("cudnn.conv2d.default")!;
+            var fixedForward = slot.Candidate("cudnn.conv2d.algo1")!;
+            var graphArgs = new CudaConv2DArgs(bx, bw, byGraph, n, c, h, h, k, oh, oh, r, r, stride, stride, pad, pad, 1, 1);
+            var fixedArgs = new CudaConv2DArgs(bx, bw, byFixed, n, c, h, h, k, oh, oh, r, r, stride, stride, pad, pad, 1, 1);
+
+            IntPtr graph = backend.CaptureGraph(() => defaultForward.Execute(graphArgs));
+            Assert.NotEqual(IntPtr.Zero, graph);
+            try
+            {
+                backend.LaunchCapturedGraph(graph);
+                backend.Synchronize();
+                fixedForward.Execute(fixedArgs);
+                backend.Synchronize();
+                float[] expected = backend.DownloadBuffer(byFixed);
+                AssertClose(expected, backend.DownloadBuffer(byGraph), "first replay");
+
+                // Regrow the workspace eagerly with the largest-workspace algorithm that runs here, then replay again.
+                foreach (int algo in new[] { 4, 5, 7, 6, 0, 2 })
+                {
+                    var candidate = slot.Candidate("cudnn.conv2d.algo" + algo);
+                    if (candidate is null || !candidate.IsApplicable(fixedArgs.Shape())) continue;
+                    try { candidate.Execute(fixedArgs); backend.Synchronize(); } catch (NotSupportedException) { }
+                }
+                backend.AllocateBuffer(1).Dispose();
+                using (var poison = backend.AllocateBuffer(Enumerable.Repeat(float.NaN, n * k * oh * oh).ToArray()))
+                    backend.Copy(poison, byGraph, n * k * oh * oh);
+                backend.Synchronize();
+                backend.LaunchCapturedGraph(graph);
+                backend.Synchronize();
+                AssertClose(expected, backend.DownloadBuffer(byGraph), "replay after workspace regrowth");
+            }
+            finally
+            {
+                backend.DestroyCapturedGraph(graph);
+            }
+        }
+        finally
+        {
+            CuDnnConvolution.HeuristicForwardEnabled = previous;
+        }
+    }
+
+    private static void AssertClose(float[] expected, float[] got, string what)
+    {
+        double largest = expected.Max(v => Math.Abs((double)v)), worst = 0;
+        for (int i = 0; i < got.Length; i++)
+        {
+            double d = Math.Abs((double)got[i] - expected[i]);
+            worst = Math.Max(worst, double.IsNaN(d) ? double.PositiveInfinity : d);
+        }
+        Assert.True(largest > 0, $"{what}: the reference wrote nothing");
+        Assert.True(worst <= 1e-4 * Math.Max(1, largest), $"{what}: error {worst:E3} of {largest:E3}");
+    }
 }
