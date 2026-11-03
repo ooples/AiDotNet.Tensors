@@ -332,4 +332,154 @@ public sealed class GotoGemmRoutingTests
             CpuParallelSettings.MaxDegreeOfParallelism = before;
         }
     }
+
+
+    // #653: under the default deterministic mode the engine's float matmul (DisableAutotune) now takes GotoGemm when n
+    // is a multiple of its 16-column panel. That route must give the same bits at every thread count and agree with an
+    // fp64 reference; with n off the panel it must not be taken.
+    [SkippableTheory]
+    [InlineData(256, 640, 768, true)]   // M=256: a 4-row tail on the 6-row tile, as in the DiT linears
+    [InlineData(130, 600, 528, true)]   // K off the 256 K-block
+    [InlineData(192, 512, 768, true)]
+    [InlineData(256, 1152, 1152, true)] // a DiT-XL projection
+    [InlineData(256, 640, 776, false)]  // n % 16 != 0: a scalar N-tail, so not thread-count invariant
+    public void DeterministicDisableAutotune_TakesGotoWhereThreadCountInvariant(int m, int k, int n, bool expectGoto)
+    {
+        Skip.IfNot(GotoGemmFp32.IsAvailable, "The packed GotoGemm route is unavailable on this CPU/OS/runtime.");
+        int before = CpuParallelSettings.MaxDegreeOfParallelism;
+        bool? beforeDeterministic = BlasProvider.GetThreadLocalDeterministicMode();
+        var rng = RandomHelper.CreateSeededRandom(6530);
+        var a = new float[m * k];
+        var b = new float[k * n];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() - 0.5);
+        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() - 0.5);
+        float[]? first = null;
+        try
+        {
+            BlasProvider.SetThreadLocalDeterministicMode(true);
+            foreach (int threads in new[] { 1, 2, 3, 7, 16, 32 })
+            {
+                CpuParallelSettings.MaxDegreeOfParallelism = threads;
+                var c = new float[m * n];
+                for (int i = 0; i < c.Length; i++) c[i] = float.NaN;
+                int runs = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.t_deterministicGotoRuns;
+                AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(a, k, false, b, n, false, c, n, m, n, k,
+                    new BlasOptions<float> { PackingMode = PackingMode.DisableAutotune });
+                Assert.True(runs + (expectGoto ? 1 : 0) == AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.t_deterministicGotoRuns, $"route at {threads} threads: expected GotoGemm={expectGoto}");
+                if (first is null)
+                {
+                    first = c;
+                    double worst = 0;
+                    for (int i = 0; i < m; i++)
+                        for (int j = 0; j < n; j++)
+                        {
+                            double e = 0;
+                            for (int p = 0; p < k; p++) e += (double)a[i * k + p] * b[p * n + j];
+                            worst = Math.Max(worst, Math.Abs(e - c[i * n + j]));
+                        }
+                    Assert.True(worst < 1e-4, $"max |C - C_ref| = {worst:E3}");
+                    continue;
+                }
+                for (int i = 0; i < c.Length; i++)
+                    Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(first[i]) == TestHelpers.MathCompat.SingleToInt32Bits(c[i]),
+                        $"C[{i / n},{i % n}] at {threads} threads: {c[i]:G9}, at 1 thread {first[i]:G9}");
+            }
+            // An explicit thread count (BlasOptions.NumThreads) takes the same route and gives the same bits.
+            CpuParallelSettings.MaxDegreeOfParallelism = 16;
+            foreach (int explicitThreads in new[] { -1, 1, 3, 64 })
+            {
+                var c = new float[m * n];
+                int runs = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.t_deterministicGotoRuns;
+                AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(a, k, false, b, n, false, c, n, m, n, k,
+                    new BlasOptions<float> { PackingMode = PackingMode.DisableAutotune, NumThreads = explicitThreads });
+                Assert.True(runs + (expectGoto ? 1 : 0) == AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.t_deterministicGotoRuns,
+                    $"route at NumThreads={explicitThreads}: expected GotoGemm={expectGoto}");
+                for (int i = 0; i < c.Length; i++)
+                    Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(first![i]) == TestHelpers.MathCompat.SingleToInt32Bits(c[i]),
+                        $"C[{i / n},{i % n}] at NumThreads={explicitThreads}: {c[i]:G9}, at 1 thread {first[i]:G9}");
+            }
+        }
+        finally
+        {
+            CpuParallelSettings.MaxDegreeOfParallelism = before;
+            BlasProvider.SetThreadLocalDeterministicMode(beforeDeterministic);
+        }
+    }
+
+    // The engine's float matmul is the caller this serves; the kill switch restores the previous routing.
+    [SkippableFact]
+    public void EngineMatMul_TakesDeterministicGoto_AndTheKillSwitchRestoresTheOldRoute()
+    {
+        Skip.IfNot(GotoGemmFp32.IsAvailable, "The packed GotoGemm route is unavailable on this CPU/OS/runtime.");
+        bool? beforeDeterministic = BlasProvider.GetThreadLocalDeterministicMode();
+        bool beforeSwitch = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.s_disableDeterministicGoto;
+        var engine = new CpuEngine();
+        var rng = RandomHelper.CreateSeededRandom(6531);
+        Tensor<float> Rand(params int[] shape)
+        {
+            var t = new Tensor<float>(shape);
+            for (int i = 0; i < t.Length; i++) t[i] = (float)(rng.NextDouble() - 0.5);
+            return t;
+        }
+        var x = Rand(256, 640);
+        var w = Rand(640, 768);
+        try
+        {
+            BlasProvider.SetThreadLocalDeterministicMode(true);
+            int runs = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.t_deterministicGotoRuns;
+            float[] viaGoto = engine.BatchMatMul(x, w).ToArray();
+            Assert.Equal(runs + 1, AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.t_deterministicGotoRuns);
+
+            AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.s_disableDeterministicGoto = true;
+            runs = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.t_deterministicGotoRuns;
+            float[] viaOld = engine.BatchMatMul(x, w).ToArray();
+            Assert.Equal(runs, AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.t_deterministicGotoRuns);
+            double worst = 0;
+            for (int i = 0; i < viaGoto.Length; i++) worst = Math.Max(worst, Math.Abs((double)viaGoto[i] - viaOld[i]));
+            Assert.True(worst < 1e-4, $"max |goto - old| = {worst:E3}");
+        }
+        finally
+        {
+            AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.s_disableDeterministicGoto = beforeSwitch;
+            BlasProvider.SetThreadLocalDeterministicMode(beforeDeterministic);
+        }
+    }
+
+    // Where the thin-M direct route serves one thread count (n <= 512, k <= 1024) and this route the others, the bits
+    // must still agree across counts.
+    [SkippableTheory]
+    [InlineData(256, 640, 512)]
+    [InlineData(132, 1024, 496)]
+    public void DeterministicDisableAutotune_AtTheThinMBoundary_IsBitIdenticalAtEveryThreadCount(int m, int k, int n)
+    {
+        Skip.IfNot(GotoGemmFp32.IsAvailable, "The packed GotoGemm route is unavailable on this CPU/OS/runtime.");
+        int before = CpuParallelSettings.MaxDegreeOfParallelism;
+        bool? beforeDeterministic = BlasProvider.GetThreadLocalDeterministicMode();
+        var rng = RandomHelper.CreateSeededRandom(6532);
+        var a = new float[m * k];
+        var b = new float[k * n];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() - 0.5);
+        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() - 0.5);
+        float[]? first = null;
+        try
+        {
+            BlasProvider.SetThreadLocalDeterministicMode(true);
+            foreach (int threads in new[] { 1, 2, 3, 7, 16, 32 })
+            {
+                CpuParallelSettings.MaxDegreeOfParallelism = threads;
+                var c = new float[m * n];
+                AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(a, k, false, b, n, false, c, n, m, n, k,
+                    new BlasOptions<float> { PackingMode = PackingMode.DisableAutotune });
+                if (first is null) { first = c; continue; }
+                for (int i = 0; i < c.Length; i++)
+                    Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(first[i]) == TestHelpers.MathCompat.SingleToInt32Bits(c[i]),
+                        $"C[{i / n},{i % n}] at {threads} threads: {c[i]:G9}, at 1 thread {first[i]:G9}");
+            }
+        }
+        finally
+        {
+            CpuParallelSettings.MaxDegreeOfParallelism = before;
+            BlasProvider.SetThreadLocalDeterministicMode(beforeDeterministic);
+        }
+    }
 }

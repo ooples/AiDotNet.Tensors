@@ -3686,31 +3686,45 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        int[] indices = savedState[0] is Tensor<int> indicesTensor
-            ? indicesTensor.GetFlattenedData()
-            : (int[])savedState[0];
+        var indicesTensor = savedState[0] as Tensor<int>;
+        int[] indices = indicesTensor is not null ? indicesTensor.GetFlattenedData() : (int[])savedState[0];
         int dim = (int)savedState[1];
         var inShape = inputs[0]._shape;
-        var inputGrad = TensorPool<T>.RentZeroed(inShape);
 
         int outerSize = 1, innerSize = 1;
         int dimSize = inShape[dim];
         for (int i = 0; i < dim; i++) outerSize *= inShape[i];
         for (int i = dim + 1; i < inShape.Length; i++) innerSize *= inShape[i];
 
-        for (int outer = 0; outer < outerSize; outer++)
-        for (int idx = 0; idx < indices.Length; idx++)
+        for (int i = 0; i < indices.Length; i++)
+            if (indices[i] < 0 || indices[i] >= dimSize)
+                throw new InvalidOperationException($"IndexSelectBackward: index {indices[i]} at position {i} out of range [0, {dimSize}).");
+
+        // Selecting along a leading axis (every axis before `dim` has size 1 -- the axis-0 row gather of MoE dispatch,
+        // embedding-style lookups, beam reordering) is exactly the embedding scatter-add: d_input[idx[i], :] +=
+        // d_out[i, :]. Route it through the engine so a GPU engine runs its device IndexAdd kernel instead of this
+        // method's host loop, which downloaded the gradient and paid a per-element indexer + version bump.
+        if (outerSize == 1)
         {
-            int srcDimIdx = indices[idx];
-            for (int inner = 0; inner < innerSize; inner++)
+            var idx = indicesTensor ?? new Tensor<int>(indices, new[] { indices.Length });
+            var g = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
+            var dense = engine.TensorEmbeddingLookupBackward(engine.Reshape(g, new[] { indices.Length, innerSize }), idx, dimSize, innerSize);
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], engine.Reshape(dense, inShape), engine);
+            return;
+        }
+
+        var inputGrad = TensorPool<T>.RentZeroed(inShape);
+        var src = (gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous()).GetReadOnlyDataArray();
+        using (var lease = inputGrad.LeaseArray())
+        {
+            var dst = lease.Array;
+            for (int outer = 0; outer < outerSize; outer++)
+            for (int idx = 0; idx < indices.Length; idx++)
             {
-                int srcFlat = (outer * dimSize + srcDimIdx) * innerSize + inner;
-                int gradFlat = (outer * indices.Length + idx) * innerSize + inner;
-                if (srcFlat < 0 || srcFlat >= inputGrad.Length)
-                    throw new InvalidOperationException($"IndexSelectBackward: source index {srcFlat} out of range [0, {inputGrad.Length}).");
-                if (gradFlat < 0 || gradFlat >= gradOutput.Length)
-                    throw new InvalidOperationException($"IndexSelectBackward: gradient index {gradFlat} out of range [0, {gradOutput.Length}).");
-                inputGrad[srcFlat] = numOps.Add(inputGrad[srcFlat], gradOutput[gradFlat]);
+                int dstBase = (outer * dimSize + indices[idx]) * innerSize;
+                int srcBase = (outer * indices.Length + idx) * innerSize;
+                for (int inner = 0; inner < innerSize; inner++)
+                    dst[dstBase + inner] = numOps.Add(dst[dstBase + inner], src[srcBase + inner]);
             }
         }
         DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);

@@ -1,7 +1,7 @@
 #if NET7_0_OR_GREATER
 namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
-public sealed partial class WebGpuBackend : IInstantNgpBackend, IFrexpBackend, IRenderingGeometryBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
+public sealed partial class WebGpuBackend : IInstantNgpBackend, IFrexpBackend, IRenderingGeometryBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, IOneHotIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
 {
     private static float[] InstantNgpUniforms(
         int numPoints, int resolution, int tableSize, int featuresPerLevel,
@@ -167,6 +167,17 @@ public sealed partial class WebGpuBackend : IInstantNgpBackend, IFrexpBackend, I
             WebGpuInstantNgpKernels.ConvertIndicesToInt32, "main",
             numericIndices, int32Indices,
             [BitConverter.Int32BitsToSingle(length), 0f, 0f, 0f], length)
+            .GetAwaiter().GetResult();
+    }
+
+    public void OneHotInt32(IGpuBuffer int32Indices, IGpuBuffer output, int rows, int depth)
+    {
+        int total = checked(rows * depth);
+        if (total <= 0) return;
+        Dispatch2BufferAsync("ResidentOneHotInt32",
+            WebGpuInstantNgpKernels.OneHotInt32, "main",
+            int32Indices, output,
+            [BitConverter.Int32BitsToSingle(rows), BitConverter.Int32BitsToSingle(depth), 0f, 0f], total)
             .GetAwaiter().GetResult();
     }
 

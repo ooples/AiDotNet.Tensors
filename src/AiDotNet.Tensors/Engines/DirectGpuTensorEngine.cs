@@ -29431,30 +29431,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (indices is null)
             throw new ArgumentNullException(nameof(indices));
 
+        // One launch over the int32 index buffer: a resident index tensor (TopK / ArgMax output) is read where it lives.
+        // This used to download the indices and issue one single-element copy per index (AiDotNet.Tensors#1664).
         if (!Compilation.GraphMode.IsActive && typeof(T) == typeof(float)
-            && depth > 0 && TryGetBackend(out var backend))
+            && depth > 0 && indices.Length > 0 && TryGetBackend(out var backend)
+            && backend is IOneHotIndexBackend oneHotBackend)
         {
             try
             {
-                var indexData = indices.GetFlattenedData();
-                int elementCount = checked(indices.Length * depth);
-                // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-                using var oneLease = AllocateTransientScratch(backend, 1);
-                var one = oneLease.Buffer;
-                backend.Fill(one, 1f, 1);
-                return DispatchDeferredGpuOp<T>(backend, elementCount,
-                    new[] { indices.Length, depth }, output =>
-                    {
-                        backend.Fill(output, 0f, elementCount);
-                        for (int i = 0; i < indexData.Length; i++)
-                        {
-                            int index = indexData[i];
-                            if ((uint)index < (uint)depth)
-                                backend.Copy(one, 0, output, i * depth + index, 1);
-                        }
-                    });
+                int rows = indices.Length;
+                int elementCount = checked(rows * depth);
+                var contiguousIndices = indices.IsContiguous ? indices : (Tensor<int>)indices.Contiguous();
+                using var indicesBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices);
+                return DispatchDeferredGpuOp<T>(backend, elementCount, new[] { rows, depth },
+                    output => oneHotBackend.OneHotInt32(indicesBuffer.Buffer, output, rows, depth));
             }
-            catch { }
+            catch (Exception ex) when (ex is not ArgumentException)
+            {
+                GpuLaunchProbe.OnFallback("TensorOneHot", ex);
+            }
         }
 
         return base.TensorOneHot<T>(indices, depth);

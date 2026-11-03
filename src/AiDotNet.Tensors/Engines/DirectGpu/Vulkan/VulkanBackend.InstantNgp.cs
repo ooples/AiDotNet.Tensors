@@ -1,6 +1,6 @@
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
-public sealed unsafe partial class VulkanBackend : IInstantNgpBackend, IFrexpBackend, IRenderingGeometryBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
+public sealed unsafe partial class VulkanBackend : IInstantNgpBackend, IFrexpBackend, IRenderingGeometryBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, IOneHotIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
 {
     public void HashGridEncodeLevel(
         IGpuBuffer positions, IGpuBuffer hashTable, IGpuBuffer output,
@@ -124,6 +124,14 @@ public sealed unsafe partial class VulkanBackend : IInstantNgpBackend, IFrexpBac
         if (length <= 0) return;
         GlslDispatchN(VulkanInstantNgpKernels.ConvertIndicesToInt32, length,
             [numericIndices, int32Indices], [(uint)length]);
+    }
+
+    public void OneHotInt32(IGpuBuffer int32Indices, IGpuBuffer output, int rows, int depth)
+    {
+        int total = checked(rows * depth);
+        if (total <= 0) return;
+        GlslDispatchN(VulkanInstantNgpKernels.OneHotInt32, total,
+            [int32Indices, output], [(uint)rows, (uint)depth]);
     }
 
     public void IndexAdd(

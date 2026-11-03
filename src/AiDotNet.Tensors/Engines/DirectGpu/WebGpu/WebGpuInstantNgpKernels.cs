@@ -392,6 +392,20 @@ struct ConvertP { length: i32 };
 }
 ";
 
+    public static string OneHotInt32 => @"
+@group(0) @binding(0) var<storage, read> indices : array<i32>;
+@group(0) @binding(1) var<storage, read_write> output_ : array<f32>;
+struct OneHotP { rows: i32, depth: i32 };
+@group(0) @binding(2) var<uniform> p : OneHotP;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
+    let gid = id.x;
+    if (gid >= u32(p.rows) * u32(p.depth)) { return; }
+    let row = gid / u32(p.depth);
+    let column = i32(gid - row * u32(p.depth));
+    output_[gid] = select(0.0, 1.0, indices[row] == column);
+}
+";
+
     public static string IndexAdd => @"
 @group(0) @binding(0) var<storage, read> destination : array<f32>;
 @group(0) @binding(1) var<storage, read> indices : array<i32>;
