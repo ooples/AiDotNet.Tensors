@@ -62,6 +62,13 @@ public static partial class BlasManaged
     internal static bool s_disableGotoGemm =
         System.Environment.GetEnvironmentVariable("AIDOTNET_DISABLE_GOTO") == "1";
 
+    // AIDOTNET_GEMM_DETERMINISTIC_GOTO=0 keeps deterministic DisableAutotune calls off GotoGemm (the previous routing).
+    internal static bool s_disableDeterministicGoto =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_GEMM_DETERMINISTIC_GOTO") == "0";
+
+    // Deterministic DisableAutotune products run on GotoGemm on this thread (test observable).
+    [ThreadStatic] internal static int t_deterministicGotoRuns;
+
     // OPT-IN bf16-B GEMM (AIDOTNET_GEMM_BF16=1, default OFF). Stores the streamed B operand as bf16
     // (half the bytes → ~2× bandwidth headroom), A stays fp32, fp32 accumulate. PRECISION-CHANGING
     // (~3 significant digits; rel-err ~3e-3) so it is NEVER default — only large bandwidth-bound shapes
@@ -813,11 +820,24 @@ public static partial class BlasManaged
         // overhead — deferred until that overhead is cut; prototype in tests/CcxGemmBench.)
         int gotoThreadBudget = CpuParallelSettings.MaxDegreeOfParallelism;
         if (gotoThreadBudget <= 0) gotoThreadBudget = Environment.ProcessorCount;
+        // A deterministic DisableAutotune call (the engine's float matmul under the default deterministic mode) must
+        // use the same reduction at every thread count. GotoGemm's per-tile route gives that when n is a multiple of
+        // its 16-column panel: mc comes from m, kc is fixed, and with no scalar N-tail every element is the same FMA
+        // chain whatever thread-count-dependent nc splits the columns (the deep-K thin-M route relies on the same
+        // property). What did vary was the decision to take it, so here it is decided on the machine's processor
+        // count like the tail split below, and the busy-dependent CCX pool and the precision-changing bf16 route are
+        // skipped. Before, these calls fell to PackBoth: 1.6-3.1x slower at 8-32 threads on the DiT M=256 linears (#653).
+        bool deterministicGoto = options.PackingMode == PackingMode.DisableAutotune && deterministic
+            && !s_disableDeterministicGoto && GotoGemmFp32.IsThreadCountInvariant(n);
+        if (deterministicGoto) gotoThreadBudget = Environment.ProcessorCount;
+        // The deterministic route also serves an explicit thread count (-1 or 1: on this thread; N: at most N tiles at
+        // once): the same shape must give the same bits whatever count is asked for.
         if (typeof(T) == typeof(float) && !s_disableGotoGemm && !transA && !transB
             && options.PackedA is null && options.PackedB is null
-            && options.NumThreads == 0 // only the default (all-core) budget; explicit -1/>0 requests honored below
-            // A deterministic DisableAutotune call must use the same reduction at every explicit thread count.
-            && (options.PackingMode == PackingMode.Auto || (options.PackingMode == PackingMode.DisableAutotune && !deterministic))
+            // only the default (all-core) budget; explicit -1/>0 requests honored below, except on the deterministic route
+            && (options.NumThreads == 0 || deterministicGoto)
+            && (options.PackingMode == PackingMode.Auto
+                || (options.PackingMode == PackingMode.DisableAutotune && (!deterministic || deterministicGoto)))
             && (GotoGemmFp32.IsPreferredForThreadBudget(gotoThreadBudget)
                 || GotoGemmFp32.PackBothUnderOccupies(m, gotoThreadBudget)
                 // #653: an M PackBoth would tail-split (to Streaming on a many-core host), at any thread budget.
@@ -852,7 +872,13 @@ public static partial class BlasManaged
                         // OPT-IN bf16-B (AIDOTNET_GEMM_BF16=1): on large bandwidth-bound shapes store B as
                         // bf16 to halve the streamed bytes (beats fp32 AND MKL on the big squares). Precision-
                         // changing ⇒ never default; falls through to exact fp32 for smaller/wide-N shapes.
-                        if (s_gemmBf16 && GotoGemmFp32.ShouldUseBf16(m, n, k))
+                        if (deterministicGoto)
+                        {
+                            t_deterministicGotoRuns++;
+                            GotoGemmFp32.RunParallel(pa, lda, pb, ldb, pc, ldc, m, n, k, gmc, gnc, gkc,
+                                maxWorkers: options.NumThreads < 0 ? 1 : options.NumThreads);
+                        }
+                        else if (s_gemmBf16 && GotoGemmFp32.ShouldUseBf16(m, n, k))
                         {
                             if (betaZero) ClearOutputTile(c, ldc, m, n);
                             GotoGemmFp32.RunParallelBf16(pa, lda, pb, ldb, pc, ldc, m, n, k, gmc, gnc, gkc);
