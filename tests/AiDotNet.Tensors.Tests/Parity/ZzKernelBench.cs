@@ -63,7 +63,7 @@ public class ZzKernelBench
                 var refC = new float[m * n];
                 SimdGemm.s_zzPackA2D = false; SimdGemm.s_stripKc = 256;
                 SimdGemm.Sgemm(A, kk, false, B, n, false, refC, m, kk, n);
-                foreach (var (kcv, pk, pa, p16) in new[] { (256, true, false, false), (256, true, false, true), (256, true, true, false), (0, true, false, false) })
+                foreach (var (kcv, pk, pa, p16) in new[] { (256, true, false, false), (256, true, false, true), (0, true, false, false) })
                 {
                     SimdGemm.s_stripKc = kcv; SimdGemm.s_packStrip512 = pk; SimdGemm.s_zzPackA2D = pa; SimdGemm.s_zzPack16 = p16;
                     var tm = Measure(() => SimdGemm.Sgemm(A, kk, false, B, n, false, C, m, kk, n));
