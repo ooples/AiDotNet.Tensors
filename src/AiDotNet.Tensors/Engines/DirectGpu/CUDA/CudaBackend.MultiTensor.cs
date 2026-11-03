@@ -4,4 +4,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 // multi_tensor_scale_by_device_scalar) are implemented in CudaBackend.cs; this declares the capability.
 public sealed partial class CudaBackend : IMultiTensorKernels
 {
+    /// <inheritdoc />
+    double IMultiTensorKernels.ReadSumOfSquares(IGpuBuffer sumOfSquares)
+    {
+        MultiTensorArgs.ValidateSumBuffer(sumOfSquares);
+        return MultiTensorArgs.DoubleFromSlots(DownloadBuffer(sumOfSquares));
+    }
 }

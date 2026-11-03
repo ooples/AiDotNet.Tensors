@@ -261,6 +261,91 @@ public static class GpuOptimizer
     }
 
     /// <summary>
+    /// PyTorch's <c>torch.nn.utils.clip_grad_norm_</c> (foreach) on the device: the total L2 norm of every gradient,
+    /// the coefficient <c>min(1, maxNorm / (norm + 1e-6))</c> and the in-place scale of every gradient, with no host
+    /// read. A non-finite norm leaves the gradients unscaled (the kernels' coefficient is 1), so a poisoned step keeps
+    /// its evidence. Returns null when the current engine is not a GPU engine, its backend has no multi-tensor kernels,
+    /// or a gradient is not device-resident; the caller then clips on the host.
+    /// </summary>
+    /// <param name="gradients">The gradients, scaled in place.</param>
+    /// <param name="maxNorm">The norm bound (positive).</param>
+    /// <returns>The total norm, read back to the host only when a caller asks for it.</returns>
+    public static DeviceGradientNorm? TryClipGradNorm(IReadOnlyList<Tensor<float>> gradients, double maxNorm)
+    {
+        if (gradients is null) throw new ArgumentNullException(nameof(gradients));
+        if (!(maxNorm > 0) || double.IsInfinity(maxNorm)) throw new ArgumentOutOfRangeException(nameof(maxNorm), "The norm bound must be positive and finite.");
+        return DeviceSumOfSquares(gradients, (float)maxNorm);
+    }
+
+    /// <summary>
+    /// The total squared L2 norm of device-resident gradients, reduced on the device (one multi-tensor launch on CUDA
+    /// and HIP) and read back only when the result is read: one scalar, where a host scan downloads every gradient.
+    /// A non-finite result means some element is NaN or infinite. Returns null under the same conditions as
+    /// <see cref="TryClipGradNorm"/>.
+    /// </summary>
+    public static DeviceGradientNorm? TryGradientSumOfSquares(IReadOnlyList<Tensor<float>> gradients)
+    {
+        if (gradients is null) throw new ArgumentNullException(nameof(gradients));
+        return DeviceSumOfSquares(gradients, clipTo: null);
+    }
+
+    private static DeviceGradientNorm? DeviceSumOfSquares(IReadOnlyList<Tensor<float>> gradients, float? clipTo)
+    {
+        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine gpuEngine)) return null;
+        using var __gpuOp = gpuEngine.EnterGpuOp();
+        var backend = gpuEngine.GetBackend();
+        if (backend is not IMultiTensorKernels multi) return null;
+
+        var buffers = new List<IGpuBuffer>(gradients.Count);
+        var sizes = new List<int>(gradients.Count);
+        var owners = new List<Tensor<float>>(gradients.Count);
+        for (int i = 0; i < gradients.Count; i++)
+        {
+            var g = gradients[i];
+            if (g is null || g.Length == 0) continue;
+            // Only a current device copy: the gradient's value on the device (a pending host download), or a buffer
+            // uploaded at the gradient's present version. Anything else is host-authoritative.
+            var buf = g.TryGetGpuBuffer();
+            if (buf is null || !(g.HasPendingGpuData || g._gpuBufferVersion == g.GpuCacheVersion)) return null;
+            buffers.Add(buf);
+            sizes.Add(g.Length);
+            owners.Add(g);
+        }
+
+        var sumOfSquares = backend.AllocateBuffer(2);
+        if (buffers.Count == 0)
+        {
+            backend.Fill(sumOfSquares, 0f, 2);
+            return new DeviceGradientNorm(multi, sumOfSquares, null);
+        }
+        IGpuBuffer? scale = null;
+        try
+        {
+            multi.MultiTensorSumOfSquares(buffers, sizes, sumOfSquares);
+            if (clipTo is { } maxNorm)
+            {
+                scale = backend.AllocateBuffer(1);
+                multi.ClipScaleFromSumOfSquares(sumOfSquares, maxNorm, scale);
+                multi.MultiTensorScaleByDeviceScalar(buffers, sizes, scale);
+            }
+        }
+        catch
+        {
+            sumOfSquares.Dispose();
+            scale?.Dispose();
+            throw;
+        }
+        if (scale is not null)
+        {
+            // The device buffers now hold the clipped values: they are each gradient's authoritative copy.
+            for (int i = 0; i < owners.Count; i++)
+                gpuEngine.BindResidentBuffer(owners[i], buffers[i], backend);
+        }
+        // The handle keeps the scratch buffers alive past the queued launches that read them.
+        return new DeviceGradientNorm(multi, sumOfSquares, scale);
+    }
+
+    /// <summary>
     /// Proximal gradient (ISTA) step with L1 soft-threshold prox, in place on the GPU.
     /// Returns false when param/grad aren't GPU-resident so the caller falls
     /// back to the CPU path.

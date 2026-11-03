@@ -148,4 +148,11 @@ public sealed partial class HipBackend : IMultiTensorKernels
 
     private static IntPtr TableHandle(IGpuBuffer? buffer) =>
         buffer?.Handle ?? throw new InvalidOperationException("The multi-tensor table was not uploaded.");
+
+    /// <inheritdoc />
+    double IMultiTensorKernels.ReadSumOfSquares(IGpuBuffer sumOfSquares)
+    {
+        MultiTensorArgs.ValidateSumBuffer(sumOfSquares);
+        return MultiTensorArgs.DoubleFromSlots(DownloadBuffer(sumOfSquares));
+    }
 }

@@ -52,5 +52,12 @@ fn scale_by_device_scalar(@builtin(global_invocation_id) gid: vec3<u32>) {
             Dispatch2BufferAsync("MultiTensor", MultiTensorSource, "scale_by_device_scalar", scale, tensors[t],
                 MultiTensorParams(sizes[t], 0f), sizes[t]).GetAwaiter().GetResult();
     }
+
+    /// <inheritdoc />
+    double IMultiTensorKernels.ReadSumOfSquares(IGpuBuffer sumOfSquares)
+    {
+        MultiTensorArgs.ValidateSumBuffer(sumOfSquares);
+        return MultiTensorArgs.DoubleFromSlots(DownloadBuffer(sumOfSquares));
+    }
 }
 #endif

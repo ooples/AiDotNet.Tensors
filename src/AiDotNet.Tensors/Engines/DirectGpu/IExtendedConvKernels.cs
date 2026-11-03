@@ -213,6 +213,10 @@ internal interface IMultiTensorKernels
     /// <summary>Scales every tensor in place by the device scalar <paramref name="scale"/>.</summary>
     void MultiTensorScaleByDeviceScalar(System.Collections.Generic.IReadOnlyList<IGpuBuffer> tensors,
         System.Collections.Generic.IReadOnlyList<int> sizes, IGpuBuffer scale);
+
+    /// <summary>Downloads a <see cref="MultiTensorSumOfSquares"/> result (the layout is this backend's) as a
+    /// double. A host read: callers defer it until the value is actually wanted.</summary>
+    double ReadSumOfSquares(IGpuBuffer sumOfSquares);
 }
 
 /// <summary>Argument checks every <see cref="IMultiTensorKernels"/> implementation shares.</summary>
@@ -233,6 +237,18 @@ internal static class MultiTensorArgs
             if (sizes[t] <= 0) throw new ArgumentOutOfRangeException(nameof(sizes), "Every tensor size must be positive.");
             if (tensors[t].Size < sizes[t]) throw new ArgumentException($"Tensor {t}'s buffer is smaller than its size.", nameof(tensors));
         }
+    }
+
+    /// <summary>The double a sum-of-squares buffer holds as two float slots (low word first): the layout of the CUDA,
+    /// HIP, OpenCL, Metal and WebGPU reductions.</summary>
+    internal static double DoubleFromSlots(float[] slots)
+    {
+        if (slots is null || slots.Length < 2) throw new ArgumentException("The sum of squares needs two float slots.", nameof(slots));
+        var bytes = new byte[8];
+        Array.Copy(BitConverter.GetBytes(slots[0]), 0, bytes, 0, 4);
+        Array.Copy(BitConverter.GetBytes(slots[1]), 0, bytes, 4, 4);
+        if (!BitConverter.IsLittleEndian) Array.Reverse(bytes);
+        return BitConverter.ToDouble(bytes, 0);
     }
 
     internal static void ValidateSumBuffer(IGpuBuffer sumOfSquares)

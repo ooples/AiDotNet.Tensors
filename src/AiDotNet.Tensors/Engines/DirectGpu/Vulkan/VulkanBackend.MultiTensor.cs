@@ -79,4 +79,12 @@ void main() {
         for (int t = 0; t < tensors.Count; t++)
             GlslUnaryOp(ScaleByDeviceScalarGlsl, scale, tensors[t], sizes[t], new[] { (uint)sizes[t] }, sizeof(uint));
     }
+
+    /// <inheritdoc />
+    /// <remarks>The Vulkan reduction accumulates a float in slot 0.</remarks>
+    double IMultiTensorKernels.ReadSumOfSquares(IGpuBuffer sumOfSquares)
+    {
+        MultiTensorArgs.ValidateSumBuffer(sumOfSquares);
+        return DownloadBuffer(sumOfSquares)[0];
+    }
 }

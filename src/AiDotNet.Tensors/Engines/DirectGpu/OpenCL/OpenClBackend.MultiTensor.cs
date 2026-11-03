@@ -58,5 +58,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 kernel.Execute1D(sizes[t], CalculateOptimalWorkGroupSize1D(sizes[t]));
             }
         }
-    }
+    
+
+        /// <inheritdoc />
+        double IMultiTensorKernels.ReadSumOfSquares(IGpuBuffer sumOfSquares)
+        {
+            MultiTensorArgs.ValidateSumBuffer(sumOfSquares);
+            return MultiTensorArgs.DoubleFromSlots(DownloadBuffer(sumOfSquares));
+        }
+}
 }
