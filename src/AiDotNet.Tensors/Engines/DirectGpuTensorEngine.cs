@@ -3697,17 +3697,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
-    /// For a backend that cannot address a sub-range of a buffer (only CUDA implements IGpuBufferViews; OpenCL
-    /// sub-buffers need offsets aligned to the device's base-address alignment, which a flat parameter layout does not
-    /// have): a ParameterBuffer view's elements copied out of the flat array's device buffer. The caller updates
-    /// <see cref="StagedFlatParameter.Staged"/> and copies it back at <see cref="StagedFlatParameter.Offset"/>, then
-    /// disposes the result. Both copies stay on the device; the view used to be declined, so its optimizer step ran on
-    /// the host. Returns <c>null</c> when the parameter is not such a view.
+    /// For a parameter view the backend cannot address as a sub-buffer (a backend without IGpuBufferViews, or an offset
+    /// it refuses: OpenCL sub-buffers need offsets aligned to the device's base-address alignment, which a flat
+    /// parameter layout does not have): a ParameterBuffer view's elements copied out of the flat array's device buffer.
+    /// The caller updates <see cref="StagedFlatParameter.Staged"/> and copies it back at
+    /// <see cref="StagedFlatParameter.Offset"/>, then disposes the result. Both copies stay on the device; the view used
+    /// to be declined, so its optimizer step ran on the host. Callers stage only after the sub-buffer view was refused;
+    /// declining every IGpuBufferViews backend here left an unaligned view on OpenCL with neither. Returns
+    /// <c>null</c> when the parameter is not such a view.
     /// </summary>
     internal StagedFlatParameter? TryStageFlatParameter(Tensor<float> param)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!TryGetBackend(out var be) || be is IGpuBufferViews || !param.IsContiguous) return null;
+        if (!TryGetBackend(out var be) || !param.IsContiguous) return null;
         if (!TryGetFlatParameterView(param, out var flat, out int offset)) return null;
         var flatBuffer = AcquireFlatDeviceBuffer(flat, be, param.GpuCacheVersion);
         var staged = be.AllocateBuffer(param.Length);
