@@ -1,6 +1,6 @@
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 
-public sealed partial class OpenClBackend : IInstantNgpBackend, IFrexpBackend, IRenderingGeometryBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
+public sealed partial class OpenClBackend : IInstantNgpBackend, IFrexpBackend, IRenderingGeometryBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, IOneHotIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
 {
     private DirectOpenClKernel GetInstantNgpKernel(string name)
     {
@@ -180,6 +180,18 @@ public sealed partial class OpenClBackend : IInstantNgpBackend, IFrexpBackend, I
         kernel.SetArg(1, InstantNgpHandle(int32Indices));
         kernel.SetArg(2, length);
         kernel.Execute1D(length, CalculateOptimalWorkGroupSize1D(length));
+    }
+
+    public void OneHotInt32(IGpuBuffer int32Indices, IGpuBuffer output, int rows, int depth)
+    {
+        int total = checked(rows * depth);
+        if (total <= 0) return;
+        var kernel = GetInstantNgpKernel("resident_one_hot_int32");
+        kernel.SetArg(0, InstantNgpHandle(int32Indices));
+        kernel.SetArg(1, InstantNgpHandle(output));
+        kernel.SetArg(2, rows);
+        kernel.SetArg(3, depth);
+        kernel.Execute1D(total, CalculateOptimalWorkGroupSize1D(total));
     }
 
     public void IndexAdd(
