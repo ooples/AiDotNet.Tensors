@@ -71,7 +71,7 @@ public sealed class DeterministicDeviceClipTests
             bool nonFinite = before.Any(t => t.Any(x => float.IsNaN(x) || float.IsInfinity(x)));
             if (policy == NonFiniteGradientPolicy.Error && nonFinite)
             {
-                var ex = Assert.Throws<ArithmeticException>(() => GpuOptimizer.TryClipGradNorm(gradients, maxNorm, policy));
+                var ex = Assert.Throws<NonFiniteGradientException>(() => GpuOptimizer.TryClipGradNorm(gradients, maxNorm, policy));
                 Assert.Contains("gradient " + Array.FindIndex(before, t => t.Any(x => float.IsNaN(x) || float.IsInfinity(x))), ex.Message);
                 for (int t = 0; t < gradients.Length; t++)
                     Assert.Equal(before[t].Select(N.SingleToUInt32Bits), gradients[t].ToArray().Select(N.SingleToUInt32Bits));

@@ -248,7 +248,7 @@ public class DeterministicGradientNormReferenceTests
                 new AiDotNet.Tensors.LinearAlgebra.Vector<float>((float[])t.Clone()))).ToArray();
             if (policy == NonFiniteGradientPolicy.Error)
             {
-                var ex = Assert.Throws<ArithmeticException>(() =>
+                var ex = Assert.Throws<NonFiniteGradientException>(() =>
                     AiDotNet.Tensors.Engines.Compilation.GradientClipping.ClipGradNorm(grads, maxNorm, policy));
                 Assert.Contains("gradient " + Array.FindIndex(tensors, t => t.Any(x => float.IsNaN(x) || float.IsInfinity(x))), ex.Message);
                 for (int t = 0; t < tensors.Length; t++)

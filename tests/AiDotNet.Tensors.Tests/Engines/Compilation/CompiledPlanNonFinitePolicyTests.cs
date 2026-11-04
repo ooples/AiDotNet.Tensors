@@ -46,7 +46,7 @@ public sealed class CompiledPlanNonFinitePolicyTests : IClassFixture<DirectGpuTe
             using (plan)
             {
                 plan.SetMaxGradNorm(1.0);
-                plan.SetNonFiniteGradientPolicy(policy);
+                ((INonFiniteGradientPolicyTarget)plan).SetNonFiniteGradientPolicy(policy);
                 plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 1.0f);
                 thrown = Record.Exception(() => plan.Step());
                 return new[] { w0.ToArray(), w1.ToArray() };
@@ -83,7 +83,9 @@ public sealed class CompiledPlanNonFinitePolicyTests : IClassFixture<DirectGpuTe
     {
         SkipUnlessAvailable(onGpu);
         var w = Step(onGpu, NonFiniteGradientPolicy.Error, out var thrown);
-        var ex = Assert.IsType<ArithmeticException>(thrown);
+        var ex = Assert.IsType<NonFiniteGradientException>(thrown);
+        Assert.Equal(0, ex.FirstNonFiniteGradient);
+        Assert.Equal(1, ex.NanCount);
         Assert.Contains("gradient 0 is the first", ex.Message);
         Assert.Contains("1 NaN", ex.Message);
         Assert.All(w[0].Where((_, i) => i != 1), v => Assert.Equal(1f, v));

@@ -384,11 +384,8 @@ public static class GpuOptimizer
 
     /// <summary>The <see cref="NonFiniteGradientPolicy.Error"/> exception (PyTorch's error_if_nonfinite message, with
     /// the first non-finite gradient and the counts).</summary>
-    internal static ArithmeticException NonFiniteNormException(int firstGradient, long nanCount, long infinityCount) =>
-        new ArithmeticException(
-            $"The total norm of order 2 for the gradients is non-finite, so it cannot be clipped: gradient {firstGradient} " +
-            $"is the first holding a non-finite element ({nanCount} NaN, {infinityCount} infinite in all). The gradients " +
-            "are left unscaled. Choose another NonFiniteGradientPolicy to scale or repair them instead.");
+    internal static NonFiniteGradientException NonFiniteNormException(int firstGradient, long nanCount, long infinityCount) =>
+        new NonFiniteGradientException(firstGradient, nanCount, infinityCount);
 
     /// <summary>
     /// Proximal gradient (ISTA) step with L1 soft-threshold prox, in place on the GPU.
