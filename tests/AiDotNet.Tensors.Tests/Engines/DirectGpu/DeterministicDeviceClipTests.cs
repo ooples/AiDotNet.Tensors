@@ -107,6 +107,49 @@ public sealed class DeterministicDeviceClipTests
         finally { AiDotNetEngine.Current = saved; }
     }
 
+    /// <summary>More chunks than the fused launch has blocks (each block grid-strides), run three times: the last block's
+    /// ticket must reset, so every launch combines all partials once. Then the record-only path (no coefficient).</summary>
+    [SkippableFact]
+    public void FusedNormClip_GridStrideAndRepeatedLaunches_MatchTheReference()
+    {
+        using var gpu = new DirectGpuTensorEngine();
+        if (Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS") == "1")
+            Assert.True(gpu.IsGpuAvailable, "The required GPU backend failed to initialize.");
+        Skip.If(!gpu.IsGpuAvailable, "GPU engine unavailable.");
+        var saved = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = gpu;
+        try
+        {
+            // Five 4M-element tensors and a 4097-element one: 5122 chunks. (Each tensor stays under 65535 * 256
+            // elements, so an elementwise op keeps it on the device even where the X workgroup count is 65535.)
+            var host = Enumerable.Range(0, 5).Select(k => Random(4 << 20, 8 + k, -40, 40)).Append(Random(4097, 13, -10, 10)).ToArray();
+            for (int run = 0; run < 3; run++)
+            {
+                var gradients = host.Select(h => gpu.TensorAdd(new Tensor<float>(new[] { h.Length }, new Vector<float>(h)),
+                    new Tensor<float>(new[] { h.Length }))).ToArray();
+                var before = gradients.Select(g => g.ToArray()).ToArray();
+                uint[] expected = N.Compute(before, 0.5f);
+                using (var sum = GpuOptimizer.TryGradientSumOfSquares(gradients))
+                {
+                    Assert.NotNull(sum);
+                    Assert.Equal(BitConverter.DoubleToInt64Bits(Double(expected)), BitConverter.DoubleToInt64Bits(sum!.TotalNormSquared));
+                    Assert.Equal(expected[N.WordNorm], N.SingleToUInt32Bits(sum.Norm));
+                }
+                using var norm = GpuOptimizer.TryClipGradNorm(gradients, 0.5f);
+                Assert.NotNull(norm);
+                Assert.Equal(expected[N.WordNorm], N.SingleToUInt32Bits(norm!.Norm));
+                Assert.Equal(expected[N.WordScale], N.SingleToUInt32Bits(norm.ClipCoefficient));
+                for (int t = 0; t < gradients.Length; t++)
+                {
+                    var after = gradients[t].ToArray();
+                    for (int i = 0; i < after.Length; i += after.Length > 4097 ? 4099 : 1)
+                        Assert.Equal(N.Mul(N.SingleToUInt32Bits(before[t][i]), expected[N.WordScale]), N.SingleToUInt32Bits(after[i]));
+                }
+            }
+        }
+        finally { AiDotNetEngine.Current = saved; }
+    }
+
     private static double Double(uint[] r) =>
         BitConverter.Int64BitsToDouble((long)(((ulong)r[N.WordSumSquaresHi] << 32) | r[N.WordSumSquaresLo]));
 }

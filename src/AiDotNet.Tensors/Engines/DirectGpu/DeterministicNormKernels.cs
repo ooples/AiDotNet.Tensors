@@ -15,7 +15,10 @@ internal static class DeterministicNormKernels
     internal const int GroupSize = 256;
 
     internal static readonly string[] CudaKernelNames =
-        { "dgn_chunk_partials", "dgn_finish", "dgn_clip_scale", "dgn_multi_tensor_scale" };
+        { "dgn_chunk_partials", "dgn_finish", "dgn_clip_scale", "dgn_multi_tensor_scale", "dgn_norm_clip" };
+
+    /// <summary>The <c>policy</c> argument of <c>dgn_norm_clip</c> that writes the record only (no coefficient).</summary>
+    internal const uint RecordOnly = 0xFFFFFFFFu;
 
     internal static readonly string[] PerTensorKernelNames =
         { "dgn_chunk_partials_tensor", "dgn_finish", "dgn_clip_scale", "dgn_scale_tensor" };
@@ -435,6 +438,39 @@ extern ""C"" __global__ __launch_bounds__(256) void dgn_finish(
     __shared__ U32 su[256], su2[256];
     __shared__ U64 slo[256], shi[256];
     dgn_finish_body(partials, count, headroom, record, (int)threadIdx.x, su, su2, slo, shi);
+}
+
+// The whole norm in one launch: every block reduces its chunks to partials, and the block that finishes last (an
+// atomic ticket after a device fence) combines all of them in index order, as dgn_finish does, then writes the
+// coefficient (dgn_clip_body) unless policy is RecordOnly. Arrival order picks only which block combines, never the
+// order of the combine, so the bits are dgn_chunk_partials + dgn_finish + dgn_clip_scale's. The last block resets the
+// ticket, so the launch replays (CUDA graphs) with no host work.
+extern ""C"" __global__ __launch_bounds__(256) void dgn_norm_clip(
+    const unsigned long long* __restrict__ ptrs, const int* __restrict__ sizes, const int* __restrict__ chunkTensor,
+    const int* __restrict__ chunkStart, int totalChunks, unsigned int* partials, unsigned int* ticket, int headroom,
+    unsigned int* record, unsigned int maxNormBits, unsigned int policy, unsigned int* scale)
+{
+    __shared__ U32 su[256], su2[256];
+    __shared__ U64 slo[256], shi[256];
+    __shared__ int isLast;
+    for (int c = blockIdx.x; c < totalChunks; c += gridDim.x)
+    {
+        int t = chunkTensor[c], start = chunkStart[c];
+        int end = min(start + DGN_CHUNK, sizes[t]);
+        dgn_chunk((const U32*)ptrs[t], start, end, (U32)t, partials + (size_t)c * 8u, (int)threadIdx.x, su, slo, shi);
+    }
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) isLast = atomicAdd(ticket, 1u) == gridDim.x - 1u;
+    __syncthreads();
+    if (!isLast) return;
+    __threadfence();
+    dgn_finish_body((const U32*)partials, totalChunks, headroom, record, (int)threadIdx.x, su, su2, slo, shi);
+    if (threadIdx.x == 0)
+    {
+        if (policy != 0xFFFFFFFFu) dgn_clip_body(record, maxNormBits, policy, scale);
+        *ticket = 0u;
+    }
 }
 
 extern ""C"" __global__ void dgn_clip_scale(unsigned int* __restrict__ record, unsigned int maxNormBits, unsigned int policy,

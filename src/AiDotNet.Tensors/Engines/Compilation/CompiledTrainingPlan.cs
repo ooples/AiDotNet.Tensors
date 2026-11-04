@@ -12550,9 +12550,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 sumSquares = _clipSumSq = cb.AllocateBuffer(Engines.Gpu.DeterministicGradientNorm.RecordWords);
             }
             var scale = _clipTmp ??= cb.AllocateBuffer(1);
-            multi.MultiTensorSumOfSquares(buffers, sizes, sumSquares);
+            // The record and the coefficient: one launch on CUDA and HIP.
+            Engines.DirectGpu.MultiTensorArgs.NormAndClipScale(multi, buffers, sizes, sumSquares, (float)maxNorm, scale,
+                Engines.Gpu.NonFiniteGradientPolicy.LeaveUnscaled);
             RecordClipSumOfSquares(cb, buffers, sizes);
-            multi.ClipScaleFromSumOfSquares(sumSquares, (float)maxNorm, scale);
             multi.MultiTensorScaleByDeviceScalar(buffers, sizes, scale);
             for (int p = 0; p < owners.Count; p++)
                 (_engine as Engines.DirectGpuTensorEngine)?.BindResidentBuffer(owners[p], buffers[p], cb);

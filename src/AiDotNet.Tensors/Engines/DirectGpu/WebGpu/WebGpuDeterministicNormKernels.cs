@@ -363,13 +363,15 @@ fn dgn_clip_scale(@builtin(global_invocation_id) gid: vec3<u32>) {
     b[0] = s;
 }
 
-// a = scale, b = tensor; params = (n, zeroNonFinite).
+// a = scale, b = tensor; params = (n, zeroNonFinite). Grid-strided, so the dispatch stays within
+// maxComputeWorkgroupsPerDimension (65535 by default) for any n.
 @compute @workgroup_size(256)
-fn dgn_scale(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i < params.p0) {
+fn dgn_scale(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
+    let s = a[0];
+    let stride = groups.x * 256u;
+    for (var i = gid.x; i < params.p0; i += stride) {
         let g = b[i];
-        b[i] = select(dgn_mul(g, a[0]), 0u, params.p1 != 0u && ((g >> 23u) & 0xFFu) == 0xFFu);
+        b[i] = select(dgn_mul(g, s), 0u, params.p1 != 0u && ((g >> 23u) & 0xFFu) == 0xFFu);
     }
 }
 ";

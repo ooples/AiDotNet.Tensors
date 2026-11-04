@@ -5,8 +5,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     // The global-norm clip as chunk reductions per tensor (no device address tables on OpenCL), the OpenCL port of
     // CudaBackend's IMultiTensorKernels: the deterministic record (Gpu.DeterministicGradientNorm). FinishSumOfSquaresDouble
     // still serves the float-and-scaled-sum accumulator of IDeviceScalarOps and the device-guarded updates (#1502).
-    public sealed partial class OpenClBackend : IMultiTensorKernels
+    public sealed partial class OpenClBackend : IMultiTensorKernels, IFusedNormClipKernels
     {
+        // The reduction here is one dispatch per tensor (no buffer table), so the record already takes N + 1 launches; the
+        // coefficient follows as one more. CUDA and HIP fold all of it into one launch (dgn_norm_clip).
+        void IFusedNormClipKernels.MultiTensorNormAndClipScale(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes,
+            IGpuBuffer record, float maxNorm, IGpuBuffer? scale, Gpu.NonFiniteGradientPolicy policy)
+        {
+            IMultiTensorKernels multi = this;
+            multi.MultiTensorSumOfSquares(tensors, sizes, record);
+            if (scale is not null) multi.ClipScaleFromRecord(record, maxNorm, scale, policy);
+        }
+
         // The finiteness reduction IDeviceScalarOps promises (a double in two slots): float and 2^-80-scaled sums.
         internal void FinitenessSumOfSquares(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer sumOfSquares)
         {

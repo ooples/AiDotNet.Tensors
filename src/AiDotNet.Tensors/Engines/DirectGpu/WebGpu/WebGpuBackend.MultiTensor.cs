@@ -8,8 +8,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 // CudaBackend's IMultiTensorKernels: the deterministic record (Gpu.DeterministicGradientNorm) in u32-only WGSL
 // (WebGpuDeterministicNormKernels). The public MultiTensorSumOfSquares is the finiteness reduction (the double the
 // guard and IDeviceScalarOps read, WebGpuFiniteGuardKernels).
-public sealed partial class WebGpuBackend : IMultiTensorKernels
+public sealed partial class WebGpuBackend : IMultiTensorKernels, IFusedNormClipKernels
 {
+    // The reduction here is one dispatch per tensor (no buffer table), so the record already takes N + 1 launches; the
+    // coefficient follows as one more. CUDA and HIP fold all of it into one launch (dgn_norm_clip).
+    void IFusedNormClipKernels.MultiTensorNormAndClipScale(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes,
+        IGpuBuffer record, float maxNorm, IGpuBuffer? scale, Gpu.NonFiniteGradientPolicy policy)
+    {
+        IMultiTensorKernels multi = this;
+        multi.MultiTensorSumOfSquares(tensors, sizes, record);
+        if (scale is not null) multi.ClipScaleFromRecord(record, maxNorm, scale, policy);
+    }
+
     private IGpuBuffer? _normPartials;
     private readonly object _normPartialsLock = new();
 
@@ -86,7 +96,8 @@ public sealed partial class WebGpuBackend : IMultiTensorKernels
         MultiTensorArgs.Validate(tensors, sizes);
         // dgn_mul: the IEEE product with subnormals kept, so a flush-to-zero device still matches the others.
         for (int t = 0; t < tensors.Count; t++)
-            NormDispatch("dgn_scale", scale, tensors[t], NormParams((uint)sizes[t], zeroNonFinite ? 1u : 0u), sizes[t]);
+            NormDispatch("dgn_scale", scale, tensors[t], NormParams((uint)sizes[t], zeroNonFinite ? 1u : 0u),
+                Math.Min(sizes[t], MultiTensorArgs.MaxStridedScaleThreads));
     }
 
     /// <inheritdoc />

@@ -199,6 +199,18 @@ internal interface IRectSliceKernels
 /// cannot address an arbitrary buffer from a table, so they launch one chunk reduction per tensor. A second launch
 /// combines the chunk partials.
 /// </remarks>
+/// <summary>The norm record and the clip coefficient in one launch (CUDA, HIP). <see cref="MultiTensorArgs.NormAndClipScale"/>
+/// uses it where implemented and the separate <see cref="IMultiTensorKernels"/> launches elsewhere; the bits are the
+/// same either way.</summary>
+internal interface IFusedNormClipKernels
+{
+    /// <summary>Writes <paramref name="record"/> as <see cref="IMultiTensorKernels.MultiTensorSumOfSquares"/> and, when
+    /// <paramref name="scale"/> is not null, the coefficient as <see cref="IMultiTensorKernels.ClipScaleFromRecord"/>.</summary>
+    void MultiTensorNormAndClipScale(System.Collections.Generic.IReadOnlyList<IGpuBuffer> tensors,
+        System.Collections.Generic.IReadOnlyList<int> sizes, IGpuBuffer record, float maxNorm, IGpuBuffer? scale,
+        Gpu.NonFiniteGradientPolicy policy);
+}
+
 internal interface IMultiTensorKernels
 {
     /// <summary>Writes the deterministic norm record (<see cref="Gpu.DeterministicGradientNorm"/>, at least
@@ -233,6 +245,25 @@ internal interface IMultiTensorKernels
 /// <summary>Argument checks every <see cref="IMultiTensorKernels"/> implementation shares.</summary>
 internal static class MultiTensorArgs
 {
+    /// <summary>The norm record and, when <paramref name="scale"/> is not null, the clip coefficient: one launch on a
+    /// backend with <see cref="IFusedNormClipKernels"/>, else the record reduction then the coefficient.</summary>
+    internal static void NormAndClipScale(IMultiTensorKernels multi, System.Collections.Generic.IReadOnlyList<IGpuBuffer> tensors,
+        System.Collections.Generic.IReadOnlyList<int> sizes, IGpuBuffer record, float maxNorm, IGpuBuffer? scale,
+        Gpu.NonFiniteGradientPolicy policy)
+    {
+        if (multi is IFusedNormClipKernels fused)
+        {
+            fused.MultiTensorNormAndClipScale(tensors, sizes, record, maxNorm, scale, policy);
+            return;
+        }
+        multi.MultiTensorSumOfSquares(tensors, sizes, record);
+        if (scale is not null) multi.ClipScaleFromRecord(record, maxNorm, scale, policy);
+    }
+
+    /// <summary>Threads of a grid-strided scale dispatch (Vulkan, WebGPU): 65535 groups of 256, the spec minimum of
+    /// the X workgroup count, so the dispatch is legal on every device and each thread loops over the rest.</summary>
+    internal const int MaxStridedScaleThreads = 65535 * 256;
+
     /// <summary>The work-group size of the per-tensor reduction on OpenCL, Metal, Vulkan and WebGPU.</summary>
     internal const int ReductionGroupSize = 256;
 

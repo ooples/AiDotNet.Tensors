@@ -383,7 +383,8 @@ void main() {
     scale[0] = s;
 }";
 
-    /// <summary>x[i] = x[i] * scale with subnormals kept: binding 0 scale, 1 x; push n.</summary>
+    /// <summary>x[i] = x[i] * scale with subnormals kept: binding 0 scale, 1 x; push n, zeroNonFinite. Grid-strided, so
+    /// the dispatch stays within maxComputeWorkGroupCountX (65535 on minimum-spec devices) for any n.</summary>
     internal const string Scale = @"#version 450
 layout(local_size_x = 256) in;
 layout(set=0,binding=0) readonly buffer Sb { uint scale[]; };
@@ -391,7 +392,8 @@ layout(set=0,binding=1) buffer Xb { uint x[]; };
 layout(push_constant) uniform PC { uint n; uint zeroNonFinite; };
 " + Common + @"
 void main() {
-    uint i = gl_GlobalInvocationID.x;
-    if (i < n) x[i] = (zeroNonFinite != 0u && ((x[i] >> 23) & 0xFFu) == 0xFFu) ? 0u : dgn_mul(x[i], scale[0]);
+    uint s = scale[0], stride = gl_NumWorkGroups.x * 256u;
+    for (uint i = gl_GlobalInvocationID.x; i < n; i += stride)
+        x[i] = (zeroNonFinite != 0u && ((x[i] >> 23) & 0xFFu) == 0xFFu) ? 0u : dgn_mul(x[i], s);
 }";
 }

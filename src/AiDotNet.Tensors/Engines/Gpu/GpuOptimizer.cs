@@ -347,15 +347,13 @@ public static class GpuOptimizer
         IGpuBuffer? scale = null;
         try
         {
-            multi.MultiTensorSumOfSquares(buffers, sizes, sumOfSquares);
-            if (clipTo is { } maxNorm)
-            {
-                scale = backend.AllocateBuffer(1);
-                // Error is raised on the host below; on the device it leaves the gradients unscaled.
-                multi.ClipScaleFromRecord(sumOfSquares, maxNorm, scale,
-                    nonFinite == NonFiniteGradientPolicy.Error ? NonFiniteGradientPolicy.LeaveUnscaled : nonFinite);
+            if (clipTo is not null) scale = backend.AllocateBuffer(1);
+            // The record and the coefficient (one launch on CUDA and HIP). Error is raised on the host below; on the
+            // device it leaves the gradients unscaled.
+            MultiTensorArgs.NormAndClipScale(multi, buffers, sizes, sumOfSquares, clipTo ?? 0f, scale,
+                nonFinite == NonFiniteGradientPolicy.Error ? NonFiniteGradientPolicy.LeaveUnscaled : nonFinite);
+            if (scale is not null)
                 multi.MultiTensorClipScale(buffers, sizes, scale, nonFinite == NonFiniteGradientPolicy.ZeroNonFinite);
-            }
         }
         catch
         {

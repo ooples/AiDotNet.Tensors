@@ -7,8 +7,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 // port of CudaBackend's IMultiTensorKernels: the deterministic record (Gpu.DeterministicGradientNorm) in 32-bit integer
 // GLSL (VulkanDeterministicNormKernels). The finite guard's own reduction (MultiTensorSumOfSquaresOnDevice) still
 // serves IDeviceScalarOps and the guarded optimizer updates.
-public sealed partial class VulkanBackend : IMultiTensorKernels
+public sealed partial class VulkanBackend : IMultiTensorKernels, IFusedNormClipKernels
 {
+    // The reduction here is one dispatch per tensor (no buffer table), so the record already takes N + 1 launches; the
+    // coefficient follows as one more. CUDA and HIP fold all of it into one launch (dgn_norm_clip).
+    void IFusedNormClipKernels.MultiTensorNormAndClipScale(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes,
+        IGpuBuffer record, float maxNorm, IGpuBuffer? scale, Gpu.NonFiniteGradientPolicy policy)
+    {
+        IMultiTensorKernels multi = this;
+        multi.MultiTensorSumOfSquares(tensors, sizes, record);
+        if (scale is not null) multi.ClipScaleFromRecord(record, maxNorm, scale, policy);
+    }
+
     private IGpuBuffer? _normPartials;
 
     public void MultiTensorSumOfSquares(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer sumOfSquares)
@@ -63,7 +73,7 @@ public sealed partial class VulkanBackend : IMultiTensorKernels
         MultiTensorArgs.Validate(tensors, sizes);
         // dgn_mul: the IEEE product with subnormals kept, so a flush-to-zero device still matches the others.
         for (int t = 0; t < tensors.Count; t++)
-            GlslUnaryOp(VulkanDeterministicNormKernels.Scale, scale, tensors[t], sizes[t], new[] { (uint)sizes[t], zeroNonFinite ? 1u : 0u }, 2 * sizeof(uint));
+            GlslUnaryOp(VulkanDeterministicNormKernels.Scale, scale, tensors[t], Math.Min(sizes[t], MultiTensorArgs.MaxStridedScaleThreads), new[] { (uint)sizes[t], zeroNonFinite ? 1u : 0u }, 2 * sizeof(uint));
     }
 
     /// <inheritdoc />

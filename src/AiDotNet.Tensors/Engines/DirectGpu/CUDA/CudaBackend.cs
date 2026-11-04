@@ -18867,6 +18867,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 _gradientTable = null;
                 _normPartials?.Dispose();
                 _normPartials = null;
+                _normTicket?.Dispose();
+                _normTicket = null;
             }
             lock (_adamTableSync)
             {

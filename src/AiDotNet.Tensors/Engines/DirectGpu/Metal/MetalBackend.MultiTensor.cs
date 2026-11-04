@@ -6,8 +6,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 // The global-norm clip as chunk reductions per tensor, the Metal port of CudaBackend's IMultiTensorKernels: the
 // deterministic record (Gpu.DeterministicGradientNorm). The public MultiTensorSumOfSquares is the finiteness reduction
 // (a float sum and a non-finite mark finished as a double) that IDeviceScalarOps and the guarded updates use (#1520).
-public sealed partial class MetalBackend : IMultiTensorKernels
+public sealed partial class MetalBackend : IMultiTensorKernels, IFusedNormClipKernels
 {
+    // The reduction here is one dispatch per tensor (no buffer table), so the record already takes N + 1 launches; the
+    // coefficient follows as one more. CUDA and HIP fold all of it into one launch (dgn_norm_clip).
+    void IFusedNormClipKernels.MultiTensorNormAndClipScale(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes,
+        IGpuBuffer record, float maxNorm, IGpuBuffer? scale, Gpu.NonFiniteGradientPolicy policy)
+    {
+        IMultiTensorKernels multi = this;
+        multi.MultiTensorSumOfSquares(tensors, sizes, record);
+        if (scale is not null) multi.ClipScaleFromRecord(record, maxNorm, scale, policy);
+    }
+
     private IGpuBuffer? _normPartials;
 
     // Exactly `groups` threadgroups of `groupSize` threads (the norm reductions need whole 256-thread groups).
