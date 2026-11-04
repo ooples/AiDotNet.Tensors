@@ -70,7 +70,8 @@ public static class GpuOptimizer
     /// </summary>
     private static void MarkParameterUpdated(DirectGpuTensorEngine engine, IDirectGpuBackend backend, Tensor<float> param, IGpuBuffer buffer)
     {
-        if (param.OffloadDevicePointer == IntPtr.Zero && param.GetBackingArrayForCacheLookupUnsafe() is not null)
+        if (param._gpuBuffer is not null ||
+            (param.OffloadDevicePointer == IntPtr.Zero && param.GetBackingArrayForCacheLookupUnsafe() is not null))
             engine.CommitParameterUpdatedOnDevice(param, buffer, backend, CreateWriteSyncPoint(backend));
         else
             MarkGpuUpdated(backend, param);

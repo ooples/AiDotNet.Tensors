@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Runtime.InteropServices;
 
 namespace AiDotNet.Tensors.Engines;
@@ -1314,8 +1315,8 @@ public sealed class CuDnnContext : IDisposable
     {
         if (_disposed) return;
 
-        foreach (var handle in _handleByStream.Values)
-            if (handle != _primaryHandle) CuDnnNative.cudnnDestroy(handle);
+        foreach (var handle in _handleByStream.Values.Where(handle => handle != _primaryHandle))
+            CuDnnNative.cudnnDestroy(handle);
         _handleByStream.Clear();
         if (_primaryHandle != IntPtr.Zero)
         {

@@ -30,6 +30,35 @@ public sealed class GpuOptimizerFlatParameterViewTests : IClassFixture<DirectGpu
 
     public void Dispose() => AiDotNetEngine.Current = _prior;
 
+    [SkippableFact]
+    public void BoundOffloadParameter_DeviceStepIsDownloadedOnHostRead()
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        var gpu = _fixture.Engine!;
+        var param = Rand(new[] { 4, 4 }, 31);
+        Tensor<float> Grad() => gpu.TensorMultiplyScalar(Rand(new[] { 4, 4 }, 32), 1f);
+        Assert.True(GpuOptimizer.TrySgdStep(param, Grad(), 0.1f));
+        var before = (float[])param.GetReadOnlyDataArray().Clone();
+        Assert.NotNull(param._gpuBuffer);
+
+        // A bound offload parameter updates this buffer, rather than the offload mirror.
+        // Use the live buffer's handle as the offload tag; no separate offload allocation is owned here.
+        param.OffloadDevicePointer = param._gpuBuffer!.Handle;
+        try
+        {
+            var gradient = Rand(new[] { 4, 4 }, 32).ToArray();
+            Assert.True(GpuOptimizer.TrySgdStep(param, Grad(), 0.1f));
+            Assert.True(param.HasPendingGpuData);
+            var actual = param.GetReadOnlyDataArray();
+            for (int i = 0; i < before.Length; i++)
+                Assert.Equal(before[i] - 0.1f * gradient[i], actual[i], precision: 6);
+        }
+        finally
+        {
+            param.OffloadDevicePointer = IntPtr.Zero;
+        }
+    }
+
     private static Tensor<float> Rand(int[] shape, int seed)
     {
         var rng = new Random(seed);
@@ -239,6 +268,7 @@ public sealed class GpuOptimizerFlatParameterViewTests : IClassFixture<DirectGpu
         Assert.True(GpuOptimizer.TrySgdStep(param, Grad(23), 0.1f), Fallbacks());
 
         Assert.Equal(afterFirst, snapshot.ToArray());
+        Assert.NotEqual(afterFirst, param.GetReadOnlyDataArray());
         Assert.Equal(reference.ToArray(), param.ToArray());
     }
 
@@ -261,7 +291,16 @@ public sealed class GpuOptimizerFlatParameterViewTests : IClassFixture<DirectGpu
             "The backend has no compressed optimizer moments.");
         try
         {
-            var before = param.ToArray();
+            var reference = Rand(shape, 13);
+            Assert.True(GpuOptimizer.TrySgdStep(reference, Grad(), 0.1f));
+            var before = (float[])reference.GetReadOnlyDataArray().Clone();
+            Assert.True(GpuOptimizer.TryAdam8BitStep(reference, Grad(), mQ, vQ, mS, vS,
+                0.01f, 0.9f, 0.999f, 1e-8f, 1f - 0.9f, 1f - 0.999f, blockSize));
+            var expected = (float[])reference.GetReadOnlyDataArray().Clone();
+            // A fresh moment state makes the tested update identical to the reference update.
+            foreach (var buffer in new[] { mQ, vQ, mS, vS })
+                if (buffer is not null) GpuOptimizer.FreeGpuBuffer(buffer);
+            Assert.True(GpuOptimizer.TryAllocAdam8BitState(param.Length, blockSize, out mQ, out vQ, out mS, out vS));
             var snapshot = (Tensor<float>)param.CloneShared();
             // The detach drops the shared device binding; the step must place the private copy, not decline.
             Assert.True(GpuOptimizer.TryAdam8BitStep(param, Grad(), mQ, vQ, mS, vS,
@@ -270,7 +309,9 @@ public sealed class GpuOptimizerFlatParameterViewTests : IClassFixture<DirectGpu
             Assert.True(gpu.IsDeviceAuthoritative(param));
 
             Assert.Equal(before, snapshot.ToArray());
-            Assert.NotEqual(before, param.ToArray());
+            var actual = param.GetReadOnlyDataArray();
+            Assert.NotEqual(before, actual);
+            Assert.Equal(expected, actual);
         }
         finally
         {
