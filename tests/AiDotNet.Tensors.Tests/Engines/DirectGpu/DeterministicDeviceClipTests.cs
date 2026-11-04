@@ -93,3 +93,47 @@ public sealed class DeterministicDeviceClipTests
     private static double Double(uint[] r) =>
         BitConverter.Int64BitsToDouble((long)(((ulong)r[N.WordSumSquaresHi] << 32) | r[N.WordSumSquaresLo]));
 }
+
+#if NET7_0_OR_GREATER
+/// <summary>The WebGPU port of the deterministic clip, on Dawn (it only runs where AIDOTNET_WEBGPU_NODE_DIR is set):
+/// the same record and scaled bits as <see cref="DeterministicGradientNorm"/>.</summary>
+[Collection("DirectGpuSerial")]
+public sealed class DeterministicWebGpuClipTests
+{
+    [SkippableTheory]
+    [MemberData(nameof(DeterministicDeviceClipTests.Cases), MemberType = typeof(DeterministicDeviceClipTests))]
+    public void WebGpuClip_MatchesTheIntegerReferenceBitForBit(string name, float[][] host, float maxNorm)
+    {
+        var backend = DawnHostedWebGpu.BackendOrSkip();
+        IMultiTensorKernels multi = backend;
+        foreach (var policy in new[] { NonFiniteGradientPolicy.LeaveUnscaled, NonFiniteGradientPolicy.Propagate })
+        {
+            var buffers = host.Select(h => backend.AllocateBuffer(h)).ToArray();
+            var sizes = host.Select(h => h.Length).ToArray();
+            using var record = backend.AllocateBuffer(N.RecordWords);
+            using var scale = backend.AllocateBuffer(1);
+            try
+            {
+                multi.MultiTensorSumOfSquares(buffers, sizes, record);
+                multi.ClipScaleFromRecord(record, maxNorm, scale, policy);
+                multi.MultiTensorScaleByDeviceScalar(buffers, sizes, scale);
+                uint[] expected = N.Compute(host, maxNorm, policy);
+                uint[] got = MultiTensorArgs.RecordFromSlots(backend.DownloadBuffer(record));
+                for (int w = 0; w <= N.WordMaxNorm; w++)
+                    Assert.True(expected[w] == got[w], $"{name}/{policy}: record word {w}: device 0x{got[w]:X8}, reference 0x{expected[w]:X8}");
+                for (int t = 0; t < buffers.Length; t++)
+                {
+                    var after = backend.DownloadBuffer(buffers[t]);
+                    for (int i = 0; i < host[t].Length; i++)
+                    {
+                        uint want = N.Mul(N.SingleToUInt32Bits(host[t][i]), expected[N.WordScale]);
+                        uint gotBits = N.SingleToUInt32Bits(after[i]);
+                        if (want != gotBits) Assert.Fail($"{name}/{policy}: {t}[{i}]: device 0x{gotBits:X8}, reference 0x{want:X8}");
+                    }
+                }
+            }
+            finally { foreach (var b in buffers) b.Dispose(); }
+        }
+    }
+}
+#endif

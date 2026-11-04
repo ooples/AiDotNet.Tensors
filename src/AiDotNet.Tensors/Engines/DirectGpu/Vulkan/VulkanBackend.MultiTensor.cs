@@ -3,62 +3,49 @@ using System.Collections.Generic;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
-// The global-norm clip as one work-group reduction per tensor (no device address tables in core Vulkan compute), the
-// Vulkan port of CudaBackend's IMultiTensorKernels. The sum of squares is the finite guard's (VulkanFiniteGuardKernels):
-// a float accumulation and a 2^-80-scaled one finished as the double the other backends write, so the clip, the guarded
-// optimizer updates and ReadSumOfSquares share one layout. (The clip used to read its own raw float sum, which became
-// infinite past the float range -- an L2 norm above ~1.8e19 -- and left those gradients unclipped and reported as
-// non-finite.)
+// The global-norm clip as chunk reductions per tensor (no device address tables in core Vulkan compute), the Vulkan
+// port of CudaBackend's IMultiTensorKernels: the deterministic record (Gpu.DeterministicGradientNorm) in 32-bit integer
+// GLSL (VulkanDeterministicNormKernels). The finite guard's own reduction (MultiTensorSumOfSquaresOnDevice) still
+// serves IDeviceScalarOps and the guarded optimizer updates.
 public sealed partial class VulkanBackend : IMultiTensorKernels
 {
-    // min(1, maxNorm / (norm + 1e-6)) from the finished double, the norm taken from its exponent and mantissa
-    // (sum = m * 2^k, norm = sqrt(m) * 2^(k/2)) so a sum past the float range, carried by the finish from the scaled
-    // sum, gets the coefficient CUDA's double norm gives. A non-finite norm leaves the gradients unscaled.
-    private const string ClipScaleFromSumSquaresGlsl = @"#version 450
-layout(local_size_x = 1) in;
-layout(set=0,binding=0) readonly buffer Accb { uint acc[]; };
-layout(set=0,binding=1) buffer Scaleb { float scale[]; };
-layout(push_constant) uniform PC { float maxNorm; };
-void main() {
-    if (gl_GlobalInvocationID.x != 0u) return;
-    uint lo = acc[0], hi = acc[1];
-    uint ef = (hi >> 20) & 0x7ffu;
-    float c = 1.0;
-    if (ef == 0u) c = maxNorm / 1e-6;
-    else if (ef != 0x7ffu) {
-        int k = int(ef) - 1023;
-        float m = uintBitsToFloat(0x3f800000u | ((hi & 0xfffffu) << 3) | (lo >> 29));
-        if ((k & 1) != 0) { m *= 2.0; k -= 1; }
-        int h = k / 2;
-        float root = sqrt(m);
-        c = h < 64 ? maxNorm / (ldexp(root, h) + 1e-6) : ldexp(maxNorm / root, -h);
-    }
-    scale[0] = c < 1.0 ? c : 1.0;
-}";
-
-    private const string ScaleByDeviceScalarGlsl = @"#version 450
-layout(local_size_x = 256) in;
-layout(set=0,binding=0) readonly buffer Scaleb { float scale[]; };
-layout(set=0,binding=1) buffer Xb { float x[]; };
-layout(push_constant) uniform PC { uint n; };
-void main() {
-    uint i = gl_GlobalInvocationID.x;
-    if (i < n) x[i] *= scale[0];
-}";
+    private IGpuBuffer? _normPartials;
 
     public void MultiTensorSumOfSquares(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer sumOfSquares)
     {
         EnsureInitialized();
-        MultiTensorSumOfSquaresOnDevice(tensors, sizes, sumOfSquares);
+        MultiTensorArgs.ValidateRecordBuffer(sumOfSquares);
+        MultiTensorArgs.Validate(tensors, sizes);
+        int total = 0;
+        for (int t = 0; t < sizes.Count; t++) total += Gpu.DeterministicGradientNorm.ChunkCount(sizes[t]);
+        int words = Math.Max(1, total) * Gpu.DeterministicGradientNorm.PartialWords;
+        if (_normPartials is not { } partials || partials.Size < words)
+        {
+            _normPartials?.Dispose();
+            partials = _normPartials = AllocateBuffer(Math.Max(words, 64 * Gpu.DeterministicGradientNorm.PartialWords));
+        }
+        uint first = 0;
+        for (int t = 0; t < tensors.Count; t++)
+        {
+            int chunks = Gpu.DeterministicGradientNorm.ChunkCount(sizes[t]);
+            GlslUnaryOp(VulkanDeterministicNormKernels.ChunkPartials, tensors[t], partials,
+                chunks * DeterministicNormKernels.GroupSize, new[] { (uint)sizes[t], (uint)t, first }, 3 * sizeof(uint));
+            first += (uint)chunks;
+        }
+        GlslUnaryOp(VulkanDeterministicNormKernels.Finish, partials, sumOfSquares, DeterministicNormKernels.GroupSize,
+            new[] { (uint)total, (uint)Gpu.DeterministicGradientNorm.Headroom(total) }, 2 * sizeof(uint));
     }
 
     public void ClipScaleFromSumOfSquares(IGpuBuffer sumOfSquares, float maxNorm, IGpuBuffer scale)
+        => ((IMultiTensorKernels)this).ClipScaleFromRecord(sumOfSquares, maxNorm, scale, Gpu.NonFiniteGradientPolicy.LeaveUnscaled);
+
+    void IMultiTensorKernels.ClipScaleFromRecord(IGpuBuffer sumOfSquares, float maxNorm, IGpuBuffer scale, Gpu.NonFiniteGradientPolicy policy)
     {
         EnsureInitialized();
-        MultiTensorArgs.ValidateSumBuffer(sumOfSquares);
+        MultiTensorArgs.ValidateRecordBuffer(sumOfSquares);
         if (scale is null) throw new ArgumentNullException(nameof(scale));
-        GlslUnaryOp(ClipScaleFromSumSquaresGlsl, sumOfSquares, scale, 1,
-            new[] { unchecked((uint)SingleToInt32BitsCompat(maxNorm)) }, sizeof(uint));
+        GlslUnaryOp(VulkanDeterministicNormKernels.ClipScale, sumOfSquares, scale, 1,
+            new[] { Gpu.DeterministicGradientNorm.SingleToUInt32Bits(maxNorm), (uint)policy }, 2 * sizeof(uint));
     }
 
     public void MultiTensorScaleByDeviceScalar(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer scale)
@@ -66,13 +53,10 @@ void main() {
         EnsureInitialized();
         if (scale is null) throw new ArgumentNullException(nameof(scale));
         MultiTensorArgs.Validate(tensors, sizes);
+        // dgn_mul: the IEEE product with subnormals kept, so a flush-to-zero device still matches the others.
         for (int t = 0; t < tensors.Count; t++)
-            GlslUnaryOp(ScaleByDeviceScalarGlsl, scale, tensors[t], sizes[t], new[] { (uint)sizes[t] }, sizeof(uint));
+            GlslUnaryOp(VulkanDeterministicNormKernels.Scale, scale, tensors[t], sizes[t], new[] { (uint)sizes[t] }, sizeof(uint));
     }
-
-    // TODO-PORT placeholder replaced by the u32 port below.
-    void IMultiTensorKernels.ClipScaleFromRecord(IGpuBuffer sumOfSquares, float maxNorm, IGpuBuffer scale, Gpu.NonFiniteGradientPolicy policy)
-        => ClipScaleFromSumOfSquares(sumOfSquares, maxNorm, scale);
 
     /// <inheritdoc />
     double IMultiTensorKernels.ReadSumOfSquares(IGpuBuffer sumOfSquares)

@@ -4,26 +4,49 @@ using System.Collections.Generic;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
-// The global-norm clip as one work-group reduction per tensor (WGSL cannot address a buffer from a table), the WebGPU
-// port of CudaBackend's IMultiTensorKernels. The sum of squares is the double CUDA writes (WebGpuFiniteGuardKernels).
+// The global-norm clip as chunk reductions per tensor (WGSL cannot address a buffer from a table), the WebGPU port of
+// CudaBackend's IMultiTensorKernels: the deterministic record (Gpu.DeterministicGradientNorm) in u32-only WGSL
+// (WebGpuDeterministicNormKernels). The public MultiTensorSumOfSquares is the finiteness reduction (the double the
+// guard and IDeviceScalarOps read, WebGpuFiniteGuardKernels).
 public sealed partial class WebGpuBackend : IMultiTensorKernels
 {
-    private const string MultiTensorSource = @"
-@group(0) @binding(0) var<storage, read_write> a: array<f32>;
-@group(0) @binding(1) var<storage, read_write> b: array<f32>;
-struct Params { n: u32, maxNorm: f32, _p0: u32, _p1: u32, }
-@group(0) @binding(2) var<uniform> params: Params;
+    private IGpuBuffer? _normPartials;
 
-// a = scale, b = tensor: b[i] *= a[0].
-@compute @workgroup_size(256)
-fn scale_by_device_scalar(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i < params.n) { b[i] = b[i] * a[0]; }
-}
-";
-
+    // The finite guard's uniform (WebGpuBackend.FiniteGuard): n and the norm bound.
     private static float[] MultiTensorParams(int n, float maxNorm) =>
         new[] { BitConverter.Int32BitsToSingle(n), maxNorm, 0f, 0f };
+
+    private static float[] NormParams(uint p0, uint p1 = 0, uint p2 = 0) =>
+        new[] { BitConverter.Int32BitsToSingle(unchecked((int)p0)), BitConverter.Int32BitsToSingle(unchecked((int)p1)),
+                BitConverter.Int32BitsToSingle(unchecked((int)p2)), 0f };
+
+    private void NormDispatch(string kernel, IGpuBuffer a, IGpuBuffer b, float[] parameters, int workSize) =>
+        Dispatch2BufferAsync(WebGpuDeterministicNormKernels.ModuleName, WebGpuDeterministicNormKernels.Source, kernel,
+            a, b, parameters, workSize).GetAwaiter().GetResult();
+
+    void IMultiTensorKernels.MultiTensorSumOfSquares(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer record)
+    {
+        MultiTensorArgs.ValidateRecordBuffer(record);
+        MultiTensorArgs.Validate(tensors, sizes);
+        int total = 0;
+        for (int t = 0; t < sizes.Count; t++) total += Gpu.DeterministicGradientNorm.ChunkCount(sizes[t]);
+        int words = Math.Max(1, total) * Gpu.DeterministicGradientNorm.PartialWords;
+        if (_normPartials is not { } partials || partials.Size < words)
+        {
+            _normPartials?.Dispose();
+            partials = _normPartials = AllocateBuffer(Math.Max(words, 64 * Gpu.DeterministicGradientNorm.PartialWords));
+        }
+        uint first = 0;
+        for (int t = 0; t < tensors.Count; t++)
+        {
+            int chunks = Gpu.DeterministicGradientNorm.ChunkCount(sizes[t]);
+            NormDispatch("dgn_chunk_partials", tensors[t], partials, NormParams((uint)sizes[t], (uint)t, first),
+                chunks * DeterministicNormKernels.GroupSize);
+            first += (uint)chunks;
+        }
+        NormDispatch("dgn_finish", partials, record, NormParams((uint)total, (uint)Gpu.DeterministicGradientNorm.Headroom(total)),
+            DeterministicNormKernels.GroupSize);
+    }
 
     public void MultiTensorSumOfSquares(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer sumOfSquares)
     {
@@ -38,24 +61,24 @@ fn scale_by_device_scalar(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     public void ClipScaleFromSumOfSquares(IGpuBuffer sumOfSquares, float maxNorm, IGpuBuffer scale)
+        => ((IMultiTensorKernels)this).ClipScaleFromRecord(sumOfSquares, maxNorm, scale, Gpu.NonFiniteGradientPolicy.LeaveUnscaled);
+
+    void IMultiTensorKernels.ClipScaleFromRecord(IGpuBuffer sumOfSquares, float maxNorm, IGpuBuffer scale, Gpu.NonFiniteGradientPolicy policy)
     {
-        MultiTensorArgs.ValidateSumBuffer(sumOfSquares);
+        MultiTensorArgs.ValidateRecordBuffer(sumOfSquares);
         if (scale is null) throw new ArgumentNullException(nameof(scale));
-        GuardDispatch("guard_clip_scale", scale, sumOfSquares, 1, maxNorm, 1);
+        NormDispatch("dgn_clip_scale", sumOfSquares, scale,
+            NormParams(Gpu.DeterministicGradientNorm.SingleToUInt32Bits(maxNorm), (uint)policy), 1);
     }
 
     public void MultiTensorScaleByDeviceScalar(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer scale)
     {
         if (scale is null) throw new ArgumentNullException(nameof(scale));
         MultiTensorArgs.Validate(tensors, sizes);
+        // dgn_mul: the IEEE product with subnormals kept, so a flush-to-zero device still matches the others.
         for (int t = 0; t < tensors.Count; t++)
-            Dispatch2BufferAsync("MultiTensor", MultiTensorSource, "scale_by_device_scalar", scale, tensors[t],
-                MultiTensorParams(sizes[t], 0f), sizes[t]).GetAwaiter().GetResult();
+            NormDispatch("dgn_scale", scale, tensors[t], NormParams((uint)sizes[t]), sizes[t]);
     }
-
-    // TODO-PORT placeholder replaced by the u32 port below.
-    void IMultiTensorKernels.ClipScaleFromRecord(IGpuBuffer sumOfSquares, float maxNorm, IGpuBuffer scale, Gpu.NonFiniteGradientPolicy policy)
-        => ClipScaleFromSumOfSquares(sumOfSquares, maxNorm, scale);
 
     /// <inheritdoc />
     double IMultiTensorKernels.ReadSumOfSquares(IGpuBuffer sumOfSquares)
