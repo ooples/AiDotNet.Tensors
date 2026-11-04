@@ -26,7 +26,7 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 ///
 /// This REPLACES the GradientTape for compiled workloads.
 /// </summary>
-internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompiledTrainingPlanIntrospection<T>, IPingPongOwner, INonFiniteGradientPolicyTarget
+internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompiledTrainingPlanIntrospection<T>, ICompiledTrainingPlanStreamedState, IPingPongOwner, INonFiniteGradientPolicyTarget
 {
     // Phase G.4: mutable so EnableFrozenWeightOptimizations() can swap in
     // a rebuilt forward-action array using allowCachedB=true.
@@ -8729,30 +8729,47 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// <inheritdoc/>
     public byte[]? ExportOptimizerState()
     {
-        if (_disposed) throw new ObjectDisposedException(nameof(CompiledTrainingPlan<T>));
-        var checkpoint = CaptureFusedOptimizerCheckpoint();
-        if (checkpoint is null) return null;
-
         using var stream = new MemoryStream();
-        using (var writer = new BinaryWriter(stream))
+        return ExportOptimizerState(stream) ? stream.ToArray() : null;
+    }
+
+    /// <inheritdoc/>
+    public bool ExportOptimizerState(Stream destination)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CompiledTrainingPlan<T>));
+        if (destination is null) throw new ArgumentNullException(nameof(destination));
+        if (!destination.CanWrite) throw new ArgumentException("The stream is not writable.", nameof(destination));
+        var checkpoint = CaptureFusedOptimizerCheckpoint();
+        if (checkpoint is null) return false;
+
+        using (var writer = new BinaryWriter(destination, System.Text.Encoding.UTF8, leaveOpen: true))
         {
             writer.Write(OptimizerStateMagic);
             writer.Write(OptimizerStateVersion);
             FusedOptimizerCheckpointSerializer.Write(writer, checkpoint);
         }
-        return stream.ToArray();
+        return true;
     }
 
     /// <inheritdoc/>
     public void ImportOptimizerState(byte[] state)
     {
-        if (_disposed) throw new ObjectDisposedException(nameof(CompiledTrainingPlan<T>));
         if (state is null) throw new ArgumentNullException(nameof(state));
+        using var stream = new MemoryStream(state, writable: false);
+        ImportOptimizerState(stream);
+    }
+
+    /// <inheritdoc/>
+    public void ImportOptimizerState(Stream source)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CompiledTrainingPlan<T>));
+        if (source is null) throw new ArgumentNullException(nameof(source));
+        if (!source.CanRead) throw new ArgumentException("The stream is not readable.", nameof(source));
 
         FusedOptimizerCheckpoint? checkpoint;
         try
         {
-            using var reader = new BinaryReader(new MemoryStream(state, writable: false));
+            using var reader = new BinaryReader(source, System.Text.Encoding.UTF8, leaveOpen: true);
             if (reader.ReadInt32() != OptimizerStateMagic)
                 throw new InvalidDataException("The payload is not compiled optimizer state (bad magic).");
             int version = reader.ReadInt32();
