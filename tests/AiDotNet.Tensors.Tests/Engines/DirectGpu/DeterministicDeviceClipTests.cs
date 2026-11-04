@@ -122,7 +122,7 @@ public sealed class DeterministicDeviceClipTests
         {
             // Five 4M-element tensors and a 4097-element one: 5122 chunks. (Each tensor stays under 65535 * 256
             // elements, so an elementwise op keeps it on the device even where the X workgroup count is 65535.)
-            var host = Enumerable.Range(0, 5).Select(k => Random(4 << 20, 8 + k, -40, 40)).Append(Random(4097, 13, -10, 10)).ToArray();
+            var host = Enumerable.Range(0, 5).Select(k => Random(4 << 20, 8 + k, -40, 40)).Concat(new[] { Random(4097, 13, -10, 10) }).ToArray();
             for (int run = 0; run < 3; run++)
             {
                 var gradients = host.Select(h => gpu.TensorAdd(new Tensor<float>(new[] { h.Length }, new Vector<float>(h)),
