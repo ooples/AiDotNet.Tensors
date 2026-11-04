@@ -3949,6 +3949,13 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         }
     }
 
+    /// <summary>
+    /// <see cref="EnsureOwnedForWrite"/> for a write that bypasses the host write paths: an optimizer updating the
+    /// tensor's device buffer in place. A copy-on-write peer (a DeepCopy snapshot) shares the storage, its device
+    /// copy and pending download, so without the detach the update reached the snapshot as well.
+    /// </summary>
+    internal void EnsureOwnedForDeviceWrite() => EnsureOwnedForWrite();
+
     protected void EnsureOwnedForWrite()
     {
         EnsureStreamingStoreWritable();
@@ -4071,6 +4078,9 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
                     member._data = fresh;
                     member._storage = privateStorage;
                     member._cowFamily = null;
+                    // A device buffer bound to the shared storage is the peer's too: writing it (an in-place device
+                    // update reads the binding first) would reach the copy this detach exists to protect.
+                    member.InvalidateGpuBindingAfterStorageReplacement();
                     oldStorage.Release();
                     member.IncrementVersion();
                 }
