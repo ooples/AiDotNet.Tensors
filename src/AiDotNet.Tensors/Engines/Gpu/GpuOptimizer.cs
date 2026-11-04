@@ -186,6 +186,9 @@ public static class GpuOptimizer
     private static bool TryUpdateParameter(DirectGpuTensorEngine engine, IDirectGpuBackend backend, Tensor<float> param,
         Action<IGpuBuffer> update, string site)
     {
+        // Privatize a copy-on-write share (a DeepCopy snapshot) first: the in-place device write would reach it; the
+        // detach also drops the binding to the shared device buffer.
+        param.EnsureOwnedForDeviceWrite();
         var pBuf = DirectGpuTensorEngine.IsFlatParameterView(param)
             ? engine.AcquireParameterBuffer(param, out _)
             : param.TryGetGpuBuffer() ?? engine.AcquireParameterBuffer(param, out _);
@@ -255,6 +258,7 @@ public static class GpuOptimizer
             var grad = gradients[i] ?? throw new ArgumentNullException(nameof(gradients));
             if (param.Length != grad.Length)
                 throw new ArgumentException($"Parameter {i} and its gradient differ in length.", nameof(gradients));
+            param.EnsureOwnedForDeviceWrite();   // see TryUpdateParameter
             var pBuf = param.TryGetGpuBuffer();
             var gBuf = grad.TryGetGpuBuffer();
             if (pBuf is null || gBuf is null) return false;
@@ -441,6 +445,7 @@ public static class GpuOptimizer
     private static bool TryUpdateCompressedParameter(DirectGpuTensorEngine engine, IDirectGpuBackend backend,
         Tensor<float> param, Action<IGpuBuffer> update)
     {
+        param.EnsureOwnedForDeviceWrite();   // see TryUpdateParameter
         bool flat = DirectGpuTensorEngine.IsFlatParameterView(param);
         var buffer = flat ? engine.AcquireParameterBuffer(param, out _) : param.TryGetGpuBuffer();
         if (buffer is null && flat && engine.TryStageFlatParameter(param) is { } staged)
@@ -803,6 +808,7 @@ public static class GpuOptimizer
         {
             backend = engine.GetBackend();
             if (backend is null) return false;
+            param.EnsureOwnedForDeviceWrite();   // see TryUpdateParameter
             pBuf = param.TryGetGpuBuffer();
             idxBuf = sparseIndices.TryGetGpuBuffer();
             valBuf = sparseValues.TryGetGpuBuffer();

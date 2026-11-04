@@ -165,6 +165,71 @@ public sealed class GpuOptimizerFlatParameterViewTests : IClassFixture<DirectGpu
     }
 
     /// <summary>
+    /// A copy-on-write snapshot of a parameter (what a model DeepCopy takes) keeps its values through a device
+    /// optimizer step. The step wrote the parameter's device buffer in place without detaching the share, and the
+    /// snapshot read the same array, device copy and pending download, so it received the training update too.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void DeviceStep_LeavesACopyOnWriteSnapshotUnchanged(bool alreadyOnDevice)
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        var gpu = _fixture.Engine!;
+        int[] shape = { 6, 4 };
+        var param = Rand(shape, 11);
+        Tensor<float> Grad() => gpu.TensorMultiplyScalar(Rand(shape, 12), 1f);
+        // Optionally make the parameter device-bound and device-authoritative before the snapshot.
+        if (alreadyOnDevice)
+            Assert.True(GpuOptimizer.TrySgdStep(param, Grad(), 0.1f), string.Join("; ", GpuLaunchProbe.Fallbacks));
+
+        var before = param.ToArray();
+        var snapshot = (Tensor<float>)param.CloneShared();
+        Assert.True(param.IsCowShared && snapshot.IsCowShared);
+
+        Assert.True(GpuOptimizer.TryAdamWStep(param, Grad(), GpuOptimizer.CreateStateTensor(shape),
+            GpuOptimizer.CreateStateTensor(shape), 0.01f, 0.9f, 0.999f, 1e-8f, 0.01f, 1),
+            string.Join("; ", GpuLaunchProbe.Fallbacks));
+
+        Assert.Equal(before, snapshot.ToArray());
+        Assert.NotEqual(before, param.ToArray());
+    }
+
+    /// <summary>
+    /// The compressed-moment (int8) AdamW step writes the parameter's device buffer in place through its own
+    /// placement path; a copy-on-write snapshot of a device-bound parameter must keep its values through it too.
+    /// </summary>
+    [SkippableFact]
+    public void CompressedMomentStep_LeavesACopyOnWriteSnapshotUnchanged()
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        var gpu = _fixture.Engine!;
+        int[] shape = { 8, 8 };
+        const int blockSize = 32;
+        var param = Rand(shape, 13);
+        Tensor<float> Grad() => gpu.TensorMultiplyScalar(Rand(shape, 14), 1f);
+        Assert.True(GpuOptimizer.TrySgdStep(param, Grad(), 0.1f), string.Join("; ", GpuLaunchProbe.Fallbacks));
+        Skip.IfNot(GpuOptimizer.TryAllocAdam8BitState(param.Length, blockSize, out var mQ, out var vQ, out var mS, out var vS),
+            "The backend has no compressed optimizer moments.");
+        try
+        {
+            var before = param.ToArray();
+            var snapshot = (Tensor<float>)param.CloneShared();
+            bool stepped = GpuOptimizer.TryAdam8BitStep(param, Grad(), mQ, vQ, mS, vS,
+                0.01f, 0.9f, 0.999f, 1e-8f, 1f - 0.9f, 1f - 0.999f, blockSize);
+
+            Assert.Equal(before, snapshot.ToArray());
+            // A declined step (the detach drops the shared device binding) leaves the update to the caller's host path.
+            if (stepped) Assert.NotEqual(before, param.ToArray());
+        }
+        finally
+        {
+            foreach (var buffer in new[] { mQ, vQ, mS, vS })
+                if (buffer is not null) GpuOptimizer.FreeGpuBuffer(buffer);
+        }
+    }
+
+    /// <summary>
     /// A write through the vector <see cref="ParameterBuffer{T}.AsVector"/> returned, made after a GPU read uploaded
     /// the flat array, must reach the next GPU read. The version was advanced only when AsVector returned, so the
     /// device copy uploaded in between was reused with the old element.
