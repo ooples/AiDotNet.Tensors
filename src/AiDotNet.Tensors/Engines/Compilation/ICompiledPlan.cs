@@ -692,7 +692,7 @@ public interface ICompiledTrainingPlan<T> : IDisposable
     /// optimizer step (Adam's bias-correction step), LR schedule position, scalar accumulators, moment
     /// storage mode and hyperparameters. Returns <c>null</c> when no optimizer is configured.
     /// </summary>
-    /// <returns>An opaque payload for <see cref="ImportOptimizerState"/>, or <c>null</c>.</returns>
+    /// <returns>An opaque payload for <see cref="ImportOptimizerState(byte[])"/>, or <c>null</c>.</returns>
     /// <remarks>
     /// <para>
     /// A fused optimizer keeps its state inside the plan, not in the caller's optimizer object, so a
@@ -709,10 +709,10 @@ public interface ICompiledTrainingPlan<T> : IDisposable
     byte[]? ExportOptimizerState();
 
     /// <summary>
-    /// Restores fused optimizer state produced by <see cref="ExportOptimizerState"/>, reconfiguring the
+    /// Restores fused optimizer state produced by <see cref="ExportOptimizerState()"/>, reconfiguring the
     /// plan's optimizer from it. The next <see cref="Step"/> continues the exported trajectory exactly.
     /// </summary>
-    /// <param name="state">A payload from <see cref="ExportOptimizerState"/>.</param>
+    /// <param name="state">A payload from <see cref="ExportOptimizerState()"/>.</param>
     /// <exception cref="ArgumentNullException"><paramref name="state"/> is <c>null</c>.</exception>
     /// <exception cref="InvalidDataException">The payload is corrupt, empty, or was exported from a plan
     /// with a different parameter count or per-parameter state size.</exception>
@@ -762,4 +762,45 @@ public interface ICompiledTrainingPlanIntrospection<T>
     /// reads.
     /// </summary>
     IReadOnlyList<LrSchedule> LearningRateSchedules { get; }
+}
+
+/// <summary>
+/// Streams a compiled training plan's fused optimizer state to and from a <see cref="Stream"/>, so a checkpoint of
+/// any size is written and read without one in-memory copy of the payload.
+/// </summary>
+/// <remarks>
+/// <para>
+/// <see cref="ICompiledTrainingPlan{T}.ExportOptimizerState()"/> returns an array, which caps the payload at 2 GB: the
+/// moments of a few hundred million parameters exceed it. The payload format is identical, so an array written by one
+/// imports through the other.
+/// </para>
+/// <para>
+/// Separate from <see cref="ICompiledTrainingPlan{T}"/> so adding it breaks no existing implementer of that interface
+/// (default interface members are unavailable on .NET Framework). The built-in plan implements both; test for it with
+/// <c>plan is ICompiledTrainingPlanStreamedState streamed</c>.
+/// </para>
+/// </remarks>
+public interface ICompiledTrainingPlanStreamedState
+{
+    /// <summary>
+    /// Writes the same payload as <see cref="ICompiledTrainingPlan{T}.ExportOptimizerState()"/> straight to <paramref name="destination"/>,
+    /// without building it in memory first. Use it for large models: the array overload is capped at 2 GB (an array's
+    /// maximum length), which the moments of a few hundred million parameters already exceed.
+    /// </summary>
+    /// <param name="destination">A writable stream; it is left open, positioned after the payload.</param>
+    /// <returns><c>true</c> when state was written; <c>false</c> (nothing written) when no optimizer is configured.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="destination"/> is <c>null</c>.</exception>
+    /// <exception cref="ArgumentException"><paramref name="destination"/> is not writable.</exception>
+    bool ExportOptimizerState(Stream destination);
+
+    /// <summary>
+    /// Restores fused optimizer state written by <see cref="ExportOptimizerState(Stream)"/> or
+    /// <see cref="ICompiledTrainingPlan{T}.ExportOptimizerState()"/>, reading it from <paramref name="source"/> without loading the payload
+    /// into one array. The payload is read and validated completely before the plan changes.
+    /// </summary>
+    /// <param name="source">A readable stream positioned at the payload; it is left open, positioned after it.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="source"/> is <c>null</c>.</exception>
+    /// <exception cref="ArgumentException"><paramref name="source"/> is not readable.</exception>
+    /// <exception cref="InvalidDataException">The payload is corrupt or truncated, or does not match this plan.</exception>
+    void ImportOptimizerState(Stream source);
 }
