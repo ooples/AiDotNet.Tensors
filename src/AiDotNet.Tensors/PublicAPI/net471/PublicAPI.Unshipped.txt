@@ -18,3 +18,4 @@ static AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TryClipGradNorm(System.Collecti
 AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy.ZeroNonFinite = 2 -> AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy
 AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy.Error = 3 -> AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy
 static AiDotNet.Tensors.Engines.Compilation.GradientClipping.ClipGradNorm(AiDotNet.Tensors.LinearAlgebra.Tensor<float>![]! gradients, float maxNorm, AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy nonFinite) -> float
+AiDotNet.Tensors.Engines.Compilation.ICompiledTrainingPlan<T>.SetNonFiniteGradientPolicy(AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy policy) -> void

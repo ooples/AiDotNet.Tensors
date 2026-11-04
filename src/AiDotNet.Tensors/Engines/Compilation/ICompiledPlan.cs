@@ -466,6 +466,14 @@ public interface ICompiledTrainingPlan<T> : IDisposable
     void SetL2Regularization(double strength);
 
     /// <summary>
+    /// What the global-norm clip (<see cref="SetMaxGradNorm"/>) does when a gradient element is NaN or infinite:
+    /// leave the gradients unscaled (the default), propagate PyTorch's NaN/0 coefficient, zero only the NaN/Inf
+    /// elements and clip by the rest, or throw an <see cref="ArithmeticException"/> from the step naming the first
+    /// offending gradient (PyTorch's <c>error_if_nonfinite</c>).
+    /// </summary>
+    void SetNonFiniteGradientPolicy(AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy policy);
+
+    /// <summary>
     /// Continues <paramref name="previous"/>'s optimizer in this plan: its configuration, step count, LR schedule
     /// position, gradient clip, L2 strength and every per-parameter moment. Both plans must train the same parameter
     /// tensors in the same order. A training loop recompiles when the batch shape changes - most commonly the smaller

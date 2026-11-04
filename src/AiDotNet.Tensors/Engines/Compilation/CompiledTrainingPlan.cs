@@ -3153,6 +3153,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _optimizerStep = source._optimizerStep;
         SyncCapturedOptimizerStep();
         _maxGradNorm = source._maxGradNorm;
+        _nonFiniteGradientPolicy = source._nonFiniteGradientPolicy;
         target.Scalars.HypergradientAdjustment = src.Scalars.HypergradientAdjustment;
         target.Scalars.DAdaptationEstimate = src.Scalars.DAdaptationEstimate;
         target.Scalars.DAdaptationRAccum = src.Scalars.DAdaptationRAccum;
@@ -3281,6 +3282,25 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
         static Engines.DirectGpu.IGpuBuffer? CurrentDeviceBuffer(Tensor<T> t, bool capturing)
             => t.TryGetGpuBuffer() is { } buffer && (capturing || t._gpuBufferVersion == t.GpuCacheVersion) ? buffer : null;
+    }
+
+    // What the clip does with a NaN or infinite gradient element (SetNonFiniteGradientPolicy).
+    private Engines.Gpu.NonFiniteGradientPolicy _nonFiniteGradientPolicy = Engines.Gpu.NonFiniteGradientPolicy.LeaveUnscaled;
+
+    /// <summary>
+    /// What the global-norm clip (<see cref="SetMaxGradNorm"/>) does when a gradient element is NaN or infinite, on
+    /// the host and on every GPU backend alike. Default <see cref="Engines.Gpu.NonFiniteGradientPolicy.LeaveUnscaled"/>.
+    /// </summary>
+    /// <remarks><see cref="Engines.Gpu.NonFiniteGradientPolicy.Error"/> throws an <see cref="ArithmeticException"/>
+    /// from <see cref="Step"/> naming the first offending gradient (on a GPU backend it reads the norm record back each
+    /// step, as PyTorch's <c>error_if_nonfinite</c> does); the gradients are left unscaled and no update runs.
+    /// <see cref="Engines.Gpu.NonFiniteGradientPolicy.ZeroNonFinite"/> zeroes only the NaN/Inf elements and clips by
+    /// the norm of the rest, so the step's update goes ahead.</remarks>
+    public void SetNonFiniteGradientPolicy(Engines.Gpu.NonFiniteGradientPolicy policy)
+    {
+        if (!Enum.IsDefined(typeof(Engines.Gpu.NonFiniteGradientPolicy), policy))
+            throw new ArgumentOutOfRangeException(nameof(policy), policy, "Undefined non-finite gradient policy.");
+        _nonFiniteGradientPolicy = policy;
     }
 
     public void SetMaxGradNorm(double maxNorm)
@@ -11692,13 +11712,89 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 }
         }
         _hostClipSumFinite = !double.IsNaN(totalNormSq) && !double.IsInfinity(totalNormSq);
-        if (totalNormSq == 0.0) return;
-        double totalNorm = Math.Sqrt(totalNormSq);
-        if (totalNorm <= maxNorm) return;
+        double coefficient;
+        if (!_hostClipSumFinite)
+        {
+            // A NaN/Inf element (a double sum of float squares cannot overflow; double gradients can, and are then
+            // measured again scaled by their largest magnitude).
+            long nan = 0, inf = 0;
+            int first = -1;
+            double maxAbs = 0.0;
+            for (int p = 0; p < gradients.Length; p++)
+            {
+                var tensor = gradients[p];
+                if (tensor == null || SkipUnexercised(p)) continue;
+                for (int i = 0; i < tensor.Length; i++)
+                {
+                    double v = numOps.ToDouble(tensor.GetFlat(i));
+                    if (double.IsNaN(v)) nan++;
+                    else if (double.IsInfinity(v)) inf++;
+                    else { maxAbs = Math.Max(maxAbs, Math.Abs(v)); continue; }
+                    if (first < 0) first = p;
+                }
+            }
+            var policy = _nonFiniteGradientPolicy;
+            if (nan == 0 && inf == 0)
+            {
+                double scaledSq = 0.0;
+                for (int p = 0; p < gradients.Length; p++)
+                {
+                    var tensor = gradients[p];
+                    if (tensor == null || SkipUnexercised(p)) continue;
+                    for (int i = 0; i < tensor.Length; i++)
+                    {
+                        double v = numOps.ToDouble(tensor.GetFlat(i)) / maxAbs;
+                        scaledSq += v * v;
+                    }
+                }
+                _hostClipSumFinite = true;
+                _hostClipCovered.Clear();
+                double overflowNorm = Math.Sqrt(scaledSq) * maxAbs;
+                if (overflowNorm <= maxNorm) return;
+                coefficient = maxNorm / (overflowNorm + 1e-6);
+            }
+            else if (policy == Engines.Gpu.NonFiniteGradientPolicy.Error)
+                throw Engines.Gpu.GpuOptimizer.NonFiniteNormException(first, nan, inf);
+            else if (policy == Engines.Gpu.NonFiniteGradientPolicy.LeaveUnscaled)
+                return;
+            else if (policy == Engines.Gpu.NonFiniteGradientPolicy.Propagate)
+                coefficient = nan > 0 ? double.NaN : 0.0; // maxNorm / (NaN or Inf), as PyTorch multiplies through
+            else
+            {
+                // ZeroNonFinite: the NaN/Inf elements become +0 and the rest are clipped by their own norm.
+                double finiteSq = 0.0;
+                T zero = numOps.Zero;
+                for (int p = 0; p < gradients.Length; p++)
+                {
+                    var tensor = gradients[p];
+                    if (tensor == null || SkipUnexercised(p)) continue;
+                    bool changed = false;
+                    for (int i = 0; i < tensor.Length; i++)
+                    {
+                        double v = numOps.ToDouble(tensor.GetFlat(i));
+                        if (double.IsNaN(v) || double.IsInfinity(v)) { tensor.SetFlat(i, zero); changed = true; }
+                        else finiteSq += v * v;
+                    }
+                    if (changed) tensor.IncrementVersion();
+                }
+                // The guard's reuse covered the gradients before the repair; it measures them again.
+                _hostClipCovered.Clear();
+                double finiteNorm = Math.Sqrt(finiteSq);
+                if (finiteSq == 0.0 || finiteNorm <= maxNorm) return;
+                coefficient = maxNorm / (finiteNorm + 1e-6);
+            }
+        }
+        else
+        {
+            if (totalNormSq == 0.0) return;
+            double totalNorm = Math.Sqrt(totalNormSq);
+            if (totalNorm <= maxNorm) return;
+            coefficient = maxNorm / (totalNorm + 1e-6);
+        }
 
         // Step 2: scale every gradient by maxNorm / (totalNorm + 1e-6). The dense float gradients are gathered and scaled
         // in one pool dispatch (ScaleInPlaceMany), the rest in place as before.
-        T scale = numOps.FromDouble(maxNorm / (totalNorm + 1e-6));
+        T scale = numOps.FromDouble(coefficient);
         _clipFloatItems.Clear();
         for (int p = 0; p < gradients.Length; p++)
         {
@@ -11708,7 +11804,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var arr = tensor.GetCpuBackingForContiguousWrite(out int offset);
             if (offset == 0 && arr is double[] dScale)
             {
-                ScaleInPlaceVectorized(dScale, len, maxNorm / (totalNorm + 1e-6));
+                ScaleInPlaceVectorized(dScale, len, coefficient);
                 tensor.IncrementVersion();
             }
             else if (offset == 0 && arr is float[] fScale)
@@ -11719,7 +11815,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             else
                 tensor.ScaleLogicalInPlace(scale);
         }
-        ScaleInPlaceMany(_clipFloatItems, (float)(maxNorm / (totalNorm + 1e-6)), ref _clipUnits);
+        ScaleInPlaceMany(_clipFloatItems, (float)coefficient, ref _clipUnits);
         foreach (var scaled in _clipScaledTensors) scaled.IncrementVersion();
         _clipScaledTensors.Clear();
         _clipFloatItems.Clear();
@@ -12550,11 +12646,28 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 sumSquares = _clipSumSq = cb.AllocateBuffer(Engines.Gpu.DeterministicGradientNorm.RecordWords);
             }
             var scale = _clipTmp ??= cb.AllocateBuffer(1);
-            // The record and the coefficient: one launch on CUDA and HIP.
+            var policy = _nonFiniteGradientPolicy;
+            // The record and the coefficient: one launch on CUDA and HIP. Error leaves the gradients unscaled on the
+            // device and is raised here, from one read of the record (the clip runs outside graph capture).
             Engines.DirectGpu.MultiTensorArgs.NormAndClipScale(multi, buffers, sizes, sumSquares, (float)maxNorm, scale,
-                Engines.Gpu.NonFiniteGradientPolicy.LeaveUnscaled);
-            RecordClipSumOfSquares(cb, buffers, sizes);
-            multi.MultiTensorScaleByDeviceScalar(buffers, sizes, scale);
+                policy == Engines.Gpu.NonFiniteGradientPolicy.Error ? Engines.Gpu.NonFiniteGradientPolicy.LeaveUnscaled : policy);
+            if (policy == Engines.Gpu.NonFiniteGradientPolicy.Error)
+            {
+                var record = Engines.DirectGpu.MultiTensorArgs.RecordFromSlots(cb.DownloadBuffer(sumSquares));
+                if (record[Engines.Gpu.DeterministicGradientNorm.WordNonFinite] != 0)
+                {
+                    uint t = record[Engines.Gpu.DeterministicGradientNorm.WordFirstNonFiniteTensor];
+                    int first = t == uint.MaxValue ? -1 : Array.IndexOf(gradients, owners[(int)t]);
+                    throw Engines.Gpu.GpuOptimizer.NonFiniteNormException(first,
+                        record[Engines.Gpu.DeterministicGradientNorm.WordNanCount],
+                        record[Engines.Gpu.DeterministicGradientNorm.WordInfCount]);
+                }
+            }
+            bool zeroNonFinite = policy == Engines.Gpu.NonFiniteGradientPolicy.ZeroNonFinite;
+            // The record describes the gradients before the clip, so after zeroing their NaN/Inf elements it no longer
+            // stands for them: the finiteness guard then measures the repaired gradients itself.
+            if (!zeroNonFinite) RecordClipSumOfSquares(cb, buffers, sizes);
+            multi.MultiTensorClipScale(buffers, sizes, scale, zeroNonFinite);
             for (int p = 0; p < owners.Count; p++)
                 (_engine as Engines.DirectGpuTensorEngine)?.BindResidentBuffer(owners[p], buffers[p], cb);
             return true;
