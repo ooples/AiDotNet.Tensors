@@ -79,6 +79,17 @@ internal static class ConvBackwardShapeGuard
             throw new ArgumentException(
                 $"{op}: expected rank-{spatialRank + 2} gradient, input and kernel shapes and {spatialRank} strides and paddings.",
                 nameof(gradOutputShape));
+        // The kernels size their loops from inputShape's batch and the kernel's channels, so a gradient with fewer
+        // samples or other channels would be read past its end; refuse it here for every caller.
+        if (gradOutputShape[0] != inputShape[0])
+            throw new ArgumentException(
+                $"{op}: gradOutput batch is {gradOutputShape[0]}, but the input batch is {inputShape[0]}.",
+                nameof(gradOutputShape));
+        if (kernelShape[0] != inputShape[1] || kernelShape[1] != gradOutputShape[1])
+            throw new ArgumentException(
+                $"{op}: kernel channels [{kernelShape[0]}, {kernelShape[1]}] must be the input's {inputShape[1]} and the "
+                    + $"gradient's {gradOutputShape[1]} ([in, out, ...kernel]).",
+                nameof(kernelShape));
 
         var outputPadding = new int[spatialRank];
         for (int axis = 0; axis < spatialRank; axis++)
@@ -87,8 +98,9 @@ internal static class ConvBackwardShapeGuard
             if (s <= 0)
                 throw new ArgumentException($"{op}: stride {axis} must be positive, got {s}.", nameof(stride));
             int inExtent = inputShape[2 + axis], kExtent = kernelShape[2 + axis], actual = gradOutputShape[2 + axis];
-            int unpadded = (inExtent - 1) * s - 2 * padding[axis] + kExtent;
-            int gap = actual - unpadded;
+            // In 64 bits: a large stride or extent would wrap the product in 32 and could land a wrapped value in range.
+            long unpadded = (inExtent - 1L) * s - 2L * padding[axis] + kExtent;
+            long gap = actual - unpadded;
             if (gap < 0 || gap >= s)
             {
                 throw new ArgumentException(
@@ -98,7 +110,7 @@ internal static class ConvBackwardShapeGuard
                         + "No transposed forward pass produces that size.",
                     nameof(gradOutputShape));
             }
-            outputPadding[axis] = gap;
+            outputPadding[axis] = (int)gap;
         }
         return outputPadding;
     }

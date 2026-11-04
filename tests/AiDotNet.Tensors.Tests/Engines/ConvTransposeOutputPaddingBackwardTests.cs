@@ -181,6 +181,60 @@ public class ConvTransposeOutputPaddingBackwardTests : IDisposable
         }
     }
 
+    // A gradient with another batch or other channels than the input and kernel describe is refused on every engine,
+    // before a kernel sized from the input reads past the gradient's end.
+    [SkippableTheory]
+    [InlineData(false, 1, 3)]   // one sample where the input has two
+    [InlineData(false, 2, 4)]   // four channels where the kernel writes three
+    [InlineData(true, 1, 3)]
+    [InlineData(true, 2, 4)]
+    public void Backward_RefusesAMismatchedBatchOrChannels(bool onGpu, int batch, int channels)
+    {
+        IEngine engine = new CpuEngine();
+        DirectGpuTensorEngine? gpu = null;
+        if (onGpu)
+        {
+            try { gpu = new DirectGpuTensorEngine(); }
+            catch (Exception ex) when (ex is DllNotFoundException or TypeInitializationException or InvalidOperationException or NotSupportedException)
+            {
+                Skip.If(true, $"The GPU engine did not construct: {ex.GetType().Name}.");
+            }
+            Skip.IfNot(gpu is not null && gpu.IsGpuAvailable, "No GPU backend is available.");
+            engine = gpu;
+        }
+        using (gpu)
+        {
+            var kernel = Make<float>(new[] { 2, 3, 3, 3 }, Fill(54, 10));
+            var input = Make<float>(new[] { 2, 2, 5, 4 }, Fill(80, 11));
+            var dy = Make<float>(new[] { batch, channels, 10, 8 }, Fill(batch * channels * 80, 12));
+            int[] s = { 2, 2 }, p = { 1, 1 };
+            Assert.Throws<ArgumentException>(() => engine.ConvTranspose2DBackwardInput(dy, kernel, input.Shape.ToArray(), s, p));
+            Assert.Throws<ArgumentException>(() => engine.ConvTranspose2DBackwardKernel(dy, input, kernel.Shape.ToArray(), s, p));
+            var kernel3 = Make<float>(new[] { 2, 3, 3, 3, 3 }, Fill(162, 13));
+            var input3 = Make<float>(new[] { 2, 2, 3, 5, 4 }, Fill(240, 14));
+            var dy3 = Make<float>(new[] { batch, channels, 3, 10, 8 }, Fill(batch * channels * 240, 15));
+            int[] s3 = { 1, 2, 2 }, p3 = { 1, 1, 1 };
+            Assert.Throws<ArgumentException>(() => engine.ConvTranspose3DBackwardInput(dy3, kernel3, input3.Shape.ToArray(), s3, p3));
+            Assert.Throws<ArgumentException>(() => engine.ConvTranspose3DBackwardKernel(dy3, input3, kernel3.Shape.ToArray(), s3, p3));
+        }
+    }
+
+    // The relation is evaluated in 64 bits: with an input extent of 5 and a stride of 2^30, (5 − 1)·2^30 wraps to 0 in
+    // 32 bits, so a gradient of extent 3 (= 0 + k) would have passed as output padding 0.
+    [Fact]
+    public void CpuBackward_RefusesAnExtentThatOnlyFitsAfterA32BitWrap()
+    {
+        IEngine engine = new CpuEngine();
+        var kernel = Make<double>(new[] { 1, 1, 3, 3 }, Fill(9, 16));
+        var dy = Make<double>(new[] { 1, 1, 3, 3 }, Fill(9, 17));
+        int[] s = { 1 << 30, 1 << 30 }, p = { 0, 0 };
+        Assert.Throws<ArgumentException>(() => engine.ConvTranspose2DBackwardInput(dy, kernel, new[] { 1, 1, 5, 5 }, s, p));
+        var kernel3 = Make<double>(new[] { 1, 1, 3, 3, 3 }, Fill(27, 18));
+        var dy3 = Make<double>(new[] { 1, 1, 3, 3, 3 }, Fill(27, 19));
+        int[] s3 = { 1 << 30, 1 << 30, 1 << 30 }, p3 = { 0, 0, 0 };
+        Assert.Throws<ArgumentException>(() => engine.ConvTranspose3DBackwardInput(dy3, kernel3, new[] { 1, 1, 5, 5, 5 }, s3, p3));
+    }
+
     // Extents no forward produces are still refused: past the largest output padding (s − 1), or short of none.
     [Theory]
     [InlineData(2, 11)]   // (5 − 1)·2 − 2 + 3 = 9; output paddings 0 and 1 give 9 and 10, so 11 is out of reach
