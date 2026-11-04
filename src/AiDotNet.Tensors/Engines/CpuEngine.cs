@@ -20359,11 +20359,11 @@ public partial class CpuEngine : ITensorLevelEngine
         if (gradOutput is null) throw new ArgumentNullException(nameof(gradOutput));
         if (kernel is null) throw new ArgumentNullException(nameof(kernel));
 
-        // CHECKED UP FRONT, AND AS AN ARGUMENT ERROR. This used to run the whole Conv2D and only
-        // then compare shapes, throwing InvalidOperationException — which reports a caller's bad
-        // argument as an internal fault, after paying for the convolution to discover it. The
-        // relation is the standard one read backwards: ConvTranspose's forward makes gradOutput from
-        // inputShape, so a Conv2D over gradOutput must land back on inputShape.
+        // CHECKED UP FRONT, AND AS AN ARGUMENT ERROR, before paying for the convolution. ConvTranspose's forward makes
+        // gradOutput from inputShape as (in - 1) * s - 2p + k plus an output padding in [0, s), so the gradient's extent
+        // must lie in that range: anything outside it no forward pass produced, and the convolution below would floor
+        // it onto some input extent and return a wrong gradient. Inside it, the convolution's floor lands back on the
+        // input extent and the output-padding rows contribute through the taps that wrote them.
         if (stride is null) throw new ArgumentNullException(nameof(stride));
         if (padding is null) throw new ArgumentNullException(nameof(padding));
         if (inputShape is null) throw new ArgumentNullException(nameof(inputShape));
@@ -20371,45 +20371,8 @@ public partial class CpuEngine : ITensorLevelEngine
         if (stride.Length >= 2 && padding.Length >= 2
             && gradOutput.Rank == 4 && kernel.Rank == 4 && inputShape.Length == 4)
         {
-            for (int axis = 0; axis < 2; axis++)
-            {
-                if (stride[axis] <= 0) break;
-
-                // THE DIVISION MUST BE EXACT HERE, unlike the forward direction. A forward
-                // convolution genuinely floors — several input extents map to the same output — but
-                // this runs the relation BACKWARDS to recover the transposed input, and floor
-                // division silently accepts a gradOutput that no forward pass could have produced.
-                // Concretely: gradOutput 6, kernel 3, stride 2, padding 0 truncates to 2 and matches
-                // an inputShape of 2, yet the transposed forward for input 2 produces 5, not 6. The
-                // convolution downstream then drops the trailing gradient position and returns a
-                // wrong input gradient — which is exactly the silent-garbage outcome this check
-                // exists to prevent.
-                int numerator =
-                    gradOutput._shape[2 + axis] + 2 * padding[axis] - kernel._shape[2 + axis];
-
-                if (numerator < 0 || numerator % stride[axis] != 0)
-                {
-                    throw new ArgumentException(
-                        $"ConvTranspose2DBackwardInput: gradOutput spatial axis {axis} is "
-                            + $"{gradOutput._shape[2 + axis]}, which does not invert to a whole input "
-                            + $"extent for kernel {kernel._shape[2 + axis]}, stride {stride[axis]} and "
-                            + $"padding {padding[axis]} (leftover {numerator} over stride "
-                            + $"{stride[axis]}). No transposed forward pass produces that size.",
-                        nameof(gradOutput));
-                }
-
-                int expected = numerator / stride[axis] + 1;
-
-                if (expected != inputShape[2 + axis])
-                {
-                    throw new ArgumentException(
-                        $"ConvTranspose2DBackwardInput: gradOutput spatial axis {axis} is "
-                            + $"{gradOutput._shape[2 + axis]}, which convolves back to {expected}, "
-                            + $"but inputShape says {inputShape[2 + axis]}. gradOutput's spatial size "
-                            + "is fixed by inputShape, the kernel, the stride and the padding.",
-                        nameof(gradOutput));
-                }
-            }
+            ConvBackwardShapeGuard.TransposedOutputPadding(nameof(ConvTranspose2DBackwardInput),
+                gradOutput._shape, inputShape, kernel._shape, stride, padding, 2);
         }
 
         // ConvTranspose2D backward w.r.t. input is equivalent to Conv2D forward
@@ -20435,6 +20398,11 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (input == null) throw new ArgumentNullException(nameof(input));
+        // An output-padded forward's gradient is valid here too; anything else is named as the transposed op's error
+        // rather than the swapped Conv2D's.
+        if (kernelShape is { Length: 4 } && stride is { Length: >= 2 } && padding is { Length: >= 2 } && gradOutput.Rank == 4 && input.Rank == 4)
+            ConvBackwardShapeGuard.TransposedOutputPadding(nameof(ConvTranspose2DBackwardKernel),
+                gradOutput._shape, input._shape, kernelShape, stride, padding, 2);
 
         // ConvTranspose2D is the adjoint of Conv2D — its backward-w.r.t.-kernel
         // is mathematically identical to Conv2DBackwardKernel with input and
@@ -24580,6 +24548,9 @@ public partial class CpuEngine : ITensorLevelEngine
         var kernelOrig = kernel;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!kernel.IsContiguous) kernel = kernel.Contiguous();
         if (inputShape == null || inputShape.Length != 5) throw new ArgumentException("Input shape must be array of 5 elements.", nameof(inputShape));
+        // The gradient of a forward with an output padding in [0, s) is valid; the convolution's floor lands back on the
+        // input extent. Any other extent no forward produced.
+        ConvBackwardShapeGuard.TransposedOutputPadding(nameof(ConvTranspose3DBackwardInput), gradOutput._shape, inputShape, kernel._shape, stride, padding, 3);
 
         // The backward pass for transposed convolution input is equivalent to a regular Conv3D
         // with the kernel applied in the normal direction
@@ -24592,6 +24563,8 @@ public partial class CpuEngine : ITensorLevelEngine
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (kernelShape == null || kernelShape.Length != 5) throw new ArgumentException("Kernel shape must be array of 5 elements.", nameof(kernelShape));
+        // An output padding in [0, s) is valid: its rows are inside the gradient and the loops below read them.
+        ConvBackwardShapeGuard.TransposedOutputPadding(nameof(ConvTranspose3DBackwardKernel), gradOutput._shape, input._shape, kernelShape, stride, padding, 3);
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
