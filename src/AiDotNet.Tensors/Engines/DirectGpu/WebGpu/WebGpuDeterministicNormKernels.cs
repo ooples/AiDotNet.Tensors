@@ -237,6 +237,7 @@ fn dgn_to_double(x: vec4<u32>, v: i32) -> vec2<u32> {
 }
 
 fn dgn_mul(g: u32, s: u32) -> u32 {
+    if (s == 0x3F800000u) { return g; }
     let eg = (g >> 23u) & 0xFFu; let es = (s >> 23u) & 0xFFu;
     if (eg - 1u < 254u && es - 1u < 254u && eg + es >= 128u) { return bitcast<u32>(bitcast<f32>(g) * bitcast<f32>(s)); }
     let sign = (g ^ s) & 0x80000000u;

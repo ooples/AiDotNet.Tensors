@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Numerics;
 using AiDotNet.Tensors.Engines.Gpu;
 using Xunit;
@@ -186,9 +187,39 @@ public class DeterministicGradientNormReferenceTests
             if (i % 3 == 0) s &= 0x00FFFFFF;   // many subnormal and tiny scales
             float expected = F(g) * F(s);
             uint got = N.Mul(g, s);
-            if (float.IsNaN(expected)) Assert.Equal(0x7FC00000u, got);
+            if (s == 0x3F800000u) Assert.Equal(g, got);   // unscaled: the element keeps its bits
+            else if (float.IsNaN(expected)) Assert.Equal(0x7FC00000u, got);
             else Assert.Equal(N.SingleToUInt32Bits(expected), got);
         }
+    }
+
+    [Theory]
+    [MemberData(nameof(Cases))]
+    public void CpuClipGradNorm_MatchesTheReferenceBitForBit(float[][] tensors, float maxNorm)
+    {
+        var grads = tensors.Select(t => new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(new[] { t.Length },
+            new AiDotNet.Tensors.LinearAlgebra.Vector<float>((float[])t.Clone()))).ToArray();
+        uint[] r = N.Compute(tensors, maxNorm);
+        float norm = AiDotNet.Tensors.Engines.Compilation.GradientClipping.ClipGradNorm(grads, maxNorm);
+        Assert.Equal(r[N.WordNorm], N.SingleToUInt32Bits(norm));
+        for (int t = 0; t < tensors.Length; t++)
+        {
+            var after = grads[t].ToArray();
+            for (int i = 0; i < after.Length; i++)
+                Assert.Equal(N.Mul(N.SingleToUInt32Bits(tensors[t][i]), r[N.WordScale]), N.SingleToUInt32Bits(after[i]));
+        }
+    }
+
+    [Fact]
+    public void CpuClipGradNorm_LargeTensor_ParallelChunksMatchTheSerialReference()
+    {
+        var big = Random(3_000_001, 1e3, 11);
+        var grads = new[] { new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(new[] { big.Length },
+            new AiDotNet.Tensors.LinearAlgebra.Vector<float>((float[])big.Clone())) };
+        uint[] r = N.Compute(new[] { big }, 1f);
+        Assert.Equal(r[N.WordNorm], N.SingleToUInt32Bits(AiDotNet.Tensors.Engines.Compilation.GradientClipping.ClipGradNorm(grads, 1f)));
+        var after = grads[0].ToArray();
+        for (int i = 0; i < after.Length; i += 997) Assert.Equal(N.Mul(N.SingleToUInt32Bits(big[i]), r[N.WordScale]), N.SingleToUInt32Bits(after[i]));
     }
 
     // ---- big-integer oracles ----

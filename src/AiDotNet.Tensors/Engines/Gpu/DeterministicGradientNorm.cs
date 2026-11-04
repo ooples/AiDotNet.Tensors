@@ -87,6 +87,46 @@ internal static class DeterministicGradientNorm
         return h;
     }
 
+    /// <summary>The partials of one host tensor's chunks into <paramref name="dest"/> from <paramref name="offset"/>,
+    /// over the thread pool when the tensor is large (chunks are independent; their order changes no bit).</summary>
+    public static unsafe void ChunkPartials(float* data, int length, uint tensor, Partial[] dest, int offset)
+    {
+        int chunks = ChunkCount(length);
+        if (chunks <= 8)
+        {
+            for (int c = 0; c < chunks; c++)
+                dest[offset + c] = ChunkPartial(new ReadOnlySpan<float>(data + (long)c * Chunk, Math.Min(Chunk, length - c * Chunk)), tensor);
+            return;
+        }
+        var p = (IntPtr)data;
+        System.Threading.Tasks.Parallel.For(0, chunks, c =>
+        {
+            var basePtr = (float*)p;
+            dest[offset + c] = ChunkPartial(new ReadOnlySpan<float>(basePtr + (long)c * Chunk, Math.Min(Chunk, length - c * Chunk)), tensor);
+        });
+    }
+
+    /// <summary>Multiplies <paramref name="data"/> in place by the record's scale (<see cref="Mul"/>); a scale of
+    /// exactly 1 leaves it untouched.</summary>
+    public static unsafe void Scale(float* data, int length, uint scale)
+    {
+        if (scale == 0x3F800000u) return;
+        var u = (uint*)data;
+        if (length < 65536)
+        {
+            for (int i = 0; i < length; i++) u[i] = Mul(u[i], scale);
+            return;
+        }
+        var p = (IntPtr)data;
+        int blocks = (length + 65535) / 65536;
+        System.Threading.Tasks.Parallel.For(0, blocks, b =>
+        {
+            var q = (uint*)p;
+            int end = Math.Min(length, (b + 1) * 65536);
+            for (int i = b * 65536; i < end; i++) q[i] = Mul(q[i], scale);
+        });
+    }
+
     public static Partial ChunkPartial(ReadOnlySpan<float> chunk, uint tensor)
     {
         var p = new Partial { Tensor = tensor, Emax = 1 };
@@ -257,9 +297,11 @@ internal static class DeterministicGradientNorm
     }
 
     /// <summary>g * s as one IEEE fp32 multiply (ties to even, subnormals kept), with NaN results canonical
-    /// (0x7FC00000) so they too have the same bits everywhere; the kernels' dgn_mul.</summary>
+    /// (0x7FC00000) so they too have the same bits everywhere, and g itself when s is exactly 1; the kernels'
+    /// dgn_mul.</summary>
     public static uint Mul(uint g, uint s)
     {
+        if (s == 0x3F800000u) return g;   // unscaled: every element, NaN payloads included, keeps its bits
         uint eg = (g >> 23) & 0xFF, es = (s >> 23) & 0xFF;
         uint fg = g & 0x7FFFFF, fs = s & 0x7FFFFF, sign = (g ^ s) & 0x80000000u;
         if ((eg == 0xFF && fg != 0) || (es == 0xFF && fs != 0)) return 0x7FC00000;

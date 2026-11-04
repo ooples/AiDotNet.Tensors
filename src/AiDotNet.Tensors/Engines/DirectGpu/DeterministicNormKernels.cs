@@ -249,6 +249,7 @@ FN void dgn_to_double(U64 alo, U64 ahi, int v, PPTR(U32) wlo, PPTR(U32) whi)
 // g * s, one IEEE multiply rounded to nearest even, with subnormal operands and results kept (no flush to zero).
 FN U32 dgn_mul(U32 g, U32 s)
 {
+    if (s == 0x3F800000u) return g;   // unscaled: every element, NaN payloads included, keeps its bits
     U32 eg = (g >> 23) & 0xFFu, es = (s >> 23) & 0xFFu;
     if (eg - 1u < 254u && es - 1u < 254u && eg + es >= 128u) return AS_UINT(AS_FLOAT(g) * AS_FLOAT(s));
     U32 sign = (g ^ s) & 0x80000000u;

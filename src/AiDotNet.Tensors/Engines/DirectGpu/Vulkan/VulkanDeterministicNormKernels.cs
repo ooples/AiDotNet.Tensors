@@ -226,6 +226,7 @@ uvec2 dgn_to_double(uvec4 a, int v)
 
 uint dgn_mul(uint g, uint s)
 {
+    if (s == 0x3F800000u) return g;   // unscaled: every element, NaN payloads included, keeps its bits
     uint eg = (g >> 23) & 0xFFu, es = (s >> 23) & 0xFFu;
     if (eg - 1u < 254u && es - 1u < 254u && eg + es >= 128u)
     {

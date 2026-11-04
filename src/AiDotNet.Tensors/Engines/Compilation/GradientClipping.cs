@@ -33,64 +33,63 @@ public static class GradientClipping
                 "Maximum gradient norm must be non-negative and not NaN.");
         if (gradients is null || gradients.Length == 0) return 0f;
 
-        // Step 1: Compute total L2 norm across all gradient tensors
-        // Squaring a finite float around 1e20 overflows float. Double covers
-        // the entire float domain and still uses SIMD in SumSquares below.
-        double totalNormSq = 0d;
+        // The device clip's definition (DeterministicGradientNorm), so the CPU and every GPU backend produce the same
+        // norm, coefficient and clipped gradients, bit for bit: exact and overflow-free, in integers. A non-finite
+        // element leaves the gradients unscaled (NonFiniteGradientPolicy.LeaveUnscaled), as the device clip does.
+        int total = 0;
+        for (int g = 0; g < gradients.Length; g++)
+            if (gradients[g] is { Length: > 0 } t) total += Gpu.DeterministicGradientNorm.ChunkCount(t.Length);
+        var partials = new Gpu.DeterministicGradientNorm.Partial[total];
+        var copies = new float[]?[gradients.Length];
+        int offset = 0;
+        uint index = 0;
         for (int g = 0; g < gradients.Length; g++)
         {
-            if (gradients[g] is null) continue;
             var grad = gradients[g];
+            if (grad is null || grad.Length == 0) continue;
             if (grad.TryGetContiguousSpan(out var logical))
             {
-                totalNormSq += SumSquares(logical);
+                fixed (float* p = logical)
+                    Gpu.DeterministicGradientNorm.ChunkPartials(p, logical.Length, index, partials, offset);
             }
             else
             {
-                // Non-contiguous views cannot expose one logical span. Copy into a
-                // pooled scratch buffer so stride traversal remains correct without
-                // creating a persistent tensor or a full-size GC allocation.
-                var scratch = System.Buffers.ArrayPool<float>.Shared.Rent(grad.Length);
-                try
-                {
-                    var logicalCopy = scratch.AsSpan(0, grad.Length);
-                    grad.CopyLogicalTo(logicalCopy);
-                    totalNormSq += SumSquares(logicalCopy);
-                }
-                finally
-                {
-                    System.Buffers.ArrayPool<float>.Shared.Return(scratch);
-                }
+                // Non-contiguous views cannot expose one logical span: reduce (and later scale) a logical copy.
+                var copy = copies[g] = new float[grad.Length];
+                grad.CopyLogicalTo(copy);
+                fixed (float* p = copy)
+                    Gpu.DeterministicGradientNorm.ChunkPartials(p, copy.Length, index, partials, offset);
             }
+            offset += Gpu.DeterministicGradientNorm.ChunkCount(grad.Length);
+            index++;
         }
+        var record = Gpu.DeterministicGradientNorm.Combine(partials, maxNorm);
+        uint scale = record[Gpu.DeterministicGradientNorm.WordScale];
 
-        double totalNorm = Math.Sqrt(totalNormSq);
-
-        // Step 2: If norm exceeds maxNorm, scale all gradients down
-        if (totalNorm > maxNorm)
+        if (scale != 0x3F800000u)
         {
-            float scale = (float)(maxNorm / (totalNorm + 1e-6d));
             for (int g = 0; g < gradients.Length; g++)
             {
-                if (gradients[g] is null) continue;
                 var grad = gradients[g];
+                if (grad is null || grad.Length == 0) continue;
                 if (grad.IsContiguous)
                 {
                     // AsWritableSpan is the single write-intent gate: it applies COW,
                     // respects a view's offset, excludes ArrayPool padding, and works
                     // for managed and native CPU storage.
                     using var gradKeep1 = new KeepAliveScope(grad);
-                    Scale(grad.AsWritableSpanUnmarked(), scale);
+                    var span = grad.AsWritableSpanUnmarked();
+                    fixed (float* p = span) Gpu.DeterministicGradientNorm.Scale(p, span.Length, scale);
                     grad.IncrementVersion();
                 }
                 else
                 {
-                    grad.ScaleLogicalInPlace(scale);
+                    grad.ScaleLogicalInPlace(Gpu.DeterministicGradientNorm.UInt32BitsToSingle(scale));
                 }
             }
         }
 
-        return (float)totalNorm;
+        return Gpu.DeterministicGradientNorm.UInt32BitsToSingle(record[Gpu.DeterministicGradientNorm.WordNorm]);
     }
 
     /// <summary>
