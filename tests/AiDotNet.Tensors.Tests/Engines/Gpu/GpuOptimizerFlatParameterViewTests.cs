@@ -197,7 +197,8 @@ public sealed class GpuOptimizerFlatParameterViewTests : IClassFixture<DirectGpu
 
     /// <summary>
     /// The compressed-moment (int8) AdamW step writes the parameter's device buffer in place through its own
-    /// placement path; a copy-on-write snapshot of a device-bound parameter must keep its values through it too.
+    /// placement path; a copy-on-write snapshot of a device-bound parameter must keep its values through it too, and the
+    /// detached parameter must still be stepped on the device.
     /// </summary>
     [SkippableFact]
     public void CompressedMomentStep_LeavesACopyOnWriteSnapshotUnchanged()
@@ -215,12 +216,14 @@ public sealed class GpuOptimizerFlatParameterViewTests : IClassFixture<DirectGpu
         {
             var before = param.ToArray();
             var snapshot = (Tensor<float>)param.CloneShared();
-            bool stepped = GpuOptimizer.TryAdam8BitStep(param, Grad(), mQ, vQ, mS, vS,
-                0.01f, 0.9f, 0.999f, 1e-8f, 1f - 0.9f, 1f - 0.999f, blockSize);
+            // The detach drops the shared device binding; the step must place the private copy, not decline.
+            Assert.True(GpuOptimizer.TryAdam8BitStep(param, Grad(), mQ, vQ, mS, vS,
+                0.01f, 0.9f, 0.999f, 1e-8f, 1f - 0.9f, 1f - 0.999f, blockSize),
+                string.Join("; ", GpuLaunchProbe.Fallbacks));
+            Assert.True(gpu.IsDeviceAuthoritative(param));
 
             Assert.Equal(before, snapshot.ToArray());
-            // A declined step (the detach drops the shared device binding) leaves the update to the caller's host path.
-            if (stepped) Assert.NotEqual(before, param.ToArray());
+            Assert.NotEqual(before, param.ToArray());
         }
         finally
         {

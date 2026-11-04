@@ -442,32 +442,10 @@ public static class GpuOptimizer
         if (buffer is IDisposable d) d.Dispose();
     }
 
-    private static bool TryUpdateCompressedParameter(DirectGpuTensorEngine engine, IDirectGpuBackend backend,
-        Tensor<float> param, Action<IGpuBuffer> update)
-    {
-        param.EnsureOwnedForDeviceWrite();   // see TryUpdateParameter
-        bool flat = DirectGpuTensorEngine.IsFlatParameterView(param);
-        var buffer = flat ? engine.AcquireParameterBuffer(param, out _) : param.TryGetGpuBuffer();
-        if (buffer is null && flat && engine.TryStageFlatParameter(param) is { } staged)
-        {
-            using (staged)
-            {
-                update(staged.Staged);
-                backend.Copy(staged.Staged, 0, staged.FlatBuffer, staged.Offset, param.Length);
-            }
-            MarkParameterUpdated(engine, backend, param, staged.FlatBuffer);
-            return true;
-        }
-        if (buffer is null) return false;
-        update(buffer);
-        MarkParameterUpdated(engine, backend, param, buffer);
-        return true;
-    }
-
-
     /// <summary>
     /// GPU-resident 8-bit Adam step: dequantize, update and requantize without host moment downloads.
-    /// Returns false when parameters or gradients are not resident, state is missing, or the backend lacks support.
+    /// A host-authoritative parameter is placed on the device as every fused step does. Returns false when the gradient is
+    /// not resident, the parameter cannot be placed, state is missing, or the backend lacks support.
     /// </summary>
     public static bool TryAdam8BitStep(Tensor<float> p, Tensor<float> g,
         DirectGpu.IGpuBuffer? mQ, DirectGpu.IGpuBuffer? vQ, DirectGpu.IGpuBuffer? mScales, DirectGpu.IGpuBuffer? vScales,
@@ -494,8 +472,9 @@ public static class GpuOptimizer
         var gb = g.TryGetGpuBuffer();
         if (gb is null) return false;
         int nb = HostCompressedMomentAdam.BlockCount(p.Length, blockSize);
-        return TryUpdateCompressedParameter(e, cb, p, pb => cb.Adam8BitUpdate(pb, gb, mQ, vQ, mScales, vScales,
-            lr, beta1, beta2, epsilon, 1f - beta1, 1f - beta2, biasCorrection1, biasCorrection2, blockSize, p.Length, nb));
+        return TryUpdateParameter(e, cb, p, pb => cb.Adam8BitUpdate(pb, gb, mQ, vQ, mScales, vScales,
+            lr, beta1, beta2, epsilon, 1f - beta1, 1f - beta2, biasCorrection1, biasCorrection2, blockSize, p.Length, nb),
+            "TryAdam8BitStep");
     }
 
     /// <summary>
@@ -531,9 +510,9 @@ public static class GpuOptimizer
         var gb = g.TryGetGpuBuffer();
         if (gb is null) return false;
         int nb = HostCompressedMomentAdam.BlockCount(p.Length, blockSize);
-        return TryUpdateCompressedParameter(e, db, p, pb => db.Adam8BitUpdate(pb, gb, mQ, vQ, mScales, vScales,
+        return TryUpdateParameter(e, db, p, pb => db.Adam8BitUpdate(pb, gb, mQ, vQ, mScales, vScales,
             lr, beta1, beta2, epsilon, 1f - beta1, 1f - beta2, biasCorrection1, biasCorrection2, blockSize, p.Length, nb,
-            weightDecay, decoupledWeightDecay));
+            weightDecay, decoupledWeightDecay), "TryAdam8BitStep");
     }
 
     /// <summary>
@@ -567,8 +546,9 @@ public static class GpuOptimizer
     /// GPU-resident Adam (<paramref name="decoupledWeightDecay"/> false: L2 decay into the gradient) or AdamW
     /// (true: decoupled decay) step with bfloat16 moments from <see cref="TryAllocBf16MomentState"/>: the update math
     /// is fp32 and the new moments are stored round-to-nearest-even. <paramref name="step"/> is the 1-based step the
-    /// bias corrections use; step 1 ignores the stored moments. Returns false (CPU fallback) when param/grad are not
-    /// GPU-resident, a moment buffer is null, or the backend has no compressed-moment kernels.
+    /// bias corrections use; step 1 ignores the stored moments. A host-authoritative parameter is placed on the device as
+    /// every fused step does. Returns false (CPU fallback) when the gradient is not GPU-resident, the parameter cannot be
+    /// placed, a moment buffer is null, or the backend has no compressed-moment kernels.
     /// </summary>
     public static bool TryAdamBf16Step(Tensor<float> p, Tensor<float> g, DirectGpu.IGpuBuffer? m, DirectGpu.IGpuBuffer? v,
         float lr, float beta1, float beta2, float epsilon, float weightDecay, int step, bool decoupledWeightDecay)
@@ -586,13 +566,13 @@ public static class GpuOptimizer
         if (e.GetBackend() is not ICompressedMomentGpuOptimizerBackend cb) return false;
         var gb = g.TryGetGpuBuffer();
         if (gb is null) return false;
-        return TryUpdateCompressedParameter(e, cb, p, pb =>
+        return TryUpdateParameter(e, cb, p, pb =>
         {
             if (decoupledWeightDecay)
                 cb.AdamWUpdateBf16(pb, gb, m, v, lr, beta1, beta2, epsilon, weightDecay, step, p.Length);
             else
                 cb.AdamUpdateBf16(pb, gb, m, v, lr, beta1, beta2, epsilon, weightDecay, step, p.Length);
-        });
+        }, "TryAdamBf16Step");
     }
 
     // ---- GPU-resident steps for the rest of the backend optimizer kernels (same contract as TryAdamStep:
