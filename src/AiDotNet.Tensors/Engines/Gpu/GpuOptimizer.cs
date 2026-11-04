@@ -295,6 +295,8 @@ public static class GpuOptimizer
     {
         if (gradients is null) throw new ArgumentNullException(nameof(gradients));
         if (!(maxNorm > 0) || double.IsInfinity(maxNorm)) throw new ArgumentOutOfRangeException(nameof(maxNorm), "The norm bound must be positive and finite.");
+        if (!Enum.IsDefined(typeof(NonFiniteGradientPolicy), nonFinite))
+            throw new ArgumentOutOfRangeException(nameof(nonFinite), nonFinite, "Undefined non-finite gradient policy.");
         // The device kernels take the bound as a float: past float.MaxValue it would narrow to infinity and the
         // coefficient to 1, leaving a norm above the bound unclipped. Such a bound is clipped on the host, in double.
         if (maxNorm > float.MaxValue) return null;
@@ -369,14 +371,17 @@ public static class GpuOptimizer
         }
         // The handle keeps the scratch buffers alive past the queued launches that read them.
         var norm = new DeviceGradientNorm(multi, sumOfSquares, scale, gradientIndex.ToArray());
-        if (clipTo is not null && nonFinite == NonFiniteGradientPolicy.Error && !norm.IsFinite)
+        try
         {
-            int first = norm.FirstNonFiniteGradient;
-            long nan = norm.NanCount, inf = norm.InfinityCount;
-            norm.Dispose();
-            throw NonFiniteNormException(first, nan, inf);
+            if (clipTo is not null && nonFinite == NonFiniteGradientPolicy.Error && !norm.IsFinite)
+                throw NonFiniteNormException(norm.FirstNonFiniteGradient, norm.NanCount, norm.InfinityCount);
+            return norm;
         }
-        return norm;
+        catch
+        {
+            norm.Dispose();
+            throw;
+        }
     }
 
     /// <summary>The <see cref="NonFiniteGradientPolicy.Error"/> exception (PyTorch's error_if_nonfinite message, with

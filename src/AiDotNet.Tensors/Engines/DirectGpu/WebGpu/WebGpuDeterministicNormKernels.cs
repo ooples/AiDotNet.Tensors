@@ -195,6 +195,7 @@ fn dgn_sqrt(x: vec4<u32>, v: i32) -> Sq {
 }
 
 fn dgn_clip_coef(nm: u32, ne: i32, ns: bool, mb: u32) -> u32 {
+    if (mb == 0x7F800000u) { return 0x3F800000u; }
     let n = dgn_round24(vec2<u32>(nm, 0u), ne, ns);
     let d = dgn_addround24(n.m, n.e, 0x8637BDu, 107 - 150);
     let me = (mb >> 23u) & 0xFFu;

@@ -181,6 +181,7 @@ void dgn_sqrt(uvec4 a, int v, out uint m, out int e, out bool sticky)
 
 uint dgn_clip_coef(uint nm, int ne, bool ns, uint mb)
 {
+    if (mb == 0x7F800000u) return 0x3F800000u;
     uint nM, dM; int nE, dE;
     dgn_round24(uvec2(nm, 0u), ne, ns, nM, nE);
     dgn_addround24(nM, nE, 0x8637BDu, 107 - 150, dM, dE);

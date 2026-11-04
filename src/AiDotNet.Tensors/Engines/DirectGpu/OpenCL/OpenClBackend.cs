@@ -14439,6 +14439,12 @@ KERNEL VARIANTS (A/B testing):
             DisposeCompiledCodegenKernels();
             _dynamicGemm?.Dispose();
             ReleaseWinogradFilterCache();
+            lock (_normPartialsLock)
+            {
+                Synchronize();
+                _normPartials?.Dispose();
+                _normPartials = null;
+            }
             _bufferPool.Dispose();
             lock (_constantIntTablesGate)
             {

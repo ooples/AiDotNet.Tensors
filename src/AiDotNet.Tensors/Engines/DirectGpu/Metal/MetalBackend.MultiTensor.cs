@@ -33,27 +33,32 @@ public sealed partial class MetalBackend : IMultiTensorKernels
     // The deterministic norm record (Gpu.DeterministicGradientNorm): per-tensor chunk reductions, then one combine.
     void IMultiTensorKernels.MultiTensorSumOfSquares(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer record)
     {
-        ThrowIfDisposed();
-        MultiTensorArgs.ValidateRecordBuffer(record);
-        MultiTensorArgs.Validate(tensors, sizes);
-        int total = 0;
-        for (int t = 0; t < sizes.Count; t++) total += Gpu.DeterministicGradientNorm.ChunkCount(sizes[t]);
-        int words = Math.Max(1, total) * Gpu.DeterministicGradientNorm.PartialWords;
-        if (_normPartials is not { } partials || partials.Size < words)
+        lock (_lock)
         {
-            _normPartials?.Dispose();
-            partials = _normPartials = AllocateBuffer(Math.Max(words, 64 * Gpu.DeterministicGradientNorm.PartialWords));
+            ThrowIfDisposed();
+            MultiTensorArgs.ValidateRecordBuffer(record);
+            MultiTensorArgs.Validate(tensors, sizes);
+            int total = 0;
+            for (int t = 0; t < sizes.Count; t++) total += Gpu.DeterministicGradientNorm.ChunkCount(sizes[t]);
+            int words = Math.Max(1, total) * Gpu.DeterministicGradientNorm.PartialWords;
+            if (_normPartials is not { } partials || partials.Size < words)
+            {
+                if (_normPartials is not null) Synchronize();
+                var grown = AllocateBuffer(Math.Max(words, 64 * Gpu.DeterministicGradientNorm.PartialWords));
+                _normPartials?.Dispose();
+                partials = _normPartials = grown;
+            }
+            uint first = 0;
+            for (int t = 0; t < tensors.Count; t++)
+            {
+                uint chunks = (uint)Gpu.DeterministicGradientNorm.ChunkCount(sizes[t]);
+                DispatchNormGroups("dgn_chunk_partials_tensor", chunks, DeterministicNormKernels.GroupSize,
+                    new[] { tensors[t], partials }, (uint)sizes[t], (uint)t, first);
+                first += chunks;
+            }
+            DispatchNormGroups("dgn_finish", 1, DeterministicNormKernels.GroupSize, new[] { partials, record },
+                (uint)total, (uint)Gpu.DeterministicGradientNorm.Headroom(total));
         }
-        uint first = 0;
-        for (int t = 0; t < tensors.Count; t++)
-        {
-            uint chunks = (uint)Gpu.DeterministicGradientNorm.ChunkCount(sizes[t]);
-            DispatchNormGroups("dgn_chunk_partials_tensor", chunks, DeterministicNormKernels.GroupSize,
-                new[] { tensors[t], partials }, (uint)sizes[t], (uint)t, first);
-            first += chunks;
-        }
-        DispatchNormGroups("dgn_finish", 1, DeterministicNormKernels.GroupSize, new[] { partials, record },
-            (uint)total, (uint)Gpu.DeterministicGradientNorm.Headroom(total));
     }
 
     // The finiteness reduction IDeviceScalarOps promises (a double in two slots).

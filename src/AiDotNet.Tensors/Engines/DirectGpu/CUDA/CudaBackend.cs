@@ -303,6 +303,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private IntPtr _audioModule;
     private IntPtr _linalgModule;
     private IntPtr _annModule;
+    private IntPtr _deterministicNormModule;
     private bool _disposed;
 
     // Process-exit guard: at process/AppDomain teardown the CUDA driver may already be unloaded, so calling ANY
@@ -1323,7 +1324,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // so every optimizer silently fell back to the CPU weight update.
         CompileKernelModule(device, CudaOptimizerKernels.GetSource(), "optimizer_kernels", CudaOptimizerKernels.GetKernelNames());
         // The deterministic global-norm clip: integer arithmetic only, so the same bits on every device (DeterministicNormKernels).
-        CompileKernelModule(device, DeterministicNormKernels.Source(DeterministicNormKernels.Dialect.Cuda), "deterministic_norm_kernels",
+        _deterministicNormModule = CompileKernelModule(device, DeterministicNormKernels.Source(DeterministicNormKernels.Dialect.Cuda), "deterministic_norm_kernels",
             DeterministicNormKernels.CudaKernelNames);
 
         // Compile reduction kernels (mean, variance, std, norm, logsumexp, product, cumsum)
@@ -19300,6 +19301,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         {
             CudaNativeBindings.cuModuleUnload(_annModule);
             _annModule = IntPtr.Zero;
+        }
+        if (_deterministicNormModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_deterministicNormModule);
+            _deterministicNormModule = IntPtr.Zero;
         }
 
         if (_cudaContext != IntPtr.Zero)

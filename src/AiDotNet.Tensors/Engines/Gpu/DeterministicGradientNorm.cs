@@ -77,7 +77,7 @@ internal static class DeterministicGradientNorm
     }
 
     /// <summary>Number of chunks of a tensor of <paramref name="length"/> elements.</summary>
-    public static int ChunkCount(int length) => (length + Chunk - 1) / Chunk;
+    public static int ChunkCount(int length) => (int)(((long)length + Chunk - 1) / Chunk);
 
     /// <summary>The combine's headroom bits, ceil(log2(partials)).</summary>
     public static int Headroom(int partials)
@@ -134,7 +134,12 @@ internal static class DeterministicGradientNorm
         {
             uint b = SingleToUInt32Bits(chunk[i]);
             uint e = (b >> 23) & 0xFF;
-            if (e == 0xFF) { if ((b & 0x7FFFFF) != 0) p.NanCount = SatAdd(p.NanCount, 1); else p.InfCount = SatAdd(p.InfCount, 1); continue; }
+            if (e == 0xFF)
+            {
+                if ((b & 0x7FFFFF) != 0) p.NanCount = SatAdd(p.NanCount, 1);
+                else p.InfCount = SatAdd(p.InfCount, 1);
+                continue;
+            }
             if (e == 0) e = 1;
             if (e > p.Emax) p.Emax = e;
         }
@@ -248,6 +253,7 @@ internal static class DeterministicGradientNorm
     /// <summary>The clip coefficient min(1, fp32(maxNorm / fp32(fp32(norm) + 1e-6f))) as fp32 bits.</summary>
     public static uint ClipScale(ulong nm, int ne, bool ns, float maxNorm)
     {
+        if (float.IsPositiveInfinity(maxNorm)) return 0x3F800000;
         // n = fp32(norm) with an unbounded exponent, as 24-bit significand nM * 2^nE.
         Round24(nm, ne, ns, out ulong nM, out int nE);
         // d = fp32(n + 1e-6f). 1e-6f = 0x358637BD = 0x8637BD * 2^(107 - 150).

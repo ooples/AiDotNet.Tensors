@@ -300,7 +300,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
             _normLibrary = _shaderLibrary.CompileLibrary("DeterministicNorm",
                 DeterministicNormKernels.Source(DeterministicNormKernels.Dialect.Metal));
         }
-        catch (Exception ex)
+        catch (InvalidOperationException ex)
         {
             System.Diagnostics.Debug.WriteLine($"Metal deterministic-norm pre-compilation warning: {ex.Message}");
             _normLibrary = IntPtr.Zero;
@@ -1927,6 +1927,9 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
 
             // Dispose shader library
             _shaderLibrary?.Dispose();
+
+            _normPartials?.Dispose();
+            _normPartials = null;
 
             // Dispose command queue
             _commandQueue?.Dispose();

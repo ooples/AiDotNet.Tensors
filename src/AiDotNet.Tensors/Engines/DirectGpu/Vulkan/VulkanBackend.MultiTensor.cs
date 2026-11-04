@@ -13,27 +13,32 @@ public sealed partial class VulkanBackend : IMultiTensorKernels
 
     public void MultiTensorSumOfSquares(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer sumOfSquares)
     {
-        EnsureInitialized();
-        MultiTensorArgs.ValidateRecordBuffer(sumOfSquares);
-        MultiTensorArgs.Validate(tensors, sizes);
-        int total = 0;
-        for (int t = 0; t < sizes.Count; t++) total += Gpu.DeterministicGradientNorm.ChunkCount(sizes[t]);
-        int words = Math.Max(1, total) * Gpu.DeterministicGradientNorm.PartialWords;
-        if (_normPartials is not { } partials || partials.Size < words)
+        lock (_computeLock)
         {
-            _normPartials?.Dispose();
-            partials = _normPartials = AllocateBuffer(Math.Max(words, 64 * Gpu.DeterministicGradientNorm.PartialWords));
+            EnsureInitialized();
+            MultiTensorArgs.ValidateRecordBuffer(sumOfSquares);
+            MultiTensorArgs.Validate(tensors, sizes);
+            int total = 0;
+            for (int t = 0; t < sizes.Count; t++) total += Gpu.DeterministicGradientNorm.ChunkCount(sizes[t]);
+            int words = Math.Max(1, total) * Gpu.DeterministicGradientNorm.PartialWords;
+            if (_normPartials is not { } partials || partials.Size < words)
+            {
+                if (_normPartials is not null) Synchronize();
+                var grown = AllocateBuffer(Math.Max(words, 64 * Gpu.DeterministicGradientNorm.PartialWords));
+                _normPartials?.Dispose();
+                partials = _normPartials = grown;
+            }
+            uint first = 0;
+            for (int t = 0; t < tensors.Count; t++)
+            {
+                int chunks = Gpu.DeterministicGradientNorm.ChunkCount(sizes[t]);
+                GlslUnaryOp(VulkanDeterministicNormKernels.ChunkPartials, tensors[t], partials,
+                    chunks * DeterministicNormKernels.GroupSize, new[] { (uint)sizes[t], (uint)t, first }, 3 * sizeof(uint));
+                first += (uint)chunks;
+            }
+            GlslUnaryOp(VulkanDeterministicNormKernels.Finish, partials, sumOfSquares, DeterministicNormKernels.GroupSize,
+                new[] { (uint)total, (uint)Gpu.DeterministicGradientNorm.Headroom(total) }, 2 * sizeof(uint));
         }
-        uint first = 0;
-        for (int t = 0; t < tensors.Count; t++)
-        {
-            int chunks = Gpu.DeterministicGradientNorm.ChunkCount(sizes[t]);
-            GlslUnaryOp(VulkanDeterministicNormKernels.ChunkPartials, tensors[t], partials,
-                chunks * DeterministicNormKernels.GroupSize, new[] { (uint)sizes[t], (uint)t, first }, 3 * sizeof(uint));
-            first += (uint)chunks;
-        }
-        GlslUnaryOp(VulkanDeterministicNormKernels.Finish, partials, sumOfSquares, DeterministicNormKernels.GroupSize,
-            new[] { (uint)total, (uint)Gpu.DeterministicGradientNorm.Headroom(total) }, 2 * sizeof(uint));
     }
 
     public void ClipScaleFromSumOfSquares(IGpuBuffer sumOfSquares, float maxNorm, IGpuBuffer scale)

@@ -26,41 +26,51 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
 
         private IGpuBuffer? _normPartials;
+        private readonly object _normPartialsLock = new();
 
         // The deterministic norm record (Gpu.DeterministicGradientNorm): one chunk-reduction launch per tensor writes
         // that tensor's partials, then one group combines them all.
         public void MultiTensorSumOfSquares(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer sumOfSquares)
         {
-            MultiTensorArgs.ValidateRecordBuffer(sumOfSquares);
-            MultiTensorArgs.Validate(tensors, sizes);
-            int total = 0;
-            for (int t = 0; t < sizes.Count; t++) total += Gpu.DeterministicGradientNorm.ChunkCount(sizes[t]);
-            int words = System.Math.Max(1, total) * Gpu.DeterministicGradientNorm.PartialWords;
-            if (_normPartials is not { } partials || partials.Size < words)
+            lock (_normPartialsLock)
             {
-                _normPartials?.Dispose();
-                partials = _normPartials = AllocateBuffer(System.Math.Max(words, 64 * Gpu.DeterministicGradientNorm.PartialWords));
+            if (_disposed) throw new System.ObjectDisposedException(nameof(OpenClBackend));
+                MultiTensorArgs.ValidateRecordBuffer(sumOfSquares);
+                MultiTensorArgs.Validate(tensors, sizes);
+                if (_kernelCache["dgn_chunk_partials_tensor"].MaxWorkGroupSize < DeterministicNormKernels.GroupSize ||
+                    _kernelCache["dgn_finish"].MaxWorkGroupSize < DeterministicNormKernels.GroupSize)
+                    throw new GpuCapabilityUnavailableException("OpenCL deterministic norm kernels require 256-thread work groups.");
+                int total = 0;
+                for (int t = 0; t < sizes.Count; t++) total += Gpu.DeterministicGradientNorm.ChunkCount(sizes[t]);
+                int words = System.Math.Max(1, total) * Gpu.DeterministicGradientNorm.PartialWords;
+                if (_normPartials is not { } partials || partials.Size < words)
+                {
+                    if (_normPartials is not null) Synchronize();
+                    var grown = AllocateBuffer(System.Math.Max(words, 64 * Gpu.DeterministicGradientNorm.PartialWords));
+                    _normPartials?.Dispose();
+                    partials = _normPartials = grown;
+                }
+                var p = ((DirectOpenClGpuBuffer)partials).Buffer.Handle;
+                var chunk = _kernelCache["dgn_chunk_partials_tensor"];
+                int first = 0;
+                for (int t = 0; t < tensors.Count; t++)
+                {
+                    int chunks = Gpu.DeterministicGradientNorm.ChunkCount(sizes[t]);
+                    chunk.SetArg(0, ((DirectOpenClGpuBuffer)tensors[t]).Buffer.Handle);
+                    chunk.SetArg(1, sizes[t]);
+                    chunk.SetArg(2, (uint)t);
+                    chunk.SetArg(3, first);
+                    chunk.SetArg(4, p);
+                    chunk.Execute1D(chunks * DeterministicNormKernels.GroupSize, DeterministicNormKernels.GroupSize);
+                    first += chunks;
+                }
+                var finish = _kernelCache["dgn_finish"];
+                finish.SetArg(0, p);
+                finish.SetArg(1, total);
+                finish.SetArg(2, Gpu.DeterministicGradientNorm.Headroom(total));
+                finish.SetArg(3, ((DirectOpenClGpuBuffer)sumOfSquares).Buffer.Handle);
+                finish.Execute1D(DeterministicNormKernels.GroupSize, DeterministicNormKernels.GroupSize);
             }
-            var p = ((DirectOpenClGpuBuffer)partials).Buffer.Handle;
-            var chunk = _kernelCache["dgn_chunk_partials_tensor"];
-            int first = 0;
-            for (int t = 0; t < tensors.Count; t++)
-            {
-                int chunks = Gpu.DeterministicGradientNorm.ChunkCount(sizes[t]);
-                chunk.SetArg(0, ((DirectOpenClGpuBuffer)tensors[t]).Buffer.Handle);
-                chunk.SetArg(1, sizes[t]);
-                chunk.SetArg(2, (uint)t);
-                chunk.SetArg(3, first);
-                chunk.SetArg(4, p);
-                chunk.Execute1D(chunks * DeterministicNormKernels.GroupSize, DeterministicNormKernels.GroupSize);
-                first += chunks;
-            }
-            var finish = _kernelCache["dgn_finish"];
-            finish.SetArg(0, p);
-            finish.SetArg(1, total);
-            finish.SetArg(2, Gpu.DeterministicGradientNorm.Headroom(total));
-            finish.SetArg(3, ((DirectOpenClGpuBuffer)sumOfSquares).Buffer.Handle);
-            finish.Execute1D(DeterministicNormKernels.GroupSize, DeterministicNormKernels.GroupSize);
         }
 
         // Turns the float sum and scaled sum in the buffer's two slots into the double they stand for.
@@ -106,7 +116,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 kernel.Execute1D(sizes[t], CalculateOptimalWorkGroupSize1D(sizes[t]));
             }
         }
-    
+
 
         /// <inheritdoc />
         double IMultiTensorKernels.ReadSumOfSquares(IGpuBuffer sumOfSquares)
@@ -114,5 +124,5 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             MultiTensorArgs.ValidateSumBuffer(sumOfSquares);
             return MultiTensorArgs.DoubleFromSlots(DownloadBuffer(sumOfSquares));
         }
-}
+    }
 }

@@ -47,8 +47,9 @@ public sealed partial class CudaBackend : IMultiTensorKernels
     {
         int words = Math.Max(1, chunks) * Gpu.DeterministicGradientNorm.PartialWords;
         if (_normPartials is { } p && p.Size >= words) return p;
+        var grown = AllocateBuffer(Math.Max(words, 64 * Gpu.DeterministicGradientNorm.PartialWords));
         _normPartials?.Dispose();
-        return _normPartials = AllocateBuffer(Math.Max(words, 64 * Gpu.DeterministicGradientNorm.PartialWords));
+        return _normPartials = grown;
     }
 
     /// <inheritdoc />

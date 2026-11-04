@@ -1292,6 +1292,8 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
                 _unusedBindingBuffer = null;
             }
             VulkanGpuBuffer.ReleaseAndDrain(placeholder);
+            VulkanGpuBuffer.ReleaseAndDrain(_normPartials);
+            _normPartials = null;
         }
 
         // Per-thread command resources are cleaned up by VulkanDevice.Cleanup()

@@ -12499,6 +12499,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (!ReferenceEquals(g._gpuBackend, cb)) return false; // grads split across backends — bail
         }
         if (cb is null) return true; // all-null grads: nothing to clip
+        if (!double.IsInfinity(maxNorm) && maxNorm > float.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(maxNorm), maxNorm, "The GPU clip bound must fit in float.");
 
         // sumSq accumulator + a 1-element scratch, both device-resident and OWNED BY THE PLAN. They were allocated
         // and disposed per call: disposal returns a buffer to the pool at once, while the scale kernels that read

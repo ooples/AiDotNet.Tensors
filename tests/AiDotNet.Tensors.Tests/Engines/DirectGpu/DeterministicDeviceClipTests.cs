@@ -122,7 +122,12 @@ public sealed class DeterministicWebGpuClipTests
     public void WebGpuClip_MatchesTheIntegerReferenceBitForBit(string name, float[][] host, float maxNorm)
     {
         var backend = DawnHostedWebGpu.BackendOrSkip();
-        IMultiTensorKernels multi = backend;
+        CheckBackend(backend, name, host, maxNorm);
+    }
+
+    internal static void CheckBackend(IDirectGpuBackend backend, string name, float[][] host, float maxNorm)
+    {
+        var multi = (IMultiTensorKernels)backend;
         foreach (var policy in new[] { NonFiniteGradientPolicy.LeaveUnscaled, NonFiniteGradientPolicy.Propagate,
                      NonFiniteGradientPolicy.ZeroNonFinite })
         {

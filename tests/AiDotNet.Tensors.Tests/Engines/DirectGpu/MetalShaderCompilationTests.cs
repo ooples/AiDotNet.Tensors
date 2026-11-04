@@ -63,6 +63,7 @@ public sealed class MetalShaderCompilationTests
         yield return ("Audio", () => MetalAudioKernels.Source, false);
         yield return ("Complex", () => MetalComplexKernels.GetSource(), false);
         yield return ("CompressedOptimizer", () => MetalCompressedOptimizerKernels.Source, false);
+        yield return ("DeterministicNorm", () => DeterministicNormKernels.Source(DeterministicNormKernels.Dialect.Metal), false);
         yield return ("ExtendedConv", () => MetalExtendedConvKernels.Source, false);
         yield return ("Fft212", () => MetalFftKernels.Source, false);
         yield return ("Resident", () => MetalResidentKernels.Source, false);

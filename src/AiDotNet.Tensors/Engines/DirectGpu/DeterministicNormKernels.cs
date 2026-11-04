@@ -206,6 +206,7 @@ FN void dgn_sqrt(U64 alo, U64 ahi, int v, PPTR(U64) m, PPTR(int) e, PPTR(int) st
 // min(1, fp32(maxNorm / fp32(fp32(norm) + 1e-6f))) as fp32 bits, unbounded exponent.
 FN U32 dgn_clip_coef(U64 nm, int ne, int ns, U32 mb)
 {
+    if (mb == 0x7F800000u) return 0x3F800000u;
     U64 nM, dM; int nE, dE;
     dgn_round24(nm, ne, ns, &nM, &nE);
     dgn_addround24(nM, nE, (U64)0x8637BDu, 107 - 150, &dM, &dE);

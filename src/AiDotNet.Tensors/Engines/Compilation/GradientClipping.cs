@@ -40,6 +40,8 @@ public static class GradientClipping
         if (float.IsNaN(maxNorm) || maxNorm < 0f)
             throw new ArgumentOutOfRangeException(nameof(maxNorm), maxNorm,
                 "Maximum gradient norm must be non-negative and not NaN.");
+        if (!Enum.IsDefined(typeof(Gpu.NonFiniteGradientPolicy), nonFinite))
+            throw new ArgumentOutOfRangeException(nameof(nonFinite), nonFinite, "Undefined non-finite gradient policy.");
         if (gradients is null || gradients.Length == 0) return 0f;
 
         // The device clip's definition (DeterministicGradientNorm), so the CPU and every GPU backend produce the same

@@ -11,6 +11,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 public sealed partial class WebGpuBackend : IMultiTensorKernels
 {
     private IGpuBuffer? _normPartials;
+    private readonly object _normPartialsLock = new();
 
     // The finite guard's uniform (WebGpuBackend.FiniteGuard): n and the norm bound.
     private static float[] MultiTensorParams(int n, float maxNorm) =>
@@ -26,26 +27,31 @@ public sealed partial class WebGpuBackend : IMultiTensorKernels
 
     void IMultiTensorKernels.MultiTensorSumOfSquares(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer record)
     {
-        MultiTensorArgs.ValidateRecordBuffer(record);
-        MultiTensorArgs.Validate(tensors, sizes);
-        int total = 0;
-        for (int t = 0; t < sizes.Count; t++) total += Gpu.DeterministicGradientNorm.ChunkCount(sizes[t]);
-        int words = Math.Max(1, total) * Gpu.DeterministicGradientNorm.PartialWords;
-        if (_normPartials is not { } partials || partials.Size < words)
+        lock (_normPartialsLock)
         {
-            _normPartials?.Dispose();
-            partials = _normPartials = AllocateBuffer(Math.Max(words, 64 * Gpu.DeterministicGradientNorm.PartialWords));
+            MultiTensorArgs.ValidateRecordBuffer(record);
+            MultiTensorArgs.Validate(tensors, sizes);
+            int total = 0;
+            for (int t = 0; t < sizes.Count; t++) total += Gpu.DeterministicGradientNorm.ChunkCount(sizes[t]);
+            int words = Math.Max(1, total) * Gpu.DeterministicGradientNorm.PartialWords;
+            if (_normPartials is not { } partials || partials.Size < words)
+            {
+                if (_normPartials is not null) Synchronize();
+                var grown = AllocateBuffer(Math.Max(words, 64 * Gpu.DeterministicGradientNorm.PartialWords));
+                _normPartials?.Dispose();
+                partials = _normPartials = grown;
+            }
+            uint first = 0;
+            for (int t = 0; t < tensors.Count; t++)
+            {
+                int chunks = Gpu.DeterministicGradientNorm.ChunkCount(sizes[t]);
+                NormDispatch("dgn_chunk_partials", tensors[t], partials, NormParams((uint)sizes[t], (uint)t, first),
+                    chunks * DeterministicNormKernels.GroupSize);
+                first += (uint)chunks;
+            }
+            NormDispatch("dgn_finish", partials, record, NormParams((uint)total, (uint)Gpu.DeterministicGradientNorm.Headroom(total)),
+                DeterministicNormKernels.GroupSize);
         }
-        uint first = 0;
-        for (int t = 0; t < tensors.Count; t++)
-        {
-            int chunks = Gpu.DeterministicGradientNorm.ChunkCount(sizes[t]);
-            NormDispatch("dgn_chunk_partials", tensors[t], partials, NormParams((uint)sizes[t], (uint)t, first),
-                chunks * DeterministicNormKernels.GroupSize);
-            first += (uint)chunks;
-        }
-        NormDispatch("dgn_finish", partials, record, NormParams((uint)total, (uint)Gpu.DeterministicGradientNorm.Headroom(total)),
-            DeterministicNormKernels.GroupSize);
     }
 
     public void MultiTensorSumOfSquares(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer sumOfSquares)

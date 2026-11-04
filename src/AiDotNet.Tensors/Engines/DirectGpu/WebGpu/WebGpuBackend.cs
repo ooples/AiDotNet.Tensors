@@ -1208,27 +1208,32 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
     /// </summary>
     public void Dispose()
     {
-        if (_disposed)
+        lock (_normPartialsLock)
         {
-            return;
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            _sharedDummyBuffer?.Dispose();
+            _sharedDummyBuffer = null;
+            _residentUnusedOperand?.Dispose();
+            _residentUnusedOperand = null;
+            DisposeTunedKernelResources();
+
+            // Dispose cached complex scratch buffers
+            _normPartials?.Dispose();
+            _normPartials = null;
+            if (_complexScratch is not null)
+            {
+                foreach (var buf in _complexScratch) buf?.Dispose();
+                _complexScratch = null;
+            }
+
+            _shaderLibrary.Dispose();
+            _pipelineCache.Clear();
         }
-
-        _disposed = true;
-        _sharedDummyBuffer?.Dispose();
-        _sharedDummyBuffer = null;
-        _residentUnusedOperand?.Dispose();
-        _residentUnusedOperand = null;
-        DisposeTunedKernelResources();
-
-        // Dispose cached complex scratch buffers
-        if (_complexScratch is not null)
-        {
-            foreach (var buf in _complexScratch) buf?.Dispose();
-            _complexScratch = null;
-        }
-
-        _shaderLibrary.Dispose();
-        _pipelineCache.Clear();
     }
 
     public override string ToString()
