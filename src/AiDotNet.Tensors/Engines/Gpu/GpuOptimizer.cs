@@ -64,10 +64,13 @@ public static class GpuOptimizer
     /// <summary>
     /// Marks a parameter updated in place on the device. A parameter with a host backing array becomes
     /// device-authoritative: its persistent weight entry follows the new version and a host read downloads it lazily.
+    /// A GpuPinned/offload tensor keeps its own mirror protocol instead: binding the wrapped device pointer would make
+    /// <see cref="TensorBase{T}.TryGetGpuBuffer"/> return it without first uploading host writes, so a write made
+    /// after a step (an optimizer state loaded mid-training) never reached the next kernel.
     /// </summary>
     private static void MarkParameterUpdated(DirectGpuTensorEngine engine, IDirectGpuBackend backend, Tensor<float> param, IGpuBuffer buffer)
     {
-        if (param.GetBackingArrayForCacheLookupUnsafe() is not null)
+        if (param.OffloadDevicePointer == IntPtr.Zero && param.GetBackingArrayForCacheLookupUnsafe() is not null)
             engine.CommitParameterUpdatedOnDevice(param, buffer, backend, CreateWriteSyncPoint(backend));
         else
             MarkGpuUpdated(backend, param);
