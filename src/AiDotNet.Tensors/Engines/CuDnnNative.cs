@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Runtime.InteropServices;
 
 namespace AiDotNet.Tensors.Engines;
@@ -988,7 +989,12 @@ public static class CuDnnNative
 /// </summary>
 public sealed class CuDnnContext : IDisposable
 {
+    // The handle created with the context, and the one the current launch uses (BindStream selects it).
+    private IntPtr _primaryHandle;
     private IntPtr _cudnnHandle;
+    // One handle per stream, each bound to its stream once (see BindStream).
+    private readonly System.Collections.Generic.Dictionary<IntPtr, IntPtr> _handleByStream =
+        new System.Collections.Generic.Dictionary<IntPtr, IntPtr>();
     private CudaBlasContext? _blasContext;
     private bool _disposed;
     private static bool _isAvailable;
@@ -1002,9 +1008,52 @@ public sealed class CuDnnContext : IDisposable
     /// </summary>
     internal object StreamBindingLock { get; } = new object();
 
-    /// <summary>Binds the handle to <paramref name="stream"/>. Call it holding <see cref="StreamBindingLock"/>, through the launch.</summary>
-    internal void BindStream(IntPtr stream) =>
-        CheckStatus(CuDnnNative.cudnnSetStream(Handle, stream), "cudnnSetStream");
+    /// <summary>
+    /// Makes <see cref="Handle"/> the handle dedicated to <paramref name="stream"/>, creating and binding it on the
+    /// stream's first use. Call it holding <see cref="StreamBindingLock"/>, through the launch. A handle is never
+    /// rebound: cudnnSetStream records an event on the handle's previous stream to order its internal work, and when
+    /// that stream was another thread's graph-capture stream the record joined that capture or, while the capturer was
+    /// in cuGraphInstantiate, faulted inside the driver (cudnnSetStream -> cuEventRecord access violation on the CUDA
+    /// lane, CudnnStreamBindingRaceTests).
+    /// </summary>
+    internal void BindStream(IntPtr stream)
+    {
+        lock (StreamBindingLock)
+        {
+            if (_handleByStream.TryGetValue(stream, out var handle))
+            {
+                _cudnnHandle = handle;
+                return;
+            }
+            bool created = _handleByStream.Count > 0;
+            if (created)
+                CheckStatus(CuDnnNative.cudnnCreate(out handle), "cudnnCreate");
+            else
+                handle = _primaryHandle;
+            var status = CuDnnNative.cudnnSetStream(handle, stream);
+            if (status != CuDnnNative.CudnnStatus.Success)
+            {
+                if (created) CuDnnNative.cudnnDestroy(handle);
+                CheckStatus(status, "cudnnSetStream");
+            }
+            _handleByStream[stream] = handle;
+            _cudnnHandle = handle;
+        }
+    }
+
+    /// <summary>
+    /// Creates <paramref name="stream"/>'s handle now without selecting it. A graph capture calls this before it begins:
+    /// cudnnCreate is not capture-safe, so the capture stream's handle cannot be created inside the capture.
+    /// </summary>
+    internal void PrepareStream(IntPtr stream)
+    {
+        lock (StreamBindingLock)
+        {
+            var current = _cudnnHandle;
+            BindStream(stream);
+            _cudnnHandle = current;
+        }
+    }
 
     /// <summary>Gets whether cuDNN is available on this system.</summary>
     public static bool IsAvailable
@@ -1058,7 +1107,8 @@ public sealed class CuDnnContext : IDisposable
         _blasContext = new CudaBlasContext();
 
         // Create cuDNN handle
-        var status = CuDnnNative.cudnnCreate(out _cudnnHandle);
+        var status = CuDnnNative.cudnnCreate(out _primaryHandle);
+        _cudnnHandle = _primaryHandle;
         if (status != CuDnnNative.CudnnStatus.Success)
         {
             _blasContext.Dispose();
@@ -1087,7 +1137,8 @@ public sealed class CuDnnContext : IDisposable
         // such an instance — the host-array helpers that need _blasContext are
         // not.
         _blasContext = null;
-        var status = CuDnnNative.cudnnCreate(out _cudnnHandle);
+        var status = CuDnnNative.cudnnCreate(out _primaryHandle);
+        _cudnnHandle = _primaryHandle;
         if (status != CuDnnNative.CudnnStatus.Success)
             throw new InvalidOperationException($"Failed to create cuDNN handle: {status}");
     }
@@ -1264,11 +1315,15 @@ public sealed class CuDnnContext : IDisposable
     {
         if (_disposed) return;
 
-        if (_cudnnHandle != IntPtr.Zero)
+        foreach (var handle in _handleByStream.Values.Where(handle => handle != _primaryHandle))
+            CuDnnNative.cudnnDestroy(handle);
+        _handleByStream.Clear();
+        if (_primaryHandle != IntPtr.Zero)
         {
-            CuDnnNative.cudnnDestroy(_cudnnHandle);
-            _cudnnHandle = IntPtr.Zero;
+            CuDnnNative.cudnnDestroy(_primaryHandle);
+            _primaryHandle = IntPtr.Zero;
         }
+        _cudnnHandle = IntPtr.Zero;
 
         _blasContext?.Dispose();
         _blasContext = null;

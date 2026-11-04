@@ -133,6 +133,14 @@ public sealed partial class CudaBackend
         try
         {
             if (_captureStream == IntPtr.Zero) CreateCaptureStream();
+            // cuDNN gets a handle of its own for the capture stream (cudnnCreate is not capture-safe, so before the
+            // capture begins): sharing one handle between it and the compute stream made every rebind record onto the
+            // other stream (see CuDnnContext.BindStream).
+            if (_cudnnContext is { } cudnn)
+            {
+                using var _ = PushContext();
+                cudnn.PrepareStream(_captureStream);
+            }
             TestHookCaptureSetup?.Invoke();
             // Everything this thread already enqueued on the compute stream happens before the captured work.
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventRecord(_captureOrderEvent, _mainStream), "cuEventRecord(capture order)");

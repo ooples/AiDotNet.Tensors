@@ -30,6 +30,35 @@ public sealed class GpuOptimizerFlatParameterViewTests : IClassFixture<DirectGpu
 
     public void Dispose() => AiDotNetEngine.Current = _prior;
 
+    [SkippableFact]
+    public void BoundOffloadParameter_DeviceStepIsDownloadedOnHostRead()
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        var gpu = _fixture.Engine!;
+        var param = Rand(new[] { 4, 4 }, 31);
+        Tensor<float> Grad() => gpu.TensorMultiplyScalar(Rand(new[] { 4, 4 }, 32), 1f);
+        Assert.True(GpuOptimizer.TrySgdStep(param, Grad(), 0.1f));
+        var before = (float[])param.GetReadOnlyDataArray().Clone();
+        Assert.NotNull(param._gpuBuffer);
+
+        // A bound offload parameter updates this buffer, rather than the offload mirror.
+        // Use the live buffer's handle as the offload tag; no separate offload allocation is owned here.
+        param.OffloadDevicePointer = param._gpuBuffer!.Handle;
+        try
+        {
+            var gradient = Rand(new[] { 4, 4 }, 32).ToArray();
+            Assert.True(GpuOptimizer.TrySgdStep(param, Grad(), 0.1f));
+            Assert.True(param.HasPendingGpuData);
+            var actual = param.GetReadOnlyDataArray();
+            for (int i = 0; i < before.Length; i++)
+                Assert.Equal(before[i] - 0.1f * gradient[i], actual[i], precision: 6);
+        }
+        finally
+        {
+            param.OffloadDevicePointer = IntPtr.Zero;
+        }
+    }
+
     private static Tensor<float> Rand(int[] shape, int seed)
     {
         var rng = new Random(seed);
@@ -162,6 +191,133 @@ public sealed class GpuOptimizerFlatParameterViewTests : IClassFixture<DirectGpu
             Assert.Equal(expected[i], got[i]);
         // The neighbouring parameter in the flat array is untouched by the staged write-back.
         Assert.Equal(Rand(shapes[0], 9).ToArray(), views[0].ToArray());
+    }
+
+    /// <summary>
+    /// A copy-on-write snapshot of a parameter (what a model DeepCopy takes) keeps its values through a device
+    /// optimizer step. The step wrote the parameter's device buffer in place without detaching the share, and the
+    /// snapshot read the same array, device copy and pending download, so it received the training update too.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void DeviceStep_LeavesACopyOnWriteSnapshotUnchanged(bool alreadyOnDevice)
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        var gpu = _fixture.Engine!;
+        int[] shape = { 6, 4 };
+        var param = Rand(shape, 11);
+        Tensor<float> Grad() => gpu.TensorMultiplyScalar(Rand(shape, 12), 1f);
+        // Optionally make the parameter device-bound and device-authoritative before the snapshot.
+        if (alreadyOnDevice)
+            Assert.True(GpuOptimizer.TrySgdStep(param, Grad(), 0.1f), string.Join("; ", GpuLaunchProbe.Fallbacks));
+
+        var before = param.ToArray();
+        var snapshot = (Tensor<float>)param.CloneShared();
+        Assert.True(param.IsCowShared && snapshot.IsCowShared);
+
+        Assert.True(GpuOptimizer.TryAdamWStep(param, Grad(), GpuOptimizer.CreateStateTensor(shape),
+            GpuOptimizer.CreateStateTensor(shape), 0.01f, 0.9f, 0.999f, 1e-8f, 0.01f, 1),
+            string.Join("; ", GpuLaunchProbe.Fallbacks));
+
+        Assert.Equal(before, snapshot.ToArray());
+        Assert.NotEqual(before, param.ToArray());
+    }
+
+    /// <summary>
+    /// A snapshot taken while the parameter's newest value exists only on the device (a pending download, never read
+    /// on the host) must hold that value, and the next device step must start from it: the detach clones the host
+    /// array and drops the device binding, so cloning it before the download resolves would lose the first step.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void DeviceStep_AfterASnapshotOfAPendingDeviceValue_StartsFromTheDeviceValue(bool parameterView)
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        var gpu = _fixture.Engine!;
+        int[] shape = { 6, 4 };
+        Tensor<float> Grad(int seed) => gpu.TensorMultiplyScalar(Rand(shape, seed), 1f);
+        string Fallbacks() => string.Join("; ", GpuLaunchProbe.Fallbacks);
+        // A ParameterBuffer view's pending download is keyed on the shared flat array, not on its own storage.
+        Tensor<float> Make()
+        {
+            if (!parameterView) return Rand(shape, 21);
+            var buffer = new ParameterBuffer<float>(new[] { new[] { 4, 8 }, shape });
+            buffer.CopyFrom(new[] { Rand(new[] { 4, 8 }, 20), Rand(shape, 21) });
+            return buffer.CreateAllViews()[1];
+        }
+
+        // Reference: the same two steps with the device value read on the host before the snapshot.
+        var reference = Make();
+        Assert.True(GpuOptimizer.TrySgdStep(reference, Grad(22), 0.1f), Fallbacks());
+        var afterFirst = reference.ToArray();
+        var referenceSnapshot = (Tensor<float>)reference.CloneShared();
+        Assert.True(GpuOptimizer.TrySgdStep(reference, Grad(23), 0.1f), Fallbacks());
+        Assert.Equal(afterFirst, referenceSnapshot.ToArray());
+
+        var param = Make();
+        Assert.True(GpuOptimizer.TrySgdStep(param, Grad(22), 0.1f), Fallbacks());
+        Assert.True(gpu.IsDeviceAuthoritative(param));
+        Assert.True(param.HasPendingGpuData, "the first step's value must still be device-only");
+        var snapshot = (Tensor<float>)param.CloneShared();
+        // A standalone tensor's snapshot shares the pending download, so the step's detach is what must resolve it. A
+        // view's CloneShared downloads the flat array itself; for it only the values below are in question.
+        if (!parameterView)
+            Assert.True(param.HasPendingGpuData && snapshot.HasPendingGpuData, "the snapshot must not resolve the download");
+        Assert.True(GpuOptimizer.TrySgdStep(param, Grad(23), 0.1f), Fallbacks());
+
+        Assert.Equal(afterFirst, snapshot.ToArray());
+        Assert.NotEqual(afterFirst, param.GetReadOnlyDataArray());
+        Assert.Equal(reference.ToArray(), param.ToArray());
+    }
+
+    /// <summary>
+    /// The compressed-moment (int8) AdamW step writes the parameter's device buffer in place through its own
+    /// placement path; a copy-on-write snapshot of a device-bound parameter must keep its values through it too, and the
+    /// detached parameter must still be stepped on the device.
+    /// </summary>
+    [SkippableFact]
+    public void CompressedMomentStep_LeavesACopyOnWriteSnapshotUnchanged()
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        var gpu = _fixture.Engine!;
+        int[] shape = { 8, 8 };
+        const int blockSize = 32;
+        var param = Rand(shape, 13);
+        Tensor<float> Grad() => gpu.TensorMultiplyScalar(Rand(shape, 14), 1f);
+        Assert.True(GpuOptimizer.TrySgdStep(param, Grad(), 0.1f), string.Join("; ", GpuLaunchProbe.Fallbacks));
+        Skip.IfNot(GpuOptimizer.TryAllocAdam8BitState(param.Length, blockSize, out var mQ, out var vQ, out var mS, out var vS),
+            "The backend has no compressed optimizer moments.");
+        try
+        {
+            var reference = Rand(shape, 13);
+            Assert.True(GpuOptimizer.TrySgdStep(reference, Grad(), 0.1f));
+            var before = (float[])reference.GetReadOnlyDataArray().Clone();
+            Assert.True(GpuOptimizer.TryAdam8BitStep(reference, Grad(), mQ, vQ, mS, vS,
+                0.01f, 0.9f, 0.999f, 1e-8f, 1f - 0.9f, 1f - 0.999f, blockSize));
+            var expected = (float[])reference.GetReadOnlyDataArray().Clone();
+            // A fresh moment state makes the tested update identical to the reference update.
+            foreach (var buffer in new[] { mQ, vQ, mS, vS })
+                if (buffer is not null) GpuOptimizer.FreeGpuBuffer(buffer);
+            Assert.True(GpuOptimizer.TryAllocAdam8BitState(param.Length, blockSize, out mQ, out vQ, out mS, out vS));
+            var snapshot = (Tensor<float>)param.CloneShared();
+            // The detach drops the shared device binding; the step must place the private copy, not decline.
+            Assert.True(GpuOptimizer.TryAdam8BitStep(param, Grad(), mQ, vQ, mS, vS,
+                0.01f, 0.9f, 0.999f, 1e-8f, 1f - 0.9f, 1f - 0.999f, blockSize),
+                string.Join("; ", GpuLaunchProbe.Fallbacks));
+            Assert.True(gpu.IsDeviceAuthoritative(param));
+
+            Assert.Equal(before, snapshot.ToArray());
+            var actual = param.GetReadOnlyDataArray();
+            Assert.NotEqual(before, actual);
+            Assert.Equal(expected, actual);
+        }
+        finally
+        {
+            foreach (var buffer in new[] { mQ, vQ, mS, vS })
+                if (buffer is not null) GpuOptimizer.FreeGpuBuffer(buffer);
+        }
     }
 
     /// <summary>
