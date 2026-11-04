@@ -352,8 +352,8 @@ fn dgn_finish(@builtin(local_invocation_id) lid: vec3<u32>) {
 fn dgn_clip_scale(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x != 0u) { return; }
     var s: u32;
-    if (a[7] != 0u) { s = select(0x3F800000u, 0x7FC00000u, params.p1 != 0u); }
-    else if (a[8] != 0u) { s = select(0x3F800000u, 0u, params.p1 != 0u); }
+    if (a[7] != 0u && params.p1 != 2u) { s = select(0x3F800000u, 0x7FC00000u, params.p1 == 1u); }
+    else if (a[8] != 0u && params.p1 != 2u) { s = select(0x3F800000u, 0u, params.p1 == 1u); }
     else {
         let r = dgn_sqrt(vec4<u32>(a[2], a[3], a[4], a[5]), bitcast<i32>(a[6]));
         s = dgn_clip_coef(r.m, r.e, r.sticky, params.p0);
@@ -362,11 +362,14 @@ fn dgn_clip_scale(@builtin(global_invocation_id) gid: vec3<u32>) {
     b[0] = s;
 }
 
-// a = scale, b = tensor; params = (n).
+// a = scale, b = tensor; params = (n, zeroNonFinite).
 @compute @workgroup_size(256)
 fn dgn_scale(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
-    if (i < params.p0) { b[i] = dgn_mul(b[i], a[0]); }
+    if (i < params.p0) {
+        let g = b[i];
+        b[i] = select(dgn_mul(g, a[0]), 0u, params.p1 != 0u && ((g >> 23u) & 0xFFu) == 0xFFu);
+    }
 }
 ";
 }

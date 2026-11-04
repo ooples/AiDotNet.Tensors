@@ -88,6 +88,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
 
         public void MultiTensorScaleByDeviceScalar(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer scale)
+            => ((IMultiTensorKernels)this).MultiTensorClipScale(tensors, sizes, scale, false);
+
+        void IMultiTensorKernels.MultiTensorClipScale(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer scale, bool zeroNonFinite)
         {
             if (scale is null) throw new System.ArgumentNullException(nameof(scale));
             MultiTensorArgs.Validate(tensors, sizes);
@@ -99,6 +102,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 kernel.SetArg(0, ((DirectOpenClGpuBuffer)tensors[t]).Buffer.Handle);
                 kernel.SetArg(1, sizes[t]);
                 kernel.SetArg(2, s);
+                kernel.SetArg(3, zeroNonFinite ? 1u : 0u);
                 kernel.Execute1D(sizes[t], CalculateOptimalWorkGroupSize1D(sizes[t]));
             }
         }

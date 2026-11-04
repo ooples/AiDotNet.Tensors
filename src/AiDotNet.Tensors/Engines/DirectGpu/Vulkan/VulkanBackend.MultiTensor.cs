@@ -49,13 +49,16 @@ public sealed partial class VulkanBackend : IMultiTensorKernels
     }
 
     public void MultiTensorScaleByDeviceScalar(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer scale)
+        => ((IMultiTensorKernels)this).MultiTensorClipScale(tensors, sizes, scale, false);
+
+    void IMultiTensorKernels.MultiTensorClipScale(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer scale, bool zeroNonFinite)
     {
         EnsureInitialized();
         if (scale is null) throw new ArgumentNullException(nameof(scale));
         MultiTensorArgs.Validate(tensors, sizes);
         // dgn_mul: the IEEE product with subnormals kept, so a flush-to-zero device still matches the others.
         for (int t = 0; t < tensors.Count; t++)
-            GlslUnaryOp(VulkanDeterministicNormKernels.Scale, scale, tensors[t], sizes[t], new[] { (uint)sizes[t] }, sizeof(uint));
+            GlslUnaryOp(VulkanDeterministicNormKernels.Scale, scale, tensors[t], sizes[t], new[] { (uint)sizes[t], zeroNonFinite ? 1u : 0u }, 2 * sizeof(uint));
     }
 
     /// <inheritdoc />

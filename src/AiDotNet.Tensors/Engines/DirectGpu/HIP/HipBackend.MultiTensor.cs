@@ -189,7 +189,10 @@ public sealed partial class HipBackend : IMultiTensorKernels
         LaunchKernel(kernel, 1, 1, args);
     }
 
-    public unsafe void MultiTensorScaleByDeviceScalar(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer scale)
+    public void MultiTensorScaleByDeviceScalar(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer scale)
+        => ((IMultiTensorKernels)this).MultiTensorClipScale(tensors, sizes, scale, false);
+
+    unsafe void IMultiTensorKernels.MultiTensorClipScale(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer scale, bool zeroNonFinite)
     {
         if (scale is null) throw new ArgumentNullException(nameof(scale));
         MultiTensorArgs.Validate(tensors, sizes);
@@ -201,8 +204,9 @@ public sealed partial class HipBackend : IMultiTensorKernels
         IntPtr ctH = TableHandle(table.ChunkTensor), csH = TableHandle(table.ChunkStart);
         IntPtr scH = scale.Handle;
         int totalChunks = table.TotalChunks;
-        void** args = stackalloc void*[6];
-        args[0] = &pH; args[1] = &sH; args[2] = &ctH; args[3] = &csH; args[4] = &totalChunks; args[5] = &scH;
+        uint zero = zeroNonFinite ? 1u : 0u;
+        void** args = stackalloc void*[7];
+        args[0] = &pH; args[1] = &sH; args[2] = &ctH; args[3] = &csH; args[4] = &totalChunks; args[5] = &scH; args[6] = &zero;
         LaunchKernel(kernel, (uint)Math.Min(totalChunks, 4096), DeterministicNormKernels.GroupSize, args);
     }
 

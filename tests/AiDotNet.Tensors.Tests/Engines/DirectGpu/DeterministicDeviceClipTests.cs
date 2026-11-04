@@ -49,6 +49,13 @@ public sealed class DeterministicDeviceClipTests
     [MemberData(nameof(Cases))]
     public void DeviceClip_MatchesTheIntegerReferenceBitForBit(string name, float[][] host, float maxNorm)
     {
+        foreach (var policy in new[] { NonFiniteGradientPolicy.LeaveUnscaled, NonFiniteGradientPolicy.Propagate,
+                     NonFiniteGradientPolicy.ZeroNonFinite, NonFiniteGradientPolicy.Error })
+            DeviceClip(name, host, maxNorm, policy);
+    }
+
+    private static void DeviceClip(string name, float[][] host, float maxNorm, NonFiniteGradientPolicy policy)
+    {
         using var gpu = new DirectGpuTensorEngine();
         if (Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS") == "1")
             Assert.True(gpu.IsGpuAvailable, "The required GPU backend failed to initialize.");
@@ -61,9 +68,19 @@ public sealed class DeterministicDeviceClipTests
                 new Tensor<float>(new[] { h.Length }))).ToArray();
             // The reference reads what the device holds (an engine op may already have flushed subnormals).
             var before = gradients.Select(g => g.ToArray()).ToArray();
-            uint[] expected = N.Compute(before, maxNorm);
+            bool nonFinite = before.Any(t => t.Any(x => float.IsNaN(x) || float.IsInfinity(x)));
+            if (policy == NonFiniteGradientPolicy.Error && nonFinite)
+            {
+                var ex = Assert.Throws<ArithmeticException>(() => GpuOptimizer.TryClipGradNorm(gradients, maxNorm, policy));
+                Assert.Contains("gradient " + Array.FindIndex(before, t => t.Any(x => float.IsNaN(x) || float.IsInfinity(x))), ex.Message);
+                for (int t = 0; t < gradients.Length; t++)
+                    Assert.Equal(before[t].Select(N.SingleToUInt32Bits), gradients[t].ToArray().Select(N.SingleToUInt32Bits));
+                return;
+            }
+            uint[] expected = N.Compute(before, maxNorm, policy == NonFiniteGradientPolicy.Error ? NonFiniteGradientPolicy.LeaveUnscaled : policy);
+            bool zero = policy == NonFiniteGradientPolicy.ZeroNonFinite;
 
-            using var norm = GpuOptimizer.TryClipGradNorm(gradients, maxNorm);
+            using var norm = GpuOptimizer.TryClipGradNorm(gradients, maxNorm, policy);
             Assert.NotNull(norm);
             Assert.Equal(BitConverter.DoubleToInt64Bits(Double(expected)), BitConverter.DoubleToInt64Bits(norm!.TotalNormSquared));
             Assert.Equal(expected[N.WordNorm], N.SingleToUInt32Bits(norm.Norm));
@@ -80,10 +97,10 @@ public sealed class DeterministicDeviceClipTests
                 var after = gradients[t].ToArray();
                 for (int i = 0; i < after.Length; i++)
                 {
-                    uint want = N.Mul(N.SingleToUInt32Bits(before[t][i]), scale);
+                    uint want = N.ScaleElement(N.SingleToUInt32Bits(before[t][i]), scale, zero);
                     uint got = N.SingleToUInt32Bits(after[i]);
                     if (want != got)
-                        Assert.Fail($"{name}: gradient {t}[{i}] = {before[t][i]:R} * {N.UInt32BitsToSingle(scale):R}: device 0x{got:X8}, reference 0x{want:X8}");
+                        Assert.Fail($"{name}/{policy}: gradient {t}[{i}] = {before[t][i]:R} * {N.UInt32BitsToSingle(scale):R}: device 0x{got:X8}, reference 0x{want:X8}");
                 }
             }
         }
@@ -106,8 +123,10 @@ public sealed class DeterministicWebGpuClipTests
     {
         var backend = DawnHostedWebGpu.BackendOrSkip();
         IMultiTensorKernels multi = backend;
-        foreach (var policy in new[] { NonFiniteGradientPolicy.LeaveUnscaled, NonFiniteGradientPolicy.Propagate })
+        foreach (var policy in new[] { NonFiniteGradientPolicy.LeaveUnscaled, NonFiniteGradientPolicy.Propagate,
+                     NonFiniteGradientPolicy.ZeroNonFinite })
         {
+            bool zero = policy == NonFiniteGradientPolicy.ZeroNonFinite;
             var buffers = host.Select(h => backend.AllocateBuffer(h)).ToArray();
             var sizes = host.Select(h => h.Length).ToArray();
             using var record = backend.AllocateBuffer(N.RecordWords);
@@ -116,7 +135,7 @@ public sealed class DeterministicWebGpuClipTests
             {
                 multi.MultiTensorSumOfSquares(buffers, sizes, record);
                 multi.ClipScaleFromRecord(record, maxNorm, scale, policy);
-                multi.MultiTensorScaleByDeviceScalar(buffers, sizes, scale);
+                multi.MultiTensorClipScale(buffers, sizes, scale, zero);
                 uint[] expected = N.Compute(host, maxNorm, policy);
                 uint[] got = MultiTensorArgs.RecordFromSlots(backend.DownloadBuffer(record));
                 for (int w = 0; w <= N.WordMaxNorm; w++)
@@ -126,7 +145,7 @@ public sealed class DeterministicWebGpuClipTests
                     var after = backend.DownloadBuffer(buffers[t]);
                     for (int i = 0; i < host[t].Length; i++)
                     {
-                        uint want = N.Mul(N.SingleToUInt32Bits(host[t][i]), expected[N.WordScale]);
+                        uint want = N.ScaleElement(N.SingleToUInt32Bits(host[t][i]), expected[N.WordScale], zero);
                         uint gotBits = N.SingleToUInt32Bits(after[i]);
                         if (want != gotBits) Assert.Fail($"{name}/{policy}: {t}[{i}]: device 0x{gotBits:X8}, reference 0x{want:X8}");
                     }

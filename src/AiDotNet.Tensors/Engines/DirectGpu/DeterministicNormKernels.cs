@@ -385,12 +385,21 @@ FN void dgn_finish_body(CGPTR(U32) p, int count, int headroom, GPTR(U32) rec, in
     }
 }
 
-// policy: 0 leaves the gradients unscaled on a non-finite element, 1 propagates as PyTorch (NaN, or 0 for +Inf).
+// The clip's element update: NonFiniteGradientPolicy.ZeroNonFinite (zeroNonFinite != 0) writes +0 for a NaN or
+// infinite element; every other element is dgn_mul(g, s).
+FN U32 dgn_scale_elem(U32 g, U32 s, U32 zeroNonFinite)
+{
+    return (zeroNonFinite != 0u && ((g >> 23) & 0xFFu) == 0xFFu) ? 0u : dgn_mul(g, s);
+}
+
+// policy (NonFiniteGradientPolicy): 0 leaves the gradients unscaled on a non-finite element, 1 propagates as PyTorch
+// (NaN, or 0 for +Inf), 2 clips by the norm of the finite elements (the sum already excludes the non-finite ones; the
+// scale pass zeroes those). The host passes 0 for 3 (Error), which it raises after reading the record.
 FN void dgn_clip_body(GPTR(U32) rec, U32 maxNormBits, U32 policy, GPTR(U32) scale)
 {
     U32 s;
-    if (rec[7] != 0u) s = policy != 0u ? 0x7FC00000u : 0x3F800000u;
-    else if (rec[8] != 0u) s = policy != 0u ? 0u : 0x3F800000u;
+    if (rec[7] != 0u && policy != 2u) s = policy == 1u ? 0x7FC00000u : 0x3F800000u;
+    else if (rec[8] != 0u && policy != 2u) s = policy == 1u ? 0u : 0x3F800000u;
     else
     {
         U64 nm; int ne, ns;
@@ -435,7 +444,7 @@ extern ""C"" __global__ void dgn_clip_scale(unsigned int* __restrict__ record, u
 
 extern ""C"" __global__ __launch_bounds__(256) void dgn_multi_tensor_scale(
     const unsigned long long* __restrict__ ptrs, const int* __restrict__ sizes, const int* __restrict__ chunkTensor,
-    const int* __restrict__ chunkStart, int totalChunks, const unsigned int* __restrict__ scale)
+    const int* __restrict__ chunkStart, int totalChunks, const unsigned int* __restrict__ scale, unsigned int zeroNonFinite)
 {
     U32 s = scale[0];
     for (int c = blockIdx.x; c < totalChunks; c += gridDim.x)
@@ -443,7 +452,7 @@ extern ""C"" __global__ __launch_bounds__(256) void dgn_multi_tensor_scale(
         int t = chunkTensor[c], start = chunkStart[c];
         int end = min(start + DGN_CHUNK, sizes[t]);
         U32* p = (U32*)ptrs[t];
-        for (int i = start + (int)threadIdx.x; i < end; i += blockDim.x) p[i] = dgn_mul(p[i], s);
+        for (int i = start + (int)threadIdx.x; i < end; i += blockDim.x) p[i] = dgn_scale_elem(p[i], s, zeroNonFinite);
     }
 }
 ",
@@ -471,10 +480,10 @@ __kernel void dgn_clip_scale(__global uint* record, const uint maxNormBits, cons
     if (get_global_id(0) == 0) dgn_clip_body(record, maxNormBits, policy, scale);
 }
 
-__kernel void dgn_scale_tensor(__global uint* x, const int n, __global const uint* scale)
+__kernel void dgn_scale_tensor(__global uint* x, const int n, __global const uint* scale, const uint zeroNonFinite)
 {
     int i = (int)get_global_id(0);
-    if (i < n) x[i] = dgn_mul(x[i], scale[0]);
+    if (i < n) x[i] = dgn_scale_elem(x[i], scale[0], zeroNonFinite);
 }
 ",
         _ => @"
@@ -505,9 +514,9 @@ kernel void dgn_clip_scale(device uint* record [[buffer(0)]], device uint* scale
 }
 
 kernel void dgn_scale_tensor(device uint* x [[buffer(0)]], device const uint* scale [[buffer(1)]],
-    constant uint& n [[buffer(2)]], uint gid [[thread_position_in_grid]])
+    constant uint& n [[buffer(2)]], constant uint& zeroNonFinite [[buffer(3)]], uint gid [[thread_position_in_grid]])
 {
-    if (gid < n) x[gid] = dgn_mul(x[gid], scale[0]);
+    if (gid < n) x[gid] = dgn_scale_elem(x[gid], scale[0], zeroNonFinite);
 }
 ",
     };

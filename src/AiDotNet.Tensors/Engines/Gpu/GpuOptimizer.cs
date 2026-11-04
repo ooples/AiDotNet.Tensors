@@ -349,8 +349,10 @@ public static class GpuOptimizer
             if (clipTo is { } maxNorm)
             {
                 scale = backend.AllocateBuffer(1);
-                multi.ClipScaleFromRecord(sumOfSquares, maxNorm, scale, nonFinite);
-                multi.MultiTensorScaleByDeviceScalar(buffers, sizes, scale);
+                // Error is raised on the host below; on the device it leaves the gradients unscaled.
+                multi.ClipScaleFromRecord(sumOfSquares, maxNorm, scale,
+                    nonFinite == NonFiniteGradientPolicy.Error ? NonFiniteGradientPolicy.LeaveUnscaled : nonFinite);
+                multi.MultiTensorClipScale(buffers, sizes, scale, nonFinite == NonFiniteGradientPolicy.ZeroNonFinite);
             }
         }
         catch
@@ -366,8 +368,24 @@ public static class GpuOptimizer
                 gpuEngine.BindResidentBuffer(owners[i], buffers[i], backend);
         }
         // The handle keeps the scratch buffers alive past the queued launches that read them.
-        return new DeviceGradientNorm(multi, sumOfSquares, scale, gradientIndex.ToArray());
+        var norm = new DeviceGradientNorm(multi, sumOfSquares, scale, gradientIndex.ToArray());
+        if (clipTo is not null && nonFinite == NonFiniteGradientPolicy.Error && !norm.IsFinite)
+        {
+            int first = norm.FirstNonFiniteGradient;
+            long nan = norm.NanCount, inf = norm.InfinityCount;
+            norm.Dispose();
+            throw NonFiniteNormException(first, nan, inf);
+        }
+        return norm;
     }
+
+    /// <summary>The <see cref="NonFiniteGradientPolicy.Error"/> exception (PyTorch's error_if_nonfinite message, with
+    /// the first non-finite gradient and the counts).</summary>
+    internal static ArithmeticException NonFiniteNormException(int firstGradient, long nanCount, long infinityCount) =>
+        new ArithmeticException(
+            $"The total norm of order 2 for the gradients is non-finite, so it cannot be clipped: gradient {firstGradient} " +
+            $"is the first holding a non-finite element ({nanCount} NaN, {infinityCount} infinite in all). The gradients " +
+            "are left unscaled. Choose another NonFiniteGradientPolicy to scale or repair them instead.");
 
     /// <summary>
     /// Proximal gradient (ISTA) step with L1 soft-threshold prox, in place on the GPU.

@@ -108,13 +108,13 @@ internal static class DeterministicGradientNorm
 
     /// <summary>Multiplies <paramref name="data"/> in place by the record's scale (<see cref="Mul"/>); a scale of
     /// exactly 1 leaves it untouched.</summary>
-    public static unsafe void Scale(float* data, int length, uint scale)
+    public static unsafe void Scale(float* data, int length, uint scale, bool zeroNonFinite = false)
     {
-        if (scale == 0x3F800000u) return;
+        if (scale == 0x3F800000u && !zeroNonFinite) return;
         var u = (uint*)data;
         if (length < 65536)
         {
-            for (int i = 0; i < length; i++) u[i] = Mul(u[i], scale);
+            for (int i = 0; i < length; i++) u[i] = ScaleElement(u[i], scale, zeroNonFinite);
             return;
         }
         var p = (IntPtr)data;
@@ -123,7 +123,7 @@ internal static class DeterministicGradientNorm
         {
             var q = (uint*)p;
             int end = Math.Min(length, (b + 1) * 65536);
-            for (int i = b * 65536; i < end; i++) q[i] = Mul(q[i], scale);
+            for (int i = b * 65536; i < end; i++) q[i] = ScaleElement(q[i], scale, zeroNonFinite);
         });
     }
 
@@ -201,6 +201,7 @@ internal static class DeterministicGradientNorm
         ulong dbl;
         uint norm, scale;
         bool propagate = policy == NonFiniteGradientPolicy.Propagate;
+        bool finiteOnly = policy == NonFiniteGradientPolicy.ZeroNonFinite;
         if (nan != 0) { dbl = 0x7FF8000000000000UL; norm = 0x7FC00000; scale = propagate ? 0x7FC00000u : 0x3F800000u; }
         else if (inf != 0) { dbl = 0x7FF0000000000000UL; norm = 0x7F800000; scale = propagate ? 0u : 0x3F800000u; }
         else
@@ -209,6 +210,12 @@ internal static class DeterministicGradientNorm
             Sqrt(aLo, aHi, v, out ulong nm, out int ne, out bool ns);
             norm = RoundToFloat(nm, ne, ns);
             scale = ClipScale(nm, ne, ns, maxNorm);
+        }
+        if (finiteOnly && (nan != 0 || inf != 0))
+        {
+            // The sum excludes the non-finite elements: clip the rest by the norm of the finite ones.
+            Sqrt(aLo, aHi, v, out ulong fm, out int fe, out bool fs);
+            scale = ClipScale(fm, fe, fs, maxNorm);
         }
         r[WordSumSquaresLo] = (uint)dbl; r[WordSumSquaresHi] = (uint)(dbl >> 32);
         r[WordNorm] = norm; r[WordScale] = scale;
@@ -295,6 +302,11 @@ internal static class DeterministicGradientNorm
         if (biased >= 255) return 0x7F800000;
         return ((uint)biased << 23) | (uint)(q & 0x7FFFFF);
     }
+
+    /// <summary>The clip's element update: +0 for a NaN or infinite element under
+    /// <see cref="NonFiniteGradientPolicy.ZeroNonFinite"/>, otherwise <see cref="Mul"/>.</summary>
+    public static uint ScaleElement(uint g, uint s, bool zeroNonFinite) =>
+        zeroNonFinite && ((g >> 23) & 0xFF) == 0xFF ? 0u : Mul(g, s);
 
     /// <summary>g * s as one IEEE fp32 multiply (ties to even, subnormals kept), with NaN results canonical
     /// (0x7FC00000) so they too have the same bits everywhere, and g itself when s is exactly 1; the kernels'

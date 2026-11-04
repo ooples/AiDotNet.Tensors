@@ -87,13 +87,16 @@ public sealed partial class MetalBackend : IMultiTensorKernels
     }
 
     public void MultiTensorScaleByDeviceScalar(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer scale)
+        => ((IMultiTensorKernels)this).MultiTensorClipScale(tensors, sizes, scale, false);
+
+    void IMultiTensorKernels.MultiTensorClipScale(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer scale, bool zeroNonFinite)
     {
         ThrowIfDisposed();
         if (scale is null) throw new ArgumentNullException(nameof(scale));
         MultiTensorArgs.Validate(tensors, sizes);
         // dgn_mul: the IEEE product with subnormals kept (Metal flushes them in float arithmetic).
         for (int t = 0; t < tensors.Count; t++)
-            DispatchNormGroups("dgn_scale_tensor", (uint)((sizes[t] + 255) / 256), 256, new[] { tensors[t], scale }, (uint)sizes[t]);
+            DispatchNormGroups("dgn_scale_tensor", (uint)((sizes[t] + 255) / 256), 256, new[] { tensors[t], scale }, (uint)sizes[t], zeroNonFinite ? 1u : 0u);
     }
 
     /// <inheritdoc />

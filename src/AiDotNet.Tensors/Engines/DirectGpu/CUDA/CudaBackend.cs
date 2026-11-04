@@ -14706,14 +14706,18 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     }
 
     /// <summary>Multiplies every element of every tensor by the device scalar <paramref name="scale"/>, in one launch.</summary>
-    public unsafe void MultiTensorScaleByDeviceScalar(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer scale)
+    public void MultiTensorScaleByDeviceScalar(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer scale)
+        => ((IMultiTensorKernels)this).MultiTensorClipScale(tensors, sizes, scale, false);
+
+    unsafe void IMultiTensorKernels.MultiTensorClipScale(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer scale, bool zeroNonFinite)
     {
         if (scale is null) throw new ArgumentNullException(nameof(scale));
         if (tensors is null || tensors.Count == 0) return;
         // dgn_mul: one IEEE multiply that keeps subnormal operands and products (this module's fast-math flushes them).
         if (!_kernelCache.TryGetValue("dgn_multi_tensor_scale", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: dgn_multi_tensor_scale");
-        void** args = stackalloc void*[6];
+        void** args = stackalloc void*[7];
+        uint zero = zeroNonFinite ? 1u : 0u;
         lock (_gradientTableSync)
         {
             var table = GetGradientTable(tensors, sizes);
@@ -14721,7 +14725,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             IntPtr pH = table.Pointers!.Handle, sH = table.SizesBuffer!.Handle, ctH = table.ChunkTensor!.Handle, csH = table.ChunkStart!.Handle;
             IntPtr scH = scale.Handle;
             int totalChunks = table.TotalChunks;
-            args[0] = &pH; args[1] = &sH; args[2] = &ctH; args[3] = &csH; args[4] = &totalChunks; args[5] = &scH;
+            args[0] = &pH; args[1] = &sH; args[2] = &ctH; args[3] = &csH; args[4] = &totalChunks; args[5] = &scH; args[6] = &zero;
             LaunchKernel(kernel, (uint)Math.Min(totalChunks, MultiTensorScaleMaxBlocks), DeterministicNormKernels.GroupSize, args);
         }
     }

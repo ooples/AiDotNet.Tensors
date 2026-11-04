@@ -19,3 +19,6 @@ AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy
 AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy.LeaveUnscaled = 0 -> AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy
 AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy.Propagate = 1 -> AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy
 static AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TryClipGradNorm(System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.LinearAlgebra.Tensor<float>!>! gradients, double maxNorm, AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy nonFinite) -> AiDotNet.Tensors.Engines.Gpu.DeviceGradientNorm?
+AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy.ZeroNonFinite = 2 -> AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy
+AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy.Error = 3 -> AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy
+static AiDotNet.Tensors.Engines.Compilation.GradientClipping.ClipGradNorm(AiDotNet.Tensors.LinearAlgebra.Tensor<float>![]! gradients, float maxNorm, AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy nonFinite) -> float

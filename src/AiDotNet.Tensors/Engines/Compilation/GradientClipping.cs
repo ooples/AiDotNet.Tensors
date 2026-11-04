@@ -26,7 +26,16 @@ public static class GradientClipping
     /// <param name="gradients">Gradient tensors to clip (modified in-place).</param>
     /// <param name="maxNorm">Maximum allowed L2 norm.</param>
     /// <returns>The total gradient norm before clipping.</returns>
-    public static unsafe float ClipGradNorm(Tensor<float>[] gradients, float maxNorm)
+    public static float ClipGradNorm(Tensor<float>[] gradients, float maxNorm)
+        => ClipGradNorm(gradients, maxNorm, Gpu.NonFiniteGradientPolicy.LeaveUnscaled);
+
+    /// <summary>
+    /// As <see cref="ClipGradNorm(Tensor{float}[], float)"/>, with <paramref name="nonFinite"/> choosing what a NaN or
+    /// infinite element does to the gradients (the device clip's policies, with the same bits).
+    /// </summary>
+    /// <exception cref="ArithmeticException"><paramref name="nonFinite"/> is
+    /// <see cref="Gpu.NonFiniteGradientPolicy.Error"/> and an element is NaN or infinite; the gradients are unchanged.</exception>
+    public static unsafe float ClipGradNorm(Tensor<float>[] gradients, float maxNorm, Gpu.NonFiniteGradientPolicy nonFinite)
     {
         if (float.IsNaN(maxNorm) || maxNorm < 0f)
             throw new ArgumentOutOfRangeException(nameof(maxNorm), maxNorm,
@@ -35,7 +44,7 @@ public static class GradientClipping
 
         // The device clip's definition (DeterministicGradientNorm), so the CPU and every GPU backend produce the same
         // norm, coefficient and clipped gradients, bit for bit: exact and overflow-free, in integers. A non-finite
-        // element leaves the gradients unscaled (NonFiniteGradientPolicy.LeaveUnscaled), as the device clip does.
+        // element is handled by nonFinite, as the device clip handles it.
         int total = 0;
         for (int g = 0; g < gradients.Length; g++)
             if (gradients[g] is { Length: > 0 } t) total += Gpu.DeterministicGradientNorm.ChunkCount(t.Length);
@@ -63,10 +72,22 @@ public static class GradientClipping
             offset += Gpu.DeterministicGradientNorm.ChunkCount(grad.Length);
             index++;
         }
-        var record = Gpu.DeterministicGradientNorm.Combine(partials, maxNorm);
+        var record = Gpu.DeterministicGradientNorm.Combine(partials, maxNorm,
+            nonFinite == Gpu.NonFiniteGradientPolicy.Error ? Gpu.NonFiniteGradientPolicy.LeaveUnscaled : nonFinite);
         uint scale = record[Gpu.DeterministicGradientNorm.WordScale];
+        bool anyNonFinite = record[Gpu.DeterministicGradientNorm.WordNonFinite] != 0;
+        if (anyNonFinite && nonFinite == Gpu.NonFiniteGradientPolicy.Error)
+        {
+            uint first = record[Gpu.DeterministicGradientNorm.WordFirstNonFiniteTensor];
+            int firstGradient = -1;
+            for (int g = 0, k = 0; g < gradients.Length; g++)
+                if (gradients[g] is { Length: > 0 } && k++ == first) { firstGradient = g; break; }
+            throw Gpu.GpuOptimizer.NonFiniteNormException(firstGradient,
+                record[Gpu.DeterministicGradientNorm.WordNanCount], record[Gpu.DeterministicGradientNorm.WordInfCount]);
+        }
+        bool zero = anyNonFinite && nonFinite == Gpu.NonFiniteGradientPolicy.ZeroNonFinite;
 
-        if (scale != 0x3F800000u)
+        if (scale != 0x3F800000u || zero)
         {
             for (int g = 0; g < gradients.Length; g++)
             {
@@ -79,12 +100,13 @@ public static class GradientClipping
                     // for managed and native CPU storage.
                     using var gradKeep1 = new KeepAliveScope(grad);
                     var span = grad.AsWritableSpanUnmarked();
-                    fixed (float* p = span) Gpu.DeterministicGradientNorm.Scale(p, span.Length, scale);
+                    fixed (float* p = span) Gpu.DeterministicGradientNorm.Scale(p, span.Length, scale, zero);
                     grad.IncrementVersion();
                 }
                 else
                 {
-                    grad.ScaleLogicalInPlace(Gpu.DeterministicGradientNorm.UInt32BitsToSingle(scale));
+                    grad.MapLogicalInPlace(x => Gpu.DeterministicGradientNorm.UInt32BitsToSingle(
+                        Gpu.DeterministicGradientNorm.ScaleElement(Gpu.DeterministicGradientNorm.SingleToUInt32Bits(x), scale, zero)));
                 }
             }
         }

@@ -219,6 +219,12 @@ internal interface IMultiTensorKernels
     void MultiTensorScaleByDeviceScalar(System.Collections.Generic.IReadOnlyList<IGpuBuffer> tensors,
         System.Collections.Generic.IReadOnlyList<int> sizes, IGpuBuffer scale);
 
+    /// <summary>The clip's scale pass: <see cref="MultiTensorScaleByDeviceScalar"/>, and with
+    /// <paramref name="zeroNonFinite"/> (<see cref="Gpu.NonFiniteGradientPolicy.ZeroNonFinite"/>) every NaN or infinite
+    /// element becomes +0 instead.</summary>
+    void MultiTensorClipScale(System.Collections.Generic.IReadOnlyList<IGpuBuffer> tensors,
+        System.Collections.Generic.IReadOnlyList<int> sizes, IGpuBuffer scale, bool zeroNonFinite);
+
     /// <summary>Downloads a <see cref="MultiTensorSumOfSquares"/> result (the layout is this backend's) as a
     /// double. A host read: callers defer it until the value is actually wanted.</summary>
     double ReadSumOfSquares(IGpuBuffer sumOfSquares);

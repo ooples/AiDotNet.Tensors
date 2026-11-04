@@ -210,6 +210,64 @@ public class DeterministicGradientNormReferenceTests
         }
     }
 
+    public static IEnumerable<object[]> NonFiniteCases()
+    {
+        yield return new object[] { new[] { new[] { 3f, 4f }, new[] { float.NaN, 1e20f } }, 1f };
+        yield return new object[] { new[] { new[] { 3e20f, float.PositiveInfinity, -4e20f } }, 1f };
+        yield return new object[] { new[] { Random(9000, 1e3, 21), new[] { float.NegativeInfinity, float.NaN, 0.5f } }, 0.25f };
+        yield return new object[] { new[] { new[] { float.NaN, float.PositiveInfinity } }, 1f };
+        yield return new object[] { new[] { new[] { 1e-3f, float.NaN } }, 10f };
+    }
+
+    /// <summary>ZeroNonFinite clips by the norm the gradients would have with their NaN/Inf elements zeroed: its
+    /// coefficient is the finite record's for that zeroed copy, an independent route to the same bits.</summary>
+    [Theory]
+    [MemberData(nameof(NonFiniteCases))]
+    public void ZeroNonFinite_ClipsByTheNormOfTheFiniteElements(float[][] tensors, float maxNorm)
+    {
+        var zeroed = tensors.Select(t => t.Select(x => float.IsNaN(x) || float.IsInfinity(x) ? 0f : x).ToArray()).ToArray();
+        uint[] z = N.Compute(tensors, maxNorm, NonFiniteGradientPolicy.ZeroNonFinite);
+        uint[] f = N.Compute(zeroed, maxNorm);
+        Assert.Equal(f[N.WordScale], z[N.WordScale]);
+        Assert.Equal(1u, z[N.WordNonFinite]);
+        // The record still reports the gradients as they were.
+        uint[] leave = N.Compute(tensors, maxNorm);
+        Assert.Equal(leave[N.WordNorm], z[N.WordNorm]);
+        Assert.Equal(leave[N.WordNanCount], z[N.WordNanCount]);
+        Assert.Equal(leave[N.WordInfCount], z[N.WordInfCount]);
+    }
+
+    [Theory]
+    [MemberData(nameof(NonFiniteCases))]
+    public void CpuClipGradNorm_EveryNonFinitePolicy_MatchesTheReference(float[][] tensors, float maxNorm)
+    {
+        foreach (var policy in new[] { NonFiniteGradientPolicy.LeaveUnscaled, NonFiniteGradientPolicy.Propagate,
+                     NonFiniteGradientPolicy.ZeroNonFinite, NonFiniteGradientPolicy.Error })
+        {
+            var grads = tensors.Select(t => new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(new[] { t.Length },
+                new AiDotNet.Tensors.LinearAlgebra.Vector<float>((float[])t.Clone()))).ToArray();
+            if (policy == NonFiniteGradientPolicy.Error)
+            {
+                var ex = Assert.Throws<ArithmeticException>(() =>
+                    AiDotNet.Tensors.Engines.Compilation.GradientClipping.ClipGradNorm(grads, maxNorm, policy));
+                Assert.Contains("gradient " + Array.FindIndex(tensors, t => t.Any(x => float.IsNaN(x) || float.IsInfinity(x))), ex.Message);
+                for (int t = 0; t < tensors.Length; t++)
+                    Assert.Equal(tensors[t].Select(N.SingleToUInt32Bits), grads[t].ToArray().Select(N.SingleToUInt32Bits));
+                continue;
+            }
+            uint[] r = N.Compute(tensors, maxNorm, policy);
+            bool zero = policy == NonFiniteGradientPolicy.ZeroNonFinite;
+            float norm = AiDotNet.Tensors.Engines.Compilation.GradientClipping.ClipGradNorm(grads, maxNorm, policy);
+            Assert.Equal(r[N.WordNorm], N.SingleToUInt32Bits(norm));
+            for (int t = 0; t < tensors.Length; t++)
+            {
+                var after = grads[t].ToArray();
+                for (int i = 0; i < after.Length; i++)
+                    Assert.Equal(N.ScaleElement(N.SingleToUInt32Bits(tensors[t][i]), r[N.WordScale], zero), N.SingleToUInt32Bits(after[i]));
+            }
+        }
+    }
+
     [Fact]
     public void CpuClipGradNorm_LargeTensor_ParallelChunksMatchTheSerialReference()
     {

@@ -370,8 +370,8 @@ layout(push_constant) uniform PC { uint maxNormBits; uint policy; };
 void main() {
     if (gl_GlobalInvocationID.x != 0u) return;
     uint s;
-    if (rec[7] != 0u) s = policy != 0u ? 0x7FC00000u : 0x3F800000u;
-    else if (rec[8] != 0u) s = policy != 0u ? 0u : 0x3F800000u;
+    if (rec[7] != 0u && policy != 2u) s = policy == 1u ? 0x7FC00000u : 0x3F800000u;
+    else if (rec[8] != 0u && policy != 2u) s = policy == 1u ? 0u : 0x3F800000u;
     else
     {
         uint nm; int ne; bool ns;
@@ -387,10 +387,10 @@ void main() {
 layout(local_size_x = 256) in;
 layout(set=0,binding=0) readonly buffer Sb { uint scale[]; };
 layout(set=0,binding=1) buffer Xb { uint x[]; };
-layout(push_constant) uniform PC { uint n; };
+layout(push_constant) uniform PC { uint n; uint zeroNonFinite; };
 " + Common + @"
 void main() {
     uint i = gl_GlobalInvocationID.x;
-    if (i < n) x[i] = dgn_mul(x[i], scale[0]);
+    if (i < n) x[i] = (zeroNonFinite != 0u && ((x[i] >> 23) & 0xFFu) == 0xFFu) ? 0u : dgn_mul(x[i], scale[0]);
 }";
 }

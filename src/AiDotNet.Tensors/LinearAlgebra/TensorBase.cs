@@ -3597,6 +3597,37 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     }
 
     /// <summary>
+    /// Replaces every logical element with <paramref name="map"/> of it, in place, preserving strided-view and
+    /// copy-on-write semantics (the general form of <see cref="ScaleLogicalInPlace"/>).
+    /// </summary>
+    internal void MapLogicalInPlace(Func<T, T> map)
+    {
+        EnsureMaterialized();
+        if (Length == 0)
+            return;
+        EnsureNonOverlappingWritableLayout();
+        EnsureOwnedForWrite();
+
+        var destination = _storage.AsWritableSpan();
+        if (IsContiguous)
+        {
+            var logical = destination.Slice(_storageOffset, Length);
+            for (int i = 0; i < logical.Length; i++)
+                logical[i] = map(logical[i]);
+        }
+        else
+        {
+            for (int i = 0; i < Length; i++)
+            {
+                int storageIndex = FlatIndexToStorageIndex(i);
+                destination[storageIndex] = map(destination[storageIndex]);
+            }
+        }
+
+        IncrementVersion();
+    }
+
+    /// <summary>
     /// Clamps every logical element in place while preserving strided-view and
     /// copy-on-write semantics. The operation touches only the tensor's logical
     /// region; storage padding and unrelated elements surrounding a view are left
