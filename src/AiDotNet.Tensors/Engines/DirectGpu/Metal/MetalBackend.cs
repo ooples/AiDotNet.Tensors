@@ -82,6 +82,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     private IntPtr _extendedConvLibrary;
     private IntPtr _fusedAdvancedLibrary;
     private IntPtr _residentLibrary;
+    private IntPtr _normLibrary;
     // Sparse-op compute kernels (CSR SpMM + SDDMM). Compiled from
     // MetalSparseKernels.Source; the sparse-autograd backward's dB and dA
     // dispatch through here on Apple hardware without touching MPS.
@@ -290,6 +291,19 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         {
             System.Diagnostics.Debug.WriteLine($"Metal resident-kernel pre-compilation warning: {ex.Message}");
             _residentLibrary = IntPtr.Zero;
+        }
+
+        // The deterministic global-norm clip (DeterministicNormKernels): integer arithmetic, the same bits as every
+        // other backend.
+        try
+        {
+            _normLibrary = _shaderLibrary.CompileLibrary("DeterministicNorm",
+                DeterministicNormKernels.Source(DeterministicNormKernels.Dialect.Metal));
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Metal deterministic-norm pre-compilation warning: {ex.Message}");
+            _normLibrary = IntPtr.Zero;
         }
 
         // Tuned-kernel registry variants and split references (#1116). Without it every tuned slot runs its reference.

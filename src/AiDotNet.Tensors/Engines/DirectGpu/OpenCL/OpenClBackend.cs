@@ -553,6 +553,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, finiteGuardProgram, name);
                 }
+                // The deterministic global-norm clip: integer arithmetic, built NaN-preserving like the guards
+                // (DeterministicNormKernels; the same bits as every other backend).
+                var deterministicNormProgram = CompileOrLoadCached(DeterministicNormKernels.Source(DeterministicNormKernels.Dialect.OpenCl),
+                    OpenClBuildOptions.SafeMathFlags, "Deterministic norm kernels");
+                _programs.Add(deterministicNormProgram);
+                foreach (var name in DeterministicNormKernels.PerTensorKernelNames)
+                {
+                    _kernelCache[name] = new DirectOpenClKernel(_context, deterministicNormProgram, name);
+                }
 
                 // Compile mixed precision kernels only if device actually supports FP16
                 // This is non-fatal - if compilation fails, we fall back to no FP16 support

@@ -70,6 +70,10 @@ void main() {
             GlslUnaryOp(ScaleByDeviceScalarGlsl, scale, tensors[t], sizes[t], new[] { (uint)sizes[t] }, sizeof(uint));
     }
 
+    // TODO-PORT placeholder replaced by the u32 port below.
+    void IMultiTensorKernels.ClipScaleFromRecord(IGpuBuffer sumOfSquares, float maxNorm, IGpuBuffer scale, Gpu.NonFiniteGradientPolicy policy)
+        => ClipScaleFromSumOfSquares(sumOfSquares, maxNorm, scale);
+
     /// <inheritdoc />
     double IMultiTensorKernels.ReadSumOfSquares(IGpuBuffer sumOfSquares)
     {

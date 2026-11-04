@@ -10,3 +10,12 @@ static extern AiDotNet.Tensors.Engines.CuBlasNative.cuMemPoolGetAttribute(nint p
 AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuBackend.OneHotInt32(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! int32Indices, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int rows, int depth) -> void
 static AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuInstantNgpKernels.OneHotInt32.get -> string!
 AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuBackend.Adam8BitUpdate(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! param, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! gradient, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! mQuant, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! vQuant, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! mScales, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! vScales, float learningRate, float beta1, float beta2, float epsilon, float oneMinusBeta1, float oneMinusBeta2, float biasCorrection1, float biasCorrection2, int blockSize, int paramLength, int numBlocks, float weightDecay, bool decoupledWeightDecay) -> void
+AiDotNet.Tensors.Engines.Gpu.DeviceGradientNorm.ClipCoefficient.get -> float
+AiDotNet.Tensors.Engines.Gpu.DeviceGradientNorm.FirstNonFiniteGradient.get -> int
+AiDotNet.Tensors.Engines.Gpu.DeviceGradientNorm.InfinityCount.get -> long
+AiDotNet.Tensors.Engines.Gpu.DeviceGradientNorm.NanCount.get -> long
+AiDotNet.Tensors.Engines.Gpu.DeviceGradientNorm.Norm.get -> float
+AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy
+AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy.LeaveUnscaled = 0 -> AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy
+AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy.Propagate = 1 -> AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy
+static AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TryClipGradNorm(System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.LinearAlgebra.Tensor<float>!>! gradients, double maxNorm, AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy nonFinite) -> AiDotNet.Tensors.Engines.Gpu.DeviceGradientNorm?

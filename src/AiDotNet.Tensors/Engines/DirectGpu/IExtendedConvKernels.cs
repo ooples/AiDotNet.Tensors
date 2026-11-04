@@ -193,21 +193,26 @@ internal interface IRectSliceKernels
 /// every gradient instead of one chain per tensor (~630 launches per N-BEATS step on the per-tensor loop).
 /// </summary>
 /// <remarks>
-/// Implemented by all six GPU backends. CUDA and HIP launch once over every tensor through a device table of buffer
-/// addresses and accumulate in double. OpenCL, Metal, Vulkan and WebGPU cannot address an arbitrary buffer from a
-/// table, so they launch one work-group reduction per tensor, accumulating in float in launch order (deterministic):
-/// one launch per tensor against the four of the plan's per-tensor loop. The <c>sumOfSquares</c> layout is private
-/// to the backend that wrote it; only that backend's <see cref="ClipScaleFromSumOfSquares"/> reads it.
+/// Implemented by all six GPU backends, every one to <see cref="Gpu.DeterministicGradientNorm"/>'s integer definition,
+/// so the record, the coefficient and the scaled gradients have the same bits on every backend and on the CPU. CUDA and
+/// HIP launch once over every tensor through a device table of buffer addresses; OpenCL, Metal, Vulkan and WebGPU
+/// cannot address an arbitrary buffer from a table, so they launch one chunk reduction per tensor. A second launch
+/// combines the chunk partials.
 /// </remarks>
 internal interface IMultiTensorKernels
 {
-    /// <summary>Writes the sum of squares of every element of every tensor to
-    /// <paramref name="sumOfSquares"/> (at least two float slots).</summary>
+    /// <summary>Writes the deterministic norm record (<see cref="Gpu.DeterministicGradientNorm"/>, at least
+    /// <see cref="Gpu.DeterministicGradientNorm.RecordWords"/> slots; its first two hold the double sum of squares)
+    /// of every element of every tensor to <paramref name="sumOfSquares"/>: the same bits on every backend.</summary>
     void MultiTensorSumOfSquares(System.Collections.Generic.IReadOnlyList<IGpuBuffer> tensors,
         System.Collections.Generic.IReadOnlyList<int> sizes, IGpuBuffer sumOfSquares);
 
     /// <summary>Writes PyTorch's clip_grad_norm_ coefficient, min(1, maxNorm / (norm + 1e-6)), to
-    /// <paramref name="scale"/> on the device, from a <see cref="MultiTensorSumOfSquares"/> result.</summary>
+    /// <paramref name="scale"/> and the record on the device, from a <see cref="MultiTensorSumOfSquares"/> record;
+    /// <paramref name="policy"/> sets it for a non-finite element.</summary>
+    void ClipScaleFromRecord(IGpuBuffer sumOfSquares, float maxNorm, IGpuBuffer scale, Gpu.NonFiniteGradientPolicy policy);
+
+    /// <summary><see cref="ClipScaleFromRecord"/> with <see cref="Gpu.NonFiniteGradientPolicy.LeaveUnscaled"/>.</summary>
     void ClipScaleFromSumOfSquares(IGpuBuffer sumOfSquares, float maxNorm, IGpuBuffer scale);
 
     /// <summary>Scales every tensor in place by the device scalar <paramref name="scale"/>.</summary>
@@ -249,6 +254,23 @@ internal static class MultiTensorArgs
         Array.Copy(BitConverter.GetBytes(slots[1]), 0, bytes, 4, 4);
         if (!BitConverter.IsLittleEndian) Array.Reverse(bytes);
         return BitConverter.ToDouble(bytes, 0);
+    }
+
+    /// <summary>A norm record (<see cref="Gpu.DeterministicGradientNorm.RecordWords"/> words) from its float slots.</summary>
+    internal static uint[] RecordFromSlots(float[] slots)
+    {
+        if (slots is null || slots.Length < Gpu.DeterministicGradientNorm.RecordWords)
+            throw new ArgumentException("A norm record needs RecordWords slots.", nameof(slots));
+        var words = new uint[Gpu.DeterministicGradientNorm.RecordWords];
+        Buffer.BlockCopy(slots, 0, words, 0, words.Length * sizeof(uint));
+        return words;
+    }
+
+    internal static void ValidateRecordBuffer(IGpuBuffer record)
+    {
+        if (record is null) throw new ArgumentNullException(nameof(record));
+        if (record.Size < Gpu.DeterministicGradientNorm.RecordWords)
+            throw new ArgumentException($"A norm record needs {Gpu.DeterministicGradientNorm.RecordWords} slots.", nameof(record));
     }
 
     internal static void ValidateSumBuffer(IGpuBuffer sumOfSquares)

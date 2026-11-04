@@ -1322,6 +1322,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // neuralnet module (adam/adagrad/rmsprop/lamb/adamw/sgd/... were dead),
         // so every optimizer silently fell back to the CPU weight update.
         CompileKernelModule(device, CudaOptimizerKernels.GetSource(), "optimizer_kernels", CudaOptimizerKernels.GetKernelNames());
+        // The deterministic global-norm clip: integer arithmetic only, so the same bits on every device (DeterministicNormKernels).
+        CompileKernelModule(device, DeterministicNormKernels.Source(DeterministicNormKernels.Dialect.Cuda), "deterministic_norm_kernels",
+            DeterministicNormKernels.CudaKernelNames);
 
         // Compile reduction kernels (mean, variance, std, norm, logsumexp, product, cumsum)
         CompileKernelModule(device, CudaReductionKernels.GetSource(), "reduction_kernels", CudaReductionKernels.GetKernelNames());
@@ -14680,19 +14683,25 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     }
 
     /// <summary>
-    /// The clip_grad_norm_ coefficient min(1, maxNorm / (norm + 1e-6)) from <see cref="MultiTensorSumOfSquares"/>'s
-    /// result, computed on the device into <paramref name="scale"/> (one float). A non-finite norm yields 1.
+    /// The clip_grad_norm_ coefficient min(1, maxNorm / (norm + 1e-6)) from an <see cref="IMultiTensorKernels"/> norm
+    /// record, computed on the device into <paramref name="scale"/> (one float) and the record, in integers
+    /// (<see cref="Gpu.DeterministicGradientNorm"/>): NaN when an element was NaN, 0 when one was infinite.
     /// </summary>
     public unsafe void ClipScaleFromSumOfSquares(IGpuBuffer sumOfSquares, float maxNorm, IGpuBuffer scale)
+        => ((IMultiTensorKernels)this).ClipScaleFromRecord(sumOfSquares, maxNorm, scale, Gpu.NonFiniteGradientPolicy.LeaveUnscaled);
+
+    unsafe void IMultiTensorKernels.ClipScaleFromRecord(IGpuBuffer sumOfSquares, float maxNorm, IGpuBuffer scale,
+        Gpu.NonFiniteGradientPolicy policy)
     {
-        if (sumOfSquares is null) throw new ArgumentNullException(nameof(sumOfSquares));
+        MultiTensorArgs.ValidateRecordBuffer(sumOfSquares);
         if (scale is null) throw new ArgumentNullException(nameof(scale));
-        if (!_kernelCache.TryGetValue("clip_scale_from_sum_squares", out var kernel))
-            throw new GpuCapabilityUnavailableException("CUDA kernel not found: clip_scale_from_sum_squares");
+        if (!_kernelCache.TryGetValue("dgn_clip_scale", out var kernel))
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: dgn_clip_scale");
         using var _ = PushContext();
         IntPtr sH = sumOfSquares.Handle, cH = scale.Handle;
-        void** args = stackalloc void*[3];
-        args[0] = &sH; args[1] = &maxNorm; args[2] = &cH;
+        uint bits = Gpu.DeterministicGradientNorm.SingleToUInt32Bits(maxNorm), pol = (uint)policy;
+        void** args = stackalloc void*[4];
+        args[0] = &sH; args[1] = &bits; args[2] = &pol; args[3] = &cH;
         LaunchKernel(kernel, 1, 1, args);
     }
 
@@ -14701,8 +14710,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         if (scale is null) throw new ArgumentNullException(nameof(scale));
         if (tensors is null || tensors.Count == 0) return;
-        if (!_kernelCache.TryGetValue("multi_tensor_scale_by_device_scalar", out var kernel))
-            throw new GpuCapabilityUnavailableException("CUDA kernel not found: multi_tensor_scale_by_device_scalar");
+        // dgn_mul: one IEEE multiply that keeps subnormal operands and products (this module's fast-math flushes them).
+        if (!_kernelCache.TryGetValue("dgn_multi_tensor_scale", out var kernel))
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: dgn_multi_tensor_scale");
         void** args = stackalloc void*[6];
         lock (_gradientTableSync)
         {
@@ -14711,8 +14721,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             IntPtr pH = table.Pointers!.Handle, sH = table.SizesBuffer!.Handle, ctH = table.ChunkTensor!.Handle, csH = table.ChunkStart!.Handle;
             IntPtr scH = scale.Handle;
             int totalChunks = table.TotalChunks;
-            args[0] = &pH; args[1] = &sH; args[2] = &ctH; args[3] = &csH; args[4] = &scH; args[5] = &totalChunks;
-            LaunchKernel(kernel, (uint)Math.Min(totalChunks, MultiTensorScaleMaxBlocks), MultiTensorChunk, args);
+            args[0] = &pH; args[1] = &sH; args[2] = &ctH; args[3] = &csH; args[4] = &totalChunks; args[5] = &scH;
+            LaunchKernel(kernel, (uint)Math.Min(totalChunks, MultiTensorScaleMaxBlocks), DeterministicNormKernels.GroupSize, args);
         }
     }
 
@@ -18850,6 +18860,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             {
                 _gradientTable?.Dispose();
                 _gradientTable = null;
+                _normPartials?.Dispose();
+                _normPartials = null;
             }
             lock (_adamTableSync)
             {

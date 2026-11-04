@@ -28,7 +28,8 @@ namespace AiDotNet.Tensors.Engines.Gpu;
 /// <c>d = fp32(n + 1e-6f)</c>, <c>coef = fp32(maxNorm / d)</c>, <c>scale = min(1, coef)</c>, each rounding as an
 /// IEEE fp32 operation would, but with no overflow: a norm past <c>float.MaxValue</c> still yields its exact
 /// coefficient (which may be subnormal). A non-finite element makes the norm NaN (any NaN) or +Inf, and the
-/// coefficient NaN or 0, as PyTorch's would be; the record also counts them for the non-finite policies.</para>
+/// coefficient NaN or 0 as PyTorch's would be under <see cref="NonFiniteGradientPolicy.Propagate"/> (1 under
+/// <see cref="NonFiniteGradientPolicy.LeaveUnscaled"/>); the record counts them either way.</para>
 /// <para><b>Scaling.</b> <c>g * scale</c> is one IEEE multiply. Kernels compute it in integers whenever an operand
 /// or the product is subnormal, so devices that flush subnormals still match.</para>
 /// </remarks>
@@ -121,7 +122,8 @@ internal static class DeterministicGradientNorm
     }
 
     /// <summary>Combines chunk partials into a norm record for <paramref name="maxNorm"/>.</summary>
-    public static uint[] Combine(IReadOnlyList<Partial> partials, float maxNorm)
+    public static uint[] Combine(IReadOnlyList<Partial> partials, float maxNorm,
+        NonFiniteGradientPolicy policy = NonFiniteGradientPolicy.LeaveUnscaled)
     {
         if (partials is null) throw new ArgumentNullException(nameof(partials));
         int h = Headroom(partials.Count);
@@ -144,11 +146,12 @@ internal static class DeterministicGradientNorm
                 Add128(ref aLo, ref aHi, lo, hi);
             }
         int v = g == 0 ? 0 : 2 * (int)g - 368 + h;
-        return Finish(aLo, aHi, v, nan, inf, first, maxNorm);
+        return Finish(aLo, aHi, v, nan, inf, first, maxNorm, policy);
     }
 
     /// <summary>The record from the exact sum <c>A * 2^V</c> and the non-finite counts (the kernels' last step).</summary>
-    public static uint[] Finish(ulong aLo, ulong aHi, int v, uint nan, uint inf, uint first, float maxNorm)
+    public static uint[] Finish(ulong aLo, ulong aHi, int v, uint nan, uint inf, uint first, float maxNorm,
+        NonFiniteGradientPolicy policy = NonFiniteGradientPolicy.LeaveUnscaled)
     {
         var r = new uint[RecordWords];
         r[WordA0] = (uint)aLo; r[WordA0 + 1] = (uint)(aLo >> 32); r[WordA0 + 2] = (uint)aHi; r[WordA0 + 3] = (uint)(aHi >> 32);
@@ -157,8 +160,9 @@ internal static class DeterministicGradientNorm
         r[WordMaxNorm] = SingleToUInt32Bits(maxNorm);
         ulong dbl;
         uint norm, scale;
-        if (nan != 0) { dbl = 0x7FF8000000000000UL; norm = 0x7FC00000; scale = 0x7FC00000; }
-        else if (inf != 0) { dbl = 0x7FF0000000000000UL; norm = 0x7F800000; scale = 0; }
+        bool propagate = policy == NonFiniteGradientPolicy.Propagate;
+        if (nan != 0) { dbl = 0x7FF8000000000000UL; norm = 0x7FC00000; scale = propagate ? 0x7FC00000u : 0x3F800000u; }
+        else if (inf != 0) { dbl = 0x7FF0000000000000UL; norm = 0x7F800000; scale = propagate ? 0u : 0x3F800000u; }
         else
         {
             dbl = ToDoubleBits(aLo, aHi, v);
@@ -173,7 +177,8 @@ internal static class DeterministicGradientNorm
     }
 
     /// <summary>The record for host tensors: the CPU engine's clip uses this so its bits match every device.</summary>
-    public static uint[] Compute(IReadOnlyList<float[]> tensors, float maxNorm) => Combine(Partials(tensors), maxNorm);
+    public static uint[] Compute(IReadOnlyList<float[]> tensors, float maxNorm,
+        NonFiniteGradientPolicy policy = NonFiniteGradientPolicy.LeaveUnscaled) => Combine(Partials(tensors), maxNorm, policy);
 
     /// <summary>sqrt(A * 2^V) as m * 2^e (m has 27 bits, or 0) plus a sticky bit for the inexact remainder.</summary>
     public static void Sqrt(ulong aLo, ulong aHi, int v, out ulong m, out int e, out bool sticky)
@@ -249,6 +254,21 @@ internal static class DeterministicGradientNorm
         int biased = ulp + 23 + 127;
         if (biased >= 255) return 0x7F800000;
         return ((uint)biased << 23) | (uint)(q & 0x7FFFFF);
+    }
+
+    /// <summary>g * s as one IEEE fp32 multiply (ties to even, subnormals kept), with NaN results canonical
+    /// (0x7FC00000) so they too have the same bits everywhere; the kernels' dgn_mul.</summary>
+    public static uint Mul(uint g, uint s)
+    {
+        uint eg = (g >> 23) & 0xFF, es = (s >> 23) & 0xFF;
+        uint fg = g & 0x7FFFFF, fs = s & 0x7FFFFF, sign = (g ^ s) & 0x80000000u;
+        if ((eg == 0xFF && fg != 0) || (es == 0xFF && fs != 0)) return 0x7FC00000;
+        bool gzero = eg == 0 && fg == 0, szero = es == 0 && fs == 0;
+        if (eg == 0xFF || es == 0xFF) return gzero || szero ? 0x7FC00000u : sign | 0x7F800000u;
+        if (gzero || szero) return sign;
+        ulong prod = (ulong)(fg | (eg != 0 ? 0x800000u : 0u)) * (fs | (es != 0 ? 0x800000u : 0u));
+        int e = (eg != 0 ? (int)eg : 1) + (es != 0 ? (int)es : 1) - 300;
+        return RoundToFloat(prod, e, false) | sign;
     }
 
     /// <summary>The exact sum of squares as a double (ties to even); A * 2^V never leaves the double range.</summary>

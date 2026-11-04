@@ -2,13 +2,13 @@ using System.Collections.Generic;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 {
-    // The global-norm clip as one work-group reduction per tensor (no device address tables on OpenCL), the OpenCL
-    // port of CudaBackend's IMultiTensorKernels. The per-tensor launches accumulate a float sum and a 2^-80-scaled sum;
-    // a last launch finishes them as the double CUDA writes (NaN when any element was not finite), so the same buffer
-    // also serves IDeviceScalarOps and the device-guarded optimizer updates (#1502).
+    // The global-norm clip as chunk reductions per tensor (no device address tables on OpenCL), the OpenCL port of
+    // CudaBackend's IMultiTensorKernels: the deterministic record (Gpu.DeterministicGradientNorm). FinishSumOfSquaresDouble
+    // still serves the float-and-scaled-sum accumulator of IDeviceScalarOps and the device-guarded updates (#1502).
     public sealed partial class OpenClBackend : IMultiTensorKernels
     {
-        public void MultiTensorSumOfSquares(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer sumOfSquares)
+        // The finiteness reduction IDeviceScalarOps promises (a double in two slots): float and 2^-80-scaled sums.
+        internal void FinitenessSumOfSquares(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer sumOfSquares)
         {
             MultiTensorArgs.ValidateSumBuffer(sumOfSquares);
             MultiTensorArgs.Validate(tensors, sizes);
@@ -25,6 +25,44 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             FinishSumOfSquaresDouble(sumOfSquares);
         }
 
+        private IGpuBuffer? _normPartials;
+
+        // The deterministic norm record (Gpu.DeterministicGradientNorm): one chunk-reduction launch per tensor writes
+        // that tensor's partials, then one group combines them all.
+        public void MultiTensorSumOfSquares(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer sumOfSquares)
+        {
+            MultiTensorArgs.ValidateRecordBuffer(sumOfSquares);
+            MultiTensorArgs.Validate(tensors, sizes);
+            int total = 0;
+            for (int t = 0; t < sizes.Count; t++) total += Gpu.DeterministicGradientNorm.ChunkCount(sizes[t]);
+            int words = System.Math.Max(1, total) * Gpu.DeterministicGradientNorm.PartialWords;
+            if (_normPartials is not { } partials || partials.Size < words)
+            {
+                _normPartials?.Dispose();
+                partials = _normPartials = AllocateBuffer(System.Math.Max(words, 64 * Gpu.DeterministicGradientNorm.PartialWords));
+            }
+            var p = ((DirectOpenClGpuBuffer)partials).Buffer.Handle;
+            var chunk = _kernelCache["dgn_chunk_partials_tensor"];
+            int first = 0;
+            for (int t = 0; t < tensors.Count; t++)
+            {
+                int chunks = Gpu.DeterministicGradientNorm.ChunkCount(sizes[t]);
+                chunk.SetArg(0, ((DirectOpenClGpuBuffer)tensors[t]).Buffer.Handle);
+                chunk.SetArg(1, sizes[t]);
+                chunk.SetArg(2, (uint)t);
+                chunk.SetArg(3, first);
+                chunk.SetArg(4, p);
+                chunk.Execute1D(chunks * DeterministicNormKernels.GroupSize, DeterministicNormKernels.GroupSize);
+                first += chunks;
+            }
+            var finish = _kernelCache["dgn_finish"];
+            finish.SetArg(0, p);
+            finish.SetArg(1, total);
+            finish.SetArg(2, Gpu.DeterministicGradientNorm.Headroom(total));
+            finish.SetArg(3, ((DirectOpenClGpuBuffer)sumOfSquares).Buffer.Handle);
+            finish.Execute1D(DeterministicNormKernels.GroupSize, DeterministicNormKernels.GroupSize);
+        }
+
         // Turns the float sum and scaled sum in the buffer's two slots into the double they stand for.
         internal void FinishSumOfSquaresDouble(IGpuBuffer accumulator)
         {
@@ -34,13 +72,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
 
         public void ClipScaleFromSumOfSquares(IGpuBuffer sumOfSquares, float maxNorm, IGpuBuffer scale)
+            => ((IMultiTensorKernels)this).ClipScaleFromRecord(sumOfSquares, maxNorm, scale, Gpu.NonFiniteGradientPolicy.LeaveUnscaled);
+
+        void IMultiTensorKernels.ClipScaleFromRecord(IGpuBuffer sumOfSquares, float maxNorm, IGpuBuffer scale,
+            Gpu.NonFiniteGradientPolicy policy)
         {
-            MultiTensorArgs.ValidateSumBuffer(sumOfSquares);
+            MultiTensorArgs.ValidateRecordBuffer(sumOfSquares);
             if (scale is null) throw new System.ArgumentNullException(nameof(scale));
-            var kernel = _kernelCache["clip_scale_from_sum_squares"];
+            var kernel = _kernelCache["dgn_clip_scale"];
             kernel.SetArg(0, ((DirectOpenClGpuBuffer)sumOfSquares).Buffer.Handle);
-            kernel.SetArg(1, maxNorm);
-            kernel.SetArg(2, ((DirectOpenClGpuBuffer)scale).Buffer.Handle);
+            kernel.SetArg(1, Gpu.DeterministicGradientNorm.SingleToUInt32Bits(maxNorm));
+            kernel.SetArg(2, (uint)policy);
+            kernel.SetArg(3, ((DirectOpenClGpuBuffer)scale).Buffer.Handle);
             kernel.Execute1D(1, 1);
         }
 
@@ -48,7 +91,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             if (scale is null) throw new System.ArgumentNullException(nameof(scale));
             MultiTensorArgs.Validate(tensors, sizes);
-            var kernel = _kernelCache["scale_by_device_scalar_inplace"];
+            // dgn_mul: the IEEE product with subnormals kept, so a flush-to-zero device still matches the others.
+            var kernel = _kernelCache["dgn_scale_tensor"];
             var s = ((DirectOpenClGpuBuffer)scale).Buffer.Handle;
             for (int t = 0; t < tensors.Count; t++)
             {

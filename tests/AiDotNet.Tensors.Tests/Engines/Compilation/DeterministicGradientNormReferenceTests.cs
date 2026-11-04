@@ -132,7 +132,8 @@ public class DeterministicGradientNormReferenceTests
     [Fact]
     public void NonFinite_IsCountedAndPropagatesAsPyTorchWould()
     {
-        var r = N.Compute(new[] { new[] { 1f, 2f }, new[] { 1f, float.PositiveInfinity, float.NaN, float.NaN } }, 1f);
+        var r = N.Compute(new[] { new[] { 1f, 2f }, new[] { 1f, float.PositiveInfinity, float.NaN, float.NaN } }, 1f,
+            NonFiniteGradientPolicy.Propagate);
         Assert.Equal(2u, r[N.WordNanCount]);
         Assert.Equal(1u, r[N.WordInfCount]);
         Assert.Equal(1u, r[N.WordFirstNonFiniteTensor]);
@@ -141,9 +142,10 @@ public class DeterministicGradientNormReferenceTests
         Assert.True(float.IsNaN(F(r[N.WordScale])));
         Assert.True(double.IsNaN(RecordDouble(r)));
 
-        var inf = N.Compute(new[] { new[] { 1f, float.NegativeInfinity } }, 1f);
+        var inf = N.Compute(new[] { new[] { 1f, float.NegativeInfinity } }, 1f, NonFiniteGradientPolicy.Propagate);
         Assert.Equal(float.PositiveInfinity, F(inf[N.WordNorm]));
         Assert.Equal(0f, F(inf[N.WordScale]));
+        Assert.Equal(1f, F(N.Compute(new[] { new[] { 1f, float.NaN } }, 1f)[N.WordScale]));   // LeaveUnscaled
         Assert.Equal(uint.MaxValue, N.Compute(new[] { new[] { 1f } }, 1f)[N.WordFirstNonFiniteTensor]);
     }
 
@@ -171,6 +173,21 @@ public class DeterministicGradientNormReferenceTests
             float norm = F(r[N.WordNorm]);
             Assert.Equal(RoundSqrtToFloat(a, v), norm);
             Assert.Equal(ReferenceScale(a, v, maxNorm), F(r[N.WordScale]));
+        }
+    }
+
+    [Fact]
+    public void Mul_IsTheIeeeProduct_WithSubnormalsAndCanonicalNaN()
+    {
+        var rng = new Random(23);
+        for (int i = 0; i < 200000; i++)
+        {
+            uint g = (uint)rng.Next() ^ ((uint)rng.Next(2) << 31), s = (uint)rng.Next(0x3F800001);
+            if (i % 3 == 0) s &= 0x00FFFFFF;   // many subnormal and tiny scales
+            float expected = F(g) * F(s);
+            uint got = N.Mul(g, s);
+            if (float.IsNaN(expected)) Assert.Equal(0x7FC00000u, got);
+            else Assert.Equal(N.SingleToUInt32Bits(expected), got);
         }
     }
 

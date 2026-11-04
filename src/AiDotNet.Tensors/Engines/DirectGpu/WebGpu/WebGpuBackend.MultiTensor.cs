@@ -53,6 +53,10 @@ fn scale_by_device_scalar(@builtin(global_invocation_id) gid: vec3<u32>) {
                 MultiTensorParams(sizes[t], 0f), sizes[t]).GetAwaiter().GetResult();
     }
 
+    // TODO-PORT placeholder replaced by the u32 port below.
+    void IMultiTensorKernels.ClipScaleFromRecord(IGpuBuffer sumOfSquares, float maxNorm, IGpuBuffer scale, Gpu.NonFiniteGradientPolicy policy)
+        => ClipScaleFromSumOfSquares(sumOfSquares, maxNorm, scale);
+
     /// <inheritdoc />
     double IMultiTensorKernels.ReadSumOfSquares(IGpuBuffer sumOfSquares)
     {

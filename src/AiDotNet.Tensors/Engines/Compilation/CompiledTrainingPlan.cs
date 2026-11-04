@@ -12539,11 +12539,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 owners.Add(g);
             }
             if (buffers.Count == 0) return true;
-            var sumSquares = _clipSumSq is { Size: >= 2 } existing ? existing : null;
+            // A deterministic norm record (DeterministicGradientNorm): its first two words are the double sum of
+            // squares the finiteness check reuses (ClipSumOfSquaresCovers).
+            var sumSquares = _clipSumSq is { Size: >= Engines.Gpu.DeterministicGradientNorm.RecordWords } existing ? existing : null;
             if (sumSquares is null)
             {
                 _clipSumSq?.Dispose();
-                sumSquares = _clipSumSq = cb.AllocateBuffer(2);
+                sumSquares = _clipSumSq = cb.AllocateBuffer(Engines.Gpu.DeterministicGradientNorm.RecordWords);
             }
             var scale = _clipTmp ??= cb.AllocateBuffer(1);
             multi.MultiTensorSumOfSquares(buffers, sizes, sumSquares);
