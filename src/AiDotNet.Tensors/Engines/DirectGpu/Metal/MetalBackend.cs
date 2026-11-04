@@ -298,7 +298,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         try
         {
             _normLibrary = _shaderLibrary.CompileLibrary("DeterministicNorm",
-                DeterministicNormKernels.Source(DeterministicNormKernels.Dialect.Metal));
+                DeterministicNormKernels.Source(DeterministicNormKernels.Dialect.Metal), requireStrictFloatingPoint: true);
         }
         catch (InvalidOperationException ex)
         {
