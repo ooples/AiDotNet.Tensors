@@ -207,7 +207,12 @@ public class DLPackTorchInteropTests
         var backend = new AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend();
         if (!backend.IsAvailable)
         {
+            var state = backend.InitializationState;
+            var failure = backend.InitializationException;
             backend.Dispose();
+            // torch sees a ROCm device here, so a HIP backend that found one and failed to start is a defect.
+            if (state == AiDotNet.Tensors.Engines.DirectGpu.GpuBackendInitializationState.Failed)
+                throw new InvalidOperationException("A HIP device was found, but the HIP backend failed to initialize.", failure);
             throw new SkipException("No HIP device is available.");
         }
         var previous = AiDotNetEngine.Current;

@@ -710,12 +710,19 @@ public sealed class DLPackTests
         internal HipBackend Backend { get; }
         internal DirectGpuTensorEngine Engine { get; }
 
-        /// <summary>The engine; skips the test when this machine has no usable HIP device.</summary>
+        /// <summary>
+        /// The engine; skips the test when this machine has no HIP device, and fails it when a device was found but the
+        /// backend failed to initialize (stream creation, kernel compilation): that is a defect, not missing hardware.
+        /// </summary>
         internal static HipEngine CreateOrSkip()
         {
             var backend = new HipBackend();
             if (backend.IsAvailable) return new HipEngine(backend);
+            var state = backend.InitializationState;
+            var failure = backend.InitializationException;
             backend.Dispose();
+            if (state == GpuBackendInitializationState.Failed)
+                throw new InvalidOperationException("A HIP device was found, but the HIP backend failed to initialize.", failure);
             throw new SkipException("No HIP device is available.");
         }
 
@@ -807,12 +814,11 @@ public sealed class DLPackTests
     }
 
     [SkippableFact]
-    public async System.Threading.Tasks.Task Hip_ImportedTensor_RunsThroughGeneratedKernels_ElementwiseAndMatMul()
+    public async System.Threading.Tasks.Task Hip_ImportedTensor_RunsThroughAGeneratedKernel()
     {
         // An import wraps the producer's pointer in a non-owning HipGpuBuffer: every device path, the generated-kernel
         // one included, must take it.
         using var hip = HipEngine.CreateOrSkip();
-        var gpu = hip.Engine;
         var backend = hip.Backend;
         // Centered on zero so the ReLU kernel has both halves to get right.
         var values = Iota(4, 8).ToArray().Select(v => v - 16f).ToArray();
@@ -825,18 +831,40 @@ public sealed class DLPackTests
         var result = await AiDotNet.Tensors.Engines.Compilation.Codegen.NativeGpuCodegenExecutorExtensions.EmitAndExecuteCodegenKernelAsync(
             backend, graph, AiDotNet.Tensors.Engines.Compilation.Codegen.Ir.CodegenElementType.Float32,
             new[] { DeviceBuffer(imported) }, new[] { output }, values.Length);
-        Skip.If(result.Declined, "The HIP code generator declined the graph: " + result.DeclineReason);
+        // A float32 unary pointwise graph is within what the HIP generator emits: a decline is a regression.
+        Assert.False(result.Declined, "The HIP code generator declined the graph: " + result.DeclineReason);
         Assert.Equal(values.Select(v => Math.Max(v, 0f)).ToArray(), backend.DownloadBuffer(output));
+    }
 
-        using var sum = gpu.TensorAdd(imported, imported);
-        Assert.Equal(values.Select(v => 2 * v).ToArray(), sum.ToArray());
-        using var weights = new Tensor<float>(Enumerable.Repeat(1f, 8 * 2).ToArray(), new[] { 8, 2 });
-        using var product = gpu.TensorMatMul(imported, weights);
-        for (int r = 0; r < 4; r++)
+    [SkippableFact]
+    public void Hip_ImportedTensor_RunsThroughTheEngine_ElementwiseAndMatMul_WithoutCpuFallback()
+    {
+        using var hip = HipEngine.CreateOrSkip();
+        var gpu = hip.Engine;
+        var values = Iota(4, 8).ToArray().Select(v => v - 16f).ToArray();
+        using var source = new Tensor<float>(values, new[] { 4, 8 }).Gpu();
+        using var imported = Tensor<float>.FromDLPack(source.ToDLPack());
+
+        // Numbers alone would pass on the CPU fallback too: a fallback must fail the test, not hide behind it.
+        bool previous = DirectGpuTensorEngine.ThrowOnGpuKernelFallback;
+        DirectGpuTensorEngine.ThrowOnGpuKernelFallback = true;
+        try
         {
-            float rowSum = values.Skip(8 * r).Take(8).Sum();
-            Assert.Equal(rowSum, product.ToArray()[2 * r], 3);
-            Assert.Equal(rowSum, product.ToArray()[2 * r + 1], 3);
+            using var sum = gpu.TensorAdd(imported, imported);
+            Assert.Equal(values.Select(v => 2 * v).ToArray(), sum.ToArray());
+            using var weights = new Tensor<float>(Enumerable.Repeat(1f, 8 * 2).ToArray(), new[] { 8, 2 });
+            using var product = gpu.TensorMatMul(imported, weights);
+            float[] productHost = product.ToArray();
+            for (int r = 0; r < 4; r++)
+            {
+                float rowSum = values.Skip(8 * r).Take(8).Sum();
+                Assert.Equal(rowSum, productHost[2 * r], 3);
+                Assert.Equal(rowSum, productHost[2 * r + 1], 3);
+            }
+        }
+        finally
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = previous;
         }
     }
 
