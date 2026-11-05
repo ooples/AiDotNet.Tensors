@@ -220,7 +220,7 @@ extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg
     int rev = 0, t = idx;
     for (int i = 0; i < log2n; i++) { rev = (rev << 1) | (t & 1); t >>= 1; }
     // gridDim.y is capped at 65535; the host clamps it and this loop covers the rest.
-    for (int b = blockIdx.y; b < batch; b += gridDim.y)
+    for (unsigned int b = blockIdx.y; b < (unsigned int)batch; b += gridDim.y)
     {
         int base = b * n;
         dstRe[base + idx] = srcRe[base + rev];
@@ -246,7 +246,7 @@ extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg
     int offset = bf * stride + wing;
 
     // gridDim.y is capped at 65535; the host clamps it and this loop covers the rest.
-    for (int b = blockIdx.y; b < batch; b += gridDim.y)
+    for (unsigned int b = blockIdx.y; b < (unsigned int)batch; b += gridDim.y)
     {
         int top = b * n + offset;
         int bot = top + halfStride;
@@ -274,7 +274,7 @@ extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg
     if (idx >= m) return;
     float bR = kRe[idx], bI = kIm[idx];
     // gridDim.y is capped at 65535; the host clamps it and this loop covers the rest.
-    for (int b = blockIdx.y; b < batch; b += gridDim.y)
+    for (unsigned int b = blockIdx.y; b < (unsigned int)batch; b += gridDim.y)
     {
         int o = b * m + idx;
         float aR = re[o], aI = im[o];
@@ -311,7 +311,7 @@ extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg
     int rev = 0, t = idx;
     for (int i = 0; i < log2n; i++) { rev = (rev << 1) | (t & 1); t >>= 1; }
     // gridDim.y is capped at 65535; the host clamps it and this loop covers the rest.
-    for (int b = blockIdx.y; b < batch; b += gridDim.y)
+    for (unsigned int b = blockIdx.y; b < (unsigned int)batch; b += gridDim.y)
     {
         int base = b * n;
         dstRe[base + idx] = srcRe[base + rev];
@@ -336,7 +336,7 @@ extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg
     int offset = bf * stride + wing;
 
     // gridDim.y is capped at 65535; the host clamps it and this loop covers the rest.
-    for (int b = blockIdx.y; b < batch; b += gridDim.y)
+    for (unsigned int b = blockIdx.y; b < (unsigned int)batch; b += gridDim.y)
     {
         int top = b * n + offset;
         int bot = top + halfStride;
@@ -373,7 +373,7 @@ extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg
     float cR = pad ? 0.0f : chRe[idx];
     float cI = pad ? 0.0f : -chIm[idx];        // conjugate
     // gridDim.y is capped at 65535; the host clamps it and this loop covers the rest.
-    for (int b = blockIdx.y; b < batch; b += gridDim.y)
+    for (unsigned int b = blockIdx.y; b < (unsigned int)batch; b += gridDim.y)
     {
         int o = b * m + idx;
         if (pad) { wRe[o] = 0.0f; wIm[o] = 0.0f; continue; }
@@ -393,7 +393,7 @@ extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg
     if (idx >= n) return;
     float cR = chRe[idx], cI = -chIm[idx];        // conjugate
     // gridDim.y is capped at 65535; the host clamps it and this loop covers the rest.
-    for (int b = blockIdx.y; b < batch; b += gridDim.y)
+    for (unsigned int b = blockIdx.y; b < (unsigned int)batch; b += gridDim.y)
     {
         int o = b * m + idx;
         float aR = wRe[o] * scale, aI = wIm[o] * scale;

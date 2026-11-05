@@ -559,7 +559,7 @@ public class CudaFftGenericKernelTests
         string source = CudaFFTGenericKernels.GetSource(type);
         int loopCount = 0;
         int searchFrom = 0;
-        const string needle = "for (int b = blockIdx.y; b < batch; b += gridDim.y)";
+        const string needle = "for (unsigned int b = blockIdx.y; b < (unsigned int)batch; b += gridDim.y)";
         while ((searchFrom = source.IndexOf(needle, searchFrom, StringComparison.Ordinal)) >= 0)
         {
             loopCount++;
@@ -569,6 +569,7 @@ public class CudaFftGenericKernelTests
         // 3 shared float32 batched kernels + 4 typed batched kernels = 7 grid-stride loops per module.
         Assert.Equal(7, loopCount);
         Assert.DoesNotContain("\n    int b = blockIdx.y;", source);
+        Assert.DoesNotContain("for (int b = blockIdx.y;", source);
     }
 
     [SkippableTheory]

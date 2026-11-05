@@ -401,7 +401,7 @@ public sealed partial class CudaBackend : IGenericFftBackend
         using IGpuBuffer twiddleImaginary = AllocateFftScratchBuffer(half);
         BuildTwiddles(twiddleReal, twiddleImaginary, n, inverse);
 
-        int scratchFloatWords = type == FftElementType.Float32 ? count : (count + 1) / 2;
+        int scratchFloatWords = type == FftElementType.Float32 ? count : count / 2 + count % 2;
         using IGpuBuffer scratchReal = AllocateFftScratchBuffer(scratchFloatWords);
         using IGpuBuffer scratchImaginary = AllocateFftScratchBuffer(scratchFloatWords);
         IntPtr bitReverse = RequireGenericFftKernel("fftg_batched_bit_reverse" + type.KernelSuffix(), type);
