@@ -160,15 +160,22 @@ public sealed class OpenClCommandQueue : IGpuStream
         try
         {
             // A marker completes only once the device reaches it, so it must be submitted and given a moment: checked
-            // straight after enqueueing it reads as pending even on a queue that drained long ago. Flush, then poll
-            // for at most a millisecond; anything still running after that is genuinely incomplete.
+            // straight after enqueueing it reads as pending even on a queue that drained long ago. Flush, then poll.
+            // The window covers the driver's completion reporting, not device work: NVIDIA's OpenCL reports a marker
+            // on a drained queue through its event thread, which under load took over a millisecond on the RTX 3080
+            // runner, so a 1 ms window answered "busy" for a finished queue. Spin for the first millisecond, then
+            // yield up to 20 ms; only a queue with work still running reaches the end, and its caller waits anyway.
             OpenClNativeBindings.Flush(_handle);
-            var deadline = System.Diagnostics.Stopwatch.GetTimestamp() + System.Diagnostics.Stopwatch.Frequency / 1000;
+            long started = System.Diagnostics.Stopwatch.GetTimestamp();
+            long spinUntil = started + System.Diagnostics.Stopwatch.Frequency / 1000;
+            long deadline = started + System.Diagnostics.Stopwatch.Frequency / 50;
             while (true)
             {
                 if (QueryEventComplete(eventHandle)) return true;
-                if (System.Diagnostics.Stopwatch.GetTimestamp() >= deadline) return false;
-                System.Threading.Thread.SpinWait(64);
+                long now = System.Diagnostics.Stopwatch.GetTimestamp();
+                if (now >= deadline) return false;
+                if (now < spinUntil) System.Threading.Thread.SpinWait(64);
+                else System.Threading.Thread.Yield();
             }
         }
         finally
