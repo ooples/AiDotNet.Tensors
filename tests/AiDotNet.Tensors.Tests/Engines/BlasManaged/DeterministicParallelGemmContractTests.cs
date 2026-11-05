@@ -126,9 +126,11 @@ public class DeterministicParallelGemmContractTests
             ? Avx512Streaming.Fp32ColumnTileWidth
             : Avx2Streaming.IsSupported
                 ? Avx2Streaming.Fp32ColumnTileWidth
-                : NeonStreaming.IsSupported
-                    ? NeonStreaming.Fp32ColumnTileWidth
-                    : 1;
+                : AvxStreaming.IsSupported
+                    ? AvxStreaming.Fp32ColumnTileWidth
+                    : NeonStreaming.IsSupported
+                        ? NeonStreaming.Fp32ColumnTileWidth
+                        : 1;
         int expectedDouble = useAvx512
             ? Avx512Streaming.Fp64ColumnTileWidth
             : Avx2Streaming.IsSupported

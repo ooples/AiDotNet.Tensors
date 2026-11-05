@@ -148,10 +148,12 @@ jobs:
         # Throwing is not the only failure: a fallback can compute a different value and still return. AiDotNet's
         # Cross-ISA nightly saw DiffSeg, UniTS and MegaTTS train to a WORSE loss only with AVX2 off (DiffSeg 5.0 ->
         # 31.4), so the fallback hosts run every CPU kernel's value and gradient checks, not one fallback class.
+        # Conv1x1PerImageGemmTests sits outside those namespaces; its shared-weight route threw here unseen until
+        # AiDotNet's nightly hit it (ooples/AiDotNet#2388).
         DOTNET_EnableAVX2: '0'
       run: |
         dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-build --verbosity normal --framework net10.0 \
-          --filter "FullyQualifiedName~InstructionSetFallbackTests|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Simd.|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.BlasManaged.|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Autodiff.|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.OpParity.|FullyQualifiedName~AiDotNet.Tensors.Tests.Operators.|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Broadcasting." \
+          --filter "FullyQualifiedName~InstructionSetFallbackTests|FullyQualifiedName~Conv1x1PerImageGemmTests|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Simd.|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.BlasManaged.|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Autodiff.|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.OpParity.|FullyQualifiedName~AiDotNet.Tensors.Tests.Operators.|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Broadcasting." \
           --collect:"XPlat Code Coverage" \
           --results-directory ./coverage/avx2-off \
           -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura \

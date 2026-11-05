@@ -1500,6 +1500,17 @@ internal static class PackBothStrategy
                     ldc, kc);
                 return;
             }
+            // AVX without AVX2/FMA: the 8x8 tile with multiply + add, bit-matching the scalar N-tail below and
+            // AvxStreaming (see AvxFp32_8x8).
+            if (mr == 8 && nr == 8 && AvxFp32_8x8.IsSupported)
+            {
+                AvxFp32_8x8.Run(
+                    MemoryMarshal.Cast<T, float>(packedA),
+                    MemoryMarshal.Cast<T, float>(packedB),
+                    MemoryMarshal.Cast<T, float>(c),
+                    ldc, kc);
+                return;
+            }
             // Neon FP32 uses Mr=8 Nr=4. PickMicrokernelTile returns (8, 4) on ARM64
             // hosts where Neon is available but AVX is not.
             if (mr == 8 && nr == 4 && NeonFp32_8x4.IsSupported)
@@ -1514,6 +1525,17 @@ internal static class PackBothStrategy
             // (4, 4) is only reached when no SIMD is available (no AVX, no Neon).
             if (mr == 4 && nr == 4)
             {
+                // 128-bit sibling of the scalar kernel, bit-identical to it (see PortableFp32_4x4): the x64 path
+                // without AVX2, where the scalar kernel's spilling K-loop ran an SGEMM 30x slower than AVX2.
+                if (PortableFp32_4x4.IsSupported)
+                {
+                    PortableFp32_4x4.Run(
+                        MemoryMarshal.Cast<T, float>(packedA),
+                        MemoryMarshal.Cast<T, float>(packedB),
+                        MemoryMarshal.Cast<T, float>(c),
+                        ldc, kc);
+                    return;
+                }
                 ScalarFp32_4x4.Run(
                     MemoryMarshal.Cast<T, float>(packedA),
                     MemoryMarshal.Cast<T, float>(packedB),

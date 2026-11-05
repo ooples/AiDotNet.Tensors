@@ -355,11 +355,26 @@ internal static class PackAOnlyStrategy
                     MemoryMarshal.Cast<T, float>(c), ldc, kc);
                 return;
             }
+            // AVX without AVX2/FMA: the same 8x8 strided-B tile with multiply + add.
+            if (mr == 8 && nr == 8 && AvxFp32_8x8.IsSupported)
+            {
+                AvxFp32_8x8.RunStridedB(
+                    MemoryMarshal.Cast<T, float>(packedA),
+                    MemoryMarshal.Cast<T, float>(b), ldb,
+                    MemoryMarshal.Cast<T, float>(c), ldc, kc);
+                return;
+            }
             // Scalar fallback (no matching SIMD kernel — e.g. net471 / no-AVX2). The fixed 4×4
             // kernel is only correct for a 4×4 tile; the general kernel honors the actual mr×nr
             // (RunSerial packs A at the active mr and dispatches mr×nr tiles, so a 6×16/8×8 tile
             // would read packed-A at the wrong stride + compute only a 4×4 corner here).
-            if (mr == 4 && nr == 4)
+            if (mr == 4 && nr == 4 && PortableFp32_4x4.IsSupported)
+                // 128-bit sibling of the scalar kernel, bit-identical to it (see PortableFp32_4x4).
+                PortableFp32_4x4.RunStridedB(
+                    MemoryMarshal.Cast<T, float>(packedA),
+                    MemoryMarshal.Cast<T, float>(b), ldb,
+                    MemoryMarshal.Cast<T, float>(c), ldc, kc);
+            else if (mr == 4 && nr == 4)
                 ScalarFp32_4x4.RunStridedB(
                     MemoryMarshal.Cast<T, float>(packedA),
                     MemoryMarshal.Cast<T, float>(b), ldb,

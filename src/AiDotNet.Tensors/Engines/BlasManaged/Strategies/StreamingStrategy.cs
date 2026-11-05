@@ -389,6 +389,7 @@ internal static class StreamingStrategy
         {
             if (s_avx512Streaming && Avx512Streaming.IsSupported) return Avx512Streaming.Fp32ColumnTileWidth;
             if (Avx2Streaming.IsSupported) return Avx2Streaming.Fp32ColumnTileWidth;
+            if (AvxStreaming.IsSupported) return AvxStreaming.Fp32ColumnTileWidth;
             if (NeonStreaming.IsSupported) return NeonStreaming.Fp32ColumnTileWidth;
             return ScalarColumnTileWidth;
         }
@@ -492,6 +493,16 @@ internal static class StreamingStrategy
             if (Avx2Streaming.IsSupported)
             {
                 Avx2Streaming.RunFp32(
+                    MemoryMarshal.Cast<T, float>(a), lda, transA,
+                    MemoryMarshal.Cast<T, float>(b), ldb, transB,
+                    MemoryMarshal.Cast<T, float>(c), ldc,
+                    m, n, k);
+                return;
+            }
+            // AVX without AVX2/FMA: bit-matches AvxFp32_8x8's tiles (see AvxStreaming).
+            if (AvxStreaming.IsSupported)
+            {
+                AvxStreaming.RunFp32(
                     MemoryMarshal.Cast<T, float>(a), lda, transA,
                     MemoryMarshal.Cast<T, float>(b), ldb, transB,
                     MemoryMarshal.Cast<T, float>(c), ldc,
