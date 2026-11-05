@@ -5800,15 +5800,22 @@ public partial class DirectGpuTensorEngine
     // depend only on the transform shape, which a training step repeats. Rebuilding a batch*nFft table on the host and
     // uploading it on every call was the spectral layers' largest per-step host cost, so each table is uploaded once per
     // backend and shape. Bounded so a workload with ever-changing shapes falls back to a per-call upload instead of
-    // growing the cache without limit.
+    // growing the cache without limit. The byte budget caps device memory: one entry holds up to batch*nFft elements,
+    // so the entry count alone bounds nothing.
     private enum SpectrumConstant { IrfftGatherIndex, IrfftImagSign, IrfftAdjointWeights }
     private const int MaxCachedSpectrumConstants = 64;
+    private const long MaxCachedSpectrumConstantBytes = 64L * 1024 * 1024;
+    private long _spectrumConstantBytes;
+    internal int CachedSpectrumConstantCount => _spectrumConstants.Count;
     private readonly System.Collections.Concurrent.ConcurrentDictionary<(IDirectGpuBackend Backend, SpectrumConstant Kind, int Batch, int NumFreqs, int NFft), IGpuBuffer> _spectrumConstants = new();
     private readonly object _spectrumConstantsGate = new();
 
-    // Owns the buffer only when the cache is full, so callers always dispose the result.
+    // Owns the buffer only when the cache is full, so callers always dispose the result. Keyed and allocated on the
+    // physical backend: under a DeferredScope the caller's backend is that scope's recording wrapper, which would give
+    // every scope its own entries and, implementing no queued release, have disposal free tables a queued graph reads.
     private OwnedBuffer CachedSpectrumConstant(IDirectGpuBackend backend, SpectrumConstant kind, int batch, int numFreqs, int nFft)
     {
+        while (backend is Gpu.DelegatingGpuBackend wrapper) backend = wrapper.InnerBackend;
         var key = (backend, kind, batch, numFreqs, nFft);
         if (_spectrumConstants.TryGetValue(key, out var cached)) return new OwnedBuffer(cached, ownsBuffer: false);
         lock (_spectrumConstantsGate)
@@ -5820,8 +5827,12 @@ public partial class DirectGpuTensorEngine
                 SpectrumConstant.IrfftImagSign => backend.AllocateBuffer(IrfftImagSign(batch, nFft)),
                 _ => backend.AllocateBuffer(IrfftAdjointWeights(batch, numFreqs, nFft)),
             };
-            if (_spectrumConstants.Count >= MaxCachedSpectrumConstants) return new OwnedBuffer(created, ownsBuffer: true);
+            long bytes = (long)created.Size * sizeof(float);
+            if (_spectrumConstants.Count >= MaxCachedSpectrumConstants
+                || _spectrumConstantBytes + bytes > MaxCachedSpectrumConstantBytes)
+                return new OwnedBuffer(created, ownsBuffer: true);
             _spectrumConstants[key] = created;
+            _spectrumConstantBytes += bytes;
             return new OwnedBuffer(created, ownsBuffer: false);
         }
     }

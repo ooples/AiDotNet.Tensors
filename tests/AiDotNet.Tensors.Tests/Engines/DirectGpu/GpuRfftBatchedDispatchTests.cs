@@ -235,10 +235,10 @@ public class GpuRfftBatchedDispatchTests : IDisposable
     [SkippableFact]
     public void Gpu_irfft_cached_tables_match_cpu_across_interleaved_shapes()
     {
-        Skip.IfNot(TryGpu(out var gpu) && gpu is not null,
-            "GPU backend did not resolve — see Gpu_rfft_matches_cpu for the natives this needs.");
+        if (!TryGpu(out var gpu) || gpu is null)
+            throw new SkipException("GPU backend did not resolve — see Gpu_rfft_matches_cpu for the natives this needs.");
 
-        using (gpu!)
+        using (gpu)
         {
             const int numFreqs = 65, n = 128;
             (float[] Out, float[] Grad) Run(IEngine engine, Tensor<float> spectrumIn)
@@ -252,10 +252,11 @@ public class GpuRfftBatchedDispatchTests : IDisposable
                 for (int i = 0; i < weight.Length; i++) weight[i] = 0.1f + 0.01f * (i % 11);
                 var loss = engine.ReduceSum(engine.TensorMultiply(signal, weight), null);
                 var grads = tape.ComputeGradients(loss, new[] { input });
-                Assert.True(grads.TryGetValue(input, out var g) && g is not null, "no gradient reached the IRFFT input");
+                if (!grads.TryGetValue(input, out var g) || g is null)
+                    throw new Xunit.Sdk.XunitException("no gradient reached the IRFFT input");
                 var o = new float[signal.Length];
                 for (int i = 0; i < o.Length; i++) o[i] = signal[i];
-                var gr = new float[g!.Length];
+                var gr = new float[g.Length];
                 for (int i = 0; i < gr.Length; i++) gr[i] = g[i];
                 return (o, gr);
             }
@@ -279,6 +280,58 @@ public class GpuRfftBatchedDispatchTests : IDisposable
                 Assert.True(outRel <= 1e-4, $"cached IRFFT forward diverged at call {call}, batch={batch}: {outRel:E3}");
                 Assert.True(gradRel <= 1e-4, $"cached IRFFT adjoint diverged at call {call}, batch={batch}: {gradRel:E3}");
             }
+        }
+    }
+
+    /// <summary>
+    /// Under a DeferredScope the IRFFT runs on the scope's recording backend. The cached tables must be keyed on the
+    /// physical backend: keyed on the wrapper, every scope added its own entries (filling the bounded cache with tables
+    /// for dead scopes), and engine disposal released them with an immediate Dispose because the wrapper has no queued
+    /// release. Two scopes and an eager call of one shape must share the same two tables and still match the CPU.
+    /// </summary>
+    [SkippableFact]
+    public void Gpu_irfft_cached_tables_are_shared_across_deferred_scopes()
+    {
+        if (!TryGpu(out var gpu) || gpu is null)
+            throw new SkipException("GPU backend did not resolve — see Gpu_rfft_matches_cpu for the natives this needs.");
+
+        using (gpu)
+        {
+            const int batch = 4, numFreqs = 33, n = 64;
+            var spectrum = Signal(batch, numFreqs * 2, seed: 7);
+            AiDotNetEngine.Current = new CpuEngine();
+            var expected = AiDotNetEngine.Current.IRFFT(spectrum, n);
+            AiDotNetEngine.Current = gpu;
+            // Through IEngine: the GPU IRFFT is an explicit interface implementation.
+            IEngine engine = gpu;
+
+            void AssertMatchesCpu(Tensor<float> actual, string label)
+            {
+                Assert.Equal(expected.Length, actual.Length);
+                for (int i = 0; i < expected.Length; i++)
+                    Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-4 * Math.Max(1.0, Math.Abs(expected[i])),
+                        $"{label}: [{i}] cpu {expected[i]} vs gpu {actual[i]}");
+            }
+
+            for (int s = 0; s < 2; s++)
+            {
+                // Trace-by-execution: pure deferral is only correct for the primitives RecordingGpuBackend records
+                // (GpuExecutionOptions.ExecuteEagerlyWhileRecording), and IRFFT's gather/FFT are not among them.
+                var scope = gpu.BeginDeferredScope(
+                    new AiDotNet.Tensors.Engines.Gpu.GpuExecutionOptions { ExecuteEagerlyWhileRecording = true });
+                if (scope is null) throw new SkipException("Backend has no deferred execution");
+                using (scope)
+                {
+                    var r = engine.IRFFT(spectrum, n);
+                    scope.Execute();
+                    AssertMatchesCpu(r.Contiguous(), $"scope {s}");
+                }
+                _out.WriteLine($"after scope {s}: {gpu.CachedSpectrumConstantCount} cached tables");
+            }
+            AssertMatchesCpu(engine.IRFFT(spectrum, n).Contiguous(), "eager");
+
+            // One gather index and one sign table for the single shape, whichever path built them.
+            Assert.Equal(2, gpu.CachedSpectrumConstantCount);
         }
     }
 }
