@@ -12640,9 +12640,10 @@ internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
         foreach (var release in parked)
         {
             try { release(); }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OutOfMemoryException)
             {
-                // One parked call failing must not strand the others; the memory is then reclaimed with the context.
+                // One parked call failing must not strand the others; the memory is then reclaimed with the context. A
+                // parked release of an imported buffer runs the producer's deleter, foreign code that may throw anything.
                 System.Diagnostics.Debug.WriteLine($"HIP buffer release after a DLPack export failed: {ex}");
             }
         }

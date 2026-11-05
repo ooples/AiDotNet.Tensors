@@ -53,7 +53,7 @@ public sealed partial class HipBackend : IDLPackDeviceBackend
         private readonly bool _orderAfterConsumer;
         private readonly IntPtr _consumerStream;
         private IDisposable? _pin;
-        private int _disposed;
+        private int _disposed;   // the ordering runs once even when the hold carries no pin (an imported buffer)
 
         public ExportHold(HipBackend backend, IDisposable? pin, bool orderAfterConsumer, IntPtr consumerStream)
         {
@@ -66,18 +66,11 @@ public sealed partial class HipBackend : IDLPackDeviceBackend
         public void Dispose()
         {
             if (System.Threading.Interlocked.Exchange(ref _disposed, 1) != 0) return;
-            try
-            {
-                if (_orderAfterConsumer && !DeviceMemoryReclaim.ProcessExiting)
-                    _backend.WaitOnStream(_consumerStream);
-            }
-            finally
-            {
-                // Released even when the ordering failed (the consumer passed a stream it has since destroyed): the
-                // memory would otherwise stay parked for the life of the process.
-                _pin?.Dispose();
-                _pin = null;
-            }
+            // Released even when the ordering throws (the consumer passed a stream it has since destroyed): the memory
+            // would otherwise stay parked for the life of the process.
+            using var pin = System.Threading.Interlocked.Exchange(ref _pin, null);
+            if (_orderAfterConsumer && !DeviceMemoryReclaim.ProcessExiting)
+                _backend.WaitOnStream(_consumerStream);
         }
     }
 
@@ -154,16 +147,17 @@ public sealed partial class HipBackend : IDLPackDeviceBackend
             {
                 entry.Backend.SynchronizeWorkStream();
             }
-            catch (Exception ex)
+            catch (HipException ex)
             {
                 // The wait failed (the backend was torn down meanwhile, or the device faulted): none of its kernels still
                 // runs on the memory, so it is released below rather than leaked.
                 System.Diagnostics.Debug.WriteLine($"HIP stream wait before a deferred DLPack release failed: {ex}");
             }
             try { entry.Release(); }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OutOfMemoryException)
             {
-                // The producer's deleter failing must not fail the unrelated operation that drained it.
+                // The release runs the producer's deleter, foreign code that may throw anything; it failing must not
+                // fail the unrelated operation that drained it.
                 System.Diagnostics.Debug.WriteLine($"A deferred DLPack deleter failed: {ex}");
             }
         }
