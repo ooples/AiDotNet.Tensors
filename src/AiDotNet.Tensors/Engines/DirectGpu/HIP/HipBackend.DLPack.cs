@@ -197,8 +197,8 @@ public sealed partial class HipBackend : IDLPackDeviceBackend
     internal void SynchronizeDeviceForRelease()
     {
         if (_disposed) return;   // Dispose synchronized the device before tearing down: nothing can still be queued
-        int previous = 0;
-        bool restore = HipNativeBindings.hipGetDevice(ref previous) == HipError.Success && previous != _hipDeviceIndex;
+        int previous = HipNativeBindings.GetCurrentDevice("hipGetDevice(DLPack release)");
+        bool restore = previous != _hipDeviceIndex;
         ((IThreadContextBackend)this).EnsureContextCurrent();
         try
         {

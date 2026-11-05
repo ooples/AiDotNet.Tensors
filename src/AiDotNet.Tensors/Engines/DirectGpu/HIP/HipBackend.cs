@@ -12717,8 +12717,9 @@ internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
             var buffer = Interlocked.Exchange(ref _buffer, null);
             if (buffer is null) return;
             // The view's parked releases run first, then the parent's: the view never outlives its parent's memory.
-            try { buffer.EndExportHold(); }
-            finally { _parentHold?.Dispose(); }
+            // Declared first, the parent's hold is disposed last, and even when the view's release throws.
+            using var parentHold = _parentHold;
+            buffer.EndExportHold();
         }
     }
 
