@@ -10,15 +10,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// </summary>
 /// <remarks>
 /// DLPack's device types that carry plain device pointers are CUDA (kDLCUDA) and ROCm (kDLROCM); OpenCL, Vulkan,
-/// Metal and WebGPU memory has no pointer a foreign library can address. CUDA implements this today. HIP does not yet
-/// (issue #1621): a GPU-resident tensor on the HIP backend exports a host copy (kDLCPU; writes through the consumer's
-/// copy do not reach the tensor), and a kDLROCM import throws <see cref="NotSupportedException"/>.
+/// Metal and WebGPU memory has no pointer a foreign library can address. The CUDA backend implements it with kDLCUDA
+/// and the HIP backend with kDLROCM; the other backends export a host copy (kDLCPU; writes through the consumer's copy
+/// do not reach the tensor).
 /// </remarks>
-[BackendSpecificRoute("DLPack device-pointer exchange exists only for pointer-addressed device memory (CUDA); every backend exports through a host copy",
+[BackendSpecificRoute("DLPack device-pointer exchange exists only for pointer-addressed device memory (CUDA, HIP); every other backend exports through a host copy",
     nameof(IDirectGpuBackend.DownloadBuffer))]
 internal interface IDLPackDeviceBackend
 {
-    /// <summary>The DLPack <c>DLDeviceType</c> of this backend's memory (kDLCUDA = 2).</summary>
+    /// <summary>The DLPack <c>DLDeviceType</c> of this backend's memory (kDLCUDA = 2, kDLROCM = 10).</summary>
     int DLPackDeviceType { get; }
 
     /// <summary>The device ordinal (<c>DLDevice.device_id</c>).</summary>

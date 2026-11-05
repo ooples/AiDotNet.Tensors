@@ -1572,6 +1572,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     // only when a pool miss drains the queue.
     private static void DrainCollectedBuffers()
     {
+        // Imported DLPack memory whose tensor was finalized: the producer gets it back behind our queued work.
+        if (!PendingExternalReleases.IsEmpty) DrainPendingExternalReleases();
         if (HipGpuBuffer.PendingFrees.IsEmpty) return;
         // A collected buffer re-enters the pool without the implicit device synchronization hipFree performed. On one
         // in-order stream the next use is ordered after every earlier one; once a caller has its own streams, queued work
@@ -12554,6 +12556,13 @@ internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     private int _poolState;
     private readonly IGpuBuffer? _viewParent;
     private DeviceMemoryHold _memory; // what GpuMemoryStats counts for this memory
+    // Device memory another library owns (a DLPack import): never pooled or freed here; releasing the buffer waits for
+    // the owning backend's queued work and then runs this once.
+    private Action? _externalRelease;
+    // Live DLPack exports of this buffer (HoldForExport) and the releases they parked.
+    private int _exportHolds;
+    private List<Action>? _parkedReleases;
+    private static readonly object s_exportLock = new();
 
     /// <summary>Frees of HIP buffers collected without Dispose, run by the backend's next allocation.</summary>
     internal static readonly DeviceFreeQueue PendingFrees = new();
@@ -12586,6 +12595,66 @@ internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     internal static HipGpuBuffer CreateView(IGpuBuffer parent, IntPtr handle, int size, HipBackend owningBackend)
         => new HipGpuBuffer(handle, size, owningBackend, parent);
 
+    /// <summary>
+    /// Wraps device memory another library owns (a DLPack import) as a buffer this backend's kernels read and write
+    /// like their own. It is never pooled or freed and counts toward no memory statistics: releasing it waits for the
+    /// owning backend's queued work, then runs <paramref name="release"/> once.
+    /// </summary>
+    internal static HipGpuBuffer CreateExternal(IntPtr handle, int size, HipBackend owningBackend, Action release)
+        => new HipGpuBuffer(handle, size, owningBackend) { _externalRelease = release ?? throw new ArgumentNullException(nameof(release)) };
+
+    /// <summary>
+    /// Holds this buffer's device memory for a DLPack export: until the returned hold is disposed, a release or a pool
+    /// return of this buffer is parked rather than run, so the memory is neither freed nor handed to another allocation
+    /// while the consumer still has its address. Disposing the hold runs the parked calls.
+    /// </summary>
+    internal IDisposable HoldForExport()
+    {
+        lock (s_exportLock) _exportHolds++;
+        return new ExportHold(this);
+    }
+
+    // Parks a release while an export holds this buffer; false when no export does (run it now).
+    private bool TryParkForExport(Action release)
+    {
+        lock (s_exportLock)
+        {
+            if (_exportHolds == 0) return false;
+            (_parkedReleases ??= new List<Action>()).Add(release);
+            return true;
+        }
+    }
+
+    private void EndExportHold()
+    {
+        List<Action>? parked = null;
+        lock (s_exportLock)
+        {
+            if (--_exportHolds == 0)
+            {
+                parked = _parkedReleases;
+                _parkedReleases = null;
+            }
+        }
+        if (parked is null) return;
+        foreach (var release in parked)
+        {
+            try { release(); }
+            catch (Exception ex)
+            {
+                // One parked call failing must not strand the others; the memory is then reclaimed with the context.
+                System.Diagnostics.Debug.WriteLine($"HIP buffer release after a DLPack export failed: {ex}");
+            }
+        }
+    }
+
+    private sealed class ExportHold : IDisposable
+    {
+        private HipGpuBuffer? _buffer;
+        public ExportHold(HipGpuBuffer buffer) => _buffer = buffer;
+        public void Dispose() => Interlocked.Exchange(ref _buffer, null)?.EndExportHold();
+    }
+
     public void MarkRented(int size)
     {
         if (size <= 0 || size > Capacity)
@@ -12597,6 +12666,12 @@ internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
 
     public void Release()
     {
+        if (TryParkForExport(Release)) return;
+        if (_externalRelease is not null)
+        {
+            ReleaseExternal();
+            return;
+        }
         if (_viewParent is not null)
         {
             Interlocked.Exchange(ref _poolState, 2);
@@ -12610,6 +12685,23 @@ internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
         _memory.OnFreed();
         if (Handle != IntPtr.Zero) FreeAfterQueuedWork(Handle);
         GC.SuppressFinalize(this);
+    }
+
+    private void ReleaseExternal()
+    {
+        var release = Interlocked.Exchange(ref _externalRelease, null);
+        if (release is null) return;
+        Interlocked.Exchange(ref _poolState, 2);
+        GC.SuppressFinalize(this);
+        try
+        {
+            // A kernel of this backend may still be using the memory: the owner gets it back once those finished.
+            OwningBackend.SynchronizeWorkStream();
+        }
+        finally
+        {
+            release();
+        }
     }
 
     // A pooled buffer is reused without synchronizing because the next use is ordered behind the last on the same
@@ -12650,6 +12742,9 @@ internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     ~HipGpuBuffer()
     {
         if (_viewParent is not null) return; // a view owns no device memory
+        // Imported memory: the DLPack deleter handle's own finalizer queues the producer's release behind this
+        // backend's work (HipBackend.ReleaseAfterPendingWorkDeferred); nothing of ours to free.
+        if (_externalRelease is not null) return;
         if (_returnToPool is { } returnToPool && Handle != IntPtr.Zero && Interlocked.CompareExchange(ref _poolState, 2, 0) == 0)
         {
             IntPtr pooledHandle = Handle;
@@ -12667,6 +12762,7 @@ internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
 
     public void Dispose()
     {
+        if (TryParkForExport(Dispose)) return;
         if (_returnToPool == null)
         {
             Release();
