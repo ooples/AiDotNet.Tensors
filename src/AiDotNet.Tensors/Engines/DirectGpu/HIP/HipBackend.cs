@@ -6199,7 +6199,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     }
 
     // Param order matches the engine call (input, gradOutput, ...) so the kernel-order bindings below bind the right buffers.
-    public unsafe void DeformableConv2DBackwardWeights(IGpuBuffer input, IGpuBuffer gradOutput, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradWeights,
+    public unsafe void DeformableConv2DBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradWeights,
         int batch, int inChannels, int inHeight, int inWidth,
         int outChannels, int outHeight, int outWidth,
         int kernelH, int kernelW,
@@ -6253,7 +6253,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     }
 
     // Param order matches the engine call (input, weights, gradOutput, ...) so the kernel-order bindings below bind the right buffers.
-    public unsafe void DeformableConv2DBackwardOffset(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer gradOutput, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradOffsets,
+    public unsafe void DeformableConv2DBackwardOffset(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradOffsets,
         int batch, int inChannels, int inHeight, int inWidth,
         int outChannels, int outHeight, int outWidth,
         int kernelH, int kernelW,
@@ -6309,7 +6309,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     }
 
     // Param order matches the engine call (input, weights, gradOutput, ...) so the kernel-order bindings below bind the right buffers.
-    public unsafe void DeformableConv2DBackwardMask(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer gradOutput, IGpuBuffer offsets, IGpuBuffer gradMask,
+    public unsafe void DeformableConv2DBackwardMask(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer gradMask,
         int batch, int inChannels, int inHeight, int inWidth,
         int outChannels, int outHeight, int outWidth,
         int kernelH, int kernelW,

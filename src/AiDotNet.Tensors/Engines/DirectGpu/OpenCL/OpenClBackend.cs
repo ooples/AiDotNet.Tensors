@@ -7741,7 +7741,7 @@ KERNEL VARIANTS (A/B testing):
             k.Execute1D(globalSize, localSize);
         }
 
-        public void DeformableConv2DBackwardWeights(IGpuBuffer input, IGpuBuffer gradOutput, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradWeights,
+        public void DeformableConv2DBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradWeights,
             int batch, int inChannels, int inHeight, int inWidth,
             int outChannels, int outHeight, int outWidth,
             int kernelH, int kernelW, int strideH, int strideW, int padH, int padW,
@@ -7782,7 +7782,7 @@ KERNEL VARIANTS (A/B testing):
             k.Execute1D(globalSize, localSize);
         }
 
-        public void DeformableConv2DBackwardOffset(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer gradOutput, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradOffset,
+        public void DeformableConv2DBackwardOffset(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradOffset,
             int batch, int inChannels, int inHeight, int inWidth,
             int outChannels, int outHeight, int outWidth,
             int kernelH, int kernelW, int strideH, int strideW, int padH, int padW,
@@ -7823,7 +7823,7 @@ KERNEL VARIANTS (A/B testing):
             k.Execute1D(globalSize, localSize);
         }
 
-        public void DeformableConv2DBackwardMask(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer gradOutput, IGpuBuffer offsets, IGpuBuffer gradMask,
+        public void DeformableConv2DBackwardMask(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer gradMask,
             int batch, int inChannels, int inHeight, int inWidth,
             int outChannels, int outHeight, int outWidth,
             int kernelH, int kernelW, int strideH, int strideW, int padH, int padW,

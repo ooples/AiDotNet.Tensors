@@ -11920,7 +11920,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 backend.DeformableConv2DBackwardWeights(
-                    inputBuffer.Buffer, gradOutputBuffer.Buffer, offsetsBuffer.Buffer, maskBuffer?.Buffer, gradWeightsBuffer.Buffer,
+                    gradOutputBuffer.Buffer, inputBuffer.Buffer, offsetsBuffer.Buffer, maskBuffer?.Buffer, gradWeightsBuffer.Buffer,
                     batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
                     kernelH, kernelW, stride[0], stride[1], padding[0], padding[1], dilation[0], dilation[1], groups, deformGroups);
                 var result = DeferTensorResult<T>(backend, gradWeightsBuffer.Buffer, kernelSize, kernelShape);
@@ -11964,7 +11964,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 backend.DeformableConv2DBackwardOffset(
-                    inputBuffer.Buffer, weightsBuffer.Buffer, gradOutputBuffer.Buffer, offsetsBuffer.Buffer, maskBuffer?.Buffer, gradOffsetBuffer.Buffer,
+                    gradOutputBuffer.Buffer, inputBuffer.Buffer, weightsBuffer.Buffer, offsetsBuffer.Buffer, maskBuffer?.Buffer, gradOffsetBuffer.Buffer,
                     batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
                     kernelH, kernelW, stride[0], stride[1], padding[0], padding[1], dilation[0], dilation[1], groups, deformGroups);
                 var result = DeferTensorResult<T>(backend, gradOffsetBuffer.Buffer, offsetSize, offset.Shape._dims);
@@ -12006,7 +12006,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             backend.DeformableConv2DBackwardMask(
-                inputBuffer.Buffer, weightsBuffer.Buffer, gradOutputBuffer.Buffer, offsetsBuffer.Buffer, gradMaskBuffer.Buffer,
+                gradOutputBuffer.Buffer, inputBuffer.Buffer, weightsBuffer.Buffer, offsetsBuffer.Buffer, gradMaskBuffer.Buffer,
                 batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
                 kernelH, kernelW, stride[0], stride[1], padding[0], padding[1], dilation[0], dilation[1], groups, deformGroups);
             var result = DeferTensorResult<T>(backend, gradMaskBuffer.Buffer, maskSize, mask.Shape._dims);
@@ -12145,7 +12145,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 backend.DeformableConv2DBackwardWeights(
-                    inputBuffer.Buffer, gradOutputBuffer.Buffer, offsetsBuffer.Buffer, maskBuffer?.Buffer, gradWeightsBuffer.Buffer,
+                    gradOutputBuffer.Buffer, inputBuffer.Buffer, offsetsBuffer.Buffer, maskBuffer?.Buffer, gradWeightsBuffer.Buffer,
                     batch, inChannels, inHeight, inWidth,
                     outChannels, outHeight, outWidth,
                     kernelH, kernelW, stride[0], stride[1], padding[0], padding[1],
@@ -12220,7 +12220,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 backend.DeformableConv2DBackwardOffset(
-                    inputBuffer.Buffer, weightsBuffer.Buffer, gradOutputBuffer.Buffer, offsetsBuffer.Buffer, maskBuffer?.Buffer, gradOffsetBuffer.Buffer,
+                    gradOutputBuffer.Buffer, inputBuffer.Buffer, weightsBuffer.Buffer, offsetsBuffer.Buffer, maskBuffer?.Buffer, gradOffsetBuffer.Buffer,
                     batch, inChannels, inHeight, inWidth,
                     outChannels, outHeight, outWidth,
                     kernelH, kernelW, stride[0], stride[1], padding[0], padding[1],
@@ -12295,7 +12295,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             backend.DeformableConv2DBackwardMask(
-                inputBuffer.Buffer, weightsBuffer.Buffer, gradOutputBuffer.Buffer, offsetsBuffer.Buffer, gradMaskBuffer.Buffer,
+                gradOutputBuffer.Buffer, inputBuffer.Buffer, weightsBuffer.Buffer, offsetsBuffer.Buffer, gradMaskBuffer.Buffer,
                 batch, inChannels, inHeight, inWidth,
                 outChannels, outHeight, outWidth,
                 kernelH, kernelW, stride[0], stride[1], padding[0], padding[1],
