@@ -29294,6 +29294,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             _adaptivePoolMatrices.Clear();
         }
 
+        lock (_spectrumConstantsGate)
+        {
+            // A queued IRFFT, or its adjoint, may still read one of these.
+            foreach (var entry in _spectrumConstants) DisposeBufferAfterQueuedUse(entry.Key.Backend, entry.Value);
+            _spectrumConstants.Clear();
+        }
+
         lock (_stridedViewLayoutsGate)
         {
             foreach (var (layoutBackend, layoutBuffer) in _stridedViewLayoutBuffers) DisposeBufferAfterQueuedUse(layoutBackend, layoutBuffer);

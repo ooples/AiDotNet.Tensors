@@ -225,4 +225,60 @@ public class GpuRfftBatchedDispatchTests : IDisposable
             Assert.True(maxAbs <= 1e-3, $"round-trip lost the signal at batch={batch} n={n}: maxAbs={maxAbs:E3}");
         }
     }
+
+    /// <summary>
+    /// The IRFFT gather/sign tables and the adjoint's bin weights are cached per backend and shape. Interleaving batch
+    /// sizes on ONE engine (3, 5, 3, 5) checks the cache key: a table reused across shapes would gather the wrong rows
+    /// (or read past a smaller table), and a cached table that was disposed or overwritten would break the repeat calls.
+    /// Forward and gradient are both compared with the CPU reference on every call.
+    /// </summary>
+    [SkippableFact]
+    public void Gpu_irfft_cached_tables_match_cpu_across_interleaved_shapes()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null,
+            "GPU backend did not resolve — see Gpu_rfft_matches_cpu for the natives this needs.");
+
+        using (gpu!)
+        {
+            const int numFreqs = 65, n = 128;
+            (float[] Out, float[] Grad) Run(IEngine engine, Tensor<float> spectrumIn)
+            {
+                AiDotNetEngine.Current = engine;
+                var input = new Tensor<float>(spectrumIn.Shape.ToArray());
+                for (int i = 0; i < input.Length; i++) input[i] = spectrumIn[i];
+                using var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>();
+                var signal = engine.IRFFT(input, n);
+                var weight = new Tensor<float>(signal.Shape.ToArray());
+                for (int i = 0; i < weight.Length; i++) weight[i] = 0.1f + 0.01f * (i % 11);
+                var loss = engine.ReduceSum(engine.TensorMultiply(signal, weight), null);
+                var grads = tape.ComputeGradients(loss, new[] { input });
+                Assert.True(grads.TryGetValue(input, out var g) && g is not null, "no gradient reached the IRFFT input");
+                var o = new float[signal.Length];
+                for (int i = 0; i < o.Length; i++) o[i] = signal[i];
+                var gr = new float[g!.Length];
+                for (int i = 0; i < gr.Length; i++) gr[i] = g[i];
+                return (o, gr);
+            }
+
+            static double MaxRel(float[] a, float[] b)
+            {
+                Assert.Equal(a.Length, b.Length);
+                double m = 0;
+                for (int i = 0; i < a.Length; i++) m = Math.Max(m, Math.Abs(a[i] - b[i]) / Math.Max(1.0, Math.Abs(a[i])));
+                return m;
+            }
+
+            int call = 0;
+            foreach (int batch in new[] { 3, 5, 3, 5 })
+            {
+                var spectrum = Signal(batch, numFreqs * 2, seed: 100 + call++);
+                var cpu = Run(new CpuEngine(), spectrum);
+                var dev = Run(gpu, spectrum);
+                double outRel = MaxRel(cpu.Out, dev.Out), gradRel = MaxRel(cpu.Grad, dev.Grad);
+                _out.WriteLine($"call={call} batch={batch}  out maxRel={outRel:E3}  grad maxRel={gradRel:E3}");
+                Assert.True(outRel <= 1e-4, $"cached IRFFT forward diverged at call {call}, batch={batch}: {outRel:E3}");
+                Assert.True(gradRel <= 1e-4, $"cached IRFFT adjoint diverged at call {call}, batch={batch}: {gradRel:E3}");
+            }
+        }
+    }
 }

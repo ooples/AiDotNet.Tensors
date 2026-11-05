@@ -1094,24 +1094,13 @@ public partial class DirectGpuTensorEngine
             backend.CopyRows(fftIm.Buffer, oneIm.Buffer, nFft, numFreqs, batch, numFreqs);
             backend.InterleaveComplex(oneRe.Buffer, oneIm.Buffer, interleaved.Buffer, batch * numFreqs);
 
-            // c_k/nFft per bin, with the Nyquist imaginary slot zeroed.
-            var w = new float[batch * numFreqs * 2];
-            float invN = 1f / nFft;
-            for (int b = 0; b < batch; b++)
-            {
-                int rowBase = b * numFreqs * 2;
-                for (int k = 0; k < numFreqs; k++)
-                {
-                    float ck = (k == 0 || k == numFreqs - 1) ? 1f : 2f;
-                    w[rowBase + k * 2] = ck * invN;
-                    w[rowBase + k * 2 + 1] = (k == numFreqs - 1) ? 0f : ck * invN;
-                }
-            }
-            using var weights = GetOrAllocateBuffer(backend, (T[])(object)w);
-            backend.Multiply(interleaved.Buffer, weights.Buffer, scaled.Buffer, w.Length);
+            // c_k/nFft per bin, with the Nyquist imaginary slot zeroed (cached per backend and shape).
+            int weightCount = batch * numFreqs * 2;
+            using var weights = CachedSpectrumConstant(backend, SpectrumConstant.IrfftAdjointWeights, batch, numFreqs, nFft);
+            backend.Multiply(interleaved.Buffer, weights.Buffer, scaled.Buffer, weightCount);
             backend.Synchronize();
 
-            var result = DeferTensorResult<T>(backend, scaled.Buffer, w.Length, (int[])inputShape.Clone());
+            var result = DeferTensorResult<T>(backend, scaled.Buffer, weightCount, (int[])inputShape.Clone());
             scaled.RelinquishOwnership();
             return result;
         }
@@ -1349,22 +1338,11 @@ public partial class DirectGpuTensorEngine
             // so one index gather per component (plus a sign flip of the mirrored imaginary part) builds every
             // full spectrum, and one BatchedFFT inverse transforms them all. Taking the real part afterwards also
             // discards the imaginary part of the DC and Nyquist bins, exactly as a real inverse transform does.
+            // The index and sign tables depend only on the transform shape, so they come from a per-backend cache
+            // instead of being rebuilt on the host and uploaded on every call.
             int fullCount = batchSize * nFft;
-            var gatherIndex = new int[fullCount];
-            var imagSign = new float[fullCount];
-            for (int b = 0; b < batchSize; b++)
-            {
-                int rowHalf = b * numFreqs, rowFull = b * nFft;
-                for (int k = 0; k < nFft; k++)
-                {
-                    bool mirrored = k > nFft / 2;
-                    gatherIndex[rowFull + k] = rowHalf + (mirrored ? nFft - k : k);
-                    imagSign[rowFull + k] = mirrored ? -1f : 1f;
-                }
-            }
-
-            using var indexBuffer = backend.AllocateIntBuffer(gatherIndex);
-            using var signBuffer = backend.AllocateBuffer(imagSign);
+            using var indexBuffer = CachedSpectrumConstant(backend, SpectrumConstant.IrfftGatherIndex, batchSize, numFreqs, nFft);
+            using var signBuffer = CachedSpectrumConstant(backend, SpectrumConstant.IrfftImagSign, batchSize, numFreqs, nFft);
             // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
             using var fullRealLease = AllocateTransientScratch(backend, fullCount);
             var fullReal = fullRealLease.Buffer;
@@ -1380,9 +1358,9 @@ public partial class DirectGpuTensorEngine
             // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
             using var timeImagLease = AllocateTransientScratch(backend, fullCount);
             var timeImag = timeImagLease.Buffer;
-            backend.Gather(allReal, indexBuffer, fullReal, fullCount, 1);
-            backend.Gather(allImag, indexBuffer, fullImagRaw, fullCount, 1);
-            backend.Multiply(fullImagRaw, signBuffer, fullImag, fullCount);
+            backend.Gather(allReal, indexBuffer.Buffer, fullReal, fullCount, 1);
+            backend.Gather(allImag, indexBuffer.Buffer, fullImagRaw, fullCount, 1);
+            backend.Multiply(fullImagRaw, signBuffer.Buffer, fullImag, fullCount);
             backend.BatchedFFT(fullReal, fullImag, timeReal, timeImag, batchSize, nFft, inverse: true);
             backend.CopyRows(timeReal, output, nFft, outputLength, batchSize, outputLength);
             backend.Synchronize();
@@ -5816,6 +5794,74 @@ public partial class DirectGpuTensorEngine
             _adaptivePoolMatrices[key] = created;
             return created;
         }
+    }
+
+    // The IRFFT's Hermitian-expansion gather index and mirrored-imaginary sign, and its adjoint's one-sided bin weights,
+    // depend only on the transform shape, which a training step repeats. Rebuilding a batch*nFft table on the host and
+    // uploading it on every call was the spectral layers' largest per-step host cost, so each table is uploaded once per
+    // backend and shape. Bounded so a workload with ever-changing shapes falls back to a per-call upload instead of
+    // growing the cache without limit.
+    private enum SpectrumConstant { IrfftGatherIndex, IrfftImagSign, IrfftAdjointWeights }
+    private const int MaxCachedSpectrumConstants = 64;
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(IDirectGpuBackend Backend, SpectrumConstant Kind, int Batch, int NumFreqs, int NFft), IGpuBuffer> _spectrumConstants = new();
+    private readonly object _spectrumConstantsGate = new();
+
+    // Owns the buffer only when the cache is full, so callers always dispose the result.
+    private OwnedBuffer CachedSpectrumConstant(IDirectGpuBackend backend, SpectrumConstant kind, int batch, int numFreqs, int nFft)
+    {
+        var key = (backend, kind, batch, numFreqs, nFft);
+        if (_spectrumConstants.TryGetValue(key, out var cached)) return new OwnedBuffer(cached, ownsBuffer: false);
+        lock (_spectrumConstantsGate)
+        {
+            if (_spectrumConstants.TryGetValue(key, out cached)) return new OwnedBuffer(cached, ownsBuffer: false);
+            var created = kind switch
+            {
+                SpectrumConstant.IrfftGatherIndex => backend.AllocateIntBuffer(IrfftGatherIndex(batch, numFreqs, nFft)),
+                SpectrumConstant.IrfftImagSign => backend.AllocateBuffer(IrfftImagSign(batch, nFft)),
+                _ => backend.AllocateBuffer(IrfftAdjointWeights(batch, numFreqs, nFft)),
+            };
+            if (_spectrumConstants.Count >= MaxCachedSpectrumConstants) return new OwnedBuffer(created, ownsBuffer: true);
+            _spectrumConstants[key] = created;
+            return new OwnedBuffer(created, ownsBuffer: false);
+        }
+    }
+
+    // full[b, k] = half[b, k] for k <= nFft/2 and half[b, nFft - k] above; IrfftImagSign supplies the conjugate.
+    private static int[] IrfftGatherIndex(int batch, int numFreqs, int nFft)
+    {
+        var index = new int[checked(batch * nFft)];
+        for (int b = 0; b < batch; b++)
+        {
+            int rowHalf = b * numFreqs, rowFull = b * nFft;
+            for (int k = 0; k < nFft; k++) index[rowFull + k] = rowHalf + (k > nFft / 2 ? nFft - k : k);
+        }
+        return index;
+    }
+
+    private static float[] IrfftImagSign(int batch, int nFft)
+    {
+        var sign = new float[checked(batch * nFft)];
+        for (int b = 0; b < batch; b++)
+            for (int k = 0; k < nFft; k++) sign[b * nFft + k] = k > nFft / 2 ? -1f : 1f;
+        return sign;
+    }
+
+    // c_k/nFft per interleaved one-sided bin (c_k = 1 at DC and Nyquist, 2 elsewhere), Nyquist imaginary slot zeroed.
+    private static float[] IrfftAdjointWeights(int batch, int numFreqs, int nFft)
+    {
+        var w = new float[checked(batch * numFreqs * 2)];
+        float invN = 1f / nFft;
+        for (int b = 0; b < batch; b++)
+        {
+            int rowBase = b * numFreqs * 2;
+            for (int k = 0; k < numFreqs; k++)
+            {
+                float ck = (k == 0 || k == numFreqs - 1) ? 1f : 2f;
+                w[rowBase + k * 2] = ck * invN;
+                w[rowBase + k * 2 + 1] = (k == numFreqs - 1) ? 0f : ck * invN;
+            }
+        }
+        return w;
     }
 
     // A strided view's shape/stride metadata repeats every step (the transformer's Q/K/V narrows are gathered on each
