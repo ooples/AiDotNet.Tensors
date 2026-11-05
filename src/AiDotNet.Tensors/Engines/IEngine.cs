@@ -10063,11 +10063,10 @@ public partial interface IEngine
 
     /// <summary>
     /// Extended <c>GridSample</c> backward with explicit mode / padding /
-    /// align-corners, matching the forward overload above. Non-default
-    /// (mode != Bilinear, padding != Zeros, alignCorners == true) paths
-    /// currently delegate through the managed CpuEngine implementation —
-    /// specialised GPU backward kernels for each mode × padding variant
-    /// are tracked as a follow-up.
+    /// align-corners, matching the forward overload above: the exact
+    /// derivative of that forward for every mode, padding and convention.
+    /// Nearest is piecewise constant, so its grid gradient is 0. On the GPU
+    /// engine, backends with geometry kernels run it on the device.
     /// </summary>
     Tensor<T> GridSampleBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> grid, int[] inputShape,
         GridSampleMode mode, GridSamplePadding padding, bool alignCorners);

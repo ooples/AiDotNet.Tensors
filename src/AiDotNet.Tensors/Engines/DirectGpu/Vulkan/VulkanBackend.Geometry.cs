@@ -3,7 +3,7 @@
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
-public sealed unsafe partial class VulkanBackend : IGeometryBackend
+public sealed unsafe partial class VulkanBackend : IGeometryBackend, IGeometryBackwardBackend
 {
     // Push-constant sizes (bytes):
     //  Interpolate2D = 8 ints = 32
@@ -59,6 +59,26 @@ public sealed unsafe partial class VulkanBackend : IGeometryBackend
             (uint)outH, (uint)outW, (uint)mode, (uint)padding, (uint)(alignCorners ? 1 : 0)
         };
         GlslBinaryOp(VulkanGeometryKernels.GridSample2D, input, grid, output, total, pc, GeometryPushGrid);
+    }
+
+    public void GridSample2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer grid, IGpuBuffer gradInput,
+        int N, int H, int W, int C, int outH, int outW,
+        int mode, int padding, bool alignCorners)
+    {
+        GlslDispatchN(VulkanGeometryKernels.GridSample2DBackwardInput, N * outH * outW,
+            new[] { gradOutput, grid, gradInput },
+            new uint[] { (uint)N, (uint)H, (uint)W, (uint)C, (uint)outH, (uint)outW,
+                         (uint)mode, (uint)padding, (uint)(alignCorners ? 1 : 0) });
+    }
+
+    public void GridSample2DBackwardGrid(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer grid,
+        IGpuBuffer gradGrid, int N, int H, int W, int C, int outH, int outW,
+        int mode, int padding, bool alignCorners)
+    {
+        GlslDispatchN(VulkanGeometryKernels.GridSample2DBackwardGrid, N * outH * outW,
+            new[] { gradOutput, input, grid, gradGrid },
+            new uint[] { (uint)N, (uint)H, (uint)W, (uint)C, (uint)outH, (uint)outW,
+                         (uint)mode, (uint)padding, (uint)(alignCorners ? 1 : 0) });
     }
 
     public void AffineGrid3D(IGpuBuffer theta, IGpuBuffer grid,

@@ -5,7 +5,7 @@ using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
-public sealed partial class CudaBackend : IGeometryBackend
+public sealed partial class CudaBackend : IGeometryBackend, IGeometryBackwardBackend
 {
     private IntPtr ResolveGeometryKernel(string name)
     {
@@ -83,6 +83,44 @@ public sealed partial class CudaBackend : IGeometryBackend
         args[0] = &inP; args[1] = &grP; args[2] = &outP;
         args[3] = &nn; args[4] = &hh; args[5] = &ww; args[6] = &cc;
         args[7] = &oh; args[8] = &ow; args[9] = &mm; args[10] = &pp; args[11] = &ac;
+        LaunchKernel(kernel, gridLaunch, DefaultBlockSize, args);
+    }
+
+    public unsafe void GridSample2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer grid, IGpuBuffer gradInput,
+        int N, int H, int W, int C, int outH, int outW,
+        int mode, int padding, bool alignCorners)
+    {
+        int total = N * outH * outW;
+        if (total <= 0) return;
+        var kernel = ResolveGeometryKernel("geometry_grid_sample_2d_backward_input");
+        using var _ = PushContext();
+        uint gridLaunch = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr goP = gradOutput.Handle, grP = grid.Handle, giP = gradInput.Handle;
+        int nn = N, hh = H, ww = W, cc = C, oh = outH, ow = outW, mm = mode, pp = padding;
+        int ac = alignCorners ? 1 : 0;
+        void** args = stackalloc void*[12];
+        args[0] = &goP; args[1] = &grP; args[2] = &giP;
+        args[3] = &nn; args[4] = &hh; args[5] = &ww; args[6] = &cc;
+        args[7] = &oh; args[8] = &ow; args[9] = &mm; args[10] = &pp; args[11] = &ac;
+        LaunchKernel(kernel, gridLaunch, DefaultBlockSize, args);
+    }
+
+    public unsafe void GridSample2DBackwardGrid(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer grid,
+        IGpuBuffer gradGrid, int N, int H, int W, int C, int outH, int outW,
+        int mode, int padding, bool alignCorners)
+    {
+        int total = N * outH * outW;
+        if (total <= 0) return;
+        var kernel = ResolveGeometryKernel("geometry_grid_sample_2d_backward_grid");
+        using var _ = PushContext();
+        uint gridLaunch = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr goP = gradOutput.Handle, inP = input.Handle, grP = grid.Handle, ggP = gradGrid.Handle;
+        int nn = N, hh = H, ww = W, cc = C, oh = outH, ow = outW, mm = mode, pp = padding;
+        int ac = alignCorners ? 1 : 0;
+        void** args = stackalloc void*[13];
+        args[0] = &goP; args[1] = &inP; args[2] = &grP; args[3] = &ggP;
+        args[4] = &nn; args[5] = &hh; args[6] = &ww; args[7] = &cc;
+        args[8] = &oh; args[9] = &ow; args[10] = &mm; args[11] = &pp; args[12] = &ac;
         LaunchKernel(kernel, gridLaunch, DefaultBlockSize, args);
     }
 

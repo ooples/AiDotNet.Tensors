@@ -257,6 +257,156 @@ void main() {
 ";
 
     // -----------------------------------------------------------------------
+    // GridSample 2D backward, every mode and padding (#1680): the exact derivative of GridSample2D. The taps
+    // and weights are the forward's; padding maps each tap to the pixel the forward read, or -1 where it read
+    // the zero padding, so it never moves a weight. One invocation per sampling point, looping C.
+    // -----------------------------------------------------------------------
+
+    private const string GridSampleBackwardPush = @"
+layout(push_constant) uniform P {
+    int N; int H; int W; int C;
+    int outH; int outW;
+    int mode; int padding; int alignCorners;
+};
+";
+
+    private const string GridSampleTaps = @"
+int grid_sample_tap(int i, int extent) {
+    if (padding == 0) return uint(i) < uint(extent) ? i : -1;
+    if (padding == 1) return clamp_i(i, 0, extent - 1);
+    return reflect_index(i, extent);
+}
+
+// dK/dd of cubic_kernel for d >= 0, which every offset the taps use is.
+float cubic_kernel_deriv(float d, float a) {
+    if (d < 1.0) return (3.0 * (a + 2.0) * d - 2.0 * (a + 3.0)) * d;
+    if (d < 2.0) return (3.0 * a * d - 10.0 * a) * d + 8.0 * a;
+    return 0.0;
+}
+
+// The taps of one sampling point: per-axis pixel index, weight and d(weight)/d(source coord). Returns the taps
+// per axis (1 nearest, 2 bilinear, 4 bicubic), or 0 when the forward samples nothing at this point (#1134).
+int grid_sample_taps(int gOff, out int tx[4], out int ty[4], out float wx[4], out float wy[4],
+    out float dwx[4], out float dwy[4]) {
+    for (int k = 0; k < 4; k++) { tx[k] = -1; ty[k] = -1; wx[k] = 0.0; wy[k] = 0.0; dwx[k] = 0.0; dwy[k] = 0.0; }
+    float gx = grid_[gOff];
+    float gy = grid_[gOff + 1];
+    float sx = alignCorners != 0 ? (gx + 1.0) * 0.5 * (W - 1) : ((gx + 1.0) * W - 1.0) * 0.5;
+    float sy = alignCorners != 0 ? (gy + 1.0) * 0.5 * (H - 1) : ((gy + 1.0) * H - 1.0) * 0.5;
+    if ((floatBitsToUint(sx) & 0x7FFFFFFFu) >= 0x4EFFFFFFu || (floatBitsToUint(sy) & 0x7FFFFFFFu) >= 0x4EFFFFFFu) return 0;
+    if (mode == 1) {
+        tx[0] = grid_sample_tap(int(roundEven(sx)), W);
+        ty[0] = grid_sample_tap(int(roundEven(sy)), H);
+        wx[0] = 1.0; wy[0] = 1.0;
+        return 1;
+    }
+    int x0 = int(floor(sx)), y0 = int(floor(sy));
+    float fx = sx - x0, fy = sy - y0;
+    if (mode == 0) {
+        wx[0] = 1.0 - fx; wx[1] = fx; dwx[0] = -1.0; dwx[1] = 1.0;
+        wy[0] = 1.0 - fy; wy[1] = fy; dwy[0] = -1.0; dwy[1] = 1.0;
+        for (int k = 0; k < 2; k++) {
+            tx[k] = grid_sample_tap(x0 + k, W);
+            ty[k] = grid_sample_tap(y0 + k, H);
+        }
+        return 2;
+    }
+    const float a = -0.75;
+    wx[0] = cubic_kernel(1.0 + fx, a); wx[1] = cubic_kernel(fx, a);
+    wx[2] = cubic_kernel(1.0 - fx, a); wx[3] = cubic_kernel(2.0 - fx, a);
+    wy[0] = cubic_kernel(1.0 + fy, a); wy[1] = cubic_kernel(fy, a);
+    wy[2] = cubic_kernel(1.0 - fy, a); wy[3] = cubic_kernel(2.0 - fy, a);
+    // Offsets 1+t and t grow with t, 1-t and 2-t shrink: hence the sign flip on the last two.
+    dwx[0] = cubic_kernel_deriv(1.0 + fx, a); dwx[1] = cubic_kernel_deriv(fx, a);
+    dwx[2] = -cubic_kernel_deriv(1.0 - fx, a); dwx[3] = -cubic_kernel_deriv(2.0 - fx, a);
+    dwy[0] = cubic_kernel_deriv(1.0 + fy, a); dwy[1] = cubic_kernel_deriv(fy, a);
+    dwy[2] = -cubic_kernel_deriv(1.0 - fy, a); dwy[3] = -cubic_kernel_deriv(2.0 - fy, a);
+    for (int k = 0; k < 4; k++) {
+        tx[k] = grid_sample_tap(x0 - 1 + k, W);
+        ty[k] = grid_sample_tap(y0 - 1 + k, H);
+    }
+    return 4;
+}
+";
+
+    /// <summary>
+    /// GridSample 2D input gradient (gradOut, grid, gradIn). gradIn must be zeroed first: several sampling
+    /// points can read one pixel, so this accumulates with a compare-and-swap float add.
+    /// </summary>
+    public static string GridSample2DBackwardInput => Header + @"
+layout(set = 0, binding = 0) readonly buffer GO { float gradOut_[]; };
+layout(set = 0, binding = 1) readonly buffer G { float grid_[]; };
+layout(set = 0, binding = 2) buffer GI { uint gradIn_[]; };
+" + GridSampleBackwardPush + Helpers + GridSampleTaps + @"
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    if (gid >= N * outH * outW) return;
+    int ox = gid % outW; int t1 = gid / outW;
+    int oy = t1 % outH; int n = t1 / outH;
+    int tx[4]; int ty[4]; float wx[4]; float wy[4]; float dwx[4]; float dwy[4];
+    int taps = grid_sample_taps(gid * 2, tx, ty, wx, wy, dwx, dwy);
+    for (int c = 0; c < C; c++) {
+        float g = gradOut_[((n * C + c) * outH + oy) * outW + ox];
+        if (g == 0.0) continue;
+        int plane = (n * C + c) * H;
+        for (int j = 0; j < taps; j++) {
+            if (ty[j] < 0) continue;
+            int row = (plane + ty[j]) * W;
+            for (int i = 0; i < taps; i++) {
+                if (tx[i] < 0) continue;
+                int at = row + tx[i];
+                float add = g * wx[i] * wy[j];
+                uint expected = gradIn_[at];
+                while (true) {
+                    uint actual = atomicCompSwap(gradIn_[at], expected, floatBitsToUint(uintBitsToFloat(expected) + add));
+                    if (actual == expected) break;
+                    expected = actual;
+                }
+            }
+        }
+    }
+}
+";
+
+    /// <summary>
+    /// GridSample 2D grid gradient (gradOut, input, grid, gradGrid). Writes every element of gradGrid.
+    /// </summary>
+    public static string GridSample2DBackwardGrid => Header + @"
+layout(set = 0, binding = 0) readonly buffer GO { float gradOut_[]; };
+layout(set = 0, binding = 1) readonly buffer A { float input_[]; };
+layout(set = 0, binding = 2) readonly buffer G { float grid_[]; };
+layout(set = 0, binding = 3) writeonly buffer GG { float gradGrid_[]; };
+" + GridSampleBackwardPush + Helpers + GridSampleTaps + @"
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    if (gid >= N * outH * outW) return;
+    int ox = gid % outW; int t1 = gid / outW;
+    int oy = t1 % outH; int n = t1 / outH;
+    int tx[4]; int ty[4]; float wx[4]; float wy[4]; float dwx[4]; float dwy[4];
+    int taps = grid_sample_taps(gid * 2, tx, ty, wx, wy, dwx, dwy);
+    float gradX = 0.0, gradY = 0.0;
+    for (int c = 0; c < C; c++) {
+        float g = gradOut_[((n * C + c) * outH + oy) * outW + ox];
+        if (g == 0.0) continue;
+        int plane = (n * C + c) * H;
+        for (int j = 0; j < taps; j++) {
+            if (ty[j] < 0) continue;
+            int row = (plane + ty[j]) * W;
+            for (int i = 0; i < taps; i++) {
+                if (tx[i] < 0) continue;
+                float v = g * input_[row + tx[i]];
+                gradX += v * dwx[i] * wy[j];
+                gradY += v * wx[i] * dwy[j];
+            }
+        }
+    }
+    // d(source coord)/d(grid coord): (S-1)/2 with alignCorners, S/2 without.
+    gradGrid_[gid * 2] = gradX * (alignCorners != 0 ? float(W - 1) * 0.5 : float(W) * 0.5);
+    gradGrid_[gid * 2 + 1] = gradY * (alignCorners != 0 ? float(H - 1) * 0.5 : float(H) * 0.5);
+}
+";
+
+    // -----------------------------------------------------------------------
     // AffineGrid 3D.
     // -----------------------------------------------------------------------
 

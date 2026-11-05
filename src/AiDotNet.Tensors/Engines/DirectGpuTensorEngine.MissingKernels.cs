@@ -6931,6 +6931,12 @@ public partial class DirectGpuTensorEngine
         // than threading a flag through six kernel sources and six wrappers.
         //
         // S == 1 makes S/(S-1) undefined; align_corners=false with a size-1 axis is degenerate, so defer.
+        //
+        // Every other mode and padding (and that degenerate case) runs the geometry backend's mode-aware
+        // kernel, the exact derivative of its GridSample2D forward (#1680).
+        if (!IsLegacyGridSampleBackward(mode, padding, alignCorners, inputShape)
+            && TryGridSampleModeBackwardInput(gradOutput, grid, inputShape, mode, padding, alignCorners, out var modeGrad))
+            return modeGrad;
         if (typeof(T) != typeof(float) || mode != GridSampleMode.Bilinear || padding != GridSamplePadding.Zeros
             || inputShape.Length != 4 || gradOutput.Rank != 4 || grid.Rank != 4
             || (!alignCorners && (inputShape[2] <= 1 || inputShape[3] <= 1))
@@ -6972,6 +6978,89 @@ public partial class DirectGpuTensorEngine
     /// the two conventions are supported everywhere without duplicating a kernel six times.
     /// </para>
     /// </remarks>
+    /// <summary>
+    /// True for the configurations the Bilinear + Zeros backward kernels above serve: every other mode and
+    /// padding, and align_corners=false with a size-1 axis, go to the geometry backend's mode-aware kernels.
+    /// </summary>
+    private static bool IsLegacyGridSampleBackward(
+        GridSampleMode mode, GridSamplePadding padding, bool alignCorners, int[] inputShape) =>
+        mode == GridSampleMode.Bilinear && padding == GridSamplePadding.Zeros
+        && (alignCorners || inputShape.Length != 4 || (inputShape[2] > 1 && inputShape[3] > 1));
+
+    /// <summary>
+    /// GridSample input gradient on the device for any mode and padding, through
+    /// <see cref="IGeometryBackwardBackend.GridSample2DBackwardInput"/>. False when the backend has no geometry
+    /// kernels or the shapes are not 4D float, so the caller falls back to the CpuEngine reference.
+    /// </summary>
+    private bool TryGridSampleModeBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> grid, int[] inputShape,
+        GridSampleMode mode, GridSamplePadding padding, bool alignCorners, out Tensor<T> result)
+    {
+        result = null!;
+        if (typeof(T) != typeof(float) || inputShape.Length != 4 || gradOutput.Rank != 4
+            || grid.Rank != 4 || grid._shape[3] != 2
+            || !TryGetBackend(out var backend) || backend is not IGeometryBackwardBackend geom)
+            return false;
+        int N = inputShape[0], C = inputShape[1], H = inputShape[2], W = inputShape[3];
+        int outH = grid._shape[1], outW = grid._shape[2];
+        // A mismatched shape would read out of bounds on the device; the CPU reference reports it.
+        if (grid._shape[0] != N || !ShapesEqual(gradOutput._shape, new[] { N, C, outH, outW })) return false;
+        int inSize = N * C * H * W;
+        try
+        {
+            using var bufGO = GetOrAllocateBuffer(backend, gradOutput);
+            using var bufGrid = GetOrAllocateBuffer(backend, grid);
+            result = DispatchDeferredGpuOp<T>(backend, inSize, (int[])inputShape.Clone(), output =>
+            {
+                // The kernel accumulates: several sampling points can read one pixel.
+                backend.Fill(output, 0f, inSize);
+                geom.GridSample2DBackwardInput(bufGO.Buffer, bufGrid.Buffer, output,
+                    N, H, W, C, outH, outW, (int)mode, (int)padding, alignCorners);
+            });
+            return true;
+        }
+        catch (NotSupportedException capabilityGap)
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            GpuLaunchProbe.OnFallback("GridSampleBackwardInput", capabilityGap);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// GridSample grid gradient on the device for any mode and padding, through
+    /// <see cref="IGeometryBackwardBackend.GridSample2DBackwardGrid"/>. Falls back like
+    /// <see cref="TryGridSampleModeBackwardInput{T}"/>.
+    /// </summary>
+    private bool TryGridSampleModeBackwardGrid<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> grid,
+        GridSampleMode mode, GridSamplePadding padding, bool alignCorners, out Tensor<T> result)
+    {
+        result = null!;
+        if (typeof(T) != typeof(float) || input.Rank != 4 || gradOutput.Rank != 4
+            || grid.Rank != 4 || grid._shape[3] != 2
+            || !TryGetBackend(out var backend) || backend is not IGeometryBackwardBackend geom)
+            return false;
+        int N = input._shape[0], C = input._shape[1], H = input._shape[2], W = input._shape[3];
+        int outH = grid._shape[1], outW = grid._shape[2];
+        if (grid._shape[0] != N || !ShapesEqual(gradOutput._shape, new[] { N, C, outH, outW })) return false;
+        try
+        {
+            using var bufGO = GetOrAllocateBuffer(backend, gradOutput);
+            using var bufIn = GetOrAllocateBuffer(backend, input);
+            using var bufGrid = GetOrAllocateBuffer(backend, grid);
+            result = DispatchDeferredGpuOp<T>(backend, N * outH * outW * 2, (int[])grid._shape.Clone(),
+                output => geom.GridSample2DBackwardGrid(bufGO.Buffer, bufIn.Buffer, bufGrid.Buffer, output,
+                    N, H, W, C, outH, outW, (int)mode, (int)padding, alignCorners),
+                fullyWritten: true);
+            return true;
+        }
+        catch (NotSupportedException capabilityGap)
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            GpuLaunchProbe.OnFallback("GridSampleBackwardGrid", capabilityGap);
+            return false;
+        }
+    }
+
     private OwnedBuffer? AlignFalseGridToAlignTrue(
         IDirectGpuBackend backend, IGpuBuffer gridBuffer, int pairCount, int h, int w, bool alignCorners)
     {
@@ -7003,6 +7092,9 @@ public partial class DirectGpuTensorEngine
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (grid is null) throw new ArgumentNullException(nameof(grid));
         // Same align_corners handling as GridSampleBackwardInput above — see the derivation there.
+        if (!IsLegacyGridSampleBackward(mode, padding, alignCorners, input._shape)
+            && TryGridSampleModeBackwardGrid(gradOutput, input, grid, mode, padding, alignCorners, out var modeGrad))
+            return modeGrad;
         if (typeof(T) != typeof(float) || mode != GridSampleMode.Bilinear || padding != GridSamplePadding.Zeros
             || input.Rank != 4 || gradOutput.Rank != 4 || grid.Rank != 4
             || (!alignCorners && (input._shape[2] <= 1 || input._shape[3] <= 1))

@@ -357,4 +357,72 @@ public class GeometryGpuParityTests : IClassFixture<DirectGpuTensorEngineTestFix
             gradOutput, input, flow, null, normalize: false);
         Assert.Equal(flow.Shape.ToArray(), unnormalized.Shape.ToArray());
     }
+
+    public static System.Collections.Generic.IEnumerable<object[]> GridSampleBackwardCombinations()
+    {
+        foreach (GridSampleMode mode in Enum.GetValues(typeof(GridSampleMode)))
+        foreach (GridSamplePadding padding in Enum.GetValues(typeof(GridSamplePadding)))
+        foreach (bool align in new[] { false, true })
+            yield return new object[] { mode, padding, align };
+    }
+
+    /// <summary>
+    /// Sampling points between -3 and S+2 pixels (so every padding rule is hit), each at least 0.15 from a tap
+    /// boundary and, for Nearest, from the .5 rounding tie: float and double then pick the same taps.
+    /// </summary>
+    private static Tensor<float> PaddingExercisingGrid(int seed, int N, int outH, int outW, int H, int W,
+        GridSampleMode mode, bool align)
+    {
+        var rng = new Random(seed);
+        var data = new float[N * outH * outW * 2];
+        for (int i = 0; i < data.Length; i++)
+        {
+            int size = i % 2 == 0 ? W : H;
+            int whole = rng.Next(-3, size + 2);
+            double frac;
+            do frac = 0.15 + rng.NextDouble() * 0.7;
+            while (mode == GridSampleMode.Nearest && Math.Abs(frac - 0.5) < 0.15);
+            double pixel = whole + frac;
+            data[i] = (float)(align ? pixel * 2.0 / (size - 1) - 1.0 : (2.0 * pixel + 1.0) / size - 1.0);
+        }
+        return new Tensor<float>(data, new[] { N, outH, outW, 2 });
+    }
+
+    private bool BackendImplementsGeometryBackward()
+    {
+        var directGpuField = typeof(DirectGpuTensorEngine).GetField(
+            "_directGpu",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+        var directGpu = directGpuField?.GetValue(_fixture.Engine);
+        return directGpu?.GetType().GetProperty("Backend")?.GetValue(directGpu) is IGeometryBackwardBackend;
+    }
+
+    /// <summary>
+    /// The device GridSample backward for every mode, padding and convention (#1680) matches the CpuEngine
+    /// reference, and runs on the device: no GridSample backward fallback is recorded.
+    /// </summary>
+    [SkippableTheory]
+    [MemberData(nameof(GridSampleBackwardCombinations))]
+    public void GridSampleModeBackward_GpuMatchesCpu(GridSampleMode mode, GridSamplePadding padding, bool alignCorners)
+    {
+        SkipIfUnavailable();
+        Skip.If(!BackendImplementsGeometryBackward(), "Backend has no IGeometryBackwardBackend kernels.");
+        const int N = 2, C = 3, H = 5, W = 6, outH = 4, outW = 5;
+        var input = Rand4D(31, N, C, H, W);
+        var gradOut = Rand4D(32, N, C, outH, outW);
+        var grid = PaddingExercisingGrid(33, N, outH, outW, H, W, mode, alignCorners);
+
+        GpuLaunchProbe.Reset();
+        var gpuInput = Gpu.GridSampleBackwardInput(gradOut, grid, new[] { N, C, H, W }, mode, padding, alignCorners);
+        var gpuGrid = Gpu.GridSampleBackwardGrid(gradOut, input, grid, mode, padding, alignCorners);
+        var fallbacks = GpuLaunchProbe.Fallbacks.Where(f => f.Contains("GridSampleBackward")).ToArray();
+        Assert.True(fallbacks.Length == 0, "GridSample backward fell back to the CPU: " + string.Join("; ", fallbacks));
+
+        var cpuInput = _cpu.GridSampleBackwardInput(gradOut, grid, new[] { N, C, H, W }, mode, padding, alignCorners);
+        var cpuGrid = _cpu.GridSampleBackwardGrid(gradOut, input, grid, mode, padding, alignCorners);
+        AssertNonDegenerate(cpuInput, "CPU input gradient");
+        if (mode != GridSampleMode.Nearest) AssertNonDegenerate(cpuGrid, "CPU grid gradient");
+        AssertClose(gpuInput, cpuInput, 1e-4f);
+        AssertClose(gpuGrid, cpuGrid, 1e-4f);
+    }
 }

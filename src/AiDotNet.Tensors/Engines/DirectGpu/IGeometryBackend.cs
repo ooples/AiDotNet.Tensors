@@ -58,4 +58,31 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
         void AffineGrid3D(IGpuBuffer theta, IGpuBuffer grid,
             int N, int D, int H, int W, bool alignCorners);
     }
+
+    /// <summary>
+    /// Native GridSample backward kernels for every mode, padding and align_corners convention (#1680): the exact
+    /// derivative of <see cref="IGeometryBackend.GridSample2D"/>. Separate from <see cref="IGeometryBackend"/> so
+    /// adding it does not break existing implementers of that interface. DirectGpuTensorEngine type-tests against
+    /// it and falls back to the CpuEngine reference when it is absent.
+    /// </summary>
+    public interface IGeometryBackwardBackend
+    {
+        /// <summary>
+        /// Input gradient of <see cref="IGeometryBackend.GridSample2D"/> for every mode, padding and
+        /// align_corners convention: each sampling point scatters <c>gradOutput * weight</c> to the pixel each of its taps read.
+        /// <paramref name="gradInput"/> (<c>[N, C, H, W]</c>) must be zeroed by the caller; the kernel
+        /// accumulates into it.
+        /// </summary>
+        void GridSample2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer grid, IGpuBuffer gradInput,
+            int N, int H, int W, int C, int outH, int outW,
+            int mode, int padding, bool alignCorners);
+
+        /// <summary>
+        /// Grid gradient of <see cref="IGeometryBackend.GridSample2D"/> for every mode, padding and
+        /// align_corners convention. Writes every element of <paramref name="gradGrid"/> (<c>[N, outH, outW, 2]</c>); Nearest's is 0.
+        /// </summary>
+        void GridSample2DBackwardGrid(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer grid, IGpuBuffer gradGrid,
+            int N, int H, int W, int C, int outH, int outW,
+            int mode, int padding, bool alignCorners);
+    }
 }

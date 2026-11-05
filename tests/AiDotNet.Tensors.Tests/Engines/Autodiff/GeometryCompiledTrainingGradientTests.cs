@@ -96,6 +96,10 @@ public class GeometryCompiledTrainingGradientTests
     [Theory]
     [InlineData(GridSampleMode.Bilinear, GridSamplePadding.Zeros, false)]
     [InlineData(GridSampleMode.Bilinear, GridSamplePadding.Zeros, true)]
+    [InlineData(GridSampleMode.Bilinear, GridSamplePadding.Border, false)]
+    [InlineData(GridSampleMode.Bilinear, GridSamplePadding.Reflection, true)]
+    [InlineData(GridSampleMode.Bicubic, GridSamplePadding.Reflection, false)]
+    [InlineData(GridSampleMode.Bicubic, GridSamplePadding.Zeros, true)]
     public void GridSampleWithModes_CompiledInputAndGridGradients_MatchTape(GridSampleMode mode, GridSamplePadding padding, bool alignCorners)
     {
         var image = Rnd(new[] { 2, 3, 8, 8 }, 4);
@@ -104,6 +108,20 @@ public class GeometryCompiledTrainingGradientTests
         AssertCompiledMatchesTape(e =>
             e.ReduceSum(e.TensorMultiply(e.GridSample(image, grid, mode, padding, alignCorners), weights), null),
             new[] { image, grid }, $"GridSample({mode}, {padding}, {alignCorners})");
+    }
+
+    /// <summary>Nearest is piecewise constant, so only its input gradient is non-zero; the grid's is 0 by definition.</summary>
+    [Theory]
+    [InlineData(GridSamplePadding.Border, false)]
+    [InlineData(GridSamplePadding.Reflection, true)]
+    public void GridSampleNearest_CompiledInputGradient_MatchesTape(GridSamplePadding padding, bool alignCorners)
+    {
+        var image = Rnd(new[] { 2, 3, 8, 8 }, 4);
+        var grid = Rnd(new[] { 2, 6, 6, 2 }, 5, 1.3);
+        var weights = Rnd(new[] { 2, 3, 6, 6 }, 6);
+        AssertCompiledMatchesTape(e =>
+            e.ReduceSum(e.TensorMultiply(e.GridSample(image, grid, GridSampleMode.Nearest, padding, alignCorners), weights), null),
+            new[] { image }, $"GridSample(Nearest, {padding}, {alignCorners})");
     }
 
     [Fact]

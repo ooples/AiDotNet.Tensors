@@ -684,19 +684,9 @@ public partial class CpuEngine
         // Tape registration. This overload previously recorded NOTHING, so a mode-aware GridSample
         // produced no gradient for either operand while the narrow overload produced both.
         //
-        // The sampling parameters are forwarded so the backward can use the mode-aware
-        // GridSampleBackwardInput/Grid entry points, which implement Bilinear + Zeros for BOTH
-        // align_corners conventions and raise NotSupportedException for any other mode or padding.
-        // They are deliberately NOT used unconditionally: Nearest is piecewise-constant, so its grid
-        // gradient is 0 rather than bilinear weights, and Border/Reflection padding changes which
-        // source pixels a boundary sample reads. A loud failure beats a plausible wrong number.
-        //
-        // The throw is deliberately DEFERRED to the backward rather than raised here when a tape is
-        // active. Recording is unconditional because a tape being open does not mean this particular
-        // output will be differentiated — a caller may sample with Nearest for a non-differentiated
-        // branch inside a taped region, and failing at the forward would break that valid use. The
-        // exception instead names the op, the mode, the padding and the fact that the FORWARD
-        // configuration is the cause, so it is self-locating without costing the working case.
+        // The sampling parameters are forwarded so the backward uses the mode-aware
+        // GridSampleBackwardInput/Grid entry points, which differentiate every mode, padding and
+        // align_corners convention this forward supports.
         DifferentiableOps.RecordBinary("GridSample", output, input, grid,
             BackwardFunctions<T>.GridSampleModeBackward,
             savedState: new object[] { (int)mode, (int)padding, alignCorners });
@@ -756,20 +746,189 @@ public partial class CpuEngine
         return r < extent ? r : period - r;
     }
 
+    /// <summary>
+    /// The pixel index <see cref="SampleSafe{T}"/> reads for an integer tap, or -1 when the tap reads the
+    /// zero padding. The backward uses it so it scatters to exactly the pixels the forward read.
+    /// </summary>
+    private static int PaddedTap(int i, int extent, GridSamplePadding padding) => padding switch
+    {
+        GridSamplePadding.Zeros => (uint)i < (uint)extent ? i : -1,
+        GridSamplePadding.Border => ClampInt(i, 0, extent - 1),
+        _ => ReflectIndex(i, extent),
+    };
+
+    /// <summary>d/dt of <see cref="CubicWeights"/>: the kernel's derivative at offsets {1+t, t, 1-t, 2-t}.</summary>
+    private static double[] CubicWeightDerivatives(double t)
+    {
+        const double a = -0.75;
+        // The offsets 1+t and t grow with t; 1-t and 2-t shrink, hence the sign flip.
+        return new[]
+        {
+            CubicKernelDerivative(1.0 + t, a),
+            CubicKernelDerivative(t, a),
+            -CubicKernelDerivative(1.0 - t, a),
+            -CubicKernelDerivative(2.0 - t, a),
+        };
+    }
+
+    /// <summary>dK/dd of <see cref="CubicKernel"/> for d &gt;= 0, which every offset CubicWeights uses is.</summary>
+    private static double CubicKernelDerivative(double d, double a)
+    {
+        if (d < 1.0) return (3.0 * (a + 2.0) * d - 2.0 * (a + 3.0)) * d;
+        if (d < 2.0) return (3.0 * a * d - 10.0 * a) * d + 8.0 * a;
+        return 0.0;
+    }
+
+    /// <summary>
+    /// GridSample backward for every mode and padding: the exact derivative of the mode-aware forward.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The forward is out[n,c,oy,ox] = sum over taps of w_tap(sx, sy) * in[n,c,pad(tap)]. The taps are the
+    /// rounded point (Nearest), the 2x2 floor neighbourhood (Bilinear) or the 4x4 one (Bicubic). pad maps a
+    /// tap to the pixel it reads: Zeros reads 0 outside the image, Border clamps the tap, Reflection
+    /// reflects it. Padding acts on the integer tap, not on the coordinate, so it leaves the weights alone.
+    /// </para>
+    /// <para>
+    /// The input gradient scatters g * w_tap to pad(tap); a Zeros tap outside the image gets nothing. The
+    /// grid gradient is the sum over taps of g * dw_tap/dsx * in[pad(tap)], times dsx/dgx: (W-1)/2 with
+    /// alignCorners, W/2 without (y likewise). Nearest is piecewise constant, so its grid gradient is 0, as
+    /// in PyTorch. A point the forward does not sample (#1134) contributes to neither gradient.
+    /// </para>
+    /// </remarks>
+    private static Tensor<T> GridSampleTapBackward<T>(Tensor<T> gradOutput, Tensor<T>? input, Tensor<T> grid,
+        int[] inputShape, GridSampleMode mode, GridSamplePadding padding, bool alignCorners, bool wantGrid)
+    {
+        if (inputShape.Length != 4) throw new ArgumentException("GridSample backward expects an NCHW input shape.");
+        if (grid.Rank != 4 || grid._shape[3] != 2) throw new ArgumentException("grid must be [N, outH, outW, 2].");
+        int N = inputShape[0], C = inputShape[1], H = inputShape[2], W = inputShape[3];
+        int outH = grid._shape[1], outW = grid._shape[2];
+        if (grid._shape[0] != N || gradOutput.Rank != 4 || gradOutput._shape[0] != N || gradOutput._shape[1] != C
+            || gradOutput._shape[2] != outH || gradOutput._shape[3] != outW)
+            throw new ArgumentException("gradOutput must be [N, C, outH, outW] for the given input shape and grid.");
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        var result = wantGrid ? new Tensor<T>((int[])grid._shape.Clone()) : new Tensor<T>((int[])inputShape.Clone());
+        if (result.Length == 0 || gradOutput.Length == 0) return result;
+        if (wantGrid && mode == GridSampleMode.Nearest) return result;
+
+        using var goLease = gradOutput.Lease();
+        var go = goLease.Span;
+        using var gLease = grid.Lease();
+        var g = gLease.Span;
+        var srcTensor = wantGrid ? input! : gradOutput; // only read when wantGrid
+        using var inLease = srcTensor.Lease();
+        var src = inLease.Span;
+        // Accumulate in double: one pixel can receive contributions from many output points.
+        var acc = new double[result.Length];
+
+        double dsxdgx = alignCorners ? (W - 1) * 0.5 : W * 0.5;
+        double dsydgy = alignCorners ? (H - 1) * 0.5 : H * 0.5;
+        int taps = mode == GridSampleMode.Nearest ? 1 : mode == GridSampleMode.Bilinear ? 2 : 4;
+        var wx = new double[4];
+        var wy = new double[4];
+        var dwx = new double[4];
+        var dwy = new double[4];
+        var tx = new int[4];
+        var ty = new int[4];
+
+        for (int n = 0; n < N; n++)
+        for (int oy = 0; oy < outH; oy++)
+        for (int ox = 0; ox < outW; ox++)
+        {
+            int gOff = ((n * outH + oy) * outW + ox) * 2;
+            double sx = NormalizedToPixel(ops.ToDouble(g[gOff]), W, alignCorners);
+            double sy = NormalizedToPixel(ops.ToDouble(g[gOff + 1]), H, alignCorners);
+            if (!GridPointSamples(sx) || !GridPointSamples(sy)) continue;
+
+            if (mode == GridSampleMode.Nearest)
+            {
+                // Math.Round, as in the forward, so the backward picks the same tap at .5 ties.
+                tx[0] = PaddedTap((int)Math.Round(sx), W, padding);
+                ty[0] = PaddedTap((int)Math.Round(sy), H, padding);
+                wx[0] = wy[0] = 1.0;
+                dwx[0] = dwy[0] = 0.0;
+            }
+            else
+            {
+                int x0 = (int)Math.Floor(sx), y0 = (int)Math.Floor(sy);
+                double fx = sx - x0, fy = sy - y0;
+                if (mode == GridSampleMode.Bilinear)
+                {
+                    wx[0] = 1 - fx; wx[1] = fx; dwx[0] = -1; dwx[1] = 1;
+                    wy[0] = 1 - fy; wy[1] = fy; dwy[0] = -1; dwy[1] = 1;
+                    for (int k = 0; k < 2; k++)
+                    {
+                        tx[k] = PaddedTap(x0 + k, W, padding);
+                        ty[k] = PaddedTap(y0 + k, H, padding);
+                    }
+                }
+                else
+                {
+                    CubicWeights(fx).CopyTo(wx, 0);
+                    CubicWeightDerivatives(fx).CopyTo(dwx, 0);
+                    CubicWeights(fy).CopyTo(wy, 0);
+                    CubicWeightDerivatives(fy).CopyTo(dwy, 0);
+                    for (int k = 0; k < 4; k++)
+                    {
+                        tx[k] = PaddedTap(x0 - 1 + k, W, padding);
+                        ty[k] = PaddedTap(y0 - 1 + k, H, padding);
+                    }
+                }
+            }
+
+            double gradX = 0.0, gradY = 0.0;
+            for (int c = 0; c < C; c++)
+            {
+                double gc = ops.ToDouble(go[((n * C + c) * outH + oy) * outW + ox]);
+                if (gc == 0.0) continue;
+                int plane = (n * C + c) * H;
+                for (int j = 0; j < taps; j++)
+                {
+                    if (ty[j] < 0) continue;
+                    int row = (plane + ty[j]) * W;
+                    for (int i = 0; i < taps; i++)
+                    {
+                        if (tx[i] < 0) continue;
+                        if (wantGrid)
+                        {
+                            double v = gc * ops.ToDouble(src[row + tx[i]]);
+                            gradX += v * dwx[i] * wy[j];
+                            gradY += v * wx[i] * dwy[j];
+                        }
+                        else
+                        {
+                            acc[row + tx[i]] += gc * wx[i] * wy[j];
+                        }
+                    }
+                }
+            }
+            if (wantGrid)
+            {
+                acc[gOff] = gradX * dsxdgx;
+                acc[gOff + 1] = gradY * dsydgy;
+            }
+        }
+
+        using var outLease = result.LeaseWritable();
+        var dst = outLease.Span;
+        for (int i = 0; i < acc.Length; i++) dst[i] = ops.FromDouble(acc[i]);
+        return result;
+    }
+
     /// <inheritdoc/>
     public virtual Tensor<T> GridSampleBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> grid, int[] inputShape,
         GridSampleMode mode, GridSamplePadding padding, bool alignCorners)
     {
+        if (gradOutput is null) throw new ArgumentNullException(nameof(gradOutput));
+        if (grid is null) throw new ArgumentNullException(nameof(grid));
+        if (inputShape is null) throw new ArgumentNullException(nameof(inputShape));
+        // Every mode and padding other than Bilinear + Zeros: the exact derivative of the forward.
+        if (mode != GridSampleMode.Bilinear || padding != GridSamplePadding.Zeros)
+            return GridSampleTapBackward(gradOutput, null, grid, inputShape, mode, padding, alignCorners, wantGrid: false);
         // The 3-arg GridSampleBackwardInput implements bilinear + zeros + alignCorners=false (the
         // torchvision defaults). alignCorners=true used to throw here as a "follow-up", which left the
         // GPU kernels — which hardcode the align-TRUE mapping — with no CPU counterpart to check against.
-        if (mode != GridSampleMode.Bilinear || padding != GridSamplePadding.Zeros)
-            throw new NotSupportedException(
-                $"GridSample backward is currently supported only for Bilinear + Zeros, but a GridSample " +
-                $"FORWARD in this tape was configured with {mode}/{padding}. The gradient is refused " +
-                $"rather than approximated: Nearest is piecewise-constant (grid gradient 0, not bilinear " +
-                $"weights) and Border/Reflection change which source pixels a boundary sample reads. " +
-                $"Change that forward call's mode/padding, or wrap it so it is not differentiated.");
         if (!alignCorners) return GridSampleBackwardInput(gradOutput, grid, inputShape);
         // No second implementation needed: the conventions differ by a pure per-axis rescale of the grid.
         //     align=false: src = (g+1)*S/2 - 0.5        align=true: src = (g+1)*(S-1)/2
@@ -808,11 +967,11 @@ public partial class CpuEngine
     public virtual Tensor<T> GridSampleBackwardGrid<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> grid,
         GridSampleMode mode, GridSamplePadding padding, bool alignCorners)
     {
+        if (gradOutput is null) throw new ArgumentNullException(nameof(gradOutput));
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (grid is null) throw new ArgumentNullException(nameof(grid));
         if (mode != GridSampleMode.Bilinear || padding != GridSamplePadding.Zeros)
-            throw new NotSupportedException(
-                $"GridSample backward is currently supported only for Bilinear + Zeros, but a GridSample " +
-                $"FORWARD in this tape was configured with {mode}/{padding}. See " +
-                $"GridSampleBackwardInput for why the gradient is refused rather than approximated.");
+            return GridSampleTapBackward(gradOutput, input, grid, input._shape, mode, padding, alignCorners, wantGrid: true);
         if (!alignCorners) return GridSampleBackwardGrid(gradOutput, input, grid);
         // Same rescale as GridSampleBackwardInput, plus the chain rule: the inner call differentiates
         // with respect to g_false, and dg_false/dg_true is that same (S-1)/S factor.

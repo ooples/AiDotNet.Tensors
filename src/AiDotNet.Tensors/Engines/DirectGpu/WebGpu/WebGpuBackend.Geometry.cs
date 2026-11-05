@@ -8,7 +8,7 @@
 #if NET7_0_OR_GREATER
 namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
-public sealed partial class WebGpuBackend : IGeometryBackend
+public sealed partial class WebGpuBackend : IGeometryBackend, IGeometryBackwardBackend
 {
     private const string GeometryModuleKey = "Geometry";
 
@@ -26,6 +26,16 @@ public sealed partial class WebGpuBackend : IGeometryBackend
     void IGeometryBackend.GridSample2D(IGpuBuffer input, IGpuBuffer grid, IGpuBuffer output,
         int N, int H, int W, int C, int outH, int outW, int mode, int padding, bool alignCorners)
         => GridSample2DAsync(input, grid, output, N, H, W, C, outH, outW, mode, padding, alignCorners)
+            .GetAwaiter().GetResult();
+
+    void IGeometryBackwardBackend.GridSample2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer grid, IGpuBuffer gradInput,
+        int N, int H, int W, int C, int outH, int outW, int mode, int padding, bool alignCorners)
+        => GridSample2DBackwardInputAsync(gradOutput, grid, gradInput, N, H, W, C, outH, outW, mode, padding, alignCorners)
+            .GetAwaiter().GetResult();
+
+    void IGeometryBackwardBackend.GridSample2DBackwardGrid(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer grid,
+        IGpuBuffer gradGrid, int N, int H, int W, int C, int outH, int outW, int mode, int padding, bool alignCorners)
+        => GridSample2DBackwardGridAsync(gradOutput, input, grid, gradGrid, N, H, W, C, outH, outW, mode, padding, alignCorners)
             .GetAwaiter().GetResult();
 
     void IGeometryBackend.AffineGrid3D(IGpuBuffer theta, IGpuBuffer grid,
@@ -103,6 +113,44 @@ public sealed partial class WebGpuBackend : IGeometryBackend
             WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
         using var bind = new WebGpuBindGroup(pipe,
             AsWgpu(input), AsWgpu(grid), AsWgpu(output));
+        var (wg, _) = _device.CalculateWorkgroups1D(total);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(
+            pipe, bind.BindGroupId, uniforms.BufferId, wg, 1, 1);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
+    }
+
+    public async Task GridSample2DBackwardInputAsync(IGpuBuffer gradOutput, IGpuBuffer grid, IGpuBuffer gradInput,
+        int N, int H, int W, int C, int outH, int outW,
+        int mode, int padding, bool alignCorners)
+    {
+        int total = N * outH * outW;
+        if (total <= 0) return;
+        var pipe = await GetOrCreatePipelineAsync(
+            GeometryModuleKey + ":GridSample2DBackwardInput", WebGpuGeometryKernels.GridSample2DBackwardInput, "main");
+        using var uniforms = new WebGpuBuffer(
+            UniformInts(N, H, W, C, outH, outW, mode, padding, alignCorners ? 1 : 0),
+            WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        using var bind = new WebGpuBindGroup(pipe,
+            AsWgpu(gradOutput), AsWgpu(grid), AsWgpu(gradInput));
+        var (wg, _) = _device.CalculateWorkgroups1D(total);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(
+            pipe, bind.BindGroupId, uniforms.BufferId, wg, 1, 1);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
+    }
+
+    public async Task GridSample2DBackwardGridAsync(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer grid,
+        IGpuBuffer gradGrid, int N, int H, int W, int C, int outH, int outW,
+        int mode, int padding, bool alignCorners)
+    {
+        int total = N * outH * outW;
+        if (total <= 0) return;
+        var pipe = await GetOrCreatePipelineAsync(
+            GeometryModuleKey + ":GridSample2DBackwardGrid", WebGpuGeometryKernels.GridSample2DBackwardGrid, "main");
+        using var uniforms = new WebGpuBuffer(
+            UniformInts(N, H, W, C, outH, outW, mode, padding, alignCorners ? 1 : 0),
+            WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        using var bind = new WebGpuBindGroup(pipe,
+            AsWgpu(gradOutput), AsWgpu(input), AsWgpu(grid), AsWgpu(gradGrid));
         var (wg, _) = _device.CalculateWorkgroups1D(total);
         await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(
             pipe, bind.BindGroupId, uniforms.BufferId, wg, 1, 1);

@@ -2,7 +2,7 @@
 // OpenCL launcher shims for the geometry / sampling kernels (Issue #217).
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 {
-    public sealed partial class OpenClBackend : IGeometryBackend
+    public sealed partial class OpenClBackend : IGeometryBackend, IGeometryBackwardBackend
     {
         private const int GeometryLocalSize = 256;
 
@@ -70,6 +70,39 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             k.SetArg(3, N); k.SetArg(4, H); k.SetArg(5, W); k.SetArg(6, C);
             k.SetArg(7, outH); k.SetArg(8, outW);
             k.SetArg(9, mode); k.SetArg(10, padding); k.SetArg(11, alignCorners ? 1 : 0);
+            k.Execute1D(RoundUpToGeometryGroup(total), GeometryLocalSize);
+        }
+
+        public void GridSample2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer grid, IGpuBuffer gradInput,
+            int N, int H, int W, int C, int outH, int outW,
+            int mode, int padding, bool alignCorners)
+        {
+            int total = N * outH * outW;
+            if (total <= 0) return;
+            var k = GetGeometryKernel("geometry_grid_sample_2d_backward_input");
+            k.SetArg(0, GeometryBufHandle(gradOutput));
+            k.SetArg(1, GeometryBufHandle(grid));
+            k.SetArg(2, GeometryBufHandle(gradInput));
+            k.SetArg(3, N); k.SetArg(4, H); k.SetArg(5, W); k.SetArg(6, C);
+            k.SetArg(7, outH); k.SetArg(8, outW);
+            k.SetArg(9, mode); k.SetArg(10, padding); k.SetArg(11, alignCorners ? 1 : 0);
+            k.Execute1D(RoundUpToGeometryGroup(total), GeometryLocalSize);
+        }
+
+        public void GridSample2DBackwardGrid(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer grid,
+            IGpuBuffer gradGrid, int N, int H, int W, int C, int outH, int outW,
+            int mode, int padding, bool alignCorners)
+        {
+            int total = N * outH * outW;
+            if (total <= 0) return;
+            var k = GetGeometryKernel("geometry_grid_sample_2d_backward_grid");
+            k.SetArg(0, GeometryBufHandle(gradOutput));
+            k.SetArg(1, GeometryBufHandle(input));
+            k.SetArg(2, GeometryBufHandle(grid));
+            k.SetArg(3, GeometryBufHandle(gradGrid));
+            k.SetArg(4, N); k.SetArg(5, H); k.SetArg(6, W); k.SetArg(7, C);
+            k.SetArg(8, outH); k.SetArg(9, outW);
+            k.SetArg(10, mode); k.SetArg(11, padding); k.SetArg(12, alignCorners ? 1 : 0);
             k.Execute1D(RoundUpToGeometryGroup(total), GeometryLocalSize);
         }
 

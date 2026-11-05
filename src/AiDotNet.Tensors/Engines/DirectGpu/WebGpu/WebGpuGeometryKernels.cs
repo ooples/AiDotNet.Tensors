@@ -12,6 +12,8 @@ public static class WebGpuGeometryKernels
         "geometry_interpolate_2d",
         "geometry_pad_4d",
         "geometry_grid_sample_2d",
+        "geometry_grid_sample_2d_backward_input",
+        "geometry_grid_sample_2d_backward_grid",
         "geometry_affine_grid_3d",
     };
 
@@ -282,6 +284,183 @@ fn sample_safe(n: i32, y_in: i32, x_in: i32, c: i32) -> f32 {
             output_[((n * p.C + c) * p.outH + oy) * p.outW + ox] = acc;
         }
     }
+}
+";
+
+    // -----------------------------------------------------------------------
+    // GridSample 2D backward, every mode and padding (#1680): the exact derivative of GridSample2D. The taps
+    // and weights are the forward's; padding maps each tap to the pixel the forward read, or -1 where it read
+    // the zero padding, so it never moves a weight. One invocation per sampling point, looping C.
+    // -----------------------------------------------------------------------
+
+    private const string GridSampleBackwardUniform = @"
+struct P {
+    N: i32, H: i32, W: i32, C: i32,
+    outH: i32, outW: i32, mode: i32, padding: i32, alignCorners: i32,
+};
+";
+
+    private const string GridSampleTaps = @"
+fn grid_sample_tap(i: i32, extent: i32) -> i32 {
+    if (p.padding == 0) {
+        if (u32(i) < u32(extent)) { return i; }
+        return -1;
+    }
+    if (p.padding == 1) { return clamp_i(i, 0, extent - 1); }
+    return reflect_index(i, extent);
+}
+
+// dK/dd of cubic_kernel_f for d >= 0, which every offset the taps use is.
+fn cubic_kernel_deriv_f(d: f32, a: f32) -> f32 {
+    if (d < 1.0) { return (3.0 * (a + 2.0) * d - 2.0 * (a + 3.0)) * d; }
+    if (d < 2.0) { return (3.0 * a * d - 10.0 * a) * d + 8.0 * a; }
+    return 0.0;
+}
+
+// The taps of one sampling point: per-axis pixel index, weight and d(weight)/d(source coord). count is the taps
+// per axis (1 nearest, 2 bilinear, 4 bicubic), or 0 when the forward samples nothing at this point (#1134).
+struct Taps {
+    count: i32,
+    tx: array<i32, 4>, ty: array<i32, 4>,
+    wx: array<f32, 4>, wy: array<f32, 4>,
+    dwx: array<f32, 4>, dwy: array<f32, 4>,
+};
+
+fn grid_sample_taps(gOff: i32) -> Taps {
+    var t : Taps;
+    t.count = 0;
+    for (var k : i32 = 0; k < 4; k = k + 1) {
+        t.tx[k] = -1; t.ty[k] = -1; t.wx[k] = 0.0; t.wy[k] = 0.0; t.dwx[k] = 0.0; t.dwy[k] = 0.0;
+    }
+    let gx = grid_[gOff];
+    let gy = grid_[gOff + 1];
+    var sx : f32; var sy : f32;
+    if (p.alignCorners != 0) {
+        sx = (gx + 1.0) * 0.5 * f32(p.W - 1);
+        sy = (gy + 1.0) * 0.5 * f32(p.H - 1);
+    } else {
+        sx = ((gx + 1.0) * f32(p.W) - 1.0) * 0.5;
+        sy = ((gy + 1.0) * f32(p.H) - 1.0) * 0.5;
+    }
+    if ((bitcast<u32>(sx) & 0x7FFFFFFFu) >= 0x4EFFFFFFu || (bitcast<u32>(sy) & 0x7FFFFFFFu) >= 0x4EFFFFFFu) { return t; }
+    if (p.mode == 1) {
+        t.count = 1;
+        t.tx[0] = grid_sample_tap(i32(round(sx)), p.W);
+        t.ty[0] = grid_sample_tap(i32(round(sy)), p.H);
+        t.wx[0] = 1.0; t.wy[0] = 1.0;
+        return t;
+    }
+    let x0 = i32(floor(sx)); let y0 = i32(floor(sy));
+    let fx = sx - f32(x0); let fy = sy - f32(y0);
+    if (p.mode == 0) {
+        t.count = 2;
+        t.wx[0] = 1.0 - fx; t.wx[1] = fx; t.dwx[0] = -1.0; t.dwx[1] = 1.0;
+        t.wy[0] = 1.0 - fy; t.wy[1] = fy; t.dwy[0] = -1.0; t.dwy[1] = 1.0;
+        for (var k : i32 = 0; k < 2; k = k + 1) {
+            t.tx[k] = grid_sample_tap(x0 + k, p.W);
+            t.ty[k] = grid_sample_tap(y0 + k, p.H);
+        }
+        return t;
+    }
+    t.count = 4;
+    let a = -0.75;
+    t.wx[0] = cubic_kernel_f(1.0 + fx, a); t.wx[1] = cubic_kernel_f(fx, a);
+    t.wx[2] = cubic_kernel_f(1.0 - fx, a); t.wx[3] = cubic_kernel_f(2.0 - fx, a);
+    t.wy[0] = cubic_kernel_f(1.0 + fy, a); t.wy[1] = cubic_kernel_f(fy, a);
+    t.wy[2] = cubic_kernel_f(1.0 - fy, a); t.wy[3] = cubic_kernel_f(2.0 - fy, a);
+    // Offsets 1+t and t grow with t, 1-t and 2-t shrink: hence the sign flip on the last two.
+    t.dwx[0] = cubic_kernel_deriv_f(1.0 + fx, a); t.dwx[1] = cubic_kernel_deriv_f(fx, a);
+    t.dwx[2] = -cubic_kernel_deriv_f(1.0 - fx, a); t.dwx[3] = -cubic_kernel_deriv_f(2.0 - fx, a);
+    t.dwy[0] = cubic_kernel_deriv_f(1.0 + fy, a); t.dwy[1] = cubic_kernel_deriv_f(fy, a);
+    t.dwy[2] = -cubic_kernel_deriv_f(1.0 - fy, a); t.dwy[3] = -cubic_kernel_deriv_f(2.0 - fy, a);
+    for (var k : i32 = 0; k < 4; k = k + 1) {
+        t.tx[k] = grid_sample_tap(x0 - 1 + k, p.W);
+        t.ty[k] = grid_sample_tap(y0 - 1 + k, p.H);
+    }
+    return t;
+}
+";
+
+    /// <summary>
+    /// GridSample 2D input gradient (gradOut, grid, gradIn). gradIn must be zeroed first: several sampling
+    /// points can read one pixel, so this accumulates with a compare-and-swap float add.
+    /// </summary>
+    public static string GridSample2DBackwardInput => @"
+@group(0) @binding(0) var<storage, read> gradOut_ : array<f32>;
+@group(0) @binding(1) var<storage, read> grid_ : array<f32>;
+@group(0) @binding(2) var<storage, read_write> gradIn_ : array<atomic<u32>>;
+" + GridSampleBackwardUniform + @"
+@group(0) @binding(3) var<uniform> p : P;
+" + Helpers + GridSampleTaps + @"
+fn atomic_add_f(idx: i32, val: f32) {
+    var old = atomicLoad(&gradIn_[idx]);
+    loop {
+        let res = atomicCompareExchangeWeak(&gradIn_[idx], old, bitcast<u32>(bitcast<f32>(old) + val));
+        if (res.exchanged) { break; }
+        old = res.old_value;
+    }
+}
+
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
+    let gid = i32(id.x);
+    if (gid >= p.N * p.outH * p.outW) { return; }
+    let ox = gid % p.outW; let t1 = gid / p.outW;
+    let oy = t1 % p.outH; let n = t1 / p.outH;
+    var t = grid_sample_taps(gid * 2);
+    for (var c : i32 = 0; c < p.C; c = c + 1) {
+        let g = gradOut_[((n * p.C + c) * p.outH + oy) * p.outW + ox];
+        if (g == 0.0) { continue; }
+        let plane = (n * p.C + c) * p.H;
+        for (var j : i32 = 0; j < t.count; j = j + 1) {
+            if (t.ty[j] < 0) { continue; }
+            let row = (plane + t.ty[j]) * p.W;
+            for (var i : i32 = 0; i < t.count; i = i + 1) {
+                if (t.tx[i] < 0) { continue; }
+                atomic_add_f(row + t.tx[i], g * t.wx[i] * t.wy[j]);
+            }
+        }
+    }
+}
+";
+
+    /// <summary>
+    /// GridSample 2D grid gradient (gradOut, input, grid, gradGrid). Writes every element of gradGrid.
+    /// </summary>
+    public static string GridSample2DBackwardGrid => @"
+@group(0) @binding(0) var<storage, read> gradOut_ : array<f32>;
+@group(0) @binding(1) var<storage, read> input_ : array<f32>;
+@group(0) @binding(2) var<storage, read> grid_ : array<f32>;
+@group(0) @binding(3) var<storage, read_write> gradGrid_ : array<f32>;
+" + GridSampleBackwardUniform + @"
+@group(0) @binding(4) var<uniform> p : P;
+" + Helpers + GridSampleTaps + @"
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
+    let gid = i32(id.x);
+    if (gid >= p.N * p.outH * p.outW) { return; }
+    let ox = gid % p.outW; let t1 = gid / p.outW;
+    let oy = t1 % p.outH; let n = t1 / p.outH;
+    var t = grid_sample_taps(gid * 2);
+    var gradX = 0.0; var gradY = 0.0;
+    for (var c : i32 = 0; c < p.C; c = c + 1) {
+        let g = gradOut_[((n * p.C + c) * p.outH + oy) * p.outW + ox];
+        if (g == 0.0) { continue; }
+        let plane = (n * p.C + c) * p.H;
+        for (var j : i32 = 0; j < t.count; j = j + 1) {
+            if (t.ty[j] < 0) { continue; }
+            let row = (plane + t.ty[j]) * p.W;
+            for (var i : i32 = 0; i < t.count; i = i + 1) {
+                if (t.tx[i] < 0) { continue; }
+                let v = g * input_[row + t.tx[i]];
+                gradX = gradX + v * t.dwx[i] * t.wy[j];
+                gradY = gradY + v * t.wx[i] * t.dwy[j];
+            }
+        }
+    }
+    // d(source coord)/d(grid coord): (S-1)/2 with alignCorners, S/2 without.
+    var sxg = f32(p.W) * 0.5; var syg = f32(p.H) * 0.5;
+    if (p.alignCorners != 0) { sxg = f32(p.W - 1) * 0.5; syg = f32(p.H - 1) * 0.5; }
+    gradGrid_[gid * 2] = gradX * sxg;
+    gradGrid_[gid * 2 + 1] = gradY * syg;
 }
 ";
 
