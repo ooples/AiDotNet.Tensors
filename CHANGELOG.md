@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.147.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.146.0...v0.147.0) (2026-11-05)
+
+
+### Features
+
+* **clip:** deterministic, overflow-free global-norm clip, bit-identical on CPU and every GPU backend ([#1672](https://github.com/ooples/AiDotNet.Tensors/issues/1672)) ([0fa810a](https://github.com/ooples/AiDotNet.Tensors/commit/0fa810a99a79e754ce1d329d058d2562747a4f21))
+* **compiled-plan:** stream fused optimizer state through ICompiledTrainingPlanStreamedState ([#1675](https://github.com/ooples/AiDotNet.Tensors/issues/1675)) ([9a603fb](https://github.com/ooples/AiDotNet.Tensors/commit/9a603fb94a2ef4aeb38870a5ba4bbbbc9dfa5295))
+
+
+### Bug Fixes
+
+* **autodiff:** accept output-padded gradients in conv-transpose backward ([#1674](https://github.com/ooples/AiDotNet.Tensors/issues/1674)) ([2a2bf42](https://github.com/ooples/AiDotNet.Tensors/commit/2a2bf42a7486ffe4d05f61dbbca395d609d434c1))
+* **gpu:** detach copy-on-write parameters before an in-place device optimizer step ([#1671](https://github.com/ooples/AiDotNet.Tensors/issues/1671)) ([52102c3](https://github.com/ooples/AiDotNet.Tensors/commit/52102c3fc14aade0fa6e0547e8b6db5486ebc7b8))
+
 ## [0.146.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.145.0...v0.146.0) (2026-11-03)
 
 
