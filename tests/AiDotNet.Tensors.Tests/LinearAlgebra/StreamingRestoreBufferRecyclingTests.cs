@@ -396,4 +396,45 @@ public class StreamingRestoreBufferRecyclingTests
             try { if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true); } catch (IOException) { }
         }
     }
+
+    // Rents, parks and drops one array in a frame of its own, so no local keeps it alive.
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static void PoolOneArray(int length)
+    {
+        var array = StreamingRestoreBuffers<float>.Rent(length, out _);
+        StreamingRestoreBuffers<float>.Park(array);
+    }
+
+    /// <summary>
+    /// The pool must never be why a near-limit heap fails to allocate (AiDotNet#2322): a full collection reclaims
+    /// idle pooled arrays, and without one they are still reused.
+    /// </summary>
+    [Fact]
+    public void PooledArrays_AreReusedUntilAFullCollection_WhichReclaimsThem()
+    {
+        const int length = 256 * 1024; // 1 MB of fp32: a large-object-heap array, freed only by a full collection
+        string dir = Configure(restorePoolBytes: 4L * length * sizeof(float));
+        try
+        {
+            AssertNoTapeIsOpen();
+            StreamingRestoreBuffers<float>.Clear();
+
+            PoolOneArray(length);
+            Assert.True(StreamingRestoreBuffers<float>.PooledBytes > 0, "An array parked with no tape open was not pooled.");
+            StreamingRestoreBuffers<float>.Rent(length, out bool recycled);
+            Assert.True(recycled, "A pooled array was not reused before any full collection.");
+
+            PoolOneArray(length);
+            GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+            GC.WaitForPendingFinalizers();
+            GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+            StreamingRestoreBuffers<float>.Rent(length, out bool afterCollection);
+            Assert.False(afterCollection, "A full collection left the idle pooled array alive: the pool held it strongly.");
+            Assert.Equal(0, StreamingRestoreBuffers<float>.PooledBytes);
+        }
+        finally
+        {
+            Cleanup(dir);
+        }
+    }
 }

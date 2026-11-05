@@ -23,8 +23,15 @@ namespace AiDotNet.Tensors.LinearAlgebra;
 /// </para>
 /// <para>
 /// Pooled and parked arrays together hold at most <see cref="GpuOffloadOptions.StreamingRestoreBufferPoolBytes"/> per
-/// element type. Arrays beyond it are left to the garbage collector as before, so the pool trades a bounded amount of
-/// resident memory for allocation and never grows without limit. A cap of zero turns recycling off.
+/// element type. Arrays beyond it are left to the garbage collector as before. A cap of zero turns recycling off.
+/// </para>
+/// <para>
+/// The pool holds its arrays weakly. They are large-object-heap arrays, which only a full collection frees, and a
+/// training loop whose restores are recycled allocates little, so full collections are rare and the arrays survive
+/// to be reused. Under memory pressure the runtime's last-resort full collection before an out-of-memory failure
+/// reclaims them instead: the pool never turns a near-limit heap into an OutOfMemoryException. Holding them strongly
+/// did exactly that on a 661M-parameter model under an 11.25 GiB heap limit (AiDotNet#2322): the cap's 1 GiB of
+/// idle arrays was the difference between passing and failing.
 /// </para>
 /// <para>
 /// A reused array keeps its identity, so every cache keyed by array identity must treat the refill as a mutation.
@@ -35,8 +42,8 @@ namespace AiDotNet.Tensors.LinearAlgebra;
 internal static class StreamingRestoreBuffers<T>
 {
     private static readonly object s_lock = new object();
-    private static readonly Dictionary<int, Stack<T[]>> s_pool = new Dictionary<int, Stack<T[]>>();
-    private static readonly List<T[]> s_parked = new List<T[]>();
+    private static readonly Dictionary<int, Stack<WeakReference<T[]>>> s_pool = new Dictionary<int, Stack<WeakReference<T[]>>>();
+    private static readonly List<WeakReference<T[]>> s_parked = new List<WeakReference<T[]>>();
     private static readonly ConditionalWeakTable<T[], object> s_issued = new ConditionalWeakTable<T[], object>();
     private static readonly object s_issuedMarker = new object();
     private static long s_pooledBytes;
@@ -70,10 +77,14 @@ internal static class StreamingRestoreBuffers<T>
         {
             lock (s_lock)
             {
-                if (s_pool.TryGetValue(length, out var stack) && stack.Count > 0)
+                if (s_pool.TryGetValue(length, out var stack))
                 {
-                    array = stack.Pop();
-                    s_pooledBytes -= (long)length * ElementSize;
+                    // Entries a full collection reclaimed are skipped; each popped entry leaves the byte count.
+                    while (array is null && stack.Count > 0)
+                    {
+                        stack.Pop().TryGetTarget(out array);
+                        s_pooledBytes -= (long)length * ElementSize;
+                    }
                 }
             }
         }
@@ -106,7 +117,7 @@ internal static class StreamingRestoreBuffers<T>
             // Parked arrays stay reachable until the step boundary, so they count against the same cap as the
             // pooled ones: together they are the memory recycling holds back from the garbage collector.
             if (s_parkedBytes + s_pooledBytes + bytes > cap) return;
-            s_parked.Add(array);
+            s_parked.Add(new WeakReference<T[]>(array));
             s_parkedBytes += bytes;
         }
 
@@ -124,20 +135,39 @@ internal static class StreamingRestoreBuffers<T>
         lock (s_lock)
         {
             if (s_parked.Count == 0) return;
-            foreach (var array in s_parked)
+            PruneCollected();
+            foreach (var parked in s_parked)
             {
+                if (!parked.TryGetTarget(out var array)) continue;
                 long bytes = (long)array.Length * ElementSize;
                 if (s_pooledBytes + bytes > cap) continue;
                 if (!s_pool.TryGetValue(array.Length, out var stack))
                 {
-                    stack = new Stack<T[]>();
+                    stack = new Stack<WeakReference<T[]>>();
                     s_pool[array.Length] = stack;
                 }
-                stack.Push(array);
+                stack.Push(parked);
                 s_pooledBytes += bytes;
             }
             s_parked.Clear();
             s_parkedBytes = 0;
+        }
+    }
+
+    // Drops pooled entries a full collection reclaimed, so they stop counting against the cap. Caller holds s_lock.
+    private static void PruneCollected()
+    {
+        foreach (var kvp in s_pool)
+        {
+            var stack = kvp.Value;
+            if (stack.Count == 0) continue;
+            var live = new List<WeakReference<T[]>>(stack.Count);
+            foreach (var entry in stack)
+                if (entry.TryGetTarget(out _)) live.Add(entry);
+            if (live.Count == stack.Count) continue;
+            s_pooledBytes -= (long)(stack.Count - live.Count) * kvp.Key * ElementSize;
+            stack.Clear();
+            for (int i = live.Count - 1; i >= 0; i--) stack.Push(live[i]);
         }
     }
 
