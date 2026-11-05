@@ -594,6 +594,17 @@ public static partial class BlasManaged
         in BlasOptions<T> options = default) where T : unmanaged
     {
         if (m <= 0 || n <= 0) return;
+        // The SIMD kernels read and write through raw pointers with no bounds checks of their own, so an undersized
+        // span must fail here rather than read or write past its end. A pre-packed operand comes from its handle,
+        // not the span, which may then be empty.
+        if (c.Length < (long)(m - 1) * ldc + n)
+            throw new ArgumentException("Span 'c' is too short for m rows of ldc.", nameof(c));
+        if (k > 0 && options.PackedA is null
+            && a.Length < (transA ? (long)(k - 1) * lda + m : (long)(m - 1) * lda + k))
+            throw new ArgumentException("Span 'a' is too short for the given m, k, lda and transA.", nameof(a));
+        if (k > 0 && options.PackedB is null
+            && b.Length < (transB ? (long)(n - 1) * ldb + k : (long)(k - 1) * ldb + n))
+            throw new ArgumentException("Span 'b' is too short for the given k, n, ldb and transB.", nameof(b));
         if (k <= 0)
         {
             // An empty reduction is still C = A · B = 0: the overwrite contract holds, so a destination that held an
@@ -1415,8 +1426,10 @@ public static partial class BlasManaged
                     //   FP32 — Avx2Fp32_8x8: Mr=8, Nr=8 → requires m%8==0, n%8==0
                     //   FP64 — mode-gated: (6,8) Fast or (4,8) Deterministic → requires m%(6or4)==0, n%8==0
                     int paoMr = 4, paoNr = 4;
+                    // AVX-only hosts pre-pack A at the same 8x8 tile (PickMicrokernelTile), so they take it here too:
+                    // on 4x4 the handle's PackMr would not match and every call would repack A.
                     if (typeof(T) == typeof(float)
-                        && Avx2Fp32_8x8.IsSupported
+                        && (Avx2Fp32_8x8.IsSupported || AvxFp32_8x8.IsSupported)
                         && m % 8 == 0 && n % 8 == 0)
                     {
                         paoMr = 8;
