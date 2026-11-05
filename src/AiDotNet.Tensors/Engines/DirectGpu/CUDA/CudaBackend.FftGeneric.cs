@@ -23,7 +23,6 @@ public sealed partial class CudaBackend : IGenericFftBackend
         => LaunchFftGeneric(real, imaginary, batch, n, inverse, type);
 
     private const int MaximumGenericFftLength = 1 << 29;
-    private const int MaximumGenericFftBatch = 65535;
 
     private IntPtr _fftGenericFloat32Module;
     private IntPtr _fftGenericFloat16Module;
@@ -264,10 +263,10 @@ public sealed partial class CudaBackend : IGenericFftBackend
     {
         if (real is null) throw new ArgumentNullException(nameof(real));
         if (imaginary is null) throw new ArgumentNullException(nameof(imaginary));
-        if (batch <= 0 || batch > MaximumGenericFftBatch)
+        if (batch <= 0)
         {
             throw new ArgumentOutOfRangeException(
-                nameof(batch), batch, $"Batch must be in [1, {MaximumGenericFftBatch}].");
+                nameof(batch), batch, "Batch must be positive.");
         }
 
         if (n <= 0 || n > MaximumGenericFftLength)
@@ -276,8 +275,15 @@ public sealed partial class CudaBackend : IGenericFftBackend
                 nameof(n), n, $"Transform length must be in [1, {MaximumGenericFftLength}].");
         }
 
+        long count = (long)batch * n;
+        if (count > int.MaxValue)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(batch), batch, "batch * n must fit a 32-bit element count.");
+        }
+
         EnsureGenericFftSupported(type);
-        long requiredBytes = checked((long)batch * n * type.ByteSize());
+        long requiredBytes = checked(count * type.ByteSize());
         if (real.SizeInBytes < requiredBytes)
         {
             throw new ArgumentException(
@@ -388,14 +394,16 @@ public sealed partial class CudaBackend : IGenericFftBackend
         FftElementType type)
     {
         int count = checked(batch * n);
-        int bytes = checked(count * type.ByteSize());
+        long bytes = checked((long)count * type.ByteSize());
+        uint gridY = GridYForBatch(batch);
         int half = Math.Max(1, n / 2);
         using IGpuBuffer twiddleReal = AllocateFftScratchBuffer(half);
         using IGpuBuffer twiddleImaginary = AllocateFftScratchBuffer(half);
         BuildTwiddles(twiddleReal, twiddleImaginary, n, inverse);
 
-        using IGpuBuffer scratchReal = AllocateFftScratchByteBuffer(bytes);
-        using IGpuBuffer scratchImaginary = AllocateFftScratchByteBuffer(bytes);
+        int scratchFloatWords = type == FftElementType.Float32 ? count : count / 2 + count % 2;
+        using IGpuBuffer scratchReal = AllocateFftScratchBuffer(scratchFloatWords);
+        using IGpuBuffer scratchImaginary = AllocateFftScratchBuffer(scratchFloatWords);
         IntPtr bitReverse = RequireGenericFftKernel("fftg_batched_bit_reverse" + type.KernelSuffix(), type);
         IntPtr realPtr = real.Handle;
         IntPtr imaginaryPtr = imaginary.Handle;
@@ -410,7 +418,7 @@ public sealed partial class CudaBackend : IGenericFftBackend
         reverseArgs[4] = &batch;
         reverseArgs[5] = &n;
         reverseArgs[6] = &log2n;
-        LaunchKernel2D(bitReverse, GridFor(n), (uint)batch, DefaultBlockSize, 1, reverseArgs);
+        LaunchKernel2D(bitReverse, GridFor(n), gridY, DefaultBlockSize, 1, reverseArgs);
         CopyBufferDtoD(scratchReal, real, bytes);
         CopyBufferDtoD(scratchImaginary, imaginary, bytes);
 
@@ -427,7 +435,7 @@ public sealed partial class CudaBackend : IGenericFftBackend
         for (int stride = 2; stride <= n; stride *= 2)
         {
             butterflyArgs[6] = &stride;
-            LaunchKernel2D(butterfly, GridFor(n / 2), (uint)batch, DefaultBlockSize, 1, butterflyArgs);
+            LaunchKernel2D(butterfly, GridFor(n / 2), gridY, DefaultBlockSize, 1, butterflyArgs);
             if (stride == n) break;
         }
 
@@ -445,6 +453,7 @@ public sealed partial class CudaBackend : IGenericFftBackend
         bool inverse)
     {
         int count = checked(batch * n);
+        uint gridY = GridYForBatch(batch);
         int half = Math.Max(1, n / 2);
         using IGpuBuffer twiddleReal = AllocateFftScratchBuffer(half);
         using IGpuBuffer twiddleImaginary = AllocateFftScratchBuffer(half);
@@ -466,7 +475,7 @@ public sealed partial class CudaBackend : IGenericFftBackend
         reverseArgs[4] = &batch;
         reverseArgs[5] = &n;
         reverseArgs[6] = &log2n;
-        LaunchKernel2D(bitReverse, GridFor(n), (uint)batch, DefaultBlockSize, 1, reverseArgs);
+        LaunchKernel2D(bitReverse, GridFor(n), gridY, DefaultBlockSize, 1, reverseArgs);
         CopyBufferDtoD(scratchReal, real, checked((long)count * sizeof(float)));
         CopyBufferDtoD(scratchImaginary, imaginary, checked((long)count * sizeof(float)));
 
@@ -483,7 +492,7 @@ public sealed partial class CudaBackend : IGenericFftBackend
         for (int stride = 2; stride <= n; stride *= 2)
         {
             butterflyArgs[6] = &stride;
-            LaunchKernel2D(butterfly, GridFor(n / 2), (uint)batch, DefaultBlockSize, 1, butterflyArgs);
+            LaunchKernel2D(butterfly, GridFor(n / 2), gridY, DefaultBlockSize, 1, butterflyArgs);
             if (stride == n) break;
         }
 
@@ -553,7 +562,14 @@ public sealed partial class CudaBackend : IGenericFftBackend
         FftElementType type)
     {
         int m = CudaFFTGenericKernels.BluesteinLength(n);
-        int workspaceCount = checked(batch * m);
+        long workspaceLong = (long)batch * m;
+        if (workspaceLong > int.MaxValue)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(batch), batch, "The Bluestein workspace (batch * m) must fit a 32-bit element count.");
+        }
+
+        int workspaceCount = (int)workspaceLong;
         using IGpuBuffer chirpReal = AllocateFftScratchBuffer(n);
         using IGpuBuffer chirpImaginary = AllocateFftScratchBuffer(n);
         using IGpuBuffer kernelReal = AllocateFftScratchBuffer(m);
@@ -639,7 +655,7 @@ public sealed partial class CudaBackend : IGenericFftBackend
         args[6] = &batch;
         args[7] = &n;
         args[8] = &m;
-        LaunchKernel2D(kernel, GridFor(m), (uint)batch, DefaultBlockSize, 1, args);
+        LaunchKernel2D(kernel, GridFor(m), GridYForBatch(batch), DefaultBlockSize, 1, args);
     }
 
     private unsafe void LaunchBluesteinPointwise(
@@ -662,7 +678,7 @@ public sealed partial class CudaBackend : IGenericFftBackend
         args[3] = &kernelImaginaryPtr;
         args[4] = &batch;
         args[5] = &m;
-        LaunchKernel2D(kernel, GridFor(m), (uint)batch, DefaultBlockSize, 1, args);
+        LaunchKernel2D(kernel, GridFor(m), GridYForBatch(batch), DefaultBlockSize, 1, args);
     }
 
     private unsafe void LaunchBluesteinPostmultiply(
@@ -696,8 +712,11 @@ public sealed partial class CudaBackend : IGenericFftBackend
         args[7] = &n;
         args[8] = &m;
         args[9] = &scale;
-        LaunchKernel2D(kernel, GridFor(n), (uint)batch, DefaultBlockSize, 1, args);
+        LaunchKernel2D(kernel, GridFor(n), GridYForBatch(batch), DefaultBlockSize, 1, args);
     }
+
+    private static uint GridYForBatch(int batch) =>
+        (uint)Math.Min(batch, MaxGridDimY);
 
     private static uint GridFor(int count) =>
         checked((uint)((count + (long)DefaultBlockSize - 1) / DefaultBlockSize));

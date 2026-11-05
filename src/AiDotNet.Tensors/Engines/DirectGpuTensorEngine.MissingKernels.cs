@@ -10171,7 +10171,8 @@ public partial class DirectGpuTensorEngine
 
     // #775: ConvTranspose2D backward w.r.t. input. Backend kernel gathers per gradInput element (1D over
     // input, no zeroing). inputShape=[N,inC,inH,inW]; gradOutput=[N,outC,outH,outW]; kernel=[inC,outC,kH,kW].
-    // The engine op carries no output-padding, so pass 0. Non-float / wrong-rank / tape / GraphMode -> base.
+    // The output padding is the gradient's extent past (in - 1) * s - 2p + k, recovered and checked by
+    // ConvBackwardShapeGuard. Non-float / wrong-rank / tape / GraphMode -> base.
     Tensor<T> IEngine.ConvTranspose2DBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> kernel, int[] inputShape, int[] stride, int[] padding)
     {
         using var __gpuOp = EnterGpuOp();
@@ -10185,6 +10186,8 @@ public partial class DirectGpuTensorEngine
             int outChannels = gradOutput.Shape._dims[1], outH = gradOutput.Shape._dims[2], outW = gradOutput.Shape._dims[3];
             int kH = kernel.Shape._dims[2], kW = kernel.Shape._dims[3];
             int inLen = batch * inChannels * inH * inW;
+            var outputPadding = ConvBackwardShapeGuard.TransposedOutputPadding(nameof(IEngine.ConvTranspose2DBackwardInput),
+                gradOutput._shape, inputShape, kernel._shape, stride, padding, 2);
             using var gradOutBuf = GetOrAllocateBuffer(backend, gradOutput);
             using var kBuf = GetOrAllocateBuffer(backend, kernel);
             var gradInBuf = AllocateOutputBuffer(backend, inLen);
@@ -10192,7 +10195,7 @@ public partial class DirectGpuTensorEngine
             {
                 backend.ConvTranspose2DBackwardInput(gradOutBuf.Buffer, kBuf.Buffer, gradInBuf.Buffer,
                     batch, inChannels, inH, inW, outChannels, outH, outW, kH, kW,
-                    stride[0], stride[1], padding[0], padding[1], 0, 0);
+                    stride[0], stride[1], padding[0], padding[1], outputPadding[0], outputPadding[1]);
                 var arr = FinishGpuOp<T>(backend, gradInBuf, inLen);
                 return new Tensor<T>(arr, (int[])inputShape.Clone());
             }
@@ -10203,7 +10206,7 @@ public partial class DirectGpuTensorEngine
 
     // #775: ConvTranspose2D backward w.r.t. the kernel. Backend zeroes gradKernel + atomic-accumulates.
     // kernelShape=[inC,outC,kH,kW]; input=[N,inC,inH,inW]; gradOutput=[N,outC,outH,outW]. Backend arg order
-    // is (input, gradOutput, ...). No output-padding on the engine op -> pass 0.
+    // is (input, gradOutput, ...). The output padding is recovered from the shapes, as for the data gradient.
     Tensor<T> IEngine.ConvTranspose2DBackwardKernel<T>(Tensor<T> gradOutput, Tensor<T> input, int[] kernelShape, int[] stride, int[] padding)
     {
         using var __gpuOp = EnterGpuOp();
@@ -10217,6 +10220,8 @@ public partial class DirectGpuTensorEngine
             int outChannels = gradOutput.Shape._dims[1], outH = gradOutput.Shape._dims[2], outW = gradOutput.Shape._dims[3];
             int kH = kernelShape[2], kW = kernelShape[3];
             int kLen = kernelShape[0] * kernelShape[1] * kernelShape[2] * kernelShape[3];
+            var outputPadding = ConvBackwardShapeGuard.TransposedOutputPadding(nameof(IEngine.ConvTranspose2DBackwardKernel),
+                gradOutput._shape, input._shape, kernelShape, stride, padding, 2);
             using var inBuf = GetOrAllocateBuffer(backend, input);
             using var gradOutBuf = GetOrAllocateBuffer(backend, gradOutput);
             var gradKBuf = AllocateOutputBuffer(backend, kLen);
@@ -10224,7 +10229,7 @@ public partial class DirectGpuTensorEngine
             {
                 backend.ConvTranspose2DBackwardKernel(inBuf.Buffer, gradOutBuf.Buffer, gradKBuf.Buffer,
                     batch, inChannels, inH, inW, outChannels, outH, outW, kH, kW,
-                    stride[0], stride[1], padding[0], padding[1], 0, 0);
+                    stride[0], stride[1], padding[0], padding[1], outputPadding[0], outputPadding[1]);
                 var arr = FinishGpuOp<T>(backend, gradKBuf, kLen);
                 return new Tensor<T>(arr, (int[])kernelShape.Clone());
             }
@@ -10508,7 +10513,8 @@ public partial class DirectGpuTensorEngine
     }
 
     // #775: ConvTranspose3D backward w.r.t. input. weights=[inC,outC,kD,kH,kW]; inputShape=[N,inC,iD,iH,iW];
-    // gradOutput=[N,outC,outD,outH,outW]. Gather kernel. No-output-padding; padded defers to base.
+    // gradOutput=[N,outC,outD,outH,outW]. The kernel gathers over the whole gradient, so an output padding (checked by
+    // ConvBackwardShapeGuard) needs no argument: it takes the padded extents as given.
     Tensor<T> IEngine.ConvTranspose3DBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> kernel, int[] inputShape, int[] stride, int[] padding)
     {
         using var __gpuOp = EnterGpuOp();
@@ -10522,6 +10528,7 @@ public partial class DirectGpuTensorEngine
             int outC = gradOutput.Shape._dims[1], outD = gradOutput.Shape._dims[2], outH = gradOutput.Shape._dims[3], outW = gradOutput.Shape._dims[4];
             int kD = kernel.Shape._dims[2], kH = kernel.Shape._dims[3], kW = kernel.Shape._dims[4];
             int inLen = n * inC * iD * iH * iW;
+            ConvBackwardShapeGuard.TransposedOutputPadding(nameof(IEngine.ConvTranspose3DBackwardInput), gradOutput._shape, inputShape, kernel._shape, stride, padding, 3);
             using var gradOutBuf = GetOrAllocateBuffer(backend, gradOutput);
             using var kBuf = GetOrAllocateBuffer(backend, kernel);
             var gradInBuf = AllocateOutputBuffer(backend, inLen);
@@ -10552,6 +10559,7 @@ public partial class DirectGpuTensorEngine
             int outC = gradOutput.Shape._dims[1], outD = gradOutput.Shape._dims[2], outH = gradOutput.Shape._dims[3], outW = gradOutput.Shape._dims[4];
             int kD = kernelShape[2], kH = kernelShape[3], kW = kernelShape[4];
             int kLen = kernelShape[0] * kernelShape[1] * kD * kH * kW;
+            ConvBackwardShapeGuard.TransposedOutputPadding(nameof(IEngine.ConvTranspose3DBackwardKernel), gradOutput._shape, input._shape, kernelShape, stride, padding, 3);
             using var gradOutBuf = GetOrAllocateBuffer(backend, gradOutput);
             using var inBuf = GetOrAllocateBuffer(backend, input);
             var gradKBuf = AllocateOutputBuffer(backend, kLen);

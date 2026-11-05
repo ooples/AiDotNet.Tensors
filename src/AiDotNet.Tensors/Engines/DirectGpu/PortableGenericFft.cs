@@ -11,7 +11,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 internal static class PortableGenericFft
 {
     public const int MaximumLength = 1 << 29;
-    public const int MaximumBatch = 65535;
 
     /// <summary>Launches a shared batch kernel by name: (kernel, thread count, arguments in kernel order).</summary>
     public delegate void Launcher(string kernel, int threads, params object[] args);
@@ -88,10 +87,12 @@ internal static class PortableGenericFft
     {
         if (real is null) throw new ArgumentNullException(nameof(real));
         if (imaginary is null) throw new ArgumentNullException(nameof(imaginary));
-        if (batch < 1 || batch > MaximumBatch) throw new ArgumentOutOfRangeException(nameof(batch));
+        if (batch < 1) throw new ArgumentOutOfRangeException(nameof(batch));
         if (n < 1 || n > MaximumLength) throw new ArgumentOutOfRangeException(nameof(n));
         if (!Supports(type)) throw new NotSupportedException($"{type} FFT storage is not supported.");
-        int count = checked(batch * n);
+        long countLong = (long)batch * n;
+        if (countLong > int.MaxValue) throw new ArgumentOutOfRangeException(nameof(batch), batch, "batch * n must fit a 32-bit element count.");
+        int count = (int)countLong;
         long needed = (long)count * type.ByteSize();
         if (real.SizeInBytes < needed || imaginary.SizeInBytes < needed)
             throw new ArgumentException($"FFT buffers need {needed} bytes for {batch} x {n} {type} values.");

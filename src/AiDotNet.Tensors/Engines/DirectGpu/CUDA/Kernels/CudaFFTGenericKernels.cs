@@ -215,41 +215,48 @@ extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg
 extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg_f32_bit_reverse(
     const float* srcRe, const float* srcIm, float* dstRe, float* dstIm, int batch, int n, int log2n)
 {
-    int b = blockIdx.y;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (b >= batch || idx >= n) return;
+    if (idx >= n) return;
     int rev = 0, t = idx;
     for (int i = 0; i < log2n; i++) { rev = (rev << 1) | (t & 1); t >>= 1; }
-    int base = b * n;
-    dstRe[base + idx] = srcRe[base + rev];
-    dstIm[base + idx] = srcIm[base + rev];
+    // gridDim.y is capped at 65535; the host clamps it and this loop covers the rest.
+    for (unsigned int b = blockIdx.y; b < (unsigned int)batch; b += gridDim.y)
+    {
+        int base = b * n;
+        dstRe[base + idx] = srcRe[base + rev];
+        dstIm[base + idx] = srcIm[base + rev];
+    }
 }
 
 extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg_f32_butterfly(
     float* re, float* im, const float* twRe, const float* twIm,
     int batch, int n, int stride)
 {
-    int b = blockIdx.y;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int halfStride = stride >> 1;
     int numBf = n / stride;
     int bf = idx / halfStride;
     int wing = idx - bf * halfStride;
-    if (b >= batch || bf >= numBf) return;
+    if (bf >= numBf) return;
 
     // Table is built for the full length n; stage `stride` samples it every n/stride entries.
     int step = n / stride;
     float twR = twRe[wing * step];
     float twI = twIm[wing * step];
+    int offset = bf * stride + wing;
 
-    int top = b * n + bf * stride + wing;
-    int bot = top + halfStride;
-    float tR = re[top], tI = im[top];
-    float bR = re[bot], bI = im[bot];
-    float xR = bR * twR - bI * twI;
-    float xI = bR * twI + bI * twR;
-    re[top] = tR + xR; im[top] = tI + xI;
-    re[bot] = tR - xR; im[bot] = tI - xI;
+    // gridDim.y is capped at 65535; the host clamps it and this loop covers the rest.
+    for (unsigned int b = blockIdx.y; b < (unsigned int)batch; b += gridDim.y)
+    {
+        int top = b * n + offset;
+        int bot = top + halfStride;
+        float tR = re[top], tI = im[top];
+        float bR = re[bot], bI = im[bot];
+        float xR = bR * twR - bI * twI;
+        float xI = bR * twI + bI * twR;
+        re[top] = tR + xR; im[top] = tI + xI;
+        re[bot] = tR - xR; im[bot] = tI - xI;
+    }
 }
 
 extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg_f32_scale(float* re, float* im, int count, float s)
@@ -263,14 +270,17 @@ extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg
 extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg_bluestein_pointwise(
     float* re, float* im, const float* kRe, const float* kIm, int batch, int m)
 {
-    int b = blockIdx.y;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (b >= batch || idx >= m) return;
-    int o = b * m + idx;
-    float aR = re[o], aI = im[o];
+    if (idx >= m) return;
     float bR = kRe[idx], bI = kIm[idx];
-    re[o] = aR * bR - aI * bI;
-    im[o] = aR * bI + aI * bR;
+    // gridDim.y is capped at 65535; the host clamps it and this loop covers the rest.
+    for (unsigned int b = blockIdx.y; b < (unsigned int)batch; b += gridDim.y)
+    {
+        int o = b * m + idx;
+        float aR = re[o], aI = im[o];
+        re[o] = aR * bR - aI * bI;
+        im[o] = aR * bI + aI * bR;
+    }
 }
 
 #endif // AIDN_FFTG_SHARED
@@ -296,42 +306,49 @@ extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg
 extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg_batched_bit_reverse" + suffix + @"(
     const STORE_T* srcRe, const STORE_T* srcIm, STORE_T* dstRe, STORE_T* dstIm, int batch, int n, int log2n)
 {
-    int b = blockIdx.y;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (b >= batch || idx >= n) return;
+    if (idx >= n) return;
     int rev = 0, t = idx;
     for (int i = 0; i < log2n; i++) { rev = (rev << 1) | (t & 1); t >>= 1; }
-    int base = b * n;
-    dstRe[base + idx] = srcRe[base + rev];
-    dstIm[base + idx] = srcIm[base + rev];
+    // gridDim.y is capped at 65535; the host clamps it and this loop covers the rest.
+    for (unsigned int b = blockIdx.y; b < (unsigned int)batch; b += gridDim.y)
+    {
+        int base = b * n;
+        dstRe[base + idx] = srcRe[base + rev];
+        dstIm[base + idx] = srcIm[base + rev];
+    }
 }
 
 extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg_batched_butterfly" + suffix + @"(
     STORE_T* re, STORE_T* im, const float* twRe, const float* twIm,
     int batch, int n, int stride)
 {
-    int b = blockIdx.y;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int halfStride = stride >> 1;
     int numBf = n / stride;
     int bf = idx / halfStride;
     int wing = idx - bf * halfStride;
-    if (b >= batch || bf >= numBf) return;
+    if (bf >= numBf) return;
 
     int step = n / stride;
     float twR = twRe[wing * step];
     float twI = twIm[wing * step];
+    int offset = bf * stride + wing;
 
-    int top = b * n + bf * stride + wing;
-    int bot = top + halfStride;
+    // gridDim.y is capped at 65535; the host clamps it and this loop covers the rest.
+    for (unsigned int b = blockIdx.y; b < (unsigned int)batch; b += gridDim.y)
+    {
+        int top = b * n + offset;
+        int bot = top + halfStride;
 
-    // Widen on load; every operation below is float32. Storing narrow is what halves the traffic.
-    float tR = aidn_ld(re[top]), tI = aidn_ld(im[top]);
-    float bR = aidn_ld(re[bot]), bI = aidn_ld(im[bot]);
-    float xR = bR * twR - bI * twI;
-    float xI = bR * twI + bI * twR;
-    re[top] = aidn_st(tR + xR); im[top] = aidn_st(tI + xI);
-    re[bot] = aidn_st(tR - xR); im[bot] = aidn_st(tI - xI);
+        // Widen on load; every operation below is float32. Storing narrow is what halves the traffic.
+        float tR = aidn_ld(re[top]), tI = aidn_ld(im[top]);
+        float bR = aidn_ld(re[bot]), bI = aidn_ld(im[bot]);
+        float xR = bR * twR - bI * twI;
+        float xI = bR * twI + bI * twR;
+        re[top] = aidn_st(tR + xR); im[top] = aidn_st(tI + xI);
+        re[bot] = aidn_st(tR - xR); im[bot] = aidn_st(tI - xI);
+    }
 }
 
 extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg_scale" + suffix + @"(
@@ -350,16 +367,21 @@ extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg
     const STORE_T* xRe, const STORE_T* xIm, const float* chRe, const float* chIm,
     float* wRe, float* wIm, int batch, int n, int m)
 {
-    int b = blockIdx.y;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (b >= batch || idx >= m) return;
-    int o = b * m + idx;
-    if (idx >= n) { wRe[o] = 0.0f; wIm[o] = 0.0f; return; }
-    int s = b * n + idx;
-    float aR = aidn_ld(xRe[s]), aI = aidn_ld(xIm[s]);
-    float cR = chRe[idx], cI = -chIm[idx];        // conjugate
-    wRe[o] = aR * cR - aI * cI;
-    wIm[o] = aR * cI + aI * cR;
+    if (idx >= m) return;
+    bool pad = idx >= n;
+    float cR = pad ? 0.0f : chRe[idx];
+    float cI = pad ? 0.0f : -chIm[idx];        // conjugate
+    // gridDim.y is capped at 65535; the host clamps it and this loop covers the rest.
+    for (unsigned int b = blockIdx.y; b < (unsigned int)batch; b += gridDim.y)
+    {
+        int o = b * m + idx;
+        if (pad) { wRe[o] = 0.0f; wIm[o] = 0.0f; continue; }
+        int s = b * n + idx;
+        float aR = aidn_ld(xRe[s]), aI = aidn_ld(xIm[s]);
+        wRe[o] = aR * cR - aI * cI;
+        wIm[o] = aR * cI + aI * cR;
+    }
 }
 
 // Bluestein step 3: multiply the first n outputs by conj(chirp) and write back in the caller's element type.
@@ -367,14 +389,17 @@ extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg
     const float* wRe, const float* wIm, const float* chRe, const float* chIm,
     STORE_T* yRe, STORE_T* yIm, int batch, int n, int m, float scale)
 {
-    int b = blockIdx.y;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (b >= batch || idx >= n) return;
-    int o = b * m + idx;
-    float aR = wRe[o] * scale, aI = wIm[o] * scale;
+    if (idx >= n) return;
     float cR = chRe[idx], cI = -chIm[idx];        // conjugate
-    yRe[b * n + idx] = aidn_st(aR * cR - aI * cI);
-    yIm[b * n + idx] = aidn_st(aR * cI + aI * cR);
+    // gridDim.y is capped at 65535; the host clamps it and this loop covers the rest.
+    for (unsigned int b = blockIdx.y; b < (unsigned int)batch; b += gridDim.y)
+    {
+        int o = b * m + idx;
+        float aR = wRe[o] * scale, aI = wIm[o] * scale;
+        yRe[b * n + idx] = aidn_st(aR * cR - aI * cI);
+        yIm[b * n + idx] = aidn_st(aR * cI + aI * cR);
+    }
 }
 ";
             return src;

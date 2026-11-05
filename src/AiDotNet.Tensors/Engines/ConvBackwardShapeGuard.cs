@@ -34,6 +34,88 @@ namespace AiDotNet.Tensors.Engines;
 internal static class ConvBackwardShapeGuard
 {
     /// <summary>
+    /// The output padding a transposed convolution's forward pass used, recovered from the shapes its backward is
+    /// handed, and checked to be one the forward could have used.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A transposed forward makes <c>out = (in - 1) * s - 2p + k + op</c> with <c>0 &lt;= op &lt; s</c> (PyTorch's
+    /// rule for unit dilation): the output padding adds rows at the far edge that the kernel taps write. The backward
+    /// ops take no output-padding argument, but they need none: <c>op</c> is the gap between the gradient's extent and
+    /// <c>(in - 1) * s - 2p + k</c>. Requiring that gap to lie in <c>[0, s)</c> accepts exactly the gradients some
+    /// forward produces and still rejects the rest, which an exact-inversion check (gap zero) did not: it refused every
+    /// output-padded transposed convolution's gradient.
+    /// </para>
+    /// <para>
+    /// With the gap in <c>[0, s)</c> the data gradient is the plain forward convolution of the whole gradient (its
+    /// floor lands back on <c>in</c>) and the weight gradient sums over every gradient position, so no kernel changes
+    /// with it; only the callers that pass an output padding on need the value.
+    /// </para>
+    /// </remarks>
+    /// <param name="op">Op name, for the message.</param>
+    /// <param name="gradOutputShape">The gradient's shape, [N, C, ...spatial].</param>
+    /// <param name="inputShape">The forward input's shape, [N, C, ...spatial].</param>
+    /// <param name="kernelShape">The kernel's shape; its trailing entries are the spatial extents.</param>
+    /// <param name="stride">Per-axis stride.</param>
+    /// <param name="padding">Per-axis padding.</param>
+    /// <param name="spatialRank">Number of spatial axes (2 or 3).</param>
+    /// <returns>The per-axis output padding.</returns>
+    public static int[] TransposedOutputPadding(
+        string op,
+        int[] gradOutputShape,
+        int[] inputShape,
+        int[] kernelShape,
+        int[] stride,
+        int[] padding,
+        int spatialRank)
+    {
+        if (gradOutputShape is null) throw new ArgumentNullException(nameof(gradOutputShape));
+        if (inputShape is null) throw new ArgumentNullException(nameof(inputShape));
+        if (kernelShape is null) throw new ArgumentNullException(nameof(kernelShape));
+        if (stride is null) throw new ArgumentNullException(nameof(stride));
+        if (padding is null) throw new ArgumentNullException(nameof(padding));
+        if (gradOutputShape.Length != spatialRank + 2 || inputShape.Length != spatialRank + 2 || kernelShape.Length != spatialRank + 2
+            || stride.Length < spatialRank || padding.Length < spatialRank)
+            throw new ArgumentException(
+                $"{op}: expected rank-{spatialRank + 2} gradient, input and kernel shapes and {spatialRank} strides and paddings.",
+                nameof(gradOutputShape));
+        // The kernels size their loops from inputShape's batch and the kernel's channels, so a gradient with fewer
+        // samples or other channels would be read past its end; refuse it here for every caller.
+        if (gradOutputShape[0] != inputShape[0])
+            throw new ArgumentException(
+                $"{op}: gradOutput batch is {gradOutputShape[0]}, but the input batch is {inputShape[0]}.",
+                nameof(gradOutputShape));
+        if (kernelShape[0] != inputShape[1] || kernelShape[1] != gradOutputShape[1])
+            throw new ArgumentException(
+                $"{op}: kernel channels [{kernelShape[0]}, {kernelShape[1]}] must be the input's {inputShape[1]} and the "
+                    + $"gradient's {gradOutputShape[1]} ([in, out, ...kernel]).",
+                nameof(kernelShape));
+
+        var outputPadding = new int[spatialRank];
+        for (int axis = 0; axis < spatialRank; axis++)
+        {
+            int s = stride[axis];
+            if (s <= 0)
+                throw new ArgumentException($"{op}: stride {axis} must be positive, got {s}.", nameof(stride));
+            int inExtent = inputShape[2 + axis], kExtent = kernelShape[2 + axis], actual = gradOutputShape[2 + axis];
+            // In 64 bits: a large stride or extent would wrap the product in 32 and could land a wrapped value in range.
+            long unpadded = (inExtent - 1L) * s - 2L * padding[axis] + kExtent;
+            long gap = actual - unpadded;
+            if (gap < 0 || gap >= s)
+            {
+                throw new ArgumentException(
+                    $"{op}: gradOutput spatial axis {axis} is {actual}, but a transposed forward pass over an input "
+                        + $"extent of {inExtent} with kernel {kExtent}, stride {s} and padding {padding[axis]} produces "
+                        + $"{unpadded} plus an output padding in [0, {s}), so {unpadded} to {unpadded + s - 1}. "
+                        + "No transposed forward pass produces that size.",
+                    nameof(gradOutputShape));
+            }
+            outputPadding[axis] = (int)gap;
+        }
+        return outputPadding;
+    }
+
+    /// <summary>
     /// Throws when <paramref name="gradOutputShape"/>'s trailing spatial dimensions are not the
     /// forward convolution's output extents for the given input, kernel and hyper-parameters.
     /// </summary>
