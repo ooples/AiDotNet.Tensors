@@ -323,12 +323,18 @@ public class GpuRfftBatchedDispatchTests : IDisposable
                 using (scope)
                 {
                     var r = engine.IRFFT(spectrum, n);
+                    // A GPU-resident result proves this scope took the GPU path (a CPU fallback returns a host tensor),
+                    // so with the count unchanged it read the tables the first scope cached instead of adding its own.
+                    Assert.True(r.IsGpuResident, $"scope {s}: IRFFT fell back to the CPU");
                     scope.Execute();
                     AssertMatchesCpu(r.Contiguous(), $"scope {s}");
                 }
                 _out.WriteLine($"after scope {s}: {gpu.CachedSpectrumConstantCount} cached tables");
+                Assert.Equal(2, gpu.CachedSpectrumConstantCount);
             }
-            AssertMatchesCpu(engine.IRFFT(spectrum, n).Contiguous(), "eager");
+            var eager = engine.IRFFT(spectrum, n);
+            Assert.True(eager.IsGpuResident, "eager IRFFT fell back to the CPU");
+            AssertMatchesCpu(eager.Contiguous(), "eager");
 
             // One gather index and one sign table for the single shape, whichever path built them.
             Assert.Equal(2, gpu.CachedSpectrumConstantCount);
