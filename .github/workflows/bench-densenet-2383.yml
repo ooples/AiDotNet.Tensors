@@ -10,6 +10,19 @@ on:
 permissions:
   contents: read
 
+# As in gpu-cuda-selfhosted.yml: CUDA only (NVIDIA's driver also provides OpenCL), no fsmonitor daemon holding the
+# checkout's HOME, and the SDK in the workspace, which the runner's service account can write.
+env:
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_NOLOGO: true
+  AIDOTNET_DIRECTGPU_BACKENDS: cuda
+  AIDOTNET_EXPECT_GPU_BACKEND: CUDA
+  GIT_CONFIG_COUNT: 1
+  GIT_CONFIG_KEY_0: core.fsmonitor
+  GIT_CONFIG_VALUE_0: false
+  DOTNET_INSTALL_DIR: .dotnet
+
 jobs:
   densenet:
     runs-on: [self-hosted, gpu, cuda, sm75]
