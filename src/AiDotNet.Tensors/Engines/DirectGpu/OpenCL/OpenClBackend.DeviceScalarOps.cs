@@ -22,5 +22,5 @@ public sealed partial class OpenClBackend : IDeviceScalarOps
     bool IDeviceScalarOps.SupportsMultiTensorSumOfSquares => IsAvailable;
 
     void IDeviceScalarOps.MultiTensorSumOfSquares(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer sumOfSquares)
-        => ((IMultiTensorKernels)this).MultiTensorSumOfSquares(tensors, sizes, sumOfSquares);
+        => FinitenessSumOfSquares(tensors, sizes, sumOfSquares);
 }

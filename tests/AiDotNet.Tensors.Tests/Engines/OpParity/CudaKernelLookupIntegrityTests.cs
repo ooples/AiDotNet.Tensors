@@ -106,6 +106,12 @@ public sealed class CudaKernelLookupIntegrityTests
             StringComparer.Ordinal);
 
         var defined = new HashSet<string>(StringComparer.Ordinal);
+        // This shared dialect generator is compiled directly, outside CUDA/Kernels.
+        Assert.Matches(@"DeterministicNormKernels\.Source\(\s*DeterministicNormKernels\.Dialect\.Cuda\s*\)", backend);
+        string normSource = AiDotNet.Tensors.Engines.DirectGpu.DeterministicNormKernels.Source(
+            AiDotNet.Tensors.Engines.DirectGpu.DeterministicNormKernels.Dialect.Cuda);
+        foreach (Match definition in Regex.Matches(normSource, @"__global__[\s\S]{0,120}?\bvoid\s+(\w+)\s*\("))
+            defined.Add(definition.Groups[1].Value);
         // CudaBackend also compiles the batch-execution source it shares with HIP (#1142).
         var kernelSources = Directory.GetFiles(Path.Combine(cuda, "Kernels"), "*.cs")
             .Append(Path.Combine(cuda, "..", "BatchExecutionCudaKernels.cs"));

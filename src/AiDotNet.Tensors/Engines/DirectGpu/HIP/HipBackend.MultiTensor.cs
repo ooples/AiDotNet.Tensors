@@ -4,8 +4,9 @@ using System.Collections.Generic;
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 
 // The global-norm clip over every gradient in one launch per operation, the HIP port of CudaBackend's
-// IMultiTensorKernels: a device table of buffer addresses plus a (tensor, start) entry per 256-element chunk.
-public sealed partial class HipBackend : IMultiTensorKernels
+// IMultiTensorKernels: a device table of buffer addresses plus a (tensor, start) entry per chunk (256 elements for
+// the finiteness reduction, 4096 for the deterministic norm record).
+public sealed partial class HipBackend : IMultiTensorKernels, IFusedNormClipKernels
 {
     private const int MultiTensorChunk = 256;
     private const int MultiTensorReductionMaxBlocks = 1024;
@@ -39,11 +40,25 @@ public sealed partial class HipBackend : IMultiTensorKernels
     }
 
     private MultiTensorTable? _multiTensorTable;
+    // The deterministic norm's table: 4096-element chunks (Gpu.DeterministicGradientNorm.Chunk), part of its definition.
+    private MultiTensorTable? _normTable;
+    private IGpuBuffer? _normPartials;
+    private readonly object _normPartialsLock = new();
 
     private void DisposeMultiTensorTable()
     {
-        _multiTensorTable?.Dispose();
-        _multiTensorTable = null;
+        lock (_normPartialsLock)
+        {
+            if (_normTable is not null || _normPartials is not null) Synchronize();
+            _multiTensorTable?.Dispose();
+            _multiTensorTable = null;
+            _normTable?.Dispose();
+            _normTable = null;
+            _normPartials?.Dispose();
+            _normPartials = null;
+            _normTicket?.Dispose();
+            _normTicket = null;
+        }
     }
 
     // Int and address tables travel in float buffers: the kernel reinterprets the bytes.
@@ -57,6 +72,25 @@ public sealed partial class HipBackend : IMultiTensorKernels
     private MultiTensorTable GetMultiTensorTable(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes)
     {
         if (_multiTensorTable is { } cached && cached.Matches(tensors, sizes)) return cached;
+        _multiTensorTable?.Dispose();
+        _multiTensorTable = null;
+        return _multiTensorTable = BuildMultiTensorTable(tensors, sizes, MultiTensorChunk);
+    }
+
+    private MultiTensorTable GetNormTable(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes)
+    {
+        lock (_normPartialsLock)
+        {
+            if (_normTable is { } cached && cached.Matches(tensors, sizes)) return cached;
+            if (_normTable is not null) Synchronize();
+            _normTable?.Dispose();
+            _normTable = null;
+            return _normTable = BuildMultiTensorTable(tensors, sizes, Gpu.DeterministicGradientNorm.Chunk);
+        }
+    }
+
+    private MultiTensorTable BuildMultiTensorTable(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, int chunkSize)
+    {
 
         int n = tensors.Count;
         var handles = new IntPtr[n];
@@ -68,17 +102,16 @@ public sealed partial class HipBackend : IMultiTensorKernels
             handles[t] = tensors[t].Handle;
             addresses[t] = unchecked((ulong)handles[t].ToInt64());
             sizeArray[t] = sizes[t];
-            totalChunks = checked(totalChunks + (sizes[t] + MultiTensorChunk - 1) / MultiTensorChunk);
+            totalChunks = checked(totalChunks + (sizes[t] + chunkSize - 1) / chunkSize);
         }
         var chunkTensor = new int[totalChunks];
         var chunkStart = new int[totalChunks];
         int c = 0;
         for (int t = 0; t < n; t++)
-            for (int start = 0; start < sizeArray[t]; start += MultiTensorChunk) { chunkTensor[c] = t; chunkStart[c] = start; c++; }
+            for (int start = 0; start < sizeArray[t]; start += chunkSize) { chunkTensor[c] = t; chunkStart[c] = start; c++; }
 
         var addressBits = new float[n * 2];
         Buffer.BlockCopy(addresses, 0, addressBits, 0, n * sizeof(ulong));
-        DisposeMultiTensorTable();
         var table = new MultiTensorTable { Handles = handles, Sizes = sizeArray, TotalChunks = totalChunks };
         try
         {
@@ -92,7 +125,6 @@ public sealed partial class HipBackend : IMultiTensorKernels
             table.Dispose();
             throw;
         }
-        _multiTensorTable = table;
         return table;
     }
 
@@ -120,30 +152,128 @@ public sealed partial class HipBackend : IMultiTensorKernels
         LaunchKernel(kernel, (uint)Math.Min(totalChunks, MultiTensorReductionMaxBlocks), MultiTensorChunk, args);
     }
 
-    public unsafe void ClipScaleFromSumOfSquares(IGpuBuffer sumOfSquares, float maxNorm, IGpuBuffer scale)
+    // The deterministic norm record (Gpu.DeterministicGradientNorm); the public MultiTensorSumOfSquares above is the
+    // finiteness reduction IDeviceScalarOps uses.
+    unsafe void IMultiTensorKernels.MultiTensorSumOfSquares(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer record)
     {
-        MultiTensorArgs.ValidateSumBuffer(sumOfSquares);
-        if (scale is null) throw new ArgumentNullException(nameof(scale));
-        var kernel = GetMultiTensorKernel("clip_scale_from_sum_squares");
-        IntPtr sH = sumOfSquares.Handle, cH = scale.Handle;
-        void** args = stackalloc void*[3];
-        args[0] = &sH; args[1] = &maxNorm; args[2] = &cH;
-        LaunchKernel(kernel, 1, 1, args);
+        lock (_normPartialsLock)
+        {
+            if (_disposed) throw new ObjectDisposedException(nameof(HipBackend));
+            MultiTensorArgs.ValidateRecordBuffer(record);
+            MultiTensorArgs.Validate(tensors, sizes);
+            var chunkKernel = GetMultiTensorKernel("dgn_chunk_partials");
+            var finish = GetMultiTensorKernel("dgn_finish");
+            int total = 0;
+            for (int t = 0; t < sizes.Count; t++) total += Gpu.DeterministicGradientNorm.ChunkCount(sizes[t]);
+            int words = Math.Max(1, total) * Gpu.DeterministicGradientNorm.PartialWords;
+            if (_normPartials is not { } partials || partials.Size < words)
+            {
+                if (_normPartials is not null) Synchronize();
+                var grown = AllocateBuffer(Math.Max(words, 64 * Gpu.DeterministicGradientNorm.PartialWords));
+                _normPartials?.Dispose();
+                partials = _normPartials = grown;
+            }
+            IntPtr partH = partials.Handle, recH = record.Handle;
+            if (total > 0)
+            {
+                var table = GetNormTable(tensors, sizes);
+                IntPtr pH = TableHandle(table.Pointers), sH = TableHandle(table.SizesBuffer);
+                IntPtr ctH = TableHandle(table.ChunkTensor), csH = TableHandle(table.ChunkStart);
+                void** a = stackalloc void*[6];
+                a[0] = &pH; a[1] = &sH; a[2] = &ctH; a[3] = &csH; a[4] = &total; a[5] = &partH;
+                LaunchKernel(chunkKernel, (uint)total, DeterministicNormKernels.GroupSize, a);
+            }
+            int headroom = Gpu.DeterministicGradientNorm.Headroom(total);
+            void** f = stackalloc void*[4];
+            f[0] = &partH; f[1] = &total; f[2] = &headroom; f[3] = &recH;
+            LaunchKernel(finish, 1, DeterministicNormKernels.GroupSize, f);
+        }
     }
 
-    public unsafe void MultiTensorScaleByDeviceScalar(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer scale)
+    private IGpuBuffer? _normTicket;
+
+    // One launch for the record and the coefficient (dgn_norm_clip, CUDA's kernel): the last block to finish combines.
+    unsafe void IFusedNormClipKernels.MultiTensorNormAndClipScale(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes,
+        IGpuBuffer record, float maxNorm, IGpuBuffer? scale, Gpu.NonFiniteGradientPolicy policy)
+    {
+        MultiTensorArgs.ValidateRecordBuffer(record);
+        MultiTensorArgs.Validate(tensors, sizes);
+        IMultiTensorKernels multi = this;
+        int total = 0;
+        for (int t = 0; t < sizes.Count; t++) total += Gpu.DeterministicGradientNorm.ChunkCount(sizes[t]);
+        if (total == 0)
+        {
+            multi.MultiTensorSumOfSquares(tensors, sizes, record);
+            if (scale is not null) multi.ClipScaleFromRecord(record, maxNorm, scale, policy);
+            return;
+        }
+        lock (_normPartialsLock)
+        {
+            if (_disposed) throw new ObjectDisposedException(nameof(HipBackend));
+            var kernel = GetMultiTensorKernel("dgn_norm_clip");
+            int words = total * Gpu.DeterministicGradientNorm.PartialWords;
+            if (_normPartials is not { } partials || partials.Size < words)
+            {
+                if (_normPartials is not null) Synchronize();
+                var grown = AllocateBuffer(Math.Max(words, 64 * Gpu.DeterministicGradientNorm.PartialWords));
+                _normPartials?.Dispose();
+                partials = _normPartials = grown;
+            }
+            // The ticket starts at zero and the launch's last block resets it.
+            var ticket = _normTicket ??= AllocateBuffer(new float[1]);
+            var table = GetNormTable(tensors, sizes);
+            IntPtr pH = TableHandle(table.Pointers), sH = TableHandle(table.SizesBuffer);
+            IntPtr ctH = TableHandle(table.ChunkTensor), csH = TableHandle(table.ChunkStart);
+            IntPtr partH = partials.Handle, tH = ticket.Handle, recH = record.Handle, scH = scale?.Handle ?? record.Handle;
+            int headroom = Gpu.DeterministicGradientNorm.Headroom(total);
+            uint bits = Gpu.DeterministicGradientNorm.SingleToUInt32Bits(maxNorm);
+            uint pol = scale is null ? DeterministicNormKernels.RecordOnly : (uint)policy;
+            void** a = stackalloc void*[12];
+            a[0] = &pH; a[1] = &sH; a[2] = &ctH; a[3] = &csH; a[4] = &total; a[5] = &partH; a[6] = &tH; a[7] = &headroom;
+            a[8] = &recH; a[9] = &bits; a[10] = &pol; a[11] = &scH;
+            LaunchKernel(kernel, (uint)Math.Min(total, 4096), DeterministicNormKernels.GroupSize, a);
+        }
+    }
+
+    public unsafe void ClipScaleFromSumOfSquares(IGpuBuffer sumOfSquares, float maxNorm, IGpuBuffer scale)
+        => ((IMultiTensorKernels)this).ClipScaleFromRecord(sumOfSquares, maxNorm, scale, Gpu.NonFiniteGradientPolicy.LeaveUnscaled);
+
+    unsafe void IMultiTensorKernels.ClipScaleFromRecord(IGpuBuffer sumOfSquares, float maxNorm, IGpuBuffer scale,
+        Gpu.NonFiniteGradientPolicy policy)
+    {
+        lock (_normPartialsLock)
+        {
+            if (_disposed) throw new ObjectDisposedException(nameof(HipBackend));
+            MultiTensorArgs.ValidateRecordBuffer(sumOfSquares);
+            if (scale is null) throw new ArgumentNullException(nameof(scale));
+            var kernel = GetMultiTensorKernel("dgn_clip_scale");
+            IntPtr sH = sumOfSquares.Handle, cH = scale.Handle;
+            uint bits = Gpu.DeterministicGradientNorm.SingleToUInt32Bits(maxNorm), pol = (uint)policy;
+            void** args = stackalloc void*[4];
+            args[0] = &sH; args[1] = &bits; args[2] = &pol; args[3] = &cH;
+            LaunchKernel(kernel, 1, 1, args);
+        }
+    }
+
+    public void MultiTensorScaleByDeviceScalar(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer scale)
+        => ((IMultiTensorKernels)this).MultiTensorClipScale(tensors, sizes, scale, false);
+
+    unsafe void IMultiTensorKernels.MultiTensorClipScale(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer scale, bool zeroNonFinite)
     {
         if (scale is null) throw new ArgumentNullException(nameof(scale));
         MultiTensorArgs.Validate(tensors, sizes);
         if (tensors.Count == 0) return;
-        var table = GetMultiTensorTable(tensors, sizes);
-        var kernel = GetMultiTensorKernel("multi_tensor_scale_by_device_scalar");
+        // dgn_mul: the IEEE product with subnormals kept, so the result matches every other backend.
+        var table = GetNormTable(tensors, sizes);
+        var kernel = GetMultiTensorKernel("dgn_multi_tensor_scale");
         IntPtr pH = TableHandle(table.Pointers), sH = TableHandle(table.SizesBuffer);
         IntPtr ctH = TableHandle(table.ChunkTensor), csH = TableHandle(table.ChunkStart);
         IntPtr scH = scale.Handle;
-        void** args = stackalloc void*[5];
-        args[0] = &pH; args[1] = &sH; args[2] = &ctH; args[3] = &csH; args[4] = &scH;
-        LaunchKernel(kernel, (uint)table.TotalChunks, MultiTensorChunk, args);
+        int totalChunks = table.TotalChunks;
+        uint zero = zeroNonFinite ? 1u : 0u;
+        void** args = stackalloc void*[7];
+        args[0] = &pH; args[1] = &sH; args[2] = &ctH; args[3] = &csH; args[4] = &totalChunks; args[5] = &scH; args[6] = &zero;
+        LaunchKernel(kernel, (uint)Math.Min(totalChunks, 4096), DeterministicNormKernels.GroupSize, args);
     }
 
     private static IntPtr TableHandle(IGpuBuffer? buffer) =>

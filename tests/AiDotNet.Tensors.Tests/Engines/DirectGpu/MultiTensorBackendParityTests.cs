@@ -47,7 +47,7 @@ public sealed class MultiTensorBackendParityTests
         try
         {
             foreach (var tensor in data) buffers.Add(backend.AllocateBuffer(tensor));
-            using var sum = backend.AllocateBuffer(new float[2]);
+            using var sum = backend.AllocateBuffer(new float[AiDotNet.Tensors.Engines.Gpu.DeterministicGradientNorm.RecordWords]);
             using var scale = backend.AllocateBuffer(new float[1]);
             // Twice: the second call must start from zero, not add to the first.
             multi.MultiTensorSumOfSquares(buffers, Sizes, sum);

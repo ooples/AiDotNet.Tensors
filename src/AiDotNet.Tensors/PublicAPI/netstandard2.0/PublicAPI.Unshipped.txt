@@ -6,6 +6,25 @@ static AiDotNet.Tensors.Interop.DLPackStream.FromHandle(System.IntPtr streamHand
 static AiDotNet.Tensors.LinearAlgebra.Tensor<T>.FromDLPack(System.IntPtr managedTensorVersioned) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
 static AiDotNet.Tensors.LinearAlgebra.Tensor<T>.FromDLPackLegacy(System.IntPtr managedTensor) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
 static extern AiDotNet.Tensors.Engines.CuBlasNative.cuMemPoolGetAttribute(System.IntPtr pool, int attr, out ulong value) -> AiDotNet.Tensors.Engines.CudaResult
+AiDotNet.Tensors.Engines.Gpu.DeviceGradientNorm.ClipCoefficient.get -> float
+AiDotNet.Tensors.Engines.Gpu.DeviceGradientNorm.FirstNonFiniteGradient.get -> int
+AiDotNet.Tensors.Engines.Gpu.DeviceGradientNorm.InfinityCount.get -> long
+AiDotNet.Tensors.Engines.Gpu.DeviceGradientNorm.NanCount.get -> long
+AiDotNet.Tensors.Engines.Gpu.DeviceGradientNorm.Norm.get -> float
+AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy
+AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy.LeaveUnscaled = 0 -> AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy
+AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy.Propagate = 1 -> AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy
+static AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TryClipGradNorm(System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.LinearAlgebra.Tensor<float>!>! gradients, double maxNorm, AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy nonFinite) -> AiDotNet.Tensors.Engines.Gpu.DeviceGradientNorm?
+AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy.ZeroNonFinite = 2 -> AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy
+AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy.Error = 3 -> AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy
+static AiDotNet.Tensors.Engines.Compilation.GradientClipping.ClipGradNorm(AiDotNet.Tensors.LinearAlgebra.Tensor<float>![]! gradients, float maxNorm, AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy nonFinite) -> float
+AiDotNet.Tensors.Engines.Compilation.INonFiniteGradientPolicyTarget
+AiDotNet.Tensors.Engines.Compilation.INonFiniteGradientPolicyTarget.SetNonFiniteGradientPolicy(AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy policy) -> void
+AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientException
+AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientException.FirstNonFiniteGradient.get -> int
+AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientException.InfinityCount.get -> long
+AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientException.NanCount.get -> long
+AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientException.NonFiniteGradientException(int firstNonFiniteGradient, long nanCount, long infinityCount) -> void
 AiDotNet.Tensors.Engines.Compilation.ICompiledTrainingPlanStreamedState
 AiDotNet.Tensors.Engines.Compilation.ICompiledTrainingPlanStreamedState.ExportOptimizerState(System.IO.Stream! destination) -> bool
 AiDotNet.Tensors.Engines.Compilation.ICompiledTrainingPlanStreamedState.ImportOptimizerState(System.IO.Stream! source) -> void

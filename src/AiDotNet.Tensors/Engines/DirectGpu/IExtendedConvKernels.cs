@@ -193,26 +193,49 @@ internal interface IRectSliceKernels
 /// every gradient instead of one chain per tensor (~630 launches per N-BEATS step on the per-tensor loop).
 /// </summary>
 /// <remarks>
-/// Implemented by all six GPU backends. CUDA and HIP launch once over every tensor through a device table of buffer
-/// addresses and accumulate in double. OpenCL, Metal, Vulkan and WebGPU cannot address an arbitrary buffer from a
-/// table, so they launch one work-group reduction per tensor, accumulating in float in launch order (deterministic):
-/// one launch per tensor against the four of the plan's per-tensor loop. The <c>sumOfSquares</c> layout is private
-/// to the backend that wrote it; only that backend's <see cref="ClipScaleFromSumOfSquares"/> reads it.
+/// Implemented by all six GPU backends, every one to <see cref="Gpu.DeterministicGradientNorm"/>'s integer definition,
+/// so the record, the coefficient and the scaled gradients have the same bits on every backend and on the CPU. CUDA and
+/// HIP launch once over every tensor through a device table of buffer addresses; OpenCL, Metal, Vulkan and WebGPU
+/// cannot address an arbitrary buffer from a table, so they launch one chunk reduction per tensor. A second launch
+/// combines the chunk partials.
 /// </remarks>
+/// <summary>The norm record and the clip coefficient in one launch (CUDA, HIP). <see cref="MultiTensorArgs.NormAndClipScale"/>
+/// uses it where implemented and the separate <see cref="IMultiTensorKernels"/> launches elsewhere; the bits are the
+/// same either way.</summary>
+internal interface IFusedNormClipKernels
+{
+    /// <summary>Writes <paramref name="record"/> as <see cref="IMultiTensorKernels.MultiTensorSumOfSquares"/> and, when
+    /// <paramref name="scale"/> is not null, the coefficient as <see cref="IMultiTensorKernels.ClipScaleFromRecord"/>.</summary>
+    void MultiTensorNormAndClipScale(System.Collections.Generic.IReadOnlyList<IGpuBuffer> tensors,
+        System.Collections.Generic.IReadOnlyList<int> sizes, IGpuBuffer record, float maxNorm, IGpuBuffer? scale,
+        Gpu.NonFiniteGradientPolicy policy);
+}
+
 internal interface IMultiTensorKernels
 {
-    /// <summary>Writes the sum of squares of every element of every tensor to
-    /// <paramref name="sumOfSquares"/> (at least two float slots).</summary>
+    /// <summary>Writes the deterministic norm record (<see cref="Gpu.DeterministicGradientNorm"/>, at least
+    /// <see cref="Gpu.DeterministicGradientNorm.RecordWords"/> slots; its first two hold the double sum of squares)
+    /// of every element of every tensor to <paramref name="sumOfSquares"/>: the same bits on every backend.</summary>
     void MultiTensorSumOfSquares(System.Collections.Generic.IReadOnlyList<IGpuBuffer> tensors,
         System.Collections.Generic.IReadOnlyList<int> sizes, IGpuBuffer sumOfSquares);
 
     /// <summary>Writes PyTorch's clip_grad_norm_ coefficient, min(1, maxNorm / (norm + 1e-6)), to
-    /// <paramref name="scale"/> on the device, from a <see cref="MultiTensorSumOfSquares"/> result.</summary>
+    /// <paramref name="scale"/> and the record on the device, from a <see cref="MultiTensorSumOfSquares"/> record;
+    /// <paramref name="policy"/> sets it for a non-finite element.</summary>
+    void ClipScaleFromRecord(IGpuBuffer sumOfSquares, float maxNorm, IGpuBuffer scale, Gpu.NonFiniteGradientPolicy policy);
+
+    /// <summary><see cref="ClipScaleFromRecord"/> with <see cref="Gpu.NonFiniteGradientPolicy.LeaveUnscaled"/>.</summary>
     void ClipScaleFromSumOfSquares(IGpuBuffer sumOfSquares, float maxNorm, IGpuBuffer scale);
 
     /// <summary>Scales every tensor in place by the device scalar <paramref name="scale"/>.</summary>
     void MultiTensorScaleByDeviceScalar(System.Collections.Generic.IReadOnlyList<IGpuBuffer> tensors,
         System.Collections.Generic.IReadOnlyList<int> sizes, IGpuBuffer scale);
+
+    /// <summary>The clip's scale pass: <see cref="MultiTensorScaleByDeviceScalar"/>, and with
+    /// <paramref name="zeroNonFinite"/> (<see cref="Gpu.NonFiniteGradientPolicy.ZeroNonFinite"/>) every NaN or infinite
+    /// element becomes +0 instead.</summary>
+    void MultiTensorClipScale(System.Collections.Generic.IReadOnlyList<IGpuBuffer> tensors,
+        System.Collections.Generic.IReadOnlyList<int> sizes, IGpuBuffer scale, bool zeroNonFinite);
 
     /// <summary>Downloads a <see cref="MultiTensorSumOfSquares"/> result (the layout is this backend's) as a
     /// double. A host read: callers defer it until the value is actually wanted.</summary>
@@ -222,6 +245,25 @@ internal interface IMultiTensorKernels
 /// <summary>Argument checks every <see cref="IMultiTensorKernels"/> implementation shares.</summary>
 internal static class MultiTensorArgs
 {
+    /// <summary>The norm record and, when <paramref name="scale"/> is not null, the clip coefficient: one launch on a
+    /// backend with <see cref="IFusedNormClipKernels"/>, else the record reduction then the coefficient.</summary>
+    internal static void NormAndClipScale(IMultiTensorKernels multi, System.Collections.Generic.IReadOnlyList<IGpuBuffer> tensors,
+        System.Collections.Generic.IReadOnlyList<int> sizes, IGpuBuffer record, float maxNorm, IGpuBuffer? scale,
+        Gpu.NonFiniteGradientPolicy policy)
+    {
+        if (multi is IFusedNormClipKernels fused)
+        {
+            fused.MultiTensorNormAndClipScale(tensors, sizes, record, maxNorm, scale, policy);
+            return;
+        }
+        multi.MultiTensorSumOfSquares(tensors, sizes, record);
+        if (scale is not null) multi.ClipScaleFromRecord(record, maxNorm, scale, policy);
+    }
+
+    /// <summary>Threads of a grid-strided scale dispatch (Vulkan, WebGPU): 65535 groups of 256, the spec minimum of
+    /// the X workgroup count, so the dispatch is legal on every device and each thread loops over the rest.</summary>
+    internal const int MaxStridedScaleThreads = 65535 * 256;
+
     /// <summary>The work-group size of the per-tensor reduction on OpenCL, Metal, Vulkan and WebGPU.</summary>
     internal const int ReductionGroupSize = 256;
 
@@ -249,6 +291,23 @@ internal static class MultiTensorArgs
         Array.Copy(BitConverter.GetBytes(slots[1]), 0, bytes, 4, 4);
         if (!BitConverter.IsLittleEndian) Array.Reverse(bytes);
         return BitConverter.ToDouble(bytes, 0);
+    }
+
+    /// <summary>A norm record (<see cref="Gpu.DeterministicGradientNorm.RecordWords"/> words) from its float slots.</summary>
+    internal static uint[] RecordFromSlots(float[] slots)
+    {
+        if (slots is null || slots.Length < Gpu.DeterministicGradientNorm.RecordWords)
+            throw new ArgumentException("A norm record needs RecordWords slots.", nameof(slots));
+        var words = new uint[Gpu.DeterministicGradientNorm.RecordWords];
+        Buffer.BlockCopy(slots, 0, words, 0, words.Length * sizeof(uint));
+        return words;
+    }
+
+    internal static void ValidateRecordBuffer(IGpuBuffer record)
+    {
+        if (record is null) throw new ArgumentNullException(nameof(record));
+        if (record.Size < Gpu.DeterministicGradientNorm.RecordWords)
+            throw new ArgumentException($"A norm record needs {Gpu.DeterministicGradientNorm.RecordWords} slots.", nameof(record));
     }
 
     internal static void ValidateSumBuffer(IGpuBuffer sumOfSquares)

@@ -11442,6 +11442,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         DisposeCompiledCodegenKernels();
         DisposeMultiTensorTable();
 
+        if (_normModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_normModule);
+            _normModule = IntPtr.Zero;
+        }
+
         // Dispose the default stream wrapper (does not destroy underlying stream)
         _defaultStream?.Dispose();
         _defaultStream = null;

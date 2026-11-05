@@ -56,8 +56,16 @@ extern ""C"" __global__ void clip_scale_from_sum_squares(const double* sumSquare
 }
 ";
 
+    private IntPtr _normModule;
+
     private void CompileFiniteGuardKernels()
     {
+        // The deterministic global-norm clip (DeterministicNormKernels): integer arithmetic, the same bits as every
+        // other backend.
+        var normFailure = CompileKernelModule(DeterministicNormKernels.Source(DeterministicNormKernels.Dialect.Hip),
+            "deterministic_norm", ref _normModule, DeterministicNormKernels.CudaKernelNames, useFastMath: false);
+        if (normFailure is not null)
+            System.Diagnostics.Trace.TraceWarning($"HIP deterministic norm kernels unavailable: {normFailure.Message}");
         var failure = CompileKernelModule(FiniteGuardKernelSource, "finite_guard", ref _finiteGuardModule,
             new[] { "multi_tensor_sum_squares", "clip_scale_from_sum_squares" }, useFastMath: false);
         if (failure is not null)

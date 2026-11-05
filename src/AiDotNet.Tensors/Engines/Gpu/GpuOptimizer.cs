@@ -284,8 +284,9 @@ public static class GpuOptimizer
     /// <summary>
     /// PyTorch's <c>torch.nn.utils.clip_grad_norm_</c> (foreach) on the device: the total L2 norm of every gradient,
     /// the coefficient <c>min(1, maxNorm / (norm + 1e-6))</c> and the in-place scale of every gradient, with no host
-    /// read. A non-finite norm leaves the gradients unscaled (the kernels' coefficient is 1), so a poisoned step keeps
-    /// its evidence. Returns null when the current engine is not a GPU engine, its backend has no multi-tensor kernels,
+    /// read. The norm is exact and overflow-free, and every result bit is the same on every backend
+    /// (<see cref="DeterministicGradientNorm"/>). A non-finite norm leaves the gradients unscaled (the coefficient is 1),
+    /// so a poisoned step keeps its evidence. Returns null when the current engine is not a GPU engine, its backend has no multi-tensor kernels,
     /// a gradient is not device-resident, or <paramref name="maxNorm"/> exceeds <see cref="float.MaxValue"/>; the caller
     /// then clips on the host.
     /// </summary>
@@ -293,13 +294,21 @@ public static class GpuOptimizer
     /// <param name="maxNorm">The norm bound (positive).</param>
     /// <returns>The total norm, read back to the host only when a caller asks for it.</returns>
     public static DeviceGradientNorm? TryClipGradNorm(IReadOnlyList<Tensor<float>> gradients, double maxNorm)
+        => TryClipGradNorm(gradients, maxNorm, NonFiniteGradientPolicy.LeaveUnscaled);
+
+    /// <summary>As <see cref="TryClipGradNorm(IReadOnlyList{Tensor{float}}, double)"/>, with
+    /// <paramref name="nonFinite"/> choosing what a NaN or infinite element does to the gradients.</summary>
+    public static DeviceGradientNorm? TryClipGradNorm(IReadOnlyList<Tensor<float>> gradients, double maxNorm,
+        NonFiniteGradientPolicy nonFinite)
     {
         if (gradients is null) throw new ArgumentNullException(nameof(gradients));
         if (!(maxNorm > 0) || double.IsInfinity(maxNorm)) throw new ArgumentOutOfRangeException(nameof(maxNorm), "The norm bound must be positive and finite.");
+        if (!Enum.IsDefined(typeof(NonFiniteGradientPolicy), nonFinite))
+            throw new ArgumentOutOfRangeException(nameof(nonFinite), nonFinite, "Undefined non-finite gradient policy.");
         // The device kernels take the bound as a float: past float.MaxValue it would narrow to infinity and the
         // coefficient to 1, leaving a norm above the bound unclipped. Such a bound is clipped on the host, in double.
         if (maxNorm > float.MaxValue) return null;
-        return DeviceSumOfSquares(gradients, (float)maxNorm);
+        return DeviceSumOfSquares(gradients, (float)maxNorm, nonFinite);
     }
 
     /// <summary>
@@ -308,16 +317,16 @@ public static class GpuOptimizer
     /// A non-finite result means some element is NaN or infinite. Returns null under the same conditions as
     /// <see cref="TryClipGradNorm"/>.
     /// </summary>
-    /// <remarks>The reduction accumulates squares in float. Squared magnitudes below the backend's float
-    /// subnormal range can underflow to zero (and devices that flush subnormals may underflow earlier).
-    /// A zero result therefore does not distinguish exactly zero gradients from underflowed tiny gradients.</remarks>
+    /// <remarks>The sum is exact to <see cref="DeterministicGradientNorm"/>'s grid, in integers: no finite gradient
+    /// overflows it or underflows to zero, and it has the same bits on every backend, the CPU included.</remarks>
     public static DeviceGradientNorm? TryGradientSumOfSquares(IReadOnlyList<Tensor<float>> gradients)
     {
         if (gradients is null) throw new ArgumentNullException(nameof(gradients));
-        return DeviceSumOfSquares(gradients, clipTo: null);
+        return DeviceSumOfSquares(gradients, clipTo: null, NonFiniteGradientPolicy.LeaveUnscaled);
     }
 
-    private static DeviceGradientNorm? DeviceSumOfSquares(IReadOnlyList<Tensor<float>> gradients, float? clipTo)
+    private static DeviceGradientNorm? DeviceSumOfSquares(IReadOnlyList<Tensor<float>> gradients, float? clipTo,
+        NonFiniteGradientPolicy nonFinite)
     {
         if (!(AiDotNetEngine.Current is DirectGpuTensorEngine gpuEngine)) return null;
         using var __gpuOp = gpuEngine.EnterGpuOp();
@@ -327,6 +336,7 @@ public static class GpuOptimizer
         var buffers = new List<IGpuBuffer>(gradients.Count);
         var sizes = new List<int>(gradients.Count);
         var owners = new List<Tensor<float>>(gradients.Count);
+        var gradientIndex = new List<int>(gradients.Count);
         for (int i = 0; i < gradients.Count; i++)
         {
             var g = gradients[i];
@@ -338,24 +348,20 @@ public static class GpuOptimizer
             buffers.Add(buf);
             sizes.Add(g.Length);
             owners.Add(g);
+            gradientIndex.Add(i);
         }
 
-        var sumOfSquares = backend.AllocateBuffer(2);
-        if (buffers.Count == 0)
-        {
-            backend.Fill(sumOfSquares, 0f, 2);
-            return new DeviceGradientNorm(multi, sumOfSquares, null);
-        }
+        var sumOfSquares = backend.AllocateBuffer(DeterministicGradientNorm.RecordWords);
         IGpuBuffer? scale = null;
         try
         {
-            multi.MultiTensorSumOfSquares(buffers, sizes, sumOfSquares);
-            if (clipTo is { } maxNorm)
-            {
-                scale = backend.AllocateBuffer(1);
-                multi.ClipScaleFromSumOfSquares(sumOfSquares, maxNorm, scale);
-                multi.MultiTensorScaleByDeviceScalar(buffers, sizes, scale);
-            }
+            if (clipTo is not null) scale = backend.AllocateBuffer(1);
+            // The record and the coefficient (one launch on CUDA and HIP). Error is raised on the host below; on the
+            // device it leaves the gradients unscaled.
+            MultiTensorArgs.NormAndClipScale(multi, buffers, sizes, sumOfSquares, clipTo ?? 0f, scale,
+                nonFinite == NonFiniteGradientPolicy.Error ? NonFiniteGradientPolicy.LeaveUnscaled : nonFinite);
+            if (scale is not null)
+                multi.MultiTensorClipScale(buffers, sizes, scale, nonFinite == NonFiniteGradientPolicy.ZeroNonFinite);
         }
         catch
         {
@@ -370,8 +376,24 @@ public static class GpuOptimizer
                 gpuEngine.BindResidentBuffer(owners[i], buffers[i], backend);
         }
         // The handle keeps the scratch buffers alive past the queued launches that read them.
-        return new DeviceGradientNorm(multi, sumOfSquares, scale);
+        var norm = new DeviceGradientNorm(multi, sumOfSquares, scale, gradientIndex.ToArray());
+        try
+        {
+            if (clipTo is not null && nonFinite == NonFiniteGradientPolicy.Error && !norm.IsFinite)
+                throw NonFiniteNormException(norm.FirstNonFiniteGradient, norm.NanCount, norm.InfinityCount);
+            return norm;
+        }
+        catch
+        {
+            norm.Dispose();
+            throw;
+        }
     }
+
+    /// <summary>The <see cref="NonFiniteGradientPolicy.Error"/> exception (PyTorch's error_if_nonfinite message, with
+    /// the first non-finite gradient and the counts).</summary>
+    internal static NonFiniteGradientException NonFiniteNormException(int firstGradient, long nanCount, long infinityCount) =>
+        new NonFiniteGradientException(firstGradient, nanCount, infinityCount);
 
     /// <summary>
     /// Proximal gradient (ISTA) step with L1 soft-threshold prox, in place on the GPU.
