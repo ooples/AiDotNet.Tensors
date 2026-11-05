@@ -2,6 +2,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using AiDotNet.Tensors.Engines.Autodiff;
@@ -162,8 +163,8 @@ internal static class StreamingRestoreBuffers<T>
             var stack = kvp.Value;
             if (stack.Count == 0) continue;
             var live = new List<WeakReference<T[]>>(stack.Count);
-            foreach (var entry in stack)
-                if (entry.TryGetTarget(out _)) live.Add(entry);
+            foreach (var entry in stack.Where(entry => entry.TryGetTarget(out _)))
+                live.Add(entry);
             if (live.Count == stack.Count) continue;
             s_pooledBytes -= (long)(stack.Count - live.Count) * kvp.Key * ElementSize;
             stack.Clear();
