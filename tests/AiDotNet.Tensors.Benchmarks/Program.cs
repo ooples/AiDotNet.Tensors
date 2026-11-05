@@ -1760,6 +1760,13 @@ class Program
             return;
         }
 
+        // Run the tuned-kernel registry gate on the Metal device (Apple GPU) and export a shippable profile (#1254)
+        if (args[0] == "--metal-tuned-profile")
+        {
+            MetalTunedProfileExperiment.Run(args.Skip(1).ToArray());
+            return;
+        }
+
         // Vulkan row sums: the split path against the one-invocation-per-row kernel (#1157)
         if (args[0] == "--vulkan-sum-axis")
         {
