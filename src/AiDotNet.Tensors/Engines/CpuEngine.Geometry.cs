@@ -583,6 +583,22 @@ public partial class CpuEngine
         if (grid.Rank != 4 || grid._shape[3] != 2) throw new ArgumentException("grid must be [N, outH, outW, 2].");
         if (input._shape[0] != grid._shape[0]) throw new ArgumentException("batch dim of input and grid must match.");
 
+        // Compiled training: the same input/grid edges as the tape records below, as a lazy node.
+        if (GraphMode.IsActive && GraphMode.Current is { } scope && scope.BindEngine(this))
+        {
+            var capturedInput = input;
+            var capturedGrid = grid;
+            return scope.RecordBinary(LazyNodeType.Custom, "GridSample", input, grid,
+                new[] { input._shape[0], input._shape[1], grid._shape[1], grid._shape[2] },
+                (eng, output) =>
+                {
+                    var replayed = eng.GridSample(capturedInput, capturedGrid, mode, padding, alignCorners);
+                    DirectGpuTensorEngine.CopyResultInto(eng, replayed, output);
+                },
+                BackwardFunctions<T>.GridSampleModeBackward,
+                new object[] { (int)mode, (int)padding, alignCorners });
+        }
+
         int N = input._shape[0], C = input._shape[1], H = input._shape[2], W = input._shape[3];
         int outH = grid._shape[1], outW = grid._shape[2];
         var output = new Tensor<T>(new[] { N, C, outH, outW });
@@ -812,6 +828,24 @@ public partial class CpuEngine
                 new[] { theta },
                 engine => engine.AffineGrid3D(
                     theta, outputDepth, outputHeight, outputWidth, alignCorners));
+        if (theta.Rank != 3 || theta._shape[1] != 3 || theta._shape[2] != 4)
+            throw new ArgumentException("theta must be [N, 3, 4].");
+
+        // Compiled training: the theta -> grid edge as a lazy node (see AffineGrid).
+        if (GraphMode.IsActive && GraphMode.Current is { } scope && scope.BindEngine(this))
+        {
+            var capturedTheta = theta;
+            return scope.RecordUnary(LazyNodeType.Custom, "AffineGrid3D", theta,
+                new[] { theta._shape[0], outputDepth, outputHeight, outputWidth, 3 },
+                (eng, output) =>
+                {
+                    var replayed = eng.AffineGrid3D(capturedTheta, outputDepth, outputHeight, outputWidth, alignCorners);
+                    DirectGpuTensorEngine.CopyResultInto(eng, replayed, output);
+                },
+                AiDotNet.Tensors.Engines.Autodiff.BackwardFunctions<T>.AffineGrid3DBackward,
+                new object[] { outputDepth, outputHeight, outputWidth, alignCorners });
+        }
+
         var result = AffineGrid3DImpl(theta, outputDepth, outputHeight, outputWidth, alignCorners);
         AiDotNet.Tensors.Engines.Autodiff.DifferentiableOps.RecordUnary(
             "AffineGrid3D", result, theta,
