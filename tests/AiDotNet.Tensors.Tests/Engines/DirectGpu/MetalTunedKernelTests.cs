@@ -500,5 +500,82 @@ public sealed class MetalTunedKernelTests
             Assert.Equal(5, backend.Conv2DForwardSlot.CandidateIds.Count);
         }
     }
+
+    [SkippableFact]
+    public void ShippedProfiles_NameOnlyRegisteredCandidates()
+    {
+        using var backend = RequireBackend();
+        var registered = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal)
+        {
+            [TunedKernelOp.Softmax.ToString()] = new(backend.SoftmaxSlot.CandidateIds),
+            [TunedKernelOp.SoftmaxBackward.ToString()] = new(backend.SoftmaxBackwardSlot.CandidateIds),
+            [TunedKernelOp.LayerNorm.ToString()] = new(backend.LayerNormSlot.CandidateIds),
+            [TunedKernelOp.LayerNormBackward.ToString()] = new(backend.LayerNormBackwardSlot.CandidateIds),
+            [TunedKernelOp.LayerNormGradParameters.ToString()] = new(backend.LayerNormGradParametersSlot.CandidateIds),
+            [TunedKernelOp.RmsNormGradGamma.ToString()] = new(backend.RmsNormGradGammaSlot.CandidateIds),
+            [TunedKernelOp.Conv2DForward.ToString()] = new(backend.Conv2DForwardSlot.CandidateIds),
+        };
+        var asm = typeof(TunedKernelProfiles).Assembly;
+        int metalProfiles = 0, entries = 0;
+        foreach (string name in asm.GetManifestResourceNames().Where(r => r.EndsWith(".tuned-profile.json", StringComparison.OrdinalIgnoreCase)))
+        {
+            using var stream = asm.GetManifestResourceStream(name) ?? throw new InvalidOperationException(name);
+            using var doc = System.Text.Json.JsonDocument.Parse(stream);
+            string device = doc.RootElement.GetProperty("device").GetString() ?? string.Empty;
+            if (!device.StartsWith("metal:", StringComparison.Ordinal)) continue;
+            metalProfiles++;
+            foreach (var e in doc.RootElement.GetProperty("entries").EnumerateArray())
+            {
+                string op = e.GetProperty("op").GetString() ?? string.Empty;
+                string candidate = e.GetProperty("candidate").GetString() ?? string.Empty;
+                Assert.True(registered.TryGetValue(op, out var ids), $"{name}: unknown op {op}");
+                Assert.True(ids is not null && ids.Contains(candidate), $"{name}: {op} names unregistered candidate {candidate}");
+                Assert.True(TunedShape.TryParse(e.GetProperty("shape").GetString() ?? string.Empty, out _), $"{name}: bad shape");
+                entries++;
+            }
+        }
+        Assert.True(metalProfiles >= 1, "no shipped Metal tuned-kernel profile");
+        Assert.True(entries >= 1, "the shipped Metal profile is empty");
+    }
+
+    // The shipped profile is what a known device runs without measuring: in Pinned mode (no online tuning) the public
+    // op must be served by the profiled variant, and still give the CPU result.
+    [SkippableFact]
+    public void ShippedProfile_IsServedByThePublicOp_OnItsDevice()
+    {
+        using var backend = RequireBackend();
+        Skip.IfNot(backend.TunedDeviceKey == "metal:Apple Paravirtual device", $"No shipped profile is asserted for {backend.TunedDeviceKey}.");
+        TunedKernelMode? previousMode = TunedKernelPolicy.ModeOverride;
+        TunedKernelPolicy.ModeOverride = TunedKernelMode.Pinned;
+        try
+        {
+            const int rows = 256, n = 768;
+            var shape = TunedShape.Of2(TunedKernelDType.Float32, rows, n);
+            float[] x = Values(rows * n, 83, 5f);
+            var expected = new float[x.Length];
+            for (int r = 0; r < rows; r++)
+            {
+                double m = double.NegativeInfinity, s = 0;
+                for (int i = 0; i < n; i++) m = Math.Max(m, x[r * n + i]);
+                for (int i = 0; i < n; i++) s += Math.Exp(x[r * n + i] - m);
+                for (int i = 0; i < n; i++) expected[r * n + i] = (float)(Math.Exp(x[r * n + i] - m) / s);
+            }
+            using var input = backend.AllocateBuffer(x);
+            using var output = backend.AllocateBuffer(x.Length);
+            backend.SoftmaxSlot.InvalidateDecisions();
+            backend.Fill(output, float.NaN, x.Length);
+            backend.Softmax(input, output, rows, n);
+            backend.Synchronize();
+            AssertClose(expected, backend.DownloadBuffer(output), x.Length, "profiled softmax");
+            var decision = Assert.Single(backend.SoftmaxSlot.CachedDecisions, d => d.Shape.Equals(shape));
+            Assert.Equal(TunedKernelDecisionReason.Profile, decision.Reason);
+            Assert.Equal("generated.softmax.lanes32", decision.CandidateId);
+        }
+        finally
+        {
+            backend.SoftmaxSlot.InvalidateDecisions();
+            TunedKernelPolicy.ModeOverride = previousMode;
+        }
+    }
 }
 #endif
