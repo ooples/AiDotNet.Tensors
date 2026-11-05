@@ -67,6 +67,12 @@ public readonly struct DLPackStream : IEquatable<DLPackStream>
     /// <summary>True when the producer must not add any stream ordering.</summary>
     public bool IsNoSync => _kind == DLPackStreamKind.NoSync;
 
+    /// <summary>
+    /// True for the per-thread default stream. Its handle names the stream of whichever thread uses it, so a release
+    /// that runs on another thread (the consumer's deleter) cannot wait on the consumer's work through it.
+    /// </summary>
+    internal bool IsPerThreadDefault => _kind == DLPackStreamKind.PerThreadDefault;
+
     /// <summary>The CUDA stream handle the consumer's work is ordered on, or <see cref="IntPtr.Zero"/> for
     /// <see cref="NoSync"/>.</summary>
     internal IntPtr CudaStreamHandle => _kind switch

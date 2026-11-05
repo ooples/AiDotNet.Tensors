@@ -29,7 +29,25 @@ public sealed partial class HipBackend : IDLPackDeviceBackend
         => WrapExternalDeviceMemory(devicePointer, elementCount, elementByteSize, release);
     void IDLPackDeviceBackend.ReleaseAfterPendingWorkDeferred(Action release) => ReleaseAfterPendingWorkDeferred(release);
     IDisposable IDLPackDeviceBackend.HoldForExport(IGpuBuffer buffer, Interop.DLPackStream consumerStream)
-        => HoldForExport(buffer, orderAfterConsumer: !consumerStream.IsNoSync, consumerStream.HipStreamHandle);
+        => HoldForExport(buffer,
+            consumerStream.IsNoSync ? ConsumerOrdering.None
+            : consumerStream.IsPerThreadDefault ? ConsumerOrdering.Device
+            : ConsumerOrdering.Stream,
+            consumerStream.HipStreamHandle);
+
+    /// <summary>How a released export waits for the consumer's work before its memory is reused.</summary>
+    internal enum ConsumerOrdering
+    {
+        /// <summary>The consumer synchronizes itself (NoSync).</summary>
+        None,
+        /// <summary>This backend's stream waits on the consumer's stream.</summary>
+        Stream,
+        /// <summary>
+        /// The whole device is synchronized: the consumer's stream is the exporting thread's per-thread default, which
+        /// the deleter (on whatever thread the consumer calls it) cannot name.
+        /// </summary>
+        Device,
+    }
 
     /// <summary>
     /// Keeps <paramref name="buffer"/>'s device memory for a DLPack export: until the hold is disposed (the consumer's
@@ -37,29 +55,35 @@ public sealed partial class HipBackend : IDLPackDeviceBackend
     /// backend's stream wait for the work queued on <paramref name="consumerStream"/> (the consumer may still have
     /// kernels using the memory when it calls the deleter), then runs the parked calls.
     /// </summary>
-    /// <param name="orderAfterConsumer">False when the consumer synchronizes itself (NoSync): no ordering at all.</param>
+    /// <param name="ordering">How the release waits for the consumer's work.</param>
     /// <param name="consumerStream">The HIP stream the consumer works on; the null stream is HIP's legacy default.</param>
-    internal IDisposable HoldForExport(IGpuBuffer buffer, bool orderAfterConsumer, IntPtr consumerStream)
+    /// <exception cref="InvalidOperationException">A release of the buffer has already started: its memory may be
+    /// freed or reused, so no pointer to it may be published.</exception>
+    internal IDisposable HoldForExport(IGpuBuffer buffer, ConsumerOrdering ordering, IntPtr consumerStream)
     {
         if (buffer is null) throw new ArgumentNullException(nameof(buffer));
-        // Imported memory belongs to another library and is never freed here; re-exporting it needs only the ordering.
-        var pin = buffer is HipGpuBuffer hip ? hip.HoldForExport() : null;
-        return new ExportHold(this, pin, orderAfterConsumer, consumerStream);
+        IDisposable? pin = null;
+        if (buffer is HipGpuBuffer hip)
+        {
+            pin = hip.HoldForExport()
+                ?? throw new InvalidOperationException("The tensor's HIP buffer is being released; it cannot be exported.");
+        }
+        return new ExportHold(this, pin, ordering, consumerStream);
     }
 
     private sealed class ExportHold : IDisposable
     {
         private readonly HipBackend _backend;
-        private readonly bool _orderAfterConsumer;
+        private readonly ConsumerOrdering _ordering;
         private readonly IntPtr _consumerStream;
         private IDisposable? _pin;
         private int _disposed;   // the ordering runs once even when the hold carries no pin (an imported buffer)
 
-        public ExportHold(HipBackend backend, IDisposable? pin, bool orderAfterConsumer, IntPtr consumerStream)
+        public ExportHold(HipBackend backend, IDisposable? pin, ConsumerOrdering ordering, IntPtr consumerStream)
         {
             _backend = backend;
             _pin = pin;
-            _orderAfterConsumer = orderAfterConsumer;
+            _ordering = ordering;
             _consumerStream = consumerStream;
         }
 
@@ -69,8 +93,9 @@ public sealed partial class HipBackend : IDLPackDeviceBackend
             // Released even when the ordering throws (the consumer passed a stream it has since destroyed): the memory
             // would otherwise stay parked for the life of the process.
             using var pin = System.Threading.Interlocked.Exchange(ref _pin, null);
-            if (_orderAfterConsumer && !DeviceMemoryReclaim.ProcessExiting)
-                _backend.WaitOnStream(_consumerStream);
+            if (DeviceMemoryReclaim.ProcessExiting) return;
+            if (_ordering == ConsumerOrdering.Stream) _backend.WaitOnStream(_consumerStream);
+            else if (_ordering == ConsumerOrdering.Device) _backend.SynchronizeDeviceForRelease();
         }
     }
 
@@ -145,7 +170,7 @@ public sealed partial class HipBackend : IDLPackDeviceBackend
             if (DeviceMemoryReclaim.ProcessExiting) continue;
             try
             {
-                entry.Backend.SynchronizeWorkStream();
+                entry.Backend.SynchronizeDeviceForRelease();
             }
             catch (HipException ex)
             {
@@ -163,11 +188,25 @@ public sealed partial class HipBackend : IDLPackDeviceBackend
         }
     }
 
-    /// <summary>Waits for this backend's stream: the release step of an imported buffer.</summary>
-    internal void SynchronizeWorkStream()
+    /// <summary>
+    /// Waits for every stream of this backend's device: the release step of imported memory, which kernels or copies
+    /// on any stream (a stream from CreateStream, or a consumer's per-thread stream) may still be using. The calling
+    /// thread's current device is restored afterwards, so a release run from another backend's operation does not
+    /// leave that operation on the wrong device.
+    /// </summary>
+    internal void SynchronizeDeviceForRelease()
     {
-        if (_disposed) return;   // torn down: nothing can still be queued
+        if (_disposed) return;   // Dispose synchronized the device before tearing down: nothing can still be queued
+        int previous = 0;
+        bool restore = HipNativeBindings.hipGetDevice(ref previous) == HipError.Success && previous != _hipDeviceIndex;
         ((IThreadContextBackend)this).EnsureContextCurrent();
-        HipNativeBindings.CheckError(HipNativeBindings.hipStreamSynchronize(_stream), "hipStreamSynchronize(DLPack release)");
+        try
+        {
+            HipNativeBindings.CheckError(HipNativeBindings.hipDeviceSynchronize(), "hipDeviceSynchronize(DLPack release)");
+        }
+        finally
+        {
+            if (restore) RebindThreadDevice(previous);
+        }
     }
 }

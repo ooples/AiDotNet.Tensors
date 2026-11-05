@@ -17,12 +17,15 @@ public partial class Tensor<T>
     /// Exports this tensor as a DLPack <c>DLManagedTensorVersioned*</c> over its own memory (no copy): what
     /// <c>__dlpack__()</c> returns. The consumer owns the pointer and must call its deleter exactly once.
     /// </summary>
-    /// <param name="consumerStream">The stream the consumer will use the data on (CUDA only; ignored for CPU).</param>
+    /// <param name="consumerStream">The stream the consumer will use the data on (a CUDA or HIP stream for a device
+    /// export; ignored for CPU).</param>
     /// <returns>The <c>DLManagedTensorVersioned*</c>.</returns>
     /// <remarks>
     /// <para>The exported memory stays valid until the deleter runs, even if this tensor is disposed first. Strided
     /// views export with their strides. A tensor over a read-only mapping exports with the read-only flag.</para>
-    /// <para>A GPU-resident <c>Tensor&lt;float&gt;</c> on the CUDA backend exports its device pointer. Any other
+    /// <para>A GPU-resident <c>Tensor&lt;float&gt;</c> on the CUDA backend (kDLCUDA) or the HIP backend (kDLROCM)
+    /// exports its device pointer: the consumer shares this tensor's memory, so writes on either side are seen by the
+    /// other, and no copy flag is set. Any other
     /// GPU-resident tensor (another backend, whose memory has no foreign-addressable pointer, or an element type the
     /// device stores float-encoded) exports a host copy, flagged <c>DLPACK_FLAG_BITMASK_IS_COPIED</c>; this tensor
     /// stays on its device and does not see writes to the copy.</para>

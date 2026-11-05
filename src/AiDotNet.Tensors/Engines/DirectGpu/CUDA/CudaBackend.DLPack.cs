@@ -22,7 +22,8 @@ public sealed partial class CudaBackend : IDLPackDeviceBackend
         => WrapExternalDeviceMemory(devicePointer, elementCount, elementByteSize, release);
     void IDLPackDeviceBackend.ReleaseAfterPendingWorkDeferred(Action release) => ReleaseAfterPendingWorkDeferred(release);
     IDisposable IDLPackDeviceBackend.HoldForExport(IGpuBuffer buffer, Interop.DLPackStream consumerStream)
-        => HoldForExport(buffer, consumerStream.IsNoSync ? IntPtr.Zero : consumerStream.CudaStreamHandle);
+        => HoldForExport(buffer, consumerStream.IsNoSync ? IntPtr.Zero : consumerStream.CudaStreamHandle,
+            synchronizeContext: consumerStream.IsPerThreadDefault);
 
     /// <summary>
     /// Keeps <paramref name="buffer"/>'s device memory for a DLPack export: until the hold is disposed (the consumer's
@@ -32,7 +33,9 @@ public sealed partial class CudaBackend : IDLPackDeviceBackend
     /// kernels using the memory when it calls the deleter), then runs the parked releases, which are stream-ordered.
     /// </summary>
     /// <param name="consumerStream">The stream the consumer works on, or zero when it synchronizes itself (NoSync).</param>
-    internal IDisposable HoldForExport(IGpuBuffer buffer, IntPtr consumerStream)
+    /// <param name="synchronizeContext">The consumer works on the exporting thread's per-thread default stream, which
+    /// the deleter (on whatever thread the consumer calls it) cannot name: the release synchronizes the context.</param>
+    internal IDisposable HoldForExport(IGpuBuffer buffer, IntPtr consumerStream, bool synchronizeContext = false)
     {
         if (buffer is null) throw new ArgumentNullException(nameof(buffer));
         // The same mechanism keeps a captured graph's memory: a pinned buffer parks every release until retirement.
@@ -40,7 +43,7 @@ public sealed partial class CudaBackend : IDLPackDeviceBackend
         if (buffer is CudaGpuBuffer cuda) cuda.PinTo(pins);
         // Imported memory (ExternalDeviceBuffer) belongs to another library and is never freed here; re-exporting it
         // needs only the stream ordering.
-        return new ExportHold(this, pins, consumerStream);
+        return new ExportHold(this, pins, consumerStream, synchronizeContext);
     }
 
     /// <summary>Makes this backend's stream wait for the work queued so far on <paramref name="consumerStream"/>.</summary>
@@ -63,17 +66,27 @@ public sealed partial class CudaBackend : IDLPackDeviceBackend
         }
     }
 
+    /// <summary>Waits for every stream of this backend's context: a per-thread consumer's release.</summary>
+    private void SynchronizeContextForRelease()
+    {
+        if (_disposed && _cudaContext == IntPtr.Zero) return;   // torn down: nothing of ours can run on the memory
+        using var _ = PushContext();
+        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuCtxSynchronize(), "cuCtxSynchronize(DLPack release)");
+    }
+
     private sealed class ExportHold : IDisposable
     {
         private readonly CudaBackend _backend;
         private readonly IntPtr _consumerStream;
+        private readonly bool _synchronizeContext;
         private CaptureMemoryPool? _pins;
 
-        public ExportHold(CudaBackend backend, CaptureMemoryPool pins, IntPtr consumerStream)
+        public ExportHold(CudaBackend backend, CaptureMemoryPool pins, IntPtr consumerStream, bool synchronizeContext)
         {
             _backend = backend;
             _pins = pins;
             _consumerStream = consumerStream;
+            _synchronizeContext = synchronizeContext;
         }
 
         public void Dispose()
@@ -83,7 +96,10 @@ public sealed partial class CudaBackend : IDLPackDeviceBackend
             try
             {
                 if (_consumerStream != IntPtr.Zero && !IsRuntimeTearingDown && !ProcessExiting)
-                    _backend.OrderAfterStream(_consumerStream);
+                {
+                    if (_synchronizeContext) _backend.SynchronizeContextForRelease();
+                    else _backend.OrderAfterStream(_consumerStream);
+                }
             }
             finally
             {
