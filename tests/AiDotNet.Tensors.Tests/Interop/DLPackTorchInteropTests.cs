@@ -195,6 +195,59 @@ public class DLPackTorchInteropTests
             gpu.Dispose();
         }
     }
+
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Rocm_RoundTripsThroughTorch_OnTheDevice(bool versioned)
+    {
+        // A ROCm build of torch addresses its device as "cuda" and exchanges it as kDLROCM (10).
+        Skip.If(TorchPython.Unavailable is not null, TorchPython.Unavailable);
+        Skip.IfNot(TorchPython.RocmAvailable, "torch was built without ROCm or sees no device.");
+        var backend = new AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend();
+        if (!backend.IsAvailable)
+        {
+            backend.Dispose();
+            throw new SkipException("No HIP device is available.");
+        }
+        var previous = AiDotNetEngine.Current;
+        var directGpu = new AiDotNet.Tensors.Engines.DirectGpu.DirectGpuEngine(backend);
+        var gpu = new DirectGpuTensorEngine(directGpu);
+        try
+        {
+            AiDotNetEngine.Current = gpu;
+            int liveBefore = DLPack.LiveExportCount;
+
+            // Tensors -> torch: torch's legacy default stream (DLPack value 1) waits on the export.
+            var source = new Tensor<float>(new[] { 4, 8 }, new Vector<float>(Iota(32))).Gpu();
+            string keyIn = "rocm_in_" + versioned;
+            if (versioned)
+                Call("from_tensors_versioned", keyIn, source.ToDLPack(DLPackStream.LegacyDefault).ToInt64(), 10, 0);
+            else
+                Call("from_tensors_legacy", keyIn, source.ToDLPackLegacy(DLPackStream.LegacyDefault).ToInt64());
+            Assert.True(Call<bool>("is_cuda", keyIn));
+            Assert.Equal(Iota(32), Call<float[]>("values", keyIn));
+            Call("drop", keyIn);
+            Assert.Equal(liveBefore, DLPack.LiveExportCount);
+            source.Dispose();
+
+            // torch -> Tensors: the import wraps torch's device pointer as a HIP buffer.
+            string keyOut = "rocm_out_" + versioned;
+            Call("make", keyOut, 16, true);
+            var ptr = new IntPtr(Call<long>("export", keyOut, versioned));
+            var imported = versioned ? Tensor<float>.FromDLPack(ptr) : Tensor<float>.FromDLPackLegacy(ptr);
+            Assert.True(imported.IsGpuResident);
+            Assert.Equal(Iota(16), imported.ToArray());
+            imported.Dispose();
+            Call("drop", keyOut);
+        }
+        finally
+        {
+            AiDotNetEngine.Current = previous;
+            gpu.Dispose();
+            directGpu.Dispose();
+        }
+    }
 }
 
 /// <summary>Starts the CPython named by <c>AIDOTNET_TORCH_PYTHON</c> once per test process.</summary>
@@ -213,6 +266,16 @@ internal static class TorchPython
         {
             if (Unavailable is not null) return false;
             using (Py.GIL()) return Py.Import("torch").GetAttr("cuda").InvokeMethod("is_available").As<bool>();
+        }
+    }
+
+    /// <summary>True when torch is a ROCm build (<c>torch.version.hip</c> is set) and sees a device.</summary>
+    internal static bool RocmAvailable
+    {
+        get
+        {
+            if (!CudaAvailable) return false;
+            using (Py.GIL()) return !Py.Import("torch").GetAttr("version").GetAttr("hip").IsNone();
         }
     }
 

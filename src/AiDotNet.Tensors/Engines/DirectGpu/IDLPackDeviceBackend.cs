@@ -27,8 +27,9 @@ internal interface IDLPackDeviceBackend
     /// <summary>The handle of the stream this backend orders its work on.</summary>
     IntPtr WorkStreamHandle { get; }
 
-    /// <summary>Makes <paramref name="consumerStream"/> wait for every operation queued so far on this backend.</summary>
-    void OrderStreamAfterPendingWork(IntPtr consumerStream);
+    /// <summary>Makes <paramref name="consumerStream"/> wait for every operation queued so far on this backend; nothing
+    /// for <see cref="Interop.DLPackStream.NoSync"/>. Each backend maps the DLPack stream value to its own handle.</summary>
+    void OrderStreamAfterPendingWork(Interop.DLPackStream consumerStream);
 
     /// <summary>Wraps device memory another library owns; disposing the buffer waits for queued work, then runs
     /// <paramref name="release"/> once.</summary>
@@ -44,8 +45,8 @@ internal interface IDLPackDeviceBackend
     /// <summary>
     /// Holds <paramref name="buffer"/>'s device memory for an export: until the result is disposed (by the consumer's
     /// deleter), releasing the buffer neither frees it nor lets another allocation reuse it. Disposing it orders this
-    /// backend's work after the work queued on <paramref name="consumerStream"/> (zero = the consumer synchronizes
-    /// itself), then runs the releases that waited.
+    /// backend's work after the work queued on <paramref name="consumerStream"/> (none for
+    /// <see cref="Interop.DLPackStream.NoSync"/>: the consumer synchronizes itself), then runs the releases that waited.
     /// </summary>
-    IDisposable HoldForExport(IGpuBuffer buffer, IntPtr consumerStream);
+    IDisposable HoldForExport(IGpuBuffer buffer, Interop.DLPackStream consumerStream);
 }

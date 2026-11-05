@@ -77,6 +77,18 @@ public readonly struct DLPackStream : IEquatable<DLPackStream>
         _ => DLPackNative.CudaLegacyDefaultStream,   // Default and LegacyDefault
     };
 
+    /// <summary>
+    /// The HIP stream handle the consumer's work is ordered on. HIP has no stream at handle 1: its legacy default stream
+    /// is the null stream, and its per-thread default stream is <c>hipStreamPerThread</c> (handle 2). Not meaningful for
+    /// <see cref="NoSync"/>, where the producer adds no ordering at all.
+    /// </summary>
+    internal IntPtr HipStreamHandle => _kind switch
+    {
+        DLPackStreamKind.PerThreadDefault => new IntPtr(2),   // hipStreamPerThread
+        DLPackStreamKind.Handle => _handle,
+        _ => IntPtr.Zero,   // Default and LegacyDefault: the null stream; NoSync never reaches a stream call
+    };
+
     /// <inheritdoc/>
     public bool Equals(DLPackStream other) => CudaStreamHandle == other.CudaStreamHandle && IsNoSync == other.IsNoSync;
 

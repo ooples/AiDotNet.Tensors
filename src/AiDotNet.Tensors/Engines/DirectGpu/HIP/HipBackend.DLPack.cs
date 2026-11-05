@@ -21,11 +21,15 @@ public sealed partial class HipBackend : IDLPackDeviceBackend
     int IDLPackDeviceBackend.DLPackDeviceType => 10;   // kDLROCM
     int IDLPackDeviceBackend.DeviceOrdinal => _hipDeviceIndex;
     IntPtr IDLPackDeviceBackend.WorkStreamHandle => _stream;
-    void IDLPackDeviceBackend.OrderStreamAfterPendingWork(IntPtr consumerStream) => OrderStreamAfterPendingWork(consumerStream);
+    void IDLPackDeviceBackend.OrderStreamAfterPendingWork(Interop.DLPackStream consumerStream)
+    {
+        if (!consumerStream.IsNoSync) OrderStreamAfterPendingWork(consumerStream.HipStreamHandle);
+    }
     IGpuBuffer IDLPackDeviceBackend.WrapExternalDeviceMemory(IntPtr devicePointer, int elementCount, int elementByteSize, Action release)
         => WrapExternalDeviceMemory(devicePointer, elementCount, elementByteSize, release);
     void IDLPackDeviceBackend.ReleaseAfterPendingWorkDeferred(Action release) => ReleaseAfterPendingWorkDeferred(release);
-    IDisposable IDLPackDeviceBackend.HoldForExport(IGpuBuffer buffer, IntPtr consumerStream) => HoldForExport(buffer, consumerStream);
+    IDisposable IDLPackDeviceBackend.HoldForExport(IGpuBuffer buffer, Interop.DLPackStream consumerStream)
+        => HoldForExport(buffer, orderAfterConsumer: !consumerStream.IsNoSync, consumerStream.HipStreamHandle);
 
     /// <summary>
     /// Keeps <paramref name="buffer"/>'s device memory for a DLPack export: until the hold is disposed (the consumer's
@@ -33,26 +37,29 @@ public sealed partial class HipBackend : IDLPackDeviceBackend
     /// backend's stream wait for the work queued on <paramref name="consumerStream"/> (the consumer may still have
     /// kernels using the memory when it calls the deleter), then runs the parked calls.
     /// </summary>
-    /// <param name="consumerStream">The stream the consumer works on, or zero when it synchronizes itself (NoSync).</param>
-    internal IDisposable HoldForExport(IGpuBuffer buffer, IntPtr consumerStream)
+    /// <param name="orderAfterConsumer">False when the consumer synchronizes itself (NoSync): no ordering at all.</param>
+    /// <param name="consumerStream">The HIP stream the consumer works on; the null stream is HIP's legacy default.</param>
+    internal IDisposable HoldForExport(IGpuBuffer buffer, bool orderAfterConsumer, IntPtr consumerStream)
     {
         if (buffer is null) throw new ArgumentNullException(nameof(buffer));
         // Imported memory belongs to another library and is never freed here; re-exporting it needs only the ordering.
         var pin = buffer is HipGpuBuffer hip ? hip.HoldForExport() : null;
-        return new ExportHold(this, pin, consumerStream);
+        return new ExportHold(this, pin, orderAfterConsumer, consumerStream);
     }
 
     private sealed class ExportHold : IDisposable
     {
         private readonly HipBackend _backend;
+        private readonly bool _orderAfterConsumer;
         private readonly IntPtr _consumerStream;
         private IDisposable? _pin;
         private int _disposed;
 
-        public ExportHold(HipBackend backend, IDisposable? pin, IntPtr consumerStream)
+        public ExportHold(HipBackend backend, IDisposable? pin, bool orderAfterConsumer, IntPtr consumerStream)
         {
             _backend = backend;
             _pin = pin;
+            _orderAfterConsumer = orderAfterConsumer;
             _consumerStream = consumerStream;
         }
 
@@ -61,7 +68,7 @@ public sealed partial class HipBackend : IDLPackDeviceBackend
             if (System.Threading.Interlocked.Exchange(ref _disposed, 1) != 0) return;
             try
             {
-                if (_consumerStream != IntPtr.Zero && !DeviceMemoryReclaim.ProcessExiting)
+                if (_orderAfterConsumer && !DeviceMemoryReclaim.ProcessExiting)
                     _backend.WaitOnStream(_consumerStream);
             }
             finally

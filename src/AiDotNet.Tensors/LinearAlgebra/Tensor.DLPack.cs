@@ -126,9 +126,9 @@ public partial class Tensor<T>
             // The view keeps the storage, not the device memory: a TensorScope or the activation cache may release the
             // buffer while the consumer still has its address. The hold parks every such release until the deleter,
             // which also orders this backend's later work after the consumer's.
-            hold = device.HoldForExport(buffer, consumerStream.IsNoSync ? IntPtr.Zero : consumerStream.CudaStreamHandle);
+            hold = device.HoldForExport(buffer, consumerStream);
             // The producer's half of the stream contract: the consumer's stream waits for the work that wrote the data.
-            if (!consumerStream.IsNoSync) device.OrderStreamAfterPendingWork(consumerStream.CudaStreamHandle);
+            device.OrderStreamAfterPendingWork(consumerStream);
             exported = DLPack.CreateExport(
                 versioned, buffer.Handle, device.DLPackDeviceType, device.DeviceOrdinal, dtype,
                 view._shape, view._strides, readOnly: false, pin: default, keepAlive: new DeviceExportLifetime(view, hold));

@@ -14,11 +14,15 @@ public sealed partial class CudaBackend : IDLPackDeviceBackend
     int IDLPackDeviceBackend.DLPackDeviceType => 2;   // kDLCUDA
     int IDLPackDeviceBackend.DeviceOrdinal => DeviceOrdinal;
     IntPtr IDLPackDeviceBackend.WorkStreamHandle => WorkStreamHandle;
-    void IDLPackDeviceBackend.OrderStreamAfterPendingWork(IntPtr consumerStream) => OrderStreamAfterPendingWork(consumerStream);
+    void IDLPackDeviceBackend.OrderStreamAfterPendingWork(Interop.DLPackStream consumerStream)
+    {
+        if (!consumerStream.IsNoSync) OrderStreamAfterPendingWork(consumerStream.CudaStreamHandle);
+    }
     IGpuBuffer IDLPackDeviceBackend.WrapExternalDeviceMemory(IntPtr devicePointer, int elementCount, int elementByteSize, Action release)
         => WrapExternalDeviceMemory(devicePointer, elementCount, elementByteSize, release);
     void IDLPackDeviceBackend.ReleaseAfterPendingWorkDeferred(Action release) => ReleaseAfterPendingWorkDeferred(release);
-    IDisposable IDLPackDeviceBackend.HoldForExport(IGpuBuffer buffer, IntPtr consumerStream) => HoldForExport(buffer, consumerStream);
+    IDisposable IDLPackDeviceBackend.HoldForExport(IGpuBuffer buffer, Interop.DLPackStream consumerStream)
+        => HoldForExport(buffer, consumerStream.IsNoSync ? IntPtr.Zero : consumerStream.CudaStreamHandle);
 
     /// <summary>
     /// Keeps <paramref name="buffer"/>'s device memory for a DLPack export: until the hold is disposed (the consumer's
