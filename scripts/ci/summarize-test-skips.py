@@ -29,9 +29,11 @@ def reason_of(result):
 
 
 def main():
-    # Test names carry their arguments, which can hold non-ASCII text (double infinity renders as U+221E); a
-    # Windows runner's console encoding is cp1252, which cannot encode it and failed the step after the tests ran.
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    # Skip reasons carry non-ASCII text (e.g. the infinity sign). A Windows runner's console is cp1252, where writing
+    # one raised UnicodeEncodeError and failed the step before the skip gate ran, so emit UTF-8 everywhere.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser()
     parser.add_argument("--title", required=True)
     parser.add_argument("--fail-on-skip", action="store_true",
