@@ -99,8 +99,9 @@ jobs:
           export AIDOTNET_TORCH_ONNX_DIR="$RUNNER_TEMP/torch-onnx"
           dotnet build tests/AiDotNet.Tensors.Onnx.Tests/AiDotNet.Tensors.Onnx.Tests.csproj --configuration Release --framework net10.0
           set -o pipefail
+          # The device round trips need a GPU build of torch: Cuda_ runs in the CUDA lane; Rocm_ needs a ROCm host.
           dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-build --framework net10.0 \
-            --filter "FullyQualifiedName~DLPackTorchInteropTests&FullyQualifiedName!~Cuda_" | tee "$RUNNER_TEMP/interop.log"
+            --filter "FullyQualifiedName~DLPackTorchInteropTests&FullyQualifiedName!~Cuda_&FullyQualifiedName!~Rocm_" | tee "$RUNNER_TEMP/interop.log"
           dotnet test tests/AiDotNet.Tensors.Onnx.Tests/AiDotNet.Tensors.Onnx.Tests.csproj --configuration Release --no-build --framework net10.0 \
             --filter "FullyQualifiedName~OnnxTorchExportTests|FullyQualifiedName~OnnxExportRoundTripTests" | tee -a "$RUNNER_TEMP/interop.log"
           # The CUDA case runs in the GPU lane; here every selected test must run.
