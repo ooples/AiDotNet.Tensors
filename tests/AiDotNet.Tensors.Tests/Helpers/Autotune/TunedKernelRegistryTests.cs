@@ -22,12 +22,14 @@ public sealed class TunedKernelRegistryTests : IDisposable
 {
     private readonly TunedKernelMode? _mode = TunedKernelPolicy.ModeOverride;
     private readonly bool _persist = TunedKernelPolicy.PersistDecisions;
+    private readonly bool _ignoreProfiles = TunedKernelPolicy.IgnoreProfiles;
     private readonly double _budget = TunedKernelPolicy.BudgetMilliseconds;
 
     public TunedKernelRegistryTests()
     {
         TunedKernelPolicy.ModeOverride = TunedKernelMode.Tune;
         TunedKernelPolicy.PersistDecisions = false;
+        TunedKernelPolicy.IgnoreProfiles = false;
         TunedKernelPolicy.BudgetMilliseconds = 60_000;
         TunedKernelPolicy.ResetBudget();
         TunedKernelPolicy.SetOverride(TunedKernelOp.Elementwise, null);
@@ -38,6 +40,7 @@ public sealed class TunedKernelRegistryTests : IDisposable
     {
         TunedKernelPolicy.ModeOverride = _mode;
         TunedKernelPolicy.PersistDecisions = _persist;
+        TunedKernelPolicy.IgnoreProfiles = _ignoreProfiles;
         TunedKernelPolicy.BudgetMilliseconds = _budget;
         TunedKernelPolicy.ResetBudget();
         TunedKernelPolicy.SetOverride(TunedKernelOp.Elementwise, null);
@@ -102,6 +105,27 @@ public sealed class TunedKernelRegistryTests : IDisposable
     private static TunedShape Shape(int rows = 4, int cols = 8) => TunedShape.Of2(TunedKernelDType.Float32, rows, cols);
 
     private static Args NewArgs() => new() { Output = new float[16] };
+
+    [Fact]
+    public void ProfileRegeneration_MeasuresExistingProfileShapesAgain()
+    {
+        TunedKernelProfiles.AddProfile(
+            "{\"schemaVersion\":1,\"device\":\"test:device\",\"entries\":[{\"op\":\"Elementwise\",\"shape\":\"f32:4x8\"," +
+            "\"deterministic\":true,\"candidate\":\"ref\",\"speedup\":1.0}]}");
+        var harness = new Harness();
+        var reference = new Fake("ref", 1f, 1.0);
+        var fast = new Fake("fast", 1f, 0.5);
+        var slot = Slot(harness, true, reference, fast);
+        Assert.Same(reference, slot.Resolve(Shape(), NewArgs()));
+        Assert.Equal(TunedKernelDecisionReason.Profile, Assert.Single(slot.CachedDecisions).Reason);
+        Assert.Equal(0, harness.Measurements);
+
+        TunedKernelPolicy.IgnoreProfiles = true;
+        slot.InvalidateDecisions();
+        Assert.Same(fast, slot.Resolve(Shape(), NewArgs()));
+        Assert.Equal(TunedKernelDecisionReason.Tuned, Assert.Single(slot.CachedDecisions).Reason);
+        Assert.True(harness.Measurements > 0);
+    }
 
     [Fact]
     public void FasterCorrectCandidate_IsPromoted_WithEvidence()

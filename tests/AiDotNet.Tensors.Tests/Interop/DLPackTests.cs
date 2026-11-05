@@ -764,6 +764,27 @@ public sealed class DLPackTests
     }
 
     [SkippableFact]
+    public void Hip_ContextBinding_DetectsAForeignDeviceChange()
+    {
+        using var hip = HipEngine.CreateOrSkip();
+        int count = 0;
+        HipNativeBindings.CheckError(HipNativeBindings.hipGetDeviceCount(ref count), "hipGetDeviceCount(test)");
+        Skip.If(count < 2, "Two HIP devices are required to test a foreign device switch.");
+        var context = (IThreadContextBackend)hip.Backend;
+        context.EnsureContextCurrent();
+        try
+        {
+            // Another backend's constructor or a foreign producer can change this thread's device directly.
+            HipNativeBindings.CheckError(HipNativeBindings.hipSetDevice(1), "hipSetDevice(test)");
+            context.EnsureContextCurrent();
+            int current = -1;
+            HipNativeBindings.CheckError(HipNativeBindings.hipGetDevice(ref current), "hipGetDevice(test)");
+            Assert.Equal(0, current);
+        }
+        finally { HipNativeBindings.CheckError(HipNativeBindings.hipSetDevice(0), "hipSetDevice(test cleanup)"); }
+    }
+
+    [SkippableFact]
     public void Hip_ImportThatIsNeverDisposed_IsReleasedByTheNextAllocation()
     {
         using var hip = HipEngine.CreateOrSkip();
