@@ -1853,6 +1853,8 @@ public static partial class BlasManaged
             // DeterministicParallelGemmContractTests at m=16). Acceptable only in Fast mode.
             if (Avx2Fp32_6x16.IsSupported) return (6, 16);   // now deterministic too — see gate fix in Gemm
             if (Avx2Fp32_8x8.IsSupported) return (8, 8);
+            // AVX without AVX2/FMA (or DOTNET_EnableAVX2=0): the same 8x8 tile with multiply + add.
+            if (AvxFp32_8x8.IsSupported) return (8, 8);
             if (NeonFp32_8x4.IsSupported) return (8, 4);
             return (4, 4);
         }

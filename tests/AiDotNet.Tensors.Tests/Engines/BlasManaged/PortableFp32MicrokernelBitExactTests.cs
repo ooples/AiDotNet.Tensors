@@ -33,13 +33,16 @@ public class PortableFp32MicrokernelBitExactTests
         return values;
     }
 
+    // BitConverter.SingleToInt32Bits is not in net462/net471.
+    private static int Bits(float value) => BitConverter.ToInt32(BitConverter.GetBytes(value), 0);
+
     private static void AssertBitIdentical(float[] expected, float[] actual, string what)
     {
         Assert.Equal(expected.Length, actual.Length);
         for (int i = 0; i < expected.Length; i++)
         {
-            int e = BitConverter.SingleToInt32Bits(expected[i]);
-            int a = BitConverter.SingleToInt32Bits(actual[i]);
+            int e = Bits(expected[i]);
+            int a = Bits(actual[i]);
             if (e != a)
             {
                 Assert.Fail(
