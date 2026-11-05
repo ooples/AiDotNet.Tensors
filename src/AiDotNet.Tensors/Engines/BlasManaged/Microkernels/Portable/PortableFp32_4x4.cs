@@ -64,15 +64,7 @@ internal static class PortableFp32_4x4
         fixed (float* bBase = &MemoryMarshal.GetReference(packedB))
         fixed (float* cBase = &MemoryMarshal.GetReference(c))
         {
-            Load(cBase, ldc, out var c0l, out var c0h, out var c1l, out var c1h,
-                out var c2l, out var c2h, out var c3l, out var c3h);
-            for (int k = 0; k < kc; k++)
-            {
-                var b = Vector128.Load(bBase + (k * Nr));
-                Step(aBase + (k * Mr), Vector128.WidenLower(b), Vector128.WidenUpper(b),
-                    ref c0l, ref c0h, ref c1l, ref c1h, ref c2l, ref c2h, ref c3l, ref c3h);
-            }
-            Store(cBase, ldc, c0l, c0h, c1l, c1h, c2l, c2h, c3l, c3h);
+            Accumulate(aBase, bBase, Nr, cBase, ldc, kc);
         }
     }
 
@@ -99,59 +91,45 @@ internal static class PortableFp32_4x4
         fixed (float* bBase = &MemoryMarshal.GetReference(b))
         fixed (float* cBase = &MemoryMarshal.GetReference(c))
         {
-            Load(cBase, ldc, out var c0l, out var c0h, out var c1l, out var c1h,
-                out var c2l, out var c2h, out var c3l, out var c3h);
-            for (int k = 0; k < kc; k++)
-            {
-                var bRow = Vector128.Load(bBase + (k * ldb));
-                Step(aBase + (k * Mr), Vector128.WidenLower(bRow), Vector128.WidenUpper(bRow),
-                    ref c0l, ref c0h, ref c1l, ref c1h, ref c2l, ref c2h, ref c3l, ref c3h);
-            }
-            Store(cBase, ldc, c0l, c0h, c1l, c1h, c2l, c2h, c3l, c3h);
+            Accumulate(aBase, bBase, ldb, cBase, ldc, kc);
         }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static unsafe void Step(float* aK, Vector128<double> bLo, Vector128<double> bHi,
-        ref Vector128<double> c0l, ref Vector128<double> c0h, ref Vector128<double> c1l, ref Vector128<double> c1h,
-        ref Vector128<double> c2l, ref Vector128<double> c2h, ref Vector128<double> c3l, ref Vector128<double> c3h)
+    private static unsafe void Accumulate(float* aBase, float* bBase, int ldb, float* cBase, int ldc, int kc)
     {
-        // No `a == 0` early-out: the scalar kernel propagates 0 * Infinity => NaN and signed zeros, and so must this.
-        var a0 = Vector128.Create((double)aK[0]);
-        var a1 = Vector128.Create((double)aK[1]);
-        var a2 = Vector128.Create((double)aK[2]);
-        var a3 = Vector128.Create((double)aK[3]);
-        c0l += a0 * bLo; c0h += a0 * bHi;
-        c1l += a1 * bLo; c1h += a1 * bHi;
-        c2l += a2 * bLo; c2h += a2 * bHi;
-        c3l += a3 * bLo; c3h += a3 * bHi;
-    }
+        // Each C row widened to two double halves: the scalar kernel's double accumulators, four lanes at a time.
+        var r0 = Vector128.Load(cBase);
+        var r1 = Vector128.Load(cBase + ldc);
+        var r2 = Vector128.Load(cBase + (2 * ldc));
+        var r3 = Vector128.Load(cBase + (3 * ldc));
+        Vector128<double> c0l = Vector128.WidenLower(r0), c0h = Vector128.WidenUpper(r0);
+        Vector128<double> c1l = Vector128.WidenLower(r1), c1h = Vector128.WidenUpper(r1);
+        Vector128<double> c2l = Vector128.WidenLower(r2), c2h = Vector128.WidenUpper(r2);
+        Vector128<double> c3l = Vector128.WidenLower(r3), c3h = Vector128.WidenUpper(r3);
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static unsafe void Load(float* c, int ldc,
-        out Vector128<double> c0l, out Vector128<double> c0h, out Vector128<double> c1l, out Vector128<double> c1h,
-        out Vector128<double> c2l, out Vector128<double> c2h, out Vector128<double> c3l, out Vector128<double> c3h)
-    {
-        var r0 = Vector128.Load(c);
-        var r1 = Vector128.Load(c + ldc);
-        var r2 = Vector128.Load(c + (2 * ldc));
-        var r3 = Vector128.Load(c + (3 * ldc));
-        c0l = Vector128.WidenLower(r0); c0h = Vector128.WidenUpper(r0);
-        c1l = Vector128.WidenLower(r1); c1h = Vector128.WidenUpper(r1);
-        c2l = Vector128.WidenLower(r2); c2h = Vector128.WidenUpper(r2);
-        c3l = Vector128.WidenLower(r3); c3h = Vector128.WidenUpper(r3);
-    }
+        for (int k = 0; k < kc; k++)
+        {
+            var bRow = Vector128.Load(bBase + (k * ldb));
+            var bLo = Vector128.WidenLower(bRow);
+            var bHi = Vector128.WidenUpper(bRow);
+            float* aK = aBase + (k * Mr);
+            // No `a == 0` early-out: the scalar kernel propagates 0 * Infinity => NaN and signed zeros, and so must this.
+            var a0 = Vector128.Create((double)aK[0]);
+            var a1 = Vector128.Create((double)aK[1]);
+            var a2 = Vector128.Create((double)aK[2]);
+            var a3 = Vector128.Create((double)aK[3]);
+            c0l += a0 * bLo; c0h += a0 * bHi;
+            c1l += a1 * bLo; c1h += a1 * bHi;
+            c2l += a2 * bLo; c2h += a2 * bHi;
+            c3l += a3 * bLo; c3h += a3 * bHi;
+        }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static unsafe void Store(float* c, int ldc,
-        Vector128<double> c0l, Vector128<double> c0h, Vector128<double> c1l, Vector128<double> c1h,
-        Vector128<double> c2l, Vector128<double> c2h, Vector128<double> c3l, Vector128<double> c3h)
-    {
         // Narrow rounds each double to the nearest float, as the scalar kernel's (float) cast does.
-        Vector128.Narrow(c0l, c0h).Store(c);
-        Vector128.Narrow(c1l, c1h).Store(c + ldc);
-        Vector128.Narrow(c2l, c2h).Store(c + (2 * ldc));
-        Vector128.Narrow(c3l, c3h).Store(c + (3 * ldc));
+        Vector128.Narrow(c0l, c0h).Store(cBase);
+        Vector128.Narrow(c1l, c1h).Store(cBase + ldc);
+        Vector128.Narrow(c2l, c2h).Store(cBase + (2 * ldc));
+        Vector128.Narrow(c3l, c3h).Store(cBase + (3 * ldc));
     }
 #else
     /// <summary>False on targets without <c>System.Runtime.Intrinsics</c>; the scalar kernel runs there.</summary>
