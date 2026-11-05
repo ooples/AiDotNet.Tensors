@@ -68,6 +68,43 @@ public class InstructionSetFallbackTests
                 $"C[{i}] = {c[i]}, expected {expected[i]}");
     }
 
+#if NET5_0_OR_GREATER
+    // The two batched 1x1-convolution GEMMs that share one weight across the images (CpuEngine's per-image 1x1
+    // route). Both packed for and called the AVX2/FMA macro-kernel with no check, so every stride-1 1x1 convolution
+    // over a small map threw under DOTNET_EnableAVX2=0 (ooples/AiDotNet#2388, GraFPrint's loss trace).
+    [Theory]
+    [InlineData(24, 40, 4, 5)]     // 2x2 maps: the columns route (hw < 64)
+    [InlineData(9, 17, 1, 33)]     // 1x1 maps, ragged m and k, more columns than one tile
+    public void SharedWeightColumnsGemm_MatchesTheReference(int m, int k, int hw, int count)
+        => AssertSharedWeightGemm(m, k, hw, count, columns: true);
+
+    [Theory]
+    [InlineData(40, 24, 16, 3)]
+    [InlineData(17, 300, 36, 4)]   // k past one Kc block, n not a multiple of the tile
+    public void SharedWeightGemm_MatchesTheReference(int m, int k, int n, int count)
+        => AssertSharedWeightGemm(m, k, n, count, columns: false);
+
+    private static void AssertSharedWeightGemm(int m, int k, int n, int count, bool columns)
+    {
+        var a = Values(m * k, 7);
+        var b = Values(count * k * n, 8);
+        var c = new float[count * m * n];
+        if (columns) SimdGemm.SgemmSharedAColumns(a, 0, b, 0, k * n, c, 0, m * n, m, k, n, count);
+        else SimdGemm.SgemmSharedA(a, 0, b, 0, k * n, c, 0, m * n, m, k, n, count);
+
+        for (int image = 0; image < count; image++)
+        {
+            var expected = Reference(a, b.AsSpan(image * k * n, k * n).ToArray(), m, k, n);
+            for (int i = 0; i < expected.Length; i++)
+            {
+                float actual = c[image * m * n + i];
+                Assert.True(Math.Abs(actual - expected[i]) <= 1e-4 * (1 + Math.Abs(expected[i])),
+                    $"image {image} C[{i}] = {actual}, expected {expected[i]}");
+            }
+        }
+    }
+#endif
+
     [Fact]
     public void Int8CachedBGemm_MatchesTheReferenceWithinQuantization()
     {

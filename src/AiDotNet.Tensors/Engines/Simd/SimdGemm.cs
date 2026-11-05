@@ -1653,6 +1653,11 @@ internal static partial class SimdGemm
         float[] a, int aOffset, float[] x, int xOffset, int xImageStride, float[] c, int cOffset, int cImageStride,
         int m, int k, int hw, int count)
     {
+        if (!PackedKernelsSupported)
+        {
+            SharedAPerPair(a, aOffset, x, xOffset, xImageStride, c, cOffset, cImageStride, m, k, hw, count);
+            return;
+        }
         int columns = count * hw;
         int tiles = (columns + SharedAColumnTile - 1) / SharedAColumnTile;
         int depthBlocks = (k + Kc - 1) / Kc;
@@ -1718,6 +1723,25 @@ internal static partial class SimdGemm
     [ThreadStatic] private static float[]? t_sharedAColumnTile;
 
     /// <summary>
+    /// The shared-A entry points on a host without AVX2+FMA: one <see cref="SgemmSequential"/> per pair, which routes
+    /// to the portable path there. Both entry points pack for and call <see cref="MacroKernel"/>, whose intrinsics
+    /// throw PlatformNotSupportedException without that ISA (see <see cref="PackedKernelsSupported"/>); unguarded,
+    /// every stride-1 1x1 convolution on a small map threw under DOTNET_EnableAVX2=0 (ooples/AiDotNet#2388). Each
+    /// pair is still written by one sequential GEMM, so the result does not depend on the thread count.
+    /// </summary>
+    private static void SharedAPerPair(float[] a, int aOffset, float[] b, int bOffset, int bStride, float[] c,
+        int cOffset, int cStride, int m, int k, int n, int count)
+    {
+        Helpers.CpuParallelSettings.ParallelForOrSerial(0, count, 2L * count * m * k * n, pair =>
+            SgemmSequential(
+                new ReadOnlySpan<float>(a, aOffset, m * k),
+                new ReadOnlySpan<float>(b, bOffset + pair * bStride, k * n),
+                new Span<float>(c, cOffset + pair * cStride, m * n),
+                m, k, n),
+            deterministicSafe: true);
+    }
+
+    /// <summary>
     /// Packs input rows [pc, pc + kc) of columns [col0, col0 + cols) of the batch-as-columns view (column = image * hw +
     /// pixel) into the micro-kernel's B layout: Nr-wide panels, each kc x Nr, columns past the end zero.
     /// </summary>
@@ -1759,6 +1783,11 @@ internal static partial class SimdGemm
         int m, int k, int n, int count)
     {
         if (n > Nc) throw new ArgumentOutOfRangeException(nameof(n), $"n must be at most {Nc}.");
+        if (!PackedKernelsSupported)
+        {
+            SharedAPerPair(a, aOffset, b, bOffset, bStride, c, cOffset, cStride, m, k, n, count);
+            return;
+        }
         int mc0 = SmallMc;
         int rowBlocks = (m + mc0 - 1) / mc0, depthBlocks = (k + Kc - 1) / Kc;
         int packedASize = ((mc0 + Mr - 1) / Mr) * Mr * Kc;
