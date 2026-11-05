@@ -17,6 +17,52 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// </summary>
 public class ArenaWithheldGradientsTests
 {
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void ReturnedGradients_SurviveUnrelatedArenaDisposalAndRents(bool callerArenaPerStep)
+    {
+        Exception? failure = null;
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                var engine = new CpuEngine();
+                var w1 = Rnd(new[] { 256, 512 }, 1);
+                var w2 = Rnd(new[] { 512, 256 }, 2);
+                var x = Rnd(new[] { 256, 256 }, 3);
+                Tensor<float> gradient;
+                using (callerArenaPerStep ? TensorArena.Create() : null)
+                {
+                    using var tape = new GradientTape<float>();
+                    var h = engine.TensorMatMul(engine.TensorMatMul(x, w1), w2);
+                    var loss = engine.ReduceSum(engine.TensorMultiply(h, h), null);
+                    gradient = tape.ComputeGradients(loss, new[] { w1, w2 })[w1];
+                }
+                Assert.True(WithheldCount() > 0, "The step must retain arena-backed gradients.");
+                var expected = gradient.ToArray();
+
+                // Neither an inference arena nor scratch rentals end the optimizer's use of these gradients.
+                using (TensorArena.Create()) { }
+                int rentals = TensorArena.CrossArenaRetainedArrayCount + 1;
+                using (TensorArena.Create())
+                {
+                    for (int i = 0; i < rentals; i++)
+                    {
+                        var scratch = TensorAllocator.Rent<float>(new[] { 256, 512 });
+                        for (int j = 0; j < scratch.Length; j++) scratch[j] = -123f;
+                    }
+                    Assert.Equal(expected, gradient.ToArray());
+                }
+                Assert.Equal(expected, gradient.ToArray());
+            }
+            catch (Exception e) { failure = e; }
+        });
+        thread.Start();
+        thread.Join();
+        if (failure is not null) throw new InvalidOperationException("Gradient lifetime regression failed.", failure);
+    }
+
     private static int WithheldCount()
     {
         var field = typeof(TensorArena).GetField("t_withheldFromPool", BindingFlags.NonPublic | BindingFlags.Static)

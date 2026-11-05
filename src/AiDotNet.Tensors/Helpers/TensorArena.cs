@@ -993,6 +993,7 @@ public sealed class TensorArena : IDisposable
     /// </remarks>
     internal void ResetKeeping(HashSet<object>? keep)
     {
+        ReturnWithheldFromPool();
         _heldOver = keep is { Count: > 0 } ? keep : null;
         Reset();
     }
@@ -1008,11 +1009,9 @@ public sealed class TensorArena : IDisposable
         Dispose();
     }
 
-    // The previous step boundary's withheld arrays go back to the cross-arena pool at this one. Every pooling
-    // Dispose is a boundary, not only DisposeKeeping: a tape over a caller's arena (NeuralNetworkBase's per-step
-    // `using var arena`) ends its step with ResetKeeping, and the arena's own Dispose then withholds the handed-over
-    // gradients; with the drain only in DisposeKeeping nothing ever returned them, so this list kept one full set of
-    // gradients per training step for the life of the thread (AiDotNet#2322: +2.6 GB/step on a 661M-parameter model).
+    // Only a tape step boundary releases the previous step's gradients. Caller-owned arenas reach this through
+    // ResetKeeping, and tape-owned arenas through DisposeKeeping. An unrelated arena's Dispose must not drain it:
+    // its caller may still be consuming those gradients before the next training step.
     private static void ReturnWithheldFromPool()
     {
         var previous = t_withheldFromPool;
@@ -1117,7 +1116,6 @@ public sealed class TensorArena : IDisposable
         // `using var arena`, no outer wrapper) keep pooling, so the GC win is preserved.
         if (_previous is null || _poolWhenNested)
         {
-            ReturnWithheldFromPool();
             foreach (var kvp in _pool)
             {
                 var (type, size) = kvp.Key;
