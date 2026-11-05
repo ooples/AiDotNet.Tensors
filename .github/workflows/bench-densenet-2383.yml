@@ -1,0 +1,93 @@
+name: Bench DenseNet-121 on CUDA (AiDotNet #2383, one-off)
+
+# Measures AiDotNet's DenseNet-121 on the GTX 1660 Ti the issue's evidence came from, against the published
+# AiDotNet.Tensors 0.147.0. Runs only on pushes to this branch; the branch is deleted once the numbers are recorded.
+
+on:
+  push:
+    branches: [ bench/densenet-2383-cuda ]
+
+permissions:
+  contents: read
+
+jobs:
+  densenet:
+    runs-on: [self-hosted, gpu, cuda, sm75]
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+    - name: Setup .NET
+      uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+      with:
+        dotnet-version: '10.0.x'
+
+    - name: Record the GPU and driver
+      run: |
+        nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv,noheader |
+          Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
+
+    - name: cuDNN
+      run: |
+        $version = '9.26.1.1'
+        $sha256 = 'c826d866641fed2c266ae1c11e679fcc1ef8517801a32a51715843051ce8df52'
+        $root = Join-Path $env:GITHUB_WORKSPACE "cudnn-$version"
+        if (-not (Test-Path (Join-Path $root 'ok'))) {
+          $zip = Join-Path $env:RUNNER_TEMP 'cudnn.zip'
+          Invoke-WebRequest -UseBasicParsing -OutFile $zip `
+            "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-${version}_cuda13-archive.zip"
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLower() -ne $sha256) { Write-Output "::error::cuDNN archive SHA-256 mismatch."; exit 1 }
+          if (Test-Path $root) { Remove-Item -Recurse -Force $root }
+          New-Item -ItemType Directory -Force $root | Out-Null
+          & "$env:SystemRoot\System32\tar.exe" -xf $zip -C $root
+          if ($LASTEXITCODE -ne 0) { Write-Output "::error::Extracting cuDNN failed."; exit 1 }
+          Remove-Item $zip
+          New-Item -ItemType File (Join-Path $root 'ok') | Out-Null
+        }
+        $dll = Get-ChildItem $root -Recurse -Filter cudnn64_9.dll | Select-Object -First 1
+        $dll.DirectoryName | Out-File -Append -FilePath $env:GITHUB_PATH
+
+    - name: Check out AiDotNet
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      with:
+        repository: ooples/AiDotNet
+        ref: master
+        path: aidn
+        persist-credentials: false
+
+    - name: Pin AiDotNet.Tensors 0.147.0
+      run: |
+        $props = 'aidn/Directory.Packages.props'
+        $text = Get-Content $props -Raw
+        foreach ($id in 'AiDotNet.Tensors', 'AiDotNet.Native.OneDNN', 'AiDotNet.Native.CLBlast') {
+          $text = $text -replace "(<PackageVersion Include=`"$([regex]::Escape($id))`" Version=`")[^`"]+(`")", '${1}0.147.0${2}'
+        }
+        Set-Content $props $text -NoNewline
+        Select-String -Path $props -Pattern 'AiDotNet\.(Tensors|Native)' | ForEach-Object { $_.Line.Trim() }
+
+    - name: Build the parity harness
+      run: dotnet build -c Release aidn/benchmarks/AiDotNet.PyTorchParity -v q -nologo
+
+    - name: DenseNet-121, three launches
+      env:
+        AIDOTNET_FUSED_DIAG: '1'
+      run: |
+        $out = Join-Path $env:RUNNER_TEMP 'densenet'
+        New-Item -ItemType Directory -Force $out | Out-Null
+        foreach ($i in 1..3) {
+          dotnet run -c Release --no-build --project aidn/benchmarks/AiDotNet.PyTorchParity -- `
+            --device cuda --models densenet121 --epochs 1 --train-batches 5 --batch-size 32 `
+            --inference-batches 1,8,16,32 --inference-iterations 10 --warmup-iterations 2 `
+            --output (Join-Path $out "densenet_$i.json") 2>&1 | Tee-Object (Join-Path $out "densenet_$i.log") |
+            Select-String -Pattern 'FUSED|fused|error|Error|Exception' | Select-Object -First 20
+          "launch $i exit $LASTEXITCODE" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
+        }
+
+    - name: Upload results
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: densenet-2383-cuda
+        path: ${{ runner.temp }}/densenet/**
+        retention-days: 5
