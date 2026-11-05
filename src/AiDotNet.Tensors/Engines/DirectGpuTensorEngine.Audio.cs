@@ -161,6 +161,19 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> Resample<T>(Tensor<T> waveform, int origRate, int newRate)
     {
+        // Under GraphMode the CpuEngine op records the compiled node; each replay re-enters here outside
+        // graph mode and runs the GPU kernel.
+        if (Compilation.GraphMode.IsActive) return base.Resample(waveform, origRate, newRate);
+        var result = ResampleOnGpu(waveform, origRate, newRate);
+        // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
+        // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
+        if (result.GradFn is null)
+            Autodiff.DifferentiableOps.RecordUnary("Resample", result, waveform, Autodiff.BackwardFunctions<T>.ResampleBackward, new object[] { origRate, newRate });
+        return result;
+    }
+
+    private Tensor<T> ResampleOnGpu<T>(Tensor<T> waveform, int origRate, int newRate)
+    {
         using var __gpuOp = EnterGpuOp();
         if (waveform is null) throw new ArgumentNullException(nameof(waveform));
         if (typeof(T) == typeof(float) && origRate > 0 && newRate == origRate

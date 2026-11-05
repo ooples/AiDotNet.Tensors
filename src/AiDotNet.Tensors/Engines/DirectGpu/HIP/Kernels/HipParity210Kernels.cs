@@ -822,8 +822,21 @@ extern ""C"" __global__ void parity210_stft_mag_phase(
     int idx = blockIdx.x * blockDim.x + threadIdx.x; int total = batch*numFreqs*numFrames; if (idx >= total) return;
     int frame = idx % numFrames; int tmp = idx / numFrames; int k = tmp % numFreqs; int b = tmp / numFreqs;
     int start = frame * hop; int inOff = b * Lp; float re = 0.0f, im = 0.0f;
-    float bk = -2.0f * (float)M_PI * (float)k / (float)nFft;
-    for (int i = 0; i < nFft; i++) { float x = padded[inOff + start + i] * window[i]; float a = bk * (float)i; re += x*cosf(a); im += x*sinf(a); }
+    // Twiddle from the integer phase m = k*i mod nFft (#1680): the angle stays in [-pi, pi] and the quarter
+    // turns are exact, as an FFT's are. cos/sin of -2*pi*k*i/nFft, with |angle| up to pi*nFft, left the DC and
+    // Nyquist bins of a real frame a spurious imaginary part: a wrong phase there, amplified by 1/|C| in its gradient.
+    float tw = -2.0f * (float)M_PI / (float)nFft; int m = 0;
+    for (int i = 0; i < nFft; i++) {
+        float x = padded[inOff + start + i] * window[i];
+        float c; float s;
+        if (m == 0) { c = 1.0f; s = 0.0f; }
+        else if (2 * m == nFft) { c = -1.0f; s = 0.0f; }
+        else if (4 * m == nFft) { c = 0.0f; s = -1.0f; }
+        else if (4 * m == 3 * nFft) { c = 0.0f; s = 1.0f; }
+        else { float a = tw * (float)(2 * m > nFft ? m - nFft : m); c = cosf(a); s = sinf(a); }
+        re += x * c; im += x * s;
+        m += k; if (m >= nFft) m -= nFft;
+    }
     int outOff = b*numFreqs*numFrames + k*numFrames + frame;
     mag[outOff] = sqrtf(re*re + im*im); phase[outOff] = atan2f(im, re);
 }

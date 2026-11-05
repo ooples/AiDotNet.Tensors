@@ -17,25 +17,25 @@ public partial class DirectGpuTensorEngine
 {
     /// <inheritdoc/>
     public override Tensor<T> BoxIou<T>(Tensor<T> boxesA, Tensor<T> boxesB)
-        => TryGpuBoxIou(boxesA, boxesB, "BoxIou", static (b, a, x, o, n, m) => b.BoxIou(a, x, o, n, m))
+        => TryGpuBoxIou(boxesA, boxesB, "BoxIou", static (b, a, x, o, n, m) => b.BoxIou(a, x, o, n, m), Autodiff.BackwardFunctions<T>.BoxIouBackward)
            ?? base.BoxIou(boxesA, boxesB);
 
     /// <inheritdoc/>
     public override Tensor<T> GeneralizedBoxIou<T>(Tensor<T> boxesA, Tensor<T> boxesB)
         => TryGpuBoxIou(boxesA, boxesB, "GeneralizedBoxIou",
-                        static (b, a, x, o, n, m) => b.GeneralizedBoxIou(a, x, o, n, m))
+                        static (b, a, x, o, n, m) => b.GeneralizedBoxIou(a, x, o, n, m), Autodiff.BackwardFunctions<T>.GeneralizedBoxIouBackward)
            ?? base.GeneralizedBoxIou(boxesA, boxesB);
 
     /// <inheritdoc/>
     public override Tensor<T> DistanceBoxIou<T>(Tensor<T> boxesA, Tensor<T> boxesB)
         => TryGpuBoxIou(boxesA, boxesB, "DistanceBoxIou",
-                        static (b, a, x, o, n, m) => b.DistanceBoxIou(a, x, o, n, m))
+                        static (b, a, x, o, n, m) => b.DistanceBoxIou(a, x, o, n, m), Autodiff.BackwardFunctions<T>.DistanceBoxIouBackward)
            ?? base.DistanceBoxIou(boxesA, boxesB);
 
     /// <inheritdoc/>
     public override Tensor<T> CompleteBoxIou<T>(Tensor<T> boxesA, Tensor<T> boxesB)
         => TryGpuBoxIou(boxesA, boxesB, "CompleteBoxIou",
-                        static (b, a, x, o, n, m) => b.CompleteBoxIou(a, x, o, n, m))
+                        static (b, a, x, o, n, m) => b.CompleteBoxIou(a, x, o, n, m), Autodiff.BackwardFunctions<T>.CompleteBoxIouBackward)
            ?? base.CompleteBoxIou(boxesA, boxesB);
 
     /// <inheritdoc/>
@@ -165,8 +165,11 @@ public partial class DirectGpuTensorEngine
     /// </summary>
     private Tensor<T>? TryGpuBoxIou<T>(
         Tensor<T> boxesA, Tensor<T> boxesB, string opName,
-        System.Action<IDetectionBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int, int> kernel)
+        System.Action<IDetectionBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int, int> kernel,
+        Autodiff.BackwardFunction<T> backward)
     {
+        // Under GraphMode the CpuEngine op records the compiled node; each replay re-enters here outside graph mode.
+        if (Compilation.GraphMode.IsActive) return null;
         if (typeof(T) != typeof(float)) return null;
         if (boxesA.Rank != 2 || boxesA._shape[1] != 4) return null;
         if (boxesB.Rank != 2 || boxesB._shape[1] != 4) return null;
@@ -185,7 +188,10 @@ public partial class DirectGpuTensorEngine
                 {
                     kernel(det, aBuf.Buffer, bBuf.Buffer, outBuf.Buffer, n, m);
                     var arr = FinishGpuOp<T>(backend, outBuf, n * m);
-                    return new Tensor<T>(arr, new[] { n, m });
+                    var result = new Tensor<T>(arr, new[] { n, m });
+                    // The CPU op's tape edge: without it every box got a zero gradient on the GPU engine.
+                    Autodiff.DifferentiableOps.RecordBinary(opName, result, boxesA, boxesB, backward);
+                    return result;
                 }
                 catch { outBuf.Dispose(); throw; }
             }

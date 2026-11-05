@@ -447,6 +447,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> PadNd<T>(Tensor<T> input, int[] pad, PadMode mode, T value = default!)
     {
+        if (TryRecordCompiledOp("PadNd", new Tensor<T>?[] { input }, e => e.PadNd(input, pad, mode, value), out var compiledNode))
+            return compiledNode;
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (pad is null) throw new ArgumentNullException(nameof(pad));
         if (GraphMode.IsInferenceTrace)

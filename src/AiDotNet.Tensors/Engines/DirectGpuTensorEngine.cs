@@ -19037,7 +19037,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // the tape entirely. savedState mirrors the CpuEngine call: the backward routes
             // each reduced cell's gradient to the argmax it came from, so it needs the
             // indices the helper just produced via the out parameter.
-            var reduceMaxResult = ReduceMaxWithIndicesGpu(input, normalizedAxes, keepDims, backend, out maxIndices);
+            var reduceMaxResult = ReduceMaxWithIndicesGpu(input, normalizedAxes, keepDims, backend, out var relative);
+            // The kernel's argmax is a position within each reduction window; this overload's contract (the CpuEngine's,
+            // and what both ReduceMaxBackward paths scatter into) is the flat input index. Passing the window position
+            // on routed every output's gradient into the first window (#1680).
+            maxIndices = WindowArgMaxToFlatInputIndex(input._shape, normalizedAxes, relative);
             Autodiff.DifferentiableOps.RecordUnary(
                 "ReduceMax", reduceMaxResult, input,
                 Autodiff.BackwardFunctions<T>.ReduceMaxBackward,
@@ -19047,6 +19051,41 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("ReduceMax", capabilityGap);
             return base.ReduceMax(input, safeAxes, keepDims, out maxIndices);
         }
+    }
+
+    /// <summary>
+    /// Converts argmax positions within each reduction window (row-major over the sorted, distinct reduced axes, one per
+    /// output element in row-major order over the kept axes) to flat indices into the input.
+    /// </summary>
+    internal static int[] WindowArgMaxToFlatInputIndex(int[] inputShape, int[] sortedAxes, int[] windowIndices)
+    {
+        int rank = inputShape.Length;
+        var reduced = new bool[rank];
+        foreach (int a in sortedAxes) reduced[a] = true;
+        var strides = new int[rank];
+        for (int d = rank - 1, s = 1; d >= 0; d--) { strides[d] = s; s = checked(s * inputShape[d]); }
+        var kept = Enumerable.Range(0, rank).Where(d => !reduced[d]).ToArray();
+        var result = new int[windowIndices.Length];
+        for (int o = 0; o < windowIndices.Length; o++)
+        {
+            int flat = 0;
+            int rem = o;
+            for (int k = kept.Length - 1; k >= 0; k--)
+            {
+                int d = kept[k];
+                flat += rem % inputShape[d] * strides[d];
+                rem /= inputShape[d];
+            }
+            rem = windowIndices[o];
+            for (int k = sortedAxes.Length - 1; k >= 0; k--)
+            {
+                int d = sortedAxes[k];
+                flat += rem % inputShape[d] * strides[d];
+                rem /= inputShape[d];
+            }
+            result[o] = flat;
+        }
+        return result;
     }
 
     /// <summary>
@@ -28626,7 +28665,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (typeof(T) != typeof(float) || !tensor.IsContiguous || repeats < 1
             || axis < 0 || axis >= tensor.Rank || !TryGetBackend(out var backend))
             return null;
-        if (repeats == 1) return tensor;
+        // repeats == 1 still copies, as the CPU op and PyTorch do: returning the input itself made
+        // TensorRepeatInterleave record a tape edge from the input to itself, doubling its gradient (#1680).
 
         int outer = 1;
         for (int d = 0; d < axis; d++) outer = checked(outer * tensor.Shape._dims[d]);

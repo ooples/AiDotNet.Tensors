@@ -13720,7 +13720,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 betaT.Grad = fusedGradBeta;
             };
         }
-        if (step.OpType == OpType.BatchNorm && step.Inputs.Length >= 3
+        // Only the batch-statistics BatchNorm: OpType.BatchNorm also covers BatchNormAffine (running statistics,
+        // whose input gradient is just gradOut * gamma / std). The batch-statistics backward below subtracts the
+        // mean of gradOut and of gradOut * xhat, which for BatchNormAffine gave a wrong input gradient (#1680).
+        if (step.OpType == OpType.BatchNorm && step.OpName == "BatchNorm" && step.Inputs.Length >= 3
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous && step.Inputs[2].IsContiguous)
         {
             var input = step.Inputs[0];

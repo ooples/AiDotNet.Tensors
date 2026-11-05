@@ -27,6 +27,8 @@ public partial class CpuEngine
         int outputHeight, int outputWidth,
         float spatialScale, int samplingRatio, bool aligned)
     {
+        if (TryRecordCompiledOp("RoIAlign", new Tensor<T>?[] { input, boxes }, e => e.RoIAlign(input, boxes, outputHeight, outputWidth, spatialScale, samplingRatio, aligned), out var compiledNode))
+            return compiledNode;
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (boxes == null) throw new ArgumentNullException(nameof(boxes));
         if (GraphMode.IsInferenceTrace)
@@ -132,6 +134,8 @@ public partial class CpuEngine
     public virtual Tensor<T> RoIPool<T>(Tensor<T> input, Tensor<T> boxes,
         int outputHeight, int outputWidth, float spatialScale)
     {
+        if (TryRecordCompiledOp("RoIPool", new Tensor<T>?[] { input, boxes }, e => e.RoIPool(input, boxes, outputHeight, outputWidth, spatialScale), out var compiledNode))
+            return compiledNode;
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (boxes == null) throw new ArgumentNullException(nameof(boxes));
         if (GraphMode.IsInferenceTrace)
@@ -223,6 +227,8 @@ public partial class CpuEngine
         int outputHeight, int outputWidth, int outputChannels,
         float spatialScale, int samplingRatio)
     {
+        if (TryRecordCompiledOp("PsRoIAlign", new Tensor<T>?[] { input, boxes }, e => e.PsRoIAlign(input, boxes, outputHeight, outputWidth, outputChannels, spatialScale, samplingRatio), out var compiledNode))
+            return compiledNode;
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (boxes == null) throw new ArgumentNullException(nameof(boxes));
         if (GraphMode.IsInferenceTrace)
@@ -306,6 +312,8 @@ public partial class CpuEngine
     public virtual Tensor<T> PsRoIPool<T>(Tensor<T> input, Tensor<T> boxes,
         int outputHeight, int outputWidth, int outputChannels, float spatialScale)
     {
+        if (TryRecordCompiledOp("PsRoIPool", new Tensor<T>?[] { input, boxes }, e => e.PsRoIPool(input, boxes, outputHeight, outputWidth, outputChannels, spatialScale), out var compiledNode))
+            return compiledNode;
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (boxes == null) throw new ArgumentNullException(nameof(boxes));
         if (GraphMode.IsInferenceTrace)
@@ -384,6 +392,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> Spectrogram<T>(Tensor<T> waveform, int nFft, int hopLength, int winLength, Tensor<T>? window = null)
     {
+        if (TryRecordCompiledOp("Spectrogram", new Tensor<T>?[] { waveform, window }, e => e.Spectrogram(waveform, nFft, hopLength, winLength, window), out var compiledNode))
+            return compiledNode;
         if (waveform == null) throw new ArgumentNullException(nameof(waveform));
         if (GraphMode.IsInferenceTrace)
         {
@@ -409,6 +419,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> StftPhase<T>(Tensor<T> waveform, int nFft, int hopLength, int winLength, Tensor<T>? window = null)
     {
+        if (TryRecordCompiledOp("StftPhase", new Tensor<T>?[] { waveform, window }, e => e.StftPhase(waveform, nFft, hopLength, winLength, window), out var compiledNode))
+            return compiledNode;
         if (waveform == null) throw new ArgumentNullException(nameof(waveform));
         if (GraphMode.IsInferenceTrace)
         {
@@ -445,6 +457,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> AmplitudeToDB<T>(Tensor<T> input, float minAmplitude = 1e-10f, float? topDb = null)
     {
+        if (TryRecordCompiledOp("AmplitudeToDB", new Tensor<T>?[] { input }, e => e.AmplitudeToDB(input, minAmplitude, topDb), out var compiledNode))
+            return compiledNode;
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (GraphMode.IsInferenceTrace)
             return CaptureInferenceKernel(
@@ -543,6 +557,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> ComputeDeltas<T>(Tensor<T> input, int winLength = 5)
     {
+        if (TryRecordCompiledOp("ComputeDeltas", new Tensor<T>?[] { input }, e => e.ComputeDeltas(input, winLength), out var compiledNode))
+            return compiledNode;
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (GraphMode.IsInferenceTrace)
             return CaptureInferenceKernel(
@@ -597,6 +613,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> Resample<T>(Tensor<T> waveform, int origRate, int newRate)
     {
+        if (TryRecordCompiledOp("Resample", new Tensor<T>?[] { waveform }, e => e.Resample(waveform, origRate, newRate), out var compiledNode))
+            return compiledNode;
         if (waveform == null) throw new ArgumentNullException(nameof(waveform));
         if (GraphMode.IsInferenceTrace)
             return CaptureInferenceKernel(

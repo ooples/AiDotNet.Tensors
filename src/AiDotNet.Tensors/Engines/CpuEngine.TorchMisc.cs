@@ -40,6 +40,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorRrelu<T>(Tensor<T> tensor, double lower = 1.0 / 8, double upper = 1.0 / 3, bool training = false, int? seed = null)
     {
+        if (TryRecordCompiledOp("TensorRrelu", new Tensor<T>?[] { tensor }, e => e.TensorRrelu(tensor, lower, upper, training, seed), out var compiledNode))
+            return compiledNode;
         if (training) GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (lower > upper) throw new ArgumentException("lower must not exceed upper.", nameof(lower));
@@ -147,6 +149,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorMsort<T>(Tensor<T> tensor)
     {
+        if (TryRecordCompiledOp("TensorMsort", new Tensor<T>?[] { tensor }, e => e.TensorMsort(tensor), out var compiledNode))
+            return compiledNode;
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (tensor.Rank == 0) return tensor;
@@ -169,6 +173,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorDiagflat<T>(Tensor<T> tensor, int offset = 0)
     {
+        if (TryRecordCompiledOp("TensorDiagflat", new Tensor<T>?[] { tensor }, e => e.TensorDiagflat(tensor, offset), out var compiledNode))
+            return compiledNode;
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         int n = tensor.Length, size = n + Math.Abs(offset);
@@ -184,6 +190,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorDiagonalScatter<T>(Tensor<T> input, Tensor<T> src, int offset = 0, int dim1 = 0, int dim2 = 1)
     {
+        if (TryRecordCompiledOp("TensorDiagonalScatter", new Tensor<T>?[] { input, src }, e => e.TensorDiagonalScatter(input, src, offset, dim1, dim2), out var compiledNode))
+            return compiledNode;
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (src == null) throw new ArgumentNullException(nameof(src));

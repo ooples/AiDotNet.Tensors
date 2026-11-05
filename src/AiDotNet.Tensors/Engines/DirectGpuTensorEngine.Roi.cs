@@ -16,6 +16,21 @@ public partial class DirectGpuTensorEngine
         int outputHeight, int outputWidth,
         float spatialScale, int samplingRatio, bool aligned)
     {
+        // Under GraphMode the CpuEngine op records the compiled node; each replay re-enters here outside
+        // graph mode and runs the GPU kernel.
+        if (Compilation.GraphMode.IsActive) return base.RoIAlign(input, boxes, outputHeight, outputWidth, spatialScale, samplingRatio, aligned);
+        var result = RoIAlignOnGpu(input, boxes, outputHeight, outputWidth, spatialScale, samplingRatio, aligned);
+        // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
+        // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
+        if (result.GradFn is null)
+            Autodiff.DifferentiableOps.RecordBinary("RoIAlign", result, input, boxes, Autodiff.BackwardFunctions<T>.RoIAlignBackward, new object[] { outputHeight, outputWidth, spatialScale, samplingRatio, aligned });
+        return result;
+    }
+
+    private Tensor<T> RoIAlignOnGpu<T>(Tensor<T> input, Tensor<T> boxes,
+        int outputHeight, int outputWidth,
+        float spatialScale, int samplingRatio, bool aligned)
+    {
         if (typeof(T) == typeof(float)
             && input.Rank == 4
             && boxes.Rank == 2 && boxes._shape[1] == 5)
@@ -74,6 +89,21 @@ public partial class DirectGpuTensorEngine
         int outputHeight, int outputWidth, int outputChannels,
         float spatialScale, int samplingRatio)
     {
+        // Under GraphMode the CpuEngine op records the compiled node; each replay re-enters here outside
+        // graph mode and runs the GPU kernel.
+        if (Compilation.GraphMode.IsActive) return base.PsRoIAlign(input, boxes, outputHeight, outputWidth, outputChannels, spatialScale, samplingRatio);
+        var result = PsRoIAlignOnGpu(input, boxes, outputHeight, outputWidth, outputChannels, spatialScale, samplingRatio);
+        // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
+        // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
+        if (result.GradFn is null)
+            Autodiff.DifferentiableOps.RecordBinary("PsRoIAlign", result, input, boxes, Autodiff.BackwardFunctions<T>.PsRoIAlignBackward, new object[] { outputHeight, outputWidth, outputChannels, spatialScale, samplingRatio });
+        return result;
+    }
+
+    private Tensor<T> PsRoIAlignOnGpu<T>(Tensor<T> input, Tensor<T> boxes,
+        int outputHeight, int outputWidth, int outputChannels,
+        float spatialScale, int samplingRatio)
+    {
         if (typeof(T) == typeof(float) && input.Rank == 4
             && boxes.Rank == 2 && boxes._shape[1] == 5)
         {
@@ -106,6 +136,20 @@ public partial class DirectGpuTensorEngine
     public override Tensor<T> PsRoIPool<T>(Tensor<T> input, Tensor<T> boxes,
         int outputHeight, int outputWidth, int outputChannels, float spatialScale)
     {
+        // Under GraphMode the CpuEngine op records the compiled node; each replay re-enters here outside
+        // graph mode and runs the GPU kernel.
+        if (Compilation.GraphMode.IsActive) return base.PsRoIPool(input, boxes, outputHeight, outputWidth, outputChannels, spatialScale);
+        var result = PsRoIPoolOnGpu(input, boxes, outputHeight, outputWidth, outputChannels, spatialScale);
+        // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
+        // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
+        if (result.GradFn is null)
+            Autodiff.DifferentiableOps.RecordBinary("PsRoIPool", result, input, boxes, Autodiff.BackwardFunctions<T>.PsRoIPoolBackward, new object[] { outputHeight, outputWidth, outputChannels, spatialScale });
+        return result;
+    }
+
+    private Tensor<T> PsRoIPoolOnGpu<T>(Tensor<T> input, Tensor<T> boxes,
+        int outputHeight, int outputWidth, int outputChannels, float spatialScale)
+    {
         if (typeof(T) == typeof(float) && input.Rank == 4
             && boxes.Rank == 2 && boxes._shape[1] == 5)
         {
@@ -135,6 +179,20 @@ public partial class DirectGpuTensorEngine
 
     /// <inheritdoc/>
     public override Tensor<T> RoIPool<T>(Tensor<T> input, Tensor<T> boxes,
+        int outputHeight, int outputWidth, float spatialScale)
+    {
+        // Under GraphMode the CpuEngine op records the compiled node; each replay re-enters here outside
+        // graph mode and runs the GPU kernel.
+        if (Compilation.GraphMode.IsActive) return base.RoIPool(input, boxes, outputHeight, outputWidth, spatialScale);
+        var result = RoIPoolOnGpu(input, boxes, outputHeight, outputWidth, spatialScale);
+        // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
+        // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
+        if (result.GradFn is null)
+            Autodiff.DifferentiableOps.RecordBinary("RoIPool", result, input, boxes, Autodiff.BackwardFunctions<T>.RoIPoolBackward, new object[] { outputHeight, outputWidth, spatialScale });
+        return result;
+    }
+
+    private Tensor<T> RoIPoolOnGpu<T>(Tensor<T> input, Tensor<T> boxes,
         int outputHeight, int outputWidth, float spatialScale)
     {
         if (typeof(T) == typeof(float)

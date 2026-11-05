@@ -4042,6 +4042,19 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorUnfold<T>(Tensor<T> tensor, int dim, int size, int step)
     {
+        // Under GraphMode the CpuEngine op records the compiled node; each replay re-enters here outside
+        // graph mode and runs the GPU kernel.
+        if (Compilation.GraphMode.IsActive) return base.TensorUnfold(tensor, dim, size, step);
+        var result = TensorUnfoldOnGpu(tensor, dim, size, step);
+        // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
+        // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
+        if (result.GradFn is null)
+            Autodiff.DifferentiableOps.RecordUnary("TensorUnfold", result, tensor, Autodiff.BackwardFunctions<T>.UnfoldParity210Backward, savedState: new object[] { dim, size, step, (int[])tensor._shape.Clone() });
+        return result;
+    }
+
+    private Tensor<T> TensorUnfoldOnGpu<T>(Tensor<T> tensor, int dim, int size, int step)
+    {
         using var __gpuOp = EnterGpuOp();
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
         if (size <= 0) throw new ArgumentOutOfRangeException(nameof(size), "size must be positive");
@@ -4169,6 +4182,8 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorCartesianProd<T>(Tensor<T>[] tensors)
     {
+        if (TryRecordCompiledOp("TensorCartesianProd", Combine(tensors), e => e.TensorCartesianProd(tensors), out var compiledNode))
+            return compiledNode;
         using var __gpuOp = EnterGpuOp();
         if (tensors is null) throw new ArgumentNullException(nameof(tensors));
         if (tensors.Length < 2 || typeof(T) != typeof(float) || !TryGetBackend(out _))
@@ -4183,28 +4198,26 @@ public partial class DirectGpuTensorEngine
             // ij-meshgrid, give each grid a trailing size-1 axis, concatenate along it, then flatten to
             // [prod, numInputs] — all GPU-resident (Meshgrid + Reshape + Concatenate).
             int m = tensors.Length;
-            var grids = TensorMeshgrid(tensors, "ij");
-            var gshape = grids[0]._shape;
-            var withOne = new int[gshape.Length + 1];
-            for (int i = 0; i < gshape.Length; i++) withOne[i] = gshape[i];
-            withOne[gshape.Length] = 1;
-            var reshaped = new Tensor<T>[m];
-            for (int k = 0; k < m; k++) reshaped[k] = grids[k].Reshape(withOne);
-            var stacked = TensorConcatenate(reshaped, gshape.Length);
-            int prod = 1; foreach (var t in tensors) prod *= t._shape[0];
-            var res = stacked.Reshape(new[] { prod, m });
-            // This record is LOAD-BEARING, not redundant, even though the GPU TensorMeshgrid above is
-            // itself built from TensorBroadcastTo(tensors[k].Reshape(rshape), ...) and so looks like it
-            // already chains back to the caller's tensors. It does not: `.Reshape` returns a VIEW that is
-            // not tape-linked to `tensors[k]` (the same GradFn-discarding behaviour the #257 notes
-            // describe for `.Contiguous`), so BroadcastToBackward accumulates into the view and the
-            // caller's input receives nothing from the composition.
-            //
-            // Verified by measurement rather than by reading, because the failure modes are adjacent and
-            // both silent: if the chain DID survive the reshape this record would double the gradient,
-            // and if it is removed the gradient disappears. CartesianProdGpuTapeParityTests pins the
-            // closed form on both engines — d(sum)/da[i] == b.Length and d(sum)/db[j] == a.Length — so
-            // either mistake fails loudly.
+            Tensor<T> res;
+            // The composition runs under NoGrad so the op owns exactly one tape edge, the record below. Whether its
+            // primitives chain back to the inputs depends on residency: a host input's Reshape is a view the tape does
+            // not link, a device-resident one's is linked. With the primitives recorded, a compiled step (whose inputs
+            // are resident) got the composition's gradient AND this edge's: twice the gradient (#1680).
+            using (GradientTape<T>.NoGrad())
+            {
+                var grids = TensorMeshgrid(tensors, "ij");
+                var gshape = grids[0]._shape;
+                var withOne = new int[gshape.Length + 1];
+                for (int i = 0; i < gshape.Length; i++) withOne[i] = gshape[i];
+                withOne[gshape.Length] = 1;
+                var reshaped = new Tensor<T>[m];
+                for (int k = 0; k < m; k++) reshaped[k] = grids[k].Reshape(withOne);
+                var stacked = TensorConcatenate(reshaped, gshape.Length);
+                int prod = 1; foreach (var t in tensors) prod *= t._shape[0];
+                res = stacked.Reshape(new[] { prod, m });
+            }
+            // CartesianProdGpuTapeParityTests pins the closed form on both engines: d(sum)/da[i] == b.Length and
+            // d(sum)/db[j] == a.Length.
             DifferentiableOps.RecordIfActive("TensorCartesianProd", res, tensors,
                 BackwardFunctions<T>.CartesianProdBackward);
             return res;
@@ -4241,6 +4254,19 @@ public partial class DirectGpuTensorEngine
 
     /// <inheritdoc/>
     public override Tensor<T> TensorMaskedSelect<T>(Tensor<T> tensor, Tensor<Bit> mask)
+    {
+        // Under GraphMode the CpuEngine op records the compiled node; each replay re-enters here outside
+        // graph mode and runs the GPU kernel.
+        if (Compilation.GraphMode.IsActive) return base.TensorMaskedSelect(tensor, mask);
+        var result = TensorMaskedSelectOnGpu(tensor, mask);
+        // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
+        // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
+        if (result.GradFn is null)
+            Autodiff.DifferentiableOps.RecordUnary("TensorMaskedSelect", result, tensor, Autodiff.BackwardFunctions<T>.MaskedSelectBackward, savedState: new object[] { mask.IsContiguous ? mask : mask.Contiguous(), (int[])tensor._shape.Clone() });
+        return result;
+    }
+
+    private Tensor<T> TensorMaskedSelectOnGpu<T>(Tensor<T> tensor, Tensor<Bit> mask)
     {
         using var __gpuOp = EnterGpuOp();
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
@@ -4813,6 +4839,19 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorTakeAlongDim<T>(Tensor<T> tensor, Tensor<int> indices, int dim)
     {
+        // Under GraphMode the CpuEngine op records the compiled node; each replay re-enters here outside
+        // graph mode and runs the GPU kernel.
+        if (Compilation.GraphMode.IsActive) return base.TensorTakeAlongDim(tensor, indices, dim);
+        var result = TensorTakeAlongDimOnGpu(tensor, indices, dim);
+        // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
+        // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
+        if (result.GradFn is null)
+            Autodiff.DifferentiableOps.RecordUnary("TensorTakeAlongDim", result, tensor, Autodiff.BackwardFunctions<T>.TakeAlongDimBackward, savedState: new object[] { indices, dim });
+        return result;
+    }
+
+    private Tensor<T> TensorTakeAlongDimOnGpu<T>(Tensor<T> tensor, Tensor<int> indices, int dim)
+    {
         using var __gpuOp = EnterGpuOp();
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
         if (indices is null) throw new ArgumentNullException(nameof(indices));
@@ -5012,6 +5051,19 @@ public partial class DirectGpuTensorEngine
 
     /// <inheritdoc/>
     public override Tensor<T> TensorKron<T>(Tensor<T> a, Tensor<T> b)
+    {
+        // Under GraphMode the CpuEngine op records the compiled node; each replay re-enters here outside
+        // graph mode and runs the GPU kernel.
+        if (Compilation.GraphMode.IsActive) return base.TensorKron(a, b);
+        var result = TensorKronOnGpu(a, b);
+        // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
+        // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
+        if (result.GradFn is null)
+            Autodiff.DifferentiableOps.RecordBinary("TensorKron", result, a, b, Autodiff.BackwardFunctions<T>.KronBackward);
+        return result;
+    }
+
+    private Tensor<T> TensorKronOnGpu<T>(Tensor<T> a, Tensor<T> b)
     {
         using var __gpuOp = EnterGpuOp();
         if (a is null) throw new ArgumentNullException(nameof(a));
@@ -6992,6 +7044,19 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorZeta<T>(Tensor<T> x, Tensor<T> q)
     {
+        // Under GraphMode the CpuEngine op records the compiled node; each replay re-enters here outside
+        // graph mode and runs the GPU kernel.
+        if (Compilation.GraphMode.IsActive) return base.TensorZeta(x, q);
+        var result = TensorZetaOnGpu(x, q);
+        // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
+        // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
+        if (result.GradFn is null)
+            Autodiff.DifferentiableOps.RecordBinary("TensorZeta", result, x, q, Autodiff.BackwardFunctions<T>.ZetaBackward);
+        return result;
+    }
+
+    private Tensor<T> TensorZetaOnGpu<T>(Tensor<T> x, Tensor<T> q)
+    {
         using var __gpuOp = EnterGpuOp();
         if (x is null) throw new ArgumentNullException(nameof(x));
         if (q is null) throw new ArgumentNullException(nameof(q));
@@ -7014,6 +7079,19 @@ public partial class DirectGpuTensorEngine
 
     /// <inheritdoc/>
     public override Tensor<T> TensorPolygamma<T>(int n, Tensor<T> tensor)
+    {
+        // Under GraphMode the CpuEngine op records the compiled node; each replay re-enters here outside
+        // graph mode and runs the GPU kernel.
+        if (Compilation.GraphMode.IsActive) return base.TensorPolygamma(n, tensor);
+        var result = TensorPolygammaOnGpu(n, tensor);
+        // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
+        // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
+        if (result.GradFn is null)
+            Autodiff.DifferentiableOps.RecordUnary("TensorPolygamma", result, tensor, Autodiff.BackwardFunctions<T>.PolygammaBackward, savedState: new object[] { n });
+        return result;
+    }
+
+    private Tensor<T> TensorPolygammaOnGpu<T>(int n, Tensor<T> tensor)
     {
         using var __gpuOp = EnterGpuOp();
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
@@ -7160,6 +7238,19 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorCross<T>(Tensor<T> a, Tensor<T> b, int dim = -1)
     {
+        // Under GraphMode the CpuEngine op records the compiled node; each replay re-enters here outside
+        // graph mode and runs the GPU kernel.
+        if (Compilation.GraphMode.IsActive) return base.TensorCross(a, b, dim);
+        var result = TensorCrossOnGpu(a, b, dim);
+        // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
+        // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
+        if (result.GradFn is null)
+            Autodiff.DifferentiableOps.RecordBinary("TensorCross", result, a, b, Autodiff.BackwardFunctions<T>.CrossBackward, savedState: new object[] { dim });
+        return result;
+    }
+
+    private Tensor<T> TensorCrossOnGpu<T>(Tensor<T> a, Tensor<T> b, int dim = -1)
+    {
         using var __gpuOp = EnterGpuOp();
         if (a is null) throw new ArgumentNullException(nameof(a));
         if (b is null) throw new ArgumentNullException(nameof(b));
@@ -7236,6 +7327,19 @@ public partial class DirectGpuTensorEngine
 
     /// <inheritdoc/>
     public override Tensor<T> TensorLdexp<T>(Tensor<T> x, Tensor<int> exp)
+    {
+        // Under GraphMode the CpuEngine op records the compiled node; each replay re-enters here outside
+        // graph mode and runs the GPU kernel.
+        if (Compilation.GraphMode.IsActive) return base.TensorLdexp(x, exp);
+        var result = TensorLdexpOnGpu(x, exp);
+        // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
+        // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
+        if (result.GradFn is null)
+            Autodiff.DifferentiableOps.RecordUnary("TensorLdexp", result, x, Autodiff.BackwardFunctions<T>.LdexpBackward, new object[] { exp });
+        return result;
+    }
+
+    private Tensor<T> TensorLdexpOnGpu<T>(Tensor<T> x, Tensor<int> exp)
     {
         using var __gpuOp = EnterGpuOp();
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
