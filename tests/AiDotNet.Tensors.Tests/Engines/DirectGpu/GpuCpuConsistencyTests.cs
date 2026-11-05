@@ -257,13 +257,13 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         var host = sizes.Select((n, t) => Enumerable.Range(0, n).Select(i => DeterministicValue(t * 1_000_003 + i)).ToArray()).ToArray();
         double exact = host.Sum(a => a.Sum(v => (double)v * v));
         var buffers = host.Select(a => cuda!.AllocateBuffer(a)).ToList();
-        var sumSq = cuda!.AllocateBuffer(2);
+        var sumSq = cuda!.AllocateBuffer(AiDotNet.Tensors.Engines.Gpu.DeterministicGradientNorm.RecordWords);
         var scale = cuda.AllocateBuffer(1);
         try
         {
             double Read() => BitConverter.ToDouble(cuda.DownloadByteBuffer(sumSq, sizeof(double)), 0);
 
-            cuda.MultiTensorSumOfSquares(buffers, sizes, sumSq);
+            ((IMultiTensorKernels)cuda).MultiTensorSumOfSquares(buffers, sizes, sumSq);
             // Each float4's four squares are summed in float before the double accumulation (FP64 is 1/64 rate on
             // consumer GPUs), so the sum carries float rounding: ~1e-7 relative, far inside what a clip norm needs.
             Assert.True(Math.Abs(Read() - exact) <= 1e-6 * exact, $"sum of squares {Read()} vs exact {exact}");
@@ -286,13 +286,13 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
             // buffer for tensor 0, which has one element; the cached pointer table must notice the new handle.)
             buffers[0].Dispose();
             buffers[0] = cuda.AllocateBuffer(new[] { 3e30f });
-            cuda.MultiTensorSumOfSquares(buffers, sizes, sumSq);
+            ((IMultiTensorKernels)cuda).MultiTensorSumOfSquares(buffers, sizes, sumSq);
             Assert.False(double.IsInfinity(Read()) || double.IsNaN(Read()), "a finite gradient read as non-finite");
 
             // One NaN anywhere makes the whole sum non-finite.
             buffers[0].Dispose();
             buffers[0] = cuda.AllocateBuffer(new[] { float.NaN });
-            cuda.MultiTensorSumOfSquares(buffers, sizes, sumSq);
+            ((IMultiTensorKernels)cuda).MultiTensorSumOfSquares(buffers, sizes, sumSq);
             Assert.True(double.IsNaN(Read()) || double.IsInfinity(Read()), "a NaN gradient read as finite");
 
             // The same two cases inside a float4 of an aligned tensor (tensor 4, 4096 elements), where the squares are
@@ -303,7 +303,7 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
             bigInVector[1001] = 3e30f;
             buffers[4].Dispose();
             buffers[4] = cuda.AllocateBuffer(bigInVector);
-            cuda.MultiTensorSumOfSquares(buffers, sizes, sumSq);
+            ((IMultiTensorKernels)cuda).MultiTensorSumOfSquares(buffers, sizes, sumSq);
             double expectedBig = exact - (double)host[0][0] * host[0][0] + 0.25
                                  - (double)host[4][1001] * host[4][1001] + 9e60;
             Assert.True(Math.Abs(Read() - expectedBig) <= 1e-6 * expectedBig,
@@ -312,7 +312,7 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
             nanInVector[2050] = float.NaN;
             buffers[4].Dispose();
             buffers[4] = cuda.AllocateBuffer(nanInVector);
-            cuda.MultiTensorSumOfSquares(buffers, sizes, sumSq);
+            ((IMultiTensorKernels)cuda).MultiTensorSumOfSquares(buffers, sizes, sumSq);
             Assert.True(double.IsNaN(Read()) || double.IsInfinity(Read()), "a NaN inside a float4 read as finite");
         }
         finally
@@ -339,11 +339,11 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         var host = sizes.Select((n, t) => Enumerable.Range(0, n).Select(i => DeterministicValue(t * 7_000_003 + i)).ToArray()).ToArray();
         double exact = host.Sum(a => a.Sum(v => (double)v * v));
         var buffers = host.Select(a => cuda!.AllocateBuffer(a)).ToList();
-        var sumSq = cuda!.AllocateBuffer(2);
+        var sumSq = cuda!.AllocateBuffer(AiDotNet.Tensors.Engines.Gpu.DeterministicGradientNorm.RecordWords);
         var scale = cuda.AllocateBuffer(1);
         try
         {
-            cuda.MultiTensorSumOfSquares(buffers, sizes, sumSq);
+            ((IMultiTensorKernels)cuda).MultiTensorSumOfSquares(buffers, sizes, sumSq);
             double got = BitConverter.ToDouble(cuda.DownloadByteBuffer(sumSq, sizeof(double)), 0);
             Assert.True(Math.Abs(got - exact) <= 1e-9 * exact, $"sum of squares {got} vs exact {exact}");
 
