@@ -19,6 +19,12 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     protected readonly IDirectGpuBackend Inner;
 
     /// <summary>
+    /// The wrapped backend, for engine caches that must key and release device buffers on the physical backend rather
+    /// than on a short-lived wrapper such as a <see cref="DeferredScope"/>'s recording backend.
+    /// </summary>
+    internal IDirectGpuBackend InnerBackend => Inner;
+
+    /// <summary>
     /// Creates a new delegating backend wrapper.
     /// </summary>
     /// <param name="inner">The backend to delegate to.</param>
