@@ -43,6 +43,7 @@ internal static class VulkanTunedProfileExperiment
         }
         TunedKernelPolicy.ModeOverride = TunedKernelMode.Tune;
         TunedKernelPolicy.PersistDecisions = false;
+        TunedKernelPolicy.IgnoreProfiles = true;   // measure the shapes a shipped profile covers, too
         TunedKernelPolicy.BudgetMilliseconds = double.MaxValue;
         Console.WriteLine($"device {backend.TunedDeviceKey}; clock {(backend.TunedKernelTimingUsesDeviceClock ? "device timestamps" : "host")}; rounds {rounds}");
 

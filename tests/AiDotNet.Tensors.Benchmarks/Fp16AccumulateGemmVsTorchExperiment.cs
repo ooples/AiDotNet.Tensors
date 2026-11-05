@@ -37,6 +37,12 @@ internal static class Fp16AccumulateGemmVsTorchExperiment
     public static void Run(string[] args)
     {
         int rounds = args.Length > 0 ? int.Parse(args[0], CultureInfo.InvariantCulture) : 7;
+        if (rounds < 1)
+        {
+            Console.WriteLine($"rounds must be at least 1 (got {rounds}).");
+            Environment.ExitCode = 1;
+            return;
+        }
         if (!torch.cuda.is_available())
         {
             Console.WriteLine("TorchSharp has no CUDA device.");
@@ -50,9 +56,18 @@ internal static class Fp16AccumulateGemmVsTorchExperiment
             Environment.ExitCode = 1;
             return;
         }
-        var rate = backend.MeasureTensorCoreAccumulateRates();
-        Console.WriteLine($"device {backend.DeviceName}; torch {torch.__version__}; tensor-core rate FP32-acc " +
-                          $"{rate.Fp32AccumulateTflops:F1} / FP16-acc {rate.Fp16AccumulateTflops:F1} TFLOP/s; rounds {rounds}");
+        // The rate probe needs compute capability 8.0+; an older card still runs the comparison (on cuBLAS).
+        string rateText;
+        try
+        {
+            var rate = backend.MeasureTensorCoreAccumulateRates();
+            rateText = $"FP32-acc {rate.Fp32AccumulateTflops:F1} / FP16-acc {rate.Fp16AccumulateTflops:F1} TFLOP/s";
+        }
+        catch (Exception ex) when (ex is NotSupportedException or InvalidOperationException)
+        {
+            rateText = $"not measured ({ex.GetType().Name}: {ex.Message})";
+        }
+        Console.WriteLine($"device {backend.DeviceName}; torch {torch.__version__}; tensor-core rate {rateText}; rounds {rounds}");
         Console.WriteLine();
         Console.WriteLine("| model | M×N×K | route | Tensors ms | PyTorch ms | Tensors TFLOP/s | PyTorch TFLOP/s | ratio (T/P) | Tensors rel err | PyTorch rel err |");
         Console.WriteLine("|---|---|---|---|---|---|---|---|---|---|");
