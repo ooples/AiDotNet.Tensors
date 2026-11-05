@@ -67,6 +67,47 @@ public class StreamingRestoreBufferRecyclingTests
         try { if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true); } catch (IOException) { }
     }
 
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static WeakReference PoolAndDrop(int length)
+    {
+        var array = StreamingRestoreBuffers<float>.Rent(length, out _);
+        StreamingRestoreBuffers<float>.Park(array);
+        return new WeakReference(array);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void CollectedPoolEntries_DoNotRejectASmallerReturn(bool activeTape)
+    {
+        const int largerLength = 32, smallerLength = 16;
+        string dir = Configure(largerLength * sizeof(float));
+        try
+        {
+            AssertNoTapeIsOpen();
+            StreamingRestoreBuffers<float>.Clear();
+            var weak = PoolAndDrop(largerLength);
+            for (int i = 0; i < 5 && weak.IsAlive; i++)
+            {
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+            }
+            Assert.False(weak.IsAlive);
+            Assert.Equal(largerLength * sizeof(float), StreamingRestoreBuffers<float>.PooledBytes);
+
+            var smaller = StreamingRestoreBuffers<float>.Rent(smallerLength, out _);
+            using (activeTape ? new GradientTape<float>() : null)
+            {
+                StreamingRestoreBuffers<float>.Park(smaller);
+                Assert.Equal(smallerLength * sizeof(float), activeTape
+                    ? StreamingRestoreBuffers<float>.ParkedBytes : StreamingRestoreBuffers<float>.PooledBytes);
+            }
+            Assert.Same(smaller, StreamingRestoreBuffers<float>.Rent(smallerLength, out bool recycled));
+            Assert.True(recycled);
+        }
+        finally { Cleanup(dir); }
+    }
+
     /// <summary>
     /// Several training-like steps, each inside a tape: materialize every weight, update it, let the owner budget
     /// shed the cold ones. From the second step on, restores are served from recycled arrays, and every weight still

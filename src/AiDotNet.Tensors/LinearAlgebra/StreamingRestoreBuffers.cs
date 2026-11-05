@@ -117,7 +117,13 @@ internal static class StreamingRestoreBuffers<T>
         {
             // Parked arrays stay reachable until the step boundary, so they count against the same cap as the
             // pooled ones: together they are the memory recycling holds back from the garbage collector.
-            if (s_parkedBytes + s_pooledBytes + bytes > cap) return;
+            if (s_parkedBytes + s_pooledBytes + bytes > cap)
+            {
+                // A full collection can reclaim weakly pooled arrays between parks. Prune before rejecting
+                // this candidate, without scanning the pool on every return that already fits.
+                PruneCollected();
+                if (s_parkedBytes + s_pooledBytes + bytes > cap) return;
+            }
             s_parked.Add(new WeakReference<T[]>(array));
             s_parkedBytes += bytes;
         }
