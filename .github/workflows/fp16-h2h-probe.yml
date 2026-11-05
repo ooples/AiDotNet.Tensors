@@ -1,0 +1,46 @@
+name: FP16 GEMM vs PyTorch (experiment)
+
+on:
+  push:
+    branches: [experiment/fp16-acc-vs-torch]
+
+jobs:
+  h2h:
+    runs-on: [self-hosted, gpu, cuda, sm86]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          dotnet-version: '10.0.x'
+      - name: Recheck the PR's three CUDA-lane failures (5 rounds)
+        if: always()
+        shell: pwsh
+        run: |
+          dotnet build tests/AiDotNet.Tensors.Tests -c Release -f net10.0 -p:EnablePackageValidation=false
+          $fails = 0
+          foreach ($i in 1..5) {
+            dotnet test tests/AiDotNet.Tensors.Tests -c Release -f net10.0 --no-build `
+              --filter "FullyQualifiedName~DeclaredProgramRouteTests|FullyQualifiedName~AsyncGpuBackendParityTests" 2>&1 |
+              Tee-Object -Append -FilePath recheck.log | Select-String 'Passed!|Failed!|\[FAIL\]'
+            if ($LASTEXITCODE -ne 0) { $fails++ }
+          }
+          "recheck rounds failed: $fails of 5" | Tee-Object -Append -FilePath recheck.log
+      - name: Head-to-head
+        if: always()
+        shell: pwsh
+        run: |
+          nvidia-smi --query-gpu=name,driver_version,clocks.max.sm,power.limit --format=csv
+          dotnet run --project tests/AiDotNet.Tensors.Benchmarks -c Release -- --fp16-accumulate-vs-torch 7 2>&1 |
+            Tee-Object -FilePath h2h.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-Content h2h.log | Select-String '^\||geometric|device' | Out-File -Append $env:GITHUB_STEP_SUMMARY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: fp16-h2h
+          path: |
+            h2h.log
+            recheck.log
