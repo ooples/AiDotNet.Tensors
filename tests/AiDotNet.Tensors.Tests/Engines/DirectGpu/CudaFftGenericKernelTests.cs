@@ -549,6 +549,103 @@ public class CudaFftGenericKernelTests
             "CUDA FftGeneric must keep the active tape connected to its input.");
     }
 
+    [Theory]
+    [InlineData(FftElementType.Float32)]
+    [InlineData(FftElementType.Float16)]
+    [InlineData(FftElementType.BFloat16)]
+    public async Task BatchedKernelsGridStrideOverBatchAxisPast65535(FftElementType type)
+    {
+        await Task.Yield();
+        string source = CudaFFTGenericKernels.GetSource(type);
+        int loopCount = 0;
+        int searchFrom = 0;
+        const string needle = "for (int b = blockIdx.y; b < batch; b += gridDim.y)";
+        while ((searchFrom = source.IndexOf(needle, searchFrom, StringComparison.Ordinal)) >= 0)
+        {
+            loopCount++;
+            searchFrom += needle.Length;
+        }
+
+        // 3 shared float32 batched kernels + 4 typed batched kernels = 7 grid-stride loops per module.
+        Assert.Equal(7, loopCount);
+        Assert.DoesNotContain("\n    int b = blockIdx.y;", source);
+    }
+
+    [SkippableTheory]
+    [InlineData(FftElementType.Float32, 8)] // Radix-2 past MaxGridDimY (65,535)
+    [InlineData(FftElementType.Float16, 8)] // Narrow-storage Radix-2 past MaxGridDimY
+    [InlineData(FftElementType.Float32, 5)] // Bluestein past MaxGridDimY
+    public async Task CudaExecutionSupportsBatchesPast65535GridLimit(
+        FftElementType type,
+        int n)
+    {
+        await Task.Yield();
+        Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver not available.");
+        using var backend = new CudaBackend();
+        Skip.IfNot(backend.IsAvailable, "CUDA backend failed to initialize.");
+        Skip.IfNot(backend.SupportsFftElementType(type), $"CUDA {type} FFT storage is unavailable.");
+
+        const int batch = 65_536; // MaxGridDimY (65,535) + 1: blockIdx.y == 0 must stride onto b == 65,535
+        int count = batch * n;
+        var rng = new Random(9001 + n + (int)type);
+        float[] sourceReal = new float[count];
+        float[] sourceImaginary = new float[count];
+        for (int i = 0; i < count; i++)
+        {
+            sourceReal[i] = (float)(rng.NextDouble() * 2.0 - 1.0);
+            sourceImaginary[i] = (float)(rng.NextDouble() * 2.0 - 1.0);
+        }
+
+        IGpuBuffer real = type == FftElementType.Float32
+            ? backend.AllocateBuffer(sourceReal)
+            : backend.AllocateByteBuffer(checked(count * type.ByteSize()));
+        IGpuBuffer imaginary = type == FftElementType.Float32
+            ? backend.AllocateBuffer(sourceImaginary)
+            : backend.AllocateByteBuffer(checked(count * type.ByteSize()));
+        using (real)
+        using (imaginary)
+        {
+            if (type != FftElementType.Float32)
+            {
+                using IGpuBuffer sourceRealBuffer = backend.AllocateBuffer(sourceReal);
+                using IGpuBuffer sourceImaginaryBuffer = backend.AllocateBuffer(sourceImaginary);
+                backend.ConvertFloatToFftStorage(sourceRealBuffer, real, count, type);
+                backend.ConvertFloatToFftStorage(sourceImaginaryBuffer, imaginary, count, type);
+            }
+
+            Complex[] quantizedInput = DownloadComplex(backend, real, imaginary, count, type);
+            backend.LaunchFftGeneric(real, imaginary, batch, n, inverse: false, type);
+            Complex[] actualForward = DownloadComplex(backend, real, imaginary, count, type);
+
+            double tolerance = type switch
+            {
+                FftElementType.Float32 => 2e-5,
+                FftElementType.Float16 => 3e-2,
+                FftElementType.BFloat16 => 8e-2,
+                _ => throw new ArgumentOutOfRangeException(nameof(type)),
+            };
+
+            // Verify boundary rows explicitly, especially row 65,535 (past CUDA's 65,535 gridDim.y limit).
+            int[] probeRows = { 0, 1, 32_767, 32_768, 65_534, 65_535 };
+            foreach (int rowIdx in probeRows)
+            {
+                var inRow = new Complex[n];
+                var gotRow = new Complex[n];
+                Array.Copy(quantizedInput, rowIdx * n, inRow, 0, n);
+                Array.Copy(actualForward, rowIdx * n, gotRow, 0, n);
+                Complex[] expectedRow = Dft(inRow, inverse: false);
+                double err = RelErr(gotRow, expectedRow);
+                Assert.True(err < tolerance, $"{type} forward n={n} row={rowIdx}: rel-err {err:E3}");
+            }
+
+            backend.LaunchFftGeneric(real, imaginary, batch, n, inverse: true, type);
+            Complex[] roundTrip = DownloadComplex(backend, real, imaginary, count, type);
+            Assert.True(
+                RelErr(roundTrip, quantizedInput) < tolerance,
+                $"{type} round-trip batch={batch} n={n}: rel-err {RelErr(roundTrip, quantizedInput):E3}");
+        }
+    }
+
     private static Complex[] DownloadComplex(
         CudaBackend backend,
         IGpuBuffer real,
