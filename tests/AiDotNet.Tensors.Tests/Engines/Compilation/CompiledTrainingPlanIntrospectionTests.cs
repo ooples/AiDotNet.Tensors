@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Linq;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -53,6 +55,63 @@ public class CompiledTrainingPlanIntrospectionTests
         target.ImportOptimizerState(state);
 
         Assert.Equal(4, Assert.IsAssignableFrom<ICompiledTrainingPlanIntrospection<float>>(target).OptimizerStep);
+    }
+
+    [Fact]
+    public void StreamedOptimizerState_IsTheArrayPayload_AndImportsLikeIt()
+    {
+        var sourceWeight = Tensor<float>.CreateRandom([3, 2]);
+        using var source = Compile(sourceWeight);
+        source.ConfigureOptimizer(OptimizerType.Adam, 1e-3f);
+        for (int i = 0; i < 4; i++) source.Step();
+        byte[] state = source.ExportOptimizerState() ?? throw new InvalidOperationException("Adam plan exported no state.");
+
+        // Written after a prefix and followed by a suffix: the stream overloads must neither assume position 0 nor
+        // read past their own payload, since a checkpoint file holds other sections around it.
+        using var file = new MemoryStream();
+        file.WriteByte(0x5A);
+        var streamed = Assert.IsAssignableFrom<ICompiledTrainingPlanStreamedState>(source);
+        Assert.True(streamed.ExportOptimizerState(file));
+        long end = file.Position;
+        file.WriteByte(0xA5);
+        Assert.Equal(state, file.ToArray().Skip(1).Take(state.Length).ToArray());
+        Assert.Equal(1 + state.Length, end);
+
+        var targetWeight = Tensor<float>.CreateRandom([3, 2]);
+        using var target = Compile(targetWeight);
+        target.ConfigureOptimizer(OptimizerType.Adam, 1e-3f);
+        file.Position = 1;
+        Assert.IsAssignableFrom<ICompiledTrainingPlanStreamedState>(target).ImportOptimizerState(file);
+        Assert.Equal(end, file.Position);
+        Assert.Equal(0xA5, file.ReadByte());
+
+        Assert.Equal(state, target.ExportOptimizerState());
+        Assert.Equal(4, Assert.IsAssignableFrom<ICompiledTrainingPlanIntrospection<float>>(target).OptimizerStep);
+    }
+
+    [Fact]
+    public void StreamedOptimizerState_WithNoOptimizer_WritesNothing_AndATruncatedStreamChangesNothing()
+    {
+        var weight = Tensor<float>.CreateRandom([3, 2]);
+        using var plain = Compile(weight);
+        using var empty = new MemoryStream();
+        Assert.False(Assert.IsAssignableFrom<ICompiledTrainingPlanStreamedState>(plain).ExportOptimizerState(empty));
+        Assert.Equal(0, empty.Length);
+
+        var sourceWeight = Tensor<float>.CreateRandom([3, 2]);
+        using var source = Compile(sourceWeight);
+        source.ConfigureOptimizer(OptimizerType.Adam, 1e-3f);
+        for (int i = 0; i < 3; i++) source.Step();
+        byte[] state = source.ExportOptimizerState()!;
+
+        var targetWeight = Tensor<float>.CreateRandom([3, 2]);
+        using var target = Compile(targetWeight);
+        target.ConfigureOptimizer(OptimizerType.Adam, 1e-3f);
+        target.Step();
+        byte[] before = target.ExportOptimizerState()!;
+        using var truncated = new MemoryStream(state, 0, state.Length / 2, writable: false);
+        Assert.Throws<InvalidDataException>(() => Assert.IsAssignableFrom<ICompiledTrainingPlanStreamedState>(target).ImportOptimizerState(truncated));
+        Assert.Equal(before, target.ExportOptimizerState());
     }
 
     [Fact]

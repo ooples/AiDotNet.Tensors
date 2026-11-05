@@ -6,3 +6,6 @@ static AiDotNet.Tensors.Interop.DLPackStream.FromHandle(System.IntPtr streamHand
 static AiDotNet.Tensors.LinearAlgebra.Tensor<T>.FromDLPack(System.IntPtr managedTensorVersioned) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
 static AiDotNet.Tensors.LinearAlgebra.Tensor<T>.FromDLPackLegacy(System.IntPtr managedTensor) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
 static extern AiDotNet.Tensors.Engines.CuBlasNative.cuMemPoolGetAttribute(System.IntPtr pool, int attr, out ulong value) -> AiDotNet.Tensors.Engines.CudaResult
+AiDotNet.Tensors.Engines.Compilation.ICompiledTrainingPlanStreamedState
+AiDotNet.Tensors.Engines.Compilation.ICompiledTrainingPlanStreamedState.ExportOptimizerState(System.IO.Stream! destination) -> bool
+AiDotNet.Tensors.Engines.Compilation.ICompiledTrainingPlanStreamedState.ImportOptimizerState(System.IO.Stream! source) -> void
