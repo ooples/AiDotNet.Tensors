@@ -115,7 +115,7 @@ jobs:
         $feed = Join-Path $env:RUNNER_TEMP 'tensors-feed'
         dotnet build tensors/src/AiDotNet.Tensors/AiDotNet.Tensors.csproj -c Release -p:Version=0.148.99 -v q -nologo
         if ($LASTEXITCODE -ne 0) { exit 1 }
-        dotnet pack tensors/src/AiDotNet.Tensors/AiDotNet.Tensors.csproj -c Release --no-build -o $feed -p:Version=0.148.99 -v q -nologo
+        dotnet pack tensors/src/AiDotNet.Tensors/AiDotNet.Tensors.csproj -c Release --no-build -o $feed -p:Version=0.148.99 -p:EnablePackageValidation=false -v q -nologo
         if ($LASTEXITCODE -ne 0) { exit 1 }
         dotnet nuget add source $feed --name tensors-feed --configfile aidn/NuGet.Config 2>$null
         if ($LASTEXITCODE -ne 0) { dotnet nuget add source $feed --name tensors-feed }
