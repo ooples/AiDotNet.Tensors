@@ -22184,7 +22184,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <see cref="BilinearGradientNHWC{T}"/> with NCHW plane indexing.</summary>
     private static (T gradH, T gradW) BilinearGradientNCHW<T>(T[] data, int plane, int height, int width, double h, double w, INumericOperations<T> numOps)
     {
-        if (h <= -1 || h >= height || w <= -1 || w >= width) return (numOps.Zero, numOps.Zero);
+        // Strictly below -1: at exactly -1 the far tap is in the image and PyTorch's grid gradient is one-sided.
+        if (h < -1 || h >= height || w < -1 || w >= width) return (numOps.Zero, numOps.Zero);
         int h0 = (int)Math.Floor(h), h1 = h0 + 1, w0 = (int)Math.Floor(w), w1 = w0 + 1;
         double lh = h - h0, lw = w - w0;
         T v00 = GetPixelValueNCHW(data, plane, height, width, h0, w0, numOps);

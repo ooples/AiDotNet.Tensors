@@ -185,26 +185,7 @@ layout(push_constant) uniform P {
     int outH; int outW;
     int mode; int padding; int alignCorners;
 };
-" + Helpers + @"
-int grid_reflect(int i, int extent) {
-    // PyTorch's convention: about the corner pixels' centres with alignCorners, about the image edges without.
-    if (alignCorners != 0) return reflect_index(i, extent);
-    int period = 2 * extent;
-    int j = i < 0 ? -1 - i : i;
-    int r = j % period;
-    return r < extent ? r : period - 1 - r;
-}
-float sample_safe(int n, int y, int x, int c) {
-    if (padding == 0) {
-        if (uint(y) >= uint(H) || uint(x) >= uint(W)) return 0.0;
-    } else if (padding == 1) {
-        y = clamp_i(y, 0, H - 1); x = clamp_i(x, 0, W - 1);
-    } else {
-        y = grid_reflect(y, H); x = grid_reflect(x, W);
-    }
-    return input_[((n * C + c) * H + y) * W + x];
-}
-
+" + Helpers + GridSampleTaps + @"
 void main() {
     int gid = int(gl_GlobalInvocationID.x);
     int total = N * outH * outW;
@@ -223,51 +204,29 @@ void main() {
         return;
     }
 
-    if (mode == 1) {
-        int nx = int(roundEven(sx)), ny = int(roundEven(sy));
-        for (int c = 0; c < C; c++)
-            output_[((n * C + c) * outH + oy) * outW + ox] = sample_safe(n, ny, nx, c);
-    } else if (mode == 0) {
-        int x0 = int(floor(sx)), y0 = int(floor(sy));
-        int x1 = x0 + 1, y1 = y0 + 1;
-        float fx = sx - x0, fy = sy - y0;
-        for (int c = 0; c < C; c++) {
-            float v00 = sample_safe(n, y0, x0, c);
-            float v01 = sample_safe(n, y0, x1, c);
-            float v10 = sample_safe(n, y1, x0, c);
-            float v11 = sample_safe(n, y1, x1, c);
-            output_[((n * C + c) * outH + oy) * outW + ox] =
-                v00 * (1.0 - fx) * (1.0 - fy) + v01 * fx * (1.0 - fy)
-              + v10 * (1.0 - fx) * fy + v11 * fx * fy;
+    // The backward's taps, so the forward and its derivative read the same pixels with the same weights.
+    int tx[4]; int ty[4]; float wx[4]; float wy[4]; float dwx[4]; float dwy[4];
+    int taps = grid_sample_taps(gOff, tx, ty, wx, wy, dwx, dwy);
+    for (int c = 0; c < C; c++) {
+        int plane = (n * C + c) * H;
+        float acc = 0.0;
+        for (int j = 0; j < taps; j++) {
+            if (ty[j] < 0) continue;
+            int row = (plane + ty[j]) * W;
+            float rowAcc = 0.0;
+            for (int i = 0; i < taps; i++)
+                if (tx[i] >= 0) rowAcc += wx[i] * input_[row + tx[i]];
+            acc += wy[j] * rowAcc;
         }
-    } else {
-        int x0 = int(floor(sx)), y0 = int(floor(sy));
-        float fx = sx - x0, fy = sy - y0;
-        float wy[4] = float[](cubic_kernel(1.0 + fy, -0.75), cubic_kernel(fy, -0.75),
-                               cubic_kernel(1.0 - fy, -0.75), cubic_kernel(2.0 - fy, -0.75));
-        float wx[4] = float[](cubic_kernel(1.0 + fx, -0.75), cubic_kernel(fx, -0.75),
-                               cubic_kernel(1.0 - fx, -0.75), cubic_kernel(2.0 - fx, -0.75));
-        for (int c = 0; c < C; c++) {
-            float acc = 0.0;
-            for (int yy = 0; yy < 4; yy++) {
-                int yi = y0 - 1 + yy;
-                float rowAcc = 0.0;
-                for (int xx = 0; xx < 4; xx++) {
-                    int xi = x0 - 1 + xx;
-                    rowAcc += wx[xx] * sample_safe(n, yi, xi, c);
-                }
-                acc += wy[yy] * rowAcc;
-            }
-            output_[((n * C + c) * outH + oy) * outW + ox] = acc;
-        }
+        output_[((n * C + c) * outH + oy) * outW + ox] = acc;
     }
 }
 ";
 
     // -----------------------------------------------------------------------
-    // GridSample 2D backward, every mode and padding (#1680): the exact derivative of GridSample2D. The taps
-    // and weights are the forward's; padding maps each tap to the pixel the forward read, or -1 where it read
-    // the zero padding, so it never moves a weight. One invocation per sampling point, looping C.
+    // GridSample 2D forward and backward, every mode and padding (#1680), with PyTorch's grid_sampler_2d
+    // padding rules. One tap helper gives each point's pixels, weights and weight derivatives; the forward sums
+    // over them and the backward differentiates the same sum. One thread per sampling point, looping C.
     // -----------------------------------------------------------------------
 
     private const string GridSampleBackwardPush = @"
@@ -279,18 +238,42 @@ layout(push_constant) uniform P {
 ";
 
     private const string GridSampleTaps = @"
-int grid_reflect(int i, int extent) {
-    // PyTorch's convention: about the corner pixels' centres with alignCorners, about the image edges without.
+// PyTorch's grid_sampler_compute_source_index for Border (1) and Reflection (2), with slope = d(result)/d(s):
+// Reflection reflects about -0.5 and S-0.5 (0 and S-1 with alignCorners), then both clip to [0, S-1]. A clipped
+// coordinate has slope 0. Bilinear and Nearest pad the coordinate this way; Bicubic pads each tap instead.
+float grid_sample_pad_coord(float s, int size, out float slope) {
+    slope = 1.0;
+    if (padding == 0) return s;
+    if (padding == 2) {
+        if (size == 1 && alignCorners != 0) { slope = 0.0; return 0.0; }
+        float twiceLow = alignCorners != 0 ? 0.0 : -1.0;
+        float twiceHigh = alignCorners != 0 ? 2.0 * float(size - 1) : 2.0 * float(size) - 1.0;
+        float mn = twiceLow * 0.5, span = (twiceHigh - twiceLow) * 0.5;
+        float x = s - mn;
+        if (x < 0.0) { slope = -1.0; x = -x; }
+        float flips = floor(x / span);
+        float extra = x - flips * span;
+        if (mod(flips, 2.0) == 0.0) s = extra + mn;
+        else { s = span - extra + mn; slope = -slope; }
+    }
+    if (s <= 0.0) { slope = 0.0; return 0.0; }
+    if (s >= float(size - 1)) { slope = 0.0; return float(size - 1); }
+    return s;
+}
+
+int grid_sample_in_bounds(int i, int extent) {
+    return uint(i) < uint(extent) ? i : -1;
+}
+
+// Bicubic's padded tap (PyTorch's compute_coordinates on an integer tap): without alignCorners Reflection
+// mirrors about -0.5 and S-0.5, repeating the edge pixel (period 2S); with it, about 0 and S-1.
+int grid_sample_bicubic_tap(int i, int extent) {
+    if (padding == 0) return grid_sample_in_bounds(i, extent);
+    if (padding == 1) return clamp_i(i, 0, extent - 1);
     if (alignCorners != 0) return reflect_index(i, extent);
     int period = 2 * extent;
-    int j = i < 0 ? -1 - i : i;
-    int r = j % period;
+    int r = ((i % period) + period) % period;
     return r < extent ? r : period - 1 - r;
-}
-int grid_sample_tap(int i, int extent) {
-    if (padding == 0) return uint(i) < uint(extent) ? i : -1;
-    if (padding == 1) return clamp_i(i, 0, extent - 1);
-    return grid_reflect(i, extent);
 }
 
 // dK/dd of cubic_kernel for d >= 0, which every offset the taps use is.
@@ -310,23 +293,29 @@ int grid_sample_taps(int gOff, out int tx[4], out int ty[4], out float wx[4], ou
     float sx = alignCorners != 0 ? (gx + 1.0) * 0.5 * (W - 1) : ((gx + 1.0) * W - 1.0) * 0.5;
     float sy = alignCorners != 0 ? (gy + 1.0) * 0.5 * (H - 1) : ((gy + 1.0) * H - 1.0) * 0.5;
     if ((floatBitsToUint(sx) & 0x7FFFFFFFu) >= 0x4EFFFFFFu || (floatBitsToUint(sy) & 0x7FFFFFFFu) >= 0x4EFFFFFFu) return 0;
-    if (mode == 1) {
-        tx[0] = grid_sample_tap(int(roundEven(sx)), W);
-        ty[0] = grid_sample_tap(int(roundEven(sy)), H);
-        wx[0] = 1.0; wy[0] = 1.0;
-        return 1;
-    }
-    int x0 = int(floor(sx)), y0 = int(floor(sy));
-    float fx = sx - x0, fy = sy - y0;
-    if (mode == 0) {
-        wx[0] = 1.0 - fx; wx[1] = fx; dwx[0] = -1.0; dwx[1] = 1.0;
-        wy[0] = 1.0 - fy; wy[1] = fy; dwy[0] = -1.0; dwy[1] = 1.0;
+    if (mode != 2) {
+        float slx, sly;
+        float px = grid_sample_pad_coord(sx, W, slx);
+        float py = grid_sample_pad_coord(sy, H, sly);
+        if (mode == 1) {
+            // roundEven rounds half to even, as PyTorch's nearbyint.
+            tx[0] = grid_sample_in_bounds(int(roundEven(px)), W);
+            ty[0] = grid_sample_in_bounds(int(roundEven(py)), H);
+            wx[0] = 1.0; wy[0] = 1.0;
+            return 1;
+        }
+        int px0 = int(floor(px)), py0 = int(floor(py));
+        float fx = px - float(px0), fy = py - float(py0);
+        wx[0] = 1.0 - fx; wx[1] = fx; dwx[0] = -slx; dwx[1] = slx;
+        wy[0] = 1.0 - fy; wy[1] = fy; dwy[0] = -sly; dwy[1] = sly;
         for (int k = 0; k < 2; k++) {
-            tx[k] = grid_sample_tap(x0 + k, W);
-            ty[k] = grid_sample_tap(y0 + k, H);
+            tx[k] = grid_sample_in_bounds(px0 + k, W);
+            ty[k] = grid_sample_in_bounds(py0 + k, H);
         }
         return 2;
     }
+    int x0 = int(floor(sx)), y0 = int(floor(sy));
+    float fx = sx - x0, fy = sy - y0;
     const float a = -0.75;
     wx[0] = cubic_kernel(1.0 + fx, a); wx[1] = cubic_kernel(fx, a);
     wx[2] = cubic_kernel(1.0 - fx, a); wx[3] = cubic_kernel(2.0 - fx, a);
@@ -338,8 +327,8 @@ int grid_sample_taps(int gOff, out int tx[4], out int ty[4], out float wx[4], ou
     dwy[0] = cubic_kernel_deriv(1.0 + fy, a); dwy[1] = cubic_kernel_deriv(fy, a);
     dwy[2] = -cubic_kernel_deriv(1.0 - fy, a); dwy[3] = -cubic_kernel_deriv(2.0 - fy, a);
     for (int k = 0; k < 4; k++) {
-        tx[k] = grid_sample_tap(x0 - 1 + k, W);
-        ty[k] = grid_sample_tap(y0 - 1 + k, H);
+        tx[k] = grid_sample_bicubic_tap(x0 - 1 + k, W);
+        ty[k] = grid_sample_bicubic_tap(y0 - 1 + k, H);
     }
     return 4;
 }
@@ -363,6 +352,7 @@ void main() {
     int taps = grid_sample_taps(gid * 2, tx, ty, wx, wy, dwx, dwy);
     for (int c = 0; c < C; c++) {
         float g = gradOut_[((n * C + c) * outH + oy) * outW + ox];
+        if (g == 0.0) continue;
         int plane = (n * C + c) * H;
         for (int j = 0; j < taps; j++) {
             if (ty[j] < 0) continue;
@@ -395,12 +385,12 @@ layout(set = 0, binding = 3) writeonly buffer GG { float gradGrid_[]; };
 void main() {
     int gid = int(gl_GlobalInvocationID.x);
     if (gid >= N * outH * outW) return;
-    // Nearest is piecewise constant: its grid gradient is exactly 0, written directly so that a non-finite input
-    // or upstream gradient cannot turn the zero derivative into NaN.
-    if (mode == 1) { gradGrid_[gid * 2] = 0.0; gradGrid_[gid * 2 + 1] = 0.0; return; }
     int ox = gid % outW; int t1 = gid / outW;
     int oy = t1 % outH; int n = t1 / outH;
     int tx[4]; int ty[4]; float wx[4]; float wy[4]; float dwx[4]; float dwy[4];
+    // Nearest is piecewise constant: its grid gradient is exactly 0. Written outright, since g * input can
+    // overflow to infinity and infinity * 0 is NaN.
+    if (mode == 1) { gradGrid_[gid * 2] = 0.0; gradGrid_[gid * 2 + 1] = 0.0; return; }
     int taps = grid_sample_taps(gid * 2, tx, ty, wx, wy, dwx, dwy);
     float gradX = 0.0, gradY = 0.0;
     for (int c = 0; c < C; c++) {

@@ -6950,10 +6950,10 @@ public partial class DirectGpuTensorEngine
         //
         // S == 1 makes S/(S-1) undefined; align_corners=false with a size-1 axis is degenerate, so defer.
         //
-        // Every other mode and padding (and that degenerate case) runs the geometry backend's mode-aware
-        // kernel, the exact derivative of its GridSample2D forward (#1680).
-        if (!IsLegacyGridSampleBackward(mode, padding, alignCorners, inputShape)
-            && TryGridSampleModeBackwardInput(gradOutput, grid, inputShape, mode, padding, alignCorners, out var modeGrad))
+        // Every mode and padding first runs the geometry backend's mode-aware kernel, the exact derivative of its
+        // GridSample2D forward with PyTorch's padding rules (#1680). This kernel is the fallback for a backend
+        // without one; it zeroes the grid gradient at a coordinate exactly on pixel -1, where PyTorch's is one-sided.
+        if (TryGridSampleModeBackwardInput(gradOutput, grid, inputShape, mode, padding, alignCorners, out var modeGrad))
             return modeGrad;
         if (typeof(T) != typeof(float) || mode != GridSampleMode.Bilinear || padding != GridSamplePadding.Zeros
             || inputShape.Length != 4 || gradOutput.Rank != 4 || grid.Rank != 4
@@ -6980,30 +6980,6 @@ public partial class DirectGpuTensorEngine
             if (bufGridAdj is not null) backend.Synchronize();
         });
     }
-
-    /// <summary>
-    /// Rescales an <c>align_corners=false</c> grid so an <c>align_corners=true</c> kernel evaluates the
-    /// same sampling positions, or returns null when no adjustment is needed.
-    /// </summary>
-    /// <remarks>
-    /// <para>
-    /// align=false maps src = (g+1)*S/2 - 0.5 and align=true maps src = (g'+1)*(S-1)/2. Equating them
-    /// gives g' = g * S/(S-1), one factor per axis. Component 0 of each grid pair is x (paired with W)
-    /// and component 1 is y (paired with H), matching how the kernels read gridBase and gridBase+1.
-    /// </para>
-    /// <para>
-    /// Built from DeinterleaveComplex/Scale/InterleaveComplex, which every backend already implements, so
-    /// the two conventions are supported everywhere without duplicating a kernel six times.
-    /// </para>
-    /// </remarks>
-    /// <summary>
-    /// True for the configurations the Bilinear + Zeros backward kernels above serve: every other mode and
-    /// padding, and align_corners=false with a size-1 axis, go to the geometry backend's mode-aware kernels.
-    /// </summary>
-    private static bool IsLegacyGridSampleBackward(
-        GridSampleMode mode, GridSamplePadding padding, bool alignCorners, int[] inputShape) =>
-        mode == GridSampleMode.Bilinear && padding == GridSamplePadding.Zeros
-        && (alignCorners || inputShape.Length != 4 || (inputShape[2] > 1 && inputShape[3] > 1));
 
     /// <summary>
     /// GridSample input gradient on the device for any mode and padding, through
@@ -7095,6 +7071,21 @@ public partial class DirectGpuTensorEngine
         }
     }
 
+    /// <summary>
+    /// Rescales an <c>align_corners=false</c> grid so an <c>align_corners=true</c> kernel evaluates the
+    /// same sampling positions, or returns null when no adjustment is needed.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// align=false maps src = (g+1)*S/2 - 0.5 and align=true maps src = (g'+1)*(S-1)/2. Equating them
+    /// gives g' = g * S/(S-1), one factor per axis. Component 0 of each grid pair is x (paired with W)
+    /// and component 1 is y (paired with H), matching how the kernels read gridBase and gridBase+1.
+    /// </para>
+    /// <para>
+    /// Built from DeinterleaveComplex/Scale/InterleaveComplex, which every backend already implements, so
+    /// the two conventions are supported everywhere without duplicating a kernel six times.
+    /// </para>
+    /// </remarks>
     private OwnedBuffer? AlignFalseGridToAlignTrue(
         IDirectGpuBackend backend, IGpuBuffer gridBuffer, int pairCount, int h, int w, bool alignCorners)
     {
@@ -7126,8 +7117,7 @@ public partial class DirectGpuTensorEngine
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (grid is null) throw new ArgumentNullException(nameof(grid));
         // Same align_corners handling as GridSampleBackwardInput above — see the derivation there.
-        if (!IsLegacyGridSampleBackward(mode, padding, alignCorners, input._shape)
-            && TryGridSampleModeBackwardGrid(gradOutput, input, grid, mode, padding, alignCorners, out var modeGrad))
+        if (TryGridSampleModeBackwardGrid(gradOutput, input, grid, mode, padding, alignCorners, out var modeGrad))
             return modeGrad;
         if (typeof(T) != typeof(float) || mode != GridSampleMode.Bilinear || padding != GridSamplePadding.Zeros
             || input.Rank != 4 || gradOutput.Rank != 4 || grid.Rank != 4
