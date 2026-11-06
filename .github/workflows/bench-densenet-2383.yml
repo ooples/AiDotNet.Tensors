@@ -130,24 +130,22 @@ jobs:
           "launch $i exit $LASTEXITCODE" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
         }
 
-    # Inference latency was flat at ~60 ms from b1 to b32 on the RTX 3080: find whether the resident CUDA-graph replay
-    # engages (REPLAY lines, split into HtoD / compute / DtoH) or every call runs eagerly (EAGER lines only).
-    - name: DenseNet-121, inference graph timing
-      env:
-        AIDOTNET_INFGRAPH_TIMING: '1'
-        AIDOTNET_INFGRAPH_TIMING_BREAKDOWN: '1'
+    # Inference latency was flat at ~60 ms from b1 to b32 on the RTX 3080 while eager OpenCL on an RX 5500 XT takes
+    # 6-16 ms, so the time is host-side overhead in the CUDA path, not compute. Sample the host CPU during an
+    # inference-heavy launch to find which calls it goes to.
+    - name: DenseNet-121, host CPU sample of inference
       run: |
         $out = Join-Path $env:RUNNER_TEMP 'densenet'
-        $timing = Join-Path ([System.IO.Path]::GetTempPath()) 'aidotnet_infgraph_timing.txt'
-        Remove-Item $timing -ErrorAction SilentlyContinue
-        dotnet run -c Release --no-build --project aidn/benchmarks/AiDotNet.PyTorchParity -- `
+        $tools = Join-Path $env:RUNNER_TEMP 'dntools'
+        dotnet tool install dotnet-trace --tool-path $tools | Out-Null
+        $exe = Get-ChildItem aidn/benchmarks/AiDotNet.PyTorchParity/bin/Release -Recurse -Filter AiDotNet.PyTorchParity.dll |
+          Select-Object -First 1
+        & (Join-Path $tools 'dotnet-trace') collect --format Speedscope --output (Join-Path $out 'inference.nettrace') `
+          --profile cpu-sampling -- dotnet $exe.FullName `
           --device cuda --models densenet121 --epochs 1 --train-batches 1 --batch-size 32 `
-          --inference-batches 1,16 --inference-iterations 10 --warmup-iterations 2 `
-          --output (Join-Path $out 'densenet_timing.json') 2>&1 | Out-File (Join-Path $out 'densenet_timing.log')
-        if (Test-Path $timing) {
-          Copy-Item $timing (Join-Path $out 'infgraph_timing.txt')
-          Get-Content $timing | Group-Object { ($_ -split ' ')[0] } | ForEach-Object { "$($_.Name): $($_.Count) calls" }
-        } else { 'no inference-graph timing written: the resident graph path never ran' }
+          --inference-batches 1,16 --inference-iterations 60 --warmup-iterations 5 `
+          --output (Join-Path $out 'densenet_trace.json') 2>&1 | Select-Object -Last 5
+        Get-ChildItem $out -Filter 'inference*' | ForEach-Object { "$($_.Name) $([math]::Round($_.Length / 1MB, 1)) MB" }
 
     - name: Upload results
       if: always()
