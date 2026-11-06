@@ -20228,11 +20228,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         try { Dispose(disposing: false); } catch { }
     }
 
-    // Batch net-unreleased CUDA buffer bytes in 512-MB quanta before forwarding to DeviceMemoryReclaim so CUDA's
-    // stream-ordered pool (_asyncMemPool) does not pay a ~250 ms managed-heap GC stall on every 64 MB of transient
-    // tensor wrappers, while still guaranteeing Gen-1 sweeps every 512 MB and Gen-2 sweeps every 2 GB of unreleased
-    // device memory on Windows WDDM.
-    private const long CudaReclaimQuantumBytes = 512L << 20;
+    // Batch net-unreleased CUDA buffer bytes in 128-MB quanta before forwarding to DeviceMemoryReclaim so CUDA's
+    // stream-ordered pool (_asyncMemPool) avoids managed-heap GC stalls on sub-128-MB microbenchmarks while still
+    // guaranteeing Gen-1 sweeps every 128 MB and Gen-2 sweeps every 512 MB of unreleased device memory (preventing
+    // 10+ GB training steps from crossing the 12 GB Windows WDDM shared-memory paging cliff).
+    private const long CudaReclaimQuantumBytes = 128L << 20;
     private static long s_cudaUnreleasedBytes;
     private static long s_cudaReclaimEpoch;
 
