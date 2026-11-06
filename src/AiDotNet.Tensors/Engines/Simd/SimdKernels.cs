@@ -7253,6 +7253,48 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
         }
 
+        /// <summary>
+        /// Writes exp(input[i] - shift) to <paramref name="output"/> and returns their sum, accumulated in double.
+        /// </summary>
+        /// <remarks>
+        /// A float running sum drops the small terms of a long row once it nears 1: with one logit at the row's maximum
+        /// and 49,151 at -15, each exp(-15) = 3.06e-7 added to a sum near 1 rounds to 3 ulp (3.58e-7), in every SIMD
+        /// lane that holds the maximum as well as in a scalar loop, and log(sum) (the cross-entropy of a confident row)
+        /// came out 17% high. The exponentials stay float; each 8-lane block is widened and summed in double.
+        /// </remarks>
+        [MethodImpl(HotInline)]
+        internal static unsafe double ExpShiftedSumUnsafe(float* input, float* output, float shift, int length)
+        {
+            int i = 0;
+            double sum = 0.0;
+#if NET5_0_OR_GREATER
+            if (Avx2.IsSupported && Fma.IsSupported && length >= 16)
+            {
+                var vshift = Vector256.Create(shift);
+                var acc0 = Vector256<double>.Zero;
+                var acc1 = Vector256<double>.Zero;
+                int simdLen = length & ~7;
+                for (; i < simdLen; i += 8)
+                {
+                    var e = FastExp256(Avx.Subtract(Avx.LoadVector256(input + i), vshift));
+                    Avx.Store(output + i, e);
+                    acc0 = Avx.Add(acc0, Avx.ConvertToVector256Double(e.GetLower()));
+                    acc1 = Avx.Add(acc1, Avx.ConvertToVector256Double(e.GetUpper()));
+                }
+                var acc = Avx.Add(acc0, acc1);
+                var pair = Sse2.Add(acc.GetLower(), acc.GetUpper());
+                sum = pair.GetElement(0) + pair.GetElement(1);
+            }
+#endif
+            for (; i < length; i++)
+            {
+                float e = (float)Math.Exp(input[i] - shift);
+                output[i] = e;
+                sum += e;
+            }
+            return sum;
+        }
+
     #endregion
 
     #region Backward Kernels

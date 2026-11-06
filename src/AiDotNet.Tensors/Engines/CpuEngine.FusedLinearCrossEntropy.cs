@@ -440,8 +440,9 @@ public partial class CpuEngine
             ? Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, n)
             : 1;
 
-    // Index-target mean CE for float logits: row r contributes -logSoftmax(logits[r])[id_r]. Each row's log-softmax
-    // is evaluated in float by the SIMD row kernel; per-row losses are summed in double, in row order.
+    // Index-target mean CE for float logits: row r contributes max + log(sum exp(logits[r] - max)) - logits[r, id_r].
+    // The exponentials are float SIMD; their sum, the log and the per-row losses are double (a float sum loses the
+    // small terms of a confident row, see ExpShiftedSumUnsafe), and the row losses are summed in row order.
     private static unsafe double FusedCeLossIndexFloat(float[] logits, int[] ids, int n, int vocab)
     {
         var rowLoss = new double[n];
@@ -459,8 +460,10 @@ public partial class CpuEngine
                 {
                     for (int r = start; r < end; r++)
                     {
-                        Simd.SimdKernels.LogSoftmaxRowUnsafe(pl + (long)r * vocab, ps, vocab);
-                        rowLoss[r] = -scratch[ids[r]];
+                        float* row = pl + (long)r * vocab;
+                        float max = Simd.SimdKernels.MaxUnsafe(row, vocab);
+                        double sumExp = Simd.SimdKernels.ExpShiftedSumUnsafe(row, ps, max, vocab);
+                        rowLoss[r] = max + Math.Log(sumExp) - row[ids[r]];
                     }
                 }
             }
@@ -474,10 +477,12 @@ public partial class CpuEngine
         return total / n;
     }
 
-    // dlogits[r, v] = (softmax(logits[r])[v] - [v == id_r]) * g / N, row-parallel, SIMD softmax + scale.
+    // dlogits[r, v] = (softmax(logits[r])[v] - [v == id_r]) * g / N, row-parallel: float SIMD exponentials, their sum
+    // in double (as in the loss), and one multiply by (g / N) / sum.
     private static unsafe void SoftmaxMinusIndexFloat(float[] logits, int[] ids, float[] dLogits, int n, int vocab, double g)
     {
-        float scale = (float)(g / n);
+        double scaleD = g / n;
+        float scale = (float)scaleD;
         int chunks = RowChunks(n, vocab);
         int rowsPerChunk = (n + chunks - 1) / chunks;
         void Chunk(int c)
@@ -489,8 +494,9 @@ public partial class CpuEngine
                 for (int r = start; r < end; r++)
                 {
                     float* src = pl + (long)r * vocab, dst = pd + (long)r * vocab;
-                    Simd.SimdKernels.SoftmaxRowUnsafe(src, dst, vocab);
-                    Simd.SimdKernels.MultiplyScalarUnsafe(dst, scale, dst, vocab);
+                    float max = Simd.SimdKernels.MaxUnsafe(src, vocab);
+                    double sumExp = Simd.SimdKernels.ExpShiftedSumUnsafe(src, dst, max, vocab);
+                    Simd.SimdKernels.MultiplyScalarUnsafe(dst, (float)(scaleD / sumExp), dst, vocab);
                     dst[ids[r]] -= scale;
                 }
             }

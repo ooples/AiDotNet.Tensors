@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -12,7 +13,10 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// (row-parallel SIMD log-softmax / softmax-minus-onehot, SIMD bias add and column sums) must agree with the double
 /// path on the same inputs - loss and all three gradients - both below the row-parallel threshold (serial) and above it
 /// (chunked across the pool), with a vocabulary that is not a multiple of the SIMD width so the row tails run.
+/// The chunk count follows <see cref="CpuParallelSettings.MaxDegreeOfParallelism"/>, a process-wide setting, so the
+/// cases pin it and run in the serial global-state collection.
 /// </summary>
+[Collection("EngineCurrentGlobalState")]
 public class FusedLinearCeCpuFloatTests
 {
     private static double[] Gen(int len, int seed, double scale)
@@ -39,11 +43,23 @@ public class FusedLinearCeCpuFloatTests
         return (loss, grads, p);
     }
 
+    private static T WithParallelism<T>(int degree, Func<T> body)
+    {
+        int prior = CpuParallelSettings.MaxDegreeOfParallelism;
+        CpuParallelSettings.MaxDegreeOfParallelism = degree;
+        try { return body(); }
+        finally { CpuParallelSettings.MaxDegreeOfParallelism = prior; }
+    }
+
     [Theory]
-    [InlineData(2, 3, 5)]        // serial path (n * vocab below the row-parallel threshold)
-    [InlineData(64, 16, 4099)]   // row-parallel path; vocab % 8 != 0 exercises the SIMD tails
-    [InlineData(96, 8, 49152)]   // LM-head vocabulary
-    public void FloatPath_MatchesDoublePath(int n, int d, int vocab)
+    [InlineData(2, 3, 5, 4)]         // serial path (n * vocab below the row-parallel threshold)
+    [InlineData(64, 16, 4099, 1)]    // above the threshold, one chunk
+    [InlineData(64, 16, 4099, 4)]    // row-parallel path, 4 chunks; vocab % 8 != 0 exercises the SIMD tails
+    [InlineData(96, 8, 49152, 4)]    // LM-head vocabulary, 4 chunks
+    public void FloatPath_MatchesDoublePath(int n, int d, int vocab, int parallelism)
+        => WithParallelism(parallelism, () => { AssertFloatMatchesDouble(n, d, vocab); return 0; });
+
+    private static void AssertFloatMatchesDouble(int n, int d, int vocab)
     {
         var h = Gen(n * d, 1, 0.8);
         var w = Gen(d * vocab, 2, 0.6);
@@ -73,4 +89,36 @@ public class FusedLinearCeCpuFloatTests
             Assert.True(maxDiff <= 1e-4 * maxAbs, $"{names[k]} gradient max diff {maxDiff:E3} vs max |g| {maxAbs:E3}");
         }
     }
+
+    // A confident row of an LM-head vocabulary: logit 0 at the target and -15 everywhere else, so the loss is
+    // log(1 + 49151 e^-15) = 0.01493. A float running sum near 1 rounds every e^-15 = 3.06e-7 to 3 ulp, which made the
+    // float loss 17% high and the target's softmax gradient 16% off. Both rows are checked relative to their own size.
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void FloatPath_ConfidentRow_KeepsTheSmallLossAccurate(int parallelism)
+        => WithParallelism(parallelism, () =>
+        {
+            // One-hot hidden rows select row k of the weight as row k's logits.
+            const int n = 2, d = 2, vocab = 49152;
+            var h = new[] { 1.0, 0.0, 0.0, 1.0 };
+            var ids = new[] { 17, 30001 };
+            var w = new double[d * vocab];
+            for (int i = 0; i < w.Length; i++) w[i] = -15;
+            for (int k = 0; k < n; k++) w[k * vocab + ids[k]] = 0;
+            var b = new double[vocab];
+            var (lf, gf, pf) = Run<float>(h, w, b, ids, n, d, vocab, x => (float)x);
+            var (ld, gd, pd) = Run<double>(h, w, b, ids, n, d, vocab, x => x);
+
+            double lossF = lf[0], lossD = ld[0];
+            Assert.True(Math.Abs(lossD - Math.Log(1 + (vocab - 1) * Math.Exp(-15))) <= 1e-10, $"double loss {lossD}");
+            Assert.True(Math.Abs(lossF - lossD) <= 1e-4 * lossD, $"loss float={lossF:R} double={lossD:R}");
+
+            var biasF = gf[pf[2]].ToArray();
+            var biasD = gd[pd[2]].ToArray();
+            foreach (int v in new[] { ids[0], ids[1], 0, vocab - 1 })
+                Assert.True(Math.Abs(biasF[v] - biasD[v]) <= 1e-4 * Math.Abs(biasD[v]),
+                    $"bias gradient[{v}] float={biasF[v]:R} double={biasD[v]:R}");
+            return 0;
+        });
 }
