@@ -130,6 +130,25 @@ jobs:
           "launch $i exit $LASTEXITCODE" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
         }
 
+    # Inference latency was flat at ~60 ms from b1 to b32 on the RTX 3080: find whether the resident CUDA-graph replay
+    # engages (REPLAY lines, split into HtoD / compute / DtoH) or every call runs eagerly (EAGER lines only).
+    - name: DenseNet-121, inference graph timing
+      env:
+        AIDOTNET_INFGRAPH_TIMING: '1'
+        AIDOTNET_INFGRAPH_TIMING_BREAKDOWN: '1'
+      run: |
+        $out = Join-Path $env:RUNNER_TEMP 'densenet'
+        $timing = Join-Path ([System.IO.Path]::GetTempPath()) 'aidotnet_infgraph_timing.txt'
+        Remove-Item $timing -ErrorAction SilentlyContinue
+        dotnet run -c Release --no-build --project aidn/benchmarks/AiDotNet.PyTorchParity -- `
+          --device cuda --models densenet121 --epochs 1 --train-batches 1 --batch-size 32 `
+          --inference-batches 1,16 --inference-iterations 10 --warmup-iterations 2 `
+          --output (Join-Path $out 'densenet_timing.json') 2>&1 | Out-File (Join-Path $out 'densenet_timing.log')
+        if (Test-Path $timing) {
+          Copy-Item $timing (Join-Path $out 'infgraph_timing.txt')
+          Get-Content $timing | Group-Object { ($_ -split ' ')[0] } | ForEach-Object { "$($_.Name): $($_.Count) calls" }
+        } else { 'no inference-graph timing written: the resident graph path never ran' }
+
     - name: Upload results
       if: always()
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
