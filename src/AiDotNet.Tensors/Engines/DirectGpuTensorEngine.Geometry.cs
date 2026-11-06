@@ -194,7 +194,8 @@ public partial class DirectGpuTensorEngine
     public override Tensor<T> GridSample<T>(Tensor<T> input, Tensor<T> grid,
         GridSampleMode mode, GridSamplePadding padding, bool alignCorners)
     {
-        if (typeof(T) == typeof(float)
+        // Under GraphMode the base records the lazy node; its compiled replay runs outside GraphMode and lands here.
+        if (typeof(T) == typeof(float) && !Compilation.GraphMode.IsActive
             && input.Rank == 4 && grid.Rank == 4 && grid._shape[3] == 2)
         {
             try
@@ -214,7 +215,13 @@ public partial class DirectGpuTensorEngine
                         geom.GridSample2D(inBuf.Buffer, grBuf.Buffer, outBuf.Buffer,
                             N, H, W, C, outH, outW, (int)mode, (int)padding, alignCorners);
                         var arr = FinishGpuOp<T>(backend, outBuf, outLen);
-                        return new Tensor<T>(arr, new[] { N, C, outH, outW });
+                        var sampled = new Tensor<T>(arr, new[] { N, C, outH, outW });
+                        // The device result needs the same input/grid edges the CPU path records, or a tape
+                        // around a GPU GridSample (a spatial transformer, a flow warp) got no gradient.
+                        Autodiff.DifferentiableOps.RecordBinary("GridSample", sampled, input, grid,
+                            Autodiff.BackwardFunctions<T>.GridSampleModeBackward,
+                            new object[] { (int)mode, (int)padding, alignCorners });
+                        return sampled;
                     }
                     catch { outBuf.Dispose(); throw; }
                 }
@@ -227,7 +234,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> AffineGrid3D<T>(Tensor<T> theta, int outputDepth, int outputHeight, int outputWidth, bool alignCorners = false)
     {
-        if (typeof(T) == typeof(float)
+        if (typeof(T) == typeof(float) && !Compilation.GraphMode.IsActive
             && theta.Rank == 3 && theta._shape[1] == 3 && theta._shape[2] == 4)
         {
             try
@@ -245,7 +252,11 @@ public partial class DirectGpuTensorEngine
                         geom.AffineGrid3D(tBuf.Buffer, gBuf.Buffer,
                             N, outputDepth, outputHeight, outputWidth, alignCorners);
                         var arr = FinishGpuOp<T>(backend, gBuf, outLen);
-                        return new Tensor<T>(arr, new[] { N, outputDepth, outputHeight, outputWidth, 3 });
+                        var grid = new Tensor<T>(arr, new[] { N, outputDepth, outputHeight, outputWidth, 3 });
+                        Autodiff.DifferentiableOps.RecordUnary("AffineGrid3D", grid, theta,
+                            Autodiff.BackwardFunctions<T>.AffineGrid3DBackward,
+                            new object[] { outputDepth, outputHeight, outputWidth, alignCorners });
+                        return grid;
                     }
                     catch { gBuf.Dispose(); throw; }
                 }
