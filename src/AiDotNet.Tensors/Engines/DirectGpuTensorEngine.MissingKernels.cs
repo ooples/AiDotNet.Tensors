@@ -1070,39 +1070,42 @@ public partial class DirectGpuTensorEngine
         {
             var gc = gradOutput.IsContiguous ? gradOutput : (Tensor<T>)gradOutput.Contiguous();
             using var bufGrad = GetOrAllocateBuffer(backend, gc);
-            using var padRe = AllocateOutputBuffer(backend, batch * nFft);
-            using var padIm = AllocateOutputBuffer(backend, batch * nFft);
-            using var fftRe = AllocateOutputBuffer(backend, batch * nFft);
-            using var fftIm = AllocateOutputBuffer(backend, batch * nFft);
-            using var oneRe = AllocateOutputBuffer(backend, batch * numFreqs);
-            using var oneIm = AllocateOutputBuffer(backend, batch * numFreqs);
-            using var interleaved = AllocateOutputBuffer(backend, batch * numFreqs * 2);
-            using var scaled = AllocateOutputBuffer(backend, batch * numFreqs * 2);
+            using var padRe = AllocateTransientScratch(backend, batch * nFft);
+            using var padIm = AllocateTransientScratch(backend, batch * nFft);
+            using var fftRe = AllocateTransientScratch(backend, batch * nFft, fullyWritten: true);
+            using var fftIm = AllocateTransientScratch(backend, batch * nFft, fullyWritten: true);
+            using var oneRe = AllocateTransientScratch(backend, batch * numFreqs, fullyWritten: true);
+            using var oneIm = AllocateTransientScratch(backend, batch * numFreqs, fullyWritten: true);
+            using var interleaved = AllocateTransientScratch(backend, batch * numFreqs * 2, fullyWritten: true);
+            var scaled = AllocateFullyWrittenOutputBuffer(backend, batch * numFreqs * 2);
+            try
+            {
+                // Zero-pad the real gradient to nFft; the imaginary part is zero throughout.
+                backend.Fill(padRe.Buffer, 0f, batch * nFft);
+                backend.Fill(padIm.Buffer, 0f, batch * nFft);
+                backend.CopyRows(bufGrad.Buffer, padRe.Buffer, outputLength, nFft, batch,
+                    System.Math.Min(outputLength, nFft));
 
-            // Zero-pad the real gradient to nFft; the imaginary part is zero throughout.
-            backend.Fill(padRe.Buffer, 0f, batch * nFft);
-            backend.Fill(padIm.Buffer, 0f, batch * nFft);
-            backend.CopyRows(bufGrad.Buffer, padRe.Buffer, outputLength, nFft, batch,
-                System.Math.Min(outputLength, nFft));
+                // FORWARD transform (inverse: false) applies no 1/nFft, so this is the unnormalized sum
+                // the adjoint needs — the mirror of RfftAdjointGpu, which undoes the inverse's 1/nFft.
+                backend.BatchedFFT(padRe.Buffer, padIm.Buffer, fftRe.Buffer, fftIm.Buffer, batch, nFft, inverse: false);
 
-            // FORWARD transform (inverse: false) applies no 1/nFft, so this is the unnormalized sum
-            // the adjoint needs — the mirror of RfftAdjointGpu, which undoes the inverse's 1/nFft.
-            backend.BatchedFFT(padRe.Buffer, padIm.Buffer, fftRe.Buffer, fftIm.Buffer, batch, nFft, inverse: false);
+                // Keep the one-sided bins.
+                backend.CopyRows(fftRe.Buffer, oneRe.Buffer, nFft, numFreqs, batch, numFreqs);
+                backend.CopyRows(fftIm.Buffer, oneIm.Buffer, nFft, numFreqs, batch, numFreqs);
+                backend.InterleaveComplex(oneRe.Buffer, oneIm.Buffer, interleaved.Buffer, batch * numFreqs);
 
-            // Keep the one-sided bins.
-            backend.CopyRows(fftRe.Buffer, oneRe.Buffer, nFft, numFreqs, batch, numFreqs);
-            backend.CopyRows(fftIm.Buffer, oneIm.Buffer, nFft, numFreqs, batch, numFreqs);
-            backend.InterleaveComplex(oneRe.Buffer, oneIm.Buffer, interleaved.Buffer, batch * numFreqs);
+                // c_k/nFft per bin, with the Nyquist imaginary slot zeroed (1-row constant broadcast across batch).
+                int weightCount = batch * numFreqs * 2;
+                using var weights = CachedSpectrumConstant(backend, SpectrumConstant.IrfftAdjointWeights, 1, numFreqs, nFft);
+                backend.BroadcastMultiplyLastAxis(interleaved.Buffer, weights.Buffer, scaled.Buffer, batch, numFreqs * 2);
+                backend.Synchronize();
 
-            // c_k/nFft per bin, with the Nyquist imaginary slot zeroed (cached per backend and shape).
-            int weightCount = batch * numFreqs * 2;
-            using var weights = CachedSpectrumConstant(backend, SpectrumConstant.IrfftAdjointWeights, batch, numFreqs, nFft);
-            backend.Multiply(interleaved.Buffer, weights.Buffer, scaled.Buffer, weightCount);
-            backend.Synchronize();
-
-            var result = DeferTensorResult<T>(backend, scaled.Buffer, weightCount, (int[])inputShape.Clone());
-            scaled.RelinquishOwnership();
-            return result;
+                var result = DeferTensorResult<T>(backend, scaled.Buffer, weightCount, (int[])inputShape.Clone());
+                scaled.RelinquishOwnership();
+                return result;
+            }
+            finally { scaled.Dispose(); }
         }
         catch (Exception)
         {
@@ -1324,10 +1327,10 @@ public partial class DirectGpuTensorEngine
             // The de-interleave is now ONE kernel over the whole batch instead of two single-element
             // device copies per frequency bin per signal (~1.06M copies at numFreqs=129, batchSize=4096).
             // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var allRealLease = AllocateTransientScratch(backend, batchSize * numFreqs);
+            using var allRealLease = AllocateTransientScratch(backend, batchSize * numFreqs, fullyWritten: true);
             var allReal = allRealLease.Buffer;
             // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var allImagLease = AllocateTransientScratch(backend, batchSize * numFreqs);
+            using var allImagLease = AllocateTransientScratch(backend, batchSize * numFreqs, fullyWritten: true);
             var allImag = allImagLease.Buffer;
             backend.DeinterleaveComplex(inputBuffer.Buffer, allReal, allImag, batchSize * numFreqs);
 
@@ -1338,33 +1341,32 @@ public partial class DirectGpuTensorEngine
             // so one index gather per component (plus a sign flip of the mirrored imaginary part) builds every
             // full spectrum, and one BatchedFFT inverse transforms them all. Taking the real part afterwards also
             // discards the imaginary part of the DC and Nyquist bins, exactly as a real inverse transform does.
-            // The index and sign tables depend only on the transform shape, so they come from a per-backend cache
-            // instead of being rebuilt on the host and uploaded on every call.
+            // The index table depends on (batch, numFreqs, nFft), while the sign row [nFft] is 1D and broadcast across batch.
             int fullCount = batchSize * nFft;
             using var indexBuffer = CachedSpectrumConstant(backend, SpectrumConstant.IrfftGatherIndex, batchSize, numFreqs, nFft);
-            using var signBuffer = CachedSpectrumConstant(backend, SpectrumConstant.IrfftImagSign, batchSize, numFreqs, nFft);
+            using var signBuffer = CachedSpectrumConstant(backend, SpectrumConstant.IrfftImagSign, 1, numFreqs, nFft);
             // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var fullRealLease = AllocateTransientScratch(backend, fullCount);
+            using var fullRealLease = AllocateTransientScratch(backend, fullCount, fullyWritten: true);
             var fullReal = fullRealLease.Buffer;
             // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var fullImagRawLease = AllocateTransientScratch(backend, fullCount);
+            using var fullImagRawLease = AllocateTransientScratch(backend, fullCount, fullyWritten: true);
             var fullImagRaw = fullImagRawLease.Buffer;
             // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var fullImagLease = AllocateTransientScratch(backend, fullCount);
+            using var fullImagLease = AllocateTransientScratch(backend, fullCount, fullyWritten: true);
             var fullImag = fullImagLease.Buffer;
             // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var timeRealLease = AllocateTransientScratch(backend, fullCount);
+            using var timeRealLease = AllocateTransientScratch(backend, fullCount, fullyWritten: true);
             var timeReal = timeRealLease.Buffer;
             // Transient scratch: shared by the step's actions, so a CUDA-graph capture allocates nothing (AiDotNet#1804).
-            using var timeImagLease = AllocateTransientScratch(backend, fullCount);
+            using var timeImagLease = AllocateTransientScratch(backend, fullCount, fullyWritten: true);
             var timeImag = timeImagLease.Buffer;
             backend.Gather(allReal, indexBuffer.Buffer, fullReal, fullCount, 1);
             backend.Gather(allImag, indexBuffer.Buffer, fullImagRaw, fullCount, 1);
-            backend.Multiply(fullImagRaw, signBuffer.Buffer, fullImag, fullCount);
+            backend.BroadcastMultiplyLastAxis(fullImagRaw, signBuffer.Buffer, fullImag, batchSize, nFft);
             backend.BatchedFFT(fullReal, fullImag, timeReal, timeImag, batchSize, nFft, inverse: true);
             backend.CopyRows(timeReal, output, nFft, outputLength, batchSize, outputLength);
             backend.Synchronize();
-        });
+        }, fullyWritten: true);
 
         // Mirrors CpuEngine.IRFFT: the backward of IRFFT is its ADJOINT, not RFFT. Routing the
         // gradient through engine.RFFT treated the inverse transform's transpose as a forward
@@ -2655,15 +2657,22 @@ public partial class DirectGpuTensorEngine
             using var gradBuffer = GetOrAllocateBuffer(backend, gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous());
             using var idBuffer = GetOrAllocateBuffer(backend, ids);
             bool deterministic = global::AiDotNet.Tensors.Engines.DirectGpu.GpuDeterminism.IsActive;
-            using var links = deterministic ? backend.AllocateIntBuffer(checked(2 * numIndices)) : null;
-            return DispatchDeferredGpuOp<T>(backend, checked(vocabSize * embeddingDim), new[] { vocabSize, embeddingDim }, result =>
+            var links = deterministic ? backend.AllocateIntBuffer(checked(2 * numIndices)) : null;
+            try
             {
-                backend.Fill(result, 0f, vocabSize * embeddingDim);
-                if (links is not null)
-                    cuda.EmbeddingBackwardFromFloatIdsDeterministic(gradBuffer.Buffer, idBuffer.Buffer, links, result, numIndices, embeddingDim, vocabSize);
-                else
-                    cuda.EmbeddingBackwardFromFloatIds(gradBuffer.Buffer, idBuffer.Buffer, result, numIndices, embeddingDim, vocabSize);
-            });
+                return DispatchDeferredGpuOp<T>(backend, checked(vocabSize * embeddingDim), new[] { vocabSize, embeddingDim }, result =>
+                {
+                    backend.Fill(result, 0f, vocabSize * embeddingDim);
+                    if (links is not null)
+                        cuda.EmbeddingBackwardFromFloatIdsDeterministic(gradBuffer.Buffer, idBuffer.Buffer, links, result, numIndices, embeddingDim, vocabSize);
+                    else
+                        cuda.EmbeddingBackwardFromFloatIds(gradBuffer.Buffer, idBuffer.Buffer, result, numIndices, embeddingDim, vocabSize);
+                }, fullyWritten: true);
+            }
+            finally
+            {
+                if (links is not null) DisposeBufferAfterQueuedUse(backend, links);
+            }
         }
         catch (Exception ex)
         {
@@ -5816,16 +5825,17 @@ public partial class DirectGpuTensorEngine
     private OwnedBuffer CachedSpectrumConstant(IDirectGpuBackend backend, SpectrumConstant kind, int batch, int numFreqs, int nFft)
     {
         while (backend is Gpu.DelegatingGpuBackend wrapper) backend = wrapper.InnerBackend;
-        var key = (backend, kind, batch, numFreqs, nFft);
+        int effectiveBatch = kind == SpectrumConstant.IrfftGatherIndex ? batch : 1;
+        var key = (backend, kind, effectiveBatch, numFreqs, nFft);
         if (_spectrumConstants.TryGetValue(key, out var cached)) return new OwnedBuffer(cached, ownsBuffer: false);
         lock (_spectrumConstantsGate)
         {
             if (_spectrumConstants.TryGetValue(key, out cached)) return new OwnedBuffer(cached, ownsBuffer: false);
             var created = kind switch
             {
-                SpectrumConstant.IrfftGatherIndex => backend.AllocateIntBuffer(IrfftGatherIndex(batch, numFreqs, nFft)),
-                SpectrumConstant.IrfftImagSign => backend.AllocateBuffer(IrfftImagSign(batch, nFft)),
-                _ => backend.AllocateBuffer(IrfftAdjointWeights(batch, numFreqs, nFft)),
+                SpectrumConstant.IrfftGatherIndex => backend.AllocateIntBuffer(IrfftGatherIndex(effectiveBatch, numFreqs, nFft)),
+                SpectrumConstant.IrfftImagSign => backend.AllocateBuffer(IrfftImagSign(nFft)),
+                _ => backend.AllocateBuffer(IrfftAdjointWeights(numFreqs, nFft)),
             };
             long bytes = (long)created.Size * sizeof(float);
             if (_spectrumConstants.Count >= MaxCachedSpectrumConstants
@@ -5849,28 +5859,23 @@ public partial class DirectGpuTensorEngine
         return index;
     }
 
-    private static float[] IrfftImagSign(int batch, int nFft)
+    private static float[] IrfftImagSign(int nFft)
     {
-        var sign = new float[checked(batch * nFft)];
-        for (int b = 0; b < batch; b++)
-            for (int k = 0; k < nFft; k++) sign[b * nFft + k] = k > nFft / 2 ? -1f : 1f;
+        var sign = new float[nFft];
+        for (int k = 0; k < nFft; k++) sign[k] = k > nFft / 2 ? -1f : 1f;
         return sign;
     }
 
     // c_k/nFft per interleaved one-sided bin (c_k = 1 at DC and Nyquist, 2 elsewhere), Nyquist imaginary slot zeroed.
-    private static float[] IrfftAdjointWeights(int batch, int numFreqs, int nFft)
+    private static float[] IrfftAdjointWeights(int numFreqs, int nFft)
     {
-        var w = new float[checked(batch * numFreqs * 2)];
+        var w = new float[checked(numFreqs * 2)];
         float invN = 1f / nFft;
-        for (int b = 0; b < batch; b++)
+        for (int k = 0; k < numFreqs; k++)
         {
-            int rowBase = b * numFreqs * 2;
-            for (int k = 0; k < numFreqs; k++)
-            {
-                float ck = (k == 0 || k == numFreqs - 1) ? 1f : 2f;
-                w[rowBase + k * 2] = ck * invN;
-                w[rowBase + k * 2 + 1] = (k == numFreqs - 1) ? 0f : ck * invN;
-            }
+            float ck = (k == 0 || k == numFreqs - 1) ? 1f : 2f;
+            w[k * 2] = ck * invN;
+            w[k * 2 + 1] = (k == numFreqs - 1) ? 0f : ck * invN;
         }
         return w;
     }
@@ -10411,15 +10416,9 @@ public partial class DirectGpuTensorEngine
             int inLen = n * inC * h * w;
             using var gradOutBuf = GetOrAllocateBuffer(backend, gradOutput);
             using var kBuf = GetOrAllocateBuffer(backend, kernel);
-            var gradInBuf = AllocateOutputBuffer(backend, inLen);
-            try
-            {
-                gpu.DepthwiseConv2DBackwardInput(gradOutBuf.Buffer, kBuf.Buffer, gradInBuf.Buffer,
-                    n, inC, h, w, m, outH, outW, kH, kW, stride[0], stride[1], padding[0], padding[1]);
-                var arr = FinishGpuOp<T>(backend, gradInBuf, inLen);
-                return new Tensor<T>(arr, (int[])inputShape.Clone());
-            }
-            catch { gradInBuf.Dispose(); throw; }
+            return DispatchDeferredGpuOp<T>(backend, inLen, (int[])inputShape.Clone(), gradInBuf =>
+                gpu.DepthwiseConv2DBackwardInput(gradOutBuf.Buffer, kBuf.Buffer, gradInBuf,
+                    n, inC, h, w, m, outH, outW, kH, kW, stride[0], stride[1], padding[0], padding[1]));
         }
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("DepthwiseConv2DBackwardInput", capabilityGap); return base.DepthwiseConv2DBackwardInput(gradOutput, kernel, inputShape, stride, padding); }
     }
@@ -10439,15 +10438,9 @@ public partial class DirectGpuTensorEngine
             int kLen = kernelShape[0] * kernelShape[1] * kernelShape[2] * kernelShape[3];
             using var gradOutBuf = GetOrAllocateBuffer(backend, gradOutput);
             using var inBuf = GetOrAllocateBuffer(backend, input);
-            var gradKBuf = AllocateOutputBuffer(backend, kLen);
-            try
-            {
-                gpu.DepthwiseConv2DBackwardKernel(gradOutBuf.Buffer, inBuf.Buffer, gradKBuf.Buffer,
-                    n, inC, h, w, m, outH, outW, kH, kW, stride[0], stride[1], padding[0], padding[1]);
-                var arr = FinishGpuOp<T>(backend, gradKBuf, kLen);
-                return new Tensor<T>(arr, (int[])kernelShape.Clone());
-            }
-            catch { gradKBuf.Dispose(); throw; }
+            return DispatchDeferredGpuOp<T>(backend, kLen, (int[])kernelShape.Clone(), gradKBuf =>
+                gpu.DepthwiseConv2DBackwardKernel(gradOutBuf.Buffer, inBuf.Buffer, gradKBuf,
+                    n, inC, h, w, m, outH, outW, kH, kW, stride[0], stride[1], padding[0], padding[1]));
         }
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("DepthwiseConv2DBackwardKernel", capabilityGap); return base.DepthwiseConv2DBackwardKernel(gradOutput, input, kernelShape, stride, padding); }
     }

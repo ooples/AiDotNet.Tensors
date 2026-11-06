@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Linq;
 using System.Runtime.CompilerServices;
@@ -1775,7 +1775,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // The device data can be keyed by the backing array or (a lazily allocated result) by the data vector; a view
         // of a vector-keyed result can still report a backing array, so try both.
         bool pending = false;
-        foreach (var key in new object?[] { view.GetBackingArrayForCacheLookupUnsafe(), view.DataVector })
+        var backingArray = view.GetBackingArrayForCacheLookupUnsafe();
+        foreach (var key in new object?[] { backingArray, view.DataVector })
         {
             if (key is null || !Helpers.HostSync.IsPending(key)) continue;
             pending = true;
@@ -1783,6 +1784,28 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return candidate.Buffer;
         }
         if (!pending) return null;
+        // Persistent 3D/4D weights (e.g. MoE expert banks [G, D, F]) updated in place on the device by GpuOptimizer
+        // arm HostSync on their backing array while their live device buffer resides in _persistentBufferCache.
+        if (backingArray is not null)
+        {
+            int hostVersion = view.GpuCacheVersion;
+            lock (_persistentBufferLock)
+            {
+                if (_persistentBufferCache.TryGetValue(backingArray, out var pe)
+                    && _persistentWeightHostVersion.TryGetValue(backingArray, out int stamped)
+                    && stamped == hostVersion
+                    && pe.Buffer.Handle != IntPtr.Zero
+                    && pe.Buffer.Size == backingArray.Length)
+                {
+                    return pe.Buffer;
+                }
+            }
+            if (Helpers.ResidentHostMirror.TryFindCovering(view, backingArray, 0, backingArray.Length, backend, out var mirrorBuf, out int mirrorStart)
+                && mirrorStart == 0 && mirrorBuf is not null && mirrorBuf.Handle != IntPtr.Zero && mirrorBuf.Size >= backingArray.Length)
+            {
+                return mirrorBuf;
+            }
+        }
         // Device-owned storage: a view of a device result shares its vector's device buffer. Use it only while it holds
         // the vector's current values.
         return view.DataVector._deviceState is { Buffer: { } shared, DeviceValid: true } state
@@ -1790,6 +1813,42 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             && !state.IsSplitComplex && !state.ContainsRawInt32 && !state.ContainsRawInt64
             ? shared
             : null;
+    }
+
+    /// <summary>
+    /// Returns a synced device buffer already holding <paramref name="view"/>'s full backing array at its current
+    /// <see cref="TensorBase{T}.GpuCacheVersion"/>, so permuting a cached weight or uploaded activation view runs on
+    /// the device instead of allocating a host Contiguous() copy and re-uploading every step.
+    /// </summary>
+    private IGpuBuffer? SyncedDeviceViewBase<T>(IDirectGpuBackend backend, Tensor<T> view)
+    {
+        var backingArray = view.GetBackingArrayForCacheLookupUnsafe();
+        if (backingArray is null) return null;
+        int hostVersion = view.GpuCacheVersion;
+        lock (_persistentBufferLock)
+        {
+            if (_persistentBufferCache.TryGetValue(backingArray, out var pe)
+                && _persistentWeightHostVersion.TryGetValue(backingArray, out int stamped)
+                && stamped == hostVersion
+                && pe.Buffer.Handle != IntPtr.Zero
+                && pe.Buffer.Size == backingArray.Length)
+            {
+                return pe.Buffer;
+            }
+        }
+        lock (_activationCacheLock)
+        {
+            if (_activationCache.TryGetValue(backingArray, out var ae)
+                && ReferenceEquals(ae.Backend, backend)
+                && !ae.IsFp16
+                && ae.HostVersion == hostVersion
+                && ae.Buffer.Handle != IntPtr.Zero
+                && ae.Buffer.Size == backingArray.Length)
+            {
+                return ae.Buffer;
+            }
+        }
+        return null;
     }
 
     /// <summary>
@@ -1896,8 +1955,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var dims = view._shape;
         var strides = view._strides;
         if (rank < 2 || strides is null || strides.Length != rank) return false;
-        if (lookUpBase) baseBuffer = DeviceAuthoritativeViewBase(backend, view);
-        if (baseBuffer is null) return false;   // host copy current, or no device copy: the host path handles it
+        if (lookUpBase) baseBuffer = DeviceAuthoritativeViewBase(backend, view) ?? SyncedDeviceViewBase(backend, view);
+        if (baseBuffer is null) return false;   // no device copy at current version: the host path handles it
 
         // Base axis order = view axes by descending stride; the view is a pure permutation iff those strides are the
         // row-major strides of the reordered shape (size-1 axes may carry any stride).

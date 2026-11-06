@@ -9659,23 +9659,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
-    public IGpuBuffer AllocateIntBuffer(int size)
-    {
-        if (!IsAvailable)
-            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
-
-        if (size <= 0)
-            throw new ArgumentOutOfRangeException(nameof(size), "Buffer size must be positive.");
-        // Issue #285: per-allocation cap check before cuMemAlloc.
-        GpuBufferSizeGuard.EnsureFits("CUDA", (long)size * sizeof(int), MaxBufferAllocBytes, DeviceName);
-        RecordDirectPtxEvidenceDeviceAllocation(checked((long)size * sizeof(int)));
-
-        using var _ = PushContext();
-        ulong byteSize = (ulong)size * sizeof(int);
-        CuBlasNative.CheckCudaResult(CuBlasNative.cuMemAlloc(out IntPtr devicePtr, byteSize), "cuMemAlloc(int)");
-        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuMemsetD32Async(devicePtr, 0, (ulong)size, _stream), "cuMemsetD32Async(int)");
-        return new CudaGpuBuffer(_cudaContext, devicePtr, size, account: _memoryAccount);
-    }
+    public IGpuBuffer AllocateIntBuffer(int size) => AllocateBuffer(size);
 
     public IGpuBuffer AllocateIntBuffer(int[] data)
     {
