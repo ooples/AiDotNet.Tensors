@@ -29,7 +29,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [sm86, sm75]
+        arch: [sm75]
     name: densenet-${{ matrix.arch }}
     runs-on: [self-hosted, gpu, cuda, '${{ matrix.arch }}']
     timeout-minutes: 90
@@ -121,7 +121,7 @@ jobs:
       run: |
         $out = Join-Path $env:RUNNER_TEMP 'densenet'
         New-Item -ItemType Directory -Force $out | Out-Null
-        foreach ($i in 1..3) {
+        foreach ($i in @()) {
           dotnet run -c Release --no-build --project aidn/benchmarks/AiDotNet.PyTorchParity -- `
             --device cuda --models densenet121 --epochs 1 --train-batches 20 --batch-size 32 `
             --inference-batches 1,8,16,32 --inference-iterations 10 --warmup-iterations 2 `
@@ -130,22 +130,22 @@ jobs:
           "launch $i exit $LASTEXITCODE" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
         }
 
-    # Inference latency was flat at ~60 ms from b1 to b32 on the RTX 3080 while eager OpenCL on an RX 5500 XT takes
-    # 6-16 ms, so the time is host-side overhead in the CUDA path, not compute. Sample the host CPU during an
-    # inference-heavy launch to find which calls it goes to.
-    - name: DenseNet-121, host CPU sample of inference
+    # The host CPU sample put half of each predict in cuMemAllocAsync under DenseBlock's channel concatenation. A/B the
+    # stream-ordered allocator against the legacy one (with its host-side buffer reuse), three launches each.
+    - name: DenseNet-121, allocator A/B
       run: |
         $out = Join-Path $env:RUNNER_TEMP 'densenet'
-        $tools = Join-Path $env:RUNNER_TEMP 'dntools'
-        dotnet tool install dotnet-trace --tool-path $tools | Out-Null
-        $exe = Get-ChildItem aidn/benchmarks/AiDotNet.PyTorchParity/bin/Release -Recurse -Filter AiDotNet.PyTorchParity.dll |
-          Select-Object -First 1
-        & (Join-Path $tools 'dotnet-trace') collect --format Speedscope --output (Join-Path $out 'inference.nettrace') `
-          -- dotnet $exe.FullName `
-          --device cuda --models densenet121 --epochs 1 --train-batches 1 --batch-size 32 `
-          --inference-batches 1,16 --inference-iterations 60 --warmup-iterations 5 `
-          --output (Join-Path $out 'densenet_trace.json') 2>&1 | Select-Object -Last 5
-        Get-ChildItem $out -Filter 'inference*' | ForEach-Object { "$($_.Name) $([math]::Round($_.Length / 1MB, 1)) MB" }
+        foreach ($mode in '1', '0') {
+          foreach ($i in 1..3) {
+            $env:AIDOTNET_CUDA_ASYNC_ALLOC = $mode
+            dotnet run -c Release --no-build --project aidn/benchmarks/AiDotNet.PyTorchParity -- `
+              --device cuda --models densenet121 --epochs 1 --train-batches 20 --batch-size 32 `
+              --inference-batches 1,8,16,32 --inference-iterations 20 --warmup-iterations 3 `
+              --output (Join-Path $out "alloc_${mode}_$i.json") 2>&1 | Out-File (Join-Path $out "alloc_${mode}_$i.log")
+            "async=$mode launch $i exit $LASTEXITCODE" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
+          }
+        }
+        Remove-Item Env:AIDOTNET_CUDA_ASYNC_ALLOC
 
     - name: Upload results
       if: always()
