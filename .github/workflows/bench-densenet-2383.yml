@@ -113,7 +113,7 @@ jobs:
     - name: Pack this branch's Tensors as 0.148.99
       run: |
         $feed = Join-Path $env:RUNNER_TEMP 'tensors-feed'
-        dotnet build tensors/src/AiDotNet.Tensors/AiDotNet.Tensors.csproj -c Release -p:Version=0.148.99 -v q -nologo
+        dotnet build tensors/src/AiDotNet.Tensors/AiDotNet.Tensors.csproj -c Release -p:Version=0.148.99 -p:EnablePackageValidation=false -p:GeneratePackageOnBuild=false -v q -nologo
         if ($LASTEXITCODE -ne 0) { exit 1 }
         dotnet pack tensors/src/AiDotNet.Tensors/AiDotNet.Tensors.csproj -c Release --no-build -o $feed -p:Version=0.148.99 -p:EnablePackageValidation=false -v q -nologo
         if ($LASTEXITCODE -ne 0) { exit 1 }
