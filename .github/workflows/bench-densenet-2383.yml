@@ -37,6 +37,33 @@ jobs:
       run:
         shell: pwsh
     steps:
+    # The GTX 1660 Ti machine ran out of disk building the harness. Clear regenerable output from every runner
+    # install on it (build outputs, crash and hang dumps, runner temp), then report what still takes the space.
+    - name: Free disk on the runner machine
+      if: matrix.arch == 'sm75'
+      continue-on-error: true
+      run: |
+        "free before: {0:N1} GB" -f ((Get-PSDrive C).Free / 1GB) | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
+        $roots = Get-ChildItem C:\ -Directory -Filter 'actions-runner*' -ErrorAction SilentlyContinue
+        foreach ($root in $roots) {
+          $work = Join-Path $root.FullName '_work'
+          if (-not (Test-Path $work)) { continue }
+          Get-ChildItem $work -Recurse -Directory -Include bin, obj, TestResults -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notlike '*\.dotnet\*' -and $_.FullName -notlike '*\_actions\*' } |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          Get-ChildItem $work -Recurse -File -Include *.dmp -ErrorAction SilentlyContinue |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+          $temp = Join-Path $work '_temp'
+          if (Test-Path $temp) { Get-ChildItem $temp | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+        "free after: {0:N1} GB" -f ((Get-PSDrive C).Free / 1GB) | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
+        $big = @($roots | ForEach-Object { Get-ChildItem (Join-Path $_.FullName '_work') -Directory -ErrorAction SilentlyContinue }) +
+          @(Get-Item $env:TEMP, 'C:\Windows\Temp', "$env:USERPROFILE\.nuget\packages" -ErrorAction SilentlyContinue)
+        $big | ForEach-Object {
+          $size = (Get-ChildItem $_.FullName -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+          [pscustomobject]@{ GB = [math]::Round($size / 1GB, 1); Path = $_.FullName }
+        } | Sort-Object GB -Descending | Select-Object -First 15 | Format-Table -AutoSize | Out-String | Write-Output
+
     - name: Setup .NET
       uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
       with:
