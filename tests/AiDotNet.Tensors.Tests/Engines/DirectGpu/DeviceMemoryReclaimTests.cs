@@ -206,6 +206,53 @@ public sealed class DeviceMemoryReclaimTests
         Assert.False(weak.IsAlive);
     }
 
+    [Fact]
+    public void StepBoundary_CumulativeMultiStepAllocations_ReclaimsGen2PromotedWrappers()
+    {
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        static (WeakReference Weak, object Root) CreateWrapper()
+        {
+            var obj = new object();
+            return (new WeakReference(obj), obj);
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        static WeakReference CreateGen2PromotedWrapperAndRelease()
+        {
+            var (weak, root) = CreateWrapper();
+            // Two blocking collections while rooted promote the wrapper into Generation 2,
+            // mirroring live forward GPU buffers promoted by mid-step ephemeral GCs.
+            GC.Collect(2, GCCollectionMode.Forced, blocking: true);
+            GC.Collect(2, GCCollectionMode.Forced, blocking: true);
+            Assert.Equal(2, GC.GetGeneration(root));
+            GC.KeepAlive(root);
+            return weak;
+        }
+
+        var tapeOpen = DeviceMemoryReclaim.TapeOpen;
+        DeviceMemoryReclaim.TapeOpen = () => true;
+        try
+        {
+            DeviceMemoryReclaim.ResetCountsForTests();
+            var weakGen2 = CreateGen2PromotedWrapperAndRelease();
+
+            // Simulate 4 steps each abandoning 64 MB (< 256 MB per step, >= 256 MB cumulative):
+            // Steps 1-3 run Gen-1 sweeps (resetting s_driverBytesSinceCollection each time), and Step 4
+            // crosses CollectGen2AfterDeviceBytes (256 MB cumulative) and runs a Gen-2 sweep.
+            for (int step = 0; step < 4; step++)
+            {
+                DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectAfterDeviceBytes);
+                Assert.True(DeviceMemoryReclaim.CollectIfDueAtStepBoundary());
+            }
+
+            Assert.False(weakGen2.IsAlive);
+        }
+        finally
+        {
+            DeviceMemoryReclaim.TapeOpen = tapeOpen;
+        }
+    }
+
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static void AbandonBuffer(IDirectGpuBackend backend) => backend.AllocateBuffer(1024);
 

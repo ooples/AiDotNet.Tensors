@@ -20240,6 +20240,21 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         private int _size;
         private CaptureMemoryPool[]? _capturePins; // live captures whose graphs use this buffer (CaptureMemoryPool)
         private DeviceMemoryHold _memory; // what GpuMemoryStats counts for this memory
+        private long _reclaimCharge;
+        private long _reclaimEpoch = -1;
+
+        private void ChargeReclaim(long bytes)
+        {
+            if (bytes <= 0 || IsCapturingOnThisThread || IsRuntimeTearingDown || ProcessExiting) return;
+            _reclaimCharge = bytes;
+            _reclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation(bytes);
+        }
+
+        private void CreditReclaim()
+        {
+            long charge = Interlocked.Exchange(ref _reclaimCharge, 0);
+            if (charge > 0) DeviceMemoryReclaim.OnDeviceRelease(charge, _reclaimEpoch);
+        }
 
         public int Size => Volatile.Read(ref _size);
         public int Capacity { get; }
@@ -20279,6 +20294,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             }
             _allocatedDuringCapture = IsCapturingOnThisThread;
             _contextGeneration = ContextGenerationOf(context);
+            if (account is not null) ChargeReclaim((long)size * sizeof(float));
         }
 
         // Allocated during a capture: never returned to the shared pool (another rent could hand it out while a
@@ -20292,6 +20308,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             Volatile.Write(ref _size, size);
             Interlocked.Exchange(ref _poolState, 0);
             _memory.OnRented();
+            ChargeReclaim((long)size * sizeof(float));
         }
 
         /// <summary>
@@ -20339,6 +20356,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 GC.SuppressFinalize(this);
                 return;
             }
+            CreditReclaim();
             _memory.OnFreed();
 
             // During CLR/AppDomain teardown the CUDA context may already be gone;
@@ -20409,6 +20427,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             if (Interlocked.CompareExchange(ref _poolState, 1, 0) != 0)
                 return;
 
+            CreditReclaim();
             try
             {
                 _returnToPool(this);
@@ -20456,6 +20475,21 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         private CaptureMemoryPool[]? _capturePins; // live captures whose graphs use this buffer (CaptureMemoryPool)
         private DeviceMemoryHold _memory; // see CudaGpuBuffer
+        private long _reclaimCharge;
+        private long _reclaimEpoch = -1;
+
+        private void ChargeReclaim(long bytes)
+        {
+            if (bytes <= 0 || IsCapturingOnThisThread || IsRuntimeTearingDown || ProcessExiting) return;
+            _reclaimCharge = bytes;
+            _reclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation(bytes);
+        }
+
+        private void CreditReclaim()
+        {
+            long charge = Interlocked.Exchange(ref _reclaimCharge, 0);
+            if (charge > 0) DeviceMemoryReclaim.OnDeviceRelease(charge, _reclaimEpoch);
+        }
 
         public CudaGpuByteBuffer(IntPtr context, IntPtr devicePtr, int size, IntPtr asyncFreeStream = default,
             DeviceMemoryAccount? account = null)
@@ -20469,6 +20503,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             CaptureMemoryPool.Current?.Pin(ref _capturePins, this);
             _allocatedDuringCapture = IsCapturingOnThisThread;
             _contextGeneration = ContextGenerationOf(context);
+            if (account is not null) ChargeReclaim(size);
         }
 
         public void Dispose()
@@ -20489,6 +20524,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 GC.SuppressFinalize(this);
                 return;
             }
+            CreditReclaim();
             _memory.OnFreed();
 
             // See CudaGpuBuffer.Release: skip native CUDA calls during teardown to

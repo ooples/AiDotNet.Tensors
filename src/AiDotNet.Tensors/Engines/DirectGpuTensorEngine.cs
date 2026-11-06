@@ -4734,12 +4734,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         lock (_trackedOwnedResults) _trackedOwnedResults.Clear();
     }
 
-    // The GC cannot see device memory. Owned results are small managed objects pinning large device buffers; forward
-    // owned-result byte accounting to DeviceMemoryReclaim so collections are deferred to GradientTape.Dispose() /
-    // InferenceModeScope.Dispose() rather than running mid-step and promoting live tape activations into older generations.
+    // CUDA, HIP, OpenCL, and Vulkan buffers charge DeviceMemoryReclaim.OnDeviceAllocation at rent/allocation and
+    // credit OnDeviceRelease on explicit Dispose, so DeferTensorResult needs no second engine-level charge.
     private void NoteOwnedResultAllocation(long bytes)
     {
-        AiDotNet.Tensors.Engines.DirectGpu.DeviceMemoryReclaim.OnDeviceAllocation(bytes);
+        _ = bytes;
     }
     /// <summary>
     /// Materializes a deferred download if the given array was returned from a GPU op

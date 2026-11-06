@@ -80,6 +80,14 @@ internal static class DeviceMemoryReclaim
     /// </summary>
     internal const long CollectNowAfterDeviceBytes = 4 * CollectAfterDeviceBytes;
 
+    /// <summary>
+    /// Cumulative unreleased device bytes across steps past which the step-boundary sweep upgrades from Gen 1 to Gen 2.
+    /// Ephemeral managed-heap Gen-1 collections during an open <c>GradientTape</c> can promote live forward device-buffer
+    /// wrappers into Gen 2; tracking cumulative unreleased bytes separately from the per-step Gen-1 counter prevents
+    /// sub-256-MB steps from leaking Gen-2 device wrappers across hundreds of steps.
+    /// </summary>
+    internal const long CollectGen2AfterDeviceBytes = 4 * CollectAfterDeviceBytes;
+
     private static int s_collectionDue;
 
     /// <summary>Whether a backend has asked for a collection at the next step or inference boundary.</summary>
@@ -88,24 +96,36 @@ internal static class DeviceMemoryReclaim
     /// <summary>Test hook: starts the byte and allocation counts from zero with no collection due.</summary>
     internal static void ResetCountsForTests()
     {
-        ResetDeviceBytes();
+        ResetDeviceBytes(resetGen2: true);
         Interlocked.Exchange(ref s_allocationsSinceCollection, 0);
         Volatile.Write(ref s_collectionDue, 0);
     }
     // Device bytes handed out since the last collection, across every backend: one collection serves them all.
     private static long s_driverBytesSinceCollection;
 
+    // Cumulative unreleased device bytes handed out since the last Gen-2 collection.
+    private static long s_driverBytesSinceGen2Collection;
+
     // Bumped by every reset of s_driverBytesSinceCollection. A charge belongs to the epoch it was counted in; once a
     // reset has dropped it, crediting it back would cancel bytes charged afterwards and hide an abandoned buffer.
     private static long s_collectionEpoch;
 
+    // The s_collectionEpoch value at the most recent Gen-2 reset; charges from >= this epoch still sit in
+    // s_driverBytesSinceGen2Collection until explicitly disposed or swept by Gen 2.
+    private static long s_gen2ResetCollectionEpoch;
+
     /// <summary>Zeroes the byte count and starts a new epoch, so no charge counted before it is credited after it.</summary>
-    private static void ResetDeviceBytes()
+    private static void ResetDeviceBytes(bool resetGen2 = false)
     {
         // Epoch first: a credit that read the old epoch and the pre-reset count then fails its exchange, re-reads, and
         // sees the new epoch.
-        Interlocked.Increment(ref s_collectionEpoch);
+        long newEpoch = Interlocked.Increment(ref s_collectionEpoch);
         Interlocked.Exchange(ref s_driverBytesSinceCollection, 0);
+        if (resetGen2)
+        {
+            Volatile.Write(ref s_gen2ResetCollectionEpoch, newEpoch);
+            Interlocked.Exchange(ref s_driverBytesSinceGen2Collection, 0);
+        }
     }
 
     /// <summary>
@@ -124,16 +144,18 @@ internal static class DeviceMemoryReclaim
         long epoch = Volatile.Read(ref s_collectionEpoch);
         Interlocked.Increment(ref s_allocationsSinceCollection);
         long since = Interlocked.Add(ref s_driverBytesSinceCollection, bytes);
-        if (since < CollectAfterDeviceBytes) return epoch;
-        if (since < CollectNowAfterDeviceBytes || TapeOpen())
+        long sinceGen2 = Interlocked.Add(ref s_driverBytesSinceGen2Collection, bytes);
+        if (since < CollectAfterDeviceBytes && sinceGen2 < CollectGen2AfterDeviceBytes) return epoch;
+        if ((since < CollectNowAfterDeviceBytes && sinceGen2 < CollectGen2AfterDeviceBytes) || TapeOpen())
         {
             Volatile.Write(ref s_collectionDue, 1);
             return epoch;
         }
-        ResetDeviceBytes();
+        bool gen2 = sinceGen2 >= CollectGen2AfterDeviceBytes;
+        ResetDeviceBytes(resetGen2: gen2);
         Interlocked.Exchange(ref s_allocationsSinceCollection, 0);
         Volatile.Write(ref s_collectionDue, 0);
-        GC.Collect(1, GCCollectionMode.Forced, blocking: true);
+        GC.Collect(gen2 ? 2 : 1, GCCollectionMode.Forced, blocking: true);
         GC.WaitForPendingFinalizers();
         return epoch;
     }
@@ -149,15 +171,25 @@ internal static class DeviceMemoryReclaim
     /// dropped it, and the credit is skipped.</param>
     internal static void OnDeviceRelease(long bytes, long epoch)
     {
+        if (epoch < 0) return;
+
         // Subtract and floor at zero in one atomic update: a negative counter would hide later allocations.
         long current = Volatile.Read(ref s_driverBytesSinceCollection);
-        while (true)
+        while (Volatile.Read(ref s_collectionEpoch) == epoch)
         {
-            if (Volatile.Read(ref s_collectionEpoch) != epoch) return;
             long next = Math.Max(0, current - bytes);
             long observed = Interlocked.CompareExchange(ref s_driverBytesSinceCollection, next, current);
-            if (observed == current) return;
+            if (observed == current) break;
             current = observed;
+        }
+
+        long currentGen2 = Volatile.Read(ref s_driverBytesSinceGen2Collection);
+        while (epoch >= Volatile.Read(ref s_gen2ResetCollectionEpoch))
+        {
+            long nextGen2 = Math.Max(0, currentGen2 - bytes);
+            long observedGen2 = Interlocked.CompareExchange(ref s_driverBytesSinceGen2Collection, nextGen2, currentGen2);
+            if (observedGen2 == currentGen2) break;
+            currentGen2 = observedGen2;
         }
     }
 
@@ -185,10 +217,11 @@ internal static class DeviceMemoryReclaim
     {
         if (Volatile.Read(ref s_allocationsSinceCollection) < CollectOnMissAfterAllocations) return false;
         if (TapeOpen()) return false;
+        bool gen2 = Volatile.Read(ref s_driverBytesSinceGen2Collection) >= CollectGen2AfterDeviceBytes;
         Interlocked.Exchange(ref s_allocationsSinceCollection, 0);
-        ResetDeviceBytes();
+        ResetDeviceBytes(resetGen2: gen2);
         Volatile.Write(ref s_collectionDue, 0);
-        GC.Collect(1, GCCollectionMode.Forced, blocking: true);
+        GC.Collect(gen2 ? 2 : 1, GCCollectionMode.Forced, blocking: true);
         // The collected buffers come back through their finalizers, which only queue a pool return.
         GC.WaitForPendingFinalizers();
         return true;
@@ -209,13 +242,15 @@ internal static class DeviceMemoryReclaim
         // recover nothing. Measured on ResNet-50 predicts under a TensorScope (OpenCL): every intermediate came back
         // that way and no buffer was ever finalized, yet a blocking collection ran on every call.
         long bytes = Volatile.Read(ref s_driverBytesSinceCollection);
-        if (bytes < CollectAfterDeviceBytes) return false;
-        ResetDeviceBytes();
+        long gen2Bytes = Volatile.Read(ref s_driverBytesSinceGen2Collection);
+        if (bytes < CollectAfterDeviceBytes && gen2Bytes < CollectGen2AfterDeviceBytes) return false;
+        bool gen2 = gen2Bytes >= CollectGen2AfterDeviceBytes;
+        ResetDeviceBytes(resetGen2: gen2);
         Interlocked.Exchange(ref s_allocationsSinceCollection, 0);
-        // Normal managed-heap Gen-0 collections during a multi-layer training step promote early forward activations
-        // into Gen 1 (or Gen 2 on >512 MB steps); collect through Gen 1 (or Gen 2 past 512 MB) once at the step
-        // boundary after GradientTape._entries has been reset so dead device buffers never accumulate across steps.
-        GC.Collect(bytes >= (512L << 20) ? 2 : 1, GCCollectionMode.Forced, blocking: true);
+        // Normal managed-heap Gen-0/Gen-1 collections during a multi-layer training step promote early forward
+        // activations into Gen 1 or Gen 2; collect through Gen 1 every 64 MB and Gen 2 every 256 MB of cumulative
+        // unreleased device allocations once GradientTape._entries has been reset.
+        GC.Collect(gen2 ? 2 : 1, GCCollectionMode.Forced, blocking: true);
         // The collected buffers come back through their finalizers. Waiting for them (they only queue a pool return)
         // lets the next step's allocations find them in the pool instead of going to the driver.
         GC.WaitForPendingFinalizers();
@@ -224,6 +259,9 @@ internal static class DeviceMemoryReclaim
 
     internal static void CollectUnreachable()
     {
+        ResetDeviceBytes(resetGen2: true);
+        Interlocked.Exchange(ref s_allocationsSinceCollection, 0);
+        Volatile.Write(ref s_collectionDue, 0);
         GC.Collect();
         GC.WaitForPendingFinalizers();
         GC.Collect();
