@@ -166,16 +166,16 @@ public partial class CpuEngine
         int hs, he, ws, we;
         if (typeof(T) == typeof(float))
         {
-            int x1 = RoundAway((float)ops.ToDouble(boxes[k * 5 + 1]) * spatialScale);
-            int y1 = RoundAway((float)ops.ToDouble(boxes[k * 5 + 2]) * spatialScale);
-            int x2 = RoundAway((float)ops.ToDouble(boxes[k * 5 + 3]) * spatialScale);
-            int y2 = RoundAway((float)ops.ToDouble(boxes[k * 5 + 4]) * spatialScale);
-            float binH = (float)Math.Max(y2 - y1 + 1, 1) / outH;
-            float binW = (float)Math.Max(x2 - x1 + 1, 1) / outW;
-            hs = (int)Math.Floor(ph * binH) + y1;
-            he = (int)Math.Ceiling((ph + 1) * binH) + y1;
-            ws = (int)Math.Floor(pw * binW) + x1;
-            we = (int)Math.Ceiling((pw + 1) * binW) + x1;
+            int x1 = RoundAway(FloatMultiply((float)ops.ToDouble(boxes[k * 5 + 1]), spatialScale));
+            int y1 = RoundAway(FloatMultiply((float)ops.ToDouble(boxes[k * 5 + 2]), spatialScale));
+            int x2 = RoundAway(FloatMultiply((float)ops.ToDouble(boxes[k * 5 + 3]), spatialScale));
+            int y2 = RoundAway(FloatMultiply((float)ops.ToDouble(boxes[k * 5 + 4]), spatialScale));
+            float binH = FloatDivide(Math.Max(y2 - y1 + 1, 1), outH);
+            float binW = FloatDivide(Math.Max(x2 - x1 + 1, 1), outW);
+            hs = (int)Math.Floor(FloatMultiply(ph, binH)) + y1;
+            he = (int)Math.Ceiling(FloatMultiply(ph + 1, binH)) + y1;
+            ws = (int)Math.Floor(FloatMultiply(pw, binW)) + x1;
+            we = (int)Math.Ceiling(FloatMultiply(pw + 1, binW)) + x1;
         }
         else
         {
@@ -198,6 +198,14 @@ public partial class CpuEngine
     // torchvision and the GPU kernels use C round/roundf: midpoint values round away from zero. Math.Round's default
     // ties-to-even selected a different pooling cell for coordinates such as 0.5.
     private static int RoundAway(double v) => (int)Math.Round(v, MidpointRounding.AwayFromZero);
+
+    // One correctly rounded IEEE float multiply or divide, on every JIT. C# lets float arithmetic run at higher
+    // precision (the .NET Framework x86 JIT keeps it on the x87 stack), and passing a float product to a double
+    // parameter need not round it to float first, so a float * float written inline is not guaranteed to be the float
+    // product. In double the product of two floats is exact, and their quotient rounds innocuously (53 >= 2 * 24 + 2
+    // bits), so the single rounding to float below gives exactly the float result the GPU kernels and torchvision use.
+    private static float FloatMultiply(float a, float b) => (float)((double)a * b);
+    private static float FloatDivide(float a, float b) => (float)((double)a / b);
 
     private Tensor<T> RoIPoolImpl<T>(Tensor<T> input, Tensor<T> boxes,
         int outputHeight, int outputWidth, float spatialScale)
