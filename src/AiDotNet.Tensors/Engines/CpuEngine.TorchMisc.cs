@@ -40,7 +40,16 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorRrelu<T>(Tensor<T> tensor, double lower = 1.0 / 8, double upper = 1.0 / 3, bool training = false, int? seed = null)
     {
-        if (training && seed is null && GraphMode.IsActive && !GraphMode.IsInferenceTrace)
+        if (!training)
+        {
+            // Evaluation RReLU is leaky_relu with the slope range's midpoint, as torch.nn.functional.rrelu computes it.
+            // Routing it there gives it LeakyReLU's graph node, so an inference trace captures it instead of freezing
+            // the trace's values.
+            if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+            if (lower > upper) throw new ArgumentException("lower must not exceed upper.", nameof(lower));
+            return TensorLeakyReLU(tensor, Scalar<T>((lower + upper) / 2));
+        }
+        if (seed is null && GraphMode.IsActive && !GraphMode.IsInferenceTrace)
         {
             // Unseeded training draws new slopes every step. The compiled backward re-runs the op under a tape, so
             // each replay draws one seed for its forward and the backward reuses it: the gradient then uses the slopes
@@ -54,15 +63,14 @@ public partial class CpuEngine
                     backwardForward: e => e.TensorRrelu(tensor, lower, upper, training: true, stepSeed)))
                 return unseededNode;
         }
-        else if (!(training && seed is null)
+        else if (seed is not null
             && TryRecordCompiledOp("TensorRrelu", new Tensor<T>?[] { tensor }, e => e.TensorRrelu(tensor, lower, upper, training, seed), out var compiledNode))
             return compiledNode;
-        if (training) GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (lower > upper) throw new ArgumentException("lower must not exceed upper.", nameof(lower));
         var ops = MathHelper.GetNumericOperations<T>();
-        var rng = training ? RandomSource(seed) : null;
-        double evalSlope = (lower + upper) / 2;
+        var rng = RandomSource(seed);
         var source = tensor.IsContiguous ? tensor : tensor.Contiguous();
         using var sourceKeep1 = new KeepAliveScope(source);
         var values = source.AsSpanUnmarked().ToArray();
@@ -70,7 +78,7 @@ public partial class CpuEngine
         // array is also the exact derivative; the backward reads it rather than recovering y / x after rounding.
         var slopes = new double[values.Length];
         for (int i = 0; i < slopes.Length; i++)
-            slopes[i] = ops.ToDouble(values[i]) > 0 ? 1 : rng is null ? evalSlope : lower + (upper - lower) * rng.NextDouble();
+            slopes[i] = ops.ToDouble(values[i]) > 0 ? 1 : lower + (upper - lower) * rng.NextDouble();
         var result = FromDoubles<T>((int[])source._shape.Clone(), i => slopes[i] * ops.ToDouble(values[i]));
         DifferentiableOps.RecordUnary("TensorRrelu", result, tensor, RreluBackward<T>, new object[] { slopes });
         return result;
