@@ -160,7 +160,15 @@ public sealed class AllOpsGpuResidencySweep
                 try { _ = mf.Invoke(cpu, (object?[])hostArgs.Clone()); }
                 catch (Exception ex) { unrunnable[key] = $"CPU float threw {Describe(ex)}"; continue; }
 
-                results.Add(Measure(gpu, deviceBackend, mf, key, OpRegistry.DifferentiableOps.Contains(name), ToDevice(gpu, hostArgs)));
+                bool differentiable = OpRegistry.DifferentiableOps.Contains(name)
+                    && !(DifferentiableOpsGradCheckSweep.Exempt.TryGetValue(name, out var exemptWhy) && exemptWhy.StartsWith("stochastic", StringComparison.Ordinal));
+                var result = Measure(gpu, deviceBackend, mf, key, differentiable, ToDevice(gpu, hostArgs));
+                if (result.Error is null && differentiable)
+                {
+                    string? mismatch = CompareGradients(gpu, cpu, mf, hostArgs);
+                    if (mismatch is not null) result = result with { Error = mismatch };
+                }
+                results.Add(result);
             }
 
             var withCrossings = results.Where(r => r.Error is null && (r.Forward > 0 || r.Train > 0)).ToList();
@@ -274,6 +282,59 @@ public sealed class AllOpsGpuResidencySweep
         finally { AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.CaptureReadbackSites = saved; }
     }
 
+    /// <summary>
+    /// The device tape's gradients for every float input against the CPU engine's on the same float values. A GPU
+    /// override that records its own tape node, rather than handing the op to the CPU engine under a tape, must
+    /// produce the CPU engine's gradients; null when they agree, otherwise what differs.
+    /// </summary>
+    private static string? CompareGradients(DirectGpuTensorEngine gpu, CpuEngine cpu, MethodInfo m, object?[] hostArgs)
+    {
+        Tensor<float>[] Inputs(object?[] a) => a.SelectMany(x => x switch
+        {
+            Tensor<float> t => new[] { t },
+            Tensor<float>[] arr => arr,
+            _ => Array.Empty<Tensor<float>>(),
+        }).ToArray();
+
+        float[][] Grads(IEngine engine, object?[] args)
+        {
+            var inputs = Inputs(args);
+            var previous = AiDotNetEngine.Current;
+            AiDotNetEngine.Current = engine;
+            try
+            {
+                using var tape = new GradientTape<float>();
+                var output = (Tensor<float>)m.Invoke(engine, (object?[])args.Clone())!;
+                var grads = tape.ComputeGradients(engine.ReduceSum(output, null), inputs);
+                return inputs.Select(t => grads.TryGetValue(t, out var g) && g is not null ? g.ToArray() : Array.Empty<float>()).ToArray();
+            }
+            finally { AiDotNetEngine.Current = previous; }
+        }
+
+        float[][] expected, actual;
+        try { expected = Grads(cpu, hostArgs); }
+        catch (Exception) { return null; }   // the CPU engine cannot differentiate it here: nothing to compare against
+        try { actual = Grads(gpu, ToDevice(gpu, hostArgs)); }
+        catch (Exception ex) { return $"gradient threw on the device ({Describe(ex)})"; }
+
+        for (int i = 0; i < expected.Length; i++)
+        {
+            if (expected[i].Length != actual[i].Length)
+                return $"gradient of input {i}: {actual[i].Length} element(s) on the device, {expected[i].Length} on the CPU";
+            double scale = 0, worst = 0; int at = -1;
+            for (int j = 0; j < expected[i].Length; j++) scale = Math.Max(scale, Math.Abs(expected[i][j]));
+            for (int j = 0; j < expected[i].Length; j++)
+            {
+                double diff = Math.Abs((double)expected[i][j] - actual[i][j]);
+                if (double.IsNaN(actual[i][j]) && !double.IsNaN(expected[i][j])) diff = double.PositiveInfinity;
+                if (diff > worst) { worst = diff; at = j; }
+            }
+            if (worst > 1e-3 * Math.Max(1.0, scale))
+                return $"gradient of input {i} differs from the CPU engine's: [{at}] device {actual[i][at]:G6} vs CPU {expected[i][at]:G6} (max |g| {scale:G4})";
+        }
+        return null;
+    }
+
     private static void Summarize(StringBuilder sb, string phase, GpuResidencyScope scope)
     {
         if (scope.Events.Count == 0) return;
@@ -329,8 +390,20 @@ public sealed class AllOpsGpuResidencySweep
     {
         Tensor<float> t => (object)gpu.UploadToGpu(t, GpuTensorRole.General),
         Tensor<float>[] arr => arr.Select(t => gpu.UploadToGpu(t, GpuTensorRole.General)).ToArray(),
+        // Index and mask tensors live on the device too, as a training step's token ids and masks do; an op that
+        // reads one back to the host (a host-side bounds check, say) is a crossing like any other.
+        Tensor<int> t => TryUpload(gpu, t),
+        Tensor<int>[] arr => arr.Select(t => TryUpload(gpu, t)).ToArray(),
+        Tensor<Bit> t => TryUpload(gpu, t),
         _ => a,
     }).ToArray();
+
+    /// <summary>The device copy of a non-float tensor, or the host tensor when the device cannot hold that type.</summary>
+    private static Tensor<TElem> TryUpload<TElem>(DirectGpuTensorEngine gpu, Tensor<TElem> t)
+    {
+        try { return gpu.UploadToGpu(t, GpuTensorRole.General); }
+        catch (Exception ex) when (ex is NotSupportedException or InvalidCastException or ArgumentException) { return t; }
+    }
 
     private static string Describe(Exception ex)
     {

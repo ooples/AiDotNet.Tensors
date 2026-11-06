@@ -5082,13 +5082,10 @@ internal static class BackwardFunctions<T>
             // where the forward made a plain selection. Both the CpuEngine Tensor<T> overload
             // and the DirectGpuTensorEngine override save the raw condition tensor, so this
             // guard is what keeps them consistent with the forward they differentiate.
-            var mask = TensorPool<T>.RentZeroed(condTensor._shape);
-            for (int i = 0; i < condTensor.Length; i++)
-                mask[i] = numOps.Equals(condTensor[i], numOps.Zero) ? numOps.Zero : numOps.One;
-
+            // The comparisons run through the engine, so a device-resident condition never visits the host.
+            var mask = engine.TensorNotEquals(condTensor, numOps.Zero);
+            var invCond = engine.TensorEquals(condTensor, numOps.Zero);
             var gradX = engine.TensorMultiply(gradOutput, mask);
-            var ones = engine.TensorAddScalar(engine.TensorMultiplyScalar(mask, numOps.Zero), numOps.One);
-            var invCond = engine.TensorSubtract(ones, mask);
             var gradY = engine.TensorMultiply(gradOutput, invCond);
             DifferentiableOps.AccumulateGrad(grads, inputs[branchInputOffset], gradX, engine);
             DifferentiableOps.AccumulateGrad(grads, inputs[branchInputOffset + 1], gradY, engine);

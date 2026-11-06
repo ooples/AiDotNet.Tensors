@@ -2500,7 +2500,7 @@ public partial class DirectGpuTensorEngine
         using var __gpuOp = EnterGpuOp();
         if (a is null) throw new ArgumentNullException(nameof(a));
         if (b is null) throw new ArgumentNullException(nameof(b));
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || !a.IsContiguous || !b.IsContiguous || a.Length != b.Length
             || !ShapesEqual(a._shape, b._shape) || !TryGetBackend(out var backend))
             return base.TensorCosineSimilarityLoss(a, b);
@@ -2540,7 +2540,7 @@ public partial class DirectGpuTensorEngine
             using var denominatorLease = AllocateTransientScratch(backend, 1);
             var denominator = denominatorLease.Buffer;
 
-            return DispatchDeferredGpuOp<T>(backend, 1, new[] { 1 }, output =>
+            var similarity = DispatchDeferredGpuOp<T>(backend, 1, new[] { 1 }, output =>
             {
                 backend.Multiply(inputA.Buffer, inputB.Buffer, product, a.Length);
                 backend.Multiply(inputA.Buffer, inputA.Buffer, squareA, a.Length);
@@ -2554,8 +2554,12 @@ public partial class DirectGpuTensorEngine
                 backend.AddScalar(normProduct, denominator, 1e-8f, 1);
                 backend.Divide(dot, denominator, output, 1);
             });
+            // The CPU engine's node; its backward runs through the engine, so it stays on the device.
+            Autodiff.DifferentiableOps.RecordBinary("CosineSimilarity", similarity, a, b,
+                Autodiff.BackwardFunctions<T>.CosineSimilarityBackward);
+            return similarity;
         }
-        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("ShapesEqual", capabilityGap); return base.TensorCosineSimilarityLoss(a, b); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorCosineSimilarityLoss", capabilityGap); return base.TensorCosineSimilarityLoss(a, b); }
     }
 
     Tensor<T> IEngine.TensorEmbeddingLookupFromFloatIndices<T>(Tensor<T> embeddings, Tensor<T> floatIndices)
@@ -9313,7 +9317,8 @@ public partial class DirectGpuTensorEngine
 
     Tensor<T> IEngine.ComplexMagnitudeSquared<T>(Tensor<T> real, Tensor<T> imag)
     {
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
+        // Under a tape the multiplies and the add below record their own nodes on the device.
+        if (Compilation.GraphMode.IsActive)
             return base.ComplexMagnitudeSquared(real, imag);
         // re*re + im*im — same two-multiply-then-add order as CpuEngine.
         return TensorAdd(TensorMultiply(real, real), TensorMultiply(imag, imag));
@@ -9350,7 +9355,8 @@ public partial class DirectGpuTensorEngine
 
     Tensor<T> IEngine.TensorOuterProduct<T>(Tensor<T> a, Tensor<T> b)
     {
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
+        // Under a tape the composition below records the reshapes and the matmul on the device.
+        if (Compilation.GraphMode.IsActive)
             return base.TensorOuterProduct(a, b);
         // outer(a,b)[i,j] = a_i * b_j == (a as [n,1]) @ (b as [1,m]). The contraction dim is 1, so it
         // is a single multiply per element (no accumulation) — bit-identical to the CpuEngine loop and
@@ -9419,7 +9425,8 @@ public partial class DirectGpuTensorEngine
     // population formula as CpuEngine. Defer to base under tape/GraphMode.
     Tensor<T> IEngine.TensorVar<T>(Tensor<T> tensor)
     {
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
+        // Under a tape the composition below records ReduceVariance and the reshape on the device.
+        if (Compilation.GraphMode.IsActive)
             return base.TensorVar(tensor);
         var allAxes = new int[tensor.Rank];
         for (int i = 0; i < tensor.Rank; i++) allAxes[i] = i;
@@ -9878,7 +9885,8 @@ public partial class DirectGpuTensorEngine
     {
         int rank = a.Rank;
         int lastDim = rank > 0 ? a.Shape._dims[rank - 1] : 0;
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || rank == 0 || lastDim % 2 != 0)
+        // Under a tape the reshape / narrow / negate / concatenate below record their own nodes on the device.
+        if (Compilation.GraphMode.IsActive || rank == 0 || lastDim % 2 != 0)
             return base.TensorComplexConjugate(a);
         var pairShape = new int[rank + 1];
         for (int i = 0; i < rank - 1; i++) pairShape[i] = a.Shape._dims[i];
@@ -9919,7 +9927,8 @@ public partial class DirectGpuTensorEngine
     {
         int rank = a.Rank;
         int lastDim = rank > 0 ? a.Shape._dims[rank - 1] : 0;
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || rank == 0 || lastDim % 2 != 0 || a.Length != b.Length)
+        // Under a tape the reshape / narrow / arithmetic / concatenate below record their own nodes on the device.
+        if (Compilation.GraphMode.IsActive || rank == 0 || lastDim % 2 != 0 || a.Length != b.Length)
             return base.TensorComplexMultiply(a, b);
         var pairShape = new int[rank + 1];
         for (int i = 0; i < rank - 1; i++) pairShape[i] = a.Shape._dims[i];
@@ -10863,13 +10872,18 @@ public partial class DirectGpuTensorEngine
     // #775: TensorReciprocal on the existing backend.Reciprocal (reciprocal_vector = 1/x) unary kernel.
     Tensor<T> IEngine.TensorReciprocal<T>(Tensor<T> tensor)
     {
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || !tensor.IsContiguous)
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || !tensor.IsContiguous)
             return base.TensorReciprocal(tensor);
         try
         {
             var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Reciprocal(input, output, size));
             if (result != null)
-                return new Tensor<T>(result, tensor.Shape._dims);
+            {
+                // The CPU engine's node: its backward (-g / x^2) runs through the engine, so it stays on the device.
+                var output = new Tensor<T>(result, tensor.Shape._dims);
+                DifferentiableOps.RecordUnary("Reciprocal", output, tensor, BackwardFunctions<T>.ReciprocalBackward);
+                return output;
+            }
             return base.TensorReciprocal(tensor);
         }
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorReciprocal", capabilityGap); return base.TensorReciprocal(tensor); }
@@ -11443,7 +11457,8 @@ public partial class DirectGpuTensorEngine
     // #775: whole-tensor mean (output [1]) via the GPU-resident ReduceMean over all axes.
     Tensor<T> IEngine.TensorMeanDiff<T>(Tensor<T> tensor)
     {
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
+        // Under a tape the composition below records ReduceMean and the reshape on the device.
+        if (Compilation.GraphMode.IsActive)
             return base.TensorMeanDiff(tensor);
         var allAxes = new int[tensor.Rank];
         for (int i = 0; i < tensor.Rank; i++) allAxes[i] = i;
