@@ -529,6 +529,12 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         get => _isAvailable && !_disposed;
         private set => _isAvailable = value;
     }
+    /// <summary>
+    /// Why construction left this backend unavailable (exception type and message), or null when it initialized or the
+    /// CUDA libraries are absent. Tests that require the device report it instead of a bare "failed to initialize".
+    /// </summary>
+    internal string? InitializationError { get; private set; }
+
     public string BackendName => "CUDA";
     public TensorDevice DeviceType => TensorDevice.CUDA;
     public string DeviceName { get; }
@@ -821,6 +827,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         {
             System.Diagnostics.Debug.WriteLine($"CudaBackend initialization failed: {ex.GetType().Name}: {ex.Message}");
             System.Diagnostics.Trace.WriteLine($"CudaBackend initialization failed: {ex.GetType().Name}: {ex.Message}");
+            InitializationError = $"{ex.GetType().Name}: {ex.Message}";
             DeviceName = "None";
             IsAvailable = false;
             Dispose();

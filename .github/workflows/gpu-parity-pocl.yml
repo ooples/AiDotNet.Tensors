@@ -140,8 +140,22 @@ jobs:
           echo "::warning::POCL device setup failed after three attempts; this legacy shard is informational."
         fi
 
+    - name: Restore test dependencies
+      # nuget.org resets connections often enough to fail a shard on restore (PRs #1681, #1682): retry the
+      # restore itself, with backoff, so a dropped download is not reported as a parity failure.
+      run: |
+        for attempt in 1 2 3; do
+          if dotnet restore tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj; then
+            exit 0
+          fi
+          echo "::warning::dotnet restore failed (attempt $attempt of 3); retrying."
+          sleep $((attempt * 15))
+        done
+        echo "::error::dotnet restore failed after three attempts."
+        exit 1
+
     - name: Build tests (net10.0)
-      run: dotnet build tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --framework net10.0
+      run: dotnet build tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --framework net10.0 --no-restore
 
     - name: Run CPU-vs-GPU parity on POCL (shard ${{ matrix.name }})
       # The focused recurrence shard is required; broad legacy shards remain informational.
