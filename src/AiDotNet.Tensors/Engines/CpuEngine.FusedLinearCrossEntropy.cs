@@ -95,6 +95,12 @@ public partial class CpuEngine
                 compiledSavedState);
         }
 
+        // Training on the CPU in float: compute the gradients in the forward, while the logits are still in cache, so
+        // the step runs the three head GEMMs (logits, dHidden, dWeight) once instead of recomputing the logits in the
+        // backward (four), and the [N, vocab] buffer is freed before the forward returns.
+        if (typeof(T) == typeof(float) && this is not DirectGpuTensorEngine && DifferentiableOps.IsRecording<T>())
+            return FusedLinearCrossEntropyWithGradientsFloat(hidden, weight, bias, ids, n, d, vocab, FusedCeChunkElements);
+
         // logits = hidden·weight + bias, computed off-tape (this op records its own node).
         //
         // MATERIALIZE ONCE. TensorMatMul returns a GPU-RESIDENT tensor when this runs on the GPU engine
@@ -404,6 +410,282 @@ public partial class CpuEngine
             DifferentiableOps.AccumulateGrad(grads, bias, dBias, engine);
             // target ids are supervision — no gradient flows to them.
         }
+    }
+
+    /// <summary>
+    /// Logit elements computed per chunk by the float training forward: 64M floats (256 MB). A 512 x 49152 LM-head
+    /// batch is one chunk; larger batches are split by rows so the transient logits stay bounded.
+    /// </summary>
+    internal const long FusedCeChunkElements = 1L << 26;
+
+    // The [rows, vocab] dLogits buffer of the float training forward, kept between steps. It never escapes the op, and
+    // writing a fresh one is what made the logits GEMM slow: 64 threads faulting in new pages serialize on the
+    // process's page tables, so h·W into a fresh 512 x 49152 buffer took 98.5 ms against 36.9 ms into a reused one on
+    // a 3990X (median of 9). One buffer, taken with an exchange: a concurrent caller finding it taken allocates its own.
+    private static float[]? s_fusedCeWorkspace;
+
+    private static float[] TakeFusedCeWorkspace(long elements)
+    {
+        var buffer = System.Threading.Interlocked.Exchange(ref s_fusedCeWorkspace, null);
+        return buffer is not null && buffer.LongLength == elements ? buffer : new float[elements];
+    }
+
+    private static void ReturnFusedCeWorkspace(float[] buffer) => System.Threading.Volatile.Write(ref s_fusedCeWorkspace, buffer);
+
+    /// <summary>The gradients the float training forward computed, handed out by the first backward.</summary>
+    internal sealed class FusedCePrecomputedGradients
+    {
+        public Tensor<float>? Hidden;
+        public Tensor<float>? Weight;
+        public Tensor<float>? Bias;
+    }
+
+    /// <summary>
+    /// Float training forward: the loss plus all three gradients for a unit upstream gradient.
+    /// </summary>
+    /// <remarks>
+    /// Per row chunk: logits = h·W + b (GEMM), then one fused SIMD pass per row that takes the row's loss and
+    /// overwrites the row with dLogits = (softmax - onehot)/N, then dHidden = dLogits·Wᵀ and dWeight += hᵀ·dLogits (two
+    /// GEMMs) and the bias column sums. The loss is a mean, so every gradient is linear in the upstream scalar: the
+    /// backward scales these by it and runs no GEMM. A second backward over the same tape (a persistent tape) finds
+    /// them handed out and recomputes through the ordinary backward.
+    /// </remarks>
+    internal Tensor<T> FusedLinearCrossEntropyWithGradientsFloat<T>(
+        Tensor<T> hidden, Tensor<T> weight, Tensor<T> bias, int[] ids, int n, int d, int vocab, long chunkElements)
+    {
+        var h = (Tensor<float>)(object)hidden;
+        var w = (Tensor<float>)(object)weight;
+        var biasData = ((Tensor<float>)(object)bias).GetDataArray()!;
+        float scale = 1f / n;
+        int rowsPerChunk = (int)Math.Max(1, Math.Min(n, chunkElements / vocab));
+        var rowLoss = new double[n];
+        var dBias = new float[vocab];
+        Tensor<float> dHidden;
+        Tensor<float>? dWeight = null;
+
+        using (new NoGradScope<float>())
+        {
+            if (rowsPerChunk >= n)
+            {
+                var data = TakeFusedCeWorkspace((long)n * vocab);
+                var dLogits = new Tensor<float>(data, new[] { n, vocab });
+                MatMulInto(dLogits, h, w);
+                CrossEntropyGradRowsFloat(data, biasData, ids, 0, n, vocab, scale, rowLoss);
+                dHidden = DLogitsTimesWeightTransposed(data, w, n, d, vocab);
+                dWeight = PrefaultedTensor(d, vocab);
+                MatMulInto(dWeight, TensorTranspose(h), dLogits);
+                ColumnSumsFloat(data, dBias, n, vocab);
+                ReturnFusedCeWorkspace(data);
+            }
+            else
+            {
+                var hData = h.IsContiguous ? h.GetDataArray()! : h.Contiguous().GetDataArray()!;
+                var dHiddenData = new float[(long)n * d];
+                for (int start = 0; start < n; start += rowsPerChunk)
+                {
+                    int rows = Math.Min(rowsPerChunk, n - start);
+                    var hc = new Tensor<float>(new float[(long)rows * d], new[] { rows, d });
+                    Array.Copy(hData, (long)start * d, hc.GetDataArray()!, 0, (long)rows * d);
+                    var data = TakeFusedCeWorkspace((long)rows * vocab);
+                    var dLogits = new Tensor<float>(data, new[] { rows, vocab });
+                    MatMulInto(dLogits, hc, w);
+                    CrossEntropyGradRowsFloat(data, biasData, ids, start, rows, vocab, scale, rowLoss);
+                    var dhc = DLogitsTimesWeightTransposed(data, w, rows, d, vocab);
+                    Array.Copy(dhc.GetDataArray()!, 0, dHiddenData, (long)start * d, (long)rows * d);
+                    var dwc = PrefaultedTensor(d, vocab);
+                    MatMulInto(dwc, TensorTranspose(hc), dLogits);
+                    if (dWeight is null) dWeight = dwc;
+                    else AddInPlaceFloat(dWeight.GetDataArray()!, dwc.GetDataArray()!);
+                    ColumnSumsFloat(data, dBias, rows, vocab);
+                    ReturnFusedCeWorkspace(data);
+                }
+                dHidden = new Tensor<float>(dHiddenData, new[] { n, d });
+            }
+        }
+
+        double total = 0.0;
+        for (int r = 0; r < n; r++) total += rowLoss[r];
+        var output = new Tensor<T>(new[] { 1 });
+        output.GetDataArray()![0] = MathHelper.GetNumericOperations<T>().FromDouble(total / n);
+
+        var precomputed = new FusedCePrecomputedGradients
+        {
+            Hidden = dHidden,
+            Weight = dWeight,
+            Bias = new Tensor<float>(dBias, new[] { vocab }),
+        };
+        DifferentiableOps.RecordIfActive<T>(
+            "FusedLinearCrossEntropy", output,
+            new[] { hidden, weight, bias },
+            FusedLinearCrossEntropyPrecomputedBackward<T>,
+            savedState: new object[] { (int[])ids.Clone(), vocab, precomputed });
+        return output;
+    }
+
+    /// <summary>
+    /// Backward of the float training forward: the precomputed gradients times the upstream scalar. Falls back to the
+    /// recomputing backward if they were already handed out.
+    /// </summary>
+    internal static void FusedLinearCrossEntropyPrecomputedBackward<T>(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output, object[] savedState,
+        IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var pre = (FusedCePrecomputedGradients)savedState[2];
+        var dHidden = System.Threading.Interlocked.Exchange(ref pre.Hidden, null);
+        var dWeight = System.Threading.Interlocked.Exchange(ref pre.Weight, null);
+        var dBias = System.Threading.Interlocked.Exchange(ref pre.Bias, null);
+        if (dHidden is null || dWeight is null || dBias is null)
+        {
+            FusedLinearCrossEntropyIndexBackward(gradOutput, inputs, output, savedState, engine, grads);
+            return;
+        }
+
+        float g = (float)MathHelper.GetNumericOperations<T>().ToDouble(gradOutput.GetDataArray()![0]);
+        if (g != 1f)
+        {
+            ScaleInPlaceFloat(dHidden.GetDataArray()!, g);
+            ScaleInPlaceFloat(dWeight.GetDataArray()!, g);
+            ScaleInPlaceFloat(dBias.GetDataArray()!, g);
+        }
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], (Tensor<T>)(object)dHidden, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], (Tensor<T>)(object)dWeight, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[2], (Tensor<T>)(object)dBias, engine);
+    }
+
+    // Rows [start, start + rows) of a chunk: rowLoss[start + i] is row i's CE, and row i becomes its scaled gradient.
+    // Row-parallel; each row is computed by exactly one worker.
+    private static unsafe void CrossEntropyGradRowsFloat(
+        float[] logits, float[] bias, int[] ids, int start, int rows, int vocab, float scale, double[] rowLoss)
+    {
+        int chunks = RowChunks(rows, vocab);
+        int rowsPerChunk = (rows + chunks - 1) / chunks;
+        void Chunk(int c)
+        {
+            int lo = c * rowsPerChunk, hi = Math.Min(lo + rowsPerChunk, rows);
+            fixed (float* pl = logits)
+            fixed (float* pb = bias)
+            {
+                for (int r = lo; r < hi; r++)
+                    rowLoss[start + r] = Simd.SimdKernels.CrossEntropyGradRowUnsafe(
+                        pl + (long)r * vocab, pb, vocab, ids[start + r], scale);
+            }
+        }
+        if (chunks == 1) Chunk(0);
+        else PersistentParallelExecutor.Instance.Execute(chunks, Chunk);
+    }
+
+    /// <summary>Smallest K slice of the split-K dHidden product.</summary>
+    internal const int FusedCeSplitKSlice = 1024;
+
+    /// <summary>Most K slices of the split-K dHidden product: a constant, so the plan never follows the thread count.</summary>
+    internal const int FusedCeSplitKMaxSlices = 48;
+
+    // Split-K partials of dLogits·Wᵀ and the per-slice transposed W panels, kept between steps like the dLogits workspace.
+    private static float[]? s_fusedCeSplitKWorkspace;
+    private static float[]? s_fusedCeSplitKPanels;
+
+    /// <summary>
+    /// dHidden[rows, d] = dLogits[rows, vocab] · W[d, vocab]ᵀ, split over the vocabulary.
+    /// </summary>
+    /// <remarks>
+    /// K (the vocabulary) is ~100-200x the output's sides. The packed transposed-B GEMM had a handful of output tiles
+    /// to share between the workers and ran 512 x 256 x 49152 at ~172 GFLOP/s (71-81 ms) on a 3990X, and splitting
+    /// the output rows instead re-streams all of W per row block. Split over K, each slice owns the whole (small)
+    /// output and every input element is read once: a slice transposes its columns of W into a contiguous
+    /// [slice, d] panel and runs the single-threaded untransposed GEMM into its own partial; the partials are summed
+    /// in slice order. The slice count comes from the shape alone, so the result does not depend on the thread count.
+    /// </remarks>
+    private static unsafe Tensor<float> DLogitsTimesWeightTransposed(float[] dLogits, Tensor<float> w, int rows, int d, int vocab)
+    {
+        var wData = w.IsContiguous ? w.GetDataArray()! : w.Contiguous().GetDataArray()!;
+        var result = new float[(long)rows * d];
+        int slices = Math.Min(FusedCeSplitKMaxSlices, vocab / FusedCeSplitKSlice);
+        if (slices < 2)
+        {
+            Helpers.BlasProvider.GemmEx(rows, d, vocab, dLogits, 0, vocab, false, wData, 0, vocab, true, result, 0, d);
+            return new Tensor<float>(result, new[] { rows, d });
+        }
+
+        long mn = (long)rows * d;
+        int kPer = (vocab + slices - 1) / slices;
+        kPer = (kPer + 7) & ~7;
+        slices = (vocab + kPer - 1) / kPer;
+        var partial = System.Threading.Interlocked.Exchange(ref s_fusedCeSplitKWorkspace, null);
+        if (partial is null || partial.LongLength != mn * slices) partial = new float[mn * slices];
+        long panelElems = (long)kPer * d;
+        var panels = System.Threading.Interlocked.Exchange(ref s_fusedCeSplitKPanels, null);
+        if (panels is null || panels.LongLength != panelElems * slices) panels = new float[panelElems * slices];
+        void Slice(int sl)
+        {
+            int k0 = sl * kPer, kl = Math.Min(kPer, vocab - k0);
+            fixed (float* pw = wData)
+            fixed (float* pp = panels)
+            {
+                // panel[kk, j] = W[j, k0 + kk]
+                float* panel = pp + sl * panelElems;
+                for (int j = 0; j < d; j++)
+                {
+                    float* src = pw + (long)j * vocab + k0;
+                    for (int kk = 0; kk < kl; kk++) panel[(long)kk * d + j] = src[kk];
+                }
+            }
+            BlasManaged.BlasManaged.Gemm<float>(
+                new ReadOnlySpan<float>(dLogits, k0, dLogits.Length - k0), vocab, false,
+                new ReadOnlySpan<float>(panels, (int)(sl * panelElems), (int)panelElems), d, false,
+                new Span<float>(partial, (int)(sl * mn), (int)mn), d,
+                rows, d, kl, new BlasManaged.BlasOptions<float> { BetaZero = true, NumThreads = -1 });
+        }
+        PersistentParallelExecutor.Instance.Execute(slices, Slice);
+        SumPartialsFloat(partial, result, slices, mn);
+        System.Threading.Volatile.Write(ref s_fusedCeSplitKWorkspace, partial);
+        System.Threading.Volatile.Write(ref s_fusedCeSplitKPanels, panels);
+        return new Tensor<float>(result, new[] { rows, d });
+    }
+
+    // result[i] = sum_s partial[s * mn + i], slices in order; parallel over contiguous index ranges.
+    private static unsafe void SumPartialsFloat(float[] partial, float[] result, int slices, long mn)
+    {
+        int chunks = (int)Math.Max(1, Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, mn / 4096));
+        long per = (mn + chunks - 1) / chunks;
+        per = (per + 7) & ~7L;
+        void Chunk(int c)
+        {
+            long start = c * per, len = Math.Min(per, mn - start);
+            if (len <= 0) return;
+            fixed (float* pp = partial)
+            fixed (float* pr = result)
+            {
+                float* dst = pr + start;
+                Buffer.MemoryCopy(pp + start, dst, len * sizeof(float), len * sizeof(float));
+                for (int sl = 1; sl < slices; sl++)
+                    Simd.SimdKernels.VectorAddUnsafe(dst, pp + sl * mn + start, dst, (int)len);
+            }
+        }
+        if (chunks == 1) Chunk(0);
+        else PersistentParallelExecutor.Instance.Execute(chunks, Chunk);
+    }
+
+    // A fresh [rows, cols] float tensor whose pages are already faulted in, for a parallel kernel to write. The gradient
+    // escapes, so it cannot come from the workspace; faulting it in from one thread (one store per 4 KiB page) costs a
+    // few ms per 100 MB, where 64 GEMM workers faulting the same pages serialize on the page tables: h^T·dLogits into
+    // a fresh 256 x 49152 output took 60-74 ms in the training step on a 3990X.
+    private static Tensor<float> PrefaultedTensor(int rows, int cols)
+    {
+        var data = new float[(long)rows * cols];
+        for (long i = 0; i < data.LongLength; i += 1024) data[i] = 0f;
+        return new Tensor<float>(data, new[] { rows, cols });
+    }
+
+    private static unsafe void ScaleInPlaceFloat(float[] data, float g)
+    {
+        fixed (float* p = data) Simd.SimdKernels.MultiplyScalarUnsafe(p, g, p, data.Length);
+    }
+
+    private static unsafe void AddInPlaceFloat(float[] acc, float[] add)
+    {
+        fixed (float* pa = acc)
+        fixed (float* pb = add)
+            Simd.SimdKernels.VectorAddUnsafe(pa, pb, pa, acc.Length);
     }
 
     [MethodImpl(Hot)]
