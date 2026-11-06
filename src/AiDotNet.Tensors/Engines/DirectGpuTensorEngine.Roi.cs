@@ -11,6 +11,14 @@ namespace AiDotNet.Tensors.Engines;
 
 public partial class DirectGpuTensorEngine
 {
+    // Binds the current tape to this engine, so the backward of a device result runs on the device. Under a NoGradScope
+    // nothing is recorded, and binding would hand this engine to the backward of a later CPU op on the same tape.
+    private void BindTapeIfRecording<T>()
+    {
+        if (Autodiff.DifferentiableOps.IsRecording<T>())
+            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
+    }
+
     /// <inheritdoc/>
     public override Tensor<T> RoIAlign<T>(Tensor<T> input, Tensor<T> boxes,
         int outputHeight, int outputWidth,
@@ -25,7 +33,7 @@ public partial class DirectGpuTensorEngine
         if (result.GradFn is null)
         {
             // Binds the tape to this engine, so the backward of a device result runs on the device.
-            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
+            BindTapeIfRecording<T>();
             Autodiff.DifferentiableOps.RecordBinary("RoIAlign", result, input, boxes, Autodiff.BackwardFunctions<T>.RoIAlignBackward, new object[] { outputHeight, outputWidth, spatialScale, samplingRatio, aligned });
         }
         return result;
@@ -102,7 +110,7 @@ public partial class DirectGpuTensorEngine
         if (result.GradFn is null)
         {
             // Binds the tape to this engine, so the backward of a device result runs on the device.
-            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
+            BindTapeIfRecording<T>();
             Autodiff.DifferentiableOps.RecordBinary("PsRoIAlign", result, input, boxes, Autodiff.BackwardFunctions<T>.PsRoIAlignBackward, new object[] { outputHeight, outputWidth, outputChannels, spatialScale, samplingRatio });
         }
         return result;
@@ -153,7 +161,7 @@ public partial class DirectGpuTensorEngine
         if (result.GradFn is null)
         {
             // Binds the tape to this engine, so the backward of a device result runs on the device.
-            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
+            BindTapeIfRecording<T>();
             Autodiff.DifferentiableOps.RecordBinary("PsRoIPool", result, input, boxes, Autodiff.BackwardFunctions<T>.PsRoIPoolBackward, new object[] { outputHeight, outputWidth, outputChannels, spatialScale });
         }
         return result;
@@ -202,7 +210,7 @@ public partial class DirectGpuTensorEngine
         if (result.GradFn is null)
         {
             // Binds the tape to this engine, so the backward of a device result runs on the device.
-            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
+            BindTapeIfRecording<T>();
             Autodiff.DifferentiableOps.RecordBinary("RoIPool", result, input, boxes, Autodiff.BackwardFunctions<T>.RoIPoolBackward, new object[] { outputHeight, outputWidth, spatialScale });
         }
         return result;

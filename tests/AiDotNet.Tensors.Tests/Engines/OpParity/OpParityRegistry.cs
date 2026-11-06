@@ -3097,6 +3097,11 @@ public static class OpParityRegistry
         yield return new OpCase("TensorLeakyReLU[4,6;0.01]", "activation",
             e => e.TensorLeakyReLU(a.F(), 0.01f), e => e.TensorLeakyReLU(a.D(), 0.01),
             ParityTol.Ulp(2), opMethod: "TensorLeakyReLU");
+        // Evaluation RReLU is deterministic: negatives are scaled by the slope range's midpoint. Training draws its
+        // slopes from each backend's own random stream, so it has no cross-backend reference.
+        yield return new OpCase("TensorRrelu[4,6;eval]", "activation",
+            e => e.TensorRrelu(a.F(), 0.125, 0.25), e => e.TensorRrelu(a.D(), 0.125, 0.25),
+            ParityTol.Ulp(2), opMethod: "TensorRrelu");
         yield return new OpCase("TensorPower[4,6;^2]", "elementwise",
             e => e.TensorPower(a.F(), 2f), e => e.TensorPower(a.D(), 2.0),
             ParityTol.Exact, opMethod: "TensorPower");

@@ -4052,7 +4052,7 @@ public partial class DirectGpuTensorEngine
         if (result.GradFn is null)
         {
             // Binds the tape to this engine, so the backward of a device result runs on the device.
-            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
+            BindTapeIfRecording<T>();
             Autodiff.DifferentiableOps.RecordUnary("TensorUnfold", result, tensor, Autodiff.BackwardFunctions<T>.UnfoldParity210Backward,
                 savedState: new object[] { dim < 0 ? dim + tensor.Rank : dim, size, step, (int[])tensor._shape.Clone() });
         }
@@ -4270,7 +4270,7 @@ public partial class DirectGpuTensorEngine
         if (result.GradFn is null)
         {
             // Binds the tape to this engine, so the backward of a device result runs on the device.
-            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
+            BindTapeIfRecording<T>();
             Autodiff.DifferentiableOps.RecordUnary("TensorMaskedSelect", result, tensor, Autodiff.BackwardFunctions<T>.MaskedSelectBackward, savedState: new object[] { mask.IsContiguous ? mask : mask.Contiguous(), (int[])tensor._shape.Clone() });
         }
         return result;
@@ -4858,7 +4858,7 @@ public partial class DirectGpuTensorEngine
         if (result.GradFn is null)
         {
             // Binds the tape to this engine, so the backward of a device result runs on the device.
-            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
+            BindTapeIfRecording<T>();
             Autodiff.DifferentiableOps.RecordUnary("TensorTakeAlongDim", result, tensor, Autodiff.BackwardFunctions<T>.TakeAlongDimBackward, savedState: new object[] { indices, dim });
         }
         return result;
@@ -5075,7 +5075,7 @@ public partial class DirectGpuTensorEngine
         if (result.GradFn is null)
         {
             // Binds the tape to this engine, so the backward of a device result runs on the device.
-            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
+            BindTapeIfRecording<T>();
             Autodiff.DifferentiableOps.RecordBinary("TensorKron", result, a, b, Autodiff.BackwardFunctions<T>.KronBackward);
         }
         return result;
@@ -7169,7 +7169,7 @@ public partial class DirectGpuTensorEngine
         if (result.GradFn is null)
         {
             // Binds the tape to this engine, so the backward of a device result runs on the device.
-            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
+            BindTapeIfRecording<T>();
             Autodiff.DifferentiableOps.RecordBinary("TensorZeta", result, x, q, Autodiff.BackwardFunctions<T>.ZetaBackward);
         }
         return result;
@@ -7209,7 +7209,7 @@ public partial class DirectGpuTensorEngine
         if (result.GradFn is null)
         {
             // Binds the tape to this engine, so the backward of a device result runs on the device.
-            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
+            BindTapeIfRecording<T>();
             Autodiff.DifferentiableOps.RecordUnary("TensorPolygamma", result, tensor, Autodiff.BackwardFunctions<T>.PolygammaBackward, savedState: new object[] { n });
         }
         return result;
@@ -7371,7 +7371,7 @@ public partial class DirectGpuTensorEngine
         if (result.GradFn is null)
         {
             // Binds the tape to this engine, so the backward of a device result runs on the device.
-            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
+            BindTapeIfRecording<T>();
             Autodiff.DifferentiableOps.RecordBinary("TensorCross", result, a, b, Autodiff.BackwardFunctions<T>.CrossBackward, savedState: new object[] { dim });
         }
         return result;
@@ -7465,7 +7465,7 @@ public partial class DirectGpuTensorEngine
         if (result.GradFn is null)
         {
             // Binds the tape to this engine, so the backward of a device result runs on the device.
-            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
+            BindTapeIfRecording<T>();
             Autodiff.DifferentiableOps.RecordUnary("TensorLdexp", result, x, Autodiff.BackwardFunctions<T>.LdexpBackward, new object[] { exp });
         }
         return result;
@@ -10240,7 +10240,7 @@ public partial class DirectGpuTensorEngine
                 ownsBuffer: true, bufferContainsRawInt32: true);
             idxBuf.RelinquishOwnership();
 
-            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
+            BindTapeIfRecording<T>();
             Autodiff.DifferentiableOps.RecordUnary("MaxPool3DWithIndices", result, input,
                 Autodiff.BackwardFunctions<T>.MaxPool3DTensorIndicesBackward,
                 new object[] { maxIndices, poolSize, stride });

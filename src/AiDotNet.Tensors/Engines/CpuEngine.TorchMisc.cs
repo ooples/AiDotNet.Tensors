@@ -40,11 +40,12 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorRrelu<T>(Tensor<T> tensor, double lower = 1.0 / 8, double upper = 1.0 / 3, bool training = false, int? seed = null)
     {
-        if (training && seed is null)
+        if (training && seed is null && GraphMode.IsActive && !GraphMode.IsInferenceTrace)
         {
             // Unseeded training draws new slopes every step. The compiled backward re-runs the op under a tape, so
             // each replay draws one seed for its forward and the backward reuses it: the gradient then uses the slopes
-            // the forward applied, as the eager tape does.
+            // the forward applied, as the eager tape does. Replays of one plan share this source, so they must not
+            // run concurrently (System.Random is not thread-safe).
             var seeds = RandomSource(null);
             int stepSeed = 0;
             if (TryRecordCompiledOp("TensorRrelu", new Tensor<T>?[] { tensor },
@@ -53,7 +54,8 @@ public partial class CpuEngine
                     backwardForward: e => e.TensorRrelu(tensor, lower, upper, training: true, stepSeed)))
                 return unseededNode;
         }
-        else if (TryRecordCompiledOp("TensorRrelu", new Tensor<T>?[] { tensor }, e => e.TensorRrelu(tensor, lower, upper, training, seed), out var compiledNode))
+        else if (!(training && seed is null)
+            && TryRecordCompiledOp("TensorRrelu", new Tensor<T>?[] { tensor }, e => e.TensorRrelu(tensor, lower, upper, training, seed), out var compiledNode))
             return compiledNode;
         if (training) GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));

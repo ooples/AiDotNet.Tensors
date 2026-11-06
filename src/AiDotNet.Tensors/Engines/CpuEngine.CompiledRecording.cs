@@ -41,15 +41,9 @@ public partial class CpuEngine
     internal bool TryRecordCompiledOp<T>(string opName, Tensor<T>?[] inputs, Func<IEngine, Tensor<T>> forward,
         out Tensor<T> result, Func<IEngine, Tensor<T>>? backwardForward = null)
     {
+        // net471 has no NotNullWhen; a caller reads result only when this returns true.
         result = null!;
-        if (!GraphMode.IsActive || GraphMode.IsInferenceTrace) return false;
-        var scope = GraphMode.Current;
-        if (scope is null || !scope.BindEngine(this)) return false;
-
-        var operands = new List<Tensor<T>>(inputs.Length);
-        foreach (var input in inputs.Where(x => x is not null && !operands.Contains(x)))
-            operands.Add(input!);
-        if (operands.Count == 0) return false;
+        if (BeginCompiledRecord(inputs, out var operands) is not { } scope) return false;
         BindCaptures(scope, forward, operands);
         if (backwardForward is not null) BindCaptures(scope, backwardForward, operands);
 
@@ -69,6 +63,23 @@ public partial class CpuEngine
             (eng, output) => DirectGpuTensorEngine.CopyResultInto(eng, CheckReplayShape(opName, forward(eng), output), output),
             BackwardFunctions<T>.ReplayUnderTape(backwardForward ?? forward));
         return true;
+    }
+
+    // The recording scope of a training trace that binds this engine, and the distinct non-null operands in order;
+    // null when the op runs eagerly (no trace, an inference trace, another engine's trace, or no tensor operand).
+    private LazyTensorScope? BeginCompiledRecord<T>(Tensor<T>?[] inputs, out List<Tensor<T>> operands)
+    {
+        operands = new List<Tensor<T>>(inputs.Length);
+        if (!GraphMode.IsActive || GraphMode.IsInferenceTrace) return null;
+        var current = GraphMode.Current;
+        if (current is null || !current.BindEngine(this)) return null;
+        for (int i = 0; i < inputs.Length; i++)
+        {
+            var input = inputs[i];
+            if (input is not null && !operands.Contains(input)) operands.Add(input);
+        }
+
+        return operands.Count == 0 ? null : current;
     }
 
     // A plan's buffers have the trace's shapes. An op whose output shape depends on data (MaskedSelect counts its
@@ -98,14 +109,7 @@ public partial class CpuEngine
     {
         result = null!;
         aux = default!;
-        if (!GraphMode.IsActive || GraphMode.IsInferenceTrace) return false;
-        var scope = GraphMode.Current;
-        if (scope is null || !scope.BindEngine(this)) return false;
-
-        var operands = new List<Tensor<T>>(inputs.Length);
-        foreach (var input in inputs.Where(x => x is not null && !operands.Contains(x)))
-            operands.Add(input!);
-        if (operands.Count == 0) return false;
+        if (BeginCompiledRecord(inputs, out var operands) is not { } scope) return false;
         BindCaptures(scope, forward, operands);
 
         Tensor<T> traced;
@@ -172,7 +176,7 @@ public partial class CpuEngine
             if (DependOnProducer(scope, value, operands)) continue;
             if (value is Array array)
             {
-                if (!array.GetType().GetElementType()!.IsValueType)
+                if (array.GetType().GetElementType() is { IsValueType: false })
                     foreach (var element in array)
                         if (element is not null) DependOnProducer(scope, element, operands);
                 field.SetValue(closure, array.Clone());

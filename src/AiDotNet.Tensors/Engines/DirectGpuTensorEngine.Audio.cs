@@ -169,7 +169,7 @@ public partial class DirectGpuTensorEngine
         // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
         if (result.GradFn is null)
         {
-            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
+            BindTapeIfRecording<T>();
             Autodiff.DifferentiableOps.RecordUnary("Resample", result, waveform, Autodiff.BackwardFunctions<T>.ResampleBackward, new object[] { origRate, newRate });
         }
         return result;
