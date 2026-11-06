@@ -12,6 +12,11 @@ namespace AiDotNet.Tensors.Engines;
 
 public partial class CpuEngine
 {
+    // The float and double kernels below take the element type's own arrays and tensors. A T[] or Tensor<T> reaches
+    // them only inside a typeof(T) branch, and C# has no direct conversion from an unconstrained T's array or tensor,
+    // so this is the one checked reinterpretation (a wrong T throws InvalidCastException, never misreads memory).
+    private static TTarget Reinterpret<TTarget>(object value) where TTarget : class => (TTarget)value;
+
     /// <summary>
     /// Fused linear (LM head) + cross-entropy-with-logits loss in a SINGLE op
     /// (forward scalar loss + custom autodiff backward), for the paper-scale LM head where the
@@ -64,7 +69,7 @@ public partial class CpuEngine
         if (targetIds.Rank != 1 || targetIds.Length != n)
             throw new ArgumentException($"targetIds must be rank-1 [N={n}].", nameof(targetIds));
 
-        var ids = (int[])(object)targetIds.GetDataArray();
+        var ids = targetIds.GetDataArray();
         for (int r = 0; r < n; r++)
             if (ids[r] < 0 || ids[r] >= vocab)
                 throw new ArgumentOutOfRangeException(nameof(targetIds),
@@ -123,9 +128,9 @@ public partial class CpuEngine
         }
 
         double lossValue = typeof(T) == typeof(double)
-            ? FusedCeLossIndexDouble((double[])(object)logitData, ids, n, vocab)
+            ? FusedCeLossIndexDouble(Reinterpret<double[]>(logitData), ids, n, vocab)
             : typeof(T) == typeof(float)
-                ? FusedCeLossIndexFloat((float[])(object)logitData, ids, n, vocab)
+                ? FusedCeLossIndexFloat(Reinterpret<float[]>(logitData), ids, n, vocab)
                 : FusedCeLossIndexGeneric<T>(logitData, ids, n, vocab);
 
         var output = new Tensor<T>(new[] { 1 }); // scalar loss (length-1)
@@ -225,7 +230,7 @@ public partial class CpuEngine
         if (typeof(T) == typeof(double))
         {
             lossValue = FusedCeLossDouble(
-                (double[])(object)logitData, (double[])(object)target.GetDataArray(), n, vocab);
+                Reinterpret<double[]>(logitData), Reinterpret<double[]>(target.GetDataArray()), n, vocab);
         }
         else
         {
@@ -257,11 +262,11 @@ public partial class CpuEngine
         var bi = bias.GetDataArray();
         if (typeof(T) == typeof(float))
         {
-            AddBiasRowsFloat((float[])(object)lo, (float[])(object)bi, n, vocab);
+            AddBiasRowsFloat(Reinterpret<float[]>(lo), Reinterpret<float[]>(bi), n, vocab);
         }
         else if (typeof(T) == typeof(double))
         {
-            var l = (double[])(object)lo; var b = (double[])(object)bi;
+            var l = Reinterpret<double[]>(lo); var b = Reinterpret<double[]>(bi);
             for (int r = 0; r < n; r++)
             {
                 int off = r * vocab;
@@ -388,13 +393,13 @@ public partial class CpuEngine
             if (typeof(T) == typeof(double))
             {
                 SoftmaxMinusIndexDouble(
-                    (double[])(object)logitData, ids,
-                    (double[])(object)dLogits.GetDataArray(), n, vocab, g);
+                    Reinterpret<double[]>(logitData), ids,
+                    Reinterpret<double[]>(dLogits.GetDataArray()), n, vocab, g);
             }
             else if (typeof(T) == typeof(float))
             {
                 SoftmaxMinusIndexFloat(
-                    (float[])(object)logitData, ids, (float[])(object)dLogits.GetDataArray(), n, vocab, g);
+                    Reinterpret<float[]>(logitData), ids, Reinterpret<float[]>(dLogits.GetDataArray()), n, vocab, g);
             }
             else
             {
@@ -453,9 +458,9 @@ public partial class CpuEngine
     internal Tensor<T> FusedLinearCrossEntropyWithGradientsFloat<T>(
         Tensor<T> hidden, Tensor<T> weight, Tensor<T> bias, int[] ids, int n, int d, int vocab, long chunkElements)
     {
-        var h = (Tensor<float>)(object)hidden;
-        var w = (Tensor<float>)(object)weight;
-        var biasData = ((Tensor<float>)(object)bias).GetDataArray()!;
+        var h = Reinterpret<Tensor<float>>(hidden);
+        var w = Reinterpret<Tensor<float>>(weight);
+        var biasData = Reinterpret<Tensor<float>>(bias).GetDataArray();
         float scale = 1f / n;
         int rowsPerChunk = (int)Math.Max(1, Math.Min(n, chunkElements / vocab));
         var rowLoss = new double[n];
@@ -479,23 +484,23 @@ public partial class CpuEngine
             }
             else
             {
-                var hData = h.IsContiguous ? h.GetDataArray()! : h.Contiguous().GetDataArray()!;
+                var hData = h.IsContiguous ? h.GetDataArray() : h.Contiguous().GetDataArray();
                 var dHiddenData = new float[(long)n * d];
                 for (int start = 0; start < n; start += rowsPerChunk)
                 {
                     int rows = Math.Min(rowsPerChunk, n - start);
                     var hc = new Tensor<float>(new float[(long)rows * d], new[] { rows, d });
-                    Array.Copy(hData, (long)start * d, hc.GetDataArray()!, 0, (long)rows * d);
+                    Array.Copy(hData, (long)start * d, hc.GetDataArray(), 0, (long)rows * d);
                     var data = TakeFusedCeWorkspace((long)rows * vocab);
                     var dLogits = new Tensor<float>(data, new[] { rows, vocab });
                     MatMulInto(dLogits, hc, w);
                     CrossEntropyGradRowsFloat(data, biasData, ids, start, rows, vocab, scale, rowLoss);
                     var dhc = DLogitsTimesWeightTransposed(data, w, rows, d, vocab);
-                    Array.Copy(dhc.GetDataArray()!, 0, dHiddenData, (long)start * d, (long)rows * d);
+                    Array.Copy(dhc.GetDataArray(), 0, dHiddenData, (long)start * d, (long)rows * d);
                     var dwc = PrefaultedTensor(d, vocab);
                     MatMulInto(dwc, TensorTranspose(hc), dLogits);
                     if (dWeight is null) dWeight = dwc;
-                    else AddInPlaceFloat(dWeight.GetDataArray()!, dwc.GetDataArray()!);
+                    else AddInPlaceFloat(dWeight.GetDataArray(), dwc.GetDataArray());
                     ColumnSumsFloat(data, dBias, rows, vocab);
                     ReturnFusedCeWorkspace(data);
                 }
@@ -506,7 +511,7 @@ public partial class CpuEngine
         double total = 0.0;
         for (int r = 0; r < n; r++) total += rowLoss[r];
         var output = new Tensor<T>(new[] { 1 });
-        output.GetDataArray()![0] = MathHelper.GetNumericOperations<T>().FromDouble(total / n);
+        output.GetDataArray()[0] = MathHelper.GetNumericOperations<T>().FromDouble(total / n);
 
         var precomputed = new FusedCePrecomputedGradients
         {
@@ -540,16 +545,16 @@ public partial class CpuEngine
             return;
         }
 
-        float g = (float)MathHelper.GetNumericOperations<T>().ToDouble(gradOutput.GetDataArray()![0]);
+        float g = (float)MathHelper.GetNumericOperations<T>().ToDouble(gradOutput.GetDataArray()[0]);
         if (g != 1f)
         {
-            ScaleInPlaceFloat(dHidden.GetDataArray()!, g);
-            ScaleInPlaceFloat(dWeight.GetDataArray()!, g);
-            ScaleInPlaceFloat(dBias.GetDataArray()!, g);
+            ScaleInPlaceFloat(dHidden.GetDataArray(), g);
+            ScaleInPlaceFloat(dWeight.GetDataArray(), g);
+            ScaleInPlaceFloat(dBias.GetDataArray(), g);
         }
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], (Tensor<T>)(object)dHidden, engine);
-        DifferentiableOps.AccumulateGrad(grads, inputs[1], (Tensor<T>)(object)dWeight, engine);
-        DifferentiableOps.AccumulateGrad(grads, inputs[2], (Tensor<T>)(object)dBias, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], Reinterpret<Tensor<T>>(dHidden), engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], Reinterpret<Tensor<T>>(dWeight), engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[2], Reinterpret<Tensor<T>>(dBias), engine);
     }
 
     // Rows [start, start + rows) of a chunk: rowLoss[start + i] is row i's CE, and row i becomes its scaled gradient.
@@ -597,7 +602,7 @@ public partial class CpuEngine
     /// </remarks>
     private static unsafe Tensor<float> DLogitsTimesWeightTransposed(float[] dLogits, Tensor<float> w, int rows, int d, int vocab)
     {
-        var wData = w.IsContiguous ? w.GetDataArray()! : w.Contiguous().GetDataArray()!;
+        var wData = w.IsContiguous ? w.GetDataArray() : w.Contiguous().GetDataArray();
         var result = new float[(long)rows * d];
         int slices = Math.Min(FusedCeSplitKMaxSlices, vocab / FusedCeSplitKSlice);
         if (slices < 2)
@@ -891,8 +896,8 @@ public partial class CpuEngine
             if (typeof(T) == typeof(double))
             {
                 SoftmaxMinusTargetDouble(
-                    (double[])(object)logitData, (double[])(object)target.GetDataArray(),
-                    (double[])(object)dLogits.GetDataArray(), n, vocab, g);
+                    Reinterpret<double[]>(logitData), Reinterpret<double[]>(target.GetDataArray()),
+                    Reinterpret<double[]>(dLogits.GetDataArray()), n, vocab, g);
             }
             else
             {
@@ -962,11 +967,11 @@ public partial class CpuEngine
         var res = result.GetDataArray();
         if (typeof(T) == typeof(float))
         {
-            ColumnSumsFloat((float[])(object)dl, (float[])(object)res, n, vocab);
+            ColumnSumsFloat(Reinterpret<float[]>(dl), Reinterpret<float[]>(res), n, vocab);
         }
         else if (typeof(T) == typeof(double))
         {
-            var d = (double[])(object)dl; var rr = (double[])(object)res;
+            var d = Reinterpret<double[]>(dl); var rr = Reinterpret<double[]>(res);
             for (int r = 0; r < n; r++)
             {
                 int off = r * vocab;

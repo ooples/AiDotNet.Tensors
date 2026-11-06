@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using AiDotNet.Tensors;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
@@ -6988,9 +6989,9 @@ public partial class DirectGpuTensorEngine
     /// kernels or the shapes are not 4D float, so the caller falls back to the CpuEngine reference.
     /// </summary>
     private bool TryGridSampleModeBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> grid, int[] inputShape,
-        GridSampleMode mode, GridSamplePadding padding, bool alignCorners, out Tensor<T> result)
+        GridSampleMode mode, GridSamplePadding padding, bool alignCorners, [NotNullWhen(true)] out Tensor<T>? result)
     {
-        result = null!;
+        result = null;
         if (typeof(T) != typeof(float) || inputShape.Length != 4 || gradOutput.Rank != 4
             || grid.Rank != 4 || grid._shape[3] != 2
             || !TryGetBackend(out var backend) || backend is not IGeometryBackwardBackend geom)
@@ -7035,9 +7036,9 @@ public partial class DirectGpuTensorEngine
     /// <see cref="TryGridSampleModeBackwardInput{T}"/>.
     /// </summary>
     private bool TryGridSampleModeBackwardGrid<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> grid,
-        GridSampleMode mode, GridSamplePadding padding, bool alignCorners, out Tensor<T> result)
+        GridSampleMode mode, GridSamplePadding padding, bool alignCorners, [NotNullWhen(true)] out Tensor<T>? result)
     {
-        result = null!;
+        result = null;
         if (typeof(T) != typeof(float) || input.Rank != 4 || gradOutput.Rank != 4
             || grid.Rank != 4 || grid._shape[3] != 2
             || !TryGetBackend(out var backend) || backend is not IGeometryBackwardBackend geom)
