@@ -9,7 +9,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private DirectOpenClKernel GetGeometryKernel(string name)
         {
             if (!_kernelCache.TryGetValue(name, out var kernel))
-                throw new InvalidOperationException(
+                // A module that failed to compile on this device is a capability gap, not a fault: the engine answers
+                // it with the CPU fallback (#1165).
+                throw new GpuCapabilityUnavailableException(
                     $"OpenCL geometry kernel not found: {name}. Module may have failed to compile.");
             return kernel;
         }

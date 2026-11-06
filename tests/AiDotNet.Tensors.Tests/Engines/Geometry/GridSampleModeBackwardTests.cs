@@ -136,19 +136,69 @@ public class GridSampleModeBackwardTests
         var dGrid = _engine.GridSampleBackwardGrid(gradOut, input, grid, GridSampleMode.Nearest, padding, false);
         for (int i = 0; i < dGrid.Length; i++) Assert.Equal(0.0, dGrid[i]);
 
-        // With an all-ones upstream gradient, each input pixel's gradient is the number of output points
-        // that read it, and the total is the number of points that read a real pixel.
+        // With an all-ones upstream gradient, each input pixel's gradient is the number of output points that read
+        // it. The reads are counted here independently of the engine: round to the nearest pixel (the points keep
+        // their fraction away from .5), then apply the padding rule to that integer index.
         var dInput = _engine.GridSampleBackwardInput(gradOut, grid, input.Shape.ToArray(),
             GridSampleMode.Nearest, padding, false);
-        double total = 0;
+        var expected = new double[dInput.Length];
+        int reads = 0;
+        for (int n = 0; n < N; n++)
+            for (int p = 0; p < OutH * OutW; p++)
+            {
+                int gOff = (n * OutH * OutW + p) * 2;
+                int x = Pad((int)Math.Round(((grid[gOff] + 1) * W - 1) / 2), W, padding);
+                int y = Pad((int)Math.Round(((grid[gOff + 1] + 1) * H - 1) / 2), H, padding);
+                if (x < 0 || y < 0) continue;
+                reads++;
+                for (int c = 0; c < C; c++) expected[((n * C + c) * H + y) * W + x] += 1;
+            }
+
+        _out.WriteLine($"Nearest/{padding}: {reads} of {N * OutH * OutW} points read a pixel");
+        Assert.True(reads > 0);
+        if (padding == GridSamplePadding.Zeros) Assert.True(reads < N * OutH * OutW, "the grid should leave the image");
         for (int i = 0; i < dInput.Length; i++)
+            Assert.True(expected[i] == dInput[i], $"Nearest/{padding}: pixel {i} read {expected[i]} times, gradient {dInput[i]}");
+    }
+
+    // The padding rule on an integer pixel index, align_corners = false: Zeros has no pixel outside the image,
+    // Border clamps, Reflection mirrors about the outer pixel edges (-1 -> 0, S -> S - 1), with period 2S.
+    /// <summary>
+    /// Reflection without align_corners mirrors about the image edges, as PyTorch does: a point one pixel left of
+    /// pixel 0 reads pixel 0, not pixel 1. Input [1, 2, 4], source x in {-1, -1.25, 3, 3.5}; PyTorch reflects x to
+    /// {0, 0.25, 2, 1.5} and samples 1, 1.25, 4 and 3. The input gradient of their sum is [1.75, 0.75, 1.5].
+    /// </summary>
+    [Fact]
+    public void BilinearReflection_WithoutAlignCorners_MirrorsAboutTheImageEdge()
+    {
+        var input = new Tensor<double>(new double[] { 1, 2, 4 }, [1, 1, 1, 3]);
+        double[] sx = { -1, -1.25, 3, 3.5 };
+        var grid = new Tensor<double>([1, 1, sx.Length, 2]);
+        for (int i = 0; i < sx.Length; i++) grid[i * 2] = PixelToNormalized(sx[i], 3, align: false);
+
+        var y = _engine.GridSample(input, grid, GridSampleMode.Bilinear, GridSamplePadding.Reflection, false);
+        double[] expected = { 1, 1.25, 4, 3 };
+        for (int i = 0; i < expected.Length; i++)
+            Assert.True(Math.Abs(y[i] - expected[i]) < 1e-12, $"x = {sx[i]}: sampled {y[i]}, PyTorch {expected[i]}");
+
+        var ones = new Tensor<double>([1, 1, 1, sx.Length]);
+        for (int i = 0; i < ones.Length; i++) ones[i] = 1.0;
+        var dInput = _engine.GridSampleBackwardInput(ones, grid, [1, 1, 1, 3], GridSampleMode.Bilinear,
+            GridSamplePadding.Reflection, false);
+        double[] expectedGrad = { 1.75, 0.75, 1.5 };
+        for (int i = 0; i < expectedGrad.Length; i++)
+            Assert.True(Math.Abs(dInput[i] - expectedGrad[i]) < 1e-12, $"pixel {i}: gradient {dInput[i]}, expected {expectedGrad[i]}");
+    }
+
+    private static int Pad(int i, int size, GridSamplePadding padding)
+    {
+        switch (padding)
         {
-            Assert.Equal(Math.Round(dInput[i]), dInput[i]);
-            total += dInput[i];
+            case GridSamplePadding.Zeros: return i >= 0 && i < size ? i : -1;
+            case GridSamplePadding.Border: return Math.Max(0, Math.Min(size - 1, i));
+            default:
+                int m = ((i % (2 * size)) + 2 * size) % (2 * size);
+                return m < size ? m : 2 * size - 1 - m;
         }
-        double expected = padding == GridSamplePadding.Zeros ? double.NaN : N * C * OutH * OutW;
-        _out.WriteLine($"Nearest/{padding}: total input gradient {total}");
-        if (!double.IsNaN(expected)) Assert.Equal(expected, total);
-        else Assert.True(total <= N * C * OutH * OutW);
     }
 }

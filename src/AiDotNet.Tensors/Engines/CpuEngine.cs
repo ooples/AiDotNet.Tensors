@@ -18273,6 +18273,14 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!GraphMode.IsActive)
             return MaxPool2DWithTensorIndicesEager(input, poolSize, stride, out maxIndices);
 
+        // Compiled training: each replay pools again and copies the fresh winners into the indices the caller holds.
+        // The route below pools through MaxPool2DWithIndices, whose graph node refreshes only the values, so a
+        // consumer of the indices (MaxUnpool) read the trace's all-zero indices on every step.
+        if (TryRecordCompiledOp("MaxPool2DWithTensorIndices", new Tensor<T>?[] { input },
+                e => (e.MaxPool2DWithTensorIndices(input, poolSize, stride, out var fresh), fresh),
+                RefreshIndices, out var compiledNode, out maxIndices))
+            return compiledNode;
+
         Tensor<T> result;
         int[,,,,] coordinateIndices;
         using (new NoGradScope<T>())
@@ -41998,6 +42006,12 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (predictions == null) throw new ArgumentNullException(nameof(predictions));
         if (targets == null) throw new ArgumentNullException(nameof(targets));
+        // The loss pairs the i-th prediction with the i-th target in row-major order and has the predictions' shape;
+        // every engine and every compiled replay pairs them that way, so the counts must agree.
+        if (targets.Length != predictions.Length)
+            throw new ArgumentException(
+                $"Binary cross-entropy pairs predictions and targets element by element: {predictions.Length} predictions, {targets.Length} targets.",
+                nameof(targets));
 
         if (GraphMode.IsActive)
         {

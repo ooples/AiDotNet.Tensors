@@ -23,7 +23,11 @@ public partial class DirectGpuTensorEngine
         // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
         // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
         if (result.GradFn is null)
+        {
+            // Binds the tape to this engine, so the backward of a device result runs on the device.
+            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
             Autodiff.DifferentiableOps.RecordBinary("RoIAlign", result, input, boxes, Autodiff.BackwardFunctions<T>.RoIAlignBackward, new object[] { outputHeight, outputWidth, spatialScale, samplingRatio, aligned });
+        }
         return result;
     }
 
@@ -96,7 +100,11 @@ public partial class DirectGpuTensorEngine
         // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
         // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
         if (result.GradFn is null)
+        {
+            // Binds the tape to this engine, so the backward of a device result runs on the device.
+            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
             Autodiff.DifferentiableOps.RecordBinary("PsRoIAlign", result, input, boxes, Autodiff.BackwardFunctions<T>.PsRoIAlignBackward, new object[] { outputHeight, outputWidth, outputChannels, spatialScale, samplingRatio });
+        }
         return result;
     }
 
@@ -143,7 +151,11 @@ public partial class DirectGpuTensorEngine
         // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
         // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
         if (result.GradFn is null)
+        {
+            // Binds the tape to this engine, so the backward of a device result runs on the device.
+            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
             Autodiff.DifferentiableOps.RecordBinary("PsRoIPool", result, input, boxes, Autodiff.BackwardFunctions<T>.PsRoIPoolBackward, new object[] { outputHeight, outputWidth, outputChannels, spatialScale });
+        }
         return result;
     }
 
@@ -188,7 +200,11 @@ public partial class DirectGpuTensorEngine
         // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
         // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
         if (result.GradFn is null)
+        {
+            // Binds the tape to this engine, so the backward of a device result runs on the device.
+            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
             Autodiff.DifferentiableOps.RecordBinary("RoIPool", result, input, boxes, Autodiff.BackwardFunctions<T>.RoIPoolBackward, new object[] { outputHeight, outputWidth, spatialScale });
+        }
         return result;
     }
 

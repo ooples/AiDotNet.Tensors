@@ -977,7 +977,8 @@ extern ""C"" __global__ __launch_bounds__(256) void reciprocal_backward(const fl
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     float y = input[idx];
-    gradInput[idx] = -gradOutput[idx] * (y * y);
+    // g * y first: y * y overflows float for |y| > 1.8e19 even when the derivative g * y^2 does not.
+    gradInput[idx] = -(gradOutput[idx] * y) * y;
 }
 
 // Variance backward: dx = gradOutput * 2*(x - mean)/n

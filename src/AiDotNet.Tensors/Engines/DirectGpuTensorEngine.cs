@@ -10750,7 +10750,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Compilation.GraphMode.ThrowIfInferenceUnsupported(
             Compilation.GraphCaptureLimitation.HeterogeneousOutput);
 
-        if (TryMaxPool2DWithTensorIndicesOnDevice(input, poolSize, stride, padding: 0) is not { } pooled)
+        // Under a compiled trace the CpuEngine op records the node; each replay re-enters here outside graph mode.
+        if (Compilation.GraphMode.IsActive
+            || TryMaxPool2DWithTensorIndicesOnDevice(input, poolSize, stride, padding: 0) is not { } pooled)
             return base.MaxPool2DWithTensorIndices(input, poolSize, stride, out maxIndices);
 
         maxIndices = pooled.Indices;

@@ -186,13 +186,21 @@ layout(push_constant) uniform P {
     int mode; int padding; int alignCorners;
 };
 " + Helpers + @"
+int grid_reflect(int i, int extent) {
+    // PyTorch's convention: about the corner pixels' centres with alignCorners, about the image edges without.
+    if (alignCorners != 0) return reflect_index(i, extent);
+    int period = 2 * extent;
+    int j = i < 0 ? -1 - i : i;
+    int r = j % period;
+    return r < extent ? r : period - 1 - r;
+}
 float sample_safe(int n, int y, int x, int c) {
     if (padding == 0) {
         if (uint(y) >= uint(H) || uint(x) >= uint(W)) return 0.0;
     } else if (padding == 1) {
         y = clamp_i(y, 0, H - 1); x = clamp_i(x, 0, W - 1);
     } else {
-        y = reflect_index(y, H); x = reflect_index(x, W);
+        y = grid_reflect(y, H); x = grid_reflect(x, W);
     }
     return input_[((n * C + c) * H + y) * W + x];
 }
@@ -271,10 +279,18 @@ layout(push_constant) uniform P {
 ";
 
     private const string GridSampleTaps = @"
+int grid_reflect(int i, int extent) {
+    // PyTorch's convention: about the corner pixels' centres with alignCorners, about the image edges without.
+    if (alignCorners != 0) return reflect_index(i, extent);
+    int period = 2 * extent;
+    int j = i < 0 ? -1 - i : i;
+    int r = j % period;
+    return r < extent ? r : period - 1 - r;
+}
 int grid_sample_tap(int i, int extent) {
     if (padding == 0) return uint(i) < uint(extent) ? i : -1;
     if (padding == 1) return clamp_i(i, 0, extent - 1);
-    return reflect_index(i, extent);
+    return grid_reflect(i, extent);
 }
 
 // dK/dd of cubic_kernel for d >= 0, which every offset the taps use is.
@@ -347,7 +363,6 @@ void main() {
     int taps = grid_sample_taps(gid * 2, tx, ty, wx, wy, dwx, dwy);
     for (int c = 0; c < C; c++) {
         float g = gradOut_[((n * C + c) * outH + oy) * outW + ox];
-        if (g == 0.0) continue;
         int plane = (n * C + c) * H;
         for (int j = 0; j < taps; j++) {
             if (ty[j] < 0) continue;
@@ -380,6 +395,9 @@ layout(set = 0, binding = 3) writeonly buffer GG { float gradGrid_[]; };
 void main() {
     int gid = int(gl_GlobalInvocationID.x);
     if (gid >= N * outH * outW) return;
+    // Nearest is piecewise constant: its grid gradient is exactly 0, written directly so that a non-finite input
+    // or upstream gradient cannot turn the zero derivative into NaN.
+    if (mode == 1) { gradGrid_[gid * 2] = 0.0; gradGrid_[gid * 2 + 1] = 0.0; return; }
     int ox = gid % outW; int t1 = gid / outW;
     int oy = t1 % outH; int n = t1 / outH;
     int tx[4]; int ty[4]; float wx[4]; float wy[4]; float dwx[4]; float dwy[4];
@@ -387,7 +405,6 @@ void main() {
     float gradX = 0.0, gradY = 0.0;
     for (int c = 0; c < C; c++) {
         float g = gradOut_[((n * C + c) * outH + oy) * outW + ox];
-        if (g == 0.0) continue;
         int plane = (n * C + c) * H;
         for (int j = 0; j < taps; j++) {
             if (ty[j] < 0) continue;

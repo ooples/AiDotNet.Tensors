@@ -57,6 +57,17 @@ inline int reflect_index(int i, int extent)
     return r < extent ? r : period - r;
 }
 
+// GridSample's Reflection (PyTorch's convention): with alignCorners about the corner pixels' centres, which is
+// reflect_index; without, about the image edges half a pixel further out, so -1 reads pixel 0.
+inline int grid_reflect(int i, int extent, int alignCorners)
+{
+    if (alignCorners != 0) return reflect_index(i, extent);
+    int period = 2 * extent;
+    int j = i < 0 ? -1 - i : i;
+    int r = j % period;
+    return r < extent ? r : period - 1 - r;
+}
+
 inline int pad_boundary(int idx, int extent, int mode)
 {
     if (extent <= 0) return 0;
@@ -200,14 +211,14 @@ __kernel void geometry_pad_4d(
 // ----------------------------------------------------------------------------
 
 inline float grid_sample_safe(__global const float* src,
-    int n, int y, int x, int c, int H, int W, int C, int padding)
+    int n, int y, int x, int c, int H, int W, int C, int padding, int alignCorners)
 {
     if (padding == 0) {
         if ((uint)y >= (uint)H || (uint)x >= (uint)W) return 0.0f;
     } else if (padding == 1) {
         y = clamp_i(y, 0, H - 1); x = clamp_i(x, 0, W - 1);
     } else {
-        y = reflect_index(y, H); x = reflect_index(x, W);
+        y = grid_reflect(y, H, alignCorners); x = grid_reflect(x, W, alignCorners);
     }
     return src[((n * C + c) * H + y) * W + x]; // NCHW
 }
@@ -243,16 +254,16 @@ __kernel void geometry_grid_sample_2d(
         int nx = (int)rint(sx), ny = (int)rint(sy);
         for (int c = 0; c < C; c++)
             output[((n * C + c) * outH + oy) * outW + ox] =
-                grid_sample_safe(input, n, ny, nx, c, H, W, C, padding);
+                grid_sample_safe(input, n, ny, nx, c, H, W, C, padding, alignCorners);
     } else if (mode == 0) {
         int x0 = (int)floor(sx), y0 = (int)floor(sy);
         int x1 = x0 + 1, y1 = y0 + 1;
         double fx = sx - x0, fy = sy - y0;
         for (int c = 0; c < C; c++) {
-            float v00 = grid_sample_safe(input, n, y0, x0, c, H, W, C, padding);
-            float v01 = grid_sample_safe(input, n, y0, x1, c, H, W, C, padding);
-            float v10 = grid_sample_safe(input, n, y1, x0, c, H, W, C, padding);
-            float v11 = grid_sample_safe(input, n, y1, x1, c, H, W, C, padding);
+            float v00 = grid_sample_safe(input, n, y0, x0, c, H, W, C, padding, alignCorners);
+            float v01 = grid_sample_safe(input, n, y0, x1, c, H, W, C, padding, alignCorners);
+            float v10 = grid_sample_safe(input, n, y1, x0, c, H, W, C, padding, alignCorners);
+            float v11 = grid_sample_safe(input, n, y1, x1, c, H, W, C, padding, alignCorners);
             double v = v00 * (1 - fx) * (1 - fy) + v01 * fx * (1 - fy)
                      + v10 * (1 - fx) * fy + v11 * fx * fy;
             output[((n * C + c) * outH + oy) * outW + ox] = (float)v;
@@ -271,7 +282,7 @@ __kernel void geometry_grid_sample_2d(
                 double rowAcc = 0.0;
                 for (int xx = 0; xx < 4; xx++) {
                     int xi = x0 - 1 + xx;
-                    rowAcc += wx[xx] * grid_sample_safe(input, n, yi, xi, c, H, W, C, padding);
+                    rowAcc += wx[xx] * grid_sample_safe(input, n, yi, xi, c, H, W, C, padding, alignCorners);
                 }
                 acc += wy[yy] * rowAcc;
             }
@@ -286,11 +297,11 @@ __kernel void geometry_grid_sample_2d(
 // read the zero padding, so it never moves a weight. One thread per sampling point, looping C like the forward.
 // ----------------------------------------------------------------------------
 
-inline int grid_sample_tap(int i, int extent, int padding)
+inline int grid_sample_tap(int i, int extent, int padding, int alignCorners)
 {
     if (padding == 0) return (unsigned)i < (unsigned)extent ? i : -1;
     if (padding == 1) return clamp_i(i, 0, extent - 1);
-    return reflect_index(i, extent);
+    return grid_reflect(i, extent, alignCorners);
 }
 
 // dK/dd of cubic_kernel for d >= 0, which every offset the taps use is.
@@ -315,8 +326,8 @@ int grid_sample_taps(__global const float* grid, int gOff, int H, int W,
     const ulong limBits = 0x41DFFFFFFDC00000UL; // 2147483639.0
     if ((as_ulong(sx) & 0x7FFFFFFFFFFFFFFFUL) >= limBits || (as_ulong(sy) & 0x7FFFFFFFFFFFFFFFUL) >= limBits) return 0;
     if (mode == 1) {
-        tx[0] = grid_sample_tap((int)rint(sx), W, padding);
-        ty[0] = grid_sample_tap((int)rint(sy), H, padding);
+        tx[0] = grid_sample_tap((int)rint(sx), W, padding, alignCorners);
+        ty[0] = grid_sample_tap((int)rint(sy), H, padding, alignCorners);
         wx[0] = 1.0; wy[0] = 1.0; dwx[0] = 0.0; dwy[0] = 0.0;
         return 1;
     }
@@ -326,8 +337,8 @@ int grid_sample_taps(__global const float* grid, int gOff, int H, int W,
         wx[0] = 1.0 - fx; wx[1] = fx; dwx[0] = -1.0; dwx[1] = 1.0;
         wy[0] = 1.0 - fy; wy[1] = fy; dwy[0] = -1.0; dwy[1] = 1.0;
         for (int k = 0; k < 2; k++) {
-            tx[k] = grid_sample_tap(x0 + k, W, padding);
-            ty[k] = grid_sample_tap(y0 + k, H, padding);
+            tx[k] = grid_sample_tap(x0 + k, W, padding, alignCorners);
+            ty[k] = grid_sample_tap(y0 + k, H, padding, alignCorners);
         }
         return 2;
     }
@@ -342,8 +353,8 @@ int grid_sample_taps(__global const float* grid, int gOff, int H, int W,
     dwy[0] = cubic_kernel_deriv(1.0 + fy, a); dwy[1] = cubic_kernel_deriv(fy, a);
     dwy[2] = -cubic_kernel_deriv(1.0 - fy, a); dwy[3] = -cubic_kernel_deriv(2.0 - fy, a);
     for (int k = 0; k < 4; k++) {
-        tx[k] = grid_sample_tap(x0 - 1 + k, W, padding);
-        ty[k] = grid_sample_tap(y0 - 1 + k, H, padding);
+        tx[k] = grid_sample_tap(x0 - 1 + k, W, padding, alignCorners);
+        ty[k] = grid_sample_tap(y0 - 1 + k, H, padding, alignCorners);
     }
     return 4;
 }
@@ -373,7 +384,6 @@ __kernel void geometry_grid_sample_2d_backward_input(
     int taps = grid_sample_taps(grid, gid * 2, H, W, mode, padding, alignCorners, tx, ty, wx, wy, dwx, dwy);
     for (int c = 0; c < C; c++) {
         double g = gradOut[((n * C + c) * outH + oy) * outW + ox];
-        if (g == 0.0) continue;
         int plane = (n * C + c) * H;
         for (int j = 0; j < taps; j++) {
             if (ty[j] < 0) continue;
@@ -393,6 +403,9 @@ __kernel void geometry_grid_sample_2d_backward_grid(
 {
     int gid = get_global_id(0);
     if (gid >= N * outH * outW) return;
+    // Nearest is piecewise constant: its grid gradient is exactly 0, written directly so that a non-finite input
+    // or upstream gradient cannot turn the zero derivative into NaN.
+    if (mode == 1) { gradGrid[gid * 2] = 0.0f; gradGrid[gid * 2 + 1] = 0.0f; return; }
     int ox = gid % outW; int t1 = gid / outW;
     int oy = t1 % outH; int n = t1 / outH;
     int tx[4], ty[4]; double wx[4], wy[4], dwx[4], dwy[4];
@@ -400,7 +413,6 @@ __kernel void geometry_grid_sample_2d_backward_grid(
     double gradX = 0.0, gradY = 0.0;
     for (int c = 0; c < C; c++) {
         double g = gradOut[((n * C + c) * outH + oy) * outW + ox];
-        if (g == 0.0) continue;
         int plane = (n * C + c) * H;
         for (int j = 0; j < taps; j++) {
             if (ty[j] < 0) continue;

@@ -998,8 +998,10 @@ public class DifferentiableOpsGradCheckSweep
                         if (got.Length != want.Length) { bad.Add($"input {i}: length {got.Length} vs {want.Length}"); continue; }
                         for (int k = 0; k < want.Length; k++)
                         {
+                            if (double.IsNaN(want[k]) && double.IsNaN(got[k])) continue;
                             double denom = Math.Max(1.0, Math.Abs(want[k]));
-                            if (Math.Abs(got[k] - want[k]) / denom > 1e-6)
+                            // Negated <= so a NaN on either side (and not both) is a mismatch.
+                            if (!(Math.Abs(got[k] - want[k]) / denom <= 1e-6))
                             {
                                 bad.Add($"input {i}[{k}]: tape {want[k]:G6} compiled {got[k]:G6}");
                                 break;

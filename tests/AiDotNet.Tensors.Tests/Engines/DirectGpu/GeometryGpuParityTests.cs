@@ -61,6 +61,16 @@ public class GeometryGpuParityTests : IClassFixture<DirectGpuTensorEngineTestFix
         var gs = g.AsSpan(); var cs = c.AsSpan();
         for (int i = 0; i < gs.Length; i++)
         {
+            // Non-finite values must match exactly: NaN fails every tolerance comparison, so without this a NaN GPU
+            // value would pass.
+            if (float.IsNaN(gs[i]) || float.IsInfinity(gs[i]) || float.IsNaN(cs[i]) || float.IsInfinity(cs[i]))
+            {
+                bool same = float.IsNaN(gs[i]) ? float.IsNaN(cs[i]) : gs[i].Equals(cs[i]);
+                if (!same)
+                    throw new Xunit.Sdk.XunitException($"GPU vs CPU non-finite mismatch at [{i}]: gpu={gs[i]}, cpu={cs[i]}");
+                continue;
+            }
+
             float d = Math.Abs(gs[i] - cs[i]);
             float scale = 1 + Math.Abs(cs[i]);
             if (d > tol * scale)
@@ -424,5 +434,30 @@ public class GeometryGpuParityTests : IClassFixture<DirectGpuTensorEngineTestFix
         if (mode != GridSampleMode.Nearest) AssertNonDegenerate(cpuGrid, "CPU grid gradient");
         AssertClose(gpuInput, cpuInput, 1e-4f);
         AssertClose(gpuGrid, cpuGrid, 1e-4f);
+    }
+
+    /// <summary>
+    /// Nearest's grid gradient is exactly 0 on the device even when the input holds infinities and the upstream
+    /// gradient is huge: a product of a non-finite value with the zero derivative would otherwise be NaN.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(GridSamplePadding.Zeros)]
+    [InlineData(GridSamplePadding.Border)]
+    [InlineData(GridSamplePadding.Reflection)]
+    public void GridSampleNearestBackward_NonFiniteInput_GridGradientIsExactlyZero(GridSamplePadding padding)
+    {
+        SkipIfUnavailable();
+        Skip.If(!BackendImplementsGeometryBackward(), "Backend has no IGeometryBackwardBackend kernels.");
+        const int N = 1, C = 2, H = 4, W = 5, outH = 3, outW = 4;
+        var input = Rand4D(41, N, C, H, W);
+        var span = input.AsWritableSpan();
+        for (int i = 0; i < span.Length; i += 3) span[i] = i % 2 == 0 ? float.PositiveInfinity : float.NaN;
+        var gradOut = Rand4D(42, N, C, outH, outW);
+        foreach (ref float v in gradOut.AsWritableSpan()) v *= 1e30f;
+        var grid = PaddingExercisingGrid(43, N, outH, outW, H, W, GridSampleMode.Nearest, false);
+
+        var gpuGrid = Gpu.GridSampleBackwardGrid(gradOut, input, grid, GridSampleMode.Nearest, padding, false);
+        foreach (float v in gpuGrid.AsSpan()) Assert.Equal(0f, v);
+        AssertClose(gpuGrid, _cpu.GridSampleBackwardGrid(gradOut, input, grid, GridSampleMode.Nearest, padding, false));
     }
 }

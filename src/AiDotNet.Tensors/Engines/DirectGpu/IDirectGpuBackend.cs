@@ -1655,6 +1655,11 @@ public interface IDirectGpuBackend : IDisposable
     void RReluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer noise, IGpuBuffer gradInput, int size);
     void Threshold(IGpuBuffer input, IGpuBuffer output, float threshold, float value, int size);
     void ThresholdBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, float threshold, int size);
+    /// <summary>
+    /// Backward of the reciprocal: gradInput = -gradOutput * y * y, where <paramref name="input"/> holds the forward
+    /// OUTPUT y = 1/x (not x), as <see cref="IEngine.ReciprocalBackward{T}"/> passes it. Every backend reads it so:
+    /// CUDA, HIP, OpenCL and Vulkan always have, and Metal and WebGPU, which divided by x * x, do since #1680.
+    /// </summary>
     void ReciprocalBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size);
 
     /// <summary>Backward for variance: dx = gradOutput * 2*(x - mean)/n</summary>

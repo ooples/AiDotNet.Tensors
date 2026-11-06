@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -33,8 +34,12 @@ public partial class CpuEngine
     /// <param name="inputs">Every tensor operand of element type <typeparamref name="T"/>, differentiable or not; nulls are ignored.</param>
     /// <param name="forward">The op itself on a given engine, closing over all of its arguments.</param>
     /// <param name="result">The recorded node's output when this returns true.</param>
+    /// <param name="backwardForward">
+    /// The forward the backward re-runs under a tape, when it must differ from <paramref name="forward"/>: a random op
+    /// whose forward draws a fresh seed each step re-runs, for its backward, with the seed that step drew.
+    /// </param>
     internal bool TryRecordCompiledOp<T>(string opName, Tensor<T>?[] inputs, Func<IEngine, Tensor<T>> forward,
-        out Tensor<T> result)
+        out Tensor<T> result, Func<IEngine, Tensor<T>>? backwardForward = null)
     {
         result = null!;
         if (!GraphMode.IsActive || GraphMode.IsInferenceTrace) return false;
@@ -42,9 +47,11 @@ public partial class CpuEngine
         if (scope is null || !scope.BindEngine(this)) return false;
 
         var operands = new List<Tensor<T>>(inputs.Length);
-        foreach (var input in inputs)
-            if (input is not null && !operands.Contains(input)) operands.Add(input);
+        foreach (var input in inputs.Where(x => x is not null && !operands.Contains(x)))
+            operands.Add(input!);
         if (operands.Count == 0) return false;
+        BindCaptures(scope, forward, operands);
+        if (backwardForward is not null) BindCaptures(scope, backwardForward, operands);
 
         Tensor<T> traced;
         GraphMode.SetCurrent(null);
@@ -60,7 +67,7 @@ public partial class CpuEngine
 
         result = scope.RecordMaterializedVariadic(LazyNodeType.Custom, opName, operands.ToArray(), traced,
             (eng, output) => DirectGpuTensorEngine.CopyResultInto(eng, CheckReplayShape(opName, forward(eng), output), output),
-            BackwardFunctions<T>.ReplayUnderTape(forward));
+            BackwardFunctions<T>.ReplayUnderTape(backwardForward ?? forward));
         return true;
     }
 
@@ -96,9 +103,10 @@ public partial class CpuEngine
         if (scope is null || !scope.BindEngine(this)) return false;
 
         var operands = new List<Tensor<T>>(inputs.Length);
-        foreach (var input in inputs)
-            if (input is not null && !operands.Contains(input)) operands.Add(input);
+        foreach (var input in inputs.Where(x => x is not null && !operands.Contains(x)))
+            operands.Add(input!);
         if (operands.Count == 0) return false;
+        BindCaptures(scope, forward, operands);
 
         Tensor<T> traced;
         TAux tracedAux;
@@ -126,6 +134,61 @@ public partial class CpuEngine
                 refreshAux(eng, a, tracedAux);
             },
             BackwardFunctions<T>.ReplayUnderTape(eng => forward(eng).Result));
+        if (tracedAux is not null) scope.RegisterAuxiliaryOutput(tracedAux, result);
+        return true;
+    }
+
+    /// <summary>
+    /// Fixes what a recorded op's closure captured to its value at trace time, and makes the node depend on the
+    /// producers of the auxiliary outputs it reads.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Each replay re-runs the closure, so an array argument (a pad, axes, a pool size, the operand list of a variadic
+    /// op) that the caller changed after tracing would change the op without changing the recorded graph. Every
+    /// captured array is replaced by a copy, as an eager call would have used the value it was given.
+    /// </para>
+    /// <para>
+    /// A captured object that is another node's auxiliary output (MaxPool's argmax, ReduceMax's indices) is not copied:
+    /// that node refreshes it in place on each replay. Its primary output joins the operands instead, so every
+    /// schedule runs the producer first. Without the edge a consumer of only the indices (ScatterAdd, Ldexp,
+    /// MaxUnpool) could run before the refresh and read the previous step's winners.
+    /// </para>
+    /// </remarks>
+    private static void BindCaptures<T>(LazyTensorScope scope, Delegate closure, List<Tensor<T>> operands)
+    {
+        if (closure.Target is { } target
+            && target.GetType().IsDefined(typeof(System.Runtime.CompilerServices.CompilerGeneratedAttribute), false))
+            BindCaptures(scope, target, operands, depth: 0);
+    }
+
+    private static void BindCaptures<T>(LazyTensorScope scope, object closure, List<Tensor<T>> operands, int depth)
+    {
+        const System.Reflection.BindingFlags fields =
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic;
+        foreach (var field in closure.GetType().GetFields(fields))
+        {
+            if (field.FieldType.IsValueType || field.GetValue(closure) is not { } value) continue;
+            if (DependOnProducer(scope, value, operands)) continue;
+            if (value is Array array)
+            {
+                if (!array.GetType().GetElementType()!.IsValueType)
+                    foreach (var element in array)
+                        if (element is not null) DependOnProducer(scope, element, operands);
+                field.SetValue(closure, array.Clone());
+            }
+            else if (depth < 4 && field.FieldType.IsDefined(typeof(System.Runtime.CompilerServices.CompilerGeneratedAttribute), false))
+            {
+                // A closure over variables of an enclosing scope holds that scope's closure object.
+                BindCaptures(scope, value, operands, depth + 1);
+            }
+        }
+    }
+
+    private static bool DependOnProducer<T>(LazyTensorScope scope, object value, List<Tensor<T>> operands)
+    {
+        if (!scope.TryGetAuxiliaryProducer(value, out var producer)) return false;
+        if (producer is Tensor<T> output && !operands.Contains(output)) operands.Add(output);
         return true;
     }
 
@@ -143,8 +206,8 @@ public partial class CpuEngine
     private protected static Tensor<T>?[] Combine<T>(params IEnumerable<Tensor<T>>[] groups)
     {
         var all = new List<Tensor<T>?>();
-        foreach (var group in groups)
-            if (group is not null) all.AddRange(group);
+        foreach (var group in groups.Where(g => g is not null))
+            all.AddRange(group);
         return all.ToArray();
     }
 }

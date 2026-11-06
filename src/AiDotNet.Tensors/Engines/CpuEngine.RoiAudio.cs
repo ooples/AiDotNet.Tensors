@@ -149,6 +149,56 @@ public partial class CpuEngine
         return result;
     }
 
+    /// <summary>
+    /// The input window [hs, he) x [ws, we) that RoIPool reduces for output cell (ph, pw) of box k, shared by the
+    /// forward and its backward so the gradient reaches the pixel the forward picked.
+    /// </summary>
+    /// <remarks>
+    /// For float tensors every step is float arithmetic, as in the GPU kernels and torchvision (which compute in the
+    /// tensor's type): the scaled box coordinate, its rounding (half away from zero, C's round) and the bin edges. In
+    /// double a float box such as 0.7f at scale 5 scales to 3.4999999 and rounds to 3, where the float product rounds
+    /// to 3.5 and then to 4; the forward and backward then chose different windows.
+    /// </remarks>
+    internal static (int Hs, int He, int Ws, int We) RoIPoolWindow<T>(ReadOnlySpan<T> boxes, int k, float spatialScale,
+        int outH, int outW, int ph, int pw, int H, int W)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        int hs, he, ws, we;
+        if (typeof(T) == typeof(float))
+        {
+            int x1 = RoundAway((float)((float)ops.ToDouble(boxes[k * 5 + 1]) * spatialScale));
+            int y1 = RoundAway((float)((float)ops.ToDouble(boxes[k * 5 + 2]) * spatialScale));
+            int x2 = RoundAway((float)((float)ops.ToDouble(boxes[k * 5 + 3]) * spatialScale));
+            int y2 = RoundAway((float)((float)ops.ToDouble(boxes[k * 5 + 4]) * spatialScale));
+            float binH = (float)Math.Max(y2 - y1 + 1, 1) / outH;
+            float binW = (float)Math.Max(x2 - x1 + 1, 1) / outW;
+            hs = (int)Math.Floor((float)(ph * binH)) + y1;
+            he = (int)Math.Ceiling((float)((ph + 1) * binH)) + y1;
+            ws = (int)Math.Floor((float)(pw * binW)) + x1;
+            we = (int)Math.Ceiling((float)((pw + 1) * binW)) + x1;
+        }
+        else
+        {
+            int x1 = RoundAway(ops.ToDouble(boxes[k * 5 + 1]) * spatialScale);
+            int y1 = RoundAway(ops.ToDouble(boxes[k * 5 + 2]) * spatialScale);
+            int x2 = RoundAway(ops.ToDouble(boxes[k * 5 + 3]) * spatialScale);
+            int y2 = RoundAway(ops.ToDouble(boxes[k * 5 + 4]) * spatialScale);
+            double binH = (double)Math.Max(y2 - y1 + 1, 1) / outH;
+            double binW = (double)Math.Max(x2 - x1 + 1, 1) / outW;
+            hs = (int)Math.Floor(ph * binH) + y1;
+            he = (int)Math.Ceiling((ph + 1) * binH) + y1;
+            ws = (int)Math.Floor(pw * binW) + x1;
+            we = (int)Math.Ceiling((pw + 1) * binW) + x1;
+        }
+
+        return (Math.Min(Math.Max(hs, 0), H), Math.Min(Math.Max(he, 0), H),
+            Math.Min(Math.Max(ws, 0), W), Math.Min(Math.Max(we, 0), W));
+    }
+
+    // torchvision and the GPU kernels use C round/roundf: midpoint values round away from zero. Math.Round's default
+    // ties-to-even selected a different pooling cell for coordinates such as 0.5.
+    private static int RoundAway(double v) => (int)Math.Round(v, MidpointRounding.AwayFromZero);
+
     private Tensor<T> RoIPoolImpl<T>(Tensor<T> input, Tensor<T> boxes,
         int outputHeight, int outputWidth, float spatialScale)
     {
@@ -172,40 +222,13 @@ public partial class CpuEngine
         {
             int n = (int)ops.ToDouble(b[k * 5]);
             if (n < 0 || n >= N) throw new ArgumentException("RoIPool batch idx out of range.");
-            // torchvision/CUDA use C round/roundf: midpoint values round away
-            // from zero. Math.Round's default ties-to-even silently selected a
-            // different pooling cell for coordinates such as 0.5.
-            int x1 = (int)Math.Round(
-                ops.ToDouble(b[k * 5 + 1]) * spatialScale,
-                MidpointRounding.AwayFromZero);
-            int y1 = (int)Math.Round(
-                ops.ToDouble(b[k * 5 + 2]) * spatialScale,
-                MidpointRounding.AwayFromZero);
-            int x2 = (int)Math.Round(
-                ops.ToDouble(b[k * 5 + 3]) * spatialScale,
-                MidpointRounding.AwayFromZero);
-            int y2 = (int)Math.Round(
-                ops.ToDouble(b[k * 5 + 4]) * spatialScale,
-                MidpointRounding.AwayFromZero);
-            int roiW = Math.Max(x2 - x1 + 1, 1);
-            int roiH = Math.Max(y2 - y1 + 1, 1);
-            double binH = (double)roiH / outputHeight;
-            double binW = (double)roiW / outputWidth;
-
             for (int c = 0; c < C; c++)
             {
                 int planeBase = (n * C + c) * H * W;
                 for (int ph = 0; ph < outputHeight; ph++)
                 for (int pw = 0; pw < outputWidth; pw++)
                 {
-                    int hstart = (int)Math.Floor(ph * binH) + y1;
-                    int hend = (int)Math.Ceiling((ph + 1) * binH) + y1;
-                    int wstart = (int)Math.Floor(pw * binW) + x1;
-                    int wend = (int)Math.Ceiling((pw + 1) * binW) + x1;
-                    hstart = Math.Min(Math.Max(hstart, 0), H);
-                    hend = Math.Min(Math.Max(hend, 0), H);
-                    wstart = Math.Min(Math.Max(wstart, 0), W);
-                    wend = Math.Min(Math.Max(wend, 0), W);
+                    var (hstart, hend, wstart, wend) = RoIPoolWindow(b, k, spatialScale, outputHeight, outputWidth, ph, pw, H, W);
                     bool empty = hend <= hstart || wend <= wstart;
                     double best = empty ? 0.0 : double.NegativeInfinity;
                     for (int yy = hstart; yy < hend; yy++)
@@ -464,12 +487,11 @@ public partial class CpuEngine
             return CaptureInferenceKernel(
                 new[] { input }, engine => engine.AmplitudeToDB(input, minAmplitude, topDb));
         var result = AmplitudeToDBImpl(input, minAmplitude, topDb);
-        // topDb clips post-hoc against the peak — the clip mask ideally
-        // zeros gradient where clipped, but that needs a saved mask.
-        // For the common topDb=null path the backward is exact.
+        // A topDb-clipped output is peak - topDb, so its gradient belongs to the peak; the backward recomputes the
+        // clip from the input and topDb.
         DifferentiableOps.RecordUnary("AmplitudeToDB", result, input,
             BackwardFunctions<T>.AmplitudeToDBBackward,
-            new object[] { minAmplitude });
+            new object[] { minAmplitude, topDb! });
         return result;
     }
 

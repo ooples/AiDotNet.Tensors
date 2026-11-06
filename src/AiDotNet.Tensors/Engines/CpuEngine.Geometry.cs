@@ -636,7 +636,7 @@ public partial class CpuEngine
                 int nx = (int)Math.Round(sx), ny = (int)Math.Round(sy);
                 for (int c = 0; c < C; c++)
                     dst[((n * C + c) * outH + oy) * outW + ox] =
-                        SampleSafe(src, n, ny, nx, c, H, W, C, padding, ops);
+                        SampleSafe(src, n, ny, nx, c, H, W, C, padding, alignCorners, ops);
             }
             else if (mode == GridSampleMode.Bilinear)
             {
@@ -645,10 +645,10 @@ public partial class CpuEngine
                 double fx = sx - x0, fy = sy - y0;
                 for (int c = 0; c < C; c++)
                 {
-                    double v00 = ops.ToDouble(SampleSafe(src, n, y0, x0, c, H, W, C, padding, ops));
-                    double v01 = ops.ToDouble(SampleSafe(src, n, y0, x1, c, H, W, C, padding, ops));
-                    double v10 = ops.ToDouble(SampleSafe(src, n, y1, x0, c, H, W, C, padding, ops));
-                    double v11 = ops.ToDouble(SampleSafe(src, n, y1, x1, c, H, W, C, padding, ops));
+                    double v00 = ops.ToDouble(SampleSafe(src, n, y0, x0, c, H, W, C, padding, alignCorners, ops));
+                    double v01 = ops.ToDouble(SampleSafe(src, n, y0, x1, c, H, W, C, padding, alignCorners, ops));
+                    double v10 = ops.ToDouble(SampleSafe(src, n, y1, x0, c, H, W, C, padding, alignCorners, ops));
+                    double v11 = ops.ToDouble(SampleSafe(src, n, y1, x1, c, H, W, C, padding, alignCorners, ops));
                     double v =
                         v00 * (1 - fx) * (1 - fy) +
                         v01 * fx * (1 - fy) +
@@ -672,7 +672,7 @@ public partial class CpuEngine
                         for (int xx = 0; xx < 4; xx++)
                         {
                             int xi = x0 - 1 + xx;
-                            rowAcc += wx[xx] * ops.ToDouble(SampleSafe(src, n, yi, xi, c, H, W, C, padding, ops));
+                            rowAcc += wx[xx] * ops.ToDouble(SampleSafe(src, n, yi, xi, c, H, W, C, padding, alignCorners, ops));
                         }
                         acc += wy[yy] * rowAcc;
                     }
@@ -715,7 +715,7 @@ public partial class CpuEngine
     }
 
     private static T SampleSafe<T>(ReadOnlySpan<T> src, int n, int y, int x, int c,
-        int H, int W, int C, GridSamplePadding padding, Interfaces.INumericOperations<T> ops)
+        int H, int W, int C, GridSamplePadding padding, bool alignCorners, Interfaces.INumericOperations<T> ops)
     {
         switch (padding)
         {
@@ -727,8 +727,8 @@ public partial class CpuEngine
                 x = ClampInt(x, 0, W - 1);
                 break;
             case GridSamplePadding.Reflection:
-                y = ReflectIndex(y, H);
-                x = ReflectIndex(x, W);
+                y = GridReflect(y, H, alignCorners);
+                x = GridReflect(x, W, alignCorners);
                 break;
         }
         // NCHW: [n, c, y, x].
@@ -747,14 +747,29 @@ public partial class CpuEngine
     }
 
     /// <summary>
+    /// GridSample's Reflection, PyTorch's convention: with <paramref name="alignCorners"/> the image reflects about
+    /// its corner pixels' centres (<see cref="ReflectIndex"/>); without, about its edges, half a pixel further out,
+    /// so tap -1 reads pixel 0. Reflecting the integer taps this way reads what PyTorch's reflected (and clipped)
+    /// coordinate reads, and so has the same derivative.
+    /// </summary>
+    private static int GridReflect(int i, int extent, bool alignCorners)
+    {
+        if (alignCorners) return ReflectIndex(i, extent);
+        int period = 2 * extent;
+        int j = i < 0 ? -1 - i : i;
+        int r = j % period;
+        return r < extent ? r : period - 1 - r;
+    }
+
+    /// <summary>
     /// The pixel index <see cref="SampleSafe{T}"/> reads for an integer tap, or -1 when the tap reads the
     /// zero padding. The backward uses it so it scatters to exactly the pixels the forward read.
     /// </summary>
-    private static int PaddedTap(int i, int extent, GridSamplePadding padding) => padding switch
+    private static int PaddedTap(int i, int extent, GridSamplePadding padding, bool alignCorners) => padding switch
     {
         GridSamplePadding.Zeros => (uint)i < (uint)extent ? i : -1,
         GridSamplePadding.Border => ClampInt(i, 0, extent - 1),
-        _ => ReflectIndex(i, extent),
+        _ => GridReflect(i, extent, alignCorners),
     };
 
     /// <summary>d/dt of <see cref="CubicWeights"/>: the kernel's derivative at offsets {1+t, t, 1-t, 2-t}.</summary>
@@ -832,11 +847,13 @@ public partial class CpuEngine
         var tx = new int[4];
         var ty = new int[4];
 
-        for (int n = 0; n < N; n++)
-        for (int oy = 0; oy < outH; oy++)
-        for (int ox = 0; ox < outW; ox++)
+        int points = N * outH * outW;
+        for (int point = 0; point < points; point++)
         {
-            int gOff = ((n * outH + oy) * outW + ox) * 2;
+            int n = point / (outH * outW);
+            int oy = point / outW % outH;
+            int ox = point % outW;
+            int gOff = point * 2;
             double sx = NormalizedToPixel(ops.ToDouble(g[gOff]), W, alignCorners);
             double sy = NormalizedToPixel(ops.ToDouble(g[gOff + 1]), H, alignCorners);
             if (!GridPointSamples(sx) || !GridPointSamples(sy)) continue;
@@ -844,8 +861,8 @@ public partial class CpuEngine
             if (mode == GridSampleMode.Nearest)
             {
                 // Math.Round, as in the forward, so the backward picks the same tap at .5 ties.
-                tx[0] = PaddedTap((int)Math.Round(sx), W, padding);
-                ty[0] = PaddedTap((int)Math.Round(sy), H, padding);
+                tx[0] = PaddedTap((int)Math.Round(sx), W, padding, alignCorners);
+                ty[0] = PaddedTap((int)Math.Round(sy), H, padding, alignCorners);
                 wx[0] = wy[0] = 1.0;
                 dwx[0] = dwy[0] = 0.0;
             }
@@ -859,8 +876,8 @@ public partial class CpuEngine
                     wy[0] = 1 - fy; wy[1] = fy; dwy[0] = -1; dwy[1] = 1;
                     for (int k = 0; k < 2; k++)
                     {
-                        tx[k] = PaddedTap(x0 + k, W, padding);
-                        ty[k] = PaddedTap(y0 + k, H, padding);
+                        tx[k] = PaddedTap(x0 + k, W, padding, alignCorners);
+                        ty[k] = PaddedTap(y0 + k, H, padding, alignCorners);
                     }
                 }
                 else
@@ -871,8 +888,8 @@ public partial class CpuEngine
                     CubicWeightDerivatives(fy).CopyTo(dwy, 0);
                     for (int k = 0; k < 4; k++)
                     {
-                        tx[k] = PaddedTap(x0 - 1 + k, W, padding);
-                        ty[k] = PaddedTap(y0 - 1 + k, H, padding);
+                        tx[k] = PaddedTap(x0 - 1 + k, W, padding, alignCorners);
+                        ty[k] = PaddedTap(y0 - 1 + k, H, padding, alignCorners);
                     }
                 }
             }
@@ -880,8 +897,8 @@ public partial class CpuEngine
             double gradX = 0.0, gradY = 0.0;
             for (int c = 0; c < C; c++)
             {
+                // No skip for a zero upstream gradient: 0 * inf is NaN, as on the GPU kernels and in PyTorch.
                 double gc = ops.ToDouble(go[((n * C + c) * outH + oy) * outW + ox]);
-                if (gc == 0.0) continue;
                 int plane = (n * C + c) * H;
                 for (int j = 0; j < taps; j++)
                 {

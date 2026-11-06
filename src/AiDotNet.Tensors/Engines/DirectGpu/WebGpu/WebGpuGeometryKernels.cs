@@ -206,6 +206,16 @@ struct P {
 };
 @group(0) @binding(3) var<uniform> p : P;
 " + Helpers + @"
+fn grid_reflect(i: i32, extent: i32) -> i32 {
+    // PyTorch's convention: about the corner pixels' centres with alignCorners, about the image edges without.
+    if (p.alignCorners != 0) { return reflect_index(i, extent); }
+    let period = 2 * extent;
+    var j = i;
+    if (i < 0) { j = -1 - i; }
+    let r = j % period;
+    if (r < extent) { return r; }
+    return period - 1 - r;
+}
 fn sample_safe(n: i32, y_in: i32, x_in: i32, c: i32) -> f32 {
     var y = y_in; var x = x_in;
     if (p.padding == 0) {
@@ -213,7 +223,7 @@ fn sample_safe(n: i32, y_in: i32, x_in: i32, c: i32) -> f32 {
     } else if (p.padding == 1) {
         y = clamp_i(y, 0, p.H - 1); x = clamp_i(x, 0, p.W - 1);
     } else {
-        y = reflect_index(y, p.H); x = reflect_index(x, p.W);
+        y = grid_reflect(y, p.H); x = grid_reflect(x, p.W);
     }
     return input_[((n * p.C + c) * p.H + y) * p.W + x];
 }
@@ -301,13 +311,23 @@ struct P {
 ";
 
     private const string GridSampleTaps = @"
+fn grid_reflect(i: i32, extent: i32) -> i32 {
+    // PyTorch's convention: about the corner pixels' centres with alignCorners, about the image edges without.
+    if (p.alignCorners != 0) { return reflect_index(i, extent); }
+    let period = 2 * extent;
+    var j = i;
+    if (i < 0) { j = -1 - i; }
+    let r = j % period;
+    if (r < extent) { return r; }
+    return period - 1 - r;
+}
 fn grid_sample_tap(i: i32, extent: i32) -> i32 {
     if (p.padding == 0) {
         if (u32(i) < u32(extent)) { return i; }
         return -1;
     }
     if (p.padding == 1) { return clamp_i(i, 0, extent - 1); }
-    return reflect_index(i, extent);
+    return grid_reflect(i, extent);
 }
 
 // dK/dd of cubic_kernel_f for d >= 0, which every offset the taps use is.
@@ -409,7 +429,6 @@ fn atomic_add_f(idx: i32, val: f32) {
     var t = grid_sample_taps(gid * 2);
     for (var c : i32 = 0; c < p.C; c = c + 1) {
         let g = gradOut_[((n * p.C + c) * p.outH + oy) * p.outW + ox];
-        if (g == 0.0) { continue; }
         let plane = (n * p.C + c) * p.H;
         for (var j : i32 = 0; j < t.count; j = j + 1) {
             if (t.ty[j] < 0) { continue; }
@@ -437,13 +456,15 @@ fn atomic_add_f(idx: i32, val: f32) {
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
     let gid = i32(id.x);
     if (gid >= p.N * p.outH * p.outW) { return; }
+    // Nearest is piecewise constant: its grid gradient is exactly 0, written directly so that a non-finite input
+    // or upstream gradient cannot turn the zero derivative into NaN.
+    if (p.mode == 1) { gradGrid_[gid * 2] = 0.0; gradGrid_[gid * 2 + 1] = 0.0; return; }
     let ox = gid % p.outW; let t1 = gid / p.outW;
     let oy = t1 % p.outH; let n = t1 / p.outH;
     var t = grid_sample_taps(gid * 2);
     var gradX = 0.0; var gradY = 0.0;
     for (var c : i32 = 0; c < p.C; c = c + 1) {
         let g = gradOut_[((n * p.C + c) * p.outH + oy) * p.outW + ox];
-        if (g == 0.0) { continue; }
         let plane = (n * p.C + c) * p.H;
         for (var j : i32 = 0; j < t.count; j = j + 1) {
             if (t.ty[j] < 0) { continue; }

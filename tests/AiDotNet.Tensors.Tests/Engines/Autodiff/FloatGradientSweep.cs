@@ -25,11 +25,19 @@ internal static class FloatGradientSweep
 
     internal sealed class Result
     {
-        public int TapeOk, CompiledOk, NoGradient;
-        public readonly List<string> TapeFailures = new(), CompiledFailures = new(), Skipped = new(), Refused = new();
+        public int TapeOk, CompiledOk;
+        public readonly List<string> TapeFailures = new(), CompiledFailures = new(), Skipped = new(), Refused = new(),
+            NoGradient = new();
 
+        /// <summary>
+        /// Every mismatch, and every op the sweep could not check: one it could not drive or convert to float, and one
+        /// whose CPU tape gave no gradient. The double sweep drives every op, so in float none of these is expected; a
+        /// new one is a gap in the check, not a pass.
+        /// </summary>
         public IReadOnlyList<string> AllFailures => TapeFailures.Select(f => "tape: " + f)
-            .Concat(CompiledFailures.Select(f => "compiled: " + f)).ToList();
+            .Concat(CompiledFailures.Select(f => "compiled: " + f))
+            .Concat(Skipped.Select(f => "not checked: " + f))
+            .Concat(NoGradient.Select(f => "no CPU tape gradient: " + f)).ToList();
 
         public void Report(ITestOutputHelper output, string engineName)
         {
@@ -37,7 +45,7 @@ internal static class FloatGradientSweep
             output.WriteLine($"{engineName} tape FAILED            : {TapeFailures.Count}");
             output.WriteLine($"{engineName} compiled == its tape   : {CompiledOk}");
             output.WriteLine($"{engineName} compiled FAILED        : {CompiledFailures.Count}");
-            output.WriteLine($"no CPU tape gradient     : {NoGradient}");
+            output.WriteLine($"no CPU tape gradient     : {NoGradient.Count}");
             output.WriteLine($"skipped                  : {Skipped.Count}");
             output.WriteLine($"refused by design        : {Refused.Count}");
             foreach (var f in Refused.OrderBy(x => x)) output.WriteLine("REFUSED   " + f);
@@ -80,7 +88,7 @@ internal static class FloatGradientSweep
                     continue;
                 }
 
-                if (cpuGrads.Count == 0) { r.NoGradient++; continue; }
+                if (cpuGrads.Count == 0) { r.NoGradient.Add(id); continue; }
                 var parameters = cpuGrads.Keys.ToArray();
 
                 Dictionary<Tensor<float>, float[]> tapeGrads = cpuGrads;
@@ -102,7 +110,8 @@ internal static class FloatGradientSweep
                             {
                                 double engineErr = MaxRelativeError(parameters, exact, p => engineGrads.TryGetValue(p, out var g) ? g : null);
                                 double cpuErr = MaxRelativeError(parameters, exact, p => cpuGrads[p]);
-                                if (engineErr <= Math.Max(Tolerance, 2 * cpuErr))
+                                // An infinite CPU error is no reference: it would accept any engine error.
+                                if (!double.IsInfinity(cpuErr) && engineErr <= Math.Max(Tolerance, 2 * cpuErr))
                                     bad = null;
                                 else
                                     bad += $" (max relative error vs CPU double: engine {engineErr:G3}, CPU float {cpuErr:G3}; "

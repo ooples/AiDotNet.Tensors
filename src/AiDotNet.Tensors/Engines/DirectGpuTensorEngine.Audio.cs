@@ -168,7 +168,10 @@ public partial class DirectGpuTensorEngine
         // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
         // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
         if (result.GradFn is null)
+        {
+            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
             Autodiff.DifferentiableOps.RecordUnary("Resample", result, waveform, Autodiff.BackwardFunctions<T>.ResampleBackward, new object[] { origRate, newRate });
+        }
         return result;
     }
 

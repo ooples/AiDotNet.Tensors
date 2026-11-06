@@ -2228,7 +2228,8 @@ void main() {
     if (idx >= size) return;
     // b is the reciprocal OUTPUT y = 1/x, so d(1/x)/dx = -1/x^2 = -y^2 (#775, #1680).
     float y = bdata[idx];
-    c[idx] = -a[idx] * (y * y);
+    // g * y first: y * y overflows float for |y| > 1.8e19 even when the derivative g * y^2 does not.
+    c[idx] = -(a[idx] * y) * y;
 }";
 
     public static string VarBackwardGlsl => Header + FourBufferLayout + @"

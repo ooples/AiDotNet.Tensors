@@ -4048,8 +4048,14 @@ public partial class DirectGpuTensorEngine
         var result = TensorUnfoldOnGpu(tensor, dim, size, step);
         // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
         // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
+        // The backward indexes the input shape with the saved axis, so it is saved normalized, as the CPU op saves it.
         if (result.GradFn is null)
-            Autodiff.DifferentiableOps.RecordUnary("TensorUnfold", result, tensor, Autodiff.BackwardFunctions<T>.UnfoldParity210Backward, savedState: new object[] { dim, size, step, (int[])tensor._shape.Clone() });
+        {
+            // Binds the tape to this engine, so the backward of a device result runs on the device.
+            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
+            Autodiff.DifferentiableOps.RecordUnary("TensorUnfold", result, tensor, Autodiff.BackwardFunctions<T>.UnfoldParity210Backward,
+                savedState: new object[] { dim < 0 ? dim + tensor.Rank : dim, size, step, (int[])tensor._shape.Clone() });
+        }
         return result;
     }
 
@@ -4262,7 +4268,11 @@ public partial class DirectGpuTensorEngine
         // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
         // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
         if (result.GradFn is null)
+        {
+            // Binds the tape to this engine, so the backward of a device result runs on the device.
+            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
             Autodiff.DifferentiableOps.RecordUnary("TensorMaskedSelect", result, tensor, Autodiff.BackwardFunctions<T>.MaskedSelectBackward, savedState: new object[] { mask.IsContiguous ? mask : mask.Contiguous(), (int[])tensor._shape.Clone() });
+        }
         return result;
     }
 
@@ -4846,7 +4856,11 @@ public partial class DirectGpuTensorEngine
         // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
         // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
         if (result.GradFn is null)
+        {
+            // Binds the tape to this engine, so the backward of a device result runs on the device.
+            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
             Autodiff.DifferentiableOps.RecordUnary("TensorTakeAlongDim", result, tensor, Autodiff.BackwardFunctions<T>.TakeAlongDimBackward, savedState: new object[] { indices, dim });
+        }
         return result;
     }
 
@@ -5059,7 +5073,11 @@ public partial class DirectGpuTensorEngine
         // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
         // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
         if (result.GradFn is null)
+        {
+            // Binds the tape to this engine, so the backward of a device result runs on the device.
+            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
             Autodiff.DifferentiableOps.RecordBinary("TensorKron", result, a, b, Autodiff.BackwardFunctions<T>.KronBackward);
+        }
         return result;
     }
 
@@ -7005,6 +7023,14 @@ public partial class DirectGpuTensorEngine
         // A mismatched shape would read out of bounds on the device; the CPU reference reports it.
         if (grid._shape[0] != N || !ShapesEqual(gradOutput._shape, new[] { N, C, outH, outW })) return false;
         int inSize = N * C * H * W;
+        // An empty input, or no sampling points, has an all-zero (possibly empty) gradient, as on the CPU. A
+        // zero-length device buffer cannot be allocated, so it is answered here.
+        if (inSize == 0 || gradOutput.Length == 0)
+        {
+            result = new Tensor<T>((int[])inputShape.Clone());
+            return true;
+        }
+
         try
         {
             using var bufGO = GetOrAllocateBuffer(backend, gradOutput);
@@ -7042,6 +7068,14 @@ public partial class DirectGpuTensorEngine
         int N = input._shape[0], C = input._shape[1], H = input._shape[2], W = input._shape[3];
         int outH = grid._shape[1], outW = grid._shape[2];
         if (grid._shape[0] != N || !ShapesEqual(gradOutput._shape, new[] { N, C, outH, outW })) return false;
+        // No sampling points, or nothing to sample: the grid gradient is all zero (possibly empty), as on the CPU,
+        // and a zero-length device buffer cannot be allocated.
+        if (grid.Length == 0 || gradOutput.Length == 0 || input.Length == 0)
+        {
+            result = new Tensor<T>((int[])grid._shape.Clone());
+            return true;
+        }
+
         try
         {
             using var bufGO = GetOrAllocateBuffer(backend, gradOutput);
@@ -7143,7 +7177,11 @@ public partial class DirectGpuTensorEngine
         // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
         // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
         if (result.GradFn is null)
+        {
+            // Binds the tape to this engine, so the backward of a device result runs on the device.
+            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
             Autodiff.DifferentiableOps.RecordBinary("TensorZeta", result, x, q, Autodiff.BackwardFunctions<T>.ZetaBackward);
+        }
         return result;
     }
 
@@ -7179,7 +7217,11 @@ public partial class DirectGpuTensorEngine
         // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
         // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
         if (result.GradFn is null)
+        {
+            // Binds the tape to this engine, so the backward of a device result runs on the device.
+            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
             Autodiff.DifferentiableOps.RecordUnary("TensorPolygamma", result, tensor, Autodiff.BackwardFunctions<T>.PolygammaBackward, savedState: new object[] { n });
+        }
         return result;
     }
 
@@ -7337,7 +7379,11 @@ public partial class DirectGpuTensorEngine
         // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
         // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
         if (result.GradFn is null)
+        {
+            // Binds the tape to this engine, so the backward of a device result runs on the device.
+            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
             Autodiff.DifferentiableOps.RecordBinary("TensorCross", result, a, b, Autodiff.BackwardFunctions<T>.CrossBackward, savedState: new object[] { dim });
+        }
         return result;
     }
 
@@ -7427,7 +7473,11 @@ public partial class DirectGpuTensorEngine
         // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
         // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
         if (result.GradFn is null)
+        {
+            // Binds the tape to this engine, so the backward of a device result runs on the device.
+            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
             Autodiff.DifferentiableOps.RecordUnary("TensorLdexp", result, x, Autodiff.BackwardFunctions<T>.LdexpBackward, new object[] { exp });
+        }
         return result;
     }
 
@@ -9770,6 +9820,7 @@ public partial class DirectGpuTensorEngine
     {
         if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
             return base.TensorBinaryCrossEntropy(predictions, targets, epsilon);
+        targets = PairedTargets(predictions, targets);
         var numOps = MathHelper.GetNumericOperations<T>();
         var upper = numOps.Subtract(numOps.One, epsilon);
         var pc = TensorClamp(predictions, epsilon, upper);                                 // clamp(p, eps, 1-eps)
@@ -9780,6 +9831,23 @@ public partial class DirectGpuTensorEngine
         return TensorNegate(loss);
     }
 
+    // The CPU loss pairs predictions and targets element by element in row-major order. The composition below
+    // broadcasts instead, so targets [1, 2] against predictions [2, 1] gave a [2, 2] loss (and a compiled replay
+    // could not copy it into the recorded [2, 1] output). Viewing the targets in the predictions' shape pairs them
+    // as the CPU does.
+    private Tensor<T> PairedTargets<T>(Tensor<T> predictions, Tensor<T> targets)
+    {
+        if (predictions is null) throw new ArgumentNullException(nameof(predictions));
+        if (targets is null) throw new ArgumentNullException(nameof(targets));
+        if (targets.Length != predictions.Length)
+            throw new ArgumentException(
+                $"Binary cross-entropy pairs predictions and targets element by element: {predictions.Length} predictions, {targets.Length} targets.",
+                nameof(targets));
+        return targets._shape.AsSpan().SequenceEqual(predictions._shape)
+            ? targets
+            : Reshape(targets, (int[])predictions._shape.Clone());
+    }
+
     // #775: BCE gradient d/dp = (1-t)/(1-pc) - t/pc, pc = clamp(p, eps, 1-eps). Element-wise compose
     // from GPU-resident TensorClamp/Divide/Subtract (1-x via Negate+AddScalar), same clamp + term order
     // as CpuEngine. Defer to base under tape/GraphMode.
@@ -9787,6 +9855,7 @@ public partial class DirectGpuTensorEngine
     {
         if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
             return base.TensorBinaryCrossEntropyBackward(predictions, targets, epsilon);
+        targets = PairedTargets(predictions, targets);
         var numOps = MathHelper.GetNumericOperations<T>();
         var upper = numOps.Subtract(numOps.One, epsilon);
         var pc = TensorClamp(predictions, epsilon, upper);
