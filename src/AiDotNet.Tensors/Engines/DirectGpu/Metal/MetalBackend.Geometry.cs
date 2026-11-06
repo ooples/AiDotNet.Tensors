@@ -21,6 +21,7 @@ public sealed partial class MetalBackend : IGeometryBackend, IGeometryBackwardBa
     {
         int total = N * C * Hout * Wout;
         if (total <= 0) return;
+        IntegerInterpolationWindow.EnsureInRange(mode, Hin, Win, Hout, Wout);
         ThrowIfDisposed();
         if (input is not MetalGpuBuffer inBuf || output is not MetalGpuBuffer outBuf)
             throw new ArgumentException("Buffers must be MetalGpuBuffer");

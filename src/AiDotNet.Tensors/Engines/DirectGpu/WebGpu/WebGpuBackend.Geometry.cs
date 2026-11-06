@@ -48,6 +48,7 @@ public sealed partial class WebGpuBackend : IGeometryBackend, IGeometryBackwardB
     {
         int total = N * C * Hout * Wout;
         if (total <= 0) return;
+        IntegerInterpolationWindow.EnsureInRange(mode, Hin, Win, Hout, Wout);
         var pipe = await GetOrCreatePipelineAsync(
             GeometryModuleKey + ":Interpolate2D", WebGpuGeometryKernels.Interpolate2D, "main");
         using var uniforms = new WebGpuBuffer(

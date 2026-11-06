@@ -21,6 +21,7 @@ public sealed unsafe partial class VulkanBackend : IGeometryBackend, IGeometryBa
     {
         int total = N * C * Hout * Wout;
         if (total <= 0) return;
+        IntegerInterpolationWindow.EnsureInRange(mode, Hin, Win, Hout, Wout);
         var pc = new uint[] {
             (uint)N, (uint)C, (uint)Hin, (uint)Win,
             (uint)Hout, (uint)Wout, (uint)mode, (uint)(alignCorners ? 1 : 0)

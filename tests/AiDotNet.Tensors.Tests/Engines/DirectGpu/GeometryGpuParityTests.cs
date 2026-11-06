@@ -102,6 +102,21 @@ public class GeometryGpuParityTests : IClassFixture<DirectGpuTensorEngineTestFix
         AssertClose(g, c);
     }
 
+    // Nearest and Area windows on Vulkan, Metal and WebGPU are int32 products of input and output sizes. A tall
+    // 65536 -> 40000 resize (2.6e9 per axis) wrapped them negative, reading outside the plane.
+    [SkippableTheory]
+    [InlineData(InterpolateMode.Nearest)]
+    [InlineData(InterpolateMode.Area)]
+    public void Interpolate2D_TallAxisPastInt32Products_GpuMatchesCpu(InterpolateMode mode)
+    {
+        SkipIfUnavailable();
+        var input = Rand4D(5, 1, 1, 65536, 1);
+        var g = Gpu.Interpolate(input, new[] { 40000, 1 }, mode, false);
+        var c = _cpu.Interpolate(input, new[] { 40000, 1 }, mode, false);
+        AssertNonDegenerate(c, "CPU reference");
+        AssertClose(g, c);
+    }
+
     [SkippableTheory]
     [InlineData(PadMode.Constant)]
     [InlineData(PadMode.Reflect)]
