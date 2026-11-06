@@ -5,7 +5,7 @@ using System;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
-public sealed unsafe partial class VulkanBackend
+public sealed unsafe partial class VulkanBackend : IGatedDeltaNetBackwardBackend
 {
     #region Optimizer Operations
 
@@ -801,6 +801,32 @@ public sealed unsafe partial class VulkanBackend
         => GlslNaryOp(VulkanRecurrenceKernels.GatedDeltaScan, new[] { q, k, v, alpha, beta, output },
             batch * numHeads * headDim,
             new[] { (uint)batch, (uint)seqLen, (uint)modelDim, (uint)numHeads, (uint)headDim });
+
+    void IGatedDeltaNetBackwardBackend.GatedDeltaNetScanBackward(
+        IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta,
+        IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dAlpha, IGpuBuffer dBeta,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "GatedDeltaNet dimensions must be positive.");
+        if (modelDim != numHeads * headDim || headDim > 256)
+            throw new ArgumentException($"Invalid GatedDeltaNet head layout (modelDim={modelDim}, numHeads={numHeads}, headDim={headDim}).");
+        int hh = headDim * headDim;
+        long totalLong = checked((long)batch * numHeads * headDim);
+        long trajLenLong = checked((long)batch * numHeads * seqLen * hh);
+        if (totalLong > int.MaxValue || trajLenLong > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(batch), "GatedDeltaNet dimensions exceed Vulkan launch/buffer limits.");
+        int total = (int)totalLong;
+        Fill(dQ, 0f, batch * seqLen * modelDim);
+        Fill(dK, 0f, batch * seqLen * modelDim);
+        Fill(dAlpha, 0f, batch * seqLen * numHeads);
+        Fill(dBeta, 0f, batch * seqLen * numHeads);
+        using var traj = AllocateBuffer((int)trajLenLong);
+        var pc = new[] { (uint)batch, (uint)seqLen, (uint)modelDim, (uint)numHeads, (uint)headDim };
+        GlslNaryOp(VulkanRecurrenceKernels.GatedDeltaRecompute, new[] { k, v, alpha, beta, traj }, total, pc);
+        GlslNaryOp(VulkanRecurrenceKernels.GatedDeltaBackward,
+            new[] { dOut, q, k, v, alpha, beta, traj, dQ, dK, dV, dAlpha, dBeta }, total, pc);
+    }
 
     public void RgLruScanForward(
         IGpuBuffer value, IGpuBuffer recGate, IGpuBuffer inpGate, IGpuBuffer decay, IGpuBuffer output,

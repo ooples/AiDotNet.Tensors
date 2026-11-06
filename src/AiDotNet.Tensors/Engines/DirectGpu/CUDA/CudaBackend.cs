@@ -19,7 +19,7 @@ using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
-public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, IChannelBiasAddOutBackend, IUninitializedGpuAllocation, IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IAdam8BitWeightDecayBackend, IMultiTensorGpuOptimizerBackend, AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend, IPixelShuffleBackend, INativeGpuCodegenExecutor, IBiasActivationBackend, IDeviceMemoryAccounted
+public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, IChannelBiasAddOutBackend, IUninitializedGpuAllocation, IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IAdam8BitWeightDecayBackend, IMultiTensorGpuOptimizerBackend, AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend, IPixelShuffleBackend, INativeGpuCodegenExecutor, IBiasActivationBackend, IDeviceMemoryAccounted, IGatedDeltaNetBackwardBackend
 {
     // During teardown the CUDA driver/context may already be destroyed, so calling driver
     // APIs (cuCtxPushCurrent / cuMemFree / cuCtxPopCurrent / cuCtxDestroy / cuModuleUnload)
@@ -18210,6 +18210,50 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         args[6] = &batch; args[7] = &seqLen; args[8] = &modelDim; args[9] = &numHeads; args[10] = &headDim;
         uint total = (uint)(batch * numHeads * headDim);
         LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
+    }
+
+    unsafe void IGatedDeltaNetBackwardBackend.GatedDeltaNetScanBackward(
+        IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta,
+        IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dAlpha, IGpuBuffer dBeta,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "GatedDeltaNet dimensions must be positive.");
+        if (modelDim != numHeads * headDim)
+            throw new ArgumentException($"modelDim ({modelDim}) must equal numHeads * headDim ({numHeads * headDim}).");
+        if (headDim > Kernels.CudaGatedDeltaNetKernels.MaxHeadDim)
+            throw new InvalidOperationException(
+                $"GatedDeltaNet headDim ({headDim}) exceeds max ({Kernels.CudaGatedDeltaNetKernels.MaxHeadDim}).");
+        if (!_kernelCache.TryGetValue("gated_delta_scan_recompute", out var recompute) ||
+            !_kernelCache.TryGetValue("gated_delta_scan_backward", out var backward))
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: gated_delta_scan_recompute / gated_delta_scan_backward");
+
+        using var _ = PushContext();
+        Fill(dQ, 0f, batch * seqLen * modelDim);
+        Fill(dK, 0f, batch * seqLen * modelDim);
+        Fill(dAlpha, 0f, batch * seqLen * numHeads);
+        Fill(dBeta, 0f, batch * seqLen * numHeads);
+        long trajLenL = checked((long)batch * numHeads * seqLen * headDim * headDim);
+        if (trajLenL > int.MaxValue)
+            throw new ArgumentException("GatedDeltaNet trajectory buffer is too large for a single allocation.");
+        int trajLen = (int)trajLenL;
+        using var trajBuf = AllocateBuffer(trajLen);
+        uint total = (uint)(batch * numHeads * headDim);
+        uint grid = (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize;
+
+        IntPtr pk = k.Handle, pv = v.Handle, pa = alpha.Handle, pb = beta.Handle, ptr = trajBuf.Handle;
+        void** ra = stackalloc void*[10];
+        ra[0] = &pk; ra[1] = &pv; ra[2] = &pa; ra[3] = &pb; ra[4] = &ptr;
+        ra[5] = &batch; ra[6] = &seqLen; ra[7] = &modelDim; ra[8] = &numHeads; ra[9] = &headDim;
+        LaunchKernel(recompute, grid, (uint)DefaultBlockSize, ra);
+
+        IntPtr pdo = dOut.Handle, pq = q.Handle;
+        IntPtr pdq = dQ.Handle, pdk = dK.Handle, pdv = dV.Handle, pda = dAlpha.Handle, pdb = dBeta.Handle;
+        void** ba = stackalloc void*[17];
+        ba[0] = &pdo; ba[1] = &pq; ba[2] = &pk; ba[3] = &pv; ba[4] = &pa; ba[5] = &pb; ba[6] = &ptr;
+        ba[7] = &pdq; ba[8] = &pdk; ba[9] = &pdv; ba[10] = &pda; ba[11] = &pdb;
+        ba[12] = &batch; ba[13] = &seqLen; ba[14] = &modelDim; ba[15] = &numHeads; ba[16] = &headDim;
+        LaunchKernel(backward, grid, (uint)DefaultBlockSize, ba);
     }
 
     // ── Fused RG-LRU scan forward (#1464) ──────────────────────────────────────────────────

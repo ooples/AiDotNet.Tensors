@@ -13041,13 +13041,72 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return result;
     }
 
-    // Fused Gated DeltaNet scan (#1464). GPU inference fast path; defer to CpuEngine otherwise.
+    /// <summary>
+    /// GPU-executed BPTT backward of the fused Gated DeltaNet scan: dQ/dK/dV [batch, seqLen, modelDim] and
+    /// dAlpha/dBeta [batch, seqLen, numHeads] via <see cref="DirectGpu.IGatedDeltaNetBackwardBackend"/>.
+    /// Returns null when the GPU backward path is unavailable so the caller falls back to the managed backward.
+    /// </summary>
+    internal Tensor<T>[]? GatedDeltaNetScanBackwardGpu<T>(Tensor<T> gradOutput, Tensor<T>[] inputs, int numHeads)
+    {
+        using var __gpuOp = EnterGpuOp();
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend) ||
+            !Engines.DirectGpu.GatedDeltaNetBackwardResolver.TryResolve(backend, out var gdnBackend))
+            return null;
+        var q = inputs[0];
+        int batch = q.Shape._dims[0], seqLen = q.Shape._dims[1], modelDim = q.Shape._dims[2];
+        int headDim = modelDim / numHeads;
+        int n = batch * seqLen * modelDim, ng = batch * seqLen * numHeads;
+        var gradBuffers = new OwnedBuffer[5];
+        int allocated = 0;
+        try
+        {
+            var g = gradOutput.IsContiguous ? gradOutput : (Tensor<T>)gradOutput.Contiguous();
+            using var dOut = GetOrAllocateBuffer(backend, g);
+            using var qB = GetOrAllocateBuffer(backend, inputs[0]);
+            using var kB = GetOrAllocateBuffer(backend, inputs[1]);
+            using var vB = GetOrAllocateBuffer(backend, inputs[2]);
+            using var aB = GetOrAllocateBuffer(backend, inputs[3]);
+            using var bB = GetOrAllocateBuffer(backend, inputs[4]);
+            for (; allocated < 5; allocated++)
+                gradBuffers[allocated] = AllocateOutputBuffer(backend, allocated < 3 ? n : ng);
+            for (int i = 0; i < 5; i++)
+                backend.Fill(gradBuffers[i].Buffer, 0f, i < 3 ? n : ng);
+            gdnBackend.GatedDeltaNetScanBackward(
+                dOut.Buffer, qB.Buffer, kB.Buffer, vB.Buffer, aB.Buffer, bB.Buffer,
+                gradBuffers[0].Buffer, gradBuffers[1].Buffer, gradBuffers[2].Buffer,
+                gradBuffers[3].Buffer, gradBuffers[4].Buffer,
+                batch, seqLen, modelDim, numHeads, headDim);
+            var result = new Tensor<T>[5];
+            for (int i = 0; i < 5; i++)
+            {
+                result[i] = DeferTensorResult<T>(backend, gradBuffers[i].Buffer, i < 3 ? n : ng,
+                    i < 3 ? new[] { batch, seqLen, modelDim } : new[] { batch, seqLen, numHeads });
+                gradBuffers[i].RelinquishOwnership();
+            }
+
+            return result;
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            System.Diagnostics.Trace.TraceWarning($"GPU GatedDeltaNet backward fallback: {ex.GetType().Name}: {ex.Message}");
+            if (ThrowOnGpuKernelFallback) throw;
+            return null;
+        }
+        finally
+        {
+            for (int i = 0; i < allocated; i++) gradBuffers[i].Dispose();
+        }
+    }
+
+    // Fused Gated DeltaNet scan (#1464). Stays on-device during both inference and GradientTape training
+    // when the backend implements IGatedDeltaNetBackwardBackend (CUDA/HIP); falls back cleanly otherwise.
     public override Tensor<T> GatedDeltaNetScanForward<T>(
         Tensor<T> qProj, Tensor<T> kProj, Tensor<T> vProj, Tensor<T> alpha, Tensor<T> beta, int numHeads)
     {
         using var __gpuOp = EnterGpuOp();
-        if (Compilation.GraphMode.IsActive || IsTapeActive<T>() ||
-            typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+        if (Compilation.GraphMode.IsActive ||
+            typeof(T) != typeof(float) || !TryGetBackend(out var backend) ||
+            (IsTapeActive<T>() && !Engines.DirectGpu.GatedDeltaNetBackwardResolver.TryResolve(backend, out _)))
             return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads);
         if (qProj.Rank != 3 || numHeads < 1)
             return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads);
@@ -13084,6 +13143,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var result = DeferTensorResult<T>(backend, outB.Buffer, batch * seqLen * modelDim,
                 new[] { batch, seqLen, modelDim });
             outB.RelinquishOwnership();
+            Autodiff.DifferentiableOps.RecordIfActive<T>(
+                "GatedDeltaNetScan", result, new[] { qProj, kProj, vProj, alpha, beta },
+                static (gradOutput, inputs, output, savedState, engine, grads) =>
+                {
+                    int heads = (int)savedState[0];
+                    if (engine is DirectGpuTensorEngine gpu
+                        && gpu.GatedDeltaNetScanBackwardGpu(gradOutput, inputs, heads) is { } gpuGrads)
+                    {
+                        for (int i = 0; i < 5; i++)
+                            Autodiff.DifferentiableOps.AccumulateGrad(grads, inputs[i], gpuGrads[i], engine);
+                        return;
+                    }
+
+                    CpuEngine.GatedDeltaNetScanBackward(gradOutput, inputs, output, savedState, engine, grads);
+                },
+                savedState: new object[] { numHeads });
             return result;
         }
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("GatedDeltaNetScanForward", capabilityGap);

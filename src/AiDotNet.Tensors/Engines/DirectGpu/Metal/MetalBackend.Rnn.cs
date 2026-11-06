@@ -7,7 +7,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 /// Metal GPU backend implementation - RNN/LSTM/GRU Sequence Operations.
 /// Provides efficient sequence modeling for recurrent neural networks with BPTT support.
 /// </summary>
-public partial class MetalBackend
+public partial class MetalBackend : IGatedDeltaNetBackwardBackend
 {
     #region RNN (LSTM/GRU) Sequence Operations
 
@@ -82,6 +82,34 @@ public partial class MetalBackend
         => DispatchRecurrence("gated_delta_scan_forward", batch * numHeads * headDim,
             new[] { M(q), M(k), M(v), M(alpha), M(beta), M(output) },
             new[] { batch, seqLen, modelDim, numHeads, headDim });
+
+    void IGatedDeltaNetBackwardBackend.GatedDeltaNetScanBackward(
+        IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta,
+        IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dAlpha, IGpuBuffer dBeta,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "GatedDeltaNet dimensions must be positive.");
+        if (modelDim != numHeads * headDim || headDim > 256)
+            throw new ArgumentException($"Invalid GatedDeltaNet head layout (modelDim={modelDim}, numHeads={numHeads}, headDim={headDim}).");
+        int hh = headDim * headDim;
+        long totalLong = checked((long)batch * numHeads * headDim);
+        long trajLenLong = checked((long)batch * numHeads * seqLen * hh);
+        if (totalLong > int.MaxValue || trajLenLong > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(batch), "GatedDeltaNet dimensions exceed Metal launch/buffer limits.");
+        int total = (int)totalLong;
+        Fill(dQ, 0f, batch * seqLen * modelDim);
+        Fill(dK, 0f, batch * seqLen * modelDim);
+        Fill(dAlpha, 0f, batch * seqLen * numHeads);
+        Fill(dBeta, 0f, batch * seqLen * numHeads);
+        using var traj = AllocateBuffer((int)trajLenLong);
+        DispatchRecurrence("gated_delta_scan_recompute", total,
+            new[] { M(k), M(v), M(alpha), M(beta), M(traj) },
+            new[] { batch, seqLen, modelDim, numHeads, headDim });
+        DispatchRecurrence("gated_delta_scan_backward", total,
+            new[] { M(dOut), M(q), M(k), M(v), M(alpha), M(beta), M(traj), M(dQ), M(dK), M(dV), M(dAlpha), M(dBeta) },
+            new[] { batch, seqLen, modelDim, numHeads, headDim });
+    }
 
     public void RgLruScanForward(
         IGpuBuffer value, IGpuBuffer recGate, IGpuBuffer inpGate, IGpuBuffer decay, IGpuBuffer output,

@@ -364,4 +364,95 @@ fn addDG(idx: i32, val: f32) { var old = atomicLoad(&dG[idx]); loop { let nv = b
         for (var ki: i32 = 0; ki < HD; ki = ki+1) { dSrow[ki] = dSrow[ki] * g; }
     }
 }";
+
+    public const string GatedDeltaRecompute = @"
+@group(0) @binding(0) var<storage, read> K: array<f32>;
+@group(0) @binding(1) var<storage, read> Vd: array<f32>;
+@group(0) @binding(2) var<storage, read> A: array<f32>;
+@group(0) @binding(3) var<storage, read> Bt: array<f32>;
+@group(0) @binding(4) var<storage, read_write> Straj: array<f32>;
+struct P { batch: i32, seqLen: i32, modelDim: i32, numHeads: i32, headDim: i32 };
+@group(0) @binding(5) var<uniform> p: P;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
+    let gid = i32(gid3.x);
+    let B = p.batch; let SL = p.seqLen; let MD = p.modelDim; let NH = p.numHeads; let HD = p.headDim;
+    if (gid >= B*NH*HD) { return; }
+    let di = gid % HD; let h = (gid/HD) % NH; let b = gid/(HD*NH); let hOff = h*HD; let hh = HD*HD;
+    let kappa = 1.0/sqrt(f32(HD));
+    var Srow: array<f32, 256>;
+    for (var ki: i32 = 0; ki < HD; ki = ki+1) { Srow[ki] = 0.0; }
+    for (var t: i32 = 0; t < SL; t = t+1) {
+        let baseOff = (b*SL+t)*MD + hOff; let gIdx = (b*SL+t)*NH + h;
+        let a = A[gIdx]; let bet = Bt[gIdx];
+        var sK: f32 = 0.0; for (var ki: i32 = 0; ki < HD; ki = ki+1) { sK = sK + Srow[ki]*(K[baseOff+ki]*kappa); }
+        let bd = bet*(Vd[baseOff+di] - sK);
+        let trajBase = ((b*NH+h)*SL+t)*hh + di*HD;
+        for (var ki: i32 = 0; ki < HD; ki = ki+1) { let s = a*Srow[ki] + bd*(K[baseOff+ki]*kappa); Srow[ki] = s; Straj[trajBase+ki] = s; }
+    }
+}";
+
+    public const string GatedDeltaBackward = @"
+@group(0) @binding(0) var<storage, read> dOut: array<f32>;
+// QKpk = Q|K, ABSpk = A|Bt|Straj, dAB = dA|dB to stay within WebGPU's 8 storage bindings per stage.
+@group(0) @binding(1) var<storage, read> QKpk: array<f32>;
+@group(0) @binding(2) var<storage, read> Vd: array<f32>;
+@group(0) @binding(3) var<storage, read> ABSpk: array<f32>;
+@group(0) @binding(4) var<storage, read_write> dQ: array<atomic<u32>>;
+@group(0) @binding(5) var<storage, read_write> dK: array<atomic<u32>>;
+@group(0) @binding(6) var<storage, read_write> dV: array<f32>;
+@group(0) @binding(7) var<storage, read_write> dAB: array<atomic<u32>>;
+struct P { batch: i32, seqLen: i32, modelDim: i32, numHeads: i32, headDim: i32 };
+@group(0) @binding(8) var<uniform> p: P;
+fn addDQ(idx: i32, val: f32) { var old = atomicLoad(&dQ[idx]); loop { let nv = bitcast<u32>(bitcast<f32>(old) + val); let r = atomicCompareExchangeWeak(&dQ[idx], old, nv); if (r.exchanged) { break; } old = r.old_value; } }
+fn addDK(idx: i32, val: f32) { var old = atomicLoad(&dK[idx]); loop { let nv = bitcast<u32>(bitcast<f32>(old) + val); let r = atomicCompareExchangeWeak(&dK[idx], old, nv); if (r.exchanged) { break; } old = r.old_value; } }
+fn addDAB(idx: i32, val: f32) { var old = atomicLoad(&dAB[idx]); loop { let nv = bitcast<u32>(bitcast<f32>(old) + val); let r = atomicCompareExchangeWeak(&dAB[idx], old, nv); if (r.exchanged) { break; } old = r.old_value; } }
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
+    let gid = i32(gid3.x);
+    let B = p.batch; let SL = p.seqLen; let MD = p.modelDim; let NH = p.numHeads; let HD = p.headDim;
+    if (gid >= B*NH*HD) { return; }
+    let di = gid % HD; let h = (gid/HD) % NH; let b = gid/(HD*NH); let hOff = h*HD; let hh = HD*HD;
+    let qkCount = B*SL*MD; let gCount = B*SL*NH; let trajOff = 2*gCount;
+    let kappa = 1.0/sqrt(f32(HD));
+    var dSrow: array<f32, 256>;
+    for (var ki: i32 = 0; ki < HD; ki = ki+1) { dSrow[ki] = 0.0; }
+    for (var t: i32 = SL-1; t >= 0; t = t-1) {
+        let baseOff = (b*SL+t)*MD + hOff; let gIdx = (b*SL+t)*NH + h;
+        let a = ABSpk[gIdx]; let bet = ABSpk[gCount + gIdx];
+        let trajBase = ((b*NH+h)*SL+t)*hh + di*HD;
+        let sprevBase = ((b*NH+h)*SL+(t-1))*hh + di*HD;
+        var sK: f32 = 0.0;
+        for (var ki: i32 = 0; ki < HD; ki = ki+1) {
+            var sprev: f32 = 0.0; if (t > 0) { sprev = ABSpk[trajOff + sprevBase + ki]; }
+            sK = sK + sprev * (QKpk[qkCount + baseOff + ki] * kappa);
+        }
+        let delta = Vd[baseOff+di] - sK;
+        let dOutVal = dOut[baseOff+di];
+        for (var ki: i32 = 0; ki < HD; ki = ki+1) {
+            let sval = ABSpk[trajOff + trajBase + ki];
+            addDQ(baseOff+ki, dOutVal*sval);
+            dSrow[ki] = dSrow[ki] + dOutVal*QKpk[baseOff+ki];
+        }
+        var dA_acc: f32 = 0.0; var dB_acc: f32 = 0.0; var dDelta: f32 = 0.0;
+        for (var ki: i32 = 0; ki < HD; ki = ki+1) {
+            let dSt = dSrow[ki];
+            var sprev: f32 = 0.0; if (t > 0) { sprev = ABSpk[trajOff + sprevBase + ki]; }
+            let kScaled = QKpk[qkCount + baseOff + ki] * kappa;
+            dA_acc = dA_acc + dSt*sprev;
+            dB_acc = dB_acc + dSt*delta*kScaled;
+            dDelta = dDelta + dSt*bet*kScaled;
+        }
+        dV[baseOff+di] = dDelta;
+        addDAB(gIdx, dA_acc);
+        addDAB(gCount + gIdx, dB_acc);
+        let dSk = -dDelta;
+        for (var ki: i32 = 0; ki < HD; ki = ki+1) {
+            let dSt = dSrow[ki];
+            var sprev: f32 = 0.0; if (t > 0) { sprev = ABSpk[trajOff + sprevBase + ki]; }
+            let kScaled = QKpk[qkCount + baseOff + ki] * kappa;
+            let dKS = dSt*(bet*delta) + dSk*sprev;
+            addDK(baseOff+ki, dKS*kappa);
+            dSrow[ki] = dSt*a + dSk*kScaled;
+        }
+    }
+}";
 }

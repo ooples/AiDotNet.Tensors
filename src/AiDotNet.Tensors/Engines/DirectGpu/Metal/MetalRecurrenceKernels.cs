@@ -462,5 +462,86 @@ kernel void gla_scan_backward(
         for (int ki = 0; ki < headDim; ki++) dSrow[ki] *= g;
     }
 }
+
+kernel void gated_delta_scan_recompute(
+    device const float* K [[buffer(0)]], device const float* V [[buffer(1)]],
+    device const float* A [[buffer(2)]], device const float* B [[buffer(3)]],
+    device float* Straj [[buffer(4)]],
+    constant int& batch [[buffer(5)]], constant int& seqLen [[buffer(6)]], constant int& modelDim [[buffer(7)]],
+    constant int& numHeads [[buffer(8)]], constant int& headDim [[buffer(9)]], uint gid [[thread_position_in_grid]])
+{
+    int total = batch * numHeads * headDim;
+    if ((int)gid >= total) return;
+    int di = (int)gid % headDim; int h = ((int)gid / headDim) % numHeads; int b = (int)gid / (headDim * numHeads);
+    int hOff = h * headDim; int hh = headDim * headDim;
+    float kappa = 1.0f / sqrt((float)headDim);
+    float Srow[REC_MAX_HEADDIM];
+    for (int ki = 0; ki < headDim; ki++) Srow[ki] = 0.0f;
+    for (int t = 0; t < seqLen; t++) {
+        int baseOff = (b * seqLen + t) * modelDim + hOff;
+        int gIdx = (b * seqLen + t) * numHeads + h;
+        float a = A[gIdx], bet = B[gIdx];
+        float sK = 0.0f;
+        for (int ki = 0; ki < headDim; ki++) sK += Srow[ki] * (K[baseOff + ki] * kappa);
+        float bd = bet * (V[baseOff + di] - sK);
+        int trajBase = ((b * numHeads + h) * seqLen + t) * hh + di * headDim;
+        for (int ki = 0; ki < headDim; ki++) { float s = a * Srow[ki] + bd * (K[baseOff + ki] * kappa); Srow[ki] = s; Straj[trajBase + ki] = s; }
+    }
+}
+
+kernel void gated_delta_scan_backward(
+    device const float* dOut [[buffer(0)]], device const float* Q [[buffer(1)]], device const float* K [[buffer(2)]],
+    device const float* V [[buffer(3)]], device const float* A [[buffer(4)]], device const float* B [[buffer(5)]],
+    device const float* Straj [[buffer(6)]],
+    device atomic_uint* dQ [[buffer(7)]], device atomic_uint* dK [[buffer(8)]], device float* dV [[buffer(9)]],
+    device atomic_uint* dA [[buffer(10)]], device atomic_uint* dB [[buffer(11)]],
+    constant int& batch [[buffer(12)]], constant int& seqLen [[buffer(13)]], constant int& modelDim [[buffer(14)]],
+    constant int& numHeads [[buffer(15)]], constant int& headDim [[buffer(16)]], uint gid [[thread_position_in_grid]])
+{
+    int total = batch * numHeads * headDim;
+    if ((int)gid >= total) return;
+    int di = (int)gid % headDim; int h = ((int)gid / headDim) % numHeads; int b = (int)gid / (headDim * numHeads);
+    int hOff = h * headDim; int hh = headDim * headDim;
+    float kappa = 1.0f / sqrt((float)headDim);
+    float dSrow[REC_MAX_HEADDIM];
+    for (int ki = 0; ki < headDim; ki++) dSrow[ki] = 0.0f;
+    for (int t = seqLen - 1; t >= 0; t--) {
+        int baseOff = (b * seqLen + t) * modelDim + hOff;
+        int gIdx = (b * seqLen + t) * numHeads + h;
+        float a = A[gIdx], bet = B[gIdx];
+        int trajBase = ((b * numHeads + h) * seqLen + t) * hh + di * headDim;
+        int sprevBase = (t > 0) ? (((b * numHeads + h) * seqLen + (t - 1)) * hh + di * headDim) : 0;
+        float sK = 0.0f;
+        for (int ki = 0; ki < headDim; ki++) { float sprev = (t > 0) ? Straj[sprevBase + ki] : 0.0f; sK += sprev * (K[baseOff + ki] * kappa); }
+        float delta = V[baseOff + di] - sK;
+        float dOutVal = dOut[baseOff + di];
+        for (int ki = 0; ki < headDim; ki++) {
+            float sval = Straj[trajBase + ki];
+            gla_atomic_add_f(dQ, baseOff + ki, dOutVal * sval);
+            dSrow[ki] += dOutVal * Q[baseOff + ki];
+        }
+        float dA_acc = 0.0f, dB_acc = 0.0f, dDelta = 0.0f;
+        for (int ki = 0; ki < headDim; ki++) {
+            float dSt = dSrow[ki];
+            float sprev = (t > 0) ? Straj[sprevBase + ki] : 0.0f;
+            float kScaled = K[baseOff + ki] * kappa;
+            dA_acc += dSt * sprev;
+            dB_acc += dSt * delta * kScaled;
+            dDelta += dSt * bet * kScaled;
+        }
+        dV[baseOff + di] = dDelta;
+        gla_atomic_add_f(dA, gIdx, dA_acc);
+        gla_atomic_add_f(dB, gIdx, dB_acc);
+        float dSk = -dDelta;
+        for (int ki = 0; ki < headDim; ki++) {
+            float dSt = dSrow[ki];
+            float sprev = (t > 0) ? Straj[sprevBase + ki] : 0.0f;
+            float kScaled = K[baseOff + ki] * kappa;
+            float dKS = dSt * (bet * delta) + dSk * sprev;
+            gla_atomic_add_f(dK, baseOff + ki, dKS * kappa);
+            dSrow[ki] = dSt * a + dSk * kScaled;
+        }
+    }
+}
 ";
 }
