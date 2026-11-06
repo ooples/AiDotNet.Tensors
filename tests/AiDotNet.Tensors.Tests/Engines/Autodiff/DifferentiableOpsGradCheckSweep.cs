@@ -41,7 +41,7 @@ public class DifferentiableOpsGradCheckSweep
     /// Ops excluded from the numeric check, with the reason. Anything here is a deliberate,
     /// documented exclusion — not a silent gap.
     /// </summary>
-    private static readonly Dictionary<string, string> Exempt = new(StringComparer.Ordinal)
+    internal static readonly Dictionary<string, string> Exempt = new(StringComparer.Ordinal)
     {
         // Non-smooth at points a random probe can land on. Finite differences straddle the kink
         // and disagree with any one-sided subgradient choice.
@@ -92,7 +92,7 @@ public class DifferentiableOpsGradCheckSweep
     /// explicit, shrinkable list rather than a silent skip count.
     /// </para>
     /// </remarks>
-    private static readonly Dictionary<string, Func<Random, object[]>> OpCases = new(StringComparer.Ordinal)
+    internal static readonly Dictionary<string, Func<Random, object[]>> OpCases = new(StringComparer.Ordinal)
     {
         // --- matmul family: inner dimensions must agree ---
         ["TensorMatMul"] = r => [SafeTensor([2, 3], r), SafeTensor([3, 2], r)],
@@ -399,7 +399,7 @@ public class DifferentiableOpsGradCheckSweep
     /// Compact parameter-type fingerprint used to key table entries to a SPECIFIC overload,
     /// e.g. <c>T,T,int[],int[],int[]</c>. <c>T</c> denotes <c>Tensor&lt;double&gt;</c>.
     /// </summary>
-    private static string ParamFingerprint(MethodInfo m)
+    internal static string ParamFingerprint(MethodInfo m)
         => string.Join(",", m.GetParameters().Select(p => TypeToken(p.ParameterType)));
 
     /// <summary>
@@ -612,7 +612,7 @@ public class DifferentiableOpsGradCheckSweep
     /// Best-effort argument construction. Returns null when a parameter type is not something
     /// this harness can synthesize, which is reported as a skip.
     /// </summary>
-    private static object[]? BuildArgs(MethodInfo m, int[] shape, Random rng, out int firstTensorIdx)
+    internal static object[]? BuildArgs(MethodInfo m, int[] shape, Random rng, out int firstTensorIdx)
     {
         firstTensorIdx = -1;
         var ps = m.GetParameters();
@@ -920,5 +920,5 @@ public class DifferentiableOpsGradCheckSweep
         return string.Join(", ", parts);
     }
 
-    private static Exception Inner(Exception ex) => ex is TargetInvocationException { InnerException: { } inner } ? inner : ex;
+    internal static Exception Inner(Exception ex) => ex is TargetInvocationException { InnerException: { } inner } ? inner : ex;
 }
