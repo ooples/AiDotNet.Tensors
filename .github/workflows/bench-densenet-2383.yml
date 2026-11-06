@@ -2,7 +2,7 @@ name: Bench DenseNet-121 on CUDA (AiDotNet #2383, one-off)
 
 # Measures AiDotNet's DenseNet-121 on the RTX 3080 (sm86) and on the GTX 1660 Ti (sm75) the issue's evidence came from,
 # against the published
-# AiDotNet.Tensors 0.147.0. Runs only on pushes to this branch; the branch is deleted once the numbers are recorded.
+# AiDotNet.Tensors 0.148.0. Runs only on pushes to this branch; the branch is deleted once the numbers are recorded.
 
 on:
   push:
@@ -75,12 +75,12 @@ jobs:
         path: aidn
         persist-credentials: false
 
-    - name: Pin AiDotNet.Tensors 0.147.0
+    - name: Pin AiDotNet.Tensors 0.148.0
       run: |
         $props = 'aidn/Directory.Packages.props'
         $text = Get-Content $props -Raw
         foreach ($id in 'AiDotNet.Tensors', 'AiDotNet.Native.OneDNN', 'AiDotNet.Native.CLBlast') {
-          $text = $text -replace "(<PackageVersion Include=`"$([regex]::Escape($id))`" Version=`")[^`"]+(`")", '${1}0.147.0${2}'
+          $text = $text -replace "(<PackageVersion Include=`"$([regex]::Escape($id))`" Version=`")[^`"]+(`")", '${1}0.148.0${2}'
         }
         Set-Content $props $text -NoNewline
         Select-String -Path $props -Pattern 'AiDotNet\.(Tensors|Native)' | ForEach-Object { $_.Line.Trim() }
