@@ -4734,10 +4734,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         lock (_trackedOwnedResults) _trackedOwnedResults.Clear();
     }
 
-    // The GC cannot see device memory. Owned results are small managed objects pinning large device buffers, so
-    // after a VRAM-proportional volume of result allocations run a cheap gen-0 collection: intermediates die young,
-    // their buffers' finalizers queue stream-ordered frees, and the next op drains them. (A failed allocation also
-    // reclaims — see CudaBackend.AllocDeviceMemoryAsync.)
+    // The GC cannot see device memory. Owned results are small managed objects pinning large device buffers. During
+    // GradientTape training, forward activations survive mid-step gen-0 collections into gen-1 before tape.Dispose()
+    // drops them, and on Windows WDDM cuMemAllocAsync silently spills into PCIe shared system memory instead of
+    // returning OOM. Collecting through gen-1 every 256 MB reclaims tape-promoted intermediates before WDDM paging.
     private long _ownedResultBytesSinceCollect;
 
     private void NoteOwnedResultAllocation(long bytes)
@@ -4745,12 +4745,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         long threshold = OwnedResultCollectThresholdBytes;
         if (System.Threading.Interlocked.Add(ref _ownedResultBytesSinceCollect, bytes) < threshold) return;
         System.Threading.Interlocked.Exchange(ref _ownedResultBytesSinceCollect, 0);
-        GC.Collect(0, GCCollectionMode.Optimized, blocking: false);
+        GC.Collect(1, GCCollectionMode.Forced, blocking: false);
     }
 
-    private long OwnedResultCollectThresholdBytes =>
-        _directGpu is { } dg && dg.GlobalMemoryBytes > 0 ? Math.Max(256L << 20, dg.GlobalMemoryBytes / 16) : 256L << 20;
-
+    private long OwnedResultCollectThresholdBytes => 256L << 20;
     /// <summary>
     /// Materializes a deferred download if the given array was returned from a GPU op
     /// within a GpuScope without downloading. This is called automatically when CPU
