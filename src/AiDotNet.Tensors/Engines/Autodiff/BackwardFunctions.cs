@@ -9712,8 +9712,8 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var input = inputs[0];
-        // The forward's clamp: max(x, max(1e-20, minAmplitude)).
-        double minAmp = Math.Max(1e-20, (float)savedState[0]);
+        // The forward's clamp: max(x, max(AmplitudeToDBFloor, minAmplitude)).
+        double minAmp = Math.Max(CpuEngine.AmplitudeToDBFloor, (float)savedState[0]);
         float? topDb = savedState.Length > 1 ? (float?)savedState[1] : null;
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(input._shape);

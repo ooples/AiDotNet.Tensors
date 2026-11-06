@@ -190,7 +190,7 @@ public partial class DirectGpuTensorEngine
                     var arr = FinishGpuOp<T>(backend, outBuf, n * m);
                     var result = new Tensor<T>(arr, new[] { n, m });
                     // The CPU op's tape edge: without it every box got a zero gradient on the GPU engine.
-                    Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
+                    BindTapeIfRecording<T>();
                     Autodiff.DifferentiableOps.RecordBinary(opName, result, boxesA, boxesB, backward);
                     return result;
                 }

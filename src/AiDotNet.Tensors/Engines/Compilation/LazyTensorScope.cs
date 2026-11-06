@@ -216,12 +216,6 @@ internal sealed class LazyTensorScope : IDisposable
         return output;
     }
 
-    /// <summary>
-    /// Records an operation whose output was materialized once to establish its exact shape during
-    /// tracing, while retaining every public tensor operand as a graph dependency. This is the
-    /// variadic counterpart to <see cref="RecordMaterializedUnary{T}"/> and is used by opaque
-    /// inference nodes for kernels that do not have a primitive graph decomposition yet.
-    /// </summary>
     // Auxiliary outputs (argmax indices) of recorded nodes, keyed by the object the caller holds, mapped to the
     // node's primary output. A node that consumes the auxiliary output depends on that output, so a schedule cannot
     // run it before the producer refreshes the indices.
@@ -242,6 +236,12 @@ internal sealed class LazyTensorScope : IDisposable
         return found;
     }
 
+    /// <summary>
+    /// Records an operation whose output was materialized once to establish its exact shape during
+    /// tracing, while retaining every public tensor operand as a graph dependency. This is the
+    /// variadic counterpart to <see cref="RecordMaterializedUnary{T}"/> and is used by opaque
+    /// inference nodes for kernels that do not have a primitive graph decomposition yet.
+    /// </summary>
     internal Tensor<T> RecordMaterializedVariadic<T>(
         LazyNodeType opType,
         string opName,

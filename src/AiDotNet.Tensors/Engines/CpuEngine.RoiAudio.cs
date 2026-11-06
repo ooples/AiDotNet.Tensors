@@ -495,6 +495,12 @@ public partial class CpuEngine
         return result;
     }
 
+    /// <summary>
+    /// The smallest amplitude AmplitudeToDB takes the log of, whatever minAmplitude asks for: the forward clamps to
+    /// max(x, max(this, minAmplitude)) and its backward routes gradient by the same threshold.
+    /// </summary>
+    internal const double AmplitudeToDBFloor = 1e-20;
+
     private Tensor<T> AmplitudeToDBImpl<T>(Tensor<T> input, float minAmplitude, float? topDb)
     {
         var ops = MathHelper.GetNumericOperations<T>();
@@ -503,7 +509,7 @@ public partial class CpuEngine
         var result = new Tensor<T>(input._shape);
         using var dstLease = result.LeaseWritable();
         var dst = dstLease.Span;
-        double minAmp = Math.Max(1e-20, minAmplitude);
+        double minAmp = Math.Max(AmplitudeToDBFloor, minAmplitude);
         double peak = double.NegativeInfinity;
         for (int i = 0; i < src.Length; i++)
         {
