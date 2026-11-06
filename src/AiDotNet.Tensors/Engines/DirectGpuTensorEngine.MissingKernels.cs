@@ -2271,13 +2271,18 @@ public partial class DirectGpuTensorEngine
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
         if (axis < 0) axis += destination.Rank;
 
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
+        // Under a tape the device result records the CPU engine's node (same backward, same saved state).
+        if (Compilation.GraphMode.IsActive)
             return base.TensorScatterAdd(destination, indices, updates, axis);
 
         try
         {
             if (TryIndexAddOnDevice(destination, axis, indices, updates) is { } output)
+            {
+                Autodiff.DifferentiableOps.RecordIfActive("TensorScatterAdd", output, new[] { destination, updates },
+                    Autodiff.BackwardFunctions<T>.ScatterAddBackward, new object[] { indices, axis });
                 return output;
+            }
         }
         catch (Exception)
         {
@@ -2297,12 +2302,16 @@ public partial class DirectGpuTensorEngine
 
         // This overload has exactly index_add semantics: clone input, then add each values slice
         // into the destination slice named by the one-dimensional indices tensor.
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
+        if (Compilation.GraphMode.IsActive)
             return base.ScatterAdd(input, indices, values, axis);
         try
         {
             if (TryIndexAddOnDevice(input, normalizedAxis, indices, values) is { } output)
+            {
+                Autodiff.DifferentiableOps.RecordBinary("ScatterAdd", output, input, values,
+                    Autodiff.BackwardFunctions<T>.ScatterAddBackward, new object[] { indices, axis });
                 return output;
+            }
         }
         catch (Exception)
         {
@@ -2321,13 +2330,17 @@ public partial class DirectGpuTensorEngine
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
         if (axis < 0) axis += tensor.Rank;
 
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
+        if (Compilation.GraphMode.IsActive)
             return base.TensorIndexAdd(tensor, axis, indices, source);
 
         try
         {
             if (TryIndexAddOnDevice(tensor, axis, indices, source) is { } output)
+            {
+                Autodiff.DifferentiableOps.RecordBinary("TensorIndexAdd", output, tensor, source,
+                    Autodiff.BackwardFunctions<T>.IndexAddBackward, savedState: new object[] { axis, indices });
                 return output;
+            }
         }
         catch (Exception)
         {
@@ -11233,7 +11246,7 @@ public partial class DirectGpuTensorEngine
         using var __gpuOp = EnterGpuOp();
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
         int actualDim = dim < 0 ? source.Rank + dim : dim;
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || source.Rank < 1 || actualDim != 0 || !outputSize.HasValue || outputSize.Value <= 0
             || indices.Length < source.Shape._dims[0]
             || !TryGetBackend(out var backend) || backend is not IResidentIndexBackend indexBackend)
@@ -11248,9 +11261,12 @@ public partial class DirectGpuTensorEngine
             outShape[0] = outDimSize;
             using var srcBuf = GetOrAllocateBuffer(backend, source);
             using var idxBuf = GetOrAllocateInt32IndexBuffer(backend, indices);
-            return DispatchDeferredGpuOp<T>(backend, outLen, outShape, result =>
+            var scattered = DispatchDeferredGpuOp<T>(backend, outLen, outShape, result =>
                 indexBackend.ScatterAddRows(srcBuf.Buffer, idxBuf.Buffer, result,
                     srcDimSize, innerSize, outDimSize));
+            Autodiff.DifferentiableOps.RecordUnary("ScatterAdd", scattered, source,
+                Autodiff.BackwardFunctions<T>.ScatterAddBackward, new object[] { indices, actualDim });
+            return scattered;
         }
         catch
         {
