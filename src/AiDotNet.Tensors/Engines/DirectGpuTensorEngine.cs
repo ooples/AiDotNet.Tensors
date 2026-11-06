@@ -25635,7 +25635,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // clean cross-engine); the only mismatch was aggregation — CpuEngine returns the scalar mean.
         // Run the per-element kernel then reduce to the mean over all elements (ScalarMeanResult), same
         // as TensorHuberLoss. Tape/GraphMode/non-float defer to the base.
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || logits.Length != targets.Length || !TryGetBackend(out var backend))
             return base.TensorBCEWithLogitsLoss(logits, targets);
         try
@@ -25645,7 +25645,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bufT = GetOrAllocateBuffer(backend, targets);
             using var bufOut = AllocateFullyWrittenOutputBuffer(backend, size);
             backend.BceWithLogitsLoss(bufL.Buffer, bufT.Buffer, bufOut.Buffer, size);
-            return ScalarMeanResult<T>(backend, bufOut, size);
+            var bceMean = ScalarMeanResult<T>(backend, bufOut, size);
+            Autodiff.DifferentiableOps.RecordBinary("BCEWithLogitsLoss", bceMean, logits, targets,
+                Autodiff.BackwardFunctions<T>.BCEWithLogitsLossBackward);
+            return bceMean;
         }
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorBCEWithLogitsLoss", capabilityGap);
             return base.TensorBCEWithLogitsLoss(logits, targets);
@@ -26351,9 +26354,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorConstantPad<T>(Tensor<T> tensor, int[] padding, T value)
     {
-        if (!IsTapeActive<T>() && padding.Length >= 4
+        if (!Compilation.GraphMode.IsActive && padding.Length >= 4
             && TryPadLast2OnDevice(tensor, padding[2], padding[3], padding[0], padding[1], value) is { } resident)
+        {
+            Autodiff.DifferentiableOps.RecordUnary("ConstantPad", resident, tensor, Autodiff.BackwardFunctions<T>.ConstantPadBackward,
+                savedState: new object[] { padding });
             return resident;
+        }
         if (tensor.Rank == 4 && padding.Length >= 4)
             return ((IEngine)this).Pad(tensor, padding[2], padding[3], padding[0], padding[1], value);
         return base.TensorConstantPad(tensor, padding, value);
@@ -28300,9 +28307,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.Pad<T>(Tensor<T> input, int padTop, int padBottom, int padLeft, int padRight, T padValue)
     {
-        if (IsTapeActive<T>()) return base.Pad(input, padTop, padBottom, padLeft, padRight, padValue);
+        // Under a tape the device result records the CPU engine's node (PadBackward, {padTop, padLeft}).
+        if (Compilation.GraphMode.IsActive) return base.Pad(input, padTop, padBottom, padLeft, padRight, padValue);
         if (TryPadLast2OnDevice(input, padTop, padBottom, padLeft, padRight, padValue) is { } resident)
+        {
+            Autodiff.DifferentiableOps.RecordUnary("Pad", resident, input, Autodiff.BackwardFunctions<T>.PadBackward, new object[] { padTop, padLeft });
             return resident;
+        }
         return base.Pad(input,padTop,padBottom,padLeft,padRight,padValue);
     }
 
@@ -28317,8 +28328,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.Crop<T>(Tensor<T> input, int top, int left, int height, int width)
     {
-        if (IsTapeActive<T>()) return base.Crop(input, top, left, height, width);
-        if (TryCropLast2OnDevice(input, top, left, height, width) is { } resident) return resident;
+        if (Compilation.GraphMode.IsActive) return base.Crop(input, top, left, height, width);
+        if (TryCropLast2OnDevice(input, top, left, height, width) is { } resident)
+        {
+            Autodiff.DifferentiableOps.RecordUnary("Crop", resident, input, Autodiff.BackwardFunctions<T>.CropBackward, new object[] { top, left });
+            return resident;
+        }
         return base.Crop(input,top,left,height,width);
     }
 

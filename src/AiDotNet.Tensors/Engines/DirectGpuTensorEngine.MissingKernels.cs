@@ -9597,7 +9597,8 @@ public partial class DirectGpuTensorEngine
     // CpuEngine's clamp bounds and term order under Accum(1e-3). Defer to base under tape/GraphMode.
     Tensor<T> IEngine.TensorBinaryCrossEntropy<T>(Tensor<T> predictions, Tensor<T> targets, T epsilon)
     {
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
+        // A composite of recorded engine ops: under a tape each piece records itself, so only GraphMode defers.
+        if (Compilation.GraphMode.IsActive)
             return base.TensorBinaryCrossEntropy(predictions, targets, epsilon);
         var numOps = MathHelper.GetNumericOperations<T>();
         var upper = numOps.Subtract(numOps.One, epsilon);
@@ -9614,7 +9615,7 @@ public partial class DirectGpuTensorEngine
     // as CpuEngine. Defer to base under tape/GraphMode.
     Tensor<T> IEngine.TensorBinaryCrossEntropyBackward<T>(Tensor<T> predictions, Tensor<T> targets, T epsilon)
     {
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
+        if (Compilation.GraphMode.IsActive)
             return base.TensorBinaryCrossEntropyBackward(predictions, targets, epsilon);
         var numOps = MathHelper.GetNumericOperations<T>();
         var upper = numOps.Subtract(numOps.One, epsilon);
