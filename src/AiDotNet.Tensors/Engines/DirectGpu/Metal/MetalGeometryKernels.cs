@@ -77,10 +77,10 @@ kernel void geometry_interpolate_2d(
     device const float* src = input + ((n * C + c) * Hin) * Win;
 
     if (mode == 0) {
-        float sy = Hout > 1 ? (float)y * Hin / Hout : 0.0;
-        float sx = Wout > 1 ? (float)x * Win / Wout : 0.0;
-        int yi = (int)floor(sy); if (yi >= Hin) yi = Hin - 1;
-        int xi = (int)floor(sx); if (xi >= Win) xi = Win - 1;
+        // floor(x * Win / Wout) in integers: a float division here is not correctly rounded (drivers may compute
+        // a * (1 / b)), so an exact quotient such as 30 / 15 came out as 1.99999994 and floored to the wrong pixel.
+        int yi = (y * Hin) / Hout; if (yi >= Hin) yi = Hin - 1;
+        int xi = (x * Win) / Wout; if (xi >= Win) xi = Win - 1;
         output[gid] = src[yi * Win + xi];
     } else if (mode == 2) {
         float sy = source_coord_f(y, Hout, Hin, alignCorners);
@@ -117,28 +117,24 @@ kernel void geometry_interpolate_2d(
         }
         output[gid] = acc;
     } else {  // Area — overlap-weighted averaging
-        float yLo = (float)y * Hin / Hout;
-        float yHi = (float)(y + 1) * Hin / Hout;
-        float xLo = (float)x * Win / Wout;
-        float xHi = (float)(x + 1) * Win / Wout;
-        int yL = (int)floor(yLo); int yH = (int)ceil(yHi);
-        int xL = (int)floor(xLo); int xH = (int)ceil(xHi);
-        if (yH <= yL) yH = yL + 1;
-        if (xH <= xL) xH = xL + 1;
-        if (yH > Hin) yH = Hin;
-        if (xH > Win) xH = Win;
-        float totalArea = (yHi - yLo) * (xHi - xLo);
-        float acc = 0.0;
+        // Positions in units of 1/Hout (1/Wout): output cell y covers [y * Hin, (y + 1) * Hin) and input pixel yy
+        // covers [yy * Hout, (yy + 1) * Hout), so every bound and overlap is an exact integer; a float division is
+        // not correctly rounded here and could open the window a pixel wide with a spurious sliver of weight.
+        int yLo = y * Hin, yHi = (y + 1) * Hin;
+        int xLo = x * Win, xHi = (x + 1) * Win;
+        int yL = yLo / Hout, yH = min((yHi + Hout - 1) / Hout, Hin);
+        int xL = xLo / Wout, xH = min((xHi + Wout - 1) / Wout, Win);
+        float acc = 0.0f;
         for (int yy = yL; yy < yH; yy++) {
-            float oy = max(0.0f, min(yHi, (float)(yy + 1)) - max(yLo, (float)yy));
-            if (oy <= 0.0f) continue;
+            int oy = min(yHi, (yy + 1) * Hout) - max(yLo, yy * Hout);
+            if (oy <= 0) continue;
             for (int xx = xL; xx < xH; xx++) {
-                float ox = max(0.0f, min(xHi, (float)(xx + 1)) - max(xLo, (float)xx));
-                if (ox <= 0.0f) continue;
-                acc += oy * ox * src[yy * Win + xx];
+                int ox = min(xHi, (xx + 1) * Wout) - max(xLo, xx * Wout);
+                if (ox <= 0) continue;
+                acc += (float)(oy * ox) * src[yy * Win + xx];
             }
         }
-        output[gid] = totalArea > 0.0 ? acc / totalArea : 0.0;
+        output[gid] = acc / (float)(Hin * Win);
     }
 }
 

@@ -81,11 +81,10 @@ struct P {
     let srcBase = ((n * p.C + c) * p.Hin) * p.Win;
 
     if (p.mode == 0) {
-        var sy : f32 = 0.0; var sx : f32 = 0.0;
-        if (p.Hout > 1) { sy = f32(y) * f32(p.Hin) / f32(p.Hout); }
-        if (p.Wout > 1) { sx = f32(x) * f32(p.Win) / f32(p.Wout); }
-        var yi = i32(floor(sy)); if (yi >= p.Hin) { yi = p.Hin - 1; }
-        var xi = i32(floor(sx)); if (xi >= p.Win) { xi = p.Win - 1; }
+        // floor(x * Win / Wout) in integers: a float division here is not correctly rounded (drivers may compute
+        // a * (1 / b)), so an exact quotient such as 30 / 15 came out as 1.99999994 and floored to the wrong pixel.
+        var yi = (y * p.Hin) / p.Hout; if (yi >= p.Hin) { yi = p.Hin - 1; }
+        var xi = (x * p.Win) / p.Wout; if (xi >= p.Win) { xi = p.Win - 1; }
         output_[gid] = input_[srcBase + yi * p.Win + xi];
     } else if (p.mode == 2) {
         let sy = source_coord(y, p.Hout, p.Hin, p.alignCorners);
@@ -126,28 +125,24 @@ struct P {
         }
         output_[gid] = acc;
     } else {  // Area — overlap-weighted averaging
-        let yLo = f32(y) * f32(p.Hin) / f32(p.Hout);
-        let yHi = f32(y + 1) * f32(p.Hin) / f32(p.Hout);
-        let xLo = f32(x) * f32(p.Win) / f32(p.Wout);
-        let xHi = f32(x + 1) * f32(p.Win) / f32(p.Wout);
-        var yL = i32(floor(yLo)); var yH = i32(ceil(yHi));
-        var xL = i32(floor(xLo)); var xH = i32(ceil(xHi));
-        if (yH <= yL) { yH = yL + 1; }
-        if (xH <= xL) { xH = xL + 1; }
-        if (yH > p.Hin) { yH = p.Hin; }
-        if (xH > p.Win) { xH = p.Win; }
-        let totalArea = (yHi - yLo) * (xHi - xLo);
+        // Positions in units of 1/Hout (1/Wout): output cell y covers [y * Hin, (y + 1) * Hin) and input pixel yy
+        // covers [yy * Hout, (yy + 1) * Hout), so every bound and overlap is an exact integer; a float division is
+        // not correctly rounded here and could open the window a pixel wide with a spurious sliver of weight.
+        let yLo = y * p.Hin; let yHi = (y + 1) * p.Hin;
+        let xLo = x * p.Win; let xHi = (x + 1) * p.Win;
+        let yL = yLo / p.Hout; let yH = min((yHi + p.Hout - 1) / p.Hout, p.Hin);
+        let xL = xLo / p.Wout; let xH = min((xHi + p.Wout - 1) / p.Wout, p.Win);
         var acc : f32 = 0.0;
         for (var yy : i32 = yL; yy < yH; yy = yy + 1) {
-            let oy = max(0.0, min(yHi, f32(yy + 1)) - max(yLo, f32(yy)));
-            if (oy <= 0.0) { continue; }
+            let oy = min(yHi, (yy + 1) * p.Hout) - max(yLo, yy * p.Hout);
+            if (oy <= 0) { continue; }
             for (var xx : i32 = xL; xx < xH; xx = xx + 1) {
-                let ox = max(0.0, min(xHi, f32(xx + 1)) - max(xLo, f32(xx)));
-                if (ox <= 0.0) { continue; }
-                acc = acc + oy * ox * input_[srcBase + yy * p.Win + xx];
+                let ox = min(xHi, (xx + 1) * p.Wout) - max(xLo, xx * p.Wout);
+                if (ox <= 0) { continue; }
+                acc = acc + f32(oy * ox) * input_[srcBase + yy * p.Win + xx];
             }
         }
-        if (totalArea > 0.0) { output_[gid] = acc / totalArea; } else { output_[gid] = 0.0; }
+        output_[gid] = acc / f32(p.Hin * p.Win);
     }
 }
 ";

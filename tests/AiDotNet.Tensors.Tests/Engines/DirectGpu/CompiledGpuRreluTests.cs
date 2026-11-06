@@ -56,7 +56,10 @@ public class CompiledGpuRreluTests
                 grad = grads[x].ToArray();
             }
             Assert.True(GpuLaunchProbe.Count > 0, "RReLU launched no GPU work.");
-            Assert.DoesNotContain(GpuLaunchProbe.Fallbacks, f => f.StartsWith("TensorRrelu", StringComparison.Ordinal));
+            // Fallbacks entries read "{count}x {op}: {reason}".
+            static bool IsRreluFallback(string entry) => entry.IndexOf("x TensorRrelu:", StringComparison.Ordinal) >= 0;
+            Assert.True(IsRreluFallback("1x TensorRrelu: guard or route declined"), "The fallback matcher misses the probe's format.");
+            Assert.DoesNotContain(GpuLaunchProbe.Fallbacks, IsRreluFallback);
 
             for (int i = 0; i < x.Length; i++)
             {

@@ -278,6 +278,13 @@ public sealed class BackendContractParityTests
         Check(backend);
     }
 
+#if NET7_0_OR_GREATER
+    // WebGPU's FP16 and fused-index contracts differ, so only the rounding check runs there: WGSL's round() is
+    // ties-to-even, the regression this guards against.
+    [SkippableFact]
+    public void WebGpu_RoiPool_RoundsHalfAwayFromZero() => CheckRoiPoolRounding(DawnHostedWebGpu.BackendOrSkip());
+#endif
+
     [SkippableFact]
     public void Hip_BackendContracts_MatchTheCudaSemantics()
     {

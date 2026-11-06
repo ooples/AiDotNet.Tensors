@@ -7,6 +7,7 @@ using System.IO;
 using System.Linq;
 using System.Text.Json;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
@@ -149,12 +150,22 @@ public sealed class PyTorchGridSampleParityTests
         var input = make(c.Input, new[] { N, C, H, W });
         var grid = make(c.Grid, new[] { N, 1, c.Points, 2 });
         var gradOut = make(c.GradOutput, new[] { N, C, 1, c.Points });
-        double[] D(Tensor<TT> t) => Array.ConvertAll(t.ToArray(), v => Convert.ToDouble(v));
+        // On a GPU engine every op must launch device work: the engine falls back to the CpuEngine silently when a
+        // kernel is unavailable, and the comparison would then check the CPU reference against PyTorch instead.
+        string where = $"{mode}/{padding}/{(align ? 1 : 0)}";
+        double[] D(string op, Func<Tensor<TT>> run)
+        {
+            GpuLaunchProbe.Reset();
+            var values = Array.ConvertAll(run().ToArray(), v => Convert.ToDouble(v));
+            if (e is DirectGpuTensorEngine)
+                Assert.True(GpuLaunchProbe.Count > 0, $"{where} {op} launched no GPU work: it ran the CPU fallback.");
+            return values;
+        }
         return new Dictionary<string, double[]>
         {
-            ["output"] = D(e.GridSample(input, grid, mode, padding, align)),
-            ["grad_input"] = D(e.GridSampleBackwardInput(gradOut, grid, new[] { N, C, H, W }, mode, padding, align)),
-            ["grad_grid"] = D(e.GridSampleBackwardGrid(gradOut, input, grid, mode, padding, align)),
+            ["output"] = D("output", () => e.GridSample(input, grid, mode, padding, align)),
+            ["grad_input"] = D("grad_input", () => e.GridSampleBackwardInput(gradOut, grid, new[] { N, C, H, W }, mode, padding, align)),
+            ["grad_grid"] = D("grad_grid", () => e.GridSampleBackwardGrid(gradOut, input, grid, mode, padding, align)),
         };
     }
 
