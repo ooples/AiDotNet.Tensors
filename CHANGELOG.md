@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.148.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.147.0...v0.148.0) (2026-11-06)
+
+
+### Features
+
+* hip dlpack exchange, metal tuned profile, fp16 gemm vs pytorch, avx-512 and cudnn evidence ([#1679](https://github.com/ooples/AiDotNet.Tensors/issues/1679)) ([4ac59b5](https://github.com/ooples/AiDotNet.Tensors/commit/4ac59b5f3e3a7726e2fc67d5bdc155057cccec25))
+
+
+### Bug Fixes
+
+* **autodiff:** record AffineGrid and mode GridSample in compiled training and on the GPU tape ([#1681](https://github.com/ooples/AiDotNet.Tensors/issues/1681)) ([515d226](https://github.com/ooples/AiDotNet.Tensors/commit/515d22610057e5ae243defeaa5e69e4a51d9b850))
+* avx2-off crash in shared-weight 1x1 conv and fp32 gemm tiers without avx2 ([#1676](https://github.com/ooples/AiDotNet.Tensors/issues/1676)) ([2167d2f](https://github.com/ooples/AiDotNet.Tensors/commit/2167d2fc94f14517d7fe100fae0af92dea48703d))
+* **memory:** stop leaking a gradient set per step and let the restore pool yield under pressure ([#1682](https://github.com/ooples/AiDotNet.Tensors/issues/1682)) ([7e5922b](https://github.com/ooples/AiDotNet.Tensors/commit/7e5922be564757c2ee5ba04f50650947efc38fd4))
+
+
+### Performance
+
+* **gpu:** cache IRFFT gather/sign tables and adjoint weights per backend and shape ([#1677](https://github.com/ooples/AiDotNet.Tensors/issues/1677)) ([1df0543](https://github.com/ooples/AiDotNet.Tensors/commit/1df05437965e9f892619761b212c22ad3bfff3ea))
+
 ## [0.147.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.146.0...v0.147.0) (2026-11-05)
 
 
