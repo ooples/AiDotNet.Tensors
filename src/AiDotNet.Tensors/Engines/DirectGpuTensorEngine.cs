@@ -27961,34 +27961,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorBatchMatMul<T>(Tensor<T> a, Tensor<T> b2)
     {
-        using var __gpuOp = EnterGpuOp();
-        if (typeof(T)==typeof(float) && TryGetBackend(out var b) && a.Rank >= 3 && b2.Rank >= 3)
-        {
-            try
-            {
-                int batchSize = a.Shape._dims[0];
-                int M = a.Shape._dims[a.Rank - 2];
-                int K = a.Shape._dims[a.Rank - 1];
-                int N = b2.Shape._dims[b2.Rank - 1];
-                var ga = UploadTensorRaw(b, a);
-                var gb = UploadTensorRaw(b, b2);
-                var go = b.AllocateBuffer(batchSize * M * N);
-                b.BatchedGemm(ga, gb, go, M, N, K, batchSize);
-                int[] outShape = (int[])a.Shape._dims.Clone();
-                outShape[a.Rank - 1] = N;
-                var output = DeferTensorResult<T>(b, go, batchSize * M * N, outShape);
-                // Record on the tape so the IEngine-typed dispatch path
-                // doesn't silently disconnect this op from autograd. The
-                // recording-path equivalent in CpuEngine.TensorBatchMatMul
-                // also delegates to RecordBinary under the "BatchMatMul"
-                // op name; mirror that here so backward dispatch picks
-                // the same BackwardFunction<T>.BatchMatMulBackward.
-                Autodiff.DifferentiableOps.RecordBinary("BatchMatMul", output, a, b2,
-                    Autodiff.BackwardFunctions<T>.BatchMatMulBackward);
-                return output;
-            }
-            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("SwishInPlace", capabilityGap); }
-        }
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (b2 is null) throw new ArgumentNullException(nameof(b2));
+        if (a.Rank >= 3 && b2.Rank == a.Rank)
+            return BatchMatMul(a, b2);
         return base.TensorBatchMatMul(a, b2);
     }
 

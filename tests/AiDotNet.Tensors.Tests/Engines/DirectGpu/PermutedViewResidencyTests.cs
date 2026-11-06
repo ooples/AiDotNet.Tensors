@@ -372,4 +372,77 @@ public sealed class PermutedViewResidencyTests : IClassFixture<DirectGpuTensorEn
             AiDotNetEngine.Current = previous;
         }
     }
+
+    [SkippableFact]
+    public void TensorFlip_CumSum_And_TensorBatchMatMul_Gradients_StayDeviceResidentForClipGradNorm()
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        var gpu = _fixture.Engine!;
+        var cpu = new CpuEngine();
+        var previous = AiDotNetEngine.Current;
+        try
+        {
+            var rng = new Random(37);
+            var x = new Tensor<float>(new[] { 4, 6, 8 });
+            for (int i = 0; i < x.Length; i++) x[i] = (float)(rng.NextDouble() * 2 - 1);
+            var convW = new Tensor<float>(new[] { 8, 4 });
+            for (int i = 0; i < convW.Length; i++) convW[i] = (float)(rng.NextDouble() * 0.5 - 0.25);
+            var expertW = new Tensor<float>(new[] { 4, 8, 8 });
+            for (int i = 0; i < expertW.Length; i++) expertW[i] = (float)(rng.NextDouble() * 0.5 - 0.25);
+
+            float[] RunCpu()
+            {
+                AiDotNetEngine.Current = cpu;
+                IEngine eng = cpu;
+                using var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>();
+                var flipped = eng.Reshape(eng.TensorFlip(convW, new[] { 1 }), new[] { 8, 1, 4 });
+                var conv = eng.TensorPermute(
+                    eng.TensorSlice(eng.DepthwiseConv1D(eng.TensorPermute(x, new[] { 0, 2, 1 }), flipped, 1, 3), new[] { 0, 0, 0 }, new[] { 4, 8, 6 }),
+                    new[] { 0, 2, 1 });
+                var cum = eng.TensorCumSum(conv, 1);
+                var bmm = eng.TensorBatchMatMul(cum, expertW);
+                var loss = eng.ReduceSum(bmm, new[] { 0, 1, 2 }, false);
+                var grads = tape.ComputeGradients(loss, new[] { x, convW, expertW });
+                return grads[convW].ToArray().Concat(grads[expertW].ToArray()).ToArray();
+            }
+
+            var cpuGrads = RunCpu();
+
+            AiDotNetEngine.Current = gpu;
+            gpu.RegisterPersistentTensor(convW, PersistentTensorRole.Weights);
+            gpu.RegisterPersistentTensor(expertW, PersistentTensorRole.Weights);
+            IEngine gpuEng = gpu;
+            Tensor<float> gx, gConvW, gExpertW;
+            using (var gpuTape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>())
+            {
+                var flipped = gpuEng.Reshape(gpuEng.TensorFlip(convW, new[] { 1 }), new[] { 8, 1, 4 });
+                var conv = gpuEng.TensorPermute(
+                    gpuEng.TensorSlice(gpuEng.DepthwiseConv1D(gpuEng.TensorPermute(x, new[] { 0, 2, 1 }), flipped, 1, 3), new[] { 0, 0, 0 }, new[] { 4, 8, 6 }),
+                    new[] { 0, 2, 1 });
+                var cum = gpuEng.TensorCumSum(conv, 1);
+                var bmm = gpuEng.TensorBatchMatMul(cum, expertW);
+                var loss = gpuEng.ReduceSum(bmm, new[] { 0, 1, 2 }, false);
+                var grads = gpuTape.ComputeGradients(loss, new[] { x, convW, expertW });
+                gx = grads[x];
+                gConvW = grads[convW];
+                gExpertW = grads[expertW];
+            }
+
+            Assert.True(gx.IsGpuResident, "CumSum/Conv input gradient should stay GPU-resident.");
+            Assert.True(gConvW.IsGpuResident, "TensorFlip kernel gradient should stay GPU-resident.");
+            Assert.True(gExpertW.IsGpuResident, "TensorBatchMatMul 3D persistent weight gradient should stay GPU-resident.");
+
+            using var devNorm = AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TryClipGradNorm(new[] { gx, gConvW, gExpertW }, maxNorm: 1000.0);
+            Assert.NotNull(devNorm);
+            Assert.True(devNorm!.IsFinite);
+
+            var gpuGrads = gConvW.ToArray().Concat(gExpertW.ToArray()).ToArray();
+            for (int i = 0; i < cpuGrads.Length; i++)
+                Assert.True(Math.Abs(cpuGrads[i] - gpuGrads[i]) < 1e-3f, $"grad[{i}] cpu {cpuGrads[i]} gpu {gpuGrads[i]}");
+        }
+        finally
+        {
+            AiDotNetEngine.Current = previous;
+        }
+    }
 }
