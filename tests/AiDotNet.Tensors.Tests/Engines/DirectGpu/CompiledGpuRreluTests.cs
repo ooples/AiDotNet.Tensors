@@ -50,12 +50,13 @@ public class CompiledGpuRreluTests
             using (var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>())
             {
                 var y = gpu.TensorRrelu(x, 0.1, 0.4, training, seed: training ? null : 3);
+                // Counted before ReduceSum and the backward launch work of their own.
+                Assert.True(GpuLaunchProbe.Count > 0, "RReLU launched no GPU work.");
                 var grads = tape.ComputeGradients(gpu.ReduceSum(y, null), new[] { x });
                 output = y.ToArray();
                 Assert.True(grads.ContainsKey(x), "The GPU engine's RReLU recorded no gradient for its input.");
                 grad = grads[x].ToArray();
             }
-            Assert.True(GpuLaunchProbe.Count > 0, "RReLU launched no GPU work.");
             // Fallbacks entries read "{count}x {op}: {reason}".
             static bool IsRreluFallback(string entry) => entry.IndexOf("x TensorRrelu:", StringComparison.Ordinal) >= 0;
             Assert.True(IsRreluFallback("1x TensorRrelu: guard or route declined"), "The fallback matcher misses the probe's format.");
