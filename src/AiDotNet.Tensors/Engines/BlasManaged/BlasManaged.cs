@@ -1135,7 +1135,13 @@ public static partial class BlasManaged
             bool denseTransA = typeof(T) == typeof(float) && mr == 6 && transA && !transB
                 && options.ParallelismAxis != ParallelismAxis.N
                 && m >= DenseTransAMinDimension && n >= DenseTransAMinDimension && k >= DenseTransAMinDimension;
-            if (splitMAligned < gateProcs * mr && options.PackingMode == PackingMode.Auto && !denseTransA)
+            // Deep transposed-B products past the work range the Streaming transB routing was measured on
+            // (StrategyDefaultTable.VeryWideTransBStreamingMaxWork): the packed interior wins even when its
+            // mr-blocks leave cores idle. 512x256x49152 transB (an LM head's dLogits . W^T) on a 128-thread
+            // 3990X: all-Streaming 1332 ms, while its 510-row aligned interior alone packs in 301 ms.
+            bool deepTransB = typeof(T) == typeof(float) && transB && !transA
+                && (long)m * n * k > StrategyDefaultTable.VeryWideTransBStreamingMaxWork;
+            if (splitMAligned < gateProcs * mr && options.PackingMode == PackingMode.Auto && !denseTransA && !deepTransB)
             {
                 // Auto + too few aligned mr-blocks for the packed kernel to beat all-Streaming,
                 // and a tail IS present — route the WHOLE shape to Streaming, which handles the

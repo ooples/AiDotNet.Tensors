@@ -47,6 +47,12 @@ internal static class StrategyDefaultTable
     /// Route a shape to a packing strategy via the seed table for the given hardware key.
     /// Falls back to a conservative default for unmapped keys; never throws.
     /// </summary>
+    /// <summary>
+    /// Largest m·n·k for which the very-wide avx2 transposed-B rule routes to Streaming: the top of the
+    /// PR #1034 sweep that rule was measured on (1.07G multiply-adds).
+    /// </summary>
+    internal const long VeryWideTransBStreamingMaxWork = 1L << 30;
+
     internal static PackingMode Route(
         HardwareFingerprint.HwKey key, int m, int n, int k,
         bool transA = false, bool transB = false)
@@ -70,7 +76,13 @@ internal static class StrategyDefaultTable
         //     is not this hardware. Thread-budget sweeps at 128/32/16 all favoured Streaming,
         //     but throttling a 128-core part is not the same machine as a real 16- or 32-core
         //     part (same L3, memory bandwidth and CCX topology), so bands 0-2 are untouched.
-        if (key.Simd == "avx2" && key.CpuBucket >= HardwareFingerprint.VeryWideCpuBucket && transB)
+        //   * measured work range only -- the sweep's largest shape was 1.07G multiply-adds. Past it the
+        //     rule inverts: the LM-head products of a V = 49152 vocabulary (512x256x49152 and
+        //     512x49152x256 transB, 6.4G each) took 1331 / 1507 ms on Streaming vs 266 / 232 ms on
+        //     PackBoth on the same 3990X (paired, alternating order, median of 9), so larger transB
+        //     shapes fall through to the band-2 routing, which sends them to PackBoth.
+        if (key.Simd == "avx2" && key.CpuBucket >= HardwareFingerprint.VeryWideCpuBucket && transB
+            && (long)m * n * k <= VeryWideTransBStreamingMaxWork)
             return PackingMode.ForceStreaming;
 
         // #653: the MediumMWide bucket (m∈[128,256], wide-N, k≥256) is mis-routed to PackAOnly
