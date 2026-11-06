@@ -216,7 +216,8 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
             if (applicable.Count == 1)
                 return Decide(map, shape, reference, TunedKernelDecisionReason.OnlyCandidate, reference, rejected);
 
-            if (TunedKernelProfiles.TryLookup(Op, Device, shape, deterministic, out string? profiled, _poolKey) &&
+            if (!TunedKernelPolicy.IgnoreProfiles &&
+                TunedKernelProfiles.TryLookup(Op, Device, shape, deterministic, out string? profiled, _poolKey) &&
                 profiled is not null)
             {
                 var named = applicable.FirstOrDefault(c => string.Equals(c.Id, profiled, StringComparison.Ordinal));

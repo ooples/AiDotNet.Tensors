@@ -10,15 +10,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// </summary>
 /// <remarks>
 /// DLPack's device types that carry plain device pointers are CUDA (kDLCUDA) and ROCm (kDLROCM); OpenCL, Vulkan,
-/// Metal and WebGPU memory has no pointer a foreign library can address. CUDA implements this today. HIP does not yet
-/// (issue #1621): a GPU-resident tensor on the HIP backend exports a host copy (kDLCPU; writes through the consumer's
-/// copy do not reach the tensor), and a kDLROCM import throws <see cref="NotSupportedException"/>.
+/// Metal and WebGPU memory has no pointer a foreign library can address. The CUDA backend implements it with kDLCUDA
+/// and the HIP backend with kDLROCM; the other backends export a host copy (kDLCPU; writes through the consumer's copy
+/// do not reach the tensor).
 /// </remarks>
-[BackendSpecificRoute("DLPack device-pointer exchange exists only for pointer-addressed device memory (CUDA); every backend exports through a host copy",
+[BackendSpecificRoute("DLPack device-pointer exchange exists only for pointer-addressed device memory (CUDA, HIP); every other backend exports through a host copy",
     nameof(IDirectGpuBackend.DownloadBuffer))]
 internal interface IDLPackDeviceBackend
 {
-    /// <summary>The DLPack <c>DLDeviceType</c> of this backend's memory (kDLCUDA = 2).</summary>
+    /// <summary>The DLPack <c>DLDeviceType</c> of this backend's memory (kDLCUDA = 2, kDLROCM = 10).</summary>
     int DLPackDeviceType { get; }
 
     /// <summary>The device ordinal (<c>DLDevice.device_id</c>).</summary>
@@ -27,8 +27,9 @@ internal interface IDLPackDeviceBackend
     /// <summary>The handle of the stream this backend orders its work on.</summary>
     IntPtr WorkStreamHandle { get; }
 
-    /// <summary>Makes <paramref name="consumerStream"/> wait for every operation queued so far on this backend.</summary>
-    void OrderStreamAfterPendingWork(IntPtr consumerStream);
+    /// <summary>Makes <paramref name="consumerStream"/> wait for every operation queued so far on this backend; nothing
+    /// for <see cref="Interop.DLPackStream.NoSync"/>. Each backend maps the DLPack stream value to its own handle.</summary>
+    void OrderStreamAfterPendingWork(Interop.DLPackStream consumerStream);
 
     /// <summary>Wraps device memory another library owns; disposing the buffer waits for queued work, then runs
     /// <paramref name="release"/> once.</summary>
@@ -44,8 +45,8 @@ internal interface IDLPackDeviceBackend
     /// <summary>
     /// Holds <paramref name="buffer"/>'s device memory for an export: until the result is disposed (by the consumer's
     /// deleter), releasing the buffer neither frees it nor lets another allocation reuse it. Disposing it orders this
-    /// backend's work after the work queued on <paramref name="consumerStream"/> (zero = the consumer synchronizes
-    /// itself), then runs the releases that waited.
+    /// backend's work after the work queued on <paramref name="consumerStream"/> (none for
+    /// <see cref="Interop.DLPackStream.NoSync"/>: the consumer synchronizes itself), then runs the releases that waited.
     /// </summary>
-    IDisposable HoldForExport(IGpuBuffer buffer, IntPtr consumerStream);
+    IDisposable HoldForExport(IGpuBuffer buffer, Interop.DLPackStream consumerStream);
 }

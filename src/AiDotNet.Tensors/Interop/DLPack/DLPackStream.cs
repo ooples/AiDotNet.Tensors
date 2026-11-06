@@ -67,6 +67,12 @@ public readonly struct DLPackStream : IEquatable<DLPackStream>
     /// <summary>True when the producer must not add any stream ordering.</summary>
     public bool IsNoSync => _kind == DLPackStreamKind.NoSync;
 
+    /// <summary>
+    /// True for the per-thread default stream. Its handle names the stream of whichever thread uses it, so a release
+    /// that runs on another thread (the consumer's deleter) cannot wait on the consumer's work through it.
+    /// </summary>
+    internal bool IsPerThreadDefault => _kind == DLPackStreamKind.PerThreadDefault;
+
     /// <summary>The CUDA stream handle the consumer's work is ordered on, or <see cref="IntPtr.Zero"/> for
     /// <see cref="NoSync"/>.</summary>
     internal IntPtr CudaStreamHandle => _kind switch
@@ -75,6 +81,18 @@ public readonly struct DLPackStream : IEquatable<DLPackStream>
         DLPackStreamKind.PerThreadDefault => DLPackNative.CudaPerThreadDefaultStream,
         DLPackStreamKind.Handle => _handle,
         _ => DLPackNative.CudaLegacyDefaultStream,   // Default and LegacyDefault
+    };
+
+    /// <summary>
+    /// The HIP stream handle the consumer's work is ordered on. HIP has no stream at handle 1: its legacy default stream
+    /// is the null stream, and its per-thread default stream is <c>hipStreamPerThread</c> (handle 2). Not meaningful for
+    /// <see cref="NoSync"/>, where the producer adds no ordering at all.
+    /// </summary>
+    internal IntPtr HipStreamHandle => _kind switch
+    {
+        DLPackStreamKind.PerThreadDefault => new IntPtr(2),   // hipStreamPerThread
+        DLPackStreamKind.Handle => _handle,
+        _ => IntPtr.Zero,   // Default and LegacyDefault: the null stream; NoSync never reaches a stream call
     };
 
     /// <inheritdoc/>

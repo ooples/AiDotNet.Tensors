@@ -993,6 +993,7 @@ public sealed class TensorArena : IDisposable
     /// </remarks>
     internal void ResetKeeping(HashSet<object>? keep)
     {
+        ReturnWithheldFromPool();
         _heldOver = keep is { Count: > 0 } ? keep : null;
         Reset();
     }
@@ -1003,12 +1004,20 @@ public sealed class TensorArena : IDisposable
     /// </summary>
     internal void DisposeKeeping(HashSet<object>? keep)
     {
+        ReturnWithheldFromPool();
+        _heldOver = keep is { Count: > 0 } ? keep : null;
+        Dispose();
+    }
+
+    // Only a tape step boundary releases the previous step's gradients. Caller-owned arenas reach this through
+    // ResetKeeping, and tape-owned arenas through DisposeKeeping. An unrelated arena's Dispose must not drain it:
+    // its caller may still be consuming those gradients before the next training step.
+    private static void ReturnWithheldFromPool()
+    {
         var previous = t_withheldFromPool;
         t_withheldFromPool = null;
         if (previous is not null)
             foreach (var (type, size, arr) in previous) ReturnPersistent(type, size, arr);
-        _heldOver = keep is { Count: > 0 } ? keep : null;
-        Dispose();
     }
 
     // Returns an array to the cross-arena pool unless the finished step's caller still holds it.

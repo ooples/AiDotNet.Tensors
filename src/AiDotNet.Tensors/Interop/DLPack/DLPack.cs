@@ -56,6 +56,16 @@ public static class DLPack
     /// <exception cref="NotSupportedException">No CUDA backend is active for that device.</exception>
     public static IntPtr GetCudaConsumerStream(int deviceId = 0) => GetCudaBackend(deviceId).Device.WorkStreamHandle;
 
+    /// <summary>
+    /// The HIP stream AiDotNet.Tensors orders its work on, as the handle a ROCm producer's <c>__dlpack__(stream=...)</c>
+    /// expects: request the capsule with this stream before passing it to <see cref="Tensor{T}.FromDLPack"/>, so the
+    /// producer's pending writes are complete before AiDotNet.Tensors reads the memory.
+    /// </summary>
+    /// <param name="deviceId">The ROCm device ordinal.</param>
+    /// <exception cref="NotSupportedException">No HIP backend is active for that device.</exception>
+    public static IntPtr GetRocmConsumerStream(int deviceId = 0)
+        => GetDeviceBackend(AiDotNetEngine.Current as DirectGpuTensorEngine, DLPackNative.DeviceRocm, deviceId).Device.WorkStreamHandle;
+
     // ── Exports ────────────────────────────────────────────────────────────────────────────────────────────────────
 
     // Every live export, by the address of its native block. The deleter looks itself up here rather than reading the
@@ -274,13 +284,11 @@ public static class DLPack
             {
                 DLPackNative.DeviceCpu or DLPackNative.DeviceCudaHost or DLPackNative.DeviceRocmHost
                     => ImportHost<T>(in dl, minor, readOnly, owner),
-                DLPackNative.DeviceCuda => ImportCuda<T>(in dl, minor, readOnly, owner, managed),
-                DLPackNative.DeviceRocm => throw new NotSupportedException(
-                    "DLPack ROCm device memory (kDLROCM) is not supported yet: the HIP backend has no zero-copy DLPack " +
-                    "exchange (issue #1621). Copy the tensor to the host on the producer side, or use CUDA."),
+                DLPackNative.DeviceCuda or DLPackNative.DeviceRocm => ImportDevice<T>(in dl, minor, readOnly, owner),
                 _ => throw new NotSupportedException(
                     $"DLPack device type {dl.Device.DeviceType} is not supported; AiDotNet.Tensors imports CPU and " +
-                    "pinned host memory (kDLCPU, kDLCUDAHost, kDLROCMHost) and CUDA device memory (kDLCUDA)."),
+                    "pinned host memory (kDLCPU, kDLCUDAHost, kDLROCMHost), CUDA device memory (kDLCUDA) and ROCm " +
+                    "device memory (kDLROCM)."),
             };
         }
         catch
@@ -390,23 +398,26 @@ public static class DLPack
         return Tensor<T>.AliasDLPackMemoryStrided(covering, (int)covered, shape, intStrides, (int)(-minIndex), writable: !readOnly);
     }
 
-    private static Tensor<T> ImportCuda<T>(in DLPackNative.DLTensor dl, uint minor, bool readOnly, DLPackDeleterHandle owner, IntPtr managed)
+    // A device-pointer import (kDLCUDA or kDLROCM): the producer's memory wrapped as a buffer of the GPU backend that
+    // owns that device type.
+    private static Tensor<T> ImportDevice<T>(in DLPackNative.DLTensor dl, uint minor, bool readOnly, DLPackDeleterHandle owner)
     {
+        string api = DeviceApiName(dl.Device.DeviceType);
         if (typeof(T) != typeof(float))
             throw new NotSupportedException(
-                $"CUDA DLPack import supports Tensor<float> only (the CUDA backend stores device data as float32); got Tensor<{typeof(T).Name}>.");
+                $"{api} DLPack import supports Tensor<float> only (the {api} backend stores device data as float32); got Tensor<{typeof(T).Name}>.");
         ReadLayout<T>(in dl, minor, out var shape, out var strides, out long count);
         if (!IsCompactRowMajor(shape, strides))
             throw new NotSupportedException(
-                "CUDA DLPack import needs a compact row-major tensor; call .contiguous() on the producer side first.");
+                $"{api} DLPack import needs a compact row-major tensor; call .contiguous() on the producer side first.");
         if (readOnly)
             throw new NotSupportedException(
-                "CUDA DLPack import of a read-only tensor is not supported: GPU-resident tensors have no read-only mode.");
+                $"{api} DLPack import of a read-only tensor is not supported: GPU-resident tensors have no read-only mode.");
 
         // Leased: the import wraps the memory on the dispatcher's backend, so a concurrent Dispose waits for it.
         var dispatcher = AiDotNetEngine.Current as DirectGpuTensorEngine;
         using var __gpuOp = dispatcher?.EnterGpuOp() ?? default;
-        var (backend, device) = GetCudaBackend(dispatcher, dl.Device.DeviceId);
+        var (backend, device) = GetDeviceBackend(dispatcher, dl.Device.DeviceType, dl.Device.DeviceId);
         if (count == 0)
         {
             owner.Release();
@@ -435,24 +446,29 @@ public static class DLPack
     /// <summary>The GPU backend tensors are placed on, as <see cref="Tensor{T}.Gpu"/> chooses it, when it exchanges
     /// CUDA device memory for <paramref name="deviceId"/>.</summary>
     internal static (IDirectGpuBackend Backend, IDLPackDeviceBackend Device) GetCudaBackend(int deviceId)
-        => GetCudaBackend(AiDotNetEngine.Current as DirectGpuTensorEngine, deviceId);
+        => GetDeviceBackend(AiDotNetEngine.Current as DirectGpuTensorEngine, DLPackNative.DeviceCuda, deviceId);
 
-    // The same, for the dispatcher the caller already read (and leased).
-    private static (IDirectGpuBackend Backend, IDLPackDeviceBackend Device) GetCudaBackend(
-        DirectGpuTensorEngine? dispatcher, int deviceId)
+    // The backend for DLPack device type deviceType (kDLCUDA or kDLROCM) on deviceId, for the dispatcher the caller
+    // already read (and leased).
+    private static (IDirectGpuBackend Backend, IDLPackDeviceBackend Device) GetDeviceBackend(
+        DirectGpuTensorEngine? dispatcher, int deviceType, int deviceId)
     {
+        string api = DeviceApiName(deviceType);
         var backend = dispatcher is not null
             ? dispatcher.PlacementBackend
             : Engine.DirectGpu is { IsAvailable: true } directGpu ? directGpu.Backend : null;
-        if (backend is not IDLPackDeviceBackend { DLPackDeviceType: DLPackNative.DeviceCuda } device)
+        if (backend is not IDLPackDeviceBackend device || device.DLPackDeviceType != deviceType)
             throw new NotSupportedException(
-                "CUDA DLPack exchange needs the CUDA backend as the active GPU backend" +
+                $"{api} DLPack exchange needs the {api} backend as the active GPU backend" +
                 (backend is null ? "; no GPU backend is active." : $"; the active backend is {backend.GetType().Name}."));
         if (device.DeviceOrdinal != deviceId)
             throw new NotSupportedException(
-                $"The DLPack tensor is on CUDA device {deviceId}; the active CUDA backend runs on device {device.DeviceOrdinal}.");
+                $"The DLPack tensor is on {api} device {deviceId}; the active {api} backend runs on device {device.DeviceOrdinal}.");
         return (backend, device);
     }
+
+    // The name a device-pointer DLPack device type goes by in messages.
+    private static string DeviceApiName(int deviceType) => deviceType == DLPackNative.DeviceRocm ? "HIP" : "CUDA";
 
     // ── Element types ──────────────────────────────────────────────────────────────────────────────────────────────
 

@@ -166,6 +166,53 @@ public class GeometryGpuParityTests : IClassFixture<DirectGpuTensorEngineTestFix
             }
     }
 
+    // The GPU results of the mode/padding GridSample and of AffineGrid3D returned without a tape edge, so a tape
+    // around them gave the input, the grid and theta no gradient at all on the GPU.
+    private static float[] TapeGradient(IEngine engine, Tensor<float> source, Func<IEngine, Tensor<float>> forward)
+    {
+        using var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>();
+        var loss = forward(engine);
+        var grads = tape.ComputeGradients(loss, new[] { source });
+        Assert.True(grads.ContainsKey(source), "The tape found no gradient path to the source.");
+        return grads[source].GetFlattenedData();
+    }
+
+    private static void AssertGradientsClose(float[] gpu, float[] cpu, string what)
+    {
+        Assert.Equal(cpu.Length, gpu.Length);
+        Assert.True(cpu.Any(v => v != 0f), $"{what}: the CPU gradient is zero, so the comparison proves nothing.");
+        for (int i = 0; i < cpu.Length; i++)
+            Assert.True(Math.Abs(gpu[i] - cpu[i]) <= Tolerance * (1 + Math.Abs(cpu[i])), $"{what}[{i}]: gpu {gpu[i]} cpu {cpu[i]}");
+    }
+
+    [SkippableFact]
+    public void GridSample2D_WithModes_TapeGradientsOnGpu_MatchCpu()
+    {
+        SkipIfUnavailable();
+        var input = Rand4D(21, 2, 3, 8, 8);
+        var grid = new Tensor<float>(Rand4D(22, 2, 6, 6, 2, 0.8f).GetFlattenedData(), new[] { 2, 6, 6, 2 });
+        var weights = Rand4D(23, 2, 3, 6, 6);
+        Tensor<float> Loss(IEngine e, Tensor<float> x, Tensor<float> g) => e.ReduceSum(
+            e.TensorMultiply(e.GridSample(x, g, GridSampleMode.Bilinear, GridSamplePadding.Zeros, false), weights), null);
+        AssertGradientsClose(TapeGradient(Gpu, input, e => Loss(e, input, grid)), TapeGradient(_cpu, input, e => Loss(e, input, grid)), "dInput");
+        AssertGradientsClose(TapeGradient(Gpu, grid, e => Loss(e, input, grid)), TapeGradient(_cpu, grid, e => Loss(e, input, grid)), "dGrid");
+    }
+
+    [SkippableFact]
+    public void AffineGrid3D_TapeThetaGradientOnGpu_MatchesCpu()
+    {
+        SkipIfUnavailable();
+        var rng = new Random(24);
+        var t = new float[2 * 3 * 4];
+        for (int i = 0; i < t.Length; i++) t[i] = (float)(rng.NextDouble() * 2 - 1);
+        var theta = new Tensor<float>(t, new[] { 2, 3, 4 });
+        var w = new float[2 * 3 * 4 * 5 * 3];
+        for (int i = 0; i < w.Length; i++) w[i] = (float)(rng.NextDouble() * 2 - 1);
+        var weights = new Tensor<float>(w, new[] { 2, 3, 4, 5, 3 });
+        Tensor<float> Loss(IEngine e) => e.ReduceSum(e.TensorMultiply(e.AffineGrid3D(theta, 3, 4, 5, alignCorners: false), weights), null);
+        AssertGradientsClose(TapeGradient(Gpu, theta, Loss), TapeGradient(_cpu, theta, Loss), "dTheta");
+    }
+
     [SkippableFact]
     public void AffineGrid3D_GpuMatchesCpu()
     {

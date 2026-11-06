@@ -43,6 +43,7 @@ internal static class HipTunedProfileExperiment
         }
         TunedKernelPolicy.ModeOverride = TunedKernelMode.Tune;
         TunedKernelPolicy.PersistDecisions = false;
+        TunedKernelPolicy.IgnoreProfiles = true;   // measure the shapes a shipped profile covers, too
         TunedKernelPolicy.BudgetMilliseconds = double.MaxValue;
         Console.WriteLine($"device {backend.TunedDeviceKey}; clock device events; rounds {rounds}");
 

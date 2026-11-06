@@ -13,6 +13,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 /// </summary>
 public sealed class OpenClCommandQueue : IGpuStream
 {
+    private const int MarkerSpinWindowMilliseconds = 1;
+    private const int MarkerPollWindowMilliseconds = 20;
+    private const int MillisecondsPerSecond = 1000;
     private readonly OpenClBackend _backend;
     private IntPtr _handle;
     private readonly IntPtr _context;
@@ -167,8 +170,8 @@ public sealed class OpenClCommandQueue : IGpuStream
             // yield up to 20 ms; only a queue with work still running reaches the end, and its caller waits anyway.
             OpenClNativeBindings.Flush(_handle);
             long started = System.Diagnostics.Stopwatch.GetTimestamp();
-            long spinUntil = started + System.Diagnostics.Stopwatch.Frequency / 1000;
-            long deadline = started + System.Diagnostics.Stopwatch.Frequency / 50;
+            long spinUntil = started + System.Diagnostics.Stopwatch.Frequency * MarkerSpinWindowMilliseconds / MillisecondsPerSecond;
+            long deadline = started + System.Diagnostics.Stopwatch.Frequency * MarkerPollWindowMilliseconds / MillisecondsPerSecond;
             while (true)
             {
                 if (QueryEventComplete(eventHandle)) return true;

@@ -25,8 +25,9 @@ public class DeclaredProgramRouteTests
         var backend = new CudaBackend();
         if (!backend.IsAvailable)
         {
+            string reason = backend.InitializationError ?? "no error was recorded";
             backend.Dispose();
-            throw new InvalidOperationException("CUDA driver was detected, but the CUDA backend failed to initialize.");
+            throw new InvalidOperationException($"CUDA driver was detected, but the CUDA backend failed to initialize: {reason}");
         }
         return backend;
     }

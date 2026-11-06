@@ -37091,6 +37091,23 @@ public partial class CpuEngine : ITensorLevelEngine
         if (theta._shape.Length != 3 || theta._shape[1] != 2 || theta._shape[2] != 3)
             throw new ArgumentException("AffineGrid expects theta shape [batch, 2, 3]");
 
+        // Compiled training records the same theta -> grid edge as a lazy node. Without this branch the op ran
+        // eagerly at trace time, so the plan held the grid as a constant and theta (a spatial transformer's
+        // localization head and everything feeding it) got no gradient from a compiled step.
+        if (GraphMode.IsActive && GraphMode.Current is { } scope && scope.BindEngine(this))
+        {
+            var capturedTheta = theta;
+            return scope.RecordUnary(LazyNodeType.Custom, "AffineGrid", theta,
+                new[] { theta._shape[0], outputHeight, outputWidth, 2 },
+                (eng, output) =>
+                {
+                    var replayed = eng.AffineGrid(capturedTheta, outputHeight, outputWidth);
+                    DirectGpuTensorEngine.CopyResultInto(eng, replayed, output);
+                },
+                AiDotNet.Tensors.Engines.Autodiff.BackwardFunctions<T>.AffineGridBackward,
+                new object[] { outputHeight, outputWidth });
+        }
+
         var grid = AffineGridImpl(theta, outputHeight, outputWidth);
 
         // Record theta -> grid for reverse-mode autodiff. AffineGrid is LINEAR in theta, so a

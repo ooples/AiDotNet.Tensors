@@ -398,6 +398,13 @@ public static class TunedKernelPolicy
     public static bool PersistDecisions { get; set; } =
         Environment.GetEnvironmentVariable(PersistEnvironmentVariable) != "0";
 
+    /// <summary>
+    /// When true, slots skip every profile (runtime, shipped and persisted) and decide by measuring or by the mode's
+    /// default. A profile experiment sets it: regenerating a device's profile must measure the shapes the shipped
+    /// profile already covers, not read them back.
+    /// </summary>
+    internal static bool IgnoreProfiles { get; set; }
+
     /// <summary>The per-process online tuning budget in milliseconds.</summary>
     public static double BudgetMilliseconds { get; set; } =
         ParseBudget(Environment.GetEnvironmentVariable(BudgetEnvironmentVariable));

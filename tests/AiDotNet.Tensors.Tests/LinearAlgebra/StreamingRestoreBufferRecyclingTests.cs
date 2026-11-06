@@ -67,6 +67,47 @@ public class StreamingRestoreBufferRecyclingTests
         try { if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true); } catch (IOException) { }
     }
 
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static WeakReference PoolAndDrop(int length)
+    {
+        var array = StreamingRestoreBuffers<float>.Rent(length, out _);
+        StreamingRestoreBuffers<float>.Park(array);
+        return new WeakReference(array);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void CollectedPoolEntries_DoNotRejectASmallerReturn(bool activeTape)
+    {
+        const int largerLength = 32, smallerLength = 16;
+        string dir = Configure(largerLength * sizeof(float));
+        try
+        {
+            AssertNoTapeIsOpen();
+            StreamingRestoreBuffers<float>.Clear();
+            var weak = PoolAndDrop(largerLength);
+            for (int i = 0; i < 5 && weak.IsAlive; i++)
+            {
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+            }
+            Assert.False(weak.IsAlive);
+            Assert.Equal(largerLength * sizeof(float), StreamingRestoreBuffers<float>.PooledBytes);
+
+            var smaller = StreamingRestoreBuffers<float>.Rent(smallerLength, out _);
+            using (activeTape ? new GradientTape<float>() : null)
+            {
+                StreamingRestoreBuffers<float>.Park(smaller);
+                Assert.Equal(smallerLength * sizeof(float), activeTape
+                    ? StreamingRestoreBuffers<float>.ParkedBytes : StreamingRestoreBuffers<float>.PooledBytes);
+            }
+            Assert.Same(smaller, StreamingRestoreBuffers<float>.Rent(smallerLength, out bool recycled));
+            Assert.True(recycled);
+        }
+        finally { Cleanup(dir); }
+    }
+
     /// <summary>
     /// Several training-like steps, each inside a tape: materialize every weight, update it, let the owner budget
     /// shed the cold ones. From the second step on, restores are served from recycled arrays, and every weight still
@@ -394,6 +435,47 @@ public class StreamingRestoreBufferRecyclingTests
         finally
         {
             try { if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true); } catch (IOException) { }
+        }
+    }
+
+    // Rents, parks and drops one array in a frame of its own, so no local keeps it alive.
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static void PoolOneArray(int length)
+    {
+        var array = StreamingRestoreBuffers<float>.Rent(length, out _);
+        StreamingRestoreBuffers<float>.Park(array);
+    }
+
+    /// <summary>
+    /// The pool must never be why a near-limit heap fails to allocate (AiDotNet#2322): a full collection reclaims
+    /// idle pooled arrays, and without one they are still reused.
+    /// </summary>
+    [Fact]
+    public void PooledArrays_AreReusedUntilAFullCollection_WhichReclaimsThem()
+    {
+        const int length = 256 * 1024; // 1 MB of fp32: a large-object-heap array, freed only by a full collection
+        string dir = Configure(restorePoolBytes: 4L * length * sizeof(float));
+        try
+        {
+            AssertNoTapeIsOpen();
+            StreamingRestoreBuffers<float>.Clear();
+
+            PoolOneArray(length);
+            Assert.True(StreamingRestoreBuffers<float>.PooledBytes > 0, "An array parked with no tape open was not pooled.");
+            StreamingRestoreBuffers<float>.Rent(length, out bool recycled);
+            Assert.True(recycled, "A pooled array was not reused before any full collection.");
+
+            PoolOneArray(length);
+            GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+            GC.WaitForPendingFinalizers();
+            GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+            StreamingRestoreBuffers<float>.Rent(length, out bool afterCollection);
+            Assert.False(afterCollection, "A full collection left the idle pooled array alive: the pool held it strongly.");
+            Assert.Equal(0, StreamingRestoreBuffers<float>.PooledBytes);
+        }
+        finally
+        {
+            Cleanup(dir);
         }
     }
 }

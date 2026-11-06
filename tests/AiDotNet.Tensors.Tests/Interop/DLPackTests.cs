@@ -4,7 +4,9 @@ using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
+using AiDotNet.Tensors.Engines.DirectGpu.HIP;
 using AiDotNet.Tensors.Interop;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
@@ -437,7 +439,7 @@ public sealed class DLPackTests
 
     [Theory]
     [InlineData(4)]    // kDLOpenCL
-    [InlineData(10)]   // kDLROCM: no HIP device exchange yet (#1621)
+    [InlineData(8)]    // kDLMetal: no pointer a foreign library can address
     public void Import_OfAnUnsupportedDevice_CallsTheDeleter_AndThrows(int deviceType)
     {
         using var producer = new FakeProducer(new float[] { 1 }, new long[] { 1 }, new long[] { 1 }, deviceType: deviceType);
@@ -483,6 +485,37 @@ public sealed class DLPackTests
             Assert.Equal(1, otherDevice.Calls);
         }
         Assert.Throws<NotSupportedException>(() => DLPack.GetCudaConsumerStream(7));
+    }
+
+    /// <summary>
+    /// The kDLROCM counterpart: a capsule the HIP import cannot take is refused before any device memory is touched,
+    /// on every machine, and each refusal still runs the producer's deleter.
+    /// </summary>
+    [Fact]
+    public void RocmImport_RefusesWhatItCannotTake_AndCallsTheDeleter()
+    {
+        const int kDLROCM = 10;
+        using (var asDouble = new FakeProducer(new float[] { 1, 2 }, new long[] { 1 }, new long[] { 1 }, code: 2, bits: 64, deviceType: kDLROCM))
+        {
+            Assert.Throws<NotSupportedException>(() => Tensor<double>.FromDLPack(asDouble.Block));
+            Assert.Equal(1, asDouble.Calls);
+        }
+        using (var strided = new FakeProducer(new float[4], new long[] { 2, 2 }, new long[] { 1, 2 }, deviceType: kDLROCM))
+        {
+            Assert.Throws<NotSupportedException>(() => Tensor<float>.FromDLPack(strided.Block));
+            Assert.Equal(1, strided.Calls);
+        }
+        using (var readOnly = new FakeProducer(new float[2], new long[] { 2 }, new long[] { 1 }, flags: 1, deviceType: kDLROCM))
+        {
+            Assert.Throws<NotSupportedException>(() => Tensor<float>.FromDLPack(readOnly.Block));
+            Assert.Equal(1, readOnly.Calls);
+        }
+        using (var otherDevice = new FakeProducer(new float[2], new long[] { 2 }, new long[] { 1 }, deviceType: kDLROCM, deviceId: 7))
+        {
+            Assert.Throws<NotSupportedException>(() => Tensor<float>.FromDLPack(otherDevice.Block));
+            Assert.Equal(1, otherDevice.Calls);
+        }
+        Assert.Throws<NotSupportedException>(() => DLPack.GetRocmConsumerStream(7));
     }
 
     [Fact]
@@ -657,6 +690,205 @@ public sealed class DLPackTests
             gpu.Dispose();
         }
     }
+    // ── HIP / ROCm ──────────────────────────────────────────────────────────────────────────────────────────────
+
+    /// <summary>A tensor engine placed on a HIP backend, made the current engine until disposed.</summary>
+    private sealed class HipEngine : IDisposable
+    {
+        private readonly IEngine _previous;
+        private readonly DirectGpuEngine _directGpu;
+
+        private HipEngine(HipBackend backend)
+        {
+            Backend = backend;
+            _directGpu = new DirectGpuEngine(backend);
+            Engine = new DirectGpuTensorEngine(_directGpu);
+            _previous = AiDotNetEngine.Current;
+            AiDotNetEngine.Current = Engine;
+        }
+
+        internal HipBackend Backend { get; }
+        internal DirectGpuTensorEngine Engine { get; }
+
+        /// <summary>
+        /// The engine; skips the test when this machine has no HIP device, and fails it when a device was found but the
+        /// backend failed to initialize (stream creation, kernel compilation): that is a defect, not missing hardware.
+        /// </summary>
+        internal static HipEngine CreateOrSkip()
+        {
+            var backend = new HipBackend();
+            if (backend.IsAvailable) return new HipEngine(backend);
+            var state = backend.InitializationState;
+            var failure = backend.InitializationException;
+            backend.Dispose();
+            if (state == GpuBackendInitializationState.Failed)
+                throw new InvalidOperationException("A HIP device was found, but the HIP backend failed to initialize.", failure);
+            throw new SkipException("No HIP device is available.");
+        }
+
+        public void Dispose()
+        {
+            AiDotNetEngine.Current = _previous;
+            Engine.Dispose();
+            _directGpu.Dispose();
+        }
+    }
+
+    private static AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer DeviceBuffer(Tensor<float> tensor)
+    {
+        var buffer = tensor.TryGetGpuBuffer();
+        Assert.NotNull(buffer);
+        return buffer;
+    }
+
+    [SkippableFact]
+    public void Hip_RoundTrip_ExportsTheDevicePointer_AndReadsBackTheSameValues()
+    {
+        using var hip = HipEngine.CreateOrSkip();
+        int liveBefore = DLPack.LiveExportCount;
+
+        var source = Iota(8, 16).Gpu();
+        Assert.True(source.IsGpuResident);
+        IntPtr capsule = source.ToDLPack();
+        var header = ReadVersioned(capsule);
+        Assert.Equal(10, header.Tensor.DeviceType);   // kDLROCM: the device pointer, not a host copy
+        Assert.Equal(DeviceBuffer(source).Handle, header.Tensor.Data);
+
+        var imported = Tensor<float>.FromDLPack(capsule);
+        Assert.True(imported.IsGpuResident);
+        Assert.Equal(Iota(8, 16).ToArray(), imported.ToArray());
+
+        imported.Dispose();
+        Assert.Equal(liveBefore, DLPack.LiveExportCount);
+        source.Dispose();
+    }
+
+    [SkippableFact]
+    public void Hip_ContextBinding_DetectsAForeignDeviceChange()
+    {
+        using var hip = HipEngine.CreateOrSkip();
+        int count = 0;
+        HipNativeBindings.CheckError(HipNativeBindings.hipGetDeviceCount(ref count), "hipGetDeviceCount(test)");
+        Skip.If(count < 2, "Two HIP devices are required to test a foreign device switch.");
+        var context = (IThreadContextBackend)hip.Backend;
+        context.EnsureContextCurrent();
+        try
+        {
+            // Another backend's constructor or a foreign producer can change this thread's device directly.
+            HipNativeBindings.CheckError(HipNativeBindings.hipSetDevice(1), "hipSetDevice(test)");
+            context.EnsureContextCurrent();
+            int current = -1;
+            HipNativeBindings.CheckError(HipNativeBindings.hipGetDevice(ref current), "hipGetDevice(test)");
+            Assert.Equal(0, current);
+        }
+        finally { HipNativeBindings.CheckError(HipNativeBindings.hipSetDevice(0), "hipSetDevice(test cleanup)"); }
+    }
+
+    [SkippableFact]
+    public void Hip_ImportThatIsNeverDisposed_IsReleasedByTheNextAllocation()
+    {
+        using var hip = HipEngine.CreateOrSkip();
+        var source = Iota(8, 16).Gpu();
+        int liveBefore = DLPack.LiveExportCount;
+        IntPtr capsule = source.ToDLPack();
+        Assert.Equal(liveBefore + 1, DLPack.LiveExportCount);
+
+        ImportUseAndDrop(capsule);
+        for (int i = 0; i < 5; i++)
+        {
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+        }
+        // The finalizer only queues the release (it never calls the driver); the next HIP allocation waits for the
+        // queued work and then runs the deleter, which is our own export's.
+        using var next = Iota(4).Gpu();
+        using var sum = hip.Engine.TensorAdd(next, next);
+        Assert.Equal(new float[] { 0, 2, 4, 6 }, sum.ToArray());
+        Assert.Equal(liveBefore, DLPack.LiveExportCount);
+        Assert.Equal(Iota(8, 16).ToArray(), source.ToArray());   // the producer's tensor is untouched
+        source.Dispose();
+    }
+
+    [SkippableFact]
+    public void Hip_ExportedBuffer_SurvivesTheTensorReleasingIt_UntilTheDeleter()
+    {
+        // The capsule holds only the device address. Releasing the producer tensor's buffer must not free it or hand
+        // it to the next allocation while the consumer can still read it.
+        using var hip = HipEngine.CreateOrSkip();
+        var gpu = hip.Engine;
+        var expected = Iota(64, 64).ToArray();
+        var source = Iota(64, 64).Gpu();
+        IntPtr address = DeviceBuffer(source).Handle;
+        IntPtr capsule = source.ToDLPack(DLPackStream.LegacyDefault);
+
+        gpu.ReleaseDeadDeviceStorage(source);
+        Assert.Null(source.DataVector._deviceState?.Buffer);
+        // Same-size allocations: without the hold the pool hands the released memory straight back.
+        var fillers = Enumerable.Range(0, 8).Select(i => gpu.TensorAdd(Iota(64, 64).Gpu(), Iota(64, 64).Gpu())).ToList();
+        Assert.DoesNotContain(fillers, f => DeviceBuffer(f).Handle == address);
+
+        var imported = Tensor<float>.FromDLPack(capsule);
+        Assert.Equal(expected, imported.ToArray());
+        imported.Dispose();   // the deleter: the hold ends and the parked release runs
+        foreach (var f in fillers) f.Dispose();
+        source.Dispose();
+    }
+
+    [SkippableFact]
+    public async System.Threading.Tasks.Task Hip_ImportedTensor_RunsThroughAGeneratedKernel()
+    {
+        // An import wraps the producer's pointer in a non-owning HipGpuBuffer: every device path, the generated-kernel
+        // one included, must take it.
+        using var hip = HipEngine.CreateOrSkip();
+        var backend = hip.Backend;
+        // Centered on zero so the ReLU kernel has both halves to get right.
+        var values = Iota(4, 8).ToArray().Select(v => v - 16f).ToArray();
+        using var source = new Tensor<float>(values, new[] { 4, 8 }).Gpu();
+        using var imported = Tensor<float>.FromDLPack(source.ToDLPack());
+
+        var graph = AiDotNet.Tensors.Engines.Compilation.Codegen.Ir.CodegenLowering.LowerUnaryPointwise<float>(
+            AiDotNet.Tensors.Engines.Compilation.Codegen.Ir.CodegenOpKind.ReLU, new[] { values.Length });
+        using var output = backend.AllocateBuffer(values.Length);
+        var result = await AiDotNet.Tensors.Engines.Compilation.Codegen.NativeGpuCodegenExecutorExtensions.EmitAndExecuteCodegenKernelAsync(
+            backend, graph, AiDotNet.Tensors.Engines.Compilation.Codegen.Ir.CodegenElementType.Float32,
+            new[] { DeviceBuffer(imported) }, new[] { output }, values.Length);
+        // A float32 unary pointwise graph is within what the HIP generator emits: a decline is a regression.
+        Assert.False(result.Declined, "The HIP code generator declined the graph: " + result.DeclineReason);
+        Assert.Equal(values.Select(v => Math.Max(v, 0f)).ToArray(), backend.DownloadBuffer(output));
+    }
+
+    [SkippableFact]
+    public void Hip_ImportedTensor_RunsThroughTheEngine_ElementwiseAndMatMul_WithoutCpuFallback()
+    {
+        using var hip = HipEngine.CreateOrSkip();
+        var gpu = hip.Engine;
+        var values = Iota(4, 8).ToArray().Select(v => v - 16f).ToArray();
+        using var source = new Tensor<float>(values, new[] { 4, 8 }).Gpu();
+        using var imported = Tensor<float>.FromDLPack(source.ToDLPack());
+
+        // Numbers alone would pass on the CPU fallback too: a fallback must fail the test, not hide behind it.
+        bool previous = DirectGpuTensorEngine.ThrowOnGpuKernelFallback;
+        DirectGpuTensorEngine.ThrowOnGpuKernelFallback = true;
+        try
+        {
+            using var sum = gpu.TensorAdd(imported, imported);
+            Assert.Equal(values.Select(v => 2 * v).ToArray(), sum.ToArray());
+            using var weights = new Tensor<float>(Enumerable.Repeat(1f, 8 * 2).ToArray(), new[] { 8, 2 });
+            using var product = gpu.TensorMatMul(imported, weights);
+            float[] productHost = product.ToArray();
+            for (int r = 0; r < 4; r++)
+            {
+                float rowSum = values.Skip(8 * r).Take(8).Sum();
+                Assert.Equal(rowSum, productHost[2 * r], 3);
+                Assert.Equal(rowSum, productHost[2 * r + 1], 3);
+            }
+        }
+        finally
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = previous;
+        }
+    }
+
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static void ImportUseAndDrop(IntPtr capsule)
     {

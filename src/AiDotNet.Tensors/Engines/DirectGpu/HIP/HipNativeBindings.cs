@@ -747,6 +747,24 @@ internal static class HipNativeBindings
     #endregion
 
     /// <summary>
+    /// The HIP device bound to the calling thread.
+    /// </summary>
+    /// <param name="operation">What the query is for, used in the error message.</param>
+    internal static int GetCurrentDevice(string operation)
+    {
+        int device = -1;
+        CheckError(hipGetDevice(ref device), operation);
+        return device;
+    }
+
+    /// <summary>
+    /// Binds <paramref name="device"/> to the calling thread.
+    /// </summary>
+    /// <param name="device">The HIP device index.</param>
+    /// <param name="operation">What the binding is for, used in the error message.</param>
+    internal static void SetCurrentDevice(int device, string operation) => CheckError(hipSetDevice(device), operation);
+
+    /// <summary>
     /// Checks a HIP result and throws if it indicates an error.
     /// </summary>
     public static void CheckError(HipError error, string operation = "HIP operation")
