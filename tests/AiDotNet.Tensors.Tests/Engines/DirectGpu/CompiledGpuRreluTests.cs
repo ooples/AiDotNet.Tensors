@@ -1,6 +1,8 @@
 using System;
+using System.Linq;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
+using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -29,7 +31,8 @@ public class CompiledGpuRreluTests
 
     /// <summary>
     /// The eager tape on a GPU engine: the device kernel records its own backward, which rebuilds the drawn slopes
-    /// from the forward's seed. In evaluation every negative slope is the midpoint (0.25 here).
+    /// from the forward's seed. In evaluation every negative slope is the midpoint (0.25 here). The op must run on the
+    /// device: a CPU fallback would pass the slope checks without exercising the device kernel or its backward.
     /// </summary>
     [SkippableTheory]
     [InlineData(true)]
@@ -43,6 +46,7 @@ public class CompiledGpuRreluTests
         {
             var x = new Tensor<float>(new[] { -1f, -2f, -0.5f, -3f, 1f, -1.5f, -0.25f, 2f }, new[] { 8 });
             float[] output, grad;
+            GpuLaunchProbe.Reset();
             using (var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>())
             {
                 var y = gpu.TensorRrelu(x, 0.1, 0.4, training, seed: training ? null : 3);
@@ -51,6 +55,8 @@ public class CompiledGpuRreluTests
                 Assert.True(grads.ContainsKey(x), "The GPU engine's RReLU recorded no gradient for its input.");
                 grad = grads[x].ToArray();
             }
+            Assert.True(GpuLaunchProbe.Count > 0, "RReLU launched no GPU work.");
+            Assert.DoesNotContain(GpuLaunchProbe.Fallbacks, f => f.StartsWith("TensorRrelu", StringComparison.Ordinal));
 
             for (int i = 0; i < x.Length; i++)
             {
@@ -87,6 +93,7 @@ public class CompiledGpuRreluTests
             using (plan)
             {
                 var firstSlopes = new float[x.Length];
+                bool anySlopeChanged = false;
                 for (int step = 0; step < 2; step++)
                 {
                     plan.Step();
@@ -100,10 +107,47 @@ public class CompiledGpuRreluTests
                         Assert.True(Math.Abs(grad[i] - slope) <= 1e-5f,
                             $"step {step}, element {i}: the forward applied slope {slope:R}, the backward {grad[i]:R}");
                         if (step == 0) firstSlopes[i] = slope;
-                        else if (x[i] < 0) Assert.NotEqual(firstSlopes[i], slope);
+                        else if (x[i] < 0 && firstSlopes[i] != slope) anySlopeChanged = true;
                     }
                 }
+                // Each step draws a new seed. One slope can repeat by chance; all six negative ones cannot.
+                Assert.True(anySlopeChanged, "Every slope of the second step repeated the first step's: the seed was not redrawn.");
             }
+        }
+        finally
+        {
+            AiDotNetEngine.Current = prior;
+        }
+    }
+
+    /// <summary>
+    /// A captured CUDA graph replays kernels with their capture-time arguments and does not re-run host code, so an
+    /// unseeded RReLU's per-step seed would freeze. Its plan must never be graph-captured; the same plan with a seed has
+    /// no per-step host state and keeps its eligibility (the control, so the check is not vacuous).
+    /// </summary>
+    [SkippableFact]
+    public void UnseededTrainingRrelu_KeepsThePlanOutOfCudaGraphCapture()
+    {
+        var gpu = Gpu();
+        var prior = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = gpu;
+        try
+        {
+            bool Eligible(int? seed)
+            {
+                var x = new Tensor<float>(new[] { -1f, -2f, -0.5f, -3f, 1f, -1.5f, -0.25f, 2f }, new[] { 8 });
+                ICompiledTrainingPlan<float> plan;
+                using (var scope = GraphMode.EnableTraining(new[] { x }))
+                {
+                    gpu.ReduceSum(gpu.TensorRrelu(x, 0.1, 0.4, training: true, seed: seed), null);
+                    plan = scope.CompileTraining(new[] { x });
+                }
+                using (plan)
+                    return Assert.IsType<CompiledTrainingPlan<float>>(plan).IsGraphStepEligible;
+            }
+
+            Assert.True(Eligible(7), "Control: the seeded RReLU plan is not graph-step eligible, so the check below proves nothing.");
+            Assert.False(Eligible(null), "The unseeded RReLU plan is graph-step eligible: a captured graph would freeze its seed.");
         }
         finally
         {

@@ -60,7 +60,8 @@ public partial class CpuEngine
             if (TryRecordCompiledOp("TensorRrelu", new Tensor<T>?[] { tensor },
                     e => { stepSeed = seeds.Next(); return e.TensorRrelu(tensor, lower, upper, training: true, stepSeed); },
                     out var unseededNode,
-                    backwardForward: e => e.TensorRrelu(tensor, lower, upper, training: true, stepSeed)))
+                    backwardForward: e => e.TensorRrelu(tensor, lower, upper, training: true, stepSeed),
+                    replaysHostState: true))
                 return unseededNode;
         }
         else if (seed is not null

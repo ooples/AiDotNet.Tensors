@@ -112,6 +112,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // Set at build time = true only for all-generic (engine-dispatched) plans; any
     // installed host-only specialization (incl. frozen-weight rebuild) clears it.
     private bool _graphStepEligible;
+    /// <summary>Whether the plan's step may be captured as a CUDA graph (see <see cref="_graphStepEligible"/>).</summary>
+    internal bool IsGraphStepEligible => _graphStepEligible;
     private const int GraphWarmupSteps = 3;   // eager first so cuBLAS workspace / lazy buffers stabilize
     private readonly Tensor<T>[] _parameters;
     // Present only when the caller registered tied weights more than once.
@@ -8976,7 +8978,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     typed.Output,
                     typed.GetInputsArray(),
                     typed.BackwardFn,
-                    typed.SavedState));
+                    typed.SavedState) { ReplaysHostState = typed.ReplaysHostState });
                 // CRITICAL (issue #350 root cause): clear LazySource on every
                 // forward-step output BEFORE the plan starts executing. Each
                 // call to plan.Step() runs the lazy execute via the
@@ -9635,7 +9637,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // Computed BEFORE pruning (pruning only removes actions, so an all-generic set
         // stays all-generic, and a mixed set is already flagged impure here).
         bool graphBackwardPure = genericBackwardCount == backwardActions.Count;
-        bool graphStepEligible = graphForwardPure && graphBackwardPure;
+        // A step whose replay updates host state every step (an unseeded random op's seed) would replay its capture-time
+        // state from a CUDA graph.
+        bool replaysHostState = forwardSteps.Exists(s => s.ReplaysHostState);
+        bool graphStepEligible = graphForwardPure && graphBackwardPure && !replaysHostState;
 
         // DIAGNOSTIC (AIDOTNET_CUDA_GRAPH_STEP=1 + ineligible): record WHY the plan can't be CUDA-graph
         // captured — the specialized/fused (host-only) actions listed here are exactly the port-to-GPU-pure
@@ -9650,7 +9655,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     if (!n.StartsWith("generic:", StringComparison.Ordinal)) specBwd.Add(n);
                 string msg = $"[GRAPHSTEP-DIAG] INELIGIBLE fwdPure={graphForwardPure}({genericForwardCount}/{allForwardActions.Count}) "
                     + $"bwdPure={graphBackwardPure}({genericBackwardCount}/{backwardActions.Count}); "
-                    + $"nonGenericFwd={allForwardActions.Count - genericForwardCount}; "
+                    + $"nonGenericFwd={allForwardActions.Count - genericForwardCount}; replaysHostState={replaysHostState}; "
                     + $"nonGenericBwd=[{string.Join(", ", specBwd)}]" + System.Environment.NewLine;
                 System.IO.File.AppendAllText(
                     System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphstep_diag.txt"), msg);

@@ -104,7 +104,7 @@ public partial class DirectGpuTensorEngine
         {
             BindTapeIfRecording<T>();
             Autodiff.DifferentiableOps.RecordUnary("TensorRrelu", result, tensor, RreluDeviceBackward<T>,
-                new object[] { this, lower, upper, training, deviceSeed });
+                new object[] { new WeakReference<DirectGpuTensorEngine>(this), lower, upper, training, deviceSeed });
         }
 
         return result;
@@ -134,11 +134,17 @@ public partial class DirectGpuTensorEngine
 
     // dy/dx is 1 for x > 0 and the element's slope otherwise. The kernel draws an element's slope from (seed, index)
     // whatever its value, so running it on -1 everywhere with the forward's seed returns -slope at every position:
-    // the slopes the forward applied, rebuilt on the device without saving them.
+    // the slopes the forward applied, rebuilt on the device without saving them. The slopes come from the device's
+    // generator, so the backward needs a GPU engine: the tape's own when it is one (the forward binds it), otherwise the
+    // forward's, held weakly so a long-lived tape does not keep an engine alive.
     private static void RreluDeviceBackward<T>(Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var gpu = (DirectGpuTensorEngine)savedState[0];
+        DirectGpuTensorEngine? forwardEngine = null;
+        var gpu = engine as DirectGpuTensorEngine
+            ?? (((WeakReference<DirectGpuTensorEngine>)savedState[0]).TryGetTarget(out forwardEngine) ? forwardEngine : null)
+            ?? throw new InvalidOperationException(
+                "TensorRrelu's device backward has no GPU engine: the engine that ran its forward was released.");
         double lower = (double)savedState[1], upper = (double)savedState[2];
         bool training = (bool)savedState[3];
         ulong deviceSeed = (ulong)savedState[4];

@@ -39,8 +39,13 @@ public partial class CpuEngine
     /// The forward the backward re-runs under a tape, when it must differ from <paramref name="forward"/>: a random op
     /// whose forward draws a fresh seed each step re-runs, for its backward, with the seed that step drew.
     /// </param>
+    /// <param name="replaysHostState">
+    /// True when <paramref name="forward"/> updates host state every replay (such a seed). The plan then never captures
+    /// its step as a CUDA graph, whose replays would keep the capture-time state.
+    /// </param>
     internal bool TryRecordCompiledOp<T>(string opName, Tensor<T>?[] inputs, Func<IEngine, Tensor<T>> forward,
-        [NotNullWhen(true)] out Tensor<T>? result, Func<IEngine, Tensor<T>>? backwardForward = null)
+        [NotNullWhen(true)] out Tensor<T>? result, Func<IEngine, Tensor<T>>? backwardForward = null,
+        bool replaysHostState = false)
     {
         result = null;
         if (BeginCompiledRecord(inputs, out var operands) is not { } scope) return false;
@@ -62,6 +67,7 @@ public partial class CpuEngine
         result = scope.RecordMaterializedVariadic(LazyNodeType.Custom, opName, operands.ToArray(), traced,
             (eng, output) => DirectGpuTensorEngine.CopyResultInto(eng, CheckReplayShape(opName, forward(eng), output), output),
             BackwardFunctions<T>.ReplayUnderTape(backwardForward ?? forward));
+        if (replaysHostState && result.LazySource is LazyNode<T> node) node.ReplaysHostState = true;
         return true;
     }
 
