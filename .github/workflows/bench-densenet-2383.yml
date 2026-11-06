@@ -102,21 +102,26 @@ jobs:
         path: aidn
         persist-credentials: false
 
-    - name: Pin AiDotNet.Tensors 0.148.0
+    # This branch's Tensors source carries the env-tunable pool cap and the allocation counters. Packed as a local
+    # package rather than referenced as a project: AiDotNet's state analyzer (ADN0062) rejects a project reference.
+    - name: Pack this branch's Tensors as 0.148.99
       run: |
+        $feed = Join-Path $env:RUNNER_TEMP 'tensors-feed'
+        dotnet pack src/AiDotNet.Tensors/AiDotNet.Tensors.csproj -c Release -o $feed -p:Version=0.148.99 -v q -nologo
+        if ($LASTEXITCODE -ne 0) { exit 1 }
+        dotnet nuget add source $feed --name tensors-feed --configfile aidn/NuGet.Config 2>$null
+        if ($LASTEXITCODE -ne 0) { dotnet nuget add source $feed --name tensors-feed }
         $props = 'aidn/Directory.Packages.props'
         $text = Get-Content $props -Raw
-        foreach ($id in 'AiDotNet.Tensors', 'AiDotNet.Native.OneDNN', 'AiDotNet.Native.CLBlast') {
+        $text = $text -replace '(<PackageVersion Include="AiDotNet\.Tensors" Version=")[^"]+(")', '${1}0.148.99${2}'
+        foreach ($id in 'AiDotNet.Native.OneDNN', 'AiDotNet.Native.CLBlast') {
           $text = $text -replace "(<PackageVersion Include=`"$([regex]::Escape($id))`" Version=`")[^`"]+(`")", '${1}0.148.0${2}'
         }
         Set-Content $props $text -NoNewline
         Select-String -Path $props -Pattern 'AiDotNet\.(Tensors|Native)' | ForEach-Object { $_.Line.Trim() }
 
     - name: Build the parity harness
-      # Against this branch's Tensors source: it carries the env-tunable pool cap and the allocation counters.
-      run: >-
-        dotnet build -c Release aidn/benchmarks/AiDotNet.PyTorchParity -v q -nologo
-        -p:UseLocalTensors=true -p:LocalTensorsRoot=$env:GITHUB_WORKSPACE -p:GeneratePackageOnBuild=false
+      run: dotnet build -c Release aidn/benchmarks/AiDotNet.PyTorchParity -v q -nologo
 
     - name: DenseNet-121, three launches
       env:
