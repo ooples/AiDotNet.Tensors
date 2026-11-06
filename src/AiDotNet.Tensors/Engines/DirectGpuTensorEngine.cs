@@ -23772,6 +23772,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> TensorMin<T>(Tensor<T> a, Tensor<T> b)
     {
         using var __gpuOp = EnterGpuOp();
+        // Same device route as TensorMax: under a tape the saved copy of a is made on the device, where a.Clone()
+        // would be a host copy that the backward uploads again.
+        if (TryBinaryResidentOutOfPlace(a, b, static (be, ia, ib, o, n) => be.Min(ia, ib, o, n)) is { } resident)
+        {
+            if (Autodiff.DifferentiableOps.IsRecording<T>())
+            {
+                Tensor<T> savedA;
+                using (var noGrad = new Autodiff.NoGradScope<T>())
+                    savedA = TensorAddScalar(a, Helpers.MathHelper.GetNumericOperations<T>().Zero);
+                Autodiff.DifferentiableOps.RecordBinary("TensorMin", resident, a, b,
+                    Autodiff.BackwardFunctions<T>.MinBackward, new object[] { savedA });
+            }
+            return resident;
+        }
         if (!IsTapeActive<T>() && typeof(T) == typeof(float)
             && ShapesMatch(a.Shape._dims, b.Shape._dims) && TryGetBackend(out var backend))
         {

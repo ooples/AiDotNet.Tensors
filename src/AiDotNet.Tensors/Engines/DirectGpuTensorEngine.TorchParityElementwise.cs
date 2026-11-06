@@ -18,15 +18,20 @@ public partial class DirectGpuTensorEngine
     private Tensor<T>? TryParityUnaryOnDevice<T>(Tensor<T> input, TorchParityUnaryOp op, float p0, float p1)
     {
         using var __gpuOp = EnterGpuOp();
-        if (input is null || input.Length == 0 || IsTapeActive<T>(op.ToString()) || !TryGetBackend(out var backend)
+        // Under a tape an op with a device derivative records its node here; the rest take the CPU engine's route.
+        bool taped = IsTapeActive<T>(op.ToString());
+        if (input is null || input.Length == 0 || (taped && (Compilation.GraphMode.IsActive || !(IsNonDifferentiableParityOp(op) || HasDeviceDerivative(op))))
+            || !TryGetBackend(out var backend)
             || backend is not ITorchParityElementwiseBackend kernels || DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return null;
         try
         {
             int n = input.Length;
             using var x = GetOrAllocateBuffer(backend, input);
-            return DispatchDeferredGpuOp<T>(backend, n, (int[])input._shape.Clone(),
+            var result = DispatchDeferredGpuOp<T>(backend, n, (int[])input._shape.Clone(),
                 output => kernels.TorchParityUnary(op, x.Buffer, output, n, p0, p1));
+            if (taped) RecordParityUnary(op, result, input, p0, p1);
+            return result;
         }
         catch (NotSupportedException ex) {
             GpuLaunchProbe.OnFallback("Tensor" + op, ex);
@@ -37,7 +42,9 @@ public partial class DirectGpuTensorEngine
     private Tensor<T>? TryParityBinaryOnDevice<T>(Tensor<T> a, Tensor<T> b, TorchParityBinaryOp op)
     {
         using var __gpuOp = EnterGpuOp();
-        if (a is null || b is null || a.Length == 0 || !a._shape.AsSpan().SequenceEqual(b._shape) || IsTapeActive<T>(op.ToString())
+        bool taped = IsTapeActive<T>(op.ToString());
+        if (a is null || b is null || a.Length == 0 || !a._shape.AsSpan().SequenceEqual(b._shape)
+            || (taped && (Compilation.GraphMode.IsActive || !(IsNonDifferentiableParityOp(op) || HasDeviceDerivative(op))))
             || !TryGetBackend(out var backend) || backend is not ITorchParityElementwiseBackend kernels
             || DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return null;
@@ -46,8 +53,10 @@ public partial class DirectGpuTensorEngine
             int n = a.Length;
             using var x = GetOrAllocateBuffer(backend, a);
             using var y = GetOrAllocateBuffer(backend, b);
-            return DispatchDeferredGpuOp<T>(backend, n, (int[])a._shape.Clone(),
+            var result = DispatchDeferredGpuOp<T>(backend, n, (int[])a._shape.Clone(),
                 output => kernels.TorchParityBinary(op, x.Buffer, y.Buffer, output, n));
+            if (taped) RecordParityBinary(op, result, a, b);
+            return result;
         }
         catch (NotSupportedException ex) {
             GpuLaunchProbe.OnFallback("Tensor" + op, ex);
