@@ -4267,11 +4267,12 @@ public partial class DirectGpuTensorEngine
         var result = TensorMaskedSelectOnGpu(tensor, mask);
         // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
         // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
-        if (result.GradFn is null)
+        if (result.GradFn is null && Autodiff.DifferentiableOps.IsRecording<T>())
         {
-            // Binds the tape to this engine, so the backward of a device result runs on the device.
+            // Binds the tape to this engine, so the backward of a device result runs on the device. The saved mask is
+            // a copy: the backward scatters by it, and the caller may edit its own tensor before backward runs.
             BindTapeIfRecording<T>();
-            Autodiff.DifferentiableOps.RecordUnary("TensorMaskedSelect", result, tensor, Autodiff.BackwardFunctions<T>.MaskedSelectBackward, savedState: new object[] { mask.IsContiguous ? mask : mask.Contiguous(), (int[])tensor._shape.Clone() });
+            Autodiff.DifferentiableOps.RecordUnary("TensorMaskedSelect", result, tensor, Autodiff.BackwardFunctions<T>.MaskedSelectBackward, savedState: new object[] { mask.IsContiguous ? mask.Clone() : mask.Contiguous(), (int[])tensor._shape.Clone() });
         }
         return result;
     }

@@ -43143,10 +43143,12 @@ public partial class CpuEngine : ITensorLevelEngine
             if ((bool)maskSpan[i]) dest[w++] = src[i];
         }
 
-        DifferentiableOps.RecordUnary(
-            "TensorMaskedSelect", result, inputTensor,
-            BackwardFunctions<T>.MaskedSelectBackward,
-            savedState: new object[] { computeMask, (int[])inputTensor._shape.Clone() });
+        // The backward scatters by the mask: keep the forward's mask, not the caller's tensor, which it may edit later.
+        if (DifferentiableOps.IsRecording<T>())
+            DifferentiableOps.RecordUnary(
+                "TensorMaskedSelect", result, inputTensor,
+                BackwardFunctions<T>.MaskedSelectBackward,
+                savedState: new object[] { ReferenceEquals(computeMask, mask) ? mask.Clone() : computeMask, (int[])inputTensor._shape.Clone() });
         return result;
     }
 
