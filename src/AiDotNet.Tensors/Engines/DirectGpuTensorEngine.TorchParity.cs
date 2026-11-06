@@ -409,7 +409,9 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorRrelu<T>(Tensor<T> tensor, double lower = 1.0 / 8, double upper = 1.0 / 3, bool training = false, int? seed = null)
     {
-        if (training) GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        // Under GraphMode the CpuEngine op records the compiled node (a training trace re-draws the slopes on each
+        // replay); each replay re-enters here outside graph mode and runs the device kernel.
+        if (GraphMode.IsActive) return base.TensorRrelu<T>(tensor, lower, upper, training, seed);
         if (TryRreluOnDevice(tensor, lower, upper, training, seed) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorRrelu: no device kernel", null);
         return base.TensorRrelu<T>(tensor, lower, upper, training, seed);

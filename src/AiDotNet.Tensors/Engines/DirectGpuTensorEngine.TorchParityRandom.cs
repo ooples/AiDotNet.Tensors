@@ -10,7 +10,8 @@ namespace AiDotNet.Tensors.Engines;
 /// seed reproduces the same tensor on the device. The draws differ from the CPU's System.Random stream (as torch's CPU
 /// and CUDA generators differ); the distributions and their algorithms are the CPU's. Per-element parameter errors are
 /// detected on the device and raised as the CPU's exceptions after one 8-byte readback of the validation flag. Under a
-/// tape or graph recording these defer to the CPU, which records the backward.
+/// tape or graph recording these defer to the CPU, which records the backward; RReLU records its own device backward
+/// instead, so a compiled step's forward and its backward replay draw the same slopes.
 /// </summary>
 public partial class DirectGpuTensorEngine
 {
@@ -96,12 +97,30 @@ public partial class DirectGpuTensorEngine
 
     private Tensor<T>? TryRreluOnDevice<T>(Tensor<T> tensor, double lower, double upper, bool training, int? seed)
     {
-        if (tensor is null || tensor.Length == 0 || lower > upper || !TryRandomBackend<T>("TensorRrelu", out var backend, out var kernels))
+        if (tensor is null || tensor.Length == 0 || lower > upper) return null;
+        ulong deviceSeed = training ? DeviceSeed(seed) : 0;
+        var result = TryRreluKernel(tensor, lower, upper, training, deviceSeed);
+        if (result is not null && Autodiff.DifferentiableOps.IsRecording<T>())
+        {
+            BindTapeIfRecording<T>();
+            Autodiff.DifferentiableOps.RecordUnary("TensorRrelu", result, tensor, RreluDeviceBackward<T>,
+                new object[] { this, lower, upper, training, deviceSeed });
+        }
+
+        return result;
+    }
+
+    // The device kernel alone. A tape does not send it to the CPU: TryRreluOnDevice records the device backward.
+    // Anomaly mode still runs on the CPU, whose op checks every value.
+    private Tensor<T>? TryRreluKernel<T>(Tensor<T> tensor, double lower, double upper, bool training, ulong deviceSeed)
+    {
+        using var __gpuOp = EnterGpuOp();
+        if (Autodiff.AnomalyModeScope.IsActive || Compilation.GraphMode.IsActive || !TryGetBackend(out var backend)
+            || DirectGpuEngine.ShouldFallbackForPrecision<T>() || backend is not ITorchParityElementwiseBackend kernels)
             return null;
         try
         {
             int n = tensor.Length;
-            ulong deviceSeed = training ? DeviceSeed(seed) : 0;
             var source = tensor.IsContiguous ? tensor : tensor.Contiguous();
             using var x = GetOrAllocateBuffer(backend, source);
             return DispatchDeferredGpuOp<T>(backend, n, (int[])tensor._shape.Clone(),
@@ -111,6 +130,35 @@ public partial class DirectGpuTensorEngine
             GpuLaunchProbe.OnFallback("TensorRrelu", ex);
             return null;
         }
+    }
+
+    // dy/dx is 1 for x > 0 and the element's slope otherwise. The kernel draws an element's slope from (seed, index)
+    // whatever its value, so running it on -1 everywhere with the forward's seed returns -slope at every position:
+    // the slopes the forward applied, rebuilt on the device without saving them.
+    private static void RreluDeviceBackward<T>(Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var gpu = (DirectGpuTensorEngine)savedState[0];
+        double lower = (double)savedState[1], upper = (double)savedState[2];
+        bool training = (bool)savedState[3];
+        ulong deviceSeed = (ulong)savedState[4];
+        var x = inputs[0];
+        var ops = MathHelper.GetNumericOperations<T>();
+        var shape = (int[])x._shape.Clone();
+        Tensor<T> Filled(double value)
+        {
+            var data = new T[x.Length];
+            var v = ops.FromDouble(value);
+            for (int i = 0; i < data.Length; i++) data[i] = v;
+            return new Tensor<T>(data, shape);
+        }
+
+        using var noGrad = new Autodiff.NoGradScope<T>();
+        var negSlopes = gpu.TryRreluKernel(Filled(-1.0), lower, upper, training, deviceSeed)
+            ?? throw new InvalidOperationException(
+                "TensorRrelu's device backward could not run the kernel its forward ran; the backend became unavailable.");
+        var slopes = gpu.TensorWhere(gpu.TensorGreaterThan(x, ops.Zero), Filled(1.0), gpu.TensorNegate(negSlopes));
+        Autodiff.DifferentiableOps.AccumulateGrad(grads, x, gpu.TensorMultiply(gradOutput, slopes), engine);
     }
 
     // Bernoulli / Poisson (one parameter tensor) and Binomial (count, probability): validated on the device.
