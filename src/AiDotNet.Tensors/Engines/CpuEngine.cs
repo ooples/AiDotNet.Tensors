@@ -18278,8 +18278,11 @@ public partial class CpuEngine : ITensorLevelEngine
         // consumer of the indices (MaxUnpool) read the trace's all-zero indices on every step.
         if (TryRecordCompiledOp("MaxPool2DWithTensorIndices", new Tensor<T>?[] { input },
                 e => (e.MaxPool2DWithTensorIndices(input, poolSize, stride, out var fresh), fresh),
-                RefreshIndices, out var compiledNode, out maxIndices))
+                RefreshIndices, out var compiledNode, out var compiledIndices))
+        {
+            maxIndices = compiledIndices;
             return compiledNode;
+        }
 
         Tensor<T> result;
         int[,,,,] coordinateIndices;
@@ -23798,8 +23801,11 @@ public partial class CpuEngine : ITensorLevelEngine
         if (TryRecordCompiledOp("MaxPool3DWithIndices", new Tensor<T>?[] { input },
                 e => (e.MaxPool3DWithIndices(input, poolSize, stride, out var fresh), fresh),
                 (_, fresh, held) => Array.Copy(fresh, held, fresh.Length),
-                out var compiledNode, out maxIndices))
+                out var compiledNode, out var compiledIndices))
+        {
+            maxIndices = compiledIndices;
             return compiledNode;
+        }
         if (input.Rank != 5) throw new ArgumentException($"MaxPool3D requires 5D input tensor [batch, channels, depth, height, width]. Got rank {input.Rank}.", nameof(input));
         if (poolSize == null || poolSize.Length != 3) throw new ArgumentException("Pool size must be array of 3 elements [poolD, poolH, poolW].", nameof(poolSize));
         if (stride == null || stride.Length != 3) throw new ArgumentException("Stride must be array of 3 elements [strideD, strideH, strideW].", nameof(stride));
@@ -23901,8 +23907,11 @@ public partial class CpuEngine : ITensorLevelEngine
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousOutput);
         if (TryRecordCompiledOp("MaxPool3DWithTensorIndices", new Tensor<T>?[] { input },
                 e => (e.MaxPool3DWithTensorIndices(input, poolSize, stride, out var fresh), fresh),
-                RefreshIndices, out var compiledNode, out maxIndices))
+                RefreshIndices, out var compiledNode, out var compiledIndices))
+        {
+            maxIndices = compiledIndices;
             return compiledNode;
+        }
 
         Tensor<T> result;
         int[,,,,,] coordinateIndices;
@@ -35505,8 +35514,11 @@ public partial class CpuEngine : ITensorLevelEngine
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousOutput);
         if (TryRecordCompiledOp("ReduceMaxWithTensorIndices", new Tensor<T>?[] { input },
                 e => (e.ReduceMaxWithTensorIndices(input, axes, keepDims, out var fresh), fresh),
-                RefreshIndices, out var compiledNode, out maxIndices))
+                RefreshIndices, out var compiledNode, out var compiledIndices))
+        {
+            maxIndices = compiledIndices;
             return compiledNode;
+        }
 
         Tensor<T> result;
         int[] absoluteIndices;

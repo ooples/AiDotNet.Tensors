@@ -64,7 +64,7 @@ public partial class CpuEngine
         if (targetIds.Rank != 1 || targetIds.Length != n)
             throw new ArgumentException($"targetIds must be rank-1 [N={n}].", nameof(targetIds));
 
-        var ids = (int[])(object)targetIds.GetDataArray()!;
+        var ids = (int[])(object)targetIds.GetDataArray();
         for (int r = 0; r < n; r++)
             if (ids[r] < 0 || ids[r] >= vocab)
                 throw new ArgumentOutOfRangeException(nameof(targetIds),
@@ -86,7 +86,7 @@ public partial class CpuEngine
                 {
                     // Labels are not differentiable graph inputs, but they are live training data.
                     // Refresh the backward state on every replay instead of freezing the trace batch.
-                    compiledSavedState[0] = (int[])capturedTargetIds.GetDataArray()!.Clone();
+                    compiledSavedState[0] = (int[])capturedTargetIds.GetDataArray().Clone();
                     var result = eng.FusedLinearCrossEntropyWithLogits(
                         capturedHidden, capturedWeight, capturedBias, capturedTargetIds);
                     DirectGpuTensorEngine.CopyResultInto(eng, result, output);
@@ -112,7 +112,7 @@ public partial class CpuEngine
         using (new NoGradScope<T>())
         {
             logits = TensorMatMul(hidden, weight);
-            logitData = logits.GetDataArray()!;
+            logitData = logits.GetDataArray();
             AddBiasRowsInto(logitData, bias, n, vocab);
         }
 
@@ -123,7 +123,7 @@ public partial class CpuEngine
                 : FusedCeLossIndexGeneric<T>(logitData, ids, n, vocab);
 
         var output = new Tensor<T>(new[] { 1 }); // scalar loss (length-1)
-        output.GetDataArray()![0] = MathHelper.GetNumericOperations<T>().FromDouble(lossValue);
+        output.GetDataArray()[0] = MathHelper.GetNumericOperations<T>().FromDouble(lossValue);
 
         // target ids are supervision (no gradient): carry them in savedState rather than as a
         // differentiable tape input. Save a COPY so the backward is tied to the forward's labels —
@@ -211,7 +211,7 @@ public partial class CpuEngine
             logits = TensorMatMul(hidden, weight);              // [N, vocab]
             // Materialize ONCE — see the int-id forward: GetDataArray() returns a fresh detached copy
             // for a GPU-resident tensor, so adding the bias to one copy and reading another drops it.
-            logitData = logits.GetDataArray()!;
+            logitData = logits.GetDataArray();
             AddBiasRowsInto(logitData, bias, n, vocab);
         }
 
@@ -219,15 +219,15 @@ public partial class CpuEngine
         if (typeof(T) == typeof(double))
         {
             lossValue = FusedCeLossDouble(
-                (double[])(object)logitData, (double[])(object)target.GetDataArray()!, n, vocab);
+                (double[])(object)logitData, (double[])(object)target.GetDataArray(), n, vocab);
         }
         else
         {
-            lossValue = FusedCeLossGeneric<T>(logitData, target.GetDataArray()!, n, vocab);
+            lossValue = FusedCeLossGeneric<T>(logitData, target.GetDataArray(), n, vocab);
         }
 
         var output = new Tensor<T>(new[] { 1 }); // scalar loss (length-1)
-        output.GetDataArray()![0] = MathHelper.GetNumericOperations<T>().FromDouble(lossValue);
+        output.GetDataArray()[0] = MathHelper.GetNumericOperations<T>().FromDouble(lossValue);
 
         DifferentiableOps.RecordIfActive<T>(
             "FusedLinearCrossEntropy", output,
@@ -248,7 +248,7 @@ public partial class CpuEngine
     /// </remarks>
     private static void AddBiasRowsInto<T>(T[] lo, Tensor<T> bias, int n, int vocab)
     {
-        var bi = bias.GetDataArray()!;
+        var bi = bias.GetDataArray();
         if (typeof(T) == typeof(float))
         {
             AddBiasRowsFloat((float[])(object)lo, (float[])(object)bi, n, vocab);
@@ -369,7 +369,7 @@ public partial class CpuEngine
 
         int n = hidden.Shape[0];
         var ops = MathHelper.GetNumericOperations<T>();
-        double g = ops.ToDouble(gradOutput.GetDataArray()![0]);
+        double g = ops.ToDouble(gradOutput.GetDataArray()[0]);
 
         var dLogits = new Tensor<T>(new[] { n, vocab });
         using (new NoGradScope<T>())
@@ -377,22 +377,22 @@ public partial class CpuEngine
             var logits = engine.TensorMatMul(hidden, weight);
             // Materialize ONCE — see the int-id forward: GetDataArray() returns a fresh detached copy
             // for a GPU-resident tensor, so adding the bias to one copy and reading another drops it.
-            var logitData = logits.GetDataArray()!;
+            var logitData = logits.GetDataArray();
             AddBiasRowsInto(logitData, bias, n, vocab);
             if (typeof(T) == typeof(double))
             {
                 SoftmaxMinusIndexDouble(
                     (double[])(object)logitData, ids,
-                    (double[])(object)dLogits.GetDataArray()!, n, vocab, g);
+                    (double[])(object)dLogits.GetDataArray(), n, vocab, g);
             }
             else if (typeof(T) == typeof(float))
             {
                 SoftmaxMinusIndexFloat(
-                    (float[])(object)logitData, ids, (float[])(object)dLogits.GetDataArray()!, n, vocab, g);
+                    (float[])(object)logitData, ids, (float[])(object)dLogits.GetDataArray(), n, vocab, g);
             }
             else
             {
-                SoftmaxMinusIndexGeneric<T>(logitData, ids, dLogits.GetDataArray()!, n, vocab, g);
+                SoftmaxMinusIndexGeneric<T>(logitData, ids, dLogits.GetDataArray(), n, vocab, g);
             }
 
             var dHidden = engine.TensorMatMulTransposed(dLogits, weight);
@@ -589,7 +589,7 @@ public partial class CpuEngine
 
         // Upstream scalar grad (∂L_outer/∂loss). dlogits = g·(softmax(logits) - target)/N.
         var ops = MathHelper.GetNumericOperations<T>();
-        double g = ops.ToDouble(gradOutput.GetDataArray()![0]);
+        double g = ops.ToDouble(gradOutput.GetDataArray()[0]);
 
         // Recompute logits → softmax → dlogits, all off-tape.
         var dLogits = new Tensor<T>(new[] { n, vocab });
@@ -598,18 +598,18 @@ public partial class CpuEngine
             var logits = engine.TensorMatMul(hidden, weight);
             // Materialize ONCE — see the int-id forward: GetDataArray() returns a fresh detached copy
             // for a GPU-resident tensor, so adding the bias to one copy and reading another drops it.
-            var logitData = logits.GetDataArray()!;
+            var logitData = logits.GetDataArray();
             AddBiasRowsInto(logitData, bias, n, vocab);
             if (typeof(T) == typeof(double))
             {
                 SoftmaxMinusTargetDouble(
-                    (double[])(object)logitData, (double[])(object)target.GetDataArray()!,
-                    (double[])(object)dLogits.GetDataArray()!, n, vocab, g);
+                    (double[])(object)logitData, (double[])(object)target.GetDataArray(),
+                    (double[])(object)dLogits.GetDataArray(), n, vocab, g);
             }
             else
             {
                 SoftmaxMinusTargetGeneric<T>(
-                    logitData, target.GetDataArray()!, dLogits.GetDataArray()!, n, vocab, g);
+                    logitData, target.GetDataArray(), dLogits.GetDataArray(), n, vocab, g);
             }
 
             // dHidden = dLogits·weightᵀ  [N,d]  (weight is [d,vocab] → weightᵀ [vocab,d]).
@@ -670,8 +670,8 @@ public partial class CpuEngine
     private static Tensor<T> ColumnSums<T>(Tensor<T> dLogits, int n, int vocab)
     {
         var result = new Tensor<T>(new[] { vocab });
-        var dl = dLogits.GetDataArray()!;
-        var res = result.GetDataArray()!;
+        var dl = dLogits.GetDataArray();
+        var res = result.GetDataArray();
         if (typeof(T) == typeof(float))
         {
             ColumnSumsFloat((float[])(object)dl, (float[])(object)res, n, vocab);

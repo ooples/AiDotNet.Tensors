@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
@@ -39,10 +40,9 @@ public partial class CpuEngine
     /// whose forward draws a fresh seed each step re-runs, for its backward, with the seed that step drew.
     /// </param>
     internal bool TryRecordCompiledOp<T>(string opName, Tensor<T>?[] inputs, Func<IEngine, Tensor<T>> forward,
-        out Tensor<T> result, Func<IEngine, Tensor<T>>? backwardForward = null)
+        [NotNullWhen(true)] out Tensor<T>? result, Func<IEngine, Tensor<T>>? backwardForward = null)
     {
-        // net471 has no NotNullWhen; a caller reads result only when this returns true.
-        result = null!;
+        result = null;
         if (BeginCompiledRecord(inputs, out var operands) is not { } scope) return false;
         BindCaptures(scope, forward, operands);
         if (backwardForward is not null) BindCaptures(scope, backwardForward, operands);
@@ -105,10 +105,10 @@ public partial class CpuEngine
     /// </remarks>
     internal bool TryRecordCompiledOp<T, TAux>(string opName, Tensor<T>?[] inputs,
         Func<IEngine, (Tensor<T> Result, TAux Aux)> forward, Action<IEngine, TAux, TAux> refreshAux,
-        out Tensor<T> result, out TAux aux)
+        [NotNullWhen(true)] out Tensor<T>? result, [MaybeNullWhen(false)] out TAux aux)
     {
-        result = null!;
-        aux = default!;
+        result = null;
+        aux = default;
         if (BeginCompiledRecord(inputs, out var operands) is not { } scope) return false;
         BindCaptures(scope, forward, operands);
 
@@ -177,8 +177,8 @@ public partial class CpuEngine
             if (value is Array array)
             {
                 if (array.GetType().GetElementType() is { IsValueType: false })
-                    foreach (var element in array)
-                        if (element is not null) DependOnProducer(scope, element, operands);
+                    foreach (var element in array.OfType<object>())
+                        DependOnProducer(scope, element, operands);
                 field.SetValue(closure, array.Clone());
             }
             else if (depth < 4 && field.FieldType.IsDefined(typeof(System.Runtime.CompilerServices.CompilerGeneratedAttribute), false))
