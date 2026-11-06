@@ -499,7 +499,7 @@ public partial class CpuEngine
         // clip from the input and topDb.
         DifferentiableOps.RecordUnary("AmplitudeToDB", result, input,
             BackwardFunctions<T>.AmplitudeToDBBackward,
-            new object[] { minAmplitude, topDb! });
+            topDb.HasValue ? new object[] { minAmplitude, topDb.Value } : new object[] { minAmplitude });
         return result;
     }
 
