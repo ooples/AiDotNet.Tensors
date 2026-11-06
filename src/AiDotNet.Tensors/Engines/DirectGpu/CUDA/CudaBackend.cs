@@ -20228,6 +20228,47 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         try { Dispose(disposing: false); } catch { }
     }
 
+    // Batch net-unreleased CUDA buffer bytes in 512-MB quanta before forwarding to DeviceMemoryReclaim so CUDA's
+    // stream-ordered pool (_asyncMemPool) does not pay a ~250 ms managed-heap GC stall on every 64 MB of transient
+    // tensor wrappers, while still guaranteeing Gen-1 sweeps every 512 MB and Gen-2 sweeps every 2 GB of unreleased
+    // device memory on Windows WDDM.
+    private const long CudaReclaimQuantumBytes = 512L << 20;
+    private static long s_cudaUnreleasedBytes;
+    private static long s_cudaReclaimEpoch;
+
+    private static long ChargeCudaReclaim(long bytes)
+    {
+        if (bytes <= 0 || IsCapturingOnThisThread || IsRuntimeTearingDown || ProcessExiting) return -1;
+        long epoch = Volatile.Read(ref s_cudaReclaimEpoch);
+        long pending = Interlocked.Add(ref s_cudaUnreleasedBytes, bytes);
+        while (pending >= CudaReclaimQuantumBytes)
+        {
+            long chunks = pending / CudaReclaimQuantumBytes;
+            long drain = chunks * CudaReclaimQuantumBytes;
+            long observed = Interlocked.CompareExchange(ref s_cudaUnreleasedBytes, pending - drain, pending);
+            if (observed == pending)
+            {
+                Interlocked.Increment(ref s_cudaReclaimEpoch);
+                DeviceMemoryReclaim.OnDeviceAllocation(chunks * DeviceMemoryReclaim.CollectAfterDeviceBytes);
+                return -1;
+            }
+            pending = observed;
+        }
+        return epoch;
+    }
+
+    private static void CreditCudaReclaim(long bytes, long epoch)
+    {
+        if (bytes <= 0 || epoch < 0) return;
+        while (true)
+        {
+            long current = Volatile.Read(ref s_cudaUnreleasedBytes);
+            if (Volatile.Read(ref s_cudaReclaimEpoch) != epoch || current <= 0) return;
+            long next = Math.Max(0, current - bytes);
+            if (Interlocked.CompareExchange(ref s_cudaUnreleasedBytes, next, current) == current) return;
+        }
+    }
+
     internal sealed class CudaGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     {
         private IntPtr _context;
@@ -20247,13 +20288,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         {
             if (bytes <= 0 || IsCapturingOnThisThread || IsRuntimeTearingDown || ProcessExiting) return;
             _reclaimCharge = bytes;
-            _reclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation(bytes);
+            _reclaimEpoch = ChargeCudaReclaim(bytes);
         }
 
         private void CreditReclaim()
         {
             long charge = Interlocked.Exchange(ref _reclaimCharge, 0);
-            if (charge > 0) DeviceMemoryReclaim.OnDeviceRelease(charge, _reclaimEpoch);
+            if (charge > 0) CreditCudaReclaim(charge, _reclaimEpoch);
         }
 
         public int Size => Volatile.Read(ref _size);
@@ -20482,13 +20523,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         {
             if (bytes <= 0 || IsCapturingOnThisThread || IsRuntimeTearingDown || ProcessExiting) return;
             _reclaimCharge = bytes;
-            _reclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation(bytes);
+            _reclaimEpoch = ChargeCudaReclaim(bytes);
         }
 
         private void CreditReclaim()
         {
             long charge = Interlocked.Exchange(ref _reclaimCharge, 0);
-            if (charge > 0) DeviceMemoryReclaim.OnDeviceRelease(charge, _reclaimEpoch);
+            if (charge > 0) CreditCudaReclaim(charge, _reclaimEpoch);
         }
 
         public CudaGpuByteBuffer(IntPtr context, IntPtr devicePtr, int size, IntPtr asyncFreeStream = default,
