@@ -159,6 +159,13 @@ layout(set = 0, binding = 2) writeonly buffer O { float output_[]; };
 layout(push_constant) uniform P {
     int N; int C; int H; int W; int K; int outH; int outW; float spatialScale;
 };
+// roundf: halves away from zero, as the CUDA/HIP/OpenCL/Metal kernels and the CpuEngine round box corners. GLSL's
+// round() leaves the direction of a half implementation-defined. v - trunc(v) is exact, so no addition can carry a
+// value just below a half up to it.
+int round_away(float v) {
+    float t = trunc(v);
+    return int(abs(v - t) >= 0.5 ? t + sign(v) : t);
+}
 void main() {
     int gid = int(gl_GlobalInvocationID.x);
     int total = K * C * outH * outW;
@@ -168,10 +175,10 @@ void main() {
     int c = t2 % C; int k = t2 / C;
     int n = int(boxes[k * 5]);
     if (n < 0 || n >= N) { output_[gid] = 0.0; return; }
-    int x1 = int(round(boxes[k * 5 + 1] * spatialScale));
-    int y1 = int(round(boxes[k * 5 + 2] * spatialScale));
-    int x2 = int(round(boxes[k * 5 + 3] * spatialScale));
-    int y2 = int(round(boxes[k * 5 + 4] * spatialScale));
+    int x1 = round_away(boxes[k * 5 + 1] * spatialScale);
+    int y1 = round_away(boxes[k * 5 + 2] * spatialScale);
+    int x2 = round_away(boxes[k * 5 + 3] * spatialScale);
+    int y2 = round_away(boxes[k * 5 + 4] * spatialScale);
     int roiW = x2 - x1 + 1; if (roiW < 1) roiW = 1;
     int roiH = y2 - y1 + 1; if (roiH < 1) roiH = 1;
     float binH = float(roiH) / outH;

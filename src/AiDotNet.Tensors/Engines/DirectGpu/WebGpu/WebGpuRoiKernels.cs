@@ -83,6 +83,13 @@ struct P {
 };
 @group(0) @binding(3) var<uniform> p : P;
 
+// roundf: halves away from zero, as the CUDA/HIP/OpenCL/Metal kernels and the CpuEngine round box corners. WGSL's
+// round() rounds a half to even. v - trunc(v) is exact, so no addition can carry a value just below a half up to it.
+fn round_away(v: f32) -> i32 {
+    let t = trunc(v);
+    return i32(select(t, t + sign(v), abs(v - t) >= 0.5));
+}
+
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
     let gid = i32(id.x);
     let total = p.K * p.C * p.outH * p.outW;
@@ -92,10 +99,10 @@ struct P {
     let c = t2 % p.C; let k = t2 / p.C;
     let n = i32(boxes[k * 5]);
     if (n < 0 || n >= p.N) { output_[gid] = 0.0; return; }
-    let x1 = i32(round(boxes[k * 5 + 1] * p.spatialScale));
-    let y1 = i32(round(boxes[k * 5 + 2] * p.spatialScale));
-    let x2 = i32(round(boxes[k * 5 + 3] * p.spatialScale));
-    let y2 = i32(round(boxes[k * 5 + 4] * p.spatialScale));
+    let x1 = round_away(boxes[k * 5 + 1] * p.spatialScale);
+    let y1 = round_away(boxes[k * 5 + 2] * p.spatialScale);
+    let x2 = round_away(boxes[k * 5 + 3] * p.spatialScale);
+    let y2 = round_away(boxes[k * 5 + 4] * p.spatialScale);
     var roiW = x2 - x1 + 1; if (roiW < 1) { roiW = 1; }
     var roiH = y2 - y1 + 1; if (roiH < 1) { roiH = 1; }
     let binH = f32(roiH) / f32(p.outH);
