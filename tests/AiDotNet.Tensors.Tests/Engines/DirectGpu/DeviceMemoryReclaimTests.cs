@@ -165,6 +165,47 @@ public sealed class DeviceMemoryReclaimTests
         DeviceMemoryReclaim.OnDeviceRelease(DeviceMemoryReclaim.CollectNowAfterDeviceBytes, trigger);
         Assert.True(DeviceMemoryReclaim.CollectIfDueAtStepBoundary());
     }
+    [Fact]
+    public void GradientTapeDispose_CollectsStepIntermediatesAfterEntriesReset()
+    {
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        static WeakReference RecordUnpooledEntry(
+            AiDotNet.Tensors.Engines.Autodiff.GradientTape<float> tape,
+            AiDotNet.Tensors.LinearAlgebra.Tensor<float> x)
+        {
+            var unpooled = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(new[] { 16 });
+            tape.Record(new AiDotNet.Tensors.Engines.Autodiff.TapeEntry<float>
+            {
+                OperationName = "test_step_boundary",
+                Output = unpooled,
+                Input0 = x,
+                InputCount = 1,
+            });
+            return new WeakReference(unpooled);
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        static WeakReference RecordForwardStepAndDispose()
+        {
+            var x = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(new[] { 16 });
+            WeakReference weakForward;
+            using (var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>())
+            {
+                weakForward = RecordUnpooledEntry(tape, x);
+                // Simulate >256 MB of device allocations inside an open tape: must defer to tape.Dispose()
+                // rather than running a mid-step GC while _entries still roots unpooled.
+                DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectNowAfterDeviceBytes);
+                Assert.True(DeviceMemoryReclaim.CollectionDue);
+            }
+            return weakForward;
+        }
+
+        DeviceMemoryReclaim.ResetCountsForTests();
+        var weak = RecordForwardStepAndDispose();
+        Assert.False(DeviceMemoryReclaim.CollectionDue);
+        Assert.False(weak.IsAlive);
+    }
+
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static void AbandonBuffer(IDirectGpuBackend backend) => backend.AllocateBuffer(1024);
 

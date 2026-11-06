@@ -125,7 +125,7 @@ internal static class DeviceMemoryReclaim
         Interlocked.Increment(ref s_allocationsSinceCollection);
         long since = Interlocked.Add(ref s_driverBytesSinceCollection, bytes);
         if (since < CollectAfterDeviceBytes) return epoch;
-        if (since < CollectNowAfterDeviceBytes)
+        if (since < CollectNowAfterDeviceBytes || TapeOpen())
         {
             Volatile.Write(ref s_collectionDue, 1);
             return epoch;
@@ -133,7 +133,8 @@ internal static class DeviceMemoryReclaim
         ResetDeviceBytes();
         Interlocked.Exchange(ref s_allocationsSinceCollection, 0);
         Volatile.Write(ref s_collectionDue, 0);
-        GC.Collect(0, GCCollectionMode.Forced, blocking: true);
+        GC.Collect(1, GCCollectionMode.Forced, blocking: true);
+        GC.WaitForPendingFinalizers();
         return epoch;
     }
 
@@ -207,10 +208,14 @@ internal static class DeviceMemoryReclaim
         // tape releasing its intermediates): those buffers are back in the pool and credited, so a collection would
         // recover nothing. Measured on ResNet-50 predicts under a TensorScope (OpenCL): every intermediate came back
         // that way and no buffer was ever finalized, yet a blocking collection ran on every call.
-        if (Volatile.Read(ref s_driverBytesSinceCollection) < CollectAfterDeviceBytes) return false;
+        long bytes = Volatile.Read(ref s_driverBytesSinceCollection);
+        if (bytes < CollectAfterDeviceBytes) return false;
         ResetDeviceBytes();
         Interlocked.Exchange(ref s_allocationsSinceCollection, 0);
-        GC.Collect(0, GCCollectionMode.Forced, blocking: true);
+        // Normal managed-heap Gen-0 collections during a multi-layer training step promote early forward activations
+        // into Gen 1 (or Gen 2 on >512 MB steps); collect through Gen 1 (or Gen 2 past 512 MB) once at the step
+        // boundary after GradientTape._entries has been reset so dead device buffers never accumulate across steps.
+        GC.Collect(bytes >= (512L << 20) ? 2 : 1, GCCollectionMode.Forced, blocking: true);
         // The collected buffers come back through their finalizers. Waiting for them (they only queue a pool return)
         // lets the next step's allocations find them in the pool instead of going to the driver.
         GC.WaitForPendingFinalizers();

@@ -3158,10 +3158,6 @@ public sealed class GradientTape<T> : IDisposable
             if (_keptKeys is not null) _snapshotEngine.DetachToTensorLifetime(_keptKeys);
             _snapshotEngine.ReclaimDetachedResultsOverBudget();
         }
-        // The step this tape recorded is over and its intermediates are dead: run the young collection a GPU backend
-        // asked for here, so they are collected young and their buffers return to the pool (see DeviceMemoryReclaim).
-        if (_parent is null) Engines.DirectGpu.DeviceMemoryReclaim.CollectIfDueAtStepBoundary();
-
         // A tape may be disposed before backward, or after a cleanup path that
         // visited only reachable nodes. Release any entry-owned saved-state pins
         // before the arena drops those references; already-cleaned entries no-op.
@@ -3210,6 +3206,13 @@ public sealed class GradientTape<T> : IDisposable
             // then reuses buffers still holding live gradients, corrupting them. Inner tapes
             // set SuppressArenaScope so only the genuine step-boundary tape resets per step.
             Helpers.TensorArena.Current?.ResetKeeping(handedToCaller);
+        }
+        // Run the step-boundary device collection AFTER _entries.Reset(), saved-state unpinning, and arena disposal
+        // have dropped every reference to this step's dead intermediates (running earlier promoted live _entries
+        // tensors out of gen-0 instead of reclaiming them).
+        if (_parent is null)
+        {
+            Engines.DirectGpu.DeviceMemoryReclaim.CollectIfDueAtStepBoundary();
         }
     }
 

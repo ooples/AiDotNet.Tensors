@@ -4734,21 +4734,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         lock (_trackedOwnedResults) _trackedOwnedResults.Clear();
     }
 
-    // The GC cannot see device memory. Owned results are small managed objects pinning large device buffers. During
-    // GradientTape training, forward activations survive mid-step gen-0 collections into gen-1 before tape.Dispose()
-    // drops them, and on Windows WDDM cuMemAllocAsync silently spills into PCIe shared system memory instead of
-    // returning OOM. Collecting through gen-1 every 256 MB reclaims tape-promoted intermediates before WDDM paging.
-    private long _ownedResultBytesSinceCollect;
-
+    // The GC cannot see device memory. Owned results are small managed objects pinning large device buffers; forward
+    // owned-result byte accounting to DeviceMemoryReclaim so collections are deferred to GradientTape.Dispose() /
+    // InferenceModeScope.Dispose() rather than running mid-step and promoting live tape activations into older generations.
     private void NoteOwnedResultAllocation(long bytes)
     {
-        long threshold = OwnedResultCollectThresholdBytes;
-        if (System.Threading.Interlocked.Add(ref _ownedResultBytesSinceCollect, bytes) < threshold) return;
-        System.Threading.Interlocked.Exchange(ref _ownedResultBytesSinceCollect, 0);
-        GC.Collect(1, GCCollectionMode.Forced, blocking: false);
+        AiDotNet.Tensors.Engines.DirectGpu.DeviceMemoryReclaim.OnDeviceAllocation(bytes);
     }
-
-    private long OwnedResultCollectThresholdBytes => 256L << 20;
     /// <summary>
     /// Materializes a deferred download if the given array was returned from a GPU op
     /// within a GpuScope without downloading. This is called automatically when CPU
