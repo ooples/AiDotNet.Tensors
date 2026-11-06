@@ -486,6 +486,8 @@ public partial class CpuEngine
             {
                 var hData = h.IsContiguous ? h.GetDataArray() : h.Contiguous().GetDataArray();
                 var dHiddenData = new float[(long)n * d];
+                // The first chunk's product becomes dWeight; later chunks write into one scratch and add it in.
+                Tensor<float>? dwcScratch = null;
                 for (int start = 0; start < n; start += rowsPerChunk)
                 {
                     int rows = Math.Min(rowsPerChunk, n - start);
@@ -497,10 +499,17 @@ public partial class CpuEngine
                     CrossEntropyGradRowsFloat(data, biasData, ids, start, rows, vocab, scale, rowLoss);
                     var dhc = DLogitsTimesWeightTransposed(data, w, rows, d, vocab);
                     Array.Copy(dhc.GetDataArray(), 0, dHiddenData, (long)start * d, (long)rows * d);
-                    var dwc = PrefaultedTensor(d, vocab);
-                    MatMulInto(dwc, TensorTranspose(hc), dLogits);
-                    if (dWeight is null) dWeight = dwc;
-                    else AddInPlaceFloat(dWeight.GetDataArray(), dwc.GetDataArray());
+                    if (dWeight is null)
+                    {
+                        dWeight = PrefaultedTensor(d, vocab);
+                        MatMulInto(dWeight, TensorTranspose(hc), dLogits);
+                    }
+                    else
+                    {
+                        dwcScratch ??= PrefaultedTensor(d, vocab);
+                        MatMulInto(dwcScratch, TensorTranspose(hc), dLogits);
+                        AddInPlaceFloat(dWeight.GetDataArray(), dwcScratch.GetDataArray());
+                    }
                     ColumnSumsFloat(data, dBias, rows, vocab);
                     ReturnFusedCeWorkspace(data);
                 }
