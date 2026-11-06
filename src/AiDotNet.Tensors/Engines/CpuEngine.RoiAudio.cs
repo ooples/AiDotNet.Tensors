@@ -166,16 +166,16 @@ public partial class CpuEngine
         int hs, he, ws, we;
         if (typeof(T) == typeof(float))
         {
-            int x1 = RoundAway((float)((float)ops.ToDouble(boxes[k * 5 + 1]) * spatialScale));
-            int y1 = RoundAway((float)((float)ops.ToDouble(boxes[k * 5 + 2]) * spatialScale));
-            int x2 = RoundAway((float)((float)ops.ToDouble(boxes[k * 5 + 3]) * spatialScale));
-            int y2 = RoundAway((float)((float)ops.ToDouble(boxes[k * 5 + 4]) * spatialScale));
+            int x1 = RoundAway((float)ops.ToDouble(boxes[k * 5 + 1]) * spatialScale);
+            int y1 = RoundAway((float)ops.ToDouble(boxes[k * 5 + 2]) * spatialScale);
+            int x2 = RoundAway((float)ops.ToDouble(boxes[k * 5 + 3]) * spatialScale);
+            int y2 = RoundAway((float)ops.ToDouble(boxes[k * 5 + 4]) * spatialScale);
             float binH = (float)Math.Max(y2 - y1 + 1, 1) / outH;
             float binW = (float)Math.Max(x2 - x1 + 1, 1) / outW;
-            hs = (int)Math.Floor((float)(ph * binH)) + y1;
-            he = (int)Math.Ceiling((float)((ph + 1) * binH)) + y1;
-            ws = (int)Math.Floor((float)(pw * binW)) + x1;
-            we = (int)Math.Ceiling((float)((pw + 1) * binW)) + x1;
+            hs = (int)Math.Floor(ph * binH) + y1;
+            he = (int)Math.Ceiling((ph + 1) * binH) + y1;
+            ws = (int)Math.Floor(pw * binW) + x1;
+            we = (int)Math.Ceiling((pw + 1) * binW) + x1;
         }
         else
         {

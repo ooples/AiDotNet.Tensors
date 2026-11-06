@@ -460,7 +460,7 @@ public partial class CpuEngine
                     for (int r = start; r < end; r++)
                     {
                         Simd.SimdKernels.LogSoftmaxRowUnsafe(pl + (long)r * vocab, ps, vocab);
-                        rowLoss[r] = -ps[ids[r]];
+                        rowLoss[r] = -scratch[ids[r]];
                     }
                 }
             }
