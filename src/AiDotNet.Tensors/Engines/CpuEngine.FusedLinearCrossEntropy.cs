@@ -118,7 +118,9 @@ public partial class CpuEngine
 
         double lossValue = typeof(T) == typeof(double)
             ? FusedCeLossIndexDouble((double[])(object)logitData, ids, n, vocab)
-            : FusedCeLossIndexGeneric<T>(logitData, ids, n, vocab);
+            : typeof(T) == typeof(float)
+                ? FusedCeLossIndexFloat((float[])(object)logitData, ids, n, vocab)
+                : FusedCeLossIndexGeneric<T>(logitData, ids, n, vocab);
 
         var output = new Tensor<T>(new[] { 1 }); // scalar loss (length-1)
         output.GetDataArray()![0] = MathHelper.GetNumericOperations<T>().FromDouble(lossValue);
@@ -247,7 +249,11 @@ public partial class CpuEngine
     private static void AddBiasRowsInto<T>(T[] lo, Tensor<T> bias, int n, int vocab)
     {
         var bi = bias.GetDataArray()!;
-        if (typeof(T) == typeof(double))
+        if (typeof(T) == typeof(float))
+        {
+            AddBiasRowsFloat((float[])(object)lo, (float[])(object)bi, n, vocab);
+        }
+        else if (typeof(T) == typeof(double))
         {
             var l = (double[])(object)lo; var b = (double[])(object)bi;
             for (int r = 0; r < n; r++)
@@ -379,6 +385,11 @@ public partial class CpuEngine
                     (double[])(object)logitData, ids,
                     (double[])(object)dLogits.GetDataArray()!, n, vocab, g);
             }
+            else if (typeof(T) == typeof(float))
+            {
+                SoftmaxMinusIndexFloat(
+                    (float[])(object)logitData, ids, (float[])(object)dLogits.GetDataArray()!, n, vocab, g);
+            }
             else
             {
                 SoftmaxMinusIndexGeneric<T>(logitData, ids, dLogits.GetDataArray()!, n, vocab, g);
@@ -415,6 +426,121 @@ public partial class CpuEngine
                 dLogits[off + v] = (sm - (v == id ? 1.0 : 0.0)) * scale;
             }
         }
+    }
+
+    // float paths. The generic path widens every element through INumericOperations and calls the scalar double
+    // Math.Exp - twice per element in the backward - on one thread; for an LM head (N rows x V ~ 5e4) that serial
+    // softmax dominated the op while the GEMMs around it ran on every core. Rows are independent, so they are split
+    // into contiguous chunks across the persistent pool (deterministic: each row is computed by exactly one worker,
+    // and the per-row losses are reduced in row order) and each row uses the SIMD row kernels.
+    private const int FloatRowParallelMinElements = 32768;
+
+    private static int RowChunks(int n, int vocab)
+        => n >= 2 && (long)n * vocab >= FloatRowParallelMinElements
+            ? Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, n)
+            : 1;
+
+    // Index-target mean CE for float logits: row r contributes -logSoftmax(logits[r])[id_r]. Each row's log-softmax
+    // is evaluated in float by the SIMD row kernel; per-row losses are summed in double, in row order.
+    private static unsafe double FusedCeLossIndexFloat(float[] logits, int[] ids, int n, int vocab)
+    {
+        var rowLoss = new double[n];
+        int chunks = RowChunks(n, vocab);
+        int rowsPerChunk = (n + chunks - 1) / chunks;
+        void Chunk(int c)
+        {
+            int start = c * rowsPerChunk, end = Math.Min(start + rowsPerChunk, n);
+            if (start >= end) return;
+            var scratch = System.Buffers.ArrayPool<float>.Shared.Rent(vocab);
+            try
+            {
+                fixed (float* pl = logits)
+                fixed (float* ps = scratch)
+                {
+                    for (int r = start; r < end; r++)
+                    {
+                        Simd.SimdKernels.LogSoftmaxRowUnsafe(pl + (long)r * vocab, ps, vocab);
+                        rowLoss[r] = -ps[ids[r]];
+                    }
+                }
+            }
+            finally { System.Buffers.ArrayPool<float>.Shared.Return(scratch); }
+        }
+        if (chunks == 1) Chunk(0);
+        else PersistentParallelExecutor.Instance.Execute(chunks, Chunk);
+
+        double total = 0.0;
+        for (int r = 0; r < n; r++) total += rowLoss[r];
+        return total / n;
+    }
+
+    // dlogits[r, v] = (softmax(logits[r])[v] - [v == id_r]) * g / N, row-parallel, SIMD softmax + scale.
+    private static unsafe void SoftmaxMinusIndexFloat(float[] logits, int[] ids, float[] dLogits, int n, int vocab, double g)
+    {
+        float scale = (float)(g / n);
+        int chunks = RowChunks(n, vocab);
+        int rowsPerChunk = (n + chunks - 1) / chunks;
+        void Chunk(int c)
+        {
+            int start = c * rowsPerChunk, end = Math.Min(start + rowsPerChunk, n);
+            fixed (float* pl = logits)
+            fixed (float* pd = dLogits)
+            {
+                for (int r = start; r < end; r++)
+                {
+                    float* src = pl + (long)r * vocab, dst = pd + (long)r * vocab;
+                    Simd.SimdKernels.SoftmaxRowUnsafe(src, dst, vocab);
+                    Simd.SimdKernels.MultiplyScalarUnsafe(dst, scale, dst, vocab);
+                    dst[ids[r]] -= scale;
+                }
+            }
+        }
+        if (chunks == 1) Chunk(0);
+        else PersistentParallelExecutor.Instance.Execute(chunks, Chunk);
+    }
+
+    // logits[r, :] += bias, row-parallel, SIMD.
+    private static unsafe void AddBiasRowsFloat(float[] logits, float[] bias, int n, int vocab)
+    {
+        int chunks = RowChunks(n, vocab);
+        int rowsPerChunk = (n + chunks - 1) / chunks;
+        void Chunk(int c)
+        {
+            int start = c * rowsPerChunk, end = Math.Min(start + rowsPerChunk, n);
+            fixed (float* pl = logits)
+            fixed (float* pb = bias)
+            {
+                for (int r = start; r < end; r++)
+                {
+                    float* row = pl + (long)r * vocab;
+                    Simd.SimdKernels.VectorAddUnsafe(row, pb, row, vocab);
+                }
+            }
+        }
+        if (chunks == 1) Chunk(0);
+        else PersistentParallelExecutor.Instance.Execute(chunks, Chunk);
+    }
+
+    // result[v] = sum_r dLogits[r, v]. Parallel over column blocks: each worker owns a column range and adds the rows
+    // in row order, so every element is summed in the same order as the serial loop (bit-identical, deterministic).
+    private static unsafe void ColumnSumsFloat(float[] dLogits, float[] result, int n, int vocab)
+    {
+        int chunks = RowChunks(n, vocab) == 1 ? 1 : Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, vocab / 256));
+        int colsPerChunk = (vocab + chunks - 1) / chunks;
+        void Chunk(int c)
+        {
+            int start = c * colsPerChunk, len = Math.Min(start + colsPerChunk, vocab) - start;
+            if (len <= 0) return;
+            fixed (float* pd = dLogits)
+            fixed (float* pr = result)
+            {
+                float* acc = pr + start;
+                for (int r = 0; r < n; r++)
+                    Simd.SimdKernels.VectorAddUnsafe(acc, pd + (long)r * vocab + start, acc, len);
+            }
+        }
+        if (chunks == 1) Chunk(0);
+        else PersistentParallelExecutor.Instance.Execute(chunks, Chunk);
     }
 
     private static void SoftmaxMinusIndexGeneric<T>(
@@ -546,7 +672,11 @@ public partial class CpuEngine
         var result = new Tensor<T>(new[] { vocab });
         var dl = dLogits.GetDataArray()!;
         var res = result.GetDataArray()!;
-        if (typeof(T) == typeof(double))
+        if (typeof(T) == typeof(float))
+        {
+            ColumnSumsFloat((float[])(object)dl, (float[])(object)res, n, vocab);
+        }
+        else if (typeof(T) == typeof(double))
         {
             var d = (double[])(object)dl; var rr = (double[])(object)res;
             for (int r = 0; r < n; r++)
