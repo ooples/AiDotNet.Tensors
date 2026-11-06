@@ -471,7 +471,7 @@ public partial class CpuEngine
                 var dLogits = new Tensor<float>(data, new[] { n, vocab });
                 MatMulInto(dLogits, h, w);
                 CrossEntropyGradRowsFloat(data, biasData, ids, 0, n, vocab, scale, rowLoss);
-                dHidden = TensorMatMulTransposed(dLogits, w);
+                dHidden = DLogitsTimesWeightTransposed(data, w, n, d, vocab);
                 dWeight = PrefaultedTensor(d, vocab);
                 MatMulInto(dWeight, TensorTranspose(h), dLogits);
                 ColumnSumsFloat(data, dBias, n, vocab);
@@ -490,7 +490,7 @@ public partial class CpuEngine
                     var dLogits = new Tensor<float>(data, new[] { rows, vocab });
                     MatMulInto(dLogits, hc, w);
                     CrossEntropyGradRowsFloat(data, biasData, ids, start, rows, vocab, scale, rowLoss);
-                    var dhc = TensorMatMulTransposed(dLogits, w);
+                    var dhc = DLogitsTimesWeightTransposed(data, w, rows, d, vocab);
                     Array.Copy(dhc.GetDataArray()!, 0, dHiddenData, (long)start * d, (long)rows * d);
                     var dwc = PrefaultedTensor(d, vocab);
                     MatMulInto(dwc, TensorTranspose(hc), dLogits);
@@ -568,6 +568,97 @@ public partial class CpuEngine
                 for (int r = lo; r < hi; r++)
                     rowLoss[start + r] = Simd.SimdKernels.CrossEntropyGradRowUnsafe(
                         pl + (long)r * vocab, pb, vocab, ids[start + r], scale);
+            }
+        }
+        if (chunks == 1) Chunk(0);
+        else PersistentParallelExecutor.Instance.Execute(chunks, Chunk);
+    }
+
+    /// <summary>Smallest K slice of the split-K dHidden product.</summary>
+    internal const int FusedCeSplitKSlice = 1024;
+
+    /// <summary>Most K slices of the split-K dHidden product: a constant, so the plan never follows the thread count.</summary>
+    internal const int FusedCeSplitKMaxSlices = 48;
+
+    // Split-K partials of dLogits·Wᵀ and the per-slice transposed W panels, kept between steps like the dLogits workspace.
+    private static float[]? s_fusedCeSplitKWorkspace;
+    private static float[]? s_fusedCeSplitKPanels;
+
+    /// <summary>
+    /// dHidden[rows, d] = dLogits[rows, vocab] · W[d, vocab]ᵀ, split over the vocabulary.
+    /// </summary>
+    /// <remarks>
+    /// K (the vocabulary) is ~100-200x the output's sides. The packed transposed-B GEMM had a handful of output tiles
+    /// to share between the workers and ran 512 x 256 x 49152 at ~172 GFLOP/s (71-81 ms) on a 3990X, and splitting
+    /// the output rows instead re-streams all of W per row block. Split over K, each slice owns the whole (small)
+    /// output and every input element is read once: a slice transposes its columns of W into a contiguous
+    /// [slice, d] panel and runs the single-threaded untransposed GEMM into its own partial; the partials are summed
+    /// in slice order. The slice count comes from the shape alone, so the result does not depend on the thread count.
+    /// </remarks>
+    private static unsafe Tensor<float> DLogitsTimesWeightTransposed(float[] dLogits, Tensor<float> w, int rows, int d, int vocab)
+    {
+        var wData = w.IsContiguous ? w.GetDataArray()! : w.Contiguous().GetDataArray()!;
+        var result = new float[(long)rows * d];
+        int slices = Math.Min(FusedCeSplitKMaxSlices, vocab / FusedCeSplitKSlice);
+        if (slices < 2)
+        {
+            Helpers.BlasProvider.GemmEx(rows, d, vocab, dLogits, 0, vocab, false, wData, 0, vocab, true, result, 0, d);
+            return new Tensor<float>(result, new[] { rows, d });
+        }
+
+        long mn = (long)rows * d;
+        int kPer = (vocab + slices - 1) / slices;
+        kPer = (kPer + 7) & ~7;
+        slices = (vocab + kPer - 1) / kPer;
+        var partial = System.Threading.Interlocked.Exchange(ref s_fusedCeSplitKWorkspace, null);
+        if (partial is null || partial.LongLength != mn * slices) partial = new float[mn * slices];
+        long panelElems = (long)kPer * d;
+        var panels = System.Threading.Interlocked.Exchange(ref s_fusedCeSplitKPanels, null);
+        if (panels is null || panels.LongLength != panelElems * slices) panels = new float[panelElems * slices];
+        void Slice(int sl)
+        {
+            int k0 = sl * kPer, kl = Math.Min(kPer, vocab - k0);
+            fixed (float* pw = wData)
+            fixed (float* pp = panels)
+            {
+                // panel[kk, j] = W[j, k0 + kk]
+                float* panel = pp + sl * panelElems;
+                for (int j = 0; j < d; j++)
+                {
+                    float* src = pw + (long)j * vocab + k0;
+                    for (int kk = 0; kk < kl; kk++) panel[(long)kk * d + j] = src[kk];
+                }
+            }
+            BlasManaged.BlasManaged.Gemm<float>(
+                new ReadOnlySpan<float>(dLogits, k0, dLogits.Length - k0), vocab, false,
+                new ReadOnlySpan<float>(panels, (int)(sl * panelElems), (int)panelElems), d, false,
+                new Span<float>(partial, (int)(sl * mn), (int)mn), d,
+                rows, d, kl, new BlasManaged.BlasOptions<float> { BetaZero = true, NumThreads = -1 });
+        }
+        PersistentParallelExecutor.Instance.Execute(slices, Slice);
+        SumPartialsFloat(partial, result, slices, mn);
+        System.Threading.Volatile.Write(ref s_fusedCeSplitKWorkspace, partial);
+        System.Threading.Volatile.Write(ref s_fusedCeSplitKPanels, panels);
+        return new Tensor<float>(result, new[] { rows, d });
+    }
+
+    // result[i] = sum_s partial[s * mn + i], slices in order; parallel over contiguous index ranges.
+    private static unsafe void SumPartialsFloat(float[] partial, float[] result, int slices, long mn)
+    {
+        int chunks = (int)Math.Max(1, Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, mn / 4096));
+        long per = (mn + chunks - 1) / chunks;
+        per = (per + 7) & ~7L;
+        void Chunk(int c)
+        {
+            long start = c * per, len = Math.Min(per, mn - start);
+            if (len <= 0) return;
+            fixed (float* pp = partial)
+            fixed (float* pr = result)
+            {
+                float* dst = pr + start;
+                Buffer.MemoryCopy(pp + start, dst, len * sizeof(float), len * sizeof(float));
+                for (int sl = 1; sl < slices; sl++)
+                    Simd.SimdKernels.VectorAddUnsafe(dst, pp + sl * mn + start, dst, (int)len);
             }
         }
         if (chunks == 1) Chunk(0);
