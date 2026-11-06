@@ -329,7 +329,20 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         => CuBlasNative.cuMemPoolGetAttribute(pool, attribute, out ulong value) == CudaResult.Success ? (long)value : 0;
 
     private const int MaxPooledBufferElements = 16_777_216;
-    private const int MaxPooledBuffersPerSize = 4;
+    // BENCH ONLY (#2383): the per-bucket cap and allocation counters, read from the environment.
+    private static readonly int MaxPooledBuffersPerSize =
+        int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_POOL_PER_SIZE"), out int perSize) && perSize > 0 ? perSize : 4;
+    internal static long s_traceRentHits, s_traceRentMisses, s_traceAllocCalls, s_traceAllocTicks, s_traceAllocBytes;
+    private static readonly bool s_traceRegistered = RegisterPoolTrace();
+    private static bool RegisterPoolTrace()
+    {
+        if (Environment.GetEnvironmentVariable("AIDOTNET_CUDA_POOL_TRACE") == "1")
+            AppDomain.CurrentDomain.ProcessExit += (_, _) => Console.Error.WriteLine(
+                $"[pooltrace] perSize={MaxPooledBuffersPerSize} rentHits={s_traceRentHits} rentMisses={s_traceRentMisses} "
+                + $"allocCalls={s_traceAllocCalls} allocMs={s_traceAllocTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} "
+                + $"allocMB={s_traceAllocBytes / 1048576.0:F1} poolRejects={GpuBufferPoolTrace.Rejects}");
+        return true;
+    }
     private readonly GpuBufferPool<CudaGpuBuffer> _bufferPool =
         new GpuBufferPool<CudaGpuBuffer>(MaxPooledBuffersPerSize, MaxPooledBufferElements);
 
@@ -364,7 +377,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private CudaGpuBuffer? TryRentAsyncBuffer(int size)
     {
         if (_backendStreamCaptureActive || _mainStream == IntPtr.Zero) return null;
-        return _bufferPool.TryRent(size, AsyncPoolAffinity, out var pooled) ? pooled : null;
+        bool hit = _bufferPool.TryRent(size, AsyncPoolAffinity, out var pooled);
+        System.Threading.Interlocked.Increment(ref hit ? ref s_traceRentHits : ref s_traceRentMisses);
+        return hit ? pooled : null;
     }
     // Event-based deferred buffer free (#555 / #226). A buffer evicted mid-step may still
     // be referenced by an in-flight async kernel; returning it to the pool (for reuse OR a
@@ -2185,7 +2200,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     // cuMemFreeAsync reclamations complete) and retry once before surfacing the error.
     private IntPtr AllocDeviceMemoryAsync(ulong byteSize)
     {
+        long traceStart = System.Diagnostics.Stopwatch.GetTimestamp();
         var r = CuBlasNative.cuMemAllocAsync(out IntPtr p, byteSize, _mainStream);
+        System.Threading.Interlocked.Add(ref s_traceAllocTicks, System.Diagnostics.Stopwatch.GetTimestamp() - traceStart);
+        System.Threading.Interlocked.Increment(ref s_traceAllocCalls);
+        System.Threading.Interlocked.Add(ref s_traceAllocBytes, (long)byteSize);
         if (r != CudaResult.Success && IsStreamCapturing())
         {
             // #1650/#638 capture: during stream capture cuCtxSynchronize / cuMemPoolTrimTo are ILLEGAL

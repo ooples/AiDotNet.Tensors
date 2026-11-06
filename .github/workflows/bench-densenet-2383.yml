@@ -113,7 +113,10 @@ jobs:
         Select-String -Path $props -Pattern 'AiDotNet\.(Tensors|Native)' | ForEach-Object { $_.Line.Trim() }
 
     - name: Build the parity harness
-      run: dotnet build -c Release aidn/benchmarks/AiDotNet.PyTorchParity -v q -nologo
+      # Against this branch's Tensors source: it carries the env-tunable pool cap and the allocation counters.
+      run: >-
+        dotnet build -c Release aidn/benchmarks/AiDotNet.PyTorchParity -v q -nologo
+        -p:UseLocalTensors=true -p:LocalTensorsRoot=$env:GITHUB_WORKSPACE -p:GeneratePackageOnBuild=false
 
     - name: DenseNet-121, three launches
       env:
@@ -130,22 +133,25 @@ jobs:
           "launch $i exit $LASTEXITCODE" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
         }
 
-    # The host CPU sample put half of each predict in cuMemAllocAsync under DenseBlock's channel concatenation. A/B the
-    # stream-ordered allocator against the legacy one (with its host-side buffer reuse), three launches each.
-    - name: DenseNet-121, allocator A/B
+    # Async allocation measured 2x faster than the legacy allocator, so the remaining allocation cost is pool misses.
+    # The host-side reuse pool keeps at most 4 buffers per power-of-two bucket, and a predict returns DenseNet's 58
+    # concatenation outputs together, up to 12 of them in one bucket. Sweep the cap, with the allocation counters on.
+    - name: DenseNet-121, pool cap sweep
+      env:
+        AIDOTNET_CUDA_POOL_TRACE: '1'
       run: |
         $out = Join-Path $env:RUNNER_TEMP 'densenet'
-        foreach ($mode in '1', '0') {
-          foreach ($i in 1..3) {
-            $env:AIDOTNET_CUDA_ASYNC_ALLOC = $mode
+        foreach ($cap in '4', '64') {
+          foreach ($i in 1..2) {
+            $env:AIDOTNET_CUDA_POOL_PER_SIZE = $cap
             dotnet run -c Release --no-build --project aidn/benchmarks/AiDotNet.PyTorchParity -- `
               --device cuda --models densenet121 --epochs 1 --train-batches 20 --batch-size 32 `
               --inference-batches 1,8,16,32 --inference-iterations 20 --warmup-iterations 3 `
-              --output (Join-Path $out "alloc_${mode}_$i.json") 2>&1 | Out-File (Join-Path $out "alloc_${mode}_$i.log")
-            "async=$mode launch $i exit $LASTEXITCODE" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
+              --output (Join-Path $out "cap_${cap}_$i.json") 2>&1 | Out-File (Join-Path $out "cap_${cap}_$i.log")
+            $trace = Select-String -Path (Join-Path $out "cap_${cap}_$i.log") -Pattern '\[pooltrace\]' | Select-Object -Last 1
+            "cap=$cap launch $i exit $LASTEXITCODE $($trace.Line)" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
           }
         }
-        Remove-Item Env:AIDOTNET_CUDA_ASYNC_ALLOC
 
     - name: Upload results
       if: always()

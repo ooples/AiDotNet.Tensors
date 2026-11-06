@@ -39,6 +39,12 @@ internal readonly struct GpuBufferPoolAffinity : IEquatable<GpuBufferPoolAffinit
     public override int GetHashCode() => _value.GetHashCode();
 }
 
+// BENCH ONLY (#2383): buffers released because their bucket was full.
+internal static class GpuBufferPoolTrace
+{
+    internal static long Rejects;
+}
+
 internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class, IGpuBuffer, IPoolableGpuBuffer
 {
     private sealed class Bucket
@@ -217,6 +223,7 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
             {
                 Interlocked.Decrement(ref bucket.Count);
                 if (count <= _maxPerSize) Interlocked.Add(ref _pooledElements, -buffer.Capacity);
+                Interlocked.Increment(ref GpuBufferPoolTrace.Rejects);
                 _measurementParked.TryRemove(buffer, out _);
                 buffer.Release();
                 return;
