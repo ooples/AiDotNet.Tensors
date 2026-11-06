@@ -1,6 +1,7 @@
 name: Bench DenseNet-121 on CUDA (AiDotNet #2383, one-off)
 
-# Measures AiDotNet's DenseNet-121 on the GTX 1660 Ti the issue's evidence came from, against the published
+# Measures AiDotNet's DenseNet-121 on the RTX 3080 (sm86) and on the GTX 1660 Ti (sm75) the issue's evidence came from,
+# against the published
 # AiDotNet.Tensors 0.147.0. Runs only on pushes to this branch; the branch is deleted once the numbers are recorded.
 
 on:
@@ -25,7 +26,12 @@ env:
 
 jobs:
   densenet:
-    runs-on: [self-hosted, gpu, cuda, sm75]
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [sm86, sm75]
+    name: densenet-${{ matrix.arch }}
+    runs-on: [self-hosted, gpu, cuda, '${{ matrix.arch }}']
     timeout-minutes: 90
     defaults:
       run:
@@ -101,6 +107,6 @@ jobs:
       if: always()
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       with:
-        name: densenet-2383-cuda
+        name: densenet-2383-cuda-${{ matrix.arch }}
         path: ${{ runner.temp }}/densenet/**
         retention-days: 5
