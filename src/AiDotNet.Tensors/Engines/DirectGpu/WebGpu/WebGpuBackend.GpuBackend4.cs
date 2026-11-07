@@ -885,8 +885,12 @@ public sealed partial class WebGpuBackend : IGatedDeltaNetBackwardBackend
         int total = (int)totalLong;
         int qkCount = checked(batch * seqLen * modelDim);
         int gateCount = checked(batch * seqLen * numHeads);
-        Fill(dQ, 0f, qkCount);
-        Fill(dK, 0f, qkCount);
+        bool det = GpuDeterminism.IsActive;
+        if (!det)
+        {
+            Fill(dQ, 0f, qkCount);
+            Fill(dK, 0f, qkCount);
+        }
         using var traj = AllocateBuffer((int)trajLenLong);
         var pc = new[] { batch, seqLen, modelDim, numHeads, headDim };
         DispatchRecurrence("gdn_recompute", WebGpuRecurrenceKernels.GatedDeltaRecompute, total,
@@ -896,6 +900,18 @@ public sealed partial class WebGpuBackend : IGatedDeltaNetBackwardBackend
         Copy(alpha, 0, abTraj, 0, gateCount);
         Copy(beta, 0, abTraj, gateCount, gateCount);
         Copy(traj, 0, abTraj, 2 * gateCount, (int)trajLenLong);
+        if (det)
+        {
+            // Fixed-order reduction instead of CAS accumulation (see GatedDeltaBackwardDeterministic); every gradient
+            // element is written, so nothing needs clearing first.
+            using var partials = AllocateBuffer(checked(2 * qkCount));
+            DispatchRecurrence("gdn_dq", WebGpuRecurrenceKernels.GatedDeltaDq, qkCount, new[] { dOut, traj, dQ }, pc);
+            DispatchRecurrence("gdn_backward_det", WebGpuRecurrenceKernels.GatedDeltaBackwardDeterministic, total,
+                new[] { dOut, qk, v, abTraj, partials, dV }, pc);
+            DispatchRecurrence("gdn_reduce", WebGpuRecurrenceKernels.GatedDeltaReduce, qkCount,
+                new[] { abTraj, partials, dK, dAlpha, dBeta }, pc);
+            return;
+        }
         using var dAb = AllocateBuffer(checked(2 * gateCount));
         Fill(dAb, 0f, 2 * gateCount);
         DispatchRecurrence("gdn_backward", WebGpuRecurrenceKernels.GatedDeltaBackward, total,
