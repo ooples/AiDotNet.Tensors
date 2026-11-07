@@ -13950,6 +13950,7 @@ KERNEL VARIANTS (A/B testing):
                 throw new ArgumentException($"modelDim ({modelDim}) must equal numHeads * headDim ({numHeads * headDim}).");
             if (headDim > Kernels.GatedDeltaNetKernels.MaxHeadDim)
                 throw new InvalidOperationException($"GatedDeltaNet headDim ({headDim}) exceeds max ({Kernels.GatedDeltaNetKernels.MaxHeadDim}).");
+            GatedDeltaNetBackwardResolver.ValidateBuffers(dOut, q, k, v, alpha, beta, dQ, dK, dV, dAlpha, dBeta, batch, seqLen, modelDim, numHeads);
             if (!_kernelCache.TryGetValue("gated_delta_scan_recompute", out var recompute) ||
                 !_kernelCache.TryGetValue("gated_delta_scan_backward", out var backward))
                 throw new GpuCapabilityUnavailableException("OpenCL kernel not found: gated_delta_scan_recompute / gated_delta_scan_backward");
@@ -13965,7 +13966,10 @@ KERNEL VARIANTS (A/B testing):
             int trajLen = (int)trajLenLong;
             using var trajBuf = AllocateBuffer(trajLen);
             int total = (int)totalLong;
-            int localSize = CalculateOptimalWorkGroupSize1D(total);
+            // One size launches both kernels, so it must fit the smaller compiled limit: their private state arrays
+            // can push CL_KERNEL_WORK_GROUP_SIZE below the device maximum.
+            int localSize = ClampLocalSizeForKernel(backward,
+                ClampLocalSizeForKernel(recompute, CalculateOptimalWorkGroupSize1D(total), 0), 0);
             int globalSize = ((total + localSize - 1) / localSize) * localSize;
 
             recompute.SetArg(0u, ((DirectOpenClGpuBuffer)k).Buffer.Handle);
@@ -14699,6 +14703,7 @@ KERNEL VARIANTS (A/B testing):
         {
             if (_returnToPool is { } returnToPool && Interlocked.CompareExchange(ref _poolState, 2, 0) == 0)
             {
+                DeviceMemoryReclaim.OnDeviceFinalized((long)Size * sizeof(float), ReclaimEpoch);
                 var pooledBuffer = Buffer;
                 var memory = _memory.TransferToLease();
                 PendingFrees.Enqueue(() => returnToPool(Pooled(pooledBuffer, returnToPool, memory)));

@@ -1068,7 +1068,7 @@ public partial class DirectGpuTensorEngine
 
         try
         {
-            var gc = gradOutput.IsContiguous ? gradOutput : (Tensor<T>)gradOutput.Contiguous();
+            var gc = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
             using var bufGrad = GetOrAllocateBuffer(backend, gc);
             using var padRe = AllocateTransientScratch(backend, batch * nFft);
             using var padIm = AllocateTransientScratch(backend, batch * nFft);
@@ -1077,35 +1077,31 @@ public partial class DirectGpuTensorEngine
             using var oneRe = AllocateTransientScratch(backend, batch * numFreqs, fullyWritten: true);
             using var oneIm = AllocateTransientScratch(backend, batch * numFreqs, fullyWritten: true);
             using var interleaved = AllocateTransientScratch(backend, batch * numFreqs * 2, fullyWritten: true);
-            var scaled = AllocateFullyWrittenOutputBuffer(backend, batch * numFreqs * 2);
-            try
-            {
-                // Zero-pad the real gradient to nFft; the imaginary part is zero throughout.
-                backend.Fill(padRe.Buffer, 0f, batch * nFft);
-                backend.Fill(padIm.Buffer, 0f, batch * nFft);
-                backend.CopyRows(bufGrad.Buffer, padRe.Buffer, outputLength, nFft, batch,
-                    System.Math.Min(outputLength, nFft));
+            using var scaled = AllocateFullyWrittenOutputBuffer(backend, batch * numFreqs * 2);
+            // Zero-pad the real gradient to nFft; the imaginary part is zero throughout.
+            backend.Fill(padRe.Buffer, 0f, batch * nFft);
+            backend.Fill(padIm.Buffer, 0f, batch * nFft);
+            backend.CopyRows(bufGrad.Buffer, padRe.Buffer, outputLength, nFft, batch,
+                System.Math.Min(outputLength, nFft));
 
-                // FORWARD transform (inverse: false) applies no 1/nFft, so this is the unnormalized sum
-                // the adjoint needs — the mirror of RfftAdjointGpu, which undoes the inverse's 1/nFft.
-                backend.BatchedFFT(padRe.Buffer, padIm.Buffer, fftRe.Buffer, fftIm.Buffer, batch, nFft, inverse: false);
+            // FORWARD transform (inverse: false) applies no 1/nFft, so this is the unnormalized sum
+            // the adjoint needs — the mirror of RfftAdjointGpu, which undoes the inverse's 1/nFft.
+            backend.BatchedFFT(padRe.Buffer, padIm.Buffer, fftRe.Buffer, fftIm.Buffer, batch, nFft, inverse: false);
 
-                // Keep the one-sided bins.
-                backend.CopyRows(fftRe.Buffer, oneRe.Buffer, nFft, numFreqs, batch, numFreqs);
-                backend.CopyRows(fftIm.Buffer, oneIm.Buffer, nFft, numFreqs, batch, numFreqs);
-                backend.InterleaveComplex(oneRe.Buffer, oneIm.Buffer, interleaved.Buffer, batch * numFreqs);
+            // Keep the one-sided bins.
+            backend.CopyRows(fftRe.Buffer, oneRe.Buffer, nFft, numFreqs, batch, numFreqs);
+            backend.CopyRows(fftIm.Buffer, oneIm.Buffer, nFft, numFreqs, batch, numFreqs);
+            backend.InterleaveComplex(oneRe.Buffer, oneIm.Buffer, interleaved.Buffer, batch * numFreqs);
 
-                // c_k/nFft per bin, with the Nyquist imaginary slot zeroed (1-row constant broadcast across batch).
-                int weightCount = batch * numFreqs * 2;
-                using var weights = CachedSpectrumConstant(backend, SpectrumConstant.IrfftAdjointWeights, 1, numFreqs, nFft);
-                backend.BroadcastMultiplyLastAxis(interleaved.Buffer, weights.Buffer, scaled.Buffer, batch, numFreqs * 2);
-                backend.Synchronize();
+            // c_k/nFft per bin, with the Nyquist imaginary slot zeroed (1-row constant broadcast across batch).
+            int weightCount = batch * numFreqs * 2;
+            using var weights = CachedSpectrumConstant(backend, SpectrumConstant.IrfftAdjointWeights, 1, numFreqs, nFft);
+            backend.BroadcastMultiplyLastAxis(interleaved.Buffer, weights.Buffer, scaled.Buffer, batch, numFreqs * 2);
+            backend.Synchronize();
 
-                var result = DeferTensorResult<T>(backend, scaled.Buffer, weightCount, (int[])inputShape.Clone());
-                scaled.RelinquishOwnership();
-                return result;
-            }
-            finally { scaled.Dispose(); }
+            var result = DeferTensorResult<T>(backend, scaled.Buffer, weightCount, (int[])inputShape.Clone());
+            scaled.RelinquishOwnership();
+            return result;
         }
         catch (Exception)
         {

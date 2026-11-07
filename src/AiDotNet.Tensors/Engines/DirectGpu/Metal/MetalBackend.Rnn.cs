@@ -92,6 +92,7 @@ public partial class MetalBackend : IGatedDeltaNetBackwardBackend
             throw new ArgumentOutOfRangeException(nameof(batch), "GatedDeltaNet dimensions must be positive.");
         if (modelDim != numHeads * headDim || headDim > 256)
             throw new ArgumentException($"Invalid GatedDeltaNet head layout (modelDim={modelDim}, numHeads={numHeads}, headDim={headDim}).");
+        GatedDeltaNetBackwardResolver.ValidateBuffers(dOut, q, k, v, alpha, beta, dQ, dK, dV, dAlpha, dBeta, batch, seqLen, modelDim, numHeads);
         int hh = headDim * headDim;
         long totalLong = checked((long)batch * numHeads * headDim);
         long trajLenLong = checked((long)batch * numHeads * seqLen * hh);

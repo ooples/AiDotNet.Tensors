@@ -7,8 +7,10 @@ using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
-public sealed partial class CudaBackend : IAnnBackend
+public sealed partial class CudaBackend : IAnnBackend, IChargesDeviceMemoryReclaim
 {
+    bool IChargesDeviceMemoryReclaim.ChargesDeviceMemoryReclaim => true;
+
     private IntPtr ResolveAnnKernel(string name)
     {
         if (_annModule == IntPtr.Zero)

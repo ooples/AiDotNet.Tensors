@@ -18208,6 +18208,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (headDim > Kernels.CudaGatedDeltaNetKernels.MaxHeadDim)
             throw new InvalidOperationException(
                 $"GatedDeltaNet headDim ({headDim}) exceeds max ({Kernels.CudaGatedDeltaNetKernels.MaxHeadDim}).");
+        GatedDeltaNetBackwardResolver.ValidateBuffers(dOut, q, k, v, alpha, beta, dQ, dK, dV, dAlpha, dBeta, batch, seqLen, modelDim, numHeads);
         if (!_kernelCache.TryGetValue("gated_delta_scan_recompute", out var recompute) ||
             !_kernelCache.TryGetValue("gated_delta_scan_backward", out var backward))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: gated_delta_scan_recompute / gated_delta_scan_backward");

@@ -165,6 +165,22 @@ public sealed class DeviceMemoryReclaimTests
         DeviceMemoryReclaim.OnDeviceRelease(DeviceMemoryReclaim.CollectNowAfterDeviceBytes, trigger);
         Assert.True(DeviceMemoryReclaim.CollectIfDueAtStepBoundary());
     }
+
+    [Fact]
+    public void FinalizedBuffers_AreCreditedAgainstTheGen2Count()
+    {
+        // Young collections that recover every abandoned buffer (their finalizers return them) leave nothing
+        // unreleased, so the cumulative Gen-2 count must not keep growing toward a forced Gen-2 collection.
+        DeviceMemoryReclaim.ResetCountsForTests();
+        for (int step = 0; step < 3; step++)
+        {
+            long epoch = DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectAfterDeviceBytes);
+            Assert.True(DeviceMemoryReclaim.CollectIfDueAtStepBoundary());
+            DeviceMemoryReclaim.OnDeviceFinalized(DeviceMemoryReclaim.CollectAfterDeviceBytes, epoch);
+        }
+        Assert.Equal(0, DeviceMemoryReclaim.BytesSinceGen2CollectionForTests);
+    }
+
     [Fact]
     public void GradientTapeDispose_CollectsStepIntermediatesAfterEntriesReset()
     {
