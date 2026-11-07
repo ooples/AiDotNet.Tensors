@@ -6177,63 +6177,58 @@ public partial class DirectGpuTensorEngine
             positionBits[r] = AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx.PtxCompat.Int32BitsToSingle((r % chunk) * vocab + id);
         }
 
-        var h = hidden.IsContiguous ? hidden : (Tensor<T>)hidden.Contiguous();
-        var w = weight.IsContiguous ? weight : (Tensor<T>)weight.Contiguous();
-        var b = bias.IsContiguous ? bias : (Tensor<T>)bias.Contiguous();
-        var g = gradOutput.IsContiguous ? gradOutput : (Tensor<T>)gradOutput.Contiguous();
+        var h = hidden.IsContiguous ? hidden : hidden.Contiguous();
+        var w = weight.IsContiguous ? weight : weight.Contiguous();
+        var b = bias.IsContiguous ? bias : bias.Contiguous();
+        var g = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
         using var hB = GetOrAllocateBuffer(backend, h);
         using var wB = GetOrAllocateBuffer(backend, w);
         using var bB = GetOrAllocateBuffer(backend, b);
         using var gB = GetOrAllocateBuffer(backend, g);
         using var positions = new OwnedBuffer(backend.AllocateBuffer(positionBits), ownsBuffer: true);
-        var dHidden = AllocateOutputBuffer(backend, n * d);
-        var dWeight = AllocateOutputBuffer(backend, d * vocab);
-        var dBias = AllocateOutputBuffer(backend, vocab);
-        try
+        // using: an allocation that throws (an LM-sized head under memory pressure) still disposes the buffers before
+        // it; RelinquishOwnership hands each one to its result.
+        using var dHidden = AllocateOutputBuffer(backend, n * d);
+        using var dWeight = AllocateOutputBuffer(backend, d * vocab);
+        using var dBias = AllocateOutputBuffer(backend, vocab);
+        // Stream-ordered scratch: still read by queued kernels when this returns.
+        using var logits = AllocateStreamOrderedScratch(backend, chunk * vocab);
+        using var work = AllocateStreamOrderedScratch(backend, chunk * vocab);
+        using var hChunk = AllocateStreamOrderedScratch(backend, chunk * d);
+        using var dhChunk = AllocateStreamOrderedScratch(backend, chunk * d);
+        using var ones = AllocateStreamOrderedScratch(backend, chunk);
+        using var minusOnes = AllocateStreamOrderedScratch(backend, chunk);
+        using var chunkPositions = AllocateStreamOrderedScratch(backend, chunk);
+        backend.Fill(ones, 1f, chunk);
+        backend.Fill(minusOnes, -1f, chunk);
+        for (int r0 = 0; r0 < n; r0 += chunk)
         {
-            // Stream-ordered scratch: still read by queued kernels when this returns.
-            using var logits = AllocateStreamOrderedScratch(backend, chunk * vocab);
-            using var work = AllocateStreamOrderedScratch(backend, chunk * vocab);
-            using var hChunk = AllocateStreamOrderedScratch(backend, chunk * d);
-            using var dhChunk = AllocateStreamOrderedScratch(backend, chunk * d);
-            using var ones = AllocateStreamOrderedScratch(backend, chunk);
-            using var minusOnes = AllocateStreamOrderedScratch(backend, chunk);
-            using var chunkPositions = AllocateStreamOrderedScratch(backend, chunk);
-            backend.Fill(ones, 1f, chunk);
-            backend.Fill(minusOnes, -1f, chunk);
-            for (int r0 = 0; r0 < n; r0 += chunk)
-            {
-                int c = Math.Min(chunk, n - r0), cv = c * vocab;
-                float beta = r0 == 0 ? 0f : 1f;
-                backend.Copy(hB.Buffer, r0 * d, hChunk, 0, c * d);
-                backend.Copy(positions.Buffer, r0, chunkPositions, 0, c);
-                backend.Gemm(hChunk, wB.Buffer, logits, c, vocab, d);                // logits = h_c·W
-                backend.BiasAdd(logits, bB.Buffer, work, c, vocab);                  // + b
-                backend.Softmax(work, logits, c, vocab);                             // probabilities
-                backend.ScatterAdd(minusOnes, chunkPositions, logits, c, cv);        // - one-hot
-                backend.Scale(logits, logits, 1f / n, cv);                           // / N
-                backend.BroadcastMultiplyLastAxis(logits, gB.Buffer, work, cv, 1);   // * gradOutput[0] = dLogits_c
-                backend.MatMulTransposed(work, wB.Buffer, dhChunk, c, d, vocab);     // dHidden_c = dLogits_c·Wᵀ
-                backend.Copy(dhChunk, 0, dHidden.Buffer, r0 * d, c * d);
-                transposedA.MatMulTransposedA(hChunk, work, dWeight.Buffer, d, vocab, c, 1f, beta); // dW += h_cᵀ·dL_c
-                backend.Gemm(ones, work, dBias.Buffer, 1, vocab, c, 1f, beta);       // dB += 1ᵀ·dL_c
-            }
-            LastFusedCeBackwardChunks = (n + chunk - 1) / chunk;
-            gradHidden = DeferTensorResult<T>(backend, dHidden.Buffer, n * d, new[] { n, d });
-            dHidden.RelinquishOwnership();
-            gradWeight = DeferTensorResult<T>(backend, dWeight.Buffer, d * vocab, new[] { d, vocab });
-            dWeight.RelinquishOwnership();
-            gradBias = DeferTensorResult<T>(backend, dBias.Buffer, vocab, new[] { vocab });
-            dBias.RelinquishOwnership();
-            return true;
+            int c = Math.Min(chunk, n - r0), cv = c * vocab;
+            float beta = r0 == 0 ? 0f : 1f;
+            backend.Copy(hB.Buffer, r0 * d, hChunk, 0, c * d);
+            backend.Copy(positions.Buffer, r0, chunkPositions, 0, c);
+            backend.Gemm(hChunk, wB.Buffer, logits, c, vocab, d);                // logits = h_c·W
+            backend.BiasAdd(logits, bB.Buffer, work, c, vocab);                  // + b
+            backend.Softmax(work, logits, c, vocab);                             // probabilities
+            backend.ScatterAdd(minusOnes, chunkPositions, logits, c, cv);        // - one-hot
+            backend.Scale(logits, logits, 1f / n, cv);                           // / N
+            backend.BroadcastMultiplyLastAxis(logits, gB.Buffer, work, cv, 1);   // * gradOutput[0] = dLogits_c
+            backend.MatMulTransposed(work, wB.Buffer, dhChunk, c, d, vocab);     // dHidden_c = dLogits_c·Wᵀ
+            backend.Copy(dhChunk, 0, dHidden.Buffer, r0 * d, c * d);
+            transposedA.MatMulTransposedA(hChunk, work, dWeight.Buffer, d, vocab, c, 1f, beta); // dW += h_cᵀ·dL_c
+            backend.Gemm(ones, work, dBias.Buffer, 1, vocab, c, 1f, beta);       // dB += 1ᵀ·dL_c
         }
-        finally
-        {
-            dHidden.Dispose();
-            dWeight.Dispose();
-            dBias.Dispose();
-        }
+        RecordFusedCeBackwardChunks((n + chunk - 1) / chunk);
+        gradHidden = DeferTensorResult<T>(backend, dHidden.Buffer, n * d, new[] { n, d });
+        dHidden.RelinquishOwnership();
+        gradWeight = DeferTensorResult<T>(backend, dWeight.Buffer, d * vocab, new[] { d, vocab });
+        dWeight.RelinquishOwnership();
+        gradBias = DeferTensorResult<T>(backend, dBias.Buffer, vocab, new[] { vocab });
+        dBias.RelinquishOwnership();
+        return true;
     }
+
+    private static void RecordFusedCeBackwardChunks(int chunks) => LastFusedCeBackwardChunks = chunks;
 
     /// <summary>
     /// <c>factor * scalar[0] * tensor</c> — or, with a null <paramref name="tensor"/>, <c>factor * scalar[0]</c> filled

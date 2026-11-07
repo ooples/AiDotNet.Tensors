@@ -237,7 +237,15 @@ public class GpuTapeGradientParityTests : IDisposable
         AssertStaysOnDeviceUnderTape("TensorReciprocal", static (e, t) => e.TensorReciprocal(t),
             static (x, y) =>
             {
-                for (int i = 0; i < x.Length; i++) Assert.Equal(1f / x[i], y[i], 6);
+                // Relative, at PyTorch's float32 rtol (1.3e-6): a device reciprocal is within an ulp of 1/x, and an
+                // absolute 6-decimal check demands more than float32 holds once |1/x| passes ~8 (CUDA: -66.506149 vs
+                // -66.506157, one ulp apart).
+                for (int i = 0; i < x.Length; i++)
+                {
+                    float expected = 1f / x[i];
+                    Assert.True(Math.Abs(expected - y[i]) <= 1.3e-6 * Math.Abs(expected),
+                        $"1/x[{i}]: expected {expected:R}, device {y[i]:R}");
+                }
             });
 
     [SkippableFact]
