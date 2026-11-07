@@ -270,16 +270,26 @@ jobs:
       # A hang dump is the whole test host (several GB), too big to download and analyse in practice; Blame names only
       # the test that was running, not the thread that is blocked. Print every managed thread's stack here instead.
       run: |
-        $dumps = @(Get-ChildItem "${{ runner.temp }}/trx" -Recurse -Filter *.dmp -ErrorAction SilentlyContinue)
-        if ($dumps.Count -eq 0) { Write-Output "No crash or hang dump."; exit 0 }
+        # A directory the search cannot read is reported, not taken for "no dump"; any dumps found are still analysed.
+        $dumps = @(Get-ChildItem "${{ runner.temp }}/trx" -Recurse -Filter *.dmp -ErrorAction SilentlyContinue -ErrorVariable searchErrors)
+        foreach ($searchError in $searchErrors) { Write-Output "::warning::Dump search: $($searchError.Exception.Message)" }
+        if ($dumps.Count -eq 0) {
+          if ($searchErrors.Count -gt 0) { Write-Output "::error::No dump found, but the search was incomplete."; exit 1 }
+          Write-Output "No crash or hang dump."; exit 0
+        }
         $tools = "${{ runner.temp }}/dotnet-dump"
         dotnet tool install dotnet-dump --tool-path $tools | Out-Null
-        if ($LASTEXITCODE -ne 0) { Write-Output "::warning::Could not install dotnet-dump."; exit 0 }
+        if ($LASTEXITCODE -ne 0) { Write-Output "::error::Could not install dotnet-dump; $($dumps.Count) dump(s) not analysed."; exit 1 }
+        # Every dump is analysed; one that fails is named and fails the step after the rest have printed.
+        $failed = @()
         foreach ($dump in $dumps) {
           Write-Output "::group::$($dump.Name)"
           & "$tools/dotnet-dump" analyze $dump.FullName -c "clrthreads" -c "clrstack -all" -c "exit"
+          $code = $LASTEXITCODE
           Write-Output "::endgroup::"
+          if ($code -ne 0) { $failed += $dump.Name; Write-Output "::error::dotnet-dump analyze failed ($code) on $($dump.Name)." }
         }
+        if ($failed.Count -gt 0) { exit 1 }
 
     - name: Fail on unexplained skips
       if: always()
