@@ -8,8 +8,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 // batch kernels. The Dawn parity suites run this source against the CPU references.
 public sealed partial class WebGpuBackend : ITorchParityElementwiseBackend
 {
+    // PublicationOnly: a failed translation (a regex timeout during a long process-wide pause) is not cached, so the
+    // next request translates again instead of failing until the process restarts. Translation is pure, so a race
+    // that runs it twice only costs the duplicate work.
     private static readonly Lazy<Dictionary<string, string>> TorchParityModules =
-        new(() => CudaDialectToWgsl.Translate(TorchParityF32Kernels.GetSource()));
+        new(() => CudaDialectToWgsl.Translate(TorchParityF32Kernels.GetSource()), System.Threading.LazyThreadSafetyMode.PublicationOnly);
 
 
     void ITorchParityElementwiseBackend.TorchParityUnary(TorchParityUnaryOp op, IGpuBuffer input, IGpuBuffer output, int n, float p0, float p1)
