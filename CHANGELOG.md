@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.148.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.148.0...v0.148.1) (2026-11-07)
+
+
+### Bug Fixes
+
+* **autodiff:** give every differentiable op its gradient, and differentiate every GridSample mode ([#1684](https://github.com/ooples/AiDotNet.Tensors/issues/1684)) ([6526ce5](https://github.com/ooples/AiDotNet.Tensors/commit/6526ce5de1e0c3a813d4c8c617fa2b122e5073c0))
+
+
+### Performance
+
+* **cpu:** arena idle byte budget, vectorised row broadcast, ToArray without zero-fill ([#1687](https://github.com/ooples/AiDotNet.Tensors/issues/1687)) ([fe99c62](https://github.com/ooples/AiDotNet.Tensors/commit/fe99c62f10dfd1bb8cf4e3eff85e5971871fad7f))
+* **gpu:** keep GatedDeltaNetScanForward and BPTT backward on-device across all 6 GPU backends ([#1685](https://github.com/ooples/AiDotNet.Tensors/issues/1685)) ([510bf01](https://github.com/ooples/AiDotNet.Tensors/commit/510bf015b063d6e1b953860b7c61b72c29d93b41))
+
 ## [0.148.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.147.0...v0.148.0) (2026-11-06)
 
 
