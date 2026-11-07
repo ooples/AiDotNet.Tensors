@@ -118,11 +118,8 @@ public sealed class CudaKernelLookupIntegrityTests
         // Only sources CudaBackend actually compiles define anything. CudaOctonionKernels defined four kernels the
         // backend looked up, but nothing compiled it, so a "defined in some source" check passed while every one of
         // those ops threw kernel-not-found on CUDA.
-        // Anchored on the literal ".Get" (the class name is read behind it) so the scan does not start a match at every
-        // word of 3 MB of backend source. The timeout is wall time on trusted repository input: it must also absorb the
-        // blocking collections and CPU load of tests running beside this one (5 s timed out on the CUDA runner).
         var compiledClasses = new HashSet<string>(
-            Regex.Matches(backend, @"(?<=\b(\w+))\.Get\w*Source\w*\s*\(", RegexOptions.None, TimeSpan.FromSeconds(60)).Select(m => m.Groups[1].Value),
+            Regex.Matches(backend, @"\b(\w+)\.Get\w*Source\w*\s*\(", RegexOptions.None, TimeSpan.FromSeconds(5)).Select(m => m.Groups[1].Value),
             StringComparer.Ordinal);
         Assert.Contains("CudaOctonionKernels", compiledClasses);
         foreach (var file in kernelSources)
