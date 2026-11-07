@@ -1,3 +1,4 @@
+using System.Linq;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -904,6 +905,37 @@ public class GpuTapeGradientParityTests : IDisposable
     public void FusedLinearCrossEntropy_dense_hidden_gradients_match_cpu() =>
         AssertGradientParity("FusedLinearCE(dense, hidden)", Rand([6, 10], seed: 487),
             static (e, t) => e.FusedLinearCrossEntropyWithLogits(t, HeadWeight, HeadBias, SoftTargets()));
+
+    // An LM-sized vocabulary: the index backward runs in row chunks (672 rows at V = 49152), so 1500 rows take three
+    // chunks and the weight and bias gradients accumulate across them (GEMM beta = 1 after the first chunk).
+    private const int ChunkRows = 1500, ChunkDim = 16, ChunkVocab = 49152;
+    private static readonly Tensor<float> ChunkHidden = Rand([ChunkRows, ChunkDim], seed: 491);
+    private static readonly Tensor<float> ChunkWeight = Rand([ChunkDim, ChunkVocab], seed: 499, lo: -0.3, hi: 0.3);
+    private static readonly Tensor<float> ChunkBias = Rand([ChunkVocab], seed: 503, lo: -0.1, hi: 0.1);
+    private static readonly Tensor<int> ChunkTargetIds = new(
+        Enumerable.Range(0, ChunkRows).Select(r => (r * 7919) % ChunkVocab).ToArray(), new[] { ChunkRows });
+
+    private void AssertChunkedParity(string opName, Tensor<float> x, Func<IEngine, Tensor<float>, Tensor<float>> op)
+    {
+        DirectGpuTensorEngine.LastFusedCeBackwardChunks = 0;
+        AssertGradientParity(opName, x, op);
+        Assert.Equal(3, DirectGpuTensorEngine.LastFusedCeBackwardChunks);
+    }
+
+    [SkippableFact]
+    public void FusedLinearCrossEntropy_index_chunked_hidden_gradients_match_cpu() =>
+        AssertChunkedParity("FusedLinearCE(ids, hidden, 3 chunks)", ChunkHidden,
+            static (e, t) => e.FusedLinearCrossEntropyWithLogits(t, ChunkWeight, ChunkBias, ChunkTargetIds));
+
+    [SkippableFact]
+    public void FusedLinearCrossEntropy_index_chunked_weight_gradients_match_cpu() =>
+        AssertChunkedParity("FusedLinearCE(ids, weight, 3 chunks)", ChunkWeight,
+            static (e, t) => e.FusedLinearCrossEntropyWithLogits(ChunkHidden, t, ChunkBias, ChunkTargetIds));
+
+    [SkippableFact]
+    public void FusedLinearCrossEntropy_index_chunked_bias_gradients_match_cpu() =>
+        AssertChunkedParity("FusedLinearCE(ids, bias, 3 chunks)", ChunkBias,
+            static (e, t) => e.FusedLinearCrossEntropyWithLogits(ChunkHidden, ChunkWeight, t, ChunkTargetIds));
 
     [SkippableFact]
     public void FusedLinearCrossEntropy_stays_on_the_device_while_a_tape_records() =>
