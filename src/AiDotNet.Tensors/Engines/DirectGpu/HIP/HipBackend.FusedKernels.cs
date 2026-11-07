@@ -683,10 +683,21 @@ public sealed partial class HipBackend : IGatedDeltaNetBackwardBackend
                 $"GatedDeltaNet trajectory buffer size ({trajLenLong}) exceeds int.MaxValue.");
         int trajLen = (int)trajLenLong;
         using var trajBuf = AllocateBuffer(trajLen);
-        Fill(dQ, 0f, batch * seqLen * modelDim);
-        Fill(dK, 0f, batch * seqLen * modelDim);
-        Fill(dAlpha, 0f, batch * seqLen * numHeads);
-        Fill(dBeta, 0f, batch * seqLen * numHeads);
+        // Deterministic mode replaces the atomic accumulation with per-row partials summed in a fixed order (see
+        // gated_delta_scan_backward); dq and reduce write every element, so nothing needs clearing first.
+        bool det = GpuDeterminism.IsActive;
+        IntPtr dqKernel = IntPtr.Zero, reduceKernel = IntPtr.Zero;
+        if (det && (!_kernelCache.TryGetValue("gated_delta_scan_dq", out dqKernel)
+                    || !_kernelCache.TryGetValue("gated_delta_scan_reduce", out reduceKernel)))
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: gated_delta_scan_dq / gated_delta_scan_reduce");
+        int n = batch * seqLen * modelDim;
+        if (!det)
+        {
+            Fill(dQ, 0f, n);
+            Fill(dK, 0f, n);
+            Fill(dAlpha, 0f, batch * seqLen * numHeads);
+            Fill(dBeta, 0f, batch * seqLen * numHeads);
+        }
         uint total = (uint)(batch * numHeads * headDim);
         uint grid = (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize;
 
@@ -698,11 +709,33 @@ public sealed partial class HipBackend : IGatedDeltaNetBackwardBackend
 
         IntPtr pdo = dOut.Handle, pq = q.Handle;
         IntPtr pdq = dQ.Handle, pdk = dK.Handle, pdv = dV.Handle, pda = dAlpha.Handle, pdb = dBeta.Handle;
-        void** ba = stackalloc void*[17];
+        uint nGrid = ((uint)n + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize;
+        using var partials = det ? AllocateBuffer(checked(2 * n)) : null;
+        IntPtr pp = partials?.Handle ?? IntPtr.Zero;
+        if (det)
+        {
+            void** qa = stackalloc void*[8];
+            qa[0] = &pdo; qa[1] = &ptr; qa[2] = &pdq;
+            qa[3] = &batch; qa[4] = &seqLen; qa[5] = &modelDim; qa[6] = &numHeads; qa[7] = &headDim;
+            LaunchKernel(dqKernel, nGrid, (uint)DefaultBlockSize, qa);
+        }
+
+        IntPtr pslot = det ? pp : pdq;
+        int detFlag = det ? 1 : 0;
+        void** ba = stackalloc void*[18];
         ba[0] = &pdo; ba[1] = &pq; ba[2] = &pk; ba[3] = &pv; ba[4] = &pa; ba[5] = &pb; ba[6] = &ptr;
-        ba[7] = &pdq; ba[8] = &pdk; ba[9] = &pdv; ba[10] = &pda; ba[11] = &pdb;
+        ba[7] = &pslot; ba[8] = &pdk; ba[9] = &pdv; ba[10] = &pda; ba[11] = &pdb;
         ba[12] = &batch; ba[13] = &seqLen; ba[14] = &modelDim; ba[15] = &numHeads; ba[16] = &headDim;
+        ba[17] = &detFlag;
         LaunchKernel(backward, grid, (uint)DefaultBlockSize, ba);
+
+        if (det)
+        {
+            void** rd = stackalloc void*[10];
+            rd[0] = &ptr; rd[1] = &pp; rd[2] = &pdk; rd[3] = &pda; rd[4] = &pdb;
+            rd[5] = &batch; rd[6] = &seqLen; rd[7] = &modelDim; rd[8] = &numHeads; rd[9] = &headDim;
+            LaunchKernel(reduceKernel, nGrid, (uint)DefaultBlockSize, rd);
+        }
     }
 
     // ── Fused RG-LRU scan forward (#1464) ──────────────────────────────────────────────────

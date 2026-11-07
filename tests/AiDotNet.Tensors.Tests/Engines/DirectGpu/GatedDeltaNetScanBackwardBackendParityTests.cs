@@ -38,7 +38,32 @@ public sealed class GatedDeltaNetScanBackwardBackendParityTests
         return v;
     }
 
+    /// <summary>
+    /// Both reduction modes: the atomic accumulation, and deterministic mode's fixed-order partial sums, which must
+    /// also give bit-identical gradients on a repeat run.
+    /// </summary>
     private static void Check(IDirectGpuBackend backend)
+    {
+        var saved = BlasProvider.GetThreadLocalDeterministicMode();
+        try
+        {
+            BlasProvider.SetThreadLocalDeterministicMode(false);
+            CheckOnce(backend);
+            BlasProvider.SetThreadLocalDeterministicMode(true);
+            var first = CheckOnce(backend);
+            var second = CheckOnce(backend);
+            for (int g = 0; g < first.Length; g++)
+                for (int i = 0; i < first[g].Length; i++)
+                    Assert.True(BitConverter.SingleToInt32Bits(first[g][i]) == BitConverter.SingleToInt32Bits(second[g][i]),
+                        $"deterministic mode gave gradient {g} element {i} as {first[g][i]:R}, then {second[g][i]:R}");
+        }
+        finally
+        {
+            BlasProvider.SetThreadLocalDeterministicMode(saved);
+        }
+    }
+
+    private static float[][] CheckOnce(IDirectGpuBackend backend)
     {
         var gdn = Assert.IsAssignableFrom<IGatedDeltaNetBackwardBackend>(backend);
         int n = Batch * SeqLen * ModelDim, ng = Batch * SeqLen * NumHeads;
@@ -79,6 +104,7 @@ public sealed class GatedDeltaNetScanBackwardBackendParityTests
                 + string.Join(", ", scope.Events.Select(e => $"{e.Kind} {e.Bytes} B {e.Operation}")));
 
             string[] names = { "dQ", "dK", "dV", "dAlpha", "dBeta" };
+            var results = new float[5][];
             for (int g = 0; g < 5; g++)
             {
                 var actual = backend.DownloadBuffer(gradBufs[g]);
@@ -86,7 +112,9 @@ public sealed class GatedDeltaNetScanBackwardBackendParityTests
                 for (int i = 0; i < expected[g].Length; i++)
                     Assert.True(Math.Abs(expected[g][i] - actual[i]) <= 2e-4 * scale,
                         $"{names[g]}[{i}]: cpu {expected[g][i]}, gpu {actual[i]} (scale {scale})");
+                results[g] = actual;
             }
+            return results;
         }
         finally
         {

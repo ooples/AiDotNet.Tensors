@@ -84,11 +84,16 @@ extern ""C"" __global__ void gated_delta_scan_recompute(
     }
 }
 
+// det == 0: dQ/dK/dA/dB accumulate across the head's rows with atomicAdd (unordered).
+// det != 0: nothing is accumulated here. dQ comes from gated_delta_scan_dq (run before this kernel), dQ's slot carries
+// the per-row dA/dB partials ([dA | dB], batch*seqLen*modelDim floats each), and each row's dK contribution overwrites
+// that row of Straj, which this thread alone reads and has finished with (row t was last read at step t + 1).
+// gated_delta_scan_reduce then sums the rows in a fixed order.
 extern ""C"" __global__ void gated_delta_scan_backward(
     const float* dOut, const float* Q, const float* K, const float* V, const float* A, const float* B,
-    const float* Straj,
+    float* Straj,
     float* dQ, float* dK, float* dV, float* dA, float* dB,
-    int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    int batch, int seqLen, int modelDim, int numHeads, int headDim, int det)
 {
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
     int total = batch * numHeads * headDim;
@@ -120,8 +125,7 @@ extern ""C"" __global__ void gated_delta_scan_backward(
 
         float dOutVal = dOut[baseOff + di];
         for (int ki = 0; ki < headDim; ki++) {
-            float sVal = Straj[trajBase + ki];
-            atomicAdd(&dQ[baseOff + ki], dOutVal * sVal);
+            if (!det) atomicAdd(&dQ[baseOff + ki], dOutVal * Straj[trajBase + ki]);
             dSrow[ki] += dOutVal * Q[baseOff + ki];
         }
 
@@ -137,8 +141,14 @@ extern ""C"" __global__ void gated_delta_scan_backward(
             dDelta += dSt * bet * kScaled;
         }
         dV[baseOff + di] = dDelta;
-        atomicAdd(&dA[gIdx], dA_acc);
-        atomicAdd(&dB[gIdx], dB_acc);
+        if (det) {
+            int n = batch * seqLen * modelDim;
+            dQ[gIdx * headDim + di] = dA_acc;
+            dQ[n + gIdx * headDim + di] = dB_acc;
+        } else {
+            atomicAdd(&dA[gIdx], dA_acc);
+            atomicAdd(&dB[gIdx], dB_acc);
+        }
 
         float dSk = -dDelta;
         for (int ki = 0; ki < headDim; ki++) {
@@ -146,9 +156,57 @@ extern ""C"" __global__ void gated_delta_scan_backward(
             float sprev = (t > 0) ? Straj[sprevBase + ki] : 0.0f;
             float kScaled = K[baseOff + ki] * kappa;
             float dKS_ki = dSt * (bet * delta) + dSk * sprev;
-            atomicAdd(&dK[baseOff + ki], dKS_ki * kappa);
+            if (det) Straj[trajBase + ki] = dKS_ki * kappa;
+            else atomicAdd(&dK[baseOff + ki], dKS_ki * kappa);
             dSrow[ki] = dSt * a + dSk * kScaled;
         }
+    }
+}
+
+// Deterministic dQ: dQ[b,t,h,ki] = sum over di (ascending) of dOut[b,t,h,di] * S_t[di,ki]. One thread per dQ element.
+extern ""C"" __global__ void gated_delta_scan_dq(
+    const float* dOut, const float* Straj, float* dQ,
+    int batch, int seqLen, int modelDim, int numHeads, int headDim)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= batch * seqLen * modelDim) return;
+    int ki = gid % headDim;
+    int h  = (gid / headDim) % numHeads;
+    int bt = gid / modelDim;
+    int t = bt % seqLen, b = bt / seqLen;
+    long trajT = ((long)(b * numHeads + h) * seqLen + t) * (long)(headDim * headDim);
+    int base = bt * modelDim + h * headDim;
+    float acc = 0.0f;
+    for (int di = 0; di < headDim; di++) acc += dOut[base + di] * Straj[trajT + (long)di * headDim + ki];
+    dQ[gid] = acc;
+}
+
+// Deterministic reduction of the backward's per-row partials: dK from the rows of PK (the overwritten trajectory) and
+// dA/dB from P = [dA | dB], each summed over di in ascending order. One thread per dK element.
+extern ""C"" __global__ void gated_delta_scan_reduce(
+    const float* PK, const float* P, float* dK, float* dA, float* dB,
+    int batch, int seqLen, int modelDim, int numHeads, int headDim)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int n = batch * seqLen * modelDim;
+    if (gid >= n) return;
+    int ki = gid % headDim;
+    int h  = (gid / headDim) % numHeads;
+    int bt = gid / modelDim;
+    int t = bt % seqLen, b = bt / seqLen;
+    long trajT = ((long)(b * numHeads + h) * seqLen + t) * (long)(headDim * headDim);
+    float acc = 0.0f;
+    for (int di = 0; di < headDim; di++) acc += PK[trajT + (long)di * headDim + ki];
+    dK[gid] = acc;
+    if (ki == 0) {
+        int gIdx = bt * numHeads + h;
+        float sa = 0.0f, sb = 0.0f;
+        for (int di = 0; di < headDim; di++) {
+            sa += P[gIdx * headDim + di];
+            sb += P[n + gIdx * headDim + di];
+        }
+        dA[gIdx] = sa;
+        dB[gIdx] = sb;
     }
 }
 ";
@@ -158,6 +216,8 @@ extern ""C"" __global__ void gated_delta_scan_backward(
     {
         "gated_delta_scan_forward",
         "gated_delta_scan_recompute",
-        "gated_delta_scan_backward"
+        "gated_delta_scan_backward",
+        "gated_delta_scan_dq",
+        "gated_delta_scan_reduce"
     };
 }
