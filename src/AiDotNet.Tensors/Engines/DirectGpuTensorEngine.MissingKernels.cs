@@ -6088,6 +6088,9 @@ public partial class DirectGpuTensorEngine
             return false;
         try
         {
+            if (targetIds is not null && TryFusedLinearCrossEntropyIndexBackwardChunked(gradOutput, hidden, weight, bias,
+                    targetIds, out gradHidden, out gradWeight, out gradBias))
+                return true;
             int n = hidden._shape[0], vocab = weight._shape[1];
             int total = checked(n * vocab);
             var logitShape = new[] { n, vocab };
@@ -6134,6 +6137,98 @@ public partial class DirectGpuTensorEngine
             return false;
         }
     }
+
+    // Scratch per row chunk of the chunked fused-CE backward: two [chunk, vocab] float buffers of at most this many
+    // elements each (128 MiB), so a V=49152 head takes 672-row chunks instead of several [N, V] tensors.
+    private const int FusedCeBackwardChunkElements = 32 * 1024 * 1024;
+
+    /// <summary>Row chunks the last chunked fused-CE backward ran (tests: proves the multi-chunk path executed).</summary>
+    internal static int LastFusedCeBackwardChunks;
+
+    /// <summary>
+    /// The index-target fused linear + cross-entropy backward in row chunks, never forming <c>[N, vocab]</c>:
+    /// per chunk of rows, logits = h_c·W + b, softmax, minus the one-hot (a scatter-add of -1), times
+    /// gradOutput[0] / N (read on the device), then dHidden_c = dLogits_c·Wᵀ, dWeight += h_cᵀ·dLogits_c and
+    /// dBias += 1ᵀ·dLogits_c (GEMMs accumulating with beta = 1). The whole-tensor version kept the logits, the
+    /// probabilities, their copy, the scaled difference and dLogits alive at once: five [N, V] tensors (4096 x 49152
+    /// floats = 805 MB each), which filled a 12 GB device and made every training step wait on their frees.
+    /// </summary>
+    private bool TryFusedLinearCrossEntropyIndexBackwardChunked<T>(Tensor<T> gradOutput, Tensor<T> hidden,
+        Tensor<T> weight, Tensor<T> bias, int[] targetIds,
+        out Tensor<T> gradHidden, out Tensor<T> gradWeight, out Tensor<T> gradBias)
+    {
+        gradHidden = gradWeight = gradBias = hidden;
+        if (!TryGetBackend(out var backend) || backend is not DirectGpu.ITransposedAGemm transposedA
+            || gradOutput.Length != 1 || bias.Length != weight._shape[1])
+            return false;
+        int n = hidden._shape[0], d = hidden._shape[1], vocab = weight._shape[1];
+        if (n <= 0 || d <= 0 || vocab <= 0 || weight._shape[0] != d || targetIds.Length != n) return false;
+        int chunk = Math.Max(1, Math.Min(n, FusedCeBackwardChunkElements / vocab));
+        if (chunk >= 32) chunk &= ~31;
+        checked { _ = chunk * vocab; _ = n * d; _ = d * vocab; }
+
+        // Target positions inside a chunk's [chunk, vocab] block, as int bits in a float buffer (the scatter reads
+        // the bits; a pooled float buffer is returned to the pool instead of a blocking free).
+        var positionBits = new float[n];
+        for (int r = 0; r < n; r++)
+        {
+            int id = targetIds[r];
+            if (id < 0 || id >= vocab) return false;
+            positionBits[r] = AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx.PtxCompat.Int32BitsToSingle((r % chunk) * vocab + id);
+        }
+
+        var h = hidden.IsContiguous ? hidden : hidden.Contiguous();
+        var w = weight.IsContiguous ? weight : weight.Contiguous();
+        var b = bias.IsContiguous ? bias : bias.Contiguous();
+        var g = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
+        using var hB = GetOrAllocateBuffer(backend, h);
+        using var wB = GetOrAllocateBuffer(backend, w);
+        using var bB = GetOrAllocateBuffer(backend, b);
+        using var gB = GetOrAllocateBuffer(backend, g);
+        using var positions = new OwnedBuffer(backend.AllocateBuffer(positionBits), ownsBuffer: true);
+        // using: an allocation that throws (an LM-sized head under memory pressure) still disposes the buffers before
+        // it; RelinquishOwnership hands each one to its result.
+        using var dHidden = AllocateOutputBuffer(backend, n * d);
+        using var dWeight = AllocateOutputBuffer(backend, d * vocab);
+        using var dBias = AllocateOutputBuffer(backend, vocab);
+        // Stream-ordered scratch: still read by queued kernels when this returns.
+        using var logits = AllocateStreamOrderedScratch(backend, chunk * vocab);
+        using var work = AllocateStreamOrderedScratch(backend, chunk * vocab);
+        using var hChunk = AllocateStreamOrderedScratch(backend, chunk * d);
+        using var dhChunk = AllocateStreamOrderedScratch(backend, chunk * d);
+        using var ones = AllocateStreamOrderedScratch(backend, chunk);
+        using var minusOnes = AllocateStreamOrderedScratch(backend, chunk);
+        using var chunkPositions = AllocateStreamOrderedScratch(backend, chunk);
+        backend.Fill(ones, 1f, chunk);
+        backend.Fill(minusOnes, -1f, chunk);
+        for (int r0 = 0; r0 < n; r0 += chunk)
+        {
+            int c = Math.Min(chunk, n - r0), cv = c * vocab;
+            float beta = r0 == 0 ? 0f : 1f;
+            backend.Copy(hB.Buffer, r0 * d, hChunk, 0, c * d);
+            backend.Copy(positions.Buffer, r0, chunkPositions, 0, c);
+            backend.Gemm(hChunk, wB.Buffer, logits, c, vocab, d);                // logits = h_c·W
+            backend.BiasAdd(logits, bB.Buffer, work, c, vocab);                  // + b
+            backend.Softmax(work, logits, c, vocab);                             // probabilities
+            backend.ScatterAdd(minusOnes, chunkPositions, logits, c, cv);        // - one-hot
+            backend.Scale(logits, logits, 1f / n, cv);                           // / N
+            backend.BroadcastMultiplyLastAxis(logits, gB.Buffer, work, cv, 1);   // * gradOutput[0] = dLogits_c
+            backend.MatMulTransposed(work, wB.Buffer, dhChunk, c, d, vocab);     // dHidden_c = dLogits_c·Wᵀ
+            backend.Copy(dhChunk, 0, dHidden.Buffer, r0 * d, c * d);
+            transposedA.MatMulTransposedA(hChunk, work, dWeight.Buffer, d, vocab, c, 1f, beta); // dW += h_cᵀ·dL_c
+            backend.Gemm(ones, work, dBias.Buffer, 1, vocab, c, 1f, beta);       // dB += 1ᵀ·dL_c
+        }
+        RecordFusedCeBackwardChunks((n + chunk - 1) / chunk);
+        gradHidden = DeferTensorResult<T>(backend, dHidden.Buffer, n * d, new[] { n, d });
+        dHidden.RelinquishOwnership();
+        gradWeight = DeferTensorResult<T>(backend, dWeight.Buffer, d * vocab, new[] { d, vocab });
+        dWeight.RelinquishOwnership();
+        gradBias = DeferTensorResult<T>(backend, dBias.Buffer, vocab, new[] { vocab });
+        dBias.RelinquishOwnership();
+        return true;
+    }
+
+    private static void RecordFusedCeBackwardChunks(int chunks) => LastFusedCeBackwardChunks = chunks;
 
     /// <summary>
     /// <c>factor * scalar[0] * tensor</c> — or, with a null <paramref name="tensor"/>, <c>factor * scalar[0]</c> filled
@@ -11113,16 +11208,21 @@ public partial class DirectGpuTensorEngine
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorSinh", capabilityGap); return base.TensorSinh(tensor); }
     }
 
-    // #775: TensorReciprocal on the existing backend.Reciprocal (reciprocal_vector = 1/x) unary kernel.
+    // #775: TensorReciprocal on the existing backend.Reciprocal (reciprocal_vector = 1/x) unary kernel. The result stays
+    // on the device and the tape records the same node CpuEngine does: this used to return to the host whenever a tape
+    // was active, so every training step's RMSNorm 1/rms ran on the CPU (with a download of rms per layer).
     Tensor<T> IEngine.TensorReciprocal<T>(Tensor<T> tensor)
     {
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || !tensor.IsContiguous)
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float))
             return base.TensorReciprocal(tensor);
         try
         {
-            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Reciprocal(input, output, size));
-            if (result != null)
-                return new Tensor<T>(result, tensor.Shape._dims);
+            var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) => backend.Reciprocal(input, output, size));
+            if (output != null)
+            {
+                DifferentiableOps.RecordUnary("Reciprocal", output, tensor, BackwardFunctions<T>.ReciprocalBackward);
+                return output;
+            }
             return base.TensorReciprocal(tensor);
         }
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorReciprocal", capabilityGap); return base.TensorReciprocal(tensor); }

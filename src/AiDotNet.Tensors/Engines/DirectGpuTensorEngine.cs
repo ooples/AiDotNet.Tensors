@@ -2012,12 +2012,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // #3 FP16-act CONVERT-AT-GAP: an FP16-tagged input → stable up-converted FP32, so EVERY non-FP16-aware op
         // that fetches its activation through this helper (softmax, scale, in-place unary/binary, etc.) reads
         // correct FP32. FP16-aware ops (conv/groupnorm/add) bypass via TryFp16ResidentInput. Capture-safe scratch.
-        var tHalfG = TryFp16ResidentInput(tensor, out var tCountG);
+        bool isView = !tensor.IsContiguous || tensor._storageOffset != 0;
+        int tCountG = 0;
+        var tHalfG = isView ? null : TryFp16ResidentInput(tensor, out tCountG);
         if (tHalfG is not null)
         {
             var kG = tensor.GetBackingArrayForCacheLookupUnsafe();
             if (kG is not null) return new OwnedBuffer(Fp16InputToFp32Stable(backend, tHalfG, tCountG, kG), ownsBuffer: false);
         }
+        // A strided view of an FP16-resident tensor shares its backing array, and the device copy behind that array
+        // holds FP16 bits: the device view paths below would permute or slice them as FP32. Contiguous() reads the view
+        // through the FP16 -> FP32 host materializer instead.
+        bool fp16View = isView && IsFp16Resident(tensor);
         // A non-contiguous tensor (or one with a nonzero storage offset) is a STRIDED VIEW: it shares
         // its source's backing array, and any GPU buffer cached against that array holds the SOURCE's
         // contiguous layout — NOT the view's permuted/sliced layout. The fast paths below all key off
@@ -2032,16 +2038,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Contiguous() below would download the whole flat array to slice this view on the host.
         // Every view into a flat ParameterBuffer -- including the one at offset 0, which the persistent-cache path
         // below would otherwise re-upload from the (stale) host copy over the device-authoritative flat buffer.
-        if (TryResolveDeviceParameterView(backend, tensor, out var parameterView, out bool parameterViewOwned))
-            return new OwnedBuffer(parameterView, ownsBuffer: parameterViewOwned);
-        // A permuted view of a tensor whose data is only on the device: permute on the device. Contiguous() below
-        // would download the base, permute it on the host and upload the result.
-        if (!tensor.IsContiguous && TryPermuteViewOnDevice(backend, tensor, out var permuted))
-            return permuted;
-        if (TrySliceViewOnDevice(backend, tensor, out var sliced))
-            return sliced;
-        if (TrySliceResidentMemberOnDevice(backend, tensor, out var memberSlice))
-            return memberSlice;
+        if (!fp16View)
+        {
+            if (TryResolveDeviceParameterView(backend, tensor, out var parameterView, out bool parameterViewOwned))
+                return new OwnedBuffer(parameterView, ownsBuffer: parameterViewOwned);
+            // A permuted view of a tensor whose data is only on the device: permute on the device. Contiguous() below
+            // would download the base, permute it on the host and upload the result.
+            if (!tensor.IsContiguous && TryPermuteViewOnDevice(backend, tensor, out var permuted))
+                return permuted;
+            if (TrySliceViewOnDevice(backend, tensor, out var sliced))
+                return sliced;
+            if (TrySliceResidentMemberOnDevice(backend, tensor, out var memberSlice))
+                return memberSlice;
+        }
         if (!tensor.IsContiguous || tensor._storageOffset != 0)
             tensor = (Tensor<T>)tensor.Contiguous();
 
@@ -28775,11 +28784,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private Tensor<T>? TryRepeatAxisOnDevice<T>(Tensor<T> tensor, int repeats, int axis)
     {
         using var __gpuOp = EnterGpuOp();
-        if (typeof(T) != typeof(float) || !tensor.IsContiguous || repeats < 1
+        if (typeof(T) != typeof(float) || repeats < 1
             || axis < 0 || axis >= tensor.Rank || !TryGetBackend(out var backend))
             return null;
         // repeats == 1 still copies, as the CPU op and PyTorch do: returning the input itself made
         // TensorRepeatInterleave record a tape edge from the input to itself, doubling its gradient (#1680).
+        // A permuted view (GQA's [B, Hkv, S, D] K/V after the head permute) is copied contiguous on the device by
+        // Tensor.Contiguous; rejecting it sent every GQA layer's K and V repeat to the host.
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         int outer = 1;
         for (int d = 0; d < axis; d++) outer = checked(outer * tensor.Shape._dims[d]);

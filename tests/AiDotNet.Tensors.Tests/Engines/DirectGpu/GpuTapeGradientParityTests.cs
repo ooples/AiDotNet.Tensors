@@ -1,3 +1,4 @@
+using System.Linq;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -229,6 +230,90 @@ public class GpuTapeGradientParityTests : IDisposable
             checkResult(x, y);
         }
     }
+
+    // RMSNorm's 1/rms: the device reciprocal used to return to the host whenever a tape was recording.
+    [SkippableFact]
+    public void Reciprocal_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorReciprocal", static (e, t) => e.TensorReciprocal(t),
+            static (x, y) =>
+            {
+                // Relative, at PyTorch's float32 rtol (1.3e-6): a device reciprocal is within an ulp of 1/x, and an
+                // absolute 6-decimal check demands more than float32 holds once |1/x| passes ~8 (CUDA: -66.506149 vs
+                // -66.506157, one ulp apart).
+                for (int i = 0; i < x.Length; i++)
+                {
+                    float expected = 1f / x[i];
+                    Assert.True(Math.Abs(expected - y[i]) <= 1.3e-6 * Math.Abs(expected),
+                        $"1/x[{i}]: expected {expected:R}, device {y[i]:R}");
+                }
+            });
+
+    // A permuted view of an FP16-resident activation shares its source's backing array, so the FP16 lookup used to hand
+    // the reciprocal the whole up-converted source in storage order instead of the view's order.
+    [SkippableFact]
+    public void Reciprocal_of_a_view_of_an_fp16_resident_tensor_reads_the_view_order()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        var saved = DirectGpuTensorEngine.Fp16ActOverride;
+        using (gpu!)
+        {
+            try
+            {
+                DirectGpuTensorEngine.Fp16ActOverride = true;
+                var backend = gpu!.GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
+                var x = Rand([6, 10], seed: 527, lo: 0.5, hi: 2.0);
+                var host = x.ToArray();
+                using var f32 = backend.AllocateBuffer(host);
+                var half = backend.AllocateBuffer(host.Length);
+                backend.ConvertToFp16(f32, half, host.Length);
+                gpu.BindResidentBufferFp16(x, half, backend, host.Length);
+
+                var y = ((IEngine)gpu).TensorReciprocal(((IEngine)gpu).TensorPermute(x, new[] { 1, 0 }));
+                Assert.Equal(new[] { 10, 6 }, y.Shape.ToArray());
+                for (int i = 0; i < 10; i++)
+                    for (int j = 0; j < 6; j++)
+                    {
+                        float expected = 1f / host[j * 10 + i];
+                        // FP16 storage: about three significant digits.
+                        Assert.True(Math.Abs(expected - y[i * 6 + j]) <= 2e-3 * Math.Abs(expected),
+                            $"1/view[{i},{j}]: expected {expected:R}, device {y[i * 6 + j]:R}");
+                    }
+            }
+            finally
+            {
+                DirectGpuTensorEngine.Fp16ActOverride = saved;
+            }
+        }
+    }
+
+    [SkippableFact]
+    public void Reciprocal_gradients_match_cpu() =>
+        AssertGradientParity("TensorReciprocal", Rand([4, 16], seed: 509, lo: 0.5, hi: 2.0),
+            static (e, t) => e.TensorReciprocal(t), probe: Engagement.UseResidencyCounter);
+
+    // GQA's K/V: [B, Hkv, S, D] is a permuted view when it reaches the repeat. A non-contiguous input used to send
+    // the repeat (and its backward) to the host.
+    private static Tensor<float> RepeatPermutedKv(IEngine e, Tensor<float> t) =>
+        e.TensorRepeatInterleave(e.TensorPermute(e.Reshape(t, new[] { 1, 2, 3, 10 }), new[] { 0, 2, 1, 3 }), 2, 1);
+
+    [SkippableFact]
+    public void RepeatInterleave_of_a_permuted_view_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorRepeatInterleave(permuted)", static (e, t) => RepeatPermutedKv(e, t),
+            static (x, y) =>
+            {
+                // The gradient is linear and cannot see a forward that read the un-permuted buffer, so check the
+                // values: p[0, s, k, d] = x[(k * 3 + s) * 10 + d], repeated twice along axis 1.
+                Assert.Equal(new[] { 1, 6, 2, 10 }, y.Shape.ToArray());
+                for (int j = 0; j < 6; j++)
+                    for (int k = 0; k < 2; k++)
+                        for (int d = 0; d < 10; d++)
+                            Assert.Equal(x[(k * 3 + j / 2) * 10 + d], y[(j * 2 + k) * 10 + d]);
+            });
+
+    [SkippableFact]
+    public void RepeatInterleave_of_a_permuted_view_gradients_match_cpu() =>
+        AssertGradientParity("TensorRepeatInterleave(permuted)", Rand([6, 10], seed: 521),
+            static (e, t) => RepeatPermutedKv(e, t), probe: Engagement.UseResidencyCounter);
 
     [SkippableFact]
     public void PixelShuffle_gradients_match_cpu() =>
@@ -904,6 +989,39 @@ public class GpuTapeGradientParityTests : IDisposable
     public void FusedLinearCrossEntropy_dense_hidden_gradients_match_cpu() =>
         AssertGradientParity("FusedLinearCE(dense, hidden)", Rand([6, 10], seed: 487),
             static (e, t) => e.FusedLinearCrossEntropyWithLogits(t, HeadWeight, HeadBias, SoftTargets()));
+
+    // An LM-sized vocabulary: the index backward runs in row chunks (672 rows at V = 49152), so 1500 rows take three
+    // chunks and the weight and bias gradients accumulate across them (GEMM beta = 1 after the first chunk).
+    private const int ChunkRows = 1500, ChunkDim = 16, ChunkVocab = 49152;
+    private static readonly Tensor<float> ChunkHidden = Rand([ChunkRows, ChunkDim], seed: 491);
+    private static readonly Tensor<float> ChunkWeight = Rand([ChunkDim, ChunkVocab], seed: 499, lo: -0.3, hi: 0.3);
+    private static readonly Tensor<float> ChunkBias = Rand([ChunkVocab], seed: 503, lo: -0.1, hi: 0.1);
+    private static readonly Tensor<int> ChunkTargetIds = new(
+        Enumerable.Range(0, ChunkRows).Select(r => (r * 7919) % ChunkVocab).ToArray(), new[] { ChunkRows });
+
+    private void AssertChunkedParity(string opName, Tensor<float> x, Func<IEngine, Tensor<float>, Tensor<float>> op)
+    {
+        DirectGpuTensorEngine.LastFusedCeBackwardChunks = 0;
+        // These gradients peak near 1e-4 (the loss is a mean over 1500 rows), so the default tolerance, an absolute
+        // 1e-4 below |g| = 1, would accept an all-zero gradient.
+        AssertGradientParity(opName, x, op, tol: 1e-6);
+        Assert.Equal(3, DirectGpuTensorEngine.LastFusedCeBackwardChunks);
+    }
+
+    [SkippableFact]
+    public void FusedLinearCrossEntropy_index_chunked_hidden_gradients_match_cpu() =>
+        AssertChunkedParity("FusedLinearCE(ids, hidden, 3 chunks)", ChunkHidden,
+            static (e, t) => e.FusedLinearCrossEntropyWithLogits(t, ChunkWeight, ChunkBias, ChunkTargetIds));
+
+    [SkippableFact]
+    public void FusedLinearCrossEntropy_index_chunked_weight_gradients_match_cpu() =>
+        AssertChunkedParity("FusedLinearCE(ids, weight, 3 chunks)", ChunkWeight,
+            static (e, t) => e.FusedLinearCrossEntropyWithLogits(ChunkHidden, t, ChunkBias, ChunkTargetIds));
+
+    [SkippableFact]
+    public void FusedLinearCrossEntropy_index_chunked_bias_gradients_match_cpu() =>
+        AssertChunkedParity("FusedLinearCE(ids, bias, 3 chunks)", ChunkBias,
+            static (e, t) => e.FusedLinearCrossEntropyWithLogits(ChunkHidden, ChunkWeight, t, ChunkTargetIds));
 
     [SkippableFact]
     public void FusedLinearCrossEntropy_stays_on_the_device_while_a_tape_records() =>

@@ -7593,6 +7593,18 @@ internal static class BackwardFunctions<T>
         int repeats = (int)savedState[0];
         int dim = (int)savedState[1];
         var input = inputs[0];
+        if (engine is DirectGpuTensorEngine)
+        {
+            // Output element [o, i * repeats + r, n] came from input [o, i, n]: viewed as [outer, axis, repeats, inner]
+            // the gradient is a sum over the repeats axis, a device reduction instead of a host walk of gradOutput.
+            int outerN = 1; for (int k = 0; k < dim; k++) outerN *= input._shape[k];
+            int innerN = 1; for (int k = dim + 1; k < input.Rank; k++) innerN *= input._shape[k];
+            var g = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
+            var viewed = engine.Reshape(g, new[] { outerN, input._shape[dim], repeats, innerN });
+            var summed = engine.ReduceSum(viewed, new[] { 2 }, keepDims: false);
+            DifferentiableOps.AccumulateGrad(grads, input, engine.Reshape(summed, (int[])input._shape.Clone()), engine);
+            return;
+        }
         var grad = new Tensor<T>(input._shape);
 
         int rank = input.Rank;
