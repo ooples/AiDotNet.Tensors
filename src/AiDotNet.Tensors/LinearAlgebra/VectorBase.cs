@@ -459,7 +459,15 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.
     {
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         EnsureMaterialized();
+#if NET5_0_OR_GREATER
+        // Memory<T>.ToArray zero-fills new T[n] and then overwrites it; skip the fill.
+        if (_memory.Length == 0) return Array.Empty<T>();
+        var result = GC.AllocateUninitializedArray<T>(_memory.Length);
+        _memory.Span.CopyTo(result);
+        return result;
+#else
         return _memory.ToArray();
+#endif
     }
 
     /// <summary>

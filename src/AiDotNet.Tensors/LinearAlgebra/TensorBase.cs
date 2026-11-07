@@ -2743,7 +2743,13 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         if (Length == 0) return Array.Empty<T>();
         if (IsContiguous && _storageOffset == 0 && _storage.Length == Length)
             return _data.ToArray();
+        // Every element is written below, so the zero-fill of new T[n] is wasted work (a large result is an LOH
+        // array: the fill is a full extra pass over memory).
+#if NET5_0_OR_GREATER
+        var result = GC.AllocateUninitializedArray<T>(Length);
+#else
         var result = new T[Length];
+#endif
         if (IsContiguous)
         {
             _data.AsSpan().Slice(_storageOffset, Length).CopyTo(result);
