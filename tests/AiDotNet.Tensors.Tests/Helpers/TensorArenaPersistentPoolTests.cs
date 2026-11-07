@@ -431,7 +431,8 @@ public class TensorArenaPersistentPoolTests
     {
         Assert.Equal(2 * sizeof(double), TensorArena.ElementBytes(typeof(Pair<double>)));
         Assert.Equal(2 * sizeof(float), TensorArena.ElementBytes(typeof(Pair<float>)));
-        // Complex<T> also holds its numeric-operations reference.
+        // Complex<T> also holds its numeric-operations reference: exactly the runtime's managed size, padding included.
+        Assert.Equal(System.Runtime.CompilerServices.Unsafe.SizeOf<Complex<double>>(), TensorArena.ElementBytes(typeof(Complex<double>)));
         Assert.True(TensorArena.ElementBytes(typeof(Complex<double>)) >= 2 * sizeof(double) + IntPtr.Size);
         Assert.Equal(sizeof(float), TensorArena.ElementBytes(typeof(float)));
         Assert.Equal(IntPtr.Size, TensorArena.ElementBytes(typeof(string)));

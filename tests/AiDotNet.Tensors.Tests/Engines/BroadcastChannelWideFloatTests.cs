@@ -63,12 +63,12 @@ public class BroadcastChannelWideFloatTests
     /// The row path takes over at one full vector of channels: a 7-wide row stays on the serial plane loop and an
     /// 8-wide row takes the wide kernel. The end-to-end cases above cover both results; this pins the dispatch.
     /// </summary>
-    [Theory]
+    [SkippableTheory]
     [InlineData(7, false)]
     [InlineData(8, true)]
     public void RowBroadcast_DispatchesAtOneFullVector(int cols, bool wide)
     {
-        if (!System.Runtime.Intrinsics.X86.Avx.IsSupported) return;
+        Skip.IfNot(System.Runtime.Intrinsics.X86.Avx.IsSupported, "AVX is not available on this host.");
         const int rows = 4;
         var a = new float[rows * cols];
         var b = new float[cols];

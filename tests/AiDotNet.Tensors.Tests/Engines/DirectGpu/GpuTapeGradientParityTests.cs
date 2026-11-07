@@ -248,6 +248,44 @@ public class GpuTapeGradientParityTests : IDisposable
                 }
             });
 
+    // A permuted view of an FP16-resident activation shares its source's backing array, so the FP16 lookup used to hand
+    // the reciprocal the whole up-converted source in storage order instead of the view's order.
+    [SkippableFact]
+    public void Reciprocal_of_a_view_of_an_fp16_resident_tensor_reads_the_view_order()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        var saved = DirectGpuTensorEngine.Fp16ActOverride;
+        using (gpu!)
+        {
+            try
+            {
+                DirectGpuTensorEngine.Fp16ActOverride = true;
+                var backend = gpu!.GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
+                var x = Rand([6, 10], seed: 527, lo: 0.5, hi: 2.0);
+                var host = x.ToArray();
+                using var f32 = backend.AllocateBuffer(host);
+                var half = backend.AllocateBuffer(host.Length);
+                backend.ConvertToFp16(f32, half, host.Length);
+                gpu.BindResidentBufferFp16(x, half, backend, host.Length);
+
+                var y = ((IEngine)gpu).TensorReciprocal(((IEngine)gpu).TensorPermute(x, new[] { 1, 0 }));
+                Assert.Equal(new[] { 10, 6 }, y.Shape.ToArray());
+                for (int i = 0; i < 10; i++)
+                    for (int j = 0; j < 6; j++)
+                    {
+                        float expected = 1f / host[j * 10 + i];
+                        // FP16 storage: about three significant digits.
+                        Assert.True(Math.Abs(expected - y[i * 6 + j]) <= 2e-3 * Math.Abs(expected),
+                            $"1/view[{i},{j}]: expected {expected:R}, device {y[i * 6 + j]:R}");
+                    }
+            }
+            finally
+            {
+                DirectGpuTensorEngine.Fp16ActOverride = saved;
+            }
+        }
+    }
+
     [SkippableFact]
     public void Reciprocal_gradients_match_cpu() =>
         AssertGradientParity("TensorReciprocal", Rand([4, 16], seed: 509, lo: 0.5, hi: 2.0),
@@ -261,7 +299,16 @@ public class GpuTapeGradientParityTests : IDisposable
     [SkippableFact]
     public void RepeatInterleave_of_a_permuted_view_stays_on_the_device_while_a_tape_records() =>
         AssertStaysOnDeviceUnderTape("TensorRepeatInterleave(permuted)", static (e, t) => RepeatPermutedKv(e, t),
-            static (x, y) => Assert.Equal(new[] { 1, 6, 2, 10 }, y.Shape.ToArray()));
+            static (x, y) =>
+            {
+                // The gradient is linear and cannot see a forward that read the un-permuted buffer, so check the
+                // values: p[0, s, k, d] = x[(k * 3 + s) * 10 + d], repeated twice along axis 1.
+                Assert.Equal(new[] { 1, 6, 2, 10 }, y.Shape.ToArray());
+                for (int j = 0; j < 6; j++)
+                    for (int k = 0; k < 2; k++)
+                        for (int d = 0; d < 10; d++)
+                            Assert.Equal(x[(k * 3 + j / 2) * 10 + d], y[(j * 2 + k) * 10 + d]);
+            });
 
     [SkippableFact]
     public void RepeatInterleave_of_a_permuted_view_gradients_match_cpu() =>
@@ -955,7 +1002,9 @@ public class GpuTapeGradientParityTests : IDisposable
     private void AssertChunkedParity(string opName, Tensor<float> x, Func<IEngine, Tensor<float>, Tensor<float>> op)
     {
         DirectGpuTensorEngine.LastFusedCeBackwardChunks = 0;
-        AssertGradientParity(opName, x, op);
+        // These gradients peak near 1e-4 (the loss is a mean over 1500 rows), so the default tolerance, an absolute
+        // 1e-4 below |g| = 1, would accept an all-zero gradient.
+        AssertGradientParity(opName, x, op, tol: 1e-6);
         Assert.Equal(3, DirectGpuTensorEngine.LastFusedCeBackwardChunks);
     }
 
