@@ -3,7 +3,7 @@
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
-public sealed partial class MetalBackend : IGeometryBackend
+public sealed partial class MetalBackend : IGeometryBackend, IGeometryBackwardBackend
 {
     private const string GeometryLibName = "Geometry";
 
@@ -21,6 +21,7 @@ public sealed partial class MetalBackend : IGeometryBackend
     {
         int total = N * C * Hout * Wout;
         if (total <= 0) return;
+        IntegerInterpolationWindow.EnsureInRange(mode, Hin, Win, Hout, Wout);
         ThrowIfDisposed();
         if (input is not MetalGpuBuffer inBuf || output is not MetalGpuBuffer outBuf)
             throw new ArgumentException("Buffers must be MetalGpuBuffer");
@@ -90,6 +91,55 @@ public sealed partial class MetalBackend : IGeometryBackend
         encoder.SetBytes(outH, 7); encoder.SetBytes(outW, 8);
         encoder.SetBytes(mode, 9); encoder.SetBytes(padding, 10);
         encoder.SetBytes(alignCorners ? 1 : 0, 11);
+        encoder.DispatchThreadgroups(tgr, tpg);
+    }
+
+    public void GridSample2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer grid, IGpuBuffer gradInput,
+        int N, int H, int W, int C, int outH, int outW,
+        int mode, int padding, bool alignCorners)
+    {
+        int total = N * outH * outW;
+        if (total <= 0) return;
+        ThrowIfDisposed();
+        if (gradOutput is not MetalGpuBuffer goBuf || grid is not MetalGpuBuffer grBuf
+            || gradInput is not MetalGpuBuffer giBuf)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        var pipe = GetGeometryPipeline("geometry_grid_sample_2d_backward_input");
+        var (tgr, tpg) = pipe.Calculate1DDispatch(total);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipe.Handle);
+        encoder.SetBuffer(goBuf, 0);
+        encoder.SetBuffer(grBuf, 1);
+        encoder.SetBuffer(giBuf, 2);
+        encoder.SetBytes(N, 3); encoder.SetBytes(H, 4); encoder.SetBytes(W, 5); encoder.SetBytes(C, 6);
+        encoder.SetBytes(outH, 7); encoder.SetBytes(outW, 8);
+        encoder.SetBytes(mode, 9); encoder.SetBytes(padding, 10);
+        encoder.SetBytes(alignCorners ? 1 : 0, 11);
+        encoder.DispatchThreadgroups(tgr, tpg);
+    }
+
+    public void GridSample2DBackwardGrid(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer grid,
+        IGpuBuffer gradGrid, int N, int H, int W, int C, int outH, int outW,
+        int mode, int padding, bool alignCorners)
+    {
+        int total = N * outH * outW;
+        if (total <= 0) return;
+        ThrowIfDisposed();
+        if (gradOutput is not MetalGpuBuffer goBuf || input is not MetalGpuBuffer inBuf
+            || grid is not MetalGpuBuffer grBuf || gradGrid is not MetalGpuBuffer ggBuf)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        var pipe = GetGeometryPipeline("geometry_grid_sample_2d_backward_grid");
+        var (tgr, tpg) = pipe.Calculate1DDispatch(total);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipe.Handle);
+        encoder.SetBuffer(goBuf, 0);
+        encoder.SetBuffer(inBuf, 1);
+        encoder.SetBuffer(grBuf, 2);
+        encoder.SetBuffer(ggBuf, 3);
+        encoder.SetBytes(N, 4); encoder.SetBytes(H, 5); encoder.SetBytes(W, 6); encoder.SetBytes(C, 7);
+        encoder.SetBytes(outH, 8); encoder.SetBytes(outW, 9);
+        encoder.SetBytes(mode, 10); encoder.SetBytes(padding, 11);
+        encoder.SetBytes(alignCorners ? 1 : 0, 12);
         encoder.DispatchThreadgroups(tgr, tpg);
     }
 

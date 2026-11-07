@@ -216,6 +216,26 @@ internal sealed class LazyTensorScope : IDisposable
         return output;
     }
 
+    // Auxiliary outputs (argmax indices) of recorded nodes, keyed by the object the caller holds, mapped to the
+    // node's primary output. A node that consumes the auxiliary output depends on that output, so a schedule cannot
+    // run it before the producer refreshes the indices.
+    private readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, object> _auxiliaryProducers = new();
+
+    /// <summary>Records that each replay of the node producing <paramref name="producerOutput"/> refreshes <paramref name="auxiliary"/>.</summary>
+    internal void RegisterAuxiliaryOutput(object auxiliary, object producerOutput)
+    {
+        _auxiliaryProducers.Remove(auxiliary);
+        _auxiliaryProducers.Add(auxiliary, producerOutput);
+    }
+
+    /// <summary>The primary output of the node whose replay refreshes <paramref name="auxiliary"/>, if one does.</summary>
+    internal bool TryGetAuxiliaryProducer(object auxiliary, out object? producerOutput)
+    {
+        bool found = _auxiliaryProducers.TryGetValue(auxiliary, out var output);
+        producerOutput = output;
+        return found;
+    }
+
     /// <summary>
     /// Records an operation whose output was materialized once to establish its exact shape during
     /// tracing, while retaining every public tensor operand as a graph dependency. This is the

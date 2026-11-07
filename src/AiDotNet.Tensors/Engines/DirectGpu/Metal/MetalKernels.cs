@@ -1071,8 +1071,10 @@ kernel void reciprocal_backward(
     uint gid [[thread_position_in_grid]])
 {
     if (gid < size) {
-        float x = input[gid];
-        gradInput[gid] = -gradOutput[gid] / (x * x);
+        // The second buffer is the reciprocal OUTPUT y = 1/x, so d(1/x)/dx = -1/x^2 = -y^2 (#775, #1680).
+        float y = input[gid];
+        // g * y first: y * y overflows float for |y| > 1.8e19 even when the derivative g * y^2 does not.
+        gradInput[gid] = -(gradOutput[gid] * y) * y;
     }
 }
 

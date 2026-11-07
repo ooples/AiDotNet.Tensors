@@ -362,6 +362,8 @@ public partial class CpuEngine
     public virtual Tensor<T> TensorQuantile<T>(Tensor<T> tensor, double q, int? dim = null, bool keepDim = false,
         QuantileInterpolation interpolation = QuantileInterpolation.Linear)
     {
+        if (TryRecordCompiledOp("TensorQuantile", new Tensor<T>?[] { tensor }, e => e.TensorQuantile(tensor, q, dim, keepDim, interpolation), out var compiledNode))
+            return compiledNode;
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         return QuantileCore("TensorQuantile", tensor, q, dim, keepDim, interpolation, ignoreNan: false);
     }
@@ -370,6 +372,8 @@ public partial class CpuEngine
     public virtual Tensor<T> TensorNanQuantile<T>(Tensor<T> tensor, double q, int? dim = null, bool keepDim = false,
         QuantileInterpolation interpolation = QuantileInterpolation.Linear)
     {
+        if (TryRecordCompiledOp("TensorNanQuantile", new Tensor<T>?[] { tensor }, e => e.TensorNanQuantile(tensor, q, dim, keepDim, interpolation), out var compiledNode))
+            return compiledNode;
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         return QuantileCore("TensorNanQuantile", tensor, q, dim, keepDim, interpolation, ignoreNan: true);
     }

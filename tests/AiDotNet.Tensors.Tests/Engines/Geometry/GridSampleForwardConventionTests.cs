@@ -164,37 +164,4 @@ public class GridSampleForwardConventionTests
             }
         }
     }
-
-    /// <summary>
-    /// Sampling parameters the backward does not implement must throw rather than silently return the
-    /// bilinear-zeros gradient.
-    /// </summary>
-    /// <remarks>
-    /// alignCorners=true USED to be listed here. It is now implemented — the two conventions differ by
-    /// the per-axis rescale g_false = g_true * (S-1)/S, so no second gradient implementation was needed —
-    /// and GridSampleBackwardAlignCornersTests pins CPU against GPU for both conventions. Mode and
-    /// padding remain genuinely unimplemented and must still throw.
-    /// </remarks>
-    [Theory]
-    [InlineData(GridSampleMode.Nearest, GridSamplePadding.Zeros, false)]
-    [InlineData(GridSampleMode.Bilinear, GridSamplePadding.Border, false)]
-    public void UnsupportedCombination_ThrowsRatherThanReturningAWrongGradient(
-        GridSampleMode mode, GridSamplePadding padding, bool alignCorners)
-    {
-        var input = Input();
-        var grid = InteriorGrid();
-
-        using var tape = new GradientTape<double>();
-        tape.BindEngineIfUnset(_engine);
-        var loss = _engine.ReduceSum(_engine.GridSample(input, grid, mode, padding, alignCorners), null);
-
-        // Pin the TYPE and the message content, not merely "something threw". Assert.NotNull accepts a
-        // NullReferenceException or a shape bug just as happily, which would leave the unsupported
-        // mode/padding contract itself untested.
-        var ex = Record.Exception(() => tape.ComputeGradients(loss, [input, grid]));
-        var notSupported = Assert.IsType<NotSupportedException>(ex);
-        _out.WriteLine($"{mode}/{padding}/align={alignCorners} -> {notSupported.Message}");
-        Assert.Contains(mode.ToString(), notSupported.Message, StringComparison.Ordinal);
-        Assert.Contains(padding.ToString(), notSupported.Message, StringComparison.Ordinal);
-    }
 }

@@ -8503,6 +8503,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorMax<T>(Tensor<T> tensor, T value)
     {
+        if (TryRecordCompiledOp("TensorMax", new Tensor<T>?[] { tensor }, e => e.TensorMax(tensor, value), out var compiledNode))
+            return compiledNode;
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
@@ -18383,6 +18385,17 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!GraphMode.IsActive)
             return MaxPool2DWithTensorIndicesEager(input, poolSize, stride, out maxIndices);
 
+        // Compiled training: each replay pools again and copies the fresh winners into the indices the caller holds.
+        // The route below pools through MaxPool2DWithIndices, whose graph node refreshes only the values, so a
+        // consumer of the indices (MaxUnpool) read the trace's all-zero indices on every step.
+        if (TryRecordCompiledOp("MaxPool2DWithTensorIndices", new Tensor<T>?[] { input },
+                e => (e.MaxPool2DWithTensorIndices(input, poolSize, stride, out var fresh), fresh),
+                RefreshIndices, out var compiledNode, out var compiledIndices))
+        {
+            maxIndices = compiledIndices;
+            return compiledNode;
+        }
+
         Tensor<T> result;
         int[,,,,] coordinateIndices;
         using (new NoGradScope<T>())
@@ -22286,7 +22299,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <see cref="BilinearGradientNHWC{T}"/> with NCHW plane indexing.</summary>
     private static (T gradH, T gradW) BilinearGradientNCHW<T>(T[] data, int plane, int height, int width, double h, double w, INumericOperations<T> numOps)
     {
-        if (h <= -1 || h >= height || w <= -1 || w >= width) return (numOps.Zero, numOps.Zero);
+        // Strictly below -1: at exactly -1 the far tap is in the image and PyTorch's grid gradient is one-sided.
+        if (h < -1 || h >= height || w < -1 || w >= width) return (numOps.Zero, numOps.Zero);
         int h0 = (int)Math.Floor(h), h1 = h0 + 1, w0 = (int)Math.Floor(w), w1 = w0 + 1;
         double lh = h - h0, lw = w - w0;
         T v00 = GetPixelValueNCHW(data, plane, height, width, h0, w0, numOps);
@@ -23894,7 +23908,16 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> MaxPool3DWithIndices<T>(Tensor<T> input, int[] poolSize, int[] stride, out int[,,,,,] maxIndices)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
-        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        // The host index array is refreshed in place each replay; only an inference trace cannot carry it.
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HostBoundary);
+        if (TryRecordCompiledOp("MaxPool3DWithIndices", new Tensor<T>?[] { input },
+                e => (e.MaxPool3DWithIndices(input, poolSize, stride, out var fresh), fresh),
+                (_, fresh, held) => Array.Copy(fresh, held, fresh.Length),
+                out var compiledNode, out var compiledIndices))
+        {
+            maxIndices = compiledIndices;
+            return compiledNode;
+        }
         if (input.Rank != 5) throw new ArgumentException($"MaxPool3D requires 5D input tensor [batch, channels, depth, height, width]. Got rank {input.Rank}.", nameof(input));
         if (poolSize == null || poolSize.Length != 3) throw new ArgumentException("Pool size must be array of 3 elements [poolD, poolH, poolW].", nameof(poolSize));
         if (stride == null || stride.Length != 3) throw new ArgumentException("Stride must be array of 3 elements [strideD, strideH, strideW].", nameof(stride));
@@ -23994,6 +24017,13 @@ public partial class CpuEngine : ITensorLevelEngine
         Tensor<T> input, int[] poolSize, int[] stride, out Tensor<int> maxIndices)
     {
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousOutput);
+        if (TryRecordCompiledOp("MaxPool3DWithTensorIndices", new Tensor<T>?[] { input },
+                e => (e.MaxPool3DWithTensorIndices(input, poolSize, stride, out var fresh), fresh),
+                RefreshIndices, out var compiledNode, out var compiledIndices))
+        {
+            maxIndices = compiledIndices;
+            return compiledNode;
+        }
 
         Tensor<T> result;
         int[,,,,,] coordinateIndices;
@@ -34606,6 +34636,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// </summary>
     public Tensor<T> ScatterAdd<T>(Tensor<T> source, Tensor<int> indices, int dim = 0, int? outputSize = null)
     {
+        if (TryRecordCompiledOp("ScatterAdd", new Tensor<T>?[] { source }, e => e.ScatterAdd(source, indices, dim, outputSize), out var compiledNode))
+            return compiledNode;
         if (source == null)
             throw new ArgumentNullException(nameof(source));
         if (indices == null)
@@ -34761,9 +34793,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 GraphMode.SetCurrent(null);
                 var eagerResult = ScatterMean(cs, ci, out counts, cd, co);
                 GraphMode.SetCurrent(savedScope);
-                // AiDotNet#1331: counts isn't currently referenced by the backward
-                // (only `indices` and `dim` are saved), but mirror the refresh
-                // pattern for safety in case ScatterMeanBackward starts consuming counts.
+                // ScatterMeanBackward divides by savedState[1], the counts tensor; each replay refreshes it
+                // in place (AiDotNet#1331), so the saved reference always holds this step's counts.
                 var capturedCounts = counts;
                 var lazyResult = scope.RecordUnary(LazyNodeType.Custom, "ScatterMean", source, eagerResult._shape,
                     (eng, output) =>
@@ -34774,7 +34805,7 @@ public partial class CpuEngine : ITensorLevelEngine
                             && capturedCounts.Length == freshCounts.Length)
                             DirectGpuTensorEngine.CopyResultInto(eng, freshCounts, capturedCounts);
                     },
-                    BackwardFunctions<T>.ScatterMeanBackward, new object[] { indices, dim });
+                    BackwardFunctions<T>.ScatterMeanBackward, new object[] { indices, capturedCounts! });
                 using var eagerResultKeep5 = new KeepAliveScope(eagerResult);
                 using var lazyResultKeep6 = new KeepAliveScope(lazyResult);
                 eagerResult.AsSpanUnmarked().CopyTo(lazyResult.AsWritableSpanUnmarked());
@@ -34992,6 +35023,11 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> ScatterMax<T>(Tensor<T> source, Tensor<int> indices, out Tensor<int>? argmax, int dim = 0, int? outputSize = null)
     {
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousOutput);
+        if (source is not null && indices is not null
+            && TryRecordCompiledOp("ScatterMax", new Tensor<T>?[] { source },
+                e => (e.ScatterMax(source, indices, out var fresh, dim, outputSize), fresh),
+                RefreshIndices, out var compiledNode, out argmax))
+            return compiledNode;
 
         if (source == null)
             throw new ArgumentNullException(nameof(source));
@@ -35587,7 +35623,14 @@ public partial class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> ReduceMaxWithTensorIndices<T>(
         Tensor<T> input, int[] axes, bool keepDims, out Tensor<int> maxIndices)
     {
-        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HeterogeneousOutput);
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousOutput);
+        if (TryRecordCompiledOp("ReduceMaxWithTensorIndices", new Tensor<T>?[] { input },
+                e => (e.ReduceMaxWithTensorIndices(input, axes, keepDims, out var fresh), fresh),
+                RefreshIndices, out var compiledNode, out var compiledIndices))
+        {
+            maxIndices = compiledIndices;
+            return compiledNode;
+        }
 
         Tensor<T> result;
         int[] absoluteIndices;
@@ -42088,6 +42131,12 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (predictions == null) throw new ArgumentNullException(nameof(predictions));
         if (targets == null) throw new ArgumentNullException(nameof(targets));
+        // The loss pairs the i-th prediction with the i-th target in row-major order and has the predictions' shape;
+        // every engine and every compiled replay pairs them that way, so the counts must agree.
+        if (targets.Length != predictions.Length)
+            throw new ArgumentException(
+                $"Binary cross-entropy pairs predictions and targets element by element: {predictions.Length} predictions, {targets.Length} targets.",
+                nameof(targets));
 
         if (GraphMode.IsActive)
         {
@@ -42096,8 +42145,12 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var cp = predictions; var ct = targets; var ce = epsilon;
                 return scope.RecordBinary(LazyNodeType.Custom, "TensorBinaryCrossEntropy", predictions, targets, predictions._shape,
-                    (eng, output) => { var r = ((CpuEngine)eng).TensorBinaryCrossEntropy(cp, ct, ce); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
-                    BackwardFunctions<T>.BinaryCrossEntropyBackward, new object[] { (object)epsilon! });
+                    // Through IEngine, so a GPU engine replays its device composition rather than this host loop.
+                    (eng, output) => { var r = eng.TensorBinaryCrossEntropy(cp, ct, ce); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
+                    // The backward reads epsilon as a double, as the eager path saves it: a boxed T threw an
+                    // InvalidCastException in every float compiled step (#1680).
+                    BackwardFunctions<T>.BinaryCrossEntropyBackward,
+                    new object[] { MathHelper.GetNumericOperations<T>().ToDouble(epsilon) });
             }
         }
 
@@ -43202,10 +43255,12 @@ public partial class CpuEngine : ITensorLevelEngine
             if ((bool)maskSpan[i]) dest[w++] = src[i];
         }
 
-        DifferentiableOps.RecordUnary(
-            "TensorMaskedSelect", result, inputTensor,
-            BackwardFunctions<T>.MaskedSelectBackward,
-            savedState: new object[] { computeMask, (int[])inputTensor._shape.Clone() });
+        // The backward scatters by the mask: keep the forward's mask, not the caller's tensor, which it may edit later.
+        if (DifferentiableOps.IsRecording<T>())
+            DifferentiableOps.RecordUnary(
+                "TensorMaskedSelect", result, inputTensor,
+                BackwardFunctions<T>.MaskedSelectBackward,
+                savedState: new object[] { ReferenceEquals(computeMask, mask) ? mask.Clone() : computeMask, (int[])inputTensor._shape.Clone() });
         return result;
     }
 
@@ -43213,6 +43268,8 @@ public partial class CpuEngine : ITensorLevelEngine
     [MethodImpl(Hot)]
     public Tensor<T> TensorWhere<T>(Tensor<bool> condition, Tensor<T> x, Tensor<T> y)
     {
+        if (TryRecordCompiledOp("TensorWhere", new Tensor<T>?[] { x, y }, e => e.TensorWhere(condition, x, y), out var compiledNode))
+            return compiledNode;
         if (condition == null) throw new ArgumentNullException(nameof(condition));
         if (x == null) throw new ArgumentNullException(nameof(x));
         if (y == null) throw new ArgumentNullException(nameof(y));
@@ -43248,6 +43305,8 @@ public partial class CpuEngine : ITensorLevelEngine
     [MethodImpl(Hot)]
     public virtual Tensor<T> TensorWhere<T>(Tensor<Bit> condition, Tensor<T> x, Tensor<T> y)
     {
+        if (TryRecordCompiledOp("TensorWhere", new Tensor<T>?[] { x, y }, e => e.TensorWhere(condition, x, y), out var compiledNode))
+            return compiledNode;
         if (condition == null) throw new ArgumentNullException(nameof(condition));
         if (x == null) throw new ArgumentNullException(nameof(x));
         if (y == null) throw new ArgumentNullException(nameof(y));
@@ -44074,6 +44133,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ScatterAdd<T>(Tensor<T> input, Tensor<int> indices, Tensor<T> values, int axis)
     {
+        if (TryRecordCompiledOp("ScatterAdd", new Tensor<T>?[] { input, values }, e => e.ScatterAdd(input, indices, values, axis), out var compiledNode))
+            return compiledNode;
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
 
         var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -46268,6 +46329,8 @@ public partial class CpuEngine : ITensorLevelEngine
         bool center,
         int? length = null)
     {
+        if (TryRecordCompiledOp("ISTFT", new Tensor<T>?[] { magnitude, phase, window }, e => e.ISTFT(magnitude, phase, nFft, hopLength, window, center, length), out var compiledNode))
+            return compiledNode;
         if (magnitude == null) throw new ArgumentNullException(nameof(magnitude));
         if (phase == null) throw new ArgumentNullException(nameof(phase));
         if (window == null) throw new ArgumentNullException(nameof(window));
@@ -48457,7 +48520,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         }
                         var r = eng.Embedding(ci, ct); DirectGpuTensorEngine.CopyResultInto(eng, r, output);
                     },
-                    BackwardFunctions<T>.EmbeddingBackward, new object[] { indices });
+                    BackwardFunctions<T>.EmbeddingBackward, new object[] { indices, embeddingTable._shape[0], embDim });
             }
         }
 
@@ -51395,6 +51458,8 @@ public partial class CpuEngine : ITensorLevelEngine
     [MethodImpl(Hot)]
     public Tensor<T> TensorMaskedFill<T>(Tensor<T> tensor, bool[] mask, T value)
     {
+        if (TryRecordCompiledOp("TensorMaskedFill", new Tensor<T>?[] { tensor }, e => e.TensorMaskedFill(tensor, mask, value), out var compiledNode))
+            return compiledNode;
         var result = new Tensor<T>(tensor.Shape.ToArray());
         for (int i = 0; i < tensor.Length; i++)
             result[i] = mask[i] ? value : tensor[i];

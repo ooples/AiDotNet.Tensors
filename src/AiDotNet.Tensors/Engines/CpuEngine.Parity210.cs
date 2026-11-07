@@ -621,6 +621,8 @@ public partial class CpuEngine
     [MethodImpl(Hot)]
     public virtual Tensor<T> TensorDot<T>(Tensor<T> a, Tensor<T> b, int[] axesA, int[] axesB)
     {
+        if (TryRecordCompiledOp("TensorDot", new Tensor<T>?[] { a, b }, e => e.TensorDot(a, b, axesA, axesB), out var compiledNode))
+            return compiledNode;
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
         if (axesA == null) throw new ArgumentNullException(nameof(axesA));
@@ -706,6 +708,8 @@ public partial class CpuEngine
     public virtual Tensor<T> TensorCosineSimilarity<T>(
         Tensor<T> x1, Tensor<T> x2, int dim = -1, double eps = 1e-8)
     {
+        if (TryRecordCompiledOp("TensorCosineSimilarity", new Tensor<T>?[] { x1, x2 }, e => e.TensorCosineSimilarity(x1, x2, dim, eps), out var compiledNode))
+            return compiledNode;
         if (x1 == null) throw new ArgumentNullException(nameof(x1));
         if (x2 == null) throw new ArgumentNullException(nameof(x2));
         if (GraphMode.IsInferenceTrace)
@@ -788,6 +792,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorPDist<T>(Tensor<T> input, double p = 2.0)
     {
+        if (TryRecordCompiledOp("TensorPDist", new Tensor<T>?[] { input }, e => e.TensorPDist(input, p), out var compiledNode))
+            return compiledNode;
         // Pairwise p-norm distance over the N rows of a 2-D [N, D] input.
         // Output shape: 1-D of length N·(N-1)/2, ordered (0,1),(0,2),...,
         // matching torch.pdist.
@@ -828,6 +834,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorCDist<T>(Tensor<T> x1, Tensor<T> x2, double p = 2.0)
     {
+        if (TryRecordCompiledOp("TensorCDist", new Tensor<T>?[] { x1, x2 }, e => e.TensorCDist(x1, x2, p), out var compiledNode))
+            return compiledNode;
         // Cross pairwise p-norm: output[i, j] = ‖x1[i] − x2[j]‖_p.
         if (x1 == null) throw new ArgumentNullException(nameof(x1));
         if (x2 == null) throw new ArgumentNullException(nameof(x2));
@@ -946,6 +954,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorKron<T>(Tensor<T> a, Tensor<T> b)
     {
+        if (TryRecordCompiledOp("TensorKron", new Tensor<T>?[] { a, b }, e => e.TensorKron(a, b), out var compiledNode))
+            return compiledNode;
         // Kronecker product torch.kron — generalises to arbitrary rank.
         //
         //   output[i0*b0 + j0, i1*b1 + j1, ..., iN*bN + jN]
@@ -1039,6 +1049,8 @@ public partial class CpuEngine
     [MethodImpl(Hot)]
     public virtual Tensor<T> TensorInner<T>(Tensor<T> a, Tensor<T> b)
     {
+        if (TryRecordCompiledOp("TensorInner", new Tensor<T>?[] { a, b }, e => e.TensorInner(a, b), out var compiledNode))
+            return compiledNode;
         // Inner product over the last axis (torch.inner). Output shape is
         // a.shape[:-1] + b.shape[:-1]; contracts matching last-axis sizes.
         if (a == null) throw new ArgumentNullException(nameof(a));
@@ -1080,6 +1092,8 @@ public partial class CpuEngine
     [MethodImpl(Hot)]
     public virtual Tensor<T> TensorCartesianProd<T>(Tensor<T>[] tensors)
     {
+        if (TryRecordCompiledOp("TensorCartesianProd", Combine(tensors), e => e.TensorCartesianProd(tensors), out var compiledNode))
+            return compiledNode;
         if (tensors == null) throw new ArgumentNullException(nameof(tensors));
         if (tensors.Length == 0)
             throw new ArgumentException("CartesianProd requires at least one tensor");
@@ -1505,6 +1519,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorLogCumSumExp<T>(Tensor<T> tensor, int axis)
     {
+        if (TryRecordCompiledOp("TensorLogCumSumExp", new Tensor<T>?[] { tensor }, e => e.TensorLogCumSumExp(tensor, axis), out var compiledNode))
+            return compiledNode;
         // log-sum-exp cumulative scan: running m = max, running s = sum exp(x-m)
         // result[i] = m + log(s)
         // Numerically stable across wide dynamic ranges.
@@ -1994,6 +2010,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorClampTensor<T>(Tensor<T> tensor, Tensor<T>? min, Tensor<T>? max)
     {
+        if (TryRecordCompiledOp("TensorClampTensor", new Tensor<T>?[] { tensor, min, max }, e => e.TensorClampTensor(tensor, min, max), out var compiledNode))
+            return compiledNode;
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (min is null && max is null)
             throw new ArgumentException("At least one of min / max must be supplied");
@@ -2084,6 +2102,8 @@ public partial class CpuEngine
     public virtual Tensor<T> TensorSelectScatter<T>(
         Tensor<T> tensor, Tensor<T> source, int dim, int index)
     {
+        if (TryRecordCompiledOp("TensorSelectScatter", new Tensor<T>?[] { tensor, source }, e => e.TensorSelectScatter(tensor, source, dim, index), out var compiledNode))
+            return compiledNode;
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (source == null) throw new ArgumentNullException(nameof(source));
         if (GraphMode.IsInferenceTrace)
@@ -2247,6 +2267,8 @@ public partial class CpuEngine
     public virtual Tensor<T> TensorIndexPut<T>(
         Tensor<T> tensor, Tensor<int>[] indices, Tensor<T> source, bool accumulate = false)
     {
+        if (TryRecordCompiledOp("TensorIndexPut", new Tensor<T>?[] { tensor, source }, e => e.TensorIndexPut(tensor, indices, source, accumulate), out var compiledNode))
+            return compiledNode;
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
 
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -2462,6 +2484,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorBlockDiag<T>(Tensor<T>[] matrices)
     {
+        if (TryRecordCompiledOp("TensorBlockDiag", Combine(matrices), e => e.TensorBlockDiag(matrices), out var compiledNode))
+            return compiledNode;
         if (matrices == null) throw new ArgumentNullException(nameof(matrices));
         if (matrices.Length == 0) throw new ArgumentException("BlockDiag requires at least one matrix");
         if (GraphMode.IsInferenceTrace)
@@ -2513,6 +2537,8 @@ public partial class CpuEngine
     public virtual Tensor<T> TensorSliceScatter<T>(
         Tensor<T> tensor, Tensor<T> source, int dim, int start, int length)
     {
+        if (TryRecordCompiledOp("TensorSliceScatter", new Tensor<T>?[] { tensor, source }, e => e.TensorSliceScatter(tensor, source, dim, start, length), out var compiledNode))
+            return compiledNode;
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (source == null) throw new ArgumentNullException(nameof(source));
         if (GraphMode.IsInferenceTrace)
@@ -2573,6 +2599,8 @@ public partial class CpuEngine
     public virtual Tensor<T> TensorIndexFill<T>(
         Tensor<T> tensor, int axis, Tensor<int> indices, T value)
     {
+        if (TryRecordCompiledOp("TensorIndexFill", new Tensor<T>?[] { tensor }, e => e.TensorIndexFill(tensor, axis, indices, value), out var compiledNode))
+            return compiledNode;
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
 
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -2618,6 +2646,8 @@ public partial class CpuEngine
         Tensor<T> tensor, int dim, Tensor<int> indices, Tensor<T> source,
         ScatterReduceMode mode, bool includeSelf = true)
     {
+        if (TryRecordCompiledOp("TensorScatterReduce", new Tensor<T>?[] { tensor, source }, e => e.TensorScatterReduce(tensor, dim, indices, source, mode, includeSelf), out var compiledNode))
+            return compiledNode;
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
 
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -3301,6 +3331,8 @@ public partial class CpuEngine
     [MethodImpl(Hot)]
     public virtual Tensor<T> TensorUnfold<T>(Tensor<T> tensor, int dim, int size, int step)
     {
+        if (TryRecordCompiledOp("TensorUnfold", new Tensor<T>?[] { tensor }, e => e.TensorUnfold(tensor, dim, size, step), out var compiledNode))
+            return compiledNode;
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (GraphMode.IsInferenceTrace)
             return CaptureInferenceKernel(
@@ -3377,6 +3409,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorZeta<T>(Tensor<T> x, Tensor<T> q)
     {
+        if (TryRecordCompiledOp("TensorZeta", new Tensor<T>?[] { x, q }, e => e.TensorZeta(x, q), out var compiledNode))
+            return compiledNode;
         if (x == null) throw new ArgumentNullException(nameof(x));
         if (q == null) throw new ArgumentNullException(nameof(q));
         if (GraphMode.IsInferenceTrace)
@@ -3672,6 +3706,8 @@ public partial class CpuEngine
     [MethodImpl(Hot)]
     public virtual Tensor<T> TensorMultiDot<T>(Tensor<T>[] matrices)
     {
+        if (TryRecordCompiledOp("TensorMultiDot", Combine(matrices), e => e.TensorMultiDot(matrices), out var compiledNode))
+            return compiledNode;
         if (matrices == null) throw new ArgumentNullException(nameof(matrices));
         if (matrices.Length == 0) throw new ArgumentException("MultiDot requires at least one matrix");
         if (GraphMode.IsInferenceTrace)
@@ -3931,6 +3967,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorLdexp<T>(Tensor<T> x, Tensor<int> exp)
     {
+        if (TryRecordCompiledOp("TensorLdexp", new Tensor<T>?[] { x }, e => e.TensorLdexp(x, exp), out var compiledNode))
+            return compiledNode;
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
 
         if (x == null) throw new ArgumentNullException(nameof(x));
@@ -4057,6 +4095,8 @@ public partial class CpuEngine
     [MethodImpl(Hot)]
     public virtual Tensor<T> TensorPut<T>(Tensor<T> tensor, Tensor<int> indices, Tensor<T> source)
     {
+        if (TryRecordCompiledOp("TensorPut", new Tensor<T>?[] { tensor, source }, e => e.TensorPut(tensor, indices, source), out var compiledNode))
+            return compiledNode;
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
 
         // Flat-indexed scatter. Inverse of Take: tensor[indices.flatten()] = source.
@@ -4160,6 +4200,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorPolygamma<T>(int n, Tensor<T> tensor)
     {
+        if (TryRecordCompiledOp("TensorPolygamma", new Tensor<T>?[] { tensor }, e => e.TensorPolygamma(n, tensor), out var compiledNode))
+            return compiledNode;
         if (n < 0) throw new ArgumentOutOfRangeException(nameof(n), "Polygamma order must be >= 0");
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (GraphMode.IsInferenceTrace)
@@ -4433,6 +4475,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorDigamma<T>(Tensor<T> tensor)
     {
+        if (TryRecordCompiledOp("TensorDigamma", new Tensor<T>?[] { tensor }, e => e.TensorDigamma(tensor), out var compiledNode))
+            return compiledNode;
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (GraphMode.IsInferenceTrace)
             return CaptureInferenceKernel(new[] { tensor }, engine => engine.TensorDigamma(tensor));

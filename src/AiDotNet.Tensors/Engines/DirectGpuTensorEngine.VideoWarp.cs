@@ -67,6 +67,8 @@ public partial class DirectGpuTensorEngine
     public override Tensor<T> ForwardSplat<T>(
         Tensor<T> input, Tensor<T> flow, bool normalize = true)
     {
+        if (TryRecordCompiledOp("ForwardSplat", new Tensor<T>?[] { input, flow }, e => e.ForwardSplat(input, flow, normalize), out var compiledNode))
+            return compiledNode;
         using var __gpuOp = EnterGpuOp();
         ValidateForwardSplat(input, flow);
         if (typeof(T) == typeof(float) && IsGpuAvailable && Compilation.GraphMode.IsActive)

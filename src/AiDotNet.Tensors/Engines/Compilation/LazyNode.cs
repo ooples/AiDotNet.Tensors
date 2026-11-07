@@ -16,6 +16,12 @@ internal sealed class LazyNode<T> : ILazyNode
     public LazyNodeType OpType { get; }
     public string OpName { get; }
 
+    /// <summary>
+    /// True when the node's replay updates host state of its own every step (an unseeded random op drawing its step's
+    /// seed). A captured CUDA graph does not re-run host code, so a plan holding such a node is never graph-captured.
+    /// </summary>
+    internal bool ReplaysHostState { get; set; }
+
     // ═══ Input graph edges (inline for 1-3, overflow for 4+) ═══
     public readonly Tensor<T> Input0;
     public readonly Tensor<T>? Input1;

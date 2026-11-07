@@ -459,7 +459,8 @@ extern ""C"" __global__ __launch_bounds__(256) void reciprocal_backward(const fl
     // Second arg is the reciprocal OUTPUT y = 1/x (see ReciprocalBackward signature), so
     // d/dx(1/x) = -1/x^2 = -y^2. Must MULTIPLY by y*y, not divide (matches CpuEngine.ReciprocalBackward).
     float y = output[idx];
-    gradInput[idx] = -gradOutput[idx] * (y * y);
+    // g * y first: y * y overflows float for |y| > 1.8e19 even when the derivative g * y^2 does not.
+    gradInput[idx] = -(gradOutput[idx] * y) * y;
 }
 
 // ===========================================================================

@@ -146,6 +146,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> BoxIou<T>(Tensor<T> boxesA, Tensor<T> boxesB)
     {
+        if (TryRecordCompiledOp("BoxIou", new Tensor<T>?[] { boxesA, boxesB }, e => e.BoxIou(boxesA, boxesB), out var compiledNode))
+            return compiledNode;
         ValidateBoxes(boxesA, nameof(boxesA));
         ValidateBoxes(boxesB, nameof(boxesB));
         if (GraphMode.IsInferenceTrace)
@@ -161,6 +163,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> GeneralizedBoxIou<T>(Tensor<T> boxesA, Tensor<T> boxesB)
     {
+        if (TryRecordCompiledOp("GeneralizedBoxIou", new Tensor<T>?[] { boxesA, boxesB }, e => e.GeneralizedBoxIou(boxesA, boxesB), out var compiledNode))
+            return compiledNode;
         ValidateBoxes(boxesA, nameof(boxesA));
         ValidateBoxes(boxesB, nameof(boxesB));
         if (GraphMode.IsInferenceTrace)
@@ -210,6 +214,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> DistanceBoxIou<T>(Tensor<T> boxesA, Tensor<T> boxesB)
     {
+        if (TryRecordCompiledOp("DistanceBoxIou", new Tensor<T>?[] { boxesA, boxesB }, e => e.DistanceBoxIou(boxesA, boxesB), out var compiledNode))
+            return compiledNode;
         if (boxesA == null) throw new ArgumentNullException(nameof(boxesA));
         if (boxesB == null) throw new ArgumentNullException(nameof(boxesB));
         if (GraphMode.IsInferenceTrace)
@@ -224,6 +230,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> CompleteBoxIou<T>(Tensor<T> boxesA, Tensor<T> boxesB)
     {
+        if (TryRecordCompiledOp("CompleteBoxIou", new Tensor<T>?[] { boxesA, boxesB }, e => e.CompleteBoxIou(boxesA, boxesB), out var compiledNode))
+            return compiledNode;
         if (boxesA == null) throw new ArgumentNullException(nameof(boxesA));
         if (boxesB == null) throw new ArgumentNullException(nameof(boxesB));
         if (GraphMode.IsInferenceTrace)

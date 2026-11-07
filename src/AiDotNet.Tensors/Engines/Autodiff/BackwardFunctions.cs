@@ -9689,19 +9689,6 @@ internal static class BackwardFunctions<T>
         {
             int n = (int)numOps.ToDouble(b[k * 5]);
             if (n < 0 || n >= N) continue;
-            // Reconstruct bin bounds with the same away-from-zero rule the forward
-            // RoIPool uses. Math.Round's default ties-to-even would place a
-            // half-valued coordinate in a different pixel than the forward pass,
-            // scattering the gradient to the wrong argmax pixel.
-            int x1 = (int)Math.Round(numOps.ToDouble(b[k * 5 + 1]) * spatialScale, MidpointRounding.AwayFromZero);
-            int y1 = (int)Math.Round(numOps.ToDouble(b[k * 5 + 2]) * spatialScale, MidpointRounding.AwayFromZero);
-            int x2 = (int)Math.Round(numOps.ToDouble(b[k * 5 + 3]) * spatialScale, MidpointRounding.AwayFromZero);
-            int y2 = (int)Math.Round(numOps.ToDouble(b[k * 5 + 4]) * spatialScale, MidpointRounding.AwayFromZero);
-            int roiW = Math.Max(x2 - x1 + 1, 1);
-            int roiH = Math.Max(y2 - y1 + 1, 1);
-            double binH = (double)roiH / outH;
-            double binW = (double)roiW / outW;
-
             for (int c = 0; c < C; c++)
             {
                 int planeBase = (n * C + c) * H * W;
@@ -9710,10 +9697,8 @@ internal static class BackwardFunctions<T>
                 {
                     double g = numOps.ToDouble(go[((k * C + c) * outH + ph) * outW + pw]);
                     if (g == 0) continue;
-                    int hs = Math.Max(0, Math.Min(H, (int)Math.Floor(ph * binH) + y1));
-                    int he = Math.Max(0, Math.Min(H, (int)Math.Ceiling((ph + 1) * binH) + y1));
-                    int ws = Math.Max(0, Math.Min(W, (int)Math.Floor(pw * binW) + x1));
-                    int we = Math.Max(0, Math.Min(W, (int)Math.Ceiling((pw + 1) * binW) + x1));
+                    // The forward's window, in the forward's arithmetic (float for float tensors, as on the GPU).
+                    var (hs, he, ws, we) = CpuEngine.RoIPoolWindow(b, k, spatialScale, outH, outW, ph, pw, H, W);
                     if (hs >= he || ws >= we) continue;
                     // Find argmax in the bin and scatter g there.
                     double best = double.NegativeInfinity;
@@ -9739,7 +9724,9 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var input = inputs[0];
-        float minAmp = (float)savedState[0];
+        // The forward's clamp: max(x, max(AmplitudeToDBFloor, minAmplitude)).
+        double minAmp = Math.Max(CpuEngine.AmplitudeToDBFloor, (float)savedState[0]);
+        float? topDb = savedState.Length > 1 ? (float?)savedState[1] : null;
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(input._shape);
         using var srcLease = input.Lease();
@@ -9749,14 +9736,45 @@ internal static class BackwardFunctions<T>
         using var dstLease = result.LeaseWritable();
         var dst = dstLease.Span;
         double scale = 20.0 / Math.Log(10.0);
+
+        // With topDb, an output below peak - topDb is replaced by peak - topDb: a constant in its own input, and
+        // a function of the peak's. The forward's peak is the first maximum, and it compares the rounded dB value.
+        int peakIndex = -1;
+        double floor = double.NegativeInfinity;
+        if (topDb.HasValue)
+        {
+            double peak = double.NegativeInfinity;
+            for (int i = 0; i < src.Length; i++)
+            {
+                double db = 20.0 * Math.Log10(Math.Max(numOps.ToDouble(src[i]), minAmp));
+                if (db > peak) { peak = db; peakIndex = i; }
+            }
+
+            floor = peak - topDb.Value;
+        }
+
+        double toPeak = 0;
         for (int i = 0; i < src.Length; i++)
         {
             double x = numOps.ToDouble(src[i]);
-            // Below floor the forward clamps to minAmp (a constant) —
-            // gradient is zero there.
-            double d = x > minAmp ? scale / x : 0.0;
-            dst[i] = numOps.FromDouble(numOps.ToDouble(gout[i]) * d);
+            double g = numOps.ToDouble(gout[i]);
+            if (topDb.HasValue && numOps.ToDouble(numOps.FromDouble(20.0 * Math.Log10(Math.Max(x, minAmp)))) < floor)
+            {
+                toPeak += g;
+                continue;
+            }
+
+            // Below minAmp the forward clamps to a constant: gradient zero there.
+            dst[i] = numOps.FromDouble(x > minAmp ? g * scale / x : 0.0);
         }
+
+        if (peakIndex >= 0)
+        {
+            double xp = numOps.ToDouble(src[peakIndex]);
+            if (xp > minAmp)
+                dst[peakIndex] = numOps.FromDouble(numOps.ToDouble(dst[peakIndex]) + toPeak * scale / xp);
+        }
+
         DifferentiableOps.AccumulateGrad(grads, input, result, engine);
     }
 
