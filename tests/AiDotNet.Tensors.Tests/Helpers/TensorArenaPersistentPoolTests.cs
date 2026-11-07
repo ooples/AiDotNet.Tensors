@@ -119,6 +119,15 @@ public class TensorArenaPersistentPoolTests
     [Fact]
     public void ManyDistinctShapes_RetentionStaysBounded()
     {
+        // Budget 0 = pure generation eviction: no idle bucket survives.
+        long savedBudget = TensorPool.ArenaIdleRetentionBytes;
+        TensorPool.ArenaIdleRetentionBytes = 0;
+        try { ManyDistinctShapesCore(); }
+        finally { TensorPool.ArenaIdleRetentionBytes = savedBudget; }
+    }
+
+    private static void ManyDistinctShapesCore()
+    {
         TensorArena.ClearPersistentPool();
 
         const int shapes = 40;
@@ -302,5 +311,70 @@ public class TensorArenaPersistentPoolTests
         var t2 = TensorAllocator.RentUninitialized<float>(shape);
         t2.AsWritableSpan()[0] = 7f;
         Assert.Equal(7f, t2.AsSpan()[0]);
+    }
+
+    /// <summary>
+    /// A process that alternates models (an interleaved latency harness, a service hosting several models) leaves
+    /// each model's buckets idle for as many lifetimes as there are other models. Pure generation eviction dropped
+    /// them between calls, so every call re-allocated and zeroed its whole working set. Within the idle budget they
+    /// survive: after one warm-up call per model, every rent is a reuse hit.
+    /// </summary>
+    [Fact]
+    public void AlternatingModels_WithinIdleBudget_EveryCallReuses()
+    {
+        long savedBudget = TensorPool.ArenaIdleRetentionBytes;
+        TensorPool.ArenaIdleRetentionBytes = 64L * 1024 * 1024;
+        try
+        {
+            TensorArena.ClearPersistentPool();
+            int[][] models = { new[] { 96 * 1024 }, new[] { 112 * 1024 }, new[] { 144 * 1024 }, new[] { 176 * 1024 } };
+            const int rounds = 6;
+            for (int r = 0; r < rounds; r++)
+                foreach (var shape in models)
+                {
+                    using var arena = TensorArena.Create();
+                    TensorAllocator.RentUninitialized<float>(shape).AsWritableSpan()[0] = r;
+                }
+            Assert.Equal((rounds - 1) * models.Length, TensorArena.PersistentReuseHits);
+            Assert.Equal(models.Length, TensorArena.CrossArenaBucketCount);
+        }
+        finally { TensorPool.ArenaIdleRetentionBytes = savedBudget; }
+    }
+
+    /// <summary>
+    /// The budget bounds idle bytes and evicts the least recently touched bucket first: with room for two idle
+    /// 512 KiB buckets, cycling through four sizes keeps at most two idle buckets (plus the active one), and those are
+    /// the most recently used sizes.
+    /// </summary>
+    [Fact]
+    public void OverIdleBudget_EvictsLeastRecentlyTouchedFirst()
+    {
+        long savedBudget = TensorPool.ArenaIdleRetentionBytes;
+        const int elems = 128 * 1024;                       // 512 KiB of float per bucket
+        TensorPool.ArenaIdleRetentionBytes = 2L * elems * sizeof(float);
+        try
+        {
+            TensorArena.ClearPersistentPool();
+            // Sizes A, B, C, D, then several idle lifetimes so every bucket but the newest is idle.
+            for (int i = 0; i < 4; i++)
+            {
+                using var arena = TensorArena.Create();
+                TensorAllocator.RentUninitialized<float>(new[] { elems + (i * 1024) }).AsWritableSpan()[0] = i;
+            }
+            for (int i = 0; i < 4; i++)
+            {
+                using var idle = TensorArena.Create();
+            }
+            Assert.InRange(TensorArena.CrossArenaBucketCount, 1, 2);
+            long hitsBefore = TensorArena.PersistentReuseHits;
+            // The newest size (D) must have survived; the oldest (A) must not.
+            using (var arena = TensorArena.Create())
+                TensorAllocator.RentUninitialized<float>(new[] { elems + (3 * 1024) }).AsWritableSpan()[0] = 1;
+            Assert.Equal(hitsBefore + 1, TensorArena.PersistentReuseHits);
+            using (var arena = TensorArena.Create())
+                TensorAllocator.RentUninitialized<float>(new[] { elems }).AsWritableSpan()[0] = 1;
+            Assert.Equal(hitsBefore + 1, TensorArena.PersistentReuseHits);
+        }
+        finally { TensorPool.ArenaIdleRetentionBytes = savedBudget; }
     }
 }

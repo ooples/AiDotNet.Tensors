@@ -50,6 +50,23 @@ public static class TensorPool
     public static bool ForceFreshAllocations { get; set; } = IsEnvTrue("AIDOTNET_FORCE_FRESH_ALLOCATIONS");
 
     /// <summary>
+    /// Bytes of IDLE cross-arena buffers one thread may keep: buffers whose (type, size) bucket no arena has rented or
+    /// returned for more than two arena lifetimes. Active buckets (a training loop's per-step shapes) are never
+    /// counted or evicted. Within the budget idle buckets survive, so a process that alternates models (an
+    /// interleaved latency harness, a service hosting several models) reuses each model's buffers instead of
+    /// allocating and zeroing them again every call; beyond it the least recently touched buckets are dropped first.
+    /// 0 restores pure generation eviction. Default 256 MiB, or <c>AIDOTNET_ARENA_IDLE_RETENTION_MB</c>.
+    /// </summary>
+    public static long ArenaIdleRetentionBytes { get; set; } = EnvMegabytes("AIDOTNET_ARENA_IDLE_RETENTION_MB", 256);
+
+    private static long EnvMegabytes(string name, long defaultMb)
+    {
+        var text = Environment.GetEnvironmentVariable(name);
+        long mb = long.TryParse(text, out var v) && v >= 0 ? v : defaultMb;
+        return mb * 1024L * 1024L;
+    }
+
+    /// <summary>
     /// Creates a zero-initialized tensor with the given shape.
     /// Large tensors use ArrayPool to reduce GC pressure; small-medium tensors
     /// use standard CLR allocation. All paths return zeroed memory.

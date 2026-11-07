@@ -136,10 +136,13 @@ public sealed class TensorArena : IDisposable
     /// a bucket untouched for several lifetimes is not serving that purpose — it is holding a
     /// previous model's working set resident. Two preserves steady-state reuse for a train loop that
     /// rents the same shapes every step (touched every generation, so never stale) while releasing a
-    /// different model's shapes within two lifetimes. This is deliberately a generation policy and
-    /// not a byte budget: a byte cap cannot tell "one paper-scale model's ~1 GB working set, which
-    /// the next step genuinely wants" apart from "twenty models' leftovers", and picking a number
-    /// low enough to bound the second would evict the first every step and undo issue #478.
+    /// different model's shapes within two lifetimes. The generation policy decides what is IDLE; a byte budget
+    /// (<see cref="TensorPool.ArenaIdleRetentionBytes"/>) then bounds only the idle part. A cap on
+    /// ALL retained bytes could not tell "one paper-scale model's ~1 GB working set, which the next
+    /// step genuinely wants" apart from "twenty models' leftovers"; a cap on idle bytes never touches
+    /// the first (it is active) and still bounds the second. Without it a process alternating two or
+    /// more models evicted each one's buffers between its calls and re-allocated (and zeroed) every
+    /// intermediate on every call.
     /// </remarks>
     private const long MaxIdleGenerations = 2;
 
@@ -323,24 +326,50 @@ public sealed class TensorArena : IDisposable
     /// </summary>
     private static void PruneStaleCrossArenaBuckets()
     {
-        Prune(_persistent);
-        Prune(_carryPool);
+        // Idle = untouched for more than MaxIdleGenerations lifetimes. Empty idle buckets hold nothing and are always
+        // dropped; non-empty ones are kept while their total bytes fit TensorPool.ArenaIdleRetentionBytes, evicting
+        // the least recently touched first. A steady train loop touches its buckets every lifetime, so none of its
+        // buffers is ever idle; a process alternating between models keeps each model's working set within budget.
+        long budget = TensorPool.ArenaIdleRetentionBytes;
+        List<(Dictionary<(Type, int), Bucket> Pool, (Type, int) Key, long Generation, long Bytes)>? idle = null;
+        long idleBytes = 0;
+        Collect(_persistent);
+        Collect(_carryPool);
+        if (idle is null || idleBytes <= budget) return;
 
-        static void Prune(Dictionary<(Type, int), Bucket>? pool)
+        idle.Sort((a, b) => a.Generation.CompareTo(b.Generation));
+        for (int i = 0; i < idle.Count && idleBytes > budget; i++)
+        {
+            idle[i].Pool.Remove(idle[i].Key);
+            idleBytes -= idle[i].Bytes;
+        }
+
+        void Collect(Dictionary<(Type, int), Bucket>? pool)
         {
             if (pool is null || pool.Count == 0) return;
-
-            List<(Type, int)>? stale = null;
+            List<(Type, int)>? empty = null;
             foreach (var kvp in pool)
             {
                 if (kvp.Value.LastTouchedGeneration + MaxIdleGenerations >= _arenaGeneration) continue;
-                (stale ??= new List<(Type, int)>()).Add(kvp.Key);
+                if (kvp.Value.Arrays.Count == 0) { (empty ??= new List<(Type, int)>()).Add(kvp.Key); continue; }
+                long bytes = (long)kvp.Value.Arrays.Count * kvp.Key.Item2 * ElementBytes(kvp.Key.Item1);
+                (idle ??= new()).Add((pool, kvp.Key, kvp.Value.LastTouchedGeneration, bytes));
+                idleBytes += bytes;
             }
-
-            if (stale is null) return;
-            for (int i = 0; i < stale.Count; i++) pool.Remove(stale[i]);
+            if (empty is not null)
+                for (int i = 0; i < empty.Count; i++) pool.Remove(empty[i]);
         }
     }
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<Type, int> s_elementBytes = new();
+
+    /// <summary>Bytes per element of a pooled array's element type (pointer size for a reference type).</summary>
+    private static int ElementBytes(Type type) => s_elementBytes.GetOrAdd(type, static t =>
+    {
+        if (!t.IsValueType) return IntPtr.Size;
+        try { return System.Runtime.InteropServices.Marshal.SizeOf(t); }
+        catch (ArgumentException) { return IntPtr.Size; }
+    });
 
     /// <summary>
     /// Buckets currently held across the two cross-arena pools on this thread. Diagnostic: lets a

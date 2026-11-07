@@ -71,3 +71,5 @@ AiDotNet.Tensors.Engines.Gpu.HostCompressedMomentAdam
 static AiDotNet.Tensors.Engines.Gpu.HostCompressedMomentAdam.Bf16Step(float[]! param, float[]! grad, byte[]! m, byte[]! v, int length, float lr, float beta1, float beta2, float epsilon, float weightDecay, int step, bool decoupledWeightDecay) -> void
 static AiDotNet.Tensors.Engines.Gpu.HostCompressedMomentAdam.Int8Step(float[]! param, float[]! grad, byte[]! mQuant, byte[]! vQuant, float[]! mScales, float[]! vScales, int length, int blockSize, float lr, float beta1, float beta2, float epsilon, float weightDecay, int step, bool decoupledWeightDecay) -> void
 static AiDotNet.Tensors.Engines.Gpu.HostCompressedMomentAdam.BlockCount(int length, int blockSize) -> int
+static AiDotNet.Tensors.Helpers.TensorPool.ArenaIdleRetentionBytes.get -> long
+static AiDotNet.Tensors.Helpers.TensorPool.ArenaIdleRetentionBytes.set -> void
