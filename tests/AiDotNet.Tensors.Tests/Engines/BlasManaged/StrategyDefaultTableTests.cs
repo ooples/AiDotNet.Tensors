@@ -61,6 +61,30 @@ public class StrategyDefaultTableTests
     }
 
     [Theory]
+    // Past the sweep's measured range (1.07G work) the band-3 transposed-B rule does not apply: the
+    // LM-head products of a 49152-token vocabulary ran 5-6.5x faster on PackBoth than on Streaming on a
+    // 128-thread 3990X (1331 vs 266 ms, 1507 vs 232 ms).
+    [InlineData(512, 256, 49152)]   // fused linear-CE dHidden = dLogits . W^T
+    [InlineData(512, 49152, 256)]   // logits = h . table^T
+    [InlineData(510, 256, 49152)]
+    public void Route_VeryWideAvx2_TransposedB_BeyondMeasuredWork_PacksBoth(int m, int n, int k)
+    {
+        Assert.True((long)m * n * k > StrategyDefaultTable.VeryWideTransBStreamingMaxWork);
+        var key = new HardwareFingerprint.HwKey("avx2", "amd", 3);
+        Assert.Equal(
+            PackingMode.ForcePackBoth,
+            StrategyDefaultTable.Route(key, m, n, k, transA: false, transB: true));
+    }
+
+    [Fact]
+    public void Route_VeryWideAvx2_TransposedB_MeasuredWorkBoundary_StillStreams()
+    {
+        // 1024 x 1024 x 1024 = 2^30, exactly the cap: still inside the measured range.
+        var key = new HardwareFingerprint.HwKey("avx2", "amd", 3);
+        Assert.Equal(PackingMode.ForceStreaming, StrategyDefaultTable.Route(key, 1024, 1024, 1024, transA: false, transB: true));
+    }
+
+    [Theory]
     // The UNTRANSPOSED routing for band 3 is deliberately identical to band 2. The sweep
     // showed untransposed optima differ and sometimes oppose the transposed ones
     // (512x2048x512 untransposed wants PackBoth; Streaming is ~3.0x slower there).

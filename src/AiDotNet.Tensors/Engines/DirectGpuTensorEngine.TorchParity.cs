@@ -306,6 +306,8 @@ public partial class DirectGpuTensorEngine
     /// <see cref="GpuLaunchProbe"/> fallback (follow-ups #1124-#1128).</remarks>
     public override Tensor<T> TensorQuantile<T>(Tensor<T> tensor, double q, int? dim = null, bool keepDim = false, QuantileInterpolation interpolation = QuantileInterpolation.Linear)
     {
+        if (TryRecordCompiledOp("TensorQuantile", new Tensor<T>?[] { tensor }, e => e.TensorQuantile(tensor, q, dim, keepDim, interpolation), out var compiledNode))
+            return compiledNode;
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         if (TryQuantileOnDevice("TensorQuantile", tensor, q, dim, keepDim, interpolation, ignoreNan: false) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorQuantile: no device kernel", null);
@@ -317,6 +319,8 @@ public partial class DirectGpuTensorEngine
     /// <see cref="GpuLaunchProbe"/> fallback (follow-ups #1124-#1128).</remarks>
     public override Tensor<T> TensorNanQuantile<T>(Tensor<T> tensor, double q, int? dim = null, bool keepDim = false, QuantileInterpolation interpolation = QuantileInterpolation.Linear)
     {
+        if (TryRecordCompiledOp("TensorNanQuantile", new Tensor<T>?[] { tensor }, e => e.TensorNanQuantile(tensor, q, dim, keepDim, interpolation), out var compiledNode))
+            return compiledNode;
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         if (TryQuantileOnDevice("TensorNanQuantile", tensor, q, dim, keepDim, interpolation, ignoreNan: true) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorNanQuantile: no device kernel", null);
@@ -356,6 +360,8 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorGridSample3D<T>(Tensor<T> input, Tensor<T> grid, GridSampleMode mode = GridSampleMode.Bilinear, GridSamplePadding padding = GridSamplePadding.Zeros, bool alignCorners = false)
     {
+        if (TryRecordCompiledOp("TensorGridSample3D", new Tensor<T>?[] { input, grid }, e => e.TensorGridSample3D(input, grid, mode, padding, alignCorners), out var compiledNode))
+            return compiledNode;
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         if (TryGridSample3DOnDevice(input, grid, mode, padding, alignCorners) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorGridSample3D: no device kernel", null);
@@ -403,7 +409,9 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorRrelu<T>(Tensor<T> tensor, double lower = 1.0 / 8, double upper = 1.0 / 3, bool training = false, int? seed = null)
     {
-        if (training) GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        // Under GraphMode the CpuEngine op records the compiled node (a training trace re-draws the slopes on each
+        // replay); each replay re-enters here outside graph mode and runs the device kernel.
+        if (GraphMode.IsActive) return base.TensorRrelu<T>(tensor, lower, upper, training, seed);
         if (TryRreluOnDevice(tensor, lower, upper, training, seed) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorRrelu: no device kernel", null);
         return base.TensorRrelu<T>(tensor, lower, upper, training, seed);
@@ -440,6 +448,8 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorMsort<T>(Tensor<T> tensor)
     {
+        if (TryRecordCompiledOp("TensorMsort", new Tensor<T>?[] { tensor }, e => e.TensorMsort(tensor), out var compiledNode))
+            return compiledNode;
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         if (TryMsortOnDevice(tensor) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorMsort: no device kernel", null);
@@ -449,6 +459,8 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorDiagflat<T>(Tensor<T> tensor, int offset = 0)
     {
+        if (TryRecordCompiledOp("TensorDiagflat", new Tensor<T>?[] { tensor }, e => e.TensorDiagflat(tensor, offset), out var compiledNode))
+            return compiledNode;
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         if (TryDiagflatOnDevice(tensor, offset) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorDiagflat: no device kernel", null);
@@ -458,6 +470,8 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorDiagonalScatter<T>(Tensor<T> input, Tensor<T> src, int offset = 0, int dim1 = 0, int dim2 = 1)
     {
+        if (TryRecordCompiledOp("TensorDiagonalScatter", new Tensor<T>?[] { input, src }, e => e.TensorDiagonalScatter(input, src, offset, dim1, dim2), out var compiledNode))
+            return compiledNode;
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         if (TryDiagonalScatterOnDevice(input, src, offset, dim1, dim2) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorDiagonalScatter: no device kernel", null);

@@ -61,8 +61,21 @@ void main() {
     int idx = int(gl_GlobalInvocationID.x); int total = batch*numFreqs*numFrames; if (idx >= total) return;
     int frame = idx % numFrames; int tmp = idx / numFrames; int k = tmp % numFreqs; int b = tmp / numFreqs;
     int start = frame * hop; int inOff = b * Lp; float re = 0.0, im = 0.0;
-    float bk = -2.0 * float(M_PI) * float(k) / float(nFft);
-    for (int i = 0; i < nFft; i++) { float x = padded[inOff + start + i] * window[i]; float a = bk * float(i); re += x*cos(a); im += x*sin(a); }
+    // Twiddle from the integer phase m = k*i mod nFft (#1680): the angle stays in [-pi, pi] and the quarter
+    // turns are exact, as an FFT's are. cos/sin of -2*pi*k*i/nFft, with |angle| up to pi*nFft, left the DC and
+    // Nyquist bins of a real frame a spurious imaginary part: a wrong phase there, amplified by 1/|C| in its gradient.
+    float tw = -2.0 * float(M_PI) / float(nFft); int m = 0;
+    for (int i = 0; i < nFft; i++) {
+        float x = padded[inOff + start + i] * window[i];
+        float c; float s;
+        if (m == 0) { c = 1.0; s = 0.0; }
+        else if (2 * m == nFft) { c = -1.0; s = 0.0; }
+        else if (4 * m == nFft) { c = 0.0; s = -1.0; }
+        else if (4 * m == 3 * nFft) { c = 0.0; s = 1.0; }
+        else { float a = tw * float((2 * m > nFft ? m - nFft : m)); c = cos(a); s = sin(a); }
+        re += x * c; im += x * s;
+        m += k; if (m >= nFft) m -= nFft;
+    }
     int outOff = b*numFreqs*numFrames + k*numFrames + frame;
     mag[outOff] = sqrt(re*re + im*im); phase[outOff] = atan(im, re);
 

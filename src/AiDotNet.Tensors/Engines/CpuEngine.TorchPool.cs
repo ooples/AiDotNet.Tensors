@@ -138,6 +138,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorAdaptiveAvgPool1D<T>(Tensor<T> input, int outputSize)
     {
+        if (TryRecordCompiledOp("TensorAdaptiveAvgPool1D", new Tensor<T>?[] { input }, e => e.TensorAdaptiveAvgPool1D(input, outputSize), out var compiledNode))
+            return compiledNode;
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         return AdaptivePool("TensorAdaptiveAvgPool1D", input, new[] { outputSize }, WindowReduce.Average).Output;
     }
@@ -145,6 +147,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorAdaptiveAvgPool3D<T>(Tensor<T> input, int[] outputSize)
     {
+        if (TryRecordCompiledOp("TensorAdaptiveAvgPool3D", new Tensor<T>?[] { input }, e => e.TensorAdaptiveAvgPool3D(input, outputSize), out var compiledNode))
+            return compiledNode;
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         return AdaptivePool("TensorAdaptiveAvgPool3D", input, CheckSize(outputSize, 3), WindowReduce.Average).Output;
     }
@@ -152,6 +156,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorAdaptiveMaxPool1D<T>(Tensor<T> input, int outputSize)
     {
+        if (TryRecordCompiledOp("TensorAdaptiveMaxPool1D", new Tensor<T>?[] { input }, e => e.TensorAdaptiveMaxPool1D(input, outputSize), out var compiledNode))
+            return compiledNode;
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         return AdaptivePool("TensorAdaptiveMaxPool1D", input, new[] { outputSize }, WindowReduce.Max).Output;
     }
@@ -159,6 +165,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorAdaptiveMaxPool3D<T>(Tensor<T> input, int[] outputSize)
     {
+        if (TryRecordCompiledOp("TensorAdaptiveMaxPool3D", new Tensor<T>?[] { input }, e => e.TensorAdaptiveMaxPool3D(input, outputSize), out var compiledNode))
+            return compiledNode;
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         return AdaptivePool("TensorAdaptiveMaxPool3D", input, CheckSize(outputSize, 3), WindowReduce.Max).Output;
     }
@@ -188,6 +196,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorLpPool<T>(Tensor<T> input, double power, int[] kernelSize, int[]? stride = null)
     {
+        if (TryRecordCompiledOp("TensorLpPool", new Tensor<T>?[] { input }, e => e.TensorLpPool(input, power, kernelSize, stride), out var compiledNode))
+            return compiledNode;
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (kernelSize == null || kernelSize.Length == 0) throw new ArgumentException("kernelSize is required.", nameof(kernelSize));
@@ -215,6 +225,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorMaxUnpool<T>(Tensor<T> input, Tensor<int> indices, int[] outputSize)
     {
+        if (TryRecordCompiledOp("TensorMaxUnpool", new Tensor<T>?[] { input }, e => e.TensorMaxUnpool(input, indices, outputSize), out var compiledNode))
+            return compiledNode;
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HeterogeneousInput);
         var source = MaxUnpoolSource(input, indices, outputSize, out int[] shape);
         return IndexMap("TensorMaxUnpool", input, shape, source);

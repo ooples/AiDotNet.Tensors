@@ -6198,7 +6198,18 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             }
     }
 
-    // Param order matches the engine call (input, gradOutput, ...) so the kernel-order bindings below bind the right buffers.
+    // IDirectGpuBackend declares gradOutput first; this class's public method keeps its shipped parameter order, so
+    // a positional caller of the concrete class still binds as before. Both bind the kernel's buffers by name.
+    void IDirectGpuBackend.DeformableConv2DBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradWeights,
+        int batch, int inChannels, int inHeight, int inWidth,
+        int outChannels, int outHeight, int outWidth,
+        int kernelH, int kernelW,
+        int strideH, int strideW, int padH, int padW,
+        int dilationH, int dilationW,
+        int groups, int deformGroups)
+        => DeformableConv2DBackwardWeights(input, gradOutput, offsets, mask, gradWeights,
+            batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups);
+
     public unsafe void DeformableConv2DBackwardWeights(IGpuBuffer input, IGpuBuffer gradOutput, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradWeights,
         int batch, int inChannels, int inHeight, int inWidth,
         int outChannels, int outHeight, int outWidth,
@@ -6252,7 +6263,18 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             }
     }
 
-    // Param order matches the engine call (input, weights, gradOutput, ...) so the kernel-order bindings below bind the right buffers.
+    // IDirectGpuBackend declares gradOutput first; this class's public method keeps its shipped parameter order, so
+    // a positional caller of the concrete class still binds as before. Both bind the kernel's buffers by name.
+    void IDirectGpuBackend.DeformableConv2DBackwardOffset(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradOffsets,
+        int batch, int inChannels, int inHeight, int inWidth,
+        int outChannels, int outHeight, int outWidth,
+        int kernelH, int kernelW,
+        int strideH, int strideW, int padH, int padW,
+        int dilationH, int dilationW,
+        int groups, int deformGroups)
+        => DeformableConv2DBackwardOffset(input, weights, gradOutput, offsets, mask, gradOffsets,
+            batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups);
+
     public unsafe void DeformableConv2DBackwardOffset(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer gradOutput, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradOffsets,
         int batch, int inChannels, int inHeight, int inWidth,
         int outChannels, int outHeight, int outWidth,
@@ -6308,7 +6330,18 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             }
     }
 
-    // Param order matches the engine call (input, weights, gradOutput, ...) so the kernel-order bindings below bind the right buffers.
+    // IDirectGpuBackend declares gradOutput first; this class's public method keeps its shipped parameter order, so
+    // a positional caller of the concrete class still binds as before. Both bind the kernel's buffers by name.
+    void IDirectGpuBackend.DeformableConv2DBackwardMask(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer gradMask,
+        int batch, int inChannels, int inHeight, int inWidth,
+        int outChannels, int outHeight, int outWidth,
+        int kernelH, int kernelW,
+        int strideH, int strideW, int padH, int padW,
+        int dilationH, int dilationW,
+        int groups, int deformGroups)
+        => DeformableConv2DBackwardMask(input, weights, gradOutput, offsets, gradMask,
+            batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups);
+
     public unsafe void DeformableConv2DBackwardMask(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer gradOutput, IGpuBuffer offsets, IGpuBuffer gradMask,
         int batch, int inChannels, int inHeight, int inWidth,
         int outChannels, int outHeight, int outWidth,

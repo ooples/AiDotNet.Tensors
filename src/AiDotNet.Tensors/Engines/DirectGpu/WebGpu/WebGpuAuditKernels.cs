@@ -37,8 +37,21 @@ struct P { batch: i32, Lp: i32, nFft: i32, hop: i32, numFrames: i32, numFreqs: i
   let idx = i32(gid.x); let total = pc.batch * pc.numFreqs * pc.numFrames; if (idx >= total) { return; }
   let frame = idx % pc.numFrames; let tmp = idx / pc.numFrames; let k = tmp % pc.numFreqs; let b = tmp / pc.numFreqs;
   let start = frame * pc.hop; let inOff = b * pc.Lp; var re = 0.0; var im = 0.0;
-  let bk = -2.0 * 3.14159265358979 * f32(k) / f32(pc.nFft);
-  for (var i = 0; i < pc.nFft; i = i + 1) { let x = padded[inOff + start + i] * window[i]; let a = bk * f32(i); re = re + x * cos(a); im = im + x * sin(a); }
+  // Twiddle from the integer phase m = k*i mod nFft (#1680): the angle stays in [-pi, pi] and the quarter
+  // turns are exact, as an FFT's are. cos/sin of -2*pi*k*i/nFft, with |angle| up to pi*nFft, left the DC and
+  // Nyquist bins of a real frame a spurious imaginary part: a wrong phase there, amplified by 1/|C| in its gradient.
+  let tw = -2.0 * 3.14159265358979 / f32(pc.nFft); var m = 0;
+  for (var i = 0; i < pc.nFft; i = i + 1) {
+    let x = padded[inOff + start + i] * window[i];
+    var c = 0.0; var s = 0.0;
+    if (m == 0) { c = 1.0; s = 0.0; }
+    else if (2 * m == pc.nFft) { c = -1.0; s = 0.0; }
+    else if (4 * m == pc.nFft) { c = 0.0; s = -1.0; }
+    else if (4 * m == 3 * pc.nFft) { c = 0.0; s = 1.0; }
+    else { var r = m; if (2 * m > pc.nFft) { r = m - pc.nFft; } let a = tw * f32(r); c = cos(a); s = sin(a); }
+    re = re + x * c; im = im + x * s;
+    m = m + k; if (m >= pc.nFft) { m = m - pc.nFft; }
+  }
   let outOff = b * pc.numFreqs * pc.numFrames + k * pc.numFrames + frame;
   mag[outOff] = sqrt(re * re + im * im); phase[outOff] = atan2(im, re);
 }";

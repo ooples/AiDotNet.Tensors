@@ -2252,8 +2252,11 @@ fn threshold_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn reciprocal_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < params.size) {
-        let x = forward_data[idx];
-        grad_input[idx] = -grad_output[idx] / (x * x);
+        // forward_data is the reciprocal OUTPUT y = 1/x, so d(1/x)/dx = -1/x^2 = -y^2 (#775, #1680).
+        let y = forward_data[idx];
+        // g * y first, as its own value: y * y overflows f32 for |y| > 1.8e19 even when the derivative g * y^2 does not.
+        let gy = grad_output[idx] * y;
+        grad_input[idx] = -(gy * y);
     }
 }
 ";

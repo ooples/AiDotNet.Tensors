@@ -4,6 +4,7 @@ using System.Linq;
 using System.Reflection;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 using Xunit.Abstractions;
@@ -399,7 +400,7 @@ public class DifferentiableOpsGradCheckSweep
     /// Compact parameter-type fingerprint used to key table entries to a SPECIFIC overload,
     /// e.g. <c>T,T,int[],int[],int[]</c>. <c>T</c> denotes <c>Tensor&lt;double&gt;</c>.
     /// </summary>
-    private static string ParamFingerprint(MethodInfo m)
+    internal static string ParamFingerprint(MethodInfo m)
         => string.Join(",", m.GetParameters().Select(p => TypeToken(p.ParameterType)));
 
     /// <summary>
@@ -895,7 +896,174 @@ public class DifferentiableOpsGradCheckSweep
         }
     }
 
-    private static object[] CopyArgs(object[] args) => (object[])args.Clone();
+    /// <summary>
+    /// Every op the sweep above can drive, with arguments that run: (name, bound method, arguments).
+    /// </summary>
+    internal IEnumerable<(string Name, MethodInfo Method, object[] Args)> DrivableOps(List<string> skipped)
+    {
+        var candidates = typeof(IEngine).GetMethods(BindingFlags.Public | BindingFlags.Instance)
+            .Where(m => !m.IsSpecialName && m.IsGenericMethodDefinition)
+            .Where(m => m.GetGenericArguments().Length == 1)
+            .Where(m => IsTensorDouble(m.ReturnType))
+            .ToList();
+        var shapes = new[] { new[] { 6 }, new[] { 2, 3 } };
+        foreach (var def in candidates)
+        {
+            var name = def.Name;
+            if (name.Contains('`')) name = name.Substring(0, name.IndexOf('`'));
+            if (!OpRegistry.DifferentiableOps.Contains(name)) continue;
+            MethodInfo m;
+            try { m = def.MakeGenericMethod(typeof(double)); }
+            catch { skipped.Add($"{name}: cannot bind <double>"); continue; }
+            string fingerprint = $"{name}|{ParamFingerprint(m)}";
+            bool hasTable = OpCases.TryGetValue(fingerprint, out var caseFactory)
+                         || OpCases.TryGetValue($"{name}/{m.GetParameters().Length}", out caseFactory)
+                         || OpCases.TryGetValue(name, out caseFactory);
+            object[]? found = null;
+            foreach (var shape in hasTable ? new[] { Array.Empty<int>() } : shapes)
+            {
+                var rng = new Random(1234);
+                object[]? args;
+                try { args = hasTable ? caseFactory!(rng) : BuildArgs(m, shape, rng, out _); }
+                catch { continue; }
+                if (args is null) continue;
+                try { _ = m.Invoke(_engine, CopyArgs(args)); }
+                catch { continue; }
+                found = args;
+                break;
+            }
+
+            if (found is null) { skipped.Add($"{fingerprint}: no valid invocation"); continue; }
+            yield return (name, m, found);
+        }
+    }
+
+    private static Tensor<double>[] TensorInputs(object[] args) => args.SelectMany(a => a switch
+    {
+        Tensor<double> t => new[] { t },
+        Tensor<double>[] arr => arr,
+        IEnumerable<Tensor<double>> seq => seq.ToArray(),
+        _ => Array.Empty<Tensor<double>>(),
+    }).Distinct().ToArray();
+
+    /// <summary>
+    /// A compiled training step must give every differentiable op the gradients the tape gives it. An op with a tape
+    /// edge but no GraphMode node runs once at trace time and is frozen into the plan as a constant: every input
+    /// feeding it then gets a zero gradient from compiled training while the eager tape is correct (AffineGrid,
+    /// AffineGrid3D and the mode GridSample did this, #1680). This checks all of them, not the ones someone noticed.
+    /// </summary>
+    [Fact]
+    public void EveryDifferentiableOp_CompiledTrainingGradientMatchesTheTape()
+    {
+        var prior = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = _engine;
+        var skipped = new List<string>();
+        var failures = new List<string>();
+        var refused = new List<string>();
+        int ok = 0, noTapeGradient = 0;
+        try
+        {
+            foreach (var (name, m, args) in DrivableOps(skipped))
+            {
+                var inputs = TensorInputs(args);
+                Dictionary<Tensor<double>, double[]> expected;
+                try
+                {
+                    using var tape = new GradientTape<double>();
+                    var outT = (Tensor<double>)m.Invoke(_engine, CopyArgs(args))!;
+                    var grads = tape.ComputeGradients(_engine.ReduceSum(outT, null), inputs);
+                    expected = inputs.Where(x => grads.TryGetValue(x, out var g) && g is not null)
+                        .ToDictionary(x => x, x => grads[x].GetFlattenedData().Select(v => v).ToArray());
+                }
+                catch (Exception ex) { failures.Add($"{name}: tape backward threw {Inner(ex).GetType().Name}: {Inner(ex).Message}"); continue; }
+
+                if (expected.Count == 0) { noTapeGradient++; continue; }
+                var parameters = expected.Keys.ToArray();
+                ICompiledTrainingPlan<double>? plan = null;
+                try
+                {
+                    using (var scope = GraphMode.EnableTraining(parameters))
+                    {
+                        var outT = (Tensor<double>)m.Invoke(_engine, CopyArgs(args))!;
+                        _engine.ReduceSum(outT, null);
+                        plan = scope.CompileTraining(parameters);
+                    }
+
+                    plan.Step();
+                    var bad = new List<string>();
+                    for (int i = 0; i < parameters.Length; i++)
+                    {
+                        var want = expected[parameters[i]];
+                        var got = plan.Gradients[i].AsSpan();
+                        if (got.Length != want.Length) { bad.Add($"input {i}: length {got.Length} vs {want.Length}"); continue; }
+                        for (int k = 0; k < want.Length; k++)
+                        {
+                            if (double.IsNaN(want[k]) && double.IsNaN(got[k])) continue;
+                            double denom = Math.Max(1.0, Math.Abs(want[k]));
+                            // Negated <= so a NaN on either side (and not both) is a mismatch.
+                            if (!(Math.Abs(got[k] - want[k]) / denom <= 1e-6))
+                            {
+                                bad.Add($"input {i}[{k}]: tape {want[k]:G6} compiled {got[k]:G6}");
+                                break;
+                            }
+                        }
+                    }
+
+                    if (bad.Count > 0) failures.Add($"{name}|{ParamFingerprint(m)}: " + string.Join("; ", bad.Take(3)));
+                    else ok++;
+                }
+                catch (Exception ex) when (IsRefusedByDesign(Inner(ex)))
+                {
+                    refused.Add($"{name}|{ParamFingerprint(m)}: {Inner(ex).Message}");
+                }
+                catch (Exception ex)
+                {
+                    failures.Add($"{name}|{ParamFingerprint(m)}: compiled step threw {Inner(ex).GetType().Name}: {Inner(ex).Message}");
+                }
+                finally
+                {
+                    plan?.Dispose();
+                }
+            }
+        }
+        finally
+        {
+            AiDotNetEngine.Current = prior;
+        }
+
+        _out.WriteLine($"compiled == tape : {ok}");
+        _out.WriteLine($"FAILED           : {failures.Count}");
+        _out.WriteLine($"no tape gradient : {noTapeGradient} (the finite-difference sweep owns these)");
+        _out.WriteLine($"skipped          : {skipped.Count}");
+        _out.WriteLine($"refused by design: {refused.Count} (a loud GraphCaptureNotSupportedException, never a frozen value)");
+        foreach (var f in refused.OrderBy(x => x)) _out.WriteLine("REFUSED  " + f);
+        foreach (var f in failures.OrderBy(x => x)) _out.WriteLine("FAIL  " + f);
+        foreach (var s in skipped.OrderBy(x => x)) _out.WriteLine("skip  " + s);
+        Assert.True(failures.Count == 0,
+            $"{failures.Count} op(s) differ between compiled training and the tape:\n" + string.Join("\n", failures.OrderBy(x => x).Take(60)));
+    }
+
+    /// <summary>
+    /// An op whose output shape depends on its data (MaskedSelect) refuses a graph trace by design (#365): a static
+    /// plan cannot hold it, and the refusal is loud. That is not the frozen-constant failure these sweeps look for.
+    /// </summary>
+    internal static bool IsRefusedByDesign(Exception ex) =>
+        ex is GraphCaptureNotSupportedException { Limitation: GraphCaptureLimitation.DataDependentOutputShape };
+
+    /// <summary>
+    /// The compiled-training check above in <c>float</c>: the CPU's float-only fused paths and saved states boxed as
+    /// <c>T</c> are invisible to a double sweep (#1680).
+    /// </summary>
+    [Fact]
+    public void EveryDifferentiableOp_FloatCompiledTrainingGradientMatchesTheTape()
+    {
+        var result = FloatGradientSweep.Run(_engine, _out);
+        result.Report(_out, "CPU float");
+        var all = result.AllFailures;
+        Assert.True(all.Count == 0, $"{all.Count} op(s) differ in float:\n" + string.Join("\n", all.Take(60)));
+    }
+
+    internal static object[] CopyArgs(object[] args) => (object[])args.Clone();
 
     /// <summary>
     /// Renders the synthesized arguments so a reported finding is reproducible by hand. Without
@@ -920,5 +1088,5 @@ public class DifferentiableOpsGradCheckSweep
         return string.Join(", ", parts);
     }
 
-    private static Exception Inner(Exception ex) => ex is TargetInvocationException { InnerException: { } inner } ? inner : ex;
+    internal static Exception Inner(Exception ex) => ex is TargetInvocationException { InnerException: { } inner } ? inner : ex;
 }

@@ -99,4 +99,27 @@ public class MaskedSelectTests
                 Assert.Equal(expected, gx[i, j]);
             }
     }
+
+    // The backward scatters by the forward's mask. Editing the caller's mask between the forward and the backward
+    // must not move the gradient to the newly selected positions.
+    [Fact]
+    public void Backward_MaskEditedAfterForward_ScattersToTheForwardSelection()
+    {
+        var engine = new CpuEngine();
+        var x = Seq(2, 3);
+        var maskArr = new[] { true, false, true, false, true, false };
+        var mask = MaskFromBools(maskArr, new[] { 2, 3 });
+
+        using var tape = new GradientTape<float>();
+        var selected = engine.TensorMaskedSelect(x, mask);
+        var loss = engine.ReduceSum(selected, null);
+        for (int i = 0; i < 2; i++)
+            for (int j = 0; j < 3; j++)
+                mask[i, j] = maskArr[i * 3 + j] ? Bit.False : Bit.True;
+        var gx = tape.ComputeGradients(loss, new[] { x })[x];
+
+        for (int i = 0; i < 2; i++)
+            for (int j = 0; j < 3; j++)
+                Assert.Equal(maskArr[i * 3 + j] ? 1f : 0f, gx[i, j]);
+    }
 }

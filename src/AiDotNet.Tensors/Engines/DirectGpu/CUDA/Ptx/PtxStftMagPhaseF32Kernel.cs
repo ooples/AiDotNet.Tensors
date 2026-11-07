@@ -10,8 +10,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// DFT of the padded signal and emit its magnitude and phase. One thread owns one output bin, loops over
 /// the <c>nFft</c> window taps accumulating <c>padded[b*Lp + frame*hop + i] * window[i]</c> against
 /// <c>cos</c>/<c>sin</c> of <c>-2*pi*k*i/nFft</c> with <c>fma.rn</c>, then writes
-/// <c>mag = sqrt(re^2 + im^2)</c> and <c>phase = atan2(im, re)</c>. The twiddle uses
-/// <c>cos.approx</c>/<c>sin.approx</c> and the phase uses a minimax atan2, so the parity spec is
+/// <c>mag = sqrt(re^2 + im^2)</c> and <c>phase = atan2(im, re)</c>. The twiddle angle comes from the integer
+/// phase <c>k*i mod nFft</c> folded into <c>[-pi, pi]</c>, with exact quarter turns (so the DC and Nyquist bins of a
+/// real frame have no spurious imaginary part); off the quarter turns it uses
+/// <c>cos.approx</c>/<c>sin.approx</c>, and the phase uses a minimax atan2, so the parity spec is
 /// TOLERANCE-based, not bit-exact. <c>batch</c>, <c>Lp</c>, <c>nFft</c>, <c>hop</c>, <c>numFrames</c>, and
 /// <c>numFreqs</c> are baked; the launch covers exactly <c>batch * numFreqs * numFrames</c> threads with no
 /// bounds guard. Four pointers reach the launch ABI.
@@ -134,8 +136,8 @@ internal sealed class PtxStftMagPhaseF32Kernel : IDisposable
         ptx.AppendLine(")");
         ptx.AppendLine($".maxntid {blockThreads}, 1, 1");
         ptx.AppendLine("{");
-        ptx.AppendLine("    .reg .pred %p<6>;");
-        ptx.AppendLine("    .reg .b32 %r<16>;");
+        ptx.AppendLine("    .reg .pred %p<12>;");
+        ptx.AppendLine("    .reg .b32 %r<32>;");
         ptx.AppendLine("    .reg .b64 %rd<16>;");
         ptx.AppendLine("    .reg .f32 %f<28>;");
         ptx.AppendLine("    ld.param.u64 %rd0, [padded_ptr];");
@@ -156,8 +158,7 @@ internal sealed class PtxStftMagPhaseF32Kernel : IDisposable
         ptx.AppendLine("    add.u32 %r9, %r8, %r7;");                      // inStart = inOff + start
         ptx.AppendLine("    mul.wide.u32 %rd4, %r9, 4;");
         ptx.AppendLine("    add.u64 %rd5, %rd0, %rd4;");                   // paddedBase (at inStart)
-        ptx.AppendLine("    cvt.rn.f32.u32 %f2, %r5;");                    // kF
-        ptx.AppendLine($"    mul.rn.f32 %f2, %f2, {negTwoPiOverN};");     // bk = -2pi*k/nFft
+        ptx.AppendLine("    mov.u32 %r20, 0;");                            // m = k*i mod nFft
         ptx.AppendLine("    mov.f32 %f0, 0f00000000;");                    // re
         ptx.AppendLine("    mov.f32 %f1, 0f00000000;");                    // im
         ptx.AppendLine("    mov.u32 %r10, 0;");                            // i
@@ -171,12 +172,34 @@ internal sealed class PtxStftMagPhaseF32Kernel : IDisposable
         ptx.AppendLine("    ld.global.nc.f32 %f3, [%rd7];");   // pv
         ptx.AppendLine("    ld.global.nc.f32 %f4, [%rd8];");   // wv
         ptx.AppendLine("    mul.rn.f32 %f5, %f3, %f4;");       // x = pv*wv
-        ptx.AppendLine("    cvt.rn.f32.u32 %f6, %r10;");       // iF
-        ptx.AppendLine("    mul.rn.f32 %f7, %f2, %f6;");       // a = bk*iF
+        // Twiddle from the integer phase m = k*i mod nFft (#1680): r = m folded into (-nFft/2, nFft/2], so the
+        // approximate cos/sin only ever see |angle| <= pi, and the quarter turns are exact, as an FFT's are.
+        ptx.AppendLine("    shl.b32 %r21, %r20, 1;");                     // 2m
+        ptx.AppendLine($"    setp.gt.u32 %p6, %r21, {nFft};");
+        ptx.AppendLine($"    sub.s32 %r22, %r20, {nFft};");
+        ptx.AppendLine("    selp.b32 %r23, %r22, %r20, %p6;");          // r
+        ptx.AppendLine("    cvt.rn.f32.s32 %f6, %r23;");
+        ptx.AppendLine($"    mul.rn.f32 %f7, %f6, {negTwoPiOverN};");     // a = -2pi*r/nFft
         ptx.AppendLine("    cos.approx.f32 %f8, %f7;");
         ptx.AppendLine("    sin.approx.f32 %f9, %f7;");
+        ptx.AppendLine("    shl.b32 %r24, %r20, 2;");                     // 4m
+        ptx.AppendLine("    setp.eq.u32 %p7, %r20, 0;");
+        ptx.AppendLine($"    setp.eq.u32 %p8, %r21, {nFft};");
+        ptx.AppendLine($"    setp.eq.u32 %p9, %r24, {nFft};");
+        ptx.AppendLine($"    setp.eq.u32 %p10, %r24, {checked(3 * nFft)};");
+        ptx.AppendLine("    selp.f32 %f8, 0f3F800000, %f8, %p7;");
+        ptx.AppendLine("    selp.f32 %f9, 0f00000000, %f9, %p7;");
+        ptx.AppendLine("    selp.f32 %f8, 0fBF800000, %f8, %p8;");
+        ptx.AppendLine("    selp.f32 %f9, 0f00000000, %f9, %p8;");
+        ptx.AppendLine("    selp.f32 %f8, 0f00000000, %f8, %p9;");
+        ptx.AppendLine("    selp.f32 %f9, 0fBF800000, %f9, %p9;");
+        ptx.AppendLine("    selp.f32 %f8, 0f00000000, %f8, %p10;");
+        ptx.AppendLine("    selp.f32 %f9, 0f3F800000, %f9, %p10;");
         ptx.AppendLine("    fma.rn.f32 %f0, %f5, %f8, %f0;"); // re += x*cos(a)
         ptx.AppendLine("    fma.rn.f32 %f1, %f5, %f9, %f1;"); // im += x*sin(a)
+        ptx.AppendLine("    add.u32 %r20, %r20, %r5;");                  // m += k (mod nFft)
+        ptx.AppendLine($"    setp.ge.u32 %p11, %r20, {nFft};");
+        ptx.AppendLine($"    @%p11 sub.u32 %r20, %r20, {nFft};");
         ptx.AppendLine("    add.u32 %r10, %r10, 1;");
         ptx.AppendLine("    bra $STFT_LOOP;");
         ptx.AppendLine("$STFT_AFTER:");
@@ -256,7 +279,7 @@ internal sealed class PtxStftMagPhaseF32Kernel : IDisposable
             {
                 ["formula"] = "windowed length-nFft DFT per (b,k,frame); mag=sqrt(re^2+im^2), phase=atan2(im,re)",
                 ["mode"] = "inference-forward-stft-mag-phase",
-                ["arithmetic"] = "cos.approx/sin.approx twiddle, fma.rn accumulation, minimax atan2; tolerance-based parity",
+                ["arithmetic"] = "integer-reduced twiddle with exact quarter turns, cos.approx/sin.approx on |angle| <= pi, fma.rn accumulation, minimax atan2; tolerance-based parity",
                 ["loop"] = "per output bin, over nFft window taps",
                 ["bounds-check"] = "none - the launch covers exactly batch*numFreqs*numFrames threads",
                 ["global-intermediates"] = "none",

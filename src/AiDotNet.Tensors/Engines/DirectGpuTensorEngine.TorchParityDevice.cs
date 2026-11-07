@@ -142,6 +142,8 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorMaxUnpool<T>(Tensor<T> input, Tensor<int> indices, int[] outputSize)
     {
+        if (TryRecordCompiledOp("TensorMaxUnpool", new Tensor<T>?[] { input }, e => e.TensorMaxUnpool(input, indices, outputSize), out var compiledNode))
+            return compiledNode;
         using var __gpuOp = EnterGpuOp();
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HeterogeneousInput);
         if (IsTapeActive<T>() || input is null || input.Length == 0 || !TryGetBackend(out _) || DirectGpuEngine.ShouldFallbackForPrecision<T>())
