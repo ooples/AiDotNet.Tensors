@@ -365,7 +365,8 @@ public class TensorArenaPersistentPoolTests
             {
                 using var idle = TensorArena.Create();
             }
-            Assert.InRange(TensorArena.CrossArenaBucketCount, 1, 2);
+            // C + D is still over the budget (each bucket exceeds half of it), so only D fits.
+            Assert.Equal(1, TensorArena.CrossArenaBucketCount);
             long hitsBefore = TensorArena.PersistentReuseHits;
             // The newest size (D) must have survived; the oldest (A) must not.
             using (var arena = TensorArena.Create())
@@ -376,5 +377,63 @@ public class TensorArenaPersistentPoolTests
             Assert.Equal(hitsBefore + 1, TensorArena.PersistentReuseHits);
         }
         finally { TensorPool.ArenaIdleRetentionBytes = savedBudget; }
+    }
+
+    /// <summary>
+    /// The other side of the budget: when the two most recent idle buckets fit, both survive and the older ones go.
+    /// Over-eviction (dropping a bucket that fits) fails here; over-retention fails the case above.
+    /// </summary>
+    [Fact]
+    public void WithinIdleBudget_KeepsEveryBucketThatFits()
+    {
+        long savedBudget = TensorPool.ArenaIdleRetentionBytes;
+        const int elems = 128 * 1024;
+        // Exactly C + D.
+        TensorPool.ArenaIdleRetentionBytes = ((long)(elems + 2 * 1024) + (elems + 3 * 1024)) * sizeof(float);
+        try
+        {
+            TensorArena.ClearPersistentPool();
+            for (int i = 0; i < 4; i++)
+            {
+                using var arena = TensorArena.Create();
+                TensorAllocator.RentUninitialized<float>(new[] { elems + (i * 1024) }).AsWritableSpan()[0] = i;
+            }
+            for (int i = 0; i < 4; i++)
+            {
+                using var idle = TensorArena.Create();
+            }
+            Assert.Equal(2, TensorArena.CrossArenaBucketCount);
+            long hitsBefore = TensorArena.PersistentReuseHits;
+            foreach (int i in new[] { 3, 2 })
+                using (var arena = TensorArena.Create())
+                    TensorAllocator.RentUninitialized<float>(new[] { elems + (i * 1024) }).AsWritableSpan()[0] = 1;
+            Assert.Equal(hitsBefore + 2, TensorArena.PersistentReuseHits);
+            using (var arena = TensorArena.Create())
+                TensorAllocator.RentUninitialized<float>(new[] { elems + 1024 }).AsWritableSpan()[0] = 1;
+            Assert.Equal(hitsBefore + 2, TensorArena.PersistentReuseHits);
+        }
+        finally { TensorPool.ArenaIdleRetentionBytes = savedBudget; }
+    }
+
+    private struct Pair<T> where T : struct
+    {
+        public T First;
+        public T Second;
+    }
+
+    /// <summary>
+    /// The idle budget charges a bucket its managed bytes. Marshal.SizeOf throws for a generic struct (such as
+    /// <see cref="Complex{T}"/>), and the old pointer-size fallback charged a 16-byte pair of doubles as 8, letting
+    /// twice the budget stay resident.
+    /// </summary>
+    [Fact]
+    public void IdleBudget_ChargesManagedElementSizes()
+    {
+        Assert.Equal(2 * sizeof(double), TensorArena.ElementBytes(typeof(Pair<double>)));
+        Assert.Equal(2 * sizeof(float), TensorArena.ElementBytes(typeof(Pair<float>)));
+        // Complex<T> also holds its numeric-operations reference.
+        Assert.True(TensorArena.ElementBytes(typeof(Complex<double>)) >= 2 * sizeof(double) + IntPtr.Size);
+        Assert.Equal(sizeof(float), TensorArena.ElementBytes(typeof(float)));
+        Assert.Equal(IntPtr.Size, TensorArena.ElementBytes(typeof(string)));
     }
 }

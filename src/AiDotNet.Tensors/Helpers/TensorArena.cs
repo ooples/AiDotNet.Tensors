@@ -363,13 +363,17 @@ public sealed class TensorArena : IDisposable
 
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<Type, int> s_elementBytes = new();
 
-    /// <summary>Bytes per element of a pooled array's element type (pointer size for a reference type).</summary>
-    private static int ElementBytes(Type type) => s_elementBytes.GetOrAdd(type, static t =>
-    {
-        if (!t.IsValueType) return IntPtr.Size;
-        try { return System.Runtime.InteropServices.Marshal.SizeOf(t); }
-        catch (ArgumentException) { return IntPtr.Size; }
-    });
+    private static readonly System.Reflection.MethodInfo s_unsafeSizeOf =
+        typeof(System.Runtime.CompilerServices.Unsafe).GetMethod(nameof(System.Runtime.CompilerServices.Unsafe.SizeOf))
+        ?? throw new MissingMethodException(nameof(System.Runtime.CompilerServices.Unsafe), nameof(System.Runtime.CompilerServices.Unsafe.SizeOf));
+
+    /// <summary>
+    /// Bytes per element of a pooled array's element type: its managed size, as an array of it stores it (pointer size
+    /// for a reference type). Marshal.SizeOf is not that: it throws for a generic struct such as
+    /// <c>Complex&lt;double&gt;</c>, and a pointer-size fallback charged its 16-byte elements as 8.
+    /// </summary>
+    internal static int ElementBytes(Type type) => s_elementBytes.GetOrAdd(type, static t =>
+        s_unsafeSizeOf.MakeGenericMethod(t).Invoke(null, null) is int bytes ? bytes : IntPtr.Size);
 
     /// <summary>
     /// Buckets currently held across the two cross-arena pools on this thread. Diagnostic: lets a

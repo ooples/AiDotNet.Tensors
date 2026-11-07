@@ -1,5 +1,6 @@
 using System;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -18,7 +19,7 @@ public class BroadcastChannelWideFloatTests
     private static Tensor<float> Random(int[] shape, int seed, bool nonZero = false)
     {
         var t = new Tensor<float>(shape);
-        var rng = new Random(seed);
+        var rng = RandomHelper.CreateSeededRandom(seed);
         var s = t.AsWritableSpan();
         for (int i = 0; i < s.Length; i++)
         {
@@ -35,14 +36,14 @@ public class BroadcastChannelWideFloatTests
         for (int i = 0; i < sa.Length; i++)
         {
             float expected = op(sa[i], sb[(i / spatial) % channels]);
-            Assert.True(BitConverter.SingleToInt32Bits(expected) == BitConverter.SingleToInt32Bits(sg[i]),
+            Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(expected) == TestHelpers.MathCompat.SingleToInt32Bits(sg[i]),
                 $"element {i}: expected {expected:R}, got {sg[i]:R}");
         }
     }
 
     public static TheoryData<int, int> RowShapes => new()
     {
-        { 1, 8 }, { 3, 13 }, { 1, 49152 }, { 512, 1001 }, { 64, 49152 },
+        { 3, 7 }, { 4, 8 }, { 1, 8 }, { 3, 13 }, { 1, 49152 }, { 512, 1001 }, { 64, 49152 },
     };
 
     [Theory]
@@ -56,6 +57,25 @@ public class BroadcastChannelWideFloatTests
         AssertExact(a, b, _engine.TensorMultiply(a, b), (x, y) => x * y);
         AssertExact(a, b, _engine.TensorDivide(a, b), (x, y) => x / y);
     }
+
+#if NET5_0_OR_GREATER
+    /// <summary>
+    /// The row path takes over at one full vector of channels: a 7-wide row stays on the serial plane loop and an
+    /// 8-wide row takes the wide kernel. The end-to-end cases above cover both results; this pins the dispatch.
+    /// </summary>
+    [Theory]
+    [InlineData(7, false)]
+    [InlineData(8, true)]
+    public void RowBroadcast_DispatchesAtOneFullVector(int cols, bool wide)
+    {
+        if (!System.Runtime.Intrinsics.X86.Avx.IsSupported) return;
+        const int rows = 4;
+        var a = new float[rows * cols];
+        var b = new float[cols];
+        var r = new float[rows * cols];
+        Assert.Equal(wide, CpuEngine.TryBroadcastChannelFloatWide(a, 0, b, 0, r, 0, rows, cols, 1, CpuEngine.BroadcastOp.Add));
+    }
+#endif
 
     [Theory]
     [InlineData(4, 64, 32, 32)]   // 262,144 elements: parallel over planes

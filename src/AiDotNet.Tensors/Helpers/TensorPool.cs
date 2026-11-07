@@ -63,7 +63,8 @@ public static class TensorPool
     {
         var text = Environment.GetEnvironmentVariable(name);
         long mb = long.TryParse(text, out var v) && v >= 0 ? v : defaultMb;
-        return mb * 1024L * 1024L;
+        // Saturate rather than wrap: a huge setting means "no practical budget", never a negative one.
+        return mb > long.MaxValue / (1024L * 1024L) ? long.MaxValue : mb * 1024L * 1024L;
     }
 
     /// <summary>

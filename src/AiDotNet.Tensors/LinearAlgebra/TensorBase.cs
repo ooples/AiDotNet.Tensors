@@ -2740,24 +2740,26 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         EnsureMaterialized();
         ThrowIfSparse();
-        if (Length == 0) return Array.Empty<T>();
-        if (IsContiguous && _storageOffset == 0 && _storage.Length == Length)
+        int length = Length;
+        if (length == 0) return Array.Empty<T>();
+        if (IsContiguous && _storageOffset == 0 && _storage.Length == length)
             return _data.ToArray();
-        // Every element is written below, so the zero-fill of new T[n] is wasted work (a large result is an LOH
-        // array: the fill is a full extra pass over memory).
+        // Every one of the `length` elements is written below (the length is read once, so the allocation and the
+        // copy agree), so the zero-fill of new T[n] is wasted work (a large result is an LOH array: the fill is a
+        // full extra pass over memory).
 #if NET5_0_OR_GREATER
-        var result = GC.AllocateUninitializedArray<T>(Length);
+        var result = GC.AllocateUninitializedArray<T>(length);
 #else
-        var result = new T[Length];
+        var result = new T[length];
 #endif
         if (IsContiguous)
         {
-            _data.AsSpan().Slice(_storageOffset, Length).CopyTo(result);
+            _data.AsSpan().Slice(_storageOffset, length).CopyTo(result);
         }
         else
         {
             var srcData = _data.AsSpan();
-            for (int i = 0; i < Length; i++)
+            for (int i = 0; i < length; i++)
                 result[i] = srcData[FlatIndexToStorageIndex(i)];
         }
         return result;

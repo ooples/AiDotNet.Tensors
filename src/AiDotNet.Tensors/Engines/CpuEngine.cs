@@ -4240,7 +4240,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     // Op selector for the channel-repeat broadcast kernel.
-    private enum BroadcastOp { Add, Subtract, Multiply, Divide }
+    internal enum BroadcastOp { Add, Subtract, Multiply, Divide }
 
     /// <summary>
     /// Channel-repeat broadcast kernel: writes <c>result[i] = a[i] OP b[c]</c>
@@ -4261,6 +4261,9 @@ public partial class CpuEngine : ITensorLevelEngine
     // Below this many elements a channel-repeat broadcast stays on the calling thread.
     private const long ParallelBroadcastMinElements = 1L << 16;
 
+    // Floats per AVX register: the vector width of the wide broadcast kernels below.
+    private const int AvxFloatLanes = 8;
+
     /// <summary>
     /// The two channel-repeat shapes the plane loop in <see cref="ApplyBroadcastChannelOp{T}"/> handles badly, for float:
     /// <list type="bullet">
@@ -4271,13 +4274,13 @@ public partial class CpuEngine : ITensorLevelEngine
     /// </list>
     /// Elementwise, so the split cannot change any result. Returns false for the shapes the serial loop already serves.
     /// </summary>
-    private static unsafe bool TryBroadcastChannelFloatWide(float[] aF, int aOff, float[] bF, int bOff, float[] rF, int rOff,
+    internal static unsafe bool TryBroadcastChannelFloatWide(float[] aF, int aOff, float[] bF, int bOff, float[] rF, int rOff,
         int batchCount, int channelCount, int spatialSize, BroadcastOp op)
     {
         long total = (long)batchCount * channelCount * spatialSize;
         if (spatialSize == 1)
         {
-            if (channelCount < 8) return false;
+            if (channelCount < AvxFloatLanes) return false;
             CpuParallelSettings.ParallelForOrSerial(0, batchCount, total, n =>
             {
                 fixed (float* a0 = aF) fixed (float* b0 = bF) fixed (float* r0 = rF)
@@ -4288,7 +4291,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }, deterministicSafe: true);
             return true;
         }
-        if (spatialSize < 8 || total < ParallelBroadcastMinElements) return false;
+        if (spatialSize < AvxFloatLanes || total < ParallelBroadcastMinElements) return false;
         int planes = batchCount * channelCount;
         CpuParallelSettings.ParallelForOrSerial(0, planes, total, plane =>
         {
@@ -4303,29 +4306,29 @@ public partial class CpuEngine : ITensorLevelEngine
 
     private static unsafe void BroadcastRowFloat(float* a, float* b, float* r, int n, BroadcastOp op)
     {
-        int i = 0, simd = n & ~7;
+        int i = 0, simd = n & ~(AvxFloatLanes - 1);
         switch (op)
         {
             case BroadcastOp.Add:
-                for (; i < simd; i += 8)
+                for (; i < simd; i += AvxFloatLanes)
                     System.Runtime.Intrinsics.X86.Avx.Store(r + i, System.Runtime.Intrinsics.X86.Avx.Add(
                         System.Runtime.Intrinsics.X86.Avx.LoadVector256(a + i), System.Runtime.Intrinsics.X86.Avx.LoadVector256(b + i)));
                 for (; i < n; i++) r[i] = a[i] + b[i];
                 break;
             case BroadcastOp.Subtract:
-                for (; i < simd; i += 8)
+                for (; i < simd; i += AvxFloatLanes)
                     System.Runtime.Intrinsics.X86.Avx.Store(r + i, System.Runtime.Intrinsics.X86.Avx.Subtract(
                         System.Runtime.Intrinsics.X86.Avx.LoadVector256(a + i), System.Runtime.Intrinsics.X86.Avx.LoadVector256(b + i)));
                 for (; i < n; i++) r[i] = a[i] - b[i];
                 break;
             case BroadcastOp.Multiply:
-                for (; i < simd; i += 8)
+                for (; i < simd; i += AvxFloatLanes)
                     System.Runtime.Intrinsics.X86.Avx.Store(r + i, System.Runtime.Intrinsics.X86.Avx.Multiply(
                         System.Runtime.Intrinsics.X86.Avx.LoadVector256(a + i), System.Runtime.Intrinsics.X86.Avx.LoadVector256(b + i)));
                 for (; i < n; i++) r[i] = a[i] * b[i];
                 break;
             case BroadcastOp.Divide:
-                for (; i < simd; i += 8)
+                for (; i < simd; i += AvxFloatLanes)
                     System.Runtime.Intrinsics.X86.Avx.Store(r + i, System.Runtime.Intrinsics.X86.Avx.Divide(
                         System.Runtime.Intrinsics.X86.Avx.LoadVector256(a + i), System.Runtime.Intrinsics.X86.Avx.LoadVector256(b + i)));
                 for (; i < n; i++) r[i] = a[i] / b[i];
@@ -4336,26 +4339,26 @@ public partial class CpuEngine : ITensorLevelEngine
     private static unsafe void BroadcastScalarFloat(float* a, float scalar, float* r, int n, BroadcastOp op)
     {
         var vs = System.Runtime.Intrinsics.Vector256.Create(scalar);
-        int i = 0, simd = n & ~7;
+        int i = 0, simd = n & ~(AvxFloatLanes - 1);
         switch (op)
         {
             case BroadcastOp.Add:
-                for (; i < simd; i += 8)
+                for (; i < simd; i += AvxFloatLanes)
                     System.Runtime.Intrinsics.X86.Avx.Store(r + i, System.Runtime.Intrinsics.X86.Avx.Add(System.Runtime.Intrinsics.X86.Avx.LoadVector256(a + i), vs));
                 for (; i < n; i++) r[i] = a[i] + scalar;
                 break;
             case BroadcastOp.Subtract:
-                for (; i < simd; i += 8)
+                for (; i < simd; i += AvxFloatLanes)
                     System.Runtime.Intrinsics.X86.Avx.Store(r + i, System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(a + i), vs));
                 for (; i < n; i++) r[i] = a[i] - scalar;
                 break;
             case BroadcastOp.Multiply:
-                for (; i < simd; i += 8)
+                for (; i < simd; i += AvxFloatLanes)
                     System.Runtime.Intrinsics.X86.Avx.Store(r + i, System.Runtime.Intrinsics.X86.Avx.Multiply(System.Runtime.Intrinsics.X86.Avx.LoadVector256(a + i), vs));
                 for (; i < n; i++) r[i] = a[i] * scalar;
                 break;
             case BroadcastOp.Divide:
-                for (; i < simd; i += 8)
+                for (; i < simd; i += AvxFloatLanes)
                     System.Runtime.Intrinsics.X86.Avx.Store(r + i, System.Runtime.Intrinsics.X86.Avx.Divide(System.Runtime.Intrinsics.X86.Avx.LoadVector256(a + i), vs));
                 for (; i < n; i++) r[i] = a[i] / scalar;
                 break;
