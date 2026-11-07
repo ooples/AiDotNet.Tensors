@@ -265,6 +265,22 @@ jobs:
       # With --blame the TRX logger ignores LogFilePath and writes under the project's TestResults; the results
       # directory puts the TRX and any crash or hang dump where the skip check and the upload look.
 
+    - name: Managed stacks of a hung or crashed test host
+      if: failure()
+      # A hang dump is the whole test host (several GB), too big to download and analyse in practice; Blame names only
+      # the test that was running, not the thread that is blocked. Print every managed thread's stack here instead.
+      run: |
+        $dumps = @(Get-ChildItem "${{ runner.temp }}/trx" -Recurse -Filter *.dmp -ErrorAction SilentlyContinue)
+        if ($dumps.Count -eq 0) { Write-Output "No crash or hang dump."; exit 0 }
+        $tools = "${{ runner.temp }}/dotnet-dump"
+        dotnet tool install dotnet-dump --tool-path $tools | Out-Null
+        if ($LASTEXITCODE -ne 0) { Write-Output "::warning::Could not install dotnet-dump."; exit 0 }
+        foreach ($dump in $dumps) {
+          Write-Output "::group::$($dump.Name)"
+          & "$tools/dotnet-dump" analyze $dump.FullName -c "clrthreads" -c "clrstack -all" -c "exit"
+          Write-Output "::endgroup::"
+        }
+
     - name: Fail on unexplained skips
       if: always()
       # Allowed skip reasons:
