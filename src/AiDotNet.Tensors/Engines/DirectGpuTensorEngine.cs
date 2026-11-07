@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Linq;
 using System.Runtime.CompilerServices;
@@ -1775,7 +1775,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // The device data can be keyed by the backing array or (a lazily allocated result) by the data vector; a view
         // of a vector-keyed result can still report a backing array, so try both.
         bool pending = false;
-        foreach (var key in new object?[] { view.GetBackingArrayForCacheLookupUnsafe(), view.DataVector })
+        var backingArray = view.GetBackingArrayForCacheLookupUnsafe();
+        foreach (var key in new object?[] { backingArray, view.DataVector })
         {
             if (key is null || !Helpers.HostSync.IsPending(key)) continue;
             pending = true;
@@ -1783,6 +1784,28 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return candidate.Buffer;
         }
         if (!pending) return null;
+        // Persistent 3D/4D weights (e.g. MoE expert banks [G, D, F]) updated in place on the device by GpuOptimizer
+        // arm HostSync on their backing array while their live device buffer resides in _persistentBufferCache.
+        if (backingArray is not null)
+        {
+            int hostVersion = view.GpuCacheVersion;
+            lock (_persistentBufferLock)
+            {
+                if (_persistentBufferCache.TryGetValue(backingArray, out var pe)
+                    && _persistentWeightHostVersion.TryGetValue(backingArray, out int stamped)
+                    && stamped == hostVersion
+                    && pe.Buffer.Handle != IntPtr.Zero
+                    && pe.Buffer.Size == backingArray.Length)
+                {
+                    return pe.Buffer;
+                }
+            }
+            if (Helpers.ResidentHostMirror.TryFindCovering(view, backingArray, 0, backingArray.Length, backend, out var mirrorBuf, out int mirrorStart)
+                && mirrorStart == 0 && mirrorBuf is not null && mirrorBuf.Handle != IntPtr.Zero && mirrorBuf.Size >= backingArray.Length)
+            {
+                return mirrorBuf;
+            }
+        }
         // Device-owned storage: a view of a device result shares its vector's device buffer. Use it only while it holds
         // the vector's current values.
         return view.DataVector._deviceState is { Buffer: { } shared, DeviceValid: true } state
@@ -1790,6 +1813,42 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             && !state.IsSplitComplex && !state.ContainsRawInt32 && !state.ContainsRawInt64
             ? shared
             : null;
+    }
+
+    /// <summary>
+    /// Returns a synced device buffer already holding <paramref name="view"/>'s full backing array at its current
+    /// <see cref="TensorBase{T}.GpuCacheVersion"/>, so permuting a cached weight or uploaded activation view runs on
+    /// the device instead of allocating a host Contiguous() copy and re-uploading every step.
+    /// </summary>
+    private IGpuBuffer? SyncedDeviceViewBase<T>(IDirectGpuBackend backend, Tensor<T> view)
+    {
+        var backingArray = view.GetBackingArrayForCacheLookupUnsafe();
+        if (backingArray is null) return null;
+        int hostVersion = view.GpuCacheVersion;
+        lock (_persistentBufferLock)
+        {
+            if (_persistentBufferCache.TryGetValue(backingArray, out var pe)
+                && _persistentWeightHostVersion.TryGetValue(backingArray, out int stamped)
+                && stamped == hostVersion
+                && pe.Buffer.Handle != IntPtr.Zero
+                && pe.Buffer.Size == backingArray.Length)
+            {
+                return pe.Buffer;
+            }
+        }
+        lock (_activationCacheLock)
+        {
+            if (_activationCache.TryGetValue(backingArray, out var ae)
+                && ReferenceEquals(ae.Backend, backend)
+                && !ae.IsFp16
+                && ae.HostVersion == hostVersion
+                && ae.Buffer.Handle != IntPtr.Zero
+                && ae.Buffer.Size == backingArray.Length)
+            {
+                return ae.Buffer;
+            }
+        }
+        return null;
     }
 
     /// <summary>
@@ -1896,8 +1955,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var dims = view._shape;
         var strides = view._strides;
         if (rank < 2 || strides is null || strides.Length != rank) return false;
-        if (lookUpBase) baseBuffer = DeviceAuthoritativeViewBase(backend, view);
-        if (baseBuffer is null) return false;   // host copy current, or no device copy: the host path handles it
+        if (lookUpBase) baseBuffer = DeviceAuthoritativeViewBase(backend, view) ?? SyncedDeviceViewBase(backend, view);
+        if (baseBuffer is null) return false;   // no device copy at current version: the host path handles it
 
         // Base axis order = view axes by descending stride; the view is a pure permutation iff those strides are the
         // row-major strides of the reordered shape (size-1 axes may carry any stride).
@@ -4618,7 +4677,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         tensor._ownsGpuBuffer = true;
         // A backend this engine frees when it is released: the result must reach the host first.
         if (_ownsDirectGpu) _ownedResults.Add(vector, backend);
-        NoteOwnedResultAllocation(outputBuffer.SizeInBytes);
+        NoteOwnedResultAllocation(backend, outputBuffer.SizeInBytes);
         // Not released when the tape ends: a result the caller holds stays valid, as in PyTorch, and returns to the pool
         // when it is collected. The gradients backward computes but does not return are freed as soon as backward ends
         // (GradientTape.ReleaseDroppedGradients).
@@ -4675,14 +4734,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         lock (_trackedOwnedResults) _trackedOwnedResults.Clear();
     }
 
-    // The GC cannot see device memory. Owned results are small managed objects pinning large device buffers, so
-    // after a VRAM-proportional volume of result allocations run a cheap gen-0 collection: intermediates die young,
-    // their buffers' finalizers queue stream-ordered frees, and the next op drains them. (A failed allocation also
-    // reclaims — see CudaBackend.AllocDeviceMemoryAsync.)
     private long _ownedResultBytesSinceCollect;
 
-    private void NoteOwnedResultAllocation(long bytes)
+    // CUDA, HIP, OpenCL, and Vulkan buffers charge DeviceMemoryReclaim.OnDeviceAllocation at rent/allocation and
+    // credit OnDeviceRelease on explicit Dispose, so their results need no second engine-level charge. Metal and
+    // WebGPU buffers do not: an abandoned result there is reclaimed only by its finalizer, and a GPU loop allocates
+    // too little managed memory for the GC to run on its own, so this byte count still prompts a young collection.
+    private void NoteOwnedResultAllocation(IDirectGpuBackend backend, long bytes)
     {
+        while (backend is Gpu.DelegatingGpuBackend wrapper) backend = wrapper.InnerBackend;
+        if (backend is Engines.DirectGpu.IChargesDeviceMemoryReclaim { ChargesDeviceMemoryReclaim: true }) return;
         long threshold = OwnedResultCollectThresholdBytes;
         if (System.Threading.Interlocked.Add(ref _ownedResultBytesSinceCollect, bytes) < threshold) return;
         System.Threading.Interlocked.Exchange(ref _ownedResultBytesSinceCollect, 0);
@@ -4691,7 +4752,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     private long OwnedResultCollectThresholdBytes =>
         _directGpu is { } dg && dg.GlobalMemoryBytes > 0 ? Math.Max(256L << 20, dg.GlobalMemoryBytes / 16) : 256L << 20;
-
     /// <summary>
     /// Materializes a deferred download if the given array was returned from a GPU op
     /// within a GpuScope without downloading. This is called automatically when CPU
@@ -13043,13 +13103,82 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return result;
     }
 
-    // Fused Gated DeltaNet scan (#1464). GPU inference fast path; defer to CpuEngine otherwise.
+    /// <summary>
+    /// GPU-executed BPTT backward of the fused Gated DeltaNet scan: dQ/dK/dV [batch, seqLen, modelDim] and
+    /// dAlpha/dBeta [batch, seqLen, numHeads] via <see cref="DirectGpu.IGatedDeltaNetBackwardBackend"/>.
+    /// Returns null when the GPU backward path is unavailable so the caller falls back to the managed backward.
+    /// </summary>
+    internal Tensor<T>[]? GatedDeltaNetScanBackwardGpu<T>(Tensor<T> gradOutput, Tensor<T>[] inputs, int numHeads)
+    {
+        using var __gpuOp = EnterGpuOp();
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend) ||
+            Engines.DirectGpu.GatedDeltaNetBackwardResolver.Resolve(backend) is not { } gdnBackend)
+            return null;
+        var q = inputs[0];
+        int batch = q.Shape._dims[0], seqLen = q.Shape._dims[1], modelDim = q.Shape._dims[2];
+        int headDim = modelDim / numHeads;
+        int n = batch * seqLen * modelDim, ng = batch * seqLen * numHeads;
+        // The kernels read dOut as [batch, seqLen, modelDim]; a gradient of any other size would be read past its end.
+        if (gradOutput.Length != n)
+            throw new ArgumentException(
+                $"GatedDeltaNet output gradient has {gradOutput.Length} elements; the scan output has {n}.", nameof(gradOutput));
+        // The backward keeps every (batch, head) state trajectory resident at once: batch*heads*seqLen*headDim^2 floats.
+        // Past a quarter of device memory it would starve or fail the allocation, so the managed backward, which holds
+        // one trajectory per worker, takes it instead.
+        long trajectoryBytes = (long)batch * numHeads * seqLen * headDim * headDim * sizeof(float);
+        if (backend.GlobalMemoryBytes > 0 && trajectoryBytes > backend.GlobalMemoryBytes / 4)
+            return null;
+        var gradBuffers = new OwnedBuffer[5];
+        int allocated = 0;
+        try
+        {
+            var g = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
+            using var dOut = GetOrAllocateBuffer(backend, g);
+            using var qB = GetOrAllocateBuffer(backend, inputs[0]);
+            using var kB = GetOrAllocateBuffer(backend, inputs[1]);
+            using var vB = GetOrAllocateBuffer(backend, inputs[2]);
+            using var aB = GetOrAllocateBuffer(backend, inputs[3]);
+            using var bB = GetOrAllocateBuffer(backend, inputs[4]);
+            for (; allocated < 5; allocated++)
+                gradBuffers[allocated] = AllocateOutputBuffer(backend, allocated < 3 ? n : ng);
+            for (int i = 0; i < 5; i++)
+                backend.Fill(gradBuffers[i].Buffer, 0f, i < 3 ? n : ng);
+            gdnBackend.GatedDeltaNetScanBackward(
+                dOut.Buffer, qB.Buffer, kB.Buffer, vB.Buffer, aB.Buffer, bB.Buffer,
+                gradBuffers[0].Buffer, gradBuffers[1].Buffer, gradBuffers[2].Buffer,
+                gradBuffers[3].Buffer, gradBuffers[4].Buffer,
+                batch, seqLen, modelDim, numHeads, headDim);
+            var result = new Tensor<T>[5];
+            for (int i = 0; i < 5; i++)
+            {
+                result[i] = DeferTensorResult<T>(backend, gradBuffers[i].Buffer, i < 3 ? n : ng,
+                    i < 3 ? new[] { batch, seqLen, modelDim } : new[] { batch, seqLen, numHeads });
+                gradBuffers[i].RelinquishOwnership();
+            }
+
+            return result;
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            System.Diagnostics.Trace.TraceWarning($"GPU GatedDeltaNet backward fallback: {ex.GetType().Name}: {ex.Message}");
+            if (ThrowOnGpuKernelFallback) throw;
+            return null;
+        }
+        finally
+        {
+            for (int i = 0; i < allocated; i++) gradBuffers[i].Dispose();
+        }
+    }
+
+    // Fused Gated DeltaNet scan (#1464). Stays on-device during both inference and GradientTape training
+    // when the backend implements IGatedDeltaNetBackwardBackend (CUDA/HIP); falls back cleanly otherwise.
     public override Tensor<T> GatedDeltaNetScanForward<T>(
         Tensor<T> qProj, Tensor<T> kProj, Tensor<T> vProj, Tensor<T> alpha, Tensor<T> beta, int numHeads)
     {
         using var __gpuOp = EnterGpuOp();
-        if (Compilation.GraphMode.IsActive || IsTapeActive<T>() ||
-            typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+        if (Compilation.GraphMode.IsActive ||
+            typeof(T) != typeof(float) || !TryGetBackend(out var backend) ||
+            (IsTapeActive<T>() && Engines.DirectGpu.GatedDeltaNetBackwardResolver.Resolve(backend) is null))
             return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads);
         if (qProj.Rank != 3 || numHeads < 1)
             return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads);
@@ -13086,6 +13215,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var result = DeferTensorResult<T>(backend, outB.Buffer, batch * seqLen * modelDim,
                 new[] { batch, seqLen, modelDim });
             outB.RelinquishOwnership();
+            // CpuEngine.GatedDeltaNetScanBackward tries the device backward first and takes the managed one only when
+            // that declines, so a failed device attempt is not repeated.
+            Autodiff.DifferentiableOps.RecordIfActive<T>(
+                "GatedDeltaNetScan", result, new[] { qProj, kProj, vProj, alpha, beta },
+                CpuEngine.GatedDeltaNetScanBackward,
+                savedState: new object[] { numHeads });
             return result;
         }
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("GatedDeltaNetScanForward", capabilityGap);
@@ -27868,34 +28003,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorBatchMatMul<T>(Tensor<T> a, Tensor<T> b2)
     {
-        using var __gpuOp = EnterGpuOp();
-        if (typeof(T)==typeof(float) && TryGetBackend(out var b) && a.Rank >= 3 && b2.Rank >= 3)
-        {
-            try
-            {
-                int batchSize = a.Shape._dims[0];
-                int M = a.Shape._dims[a.Rank - 2];
-                int K = a.Shape._dims[a.Rank - 1];
-                int N = b2.Shape._dims[b2.Rank - 1];
-                var ga = UploadTensorRaw(b, a);
-                var gb = UploadTensorRaw(b, b2);
-                var go = b.AllocateBuffer(batchSize * M * N);
-                b.BatchedGemm(ga, gb, go, M, N, K, batchSize);
-                int[] outShape = (int[])a.Shape._dims.Clone();
-                outShape[a.Rank - 1] = N;
-                var output = DeferTensorResult<T>(b, go, batchSize * M * N, outShape);
-                // Record on the tape so the IEngine-typed dispatch path
-                // doesn't silently disconnect this op from autograd. The
-                // recording-path equivalent in CpuEngine.TensorBatchMatMul
-                // also delegates to RecordBinary under the "BatchMatMul"
-                // op name; mirror that here so backward dispatch picks
-                // the same BackwardFunction<T>.BatchMatMulBackward.
-                Autodiff.DifferentiableOps.RecordBinary("BatchMatMul", output, a, b2,
-                    Autodiff.BackwardFunctions<T>.BatchMatMulBackward);
-                return output;
-            }
-            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("SwishInPlace", capabilityGap); }
-        }
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (b2 is null) throw new ArgumentNullException(nameof(b2));
+        if (a.Rank >= 3 && b2.Rank == a.Rank)
+            return BatchMatMul(a, b2);
         return base.TensorBatchMatMul(a, b2);
     }
 

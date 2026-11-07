@@ -34,8 +34,9 @@ public partial class DirectGpuTensorEngine
         try
         {
             launch(p210, inBuf.Buffer, outBuf.Buffer, input.Length);
-            var arr = FinishGpuOp<T>(backend, outBuf, outSize);
-            return new Tensor<T>(arr, outputShape);
+            var r = DeferTensorResult<T>(backend, outBuf.Buffer, outSize, outputShape);
+            outBuf.RelinquishOwnership();
+            return r;
         }
         catch
         {
@@ -64,8 +65,9 @@ public partial class DirectGpuTensorEngine
         try
         {
             launch(p210, aBuf.Buffer, bBuf.Buffer, outBuf.Buffer, a.Length);
-            var arr = FinishGpuOp<T>(backend, outBuf, outSize);
-            return new Tensor<T>(arr, outputShape);
+            var r = DeferTensorResult<T>(backend, outBuf.Buffer, outSize, outputShape);
+            outBuf.RelinquishOwnership();
+            return r;
         }
         catch
         {
@@ -356,8 +358,8 @@ public partial class DirectGpuTensorEngine
                 try
                 {
                     p210.Parity210CumSum(inBuf.Buffer, outBuf.Buffer, outer, axisSize, inner);
-                    var arr = FinishGpuOp<T>(backend, outBuf, tensor.Length);
-                    var r = new Tensor<T>(arr, (int[])tensor._shape.Clone());
+                    var r = DeferTensorResult<T>(backend, outBuf.Buffer, tensor.Length, (int[])tensor._shape.Clone());
+                    outBuf.RelinquishOwnership();
                     Autodiff.DifferentiableOps.RecordUnary("TensorCumSum", r, tensor,
                         Autodiff.BackwardFunctions<T>.CumSumBackward, new object[] { axis });
                     return r;
@@ -394,8 +396,9 @@ public partial class DirectGpuTensorEngine
         try
         {
             launch(p210, inBuf.Buffer, outBuf.Buffer, outer, axisSize, inner);
-            var arr = FinishGpuOp<T>(backend, outBuf, tensor.Length);
-            return new Tensor<T>(arr, (int[])tensor._shape.Clone());
+            var r = DeferTensorResult<T>(backend, outBuf.Buffer, tensor.Length, (int[])tensor._shape.Clone());
+            outBuf.RelinquishOwnership();
+            return r;
         }
         catch
         {
@@ -499,8 +502,8 @@ public partial class DirectGpuTensorEngine
                     try
                     {
                         p210.Parity210Roll1D(inBuf.Buffer, outBuf.Buffer, outer, axisSize, inner, shifts[0]);
-                        var arr = FinishGpuOp<T>(backend, outBuf, tensor.Length);
-                        var r = new Tensor<T>(arr, (int[])tensor._shape.Clone());
+                        var r = DeferTensorResult<T>(backend, outBuf.Buffer, tensor.Length, (int[])tensor._shape.Clone());
+                        outBuf.RelinquishOwnership();
                         Autodiff.DifferentiableOps.RecordUnary("TensorRoll", r, tensor,
                             Autodiff.BackwardFunctions<T>.RollBackward,
                             savedState: new object[] { (int[])shifts.Clone(), (int[])axes.Clone() });
@@ -540,8 +543,8 @@ public partial class DirectGpuTensorEngine
                     try
                     {
                         p210.Parity210FlipAxis(inBuf.Buffer, outBuf.Buffer, outer, axisSize, inner);
-                        var arr = FinishGpuOp<T>(backend, outBuf, tensor.Length);
-                        var r = new Tensor<T>(arr, (int[])tensor._shape.Clone());
+                        var r = DeferTensorResult<T>(backend, outBuf.Buffer, tensor.Length, (int[])tensor._shape.Clone());
+                        outBuf.RelinquishOwnership();
                         Autodiff.DifferentiableOps.RecordUnary("TensorFlip", r, tensor,
                             Autodiff.BackwardFunctions<T>.FlipBackward,
                             savedState: new object[] { (int[])axes.Clone() });
@@ -581,8 +584,8 @@ public partial class DirectGpuTensorEngine
                 try
                 {
                     p210.Parity210DiagEmbed(inBuf.Buffer, outBuf.Buffer, batch, diagLen, matSize, offset);
-                    var arr = FinishGpuOp<T>(backend, outBuf, outLen);
-                    var r = new Tensor<T>(arr, outShape);
+                    var r = DeferTensorResult<T>(backend, outBuf.Buffer, outLen, outShape);
+                    outBuf.RelinquishOwnership();
                     Autodiff.DifferentiableOps.RecordUnary("TensorDiagEmbed", r, tensor,
                         Autodiff.BackwardFunctions<T>.DiagEmbedBackward,
                         savedState: new object[] { offset });
@@ -748,8 +751,8 @@ public partial class DirectGpuTensorEngine
                 try
                 {
                     p210.Parity210NanToNum(inBuf.Buffer, outBuf.Buffer, tensor.Length, nanVal, posV, negV);
-                    var arr = FinishGpuOp<T>(backend, outBuf, tensor.Length);
-                    var r = new Tensor<T>(arr, (int[])tensor._shape.Clone());
+                    var r = DeferTensorResult<T>(backend, outBuf.Buffer, tensor.Length, (int[])tensor._shape.Clone());
+                    outBuf.RelinquishOwnership();
                     Autodiff.DifferentiableOps.RecordUnary("TensorNanToNum", r, tensor,
                         Autodiff.BackwardFunctions<T>.NanToNumBackward);
                     return r;

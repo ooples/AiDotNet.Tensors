@@ -165,6 +165,112 @@ public sealed class DeviceMemoryReclaimTests
         DeviceMemoryReclaim.OnDeviceRelease(DeviceMemoryReclaim.CollectNowAfterDeviceBytes, trigger);
         Assert.True(DeviceMemoryReclaim.CollectIfDueAtStepBoundary());
     }
+
+    [Fact]
+    public void FinalizedBuffers_AreCreditedAgainstTheGen2Count()
+    {
+        // Young collections that recover every abandoned buffer (their finalizers return them) leave nothing
+        // unreleased, so the cumulative Gen-2 count must not keep growing toward a forced Gen-2 collection.
+        DeviceMemoryReclaim.ResetCountsForTests();
+        for (int step = 0; step < 3; step++)
+        {
+            long epoch = DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectAfterDeviceBytes);
+            Assert.True(DeviceMemoryReclaim.CollectIfDueAtStepBoundary());
+            // The young collection leaves the Gen-2 count alone, so this step's allocation is still charged there.
+            Assert.Equal(DeviceMemoryReclaim.CollectAfterDeviceBytes, DeviceMemoryReclaim.BytesSinceGen2CollectionForTests);
+            DeviceMemoryReclaim.OnDeviceFinalized(DeviceMemoryReclaim.CollectAfterDeviceBytes, epoch);
+        }
+        Assert.Equal(0, DeviceMemoryReclaim.BytesSinceGen2CollectionForTests);
+    }
+
+    [Fact]
+    public void GradientTapeDispose_CollectsStepIntermediatesAfterEntriesReset()
+    {
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        static WeakReference RecordUnpooledEntry(
+            AiDotNet.Tensors.Engines.Autodiff.GradientTape<float> tape,
+            AiDotNet.Tensors.LinearAlgebra.Tensor<float> x)
+        {
+            var unpooled = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(new[] { 16 });
+            tape.Record(new AiDotNet.Tensors.Engines.Autodiff.TapeEntry<float>
+            {
+                OperationName = "test_step_boundary",
+                Output = unpooled,
+                Input0 = x,
+                InputCount = 1,
+            });
+            return new WeakReference(unpooled);
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        static WeakReference RecordForwardStepAndDispose()
+        {
+            var x = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(new[] { 16 });
+            WeakReference weakForward;
+            using (var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>())
+            {
+                weakForward = RecordUnpooledEntry(tape, x);
+                // Simulate >256 MB of device allocations inside an open tape: must defer to tape.Dispose()
+                // rather than running a mid-step GC while _entries still roots unpooled.
+                DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectNowAfterDeviceBytes);
+                Assert.True(DeviceMemoryReclaim.CollectionDue);
+            }
+            return weakForward;
+        }
+
+        DeviceMemoryReclaim.ResetCountsForTests();
+        var weak = RecordForwardStepAndDispose();
+        Assert.False(DeviceMemoryReclaim.CollectionDue);
+        Assert.False(weak.IsAlive);
+    }
+
+    [Fact]
+    public void StepBoundary_CumulativeMultiStepAllocations_ReclaimsGen2PromotedWrappers()
+    {
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        static (WeakReference Weak, object Root) CreateWrapper()
+        {
+            var obj = new object();
+            return (new WeakReference(obj), obj);
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        static WeakReference CreateGen2PromotedWrapperAndRelease()
+        {
+            var (weak, root) = CreateWrapper();
+            // Two blocking collections while rooted promote the wrapper into Generation 2,
+            // mirroring live forward GPU buffers promoted by mid-step ephemeral GCs.
+            GC.Collect(2, GCCollectionMode.Forced, blocking: true);
+            GC.Collect(2, GCCollectionMode.Forced, blocking: true);
+            Assert.Equal(2, GC.GetGeneration(root));
+            GC.KeepAlive(root);
+            return weak;
+        }
+
+        var tapeOpen = DeviceMemoryReclaim.TapeOpen;
+        DeviceMemoryReclaim.TapeOpen = () => true;
+        try
+        {
+            DeviceMemoryReclaim.ResetCountsForTests();
+            var weakGen2 = CreateGen2PromotedWrapperAndRelease();
+
+            // Simulate 4 steps each abandoning 64 MB (< 256 MB per step, >= 256 MB cumulative):
+            // Steps 1-3 run Gen-1 sweeps (resetting s_driverBytesSinceCollection each time), and Step 4
+            // crosses CollectGen2AfterDeviceBytes (256 MB cumulative) and runs a Gen-2 sweep.
+            for (int step = 0; step < 4; step++)
+            {
+                DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectAfterDeviceBytes);
+                Assert.True(DeviceMemoryReclaim.CollectIfDueAtStepBoundary());
+            }
+
+            Assert.False(weakGen2.IsAlive);
+        }
+        finally
+        {
+            DeviceMemoryReclaim.TapeOpen = tapeOpen;
+        }
+    }
+
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static void AbandonBuffer(IDirectGpuBackend backend) => backend.AllocateBuffer(1024);
 

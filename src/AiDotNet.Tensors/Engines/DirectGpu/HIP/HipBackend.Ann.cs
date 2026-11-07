@@ -4,8 +4,10 @@
 // detection idiom. Numerically identical to AnnPrimitives (the CPU oracle).
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 
-public sealed partial class HipBackend : IAnnBackend
+public sealed partial class HipBackend : IAnnBackend, IChargesDeviceMemoryReclaim
 {
+    bool IChargesDeviceMemoryReclaim.ChargesDeviceMemoryReclaim => true;
+
     // ANN kernel module handle. Compiled best-effort in HipBackend.cs; zero when
     // hipRTC rejected the source (callers then route to the CpuEngine reference).
     private IntPtr _annModule;

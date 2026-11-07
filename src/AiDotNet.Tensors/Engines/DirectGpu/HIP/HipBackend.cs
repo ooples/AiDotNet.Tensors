@@ -1583,9 +1583,6 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         HipGpuBuffer.PendingFrees.Drain();
     }
 
-    private HipError HipMallocReclaiming(ref IntPtr devicePtr, UIntPtr sizeBytes) =>
-        HipMallocReclaiming(ref devicePtr, sizeBytes, out _);
-
     // reclaimEpoch: the epoch the allocation's charge is counted in (DeviceMemoryReclaim.OnDeviceRelease).
     private HipError HipMallocReclaiming(ref IntPtr devicePtr, UIntPtr sizeBytes, out long reclaimEpoch)
     {
@@ -1606,7 +1603,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public IGpuBuffer AllocateBuffer(int size)
     {
         IntPtr devicePtr = IntPtr.Zero;
-        var sizeBytes = (UIntPtr)(size * sizeof(float));
+        var sizeBytes = (UIntPtr)((ulong)size * sizeof(float));
         // Issue #285: per-allocation cap check before hipMalloc.
         GpuBufferSizeGuard.EnsureFits("HIP", (long)size * sizeof(float), MaxBufferAllocBytes, DeviceName);
 
@@ -3670,14 +3667,14 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         // Issue #285: per-allocation cap check before hipMalloc.
         GpuBufferSizeGuard.EnsureFits("HIP", size, MaxBufferAllocBytes, DeviceName);
 
-        var result = HipMallocReclaiming(ref devicePtr, sizeBytes);
+        var result = HipMallocReclaiming(ref devicePtr, sizeBytes, out long reclaimEpoch);
         HipNativeBindings.CheckError(result, "hipMalloc (byte buffer)");
 
         // Zero-initialize
         result = HipNativeBindings.hipMemset(devicePtr, 0, sizeBytes);
         HipNativeBindings.CheckError(result, "hipMemset (byte buffer)");
 
-        return new HipGpuByteBuffer(devicePtr, size, _memoryAccount);
+        return new HipGpuByteBuffer(devicePtr, size, _memoryAccount) { ReclaimEpoch = reclaimEpoch };
     }
 
     public unsafe void Enforce2x4Sparsity(IGpuBuffer denseInput, IGpuBuffer sparseValues, IGpuBuffer sparseIndices, int M, int K)
@@ -5860,17 +5857,17 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public IGpuBuffer AllocateIntBuffer(int size)
     {
         IntPtr devicePtr = IntPtr.Zero;
-        var sizeBytes = (UIntPtr)(size * sizeof(int));
+        var sizeBytes = (UIntPtr)((ulong)size * sizeof(int));
         // Issue #285: per-allocation cap check before hipMalloc.
         GpuBufferSizeGuard.EnsureFits("HIP", (long)size * sizeof(int), MaxBufferAllocBytes, DeviceName);
 
-        var result = HipMallocReclaiming(ref devicePtr, sizeBytes);
+        var result = HipMallocReclaiming(ref devicePtr, sizeBytes, out long reclaimEpoch);
         HipNativeBindings.CheckError(result, "hipMalloc(int)");
 
         result = HipNativeBindings.hipMemset(devicePtr, 0, sizeBytes);
         HipNativeBindings.CheckError(result, "hipMemset(int)");
 
-        return new HipGpuBuffer(devicePtr, size, this, account: _memoryAccount);
+        return new HipGpuBuffer(devicePtr, size, this, account: _memoryAccount) { ReclaimEpoch = reclaimEpoch };
     }
 
     /// <inheritdoc/>
@@ -5915,12 +5912,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
         IntPtr devicePtr = IntPtr.Zero;
         var size = data.Length;
-        var sizeBytes = (UIntPtr)(size * sizeof(int));
+        var sizeBytes = (UIntPtr)((ulong)size * sizeof(int));
         // Issue #285: per-allocation cap check before hipMalloc.
         GpuBufferSizeGuard.EnsureFits("HIP", (long)size * sizeof(int), MaxBufferAllocBytes, DeviceName);
         GpuLaunchProbe.OnUpload(data, sizeof(int), GpuBackendType.Hip);
 
-        var result = HipMallocReclaiming(ref devicePtr, sizeBytes);
+        var result = HipMallocReclaiming(ref devicePtr, sizeBytes, out long reclaimEpoch);
         HipNativeBindings.CheckError(result, "hipMalloc(int)");
 
         GCHandle handle = GCHandle.Alloc(data, GCHandleType.Pinned);
@@ -5938,7 +5935,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             handle.Free();
         }
 
-        return new HipGpuBuffer(devicePtr, size, this, account: _memoryAccount);
+        return new HipGpuBuffer(devicePtr, size, this, account: _memoryAccount) { ReclaimEpoch = reclaimEpoch };
     }
 
     #region Locally Connected Convolution Operations
@@ -6977,7 +6974,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public void Copy(IGpuBuffer source, IGpuBuffer destination, int size)
     {
-        var sizeBytes = (UIntPtr)(size * sizeof(float));
+        var sizeBytes = (UIntPtr)((ulong)size * sizeof(float));
         var result = HipNativeBindings.hipMemcpy(
             destination.Handle,
             source.Handle,
@@ -6995,7 +6992,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         // +0 is all-zero bytes, so hipMemset serves; -0 compares equal to 0 but is not, so it takes the kernel.
         if (BitConverter.ToInt32(BitConverter.GetBytes(value), 0) == 0)
         {
-            var sizeBytes = (UIntPtr)(size * sizeof(float));
+            var sizeBytes = (UIntPtr)((ulong)size * sizeof(float));
             var result = HipNativeBindings.hipMemset(buffer.Handle, 0, sizeBytes);
             HipNativeBindings.CheckError(result, "hipMemset (Fill zero)");
             GpuLaunchProbe.OnLaunch();   // a device-side memset is GPU work, as CUDA's Fill counts it
@@ -10018,7 +10015,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     /// </summary>
     private void HipCopyBuffer(IGpuBuffer source, IGpuBuffer destination, int count)
     {
-        var size = (UIntPtr)(count * sizeof(float));
+        var size = (UIntPtr)((ulong)count * sizeof(float));
         var result = HipNativeBindings.hipMemcpy(
             destination.Handle,
             source.Handle,
@@ -10033,7 +10030,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     /// </summary>
     private void HipZeroBuffer(IGpuBuffer buffer, int count)
     {
-        var size = (UIntPtr)(count * sizeof(float));
+        var size = (UIntPtr)((ulong)count * sizeof(float));
         var result = HipNativeBindings.hipMemset(buffer.Handle, 0, size);
         HipNativeBindings.CheckError(result, "hipMemset");
         GpuLaunchProbe.OnLaunch();   // a device-side memset is GPU work
@@ -10214,7 +10211,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     /// <inheritdoc/>
     public void CopyBufferAsync(IGpuBuffer source, IGpuBuffer destination, int size, IGpuStream stream)
     {
-        var byteSize = (UIntPtr)(size * sizeof(float));
+        var byteSize = (UIntPtr)((ulong)size * sizeof(float));
         var result = HipNativeBindings.hipMemcpyAsync(
             destination.Handle,
             source.Handle,
@@ -10406,7 +10403,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
         IntPtr srcPtr = source.Handle + sourceOffset * sizeof(float);
         IntPtr dstPtr = destination.Handle + destinationOffset * sizeof(float);
-        var sizeBytes = (UIntPtr)(length * sizeof(float));
+        var sizeBytes = (UIntPtr)((ulong)length * sizeof(float));
         var result = HipNativeBindings.hipMemcpy(dstPtr, srcPtr, sizeBytes, HipMemcpyKind.DeviceToDevice);
         HipNativeBindings.CheckError(result, "hipMemcpy D2D (strided)");
         GpuLaunchProbe.OnLaunch();   // a device-to-device copy is GPU work
@@ -11169,7 +11166,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             // seqLen - 1.
             int finalStateOffset = (seqLen - 1) * batch * hiddenSize;
             int stateSize = batch * hiddenSize;
-            var byteSize = (UIntPtr)(stateSize * sizeof(float));
+            var byteSize = (UIntPtr)((ulong)stateSize * sizeof(float));
 
             // Device-to-device copy from allH[seqLen] to hFinal
             IntPtr srcH = IntPtr.Add(allH.Handle, finalStateOffset * sizeof(float));
@@ -12595,6 +12592,10 @@ internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
 {
     // The DeviceMemoryReclaim epoch of this buffer's current charge (set at each allocation or pool hit).
     internal long ReclaimEpoch = -1;
+
+    // Claims the current charge for crediting, so a buffer whose pool return fails and falls back to Release is
+    // credited once.
+    private long TakeReclaimEpoch() => Interlocked.Exchange(ref ReclaimEpoch, -1);
     public IntPtr Handle { get; }
     private int _size;
     public int Size => Volatile.Read(ref _size);
@@ -12785,6 +12786,7 @@ internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
             return;
 
         _memory.OnFreed();
+        DeviceMemoryReclaim.OnDeviceRelease(SizeInBytes, TakeReclaimEpoch());
         if (Handle != IntPtr.Zero) FreeAfterQueuedWork(Handle);
         GC.SuppressFinalize(this);
     }
@@ -12851,6 +12853,7 @@ internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
         if (_isExternal) return;
         if (_returnToPool is { } returnToPool && Handle != IntPtr.Zero && Interlocked.CompareExchange(ref _poolState, 2, 0) == 0)
         {
+            DeviceMemoryReclaim.OnDeviceFinalized(SizeInBytes, TakeReclaimEpoch());
             IntPtr pooledHandle = Handle;
             int capacity = Capacity;
             HipBackend backend = OwningBackend;
@@ -12860,6 +12863,7 @@ internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
         }
         if (Interlocked.Exchange(ref _poolState, 2) == 2 || Handle == IntPtr.Zero) return;
         _memory.OnFreed();
+        DeviceMemoryReclaim.OnDeviceFinalized(SizeInBytes, TakeReclaimEpoch());
         var handle = Handle;
         PendingFrees.Enqueue(() => FreeAfterQueuedWork(handle));
     }
@@ -12879,7 +12883,7 @@ internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
         // Disposed by its owner, not abandoned to the finalizer: no collection is needed to get it back. AllocateBuffer
         // charged a pooled buffer its size (pool hit or hipMalloc); without the credit a TensorScope's frees still counted
         // toward a forced collection.
-        DeviceMemoryReclaim.OnDeviceRelease(SizeInBytes, ReclaimEpoch);
+        DeviceMemoryReclaim.OnDeviceRelease(SizeInBytes, TakeReclaimEpoch());
         _memory.OnReturned();
         try
         {
@@ -12904,6 +12908,8 @@ internal sealed class HipGpuByteBuffer : IGpuBuffer
     public long SizeInBytes => Size;
     private int _disposed;
     private DeviceMemoryHold _memory; // see HipGpuBuffer
+    // The epoch HipMallocReclaiming charged this allocation in, credited back on release (see HipGpuBuffer).
+    internal long ReclaimEpoch = -1;
 
     public HipGpuByteBuffer(IntPtr handle, int size, DeviceMemoryAccount? account = null)
     {
@@ -12917,6 +12923,7 @@ internal sealed class HipGpuByteBuffer : IGpuBuffer
         if (Interlocked.Exchange(ref _disposed, 1) == 1) return;
 
         _memory.OnFreed();
+        DeviceMemoryReclaim.OnDeviceRelease(SizeInBytes, ReclaimEpoch);
         if (Handle != IntPtr.Zero)
         {
             var result = HipNativeBindings.hipFree(Handle);
@@ -12932,6 +12939,7 @@ internal sealed class HipGpuByteBuffer : IGpuBuffer
     {
         if (Interlocked.Exchange(ref _disposed, 1) == 1 || Handle == IntPtr.Zero) return;
         _memory.OnFreed();
+        DeviceMemoryReclaim.OnDeviceFinalized(SizeInBytes, ReclaimEpoch);
         var handle = Handle;
         HipGpuBuffer.PendingFrees.Enqueue(() => HipNativeBindings.hipFree(handle));
     }

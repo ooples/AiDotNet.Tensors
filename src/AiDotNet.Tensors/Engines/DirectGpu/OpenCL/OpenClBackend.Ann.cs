@@ -5,8 +5,10 @@
 // 256-thread workgroups. Numerically mirrors AiDotNet.Tensors.Ann.AnnPrimitives.
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 {
-    public sealed partial class OpenClBackend : IAnnBackend
+    public sealed partial class OpenClBackend : IAnnBackend, IChargesDeviceMemoryReclaim
     {
+        bool IChargesDeviceMemoryReclaim.ChargesDeviceMemoryReclaim => true;
+
         private const int AnnLocalSize = 256;
 
         private DirectOpenClKernel GetAnnKernel(string name)

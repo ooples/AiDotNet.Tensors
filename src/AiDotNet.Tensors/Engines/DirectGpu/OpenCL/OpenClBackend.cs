@@ -32,7 +32,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     /// <item>Bank-conflict-free shared memory</item>
     /// </list>
     /// </remarks>
-    public sealed partial class OpenClBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IAdam8BitWeightDecayBackend, IExtendedConvKernels, IPixelShuffleBackend, INativeGpuCodegenExecutor, IDeviceMemoryAccounted
+    public sealed partial class OpenClBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IAdam8BitWeightDecayBackend, IExtendedConvKernels, IPixelShuffleBackend, INativeGpuCodegenExecutor, IDeviceMemoryAccounted, IGatedDeltaNetBackwardBackend
     {
         /// <summary>
         /// OpenCL has no cuDNN-equivalent half/bfloat16 conv path —
@@ -13967,6 +13967,118 @@ KERNEL VARIANTS (A/B testing):
             kernel.Execute1D(globalSize, localSize);
         }
 
+        void IGatedDeltaNetBackwardBackend.GatedDeltaNetScanBackward(
+            IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta,
+            IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dAlpha, IGpuBuffer dBeta,
+            int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        {
+            if (_context == null)
+                throw new GpuCapabilityUnavailableException("OpenCL context is not initialized. Cannot execute GatedDeltaNetScanBackward.");
+            if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
+                throw new ArgumentOutOfRangeException(nameof(batch), "GatedDeltaNet dimensions must be positive.");
+            if (modelDim != numHeads * headDim)
+                throw new ArgumentException($"modelDim ({modelDim}) must equal numHeads * headDim ({numHeads * headDim}).");
+            if (headDim > Kernels.GatedDeltaNetKernels.MaxHeadDim)
+                throw new InvalidOperationException($"GatedDeltaNet headDim ({headDim}) exceeds max ({Kernels.GatedDeltaNetKernels.MaxHeadDim}).");
+            GatedDeltaNetBackwardResolver.ValidateBuffers(dOut, q, k, v, alpha, beta, dQ, dK, dV, dAlpha, dBeta, batch, seqLen, modelDim, numHeads);
+            if (!_kernelCache.TryGetValue("gated_delta_scan_recompute", out var recompute) ||
+                !_kernelCache.TryGetValue("gated_delta_scan_backward", out var backward))
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: gated_delta_scan_recompute / gated_delta_scan_backward");
+
+            long totalLong = checked((long)batch * numHeads * headDim);
+            long trajLenLong = checked(totalLong * seqLen * headDim);
+            if (totalLong > int.MaxValue || trajLenLong > int.MaxValue)
+                throw new ArgumentOutOfRangeException(nameof(batch), "GatedDeltaNet dimensions exceed OpenCL launch/buffer limits.");
+            // Deterministic mode replaces the atomic accumulation with per-row partials summed in a fixed order (see
+            // gated_delta_scan_backward); dq and reduce write every element, so nothing needs clearing first.
+            bool det = GpuDeterminism.IsActive;
+            DirectOpenClKernel? dqKernel = null, reduceKernel = null;
+            if (det && (!_kernelCache.TryGetValue("gated_delta_scan_dq", out dqKernel)
+                        || !_kernelCache.TryGetValue("gated_delta_scan_reduce", out reduceKernel)))
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: gated_delta_scan_dq / gated_delta_scan_reduce");
+            int n = batch * seqLen * modelDim;
+            if (!det)
+            {
+                Fill(dQ, 0f, n);
+                Fill(dK, 0f, n);
+                Fill(dAlpha, 0f, batch * seqLen * numHeads);
+                Fill(dBeta, 0f, batch * seqLen * numHeads);
+            }
+            int trajLen = (int)trajLenLong;
+            using var trajBuf = AllocateBuffer(trajLen);
+            int total = (int)totalLong;
+            // One size launches both kernels, so it must fit the smaller compiled limit: their private state arrays
+            // can push CL_KERNEL_WORK_GROUP_SIZE below the device maximum.
+            int localSize = ClampLocalSizeForKernel(backward,
+                ClampLocalSizeForKernel(recompute, CalculateOptimalWorkGroupSize1D(total), 0), 0);
+            int globalSize = ((total + localSize - 1) / localSize) * localSize;
+
+            recompute.SetArg(0u, ((DirectOpenClGpuBuffer)k).Buffer.Handle);
+            recompute.SetArg(1u, ((DirectOpenClGpuBuffer)v).Buffer.Handle);
+            recompute.SetArg(2u, ((DirectOpenClGpuBuffer)alpha).Buffer.Handle);
+            recompute.SetArg(3u, ((DirectOpenClGpuBuffer)beta).Buffer.Handle);
+            recompute.SetArg(4u, ((DirectOpenClGpuBuffer)trajBuf).Buffer.Handle);
+            recompute.SetArg(5u, batch);
+            recompute.SetArg(6u, seqLen);
+            recompute.SetArg(7u, modelDim);
+            recompute.SetArg(8u, numHeads);
+            recompute.SetArg(9u, headDim);
+            recompute.Execute1D(globalSize, localSize);
+
+            using var partials = det ? AllocateBuffer(checked(2 * n)) : null;
+            if (dqKernel is not null)
+            {
+                dqKernel.SetArg(0u, ((DirectOpenClGpuBuffer)dOut).Buffer.Handle);
+                dqKernel.SetArg(1u, ((DirectOpenClGpuBuffer)trajBuf).Buffer.Handle);
+                dqKernel.SetArg(2u, ((DirectOpenClGpuBuffer)dQ).Buffer.Handle);
+                SetScanDims(dqKernel, 3u, batch, seqLen, modelDim, numHeads, headDim);
+                int dqLocal = ClampLocalSizeForKernel(dqKernel, CalculateOptimalWorkGroupSize1D(n), 0);
+                dqKernel.Execute1D(((n + dqLocal - 1) / dqLocal) * dqLocal, dqLocal);
+            }
+
+            backward.SetArg(0u, ((DirectOpenClGpuBuffer)dOut).Buffer.Handle);
+            backward.SetArg(1u, ((DirectOpenClGpuBuffer)q).Buffer.Handle);
+            backward.SetArg(2u, ((DirectOpenClGpuBuffer)k).Buffer.Handle);
+            backward.SetArg(3u, ((DirectOpenClGpuBuffer)v).Buffer.Handle);
+            backward.SetArg(4u, ((DirectOpenClGpuBuffer)alpha).Buffer.Handle);
+            backward.SetArg(5u, ((DirectOpenClGpuBuffer)beta).Buffer.Handle);
+            backward.SetArg(6u, ((DirectOpenClGpuBuffer)trajBuf).Buffer.Handle);
+            backward.SetArg(7u, ((DirectOpenClGpuBuffer)(partials ?? dQ)).Buffer.Handle);
+            backward.SetArg(8u, ((DirectOpenClGpuBuffer)dK).Buffer.Handle);
+            backward.SetArg(9u, ((DirectOpenClGpuBuffer)dV).Buffer.Handle);
+            backward.SetArg(10u, ((DirectOpenClGpuBuffer)dAlpha).Buffer.Handle);
+            backward.SetArg(11u, ((DirectOpenClGpuBuffer)dBeta).Buffer.Handle);
+            backward.SetArg(12u, batch);
+            backward.SetArg(13u, seqLen);
+            backward.SetArg(14u, modelDim);
+            backward.SetArg(15u, numHeads);
+            backward.SetArg(16u, headDim);
+            backward.SetArg(17u, det ? 1 : 0);
+            backward.Execute1D(globalSize, localSize);
+
+            if (reduceKernel is not null && partials is not null)
+            {
+                reduceKernel.SetArg(0u, ((DirectOpenClGpuBuffer)trajBuf).Buffer.Handle);
+                reduceKernel.SetArg(1u, ((DirectOpenClGpuBuffer)partials).Buffer.Handle);
+                reduceKernel.SetArg(2u, ((DirectOpenClGpuBuffer)dK).Buffer.Handle);
+                reduceKernel.SetArg(3u, ((DirectOpenClGpuBuffer)dAlpha).Buffer.Handle);
+                reduceKernel.SetArg(4u, ((DirectOpenClGpuBuffer)dBeta).Buffer.Handle);
+                SetScanDims(reduceKernel, 5u, batch, seqLen, modelDim, numHeads, headDim);
+                int reduceLocal = ClampLocalSizeForKernel(reduceKernel, CalculateOptimalWorkGroupSize1D(n), 0);
+                reduceKernel.Execute1D(((n + reduceLocal - 1) / reduceLocal) * reduceLocal, reduceLocal);
+            }
+        }
+
+        private static void SetScanDims(DirectOpenClKernel kernel, uint first, int batch, int seqLen, int modelDim,
+            int numHeads, int headDim)
+        {
+            kernel.SetArg(first, batch);
+            kernel.SetArg(first + 1, seqLen);
+            kernel.SetArg(first + 2, modelDim);
+            kernel.SetArg(first + 3, numHeads);
+            kernel.SetArg(first + 4, headDim);
+        }
+
         // ── Fused RG-LRU scan forward (#1464) ───────────────────────────────────────────────
         public void RgLruScanForward(
             IGpuBuffer value, IGpuBuffer recGate, IGpuBuffer inpGate, IGpuBuffer decay, IGpuBuffer output,
@@ -14666,6 +14778,7 @@ KERNEL VARIANTS (A/B testing):
         {
             if (_returnToPool is { } returnToPool && Interlocked.CompareExchange(ref _poolState, 2, 0) == 0)
             {
+                DeviceMemoryReclaim.OnDeviceFinalized((long)Size * sizeof(float), ReclaimEpoch);
                 var pooledBuffer = Buffer;
                 var memory = _memory.TransferToLease();
                 PendingFrees.Enqueue(() => returnToPool(Pooled(pooledBuffer, returnToPool, memory)));

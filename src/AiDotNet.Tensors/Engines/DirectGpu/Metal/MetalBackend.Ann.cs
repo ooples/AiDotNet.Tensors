@@ -6,8 +6,10 @@
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
-public sealed partial class MetalBackend : IAnnBackend
+public sealed partial class MetalBackend : IAnnBackend, IChargesDeviceMemoryReclaim
 {
+    bool IChargesDeviceMemoryReclaim.ChargesDeviceMemoryReclaim => false;
+
     private const string AnnLibName = "Ann";
 
     private MetalPipelineState GetAnnPipeline(string kernelName)
