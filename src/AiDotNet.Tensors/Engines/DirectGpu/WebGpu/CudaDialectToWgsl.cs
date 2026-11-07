@@ -26,7 +26,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 /// </summary>
 internal static class CudaDialectToWgsl
 {
-    private static readonly System.TimeSpan Timeout = System.TimeSpan.FromSeconds(5);
+    // The input is this library's own compiled-in kernel source, so the timeout only has to stop a runaway pattern. It is
+    // wall time, and a blocking full collection of a large heap suspends this thread too: 5 s timed out translating a
+    // small kernel on the CUDA runner (RegexMatchTimeoutException in the Dawn parity fixture).
+    private static readonly System.TimeSpan Timeout = System.TimeSpan.FromSeconds(60);
 
     private static readonly Regex KernelHeader = new(
         @"extern ""C"" __global__ __launch_bounds__\(256\) void (\w+)\(([^)]*)\)\s*\{", RegexOptions.None, Timeout);
