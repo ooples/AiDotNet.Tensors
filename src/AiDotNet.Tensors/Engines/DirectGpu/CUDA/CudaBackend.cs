@@ -19,7 +19,7 @@ using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
-public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, IChannelBiasAddOutBackend, IUninitializedGpuAllocation, IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IAdam8BitWeightDecayBackend, IMultiTensorGpuOptimizerBackend, AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend, IPixelShuffleBackend, INativeGpuCodegenExecutor, IBiasActivationBackend, IDeviceMemoryAccounted
+public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, IChannelBiasAddOutBackend, IUninitializedGpuAllocation, IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IAdam8BitWeightDecayBackend, IMultiTensorGpuOptimizerBackend, AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend, IPixelShuffleBackend, INativeGpuCodegenExecutor, IBiasActivationBackend, IDeviceMemoryAccounted, IGatedDeltaNetBackwardBackend
 {
     // During teardown the CUDA driver/context may already be destroyed, so calling driver
     // APIs (cuCtxPushCurrent / cuMemFree / cuCtxPopCurrent / cuCtxDestroy / cuModuleUnload)
@@ -9692,23 +9692,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
-    public IGpuBuffer AllocateIntBuffer(int size)
-    {
-        if (!IsAvailable)
-            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
-
-        if (size <= 0)
-            throw new ArgumentOutOfRangeException(nameof(size), "Buffer size must be positive.");
-        // Issue #285: per-allocation cap check before cuMemAlloc.
-        GpuBufferSizeGuard.EnsureFits("CUDA", (long)size * sizeof(int), MaxBufferAllocBytes, DeviceName);
-        RecordDirectPtxEvidenceDeviceAllocation(checked((long)size * sizeof(int)));
-
-        using var _ = PushContext();
-        ulong byteSize = (ulong)size * sizeof(int);
-        CuBlasNative.CheckCudaResult(CuBlasNative.cuMemAlloc(out IntPtr devicePtr, byteSize), "cuMemAlloc(int)");
-        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuMemsetD32Async(devicePtr, 0, (ulong)size, _stream), "cuMemsetD32Async(int)");
-        return new CudaGpuBuffer(_cudaContext, devicePtr, size, account: _memoryAccount);
-    }
+    public IGpuBuffer AllocateIntBuffer(int size) => AllocateBuffer(size);
 
     public IGpuBuffer AllocateIntBuffer(int[] data)
     {
@@ -18245,6 +18229,84 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
     }
 
+    unsafe void IGatedDeltaNetBackwardBackend.GatedDeltaNetScanBackward(
+        IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta,
+        IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dAlpha, IGpuBuffer dBeta,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "GatedDeltaNet dimensions must be positive.");
+        if (modelDim != numHeads * headDim)
+            throw new ArgumentException($"modelDim ({modelDim}) must equal numHeads * headDim ({numHeads * headDim}).");
+        if (headDim > Kernels.CudaGatedDeltaNetKernels.MaxHeadDim)
+            throw new InvalidOperationException(
+                $"GatedDeltaNet headDim ({headDim}) exceeds max ({Kernels.CudaGatedDeltaNetKernels.MaxHeadDim}).");
+        GatedDeltaNetBackwardResolver.ValidateBuffers(dOut, q, k, v, alpha, beta, dQ, dK, dV, dAlpha, dBeta, batch, seqLen, modelDim, numHeads);
+        if (!_kernelCache.TryGetValue("gated_delta_scan_recompute", out var recompute) ||
+            !_kernelCache.TryGetValue("gated_delta_scan_backward", out var backward))
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: gated_delta_scan_recompute / gated_delta_scan_backward");
+
+        using var _ = PushContext();
+        // Deterministic mode replaces the atomic accumulation with per-row partials summed in a fixed order (see
+        // gated_delta_scan_backward); dq and reduce write every element, so nothing needs clearing first.
+        bool det = GpuDeterminism.IsActive;
+        IntPtr dqKernel = IntPtr.Zero, reduceKernel = IntPtr.Zero;
+        if (det && (!_kernelCache.TryGetValue("gated_delta_scan_dq", out dqKernel)
+                    || !_kernelCache.TryGetValue("gated_delta_scan_reduce", out reduceKernel)))
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: gated_delta_scan_dq / gated_delta_scan_reduce");
+        int n = batch * seqLen * modelDim;
+        if (!det)
+        {
+            Fill(dQ, 0f, n);
+            Fill(dK, 0f, n);
+            Fill(dAlpha, 0f, batch * seqLen * numHeads);
+            Fill(dBeta, 0f, batch * seqLen * numHeads);
+        }
+        long trajLenL = checked((long)batch * numHeads * seqLen * headDim * headDim);
+        if (trajLenL > int.MaxValue)
+            throw new ArgumentException("GatedDeltaNet trajectory buffer is too large for a single allocation.");
+        int trajLen = (int)trajLenL;
+        using var trajBuf = AllocateBuffer(trajLen);
+        uint total = (uint)(batch * numHeads * headDim);
+        uint grid = (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize;
+
+        IntPtr pk = k.Handle, pv = v.Handle, pa = alpha.Handle, pb = beta.Handle, ptr = trajBuf.Handle;
+        void** ra = stackalloc void*[10];
+        ra[0] = &pk; ra[1] = &pv; ra[2] = &pa; ra[3] = &pb; ra[4] = &ptr;
+        ra[5] = &batch; ra[6] = &seqLen; ra[7] = &modelDim; ra[8] = &numHeads; ra[9] = &headDim;
+        LaunchKernel(recompute, grid, (uint)DefaultBlockSize, ra);
+
+        IntPtr pdo = dOut.Handle, pq = q.Handle;
+        IntPtr pdq = dQ.Handle, pdk = dK.Handle, pdv = dV.Handle, pda = dAlpha.Handle, pdb = dBeta.Handle;
+        uint nGrid = ((uint)n + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize;
+        using var partials = det ? AllocateBuffer(checked(2 * n)) : null;
+        IntPtr pp = partials?.Handle ?? IntPtr.Zero;
+        if (det)
+        {
+            void** qa = stackalloc void*[8];
+            qa[0] = &pdo; qa[1] = &ptr; qa[2] = &pdq;
+            qa[3] = &batch; qa[4] = &seqLen; qa[5] = &modelDim; qa[6] = &numHeads; qa[7] = &headDim;
+            LaunchKernel(dqKernel, nGrid, (uint)DefaultBlockSize, qa);
+        }
+
+        IntPtr pslot = det ? pp : pdq;
+        int detFlag = det ? 1 : 0;
+        void** ba = stackalloc void*[18];
+        ba[0] = &pdo; ba[1] = &pq; ba[2] = &pk; ba[3] = &pv; ba[4] = &pa; ba[5] = &pb; ba[6] = &ptr;
+        ba[7] = &pslot; ba[8] = &pdk; ba[9] = &pdv; ba[10] = &pda; ba[11] = &pdb;
+        ba[12] = &batch; ba[13] = &seqLen; ba[14] = &modelDim; ba[15] = &numHeads; ba[16] = &headDim;
+        ba[17] = &detFlag;
+        LaunchKernel(backward, grid, (uint)DefaultBlockSize, ba);
+
+        if (det)
+        {
+            void** rd = stackalloc void*[10];
+            rd[0] = &ptr; rd[1] = &pp; rd[2] = &pdk; rd[3] = &pda; rd[4] = &pdb;
+            rd[5] = &batch; rd[6] = &seqLen; rd[7] = &modelDim; rd[8] = &numHeads; rd[9] = &headDim;
+            LaunchKernel(reduceKernel, nGrid, (uint)DefaultBlockSize, rd);
+        }
+    }
+
     // ── Fused RG-LRU scan forward (#1464) ──────────────────────────────────────────────────
     public unsafe void RgLruScanForward(
         IGpuBuffer value, IGpuBuffer recGate, IGpuBuffer inpGate, IGpuBuffer decay, IGpuBuffer output,
@@ -20233,6 +20295,47 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         try { Dispose(disposing: false); } catch { }
     }
 
+    // Batch net-unreleased CUDA buffer bytes in 128-MB quanta before forwarding to DeviceMemoryReclaim so CUDA's
+    // stream-ordered pool (_asyncMemPool) avoids managed-heap GC stalls on sub-128-MB microbenchmarks while still
+    // guaranteeing Gen-1 sweeps every 128 MB and Gen-2 sweeps every 512 MB of unreleased device memory (preventing
+    // 10+ GB training steps from crossing the 12 GB Windows WDDM shared-memory paging cliff).
+    private const long CudaReclaimQuantumBytes = 128L << 20;
+    private static long s_cudaUnreleasedBytes;
+    private static long s_cudaReclaimEpoch;
+
+    private static long ChargeCudaReclaim(long bytes)
+    {
+        if (bytes <= 0 || IsCapturingOnThisThread || IsRuntimeTearingDown || ProcessExiting) return -1;
+        long epoch = Volatile.Read(ref s_cudaReclaimEpoch);
+        long pending = Interlocked.Add(ref s_cudaUnreleasedBytes, bytes);
+        while (pending >= CudaReclaimQuantumBytes)
+        {
+            long chunks = pending / CudaReclaimQuantumBytes;
+            long drain = chunks * CudaReclaimQuantumBytes;
+            long observed = Interlocked.CompareExchange(ref s_cudaUnreleasedBytes, pending - drain, pending);
+            if (observed == pending)
+            {
+                Interlocked.Increment(ref s_cudaReclaimEpoch);
+                DeviceMemoryReclaim.OnDeviceAllocation(chunks * DeviceMemoryReclaim.CollectAfterDeviceBytes);
+                return -1;
+            }
+            pending = observed;
+        }
+        return epoch;
+    }
+
+    private static void CreditCudaReclaim(long bytes, long epoch)
+    {
+        if (bytes <= 0 || epoch < 0) return;
+        while (true)
+        {
+            long current = Volatile.Read(ref s_cudaUnreleasedBytes);
+            if (Volatile.Read(ref s_cudaReclaimEpoch) != epoch || current <= 0) return;
+            long next = Math.Max(0, current - bytes);
+            if (Interlocked.CompareExchange(ref s_cudaUnreleasedBytes, next, current) == current) return;
+        }
+    }
+
     internal sealed class CudaGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     {
         private IntPtr _context;
@@ -20245,6 +20348,21 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         private int _size;
         private CaptureMemoryPool[]? _capturePins; // live captures whose graphs use this buffer (CaptureMemoryPool)
         private DeviceMemoryHold _memory; // what GpuMemoryStats counts for this memory
+        private long _reclaimCharge;
+        private long _reclaimEpoch = -1;
+
+        private void ChargeReclaim(long bytes)
+        {
+            if (bytes <= 0 || IsCapturingOnThisThread || IsRuntimeTearingDown || ProcessExiting) return;
+            _reclaimCharge = bytes;
+            _reclaimEpoch = ChargeCudaReclaim(bytes);
+        }
+
+        private void CreditReclaim()
+        {
+            long charge = Interlocked.Exchange(ref _reclaimCharge, 0);
+            if (charge > 0) CreditCudaReclaim(charge, _reclaimEpoch);
+        }
 
         public int Size => Volatile.Read(ref _size);
         public int Capacity { get; }
@@ -20284,6 +20402,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             }
             _allocatedDuringCapture = IsCapturingOnThisThread;
             _contextGeneration = ContextGenerationOf(context);
+            if (account is not null) ChargeReclaim((long)size * sizeof(float));
         }
 
         // Allocated during a capture: never returned to the shared pool (another rent could hand it out while a
@@ -20297,6 +20416,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             Volatile.Write(ref _size, size);
             Interlocked.Exchange(ref _poolState, 0);
             _memory.OnRented();
+            ChargeReclaim((long)size * sizeof(float));
         }
 
         /// <summary>
@@ -20344,6 +20464,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 GC.SuppressFinalize(this);
                 return;
             }
+            CreditReclaim();
             _memory.OnFreed();
 
             // During CLR/AppDomain teardown the CUDA context may already be gone;
@@ -20414,6 +20535,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             if (Interlocked.CompareExchange(ref _poolState, 1, 0) != 0)
                 return;
 
+            CreditReclaim();
             try
             {
                 _returnToPool(this);
@@ -20461,6 +20583,21 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         private CaptureMemoryPool[]? _capturePins; // live captures whose graphs use this buffer (CaptureMemoryPool)
         private DeviceMemoryHold _memory; // see CudaGpuBuffer
+        private long _reclaimCharge;
+        private long _reclaimEpoch = -1;
+
+        private void ChargeReclaim(long bytes)
+        {
+            if (bytes <= 0 || IsCapturingOnThisThread || IsRuntimeTearingDown || ProcessExiting) return;
+            _reclaimCharge = bytes;
+            _reclaimEpoch = ChargeCudaReclaim(bytes);
+        }
+
+        private void CreditReclaim()
+        {
+            long charge = Interlocked.Exchange(ref _reclaimCharge, 0);
+            if (charge > 0) CreditCudaReclaim(charge, _reclaimEpoch);
+        }
 
         public CudaGpuByteBuffer(IntPtr context, IntPtr devicePtr, int size, IntPtr asyncFreeStream = default,
             DeviceMemoryAccount? account = null)
@@ -20474,6 +20611,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             CaptureMemoryPool.Current?.Pin(ref _capturePins, this);
             _allocatedDuringCapture = IsCapturingOnThisThread;
             _contextGeneration = ContextGenerationOf(context);
+            if (account is not null) ChargeReclaim(size);
         }
 
         public void Dispose()
@@ -20494,6 +20632,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 GC.SuppressFinalize(this);
                 return;
             }
+            CreditReclaim();
             _memory.OnFreed();
 
             // See CudaGpuBuffer.Release: skip native CUDA calls during teardown to

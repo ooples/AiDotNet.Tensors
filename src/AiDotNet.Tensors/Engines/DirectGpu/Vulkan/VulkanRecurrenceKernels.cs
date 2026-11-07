@@ -350,4 +350,173 @@ void main() {
         for (int ki=0; ki<HD; ki++) dSrow[ki]*=g;
     }
 }";
+
+    public static string GatedDeltaRecompute => Header + @"
+layout(set=0,binding=0) readonly buffer Kb { float K[]; };
+layout(set=0,binding=1) readonly buffer Vb { float Vd[]; };
+layout(set=0,binding=2) readonly buffer Ab { float A[]; };
+layout(set=0,binding=3) readonly buffer Bb { float Bt[]; };
+layout(set=0,binding=4) buffer Sb { float Straj[]; };
+layout(push_constant) uniform PC { uint batch; uint seqLen; uint modelDim; uint numHeads; uint headDim; };
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    int B=int(batch), SL=int(seqLen), MD=int(modelDim), NH=int(numHeads), HD=int(headDim);
+    if (gid >= B*NH*HD) return;
+    int di = gid % HD; int h = (gid/HD) % NH; int b = gid/(HD*NH); int hOff = h*HD; int hh = HD*HD;
+    float kappa = 1.0/sqrt(float(HD));
+    float Srow[256];
+    for (int ki=0; ki<HD; ki++) Srow[ki]=0.0;
+    for (int t=0; t<SL; t++) {
+        int baseOff = (b*SL+t)*MD + hOff; int gIdx = (b*SL+t)*NH + h;
+        float a = A[gIdx], bet = Bt[gIdx];
+        float sK = 0.0; for (int ki=0; ki<HD; ki++) sK += Srow[ki]*(K[baseOff+ki]*kappa);
+        float bd = bet*(Vd[baseOff+di]-sK);
+        int trajBase = ((b*NH+h)*SL+t)*hh + di*HD;
+        for (int ki=0; ki<HD; ki++) { float s = a*Srow[ki] + bd*(K[baseOff+ki]*kappa); Srow[ki]=s; Straj[trajBase+ki]=s; }
+    }
+}";
+
+    public static string GatedDeltaBackward => GatedDeltaBackwardSource(deterministic: false);
+
+    /// <summary>
+    /// The backward without atomics: dQ comes from <see cref="GatedDeltaDq"/>, each row's dK contribution overwrites
+    /// that row of the trajectory (read only by this invocation, and last read at step t + 1), and dA/dB go to per-row
+    /// partials P = [dA | dB]. <see cref="GatedDeltaReduce"/> then sums the rows in a fixed order.
+    /// </summary>
+    public static string GatedDeltaBackwardDeterministic => GatedDeltaBackwardSource(deterministic: true);
+
+    private static string GatedDeltaBackwardSource(bool deterministic) => Header + (deterministic ? @"
+layout(set=0,binding=0) readonly buffer DOb { float dOut[]; };
+layout(set=0,binding=1) readonly buffer Qb { float Q[]; };
+layout(set=0,binding=2) readonly buffer Kb { float K[]; };
+layout(set=0,binding=3) readonly buffer Vb { float Vd[]; };
+layout(set=0,binding=4) readonly buffer Ab { float A[]; };
+layout(set=0,binding=5) readonly buffer Bb { float Bt[]; };
+layout(set=0,binding=6) buffer Sb { float Straj[]; };
+layout(set=0,binding=7) writeonly buffer Pb { float P[]; };
+layout(set=0,binding=8) writeonly buffer DVb { float dV[]; };
+layout(push_constant) uniform PC { uint batch; uint seqLen; uint modelDim; uint numHeads; uint headDim; };
+void addDQ(int idx, float val){ }
+void addDK(int idx, float val){ }
+" : @"
+layout(set=0,binding=0) readonly buffer DOb { float dOut[]; };
+layout(set=0,binding=1) readonly buffer Qb { float Q[]; };
+layout(set=0,binding=2) readonly buffer Kb { float K[]; };
+layout(set=0,binding=3) readonly buffer Vb { float Vd[]; };
+layout(set=0,binding=4) readonly buffer Ab { float A[]; };
+layout(set=0,binding=5) readonly buffer Bb { float Bt[]; };
+layout(set=0,binding=6) readonly buffer Sb { float Straj[]; };
+layout(set=0,binding=7) buffer DQb { uint dQ[]; };
+layout(set=0,binding=8) buffer DKb { uint dK[]; };
+layout(set=0,binding=9) buffer DVb { float dV[]; };
+layout(set=0,binding=10) buffer DAb { uint dA[]; };
+layout(set=0,binding=11) buffer DBb { uint dB[]; };
+layout(push_constant) uniform PC { uint batch; uint seqLen; uint modelDim; uint numHeads; uint headDim; };
+void addDQ(int idx, float val){ uint old=dQ[idx]; uint assumed; do { assumed=old; old=atomicCompSwap(dQ[idx], assumed, floatBitsToUint(uintBitsToFloat(assumed)+val)); } while(old!=assumed); }
+void addDK(int idx, float val){ uint old=dK[idx]; uint assumed; do { assumed=old; old=atomicCompSwap(dK[idx], assumed, floatBitsToUint(uintBitsToFloat(assumed)+val)); } while(old!=assumed); }
+void addDA(int idx, float val){ uint old=dA[idx]; uint assumed; do { assumed=old; old=atomicCompSwap(dA[idx], assumed, floatBitsToUint(uintBitsToFloat(assumed)+val)); } while(old!=assumed); }
+void addDB(int idx, float val){ uint old=dB[idx]; uint assumed; do { assumed=old; old=atomicCompSwap(dB[idx], assumed, floatBitsToUint(uintBitsToFloat(assumed)+val)); } while(old!=assumed); }
+") + (deterministic ? @"
+#define DET 1
+" : @"
+#define DET 0
+") + @"
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    int B=int(batch), SL=int(seqLen), MD=int(modelDim), NH=int(numHeads), HD=int(headDim);
+    if (gid >= B*NH*HD) return;
+    int di = gid % HD; int h = (gid/HD) % NH; int b = gid/(HD*NH); int hOff = h*HD; int hh = HD*HD;
+    float kappa = 1.0/sqrt(float(HD));
+    float dSrow[256];
+    for (int ki=0; ki<HD; ki++) dSrow[ki]=0.0;
+    for (int t=SL-1; t>=0; t--) {
+        int baseOff = (b*SL+t)*MD + hOff; int gIdx = (b*SL+t)*NH + h;
+        float a = A[gIdx], bet = Bt[gIdx];
+        int trajBase = ((b*NH+h)*SL+t)*hh + di*HD;
+        int sprevBase = (t>0) ? (((b*NH+h)*SL+(t-1))*hh + di*HD) : 0;
+        float sK = 0.0;
+        for (int ki=0; ki<HD; ki++) { float sprev = (t>0) ? Straj[sprevBase+ki] : 0.0; sK += sprev*(K[baseOff+ki]*kappa); }
+        float delta = Vd[baseOff+di] - sK;
+        float dOutVal = dOut[baseOff+di];
+        for (int ki=0; ki<HD; ki++) { if (DET == 0) addDQ(baseOff+ki, dOutVal*Straj[trajBase+ki]); dSrow[ki]+=dOutVal*Q[baseOff+ki]; }
+        float dA_acc=0.0, dB_acc=0.0, dDelta=0.0;
+        for (int ki=0; ki<HD; ki++) {
+            float dSt = dSrow[ki];
+            float sprev = (t>0) ? Straj[sprevBase+ki] : 0.0;
+            float kScaled = K[baseOff+ki]*kappa;
+            dA_acc += dSt*sprev;
+            dB_acc += dSt*delta*kScaled;
+            dDelta += dSt*bet*kScaled;
+        }
+        dV[baseOff+di] = dDelta;
+#if DET
+        P[gIdx*HD + di] = dA_acc;
+        P[B*SL*MD + gIdx*HD + di] = dB_acc;
+#else
+        addDA(gIdx, dA_acc);
+        addDB(gIdx, dB_acc);
+#endif
+        float dSk = -dDelta;
+        for (int ki=0; ki<HD; ki++) {
+            float dSt = dSrow[ki];
+            float sprev = (t>0) ? Straj[sprevBase+ki] : 0.0;
+            float kScaled = K[baseOff+ki]*kappa;
+            float dKS = dSt*(bet*delta) + dSk*sprev;
+#if DET
+            Straj[trajBase+ki] = dKS*kappa;
+#else
+            addDK(baseOff+ki, dKS*kappa);
+#endif
+            dSrow[ki] = dSt*a + dSk*kScaled;
+        }
+    }
+}";
+
+    /// <summary>Deterministic dQ: dQ[b,t,h,ki] = sum over di (ascending) of dOut[b,t,h,di] * S_t[di,ki].</summary>
+    public static string GatedDeltaDq => Header + @"
+layout(set=0,binding=0) readonly buffer DOb { float dOut[]; };
+layout(set=0,binding=1) readonly buffer Sb { float Straj[]; };
+layout(set=0,binding=2) writeonly buffer DQb { float dQ[]; };
+layout(push_constant) uniform PC { uint batch; uint seqLen; uint modelDim; uint numHeads; uint headDim; };
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    int SL=int(seqLen), MD=int(modelDim), NH=int(numHeads), HD=int(headDim);
+    if (gid >= int(batch)*SL*MD) return;
+    int ki = gid % HD; int h = (gid/HD) % NH; int bt = gid / MD; int t = bt % SL; int b = bt / SL;
+    int trajT = ((b*NH+h)*SL+t)*HD*HD;
+    int base = bt*MD + h*HD;
+    float acc = 0.0;
+    for (int di=0; di<HD; di++) acc += dOut[base+di]*Straj[trajT + di*HD + ki];
+    dQ[gid] = acc;
+}";
+
+    /// <summary>
+    /// Deterministic reduction of <see cref="GatedDeltaBackwardDeterministic"/>'s partials: dK from the rows of PK (the
+    /// overwritten trajectory) and dA/dB from P = [dA | dB], each summed over di in ascending order.
+    /// </summary>
+    public static string GatedDeltaReduce => Header + @"
+layout(set=0,binding=0) readonly buffer PKb { float PK[]; };
+layout(set=0,binding=1) readonly buffer Pb { float P[]; };
+layout(set=0,binding=2) writeonly buffer DKb { float dK[]; };
+layout(set=0,binding=3) writeonly buffer DAb { float dA[]; };
+layout(set=0,binding=4) writeonly buffer DBb { float dB[]; };
+layout(push_constant) uniform PC { uint batch; uint seqLen; uint modelDim; uint numHeads; uint headDim; };
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    int SL=int(seqLen), MD=int(modelDim), NH=int(numHeads), HD=int(headDim);
+    int n = int(batch)*SL*MD;
+    if (gid >= n) return;
+    int ki = gid % HD; int h = (gid/HD) % NH; int bt = gid / MD; int t = bt % SL; int b = bt / SL;
+    int trajT = ((b*NH+h)*SL+t)*HD*HD;
+    float acc = 0.0;
+    for (int di=0; di<HD; di++) acc += PK[trajT + di*HD + ki];
+    dK[gid] = acc;
+    if (ki == 0) {
+        int gIdx = bt*NH + h;
+        float sa = 0.0, sb = 0.0;
+        for (int di=0; di<HD; di++) { sa += P[gIdx*HD + di]; sb += P[n + gIdx*HD + di]; }
+        dA[gIdx] = sa;
+        dB[gIdx] = sb;
+    }
+}";
 }

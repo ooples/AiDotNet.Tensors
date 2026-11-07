@@ -88,16 +88,24 @@ public partial class CpuEngine
         if (typeof(T) == typeof(double))
         {
             GatedDeltaForwardDouble(
-                (double[])(object)qProj.GetDataArray()!, (double[])(object)kProj.GetDataArray()!,
-                (double[])(object)vProj.GetDataArray()!, (double[])(object)alpha.GetDataArray()!,
-                (double[])(object)beta.GetDataArray()!, (double[])(object)output.GetDataArray()!,
+                (double[])(object)qProj.GetDataArray(), (double[])(object)kProj.GetDataArray(),
+                (double[])(object)vProj.GetDataArray(), (double[])(object)alpha.GetDataArray(),
+                (double[])(object)beta.GetDataArray(), (double[])(object)output.GetDataArray(),
+                batch, seqLen, modelDim, numHeads, headDim);
+        }
+        else if (typeof(T) == typeof(float))
+        {
+            GatedDeltaForwardFloat(
+                (float[])(object)qProj.GetDataArray(), (float[])(object)kProj.GetDataArray(),
+                (float[])(object)vProj.GetDataArray(), (float[])(object)alpha.GetDataArray(),
+                (float[])(object)beta.GetDataArray(), (float[])(object)output.GetDataArray(),
                 batch, seqLen, modelDim, numHeads, headDim);
         }
         else
         {
             GatedDeltaForwardGeneric<T>(
-                qProj.GetDataArray()!, kProj.GetDataArray()!, vProj.GetDataArray()!,
-                alpha.GetDataArray()!, beta.GetDataArray()!, output.GetDataArray()!,
+                qProj.GetDataArray(), kProj.GetDataArray(), vProj.GetDataArray(),
+                alpha.GetDataArray(), beta.GetDataArray(), output.GetDataArray(),
                 batch, seqLen, modelDim, numHeads, headDim);
         }
 
@@ -291,6 +299,176 @@ public partial class CpuEngine
         });
     }
 
+    // ── Float fast path ──────────────────────────────────────────────────────────────────
+    [MethodImpl(Hot)]
+    private static void GatedDeltaForwardFloat(
+        float[] Q, float[] K, float[] V, float[] A, float[] B, float[] outp,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        int hh = headDim * headDim;
+        float kappa = (float)(1.0 / Math.Sqrt(headDim));
+        CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, [MethodImpl(Hot)] (bhStart, bhCount) =>
+        {
+            var S = new float[hh];
+            var kS = new float[headDim];
+            var sK = new float[headDim];
+            int bhEnd = bhStart + bhCount;
+            for (int bh = bhStart; bh < bhEnd; bh++)
+            {
+                int b = bh / numHeads;
+                int h = bh % numHeads;
+                Array.Clear(S, 0, hh);
+                int hOff = h * headDim;
+                for (int t = 0; t < seqLen; t++)
+                {
+                    int baseOff = (b * seqLen + t) * modelDim + hOff;
+                    int gIdx = (b * seqLen + t) * numHeads + h;
+                    float a = A[gIdx], bet = B[gIdx];
+                    for (int ki = 0; ki < headDim; ki++) kS[ki] = K[baseOff + ki] * kappa;
+
+                    for (int di = 0; di < headDim; di++)
+                    {
+                        int srow = di * headDim;
+                        float s = 0f;
+                        for (int ki = 0; ki < headDim; ki++) s += S[srow + ki] * kS[ki];
+                        sK[di] = s;
+                    }
+                    for (int di = 0; di < headDim; di++)
+                    {
+                        int srow = di * headDim;
+                        float delta = V[baseOff + di] - sK[di];
+                        float bd = bet * delta;
+                        for (int ki = 0; ki < headDim; ki++)
+                            S[srow + ki] = a * S[srow + ki] + bd * kS[ki];
+                    }
+                    for (int di = 0; di < headDim; di++)
+                    {
+                        int srow = di * headDim;
+                        float o = 0f;
+                        for (int ki = 0; ki < headDim; ki++) o += S[srow + ki] * Q[baseOff + ki];
+                        outp[baseOff + di] = o;
+                    }
+                }
+            }
+        });
+    }
+
+    [MethodImpl(Hot)]
+    private static void GatedDeltaBackwardFloat(
+        float[] dOut, float[] Q, float[] K, float[] V, float[] A, float[] B,
+        float[] dQ, float[] dK, float[] dV, float[] dA, float[] dB,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        int hh = headDim * headDim;
+        float kappa = (float)(1.0 / Math.Sqrt(headDim));
+        CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, [MethodImpl(Hot)] (bhStart, bhCount) =>
+        {
+            var Straj = new float[(seqLen + 1) * hh];
+            var S = new float[hh];
+            var dS = new float[hh];
+            var dSp = new float[hh];
+            var kS = new float[headDim];
+            var sK = new float[headDim];
+            var dKS = new float[headDim];
+            var dDelta = new float[headDim];
+            int bhEnd = bhStart + bhCount;
+            for (int bh = bhStart; bh < bhEnd; bh++)
+            {
+                int b = bh / numHeads;
+                int h = bh % numHeads;
+                int hOff = h * headDim;
+
+                Array.Clear(S, 0, hh);
+                for (int t = 0; t < seqLen; t++)
+                {
+                    Array.Copy(S, 0, Straj, t * hh, hh);
+                    int baseOff = (b * seqLen + t) * modelDim + hOff;
+                    int gIdx = (b * seqLen + t) * numHeads + h;
+                    float a = A[gIdx], bet = B[gIdx];
+                    for (int ki = 0; ki < headDim; ki++) kS[ki] = K[baseOff + ki] * kappa;
+                    for (int di = 0; di < headDim; di++)
+                    {
+                        int srow = di * headDim;
+                        float s = 0f;
+                        for (int ki = 0; ki < headDim; ki++) s += S[srow + ki] * kS[ki];
+                        float delta = V[baseOff + di] - s;
+                        float bd = bet * delta;
+                        for (int ki = 0; ki < headDim; ki++)
+                            S[srow + ki] = a * S[srow + ki] + bd * kS[ki];
+                    }
+                }
+
+                Array.Clear(dS, 0, hh);
+                for (int t = seqLen - 1; t >= 0; t--)
+                {
+                    int baseOff = (b * seqLen + t) * modelDim + hOff;
+                    int gIdx = (b * seqLen + t) * numHeads + h;
+                    float a = A[gIdx], bet = B[gIdx];
+                    var Sp = Straj; int spOff = t * hh;
+
+                    for (int ki = 0; ki < headDim; ki++) kS[ki] = K[baseOff + ki] * kappa;
+                    for (int di = 0; di < headDim; di++)
+                    {
+                        int srow = di * headDim;
+                        float s = 0f;
+                        for (int ki = 0; ki < headDim; ki++) s += Sp[spOff + srow + ki] * kS[ki];
+                        sK[di] = s;
+                    }
+
+                    for (int di = 0; di < headDim; di++)
+                    {
+                        int srow = di * headDim;
+                        float dOutVal = dOut[baseOff + di];
+                        float delta = V[baseOff + di] - sK[di];
+                        float bd = bet * delta;
+                        for (int ki = 0; ki < headDim; ki++)
+                        {
+                            float sT = a * Sp[spOff + srow + ki] + bd * kS[ki];
+                            dQ[baseOff + ki] += dOutVal * sT;
+                            dS[srow + ki] += dOutVal * Q[baseOff + ki];
+                        }
+                    }
+
+                    Array.Clear(dSp, 0, hh);
+                    Array.Clear(dKS, 0, headDim);
+                    Array.Clear(dDelta, 0, headDim);
+                    float dA_acc = 0f, dB_acc = 0f;
+                    for (int di = 0; di < headDim; di++)
+                    {
+                        int srow = di * headDim;
+                        float delta = V[baseOff + di] - sK[di];
+                        for (int ki = 0; ki < headDim; ki++)
+                        {
+                            float dSt = dS[srow + ki];
+                            dA_acc += dSt * Sp[spOff + srow + ki];
+                            dSp[srow + ki] += dSt * a;
+                            dB_acc += dSt * delta * kS[ki];
+                            dDelta[di] += dSt * bet * kS[ki];
+                            dKS[ki] += dSt * bet * delta;
+                        }
+                    }
+                    for (int di = 0; di < headDim; di++)
+                    {
+                        int srow = di * headDim;
+                        dV[baseOff + di] += dDelta[di];
+                        float dSk = -dDelta[di];
+                        for (int kj = 0; kj < headDim; kj++)
+                        {
+                            dSp[srow + kj] += dSk * kS[kj];
+                            dKS[kj] += dSk * Sp[spOff + srow + kj];
+                        }
+                    }
+                    for (int ki = 0; ki < headDim; ki++) dK[baseOff + ki] += dKS[ki] * kappa;
+
+                    dA[gIdx] += dA_acc;
+                    dB[gIdx] += dB_acc;
+
+                    Array.Copy(dSp, 0, dS, 0, hh);
+                }
+            }
+        });
+    }
+
     // ── Generic-T path ───────────────────────────────────────────────────────────────────
     private static void GatedDeltaForwardGeneric<T>(
         T[] Q, T[] K, T[] V, T[] A, T[] B, T[] outp,
@@ -459,11 +637,18 @@ public partial class CpuEngine
         });
     }
 
-    private static void GatedDeltaNetScanBackward<T>(
+    [MethodImpl(Hot)]
+    internal static void GatedDeltaNetScanBackward<T>(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output, object[] savedState,
         IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         int numHeads = (int)savedState[0];
+        if (engine is DirectGpuTensorEngine gpu && gpu.GatedDeltaNetScanBackwardGpu(gradOutput, inputs, numHeads) is { } gpuGrads)
+        {
+            for (int i = 0; i < 5; i++)
+                DifferentiableOps.AccumulateGrad(grads, inputs[i], gpuGrads[i], engine);
+            return;
+        }
         var qProj = inputs[0];
         var kProj = inputs[1];
         var vProj = inputs[2];
@@ -484,23 +669,35 @@ public partial class CpuEngine
         if (typeof(T) == typeof(double))
         {
             GatedDeltaBackwardDouble(
-                (double[])(object)gradOutput.GetDataArray()!,
-                (double[])(object)qProj.GetDataArray()!, (double[])(object)kProj.GetDataArray()!,
-                (double[])(object)vProj.GetDataArray()!, (double[])(object)alpha.GetDataArray()!,
-                (double[])(object)beta.GetDataArray()!,
-                (double[])(object)dQ.GetDataArray()!, (double[])(object)dK.GetDataArray()!,
-                (double[])(object)dV.GetDataArray()!, (double[])(object)dA.GetDataArray()!,
-                (double[])(object)dB.GetDataArray()!,
+                (double[])(object)gradOutput.GetDataArray(),
+                (double[])(object)qProj.GetDataArray(), (double[])(object)kProj.GetDataArray(),
+                (double[])(object)vProj.GetDataArray(), (double[])(object)alpha.GetDataArray(),
+                (double[])(object)beta.GetDataArray(),
+                (double[])(object)dQ.GetDataArray(), (double[])(object)dK.GetDataArray(),
+                (double[])(object)dV.GetDataArray(), (double[])(object)dA.GetDataArray(),
+                (double[])(object)dB.GetDataArray(),
+                batch, seqLen, modelDim, numHeads, headDim);
+        }
+        else if (typeof(T) == typeof(float))
+        {
+            GatedDeltaBackwardFloat(
+                (float[])(object)gradOutput.GetDataArray(),
+                (float[])(object)qProj.GetDataArray(), (float[])(object)kProj.GetDataArray(),
+                (float[])(object)vProj.GetDataArray(), (float[])(object)alpha.GetDataArray(),
+                (float[])(object)beta.GetDataArray(),
+                (float[])(object)dQ.GetDataArray(), (float[])(object)dK.GetDataArray(),
+                (float[])(object)dV.GetDataArray(), (float[])(object)dA.GetDataArray(),
+                (float[])(object)dB.GetDataArray(),
                 batch, seqLen, modelDim, numHeads, headDim);
         }
         else
         {
             GatedDeltaBackwardGeneric<T>(
-                gradOutput.GetDataArray()!,
-                qProj.GetDataArray()!, kProj.GetDataArray()!, vProj.GetDataArray()!,
-                alpha.GetDataArray()!, beta.GetDataArray()!,
-                dQ.GetDataArray()!, dK.GetDataArray()!, dV.GetDataArray()!,
-                dA.GetDataArray()!, dB.GetDataArray()!,
+                gradOutput.GetDataArray(),
+                qProj.GetDataArray(), kProj.GetDataArray(), vProj.GetDataArray(),
+                alpha.GetDataArray(), beta.GetDataArray(),
+                dQ.GetDataArray(), dK.GetDataArray(), dV.GetDataArray(),
+                dA.GetDataArray(), dB.GetDataArray(),
                 batch, seqLen, modelDim, numHeads, headDim);
         }
 
