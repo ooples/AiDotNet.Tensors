@@ -3225,8 +3225,9 @@ public sealed class GradientTape<T> : IDisposable
         }
         // Run the step-boundary device collection AFTER _entries.Reset(), saved-state unpinning, and arena disposal
         // have dropped every reference to this step's dead intermediates (running earlier promoted live _entries
-        // tensors out of gen-0 instead of reclaiming them).
-        if (_parent is null)
+        // tensors out of gen-0 instead of reclaiming them). Not for a SuppressArenaScope tape (the GradientCheckpointing
+        // recompute tape): it is disposed mid-backward of the outer step, where a blocking collection would stall it.
+        if (_parent is null && !_options.SuppressArenaScope)
         {
             Engines.DirectGpu.DeviceMemoryReclaim.CollectIfDueAtStepBoundary();
         }

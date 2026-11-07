@@ -176,6 +176,8 @@ public sealed class DeviceMemoryReclaimTests
         {
             long epoch = DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectAfterDeviceBytes);
             Assert.True(DeviceMemoryReclaim.CollectIfDueAtStepBoundary());
+            // The young collection leaves the Gen-2 count alone, so this step's allocation is still charged there.
+            Assert.Equal(DeviceMemoryReclaim.CollectAfterDeviceBytes, DeviceMemoryReclaim.BytesSinceGen2CollectionForTests);
             DeviceMemoryReclaim.OnDeviceFinalized(DeviceMemoryReclaim.CollectAfterDeviceBytes, epoch);
         }
         Assert.Equal(0, DeviceMemoryReclaim.BytesSinceGen2CollectionForTests);

@@ -378,19 +378,27 @@ public sealed class PermutedViewResidencyTests : IClassFixture<DirectGpuTensorEn
             for (int i = 0; i < cpuGx.Length; i++) expectedNormSq += (double)cpuGx[i] * cpuGx[i];
             for (int i = 0; i < cpuGk.Length; i++) expectedNormSq += (double)cpuGk[i] * cpuGk[i];
 
-            using var devNorm = AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TryClipGradNorm(new[] { gpuGx, gpuGk }, maxNorm: 1000.0);
+            // A threshold of half the norm, so the clip actually scales the gradients in place.
+            double expectedNorm = Math.Sqrt(expectedNormSq);
+            double maxNorm = expectedNorm / 2;
+            using var devNorm = AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TryClipGradNorm(new[] { gpuGx, gpuGk }, maxNorm);
             Assert.NotNull(devNorm);
             if (devNorm is null) return;
             Assert.True(devNorm.IsFinite);
-            Assert.True(Math.Abs(Math.Sqrt(expectedNormSq) - devNorm.TotalNorm) < 1e-2,
-                $"Expected norm {Math.Sqrt(expectedNormSq)} vs GPU norm {devNorm.TotalNorm}");
+            Assert.True(Math.Abs(expectedNorm - devNorm.TotalNorm) < 1e-2,
+                $"Expected pre-clip norm {expectedNorm} vs GPU norm {devNorm.TotalNorm}");
+            float coefficient = (float)(maxNorm / (expectedNorm + 1e-6));
+            Assert.True(Math.Abs(coefficient - devNorm.ClipCoefficient) < 1e-4f,
+                $"Expected clip coefficient {coefficient} vs GPU {devNorm.ClipCoefficient}");
 
             var gpuGxArr = gpuGx.ToArray();
             var gpuGkArr = gpuGk.ToArray();
             for (int i = 0; i < cpuGx.Length; i++)
-                Assert.True(Math.Abs(cpuGx[i] - gpuGxArr[i]) < 1e-4f, $"d/dx[{i}] cpu {cpuGx[i]} gpu {gpuGxArr[i]}");
+                Assert.True(Math.Abs(cpuGx[i] * coefficient - gpuGxArr[i]) < 1e-4f, $"d/dx[{i}] cpu {cpuGx[i] * coefficient} gpu {gpuGxArr[i]}");
             for (int i = 0; i < cpuGk.Length; i++)
-                Assert.True(Math.Abs(cpuGk[i] - gpuGkArr[i]) < 1e-4f, $"d/dk[{i}] cpu {cpuGk[i]} gpu {gpuGkArr[i]}");
+                Assert.True(Math.Abs(cpuGk[i] * coefficient - gpuGkArr[i]) < 1e-4f, $"d/dk[{i}] cpu {cpuGk[i] * coefficient} gpu {gpuGkArr[i]}");
+            double clippedNorm = Math.Sqrt(gpuGxArr.Concat(gpuGkArr).Sum(g => (double)g * g));
+            Assert.True(Math.Abs(clippedNorm - maxNorm) < 1e-3 * maxNorm, $"clipped norm {clippedNorm}, max norm {maxNorm}");
         }
         finally
         {
@@ -457,16 +465,23 @@ public sealed class PermutedViewResidencyTests : IClassFixture<DirectGpuTensorEn
             Assert.True(gConvW.IsGpuResident, "TensorFlip kernel gradient should stay GPU-resident.");
             Assert.True(gExpertW.IsGpuResident, "TensorBatchMatMul 3D persistent weight gradient should stay GPU-resident.");
 
-            using var devNorm = AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TryClipGradNorm(new[] { gx, gConvW, gExpertW }, maxNorm: 1000.0);
+            // A threshold of half the CPU reference norm, so the clip actually scales every gradient in place.
+            double expectedNorm = Math.Sqrt(cpuGrads.Sum(g => (double)g * g));
+            double maxNorm = expectedNorm / 2;
+            using var devNorm = AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TryClipGradNorm(new[] { gx, gConvW, gExpertW }, maxNorm);
             Assert.True(devNorm is { IsFinite: true }, "the device gradient-norm clip declined or saw a non-finite norm");
-            // The clip scaled every gradient in place by its coefficient; scale the CPU reference the same way.
-            float coefficient = devNorm is null ? 1f : devNorm.ClipCoefficient;
+            double deviceNorm = devNorm is null ? double.NaN : devNorm.TotalNorm;
+            Assert.True(Math.Abs(expectedNorm - deviceNorm) < 1e-3 * expectedNorm,
+                $"Expected pre-clip norm {expectedNorm} vs GPU norm {deviceNorm}");
+            float coefficient = (float)(maxNorm / (expectedNorm + 1e-6));
 
             var gpuGrads = gx.ToArray().Concat(gConvW.ToArray()).Concat(gExpertW.ToArray()).ToArray();
             Assert.Equal(cpuGrads.Length, gpuGrads.Length);
             for (int i = 0; i < cpuGrads.Length; i++)
                 Assert.True(Math.Abs(cpuGrads[i] * coefficient - gpuGrads[i]) < 1e-3f,
                     $"grad[{i}] cpu {cpuGrads[i] * coefficient} gpu {gpuGrads[i]} (clip coefficient {coefficient})");
+            double clippedNorm = Math.Sqrt(gpuGrads.Sum(g => (double)g * g));
+            Assert.True(Math.Abs(clippedNorm - maxNorm) < 1e-3 * maxNorm, $"clipped norm {clippedNorm}, max norm {maxNorm}");
         }
         finally
         {

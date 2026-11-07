@@ -14,12 +14,14 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// </summary>
 public class PersistentTapeDisposeReleaseTests
 {
-    [Fact]
-    public void DisposedPersistentTape_StillReferenced_DoesNotPinItsOutputs()
+    [Theory]
+    [InlineData(0)]     // small tape: only the leaf-source cache is built
+    [InlineData(120)]   // 100+ entries: the gradient relevance set is cached as well
+    public void DisposedPersistentTape_StillReferenced_DoesNotPinItsOutputs(int extraOps)
     {
         var engine = new CpuEngine();
         var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = true });
-        var hidden = RecordAndDifferentiate(engine, tape);
+        var hidden = RecordAndDifferentiate(engine, tape, extraOps);
         tape.Dispose();
 
         GC.Collect();
@@ -31,12 +33,14 @@ public class PersistentTapeDisposeReleaseTests
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
-    private static WeakReference RecordAndDifferentiate(CpuEngine engine, GradientTape<float> tape)
+    private static WeakReference RecordAndDifferentiate(CpuEngine engine, GradientTape<float> tape, int extraOps)
     {
         var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, new[] { 2, 2 });
         var w = new Tensor<float>(new float[] { 0.5f, -1f, 2f, 0.25f }, new[] { 2, 2 });
         var hidden = engine.TensorMatMul(x, w);
-        var loss = engine.ReduceSum(engine.TensorMultiply(hidden, hidden), null);
+        var y = engine.TensorMultiply(hidden, hidden);
+        for (int i = 0; i < extraOps; i++) y = engine.TensorAdd(y, hidden);
+        var loss = engine.ReduceSum(y, null);
         var grads = tape.ComputeGradients(loss, new[] { w });
         Assert.True(grads.ContainsKey(w));
         return new WeakReference(hidden);
