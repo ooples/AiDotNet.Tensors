@@ -28623,10 +28623,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private Tensor<T>? TryRepeatAxisOnDevice<T>(Tensor<T> tensor, int repeats, int axis)
     {
         using var __gpuOp = EnterGpuOp();
-        if (typeof(T) != typeof(float) || !tensor.IsContiguous || repeats < 1
+        if (typeof(T) != typeof(float) || repeats < 1
             || axis < 0 || axis >= tensor.Rank || !TryGetBackend(out var backend))
             return null;
         if (repeats == 1) return tensor;
+        // A permuted view (GQA's [B, Hkv, S, D] K/V after the head permute) is copied contiguous on the device by
+        // Tensor.Contiguous; rejecting it sent every GQA layer's K and V repeat to the host.
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         int outer = 1;
         for (int d = 0; d < axis; d++) outer = checked(outer * tensor.Shape._dims[d]);

@@ -10967,16 +10967,21 @@ public partial class DirectGpuTensorEngine
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorSinh", capabilityGap); return base.TensorSinh(tensor); }
     }
 
-    // #775: TensorReciprocal on the existing backend.Reciprocal (reciprocal_vector = 1/x) unary kernel.
+    // #775: TensorReciprocal on the existing backend.Reciprocal (reciprocal_vector = 1/x) unary kernel. The result stays
+    // on the device and the tape records the same node CpuEngine does: this used to return to the host whenever a tape
+    // was active, so every training step's RMSNorm 1/rms ran on the CPU (with a download of rms per layer).
     Tensor<T> IEngine.TensorReciprocal<T>(Tensor<T> tensor)
     {
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || !tensor.IsContiguous)
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float))
             return base.TensorReciprocal(tensor);
         try
         {
-            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Reciprocal(input, output, size));
-            if (result != null)
-                return new Tensor<T>(result, tensor.Shape._dims);
+            var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) => backend.Reciprocal(input, output, size));
+            if (output != null)
+            {
+                DifferentiableOps.RecordUnary("Reciprocal", output, tensor, BackwardFunctions<T>.ReciprocalBackward);
+                return output;
+            }
             return base.TensorReciprocal(tensor);
         }
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorReciprocal", capabilityGap); return base.TensorReciprocal(tensor); }

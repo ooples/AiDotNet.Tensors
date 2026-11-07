@@ -231,6 +231,35 @@ public class GpuTapeGradientParityTests : IDisposable
         }
     }
 
+    // RMSNorm's 1/rms: the device reciprocal used to return to the host whenever a tape was recording.
+    [SkippableFact]
+    public void Reciprocal_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorReciprocal", static (e, t) => e.TensorReciprocal(t),
+            static (x, y) =>
+            {
+                for (int i = 0; i < x.Length; i++) Assert.Equal(1f / x[i], y[i], 6);
+            });
+
+    [SkippableFact]
+    public void Reciprocal_gradients_match_cpu() =>
+        AssertGradientParity("TensorReciprocal", Rand([4, 16], seed: 509, lo: 0.5, hi: 2.0),
+            static (e, t) => e.TensorReciprocal(t), probe: Engagement.UseResidencyCounter);
+
+    // GQA's K/V: [B, Hkv, S, D] is a permuted view when it reaches the repeat. A non-contiguous input used to send
+    // the repeat (and its backward) to the host.
+    private static Tensor<float> RepeatPermutedKv(IEngine e, Tensor<float> t) =>
+        e.TensorRepeatInterleave(e.TensorPermute(e.Reshape(t, new[] { 1, 2, 3, 10 }), new[] { 0, 2, 1, 3 }), 2, 1);
+
+    [SkippableFact]
+    public void RepeatInterleave_of_a_permuted_view_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorRepeatInterleave(permuted)", static (e, t) => RepeatPermutedKv(e, t),
+            static (x, y) => Assert.Equal(new[] { 1, 6, 2, 10 }, y.Shape.ToArray()));
+
+    [SkippableFact]
+    public void RepeatInterleave_of_a_permuted_view_gradients_match_cpu() =>
+        AssertGradientParity("TensorRepeatInterleave(permuted)", Rand([6, 10], seed: 521),
+            static (e, t) => RepeatPermutedKv(e, t), probe: Engagement.UseResidencyCounter);
+
     [SkippableFact]
     public void PixelShuffle_gradients_match_cpu() =>
         // A pure permutation is exact on both engines, so engagement is shown by device residency, not divergence.
