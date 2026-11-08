@@ -1023,6 +1023,23 @@ public class GpuTapeGradientParityTests : IDisposable
         AssertChunkedParity("FusedLinearCE(ids, bias, 3 chunks)", ChunkBias,
             static (e, t) => e.FusedLinearCrossEntropyWithLogits(ChunkHidden, ChunkWeight, t, ChunkTargetIds));
 
+    // The forward runs in the same row chunks: a GEMM per chunk, row log-softmax, a gather of the target log-probability
+    // and a ones-vector GEMM summing them. It replaced a one-thread-per-row kernel that took 3.68 s at N=4096, V=49152.
+    [SkippableFact]
+    public void FusedLinearCrossEntropy_index_chunked_forward_loss_matches_cpu()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu!)
+        {
+            float cpu = new CpuEngine().FusedLinearCrossEntropyWithLogits(ChunkHidden, ChunkWeight, ChunkBias, ChunkTargetIds).ToArray()[0];
+            DirectGpuTensorEngine.LastFusedCeForwardChunks = 0;
+            float device = gpu.FusedLinearCrossEntropyWithLogits(ChunkHidden, ChunkWeight, ChunkBias, ChunkTargetIds).ToArray()[0];
+            Assert.Equal(3, DirectGpuTensorEngine.LastFusedCeForwardChunks);
+            Assert.True(float.IsFinite(cpu) && cpu > 1f, $"CPU loss {cpu} is not a usable reference.");
+            Assert.True(Math.Abs(device - cpu) <= 1e-5 * Math.Abs(cpu), $"GPU loss {device} vs CPU {cpu}.");
+        }
+    }
+
     [SkippableFact]
     public void FusedLinearCrossEntropy_stays_on_the_device_while_a_tape_records() =>
         AssertStaysOnDeviceUnderTape("FusedLinearCrossEntropy",

@@ -13622,10 +13622,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var hB = GetOrAllocateBuffer(backend, hidden);
             using var wB = GetOrAllocateBuffer(backend, weight);
             using var bB = GetOrAllocateBuffer(backend, bias);
-            using var tB = GetOrAllocateBuffer(backend, targetIds);
             using var loss = AllocateOutputBuffer(backend, 1);
-            backend.FusedLinearCrossEntropyIndex(
-                hB.Buffer, wB.Buffer, bB.Buffer, tB.Buffer, loss.Buffer, n, d, vocab);
+            if (!TryFusedLinearCrossEntropyIndexForwardChunked(backend, hB.Buffer, wB.Buffer, bB.Buffer,
+                    targetIds.GetDataArray(), loss.Buffer, n, d, vocab))
+            {
+                using var tB = GetOrAllocateBuffer(backend, targetIds);
+                backend.FusedLinearCrossEntropyIndex(
+                    hB.Buffer, wB.Buffer, bB.Buffer, tB.Buffer, loss.Buffer, n, d, vocab);
+            }
             var result = DeferTensorResult<T>(backend, loss.Buffer, 1, new[] { 1 });
             loss.RelinquishOwnership();
             // Same node CpuEngine records, labels saved as a host COPY (supervision, not a tape input). Reading
