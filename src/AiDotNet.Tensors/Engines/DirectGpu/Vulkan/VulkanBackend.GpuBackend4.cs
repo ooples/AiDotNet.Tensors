@@ -819,26 +819,38 @@ public sealed unsafe partial class VulkanBackend : IGatedDeltaNetBackwardBackend
             throw new ArgumentOutOfRangeException(nameof(batch), "GatedDeltaNet dimensions exceed Vulkan launch/buffer limits.");
         int total = (int)totalLong;
         int n = batch * seqLen * modelDim;
-        using var traj = AllocateBuffer((int)trajLenLong);
-        var pc = new[] { (uint)batch, (uint)seqLen, (uint)modelDim, (uint)numHeads, (uint)headDim };
-        GlslNaryOp(VulkanRecurrenceKernels.GatedDeltaRecompute, new[] { k, v, alpha, beta, traj }, total, pc);
-        if (GpuDeterminism.IsActive)
+        // Inside a batch the dispatches below are only recorded; disposing the scratch here would return it to the pool
+        // for another allocation to take before they run. The queued release holds it until the batch has completed.
+        var release = (IQueuedBufferRelease)this;
+        var traj = AllocateBuffer((int)trajLenLong);
+        IGpuBuffer? partials = null;
+        try
         {
-            // Fixed-order reduction instead of CAS accumulation (see GatedDeltaBackwardDeterministic); every gradient
-            // element is written, so nothing needs clearing first.
-            using var partials = AllocateBuffer(checked(2 * n));
-            GlslNaryOp(VulkanRecurrenceKernels.GatedDeltaDq, new[] { dOut, traj, dQ }, n, pc);
-            GlslNaryOp(VulkanRecurrenceKernels.GatedDeltaBackwardDeterministic,
-                new[] { dOut, q, k, v, alpha, beta, traj, partials, dV }, total, pc);
-            GlslNaryOp(VulkanRecurrenceKernels.GatedDeltaReduce, new[] { traj, partials, dK, dAlpha, dBeta }, n, pc);
-            return;
+            var pc = new[] { (uint)batch, (uint)seqLen, (uint)modelDim, (uint)numHeads, (uint)headDim };
+            GlslNaryOp(VulkanRecurrenceKernels.GatedDeltaRecompute, new[] { k, v, alpha, beta, traj }, total, pc);
+            if (GpuDeterminism.IsActive)
+            {
+                // Fixed-order reduction instead of CAS accumulation (see GatedDeltaBackwardDeterministic); every
+                // gradient element is written, so nothing needs clearing first.
+                partials = AllocateBuffer(checked(2 * n));
+                GlslNaryOp(VulkanRecurrenceKernels.GatedDeltaDq, new[] { dOut, traj, dQ }, n, pc);
+                GlslNaryOp(VulkanRecurrenceKernels.GatedDeltaBackwardDeterministic,
+                    new[] { dOut, q, k, v, alpha, beta, traj, partials, dV }, total, pc);
+                GlslNaryOp(VulkanRecurrenceKernels.GatedDeltaReduce, new[] { traj, partials, dK, dAlpha, dBeta }, n, pc);
+                return;
+            }
+            Fill(dQ, 0f, n);
+            Fill(dK, 0f, n);
+            Fill(dAlpha, 0f, batch * seqLen * numHeads);
+            Fill(dBeta, 0f, batch * seqLen * numHeads);
+            GlslNaryOp(VulkanRecurrenceKernels.GatedDeltaBackward,
+                new[] { dOut, q, k, v, alpha, beta, traj, dQ, dK, dV, dAlpha, dBeta }, total, pc);
         }
-        Fill(dQ, 0f, n);
-        Fill(dK, 0f, n);
-        Fill(dAlpha, 0f, batch * seqLen * numHeads);
-        Fill(dBeta, 0f, batch * seqLen * numHeads);
-        GlslNaryOp(VulkanRecurrenceKernels.GatedDeltaBackward,
-            new[] { dOut, q, k, v, alpha, beta, traj, dQ, dK, dV, dAlpha, dBeta }, total, pc);
+        finally
+        {
+            release.ReleaseAfterQueuedWork(traj);
+            if (partials is not null) release.ReleaseAfterQueuedWork(partials);
+        }
     }
 
     public void RgLruScanForward(

@@ -638,11 +638,113 @@ public partial class CpuEngine
     }
 
     [MethodImpl(Hot)]
+    /// <summary>
+    /// The scan's BPTT gradients as recorded engine ops, batched over (batch, head): the forward recomputes each state
+    /// <c>S_t = a_t S_{t-1} + b_t (v_t - S_{t-1} k_t) k_tᵀ</c> (keys scaled by κ), then the reverse sweep carries
+    /// <c>dS</c> back through <c>o_t = S_t q_t</c>. Every op records on the tape the create-graph backward writes to,
+    /// so the returned gradients differentiate again. One small op chain per time step: for create-graph only.
+    /// </summary>
+    /// <returns>dQ, dK, dV [batch, seqLen, modelDim] and dAlpha, dBeta [batch, seqLen, numHeads].</returns>
+    private static Tensor<T>[] GatedDeltaNetScanGradRecorded<T>(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, int numHeads, IEngine engine)
+    {
+        int batch = inputs[0].Shape[0], seqLen = inputs[0].Shape[1], modelDim = inputs[0].Shape[2];
+        int headDim = modelDim / numHeads, bh = batch * numHeads;
+        var kappa = MathHelper.GetNumericOperations<T>().FromDouble(1.0 / Math.Sqrt(headDim));
+
+        // [batch, seqLen, modelDim] -> [batch*heads, seqLen, headDim]; [batch, seqLen, heads] -> [batch*heads, seqLen].
+        Tensor<T> Heads(Tensor<T> x) => engine.Reshape(
+            engine.TensorPermute(engine.Reshape(x, new[] { batch, seqLen, numHeads, headDim }), new[] { 0, 2, 1, 3 }),
+            new[] { bh, seqLen, headDim });
+        Tensor<T> Gates(Tensor<T> x) => engine.Reshape(engine.TensorPermute(x, new[] { 0, 2, 1 }), new[] { bh, seqLen });
+        // Step t as a column [bh, headDim, 1], or a gate as [bh, 1, 1].
+        Tensor<T> Column(Tensor<T> x, int t) => engine.Reshape(engine.TensorNarrow(x, 1, t, 1), new[] { bh, headDim, 1 });
+        Tensor<T> Gate(Tensor<T> x, int t) => engine.Reshape(engine.TensorNarrow(x, 1, t, 1), new[] { bh, 1, 1 });
+        Tensor<T> Transposed(Tensor<T> x) => engine.TensorPermute(x, new[] { 0, 2, 1 });
+
+        var q = Heads(inputs[0]);
+        var k = Heads(inputs[1]);
+        var v = Heads(inputs[2]);
+        var a = Gates(inputs[3]);
+        var b = Gates(inputs[4]);
+        var g = Heads(gradOutput);
+
+        // states[t] is S_t; states[0] is the zero initial state, so S_{t-1} is states[t] and S_t is states[t + 1].
+        var states = new Tensor<T>[seqLen + 1];
+        var keys = new Tensor<T>[seqLen];
+        var deltas = new Tensor<T>[seqLen];
+        states[0] = new Tensor<T>(new[] { bh, headDim, headDim });
+        for (int t = 0; t < seqLen; t++)
+        {
+            keys[t] = engine.TensorMultiplyScalar(Column(k, t), kappa);
+            deltas[t] = engine.TensorSubtract(Column(v, t), engine.BatchMatMul(states[t], keys[t]));
+            states[t + 1] = engine.TensorAdd(
+                engine.TensorMultiply(Gate(a, t), states[t]),
+                engine.TensorMultiply(Gate(b, t), engine.BatchMatMul(deltas[t], Transposed(keys[t]))));
+        }
+
+        var dQ = new Tensor<T>[seqLen];
+        var dK = new Tensor<T>[seqLen];
+        var dV = new Tensor<T>[seqLen];
+        var dA = new Tensor<T>[seqLen];
+        var dB = new Tensor<T>[seqLen];
+        var dS = new Tensor<T>(new[] { bh, headDim, headDim });
+        var sumAxes = new[] { 1, 2 };
+        for (int t = seqLen - 1; t >= 0; t--)
+        {
+            var gt = Column(g, t);
+            var qt = Column(q, t);
+            var previous = states[t];
+            var betaT = Gate(b, t);
+            // o_t = S_t q_t
+            dS = engine.TensorAdd(dS, engine.BatchMatMul(gt, Transposed(qt)));
+            dQ[t] = engine.BatchMatMul(Transposed(states[t + 1]), gt);
+            // S_t = a S_{t-1} + b delta kᵀ with delta = v - S_{t-1} k
+            var dSk = engine.BatchMatMul(dS, keys[t]);
+            var dDelta = engine.TensorMultiply(betaT, dSk);
+            dV[t] = dDelta;
+            dB[t] = engine.ReduceSum(engine.TensorMultiply(deltas[t], dSk), sumAxes, keepDims: false);
+            dA[t] = engine.ReduceSum(engine.TensorMultiply(dS, previous), sumAxes, keepDims: false);
+            var dKey = engine.TensorSubtract(
+                engine.TensorMultiply(betaT, engine.BatchMatMul(Transposed(dS), deltas[t])),
+                engine.BatchMatMul(Transposed(previous), dDelta));
+            dK[t] = engine.TensorMultiplyScalar(dKey, kappa);
+            dS = engine.TensorSubtract(
+                engine.TensorMultiply(Gate(a, t), dS),
+                engine.BatchMatMul(dDelta, Transposed(keys[t])));
+        }
+
+        // [batch*heads, seqLen, headDim] back to [batch, seqLen, modelDim]; [batch*heads, seqLen] to [batch, seqLen, heads].
+        Tensor<T> FromHeads(Tensor<T>[] steps)
+        {
+            var columns = new Tensor<T>[seqLen];
+            for (int t = 0; t < seqLen; t++) columns[t] = engine.Reshape(steps[t], new[] { bh, headDim });
+            var stacked = engine.Reshape(engine.TensorStack(columns, 1), new[] { batch, numHeads, seqLen, headDim });
+            return engine.Reshape(engine.TensorPermute(stacked, new[] { 0, 2, 1, 3 }), new[] { batch, seqLen, modelDim });
+        }
+        Tensor<T> FromGates(Tensor<T>[] steps)
+        {
+            var stacked = engine.Reshape(engine.TensorStack(steps, 1), new[] { batch, numHeads, seqLen });
+            return engine.Reshape(engine.TensorPermute(stacked, new[] { 0, 2, 1 }), new[] { batch, seqLen, numHeads });
+        }
+
+        return new[] { FromHeads(dQ), FromHeads(dK), FromHeads(dV), FromGates(dA), FromGates(dB) };
+    }
+
     internal static void GatedDeltaNetScanBackward<T>(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output, object[] savedState,
         IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         int numHeads = (int)savedState[0];
+        // Under create-graph the gradients are themselves differentiated (a second-order meta-learner, a gradient
+        // penalty), so they have to come from recorded ops: the fused kernels below record nothing.
+        if (DifferentiableOps._isBackwardCreateGraph)
+        {
+            var recorded = GatedDeltaNetScanGradRecorded(gradOutput, inputs, numHeads, engine);
+            for (int i = 0; i < 5; i++)
+                DifferentiableOps.AccumulateGrad(grads, inputs[i], recorded[i], engine);
+            return;
+        }
         if (engine is DirectGpuTensorEngine gpu && gpu.GatedDeltaNetScanBackwardGpu(gradOutput, inputs, numHeads) is { } gpuGrads)
         {
             for (int i = 0; i < 5; i++)
