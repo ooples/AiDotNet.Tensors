@@ -718,6 +718,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 if (CuBlasNative.cuDeviceGetDefaultMemPool(out var memPool, device) == CudaResult.Success)
                 {
                     _asyncMemPool = memPool;
+                    _poolSoftBudget = ComputePoolSoftBudget(_cuDevice);
                     // Stream-ordered buffers are not counted as reserved one by one: freed ones stay in this pool, so
                     // the pool's own counter is the device memory they hold. It captures the handle, not the backend.
                     _memoryAccount.SetDriverReserved(
@@ -2190,8 +2191,59 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     // Stream-ordered device allocation (#558 layer 6). On OOM, sync the context (lets pending
     // cuMemFreeAsync reclamations complete) and retry once before surfacing the error.
+    // Windows display-driver (WDDM) devices let an allocation succeed past physical memory: by default the driver
+    // backs the excess with system memory ("sysmem fallback"), so cuMemAllocAsync never reports out-of-memory and the
+    // reclamation below (free unreachable buffers, sync, trim the pool) never runs. The stream-ordered pool keeps every
+    // freed block (release threshold maxed), so its reservation then grows past the device and kernels touching the
+    // paged-out part stall: a 24M-parameter GatedDeltaNet/MoE LM on a 12 GB RTX 3080 reserved 12.7 GB, about 1 in 1000
+    // GEMM launches took 52 ms instead of 37 us, and training steps went from 0.4 s to 2 s. This budget is the
+    // device's free memory when the pool was set up, less headroom; before the pool grows past it, the allocation
+    // runs the same reclamation an out-of-memory failure would. 0 = off (Linux, or a TCC device, fails instead).
+    private long _poolSoftBudget;
+    // After a reclamation that could not get the pool back under the budget (the live set itself exceeds it), the
+    // pool may grow this far before the next attempt, so a working set larger than the budget is not reclaimed on
+    // every allocation.
+    private long _poolReclaimCeiling;
+
+    private static long ComputePoolSoftBudget(int device)
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return 0;
+        const int CU_DEVICE_ATTRIBUTE_TCC_DRIVER = 35;
+        if (CuBlasNative.cuDeviceGetAttribute(out int tcc, CU_DEVICE_ATTRIBUTE_TCC_DRIVER, device) == CudaResult.Success && tcc != 0)
+            return 0;
+        if (CudaNativeBindings.cuMemGetInfo(out ulong free, out ulong total) != CudaResult.Success || total == 0) return 0;
+        long headroom = Math.Max(256L << 20, (long)(total / 32));
+        long budget = (long)free - headroom;
+        return budget > (512L << 20) ? budget : 0;
+    }
+
+    // CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT = 5, CU_MEMPOOL_ATTR_USED_MEM_CURRENT = 7.
+    private void KeepPoolWithinBudget(long bytes)
+    {
+        long reserved = ReadMemPoolBytes(_asyncMemPool, 5);
+        if (reserved + bytes <= Math.Max(_poolSoftBudget, _poolReclaimCeiling)) return;
+        // Blocks the pool already holds but nothing uses may serve this request without growing it.
+        if (reserved - ReadMemPoolBytes(_asyncMemPool, 7) >= bytes) return;
+        if (IsStreamCapturing()) return; // sync and trim are illegal mid-capture; capture pre-grew the pool
+        _bufferPool.DrainAll();
+        ReclaimUnreachableForRetry();
+        // This backend's frees are ordered on its own streams; a context-wide sync is unsafe on the shared context.
+        SynchronizeOwnStreams("cuStreamSynchronize (pool budget)");
+        var trimStatus = CuBlasNative.cuMemPoolTrimTo(_asyncMemPool, 0);
+        if (trimStatus != CudaResult.Success)
+            System.Diagnostics.Trace.TraceWarning($"[CudaBackend] cuMemPoolTrimTo failed under the pool budget: {trimStatus}.");
+        long after = ReadMemPoolBytes(_asyncMemPool, 5);
+        _poolReclaimCeiling = after + bytes > _poolSoftBudget ? after + bytes + _poolSoftBudget / 16 : 0;
+        Interlocked.Increment(ref _poolBudgetReclaims);
+    }
+
+    private long _poolBudgetReclaims;
+    /// <summary>How many allocations ran the out-of-memory reclamation early to keep the pool within the device.</summary>
+    internal long PoolBudgetReclaims => Interlocked.Read(ref _poolBudgetReclaims);
+
     private IntPtr AllocDeviceMemoryAsync(ulong byteSize)
     {
+        if (_poolSoftBudget > 0) KeepPoolWithinBudget((long)byteSize);
         var r = CuBlasNative.cuMemAllocAsync(out IntPtr p, byteSize, _mainStream);
         if (r != CudaResult.Success && IsStreamCapturing())
         {
