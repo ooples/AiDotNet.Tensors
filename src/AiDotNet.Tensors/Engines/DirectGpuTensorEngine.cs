@@ -13623,8 +13623,26 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var wB = GetOrAllocateBuffer(backend, weight);
             using var bB = GetOrAllocateBuffer(backend, bias);
             using var loss = AllocateOutputBuffer(backend, 1);
-            if (!TryFusedLinearCrossEntropyIndexForwardChunked(backend, hB.Buffer, wB.Buffer, bB.Buffer,
-                    targetIds.GetDataArray(), loss.Buffer, n, d, vocab))
+            // The chunked forward builds its gather positions on the host. Resident ids are read only when the tape
+            // downloads them below anyway; otherwise (a captured step) they stay on the device for the fused kernel.
+            bool chunked = false;
+            if (!HasResidentIndexStorage(targetIds) || IsTapeActive<T>())
+            {
+                try
+                {
+                    chunked = TryFusedLinearCrossEntropyIndexForwardChunked(backend, hB.Buffer, wB.Buffer, bB.Buffer,
+                        targetIds.GetDataArray(), loss.Buffer, n, d, vocab);
+                }
+                catch (Exception ex) when (ex is GpuOutOfMemoryException or OutOfMemoryException)
+                {
+                    // Its scratch did not fit; the buffers it did get were disposed as it threw. The fused kernel
+                    // needs none of them.
+                    System.Diagnostics.Trace.TraceWarning(
+                        $"[DirectGpuTensorEngine] Chunked fused-CE forward scratch did not fit ({ex.GetType().Name}: " +
+                        $"{ex.Message}); using the fused kernel.");
+                }
+            }
+            if (!chunked)
             {
                 using var tB = GetOrAllocateBuffer(backend, targetIds);
                 backend.FusedLinearCrossEntropyIndex(

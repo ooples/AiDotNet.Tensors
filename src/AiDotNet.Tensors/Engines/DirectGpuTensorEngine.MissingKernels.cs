@@ -6202,7 +6202,7 @@ public partial class DirectGpuTensorEngine
             backend.Gemm(ones, picked, meanLoss, 1, 1, c, -1f, 1f);        // sum -= 1ᵀ·target
         }
         backend.Scale(meanLoss, meanLoss, 1f / n, 1);
-        LastFusedCeForwardChunks = (n + chunk - 1) / chunk;
+        RecordFusedCeForwardChunks((n + chunk - 1) / chunk);
         return true;
     }
 
@@ -6290,6 +6290,8 @@ public partial class DirectGpuTensorEngine
     }
 
     private static void RecordFusedCeBackwardChunks(int chunks) => LastFusedCeBackwardChunks = chunks;
+
+    private static void RecordFusedCeForwardChunks(int chunks) => LastFusedCeForwardChunks = chunks;
 
     /// <summary>
     /// <c>factor * scalar[0] * tensor</c> — or, with a null <paramref name="tensor"/>, <c>factor * scalar[0]</c> filled
