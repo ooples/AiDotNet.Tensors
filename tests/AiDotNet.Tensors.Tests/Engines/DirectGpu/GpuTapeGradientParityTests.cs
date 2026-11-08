@@ -1035,7 +1035,7 @@ public class GpuTapeGradientParityTests : IDisposable
             DirectGpuTensorEngine.LastFusedCeForwardChunks = 0;
             float device = gpu.FusedLinearCrossEntropyWithLogits(ChunkHidden, ChunkWeight, ChunkBias, ChunkTargetIds).ToArray()[0];
             Assert.Equal(3, DirectGpuTensorEngine.LastFusedCeForwardChunks);
-            Assert.True(float.IsFinite(cpu) && cpu > 1f, $"CPU loss {cpu} is not a usable reference.");
+            Assert.True(!float.IsNaN(cpu) && !float.IsInfinity(cpu) && cpu > 1f, $"CPU loss {cpu} is not a usable reference.");
             Assert.True(Math.Abs(device - cpu) <= 1e-5 * Math.Abs(cpu), $"GPU loss {device} vs CPU {cpu}.");
         }
     }
