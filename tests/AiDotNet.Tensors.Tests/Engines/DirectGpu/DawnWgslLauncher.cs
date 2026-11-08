@@ -116,10 +116,20 @@ for await (const line of rl) {
     /// failure of a configured server throws, so a broken Dawn setup fails its tests instead of skipping them.
     /// </summary>
     /// <param name="modules">Kernel name to WGSL module; null runs the batch-execution ports.</param>
-    public static DawnWgslLauncher? TryCreate(IReadOnlyDictionary<string, string>? modules = null)
+    /// <summary>True when AIDOTNET_WEBGPU_NODE_DIR names a node install with the webgpu package; else
+    /// <see cref="TryCreate"/> returns null without starting anything.</summary>
+    public static bool IsConfigured => NodeDirectory() is not null;
+
+    private static string? NodeDirectory()
     {
         string? dir = Environment.GetEnvironmentVariable("AIDOTNET_WEBGPU_NODE_DIR");
-        if (string.IsNullOrEmpty(dir) || !Directory.Exists(Path.Combine(dir, "node_modules", "webgpu"))) return null;
+        return string.IsNullOrEmpty(dir) || !Directory.Exists(Path.Combine(dir, "node_modules", "webgpu")) ? null : dir;
+    }
+
+    public static DawnWgslLauncher? TryCreate(IReadOnlyDictionary<string, string>? modules = null)
+    {
+        string? dir = NodeDirectory();
+        if (dir is null) return null;
         string script = Path.Combine(dir, "aidotnet-wgsl-server.mjs");
         File.WriteAllText(script, Server);
         var started = StartServer(script);

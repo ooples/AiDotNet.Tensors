@@ -96,7 +96,11 @@ public sealed class DawnTorchParityFixture : IDirectGpuTensorEngineFixture, IDis
 
     public DawnTorchParityFixture()
     {
-        var dawn = DawnWgslLauncher.TryCreate(TorchParityModules.Value);
+        // Translate only where Dawn can run: elsewhere the fixture is unavailable, and a translation that timed out
+        // would fail the class instead of letting it skip. Translating before the server starts leaves nothing to
+        // clean up when it throws.
+        if (!DawnWgslLauncher.IsConfigured) return;
+        var dawn = DawnWgslLauncher.TryCreate(AiDotNet.Tensors.Engines.DirectGpu.WebGpu.CudaDialectToWgsl.Modules(TorchParityModules));
         if (dawn is null) return;
         OpenClBackend? host = null;
         try
@@ -122,8 +126,11 @@ public sealed class DawnTorchParityFixture : IDirectGpuTensorEngineFixture, IDis
         _dawn = dawn;
     }
 
-    internal static readonly Lazy<System.Collections.Generic.IReadOnlyDictionary<string, string>> TorchParityModules = new(() =>
-        AiDotNet.Tensors.Engines.DirectGpu.WebGpu.CudaDialectToWgsl.Translate(TorchParityF32Kernels.GetSource()));
+    // As in WebGpuBackend: a translation that fails once (a regex timeout during a long pause) is retried by the next
+    // fixture instead of failing every Dawn parity class in the run from one cached exception.
+    internal static readonly Lazy<System.Collections.Generic.IReadOnlyDictionary<string, string>> TorchParityModules =
+        AiDotNet.Tensors.Engines.DirectGpu.WebGpu.CudaDialectToWgsl.RetryingModules<System.Collections.Generic.IReadOnlyDictionary<string, string>>(() =>
+            AiDotNet.Tensors.Engines.DirectGpu.WebGpu.CudaDialectToWgsl.Translate(TorchParityF32Kernels.GetSource()));
 
     public void Dispose()
     {
