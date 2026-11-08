@@ -13619,7 +13619,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
-            if (!HasResidentIndexStorage(targetIds))
+            // Host ids are validated whenever this call reads them on the host: always for host-backed ids, and for
+            // resident ids when the tape downloads them anyway. An invalid id must throw, not route to a kernel that
+            // never checks it.
+            if (!HasResidentIndexStorage(targetIds) || IsTapeActive<T>())
             {
                 using var idsLease = targetIds.LeaseArray();
                 var ids = idsLease.Array;
@@ -13643,10 +13646,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     chunked = TryFusedLinearCrossEntropyIndexForwardChunked(backend, hB.Buffer, wB.Buffer, bB.Buffer,
                         targetIds.GetDataArray(), loss.Buffer, n, d, vocab);
                 }
-                catch (Exception ex) when (ex is GpuOutOfMemoryException or OutOfMemoryException)
+                catch (Exception ex) when (ex is GpuOutOfMemoryException or GpuBufferTooLargeException
+                    or OutOfMemoryException)
                 {
-                    // Its scratch did not fit; the buffers it did get were disposed as it threw. The fused kernel
-                    // needs none of them.
+                    // Its scratch did not fit (out of memory, or a chunk over the per-allocation cap); the buffers it
+                    // did get were disposed as it threw. The fused kernel needs none of them.
                     System.Diagnostics.Trace.TraceWarning(
                         $"[DirectGpuTensorEngine] Chunked fused-CE forward scratch did not fit ({ex.GetType().Name}: " +
                         $"{ex.Message}); using the fused kernel.");

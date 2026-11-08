@@ -1076,6 +1076,31 @@ public class GpuTapeGradientParityTests : IDisposable
         }
     }
 
+    // Under a tape the resident ids are downloaded for the backward anyway, so they are validated there too: an id out
+    // of range made the chunked forward decline and the fused kernel (which checks nothing) returned a finite loss.
+    [SkippableFact]
+    public void FusedLinearCrossEntropy_index_rejects_an_invalid_resident_id_under_a_tape()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu!)
+        {
+            const int vocab = 5;
+            var hidden = Rand([4, 8], seed: 523);
+            var weight = Rand([8, vocab], seed: 541);
+            var bias = Rand([vocab], seed: 547, lo: -0.1, hi: 0.1);
+            // SearchSorted leaves its result on the device: 9 lies past every entry of [0, 5), so its id is vocab.
+            var ids = gpu.TensorSearchSorted(
+                new Tensor<float>(new float[] { 0, 1, 2, 3, 4 }, new[] { vocab }),
+                new Tensor<float>(new float[] { 0, 1, 2, 9 }, new[] { 4 }));
+            Skip.IfNot(ids.IsGpuResident, "The backend returned host ids, so this checks nothing about resident ids.");
+
+            using var tape = new GradientTape<float>();
+            var ex = Assert.Throws<ArgumentOutOfRangeException>(
+                () => gpu.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, ids));
+            Assert.Equal("targetIds", ex.ParamName);
+        }
+    }
+
     [SkippableFact]
     public void FusedLinearCrossEntropy_stays_on_the_device_while_a_tape_records() =>
         AssertStaysOnDeviceUnderTape("FusedLinearCrossEntropy",
