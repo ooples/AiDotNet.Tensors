@@ -112,6 +112,70 @@ public sealed class GatedDeltaNetScanTapeGpuTests : IClassFixture<DirectGpuTenso
         }
     }
 
+    /// <summary>
+    /// The weighted loss <c>sum(output * r)</c> against central finite differences in double, for every element of all
+    /// five inputs. The other tests compare one analytic backward with another, so an error they share for a
+    /// non-uniform output gradient would pass them.
+    /// </summary>
+    [Fact]
+    public void WeightedLossGradients_MatchFiniteDifferences()
+    {
+        var cpu = new CpuEngine();
+        int batch = 1, seqLen = 5, modelDim = 6, numHeads = 2;
+        int[] shape = [batch, seqLen, modelDim];
+        int[] gateShape = [batch, seqLen, numHeads];
+        var inputs = new[]
+        {
+            ToDouble(Rand(shape, 31)),
+            ToDouble(Rand(shape, 32)),
+            ToDouble(Rand(shape, 33)),
+            ToDouble(Rand(gateShape, 34, gate: true)),
+            ToDouble(Rand(gateShape, 35, gate: true))
+        };
+        var r = ToDouble(Rand(shape, 36));
+
+        double Loss()
+        {
+            var output = cpu.GatedDeltaNetScanForward(inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], numHeads);
+            return cpu.ReduceSum(cpu.TensorMultiply(output, r), [0, 1, 2], keepDims: false)[0];
+        }
+
+        Dictionary<Tensor<double>, Tensor<double>> grads;
+        using (var tape = new GradientTape<double>())
+        {
+            var output = cpu.GatedDeltaNetScanForward(inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], numHeads);
+            var loss = cpu.ReduceSum(cpu.TensorMultiply(output, r), [0, 1, 2], keepDims: false);
+            grads = tape.ComputeGradients(loss, inputs);
+        }
+
+        const double h = 1e-6;
+        string[] names = ["dQ", "dK", "dV", "dAlpha", "dBeta"];
+        for (int i = 0; i < 5; i++)
+        {
+            var analytic = grads[inputs[i]].ToArray();
+            for (int j = 0; j < inputs[i].Length; j++)
+            {
+                double saved = inputs[i][j];
+                inputs[i][j] = saved + h;
+                double plus = Loss();
+                inputs[i][j] = saved - h;
+                double minus = Loss();
+                inputs[i][j] = saved;
+                double numeric = (plus - minus) / (2 * h);
+                Assert.True(Math.Abs(numeric - analytic[j]) <= 1e-6 * Math.Max(1.0, Math.Abs(numeric)),
+                    $"{names[i]}[{j}]: analytic {analytic[j]}, finite difference {numeric}");
+            }
+        }
+    }
+
+    private static Tensor<double> ToDouble(Tensor<float> f)
+    {
+        var d = new Tensor<double>(f.Shape.ToArray());
+        var fa = f.ToArray();
+        for (int i = 0; i < fa.Length; i++) d[i] = fa[i];
+        return d;
+    }
+
     [Fact]
     public void CpuFloatFastPath_MatchesDoubleReference()
     {
@@ -128,14 +192,6 @@ public sealed class GatedDeltaNetScanTapeGpuTests : IClassFixture<DirectGpuTenso
             Rand(gateShape, 25, gate: true)
         };
         var rF = Rand(shape, 26);
-
-        Tensor<double> ToDouble(Tensor<float> f)
-        {
-            var d = new Tensor<double>(f.Shape.ToArray());
-            var fa = f.ToArray();
-            for (int i = 0; i < fa.Length; i++) d[i] = fa[i];
-            return d;
-        }
 
         var inputsD = inputsF.Select(ToDouble).ToArray();
         var rD = ToDouble(rF);

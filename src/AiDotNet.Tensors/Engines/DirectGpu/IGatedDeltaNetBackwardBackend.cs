@@ -31,6 +31,9 @@ internal interface IGatedDeltaNetBackwardBackend
 
 internal static class GatedDeltaNetBackwardResolver
 {
+    /// <summary>The largest head every backend's scan kernels hold in their per-thread state rows.</summary>
+    public const int MaxHeadDim = 256;
+
     /// <summary>The physical backend's fused backward, or null when it has none or may not launch it now.</summary>
     public static IGatedDeltaNetBackwardBackend? Resolve(IDirectGpuBackend backend)
     {

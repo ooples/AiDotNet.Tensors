@@ -9,6 +9,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
 internal static class MetalRecurrenceKernels
 {
+    /// <summary>
+    /// The largest head the recurrence kernels' per-thread rows hold. Must equal <c>REC_MAX_HEADDIM</c> in
+    /// <see cref="Source"/>: a larger head would index past those thread arrays.
+    /// </summary>
+    public const int MaxHeadDim = 256;
+
     public const string Source = @"
 #include <metal_stdlib>
 #include <metal_math>

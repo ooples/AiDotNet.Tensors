@@ -3,6 +3,7 @@
 using System;
 using System.Runtime.CompilerServices;
 using AiDotNet.Tensors.Engines.DirectGpu;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 using AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 using Xunit;
@@ -164,6 +165,40 @@ public sealed class DeviceMemoryReclaimTests
         DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectAfterDeviceBytes);   // abandoned
         DeviceMemoryReclaim.OnDeviceRelease(DeviceMemoryReclaim.CollectNowAfterDeviceBytes, trigger);
         Assert.True(DeviceMemoryReclaim.CollectIfDueAtStepBoundary());
+    }
+
+    [Fact]
+    public void CudaBuffersReleasedAfterTheirQuantumDrained_AreCreditedAgainstTheGen2Count()
+    {
+        // Two 64 MiB buffers fill a 128 MiB quantum, which is forwarded to DeviceMemoryReclaim. Their releases used to
+        // be dropped (the drain had moved the epoch on), so four released pairs still forced a Gen-2 collection.
+        DeviceMemoryReclaim.ResetCountsForTests();
+        CudaBackend.ResetCudaReclaimForTests();
+        const long half = 64L << 20;
+        for (int pair = 0; pair < 4; pair++)
+        {
+            long first = CudaBackend.ChargeCudaReclaim(half);
+            long second = CudaBackend.ChargeCudaReclaim(half);
+            Assert.True(first >= 0 && second >= 0, "a CUDA charge outside a capture is counted");
+            CudaBackend.CreditCudaReclaim(half, first);
+            CudaBackend.CreditCudaReclaim(half, second);
+            // Checked every pair: the fourth uncredited pair would force the Gen-2 collection, which zeroes the count.
+            Assert.Equal(0, DeviceMemoryReclaim.BytesSinceGen2CollectionForTests);
+            Assert.Equal(0, CudaBackend.CudaReclaimPendingBytesForTests);
+        }
+    }
+
+    [Fact]
+    public void ACudaCreditFromADrainedQuantum_DoesNotCancelANewerCharge()
+    {
+        DeviceMemoryReclaim.ResetCountsForTests();
+        CudaBackend.ResetCudaReclaimForTests();
+        const long half = 64L << 20;
+        long drained = CudaBackend.ChargeCudaReclaim(half);
+        CudaBackend.ChargeCudaReclaim(half);   // fills the quantum: it drains and a new epoch starts
+        CudaBackend.ChargeCudaReclaim(32L << 20);   // abandoned in the new epoch
+        CudaBackend.CreditCudaReclaim(half, drained);
+        Assert.Equal(32L << 20, CudaBackend.CudaReclaimPendingBytesForTests);
     }
 
     [Fact]
