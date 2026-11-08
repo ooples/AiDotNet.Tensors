@@ -3107,8 +3107,12 @@ namespace AiDotNet.Tensors.Engines.Simd
             var c9 = Vector256.Create(2.75573192239844089230e-6);
             var c10 = Vector256.Create(2.75573192239332268710e-7);
             var c11 = Vector256.Create(2.50521083854417187751e-8);
+            var c12 = Vector256.Create(2.08767569878680989792e-9);
+            var c13 = Vector256.Create(1.60590438368216145994e-10);
 
-            var poly = Fma.MultiplyAdd(c11, r, c10);
+            var poly = Fma.MultiplyAdd(c13, r, c12);
+            poly = Fma.MultiplyAdd(poly, r, c11);
+            poly = Fma.MultiplyAdd(poly, r, c10);
             poly = Fma.MultiplyAdd(poly, r, c9);
             poly = Fma.MultiplyAdd(poly, r, c8);
             poly = Fma.MultiplyAdd(poly, r, c7);
