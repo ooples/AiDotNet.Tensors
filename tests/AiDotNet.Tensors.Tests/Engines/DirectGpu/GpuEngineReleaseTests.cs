@@ -267,7 +267,7 @@ public class GpuEngineReleaseTests
 
     // Results computed and dropped (in their own frame, so nothing on this one keeps them reachable).
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
-    private static void DropDeviceResults(DirectGpuTensorEngine gpu, int elements, int count)
+    internal static void DropDeviceResults(DirectGpuTensorEngine gpu, int elements, int count)
     {
         var x = new Tensor<float>(new float[elements], new[] { elements });
         for (int i = 0; i < count; i++)
