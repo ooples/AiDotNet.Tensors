@@ -118,6 +118,37 @@ public sealed class DeviceMemoryReclaimTests
     }
 
     [Fact]
+    public void InsideATape_AStepDroppingPastTheInTapeThreshold_CollectsWithoutWaitingForTheBoundary()
+    {
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        static WeakReference Abandon() => new WeakReference(new object());
+
+        var tapeOpen = DeviceMemoryReclaim.TapeOpen;
+        DeviceMemoryReclaim.TapeOpen = () => true;
+        try
+        {
+            DeviceMemoryReclaim.ResetCountsForTests();
+            var dead = Abandon();
+            // Below the in-tape threshold a tape still waits for the step boundary.
+            DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectAfterDeviceBytes);
+            Assert.True(DeviceMemoryReclaim.CollectionDue);
+            // Past it, the step's dead results are collected now: a GPU step can drop gigabytes before its boundary.
+            // The collection count proves this call collected; an unrelated GC could clear `dead` on its own.
+            int collectionsBefore = GC.CollectionCount(1);
+            DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectInsideTapeAfterDeviceBytes - DeviceMemoryReclaim.CollectAfterDeviceBytes);
+            Assert.True(GC.CollectionCount(1) > collectionsBefore, "the in-tape threshold did not collect");
+            Assert.False(dead.IsAlive);
+            // What the tape still holds survived that collection, so the boundary sweep stays requested.
+            Assert.True(DeviceMemoryReclaim.CollectionDue);
+        }
+        finally
+        {
+            DeviceMemoryReclaim.TapeOpen = tapeOpen;
+            DeviceMemoryReclaim.ResetCountsForTests();
+        }
+    }
+
+    [Fact]
     public void StepBoundary_SkipsTheCollection_WhenOwnersDisposedWhatWasHandedOut()
     {
         // A TensorScope ending an inference call disposes its intermediates: they are back in the pool and credited, so
@@ -245,9 +276,9 @@ public sealed class DeviceMemoryReclaimTests
             using (var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>())
             {
                 weakForward = RecordUnpooledEntry(tape, x);
-                // Simulate >256 MB of device allocations inside an open tape: must defer to tape.Dispose()
+                // Device allocations inside an open tape below the in-tape threshold defer to tape.Dispose()
                 // rather than running a mid-step GC while _entries still roots unpooled.
-                DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectNowAfterDeviceBytes);
+                DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectInsideTapeAfterDeviceBytes - 1);
                 Assert.True(DeviceMemoryReclaim.CollectionDue);
             }
             return weakForward;
@@ -255,6 +286,51 @@ public sealed class DeviceMemoryReclaimTests
 
         DeviceMemoryReclaim.ResetCountsForTests();
         var weak = RecordForwardStepAndDispose();
+        Assert.False(DeviceMemoryReclaim.CollectionDue);
+        Assert.False(weak.IsAlive);
+    }
+
+    [Fact]
+    public void AnOwnerTheTapeHeldAcrossAnInTapeCollection_IsCollectedAtTheStepBoundary()
+    {
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        static WeakReference RecordHeldEntry(
+            AiDotNet.Tensors.Engines.Autodiff.GradientTape<float> tape,
+            AiDotNet.Tensors.LinearAlgebra.Tensor<float> x)
+        {
+            var held = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(new[] { 16 });
+            tape.Record(new AiDotNet.Tensors.Engines.Autodiff.TapeEntry<float>
+            {
+                OperationName = "test_in_tape_survivor",
+                Output = held,
+                Input0 = x,
+                InputCount = 1,
+            });
+            return new WeakReference(held);
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        static WeakReference StepWithAnInTapeCollection()
+        {
+            var x = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(new[] { 16 });
+            WeakReference weakHeld;
+            using (var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>())
+            {
+                weakHeld = RecordHeldEntry(tape, x);
+                int collectionsBefore = GC.CollectionCount(1);
+                DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectInsideTapeAfterDeviceBytes);
+                Assert.True(GC.CollectionCount(1) > collectionsBefore, "the in-tape threshold did not collect");
+                // The tape still roots its entry: the collection promoted it instead of freeing it.
+                Assert.True(weakHeld.IsAlive);
+                Assert.True(DeviceMemoryReclaim.CollectionDue);
+            }
+            return weakHeld;
+        }
+
+        DeviceMemoryReclaim.ResetCountsForTests();
+        var weak = StepWithAnInTapeCollection();
+        // Disposing the tape released the entry and ran the boundary sweep through Gen 2, which reaches the promoted
+        // owner.
         Assert.False(DeviceMemoryReclaim.CollectionDue);
         Assert.False(weak.IsAlive);
     }
