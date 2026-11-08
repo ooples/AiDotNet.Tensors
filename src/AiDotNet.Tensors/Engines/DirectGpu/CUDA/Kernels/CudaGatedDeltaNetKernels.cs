@@ -2,6 +2,9 @@
 // CUDA kernels for the fused Gated DeltaNet scan (forward + recompute BPTT backward, issue ooples/AiDotNet#1464).
 // Same design as HipGatedDeltaNetKernels: each value row di is independent in both forward and BPTT backward,
 // so one thread per (batch, head, value-row) carries that state/adjoint row in registers across time.
+// The BPTT trajectory is stored [b, h, t, ki, di] (value row innermost): the threads of a warp are consecutive di, so
+// each of their per-ki reads and writes is one coalesced transaction. Stored [.., di, ki] they were headDim floats
+// apart (one transaction per thread), and recompute + backward were 26% of an LM training step's GPU time.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
 
@@ -75,11 +78,11 @@ extern ""C"" __global__ void gated_delta_scan_recompute(
         float sK = 0.0f;
         for (int ki = 0; ki < headDim; ki++) sK += Srow[ki] * (K[baseOff + ki] * kappa);
         float bd = bet * (V[baseOff + di] - sK);
-        long trajBase = ((long)(b * numHeads + h) * seqLen + t) * hh + (long)di * headDim;
+        long trajBase = ((long)(b * numHeads + h) * seqLen + t) * hh + di;
         for (int ki = 0; ki < headDim; ki++) {
             float s = a * Srow[ki] + bd * (K[baseOff + ki] * kappa);
             Srow[ki] = s;
-            Straj[trajBase + ki] = s;
+            Straj[trajBase + (long)ki * headDim] = s;
         }
     }
 }
@@ -113,19 +116,19 @@ extern ""C"" __global__ void gated_delta_scan_backward(
         int baseOff = (b * seqLen + t) * modelDim + hOff;
         int gIdx = (b * seqLen + t) * numHeads + h;
         float a = A[gIdx], bet = B[gIdx];
-        long trajBase = ((long)(b * numHeads + h) * seqLen + t) * hh + (long)di * headDim;
-        long sprevBase = (t > 0) ? (((long)(b * numHeads + h) * seqLen + (t - 1)) * hh + (long)di * headDim) : 0L;
+        long trajBase = ((long)(b * numHeads + h) * seqLen + t) * hh + di;
+        long sprevBase = (t > 0) ? (((long)(b * numHeads + h) * seqLen + (t - 1)) * hh + di) : 0L;
 
         float sK = 0.0f;
         for (int ki = 0; ki < headDim; ki++) {
-            float sprev = (t > 0) ? Straj[sprevBase + ki] : 0.0f;
+            float sprev = (t > 0) ? Straj[sprevBase + (long)ki * headDim] : 0.0f;
             sK += sprev * (K[baseOff + ki] * kappa);
         }
         float delta = V[baseOff + di] - sK;
 
         float dOutVal = dOut[baseOff + di];
         for (int ki = 0; ki < headDim; ki++) {
-            if (!det) atomicAdd(&dQ[baseOff + ki], dOutVal * Straj[trajBase + ki]);
+            if (!det) atomicAdd(&dQ[baseOff + ki], dOutVal * Straj[trajBase + (long)ki * headDim]);
             dSrow[ki] += dOutVal * Q[baseOff + ki];
         }
 
@@ -134,7 +137,7 @@ extern ""C"" __global__ void gated_delta_scan_backward(
         float dDelta = 0.0f;
         for (int ki = 0; ki < headDim; ki++) {
             float dSt = dSrow[ki];
-            float sprev = (t > 0) ? Straj[sprevBase + ki] : 0.0f;
+            float sprev = (t > 0) ? Straj[sprevBase + (long)ki * headDim] : 0.0f;
             float kScaled = K[baseOff + ki] * kappa;
             dA_acc += dSt * sprev;
             dB_acc += dSt * delta * kScaled;
@@ -153,10 +156,10 @@ extern ""C"" __global__ void gated_delta_scan_backward(
         float dSk = -dDelta;
         for (int ki = 0; ki < headDim; ki++) {
             float dSt = dSrow[ki];
-            float sprev = (t > 0) ? Straj[sprevBase + ki] : 0.0f;
+            float sprev = (t > 0) ? Straj[sprevBase + (long)ki * headDim] : 0.0f;
             float kScaled = K[baseOff + ki] * kappa;
             float dKS_ki = dSt * (bet * delta) + dSk * sprev;
-            if (det) Straj[trajBase + ki] = dKS_ki * kappa;
+            if (det) Straj[trajBase + (long)ki * headDim] = dKS_ki * kappa;
             else atomicAdd(&dK[baseOff + ki], dKS_ki * kappa);
             dSrow[ki] = dSt * a + dSk * kScaled;
         }
@@ -177,7 +180,7 @@ extern ""C"" __global__ void gated_delta_scan_dq(
     long trajT = ((long)(b * numHeads + h) * seqLen + t) * (long)(headDim * headDim);
     int base = bt * modelDim + h * headDim;
     float acc = 0.0f;
-    for (int di = 0; di < headDim; di++) acc += dOut[base + di] * Straj[trajT + (long)di * headDim + ki];
+    for (int di = 0; di < headDim; di++) acc += dOut[base + di] * Straj[trajT + (long)ki * headDim + di];
     dQ[gid] = acc;
 }
 
@@ -196,7 +199,7 @@ extern ""C"" __global__ void gated_delta_scan_reduce(
     int t = bt % seqLen, b = bt / seqLen;
     long trajT = ((long)(b * numHeads + h) * seqLen + t) * (long)(headDim * headDim);
     float acc = 0.0f;
-    for (int di = 0; di < headDim; di++) acc += PK[trajT + (long)di * headDim + ki];
+    for (int di = 0; di < headDim; di++) acc += PK[trajT + (long)ki * headDim + di];
     dK[gid] = acc;
     if (ki == 0) {
         int gIdx = bt * numHeads + h;
