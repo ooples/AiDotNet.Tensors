@@ -13126,6 +13126,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var q = inputs[0];
         int batch = q.Shape._dims[0], seqLen = q.Shape._dims[1], modelDim = q.Shape._dims[2];
         int headDim = modelDim / numHeads;
+        // A scan whose forward ran on the CPU for its head size reaches here too; decline before allocating anything.
+        if (headDim > Engines.DirectGpu.GatedDeltaNetBackwardResolver.MaxHeadDim)
+            return null;
         int n = batch * seqLen * modelDim, ng = batch * seqLen * numHeads;
         // The kernels read dOut as [batch, seqLen, modelDim]; a gradient of any other size would be read past its end.
         if (gradOutput.Length != n)
@@ -13185,6 +13188,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Tensor<T> qProj, Tensor<T> kProj, Tensor<T> vProj, Tensor<T> alpha, Tensor<T> beta, int numHeads)
     {
         using var __gpuOp = EnterGpuOp();
+        if (qProj is null) throw new ArgumentNullException(nameof(qProj));
+        if (kProj is null) throw new ArgumentNullException(nameof(kProj));
+        if (vProj is null) throw new ArgumentNullException(nameof(vProj));
+        if (alpha is null) throw new ArgumentNullException(nameof(alpha));
+        if (beta is null) throw new ArgumentNullException(nameof(beta));
         if (Compilation.GraphMode.IsActive ||
             typeof(T) != typeof(float) || !TryGetBackend(out var backend) ||
             (IsTapeActive<T>() && Engines.DirectGpu.GatedDeltaNetBackwardResolver.Resolve(backend) is null))
@@ -13203,7 +13211,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads);
         int headDim = modelDim / numHeads;
         // alpha/beta are per-head gates [batch, seqLen, numHeads].
-        if (headDim > 256 ||
+        if (headDim > Engines.DirectGpu.GatedDeltaNetBackwardResolver.MaxHeadDim ||
             alpha.Rank != 3 || beta.Rank != 3 ||
             alpha.Shape._dims[0] != batch || alpha.Shape._dims[1] != seqLen || alpha.Shape._dims[2] != numHeads ||
             beta.Shape._dims[0] != batch || beta.Shape._dims[1] != seqLen || beta.Shape._dims[2] != numHeads)

@@ -1761,6 +1761,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // Issue #285: per-allocation cap check before cuMemAlloc.
         GpuBufferSizeGuard.EnsureFits("CUDA", (long)byteSize, MaxBufferAllocBytes, DeviceName);
         RecordDirectPtxEvidenceDeviceAllocation(checked((long)byteSize));
+        DrainFinalizedFreesBeforeAllocation();
 
         // CUDA driver API calls are required for device memory operations.
         using var _ = PushContext();
@@ -2090,6 +2091,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // Issue #285: per-allocation cap check before cuMemAlloc.
         GpuBufferSizeGuard.EnsureFits("CUDA", (long)size * sizeof(float), MaxBufferAllocBytes, DeviceName);
         RecordDirectPtxEvidenceDeviceAllocation(checked((long)size * sizeof(float)));
+        DrainFinalizedFreesBeforeAllocation();
 
         // CUDA driver API calls are required for device memory operations.
         using var _ = PushContext();
@@ -2141,6 +2143,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new ArgumentOutOfRangeException(nameof(size), "Buffer size must be positive.");
         GpuBufferSizeGuard.EnsureFits("CUDA", (long)size * sizeof(float), MaxBufferAllocBytes, DeviceName);
         RecordDirectPtxEvidenceDeviceAllocation(checked((long)size * sizeof(float)));
+        DrainFinalizedFreesBeforeAllocation();
         // Only the stream-ordered allocator skips the fill: the legacy path's pooled buffers are recycled across
         // the null stream, so keep its zeroing (and everything else about it) exactly as AllocateBuffer does.
         if (!_asyncAlloc)
@@ -2183,6 +2186,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new ArgumentOutOfRangeException(nameof(size), "Buffer size must be positive.");
         GpuBufferSizeGuard.EnsureFits("CUDA", size, MaxBufferAllocBytes, DeviceName);
         RecordDirectPtxEvidenceDeviceAllocation(size);
+        DrainFinalizedFreesBeforeAllocation();
 
         using var _ = PushContext();
         if (_asyncAlloc)
@@ -6334,6 +6338,16 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     /// illegal inside a stream capture and silently invalidates it (seen as intermittent explicit-capture failures
     /// under load); the queues then wait for this thread's next non-capturing operation.
     /// </summary>
+    /// <summary>
+    /// Runs the frees finalizers queued before handing out more memory. Engine ops drain the queue as they make the
+    /// context current; a caller that allocates on the backend directly would otherwise keep the collected buffers'
+    /// memory out of reach until an out-of-memory retry. Skipped while this thread captures (see CanRunDeferredFrees).
+    /// </summary>
+    private void DrainFinalizedFreesBeforeAllocation()
+    {
+        if (!PendingFinalizerFrees.IsEmpty && CanRunDeferredFrees()) DrainPendingFinalizerFrees();
+    }
+
     private bool CanRunDeferredFrees()
     {
         if (PendingFinalizerFrees.IsEmpty && PendingGraphDestroys.IsEmpty && PendingContextDestroys.IsEmpty
@@ -9723,6 +9737,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // Issue #285: per-allocation cap check before cuMemAlloc.
         GpuBufferSizeGuard.EnsureFits("CUDA", (long)byteSize, MaxBufferAllocBytes, DeviceName);
         RecordDirectPtxEvidenceDeviceAllocation(checked((long)byteSize));
+        DrainFinalizedFreesBeforeAllocation();
 
         CuBlasNative.CheckCudaResult(CuBlasNative.cuMemAlloc(out IntPtr devicePtr, byteSize), "cuMemAlloc(int)");
 
@@ -20314,41 +20329,87 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     // guaranteeing Gen-1 sweeps every 128 MB and Gen-2 sweeps every 512 MB of unreleased device memory (preventing
     // 10+ GB training steps from crossing the 12 GB Windows WDDM shared-memory paging cliff).
     private const long CudaReclaimQuantumBytes = 128L << 20;
-    private static long s_cudaUnreleasedBytes;
-    private static long s_cudaReclaimEpoch;
 
-    private static long ChargeCudaReclaim(long bytes)
+    // Unreleased bytes (low 40 bits) and the quantum epoch (high bits) in one word: a credit checks its epoch and
+    // subtracts in the same compare-exchange, so one that paused across a drain cannot take a newer epoch's charge.
+    private const int CudaReclaimByteBits = 40;
+    private const long CudaReclaimByteMask = (1L << CudaReclaimByteBits) - 1;
+    private const long CudaReclaimEpochMask = (1L << (63 - CudaReclaimByteBits)) - 1;
+    private static long s_cudaReclaimState;
+
+    // The DeviceMemoryReclaim epoch each recent drain forwarded its quantum under, by quantum epoch. A buffer charged
+    // in a drained epoch credits the forwarded charge instead: without it, released buffers still counted toward the
+    // Gen-2 sweep (four 64 MiB pairs forced a blocking Gen-2 collection though every buffer had been released).
+    private const int CudaReclaimForwardSlots = 64;
+    private static readonly long[] s_cudaForwardedEpochs = NewForwardedEpochs();
+
+    private static long[] NewForwardedEpochs()
     {
-        if (bytes <= 0 || IsCapturingOnThisThread || IsRuntimeTearingDown || ProcessExiting) return -1;
-        long epoch = Volatile.Read(ref s_cudaReclaimEpoch);
-        long pending = Interlocked.Add(ref s_cudaUnreleasedBytes, bytes);
-        while (pending >= CudaReclaimQuantumBytes)
-        {
-            long chunks = pending / CudaReclaimQuantumBytes;
-            long drain = chunks * CudaReclaimQuantumBytes;
-            long observed = Interlocked.CompareExchange(ref s_cudaUnreleasedBytes, pending - drain, pending);
-            if (observed == pending)
-            {
-                Interlocked.Increment(ref s_cudaReclaimEpoch);
-                DeviceMemoryReclaim.OnDeviceAllocation(chunks * DeviceMemoryReclaim.CollectAfterDeviceBytes);
-                return -1;
-            }
-            pending = observed;
-        }
-        return epoch;
+        var epochs = new long[CudaReclaimForwardSlots];
+        for (int i = 0; i < epochs.Length; i++) epochs[i] = -1;
+        return epochs;
     }
 
-    private static void CreditCudaReclaim(long bytes, long epoch)
+    /// <returns>The quantum epoch the charge is counted in, or -1 when it is not counted.</returns>
+    internal static long ChargeCudaReclaim(long bytes)
+    {
+        if (bytes <= 0 || IsCapturingOnThisThread || IsRuntimeTearingDown || ProcessExiting) return -1;
+        while (true)
+        {
+            long state = Volatile.Read(ref s_cudaReclaimState);
+            long epoch = (long)((ulong)state >> CudaReclaimByteBits);
+            long pending = Math.Min((state & CudaReclaimByteMask) + bytes, CudaReclaimByteMask);
+            if (pending < CudaReclaimQuantumBytes)
+            {
+                if (Interlocked.CompareExchange(ref s_cudaReclaimState, (epoch << CudaReclaimByteBits) | pending, state) == state)
+                    return epoch;
+                continue;
+            }
+            long chunks = pending / CudaReclaimQuantumBytes;
+            long next = (((epoch + 1) & CudaReclaimEpochMask) << CudaReclaimByteBits)
+                | (pending - chunks * CudaReclaimQuantumBytes);
+            if (Interlocked.CompareExchange(ref s_cudaReclaimState, next, state) != state) continue;
+            int slot = (int)(epoch % CudaReclaimForwardSlots);
+            Volatile.Write(ref s_cudaForwardedEpochs[slot], -1);
+            long forwarded = DeviceMemoryReclaim.OnDeviceAllocation(chunks * DeviceMemoryReclaim.CollectAfterDeviceBytes);
+            Volatile.Write(ref s_cudaForwardedEpochs[slot], forwarded);
+            return epoch;
+        }
+    }
+
+    internal static void CreditCudaReclaim(long bytes, long epoch)
     {
         if (bytes <= 0 || epoch < 0) return;
         while (true)
         {
-            long current = Volatile.Read(ref s_cudaUnreleasedBytes);
-            if (Volatile.Read(ref s_cudaReclaimEpoch) != epoch || current <= 0) return;
-            long next = Math.Max(0, current - bytes);
-            if (Interlocked.CompareExchange(ref s_cudaUnreleasedBytes, next, current) == current) return;
+            long state = Volatile.Read(ref s_cudaReclaimState);
+            long current = (long)((ulong)state >> CudaReclaimByteBits);
+            if (current != epoch)
+            {
+                // Its epoch was drained into DeviceMemoryReclaim at the quantum's scale, so the credit goes there. A
+                // drain more than CudaReclaimForwardSlots quanta ago has lost its slot, and the credit is dropped.
+                if (((current - epoch) & CudaReclaimEpochMask) <= CudaReclaimForwardSlots)
+                    DeviceMemoryReclaim.OnDeviceRelease(
+                        bytes * DeviceMemoryReclaim.CollectAfterDeviceBytes / CudaReclaimQuantumBytes,
+                        Volatile.Read(ref s_cudaForwardedEpochs[(int)(epoch % CudaReclaimForwardSlots)]));
+                return;
+            }
+            long pending = state & CudaReclaimByteMask;
+            if (pending <= 0) return;
+            long next = (epoch << CudaReclaimByteBits) | Math.Max(0, pending - bytes);
+            if (Interlocked.CompareExchange(ref s_cudaReclaimState, next, state) == state) return;
         }
     }
+
+    /// <summary>Test hook: starts the quantum count from zero with no drain recorded.</summary>
+    internal static void ResetCudaReclaimForTests()
+    {
+        Volatile.Write(ref s_cudaReclaimState, 0);
+        for (int i = 0; i < s_cudaForwardedEpochs.Length; i++) Volatile.Write(ref s_cudaForwardedEpochs[i], -1);
+    }
+
+    /// <summary>Test hook: the unreleased bytes of the current quantum.</summary>
+    internal static long CudaReclaimPendingBytesForTests => Volatile.Read(ref s_cudaReclaimState) & CudaReclaimByteMask;
 
     internal sealed class CudaGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     {

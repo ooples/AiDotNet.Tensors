@@ -90,7 +90,7 @@ public partial class MetalBackend : IGatedDeltaNetBackwardBackend
     {
         if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
             throw new ArgumentOutOfRangeException(nameof(batch), "GatedDeltaNet dimensions must be positive.");
-        if (modelDim != numHeads * headDim || headDim > 256)
+        if (modelDim != numHeads * headDim || headDim > MetalRecurrenceKernels.MaxHeadDim)
             throw new ArgumentException($"Invalid GatedDeltaNet head layout (modelDim={modelDim}, numHeads={numHeads}, headDim={headDim}).");
         GatedDeltaNetBackwardResolver.ValidateBuffers(dOut, q, k, v, alpha, beta, dQ, dK, dV, dAlpha, dBeta, batch, seqLen, modelDim, numHeads);
         int hh = headDim * headDim;

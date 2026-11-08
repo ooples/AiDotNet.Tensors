@@ -287,7 +287,7 @@ public sealed class PermutedViewResidencyTests : IClassFixture<DirectGpuTensorEn
                     "the on-device Adam step declined");
                 long step2Readback;
                 string step2Sites;
-                Tensor<float> gpuGradW2;
+                Tensor<float> gpuGradX2, gpuGradW2;
                 using (var gpuTape2 = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>())
                 {
                     var gpuOut2 = gpu.BatchMatMul(x, wGpu);
@@ -296,6 +296,7 @@ public sealed class PermutedViewResidencyTests : IClassFixture<DirectGpuTensorEn
                     var grads2 = gpuTape2.ComputeGradients(gpuLoss2, new[] { x, wGpu });
                     step2Readback = GpuLaunchProbe.ReadbackBytes;
                     step2Sites = string.Join("; ", GpuLaunchProbe.ReadbackSites);
+                    gpuGradX2 = grads2[x];
                     gpuGradW2 = grads2[wGpu];
                 }
                 Assert.True(step2Readback <= 64, $"Step 2 BatchMatMul backward read back {step2Readback} bytes: {step2Sites}");
@@ -304,10 +305,26 @@ public sealed class PermutedViewResidencyTests : IClassFixture<DirectGpuTensorEn
                 // readback is outside the measured window.
                 AiDotNetEngine.Current = cpu;
                 var wUpdated = new Tensor<float>(wGpu.ToArray(), new[] { 4, 6, 8 });
+
+                // The update itself, against an independent Adam step: with bias correction the first step moves each
+                // weight by lr * g / (|g| + eps). The bf16 moments round m and v to about 0.4%, well inside 2e-4.
+                var wArr = wCpu.ToArray();
+                var gArr = cpuGradW.ToArray();
+                var updatedArr = wUpdated.ToArray();
+                for (int i = 0; i < wArr.Length; i++)
+                {
+                    float expected = wArr[i] - 1e-2f * gArr[i] / (Math.Abs(gArr[i]) + 1e-8f);
+                    Assert.True(Math.Abs(expected - updatedArr[i]) < 2e-4f,
+                        $"step2 W[{i}] after Adam: expected {expected}, device {updatedArr[i]}");
+                }
+
+                // d/dW of sum(x @ W) does not depend on W; d/dx does, so it is the one that catches a stale weight.
                 using (var cpuTape2 = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>())
                 {
                     var cpuLoss2 = cpu.ReduceSum(cpu.BatchMatMul(x, wUpdated), new[] { 0, 1, 2 }, keepDims: false);
-                    AssertGradientsMatch(cpuTape2.ComputeGradients(cpuLoss2, new[] { wUpdated })[wUpdated], gpuGradW2, "step2 d/dW");
+                    var cpuGrads2 = cpuTape2.ComputeGradients(cpuLoss2, new[] { x, wUpdated });
+                    AssertGradientsMatch(cpuGrads2[x], gpuGradX2, "step2 d/dx");
+                    AssertGradientsMatch(cpuGrads2[wUpdated], gpuGradW2, "step2 d/dW");
                 }
             }
             finally
