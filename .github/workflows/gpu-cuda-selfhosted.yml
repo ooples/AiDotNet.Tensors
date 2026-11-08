@@ -161,25 +161,31 @@ jobs:
         if (-not $python) { Write-Output "::error::This runner has no python on PATH; install Python 3 for all users."; exit 1 }
         "Python: $(python --version) at $($python.Source)" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
 
-    # The PyTorch reference tests (nn.GRU parity on the CPU and on CUDA) call PARITY_PYTHON with numpy and torch. They
-    # go into a virtual environment in the workspace, built once per pinned set and reused, since the service account
-    # cannot install into the machine's Python. torch is the CPU build: the references run on the host.
+    # The PyTorch reference tests (nn.GRU parity, the caching-allocator comparison) call PARITY_PYTHON with numpy and
+    # torch, and the DLPack round trips embed AIDOTNET_TORCH_PYTHON. They go into a virtual environment in the
+    # workspace, built once per pinned set and wheel index and reused, since the service account cannot install into
+    # the machine's Python. torch is the CUDA build: the allocator comparison and the CUDA DLPack round trips need a
+    # device, and AIDOTNET_REQUIRE_TORCH_CUDA makes a torch that cannot reach one fail instead of skip.
     - name: Python packages
       run: |
         $pins = 'numpy==2.3.4', 'torch==2.9.0'
+        $index = 'https://download.pytorch.org/whl/cu128'
         $venv = Join-Path $env:GITHUB_WORKSPACE 'pyenv'
-        $marker = Join-Path $venv ('ok-' + (($pins -join '_') -replace '[^A-Za-z0-9_.]', '-'))
+        $marker = Join-Path $venv ('ok-' + ((($pins + (Split-Path $index -Leaf)) -join '_') -replace '[^A-Za-z0-9_.]', '-'))
         $py = Join-Path $venv 'Scripts\python.exe'
         if (-not (Test-Path $marker)) {
           if (Test-Path $venv) { Remove-Item -Recurse -Force $venv }
           python -m venv $venv
           if ($LASTEXITCODE -ne 0) { Write-Output "::error::Creating the Python virtual environment failed."; exit 1 }
-          & $py -m pip install --disable-pip-version-check -q $pins --extra-index-url https://download.pytorch.org/whl/cpu
+          & $py -m pip install --disable-pip-version-check -q $pins --extra-index-url $index
           if ($LASTEXITCODE -ne 0) { Write-Output "::error::Installing $($pins -join ', ') failed."; exit 1 }
           New-Item -ItemType File -Path $marker | Out-Null
         }
-        "PARITY_PYTHON=$py" | Out-File -Append -Encoding utf8 -FilePath $env:GITHUB_ENV
-        "Python packages (numpy, torch): $(& $py -I -c 'import numpy, torch; print(numpy.__version__, torch.__version__)')" |
+        $cuda = & $py -I -c 'import torch; print(torch.cuda.is_available())'
+        if ($cuda -ne 'True') { Write-Output "::error::The CUDA build of torch cannot reach a device here (is_available: $cuda)."; exit 1 }
+        "PARITY_PYTHON=$py", "AIDOTNET_TORCH_PYTHON=$py", 'AIDOTNET_REQUIRE_TORCH_CUDA=1' |
+          Out-File -Append -Encoding utf8 -FilePath $env:GITHUB_ENV
+        "Python packages (numpy, torch): $(& $py -I -c 'import numpy, torch; print(numpy.__version__, torch.__version__, torch.version.cuda)')" |
           Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
 
     # The harness steps below serve only the model-family step, which runs on SM86; the SM75 job skips them all.
