@@ -1042,6 +1042,8 @@ public class GpuTapeGradientParityTests : IDisposable
 
     // A captured graph replays the device work it recorded: host ids uploaded during capture would be replayed as the
     // captured batch's labels on every later step, so the capture is refused instead (the compiled step runs eagerly).
+    // CaptureGraph aborts a capture whose work throws and returns no graph rather than rethrowing, so the refusal is
+    // observed inside the captured work.
     [SkippableFact]
     public void FusedLinearCrossEntropy_index_refuses_capture_with_host_target_ids()
     {
@@ -1050,10 +1052,27 @@ public class GpuTapeGradientParityTests : IDisposable
         {
             var capture = gpu.GetBackend() as AiDotNet.Tensors.Engines.DirectGpu.IGpuGraphCapture;
             Skip.IfNot(capture is { SupportsGraphCapture: true }, "The backend has no stream capture.");
+            float cpu = new CpuEngine().FusedLinearCrossEntropyWithLogits(ChunkHidden, ChunkWeight, ChunkBias, ChunkTargetIds).ToArray()[0];
             gpu.FusedLinearCrossEntropyWithLogits(ChunkHidden, ChunkWeight, ChunkBias, ChunkTargetIds);   // warm-up
-            var refused = Assert.Throws<NotSupportedException>(() => capture.CaptureGraph(
-                () => gpu.FusedLinearCrossEntropyWithLogits(ChunkHidden, ChunkWeight, ChunkBias, ChunkTargetIds)));
+            NotSupportedException? refused = null;
+            IntPtr graph = capture.CaptureGraph(() =>
+            {
+                try
+                {
+                    gpu.FusedLinearCrossEntropyWithLogits(ChunkHidden, ChunkWeight, ChunkBias, ChunkTargetIds);
+                }
+                catch (NotSupportedException ex)
+                {
+                    refused = ex;
+                    throw;
+                }
+            });
+            Assert.Equal(IntPtr.Zero, graph);
+            Assert.NotNull(refused);
             Assert.Contains("host-backed target ids", refused.Message);
+            // The aborted capture leaves the stream usable: the same call runs eagerly and still matches the CPU.
+            float after = gpu.FusedLinearCrossEntropyWithLogits(ChunkHidden, ChunkWeight, ChunkBias, ChunkTargetIds).ToArray()[0];
+            Assert.True(Math.Abs(after - cpu) <= 1e-5 * Math.Abs(cpu), $"GPU loss after the refused capture {after} vs CPU {cpu}.");
         }
     }
 
