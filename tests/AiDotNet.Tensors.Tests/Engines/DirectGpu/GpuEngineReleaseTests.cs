@@ -265,16 +265,16 @@ public class GpuEngineReleaseTests
         }
     }
 
-    // Results computed and dropped (in their own frame, so nothing on this one keeps them reachable).
+    // Results computed and dropped (in their own frame, so nothing on this one keeps them reachable). All of them stay
+    // alive until the frame ends, as a Python list holds PyTorch's in the comparison: one collected mid-loop would hand
+    // its buffer to the next result and shrink what a release can return.
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
-    private static void DropDeviceResults(DirectGpuTensorEngine gpu, int elements, int count)
+    internal static void DropDeviceResults(DirectGpuTensorEngine gpu, int elements, int count)
     {
         var x = new Tensor<float>(new float[elements], new[] { elements });
-        for (int i = 0; i < count; i++)
-        {
-            var y = gpu.TensorAdd(x, x);
-            GC.KeepAlive(y);
-        }
+        var results = new Tensor<float>[count];
+        for (int i = 0; i < count; i++) results[i] = gpu.TensorAdd(x, x);
+        GC.KeepAlive(results);
     }
 
     /// <summary>
