@@ -117,6 +117,33 @@ public sealed class DeviceMemoryReclaimTests
     }
 
     [Fact]
+    public void InsideATape_AStepDroppingPastTheInTapeThreshold_CollectsWithoutWaitingForTheBoundary()
+    {
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        static WeakReference Abandon() => new WeakReference(new object());
+
+        var tapeOpen = DeviceMemoryReclaim.TapeOpen;
+        DeviceMemoryReclaim.TapeOpen = () => true;
+        try
+        {
+            DeviceMemoryReclaim.ResetCountsForTests();
+            var dead = Abandon();
+            // Below the in-tape threshold a tape still waits for the step boundary.
+            DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectAfterDeviceBytes);
+            Assert.True(DeviceMemoryReclaim.CollectionDue);
+            // Past it, the step's dead results are collected now: a GPU step can drop gigabytes before its boundary.
+            DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectInsideTapeAfterDeviceBytes - DeviceMemoryReclaim.CollectAfterDeviceBytes);
+            Assert.False(DeviceMemoryReclaim.CollectionDue);
+            Assert.False(dead.IsAlive);
+        }
+        finally
+        {
+            DeviceMemoryReclaim.TapeOpen = tapeOpen;
+            DeviceMemoryReclaim.ResetCountsForTests();
+        }
+    }
+
+    [Fact]
     public void StepBoundary_SkipsTheCollection_WhenOwnersDisposedWhatWasHandedOut()
     {
         // A TensorScope ending an inference call disposes its intermediates: they are back in the pool and credited, so
@@ -210,9 +237,9 @@ public sealed class DeviceMemoryReclaimTests
             using (var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>())
             {
                 weakForward = RecordUnpooledEntry(tape, x);
-                // Simulate >256 MB of device allocations inside an open tape: must defer to tape.Dispose()
+                // Device allocations inside an open tape below the in-tape threshold defer to tape.Dispose()
                 // rather than running a mid-step GC while _entries still roots unpooled.
-                DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectNowAfterDeviceBytes);
+                DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectInsideTapeAfterDeviceBytes - 1);
                 Assert.True(DeviceMemoryReclaim.CollectionDue);
             }
             return weakForward;

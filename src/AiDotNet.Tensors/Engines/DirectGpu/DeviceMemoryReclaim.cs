@@ -91,6 +91,17 @@ internal static class DeviceMemoryReclaim
     internal const long CollectNowAfterDeviceBytes = 4 * CollectAfterDeviceBytes;
 
     /// <summary>
+    /// Device bytes handed out inside an open gradient tape past which a backend collects on the spot anyway. Below it a
+    /// tape waits for its step boundary, but a step's dead results stay allocated until some collection runs. Waiting for
+    /// the boundary held every dead intermediate of a 24M-parameter GatedDeltaNet/MoE LM step (batch 16 x 256, RTX 3080
+    /// 12 GB, 120 steps): 9.6-12.0 GB on the device, and when the stream-ordered pool outgrew it WDDM paged (189 s
+    /// instead of 59 s). A 1 GB threshold still peaked at 9.8-9.9 GB; this one at 7.6-7.9 GB, 59 s, identical losses.
+    /// A result the tape still holds is promoted by such a collection; the cumulative Gen-2 count returns it at a later
+    /// step boundary (StepBoundary_CumulativeMultiStepAllocations_ReclaimsGen2PromotedWrappers).
+    /// </summary>
+    internal const long CollectInsideTapeAfterDeviceBytes = CollectNowAfterDeviceBytes;
+
+    /// <summary>
     /// Cumulative unreleased device bytes across steps past which the step-boundary sweep upgrades from Gen 1 to Gen 2.
     /// Ephemeral managed-heap Gen-1 collections during an open <c>GradientTape</c> can promote live forward device-buffer
     /// wrappers into Gen 2; tracking cumulative unreleased bytes separately from the per-step Gen-1 counter prevents
@@ -156,7 +167,9 @@ internal static class DeviceMemoryReclaim
         long since = Interlocked.Add(ref s_driverBytesSinceCollection, bytes);
         long sinceGen2 = Interlocked.Add(ref s_driverBytesSinceGen2Collection, bytes);
         if (since < CollectAfterDeviceBytes && sinceGen2 < CollectGen2AfterDeviceBytes) return epoch;
-        if ((since < CollectNowAfterDeviceBytes && sinceGen2 < CollectGen2AfterDeviceBytes) || TapeOpen())
+        bool waitForBoundary = TapeOpen() ? since < CollectInsideTapeAfterDeviceBytes
+            : since < CollectNowAfterDeviceBytes && sinceGen2 < CollectGen2AfterDeviceBytes;
+        if (waitForBoundary)
         {
             Volatile.Write(ref s_collectionDue, 1);
             return epoch;
