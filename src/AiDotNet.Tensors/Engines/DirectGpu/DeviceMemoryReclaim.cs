@@ -111,6 +111,10 @@ internal static class DeviceMemoryReclaim
 
     private static int s_collectionDue;
 
+    // Set by a collection that ran inside an open tape. What the tape still held survived it and was promoted, so the
+    // step boundary must still collect, and through Gen 2, once the tape has released those owners.
+    private static int s_survivorsPromotedInsideTape;
+
     /// <summary>Whether a backend has asked for a collection at the next step or inference boundary.</summary>
     internal static bool CollectionDue => Volatile.Read(ref s_collectionDue) != 0;
 
@@ -120,6 +124,7 @@ internal static class DeviceMemoryReclaim
         ResetDeviceBytes(resetGen2: true);
         Interlocked.Exchange(ref s_allocationsSinceCollection, 0);
         Volatile.Write(ref s_collectionDue, 0);
+        Volatile.Write(ref s_survivorsPromotedInsideTape, 0);
     }
     // Device bytes handed out since the last collection, across every backend: one collection serves them all.
     private static long s_driverBytesSinceCollection;
@@ -167,7 +172,8 @@ internal static class DeviceMemoryReclaim
         long since = Interlocked.Add(ref s_driverBytesSinceCollection, bytes);
         long sinceGen2 = Interlocked.Add(ref s_driverBytesSinceGen2Collection, bytes);
         if (since < CollectAfterDeviceBytes && sinceGen2 < CollectGen2AfterDeviceBytes) return epoch;
-        bool waitForBoundary = TapeOpen() ? since < CollectInsideTapeAfterDeviceBytes
+        bool tapeOpen = TapeOpen();
+        bool waitForBoundary = tapeOpen ? since < CollectInsideTapeAfterDeviceBytes
             : since < CollectNowAfterDeviceBytes && sinceGen2 < CollectGen2AfterDeviceBytes;
         if (waitForBoundary)
         {
@@ -177,7 +183,17 @@ internal static class DeviceMemoryReclaim
         bool gen2 = sinceGen2 >= CollectGen2AfterDeviceBytes;
         ResetDeviceBytes(resetGen2: gen2);
         Interlocked.Exchange(ref s_allocationsSinceCollection, 0);
-        Volatile.Write(ref s_collectionDue, 0);
+        if (tapeOpen)
+        {
+            // The step's dead results go now; the owners its tape still holds survive (promoted) and are freed by the
+            // boundary collection once the tape releases them.
+            Volatile.Write(ref s_survivorsPromotedInsideTape, 1);
+            Volatile.Write(ref s_collectionDue, 1);
+        }
+        else
+        {
+            Volatile.Write(ref s_collectionDue, 0);
+        }
         GC.Collect(gen2 ? 2 : 1, GCCollectionMode.Forced, blocking: true);
         GC.WaitForPendingFinalizers();
         return epoch;
@@ -287,8 +303,10 @@ internal static class DeviceMemoryReclaim
         // that way and no buffer was ever finalized, yet a blocking collection ran on every call.
         long bytes = Volatile.Read(ref s_driverBytesSinceCollection);
         long gen2Bytes = Volatile.Read(ref s_driverBytesSinceGen2Collection);
-        if (bytes < CollectAfterDeviceBytes && gen2Bytes < CollectGen2AfterDeviceBytes) return false;
-        bool gen2 = gen2Bytes >= CollectGen2AfterDeviceBytes;
+        // An in-tape collection promoted what the tape held: only a Gen-2 collection reaches those owners now.
+        bool promoted = Interlocked.Exchange(ref s_survivorsPromotedInsideTape, 0) != 0;
+        if (!promoted && bytes < CollectAfterDeviceBytes && gen2Bytes < CollectGen2AfterDeviceBytes) return false;
+        bool gen2 = promoted || gen2Bytes >= CollectGen2AfterDeviceBytes;
         ResetDeviceBytes(resetGen2: gen2);
         Interlocked.Exchange(ref s_allocationsSinceCollection, 0);
         // Normal managed-heap Gen-0/Gen-1 collections during a multi-layer training step promote early forward
@@ -306,6 +324,7 @@ internal static class DeviceMemoryReclaim
         ResetDeviceBytes(resetGen2: true);
         Interlocked.Exchange(ref s_allocationsSinceCollection, 0);
         Volatile.Write(ref s_collectionDue, 0);
+        Volatile.Write(ref s_survivorsPromotedInsideTape, 0);
         GC.Collect();
         GC.WaitForPendingFinalizers();
         GC.Collect();
