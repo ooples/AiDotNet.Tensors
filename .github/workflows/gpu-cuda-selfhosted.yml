@@ -261,13 +261,40 @@ jobs:
         # then names the CUDA runtime call that failed, which the exception does not.
         CUDNN_LOGERR_DBG: '1'
         CUDNN_LOGDEST_DBG: ${{ runner.temp }}/trx/cudnn-errors.log
+        # Blame dumps a test host only when no test starts or finishes for 15 minutes. Two runs on 2026-11-08 sat in
+        # this step past two hours without it firing, and the job timeout then cancelled the job, which skips the
+        # failure-only stack step below. The watchdog bounds the step instead: past the limit it prints each test
+        # host's managed stacks and the processes under the runner, then fails the step so the steps below still run.
+        # Passing runs take 78 to 101 minutes here.
+        SUITE_WATCHDOG_MINUTES: '120'
       run: |
         New-Item -ItemType Directory -Force "${{ runner.temp }}/trx" | Out-Null
-        dotnet test AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj `
-          --configuration Release --no-build --framework net10.0 `
-          --filter ($env:CUDA_LANE_FILTER -replace "\s", "") `
-          --results-directory "${{ runner.temp }}/trx" --logger "trx;LogFileName=cuda.trx" `
-          --blame-hang --blame-hang-timeout 900s --blame-crash
+        $filter = $env:CUDA_LANE_FILTER -replace "\s", ""
+        $testArgs = 'test AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj ' +
+          '--configuration Release --no-build --framework net10.0 ' +
+          "--filter `"$filter`" " +
+          "--results-directory `"${{ runner.temp }}/trx`" --logger `"trx;LogFileName=cuda.trx`" " +
+          '--blame-hang --blame-hang-timeout 900s --blame-crash'
+        $run = Start-Process dotnet -ArgumentList $testArgs -NoNewWindow -PassThru
+        $null = $run.Handle   # cache the handle so ExitCode is readable after the process exits
+        if ($run.WaitForExit([int]$env:SUITE_WATCHDOG_MINUTES * 60 * 1000)) { exit $run.ExitCode }
+
+        Write-Output "::error::The GPU suites were still running after $env:SUITE_WATCHDOG_MINUTES minutes."
+        Write-Output "::group::Processes"
+        Get-CimInstance Win32_Process |
+          Where-Object { $_.Name -match '^(testhost|dotnet|python)' } |
+          Format-Table ProcessId, ParentProcessId, Name, CommandLine -AutoSize -Wrap | Out-String -Width 400
+        Write-Output "::endgroup::"
+        $tools = "${{ runner.temp }}/dotnet-stack"
+        dotnet tool install dotnet-stack --tool-path $tools | Out-Null
+        foreach ($testHost in @(Get-Process -Name testhost* -ErrorAction SilentlyContinue)) {
+          Write-Output "::group::Managed stacks of testhost $($testHost.Id)"
+          & "$tools/dotnet-stack" report -p $testHost.Id
+          if ($LASTEXITCODE -ne 0) { Write-Output "::warning::dotnet-stack failed ($LASTEXITCODE) on $($testHost.Id)." }
+          Write-Output "::endgroup::"
+        }
+        taskkill /T /F /PID $run.Id | Out-Null
+        exit 1
       # With --blame the TRX logger ignores LogFilePath and writes under the project's TestResults; the results
       # directory puts the TRX and any crash or hang dump where the skip check and the upload look.
 
