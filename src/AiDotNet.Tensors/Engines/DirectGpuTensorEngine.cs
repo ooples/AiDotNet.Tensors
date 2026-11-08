@@ -13608,6 +13608,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (n <= 0 || vocab <= 0 || weight.Shape._dims[0] != d || bias.Length != vocab || targetIds.Length != n)
             return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, targetIds);
 
+        // A captured graph replays the device work it recorded, not this call: host-backed ids uploaded now would be
+        // replayed as this batch's labels on every later step. Refusing the capture makes a compiled step fall back to
+        // eager execution, where every call uploads its own ids.
+        bool capturing = backend is IGpuGraphCapture capture && capture.IsStreamCapturing();
+        if (capturing && !HasResidentIndexStorage(targetIds))
+            throw new NotSupportedException(
+                "FusedLinearCrossEntropyWithLogits cannot be captured with host-backed target ids: replay would reuse " +
+                "the labels of the captured batch. Keep the ids resident on the device to capture this step.");
+
         try
         {
             if (!HasResidentIndexStorage(targetIds))
@@ -13623,10 +13632,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var wB = GetOrAllocateBuffer(backend, weight);
             using var bB = GetOrAllocateBuffer(backend, bias);
             using var loss = AllocateOutputBuffer(backend, 1);
-            // The chunked forward builds its gather positions on the host. Resident ids are read only when the tape
-            // downloads them below anyway; otherwise (a captured step) they stay on the device for the fused kernel.
+            // The chunked forward builds its gather positions on the host, so it never runs inside a capture (the upload
+            // would be baked into the graph). Resident ids are read only when the tape downloads them below anyway;
+            // otherwise they stay on the device for the fused kernel.
             bool chunked = false;
-            if (!HasResidentIndexStorage(targetIds) || IsTapeActive<T>())
+            if (!capturing && (!HasResidentIndexStorage(targetIds) || IsTapeActive<T>()))
             {
                 try
                 {

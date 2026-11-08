@@ -1040,6 +1040,23 @@ public class GpuTapeGradientParityTests : IDisposable
         }
     }
 
+    // A captured graph replays the device work it recorded: host ids uploaded during capture would be replayed as the
+    // captured batch's labels on every later step, so the capture is refused instead (the compiled step runs eagerly).
+    [SkippableFact]
+    public void FusedLinearCrossEntropy_index_refuses_capture_with_host_target_ids()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu!)
+        {
+            var capture = gpu.GetBackend() as AiDotNet.Tensors.Engines.DirectGpu.IGpuGraphCapture;
+            Skip.IfNot(capture is { SupportsGraphCapture: true }, "The backend has no stream capture.");
+            gpu.FusedLinearCrossEntropyWithLogits(ChunkHidden, ChunkWeight, ChunkBias, ChunkTargetIds);   // warm-up
+            var refused = Assert.Throws<NotSupportedException>(() => capture.CaptureGraph(
+                () => gpu.FusedLinearCrossEntropyWithLogits(ChunkHidden, ChunkWeight, ChunkBias, ChunkTargetIds)));
+            Assert.Contains("host-backed target ids", refused.Message);
+        }
+    }
+
     [SkippableFact]
     public void FusedLinearCrossEntropy_stays_on_the_device_while_a_tape_records() =>
         AssertStaysOnDeviceUnderTape("FusedLinearCrossEntropy",
