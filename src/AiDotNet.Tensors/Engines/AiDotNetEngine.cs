@@ -42,6 +42,10 @@ public static class AiDotNetEngine
     private static DirectGpuTensorEngine? _adoptedGpu;
     private static readonly object _adoptionLock = new object();
 
+    // True while Current holds an engine the caller assigned through the setter, as opposed to the startup CPU engine,
+    // one auto-detection adopted, or one a reset/release installed. Written under _adoptionLock with every write of Current.
+    private static bool _callerAssigned;
+
     /// <summary>
     /// Static constructor initializes with CPU engine by default.
     /// </summary>
@@ -91,9 +95,28 @@ public static class AiDotNetEngine
             lock (_adoptionLock)
             {
                 Volatile.Write(ref _current, value);
+                // Handing back the engine auto-detection adopted (a test restoring a saved engine) is not a choice.
+                Volatile.Write(ref _callerAssigned, !ReferenceEquals(value, _adoptedGpu));
             }
         }
     }
+
+    /// <summary>
+    /// Gets whether <see cref="Current"/> holds an engine the caller assigned through its setter, rather than the
+    /// startup CPU engine, an engine <see cref="AutoDetectAndConfigureGpu(bool)"/> adopted, or the CPU engine
+    /// <see cref="ResetToCpu"/> installed.
+    /// </summary>
+    /// <remarks>
+    /// A caller-assigned engine is an explicit choice. Code that auto-detects hardware only as a default (for example a
+    /// model builder with no GPU configuration) should leave it in place instead of calling
+    /// <see cref="AutoDetectAndConfigureGpu(bool)"/>, which adopts the GPU whenever one passes its probe. An explicit
+    /// call to <see cref="AutoDetectAndConfigureGpu(bool)"/> that installs an engine (a new or previously adopted GPU
+    /// engine, or the CPU engine once the circuit breaker has tripped) clears this flag. When <see cref="Current"/>
+    /// already is a GPU-capable <see cref="DirectGpuTensorEngine"/>, the call keeps that engine and leaves the flag as it
+    /// was, so a GPU engine the caller assigned stays caller-assigned. The flag is also cleared when the GPU circuit
+    /// breaker replaces a GPU engine with the CPU engine.
+    /// </remarks>
+    public static bool IsCallerAssigned => Volatile.Read(ref _callerAssigned);
 
     /// <summary>
     /// User-configurable log sink for engine-level events (GPU auto-detect status,
@@ -232,6 +255,7 @@ public static class AiDotNetEngine
             if (parked is not null && !parked.IsDisposed && parked.SupportsGpu)
             {
                 Volatile.Write(ref _current, parked);
+                Volatile.Write(ref _callerAssigned, false);
                 return true;
             }
         }
@@ -251,11 +275,13 @@ public static class AiDotNetEngine
                     {
                         gpuEngine.Dispose();
                         Volatile.Write(ref _current, winner);
+                        Volatile.Write(ref _callerAssigned, false);
                         return true;
                     }
 
                     _adoptedGpu = gpuEngine;
                     Volatile.Write(ref _current, gpuEngine);
+                    Volatile.Write(ref _callerAssigned, false);
                 }
                 TryRegisterGpuOffloadAllocator(gpuEngine, verbose);
                 EmitLog($"[AiDotNet] GPU acceleration enabled: {gpuEngine.Name}", verbose);
@@ -415,6 +441,8 @@ public static class AiDotNetEngine
         lock (_adoptionLock)
         {
             var observed = Volatile.Read(ref _current);
+            // A reset hands the choice back to the library either way, also when it keeps a plain CPU engine.
+            Volatile.Write(ref _callerAssigned, false);
             if (observed is not null && observed.GetType() == typeof(CpuEngine)) return;
             Volatile.Write(ref _current, new CpuEngine());
             if (observed is DirectGpuTensorEngine gpu && ReferenceEquals(gpu, _adoptedGpu)) parked = gpu;
@@ -463,7 +491,11 @@ public static class AiDotNetEngine
             engine = _adoptedGpu;
             if (engine is null) return false;
             _adoptedGpu = null;
-            if (ReferenceEquals(Volatile.Read(ref _current), engine)) Volatile.Write(ref _current, new CpuEngine());
+            if (ReferenceEquals(Volatile.Read(ref _current), engine))
+            {
+                Volatile.Write(ref _current, new CpuEngine());
+                Volatile.Write(ref _callerAssigned, false);
+            }
         }
 
         // A context the circuit breaker found corrupted is never torn down (a teardown on it can fault the process);
@@ -521,6 +553,9 @@ public static class AiDotNetEngine
 
     private static volatile bool _gpuCircuitBroken;
 
+    /// <summary>Re-arms the circuit breaker so a test can trip it without leaving the process on the CPU.</summary>
+    internal static void ResetGpuCircuitBreakerForTests() => _gpuCircuitBroken = false;
+
     /// <summary>True once a sticky CUDA fault has forced a permanent CPU fallback for this process.</summary>
     public static bool GpuCircuitBroken => _gpuCircuitBroken;
 
@@ -541,15 +576,20 @@ public static class AiDotNetEngine
         _gpuCircuitBroken = true;
         try
         {
-            if (_current is DirectGpuTensorEngine)
+            lock (_adoptionLock)
             {
-                // Deliberately do NOT Dispose() the demoted engine here (unlike SwitchToCpuEngine).
-                // This runs from inside a CUDA fault handler on an already-corrupted context; calling
-                // cuCtxDestroy/cuMemFree on a dead context can raise an uncatchable native 0xC0000005,
-                // crashing the very process the breaker is trying to keep alive on CPU. The breaker
-                // trips at most once per process, so leaking this one context until process exit (the
-                // OS reclaims it) is the strictly safer trade than risking a fatal teardown.
-                _current = new CpuEngine();
+                if (Volatile.Read(ref _current) is DirectGpuTensorEngine)
+                {
+                    // Deliberately do NOT Dispose() the demoted engine here (unlike SwitchToCpuEngine).
+                    // This runs from inside a CUDA fault handler on an already-corrupted context; calling
+                    // cuCtxDestroy/cuMemFree on a dead context can raise an uncatchable native 0xC0000005,
+                    // crashing the very process the breaker is trying to keep alive on CPU. The breaker
+                    // trips at most once per process, so leaking this one context until process exit (the
+                    // OS reclaims it) is the strictly safer trade than risking a fatal teardown.
+                    Volatile.Write(ref _current, new CpuEngine());
+                    // The library installed this CPU engine, even when the GPU it replaced was the caller's.
+                    Volatile.Write(ref _callerAssigned, false);
+                }
             }
         }
         catch
