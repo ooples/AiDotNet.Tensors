@@ -64,4 +64,30 @@ public class ResetToCpuGpuEngineTests
             AiDotNetEngine.Current = saved;
         }
     }
+
+    /// <summary>
+    /// Auto-detection clears the caller's choice, and handing back the engine it adopted (a test restoring a saved
+    /// engine) does not count as one: only an engine the library did not adopt is the caller's.
+    /// </summary>
+    [SkippableFact]
+    public void Adoption_clears_the_caller_choice_and_reassigning_the_adopted_engine_is_not_one()
+    {
+        var saved = AiDotNetEngine.Current;
+        try
+        {
+            AiDotNetEngine.Current = new CpuEngine();
+            Assert.True(AiDotNetEngine.IsCallerAssigned);
+            Skip.IfNot(AiDotNetEngine.AutoDetectAndConfigureGpu(verbose: false), "No GPU was adopted");
+            var adopted = Assert.IsType<DirectGpuTensorEngine>(AiDotNetEngine.Current);
+            Assert.False(AiDotNetEngine.IsCallerAssigned);
+
+            AiDotNetEngine.Current = new CpuEngine();
+            AiDotNetEngine.Current = adopted;
+            Assert.False(AiDotNetEngine.IsCallerAssigned);
+        }
+        finally
+        {
+            AiDotNetEngine.Current = saved;
+        }
+    }
 }

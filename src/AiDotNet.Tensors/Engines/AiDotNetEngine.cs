@@ -42,6 +42,10 @@ public static class AiDotNetEngine
     private static DirectGpuTensorEngine? _adoptedGpu;
     private static readonly object _adoptionLock = new object();
 
+    // True while Current holds an engine the caller assigned through the setter, as opposed to the startup CPU engine,
+    // one auto-detection adopted, or one a reset/release installed. Written under _adoptionLock with every write of Current.
+    private static bool _callerAssigned;
+
     /// <summary>
     /// Static constructor initializes with CPU engine by default.
     /// </summary>
@@ -91,9 +95,24 @@ public static class AiDotNetEngine
             lock (_adoptionLock)
             {
                 Volatile.Write(ref _current, value);
+                // Handing back the engine auto-detection adopted (a test restoring a saved engine) is not a choice.
+                Volatile.Write(ref _callerAssigned, !ReferenceEquals(value, _adoptedGpu));
             }
         }
     }
+
+    /// <summary>
+    /// Gets whether <see cref="Current"/> holds an engine the caller assigned through its setter, rather than the
+    /// startup CPU engine, an engine <see cref="AutoDetectAndConfigureGpu(bool)"/> adopted, or the CPU engine
+    /// <see cref="ResetToCpu"/> installed.
+    /// </summary>
+    /// <remarks>
+    /// A caller-assigned engine is an explicit choice. Code that auto-detects hardware only as a default (for example a
+    /// model builder with no GPU configuration) should leave it in place instead of calling
+    /// <see cref="AutoDetectAndConfigureGpu(bool)"/>, which adopts the GPU whenever one passes its probe. An explicit
+    /// call to <see cref="AutoDetectAndConfigureGpu(bool)"/> still adopts the GPU and clears this flag.
+    /// </remarks>
+    public static bool IsCallerAssigned => Volatile.Read(ref _callerAssigned);
 
     /// <summary>
     /// User-configurable log sink for engine-level events (GPU auto-detect status,
@@ -232,6 +251,7 @@ public static class AiDotNetEngine
             if (parked is not null && !parked.IsDisposed && parked.SupportsGpu)
             {
                 Volatile.Write(ref _current, parked);
+                Volatile.Write(ref _callerAssigned, false);
                 return true;
             }
         }
@@ -251,11 +271,13 @@ public static class AiDotNetEngine
                     {
                         gpuEngine.Dispose();
                         Volatile.Write(ref _current, winner);
+                        Volatile.Write(ref _callerAssigned, false);
                         return true;
                     }
 
                     _adoptedGpu = gpuEngine;
                     Volatile.Write(ref _current, gpuEngine);
+                    Volatile.Write(ref _callerAssigned, false);
                 }
                 TryRegisterGpuOffloadAllocator(gpuEngine, verbose);
                 EmitLog($"[AiDotNet] GPU acceleration enabled: {gpuEngine.Name}", verbose);
@@ -415,6 +437,8 @@ public static class AiDotNetEngine
         lock (_adoptionLock)
         {
             var observed = Volatile.Read(ref _current);
+            // A reset hands the choice back to the library either way, also when it keeps a plain CPU engine.
+            Volatile.Write(ref _callerAssigned, false);
             if (observed is not null && observed.GetType() == typeof(CpuEngine)) return;
             Volatile.Write(ref _current, new CpuEngine());
             if (observed is DirectGpuTensorEngine gpu && ReferenceEquals(gpu, _adoptedGpu)) parked = gpu;
@@ -463,7 +487,11 @@ public static class AiDotNetEngine
             engine = _adoptedGpu;
             if (engine is null) return false;
             _adoptedGpu = null;
-            if (ReferenceEquals(Volatile.Read(ref _current), engine)) Volatile.Write(ref _current, new CpuEngine());
+            if (ReferenceEquals(Volatile.Read(ref _current), engine))
+            {
+                Volatile.Write(ref _current, new CpuEngine());
+                Volatile.Write(ref _callerAssigned, false);
+            }
         }
 
         // A context the circuit breaker found corrupted is never torn down (a teardown on it can fault the process);
