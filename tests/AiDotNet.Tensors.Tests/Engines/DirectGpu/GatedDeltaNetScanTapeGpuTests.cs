@@ -168,6 +168,83 @@ public sealed class GatedDeltaNetScanTapeGpuTests : IClassFixture<DirectGpuTenso
         }
     }
 
+    /// <summary>
+    /// Second order: under <c>createGraph</c> the scan's gradients are differentiated again. The gradient of
+    /// <c>s = sum_i &lt;dLoss/dx_i, w_i&gt;</c> is checked against central differences of <c>s</c>, which is computed
+    /// from first-order gradients (themselves checked above). The fused backward records nothing, so before it
+    /// was given a recorded form every second derivative through the scan came out missing.
+    /// </summary>
+    [Fact]
+    public void CreateGraphGradients_DifferentiateAgain_AndMatchFiniteDifferences()
+    {
+        var cpu = new CpuEngine();
+        int batch = 1, seqLen = 4, modelDim = 4, numHeads = 2;
+        int[] shape = [batch, seqLen, modelDim];
+        int[] gateShape = [batch, seqLen, numHeads];
+        var inputs = new[]
+        {
+            ToDouble(Rand(shape, 41)),
+            ToDouble(Rand(shape, 42)),
+            ToDouble(Rand(shape, 43)),
+            ToDouble(Rand(gateShape, 44, gate: true)),
+            ToDouble(Rand(gateShape, 45, gate: true))
+        };
+        var r = ToDouble(Rand(shape, 46));
+        var w = new[]
+        {
+            ToDouble(Rand(shape, 47)), ToDouble(Rand(shape, 48)), ToDouble(Rand(shape, 49)),
+            ToDouble(Rand(gateShape, 50)), ToDouble(Rand(gateShape, 51))
+        };
+
+        Tensor<double> Weighted(Dictionary<Tensor<double>, Tensor<double>> grads)
+        {
+            Tensor<double>? s = null;
+            for (int i = 0; i < 5; i++)
+            {
+                var term = cpu.ReduceSum(cpu.TensorMultiply(grads[inputs[i]], w[i]), [0, 1, 2], keepDims: false);
+                s = s is null ? term : cpu.TensorAdd(s, term);
+            }
+            return s ?? throw new InvalidOperationException("No gradient terms.");
+        }
+
+        double FirstOrder()
+        {
+            using var tape = new GradientTape<double>();
+            var output = cpu.GatedDeltaNetScanForward(inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], numHeads);
+            var loss = cpu.ReduceSum(cpu.TensorMultiply(output, r), [0, 1, 2], keepDims: false);
+            return Weighted(tape.ComputeGradients(loss, inputs))[0];
+        }
+
+        Dictionary<Tensor<double>, Tensor<double>> second;
+        using (var tape = new GradientTape<double>(new GradientTapeOptions { Persistent = true }))
+        {
+            var output = cpu.GatedDeltaNetScanForward(inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], numHeads);
+            var loss = cpu.ReduceSum(cpu.TensorMultiply(output, r), [0, 1, 2], keepDims: false);
+            var first = tape.ComputeGradients(loss, inputs, createGraph: true);
+            second = tape.ComputeGradients(Weighted(first), inputs);
+        }
+
+        const double h = 1e-5;
+        string[] names = ["Q", "K", "V", "Alpha", "Beta"];
+        for (int i = 0; i < 5; i++)
+        {
+            Assert.True(second.ContainsKey(inputs[i]), $"no second-order gradient reached {names[i]}");
+            var analytic = second[inputs[i]].ToArray();
+            for (int j = 0; j < inputs[i].Length; j++)
+            {
+                double saved = inputs[i][j];
+                inputs[i][j] = saved + h;
+                double plus = FirstOrder();
+                inputs[i][j] = saved - h;
+                double minus = FirstOrder();
+                inputs[i][j] = saved;
+                double numeric = (plus - minus) / (2 * h);
+                Assert.True(Math.Abs(numeric - analytic[j]) <= 1e-5 * Math.Max(1.0, Math.Abs(numeric)),
+                    $"d2/d{names[i]}[{j}]: analytic {analytic[j]}, finite difference {numeric}");
+            }
+        }
+    }
+
     private static Tensor<double> ToDouble(Tensor<float> f)
     {
         var d = new Tensor<double>(f.Shape.ToArray());
