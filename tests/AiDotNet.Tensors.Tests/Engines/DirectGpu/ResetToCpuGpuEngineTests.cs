@@ -90,4 +90,33 @@ public class ResetToCpuGpuEngineTests
             AiDotNetEngine.Current = saved;
         }
     }
+
+    /// <summary>
+    /// The circuit breaker installs the CPU engine itself, so a GPU engine the caller had assigned stops counting as the
+    /// caller's choice: the CPU engine it leaves behind was never chosen.
+    /// </summary>
+    [SkippableFact]
+    public void Tripping_the_breaker_over_a_caller_assigned_gpu_clears_the_caller_choice()
+    {
+        Skip.If(AiDotNetEngine.GpuCircuitBroken, "The breaker already tripped in this process.");
+        var saved = AiDotNetEngine.Current;
+        var gpu = new DirectGpuTensorEngine();
+        try
+        {
+            Skip.IfNot(gpu.SupportsGpu, "No GPU backend resolved.");
+            AiDotNetEngine.Current = gpu;
+            Assert.True(AiDotNetEngine.IsCallerAssigned);
+
+            AiDotNetEngine.TripGpuCircuitBreaker("test", 700);
+
+            Assert.IsType<CpuEngine>(AiDotNetEngine.Current);
+            Assert.False(AiDotNetEngine.IsCallerAssigned);
+        }
+        finally
+        {
+            AiDotNetEngine.ResetGpuCircuitBreakerForTests();
+            AiDotNetEngine.Current = saved;
+            gpu.Dispose();
+        }
+    }
 }
