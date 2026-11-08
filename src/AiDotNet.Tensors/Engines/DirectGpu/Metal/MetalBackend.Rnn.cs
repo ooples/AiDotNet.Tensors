@@ -92,23 +92,36 @@ public partial class MetalBackend : IGatedDeltaNetBackwardBackend
             throw new ArgumentOutOfRangeException(nameof(batch), "GatedDeltaNet dimensions must be positive.");
         if (modelDim != numHeads * headDim || headDim > 256)
             throw new ArgumentException($"Invalid GatedDeltaNet head layout (modelDim={modelDim}, numHeads={numHeads}, headDim={headDim}).");
+        GatedDeltaNetBackwardResolver.ValidateBuffers(dOut, q, k, v, alpha, beta, dQ, dK, dV, dAlpha, dBeta, batch, seqLen, modelDim, numHeads);
         int hh = headDim * headDim;
         long totalLong = checked((long)batch * numHeads * headDim);
         long trajLenLong = checked((long)batch * numHeads * seqLen * hh);
         if (totalLong > int.MaxValue || trajLenLong > int.MaxValue)
             throw new ArgumentOutOfRangeException(nameof(batch), "GatedDeltaNet dimensions exceed Metal launch/buffer limits.");
         int total = (int)totalLong;
-        Fill(dQ, 0f, batch * seqLen * modelDim);
-        Fill(dK, 0f, batch * seqLen * modelDim);
-        Fill(dAlpha, 0f, batch * seqLen * numHeads);
-        Fill(dBeta, 0f, batch * seqLen * numHeads);
+        int n = batch * seqLen * modelDim;
+        var dims = new[] { batch, seqLen, modelDim, numHeads, headDim };
         using var traj = AllocateBuffer((int)trajLenLong);
         DispatchRecurrence("gated_delta_scan_recompute", total,
-            new[] { M(k), M(v), M(alpha), M(beta), M(traj) },
-            new[] { batch, seqLen, modelDim, numHeads, headDim });
+            new[] { M(k), M(v), M(alpha), M(beta), M(traj) }, dims);
+        if (GpuDeterminism.IsActive)
+        {
+            // Fixed-order reduction instead of CAS accumulation (see gated_delta_scan_backward_det); every gradient
+            // element is written, so nothing needs clearing first.
+            using var partials = AllocateBuffer(checked(2 * n));
+            DispatchRecurrence("gated_delta_scan_dq", n, new[] { M(dOut), M(traj), M(dQ) }, dims);
+            DispatchRecurrence("gated_delta_scan_backward_det", total,
+                new[] { M(dOut), M(q), M(k), M(v), M(alpha), M(beta), M(traj), M(partials), M(dV) }, dims);
+            DispatchRecurrence("gated_delta_scan_reduce", n,
+                new[] { M(traj), M(partials), M(dK), M(dAlpha), M(dBeta) }, dims);
+            return;
+        }
+        Fill(dQ, 0f, n);
+        Fill(dK, 0f, n);
+        Fill(dAlpha, 0f, batch * seqLen * numHeads);
+        Fill(dBeta, 0f, batch * seqLen * numHeads);
         DispatchRecurrence("gated_delta_scan_backward", total,
-            new[] { M(dOut), M(q), M(k), M(v), M(alpha), M(beta), M(traj), M(dQ), M(dK), M(dV), M(dAlpha), M(dBeta) },
-            new[] { batch, seqLen, modelDim, numHeads, headDim });
+            new[] { M(dOut), M(q), M(k), M(v), M(alpha), M(beta), M(traj), M(dQ), M(dK), M(dV), M(dAlpha), M(dBeta) }, dims);
     }
 
     public void RgLruScanForward(

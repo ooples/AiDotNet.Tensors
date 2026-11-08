@@ -295,6 +295,8 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     ~VulkanGpuBuffer()
     {
         if (System.Threading.Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        long charge = System.Threading.Interlocked.Exchange(ref _reclaimCharge, 0);
+        DeviceMemoryReclaim.OnDeviceFinalized(charge, _reclaimEpoch);
         var storage = Storage;
         var staging = Staging;
         int size = Size;

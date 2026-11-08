@@ -2226,8 +2226,10 @@ layout(push_constant) uniform Params { uint size; };
 void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= size) return;
-    float x = bdata[idx];
-    c[idx] = -a[idx] / (x * x);
+    // b is the reciprocal OUTPUT y = 1/x, so d(1/x)/dx = -1/x^2 = -y^2 (#775, #1680).
+    float y = bdata[idx];
+    // g * y first: y * y overflows float for |y| > 1.8e19 even when the derivative g * y^2 does not.
+    c[idx] = -(a[idx] * y) * y;
 }";
 
     public static string VarBackwardGlsl => Header + FourBufferLayout + @"

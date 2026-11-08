@@ -1112,7 +1112,8 @@ __kernel void threshold_backward(__global const float* gradOutput, __global cons
 __kernel void reciprocal_backward(__global const float* gradOutput, __global const float* input, __global float* gradInput, const int size)
 {
     const int idx = get_global_id(0); if (idx >= size) return;
-    float y = input[idx]; gradInput[idx] = -gradOutput[idx] * (y * y);
+    // g * y first: y * y overflows float for |y| > 1.8e19 even when the derivative g * y^2 does not.
+    float y = input[idx]; gradInput[idx] = -(gradOutput[idx] * y) * y;
 }
 
 __kernel void var_backward(__global const float* gradOutput, __global const float* input, __global const float* mean, __global float* gradInput, const int outerSize, const int reduceSize)

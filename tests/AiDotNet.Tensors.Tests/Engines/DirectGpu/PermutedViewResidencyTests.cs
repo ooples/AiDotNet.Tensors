@@ -2,6 +2,7 @@
 
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -32,9 +33,9 @@ public sealed class PermutedViewResidencyTests : IClassFixture<DirectGpuTensorEn
     public void PermutedViewOfResidentResult_IsPermutedOnTheDevice(int[] shape, int[] axes)
     {
         Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
-        IEngine gpu = _fixture.Engine!;
+        IEngine gpu = _fixture.Engine ?? throw new InvalidOperationException("The GPU fixture reported a device but has no engine.");
         var cpu = new CpuEngine();
-        var rng = new Random(3);
+        var rng = RandomHelper.CreateSeededRandom(3);
         var x = new Tensor<float>(shape);
         for (int i = 0; i < x.Length; i++) x[i] = (float)(rng.NextDouble() * 2 - 1);
         var expected = cpu.TensorMultiplyScalar(cpu.TensorPermute(cpu.TensorTanh(x), axes), 2f).ToArray();
@@ -72,9 +73,9 @@ public sealed class PermutedViewResidencyTests : IClassFixture<DirectGpuTensorEn
     public void HeadSplitViewOfMatMulResult_IsPermutedOnTheDevice()
     {
         Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
-        IEngine gpu = _fixture.Engine!;
+        IEngine gpu = _fixture.Engine ?? throw new InvalidOperationException("The GPU fixture reported a device but has no engine.");
         var cpu = new CpuEngine();
-        var rng = new Random(8);
+        var rng = RandomHelper.CreateSeededRandom(8);
         var x = new Tensor<float>(new[] { 8, 12 });
         var w = new Tensor<float>(new[] { 12, 24 });
         for (int i = 0; i < x.Length; i++) x[i] = (float)(rng.NextDouble() * 2 - 1);
@@ -113,11 +114,11 @@ public sealed class PermutedViewResidencyTests : IClassFixture<DirectGpuTensorEn
     public void ReshapeOfPermutedView_StaysOnDevice_AndKeepsTheGradient()
     {
         Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
-        var gpu = _fixture.Engine!;
+        var gpu = _fixture.Engine ?? throw new InvalidOperationException("The GPU fixture reported a device but has no engine.");
         var previous = AiDotNetEngine.Current;
         try
         {
-            var rng = new Random(4);
+            var rng = RandomHelper.CreateSeededRandom(4);
             var x = new Tensor<float>(new[] { 2, 3, 4, 5 });
             for (int i = 0; i < x.Length; i++) x[i] = (float)(rng.NextDouble() * 2 - 1);
 
@@ -166,11 +167,11 @@ public sealed class PermutedViewResidencyTests : IClassFixture<DirectGpuTensorEn
     public void PermuteBackward_StaysOnTheDevice()
     {
         Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
-        var gpu = _fixture.Engine!;
+        var gpu = _fixture.Engine ?? throw new InvalidOperationException("The GPU fixture reported a device but has no engine.");
         var previous = AiDotNetEngine.Current;
         try
         {
-            var rng = new Random(12);
+            var rng = RandomHelper.CreateSeededRandom(12);
             var x = new Tensor<float>(new[] { 2, 3, 4, 5 });
             for (int i = 0; i < x.Length; i++) x[i] = (float)(rng.NextDouble() * 2 - 1);
             var weights = new Tensor<float>(new[] { 2, 4, 3, 5 });
@@ -217,12 +218,12 @@ public sealed class PermutedViewResidencyTests : IClassFixture<DirectGpuTensorEn
     public void PermutedViewOfPersistent3DWeight_StaysOnTheDevice_BeforeAndAfterOnDeviceOptimizerStep()
     {
         Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
-        var gpu = _fixture.Engine!;
+        var gpu = _fixture.Engine ?? throw new InvalidOperationException("The GPU fixture reported a device but has no engine.");
         var cpu = new CpuEngine();
         var previous = AiDotNetEngine.Current;
         try
         {
-            var rng = new Random(19);
+            var rng = RandomHelper.CreateSeededRandom(19);
             var x = new Tensor<float>(new[] { 4, 5, 6 });
             for (int i = 0; i < x.Length; i++) x[i] = (float)(rng.NextDouble() * 2 - 1);
             var wCpu = new Tensor<float>(new[] { 4, 6, 8 });
@@ -274,25 +275,39 @@ public sealed class PermutedViewResidencyTests : IClassFixture<DirectGpuTensorEn
                 var cpuGradXArr = cpuGradX.ToArray();
                 for (int i = 0; i < cpuGradXArr.Length; i++)
                     Assert.True(Math.Abs(cpuGradXArr[i] - gpuGradXArr[i]) < 1e-4f, $"step1 d/dx[{i}] cpu {cpuGradXArr[i]} gpu {gpuGradXArr[i]}");
+                AssertGradientsMatch(cpuGradW, gpuGradW, "step1 d/dW");
 
-                // Step 2: on-device optimizer updates wGpu in-place (DeviceAuthoritativeViewBase path)
-                if (AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TryAllocBf16MomentState(wGpu.Length, out mBuf, out vBuf) &&
-                    AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TryAdamBf16Step(
+                // Step 2: on-device optimizer updates wGpu in-place (DeviceAuthoritativeViewBase path). Every backend
+                // implements the compressed-moment optimizer, so a declined step is a failure, not a skip.
+                Assert.True(AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TryAllocBf16MomentState(wGpu.Length, out mBuf, out vBuf),
+                    "the bf16 moment state was not allocated on the device");
+                Assert.True(AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TryAdamBf16Step(
                         wGpu, gpuGradW, mBuf, vBuf, lr: 1e-2f, beta1: 0.9f, beta2: 0.999f,
-                        epsilon: 1e-8f, weightDecay: 0f, step: 1, decoupledWeightDecay: true))
+                        epsilon: 1e-8f, weightDecay: 0f, step: 1, decoupledWeightDecay: true),
+                    "the on-device Adam step declined");
+                long step2Readback;
+                string step2Sites;
+                Tensor<float> gpuGradW2;
+                using (var gpuTape2 = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>())
                 {
-                    long step2Readback;
-                    string step2Sites;
-                    using (var gpuTape2 = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>())
-                    {
-                        var gpuOut2 = gpu.BatchMatMul(x, wGpu);
-                        var gpuLoss2 = gpu.ReduceSum(gpuOut2, new[] { 0, 1, 2 }, keepDims: false);
-                        GpuLaunchProbe.Reset();
-                        _ = gpuTape2.ComputeGradients(gpuLoss2, new[] { x, wGpu });
-                        step2Readback = GpuLaunchProbe.ReadbackBytes;
-                        step2Sites = string.Join("; ", GpuLaunchProbe.ReadbackSites);
-                    }
-                    Assert.True(step2Readback <= 64, $"Step 2 BatchMatMul backward read back {step2Readback} bytes: {step2Sites}");
+                    var gpuOut2 = gpu.BatchMatMul(x, wGpu);
+                    var gpuLoss2 = gpu.ReduceSum(gpuOut2, new[] { 0, 1, 2 }, keepDims: false);
+                    GpuLaunchProbe.Reset();
+                    var grads2 = gpuTape2.ComputeGradients(gpuLoss2, new[] { x, wGpu });
+                    step2Readback = GpuLaunchProbe.ReadbackBytes;
+                    step2Sites = string.Join("; ", GpuLaunchProbe.ReadbackSites);
+                    gpuGradW2 = grads2[wGpu];
+                }
+                Assert.True(step2Readback <= 64, $"Step 2 BatchMatMul backward read back {step2Readback} bytes: {step2Sites}");
+
+                // The CPU reference for step 2 runs on a copy of the updated weight, taken only now so the copy's
+                // readback is outside the measured window.
+                AiDotNetEngine.Current = cpu;
+                var wUpdated = new Tensor<float>(wGpu.ToArray(), new[] { 4, 6, 8 });
+                using (var cpuTape2 = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>())
+                {
+                    var cpuLoss2 = cpu.ReduceSum(cpu.BatchMatMul(x, wUpdated), new[] { 0, 1, 2 }, keepDims: false);
+                    AssertGradientsMatch(cpuTape2.ComputeGradients(cpuLoss2, new[] { wUpdated })[wUpdated], gpuGradW2, "step2 d/dW");
                 }
             }
             finally
@@ -309,16 +324,25 @@ public sealed class PermutedViewResidencyTests : IClassFixture<DirectGpuTensorEn
         }
     }
 
+    private static void AssertGradientsMatch(Tensor<float> cpu, Tensor<float> gpu, string name)
+    {
+        var c = cpu.ToArray();
+        var g = gpu.ToArray();
+        Assert.Equal(c.Length, g.Length);
+        for (int i = 0; i < c.Length; i++)
+            Assert.True(Math.Abs(c[i] - g[i]) < 1e-4f, $"{name}[{i}] cpu {c[i]} gpu {g[i]}");
+    }
+
     [SkippableFact]
     public void DepthwiseConv1D_BackwardGradients_StayDeviceResidentForClipGradNorm()
     {
         Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
-        var gpu = _fixture.Engine!;
+        var gpu = _fixture.Engine ?? throw new InvalidOperationException("The GPU fixture reported a device but has no engine.");
         var cpu = new CpuEngine();
         var previous = AiDotNetEngine.Current;
         try
         {
-            var rng = new Random(29);
+            var rng = RandomHelper.CreateSeededRandom(29);
             var x = new Tensor<float>(new[] { 2, 8, 16 });
             for (int i = 0; i < x.Length; i++) x[i] = (float)(rng.NextDouble() * 2 - 1);
             var k = new Tensor<float>(new[] { 8, 1, 4 });
@@ -354,18 +378,27 @@ public sealed class PermutedViewResidencyTests : IClassFixture<DirectGpuTensorEn
             for (int i = 0; i < cpuGx.Length; i++) expectedNormSq += (double)cpuGx[i] * cpuGx[i];
             for (int i = 0; i < cpuGk.Length; i++) expectedNormSq += (double)cpuGk[i] * cpuGk[i];
 
-            using var devNorm = AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TryClipGradNorm(new[] { gpuGx, gpuGk }, maxNorm: 1000.0);
+            // A threshold of half the norm, so the clip actually scales the gradients in place.
+            double expectedNorm = Math.Sqrt(expectedNormSq);
+            double maxNorm = expectedNorm / 2;
+            using var devNorm = AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TryClipGradNorm(new[] { gpuGx, gpuGk }, maxNorm);
             Assert.NotNull(devNorm);
-            Assert.True(devNorm!.IsFinite);
-            Assert.True(Math.Abs(Math.Sqrt(expectedNormSq) - devNorm.TotalNorm) < 1e-2,
-                $"Expected norm {Math.Sqrt(expectedNormSq)} vs GPU norm {devNorm.TotalNorm}");
+            if (devNorm is null) return;
+            Assert.True(devNorm.IsFinite);
+            Assert.True(Math.Abs(expectedNorm - devNorm.TotalNorm) < 1e-2,
+                $"Expected pre-clip norm {expectedNorm} vs GPU norm {devNorm.TotalNorm}");
+            float coefficient = (float)(maxNorm / (expectedNorm + 1e-6));
+            Assert.True(Math.Abs(coefficient - devNorm.ClipCoefficient) < 1e-4f,
+                $"Expected clip coefficient {coefficient} vs GPU {devNorm.ClipCoefficient}");
 
             var gpuGxArr = gpuGx.ToArray();
             var gpuGkArr = gpuGk.ToArray();
             for (int i = 0; i < cpuGx.Length; i++)
-                Assert.True(Math.Abs(cpuGx[i] - gpuGxArr[i]) < 1e-4f, $"d/dx[{i}] cpu {cpuGx[i]} gpu {gpuGxArr[i]}");
+                Assert.True(Math.Abs(cpuGx[i] * coefficient - gpuGxArr[i]) < 1e-4f, $"d/dx[{i}] cpu {cpuGx[i] * coefficient} gpu {gpuGxArr[i]}");
             for (int i = 0; i < cpuGk.Length; i++)
-                Assert.True(Math.Abs(cpuGk[i] - gpuGkArr[i]) < 1e-4f, $"d/dk[{i}] cpu {cpuGk[i]} gpu {gpuGkArr[i]}");
+                Assert.True(Math.Abs(cpuGk[i] * coefficient - gpuGkArr[i]) < 1e-4f, $"d/dk[{i}] cpu {cpuGk[i] * coefficient} gpu {gpuGkArr[i]}");
+            double clippedNorm = Math.Sqrt(gpuGxArr.Concat(gpuGkArr).Sum(g => (double)g * g));
+            Assert.True(Math.Abs(clippedNorm - maxNorm) < 1e-3 * maxNorm, $"clipped norm {clippedNorm}, max norm {maxNorm}");
         }
         finally
         {
@@ -377,12 +410,12 @@ public sealed class PermutedViewResidencyTests : IClassFixture<DirectGpuTensorEn
     public void TensorFlip_CumSum_And_TensorBatchMatMul_Gradients_StayDeviceResidentForClipGradNorm()
     {
         Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
-        var gpu = _fixture.Engine!;
+        var gpu = _fixture.Engine ?? throw new InvalidOperationException("The GPU fixture reported a device but has no engine.");
         var cpu = new CpuEngine();
         var previous = AiDotNetEngine.Current;
         try
         {
-            var rng = new Random(37);
+            var rng = RandomHelper.CreateSeededRandom(37);
             var x = new Tensor<float>(new[] { 4, 6, 8 });
             for (int i = 0; i < x.Length; i++) x[i] = (float)(rng.NextDouble() * 2 - 1);
             var convW = new Tensor<float>(new[] { 8, 4 });
@@ -403,7 +436,7 @@ public sealed class PermutedViewResidencyTests : IClassFixture<DirectGpuTensorEn
                 var bmm = eng.TensorBatchMatMul(cum, expertW);
                 var loss = eng.ReduceSum(bmm, new[] { 0, 1, 2 }, false);
                 var grads = tape.ComputeGradients(loss, new[] { x, convW, expertW });
-                return grads[convW].ToArray().Concat(grads[expertW].ToArray()).ToArray();
+                return grads[x].ToArray().Concat(grads[convW].ToArray()).Concat(grads[expertW].ToArray()).ToArray();
             }
 
             var cpuGrads = RunCpu();
@@ -432,13 +465,23 @@ public sealed class PermutedViewResidencyTests : IClassFixture<DirectGpuTensorEn
             Assert.True(gConvW.IsGpuResident, "TensorFlip kernel gradient should stay GPU-resident.");
             Assert.True(gExpertW.IsGpuResident, "TensorBatchMatMul 3D persistent weight gradient should stay GPU-resident.");
 
-            using var devNorm = AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TryClipGradNorm(new[] { gx, gConvW, gExpertW }, maxNorm: 1000.0);
-            Assert.NotNull(devNorm);
-            Assert.True(devNorm!.IsFinite);
+            // A threshold of half the CPU reference norm, so the clip actually scales every gradient in place.
+            double expectedNorm = Math.Sqrt(cpuGrads.Sum(g => (double)g * g));
+            double maxNorm = expectedNorm / 2;
+            using var devNorm = AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TryClipGradNorm(new[] { gx, gConvW, gExpertW }, maxNorm);
+            Assert.True(devNorm is { IsFinite: true }, "the device gradient-norm clip declined or saw a non-finite norm");
+            double deviceNorm = devNorm is null ? double.NaN : devNorm.TotalNorm;
+            Assert.True(Math.Abs(expectedNorm - deviceNorm) < 1e-3 * expectedNorm,
+                $"Expected pre-clip norm {expectedNorm} vs GPU norm {deviceNorm}");
+            float coefficient = (float)(maxNorm / (expectedNorm + 1e-6));
 
-            var gpuGrads = gConvW.ToArray().Concat(gExpertW.ToArray()).ToArray();
+            var gpuGrads = gx.ToArray().Concat(gConvW.ToArray()).Concat(gExpertW.ToArray()).ToArray();
+            Assert.Equal(cpuGrads.Length, gpuGrads.Length);
             for (int i = 0; i < cpuGrads.Length; i++)
-                Assert.True(Math.Abs(cpuGrads[i] - gpuGrads[i]) < 1e-3f, $"grad[{i}] cpu {cpuGrads[i]} gpu {gpuGrads[i]}");
+                Assert.True(Math.Abs(cpuGrads[i] * coefficient - gpuGrads[i]) < 1e-3f,
+                    $"grad[{i}] cpu {cpuGrads[i] * coefficient} gpu {gpuGrads[i]} (clip coefficient {coefficient})");
+            double clippedNorm = Math.Sqrt(gpuGrads.Sum(g => (double)g * g));
+            Assert.True(Math.Abs(clippedNorm - maxNorm) < 1e-3 * maxNorm, $"clipped norm {clippedNorm}, max norm {maxNorm}");
         }
         finally
         {

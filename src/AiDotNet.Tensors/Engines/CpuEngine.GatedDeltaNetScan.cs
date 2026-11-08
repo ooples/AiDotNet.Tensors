@@ -88,24 +88,24 @@ public partial class CpuEngine
         if (typeof(T) == typeof(double))
         {
             GatedDeltaForwardDouble(
-                (double[])(object)qProj.GetDataArray()!, (double[])(object)kProj.GetDataArray()!,
-                (double[])(object)vProj.GetDataArray()!, (double[])(object)alpha.GetDataArray()!,
-                (double[])(object)beta.GetDataArray()!, (double[])(object)output.GetDataArray()!,
+                (double[])(object)qProj.GetDataArray(), (double[])(object)kProj.GetDataArray(),
+                (double[])(object)vProj.GetDataArray(), (double[])(object)alpha.GetDataArray(),
+                (double[])(object)beta.GetDataArray(), (double[])(object)output.GetDataArray(),
                 batch, seqLen, modelDim, numHeads, headDim);
         }
         else if (typeof(T) == typeof(float))
         {
             GatedDeltaForwardFloat(
-                (float[])(object)qProj.GetDataArray()!, (float[])(object)kProj.GetDataArray()!,
-                (float[])(object)vProj.GetDataArray()!, (float[])(object)alpha.GetDataArray()!,
-                (float[])(object)beta.GetDataArray()!, (float[])(object)output.GetDataArray()!,
+                (float[])(object)qProj.GetDataArray(), (float[])(object)kProj.GetDataArray(),
+                (float[])(object)vProj.GetDataArray(), (float[])(object)alpha.GetDataArray(),
+                (float[])(object)beta.GetDataArray(), (float[])(object)output.GetDataArray(),
                 batch, seqLen, modelDim, numHeads, headDim);
         }
         else
         {
             GatedDeltaForwardGeneric<T>(
-                qProj.GetDataArray()!, kProj.GetDataArray()!, vProj.GetDataArray()!,
-                alpha.GetDataArray()!, beta.GetDataArray()!, output.GetDataArray()!,
+                qProj.GetDataArray(), kProj.GetDataArray(), vProj.GetDataArray(),
+                alpha.GetDataArray(), beta.GetDataArray(), output.GetDataArray(),
                 batch, seqLen, modelDim, numHeads, headDim);
         }
 
@@ -669,35 +669,35 @@ public partial class CpuEngine
         if (typeof(T) == typeof(double))
         {
             GatedDeltaBackwardDouble(
-                (double[])(object)gradOutput.GetDataArray()!,
-                (double[])(object)qProj.GetDataArray()!, (double[])(object)kProj.GetDataArray()!,
-                (double[])(object)vProj.GetDataArray()!, (double[])(object)alpha.GetDataArray()!,
-                (double[])(object)beta.GetDataArray()!,
-                (double[])(object)dQ.GetDataArray()!, (double[])(object)dK.GetDataArray()!,
-                (double[])(object)dV.GetDataArray()!, (double[])(object)dA.GetDataArray()!,
-                (double[])(object)dB.GetDataArray()!,
+                (double[])(object)gradOutput.GetDataArray(),
+                (double[])(object)qProj.GetDataArray(), (double[])(object)kProj.GetDataArray(),
+                (double[])(object)vProj.GetDataArray(), (double[])(object)alpha.GetDataArray(),
+                (double[])(object)beta.GetDataArray(),
+                (double[])(object)dQ.GetDataArray(), (double[])(object)dK.GetDataArray(),
+                (double[])(object)dV.GetDataArray(), (double[])(object)dA.GetDataArray(),
+                (double[])(object)dB.GetDataArray(),
                 batch, seqLen, modelDim, numHeads, headDim);
         }
         else if (typeof(T) == typeof(float))
         {
             GatedDeltaBackwardFloat(
-                (float[])(object)gradOutput.GetDataArray()!,
-                (float[])(object)qProj.GetDataArray()!, (float[])(object)kProj.GetDataArray()!,
-                (float[])(object)vProj.GetDataArray()!, (float[])(object)alpha.GetDataArray()!,
-                (float[])(object)beta.GetDataArray()!,
-                (float[])(object)dQ.GetDataArray()!, (float[])(object)dK.GetDataArray()!,
-                (float[])(object)dV.GetDataArray()!, (float[])(object)dA.GetDataArray()!,
-                (float[])(object)dB.GetDataArray()!,
+                (float[])(object)gradOutput.GetDataArray(),
+                (float[])(object)qProj.GetDataArray(), (float[])(object)kProj.GetDataArray(),
+                (float[])(object)vProj.GetDataArray(), (float[])(object)alpha.GetDataArray(),
+                (float[])(object)beta.GetDataArray(),
+                (float[])(object)dQ.GetDataArray(), (float[])(object)dK.GetDataArray(),
+                (float[])(object)dV.GetDataArray(), (float[])(object)dA.GetDataArray(),
+                (float[])(object)dB.GetDataArray(),
                 batch, seqLen, modelDim, numHeads, headDim);
         }
         else
         {
             GatedDeltaBackwardGeneric<T>(
-                gradOutput.GetDataArray()!,
-                qProj.GetDataArray()!, kProj.GetDataArray()!, vProj.GetDataArray()!,
-                alpha.GetDataArray()!, beta.GetDataArray()!,
-                dQ.GetDataArray()!, dK.GetDataArray()!, dV.GetDataArray()!,
-                dA.GetDataArray()!, dB.GetDataArray()!,
+                gradOutput.GetDataArray(),
+                qProj.GetDataArray(), kProj.GetDataArray(), vProj.GetDataArray(),
+                alpha.GetDataArray(), beta.GetDataArray(),
+                dQ.GetDataArray(), dK.GetDataArray(), dV.GetDataArray(),
+                dA.GetDataArray(), dB.GetDataArray(),
                 batch, seqLen, modelDim, numHeads, headDim);
         }
 

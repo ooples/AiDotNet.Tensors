@@ -445,6 +445,13 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     {
         EnsureInitialized();
         if (dispatchSize <= 0) return;
+        // A shader binding more storage buffers than one stage may use fails pipeline creation (the spec only promises
+        // 4; desktop drivers report 8 to millions). Say so as a capability gap so the engine takes its CPU path.
+        uint storageBufferLimit = Math.Min(
+            _device.Limits.maxPerStageDescriptorStorageBuffers, _device.Limits.maxDescriptorSetStorageBuffers);
+        if ((uint)buffers.Length > storageBufferLimit)
+            throw new GpuCapabilityUnavailableException(
+                $"Vulkan shader needs {buffers.Length} storage buffers; device limit is {storageBufferLimit}.");
         uint pushConstantSize = (uint)(pushConstants.Length * sizeof(uint));
         var pipeline = GetOrCreateGlslPipeline(glslSource, buffers.Length, pushConstantSize);
         if (pipeline is null)

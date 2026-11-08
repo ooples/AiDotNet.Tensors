@@ -1645,6 +1645,19 @@ public sealed class GradientTape<T> : IDisposable
     private Tensor<T>? _cachedGradientLeafSourcesLastOutput;
     private HashSet<Tensor<T>>? _cachedGradientLeafSources;
 
+    private void ClearGradientCaches()
+    {
+        _cachedGradientRelevanceLoss = null;
+        _cachedGradientRelevanceSources = null;
+        _cachedGradientRelevanceEntryCount = -1;
+        _cachedGradientRelevance = null;
+        _cachedGradientLeafSourcesKey = null;
+        _cachedGradientLeafSourcesEntryCount = -1;
+        _cachedGradientLeafSourcesFirstOutput = null;
+        _cachedGradientLeafSourcesLastOutput = null;
+        _cachedGradientLeafSources = null;
+    }
+
     private HashSet<Tensor<T>> BuildGradientLeafSources(IReadOnlyList<Tensor<T>> sources)
     {
         // A persistent tape re-run with the same sources over the same entries gets the same set; retained and
@@ -3166,6 +3179,9 @@ public sealed class GradientTape<T> : IDisposable
         // Return arena to thread-local cache for reuse by next GradientTape
         _entries.Reset();
         _cachedArena = _entries;
+        // A persistent tape's gradient caches hold this step's recorded outputs (and through them their device
+        // buffers); a disposed tape that its owner keeps referencing must not pin them past the step boundary.
+        ClearGradientCaches();
 
         // Transparent per-step TensorArena recycling (AiDotNet #1804). When the
         // OUTERMOST tape on this thread disposes, one training/compute step has
@@ -3209,8 +3225,9 @@ public sealed class GradientTape<T> : IDisposable
         }
         // Run the step-boundary device collection AFTER _entries.Reset(), saved-state unpinning, and arena disposal
         // have dropped every reference to this step's dead intermediates (running earlier promoted live _entries
-        // tensors out of gen-0 instead of reclaiming them).
-        if (_parent is null)
+        // tensors out of gen-0 instead of reclaiming them). Not for a SuppressArenaScope tape (the GradientCheckpointing
+        // recompute tape): it is disposed mid-backward of the outer step, where a blocking collection would stall it.
+        if (_parent is null && !_options.SuppressArenaScope)
         {
             Engines.DirectGpu.DeviceMemoryReclaim.CollectIfDueAtStepBoundary();
         }

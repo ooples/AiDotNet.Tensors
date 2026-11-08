@@ -119,7 +119,11 @@ public sealed class CudaKernelLookupIntegrityTests
         // backend looked up, but nothing compiled it, so a "defined in some source" check passed while every one of
         // those ops threw kernel-not-found on CUDA.
         var compiledClasses = new HashSet<string>(
-            Regex.Matches(backend, @"\b(\w+)\.Get\w*Source\w*\s*\(", RegexOptions.None, TimeSpan.FromSeconds(5)).Select(m => m.Groups[1].Value),
+            // The literal ".Get" leads the pattern (the class name is a lookbehind), so the engine jumps between ".Get"
+            // occurrences instead of trying "\b\w+" at every word of ~3 MB of backend source: 2.7x faster, same 75
+            // matches. The 5 s budget timed out on a contended CI runner (RegexMatchTimeoutException), so it is 30 s;
+            // a catastrophic-backtracking regression still trips it.
+            Regex.Matches(backend, @"(?<=\b(\w+))\.Get\w*Source\w*\s*\(", RegexOptions.None, TimeSpan.FromSeconds(30)).Select(m => m.Groups[1].Value),
             StringComparer.Ordinal);
         Assert.Contains("CudaOctonionKernels", compiledClasses);
         foreach (var file in kernelSources)

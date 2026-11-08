@@ -52,6 +52,16 @@ public sealed class GpuOutOfMemoryException : InvalidOperationException
 /// finalizers queue their frees, runs them, drains the backend's buffer pool and retries once -- then fails with
 /// the backend's own out-of-memory error. PyTorch's caching allocator frees its cached blocks and retries the same way.
 /// </summary>
+/// <summary>
+/// Whether a backend's buffers charge <see cref="DeviceMemoryReclaim.OnDeviceAllocation"/> when handed out and credit it
+/// when disposed. When they do, the engine adds no charge of its own for the results it defers onto them; when they do
+/// not (Metal, WebGPU), the engine counts result bytes itself so abandoned results still prompt a collection.
+/// </summary>
+internal interface IChargesDeviceMemoryReclaim
+{
+    bool ChargesDeviceMemoryReclaim { get; }
+}
+
 internal static class DeviceMemoryReclaim
 {
     private static int s_processExiting;
@@ -183,6 +193,24 @@ internal static class DeviceMemoryReclaim
             current = observed;
         }
 
+        CreditGen2(bytes, epoch);
+    }
+
+    /// <summary>
+    /// Credits a buffer the GC reclaimed (its owner was collected and the finalizer queued it back to the pool or to
+    /// the driver) against the cumulative Gen-2 count only. The young-generation collection that found it already
+    /// reset the per-collection count, but the Gen-2 count tracks bytes still unreleased: leaving a finalized buffer in
+    /// it forced a Gen-2 collection every <see cref="CollectGen2AfterDeviceBytes"/> even when young collections were
+    /// recovering everything. Safe on the finalizer thread: it only updates counters.
+    /// </summary>
+    internal static void OnDeviceFinalized(long bytes, long epoch)
+    {
+        if (epoch < 0 || bytes <= 0) return;
+        CreditGen2(bytes, epoch);
+    }
+
+    private static void CreditGen2(long bytes, long epoch)
+    {
         long currentGen2 = Volatile.Read(ref s_driverBytesSinceGen2Collection);
         while (epoch >= Volatile.Read(ref s_gen2ResetCollectionEpoch))
         {
@@ -192,6 +220,9 @@ internal static class DeviceMemoryReclaim
             currentGen2 = observedGen2;
         }
     }
+
+    /// <summary>Test hook: the cumulative unreleased bytes the Gen-2 sweep is measured against.</summary>
+    internal static long BytesSinceGen2CollectionForTests => Volatile.Read(ref s_driverBytesSinceGen2Collection);
 
     // Buffers handed out since the last collection this class ran, pool hits included.
     private static long s_allocationsSinceCollection;

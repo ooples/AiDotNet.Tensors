@@ -7962,7 +7962,18 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         LaunchKernel(cudaKernel, gridX, DefaultBlockSize, args);
     }
 
-    // Param order matches the engine call (input, gradOutput, ...) so the kernel-order bindings below bind the right buffers.
+    // IDirectGpuBackend declares gradOutput first; this class's public method keeps its shipped parameter order, so
+    // a positional caller of the concrete class still binds as before. Both bind the kernel's buffers by name.
+    void IDirectGpuBackend.DeformableConv2DBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradWeights,
+        int batch, int inChannels, int inHeight, int inWidth,
+        int outChannels, int outHeight, int outWidth,
+        int kernelH, int kernelW,
+        int strideH, int strideW, int padH, int padW,
+        int dilationH, int dilationW,
+        int groups, int deformGroups)
+        => DeformableConv2DBackwardWeights(input, gradOutput, offsets, mask, gradWeights,
+            batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups);
+
     public unsafe void DeformableConv2DBackwardWeights(IGpuBuffer input, IGpuBuffer gradOutput, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradWeights,
         int batch, int inChannels, int inHeight, int inWidth,
         int outChannels, int outHeight, int outWidth,
@@ -8016,7 +8027,18 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         LaunchKernel(cudaKernel, gridX, DefaultBlockSize, args);
     }
 
-    // Param order matches the engine call (input, weights, gradOutput, ...) so the kernel-order bindings below bind the right buffers.
+    // IDirectGpuBackend declares gradOutput first; this class's public method keeps its shipped parameter order, so
+    // a positional caller of the concrete class still binds as before. Both bind the kernel's buffers by name.
+    void IDirectGpuBackend.DeformableConv2DBackwardOffset(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradOffsets,
+        int batch, int inChannels, int inHeight, int inWidth,
+        int outChannels, int outHeight, int outWidth,
+        int kernelH, int kernelW,
+        int strideH, int strideW, int padH, int padW,
+        int dilationH, int dilationW,
+        int groups, int deformGroups)
+        => DeformableConv2DBackwardOffset(input, weights, gradOutput, offsets, mask, gradOffsets,
+            batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups);
+
     public unsafe void DeformableConv2DBackwardOffset(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer gradOutput, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradOffsets,
         int batch, int inChannels, int inHeight, int inWidth,
         int outChannels, int outHeight, int outWidth,
@@ -8073,7 +8095,18 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         LaunchKernel(cudaKernel, gridX, DefaultBlockSize, args);
     }
 
-    // Param order matches the engine call (input, weights, gradOutput, ...) so the kernel-order bindings below bind the right buffers.
+    // IDirectGpuBackend declares gradOutput first; this class's public method keeps its shipped parameter order, so
+    // a positional caller of the concrete class still binds as before. Both bind the kernel's buffers by name.
+    void IDirectGpuBackend.DeformableConv2DBackwardMask(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer gradMask,
+        int batch, int inChannels, int inHeight, int inWidth,
+        int outChannels, int outHeight, int outWidth,
+        int kernelH, int kernelW,
+        int strideH, int strideW, int padH, int padW,
+        int dilationH, int dilationW,
+        int groups, int deformGroups)
+        => DeformableConv2DBackwardMask(input, weights, gradOutput, offsets, gradMask,
+            batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups);
+
     public unsafe void DeformableConv2DBackwardMask(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer gradOutput, IGpuBuffer offsets, IGpuBuffer gradMask,
         int batch, int inChannels, int inHeight, int inWidth,
         int outChannels, int outHeight, int outWidth,
@@ -18208,15 +18241,27 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (headDim > Kernels.CudaGatedDeltaNetKernels.MaxHeadDim)
             throw new InvalidOperationException(
                 $"GatedDeltaNet headDim ({headDim}) exceeds max ({Kernels.CudaGatedDeltaNetKernels.MaxHeadDim}).");
+        GatedDeltaNetBackwardResolver.ValidateBuffers(dOut, q, k, v, alpha, beta, dQ, dK, dV, dAlpha, dBeta, batch, seqLen, modelDim, numHeads);
         if (!_kernelCache.TryGetValue("gated_delta_scan_recompute", out var recompute) ||
             !_kernelCache.TryGetValue("gated_delta_scan_backward", out var backward))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: gated_delta_scan_recompute / gated_delta_scan_backward");
 
         using var _ = PushContext();
-        Fill(dQ, 0f, batch * seqLen * modelDim);
-        Fill(dK, 0f, batch * seqLen * modelDim);
-        Fill(dAlpha, 0f, batch * seqLen * numHeads);
-        Fill(dBeta, 0f, batch * seqLen * numHeads);
+        // Deterministic mode replaces the atomic accumulation with per-row partials summed in a fixed order (see
+        // gated_delta_scan_backward); dq and reduce write every element, so nothing needs clearing first.
+        bool det = GpuDeterminism.IsActive;
+        IntPtr dqKernel = IntPtr.Zero, reduceKernel = IntPtr.Zero;
+        if (det && (!_kernelCache.TryGetValue("gated_delta_scan_dq", out dqKernel)
+                    || !_kernelCache.TryGetValue("gated_delta_scan_reduce", out reduceKernel)))
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: gated_delta_scan_dq / gated_delta_scan_reduce");
+        int n = batch * seqLen * modelDim;
+        if (!det)
+        {
+            Fill(dQ, 0f, n);
+            Fill(dK, 0f, n);
+            Fill(dAlpha, 0f, batch * seqLen * numHeads);
+            Fill(dBeta, 0f, batch * seqLen * numHeads);
+        }
         long trajLenL = checked((long)batch * numHeads * seqLen * headDim * headDim);
         if (trajLenL > int.MaxValue)
             throw new ArgumentException("GatedDeltaNet trajectory buffer is too large for a single allocation.");
@@ -18233,11 +18278,33 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         IntPtr pdo = dOut.Handle, pq = q.Handle;
         IntPtr pdq = dQ.Handle, pdk = dK.Handle, pdv = dV.Handle, pda = dAlpha.Handle, pdb = dBeta.Handle;
-        void** ba = stackalloc void*[17];
+        uint nGrid = ((uint)n + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize;
+        using var partials = det ? AllocateBuffer(checked(2 * n)) : null;
+        IntPtr pp = partials?.Handle ?? IntPtr.Zero;
+        if (det)
+        {
+            void** qa = stackalloc void*[8];
+            qa[0] = &pdo; qa[1] = &ptr; qa[2] = &pdq;
+            qa[3] = &batch; qa[4] = &seqLen; qa[5] = &modelDim; qa[6] = &numHeads; qa[7] = &headDim;
+            LaunchKernel(dqKernel, nGrid, (uint)DefaultBlockSize, qa);
+        }
+
+        IntPtr pslot = det ? pp : pdq;
+        int detFlag = det ? 1 : 0;
+        void** ba = stackalloc void*[18];
         ba[0] = &pdo; ba[1] = &pq; ba[2] = &pk; ba[3] = &pv; ba[4] = &pa; ba[5] = &pb; ba[6] = &ptr;
-        ba[7] = &pdq; ba[8] = &pdk; ba[9] = &pdv; ba[10] = &pda; ba[11] = &pdb;
+        ba[7] = &pslot; ba[8] = &pdk; ba[9] = &pdv; ba[10] = &pda; ba[11] = &pdb;
         ba[12] = &batch; ba[13] = &seqLen; ba[14] = &modelDim; ba[15] = &numHeads; ba[16] = &headDim;
+        ba[17] = &detFlag;
         LaunchKernel(backward, grid, (uint)DefaultBlockSize, ba);
+
+        if (det)
+        {
+            void** rd = stackalloc void*[10];
+            rd[0] = &ptr; rd[1] = &pp; rd[2] = &pdk; rd[3] = &pda; rd[4] = &pdb;
+            rd[5] = &batch; rd[6] = &seqLen; rd[7] = &modelDim; rd[8] = &numHeads; rd[9] = &headDim;
+            LaunchKernel(reduceKernel, nGrid, (uint)DefaultBlockSize, rd);
+        }
     }
 
     // ── Fused RG-LRU scan forward (#1464) ──────────────────────────────────────────────────

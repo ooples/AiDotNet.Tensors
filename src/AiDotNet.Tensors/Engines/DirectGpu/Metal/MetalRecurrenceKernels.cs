@@ -543,5 +543,100 @@ kernel void gated_delta_scan_backward(
         }
     }
 }
+
+// gated_delta_scan_backward without atomics, for deterministic mode: dQ comes from gated_delta_scan_dq, each row's dK
+// contribution overwrites that row of Straj (read only by this thread, and last read at step t + 1), and dA/dB go to
+// per-row partials P = [dA | dB]. gated_delta_scan_reduce then sums the rows in a fixed order.
+kernel void gated_delta_scan_backward_det(
+    device const float* dOut [[buffer(0)]], device const float* Q [[buffer(1)]], device const float* K [[buffer(2)]],
+    device const float* V [[buffer(3)]], device const float* A [[buffer(4)]], device const float* B [[buffer(5)]],
+    device float* Straj [[buffer(6)]], device float* P [[buffer(7)]], device float* dV [[buffer(8)]],
+    constant int& batch [[buffer(9)]], constant int& seqLen [[buffer(10)]], constant int& modelDim [[buffer(11)]],
+    constant int& numHeads [[buffer(12)]], constant int& headDim [[buffer(13)]], uint gid [[thread_position_in_grid]])
+{
+    int total = batch * numHeads * headDim;
+    if ((int)gid >= total) return;
+    int di = (int)gid % headDim; int h = ((int)gid / headDim) % numHeads; int b = (int)gid / (headDim * numHeads);
+    int hOff = h * headDim; int hh = headDim * headDim;
+    float kappa = 1.0f / sqrt((float)headDim);
+    float dSrow[REC_MAX_HEADDIM];
+    for (int ki = 0; ki < headDim; ki++) dSrow[ki] = 0.0f;
+    for (int t = seqLen - 1; t >= 0; t--) {
+        int baseOff = (b * seqLen + t) * modelDim + hOff;
+        int gIdx = (b * seqLen + t) * numHeads + h;
+        float a = A[gIdx], bet = B[gIdx];
+        int trajBase = ((b * numHeads + h) * seqLen + t) * hh + di * headDim;
+        int sprevBase = (t > 0) ? (((b * numHeads + h) * seqLen + (t - 1)) * hh + di * headDim) : 0;
+        float sK = 0.0f;
+        for (int ki = 0; ki < headDim; ki++) { float sprev = (t > 0) ? Straj[sprevBase + ki] : 0.0f; sK += sprev * (K[baseOff + ki] * kappa); }
+        float delta = V[baseOff + di] - sK;
+        float dOutVal = dOut[baseOff + di];
+        for (int ki = 0; ki < headDim; ki++) {
+            dSrow[ki] += dOutVal * Q[baseOff + ki];
+        }
+        float dA_acc = 0.0f, dB_acc = 0.0f, dDelta = 0.0f;
+        for (int ki = 0; ki < headDim; ki++) {
+            float dSt = dSrow[ki];
+            float sprev = (t > 0) ? Straj[sprevBase + ki] : 0.0f;
+            float kScaled = K[baseOff + ki] * kappa;
+            dA_acc += dSt * sprev;
+            dB_acc += dSt * delta * kScaled;
+            dDelta += dSt * bet * kScaled;
+        }
+        dV[baseOff + di] = dDelta;
+        P[gIdx * headDim + di] = dA_acc;
+        P[batch * seqLen * modelDim + gIdx * headDim + di] = dB_acc;
+        float dSk = -dDelta;
+        for (int ki = 0; ki < headDim; ki++) {
+            float dSt = dSrow[ki];
+            float sprev = (t > 0) ? Straj[sprevBase + ki] : 0.0f;
+            float kScaled = K[baseOff + ki] * kappa;
+            float dKS = dSt * (bet * delta) + dSk * sprev;
+            Straj[trajBase + ki] = dKS * kappa;
+            dSrow[ki] = dSt * a + dSk * kScaled;
+        }
+    }
+}
+
+// Deterministic dQ: dQ[b,t,h,ki] = sum over di (ascending) of dOut[b,t,h,di] * S_t[di,ki].
+kernel void gated_delta_scan_dq(
+    device const float* dOut [[buffer(0)]], device const float* Straj [[buffer(1)]], device float* dQ [[buffer(2)]],
+    constant int& batch [[buffer(3)]], constant int& seqLen [[buffer(4)]], constant int& modelDim [[buffer(5)]],
+    constant int& numHeads [[buffer(6)]], constant int& headDim [[buffer(7)]], uint gid [[thread_position_in_grid]])
+{
+    int g = (int)gid;
+    if (g >= batch * seqLen * modelDim) return;
+    int ki = g % headDim; int h = (g / headDim) % numHeads; int bt = g / modelDim; int t = bt % seqLen; int b = bt / seqLen;
+    int trajT = ((b * numHeads + h) * seqLen + t) * headDim * headDim;
+    int base = bt * modelDim + h * headDim;
+    float acc = 0.0f;
+    for (int di = 0; di < headDim; di++) acc += dOut[base + di] * Straj[trajT + di * headDim + ki];
+    dQ[g] = acc;
+}
+
+// Deterministic reduction of gated_delta_scan_backward_det's partials: dK from the rows of PK (the overwritten
+// trajectory) and dA/dB from P = [dA | dB], each summed over di in ascending order.
+kernel void gated_delta_scan_reduce(
+    device const float* PK [[buffer(0)]], device const float* P [[buffer(1)]], device float* dK [[buffer(2)]],
+    device float* dA [[buffer(3)]], device float* dB [[buffer(4)]],
+    constant int& batch [[buffer(5)]], constant int& seqLen [[buffer(6)]], constant int& modelDim [[buffer(7)]],
+    constant int& numHeads [[buffer(8)]], constant int& headDim [[buffer(9)]], uint gid [[thread_position_in_grid]])
+{
+    int g = (int)gid;
+    int n = batch * seqLen * modelDim;
+    if (g >= n) return;
+    int ki = g % headDim; int h = (g / headDim) % numHeads; int bt = g / modelDim; int t = bt % seqLen; int b = bt / seqLen;
+    int trajT = ((b * numHeads + h) * seqLen + t) * headDim * headDim;
+    float acc = 0.0f;
+    for (int di = 0; di < headDim; di++) acc += PK[trajT + di * headDim + ki];
+    dK[g] = acc;
+    if (ki == 0) {
+        int gIdx = bt * numHeads + h;
+        float sa = 0.0f, sb = 0.0f;
+        for (int di = 0; di < headDim; di++) { sa += P[gIdx * headDim + di]; sb += P[n + gIdx * headDim + di]; }
+        dA[gIdx] = sa;
+        dB[gIdx] = sb;
+    }
+}
 ";
 }

@@ -11,6 +11,8 @@ public partial class CpuEngine
     public virtual Tensor<T> TensorGridSample3D<T>(Tensor<T> input, Tensor<T> grid, GridSampleMode mode = GridSampleMode.Bilinear,
         GridSamplePadding padding = GridSamplePadding.Zeros, bool alignCorners = false)
     {
+        if (TryRecordCompiledOp("TensorGridSample3D", new Tensor<T>?[] { input, grid }, e => e.TensorGridSample3D(input, grid, mode, padding, alignCorners), out var compiledNode))
+            return compiledNode;
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (grid == null) throw new ArgumentNullException(nameof(grid));

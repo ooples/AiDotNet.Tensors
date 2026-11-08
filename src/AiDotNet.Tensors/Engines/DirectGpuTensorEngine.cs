@@ -2012,12 +2012,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // #3 FP16-act CONVERT-AT-GAP: an FP16-tagged input → stable up-converted FP32, so EVERY non-FP16-aware op
         // that fetches its activation through this helper (softmax, scale, in-place unary/binary, etc.) reads
         // correct FP32. FP16-aware ops (conv/groupnorm/add) bypass via TryFp16ResidentInput. Capture-safe scratch.
-        var tHalfG = TryFp16ResidentInput(tensor, out var tCountG);
+        bool isView = !tensor.IsContiguous || tensor._storageOffset != 0;
+        int tCountG = 0;
+        var tHalfG = isView ? null : TryFp16ResidentInput(tensor, out tCountG);
         if (tHalfG is not null)
         {
             var kG = tensor.GetBackingArrayForCacheLookupUnsafe();
             if (kG is not null) return new OwnedBuffer(Fp16InputToFp32Stable(backend, tHalfG, tCountG, kG), ownsBuffer: false);
         }
+        // A strided view of an FP16-resident tensor shares its backing array, and the device copy behind that array
+        // holds FP16 bits: the device view paths below would permute or slice them as FP32. Contiguous() reads the view
+        // through the FP16 -> FP32 host materializer instead.
+        bool fp16View = isView && IsFp16Resident(tensor);
         // A non-contiguous tensor (or one with a nonzero storage offset) is a STRIDED VIEW: it shares
         // its source's backing array, and any GPU buffer cached against that array holds the SOURCE's
         // contiguous layout — NOT the view's permuted/sliced layout. The fast paths below all key off
@@ -2032,16 +2038,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Contiguous() below would download the whole flat array to slice this view on the host.
         // Every view into a flat ParameterBuffer -- including the one at offset 0, which the persistent-cache path
         // below would otherwise re-upload from the (stale) host copy over the device-authoritative flat buffer.
-        if (TryResolveDeviceParameterView(backend, tensor, out var parameterView, out bool parameterViewOwned))
-            return new OwnedBuffer(parameterView, ownsBuffer: parameterViewOwned);
-        // A permuted view of a tensor whose data is only on the device: permute on the device. Contiguous() below
-        // would download the base, permute it on the host and upload the result.
-        if (!tensor.IsContiguous && TryPermuteViewOnDevice(backend, tensor, out var permuted))
-            return permuted;
-        if (TrySliceViewOnDevice(backend, tensor, out var sliced))
-            return sliced;
-        if (TrySliceResidentMemberOnDevice(backend, tensor, out var memberSlice))
-            return memberSlice;
+        if (!fp16View)
+        {
+            if (TryResolveDeviceParameterView(backend, tensor, out var parameterView, out bool parameterViewOwned))
+                return new OwnedBuffer(parameterView, ownsBuffer: parameterViewOwned);
+            // A permuted view of a tensor whose data is only on the device: permute on the device. Contiguous() below
+            // would download the base, permute it on the host and upload the result.
+            if (!tensor.IsContiguous && TryPermuteViewOnDevice(backend, tensor, out var permuted))
+                return permuted;
+            if (TrySliceViewOnDevice(backend, tensor, out var sliced))
+                return sliced;
+            if (TrySliceResidentMemberOnDevice(backend, tensor, out var memberSlice))
+                return memberSlice;
+        }
         if (!tensor.IsContiguous || tensor._storageOffset != 0)
             tensor = (Tensor<T>)tensor.Contiguous();
 
@@ -4677,7 +4686,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         tensor._ownsGpuBuffer = true;
         // A backend this engine frees when it is released: the result must reach the host first.
         if (_ownsDirectGpu) _ownedResults.Add(vector, backend);
-        NoteOwnedResultAllocation(outputBuffer.SizeInBytes);
+        NoteOwnedResultAllocation(backend, outputBuffer.SizeInBytes);
         // Not released when the tape ends: a result the caller holds stays valid, as in PyTorch, and returns to the pool
         // when it is collected. The gradients backward computes but does not return are freed as soon as backward ends
         // (GradientTape.ReleaseDroppedGradients).
@@ -4734,12 +4743,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         lock (_trackedOwnedResults) _trackedOwnedResults.Clear();
     }
 
+    private long _ownedResultBytesSinceCollect;
+
     // CUDA, HIP, OpenCL, and Vulkan buffers charge DeviceMemoryReclaim.OnDeviceAllocation at rent/allocation and
-    // credit OnDeviceRelease on explicit Dispose, so DeferTensorResult needs no second engine-level charge.
-    private void NoteOwnedResultAllocation(long bytes)
+    // credit OnDeviceRelease on explicit Dispose, so their results need no second engine-level charge. Metal and
+    // WebGPU buffers do not: an abandoned result there is reclaimed only by its finalizer, and a GPU loop allocates
+    // too little managed memory for the GC to run on its own, so this byte count still prompts a young collection.
+    private void NoteOwnedResultAllocation(IDirectGpuBackend backend, long bytes)
     {
-        _ = bytes;
+        while (backend is Gpu.DelegatingGpuBackend wrapper) backend = wrapper.InnerBackend;
+        if (backend is Engines.DirectGpu.IChargesDeviceMemoryReclaim { ChargesDeviceMemoryReclaim: true }) return;
+        long threshold = OwnedResultCollectThresholdBytes;
+        if (System.Threading.Interlocked.Add(ref _ownedResultBytesSinceCollect, bytes) < threshold) return;
+        System.Threading.Interlocked.Exchange(ref _ownedResultBytesSinceCollect, 0);
+        GC.Collect(0, GCCollectionMode.Optimized, blocking: false);
     }
+
+    private long OwnedResultCollectThresholdBytes =>
+        _directGpu is { } dg && dg.GlobalMemoryBytes > 0 ? Math.Max(256L << 20, dg.GlobalMemoryBytes / 16) : 256L << 20;
     /// <summary>
     /// Materializes a deferred download if the given array was returned from a GPU op
     /// within a GpuScope without downloading. This is called automatically when CPU
@@ -10798,7 +10819,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Compilation.GraphMode.ThrowIfInferenceUnsupported(
             Compilation.GraphCaptureLimitation.HeterogeneousOutput);
 
-        if (TryMaxPool2DWithTensorIndicesOnDevice(input, poolSize, stride, padding: 0) is not { } pooled)
+        // Under a compiled trace the CpuEngine op records the node; each replay re-enters here outside graph mode.
+        if (Compilation.GraphMode.IsActive
+            || TryMaxPool2DWithTensorIndicesOnDevice(input, poolSize, stride, padding: 0) is not { } pooled)
             return base.MaxPool2DWithTensorIndices(input, poolSize, stride, out maxIndices);
 
         maxIndices = pooled.Indices;
@@ -11968,7 +11991,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 backend.DeformableConv2DBackwardWeights(
-                    inputBuffer.Buffer, gradOutputBuffer.Buffer, offsetsBuffer.Buffer, maskBuffer?.Buffer, gradWeightsBuffer.Buffer,
+                    gradOutputBuffer.Buffer, inputBuffer.Buffer, offsetsBuffer.Buffer, maskBuffer?.Buffer, gradWeightsBuffer.Buffer,
                     batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
                     kernelH, kernelW, stride[0], stride[1], padding[0], padding[1], dilation[0], dilation[1], groups, deformGroups);
                 var result = DeferTensorResult<T>(backend, gradWeightsBuffer.Buffer, kernelSize, kernelShape);
@@ -12012,7 +12035,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 backend.DeformableConv2DBackwardOffset(
-                    inputBuffer.Buffer, weightsBuffer.Buffer, gradOutputBuffer.Buffer, offsetsBuffer.Buffer, maskBuffer?.Buffer, gradOffsetBuffer.Buffer,
+                    gradOutputBuffer.Buffer, inputBuffer.Buffer, weightsBuffer.Buffer, offsetsBuffer.Buffer, maskBuffer?.Buffer, gradOffsetBuffer.Buffer,
                     batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
                     kernelH, kernelW, stride[0], stride[1], padding[0], padding[1], dilation[0], dilation[1], groups, deformGroups);
                 var result = DeferTensorResult<T>(backend, gradOffsetBuffer.Buffer, offsetSize, offset.Shape._dims);
@@ -12054,7 +12077,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             backend.DeformableConv2DBackwardMask(
-                inputBuffer.Buffer, weightsBuffer.Buffer, gradOutputBuffer.Buffer, offsetsBuffer.Buffer, gradMaskBuffer.Buffer,
+                gradOutputBuffer.Buffer, inputBuffer.Buffer, weightsBuffer.Buffer, offsetsBuffer.Buffer, gradMaskBuffer.Buffer,
                 batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
                 kernelH, kernelW, stride[0], stride[1], padding[0], padding[1], dilation[0], dilation[1], groups, deformGroups);
             var result = DeferTensorResult<T>(backend, gradMaskBuffer.Buffer, maskSize, mask.Shape._dims);
@@ -12193,7 +12216,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 backend.DeformableConv2DBackwardWeights(
-                    inputBuffer.Buffer, gradOutputBuffer.Buffer, offsetsBuffer.Buffer, maskBuffer?.Buffer, gradWeightsBuffer.Buffer,
+                    gradOutputBuffer.Buffer, inputBuffer.Buffer, offsetsBuffer.Buffer, maskBuffer?.Buffer, gradWeightsBuffer.Buffer,
                     batch, inChannels, inHeight, inWidth,
                     outChannels, outHeight, outWidth,
                     kernelH, kernelW, stride[0], stride[1], padding[0], padding[1],
@@ -12268,7 +12291,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 backend.DeformableConv2DBackwardOffset(
-                    inputBuffer.Buffer, weightsBuffer.Buffer, gradOutputBuffer.Buffer, offsetsBuffer.Buffer, maskBuffer?.Buffer, gradOffsetBuffer.Buffer,
+                    gradOutputBuffer.Buffer, inputBuffer.Buffer, weightsBuffer.Buffer, offsetsBuffer.Buffer, maskBuffer?.Buffer, gradOffsetBuffer.Buffer,
                     batch, inChannels, inHeight, inWidth,
                     outChannels, outHeight, outWidth,
                     kernelH, kernelW, stride[0], stride[1], padding[0], padding[1],
@@ -12343,7 +12366,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             backend.DeformableConv2DBackwardMask(
-                inputBuffer.Buffer, weightsBuffer.Buffer, gradOutputBuffer.Buffer, offsetsBuffer.Buffer, gradMaskBuffer.Buffer,
+                gradOutputBuffer.Buffer, inputBuffer.Buffer, weightsBuffer.Buffer, offsetsBuffer.Buffer, gradMaskBuffer.Buffer,
                 batch, inChannels, inHeight, inWidth,
                 outChannels, outHeight, outWidth,
                 kernelH, kernelW, stride[0], stride[1], padding[0], padding[1],
@@ -13098,17 +13121,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         using var __gpuOp = EnterGpuOp();
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend) ||
-            !Engines.DirectGpu.GatedDeltaNetBackwardResolver.TryResolve(backend, out var gdnBackend))
+            Engines.DirectGpu.GatedDeltaNetBackwardResolver.Resolve(backend) is not { } gdnBackend)
             return null;
         var q = inputs[0];
         int batch = q.Shape._dims[0], seqLen = q.Shape._dims[1], modelDim = q.Shape._dims[2];
         int headDim = modelDim / numHeads;
         int n = batch * seqLen * modelDim, ng = batch * seqLen * numHeads;
+        // The kernels read dOut as [batch, seqLen, modelDim]; a gradient of any other size would be read past its end.
+        if (gradOutput.Length != n)
+            throw new ArgumentException(
+                $"GatedDeltaNet output gradient has {gradOutput.Length} elements; the scan output has {n}.", nameof(gradOutput));
+        // The backward keeps every (batch, head) state trajectory resident at once: batch*heads*seqLen*headDim^2 floats.
+        // Past a quarter of device memory it would starve or fail the allocation, so the managed backward, which holds
+        // one trajectory per worker, takes it instead.
+        long trajectoryBytes = (long)batch * numHeads * seqLen * headDim * headDim * sizeof(float);
+        if (backend.GlobalMemoryBytes > 0 && trajectoryBytes > backend.GlobalMemoryBytes / 4)
+            return null;
         var gradBuffers = new OwnedBuffer[5];
         int allocated = 0;
         try
         {
-            var g = gradOutput.IsContiguous ? gradOutput : (Tensor<T>)gradOutput.Contiguous();
+            var g = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
             using var dOut = GetOrAllocateBuffer(backend, g);
             using var qB = GetOrAllocateBuffer(backend, inputs[0]);
             using var kB = GetOrAllocateBuffer(backend, inputs[1]);
@@ -13154,7 +13187,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var __gpuOp = EnterGpuOp();
         if (Compilation.GraphMode.IsActive ||
             typeof(T) != typeof(float) || !TryGetBackend(out var backend) ||
-            (IsTapeActive<T>() && !Engines.DirectGpu.GatedDeltaNetBackwardResolver.TryResolve(backend, out _)))
+            (IsTapeActive<T>() && Engines.DirectGpu.GatedDeltaNetBackwardResolver.Resolve(backend) is null))
             return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads);
         if (qProj.Rank != 3 || numHeads < 1)
             return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads);
@@ -13191,21 +13224,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var result = DeferTensorResult<T>(backend, outB.Buffer, batch * seqLen * modelDim,
                 new[] { batch, seqLen, modelDim });
             outB.RelinquishOwnership();
+            // CpuEngine.GatedDeltaNetScanBackward tries the device backward first and takes the managed one only when
+            // that declines, so a failed device attempt is not repeated.
             Autodiff.DifferentiableOps.RecordIfActive<T>(
                 "GatedDeltaNetScan", result, new[] { qProj, kProj, vProj, alpha, beta },
-                static (gradOutput, inputs, output, savedState, engine, grads) =>
-                {
-                    int heads = (int)savedState[0];
-                    if (engine is DirectGpuTensorEngine gpu
-                        && gpu.GatedDeltaNetScanBackwardGpu(gradOutput, inputs, heads) is { } gpuGrads)
-                    {
-                        for (int i = 0; i < 5; i++)
-                            Autodiff.DifferentiableOps.AccumulateGrad(grads, inputs[i], gpuGrads[i], engine);
-                        return;
-                    }
-
-                    CpuEngine.GatedDeltaNetScanBackward(gradOutput, inputs, output, savedState, engine, grads);
-                },
+                CpuEngine.GatedDeltaNetScanBackward,
                 savedState: new object[] { numHeads });
             return result;
         }
@@ -19160,7 +19183,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // the tape entirely. savedState mirrors the CpuEngine call: the backward routes
             // each reduced cell's gradient to the argmax it came from, so it needs the
             // indices the helper just produced via the out parameter.
-            var reduceMaxResult = ReduceMaxWithIndicesGpu(input, normalizedAxes, keepDims, backend, out maxIndices);
+            var reduceMaxResult = ReduceMaxWithIndicesGpu(input, normalizedAxes, keepDims, backend, out var relative);
+            // The kernel's argmax is a position within each reduction window; this overload's contract (the CpuEngine's,
+            // and what both ReduceMaxBackward paths scatter into) is the flat input index. Passing the window position
+            // on routed every output's gradient into the first window (#1680).
+            maxIndices = WindowArgMaxToFlatInputIndex(input._shape, normalizedAxes, relative);
             Autodiff.DifferentiableOps.RecordUnary(
                 "ReduceMax", reduceMaxResult, input,
                 Autodiff.BackwardFunctions<T>.ReduceMaxBackward,
@@ -19170,6 +19197,41 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("ReduceMax", capabilityGap);
             return base.ReduceMax(input, safeAxes, keepDims, out maxIndices);
         }
+    }
+
+    /// <summary>
+    /// Converts argmax positions within each reduction window (row-major over the sorted, distinct reduced axes, one per
+    /// output element in row-major order over the kept axes) to flat indices into the input.
+    /// </summary>
+    internal static int[] WindowArgMaxToFlatInputIndex(int[] inputShape, int[] sortedAxes, int[] windowIndices)
+    {
+        int rank = inputShape.Length;
+        var reduced = new bool[rank];
+        foreach (int a in sortedAxes) reduced[a] = true;
+        var strides = new int[rank];
+        for (int d = rank - 1, s = 1; d >= 0; d--) { strides[d] = s; s = checked(s * inputShape[d]); }
+        var kept = Enumerable.Range(0, rank).Where(d => !reduced[d]).ToArray();
+        var result = new int[windowIndices.Length];
+        for (int o = 0; o < windowIndices.Length; o++)
+        {
+            int flat = 0;
+            int rem = o;
+            for (int k = kept.Length - 1; k >= 0; k--)
+            {
+                int d = kept[k];
+                flat += rem % inputShape[d] * strides[d];
+                rem /= inputShape[d];
+            }
+            rem = windowIndices[o];
+            for (int k = sortedAxes.Length - 1; k >= 0; k--)
+            {
+                int d = sortedAxes[k];
+                flat += rem % inputShape[d] * strides[d];
+                rem /= inputShape[d];
+            }
+            result[o] = flat;
+        }
+        return result;
     }
 
     /// <summary>
@@ -28722,10 +28784,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private Tensor<T>? TryRepeatAxisOnDevice<T>(Tensor<T> tensor, int repeats, int axis)
     {
         using var __gpuOp = EnterGpuOp();
-        if (typeof(T) != typeof(float) || !tensor.IsContiguous || repeats < 1
+        if (typeof(T) != typeof(float) || repeats < 1
             || axis < 0 || axis >= tensor.Rank || !TryGetBackend(out var backend))
             return null;
-        if (repeats == 1) return tensor;
+        // repeats == 1 still copies, as the CPU op and PyTorch do: returning the input itself made
+        // TensorRepeatInterleave record a tape edge from the input to itself, doubling its gradient (#1680).
+        // A permuted view (GQA's [B, Hkv, S, D] K/V after the head permute) is copied contiguous on the device by
+        // Tensor.Contiguous; rejecting it sent every GQA layer's K and V repeat to the host.
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         int outer = 1;
         for (int d = 0; d < axis; d++) outer = checked(outer * tensor.Shape._dims[d]);

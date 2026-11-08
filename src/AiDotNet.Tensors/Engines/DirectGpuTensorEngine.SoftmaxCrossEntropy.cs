@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -80,6 +81,17 @@ public partial class DirectGpuTensorEngine
                 var fused = (ISoftmaxCrossEntropyBackend)backend;
                 var stats = node.RowStats?._gpuBuffer ?? throw new InvalidOperationException("The loss node's backward ran before its forward.");
                 var count = node.Count?._gpuBuffer ?? throw new InvalidOperationException("The loss node's backward ran before its forward.");
+                // dL/dt = -(g / count) * log_softmax(z), the CPU backward's target term. The fused kernel writes only the
+                // logits' gradient, so a trained target (soft labels from a model being trained) got none (#1680).
+                if (Autodiff.DifferentiableOps.IsGradientRequired(inputs[1]))
+                {
+                    var ones = Enumerable.Repeat(1, inputs[0].Rank).ToArray();
+                    var scale = engine.TensorNegate(engine.TensorDivide(
+                        engine.Reshape(gradOutput, new[] { 1 }), (Tensor<T>)(object)node.Count!));
+                    var dT = engine.TensorMultiply(engine.TensorLogSoftmax(inputs[0], inputs[0].Rank - 1),
+                        engine.TensorBroadcastTo(engine.Reshape(scale, ones), (int[])inputs[0]._shape.Clone()));
+                    Autodiff.DifferentiableOps.AccumulateGrad(grads, inputs[1], dT, engine);
+                }
                 using var z = gpu.GetOrAllocateBuffer(backend, inputs[0]);
                 using var t = gpu.GetOrAllocateBuffer(backend, inputs[1]);
                 using var g = gpu.GetOrAllocateBuffer(backend, gradOutput);

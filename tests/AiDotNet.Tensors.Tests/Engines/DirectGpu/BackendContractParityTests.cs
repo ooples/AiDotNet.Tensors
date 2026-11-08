@@ -236,8 +236,27 @@ public sealed class BackendContractParityTests
         for (int i = 0; i < fresh.Length; i++) Assert.Equal(fresh[i], uploaded[i]);
     }
 
+    // RoIPool rounds box corners as roundf does, halves away from zero (torchvision, the CUDA kernel, the CpuEngine).
+    // With scale 0.5 every corner below is an exact half: 2.5 must give pixel 3, where WGSL's round() and some GLSL
+    // drivers give 2 (half to even).
+    private static void CheckRoiPoolRounding(IDirectGpuBackend backend)
+    {
+        var roi = Assert.IsAssignableFrom<IRoiBackend>(backend);
+        const int size = 6;
+        var plane = new float[size * size];
+        for (int i = 0; i < plane.Length; i++) plane[i] = i;
+        using var x = backend.AllocateBuffer(plane);
+        using var boxes = backend.AllocateBuffer(new[] { 0f, 5f, 5f, 5f, 5f, 0f, 3f, 5f, 7f, 9f });
+        using var o = backend.AllocateBuffer(new float[2]);
+        roi.RoIPool(x, boxes, o, 1, 1, size, size, 2, 1, 1, 0.5f);
+        var got = backend.DownloadBuffer(o);
+        Assert.Equal(3 * size + 3, got[0]);          // corners (3, 3)-(3, 3)
+        Assert.Equal(5 * size + 4, got[1]);          // x 1.5 -> 2 .. 3.5 -> 4, y 2.5 -> 3 .. 4.5 -> 5: max at (5, 4)
+    }
+
     private static void Check(IDirectGpuBackend backend)
     {
+        CheckRoiPoolRounding(backend);
         CheckFp16(backend);
         CheckFusedIndex(backend);
         CheckDeviceOps(backend);
@@ -258,6 +277,13 @@ public sealed class BackendContractParityTests
         Skip.IfNot(backend.Initialize() && backend.IsGlslCompilerAvailable, "Vulkan with a GLSL compiler is not available.");
         Check(backend);
     }
+
+#if NET7_0_OR_GREATER
+    // WebGPU's FP16 and fused-index contracts differ, so only the rounding check runs there: WGSL's round() is
+    // ties-to-even, the regression this guards against.
+    [SkippableFact]
+    public void WebGpu_RoiPool_RoundsHalfAwayFromZero() => CheckRoiPoolRounding(DawnHostedWebGpu.BackendOrSkip());
+#endif
 
     [SkippableFact]
     public void Hip_BackendContracts_MatchTheCudaSemantics()

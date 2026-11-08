@@ -5,6 +5,9 @@ using System.Collections.Generic;
 using System.Linq;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Diagnostics;
+using AiDotNet.Tensors.Engines.Gpu;
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -26,7 +29,7 @@ public sealed class GatedDeltaNetScanTapeGpuTests : IClassFixture<DirectGpuTenso
 
     private static Tensor<float> Rand(int[] shape, int seed, bool gate = false)
     {
-        var rng = new Random(seed);
+        var rng = RandomHelper.CreateSeededRandom(seed);
         var t = new Tensor<float>(shape);
         for (int i = 0; i < t.Length; i++)
             t[i] = gate ? (float)(0.2 + 0.75 * rng.NextDouble()) : (float)(rng.NextDouble() - 0.5);
@@ -70,7 +73,7 @@ public sealed class GatedDeltaNetScanTapeGpuTests : IClassFixture<DirectGpuTenso
     public void TapeForwardAndGradients_StayOnGpu_AndMatchCpu(int batch, int seqLen, int modelDim, int numHeads)
     {
         Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
-        var gpu = _fixture.Engine!;
+        var gpu = _fixture.Engine ?? throw new InvalidOperationException("The GPU fixture reported a device but has no engine.");
         var cpu = new CpuEngine();
         int[] shape = [batch, seqLen, modelDim];
         int[] gateShape = [batch, seqLen, numHeads];
@@ -85,14 +88,27 @@ public sealed class GatedDeltaNetScanTapeGpuTests : IClassFixture<DirectGpuTenso
         var r = Rand(shape, 16);
 
         var (cpuOut, cpuGrads) = Run(cpu, inputs, r, numHeads);
-        var (gpuOut, gpuGrads) = Run(gpu, inputs, r, numHeads, expectOnDevice: true);
+
+        // Device-only copies, so a host read inside the taped scan cannot be served from a host array: any transfer or
+        // CPU fallback in the forward or backward shows up in the scope below.
+        var deviceInputs = inputs.Select(t => gpu.UploadToGpu(t, GpuTensorRole.General)).ToArray();
+        var deviceR = gpu.UploadToGpu(r, GpuTensorRole.General);
+        Run(gpu, deviceInputs, deviceR, numHeads);   // warm-up: kernel compilation and pooled buffers
+        GpuResidencyScope scope;
+        (Tensor<float> Out, Dictionary<Tensor<float>, Tensor<float>> Grads) measured;
+        using (scope = GpuResidencyScope.Begin(captureOperations: true))
+            measured = Run(gpu, deviceInputs, deviceR, numHeads, expectOnDevice: true);
+        Assert.True(scope.Uploads + scope.Downloads == 0,
+            "the taped scan crossed the host-device boundary: "
+            + string.Join(", ", scope.Events.Select(e => $"{e.Kind} {e.Bytes} B {e.Operation}")));
+        var (gpuOut, gpuGrads) = measured;
 
         AssertClose(cpuOut, gpuOut, "output");
         string[] names = ["dQ", "dK", "dV", "dAlpha", "dBeta"];
         for (int i = 0; i < 5; i++)
         {
-            Assert.True(gpuGrads.ContainsKey(inputs[i]), $"{names[i]} missing from the GPU tape");
-            AssertClose(cpuGrads[inputs[i]], gpuGrads[inputs[i]], names[i]);
+            Assert.True(gpuGrads.ContainsKey(deviceInputs[i]), $"{names[i]} missing from the GPU tape");
+            AssertClose(cpuGrads[inputs[i]], gpuGrads[deviceInputs[i]], names[i]);
         }
     }
 

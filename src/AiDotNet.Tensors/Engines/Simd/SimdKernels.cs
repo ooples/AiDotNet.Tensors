@@ -7150,6 +7150,95 @@ namespace AiDotNet.Tensors.Engines.Simd
                 output[j] *= invSum;
         }
 
+        /// <summary><c>row[i] += bias[i]</c>, returning the maximum of the updated row: the bias add and the softmax max
+        /// in one pass.</summary>
+        [MethodImpl(Hot)]
+        internal static unsafe float AddInPlaceAndMaxUnsafe(float* row, float* bias, int length)
+        {
+            int i = 0;
+            float max = float.NegativeInfinity;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 16)
+            {
+                var m0 = Vector256.Create(float.NegativeInfinity);
+                var m1 = m0;
+                int simdLength = length & ~15;
+                for (; i < simdLength; i += 16)
+                {
+                    var v0 = Avx.Add(Avx.LoadVector256(row + i), Avx.LoadVector256(bias + i));
+                    var v1 = Avx.Add(Avx.LoadVector256(row + i + 8), Avx.LoadVector256(bias + i + 8));
+                    Avx.Store(row + i, v0);
+                    Avx.Store(row + i + 8, v1);
+                    m0 = Avx.Max(m0, v0);
+                    m1 = Avx.Max(m1, v1);
+                }
+                var m = Avx.Max(m0, m1);
+                var lo = Sse.Max(m.GetLower(), m.GetUpper());
+                lo = Sse.Max(lo, Sse.Shuffle(lo, lo, 0b_01_00_11_10));
+                lo = Sse.Max(lo, Sse.Shuffle(lo, lo, 0b_10_11_00_01));
+                max = lo.ToScalar();
+            }
+#endif
+            for (; i < length; i++)
+            {
+                float v = row[i] + bias[i];
+                row[i] = v;
+                if (v > max) max = v;
+            }
+            return max;
+        }
+
+        /// <summary>
+        /// Cross-entropy of one logit row (plus <paramref name="bias"/> when non-null) against a class id, overwriting the
+        /// row with its gradient:
+        /// <c>row[v] = (softmax(row)[v] - [v == target]) * scale</c>. Returns the row's loss
+        /// <c>logsumexp(row) - row[target]</c>.
+        /// </summary>
+        /// <remarks>
+        /// One max pass, one fused exp-and-sum pass that stores the exponentials in place, and one scale pass, all
+        /// SIMD. SoftmaxRowUnsafe falls back to a scalar MathF.Exp loop for rows longer than 2048, which is every row of
+        /// an LM head. Uses FastExp256, the exp every AVX2 CPU uses (see ExpUnsafe), so the result does not depend on
+        /// the CPU vendor; the sum is accumulated in double per 32-element block, so a 50k-wide row does not lose the small
+        /// terms to float rounding.
+        /// </remarks>
+        [MethodImpl(Hot)]
+        internal static unsafe double CrossEntropyGradRowUnsafe(float* row, float* bias, int length, int target, float scale)
+        {
+            float max = bias is null ? MaxUnsafe(row, length) : AddInPlaceAndMaxUnsafe(row, bias, length);
+            float shiftedTarget = row[target] - max;
+            double sum = 0.0;
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
+            {
+                var vmax = Vector256.Create(max);
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    var e0 = FastExp256(Avx.Subtract(Avx.LoadVector256(row + i), vmax));
+                    var e1 = FastExp256(Avx.Subtract(Avx.LoadVector256(row + i + 8), vmax));
+                    var e2 = FastExp256(Avx.Subtract(Avx.LoadVector256(row + i + 16), vmax));
+                    var e3 = FastExp256(Avx.Subtract(Avx.LoadVector256(row + i + 24), vmax));
+                    Avx.Store(row + i, e0);
+                    Avx.Store(row + i + 8, e1);
+                    Avx.Store(row + i + 16, e2);
+                    Avx.Store(row + i + 24, e3);
+                    sum += HorizontalSum(Avx.Add(Avx.Add(e0, e1), Avx.Add(e2, e3)));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                float e = MathF.Exp(row[i] - max);
+                row[i] = e;
+                sum += e;
+            }
+
+            MultiplyScalarUnsafe(row, (float)(scale / sum), row, length);
+            row[target] -= scale;
+            return Math.Log(sum) - shiftedTarget;
+        }
+
         /// <summary>
         /// Computes log_softmax for a single contiguous row using unsafe pointers.
         /// log_softmax(x) = (x - max) - log(sum(exp(x - max)))
@@ -7255,6 +7344,48 @@ namespace AiDotNet.Tensors.Engines.Simd
             {
                 output[i] -= logSumExp;
             }
+        }
+
+        /// <summary>
+        /// Writes exp(input[i] - shift) to <paramref name="output"/> and returns their sum, accumulated in double.
+        /// </summary>
+        /// <remarks>
+        /// A float running sum drops the small terms of a long row once it nears 1: with one logit at the row's maximum
+        /// and 49,151 at -15, each exp(-15) = 3.06e-7 added to a sum near 1 rounds to 3 ulp (3.58e-7), in every SIMD
+        /// lane that holds the maximum as well as in a scalar loop, and log(sum) (the cross-entropy of a confident row)
+        /// came out 17% high. The exponentials stay float; each 8-lane block is widened and summed in double.
+        /// </remarks>
+        [MethodImpl(HotInline)]
+        internal static unsafe double ExpShiftedSumUnsafe(float* input, float* output, float shift, int length)
+        {
+            int i = 0;
+            double sum = 0.0;
+#if NET5_0_OR_GREATER
+            if (Avx2.IsSupported && Fma.IsSupported && length >= 16)
+            {
+                var vshift = Vector256.Create(shift);
+                var acc0 = Vector256<double>.Zero;
+                var acc1 = Vector256<double>.Zero;
+                int simdLen = length & ~7;
+                for (; i < simdLen; i += 8)
+                {
+                    var e = FastExp256(Avx.Subtract(Avx.LoadVector256(input + i), vshift));
+                    Avx.Store(output + i, e);
+                    acc0 = Avx.Add(acc0, Avx.ConvertToVector256Double(e.GetLower()));
+                    acc1 = Avx.Add(acc1, Avx.ConvertToVector256Double(e.GetUpper()));
+                }
+                var acc = Avx.Add(acc0, acc1);
+                var pair = Sse2.Add(acc.GetLower(), acc.GetUpper());
+                sum = pair.GetElement(0) + pair.GetElement(1);
+            }
+#endif
+            for (; i < length; i++)
+            {
+                float e = (float)Math.Exp(input[i] - shift);
+                output[i] = e;
+                sum += e;
+            }
+            return sum;
         }
 
     #endregion

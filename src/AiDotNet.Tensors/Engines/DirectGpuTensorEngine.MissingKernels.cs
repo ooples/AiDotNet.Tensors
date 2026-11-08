@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using AiDotNet.Tensors;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
@@ -1068,7 +1069,7 @@ public partial class DirectGpuTensorEngine
 
         try
         {
-            var gc = gradOutput.IsContiguous ? gradOutput : (Tensor<T>)gradOutput.Contiguous();
+            var gc = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
             using var bufGrad = GetOrAllocateBuffer(backend, gc);
             using var padRe = AllocateTransientScratch(backend, batch * nFft);
             using var padIm = AllocateTransientScratch(backend, batch * nFft);
@@ -1077,35 +1078,31 @@ public partial class DirectGpuTensorEngine
             using var oneRe = AllocateTransientScratch(backend, batch * numFreqs, fullyWritten: true);
             using var oneIm = AllocateTransientScratch(backend, batch * numFreqs, fullyWritten: true);
             using var interleaved = AllocateTransientScratch(backend, batch * numFreqs * 2, fullyWritten: true);
-            var scaled = AllocateFullyWrittenOutputBuffer(backend, batch * numFreqs * 2);
-            try
-            {
-                // Zero-pad the real gradient to nFft; the imaginary part is zero throughout.
-                backend.Fill(padRe.Buffer, 0f, batch * nFft);
-                backend.Fill(padIm.Buffer, 0f, batch * nFft);
-                backend.CopyRows(bufGrad.Buffer, padRe.Buffer, outputLength, nFft, batch,
-                    System.Math.Min(outputLength, nFft));
+            using var scaled = AllocateFullyWrittenOutputBuffer(backend, batch * numFreqs * 2);
+            // Zero-pad the real gradient to nFft; the imaginary part is zero throughout.
+            backend.Fill(padRe.Buffer, 0f, batch * nFft);
+            backend.Fill(padIm.Buffer, 0f, batch * nFft);
+            backend.CopyRows(bufGrad.Buffer, padRe.Buffer, outputLength, nFft, batch,
+                System.Math.Min(outputLength, nFft));
 
-                // FORWARD transform (inverse: false) applies no 1/nFft, so this is the unnormalized sum
-                // the adjoint needs — the mirror of RfftAdjointGpu, which undoes the inverse's 1/nFft.
-                backend.BatchedFFT(padRe.Buffer, padIm.Buffer, fftRe.Buffer, fftIm.Buffer, batch, nFft, inverse: false);
+            // FORWARD transform (inverse: false) applies no 1/nFft, so this is the unnormalized sum
+            // the adjoint needs — the mirror of RfftAdjointGpu, which undoes the inverse's 1/nFft.
+            backend.BatchedFFT(padRe.Buffer, padIm.Buffer, fftRe.Buffer, fftIm.Buffer, batch, nFft, inverse: false);
 
-                // Keep the one-sided bins.
-                backend.CopyRows(fftRe.Buffer, oneRe.Buffer, nFft, numFreqs, batch, numFreqs);
-                backend.CopyRows(fftIm.Buffer, oneIm.Buffer, nFft, numFreqs, batch, numFreqs);
-                backend.InterleaveComplex(oneRe.Buffer, oneIm.Buffer, interleaved.Buffer, batch * numFreqs);
+            // Keep the one-sided bins.
+            backend.CopyRows(fftRe.Buffer, oneRe.Buffer, nFft, numFreqs, batch, numFreqs);
+            backend.CopyRows(fftIm.Buffer, oneIm.Buffer, nFft, numFreqs, batch, numFreqs);
+            backend.InterleaveComplex(oneRe.Buffer, oneIm.Buffer, interleaved.Buffer, batch * numFreqs);
 
-                // c_k/nFft per bin, with the Nyquist imaginary slot zeroed (1-row constant broadcast across batch).
-                int weightCount = batch * numFreqs * 2;
-                using var weights = CachedSpectrumConstant(backend, SpectrumConstant.IrfftAdjointWeights, 1, numFreqs, nFft);
-                backend.BroadcastMultiplyLastAxis(interleaved.Buffer, weights.Buffer, scaled.Buffer, batch, numFreqs * 2);
-                backend.Synchronize();
+            // c_k/nFft per bin, with the Nyquist imaginary slot zeroed (1-row constant broadcast across batch).
+            int weightCount = batch * numFreqs * 2;
+            using var weights = CachedSpectrumConstant(backend, SpectrumConstant.IrfftAdjointWeights, 1, numFreqs, nFft);
+            backend.BroadcastMultiplyLastAxis(interleaved.Buffer, weights.Buffer, scaled.Buffer, batch, numFreqs * 2);
+            backend.Synchronize();
 
-                var result = DeferTensorResult<T>(backend, scaled.Buffer, weightCount, (int[])inputShape.Clone());
-                scaled.RelinquishOwnership();
-                return result;
-            }
-            finally { scaled.Dispose(); }
+            var result = DeferTensorResult<T>(backend, scaled.Buffer, weightCount, (int[])inputShape.Clone());
+            scaled.RelinquishOwnership();
+            return result;
         }
         catch (Exception)
         {
@@ -4051,6 +4048,25 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorUnfold<T>(Tensor<T> tensor, int dim, int size, int step)
     {
+        // Under GraphMode the CpuEngine op records the compiled node; each replay re-enters here outside
+        // graph mode and runs the GPU kernel.
+        if (Compilation.GraphMode.IsActive) return base.TensorUnfold(tensor, dim, size, step);
+        var result = TensorUnfoldOnGpu(tensor, dim, size, step);
+        // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
+        // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
+        // The backward indexes the input shape with the saved axis, so it is saved normalized, as the CPU op saves it.
+        if (result.GradFn is null)
+        {
+            // Binds the tape to this engine, so the backward of a device result runs on the device.
+            BindTapeIfRecording<T>();
+            Autodiff.DifferentiableOps.RecordUnary("TensorUnfold", result, tensor, Autodiff.BackwardFunctions<T>.UnfoldParity210Backward,
+                savedState: new object[] { dim < 0 ? dim + tensor.Rank : dim, size, step, (int[])tensor._shape.Clone() });
+        }
+        return result;
+    }
+
+    private Tensor<T> TensorUnfoldOnGpu<T>(Tensor<T> tensor, int dim, int size, int step)
+    {
         using var __gpuOp = EnterGpuOp();
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
         if (size <= 0) throw new ArgumentOutOfRangeException(nameof(size), "size must be positive");
@@ -4178,6 +4194,8 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorCartesianProd<T>(Tensor<T>[] tensors)
     {
+        if (TryRecordCompiledOp("TensorCartesianProd", Combine(tensors), e => e.TensorCartesianProd(tensors), out var compiledNode))
+            return compiledNode;
         using var __gpuOp = EnterGpuOp();
         if (tensors is null) throw new ArgumentNullException(nameof(tensors));
         if (tensors.Length < 2 || typeof(T) != typeof(float) || !TryGetBackend(out _))
@@ -4192,28 +4210,26 @@ public partial class DirectGpuTensorEngine
             // ij-meshgrid, give each grid a trailing size-1 axis, concatenate along it, then flatten to
             // [prod, numInputs] — all GPU-resident (Meshgrid + Reshape + Concatenate).
             int m = tensors.Length;
-            var grids = TensorMeshgrid(tensors, "ij");
-            var gshape = grids[0]._shape;
-            var withOne = new int[gshape.Length + 1];
-            for (int i = 0; i < gshape.Length; i++) withOne[i] = gshape[i];
-            withOne[gshape.Length] = 1;
-            var reshaped = new Tensor<T>[m];
-            for (int k = 0; k < m; k++) reshaped[k] = grids[k].Reshape(withOne);
-            var stacked = TensorConcatenate(reshaped, gshape.Length);
-            int prod = 1; foreach (var t in tensors) prod *= t._shape[0];
-            var res = stacked.Reshape(new[] { prod, m });
-            // This record is LOAD-BEARING, not redundant, even though the GPU TensorMeshgrid above is
-            // itself built from TensorBroadcastTo(tensors[k].Reshape(rshape), ...) and so looks like it
-            // already chains back to the caller's tensors. It does not: `.Reshape` returns a VIEW that is
-            // not tape-linked to `tensors[k]` (the same GradFn-discarding behaviour the #257 notes
-            // describe for `.Contiguous`), so BroadcastToBackward accumulates into the view and the
-            // caller's input receives nothing from the composition.
-            //
-            // Verified by measurement rather than by reading, because the failure modes are adjacent and
-            // both silent: if the chain DID survive the reshape this record would double the gradient,
-            // and if it is removed the gradient disappears. CartesianProdGpuTapeParityTests pins the
-            // closed form on both engines — d(sum)/da[i] == b.Length and d(sum)/db[j] == a.Length — so
-            // either mistake fails loudly.
+            Tensor<T> res;
+            // The composition runs under NoGrad so the op owns exactly one tape edge, the record below. Whether its
+            // primitives chain back to the inputs depends on residency: a host input's Reshape is a view the tape does
+            // not link, a device-resident one's is linked. With the primitives recorded, a compiled step (whose inputs
+            // are resident) got the composition's gradient AND this edge's: twice the gradient (#1680).
+            using (GradientTape<T>.NoGrad())
+            {
+                var grids = TensorMeshgrid(tensors, "ij");
+                var gshape = grids[0]._shape;
+                var withOne = new int[gshape.Length + 1];
+                for (int i = 0; i < gshape.Length; i++) withOne[i] = gshape[i];
+                withOne[gshape.Length] = 1;
+                var reshaped = new Tensor<T>[m];
+                for (int k = 0; k < m; k++) reshaped[k] = grids[k].Reshape(withOne);
+                var stacked = TensorConcatenate(reshaped, gshape.Length);
+                int prod = 1; foreach (var t in tensors) prod *= t._shape[0];
+                res = stacked.Reshape(new[] { prod, m });
+            }
+            // CartesianProdGpuTapeParityTests pins the closed form on both engines: d(sum)/da[i] == b.Length and
+            // d(sum)/db[j] == a.Length.
             DifferentiableOps.RecordIfActive("TensorCartesianProd", res, tensors,
                 BackwardFunctions<T>.CartesianProdBackward);
             return res;
@@ -4250,6 +4266,24 @@ public partial class DirectGpuTensorEngine
 
     /// <inheritdoc/>
     public override Tensor<T> TensorMaskedSelect<T>(Tensor<T> tensor, Tensor<Bit> mask)
+    {
+        // Under GraphMode the CpuEngine op records the compiled node; each replay re-enters here outside
+        // graph mode and runs the GPU kernel.
+        if (Compilation.GraphMode.IsActive) return base.TensorMaskedSelect(tensor, mask);
+        var result = TensorMaskedSelectOnGpu(tensor, mask);
+        // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
+        // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
+        if (result.GradFn is null && Autodiff.DifferentiableOps.IsRecording<T>())
+        {
+            // Binds the tape to this engine, so the backward of a device result runs on the device. The saved mask is
+            // a copy: the backward scatters by it, and the caller may edit its own tensor before backward runs.
+            BindTapeIfRecording<T>();
+            Autodiff.DifferentiableOps.RecordUnary("TensorMaskedSelect", result, tensor, Autodiff.BackwardFunctions<T>.MaskedSelectBackward, savedState: new object[] { mask.IsContiguous ? mask.Clone() : mask.Contiguous(), (int[])tensor._shape.Clone() });
+        }
+        return result;
+    }
+
+    private Tensor<T> TensorMaskedSelectOnGpu<T>(Tensor<T> tensor, Tensor<Bit> mask)
     {
         using var __gpuOp = EnterGpuOp();
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
@@ -4822,6 +4856,23 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorTakeAlongDim<T>(Tensor<T> tensor, Tensor<int> indices, int dim)
     {
+        // Under GraphMode the CpuEngine op records the compiled node; each replay re-enters here outside
+        // graph mode and runs the GPU kernel.
+        if (Compilation.GraphMode.IsActive) return base.TensorTakeAlongDim(tensor, indices, dim);
+        var result = TensorTakeAlongDimOnGpu(tensor, indices, dim);
+        // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
+        // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
+        if (result.GradFn is null)
+        {
+            // Binds the tape to this engine, so the backward of a device result runs on the device.
+            BindTapeIfRecording<T>();
+            Autodiff.DifferentiableOps.RecordUnary("TensorTakeAlongDim", result, tensor, Autodiff.BackwardFunctions<T>.TakeAlongDimBackward, savedState: new object[] { indices, dim });
+        }
+        return result;
+    }
+
+    private Tensor<T> TensorTakeAlongDimOnGpu<T>(Tensor<T> tensor, Tensor<int> indices, int dim)
+    {
         using var __gpuOp = EnterGpuOp();
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
         if (indices is null) throw new ArgumentNullException(nameof(indices));
@@ -5021,6 +5072,23 @@ public partial class DirectGpuTensorEngine
 
     /// <inheritdoc/>
     public override Tensor<T> TensorKron<T>(Tensor<T> a, Tensor<T> b)
+    {
+        // Under GraphMode the CpuEngine op records the compiled node; each replay re-enters here outside
+        // graph mode and runs the GPU kernel.
+        if (Compilation.GraphMode.IsActive) return base.TensorKron(a, b);
+        var result = TensorKronOnGpu(a, b);
+        // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
+        // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
+        if (result.GradFn is null)
+        {
+            // Binds the tape to this engine, so the backward of a device result runs on the device.
+            BindTapeIfRecording<T>();
+            Autodiff.DifferentiableOps.RecordBinary("TensorKron", result, a, b, Autodiff.BackwardFunctions<T>.KronBackward);
+        }
+        return result;
+    }
+
+    private Tensor<T> TensorKronOnGpu<T>(Tensor<T> a, Tensor<T> b)
     {
         using var __gpuOp = EnterGpuOp();
         if (a is null) throw new ArgumentNullException(nameof(a));
@@ -6020,6 +6088,9 @@ public partial class DirectGpuTensorEngine
             return false;
         try
         {
+            if (targetIds is not null && TryFusedLinearCrossEntropyIndexBackwardChunked(gradOutput, hidden, weight, bias,
+                    targetIds, out gradHidden, out gradWeight, out gradBias))
+                return true;
             int n = hidden._shape[0], vocab = weight._shape[1];
             int total = checked(n * vocab);
             var logitShape = new[] { n, vocab };
@@ -6066,6 +6137,98 @@ public partial class DirectGpuTensorEngine
             return false;
         }
     }
+
+    // Scratch per row chunk of the chunked fused-CE backward: two [chunk, vocab] float buffers of at most this many
+    // elements each (128 MiB), so a V=49152 head takes 672-row chunks instead of several [N, V] tensors.
+    private const int FusedCeBackwardChunkElements = 32 * 1024 * 1024;
+
+    /// <summary>Row chunks the last chunked fused-CE backward ran (tests: proves the multi-chunk path executed).</summary>
+    internal static int LastFusedCeBackwardChunks;
+
+    /// <summary>
+    /// The index-target fused linear + cross-entropy backward in row chunks, never forming <c>[N, vocab]</c>:
+    /// per chunk of rows, logits = h_c·W + b, softmax, minus the one-hot (a scatter-add of -1), times
+    /// gradOutput[0] / N (read on the device), then dHidden_c = dLogits_c·Wᵀ, dWeight += h_cᵀ·dLogits_c and
+    /// dBias += 1ᵀ·dLogits_c (GEMMs accumulating with beta = 1). The whole-tensor version kept the logits, the
+    /// probabilities, their copy, the scaled difference and dLogits alive at once: five [N, V] tensors (4096 x 49152
+    /// floats = 805 MB each), which filled a 12 GB device and made every training step wait on their frees.
+    /// </summary>
+    private bool TryFusedLinearCrossEntropyIndexBackwardChunked<T>(Tensor<T> gradOutput, Tensor<T> hidden,
+        Tensor<T> weight, Tensor<T> bias, int[] targetIds,
+        out Tensor<T> gradHidden, out Tensor<T> gradWeight, out Tensor<T> gradBias)
+    {
+        gradHidden = gradWeight = gradBias = hidden;
+        if (!TryGetBackend(out var backend) || backend is not DirectGpu.ITransposedAGemm transposedA
+            || gradOutput.Length != 1 || bias.Length != weight._shape[1])
+            return false;
+        int n = hidden._shape[0], d = hidden._shape[1], vocab = weight._shape[1];
+        if (n <= 0 || d <= 0 || vocab <= 0 || weight._shape[0] != d || targetIds.Length != n) return false;
+        int chunk = Math.Max(1, Math.Min(n, FusedCeBackwardChunkElements / vocab));
+        if (chunk >= 32) chunk &= ~31;
+        checked { _ = chunk * vocab; _ = n * d; _ = d * vocab; }
+
+        // Target positions inside a chunk's [chunk, vocab] block, as int bits in a float buffer (the scatter reads
+        // the bits; a pooled float buffer is returned to the pool instead of a blocking free).
+        var positionBits = new float[n];
+        for (int r = 0; r < n; r++)
+        {
+            int id = targetIds[r];
+            if (id < 0 || id >= vocab) return false;
+            positionBits[r] = AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx.PtxCompat.Int32BitsToSingle((r % chunk) * vocab + id);
+        }
+
+        var h = hidden.IsContiguous ? hidden : hidden.Contiguous();
+        var w = weight.IsContiguous ? weight : weight.Contiguous();
+        var b = bias.IsContiguous ? bias : bias.Contiguous();
+        var g = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
+        using var hB = GetOrAllocateBuffer(backend, h);
+        using var wB = GetOrAllocateBuffer(backend, w);
+        using var bB = GetOrAllocateBuffer(backend, b);
+        using var gB = GetOrAllocateBuffer(backend, g);
+        using var positions = new OwnedBuffer(backend.AllocateBuffer(positionBits), ownsBuffer: true);
+        // using: an allocation that throws (an LM-sized head under memory pressure) still disposes the buffers before
+        // it; RelinquishOwnership hands each one to its result.
+        using var dHidden = AllocateOutputBuffer(backend, n * d);
+        using var dWeight = AllocateOutputBuffer(backend, d * vocab);
+        using var dBias = AllocateOutputBuffer(backend, vocab);
+        // Stream-ordered scratch: still read by queued kernels when this returns.
+        using var logits = AllocateStreamOrderedScratch(backend, chunk * vocab);
+        using var work = AllocateStreamOrderedScratch(backend, chunk * vocab);
+        using var hChunk = AllocateStreamOrderedScratch(backend, chunk * d);
+        using var dhChunk = AllocateStreamOrderedScratch(backend, chunk * d);
+        using var ones = AllocateStreamOrderedScratch(backend, chunk);
+        using var minusOnes = AllocateStreamOrderedScratch(backend, chunk);
+        using var chunkPositions = AllocateStreamOrderedScratch(backend, chunk);
+        backend.Fill(ones, 1f, chunk);
+        backend.Fill(minusOnes, -1f, chunk);
+        for (int r0 = 0; r0 < n; r0 += chunk)
+        {
+            int c = Math.Min(chunk, n - r0), cv = c * vocab;
+            float beta = r0 == 0 ? 0f : 1f;
+            backend.Copy(hB.Buffer, r0 * d, hChunk, 0, c * d);
+            backend.Copy(positions.Buffer, r0, chunkPositions, 0, c);
+            backend.Gemm(hChunk, wB.Buffer, logits, c, vocab, d);                // logits = h_c·W
+            backend.BiasAdd(logits, bB.Buffer, work, c, vocab);                  // + b
+            backend.Softmax(work, logits, c, vocab);                             // probabilities
+            backend.ScatterAdd(minusOnes, chunkPositions, logits, c, cv);        // - one-hot
+            backend.Scale(logits, logits, 1f / n, cv);                           // / N
+            backend.BroadcastMultiplyLastAxis(logits, gB.Buffer, work, cv, 1);   // * gradOutput[0] = dLogits_c
+            backend.MatMulTransposed(work, wB.Buffer, dhChunk, c, d, vocab);     // dHidden_c = dLogits_c·Wᵀ
+            backend.Copy(dhChunk, 0, dHidden.Buffer, r0 * d, c * d);
+            transposedA.MatMulTransposedA(hChunk, work, dWeight.Buffer, d, vocab, c, 1f, beta); // dW += h_cᵀ·dL_c
+            backend.Gemm(ones, work, dBias.Buffer, 1, vocab, c, 1f, beta);       // dB += 1ᵀ·dL_c
+        }
+        RecordFusedCeBackwardChunks((n + chunk - 1) / chunk);
+        gradHidden = DeferTensorResult<T>(backend, dHidden.Buffer, n * d, new[] { n, d });
+        dHidden.RelinquishOwnership();
+        gradWeight = DeferTensorResult<T>(backend, dWeight.Buffer, d * vocab, new[] { d, vocab });
+        dWeight.RelinquishOwnership();
+        gradBias = DeferTensorResult<T>(backend, dBias.Buffer, vocab, new[] { vocab });
+        dBias.RelinquishOwnership();
+        return true;
+    }
+
+    private static void RecordFusedCeBackwardChunks(int chunks) => LastFusedCeBackwardChunks = chunks;
 
     /// <summary>
     /// <c>factor * scalar[0] * tensor</c> — or, with a null <paramref name="tensor"/>, <c>factor * scalar[0]</c> filled
@@ -6884,6 +7047,12 @@ public partial class DirectGpuTensorEngine
         // than threading a flag through six kernel sources and six wrappers.
         //
         // S == 1 makes S/(S-1) undefined; align_corners=false with a size-1 axis is degenerate, so defer.
+        //
+        // Every mode and padding first runs the geometry backend's mode-aware kernel, the exact derivative of its
+        // GridSample2D forward with PyTorch's padding rules (#1680). This kernel is the fallback for a backend
+        // without one; it zeroes the grid gradient at a coordinate exactly on pixel -1, where PyTorch's is one-sided.
+        if (TryGridSampleModeBackwardInput(gradOutput, grid, inputShape, mode, padding, alignCorners, out var modeGrad))
+            return modeGrad;
         if (typeof(T) != typeof(float) || mode != GridSampleMode.Bilinear || padding != GridSamplePadding.Zeros
             || inputShape.Length != 4 || gradOutput.Rank != 4 || grid.Rank != 4
             || (!alignCorners && (inputShape[2] <= 1 || inputShape[3] <= 1))
@@ -6908,6 +7077,96 @@ public partial class DirectGpuTensorEngine
             // while the launch above may still be reading it.
             if (bufGridAdj is not null) backend.Synchronize();
         });
+    }
+
+    /// <summary>
+    /// GridSample input gradient on the device for any mode and padding, through
+    /// <see cref="IGeometryBackwardBackend.GridSample2DBackwardInput"/>. False when the backend has no geometry
+    /// kernels or the shapes are not 4D float, so the caller falls back to the CpuEngine reference.
+    /// </summary>
+    private bool TryGridSampleModeBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> grid, int[] inputShape,
+        GridSampleMode mode, GridSamplePadding padding, bool alignCorners, [NotNullWhen(true)] out Tensor<T>? result)
+    {
+        result = null;
+        if (typeof(T) != typeof(float) || inputShape.Length != 4 || gradOutput.Rank != 4
+            || grid.Rank != 4 || grid._shape[3] != 2
+            || !TryGetBackend(out var backend) || backend is not IGeometryBackwardBackend geom)
+            return false;
+        int N = inputShape[0], C = inputShape[1], H = inputShape[2], W = inputShape[3];
+        int outH = grid._shape[1], outW = grid._shape[2];
+        // A mismatched shape would read out of bounds on the device; the CPU reference reports it.
+        if (grid._shape[0] != N || !ShapesEqual(gradOutput._shape, new[] { N, C, outH, outW })) return false;
+        int inSize = N * C * H * W;
+        // An empty input, or no sampling points, has an all-zero (possibly empty) gradient, as on the CPU. A
+        // zero-length device buffer cannot be allocated, so it is answered here.
+        if (inSize == 0 || gradOutput.Length == 0)
+        {
+            result = new Tensor<T>((int[])inputShape.Clone());
+            return true;
+        }
+
+        try
+        {
+            using var bufGO = GetOrAllocateBuffer(backend, gradOutput);
+            using var bufGrid = GetOrAllocateBuffer(backend, grid);
+            result = DispatchDeferredGpuOp<T>(backend, inSize, (int[])inputShape.Clone(), output =>
+            {
+                // The kernel accumulates: several sampling points can read one pixel.
+                backend.Fill(output, 0f, inSize);
+                geom.GridSample2DBackwardInput(bufGO.Buffer, bufGrid.Buffer, output,
+                    N, H, W, C, outH, outW, (int)mode, (int)padding, alignCorners);
+            });
+            return true;
+        }
+        catch (NotSupportedException capabilityGap)
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            GpuLaunchProbe.OnFallback("GridSampleBackwardInput", capabilityGap);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// GridSample grid gradient on the device for any mode and padding, through
+    /// <see cref="IGeometryBackwardBackend.GridSample2DBackwardGrid"/>. Falls back like
+    /// <see cref="TryGridSampleModeBackwardInput{T}"/>.
+    /// </summary>
+    private bool TryGridSampleModeBackwardGrid<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> grid,
+        GridSampleMode mode, GridSamplePadding padding, bool alignCorners, [NotNullWhen(true)] out Tensor<T>? result)
+    {
+        result = null;
+        if (typeof(T) != typeof(float) || input.Rank != 4 || gradOutput.Rank != 4
+            || grid.Rank != 4 || grid._shape[3] != 2
+            || !TryGetBackend(out var backend) || backend is not IGeometryBackwardBackend geom)
+            return false;
+        int N = input._shape[0], C = input._shape[1], H = input._shape[2], W = input._shape[3];
+        int outH = grid._shape[1], outW = grid._shape[2];
+        if (grid._shape[0] != N || !ShapesEqual(gradOutput._shape, new[] { N, C, outH, outW })) return false;
+        // No sampling points, or nothing to sample: the grid gradient is all zero (possibly empty), as on the CPU,
+        // and a zero-length device buffer cannot be allocated.
+        if (grid.Length == 0 || gradOutput.Length == 0 || input.Length == 0)
+        {
+            result = new Tensor<T>((int[])grid._shape.Clone());
+            return true;
+        }
+
+        try
+        {
+            using var bufGO = GetOrAllocateBuffer(backend, gradOutput);
+            using var bufIn = GetOrAllocateBuffer(backend, input);
+            using var bufGrid = GetOrAllocateBuffer(backend, grid);
+            result = DispatchDeferredGpuOp<T>(backend, N * outH * outW * 2, (int[])grid._shape.Clone(),
+                output => geom.GridSample2DBackwardGrid(bufGO.Buffer, bufIn.Buffer, bufGrid.Buffer, output,
+                    N, H, W, C, outH, outW, (int)mode, (int)padding, alignCorners),
+                fullyWritten: true);
+            return true;
+        }
+        catch (NotSupportedException capabilityGap)
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            GpuLaunchProbe.OnFallback("GridSampleBackwardGrid", capabilityGap);
+            return false;
+        }
     }
 
     /// <summary>
@@ -6956,6 +7215,8 @@ public partial class DirectGpuTensorEngine
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (grid is null) throw new ArgumentNullException(nameof(grid));
         // Same align_corners handling as GridSampleBackwardInput above — see the derivation there.
+        if (TryGridSampleModeBackwardGrid(gradOutput, input, grid, mode, padding, alignCorners, out var modeGrad))
+            return modeGrad;
         if (typeof(T) != typeof(float) || mode != GridSampleMode.Bilinear || padding != GridSamplePadding.Zeros
             || input.Rank != 4 || gradOutput.Rank != 4 || grid.Rank != 4
             || (!alignCorners && (input._shape[2] <= 1 || input._shape[3] <= 1))
@@ -6997,6 +7258,23 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorZeta<T>(Tensor<T> x, Tensor<T> q)
     {
+        // Under GraphMode the CpuEngine op records the compiled node; each replay re-enters here outside
+        // graph mode and runs the GPU kernel.
+        if (Compilation.GraphMode.IsActive) return base.TensorZeta(x, q);
+        var result = TensorZetaOnGpu(x, q);
+        // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
+        // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
+        if (result.GradFn is null)
+        {
+            // Binds the tape to this engine, so the backward of a device result runs on the device.
+            BindTapeIfRecording<T>();
+            Autodiff.DifferentiableOps.RecordBinary("TensorZeta", result, x, q, Autodiff.BackwardFunctions<T>.ZetaBackward);
+        }
+        return result;
+    }
+
+    private Tensor<T> TensorZetaOnGpu<T>(Tensor<T> x, Tensor<T> q)
+    {
         using var __gpuOp = EnterGpuOp();
         if (x is null) throw new ArgumentNullException(nameof(x));
         if (q is null) throw new ArgumentNullException(nameof(q));
@@ -7019,6 +7297,23 @@ public partial class DirectGpuTensorEngine
 
     /// <inheritdoc/>
     public override Tensor<T> TensorPolygamma<T>(int n, Tensor<T> tensor)
+    {
+        // Under GraphMode the CpuEngine op records the compiled node; each replay re-enters here outside
+        // graph mode and runs the GPU kernel.
+        if (Compilation.GraphMode.IsActive) return base.TensorPolygamma(n, tensor);
+        var result = TensorPolygammaOnGpu(n, tensor);
+        // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
+        // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
+        if (result.GradFn is null)
+        {
+            // Binds the tape to this engine, so the backward of a device result runs on the device.
+            BindTapeIfRecording<T>();
+            Autodiff.DifferentiableOps.RecordUnary("TensorPolygamma", result, tensor, Autodiff.BackwardFunctions<T>.PolygammaBackward, savedState: new object[] { n });
+        }
+        return result;
+    }
+
+    private Tensor<T> TensorPolygammaOnGpu<T>(int n, Tensor<T> tensor)
     {
         using var __gpuOp = EnterGpuOp();
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
@@ -7165,6 +7460,23 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorCross<T>(Tensor<T> a, Tensor<T> b, int dim = -1)
     {
+        // Under GraphMode the CpuEngine op records the compiled node; each replay re-enters here outside
+        // graph mode and runs the GPU kernel.
+        if (Compilation.GraphMode.IsActive) return base.TensorCross(a, b, dim);
+        var result = TensorCrossOnGpu(a, b, dim);
+        // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
+        // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
+        if (result.GradFn is null)
+        {
+            // Binds the tape to this engine, so the backward of a device result runs on the device.
+            BindTapeIfRecording<T>();
+            Autodiff.DifferentiableOps.RecordBinary("TensorCross", result, a, b, Autodiff.BackwardFunctions<T>.CrossBackward, savedState: new object[] { dim });
+        }
+        return result;
+    }
+
+    private Tensor<T> TensorCrossOnGpu<T>(Tensor<T> a, Tensor<T> b, int dim = -1)
+    {
         using var __gpuOp = EnterGpuOp();
         if (a is null) throw new ArgumentNullException(nameof(a));
         if (b is null) throw new ArgumentNullException(nameof(b));
@@ -7241,6 +7553,23 @@ public partial class DirectGpuTensorEngine
 
     /// <inheritdoc/>
     public override Tensor<T> TensorLdexp<T>(Tensor<T> x, Tensor<int> exp)
+    {
+        // Under GraphMode the CpuEngine op records the compiled node; each replay re-enters here outside
+        // graph mode and runs the GPU kernel.
+        if (Compilation.GraphMode.IsActive) return base.TensorLdexp(x, exp);
+        var result = TensorLdexpOnGpu(x, exp);
+        // The CPU op's tape edge, on a result the kernel produced (#1680): without it every input got a zero
+        // gradient on the GPU engine. A result the CPU fallback produced already carries the edge.
+        if (result.GradFn is null)
+        {
+            // Binds the tape to this engine, so the backward of a device result runs on the device.
+            BindTapeIfRecording<T>();
+            Autodiff.DifferentiableOps.RecordUnary("TensorLdexp", result, x, Autodiff.BackwardFunctions<T>.LdexpBackward, new object[] { exp });
+        }
+        return result;
+    }
+
+    private Tensor<T> TensorLdexpOnGpu<T>(Tensor<T> x, Tensor<int> exp)
     {
         using var __gpuOp = EnterGpuOp();
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
@@ -9579,6 +9908,7 @@ public partial class DirectGpuTensorEngine
     {
         if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
             return base.TensorBinaryCrossEntropy(predictions, targets, epsilon);
+        targets = PairedTargets(predictions, targets);
         var numOps = MathHelper.GetNumericOperations<T>();
         var upper = numOps.Subtract(numOps.One, epsilon);
         var pc = TensorClamp(predictions, epsilon, upper);                                 // clamp(p, eps, 1-eps)
@@ -9589,6 +9919,23 @@ public partial class DirectGpuTensorEngine
         return TensorNegate(loss);
     }
 
+    // The CPU loss pairs predictions and targets element by element in row-major order. The composition below
+    // broadcasts instead, so targets [1, 2] against predictions [2, 1] gave a [2, 2] loss (and a compiled replay
+    // could not copy it into the recorded [2, 1] output). Viewing the targets in the predictions' shape pairs them
+    // as the CPU does.
+    private Tensor<T> PairedTargets<T>(Tensor<T> predictions, Tensor<T> targets)
+    {
+        if (predictions is null) throw new ArgumentNullException(nameof(predictions));
+        if (targets is null) throw new ArgumentNullException(nameof(targets));
+        if (targets.Length != predictions.Length)
+            throw new ArgumentException(
+                $"Binary cross-entropy pairs predictions and targets element by element: {predictions.Length} predictions, {targets.Length} targets.",
+                nameof(targets));
+        return targets._shape.AsSpan().SequenceEqual(predictions._shape)
+            ? targets
+            : Reshape(targets, (int[])predictions._shape.Clone());
+    }
+
     // #775: BCE gradient d/dp = (1-t)/(1-pc) - t/pc, pc = clamp(p, eps, 1-eps). Element-wise compose
     // from GPU-resident TensorClamp/Divide/Subtract (1-x via Negate+AddScalar), same clamp + term order
     // as CpuEngine. Defer to base under tape/GraphMode.
@@ -9596,6 +9943,7 @@ public partial class DirectGpuTensorEngine
     {
         if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
             return base.TensorBinaryCrossEntropyBackward(predictions, targets, epsilon);
+        targets = PairedTargets(predictions, targets);
         var numOps = MathHelper.GetNumericOperations<T>();
         var upper = numOps.Subtract(numOps.One, epsilon);
         var pc = TensorClamp(predictions, epsilon, upper);
@@ -9990,7 +10338,7 @@ public partial class DirectGpuTensorEngine
                 ownsBuffer: true, bufferContainsRawInt32: true);
             idxBuf.RelinquishOwnership();
 
-            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
+            BindTapeIfRecording<T>();
             Autodiff.DifferentiableOps.RecordUnary("MaxPool3DWithIndices", result, input,
                 Autodiff.BackwardFunctions<T>.MaxPool3DTensorIndicesBackward,
                 new object[] { maxIndices, poolSize, stride });
@@ -10860,16 +11208,21 @@ public partial class DirectGpuTensorEngine
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorSinh", capabilityGap); return base.TensorSinh(tensor); }
     }
 
-    // #775: TensorReciprocal on the existing backend.Reciprocal (reciprocal_vector = 1/x) unary kernel.
+    // #775: TensorReciprocal on the existing backend.Reciprocal (reciprocal_vector = 1/x) unary kernel. The result stays
+    // on the device and the tape records the same node CpuEngine does: this used to return to the host whenever a tape
+    // was active, so every training step's RMSNorm 1/rms ran on the CPU (with a download of rms per layer).
     Tensor<T> IEngine.TensorReciprocal<T>(Tensor<T> tensor)
     {
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || !tensor.IsContiguous)
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float))
             return base.TensorReciprocal(tensor);
         try
         {
-            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Reciprocal(input, output, size));
-            if (result != null)
-                return new Tensor<T>(result, tensor.Shape._dims);
+            var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) => backend.Reciprocal(input, output, size));
+            if (output != null)
+            {
+                DifferentiableOps.RecordUnary("Reciprocal", output, tensor, BackwardFunctions<T>.ReciprocalBackward);
+                return output;
+            }
             return base.TensorReciprocal(tensor);
         }
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorReciprocal", capabilityGap); return base.TensorReciprocal(tensor); }

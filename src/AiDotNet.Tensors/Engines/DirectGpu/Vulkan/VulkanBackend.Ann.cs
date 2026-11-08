@@ -10,8 +10,10 @@ using System;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
-public sealed unsafe partial class VulkanBackend : IAnnBackend
+public sealed unsafe partial class VulkanBackend : IAnnBackend, IChargesDeviceMemoryReclaim
 {
+    bool IChargesDeviceMemoryReclaim.ChargesDeviceMemoryReclaim => true;
+
     private const uint AnnPush4 = 4u * sizeof(uint); // numX, numY, dim/m, metric/...
     private const uint AnnPush5 = 5u * sizeof(uint); // PQ tables: +dsub
 

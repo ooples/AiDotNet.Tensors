@@ -28,6 +28,12 @@ internal sealed class CompiledStep<T>
     /// <summary>Operation name for diagnostics.</summary>
     internal readonly string OpName;
 
+    /// <summary>
+    /// True when <see cref="Execute"/> updates host state of its own on every replay (an unseeded random op drawing
+    /// its step's seed), which a captured CUDA graph would freeze at its capture-time value.
+    /// </summary>
+    internal bool ReplaysHostState { get; init; }
+
     /// <summary>Type-safe operation type for compiled plan dispatch (avoids string comparisons).</summary>
     internal readonly OpType OpType;
 

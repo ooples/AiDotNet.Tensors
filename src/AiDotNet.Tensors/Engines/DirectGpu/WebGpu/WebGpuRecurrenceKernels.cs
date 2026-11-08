@@ -455,4 +455,112 @@ fn addDAB(idx: i32, val: f32) { var old = atomicLoad(&dAB[idx]); loop { let nv =
         }
     }
 }";
+
+    public const string GatedDeltaBackwardDeterministic = @"
+@group(0) @binding(0) var<storage, read> dOut: array<f32>;
+// QKpk = Q|K and ABSpk = A|Bt|Straj as in GatedDeltaBackward. Each row's dK contribution overwrites that row of the
+// trajectory in ABSpk (read only by this invocation, and last read at step t + 1); Part = [dA | dB] per-row partials.
+@group(0) @binding(1) var<storage, read> QKpk: array<f32>;
+@group(0) @binding(2) var<storage, read> Vd: array<f32>;
+@group(0) @binding(3) var<storage, read_write> ABSpk: array<f32>;
+@group(0) @binding(4) var<storage, read_write> Part: array<f32>;
+@group(0) @binding(5) var<storage, read_write> dV: array<f32>;
+struct P { batch: i32, seqLen: i32, modelDim: i32, numHeads: i32, headDim: i32 };
+@group(0) @binding(6) var<uniform> p: P;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
+    let gid = i32(gid3.x);
+    let B = p.batch; let SL = p.seqLen; let MD = p.modelDim; let NH = p.numHeads; let HD = p.headDim;
+    if (gid >= B*NH*HD) { return; }
+    let di = gid % HD; let h = (gid/HD) % NH; let b = gid/(HD*NH); let hOff = h*HD; let hh = HD*HD;
+    let qkCount = B*SL*MD; let gCount = B*SL*NH; let trajOff = 2*gCount;
+    let kappa = 1.0/sqrt(f32(HD));
+    var dSrow: array<f32, 256>;
+    for (var ki: i32 = 0; ki < HD; ki = ki+1) { dSrow[ki] = 0.0; }
+    for (var t: i32 = SL-1; t >= 0; t = t-1) {
+        let baseOff = (b*SL+t)*MD + hOff; let gIdx = (b*SL+t)*NH + h;
+        let a = ABSpk[gIdx]; let bet = ABSpk[gCount + gIdx];
+        let trajBase = ((b*NH+h)*SL+t)*hh + di*HD;
+        let sprevBase = ((b*NH+h)*SL+(t-1))*hh + di*HD;
+        var sK: f32 = 0.0;
+        for (var ki: i32 = 0; ki < HD; ki = ki+1) {
+            var sprev: f32 = 0.0; if (t > 0) { sprev = ABSpk[trajOff + sprevBase + ki]; }
+            sK = sK + sprev * (QKpk[qkCount + baseOff + ki] * kappa);
+        }
+        let delta = Vd[baseOff+di] - sK;
+        let dOutVal = dOut[baseOff+di];
+        for (var ki: i32 = 0; ki < HD; ki = ki+1) {
+            dSrow[ki] = dSrow[ki] + dOutVal*QKpk[baseOff+ki];
+        }
+        var dA_acc: f32 = 0.0; var dB_acc: f32 = 0.0; var dDelta: f32 = 0.0;
+        for (var ki: i32 = 0; ki < HD; ki = ki+1) {
+            let dSt = dSrow[ki];
+            var sprev: f32 = 0.0; if (t > 0) { sprev = ABSpk[trajOff + sprevBase + ki]; }
+            let kScaled = QKpk[qkCount + baseOff + ki] * kappa;
+            dA_acc = dA_acc + dSt*sprev;
+            dB_acc = dB_acc + dSt*delta*kScaled;
+            dDelta = dDelta + dSt*bet*kScaled;
+        }
+        dV[baseOff+di] = dDelta;
+        Part[gIdx*HD + di] = dA_acc;
+        Part[qkCount + gIdx*HD + di] = dB_acc;
+        let dSk = -dDelta;
+        for (var ki: i32 = 0; ki < HD; ki = ki+1) {
+            let dSt = dSrow[ki];
+            var sprev: f32 = 0.0; if (t > 0) { sprev = ABSpk[trajOff + sprevBase + ki]; }
+            let kScaled = QKpk[qkCount + baseOff + ki] * kappa;
+            let dKS = dSt*(bet*delta) + dSk*sprev;
+            ABSpk[trajOff + trajBase + ki] = dKS*kappa;
+            dSrow[ki] = dSt*a + dSk*kScaled;
+        }
+    }
+}";
+
+    // Deterministic dQ: dQ[b,t,h,ki] = sum over di (ascending) of dOut[b,t,h,di] * S_t[di,ki].
+    public const string GatedDeltaDq = @"
+@group(0) @binding(0) var<storage, read> dOut: array<f32>;
+@group(0) @binding(1) var<storage, read> Straj: array<f32>;
+@group(0) @binding(2) var<storage, read_write> dQ: array<f32>;
+struct P { batch: i32, seqLen: i32, modelDim: i32, numHeads: i32, headDim: i32 };
+@group(0) @binding(3) var<uniform> p: P;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
+    let gid = i32(gid3.x);
+    let SL = p.seqLen; let MD = p.modelDim; let NH = p.numHeads; let HD = p.headDim;
+    if (gid >= p.batch*SL*MD) { return; }
+    let ki = gid % HD; let h = (gid/HD) % NH; let bt = gid / MD; let t = bt % SL; let b = bt / SL;
+    let trajT = ((b*NH+h)*SL+t)*HD*HD;
+    let base = bt*MD + h*HD;
+    var acc: f32 = 0.0;
+    for (var di: i32 = 0; di < HD; di = di+1) { acc = acc + dOut[base+di]*Straj[trajT + di*HD + ki]; }
+    dQ[gid] = acc;
+}";
+
+    // Deterministic reduction of GatedDeltaBackwardDeterministic's partials: dK from the overwritten trajectory rows
+    // in ABSpk and dA/dB from Part = [dA | dB], each summed over di in ascending order.
+    public const string GatedDeltaReduce = @"
+@group(0) @binding(0) var<storage, read> ABSpk: array<f32>;
+@group(0) @binding(1) var<storage, read> Part: array<f32>;
+@group(0) @binding(2) var<storage, read_write> dK: array<f32>;
+@group(0) @binding(3) var<storage, read_write> dA: array<f32>;
+@group(0) @binding(4) var<storage, read_write> dB: array<f32>;
+struct P { batch: i32, seqLen: i32, modelDim: i32, numHeads: i32, headDim: i32 };
+@group(0) @binding(5) var<uniform> p: P;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
+    let gid = i32(gid3.x);
+    let SL = p.seqLen; let MD = p.modelDim; let NH = p.numHeads; let HD = p.headDim;
+    let n = p.batch*SL*MD;
+    if (gid >= n) { return; }
+    let ki = gid % HD; let h = (gid/HD) % NH; let bt = gid / MD; let t = bt % SL; let b = bt / SL;
+    let trajOff = 2*p.batch*SL*NH;
+    let trajT = trajOff + ((b*NH+h)*SL+t)*HD*HD;
+    var acc: f32 = 0.0;
+    for (var di: i32 = 0; di < HD; di = di+1) { acc = acc + ABSpk[trajT + di*HD + ki]; }
+    dK[gid] = acc;
+    if (ki == 0) {
+        let gIdx = bt*NH + h;
+        var sa: f32 = 0.0; var sb: f32 = 0.0;
+        for (var di: i32 = 0; di < HD; di = di+1) { sa = sa + Part[gIdx*HD + di]; sb = sb + Part[n + gIdx*HD + di]; }
+        dA[gIdx] = sa;
+        dB[gIdx] = sb;
+    }
+}";
 }

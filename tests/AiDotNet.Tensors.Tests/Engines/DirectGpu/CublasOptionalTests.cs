@@ -128,6 +128,8 @@ public sealed class CublasOptionalTests
                 backend.GemmRoutingEnabled = false;   // keep routing out of it: this compares cuBLAS and the fallback
                 // Likewise the small-shape kernels (#1410): they would serve the smaller shapes before either side.
                 backend.SmallGemmRoutesEnabled = false;
+                // And the declared GEMM slot: it takes alpha = 1, beta = 0 calls (MatMulTransposedA here) on both sides.
+                backend.DeclaredKernelsSwitch = false;
                 Expect(Both(backend, output, c => backend.Gemm(a, b, c, m, n, k, 0.5f, 2f), Read, "Gemm"), "Gemm");
                 Expect(Both(backend, output, c => backend.MatMulTransposed(a, bT, c, m, n, k, 1.5f, -1f), Read, "MatMulTransposed"),
                     "MatMulTransposed");
@@ -160,6 +162,8 @@ public sealed class CublasOptionalTests
         backend.GemmRoutingEnabled = false;
         // The small-shape kernels (#1410) are generated too, but they are not the fallback GEMM this test counts.
         backend.SmallGemmRoutesEnabled = false;
+        // Nor is the declared GEMM slot, which serves alpha = 1, beta = 0 calls before either.
+        backend.DeclaredKernelsSwitch = false;
         const int m = 33, n = 65, k = 17;
         using var a = backend.AllocateBuffer(Values(m * k, 1));
         using var b = backend.AllocateBuffer(Values(k * n, 2));

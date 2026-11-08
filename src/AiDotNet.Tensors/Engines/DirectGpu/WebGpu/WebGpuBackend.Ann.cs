@@ -17,8 +17,10 @@ using System.Threading.Tasks;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
-public sealed partial class WebGpuBackend : IAnnBackend
+public sealed partial class WebGpuBackend : IAnnBackend, IChargesDeviceMemoryReclaim
 {
+    bool IChargesDeviceMemoryReclaim.ChargesDeviceMemoryReclaim => false;
+
     private const string AnnModuleKey = "Ann";
 
     // -----------------------------------------------------------------------

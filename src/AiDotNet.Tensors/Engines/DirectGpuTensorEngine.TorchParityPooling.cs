@@ -16,25 +16,43 @@ public partial class DirectGpuTensorEngine
 {
     /// <inheritdoc/>
     public override Tensor<T> TensorAdaptiveMaxPool1D<T>(Tensor<T> input, int outputSize)
-        => AdaptiveMaxOnDevice(input, new[] { outputSize }, "TensorAdaptiveMaxPool1D") ?? HostFallback("TensorAdaptiveMaxPool1D", () => base.TensorAdaptiveMaxPool1D(input, outputSize));
+    {
+        if (TryRecordCompiledOp("TensorAdaptiveMaxPool1D", new Tensor<T>?[] { input }, e => e.TensorAdaptiveMaxPool1D(input, outputSize), out var compiledNode))
+            return compiledNode;
+        return AdaptiveMaxOnDevice(input, new[] { outputSize }, "TensorAdaptiveMaxPool1D") ?? HostFallback("TensorAdaptiveMaxPool1D", () => base.TensorAdaptiveMaxPool1D(input, outputSize));
+    }
 
     /// <inheritdoc/>
     public override Tensor<T> TensorAdaptiveMaxPool3D<T>(Tensor<T> input, int[] outputSize)
-        => (outputSize is { Length: 3 } ? AdaptiveMaxOnDevice(input, outputSize, "TensorAdaptiveMaxPool3D") : null)
+    {
+        if (TryRecordCompiledOp("TensorAdaptiveMaxPool3D", new Tensor<T>?[] { input }, e => e.TensorAdaptiveMaxPool3D(input, outputSize), out var compiledNode))
+            return compiledNode;
+        return (outputSize is { Length: 3 } ? AdaptiveMaxOnDevice(input, outputSize, "TensorAdaptiveMaxPool3D") : null)
            ?? HostFallback("TensorAdaptiveMaxPool3D", () => base.TensorAdaptiveMaxPool3D(input, outputSize));
+    }
 
     /// <inheritdoc/>
     public override Tensor<T> TensorAdaptiveAvgPool1D<T>(Tensor<T> input, int outputSize)
-        => AdaptiveAverageOnDevice(input, new[] { outputSize }, "TensorAdaptiveAvgPool1D") ?? HostFallback("TensorAdaptiveAvgPool1D", () => base.TensorAdaptiveAvgPool1D(input, outputSize));
+    {
+        if (TryRecordCompiledOp("TensorAdaptiveAvgPool1D", new Tensor<T>?[] { input }, e => e.TensorAdaptiveAvgPool1D(input, outputSize), out var compiledNode))
+            return compiledNode;
+        return AdaptiveAverageOnDevice(input, new[] { outputSize }, "TensorAdaptiveAvgPool1D") ?? HostFallback("TensorAdaptiveAvgPool1D", () => base.TensorAdaptiveAvgPool1D(input, outputSize));
+    }
 
     /// <inheritdoc/>
     public override Tensor<T> TensorAdaptiveAvgPool3D<T>(Tensor<T> input, int[] outputSize)
-        => (outputSize is { Length: 3 } ? AdaptiveAverageOnDevice(input, outputSize, "TensorAdaptiveAvgPool3D") : null)
+    {
+        if (TryRecordCompiledOp("TensorAdaptiveAvgPool3D", new Tensor<T>?[] { input }, e => e.TensorAdaptiveAvgPool3D(input, outputSize), out var compiledNode))
+            return compiledNode;
+        return (outputSize is { Length: 3 } ? AdaptiveAverageOnDevice(input, outputSize, "TensorAdaptiveAvgPool3D") : null)
            ?? HostFallback("TensorAdaptiveAvgPool3D", () => base.TensorAdaptiveAvgPool3D(input, outputSize));
+    }
 
     /// <inheritdoc/>
     public override Tensor<T> TensorLpPool<T>(Tensor<T> input, double power, int[] kernelSize, int[]? stride = null)
     {
+        if (TryRecordCompiledOp("TensorLpPool", new Tensor<T>?[] { input }, e => e.TensorLpPool(input, power, kernelSize, stride), out var compiledNode))
+            return compiledNode;
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         // The zero pad contributes 0^p, which is 0 only for p > 0; other powers (and invalid arguments) take the CPU path.
         if (input is not null && power > 0 && !double.IsInfinity(power) && kernelSize is { Length: > 0 }

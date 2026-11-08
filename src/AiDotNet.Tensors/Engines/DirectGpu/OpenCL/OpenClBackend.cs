@@ -7741,6 +7741,16 @@ KERNEL VARIANTS (A/B testing):
             k.Execute1D(globalSize, localSize);
         }
 
+        // IDirectGpuBackend declares gradOutput first; this class's public method keeps its shipped parameter order, so
+        // a positional caller of the concrete class still binds as before. Both bind the kernel's buffers by name.
+        void IDirectGpuBackend.DeformableConv2DBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradWeights,
+            int batch, int inChannels, int inHeight, int inWidth,
+            int outChannels, int outHeight, int outWidth,
+            int kernelH, int kernelW, int strideH, int strideW, int padH, int padW,
+            int dilationH, int dilationW, int groups, int deformGroups)
+            => DeformableConv2DBackwardWeights(input, gradOutput, offsets, mask, gradWeights,
+                batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups);
+
         public void DeformableConv2DBackwardWeights(IGpuBuffer input, IGpuBuffer gradOutput, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradWeights,
             int batch, int inChannels, int inHeight, int inWidth,
             int outChannels, int outHeight, int outWidth,
@@ -7782,6 +7792,16 @@ KERNEL VARIANTS (A/B testing):
             k.Execute1D(globalSize, localSize);
         }
 
+        // IDirectGpuBackend declares gradOutput first; this class's public method keeps its shipped parameter order, so
+        // a positional caller of the concrete class still binds as before. Both bind the kernel's buffers by name.
+        void IDirectGpuBackend.DeformableConv2DBackwardOffset(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradOffset,
+            int batch, int inChannels, int inHeight, int inWidth,
+            int outChannels, int outHeight, int outWidth,
+            int kernelH, int kernelW, int strideH, int strideW, int padH, int padW,
+            int dilationH, int dilationW, int groups, int deformGroups)
+            => DeformableConv2DBackwardOffset(input, weights, gradOutput, offsets, mask, gradOffset,
+                batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups);
+
         public void DeformableConv2DBackwardOffset(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer gradOutput, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradOffset,
             int batch, int inChannels, int inHeight, int inWidth,
             int outChannels, int outHeight, int outWidth,
@@ -7822,6 +7842,16 @@ KERNEL VARIANTS (A/B testing):
             int globalSize = ((totalOffsets + localSize - 1) / localSize) * localSize;
             k.Execute1D(globalSize, localSize);
         }
+
+        // IDirectGpuBackend declares gradOutput first; this class's public method keeps its shipped parameter order, so
+        // a positional caller of the concrete class still binds as before. Both bind the kernel's buffers by name.
+        void IDirectGpuBackend.DeformableConv2DBackwardMask(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer gradMask,
+            int batch, int inChannels, int inHeight, int inWidth,
+            int outChannels, int outHeight, int outWidth,
+            int kernelH, int kernelW, int strideH, int strideW, int padH, int padW,
+            int dilationH, int dilationW, int groups, int deformGroups)
+            => DeformableConv2DBackwardMask(input, weights, gradOutput, offsets, gradMask,
+                batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups);
 
         public void DeformableConv2DBackwardMask(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer gradOutput, IGpuBuffer offsets, IGpuBuffer gradMask,
             int batch, int inChannels, int inHeight, int inWidth,
@@ -13950,6 +13980,7 @@ KERNEL VARIANTS (A/B testing):
                 throw new ArgumentException($"modelDim ({modelDim}) must equal numHeads * headDim ({numHeads * headDim}).");
             if (headDim > Kernels.GatedDeltaNetKernels.MaxHeadDim)
                 throw new InvalidOperationException($"GatedDeltaNet headDim ({headDim}) exceeds max ({Kernels.GatedDeltaNetKernels.MaxHeadDim}).");
+            GatedDeltaNetBackwardResolver.ValidateBuffers(dOut, q, k, v, alpha, beta, dQ, dK, dV, dAlpha, dBeta, batch, seqLen, modelDim, numHeads);
             if (!_kernelCache.TryGetValue("gated_delta_scan_recompute", out var recompute) ||
                 !_kernelCache.TryGetValue("gated_delta_scan_backward", out var backward))
                 throw new GpuCapabilityUnavailableException("OpenCL kernel not found: gated_delta_scan_recompute / gated_delta_scan_backward");
@@ -13958,14 +13989,28 @@ KERNEL VARIANTS (A/B testing):
             long trajLenLong = checked(totalLong * seqLen * headDim);
             if (totalLong > int.MaxValue || trajLenLong > int.MaxValue)
                 throw new ArgumentOutOfRangeException(nameof(batch), "GatedDeltaNet dimensions exceed OpenCL launch/buffer limits.");
-            Fill(dQ, 0f, batch * seqLen * modelDim);
-            Fill(dK, 0f, batch * seqLen * modelDim);
-            Fill(dAlpha, 0f, batch * seqLen * numHeads);
-            Fill(dBeta, 0f, batch * seqLen * numHeads);
+            // Deterministic mode replaces the atomic accumulation with per-row partials summed in a fixed order (see
+            // gated_delta_scan_backward); dq and reduce write every element, so nothing needs clearing first.
+            bool det = GpuDeterminism.IsActive;
+            DirectOpenClKernel? dqKernel = null, reduceKernel = null;
+            if (det && (!_kernelCache.TryGetValue("gated_delta_scan_dq", out dqKernel)
+                        || !_kernelCache.TryGetValue("gated_delta_scan_reduce", out reduceKernel)))
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: gated_delta_scan_dq / gated_delta_scan_reduce");
+            int n = batch * seqLen * modelDim;
+            if (!det)
+            {
+                Fill(dQ, 0f, n);
+                Fill(dK, 0f, n);
+                Fill(dAlpha, 0f, batch * seqLen * numHeads);
+                Fill(dBeta, 0f, batch * seqLen * numHeads);
+            }
             int trajLen = (int)trajLenLong;
             using var trajBuf = AllocateBuffer(trajLen);
             int total = (int)totalLong;
-            int localSize = CalculateOptimalWorkGroupSize1D(total);
+            // One size launches both kernels, so it must fit the smaller compiled limit: their private state arrays
+            // can push CL_KERNEL_WORK_GROUP_SIZE below the device maximum.
+            int localSize = ClampLocalSizeForKernel(backward,
+                ClampLocalSizeForKernel(recompute, CalculateOptimalWorkGroupSize1D(total), 0), 0);
             int globalSize = ((total + localSize - 1) / localSize) * localSize;
 
             recompute.SetArg(0u, ((DirectOpenClGpuBuffer)k).Buffer.Handle);
@@ -13980,6 +14025,17 @@ KERNEL VARIANTS (A/B testing):
             recompute.SetArg(9u, headDim);
             recompute.Execute1D(globalSize, localSize);
 
+            using var partials = det ? AllocateBuffer(checked(2 * n)) : null;
+            if (dqKernel is not null)
+            {
+                dqKernel.SetArg(0u, ((DirectOpenClGpuBuffer)dOut).Buffer.Handle);
+                dqKernel.SetArg(1u, ((DirectOpenClGpuBuffer)trajBuf).Buffer.Handle);
+                dqKernel.SetArg(2u, ((DirectOpenClGpuBuffer)dQ).Buffer.Handle);
+                SetScanDims(dqKernel, 3u, batch, seqLen, modelDim, numHeads, headDim);
+                int dqLocal = ClampLocalSizeForKernel(dqKernel, CalculateOptimalWorkGroupSize1D(n), 0);
+                dqKernel.Execute1D(((n + dqLocal - 1) / dqLocal) * dqLocal, dqLocal);
+            }
+
             backward.SetArg(0u, ((DirectOpenClGpuBuffer)dOut).Buffer.Handle);
             backward.SetArg(1u, ((DirectOpenClGpuBuffer)q).Buffer.Handle);
             backward.SetArg(2u, ((DirectOpenClGpuBuffer)k).Buffer.Handle);
@@ -13987,7 +14043,7 @@ KERNEL VARIANTS (A/B testing):
             backward.SetArg(4u, ((DirectOpenClGpuBuffer)alpha).Buffer.Handle);
             backward.SetArg(5u, ((DirectOpenClGpuBuffer)beta).Buffer.Handle);
             backward.SetArg(6u, ((DirectOpenClGpuBuffer)trajBuf).Buffer.Handle);
-            backward.SetArg(7u, ((DirectOpenClGpuBuffer)dQ).Buffer.Handle);
+            backward.SetArg(7u, ((DirectOpenClGpuBuffer)(partials ?? dQ)).Buffer.Handle);
             backward.SetArg(8u, ((DirectOpenClGpuBuffer)dK).Buffer.Handle);
             backward.SetArg(9u, ((DirectOpenClGpuBuffer)dV).Buffer.Handle);
             backward.SetArg(10u, ((DirectOpenClGpuBuffer)dAlpha).Buffer.Handle);
@@ -13997,7 +14053,30 @@ KERNEL VARIANTS (A/B testing):
             backward.SetArg(14u, modelDim);
             backward.SetArg(15u, numHeads);
             backward.SetArg(16u, headDim);
+            backward.SetArg(17u, det ? 1 : 0);
             backward.Execute1D(globalSize, localSize);
+
+            if (reduceKernel is not null && partials is not null)
+            {
+                reduceKernel.SetArg(0u, ((DirectOpenClGpuBuffer)trajBuf).Buffer.Handle);
+                reduceKernel.SetArg(1u, ((DirectOpenClGpuBuffer)partials).Buffer.Handle);
+                reduceKernel.SetArg(2u, ((DirectOpenClGpuBuffer)dK).Buffer.Handle);
+                reduceKernel.SetArg(3u, ((DirectOpenClGpuBuffer)dAlpha).Buffer.Handle);
+                reduceKernel.SetArg(4u, ((DirectOpenClGpuBuffer)dBeta).Buffer.Handle);
+                SetScanDims(reduceKernel, 5u, batch, seqLen, modelDim, numHeads, headDim);
+                int reduceLocal = ClampLocalSizeForKernel(reduceKernel, CalculateOptimalWorkGroupSize1D(n), 0);
+                reduceKernel.Execute1D(((n + reduceLocal - 1) / reduceLocal) * reduceLocal, reduceLocal);
+            }
+        }
+
+        private static void SetScanDims(DirectOpenClKernel kernel, uint first, int batch, int seqLen, int modelDim,
+            int numHeads, int headDim)
+        {
+            kernel.SetArg(first, batch);
+            kernel.SetArg(first + 1, seqLen);
+            kernel.SetArg(first + 2, modelDim);
+            kernel.SetArg(first + 3, numHeads);
+            kernel.SetArg(first + 4, headDim);
         }
 
         // ── Fused RG-LRU scan forward (#1464) ───────────────────────────────────────────────
@@ -14699,6 +14778,7 @@ KERNEL VARIANTS (A/B testing):
         {
             if (_returnToPool is { } returnToPool && Interlocked.CompareExchange(ref _poolState, 2, 0) == 0)
             {
+                DeviceMemoryReclaim.OnDeviceFinalized((long)Size * sizeof(float), ReclaimEpoch);
                 var pooledBuffer = Buffer;
                 var memory = _memory.TransferToLease();
                 PendingFrees.Enqueue(() => returnToPool(Pooled(pooledBuffer, returnToPool, memory)));
