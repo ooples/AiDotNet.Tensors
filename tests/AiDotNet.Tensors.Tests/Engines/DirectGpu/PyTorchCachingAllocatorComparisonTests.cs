@@ -69,13 +69,17 @@ public class PyTorchCachingAllocatorComparisonTests
                 return;
             }
 
+            // Both sides must be measuring one device, or every number below compares two different GPUs.
+            Assert.True(string.Equals(backend.DeviceName.Trim(), torch.Device.Trim(), StringComparison.Ordinal),
+                $"our engine runs on '{backend.DeviceName}' but PyTorch measured '{torch.Device}'");
+
             // Ours, release: the same drop as GpuEngineReleaseTests, then the reset.
             GpuEngineReleaseTests.DropDeviceResults(gpu, Elements, Count);
-            memory.TryGetDeviceMemory(out ulong before, out _);
+            Assert.True(memory.TryGetDeviceMemory(out ulong before, out _), "free device memory before the reset was not readable");
             var watch = Stopwatch.StartNew();
             AiDotNetEngine.ResetToCpu();
             double releaseSeconds = watch.Elapsed.TotalSeconds;
-            memory.TryGetDeviceMemory(out ulong after, out _);
+            Assert.True(memory.TryGetDeviceMemory(out ulong after, out _), "free device memory after the reset was not readable");
             long freed = (long)after - (long)before;
 
             // Ours, churn: the backend's allocate + free, as torch.empty + del exercises PyTorch's.

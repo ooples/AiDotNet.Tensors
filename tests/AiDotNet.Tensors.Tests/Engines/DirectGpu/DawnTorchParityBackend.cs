@@ -96,6 +96,10 @@ public sealed class DawnTorchParityFixture : IDirectGpuTensorEngineFixture, IDis
 
     public DawnTorchParityFixture()
     {
+        // Translate only where Dawn can run: elsewhere the fixture is unavailable, and a translation that timed out
+        // would fail the class instead of letting it skip. Translating before the server starts leaves nothing to
+        // clean up when it throws.
+        if (!DawnWgslLauncher.IsConfigured) return;
         var dawn = DawnWgslLauncher.TryCreate(AiDotNet.Tensors.Engines.DirectGpu.WebGpu.CudaDialectToWgsl.Modules(TorchParityModules));
         if (dawn is null) return;
         OpenClBackend? host = null;
