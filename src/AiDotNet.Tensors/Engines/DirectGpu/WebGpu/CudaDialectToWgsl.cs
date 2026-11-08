@@ -26,7 +26,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 /// </summary>
 internal static class CudaDialectToWgsl
 {
-    private static readonly System.TimeSpan Timeout = System.TimeSpan.FromSeconds(5);
+    // The input is this library's own compiled-in kernel source, so the timeout only has to stop a runaway pattern. It is
+    // wall time, and a blocking full collection of a large heap suspends this thread too: 5 s timed out translating a
+    // small kernel on the CUDA runner (RegexMatchTimeoutException in the Dawn parity fixture).
+    private static readonly System.TimeSpan Timeout = System.TimeSpan.FromSeconds(60);
 
     private static readonly Regex KernelHeader = new(
         @"extern ""C"" __global__ __launch_bounds__\(256\) void (\w+)\(([^)]*)\)\s*\{", RegexOptions.None, Timeout);
@@ -34,6 +37,31 @@ internal static class CudaDialectToWgsl
 
     private static readonly Regex HelperHeader = new(
         @"__device__ __forceinline__ (float2|uint2|float|int|unsigned int|bool|void) (\w+)\(([^)]*)\)\s*\{", RegexOptions.None, Timeout);
+
+    /// <summary>
+    /// A translated module set computed on first use and not poisoned by a failed translation: a default
+    /// <see cref="System.Lazy{T}"/> caches the exception, so one regex timeout during a long process-wide pause failed
+    /// every later request until the process restarted. The next request translates again; translation is pure, so a
+    /// race that runs it twice only duplicates the work. Read it through <see cref="Modules{T}"/>.
+    /// </summary>
+    internal static System.Lazy<T> RetryingModules<T>(System.Func<T> translate) =>
+        new(translate, System.Threading.LazyThreadSafetyMode.PublicationOnly);
+
+    /// <summary>
+    /// The value of a <see cref="RetryingModules{T}"/> set. A translation that timed out while a concurrent one
+    /// published its result uses the published modules; with nothing published the timeout propagates.
+    /// </summary>
+    internal static T Modules<T>(System.Lazy<T> modules)
+    {
+        try
+        {
+            return modules.Value;
+        }
+        catch (RegexMatchTimeoutException) when (modules.IsValueCreated)
+        {
+            return modules.Value;
+        }
+    }
 
     /// <summary>Kernel name to its WGSL module.</summary>
     public static Dictionary<string, string> Translate(string source)
