@@ -38,6 +38,31 @@ internal static class CudaDialectToWgsl
     private static readonly Regex HelperHeader = new(
         @"__device__ __forceinline__ (float2|uint2|float|int|unsigned int|bool|void) (\w+)\(([^)]*)\)\s*\{", RegexOptions.None, Timeout);
 
+    /// <summary>
+    /// A translated module set computed on first use and not poisoned by a failed translation: a default
+    /// <see cref="System.Lazy{T}"/> caches the exception, so one regex timeout during a long process-wide pause failed
+    /// every later request until the process restarted. The next request translates again; translation is pure, so a
+    /// race that runs it twice only duplicates the work. Read it through <see cref="Modules{T}"/>.
+    /// </summary>
+    internal static System.Lazy<T> RetryingModules<T>(System.Func<T> translate) =>
+        new(translate, System.Threading.LazyThreadSafetyMode.PublicationOnly);
+
+    /// <summary>
+    /// The value of a <see cref="RetryingModules{T}"/> set. A translation that timed out while a concurrent one
+    /// published its result uses the published modules; with nothing published the timeout propagates.
+    /// </summary>
+    internal static T Modules<T>(System.Lazy<T> modules)
+    {
+        try
+        {
+            return modules.Value;
+        }
+        catch (RegexMatchTimeoutException) when (modules.IsValueCreated)
+        {
+            return modules.Value;
+        }
+    }
+
     /// <summary>Kernel name to its WGSL module.</summary>
     public static Dictionary<string, string> Translate(string source)
     {
