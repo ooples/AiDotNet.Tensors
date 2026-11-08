@@ -265,8 +265,9 @@ jobs:
         # this step past two hours without it firing, and the job timeout then cancelled the job, which skips the
         # failure-only stack step below. The watchdog bounds the step instead: past the limit it prints each test
         # host's managed stacks and the processes under the runner, then fails the step so the steps below still run.
-        # Passing runs take 78 to 101 minutes here.
-        SUITE_WATCHDOG_MINUTES: '120'
+        # Passing SM86 runs take 78 to 101 minutes here (job limit 150); the SM75 suites take about 3 hours (job limit
+        # 240). Each watchdog leaves time before its job limit for the diagnostics and the steps after this one.
+        SUITE_WATCHDOG_MINUTES: ${{ matrix.arch == 'sm86' && '120' || '215' }}
       run: |
         New-Item -ItemType Directory -Force "${{ runner.temp }}/trx" | Out-Null
         $filter = $env:CUDA_LANE_FILTER -replace "\s", ""
@@ -280,10 +281,11 @@ jobs:
         if ($run.WaitForExit([int]$env:SUITE_WATCHDOG_MINUTES * 60 * 1000)) { exit $run.ExitCode }
 
         Write-Output "::error::The GPU suites were still running after $env:SUITE_WATCHDOG_MINUTES minutes."
+        # Ids, parents and names only: a command line from another workload on the runner could carry a credential.
         Write-Output "::group::Processes"
         Get-CimInstance Win32_Process |
           Where-Object { $_.Name -match '^(testhost|dotnet|python)' } |
-          Format-Table ProcessId, ParentProcessId, Name, CommandLine -AutoSize -Wrap | Out-String -Width 400
+          Format-Table ProcessId, ParentProcessId, Name, CreationDate -AutoSize | Out-String -Width 200
         Write-Output "::endgroup::"
         $tools = "${{ runner.temp }}/dotnet-stack"
         dotnet tool install dotnet-stack --tool-path $tools | Out-Null
