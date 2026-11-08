@@ -18278,7 +18278,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         IntPtr pdo = dOut.Handle, pq = q.Handle;
         IntPtr pdq = dQ.Handle, pdk = dK.Handle, pdv = dV.Handle, pda = dAlpha.Handle, pdb = dBeta.Handle;
-        uint nGrid = ((uint)n + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize;
+        // dq and reduce run one warp per element (32 threads each).
+        uint nGrid = (uint)checked(((long)n * 32 + DefaultBlockSize - 1) / DefaultBlockSize);
         using var partials = det ? AllocateBuffer(checked(2 * n)) : null;
         IntPtr pp = partials?.Handle ?? IntPtr.Zero;
         if (det)

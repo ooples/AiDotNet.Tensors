@@ -166,50 +166,66 @@ extern ""C"" __global__ void gated_delta_scan_backward(
     }
 }
 
-// Deterministic dQ: dQ[b,t,h,ki] = sum over di (ascending) of dOut[b,t,h,di] * S_t[di,ki]. One thread per dQ element.
+// Deterministic dQ: dQ[b,t,h,ki] = sum over di of dOut[b,t,h,di] * S_t[ki,di]. One warp per dQ element: lane l sums
+// di = l, l+32, ... (consecutive lanes read consecutive di of the [ki, di] trajectory row, one transaction), then a
+// fixed shuffle tree combines the lanes, so the order is the same on every run. Launched with gridDim*blockDim >= 32*n
+// and blockDim a multiple of 32, so a warp leaves together.
+__device__ __forceinline__ float gdn_warp_sum(float v)
+{
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+    return v;
+}
+
 extern ""C"" __global__ void gated_delta_scan_dq(
     const float* dOut, const float* Straj, float* dQ,
     int batch, int seqLen, int modelDim, int numHeads, int headDim)
 {
-    int gid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (gid >= batch * seqLen * modelDim) return;
+    long gw = ((long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    if (gw >= (long)batch * seqLen * modelDim) return;
+    int gid = (int)gw;
     int ki = gid % headDim;
     int h  = (gid / headDim) % numHeads;
     int bt = gid / modelDim;
     int t = bt % seqLen, b = bt / seqLen;
-    long trajT = ((long)(b * numHeads + h) * seqLen + t) * (long)(headDim * headDim);
+    long row = ((long)(b * numHeads + h) * seqLen + t) * (long)(headDim * headDim) + (long)ki * headDim;
     int base = bt * modelDim + h * headDim;
     float acc = 0.0f;
-    for (int di = 0; di < headDim; di++) acc += dOut[base + di] * Straj[trajT + (long)ki * headDim + di];
-    dQ[gid] = acc;
+    for (int di = lane; di < headDim; di += 32) acc += dOut[base + di] * Straj[row + di];
+    acc = gdn_warp_sum(acc);
+    if (lane == 0) dQ[gid] = acc;
 }
 
 // Deterministic reduction of the backward's per-row partials: dK from the rows of PK (the overwritten trajectory) and
-// dA/dB from P = [dA | dB], each summed over di in ascending order. One thread per dK element.
+// dA/dB from P = [dA | dB], each summed over di by one warp per dK element (same lane order and shuffle tree as dq).
 extern ""C"" __global__ void gated_delta_scan_reduce(
     const float* PK, const float* P, float* dK, float* dA, float* dB,
     int batch, int seqLen, int modelDim, int numHeads, int headDim)
 {
-    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    long gw = ((long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
     int n = batch * seqLen * modelDim;
-    if (gid >= n) return;
+    if (gw >= n) return;
+    int gid = (int)gw;
     int ki = gid % headDim;
     int h  = (gid / headDim) % numHeads;
     int bt = gid / modelDim;
     int t = bt % seqLen, b = bt / seqLen;
-    long trajT = ((long)(b * numHeads + h) * seqLen + t) * (long)(headDim * headDim);
+    long row = ((long)(b * numHeads + h) * seqLen + t) * (long)(headDim * headDim) + (long)ki * headDim;
     float acc = 0.0f;
-    for (int di = 0; di < headDim; di++) acc += PK[trajT + (long)ki * headDim + di];
-    dK[gid] = acc;
+    for (int di = lane; di < headDim; di += 32) acc += PK[row + di];
+    acc = gdn_warp_sum(acc);
+    if (lane == 0) dK[gid] = acc;
     if (ki == 0) {
         int gIdx = bt * numHeads + h;
         float sa = 0.0f, sb = 0.0f;
-        for (int di = 0; di < headDim; di++) {
+        for (int di = lane; di < headDim; di += 32) {
             sa += P[gIdx * headDim + di];
             sb += P[n + gIdx * headDim + di];
         }
-        dA[gIdx] = sa;
-        dB[gIdx] = sb;
+        sa = gdn_warp_sum(sa);
+        sb = gdn_warp_sum(sb);
+        if (lane == 0) { dA[gIdx] = sa; dB[gIdx] = sb; }
     }
 }
 ";
