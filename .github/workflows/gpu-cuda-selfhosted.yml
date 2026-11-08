@@ -290,6 +290,8 @@ jobs:
           if ($code -ne 0) { $failed += $dump.Name; Write-Output "::error::dotnet-dump analyze failed ($code) on $($dump.Name)." }
         }
         if ($failed.Count -gt 0) { exit 1 }
+        # Dumps the search could not reach were never analysed: the found ones printed above, but the step still fails.
+        if ($searchErrors.Count -gt 0) { Write-Output "::error::The dump search was incomplete; unreachable dumps were not analysed."; exit 1 }
 
     - name: Fail on unexplained skips
       if: always()
