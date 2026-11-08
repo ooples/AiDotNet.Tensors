@@ -2190,9 +2190,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             var pA = AllocDeviceMemoryAsync((ulong)size);
             return new CudaGpuByteBuffer(_cudaContext, pA, size, asyncFreeStream: _mainStream, account: _memoryAccount);
         }
-        CuBlasNative.CheckCudaResult(
-            CuBlasNative.cuMemAlloc(out IntPtr devicePtr, (ulong)size),
-            "cuMemAlloc(byte)");
+        var byteResult = CuBlasNative.cuMemAlloc(out IntPtr devicePtr, (ulong)size);
+        if (byteResult == CudaResult.OutOfMemory)
+            throw CudaAllocationError(byteResult, $"cuMemAlloc(byte) failed: {CuBlasNative.GetCudaErrorString(byteResult)} (requested {size} bytes)");
+        CuBlasNative.CheckCudaResult(byteResult, "cuMemAlloc(byte)");
 
         return new CudaGpuByteBuffer(_cudaContext, devicePtr, size, account: _memoryAccount);
     }
@@ -9724,7 +9725,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         GpuBufferSizeGuard.EnsureFits("CUDA", (long)byteSize, MaxBufferAllocBytes, DeviceName);
         RecordDirectPtxEvidenceDeviceAllocation(checked((long)byteSize));
 
-        CuBlasNative.CheckCudaResult(CuBlasNative.cuMemAlloc(out IntPtr devicePtr, byteSize), "cuMemAlloc(int)");
+        var intResult = CuBlasNative.cuMemAlloc(out IntPtr devicePtr, byteSize);
+        if (intResult == CudaResult.OutOfMemory)
+            throw CudaAllocationError(intResult, $"cuMemAlloc(int) failed: {CuBlasNative.GetCudaErrorString(intResult)} (requested {byteSize} bytes)");
+        CuBlasNative.CheckCudaResult(intResult, "cuMemAlloc(int)");
 
         try
         {

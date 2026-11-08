@@ -13611,18 +13611,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // A captured graph replays the device work it recorded, not this call: host-backed ids uploaded now would be
         // replayed as this batch's labels on every later step. Refusing the capture makes a compiled step fall back to
         // eager execution, where every call uploads its own ids.
+        // Recording under a tape reads the ids on the host too (they are the backward's saved state), and that read
+        // would synchronize the capturing stream, so a taped call is refused the same way.
         bool capturing = backend is IGpuGraphCapture capture && capture.IsStreamCapturing();
         if (capturing && !HasResidentIndexStorage(targetIds))
             throw new NotSupportedException(
                 "FusedLinearCrossEntropyWithLogits cannot be captured with host-backed target ids: replay would reuse " +
                 "the labels of the captured batch. Keep the ids resident on the device to capture this step.");
+        if (capturing && IsTapeActive<T>())
+            throw new NotSupportedException(
+                "FusedLinearCrossEntropyWithLogits cannot be captured while a gradient tape records: the backward " +
+                "saves the target ids on the host, and reading them would synchronize the capturing stream.");
 
         try
         {
-            // Host ids are validated whenever this call reads them on the host: always for host-backed ids, and for
-            // resident ids when the tape downloads them anyway. An invalid id must throw, not route to a kernel that
-            // never checks it.
-            if (!HasResidentIndexStorage(targetIds) || IsTapeActive<T>())
+            // The ids are validated on every eager call, resident ones too (one [N] int download): an invalid id must
+            // throw, not reach a kernel that never checks it and returns an infinite loss. A capture cannot read them
+            // (the read would synchronize the capturing stream, and a replay never runs this check), so captured
+            // resident ids are the caller's to keep in range.
+            if (!capturing)
             {
                 using var idsLease = targetIds.LeaseArray();
                 var ids = idsLease.Array;
@@ -13636,10 +13643,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bB = GetOrAllocateBuffer(backend, bias);
             using var loss = AllocateOutputBuffer(backend, 1);
             // The chunked forward builds its gather positions on the host, so it never runs inside a capture (the upload
-            // would be baked into the graph). Resident ids are read only when the tape downloads them below anyway;
-            // otherwise they stay on the device for the fused kernel.
+            // would be baked into the graph). An eager call has already read the ids for validation above.
             bool chunked = false;
-            if (!capturing && (!HasResidentIndexStorage(targetIds) || IsTapeActive<T>()))
+            if (!capturing)
             {
                 try
                 {

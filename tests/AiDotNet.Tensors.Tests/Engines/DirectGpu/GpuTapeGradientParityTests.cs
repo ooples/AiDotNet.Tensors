@@ -1076,28 +1076,87 @@ public class GpuTapeGradientParityTests : IDisposable
         }
     }
 
-    // Under a tape the resident ids are downloaded for the backward anyway, so they are validated there too: an id out
-    // of range made the chunked forward decline and the fused kernel (which checks nothing) returned a finite loss.
+    // Under a tape the backward saves the ids on the host, and that read would synchronize the capturing stream, so a
+    // taped capture is refused even with resident ids (the compiled step then runs eagerly).
     [SkippableFact]
-    public void FusedLinearCrossEntropy_index_rejects_an_invalid_resident_id_under_a_tape()
+    public void FusedLinearCrossEntropy_index_refuses_capture_under_a_tape()
     {
         Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
         using (gpu!)
         {
+            var capture = gpu.GetBackend() as AiDotNet.Tensors.Engines.DirectGpu.IGpuGraphCapture;
+            Skip.IfNot(capture is { SupportsGraphCapture: true }, "The backend has no stream capture.");
             const int vocab = 5;
-            var hidden = Rand([4, 8], seed: 523);
-            var weight = Rand([8, vocab], seed: 541);
-            var bias = Rand([vocab], seed: 547, lo: -0.1, hi: 0.1);
-            // SearchSorted leaves its result on the device: 9 lies past every entry of [0, 5), so its id is vocab.
+            var hidden = Rand([4, 8], seed: 557);
+            var weight = Rand([8, vocab], seed: 563);
+            var bias = Rand([vocab], seed: 569, lo: -0.1, hi: 0.1);
             var ids = gpu.TensorSearchSorted(
                 new Tensor<float>(new float[] { 0, 1, 2, 3, 4 }, new[] { vocab }),
-                new Tensor<float>(new float[] { 0, 1, 2, 9 }, new[] { 4 }));
-            Skip.IfNot(ids.IsGpuResident, "The backend returned host ids, so this checks nothing about resident ids.");
+                new Tensor<float>(new float[] { 0, 1, 2, 3 }, new[] { 4 }));
+            Assert.True(ids.IsGpuResident, "TensorSearchSorted returned host ids, so the resident case goes untested.");
+            gpu.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, ids);   // warm-up
 
             using var tape = new GradientTape<float>();
-            var ex = Assert.Throws<ArgumentOutOfRangeException>(
-                () => gpu.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, ids));
-            Assert.Equal("targetIds", ex.ParamName);
+            NotSupportedException? refused = null;
+            IntPtr graph = capture.CaptureGraph(() =>
+            {
+                try
+                {
+                    gpu.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, ids);
+                }
+                catch (NotSupportedException ex)
+                {
+                    refused = ex;
+                    throw;
+                }
+            });
+            Assert.Equal(IntPtr.Zero, graph);
+            Assert.NotNull(refused);
+            Assert.Contains("while a gradient tape records", refused.Message);
+        }
+    }
+
+    // Resident ids are validated on every eager call. An id out of range used to reach the fused kernel, which checks
+    // nothing and returned a finite (taped) or infinite (untaped) loss. The ids must really be on the device, and the
+    // CPU fallback is switched off so its own range check cannot be what throws.
+    [SkippableFact]
+    public void FusedLinearCrossEntropy_index_rejects_an_invalid_resident_id_under_a_tape() =>
+        AssertRejectsInvalidResidentId(underTape: true);
+
+    [SkippableFact]
+    public void FusedLinearCrossEntropy_index_rejects_an_invalid_resident_id_without_a_tape() =>
+        AssertRejectsInvalidResidentId(underTape: false);
+
+    private static void AssertRejectsInvalidResidentId(bool underTape)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        bool savedThrowOnFallback = DirectGpuTensorEngine.ThrowOnGpuKernelFallback;
+        using (gpu!)
+        {
+            try
+            {
+                DirectGpuTensorEngine.ThrowOnGpuKernelFallback = true;
+                const int vocab = 5;
+                var hidden = Rand([4, 8], seed: 523);
+                var weight = Rand([8, vocab], seed: 541);
+                var bias = Rand([vocab], seed: 547, lo: -0.1, hi: 0.1);
+                // SearchSorted leaves its result on the device: 9 lies past every entry of [0, 5), so its id is vocab.
+                var ids = gpu.TensorSearchSorted(
+                    new Tensor<float>(new float[] { 0, 1, 2, 3, 4 }, new[] { vocab }),
+                    new Tensor<float>(new float[] { 0, 1, 2, 9 }, new[] { 4 }));
+                Assert.True(ids.IsGpuResident, "TensorSearchSorted returned host ids, so resident ids go untested.");
+
+                using var tape = underTape ? new GradientTape<float>() : null;
+                var ex = Assert.Throws<ArgumentOutOfRangeException>(
+                    () => gpu.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, ids));
+                Assert.Equal("targetIds", ex.ParamName);
+                // The GPU engine's own message; the CPU engine words its range check differently.
+                Assert.Contains("is out of bounds for vocabulary size 5", ex.Message);
+            }
+            finally
+            {
+                DirectGpuTensorEngine.ThrowOnGpuKernelFallback = savedThrowOnFallback;
+            }
         }
     }
 
