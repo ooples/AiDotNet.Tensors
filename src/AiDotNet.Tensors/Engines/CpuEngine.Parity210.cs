@@ -842,10 +842,12 @@ public partial class CpuEngine
         if (GraphMode.IsInferenceTrace)
             return CaptureInferenceKernel(
                 new[] { x1, x2 }, engine => engine.TensorCDist(x1, x2, p));
-        if (x1.Rank != 2 || x2.Rank != 2)
-            throw new ArgumentException("CDist requires rank-2 inputs");
-        if (x1._shape[1] != x2._shape[1])
+        if (x1.Rank < 2 || x2.Rank < 2)
+            throw new ArgumentException("CDist needs inputs of shape [..., P, M] and [..., R, M].");
+        if (x1._shape[x1.Rank - 1] != x2._shape[x2.Rank - 1])
             throw new ArgumentException("CDist: feature dim must match");
+        // torch.cdist: leading batch dims broadcast; the output is [batch..., P, R].
+        var batchShape = CDistBatchLayout(x1._shape, x2._shape, out var base1, out var base2);
 
         var ops = MathHelper.GetNumericOperations<T>();
         // #257: preserve the user-facing refs before .Contiguous() discards GradFn.
@@ -857,14 +859,22 @@ public partial class CpuEngine
         var a = aLease.Span;
         using var bLease = x2.Lease();
         var b = bLease.Span;
-        int m = x1._shape[0], n = x2._shape[0], d = x1._shape[1];
+        int m = x1._shape[x1.Rank - 2], n = x2._shape[x2.Rank - 2], d = x1._shape[x1.Rank - 1];
 
-        var result = new Tensor<T>(new[] { m, n });
+        var outShape = new int[batchShape.Length + 2];
+        Array.Copy(batchShape, outShape, batchShape.Length);
+        outShape[batchShape.Length] = m;
+        outShape[batchShape.Length + 1] = n;
+        var result = new Tensor<T>(outShape);
         using var dstLease = result.LeaseWritable();
         var dst = dstLease.Span;
-        for (int i = 0; i < m; i++)
-            for (int j = 0; j < n; j++)
-                dst[i * n + j] = PNormCross(ops, a, i * d, b, j * d, d, p);
+        for (int bi = 0; bi < base1.Length; bi++)
+        {
+            int o1 = base1[bi] * m * d, o2 = base2[bi] * n * d, oo = bi * m * n;
+            for (int i = 0; i < m; i++)
+                for (int j = 0; j < n; j++)
+                    dst[oo + i * n + j] = PNormCross(ops, a, o1 + i * d, b, o2 + j * d, d, p);
+        }
 
         // Tape registration — this op recorded nothing, so neither input received a gradient
         // despite OpRegistry classifying TensorCDist as differentiable.
@@ -873,6 +883,44 @@ public partial class CpuEngine
             BackwardFunctions<T>.CDistBackward,
             savedState: new object[] { p });
         return result;
+    }
+
+    /// <summary>
+    /// Batch layout of <c>cdist</c> on [b1..., P, M] and [b2..., R, M]: the broadcast batch shape, and for each
+    /// output batch (row-major) the index of the matrix it reads in each input.
+    /// </summary>
+    internal static int[] CDistBatchLayout(int[] s1, int[] s2, out int[] base1, out int[] base2)
+    {
+        int r1 = s1.Length - 2, r2 = s2.Length - 2, r = Math.Max(r1, r2);
+        var shape = new int[r];
+        for (int k = 0; k < r; k++)
+        {
+            int k1 = k - (r - r1), k2 = k - (r - r2);
+            int a = k1 >= 0 ? s1[k1] : 1, b = k2 >= 0 ? s2[k2] : 1;
+            if (a != b && a != 1 && b != 1)
+                throw new ArgumentException($"CDist: batch dim {k} is {a} vs {b}; they do not broadcast.");
+            shape[k] = Math.Max(a, b);
+        }
+        int count = 1;
+        foreach (var v in shape) count *= v;
+        base1 = new int[count];
+        base2 = new int[count];
+        var idx = new int[r];
+        for (int bi = 0; bi < count; bi++)
+        {
+            int rem = bi;
+            for (int k = r - 1; k >= 0; k--) { idx[k] = rem % shape[k]; rem /= shape[k]; }
+            int f1 = 0, f2 = 0;
+            for (int k = 0; k < r; k++)
+            {
+                int k1 = k - (r - r1), k2 = k - (r - r2);
+                if (k1 >= 0) f1 = f1 * s1[k1] + (s1[k1] == 1 ? 0 : idx[k]);
+                if (k2 >= 0) f2 = f2 * s2[k2] + (s2[k2] == 1 ? 0 : idx[k]);
+            }
+            base1[bi] = f1;
+            base2[bi] = f2;
+        }
+        return shape;
     }
 
     private static T PNorm<T>(Interfaces.INumericOperations<T> ops, System.ReadOnlySpan<T> s,
@@ -3550,6 +3598,42 @@ public partial class CpuEngine
         return new Tensor<T>(outArr, new[] { outArr.Length });
     }
 
+    /// <summary>
+    /// torch.searchsorted with an N-D sorted sequence [..., S]: values [..., V] share its leading dims, and each
+    /// row of values is searched in its own row of the sequence.
+    /// </summary>
+    private Tensor<int> SearchSortedBatched<T>(Tensor<T> sortedSequence, Tensor<T> values, bool right)
+    {
+        int rank = sortedSequence.Rank;
+        if (values.Rank != rank)
+            throw new ArgumentException($"SearchSorted: values must have the sorted sequence's rank {rank}; got {values.Rank}.");
+        for (int d = 0; d < rank - 1; d++)
+            if (values._shape[d] != sortedSequence._shape[d])
+                throw new ArgumentException($"SearchSorted: leading dim {d} is {values._shape[d]} vs {sortedSequence._shape[d]}.");
+        int s = sortedSequence._shape[rank - 1], v = values._shape[rank - 1], rows = values.Length / Math.Max(1, v);
+        var seq = sortedSequence.GetFlattenedData();
+        var vals = values.GetFlattenedData();
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var result = new Tensor<int>(values._shape);
+        var dst = result.GetDataArrayUnmarked();
+        for (int r = 0; r < rows; r++)
+            for (int j = 0; j < v; j++)
+            {
+                var x = vals[r * v + j];
+                int lo = 0, hi = s;
+                while (lo < hi)
+                {
+                    int mid = lo + ((hi - lo) >> 1);
+                    var e = seq[r * s + mid];
+                    // right = false: first position with seq >= x; right = true: first position with seq > x.
+                    bool goRight = right ? !numOps.GreaterThan(e, x) : numOps.LessThan(e, x);
+                    if (goRight) lo = mid + 1; else hi = mid;
+                }
+                dst[r * v + j] = lo;
+            }
+        return result;
+    }
+
     /// <inheritdoc/>
     public virtual Tensor<int> TensorSearchSorted<T>(
         Tensor<T> sortedSequence, Tensor<T> values, bool right = false)
@@ -3558,8 +3642,10 @@ public partial class CpuEngine
 
         if (sortedSequence == null) throw new ArgumentNullException(nameof(sortedSequence));
         if (values == null) throw new ArgumentNullException(nameof(values));
-        if (sortedSequence.Rank != 1)
-            throw new ArgumentException("SearchSorted expects a 1-D sorted sequence");
+        if (sortedSequence.Rank == 0)
+            throw new ArgumentException("SearchSorted expects a sorted sequence of rank >= 1");
+        if (sortedSequence.Rank > 1)
+            return SearchSortedBatched(sortedSequence, values, right);
 
         if (!sortedSequence.IsContiguous) sortedSequence = sortedSequence.Contiguous();
         if (!values.IsContiguous) values = values.Contiguous();

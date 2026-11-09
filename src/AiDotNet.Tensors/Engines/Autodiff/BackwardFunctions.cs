@@ -4654,23 +4654,34 @@ internal static class BackwardFunctions<T>
 
         var x1 = inputs[0];
         var x2 = inputs[1];
-        int m = x1._shape[0], n = x2._shape[0], d = x1._shape[1];
+        int m = x1._shape[x1.Rank - 2], n = x2._shape[x2.Rank - 2], d = x1._shape[x1.Rank - 1];
+        CpuEngine.CDistBatchLayout(x1._shape, x2._shape, out var base1, out var base2);
         var gradX1 = TensorPool<T>.RentZeroed(x1._shape);
         var gradX2 = TensorPool<T>.RentZeroed(x2._shape);
+        var a = x1.GetFlattenedData();
+        var b = x2.GetFlattenedData();
+        var dist = output.GetFlattenedData();
+        var go = gradOutput.GetFlattenedData();
 
-        for (int i = 0; i < m; i++)
-        for (int j = 0; j < n; j++)
+        // A broadcast batch maps several output matrices to one input matrix, whose gradient sums over them.
+        for (int bi = 0; bi < base1.Length; bi++)
         {
-            double dist = numOps.ToDouble(output[i * n + j]);
-            double g = numOps.ToDouble(gradOutput[i * n + j]);
-            if (g == 0.0) continue;
-            for (int k = 0; k < d; k++)
+            int o1 = base1[bi] * m * d, o2 = base2[bi] * n * d, oo = bi * m * n;
+            for (int i = 0; i < m; i++)
+            for (int j = 0; j < n; j++)
             {
-                double diff = numOps.ToDouble(x1[i * d + k]) - numOps.ToDouble(x2[j * d + k]);
-                double s = g * PNormTermGrad(diff, dist, p);
-                if (s == 0.0) continue;
-                gradX1[i * d + k] = numOps.Add(gradX1[i * d + k], numOps.FromDouble(s));
-                gradX2[j * d + k] = numOps.Subtract(gradX2[j * d + k], numOps.FromDouble(s));
+                double g = numOps.ToDouble(go[oo + i * n + j]);
+                if (g == 0.0) continue;
+                double dd = numOps.ToDouble(dist[oo + i * n + j]);
+                for (int k = 0; k < d; k++)
+                {
+                    int ia = o1 + i * d + k, ib = o2 + j * d + k;
+                    double diff = numOps.ToDouble(a[ia]) - numOps.ToDouble(b[ib]);
+                    double s = g * PNormTermGrad(diff, dd, p);
+                    if (s == 0.0) continue;
+                    gradX1[ia] = numOps.Add(gradX1[ia], numOps.FromDouble(s));
+                    gradX2[ib] = numOps.Subtract(gradX2[ib], numOps.FromDouble(s));
+                }
             }
         }
 
