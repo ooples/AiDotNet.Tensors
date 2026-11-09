@@ -99,4 +99,43 @@ public class TopKRank3GpuTests
         Assert.Equal(ev, values.ToArray());
         Assert.Equal(ei, indices.ToArray());
     }
+
+    /// <summary>
+    /// The tournament pads each row to a whole chunk with -inf at index -1. A row whose real entries are -inf ties with
+    /// those pads, and a pad must never be returned for it: every selected index has to be a real, distinct column.
+    /// The sort's comparator (bitonic_sorts_before) orders a pad after every real entry whatever the values; this pins it.
+    /// Row 0 is all -inf; row 1 has fewer finite entries than k, so the rest of its top k are real -inf columns.
+    /// </summary>
+    [SkippableFact]
+    public void Chunk_tournament_never_returns_a_pad_for_a_negative_infinity_row()
+    {
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.IfNot(gpu.IsGpuAvailable, "No DirectGpu backend available");
+        const int rows = 2, columns = 1000, k = 20;
+        var data = Enumerable.Repeat(float.NegativeInfinity, rows * columns).ToArray();
+        var finite = new[] { (Column: 7, Value: 3f), (Column: 500, Value: 2f), (Column: 999, Value: 1f) };
+        foreach (var (column, value) in finite) data[columns + column] = value;
+
+        int tournamentsBefore = gpu.TopKTournamentsCompleted;
+        var values = ((IEngine)gpu).TensorTopK(new Tensor<float>(data, new[] { rows, columns }), k, 1, out var indices);
+        Assert.Equal(tournamentsBefore + 1, gpu.TopKTournamentsCompleted);
+
+        var v = values.ToArray();
+        var ix = indices.ToArray();
+        for (int r = 0; r < rows; r++)
+        {
+            var rowIndices = ix.Skip(r * k).Take(k).ToArray();
+            Assert.All(rowIndices, c => Assert.InRange(c, 0, columns - 1));
+            Assert.Equal(k, rowIndices.Distinct().Count());
+            for (int i = 0; i < k; i++) Assert.Equal(data[r * columns + rowIndices[i]], v[r * k + i]);
+        }
+        Assert.All(v.Take(k), x => Assert.Equal(float.NegativeInfinity, x));
+        for (int i = 0; i < finite.Length; i++)
+        {
+            Assert.Equal(finite[i].Column, ix[k + i]);
+            Assert.Equal(finite[i].Value, v[k + i]);
+        }
+        Assert.All(v.Skip(k + finite.Length), x => Assert.Equal(float.NegativeInfinity, x));
+    }
+
 }
