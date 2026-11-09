@@ -293,7 +293,9 @@ public sealed class BatchedCDistSearchSortedTests
         var x = new Tensor<float>(new[] { 2, 3, 2 }, new Vector<float>(Enumerable.Range(0, 12).Select(i => 0.1f * i).ToArray()));
         Assert.Throws<ArgumentException>(() => eng.TensorCrossEntropyLoss(x, x));
         Assert.Throws<ArgumentException>(() => eng.TensorNLLLoss(x, x));
-        Assert.Throws<ArgumentException>(() => eng.CrossEntropyBackward(x, x));
+        // CrossEntropyBackward follows torch on any rank (class axis 1, see CrossEntropyNdTests): the whole input gets
+        // a gradient instead of only its first [batch, classes] block.
+        Assert.Equal(x.Shape.ToArray(), eng.CrossEntropyBackward(x, x).Shape.ToArray());
     }
 
     [Fact]

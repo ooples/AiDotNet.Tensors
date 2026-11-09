@@ -3952,10 +3952,11 @@ public partial class DirectGpuTensorEngine
 
     Tensor<T> IEngine.SparsemaxBackward<T>(Tensor<T> gradOutput, Tensor<T> output, int axis)
     {
-        using var __gpuOp = EnterGpuOp();
         if (gradOutput is null) throw new ArgumentNullException(nameof(gradOutput));
         if (output is null) throw new ArgumentNullException(nameof(output));
-        if (!output.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        ValidateSameShapePair("SparsemaxBackward", gradOutput, output);
+        using var __gpuOp = EnterGpuOp();
+        if (!output.IsContiguous) output = output.Contiguous();
         int normalizedAxis = axis < 0 ? axis + output.Rank : axis;
         if (typeof(T) != typeof(float) || normalizedAxis != output.Rank - 1
             || gradOutput.Length != output.Length || !gradOutput.IsContiguous

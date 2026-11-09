@@ -14430,8 +14430,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             throw new ArgumentException("RoPE input must have rank >= 2 ([.., seqLen, headDim]).", nameof(input));
         int headDim = input.Shape._dims[rank - 1];
         int seqLen = input.Shape._dims[rank - 2];
-        if (headDim <= 0 || seqLen <= 0 || (headDim & 1) != 0)
-            throw new ArgumentException("RoPE requires positive seqLen and an even headDim.", nameof(input));
+        if (headDim <= 0 || seqLen < 0 || (headDim & 1) != 0)
+            throw new ArgumentException("RoPE requires a positive, even headDim.", nameof(input));
+        // An empty sequence (or batch) has nothing to rotate.
+        if (input.Length == 0) return new Tensor<T>((int[])input.Shape._dims.Clone());
 
         int rows = input.Length / headDim;
 
@@ -15736,6 +15738,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </remarks>
     Tensor<T> IEngine.SoftmaxBackward<T>(Tensor<T> gradOutput, Tensor<T> output, int axis)
     {
+        ValidateSameShapePair("SoftmaxBackward", gradOutput, output);
         using var __gpuOp = EnterGpuOp();
         if (IsTapeActive<T>())
             return base.SoftmaxBackward(gradOutput, output, axis);
@@ -18858,6 +18861,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.CrossEntropyBackward<T>(Tensor<T> predictions, Tensor<T> targets)
     {
+        ValidateCrossEntropyPair(predictions, targets);
         using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend))
             return base.CrossEntropyBackward(predictions, targets);
@@ -18892,6 +18896,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.MseBackward<T>(Tensor<T> predictions, Tensor<T> targets)
     {
+        ValidateElementwisePair("MseBackward", predictions, targets);
         using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend))
             return base.MseBackward(predictions, targets);
@@ -22983,6 +22988,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> ReluBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
+        ValidateElementwisePair("ReluBackward", gradOutput, input);
         try
         {
             using var __gpuOp = EnterGpuOp();
@@ -23051,6 +23057,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> SigmoidBackward<T>(Tensor<T> gradOutput, Tensor<T> output)
     {
+        ValidateElementwisePair("SigmoidBackward", gradOutput, output);
         try
         {
             using var __gpuOp = EnterGpuOp();
@@ -23074,6 +23081,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TanhBackward<T>(Tensor<T> gradOutput, Tensor<T> output)
     {
+        ValidateElementwisePair("TanhBackward", gradOutput, output);
         try
         {
             using var __gpuOp = EnterGpuOp();
@@ -23101,6 +23109,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> GeluBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
+        ValidateElementwisePair("GeluBackward", gradOutput, input);
         try
         {
             using var __gpuOp = EnterGpuOp();
@@ -23169,6 +23178,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> SwishBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
+        ValidateElementwisePair("SwishBackward", gradOutput, input);
         try
         {
             using var __gpuOp = EnterGpuOp();
@@ -23191,6 +23201,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> MishBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
+        ValidateElementwisePair("MishBackward", gradOutput, input);
         try
         {
             using var __gpuOp = EnterGpuOp();
@@ -23213,6 +23224,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> SoftplusBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
+        ValidateElementwisePair("SoftplusBackward", gradOutput, input);
         try
         {
             using var __gpuOp = EnterGpuOp();
@@ -23235,6 +23247,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> HardswishBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
+        ValidateElementwisePair("HardswishBackward", gradOutput, input);
         try
         {
             using var __gpuOp = EnterGpuOp();
@@ -23257,6 +23270,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> SeluBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
+        ValidateElementwisePair("SeluBackward", gradOutput, input);
         using var __gpuOp = EnterGpuOp();
         // #775: the selu_backward kernel/backend arg mismatch is fixed (kernel takes 4 args with
         // hardcoded SELU consts and uses >= to match CpuEngine deriv = x>=0 ? scale :
@@ -23284,6 +23298,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> HardsigmoidBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
+        ValidateElementwisePair("HardsigmoidBackward", gradOutput, input);
         if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return base.HardsigmoidBackward(gradOutput, input);
 
@@ -23309,6 +23324,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> Relu6Backward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
+        ValidateElementwisePair("Relu6Backward", gradOutput, input);
         try
         {
             using var __gpuOp = EnterGpuOp();
@@ -23353,6 +23369,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> ReciprocalBackward<T>(Tensor<T> gradOutput, Tensor<T> output)
     {
+        ValidateElementwisePair("ReciprocalBackward", gradOutput, output);
         using var __gpuOp = EnterGpuOp();
         // #775: the reciprocal_backward kernel now computes -gradOutput * output^2 (it previously
         // DIVIDED by output^2, which was wrong, so this was routed to base). grad = -gradOutput *
@@ -28459,7 +28476,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     var outShape = new int[rank - 1];
                     for (int i = 0, j = 0; i < rank; i++)
                         if (i != normalizedAxis) outShape[j++] = tensor.Shape._dims[i];
-                    if (outShape.Length == 0) outShape = new[] { 1 };
+                    // A rank-1 input reduces to a 0-d tensor, as on the CPU engine and in torch.
                     return result.Reshape(outShape);
                 }
                 catch
