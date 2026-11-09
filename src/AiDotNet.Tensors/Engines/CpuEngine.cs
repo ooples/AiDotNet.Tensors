@@ -42581,16 +42581,7 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentOutOfRangeException(nameof(axis), $"Axis {axis} is out of range for tensor of rank {destination.Rank}.");
         if (index < 0 || index >= destination._shape[axis])
             throw new ArgumentOutOfRangeException(nameof(index), $"Index {index} is out of range for axis {axis} with size {destination._shape[axis]}.");
-        // The source is one slice: the destination's shape without the axis (or with it at length 1). A larger source
-        // used to be read in part.
-        bool removed = source.Rank == destination.Rank - 1, kept = source.Rank == destination.Rank;
-        for (int d = 0, s = 0; (removed || kept) && d < destination.Rank; d++)
-        {
-            if (d == axis) { if (kept && source._shape[s++] != 1) kept = false; continue; }
-            if (source._shape[s++] != destination._shape[d]) { removed = false; kept = false; }
-        }
-        if (!removed && !kept)
-            throw new ArgumentException($"TensorSetSliceAxis needs a source of the destination's shape without axis {axis}; got [{string.Join(", ", source._shape)}] for [{string.Join(", ", destination._shape)}].", nameof(source));
+        ValidateSliceSourceShape(destination._shape, source._shape, axis);
 
         if (!destination.IsContiguous) throw new InvalidOperationException("TensorSetSliceAxis requires contiguous destination tensor.");
         var sourceOrig = source;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -42853,6 +42844,22 @@ public partial class CpuEngine : ITensorLevelEngine
             if (d != axis && indices[d] != destination[d])
                 throw new ArgumentException($"TensorScatter needs indices to match the destination off the axis; dimension {d} is {indices[d]} vs {destination[d]}.");
         }
+    }
+
+    /// <summary>
+    /// TensorSetSliceAxis shape rule: the source is one slice, the destination's shape without the axis (or with it at
+    /// length 1). A larger source used to be read in part.
+    /// </summary>
+    internal static void ValidateSliceSourceShape(int[] destination, int[] source, int axis)
+    {
+        bool removed = source.Length == destination.Length - 1, kept = source.Length == destination.Length;
+        for (int d = 0, s = 0; (removed || kept) && d < destination.Length; d++)
+        {
+            if (d == axis) { if (kept && source[s++] != 1) kept = false; continue; }
+            if (source[s++] != destination[d]) { removed = false; kept = false; }
+        }
+        if (!removed && !kept)
+            throw new ArgumentException($"TensorSetSliceAxis needs a source of the destination's shape without axis {axis}; got [{string.Join(", ", source)}] for [{string.Join(", ", destination)}].", "source");
     }
 
     /// <summary>

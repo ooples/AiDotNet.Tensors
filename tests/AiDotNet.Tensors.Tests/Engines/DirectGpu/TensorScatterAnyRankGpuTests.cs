@@ -58,6 +58,20 @@ public sealed class TensorScatterAnyRankGpuTests : IClassFixture<DirectGpuTensor
         }
     }
 
+    [SkippableFact]
+    public void Gpu_index_copy_add_and_set_slice_reject_shapes_the_cpu_rejects()
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        IEngine gpu = _fixture.Engine!;
+        var input = new Tensor<float>(new[] { 2, 3, 4 });
+        var idx = new Tensor<int>(new[] { 0, 2 }, new[] { 2 });
+        var sameLengthWrongShape = new Tensor<float>(new[] { 2, 4, 2 });
+        Assert.Throws<ArgumentException>(() => gpu.Scatter(input, idx, sameLengthWrongShape, 1));
+        Assert.Throws<ArgumentException>(() => gpu.ScatterAdd(input, idx, sameLengthWrongShape, 1));
+        Assert.Throws<ArgumentException>(() => gpu.TensorSetSliceAxis(input, new Tensor<float>(new[] { 2, 3, 4 }), 1, 0));
+        gpu.TensorSetSliceAxis(input, new Tensor<float>(new[] { 2, 4 }), 1, 0);
+    }
+
     private static (float[] Y, float[] GradDestination, float[] GradSource) Run(
         IEngine engine, int[] shape, int[] idxShape, Tensor<int> indices, int axis)
     {

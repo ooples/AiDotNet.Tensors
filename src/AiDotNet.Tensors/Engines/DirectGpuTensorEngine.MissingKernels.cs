@@ -2294,6 +2294,8 @@ public partial class DirectGpuTensorEngine
 
         // This overload has exactly index_add semantics: clone input, then add each values slice
         // into the destination slice named by the one-dimensional indices tensor.
+        if (normalizedAxis >= 0 && normalizedAxis < input.Rank)
+            CpuEngine.ValidateIndexedValuesShape("ScatterAdd", input._shape, indices.Length, values._shape, normalizedAxis);
         if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
             return base.ScatterAdd(input, indices, values, axis);
         try
@@ -9327,6 +9329,8 @@ public partial class DirectGpuTensorEngine
         // d/d(values) gathers the upstream gradient at them. An earlier recording got d(input) wrong by 3.14e-01;
         // this one saves the NORMALISED axis the backward indexes with and runs the same device helpers as
         // index_copy, and GpuTapeGradientParityTests proves BOTH operands against the CPU.
+        if (normalizedAxis >= 0 && normalizedAxis < input.Rank)
+            CpuEngine.ValidateIndexedValuesShape("Scatter", input._shape, indices.Length, values._shape, normalizedAxis);
         if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || normalizedAxis < 0 || normalizedAxis >= input.Rank || !TryGetBackend(out var backend))
             return base.Scatter(input, indices, values, axis);
