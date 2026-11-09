@@ -38,6 +38,27 @@ public class BackwardGemmInputGradientRouteTests
         }
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Route_SkipsTheTransposeForALargeWeight(bool vector512)
+    {
+        // A weight above 1M elements is not transposed: the per-call copy was not kept by the shared pool between
+        // training steps (FasterRCNN's fc6 [12544, 1024] allocated 51 MB per step) and the transposed-B kernel matches it.
+        bool? previous = SimdGemm.s_forceVector512Direct;
+        try
+        {
+            SimdGemm.s_forceVector512Direct = vector512;
+            Assert.True(BackwardFunctions<float>.BackwardInputGradientPrefersTransposedW(128, 512));
+            Assert.True(BackwardFunctions<float>.BackwardInputGradientPrefersTransposedW(128, 512, 784));
+            Assert.False(BackwardFunctions<float>.BackwardInputGradientPrefersTransposedW(128, 1024, 12544));
+        }
+        finally
+        {
+            SimdGemm.s_forceVector512Direct = previous;
+        }
+    }
+
     [SkippableTheory]
     [InlineData(true, 128, 784, 512)]
     [InlineData(true, 128, 512, 256)]
@@ -63,7 +84,7 @@ public class BackwardGemmInputGradientRouteTests
             SimdGemm.s_forceVector512Direct = vector512;
             // AVX-512 takes the fused transposed-strip kernel; otherwise the explicit transpose where preferred.
             bool fused = vector512 && m >= 64 && n <= SimdGemm.MaxPackedStripK;
-            routed = fused || BackwardFunctions<float>.BackwardInputGradientPrefersTransposedW(m, n);
+            routed = fused || BackwardFunctions<float>.BackwardInputGradientPrefersTransposedW(m, n, k);
             long transposedBefore = BackwardFunctions<float>.t_transposedWInputGradientRuns;
             int fusedBefore = SimdGemm.t_directParallel2DTransBRuns;
             BackwardFunctions<float>.BackwardGemmInputGradient(dY, w, dX, m, k, n);

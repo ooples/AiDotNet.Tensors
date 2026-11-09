@@ -754,6 +754,15 @@ internal static class BackwardFunctions<T>
     /// <summary>Test observable: input gradients this thread formed through the transposed-W NN product.</summary>
     [ThreadStatic] internal static long t_transposedWInputGradientRuns;
 
+    // The transposed copy of W is rented per call. Above this size the shared pool does not reliably keep it between
+    // training steps (a Gen2 collection trims large arrays), so every backward allocated it afresh: FasterRCNN's fc6
+    // weight [12544, 1024] cost 51 MB per step in an allocation trace. There the transposed-B kernel is as fast
+    // (66 rows: 41.9 vs 44.4 ms; fc7 [1024, 1024]: 1.9 vs 2.5 ms) and needs no buffer.
+    private const long BackwardInputGradientTransposeMaxElements = 1L << 20;
+
+    internal static bool BackwardInputGradientPrefersTransposedW(int m, int n, int k)
+        => (long)k * n <= BackwardInputGradientTransposeMaxElements && BackwardInputGradientPrefersTransposedW(m, n);
+
     internal static bool BackwardInputGradientPrefersTransposedW(int m, int n)
     {
 #if NET9_0_OR_GREATER
@@ -777,7 +786,7 @@ internal static class BackwardFunctions<T>
                 return;
 #endif
 #if NET5_0_OR_GREATER
-            if (BackwardInputGradientPrefersTransposedW(m, n))
+            if (BackwardInputGradientPrefersTransposedW(m, n, k))
             {
                 t_transposedWInputGradientRuns++;
                 float[] wT = System.Buffers.ArrayPool<float>.Shared.Rent(n * k);
