@@ -4652,34 +4652,23 @@ public partial class DirectGpuTensorEngine
         {
             // Raw int32 storage is copied as it is: converting to floats would round an index past 2^24.
             using var raw = GetOrAllocateInt32IndexBuffer(backend, indices);
-            var rawCopy = AllocateOutputBuffer(backend, indices.Length);
-            try
-            {
-                backend.Copy(raw.Buffer, rawCopy.Buffer, indices.Length);
-                var rawSnapshot = Tensor<int>.FromGpuBuffer(backend, rawCopy.Buffer, shape, Gpu.GpuTensorRole.Intermediate,
-                    ownsBuffer: true, bufferContainsRawInt32: true);
-                rawCopy.RelinquishOwnership();
-                return rawSnapshot;
-            }
-            finally
-            {
-                rawCopy.Dispose();
-            }
+            // Until the snapshot owns it, a failed copy must not leave the buffer held; disposal after
+            // RelinquishOwnership is a no-op.
+            using var rawCopy = AllocateOutputBuffer(backend, indices.Length);
+            backend.Copy(raw.Buffer, rawCopy.Buffer, indices.Length);
+            var rawSnapshot = Tensor<int>.FromGpuBuffer(backend, rawCopy.Buffer, shape, Gpu.GpuTensorRole.Intermediate,
+                ownsBuffer: true, bufferContainsRawInt32: true);
+            rawCopy.RelinquishOwnership();
+            return rawSnapshot;
         }
         using var numeric = GetOrAllocateNumericIndexBuffer(backend, indices);
-        var copy = AllocateOutputBuffer(backend, indices.Length);
-        try
-        {
-            backend.Copy(numeric.Buffer, copy.Buffer, indices.Length);
-            var snapshot = DeferTensorResult<int>(backend, copy.Buffer, indices.Length, shape);
-            copy.RelinquishOwnership();
-            return snapshot;
-        }
-        finally
-        {
-            // Until the snapshot owns it, a failed copy must not leave the buffer held.
-            copy.Dispose();
-        }
+        // Until the snapshot owns it, a failed copy must not leave the buffer held; disposal after
+        // RelinquishOwnership is a no-op.
+        using var copy = AllocateOutputBuffer(backend, indices.Length);
+        backend.Copy(numeric.Buffer, copy.Buffer, indices.Length);
+        var snapshot = DeferTensorResult<int>(backend, copy.Buffer, indices.Length, shape);
+        copy.RelinquishOwnership();
+        return snapshot;
     }
 
     /// <summary>
@@ -5342,7 +5331,7 @@ public partial class DirectGpuTensorEngine
     {
         if (double.IsPositiveInfinity(p)) return -1f;
         float f = (float)p;
-        if (p > 0 && f == 0f) return float.Epsilon;
+        if (p > 0 && f < float.Epsilon) return float.Epsilon;   // underflowed to 0: f is never negative here
         return float.IsPositiveInfinity(f) ? float.MaxValue : f;
     }
 

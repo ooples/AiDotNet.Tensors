@@ -939,12 +939,13 @@ public partial class CpuEngine
         // here diverged from the fp32 GPU kernel by ~1% at d≈129 — the recorded GPU/CPU parity
         // failure (TensorPDist on [129,129]: max_abs_err 1.37e-2 > tol 1e-2). Float-vs-float is
         // bit-consistent (same sequential op order as the kernel).
+        var order = ClassifyNormOrder(p);
         if (typeof(T) == typeof(float))
         {
             float sumF = 0f;
             for (int k = 0; k < d; k++)
-                sumF = AccumulateNormF(sumF, System.Math.Abs(ops.ToFloat(s[offA + k]) - ops.ToFloat(s[offB + k])), p);
-            return ops.FromFloat(FinishNormF(sumF, p));
+                sumF = AccumulateNormF(sumF, System.Math.Abs(ops.ToFloat(s[offA + k]) - ops.ToFloat(s[offB + k])), order, p);
+            return ops.FromFloat(FinishNormF(sumF, order, p));
         }
 
         // Non-float T keeps the double path (higher precision; no GPU bit-equivalence committed).
@@ -952,9 +953,9 @@ public partial class CpuEngine
         for (int k = 0; k < d; k++)
         {
             double diff = System.Convert.ToDouble(s[offA + k]) - System.Convert.ToDouble(s[offB + k]);
-            acc = AccumulateNorm(acc, System.Math.Abs(diff), p);
+            acc = AccumulateNorm(acc, System.Math.Abs(diff), order, p);
         }
-        return ops.FromDouble(FinishNorm(acc, p));
+        return ops.FromDouble(FinishNorm(acc, order, p));
     }
 
     private static T PNormCross<T>(Interfaces.INumericOperations<T> ops,
@@ -966,6 +967,7 @@ public partial class CpuEngine
         // by exactly the fp32 rounding noise of d squared-diff terms — ~1% at
         // d=129 — and force every consumer-GPU CDist call to either pay 32-64×
         // FP64 throughput penalty or accept the mismatch).
+        var order = ClassifyNormOrder(p);
         if (typeof(T) == typeof(float))
         {
             // Accumulate in float (not double) to match the GPU's fp32 parity210_cdist.
@@ -976,8 +978,8 @@ public partial class CpuEngine
             // float value with no precision loss.
             float sumF = 0f;
             for (int k = 0; k < d; k++)
-                sumF = AccumulateNormF(sumF, System.Math.Abs(ops.ToFloat(a[offA + k]) - ops.ToFloat(b[offB + k])), p);
-            return ops.FromFloat(FinishNormF(sumF, p));
+                sumF = AccumulateNormF(sumF, System.Math.Abs(ops.ToFloat(a[offA + k]) - ops.ToFloat(b[offB + k])), order, p);
+            return ops.FromFloat(FinishNormF(sumF, order, p));
         }
 
         // Non-float T (e.g. double) keeps the double-precision path — the
@@ -987,38 +989,59 @@ public partial class CpuEngine
         for (int k = 0; k < d; k++)
         {
             double diff = System.Convert.ToDouble(a[offA + k]) - System.Convert.ToDouble(b[offB + k]);
-            acc = AccumulateNorm(acc, System.Math.Abs(diff), p);
+            acc = AccumulateNorm(acc, System.Math.Abs(diff), order, p);
         }
-        return ops.FromDouble(FinishNorm(acc, p));
+        return ops.FromDouble(FinishNorm(acc, order, p));
     }
 
     /// <summary>
-    /// One coordinate of a torch p-norm distance: p = 0 counts differing coordinates, p = +inf keeps the largest
-    /// difference, any other p sums |diff|^p.
+    /// The kind of a torch p-norm order, decided once per distance. p = 0 counts differing coordinates and p = +inf
+    /// keeps the largest difference; 1 and 2 have their own float arithmetic; any other p sums |diff|^p. The kind is
+    /// chosen on the double p, so a positive p that rounds to float 0 or +inf is still the p-norm the backward
+    /// differentiates.
     /// </summary>
-    private static double AccumulateNorm(double acc, double absDiff, double p) =>
-        p == 0 ? acc + (absDiff != 0 ? 1 : 0)
-        : double.IsPositiveInfinity(p) ? (absDiff > acc || double.IsNaN(absDiff) ? absDiff : acc)
-        : acc + System.Math.Pow(absDiff, p);
+    internal enum NormOrder { Count, Manhattan, Euclidean, Max, General }
+
+    internal static NormOrder ClassifyNormOrder(double p) =>
+        double.IsPositiveInfinity(p) ? NormOrder.Max
+        : p == 0 ? NormOrder.Count
+        : p == 1 ? NormOrder.Manhattan
+        : p == 2 ? NormOrder.Euclidean
+        : NormOrder.General;
+
+    // A difference counts when it is not zero; NaN counts too (NaN != 0), as in torch. |diff| is never negative.
+    private static bool Differs(double absDiff) => absDiff > 0 || double.IsNaN(absDiff);
 
     /// <summary>
-    /// <see cref="AccumulateNorm"/> in float, the GPU kernels' arithmetic. The special orders are chosen on the double
-    /// p, so a positive p that rounds to float 0 or +inf is still the p-norm the backward differentiates. A NaN
-    /// difference propagates through the maximum.
+    /// One coordinate of a double p-norm distance. A NaN difference propagates through the maximum. Orders 1 and 2
+    /// take the general |diff|^p form here, as the double path always has.
     /// </summary>
-    private static float AccumulateNormF(float sum, float absDiff, double p) =>
-        p == 1 ? sum + absDiff
-        : p == 2 ? sum + absDiff * absDiff
-        : p == 0 ? sum + (absDiff != 0f ? 1f : 0f)
-        : double.IsPositiveInfinity(p) ? (absDiff > sum || float.IsNaN(absDiff) ? absDiff : sum)
-        : sum + (float)System.Math.Pow(absDiff, p);
+    private static double AccumulateNorm(double acc, double absDiff, NormOrder order, double p) => order switch
+    {
+        NormOrder.Count => acc + (Differs(absDiff) ? 1 : 0),
+        NormOrder.Max => absDiff > acc || double.IsNaN(absDiff) ? absDiff : acc,
+        _ => acc + System.Math.Pow(absDiff, p),
+    };
 
-    private static float FinishNormF(float sum, double p) =>
-        p == 1 || p == 0 || double.IsPositiveInfinity(p) ? sum
-        : p == 2 ? (float)System.Math.Sqrt(sum) : (float)System.Math.Pow(sum, 1.0 / p);
+    private static double FinishNorm(double acc, NormOrder order, double p) =>
+        order is NormOrder.Count or NormOrder.Max ? acc : System.Math.Pow(acc, 1.0 / p);
 
-    private static double FinishNorm(double acc, double p) =>
-        p == 0 || double.IsPositiveInfinity(p) ? acc : System.Math.Pow(acc, 1.0 / p);
+    /// <summary><see cref="AccumulateNorm"/> in float, the GPU kernels' arithmetic.</summary>
+    private static float AccumulateNormF(float sum, float absDiff, NormOrder order, double p) => order switch
+    {
+        NormOrder.Manhattan => sum + absDiff,
+        NormOrder.Euclidean => sum + absDiff * absDiff,
+        NormOrder.Count => sum + (Differs(absDiff) ? 1f : 0f),
+        NormOrder.Max => absDiff > sum || float.IsNaN(absDiff) ? absDiff : sum,
+        _ => sum + (float)System.Math.Pow(absDiff, p),
+    };
+
+    private static float FinishNormF(float sum, NormOrder order, double p) => order switch
+    {
+        NormOrder.Euclidean => (float)System.Math.Sqrt(sum),
+        NormOrder.General => (float)System.Math.Pow(sum, 1.0 / p),
+        _ => sum,
+    };
 
     /// <summary>torch.cdist / pdist take p in [0, +inf]; a negative or NaN p has no norm.</summary>
     internal static void ValidateNormOrder(double p)
