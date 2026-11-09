@@ -74,7 +74,7 @@ internal sealed class RoIAlignPlan
             double binH = roiH / outputHeight, binW = roiW / outputWidth;
             int ry = Math.Max(1, samplingRatio > 0 ? samplingRatio : (int)Math.Ceiling(roiH / outputHeight));
             int rx = Math.Max(1, samplingRatio > 0 ? samplingRatio : (int)Math.Ceiling(roiW / outputWidth));
-            double average = 1.0 / (ry * rx);
+            double average = 1.0 / ((double)ry * rx);
 
             for (int ph = 0; ph < outputHeight; ph++)
             {
