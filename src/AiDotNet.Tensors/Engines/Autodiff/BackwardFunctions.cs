@@ -3003,6 +3003,21 @@ internal static class BackwardFunctions<T>
         }
     }
 
+    /// <summary>
+    /// TensorScatter backward (torch.scatter): the destination's gradient is gradOutput with the overwritten positions
+    /// zeroed, and the source's is gradOutput read back at those positions (take-along-dim).
+    /// </summary>
+    internal static void TensorScatterBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var indices = (Tensor<int>)savedState[0];
+        var axis = (int)savedState[1];
+        var gradDestination = engine.TensorScatter(gradOutput, indices, new Tensor<T>(indices._shape), axis);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradDestination, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], engine.TensorTakeAlongDim(gradOutput, indices, axis), engine);
+    }
+
     /// <summary>ExpandDims backward: squeeze the added dimension</summary>
     internal static void ExpandDimsBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,

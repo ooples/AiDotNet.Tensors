@@ -42875,27 +42875,47 @@ public partial class CpuEngine : ITensorLevelEngine
         if (source == null) throw new ArgumentNullException(nameof(source));
 
         var result = destination.Clone();
-
-        // For 2D with axis=1: result[b, indices[b, i]] = source[b, i]
-        if (result.Rank == 2 && axis == 1)
+        int rank = result.Rank;
+        if (axis < 0) axis += rank;
+        if (axis < 0 || axis >= rank)
+            throw new ArgumentOutOfRangeException(nameof(axis), $"Axis {axis} is out of range for a rank-{rank} tensor.");
+        // torch.scatter semantics: result[.., indices[p], ..] = source[p] along the axis, with indices and source of
+        // one shape that equals the destination's on every other dimension. Any rank, any axis.
+        if (indices.Rank != rank || source.Rank != rank)
+            throw new ArgumentException($"TensorScatter needs indices and source of the destination's rank {rank}; got {indices.Rank} and {source.Rank}.");
+        for (int d = 0; d < rank; d++)
         {
-            int batch = result._shape[0];
-            int numIndices = indices._shape[1];
-
-            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * numIndices, [MethodImpl(Hot)] (b) =>
+            if (indices._shape[d] != source._shape[d])
+                throw new ArgumentException($"TensorScatter needs indices and source of one shape; dimension {d} is {indices._shape[d]} vs {source._shape[d]}.");
+            if (d != axis && indices._shape[d] != result._shape[d])
+                throw new ArgumentException($"TensorScatter needs indices to match the destination off the axis; dimension {d} is {indices._shape[d]} vs {result._shape[d]}.");
+        }
+        int outer = 1, inner = 1, dstAxis = result._shape[axis], idxAxis = indices._shape[axis];
+        for (int d = 0; d < axis; d++) outer *= result._shape[d];
+        for (int d = axis + 1; d < rank; d++) inner *= result._shape[d];
+        var indexData = indices.GetFlattenedData();
+        for (int i = 0; i < indexData.Length; i++)
+            if ((uint)indexData[i] >= (uint)dstAxis)
+                throw new IndexOutOfRangeException($"Index {indexData[i]} is out of bounds for axis size {dstAxis}");
+        var sourceData = source.GetFlattenedData();
+        using (var lease = result.LeaseArray())
+        {
+            var dst = lease.Array;
+            // Each outer slice writes only its own block of the result, so slices run in parallel; inside one, writes
+            // run in order, so a repeated index keeps its last source value.
+            CpuParallelSettings.ParallelForOrSerial(0, outer, (long)outer * idxAxis * inner, [MethodImpl(Hot)] (o) =>
             {
-                for (int i = 0; i < numIndices; i++)
+                for (int j = 0; j < idxAxis; j++)
                 {
-                    int idx = indices[b, i];
-                    result[b, idx] = source[b, i];
+                    int srcBase = (o * idxAxis + j) * inner;
+                    for (int k = 0; k < inner; k++)
+                        dst[(o * dstAxis + indexData[srcBase + k]) * inner + k] = sourceData[srcBase + k];
                 }
             });
         }
-        else
-        {
-            throw new NotSupportedException("TensorScatter currently only supports 2D tensors with axis=1.");
-        }
 
+        DifferentiableOps.RecordBinary("TensorScatter", result, destination, source,
+            BackwardFunctions<T>.TensorScatterBackward, new object[] { indices, axis });
         return result;
     }
 
