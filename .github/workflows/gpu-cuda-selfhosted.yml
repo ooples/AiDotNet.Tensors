@@ -27,27 +27,15 @@ on:
   schedule:
     - cron: '30 6 * * *'
   workflow_dispatch:
-  pull_request:
-    branches: [ main ]
-    # ready_for_review starts the lane when a draft is marked ready; draft pushes do not take the runner (see the job's if).
-    types: [ opened, synchronize, reopened, ready_for_review ]
-    paths:
-      - 'src/AiDotNet.Tensors/Engines/CuDnnNative.cs'
-      - 'tests/AiDotNet.Tensors.Tests/Engines/DirectGpu/Cudnn*.cs'
-      - 'tests/AiDotNet.Tensors.Tests/Engines/Gpu/CuDnn*.cs'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpu/**'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpuTensorEngine*.cs'
-      - 'src/AiDotNet.Tensors/Engines/Gpu/**'
-      # Shared paths that decide GPU residency and buffer lifetime: a CUDA regression there must surface before merge.
-      - 'src/AiDotNet.Tensors/Engines/TensorScope.cs'
-      - 'src/AiDotNet.Tensors/Engines/Autodiff/**'
-      - 'src/AiDotNet.Tensors/LinearAlgebra/Tensor.cs'
-      - 'src/AiDotNet.Tensors/LinearAlgebra/TensorStorage.cs'
-      - 'src/AiDotNet.Tensors/Helpers/Autotune/**'
-      - '.github/workflows/gpu-cuda-selfhosted.yml'
+  # Pull requests run this workflow through ci.yml, as one job of the pull request's single CI run, when ci.yml's
+  # changes job finds a file matching its path filter (cuda in .github/ci-path-filters.yml). Pushes to main do not
+  # run it: the nightly schedule covers main.
+  workflow_call:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Pull-request runs share a group per ref; any other run (a push to main, a schedule) gets its own, so main
+  # runs never cancel or replace one another and every push to main produces its results and coverage.
+  group: gpu-cuda-selfhosted-${{ (github.event_name == 'pull_request' && github.ref || github.run_id) }}
   cancel-in-progress: true
 
 permissions:
@@ -98,11 +86,14 @@ jobs:
     # Each runner needs self-hosted, gpu, cuda AND its architecture label (sm86 or sm75); a runner registered before
     # the split carries no architecture label and picks up neither job until relabelled (see the header for how).
     runs-on: [self-hosted, gpu, cuda, '${{ matrix.arch }}']
-    timeout-minutes: ${{ matrix.arch == 'sm86' && 150 || 240 }}
+    timeout-minutes: ${{ matrix.arch == 'sm86' && (github.event_name == 'pull_request' && 160 || 560) || 240 }}
     env:
       # The tests this lane runs. It selects by name, so a GPU test outside these terms never runs on CUDA; the
       # coverage check below fails the lane when a test class that drives the GPU engine is not selected. A term
-      # ending in "." matches one class. Folding joins the lines with spaces; the steps strip them.
+      # ending in "." matches one class. Folding joins the lines with spaces; the steps strip them. The CUDA head-to-head
+      # benchmarks (HeadToHeadGpuNetworkTests) stay out: each torch.compiles the network in every mode for up to an hour
+      # with no test finishing, so the 15-minute hang blame killed the host. They run through tools/parity/run-gpu.ps1.
+      # The rest of their categories stay in, among them the transfer-count residency ratchets.
       CUDA_LANE_FILTER: >-
         (FullyQualifiedName~GpuLaneBackend|
         FullyQualifiedName~Engines.DirectGpu|
@@ -135,7 +126,8 @@ jobs:
         FullyQualifiedName~.StreamingTensorJournalTests.|
         FullyQualifiedName~.TensorCowInferenceReadPathTests.|
         FullyQualifiedName~.TensorAddActivationTests.|
-        FullyQualifiedName~.TensorGpuCachePhysicalTests.)&Category!=Benchmark&Category!=Performance&Category!=RequiresOpenCL
+        FullyQualifiedName~.TensorGpuCachePhysicalTests.)&Category!=Benchmark&Category!=Performance&Category!=RequiresOpenCL&
+        FullyQualifiedName!~.HeadToHeadGpuNetworkTests.
     defaults:
       run:
         shell: pwsh
@@ -265,15 +257,18 @@ jobs:
         # this step past two hours without it firing, and the job timeout then cancelled the job, which skips the
         # failure-only stack step below. The watchdog bounds the step instead: past the limit it prints each test
         # host's managed stacks and the processes under the runner, then fails the step so the steps below still run.
-        # Passing SM86 runs take 78 to 101 minutes here; the SM75 suites take about 3 hours. The deadline counts from
+        # Passing SM86 runs take 78 to 101 minutes here; the SM75 suites take about 3 hours. The reserve also covers the
+        # steps after the suites on a pull request: the torch interop step (at most 5 minutes), the model families
+        # (about 18, bounded at 22) and the upload. The deadline counts from
         # the job's start (the runner worker's), not this step's, and stops DIAGNOSTICS_RESERVE_MINUTES short of the job
         # limit, so slow setup cannot let the job timeout cancel the step before the watchdog fires.
         SUITE_WATCHDOG_MINUTES: ${{ matrix.arch == 'sm86' && '120' || '215' }}
-        JOB_LIMIT_MINUTES: ${{ matrix.arch == 'sm86' && '150' || '240' }}
-        DIAGNOSTICS_RESERVE_MINUTES: '20'
+        JOB_LIMIT_MINUTES: ${{ matrix.arch == 'sm86' && (github.event_name == 'pull_request' && 160 || 560) || 240 }}
+        DIAGNOSTICS_RESERVE_MINUTES: '30'
       run: |
         New-Item -ItemType Directory -Force "${{ runner.temp }}/trx" | Out-Null
-        $filter = $env:CUDA_LANE_FILTER -replace "\s", ""
+        # The embedded-torch class runs in its own test host (the next step).
+        $filter = ($env:CUDA_LANE_FILTER -replace "\s", "") + '&FullyQualifiedName!~.DLPackTorchInteropTests.'
         $testArgs = 'test AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj ' +
           '--configuration Release --no-build --framework net10.0 ' +
           "--filter `"$filter`" " +
@@ -337,6 +332,21 @@ jobs:
       # With --blame the TRX logger ignores LogFilePath and writes under the project's TestResults; the results
       # directory puts the TRX and any crash or hang dump where the skip check and the upload look.
 
+    # DLPackTorchInteropTests embeds CPython and imports torch in the test host. The CUDA torch wheel ships its own
+    # cuDNN 9 (a CUDA 12 build) under the same DLL names as the cuDNN 9.26 above; in a host whose GPU tests had loaded
+    # ours first, torch's cudnn_cnn64_9.dll bound to our modules and failed with WinError 127, so every test of the
+    # class failed. In a host of its own, torch is imported before the class creates an engine.
+    - name: Embedded torch interop (own test host)
+      if: ${{ !cancelled() }}
+      # Eight tests and one interpreter start: seconds. The bound leaves the model families' ~18 minutes and the upload
+      # inside the job limit even when the suites end at the watchdog deadline (about 123 minutes into the job).
+      timeout-minutes: 5
+      run: >-
+        dotnet test AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj
+        --configuration Release --no-build --framework net10.0
+        --filter "FullyQualifiedName~.DLPackTorchInteropTests."
+        --results-directory "${{ runner.temp }}/trx" --logger "trx;LogFileName=cuda-torch-interop.trx"
+
     - name: Managed stacks of a hung or crashed test host
       if: failure()
       # A hang dump is the whole test host (several GB), too big to download and analyse in practice; Blame names only
@@ -378,15 +388,27 @@ jobs:
       #   - "Not applicable: CUDA ...", a test of a mechanism CUDA deliberately does not use (it names CUDA's own).
       # Allowed test names: device classes of another backend (TorchParity*HipDeviceTests and the like), whose reasons say
       # only that no backend is available. A CUDA test skipping for any other reason fails the lane.
-      run: >-
-        python AiDotNet.Tensors/scripts/ci/summarize-test-skips.py --title "CUDA (${{ matrix.arch }})" --fail-on-skip
-        --allowed-skip "(?i)(HIP|ROCm|Metal|MoltenVK|Vulkan|WebGPU|Dawn|AIDOTNET_WEBGPU_NODE_DIR|OpenCL|POCL|DirectML|macOS)|requires sm_|compute capability|torch|numpy|python|PARITY_PYTHON|AVX-512|^NEEDS SPEC:|TAPE-GRADIENT BASELINE|forward recorded no differentiable leaf|Full PTX transfer not complete|^Not applicable: CUDA |Requires a non-CUDA|benchmark|Wall-clock perf gate|run manually|manual perf harness|Manual CUDA|Diagnostic-only|Set (AIDOTNET|PARITY)_[A-Z0-9_]+=|AIDOTNET_GPU_MEMTRACK|AIDOTNET_KERNEL_REGISTRY_PERSIST${{ matrix.arch != 'sm86' && '|\bSM ?86\b|GA10[0-9x]' || '' }}"
-        --allowed-skip-test "(Hip|Rocm|Dawn|WebGpu|Vulkan|Metal|MoltenVk|OpenCl|Pocl|DirectMl)[A-Za-z0-9]*Tests\."
-        "${{ runner.temp }}/trx/*.trx"
+      # The main suites and the torch interop host are checked apart, so each must have run tests of its own: a main
+      # filter that selected nothing cannot pass on the interop tests alone.
+      env:
+        ALLOWED_SKIP: '(?i)(HIP|ROCm|Metal|MoltenVK|Vulkan|WebGPU|Dawn|AIDOTNET_WEBGPU_NODE_DIR|OpenCL|POCL|DirectML|macOS)|requires sm_|compute capability|torch|numpy|python|PARITY_PYTHON|AVX-512|^NEEDS SPEC:|TAPE-GRADIENT BASELINE|forward recorded no differentiable leaf|Full PTX transfer not complete|^Not applicable: CUDA |Requires a non-CUDA|benchmark|Wall-clock perf gate|run manually|manual perf harness|Manual CUDA|Diagnostic-only|Set (AIDOTNET|PARITY)_[A-Z0-9_]+=|AIDOTNET_GPU_MEMTRACK|AIDOTNET_KERNEL_REGISTRY_PERSIST${{ matrix.arch != ''sm86'' && ''|\bSM ?86\b|GA10[0-9x]'' || '''' }}'
+        ALLOWED_SKIP_TEST: '(Hip|Rocm|Dawn|WebGpu|Vulkan|Metal|MoltenVk|OpenCl|Pocl|DirectMl)[A-Za-z0-9]*Tests\.'
+      run: |
+        $failed = $false
+        foreach ($part in @(@{ Title = 'CUDA (${{ matrix.arch }})'; Trx = 'cuda.trx' },
+                            @{ Title = 'CUDA (${{ matrix.arch }}) torch interop'; Trx = 'cuda-torch-interop.trx' })) {
+          python AiDotNet.Tensors/scripts/ci/summarize-test-skips.py --title $part.Title --fail-on-skip `
+            --allowed-skip $env:ALLOWED_SKIP --allowed-skip-test $env:ALLOWED_SKIP_TEST `
+            (Join-Path "${{ runner.temp }}/trx" $part.Trx)
+          if ($LASTEXITCODE -ne 0) { $failed = $true }
+        }
+        if ($failed) { exit 1 }
 
 
     - name: AiDotNet model families on CUDA (2 training steps, inference up to batch 128)
       if: matrix.arch == 'sm86'
+      # About 18 minutes in a passing run; bounded so the job budget above holds.
+      timeout-minutes: 22
       # Builds AiDotNet against this checkout (UseLocalTensors resolves ../../AiDotNet.Tensors from aidn/src), so the
       # model families exercise exactly this commit's kernels; the families were checked at the start of the job.
       run: |
@@ -408,6 +430,38 @@ jobs:
           --inference-iterations 3 --warmup-iterations 1 --output "${{ runner.temp }}/aidotnet-cuda.json"
         if ($LASTEXITCODE -ne 0) { Write-Output "::error::An AiDotNet model family failed on CUDA."; exit 1 }
 
+    # The CUDA step-time ratchets: each network's ours/PyTorch step ratio on this machine class may not rise above the
+    # one recorded in parity/head-to-head-baseline.json. PyTorch compiles each network in every mode for up to an hour
+    # (the runner's RunnerTimeout), far past a pull request's budget and the 15-minute hang blame, so they run nightly
+    # and on dispatch on the RTX 3080 only (the SM86 job's limit rises to 560 minutes then: at most about 160 minutes
+    # before this step, 360 in it, and the upload). They run only after every earlier step passed, so a red night does
+    # not hold the shared runner for hours more. A deferral (no baseline for the machine class, a torch that cannot reach
+    # the device) fails the step, and so does a missing network: each of the six must report a pass or a failure.
+    - name: CUDA step-time ratchets (nightly)
+      if: ${{ success() && matrix.arch == 'sm86' && github.event_name != 'pull_request' }}
+      timeout-minutes: 360
+      run: |
+        dotnet test AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj `
+          --configuration Release --no-build --framework net10.0 `
+          --filter "FullyQualifiedName~.HeadToHeadGpuNetworkTests.&Category=PyTorchParityGpu" `
+          --results-directory "${{ runner.temp }}/ratchets" --logger "trx;LogFileName=cuda-ratchets.trx" `
+          --blame-hang --blame-hang-timeout 75m --blame-crash
+        $tests = $LASTEXITCODE
+        python AiDotNet.Tensors/scripts/ci/summarize-test-skips.py --title "CUDA step-time ratchets" --fail-on-skip `
+          "${{ runner.temp }}/ratchets/*.trx"
+        $skips = $LASTEXITCODE
+        $ran = @{}
+        foreach ($trx in Get-ChildItem "${{ runner.temp }}/ratchets" -Recurse -Filter *.trx) {
+          foreach ($r in ([xml](Get-Content $trx.FullName -Raw)).TestRun.Results.UnitTestResult) {
+            if ($r.outcome -in 'Passed', 'Failed') { $ran[$r.testName] = $true }
+          }
+        }
+        $missing = @('Mlp', 'Cnn', 'Lstm', 'Gru', 'Transformer', 'Resnet18' |
+          ForEach-Object { "AiDotNet.Tensors.Tests.Parity.HeadToHeadGpuNetworkTests.$($_)_Cuda_DoesNotRegress" } |
+          Where-Object { -not $ran.ContainsKey($_) })
+        foreach ($name in $missing) { Write-Output "::error::Ratchet $name did not run (no pass or failure in the results)." }
+        if ($tests -ne 0 -or $skips -ne 0 -or $missing.Count -gt 0) { exit 1 }
+
     - name: Upload results
       if: always()
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -415,6 +469,7 @@ jobs:
         name: ${{ matrix.arch == 'sm86' && 'gpu-cuda-results' || format('gpu-cuda-results-{0}', matrix.arch) }}
         path: |
           ${{ runner.temp }}/trx/**
+          ${{ runner.temp }}/ratchets/**
           ${{ runner.temp }}/aidotnet-cuda.json
         if-no-files-found: ignore
         # A crash dump is the full test host (gigabytes); keep it only long enough to analyse.

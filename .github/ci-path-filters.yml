@@ -1,0 +1,227 @@
+# Path filters for ci.yml's changes job: a filtered workflow runs on a pull request or push only when a
+# changed file matches its list for that event (GitHub's glob syntax: * stays inside a directory, ** crosses
+# them). These are the lists each workflow carried on its own pull_request and push triggers before ci.yml
+# took them over; a workflow absent here, or an event absent under it, runs unfiltered.
+ptx-capsule:
+  # direct-ptx-capsule-gate.yml
+  pull_request:
+    - '.github/workflows/direct-ptx-capsule-gate.yml'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxFusedSquashF32Kernel.cs'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/**'
+    - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxCapsuleCubinTool.cs'
+    - 'tests/AiDotNet.Tensors.Benchmarks/Program.cs'
+  push:
+    - '.github/workflows/direct-ptx-capsule-gate.yml'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/**'
+    - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxCapsuleCubinTool.cs'
+
+ptx-convolution:
+  # direct-ptx-convolution-gate.yml
+  pull_request:
+    - '.github/workflows/direct-ptx-convolution-gate.yml'
+    - 'src/AiDotNet.Tensors/AiDotNet.Tensors.csproj'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/DirectPtxCubinArtifact.cs'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxFusedConv2DNchwK1Kernel.cs'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/**'
+    - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxConvolutionArtifactTool.cs'
+    - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxSassAuditTool.cs'
+    - 'tests/AiDotNet.Tensors.Benchmarks/Program.cs'
+  push:
+    - '.github/workflows/direct-ptx-convolution-gate.yml'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/**'
+    - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxConvolutionArtifactTool.cs'
+    - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxSassAuditTool.cs'
+
+ptx-dense-linear:
+  # direct-ptx-dense-linear-gate.yml
+  pull_request:
+    - '.github/workflows/direct-ptx-dense-linear-gate.yml'
+    - 'src/AiDotNet.Tensors/AiDotNet.Tensors.csproj'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/CudaNativeBindings.cs'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/CudaBackend.cs'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/CudaBackend.DirectPtx*.cs'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/CuBlasLtMatmul.cs'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/DirectPtx*.cs'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Ptx*.cs'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/**'
+    - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxDenseLinearArtifactTool.cs'
+    - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxDenseLinearSassAuditTool.cs'
+    - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxDenseLinearFullExperiment.cs'
+    - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxProfileTarget.cs'
+    - 'tests/AiDotNet.Tensors.Benchmarks/GpuBenchmarkEnvironment.cs'
+    - 'tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-ncu.ps1'
+    - 'tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-release-evidence.ps1'
+    - 'tests/AiDotNet.Tensors.Benchmarks/BaselineRunners/py/run_direct_ptx_dense_linear_full_competitors.py'
+    - 'tests/AiDotNet.Tensors.Benchmarks/Program.cs'
+    - 'tests/AiDotNet.Tensors.Tests/Engines/DirectGpu/DirectPtxDenseLinear*.cs'
+    - 'tests/AiDotNet.Tensors.Tests/Engines/DirectGpu/DirectPtxWmmaTests.cs'
+  push:
+    - '.github/workflows/direct-ptx-dense-linear-gate.yml'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/**'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/CudaBackend.cs'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/CudaBackend.DirectPtx*.cs'
+    - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxDenseLinearArtifactTool.cs'
+    - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxDenseLinearSassAuditTool.cs'
+    - 'tests/AiDotNet.Tensors.Benchmarks/GpuBenchmarkEnvironment.cs'
+    - 'tests/AiDotNet.Tensors.Tests/Engines/DirectGpu/DirectPtxDenseLinear*.cs'
+    - 'tests/AiDotNet.Tensors.Tests/Engines/DirectGpu/DirectPtxWmmaTests.cs'
+
+ptx-gather:
+  # direct-ptx-gather-gate.yml
+  pull_request:
+    - '.github/workflows/direct-ptx-gather-gate.yml'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxFusedGatherF32Kernel.cs'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxFusedIndexSelectF32Kernel.cs'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/**'
+    - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxGatherCubinTool.cs'
+    - 'tests/AiDotNet.Tensors.Benchmarks/Program.cs'
+  push:
+    - '.github/workflows/direct-ptx-gather-gate.yml'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/**'
+    - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxGatherCubinTool.cs'
+
+ptx-layout:
+  # direct-ptx-layout-gate.yml
+  pull_request:
+    - '.github/workflows/direct-ptx-layout-gate.yml'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxFusedCastF32ToF16Kernel.cs'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxFusedCastF16ToF32Kernel.cs'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxFusedTranspose2DF32Kernel.cs'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/**'
+    - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxOfflineCubinTool.cs'
+    - 'tests/AiDotNet.Tensors.Benchmarks/Program.cs'
+  push:
+    - '.github/workflows/direct-ptx-layout-gate.yml'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/**'
+    - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxOfflineCubinTool.cs'
+
+ptx-loss:
+  # direct-ptx-loss-gate.yml
+  pull_request:
+    - '.github/workflows/direct-ptx-loss-gate.yml'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/**'
+    - 'tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmarks.csproj'
+    - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxCubinToolCore.cs'
+    - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxLossCubinTool.cs'
+    - 'tests/AiDotNet.Tensors.Benchmarks/Program.cs'
+  push:
+    - '.github/workflows/direct-ptx-loss-gate.yml'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/**'
+    - 'tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmarks.csproj'
+    - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxCubinToolCore.cs'
+    - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxLossCubinTool.cs'
+    - 'tests/AiDotNet.Tensors.Benchmarks/Program.cs'
+
+ptx-normalization:
+  # direct-ptx-normalization-offline-gate.yml
+  pull_request:
+    - '.github/workflows/direct-ptx-normalization-offline-gate.yml'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/**'
+    - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxNormalizationOfflineCubinTool.cs'
+    - 'tests/AiDotNet.Tensors.Benchmarks/Program.cs'
+  push:
+    - '.github/workflows/direct-ptx-normalization-offline-gate.yml'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/**'
+    - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxNormalizationOfflineCubinTool.cs'
+
+ptx-optimizer:
+  # direct-ptx-optimizer-gate.yml
+  pull_request:
+    - '.github/workflows/direct-ptx-optimizer-gate.yml'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxFusedSgdMomentumF32Kernel.cs'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxFusedAdamUpdateF32Kernel.cs'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/**'
+    - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxOptimizerCubinTool.cs'
+    - 'tests/AiDotNet.Tensors.Benchmarks/Program.cs'
+  push:
+    - '.github/workflows/direct-ptx-optimizer-gate.yml'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/**'
+    - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxOptimizerCubinTool.cs'
+
+ptx-pooling:
+  # direct-ptx-pooling-gate.yml
+  pull_request:
+    - '.github/workflows/direct-ptx-pooling-gate.yml'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxFusedGlobalAvgPoolF32Kernel.cs'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxFusedGlobalMaxPoolF32Kernel.cs'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/**'
+    - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxPoolingCubinTool.cs'
+    - 'tests/AiDotNet.Tensors.Benchmarks/Program.cs'
+  push:
+    - '.github/workflows/direct-ptx-pooling-gate.yml'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/**'
+    - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxPoolingCubinTool.cs'
+
+ptx-reduction:
+  # direct-ptx-reduction-gate.yml
+  pull_request:
+    - '.github/workflows/direct-ptx-reduction-gate.yml'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxFusedRowReduceF32Kernel.cs'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxFusedRowReduceOpF32Kernel.cs'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxFusedRowL2NormalizeF32Kernel.cs'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/**'
+    - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxReductionCubinTool.cs'
+    - 'tests/AiDotNet.Tensors.Benchmarks/Program.cs'
+  push:
+    - '.github/workflows/direct-ptx-reduction-gate.yml'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/**'
+    - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxReductionCubinTool.cs'
+
+ptx-spectral:
+  # direct-ptx-spectral-gate.yml
+  pull_request:
+    # Any emitter under Ptx/ can change the generated PTX, and the cubin tool
+    # core decides how it is compiled and hashed. Naming individual kernels
+    # here let most of the family change without ever running this gate, so
+    # the pull_request filter now matches the push filter's breadth.
+    - '.github/workflows/direct-ptx-spectral-gate.yml'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/**'
+    - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxSpectralCubinTool.cs'
+    - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxCubinToolCore.cs'
+    - 'tests/AiDotNet.Tensors.Benchmarks/Program.cs'
+  push:
+    - '.github/workflows/direct-ptx-spectral-gate.yml'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/**'
+    - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxSpectralCubinTool.cs'
+    - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxCubinToolCore.cs'
+
+evolution-lifecycle:
+  # evolution-lifecycle.yml
+  pull_request:
+    - 'src/AiDotNet.Tensors/Helpers/Autotune/**'
+    - 'src/AiDotNet.Tensors/AiDotNet.Tensors.csproj'
+    - 'tests/AiDotNet.Tensors.Tests/Helpers/Autotune/**'
+    - 'tests/AiDotNet.Tensors.Autotune.Tests/**'
+    - '.github/workflows/evolution-lifecycle.yml'
+
+gemm-bench:
+  # gemm-bench.yml
+  # Auto no-regression gate: runs on PRs that touch the GEMM kernel or the bench
+  # itself. On the default ubuntu-latest runner the small-M lever no-ops (the
+  # shapes aren't under-tiled at <=~8 cores), so ON and OFF exercise the same
+  # code path and the gate is a stable identical-code A/B. Point GEMM_BENCH_RUNNER
+  # at a many-core runner (and use workflow_dispatch) to also validate the WIN.
+  pull_request:
+    - 'src/AiDotNet.Tensors/Engines/Simd/SimdGemm.cs'
+    - 'src/AiDotNet.Tensors/Engines/BlasManaged/**'
+    - 'tools/ConvParallelProbe/**'
+    # The probe reads internals: this file's InternalsVisibleTo list decides whether it compiles.
+    - 'src/AiDotNet.Tensors/AiDotNet.Tensors.csproj'
+    - '.github/workflows/gemm-bench.yml'
+
+cuda:
+  # gpu-cuda-selfhosted.yml
+  pull_request:
+    - 'src/AiDotNet.Tensors/Engines/CuDnnNative.cs'
+    - 'tests/AiDotNet.Tensors.Tests/Engines/DirectGpu/Cudnn*.cs'
+    - 'tests/AiDotNet.Tensors.Tests/Engines/Gpu/CuDnn*.cs'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/**'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpuTensorEngine*.cs'
+    - 'src/AiDotNet.Tensors/Engines/Gpu/**'
+    # Shared paths that decide GPU residency and buffer lifetime: a CUDA regression there must surface before merge.
+    - 'src/AiDotNet.Tensors/Engines/TensorScope.cs'
+    - 'src/AiDotNet.Tensors/Engines/Autodiff/**'
+    - 'src/AiDotNet.Tensors/LinearAlgebra/Tensor.cs'
+    - 'src/AiDotNet.Tensors/LinearAlgebra/TensorStorage.cs'
+    - 'src/AiDotNet.Tensors/Helpers/Autotune/**'
+    - '.github/workflows/gpu-cuda-selfhosted.yml'

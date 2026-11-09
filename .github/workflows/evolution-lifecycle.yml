@@ -1,20 +1,19 @@
 name: Evolution lifecycle source integration
 
 on:
-  pull_request:
-    paths:
-      - 'src/AiDotNet.Tensors/Helpers/Autotune/**'
-      - 'src/AiDotNet.Tensors/AiDotNet.Tensors.csproj'
-      - 'tests/AiDotNet.Tensors.Tests/Helpers/Autotune/**'
-      - 'tests/AiDotNet.Tensors.Autotune.Tests/**'
-      - '.github/workflows/evolution-lifecycle.yml'
+  # Pull requests and pushes run this workflow through ci.yml, so each push is one CI run with one cancel
+  # point. ci.yml's changes job applies this workflow's path filter (evolution-lifecycle in
+  # .github/ci-path-filters.yml).
+  workflow_call:
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: evolution-lifecycle-${{ github.ref }}
+  # Pull-request runs share a group per ref; any other run (a push to main, a schedule) gets its own, so main
+  # runs never cancel or replace one another and every push to main produces its results and coverage.
+  group: evolution-lifecycle-${{ (github.event_name == 'pull_request' && github.ref || github.run_id) }}
   cancel-in-progress: true
 
 jobs:

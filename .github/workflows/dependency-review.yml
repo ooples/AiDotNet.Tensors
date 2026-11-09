@@ -1,8 +1,9 @@
 name: Dependency Review
 
 on:
-  pull_request:
-    branches: [main]
+  # Pull requests and pushes run this workflow through ci.yml, so each push is one CI run with one cancel
+  # point.
+  workflow_call:
 
 permissions:
   contents: read

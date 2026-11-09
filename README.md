@@ -1,7 +1,7 @@
 # AiDotNet.Tensors
 
 [![NuGet](https://img.shields.io/nuget/v/AiDotNet.Tensors.svg)](https://www.nuget.org/packages/AiDotNet.Tensors/)
-[![Build](https://github.com/ooples/AiDotNet.Tensors/actions/workflows/build.yml/badge.svg)](https://github.com/ooples/AiDotNet.Tensors/actions/workflows/build.yml)
+[![CI](https://github.com/ooples/AiDotNet.Tensors/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ooples/AiDotNet.Tensors/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-BSL%201.1-blue.svg)](LICENSE)
 
 A high-performance .NET tensor library with hand-written AVX2/AVX-512 SIMD kernels in `SimdKernels.cs` / `SimdGemm.cs` / `SimdConvHelper.cs`. Every hot path runs through our own managed-C# kernels — we do NOT call into `System.Numerics.Tensors`, MKL.NET, or oneDNN through the standard wrappers. In the latest benchmark run on a Threadripper 3990X (see [CPU Benchmarks](#cpu-benchmarks) for every number, the versions compared and the losses), AiDotNet.Tensors was faster than TorchSharp 0.107 (libtorch) in 73 of 82 measurements, than ML.NET 5.0 and TensorFlow.NET 0.150 in all of them, than NumSharp 0.70 in 45 of 48 and than MathNet.Numerics 5.0 in all 33.

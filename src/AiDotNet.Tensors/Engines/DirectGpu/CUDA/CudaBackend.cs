@@ -2036,9 +2036,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             : new InvalidOperationException(message);
 
     /// <summary>
-    /// When set, every device allocation requests this many bytes instead of its own size: a test sets it past the
-    /// device's memory so the driver itself refuses each request, and the allocators' real out-of-memory handling
-    /// (reclaim, retry, classification) runs without depending on what else holds device memory.
+    /// When set, every device allocation requests this many bytes instead of its own size: a test sets it past
+    /// anything the machine can back so the driver itself refuses each request, and the allocators' real
+    /// out-of-memory handling (reclaim, retry, classification) runs without depending on what else holds device
+    /// memory. Past the device's memory alone is not enough on Windows: the driver's sysmem fallback lets a
+    /// synchronous <c>cuMemAlloc</c> of twice an RTX 3080's memory succeed in shared system memory.
     /// </summary>
     internal static ulong? AllocationBytesOverrideForTests;
 

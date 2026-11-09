@@ -1,15 +1,16 @@
 name: CodeQL
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  # Pull requests and pushes run this workflow through ci.yml, so each push is one CI run with one cancel
+  # point.
+  workflow_call:
   schedule:
     - cron: '0 8 * * 1'
 
 concurrency:
-  group: codeql-${{ github.ref }}
+  # Pull-request runs share a group per ref; any other run (a push to main, a schedule) gets its own, so main
+  # runs never cancel or replace one another and every push to main produces its results and coverage.
+  group: codeql-${{ (github.event_name == 'pull_request' && github.ref || github.run_id) }}
   # Cancel a superseded PR run, never a push to main: every merge shares the main ref, so
   # cancelling there would kill the previous merge's analysis.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
