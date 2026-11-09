@@ -1,10 +1,9 @@
 name: CodeQL
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  # Pull requests and pushes run this workflow through ci.yml, so each push is one CI run with one cancel
+  # point.
+  workflow_call:
   schedule:
     - cron: '0 8 * * 1'
 

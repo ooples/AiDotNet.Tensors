@@ -11,9 +11,9 @@ name: PyTorch Parity
 # GPU cases (Category=PyTorchParityGpu) need an NVIDIA device and run locally via tools/parity/run-gpu.ps1.
 
 on:
-  pull_request:
-  push:
-    branches: [main]
+  # Pull requests and pushes run this workflow through ci.yml, so each push is one CI run with one cancel
+  # point.
+  workflow_call:
   schedule:
     - cron: '0 7 * * *'
   workflow_dispatch:

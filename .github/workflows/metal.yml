@@ -12,13 +12,12 @@ name: Metal (macOS, Apple GPU)
 # which that noise widens but does not bias.
 
 on:
-  push:
-    branches: [ master, main ]
-  pull_request:
-    branches: [ master, main ]
+  # Pull requests and pushes run this workflow through ci.yml, so each push is one CI run with one cancel
+  # point.
+  workflow_call:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: metal-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:

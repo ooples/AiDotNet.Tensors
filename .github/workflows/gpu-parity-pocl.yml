@@ -26,13 +26,12 @@ name: GPU Parity (POCL / CPU-OpenCL)
 # hardware (the LSTM parity passes 234/234 on a local AMD RX 5500 XT).
 
 on:
-  push:
-    branches: [ master, main ]
-  pull_request:
-    branches: [ master, main ]
+  # Pull requests and pushes run this workflow through ci.yml, so each push is one CI run with one cancel
+  # point.
+  workflow_call:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: gpu-parity-pocl-${{ github.ref }}
   cancel-in-progress: true
 
 # Least privilege: this lane only reads the repo to check out + build + test.

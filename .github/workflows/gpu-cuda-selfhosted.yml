@@ -27,27 +27,13 @@ on:
   schedule:
     - cron: '30 6 * * *'
   workflow_dispatch:
-  pull_request:
-    branches: [ main ]
-    # ready_for_review starts the lane when a draft is marked ready; draft pushes do not take the runner (see the job's if).
-    types: [ opened, synchronize, reopened, ready_for_review ]
-    paths:
-      - 'src/AiDotNet.Tensors/Engines/CuDnnNative.cs'
-      - 'tests/AiDotNet.Tensors.Tests/Engines/DirectGpu/Cudnn*.cs'
-      - 'tests/AiDotNet.Tensors.Tests/Engines/Gpu/CuDnn*.cs'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpu/**'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpuTensorEngine*.cs'
-      - 'src/AiDotNet.Tensors/Engines/Gpu/**'
-      # Shared paths that decide GPU residency and buffer lifetime: a CUDA regression there must surface before merge.
-      - 'src/AiDotNet.Tensors/Engines/TensorScope.cs'
-      - 'src/AiDotNet.Tensors/Engines/Autodiff/**'
-      - 'src/AiDotNet.Tensors/LinearAlgebra/Tensor.cs'
-      - 'src/AiDotNet.Tensors/LinearAlgebra/TensorStorage.cs'
-      - 'src/AiDotNet.Tensors/Helpers/Autotune/**'
-      - '.github/workflows/gpu-cuda-selfhosted.yml'
+  # Pull requests and pushes run this workflow through ci.yml, so each push is one CI run with one cancel
+  # point. ci.yml's changes job applies this workflow's path filter (cuda in
+  # .github/ci-path-filters.yml).
+  workflow_call:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: gpu-cuda-selfhosted-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:

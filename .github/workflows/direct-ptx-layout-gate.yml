@@ -9,26 +9,14 @@ name: Direct PTX Layout Gate
 # instead of depending on one admitted device being available.
 
 on:
-  pull_request:
-    branches: [master, main]
-    paths:
-      - '.github/workflows/direct-ptx-layout-gate.yml'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxFusedCastF32ToF16Kernel.cs'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxFusedCastF16ToF32Kernel.cs'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxFusedTranspose2DF32Kernel.cs'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/**'
-      - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxOfflineCubinTool.cs'
-      - 'tests/AiDotNet.Tensors.Benchmarks/Program.cs'
-  push:
-    branches: [master, main]
-    paths:
-      - '.github/workflows/direct-ptx-layout-gate.yml'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/**'
-      - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxOfflineCubinTool.cs'
+  # Pull requests and pushes run this workflow through ci.yml, so each push is one CI run with one cancel
+  # point. ci.yml's changes job applies this workflow's path filter (ptx-layout in
+  # .github/ci-path-filters.yml).
+  workflow_call:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: direct-ptx-layout-gate-${{ github.ref }}
   cancel-in-progress: true
 
 env:

@@ -1,13 +1,12 @@
 name: Build and Test
 
 on:
-  push:
-    branches: [ master, main ]
-  pull_request:
-    branches: [ master, main ]
+  # Pull requests and pushes run this workflow through ci.yml, so each push is one CI run with one cancel
+  # point.
+  workflow_call:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: build-${{ github.ref }}
   # Only superseded PR runs are cancelled. A cancelled main run uploads no coverage, and codecov then
   # scores every open PR against an older base: #1066 and #1064 both merged within a minute on
   # 2026-09-29, each cancelled the other, and #1067's codecov/patch read 15.38% while codecov's own

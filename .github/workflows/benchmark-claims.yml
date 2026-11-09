@@ -10,9 +10,9 @@ name: Benchmark Claims
 # exists because editing the repository description (Settings, or gh repo edit) opens no pull request.
 
 on:
-  pull_request:
-  push:
-    branches: [main]
+  # Pull requests and pushes run this workflow through ci.yml, so each push is one CI run with one cancel
+  # point.
+  workflow_call:
   schedule:
     - cron: '17 6 * * *'
   workflow_dispatch:

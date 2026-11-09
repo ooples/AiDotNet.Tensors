@@ -1,45 +1,14 @@
 name: Direct PTX Dense Linear Gate
 
 on:
-  pull_request:
-    branches: [main]
-    paths:
-      - '.github/workflows/direct-ptx-dense-linear-gate.yml'
-      - 'src/AiDotNet.Tensors/AiDotNet.Tensors.csproj'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/CudaNativeBindings.cs'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/CudaBackend.cs'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/CudaBackend.DirectPtx*.cs'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/CuBlasLtMatmul.cs'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/DirectPtx*.cs'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Ptx*.cs'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/**'
-      - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxDenseLinearArtifactTool.cs'
-      - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxDenseLinearSassAuditTool.cs'
-      - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxDenseLinearFullExperiment.cs'
-      - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxProfileTarget.cs'
-      - 'tests/AiDotNet.Tensors.Benchmarks/GpuBenchmarkEnvironment.cs'
-      - 'tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-ncu.ps1'
-      - 'tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-release-evidence.ps1'
-      - 'tests/AiDotNet.Tensors.Benchmarks/BaselineRunners/py/run_direct_ptx_dense_linear_full_competitors.py'
-      - 'tests/AiDotNet.Tensors.Benchmarks/Program.cs'
-      - 'tests/AiDotNet.Tensors.Tests/Engines/DirectGpu/DirectPtxDenseLinear*.cs'
-      - 'tests/AiDotNet.Tensors.Tests/Engines/DirectGpu/DirectPtxWmmaTests.cs'
-  push:
-    branches: [main]
-    paths:
-      - '.github/workflows/direct-ptx-dense-linear-gate.yml'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/**'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/CudaBackend.cs'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/CudaBackend.DirectPtx*.cs'
-      - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxDenseLinearArtifactTool.cs'
-      - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxDenseLinearSassAuditTool.cs'
-      - 'tests/AiDotNet.Tensors.Benchmarks/GpuBenchmarkEnvironment.cs'
-      - 'tests/AiDotNet.Tensors.Tests/Engines/DirectGpu/DirectPtxDenseLinear*.cs'
-      - 'tests/AiDotNet.Tensors.Tests/Engines/DirectGpu/DirectPtxWmmaTests.cs'
+  # Pull requests and pushes run this workflow through ci.yml, so each push is one CI run with one cancel
+  # point. ci.yml's changes job applies this workflow's path filter (ptx-dense-linear in
+  # .github/ci-path-filters.yml).
+  workflow_call:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: direct-ptx-dense-linear-gate-${{ github.ref }}
   cancel-in-progress: true
 
 env:
