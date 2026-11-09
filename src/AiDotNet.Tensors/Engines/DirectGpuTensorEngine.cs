@@ -7931,6 +7931,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // GPU-RESIDENT compiled-step path first (no upload/download → capture-safe). Falls through to the
         // upload+compute+download path below when not on the resident step or not last-axis.
         if (TrySoftmaxResidentInto(destination, input, axis)) return;
+        {
+            int ea = axis < 0 ? input.Rank + axis : axis;
+            // The row kernel below is last-axis only; any other axis ran as if it were last and wrote wrong values.
+            if (ea >= 0 && ea < input.Rank && InnerSize(input, ea) != 1)
+            {
+                ((IEngine)this).TensorCopy(AlongLastAxis(input, ea, t => ((IEngine)this).Softmax(t, -1)), destination);
+                return;
+            }
+        }
         // Try GPU softmax: upload input, compute on GPU, download to destination
         if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
         {
@@ -29917,6 +29926,46 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     // TensorBinaryCrossEntropy has 3-param signature (includes epsilon) — handled in base
 
+    /// <summary>Product of the dims after <paramref name="axis"/>: 1 exactly when a row kernel can run along it.</summary>
+    private static int InnerSize<T>(Tensor<T> t, int axis)
+    {
+        int inner = 1;
+        for (int d = axis + 1; d < t.Rank; d++) inner *= t.Shape._dims[d];
+        return inner;
+    }
+
+    private static int[] AxisLastPermutation(int rank, int axis)
+    {
+        var perm = new int[rank];
+        for (int d = 0, k = 0; d < rank; d++) if (d != axis) perm[k++] = d;
+        perm[rank - 1] = axis;
+        return perm;
+    }
+
+    private static int[] InversePermutation(int[] perm)
+    {
+        var inv = new int[perm.Length];
+        for (int i = 0; i < perm.Length; i++) inv[perm[i]] = i;
+        return inv;
+    }
+
+    /// <summary>The permutation materialized contiguously on the device (TensorPermuteInto), not a strided view.</summary>
+    private Tensor<T> PermutedContiguous<T>(Tensor<T> t, int[] perm)
+    {
+        var dims = new int[perm.Length];
+        for (int i = 0; i < perm.Length; i++) dims[i] = t.Shape._dims[perm[i]];
+        var output = new Tensor<T>(new T[t.Length], dims);
+        TensorPermuteInto(output, t, perm);
+        return output;
+    }
+
+    /// <summary>Runs a last-axis row op along <paramref name="axis"/>: move the axis last, apply, move it back.</summary>
+    private Tensor<T> AlongLastAxis<T>(Tensor<T> input, int axis, Func<Tensor<T>, Tensor<T>> lastAxisOp)
+    {
+        var perm = AxisLastPermutation(input.Rank, axis);
+        return PermutedContiguous(lastAxisOp(PermutedContiguous(input, perm)), InversePermutation(perm));
+    }
+
     Tensor<T> IEngine.GLU<T>(Tensor<T> input, int axis)
     {
         using var __gpuOp = EnterGpuOp();
@@ -29927,6 +29976,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 int rank = input.Rank;
                 int ea = axis < 0 ? rank + axis : axis;
+                // The kernel gates along contiguous rows, i.e. the last axis. Any other axis is moved last on the device
+                // and back: before, it ran with the trailing dims folded away and returned wrong values.
+                if (InnerSize(input, ea) != 1)
+                    return AlongLastAxis(input, ea, t => ((IEngine)this).GLU(t, -1));
                 int halfDim = input.Shape._dims[ea] / 2;
                 int outerSize = 1;
                 for (int i = 0; i < ea; i++) outerSize *= input.Shape._dims[i];
@@ -29952,6 +30005,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 int rank = input.Rank;
                 int ea = axis < 0 ? rank + axis : axis;
+                // The kernel gates along contiguous rows, i.e. the last axis. Any other axis is moved last on the device
+                // and back: before, it ran with the trailing dims folded away and returned wrong values.
+                if (InnerSize(input, ea) != 1)
+                    return AlongLastAxis(input, ea, t => ((IEngine)this).GeGLU(t, -1));
                 int halfDim = input.Shape._dims[ea] / 2;
                 int outerSize = 1;
                 for (int i = 0; i < ea; i++) outerSize *= input.Shape._dims[i];
@@ -29976,6 +30033,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 int ea = axis < 0 ? input.Rank + axis : axis;
+                // The kernel gates along contiguous rows, i.e. the last axis. Any other axis is moved last on the device
+                // and back: before, it ran with the trailing dims folded away and returned wrong values.
+                if (InnerSize(input, ea) != 1)
+                    return AlongLastAxis(input, ea, t => ((IEngine)this).ReGLU(t, -1));
                 int halfDim = input.Shape._dims[ea] / 2;
                 int outerSize = 1;
                 for (int i = 0; i < ea; i++) outerSize *= input.Shape._dims[i];
@@ -30000,6 +30061,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 int ea = axis < 0 ? input.Rank + axis : axis;
+                // The kernel gates along contiguous rows, i.e. the last axis. Any other axis is moved last on the device
+                // and back: before, it ran with the trailing dims folded away and returned wrong values.
+                if (InnerSize(input, ea) != 1)
+                    return AlongLastAxis(input, ea, t => ((IEngine)this).SwiGLU(t, -1));
                 int halfDim = input.Shape._dims[ea] / 2;
                 int outerSize = 1;
                 for (int i = 0; i < ea; i++) outerSize *= input.Shape._dims[i];
@@ -30326,6 +30391,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var ggo=UploadTensorRaw(b, gradOutput);
                 int rank=softmaxOutput.Rank;
                 int ea=axis<0?rank+axis:axis;
+                // Row kernel (last axis). Any other axis: move it last on the device for both operands, then back.
+                if (InnerSize(softmaxOutput, ea) != 1)
+                {
+                    var perm = AxisLastPermutation(rank, ea);
+                    var r = ((IEngine)this).TensorSoftmaxBackward(PermutedContiguous(softmaxOutput, perm), PermutedContiguous(gradOutput, perm), -1);
+                    return PermutedContiguous(r, InversePermutation(perm));
+                }
                 int features=softmaxOutput.Shape._dims[ea];
                 int outerSize=softmaxOutput.Length/features;
                 return DispatchDeferredGpuOp<T>(b,softmaxOutput.Length,softmaxOutput.Shape.ToArray(),
