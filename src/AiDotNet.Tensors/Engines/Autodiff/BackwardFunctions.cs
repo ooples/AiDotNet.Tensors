@@ -3756,49 +3756,16 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var numOps = MathHelper.GetNumericOperations<T>();
-        var indicesTensor = savedState[0] as Tensor<int>;
-        int[] indices = indicesTensor is not null ? indicesTensor.GetFlattenedData() : (int[])savedState[0];
+        var indicesTensor = savedState[0] as Tensor<int> ?? new Tensor<int>((int[])savedState[0], new[] { ((int[])savedState[0]).Length });
         int dim = (int)savedState[1];
         var inShape = inputs[0]._shape;
-
-        int outerSize = 1, innerSize = 1;
-        int dimSize = inShape[dim];
-        for (int i = 0; i < dim; i++) outerSize *= inShape[i];
-        for (int i = dim + 1; i < inShape.Length; i++) innerSize *= inShape[i];
-
-        for (int i = 0; i < indices.Length; i++)
-            if (indices[i] < 0 || indices[i] >= dimSize)
-                throw new InvalidOperationException($"IndexSelectBackward: index {indices[i]} at position {i} out of range [0, {dimSize}).");
-
-        // Selecting along a leading axis (every axis before `dim` has size 1 -- the axis-0 row gather of MoE dispatch,
-        // embedding-style lookups, beam reordering) is exactly the embedding scatter-add: d_input[idx[i], :] +=
-        // d_out[i, :]. Route it through the engine so a GPU engine runs its device IndexAdd kernel instead of this
-        // method's host loop, which downloaded the gradient and paid a per-element indexer + version bump.
-        if (outerSize == 1)
-        {
-            var idx = indicesTensor ?? new Tensor<int>(indices, new[] { indices.Length });
-            var g = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
-            var dense = engine.TensorEmbeddingLookupBackward(engine.Reshape(g, new[] { indices.Length, innerSize }), idx, dimSize, innerSize);
-            DifferentiableOps.AccumulateGrad(grads, inputs[0], engine.Reshape(dense, inShape), engine);
-            return;
-        }
-
-        var inputGrad = TensorPool<T>.RentZeroed(inShape);
-        var src = (gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous()).GetReadOnlyDataArray();
-        using (var lease = inputGrad.LeaseArray())
-        {
-            var dst = lease.Array;
-            for (int outer = 0; outer < outerSize; outer++)
-            for (int idx = 0; idx < indices.Length; idx++)
-            {
-                int dstBase = (outer * dimSize + indices[idx]) * innerSize;
-                int srcBase = (outer * indices.Length + idx) * innerSize;
-                for (int inner = 0; inner < innerSize; inner++)
-                    dst[dstBase + inner] = numOps.Add(dst[dstBase + inner], src[srcBase + inner]);
-            }
-        }
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
+        // index_select's gradient is index_add of the output gradient into zeros: each selected slice adds back to the
+        // slice it came from (a repeated index accumulates). Through the engine, a GPU engine runs its IndexAdd kernel
+        // on device-resident operands; the forward validated the indices.
+        var index1D = indicesTensor.Rank == 1 ? indicesTensor : indicesTensor.Reshape(indicesTensor.Length);
+        var g = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
+        var gradInput = engine.ScatterAdd(new Tensor<T>((int[])inShape.Clone()), index1D, g, dim);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
     }
 
     /// <summary>L1 loss backward</summary>

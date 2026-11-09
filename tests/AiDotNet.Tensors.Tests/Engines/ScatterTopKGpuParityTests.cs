@@ -179,4 +179,50 @@ public class ScatterTopKGpuParityTests
         Assert.Equal(new[] { 2f, 3f }, g[src].ToArray());
         Assert.Equal(new[] { 0f, 0f, 4f }, g[dst].ToArray());
     }
+
+    [SkippableFact]
+    public void Taped_index_select_along_a_middle_axis_trains_on_the_device()
+    {
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.IfNot(gpu.IsGpuAvailable, "No DirectGpu backend available");
+
+        int[] shape = { 2, 5, 3 };
+        // A repeated index: its gradient slices accumulate into the one source slice.
+        var idx = new Tensor<int>(new[] { 4, 1, 4, 0 }, new[] { 4 });
+        (float[] y, float[] g, long forwardReadbacks) Run(IEngine eng, bool upload)
+        {
+            var host = new Tensor<float>(shape, new Vector<float>(Gen(30, 6)));
+            var x = upload && eng is DirectGpuTensorEngine d ? d.UploadToGpu(host, AiDotNet.Tensors.Engines.Gpu.GpuTensorRole.General) : host;
+            var w = new Tensor<float>(new[] { 2, 4, 3 }, new Vector<float>(Gen(24, 7)));
+            using var tape = new GradientTape<float>();
+            GpuLaunchProbe.Reset();
+            var y = eng.TensorIndexSelect(x, idx, 1);
+            long readbacks = GpuLaunchProbe.Readbacks;
+            var grads = tape.ComputeGradients(eng.ReduceSum(eng.TensorMultiply(y, w), null, keepDims: false), new[] { x });
+            return (y.ToArray(), grads[x].ToArray(), readbacks);
+        }
+
+        var expected = Run(new CpuEngine(), upload: false);
+        var actual = OnDevice(() => Run(gpu, upload: true));
+        Assert.True(actual.forwardReadbacks == 0, $"The taped index select read {actual.forwardReadbacks} buffers back.");
+        Assert.Equal(expected.y, actual.y);
+        Assert.Equal(expected.g, actual.g);
+    }
+
+    [Fact]
+    public void Index_select_backward_uses_the_indices_of_the_forward()
+    {
+        var eng = new CpuEngine();
+        var x = new Tensor<float>(new[] { 3, 2 }, new Vector<float>(new[] { 1f, 2f, 3f, 4f, 5f, 6f }));
+        var idx = new Tensor<int>(new[] { 2, 0 }, new[] { 2 });
+        var w = new Tensor<float>(new[] { 2, 2 }, new Vector<float>(new[] { 1f, 2f, 3f, 4f }));
+        System.Collections.Generic.Dictionary<Tensor<float>, Tensor<float>> g;
+        using (var tape = new GradientTape<float>())
+        {
+            var y = eng.TensorIndexSelect(x, idx, 0);
+            idx[0] = 1;
+            g = tape.ComputeGradients(eng.ReduceSum(eng.TensorMultiply(y, w), null, keepDims: false), new[] { x });
+        }
+        Assert.Equal(new[] { 3f, 4f, 0f, 0f, 1f, 2f }, g[x].ToArray());
+    }
 }

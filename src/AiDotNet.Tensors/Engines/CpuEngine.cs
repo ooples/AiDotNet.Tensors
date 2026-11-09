@@ -42990,7 +42990,7 @@ public partial class CpuEngine : ITensorLevelEngine
             });
 
             DifferentiableOps.RecordUnary("TensorIndexSelect", result, tensor,
-                BackwardFunctions<T>.IndexSelectBackward, new object[] { indices, axis });
+                BackwardFunctions<T>.IndexSelectBackward, new object[] { indices.Clone(), axis });
             AutoTracer.RecordOp("TensorIndexSelect", result, eng => eng.TensorIndexSelect(tensor, indices, axis));
             return result;
         }
@@ -43015,7 +43015,7 @@ public partial class CpuEngine : ITensorLevelEngine
             });
 
             DifferentiableOps.RecordUnary("TensorIndexSelect", result, tensor,
-                BackwardFunctions<T>.IndexSelectBackward, new object[] { indices, axis });
+                BackwardFunctions<T>.IndexSelectBackward, new object[] { indices.Clone(), axis });
             AutoTracer.RecordOp("TensorIndexSelect", result, eng => eng.TensorIndexSelect(tensor, indices, axis));
             return result;
         }
@@ -43047,7 +43047,7 @@ public partial class CpuEngine : ITensorLevelEngine
             });
 
             DifferentiableOps.RecordUnary("TensorIndexSelect", result, tensor,
-                BackwardFunctions<T>.IndexSelectBackward, new object[] { indices, axis });
+                BackwardFunctions<T>.IndexSelectBackward, new object[] { indices.Clone(), axis });
             AutoTracer.RecordOp("TensorIndexSelect", result, eng => eng.TensorIndexSelect(tensor, indices, axis));
             return result;
         }

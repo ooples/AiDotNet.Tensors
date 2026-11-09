@@ -4640,6 +4640,24 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <summary>
+    /// A copy of <paramref name="indices"/> for a tape entry, so a caller editing its tensor after the forward does not
+    /// change the gradient: on the device (numeric floats, the resident index form) for device-resident indices, a host
+    /// array otherwise.
+    /// </summary>
+    internal Tensor<int> SnapshotIndices(IDirectGpuBackend backend, Tensor<int> indices)
+    {
+        var shape = (int[])indices._shape.Clone();
+        if (indices.Length == 0 || !HasResidentIndexStorage(indices))
+            return new Tensor<int>(indices.ToArray(), shape);
+        using var numeric = GetOrAllocateNumericIndexBuffer(backend, indices);
+        var copy = AllocateOutputBuffer(backend, indices.Length);
+        backend.Copy(numeric.Buffer, copy.Buffer, indices.Length);
+        var snapshot = DeferTensorResult<int>(backend, copy.Buffer, indices.Length, shape);
+        copy.RelinquishOwnership();
+        return snapshot;
+    }
+
+    /// <summary>
     /// The indices as numeric floats, the form the float-indexed kernels (take-along-dim) read. Device-resident indices
     /// stored as raw int32 (argmax indices) are converted on the device; their raw bits read as floats would be
     /// denormals that truncate to 0.
@@ -9483,19 +9501,8 @@ public partial class DirectGpuTensorEngine
             if (IsTapeActive<T>())
             {
                 // The backward reads the indices this forward used: a caller editing its tensor afterwards must not
-                // change the gradient, so the tape keeps a copy (on the device for device-resident indices).
-                Tensor<int> savedIndices;
-                if (m > 0 && HasResidentIndexStorage(ci))
-                {
-                    var copy = AllocateOutputBuffer(backend, m);
-                    backend.Copy(floatIndex.Buffer, copy.Buffer, m);
-                    savedIndices = DeferTensorResult<int>(backend, copy.Buffer, m, (int[])ci._shape.Clone());
-                    copy.RelinquishOwnership();
-                }
-                else
-                {
-                    savedIndices = new Tensor<int>(ci.ToArray(), (int[])ci._shape.Clone());
-                }
+                // change the gradient, so the tape keeps a copy.
+                var savedIndices = SnapshotIndices(backend, ci);
                 Autodiff.DifferentiableOps.RecordBinary("TensorScatter", result, destination, source,
                     Autodiff.BackwardFunctions<T>.TensorScatterBackward, new object[] { savedIndices, d });
             }

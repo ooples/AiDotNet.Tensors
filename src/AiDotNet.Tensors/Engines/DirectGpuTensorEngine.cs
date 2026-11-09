@@ -27363,7 +27363,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Compilation.GraphMode.ThrowIfInferenceUnsupported(
             Compilation.GraphCaptureLimitation.HeterogeneousInput);
         int normalizedAxis = axis < 0 ? tensor.Rank + axis : axis;
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+        // Graph capture records its lazy node in the host implementation; a tape does not stop the kernel, which records
+        // its own entry below.
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || normalizedAxis < 0 || normalizedAxis >= tensor.Rank || !TryGetBackend(out var backend)
             || backend is not IResidentIndexBackend indexBackend)
             return base.TensorIndexSelect(tensor, indices, axis);
@@ -27398,9 +27400,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var output = DispatchDeferredGpuOp<T>(backend, total, outShape, result =>
                 indexBackend.IndexSelect(sourceBuffer.Buffer, indexBuffer.Buffer, result,
                     outerSize, axisSize, numIndices, innerSize));
-            Autodiff.DifferentiableOps.RecordUnary("IndexSelect", output, tensor,
-                Autodiff.BackwardFunctions<T>.IndexSelectBackward,
-                new object[] { indices, normalizedAxis, tensor.Shape._dims });
+            if (IsTapeActive<T>())
+                Autodiff.DifferentiableOps.RecordUnary("IndexSelect", output, tensor,
+                    Autodiff.BackwardFunctions<T>.IndexSelectBackward,
+                    new object[] { SnapshotIndices(backend, contiguousIndices), normalizedAxis });
             return output;
         }
         catch (Exception)
