@@ -7,6 +7,26 @@ using AiDotNet.Tensors.LinearAlgebra;
 namespace AiDotNet.Tensors.Engines.Compilation;
 
 /// <summary>
+/// Where a compiled training step adds the L2 term (<c>strength * parameter</c>) relative to global-norm gradient
+/// clipping.
+/// </summary>
+public enum GradientRegularizationOrder
+{
+    /// <summary>
+    /// Adds the L2 term, then clips the regularized gradient: the order of an L2 penalty written into the loss, as
+    /// TensorFlow/Keras train with a kernel regularizer and <c>clipnorm</c>. The clip bounds the decay too.
+    /// </summary>
+    RegularizeThenClip,
+
+    /// <summary>
+    /// Clips the loss gradient, then adds the L2 term: PyTorch's order, where <c>clip_grad_norm_</c> runs before
+    /// <c>optimizer.step()</c> folds <c>weight_decay * parameter</c> into the gradient. The decay is never scaled by
+    /// the clip.
+    /// </summary>
+    ClipThenRegularize,
+}
+
+/// <summary>
 /// Reduced optimizer-state storage modes supported by fused compiled training.
 /// Parameters and gradients remain fp32; this controls only Adam-family moment
 /// buffers owned by the compiled optimizer closure.
@@ -460,8 +480,7 @@ public interface ICompiledTrainingPlan<T> : IDisposable
 
     /// <summary>
     /// Adds <c>strength * parameter</c> to every parameter gradient each step, BEFORE gradient clipping and the
-    /// optimizer update - L2 regularization in the order AiDotNet's optimizers apply it to a flat gradient (which is
-    /// not the order of a coupled optimizer weight decay, applied after clipping). 0 disables it.
+    /// optimizer update (<see cref="GradientRegularizationOrder.RegularizeThenClip"/>). 0 disables it.
     /// </summary>
     void SetL2Regularization(double strength);
 
@@ -762,6 +781,24 @@ public interface ICompiledTrainingPlanIntrospection<T>
     /// reads.
     /// </summary>
     IReadOnlyList<LrSchedule> LearningRateSchedules { get; }
+}
+
+/// <summary>
+/// Chooses which side of global-norm gradient clipping a compiled training plan adds its L2 term on.
+/// </summary>
+/// <remarks>
+/// Separate from <see cref="ICompiledTrainingPlan{T}"/> so adding it breaks no existing implementer of that interface
+/// (default interface members are unavailable on .NET Framework). The built-in plan implements both; test for it with
+/// <c>plan is ICompiledTrainingPlanRegularizationOrder ordered</c>.
+/// </remarks>
+public interface ICompiledTrainingPlanRegularizationOrder
+{
+    /// <summary>
+    /// Adds <c>strength * parameter</c> to every parameter gradient each step, on the side of gradient clipping that
+    /// <paramref name="order"/> names, before the optimizer update. 0 disables it. Replaces any earlier
+    /// <see cref="ICompiledTrainingPlan{T}.SetL2Regularization(double)"/> call.
+    /// </summary>
+    void SetL2Regularization(double strength, GradientRegularizationOrder order);
 }
 
 /// <summary>
