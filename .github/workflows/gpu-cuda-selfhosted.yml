@@ -98,7 +98,7 @@ jobs:
     # Each runner needs self-hosted, gpu, cuda AND its architecture label (sm86 or sm75); a runner registered before
     # the split carries no architecture label and picks up neither job until relabelled (see the header for how).
     runs-on: [self-hosted, gpu, cuda, '${{ matrix.arch }}']
-    timeout-minutes: ${{ matrix.arch == 'sm86' && 150 || 240 }}
+    timeout-minutes: ${{ matrix.arch == 'sm86' && 160 || 240 }}
     env:
       # The tests this lane runs. It selects by name, so a GPU test outside these terms never runs on CUDA; the
       # coverage check below fails the lane when a test class that drives the GPU engine is not selected. A term
@@ -273,7 +273,7 @@ jobs:
         # the job's start (the runner worker's), not this step's, and stops DIAGNOSTICS_RESERVE_MINUTES short of the job
         # limit, so slow setup cannot let the job timeout cancel the step before the watchdog fires.
         SUITE_WATCHDOG_MINUTES: ${{ matrix.arch == 'sm86' && '120' || '215' }}
-        JOB_LIMIT_MINUTES: ${{ matrix.arch == 'sm86' && '150' || '240' }}
+        JOB_LIMIT_MINUTES: ${{ matrix.arch == 'sm86' && '160' || '240' }}
         DIAGNOSTICS_RESERVE_MINUTES: '20'
       run: |
         New-Item -ItemType Directory -Force "${{ runner.temp }}/trx" | Out-Null
@@ -348,7 +348,9 @@ jobs:
     # class failed. In a host of its own, torch is imported before the class creates an engine.
     - name: Embedded torch interop (own test host)
       if: ${{ !cancelled() }}
-      timeout-minutes: 15
+      # Eight tests and one interpreter start: seconds. The bound leaves the model families' ~18 minutes and the upload
+      # inside the job limit even when the suites end at the watchdog deadline (about 123 minutes into the job).
+      timeout-minutes: 5
       run: >-
         dotnet test AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj
         --configuration Release --no-build --framework net10.0

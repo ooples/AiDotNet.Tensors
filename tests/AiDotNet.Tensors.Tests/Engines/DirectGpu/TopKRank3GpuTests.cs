@@ -96,6 +96,7 @@ public class TopKRank3GpuTests
         Assert.Equal(tournamentsBefore + 1, gpu.TopKTournamentsCompleted);
         var (ev, ei) = TopKAnyAxisTests.Reference(data, shape, 1, k, largest: true);
         Assert.Equal(new[] { rows, k }, values.Shape.ToArray());
+        Assert.Equal(new[] { rows, k }, indices.Shape.ToArray());
         Assert.Equal(ev, values.ToArray());
         Assert.Equal(ei, indices.ToArray());
     }
@@ -119,6 +120,8 @@ public class TopKRank3GpuTests
         int tournamentsBefore = gpu.TopKTournamentsCompleted;
         var values = ((IEngine)gpu).TensorTopK(new Tensor<float>(data, new[] { rows, columns }), k, 1, out var indices);
         Assert.Equal(tournamentsBefore + 1, gpu.TopKTournamentsCompleted);
+        Assert.Equal(new[] { rows, k }, values.Shape.ToArray());
+        Assert.Equal(new[] { rows, k }, indices.Shape.ToArray());
 
         var v = values.ToArray();
         var ix = indices.ToArray();
