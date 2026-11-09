@@ -4568,11 +4568,15 @@ public partial class DirectGpuTensorEngine
     // Sorts numRows contiguous rows of length L on the GPU (NaN-aware, torch order) and returns the
     // sorted values and original-position indices in the SAME [numRows*L] layout. Rows are padded to a
     // power of two on the device (ascending pad = NaN -> +inf -> tail; descending pad = -inf -> tail);
-    // the host drives the O(log^2 P) bitonic (k, j) schedule. Indices ride along as floats (exact for
-    // the index range). Verified against the CPU reference.
+    // the host drives the O(log^2 P) bitonic (k, j) schedule. Indices ride along as floats, exact only while
+    // every position is at most 2^24 (MaxFloatExactSortIndexColumns columns); longer rows lose index bits, so a
+    // caller that returns indices must route them elsewhere. Verified against the CPU reference.
     // Sorts numRows rows of length L on the GPU and returns the un-padded sorted VALUE + INDEX buffers
     // (index buffer holds the original positions as float; caller owns both — NOT downloaded). This is
     // the resident core; download wrappers and FinishGpuOp callers build on it.
+    /// <summary>Longest row whose positions 0..L-1 a float holds exactly (2^24 + 1 columns: the last index is 2^24).</summary>
+    internal const int MaxFloatExactSortIndexColumns = (1 << 24) + 1;
+
     private (OwnedBuffer outVal, OwnedBuffer outIdx) BitonicSortRowsToBuffers(
         IDirectGpuBackend backend, IGpuBuffer source, int numRows, int L, bool descending)
     {
@@ -4717,6 +4721,11 @@ public partial class DirectGpuTensorEngine
 
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
         int normalizedAxis = axis < 0 ? axis + tensor.Rank : axis;
+        // An empty tensor has no rows to sort (an empty last axis would also divide by zero below), and the row sort
+        // carries indices as floats, which are exact only up to 2^24: the CPU selection handles both.
+        if (tensor.Length == 0
+            || (normalizedAxis >= 0 && normalizedAxis < tensor.Rank && tensor._shape[normalizedAxis] > MaxFloatExactSortIndexColumns))
+            return base.TensorTopK(tensor, k, axis, out indices);
         // Last axis of a higher-rank contiguous tensor (e.g. [B, S, V] logits): the same rows-on-device kernel over
         // [outer, V], with the leading shape restored on the outputs.
         if (typeof(T) == typeof(float) && tensor.Rank > 2 && normalizedAxis == tensor.Rank - 1 && k > 0 && tensor.IsContiguous)
