@@ -4717,6 +4717,17 @@ public partial class DirectGpuTensorEngine
 
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
         int normalizedAxis = axis < 0 ? axis + tensor.Rank : axis;
+        // Last axis of a higher-rank contiguous tensor (e.g. [B, S, V] logits): the same rows-on-device kernel over
+        // [outer, V], with the leading shape restored on the outputs.
+        if (typeof(T) == typeof(float) && tensor.Rank > 2 && normalizedAxis == tensor.Rank - 1 && k > 0 && tensor.IsContiguous)
+        {
+            int columns = tensor._shape[normalizedAxis];
+            var rowValues = ((IEngine)this).TensorTopK(Reshape(tensor, new[] { tensor.Length / columns, columns }), k, 1, out var rowIndices);
+            var outShape = (int[])tensor._shape.Clone();
+            outShape[normalizedAxis] = rowValues._shape[1];
+            indices = rowIndices.Reshape(outShape);
+            return Reshape(rowValues, outShape);
+        }
         if (typeof(T) != typeof(float) || tensor.Rank != 2 || normalizedAxis != 1
             || k <= 0 || !tensor.IsContiguous || !TryGetBackend(out var backend))
             return base.TensorTopK(tensor, k, axis, out indices);
