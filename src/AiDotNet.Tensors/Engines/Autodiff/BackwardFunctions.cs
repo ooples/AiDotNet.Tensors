@@ -9263,6 +9263,7 @@ internal static class BackwardFunctions<T>
     private static Tensor<T> InterpolateBackwardImpl(Tensor<T> gradOutput, Tensor<T> input,
         InterpolateMode mode, bool alignCorners)
     {
+        if (InterpolateKernels.Handles(mode) && InterpolateKernels.TryBackward(gradOutput, input, mode, alignCorners) is { } fast) return fast;
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradInput = new Tensor<T>(input._shape);
         int spatial = input.Rank - 2;
