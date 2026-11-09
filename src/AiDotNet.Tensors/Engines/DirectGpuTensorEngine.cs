@@ -27664,6 +27664,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             && destination.IsContiguous && axis >= 0 && axis < destination.Rank
             && index >= 0 && index < destination.Shape._dims[axis] && TryGetBackend(out var backend))
         {
+            ValidateSliceSource(destination._shape, source._shape, axis);
             var src = source.IsContiguous ? source : source.Contiguous();
             var srcR = ResolveResidentBufferNoUpload(backend, src, src.Length);
             if (srcR is null && System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1")

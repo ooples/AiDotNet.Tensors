@@ -1042,7 +1042,10 @@ extern ""C"" __global__ void parity210_kron2d(const float* __restrict__ a, const
 }
 extern ""C"" __global__ void parity210_search_sorted(const float* __restrict__ seq, const float* __restrict__ values, float* __restrict__ output, int seqLen, int numValues, int right) {
     int idx = blockIdx.x*blockDim.x+threadIdx.x; if (idx >= numValues) return; float v = values[idx]; int lo=0, hi=seqLen;
-    while (lo < hi) { int mid=(lo+hi)>>1; int cond=(right!=0)?(seq[mid]<=v):(seq[mid]<v); if (cond) lo=mid+1; else hi=mid; }
+    int vNan=(__float_as_uint(v)&0x7FFFFFFFu)>0x7F800000u;
+    // torch.searchsorted moves right on !(seq[mid] >= v) (!(seq[mid] > v) for right), so every comparison with a NaN
+    // moves right; the NaN test reads the bits so fast-math cannot fold it away.
+    while (lo < hi) { int mid=(lo+hi)>>1; float s=seq[mid]; int nan=vNan||((__float_as_uint(s)&0x7FFFFFFFu)>0x7F800000u); int cond=nan||((right!=0)?(s<=v):(s<v)); if (cond) lo=mid+1; else hi=mid; }
     output[idx] = (float)lo;
 }
 extern ""C"" __global__ void parity210_next_after(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ output, int size) {

@@ -3005,7 +3005,9 @@ internal static class BackwardFunctions<T>
 
     /// <summary>
     /// TensorScatter backward (torch.scatter): the destination's gradient is gradOutput with the overwritten positions
-    /// zeroed, and the source's is gradOutput read back at those positions (take-along-dim).
+    /// zeroed, and the source's is gradOutput read back at those positions (take-along-dim). When an index repeats
+    /// within a fibre the forward keeps only the last write, so only that source element receives the gradient; the
+    /// earlier writes were overwritten and get zero.
     /// </summary>
     internal static void TensorScatterBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
@@ -3015,7 +3017,61 @@ internal static class BackwardFunctions<T>
         var axis = (int)savedState[1];
         var gradDestination = engine.TensorScatter(gradOutput, indices, new Tensor<T>(indices._shape), axis);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradDestination, engine);
-        DifferentiableOps.AccumulateGrad(grads, inputs[1], engine.TensorTakeAlongDim(gradOutput, indices, axis), engine);
+        var gradSource = engine.TensorTakeAlongDim(gradOutput, indices, axis);
+        // A GPU engine finds the overwritten writes on the device; the host scan is for host engines.
+        var lastWrites = engine is DirectGpuTensorEngine gpu
+            ? gpu.TryScatterLastWriteMask<T>(indices, axis, output._shape) ?? ScatterLastWriteMask(indices, axis)
+            : ScatterLastWriteMask(indices, axis);
+        if (lastWrites is not null)
+            gradSource = engine.TensorWhere(lastWrites, gradSource, new Tensor<T>((int[])gradSource._shape.Clone()));
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradSource, engine);
+    }
+
+    /// <summary>
+    /// For a scatter along <paramref name="axis"/>: 1 where an index entry is the last write to its position within its
+    /// fibre and 0 where a later entry overwrites it; null when no fibre repeats an index (every write survives).
+    /// </summary>
+    private static Tensor<T>? ScatterLastWriteMask(Tensor<int> indices, int axis)
+    {
+        var shape = indices._shape;
+        int count = shape[axis], outer = 1, inner = 1;
+        for (int d = 0; d < axis; d++) outer *= shape[d];
+        for (int d = axis + 1; d < shape.Length; d++) inner *= shape[d];
+        var index = indices.GetFlattenedData();
+        bool[]? overwritten = null;
+        var seen = new HashSet<int>();
+        for (int o = 0; o < outer; o++)
+        {
+            for (int i = 0; i < inner; i++)
+            {
+                seen.Clear();
+                for (int j = count - 1; j >= 0; j--)
+                {
+                    int flat = (o * count + j) * inner + i;
+                    if (!seen.Add(index[flat]))
+                        (overwritten ??= new bool[indices.Length])[flat] = true;
+                }
+            }
+        }
+        if (overwritten is null) return null;
+        var ops = MathHelper.GetNumericOperations<T>();
+        var mask = new T[overwritten.Length];
+        for (int p = 0; p < mask.Length; p++) mask[p] = overwritten[p] ? ops.Zero : ops.One;
+        return new Tensor<T>(mask, (int[])shape.Clone());
+    }
+
+    /// <summary>
+    /// TopK backward: each selected value's gradient flows back to its position along the axis, and the positions that
+    /// were not selected get zero. The indices are distinct within a fibre, so a scatter into zeros is exact.
+    /// </summary>
+    internal static void TopKBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var indices = (Tensor<int>)savedState[0];
+        var axis = (int)savedState[1];
+        var gradInput = engine.TensorScatter(new Tensor<T>((int[])inputs[0]._shape.Clone()), indices, gradOutput, axis);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
     }
 
     /// <summary>ExpandDims backward: squeeze the added dimension</summary>

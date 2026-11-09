@@ -899,7 +899,8 @@ public partial class CpuEngine
             int a = k1 >= 0 ? s1[k1] : 1, b = k2 >= 0 ? s2[k2] : 1;
             if (a != b && a != 1 && b != 1)
                 throw new ArgumentException($"CDist: batch dim {k} is {a} vs {b}; they do not broadcast.");
-            shape[k] = Math.Max(a, b);
+            // A singleton broadcasts to the other size, 0 included: batches 0 and 1 give 0, not Math.Max's 1.
+            shape[k] = a == 1 ? b : a;
         }
         int count = 1;
         foreach (var v in shape) count *= v;
@@ -3625,13 +3626,21 @@ public partial class CpuEngine
                 {
                     int mid = lo + ((hi - lo) >> 1);
                     var e = seq[r * s + mid];
-                    // right = false: first position with seq >= x; right = true: first position with seq > x.
-                    bool goRight = right ? !numOps.GreaterThan(e, x) : numOps.LessThan(e, x);
-                    if (goRight) lo = mid + 1; else hi = mid;
+                    // The rank-one search's comparisons: right = false splits at x <= seq, right = true at x < seq. Both
+                    // are false for NaN, so a NaN value lands after every element, as it does at rank one.
+                    bool beforeMid = right ? numOps.LessThan(x, e) : numOps.LessThanOrEquals(x, e);
+                    if (beforeMid) hi = mid; else lo = mid + 1;
                 }
                 dst[r * v + j] = lo;
             }
         return result;
+    }
+
+    private static bool SequenceHasNaN(ReadOnlySpan<float> sequence)
+    {
+        for (int i = 0; i < sequence.Length; i++)
+            if (float.IsNaN(sequence[i])) return true;
+        return false;
     }
 
     /// <inheritdoc/>
@@ -3656,16 +3665,22 @@ public partial class CpuEngine
         // Float32 fast path: route through SortKernels which uses AVX2
         // popcount-masked comparison for short sequences and a branchless
         // binary search for longer ones.
-        if (typeof(T) == typeof(float))
+        // The kernels count elements below the value, which is torch's answer only when the sequence holds no NaN:
+        // torch's binary search moves right past a NaN element, so such a sequence takes the search loop below.
+        if (typeof(T) == typeof(float) && !SequenceHasNaN(((Tensor<float>)(object)sortedSequence).AsSpan()))
         {
             using var seqArrLease = sortedSequence.LeaseArray();
             float[] seqArr = (float[])(object)seqArrLease.Array;
             float[] vsArr = (float[])(object)values.GetDataArray();
             ReadOnlySpan<float> seqSpan = seqArr;
+            // A NaN value lands after every element (torch.searchsorted, and the search loop below); the kernels'
+            // comparisons are all false for NaN and would place it first.
             if (right)
-                for (int i = 0; i < values.Length; i++) dst[i] = Simd.SortKernels.UpperBoundFloat(seqSpan, vsArr[i]);
+                for (int i = 0; i < values.Length; i++)
+                    dst[i] = float.IsNaN(vsArr[i]) ? seqSpan.Length : Simd.SortKernels.UpperBoundFloat(seqSpan, vsArr[i]);
             else
-                for (int i = 0; i < values.Length; i++) dst[i] = Simd.SortKernels.LowerBoundFloat(seqSpan, vsArr[i]);
+                for (int i = 0; i < values.Length; i++)
+                    dst[i] = float.IsNaN(vsArr[i]) ? seqSpan.Length : Simd.SortKernels.LowerBoundFloat(seqSpan, vsArr[i]);
             return result;
         }
 

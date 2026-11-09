@@ -42571,6 +42571,24 @@ public partial class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    /// <summary>
+    /// The source of a set-slice must be the slice: the destination's shape without <paramref name="axis"/>, with or
+    /// without size-1 dims (the slice's gradient keeps the axis as 1). Anything else was copied as a flat prefix,
+    /// silently writing the wrong elements.
+    /// </summary>
+    internal static void ValidateSliceSource(int[] destinationShape, int[] sourceShape, int axis)
+    {
+        var slice = destinationShape.Where((_, d) => d != axis).Where(n => n != 1);
+        if (!slice.SequenceEqual(sourceShape.Where(n => n != 1)))
+        {
+            var expected = destinationShape.Where((_, d) => d != axis);
+            throw new ArgumentException(
+                $"TensorSetSliceAxis: source shape [{string.Join(", ", sourceShape)}] is not the slice shape " +
+                $"[{string.Join(", ", expected)}] of destination [{string.Join(", ", destinationShape)}] along axis {axis}.",
+                "source");
+        }
+    }
+
     /// <inheritdoc/>
     [MethodImpl(Hot)]
     public void TensorSetSliceAxis<T>(Tensor<T> destination, Tensor<T> source, int axis, int index)
@@ -42581,6 +42599,7 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentOutOfRangeException(nameof(axis), $"Axis {axis} is out of range for tensor of rank {destination.Rank}.");
         if (index < 0 || index >= destination._shape[axis])
             throw new ArgumentOutOfRangeException(nameof(index), $"Index {index} is out of range for axis {axis} with size {destination._shape[axis]}.");
+        ValidateSliceSource(destination._shape, source._shape, axis);
 
         if (!destination.IsContiguous) throw new InvalidOperationException("TensorSetSliceAxis requires contiguous destination tensor.");
         var sourceOrig = source;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -42857,7 +42876,8 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int d = 0; d < axis; d++) outer *= result._shape[d];
         for (int d = axis + 1; d < rank; d++) inner *= result._shape[d];
         var indexData = indices.GetFlattenedData();
-        for (int i = 0; i < indexData.Length; i++)
+        // Only the logical elements: an offset-zero view of a larger array can hand back the whole backing array.
+        for (int i = 0; i < indices.Length; i++)
             if ((uint)indexData[i] >= (uint)dstAxis)
                 throw new IndexOutOfRangeException($"Index {indexData[i]} is out of bounds for axis size {dstAxis}");
         var sourceData = source.GetFlattenedData();
@@ -43969,6 +43989,8 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }, deterministicSafe: true);
 
+        DifferentiableOps.RecordUnary("TopK", values, input,
+            BackwardFunctions<T>.TopKBackward, new object[] { indices, axis });
         return (values, indices);
     }
 
@@ -44161,8 +44183,7 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = axis + 1; i < input._shape.Length; i++) innerSize *= input._shape[i];
         // index_copy / index_add semantics: values holds one slice per index, so it has the input's shape with the
         // axis length replaced by the index count. A larger tensor used to be read in part, at the wrong offsets.
-        if (values.Length != outerSize * indices.Length * innerSize)
-            throw new ArgumentException($"Scatter needs values with {indices.Length} slices along axis {axis} ({outerSize * indices.Length * innerSize} elements); got {values.Length}.", nameof(values));
+        ValidateIndexCopyValues("Scatter", input._shape, values._shape, indices.Length, axis);
 
         for (int outer = 0; outer < outerSize; outer++)
         {
@@ -44181,6 +44202,24 @@ public partial class CpuEngine : ITensorLevelEngine
         DifferentiableOps.RecordBinary("Scatter", result, input, values, BackwardFunctions<T>.ScatterBackward, new object[] { indicesOrig, axis });
         { var ca2 = input; var ci2 = indices; var cv2 = values; var cx2 = axis; AutoTracer.RecordOp("Scatter", result, eng => eng.Scatter(ca2, ci2, cv2, cx2)); }
         return result;
+    }
+
+    /// <summary>
+    /// index_copy / index_add shape contract: values has the input's rank and shape, with the axis length replaced by
+    /// the index count. Checking only the element count let a values tensor of another layout (for input [2,3,4] and two
+    /// indices on axis 1, values [2,4,2] instead of [2,2,4]) be read regrouped at the wrong offsets.
+    /// </summary>
+    private static void ValidateIndexCopyValues(string op, int[] inputShape, int[] valuesShape, int indexCount, int axis)
+    {
+        bool matches = valuesShape.Length == inputShape.Length;
+        for (int d = 0; matches && d < inputShape.Length; d++)
+            matches = valuesShape[d] == (d == axis ? indexCount : inputShape[d]);
+        if (matches) return;
+        var expected = (int[])inputShape.Clone();
+        expected[axis] = indexCount;
+        throw new ArgumentException(
+            $"{op} needs values of shape [{string.Join(", ", expected)}] ({indexCount} slices along axis {axis}); got [{string.Join(", ", valuesShape)}].",
+            "values");
     }
 
     /// <inheritdoc/>
@@ -44219,8 +44258,7 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = axis + 1; i < input._shape.Length; i++) innerSize *= input._shape[i];
         // index_copy / index_add semantics: values holds one slice per index, so it has the input's shape with the
         // axis length replaced by the index count. A larger tensor used to be read in part, at the wrong offsets.
-        if (values.Length != outerSize * indices.Length * innerSize)
-            throw new ArgumentException($"ScatterAdd needs values with {indices.Length} slices along axis {axis} ({outerSize * indices.Length * innerSize} elements); got {values.Length}.", nameof(values));
+        ValidateIndexCopyValues("ScatterAdd", input._shape, values._shape, indices.Length, axis);
 
         for (int outer = 0; outer < outerSize; outer++)
         {

@@ -4873,7 +4873,10 @@ public partial class DirectGpuTensorEngine
                     indicesHandedOff = true;
                     if (tournament) Interlocked.Increment(ref _topKTournamentsCompleted);
                     indices = new Tensor<int>(indexData, new[] { rows, selected });
-                    return new Tensor<T>(valueData, new[] { rows, selected });
+                    var topValues = new Tensor<T>(valueData, new[] { rows, selected });
+                    Autodiff.DifferentiableOps.RecordUnary("TopK", topValues, tensor,
+                        Autodiff.BackwardFunctions<T>.TopKBackward, new object[] { indices, 1 });
+                    return topValues;
                 }
                 finally
                 {
@@ -9383,57 +9386,151 @@ public partial class DirectGpuTensorEngine
         if (destination is null) throw new ArgumentNullException(nameof(destination));
         if (indices is null) throw new ArgumentNullException(nameof(indices));
         if (source is null) throw new ArgumentNullException(nameof(source));
-        int normalizedAxis = axis < 0 ? axis + destination.Rank : axis;
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
-            || destination.Rank != 2 || normalizedAxis != 1 || indices.Rank != 2
-            || source.Rank != 2 || indices.Shape._dims[0] != destination.Shape._dims[0]
-            || !ShapesEqual(indices._shape, source._shape) || !TryGetBackend(out var backend))
+        int rank = destination.Rank;
+        int d = axis < 0 ? axis + rank : axis;
+        // Graph capture records its node in the host implementation (the node replays through this engine). Shapes the
+        // host rejects go there for its descriptive error. Every other float call runs on the device, training included.
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || d < 0 || d >= rank
+            || indices.Rank != rank || !ShapesEqual(indices._shape, source._shape) || !TryGetBackend(out var backend))
             return base.TensorScatter(destination, indices, source, axis);
+        for (int k = 0; k < rank; k++)
+            if (k != d && indices._shape[k] != destination._shape[k])
+                return base.TensorScatter(destination, indices, source, axis);
+
+        int dstDim = destination._shape[d], srcDim = indices._shape[d];
+        int outer = 1; for (int k = 0; k < d; k++) outer *= destination._shape[k];
+        int inner = 1; for (int k = d + 1; k < rank; k++) inner *= destination._shape[k];
+        int n = destination.Length, m = indices.Length;
+        var ci = indices.IsContiguous ? indices : (Tensor<int>)indices.Contiguous();
+        if (!HasResidentIndexStorage(ci))
+        {
+            // Host indices are validated here, as the host implementation does; device-resident ones are not read
+            // back, and the kernels skip an out-of-range entry.
+            using var indexLease = ci.LeaseArray();
+            var indexData = indexLease.Array;
+            for (int i = 0; i < m; i++)
+                if ((uint)indexData[i] >= (uint)dstDim)
+                    throw new IndexOutOfRangeException($"Index {indexData[i]} is out of bounds for axis size {dstDim}");
+        }
+
+        var buffers = new List<IGpuBuffer>();
         try
         {
-            int batch = destination.Shape._dims[0];
-            int columns = destination.Shape._dims[1];
-            int updatesPerRow = indices.Shape._dims[1];
-            if (destination.Length > 1 << 24)
-                return base.TensorScatter(destination, indices, source, axis);
-            var contiguousIndices = indices.IsContiguous ? indices : (Tensor<int>)indices.Contiguous();
-            if (!HasResidentIndexStorage(contiguousIndices))
-            {
-                using var indexDataLease = contiguousIndices.LeaseArray();
-                var indexData = indexDataLease.Array;
-                for (int i = 0; i < contiguousIndices.Length; i++)
-                    if (indexData[i] < 0 || indexData[i] >= columns)
-                        throw new IndexOutOfRangeException(
-                            $"Index {indexData[i]} is out of bounds for axis size {columns}");
-            }
+            var cd = destination.IsContiguous ? destination : (Tensor<T>)destination.Contiguous();
+            var cs = source.IsContiguous ? source : (Tensor<T>)source.Contiguous();
+            using var destinationBuffer = GetOrAllocateBuffer(backend, cd);
+            using var sourceBuffer = GetOrAllocateBuffer(backend, cs);
+            using var int32Index = GetOrAllocateInt32IndexBuffer(backend, ci);
+            using var floatIndex = GetOrAllocateBuffer(backend, ci);
+            IGpuBuffer Scratch(int size) { var b = backend.AllocateBuffer(size); buffers.Add(b); return b; }
+            var claims = Scratch(n);
+            var winners = Scratch(m);
+            var positions = UploadScatterPositions(backend, buffers, outer, srcDim, inner);
+            var zeros = Scratch(m);
+            var winningSource = Scratch(m);
+            var scattered = Scratch(n);
+            var unwritten = Scratch(n);
+            var minusOne = Scratch(n);
 
-            var contiguousDestination = destination.IsContiguous ? destination : (Tensor<T>)destination.Contiguous();
-            var contiguousSource = source.IsContiguous ? source : (Tensor<T>)source.Contiguous();
-            using var destinationBuffer = GetOrAllocateBuffer(backend, contiguousDestination);
-            using var sourceBuffer = GetOrAllocateBuffer(backend, contiguousSource);
-            using var numericIndexBuffer = GetOrAllocateBuffer(backend, contiguousIndices);
-            var rowOffsets = new float[indices.Length];
-            for (int row = 0; row < batch; row++)
-                for (int update = 0; update < updatesPerRow; update++)
-                    rowOffsets[row * updatesPerRow + update] = row * columns;
-            using var rowOffsetBuffer = backend.AllocateBuffer(rowOffsets);
-            using var flatPositionBuffer = AllocateOutputBuffer(backend, indices.Length);
-            backend.Add(numericIndexBuffer.Buffer, rowOffsetBuffer,
-                flatPositionBuffer.Buffer, indices.Length);
-            using var nativePositionBuffer = ConvertNumericIndicesToInt32(
-                backend, flatPositionBuffer.Buffer, indices.Length);
-            return DispatchDeferredGpuOp<T>(backend, destination.Length, destination.Shape.ToArray(), output =>
+            var result = DispatchDeferredGpuOp<T>(backend, n, (int[])destination._shape.Clone(), output =>
             {
-                backend.Copy(destinationBuffer.Buffer, output, destination.Length);
-                backend.IndexWrite(output, nativePositionBuffer.Buffer, sourceBuffer.Buffer,
-                    0f, mode: 0, outerSize: 1, idxAxis: indices.Length,
-                    innerSize: 1, dstAxis: destination.Length);
+                ScatterLastWritesOnDevice(backend, int32Index.Buffer, floatIndex.Buffer, positions, claims, winners,
+                    outer, srcDim, dstDim, inner);
+                // torch.scatter keeps the last write to a slot. Only the winning writes carry their source value into
+                // a zeroed buffer, so each written slot receives exactly one non-zero term and the atomic sum is exact.
+                backend.Fill(zeros, 0f, m);
+                backend.Where(winners, sourceBuffer.Buffer, zeros, winningSource, m);
+                backend.Fill(scattered, 0f, n);
+                backend.ScatterReduce(scattered, winningSource, int32Index.Buffer, outer, srcDim, dstDim, inner, 0);
+                // Slots nothing writes keep the destination.
+                backend.Fill(minusOne, -1f, n);
+                backend.Equal(claims, minusOne, unwritten, n);
+                backend.Where(unwritten, destinationBuffer.Buffer, scattered, output, n);
             });
+            Autodiff.DifferentiableOps.RecordBinary("TensorScatter", result, destination, source,
+                Autodiff.BackwardFunctions<T>.TensorScatterBackward, new object[] { indices, d });
+            return result;
         }
-        catch
+        catch (NotSupportedException capabilityGap)
         {
+            GpuLaunchProbe.OnFallback("TensorScatter", capabilityGap);
             if (ThrowOnGpuKernelFallback) throw;
             return base.TensorScatter(destination, indices, source, axis);
+        }
+        finally
+        {
+            foreach (var b in buffers) DisposeBufferAfterQueuedUse(backend, b);
+        }
+    }
+
+    /// <summary>
+    /// Each write's position along the scatter axis ([outer, srcDim, inner], the value j at every (o, j, i)), uploaded
+    /// as floats. It depends only on the shape.
+    /// </summary>
+    private static IGpuBuffer UploadScatterPositions(IDirectGpuBackend backend, List<IGpuBuffer> owned, int outer, int srcDim, int inner)
+    {
+        var positions = new float[outer * srcDim * inner];
+        for (int o = 0; o < outer; o++)
+            for (int j = 0; j < srcDim; j++)
+                for (int i = 0; i < inner; i++)
+                    positions[(o * srcDim + j) * inner + i] = j;
+        var buffer = backend.AllocateBuffer(positions);
+        owned.Add(buffer);
+        return buffer;
+    }
+
+    /// <summary>
+    /// For a scatter of [outer, srcDim, inner] writes into [outer, dstDim, inner]: <paramref name="claims"/> gets, per
+    /// destination slot, the position j of the last write to it (-1 where nothing writes), and <paramref name="winners"/>
+    /// gets, per write, 1 when it is that last write and 0 when a later write in its fibre overwrites it. All on the
+    /// device: an amax scatter of the positions, then a gather of the claims back along the same indices.
+    /// </summary>
+    private static void ScatterLastWritesOnDevice(IDirectGpuBackend backend, IGpuBuffer int32Index, IGpuBuffer floatIndex,
+        IGpuBuffer positions, IGpuBuffer claims, IGpuBuffer winners, int outer, int srcDim, int dstDim, int inner)
+    {
+        int n = outer * dstDim * inner, m = outer * srcDim * inner;
+        backend.Fill(claims, -1f, n);
+        backend.ScatterReduce(claims, positions, int32Index, outer, srcDim, dstDim, inner, 2);
+        backend.TakeAlongDim(claims, floatIndex, winners, outer, srcDim, inner, dstDim);
+        backend.Equal(winners, positions, winners, m);
+    }
+
+    /// <summary>
+    /// The scatter backward's last-write mask (1 for a write that survives, 0 for one a later write overwrote) computed
+    /// on the device, shaped like <paramref name="indices"/>. Null when the device cannot compute it.
+    /// </summary>
+    internal Tensor<T>? TryScatterLastWriteMask<T>(Tensor<int> indices, int axis, int[] destinationShape)
+    {
+        using var __gpuOp = EnterGpuOp();
+        int rank = destinationShape.Length;
+        if (typeof(T) != typeof(float) || indices.Rank != rank || axis < 0 || axis >= rank || !TryGetBackend(out var backend))
+            return null;
+        int dstDim = destinationShape[axis], srcDim = indices._shape[axis];
+        int outer = 1; for (int k = 0; k < axis; k++) outer *= destinationShape[k];
+        int inner = 1; for (int k = axis + 1; k < rank; k++) inner *= destinationShape[k];
+        int n = outer * dstDim * inner, m = indices.Length;
+        var ci = indices.IsContiguous ? indices : (Tensor<int>)indices.Contiguous();
+        var buffers = new List<IGpuBuffer>();
+        try
+        {
+            using var int32Index = GetOrAllocateInt32IndexBuffer(backend, ci);
+            using var floatIndex = GetOrAllocateBuffer(backend, ci);
+            var claims = backend.AllocateBuffer(n);
+            buffers.Add(claims);
+            var positions = UploadScatterPositions(backend, buffers, outer, srcDim, inner);
+            return DispatchDeferredGpuOp<T>(backend, m, (int[])indices._shape.Clone(), winners =>
+                ScatterLastWritesOnDevice(backend, int32Index.Buffer, floatIndex.Buffer, positions, claims, winners,
+                    outer, srcDim, dstDim, inner));
+        }
+        catch (NotSupportedException capabilityGap)
+        {
+            GpuLaunchProbe.OnFallback("TensorScatterBackward", capabilityGap);
+            if (ThrowOnGpuKernelFallback) throw;
+            return null;
+        }
+        finally
+        {
+            foreach (var b in buffers) DisposeBufferAfterQueuedUse(backend, b);
         }
     }
 

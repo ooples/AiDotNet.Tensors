@@ -182,9 +182,14 @@ __kernel void search_sorted(__global const float* seq, __global const float* val
     int idx = get_global_id(0); if (idx >= numValues) return;
     float v = values[idx];
     int lo = 0, hi = seqLen;
+    // torch.searchsorted moves right on !(seq[mid] >= v) (!(seq[mid] > v) for right), so every comparison with a NaN
+    // moves right; the NaN test reads the bits so -cl-finite-math-only cannot fold it away.
+    int vNan = (as_uint(v) & 0x7FFFFFFFu) > 0x7F800000u;
     while (lo < hi) {
         int mid = (lo + hi) >> 1;
-        int cond = (right != 0) ? (seq[mid] <= v) : (seq[mid] < v);
+        float s = seq[mid];
+        int nan = vNan || ((as_uint(s) & 0x7FFFFFFFu) > 0x7F800000u);
+        int cond = nan || ((right != 0) ? (s <= v) : (s < v));
         if (cond) lo = mid + 1; else hi = mid;
     }
     output[idx] = (float)lo;

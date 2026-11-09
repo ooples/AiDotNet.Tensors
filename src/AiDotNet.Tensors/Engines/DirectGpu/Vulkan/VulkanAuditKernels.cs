@@ -621,7 +621,10 @@ float p210_lgamma(float x) {
 void main() {
 
     int idx = int(gl_GlobalInvocationID.x); if (idx >= numValues) return; float v = values[idx]; int lo=0, hi=seqLen;
-    while (lo < hi) { int mid=(lo+hi)>>1; bool cond=(right!=0)?(seq[mid]<=v):(seq[mid]<v); if (cond) lo=mid+1; else hi=mid; }
+    // torch.searchsorted moves right on !(seq[mid] >= v) (!(seq[mid] > v) for right), so every comparison with a NaN
+    // moves right; the NaN test reads the bits so the compiler cannot fold it away.
+    bool vNan = (floatBitsToUint(v) & 0x7FFFFFFFu) > 0x7F800000u;
+    while (lo < hi) { int mid=(lo+hi)>>1; float s=seq[mid]; bool nan=vNan||((floatBitsToUint(s)&0x7FFFFFFFu)>0x7F800000u); bool cond=nan||((right!=0)?(s<=v):(s<v)); if (cond) lo=mid+1; else hi=mid; }
     outputValues[idx] = float(lo);
 
 }";

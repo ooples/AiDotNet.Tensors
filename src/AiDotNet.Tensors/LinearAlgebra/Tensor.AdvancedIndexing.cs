@@ -61,7 +61,13 @@ public partial class Tensor<T>
         {
             if (indices == null) throw new ArgumentNullException(nameof(indices));
             var engine = new CpuEngine();
-            return engine.TensorIndexSelect(this, indices, 0);
+            var selected = engine.TensorIndexSelect(this, indices, 0);
+            if (indices.Rank == 1) return selected;
+            // The selection is [indices.Length, Shape[1..]]; restore the index tensor's own dimensions in front.
+            var shape = new int[indices.Rank + Rank - 1];
+            for (int d = 0; d < indices.Rank; d++) shape[d] = indices._shape[d];
+            for (int d = 1; d < Rank; d++) shape[indices.Rank + d - 1] = _shape[d];
+            return engine.Reshape(selected, shape);
         }
     }
 

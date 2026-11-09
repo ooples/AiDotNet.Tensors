@@ -217,7 +217,10 @@ struct P { seqLen: i32, numValues: i32, right: i32 };
 @group(0) @binding(3) var<uniform> pc : P;
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let idx = i32(gid.x); if (idx >= pc.numValues) { return; } let v = values[idx]; var lo = 0; var hi = pc.seqLen;
-  while (lo < hi) { let mid = (lo + hi) >> 1u; var cond = false; if (pc.right != 0) { cond = seq[mid] <= v; } else { cond = seq[mid] < v; } if (cond) { lo = mid + 1; } else { hi = mid; } }
+  // torch.searchsorted moves right on !(seq[mid] >= v) (!(seq[mid] > v) for right), so every comparison with a NaN
+  // moves right; the NaN test reads the bits so the compiler cannot fold it away.
+  let vNan = (bitcast<u32>(v) & 0x7FFFFFFFu) > 0x7F800000u;
+  while (lo < hi) { let mid = (lo + hi) >> 1u; let s = seq[mid]; var cond = vNan || ((bitcast<u32>(s) & 0x7FFFFFFFu) > 0x7F800000u); if (!cond) { if (pc.right != 0) { cond = s <= v; } else { cond = s < v; } } if (cond) { lo = mid + 1; } else { hi = mid; } }
   outp[idx] = f32(lo);
 }";
 

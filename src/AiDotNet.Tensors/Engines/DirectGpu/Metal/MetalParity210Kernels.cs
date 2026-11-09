@@ -1278,7 +1278,10 @@ kernel void parity210_search_sorted(
     constant int& right [[buffer(5)]],
     uint gid [[thread_position_in_grid]]) {
     int idx = (int)gid; if (idx >= numValues) return; float v = values[idx]; int lo=0, hi=seqLen;
-    while (lo < hi) { int mid=(lo+hi)>>1; int cond=(right!=0)?(seq[mid]<=v):(seq[mid]<v); if (cond) lo=mid+1; else hi=mid; }
+    int vNan=(as_type<uint>(v)&0x7FFFFFFFu)>0x7F800000u;
+    // torch.searchsorted moves right on !(seq[mid] >= v) (!(seq[mid] > v) for right), so every comparison with a NaN
+    // moves right; the NaN test reads the bits so fast-math cannot fold it away.
+    while (lo < hi) { int mid=(lo+hi)>>1; float s=seq[mid]; int nan=vNan||((as_type<uint>(s)&0x7FFFFFFFu)>0x7F800000u); int cond=nan||((right!=0)?(s<=v):(s<v)); if (cond) lo=mid+1; else hi=mid; }
     output[idx] = (float)lo;
 }
 
