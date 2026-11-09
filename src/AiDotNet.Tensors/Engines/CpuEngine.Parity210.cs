@@ -899,7 +899,7 @@ public partial class CpuEngine
             int a = k1 >= 0 ? s1[k1] : 1, b = k2 >= 0 ? s2[k2] : 1;
             if (a != b && a != 1 && b != 1)
                 throw new ArgumentException($"CDist: batch dim {k} is {a} vs {b}; they do not broadcast.");
-            shape[k] = Math.Max(a, b);
+            shape[k] = a == 1 ? b : a; // a size-1 dim takes the other's size, including 0
         }
         int count = 1;
         foreach (var v in shape) count *= v;
@@ -3616,6 +3616,20 @@ public partial class CpuEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<int>(values._shape);
         var dst = result.GetDataArrayUnmarked();
+        // Each row uses exactly the rank-1 search (same comparisons, so NaN lands where it does at rank 1).
+        if (typeof(T) == typeof(float))
+        {
+            var seqF = (float[])(object)seq;
+            var valF = (float[])(object)vals;
+            for (int r = 0; r < rows; r++)
+            {
+                ReadOnlySpan<float> row = new ReadOnlySpan<float>(seqF, r * s, s);
+                for (int j = 0; j < v; j++)
+                    dst[r * v + j] = right ? Simd.SortKernels.UpperBoundFloat(row, valF[r * v + j])
+                                           : Simd.SortKernels.LowerBoundFloat(row, valF[r * v + j]);
+            }
+            return result;
+        }
         for (int r = 0; r < rows; r++)
             for (int j = 0; j < v; j++)
             {
@@ -3624,10 +3638,10 @@ public partial class CpuEngine
                 while (lo < hi)
                 {
                     int mid = lo + ((hi - lo) >> 1);
-                    var e = seq[r * s + mid];
-                    // right = false: first position with seq >= x; right = true: first position with seq > x.
-                    bool goRight = right ? !numOps.GreaterThan(e, x) : numOps.LessThan(e, x);
-                    if (goRight) lo = mid + 1; else hi = mid;
+                    bool beforeMid = right
+                        ? numOps.LessThan(x, seq[r * s + mid])
+                        : numOps.LessThanOrEquals(x, seq[r * s + mid]);
+                    if (beforeMid) hi = mid; else lo = mid + 1;
                 }
                 dst[r * v + j] = lo;
             }

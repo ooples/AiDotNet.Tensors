@@ -9384,27 +9384,34 @@ public partial class DirectGpuTensorEngine
         if (indices is null) throw new ArgumentNullException(nameof(indices));
         if (source is null) throw new ArgumentNullException(nameof(source));
         int normalizedAxis = axis < 0 ? axis + destination.Rank : axis;
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
-            || destination.Rank != 2 || normalizedAxis != 1 || indices.Rank != 2
-            || source.Rank != 2 || indices.Shape._dims[0] != destination.Shape._dims[0]
-            || !ShapesEqual(indices._shape, source._shape) || !TryGetBackend(out var backend))
+        // Graph capture records its lazy node in the CPU entry; every other call runs here, at any rank and axis, and
+        // records its own tape entry, so training no longer drops to the CPU kernel.
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+            || normalizedAxis < 0 || normalizedAxis >= destination.Rank || !TryGetBackend(out var backend))
+            return base.TensorScatter(destination, indices, source, axis);
+        CpuEngine.ValidateTensorScatterShapes(destination._shape, indices._shape, source._shape, normalizedAxis);
+        // Flat positions travel as float on the device: exact only below 2^24.
+        if (destination.Length > 1 << 24 || indices.Length == 0)
             return base.TensorScatter(destination, indices, source, axis);
         try
         {
-            int batch = destination.Shape._dims[0];
-            int columns = destination.Shape._dims[1];
-            int updatesPerRow = indices.Shape._dims[1];
-            if (destination.Length > 1 << 24)
-                return base.TensorScatter(destination, indices, source, axis);
+            int outer = 1, inner = 1, dstAxis = destination._shape[normalizedAxis], idxAxis = indices._shape[normalizedAxis];
+            for (int d = 0; d < normalizedAxis; d++) outer *= destination._shape[d];
+            for (int d = normalizedAxis + 1; d < destination.Rank; d++) inner *= destination._shape[d];
             var contiguousIndices = indices.IsContiguous ? indices : (Tensor<int>)indices.Contiguous();
             if (!HasResidentIndexStorage(contiguousIndices))
             {
-                using var indexDataLease = contiguousIndices.LeaseArray();
-                var indexData = indexDataLease.Array;
-                for (int i = 0; i < contiguousIndices.Length; i++)
-                    if (indexData[i] < 0 || indexData[i] >= columns)
-                        throw new IndexOutOfRangeException(
-                            $"Index {indexData[i]} is out of bounds for axis size {columns}");
+                using (var indexDataLease = contiguousIndices.LeaseArray())
+                {
+                    var indexData = indexDataLease.Array;
+                    for (int i = 0; i < contiguousIndices.Length; i++)
+                        if (indexData[i] < 0 || indexData[i] >= dstAxis)
+                            throw new IndexOutOfRangeException(
+                                $"Index {indexData[i]} is out of bounds for axis size {dstAxis}");
+                }
+                // A repeated index within a fibre is last-write-wins, which an unordered device write cannot honour.
+                if (Autodiff.BackwardFunctions<T>.TensorScatterOverwrittenMask(contiguousIndices, dstAxis, normalizedAxis) is not null)
+                    return base.TensorScatter(destination, indices, source, axis);
             }
 
             var contiguousDestination = destination.IsContiguous ? destination : (Tensor<T>)destination.Contiguous();
@@ -9412,25 +9419,38 @@ public partial class DirectGpuTensorEngine
             using var destinationBuffer = GetOrAllocateBuffer(backend, contiguousDestination);
             using var sourceBuffer = GetOrAllocateBuffer(backend, contiguousSource);
             using var numericIndexBuffer = GetOrAllocateBuffer(backend, contiguousIndices);
-            var rowOffsets = new float[indices.Length];
-            for (int row = 0; row < batch; row++)
-                for (int update = 0; update < updatesPerRow; update++)
-                    rowOffsets[row * updatesPerRow + update] = row * columns;
-            using var rowOffsetBuffer = backend.AllocateBuffer(rowOffsets);
+            // Element p = (o, j, k) of the index writes flat position index[p] * inner + (o * dstAxis * inner + k).
+            var offsets = new float[indices.Length];
+            for (int o = 0; o < outer; o++)
+                for (int j = 0; j < idxAxis; j++)
+                    for (int k = 0; k < inner; k++)
+                        offsets[(o * idxAxis + j) * inner + k] = o * dstAxis * inner + k;
+            using var offsetBuffer = backend.AllocateBuffer(offsets);
             using var flatPositionBuffer = AllocateOutputBuffer(backend, indices.Length);
-            backend.Add(numericIndexBuffer.Buffer, rowOffsetBuffer,
-                flatPositionBuffer.Buffer, indices.Length);
+            if (inner == 1)
+            {
+                backend.Add(numericIndexBuffer.Buffer, offsetBuffer, flatPositionBuffer.Buffer, indices.Length);
+            }
+            else
+            {
+                using var scaledBuffer = AllocateOutputBuffer(backend, indices.Length);
+                backend.Scale(numericIndexBuffer.Buffer, scaledBuffer.Buffer, inner, indices.Length);
+                backend.Add(scaledBuffer.Buffer, offsetBuffer, flatPositionBuffer.Buffer, indices.Length);
+            }
             using var nativePositionBuffer = ConvertNumericIndicesToInt32(
                 backend, flatPositionBuffer.Buffer, indices.Length);
-            return DispatchDeferredGpuOp<T>(backend, destination.Length, destination.Shape.ToArray(), output =>
+            var result = DispatchDeferredGpuOp<T>(backend, destination.Length, destination.Shape.ToArray(), output =>
             {
                 backend.Copy(destinationBuffer.Buffer, output, destination.Length);
                 backend.IndexWrite(output, nativePositionBuffer.Buffer, sourceBuffer.Buffer,
                     0f, mode: 0, outerSize: 1, idxAxis: indices.Length,
                     innerSize: 1, dstAxis: destination.Length);
             });
+            Autodiff.DifferentiableOps.RecordBinary("TensorScatter", result, destination, source,
+                Autodiff.BackwardFunctions<T>.TensorScatterBackward, new object[] { indices, normalizedAxis });
+            return result;
         }
-        catch
+        catch (Exception e) when (e is not IndexOutOfRangeException)
         {
             if (ThrowOnGpuKernelFallback) throw;
             return base.TensorScatter(destination, indices, source, axis);

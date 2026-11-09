@@ -79,6 +79,17 @@ public sealed class IndexSelectAnyRankTests
     }
 
     [Fact]
+    public void Tensor_indexer_keeps_an_nd_index_shape_in_front()
+    {
+        var x = new Tensor<float>(new[] { 3, 2, 4 }, new Vector<float>(Enumerable.Range(0, 24).Select(i => (float)i).ToArray()));
+        var idx = new Tensor<int>(new[] { 2, 0, 1, 2 }, new[] { 2, 2 });
+        var y = x[idx];
+        Assert.Equal(new[] { 2, 2, 2, 4 }, y.Shape.ToArray());
+        var expected = new[] { 2, 0, 1, 2 }.SelectMany(r => Enumerable.Range(r * 8, 8).Select(i => (float)i)).ToArray();
+        Assert.Equal(expected, y.ToArray());
+    }
+
+    [Fact]
     public void Out_of_range_index_throws()
     {
         var eng = new CpuEngine();

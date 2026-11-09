@@ -40,6 +40,7 @@ public sealed class AxisOpsRankConformanceTests
         ["TensorExpandDims"] = "inserts an axis: its valid axes run to rank, not rank - 1",
         ["TensorSqueeze"] = "removes a length-1 axis; the probe's axes are longer than 1",
         ["TensorSqueezeInPlace"] = "removes a length-1 axis; the probe's axes are longer than 1",
+        ["TensorUnsqueezeInPlace"] = "inserts an axis: its valid axes run to rank, not rank - 1",
         ["TensorUnflatten"] = "rewrites the shape; not an op along the axis",
         ["TensorUniqueDim"] = "the output length depends on the data",
     };
@@ -84,7 +85,13 @@ public sealed class AxisOpsRankConformanceTests
     /// <c>Cut</c> = the input's shape with the axis cut to 2.</summary>
     private enum Idx { None, Flat, Full, Cut }
 
-    private sealed record Plan(Idx Index, Sec Secondary);
+    private sealed class Plan
+    {
+        public Plan(Idx index, Sec secondary) { Index = index; Secondary = secondary; }
+        public Idx Index { get; }
+        public Sec Secondary { get; }
+        public override string ToString() => $"Plan {{ Index = {Index}, Secondary = {Secondary} }}";
+    }
 
     [Fact]
     public void Every_axis_op_that_runs_on_rank_2_runs_on_every_rank_and_matches_the_lifted_reference()
@@ -114,23 +121,26 @@ public sealed class AxisOpsRankConformanceTests
                 for (int ax = 0; ax < shape.Length; ax++)
                 {
                     string where = $"{sig} rank {shape.Length} axis {ax} [{string.Join(",", shape)}]";
+                    bool lift = !RunOnly.ContainsKey(def.Name) && CanLift(m);
                     object?[] args;
+                    object?[]? lifted = null;
                     object? actual;
                     try
                     {
                         args = BuildArgs(engine, m, fwd, shape, ax, plan);
-                        actual = Invoke(engine, m, args);
+                        // Lift first: an in-place op mutates its arguments, and the lifted copy must see the inputs.
+                        if (lift) lifted = Lift(args, m, shape, ax, plan);
+                        actual = Result(m, args, Invoke(engine, m, args));
                     }
                     catch (Exception e)
                     {
                         failures.Add($"{where}: {Inner(e)}");
                         continue;
                     }
-                    if (RunOnly.ContainsKey(def.Name) || !CanLift(m)) continue;
+                    if (!lift) continue;
                     try
                     {
-                        var lifted = Lift(args, m, shape, ax, plan);
-                        var expected = Unlift(Invoke(engine, m, lifted), shape, ax);
+                        var expected = Unlift(Result(m, lifted!, Invoke(engine, m, lifted!)), shape, ax);
                         if (Compare(actual, expected) is { } diff)
                             failures.Add($"{where}: differs from the lifted rank-2 reference: {diff}");
                     }
@@ -253,6 +263,14 @@ public sealed class AxisOpsRankConformanceTests
         return outs.Count == 0 ? r : new object?[] { r }.Concat(outs).ToArray();
     }
 
+    /// <summary>The value to compare: the return value, or for a void (in-place) op the tensor it mutated.</summary>
+    private static object? Result(MethodInfo m, object?[] args, object? returned)
+    {
+        if (m.ReturnType != typeof(void)) return returned;
+        var p = m.GetParameters().First(q => q.ParameterType == typeof(Tensor<float>));
+        return args[p.Position];
+    }
+
     private static Tensor<float>? FirstTensor(object? r) => r switch
     {
         Tensor<float> t => t,
@@ -283,7 +301,7 @@ public sealed class AxisOpsRankConformanceTests
         if (fwd is not null)
         {
             var fps = fwd.GetParameters();
-            var fargs = BuildArgs(engine, fwd, null, shape, ax, plan with { Secondary = Sec.X });
+            var fargs = BuildArgs(engine, fwd, null, shape, ax, new Plan(plan.Index, Sec.X));
             fOut = FirstTensor(Invoke(engine, fwd, fargs));
             var fx = fps.Where(p => p.ParameterType == typeof(Tensor<float>)).Select(p => fargs[p.Position]).FirstOrDefault();
             if (fx is Tensor<float> t) x = t;
@@ -447,8 +465,13 @@ public sealed class AxisOpsRankConformanceTests
         if (!sa.SequenceEqual(se) && !(Prod(sa) == Prod(se) && (sa.Length <= 1 || se.Length <= 1 || sa[0] == 1 || se[0] == 1)))
             return $"shape [{string.Join(",", sa)}] vs lifted [{string.Join(",", se)}]";
         for (int i = 0; i < a.Length; i++)
-            if (Math.Abs(a[i] - e[i]) > 1e-4 * (1 + Math.Abs(e[i])))
-                return $"element {i}: {a[i]} vs lifted {e[i]}";
+        {
+            bool finite = !double.IsNaN(e[i]) && !double.IsInfinity(e[i]);
+            bool same = finite
+                ? !double.IsNaN(a[i]) && !double.IsInfinity(a[i]) && Math.Abs(a[i] - e[i]) <= 1e-4 * (1 + Math.Abs(e[i]))
+                : double.IsNaN(e[i]) ? double.IsNaN(a[i]) : a[i].Equals(e[i]); // NaN matches NaN; an infinity its own sign
+            if (!same) return $"element {i}: {a[i]} vs lifted {e[i]}";
+        }
         return null;
     }
 }

@@ -3015,7 +3015,45 @@ internal static class BackwardFunctions<T>
         var axis = (int)savedState[1];
         var gradDestination = engine.TensorScatter(gradOutput, indices, new Tensor<T>(indices._shape), axis);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradDestination, engine);
-        DifferentiableOps.AccumulateGrad(grads, inputs[1], engine.TensorTakeAlongDim(gradOutput, indices, axis), engine);
+        var gradSource = engine.TensorTakeAlongDim(gradOutput, indices, axis);
+        // The forward is last-write-wins within a fibre, so a source entry overwritten by a later duplicate index never
+        // reaches the output: its gradient is zero. Masked only when duplicates exist (the common case has none).
+        if (TensorScatterOverwrittenMask(indices, inputs[0]._shape[axis], axis) is { } mask)
+            gradSource = engine.TensorMultiply(gradSource, mask);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradSource, engine);
+    }
+
+    /// <summary>
+    /// For TensorScatter: a 0/1 mask over the source, 0 where a later write to the same destination element (same
+    /// fibre, same index) overwrites it. Null when no index repeats within a fibre.
+    /// </summary>
+    internal static Tensor<T>? TensorScatterOverwrittenMask(Tensor<int> indices, int dstAxis, int axis)
+    {
+        var shape = indices._shape;
+        int outer = 1, inner = 1, idxAxis = shape[axis];
+        for (int d = 0; d < axis; d++) outer *= shape[d];
+        for (int d = axis + 1; d < shape.Length; d++) inner *= shape[d];
+        var idx = indices.GetFlattenedData();
+        T[]? mask = null;
+        var seen = new bool[dstAxis];
+        for (int o = 0; o < outer; o++)
+            for (int k = 0; k < inner; k++)
+            {
+                Array.Clear(seen, 0, dstAxis);
+                for (int j = idxAxis - 1; j >= 0; j--)
+                {
+                    int p = (o * idxAxis + j) * inner + k;
+                    if (!seen[idx[p]]) { seen[idx[p]] = true; continue; }
+                    if (mask is null)
+                    {
+                        mask = new T[indices.Length];
+                        var one = MathHelper.GetNumericOperations<T>().One;
+                        for (int i = 0; i < mask.Length; i++) mask[i] = one;
+                    }
+                    mask[p] = default!;
+                }
+            }
+        return mask is null ? null : new Tensor<T>(mask, (int[])shape.Clone());
     }
 
     /// <summary>ExpandDims backward: squeeze the added dimension</summary>

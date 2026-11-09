@@ -42581,6 +42581,16 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentOutOfRangeException(nameof(axis), $"Axis {axis} is out of range for tensor of rank {destination.Rank}.");
         if (index < 0 || index >= destination._shape[axis])
             throw new ArgumentOutOfRangeException(nameof(index), $"Index {index} is out of range for axis {axis} with size {destination._shape[axis]}.");
+        // The source is one slice: the destination's shape without the axis (or with it at length 1). A larger source
+        // used to be read in part.
+        bool removed = source.Rank == destination.Rank - 1, kept = source.Rank == destination.Rank;
+        for (int d = 0, s = 0; (removed || kept) && d < destination.Rank; d++)
+        {
+            if (d == axis) { if (kept && source._shape[s++] != 1) kept = false; continue; }
+            if (source._shape[s++] != destination._shape[d]) { removed = false; kept = false; }
+        }
+        if (!removed && !kept)
+            throw new ArgumentException($"TensorSetSliceAxis needs a source of the destination's shape without axis {axis}; got [{string.Join(", ", source._shape)}] for [{string.Join(", ", destination._shape)}].", nameof(source));
 
         if (!destination.IsContiguous) throw new InvalidOperationException("TensorSetSliceAxis requires contiguous destination tensor.");
         var sourceOrig = source;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -42827,6 +42837,40 @@ public partial class CpuEngine : ITensorLevelEngine
         return values;
     }
 
+    /// <summary>
+    /// torch.scatter shape rules: indices and source have the destination's rank and one shape, which equals the
+    /// destination's on every dimension but the (normalized) axis.
+    /// </summary>
+    internal static void ValidateTensorScatterShapes(int[] destination, int[] indices, int[] source, int axis)
+    {
+        int rank = destination.Length;
+        if (indices.Length != rank || source.Length != rank)
+            throw new ArgumentException($"TensorScatter needs indices and source of the destination's rank {rank}; got {indices.Length} and {source.Length}.");
+        for (int d = 0; d < rank; d++)
+        {
+            if (indices[d] != source[d])
+                throw new ArgumentException($"TensorScatter needs indices and source of one shape; dimension {d} is {indices[d]} vs {source[d]}.");
+            if (d != axis && indices[d] != destination[d])
+                throw new ArgumentException($"TensorScatter needs indices to match the destination off the axis; dimension {d} is {indices[d]} vs {destination[d]}.");
+        }
+    }
+
+    /// <summary>
+    /// index_copy / index_add shape rule: values has the input's shape with the axis length replaced by the index count.
+    /// </summary>
+    internal static void ValidateIndexedValuesShape(string op, int[] input, int indexCount, int[] values, int axis)
+    {
+        bool ok = values.Length == input.Length;
+        for (int d = 0; ok && d < input.Length; d++)
+            ok = values[d] == (d == axis ? indexCount : input[d]);
+        if (!ok)
+        {
+            var expected = (int[])input.Clone();
+            expected[axis] = indexCount;
+            throw new ArgumentException($"{op} needs values of shape [{string.Join(", ", expected)}] ({indexCount} slices along axis {axis}); got [{string.Join(", ", values)}].", "values");
+        }
+    }
+
     /// <inheritdoc/>
     [MethodImpl(Hot)]
     public Tensor<T> TensorScatter<T>(Tensor<T> destination, Tensor<int> indices, Tensor<T> source, int axis)
@@ -42837,27 +42881,33 @@ public partial class CpuEngine : ITensorLevelEngine
         if (indices == null) throw new ArgumentNullException(nameof(indices));
         if (source == null) throw new ArgumentNullException(nameof(source));
 
-        var result = destination.Clone();
-        int rank = result.Rank;
+        int rank = destination.Rank;
         if (axis < 0) axis += rank;
         if (axis < 0 || axis >= rank)
             throw new ArgumentOutOfRangeException(nameof(axis), $"Axis {axis} is out of range for a rank-{rank} tensor.");
-        // torch.scatter semantics: result[.., indices[p], ..] = source[p] along the axis, with indices and source of
-        // one shape that equals the destination's on every other dimension. Any rank, any axis.
-        if (indices.Rank != rank || source.Rank != rank)
-            throw new ArgumentException($"TensorScatter needs indices and source of the destination's rank {rank}; got {indices.Rank} and {source.Rank}.");
-        for (int d = 0; d < rank; d++)
+        ValidateTensorScatterShapes(destination._shape, indices._shape, source._shape, axis);
+
+        // Training-graph capture: record a lazy node with the scatter backward, so a compiled plan propagates
+        // gradients to both operands instead of treating the result as a constant.
+        if (GraphMode.IsActive)
         {
-            if (indices._shape[d] != source._shape[d])
-                throw new ArgumentException($"TensorScatter needs indices and source of one shape; dimension {d} is {indices._shape[d]} vs {source._shape[d]}.");
-            if (d != axis && indices._shape[d] != result._shape[d])
-                throw new ArgumentException($"TensorScatter needs indices to match the destination off the axis; dimension {d} is {indices._shape[d]} vs {result._shape[d]}.");
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
+            if (scope is not null)
+            {
+                var cd = destination; var ci = indices; var cs = source; int ca = axis;
+                return scope.RecordBinary(LazyNodeType.Custom, "TensorScatter", destination, source, (int[])destination._shape.Clone(),
+                    (eng, output) => { var r = eng.TensorScatter(cd, ci, cs, ca); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
+                    BackwardFunctions<T>.TensorScatterBackward, new object[] { indices, axis });
+            }
         }
+
+        var result = destination.Clone();
         int outer = 1, inner = 1, dstAxis = result._shape[axis], idxAxis = indices._shape[axis];
         for (int d = 0; d < axis; d++) outer *= result._shape[d];
         for (int d = axis + 1; d < rank; d++) inner *= result._shape[d];
         var indexData = indices.GetFlattenedData();
-        for (int i = 0; i < indexData.Length; i++)
+        // Only the tensor's own elements: the flattened array of a view can be longer than the view.
+        for (int i = 0; i < indices.Length; i++)
             if ((uint)indexData[i] >= (uint)dstAxis)
                 throw new IndexOutOfRangeException($"Index {indexData[i]} is out of bounds for axis size {dstAxis}");
         var sourceData = source.GetFlattenedData();
@@ -44161,8 +44211,7 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = axis + 1; i < input._shape.Length; i++) innerSize *= input._shape[i];
         // index_copy / index_add semantics: values holds one slice per index, so it has the input's shape with the
         // axis length replaced by the index count. A larger tensor used to be read in part, at the wrong offsets.
-        if (values.Length != outerSize * indices.Length * innerSize)
-            throw new ArgumentException($"Scatter needs values with {indices.Length} slices along axis {axis} ({outerSize * indices.Length * innerSize} elements); got {values.Length}.", nameof(values));
+        ValidateIndexedValuesShape("Scatter", input._shape, indices.Length, values._shape, axis);
 
         for (int outer = 0; outer < outerSize; outer++)
         {
@@ -44219,8 +44268,7 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = axis + 1; i < input._shape.Length; i++) innerSize *= input._shape[i];
         // index_copy / index_add semantics: values holds one slice per index, so it has the input's shape with the
         // axis length replaced by the index count. A larger tensor used to be read in part, at the wrong offsets.
-        if (values.Length != outerSize * indices.Length * innerSize)
-            throw new ArgumentException($"ScatterAdd needs values with {indices.Length} slices along axis {axis} ({outerSize * indices.Length * innerSize} elements); got {values.Length}.", nameof(values));
+        ValidateIndexedValuesShape("ScatterAdd", input._shape, indices.Length, values._shape, axis);
 
         for (int outer = 0; outer < outerSize; outer++)
         {

@@ -68,6 +68,69 @@ public sealed class BatchedCDistSearchSortedTests
     }
 
     [Fact]
+    public void Cdist_broadcasts_explicit_singleton_batch_dims_with_gradients()
+    {
+        var eng = new CpuEngine();
+        var x1 = Rand(new[] { 2, 1, 3, 4 }, 4);
+        var x2 = Rand(new[] { 1, 3, 5, 4 }, 5);
+        var w = Rand(new[] { 2, 3, 3, 5 }, 6);
+        Tensor<double> y;
+        System.Collections.Generic.Dictionary<Tensor<double>, Tensor<double>> g;
+        using (var tape = new GradientTape<double>())
+        {
+            y = eng.TensorCDist(x1, x2);
+            g = tape.ComputeGradients(eng.ReduceSum(eng.TensorMultiply(y, w), null, keepDims: false), new[] { x1, x2 });
+        }
+        Assert.Equal(new[] { 2, 3, 3, 5 }, y.Shape.ToArray());
+        var expected = new double[y.Length];
+        var g1 = new double[x1.Length];
+        var g2 = new double[x2.Length];
+        for (int i = 0; i < 2; i++)
+            for (int j = 0; j < 3; j++)
+            {
+                int b = i * 3 + j;
+                var a = Slice(x1, i);
+                var c = Slice(x2, j);
+                var wb = new Tensor<double>(new[] { 3, 5 }, new Vector<double>(w.ToArray().Skip(b * 15).Take(15).ToArray()));
+                using var tape = new GradientTape<double>();
+                var yb = eng.TensorCDist(a, c);
+                var gb = tape.ComputeGradients(eng.ReduceSum(eng.TensorMultiply(yb, wb), null, keepDims: false), new[] { a, c });
+                Array.Copy(yb.ToArray(), 0, expected, b * 15, 15);
+                var ga = gb[a].ToArray();
+                var gc = gb[c].ToArray();
+                for (int e = 0; e < 12; e++) g1[i * 12 + e] += ga[e];
+                for (int e = 0; e < 20; e++) g2[j * 20 + e] += gc[e];
+            }
+        AssertClose(expected, y.ToArray());
+        AssertClose(g1, g[x1].ToArray());
+        AssertClose(g2, g[x2].ToArray());
+    }
+
+    [Fact]
+    public void Cdist_keeps_a_zero_sized_batch_dim()
+    {
+        var eng = new CpuEngine();
+        var y = eng.TensorCDist(new Tensor<float>(new[] { 0, 3, 4 }), new Tensor<float>(new[] { 1, 5, 4 }));
+        Assert.Equal(new[] { 0, 3, 5 }, y.Shape.ToArray());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Nd_searchsorted_places_nan_where_rank_1_does(bool right)
+    {
+        var eng = new CpuEngine();
+        var sd = new Tensor<double>(new[] { 3 }, new Vector<double>(new[] { 1.0, 3.0, 5.0 }));
+        var vd = new Tensor<double>(new[] { 2 }, new Vector<double>(new[] { double.NaN, 3.0 }));
+        Assert.Equal(eng.TensorSearchSorted(sd, vd, right).ToArray(),
+            eng.TensorSearchSorted(eng.Reshape(sd, new[] { 1, 3 }), eng.Reshape(vd, new[] { 1, 2 }), right).ToArray());
+        var sf = new Tensor<float>(new[] { 3 }, new Vector<float>(new[] { 1f, 3f, 5f }));
+        var vf = new Tensor<float>(new[] { 2 }, new Vector<float>(new[] { float.NaN, 3f }));
+        Assert.Equal(eng.TensorSearchSorted(sf, vf, right).ToArray(),
+            eng.TensorSearchSorted(eng.Reshape(sf, new[] { 1, 3 }), eng.Reshape(vf, new[] { 1, 2 }), right).ToArray());
+    }
+
+    [Fact]
     public void Cdist_rejects_batch_dims_that_do_not_broadcast()
     {
         var eng = new CpuEngine();
