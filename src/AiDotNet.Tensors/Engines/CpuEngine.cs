@@ -42912,7 +42912,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (GraphMode.IsActive)
         {
             var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
-            if (scope != null && tensor.Rank == 2)
+            if (scope != null && tensor.Rank >= 1 && axis >= 0 && axis < tensor.Rank)
             {
                 var captured = tensor;
                 var capIndices = indices;
@@ -42976,7 +42976,35 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else
         {
-            throw new NotSupportedException("TensorIndexSelect currently only supports 2D tensors.");
+            // Any rank, any axis: the tensor is [outer, axisSize, inner] around the axis, and each selected slice is a
+            // contiguous run of `inner` elements, so the output is outer x numIndices block copies. Same contract as the
+            // GPU kernel (IResidentIndexBackend.IndexSelect) and IndexSelectBackward, which were already rank-general.
+            if (axis < 0 || axis >= tensor.Rank)
+                throw new ArgumentOutOfRangeException(nameof(axis), $"Axis {axis} is out of range for a rank-{tensor.Rank} tensor.");
+            int axisSize = tensor._shape[axis], numIndices = indices.Length;
+            int outer = 1, inner = 1;
+            for (int d = 0; d < axis; d++) outer *= tensor._shape[d];
+            for (int d = axis + 1; d < tensor.Rank; d++) inner *= tensor._shape[d];
+            var indicesData = indices.GetFlattenedData();
+            for (int i = 0; i < numIndices; i++)
+                if ((uint)indicesData[i] >= (uint)axisSize)
+                    throw new IndexOutOfRangeException($"Index {indicesData[i]} is out of bounds for axis size {axisSize}");
+            var outShape = (int[])tensor._shape.Clone();
+            outShape[axis] = numIndices;
+            var result = TensorAllocator.Rent<T>(outShape);
+            var tensorData = tensor.GetFlattenedData();
+            using var resultDataLease = result.LeaseArray();
+            var resultData = resultDataLease.Array;
+            CpuParallelSettings.ParallelForOrSerial(0, outer * numIndices, result.Length, b =>
+            {
+                int o = b / numIndices, i = b - o * numIndices;
+                Array.Copy(tensorData, ((long)o * axisSize + indicesData[i]) * inner, resultData, (long)b * inner, inner);
+            });
+
+            DifferentiableOps.RecordUnary("TensorIndexSelect", result, tensor,
+                BackwardFunctions<T>.IndexSelectBackward, new object[] { indices, axis });
+            AutoTracer.RecordOp("TensorIndexSelect", result, eng => eng.TensorIndexSelect(tensor, indices, axis));
+            return result;
         }
     }
 
