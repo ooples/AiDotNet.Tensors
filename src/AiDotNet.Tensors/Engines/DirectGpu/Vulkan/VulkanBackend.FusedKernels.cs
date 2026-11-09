@@ -153,14 +153,14 @@ public sealed partial class VulkanBackend
     }
     public void Int32ToFloat(IGpuBuffer raw, IGpuBuffer output, int n)
     {
-        if (n <= 0) return; GpuBufferCapacity.Require(raw, n, nameof(raw)); GpuBufferCapacity.Require(output, n, nameof(output));
+        if (GpuBufferCapacity.IsEmptyLaunch(n)) return; GpuBufferCapacity.Require(raw, n, nameof(raw)); GpuBufferCapacity.Require(output, n, nameof(output));
         GlslDispatchN(VulkanAuditKernels.Int32ToFloat, n,
             new IGpuBuffer[] { raw, output },
             new uint[] { (uint)n });
     }
     public void ScatterPositions(IGpuBuffer output, int srcDim, int inner, int n)
     {
-        if (n <= 0) return; GpuBufferCapacity.RequirePositions(output, srcDim, inner, n);
+        if (GpuBufferCapacity.IsEmptyLaunch(n)) return; GpuBufferCapacity.RequirePositions(output, srcDim, inner, n);
         GlslDispatchN(VulkanAuditKernels.ScatterPositions, n,
             new IGpuBuffer[] { output },
             new uint[] { (uint)srcDim, (uint)inner, (uint)n });

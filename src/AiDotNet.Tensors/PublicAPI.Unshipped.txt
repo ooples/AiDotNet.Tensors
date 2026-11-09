@@ -116,3 +116,7 @@ AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.ScatterPositions(AiDotNe
 static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanAuditKernels.ScatterPositions.get -> string!
 static AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuAuditKernels.ScatterPositions.get -> string!
 virtual AiDotNet.Tensors.Engines.Gpu.DelegatingGpuBackend.ScatterPositions(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int srcDim, int inner, int n) -> void
+override AiDotNet.Tensors.Engines.Gpu.RecordingGpuBackend.CDist(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! x1, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! x2, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int m, int n, int d, float p) -> void
+override AiDotNet.Tensors.Engines.Gpu.RecordingGpuBackend.Int32ToFloat(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! raw, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int n) -> void
+override AiDotNet.Tensors.Engines.Gpu.RecordingGpuBackend.PDist(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! input, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int n, int d, float p) -> void
+override AiDotNet.Tensors.Engines.Gpu.RecordingGpuBackend.ScatterPositions(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int srcDim, int inner, int n) -> void

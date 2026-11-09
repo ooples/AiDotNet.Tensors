@@ -5382,8 +5382,11 @@ public partial class DirectGpuTensorEngine
         Array.Copy(batchShape, outShape, batchShape.Length);
         outShape[batchShape.Length] = m;
         outShape[batchShape.Length + 1] = n;
-        int batches = base1.Length, pairs = m * n, total = batches * pairs;
-        var buffers = new List<IGpuBuffer>();
+        // An overflowing size throws here, before any buffer is allocated. The copy offsets base * matrix stay inside
+        // an input's Length, and bi * pairs inside total, so they cannot overflow once these do not.
+        int batches = base1.Length, pairs = checked(m * n), total = checked(batches * pairs);
+        int matrix1 = checked(m * d), matrix2 = checked(n * d);
+        var leases = new List<OwnedBuffer>();
         try
         {
             Tensor<T> res;
@@ -5401,9 +5404,9 @@ public partial class DirectGpuTensorEngine
                 using var buf2 = GetOrAllocateBuffer(backend, c2);
                 float kernelP = KernelNormOrder(p);
                 bool single = batches == 1 && base1[0] == 0 && base2[0] == 0;
-                IGpuBuffer Scratch(int size) { var b = backend.AllocateBuffer(size); buffers.Add(b); return b; }
-                var a = single ? buf1.Buffer : Scratch(m * d);
-                var b = single ? buf2.Buffer : Scratch(n * d);
+                IGpuBuffer Scratch(int size) => RentOpScratch(backend, size, leases);
+                var a = single ? buf1.Buffer : Scratch(matrix1);
+                var b = single ? buf2.Buffer : Scratch(matrix2);
                 var pairOut = single ? null : Scratch(pairs);
                 res = DispatchDeferredGpuOp<T>(backend, total, outShape, output =>
                 {
@@ -5415,8 +5418,8 @@ public partial class DirectGpuTensorEngine
                     // One kernel per output batch over the two matrices it reads; every copy stays on the device.
                     for (int bi = 0; bi < batches; bi++)
                     {
-                        backend.Copy(buf1.Buffer, base1[bi] * m * d, a, 0, m * d);
-                        backend.Copy(buf2.Buffer, base2[bi] * n * d, b, 0, n * d);
+                        backend.Copy(buf1.Buffer, base1[bi] * matrix1, a, 0, matrix1);
+                        backend.Copy(buf2.Buffer, base2[bi] * matrix2, b, 0, matrix2);
                         backend.CDist(a, b, pairOut, m, n, d, kernelP);
                         backend.Copy(pairOut, 0, output, bi * pairs, pairs);
                     }
@@ -5435,7 +5438,7 @@ public partial class DirectGpuTensorEngine
         }
         finally
         {
-            foreach (var b in buffers) DisposeBufferAfterQueuedUse(backend, b);
+            foreach (var lease in leases) lease.DisposeAfterQueuedUse(backend);
         }
     }
 
@@ -9527,7 +9530,7 @@ public partial class DirectGpuTensorEngine
                     throw new IndexOutOfRangeException($"Index {indexData[i]} is out of bounds for axis size {dstDim}");
         }
 
-        var buffers = new List<IGpuBuffer>();
+        var leases = new List<OwnedBuffer>();
         try
         {
             var cd = destination.IsContiguous ? destination : destination.Contiguous();
@@ -9562,7 +9565,7 @@ public partial class DirectGpuTensorEngine
             using var sourceBuffer = GetOrAllocateBuffer(backend, cs);
             using var int32Index = GetOrAllocateInt32IndexBuffer(backend, ci);
             using var floatIndex = GetOrAllocateNumericIndexBuffer(backend, ci);
-            IGpuBuffer Scratch(int size) { var b = backend.AllocateBuffer(size); buffers.Add(b); return b; }
+            IGpuBuffer Scratch(int size) => RentOpScratch(backend, size, leases);
             var claims = Scratch(n);
             var winners = Scratch(m);
             var positions = Scratch(m);
@@ -9605,8 +9608,21 @@ public partial class DirectGpuTensorEngine
         }
         finally
         {
-            foreach (var b in buffers) DisposeBufferAfterQueuedUse(backend, b);
+            foreach (var lease in leases) lease.DisposeAfterQueuedUse(backend);
         }
+    }
+
+    /// <summary>
+    /// Scratch an op's kernels fill completely and drop when the op returns. Inside a compiled step it is a stable
+    /// buffer from the step's transient arena, so a captured graph allocates nothing; elsewhere it is an owned buffer
+    /// the caller releases after the work queued on it (<see cref="OwnedBuffer.DisposeAfterQueuedUse"/>). Each call
+    /// gets a distinct buffer.
+    /// </summary>
+    private static IGpuBuffer RentOpScratch(IDirectGpuBackend backend, int size, List<OwnedBuffer> leases)
+    {
+        var lease = AllocateTransientScratch(backend, size, fullyWritten: true);
+        leases.Add(lease);
+        return lease.Buffer;
     }
 
     /// <summary>
@@ -9651,15 +9667,13 @@ public partial class DirectGpuTensorEngine
         // Positions or indices past a float's exact range would merge; the host mask is exact.
         if (Math.Max(srcDim, dstDim) > MaxExactScatterPositions) return null;
         var ci = indices.IsContiguous ? indices : indices.Contiguous();
-        var buffers = new List<IGpuBuffer>();
+        var leases = new List<OwnedBuffer>();
         try
         {
             using var int32Index = GetOrAllocateInt32IndexBuffer(backend, ci);
             using var floatIndex = GetOrAllocateNumericIndexBuffer(backend, ci);
-            var claims = backend.AllocateBuffer(n);
-            buffers.Add(claims);
-            var positions = backend.AllocateBuffer(m);
-            buffers.Add(positions);
+            var claims = RentOpScratch(backend, n, leases);
+            var positions = RentOpScratch(backend, m, leases);
             return DispatchDeferredGpuOp<T>(backend, m, (int[])indices._shape.Clone(), winners =>
                 ScatterLastWritesOnDevice(backend, int32Index.Buffer, floatIndex.Buffer, positions, claims, winners,
                     outer, srcDim, dstDim, inner));
@@ -9672,7 +9686,7 @@ public partial class DirectGpuTensorEngine
         }
         finally
         {
-            foreach (var b in buffers) DisposeBufferAfterQueuedUse(backend, b);
+            foreach (var lease in leases) lease.DisposeAfterQueuedUse(backend);
         }
     }
 

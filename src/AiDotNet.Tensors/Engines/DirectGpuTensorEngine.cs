@@ -30011,7 +30011,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // The kernel gates along contiguous rows, i.e. the last axis. Any other axis is moved last on the device
                 // and back: before, it ran with the trailing dims folded away and returned wrong values.
                 if (InnerSize(input, ea) != 1)
+                {
+                    // The device permutation converts through float; any other T keeps its precision on the host.
+                    if (typeof(T) != typeof(float)) return base.GLU(input, axis);
                     return AlongLastAxis(input, ea, t => ((IEngine)this).GLU(t, -1));
+                }
                 int halfDim = input.Shape._dims[ea] / 2;
                 int outerSize = 1;
                 for (int i = 0; i < ea; i++) outerSize *= input.Shape._dims[i];
@@ -30042,7 +30046,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // The kernel gates along contiguous rows, i.e. the last axis. Any other axis is moved last on the device
                 // and back: before, it ran with the trailing dims folded away and returned wrong values.
                 if (InnerSize(input, ea) != 1)
+                {
+                    // The device permutation converts through float; any other T keeps its precision on the host.
+                    if (typeof(T) != typeof(float)) return base.GeGLU(input, axis);
                     return AlongLastAxis(input, ea, t => ((IEngine)this).GeGLU(t, -1));
+                }
                 int halfDim = input.Shape._dims[ea] / 2;
                 int outerSize = 1;
                 for (int i = 0; i < ea; i++) outerSize *= input.Shape._dims[i];
@@ -30072,7 +30080,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // The kernel gates along contiguous rows, i.e. the last axis. Any other axis is moved last on the device
                 // and back: before, it ran with the trailing dims folded away and returned wrong values.
                 if (InnerSize(input, ea) != 1)
+                {
+                    // The device permutation converts through float; any other T keeps its precision on the host.
+                    if (typeof(T) != typeof(float)) return base.ReGLU(input, axis);
                     return AlongLastAxis(input, ea, t => ((IEngine)this).ReGLU(t, -1));
+                }
                 int halfDim = input.Shape._dims[ea] / 2;
                 int outerSize = 1;
                 for (int i = 0; i < ea; i++) outerSize *= input.Shape._dims[i];
@@ -30102,7 +30114,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // The kernel gates along contiguous rows, i.e. the last axis. Any other axis is moved last on the device
                 // and back: before, it ran with the trailing dims folded away and returned wrong values.
                 if (InnerSize(input, ea) != 1)
+                {
+                    // The device permutation converts through float; any other T keeps its precision on the host.
+                    if (typeof(T) != typeof(float)) return base.SwiGLU(input, axis);
                     return AlongLastAxis(input, ea, t => ((IEngine)this).SwiGLU(t, -1));
+                }
                 int halfDim = input.Shape._dims[ea] / 2;
                 int outerSize = 1;
                 for (int i = 0; i < ea; i++) outerSize *= input.Shape._dims[i];

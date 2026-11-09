@@ -8,6 +8,16 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// </summary>
 internal static class GpuBufferCapacity
 {
+    /// <summary>
+    /// True when a launch of <paramref name="count"/> elements has nothing to do; a negative count throws rather than
+    /// returning with the output unwritten.
+    /// </summary>
+    internal static bool IsEmptyLaunch(int count)
+    {
+        if (count < 0) throw new ArgumentOutOfRangeException(nameof(count), $"The element count {count} is negative.");
+        return count == 0;
+    }
+
     /// <summary>Throws when <paramref name="buffer"/> holds fewer than <paramref name="count"/> 4-byte elements.</summary>
     internal static void Require(IGpuBuffer buffer, int count, string name)
     {

@@ -284,8 +284,6 @@ public partial class CpuEngine
         //                    k=3 ≡ flip(axes[0]) then transpose(axes).
         var result = tensor;
         int a0 = axes[0], a1 = axes[1];
-        if (a0 < 0) a0 += tensor.Rank;
-        if (a1 < 0) a1 += tensor.Rank;
 
         for (int s = 0; s < steps; s++)
         {

@@ -268,7 +268,7 @@ public sealed partial class MetalBackend
     {
         ThrowIfDisposed();
         var pipeline = GetParity210Pipeline("parity210_int32_to_float");
-        if (n <= 0) return; GpuBufferCapacity.Require(raw, n, nameof(raw)); GpuBufferCapacity.Require(output, n, nameof(output));
+        if (GpuBufferCapacity.IsEmptyLaunch(n)) return; GpuBufferCapacity.Require(raw, n, nameof(raw)); GpuBufferCapacity.Require(output, n, nameof(output));
         var (tgr, tpg) = pipeline.Calculate1DDispatch(n);
         using var encoder = _commandQueue.CreateScopedComputeEncoder();
         encoder.SetPipelineState(pipeline.Handle);
@@ -281,7 +281,7 @@ public sealed partial class MetalBackend
     {
         ThrowIfDisposed();
         var pipeline = GetParity210Pipeline("parity210_scatter_positions");
-        if (n <= 0) return; GpuBufferCapacity.RequirePositions(output, srcDim, inner, n);
+        if (GpuBufferCapacity.IsEmptyLaunch(n)) return; GpuBufferCapacity.RequirePositions(output, srcDim, inner, n);
         var (tgr, tpg) = pipeline.Calculate1DDispatch(n);
         using var encoder = _commandQueue.CreateScopedComputeEncoder();
         encoder.SetPipelineState(pipeline.Handle);
