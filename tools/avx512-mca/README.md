@@ -31,3 +31,20 @@ Cycles per loop iteration.
 **Zen 4.** Its model is used as is:
 - Per multiply-add, the 512-bit weight-gradient loop drops from 0.099 to 0.081 cycles.
 - The AVX2 tile takes 0.103 cycles, so on Zen 4 the 512-bit tile wins only without the joins.
+
+## Measured under Intel SDE (executed instructions)
+
+`sde-mix/run-sde-mix.sh` runs the weight gradient and the strided input gradient through DirectConvAvx2's AVX-512 tiles under `sde64 -spr` (SDE 9.58.0) and counts the executed instructions.
+- **Where:** on Linux (WSL works).
+- **Why not Windows:** there .NET also asks the OS which register state it saves, so it keeps AVX-512 off under SDE on a non-AVX-512 host. On Linux it reads XCR0, which SDE emulates.
+- **Shape:** batch 2, 64 → 64 channels, 16×16, 3×3, one thread, three repetitions.
+
+| path | build | zmm FMAs | `vinsertf32x8` | per FMA |
+|---|---|---:|---:|---:|
+| weight gradient (stride 1) | main | 3,538,944 | 884,736 | 0.25 |
+| weight gradient (stride 1) | #1445 | 3,538,944 | **0** | 0 |
+| strided input gradient (stride 2) | main | 912,384 | 165,888 | 0.18 |
+| strided input gradient (stride 2) | #1445 | 912,384 | **0** | 0 |
+
+- **Same work, same results:** the FMA counts are identical, and so are the output checksums (main against #1445).
+- **The model was right:** 0.25 is exactly the static count above (6 shuffles per 24 FMAs).
