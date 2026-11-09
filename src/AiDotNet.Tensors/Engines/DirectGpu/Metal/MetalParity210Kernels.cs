@@ -13,7 +13,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal
     {
         public static string[] GetKernelNames() => new[]
         {
-            "parity210_reflect_pad_1d","parity210_stft_mag_phase","parity210_phase_vocoder","parity210_build_spectrum","parity210_istft_from_spectrum","parity210_istft_normalize","parity210_logical_op","parity210_logical_not","parity210_shifted_diff","parity210_masks_to_boxes","parity210_pairwise_iou","parity210_histogramdd","parity210_gridsample_backward_input","parity210_gridsample_backward_grid","parity210_take_along_dim_f","parity210_cross3","parity210_ldexp","parity210_kron2d","parity210_search_sorted","parity210_next_after","parity210_index_write","parity210_cdist","parity210_pdist","parity210_histc","parity210_bitonic_step","parity210_copy_rows","parity210_iota_pad","parity210_int32_to_float","parity210_hsoftmax_paths","parity210_isin","parity210_copy_block_2d","parity210_scatter_reduce","parity210_unfold","parity210_classify_float","parity210_zeta","parity210_polygamma","parity210_rwkv7_forward",
+            "parity210_reflect_pad_1d","parity210_stft_mag_phase","parity210_phase_vocoder","parity210_build_spectrum","parity210_istft_from_spectrum","parity210_istft_normalize","parity210_logical_op","parity210_logical_not","parity210_shifted_diff","parity210_masks_to_boxes","parity210_pairwise_iou","parity210_histogramdd","parity210_gridsample_backward_input","parity210_gridsample_backward_grid","parity210_take_along_dim_f","parity210_cross3","parity210_ldexp","parity210_kron2d","parity210_search_sorted","parity210_next_after","parity210_index_write","parity210_cdist","parity210_pdist","parity210_histc","parity210_bitonic_step","parity210_copy_rows","parity210_iota_pad","parity210_int32_to_float","parity210_scatter_positions","parity210_hsoftmax_paths","parity210_isin","parity210_copy_block_2d","parity210_scatter_reduce","parity210_unfold","parity210_classify_float","parity210_zeta","parity210_polygamma","parity210_rwkv7_forward",
             "parity210_roll_1d","parity210_flip_axis","parity210_triu","parity210_tril",
             "parity210_diag_embed",
             "parity210_cumsum_axis","parity210_cumprod_axis","parity210_cummax_axis",
@@ -1330,7 +1330,7 @@ kernel void parity210_cdist(
     constant float& p [[buffer(6)]],
     uint gid [[thread_position_in_grid]]) {
     int idx = (int)gid; if (idx>=m*n) return; int j=idx%n; int i=idx/n; float sum=0.0f;
-    for (int k=0;k<d;k++){ float diff=fabs(x1[i*d+k]-x2[j*d+k]); if (p==1.0f) sum+=diff; else if (p==2.0f) sum+=diff*diff; else if (p==0.0f) sum+=(diff!=0.0f)?1.0f:0.0f; else if (p<0.0f) sum=fmax(sum,diff); else sum+=pow(diff,p); }
+    for (int k=0;k<d;k++){ float diff=fabs(x1[i*d+k]-x2[j*d+k]); if (p==1.0f) sum+=diff; else if (p==2.0f) sum+=diff*diff; else if (p==0.0f) sum+=(diff!=0.0f)?1.0f:0.0f; else if (p<0.0f) sum=(diff>sum||(as_type<uint>(diff)&0x7FFFFFFFu)>0x7F800000u)?diff:sum; else sum+=pow(diff,p); }
     output[idx]=(p==1.0f||p==0.0f||p<0.0f)?sum:(p==2.0f)?sqrt(sum):pow(sum,1.0f/p);
 }
 
@@ -1342,7 +1342,7 @@ kernel void parity210_pdist(
     constant float& p [[buffer(4)]],
     uint gid [[thread_position_in_grid]]) {
     int flat = (int)gid; if (flat>=n*n) return; int j=flat%n; int i=flat/n; if (i>=j) return; float sum=0.0f;
-    for (int k=0;k<d;k++){ float diff=fabs(input[i*d+k]-input[j*d+k]); if (p==1.0f) sum+=diff; else if (p==2.0f) sum+=diff*diff; else if (p==0.0f) sum+=(diff!=0.0f)?1.0f:0.0f; else if (p<0.0f) sum=fmax(sum,diff); else sum+=pow(diff,p); }
+    for (int k=0;k<d;k++){ float diff=fabs(input[i*d+k]-input[j*d+k]); if (p==1.0f) sum+=diff; else if (p==2.0f) sum+=diff*diff; else if (p==0.0f) sum+=(diff!=0.0f)?1.0f:0.0f; else if (p<0.0f) sum=(diff>sum||(as_type<uint>(diff)&0x7FFFFFFFu)>0x7F800000u)?diff:sum; else sum+=pow(diff,p); }
     float dist=(p==1.0f||p==0.0f||p<0.0f)?sum:(p==2.0f)?sqrt(sum):pow(sum,1.0f/p); int outIdx=i*n-(i*(i+1))/2+(j-i-1); output[outIdx]=dist;
 }
 
@@ -1403,6 +1403,15 @@ kernel void parity210_int32_to_float(
     constant int& n [[buffer(2)]],
     uint gid [[thread_position_in_grid]]) {
     int gi = (int)gid; if (gi>=n) return; output[gi]=(float)raw[gi];
+}
+
+kernel void parity210_scatter_positions(
+    device float* output [[buffer(0)]],
+    constant int& srcDim [[buffer(1)]],
+    constant int& inner [[buffer(2)]],
+    constant int& n [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+    int gi = (int)gid; if (gi>=n) return; output[gi]=(float)((gi/inner)%srcDim);
 }
 
 kernel void parity210_iota_pad(

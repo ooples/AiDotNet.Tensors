@@ -44068,7 +44068,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }, deterministicSafe: true);
 
         DifferentiableOps.RecordUnary("TopK", values, input,
-            BackwardFunctions<T>.TopKBackward, new object[] { indices, axis });
+            BackwardFunctions<T>.TopKBackward, new object[] { indices.Clone(), axis });
         return (values, indices);
     }
 
@@ -53114,9 +53114,14 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!input.IsContiguous || input._storageOffset != 0)
         {
             // The kernel reads (and in place, writes) the storage array directly; a strided view would be read in
-            // storage order. Out of place, materialize the view; in place, there is no storage of the view's own.
+            // storage order. Out of place, materialize the view; in place, normalize a materialized copy and write it
+            // back through the view, so the caller's storage holds the result at the view's own offset and strides.
             if (inPlace)
-                throw new InvalidOperationException("NativeNormalizeRows in place requires a contiguous tensor.");
+            {
+                var normalized = NativeNormalizeRows(input.Contiguous(), inPlace: false);
+                input.CopyFromArray(normalized.ToArray());
+                return input;
+            }
             input = input.Contiguous();
         }
         int rows = input._shape[0];

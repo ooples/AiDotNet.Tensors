@@ -937,20 +937,10 @@ public partial class CpuEngine
         // bit-consistent (same sequential op order as the kernel).
         if (typeof(T) == typeof(float))
         {
-            float pf = (float)p;
             float sumF = 0f;
             for (int k = 0; k < d; k++)
-            {
-                float diff = System.Math.Abs(ops.ToFloat(s[offA + k]) - ops.ToFloat(s[offB + k]));
-                if (pf == 1f) sumF += diff;
-                else if (pf == 2f) sumF += diff * diff;
-                else if (pf == 0f) sumF += diff != 0f ? 1f : 0f;
-                else if (float.IsPositiveInfinity(pf)) sumF = System.Math.Max(sumF, diff);
-                else sumF += (float)System.Math.Pow(diff, p);
-            }
-            float resF = pf == 1f || pf == 0f || float.IsPositiveInfinity(pf) ? sumF
-                : pf == 2f ? (float)System.Math.Sqrt(sumF) : (float)System.Math.Pow(sumF, 1.0 / p);
-            return ops.FromFloat(resF);
+                sumF = AccumulateNormF(sumF, System.Math.Abs(ops.ToFloat(s[offA + k]) - ops.ToFloat(s[offB + k])), p);
+            return ops.FromFloat(FinishNormF(sumF, p));
         }
 
         // Non-float T keeps the double path (higher precision; no GPU bit-equivalence committed).
@@ -980,20 +970,10 @@ public partial class CpuEngine
             // INumericOperations seam (ops.ToFloat / ops.FromFloat) — the codebase's
             // constraint-free conversion mechanism — which for typeof(T)==float is the exact
             // float value with no precision loss.
-            float pf = (float)p;
             float sumF = 0f;
             for (int k = 0; k < d; k++)
-            {
-                float diff = System.Math.Abs(ops.ToFloat(a[offA + k]) - ops.ToFloat(b[offB + k]));
-                if (pf == 1f) sumF += diff;
-                else if (pf == 2f) sumF += diff * diff;
-                else if (pf == 0f) sumF += diff != 0f ? 1f : 0f;
-                else if (float.IsPositiveInfinity(pf)) sumF = System.Math.Max(sumF, diff);
-                else sumF += (float)System.Math.Pow(diff, p);
-            }
-            float resF = pf == 1f || pf == 0f || float.IsPositiveInfinity(pf) ? sumF
-                : pf == 2f ? (float)System.Math.Sqrt(sumF) : (float)System.Math.Pow(sumF, 1.0 / p);
-            return ops.FromFloat(resF);
+                sumF = AccumulateNormF(sumF, System.Math.Abs(ops.ToFloat(a[offA + k]) - ops.ToFloat(b[offB + k])), p);
+            return ops.FromFloat(FinishNormF(sumF, p));
         }
 
         // Non-float T (e.g. double) keeps the double-precision path — the
@@ -1014,8 +994,24 @@ public partial class CpuEngine
     /// </summary>
     private static double AccumulateNorm(double acc, double absDiff, double p) =>
         p == 0 ? acc + (absDiff != 0 ? 1 : 0)
-        : double.IsPositiveInfinity(p) ? System.Math.Max(acc, absDiff)
+        : double.IsPositiveInfinity(p) ? (absDiff > acc || double.IsNaN(absDiff) ? absDiff : acc)
         : acc + System.Math.Pow(absDiff, p);
+
+    /// <summary>
+    /// <see cref="AccumulateNorm"/> in float, the GPU kernels' arithmetic. The special orders are chosen on the double
+    /// p, so a positive p that rounds to float 0 or +inf is still the p-norm the backward differentiates. A NaN
+    /// difference propagates through the maximum.
+    /// </summary>
+    private static float AccumulateNormF(float sum, float absDiff, double p) =>
+        p == 1 ? sum + absDiff
+        : p == 2 ? sum + absDiff * absDiff
+        : p == 0 ? sum + (absDiff != 0f ? 1f : 0f)
+        : double.IsPositiveInfinity(p) ? (absDiff > sum || float.IsNaN(absDiff) ? absDiff : sum)
+        : sum + (float)System.Math.Pow(absDiff, p);
+
+    private static float FinishNormF(float sum, double p) =>
+        p == 1 || p == 0 || double.IsPositiveInfinity(p) ? sum
+        : p == 2 ? (float)System.Math.Sqrt(sum) : (float)System.Math.Pow(sum, 1.0 / p);
 
     private static double FinishNorm(double acc, double p) =>
         p == 0 || double.IsPositiveInfinity(p) ? acc : System.Math.Pow(acc, 1.0 / p);

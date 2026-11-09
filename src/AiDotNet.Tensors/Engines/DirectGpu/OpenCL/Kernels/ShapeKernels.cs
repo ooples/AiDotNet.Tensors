@@ -217,7 +217,7 @@ __kernel void cdist(__global const float* x1, __global const float* x2, __global
         if (p == 1.0f) sum += diff;
         else if (p == 2.0f) sum += diff * diff;
         else if (p == 0.0f) sum += (diff != 0.0f) ? 1.0f : 0.0f;
-        else if (p < 0.0f) sum = fmax(sum, diff);
+        else if (p < 0.0f) sum = (diff > sum || (as_uint(diff) & 0x7FFFFFFFu) > 0x7F800000u) ? diff : sum;
         else sum += pow(diff, p);
     }
     output[idx] = (p == 1.0f || p == 0.0f || p < 0.0f) ? sum : (p == 2.0f) ? sqrt(sum) : pow(sum, 1.0f / p);
@@ -543,6 +543,11 @@ __kernel void int32_to_float(__global const int* raw, __global float* output, in
     int gid = get_global_id(0); if (gid >= n) return;
     output[gid] = (float)raw[gid];
 }
+// A scatter write's position along its axis for [outer, srcDim, inner] writes, as a float: (gid / inner) % srcDim.
+__kernel void scatter_positions(__global float* output, int srcDim, int inner, int n) {
+    int gid = get_global_id(0); if (gid >= n) return;
+    output[gid] = (float)((gid / inner) % srcDim);
+}
 __kernel void iota_pad(__global float* idx, int L, int P, int numRows) {
     int gid = get_global_id(0); if (gid >= numRows * P) return;
     int i = gid % P; idx[gid] = (i < L) ? (float)i : -1.0f;
@@ -709,7 +714,7 @@ __kernel void pdist(__global const float* input, __global float* output, int n, 
         if (p == 1.0f) sum += diff;
         else if (p == 2.0f) sum += diff * diff;
         else if (p == 0.0f) sum += (diff != 0.0f) ? 1.0f : 0.0f;
-        else if (p < 0.0f) sum = fmax(sum, diff);
+        else if (p < 0.0f) sum = (diff > sum || (as_uint(diff) & 0x7FFFFFFFu) > 0x7F800000u) ? diff : sum;
         else sum += pow(diff, p);
     }
     float dist = (p == 1.0f || p == 0.0f || p < 0.0f) ? sum : (p == 2.0f) ? sqrt(sum) : pow(sum, 1.0f / p);
@@ -745,7 +750,7 @@ __kernel void next_after(__global const float* a, __global const float* b, __glo
             "diag_kernel", "extract_diag_kernel", "triangular_mask",
             "masked_fill_kernel", "index_select", "take_along_dim",
             "cross3", "ldexp_kernel", "kron2d", "search_sorted", "next_after", "index_write", "cdist", "pdist",
-            "histc", "bitonic_step", "copy_rows", "copy_2d_strided", "copy_2d_strided4", "iota_pad", "int32_to_float", "rwkv7_forward", "hsoftmax_paths",
+            "histc", "bitonic_step", "copy_rows", "copy_2d_strided", "copy_2d_strided4", "iota_pad", "int32_to_float", "scatter_positions", "rwkv7_forward", "hsoftmax_paths",
             "isin", "unfold", "copy_block_2d", "scatter_reduce", "zeta_kernel", "polygamma_kernel", "reflect_pad_1d", "stft_mag_phase", "phase_vocoder", "build_spectrum", "istft_from_spectrum", "istft_normalize", "shifted_diff", "histogramdd", "masks_to_boxes", "pairwise_iou", "logical_op", "logical_not", "gridsample_backward_input", "gridsample_backward_grid"
         };
     }

@@ -207,6 +207,42 @@ public sealed class BatchedCDistSearchSortedTests
     }
 
     [Fact]
+    public void Float_cdist_keeps_a_tiny_positive_order_as_the_p_norm()
+    {
+        var eng = new CpuEngine();
+        // 1e-50 rounds to float 0, which used to select the count of differing coordinates (2); the p-norm of
+        // (3, 1) at so small a p overflows to +inf, as the double path computes.
+        var a = new Tensor<float>(new[] { 4f, 2f }, new[] { 1, 2 });
+        var b = new Tensor<float>(new[] { 1f, 1f }, new[] { 1, 2 });
+        var ad = new Tensor<double>(new[] { 4.0, 2.0 }, new[] { 1, 2 });
+        var bd = new Tensor<double>(new[] { 1.0, 1.0 }, new[] { 1, 2 });
+        Assert.Equal((float)eng.TensorCDist(ad, bd, 1e-50).ToArray()[0], eng.TensorCDist(a, b, 1e-50).ToArray()[0]);
+        Assert.NotEqual(2f, eng.TensorCDist(a, b, 1e-50).ToArray()[0]);
+    }
+
+    [Fact]
+    public void Double_max_norm_gradient_goes_only_to_the_exact_maximum()
+    {
+        var eng = new CpuEngine();
+        // Differences 1.0 and 0.999999999 are equal as floats but not as doubles: only the first attains the max.
+        var a = new Tensor<double>(new[] { 1.0, 0.999999999 }, new[] { 1, 2 });
+        var b = new Tensor<double>(new[] { 0.0, 0.0 }, new[] { 1, 2 });
+        System.Collections.Generic.Dictionary<Tensor<double>, Tensor<double>> g;
+        using (var tape = new GradientTape<double>())
+            g = tape.ComputeGradients(eng.ReduceSum(eng.TensorCDist(a, b, double.PositiveInfinity), null, keepDims: false), new[] { a });
+        Assert.Equal(new[] { 1.0, 0.0 }, g[a].ToArray());
+    }
+
+    [Fact]
+    public void Cdist_max_norm_propagates_nan()
+    {
+        var eng = new CpuEngine();
+        var a = new Tensor<float>(new[] { 6f, float.NaN }, new[] { 1, 2 });
+        var b = new Tensor<float>(new[] { 1f, 1f }, new[] { 1, 2 });
+        Assert.True(float.IsNaN(eng.TensorCDist(a, b, double.PositiveInfinity).ToArray()[0]));
+    }
+
+    [Fact]
     public void Cdist_rejects_batch_dims_that_do_not_broadcast()
     {
         var eng = new CpuEngine();

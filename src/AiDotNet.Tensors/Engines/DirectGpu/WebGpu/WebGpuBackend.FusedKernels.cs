@@ -121,12 +121,14 @@ public sealed partial class WebGpuBackend
     }
     public void CDist(IGpuBuffer x1, IGpuBuffer x2, IGpuBuffer output, int m, int n, int d, float p)
     {
+        p = AiDotNet.Tensors.Engines.DirectGpuTensorEngine.KernelNormOrder(p);
         int __total = m*n; if (__total <= 0) return;
         DispatchNBufferAsync("Audit:Cdist", WebGpuAuditKernels.Cdist, "main",
             new IGpuBuffer[] { x1, x2, output }, new float[] { BitConverter.Int32BitsToSingle(m), BitConverter.Int32BitsToSingle(n), BitConverter.Int32BitsToSingle(d), p }, __total).GetAwaiter().GetResult();
     }
     public void PDist(IGpuBuffer input, IGpuBuffer output, int n, int d, float p)
     {
+        p = AiDotNet.Tensors.Engines.DirectGpuTensorEngine.KernelNormOrder(p);
         int __total = n*n; if (__total <= 0) return;
         DispatchNBufferAsync("Audit:Pdist", WebGpuAuditKernels.Pdist, "main",
             new IGpuBuffer[] { input, output }, new float[] { BitConverter.Int32BitsToSingle(n), BitConverter.Int32BitsToSingle(d), p, 0f }, __total).GetAwaiter().GetResult();
@@ -154,6 +156,12 @@ public sealed partial class WebGpuBackend
         if (n <= 0) return;
         DispatchNBufferAsync("Audit:Int32ToFloat", WebGpuAuditKernels.Int32ToFloat, "main",
             new IGpuBuffer[] { raw, output }, new float[] { BitConverter.Int32BitsToSingle(n), 0f, 0f, 0f }, n).GetAwaiter().GetResult();
+    }
+    public void ScatterPositions(IGpuBuffer output, int srcDim, int inner, int n)
+    {
+        if (n <= 0) return;
+        DispatchNBufferAsync("Audit:ScatterPositions", WebGpuAuditKernels.ScatterPositions, "main",
+            new IGpuBuffer[] { output }, new float[] { BitConverter.Int32BitsToSingle(srcDim), BitConverter.Int32BitsToSingle(inner), BitConverter.Int32BitsToSingle(n), 0f }, n).GetAwaiter().GetResult();
     }
     public void IotaPad(IGpuBuffer idx, int l, int p, int numRows)
     {

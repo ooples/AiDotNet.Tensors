@@ -2044,6 +2044,12 @@ public interface IDirectGpuBackend : IDisposable
     void Int32ToFloat(IGpuBuffer raw, IGpuBuffer output, int n);
 
     /// <summary>
+    /// Each write's position along the scatter axis for [outer, srcDim, inner] writes, as a float:
+    /// output[g] = (g / inner) % srcDim, computed in integers on the device (no host upload).
+    /// </summary>
+    void ScatterPositions(IGpuBuffer output, int srcDim, int inner, int n);
+
+    /// <summary>
     /// RWKV-7 "Goose" generalized-delta-rule sequence forward (arXiv:2503.14456, Eq. 17), parallel over
     /// (batch, head):
     /// <c>S_t = S_{t-1}(diag(w_t) - kappaHat_t^T(a_t (*) kappaHat_t)) + v_t^T kTilde_t</c>,

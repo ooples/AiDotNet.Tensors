@@ -107,3 +107,12 @@ AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Int32ToFloat(AiDotNet.Te
 static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanAuditKernels.Int32ToFloat.get -> string!
 static AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuAuditKernels.Int32ToFloat.get -> string!
 virtual AiDotNet.Tensors.Engines.Gpu.DelegatingGpuBackend.Int32ToFloat(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! raw, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int n) -> void
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.ScatterPositions(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int srcDim, int inner, int n) -> void
+AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend.ScatterPositions(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int srcDim, int inner, int n) -> void
+AiDotNet.Tensors.Engines.DirectGpu.IDirectGpuBackend.ScatterPositions(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int srcDim, int inner, int n) -> void
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalBackend.ScatterPositions(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int srcDim, int inner, int n) -> void
+AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend.ScatterPositions(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int srcDim, int inner, int n) -> void
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.ScatterPositions(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int srcDim, int inner, int n) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanAuditKernels.ScatterPositions.get -> string!
+static AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuAuditKernels.ScatterPositions.get -> string!
+virtual AiDotNet.Tensors.Engines.Gpu.DelegatingGpuBackend.ScatterPositions(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int srcDim, int inner, int n) -> void

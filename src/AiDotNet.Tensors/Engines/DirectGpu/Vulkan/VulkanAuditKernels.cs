@@ -718,7 +718,7 @@ float p210_lgamma(float x) {
 void main() {
 
     int idx = int(gl_GlobalInvocationID.x); if (idx>=m*n) return; int j=idx%n; int i=idx/n; float sum=0.0;
-    for (int k=0;k<d;k++){ float diff=abs(x1[i*d+k]-x2[j*d+k]); if (p==1.0) sum+=diff; else if (p==2.0) sum+=diff*diff; else if (p==0.0) sum+=(diff!=0.0)?1.0:0.0; else if (p<0.0) sum=max(sum,diff); else sum+=pow(diff,p); }
+    for (int k=0;k<d;k++){ float diff=abs(x1[i*d+k]-x2[j*d+k]); if (p==1.0) sum+=diff; else if (p==2.0) sum+=diff*diff; else if (p==0.0) sum+=(diff!=0.0)?1.0:0.0; else if (p<0.0) sum=(diff>sum||(floatBitsToUint(diff)&0x7FFFFFFFu)>0x7F800000u)?diff:sum; else sum+=pow(diff,p); }
     outputValues[idx]=(p==1.0||p==0.0||p<0.0)?sum:(p==2.0)?sqrt(sum):pow(sum,1.0/p);
 
 }";
@@ -745,7 +745,7 @@ float p210_lgamma(float x) {
 void main() {
 
     int flatIndex = int(gl_GlobalInvocationID.x); if (flatIndex>=n*n) return; int j=flatIndex%n; int i=flatIndex/n; if (i>=j) return; float sum=0.0;
-    for (int k=0;k<d;k++){ float diff=abs(inputValues[i*d+k]-inputValues[j*d+k]); if (p==1.0) sum+=diff; else if (p==2.0) sum+=diff*diff; else if (p==0.0) sum+=(diff!=0.0)?1.0:0.0; else if (p<0.0) sum=max(sum,diff); else sum+=pow(diff,p); }
+    for (int k=0;k<d;k++){ float diff=abs(inputValues[i*d+k]-inputValues[j*d+k]); if (p==1.0) sum+=diff; else if (p==2.0) sum+=diff*diff; else if (p==0.0) sum+=(diff!=0.0)?1.0:0.0; else if (p<0.0) sum=(diff>sum||(floatBitsToUint(diff)&0x7FFFFFFFu)>0x7F800000u)?diff:sum; else sum+=pow(diff,p); }
     float dist=(p==1.0||p==0.0||p<0.0)?sum:(p==2.0)?sqrt(sum):pow(sum,1.0/p); int outIdx=i*n-(i*(i+1))/2+(j-i-1); outputValues[outIdx]=dist;
 
 }";
@@ -894,6 +894,19 @@ layout(push_constant) uniform PC {
 
 void main() {
     int gid = int(gl_GlobalInvocationID.x); if (gid >= n) return; outputValues[gid] = float(raw[gid]);
+}";
+
+    public static string ScatterPositions => @"#version 450
+layout(local_size_x = 256) in;
+layout(set=0, binding=0) buffer B0 { float outputValues[]; };
+layout(push_constant) uniform PC {
+    int srcDim;
+    int inner;
+    int n;
+};
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x); if (gid >= n) return; outputValues[gid] = float((gid / inner) % srcDim);
 }";
 
     public static string IotaPad => @"#version 450

@@ -24021,7 +24021,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (Compilation.GraphMode.IsActive)
             return base.TensorWhere(condition, x, y);
 
-        if (!TryGetBackend(out var backend))
+        // An empty select has nothing to compute, and a backend may reject zero-sized buffers.
+        if (x.Length == 0 || !TryGetBackend(out var backend))
             return base.TensorWhere(condition, x, y);
 
         try

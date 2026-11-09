@@ -121,12 +121,14 @@ public sealed partial class VulkanBackend
     }
     public void CDist(IGpuBuffer x1, IGpuBuffer x2, IGpuBuffer output, int m, int n, int d, float p)
     {
+        p = AiDotNet.Tensors.Engines.DirectGpuTensorEngine.KernelNormOrder(p);
         GlslDispatchN(VulkanAuditKernels.Cdist, m*n,
             new IGpuBuffer[] { x1, x2, output },
             new uint[] { (uint)m, (uint)n, (uint)d, FloatBits(p) });
     }
     public void PDist(IGpuBuffer input, IGpuBuffer output, int n, int d, float p)
     {
+        p = AiDotNet.Tensors.Engines.DirectGpuTensorEngine.KernelNormOrder(p);
         GlslDispatchN(VulkanAuditKernels.Pdist, n*n,
             new IGpuBuffer[] { input, output },
             new uint[] { (uint)n, (uint)d, FloatBits(p) });
@@ -155,6 +157,13 @@ public sealed partial class VulkanBackend
         GlslDispatchN(VulkanAuditKernels.Int32ToFloat, n,
             new IGpuBuffer[] { raw, output },
             new uint[] { (uint)n });
+    }
+    public void ScatterPositions(IGpuBuffer output, int srcDim, int inner, int n)
+    {
+        if (n <= 0) return;
+        GlslDispatchN(VulkanAuditKernels.ScatterPositions, n,
+            new IGpuBuffer[] { output },
+            new uint[] { (uint)srcDim, (uint)inner, (uint)n });
     }
     public void IotaPad(IGpuBuffer idx, int l, int p, int numRows)
     {

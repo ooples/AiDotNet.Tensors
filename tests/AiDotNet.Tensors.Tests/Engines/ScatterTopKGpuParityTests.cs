@@ -30,6 +30,26 @@ public class ScatterTopKGpuParityTests
         return new Tensor<int>(Enumerable.Range(0, n).Select(i => (i * 7 + i / 3) % shape[ax] / 2).ToArray(), idxShape);
     }
 
+    /// <summary>
+    /// Runs one phase (a forward or a backward) and, on the device, proves that phase itself launched GPU work and fell
+    /// back nowhere. A whole-run count cannot: the loss ops launch work even when a backward runs on the host. With
+    /// <paramref name="noReadbacks"/> the phase may not read a buffer back either, which a host backward must do to see
+    /// the device gradient.
+    /// </summary>
+    private static T Phase<T>(IEngine eng, string name, Func<T> run, bool noReadbacks)
+    {
+        if (eng is not DirectGpuTensorEngine) return run();
+        long launches = GpuLaunchProbe.Count, readbacks = GpuLaunchProbe.Readbacks;
+        int fallbacks = GpuLaunchProbe.Fallbacks.Length;
+        var result = run();
+        Assert.True(GpuLaunchProbe.Count > launches, $"{name} launched no GPU work.");
+        Assert.Equal(fallbacks, GpuLaunchProbe.Fallbacks.Length);
+        if (noReadbacks)
+            Assert.True(GpuLaunchProbe.Readbacks == readbacks,
+                $"{name} read {GpuLaunchProbe.Readbacks - readbacks} buffers back to the host.");
+        return result;
+    }
+
     private static (float[] y, float[] gDst, float[] gSrc) RunScatter(IEngine eng, int[] shape, int axis, int count)
     {
         int ax = axis < 0 ? shape.Length + axis : axis;
@@ -39,8 +59,9 @@ public class ScatterTopKGpuParityTests
         var src = new Tensor<float>(idx.Shape.ToArray(), new Vector<float>(Gen(idx.Length, 2)));
         var w = new Tensor<float>(shape, new Vector<float>(Gen(n, 3)));
         using var tape = new GradientTape<float>();
-        var y = eng.TensorScatter(dst, idx, src, axis);
-        var g = tape.ComputeGradients(eng.ReduceSum(eng.TensorMultiply(y, w), null, keepDims: false), new[] { dst, src });
+        var y = Phase(eng, "The scatter forward", () => eng.TensorScatter(dst, idx, src, axis), noReadbacks: true);
+        var loss = eng.ReduceSum(eng.TensorMultiply(y, w), null, keepDims: false);
+        var g = Phase(eng, "The scatter backward", () => tape.ComputeGradients(loss, new[] { dst, src }), noReadbacks: true);
         return (y.ToArray(), g[dst].ToArray(), g[src].ToArray());
     }
 
@@ -92,8 +113,10 @@ public class ScatterTopKGpuParityTests
             var x = new Tensor<float>(new[] { 4, 9 }, new Vector<float>(Gen(36, 4)));
             var w = new Tensor<float>(new[] { 4, 3 }, new Vector<float>(Gen(12, 5)));
             using var tape = new GradientTape<float>();
-            var values = eng.TensorTopK(x, 3, 1, out _);
-            var g = tape.ComputeGradients(eng.ReduceSum(eng.TensorMultiply(values, w), null, keepDims: false), new[] { x });
+            // The top-k forward hands its indices to the host, so only its backward is held to no readbacks.
+            var values = Phase(eng, "The top-k forward", () => eng.TensorTopK(x, 3, 1, out _), noReadbacks: false);
+            var loss = eng.ReduceSum(eng.TensorMultiply(values, w), null, keepDims: false);
+            var g = Phase(eng, "The top-k backward", () => tape.ComputeGradients(loss, new[] { x }), noReadbacks: true);
             return (values.ToArray(), g[x].ToArray());
         }
 
@@ -224,5 +247,31 @@ public class ScatterTopKGpuParityTests
             g = tape.ComputeGradients(eng.ReduceSum(eng.TensorMultiply(y, w), null, keepDims: false), new[] { x });
         }
         Assert.Equal(new[] { 3f, 4f, 0f, 0f, 1f, 2f }, g[x].ToArray());
+    }
+
+    [SkippableFact]
+    public void Empty_scatter_returns_the_destination_and_passes_its_gradient()
+    {
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.IfNot(gpu.IsGpuAvailable, "No DirectGpu backend available");
+
+        (float[] y, float[] g, int sourceGradLength) Run(IEngine eng)
+        {
+            var dst = new Tensor<float>(new[] { 1f, 2f, 3f }, new[] { 3 });
+            var src = new Tensor<float>(new[] { 0 });
+            var idx = new Tensor<int>(new[] { 0 });
+            var w = new Tensor<float>(new[] { 4f, 5f, 6f }, new[] { 3 });
+            using var tape = new GradientTape<float>();
+            var y = eng.TensorScatter(dst, idx, src, 0);
+            var g = tape.ComputeGradients(eng.ReduceSum(eng.TensorMultiply(y, w), null, keepDims: false), new[] { dst, src });
+            return (y.ToArray(), g[dst].ToArray(), g[src].Length);
+        }
+
+        var expected = Run(new CpuEngine());
+        var actual = OnDevice(() => Run(gpu));
+        Assert.Equal(new[] { 1f, 2f, 3f }, actual.y);
+        Assert.Equal(expected.y, actual.y);
+        Assert.Equal(expected.g, actual.g);
+        Assert.Equal(0, actual.sourceGradLength);
     }
 }

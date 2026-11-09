@@ -1506,6 +1506,7 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     public virtual void IotaPad(IGpuBuffer idx, int l, int p, int numRows) => Inner.IotaPad(idx, l, p, numRows);
     /// <inheritdoc/>
     public virtual void Int32ToFloat(IGpuBuffer raw, IGpuBuffer output, int n) => Inner.Int32ToFloat(raw, output, n);
+    public virtual void ScatterPositions(IGpuBuffer output, int srcDim, int inner, int n) => Inner.ScatterPositions(output, srcDim, inner, n);
     /// <inheritdoc/>
     public virtual void Rwkv7Forward(IGpuBuffer r, IGpuBuffer kappa, IGpuBuffer kTilde, IGpuBuffer v, IGpuBuffer decayLogit, IGpuBuffer iclRate, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim) => Inner.Rwkv7Forward(r, kappa, kTilde, v, decayLogit, iclRate, output, sbuf, batch, seqLen, modelDim, numHeads, headDim);
     /// <inheritdoc/>

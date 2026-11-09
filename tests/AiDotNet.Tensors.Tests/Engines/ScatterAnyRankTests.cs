@@ -264,4 +264,21 @@ public sealed class ScatterAnyRankTests
         var expected = new[] { 2, 0, 1, 2 }.SelectMany(r => data.Skip(r * 8).Take(8)).ToArray();
         Assert.Equal(expected, picked.ToArray());
     }
+
+    [Fact]
+    public void TopK_backward_uses_the_indices_of_the_forward()
+    {
+        var eng = new CpuEngine();
+        var x = new Tensor<float>(new[] { 1f, 5f, 3f, 4f }, new[] { 1, 4 });
+        System.Collections.Generic.Dictionary<Tensor<float>, Tensor<float>> g;
+        using (var tape = new GradientTape<float>())
+        {
+            var values = eng.TensorTopK(x, 2, 1, out var indices);
+            // Editing the returned indices must not move the gradient: positions 1 and 3 were selected.
+            indices[0, 0] = 0;
+            indices[0, 1] = 2;
+            g = tape.ComputeGradients(eng.ReduceSum(values, null, keepDims: false), new[] { x });
+        }
+        Assert.Equal(new[] { 0f, 1f, 0f, 1f }, g[x].ToArray());
+    }
 }
