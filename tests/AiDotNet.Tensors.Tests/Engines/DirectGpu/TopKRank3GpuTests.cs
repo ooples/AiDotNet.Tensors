@@ -1,5 +1,6 @@
 using System.Linq;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using AiDotNet.Tensors.Tests.Engines;
 using Xunit;
@@ -80,7 +81,7 @@ public class TopKRank3GpuTests
     {
         using var gpu = new DirectGpuTensorEngine();
         Skip.IfNot(gpu.IsGpuAvailable, "No DirectGpu backend available");
-        var rng = new System.Random(rows * 31 + columns);
+        var rng = RandomHelper.CreateSeededRandom(rows * 31 + columns);
         var data = new float[rows * columns];
         for (int r = 0; r < rows; r++)
         {
@@ -89,7 +90,10 @@ public class TopKRank3GpuTests
             for (int c = 0; c < columns; c++) data[r * columns + c] = perm[c] * 0.5f - 7f;
         }
         int[] shape = { rows, columns };
+        int tournamentsBefore = gpu.TopKTournamentsCompleted;
         var values = ((IEngine)gpu).TensorTopK(new Tensor<float>(data, shape), k, 1, out var indices);
+        // The tournament itself ran on the device: a full row sort or a CPU fallback returns the same answer.
+        Assert.Equal(tournamentsBefore + 1, gpu.TopKTournamentsCompleted);
         var (ev, ei) = TopKAnyAxisTests.Reference(data, shape, 1, k, largest: true);
         Assert.Equal(new[] { rows, k }, values.Shape.ToArray());
         Assert.Equal(ev, values.ToArray());

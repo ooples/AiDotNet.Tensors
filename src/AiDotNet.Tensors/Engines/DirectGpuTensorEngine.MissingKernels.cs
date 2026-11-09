@@ -4716,6 +4716,14 @@ public partial class DirectGpuTensorEngine
 
     private const int TopKChunk = 128;
 
+    private int _topKTournamentsCompleted;
+
+    /// <summary>
+    /// Top-k calls on this engine whose rows went through the chunk tournament and came back from the device, for tests
+    /// telling that route apart from the full row sort and the CPU fallback.
+    /// </summary>
+    internal int TopKTournamentsCompleted => Volatile.Read(ref _topKTournamentsCompleted);
+
     /// <summary>
     /// Exact top-k of each row by a chunk tournament. Each round sorts every TopKChunk-wide chunk (bitonic, indices
     /// co-permuted) and keeps each chunk's best k, so a row shrinks by TopKChunk / k per round. It is exact because an
@@ -4731,11 +4739,14 @@ public partial class DirectGpuTensorEngine
     {
         const int C = TopKChunk;
         int n = (columns + C - 1) / C * C;
+        // Each buffer is under the cleanup below from the moment it exists, so a failed allocation of its partner
+        // never strands it until a collection.
         var val = AllocateOutputBuffer(backend, rows * n);
-        var idx = AllocateOutputBuffer(backend, rows * n);
+        OwnedBuffer idx = default;
         bool owned = true;
         try
         {
+            idx = AllocateOutputBuffer(backend, rows * n);
             backend.Fill(val.Buffer, float.NegativeInfinity, rows * n);
             backend.CopyRows(source, val.Buffer, columns, n, rows, columns);
             backend.IotaPad(idx.Buffer, columns, n, rows);
@@ -4753,9 +4764,10 @@ public partial class DirectGpuTensorEngine
                 }
                 int next = chunks * k, nextPad = (next + C - 1) / C * C;
                 var nextVal = AllocateOutputBuffer(backend, rows * nextPad);
-                var nextIdx = AllocateOutputBuffer(backend, rows * nextPad);
+                OwnedBuffer nextIdx = default;
                 try
                 {
+                    nextIdx = AllocateOutputBuffer(backend, rows * nextPad);
                     backend.Fill(nextVal.Buffer, float.NegativeInfinity, rows * nextPad);
                     backend.Fill(nextIdx.Buffer, -1f, rows * nextPad);
                     using (var packedVal = AllocateOutputBuffer(backend, rows * next))
@@ -4826,7 +4838,8 @@ public partial class DirectGpuTensorEngine
             using var input = GetOrAllocateBuffer(backend, tensor);
             // Small k over a long row (LM logits: k = 32 of 49,152): exact chunk tournament instead of sorting the row.
             int sortedStride = columns;
-            var (sortedValues, sortedIndices) = selected * 2 <= TopKChunk && columns >= 4 * TopKChunk
+            bool tournament = selected * 2 <= TopKChunk && columns >= 4 * TopKChunk;
+            var (sortedValues, sortedIndices) = tournament
                 ? ChunkedTopKRowsToBuffers(backend, input.Buffer, rows, columns, selected, out sortedStride)
                 : BitonicSortRowsToBuffers(backend, input.Buffer, rows, columns, descending: true);
             using (sortedValues)
@@ -4846,6 +4859,7 @@ public partial class DirectGpuTensorEngine
                     valuesHandedOff = true;
                     var indexData = FinishGpuOp<int>(backend, indexOutput, rows * selected);
                     indicesHandedOff = true;
+                    if (tournament) Interlocked.Increment(ref _topKTournamentsCompleted);
                     indices = new Tensor<int>(indexData, new[] { rows, selected });
                     return new Tensor<T>(valueData, new[] { rows, selected });
                 }
