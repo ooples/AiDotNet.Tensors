@@ -170,7 +170,7 @@ public sealed class AxisOpsRankConformanceTests
                         try
                         {
                             var expected = Invoke(reference, m, refArgs);
-                            if (Compare(actual, expected) is { } diff)
+                            if (Compare(actual, expected, rankOneInput: false) is { } diff)
                                 failures.Add($"{where}: differs from the reference engine: {diff}");
                         }
                         catch (Exception e) { failures.Add($"{where}: reference engine failed: {Inner(e)}"); }
@@ -180,7 +180,7 @@ public sealed class AxisOpsRankConformanceTests
                     try
                     {
                         var expected = Unlift(Invoke(engine, m, lifted), shape, ax);
-                        if (Compare(actual, expected) is { } diff)
+                        if (Compare(actual, expected, rankOneInput: shape.Length == 1) is { } diff)
                             failures.Add($"{where}: differs from the lifted rank-2 reference: {diff}");
                     }
                     catch (Exception e) { failures.Add($"{where}: lifted rank-2 call failed: {Inner(e)}"); }
@@ -475,31 +475,36 @@ public sealed class AxisOpsRankConformanceTests
         return new Tensor<T>(d, WithAxis(shape, ax, s[1]));
     }
 
-    private static string? Compare(object? a, object? e)
+    /// <summary>
+    /// Null when <paramref name="a"/> matches <paramref name="e"/>. Shapes must match exactly, except that a rank-1
+    /// input lifts to [1, n], so its per-row result comes back as [n] or [1, n].
+    /// </summary>
+    private static string? Compare(object? a, object? e, bool rankOneInput)
     {
         switch (a)
         {
             case null: return e is null ? null : "null result";
             case object?[] aa when e is object?[] ea:
                 for (int i = 0; i < Math.Min(aa.Length, ea.Length); i++)
-                    if (Compare(aa[i], ea[i]) is { } d) return $"item {i}: {d}";
+                    if (Compare(aa[i], ea[i], rankOneInput) is { } d) return $"item {i}: {d}";
                 return aa.Length == ea.Length ? null : $"{aa.Length} items vs {ea.Length}";
             case Tensor<float> af when e is Tensor<float> ef:
-                return CompareData(af.Shape.ToArray(), ef.Shape.ToArray(), af.ToArray().Select(v => (double)v).ToArray(), ef.ToArray().Select(v => (double)v).ToArray());
+                return CompareData(rankOneInput, af.Shape.ToArray(), ef.Shape.ToArray(), af.ToArray().Select(v => (double)v).ToArray(), ef.ToArray().Select(v => (double)v).ToArray());
             case Tensor<int> ai when e is Tensor<int> ei:
-                return CompareData(ai.Shape.ToArray(), ei.Shape.ToArray(), ai.ToArray().Select(v => (double)v).ToArray(), ei.ToArray().Select(v => (double)v).ToArray());
+                return CompareData(rankOneInput, ai.Shape.ToArray(), ei.Shape.ToArray(), ai.ToArray().Select(v => (double)v).ToArray(), ei.ToArray().Select(v => (double)v).ToArray());
             default:
                 var tt = a.GetType();
                 if (tt.FullName!.StartsWith("System.ValueTuple", StringComparison.Ordinal))
-                    return Compare(tt.GetFields().Select(fi => fi.GetValue(a)).ToArray(), e);
+                    return Compare(tt.GetFields().Select(fi => fi.GetValue(a)).ToArray(), e, rankOneInput);
                 return null;
         }
     }
 
-    private static string? CompareData(int[] sa, int[] se, double[] a, double[] e)
+    private static string? CompareData(bool rankOneInput, int[] sa, int[] se, double[] a, double[] e)
     {
         // A rank-1 input lifts to [1, n], so its per-row result comes back as [n] or [1, n]: compare the data.
-        if (!sa.SequenceEqual(se) && !(Prod(sa) == Prod(se) && (sa.Length <= 1 || se.Length <= 1 || sa[0] == 1 || se[0] == 1)))
+        if (!sa.SequenceEqual(se)
+            && !(rankOneInput && Prod(sa) == Prod(se) && (sa.Length <= 1 || se.Length <= 1 || sa[0] == 1 || se[0] == 1)))
             return $"shape [{string.Join(",", sa)}] vs lifted [{string.Join(",", se)}]";
         for (int i = 0; i < a.Length; i++)
         {

@@ -23,6 +23,9 @@ public sealed class TensorScatterAnyRankGpuTests : IClassFixture<DirectGpuTensor
 
     public TensorScatterAnyRankGpuTests(DirectGpuTensorEngineTestFixture fixture) => _fixture = fixture;
 
+    private DirectGpuTensorEngine Gpu => _fixture.Engine ?? throw new InvalidOperationException(
+        "Direct GPU engine was not initialized.", _fixture.InitializationException);
+
     [SkippableTheory]
     [InlineData(0)]
     [InlineData(1)]
@@ -47,7 +50,7 @@ public sealed class TensorScatterAnyRankGpuTests : IClassFixture<DirectGpuTensor
         DirectGpuTensorEngine.ThrowOnGpuKernelFallback = true;
         try
         {
-            var (gpuY, gpuGd, gpuGs) = Run(_fixture.Engine!, shape, idxShape, indices, axis);
+            var (gpuY, gpuGd, gpuGs) = Run(Gpu, shape, idxShape, indices, axis);
             Assert.Equal(cpuY, gpuY);
             AssertClose(cpuGd, gpuGd);
             AssertClose(cpuGs, gpuGs);
@@ -62,7 +65,7 @@ public sealed class TensorScatterAnyRankGpuTests : IClassFixture<DirectGpuTensor
     public void Gpu_index_copy_add_and_set_slice_reject_shapes_the_cpu_rejects()
     {
         Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
-        IEngine gpu = _fixture.Engine!;
+        IEngine gpu = Gpu;
         var input = new Tensor<float>(new[] { 2, 3, 4 });
         var idx = new Tensor<int>(new[] { 0, 2 }, new[] { 2 });
         var sameLengthWrongShape = new Tensor<float>(new[] { 2, 4, 2 });
@@ -70,6 +73,39 @@ public sealed class TensorScatterAnyRankGpuTests : IClassFixture<DirectGpuTensor
         Assert.Throws<ArgumentException>(() => gpu.ScatterAdd(input, idx, sameLengthWrongShape, 1));
         Assert.Throws<ArgumentException>(() => gpu.TensorSetSliceAxis(input, new Tensor<float>(new[] { 2, 3, 4 }), 1, 0));
         gpu.TensorSetSliceAxis(input, new Tensor<float>(new[] { 2, 4 }), 1, 0);
+    }
+
+    [SkippableFact]
+    public void Taped_scatter_of_resident_operands_runs_on_the_device_without_readbacks()
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        var gpu = Gpu;
+        int[] shape = { 2, 6, 3 };
+        // Repeated indices within a fibre, so the last-write resolution is part of what must stay on the device.
+        var indices = new Tensor<int>(Enumerable.Range(0, 2 * 4 * 3).Select(i => (i * 5 + i / 4) % 6 / 2).ToArray(), new[] { 2, 4, 3 });
+        var dst = gpu.UploadToGpu(new Tensor<float>(Enumerable.Range(0, 36).Select(i => i * 0.5f).ToArray(), shape), AiDotNet.Tensors.Engines.Gpu.GpuTensorRole.General);
+        var src = gpu.UploadToGpu(new Tensor<float>(Enumerable.Range(0, 24).Select(i => 10f + i).ToArray(), new[] { 2, 4, 3 }), AiDotNet.Tensors.Engines.Gpu.GpuTensorRole.General);
+        bool previous = DirectGpuTensorEngine.ThrowOnGpuKernelFallback;
+        DirectGpuTensorEngine.ThrowOnGpuKernelFallback = true;
+        try
+        {
+            using var tape = new GradientTape<float>();
+            GpuLaunchProbe.Reset();
+            var y = ((IEngine)gpu).TensorScatter(dst, indices, src, 1);
+            // Measured before the backward and before anything materializes the result on the host.
+            long launches = GpuLaunchProbe.Count, readbacks = GpuLaunchProbe.Readbacks;
+            Assert.True(launches > 0, "The taped scatter launched no GPU work.");
+            Assert.True(readbacks == 0, $"The taped scatter read {readbacks} buffers back to the host.");
+            Assert.Empty(GpuLaunchProbe.Fallbacks);
+            var expected = new CpuEngine().TensorScatter(
+                new Tensor<float>(Enumerable.Range(0, 36).Select(i => i * 0.5f).ToArray(), shape), indices,
+                new Tensor<float>(Enumerable.Range(0, 24).Select(i => 10f + i).ToArray(), new[] { 2, 4, 3 }), 1);
+            Assert.Equal(expected.ToArray(), y.ToArray());
+        }
+        finally
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = previous;
+        }
     }
 
     private static (float[] Y, float[] GradDestination, float[] GradSource) Run(
