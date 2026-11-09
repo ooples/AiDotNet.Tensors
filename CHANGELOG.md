@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.149.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.148.1...v0.149.0) (2026-11-09)
+
+
+### Features
+
+* **engine:** report whether the current engine is the caller's choice ([#1695](https://github.com/ooples/AiDotNet.Tensors/issues/1695)) ([838ddce](https://github.com/ooples/AiDotNet.Tensors/commit/838ddce76c06501690fd457c8afdf1e141ecf5eb))
+
+
+### Bug Fixes
+
+* **ci:** print hung test host stacks and stop gc pauses tripping wgsl translation ([#1690](https://github.com/ooples/AiDotNet.Tensors/issues/1690)) ([c3fe3a1](https://github.com/ooples/AiDotNet.Tensors/commit/c3fe3a1fae1b6968390d97d2b80b3c0417fd92bd))
+* **simd:** extend FastExpDouble256 Taylor expansion to degree 13 (&lt;0.5 ULP across +-ln2/2) ([#1692](https://github.com/ooples/AiDotNet.Tensors/issues/1692)) ([3ff6e9c](https://github.com/ooples/AiDotNet.Tensors/commit/3ff6e9c51bf1b98da00ba3d6f970d67bf7228621))
+
+
+### Performance
+
+* **gpu:** collect dead step results inside an open tape past 256 MB ([#1693](https://github.com/ooples/AiDotNet.Tensors/issues/1693)) ([8e8d8a1](https://github.com/ooples/AiDotNet.Tensors/commit/8e8d8a1b98080413d2e8a0aeccab2921e927cb29))
+* **gpu:** fused linear-CE index forward in row chunks over backend GEMMs (44% of an LM step) ([#1691](https://github.com/ooples/AiDotNet.Tensors/issues/1691)) ([9556d47](https://github.com/ooples/AiDotNet.Tensors/commit/9556d47d3f9973cf31566d5b7af859ee17a43573))
+
 ## [0.148.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.148.0...v0.148.1) (2026-11-07)
 
 
