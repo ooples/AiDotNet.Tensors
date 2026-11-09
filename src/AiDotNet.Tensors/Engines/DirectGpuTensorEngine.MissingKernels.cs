@@ -6149,6 +6149,12 @@ public partial class DirectGpuTensorEngine
     internal static int LastFusedCeForwardChunks;
 
     /// <summary>
+    /// Set when the chunked forward threw a resource or capability failure and the fused kernel ran instead; a test
+    /// expecting chunks reads it to tell that supported fallback from a chunking regression. Tests reset it.
+    /// </summary>
+    internal static bool LastFusedCeForwardChunkedDeclined;
+
+    /// <summary>
     /// The index-target fused linear + cross-entropy FORWARD in row chunks: per chunk of rows, logits = h_c·W + b
     /// (a backend GEMM), minus each row's max (a rank-1 GEMM), then lse_r = log(sum exp) and the shifted target logit
     /// (a gather); ones-vector GEMMs accumulate sum(lse_r - target_r) across chunks (beta = 1 after the first), and the

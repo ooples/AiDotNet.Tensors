@@ -143,7 +143,8 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
             c.Execute(args);
             return true;
         }
-        catch (Exception ex) when (ex is not OutOfMemoryException && !IsReference(c))
+        catch (Exception ex) when (ex is not OutOfMemoryException && ex is not Engines.DirectGpu.GpuOutOfMemoryException
+            && !IsReference(c))
         {
             // A tuned candidate failed where the reference would not: retire it, drop the decisions that chose it,
             // and let the caller run its own reference path for this call.
@@ -152,9 +153,10 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
         }
         catch (Engines.DirectGpu.GpuOutOfMemoryException ex)
         {
-            // The reference itself ran out of device memory (an im2col reference's column buffer): the caller's own path
-            // (a direct kernel with no scratch) still runs. Nothing is retired; a later call with memory free uses it.
-            System.Diagnostics.Trace.TraceWarning($"Tuned kernel reference {c.Id} for {Op} ran out of device memory: {ex.Message}");
+            // The candidate ran out of device memory (an im2col reference's column buffer, a tuned candidate's
+            // scratch): the caller's own path (a direct kernel with no scratch) still runs. Running out is transient, so
+            // nothing is retired and no decision is dropped; a later call with memory free uses the candidate again.
+            System.Diagnostics.Trace.TraceWarning($"Tuned kernel {c.Id} for {Op} ran out of device memory: {ex.Message}");
             return false;
         }
     }

@@ -60,6 +60,7 @@ public sealed class TunedKernelRegistryTests : IDisposable
         }
         public float Value { get; set; }
         public bool ThrowOnExecute { get; set; }
+        public bool OutOfDeviceMemoryOnExecute { get; set; }
         public string Id { get; }
         public TunedKernelOrigin Origin => TunedKernelOrigin.Generated;
         public bool IsDeterministic { get; }
@@ -71,6 +72,8 @@ public sealed class TunedKernelRegistryTests : IDisposable
         {
             Executions++;
             if (ThrowOnExecute) throw new InvalidOperationException(Id + " failed at dispatch");
+            if (OutOfDeviceMemoryOnExecute)
+                throw new AiDotNet.Tensors.Engines.DirectGpu.GpuOutOfMemoryException(Id + " scratch did not fit", 2);
             for (int i = 0; i < args.Output.Length; i++) args.Output[i] = Value + i;
         }
     }
@@ -162,6 +165,26 @@ public sealed class TunedKernelRegistryTests : IDisposable
         Assert.Equal("ref", decision.CandidateId);
         Assert.Contains(decision.Rejected, r => r.StartsWith("fast:", StringComparison.Ordinal));
         Assert.True(slot.TryExecute(Shape(), NewArgs()));
+    }
+
+    // Running out of device memory is transient: the caller's own path runs this time, and the candidate is neither
+    // retired nor dropped, so the next call with memory free takes the faster route again.
+    [Fact]
+    public void ACachedTunedCandidateThatRunsOutOfDeviceMemory_IsKept_AndRunsAgainOnceMemoryIsFree()
+    {
+        var reference = new Fake("ref", 1f, 1.0);
+        var fast = new Fake("fast", 1f, 0.5);
+        var slot = Slot(new Harness(), false, reference, fast);
+        Assert.Same(fast, slot.Resolve(Shape(), NewArgs()));
+
+        fast.OutOfDeviceMemoryOnExecute = true;
+        Assert.False(slot.TryExecute(Shape(), NewArgs()));
+        Assert.Equal("fast", Assert.Single(slot.CachedDecisions).CandidateId);
+
+        fast.OutOfDeviceMemoryOnExecute = false;
+        int before = fast.Executions;
+        Assert.True(slot.TryExecute(Shape(), NewArgs()));
+        Assert.Equal(before + 1, fast.Executions);
     }
 
     [Fact]

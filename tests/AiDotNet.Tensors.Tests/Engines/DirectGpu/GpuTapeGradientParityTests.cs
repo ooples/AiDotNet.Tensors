@@ -1033,7 +1033,11 @@ public class GpuTapeGradientParityTests : IDisposable
         {
             float cpu = new CpuEngine().FusedLinearCrossEntropyWithLogits(ChunkHidden, ChunkWeight, ChunkBias, ChunkTargetIds).ToArray()[0];
             DirectGpuTensorEngine.LastFusedCeForwardChunks = 0;
+            DirectGpuTensorEngine.LastFusedCeForwardChunkedDeclined = false;
             float device = gpu.FusedLinearCrossEntropyWithLogits(ChunkHidden, ChunkWeight, ChunkBias, ChunkTargetIds).ToArray()[0];
+            // A device without room for the chunk scratch takes the supported fused-kernel fallback: no chunks to count.
+            Skip.If(DirectGpuTensorEngine.LastFusedCeForwardChunkedDeclined,
+                "The chunked forward declined on this device (scratch did not fit or a primitive is unavailable).");
             Assert.Equal(3, DirectGpuTensorEngine.LastFusedCeForwardChunks);
             Assert.True(!float.IsNaN(cpu) && !float.IsInfinity(cpu) && cpu > 1f, $"CPU loss {cpu} is not a usable reference.");
             Assert.True(Math.Abs(device - cpu) <= 1e-5 * Math.Abs(cpu), $"GPU loss {device} vs CPU {cpu}.");

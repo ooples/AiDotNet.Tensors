@@ -13661,12 +13661,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         targetIds.GetDataArray(), loss.Buffer, n, d, vocab);
                 }
                 catch (Exception ex) when (ex is GpuOutOfMemoryException or GpuBufferTooLargeException
-                    or OutOfMemoryException)
+                    or OutOfMemoryException or NotSupportedException)
                 {
-                    // Its scratch did not fit (out of memory, or a chunk over the per-allocation cap); the buffers it
-                    // did get were disposed as it threw. The fused kernel needs none of them.
+                    // Its scratch did not fit (out of memory, or a chunk over the per-allocation cap), or a primitive it
+                    // composes is unavailable on this backend (a HIP module that failed to load raises
+                    // GpuCapabilityUnavailableException, a NotSupportedException). The buffers it did get were disposed
+                    // as it threw, and the fused kernel needs none of them. Falling through to the outer catch instead
+                    // would compute the full [N, vocab] logits.
+                    LastFusedCeForwardChunkedDeclined = true;
                     System.Diagnostics.Trace.TraceWarning(
-                        $"[DirectGpuTensorEngine] Chunked fused-CE forward scratch did not fit ({ex.GetType().Name}: " +
+                        $"[DirectGpuTensorEngine] Chunked fused-CE forward could not run ({ex.GetType().Name}: " +
                         $"{ex.Message}); using the fused kernel.");
                 }
             }

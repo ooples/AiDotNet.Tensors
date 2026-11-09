@@ -2035,8 +2035,16 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             ? new GpuOutOfMemoryException(message, (int)result)
             : new InvalidOperationException(message);
 
+    /// <summary>
+    /// When set, every device allocation requests this many bytes instead of its own size: a test sets it past the
+    /// device's memory so the driver itself refuses each request, and the allocators' real out-of-memory handling
+    /// (reclaim, retry, classification) runs without depending on what else holds device memory.
+    /// </summary>
+    internal static ulong? AllocationBytesOverrideForTests;
+
     private IntPtr AllocDeviceMemoryWithRetry(ulong byteSize)
     {
+        byteSize = AllocationBytesOverrideForTests ?? byteSize;
         var result = CuBlasNative.cuMemAlloc(out IntPtr devicePtr, byteSize);
         if (result == CudaResult.OutOfMemory)
         {
@@ -2204,6 +2212,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     // cuMemFreeAsync reclamations complete) and retry once before surfacing the error.
     private IntPtr AllocDeviceMemoryAsync(ulong byteSize)
     {
+        byteSize = AllocationBytesOverrideForTests ?? byteSize;
         var r = CuBlasNative.cuMemAllocAsync(out IntPtr p, byteSize, _mainStream);
         if (r != CudaResult.Success && IsStreamCapturing())
         {
