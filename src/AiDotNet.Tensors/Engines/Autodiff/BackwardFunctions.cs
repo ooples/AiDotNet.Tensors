@@ -9592,56 +9592,13 @@ internal static class BackwardFunctions<T>
     private static Tensor<T> RoIAlignBackwardImpl(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> boxes,
         int outH, int outW, float spatialScale, int samplingRatio, bool aligned)
     {
-        var numOps = MathHelper.GetNumericOperations<T>();
-        var gradInput = new Tensor<T>(input._shape);
         int N = input._shape[0], C = input._shape[1], H = input._shape[2], W = input._shape[3];
-        int K = boxes._shape[0];
-        using var goLease = gradOutput.Lease();
-        var go = goLease.Span;
-        using var bLease = boxes.Lease();
-        var b = bLease.Span;
-        using var giLease = gradInput.LeaseWritable();
-        var gi = giLease.Span;
-        double offset = aligned ? 0.5 : 0.0;
+        if (boxes._shape[0] == 0) return new Tensor<T>(input._shape);
 
-        for (int k = 0; k < K; k++)
-        {
-            int n = (int)numOps.ToDouble(b[k * 5]);
-            if (n < 0 || n >= N) continue;
-            double x1 = numOps.ToDouble(b[k * 5 + 1]) * spatialScale - offset;
-            double y1 = numOps.ToDouble(b[k * 5 + 2]) * spatialScale - offset;
-            double x2 = numOps.ToDouble(b[k * 5 + 3]) * spatialScale - offset;
-            double y2 = numOps.ToDouble(b[k * 5 + 4]) * spatialScale - offset;
-            double roiW = aligned ? (x2 - x1) : Math.Max(x2 - x1, 1.0);
-            double roiH = aligned ? (y2 - y1) : Math.Max(y2 - y1, 1.0);
-            double binH = roiH / outH;
-            double binW = roiW / outW;
-            int ry = samplingRatio > 0 ? samplingRatio : (int)Math.Ceiling(roiH / outH);
-            int rx = samplingRatio > 0 ? samplingRatio : (int)Math.Ceiling(roiW / outW);
-            if (ry < 1) ry = 1; if (rx < 1) rx = 1;
-            double gridArea = ry * rx;
-
-            for (int c = 0; c < C; c++)
-            {
-                int planeBase = (n * C + c) * H * W;
-                for (int ph = 0; ph < outH; ph++)
-                for (int pw = 0; pw < outW; pw++)
-                {
-                    double g = numOps.ToDouble(go[((k * C + c) * outH + ph) * outW + pw]) / gridArea;
-                    if (g == 0) continue;
-                    for (int iy = 0; iy < ry; iy++)
-                    {
-                        double sy = y1 + ph * binH + (iy + 0.5) * binH / ry;
-                        for (int ix = 0; ix < rx; ix++)
-                        {
-                            double sx = x1 + pw * binW + (ix + 0.5) * binW / rx;
-                            ScatterBilinear(gi, planeBase, sy, sx, H, W, g, numOps);
-                        }
-                    }
-                }
-            }
-        }
-        return gradInput;
+        // The forward's taps scattered back, parallel over channels so overlapping RoIs never race; see RoIAlignPlan.
+        var plan = RoIAlignPlan.Build(RoIAlignPlan.ReadBoxes(boxes), N, H, W, outH, outW, spatialScale, samplingRatio, aligned);
+        var gradInput = plan.Backward(RoIAlignPlan.ToDoubles(gradOutput), N, C, H * W);
+        return RoIAlignPlan.FromDoubles<T>(gradInput, input._shape);
     }
 
     private static void ScatterBilinear(Span<T> dst, int planeBase,
