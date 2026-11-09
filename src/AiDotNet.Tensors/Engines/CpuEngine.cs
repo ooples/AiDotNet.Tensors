@@ -42817,48 +42817,14 @@ public partial class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (k <= 0) throw new ArgumentException("k must be positive.", nameof(k));
 
-        var numOps = MathHelper.GetNumericOperations<T>();
         if (axis < 0) axis = tensor.Rank + axis;
 
         if (axis < 0 || axis >= tensor.Rank)
             throw new ArgumentOutOfRangeException(nameof(axis), $"Axis {axis} is out of range for a rank-{tensor.Rank} tensor.");
-
-        // Any rank, any axis: the k largest of every fibre along the axis, in descending order, with their positions.
-        int features = tensor._shape[axis];
-        k = Math.Min(k, features);
-        int outer = 1, inner = 1;
-        for (int d = 0; d < axis; d++) outer *= tensor._shape[d];
-        for (int d = axis + 1; d < tensor.Rank; d++) inner *= tensor._shape[d];
-        var outShape = (int[])tensor._shape.Clone();
-        outShape[axis] = k;
-        var resultValues = TensorAllocator.Rent<T>(outShape);
-        var indicesResult = new Tensor<int>(outShape);
-        var src = tensor.GetFlattenedData();
-        var dstValues = resultValues.GetDataArrayUnmarked();
-        var dstIndices = indicesResult.GetDataArrayUnmarked();
-        int kk = k;
-        CpuParallelSettings.ParallelForOrSerial(0, outer * inner, (long)outer * inner * features, f =>
-        {
-            int o = f / inner, i = f % inner;
-            var fibre = new (T value, int index)[features];
-            for (int a = 0; a < features; a++)
-                fibre[a] = (src[(o * features + a) * inner + i], a);
-            Array.Sort(fibre, (a, x) =>
-            {
-                if (numOps.GreaterThan(x.value, a.value)) return 1;
-                if (numOps.LessThan(x.value, a.value)) return -1;
-                return 0;
-            });
-            for (int j = 0; j < kk; j++)
-            {
-                int dst = (o * kk + j) * inner + i;
-                dstValues[dst] = fibre[j].value;
-                dstIndices[dst] = fibre[j].index;
-            }
-        });
-
-        indices = indicesResult;
-        return resultValues;
+        // Any rank and axis (torch.topk): k is clamped to the axis length, the largest values come first.
+        var (values, selected) = TopK(tensor, Math.Min(k, tensor._shape[axis]), axis, largest: true);
+        indices = selected;
+        return values;
     }
 
     /// <inheritdoc/>
@@ -43967,40 +43933,78 @@ public partial class CpuEngine : ITensorLevelEngine
         int innerSize = 1;
         for (int i = axis + 1; i < input._shape.Length; i++) innerSize *= input._shape[i];
 
-        // Process each "slice" along the axis
-        for (int outer = 0; outer < outerSize; outer++)
+        // One independent slice per (outer, inner) pair: select its k best with a size-k heap (O(n log k), the
+        // torch.topk shape of work) instead of sorting the whole axis, and run the slices in parallel. Output is
+        // sorted best-first; ties go to the lower index, so the result does not depend on the thread schedule.
+        int slices = outerSize * innerSize;
+        CpuParallelSettings.ParallelForOrSerial(0, slices, (long)slices * axisSize, slice =>
         {
-            for (int inner = 0; inner < innerSize; inner++)
+            int outer = slice / innerSize, inner = slice % innerSize;
+            int baseIndex = outer * axisSize * innerSize + inner;
+            var heapValues = new T[k];
+            var heapIndices = new int[k];
+            int count = 0;
+            for (int a = 0; a < axisSize; a++)
             {
-                // Extract values along axis
-                var axisValues = new (T value, int index)[axisSize];
-                for (int a = 0; a < axisSize; a++)
+                T v = inputData[baseIndex + a * innerSize];
+                if (count < k)
                 {
-                    int flatIndex = outer * axisSize * innerSize + a * innerSize + inner;
-                    axisValues[a] = (inputData[flatIndex], a);
+                    heapValues[count] = v; heapIndices[count] = a;
+                    TopKSiftUp(heapValues, heapIndices, count++, numOps, largest);
                 }
-
-                // Sort by value
-                if (largest)
+                else if (TopKBetter(v, a, heapValues[0], heapIndices[0], numOps, largest))
                 {
-                    Array.Sort(axisValues, (x, y) => numOps.Compare(y.value, x.value));
-                }
-                else
-                {
-                    Array.Sort(axisValues, (x, y) => numOps.Compare(x.value, y.value));
-                }
-
-                // Take top k
-                for (int i = 0; i < k; i++)
-                {
-                    int outputFlatIndex = outer * k * innerSize + i * innerSize + inner;
-                    valuesData[outputFlatIndex] = axisValues[i].value;
-                    indicesData[outputFlatIndex] = axisValues[i].index;
+                    heapValues[0] = v; heapIndices[0] = a;
+                    TopKSiftDown(heapValues, heapIndices, k, numOps, largest);
                 }
             }
-        }
+            // Pop worst-first into the tail so the output runs best-first.
+            for (int n = k; n > 0; n--)
+            {
+                int outputFlatIndex = outer * k * innerSize + (n - 1) * innerSize + inner;
+                valuesData[outputFlatIndex] = heapValues[0];
+                indicesData[outputFlatIndex] = heapIndices[0];
+                heapValues[0] = heapValues[n - 1]; heapIndices[0] = heapIndices[n - 1];
+                TopKSiftDown(heapValues, heapIndices, n - 1, numOps, largest);
+            }
+        }, deterministicSafe: true);
 
         return (values, indices);
+    }
+
+    // TopK heap: the root is the WORST kept element. "Better" = larger (smaller when !largest) value, ties to the lower index.
+    private static bool TopKBetter<T>(T v, int i, T w, int j, INumericOperations<T> ops, bool largest)
+    {
+        int c = ops.Compare(v, w);
+        if (c != 0) return largest ? c > 0 : c < 0;
+        return i < j;
+    }
+
+    private static void TopKSiftUp<T>(T[] values, int[] indices, int n, INumericOperations<T> ops, bool largest)
+    {
+        while (n > 0)
+        {
+            int parent = (n - 1) / 2;
+            if (!TopKBetter(values[parent], indices[parent], values[n], indices[n], ops, largest)) break;
+            (values[parent], values[n]) = (values[n], values[parent]);
+            (indices[parent], indices[n]) = (indices[n], indices[parent]);
+            n = parent;
+        }
+    }
+
+    private static void TopKSiftDown<T>(T[] values, int[] indices, int count, INumericOperations<T> ops, bool largest)
+    {
+        int n = 0;
+        while (true)
+        {
+            int l = 2 * n + 1, r = l + 1, worst = n;
+            if (l < count && TopKBetter(values[worst], indices[worst], values[l], indices[l], ops, largest)) worst = l;
+            if (r < count && TopKBetter(values[worst], indices[worst], values[r], indices[r], ops, largest)) worst = r;
+            if (worst == n) return;
+            (values[worst], values[n]) = (values[n], values[worst]);
+            (indices[worst], indices[n]) = (indices[n], indices[worst]);
+            n = worst;
+        }
     }
 
     /// <inheritdoc/>

@@ -1,0 +1,206 @@
+name: CI
+
+# One run per pull-request push (and per push to main): every check workflow is a job of this run, called
+# through workflow_call, so a superseded push is cancelled in one place instead of across twenty separate
+# runs. The called workflows keep their own schedules and manual dispatch. A path-filtered workflow runs only
+# when the changes job finds a matching file (.github/ci-path-filters.yml); the rest run on every push.
+#
+# Outside this run: release-please.yml (it cuts releases, not checks) and pr-title-lint.yml (it re-runs on
+# title edits, which must not restart the suites).
+
+on:
+  pull_request:
+    branches: [ main, master ]
+    # ready_for_review starts the CUDA lane when a draft is marked ready; draft pushes do not take the runner
+    # (see gpu-cuda-selfhosted.yml's job if).
+    types: [ opened, synchronize, reopened, ready_for_review ]
+  push:
+    branches: [ main, master ]
+
+# A newer push to a pull request cancels the superseded run. Pushes to main never cancel or queue behind one
+# another (each run has its own group): a cancelled main run uploads no coverage, and codecov then scores open
+# pull requests against an older base (see build.yml).
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    name: Changed paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      ptx-capsule: ${{ steps.filters.outputs.ptx-capsule }}
+      ptx-convolution: ${{ steps.filters.outputs.ptx-convolution }}
+      ptx-dense-linear: ${{ steps.filters.outputs.ptx-dense-linear }}
+      ptx-gather: ${{ steps.filters.outputs.ptx-gather }}
+      ptx-layout: ${{ steps.filters.outputs.ptx-layout }}
+      ptx-loss: ${{ steps.filters.outputs.ptx-loss }}
+      ptx-normalization: ${{ steps.filters.outputs.ptx-normalization }}
+      ptx-optimizer: ${{ steps.filters.outputs.ptx-optimizer }}
+      ptx-pooling: ${{ steps.filters.outputs.ptx-pooling }}
+      ptx-reduction: ${{ steps.filters.outputs.ptx-reduction }}
+      ptx-spectral: ${{ steps.filters.outputs.ptx-spectral }}
+      evolution-lifecycle: ${{ steps.filters.outputs.evolution-lifecycle }}
+      gemm-bench: ${{ steps.filters.outputs.gemm-bench }}
+      cuda: ${{ steps.filters.outputs.cuda }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          sparse-checkout: |
+            .github/ci-path-filters.yml
+            scripts/ci/ci-changed-filters.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - id: filters
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check 'pyyaml==6.0.2'
+          python3 scripts/ci/ci-changed-filters.py .github/ci-path-filters.yml
+
+  build:
+    name: Build and Test
+    uses: ./.github/workflows/build.yml
+    secrets: inherit
+
+  codeql:
+    name: CodeQL
+    uses: ./.github/workflows/codeql.yml
+    secrets: inherit
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+
+  dependency-review:
+    name: Dependency Review
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/dependency-review.yml
+    secrets: inherit
+
+  benchmark-claims:
+    name: Benchmark Claims
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/benchmark-claims.yml
+    secrets: inherit
+
+  parity:
+    name: PyTorch Parity
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/parity.yml
+    secrets: inherit
+
+  gpu-parity-pocl:
+    name: GPU Parity (POCL / CPU-OpenCL)
+    uses: ./.github/workflows/gpu-parity-pocl.yml
+    secrets: inherit
+
+  metal:
+    name: Metal (macOS, Apple GPU)
+    uses: ./.github/workflows/metal.yml
+    secrets: inherit
+
+  cuda:
+    name: GPU (CUDA, self-hosted)
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.cuda == 'true'
+    uses: ./.github/workflows/gpu-cuda-selfhosted.yml
+    secrets: inherit
+
+  evolution-lifecycle:
+    name: Evolution lifecycle source integration
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.evolution-lifecycle == 'true'
+    uses: ./.github/workflows/evolution-lifecycle.yml
+    secrets: inherit
+
+  gemm-bench:
+    name: GEMM small-M tiling bench
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.gemm-bench == 'true'
+    uses: ./.github/workflows/gemm-bench.yml
+    secrets: inherit
+
+  ptx-capsule:
+    name: Direct PTX Capsule Gate
+    needs: changes
+    if: needs.changes.outputs.ptx-capsule == 'true'
+    uses: ./.github/workflows/direct-ptx-capsule-gate.yml
+    secrets: inherit
+
+  ptx-convolution:
+    name: Direct PTX Convolution Gate
+    needs: changes
+    if: needs.changes.outputs.ptx-convolution == 'true'
+    uses: ./.github/workflows/direct-ptx-convolution-gate.yml
+    secrets: inherit
+
+  ptx-dense-linear:
+    name: Direct PTX Dense Linear Gate
+    needs: changes
+    if: needs.changes.outputs.ptx-dense-linear == 'true'
+    uses: ./.github/workflows/direct-ptx-dense-linear-gate.yml
+    secrets: inherit
+
+  ptx-gather:
+    name: Direct PTX Gather Gate
+    needs: changes
+    if: needs.changes.outputs.ptx-gather == 'true'
+    uses: ./.github/workflows/direct-ptx-gather-gate.yml
+    secrets: inherit
+
+  ptx-layout:
+    name: Direct PTX Layout Gate
+    needs: changes
+    if: needs.changes.outputs.ptx-layout == 'true'
+    uses: ./.github/workflows/direct-ptx-layout-gate.yml
+    secrets: inherit
+
+  ptx-loss:
+    name: Direct PTX Loss Gate
+    needs: changes
+    if: needs.changes.outputs.ptx-loss == 'true'
+    uses: ./.github/workflows/direct-ptx-loss-gate.yml
+    secrets: inherit
+
+  ptx-normalization:
+    name: Direct PTX Normalization Offline Gate
+    needs: changes
+    if: needs.changes.outputs.ptx-normalization == 'true'
+    uses: ./.github/workflows/direct-ptx-normalization-offline-gate.yml
+    secrets: inherit
+
+  ptx-optimizer:
+    name: Direct PTX Optimizer Gate
+    needs: changes
+    if: needs.changes.outputs.ptx-optimizer == 'true'
+    uses: ./.github/workflows/direct-ptx-optimizer-gate.yml
+    secrets: inherit
+
+  ptx-pooling:
+    name: Direct PTX Pooling Gate
+    needs: changes
+    if: needs.changes.outputs.ptx-pooling == 'true'
+    uses: ./.github/workflows/direct-ptx-pooling-gate.yml
+    secrets: inherit
+
+  ptx-reduction:
+    name: Direct PTX Reduction Gate
+    needs: changes
+    if: needs.changes.outputs.ptx-reduction == 'true'
+    uses: ./.github/workflows/direct-ptx-reduction-gate.yml
+    secrets: inherit
+
+  ptx-spectral:
+    name: Direct PTX Spectral Gate
+    needs: changes
+    if: needs.changes.outputs.ptx-spectral == 'true'
+    uses: ./.github/workflows/direct-ptx-spectral-gate.yml
+    secrets: inherit

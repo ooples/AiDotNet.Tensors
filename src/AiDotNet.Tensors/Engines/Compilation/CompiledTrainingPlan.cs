@@ -26,7 +26,7 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 ///
 /// This REPLACES the GradientTape for compiled workloads.
 /// </summary>
-internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompiledTrainingPlanIntrospection<T>, ICompiledTrainingPlanStreamedState, IPingPongOwner, INonFiniteGradientPolicyTarget
+internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompiledTrainingPlanIntrospection<T>, ICompiledTrainingPlanStreamedState, ICompiledTrainingPlanRegularizationOrder, IPingPongOwner, INonFiniteGradientPolicyTarget
 {
     // Phase G.4: mutable so EnableFrozenWeightOptimizations() can swap in
     // a rebuilt forward-action array using allowCachedB=true.
@@ -3034,13 +3034,21 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// independently — both paths agree when given the same threshold.
     /// </remarks>
     private float _l2Regularization;
+    private GradientRegularizationOrder _l2Order = GradientRegularizationOrder.RegularizeThenClip;
 
     /// <inheritdoc/>
     public void SetL2Regularization(double strength)
+        => SetL2Regularization(strength, GradientRegularizationOrder.RegularizeThenClip);
+
+    /// <inheritdoc/>
+    public void SetL2Regularization(double strength, GradientRegularizationOrder order)
     {
         if (double.IsNaN(strength) || double.IsInfinity(strength) || strength < 0)
             throw new ArgumentOutOfRangeException(nameof(strength), strength, "L2 strength must be finite and >= 0.");
+        if (order != GradientRegularizationOrder.RegularizeThenClip && order != GradientRegularizationOrder.ClipThenRegularize)
+            throw new ArgumentOutOfRangeException(nameof(order), order, "Unknown gradient regularization order.");
         _l2Regularization = (float)strength;
+        _l2Order = order;
         RetireCapturedOptimizerIfIneligible();
     }
 
@@ -3080,6 +3088,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             RestoreFusedOptimizerCheckpoint(checkpoint, sourceState.Schedules);
         }
         _l2Regularization = source._l2Regularization;
+        _l2Order = source._l2Order;
         RetireCapturedOptimizerIfIneligible();
     }
 
@@ -3243,7 +3252,20 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (--group.Members == 0) group.Release();
     }
 
-    // grad += strength * param for every parameter, before clipping (see SetL2Regularization). On the device when both
+    // The step's gradient post-processing ahead of the optimizer: the L2 term and the global-norm clip, in the order
+    // SetL2Regularization chose. The GPU-resident clip scales the device grad buffers in place with no host read, so
+    // clipping stays correct on the resident / captured path (the CPU clip throws on GPU-resident grads); the CPU clip
+    // covers CPU-resident and non-CUDA grads.
+    private void RegularizeAndClipGradients()
+    {
+        bool afterClip = _l2Order == GradientRegularizationOrder.ClipThenRegularize;
+        if (!afterClip) ApplyL2Regularization();
+        if (_maxGradNorm > 0.0 && !TryClipGradientsGlobalL2Gpu(_gradients, _maxGradNorm))
+            ClipGradientsGlobalL2(_gradients, _maxGradNorm);
+        if (afterClip) ApplyL2Regularization();
+    }
+
+    // grad += strength * param for every parameter (see SetL2Regularization). On the device when both
     // the gradient and the parameter are resident (the captured / resident path) - one launch per parameter - else on
     // the host arrays the optimizer binds.
     private void ApplyL2Regularization()
@@ -3901,9 +3923,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // capture step. Its kernels enqueue (in order) after the graph launch.
                     // GPU-resident grad clip (if enabled): scales the device grad buffers in place on the
                     // compute stream — ordered after the captured backward, before the optimizer reads them.
-                    ApplyL2Regularization();
-                    if (_maxGradNorm > 0.0 && !TryClipGradientsGlobalL2Gpu(_gradients, _maxGradNorm))
-                        ClipGradientsGlobalL2(_gradients, _maxGradNorm);
+                    RegularizeAndClipGradients();
                     CommitHostOptimizerGradients();
                     InvokeOptimizerUpdate();
                     return _lossOutput;
@@ -3932,9 +3952,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     capturedReplay.AfterReplay?.Invoke();   // the graph ran the update
                     return _lossOutput;
                 }
-                ApplyL2Regularization();
-                if (_maxGradNorm > 0.0 && !TryClipGradientsGlobalL2Gpu(_gradients, _maxGradNorm))
-                    ClipGradientsGlobalL2(_gradients, _maxGradNorm);
+                RegularizeAndClipGradients();
                 CommitHostOptimizerGradients();
                 InvokeOptimizerUpdate();
                 return _lossOutput;
@@ -3982,9 +4000,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     ran = true;
                     _residentBodyRanLast = true;
                     RefreshLossFromCapturedGraph(gte);
-                    ApplyL2Regularization();   // before clipping, as the eager and graph steps order it
-                    if (_maxGradNorm > 0.0 && !TryClipGradientsGlobalL2Gpu(_gradients, _maxGradNorm))
-                        ClipGradientsGlobalL2(_gradients, _maxGradNorm);
+                    RegularizeAndClipGradients();   // in the order the eager and graph steps use
                     CommitHostOptimizerGradients();
                     InvokeOptimizerUpdate();
                     return _lossOutput;
@@ -5062,16 +5078,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // every traced tensor) and not using arr.Length (which is the
         // pool-padded backing-array length whose tail bytes Array.Clear
         // leaves uninitialised).
-        ApplyL2Regularization();   // before clipping, as the flat optimizer path orders it
-        if (_maxGradNorm > 0.0)
-        {
-            // Prefer the fully GPU-resident clip when grads are CUDA-resident — it scales the device grad
-            // buffers in place with no host read, so clipping stays correct on the resident/captured path
-            // (the CPU ClipGradientsGlobalL2 throws on GPU-resident grads). Falls back to the CPU clip for
-            // CPU-resident / non-CUDA grads.
-            if (!TryClipGradientsGlobalL2Gpu(_gradients, _maxGradNorm))
-                ClipGradientsGlobalL2(_gradients, _maxGradNorm);
-        }
+        RegularizeAndClipGradients();
 
         if (bwdProbe != null) bwdProbe("BEGIN-OPT");
         // Fused optimizer update (if configured via ConfigureOptimizer)

@@ -12,19 +12,10 @@ name: GEMM small-M tiling bench (#653)
 # still validates the NO-REGRESSION gate.
 
 on:
-  # Auto no-regression gate: runs on PRs that touch the GEMM kernel or the bench
-  # itself. On the default ubuntu-latest runner the small-M lever no-ops (the
-  # shapes aren't under-tiled at <=~8 cores), so ON and OFF exercise the same
-  # code path and the gate is a stable identical-code A/B. Point GEMM_BENCH_RUNNER
-  # at a many-core runner (and use workflow_dispatch) to also validate the WIN.
-  pull_request:
-    paths:
-      - 'src/AiDotNet.Tensors/Engines/Simd/SimdGemm.cs'
-      - 'src/AiDotNet.Tensors/Engines/BlasManaged/**'
-      - 'tools/ConvParallelProbe/**'
-      # The probe reads internals: this file's InternalsVisibleTo list decides whether it compiles.
-      - 'src/AiDotNet.Tensors/AiDotNet.Tensors.csproj'
-      - '.github/workflows/gemm-bench.yml'
+  # Pull requests and pushes run this workflow through ci.yml, so each push is one CI run with one cancel
+  # point. ci.yml's changes job applies this workflow's path filter (gemm-bench in
+  # .github/ci-path-filters.yml).
+  workflow_call:
   workflow_dispatch:
     inputs:
       maxdop:
@@ -45,7 +36,9 @@ on:
         default: '0.10'
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Pull-request runs share a group per ref; any other run (a push to main, a schedule) gets its own, so main
+  # runs never cancel or replace one another and every push to main produces its results and coverage.
+  group: gemm-bench-${{ (github.event_name == 'pull_request' && github.ref || github.run_id) }}
   cancel-in-progress: true
 
 env:

@@ -1,28 +1,16 @@
 name: Direct PTX Convolution Gate
 
 on:
-  pull_request:
-    branches: [master, main]
-    paths:
-      - '.github/workflows/direct-ptx-convolution-gate.yml'
-      - 'src/AiDotNet.Tensors/AiDotNet.Tensors.csproj'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/DirectPtxCubinArtifact.cs'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/PtxFusedConv2DNchwK1Kernel.cs'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/Artifacts/**'
-      - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxConvolutionArtifactTool.cs'
-      - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxSassAuditTool.cs'
-      - 'tests/AiDotNet.Tensors.Benchmarks/Program.cs'
-  push:
-    branches: [master, main]
-    paths:
-      - '.github/workflows/direct-ptx-convolution-gate.yml'
-      - 'src/AiDotNet.Tensors/Engines/DirectGpu/CUDA/Ptx/**'
-      - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxConvolutionArtifactTool.cs'
-      - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxSassAuditTool.cs'
+  # Pull requests and pushes run this workflow through ci.yml, so each push is one CI run with one cancel
+  # point. ci.yml's changes job applies this workflow's path filter (ptx-convolution in
+  # .github/ci-path-filters.yml).
+  workflow_call:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Pull-request runs share a group per ref; any other run (a push to main, a schedule) gets its own, so main
+  # runs never cancel or replace one another and every push to main produces its results and coverage.
+  group: direct-ptx-convolution-gate-${{ (github.event_name == 'pull_request' && github.ref || github.run_id) }}
   cancel-in-progress: true
 
 env:
