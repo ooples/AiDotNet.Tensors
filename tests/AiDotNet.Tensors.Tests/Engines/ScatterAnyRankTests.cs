@@ -102,4 +102,84 @@ public sealed class ScatterAnyRankTests
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             eng.TensorScatter(dst, new Tensor<int>(new[] { 0, 1 }, new[] { 2, 1 }), new Tensor<float>(new[] { 2, 1 }), 2));
     }
+
+    [Fact]
+    public void Repeated_index_keeps_the_last_write_and_only_it_gets_the_gradient()
+    {
+        var eng = new CpuEngine();
+        var dst = new Tensor<double>(new[] { 1, 3 }, new Vector<double>(new[] { 1.0, 2.0, 3.0 }));
+        var idx = new Tensor<int>(new[] { 0, 0 }, new[] { 1, 2 });
+        var src = new Tensor<double>(new[] { 1, 2 }, new Vector<double>(new[] { 5.0, 7.0 }));
+        var w = new Tensor<double>(new[] { 1, 3 }, new Vector<double>(new[] { 2.0, 3.0, 4.0 }));
+        Tensor<double> y;
+        System.Collections.Generic.Dictionary<Tensor<double>, Tensor<double>> g;
+        using (var tape = new GradientTape<double>())
+        {
+            y = eng.TensorScatter(dst, idx, src, 1);
+            g = tape.ComputeGradients(eng.ReduceSum(eng.TensorMultiply(y, w), null, keepDims: false), new[] { dst, src });
+        }
+        // torch.scatter: the second write to slot 0 wins, so the first source element is overwritten and gets no
+        // gradient; slot 0 of the destination is overwritten too.
+        Assert.Equal(new[] { 7.0, 2.0, 3.0 }, y.ToArray());
+        Assert.Equal(new[] { 0.0, 2.0 }, g[src].ToArray());
+        Assert.Equal(new[] { 0.0, 3.0, 4.0 }, g[dst].ToArray());
+    }
+
+    [Fact]
+    public void TopK_routes_the_gradient_to_the_selected_positions()
+    {
+        var eng = new CpuEngine();
+        var x = new Tensor<double>(new[] { 2, 3 }, new Vector<double>(new[] { 3.0, 1.0, 2.0, 0.5, 4.0, 6.0 }));
+        var w = new Tensor<double>(new[] { 2, 2 }, new Vector<double>(new[] { 10.0, 20.0, 30.0, 40.0 }));
+        Tensor<double> values;
+        System.Collections.Generic.Dictionary<Tensor<double>, Tensor<double>> g;
+        using (var tape = new GradientTape<double>())
+        {
+            (values, _) = eng.TopK(x, 2, axis: 1);
+            g = tape.ComputeGradients(eng.ReduceSum(eng.TensorMultiply(values, w), null, keepDims: false), new[] { x });
+        }
+        Assert.Equal(new[] { 3.0, 2.0, 6.0, 4.0 }, values.ToArray());
+        Assert.Equal(new[] { 10.0, 0.0, 20.0, 0.0, 40.0, 30.0 }, g[x].ToArray());
+    }
+
+    [Fact]
+    public void Scatter_and_scatter_add_reject_values_of_the_wrong_shape()
+    {
+        var eng = new CpuEngine();
+        var input = new Tensor<float>(new[] { 4, 3 });
+        var indices = new Tensor<int>(new[] { 0, 2 }, new[] { 2 });
+        // Two rows of 3 are expected; [3, 2] has the right element count but the wrong shape.
+        Assert.Throws<ArgumentException>(() => eng.Scatter(input, indices, new Tensor<float>(new[] { 3, 2 }), 0));
+        Assert.Throws<ArgumentException>(() => eng.ScatterAdd(input, indices, new Tensor<float>(new[] { 3, 2 }), 0));
+        Assert.Throws<ArgumentException>(() => eng.Scatter(input, indices, new Tensor<float>(new[] { 6 }), 0));
+        Assert.Equal(new[] { 4, 3 }, eng.Scatter(input, indices, new Tensor<float>(new[] { 2, 3 }), 0).Shape.ToArray());
+    }
+
+    [Fact]
+    public void Set_slice_rejects_a_source_that_is_not_the_slice()
+    {
+        var eng = new CpuEngine();
+        var dst = new Tensor<float>(new[] { 2, 3, 4 });
+        // A full-size source used to be copied as a flat prefix, writing the wrong elements on every axis but the last.
+        Assert.Throws<ArgumentException>(() => eng.TensorSetSliceAxis(dst, new Tensor<float>(new[] { 2, 3, 4 }), 1, 0));
+        Assert.Throws<ArgumentException>(() => eng.TensorSetSliceAxis(dst, new Tensor<float>(new[] { 4, 2 }), 1, 0));
+        var slice = new Tensor<float>(Enumerable.Range(1, 8).Select(i => (float)i).ToArray(), new[] { 2, 4 });
+        eng.TensorSetSliceAxis(dst, slice, 1, 2);
+        // The slice's gradient keeps the axis as size 1; that is the same slice.
+        eng.TensorSetSliceAxis(dst, new Tensor<float>(slice.ToArray(), new[] { 2, 1, 4 }), 1, 0);
+        var d = dst.ToArray();
+        Assert.Equal(new float[] { 1, 2, 3, 4, 0, 0, 0, 0, 1, 2, 3, 4 }, d.Take(12).ToArray());
+        Assert.Equal(new float[] { 5, 6, 7, 8, 0, 0, 0, 0, 5, 6, 7, 8 }, d.Skip(12).ToArray());
+    }
+
+    [Fact]
+    public void Tensor_index_with_a_matrix_of_indices_keeps_the_index_shape()
+    {
+        var data = Enumerable.Range(0, 24).Select(i => (float)i).ToArray();
+        var t = new Tensor<float>(new[] { 3, 2, 4 }, new Vector<float>(data));
+        var picked = t[new Tensor<int>(new[] { 2, 0, 1, 2 }, new[] { 2, 2 })];
+        Assert.Equal(new[] { 2, 2, 2, 4 }, picked.Shape.ToArray());
+        var expected = new[] { 2, 0, 1, 2 }.SelectMany(r => data.Skip(r * 8).Take(8)).ToArray();
+        Assert.Equal(expected, picked.ToArray());
+    }
 }

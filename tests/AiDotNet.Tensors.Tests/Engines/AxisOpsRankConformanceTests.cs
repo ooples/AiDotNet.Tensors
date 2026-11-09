@@ -50,6 +50,7 @@ public sealed class AxisOpsRankConformanceTests
         ["GumbelSoftmax"] = "draws noise per element; the lifted call draws it in a different order",
         ["TensorCategoricalSample"] = "draws one sample per fibre; the lifted call draws them in a different order",
         ["TensorNormExceptDim"] = "reduces every axis but one; the lifted reshape changes which axes those are",
+        ["TensorUnsqueezeInPlace"] = "inserts an axis, so the result's rank follows the input's and has no rank-2 form",
     };
 
     private static readonly int[][] Shapes =
@@ -84,7 +85,19 @@ public sealed class AxisOpsRankConformanceTests
     /// <c>Cut</c> = the input's shape with the axis cut to 2.</summary>
     private enum Idx { None, Flat, Full, Cut }
 
-    private sealed record Plan(Idx Index, Sec Secondary);
+    private sealed class Plan
+    {
+        public Plan(Idx index, Sec secondary)
+        {
+            Index = index;
+            Secondary = secondary;
+        }
+
+        public Idx Index { get; }
+        public Sec Secondary { get; }
+
+        public override string ToString() => $"Plan {{ Index = {Index}, Secondary = {Secondary} }}";
+    }
 
     [Fact]
     public void Every_axis_op_that_runs_on_rank_2_runs_on_every_rank_and_matches_the_lifted_reference()
@@ -115,10 +128,18 @@ public sealed class AxisOpsRankConformanceTests
                 {
                     string where = $"{sig} rank {shape.Length} axis {ax} [{string.Join(",", shape)}]";
                     object?[] args;
+                    object?[] pristine;
                     object? actual;
                     try
                     {
                         args = BuildArgs(engine, m, fwd, shape, ax, plan);
+                        // An in-place op mutates args, so the lifted reference starts from a copy taken before the call.
+                        pristine = args.Select(a => a switch
+                        {
+                            Tensor<float> f => f.Clone(),
+                            Tensor<int> i => (object)i.Clone(),
+                            _ => a,
+                        }).ToArray();
                         actual = Invoke(engine, m, args);
                     }
                     catch (Exception e)
@@ -129,7 +150,7 @@ public sealed class AxisOpsRankConformanceTests
                     if (RunOnly.ContainsKey(def.Name) || !CanLift(m)) continue;
                     try
                     {
-                        var lifted = Lift(args, m, shape, ax, plan);
+                        var lifted = Lift(pristine, m, shape, ax, plan);
                         var expected = Unlift(Invoke(engine, m, lifted), shape, ax);
                         if (Compare(actual, expected) is { } diff)
                             failures.Add($"{where}: differs from the lifted rank-2 reference: {diff}");
@@ -249,6 +270,9 @@ public sealed class AxisOpsRankConformanceTests
     private static object? Invoke(IEngine engine, MethodInfo m, object?[] args)
     {
         var r = m.Invoke(engine, args);
+        // An in-place op (TensorCumSumInPlace) returns nothing: its result is the tensor it mutated, the first one.
+        if (m.ReturnType == typeof(void))
+            r = args.OfType<Tensor<float>>().FirstOrDefault();
         var outs = m.GetParameters().Where(p => p.IsOut).Select(p => args[p.Position]).ToList();
         return outs.Count == 0 ? r : new object?[] { r }.Concat(outs).ToArray();
     }
@@ -283,7 +307,7 @@ public sealed class AxisOpsRankConformanceTests
         if (fwd is not null)
         {
             var fps = fwd.GetParameters();
-            var fargs = BuildArgs(engine, fwd, null, shape, ax, plan with { Secondary = Sec.X });
+            var fargs = BuildArgs(engine, fwd, null, shape, ax, new Plan(plan.Index, Sec.X));
             fOut = FirstTensor(Invoke(engine, fwd, fargs));
             var fx = fps.Where(p => p.ParameterType == typeof(Tensor<float>)).Select(p => fargs[p.Position]).FirstOrDefault();
             if (fx is Tensor<float> t) x = t;
@@ -447,8 +471,18 @@ public sealed class AxisOpsRankConformanceTests
         if (!sa.SequenceEqual(se) && !(Prod(sa) == Prod(se) && (sa.Length <= 1 || se.Length <= 1 || sa[0] == 1 || se[0] == 1)))
             return $"shape [{string.Join(",", sa)}] vs lifted [{string.Join(",", se)}]";
         for (int i = 0; i < a.Length; i++)
+        {
+            // A NaN or an infinity fails every tolerance comparison, so it must match exactly: NaN with NaN, and an
+            // infinity with the same infinity.
+            if (double.IsNaN(a[i]) || double.IsNaN(e[i]) || double.IsInfinity(a[i]) || double.IsInfinity(e[i]))
+            {
+                if (!(double.IsNaN(a[i]) && double.IsNaN(e[i])) && !a[i].Equals(e[i]))
+                    return $"element {i}: {a[i]} vs lifted {e[i]}";
+                continue;
+            }
             if (Math.Abs(a[i] - e[i]) > 1e-4 * (1 + Math.Abs(e[i])))
                 return $"element {i}: {a[i]} vs lifted {e[i]}";
+        }
         return null;
     }
 }
