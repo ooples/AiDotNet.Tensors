@@ -13,3 +13,6 @@ TENS0005 | BackendParity | Error | BackendParityAnalyzer
 TENS0006 | BackendParity | Error | BackendParityAnalyzer
 TENS0007 | BackendParity | Error | BackendParityAnalyzer
 TENS0008 | BackendParity | Error | BackendParityAnalyzer
+TENS0010 | ElementWise | Error | ElementWiseAnalyzer
+TENS0011 | ElementWise | Error | ElementWiseAnalyzer
+TENS0012 | ElementWise | Error | ElementWiseAnalyzer
