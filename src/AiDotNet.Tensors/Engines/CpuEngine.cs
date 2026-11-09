@@ -42888,7 +42888,9 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         bool ok = values.Length == input.Length;
         for (int d = 0; ok && d < input.Length; d++)
+        {
             ok = values[d] == (d == axis ? indexCount : input[d]);
+        }
         if (!ok)
         {
             var expected = (int[])input.Clone();

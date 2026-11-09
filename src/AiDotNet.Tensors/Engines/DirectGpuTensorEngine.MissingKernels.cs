@@ -9328,7 +9328,7 @@ public partial class DirectGpuTensorEngine
         try
         {
             var contiguousInput = input.IsContiguous ? input : (Tensor<T>)input.Contiguous();
-            var contiguousIndices = indices.IsContiguous ? indices : (Tensor<int>)indices.Contiguous();
+            var contiguousIndices = indices.IsContiguous ? indices : indices.Contiguous();
             int axisSize = input.Shape._dims[normalizedAxis];
             int outerSize = 1;
             for (int i = 0; i < normalizedAxis; i++) outerSize *= input.Shape._dims[i];
@@ -9386,7 +9386,7 @@ public partial class DirectGpuTensorEngine
             for (int i = normalizedAxis + 1; i < input.Rank; i++) innerSize *= input.Shape._dims[i];
             if (values.Length != outerSize * indices.Length * innerSize)
                 return base.Scatter(input, indices, values, axis);
-            var contiguousIndices = indices.IsContiguous ? indices : (Tensor<int>)indices.Contiguous();
+            var contiguousIndices = indices.IsContiguous ? indices : indices.Contiguous();
             if (!HasResidentIndexStorage(contiguousIndices)
                 && Autodiff.BackwardFunctions<T>.OverwrittenIndexPositions(contiguousIndices.GetDataArray()).Length > 0)
                 return base.Scatter(input, indices, values, axis);   // duplicates: see TensorIndexCopy
@@ -9445,7 +9445,7 @@ public partial class DirectGpuTensorEngine
         int outer = 1; for (int k = 0; k < d; k++) outer *= destination._shape[k];
         int inner = 1; for (int k = d + 1; k < rank; k++) inner *= destination._shape[k];
         int n = destination.Length, m = indices.Length;
-        var ci = indices.IsContiguous ? indices : (Tensor<int>)indices.Contiguous();
+        var ci = indices.IsContiguous ? indices : indices.Contiguous();
         if (!HasResidentIndexStorage(ci))
         {
             // Host indices are validated here, as the host implementation does; device-resident ones are not read
@@ -9460,8 +9460,8 @@ public partial class DirectGpuTensorEngine
         var buffers = new List<IGpuBuffer>();
         try
         {
-            var cd = destination.IsContiguous ? destination : (Tensor<T>)destination.Contiguous();
-            var cs = source.IsContiguous ? source : (Tensor<T>)source.Contiguous();
+            var cd = destination.IsContiguous ? destination : destination.Contiguous();
+            var cs = source.IsContiguous ? source : source.Contiguous();
             using var destinationBuffer = GetOrAllocateBuffer(backend, cd);
             using var sourceBuffer = GetOrAllocateBuffer(backend, cs);
             using var int32Index = GetOrAllocateInt32IndexBuffer(backend, ci);
@@ -9566,7 +9566,7 @@ public partial class DirectGpuTensorEngine
         int inner = 1; for (int k = axis + 1; k < rank; k++) inner *= destinationShape[k];
         int n = outer * dstDim * inner, m = indices.Length;
         if (m == 0) return new Tensor<T>((int[])indices._shape.Clone());
-        var ci = indices.IsContiguous ? indices : (Tensor<int>)indices.Contiguous();
+        var ci = indices.IsContiguous ? indices : indices.Contiguous();
         var buffers = new List<IGpuBuffer>();
         try
         {
@@ -9612,7 +9612,7 @@ public partial class DirectGpuTensorEngine
         try
         {
             var contiguousPacked = packed.IsContiguous ? packed : (Tensor<byte>)packed.Contiguous();
-            var contiguousIndices = indices.IsContiguous ? indices : (Tensor<int>)indices.Contiguous();
+            var contiguousIndices = indices.IsContiguous ? indices : indices.Contiguous();
             int sourceAxis = packed.Shape._dims[normalizedAxis];
             if (!HasResidentIndexStorage(contiguousIndices))
             {
@@ -9667,7 +9667,7 @@ public partial class DirectGpuTensorEngine
         {
             var contiguousPacked = packed.IsContiguous ? packed : (Tensor<byte>)packed.Contiguous();
             var contiguousSource = source.IsContiguous ? source : (Tensor<byte>)source.Contiguous();
-            var contiguousIndices = indices.IsContiguous ? indices : (Tensor<int>)indices.Contiguous();
+            var contiguousIndices = indices.IsContiguous ? indices : indices.Contiguous();
             int destinationAxis = packed.Shape._dims[normalizedAxis];
             int sourceAxis = source.Shape._dims[normalizedAxis];
             if (sourceAxis != indices.Length)

@@ -3037,27 +3037,34 @@ internal static class BackwardFunctions<T>
         int count = shape[axis], outer = 1, inner = 1;
         for (int d = 0; d < axis; d++) outer *= shape[d];
         for (int d = axis + 1; d < shape.Length; d++) inner *= shape[d];
-        var index = indices.GetFlattenedData();
-        bool[]? overwritten = null;
-        var seen = new HashSet<int>();
-        for (int o = 0; o < outer; o++)
-        {
-            for (int i = 0; i < inner; i++)
-            {
-                seen.Clear();
-                for (int j = count - 1; j >= 0; j--)
-                {
-                    int flat = (o * count + j) * inner + i;
-                    if (!seen.Add(index[flat]))
-                        (overwritten ??= new bool[indices.Length])[flat] = true;
-                }
-            }
-        }
+        var overwritten = FindOverwrittenWrites(indices.GetFlattenedData(), indices.Length, outer, count, inner);
         if (overwritten is null) return null;
         var ops = MathHelper.GetNumericOperations<T>();
         var mask = new T[overwritten.Length];
         for (int p = 0; p < mask.Length; p++) mask[p] = overwritten[p] ? ops.Zero : ops.One;
         return new Tensor<T>(mask, (int[])shape.Clone());
+    }
+
+    /// <summary>
+    /// Marks each index entry that a later entry of its fibre overwrites (walking each fibre from its last write back);
+    /// null when no fibre repeats an index.
+    /// </summary>
+    private static bool[]? FindOverwrittenWrites(int[] index, int length, int outer, int count, int inner)
+    {
+        bool[]? overwritten = null;
+        var seen = new HashSet<int>();
+        for (int fibre = 0; fibre < outer * inner; fibre++)
+        {
+            int o = fibre / inner, i = fibre % inner;
+            seen.Clear();
+            for (int j = count - 1; j >= 0; j--)
+            {
+                int flat = (o * count + j) * inner + i;
+                if (!seen.Add(index[flat]))
+                    (overwritten ??= new bool[length])[flat] = true;
+            }
+        }
+        return overwritten;
     }
 
     /// <summary>
