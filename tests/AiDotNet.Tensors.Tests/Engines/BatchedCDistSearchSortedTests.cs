@@ -287,6 +287,22 @@ public sealed class BatchedCDistSearchSortedTests
     }
 
     [Fact]
+    public void Elementwise_losses_reject_targets_of_another_length()
+    {
+        // The kernels run over the predictions: a shorter target was read past its end (IndexOutOfRange).
+        var eng = new CpuEngine();
+        var p = new Tensor<float>(new[] { 2, 3, 4 }, new Vector<float>(Enumerable.Range(0, 24).Select(i => 0.1f * i).ToArray()));
+        var t = new Tensor<float>(new[] { 4 }, new Vector<float>(new[] { 0.1f, 0.2f, 0.3f, 0.4f }));
+        foreach (var (a, b) in new[] { (p, t), (t, p) })
+        {
+            Assert.Throws<ArgumentException>(() => eng.TensorMSELoss(a, b));
+            Assert.Throws<ArgumentException>(() => eng.TensorL1Loss(a, b));
+            Assert.Throws<ArgumentException>(() => eng.TensorHuberLoss(a, b));
+            Assert.Throws<ArgumentException>(() => eng.TensorBCEWithLogitsLoss(a, b));
+        }
+    }
+
+    [Fact]
     public void Losses_reject_inputs_with_dims_after_the_classes()
     {
         var eng = new CpuEngine();

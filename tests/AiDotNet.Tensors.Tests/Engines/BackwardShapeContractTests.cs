@@ -98,6 +98,8 @@ public sealed class BackwardShapeContractTests
     {
         var bad = Violations(new CpuEngine(), out int probed);
         _out.WriteLine($"probed {probed} backward ops; {bad.Count} violations");
+        // An empty sweep (a filter that matched nothing) would pass with no violations.
+        Assert.True(probed > 0, "The sweep probed no backward op.");
         foreach (var b in bad) _out.WriteLine("FAIL " + b);
         Assert.True(bad.Count == 0, $"{bad.Count} backward shape-contract violations:\n" + string.Join("\n", bad));
     }

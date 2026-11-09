@@ -47536,7 +47536,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> SigmoidBackward<T>(Tensor<T> gradOutput, Tensor<T> output)
     {
         ValidateElementwisePair("SigmoidBackward", gradOutput, output);
-        if (typeof(T) == typeof(float) && gradOutput.Length == output.Length)
+        if (typeof(T) == typeof(float))
         {
             unsafe
             {
@@ -47731,7 +47731,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TanhBackward<T>(Tensor<T> gradOutput, Tensor<T> output)
     {
         ValidateElementwisePair("TanhBackward", gradOutput, output);
-        if (typeof(T) == typeof(float) && gradOutput.Length == output.Length)
+        if (typeof(T) == typeof(float))
         {
             unsafe
             {
@@ -47959,8 +47959,6 @@ public partial class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> SwishBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
         ValidateElementwisePair("SwishBackward", gradOutput, input);
-        if (gradOutput.Length != input.Length)
-            throw new ArgumentException($"Shape mismatch: gradOutput length {gradOutput.Length} != input length {input.Length}");
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new T[gradOutput.Length];
         using var gDataLease = gradOutput.LeaseArray();
@@ -50048,6 +50046,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>MSE loss: mean((pred - target)^2). Returns scalar tensor for tape.</summary>
     public virtual Tensor<T> TensorMSELoss<T>(Tensor<T> predictions, Tensor<T> targets)
     {
+        // Elementwise over both: a shorter operand would be read past its end.
+        ValidateElementwisePair("TensorMSELoss", predictions, targets);
         if (GraphMode.IsActive)
         { var ac = AutoTracer.TryGetCompiledPlan<T>("MSELoss", predictions._shape); if (ac is not null) return ac.Execute(); }
 
@@ -50122,6 +50122,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>L1 loss: mean(|pred - target|). Returns scalar tensor for tape.</summary>
     public virtual Tensor<T> TensorL1Loss<T>(Tensor<T> predictions, Tensor<T> targets)
     {
+        // Elementwise over both: a shorter operand would be read past its end.
+        ValidateElementwisePair("TensorL1Loss", predictions, targets);
         if (GraphMode.IsActive)
         { var ac = AutoTracer.TryGetCompiledPlan<T>("L1Loss", predictions._shape); if (ac is not null) return ac.Execute(); }
 
@@ -50190,6 +50192,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>Huber loss: smooth L1 that transitions from L2 to L1 at delta=1.</summary>
     public virtual Tensor<T> TensorHuberLoss<T>(Tensor<T> predictions, Tensor<T> targets, double delta = 1.0)
     {
+        // Elementwise over both: a shorter operand would be read past its end.
+        ValidateElementwisePair("TensorHuberLoss", predictions, targets);
         if (GraphMode.IsActive)
         { var ac = AutoTracer.TryGetCompiledPlan<T>("HuberLoss", predictions._shape); if (ac is not null) return ac.Execute(); }
 
@@ -50276,6 +50280,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>BCE with logits: sigmoid cross-entropy loss.</summary>
     public virtual Tensor<T> TensorBCEWithLogitsLoss<T>(Tensor<T> logits, Tensor<T> targets)
     {
+        // Elementwise over both: a shorter operand would be read past its end.
+        ValidateElementwisePair("TensorBCEWithLogitsLoss", logits, targets);
         if (GraphMode.IsActive)
         { var ac = AutoTracer.TryGetCompiledPlan<T>("BCEWithLogitsLoss", logits._shape); if (ac is not null) return ac.Execute(); }
 

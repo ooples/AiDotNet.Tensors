@@ -191,6 +191,56 @@ public sealed class DeferredScopeReproTests
             gpu.Dispose();
         }
     }
+
+    /// <summary>
+    /// A batched cdist copies each batch's matrices into shared scratch (recorded copies) and runs one kernel per batch.
+    /// The kernel must replay between those copies: run at record time, it read scratch the copies had not filled and
+    /// every batch came back with the same, wrong distances.
+    /// </summary>
+    [SkippableFact]
+    public void DeferredScope_BatchedCDist_ReplaysEachBatchInOrder()
+    {
+        DirectGpuTensorEngine gpu;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch { Skip.If(true, "No GPU backend"); return; }
+        if (!gpu.IsGpuAvailable) { gpu.Dispose(); Skip.If(true, "No GPU available"); return; }
+
+        var previous = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = gpu;
+        try
+        {
+            static float[] Data(int n, int salt)
+            {
+                var d = new float[n];
+                for (int i = 0; i < n; i++) d[i] = 0.1f + ((i * 37 + salt * 11) % 101) / 101f * (1 + salt);
+                return d;
+            }
+            var x1 = new Tensor<float>(Data(3 * 4 * 5, 1), new[] { 3, 4, 5 });
+            var x2 = new Tensor<float>(Data(3 * 2 * 5, 2), new[] { 3, 2, 5 });
+            var expected = new CpuEngine().TensorCDist(x1, x2).ToArray();
+
+            var scope = gpu.BeginDeferredScope();
+            if (scope is null) { Skip.If(true, "Backend has no deferred execution"); return; }
+
+            float[] deferred;
+            using (scope)
+            {
+                var r = gpu.TensorCDist(x1, x2);
+                scope.Execute();
+                deferred = r.Contiguous().AsSpan().ToArray();
+            }
+
+            Assert.Equal(expected.Length, deferred.Length);
+            for (int i = 0; i < expected.Length; i++)
+                Assert.True(Math.Abs(expected[i] - deferred[i]) <= 1e-4f * (1 + Math.Abs(expected[i])),
+                    $"[{i}] cpu {expected[i]} vs deferred {deferred[i]}");
+        }
+        finally
+        {
+            AiDotNetEngine.Current = previous;
+            gpu.Dispose();
+        }
+    }
 }
 
 #endif

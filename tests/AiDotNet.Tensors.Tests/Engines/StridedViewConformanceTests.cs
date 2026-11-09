@@ -23,11 +23,9 @@ public sealed class StridedViewConformanceTests
 
     public StridedViewConformanceTests(ITestOutputHelper output) => _out = output;
 
-    private static readonly string[] NonDeterministic =
-    {
-        "Dropout", "Random", "Rand", "Noise", "Bernoulli", "Multinomial", "Sample", "Gumbel", "Uniform", "Normal",
-        "Shuffle", "Perturb", "Stochastic", "Poisson",
-    };
+    // The ops that draw random values, by exact name and shared with the GPU/CPU parity sweep: a substring match
+    // ("Normal", "Sample") also dropped deterministic ops such as NativeNormalizeRows and GridSample.
+    private static readonly HashSet<string> NonDeterministic = DirectGpu.TensorOpsGpuCpuParitySweepTests.NonDeterministic;
 
     private static readonly int[][] Shapes = { new[] { 3, 5 }, new[] { 2, 3, 4 }, new[] { 2, 3, 2, 3 } };
 
@@ -47,7 +45,7 @@ public sealed class StridedViewConformanceTests
                 return m.ReturnType == tensorT && tensors >= 1 && tensors <= 3
                     && ps.All(p => p.ParameterType == tensorT || IsAxis(p) || (p.HasDefaultValue && !p.ParameterType.IsByRef));
             })
-            .Where(m => !NonDeterministic.Any(n => m.Name.Contains(n)))
+            .Where(m => !NonDeterministic.Contains(m.Name))
             .Distinct()
             .OrderBy(m => m.Name);
 
@@ -113,7 +111,8 @@ public sealed class StridedViewConformanceTests
                 }
                 Tensor<T> expected;
                 try { expected = (Tensor<T>)m.Invoke(cpu, dense)!; }
-                catch { continue; } // the op does not take this shape
+                catch (Exception e) when (DirectGpu.TensorOpsGpuCpuParitySweepTests.RejectsArguments(e)) { continue; } // the op does not take this shape
+                catch (Exception e) { failures.Add($"{where}: failed on the contiguous copy: {Inner(e)}"); continue; }
                 ran = true;
                 Tensor<T> actual;
                 try { actual = (Tensor<T>)m.Invoke(cpu, views)!; }
@@ -144,6 +143,7 @@ public sealed class StridedViewConformanceTests
     {
         var failures = Sweep<float>(out int probed);
         _out.WriteLine($"float: probed {probed} ops; {failures.Count} failures");
+        Assert.True(probed > 0, "The sweep compared no op.");
         foreach (var f in failures) _out.WriteLine("FAIL " + f);
         Assert.True(failures.Count == 0, $"{failures.Count} layout-dependent results:\n" + string.Join("\n", failures));
     }
@@ -153,6 +153,7 @@ public sealed class StridedViewConformanceTests
     {
         var failures = Sweep<double>(out int probed);
         _out.WriteLine($"double: probed {probed} ops; {failures.Count} failures");
+        Assert.True(probed > 0, "The sweep compared no op.");
         foreach (var f in failures) _out.WriteLine("FAIL " + f);
         Assert.True(failures.Count == 0, $"{failures.Count} layout-dependent results:\n" + string.Join("\n", failures));
     }

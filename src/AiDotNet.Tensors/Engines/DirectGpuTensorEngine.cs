@@ -25659,6 +25659,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> TensorMSELoss<T>(Tensor<T> predictions, Tensor<T> targets)
     {
         using var __gpuOp = EnterGpuOp();
+        // The kernels run over the first operand's length: a shorter second operand would be read past its end.
+        ValidateElementwisePair("TensorMSELoss", predictions, targets);
         if (predictions is null) throw new ArgumentNullException(nameof(predictions));
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         // Composed from device ops the tape records -- mean((p - t)^2) = sum((p - t)^2) / n -- so the loss and its
@@ -25718,6 +25720,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> TensorL1Loss<T>(Tensor<T> predictions, Tensor<T> targets)
     {
         using var __gpuOp = EnterGpuOp();
+        // The kernels run over the first operand's length: a shorter second operand would be read past its end.
+        ValidateElementwisePair("TensorL1Loss", predictions, targets);
         if (IsTapeActive<T>()) return base.TensorL1Loss(predictions, targets);
         if (!TryGetBackend(out var backend))
             return base.TensorL1Loss(predictions, targets);
@@ -25742,6 +25746,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> TensorHuberLoss<T>(Tensor<T> predictions, Tensor<T> targets, double delta)
     {
         using var __gpuOp = EnterGpuOp();
+        // The kernels run over the first operand's length: a shorter second operand would be read past its end.
+        ValidateElementwisePair("TensorHuberLoss", predictions, targets);
         if (IsTapeActive<T>()) return base.TensorHuberLoss(predictions, targets, delta);
         if (!TryGetBackend(out var backend))
             return base.TensorHuberLoss(predictions, targets, delta);
@@ -25765,6 +25771,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> TensorBCEWithLogitsLoss<T>(Tensor<T> logits, Tensor<T> targets)
     {
         using var __gpuOp = EnterGpuOp();
+        // The kernels run over the first operand's length: a shorter second operand would be read past its end.
+        ValidateElementwisePair("TensorBCEWithLogitsLoss", logits, targets);
         // #775: the per-element BCE-with-logits kernel matches CpuEngine element-wise (the #775 loss is
         // clean cross-engine); the only mismatch was aggregation — CpuEngine returns the scalar mean.
         // Run the per-element kernel then reduce to the mean over all elements (ScalarMeanResult), same

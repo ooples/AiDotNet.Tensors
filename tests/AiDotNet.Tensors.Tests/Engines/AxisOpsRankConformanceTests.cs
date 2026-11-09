@@ -40,7 +40,6 @@ public sealed class AxisOpsRankConformanceTests
         ["TensorExpandDims"] = "inserts an axis: its valid axes run to rank, not rank - 1",
         ["TensorSqueeze"] = "removes a length-1 axis; the probe's axes are longer than 1",
         ["TensorSqueezeInPlace"] = "removes a length-1 axis; the probe's axes are longer than 1",
-        ["TensorUnsqueezeInPlace"] = "inserts an axis: its valid axes run to rank, not rank - 1",
         ["TensorUnflatten"] = "rewrites the shape; not an op along the axis",
         ["TensorUniqueDim"] = "the output length depends on the data",
     };

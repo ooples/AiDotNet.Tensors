@@ -33,7 +33,7 @@ public sealed class TensorOpsGpuCpuParitySweepTests : IClassFixture<DirectGpuTen
     /// Ops whose result is random by definition, by exact name: a substring match also dropped deterministic ops
     /// (NativeNormalizeRows, PixelShuffle, GridSample and the backwards of random ops).
     /// </summary>
-    private static readonly HashSet<string> NonDeterministic = new()
+    internal static readonly HashSet<string> NonDeterministic = new()
     {
         "Dropout", "GumbelSoftmax", "TensorAlphaDropout", "TensorBernoulli", "TensorCategoricalSample",
         "TensorChannelDropout", "TensorDropoutMask", "TensorFeatureAlphaDropout", "TensorLogNormal", "TensorMultinomial",
@@ -149,7 +149,7 @@ public sealed class TensorOpsGpuCpuParitySweepTests : IClassFixture<DirectGpuTen
     }
 
     /// <summary>The CPU engine's rejection of an input it does not take: an argument or shape error, not a fault.</summary>
-    private static bool RejectsArguments(Exception e)
+    internal static bool RejectsArguments(Exception e)
     {
         while (e is TargetInvocationException { InnerException: not null } t) e = t.InnerException;
         return e is ArgumentException or NotSupportedException or InvalidOperationException or RankException;
@@ -265,7 +265,8 @@ public sealed class TensorOpsGpuCpuParitySweepTests : IClassFixture<DirectGpuTen
                 string where = $"{def.Name} [{string.Join(",", sa)}]x[{string.Join(",", sb)}]";
                 Tensor<float> expected;
                 try { expected = (Tensor<float>)m.Invoke(cpu, MakeArgs())!; }
-                catch { continue; }
+                catch (Exception e) when (RejectsArguments(e)) { continue; }   // the op does not broadcast these shapes
+                catch (Exception e) { failures.Add($"{where}: the CPU failed: {Inner(e)}"); continue; }
                 ran = true;
                 Tensor<float> actual;
                 try { actual = (Tensor<float>)m.Invoke(gpu, MakeArgs())!; }
@@ -290,6 +291,7 @@ public sealed class TensorOpsGpuCpuParitySweepTests : IClassFixture<DirectGpuTen
         }
         _out.WriteLine($"broadcast: probed {probed} ops; {failures.Count} failures");
         foreach (var f in failures) _out.WriteLine("FAIL " + f);
+        Assert.True(probed > 0, "The broadcast sweep compared no op.");
         Assert.True(failures.Count == 0, $"{failures.Count} GPU/CPU broadcast mismatches:\n" + string.Join("\n", failures));
     }
 
@@ -300,6 +302,8 @@ public sealed class TensorOpsGpuCpuParitySweepTests : IClassFixture<DirectGpuTen
         Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
         var bad = BackwardShapeContractTests.Violations(_fixture.Engine!, out int probed);
         _out.WriteLine($"gpu: probed {probed} backward ops; {bad.Count} violations");
+        // An empty sweep (a filter that matched nothing) would pass with no violations.
+        Assert.True(probed > 0, "The sweep probed no backward op.");
         foreach (var b in bad) _out.WriteLine("FAIL " + b);
         Assert.True(bad.Count == 0, $"{bad.Count} GPU backward shape-contract violations:\n" + string.Join("\n", bad));
     }
