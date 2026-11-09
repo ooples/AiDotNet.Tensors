@@ -13616,9 +13616,28 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (n <= 0 || vocab <= 0 || weight.Shape._dims[0] != d || bias.Length != vocab || targetIds.Length != n)
             return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, targetIds);
 
+        // A captured graph replays the device work it recorded, not this call: host-backed ids uploaded now would be
+        // replayed as this batch's labels on every later step. Refusing the capture makes a compiled step fall back to
+        // eager execution, where every call uploads its own ids.
+        // Recording under a tape reads the ids on the host too (they are the backward's saved state), and that read
+        // would synchronize the capturing stream, so a taped call is refused the same way.
+        bool capturing = backend is IGpuGraphCapture capture && capture.IsStreamCapturing();
+        if (capturing && !HasResidentIndexStorage(targetIds))
+            throw new NotSupportedException(
+                "FusedLinearCrossEntropyWithLogits cannot be captured with host-backed target ids: replay would reuse " +
+                "the labels of the captured batch. Keep the ids resident on the device to capture this step.");
+        if (capturing && IsTapeActive<T>())
+            throw new NotSupportedException(
+                "FusedLinearCrossEntropyWithLogits cannot be captured while a gradient tape records: the backward " +
+                "saves the target ids on the host, and reading them would synchronize the capturing stream.");
+
         try
         {
-            if (!HasResidentIndexStorage(targetIds))
+            // The ids are validated on every eager call, resident ones too (one [N] int download): an invalid id must
+            // throw, not reach a kernel that never checks it and returns an infinite loss. A capture cannot read them
+            // (the read would synchronize the capturing stream, and a replay never runs this check), so captured
+            // resident ids are the caller's to keep in range.
+            if (!capturing)
             {
                 using var idsLease = targetIds.LeaseArray();
                 var ids = idsLease.Array;
@@ -13630,10 +13649,37 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var hB = GetOrAllocateBuffer(backend, hidden);
             using var wB = GetOrAllocateBuffer(backend, weight);
             using var bB = GetOrAllocateBuffer(backend, bias);
-            using var tB = GetOrAllocateBuffer(backend, targetIds);
             using var loss = AllocateOutputBuffer(backend, 1);
-            backend.FusedLinearCrossEntropyIndex(
-                hB.Buffer, wB.Buffer, bB.Buffer, tB.Buffer, loss.Buffer, n, d, vocab);
+            // The chunked forward builds its gather positions on the host, so it never runs inside a capture (the upload
+            // would be baked into the graph). An eager call has already read the ids for validation above.
+            bool chunked = false;
+            if (!capturing)
+            {
+                try
+                {
+                    chunked = TryFusedLinearCrossEntropyIndexForwardChunked(backend, hB.Buffer, wB.Buffer, bB.Buffer,
+                        targetIds.GetDataArray(), loss.Buffer, n, d, vocab);
+                }
+                catch (Exception ex) when (ex is GpuOutOfMemoryException or GpuBufferTooLargeException
+                    or OutOfMemoryException or NotSupportedException)
+                {
+                    // Its scratch did not fit (out of memory, or a chunk over the per-allocation cap), or a primitive it
+                    // composes is unavailable on this backend (a HIP module that failed to load raises
+                    // GpuCapabilityUnavailableException, a NotSupportedException). The buffers it did get were disposed
+                    // as it threw, and the fused kernel needs none of them. Falling through to the outer catch instead
+                    // would compute the full [N, vocab] logits.
+                    RecordFusedCeForwardChunkedDeclined();
+                    System.Diagnostics.Trace.TraceWarning(
+                        $"[DirectGpuTensorEngine] Chunked fused-CE forward could not run ({ex.GetType().Name}: " +
+                        $"{ex.Message}); using the fused kernel.");
+                }
+            }
+            if (!chunked)
+            {
+                using var tB = GetOrAllocateBuffer(backend, targetIds);
+                backend.FusedLinearCrossEntropyIndex(
+                    hB.Buffer, wB.Buffer, bB.Buffer, tB.Buffer, loss.Buffer, n, d, vocab);
+            }
             var result = DeferTensorResult<T>(backend, loss.Buffer, 1, new[] { 1 });
             loss.RelinquishOwnership();
             // Same node CpuEngine records, labels saved as a host COPY (supervision, not a tape input). Reading

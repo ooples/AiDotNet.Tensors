@@ -665,10 +665,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // total VRAM as the upper bound. NOTE: this means the cap guard
             // only catches obviously-impossible requests (> total VRAM). If
             // a smaller-than-VRAM allocation hits cudaErrorOutOfMemory due
-            // to fragmentation, the existing CheckCudaResult path surfaces
-            // it as a generic CUDA error — the chunker won't catch that.
-            // Translating cuMemAlloc OOM → GpuBufferTooLargeException is
-            // tracked as follow-up work.
+            // to fragmentation, it surfaces after reclamation as a
+            // GpuOutOfMemoryException (CudaAllocationError), not as
+            // GpuBufferTooLargeException — the chunker won't catch that.
             MaxBufferAllocBytes = (long)totalMem;
 
             // The device's primary context, shared by every backend on it (see PrimaryContextHolders). The
@@ -2026,8 +2025,26 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (CanRunDeferredFrees()) DrainPendingFinalizerFrees();
     }
 
+    /// <summary>
+    /// The error for a device allocation that still failed after reclamation: out-of-memory raises
+    /// <see cref="GpuOutOfMemoryException"/>, as the OpenCL and Vulkan allocators do, so callers with a lighter path
+    /// (a kernel needing no scratch) can take it; any other result stays an <see cref="InvalidOperationException"/>.
+    /// </summary>
+    internal static InvalidOperationException CudaAllocationError(CudaResult result, string message)
+        => result == CudaResult.OutOfMemory
+            ? new GpuOutOfMemoryException(message, (int)result)
+            : new InvalidOperationException(message);
+
+    /// <summary>
+    /// When set, every device allocation requests this many bytes instead of its own size: a test sets it past the
+    /// device's memory so the driver itself refuses each request, and the allocators' real out-of-memory handling
+    /// (reclaim, retry, classification) runs without depending on what else holds device memory.
+    /// </summary>
+    internal static ulong? AllocationBytesOverrideForTests;
+
     private IntPtr AllocDeviceMemoryWithRetry(ulong byteSize)
     {
+        byteSize = AllocationBytesOverrideForTests ?? byteSize;
         var result = CuBlasNative.cuMemAlloc(out IntPtr devicePtr, byteSize);
         if (result == CudaResult.OutOfMemory)
         {
@@ -2058,10 +2075,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 try { CudaNativeBindings.cuMemGetInfo(out free, out total); }
                 catch { /* diagnostic only — never mask the real failure */ }
                 GpuMemoryTracker.Dump($"cuMemAlloc OOM requesting {byteSize} bytes (free={free})");
-                throw new InvalidOperationException(
-                    $"cuMemAlloc failed: {CuBlasNative.GetCudaErrorString(result)} " +
+                string message = $"cuMemAlloc failed: {CuBlasNative.GetCudaErrorString(result)} " +
                     $"(requested {byteSize} bytes; drained {drained} pooled buffers; " +
-                    $"device free={free} total={total} bytes)");
+                    $"device free={free} total={total} bytes)";
+                throw CudaAllocationError(result, message);
             }
         }
         else
@@ -2185,9 +2202,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             var pA = AllocDeviceMemoryAsync((ulong)size);
             return new CudaGpuByteBuffer(_cudaContext, pA, size, asyncFreeStream: _mainStream, account: _memoryAccount);
         }
-        CuBlasNative.CheckCudaResult(
-            CuBlasNative.cuMemAlloc(out IntPtr devicePtr, (ulong)size),
-            "cuMemAlloc(byte)");
+        // The shared allocator reclaims and retries once on out-of-memory, then raises GpuOutOfMemoryException.
+        IntPtr devicePtr = AllocDeviceMemoryWithRetry((ulong)size);
 
         return new CudaGpuByteBuffer(_cudaContext, devicePtr, size, account: _memoryAccount);
     }
@@ -2196,6 +2212,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     // cuMemFreeAsync reclamations complete) and retry once before surfacing the error.
     private IntPtr AllocDeviceMemoryAsync(ulong byteSize)
     {
+        byteSize = AllocationBytesOverrideForTests ?? byteSize;
         var r = CuBlasNative.cuMemAllocAsync(out IntPtr p, byteSize, _mainStream);
         if (r != CudaResult.Success && IsStreamCapturing())
         {
@@ -2207,6 +2224,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // anyway. Surface the real alloc error (capture aborts → graceful eager fallback) instead of
             // masking it behind an illegal-sync CUDA 900.
             if (r != CudaResult.Success) GpuMemoryTracker.Dump($"cuMemAllocAsync OOM (capturing) requesting {byteSize} bytes");
+            if (r == CudaResult.OutOfMemory)
+                throw CudaAllocationError(r, $"cuMemAllocAsync (during capture) failed: {CuBlasNative.GetCudaErrorString(r)} (requested {byteSize} bytes)");
             CuBlasNative.CheckCudaResult(r, "cuMemAllocAsync (during capture)");
             GpuMemoryTracker.OnAlloc(p, (long)byteSize);
             return p;
@@ -2240,6 +2259,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             r = CuBlasNative.cuMemAllocAsync(out p, byteSize, _mainStream);
         }
         if (r != CudaResult.Success) GpuMemoryTracker.Dump($"cuMemAllocAsync OOM requesting {byteSize} bytes");
+        if (r == CudaResult.OutOfMemory)
+            throw CudaAllocationError(r, $"cuMemAllocAsync failed: {CuBlasNative.GetCudaErrorString(r)} (requested {byteSize} bytes)");
         CuBlasNative.CheckCudaResult(r, "cuMemAllocAsync");
         GpuMemoryTracker.OnAlloc(p, (long)byteSize);
         return p;
@@ -9726,7 +9747,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         RecordDirectPtxEvidenceDeviceAllocation(checked((long)byteSize));
         DrainFinalizedFreesBeforeAllocation();
 
-        CuBlasNative.CheckCudaResult(CuBlasNative.cuMemAlloc(out IntPtr devicePtr, byteSize), "cuMemAlloc(int)");
+        // The shared allocator reclaims and retries once on out-of-memory, then raises GpuOutOfMemoryException.
+        IntPtr devicePtr = AllocDeviceMemoryWithRetry(byteSize);
 
         try
         {
@@ -18293,7 +18315,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         IntPtr pdo = dOut.Handle, pq = q.Handle;
         IntPtr pdq = dQ.Handle, pdk = dK.Handle, pdv = dV.Handle, pda = dAlpha.Handle, pdb = dBeta.Handle;
-        uint nGrid = ((uint)n + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize;
+        // dq and reduce run one warp per element (32 threads each).
+        uint nGrid = (uint)checked(((long)n * 32 + DefaultBlockSize - 1) / DefaultBlockSize);
         using var partials = det ? AllocateBuffer(checked(2 * n)) : null;
         IntPtr pp = partials?.Handle ?? IntPtr.Zero;
         if (det)

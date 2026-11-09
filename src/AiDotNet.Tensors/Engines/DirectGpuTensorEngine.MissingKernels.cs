@@ -6145,6 +6145,73 @@ public partial class DirectGpuTensorEngine
     /// <summary>Row chunks the last chunked fused-CE backward ran (tests: proves the multi-chunk path executed).</summary>
     internal static int LastFusedCeBackwardChunks;
 
+    /// <summary>Row chunks the last chunked fused-CE forward ran (tests: proves the chunked forward executed).</summary>
+    internal static int LastFusedCeForwardChunks;
+
+    /// <summary>
+    /// Set when the chunked forward threw a resource or capability failure and the fused kernel ran instead; a test
+    /// expecting chunks reads it to tell that supported fallback from a chunking regression. Tests reset it.
+    /// </summary>
+    internal static bool LastFusedCeForwardChunkedDeclined;
+
+    /// <summary>
+    /// The index-target fused linear + cross-entropy FORWARD in row chunks: per chunk of rows, logits = h_c·W + b
+    /// (a backend GEMM), minus each row's max (a rank-1 GEMM), then lse_r = log(sum exp) and the shifted target logit
+    /// (a gather); ones-vector GEMMs accumulate sum(lse_r - target_r) across chunks (beta = 1 after the first), and the
+    /// mean loss is that sum / N. Only primitives every backend implements. The backend's
+    /// fused_linear_ce_index kernel ran one thread per row with a scalar dot product per logit, twice (max, then
+    /// sum of exponentials): 3.68 s per call at N=4096, d=256, V=49152 on an RTX 3080 (Nsight), 44% of a training step.
+    /// </summary>
+    private bool TryFusedLinearCrossEntropyIndexForwardChunked(IDirectGpuBackend backend, IGpuBuffer h, IGpuBuffer w,
+        IGpuBuffer b, int[] targetIds, IGpuBuffer meanLoss, int n, int d, int vocab)
+    {
+        if (n <= 0 || d <= 0 || vocab <= 0 || targetIds.Length != n) return false;
+        int chunk = Math.Max(1, Math.Min(n, FusedCeBackwardChunkElements / vocab));
+        if (chunk >= 32) chunk &= ~31;
+        checked { _ = chunk * vocab; _ = n * d; }
+
+        // Each row's target position inside its chunk's [chunk, vocab] block, as int bits (the gather reads the bits).
+        var positionBits = new float[n];
+        for (int r = 0; r < n; r++)
+        {
+            int id = targetIds[r];
+            if (id < 0 || id >= vocab) return false;
+            positionBits[r] = AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx.PtxCompat.Int32BitsToSingle((r % chunk) * vocab + id);
+        }
+
+        using var positions = new OwnedBuffer(backend.AllocateBuffer(positionBits), ownsBuffer: true);
+        using var logits = AllocateStreamOrderedScratch(backend, chunk * vocab);
+        using var work = AllocateStreamOrderedScratch(backend, chunk * vocab);
+        using var hChunk = AllocateStreamOrderedScratch(backend, chunk * d);
+        using var ones = AllocateStreamOrderedScratch(backend, chunk);
+        using var picked = AllocateStreamOrderedScratch(backend, chunk);
+        using var rowStat = AllocateStreamOrderedScratch(backend, chunk);
+        using var onesV = AllocateStreamOrderedScratch(backend, vocab);
+        using var chunkPositions = AllocateStreamOrderedScratch(backend, chunk);
+        backend.Fill(ones, 1f, chunk);
+        backend.Fill(onesV, 1f, vocab);
+        for (int r0 = 0; r0 < n; r0 += chunk)
+        {
+            int c = Math.Min(chunk, n - r0), cv = c * vocab;
+            float beta = r0 == 0 ? 0f : 1f;
+            backend.Copy(h, r0 * d, hChunk, 0, c * d);
+            backend.Copy(positions.Buffer, r0, chunkPositions, 0, c);
+            backend.Gemm(hChunk, w, work, c, vocab, d);                    // h_c·W
+            backend.BiasAdd(work, b, logits, c, vocab);                    // logits = h_c·W + b
+            backend.MaxAxis(logits, rowStat, c, vocab);                    // m_r
+            backend.Gemm(rowStat, onesV, logits, c, vocab, 1, -1f, 1f);    // logits - m_r (rank-1 update)
+            backend.Gather(logits, chunkPositions, picked, c, 1);          // shifted target logit
+            backend.Exp(logits, work, cv);
+            backend.SumAxis(work, rowStat, c, vocab);
+            backend.Log(rowStat, rowStat, c);                              // shifted lse_r
+            backend.Gemm(ones, rowStat, meanLoss, 1, 1, c, 1f, beta);      // sum += 1ᵀ·lse
+            backend.Gemm(ones, picked, meanLoss, 1, 1, c, -1f, 1f);        // sum -= 1ᵀ·target
+        }
+        backend.Scale(meanLoss, meanLoss, 1f / n, 1);
+        RecordFusedCeForwardChunks((n + chunk - 1) / chunk);
+        return true;
+    }
+
     /// <summary>
     /// The index-target fused linear + cross-entropy backward in row chunks, never forming <c>[N, vocab]</c>:
     /// per chunk of rows, logits = h_c·W + b, softmax, minus the one-hot (a scatter-add of -1), times
@@ -6229,6 +6296,10 @@ public partial class DirectGpuTensorEngine
     }
 
     private static void RecordFusedCeBackwardChunks(int chunks) => LastFusedCeBackwardChunks = chunks;
+
+    private static void RecordFusedCeForwardChunks(int chunks) => LastFusedCeForwardChunks = chunks;
+
+    private static void RecordFusedCeForwardChunkedDeclined() => LastFusedCeForwardChunkedDeclined = true;
 
     /// <summary>
     /// <c>factor * scalar[0] * tensor</c> — or, with a null <paramref name="tensor"/>, <c>factor * scalar[0]</c> filled

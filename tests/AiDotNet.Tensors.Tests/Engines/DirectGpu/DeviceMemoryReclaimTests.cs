@@ -54,6 +54,23 @@ public sealed class DeviceMemoryReclaimTests
         Assert.Equal(1, attempts);
     }
 
+    // A CUDA allocation still out of memory after reclamation raised a bare InvalidOperationException, so a caller with
+    // a lighter fallback (the fused-CE kernel when the chunked forward's scratch does not fit) could not tell it from a
+    // real CUDA fault. It now raises the same GpuOutOfMemoryException as the OpenCL and Vulkan allocators.
+    [Fact]
+    public void CudaAllocationError_ClassifiesOutOfMemory_AndKeepsOtherErrorsGeneric()
+    {
+        var oom = AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.CudaAllocationError(
+            AiDotNet.Tensors.Engines.CudaResult.OutOfMemory, "cuMemAllocAsync failed");
+        var gpuOom = Assert.IsType<GpuOutOfMemoryException>(oom);
+        Assert.Equal((int)AiDotNet.Tensors.Engines.CudaResult.OutOfMemory, gpuOom.NativeCode);
+        Assert.Equal("cuMemAllocAsync failed", gpuOom.Message);
+
+        var other = AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.CudaAllocationError(
+            AiDotNet.Tensors.Engines.CudaResult.InvalidValue, "cuMemAlloc failed");
+        Assert.IsType<InvalidOperationException>(other);
+    }
+
     [Fact]
     public void FreeQueue_RunsEveryFree_EvenWhenOneThrows()
     {

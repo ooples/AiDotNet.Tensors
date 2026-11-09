@@ -1023,6 +1023,147 @@ public class GpuTapeGradientParityTests : IDisposable
         AssertChunkedParity("FusedLinearCE(ids, bias, 3 chunks)", ChunkBias,
             static (e, t) => e.FusedLinearCrossEntropyWithLogits(ChunkHidden, ChunkWeight, t, ChunkTargetIds));
 
+    // The forward runs in the same row chunks: a GEMM per chunk, row log-softmax, a gather of the target log-probability
+    // and a ones-vector GEMM summing them. It replaced a one-thread-per-row kernel that took 3.68 s at N=4096, V=49152.
+    [SkippableFact]
+    public void FusedLinearCrossEntropy_index_chunked_forward_loss_matches_cpu()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu!)
+        {
+            float cpu = new CpuEngine().FusedLinearCrossEntropyWithLogits(ChunkHidden, ChunkWeight, ChunkBias, ChunkTargetIds).ToArray()[0];
+            DirectGpuTensorEngine.LastFusedCeForwardChunks = 0;
+            DirectGpuTensorEngine.LastFusedCeForwardChunkedDeclined = false;
+            float device = gpu.FusedLinearCrossEntropyWithLogits(ChunkHidden, ChunkWeight, ChunkBias, ChunkTargetIds).ToArray()[0];
+            // A device without room for the chunk scratch takes the supported fused-kernel fallback: no chunks to count.
+            Skip.If(DirectGpuTensorEngine.LastFusedCeForwardChunkedDeclined,
+                "The chunked forward declined on this device (scratch did not fit or a primitive is unavailable).");
+            Assert.Equal(3, DirectGpuTensorEngine.LastFusedCeForwardChunks);
+            Assert.True(!float.IsNaN(cpu) && !float.IsInfinity(cpu) && cpu > 1f, $"CPU loss {cpu} is not a usable reference.");
+            Assert.True(Math.Abs(device - cpu) <= 1e-5 * Math.Abs(cpu), $"GPU loss {device} vs CPU {cpu}.");
+        }
+    }
+
+    // A captured graph replays the device work it recorded: host ids uploaded during capture would be replayed as the
+    // captured batch's labels on every later step, so the capture is refused instead (the compiled step runs eagerly).
+    // CaptureGraph aborts a capture whose work throws and returns no graph rather than rethrowing, so the refusal is
+    // observed inside the captured work.
+    [SkippableFact]
+    public void FusedLinearCrossEntropy_index_refuses_capture_with_host_target_ids()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu!)
+        {
+            var capture = gpu.GetBackend() as AiDotNet.Tensors.Engines.DirectGpu.IGpuGraphCapture;
+            Skip.IfNot(capture is { SupportsGraphCapture: true }, "The backend has no stream capture.");
+            float cpu = new CpuEngine().FusedLinearCrossEntropyWithLogits(ChunkHidden, ChunkWeight, ChunkBias, ChunkTargetIds).ToArray()[0];
+            gpu.FusedLinearCrossEntropyWithLogits(ChunkHidden, ChunkWeight, ChunkBias, ChunkTargetIds);   // warm-up
+            NotSupportedException? refused = null;
+            IntPtr graph = capture.CaptureGraph(() =>
+            {
+                try
+                {
+                    gpu.FusedLinearCrossEntropyWithLogits(ChunkHidden, ChunkWeight, ChunkBias, ChunkTargetIds);
+                }
+                catch (NotSupportedException ex)
+                {
+                    refused = ex;
+                    throw;
+                }
+            });
+            Assert.Equal(IntPtr.Zero, graph);
+            Assert.NotNull(refused);
+            Assert.Contains("host-backed target ids", refused.Message);
+            // The aborted capture leaves the stream usable: the same call runs eagerly and still matches the CPU.
+            float after = gpu.FusedLinearCrossEntropyWithLogits(ChunkHidden, ChunkWeight, ChunkBias, ChunkTargetIds).ToArray()[0];
+            Assert.True(Math.Abs(after - cpu) <= 1e-5 * Math.Abs(cpu), $"GPU loss after the refused capture {after} vs CPU {cpu}.");
+        }
+    }
+
+    // Under a tape the backward saves the ids on the host, and that read would synchronize the capturing stream, so a
+    // taped capture is refused even with resident ids (the compiled step then runs eagerly).
+    [SkippableFact]
+    public void FusedLinearCrossEntropy_index_refuses_capture_under_a_tape()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu!)
+        {
+            var capture = gpu.GetBackend() as AiDotNet.Tensors.Engines.DirectGpu.IGpuGraphCapture;
+            Skip.IfNot(capture is { SupportsGraphCapture: true }, "The backend has no stream capture.");
+            const int vocab = 5;
+            var hidden = Rand([4, 8], seed: 557);
+            var weight = Rand([8, vocab], seed: 563);
+            var bias = Rand([vocab], seed: 569, lo: -0.1, hi: 0.1);
+            var ids = gpu.TensorSearchSorted(
+                new Tensor<float>(new float[] { 0, 1, 2, 3, 4 }, new[] { vocab }),
+                new Tensor<float>(new float[] { 0, 1, 2, 3 }, new[] { 4 }));
+            Assert.True(ids.IsGpuResident, "TensorSearchSorted returned host ids, so the resident case goes untested.");
+            gpu.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, ids);   // warm-up
+
+            using var tape = new GradientTape<float>();
+            NotSupportedException? refused = null;
+            IntPtr graph = capture.CaptureGraph(() =>
+            {
+                try
+                {
+                    gpu.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, ids);
+                }
+                catch (NotSupportedException ex)
+                {
+                    refused = ex;
+                    throw;
+                }
+            });
+            Assert.Equal(IntPtr.Zero, graph);
+            Assert.NotNull(refused);
+            Assert.Contains("while a gradient tape records", refused.Message);
+        }
+    }
+
+    // Resident ids are validated on every eager call. An id out of range used to reach the fused kernel, which checks
+    // nothing and returned a finite (taped) or infinite (untaped) loss. The ids must really be on the device, and the
+    // CPU fallback is switched off so its own range check cannot be what throws.
+    [SkippableFact]
+    public void FusedLinearCrossEntropy_index_rejects_an_invalid_resident_id_under_a_tape() =>
+        AssertRejectsInvalidResidentId(underTape: true);
+
+    [SkippableFact]
+    public void FusedLinearCrossEntropy_index_rejects_an_invalid_resident_id_without_a_tape() =>
+        AssertRejectsInvalidResidentId(underTape: false);
+
+    private static void AssertRejectsInvalidResidentId(bool underTape)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        bool savedThrowOnFallback = DirectGpuTensorEngine.ThrowOnGpuKernelFallback;
+        using (gpu!)
+        {
+            try
+            {
+                DirectGpuTensorEngine.ThrowOnGpuKernelFallback = true;
+                const int vocab = 5;
+                var hidden = Rand([4, 8], seed: 523);
+                var weight = Rand([8, vocab], seed: 541);
+                var bias = Rand([vocab], seed: 547, lo: -0.1, hi: 0.1);
+                // SearchSorted leaves its result on the device: 9 lies past every entry of [0, 5), so its id is vocab.
+                var ids = gpu.TensorSearchSorted(
+                    new Tensor<float>(new float[] { 0, 1, 2, 3, 4 }, new[] { vocab }),
+                    new Tensor<float>(new float[] { 0, 1, 2, 9 }, new[] { 4 }));
+                Assert.True(ids.IsGpuResident, "TensorSearchSorted returned host ids, so resident ids go untested.");
+
+                using var tape = underTape ? new GradientTape<float>() : null;
+                var ex = Assert.Throws<ArgumentOutOfRangeException>(
+                    () => gpu.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, ids));
+                Assert.Equal("targetIds", ex.ParamName);
+                // The GPU engine's own message; the CPU engine words its range check differently.
+                Assert.Contains("is out of bounds for vocabulary size 5", ex.Message);
+            }
+            finally
+            {
+                DirectGpuTensorEngine.ThrowOnGpuKernelFallback = savedThrowOnFallback;
+            }
+        }
+    }
+
     [SkippableFact]
     public void FusedLinearCrossEntropy_stays_on_the_device_while_a_tape_records() =>
         AssertStaysOnDeviceUnderTape("FusedLinearCrossEntropy",
