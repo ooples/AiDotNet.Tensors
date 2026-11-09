@@ -710,6 +710,18 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             "[PING-PONG] " + message + System.Environment.NewLine); } catch { }
     }
 
+    /// <summary>
+    /// True when <c>AIDOTNET_COMPILED_INPUT_GRADS=1</c>: compiled training plans then also compute the gradient into
+    /// the graph's external leaves (the network input) and set <c>.Grad</c> on them. Off by default, because training
+    /// never reads it and the first layer's input gradient is a whole extra convolution or GEMM. Read at compile time.
+    /// </summary>
+    internal static bool CompiledInputGradientsRequested
+        => CompiledInputGradientsForTests ?? Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_INPUT_GRADS") == "1";
+
+    /// <summary>Tests: overrides <c>AIDOTNET_COMPILED_INPUT_GRADS</c> for plans compiled on this thread (null: the variable).
+    /// Thread-local, so a test that turns it on cannot leak input gradients into another test's plan.</summary>
+    [ThreadStatic] internal static bool? CompiledInputGradientsForTests;
+
     private void RecordGraphCaptureFailure(string reason)
     {
         GraphCaptureFailureReason = reason;
@@ -3883,8 +3895,14 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     }
                     if (exec == IntPtr.Zero)
                     {
-                        RecordGraphCaptureFailure("the captured stream produced no graph (an op in the step body is not "
-                            + "capturable: a host read, a synchronous copy or an allocation; AIDOTNET_GRAPH_CAPTURE_DEBUG=1 names it)");
+                        // The backend ends a capture cleanly when the body throws or the driver invalidates it, and
+                        // returns a zero handle; its diagnostics say which, so the reason is not lost (#1096 F4).
+                        string? backendReason = cb.LastCaptureFailure;
+                        RecordGraphCaptureFailure(backendReason is not null
+                            ? "the captured stream produced no graph: " + backendReason
+                                + " (AIDOTNET_GRAPH_CAPTURE_DEBUG=1 traces the step body)"
+                            : "the captured stream produced no graph (an op in the step body is not capturable: a host "
+                                + "read, a synchronous copy or an allocation; AIDOTNET_GRAPH_CAPTURE_DEBUG=1 names it)");
                         // Capture failed → the graph is permanently abandoned for this plan. Resume the
                         // eviction suspension we took above right now: StepEager doesn't need stable device
                         // pointers, and leaving it suspended for the plan's whole lifetime pins every offload
@@ -9263,6 +9281,18 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // parameters' gradients, so a backward may skip computing the gradient INTO it. Used by the Conv2D
         // backwards below, where the input gradient of the first layer is a whole extra convolution.
         var requiresGradTensors = new HashSet<Tensor<T>>(parameters);
+        // AIDOTNET_COMPILED_INPUT_GRADS=1 (#1096 follow-up): also treat the graph's external leaves (the network input,
+        // labels, masks) as gradient sources, so the compiled step sets .Grad on them the way the eager tape does.
+        // Saliency maps and adversarial examples need the input gradient; training does not, so it stays off.
+        if (CompiledInputGradientsRequested)
+        {
+            var producedByStep = new HashSet<Tensor<T>>();
+            foreach (var fwdStep in forwardSteps) producedByStep.Add(fwdStep.OutputBuffer);
+            foreach (var fwdStep in forwardSteps)
+                foreach (var fwdInput in fwdStep.Inputs)
+                    if (fwdInput is not null && !producedByStep.Contains(fwdInput))
+                        requiresGradTensors.Add(fwdInput);
+        }
         foreach (var fwdStep in forwardSteps)
             foreach (var fwdInput in fwdStep.Inputs)
                 if (fwdInput is not null && requiresGradTensors.Contains(fwdInput))
@@ -9280,9 +9310,17 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             && engine is CpuEngine && !engine.SupportsGpu
             && Environment.GetEnvironmentVariable("AIDOTNET_CONV_EPILOGUE_FUSION") != "0")
         {
+            var claimedElsewhere = new HashSet<int>(fusedStepIndices);
+            claimedElsewhere.UnionWith(consumedBySlicePrefix);
+            claimedElsewhere.UnionWith(analyticBackwardSpecs.Keys);
+            claimedElsewhere.UnionWith(analyticForwardSpecs.Keys);
+            claimedElsewhere.UnionWith(slicePrefixForwardSpecs.Keys);
+            claimedElsewhere.UnionWith(slicePrefixBackwardSpecs.Keys);
+            claimedElsewhere.UnionWith(skippableReduceSumIndices);
+            claimedElsewhere.UnionWith(skippableReduceSumForwardIndices);
             DetectConvBiasActivationFusion(forwardSteps, consumerCount, gradMap, requiresGradTensors,
                 convEpilogueForwardSpecs, convEpilogueBackwardSpecs, consumedByConvEpilogue, convEpilogueChains,
-                convEpilogueDeadInternals);
+                convEpilogueDeadInternals, claimedElsewhere);
         }
 
         // Forward-only outputs (no backward reads them) share arrays by forward liveness; see PoolForwardOnlyOutputs.
@@ -15021,9 +15059,14 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         Dictionary<int, Action<IEngine>> backwardSpecs,
         HashSet<int> consumed,
         Dictionary<int, int[]>? chainSteps = null,
-        List<Tensor<T>>? deadInternals = null)
+        List<Tensor<T>>? deadInternals = null,
+        HashSet<int>? excluded = null)
     {
         if (typeof(T) != typeof(float)) return;
+        // A step another fusion already owns (fused groups, analytic or slice-prefix specs, skipped reduce-sums) must
+        // not join a chain: the backward loop checks those owners before the chain's spec, so a shared index would run
+        // the fused forward and silently drop the chain's backward (#1096 follow-up).
+        bool Taken(int i) => consumed.Contains(i) || (excluded is not null && excluded.Contains(i));
         // AIDOTNET_CONV_POOL_BACKWARD_FUSION=0 keeps a following max pool's backward separate (A/B and tests).
         bool poolBackwardFusion = Environment.GetEnvironmentVariable("AIDOTNET_CONV_POOL_BACKWARD_FUSION") != "0";
 
@@ -15037,7 +15080,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         for (int convIdx = 0; convIdx < steps.Count; convIdx++)
         {
             var conv = steps[convIdx];
-            if (conv.OpType != OpType.Conv2D || conv.Inputs.Length != 2 || conv.BackwardFn == null) continue;
+            if (conv.OpType != OpType.Conv2D || conv.Inputs.Length != 2 || conv.BackwardFn == null || Taken(convIdx)) continue;
             if (conv.SavedState is not { Length: >= 3 } convState
                 || convState[0] is not int[] stride || convState[1] is not int[] padding
                 || convState[2] is not int[] dilation) continue;
@@ -15046,7 +15089,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var convOut = conv.OutputBuffer;
             if (x.Rank != 4 || kernel.Rank != 4 || convOut.Rank != 4
                 || !x.IsContiguous || !kernel.IsContiguous || !convOut.IsContiguous) continue;
-            if (!soleConsumer.TryGetValue(convOut, out int biasIdx) || biasIdx <= convIdx || consumed.Contains(biasIdx)) continue;
+            if (!soleConsumer.TryGetValue(convOut, out int biasIdx) || biasIdx <= convIdx || Taken(biasIdx)) continue;
 
             var biasStep = steps[biasIdx];
             if (biasStep.OpName != "TensorChannelBiasAdd" || biasStep.Inputs.Length != 2
@@ -15059,7 +15102,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // Extend through a ReLU when the bias-add output feeds only that ReLU.
             int last = biasIdx;
             bool relu = false;
-            if (soleConsumer.TryGetValue(biasOut, out int reluIdx) && reluIdx > biasIdx && !consumed.Contains(reluIdx))
+            if (soleConsumer.TryGetValue(biasOut, out int reluIdx) && reluIdx > biasIdx && !Taken(reluIdx))
             {
                 var reluStep = steps[reluIdx];
                 if (reluStep.OpType == OpType.ReLU && reluStep.Inputs.Length == 1
@@ -15089,7 +15132,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             Tensor<float>? gradPoolOutF = null;
             if (relu && poolBackwardFusion && y.Rank == 4 && y.IsContiguous
                 && soleConsumer.TryGetValue(y, out int candidatePool) && candidatePool > last
-                && !consumed.Contains(candidatePool))
+                && !Taken(candidatePool))
             {
                 var pool = steps[candidatePool];
                 if (pool.OpName == "AdaptiveAvgPool2D" && pool.Inputs.Length == 1 && ReferenceEquals(pool.Inputs[0], y)

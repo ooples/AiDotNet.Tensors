@@ -86,12 +86,23 @@ internal static class DifferentiableOps
 
     /// <summary>
     /// Non-zero while a compiled step runs a backward whose gradient buffers are NOT zeroed beforehand: the first
-    /// contribution a buffer receives in this generation is copied in, later ones are added. A compiled plan sets it
-    /// only when every backward action accumulates through <see cref="AccumulateGrad{T}"/> (all-generic), where the
-    /// write order is fixed, so each buffer's first writer is the same every step. Replaces a memset of every
+    /// contribution a buffer receives in this generation is copied in, later ones are added. Replaces a memset of every
     /// gradient buffer plus an add for every contribution with one copy per buffer (AiDotNet #1804: 836 memsets and
     /// 393 adds per N-BEATS step on GPU).
     /// </summary>
+    /// <remarks>
+    /// A compiled plan sets it in two places, and in both the write order is fixed, so each buffer's first writer is
+    /// the same every step:
+    /// <list type="bullet">
+    /// <item>The GPU resident/capture step, when every backward action accumulates through
+    /// <see cref="AccumulateGrad{T}"/> (all-generic).</item>
+    /// <item>The CPU eager step (<c>StepEager</c>), for mixed specialized/generic plans. Only the first-write candidate
+    /// buffers are left unzeroed; the first run zeroes everything and records which candidates the backward actually
+    /// wrote, and any it did not write keep being zeroed (<c>RecordEagerFirstWriteCoverage</c>). A specialized
+    /// delegate that writes a multi-consumer input gradient claims that buffer's first write through
+    /// <c>AccumulatesInto</c>, so the generic contributions after it add instead of copying.</item>
+    /// </list>
+    /// </remarks>
     [ThreadStatic]
     internal static int GradWriteGeneration;
 

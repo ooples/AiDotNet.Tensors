@@ -190,11 +190,35 @@ public sealed partial class CudaBackend
         return (result.Fp32AccumulateTflops, result.Fp16AccumulateTflops, result.Fp32AccumulateIsFullRate);
     }
 
-    // The device's rate class, measured on first use (null when the probe cannot run here).
+    // AIDOTNET_MMA_RATE_SOURCE: "auto" (default) asks the driver first and measures when it cannot answer; "driver"
+    // never measures; "probe" never asks the driver.
+    private static readonly string s_mmaRateSource =
+        (Environment.GetEnvironmentVariable("AIDOTNET_MMA_RATE_SOURCE") ?? "auto").Trim().ToLowerInvariant();
+
+    private (int Domain, int Bus, int Device)? _pciAddress;   // set at init when the driver reports it
+    private string? _mmaRateQueryFailure;
+
+    /// <summary>Tests: replaces the driver's issue-rate query (a mock, or null for no query at all).</summary>
+    internal ISmIssueRateQuery? SmIssueRateQueryForTests { get; set; } = NvRmIssueRateQuery.Instance;
+
+    /// <summary>Tests: the PCI address the driver query is asked about, in place of the device's own.</summary>
+    internal (int Domain, int Bus, int Device)? PciAddressForTests { get; set; }
+
+    /// <summary>Why the driver query did not answer, when it did not (diagnostics hook).</summary>
+    internal string? MmaRateQueryFailure => _mmaRateQueryFailure;
+
+    // The device's rate class, read on first use: from the driver's issue-rate modifiers when it reports them (instant,
+    // and exact), otherwise measured by the probe. Null when neither can run here.
     private PtxMmaRateProbe.Result? MmaRate()
     {
         if (_mmaRate is null)
         {
+            if (s_mmaRateSource != "probe" && TryQueryDriverMmaRate() is { } fromDriver)
+            {
+                _mmaRate = fromDriver;
+                return _mmaRate;
+            }
+            if (s_mmaRateSource == "driver") return null;
             try
             {
                 _mmaRate = PtxMmaRateProbe.Measure(GetDirectPtxRuntime());
@@ -207,17 +231,78 @@ public sealed partial class CudaBackend
         return _mmaRate;
     }
 
+    private PtxMmaRateProbe.Result? TryQueryDriverMmaRate()
+    {
+        var query = SmIssueRateQueryForTests;
+        var address = PciAddressForTests ?? _pciAddress;
+        if (query is null || address is not { } pci)
+        {
+            _mmaRateQueryFailure = query is null ? "no driver query" : "the device's PCI address is unknown";
+            return null;
+        }
+        if (!query.TryQuery(pci.Domain, pci.Bus, pci.Device, out var modifier, out var failure))
+        {
+            _mmaRateQueryFailure = failure;
+            return null;
+        }
+        _mmaRateQueryFailure = null;
+        return modifier.ToRateResult();
+    }
+
+    /// <summary>
+    /// The FP16 MMA issue rates this backend routes by (#1549): from the driver's issue-rate modifiers where it reports
+    /// them, otherwise measured once. <c>Source</c> is "driver" or "measured"; with "driver" the rates are fractions of the
+    /// full issue rate (1 = full), with "measured" TFLOP/s. <c>RateClass</c> is the key autotune verdicts are stored
+    /// under ("fp32acc-full", "fp32acc-1/2", ...). Null when neither the driver nor the probe can answer on this device.
+    /// </summary>
+    internal (double Fp32Accumulate, double Fp16Accumulate, string Source, string RateClass)? TensorCoreAccumulateRateProfile()
+    {
+        lock (_fp16AccumulateTuneLock)
+        {
+            if (MmaRate() is not { } rate) return null;
+            string source = rate.Source switch
+            {
+                PtxMmaRateProbe.RateSource.DriverQuery => "driver",
+                PtxMmaRateProbe.RateSource.Forced => "forced",
+                _ => "measured",
+            };
+            return (rate.Fp32AccumulateTflops, rate.Fp16AccumulateTflops, source, rate.RateClass);
+        }
+    }
+
     /// <summary>Tests: the rate the route believes this device has (as if measured), e.g. an unlocked card's.</summary>
     internal void ForceMmaRateForTests(double fp32AccumulateTflops, double fp16AccumulateTflops) =>
-        _mmaRate = new PtxMmaRateProbe.Result(fp32AccumulateTflops, fp16AccumulateTflops);
+        _mmaRate = new PtxMmaRateProbe.Result(fp32AccumulateTflops, fp16AccumulateTflops, PtxMmaRateProbe.RateSource.Forced);
+
+    /// <summary>Tests: forgets the rate read so far, so the next route decision reads it again.</summary>
+    internal void ResetMmaRateForTests()
+    {
+        lock (_fp16AccumulateTuneLock) _mmaRate = null;
+    }
+
+    /// <summary>
+    /// True when this device's FP32-accumulate (and TF32) tensor-core math already issues at the FP16 rate: a datacenter
+    /// or workstation part, or a GeForce card its owner unlocked. Routes that pick between FP32-accumulate/TF32 and an
+    /// FP16-accumulate or strict-FP32 alternative read it. False when the rate is reduced or unknown.
+    /// </summary>
+    internal bool Fp32AccumulateIsFullRate()
+    {
+        lock (_fp16AccumulateTuneLock) return MmaRate() is { Fp32AccumulateIsFullRate: true };
+    }
+
+    /// <summary>The rate class verdicts are keyed on ("unknown" when it cannot be read).</summary>
+    internal string MmaRateClass()
+    {
+        lock (_fp16AccumulateTuneLock) return MmaRate()?.RateClass ?? "unknown";
+    }
 
     // A route that keeps cuBLAS because FP32 accumulation already runs at full rate, or null to go on.
     private Fp16AccumulateRoute? Fp16AccumulateRateRejection()
     {
         if (s_fp16AccumulateForced || MmaRate() is not { Fp32AccumulateIsFullRate: true } rate) return null;
         return new Fp16AccumulateRoute(null,
-            $"FP32 accumulation already issues at the FP16 rate on this device ({rate.Fp32AccumulateTflops:F0} against " +
-            $"{rate.Fp16AccumulateTflops:F0} TFLOP/s): FP16 accumulation cannot double it", 0);
+            $"FP32 accumulation already issues at the FP16 rate on this device ({rate.Describe()}): " +
+            "FP16 accumulation cannot double it", 0);
     }
 
     private void LaunchFp16Accumulate(PtxTensorCoreGemmKernel kernel, IGpuBuffer a, IGpuBuffer b, IGpuBuffer c,

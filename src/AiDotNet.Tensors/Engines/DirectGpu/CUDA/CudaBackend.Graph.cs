@@ -269,8 +269,24 @@ public sealed partial class CudaBackend
         return CaptureWithPrivateMemory(() => CaptureGraphOnCurrentStream(launch), graphExec => graphExec);
     }
 
+    // Per thread: captures are thread-local (CU_STREAM_CAPTURE_MODE_THREAD_LOCAL), and the reader is the thread that
+    // just called CaptureGraph / TryUpdateCapturedGraph.
+    [ThreadStatic] private static string? t_lastCaptureFailure;
+
+    /// <inheritdoc cref="IGpuGraphCapture.LastCaptureFailure"/>
+    string? IGpuGraphCapture.LastCaptureFailure => t_lastCaptureFailure;
+
+    private static string DescribeCaptureException(Exception ex)
+    {
+        var inner = ex;
+        while (inner is AggregateException { InnerException: { } aggInner }) inner = aggInner;
+        while (inner is System.Reflection.TargetInvocationException { InnerException: { } tieInner }) inner = tieInner;
+        return "the captured step body threw " + inner.GetType().Name + ": " + inner.Message;
+    }
+
     private IntPtr CaptureGraphOnCurrentStream(Action launch)
     {
+        t_lastCaptureFailure = null;
         DirectPtxCapturePinSet directPtxPins = BeginDirectPtxCapturePinTracking();
         try { EnterCapture(); }
         catch
@@ -284,6 +300,7 @@ public sealed partial class CudaBackend
             ExitCapture();
             AbortDirectPtxCapturePinTracking(directPtxPins);
             GcDiag($"beginCapture FAILED rc={rc}");
+            t_lastCaptureFailure = "cuStreamBeginCapture failed: " + rc;
             return IntPtr.Zero;
         }
 
@@ -298,6 +315,7 @@ public sealed partial class CudaBackend
         catch (Exception ex)
         {
             { var st = ex.StackTrace?.Replace("\r", "").Replace("\n", " >> ") ?? ""; GcDiag($"launch() THREW {ex.GetType().Name}: {ex.Message} | {st.Substring(0, System.Math.Min(2500, st.Length))}"); }
+            t_lastCaptureFailure = DescribeCaptureException(ex);
             CudaNativeBindings.cuStreamEndCapture(_stream, out var abortedGraph);
             ExitCapture();
             if (abortedGraph != IntPtr.Zero) CudaNativeBindings.cuGraphDestroy(abortedGraph);
@@ -315,6 +333,9 @@ public sealed partial class CudaBackend
         {
             AbortDirectPtxCapturePinTracking(directPtxPins);
             GcDiag($"endCapture FAILED rc={rc} graph={(graph != IntPtr.Zero)} (a non-capturable op — sync HtoD/DtoH or cuMemAlloc — was issued during launch)");
+            t_lastCaptureFailure = "cuStreamEndCapture returned " + rc + (graph == IntPtr.Zero ? " with no graph" : "")
+                + " (the capture was invalidated by a non-capturable call in the step body: a host read, a synchronous "
+                + "copy or an allocation)";
             return IntPtr.Zero;
         }
 
@@ -353,6 +374,7 @@ public sealed partial class CudaBackend
         if (rc != CudaResult.Success)
         {
             GcDiag($"instantiate FAILED rc={rc}");
+            t_lastCaptureFailure = "cuGraphInstantiate failed: " + rc;
             AbortDirectPtxCapturePinTracking(directPtxPins);
             return IntPtr.Zero;
         }
@@ -437,7 +459,7 @@ public sealed partial class CudaBackend
 
     private bool TryUpdateCapturedGraphOnCurrentStream(IntPtr graphExec, Action relaunch)
     {
-
+        t_lastCaptureFailure = null;
         DirectPtxCapturePinSet directPtxPins = BeginDirectPtxCapturePinTracking();
         try { EnterCapture(); }
         catch
@@ -456,8 +478,10 @@ public sealed partial class CudaBackend
             _backendStreamCaptureActive = true;
             relaunch();
         }
-        catch
+        catch (Exception ex)
         {
+            t_lastCaptureFailure = DescribeCaptureException(ex);
+            GcDiag("graph update relaunch() THREW " + ex.GetType().Name + ": " + ex.Message);
             CudaNativeBindings.cuStreamEndCapture(_stream, out var g);
             ExitCapture();
             if (g != IntPtr.Zero) CudaNativeBindings.cuGraphDestroy(g);

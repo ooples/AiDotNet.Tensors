@@ -49,13 +49,16 @@ layout(push_constant) uniform PC {
     float weightDecay;
 } pc;
 " + Bf16Helpers + @"
+// 1 - beta^t without cancellation (see CudaOptimizerKernels.bias_correction): pow's error, subtracted from 1, grows by
+// 1/(1 - beta). GLSL has no expm1, so Kahan's form; precise keeps the compiler from reassociating it.
+float vkc_bias_correction(float beta, float t){precise float x=t*log(beta);precise float e=exp(x);if(e==1.0)return -x;precise float em1=e-1.0;if(em1==-1.0)return 1.0;return -(em1*(x/log(e)));}
 void main() {
     uint w = gl_GlobalInvocationID.x;
     uint base = w * 2u;
     if (base >= pc.size) { return; }
 
-    float bc1 = 1.0 - pow(pc.beta1, float(pc.step));
-    float bc2 = 1.0 - pow(pc.beta2, float(pc.step));
+    float bc1 = vkc_bias_correction(pc.beta1, float(pc.step));
+    float bc2 = vkc_bias_correction(pc.beta2, float(pc.step));
     bool firstStep = pc.step <= 1u;
 
     uint mword = m_bits[w];

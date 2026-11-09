@@ -1670,7 +1670,10 @@ __device__ __forceinline__ void conv2d_wgrad_ce_body(
             rb[r] = v;
         }
     };
-    auto store = [&](auto as, auto bs)
+    // Concrete parameter types, not (auto as, auto bs): NVRTC 12.x (the 12.6 runtime AiDotNet.Native.CUDA ships) treats
+    // a generic lambda as a host function in JIT mode and rejects the whole module, leaving the CUDA backend
+    // unavailable. The tiles are the mainloop's shared buffers, rows padded by CePad<MAIN>.
+    auto store = [&](float (*as)[BM + CePad<MAIN>::value], float (*bs)[BN + CePad<MAIN>::value])
     {
         #pragma unroll
         for (int r = 0; r < RA; r++) as[lk][lr + 32 * r] = ra[r];
@@ -1832,7 +1835,10 @@ __device__ __forceinline__ void conv2d_dgrad_ce_body(
         for (int r = 0; r < RB; r++)
             rb[r] = valid ? src[(long long)(BSTEP * r) * L] : 0.0f;
     };
-    auto store = [&](auto as, auto bs)
+    // Concrete parameter types, not (auto as, auto bs): NVRTC 12.x (the 12.6 runtime AiDotNet.Native.CUDA ships) treats
+    // a generic lambda as a host function in JIT mode and rejects the whole module, leaving the CUDA backend
+    // unavailable. The tiles are the mainloop's shared buffers, rows padded by CePad<MAIN>.
+    auto store = [&](float (*as)[BM + CePad<MAIN>::value], float (*bs)[BN + CePad<MAIN>::value])
     {
         #pragma unroll
         for (int r = 0; r < RA; r++) as[ak + ASTEP * r][am] = ra[r];
@@ -2257,7 +2263,10 @@ __device__ __forceinline__ void conv2d_fprop_ig_body(
             }
         }
     };
-    auto store = [&](auto as, auto bs)
+    // Concrete parameter types, not (auto as, auto bs): NVRTC 12.x (the 12.6 runtime AiDotNet.Native.CUDA ships) treats
+    // a generic lambda as a host function in JIT mode and rejects the whole module, leaving the CUDA backend
+    // unavailable. The tiles are the mainloop's shared buffers, rows padded by CePad<MAIN>.
+    auto store = [&](float (*as)[BM + CePad<MAIN>::value], float (*bs)[BN + CePad<MAIN>::value])
     {
         #pragma unroll
         for (int r = 0; r < RA; r++) as[ak][am + 32 * r] = ra[r];

@@ -79,7 +79,8 @@ internal static class HeadToHeadNetworkHarness
     /// is. The first loss sees identical weights and data, so only the reduction order differs; later steps
     /// compound that through SGD, so their tolerance is looser.
     /// </summary>
-    internal static string? LossMismatch(IReadOnlyList<double> ours, IReadOnlyList<double> reference)
+    internal static string? LossMismatch(IReadOnlyList<double> ours, IReadOnlyList<double> reference,
+        double firstTolerance = 1e-4, double laterTolerance = 1e-3)
     {
         // Every reference step must be matched: comparing only the common prefix let a mode that recorded fewer
         // losses pass on a partly verified curve and win the gated best.
@@ -88,7 +89,7 @@ internal static class HeadToHeadNetworkHarness
         if (ours.Count < n) return $"{ours.Count} losses were recorded; the reference has {n}";
         for (int i = 0; i < n; i++)
         {
-            double tolerance = i == 0 ? 1e-4 : 1e-3;
+            double tolerance = i == 0 ? firstTolerance : laterTolerance;
             // A NaN difference compares false against any tolerance, so a diverged run must be refused explicitly.
             if (double.IsNaN(ours[i]) || double.IsInfinity(ours[i])
                 || Math.Abs(ours[i] - reference[i]) > tolerance * Math.Max(1.0, Math.Abs(reference[i])))
@@ -398,12 +399,39 @@ internal static class HeadToHeadNetworkHarness
     /// fastest mode whose losses agree with <paramref name="reference"/> is the gated best. A mode that throws is
     /// a Tensors defect and fails the case.
     /// </summary>
+    /// <summary>The spec's loss-agreement bounds (first step, later steps); the FP32 defaults when it sets none.</summary>
+    internal static (double First, double Later) LossTolerance(JsonElement spec)
+    {
+        if (!spec.TryGetProperty("lossTolerance", out var t)) return (1e-4, 1e-3);
+        if (t.ValueKind != JsonValueKind.Array || t.GetArrayLength() != 2)
+            throw new InvalidDataException($"\"lossTolerance\" must be [first, later], got {t.GetRawText()}.");
+        return (t[0].GetDouble(), t[1].GetDouble());
+    }
+
+    /// <summary>
+    /// The spec's autocast precision (#1549): "fp16" trains every Tensors mode under the FP16 autocast scope, against
+    /// PyTorch under torch.autocast(float16). Null for plain FP32.
+    /// </summary>
+    internal static string? AutocastOf(JsonElement spec)
+    {
+        if (!spec.TryGetProperty("autocast", out var a) || a.ValueKind == JsonValueKind.Null) return null;
+        string? value = a.GetString();
+        if (value != "fp16") throw new InvalidDataException($"unsupported \"autocast\": {a.GetRawText()}.");
+        return value;
+    }
+
     private static SideResult RunTensors(JsonElement spec, string work, DirectGpuTensorEngine? gpu, IReadOnlyList<double> reference)
     {
         // The CPU case must run on the CPU engine: on a machine with a GPU the default engine is the GPU engine, so the
         // "cpu" case trained and timed the GPU engine over host tensors.
         var previous = AiDotNetEngine.Current;
         AiDotNetEngine.Current = gpu is not null ? gpu : new CpuEngine();
+        var (firstTolerance, laterTolerance) = LossTolerance(spec);
+        // The compiled plan opens its autocast scope from AIDOTNET_AUTOCAST at every step (CompiledTrainingPlan.StepCore);
+        // the eager loop opens one itself (TrainTensors). Restored after, so later cases run FP32.
+        string? autocast = AutocastOf(spec);
+        string? previousAutocast = Environment.GetEnvironmentVariable("AIDOTNET_AUTOCAST");
+        if (autocast is not null) Environment.SetEnvironmentVariable("AIDOTNET_AUTOCAST", autocast);
         try
         {
             var phased = TrainTensors(spec, work, gpu, TensorsMode.PhaseSynchronized);
@@ -432,7 +460,7 @@ internal static class HeadToHeadNetworkHarness
 
             var modes = runs.Select(r =>
             {
-                string? mismatch = LossMismatch(r.Run.Losses, reference);
+                string? mismatch = LossMismatch(r.Run.Losses, reference, firstTolerance, laterTolerance);
                 return new ModeResult(r.Name, mismatch is null ? "ok" : "rejected", mismatch ?? r.Run.Note, r.Run.Phases["step"]);
             }).ToList();
             // The fastest agreeing mode, first on a tie. Pattern-matched so the compiler sees that the chosen step is
@@ -458,6 +486,7 @@ internal static class HeadToHeadNetworkHarness
         finally
         {
             AiDotNetEngine.Current = previous;
+            if (autocast is not null) Environment.SetEnvironmentVariable("AIDOTNET_AUTOCAST", previousAutocast);
         }
     }
 
@@ -496,6 +525,65 @@ internal static class HeadToHeadNetworkHarness
         }
     }
 
+    /// <summary>
+    /// What one steady-state compiled training step of <c>network</c> costs in countable units (#1096 P0.7): managed
+    /// bytes allocated per step and, on CUDA, the captured step graph's kernel, memcpy and memset nodes. Random weights
+    /// and data, so no PyTorch run is needed; on the CPU the step runs on one thread, so the allocation count is exact and
+    /// independent of other tests and of the runner's core count.
+    /// </summary>
+    internal static StepCounts MeasureCompiledStepCounts(string root, string network, DirectGpuTensorEngine? gpu,
+        int warmupSteps = 5, int measuredSteps = 10)
+    {
+        var spec = ReadJson(Path.Combine(root, "parity", "networks", network + ".json"));
+        string work = Path.Combine(Path.GetTempPath(), "aidotnet-stepcounts", network + "-" + (gpu is null ? "cpu" : "cuda"));
+        Directory.CreateDirectory(work);
+        var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(spec.GetProperty("seed").GetInt32());
+        void WriteRandom(string file, int count, float scale)
+        {
+            using var writer = new BinaryWriter(File.Create(Path.Combine(work, file)));
+            for (int i = 0; i < count; i++) writer.Write((float)((rng.NextDouble() * 2 - 1) * scale));
+        }
+        WriteRandom("weights.bin", 12_000_000, 0.05f);
+        WriteRandom("data.bin", 2_000_000, 1f);
+
+        var previous = AiDotNetEngine.Current;
+        int previousThreads = CpuParallelSettings.MaxDegreeOfParallelism;
+        AiDotNetEngine.Current = gpu is not null ? gpu : new CpuEngine();
+        if (gpu is null) CpuParallelSettings.MaxDegreeOfParallelism = 1;
+        try
+        {
+            var counts = new StepCounts(warmupSteps, measuredSteps);
+            TrainTensors(spec, work, gpu, TensorsMode.Compiled, counts: counts);
+            return counts;
+        }
+        finally
+        {
+            AiDotNetEngine.Current = previous;
+            CpuParallelSettings.MaxDegreeOfParallelism = previousThreads;
+        }
+    }
+
+    /// <summary>The counts <see cref="MeasureCompiledStepCounts"/> fills in.</summary>
+    internal sealed class StepCounts
+    {
+        internal StepCounts(int warmupSteps, int measuredSteps)
+        {
+            WarmupSteps = warmupSteps;
+            MeasuredSteps = measuredSteps;
+        }
+
+        internal int WarmupSteps { get; }
+        internal int MeasuredSteps { get; }
+        /// <summary>Managed bytes allocated on the stepping thread per steady-state Step(), averaged over the measured steps.</summary>
+        internal long AllocatedBytesPerStep { get; set; }
+        /// <summary>Kernel nodes of the captured step graph (CUDA; null without one).</summary>
+        internal int? KernelNodes { get; set; }
+        internal int? MemcpyNodes { get; set; }
+        internal int? MemsetNodes { get; set; }
+        /// <summary>Why no graph was captured, when none was (CUDA).</summary>
+        internal string? GraphCaptureFailure { get; set; }
+    }
+
     private sealed class StepCrossingCapture
     {
         internal StepCrossingCapture(int measuredStep) => MeasuredStep = measuredStep;
@@ -519,7 +607,8 @@ internal static class HeadToHeadNetworkHarness
     internal const double DefaultWarmupMs = 1000;
 
     private static TrainRun TrainCompiled(JsonElement spec, IEngine engine, List<Func<Tensor<float>, Tensor<float>>> layers,
-        List<Tensor<float>> parameters, Tensor<float> x, Tensor<float> y, double lr, DirectGpuTensorEngine? gpu)
+        List<Tensor<float>> parameters, Tensor<float> x, Tensor<float> y, double lr, DirectGpuTensorEngine? gpu,
+        StepCounts? counts = null)
     {
         var allAxes = new[] { 0, 1 };
         using var plan = AiDotNet.Tensors.Engines.Compilation.TensorCodec.CompileTraining<float>(() =>
@@ -530,6 +619,26 @@ internal static class HeadToHeadNetworkHarness
         }, parameters.ToArray());
         plan.ConfigureOptimizer(AiDotNet.Tensors.Engines.Compilation.OptimizerType.SGD, lr);
         void Sync() => gpu?.SynchronizeStream();
+
+        if (counts is not null)
+        {
+            // Steady state only: the warmup compiles, captures and sizes every buffer.
+            for (int i = 0; i < counts.WarmupSteps; i++) { plan.Step(); Sync(); }
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < counts.MeasuredSteps; i++) { plan.Step(); Sync(); }
+            counts.AllocatedBytesPerStep = (GC.GetAllocatedBytesForCurrentThread() - before) / counts.MeasuredSteps;
+            if (gpu?.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cuda)
+            {
+                counts.GraphCaptureFailure = plan.GraphCaptureFailureReason;
+                if (counts.GraphCaptureFailure is null)
+                {
+                    counts.KernelNodes = cuda.LastCaptureKernelNodeCount;
+                    counts.MemcpyNodes = cuda.LastCaptureMemcpyNodeCount;
+                    counts.MemsetNodes = cuda.LastCaptureMemsetNodeCount;
+                }
+            }
+            return new TrainRun(new Dictionary<string, PhaseStats>(), Array.Empty<double>());
+        }
 
         int warmup = spec.GetProperty("warmupSteps").GetInt32();
         int measured = spec.GetProperty("measuredSteps").GetInt32();
@@ -559,7 +668,7 @@ internal static class HeadToHeadNetworkHarness
     }
 
     private static TrainRun TrainTensors(JsonElement spec, string work, DirectGpuTensorEngine? gpu, TensorsMode mode,
-        StepCrossingCapture? capture = null)
+        StepCrossingCapture? capture = null, StepCounts? counts = null)
     {
         IEngine engine = AiDotNetEngine.Current;
         Tensor<float> Place(Tensor<float> tensor) => gpu is null ? tensor : gpu.UploadToGpu(tensor, GpuTensorRole.General);
@@ -777,7 +886,7 @@ internal static class HeadToHeadNetworkHarness
         if (mode == TensorsMode.Compiled)
         {
             if (capture is not null) throw new ArgumentException("The crossing capture inspects the eager tape.", nameof(mode));
-            return TrainCompiled(spec, engine, layers, parameters, x, y, lr, gpu);
+            return TrainCompiled(spec, engine, layers, parameters, x, y, lr, gpu, counts);
         }
 
         // Phase boundaries synchronise only when the phase breakdown is being measured.
@@ -821,6 +930,8 @@ internal static class HeadToHeadNetworkHarness
                 ? AiDotNet.Tensors.Engines.Diagnostics.GpuResidencyScope.Begin(captureOperations: true)
                 : null;
             sw.Restart();
+            // An "autocast" spec sets AIDOTNET_AUTOCAST (RunTensors); the compiled plan opens the same scope itself.
+            using var stepAutocast = AiDotNet.Tensors.Engines.Gpu.AutocastScope.EnableFromEnvironment();
             using var tape = new GradientTape<float>();
             var h = x;
             foreach (var layer in layers) h = layer(h);

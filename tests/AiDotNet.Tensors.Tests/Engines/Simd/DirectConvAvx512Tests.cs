@@ -49,7 +49,52 @@ public class DirectConvAvx512Tests
         // positions per forward task (the default 128-task split) for a task to hold twelve.
         { 6, 32, 128, 16, 2, 1, 3, 1 },
         { 4, 64, 128, 24, 2, 1, 3, 1 },
+        // #1445: the strided input gradient's phases packed tile-interleaved, over several 32-channel tiles (64 and 128
+        // input channels), a 1x1 stride-2 conv whose odd phases receive no tap, and stride 3 (nine phases, uneven taps).
+        // The weight gradient packs its input sixteen channels wide for the 512-bit tile; a 13-wide plane exercises the
+        // pack's scalar tail (widths not a multiple of eight).
+        { 2, 64, 64, 16, 2, 1, 3, 1 },
+        { 2, 128, 64, 12, 2, 1, 3, 1 },
+        { 2, 64, 32, 8, 2, 0, 1, 1 },
+        { 2, 32, 64, 10, 3, 1, 3, 1 },
+        { 3, 64, 32, 13, 1, 1, 3, 1 },
     };
+
+    // The sixteen-wide weight-gradient packing on its own: 48 input channels (three wide blocks, not a multiple of the
+    // 32-channel tiles the forward and input gradient need), so only the weight gradient is compared.
+    [SkippableFact]
+    public void WideWeightGradientPacking_MatchesTheAvx2Tile_At48InputChannels()
+    {
+        Skip.IfNot(System.Runtime.Intrinsics.X86.Avx2.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported,
+            "The AVX2 side of the comparison needs AVX2 and FMA.");
+        const int batch = 2, inChannels = 48, outChannels = 32, size = 11, kernel = 3, padding = 1, stride = 1;
+        int o = (size + 2 * padding - kernel) / stride + 1;
+        var rng = new Random(1445);
+        var x = Random(rng, batch, inChannels, size, size);
+        var dy = Random(rng, batch, outChannels, o, o);
+        float[] Dw()
+        {
+            var dw = new float[outChannels * inChannels * kernel * kernel];
+            DirectConvAvx2.BackwardKernel(x.ToArray(), 0, dy.ToArray(), 0, dw, 0, accumulate: false, batch, inChannels, size,
+                size, outChannels, kernel, kernel, stride, stride, padding, padding, 1, 1, o, o);
+            return dw;
+        }
+        bool previous = DirectConvAvx2.s_useAvx512, previousForce = DirectConvAvx2.s_forceAvx512ForTest;
+        try
+        {
+            DirectConvAvx2.s_useAvx512 = true;
+            DirectConvAvx2.s_forceAvx512ForTest = !System.Runtime.Intrinsics.Vector512.IsHardwareAccelerated;
+            var wide = Dw();
+            DirectConvAvx2.s_useAvx512 = false;
+            var avx2 = Dw();
+            Assert.Equal(avx2, wide);
+        }
+        finally
+        {
+            DirectConvAvx2.s_useAvx512 = previous;
+            DirectConvAvx2.s_forceAvx512ForTest = previousForce;
+        }
+    }
 
     [SkippableTheory]
     [MemberData(nameof(Shapes))]

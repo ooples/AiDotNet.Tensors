@@ -8,6 +8,17 @@ internal static class MetalResidentKernels
     public const string Source = @"
 #include <metal_stdlib>
 using namespace metal;
+// 1 - beta^t without cancellation (see CudaOptimizerKernels.bias_correction). MSL has no expm1, so Kahan's form:
+// expm1(x) = (e - 1) * x / log(e) with e = exp(x), on the precise functions (fast math would undo the point).
+// 1 - beta is exact for beta in [0.5, 1], so log1p(-(1 - beta)) is log(beta).
+static inline float mtl_res_bias_correction(float beta, float t) {
+    float x = t * precise::log(beta);
+    float e = precise::exp(x);
+    if (e == 1.0f) return -x;
+    float em1 = e - 1.0f;
+    if (em1 == -1.0f) return 1.0f;
+    return -(em1 * (x / precise::log(e)));
+}
 
 kernel void hyperbolic_linear_forward(
     device const float* input [[buffer(0)]],
@@ -1006,7 +1017,7 @@ inline void optimizer_step(
         float m = a * state1[gid] + (1.0f - a) * g;
         float v = b * state2[gid] + (1.0f - b) * g * g;
         state1[gid] = m; state2[gid] = v;
-        float mHat = m / (1.0f - pow(a, float(step))), vHat = v / (1.0f - pow(b, float(step)));
+        float mHat = m / (mtl_res_bias_correction(a, float(step))), vHat = v / (mtl_res_bias_correction(b, float(step)));
         float update = learningRate * mHat / (sqrt(vHat) + c);
         parameter[gid] = operation == 3u ? value * (1.0f - learningRate * d) - update : value - update;
         return;
@@ -1022,12 +1033,12 @@ inline void optimizer_step(
     if (operation == 8u) {
         g += d * value; float m = a * state1[gid] + (1.0f - a) * g, v = b * state2[gid] + (1.0f - b) * g * g;
         state1[gid] = m; state2[gid] = v; float maximum = max(state3[gid], v); state3[gid] = maximum;
-        float mHat = m / (1.0f - pow(a, float(step))), maxHat = maximum / (1.0f - pow(b, float(step)));
+        float mHat = m / (mtl_res_bias_correction(a, float(step))), maxHat = maximum / (mtl_res_bias_correction(b, float(step)));
         parameter[gid] = value - learningRate * mHat / (sqrt(maxHat) + c); return;
     }
     if (operation == 9u) {
         g += d * value; float m = a * state1[gid] + (1.0f - a) * g, u = max(b * state2[gid], abs(g));
-        state1[gid] = m; state2[gid] = u; float mHat = m / (1.0f - pow(a, float(step)));
+        state1[gid] = m; state2[gid] = u; float mHat = m / (mtl_res_bias_correction(a, float(step)));
         parameter[gid] = value - learningRate * mHat / (u + c); return;
     }
     if (operation == 10u) {
@@ -1038,9 +1049,9 @@ inline void optimizer_step(
     if (operation == 11u) {
         g += d * value; float m = a * state1[gid] + (1.0f - a) * g, v = b * state2[gid] + (1.0f - b) * g * g;
         state1[gid] = m; state2[gid] = v;
-        float correction1 = 1.0f - pow(a, float(step)), correctionNext = 1.0f - pow(a, float(step + 1u));
+        float correction1 = mtl_res_bias_correction(a, float(step)), correctionNext = mtl_res_bias_correction(a, float(step + 1u));
         float nesterov = a * (m / correctionNext) + (1.0f - a) * g / correction1;   // Dozat 2016 Alg. 2 (constant mu)
-        parameter[gid] = value - learningRate * nesterov / (sqrt(v / (1.0f - pow(b, float(step)))) + c); return;
+        parameter[gid] = value - learningRate * nesterov / (sqrt(v / (mtl_res_bias_correction(b, float(step)))) + c); return;
     }
     if (operation == 12u) {
         float previous = state2[gid], current = previous + g * g; state2[gid] = current;
@@ -1109,7 +1120,7 @@ kernel void lamb_update_serial(
     if (gid != 0u) return;
     float learningRate = as_type<float>(learningRateBits), beta1 = as_type<float>(beta1Bits), beta2 = as_type<float>(beta2Bits);
     float epsilon = as_type<float>(epsilonBits), decay = as_type<float>(decayBits);
-    float correction1 = 1.0f - pow(beta1, float(step)), correction2 = 1.0f - pow(beta2, float(step));
+    float correction1 = mtl_res_bias_correction(beta1, float(step)), correction2 = mtl_res_bias_correction(beta2, float(step));
     for (uint i = 0; i < count; ++i) { float g = gradient[i]; m[i] = beta1 * m[i] + (1.0f - beta1) * g; v[i] = beta2 * v[i] + (1.0f - beta2) * g * g; }
     float parameterNorm = 0.0f, updateNorm = 0.0f;
     for (uint i = 0; i < count; ++i) { float update = (m[i] / correction1) / (sqrt(v[i] / correction2) + epsilon) + decay * parameter[i]; parameterNorm += parameter[i] * parameter[i]; updateNorm += update * update; }
@@ -1128,7 +1139,7 @@ kernel void sparse_optimizer_serial(
     if (gid != 0u) return;
     float learningRate = as_type<float>(learningRateBits), a = as_type<float>(aBits), b = as_type<float>(bBits);
     float c = as_type<float>(cBits), d = as_type<float>(dBits);
-    float correction1 = 1.0f - pow(a, float(step)), correction2 = 1.0f - pow(b, float(step));
+    float correction1 = mtl_res_bias_correction(a, float(step)), correction2 = mtl_res_bias_correction(b, float(step));
     for (uint k = 0u; k < nonzeroCount; ++k) {
         int bitIndex = as_type<int>(indices[k]);
         int numericIndex = int(indices[k]);
@@ -1152,7 +1163,7 @@ kernel void sparse_optimizer_serial(
         else if (operation == 8u) { if (d > 0.0f) g += d * value; float m = a * state1[i] + (1.0f - a) * g, v = b * state2[i] + (1.0f - b) * g * g; state1[i] = m; state2[i] = v; float maximum = max(state3[i], v); state3[i] = maximum; parameter[i] = value - learningRate * (m / correction1) / (sqrt(maximum / correction2) + c); }
         else if (operation == 9u) { if (d > 0.0f) g += d * value; float m = a * state1[i] + (1.0f - a) * g, u = max(b * state2[i], abs(g)); state1[i] = m; state2[i] = u; parameter[i] = value - (learningRate / correction1) * m / (u + c); }
         else if (operation == 10u) { float combined = a * state1[i] + (1.0f - a) * g, update = sign(combined); if (c > 0.0f) update += c * value; parameter[i] = value - learningRate * update; state1[i] = b * state1[i] + (1.0f - b) * g; }
-        else if (operation == 11u) { if (d > 0.0f) g += d * value; float m = a * state1[i] + (1.0f - a) * g, v = b * state2[i] + (1.0f - b) * g * g; state1[i] = m; state2[i] = v; float mHat = a * m / (1.0f - pow(a, float(step + 1u))) + (1.0f - a) * g / correction1; parameter[i] = value - learningRate * mHat / (sqrt(v / correction2) + c); }
+        else if (operation == 11u) { if (d > 0.0f) g += d * value; float m = a * state1[i] + (1.0f - a) * g, v = b * state2[i] + (1.0f - b) * g * g; state1[i] = m; state2[i] = v; float mHat = a * m / (mtl_res_bias_correction(a, float(step + 1u))) + (1.0f - a) * g / correction1; parameter[i] = value - learningRate * mHat / (sqrt(v / correction2) + c); }
         else if (operation == 12u) { float old = state2[i], current = old + g * g; state2[i] = current; float sigma = (sqrt(current) - sqrt(old)) / learningRate; float z = state1[i] + g - sigma * value; state1[i] = z; parameter[i] = abs(z) <= a ? 0.0f : ((z > 0.0f ? 1.0f : -1.0f) * a - z) / ((c + sqrt(current)) / learningRate + b); }
         else { float updated = value - learningRate * g, threshold = learningRate * a; parameter[i] = updated > threshold ? updated - threshold : (updated < -threshold ? updated + threshold : 0.0f); }
     }

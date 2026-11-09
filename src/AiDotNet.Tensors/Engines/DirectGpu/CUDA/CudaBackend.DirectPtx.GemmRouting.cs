@@ -282,7 +282,8 @@ public sealed partial class CudaBackend
             else
             {
                 if (!Matches(p, "codec-id", PtxTensorCoreGemmEvolution.GenomeCodec.Id) ||
-                    !Matches(p, "codec-version", PtxTensorCoreGemmEvolution.GenomeCodec.VersionHash)) return false;
+                    !Matches(p, "codec-version", PtxTensorCoreGemmEvolution.GenomeCodec.VersionHash) ||
+                    !TensorCoreVerdictMatchesRate(p)) return false;
                 PtxTensorCoreGemmConfiguration configuration = PtxTensorCoreGemmEvolution.GenomeCodec.Deserialize(genome);
                 route = CreateTensorCoreRoute(runtime, configuration, m, n, k);
             }
@@ -544,8 +545,50 @@ public sealed partial class CudaBackend
         return new GemmRouteVerdict(wins, median, minimum, bestCublas, bestPtx, GemmRouteRounds, reason);
     }
 
-    private static void PersistGemmRoute(DirectPtxRuntime runtime, CudaGemmRouteDecision decision, string genome,
+    private void PersistGemmRoute(DirectPtxRuntime runtime, CudaGemmRouteDecision decision, string genome,
         string codecId, string codecVersion)
+    {
+        var parameters = GemmRouteParameters(runtime, decision, genome, codecId, codecVersion);
+        // A TF32 verdict compares tensor-core TF32 (an FMLA32-class instruction) against cuBLAS's TF32: both move with
+        // the FP32-accumulate issue rate, but by different amounts (the generated kernel is more often issue-bound), so
+        // a verdict measured at half rate says nothing about an unlocked card. Keyed by rate class like the
+        // FP16-accumulate routes (#1549); strict FP32 runs on the CUDA cores and is unaffected.
+        if (!decision.StrictFp32) parameters["mma-rate"] = MmaRateClass();
+        PersistGemmRouteChoice(decision, parameters);
+    }
+
+    // A persisted TF32 verdict applies only at the rate class it was measured at. Verdicts recorded before the class was
+    // stored were measured on stock (reduced-rate) cards, so they are dropped once FP32 accumulation reads full rate.
+    private bool TensorCoreVerdictMatchesRate(Dictionary<string, string> parameters)
+    {
+        string current = MmaRateClass();
+        return parameters.TryGetValue("mma-rate", out string? recorded)
+            ? string.Equals(recorded, current, StringComparison.Ordinal)
+            : !string.Equals(current, PtxMmaRateProbe.FullRateClass, StringComparison.Ordinal);
+    }
+
+    private static Dictionary<string, string> GemmRouteParameters(DirectPtxRuntime runtime,
+        CudaGemmRouteDecision decision, string genome, string codecId, string codecVersion) =>
+        new(StringComparer.Ordinal)
+        {
+            ["device"] = PtxGemmEvolution.Fingerprint(runtime).LocalKey,
+            ["route"] = decision.UsesDirectPtx ? "ptx" : "cublas",
+            ["family"] = decision.StrictFp32 ? "sgemm" : "tf32",
+            ["kernel"] = decision.Kernel,
+            ["genome"] = genome,
+            ["codec-id"] = codecId,
+            ["codec-version"] = codecVersion,
+            ["median-speedup"] = decision.MedianSpeedup.ToString("R", CultureInfo.InvariantCulture),
+            ["minimum-speedup"] = decision.MinimumSpeedup.ToString("R", CultureInfo.InvariantCulture),
+            ["max-relative-difference"] = decision.MaxRelativeDifference.ToString("R", CultureInfo.InvariantCulture),
+            ["reason"] = decision.Reason,
+            ["graph-route"] = decision.UsesDirectPtxInGraph ? "ptx" : "cublas",
+            ["graph-median-speedup"] = decision.GraphMedianSpeedup.ToString("R", CultureInfo.InvariantCulture),
+            ["graph-minimum-speedup"] = decision.GraphMinimumSpeedup.ToString("R", CultureInfo.InvariantCulture),
+            ["graph-reason"] = decision.GraphReason,
+        };
+
+    private static void PersistGemmRouteChoice(CudaGemmRouteDecision decision, Dictionary<string, string> parameters)
     {
         var choice = new KernelChoice
         {
@@ -555,24 +598,7 @@ public sealed partial class CudaBackend
                 ? 2d * decision.M * decision.N * decision.K /
                   ((decision.UsesDirectPtx ? decision.DirectPtxMicroseconds : decision.CublasMicroseconds) * 1000.0)
                 : 0,
-            Parameters = new Dictionary<string, string>(StringComparer.Ordinal)
-            {
-                ["device"] = PtxGemmEvolution.Fingerprint(runtime).LocalKey,
-                ["route"] = decision.UsesDirectPtx ? "ptx" : "cublas",
-                ["family"] = decision.StrictFp32 ? "sgemm" : "tf32",
-                ["kernel"] = decision.Kernel,
-                ["genome"] = genome,
-                ["codec-id"] = codecId,
-                ["codec-version"] = codecVersion,
-                ["median-speedup"] = decision.MedianSpeedup.ToString("R", CultureInfo.InvariantCulture),
-                ["minimum-speedup"] = decision.MinimumSpeedup.ToString("R", CultureInfo.InvariantCulture),
-                ["max-relative-difference"] = decision.MaxRelativeDifference.ToString("R", CultureInfo.InvariantCulture),
-                ["reason"] = decision.Reason,
-                ["graph-route"] = decision.UsesDirectPtxInGraph ? "ptx" : "cublas",
-                ["graph-median-speedup"] = decision.GraphMedianSpeedup.ToString("R", CultureInfo.InvariantCulture),
-                ["graph-minimum-speedup"] = decision.GraphMinimumSpeedup.ToString("R", CultureInfo.InvariantCulture),
-                ["graph-reason"] = decision.GraphReason,
-            },
+            Parameters = parameters,
         };
         AutotuneCache.TryStore(GemmRouteKernelId,
             RouteShape(decision.M, decision.N, decision.K, decision.StrictFp32), choice);
