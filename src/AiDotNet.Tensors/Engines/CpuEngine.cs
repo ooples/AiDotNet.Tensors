@@ -42571,24 +42571,6 @@ public partial class CpuEngine : ITensorLevelEngine
         return result;
     }
 
-    /// <summary>
-    /// The source of a set-slice must be the slice: the destination's shape without <paramref name="axis"/>, with or
-    /// without size-1 dims (the slice's gradient keeps the axis as 1). Anything else was copied as a flat prefix,
-    /// silently writing the wrong elements.
-    /// </summary>
-    internal static void ValidateSliceSource(int[] destinationShape, int[] sourceShape, int axis)
-    {
-        var slice = destinationShape.Where((_, d) => d != axis).Where(n => n != 1);
-        if (!slice.SequenceEqual(sourceShape.Where(n => n != 1)))
-        {
-            var expected = destinationShape.Where((_, d) => d != axis);
-            throw new ArgumentException(
-                $"TensorSetSliceAxis: source shape [{string.Join(", ", sourceShape)}] is not the slice shape " +
-                $"[{string.Join(", ", expected)}] of destination [{string.Join(", ", destinationShape)}] along axis {axis}.",
-                "source");
-        }
-    }
-
     /// <inheritdoc/>
     [MethodImpl(Hot)]
     public void TensorSetSliceAxis<T>(Tensor<T> destination, Tensor<T> source, int axis, int index)
@@ -42599,7 +42581,7 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentOutOfRangeException(nameof(axis), $"Axis {axis} is out of range for tensor of rank {destination.Rank}.");
         if (index < 0 || index >= destination._shape[axis])
             throw new ArgumentOutOfRangeException(nameof(index), $"Index {index} is out of range for axis {axis} with size {destination._shape[axis]}.");
-        ValidateSliceSource(destination._shape, source._shape, axis);
+        ValidateSliceSourceShape(destination._shape, source._shape, axis);
 
         if (!destination.IsContiguous) throw new InvalidOperationException("TensorSetSliceAxis requires contiguous destination tensor.");
         var sourceOrig = source;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -42861,6 +42843,38 @@ public partial class CpuEngine : ITensorLevelEngine
                 throw new ArgumentException($"TensorScatter needs indices and source of one shape; dimension {d} is {indices[d]} vs {source[d]}.");
             if (d != axis && indices[d] != destination[d])
                 throw new ArgumentException($"TensorScatter needs indices to match the destination off the axis; dimension {d} is {indices[d]} vs {destination[d]}.");
+        }
+    }
+
+    /// <summary>
+    /// TensorSetSliceAxis shape rule: the source is one slice, the destination's shape without the axis (or with it at
+    /// length 1). A larger source used to be read in part.
+    /// </summary>
+    internal static void ValidateSliceSourceShape(int[] destination, int[] source, int axis)
+    {
+        bool removed = source.Length == destination.Length - 1, kept = source.Length == destination.Length;
+        for (int d = 0, s = 0; (removed || kept) && d < destination.Length; d++)
+        {
+            if (d == axis) { if (kept && source[s++] != 1) kept = false; continue; }
+            if (source[s++] != destination[d]) { removed = false; kept = false; }
+        }
+        if (!removed && !kept)
+            throw new ArgumentException($"TensorSetSliceAxis needs a source of the destination's shape without axis {axis}; got [{string.Join(", ", source)}] for [{string.Join(", ", destination)}].", "source");
+    }
+
+    /// <summary>
+    /// index_copy / index_add shape rule: values has the input's shape with the axis length replaced by the index count.
+    /// </summary>
+    internal static void ValidateIndexedValuesShape(string op, int[] input, int indexCount, int[] values, int axis)
+    {
+        bool ok = values.Length == input.Length;
+        for (int d = 0; ok && d < input.Length; d++)
+            ok = values[d] == (d == axis ? indexCount : input[d]);
+        if (!ok)
+        {
+            var expected = (int[])input.Clone();
+            expected[axis] = indexCount;
+            throw new ArgumentException($"{op} needs values of shape [{string.Join(", ", expected)}] ({indexCount} slices along axis {axis}); got [{string.Join(", ", values)}].", "values");
         }
     }
 
@@ -44206,7 +44220,7 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = axis + 1; i < input._shape.Length; i++) innerSize *= input._shape[i];
         // index_copy / index_add semantics: values holds one slice per index, so it has the input's shape with the
         // axis length replaced by the index count. A larger tensor used to be read in part, at the wrong offsets.
-        ValidateIndexCopyValues("Scatter", input._shape, values._shape, indices.Length, axis);
+        ValidateIndexedValuesShape("Scatter", input._shape, indices.Length, values._shape, axis);
 
         for (int outer = 0; outer < outerSize; outer++)
         {
@@ -44225,24 +44239,6 @@ public partial class CpuEngine : ITensorLevelEngine
         DifferentiableOps.RecordBinary("Scatter", result, input, values, BackwardFunctions<T>.ScatterBackward, new object[] { indicesOrig, axis });
         { var ca2 = input; var ci2 = indices; var cv2 = values; var cx2 = axis; AutoTracer.RecordOp("Scatter", result, eng => eng.Scatter(ca2, ci2, cv2, cx2)); }
         return result;
-    }
-
-    /// <summary>
-    /// index_copy / index_add shape contract: values has the input's rank and shape, with the axis length replaced by
-    /// the index count. Checking only the element count let a values tensor of another layout (for input [2,3,4] and two
-    /// indices on axis 1, values [2,4,2] instead of [2,2,4]) be read regrouped at the wrong offsets.
-    /// </summary>
-    private static void ValidateIndexCopyValues(string op, int[] inputShape, int[] valuesShape, int indexCount, int axis)
-    {
-        bool matches = valuesShape.Length == inputShape.Length;
-        for (int d = 0; matches && d < inputShape.Length; d++)
-            matches = valuesShape[d] == (d == axis ? indexCount : inputShape[d]);
-        if (matches) return;
-        var expected = (int[])inputShape.Clone();
-        expected[axis] = indexCount;
-        throw new ArgumentException(
-            $"{op} needs values of shape [{string.Join(", ", expected)}] ({indexCount} slices along axis {axis}); got [{string.Join(", ", valuesShape)}].",
-            "values");
     }
 
     /// <inheritdoc/>
@@ -44281,7 +44277,7 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = axis + 1; i < input._shape.Length; i++) innerSize *= input._shape[i];
         // index_copy / index_add semantics: values holds one slice per index, so it has the input's shape with the
         // axis length replaced by the index count. A larger tensor used to be read in part, at the wrong offsets.
-        ValidateIndexCopyValues("ScatterAdd", input._shape, values._shape, indices.Length, axis);
+        ValidateIndexedValuesShape("ScatterAdd", input._shape, indices.Length, values._shape, axis);
 
         for (int outer = 0; outer < outerSize; outer++)
         {

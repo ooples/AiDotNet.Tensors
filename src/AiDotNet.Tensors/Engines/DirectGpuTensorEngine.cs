@@ -27660,11 +27660,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var __gpuOp = EnterGpuOp();
         if (System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1")
             AliasDiag($"SetSliceAxis ENTRY residentStep={ResidentStepActive} float={typeof(T) == typeof(float)} dstContig={destination.IsContiguous} axis={axis} idx={index} dst=[{string.Join(",", destination._shape)}]");
+        if (destination is null) throw new ArgumentNullException(nameof(destination));
+        if (source is null) throw new ArgumentNullException(nameof(source));
+        if (axis >= 0 && axis < destination.Rank)
+            CpuEngine.ValidateSliceSourceShape(destination._shape, source._shape, axis);
         if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
             && destination.IsContiguous && axis >= 0 && axis < destination.Rank
             && index >= 0 && index < destination.Shape._dims[axis] && TryGetBackend(out var backend))
         {
-            ValidateSliceSource(destination._shape, source._shape, axis);
             var src = source.IsContiguous ? source : source.Contiguous();
             var srcR = ResolveResidentBufferNoUpload(backend, src, src.Length);
             if (srcR is null && System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1")
