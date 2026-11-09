@@ -18,7 +18,9 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: benchmark-claims-${{ github.event.pull_request.number || github.ref }}
+  # Pull-request runs share a group per ref; any other run (a push to main, a schedule) gets its own, so main
+  # runs never cancel or replace one another and every push to main produces its results and coverage.
+  group: benchmark-claims-${{ github.event.pull_request.number || (github.event_name == 'pull_request' && github.ref || github.run_id) }}
   cancel-in-progress: true
 
 # contents: read covers the checkout and the repository-description lookup (public repository metadata).

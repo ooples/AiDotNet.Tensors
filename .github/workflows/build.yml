@@ -6,7 +6,9 @@ on:
   workflow_call:
 
 concurrency:
-  group: build-${{ github.ref }}
+  # Pull-request runs share a group per ref; any other run (a push to main, a schedule) gets its own, so main
+  # runs never cancel or replace one another and every push to main produces its results and coverage.
+  group: build-${{ (github.event_name == 'pull_request' && github.ref || github.run_id) }}
   # Only superseded PR runs are cancelled. A cancelled main run uploads no coverage, and codecov then
   # scores every open PR against an older base: #1066 and #1064 both merged within a minute on
   # 2026-09-29, each cancelled the other, and #1067's codecov/patch read 15.38% while codecov's own

@@ -11,7 +11,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: evolution-lifecycle-${{ github.ref }}
+  # Pull-request runs share a group per ref; any other run (a push to main, a schedule) gets its own, so main
+  # runs never cancel or replace one another and every push to main produces its results and coverage.
+  group: evolution-lifecycle-${{ (github.event_name == 'pull_request' && github.ref || github.run_id) }}
   cancel-in-progress: true
 
 jobs:
