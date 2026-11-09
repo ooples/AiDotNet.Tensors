@@ -801,6 +801,7 @@ public partial class CpuEngine
         if (GraphMode.IsInferenceTrace)
             return CaptureInferenceKernel(new[] { input }, engine => engine.TensorPDist(input, p));
         if (input.Rank != 2) throw new ArgumentException("PDist requires rank-2 input");
+        ValidateNormOrder(p);
         int n = input._shape[0];
         int d = input._shape[1];
         if (n == 0) return new Tensor<T>(new[] { 0 });
@@ -844,6 +845,7 @@ public partial class CpuEngine
                 new[] { x1, x2 }, engine => engine.TensorCDist(x1, x2, p));
         if (x1.Rank < 2 || x2.Rank < 2)
             throw new ArgumentException("CDist needs inputs of shape [..., P, M] and [..., R, M].");
+        ValidateNormOrder(p);
         if (x1._shape[x1.Rank - 1] != x2._shape[x2.Rank - 1])
             throw new ArgumentException("CDist: feature dim must match");
         // torch.cdist: leading batch dims broadcast; the output is [batch..., P, R].
@@ -942,9 +944,12 @@ public partial class CpuEngine
                 float diff = System.Math.Abs(ops.ToFloat(s[offA + k]) - ops.ToFloat(s[offB + k]));
                 if (pf == 1f) sumF += diff;
                 else if (pf == 2f) sumF += diff * diff;
+                else if (pf == 0f) sumF += diff != 0f ? 1f : 0f;
+                else if (float.IsPositiveInfinity(pf)) sumF = System.Math.Max(sumF, diff);
                 else sumF += (float)System.Math.Pow(diff, p);
             }
-            float resF = pf == 1f ? sumF : pf == 2f ? (float)System.Math.Sqrt(sumF) : (float)System.Math.Pow(sumF, 1.0 / p);
+            float resF = pf == 1f || pf == 0f || float.IsPositiveInfinity(pf) ? sumF
+                : pf == 2f ? (float)System.Math.Sqrt(sumF) : (float)System.Math.Pow(sumF, 1.0 / p);
             return ops.FromFloat(resF);
         }
 
@@ -953,9 +958,9 @@ public partial class CpuEngine
         for (int k = 0; k < d; k++)
         {
             double diff = System.Convert.ToDouble(s[offA + k]) - System.Convert.ToDouble(s[offB + k]);
-            acc += System.Math.Pow(System.Math.Abs(diff), p);
+            acc = AccumulateNorm(acc, System.Math.Abs(diff), p);
         }
-        return ops.FromDouble(System.Math.Pow(acc, 1.0 / p));
+        return ops.FromDouble(FinishNorm(acc, p));
     }
 
     private static T PNormCross<T>(Interfaces.INumericOperations<T> ops,
@@ -982,9 +987,12 @@ public partial class CpuEngine
                 float diff = System.Math.Abs(ops.ToFloat(a[offA + k]) - ops.ToFloat(b[offB + k]));
                 if (pf == 1f) sumF += diff;
                 else if (pf == 2f) sumF += diff * diff;
+                else if (pf == 0f) sumF += diff != 0f ? 1f : 0f;
+                else if (float.IsPositiveInfinity(pf)) sumF = System.Math.Max(sumF, diff);
                 else sumF += (float)System.Math.Pow(diff, p);
             }
-            float resF = pf == 1f ? sumF : pf == 2f ? (float)System.Math.Sqrt(sumF) : (float)System.Math.Pow(sumF, 1.0 / p);
+            float resF = pf == 1f || pf == 0f || float.IsPositiveInfinity(pf) ? sumF
+                : pf == 2f ? (float)System.Math.Sqrt(sumF) : (float)System.Math.Pow(sumF, 1.0 / p);
             return ops.FromFloat(resF);
         }
 
@@ -995,9 +1003,28 @@ public partial class CpuEngine
         for (int k = 0; k < d; k++)
         {
             double diff = System.Convert.ToDouble(a[offA + k]) - System.Convert.ToDouble(b[offB + k]);
-            acc += System.Math.Pow(System.Math.Abs(diff), p);
+            acc = AccumulateNorm(acc, System.Math.Abs(diff), p);
         }
-        return ops.FromDouble(System.Math.Pow(acc, 1.0 / p));
+        return ops.FromDouble(FinishNorm(acc, p));
+    }
+
+    /// <summary>
+    /// One coordinate of a torch p-norm distance: p = 0 counts differing coordinates, p = +inf keeps the largest
+    /// difference, any other p sums |diff|^p.
+    /// </summary>
+    private static double AccumulateNorm(double acc, double absDiff, double p) =>
+        p == 0 ? acc + (absDiff != 0 ? 1 : 0)
+        : double.IsPositiveInfinity(p) ? System.Math.Max(acc, absDiff)
+        : acc + System.Math.Pow(absDiff, p);
+
+    private static double FinishNorm(double acc, double p) =>
+        p == 0 || double.IsPositiveInfinity(p) ? acc : System.Math.Pow(acc, 1.0 / p);
+
+    /// <summary>torch.cdist / pdist take p in [0, +inf]; a negative or NaN p has no norm.</summary>
+    internal static void ValidateNormOrder(double p)
+    {
+        if (double.IsNaN(p) || p < 0)
+            throw new ArgumentOutOfRangeException(nameof(p), $"The p-norm order must be in [0, +inf]; got {p}.");
     }
 
     /// <inheritdoc/>

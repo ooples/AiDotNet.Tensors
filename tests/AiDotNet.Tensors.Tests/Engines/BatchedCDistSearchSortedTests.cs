@@ -170,6 +170,43 @@ public sealed class BatchedCDistSearchSortedTests
     }
 
     [Fact]
+    public void Cdist_and_pdist_take_torch_special_norm_orders()
+    {
+        var eng = new CpuEngine();
+        // Rows minus b give diffs (3, 0, -1) and (1, 4, 2): p = 0 counts nonzero diffs, p = inf takes the largest.
+        var a = new Tensor<double>(new[] { 1, 2, 3 }, new Vector<double>(new[] { 4.0, 1.0, 0.0, 2.0, 5.0, 3.0 }));
+        var b = new Tensor<double>(new[] { 1, 1, 3 }, new Vector<double>(new[] { 1.0, 1.0, 1.0 }));
+        Assert.Equal(new[] { 2.0, 3.0 }, eng.TensorCDist(a, b, 0.0).ToArray());
+        Assert.Equal(new[] { 3.0, 4.0 }, eng.TensorCDist(a, b, double.PositiveInfinity).ToArray());
+        var af = new Tensor<float>(new[] { 2, 3 }, new Vector<float>(new[] { 4f, 1f, 0f, 2f, 5f, 3f }));
+        var bf = new Tensor<float>(new[] { 1, 3 }, new Vector<float>(new[] { 1f, 1f, 1f }));
+        Assert.Equal(new[] { 2f, 3f }, eng.TensorCDist(af, bf, 0.0).ToArray());
+        Assert.Equal(new[] { 3f, 4f }, eng.TensorCDist(af, bf, double.PositiveInfinity).ToArray());
+        // pdist over the rows of [[4, 1, 0], [2, 5, 3]]: diffs (2, 4, 3).
+        Assert.Equal(new[] { 3.0 }, eng.TensorPDist(new Tensor<double>(new[] { 2, 3 }, new Vector<double>(new[] { 4.0, 1.0, 0.0, 2.0, 5.0, 3.0 })), 0.0).ToArray());
+        Assert.Equal(new[] { 4f }, eng.TensorPDist(af, double.PositiveInfinity).ToArray());
+        Assert.Throws<ArgumentOutOfRangeException>(() => eng.TensorCDist(a, b, -1.0));
+        Assert.Throws<ArgumentOutOfRangeException>(() => eng.TensorPDist(af, double.NaN));
+    }
+
+    [Fact]
+    public void Cdist_special_norm_orders_have_torch_gradients()
+    {
+        var eng = new CpuEngine();
+        var a = new Tensor<double>(new[] { 1, 1, 3 }, new Vector<double>(new[] { 4.0, 1.0, 0.0 }));
+        var b = new Tensor<double>(new[] { 1, 1, 3 }, new Vector<double>(new[] { 1.0, 1.0, 1.0 }));
+        System.Collections.Generic.Dictionary<Tensor<double>, Tensor<double>> gInf, gZero;
+        using (var tape = new GradientTape<double>())
+            gInf = tape.ComputeGradients(eng.ReduceSum(eng.TensorCDist(a, b, double.PositiveInfinity), null, keepDims: false), new[] { a, b });
+        using (var tape = new GradientTape<double>())
+            gZero = tape.ComputeGradients(eng.ReduceSum(eng.TensorCDist(a, b, 0.0), null, keepDims: false), new[] { a, b });
+        // max-norm: sign(diff) on the coordinate attaining the maximum (diff 3 at k = 0), zero elsewhere.
+        Assert.Equal(new[] { 1.0, 0.0, 0.0 }, gInf[a].ToArray());
+        Assert.Equal(new[] { -1.0, 0.0, 0.0 }, gInf[b].ToArray());
+        Assert.Equal(new[] { 0.0, 0.0, 0.0 }, gZero[a].ToArray());
+    }
+
+    [Fact]
     public void Cdist_rejects_batch_dims_that_do_not_broadcast()
     {
         var eng = new CpuEngine();

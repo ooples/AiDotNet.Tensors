@@ -1068,13 +1068,13 @@ extern ""C"" __global__ void parity210_index_write(float* __restrict__ output, c
 }
 extern ""C"" __global__ void parity210_cdist(const float* __restrict__ x1, const float* __restrict__ x2, float* __restrict__ output, int m, int n, int d, float p) {
     int idx = blockIdx.x*blockDim.x+threadIdx.x; if (idx>=m*n) return; int j=idx%n; int i=idx/n; float sum=0.0f;
-    for (int k=0;k<d;k++){ float diff=fabsf(x1[i*d+k]-x2[j*d+k]); if (p==1.0f) sum+=diff; else if (p==2.0f) sum+=diff*diff; else sum+=powf(diff,p); }
-    output[idx]=(p==1.0f)?sum:(p==2.0f)?sqrtf(sum):powf(sum,1.0f/p);
+    for (int k=0;k<d;k++){ float diff=fabsf(x1[i*d+k]-x2[j*d+k]); if (p==1.0f) sum+=diff; else if (p==2.0f) sum+=diff*diff; else if (p==0.0f) sum+=(diff!=0.0f)?1.0f:0.0f; else if (p<0.0f) sum=fmaxf(sum,diff); else sum+=powf(diff,p); }
+    output[idx]=(p==1.0f||p==0.0f||p<0.0f)?sum:(p==2.0f)?sqrtf(sum):powf(sum,1.0f/p);
 }
 extern ""C"" __global__ void parity210_pdist(const float* __restrict__ input, float* __restrict__ output, int n, int d, float p) {
     int flat = blockIdx.x*blockDim.x+threadIdx.x; if (flat>=n*n) return; int j=flat%n; int i=flat/n; if (i>=j) return; float sum=0.0f;
-    for (int k=0;k<d;k++){ float diff=fabsf(input[i*d+k]-input[j*d+k]); if (p==1.0f) sum+=diff; else if (p==2.0f) sum+=diff*diff; else sum+=powf(diff,p); }
-    float dist=(p==1.0f)?sum:(p==2.0f)?sqrtf(sum):powf(sum,1.0f/p); int outIdx=i*n-(i*(i+1))/2+(j-i-1); output[outIdx]=dist;
+    for (int k=0;k<d;k++){ float diff=fabsf(input[i*d+k]-input[j*d+k]); if (p==1.0f) sum+=diff; else if (p==2.0f) sum+=diff*diff; else if (p==0.0f) sum+=(diff!=0.0f)?1.0f:0.0f; else if (p<0.0f) sum=fmaxf(sum,diff); else sum+=powf(diff,p); }
+    float dist=(p==1.0f||p==0.0f||p<0.0f)?sum:(p==2.0f)?sqrtf(sum):powf(sum,1.0f/p); int outIdx=i*n-(i*(i+1))/2+(j-i-1); output[outIdx]=dist;
 }
 extern ""C"" __global__ void parity210_histc(const float* __restrict__ input, float* __restrict__ hist, int n, int bins, float mn, float mx) {
     int idx = blockIdx.x*blockDim.x+threadIdx.x; if (idx>=n) return; float x=input[idx]; if (!(x>=mn&&x<=mx)) return;

@@ -1330,8 +1330,8 @@ kernel void parity210_cdist(
     constant float& p [[buffer(6)]],
     uint gid [[thread_position_in_grid]]) {
     int idx = (int)gid; if (idx>=m*n) return; int j=idx%n; int i=idx/n; float sum=0.0f;
-    for (int k=0;k<d;k++){ float diff=fabs(x1[i*d+k]-x2[j*d+k]); if (p==1.0f) sum+=diff; else if (p==2.0f) sum+=diff*diff; else sum+=pow(diff,p); }
-    output[idx]=(p==1.0f)?sum:(p==2.0f)?sqrt(sum):pow(sum,1.0f/p);
+    for (int k=0;k<d;k++){ float diff=fabs(x1[i*d+k]-x2[j*d+k]); if (p==1.0f) sum+=diff; else if (p==2.0f) sum+=diff*diff; else if (p==0.0f) sum+=(diff!=0.0f)?1.0f:0.0f; else if (p<0.0f) sum=fmax(sum,diff); else sum+=pow(diff,p); }
+    output[idx]=(p==1.0f||p==0.0f||p<0.0f)?sum:(p==2.0f)?sqrt(sum):pow(sum,1.0f/p);
 }
 
 kernel void parity210_pdist(
@@ -1342,8 +1342,8 @@ kernel void parity210_pdist(
     constant float& p [[buffer(4)]],
     uint gid [[thread_position_in_grid]]) {
     int flat = (int)gid; if (flat>=n*n) return; int j=flat%n; int i=flat/n; if (i>=j) return; float sum=0.0f;
-    for (int k=0;k<d;k++){ float diff=fabs(input[i*d+k]-input[j*d+k]); if (p==1.0f) sum+=diff; else if (p==2.0f) sum+=diff*diff; else sum+=pow(diff,p); }
-    float dist=(p==1.0f)?sum:(p==2.0f)?sqrt(sum):pow(sum,1.0f/p); int outIdx=i*n-(i*(i+1))/2+(j-i-1); output[outIdx]=dist;
+    for (int k=0;k<d;k++){ float diff=fabs(input[i*d+k]-input[j*d+k]); if (p==1.0f) sum+=diff; else if (p==2.0f) sum+=diff*diff; else if (p==0.0f) sum+=(diff!=0.0f)?1.0f:0.0f; else if (p<0.0f) sum=fmax(sum,diff); else sum+=pow(diff,p); }
+    float dist=(p==1.0f||p==0.0f||p<0.0f)?sum:(p==2.0f)?sqrt(sum):pow(sum,1.0f/p); int outIdx=i*n-(i*(i+1))/2+(j-i-1); output[outIdx]=dist;
 }
 
 kernel void parity210_histc(

@@ -265,8 +265,8 @@ struct P { m: i32, n: i32, d: i32, p: f32 };
 @group(0) @binding(3) var<uniform> pc : P;
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let idx = i32(gid.x); if (idx >= pc.m * pc.n) { return; } let j = idx % pc.n; let i = idx / pc.n; var sum = 0.0;
-  for (var k = 0; k < pc.d; k = k + 1) { let diff = abs(x1[i * pc.d + k] - x2[j * pc.d + k]); if (pc.p == 1.0) { sum = sum + diff; } else if (pc.p == 2.0) { sum = sum + diff * diff; } else { sum = sum + pow(diff, pc.p); } }
-  outp[idx] = select(select(pow(sum, 1.0 / pc.p), sqrt(sum), pc.p == 2.0), sum, pc.p == 1.0);
+  for (var k = 0; k < pc.d; k = k + 1) { let diff = abs(x1[i * pc.d + k] - x2[j * pc.d + k]); if (pc.p == 1.0) { sum = sum + diff; } else if (pc.p == 2.0) { sum = sum + diff * diff; } else if (pc.p == 0.0) { sum = sum + select(0.0, 1.0, diff != 0.0); } else if (pc.p < 0.0) { sum = max(sum, diff); } else { sum = sum + pow(diff, pc.p); } }
+  outp[idx] = select(select(pow(sum, 1.0 / pc.p), sqrt(sum), pc.p == 2.0), sum, pc.p == 1.0 || pc.p == 0.0 || pc.p < 0.0);
 }";
 
     public static string Pdist => @"
@@ -276,8 +276,8 @@ struct P { n: i32, d: i32, p: f32 };
 @group(0) @binding(2) var<uniform> pc : P;
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let flat = i32(gid.x); if (flat >= pc.n * pc.n) { return; } let j = flat % pc.n; let i = flat / pc.n; if (i >= j) { return; } var sum = 0.0;
-  for (var k = 0; k < pc.d; k = k + 1) { let diff = abs(inp[i * pc.d + k] - inp[j * pc.d + k]); if (pc.p == 1.0) { sum = sum + diff; } else if (pc.p == 2.0) { sum = sum + diff * diff; } else { sum = sum + pow(diff, pc.p); } }
-  let dist = select(select(pow(sum, 1.0 / pc.p), sqrt(sum), pc.p == 2.0), sum, pc.p == 1.0);
+  for (var k = 0; k < pc.d; k = k + 1) { let diff = abs(inp[i * pc.d + k] - inp[j * pc.d + k]); if (pc.p == 1.0) { sum = sum + diff; } else if (pc.p == 2.0) { sum = sum + diff * diff; } else if (pc.p == 0.0) { sum = sum + select(0.0, 1.0, diff != 0.0); } else if (pc.p < 0.0) { sum = max(sum, diff); } else { sum = sum + pow(diff, pc.p); } }
+  let dist = select(select(pow(sum, 1.0 / pc.p), sqrt(sum), pc.p == 2.0), sum, pc.p == 1.0 || pc.p == 0.0 || pc.p < 0.0);
   let outIdx = i * pc.n - (i * (i + 1)) / 2 + (j - i - 1); outp[outIdx] = dist;
 }";
 

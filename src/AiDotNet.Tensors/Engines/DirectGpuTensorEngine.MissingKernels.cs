@@ -5283,11 +5283,18 @@ public partial class DirectGpuTensorEngine
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorHistc", capabilityGap); return base.TensorHistc(input, bins, min, max); }
     }
 
+    /// <summary>
+    /// The p the cdist/pdist kernels take: +inf travels as -1, because finite-math compiler flags may assume a float
+    /// is never infinite; 0 (count of differing coordinates) and finite p pass through.
+    /// </summary>
+    private static float KernelNormOrder(double p) => double.IsPositiveInfinity(p) ? -1f : (float)p;
+
     /// <inheritdoc/>
     public override Tensor<T> TensorPDist<T>(Tensor<T> input, double p = 2.0)
     {
         using var __gpuOp = EnterGpuOp();
         if (input is null) throw new ArgumentNullException(nameof(input));
+        CpuEngine.ValidateNormOrder(p);
         if (typeof(T) != typeof(float) || input.Rank != 2 || input._shape[0] < 2 || !TryGetBackend(out var backend))
             return base.TensorPDist(input, p);
         try
@@ -5297,7 +5304,7 @@ public partial class DirectGpuTensorEngine
             int outN = n * (n - 1) / 2;
             using var bufIn = GetOrAllocateBuffer(backend, c);
             var bufOut = AllocateOutputBuffer(backend, outN);
-            backend.PDist(bufIn.Buffer, bufOut.Buffer, n, d, (float)p);
+            backend.PDist(bufIn.Buffer, bufOut.Buffer, n, d, KernelNormOrder(p));
             var arr = FinishGpuOp<T>(backend, bufOut, outN);
             var res = new Tensor<T>(arr, new[] { outN });
             // Record against the ORIGINAL input, not the Contiguous() copy, and with the same
@@ -5317,6 +5324,7 @@ public partial class DirectGpuTensorEngine
         using var __gpuOp = EnterGpuOp();
         if (x1 is null) throw new ArgumentNullException(nameof(x1));
         if (x2 is null) throw new ArgumentNullException(nameof(x2));
+        CpuEngine.ValidateNormOrder(p);
         if (typeof(T) != typeof(float) || x1.Rank != 2 || x2.Rank != 2
             || x1._shape[1] != x2._shape[1] || !TryGetBackend(out var backend))
             return base.TensorCDist(x1, x2, p);
@@ -5333,7 +5341,7 @@ public partial class DirectGpuTensorEngine
             using var buf1 = GetOrAllocateBuffer(backend, c1);
             using var buf2 = GetOrAllocateBuffer(backend, c2);
             var bufOut = AllocateOutputBuffer(backend, outN);
-            backend.CDist(buf1.Buffer, buf2.Buffer, bufOut.Buffer, m, n, d, (float)p);
+            backend.CDist(buf1.Buffer, buf2.Buffer, bufOut.Buffer, m, n, d, KernelNormOrder(p));
             var arr = FinishGpuOp<T>(backend, bufOut, outN);
             var res = new Tensor<T>(arr, new[] { m, n });
             // Record against the ORIGINAL operands, not the Contiguous() copies.

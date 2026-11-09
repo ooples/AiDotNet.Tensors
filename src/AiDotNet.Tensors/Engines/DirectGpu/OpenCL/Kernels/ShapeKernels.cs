@@ -216,9 +216,11 @@ __kernel void cdist(__global const float* x1, __global const float* x2, __global
         float diff = fabs(x1[i * d + k] - x2[j * d + k]);
         if (p == 1.0f) sum += diff;
         else if (p == 2.0f) sum += diff * diff;
+        else if (p == 0.0f) sum += (diff != 0.0f) ? 1.0f : 0.0f;
+        else if (p < 0.0f) sum = fmax(sum, diff);
         else sum += pow(diff, p);
     }
-    output[idx] = (p == 1.0f) ? sum : (p == 2.0f) ? sqrt(sum) : pow(sum, 1.0f / p);
+    output[idx] = (p == 1.0f || p == 0.0f || p < 0.0f) ? sum : (p == 2.0f) ? sqrt(sum) : pow(sum, 1.0f / p);
 }
 // Hierarchical-softmax leaf probabilities from raw per-level node activations `acts` [rows, treeDepth].
 // gate = sigmoid(acts[level]); per class c, prob = product over levels of (bit ? gate : 1-gate), with the
@@ -706,9 +708,11 @@ __kernel void pdist(__global const float* input, __global float* output, int n, 
         float diff = fabs(input[i * d + k] - input[j * d + k]);
         if (p == 1.0f) sum += diff;
         else if (p == 2.0f) sum += diff * diff;
+        else if (p == 0.0f) sum += (diff != 0.0f) ? 1.0f : 0.0f;
+        else if (p < 0.0f) sum = fmax(sum, diff);
         else sum += pow(diff, p);
     }
-    float dist = (p == 1.0f) ? sum : (p == 2.0f) ? sqrt(sum) : pow(sum, 1.0f / p);
+    float dist = (p == 1.0f || p == 0.0f || p < 0.0f) ? sum : (p == 2.0f) ? sqrt(sum) : pow(sum, 1.0f / p);
     int outIdx = i * n - (i * (i + 1)) / 2 + (j - i - 1);
     output[outIdx] = dist;
 }

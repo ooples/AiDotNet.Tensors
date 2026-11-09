@@ -4647,6 +4647,16 @@ internal static class BackwardFunctions<T>
     {
         if (dist == 0.0) return 0.0;          // kink: choose the 0 subgradient
         if (diff == 0.0) return 0.0;
+        if (p == 0.0) return 0.0;             // a count of differing coordinates is piecewise constant
+        // The max-norm moves with the coordinates that attain the maximum (torch: sign(diff) where |diff| == dist).
+        // A float tensor's forward rounds |a - b| to float (exactly the float of this double difference), so the
+        // comparison is at float precision when the distance is a float value.
+        if (double.IsPositiveInfinity(p))
+        {
+            double absDiff = Math.Abs(diff);
+            bool attains = absDiff == dist || (dist == (float)dist && (float)absDiff == (float)dist);
+            return attains ? (diff > 0 ? 1.0 : -1.0) : 0.0;
+        }
         if (p == 2.0) return diff / dist;     // |d|·sign(d)·dist^-1 == d/dist
         if (p == 1.0) return diff > 0 ? 1.0 : -1.0;
         double mag = Math.Pow(Math.Abs(diff), p - 1.0) * Math.Pow(dist, 1.0 - p);
