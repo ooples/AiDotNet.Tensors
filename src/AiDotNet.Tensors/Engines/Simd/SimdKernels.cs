@@ -3072,7 +3072,9 @@ namespace AiDotNet.Tensors.Engines.Simd
 
         /// <summary>
         /// Cephes-style fast exp for Vector256&lt;double&gt; (4 doubles per vector).
-        /// Uses 11th-order minimax polynomial for double precision (~1e-16 relative error).
+        /// Uses a degree-13 Taylor polynomial on the reduced range |r| &lt;= ln2/2. Its truncation error is
+        /// negligible; rounding in the evaluation leaves a maximum error of about 1 ULP (1.001 ULP measured
+        /// over x in [-700, 700]), so results are not correctly rounded.
         /// </summary>
         [MethodImpl(HotInline)]
         private static Vector256<double> FastExpDouble256(Vector256<double> x)
