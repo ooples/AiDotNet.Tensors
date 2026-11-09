@@ -98,3 +98,12 @@ AiDotNet.Tensors.Engines.Compilation.GradientRegularizationOrder.ClipThenRegular
 AiDotNet.Tensors.Engines.Compilation.GradientRegularizationOrder.RegularizeThenClip = 0 -> AiDotNet.Tensors.Engines.Compilation.GradientRegularizationOrder
 AiDotNet.Tensors.Engines.Compilation.ICompiledTrainingPlanRegularizationOrder
 AiDotNet.Tensors.Engines.Compilation.ICompiledTrainingPlanRegularizationOrder.SetL2Regularization(double strength, AiDotNet.Tensors.Engines.Compilation.GradientRegularizationOrder order) -> void
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.Int32ToFloat(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! raw, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int n) -> void
+AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend.Int32ToFloat(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! raw, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int n) -> void
+AiDotNet.Tensors.Engines.DirectGpu.IDirectGpuBackend.Int32ToFloat(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! raw, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int n) -> void
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalBackend.Int32ToFloat(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! raw, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int n) -> void
+AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend.Int32ToFloat(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! raw, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int n) -> void
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Int32ToFloat(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! raw, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int n) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanAuditKernels.Int32ToFloat.get -> string!
+static AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuAuditKernels.Int32ToFloat.get -> string!
+virtual AiDotNet.Tensors.Engines.Gpu.DelegatingGpuBackend.Int32ToFloat(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! raw, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int n) -> void

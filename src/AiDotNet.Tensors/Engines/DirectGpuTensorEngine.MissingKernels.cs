@@ -4639,6 +4639,21 @@ public partial class DirectGpuTensorEngine
         return ConvertNumericIndicesToInt32(backend, numericIndices.Buffer, indices.Length);
     }
 
+    /// <summary>
+    /// The indices as numeric floats, the form the float-indexed kernels (take-along-dim) read. Device-resident indices
+    /// stored as raw int32 (argmax indices) are converted on the device; their raw bits read as floats would be
+    /// denormals that truncate to 0.
+    /// </summary>
+    private OwnedBuffer GetOrAllocateNumericIndexBuffer(IDirectGpuBackend backend, Tensor<int> indices)
+    {
+        if (!indices._gpuBufferContainsRawInt32 || !HasResidentIndexStorage(indices))
+            return GetOrAllocateBuffer(backend, indices);
+        using var raw = GetOrAllocateBuffer(backend, indices);
+        var numeric = AllocateOutputBuffer(backend, Math.Max(1, indices.Length));
+        backend.Int32ToFloat(raw.Buffer, numeric.Buffer, indices.Length);
+        return numeric;
+    }
+
     private static bool HasResidentIndexStorage(Tensor<int> indices)
     {
         if (indices.IsGpuResident) return true;
@@ -5031,7 +5046,7 @@ public partial class DirectGpuTensorEngine
             using var bufIn = GetOrAllocateBuffer(backend, ct);
             // Indices ride as a FLOAT buffer (int values, cast in-kernel) so a RESIDENT int-index tensor
             // (e.g. from Argsort) is reused in place instead of re-uploaded — the int-residency chain.
-            using var bufIdx = GetOrAllocateBuffer(backend, ci);
+            using var bufIdx = GetOrAllocateNumericIndexBuffer(backend, ci);
             var bufOut = AllocateOutputBuffer(backend, outN);
             backend.TakeAlongDim(bufIn.Buffer, bufIdx.Buffer, bufOut.Buffer, outerSize, axisOut, innerSize, axisIn);
             var arr = FinishGpuOp<T>(backend, bufOut, outN);
@@ -9425,7 +9440,7 @@ public partial class DirectGpuTensorEngine
             using var destinationBuffer = GetOrAllocateBuffer(backend, cd);
             using var sourceBuffer = GetOrAllocateBuffer(backend, cs);
             using var int32Index = GetOrAllocateInt32IndexBuffer(backend, ci);
-            using var floatIndex = GetOrAllocateBuffer(backend, ci);
+            using var floatIndex = GetOrAllocateNumericIndexBuffer(backend, ci);
             // An empty index writes nothing (the result is the destination); buffers are never zero-sized.
             IGpuBuffer Scratch(int size) { var b = backend.AllocateBuffer(Math.Max(1, size)); buffers.Add(b); return b; }
             var claims = Scratch(n);
@@ -9457,8 +9472,25 @@ public partial class DirectGpuTensorEngine
                 backend.Equal(claims, minusOne, unwritten, n);
                 backend.Where(unwritten, destinationBuffer.Buffer, scattered, output, n);
             });
-            Autodiff.DifferentiableOps.RecordBinary("TensorScatter", result, destination, source,
-                Autodiff.BackwardFunctions<T>.TensorScatterBackward, new object[] { indices, d });
+            if (IsTapeActive<T>())
+            {
+                // The backward reads the indices this forward used: a caller editing its tensor afterwards must not
+                // change the gradient, so the tape keeps a copy (on the device for device-resident indices).
+                Tensor<int> savedIndices;
+                if (m > 0 && HasResidentIndexStorage(ci))
+                {
+                    var copy = AllocateOutputBuffer(backend, m);
+                    backend.Copy(floatIndex.Buffer, copy.Buffer, m);
+                    savedIndices = DeferTensorResult<int>(backend, copy.Buffer, m, (int[])ci._shape.Clone());
+                    copy.RelinquishOwnership();
+                }
+                else
+                {
+                    savedIndices = new Tensor<int>(ci.ToArray(), (int[])ci._shape.Clone());
+                }
+                Autodiff.DifferentiableOps.RecordBinary("TensorScatter", result, destination, source,
+                    Autodiff.BackwardFunctions<T>.TensorScatterBackward, new object[] { savedIndices, d });
+            }
             return result;
         }
         catch (NotSupportedException capabilityGap)
@@ -9525,7 +9557,7 @@ public partial class DirectGpuTensorEngine
         try
         {
             using var int32Index = GetOrAllocateInt32IndexBuffer(backend, ci);
-            using var floatIndex = GetOrAllocateBuffer(backend, ci);
+            using var floatIndex = GetOrAllocateNumericIndexBuffer(backend, ci);
             var claims = backend.AllocateBuffer(n);
             buffers.Add(claims);
             var positions = UploadScatterPositions(backend, buffers, outer, srcDim, inner);

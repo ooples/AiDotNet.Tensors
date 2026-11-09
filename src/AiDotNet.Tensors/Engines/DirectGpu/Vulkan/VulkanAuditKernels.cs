@@ -884,6 +884,18 @@ void main() {
 
 }";
 
+    public static string Int32ToFloat => @"#version 450
+layout(local_size_x = 256) in;
+layout(set=0, binding=0) buffer B0 { int raw[]; };
+layout(set=0, binding=1) buffer B1 { float outputValues[]; };
+layout(push_constant) uniform PC {
+    int n;
+};
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x); if (gid >= n) return; outputValues[gid] = float(raw[gid]);
+}";
+
     public static string IotaPad => @"#version 450
 layout(local_size_x = 256) in;
 layout(set=0, binding=0) buffer B0 { float idx[]; };

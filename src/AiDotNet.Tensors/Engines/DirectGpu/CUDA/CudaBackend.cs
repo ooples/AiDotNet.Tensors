@@ -13600,6 +13600,17 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5;
         LaunchKernel(kernel, gsz, DefaultBlockSize, args);
     }
+    public unsafe void Int32ToFloat(IGpuBuffer raw, IGpuBuffer output, int n)
+    {
+        var kernel = ResolveParity210Kernel("parity210_int32_to_float");
+        using var _ = PushContext();
+        if (n <= 0) return;
+        uint gsz = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = raw.Handle; IntPtr la1 = output.Handle; int la2 = n;
+        void** args = stackalloc void*[3];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+    }
     public unsafe void IotaPad(IGpuBuffer idx, int l, int p, int numRows)
     {
         var kernel = ResolveParity210Kernel("parity210_iota_pad");

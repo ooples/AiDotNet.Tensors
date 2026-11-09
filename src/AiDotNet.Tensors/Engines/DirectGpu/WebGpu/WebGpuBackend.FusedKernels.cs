@@ -149,6 +149,12 @@ public sealed partial class WebGpuBackend
         DispatchNBufferAsync("Audit:CopyRows", WebGpuAuditKernels.CopyRows, "main",
             new IGpuBuffer[] { src, dst }, new float[] { BitConverter.Int32BitsToSingle(srcRowLen), BitConverter.Int32BitsToSingle(dstRowLen), BitConverter.Int32BitsToSingle(numRows), BitConverter.Int32BitsToSingle(copyLen) }, __total).GetAwaiter().GetResult();
     }
+    public void Int32ToFloat(IGpuBuffer raw, IGpuBuffer output, int n)
+    {
+        if (n <= 0) return;
+        DispatchNBufferAsync("Audit:Int32ToFloat", WebGpuAuditKernels.Int32ToFloat, "main",
+            new IGpuBuffer[] { raw, output }, new float[] { BitConverter.Int32BitsToSingle(n), 0f, 0f, 0f }, n).GetAwaiter().GetResult();
+    }
     public void IotaPad(IGpuBuffer idx, int l, int p, int numRows)
     {
         int __total = numRows*p; if (__total <= 0) return;

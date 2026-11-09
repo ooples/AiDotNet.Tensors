@@ -42934,8 +42934,13 @@ public partial class CpuEngine : ITensorLevelEngine
             });
         }
 
+        // The backward reads the indices this forward used: a caller editing its tensor afterwards must not change
+        // the gradient, so the tape keeps a copy.
+        var savedIndices = new int[indices.Length];
+        Array.Copy(indexData, savedIndices, savedIndices.Length);
         DifferentiableOps.RecordBinary("TensorScatter", result, destination, source,
-            BackwardFunctions<T>.TensorScatterBackward, new object[] { indices, axis });
+            BackwardFunctions<T>.TensorScatterBackward,
+            new object[] { new Tensor<int>(savedIndices, (int[])indices._shape.Clone()), axis });
         return result;
     }
 

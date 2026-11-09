@@ -217,6 +217,27 @@ public sealed class ScatterAnyRankTests
     }
 
     [Fact]
+    public void Backward_uses_the_indices_of_the_forward()
+    {
+        var eng = new CpuEngine();
+        var dst = new Tensor<double>(new[] { 1, 3 }, new Vector<double>(new[] { 1.0, 2.0, 3.0 }));
+        var idx = new Tensor<int>(new[] { 0, 1 }, new[] { 1, 2 });
+        var src = new Tensor<double>(new[] { 1, 2 }, new Vector<double>(new[] { 5.0, 7.0 }));
+        var w = new Tensor<double>(new[] { 1, 3 }, new Vector<double>(new[] { 2.0, 3.0, 4.0 }));
+        System.Collections.Generic.Dictionary<Tensor<double>, Tensor<double>> g;
+        using (var tape = new GradientTape<double>())
+        {
+            var y = eng.TensorScatter(dst, idx, src, 1);
+            // The caller reuses its index tensor before the backward runs; the gradient is still the forward's.
+            idx[0, 0] = 1;
+            idx[0, 1] = 0;
+            g = tape.ComputeGradients(eng.ReduceSum(eng.TensorMultiply(y, w), null, keepDims: false), new[] { dst, src });
+        }
+        Assert.Equal(new[] { 2.0, 3.0 }, g[src].ToArray());
+        Assert.Equal(new[] { 0.0, 0.0, 4.0 }, g[dst].ToArray());
+    }
+
+    [Fact]
     public void Set_slice_rejects_a_source_that_is_not_the_slice()
     {
         var eng = new CpuEngine();

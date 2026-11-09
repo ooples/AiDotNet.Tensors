@@ -149,6 +149,13 @@ public sealed partial class VulkanBackend
             new IGpuBuffer[] { src, dst },
             new uint[] { (uint)srcRowLen, (uint)dstRowLen, (uint)numRows, (uint)copyLen });
     }
+    public void Int32ToFloat(IGpuBuffer raw, IGpuBuffer output, int n)
+    {
+        if (n <= 0) return;
+        GlslDispatchN(VulkanAuditKernels.Int32ToFloat, n,
+            new IGpuBuffer[] { raw, output },
+            new uint[] { (uint)n });
+    }
     public void IotaPad(IGpuBuffer idx, int l, int p, int numRows)
     {
         GlslDispatchN(VulkanAuditKernels.IotaPad, numRows*p,

@@ -319,6 +319,15 @@ struct P { srcRowLen: i32, dstRowLen: i32, numRows: i32, copyLen: i32 };
   let g = i32(gid.x); if (g >= pc.numRows * pc.copyLen) { return; } let i = g % pc.copyLen; let r = g / pc.copyLen; dst[r * pc.dstRowLen + i] = src[r * pc.srcRowLen + i];
 }";
 
+    public static string Int32ToFloat => @"
+@group(0) @binding(0) var<storage, read> raw : array<i32>;
+@group(0) @binding(1) var<storage, read_write> outp : array<f32>;
+struct P { n: i32 };
+@group(0) @binding(2) var<uniform> pc : P;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let g = i32(gid.x); if (g >= pc.n) { return; } outp[g] = f32(raw[g]);
+}";
+
     public static string IotaPad => @"
 @group(0) @binding(0) var<storage, read_write> idxb : array<f32>;
 struct P { L: i32, Pp: i32, numRows: i32 };

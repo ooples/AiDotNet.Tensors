@@ -124,4 +124,59 @@ public class ScatterTopKGpuParityTests
             }
         }
     }
+
+    [SkippableFact]
+    public void Scatter_and_take_along_dim_read_raw_int32_resident_indices()
+    {
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.IfNot(gpu.IsGpuAvailable, "No DirectGpu backend available");
+
+        int[] shape = { 3, 8 };
+        var host = RepeatingIndices(shape, 1, 6);
+        // An int32 op on the device leaves its result as raw int32 storage, the form argmax indices take.
+        var resident = gpu.TensorBitwiseAnd(host, host);
+        Assert.True(resident._gpuBufferContainsRawInt32, "The positive control lost its raw int32 storage.");
+
+        (float[] y, float[] gDst, float[] gSrc, float[] taken) Run(IEngine eng, Tensor<int> idx)
+        {
+            var dst = new Tensor<float>(shape, new Vector<float>(Gen(24, 1)));
+            var src = new Tensor<float>(idx.Shape.ToArray(), new Vector<float>(Gen(idx.Length, 2)));
+            var w = new Tensor<float>(shape, new Vector<float>(Gen(24, 3)));
+            using var tape = new GradientTape<float>();
+            var y = eng.TensorScatter(dst, idx, src, 1);
+            var g = tape.ComputeGradients(eng.ReduceSum(eng.TensorMultiply(y, w), null, keepDims: false), new[] { dst, src });
+            var taken = eng.TensorTakeAlongDim(w, idx, 1).ToArray();
+            return (y.ToArray(), g[dst].ToArray(), g[src].ToArray(), taken);
+        }
+
+        var expected = Run(new CpuEngine(), host);
+        var actual = OnDevice(() => Run(gpu, resident));
+        Assert.Equal(expected.y, actual.y);
+        Assert.Equal(expected.gDst, actual.gDst);
+        Assert.Equal(expected.gSrc, actual.gSrc);
+        Assert.Equal(expected.taken, actual.taken);
+    }
+
+    [SkippableFact]
+    public void Scatter_backward_uses_the_indices_of_the_forward()
+    {
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.IfNot(gpu.IsGpuAvailable, "No DirectGpu backend available");
+
+        var dst = new Tensor<float>(new[] { 1, 3 }, new Vector<float>(new[] { 1f, 2f, 3f }));
+        var idx = new Tensor<int>(new[] { 0, 1 }, new[] { 1, 2 });
+        var src = new Tensor<float>(new[] { 1, 2 }, new Vector<float>(new[] { 5f, 7f }));
+        var w = new Tensor<float>(new[] { 1, 3 }, new Vector<float>(new[] { 2f, 3f, 4f }));
+        var g = OnDevice(() =>
+        {
+            using var tape = new GradientTape<float>();
+            var y = ((IEngine)gpu).TensorScatter(dst, idx, src, 1);
+            // The caller reuses its index tensor before the backward runs.
+            idx[0, 0] = 1;
+            idx[0, 1] = 0;
+            return tape.ComputeGradients(gpu.ReduceSum(gpu.TensorMultiply(y, w), null, keepDims: false), new[] { dst, src });
+        });
+        Assert.Equal(new[] { 2f, 3f }, g[src].ToArray());
+        Assert.Equal(new[] { 0f, 0f, 4f }, g[dst].ToArray());
+    }
 }

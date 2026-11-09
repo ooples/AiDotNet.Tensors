@@ -262,6 +262,19 @@ public sealed partial class MetalBackend
         encoder.SetBytes(copyLen, 5);
         encoder.DispatchThreadgroups(tgr, tpg);
     }
+    public void Int32ToFloat(IGpuBuffer raw, IGpuBuffer output, int n)
+    {
+        ThrowIfDisposed();
+        var pipeline = GetParity210Pipeline("parity210_int32_to_float");
+        if (n <= 0) return;
+        var (tgr, tpg) = pipeline.Calculate1DDispatch(n);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer((MetalGpuBuffer)raw, 0);
+        encoder.SetBuffer((MetalGpuBuffer)output, 1);
+        encoder.SetBytes(n, 2);
+        encoder.DispatchThreadgroups(tgr, tpg);
+    }
     public void IotaPad(IGpuBuffer idx, int l, int p, int numRows)
     {
         ThrowIfDisposed();
