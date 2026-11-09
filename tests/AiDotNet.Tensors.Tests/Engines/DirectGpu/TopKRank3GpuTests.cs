@@ -67,4 +67,32 @@ public class TopKRank3GpuTests
         ((IEngine)gpu).TensorTopK(new Tensor<float>(data, new[] { 1, 1, columns }), 2, -1, out var indices);
         Assert.Equal(new[] { columns - 2, columns - 1 }, indices.ToArray());
     }
+
+    /// <summary>
+    /// Small k over long rows takes the chunk tournament (TopKChunk = 128): an LM-vocabulary row (three rounds) and a
+    /// row whose length is not a multiple of the chunk (padded chunk). Distinct values, so the order is fully defined.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(64, 49152, 32)]
+    [InlineData(3, 1000, 20)]
+    [InlineData(5, 4096, 64)]
+    public void Chunk_tournament_topk_matches_the_reference(int rows, int columns, int k)
+    {
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.IfNot(gpu.IsGpuAvailable, "No DirectGpu backend available");
+        var rng = new System.Random(rows * 31 + columns);
+        var data = new float[rows * columns];
+        for (int r = 0; r < rows; r++)
+        {
+            // A random permutation of 0..columns-1 per row, scaled: distinct values, worst cases spread over chunks.
+            var perm = Enumerable.Range(0, columns).OrderBy(_ => rng.Next()).ToArray();
+            for (int c = 0; c < columns; c++) data[r * columns + c] = perm[c] * 0.5f - 7f;
+        }
+        int[] shape = { rows, columns };
+        var values = ((IEngine)gpu).TensorTopK(new Tensor<float>(data, shape), k, 1, out var indices);
+        var (ev, ei) = TopKAnyAxisTests.Reference(data, shape, 1, k, largest: true);
+        Assert.Equal(new[] { rows, k }, values.Shape.ToArray());
+        Assert.Equal(ev, values.ToArray());
+        Assert.Equal(ei, indices.ToArray());
+    }
 }

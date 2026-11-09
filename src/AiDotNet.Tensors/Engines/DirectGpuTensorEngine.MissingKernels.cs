@@ -4714,6 +4714,83 @@ public partial class DirectGpuTensorEngine
         return TensorArgsort(input, axis, descending);
     }
 
+    private const int TopKChunk = 128;
+
+    /// <summary>
+    /// Exact top-k of each row by a chunk tournament. Each round sorts every TopKChunk-wide chunk (bitonic, indices
+    /// co-permuted) and keeps each chunk's best k, so a row shrinks by TopKChunk / k per round. It is exact because an
+    /// element in the row's top k has at most k - 1 larger elements in the row, so at most k - 1 in its chunk: it
+    /// survives every round. Indices travel with their values, so the survivors carry their original column. Pads are
+    /// -inf with index -1, the same contract as <see cref="BitonicSortRowsToBuffers"/>. Returns rows sorted best-first
+    /// over their first <paramref name="stride"/> (= TopKChunk) columns. Work: about
+    /// log2(C)(log2(C) + 1)/2 compare passes over a geometrically shrinking row, against log2(P)(log2(P) + 1)/2 over
+    /// the padded row P for a full sort (P = 65,536 for a 49,152-token vocabulary).
+    /// </summary>
+    private (OwnedBuffer outVal, OwnedBuffer outIdx) ChunkedTopKRowsToBuffers(
+        IDirectGpuBackend backend, IGpuBuffer source, int rows, int columns, int k, out int stride)
+    {
+        const int C = TopKChunk;
+        int n = (columns + C - 1) / C * C;
+        var val = AllocateOutputBuffer(backend, rows * n);
+        var idx = AllocateOutputBuffer(backend, rows * n);
+        bool owned = true;
+        try
+        {
+            backend.Fill(val.Buffer, float.NegativeInfinity, rows * n);
+            backend.CopyRows(source, val.Buffer, columns, n, rows, columns);
+            backend.IotaPad(idx.Buffer, columns, n, rows);
+            while (true)
+            {
+                int chunks = n / C;
+                for (int size = 2; size <= C; size <<= 1)
+                    for (int j = size >> 1; j > 0; j >>= 1)
+                        backend.BitonicStep(val.Buffer, idx.Buffer, C, size, j, rows * chunks, 1);
+                if (chunks == 1)
+                {
+                    stride = C;
+                    owned = false;
+                    return (val, idx);
+                }
+                int next = chunks * k, nextPad = (next + C - 1) / C * C;
+                var nextVal = AllocateOutputBuffer(backend, rows * nextPad);
+                var nextIdx = AllocateOutputBuffer(backend, rows * nextPad);
+                try
+                {
+                    backend.Fill(nextVal.Buffer, float.NegativeInfinity, rows * nextPad);
+                    backend.Fill(nextIdx.Buffer, -1f, rows * nextPad);
+                    using (var packedVal = AllocateOutputBuffer(backend, rows * next))
+                    using (var packedIdx = AllocateOutputBuffer(backend, rows * next))
+                    {
+                        // Best k of every chunk, packed row-major: [rows * chunks, k] == [rows, chunks * k].
+                        backend.CopyRows(val.Buffer, packedVal.Buffer, C, k, rows * chunks, k);
+                        backend.CopyRows(idx.Buffer, packedIdx.Buffer, C, k, rows * chunks, k);
+                        backend.CopyRows(packedVal.Buffer, nextVal.Buffer, next, nextPad, rows, next);
+                        backend.CopyRows(packedIdx.Buffer, nextIdx.Buffer, next, nextPad, rows, next);
+                    }
+                }
+                catch
+                {
+                    nextVal.Dispose();
+                    nextIdx.Dispose();
+                    throw;
+                }
+                val.Dispose();
+                idx.Dispose();
+                val = nextVal;
+                idx = nextIdx;
+                n = nextPad;
+            }
+        }
+        finally
+        {
+            if (owned)
+            {
+                val.Dispose();
+                idx.Dispose();
+            }
+        }
+    }
+
     Tensor<T> IEngine.TensorTopK<T>(Tensor<T> tensor, int k, int axis, out Tensor<int> indices)
     {
         using var __gpuOp = EnterGpuOp();
@@ -4747,8 +4824,11 @@ public partial class DirectGpuTensorEngine
             int columns = tensor._shape[1];
             int selected = Math.Min(k, columns);
             using var input = GetOrAllocateBuffer(backend, tensor);
-            var (sortedValues, sortedIndices) = BitonicSortRowsToBuffers(
-                backend, input.Buffer, rows, columns, descending: true);
+            // Small k over a long row (LM logits: k = 32 of 49,152): exact chunk tournament instead of sorting the row.
+            int sortedStride = columns;
+            var (sortedValues, sortedIndices) = selected * 2 <= TopKChunk && columns >= 4 * TopKChunk
+                ? ChunkedTopKRowsToBuffers(backend, input.Buffer, rows, columns, selected, out sortedStride)
+                : BitonicSortRowsToBuffers(backend, input.Buffer, rows, columns, descending: true);
             using (sortedValues)
             using (sortedIndices)
             {
@@ -4759,9 +4839,9 @@ public partial class DirectGpuTensorEngine
                 try
                 {
                     backend.CopyRows(sortedValues.Buffer, valueOutput.Buffer,
-                        columns, selected, rows, selected);
+                        sortedStride, selected, rows, selected);
                     backend.CopyRows(sortedIndices.Buffer, indexOutput.Buffer,
-                        columns, selected, rows, selected);
+                        sortedStride, selected, rows, selected);
                     var valueData = FinishGpuOp<T>(backend, valueOutput, rows * selected);
                     valuesHandedOff = true;
                     var indexData = FinishGpuOp<int>(backend, indexOutput, rows * selected);
