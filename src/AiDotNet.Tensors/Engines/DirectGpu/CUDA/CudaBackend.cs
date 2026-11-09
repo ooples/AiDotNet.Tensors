@@ -2194,7 +2194,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             var pA = AllocDeviceMemoryAsync((ulong)size);
             return new CudaGpuByteBuffer(_cudaContext, pA, size, asyncFreeStream: _mainStream, account: _memoryAccount);
         }
-        var byteResult = CuBlasNative.cuMemAlloc(out IntPtr devicePtr, (ulong)size);
+        var byteResult = CuBlasNative.cuMemAlloc(out IntPtr devicePtr, (ulong)size); // lgtm[cs/call-to-unmanaged-code] The CUDA driver allocator has no managed API.
         if (byteResult == CudaResult.OutOfMemory)
             throw CudaAllocationError(byteResult, $"cuMemAlloc(byte) failed: {CuBlasNative.GetCudaErrorString(byteResult)} (requested {size} bytes)");
         CuBlasNative.CheckCudaResult(byteResult, "cuMemAlloc(byte)");
@@ -9740,7 +9740,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         RecordDirectPtxEvidenceDeviceAllocation(checked((long)byteSize));
         DrainFinalizedFreesBeforeAllocation();
 
-        var intResult = CuBlasNative.cuMemAlloc(out IntPtr devicePtr, byteSize);
+        var intResult = CuBlasNative.cuMemAlloc(out IntPtr devicePtr, byteSize); // lgtm[cs/call-to-unmanaged-code] The CUDA driver allocator has no managed API.
         if (intResult == CudaResult.OutOfMemory)
             throw CudaAllocationError(intResult, $"cuMemAlloc(int) failed: {CuBlasNative.GetCudaErrorString(intResult)} (requested {byteSize} bytes)");
         CuBlasNative.CheckCudaResult(intResult, "cuMemAlloc(int)");
