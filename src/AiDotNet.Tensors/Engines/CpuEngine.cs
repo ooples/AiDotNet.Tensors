@@ -13554,6 +13554,21 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>
+    /// GLU-family backward shape rule: gradOutput is the forward output, i.e. the input's shape with the gated axis
+    /// halved. A gradient of the wrong shape (for example the input's own) was read at the wrong offsets.
+    /// </summary>
+    internal static void ValidateGatedGradShape(string op, int[] gradOutput, int[] input, int axis)
+    {
+        if (axis < 0 || axis >= input.Length)
+            throw new ArgumentOutOfRangeException("dim", $"{op}: dim {axis} is out of range for a rank-{input.Length} input.");
+        bool ok = gradOutput.Length == input.Length;
+        for (int d = 0; ok && d < input.Length; d++)
+            ok = gradOutput[d] == (d == axis ? input[d] / 2 : input[d]);
+        if (!ok)
+            throw new ArgumentException($"{op} needs gradOutput of the forward output's shape (the input's with dim {axis} halved); got [{string.Join(", ", gradOutput)}] for input [{string.Join(", ", input)}].", "gradOutput");
+    }
+
+    /// <summary>
     /// GLU backward pass.
     /// </summary>
     public Tensor<T> GLUBackward<T>(Tensor<T> gradOutput, Tensor<T> input, int dim = -1)
@@ -13568,6 +13583,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
 
         int actualDim = dim < 0 ? input.Rank + dim : dim;
+        ValidateGatedGradShape("GLUBackward", gradOutput._shape, input._shape, actualDim);
         int dimSize = input._shape[actualDim];
         int halfSize = dimSize / 2;
 
@@ -13693,6 +13709,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
 
         int actualDim = dim < 0 ? input.Rank + dim : dim;
+        ValidateGatedGradShape("GeGLUBackward", gradOutput._shape, input._shape, actualDim);
         int dimSize = input._shape[actualDim];
         int halfSize = dimSize / 2;
 
@@ -13826,6 +13843,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
 
         int actualDim = dim < 0 ? input.Rank + dim : dim;
+        ValidateGatedGradShape("SwiGLUBackward", gradOutput._shape, input._shape, actualDim);
         int dimSize = input._shape[actualDim];
         int halfSize = dimSize / 2;
 
@@ -13951,6 +13969,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
 
         int actualDim = dim < 0 ? input.Rank + dim : dim;
+        ValidateGatedGradShape("ReGLUBackward", gradOutput._shape, input._shape, actualDim);
         int dimSize = input._shape[actualDim];
         int halfSize = dimSize / 2;
 
@@ -53090,6 +53109,14 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         if (input.Rank != 2) throw new ArgumentException($"NativeNormalizeRows requires a 2D tensor. Got rank {input.Rank}.", nameof(input));
 
+        if (!input.IsContiguous || input._storageOffset != 0)
+        {
+            // The kernel reads (and in place, writes) the storage array directly; a strided view would be read in
+            // storage order. Out of place, materialize the view; in place, there is no storage of the view's own.
+            if (inPlace)
+                throw new InvalidOperationException("NativeNormalizeRows in place requires a contiguous tensor.");
+            input = input.Contiguous();
+        }
         int rows = input._shape[0];
         int cols = input._shape[1];
         var result = inPlace ? input : new Tensor<T>(input._shape);
@@ -53326,6 +53353,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (GraphMode.IsInferenceTrace)
             return CaptureInferenceKernel(new[] { input }, engine => engine.NativeTanh(input));
+        // These kernels read the storage array directly, so a strided view (a transpose, a slice) would be read in
+        // storage order: materialize its logical layout first.
+        if (!input.IsContiguous || input._storageOffset != 0) input = input.Contiguous();
         var result = new Tensor<T>(input._shape);
         int n = input.Length;
 
@@ -53378,6 +53408,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (GraphMode.IsInferenceTrace)
             return CaptureInferenceKernel(new[] { input }, engine => engine.NativeExp(input));
+        // These kernels read the storage array directly, so a strided view (a transpose, a slice) would be read in
+        // storage order: materialize its logical layout first.
+        if (!input.IsContiguous || input._storageOffset != 0) input = input.Contiguous();
         var result = new Tensor<T>(input._shape);
         int n = input.Length;
 
@@ -53451,6 +53484,10 @@ public partial class CpuEngine : ITensorLevelEngine
                     $"imag and real must have the same shape; differ at axis {d}: imag={imag._shape[d]}, real={real._shape[d]}.",
                     nameof(real));
         }
+        // These kernels read the storage array directly, so a strided view (a transpose, a slice) would be read in
+        // storage order: materialize its logical layout first.
+        if (!imag.IsContiguous || imag._storageOffset != 0) imag = imag.Contiguous();
+        if (!real.IsContiguous || real._storageOffset != 0) real = real.Contiguous();
         var result = new Tensor<T>(imag._shape);
         int n = imag.Length;
 
@@ -55126,6 +55163,10 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (filter is null) throw new ArgumentNullException(nameof(filter));
+        // These kernels read the storage array directly, so a strided view (a transpose, a slice) would be read in
+        // storage order: materialize its logical layout first.
+        if (!input.IsContiguous || input._storageOffset != 0) input = input.Contiguous();
+        if (!filter.IsContiguous || filter._storageOffset != 0) filter = filter.Contiguous();
         if (input.Rank < 2)
             throw new ArgumentException("NativeSpectralFilter requires at least a 2D input tensor.", nameof(input));
         if (filter.Rank < 2)
@@ -55275,6 +55316,10 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (filter is null) throw new ArgumentNullException(nameof(filter));
+        // These kernels read the storage array directly, so a strided view (a transpose, a slice) would be read in
+        // storage order: materialize its logical layout first.
+        if (!input.IsContiguous || input._storageOffset != 0) input = input.Contiguous();
+        if (!filter.IsContiguous || filter._storageOffset != 0) filter = filter.Contiguous();
         if (input.Rank != 4)
             throw new ArgumentException(
                 $"NativeSpectralFilterBatch requires 4D input [B,C,H,W]. Got rank {input.Rank}.",

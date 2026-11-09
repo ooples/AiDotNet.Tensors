@@ -2424,7 +2424,6 @@ public partial class DirectGpuTensorEngine
             int batchSize = x1.Length / axisLen;
             var outShape = new int[rank - 1];
             for (int i = 0; i < rank - 1; i++) outShape[i] = x1._shape[i];
-            if (outShape.Length == 0) outShape = new[] { 1 };
 
             using var a = GetOrAllocateBuffer(backend, x1);
             using var b = GetOrAllocateBuffer(backend, x2);

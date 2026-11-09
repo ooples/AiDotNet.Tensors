@@ -4431,8 +4431,10 @@ public partial class CpuEngine
         var result = ElementwiseUnary(tensor, x => {
             var ops = MathHelper.GetNumericOperations<T>();
             double y = System.Convert.ToDouble(x, System.Globalization.CultureInfo.InvariantCulture);
-            if (y >= 1.0) return ops.FromDouble(double.PositiveInfinity);
-            if (y <= -1.0) return ops.FromDouble(double.NegativeInfinity);
+            // torch.erfinv: +-inf at +-1, NaN outside [-1, 1] (and for NaN input).
+            if (double.IsNaN(y) || y > 1.0 || y < -1.0) return ops.FromDouble(double.NaN);
+            if (y == 1.0) return ops.FromDouble(double.PositiveInfinity);
+            if (y == -1.0) return ops.FromDouble(double.NegativeInfinity);
             // Seed: Winitzki's approximation, good to ~5 digits.
             double ln = System.Math.Log(1.0 - y * y);
             double a = 0.147;
