@@ -98,7 +98,7 @@ jobs:
     # Each runner needs self-hosted, gpu, cuda AND its architecture label (sm86 or sm75); a runner registered before
     # the split carries no architecture label and picks up neither job until relabelled (see the header for how).
     runs-on: [self-hosted, gpu, cuda, '${{ matrix.arch }}']
-    timeout-minutes: ${{ matrix.arch == 'sm86' && 160 || 240 }}
+    timeout-minutes: ${{ matrix.arch == 'sm86' && (github.event_name == 'pull_request' && 160 || 520) || 240 }}
     env:
       # The tests this lane runs. It selects by name, so a GPU test outside these terms never runs on CUDA; the
       # coverage check below fails the lane when a test class that drives the GPU engine is not selected. A term
@@ -273,7 +273,7 @@ jobs:
         # the job's start (the runner worker's), not this step's, and stops DIAGNOSTICS_RESERVE_MINUTES short of the job
         # limit, so slow setup cannot let the job timeout cancel the step before the watchdog fires.
         SUITE_WATCHDOG_MINUTES: ${{ matrix.arch == 'sm86' && '120' || '215' }}
-        JOB_LIMIT_MINUTES: ${{ matrix.arch == 'sm86' && '160' || '240' }}
+        JOB_LIMIT_MINUTES: ${{ matrix.arch == 'sm86' && (github.event_name == 'pull_request' && 160 || 520) || 240 }}
         DIAGNOSTICS_RESERVE_MINUTES: '20'
       run: |
         New-Item -ItemType Directory -Force "${{ runner.temp }}/trx" | Out-Null
@@ -428,6 +428,25 @@ jobs:
           --inference-iterations 3 --warmup-iterations 1 --output "${{ runner.temp }}/aidotnet-cuda.json"
         if ($LASTEXITCODE -ne 0) { Write-Output "::error::An AiDotNet model family failed on CUDA."; exit 1 }
 
+    # The CUDA step-time ratchets: each network's ours/PyTorch step ratio on this machine class may not rise above the
+    # one recorded in parity/head-to-head-baseline.json. PyTorch compiles each network in every mode for up to an hour
+    # (the runner's RunnerTimeout), far past a pull request's budget and the 15-minute hang blame, so they run nightly
+    # and on dispatch on the RTX 3080 only (the SM86 job's limit rises to 520 minutes then). A deferral (no baseline for
+    # the machine class, a torch that cannot reach the device) fails the step: an ungated ratchet is not a pass.
+    - name: CUDA step-time ratchets (nightly)
+      if: ${{ !cancelled() && matrix.arch == 'sm86' && github.event_name != 'pull_request' }}
+      timeout-minutes: 360
+      run: |
+        dotnet test AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj `
+          --configuration Release --no-build --framework net10.0 `
+          --filter "FullyQualifiedName~.HeadToHeadGpuNetworkTests.&Category=PyTorchParityGpu" `
+          --results-directory "${{ runner.temp }}/ratchets" --logger "trx;LogFileName=cuda-ratchets.trx" `
+          --blame-hang --blame-hang-timeout 75m --blame-crash
+        $tests = $LASTEXITCODE
+        python AiDotNet.Tensors/scripts/ci/summarize-test-skips.py --title "CUDA step-time ratchets" --fail-on-skip `
+          "${{ runner.temp }}/ratchets/*.trx"
+        if ($tests -ne 0 -or $LASTEXITCODE -ne 0) { exit 1 }
+
     - name: Upload results
       if: always()
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -435,6 +454,7 @@ jobs:
         name: ${{ matrix.arch == 'sm86' && 'gpu-cuda-results' || format('gpu-cuda-results-{0}', matrix.arch) }}
         path: |
           ${{ runner.temp }}/trx/**
+          ${{ runner.temp }}/ratchets/**
           ${{ runner.temp }}/aidotnet-cuda.json
         if-no-files-found: ignore
         # A crash dump is the full test host (gigabytes); keep it only long enough to analyse.
