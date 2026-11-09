@@ -14430,8 +14430,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             throw new ArgumentException("RoPE input must have rank >= 2 ([.., seqLen, headDim]).", nameof(input));
         int headDim = input.Shape._dims[rank - 1];
         int seqLen = input.Shape._dims[rank - 2];
-        if (headDim <= 0 || seqLen <= 0 || (headDim & 1) != 0)
-            throw new ArgumentException("RoPE requires positive seqLen and an even headDim.", nameof(input));
+        if (headDim <= 0 || seqLen < 0 || (headDim & 1) != 0)
+            throw new ArgumentException("RoPE requires a positive, even headDim.", nameof(input));
+        // An empty sequence (or batch) has nothing to rotate.
+        if (input.Length == 0) return new Tensor<T>((int[])input.Shape._dims.Clone());
 
         int rows = input.Length / headDim;
 

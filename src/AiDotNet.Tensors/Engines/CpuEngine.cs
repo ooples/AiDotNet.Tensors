@@ -26027,6 +26027,9 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < axis; i++) outerSize *= shape[i];
         for (int i = axis + 1; i < rank; i++) innerSize *= shape[i];
 
+        // An empty softmax axis has no row to normalize (the per-row max would read element 0 of an empty row); the
+        // result is the empty tensor already allocated.
+        if (axisSize > 0)
         CpuParallelSettings.ParallelForOrSerial(0, outerSize * innerSize, (long)outerSize * innerSize * axisSize, idx =>
         {
             int outer = idx / innerSize;
@@ -30671,8 +30674,10 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException("RoPE input must have rank >= 2 ([.., seqLen, headDim]).", nameof(input));
         int headDim = input._shape[rank - 1];
         int seqLen = input._shape[rank - 2];
-        if (headDim <= 0 || seqLen <= 0 || (headDim & 1) != 0)
-            throw new ArgumentException("RoPE requires positive seqLen and an even headDim.", nameof(input));
+        if (headDim <= 0 || seqLen < 0 || (headDim & 1) != 0)
+            throw new ArgumentException("RoPE requires a positive, even headDim.", nameof(input));
+        // An empty sequence (or batch) has nothing to rotate.
+        if (input.Length == 0) return new Tensor<T>((int[])input._shape.Clone());
         int halfDim = headDim / 2;
 
         if (GraphMode.IsActive)
@@ -54386,6 +54391,8 @@ public partial class CpuEngine : ITensorLevelEngine
         int rows = input._shape[0];
         int cols = input._shape[1];
         var result = new Tensor<T>(input._shape);
+        // Empty rows have nothing to normalize (the row max would read element 0 of an empty row).
+        if (cols == 0) return result;
 
         for (int r = 0; r < rows; r++)
         {
