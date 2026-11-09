@@ -40,6 +40,7 @@ public sealed class AxisOpsRankConformanceTests
         ["TensorExpandDims"] = "inserts an axis: its valid axes run to rank, not rank - 1",
         ["TensorSqueeze"] = "removes a length-1 axis; the probe's axes are longer than 1",
         ["TensorSqueezeInPlace"] = "removes a length-1 axis; the probe's axes are longer than 1",
+        ["TensorUnsqueezeInPlace"] = "inserts an axis: its valid axes run to rank, not rank - 1",
         ["TensorUnflatten"] = "rewrites the shape; not an op along the axis",
         ["TensorUniqueDim"] = "the output length depends on the data",
     };
@@ -127,6 +128,7 @@ public sealed class AxisOpsRankConformanceTests
                 for (int ax = 0; ax < shape.Length; ax++)
                 {
                     string where = $"{sig} rank {shape.Length} axis {ax} [{string.Join(",", shape)}]";
+                    bool lift = !RunOnly.ContainsKey(def.Name) && CanLift(m);
                     object?[] args;
                     object?[] pristine;
                     object? actual;
@@ -147,7 +149,7 @@ public sealed class AxisOpsRankConformanceTests
                         failures.Add($"{where}: {Inner(e)}");
                         continue;
                     }
-                    if (RunOnly.ContainsKey(def.Name) || !CanLift(m)) continue;
+                    if (!lift) continue;
                     try
                     {
                         var lifted = Lift(pristine, m, shape, ax, plan);

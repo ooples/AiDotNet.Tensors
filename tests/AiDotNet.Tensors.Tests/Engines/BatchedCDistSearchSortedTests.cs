@@ -146,6 +146,30 @@ public sealed class BatchedCDistSearchSortedTests
     }
 
     [Fact]
+    public void Cdist_keeps_a_zero_sized_batch_dim()
+    {
+        var eng = new CpuEngine();
+        var y = eng.TensorCDist(new Tensor<float>(new[] { 0, 3, 4 }), new Tensor<float>(new[] { 1, 5, 4 }));
+        Assert.Equal(new[] { 0, 3, 5 }, y.Shape.ToArray());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Nd_searchsorted_places_nan_where_rank_1_does(bool right)
+    {
+        var eng = new CpuEngine();
+        var sd = new Tensor<double>(new[] { 3 }, new Vector<double>(new[] { 1.0, 3.0, 5.0 }));
+        var vd = new Tensor<double>(new[] { 2 }, new Vector<double>(new[] { double.NaN, 3.0 }));
+        Assert.Equal(eng.TensorSearchSorted(sd, vd, right).ToArray(),
+            eng.TensorSearchSorted(eng.Reshape(sd, new[] { 1, 3 }), eng.Reshape(vd, new[] { 1, 2 }), right).ToArray());
+        var sf = new Tensor<float>(new[] { 3 }, new Vector<float>(new[] { 1f, 3f, 5f }));
+        var vf = new Tensor<float>(new[] { 2 }, new Vector<float>(new[] { float.NaN, 3f }));
+        Assert.Equal(eng.TensorSearchSorted(sf, vf, right).ToArray(),
+            eng.TensorSearchSorted(eng.Reshape(sf, new[] { 1, 3 }), eng.Reshape(vf, new[] { 1, 2 }), right).ToArray());
+    }
+
+    [Fact]
     public void Cdist_rejects_batch_dims_that_do_not_broadcast()
     {
         var eng = new CpuEngine();

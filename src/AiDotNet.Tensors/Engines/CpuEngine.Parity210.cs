@@ -3617,6 +3617,7 @@ public partial class CpuEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<int>(values._shape);
         var dst = result.GetDataArrayUnmarked();
+        // torch's comparisons on every row (the count kernels disagree with them when a NaN is involved).
         for (int r = 0; r < rows; r++)
             for (int j = 0; j < v; j++)
             {

@@ -9422,10 +9422,11 @@ public partial class DirectGpuTensorEngine
             using var sourceBuffer = GetOrAllocateBuffer(backend, cs);
             using var int32Index = GetOrAllocateInt32IndexBuffer(backend, ci);
             using var floatIndex = GetOrAllocateBuffer(backend, ci);
-            IGpuBuffer Scratch(int size) { var b = backend.AllocateBuffer(size); buffers.Add(b); return b; }
+            // An empty index writes nothing (the result is the destination); buffers are never zero-sized.
+            IGpuBuffer Scratch(int size) { var b = backend.AllocateBuffer(Math.Max(1, size)); buffers.Add(b); return b; }
             var claims = Scratch(n);
             var winners = Scratch(m);
-            var positions = UploadScatterPositions(backend, buffers, outer, srcDim, inner);
+            var positions = m == 0 ? Scratch(1) : UploadScatterPositions(backend, buffers, outer, srcDim, inner);
             var zeros = Scratch(m);
             var winningSource = Scratch(m);
             var scattered = Scratch(n);
@@ -9434,6 +9435,11 @@ public partial class DirectGpuTensorEngine
 
             var result = DispatchDeferredGpuOp<T>(backend, n, (int[])destination._shape.Clone(), output =>
             {
+                if (m == 0 || n == 0)
+                {
+                    if (n > 0) backend.Copy(destinationBuffer.Buffer, output, n);
+                    return;
+                }
                 ScatterLastWritesOnDevice(backend, int32Index.Buffer, floatIndex.Buffer, positions, claims, winners,
                     outer, srcDim, dstDim, inner);
                 // torch.scatter keeps the last write to a slot. Only the winning writes carry their source value into
@@ -9509,6 +9515,7 @@ public partial class DirectGpuTensorEngine
         int outer = 1; for (int k = 0; k < axis; k++) outer *= destinationShape[k];
         int inner = 1; for (int k = axis + 1; k < rank; k++) inner *= destinationShape[k];
         int n = outer * dstDim * inner, m = indices.Length;
+        if (m == 0) return new Tensor<T>((int[])indices._shape.Clone());
         var ci = indices.IsContiguous ? indices : (Tensor<int>)indices.Contiguous();
         var buffers = new List<IGpuBuffer>();
         try

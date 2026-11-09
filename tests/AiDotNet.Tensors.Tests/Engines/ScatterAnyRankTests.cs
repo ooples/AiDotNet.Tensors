@@ -2,6 +2,7 @@ using System;
 using System.Linq;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -86,6 +87,66 @@ public sealed class ScatterAnyRankTests
         Assert.Equal(gDst, g[dst].ToArray());
         Assert.Equal(gSrc, g[src].ToArray());
         Assert.Equal(dstData, dst.ToArray()); // the destination is not modified
+    }
+
+    [Fact]
+    public void Overwritten_source_entries_get_no_gradient()
+    {
+        // Last write wins: with indices [0, 0] along the axis, only the second source entry reaches the output.
+        var eng = new CpuEngine();
+        var dst = new Tensor<double>(new[] { 1, 3 }, new Vector<double>(new[] { 1.0, 2.0, 3.0 }));
+        var src = new Tensor<double>(new[] { 1, 2 }, new Vector<double>(new[] { 10.0, 20.0 }));
+        var idx = new Tensor<int>(new[] { 0, 0 }, new[] { 1, 2 });
+        using var tape = new GradientTape<double>();
+        var y = eng.TensorScatter(dst, idx, src, 1);
+        var g = tape.ComputeGradients(eng.ReduceSum(y, null, keepDims: false), new[] { dst, src });
+        Assert.Equal(new[] { 20.0, 2.0, 3.0 }, y.ToArray());
+        Assert.Equal(new[] { 0.0, 1.0 }, g[src].ToArray());
+        Assert.Equal(new[] { 0.0, 1.0, 1.0 }, g[dst].ToArray());
+    }
+
+    [Fact]
+    public void Compiled_training_plan_propagates_scatter_gradients()
+    {
+        var priorEngine = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = new CpuEngine();
+        try
+        {
+            var dst = new Tensor<float>(new[] { 2, 3, 4 }, new Vector<float>(Enumerable.Range(0, 24).Select(i => 0.1f * i).ToArray()));
+            var src = new Tensor<float>(new[] { 2, 2, 4 }, new Vector<float>(Enumerable.Range(0, 16).Select(i => 1f + i).ToArray()));
+            var idx = Indices(new[] { 2, 3, 4 }, 1, 2, new Random(3));
+            var w = new Tensor<float>(new[] { 2, 3, 4 }, new Vector<float>(Enumerable.Range(0, 24).Select(i => 1f + (i % 5)).ToArray()));
+            Tensor<float> Forward(IEngine e) => e.ReduceSum(e.TensorMultiply(e.TensorScatter(dst, idx, src, 1), w), null);
+            System.Collections.Generic.Dictionary<Tensor<float>, Tensor<float>> tapeGrads;
+            using (var t = new GradientTape<float>())
+                tapeGrads = t.ComputeGradients(Forward(new CpuEngine()), new[] { dst, src });
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.EnableTraining(new[] { dst, src }))
+            {
+                Forward(new CpuEngine());
+                plan = scope.CompileTraining(new[] { dst, src });
+            }
+            try
+            {
+                plan.Step();
+                Assert.Equal(tapeGrads[dst].ToArray(), plan.Gradients[0].ToArray());
+                Assert.Equal(tapeGrads[src].ToArray(), plan.Gradients[1].ToArray());
+            }
+            finally { plan.Dispose(); }
+        }
+        finally { AiDotNetEngine.Current = priorEngine; }
+    }
+
+    [Fact]
+    public void Index_copy_and_add_reject_values_of_the_wrong_shape()
+    {
+        // [2, 3, 4] with two indices on axis 1 needs values [2, 2, 4]; [2, 4, 2] has the same length, not the shape.
+        var eng = new CpuEngine();
+        var input = new Tensor<float>(new[] { 2, 3, 4 });
+        var idx = new Tensor<int>(new[] { 0, 2 }, new[] { 2 });
+        Assert.Throws<ArgumentException>(() => eng.Scatter(input, idx, new Tensor<float>(new[] { 2, 4, 2 }), 1));
+        Assert.Throws<ArgumentException>(() => eng.ScatterAdd(input, idx, new Tensor<float>(new[] { 2, 4, 2 }), 1));
+        Assert.Equal(new[] { 2, 3, 4 }, eng.Scatter(input, idx, new Tensor<float>(new[] { 2, 2, 4 }), 1).Shape.ToArray());
     }
 
     [Fact]
