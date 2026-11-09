@@ -102,7 +102,10 @@ jobs:
     env:
       # The tests this lane runs. It selects by name, so a GPU test outside these terms never runs on CUDA; the
       # coverage check below fails the lane when a test class that drives the GPU engine is not selected. A term
-      # ending in "." matches one class. Folding joins the lines with spaces; the steps strip them.
+      # ending in "." matches one class. Folding joins the lines with spaces; the steps strip them. The CUDA head-to-head
+      # benchmarks (PyTorchParityGpu, PyTorchParityGpuTarget) stay out, as in build.yml: each torch.compiles the network
+      # in every mode for up to an hour with no test finishing, so the 15-minute hang blame killed the host. They run
+      # through tools/parity/run-gpu.ps1.
       CUDA_LANE_FILTER: >-
         (FullyQualifiedName~GpuLaneBackend|
         FullyQualifiedName~Engines.DirectGpu|
@@ -135,7 +138,8 @@ jobs:
         FullyQualifiedName~.StreamingTensorJournalTests.|
         FullyQualifiedName~.TensorCowInferenceReadPathTests.|
         FullyQualifiedName~.TensorAddActivationTests.|
-        FullyQualifiedName~.TensorGpuCachePhysicalTests.)&Category!=Benchmark&Category!=Performance&Category!=RequiresOpenCL
+        FullyQualifiedName~.TensorGpuCachePhysicalTests.)&Category!=Benchmark&Category!=Performance&Category!=RequiresOpenCL&
+        Category!=PyTorchParityGpu&Category!=PyTorchParityGpuTarget
     defaults:
       run:
         shell: pwsh
