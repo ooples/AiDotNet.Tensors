@@ -223,6 +223,42 @@ public class TrainingPlanSerializationTests
     }
 
     [Fact]
+    public async Task SaveLoad_TrainingPlanWithScatter_GivesOverwrittenWritesNoGradient()
+    {
+        var engine = new CpuEngine();
+        // Along axis 1 each row is one fibre, and each repeats a destination: row 0 writes columns 2, 0, 2 (its first
+        // write is overwritten), row 1 writes 1, 1, 0 (its first write is overwritten).
+        var indices = new Tensor<int>(new[] { 2, 0, 2, 1, 1, 0 }, new[] { 2, 3 });
+        Tensor<float> Destination() => new Tensor<float>(new[] { 1f, 2f, 3f, 4f, 5f, 6f }, new[] { 2, 3 });
+        Tensor<float> Source() => new Tensor<float>(new[] { 10f, 20f, 30f, 40f, 50f, 60f }, new[] { 2, 3 });
+
+        var destination = Destination();
+        var source = Source();
+        ICompiledTrainingPlan<float> original;
+        using (var scope = GraphMode.Enable())
+        {
+            engine.ReduceSum(engine.TensorScatter(destination, indices, source, 1), null);
+            original = scope.CompileTraining(new[] { destination, source });
+        }
+
+        using var stream = new MemoryStream();
+        await original.SaveAsync(stream);
+        stream.Position = 0;
+        var loaded = await CompiledPlanLoader.LoadTrainingAsync<float>(stream, engine, new[] { Destination(), Source() })
+            ?? throw new InvalidOperationException("The scatter plan did not load.");
+
+        var loss = loaded.Step();
+
+        // [[20, 2, 30], [60, 50, 6]] sums to 168. The overwritten source writes (10 and 40) get no gradient, and
+        // neither do the destination slots any write reaches.
+        Assert.Equal(168f, loss[0]);
+        Assert.Equal(new[] { 0f, 1f, 0f, 0f, 0f, 1f }, loaded.Gradients[0].AsSpan().ToArray());
+        Assert.Equal(new[] { 0f, 1f, 1f, 0f, 1f, 1f }, loaded.Gradients[1].AsSpan().ToArray());
+        original.Dispose();
+        loaded.Dispose();
+    }
+
+    [Fact]
     public async Task SaveLoad_TrainingPlanWithIndexSelect_ReplaysIndicesAndAxis()
     {
         var engine = new CpuEngine();

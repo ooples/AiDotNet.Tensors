@@ -29,11 +29,73 @@ public sealed class TensorOpsGpuCpuParitySweepTests : IClassFixture<DirectGpuTen
         _out = output;
     }
 
-    /// <summary>Ops whose result is random by definition, or which are not a function of their inputs alone.</summary>
-    private static readonly string[] NonDeterministic =
+    /// <summary>
+    /// Ops whose result is random by definition, by exact name: a substring match also dropped deterministic ops
+    /// (NativeNormalizeRows, PixelShuffle, GridSample and the backwards of random ops).
+    /// </summary>
+    private static readonly HashSet<string> NonDeterministic = new()
     {
-        "Dropout", "Random", "Rand", "Noise", "Bernoulli", "Multinomial", "Sample", "Gumbel", "Uniform", "Normal",
-        "Shuffle", "Perturb", "Stochastic", "Poisson",
+        "Dropout", "GumbelSoftmax", "TensorAlphaDropout", "TensorBernoulli", "TensorCategoricalSample",
+        "TensorChannelDropout", "TensorDropoutMask", "TensorFeatureAlphaDropout", "TensorLogNormal", "TensorMultinomial",
+        "TensorNormal", "TensorPoisson", "TensorRandLike", "TensorRandint", "TensorRandintLike", "TensorRandnLike",
+        "TensorRandomNormal", "TensorRandomUniform", "TensorRandomUniformRange", "TensorRandperm", "TensorUniform",
+        "TensorBinomial",
+    };
+
+    /// <summary>
+    /// Ops the CPU engine rejects for every same-shape float input the sweep builds, with the reason. Any other op
+    /// that never runs fails the test, so a CPU regression cannot silently drop an op from the comparison.
+    /// </summary>
+    private static readonly Dictionary<string, string> NoSameShapeForm = new()
+    {
+        ["BatchMatMul"] = "contracts operands of different shapes",
+        ["TensorBatchMatMul"] = "contracts operands of different shapes",
+        ["TensorMatMul"] = "contracts operands of different shapes",
+        ["TensorAddMM"] = "contracts operands of different shapes",
+        ["TensorAddmv"] = "contracts operands of different shapes",
+        ["TensorAddbmm"] = "contracts operands of different shapes",
+        ["TensorBaddbmm"] = "contracts operands of different shapes",
+        ["TensorGroupedMatMul"] = "contracts operands of different shapes",
+        ["OctonionMatMulTensor"] = "contracts operands of different shapes",
+        ["FusedLinearGELU"] = "contracts operands of different shapes",
+        ["FusedLinearReLU"] = "contracts operands of different shapes",
+        ["FusedLinearSigmoid"] = "contracts operands of different shapes",
+        ["FusedLinearSwish"] = "contracts operands of different shapes",
+        ["FusedLinearTanh"] = "contracts operands of different shapes",
+        ["RBFKernel"] = "contracts operands of different shapes",
+        ["BoxIou"] = "takes [n, 4] boxes",
+        ["CompleteBoxIou"] = "takes [n, 4] boxes",
+        ["DistanceBoxIou"] = "takes [n, 4] boxes",
+        ["GeneralizedBoxIou"] = "takes [n, 4] boxes",
+        ["TensorCIoULoss"] = "takes [n, 4] boxes",
+        ["TensorDIoULoss"] = "takes [n, 4] boxes",
+        ["TensorGIoULoss"] = "takes [n, 4] boxes",
+        ["TensorIoULoss"] = "takes [n, 4] boxes",
+        ["Conv3D"] = "its kernel's shape differs from the input's",
+        ["DepthwiseConv1D"] = "its kernel's shape differs from the input's",
+        ["TensorConvTbc"] = "its kernel's shape differs from the input's",
+        ["TensorConvTranspose1D"] = "its kernel's shape differs from the input's",
+        ["ForwardSplat"] = "its flow field has its own [N, 2, H, W] shape",
+        ["ForwardSplatBackwardInput"] = "its flow field has its own [N, 2, H, W] shape",
+        ["GLUBackward"] = "its gradient has half the input's split dimension",
+        ["GeGLUBackward"] = "its gradient has half the input's split dimension",
+        ["ReGLUBackward"] = "its gradient has half the input's split dimension",
+        ["SwiGLUBackward"] = "its gradient has half the input's split dimension",
+        ["GridSample"] = "its sampling grid has its own shape",
+        ["GridSampleBackwardGrid"] = "its sampling grid has its own shape",
+        ["TensorGridSample3D"] = "its sampling grid has its own shape",
+        ["TensorTrilinearInterpolate"] = "interpolates a rank-5 volume; the sweep's ranks stop at 4",
+        ["TensorTrilinearInterpolateBackward"] = "interpolates a rank-5 volume; the sweep's ranks stop at 4",
+        ["TensorBitwiseAnd"] = "an integer-only op; the CPU rejects float",
+        ["TensorBitwiseLeftShift"] = "an integer-only op; the CPU rejects float",
+        ["TensorBitwiseNot"] = "an integer-only op; the CPU rejects float",
+        ["TensorBitwiseOr"] = "an integer-only op; the CPU rejects float",
+        ["TensorBitwiseRightShift"] = "an integer-only op; the CPU rejects float",
+        ["TensorBitwiseXor"] = "an integer-only op; the CPU rejects float",
+        ["TensorGcd"] = "an integer-only op; the CPU rejects float",
+        ["TensorLcm"] = "an integer-only op; the CPU rejects float",
+        ["TensorDiagonalScatter"] = "its source is a diagonal, not the input's shape",
+        ["TensorGatherClassValues"] = "gathers with class indices of another shape",
     };
 
     private static readonly int[][] Shapes =
@@ -57,7 +119,7 @@ public sealed class TensorOpsGpuCpuParitySweepTests : IClassFixture<DirectGpuTen
                 return m.ReturnType == tensorT && tensors >= 1 && tensors <= 3
                     && ps.All(p => p.ParameterType == tensorT || (p.HasDefaultValue && !p.ParameterType.IsByRef));
             })
-            .Where(m => !NonDeterministic.Any(n => m.Name.Contains(n)))
+            .Where(m => !NonDeterministic.Contains(m.Name))
             .Distinct()
             .OrderBy(m => m.Name);
 
@@ -86,6 +148,13 @@ public sealed class TensorOpsGpuCpuParitySweepTests : IClassFixture<DirectGpuTen
             : p.DefaultValue).ToArray();
     }
 
+    /// <summary>The CPU engine's rejection of an input it does not take: an argument or shape error, not a fault.</summary>
+    private static bool RejectsArguments(Exception e)
+    {
+        while (e is TargetInvocationException { InnerException: not null } t) e = t.InnerException;
+        return e is ArgumentException or NotSupportedException or InvalidOperationException or RankException;
+    }
+
     private static string Inner(Exception e)
     {
         while (e is TargetInvocationException { InnerException: not null } t) e = t.InnerException!;
@@ -99,6 +168,7 @@ public sealed class TensorOpsGpuCpuParitySweepTests : IClassFixture<DirectGpuTen
         IEngine gpu = _fixture.Engine!;
         IEngine cpu = new CpuEngine();
         var failures = new List<string>();
+        var unprobed = new List<string>();
         int probed = 0;
         foreach (var def in SameShapeOps())
         {
@@ -111,7 +181,15 @@ public sealed class TensorOpsGpuCpuParitySweepTests : IClassFixture<DirectGpuTen
                     string where = $"{def.Name} [{string.Join(",", shape)}]{(strided ? " strided" : "")}";
                     Tensor<float> expected;
                     try { expected = (Tensor<float>)m.Invoke(cpu, Args(m, shape, strided))!; }
-                    catch { continue; } // the op does not take this shape on the CPU either
+                    catch (TargetInvocationException e) when (RejectsArguments(e))
+                    {
+                        continue; // the op does not take this shape on the CPU either
+                    }
+                    catch (Exception e)
+                    {
+                        failures.Add($"{where}: the CPU engine failed: {Inner(e)}");
+                        continue;
+                    }
                     ran = true;
                     Tensor<float> actual;
                     try { actual = (Tensor<float>)m.Invoke(gpu, Args(m, shape, strided))!; }
@@ -137,9 +215,13 @@ public sealed class TensorOpsGpuCpuParitySweepTests : IClassFixture<DirectGpuTen
                     }
                 }
             if (ran) probed++;
+            else if (!NoSameShapeForm.ContainsKey(def.Name)) unprobed.Add(def.Name);
         }
         _out.WriteLine($"probed {probed} ops; {failures.Count} failures");
         foreach (var f in failures) _out.WriteLine("FAIL " + f);
+        Assert.True(probed > 0, "The sweep probed no op.");
+        Assert.True(unprobed.Count == 0,
+            "The CPU engine ran these ops on no same-shape input, so they were never compared: " + string.Join(", ", unprobed));
         Assert.True(failures.Count == 0, $"{failures.Count} GPU/CPU mismatches:\n" + string.Join("\n", failures));
     }
 }

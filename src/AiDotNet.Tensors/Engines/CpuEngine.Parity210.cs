@@ -269,6 +269,10 @@ public partial class CpuEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         axes ??= new[] { 0, 1 };
         if (axes.Length != 2) throw new ArgumentException("Rot90 requires exactly 2 axes");
+        // torch.rot90 takes negative axes from the end; anything outside the rank has no plane to rotate.
+        axes = new[] { axes[0] < 0 ? axes[0] + tensor.Rank : axes[0], axes[1] < 0 ? axes[1] + tensor.Rank : axes[1] };
+        if (axes[0] < 0 || axes[0] >= tensor.Rank || axes[1] < 0 || axes[1] >= tensor.Rank)
+            throw new ArgumentOutOfRangeException(nameof(axes), $"Rot90 axes must lie in a rank-{tensor.Rank} tensor.");
         if (axes[0] == axes[1]) throw new ArgumentException("Rot90 axes must be different");
 
         // k mod 4; if k<0, adjust to positive rotation count.

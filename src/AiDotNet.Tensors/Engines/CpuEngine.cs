@@ -43813,7 +43813,19 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> SpiralConvBackwardBias<T>(Tensor<T> outputGradient)
     {
+        if (outputGradient == null) throw new ArgumentNullException(nameof(outputGradient));
+        RequireRank(outputGradient, 2, "SpiralConvBackwardBias", "[vertices, channels]");
         return MeshConvolutionOperations.SpiralConvBackwardBias(outputGradient);
+    }
+
+    /// <summary>
+    /// Rejects an input whose rank a kernel does not take, before the kernel indexes dimensions the shape lacks.
+    /// </summary>
+    internal static void RequireRank<T>(Tensor<T> tensor, int rank, string op, string layout)
+    {
+        if (tensor.Rank != rank)
+            throw new ArgumentException(
+                $"{op} needs a rank-{rank} {layout} tensor; got shape [{string.Join(", ", tensor._shape)}].", nameof(tensor));
     }
 
     /// <inheritdoc/>
@@ -48831,6 +48843,10 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> CrossEntropyBackward<T>(Tensor<T> predictions, Tensor<T> targets)
     {
+        if (predictions == null) throw new ArgumentNullException(nameof(predictions));
+        if (targets == null) throw new ArgumentNullException(nameof(targets));
+        if (predictions.Rank < 2)
+            throw new ArgumentException($"CrossEntropyBackward needs [batch, classes, ...] predictions; got shape [{string.Join(", ", predictions._shape)}].", nameof(predictions));
         var predictionsOrig = predictions;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!predictions.IsContiguous) predictions = predictions.Contiguous();
         var targetsOrig = targets;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -48952,6 +48968,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // head got no gradient for anything upstream of the pool.
         if (DifferentiableOps.IsTapeActiveForThread<T>() || GraphMode.IsActive)
             return AdaptiveAvgPool2D(input, 1, 1);
+        RequireRank(input, 4, "GlobalAvgPool2D", "[batch, channels, height, width]");
         var numOps = MathHelper.GetNumericOperations<T>();
         int batch = input._shape[0];
         int channels = input._shape[1];
@@ -49043,6 +49060,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (GraphMode.IsInferenceTrace)
             return CaptureInferenceKernel(new[] { input }, engine => engine.GlobalMaxPool2D(input));
+        RequireRank(input, 4, "GlobalMaxPool2D", "[batch, channels, height, width]");
         var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -50244,6 +50262,10 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>Cross-entropy loss with softmax (differentiable). Returns scalar tensor.</summary>
     public virtual Tensor<T> TensorCrossEntropyLoss<T>(Tensor<T> logits, Tensor<T> targets)
     {
+        if (logits == null) throw new ArgumentNullException(nameof(logits));
+        if (targets == null) throw new ArgumentNullException(nameof(targets));
+        if (logits.Rank < 2)
+            throw new ArgumentException($"TensorCrossEntropyLoss needs [batch, classes, ...] logits; got shape [{string.Join(", ", logits._shape)}].", nameof(logits));
         if (GraphMode.IsActive)
         { var ac = AutoTracer.TryGetCompiledPlan<T>("CrossEntropyLoss", logits._shape); if (ac is not null) return ac.Execute(); }
 
@@ -50291,6 +50313,10 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>NLL loss: -sum(target * log_probs) / batch_size. Expects log-probabilities.</summary>
     public virtual Tensor<T> TensorNLLLoss<T>(Tensor<T> logProbs, Tensor<T> targets)
     {
+        if (logProbs == null) throw new ArgumentNullException(nameof(logProbs));
+        if (targets == null) throw new ArgumentNullException(nameof(targets));
+        if (logProbs.Rank < 2)
+            throw new ArgumentException($"TensorNLLLoss needs [batch, classes, ...] log-probabilities; got shape [{string.Join(", ", logProbs._shape)}].", nameof(logProbs));
         if (GraphMode.IsActive)
         { var ac = AutoTracer.TryGetCompiledPlan<T>("NLLLoss", logProbs._shape); if (ac is not null) return ac.Execute(); }
 

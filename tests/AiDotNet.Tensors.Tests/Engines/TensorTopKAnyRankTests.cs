@@ -42,6 +42,8 @@ public sealed class TensorTopKAnyRankTests
         var x = new Tensor<float>(new[] { 2, 4, 3 }, new Vector<float>(data));
         var v = eng.TensorTopK(x, 2, 1, out var idx);
         Assert.Equal(new[] { 2, 2, 3 }, v.Shape.ToArray());
+        // The indices share the values' shape, so each position is addressed by the same coordinates.
+        Assert.Equal(new[] { 2, 2, 3 }, idx.Shape.ToArray());
         var vals = v.ToArray();
         var pos = idx.ToArray();
         for (int o = 0; o < 2; o++)

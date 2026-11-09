@@ -54,6 +54,12 @@ public sealed class AxisOpsRankConformanceTests
         ["TensorUnsqueezeInPlace"] = "inserts an axis, so the result's rank follows the input's and has no rank-2 form",
     };
 
+    /// <summary>
+    /// The <see cref="RunOnly"/> ops whose two engines draw different random values: the same-shape engine comparison
+    /// skips only these. The others lack a lifted rank-2 form but must still match the reference engine.
+    /// </summary>
+    private static readonly HashSet<string> DrawsRandomly = new() { "GumbelSoftmax", "TensorCategoricalSample" };
+
     private static readonly int[][] Shapes =
     {
         new[] { 6 },
@@ -130,7 +136,7 @@ public sealed class AxisOpsRankConformanceTests
         {
             string sig = Signature(def);
             if (Exempt.ContainsKey(def.Name)) continue;
-            if (reference is not null && RunOnly.ContainsKey(def.Name)) continue;
+            if (reference is not null && DrawsRandomly.Contains(def.Name)) continue;
             var m = def.MakeGenericMethod(typeof(float));
             var fwd = Forward(all, def);
             var plan = FindRank2Plan(planEngine, m, fwd, out string why);
@@ -493,18 +499,33 @@ public sealed class AxisOpsRankConformanceTests
             case Tensor<int> ai when e is Tensor<int> ei:
                 return CompareData(rankOneInput, ai.Shape.ToArray(), ei.Shape.ToArray(), ai.ToArray().Select(v => (double)v).ToArray(), ei.ToArray().Select(v => (double)v).ToArray());
             default:
-                var tt = a.GetType();
-                if (tt.FullName!.StartsWith("System.ValueTuple", StringComparison.Ordinal))
-                    return Compare(tt.GetFields().Select(fi => fi.GetValue(a)).ToArray(), e, rankOneInput);
-                return null;
+                // A tuple result compares member by member, so both sides are spread; anything else must at least be
+                // the same kind of value.
+                if (IsValueTuple(a) || IsValueTuple(e))
+                    return Compare(TupleItems(a), TupleItems(e), rankOneInput);
+                if (e is null || a.GetType() != e.GetType())
+                    return $"{a.GetType().Name} vs {e?.GetType().Name ?? "null"}";
+                if (a is not IConvertible || a is string) return Equals(a, e) ? null : $"{a} vs {e}";
+                double x = Convert.ToDouble(a), y = Convert.ToDouble(e);
+                bool same = (double.IsNaN(x) && double.IsNaN(y)) || x.Equals(y) || Math.Abs(x - y) <= 1e-4 * (1 + Math.Abs(y));
+                return same ? null : $"{a} vs {e}";
         }
     }
 
+    private static bool IsValueTuple(object? value) =>
+        value is not null && value.GetType().FullName is { } name && name.StartsWith("System.ValueTuple", StringComparison.Ordinal);
+
+    private static object? TupleItems(object? value) =>
+        IsValueTuple(value) && value is not null ? value.GetType().GetFields().Select(fi => fi.GetValue(value)).ToArray() : value;
+
+    private static bool DropsLeadingOne(int[] lifted, int[] shape) =>
+        lifted.Length == shape.Length + 1 && lifted[0] == 1 && lifted.Skip(1).SequenceEqual(shape);
+
     private static string? CompareData(bool rankOneInput, int[] sa, int[] se, double[] a, double[] e)
     {
-        // A rank-1 input lifts to [1, n], so its per-row result comes back as [n] or [1, n]: compare the data.
-        if (!sa.SequenceEqual(se)
-            && !(rankOneInput && Prod(sa) == Prod(se) && (sa.Length <= 1 || se.Length <= 1 || sa[0] == 1 || se[0] == 1)))
+        // A rank-1 input lifts to [1, n], so its result comes back with the lifted shape's leading 1: [n] against
+        // [1, n] (or [] against [1]). No other shape difference is accepted.
+        if (!sa.SequenceEqual(se) && !(rankOneInput && (DropsLeadingOne(se, sa) || DropsLeadingOne(sa, se))))
             return $"shape [{string.Join(",", sa)}] vs lifted [{string.Join(",", se)}]";
         for (int i = 0; i < a.Length; i++)
         {

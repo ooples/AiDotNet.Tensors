@@ -13606,7 +13606,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         var kernel = ResolveParity210Kernel("parity210_int32_to_float");
         using var _ = PushContext();
-        if (n <= 0) return;
+        if (n <= 0) return; GpuBufferCapacity.Require(raw, n, nameof(raw)); GpuBufferCapacity.Require(output, n, nameof(output));
         uint gsz = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr la0 = raw.Handle; IntPtr la1 = output.Handle; int la2 = n;
         void** args = stackalloc void*[3];
@@ -13617,7 +13617,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         var kernel = ResolveParity210Kernel("parity210_scatter_positions");
         using var _ = PushContext();
-        if (n <= 0) return;
+        if (n <= 0) return; GpuBufferCapacity.RequirePositions(output, srcDim, inner, n);
         uint gsz = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr la0 = output.Handle; int la1 = srcDim; int la2 = inner; int la3 = n;
         void** args = stackalloc void*[4];

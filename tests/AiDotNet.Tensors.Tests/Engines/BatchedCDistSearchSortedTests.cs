@@ -204,6 +204,50 @@ public sealed class BatchedCDistSearchSortedTests
         Assert.Equal(new[] { 1.0, 0.0, 0.0 }, gInf[a].ToArray());
         Assert.Equal(new[] { -1.0, 0.0, 0.0 }, gInf[b].ToArray());
         Assert.Equal(new[] { 0.0, 0.0, 0.0 }, gZero[a].ToArray());
+        Assert.Equal(new[] { 0.0, 0.0, 0.0 }, gZero[b].ToArray());
+    }
+
+    [Fact]
+    public void Broadcast_cdist_special_norm_orders_have_torch_gradients()
+    {
+        var eng = new CpuEngine();
+        // [2, 1, 3] x [1, 2, 3]: the batch dims broadcast to 2. Each pair has one coordinate attaining the maximum:
+        // (3, 0, -1), (2, 1, -5), (-1, 1, 8), (-2, 2, 4).
+        var a = new Tensor<double>(new[] { 2, 1, 3 }, new Vector<double>(new[] { 4.0, 1.0, 0.0, 0.0, 2.0, 9.0 }));
+        var b = new Tensor<double>(new[] { 1, 2, 3 }, new Vector<double>(new[] { 1.0, 1.0, 1.0, 2.0, 0.0, 5.0 }));
+        System.Collections.Generic.Dictionary<Tensor<double>, Tensor<double>> gInf, gZero;
+        using (var tape = new GradientTape<double>())
+        {
+            var d = eng.TensorCDist(a, b, double.PositiveInfinity);
+            Assert.Equal(new[] { 3.0, 5.0, 8.0, 4.0 }, d.ToArray());
+            gInf = tape.ComputeGradients(eng.ReduceSum(d, null, keepDims: false), new[] { a, b });
+        }
+        using (var tape = new GradientTape<double>())
+        {
+            var d = eng.TensorCDist(a, b, 0.0);
+            Assert.Equal(new[] { 2.0, 3.0, 3.0, 3.0 }, d.ToArray());
+            gZero = tape.ComputeGradients(eng.ReduceSum(d, null, keepDims: false), new[] { a, b });
+        }
+        // sign(diff) on the maximum coordinate: a gets it, b gets the opposite, summed over the pairs each is in.
+        Assert.Equal(new[] { 1.0, 0.0, -1.0, 0.0, 0.0, 2.0 }, gInf[a].ToArray());
+        Assert.Equal(new[] { -1.0, 0.0, -1.0, 0.0, 0.0, 0.0 }, gInf[b].ToArray());
+        Assert.Equal(new double[6], gZero[a].ToArray());
+        Assert.Equal(new double[6], gZero[b].ToArray());
+    }
+
+    [Fact]
+    public void Pdist_special_norm_orders_have_torch_gradients()
+    {
+        var eng = new CpuEngine();
+        // Rows (4, 1, 0), (1, 1, 1), (2, 0, 5): pairs (0,1), (0,2), (1,2) differ by (3, 0, -1), (2, 1, -5), (-1, 1, -4).
+        var x = new Tensor<double>(new[] { 3, 3 }, new Vector<double>(new[] { 4.0, 1.0, 0.0, 1.0, 1.0, 1.0, 2.0, 0.0, 5.0 }));
+        System.Collections.Generic.Dictionary<Tensor<double>, Tensor<double>> gInf, gZero;
+        using (var tape = new GradientTape<double>())
+            gInf = tape.ComputeGradients(eng.ReduceSum(eng.TensorPDist(x, double.PositiveInfinity), null, keepDims: false), new[] { x });
+        using (var tape = new GradientTape<double>())
+            gZero = tape.ComputeGradients(eng.ReduceSum(eng.TensorPDist(x, 0.0), null, keepDims: false), new[] { x });
+        Assert.Equal(new[] { 1.0, 0.0, -1.0, -1.0, 0.0, -1.0, 0.0, 0.0, 2.0 }, gInf[x].ToArray());
+        Assert.Equal(new double[9], gZero[x].ToArray());
     }
 
     [Fact]

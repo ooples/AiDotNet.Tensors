@@ -25,8 +25,15 @@ public class CDistNormOrderGpuTests
         Skip.IfNot(gpu.IsGpuAvailable, "No DirectGpu backend available");
 
         var cpu = new CpuEngine();
-        // Integer-valued inputs, with repeats, so p = 0 has equal coordinates to skip and the norms are exact.
-        var x1 = new Tensor<float>(new[] { 4, 5 }, new Vector<float>(Enumerable.Range(0, 20).Select(i => (float)(i * 7 % 5)).ToArray()));
+        // Integer-valued inputs so the norms are exact. The rows are distinct (pdist has nonzero distances to get
+        // right) but share some coordinates, so p = 0 has equal coordinates to skip.
+        var x1 = new Tensor<float>(new[] { 4, 5 }, new Vector<float>(new[]
+        {
+            0f, 1f, 2f, 3f, 0f,
+            0f, 2f, 2f, 1f, 3f,
+            1f, 1f, 0f, 3f, 2f,
+            0f, 1f, 2f, 0f, 0f,
+        }));
         var x2 = new Tensor<float>(new[] { 3, 5 }, new Vector<float>(Enumerable.Range(0, 15).Select(i => (float)(i * 3 % 4)).ToArray()));
         bool saved = DirectGpuTensorEngine.ThrowOnGpuKernelFallback;
         try

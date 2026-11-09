@@ -7936,7 +7936,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // The row kernel below is last-axis only; any other axis ran as if it were last and wrote wrong values.
             if (ea >= 0 && ea < input.Rank && InnerSize(input, ea) != 1)
             {
-                ((IEngine)this).TensorCopy(AlongLastAxis(input, ea, t => ((IEngine)this).Softmax(t, -1)), destination);
+                // As the host SoftmaxInto: a destination of another shape is rejected, not filled in flat order.
+                if (destination is null) throw new ArgumentNullException(nameof(destination));
+                if (!ShapesEqual(destination._shape, input._shape))
+                    throw new ArgumentException(
+                        $"Destination shape [{string.Join(", ", destination._shape)}] must match the input shape [{string.Join(", ", input._shape)}].",
+                        nameof(destination));
+                // The softmax here is a temporary copied into the destination; it is not a value the tape tracks.
+                Tensor<T> softmax;
+                using (new Autodiff.NoGradScope<T>())
+                    softmax = AlongLastAxis(input, ea, t => ((IEngine)this).Softmax(t, -1));
+                ((IEngine)this).TensorCopy(softmax, destination);
                 return;
             }
         }
@@ -29967,7 +29977,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private Tensor<T> AlongLastAxis<T>(Tensor<T> input, int axis, Func<Tensor<T>, Tensor<T>> lastAxisOp)
     {
         var perm = AxisLastPermutation(input.Rank, axis);
-        return PermutedContiguous(lastAxisOp(PermutedContiguous(input, perm)), InversePermutation(perm));
+        var permuted = PermutedContiguous(input, perm);
+        var rows = lastAxisOp(permuted);
+        var result = PermutedContiguous(rows, InversePermutation(perm));
+        // The two permuted intermediates are dead once the queued work that reads them runs: free them then rather
+        // than leaving their device memory to the collector. A tape or graph capture may still reference them.
+        if (!IsTapeActive<T>() && !Compilation.GraphMode.IsActive)
+        {
+            if (!ReferenceEquals(rows, permuted)) ReleaseDeadDeviceStorage(rows, afterQueuedWork: true);
+            ReleaseDeadDeviceStorage(permuted, afterQueuedWork: true);
+        }
+        return result;
     }
 
     Tensor<T> IEngine.GLU<T>(Tensor<T> input, int axis)
@@ -29980,6 +30000,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 int rank = input.Rank;
                 int ea = axis < 0 ? rank + axis : axis;
+                // An odd split dimension has no halves: the host implementation rejects it.
+                if (ea < 0 || ea >= input.Rank || input.Shape._dims[ea] % 2 != 0) return base.GLU(input, axis);
                 // The kernel gates along contiguous rows, i.e. the last axis. Any other axis is moved last on the device
                 // and back: before, it ran with the trailing dims folded away and returned wrong values.
                 if (InnerSize(input, ea) != 1)
@@ -30009,6 +30031,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 int rank = input.Rank;
                 int ea = axis < 0 ? rank + axis : axis;
+                // An odd split dimension has no halves: the host implementation rejects it.
+                if (ea < 0 || ea >= input.Rank || input.Shape._dims[ea] % 2 != 0) return base.GeGLU(input, axis);
                 // The kernel gates along contiguous rows, i.e. the last axis. Any other axis is moved last on the device
                 // and back: before, it ran with the trailing dims folded away and returned wrong values.
                 if (InnerSize(input, ea) != 1)
@@ -30037,6 +30061,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 int ea = axis < 0 ? input.Rank + axis : axis;
+                // An odd split dimension has no halves: the host implementation rejects it.
+                if (ea < 0 || ea >= input.Rank || input.Shape._dims[ea] % 2 != 0) return base.ReGLU(input, axis);
                 // The kernel gates along contiguous rows, i.e. the last axis. Any other axis is moved last on the device
                 // and back: before, it ran with the trailing dims folded away and returned wrong values.
                 if (InnerSize(input, ea) != 1)
@@ -30065,6 +30091,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 int ea = axis < 0 ? input.Rank + axis : axis;
+                // An odd split dimension has no halves: the host implementation rejects it.
+                if (ea < 0 || ea >= input.Rank || input.Shape._dims[ea] % 2 != 0) return base.SwiGLU(input, axis);
                 // The kernel gates along contiguous rows, i.e. the last axis. Any other axis is moved last on the device
                 // and back: before, it ran with the trailing dims folded away and returned wrong values.
                 if (InnerSize(input, ea) != 1)
@@ -30391,17 +30419,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             try
             {
-                var gso=UploadTensorRaw(b, softmaxOutput);
-                var ggo=UploadTensorRaw(b, gradOutput);
                 int rank=softmaxOutput.Rank;
                 int ea=axis<0?rank+axis:axis;
                 // Row kernel (last axis). Any other axis: move it last on the device for both operands, then back.
+                // The permutation reads the operands itself, so they are uploaded only on the row-kernel path.
                 if (InnerSize(softmaxOutput, ea) != 1)
                 {
                     var perm = AxisLastPermutation(rank, ea);
                     var r = ((IEngine)this).TensorSoftmaxBackward(PermutedContiguous(softmaxOutput, perm), PermutedContiguous(gradOutput, perm), -1);
                     return PermutedContiguous(r, InversePermutation(perm));
                 }
+                var gso=UploadTensorRaw(b, softmaxOutput);
+                var ggo=UploadTensorRaw(b, gradOutput);
                 int features=softmaxOutput.Shape._dims[ea];
                 int outerSize=softmaxOutput.Length/features;
                 return DispatchDeferredGpuOp<T>(b,softmaxOutput.Length,softmaxOutput.Shape.ToArray(),

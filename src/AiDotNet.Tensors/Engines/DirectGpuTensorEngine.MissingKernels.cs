@@ -4648,6 +4648,24 @@ public partial class DirectGpuTensorEngine
         var shape = (int[])indices._shape.Clone();
         if (indices.Length == 0 || !HasResidentIndexStorage(indices))
             return new Tensor<int>(indices.ToArray(), shape);
+        if (indices._gpuBufferContainsRawInt32)
+        {
+            // Raw int32 storage is copied as it is: converting to floats would round an index past 2^24.
+            using var raw = GetOrAllocateInt32IndexBuffer(backend, indices);
+            var rawCopy = AllocateOutputBuffer(backend, indices.Length);
+            try
+            {
+                backend.Copy(raw.Buffer, rawCopy.Buffer, indices.Length);
+                var rawSnapshot = Tensor<int>.FromGpuBuffer(backend, rawCopy.Buffer, shape, Gpu.GpuTensorRole.Intermediate,
+                    ownsBuffer: true, bufferContainsRawInt32: true);
+                rawCopy.RelinquishOwnership();
+                return rawSnapshot;
+            }
+            finally
+            {
+                rawCopy.Dispose();
+            }
+        }
         using var numeric = GetOrAllocateNumericIndexBuffer(backend, indices);
         var copy = AllocateOutputBuffer(backend, indices.Length);
         try
@@ -5073,6 +5091,10 @@ public partial class DirectGpuTensorEngine
             using var bufIn = GetOrAllocateBuffer(backend, ct);
             // Indices ride as a FLOAT buffer (int values, cast in-kernel) so a RESIDENT int-index tensor
             // (e.g. from Argsort) is reused in place instead of re-uploaded — the int-residency chain.
+            // The kernel reads indices as floats, exact only up to 2^24: a longer axis could select the wrong slot.
+            if (axisIn > MaxExactScatterPositions)
+                throw new NotSupportedException(
+                    $"TensorTakeAlongDim along an axis of {axisIn} exceeds the {MaxExactScatterPositions} indices a float holds exactly.");
             using var bufIdx = GetOrAllocateNumericIndexBuffer(backend, ci);
             var bufOut = AllocateOutputBuffer(backend, outN);
             backend.TakeAlongDim(bufIn.Buffer, bufIdx.Buffer, bufOut.Buffer, outerSize, axisOut, innerSize, axisIn);
@@ -9541,10 +9563,11 @@ public partial class DirectGpuTensorEngine
                         new object[] { new Tensor<int>((int[])ci._shape.Clone()), d });
                 return result;
             }
-            // The last-write test compares float positions along the axis; past 2^24 + 1 two positions share a float.
-            if (srcDim > MaxExactScatterPositions)
+            // The last-write test compares float positions along the axis and gathers through float indices; past
+            // 2^24 + 1 two positions (or two destination slots) share a float.
+            if (Math.Max(srcDim, dstDim) > MaxExactScatterPositions)
                 throw new NotSupportedException(
-                    $"TensorScatter along an axis of {srcDim} writes exceeds the {MaxExactScatterPositions} positions a float holds exactly.");
+                    $"TensorScatter of {srcDim} writes into an axis of {dstDim} exceeds the {MaxExactScatterPositions} positions a float holds exactly.");
             var cs = source.IsContiguous ? source : source.Contiguous();
             using var destinationBuffer = GetOrAllocateBuffer(backend, cd);
             using var sourceBuffer = GetOrAllocateBuffer(backend, cs);
@@ -9636,8 +9659,8 @@ public partial class DirectGpuTensorEngine
         int inner = 1; for (int k = axis + 1; k < rank; k++) inner *= destinationShape[k];
         int n = outer * dstDim * inner, m = indices.Length;
         if (m == 0) return new Tensor<T>((int[])indices._shape.Clone());
-        // Positions past a float's exact range would merge; the host mask is exact.
-        if (srcDim > MaxExactScatterPositions) return null;
+        // Positions or indices past a float's exact range would merge; the host mask is exact.
+        if (Math.Max(srcDim, dstDim) > MaxExactScatterPositions) return null;
         var ci = indices.IsContiguous ? indices : indices.Contiguous();
         var buffers = new List<IGpuBuffer>();
         try

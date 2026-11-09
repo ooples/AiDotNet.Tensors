@@ -153,13 +153,13 @@ public sealed partial class WebGpuBackend
     }
     public void Int32ToFloat(IGpuBuffer raw, IGpuBuffer output, int n)
     {
-        if (n <= 0) return;
+        if (n <= 0) return; GpuBufferCapacity.Require(raw, n, nameof(raw)); GpuBufferCapacity.Require(output, n, nameof(output));
         DispatchNBufferAsync("Audit:Int32ToFloat", WebGpuAuditKernels.Int32ToFloat, "main",
             new IGpuBuffer[] { raw, output }, new float[] { BitConverter.Int32BitsToSingle(n), 0f, 0f, 0f }, n).GetAwaiter().GetResult();
     }
     public void ScatterPositions(IGpuBuffer output, int srcDim, int inner, int n)
     {
-        if (n <= 0) return;
+        if (n <= 0) return; GpuBufferCapacity.RequirePositions(output, srcDim, inner, n);
         DispatchNBufferAsync("Audit:ScatterPositions", WebGpuAuditKernels.ScatterPositions, "main",
             new IGpuBuffer[] { output }, new float[] { BitConverter.Int32BitsToSingle(srcDim), BitConverter.Int32BitsToSingle(inner), BitConverter.Int32BitsToSingle(n), 0f }, n).GetAwaiter().GetResult();
     }
