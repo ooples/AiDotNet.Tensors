@@ -103,7 +103,24 @@ public sealed class AxisOpsRankConformanceTests
     [Fact]
     public void Every_axis_op_that_runs_on_rank_2_runs_on_every_rank_and_matches_the_lifted_reference()
     {
-        var engine = new CpuEngine();
+        var (failures, unprobed, probed) = Sweep(new CpuEngine(), reference: null);
+        _out.WriteLine($"probed {probed} ops; {failures.Count} failures; {unprobed.Count} unprobed");
+        foreach (var f in failures) _out.WriteLine("FAIL " + f);
+        foreach (var u in unprobed) _out.WriteLine("UNPROBED " + u);
+        Assert.True(failures.Count == 0 && unprobed.Count == 0,
+            $"{failures.Count} rank failures; {unprobed.Count} axis ops the probe cannot run at rank 2 "
+            + "(make them run, or add them to Exempt with the reason):\n"
+            + string.Join("\n", failures.Concat(unprobed.Select(u => "UNPROBED " + u))));
+    }
+
+    /// <summary>
+    /// Runs every probed axis op on every rank and axis. With no <paramref name="reference"/>, each result is compared
+    /// with the lifted rank-2 call on the same engine. With a reference engine, each result (rank 2 included) is
+    /// compared with the reference engine's result on the same arguments: the GPU/CPU parity sweep.
+    /// </summary>
+    internal static (List<string> Failures, List<string> Unprobed, int Probed) Sweep(IEngine engine, IEngine? reference)
+    {
+        var planEngine = reference ?? engine;
         var all = AllEngineMethods();
         var failures = new List<string>();
         var unprobed = new List<string>();
@@ -113,9 +130,10 @@ public sealed class AxisOpsRankConformanceTests
         {
             string sig = Signature(def);
             if (Exempt.ContainsKey(def.Name)) continue;
+            if (reference is not null && RunOnly.ContainsKey(def.Name)) continue;
             var m = def.MakeGenericMethod(typeof(float));
             var fwd = Forward(all, def);
-            var plan = FindRank2Plan(engine, m, fwd, out string why);
+            var plan = FindRank2Plan(planEngine, m, fwd, out string why);
             if (plan is null)
             {
                 unprobed.Add($"{sig}: {why}");
@@ -124,24 +142,22 @@ public sealed class AxisOpsRankConformanceTests
             probed++;
             foreach (var shape in Shapes)
             {
-                if (shape.Length == 2) continue;
+                if (shape.Length == 2 && reference is null) continue;
                 for (int ax = 0; ax < shape.Length; ax++)
                 {
                     string where = $"{sig} rank {shape.Length} axis {ax} [{string.Join(",", shape)}]";
-                    bool lift = !RunOnly.ContainsKey(def.Name) && CanLift(m);
+                    bool lift = reference is null && !RunOnly.ContainsKey(def.Name) && CanLift(m);
                     object?[] args;
-                    object?[] pristine;
+                    object?[]? refArgs = null;
+                    object?[]? lifted = null;
                     object? actual;
                     try
                     {
-                        args = BuildArgs(engine, m, fwd, shape, ax, plan);
-                        // An in-place op mutates args, so the lifted reference starts from a copy taken before the call.
-                        pristine = args.Select(a => a switch
-                        {
-                            Tensor<float> f => f.Clone(),
-                            Tensor<int> i => (object)i.Clone(),
-                            _ => a,
-                        }).ToArray();
+                        // Parity mode: one argument set (a backward op's forward output included, which may be random),
+                        // copied for each engine, so both see identical inputs.
+                        args = reference is null ? BuildArgs(engine, m, fwd, shape, ax, plan) : Clone(refArgs = BuildArgs(reference, m, fwd, shape, ax, plan));
+                        // Lift first: an in-place op mutates its arguments, and the lifted copy must see the inputs.
+                        if (lift) lifted = Lift(args, m, shape, ax, plan);
                         actual = Invoke(engine, m, args);
                     }
                     catch (Exception e)
@@ -149,10 +165,20 @@ public sealed class AxisOpsRankConformanceTests
                         failures.Add($"{where}: {Inner(e)}");
                         continue;
                     }
-                    if (!lift) continue;
+                    if (reference is not null && refArgs is not null)
+                    {
+                        try
+                        {
+                            var expected = Invoke(reference, m, refArgs);
+                            if (Compare(actual, expected) is { } diff)
+                                failures.Add($"{where}: differs from the reference engine: {diff}");
+                        }
+                        catch (Exception e) { failures.Add($"{where}: reference engine failed: {Inner(e)}"); }
+                        continue;
+                    }
+                    if (!lift || lifted is null) continue;
                     try
                     {
-                        var lifted = Lift(pristine, m, shape, ax, plan);
                         var expected = Unlift(Invoke(engine, m, lifted), shape, ax);
                         if (Compare(actual, expected) is { } diff)
                             failures.Add($"{where}: differs from the lifted rank-2 reference: {diff}");
@@ -161,15 +187,18 @@ public sealed class AxisOpsRankConformanceTests
                 }
             }
         }
-
-        _out.WriteLine($"probed {probed} ops; {failures.Count} failures; {unprobed.Count} unprobed");
-        foreach (var f in failures) _out.WriteLine("FAIL " + f);
-        foreach (var u in unprobed) _out.WriteLine("UNPROBED " + u);
-        Assert.True(failures.Count == 0 && unprobed.Count == 0,
-            $"{failures.Count} rank failures; {unprobed.Count} axis ops the probe cannot run at rank 2 "
-            + "(make them run, or add them to Exempt with the reason):\n"
-            + string.Join("\n", failures.Concat(unprobed.Select(u => "UNPROBED " + u))));
+        return (failures, unprobed, probed);
     }
+
+    private static object?[] Clone(object?[] args) => args.Select(a => a switch
+    {
+        Tensor<float> f => (object)new Tensor<float>(f.Shape.ToArray(), new Vector<float>(f.ToArray())),
+        Tensor<int> i => new Tensor<int>(i.ToArray(), i.Shape.ToArray()),
+        Tensor<float>[] fs => fs.Select(f => new Tensor<float>(f.Shape.ToArray(), new Vector<float>(f.ToArray()))).ToArray(),
+        List<Tensor<float>> fl => fl.Select(f => new Tensor<float>(f.Shape.ToArray(), new Vector<float>(f.ToArray()))).ToList(),
+        int[] ia => (int[])ia.Clone(),
+        _ => a,
+    }).ToArray();
 
     private static string Inner(Exception e)
     {
