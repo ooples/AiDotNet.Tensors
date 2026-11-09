@@ -42958,11 +42958,14 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // The backward reads the indices this forward used: a caller editing its tensor afterwards must not change
         // the gradient, so the tape keeps a copy.
-        var savedIndices = new int[indices.Length];
-        Array.Copy(indexData, savedIndices, savedIndices.Length);
-        DifferentiableOps.RecordBinary("TensorScatter", result, destination, source,
-            BackwardFunctions<T>.TensorScatterBackward,
-            new object[] { new Tensor<int>(savedIndices, (int[])indices._shape.Clone()), axis });
+        if (DifferentiableOps.IsTapeActiveForThread<T>())
+        {
+            var savedIndices = new int[indices.Length];
+            Array.Copy(indexData, savedIndices, savedIndices.Length);
+            DifferentiableOps.RecordBinary("TensorScatter", result, destination, source,
+                BackwardFunctions<T>.TensorScatterBackward,
+                new object[] { new Tensor<int>(savedIndices, (int[])indices._shape.Clone()), axis });
+        }
         return result;
     }
 
@@ -43026,7 +43029,7 @@ public partial class CpuEngine : ITensorLevelEngine
             });
 
             DifferentiableOps.RecordUnary("TensorIndexSelect", result, tensor,
-                BackwardFunctions<T>.IndexSelectBackward, new object[] { indices.Clone(), axis });
+                BackwardFunctions<T>.IndexSelectBackward, new object[] { TapeIndexCopy<T>(indices), axis });
             AutoTracer.RecordOp("TensorIndexSelect", result, eng => eng.TensorIndexSelect(tensor, indices, axis));
             return result;
         }
@@ -43051,7 +43054,7 @@ public partial class CpuEngine : ITensorLevelEngine
             });
 
             DifferentiableOps.RecordUnary("TensorIndexSelect", result, tensor,
-                BackwardFunctions<T>.IndexSelectBackward, new object[] { indices.Clone(), axis });
+                BackwardFunctions<T>.IndexSelectBackward, new object[] { TapeIndexCopy<T>(indices), axis });
             AutoTracer.RecordOp("TensorIndexSelect", result, eng => eng.TensorIndexSelect(tensor, indices, axis));
             return result;
         }
@@ -43083,7 +43086,7 @@ public partial class CpuEngine : ITensorLevelEngine
             });
 
             DifferentiableOps.RecordUnary("TensorIndexSelect", result, tensor,
-                BackwardFunctions<T>.IndexSelectBackward, new object[] { indices.Clone(), axis });
+                BackwardFunctions<T>.IndexSelectBackward, new object[] { TapeIndexCopy<T>(indices), axis });
             AutoTracer.RecordOp("TensorIndexSelect", result, eng => eng.TensorIndexSelect(tensor, indices, axis));
             return result;
         }
@@ -43819,6 +43822,13 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>
+    /// The indices a tape entry keeps: a copy, so a caller editing its tensor after the forward does not change the
+    /// gradient. With no tape recording nothing is kept, so no copy is made.
+    /// </summary>
+    internal static Tensor<int> TapeIndexCopy<T>(Tensor<int> indices) =>
+        DifferentiableOps.IsTapeActiveForThread<T>() ? indices.Clone() : indices;
+
+    /// <summary>
     /// Rejects an input whose rank a kernel does not take, before the kernel indexes dimensions the shape lacks.
     /// </summary>
     internal static void RequireRank<T>(Tensor<T> tensor, int rank, string op, string layout)
@@ -44080,7 +44090,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }, deterministicSafe: true);
 
         DifferentiableOps.RecordUnary("TopK", values, input,
-            BackwardFunctions<T>.TopKBackward, new object[] { indices.Clone(), axis });
+            BackwardFunctions<T>.TopKBackward, new object[] { TapeIndexCopy<T>(indices), axis });
         return (values, indices);
     }
 
@@ -48845,8 +48855,8 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (predictions == null) throw new ArgumentNullException(nameof(predictions));
         if (targets == null) throw new ArgumentNullException(nameof(targets));
-        if (predictions.Rank < 2)
-            throw new ArgumentException($"CrossEntropyBackward needs [batch, classes, ...] predictions; got shape [{string.Join(", ", predictions._shape)}].", nameof(predictions));
+        // The kernel reads one class vector per batch row; spatial dims after the classes are not supported.
+        RequireRank(predictions, 2, "CrossEntropyBackward", "[batch, classes]");
         var predictionsOrig = predictions;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!predictions.IsContiguous) predictions = predictions.Contiguous();
         var targetsOrig = targets;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -50264,8 +50274,8 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (logits == null) throw new ArgumentNullException(nameof(logits));
         if (targets == null) throw new ArgumentNullException(nameof(targets));
-        if (logits.Rank < 2)
-            throw new ArgumentException($"TensorCrossEntropyLoss needs [batch, classes, ...] logits; got shape [{string.Join(", ", logits._shape)}].", nameof(logits));
+        // The kernel reads one class vector per batch row; spatial dims after the classes are not supported.
+        RequireRank(logits, 2, "TensorCrossEntropyLoss", "[batch, classes]");
         if (GraphMode.IsActive)
         { var ac = AutoTracer.TryGetCompiledPlan<T>("CrossEntropyLoss", logits._shape); if (ac is not null) return ac.Execute(); }
 
@@ -50315,8 +50325,8 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (logProbs == null) throw new ArgumentNullException(nameof(logProbs));
         if (targets == null) throw new ArgumentNullException(nameof(targets));
-        if (logProbs.Rank < 2)
-            throw new ArgumentException($"TensorNLLLoss needs [batch, classes, ...] log-probabilities; got shape [{string.Join(", ", logProbs._shape)}].", nameof(logProbs));
+        // The kernel reads one class vector per batch row; spatial dims after the classes are not supported.
+        RequireRank(logProbs, 2, "TensorNLLLoss", "[batch, classes]");
         if (GraphMode.IsActive)
         { var ac = AutoTracer.TryGetCompiledPlan<T>("NLLLoss", logProbs._shape); if (ac is not null) return ac.Execute(); }
 

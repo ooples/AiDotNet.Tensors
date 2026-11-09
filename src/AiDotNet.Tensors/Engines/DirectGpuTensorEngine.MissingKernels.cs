@@ -4935,7 +4935,7 @@ public partial class DirectGpuTensorEngine
                     indices = new Tensor<int>(indexData, new[] { rows, selected });
                     var topValues = new Tensor<T>(valueData, new[] { rows, selected });
                     Autodiff.DifferentiableOps.RecordUnary("TopK", topValues, tensor,
-                        Autodiff.BackwardFunctions<T>.TopKBackward, new object[] { indices.Clone(), 1 });
+                        Autodiff.BackwardFunctions<T>.TopKBackward, new object[] { TapeIndexCopy<T>(indices), 1 });
                     return topValues;
                 }
                 finally

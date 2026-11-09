@@ -94,8 +94,23 @@ public class CDistNormOrderGpuTests
         // A NaN coordinate after a larger one: a NaN-dropping max returned 5 here.
         var x1 = new Tensor<float>(new[] { 6f, float.NaN, 0f, 1f, 2f, 3f }, new[] { 2, 3 });
         var x2 = new Tensor<float>(new[] { 1f, 1f, 1f }, new[] { 1, 3 });
-        var cd = gpu.TensorCDist(x1, x2, double.PositiveInfinity).ToArray();
-        var pd = gpu.TensorPDist(x1, double.PositiveInfinity).ToArray();
+        float[] cd, pd;
+        bool saved = DirectGpuTensorEngine.ThrowOnGpuKernelFallback;
+        try
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = true;
+            GpuLaunchProbe.Reset();
+            cd = gpu.TensorCDist(x1, x2, double.PositiveInfinity).ToArray();
+            Assert.True(GpuLaunchProbe.Count > 0, "The cdist kernel did not run.");
+            GpuLaunchProbe.Reset();
+            pd = gpu.TensorPDist(x1, double.PositiveInfinity).ToArray();
+            Assert.True(GpuLaunchProbe.Count > 0, "The pdist kernel did not run.");
+            Assert.Empty(GpuLaunchProbe.Fallbacks);
+        }
+        finally
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = saved;
+        }
         Assert.True(float.IsNaN(cd[0]), $"cdist gave {cd[0]} for a row holding NaN.");
         Assert.True(float.IsNaN(pd[0]), $"pdist gave {pd[0]} for a pair holding NaN.");
         Assert.Equal(cpu.TensorCDist(x1, x2, double.PositiveInfinity).ToArray(), cd);

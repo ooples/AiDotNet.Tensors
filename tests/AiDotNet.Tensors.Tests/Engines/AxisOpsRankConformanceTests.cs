@@ -507,7 +507,11 @@ public sealed class AxisOpsRankConformanceTests
                     return $"{a.GetType().Name} vs {e?.GetType().Name ?? "null"}";
                 if (a is not IConvertible || a is string) return Equals(a, e) ? null : $"{a} vs {e}";
                 double x = Convert.ToDouble(a), y = Convert.ToDouble(e);
-                bool same = (double.IsNaN(x) && double.IsNaN(y)) || x.Equals(y) || Math.Abs(x - y) <= 1e-4 * (1 + Math.Abs(y));
+                // A NaN or an infinity fails every tolerance comparison, so it must match exactly.
+                bool exactOnly = double.IsNaN(x) || double.IsNaN(y) || double.IsInfinity(x) || double.IsInfinity(y);
+                bool same = exactOnly
+                    ? (double.IsNaN(x) && double.IsNaN(y)) || x.Equals(y)
+                    : Math.Abs(x - y) <= 1e-4 * (1 + Math.Abs(y));
                 return same ? null : $"{a} vs {e}";
         }
     }

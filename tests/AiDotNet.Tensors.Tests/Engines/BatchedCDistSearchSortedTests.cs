@@ -287,6 +287,16 @@ public sealed class BatchedCDistSearchSortedTests
     }
 
     [Fact]
+    public void Losses_reject_inputs_with_dims_after_the_classes()
+    {
+        var eng = new CpuEngine();
+        var x = new Tensor<float>(new[] { 2, 3, 2 }, new Vector<float>(Enumerable.Range(0, 12).Select(i => 0.1f * i).ToArray()));
+        Assert.Throws<ArgumentException>(() => eng.TensorCrossEntropyLoss(x, x));
+        Assert.Throws<ArgumentException>(() => eng.TensorNLLLoss(x, x));
+        Assert.Throws<ArgumentException>(() => eng.CrossEntropyBackward(x, x));
+    }
+
+    [Fact]
     public void Cdist_rejects_batch_dims_that_do_not_broadcast()
     {
         var eng = new CpuEngine();

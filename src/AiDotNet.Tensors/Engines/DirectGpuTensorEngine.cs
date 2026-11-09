@@ -7936,6 +7936,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // The row kernel below is last-axis only; any other axis ran as if it were last and wrote wrong values.
             if (ea >= 0 && ea < input.Rank && InnerSize(input, ea) != 1)
             {
+                // The device permutation converts through float; any other T keeps its precision on the host.
+                if (typeof(T) != typeof(float))
+                {
+                    base.SoftmaxInto(destination, input, axis);
+                    return;
+                }
                 // As the host SoftmaxInto: a destination of another shape is rejected, not filled in flat order.
                 if (destination is null) throw new ArgumentNullException(nameof(destination));
                 if (!ShapesEqual(destination._shape, input._shape))
