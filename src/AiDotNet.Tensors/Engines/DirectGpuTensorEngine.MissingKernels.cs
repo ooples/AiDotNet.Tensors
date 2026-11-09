@@ -4739,67 +4739,79 @@ public partial class DirectGpuTensorEngine
     {
         const int C = TopKChunk;
         int n = (columns + C - 1) / C * C;
-        // Each buffer is under the cleanup below from the moment it exists, so a failed allocation of its partner
-        // never strands it until a collection.
-        var val = AllocateOutputBuffer(backend, rows * n);
-        OwnedBuffer idx = default;
-        bool owned = true;
-        try
+        // Each buffer goes into its round's owner as it is allocated, so any failure (a partner's allocation, a
+        // kernel) disposes everything the round holds; only the final round's pair is handed to the caller.
+        using var round = new TopKRoundBuffers();
+        round.Values = AllocateOutputBuffer(backend, rows * n);
+        round.Indices = AllocateOutputBuffer(backend, rows * n);
+        backend.Fill(round.Values.Buffer, float.NegativeInfinity, rows * n);
+        backend.CopyRows(source, round.Values.Buffer, columns, n, rows, columns);
+        backend.IotaPad(round.Indices.Buffer, columns, n, rows);
+        while (true)
         {
-            idx = AllocateOutputBuffer(backend, rows * n);
-            backend.Fill(val.Buffer, float.NegativeInfinity, rows * n);
-            backend.CopyRows(source, val.Buffer, columns, n, rows, columns);
-            backend.IotaPad(idx.Buffer, columns, n, rows);
-            while (true)
+            int chunks = n / C;
+            for (int size = 2; size <= C; size <<= 1)
+                for (int j = size >> 1; j > 0; j >>= 1)
+                    backend.BitonicStep(round.Values.Buffer, round.Indices.Buffer, C, size, j, rows * chunks, 1);
+            if (chunks == 1)
             {
-                int chunks = n / C;
-                for (int size = 2; size <= C; size <<= 1)
-                    for (int j = size >> 1; j > 0; j >>= 1)
-                        backend.BitonicStep(val.Buffer, idx.Buffer, C, size, j, rows * chunks, 1);
-                if (chunks == 1)
-                {
-                    stride = C;
-                    owned = false;
-                    return (val, idx);
-                }
-                int next = chunks * k, nextPad = (next + C - 1) / C * C;
-                var nextVal = AllocateOutputBuffer(backend, rows * nextPad);
-                OwnedBuffer nextIdx = default;
-                try
-                {
-                    nextIdx = AllocateOutputBuffer(backend, rows * nextPad);
-                    backend.Fill(nextVal.Buffer, float.NegativeInfinity, rows * nextPad);
-                    backend.Fill(nextIdx.Buffer, -1f, rows * nextPad);
-                    using (var packedVal = AllocateOutputBuffer(backend, rows * next))
-                    using (var packedIdx = AllocateOutputBuffer(backend, rows * next))
-                    {
-                        // Best k of every chunk, packed row-major: [rows * chunks, k] == [rows, chunks * k].
-                        backend.CopyRows(val.Buffer, packedVal.Buffer, C, k, rows * chunks, k);
-                        backend.CopyRows(idx.Buffer, packedIdx.Buffer, C, k, rows * chunks, k);
-                        backend.CopyRows(packedVal.Buffer, nextVal.Buffer, next, nextPad, rows, next);
-                        backend.CopyRows(packedIdx.Buffer, nextIdx.Buffer, next, nextPad, rows, next);
-                    }
-                }
-                catch
-                {
-                    nextVal.Dispose();
-                    nextIdx.Dispose();
-                    throw;
-                }
-                val.Dispose();
-                idx.Dispose();
-                val = nextVal;
-                idx = nextIdx;
-                n = nextPad;
+                stride = C;
+                return round.Release();
             }
+            int next = chunks * k, nextPad = (next + C - 1) / C * C;
+            using (var nextRound = new TopKRoundBuffers())
+            {
+                nextRound.Values = AllocateOutputBuffer(backend, rows * nextPad);
+                nextRound.Indices = AllocateOutputBuffer(backend, rows * nextPad);
+                backend.Fill(nextRound.Values.Buffer, float.NegativeInfinity, rows * nextPad);
+                backend.Fill(nextRound.Indices.Buffer, -1f, rows * nextPad);
+                using (var packed = new TopKRoundBuffers())
+                {
+                    packed.Values = AllocateOutputBuffer(backend, rows * next);
+                    packed.Indices = AllocateOutputBuffer(backend, rows * next);
+                    // Best k of every chunk, packed row-major: [rows * chunks, k] == [rows, chunks * k].
+                    backend.CopyRows(round.Values.Buffer, packed.Values.Buffer, C, k, rows * chunks, k);
+                    backend.CopyRows(round.Indices.Buffer, packed.Indices.Buffer, C, k, rows * chunks, k);
+                    backend.CopyRows(packed.Values.Buffer, nextRound.Values.Buffer, next, nextPad, rows, next);
+                    backend.CopyRows(packed.Indices.Buffer, nextRound.Indices.Buffer, next, nextPad, rows, next);
+                }
+                round.TakeFrom(nextRound);
+            }
+            n = nextPad;
         }
-        finally
+    }
+
+    /// <summary>
+    /// The value and index buffers of one tournament round. Disposing releases whatever it still holds, so a round
+    /// is released on every path; <see cref="TakeFrom"/> and <see cref="Release"/> move ownership out of it.
+    /// </summary>
+    private sealed class TopKRoundBuffers : IDisposable
+    {
+        internal OwnedBuffer Values;
+        internal OwnedBuffer Indices;
+
+        /// <summary>Releases this round's buffers and takes <paramref name="next"/>'s, leaving it empty.</summary>
+        internal void TakeFrom(TopKRoundBuffers next)
         {
-            if (owned)
-            {
-                val.Dispose();
-                idx.Dispose();
-            }
+            Dispose();
+            (Values, Indices) = next.Release();
+        }
+
+        /// <summary>Hands the buffers to the caller; this round no longer releases them.</summary>
+        internal (OwnedBuffer values, OwnedBuffer indices) Release()
+        {
+            var held = (Values, Indices);
+            Values = default;
+            Indices = default;
+            return held;
+        }
+
+        public void Dispose()
+        {
+            Values.Dispose();
+            Indices.Dispose();
+            Values = default;
+            Indices = default;
         }
     }
 
