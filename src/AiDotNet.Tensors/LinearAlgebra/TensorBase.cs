@@ -2998,7 +2998,19 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// of <see cref="AsSpan"/> whenever the object could otherwise become unreachable while the span is in use (a
     /// temporary result, or a local whose last use is the span); see <see cref="ReadLease{T}"/>.
     /// </summary>
-    internal ReadLease<T> Lease() => new(this, AsSpanUnmarked());
+    /// <remarks>
+    /// A non-contiguous view (a transpose, a strided slice) has no contiguous span of its own, so it is leased as a
+    /// logical-order copy: a reader sees the same row-major values either way. Contiguous tensors stay zero-copy.
+    /// </remarks>
+    internal ReadLease<T> Lease()
+    {
+        if (IsContiguous || Length == 0) return new(this, AsSpanUnmarked());
+        EnsureMaterialized();
+        ThrowIfSparse();
+        var copy = new T[Length];
+        CopyLogicalTo(copy);
+        return new(copy, copy);
+    }
 
     /// <summary>The writable form of <see cref="Lease"/>.</summary>
     internal WriteLease<T> LeaseWritable() => new(this, AsWritableSpanUnmarked());

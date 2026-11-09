@@ -224,4 +224,83 @@ public sealed class TensorOpsGpuCpuParitySweepTests : IClassFixture<DirectGpuTen
             "The CPU engine ran these ops on no same-shape input, so they were never compared: " + string.Join(", ", unprobed));
         Assert.True(failures.Count == 0, $"{failures.Count} GPU/CPU mismatches:\n" + string.Join("\n", failures));
     }
+
+    /// <summary>Broadcastable (left, right) shape pairs: trailing vector, middle singleton, outer product, scalar-like.</summary>
+    private static readonly (int[] A, int[] B)[] BroadcastPairs =
+    {
+        (new[] { 2, 3, 4 }, new[] { 4 }),
+        (new[] { 4 }, new[] { 2, 3, 4 }),
+        (new[] { 2, 1, 4 }, new[] { 3, 1 }),
+        (new[] { 3, 1 }, new[] { 1, 5 }),
+        (new[] { 2, 3, 4 }, new[] { 1 }),
+        (new[] { 2, 3, 4 }, new[] { 2, 1, 4 }),
+    };
+
+    /// <summary>
+    /// GPU/CPU parity for the same two-tensor ops on broadcastable shapes: wherever the CPU engine broadcasts, the GPU
+    /// must give the same shape and values (and must not throw).
+    /// </summary>
+    [SkippableFact]
+    public void Two_tensor_ops_match_the_cpu_on_broadcast_shapes()
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        IEngine gpu = _fixture.Engine!;
+        IEngine cpu = new CpuEngine();
+        var failures = new List<string>();
+        int probed = 0;
+        foreach (var def in SameShapeOps().Where(d => d.GetParameters().Count(p => p.ParameterType.IsGenericType
+            && p.ParameterType.GetGenericTypeDefinition() == typeof(Tensor<>)) == 2))
+        {
+            var m = def.MakeGenericMethod(typeof(float));
+            bool ran = false;
+            foreach (var (sa, sb) in BroadcastPairs)
+            {
+                object?[] MakeArgs()
+                {
+                    int t = 0;
+                    return m.GetParameters().Select(p => p.ParameterType == typeof(Tensor<float>)
+                        ? (object)Make(t++ == 0 ? sa : sb, t, false)
+                        : p.DefaultValue).ToArray();
+                }
+                string where = $"{def.Name} [{string.Join(",", sa)}]x[{string.Join(",", sb)}]";
+                Tensor<float> expected;
+                try { expected = (Tensor<float>)m.Invoke(cpu, MakeArgs())!; }
+                catch { continue; }
+                ran = true;
+                Tensor<float> actual;
+                try { actual = (Tensor<float>)m.Invoke(gpu, MakeArgs())!; }
+                catch (Exception e) { failures.Add($"{where}: GPU threw where the CPU did not: {Inner(e)}"); continue; }
+                if (!expected.Shape.ToArray().SequenceEqual(actual.Shape.ToArray()))
+                {
+                    failures.Add($"{where}: shape [{string.Join(",", actual.Shape.ToArray())}] vs cpu [{string.Join(",", expected.Shape.ToArray())}]");
+                    continue;
+                }
+                var e1 = expected.ToArray();
+                var a1 = actual.ToArray();
+                for (int i = 0; i < e1.Length; i++)
+                {
+                    float x = a1[i], y = e1[i];
+                    bool same = float.IsNaN(y) ? float.IsNaN(x)
+                        : float.IsInfinity(y) ? x.Equals(y)
+                        : !float.IsNaN(x) && !float.IsInfinity(x) && Math.Abs(x - y) <= 1e-3f * (1 + Math.Abs(y));
+                    if (!same) { failures.Add($"{where}: element {i}: gpu {x} vs cpu {y}"); break; }
+                }
+            }
+            if (ran) probed++;
+        }
+        _out.WriteLine($"broadcast: probed {probed} ops; {failures.Count} failures");
+        foreach (var f in failures) _out.WriteLine("FAIL " + f);
+        Assert.True(failures.Count == 0, $"{failures.Count} GPU/CPU broadcast mismatches:\n" + string.Join("\n", failures));
+    }
+
+    /// <summary>The GPU overrides must enforce the same backward shape contract as the CPU engine.</summary>
+    [SkippableFact]
+    public void Gpu_elementwise_backwards_reject_a_gradient_of_another_shape()
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        var bad = BackwardShapeContractTests.Violations(_fixture.Engine!, out int probed);
+        _out.WriteLine($"gpu: probed {probed} backward ops; {bad.Count} violations");
+        foreach (var b in bad) _out.WriteLine("FAIL " + b);
+        Assert.True(bad.Count == 0, $"{bad.Count} GPU backward shape-contract violations:\n" + string.Join("\n", bad));
+    }
 }
