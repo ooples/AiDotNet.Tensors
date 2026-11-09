@@ -6299,6 +6299,8 @@ public partial class DirectGpuTensorEngine
 
     private static void RecordFusedCeForwardChunks(int chunks) => LastFusedCeForwardChunks = chunks;
 
+    private static void RecordFusedCeForwardChunkedDeclined() => LastFusedCeForwardChunkedDeclined = true;
+
     /// <summary>
     /// <c>factor * scalar[0] * tensor</c> — or, with a null <paramref name="tensor"/>, <c>factor * scalar[0]</c> filled
     /// to <paramref name="shape"/> — computed without reading the one-element <paramref name="scalar"/> on the host.

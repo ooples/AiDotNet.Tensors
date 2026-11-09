@@ -13668,7 +13668,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     // GpuCapabilityUnavailableException, a NotSupportedException). The buffers it did get were disposed
                     // as it threw, and the fused kernel needs none of them. Falling through to the outer catch instead
                     // would compute the full [N, vocab] logits.
-                    LastFusedCeForwardChunkedDeclined = true;
+                    RecordFusedCeForwardChunkedDeclined();
                     System.Diagnostics.Trace.TraceWarning(
                         $"[DirectGpuTensorEngine] Chunked fused-CE forward could not run ({ex.GetType().Name}: " +
                         $"{ex.Message}); using the fused kernel.");
