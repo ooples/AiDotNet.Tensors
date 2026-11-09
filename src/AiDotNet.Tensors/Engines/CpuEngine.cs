@@ -14136,7 +14136,10 @@ public partial class CpuEngine : ITensorLevelEngine
             // treats it as Kᵀ-major and contracts over K).
             // Large products take the parallel packed BLAS first: a tied LM head's logits [1024,512]·[49152,512]ᵀ ran
             // 592 ms through SimdGemm vs PyTorch's 207 ms (3990X).
-            if ((long)M * N * K >= MatMulTransposedBlasMinWork)
+            // A few rows against a tall B stay on SimdGemm's skinny A·Bᵀ kernel (one dot product per output): the packed
+            // BLAS ran one whisper-tiny row against its [51865, 384] table in 51 ms against 4 ms for A·B pre-transposed.
+            if ((long)M * N * K >= MatMulTransposedBlasMinWork
+                && !AiDotNet.Tensors.Engines.Simd.SimdGemm.QualifiesForSkinnyTransB(false, true, M, K, N))
                 BlasProvider.GemmEx(M, N, K, aRaw, aOff, K, false, bRaw, bOff, K, true, rRaw, rOff, N);
             else
             AiDotNet.Tensors.Engines.Simd.SimdGemm.Sgemm(
