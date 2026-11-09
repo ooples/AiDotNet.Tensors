@@ -265,9 +265,12 @@ jobs:
         # this step past two hours without it firing, and the job timeout then cancelled the job, which skips the
         # failure-only stack step below. The watchdog bounds the step instead: past the limit it prints each test
         # host's managed stacks and the processes under the runner, then fails the step so the steps below still run.
-        # Passing SM86 runs take 78 to 101 minutes here (job limit 150); the SM75 suites take about 3 hours (job limit
-        # 240). Each watchdog leaves time before its job limit for the diagnostics and the steps after this one.
+        # Passing SM86 runs take 78 to 101 minutes here; the SM75 suites take about 3 hours. The deadline counts from
+        # the job's start (the runner worker's), not this step's, and stops DIAGNOSTICS_RESERVE_MINUTES short of the job
+        # limit, so slow setup cannot let the job timeout cancel the step before the watchdog fires.
         SUITE_WATCHDOG_MINUTES: ${{ matrix.arch == 'sm86' && '120' || '215' }}
+        JOB_LIMIT_MINUTES: ${{ matrix.arch == 'sm86' && '150' || '240' }}
+        DIAGNOSTICS_RESERVE_MINUTES: '20'
       run: |
         New-Item -ItemType Directory -Force "${{ runner.temp }}/trx" | Out-Null
         $filter = $env:CUDA_LANE_FILTER -replace "\s", ""
@@ -276,26 +279,60 @@ jobs:
           "--filter `"$filter`" " +
           "--results-directory `"${{ runner.temp }}/trx`" --logger `"trx;LogFileName=cuda.trx`" " +
           '--blame-hang --blame-hang-timeout 900s --blame-crash'
+
+        # The worker process starts with the job; fall back to this step's start if the parent is not the worker.
+        $self = Get-CimInstance Win32_Process -Filter "ProcessId=$PID"
+        $parent = Get-CimInstance Win32_Process -Filter "ProcessId=$($self.ParentProcessId)"
+        $jobStart = if ($parent -and $parent.Name -like 'Runner.Worker*') { $parent.CreationDate } else { $self.CreationDate }
+        $deadline = $jobStart.AddMinutes([int]$env:JOB_LIMIT_MINUTES - [int]$env:DIAGNOSTICS_RESERVE_MINUTES)
+        $watchdog = (Get-Date).AddMinutes([int]$env:SUITE_WATCHDOG_MINUTES)
+        if ($watchdog -lt $deadline) { $deadline = $watchdog }
+        Write-Output "Watchdog deadline: $($deadline.ToUniversalTime().ToString('u')) (job started $($jobStart.ToUniversalTime().ToString('u')))."
+
         $run = Start-Process dotnet -ArgumentList $testArgs -NoNewWindow -PassThru
         $null = $run.Handle   # cache the handle so ExitCode is readable after the process exits
-        if ($run.WaitForExit([int]$env:SUITE_WATCHDOG_MINUTES * 60 * 1000)) { exit $run.ExitCode }
+        $waitMs = [Math]::Max(0, [int]($deadline - (Get-Date)).TotalMilliseconds)
+        if ($run.WaitForExit($waitMs)) { exit $run.ExitCode }
 
-        Write-Output "::error::The GPU suites were still running after $env:SUITE_WATCHDOG_MINUTES minutes."
-        # Ids, parents and names only: a command line from another workload on the runner could carry a credential.
-        Write-Output "::group::Processes"
-        Get-CimInstance Win32_Process |
-          Where-Object { $_.Name -match '^(testhost|dotnet|python)' } |
-          Format-Table ProcessId, ParentProcessId, Name, CreationDate -AutoSize | Out-String -Width 200
-        Write-Output "::endgroup::"
-        $tools = "${{ runner.temp }}/dotnet-stack"
-        dotnet tool install dotnet-stack --tool-path $tools | Out-Null
-        foreach ($testHost in @(Get-Process -Name testhost* -ErrorAction SilentlyContinue)) {
-          Write-Output "::group::Managed stacks of testhost $($testHost.Id)"
-          & "$tools/dotnet-stack" report -p $testHost.Id
-          if ($LASTEXITCODE -ne 0) { Write-Output "::warning::dotnet-stack failed ($LASTEXITCODE) on $($testHost.Id)." }
+        Write-Output "::error::The GPU suites were still running at the watchdog deadline."
+        try {
+          # Only this run's processes: walk the tree down from dotnet test, so another workload's test host on the
+          # runner is never inspected. Ids, parents and names only (a command line could carry a credential).
+          $all = @(Get-CimInstance Win32_Process)
+          $tree = @{ [uint32]$run.Id = $true }
+          do {
+            $added = 0
+            foreach ($p in $all) {
+              if ($tree.ContainsKey([uint32]$p.ParentProcessId) -and -not $tree.ContainsKey([uint32]$p.ProcessId)) {
+                $tree[[uint32]$p.ProcessId] = $true; $added++
+              }
+            }
+          } while ($added -gt 0)
+          $mine = @($all | Where-Object { $tree.ContainsKey([uint32]$_.ProcessId) })
+          Write-Output "::group::Processes of this run"
+          $mine | Format-Table ProcessId, ParentProcessId, Name, CreationDate -AutoSize | Out-String -Width 200
           Write-Output "::endgroup::"
+
+          # Each diagnostic is bounded, so a stalled install or attach cannot spend the reserve.
+          $tools = "${{ runner.temp }}/dotnet-stack"
+          $install = Start-Process dotnet -ArgumentList "tool install dotnet-stack --tool-path `"$tools`"" -NoNewWindow -PassThru
+          if (-not $install.WaitForExit(180000)) {
+            Stop-Process -Id $install.Id -Force -ErrorAction SilentlyContinue
+            Write-Output "::warning::dotnet-stack did not install within 3 minutes; no stacks printed."
+          } else {
+            foreach ($testHost in @($mine | Where-Object { $_.Name -like 'testhost*' })) {
+              Write-Output "::group::Managed stacks of testhost $($testHost.ProcessId)"
+              $report = Start-Process "$tools/dotnet-stack" -ArgumentList "report -p $($testHost.ProcessId)" -NoNewWindow -PassThru
+              if (-not $report.WaitForExit(120000)) {
+                Stop-Process -Id $report.Id -Force -ErrorAction SilentlyContinue
+                Write-Output "::warning::dotnet-stack did not finish within 2 minutes on $($testHost.ProcessId)."
+              }
+              Write-Output "::endgroup::"
+            }
+          }
+        } finally {
+          taskkill /T /F /PID $run.Id | Out-Null
         }
-        taskkill /T /F /PID $run.Id | Out-Null
         exit 1
       # With --blame the TRX logger ignores LogFilePath and writes under the project's TestResults; the results
       # directory puts the TRX and any crash or hang dump where the skip check and the upload look.
