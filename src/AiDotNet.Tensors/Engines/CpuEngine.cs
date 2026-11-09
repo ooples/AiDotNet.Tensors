@@ -42901,6 +42901,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope is not null)
             {
+                RequireConcreteIndices(indices, "TensorScatter");
                 var cd = destination; var ci = indices; var cs = source; int ca = axis;
                 return scope.RecordBinary(LazyNodeType.Custom, "TensorScatter", destination, source, (int[])destination._shape.Clone(),
                     (eng, output) => { var r = eng.TensorScatter(cd, ci, cs, ca); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
@@ -42944,6 +42945,19 @@ public partial class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    /// <summary>
+    /// A captured indexed op reads its indices when the plan runs, but the plan schedules only its float operands:
+    /// indices still to be produced by another captured op would be read before they are computed. Such a capture
+    /// cannot replay, so it is rejected rather than run on uninitialized indices.
+    /// </summary>
+    private static void RequireConcreteIndices(Tensor<int> indices, string opName)
+    {
+        if (indices.LazySource is ILazyNode node && !node.IsRealized)
+            throw new NotSupportedException(
+                $"{opName} cannot be captured with indices produced inside the same graph; compute the indices "
+                + "before entering graph mode.");
+    }
+
     /// <inheritdoc/>
     [MethodImpl(Hot)]
     public virtual Tensor<T> TensorIndexSelect<T>(Tensor<T> tensor, Tensor<int> indices, int axis)
@@ -42959,6 +42973,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null && tensor.Rank >= 1 && axis >= 0 && axis < tensor.Rank)
             {
+                RequireConcreteIndices(indices, "TensorIndexSelect");
                 var captured = tensor;
                 var capIndices = indices;
                 int capAxis = axis;

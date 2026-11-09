@@ -262,6 +262,9 @@ internal static class TrainingPlanReader
             throw new InvalidDataException(
                 $"Training plan op name was truncated: expected {nameLen} bytes, got {nameBytes.Length}.");
         string opName = Encoding.UTF8.GetString(nameBytes);
+        // A plan written before this runtime knew the op stored OpType.Unknown; its name still identifies it.
+        if (opType == OpType.Unknown)
+            opType = OpTypeParser.Parse(opName);
 
         int inputCount = reader.ReadInt32();
         RequireNonNegative(inputCount, nameof(inputCount));

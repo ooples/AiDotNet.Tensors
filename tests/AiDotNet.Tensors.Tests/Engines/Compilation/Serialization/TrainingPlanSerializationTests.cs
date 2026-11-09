@@ -188,6 +188,85 @@ public class TrainingPlanSerializationTests
         loaded.Dispose();
     }
 
+    [Fact]
+    public async Task SaveLoad_TrainingPlanWithScatter_ReplaysIndicesAndAxis()
+    {
+        var engine = new CpuEngine();
+        // Index 1 repeats: the last write (source column 2) wins row 1, column 2.
+        var indices = new Tensor<int>(new[] { 1, 0, 1 }, new[] { 1, 3 });
+        Tensor<float> Destination() => new Tensor<float>(new[] { 1f, 2f, 3f, 4f, 5f, 6f }, new[] { 2, 3 });
+        Tensor<float> Source() => new Tensor<float>(new[] { 10f, 20f, 30f }, new[] { 1, 3 });
+
+        var destination = Destination();
+        var source = Source();
+        ICompiledTrainingPlan<float> original;
+        using (var scope = GraphMode.Enable())
+        {
+            engine.ReduceSum(engine.TensorScatter(destination, indices, source, 0), null);
+            original = scope.CompileTraining(new[] { destination, source });
+        }
+
+        using var stream = new MemoryStream();
+        await original.SaveAsync(stream);
+        stream.Position = 0;
+        var loaded = await CompiledPlanLoader.LoadTrainingAsync<float>(stream, engine, new[] { Destination(), Source() })
+            ?? throw new InvalidOperationException("The scatter plan did not load.");
+
+        var loss = loaded.Step();
+
+        // [[1, 20, 3], [10, 5, 30]] sums to 69; the overwritten destination slots get no gradient.
+        Assert.Equal(69f, loss[0]);
+        Assert.Equal(new[] { 1f, 0f, 1f, 0f, 1f, 0f }, loaded.Gradients[0].AsSpan().ToArray());
+        Assert.Equal(new[] { 1f, 1f, 1f }, loaded.Gradients[1].AsSpan().ToArray());
+        original.Dispose();
+        loaded.Dispose();
+    }
+
+    [Fact]
+    public async Task SaveLoad_TrainingPlanWithIndexSelect_ReplaysIndicesAndAxis()
+    {
+        var engine = new CpuEngine();
+        var indices = new Tensor<int>(new[] { 2, 0, 2 }, new[] { 3 });
+        Tensor<float> Input() => new Tensor<float>(new[] { 1f, 2f, 3f, 4f, 5f, 6f }, new[] { 3, 2 });
+
+        var input = Input();
+        ICompiledTrainingPlan<float> original;
+        using (var scope = GraphMode.Enable())
+        {
+            engine.ReduceSum(engine.TensorIndexSelect(input, indices, 0), null);
+            original = scope.CompileTraining(new[] { input });
+        }
+
+        using var stream = new MemoryStream();
+        await original.SaveAsync(stream);
+        stream.Position = 0;
+        var loaded = await CompiledPlanLoader.LoadTrainingAsync<float>(stream, engine, new[] { Input() })
+            ?? throw new InvalidOperationException("The index-select plan did not load.");
+
+        var loss = loaded.Step();
+
+        // Rows 2, 0, 2: 11 + 3 + 11; the repeated row accumulates two gradients.
+        Assert.Equal(25f, loss[0]);
+        Assert.Equal(new[] { 1f, 1f, 0f, 0f, 2f, 2f }, loaded.Gradients[0].AsSpan().ToArray());
+        original.Dispose();
+        loaded.Dispose();
+    }
+
+    [Fact]
+    public void Capture_rejects_scatter_indices_produced_inside_the_graph()
+    {
+        var engine = new CpuEngine();
+        var destination = new Tensor<float>(new[] { 1f, 2f, 3f, 4f }, new[] { 2, 2 });
+        var source = new Tensor<float>(new[] { 7f, 8f }, new[] { 1, 2 });
+        var baseIndices = new Tensor<int>(new[] { 0, 0 }, new[] { 1, 2 });
+        var offset = new Tensor<int>(new[] { 1, 0 }, new[] { 1, 2 });
+        using var scope = GraphMode.Enable();
+        var produced = engine.TensorAdd(baseIndices, offset);
+        Assert.NotNull(produced.LazySource);
+        Assert.Throws<NotSupportedException>(() => engine.TensorScatter(destination, produced, source, 0));
+        Assert.Throws<NotSupportedException>(() => engine.TensorIndexSelect(destination, produced, 0));
+    }
+
     [Theory]
     [MemberData(nameof(SupportedFloatOptimizerCheckpointCases))]
     public async Task SaveLoad_TrainingPlanWithEverySupportedFloatOptimizer_RestoresContinuation(OptimizerType optimizer)
