@@ -89,6 +89,17 @@ public sealed class MmaRateSourceTests
         Assert.Contains("Linux", failure);
     }
 
+    // On Linux without the NVIDIA device files (WSL2 exposes /dev/dxg, a container without the driver mounted), the
+    // query goes through the real libc open/ioctl P/Invokes and declines with a reason; the caller then measures.
+    [SkippableFact]
+    public void DriverQuery_OnLinuxWithoutTheControlDevice_DeclinesWithAReason()
+    {
+        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Linux), "Linux-only path.");
+        Skip.If(System.IO.File.Exists("/dev/nvidiactl"), "This machine has the NVIDIA control device.");
+        Assert.False(NvRmIssueRateQuery.Instance.TryQuery(0, 1, 0, out _, out string failure));
+        Assert.Contains("/dev/nvidiactl", failure);
+    }
+
     // Wherever the driver answers (a Linux box with the NVIDIA driver), its answer must be a valid speed select.
     [SkippableFact]
     public void DriverQuery_OnThisMachine_ReportsValidSpeedSelects()
