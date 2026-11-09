@@ -1909,6 +1909,126 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     }
 
     /// <summary>
+    /// The L2 term and the global-norm clip in both orders, against references written out here: clip(g + l2*theta)
+    /// for the Keras order (an L2 loss term under <c>clipnorm</c>) and clip(g) + l2*theta for PyTorch's
+    /// (<c>clip_grad_norm_</c>, then <c>weight_decay</c> inside <c>step()</c>). The clip is the plan's PyTorch formula,
+    /// <c>max_norm / (norm + 1e-6)</c> when below 1. Every step asserts the clip is active and that the two references
+    /// differ by far more than the tolerance, so a plan that ignored the order cannot pass both rows.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(false, false, GradientRegularizationOrder.RegularizeThenClip)]
+    [InlineData(false, false, GradientRegularizationOrder.ClipThenRegularize)]
+    [InlineData(true, false, GradientRegularizationOrder.RegularizeThenClip)]
+    [InlineData(true, false, GradientRegularizationOrder.ClipThenRegularize)]
+    [InlineData(true, true, GradientRegularizationOrder.RegularizeThenClip)]
+    [InlineData(true, true, GradientRegularizationOrder.ClipThenRegularize)]
+    public void Every_step_adds_l2_on_the_chosen_side_of_the_clip(bool onGpu, bool capture, GradientRegularizationOrder order)
+    {
+        const double l2 = 0.05, maxNorm = 0.05;
+        var prior = AiDotNetEngine.Current;
+        DirectGpuTensorEngine? gpu = null;
+        if (onGpu)
+        {
+            Skip.IfNot(TryGpu(out gpu) && gpu is not null, "GPU backend did not resolve.");
+            if (capture)
+            {
+                Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                    "Whole-step graph capture is CUDA-only.");
+                Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                    "Graph capture is disabled for this process.");
+            }
+        }
+        IEngine engine = gpu is not null ? gpu : new CpuEngine();
+        try
+        {
+            AiDotNetEngine.Current = engine;
+            var x = Rand([Batch, Inputs], 1, 1f);
+            var y = Rand([Batch, Outputs], 2, 1f);
+            var parameters = new[] { Rand([Inputs, Hidden], 3, 0.3f), new Tensor<float>([Hidden]), Rand([Hidden, Outputs], 4, 0.3f), new Tensor<float>([Outputs]) };
+            if (gpu is not null) foreach (var p in parameters) p.Gpu();
+
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.EnableTraining(parameters))
+            {
+                Loss(engine, x, y, parameters, composedMse: true);
+                plan = scope.CompileTraining(parameters);
+            }
+            using (plan)
+            {
+                var concrete = Assert.IsType<CompiledTrainingPlan<float>>(plan);
+                if (!capture) concrete.DisableGraphStep();
+                plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
+                plan.SetMaxGradNorm(maxNorm);
+                Assert.IsAssignableFrom<ICompiledTrainingPlanRegularizationOrder>(plan).SetL2Regularization(l2, order);
+                var gradients = Assert.IsType<Tensor<float>[]>(typeof(CompiledTrainingPlan<float>)
+                    .GetField("_gradients", BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(concrete));
+                for (int s = 0; s < Steps; s++)
+                {
+                    FeedBatch(x, y, s);
+                    var tape = CpuTapeGradients(x, y, parameters, composedMse: true);
+                    var theta = parameters.Select(t => t.ToArray()).ToArray();   // the pre-step weights
+                    Assert.True(GlobalNorm(tape) > maxNorm, $"step {s}: the loss gradient is under the clip, so no row discriminates");
+                    var keras = ClipLikeThePlan(AddL2(tape, theta, l2), maxNorm);
+                    var torch = AddL2(ClipLikeThePlan(tape, maxNorm), theta, l2);
+                    Assert.True(GlobalNorm(Subtract(keras, torch)) > 100 * 1e-3 * GlobalNorm(torch),
+                        $"step {s}: the two orders agree, so the rows cannot tell them apart");
+                    var expected = order == GradientRegularizationOrder.ClipThenRegularize ? torch : keras;
+                    plan.Step();
+                    for (int p = 0; p < parameters.Length; p++)
+                    {
+                        var actual = gpu is not null && gradients[p].TryGetGpuBuffer() is { } buffer && gpu.GetBackend() is { } backend
+                            ? backend.DownloadBuffer(buffer)
+                            : gradients[p].ToArray();
+                        double diff = 0, norm = 0;
+                        for (int i = 0; i < expected[p].Length; i++)
+                        {
+                            double d = actual[i] - expected[p][i];
+                            diff += d * d; norm += expected[p][i] * expected[p][i];
+                        }
+                        Assert.True(Math.Sqrt(diff) <= 1e-3 * Math.Sqrt(norm) + 1e-6,
+                            $"step {s}, param {p}, {order}: |plan - reference| = {Math.Sqrt(diff):G4}, |reference| = {Math.Sqrt(norm):G4}");
+                    }
+                }
+                if (capture)
+                {
+                    // A capture that failed falls back to eager and would agree trivially.
+                    var exec = typeof(CompiledTrainingPlan<float>)
+                        .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(concrete);
+                    Assert.True(exec is IntPtr handle && handle != IntPtr.Zero,
+                        "no graph was captured, so the capture rows compared eager with eager");
+                }
+            }
+        }
+        finally
+        {
+            AiDotNetEngine.Current = prior;
+            gpu?.Dispose();
+        }
+    }
+
+    private static double GlobalNorm(double[][] g) => Math.Sqrt(g.Sum(t => t.Sum(v => v * v)));
+
+    private static double GlobalNorm(float[][] g) => Math.Sqrt(g.Sum(t => t.Sum(v => (double)v * v)));
+
+    private static double[][] AddL2(float[][] g, float[][] theta, double l2)
+        => g.Select((t, p) => t.Select((v, i) => v + l2 * theta[p][i]).ToArray()).ToArray();
+
+    private static double[][] AddL2(double[][] g, float[][] theta, double l2)
+        => g.Select((t, p) => t.Select((v, i) => v + l2 * theta[p][i]).ToArray()).ToArray();
+
+    private static double[][] ClipLikeThePlan(float[][] g, double maxNorm)
+        => ClipLikeThePlan(g.Select(t => t.Select(v => (double)v).ToArray()).ToArray(), maxNorm);
+
+    private static double[][] ClipLikeThePlan(double[][] g, double maxNorm)
+    {
+        double coefficient = Math.Min(1.0, maxNorm / (GlobalNorm(g) + 1e-6));
+        return g.Select(t => t.Select(v => v * coefficient).ToArray()).ToArray();
+    }
+
+    private static double[][] Subtract(double[][] a, double[][] b)
+        => a.Select((t, p) => t.Select((v, i) => v - b[p][i]).ToArray()).ToArray();
+
+    /// <summary>
     /// A training loop recompiles when the batch shape changes (the short last batch of an epoch). The new plan must
     /// continue the optimizer - moments, step count - or Adam restarts from step 1 every epoch. Reference: one Adam
     /// trajectory across both batch sizes.
