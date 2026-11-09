@@ -42820,48 +42820,45 @@ public partial class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         if (axis < 0) axis = tensor.Rank + axis;
 
-        // For simplicity, handle 2D case: [batch, features]
-        if (tensor.Rank == 2 && axis == 1)
+        if (axis < 0 || axis >= tensor.Rank)
+            throw new ArgumentOutOfRangeException(nameof(axis), $"Axis {axis} is out of range for a rank-{tensor.Rank} tensor.");
+
+        // Any rank, any axis: the k largest of every fibre along the axis, in descending order, with their positions.
+        int features = tensor._shape[axis];
+        k = Math.Min(k, features);
+        int outer = 1, inner = 1;
+        for (int d = 0; d < axis; d++) outer *= tensor._shape[d];
+        for (int d = axis + 1; d < tensor.Rank; d++) inner *= tensor._shape[d];
+        var outShape = (int[])tensor._shape.Clone();
+        outShape[axis] = k;
+        var resultValues = TensorAllocator.Rent<T>(outShape);
+        var indicesResult = new Tensor<int>(outShape);
+        var src = tensor.GetFlattenedData();
+        var dstValues = resultValues.GetDataArrayUnmarked();
+        var dstIndices = indicesResult.GetDataArrayUnmarked();
+        int kk = k;
+        CpuParallelSettings.ParallelForOrSerial(0, outer * inner, (long)outer * inner * features, f =>
         {
-            int batch = tensor._shape[0];
-            int features = tensor._shape[1];
-            k = Math.Min(k, features);
-
-            var resultValues = TensorAllocator.Rent<T>([batch, k]);
-            var indicesResult = new Tensor<int>([batch, k]);
-
-            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * features, b =>
+            int o = f / inner, i = f % inner;
+            var fibre = new (T value, int index)[features];
+            for (int a = 0; a < features; a++)
+                fibre[a] = (src[(o * features + a) * inner + i], a);
+            Array.Sort(fibre, (a, x) =>
             {
-                // Extract row and sort with indices
-                var rowWithIndices = new (T value, int index)[features];
-                for (int i = 0; i < features; i++)
-                {
-                    rowWithIndices[i] = (tensor[b, i], i);
-                }
-
-                // Sort descending by value using GreaterThan
-                Array.Sort(rowWithIndices, (a, x) =>
-                {
-                    if (numOps.GreaterThan(x.value, a.value)) return 1;
-                    if (numOps.LessThan(x.value, a.value)) return -1;
-                    return 0;
-                });
-
-                // Take top-k
-                for (int i = 0; i < k; i++)
-                {
-                    resultValues[b, i] = rowWithIndices[i].value;
-                    indicesResult[b, i] = rowWithIndices[i].index;
-                }
+                if (numOps.GreaterThan(x.value, a.value)) return 1;
+                if (numOps.LessThan(x.value, a.value)) return -1;
+                return 0;
             });
+            for (int j = 0; j < kk; j++)
+            {
+                int dst = (o * kk + j) * inner + i;
+                dstValues[dst] = fibre[j].value;
+                dstIndices[dst] = fibre[j].index;
+            }
+        });
 
-            indices = indicesResult;
-            return resultValues;
-        }
-        else
-        {
-            throw new NotSupportedException("TensorTopK currently only supports 2D tensors with axis=1.");
-        }
+        indices = indicesResult;
+        return resultValues;
     }
 
     /// <inheritdoc/>
@@ -44158,6 +44155,10 @@ public partial class CpuEngine : ITensorLevelEngine
         int axisSize = input._shape[axis];
         int innerSize = 1;
         for (int i = axis + 1; i < input._shape.Length; i++) innerSize *= input._shape[i];
+        // index_copy / index_add semantics: values holds one slice per index, so it has the input's shape with the
+        // axis length replaced by the index count. A larger tensor used to be read in part, at the wrong offsets.
+        if (values.Length != outerSize * indices.Length * innerSize)
+            throw new ArgumentException($"Scatter needs values with {indices.Length} slices along axis {axis} ({outerSize * indices.Length * innerSize} elements); got {values.Length}.", nameof(values));
 
         for (int outer = 0; outer < outerSize; outer++)
         {
@@ -44212,6 +44213,10 @@ public partial class CpuEngine : ITensorLevelEngine
         int axisSize = input._shape[axis];
         int innerSize = 1;
         for (int i = axis + 1; i < input._shape.Length; i++) innerSize *= input._shape[i];
+        // index_copy / index_add semantics: values holds one slice per index, so it has the input's shape with the
+        // axis length replaced by the index count. A larger tensor used to be read in part, at the wrong offsets.
+        if (values.Length != outerSize * indices.Length * innerSize)
+            throw new ArgumentException($"ScatterAdd needs values with {indices.Length} slices along axis {axis} ({outerSize * indices.Length * innerSize} elements); got {values.Length}.", nameof(values));
 
         for (int outer = 0; outer < outerSize; outer++)
         {
