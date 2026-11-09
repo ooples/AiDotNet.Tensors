@@ -277,7 +277,8 @@ jobs:
         DIAGNOSTICS_RESERVE_MINUTES: '20'
       run: |
         New-Item -ItemType Directory -Force "${{ runner.temp }}/trx" | Out-Null
-        $filter = $env:CUDA_LANE_FILTER -replace "\s", ""
+        # The embedded-torch class runs in its own test host (the next step).
+        $filter = ($env:CUDA_LANE_FILTER -replace "\s", "") + '&FullyQualifiedName!~.DLPackTorchInteropTests.'
         $testArgs = 'test AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj ' +
           '--configuration Release --no-build --framework net10.0 ' +
           "--filter `"$filter`" " +
@@ -340,6 +341,19 @@ jobs:
         exit 1
       # With --blame the TRX logger ignores LogFilePath and writes under the project's TestResults; the results
       # directory puts the TRX and any crash or hang dump where the skip check and the upload look.
+
+    # DLPackTorchInteropTests embeds CPython and imports torch in the test host. The CUDA torch wheel ships its own
+    # cuDNN 9 (a CUDA 12 build) under the same DLL names as the cuDNN 9.26 above; in a host whose GPU tests had loaded
+    # ours first, torch's cudnn_cnn64_9.dll bound to our modules and failed with WinError 127, so every test of the
+    # class failed. In a host of its own, torch is imported before the class creates an engine.
+    - name: Embedded torch interop (own test host)
+      if: ${{ !cancelled() }}
+      timeout-minutes: 15
+      run: >-
+        dotnet test AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj
+        --configuration Release --no-build --framework net10.0
+        --filter "FullyQualifiedName~.DLPackTorchInteropTests."
+        --results-directory "${{ runner.temp }}/trx" --logger "trx;LogFileName=cuda-torch-interop.trx"
 
     - name: Managed stacks of a hung or crashed test host
       if: failure()
