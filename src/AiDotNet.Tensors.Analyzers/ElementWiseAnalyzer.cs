@@ -145,10 +145,9 @@ public sealed class ElementWiseAnalyzer : DiagnosticAnalyzer
             string.Equals(System.IO.Path.GetFileName(f.Path), "ElementWiseBaseline.txt", StringComparison.OrdinalIgnoreCase));
         var text = file?.GetText(cancellationToken);
         if (text is null) return baseline;
-        foreach (var line in text.Lines)
+        var entries = text.Lines.Select(line => line.ToString()).Where(content => content.Length != 0 && content[0] != '#');
+        foreach (string content in entries)
         {
-            string content = line.ToString();
-            if (content.Length == 0 || content[0] == '#') continue;
             int tab = content.IndexOf('\t');
             if (tab <= 0 || !int.TryParse(content.Substring(0, tab), out int count)) continue;
             baseline[content.Substring(tab + 1)] = count;
