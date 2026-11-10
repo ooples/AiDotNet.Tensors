@@ -13886,7 +13886,7 @@ KERNEL VARIANTS (A/B testing):
             backward.SetArg(arg++, modelDim);
             backward.SetArg(arg++, numHeads);
             backward.SetArg(arg++, headDim);
-            backward.SetArg(arg++, chunk);
+            backward.SetArg(arg, chunk);
             backward.Execute1D(globalSize, localSize);
         }
 

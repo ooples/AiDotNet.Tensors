@@ -24,7 +24,7 @@ public sealed partial class OpenClBackend : ICausalDepthwiseConvBackend
         kernel.SetArg(arg++, rows);
         kernel.SetArg(arg++, seqLen);
         kernel.SetArg(arg++, channels);
-        kernel.SetArg(arg++, taps);
+        kernel.SetArg(arg, taps);
         kernel.Execute1D(globalSize, localSize);
     }
 
