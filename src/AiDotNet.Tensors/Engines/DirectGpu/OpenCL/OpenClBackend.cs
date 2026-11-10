@@ -13854,46 +13854,39 @@ KERNEL VARIANTS (A/B testing):
                 throw new ArgumentException($"modelDim ({modelDim}) must equal numHeads * headDim ({numHeads * headDim}).");
             if (headDim > Kernels.GlaKernels.MaxHeadDim)
                 throw new InvalidOperationException($"GLA headDim ({headDim}) exceeds max ({Kernels.GlaKernels.MaxHeadDim}).");
-            if (!_kernelCache.TryGetValue("gla_scan_recompute", out var recompute) ||
-                !_kernelCache.TryGetValue("gla_scan_backward", out var backward))
-                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: gla_scan_recompute / gla_scan_backward");
+            if (!_kernelCache.TryGetValue("gla_scan_backward_ckpt", out var backward))
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: gla_scan_backward_ckpt");
 
             long totalLong = checked((long)batch * numHeads * headDim);
-            long trajLenLong = checked(totalLong * seqLen * headDim);
-            if (totalLong > int.MaxValue || trajLenLong > int.MaxValue)
+            if (totalLong > int.MaxValue)
                 throw new ArgumentOutOfRangeException(nameof(batch), "GLA dimensions exceed OpenCL launch/buffer limits.");
-            int trajLen = (int)trajLenLong;
-            using var trajBuf = AllocateBuffer(trajLen);
+            // State checkpoints every `chunk` steps plus one chunk of recomputed states instead of the full
+            // batch*heads*seqLen*headDim^2 trajectory (GlaScanCheckpoint).
+            var (chunk, ckptLen, scratchLen) = GlaScanCheckpoint.Plan(batch, seqLen, numHeads, headDim);
+            using var ckptBuf = AllocateBuffer(ckptLen);
+            using var scratchBuf = AllocateBuffer(scratchLen);
             int total = (int)totalLong;
             int localSize = CalculateOptimalWorkGroupSize1D(total);
             int globalSize = ((total + localSize - 1) / localSize) * localSize;
 
-            recompute.SetArg(0u, ((DirectOpenClGpuBuffer)k).Buffer.Handle);
-            recompute.SetArg(1u, ((DirectOpenClGpuBuffer)v).Buffer.Handle);
-            recompute.SetArg(2u, ((DirectOpenClGpuBuffer)gate).Buffer.Handle);
-            recompute.SetArg(3u, ((DirectOpenClGpuBuffer)trajBuf).Buffer.Handle);
-            recompute.SetArg(4u, batch);
-            recompute.SetArg(5u, seqLen);
-            recompute.SetArg(6u, modelDim);
-            recompute.SetArg(7u, numHeads);
-            recompute.SetArg(8u, headDim);
-            recompute.Execute1D(globalSize, localSize);
-
-            backward.SetArg(0u, ((DirectOpenClGpuBuffer)dOut).Buffer.Handle);
-            backward.SetArg(1u, ((DirectOpenClGpuBuffer)q).Buffer.Handle);
-            backward.SetArg(2u, ((DirectOpenClGpuBuffer)k).Buffer.Handle);
-            backward.SetArg(3u, ((DirectOpenClGpuBuffer)v).Buffer.Handle);
-            backward.SetArg(4u, ((DirectOpenClGpuBuffer)gate).Buffer.Handle);
-            backward.SetArg(5u, ((DirectOpenClGpuBuffer)trajBuf).Buffer.Handle);
-            backward.SetArg(6u, ((DirectOpenClGpuBuffer)dQ).Buffer.Handle);
-            backward.SetArg(7u, ((DirectOpenClGpuBuffer)dK).Buffer.Handle);
-            backward.SetArg(8u, ((DirectOpenClGpuBuffer)dV).Buffer.Handle);
-            backward.SetArg(9u, ((DirectOpenClGpuBuffer)dG).Buffer.Handle);
-            backward.SetArg(10u, batch);
-            backward.SetArg(11u, seqLen);
-            backward.SetArg(12u, modelDim);
-            backward.SetArg(13u, numHeads);
-            backward.SetArg(14u, headDim);
+            uint arg = 0;
+            backward.SetArg(arg++, ((DirectOpenClGpuBuffer)dOut).Buffer.Handle);
+            backward.SetArg(arg++, ((DirectOpenClGpuBuffer)q).Buffer.Handle);
+            backward.SetArg(arg++, ((DirectOpenClGpuBuffer)k).Buffer.Handle);
+            backward.SetArg(arg++, ((DirectOpenClGpuBuffer)v).Buffer.Handle);
+            backward.SetArg(arg++, ((DirectOpenClGpuBuffer)gate).Buffer.Handle);
+            backward.SetArg(arg++, ((DirectOpenClGpuBuffer)ckptBuf).Buffer.Handle);
+            backward.SetArg(arg++, ((DirectOpenClGpuBuffer)scratchBuf).Buffer.Handle);
+            backward.SetArg(arg++, ((DirectOpenClGpuBuffer)dQ).Buffer.Handle);
+            backward.SetArg(arg++, ((DirectOpenClGpuBuffer)dK).Buffer.Handle);
+            backward.SetArg(arg++, ((DirectOpenClGpuBuffer)dV).Buffer.Handle);
+            backward.SetArg(arg++, ((DirectOpenClGpuBuffer)dG).Buffer.Handle);
+            backward.SetArg(arg++, batch);
+            backward.SetArg(arg++, seqLen);
+            backward.SetArg(arg++, modelDim);
+            backward.SetArg(arg++, numHeads);
+            backward.SetArg(arg++, headDim);
+            backward.SetArg(arg, chunk);
             backward.Execute1D(globalSize, localSize);
         }
 

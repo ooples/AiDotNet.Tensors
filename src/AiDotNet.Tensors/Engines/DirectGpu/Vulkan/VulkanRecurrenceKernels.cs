@@ -291,64 +291,119 @@ void main() {
     rowLoss[r]=-rl;
 }";
 
-    // GLA BPTT backward: recompute the state trajectory, then reverse-sweep. dQ/dK/dG are bound as
-    // uint SSBOs and accumulated via a CAS float-atomic add (GLSL has no portable float atomicAdd);
-    // dV is a plain per-thread store. dQ/dK/dG must be pre-zeroed.
-    public static string GlaRecompute => Header + @"
-layout(set=0,binding=0) readonly buffer Kb { float K[]; };
-layout(set=0,binding=1) readonly buffer Vb { float Vd[]; };
-layout(set=0,binding=2) readonly buffer Gb { float G[]; };
-layout(set=0,binding=3) buffer Sb { float Straj[]; };
-layout(push_constant) uniform PC { uint batch; uint seqLen; uint modelDim; uint numHeads; uint headDim; };
-void main() {
-    int gid = int(gl_GlobalInvocationID.x);
-    int B=int(batch), SL=int(seqLen), MD=int(modelDim), NH=int(numHeads), HD=int(headDim);
-    if (gid >= B*NH*HD) return;
-    int di = gid % HD; int h = (gid/HD) % NH; int b = gid/(HD*NH); int hOff = h*HD; int hh = HD*HD;
-    float Srow[256];
-    for (int ki=0; ki<HD; ki++) Srow[ki]=0.0;
-    for (int t=0; t<SL; t++) {
-        int baseOff = (b*SL+t)*MD + hOff;
-        float g = G[(b*SL+t)*NH + h]; float vd = Vd[baseOff+di];
-        int trajBase = ((b*NH+h)*SL+t)*hh + di*HD;
-        for (int ki=0; ki<HD; ki++) { float s=g*Srow[ki]+vd*K[baseOff+ki]; Srow[ki]=s; Straj[trajBase+ki]=s; }
-    }
-}";
-
-    public static string GlaBackward => Header + @"
+    // GLA BPTT backward, checkpointed: pass 1 re-runs the forward scan saving the state entering each chunk of
+    // `chunk` steps (Ckpt, B*H*nChunks*d^2); pass 2 walks chunks in reverse, recomputes the chunk's states into
+    // Scratch (B*H*chunk*d^2) and reverse-sweeps it: O(sqrt(S)) state memory instead of the O(S) trajectory
+    // (GlaScanCheckpoint). dQ/dK/dG are bound as uint SSBOs and accumulated via a CAS float-atomic add (GLSL has no
+    // portable float atomicAdd); dV is a plain per-thread store. dQ/dK/dG must be pre-zeroed.
+    public static string GlaBackwardCheckpointed => Header + @"
 layout(set=0,binding=0) readonly buffer DOb { float dOut[]; };
 layout(set=0,binding=1) readonly buffer Qb { float Q[]; };
 layout(set=0,binding=2) readonly buffer Kb { float K[]; };
 layout(set=0,binding=3) readonly buffer Vb { float Vd[]; };
 layout(set=0,binding=4) readonly buffer Gb { float G[]; };
-layout(set=0,binding=5) readonly buffer Sb { float Straj[]; };
-layout(set=0,binding=6) buffer DQb { uint dQ[]; };
-layout(set=0,binding=7) buffer DKb { uint dK[]; };
-layout(set=0,binding=8) buffer DVb { float dV[]; };
-layout(set=0,binding=9) buffer DGb { uint dG[]; };
-layout(push_constant) uniform PC { uint batch; uint seqLen; uint modelDim; uint numHeads; uint headDim; };
+layout(set=0,binding=5) buffer Cb { float Ckpt[]; };
+layout(set=0,binding=6) buffer Sb { float Scratch[]; };
+layout(set=0,binding=7) buffer DQb { uint dQ[]; };
+layout(set=0,binding=8) buffer DKb { uint dK[]; };
+layout(set=0,binding=9) buffer DVb { float dV[]; };
+layout(set=0,binding=10) buffer DGb { uint dG[]; };
+layout(push_constant) uniform PC { uint batch; uint seqLen; uint modelDim; uint numHeads; uint headDim; uint chunk; };
 void addDQ(int idx, float val){ uint old=dQ[idx]; uint assumed; do { assumed=old; old=atomicCompSwap(dQ[idx], assumed, floatBitsToUint(uintBitsToFloat(assumed)+val)); } while(old!=assumed); }
 void addDK(int idx, float val){ uint old=dK[idx]; uint assumed; do { assumed=old; old=atomicCompSwap(dK[idx], assumed, floatBitsToUint(uintBitsToFloat(assumed)+val)); } while(old!=assumed); }
 void addDG(int idx, float val){ uint old=dG[idx]; uint assumed; do { assumed=old; old=atomicCompSwap(dG[idx], assumed, floatBitsToUint(uintBitsToFloat(assumed)+val)); } while(old!=assumed); }
 void main() {
     int gid = int(gl_GlobalInvocationID.x);
-    int B=int(batch), SL=int(seqLen), MD=int(modelDim), NH=int(numHeads), HD=int(headDim);
+    int B=int(batch), SL=int(seqLen), MD=int(modelDim), NH=int(numHeads), HD=int(headDim), CH=int(chunk);
     if (gid >= B*NH*HD) return;
     int di = gid % HD; int h = (gid/HD) % NH; int b = gid/(HD*NH); int hOff = h*HD; int hh = HD*HD;
+    int bh = b*NH + h; int rowOff = di*HD; int nChunks = (SL + CH - 1) / CH;
+    float Srow[256];
     float dSrow[256];
-    for (int ki=0; ki<HD; ki++) dSrow[ki]=0.0;
-    for (int t=SL-1; t>=0; t--) {
-        int baseOff = (b*SL+t)*MD + hOff; int gOff = (b*SL+t)*NH + h; float g = G[gOff];
-        int trajBase = ((b*NH+h)*SL+t)*hh + di*HD;
-        int sprevBase = ((b*NH+h)*SL+(t-1))*hh + di*HD;
-        float dOutVal = dOut[baseOff+di];
-        for (int ki=0; ki<HD; ki++) { float sval=Straj[trajBase+ki]; addDQ(baseOff+ki, dOutVal*sval); dSrow[ki]+=dOutVal*Q[baseOff+ki]; }
-        float vd = Vd[baseOff+di]; float dg=0.0; float dVacc=0.0;
-        for (int ki=0; ki<HD; ki++) { float dStv=dSrow[ki]; float sprev = (t>0) ? Straj[sprevBase+ki] : 0.0; dg+=dStv*sprev; addDK(baseOff+ki, dStv*vd); dVacc+=dStv*K[baseOff+ki]; }
-        dV[baseOff+di] = dVacc;
-        addDG(gOff, dg);
-        for (int ki=0; ki<HD; ki++) dSrow[ki]*=g;
+    for (int ki=0; ki<HD; ki++) Srow[ki]=0.0;
+    for (int t=0; t<SL; t++) {
+        if (t % CH == 0) { int ck = (bh*nChunks + t/CH)*hh + rowOff; for (int ki=0; ki<HD; ki++) Ckpt[ck+ki]=Srow[ki]; }
+        int baseOff = (b*SL+t)*MD + hOff;
+        float g = G[(b*SL+t)*NH + h]; float vd = Vd[baseOff+di];
+        for (int ki=0; ki<HD; ki++) Srow[ki]=g*Srow[ki]+vd*K[baseOff+ki];
     }
+    for (int ki=0; ki<HD; ki++) dSrow[ki]=0.0;
+    for (int c=nChunks-1; c>=0; c--) {
+        int t0 = c*CH; int t1 = min(SL, t0+CH);
+        int ck = (bh*nChunks + c)*hh + rowOff;
+        for (int ki=0; ki<HD; ki++) Srow[ki]=Ckpt[ck+ki];
+        for (int t=t0; t<t1; t++) {
+            int baseOff = (b*SL+t)*MD + hOff;
+            float g = G[(b*SL+t)*NH + h]; float vd = Vd[baseOff+di];
+            int sc = (bh*CH + (t-t0))*hh + rowOff;
+            for (int ki=0; ki<HD; ki++) { float s=g*Srow[ki]+vd*K[baseOff+ki]; Srow[ki]=s; Scratch[sc+ki]=s; }
+        }
+        for (int t=t1-1; t>=t0; t--) {
+            int baseOff = (b*SL+t)*MD + hOff; int gOff = (b*SL+t)*NH + h; float g = G[gOff];
+            int sc = (bh*CH + (t-t0))*hh + rowOff;
+            int sp = (t>t0) ? (bh*CH + (t-1-t0))*hh + rowOff : -1;
+            float dOutVal = dOut[baseOff+di];
+            for (int ki=0; ki<HD; ki++) { addDQ(baseOff+ki, dOutVal*Scratch[sc+ki]); dSrow[ki]+=dOutVal*Q[baseOff+ki]; }
+            float vd = Vd[baseOff+di]; float dg=0.0; float dVacc=0.0;
+            for (int ki=0; ki<HD; ki++) { float dStv=dSrow[ki]; float sprev = (sp>=0) ? Scratch[sp+ki] : Ckpt[ck+ki]; dg+=dStv*sprev; addDK(baseOff+ki, dStv*vd); dVacc+=dStv*K[baseOff+ki]; }
+            dV[baseOff+di] = dVacc;
+            addDG(gOff, dg);
+            for (int ki=0; ki<HD; ki++) dSrow[ki]*=g;
+        }
+    }
+}";
+
+    // Channels-last causal depthwise conv (ICausalDepthwiseConvBackend): x, y, dy, dx are [rows, seqLen, C]; w, dw
+    // are [K, C]; tap j reads j steps back. Every output element is written and nothing is atomic: deterministic.
+    public static string CausalConvForward => Header + @"
+layout(set=0,binding=0) readonly buffer Xb { float x[]; };
+layout(set=0,binding=1) readonly buffer Wb { float w[]; };
+layout(set=0,binding=2) buffer Yb { float y[]; };
+layout(push_constant) uniform PC { uint rows; uint seqLen; uint channels; uint taps; };
+void main() {
+    int idx = int(gl_GlobalInvocationID.x);
+    int SL=int(seqLen), C=int(channels), K=int(taps);
+    if (idx >= int(rows)*SL*C) return;
+    int c = idx % C; int t = (idx / C) % SL;
+    int maxJ = min(K - 1, t);
+    float acc = 0.0;
+    for (int j=0; j<=maxJ; j++) acc += w[j*C + c] * x[idx - j*C];
+    y[idx] = acc;
+}";
+
+    public static string CausalConvBackwardInput => Header + @"
+layout(set=0,binding=0) readonly buffer Gb { float dy[]; };
+layout(set=0,binding=1) readonly buffer Wb { float w[]; };
+layout(set=0,binding=2) buffer DXb { float dx[]; };
+layout(push_constant) uniform PC { uint rows; uint seqLen; uint channels; uint taps; };
+void main() {
+    int idx = int(gl_GlobalInvocationID.x);
+    int SL=int(seqLen), C=int(channels), K=int(taps);
+    if (idx >= int(rows)*SL*C) return;
+    int c = idx % C; int t = (idx / C) % SL;
+    int maxJ = min(K - 1, SL - 1 - t);
+    float acc = 0.0;
+    for (int j=0; j<=maxJ; j++) acc += w[j*C + c] * dy[idx + j*C];
+    dx[idx] = acc;
+}";
+
+    // One invocation per (tap j, channel c), summing every row and step in ascending order.
+    public static string CausalConvBackwardKernel => Header + @"
+layout(set=0,binding=0) readonly buffer Gb { float dy[]; };
+layout(set=0,binding=1) readonly buffer Xb { float x[]; };
+layout(set=0,binding=2) buffer DWb { float dw[]; };
+layout(push_constant) uniform PC { uint rows; uint seqLen; uint channels; uint taps; };
+void main() {
+    int jc = int(gl_GlobalInvocationID.x);
+    int R=int(rows), SL=int(seqLen), C=int(channels), K=int(taps);
+    if (jc >= K*C) return;
+    int j = jc / C; int c = jc % C;
+    float acc = 0.0;
+    for (int r=0; r<R; r++) {
+        int rowBase = r*SL*C;
+        for (int t=j; t<SL; t++) acc += dy[rowBase + t*C + c] * x[rowBase + (t-j)*C + c];
+    }
+    dw[jc] = acc;
 }";
 
     public static string GatedDeltaRecompute => Header + @"

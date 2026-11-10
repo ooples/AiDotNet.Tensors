@@ -963,16 +963,20 @@ public class RecordingGpuBackend : DelegatingGpuBackend
     /// <inheritdoc/>
     public override void Int32ToFloat(IGpuBuffer raw, IGpuBuffer output, int n)
     {
+        // Resolved now, through any wrappers under this one: a missing capability must surface at record time, where the
+        // engine falls back to the CPU, not when the graph replays.
+        var conversion = IndexConversion.Resolve(Inner);
         RecordOrExecute(KernelType.ElementWise, new[] { raw }, new[] { output },
-            () => Inner.Int32ToFloat(raw, output, n));
+            () => conversion.Int32ToFloat(raw, output, n));
     }
 
     /// <inheritdoc/>
     public override void ScatterPositions(IGpuBuffer output, int srcDim, int inner, int n)
     {
         // Reads nothing; the output is the node's dependency, so a recorded writer of the same buffer keeps its order.
+        var conversion = IndexConversion.Resolve(Inner);
         RecordOrExecute(KernelType.ElementWise, System.Array.Empty<IGpuBuffer>(), new[] { output },
-            () => Inner.ScatterPositions(output, srcDim, inner, n));
+            () => conversion.ScatterPositions(output, srcDim, inner, n));
     }
 
     #endregion
