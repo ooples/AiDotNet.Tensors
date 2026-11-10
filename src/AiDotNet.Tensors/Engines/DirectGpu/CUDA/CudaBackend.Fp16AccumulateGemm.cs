@@ -302,9 +302,12 @@ public sealed partial class CudaBackend
     }
 
     /// <summary>The rate class verdicts are keyed on ("unknown" when it cannot be read).</summary>
+    // The class name when neither the driver nor the probe reports a rate. Verdicts are neither stored nor reused under it.
+    internal const string UnknownMmaRateClass = "unknown";
+
     internal string MmaRateClass()
     {
-        lock (_fp16AccumulateTuneLock) return MmaRate()?.RateClass ?? "unknown";
+        lock (_fp16AccumulateTuneLock) return MmaRate()?.RateClass ?? UnknownMmaRateClass;
     }
 
     // A route that keeps cuBLAS because FP32 accumulation already runs at full rate, or null to go on.
@@ -364,12 +367,15 @@ public sealed partial class CudaBackend
         PtxTensorCoreGemmConfiguration? configuration)
     {
         if (Fp16AccumulateCacheUnavailableForTests) return false;
+        // No rate class, no verdict: one stored under "unknown" could be reused at a different rate after an unlock.
+        // False takes the same path as a refusing cache (deterministic mode falls back to cuBLAS).
+        if (MmaRate() is not { } rate) return false;
         try
         {
             var parameters = new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["device"] = PtxGemmEvolution.Fingerprint(GetDirectPtxRuntime()).LocalKey,
-                ["mma-rate"] = MmaRate()?.RateClass ?? "unknown",
+                ["mma-rate"] = rate.RateClass,
                 ["route"] = route.Kernel is not null ? "ptx" : "cublas",
                 ["median-speedup"] = route.MedianSpeedup.ToString("R", CultureInfo.InvariantCulture),
                 ["reason"] = route.Reason,
@@ -581,7 +587,7 @@ public sealed partial class CudaBackend
             DirectPtxRuntime runtime = GetDirectPtxRuntime();
             if (!Matches(p, "device", PtxGemmEvolution.Fingerprint(runtime).LocalKey)) return null;
             // A verdict measured at another MMA rate (the card was unlocked or relocked since) is stale.
-            if (!Matches(p, "mma-rate", MmaRate()?.RateClass ?? "unknown")) return null;
+            if (MmaRate() is not { } rate || !Matches(p, "mma-rate", rate.RateClass)) return null;
             string reason = p.TryGetValue("reason", out string? r) ? "persisted: " + r : "persisted";
             double median = p.TryGetValue("median-speedup", out string? ms) &&
                 double.TryParse(ms, NumberStyles.Float, CultureInfo.InvariantCulture, out double parsed) ? parsed : 0;

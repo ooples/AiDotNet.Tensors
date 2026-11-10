@@ -553,7 +553,14 @@ public sealed partial class CudaBackend
         // the FP32-accumulate issue rate, but by different amounts (the generated kernel is more often issue-bound), so
         // a verdict measured at half rate says nothing about an unlocked card. Keyed by rate class like the
         // FP16-accumulate routes (#1549); strict FP32 runs on the CUDA cores and is unaffected.
-        if (!decision.StrictFp32) parameters["mma-rate"] = MmaRateClass();
+        if (!decision.StrictFp32)
+        {
+            // An unknown rate (driver query and probe both declined) names no class: two such verdicts could have been
+            // measured at different rates, so none is recorded and the route is re-measured next process.
+            string rateClass = MmaRateClass();
+            if (string.Equals(rateClass, UnknownMmaRateClass, StringComparison.Ordinal)) return;
+            parameters["mma-rate"] = rateClass;
+        }
         PersistGemmRouteChoice(decision, parameters);
     }
 
@@ -565,6 +572,8 @@ public sealed partial class CudaBackend
     // Pure form of the check above, with the device's current rate class supplied (testable without hardware).
     internal static bool TensorCoreVerdictMatchesRate(Dictionary<string, string> parameters, string current)
     {
+        // An unknown current rate matches nothing: the verdict may have been measured at either rate.
+        if (string.Equals(current, UnknownMmaRateClass, StringComparison.Ordinal)) return false;
         return parameters.TryGetValue("mma-rate", out string? recorded)
             ? string.Equals(recorded, current, StringComparison.Ordinal)
             : !string.Equals(current, PtxMmaRateProbe.FullRateClass, StringComparison.Ordinal);

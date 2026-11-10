@@ -162,6 +162,8 @@ public sealed class MmaRateSourceTests
     [InlineData("fp32acc-1/2", "fp32acc-full", false)]  // recorded at another class
     [InlineData(null, "fp32acc-1/2", true)]             // legacy verdict, reduced-rate device
     [InlineData(null, "fp32acc-full", false)]           // legacy verdict, full-rate device
+    [InlineData("unknown", "unknown", false)]           // no rate either time: may differ, never reused
+    [InlineData(null, "unknown", false)]                // legacy verdict, rate unreadable now
     public void TensorCoreVerdict_AppliesOnlyAtItsRateClass(string? recorded, string current, bool applies)
     {
         var parameters = new System.Collections.Generic.Dictionary<string, string>();
