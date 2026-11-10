@@ -118,9 +118,13 @@ public class BackwardRecyclerTests
     // ReduceSum's backward hands back a Fill-ed ones tensor, tagged as uniform so ReluBackward can read one scalar. The
     // recycler returned that wrapper, LayerNorm's backward was given it and wrote its gradient through a lease, and the
     // ReLU then read the stale tag: every gradient below it came out as if the upstream gradient were all ones (#1702).
-    [Fact]
-    public void ReissuedRingTensor_DropsThePreviousOwnersUniformFill()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ReissuedRingTensor_DropsThePreviousOwnersUniformFill(bool acrossStepBoundary)
     {
+        // Within a step the returned array comes back under a new tensor; at the step boundary the ring reissues the
+        // wrapper itself. Either way the new owner must not inherit the first owner's uniform-fill tag.
         var engine = new CpuEngine();
         using var arena = TensorArena.Create();
         var log = new List<TensorArena.IssuedBuffer>();
@@ -130,9 +134,11 @@ public class BackwardRecyclerTests
         ones.Fill(1f);
         Assert.Single(log);
 
-        arena.ReturnIssued(log[0]);
+        if (acrossStepBoundary) arena.Reset();
+        else arena.ReturnIssued(log[0]);
         var gradient = TensorAllocator.RentUninitialized<float>(new[] { 4, 8 });
-        Assert.Same(ones, gradient);
+        if (acrossStepBoundary) Assert.Same(ones, gradient);
+        else Assert.Same(ones.GetBackingArrayForCacheLookupUnsafe(), gradient.GetBackingArrayForCacheLookupUnsafe());
         using (var lease = gradient.LeaseArray())
             for (int i = 0; i < gradient.Length; i++) lease.Array[i] = 0.25f * (i + 1);
 
