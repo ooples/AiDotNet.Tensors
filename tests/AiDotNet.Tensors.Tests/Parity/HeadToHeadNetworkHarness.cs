@@ -525,9 +525,13 @@ internal static class HeadToHeadNetworkHarness
         string work = Path.Combine(Path.GetTempPath(), "aidotnet-residency", network);
         WriteRandomWeightsAndData(spec, work);
         var previous = AiDotNetEngine.Current;
+        // The spec decides autocast, as in MeasureCompiledStepCounts: an FP16 spec's casts are crossings to count, and an
+        // inherited AIDOTNET_AUTOCAST=fp16 must not count an FP32 spec under autocast.
+        string? previousAutocast = Environment.GetEnvironmentVariable("AIDOTNET_AUTOCAST");
         AiDotNetEngine.Current = gpu;
         try
         {
+            Environment.SetEnvironmentVariable("AIDOTNET_AUTOCAST", AutocastOf(spec));
             var capture = new StepCrossingCapture(warmupSteps);
             TrainTensors(spec, work, gpu, TensorsMode.PhaseSynchronized, capture);
             return capture.Crossings ?? throw new InvalidOperationException("the measured step never ran.");
@@ -535,6 +539,7 @@ internal static class HeadToHeadNetworkHarness
         finally
         {
             AiDotNetEngine.Current = previous;
+            Environment.SetEnvironmentVariable("AIDOTNET_AUTOCAST", previousAutocast);
         }
     }
 
@@ -641,7 +646,10 @@ internal static class HeadToHeadNetworkHarness
             if (gpu?.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cuda)
             {
                 counts.GraphCaptureFailure = plan.GraphCaptureFailureReason;
-                if (counts.GraphCaptureFailure is null)
+                // Only when this plan holds a graph: no failure reason does not mean a capture ran
+                // (AIDOTNET_CUDA_GRAPH_STEP=0 skips it), and then the backend's last counts are another capture's.
+                // This plan is the only one stepping here, so a graph it holds is the backend's last capture.
+                if (plan.HasStepGraph)
                 {
                     counts.KernelNodes = cuda.LastCaptureKernelNodeCount;
                     counts.MemcpyNodes = cuda.LastCaptureMemcpyNodeCount;

@@ -730,6 +730,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// <summary>Keeps THIS plan's captured SGD update in place (one step graph): the oracle for the ping-pong update.</summary>
     internal void DisablePingPongForTesting() => _pingPongRejected = true;
 
+    /// <summary>True while the plan holds a captured step graph (it replays it instead of launching the step).</summary>
+    internal bool HasStepGraph => _stepGraphExec != IntPtr.Zero;
+
     /// <summary>True while the plan replays a graph per replay parity.</summary>
     internal bool ReplaysParityGraphs => _stepGraphExecOdd != IntPtr.Zero;
 
