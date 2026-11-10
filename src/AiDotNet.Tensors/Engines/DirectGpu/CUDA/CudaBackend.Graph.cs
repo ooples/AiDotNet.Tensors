@@ -467,10 +467,12 @@ public sealed partial class CudaBackend
             AbortDirectPtxCapturePinTracking(directPtxPins);
             throw;
         }
-        if (CudaNativeBindings.cuStreamBeginCapture(_stream, CudaNativeBindings.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL) != CudaResult.Success)
+        var beginRc = CudaNativeBindings.cuStreamBeginCapture(_stream, CudaNativeBindings.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
+        if (beginRc != CudaResult.Success)
         {
             ExitCapture();
             AbortDirectPtxCapturePinTracking(directPtxPins);
+            t_lastCaptureFailure = "cuStreamBeginCapture failed: " + beginRc;
             return false;
         }
         try
@@ -498,18 +500,27 @@ public sealed partial class CudaBackend
         if (endRc != CudaResult.Success || newGraph == IntPtr.Zero)
         {
             AbortDirectPtxCapturePinTracking(directPtxPins);
+            t_lastCaptureFailure = "cuStreamEndCapture returned " + endRc + (newGraph == IntPtr.Zero ? " with no graph" : "")
+                + " (the capture was invalidated by a non-capturable call in the step body: a host read, a synchronous "
+                + "copy or an allocation)";
             return false;
         }
 
         var info = default(CudaNativeBindings.CUgraphExecUpdateResultInfo);
         var rc = CudaNativeBindings.cuGraphExecUpdate(graphExec, newGraph, ref info);
         CudaNativeBindings.cuGraphDestroy(newGraph);
-        bool updated = rc == CudaResult.Success && info.result == 0;
+        bool updated = rc == CudaResult.Success && info.result == 0; // info.result 0 == CU_GRAPH_EXEC_UPDATE_SUCCESS
         if (updated)
+        {
             ReplaceDirectPtxGraphPins(graphExec, directPtxPins);
+        }
         else
+        {
             AbortDirectPtxCapturePinTracking(directPtxPins);
-        return updated; // info.result 0 == CU_GRAPH_EXEC_UPDATE_SUCCESS
+            t_lastCaptureFailure = "cuGraphExecUpdate could not update the graph in place (result " + rc
+                + ", update result " + info.result + "): the relaunched step's topology differs from the captured one";
+        }
+        return updated;
     }
 
     /// <summary>Frees a captured graph-exec handle. Safe to call with <see cref="IntPtr.Zero"/>.</summary>

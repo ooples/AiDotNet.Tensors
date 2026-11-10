@@ -15,6 +15,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 /// </summary>
 internal readonly record struct SmIssueRateModifier(byte Fmla16, byte Fmla32, byte Dp, byte Ffma)
 {
+    /// <summary>The slowest speed select the RM defines (REDUCED_SPEED_1_64: 1/64 of the full rate).</summary>
+    internal const byte MaxSpeedSelect = 6;
+
+    /// <summary>True when both tensor-core speed selects are within the range the RM defines.</summary>
+    internal static bool SpeedSelectsAreDefined(byte fmla16, byte fmla32) =>
+        fmla16 <= MaxSpeedSelect && fmla32 <= MaxSpeedSelect;
+
     /// <summary>
     /// As a rate result in units of the full rate (1.0 = full), so it carries the same <see cref="PtxMmaRateProbe.Result.RateClass"/>
     /// a measurement would: FP16-accumulate over FP32-accumulate = 2^(FMLA32 - FMLA16).
@@ -273,6 +280,14 @@ internal sealed class NvRmIssueRateQuery : ISmIssueRateQuery
                     sizeof(IssueRateParams), out uint rateStatus))
             {
                 failure = "GET_SM_ISSUE_RATE_MODIFIER failed (status 0x" + rateStatus.ToString("x") + ")";
+                return false;
+            }
+            // A control that "succeeds" but leaves garbage would otherwise be cached as the device's rate and the probe
+            // would never run; decline anything outside the documented speed-select range so the caller measures.
+            if (!SmIssueRateModifier.SpeedSelectsAreDefined(rates.Fmla16, rates.Fmla32))
+            {
+                failure = "GET_SM_ISSUE_RATE_MODIFIER returned out-of-range speed selects (fmla16 " + rates.Fmla16
+                    + ", fmla32 " + rates.Fmla32 + "; at most " + SmIssueRateModifier.MaxSpeedSelect + " is defined)";
                 return false;
             }
             modifier = new SmIssueRateModifier(rates.Fmla16, rates.Fmla32, rates.Dp, rates.Ffma);

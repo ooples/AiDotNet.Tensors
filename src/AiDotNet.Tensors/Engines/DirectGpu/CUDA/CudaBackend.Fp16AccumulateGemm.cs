@@ -191,11 +191,22 @@ public sealed partial class CudaBackend
     }
 
     // AIDOTNET_MMA_RATE_SOURCE: "auto" (default) asks the driver first and measures when it cannot answer; "driver"
-    // never measures; "probe" never asks the driver.
-    private static readonly string s_mmaRateSource =
-        (Environment.GetEnvironmentVariable("AIDOTNET_MMA_RATE_SOURCE") ?? "auto").Trim().ToLowerInvariant();
+    // never measures; "probe" never asks the driver. An unrecognised value keeps the default.
+    private static readonly MmaRateSourcePolicy s_defaultMmaRateSource =
+        ParseMmaRateSource(Environment.GetEnvironmentVariable("AIDOTNET_MMA_RATE_SOURCE"));
 
-    private (int Domain, int Bus, int Device)? _pciAddress;   // set at init when the driver reports it
+    internal static MmaRateSourcePolicy ParseMmaRateSource(string? value) =>
+        (value ?? string.Empty).Trim().ToLowerInvariant() switch
+        {
+            "driver" => MmaRateSourcePolicy.Driver,
+            "probe" => MmaRateSourcePolicy.Probe,
+            _ => MmaRateSourcePolicy.Auto,
+        };
+
+    /// <summary>Where the rate is read from; defaults to AIDOTNET_MMA_RATE_SOURCE, settable per backend by tests.</summary>
+    internal MmaRateSourcePolicy MmaRateSource { get; set; } = s_defaultMmaRateSource;
+
+    private readonly (int Domain, int Bus, int Device)? _pciAddress;   // set at init when the driver reports it
     private string? _mmaRateQueryFailure;
 
     /// <summary>Tests: replaces the driver's issue-rate query (a mock, or null for no query at all).</summary>
@@ -213,12 +224,12 @@ public sealed partial class CudaBackend
     {
         if (_mmaRate is null)
         {
-            if (s_mmaRateSource != "probe" && TryQueryDriverMmaRate() is { } fromDriver)
+            if (MmaRateSource != MmaRateSourcePolicy.Probe && TryQueryDriverMmaRate() is { } fromDriver)
             {
                 _mmaRate = fromDriver;
                 return _mmaRate;
             }
-            if (s_mmaRateSource == "driver") return null;
+            if (MmaRateSource == MmaRateSourcePolicy.Driver) return null;
             try
             {
                 _mmaRate = PtxMmaRateProbe.Measure(GetDirectPtxRuntime());
@@ -669,4 +680,15 @@ public sealed partial class CudaBackend
             _retiredFp16AccumulateRoutes.Clear();
         }
     }
+}
+
+/// <summary>Where <see cref="CudaBackend"/> reads the tensor-core issue rate from (AIDOTNET_MMA_RATE_SOURCE).</summary>
+internal enum MmaRateSourcePolicy
+{
+    /// <summary>Ask the driver first; measure with the probe when it cannot answer.</summary>
+    Auto,
+    /// <summary>Only ask the driver; never measure.</summary>
+    Driver,
+    /// <summary>Only measure; never ask the driver.</summary>
+    Probe,
 }

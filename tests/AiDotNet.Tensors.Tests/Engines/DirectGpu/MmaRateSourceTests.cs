@@ -111,9 +111,62 @@ public sealed class MmaRateSourceTests
         _output.WriteLine(profile is { } p
             ? $"rate source {p.Source}: FP32 acc {p.Fp32Accumulate:G4}, FP16 acc {p.Fp16Accumulate:G4} -> {p.RateClass}"
             : "no rate");
-        Skip.If(profile is not { Source: "driver" }, $"The driver did not answer: {backend.MmaRateQueryFailure}");
-        Assert.InRange(profile!.Value.Fp32Accumulate, 1.0 / 64, 1.0);
-        Assert.InRange(profile.Value.Fp16Accumulate, 1.0 / 64, 1.0);
+        if (profile is not { Source: "driver" } answered)
+        {
+            // A broken struct layout, ioctl number or refused client must not pass as a skip where the query is
+            // expected to work: lanes with an NVIDIA Linux driver set AIDOTNET_REQUIRE_RM_QUERY=1 to make it a failure.
+            Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_RM_QUERY") != "1",
+                $"The driver did not answer: {backend.MmaRateQueryFailure}");
+            Assert.Fail($"AIDOTNET_REQUIRE_RM_QUERY=1 but the driver query did not answer: {backend.MmaRateQueryFailure}");
+            return;
+        }
+        Assert.InRange(answered.Fp32Accumulate, 1.0 / 64, 1.0);
+        Assert.InRange(answered.Fp16Accumulate, 1.0 / 64, 1.0);
+        // The class must be the one the same rates produce, so routing keys verdicts consistently.
+        Assert.Equal(
+            new PtxMmaRateProbe.Result(answered.Fp32Accumulate, answered.Fp16Accumulate, PtxMmaRateProbe.RateSource.DriverQuery).RateClass,
+            answered.RateClass);
+    }
+
+    // Speed selects above REDUCED_SPEED_1_64 are not defined: the query declines them so the caller measures instead of
+    // caching garbage (an all-zero answer is legitimate: a full-rate part).
+    [Theory]
+    [InlineData(0, 0, true)]
+    [InlineData(0, 6, true)]
+    [InlineData(6, 6, true)]
+    [InlineData(0, 7, false)]
+    [InlineData(7, 0, false)]
+    [InlineData(255, 1, false)]
+    public void SpeedSelects_OutsideTheDefinedRange_AreRejected(byte fmla16, byte fmla32, bool defined)
+    {
+        Assert.Equal(defined, SmIssueRateModifier.SpeedSelectsAreDefined(fmla16, fmla32));
+    }
+
+    [Theory]
+    [InlineData(null, nameof(MmaRateSourcePolicy.Auto))]
+    [InlineData("", nameof(MmaRateSourcePolicy.Auto))]
+    [InlineData("auto", nameof(MmaRateSourcePolicy.Auto))]
+    [InlineData(" Driver ", nameof(MmaRateSourcePolicy.Driver))]
+    [InlineData("PROBE", nameof(MmaRateSourcePolicy.Probe))]
+    [InlineData("bogus", nameof(MmaRateSourcePolicy.Auto))]
+    public void RateSourceSetting_ParsesTheDocumentedValues(string? value, string expected)
+    {
+        // The policy enum is internal, so the theory names the expected member.
+        Assert.Equal(expected, CudaBackend.ParseMmaRateSource(value).ToString());
+    }
+
+    // A persisted TF32 verdict applies only at the rate class it was measured at; verdicts recorded before the class was
+    // stored came from stock (reduced-rate) cards.
+    [Theory]
+    [InlineData("fp32acc-1/2", "fp32acc-1/2", true)]    // recorded at the current class
+    [InlineData("fp32acc-1/2", "fp32acc-full", false)]  // recorded at another class
+    [InlineData(null, "fp32acc-1/2", true)]             // legacy verdict, reduced-rate device
+    [InlineData(null, "fp32acc-full", false)]           // legacy verdict, full-rate device
+    public void TensorCoreVerdict_AppliesOnlyAtItsRateClass(string? recorded, string current, bool applies)
+    {
+        var parameters = new System.Collections.Generic.Dictionary<string, string>();
+        if (recorded is not null) parameters["mma-rate"] = recorded;
+        Assert.Equal(applies, CudaBackend.TensorCoreVerdictMatchesRate(parameters, current));
     }
 
     private static CudaBackend RequireAmpereBackend()
@@ -161,14 +214,16 @@ public sealed class MmaRateSourceTests
 
         Assert.Equal(1, query.Calls);
         Assert.Equal((0, 0x41, 0), query.LastAddress);
-        var verdict = backend.Fp16AccumulateVerdict(m, n, k)!.Value;
+        var verdictOrNull = backend.Fp16AccumulateVerdict(m, n, k);
+        Assert.True(verdictOrNull.HasValue, "the route recorded no verdict");
+        var verdict = verdictOrNull.GetValueOrDefault();
         Assert.False(verdict.Routed);
         Assert.Contains("FP16 rate", verdict.Reason);
         Assert.Contains("driver speed selects", verdict.Reason);
         Assert.Equal(before, backend.Fp16AccumulateDispatchCount);
         Assert.True(backend.Fp32AccumulateIsFullRate());
         Assert.Equal(PtxMmaRateProbe.FullRateClass, backend.MmaRateClass());
-        Assert.Equal("driver", backend.TensorCoreAccumulateRateProfile()!.Value.Source);
+        Assert.Equal("driver", backend.TensorCoreAccumulateRateProfile()?.Source);
         Assert.All(backend.DownloadBuffer(dc), v => Assert.Equal(0.125f * k, v));
     }
 
@@ -184,7 +239,9 @@ public sealed class MmaRateSourceTests
 
         Assert.Equal("fp32acc-1/2", backend.MmaRateClass());
         Assert.False(backend.Fp32AccumulateIsFullRate());
-        var profile = backend.TensorCoreAccumulateRateProfile()!.Value;
+        var profileOrNull = backend.TensorCoreAccumulateRateProfile();
+        Assert.True(profileOrNull.HasValue, "no rate profile");
+        var profile = profileOrNull.GetValueOrDefault();
         Assert.Equal("driver", profile.Source);
         Assert.Equal(0.5, profile.Fp32Accumulate);
         Assert.Equal(1.0, profile.Fp16Accumulate);
@@ -204,10 +261,44 @@ public sealed class MmaRateSourceTests
         var profile = backend.TensorCoreAccumulateRateProfile();
         Assert.Equal(1, query.Calls);
         Assert.Equal("status 0x1f for tests", backend.MmaRateQueryFailure);
-        Assert.True(profile.HasValue);
-        Assert.Equal("measured", profile!.Value.Source);
-        _output.WriteLine($"measured: FP32 acc {profile.Value.Fp32Accumulate:F1}, FP16 acc {profile.Value.Fp16Accumulate:F1} TFLOP/s -> {profile.Value.RateClass}");
-        Assert.InRange(profile.Value.Fp32Accumulate, 1, 10_000);
+        Assert.True(profile is { Source: "measured" }, $"expected a measured rate, got {profile}");
+        var measured = profile.GetValueOrDefault();
+        _output.WriteLine($"measured: FP32 acc {measured.Fp32Accumulate:F1}, FP16 acc {measured.Fp16Accumulate:F1} TFLOP/s -> {measured.RateClass}");
+        Assert.InRange(measured.Fp32Accumulate, 1, 10_000);
+    }
+
+    // AIDOTNET_MMA_RATE_SOURCE=driver: the driver's answer or nothing; a declined query never falls back to measuring.
+    [SkippableFact]
+    public void DriverOnlySource_DriverDeclines_ReportsNoRate()
+    {
+        using var backend = RequireAmpereBackend();
+        var query = new FakeIssueRateQuery(null, "declined for tests");
+        backend.SmIssueRateQueryForTests = query;
+        backend.PciAddressForTests = (0, 1, 0);
+        backend.MmaRateSource = MmaRateSourcePolicy.Driver;
+        backend.ResetMmaRateForTests();
+
+        Assert.Null(backend.TensorCoreAccumulateRateProfile());
+        Assert.Equal("unknown", backend.MmaRateClass());
+        Assert.Equal("declined for tests", backend.MmaRateQueryFailure);
+        Assert.True(query.Calls >= 1);
+    }
+
+    // AIDOTNET_MMA_RATE_SOURCE=probe: always measured; the driver is never asked, even when it would answer.
+    [SkippableFact]
+    public void ProbeOnlySource_NeverAsksTheDriver()
+    {
+        using var backend = RequireAmpereBackend();
+        var query = new FakeIssueRateQuery(new SmIssueRateModifier(0, 0, 0, 0));
+        backend.SmIssueRateQueryForTests = query;
+        backend.PciAddressForTests = (0, 1, 0);
+        backend.MmaRateSource = MmaRateSourcePolicy.Probe;
+        backend.ResetMmaRateForTests();
+
+        var profile = backend.TensorCoreAccumulateRateProfile();
+
+        Assert.Equal(0, query.Calls);
+        Assert.True(profile is { Source: "measured" }, $"expected a measured rate, got {profile}");
     }
 }
 #endif

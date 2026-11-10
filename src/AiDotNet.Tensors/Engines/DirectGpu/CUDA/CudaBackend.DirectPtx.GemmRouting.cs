@@ -559,9 +559,12 @@ public sealed partial class CudaBackend
 
     // A persisted TF32 verdict applies only at the rate class it was measured at. Verdicts recorded before the class was
     // stored were measured on stock (reduced-rate) cards, so they are dropped once FP32 accumulation reads full rate.
-    private bool TensorCoreVerdictMatchesRate(Dictionary<string, string> parameters)
+    private bool TensorCoreVerdictMatchesRate(Dictionary<string, string> parameters) =>
+        TensorCoreVerdictMatchesRate(parameters, MmaRateClass());
+
+    // Pure form of the check above, with the device's current rate class supplied (testable without hardware).
+    internal static bool TensorCoreVerdictMatchesRate(Dictionary<string, string> parameters, string current)
     {
-        string current = MmaRateClass();
         return parameters.TryGetValue("mma-rate", out string? recorded)
             ? string.Equals(recorded, current, StringComparison.Ordinal)
             : !string.Equals(current, PtxMmaRateProbe.FullRateClass, StringComparison.Ordinal);

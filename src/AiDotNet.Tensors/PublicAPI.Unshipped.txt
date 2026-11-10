@@ -98,3 +98,6 @@ AiDotNet.Tensors.Engines.Compilation.GradientRegularizationOrder.ClipThenRegular
 AiDotNet.Tensors.Engines.Compilation.GradientRegularizationOrder.RegularizeThenClip = 0 -> AiDotNet.Tensors.Engines.Compilation.GradientRegularizationOrder
 AiDotNet.Tensors.Engines.Compilation.ICompiledTrainingPlanRegularizationOrder
 AiDotNet.Tensors.Engines.Compilation.ICompiledTrainingPlanRegularizationOrder.SetL2Regularization(double strength, AiDotNet.Tensors.Engines.Compilation.GradientRegularizationOrder order) -> void
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaDeviceAttribute.PciBusId = 33 -> AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaDeviceAttribute
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaDeviceAttribute.PciDeviceId = 34 -> AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaDeviceAttribute
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaDeviceAttribute.PciDomainId = 50 -> AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaDeviceAttribute
