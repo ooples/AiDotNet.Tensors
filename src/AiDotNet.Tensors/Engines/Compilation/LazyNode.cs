@@ -224,6 +224,28 @@ internal sealed class LazyNode<T> : ILazyNode
         return nodes.ToArray();
     }
 
+    public bool SavePersistentWrite(HashSet<object> saved, List<Action> restores)
+    {
+        if (!ReferenceEquals(Input0, Output)) return false;
+        // The target's producer before its chain of in-place writes; none means it came from outside the trace.
+        var prior = _externalPrerequisite;
+        while (prior is LazyNode<T> earlier && ReferenceEquals(earlier.Output, Output)) prior = earlier._externalPrerequisite;
+        if (prior is not null) return false;
+        if (saved.Add(Output))
+        {
+            // Detached from this node for the copy, so reading it (from the host or a device) does not run the write.
+            var target = Output;
+            var source = target.LazySource;
+            target.LazySource = null;
+            Tensor<T> copy;
+            try { copy = target.Clone(); }
+            finally { target.LazySource = source; }
+            var engine = RecordingEngine;
+            restores.Add(() => DirectGpuTensorEngine.CopyResultInto(engine, copy, target));
+        }
+        return true;
+    }
+
     /// <summary>Clears the LazySource reference on the output tensor after realization.</summary>
     public void ClearOutputLazySource()
     {

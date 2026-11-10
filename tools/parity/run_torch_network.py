@@ -43,6 +43,7 @@ so the Tensors side reads bytes rather than reproducing an initialisation scheme
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import json
 import math
@@ -89,6 +90,19 @@ def main() -> int:
     if spec["loss"] != "mse" or spec["optimizer"]["name"] != "sgd" or spec["dtype"] != "float32":
         print(f"unsupported spec for this runner: {spec['loss']}/{spec['optimizer']['name']}/{spec['dtype']}", file=sys.stderr)
         return 2
+    # "autocast": "fp16" (#1549) runs every forward and loss under torch.autocast(float16), as AMP training does, against
+    # the Tensors side under its FP16 autocast scope (AIDOTNET_AUTOCAST=fp16). Parameters, gradients and the update stay
+    # float32 on both sides. CUDA only: CPU autocast is bfloat16, which the Tensors side does not pair it with.
+    autocast = spec.get("autocast")
+    if autocast not in (None, "fp16"):
+        print(f"unsupported autocast for this runner: {autocast}", file=sys.stderr)
+        return 2
+    if autocast == "fp16" and args.device != "cuda":
+        print("DEFERRED: FP16 autocast is compared on CUDA only.", file=sys.stderr)
+        return 3
+    # Loss agreement bounds, first step and later steps, relative to max(1, |loss|). FP16 autocast specs loosen them:
+    # each side picks its own FP16 kernels and reduction orders, so curves agree to FP16 rounding, not FP32.
+    first_tolerance, later_tolerance = spec.get("lossTolerance", [1e-4, 1e-3])
 
     work = Path(args.workdir)
     work.mkdir(parents=True, exist_ok=True)
@@ -280,6 +294,14 @@ def main() -> int:
         if device.type == "cuda":
             torch.cuda.synchronize()
 
+    def amp():
+        # The forward and loss of every mode run under this; backward and the update follow autocast's own rules.
+        return torch.autocast("cuda", dtype=torch.float16) if autocast == "fp16" else contextlib.nullcontext()
+
+    def forward_loss(model, xs):
+        with amp():
+            return loss_fn(model(xs), y)
+
     def fresh():
         model = copy.deepcopy(base_model)
         return model, torch.optim.SGD(model.parameters(), lr=lr, foreach=True)
@@ -300,7 +322,7 @@ def main() -> int:
         measuring = step >= spec["warmupSteps"] and (time.perf_counter() - warm_start) * 1e3 >= warmup_ms
         sync()
         t0 = time.perf_counter()
-        loss = loss_fn(model(x), y)
+        loss = forward_loss(model, x)
         sync()
         t1 = time.perf_counter()
         loss.backward()
@@ -331,7 +353,7 @@ def main() -> int:
             if mark is not None:
                 mark()
             optimizer.zero_grad(set_to_none=True)
-            loss = loss_fn(model(xs), y)
+            loss = forward_loss(model, xs)
             loss.backward()
             optimizer.step()
             return loss.detach()
@@ -361,7 +383,7 @@ def main() -> int:
                 if mark is not None:
                     mark()
                 optimizer.zero_grad(set_to_none=True)
-                loss = loss_fn(compiled(xs), y)
+                loss = forward_loss(compiled, xs)
                 loss.backward()
                 compiled_update()
                 return loss.detach()
@@ -384,13 +406,13 @@ def main() -> int:
             with torch.cuda.stream(side):
                 for _ in range(3):
                     optimizer.zero_grad(set_to_none=True)
-                    loss_fn(model(xs), y).backward()
+                    forward_loss(model, xs).backward()
                     optimizer.step()
             torch.cuda.current_stream().wait_stream(side)
             graph = torch.cuda.CUDAGraph()
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.graph(graph):
-                static_loss = loss_fn(model(xs), y)
+                static_loss = forward_loss(model, xs)
                 static_loss.backward()
                 optimizer.step()
 
@@ -428,7 +450,7 @@ def main() -> int:
             return f"{len(losses)} losses were recorded; the reference has {n}"
         for i in range(n):
             # Same bounds as the Tensors side: the first step differs only in reduction order.
-            tolerance = 1e-4 if i == 0 else 1e-3
+            tolerance = first_tolerance if i == 0 else later_tolerance
             if not math.isfinite(losses[i]) or abs(losses[i] - reference[i]) > tolerance * max(1.0, abs(reference[i])):
                 return f"loss at step {i} is {losses[i]:.9g}, eager gives {reference[i]:.9g}"
         return None

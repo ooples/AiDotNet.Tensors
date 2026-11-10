@@ -409,7 +409,7 @@ jobs:
         SDE_TAR="$RUNNER_TEMP/sde.tar.xz"
         mkdir -p "$SDE_DIR"
         # Try mirrors in order; first one that yields a valid .tar.xz with sde64 wins.
-        SDE_URLS="https://downloadmirror.intel.com/843185/sde-external-9.48.0-2024-11-25-lin.tar.xz https://downloadmirror.intel.com/788820/sde-external-9.33.0-2024-01-07-lin.tar.xz"
+        SDE_URLS="https://downloadmirror.intel.com/859732/sde-external-9.58.0-2025-06-16-lin.tar.xz https://downloadmirror.intel.com/843185/sde-external-9.48.0-2024-11-25-lin.tar.xz https://downloadmirror.intel.com/788820/sde-external-9.33.0-2024-01-07-lin.tar.xz"
         SDE_OK=0
         for url in $SDE_URLS; do
           echo "Fetching Intel SDE: $url"
@@ -447,7 +447,7 @@ jobs:
         export DOTNET_EnableWriteXorExecute=0
         "$RUNNER_TEMP/sde/sde64" -spr -- dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj \
           --configuration Release --no-build --framework net10.0 \
-          --filter "FullyQualifiedName~MachineKernelGemmTests"
+          --filter "FullyQualifiedName~MachineKernelGemmTests|FullyQualifiedName~DirectConvAvx512Tests"
     # Sub-S (#409) S.4: report the per-microkernel GFLOPS (% of a measured register-FMA
     # ceiling) on this runner. On a real AVX-512 runner this prints the Avx512Fp32_16x16 /
     # 8x32 / Avx512Fp64_8x16 numbers we cannot measure on AVX2-only dev boxes (SDE GFLOPS

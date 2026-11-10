@@ -23,17 +23,41 @@ internal static class PtxMmaRateProbe
     private const int ThreadsPerBlock = 128;
     private const int BlocksPerMultiprocessor = 8;
 
-    /// <summary>One measurement: TFLOP/s of each accumulate form and their ratio (FP16 over FP32).</summary>
-    internal readonly record struct Result(double Fp32AccumulateTflops, double Fp16AccumulateTflops)
+    /// <summary>The rate class of a device whose FP32-accumulate tensor-core math issues at the FP16 rate.</summary>
+    internal const string FullRateClass = "fp32acc-full";
+
+    /// <summary>Where a <see cref="Result"/> came from.</summary>
+    internal enum RateSource
+    {
+        /// <summary>Timed by <see cref="Measure"/>; the rates are TFLOP/s.</summary>
+        Measured,
+        /// <summary>The driver's issue-rate modifiers (<see cref="NvRmIssueRateQuery"/>); the rates are fractions of full.</summary>
+        DriverQuery,
+        /// <summary>Set by a test.</summary>
+        Forced,
+    }
+
+    /// <summary>
+    /// One rate reading: each accumulate form's rate and their ratio (FP16 over FP32). Measured readings are TFLOP/s;
+    /// a driver reading is in units of the full issue rate (1 = full, 0.5 = half).
+    /// </summary>
+    internal readonly record struct Result(double Fp32AccumulateTflops, double Fp16AccumulateTflops,
+        RateSource Source = RateSource.Measured)
     {
         internal double Ratio => Fp16AccumulateTflops / Fp32AccumulateTflops;
+
+        /// <summary>The two rates for a message, in the units of <see cref="Source"/>.</summary>
+        internal string Describe() => Source == RateSource.DriverQuery
+            ? $"driver speed selects: FP32 accumulation at {Fp32AccumulateTflops:0.###} and FP16 accumulation at " +
+              $"{Fp16AccumulateTflops:0.###} of the full issue rate"
+            : $"{Fp32AccumulateTflops:F0} against {Fp16AccumulateTflops:F0} TFLOP/s";
 
         /// <summary>FP32 accumulation issues at (close to) the FP16 rate: FP16 accumulation cannot double anything.</summary>
         internal bool Fp32AccumulateIsFullRate => Ratio < 1.3;
 
         /// <summary>Stable class for cache keys: "fp32acc-full" or "fp32acc-1/N" with N the rounded ratio.</summary>
         internal string RateClass => Fp32AccumulateIsFullRate
-            ? "fp32acc-full"
+            ? FullRateClass
             : "fp32acc-1/" + Math.Round(Ratio).ToString(CultureInfo.InvariantCulture);
     }
 

@@ -6,7 +6,7 @@ internal static class VulkanOptimizerKernels
 {
     private const string Header = @"#version 450
 layout(local_size_x = 256) in;
-";
+" + VulkanBiasCorrection.Glsl;
 
     public static string TwoBuffer => Header + @"
 layout(set=0,binding=0) buffer Param { float param[]; };
@@ -29,13 +29,13 @@ layout(set=0,binding=1) readonly buffer Gradient { float gradient[]; };
 layout(set=0,binding=2) buffer State1 { float state1[]; };
 layout(set=0,binding=3) buffer State2 { float state2[]; };
 layout(push_constant) uniform Params { uint size; uint operation; uint step; float learningRate; float p0; float p1; float p2; float p3; };
-void main(){uint i=gl_GlobalInvocationID.x;if(i>=size)return;float g=gradient[i];if(operation<=1u){float beta1=p0,beta2=p1,epsilon=p2,decay=p3;if(operation==0u)g+=decay*param[i];else param[i]*=1.0-learningRate*decay;state1[i]=beta1*state1[i]+(1.0-beta1)*g;state2[i]=beta2*state2[i]+(1.0-beta2)*g*g;float mh=state1[i]/(1.0-pow(beta1,float(step))),vh=state2[i]/(1.0-pow(beta2,float(step)));param[i]-=learningRate*mh/(sqrt(vh)+epsilon);}else if(operation==2u){float rho=p0,epsilon=p1,decay=p2;g+=decay*param[i];state1[i]=rho*state1[i]+(1.0-rho)*g*g;float update=sqrt(state2[i]+epsilon)/sqrt(state1[i]+epsilon)*g;state2[i]=rho*state2[i]+(1.0-rho)*update*update;param[i]-=update;}else if(operation==3u){float beta1=p0,beta2=p1,epsilon=p2,decay=p3;g+=decay*param[i];state1[i]=beta1*state1[i]+(1.0-beta1)*g;state2[i]=max(beta2*state2[i],abs(g));param[i]-=learningRate/(1.0-pow(beta1,float(step)))*state1[i]/(state2[i]+epsilon);}else if(operation==4u){float beta1=p0,beta2=p1,epsilon=p2,decay=p3;g+=decay*param[i];state1[i]=beta1*state1[i]+(1.0-beta1)*g;state2[i]=beta2*state2[i]+(1.0-beta2)*g*g;float vh=state2[i]/(1.0-pow(beta2,float(step)));float nesterov=beta1*state1[i]/(1.0-pow(beta1,float(step+1u)))+(1.0-beta1)*g/(1.0-pow(beta1,float(step)));param[i]-=learningRate*nesterov/(sqrt(vh)+epsilon);}else{float l1=p0,l2=p1,beta=p2;float sigma=(sqrt(state2[i]+g*g)-sqrt(state2[i]))/learningRate;state1[i]+=g-sigma*param[i];state2[i]+=g*g;param[i]=abs(state1[i])<=l1?0.0:-(state1[i]-l1*sign(state1[i]))/(l2+(beta+sqrt(state2[i]))/learningRate);}}
+void main(){uint i=gl_GlobalInvocationID.x;if(i>=size)return;float g=gradient[i];if(operation<=1u){float beta1=p0,beta2=p1,epsilon=p2,decay=p3;if(operation==0u)g+=decay*param[i];else param[i]*=1.0-learningRate*decay;state1[i]=beta1*state1[i]+(1.0-beta1)*g;state2[i]=beta2*state2[i]+(1.0-beta2)*g*g;float mh=state1[i]/(vk_bias_correction(beta1,float(step))),vh=state2[i]/(vk_bias_correction(beta2,float(step)));param[i]-=learningRate*mh/(sqrt(vh)+epsilon);}else if(operation==2u){float rho=p0,epsilon=p1,decay=p2;g+=decay*param[i];state1[i]=rho*state1[i]+(1.0-rho)*g*g;float update=sqrt(state2[i]+epsilon)/sqrt(state1[i]+epsilon)*g;state2[i]=rho*state2[i]+(1.0-rho)*update*update;param[i]-=update;}else if(operation==3u){float beta1=p0,beta2=p1,epsilon=p2,decay=p3;g+=decay*param[i];state1[i]=beta1*state1[i]+(1.0-beta1)*g;state2[i]=max(beta2*state2[i],abs(g));param[i]-=learningRate/(vk_bias_correction(beta1,float(step)))*state1[i]/(state2[i]+epsilon);}else if(operation==4u){float beta1=p0,beta2=p1,epsilon=p2,decay=p3;g+=decay*param[i];state1[i]=beta1*state1[i]+(1.0-beta1)*g;state2[i]=beta2*state2[i]+(1.0-beta2)*g*g;float vh=state2[i]/(vk_bias_correction(beta2,float(step)));float nesterov=beta1*state1[i]/(vk_bias_correction(beta1,float(step+1u)))+(1.0-beta1)*g/(vk_bias_correction(beta1,float(step)));param[i]-=learningRate*nesterov/(sqrt(vh)+epsilon);}else{float l1=p0,l2=p1,beta=p2;float sigma=(sqrt(state2[i]+g*g)-sqrt(state2[i]))/learningRate;state1[i]+=g-sigma*param[i];state2[i]+=g*g;param[i]=abs(state1[i])<=l1?0.0:-(state1[i]-l1*sign(state1[i]))/(l2+(beta+sqrt(state2[i]))/learningRate);}}
 ";
 
     public static string Amsgrad => Header + @"
 layout(set=0,binding=0) buffer Param { float param[]; };layout(set=0,binding=1) readonly buffer Gradient { float gradient[]; };layout(set=0,binding=2) buffer M { float m[]; };layout(set=0,binding=3) buffer V { float v[]; };layout(set=0,binding=4) buffer VMax { float vmax[]; };
 layout(push_constant) uniform Params { uint size; uint step; float learningRate; float beta1; float beta2; float epsilon; float weightDecay; };
-void main(){uint i=gl_GlobalInvocationID.x;if(i>=size)return;float g=gradient[i]+weightDecay*param[i];m[i]=beta1*m[i]+(1.0-beta1)*g;v[i]=beta2*v[i]+(1.0-beta2)*g*g;vmax[i]=max(vmax[i],v[i]);float mh=m[i]/(1.0-pow(beta1,float(step)));param[i]-=learningRate*mh/(sqrt(vmax[i]/(1.0-pow(beta2,float(step))))+epsilon);}
+void main(){uint i=gl_GlobalInvocationID.x;if(i>=size)return;float g=gradient[i]+weightDecay*param[i];m[i]=beta1*m[i]+(1.0-beta1)*g;v[i]=beta2*v[i]+(1.0-beta2)*g*g;vmax[i]=max(vmax[i],v[i]);float mh=m[i]/(vk_bias_correction(beta1,float(step)));param[i]-=learningRate*mh/(sqrt(vmax[i]/(vk_bias_correction(beta2,float(step))))+epsilon);}
 ";
 
     public static string Lars => Header + @"
@@ -47,7 +47,7 @@ void main(){if(gl_GlobalInvocationID.x!=0u)return;float pn=0.0,gn=0.0;for(uint i
     public static string Lamb => Header + @"
 layout(set=0,binding=0) buffer Param { float param[]; };layout(set=0,binding=1) readonly buffer Gradient { float gradient[]; };layout(set=0,binding=2) buffer M { float m[]; };layout(set=0,binding=3) buffer V { float v[]; };
 layout(push_constant) uniform Params { uint size; uint step; float learningRate; float beta1; float beta2; float epsilon; float weightDecay; };
-void main(){if(gl_GlobalInvocationID.x!=0u)return;float bc1=1.0-pow(beta1,float(step)),bc2=1.0-pow(beta2,float(step));for(uint i=0u;i<size;++i){float g=gradient[i];m[i]=beta1*m[i]+(1.0-beta1)*g;v[i]=beta2*v[i]+(1.0-beta2)*g*g;}float pn=0.0,un=0.0;for(uint i=0u;i<size;++i){float update=m[i]/bc1/(sqrt(v[i]/bc2)+epsilon)+weightDecay*param[i];pn+=param[i]*param[i];un+=update*update;}float ratio=un>0.0?sqrt(pn)/sqrt(un):1.0;for(uint i=0u;i<size;++i){float update=m[i]/bc1/(sqrt(v[i]/bc2)+epsilon)+weightDecay*param[i];param[i]-=learningRate*ratio*update;}}
+void main(){if(gl_GlobalInvocationID.x!=0u)return;float bc1=vk_bias_correction(beta1,float(step)),bc2=vk_bias_correction(beta2,float(step));for(uint i=0u;i<size;++i){float g=gradient[i];m[i]=beta1*m[i]+(1.0-beta1)*g;v[i]=beta2*v[i]+(1.0-beta2)*g*g;}float pn=0.0,un=0.0;for(uint i=0u;i<size;++i){float update=m[i]/bc1/(sqrt(v[i]/bc2)+epsilon)+weightDecay*param[i];pn+=param[i]*param[i];un+=update*update;}float ratio=un>0.0?sqrt(pn)/sqrt(un):1.0;for(uint i=0u;i<size;++i){float update=m[i]/bc1/(sqrt(v[i]/bc2)+epsilon)+weightDecay*param[i];param[i]-=learningRate*ratio*update;}}
 ";
 
     public static string ConvertToFp16 => Header + @"
@@ -75,7 +75,7 @@ layout(set=0,binding=4) readonly buffer Indices { float indices[]; };
 layout(set=0,binding=5) readonly buffer Values { float values[]; };
 layout(push_constant) uniform Params { uint size; uint nnz; uint operation; uint step; float learningRate; float p0; float p1; float p2; float p3; };
 int decodeIndex(float raw){int bits=int(floatBitsToUint(raw));if(bits>=0&&uint(bits)<size)return bits;int numeric=int(raw);return numeric>=0&&uint(numeric)<size&&raw==float(numeric)?numeric:-1;}
-void main(){if(gl_GlobalInvocationID.x!=0u)return;float bc1=1.0-pow(p0,float(step)),bc2=1.0-pow(p1,float(step));
+void main(){if(gl_GlobalInvocationID.x!=0u)return;float bc1=vk_bias_correction(p0,float(step)),bc2=vk_bias_correction(p1,float(step));
     for(uint k=0u;k<nnz;++k){int decoded=decodeIndex(indices[k]);if(decoded<0)continue;uint i=uint(decoded);float g=values[k];
         if(operation==0u){if(p0>0.0)g+=p0*param[i];param[i]-=learningRate*g;}
         else if(operation==1u){if(p1>0.0)g+=p1*param[i];float value=p0*state1[i]+g;state1[i]=value;param[i]-=learningRate*value;}
@@ -87,7 +87,7 @@ void main(){if(gl_GlobalInvocationID.x!=0u)return;float bc1=1.0-pow(p0,float(ste
         else if(operation==8u){if(p3>0.0)g+=p3*param[i];float m=p0*state1[i]+(1.0-p0)*g,v=p1*state2[i]+(1.0-p1)*g*g;state1[i]=m;state2[i]=v;state3[i]=max(state3[i],v);param[i]-=learningRate*(m/bc1)/(sqrt(state3[i]/bc2)+p2);}
         else if(operation==9u){if(p3>0.0)g+=p3*param[i];float m=p0*state1[i]+(1.0-p0)*g,u=max(p1*state2[i],abs(g));state1[i]=m;state2[i]=u;param[i]-=(learningRate/bc1)*m/(u+p2);}
         else if(operation==10u){float value=p0*state1[i]+(1.0-p0)*g,update=sign(value);if(p2>0.0)update+=p2*param[i];param[i]-=learningRate*update;state1[i]=p1*state1[i]+(1.0-p1)*g;}
-        else if(operation==11u){if(p3>0.0)g+=p3*param[i];float m=p0*state1[i]+(1.0-p0)*g,v=p1*state2[i]+(1.0-p1)*g*g;state1[i]=m;state2[i]=v;float mh=p0*m/(1.0-pow(p0,float(step+1u)))+(1.0-p0)*g/bc1;param[i]-=learningRate*mh/(sqrt(v/bc2)+p2);}
+        else if(operation==11u){if(p3>0.0)g+=p3*param[i];float m=p0*state1[i]+(1.0-p0)*g,v=p1*state2[i]+(1.0-p1)*g*g;state1[i]=m;state2[i]=v;float mh=p0*m/(vk_bias_correction(p0,float(step+1u)))+(1.0-p0)*g/bc1;param[i]-=learningRate*mh/(sqrt(v/bc2)+p2);}
         else if(operation==12u){float old=state2[i],current=old+g*g;state2[i]=current;float sigma=(sqrt(current)-sqrt(old))/learningRate;state1[i]+=g-sigma*param[i];float z=state1[i];param[i]=abs(z)<=p0?0.0:((z>0.0?1.0:-1.0)*p0-z)/((p2+sqrt(current))/learningRate+p1);}
         else {float value=param[i]-learningRate*g,threshold=learningRate*p0;param[i]=value>threshold?value-threshold:(value<(-threshold)?value+threshold:0.0);}
     }

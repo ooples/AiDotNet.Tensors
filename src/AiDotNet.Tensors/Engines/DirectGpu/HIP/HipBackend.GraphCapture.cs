@@ -8,6 +8,8 @@ public sealed partial class HipBackend : IGpuGraphCapture
 
     bool IGpuGraphCapture.ContextIsLive => IsAvailable;
 
+    string? IGpuGraphCapture.LastCaptureFailure => null;
+
     bool IGpuGraphCapture.IsStreamCapturing() => false;
 
     int IGpuGraphCapture.StreamCaptureStatusRaw() => 0;
