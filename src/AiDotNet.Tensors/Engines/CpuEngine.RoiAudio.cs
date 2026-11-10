@@ -50,14 +50,11 @@ public partial class CpuEngine
         if (input.Rank != 4) throw new ArgumentException("RoIAlign input must be [N, C, H, W].");
         if (boxes.Rank != 2 || boxes._shape[1] != 5)
             throw new ArgumentException("RoIAlign boxes must be [K, 5] = (batch_idx, x1, y1, x2, y2).");
-        int N = input._shape[0], C = input._shape[1], H = input._shape[2], W = input._shape[3];
         int K = boxes._shape[0];
-        if (K == 0) return new Tensor<T>(new[] { K, C, outputHeight, outputWidth });
+        if (K == 0) return new Tensor<T>(new[] { K, input._shape[1], outputHeight, outputWidth });
 
         // Taps once per (RoI, bin), then a parallel gather over (RoI, channel); see RoIAlignPlan.
-        var pooled = RoIAlignPlan.Forward(RoIAlignPlan.ReadBoxes(boxes), N, H, W,
-            outputHeight, outputWidth, spatialScale, samplingRatio, aligned, RoIAlignPlan.ToDoubles(input), C);
-        return RoIAlignPlan.FromDoubles<T>(pooled, new[] { K, C, outputHeight, outputWidth });
+        return RoIAlignPlan.Forward(input, boxes, outputHeight, outputWidth, spatialScale, samplingRatio, aligned);
     }
 
     /// <summary>Bilinear sample with zero-padding (RoIAlign convention).</summary>

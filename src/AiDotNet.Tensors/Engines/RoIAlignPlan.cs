@@ -24,14 +24,20 @@ namespace AiDotNet.Tensors.Engines;
 /// <para>
 /// A plan covers a run of RoIs whose taps fit <see cref="TapBudget"/>; the static <c>Forward</c> and <c>Backward</c>
 /// build and run one run at a time. An adaptive sampling grid grows with the RoI, so a table for every RoI at once
-/// grew with the total sampled area: about 2 GB for 1,000 200x200 RoIs at scale 1.
+/// grew with the total sampled area: about 2 GB for 1,000 200x200 RoIs at scale 1. A single RoI whose taps alone pass
+/// the budget gets no table: its plan samples on the fly, adding the same terms in the table's order.
+/// </para>
+/// <para>
+/// Float and double tensors are read and written in place, accumulating in double; other element types go through a
+/// double copy. The backward accumulates one channel at a time in a double plane per image, so its temporary memory is
+/// a channel's worth per worker rather than a double copy of the whole gradient.
 /// </para>
 /// </remarks>
 internal sealed class RoIAlignPlan
 {
     /// <summary>
-    /// The most taps (12 bytes each) a plan holds, unless one RoI alone needs more: about 48 MB. A RoI's taps are at
-    /// most four per sample and its samples about its area in pixels, so a single RoI stays within a few channel planes.
+    /// The most taps (12 bytes each) a plan's table holds: about 48 MB. A RoI whose taps alone pass it is sampled
+    /// directly instead (see <see cref="IsDirect"/>).
     /// </summary>
     internal const long TapBudget = 1L << 22;
 
@@ -46,11 +52,29 @@ internal sealed class RoIAlignPlan
         Weights = weights;
     }
 
+    // A single RoI sampled on the fly.
+    private RoIAlignPlan(int roi, int image, RoiGrid grid, int outputHeight, int outputWidth, int height, int width)
+        : this(roi, 1, outputHeight * outputWidth, new[] { image }, Array.Empty<int>(), Array.Empty<int>(),
+            Array.Empty<double>())
+    {
+        IsDirect = true;
+        _grid = grid;
+        _outputWidth = outputWidth;
+        _height = height;
+        _width = width;
+    }
+
+    private readonly RoiGrid _grid;
+    private readonly int _outputWidth, _height, _width;
+
     /// <summary>The index, among all the call's RoIs, of this plan's first RoI.</summary>
     public int FirstRoi { get; }
 
     public int Rois { get; }
     public int Bins { get; }
+
+    /// <summary>A single RoI too large for a tap table, sampled on the fly; its table arrays are empty.</summary>
+    public bool IsDirect { get; }
 
     /// <summary>The image each RoI reads.</summary>
     public int[] Batch { get; }
@@ -64,29 +88,117 @@ internal sealed class RoIAlignPlan
     /// <summary>Weight of each tap, including the 1 / (ratioY * ratioX) average.</summary>
     public double[] Weights { get; }
 
+    /// <summary>RoIAlign of <paramref name="input"/> [N, C, H, W] over <paramref name="boxes"/> [K, 5].</summary>
+    public static Tensor<T> Forward<T>(Tensor<T> input, Tensor<T> boxes, int outputHeight, int outputWidth,
+        float spatialScale, int samplingRatio, bool aligned)
+    {
+        int images = input._shape[0], channels = input._shape[1], height = input._shape[2], width = input._shape[3];
+        var boxValues = ToDoubles(boxes);
+        var shape = new[] { boxValues.Length / 5, channels, outputHeight, outputWidth };
+        if (input is Tensor<float> floats)
+        {
+            var output = new Tensor<float>(shape);
+            using (var source = floats.LeaseArray())
+            using (var target = output.LeaseArray())
+                Forward<float, FloatElement>(boxValues, images, height, width, outputHeight, outputWidth, spatialScale,
+                    samplingRatio, aligned, source.Array, channels, target.Array, TapBudget);
+            return (Tensor<T>)(object)output;
+        }
+
+        if (input is Tensor<double> doubles)
+        {
+            var output = new Tensor<double>(shape);
+            using (var source = doubles.LeaseArray())
+            using (var target = output.LeaseArray())
+                Forward<double, DoubleElement>(boxValues, images, height, width, outputHeight, outputWidth, spatialScale,
+                    samplingRatio, aligned, source.Array, channels, target.Array, TapBudget);
+            return (Tensor<T>)(object)output;
+        }
+
+        var pooled = Forward(boxValues, images, height, width, outputHeight, outputWidth, spatialScale, samplingRatio,
+            aligned, ToDoubles(input), channels);
+        return FromDoubles<T>(pooled, shape);
+    }
+
+    /// <summary>The gradient, of shape <paramref name="inputShape"/>, of RoIAlign's input.</summary>
+    public static Tensor<T> Backward<T>(Tensor<T> gradOutput, Tensor<T> boxes, int[] inputShape, int outputHeight,
+        int outputWidth, float spatialScale, int samplingRatio, bool aligned)
+    {
+        int images = inputShape[0], channels = inputShape[1], height = inputShape[2], width = inputShape[3];
+        var boxValues = ToDoubles(boxes);
+        if (gradOutput is Tensor<float> floats)
+        {
+            var gradInput = new Tensor<float>(inputShape);
+            using (var source = floats.LeaseArray())
+            using (var target = gradInput.LeaseArray())
+                Backward<float, FloatElement>(boxValues, images, height, width, outputHeight, outputWidth, spatialScale,
+                    samplingRatio, aligned, source.Array, channels, target.Array, TapBudget);
+            return (Tensor<T>)(object)gradInput;
+        }
+
+        if (gradOutput is Tensor<double> doubles)
+        {
+            var gradInput = new Tensor<double>(inputShape);
+            using (var source = doubles.LeaseArray())
+            using (var target = gradInput.LeaseArray())
+                Backward<double, DoubleElement>(boxValues, images, height, width, outputHeight, outputWidth,
+                    spatialScale, samplingRatio, aligned, source.Array, channels, target.Array, TapBudget);
+            return (Tensor<T>)(object)gradInput;
+        }
+
+        var gradients = Backward(boxValues, images, height, width, outputHeight, outputWidth, spatialScale,
+            samplingRatio, aligned, ToDoubles(gradOutput), channels);
+        return FromDoubles<T>(gradients, inputShape);
+    }
+
     /// <summary>output[r, c, bin] for every RoI, building and gathering one budgeted run of RoIs at a time.</summary>
     public static double[] Forward(double[] boxes, int images, int height, int width, int outputHeight, int outputWidth,
-        float spatialScale, int samplingRatio, bool aligned, double[] input, int channels)
+        float spatialScale, int samplingRatio, bool aligned, double[] input, int channels, long tapBudget = TapBudget)
     {
         var output = new double[(boxes.Length / 5) * channels * outputHeight * outputWidth];
-        foreach (var plan in Plans(boxes, images, height, width, outputHeight, outputWidth, spatialScale, samplingRatio, aligned))
-            plan.Forward(input, channels, height * width, output);
+        Forward<double, DoubleElement>(boxes, images, height, width, outputHeight, outputWidth, spatialScale,
+            samplingRatio, aligned, input, channels, output, tapBudget);
         return output;
     }
 
     /// <summary>gradInput for every RoI, building and scattering one budgeted run of RoIs at a time.</summary>
     public static double[] Backward(double[] boxes, int images, int height, int width, int outputHeight, int outputWidth,
-        float spatialScale, int samplingRatio, bool aligned, double[] gradOutput, int channels)
+        float spatialScale, int samplingRatio, bool aligned, double[] gradOutput, int channels, long tapBudget = TapBudget)
     {
         var gradInput = new double[images * channels * height * width];
-        foreach (var plan in Plans(boxes, images, height, width, outputHeight, outputWidth, spatialScale, samplingRatio, aligned))
-            plan.Backward(gradOutput, channels, height * width, gradInput);
+        Backward<double, DoubleElement>(boxes, images, height, width, outputHeight, outputWidth, spatialScale,
+            samplingRatio, aligned, gradOutput, channels, gradInput, tapBudget);
         return gradInput;
     }
 
-    /// <summary>Consecutive runs of RoIs whose tap bound fits <see cref="TapBudget"/>; a run holds at least one RoI.</summary>
+    private static void Forward<TNum, TElement>(double[] boxes, int images, int height, int width, int outputHeight,
+        int outputWidth, float spatialScale, int samplingRatio, bool aligned, TNum[] input, int channels, TNum[] output,
+        long tapBudget)
+        where TElement : struct, IRoiElement<TNum>
+    {
+        foreach (var plan in Plans(boxes, images, height, width, outputHeight, outputWidth, spatialScale, samplingRatio,
+            aligned, tapBudget))
+            plan.Gather<TNum, TElement>(input, channels, height * width, output);
+    }
+
+    // gradInput must start zeroed: each plan adds its RoIs' contributions.
+    private static void Backward<TNum, TElement>(double[] boxes, int images, int height, int width, int outputHeight,
+        int outputWidth, float spatialScale, int samplingRatio, bool aligned, TNum[] gradOutput, int channels,
+        TNum[] gradInput, long tapBudget)
+        where TElement : struct, IRoiElement<TNum>
+    {
+        foreach (var plan in Plans(boxes, images, height, width, outputHeight, outputWidth, spatialScale, samplingRatio,
+            aligned, tapBudget))
+            plan.Scatter<TNum, TElement>(gradOutput, channels, height * width, gradInput);
+    }
+
+    /// <summary>
+    /// Consecutive runs of RoIs whose tap bound fits <paramref name="tapBudget"/>, each holding at least one RoI; a RoI
+    /// whose taps alone pass it gets a direct plan of its own.
+    /// </summary>
     internal static System.Collections.Generic.IEnumerable<RoIAlignPlan> Plans(double[] boxes, int images, int height,
-        int width, int outputHeight, int outputWidth, float spatialScale, int samplingRatio, bool aligned)
+        int width, int outputHeight, int outputWidth, float spatialScale, int samplingRatio, bool aligned,
+        long tapBudget = TapBudget)
     {
         int rois = boxes.Length / 5;
         long bins = (long)outputHeight * outputWidth;
@@ -96,12 +208,19 @@ internal sealed class RoIAlignPlan
         {
             var grid = Grid(boxes, r, outputHeight, outputWidth, spatialScale, samplingRatio, aligned);
             long roiTaps = 4L * grid.Ry * grid.Rx * bins;
-            if (r > first && taps + roiTaps > TapBudget)
+            if (r > first && taps + roiTaps > tapBudget)
             {
                 yield return Build(boxes, first, r - first, taps, images, height, width, outputHeight, outputWidth,
                     spatialScale, samplingRatio, aligned);
                 first = r;
                 taps = 0;
+            }
+
+            if (roiTaps > tapBudget)
+            {
+                yield return new RoIAlignPlan(r, ImageOf(boxes, r, images), grid, outputHeight, outputWidth, height, width);
+                first = r + 1;
+                continue;
             }
 
             taps += roiTaps;
@@ -110,6 +229,14 @@ internal sealed class RoIAlignPlan
         if (rois > first)
             yield return Build(boxes, first, rois - first, taps, images, height, width, outputHeight, outputWidth,
                 spatialScale, samplingRatio, aligned);
+    }
+
+    private static int ImageOf(double[] boxes, int r, int images)
+    {
+        int image = (int)boxes[r * 5];
+        if (image < 0 || image >= images)
+            throw new ArgumentException($"RoIAlign batch idx {image} out of range [0, {images}).");
+        return image;
     }
 
     // A RoI's sampling grid: its scaled corner, bin size, and samples per bin.
@@ -157,33 +284,32 @@ internal sealed class RoIAlignPlan
         int bins = outputHeight * outputWidth;
         var batch = new int[rois];
         var tapStart = new int[(rois * bins) + 1];
-        int capacity = (int)Math.Min(tapBound, int.MaxValue);
+        // The bound counts samples outside the image, which add no taps, so it sizes the lists only up to the budget.
+        int capacity = (int)Math.Min(tapBound, TapBudget);
         var offsets = new System.Collections.Generic.List<int>(capacity);
         var weights = new System.Collections.Generic.List<double>(capacity);
 
         for (int r = 0; r < rois; r++)
         {
-            int image = (int)boxes[(firstRoi + r) * 5];
-            if (image < 0 || image >= images)
-                throw new ArgumentException($"RoIAlign batch idx {image} out of range [0, {images}).");
-            batch[r] = image;
+            batch[r] = ImageOf(boxes, firstRoi + r, images);
             var grid = Grid(boxes, firstRoi + r, outputHeight, outputWidth, spatialScale, samplingRatio, aligned);
-            double y1 = grid.Y1, x1 = grid.X1, binH = grid.BinH, binW = grid.BinW;
-            int ry = grid.Ry, rx = grid.Rx;
-            double average = 1.0 / Math.Max((long)ry * rx, 1);
+            double average = Average(grid);
 
             for (int ph = 0; ph < outputHeight; ph++)
             {
                 for (int pw = 0; pw < outputWidth; pw++)
                 {
                     tapStart[(r * bins) + (ph * outputWidth) + pw] = offsets.Count;
-                    for (int iy = 0; iy < ry; iy++)
+                    for (int iy = 0; iy < grid.Ry; iy++)
                     {
-                        double sy = y1 + (ph * binH) + ((iy + 0.5) * binH / ry);
-                        for (int ix = 0; ix < rx; ix++)
+                        double sy = SampleY(grid, ph, iy);
+                        for (int ix = 0; ix < grid.Rx; ix++)
                         {
-                            double sx = x1 + (pw * binW) + ((ix + 0.5) * binW / rx);
-                            AddBilinear(offsets, weights, sy, sx, height, width, average);
+                            if (!Corners(sy, SampleX(grid, pw, ix), height, width, average, out var tap)) continue;
+                            offsets.Add(tap.O0); weights.Add(tap.W0);
+                            offsets.Add(tap.O1); weights.Add(tap.W1);
+                            offsets.Add(tap.O2); weights.Add(tap.W2);
+                            offsets.Add(tap.O3); weights.Add(tap.W3);
                         }
                     }
                 }
@@ -194,10 +320,44 @@ internal sealed class RoIAlignPlan
         return new RoIAlignPlan(firstRoi, rois, bins, batch, tapStart, offsets.ToArray(), weights.ToArray());
     }
 
-    private static void AddBilinear(System.Collections.Generic.List<int> offsets, System.Collections.Generic.List<double> weights,
-        double y, double x, int height, int width, double scale)
+    private static double Average(RoiGrid grid) => 1.0 / Math.Max((long)grid.Ry * grid.Rx, 1);
+
+    private static double SampleY(RoiGrid grid, int ph, int iy)
+        => grid.Y1 + (ph * grid.BinH) + ((iy + 0.5) * grid.BinH / grid.Ry);
+
+    private static double SampleX(RoiGrid grid, int pw, int ix)
+        => grid.X1 + (pw * grid.BinW) + ((ix + 0.5) * grid.BinW / grid.Rx);
+
+    // A sample's four bilinear taps: plane offsets, and weights already times the grid average.
+    private readonly struct Taps
     {
-        if (y < -1.0 || y > height || x < -1.0 || x > width) return;
+        public Taps(int o0, int o1, int o2, int o3, double w0, double w1, double w2, double w3)
+        {
+            O0 = o0;
+            O1 = o1;
+            O2 = o2;
+            O3 = o3;
+            W0 = w0;
+            W1 = w1;
+            W2 = w2;
+            W3 = w3;
+        }
+
+        public int O0 { get; }
+        public int O1 { get; }
+        public int O2 { get; }
+        public int O3 { get; }
+        public double W0 { get; }
+        public double W1 { get; }
+        public double W2 { get; }
+        public double W3 { get; }
+    }
+
+    // False for a sample outside [-1, size], which contributes nothing (but still counts in the average).
+    private static bool Corners(double y, double x, int height, int width, double scale, out Taps taps)
+    {
+        taps = default;
+        if (y < -1.0 || y > height || x < -1.0 || x > width) return false;
         if (y <= 0) y = 0;
         if (x <= 0) x = 0;
         int y0 = (int)y, x0 = (int)x;
@@ -206,18 +366,16 @@ internal sealed class RoIAlignPlan
         if (y0 >= height - 1) { y0 = y1 = height - 1; y = y0; }
         if (x0 >= width - 1) { x0 = x1 = width - 1; x = x0; }
         double ly = y - y0, lx = x - x0, hy = 1.0 - ly, hx = 1.0 - lx;
-        offsets.Add((y0 * width) + x0); weights.Add(hy * hx * scale);
-        offsets.Add((y0 * width) + x1); weights.Add(hy * lx * scale);
-        offsets.Add((y1 * width) + x0); weights.Add(ly * hx * scale);
-        offsets.Add((y1 * width) + x1); weights.Add(ly * lx * scale);
+        taps = new Taps((y0 * width) + x0, (y0 * width) + x1, (y1 * width) + x0, (y1 * width) + x1,
+            hy * hx * scale, hy * lx * scale, ly * hx * scale, ly * lx * scale);
+        return true;
     }
 
-    /// <summary>The boxes as doubles, read once.</summary>
-    public static double[] ReadBoxes<T>(Tensor<T> boxes) => ToDoubles(boxes);
-
     /// <summary>output[FirstRoi + r, c, bin] = sum of weight * input[batch[r], c, offset] over the bin's taps.</summary>
-    private void Forward(double[] input, int channels, int plane, double[] output)
+    private void Gather<TNum, TElement>(TNum[] input, int channels, int plane, TNum[] output)
+        where TElement : struct, IRoiElement<TNum>
     {
+        var element = default(TElement);
         long work = (long)Rois * channels * Bins * 16;
         CpuParallelSettings.ParallelForOrSerial(0, Rois * channels, work, item =>
         {
@@ -227,32 +385,123 @@ internal sealed class RoIAlignPlan
             for (int bin = 0; bin < Bins; bin++)
             {
                 double sum = 0;
-                int end = TapStart[(r * Bins) + bin + 1];
-                for (int t = TapStart[(r * Bins) + bin]; t < end; t++) sum += Weights[t] * input[planeBase + Offsets[t]];
-                output[outBase + bin] = sum;
+                if (IsDirect)
+                {
+                    // The table's terms in the table's order, computed instead of stored.
+                    int ph = bin / _outputWidth, pw = bin % _outputWidth;
+                    double average = Average(_grid);
+                    for (int iy = 0; iy < _grid.Ry; iy++)
+                    {
+                        double sy = SampleY(_grid, ph, iy);
+                        for (int ix = 0; ix < _grid.Rx; ix++)
+                        {
+                            if (!Corners(sy, SampleX(_grid, pw, ix), _height, _width, average, out var tap)) continue;
+                            sum += tap.W0 * element.ToDouble(input[planeBase + tap.O0]);
+                            sum += tap.W1 * element.ToDouble(input[planeBase + tap.O1]);
+                            sum += tap.W2 * element.ToDouble(input[planeBase + tap.O2]);
+                            sum += tap.W3 * element.ToDouble(input[planeBase + tap.O3]);
+                        }
+                    }
+                }
+                else
+                {
+                    int end = TapStart[(r * Bins) + bin + 1];
+                    for (int t = TapStart[(r * Bins) + bin]; t < end; t++)
+                        sum += Weights[t] * element.ToDouble(input[planeBase + Offsets[t]]);
+                }
+
+                output[outBase + bin] = element.FromDouble(sum);
             }
-        });
+        }, deterministicSafe: true);
     }
 
-    /// <summary>gradInput[batch[r], c, offset] += weight * gradOutput[FirstRoi + r, c, bin]; one thread per channel.</summary>
-    private void Backward(double[] gradOutput, int channels, int plane, double[] gradInput)
+    /// <summary>
+    /// gradInput[batch[r], c, offset] += weight * gradOutput[FirstRoi + r, c, bin]: one channel per worker, summed in a
+    /// double plane per image the plan reads, then added to gradInput once.
+    /// </summary>
+    private void Scatter<TNum, TElement>(TNum[] gradOutput, int channels, int plane, TNum[] gradInput)
+        where TElement : struct, IRoiElement<TNum>
     {
+        var element = default(TElement);
+        var images = new System.Collections.Generic.List<int>();
+        var slots = new System.Collections.Generic.Dictionary<int, int>();
+        var scratchBase = new int[Rois];
+        for (int r = 0; r < Rois; r++)
+        {
+            if (!slots.TryGetValue(Batch[r], out int slot))
+            {
+                slot = images.Count;
+                slots[Batch[r]] = slot;
+                images.Add(Batch[r]);
+            }
+
+            scratchBase[r] = slot * plane;
+        }
+
         long work = (long)Rois * channels * Bins * 16;
         CpuParallelSettings.ParallelForOrSerial(0, channels, work, c =>
         {
+            var scratch = new double[images.Count * plane];
             for (int r = 0; r < Rois; r++)
             {
-                int planeBase = ((Batch[r] * channels) + c) * plane;
+                int planeBase = scratchBase[r];
                 int gradBase = (((FirstRoi + r) * channels) + c) * Bins;
                 for (int bin = 0; bin < Bins; bin++)
                 {
-                    double g = gradOutput[gradBase + bin];
+                    double g = element.ToDouble(gradOutput[gradBase + bin]);
                     if (g == 0) continue;
-                    int end = TapStart[(r * Bins) + bin + 1];
-                    for (int t = TapStart[(r * Bins) + bin]; t < end; t++) gradInput[planeBase + Offsets[t]] += Weights[t] * g;
+                    if (IsDirect)
+                    {
+                        int ph = bin / _outputWidth, pw = bin % _outputWidth;
+                        double average = Average(_grid);
+                        for (int iy = 0; iy < _grid.Ry; iy++)
+                        {
+                            double sy = SampleY(_grid, ph, iy);
+                            for (int ix = 0; ix < _grid.Rx; ix++)
+                            {
+                                if (!Corners(sy, SampleX(_grid, pw, ix), _height, _width, average, out var tap)) continue;
+                                scratch[planeBase + tap.O0] += tap.W0 * g;
+                                scratch[planeBase + tap.O1] += tap.W1 * g;
+                                scratch[planeBase + tap.O2] += tap.W2 * g;
+                                scratch[planeBase + tap.O3] += tap.W3 * g;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        int end = TapStart[(r * Bins) + bin + 1];
+                        for (int t = TapStart[(r * Bins) + bin]; t < end; t++)
+                            scratch[planeBase + Offsets[t]] += Weights[t] * g;
+                    }
                 }
             }
-        });
+
+            for (int i = 0; i < images.Count; i++)
+            {
+                int target = ((images[i] * channels) + c) * plane, source = i * plane;
+                for (int p = 0; p < plane; p++)
+                    gradInput[target + p] = element.FromDouble(element.ToDouble(gradInput[target + p]) + scratch[source + p]);
+            }
+        }, deterministicSafe: true);
+    }
+
+    /// <summary>Reads and writes one element type as double; a struct per type keeps the kernels typed.</summary>
+    internal interface IRoiElement<TNum>
+    {
+        double ToDouble(TNum value);
+        TNum FromDouble(double value);
+    }
+
+    private readonly struct FloatElement : IRoiElement<float>
+    {
+        public double ToDouble(float value) => value;
+        public float FromDouble(double value) => (float)value;
+    }
+
+    private readonly struct DoubleElement : IRoiElement<double>
+    {
+        public double ToDouble(double value) => value;
+        public double FromDouble(double value) => value;
     }
 
     /// <summary>A tensor's values as doubles: a typed span read for float and double.</summary>

@@ -9688,13 +9688,10 @@ internal static class BackwardFunctions<T>
     private static Tensor<T> RoIAlignBackwardImpl(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> boxes,
         int outH, int outW, float spatialScale, int samplingRatio, bool aligned)
     {
-        int N = input._shape[0], C = input._shape[1], H = input._shape[2], W = input._shape[3];
         if (boxes._shape[0] == 0) return new Tensor<T>(input._shape);
 
         // The forward's taps scattered back, parallel over channels so overlapping RoIs never race; see RoIAlignPlan.
-        var gradInput = RoIAlignPlan.Backward(RoIAlignPlan.ReadBoxes(boxes), N, H, W, outH, outW, spatialScale,
-            samplingRatio, aligned, RoIAlignPlan.ToDoubles(gradOutput), C);
-        return RoIAlignPlan.FromDoubles<T>(gradInput, input._shape);
+        return RoIAlignPlan.Backward(gradOutput, boxes, input._shape, outH, outW, spatialScale, samplingRatio, aligned);
     }
 
     private static void ScatterBilinear(Span<T> dst, int planeBase,
