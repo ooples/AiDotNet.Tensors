@@ -90,6 +90,49 @@ public class CompiledTraceTimeOperandTests
         }, new[] { k, b });
     }
 
+    // A persistent tensor written in place (a running statistic) and read, through a recorded add, by an op whose
+    // node is built from a trace-time run. Realizing that operand at trace time runs the write; the plan then runs
+    // it again each step, so unless the trace puts the tensor back, the first step starts from a doubled state.
+    [Fact]
+    public void TraceTimeEagerOp_OnAnInPlaceWrittenPersistentTensor_WritesItOncePerStep()
+    {
+        var x = new Tensor<float>(new[] { 1, 1, 4, 4 });
+        var k = new Tensor<float>(new[] { 4, 1, 3, 3 });
+        var state = new Tensor<float>(new[] { 1, 4, 4, 4 });
+        var w = new Tensor<float>(new[] { 1, 4, 2, 2 });
+        Fill(x, 21); Fill(k, 22); Fill(state, 23); Fill(w, 24);
+        var initial = state.ToArray();
+        var one = new[] { 1, 1 };
+        var engine = new CpuEngine();
+        var prior = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = engine;
+        try
+        {
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.EnableTraining(new[] { k }))
+            {
+                engine.TensorMultiplyScalarInPlace(state, 2f);
+                var y = engine.MaxPool2DWithTensorIndices(engine.TensorAdd(engine.Conv2D(x, k, one, one, one), state),
+                    new[] { 2, 2 }, new[] { 2, 2 }, out _);
+                engine.ReduceSum(engine.TensorMultiply(y, w), null, false);
+                plan = scope.CompileTraining(new[] { k });
+            }
+            using (plan)
+            {
+                Assert.Equal(initial, state.ToArray());
+                plan.Step();
+                var stepped = state.ToArray();
+                for (int i = 0; i < initial.Length; i++)
+                    Assert.True(Math.Abs(2 * initial[i] - stepped[i]) <= 1e-6f,
+                        $"state[{i}]: initial {initial[i]:R}, after one step {stepped[i]:R}, expected {2 * initial[i]:R}");
+            }
+        }
+        finally
+        {
+            AiDotNetEngine.Current = prior;
+        }
+    }
+
     private static void AssertFirstStepsMatchTheTape(Func<IEngine, Tensor<float>> loss, Tensor<float>[] parameters)
     {
         var engine = new CpuEngine();
