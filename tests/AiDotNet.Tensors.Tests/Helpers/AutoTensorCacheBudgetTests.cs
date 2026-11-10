@@ -11,10 +11,10 @@ public class AutoTensorCacheBudgetTests
 {
     /// <summary>
     /// The per-shape copy limits bound each shape, not the total: before the aggregate cap, every distinct shape a
-    /// model produced kept its copies for the life of the thread (438 MB in AiDotNet's FasterRCNN training).
+    /// model produced kept its copies for the life of the thread.
     /// </summary>
     [Fact]
-    public void Return_StopsPoolingAtTheThreadsByteBudget()
+    public void Return_StopsPoolingAtTheByteBudget()
     {
         long prior = AutoTensorCache.MaxPooledBytes;
         try
@@ -45,11 +45,38 @@ public class AutoTensorCacheBudgetTests
     }
 
     /// <summary>
-    /// Clear empties every thread's pools but runs on one thread: another thread's counters must not keep it refusing
+    /// The budget is shared by every thread: the pools are per thread, and a parallel kernel's workers each filled
+    /// their own, so a per-thread budget multiplied by the worker count.
+    /// </summary>
+    [Fact]
+    public void Budget_IsSharedAcrossThreads()
+    {
+        long prior = AutoTensorCache.MaxPooledBytes;
+        try
+        {
+            AutoTensorCache.Clear();
+            AutoTensorCache.MaxPooledBytes = 1000 * sizeof(float);
+            var worker = new Thread(() => AutoTensorCache.Return(new Tensor<float>(new[] { 25, 40 })));
+            worker.Start();
+            worker.Join();
+
+            var mine = new Tensor<float>(new[] { 40, 25 });
+            AutoTensorCache.Return(mine);
+            Assert.NotSame(mine, AutoTensorCache.RentOrAllocate<float>(new[] { 40, 25 }));
+        }
+        finally
+        {
+            AutoTensorCache.MaxPooledBytes = prior;
+            AutoTensorCache.Clear();
+        }
+    }
+
+    /// <summary>
+    /// Clear empties every thread's pools but runs on one thread: this thread's shape counts must not keep it refusing
     /// buffers as if its emptied pools were still full.
     /// </summary>
     [Fact]
-    public void Clear_FromAnotherThread_ResetsThisThreadsBudget()
+    public void Clear_FromAnotherThread_ResetsThisThreadsShapeCounts()
     {
         long prior = AutoTensorCache.MaxPooledBytes;
         try
