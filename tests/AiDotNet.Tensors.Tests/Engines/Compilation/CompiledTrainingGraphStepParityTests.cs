@@ -1200,6 +1200,96 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     }
 
     /// <summary>
+    /// A requested input gradient (AIDOTNET_COMPILED_INPUT_GRADS) is read through the leaf's <c>.Grad</c> after the
+    /// step, like a parameter's gradient, so retiring a replayed plan must keep it too. Both retirement paths treated
+    /// only the parameters' gradients as results: Dispose (LandGradientsOnHost) detached the leaf gradient from its
+    /// array's pending download, and DisableGraphStep (RollBackCaptureResidency) unbound it without landing it, so a
+    /// leaf gradient nobody had read yet came back as the host's stale values. The reference is an identical run
+    /// that reads the leaf gradient before retiring the plan.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(PlanRetirement.DisposeEager)]
+    [InlineData(PlanRetirement.DisposeAfterReplay)]
+    [InlineData(PlanRetirement.DisableGraphStepAfterReplay)]
+    public void Retiring_a_gpu_plan_keeps_an_unread_requested_input_gradient(PlanRetirement retirement)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            bool replay = retirement != PlanRetirement.DisposeEager;
+            // The eager case runs on every GPU backend: Dispose lands the results whenever the context is live.
+            if (replay) Skip.IfNot(TryCudaCapture(gpu), "Whole-step graph capture is CUDA-only or disabled.");
+            float[] Run(bool readBeforeRetiring)
+            {
+                var x = Rand([Inputs, 512], 21, 1f);
+                var y = Rand([Hidden, 512], 22, 1f);
+                var w1 = Rand([Hidden, Inputs], 23, 0.3f);
+                var w2 = Rand([Hidden, Hidden], 24, 0.3f);
+                w1.Gpu(); w2.Gpu();
+                ICompiledTrainingPlan<float> plan;
+                bool? previous = CompiledTrainingPlan<float>.CompiledInputGradientsForTests;
+                CompiledTrainingPlan<float>.CompiledInputGradientsForTests = true;
+                try
+                {
+                    using var scope = GraphMode.EnableTraining(new[] { w1, w2 });
+                    var h = gpu.Tanh(gpu.TensorMatMul(w1, x));
+                    var o = gpu.Tanh(gpu.TensorMatMul(w2, h));
+                    var diff = gpu.TensorSubtract(o, y);
+                    gpu.ReduceMean(gpu.TensorMultiply(diff, diff), new[] { 0, 1 }, keepDims: false);
+                    plan = scope.CompileTraining(new[] { w1, w2 });
+                }
+                finally
+                {
+                    CompiledTrainingPlan<float>.CompiledInputGradientsForTests = previous;
+                }
+                var concrete = (CompiledTrainingPlan<float>)plan;
+                try
+                {
+                    if (!replay) concrete.DisableGraphStep();
+                    plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
+                    for (int s = 0; s < Steps; s++) { FeedBatch(x, y, s); plan.Step(); }
+                    if (replay) AssertGraphCaptured(concrete);
+                    if (x.Grad is not { } leafGradient)
+                    {
+                        Assert.Fail("the requested input leaf got no .Grad");
+                        return Array.Empty<float>();
+                    }
+                    float[]? early = readBeforeRetiring ? leafGradient.ToArray() : null;
+                    if (retirement == PlanRetirement.DisableGraphStepAfterReplay) concrete.DisableGraphStep();
+                    else plan.Dispose();
+                    if (early is not null) return early;
+                    // The leaf may publish a new tensor at retirement; whatever .Grad holds now is what a reader gets.
+                    var after = x.Grad ?? leafGradient;
+                    return after.ToArray();
+                }
+                finally
+                {
+                    plan.Dispose();
+                }
+            }
+            var reference = Run(readBeforeRetiring: true);
+            var retired = Run(readBeforeRetiring: false);
+            Assert.Contains(reference, v => v != 0f);
+            Assert.Equal(reference.Length, retired.Length);
+            for (int i = 0; i < reference.Length; i++)
+                Assert.True(Math.Abs(reference[i] - retired[i]) <= 1e-5f,
+                    $"x.Grad[{i}] read after {retirement} {retired[i]} != read before {reference[i]}");
+        }
+    }
+
+    /// <summary>How a test retires a compiled plan.</summary>
+    public enum PlanRetirement
+    {
+        /// <summary>Dispose a plan that trained eagerly (no captured graph).</summary>
+        DisposeEager,
+        /// <summary>Dispose a plan replaying a captured whole-step graph.</summary>
+        DisposeAfterReplay,
+        /// <summary>Retire a replaying plan's graph and keep the plan.</summary>
+        DisableGraphStepAfterReplay,
+    }
+
+    /// <summary>
     /// L2 regularization must land where the optimizer reads each gradient. It used to be written on the device
     /// whenever the gradient and parameter merely HAD device buffers, while the optimizer reads the host gradient
     /// unless the device copy is current and the parameter is resident - with mixed residency the term was silently
