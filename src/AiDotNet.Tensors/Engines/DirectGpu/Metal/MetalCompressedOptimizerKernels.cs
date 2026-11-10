@@ -19,21 +19,7 @@ internal static class MetalCompressedOptimizerKernels
         "using namespace metal;" + System.Environment.NewLine + Compilation.DynamicQuantizationCodebook.KernelPrelude(
             Compilation.DynamicQuantizationCodebook.KernelLanguage.Metal));
 
-    private const string RawSource = @"
-#include <metal_stdlib>
-using namespace metal;
-
-// 1 - beta^t without cancellation (see CudaOptimizerKernels.bias_correction). MSL has no expm1, so Kahan's form:
-// expm1(x) = (e - 1) * x / log(e) with e = exp(x), on the precise functions (fast math would undo the point).
-// 1 - beta is exact for beta in [0.5, 1], so log1p(-(1 - beta)) is log(beta).
-static inline float mtl_cmp_bias_correction(float beta, float t) {
-    float x = t * precise::log(beta);
-    float e = precise::exp(x);
-    if (e == 1.0f) return -x;
-    float em1 = e - 1.0f;
-    if (em1 == -1.0f) return 1.0f;
-    return -(em1 * (x / precise::log(e)));
-}
+    private const string RawSource = MetalBiasCorrectionPrelude.Source + @"
 static inline float bf16_to_float(uint x) { return as_type<float>(x << 16); }
 static inline uint float_to_bf16_rne(float x) {
     uint bits = as_type<uint>(x);
@@ -62,8 +48,8 @@ kernel void adam_bf16(
     uint base = w * 2u;
     if (base >= size) { return; }
 
-    float bc1 = mtl_cmp_bias_correction(beta1, (float)step);
-    float bc2 = mtl_cmp_bias_correction(beta2, (float)step);
+    float bc1 = mtl_bias_correction(beta1, (float)step);
+    float bc2 = mtl_bias_correction(beta2, (float)step);
     bool firstStep = step <= 1u;
 
     uint mword = m_bits[w];

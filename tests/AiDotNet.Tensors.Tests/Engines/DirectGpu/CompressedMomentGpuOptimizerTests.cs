@@ -685,6 +685,67 @@ public sealed class CompressedMomentGpuOptimizerTests :
         }
     }
 
+    // 1 - beta^t near beta = 1 (#1703 review). With zero moments every Adam variant's update at step t is
+    // lr * ((1 - b1) g / c1(t)) / (sqrt((1 - b2) g^2 / c2(t)) + eps), so one call at step t isolates the corrections. The
+    // naive 1 - pow(beta, t) loses ~3e-4 relative at beta = 0.9999, t = 2 (pow's rounding, divided by 1 - beta^t ~ 2e-4);
+    // the cancellation-free form holds a few ulps. The name carries "Metal" so the macOS lane's filter selects it; the
+    // Vulkan rows exercise beta2 = 0.999 at step one on whatever driver the machine has.
+    [SkippableTheory]
+    [MemberData(nameof(Backends))]
+    public void BiasCorrectionNearBetaOne_MatchesDoubleReference_OnMetalVulkanAndCuda(BackendKind kind)
+    {
+        var acquired = _backends.Get(kind);
+        var backend = RequireReady(kind, acquired, requiresGlslCompiler: true);
+        var compressed = backend as ICompressedMomentGpuOptimizerBackend;
+
+        const int length = 37;
+        const float lr = 0.01f;
+        const float eps = 1e-10f;
+        const double relativeTolerance = 2e-5;
+        var grad = Gradient(length);
+        float[] betas = { 0.9f, 0.99f, 0.999f, 0.9999f };
+        int[] steps = { 1, 2, 10, 1000 };
+        foreach (float beta1 in betas)
+        foreach (float beta2 in betas)
+        foreach (int step in steps)
+        {
+            double c1 = 1 - Math.Pow(beta1, step), c2 = 1 - Math.Pow(beta2, step);
+            var expected = new double[length];
+            for (int i = 0; i < length; i++)
+            {
+                double m = (1.0 - beta1) * grad[i], v = (1.0 - beta2) * grad[i] * (double)grad[i];
+                expected[i] = -lr * (m / c1) / (Math.Sqrt(v / c2) + eps);
+            }
+
+            using var param = backend.AllocateBuffer(new float[length]);
+            using var g = backend.AllocateBuffer(grad);
+            using var m32 = backend.AllocateBuffer(new float[length]);
+            using var v32 = backend.AllocateBuffer(new float[length]);
+            backend.AdamUpdate(param, g, m32, v32, lr, beta1, beta2, eps, 0f, step, length);
+            AssertRelative(expected, backend.DownloadBuffer(param), relativeTolerance, $"{kind} fp32 Adam b1={beta1} b2={beta2} t={step}");
+
+            if (compressed is null) continue;
+            using var paramBf16 = backend.AllocateBuffer(new float[length]);
+            using var mBf16 = backend.AllocateByteBuffer(length * sizeof(ushort));
+            using var vBf16 = backend.AllocateByteBuffer(length * sizeof(ushort));
+            // A byte buffer is not zeroed on allocation, and the kernel reads the stored moments after step one.
+            backend.UploadByteBuffer(mBf16, new byte[length * sizeof(ushort)]);
+            backend.UploadByteBuffer(vBf16, new byte[length * sizeof(ushort)]);
+            compressed.AdamUpdateBf16(paramBf16, g, mBf16, vBf16, lr, beta1, beta2, eps, 0f, step, length);
+            AssertRelative(expected, backend.DownloadBuffer(paramBf16), relativeTolerance, $"{kind} bf16 Adam b1={beta1} b2={beta2} t={step}");
+        }
+    }
+
+    private static void AssertRelative(double[] expected, float[] actual, double tolerance, string label)
+    {
+        for (int i = 0; i < expected.Length; i++)
+        {
+            double error = Math.Abs(actual[i] - expected[i]);
+            Assert.True(error <= tolerance * Math.Abs(expected[i]) + 1e-12,
+                $"{label}: element {i} is {actual[i]:G9}, expected {expected[i]:G9} (relative error {error / Math.Max(Math.Abs(expected[i]), 1e-30):E2}).");
+        }
+    }
+
     private static IDirectGpuBackend RequireReady(
         BackendKind kind,
         AcquiredBackend acquired,

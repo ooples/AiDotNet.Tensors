@@ -6,10 +6,7 @@ internal static class VulkanOptimizerKernels
 {
     private const string Header = @"#version 450
 layout(local_size_x = 256) in;
-
-// 1 - beta^t without cancellation (see CudaOptimizerKernels.bias_correction): pow's error, subtracted from 1, grows by
-// 1/(1 - beta). GLSL has no expm1, so Kahan's form; precise keeps the compiler from reassociating it.
-float vk_bias_correction(float beta, float t){precise float x=t*log(beta);precise float e=exp(x);if(e==1.0)return -x;precise float em1=e-1.0;if(em1==-1.0)return 1.0;return -(em1*(x/log(e)));}";
+" + VulkanBiasCorrection.Glsl;
 
     public static string TwoBuffer => Header + @"
 layout(set=0,binding=0) buffer Param { float param[]; };
