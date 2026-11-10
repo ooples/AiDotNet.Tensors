@@ -284,12 +284,63 @@ jobs:
         if ($watchdog -lt $deadline) { $deadline = $watchdog }
         Write-Output "Watchdog deadline: $($deadline.ToUniversalTime().ToString('u')) (job started $($jobStart.ToUniversalTime().ToString('u')))."
 
+        # The same suites took 69 to 96 minutes on some nights and passed the 120-minute watchdog on others. On
+        # 2026-11-08 the GPU tests ran up to 2.6x slower than on 2026-11-06 for the first 40 minutes only, the CPU-only
+        # tests 1.12x, with no other job on the runner, so the extra load came from outside the run. nvidia-smi samples
+        # the GPU every 30 seconds into the uploaded results: the processes holding a CUDA context, and the GPU's
+        # utilization, SM clock, temperature, power and clock-event (throttle) reasons. A slow run then shows whether
+        # another workload shared the GPU or the clocks dropped. Newer drivers name the reasons field
+        # clocks_event_reasons; older ones only accept clocks_throttle_reasons.
+        $samples = "${{ runner.temp }}/trx"
+        $reasons = 'clocks_event_reasons.active'
+        nvidia-smi --query-gpu=$reasons --format=csv,noheader 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { $reasons = 'clocks_throttle_reasons.active' }
+        $gpuFields = "timestamp,utilization.gpu,memory.used,clocks.sm,clocks.max.sm,temperature.gpu,power.draw,$reasons"
+        $samplers = @(
+          (Start-Process nvidia-smi -ArgumentList "--query-gpu=$gpuFields --format=csv -l 30 -f `"$samples/gpu-samples.csv`"" -NoNewWindow -PassThru),
+          (Start-Process nvidia-smi -ArgumentList "--query-compute-apps=timestamp,pid,process_name,used_memory --format=csv -l 30 -f `"$samples/gpu-processes.csv`"" -NoNewWindow -PassThru))
+        function Stop-GpuSampling {
+          foreach ($sampler in $samplers) { Stop-Process -Id $sampler.Id -Force -ErrorAction SilentlyContinue }
+          $rows = @(Import-Csv "$samples/gpu-samples.csv" -ErrorAction SilentlyContinue)
+          if ($rows.Count -eq 0) { Write-Output "::warning::nvidia-smi recorded no GPU samples."; return }
+          # Columns carry their unit ("clocks.current.sm [MHz]"); the value is the number before the unit.
+          function Read-Number($row, $prefix) {
+            $column = $row.PSObject.Properties | Where-Object { $_.Name.Trim() -like "$prefix*" } | Select-Object -First 1
+            $value = 0.0
+            if ($column -and [double]::TryParse(($column.Value.Trim() -split ' ')[0], [ref]$value)) { return $value }
+            return $null
+          }
+          $clocks = @($rows | ForEach-Object { Read-Number $_ 'clocks.current.sm' } | Where-Object { $null -ne $_ })
+          $temps = @($rows | ForEach-Object { Read-Number $_ 'temperature.gpu' } | Where-Object { $null -ne $_ })
+          $maxClock = Read-Number $rows[0] 'clocks.max.sm'
+          # 0x1 is GPU idle; any other bit (power cap, thermal, HW slowdown, applications clocks) lowered the clocks.
+          $limited = @($rows | Where-Object {
+            $column = $_.PSObject.Properties | Where-Object { $_.Name.Trim() -like 'clocks_*reasons*' } | Select-Object -First 1
+            $bits = [uint64]0
+            $column -and [uint64]::TryParse(($column.Value.Trim() -replace '^0x', ''),
+              [Globalization.NumberStyles]::HexNumber, [Globalization.CultureInfo]::InvariantCulture, [ref]$bits) -and
+              ($bits -shr 1) -ne 0 }).Count
+          $line = "GPU samples: $($rows.Count); SM clock $(($clocks | Measure-Object -Minimum).Minimum)-" +
+            "$(($clocks | Measure-Object -Maximum).Maximum) of $maxClock MHz; peak $(($temps | Measure-Object -Maximum).Maximum) C; " +
+            "$limited samples with a clock-lowering reason."
+          $line | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
+          # Processes with a CUDA context that are not this run's dotnet or test host shared the GPU.
+          $others = @(Import-Csv "$samples/gpu-processes.csv" -ErrorAction SilentlyContinue | ForEach-Object {
+            $name = $_.PSObject.Properties | Where-Object { $_.Name.Trim() -eq 'process_name' } | Select-Object -First 1
+            if ($name) { Split-Path -Leaf $name.Value.Trim() } } |
+            Where-Object { $_ -and $_ -notmatch '^(testhost|dotnet)(\.exe)?$' } | Sort-Object -Unique)
+          if ($others.Count -gt 0) {
+            Write-Output "::warning::Other processes held a CUDA context on this GPU during the suites: $($others -join ', ')."
+          }
+        }
+
         $run = Start-Process dotnet -ArgumentList $testArgs -NoNewWindow -PassThru
         $null = $run.Handle   # cache the handle so ExitCode is readable after the process exits
         $waitMs = [Math]::Max(0, [int]($deadline - (Get-Date)).TotalMilliseconds)
-        if ($run.WaitForExit($waitMs)) { exit $run.ExitCode }
+        if ($run.WaitForExit($waitMs)) { Stop-GpuSampling; exit $run.ExitCode }
 
         Write-Output "::error::The GPU suites were still running at the watchdog deadline."
+        Stop-GpuSampling
         try {
           # Only this run's processes: walk the tree down from dotnet test, so another workload's test host on the
           # runner is never inspected. Ids, parents and names only (a command line could carry a credential).
