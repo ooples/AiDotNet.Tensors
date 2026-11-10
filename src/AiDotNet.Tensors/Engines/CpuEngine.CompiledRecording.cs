@@ -95,9 +95,8 @@ public partial class CpuEngine
     // uninitialized memory under a compiled step's fresh allocations, and a first-step loss that changed run to run.
     private static void RealizeOperands<T>(List<Tensor<T>> operands)
     {
-        foreach (var operand in operands)
-            if (operand.LazySource is ILazyNode node && !node.IsRealized)
-                node.Realize(node.RecordingEngine);
+        foreach (var node in operands.Select(operand => operand.LazySource).OfType<ILazyNode>().Where(lazy => !lazy.IsRealized))
+            node.Realize(node.RecordingEngine);
     }
 
     // A plan's buffers have the trace's shapes. An op whose output shape depends on data (MaskedSelect counts its
