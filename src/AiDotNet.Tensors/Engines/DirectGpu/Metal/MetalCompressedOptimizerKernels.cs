@@ -19,10 +19,7 @@ internal static class MetalCompressedOptimizerKernels
         "using namespace metal;" + System.Environment.NewLine + Compilation.DynamicQuantizationCodebook.KernelPrelude(
             Compilation.DynamicQuantizationCodebook.KernelLanguage.Metal));
 
-    private const string RawSource = @"
-#include <metal_stdlib>
-using namespace metal;
-
+    private const string RawSource = MetalBiasCorrectionPrelude.Source + @"
 static inline float bf16_to_float(uint x) { return as_type<float>(x << 16); }
 static inline uint float_to_bf16_rne(float x) {
     uint bits = as_type<uint>(x);
@@ -51,8 +48,8 @@ kernel void adam_bf16(
     uint base = w * 2u;
     if (base >= size) { return; }
 
-    float bc1 = 1.0f - pow(beta1, (float)step);
-    float bc2 = 1.0f - pow(beta2, (float)step);
+    float bc1 = mtl_bias_correction(beta1, (float)step);
+    float bc2 = mtl_bias_correction(beta2, (float)step);
     bool firstStep = step <= 1u;
 
     uint mword = m_bits[w];

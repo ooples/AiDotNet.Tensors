@@ -871,10 +871,48 @@ public sealed class TensorArena : IDisposable
         return true;
     }
 
+    /// <summary>
+    /// Whether another pass holds the issue log, so a second owner can decline before taking anything else. The forward
+    /// activation log records through the same slot until a recycler takes it, so it is not another pass's log.
+    /// </summary>
+    internal bool IssueLogOpen => _issueLog is not null && !ReferenceEquals(_issueLog, _forwardLog?.Buffers);
+
     /// <summary>Stops recording issued buffers into <paramref name="log"/>; a log another owner opened stays open.</summary>
     internal void CloseIssueLog(List<IssuedBuffer> log)
     {
         if (ReferenceEquals(_issueLog, log)) _issueLog = null;
+    }
+
+    /// <summary>
+    /// The buffers a training step's forward pass rented, for a tape that hands its activations back during backward
+    /// (<see cref="Engines.Autodiff.GradientTapeOptions.ReleaseActivationsDuringBackward"/>).
+    /// </summary>
+    internal sealed class ForwardActivationLog
+    {
+        /// <summary>Every buffer issued between the tape's construction and its backward.</summary>
+        internal readonly List<IssuedBuffer> Buffers = new();
+
+        /// <summary>A backward returned some of them, so the forward's tensors no longer hold their values.</summary>
+        internal bool Released;
+    }
+
+    private ForwardActivationLog? _forwardLog;
+
+    /// <summary>Records every buffer issued from now on into <paramref name="log"/>, until it is taken.</summary>
+    internal void OpenForwardActivationLog(ForwardActivationLog log)
+    {
+        _forwardLog = log;
+        _issueLog = log.Buffers;
+    }
+
+    /// <summary>Stops recording the forward pass and hands its log to the caller; null when none is open.</summary>
+    internal ForwardActivationLog? TakeForwardActivationLog()
+    {
+        var log = _forwardLog;
+        if (log is null) return null;
+        _forwardLog = null;
+        if (ReferenceEquals(_issueLog, log.Buffers)) _issueLog = null;
+        return log;
     }
 
     /// <summary>
@@ -1292,6 +1330,7 @@ public sealed class TensorArena : IDisposable
         _ringFree = null;
         _poolFree = null;
         _issueLog = null;
+        _forwardLog = null;
 
         // Clear tensor ring pools (the Tensor<T> wrappers; their backing arrays
         // were just handed to the persistent pool above).

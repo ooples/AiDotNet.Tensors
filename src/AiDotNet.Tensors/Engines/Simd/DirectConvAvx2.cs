@@ -344,9 +344,13 @@ internal static partial class DirectConvAvx2
                         tapCount[entry] = phase.TapsH * phase.TapsW;
                         tapIndex[entry] = y * phase.TapsW + x;
                     }
+            // The 512-bit tile reads tile-interleaved weights with one load per 16 lanes; the blocked layout joined two
+            // 256-bit loads per vector (a port-5 shuffle on Intel server cores, competing with the second FMA unit). The
+            // forward and stride-1 input gradient already pack this way (#1445); the strided phases now do too.
+            bool interleave = Interleave512(inChannels);
             CpuParallelSettings.ParallelForOrSerial(0, inBlocks, (long)outChannels * inChannels * kernelHeight * kernelWidth, [MethodImpl(Hot)] (ib) =>
                 PackKernelPhases(kernel, kernelOffset, packedKernel, ib, outChannels, inChannels, kernelHeight * kernelWidth,
-                    tapSource, tapBase, tapCount, tapIndex), deterministicSafe: true);
+                    tapSource, tapBase, tapCount, tapIndex, interleave), deterministicSafe: true);
 
             // Each task runs EVERY phase over the same share of the grid (the same fraction of each phase's positions,
             // so the same images and rows): the phases interleave in dX (stride 2: alternate columns), and as separate
@@ -370,7 +374,7 @@ internal static partial class DirectConvAvx2
                         int first = ShareBound(total, share, sharesPerTile), last = ShareBound(total, share + 1, sharesPerTile);
                         if (first >= last) continue;
                         if (s_stagedStore)
-                            ForwardTileRuns(packedGrad, packedKernel, phase.KernelOffset, dest, destOffset, accumulate, phase.Geometry, tile, first, last, interleaved: false);
+                            ForwardTileRuns(packedGrad, packedKernel, phase.KernelOffset, dest, destOffset, accumulate, phase.Geometry, tile, first, last, interleaved: interleave);
                         else
                             ForwardTile(packedGrad, packedKernel, phase.KernelOffset, dest, destOffset, accumulate, phase.Geometry, tile, first, last);
                     }
@@ -409,12 +413,16 @@ internal static partial class DirectConvAvx2
     /// firstW + strideW*(tapsW-1-x)]. One pass over the kernel: an output channel's eight input channels are 8 x kH x kW
     /// consecutive floats, read once (into L1) and written to every phase's taps; one phase at a time read the whole
     /// kernel once per phase (15% of a 256 -> 512 8x8 stride-2 input gradient on a Xeon 8370C).
+    /// With <paramref name="interleave"/> each phase is tile-interleaved instead, [I/32][O/8][tapsH][tapsW][8 out][32 in],
+    /// as <see cref="Interleaved512"/> reads it: input block ib's eight lanes sit at lanes 8 (ib % 4) of its tile's rows.
     /// </summary>
     [MethodImpl(Hot)]
     private static unsafe void PackKernelPhases(float[] source, int sourceOffset, float[] packed, int ib,
-        int outChannels, int inChannels, int kernelPlane, int[] tapSource, int[] tapBase, int[] tapCount, int[] tapIndex)
+        int outChannels, int inChannels, int kernelPlane, int[] tapSource, int[] tapBase, int[] tapCount, int[] tapIndex,
+        bool interleave = false)
     {
         int outBlocks = outChannels / Block;
+        int tileBlocks = Block * OutputBlocksPerTile;   // 32 lanes per interleaved row
         var lanes = Vector256.Create(0, 1, 2, 3, 4, 5, 6, 7) * kernelPlane;
         fixed (float* ps = source)
         fixed (float* pd = packed)
@@ -426,8 +434,19 @@ internal static partial class DirectConvAvx2
                     float* row = ps + sourceOffset + ((long)(ob * Block + oo) * inChannels + ib * Block) * kernelPlane;
                     for (int e = 0; e < tapSource.Length; e++)
                     {
-                        long block = ((long)ib * outBlocks + ob) * counts[e] + index[e];
-                        float* d = pd + bases[e] + block * Block * Block + oo * Block;
+                        float* d;
+                        if (interleave)
+                        {
+                            // Tile ib / 4 spans OutputBlocksPerTile blocked block-columns of the same size.
+                            long tileBase = (long)(ib / OutputBlocksPerTile) * OutputBlocksPerTile * outBlocks * counts[e] * Block * Block;
+                            long rowIndex = ((long)ob * counts[e] + index[e]) * Block + oo;
+                            d = pd + bases[e] + tileBase + rowIndex * tileBlocks + (ib % OutputBlocksPerTile) * Block;
+                        }
+                        else
+                        {
+                            long block = ((long)ib * outBlocks + ob) * counts[e] + index[e];
+                            d = pd + bases[e] + block * Block * Block + oo * Block;
+                        }
                         Avx.Store(d, Avx2.GatherVector256(row + src[e], lanes, 4));
                     }
                 }
@@ -470,6 +489,11 @@ internal static partial class DirectConvAvx2
 #endif
         int inTiles = wide ? inBlocks / 2 : inBlocks;
         int pairs = outBlocks * inTiles;
+        // The AVX-512 tile reads sixteen input channels per position. Packed sixteen-wide ([N][C/16][H][W][16]) that is
+        // one 512-bit load; packed eight-wide it was two 256-bit loads joined with vinsertf64x4, a shuffle on the port the
+        // second 512-bit FMA unit shares on Intel server cores: three per 24 FMAs (#1445). Same image size either way.
+        int lanesPerPixel = wide ? 2 * Block : Block;
+        int planeTile = wide ? 2 * planeIn : planeIn;
         int kernelSize = outChannels * inChannels * kernelHeight * kernelWidth;
         // Few block pairs leave cores idle (32 pairs for 32->64 channels), so the batch is split too: each slice
         // sums into its own partial gradient and the partials are reduced in a fixed order afterwards.
@@ -488,18 +512,23 @@ internal static partial class DirectConvAvx2
         var partials = splits > 1 ? pool.Rent(splits * kernelSize) : null;
         try
         {
-            PackInput(input, inputOffset, packedInput, batch, inChannels, height, width, padH, padW, paddedH, paddedW);
+#if NET9_0_OR_GREATER
+            if (wide)
+                PackInputWide(input, inputOffset, packedInput, batch, inChannels, height, width, padH, padW, paddedH, paddedW);
+            else
+#endif
+                PackInput(input, inputOffset, packedInput, batch, inChannels, height, width, padH, padW, paddedH, paddedW);
             PackGradByBlock(gradOutput, gradOutputOffset, packedGrad, batch, outChannels, positions);
             for (int b = 0; b < batch; b++)
                 for (int q = 0; q < positions; q++)
                     offsets[b * positions + q] = b * inBlocks * planeIn
-                        + ((q / outputWidth) * strideH * paddedW + (q % outputWidth) * strideW) * Block;
+                        + ((q / outputWidth) * strideH * paddedW + (q % outputWidth) * strideW) * lanesPerPixel;
 
             if (partials is null)
             {
                 CpuParallelSettings.ParallelForOrSerial(0, pairs, (long)kernelSize * batch * positions,
                     [MethodImpl(Hot)] (task) => RunBackwardKernelTile(wide, packedInput, packedGrad, offsets, dest, destOffset,
-                        accumulate, task / inTiles, task % inTiles, 0, batch, inChannels, outBlocks, paddedW, planeIn,
+                        accumulate, task / inTiles, task % inTiles, 0, batch, inChannels, outBlocks, paddedW, planeTile,
                         kernelHeight, kernelWidth, dilationH, dilationW, positions),
                     deterministicSafe: true);
             }
@@ -511,7 +540,7 @@ internal static partial class DirectConvAvx2
                     int b0 = split * imagesPerSplit;
                     RunBackwardKernelTile(wide, packedInput, packedGrad, offsets, partials, split * kernelSize, false,
                         pair / inTiles, pair % inTiles, b0, Math.Min(batch, b0 + imagesPerSplit), inChannels, outBlocks,
-                        paddedW, planeIn, kernelHeight, kernelWidth, dilationH, dilationW, positions);
+                        paddedW, planeTile, kernelHeight, kernelWidth, dilationH, dilationW, positions);
                 }, deterministicSafe: true);
                 ReducePartials(partials, splits, kernelSize, dest, destOffset, accumulate);
             }
@@ -611,6 +640,62 @@ internal static partial class DirectConvAvx2
             }
         }, deterministicSafe: true);
     }
+
+#if NET9_0_OR_GREATER
+    /// <summary>
+    /// NCHW -> zero-padded [N][C/16][H+2pH][W+2pW][16] for the AVX-512 weight-gradient tile (C a multiple of 16): pixel
+    /// (y, x) of block k holds channels 16k..16k+15 contiguously, so the tile loads them with one 512-bit load. Each
+    /// image is the same size as <see cref="PackInput"/>'s and starts at the same offset.
+    /// </summary>
+    [MethodImpl(Hot)]
+    private static unsafe void PackInputWide(float[] source, int sourceOffset, float[] packed,
+        int batch, int channels, int height, int width, int padH, int padW, int paddedH, int paddedW)
+    {
+        const int Wide = 2 * Block;
+        int blocks = channels / Wide;
+        int plane = paddedH * paddedW * Wide;
+        CpuParallelSettings.ParallelForOrSerial(0, batch * blocks, (long)batch * blocks * plane, [MethodImpl(Hot)] (task) =>
+        {
+            int b = task / blocks, blk = task % blocks;
+            fixed (float* ps = source)
+            fixed (float* pd = packed)
+            {
+                float* d = pd + (long)task * plane;
+                // Only the halo needs zeroing: every interior lane is written below.
+                int rowFloats = paddedW * Wide, left = padW * Wide, right = (paddedW - padW - width) * Wide;
+                new Span<float>(d, padH * rowFloats).Clear();
+                new Span<float>(d + (long)(padH + height) * rowFloats, (paddedH - padH - height) * rowFloats).Clear();
+                var zero = Vector256<float>.Zero;
+                for (int y = 0; y < height; y++)
+                {
+                    float* row = d + (long)(y + padH) * rowFloats;
+                    for (int i = 0; i < left; i += Block) Avx.Store(row + i, zero);
+                    float* tail = row + left + width * Wide;
+                    for (int i = 0; i < right; i += Block) Avx.Store(tail + i, zero);
+                }
+                long channelPlane = (long)height * width;
+                float* s0 = ps + sourceOffset + ((long)b * channels + blk * Wide) * channelPlane;
+                int vectorWidth = width & ~(Block - 1);
+                for (int y = 0; y < height; y++)
+                {
+                    float* drow = d + ((y + padH) * paddedW + padW) * Wide;
+                    float* srow = s0 + y * width;
+                    // Eight pixels x eight channels per transpose, each half of the sixteen lanes on its own.
+                    for (int x = 0; x < vectorWidth; x += Block)
+                    {
+                        Transpose8(srow + x, channelPlane, drow + x * Wide, Wide, accumulate: false);
+                        Transpose8(srow + Block * channelPlane + x, channelPlane, drow + x * Wide + Block, Wide, accumulate: false);
+                    }
+                    for (int c = 0; c < Wide; c++)
+                    {
+                        float* sc = srow + c * channelPlane;
+                        for (int x = vectorWidth; x < width; x++) drow[x * Wide + c] = sc[x];
+                    }
+                }
+            }
+        }, deterministicSafe: true);
+    }
+#endif
 
     /// <summary>NCHW gradient -> [N][C/8][P][8].</summary>
     [MethodImpl(Hot)]
@@ -1294,7 +1379,12 @@ internal static partial class DirectConvAvx2
     /// <summary>Positions per <see cref="ForwardSextetRun512"/> call.</summary>
     private const int Avx512Positions = 6;
 
-    /// <summary>Whether <see cref="ForwardTileRuns"/> runs the AVX-512 kernel (switch for A/B and tests).</summary>
+    /// <summary>
+    /// Whether <see cref="ForwardTileRuns"/> runs the AVX-512 kernel (switch for A/B and tests). On by default on every
+    /// 512-bit host, Zen 4 included: once no tile joins two 256-bit loads per vector (#1445), llvm-mca's Zen 4 model puts
+    /// the 512-bit weight-gradient loop at 0.081 cycles per multiply-add against the AVX2 tile's 0.103 (with the joins it
+    /// was 0.099, break-even, which is what #1430 measured as a loss once the tile's other overheads were added).
+    /// </summary>
     internal static bool s_useAvx512 = Environment.GetEnvironmentVariable("AIDOTNET_DIRECT_CONV_AVX512") != "0";
 
     // Vector512.FusedMultiplyAdd (one rounding, like Fma.MultiplyAdd) is .NET 9+. Written with the cross-platform

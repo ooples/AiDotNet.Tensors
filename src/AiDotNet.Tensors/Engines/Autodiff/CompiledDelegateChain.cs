@@ -237,18 +237,26 @@ internal sealed class CompiledDelegateChain<T>
         {
             // Inside the try, so End runs (and the thread's recycler guard and arena issue log close) if this throws.
             if (recycler is not null)
-                for (int i = 0; i < _count; i++) recycler.NoteOutput(_steps[i].Output);
+                for (int i = 0; i < _count; i++)
+                {
+                    ref var noted = ref _steps[i];
+                    recycler.NoteOutput(noted.Output);
+                    if (recycler.TracksForward)
+                        recycler.NoteStep(i, noted.Output, null, null, null, noted.Inputs, noted.SavedState, noted.Backward);
+                }
             for (int i = 0; i < _count; i++)
             {
                 ref var step = ref _steps[i];
                 if (!DifferentiableOps.IsGradientRequired(step.Output))
                 {
+                    recycler?.AfterStep(grads, step.Output, i);
                     if (gpuEngine is not null)
                         _storageReleasePlan?.ReleaseAfterStep(i, gpuEngine, protectedStorages!);
                     continue;
                 }
                 if (!grads.TryGetValue(step.Output, out var gradOutput))
                 {
+                    recycler?.AfterStep(grads, step.Output, i);
                     if (gpuEngine is not null)
                         _storageReleasePlan?.ReleaseAfterStep(i, gpuEngine, protectedStorages!);
                     continue;
@@ -271,7 +279,7 @@ internal sealed class CompiledDelegateChain<T>
                     BackwardTiming.Record(step.Backward.Method.Name, ticks);
                 }
 
-                recycler?.AfterStep(grads, step.Output);
+                recycler?.AfterStep(grads, step.Output, i);
                 if (gpuEngine is not null)
                     _storageReleasePlan?.ReleaseAfterStep(i, gpuEngine, protectedStorages!);
             }

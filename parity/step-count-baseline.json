@@ -1,0 +1,15 @@
+{
+  "description": "Per-step counts of each reference network's compiled training step (#1096 P0.7), from StepCountRatchetTests. CPU: managed bytes allocated per steady-state step on one thread, keyed by vector ISA. CUDA: the captured step graph's kernel, memcpy and memset nodes, plus allocated bytes, keyed by device. A count may fall (lower it here) but never rise; a machine without an entry defers with its measured value.",
+  "protocol": 1,
+  "cases": {
+    "mlp:cpu:avx2": { "allocatedBytesPerStep": 14544 },
+    "cnn:cpu:avx2": { "allocatedBytesPerStep": 12680 },
+    "lstm:cpu:avx2": { "allocatedBytesPerStep": 108160 },
+    "transformer:cpu:avx2": { "allocatedBytesPerStep": 832972 },
+    "mlp:cuda:NVIDIA RTX 1000 Ada Generation Laptop GPU": { "allocatedBytesPerStep": 896, "kernelNodes": 22, "memcpyNodes": 0, "memsetNodes": 0 },
+    "cnn:cuda:NVIDIA RTX 1000 Ada Generation Laptop GPU": { "allocatedBytesPerStep": 1152, "kernelNodes": 38, "memcpyNodes": 0, "memsetNodes": 2 },
+    "lstm:cuda:NVIDIA RTX 1000 Ada Generation Laptop GPU": { "allocatedBytesPerStep": 896, "kernelNodes": 9, "memcpyNodes": 0, "memsetNodes": 0 },
+    "transformer:cuda:NVIDIA RTX 1000 Ada Generation Laptop GPU": { "allocatedBytesPerStep": 1920, "kernelNodes": 34, "memcpyNodes": 0, "memsetNodes": 2 },
+    "resnet18:cuda:NVIDIA RTX 1000 Ada Generation Laptop GPU": { "allocatedBytesPerStep": 8064, "kernelNodes": 158, "memcpyNodes": 0, "memsetNodes": 5 }
+  }
+}

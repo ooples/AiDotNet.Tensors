@@ -37,10 +37,6 @@ internal static class SimdConvHelper
     private const int MaxKernelGradOcBlock = 8;
     private const int MaxKernelGradIcBlock = 4;
 
-    // Largest padded image a thread keeps cached between calls (16 MiB of floats); a larger one is rented per task
-    // and returned, so a thread does not hold its biggest-ever image for the life of the process.
-    private const int MaxCachedPaddedImageFloats = 4 * 1024 * 1024;
-
     // #209 close-parity A/B testing: choose the Conv3x3Stride1 variant at runtime.
     //   "per-channel"  → existing Conv3x3Stride1SingleChannel kernel (1 oc per task)
     //   "block4"       → Conv3x3Stride1Pad1_OcBlock4 (4 oc per task, register-resident)
@@ -1226,8 +1222,6 @@ internal static class SimdConvHelper
             for (int task = 0; task < totalTasks; task++) RunTask(task);
     }
 
-    [ThreadStatic] private static float[]? t_conv3x3PaddedImage;
-
     /// <summary>
     /// The bias add and optional ReLU a <see cref="Conv3x3Stride1PaddedTiled"/> task applies to an output chunk as
     /// it stores it (<c>max(conv + bias[oc], +0)</c>), so a conv followed by a channel-bias add and a ReLU writes
@@ -1319,20 +1313,11 @@ internal static class SimdConvHelper
         void RunTask(int task)
         {
             int b = task / groups, g = task - b * groups;
-            var scratch = t_conv3x3PaddedImage;
-            float[]? rented = null;
-            if (scratch is null || scratch.Length < imageLen)
-            {
-                if (imageLen <= MaxCachedPaddedImageFloats)
-                {
-                    scratch = new float[imageLen];
-                    t_conv3x3PaddedImage = scratch;
-                }
-                else
-                {
-                    scratch = rented = System.Buffers.ArrayPool<float>.Shared.Rent(imageLen);
-                }
-            }
+            // Rented per task (#1096 follow-up): a [ThreadStatic] cache was never released, so every pool thread kept
+            // its largest padded image for the life of the process. The shared pool keeps a per-thread copy just as
+            // cheaply between tasks and trims it under memory pressure. PadImageForConv3x3 writes every element,
+            // borders included, so a recycled array needs no clearing.
+            var scratch = System.Buffers.ArrayPool<float>.Shared.Rent(imageLen);
             try
             {
                 fixed (float* padded = scratch)
@@ -1360,7 +1345,7 @@ internal static class SimdConvHelper
             }
             finally
             {
-                if (rented is not null) System.Buffers.ArrayPool<float>.Shared.Return(rented);
+                System.Buffers.ArrayPool<float>.Shared.Return(scratch);
             }
         }
 

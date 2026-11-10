@@ -96,9 +96,9 @@ public class BackwardRecyclerTests
     // gradients that pass through views, gradients shared by two consumers, and conv backward kernels whose temporaries
     // other caches pool (the transposed-convolution input gradient's flipped kernel went through AutoTensorCache).
     private Dictionary<Tensor<float>, Tensor<float>> Step(Tensor<float> x, Tensor<float> k1, Tensor<float> k2,
-        Tensor<float> w, int step)
+        Tensor<float> w, int step, bool releaseActivations = false)
     {
-        using var tape = new GradientTape<float>();
+        using var tape = new GradientTape<float>(new GradientTapeOptions { ReleaseActivationsDuringBackward = releaseActivations });
         var h = _engine.ReLU(_engine.Conv2D(x, k1, new[] { 1, 1 }, new[] { 3, 3 }, new[] { 1, 1 }));
         var r = _engine.ReLU(_engine.Conv2D(h, k2, new[] { 1, 1 }, new[] { 0, 0 }, new[] { 1, 1 }));
         r = _engine.Conv2D(r, k2, new[] { 1, 1 }, new[] { 0, 0 }, new[] { 1, 1 });
@@ -111,6 +111,10 @@ public class BackwardRecyclerTests
     }
 
     private List<float[][]> Train(bool? recycle, bool stress, bool inArena, out int returned)
+        => Train(recycle, stress, inArena, releaseActivations: false, out returned, out _);
+
+    private List<float[][]> Train(bool? recycle, bool stress, bool inArena, bool releaseActivations, out int returned,
+        out int forwardReturned)
     {
         var rng = new Random(2453);
         var x = Random(new[] { 2, 3, 40, 40 }, rng, 1f);
@@ -119,6 +123,7 @@ public class BackwardRecyclerTests
         var w = Random(new[] { 16 * 40 * 40, 10 }, rng, 0.005f);
         var gradients = new List<float[][]>();
         returned = 0;
+        forwardReturned = 0;
         var priorEnabled = BackwardRecycler<float>.EnabledOverride;
         var priorStress = BackwardRecycler<float>.StressOverride;
         BackwardRecycler<float>.EnabledOverride = recycle;
@@ -129,9 +134,11 @@ public class BackwardRecyclerTests
             for (int step = 0; step < 5; step++)
             {
                 arena?.Reset();
-                var g = Step(x, k1, k2, w, step);
+                var g = Step(x, k1, k2, w, step, releaseActivations);
                 returned += BackwardRecycler<float>.LastPassReturned;
+                forwardReturned += BackwardRecycler<float>.LastPassForwardReturned;
                 BackwardRecycler<float>.LastPassReturned = 0;
+                BackwardRecycler<float>.LastPassForwardReturned = 0;
                 gradients.Add(new[] { g[k1].ToArray(), g[k2].ToArray(), g[w].ToArray() });
                 // Apply the update inside the step, as a training loop does, so later steps see new weights.
                 _engine.TensorSubtractInPlace(k1, _engine.TensorMultiplyScalar(g[k1], 0.05f));
@@ -167,6 +174,97 @@ public class BackwardRecyclerTests
                 Assert.Equal(reference[step][p], recycled[step][p]);
             }
         }
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void TrainingStepGradients_AreIdentical_WhenActivationsAreReleasedDuringBackward(bool tapeOwnsArena, bool stress)
+    {
+        // Poisoning fills every released activation with NaN instead of reusing it: a backward step that still read one
+        // after its planned last use would turn the gradients NaN, and a second owner writing it fails at the pass end.
+        var reference = Train(recycle: false, stress: false, inArena: false, out _);
+        var released = Train(recycle: true, stress, inArena: !tapeOwnsArena, releaseActivations: true, out _,
+            out int forwardReturned);
+
+        Assert.True(forwardReturned > 0, "no forward activation was handed back during backward");
+        for (int step = 0; step < reference.Count; step++)
+            for (int p = 0; p < reference[step].Length; p++)
+                Assert.Equal(reference[step][p], released[step][p]);
+    }
+
+    [Fact]
+    public void ActivationsAreKept_WithoutTheTapeOption()
+    {
+        Train(recycle: true, stress: false, inArena: true, releaseActivations: false, out int returned, out int forwardReturned);
+        Assert.True(returned > 0);
+        Assert.Equal(0, forwardReturned);
+    }
+
+    [Fact]
+    public void SecondBackward_AfterActivationsWereReleased_Throws()
+    {
+        var rng = new Random(11);
+        var x = Random(new[] { 8, 64 }, rng, 1f);
+        var w = Random(new[] { 64, 64 }, rng, 0.1f);
+        using var tape = new GradientTape<float>(new GradientTapeOptions { ReleaseActivationsDuringBackward = true });
+        var h = _engine.Sigmoid(_engine.TensorMatMul(x, w));
+        var h2 = _engine.Sigmoid(_engine.TensorMatMul(h, w));
+        var loss = _engine.ReduceMean(_engine.TensorMultiply(h2, h2), new[] { 0, 1 }, keepDims: false);
+        tape.ComputeGradients(loss, new[] { w });
+        Assert.True(BackwardRecycler<float>.LastPassForwardReturned > 0);
+        Assert.Throws<InvalidOperationException>(() => tape.ComputeGradients(loss, new[] { w }));
+    }
+
+    [Fact]
+    public void ForwardOutputNoBackwardStepReads_KeepsItsValues()
+    {
+        // A forward output outside the loss's graph (a prediction the caller reads afterwards) is never planned for
+        // release, however much the backward rents.
+        var rng = new Random(5);
+        var x = Random(new[] { 16, 128 }, rng, 1f);
+        var w = Random(new[] { 128, 128 }, rng, 0.1f);
+        using var tape = new GradientTape<float>(new GradientTapeOptions { ReleaseActivationsDuringBackward = true });
+        var side = _engine.Sigmoid(_engine.TensorMatMul(x, x.Transpose(new[] { 1, 0 })));
+        var expected = side.ToArray();
+        var h = _engine.Sigmoid(_engine.TensorMatMul(x, w));
+        var loss = _engine.ReduceMean(_engine.TensorMultiply(h, h), new[] { 0, 1 }, keepDims: false);
+        tape.ComputeGradients(loss, new[] { w });
+        for (int i = 0; i < 4; i++) _engine.TensorMultiplyScalar(_engine.TensorMatMul(x, x.Transpose(new[] { 1, 0 })), 2f);
+        Assert.Equal(expected, side.ToArray());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ReturnedGradient_IsHeldOneStep_UnlessReleasedAtDispose(bool releaseAtDispose)
+    {
+        // Each tape owns a fresh arena and hands its buffers to the cross-arena pool when disposed; a held gradient
+        // stays out of that pool until the next step ends, so the next step cannot be given it.
+        var rng = new Random(3);
+        var x = Random(new[] { 8, 512 }, rng, 1f);
+        var w = Random(new[] { 512, 512 }, rng, 0.05f);
+        float[]? gradientArray;
+        using (var tape = new GradientTape<float>(new GradientTapeOptions { ReleaseResultsAtDispose = releaseAtDispose }))
+        {
+            var h = _engine.TensorMatMul(x, w);
+            var loss = _engine.ReduceMean(_engine.TensorMultiply(h, h), new[] { 0, 1 }, keepDims: false);
+            gradientArray = tape.ComputeGradients(loss, new[] { w })[w].GetBackingArrayForCacheLookupUnsafe();
+        }
+        Assert.NotNull(gradientArray);
+
+        bool reused = false;
+        using (new GradientTape<float>())
+        {
+            for (int i = 0; i < 4; i++)
+            {
+                var rented = TensorAllocator.RentUninitialized<float>(new[] { 512, 512 });
+                reused |= ReferenceEquals(rented.GetBackingArrayForCacheLookupUnsafe(), gradientArray);
+            }
+        }
+        Assert.Equal(releaseAtDispose, reused);
     }
 
     [Fact]

@@ -105,4 +105,32 @@ public sealed class GradientTapeOptions
     /// OUTER tape's arena mid-backward, corrupting every accumulating gradient (#734).
     /// </summary>
     public bool SuppressArenaScope { get; init; }
+
+    /// <summary>
+    /// When true, a CPU backward hands each forward activation's memory back to the step's arena after the last
+    /// backward step that reads it, so later backward work reuses it instead of growing the step's memory.
+    /// </summary>
+    /// <remarks>
+    /// <para>Without it, a training step holds every activation until the step ends, so its memory is the forward's
+    /// activations plus everything backward rents. PyTorch frees each activation once backward has used it.</para>
+    /// <para><b>Only set this when nothing reads the forward's tensors after backward</b>, other than the loss and the
+    /// returned gradients, which stay valid. A prediction, feature map or any other forward output read after
+    /// <c>ComputeGradients</c> may hold another tensor's data. A second backward on the same tape throws, because its
+    /// activations are gone. Applies to a top-level tape on a CPU engine inside a <see cref="Helpers.TensorArena"/>
+    /// (a tape opens one by default); elsewhere it does nothing.</para>
+    /// </remarks>
+    public bool ReleaseActivationsDuringBackward { get; init; }
+
+    /// <summary>
+    /// When true, the loss and gradients this tape's backward returned go back to the step's arena when the tape is
+    /// disposed, instead of being held out of reuse for one more step.
+    /// </summary>
+    /// <remarks>
+    /// <para>The hold exists for callers that read the gradients after disposing the tape (an optimizer step or a
+    /// gradient clip outside its scope, issue #1031). It costs a second set of gradient buffers: while step N runs,
+    /// step N-1's are still held, so a training loop's memory carries every parameter gradient twice.</para>
+    /// <para><b>Only set this when the update finishes inside the tape's scope</b> and nothing keeps the returned
+    /// tensors past it. Applies to a top-level tape.</para>
+    /// </remarks>
+    public bool ReleaseResultsAtDispose { get; init; }
 }

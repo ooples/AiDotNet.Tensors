@@ -78,17 +78,17 @@ RTX 3080, FP16 Q/K/V in [-1, 1), scale 1/√D, against PyTorch 2.14's best FP16 
 
 ## Rate detection
 
-The FP16-accumulate route only pays where FP32 accumulation is the slower form, so Tensors measures this before tuning anything:
-- `PtxMmaRateProbe` keeps eight independent `mma.sync.m16n8k16` chains per warp in registers, on every SM, for each accumulate form.
-- The time ratio between the two forms is the issue-rate ratio.
-- RTX 3080: 61.9 against 123.2 TFLOP/s, ratio 1.99.
+The FP16-accumulate route only pays where FP32 accumulation is the slower form, so Tensors reads the rate before tuning anything. It has two sources, tried in order:
 
-| measured ratio | rate class | what the route does |
+1. **The driver's own report (Linux).** NVIDIA's resource manager exposes the SM speed selects through the read-only control `NV2080_CTRL_CMD_GR_GET_SM_ISSUE_RATE_MODIFIER` (`0x20801230`). `NvRmIssueRateQuery` issues it through the same ioctl interface every CUDA process uses: a root client on `/dev/nvidiactl`, the GPU's `/dev/nvidiaN` registered to it, a device and subdevice object, then the control. It reads; it writes nothing to the GPU. The CUDA device is matched to the driver's GPU by PCI address. The answer is exact and instant: `fmla32` = 0 is full rate, 1 is half, 3 is an eighth (RTX 5090), relative to `fmla16`. Struct layouts come from NVIDIA's MIT-licensed [open-gpu-kernel-modules](https://github.com/NVIDIA/open-gpu-kernel-modules) headers. No code from the unlock projects is used.
+2. **A microbenchmark (everywhere else, or when the driver refuses).** `PtxMmaRateProbe` keeps eight independent `mma.sync.m16n8k16` chains per warp in registers, on every SM, for each accumulate form. The time ratio between the two forms is the issue-rate ratio. RTX 3080: 61.9 against 123.2 TFLOP/s, ratio 1.99. Windows has no user-mode path to the control, so it always measures.
+
+| ratio (driver or measured) | rate class | what the routes do |
 |---|---|---|
-| < 1.3 | `fp32acc-full` | Nothing to double: every shape keeps cuBLAS without tuning. |
+| < 1.3 | `fp32acc-full` | Nothing to double: FP16-accumulate GEMM and conv routes keep cuBLAS without tuning, and flash attention accumulates in FP32. FP32-accumulate and TF32 kernels are what run. |
 | ≈ 2, ≈ 8, … | `fp32acc-1/2`, `fp32acc-1/8`, … | Tunes and routes as above. |
 
-The rate class is part of every persisted verdict. A verdict measured before a card was unlocked, or relocked, is ignored, and the shape is measured again.
+The rate class is part of every persisted verdict, for the FP16-accumulate routes and for the TF32 tensor-core GEMM routes (`TuneGemmRouteAsync` in TF32 mode), since both move with the FP32-accumulate rate. A verdict measured before a card was unlocked, or relocked, is ignored, and the shape is measured again. TF32 verdicts recorded before the class was stored were measured on stock cards, so they stay valid at a reduced rate and are dropped at full rate. Strict-FP32 routes run on the CUDA cores and are unaffected.
 
 You can check your own card:
 
@@ -104,6 +104,19 @@ Console.WriteLine($"FP32 accumulate {fp32Acc:F0} TFLOP/s, FP16 accumulate {fp16A
 |---|---|
 | `AIDOTNET_FP16_ACCUMULATE=0` | Turns the FP16-accumulate route off: every FP16 GEMM uses cuBLAS's FP32 accumulation. |
 | `AIDOTNET_FP16_ACCUMULATE=1` | Tunes shapes even on a device whose FP32 accumulation is already full rate. |
+| `AIDOTNET_MMA_RATE_SOURCE=auto` | Default: ask the driver, measure when it cannot answer. |
+| `AIDOTNET_MMA_RATE_SOURCE=driver` | Only ask the driver; with no answer the rate is unknown and the routes behave as on a reduced-rate card. |
+| `AIDOTNET_MMA_RATE_SOURCE=probe` | Never ask the driver; always measure. |
+
+## End-to-end head-to-heads in FP16
+
+The PyTorch network head-to-head (`tests/.../Parity/HeadToHeadNetworkTests.cs`, run by `tools/parity/run-gpu.ps1`) has FP16 autocast cases: `cnn-fp16`, `transformer-fp16` and `resnet18-fp16` (`parity/networks/*-fp16.json`).
+- **PyTorch side:** every execution mode (eager, CUDA graph, every `torch.compile` mode) runs its forward and loss under `torch.autocast("cuda", dtype=torch.float16)`.
+- **Tensors side:** every mode runs under `AIDOTNET_AUTOCAST=fp16`.
+- **What stays FP32:** parameters, gradients and the SGD update, on both sides.
+- **Loss agreement:** the curves must agree within the spec's `lossTolerance` (2% relative), because each side picks its own FP16 kernels. The step-time ratio is ratcheted like the FP32 cases.
+
+There is no DiT spec yet. The runner has no adaptive-norm or patchify layer types, so DiT shapes are covered at the GEMM level only (`--fp16-accumulate-vs-torch` in the benchmarks project).
 
 ## The unlock projects
 

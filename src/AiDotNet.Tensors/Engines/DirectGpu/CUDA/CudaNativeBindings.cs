@@ -21,7 +21,10 @@ public enum CudaDeviceAttribute
     MaxRegistersPerMultiprocessor = 82,
     ComputeCapabilityMajor = 75,
     ComputeCapabilityMinor = 76,
-    CooperativeLaunch = 95
+    CooperativeLaunch = 95,
+    PciBusId = 33,
+    PciDeviceId = 34,
+    PciDomainId = 50
 }
 
 /// <summary>

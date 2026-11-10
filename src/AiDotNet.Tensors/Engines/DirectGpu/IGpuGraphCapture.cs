@@ -23,6 +23,14 @@ internal interface IGpuGraphCapture : IDirectGpuBackend
     /// <summary>Records <paramref name="launch"/>'s device work; a handle to replay, or zero when it cannot.</summary>
     System.IntPtr CaptureGraph(System.Action launch);
 
+    /// <summary>
+    /// Why the calling thread's most recent <see cref="CaptureGraph"/> returned zero (#1096 F4): the exception the captured
+    /// body threw, or the driver call that failed. A backend ends a capture cleanly when its body throws and returns a
+    /// zero handle, so without this the caller knows only that capture failed, not why. Null after a capture that
+    /// succeeded, before any capture on this thread, or on a backend without graph capture.
+    /// </summary>
+    string? LastCaptureFailure { get; }
+
     /// <summary>Replays a graph <see cref="CaptureGraph"/> returned.</summary>
     void LaunchCapturedGraph(System.IntPtr graphExec);
 
