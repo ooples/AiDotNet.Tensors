@@ -14,8 +14,8 @@ namespace AiDotNet.Tensors.Tests.Parity;
 /// <list type="bullet">
 /// <item>CPU: managed bytes allocated per steady-state step on one thread (exact, so the slack only absorbs runtime
 /// noise such as a lazily grown pool).</item>
-/// <item>CUDA: kernel, memcpy and memset nodes of the captured step graph, which must not rise at all, plus the
-/// allocated bytes.</item>
+/// <item>CUDA: memcpy and memset nodes of the captured step graph, which must not rise at all; kernel nodes, which may
+/// rise by 5% (at least 1) because the conv and GEMM routes are chosen by timing; plus the allocated bytes.</item>
 /// </list>
 /// Runs from random weights: no PyTorch needed, so the CPU cases run in hosted CI.
 /// </summary>
@@ -50,7 +50,10 @@ public abstract class StepCountRatchetBase
         Skip.IfNot(recorded, $"DEFERRED: no baseline for {key}. Measured {measuredJson}; add it under \"cases\" in {BaselineFile}.");
 
         long allowedBytes = baseline.GetProperty("allocatedBytesPerStep").GetInt64();
-        long slack = Math.Max(4096, allowedBytes / 20);
+        // 5% of the baseline, with a floor for runtime noise. The CPU floor (4 KB) absorbs a lazily grown pool. The CUDA baselines
+        // are 0.9-8 KB, so a 4 KB floor there would let an 896-byte step allocate five times its baseline unnoticed; the
+        // CUDA floor is 256 bytes.
+        long slack = Math.Max(gpu is null ? 4096 : 256, allowedBytes / 20);
         Assert.True(counts.AllocatedBytesPerStep <= allowedBytes + slack,
             $"{key}: a compiled step allocates {counts.AllocatedBytesPerStep} bytes, above the recorded {allowedBytes} " +
             $"(+{slack} slack). Find the new per-step allocation (GC.GetAllocatedBytesForCurrentThread around Step()).");
@@ -111,6 +114,8 @@ public sealed class StepCountRatchetGpuTests : StepCountRatchetBase
         using (gpu)
         {
             Skip.IfNot(gpu.IsGpuAvailable, "no GPU available to AiDotNet.Tensors.");
+            // The keys and the graph-node counts are CUDA's; another backend (HIP, OpenCL) would defer under a "cuda:" key.
+            Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend, "the CUDA ratchet needs the CUDA backend.");
             Ratchet(network, gpu);
         }
     }
