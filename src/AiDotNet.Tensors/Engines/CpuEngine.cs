@@ -39036,22 +39036,52 @@ public partial class CpuEngine : ITensorLevelEngine
         // index that overflows int32 (>2 billion) fails with a meaningful
         // ArgumentOutOfRangeException instead of an OverflowException buried
         // inside Convert.ToInt32.
-        for (int i = 0; i < numIndices; i++)
+        if (typeof(TIndex) == typeof(int))
         {
-            long tokenIdxLong = Convert.ToInt64(idxData[i]);
-
-            if (tokenIdxLong < 0 || tokenIdxLong >= vocabSize)
-                throw new ArgumentOutOfRangeException(nameof(indices),
-                    $"Index {tokenIdxLong} at position {i} is out of bounds for vocabulary size {vocabSize}.");
-
-            int tokenIdx = (int)tokenIdxLong;
-            int srcOffset = i * embeddingDim;
-            int dstOffset = tokenIdx * embeddingDim;
-
-            // Accumulate gradient for this embedding row - direct array access
-            for (int d = 0; d < embeddingDim; d++)
+            var intIdx = (int[])(object)idxData;
+            for (int i = 0; i < numIndices; i++)
             {
-                gradEmbData[dstOffset + d] = numOps.Add(gradEmbData[dstOffset + d], gradData[srcOffset + d]);
+                int tokenIdx = intIdx[i];
+                if ((uint)tokenIdx >= (uint)vocabSize)
+                    throw new ArgumentOutOfRangeException(nameof(indices),
+                        $"Index {tokenIdx} at position {i} is out of bounds for vocabulary size {vocabSize}.");
+                int srcOffset = i * embeddingDim;
+                int dstOffset = tokenIdx * embeddingDim;
+                var dstSlice = gradEmbData.AsSpan(dstOffset, embeddingDim);
+                numOps.Add(dstSlice, gradData.AsSpan(srcOffset, embeddingDim), dstSlice);
+            }
+        }
+        else if (typeof(TIndex) == typeof(long))
+        {
+            var longIdx = (long[])(object)idxData;
+            for (int i = 0; i < numIndices; i++)
+            {
+                long tokenIdxLong = longIdx[i];
+                if (tokenIdxLong < 0 || tokenIdxLong >= vocabSize)
+                    throw new ArgumentOutOfRangeException(nameof(indices),
+                        $"Index {tokenIdxLong} at position {i} is out of bounds for vocabulary size {vocabSize}.");
+                int tokenIdx = (int)tokenIdxLong;
+                int srcOffset = i * embeddingDim;
+                int dstOffset = tokenIdx * embeddingDim;
+                var dstSlice = gradEmbData.AsSpan(dstOffset, embeddingDim);
+                numOps.Add(dstSlice, gradData.AsSpan(srcOffset, embeddingDim), dstSlice);
+            }
+        }
+        else
+        {
+            for (int i = 0; i < numIndices; i++)
+            {
+                long tokenIdxLong = Convert.ToInt64(idxData[i]);
+
+                if (tokenIdxLong < 0 || tokenIdxLong >= vocabSize)
+                    throw new ArgumentOutOfRangeException(nameof(indices),
+                        $"Index {tokenIdxLong} at position {i} is out of bounds for vocabulary size {vocabSize}.");
+
+                int tokenIdx = (int)tokenIdxLong;
+                int srcOffset = i * embeddingDim;
+                int dstOffset = tokenIdx * embeddingDim;
+                var dstSlice = gradEmbData.AsSpan(dstOffset, embeddingDim);
+                numOps.Add(dstSlice, gradData.AsSpan(srcOffset, embeddingDim), dstSlice);
             }
         }
 
