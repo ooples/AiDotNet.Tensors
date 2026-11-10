@@ -61,6 +61,7 @@ public partial class CpuEngine
         var outShape = ValidateInterpolate(input, sizes, mode);
         var output = new Tensor<T>(outShape);
         if (input.Length == 0 || output.Length == 0) return output;
+        if (InterpolateKernels.Handles(mode) && InterpolateKernels.TryForward(input, output, mode, alignCorners)) return output;
 
         var ops = MathHelper.GetNumericOperations<T>();
         switch (mode)
