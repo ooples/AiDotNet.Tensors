@@ -107,6 +107,68 @@ __kernel void fft_butterfly(
     imag[j] = uImag - tImag;
 }
 
+// Whole batched transform in ONE dispatch: one work-group per row, the row held in local memory
+// (passed as two local arguments of n floats each). Reads the input once in natural order, stores it
+// at the bit-reversed position, runs every radix-2 DIT stage in local memory and writes the result
+// (times `scale`, 1/n for an inverse) once. Each group reads its whole row before writing any of it,
+// so input and output may alias. Twiddles use sinpi/cospi of the exact ratio -+2w/stride.
+// Dispatch: global = batch * groupSize, local = groupSize. n is a power of two, n >= 2.
+__kernel void batched_fft_local(
+    __global const float* inRe,
+    __global const float* inIm,
+    __global float* outRe,
+    __global float* outIm,
+    const int n,
+    const int log2n,
+    const int inverse,
+    const float scale,
+    __local float* re,
+    __local float* im)
+{
+    int lid = get_local_id(0);
+    int lsz = get_local_size(0);
+    long base = (long)get_group_id(0) * n;
+    for (int i = lid; i < n; i += lsz)
+    {
+        int r = 0, t = i;
+        for (int b = 0; b < log2n; b++) { r = (r << 1) | (t & 1); t >>= 1; }
+        re[r] = inRe[base + i];
+        im[r] = inIm[base + i];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    float sign = inverse ? 2.0f : -2.0f;
+    int halfN = n >> 1;
+    for (int lgHalf = 0; lgHalf < log2n; lgHalf++)
+    {
+        int hs = 1 << lgHalf;
+        int stride = hs << 1;
+        for (int k = lid; k < halfN; k += lsz)
+        {
+            int w = k & (hs - 1);
+            int top = ((k >> lgHalf) << (lgHalf + 1)) + w;
+            int bot = top + hs;
+            float x = sign * (float)w / (float)stride;
+            float s = sinpi(x), c = cospi(x);
+            float br = re[bot], bi = im[bot];
+            float tr = br * c - bi * s;
+            float ti = br * s + bi * c;
+            float ar = re[top], ai = im[top];
+            re[top] = ar + tr;
+            im[top] = ai + ti;
+            re[bot] = ar - tr;
+            im[bot] = ai - ti;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    for (int i = lid; i < n; i += lsz)
+    {
+        outRe[base + i] = re[i] * scale;
+        outIm[base + i] = im[i] * scale;
+    }
+}
+
 // Batched FFT butterfly for multiple signals (`fullSize` semantics — see fft_butterfly)
 __kernel void batched_fft_butterfly(
     __global float* real,
@@ -563,6 +625,7 @@ __kernel void bit_reverse_cols(
         "batched_bit_reverse",
         "fft_butterfly",
         "batched_fft_butterfly",
+        "batched_fft_local",
         "fft_scale",
         "rfft_postprocess",
         "irfft_preprocess",

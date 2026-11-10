@@ -1098,7 +1098,6 @@ public partial class DirectGpuTensorEngine
             int weightCount = batch * numFreqs * 2;
             using var weights = CachedSpectrumConstant(backend, SpectrumConstant.IrfftAdjointWeights, 1, numFreqs, nFft);
             backend.BroadcastMultiplyLastAxis(interleaved.Buffer, weights.Buffer, scaled.Buffer, batch, numFreqs * 2);
-            backend.Synchronize();
 
             var result = DeferTensorResult<T>(backend, scaled.Buffer, weightCount, (int[])inputShape.Clone());
             scaled.RelinquishOwnership();
@@ -1175,7 +1174,6 @@ public partial class DirectGpuTensorEngine
             try
             {
                 backend.CopyRows(outRe.Buffer, resultBuf.Buffer, nFft, signalLength, batch, signalLength);
-                backend.Synchronize();
 
                 // Clone: inputShape is the caller's LIVE shape array (inputs[0]._shape), and handing it
                 // to the result would alias it. IrfftAdjointGpu already clones.
@@ -1257,9 +1255,8 @@ public partial class DirectGpuTensorEngine
             backend.CopyRows(specReal, packReal, nFft, numFreqs, batchSize, numFreqs);
             backend.CopyRows(specImag, packImag, nFft, numFreqs, batchSize, numFreqs);
             backend.InterleaveComplex(packReal, packImag, output, batchSize * numFreqs);
-
-            // Transient scratch returns to backend pools on dispose; the result stays resident.
-            backend.Synchronize();
+            // No host sync: scratch is released in stream order like every other op's, and the result stays
+            // resident. A Synchronize here stalled the host once per transform (forward and adjoint alike).
         });
 
         // Same backward as CpuEngine.RFFT: the ADJOINT, not the inverse. This previously routed the
@@ -1362,7 +1359,6 @@ public partial class DirectGpuTensorEngine
             backend.BroadcastMultiplyLastAxis(fullImagRaw, signBuffer.Buffer, fullImag, batchSize, nFft);
             backend.BatchedFFT(fullReal, fullImag, timeReal, timeImag, batchSize, nFft, inverse: true);
             backend.CopyRows(timeReal, output, nFft, outputLength, batchSize, outputLength);
-            backend.Synchronize();
         }, fullyWritten: true);
 
         // Mirrors CpuEngine.IRFFT: the backward of IRFFT is its ADJOINT, not RFFT. Routing the

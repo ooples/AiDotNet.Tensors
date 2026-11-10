@@ -696,8 +696,32 @@ public sealed unsafe partial class VulkanBackend : IGatedDeltaNetBackwardBackend
     public void BatchedFFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag, int batch, int n, bool inverse)
     {
         EnsureInitialized();
+        if (batch > 0 && n >= 2 && (n & (n - 1)) == 0 && n <= SharedFftMaxLength
+            && !ReferenceEquals(inputReal, outputReal) && !ReferenceEquals(inputReal, outputImag)
+            && !ReferenceEquals(inputImag, outputReal) && !ReferenceEquals(inputImag, outputImag))
+        {
+            // One workgroup per row; slices keep each dispatch within maxComputeWorkGroupCountX (65535 at minimum).
+            string shader = VulkanResidentKernels.SharedFft(SharedFftMaxLength);
+            int log2n = 0;
+            while ((1 << log2n) < n) log2n++;
+            int sliceRows = (int)Math.Min(_device.Limits.maxComputeWorkGroupCountX, 65535u);
+            for (int row = 0; row < batch; row += sliceRows)
+            {
+                int rows = Math.Min(sliceRows, batch - row);
+                GlslNaryOp(shader, new[] { inputReal, inputImag, outputReal, outputImag },
+                    checked(rows * VulkanKernels.WorkgroupSize),
+                    new[] { (uint)row, (uint)n, (uint)log2n, inverse ? 1u : 0u });
+            }
+            return;
+        }
         DispatchSplitDft(inputReal, inputImag, outputReal, outputImag, batch, n, inverse);
     }
+
+    /// <summary>
+    /// Longest row <see cref="BatchedFFT"/> runs in one on-chip workgroup: 4096 when the device grants 32 KB of
+    /// workgroup shared memory, else 2048 (16 KB, the Vulkan minimum).
+    /// </summary>
+    private int SharedFftMaxLength => _device.MaxSharedMemorySize >= 2 * 4096 * sizeof(float) ? 4096 : 2048;
 
     public void FFT2D(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag, int height, int width, bool inverse)
     {

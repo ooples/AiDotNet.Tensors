@@ -12376,6 +12376,27 @@ KERNEL VARIANTS (A/B testing):
             // straight into the output, so the permutation IS the copy.
             int log2n = (int)MathHelper.Log2(n);
 
+            // One dispatch when a row fits in local memory: batched_fft_local bit-reverses on load, runs every
+            // stage on chip and writes once, instead of log2(n)+1 passes over global memory.
+            if (batch > 0 && n >= 2 && (n & (n - 1)) == 0 && (ulong)(2 * n * sizeof(float)) <= _context.LocalMemSize
+                && _kernelCache.TryGetValue("batched_fft_local", out var localFft))
+            {
+                int group = (int)Math.Min((ulong)Math.Min(n / 2, 256), _context.MaxWorkGroupSize);
+                while ((group & (group - 1)) != 0) group &= group - 1;
+                localFft.SetArg(0, inReal.Handle);
+                localFft.SetArg(1, inImag.Handle);
+                localFft.SetArg(2, outReal.Handle);
+                localFft.SetArg(3, outImag.Handle);
+                localFft.SetArg(4, n);
+                localFft.SetArg(5, log2n);
+                localFft.SetArg(6, inverse ? 1 : 0);
+                localFft.SetArg(7, inverse ? 1.0f / n : 1.0f);
+                localFft.SetLocalArg(8, n * sizeof(float));
+                localFft.SetLocalArg(9, n * sizeof(float));
+                localFft.Execute1D(checked(batch * group), group);
+                return;
+            }
+
             // Batched bit-reversal. NOTE: batched_bit_reverse / batched_fft_butterfly index via a
             // FLATTENED get_global_id(0) (b = idx/n, batchIdx = tid/(n/2)), so they MUST be dispatched
             // 1D over batch*n (resp. batch*(n/2)). They were dispatched via Execute2D — a real 2D

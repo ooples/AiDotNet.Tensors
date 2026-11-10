@@ -170,7 +170,35 @@ layout(set=0,binding=1) readonly buffer InputImag { float inputImag[]; };
 layout(set=0,binding=2) writeonly buffer OutputReal { float outputReal[]; };
 layout(set=0,binding=3) writeonly buffer OutputImag { float outputImag[]; };
 layout(push_constant) uniform Params { uint batch; uint n; uint inverse; };
-void main(){uint idx=gl_GlobalInvocationID.x;if(idx>=batch*n)return;uint b=idx/n,k=idx%n,offset=b*n;float realSum=0.0,imagSum=0.0,sign=inverse!=0u?1.0:-1.0;for(uint j=0u;j<n;++j){float angle=sign*6.283185307179586*float(k*j)/float(n),c=cos(angle),s=sin(angle);realSum+=inputReal[offset+j]*c-inputImag[offset+j]*s;imagSum+=inputReal[offset+j]*s+inputImag[offset+j]*c;}if(inverse!=0u){realSum/=float(n);imagSum/=float(n);}outputReal[idx]=realSum;outputImag[idx]=imagSum;}";
+void main(){uint idx=gl_GlobalInvocationID.x;if(idx>=batch*n)return;uint b=idx/n,k=idx%n,offset=b*n;float realSum=0.0,imagSum=0.0,sign=inverse!=0u?1.0:-1.0;for(uint j=0u;j<n;++j){float angle=sign*6.283185307179586*float((k*j)%n)/float(n),c=cos(angle),s=sin(angle);realSum+=inputReal[offset+j]*c-inputImag[offset+j]*s;imagSum+=inputReal[offset+j]*s+inputImag[offset+j]*c;}if(inverse!=0u){realSum/=float(n);imagSum/=float(n);}outputReal[idx]=realSum;outputImag[idx]=imagSum;}";
+
+    /// <summary>
+    /// Power-of-two batched FFT, one workgroup per row with the row held in shared memory (2 * maxN floats). Loads in
+    /// natural order to the bit-reversed slot, runs every radix-2 DIT stage on chip, and writes once (times 1/n for an
+    /// inverse): O(n log n) instead of <see cref="SplitDft"/>'s O(n^2), and float error that grows like log2(n) rather
+    /// than with n. Push constants: first row of this dispatch, n, log2(n), inverse.
+    /// </summary>
+    public static string SharedFft(int maxN) => Header + @"
+layout(set=0,binding=0) readonly buffer InputReal { float inputReal[]; };
+layout(set=0,binding=1) readonly buffer InputImag { float inputImag[]; };
+layout(set=0,binding=2) writeonly buffer OutputReal { float outputReal[]; };
+layout(set=0,binding=3) writeonly buffer OutputImag { float outputImag[]; };
+layout(push_constant) uniform Params { uint rowBase; uint n; uint log2n; uint inverse; };
+shared float sre[" + maxN + @"];
+shared float sim[" + maxN + @"];
+void main(){
+uint lid=gl_LocalInvocationID.x,base=(rowBase+gl_WorkGroupID.x)*n;
+for(uint i=lid;i<n;i+=256u){uint r=bitfieldReverse(i)>>(32u-log2n);sre[r]=inputReal[base+i];sim[r]=inputImag[base+i];}
+memoryBarrierShared();barrier();
+float sgn=inverse!=0u?2.0:-2.0;uint halfN=n>>1u;
+for(uint lg=0u;lg<log2n;++lg){uint hs=1u<<lg;
+for(uint k=lid;k<halfN;k+=256u){uint w=k&(hs-1u),top=((k>>lg)<<(lg+1u))+w,bot=top+hs;
+float a=3.14159265358979323846*sgn*float(w)/float(hs<<1u),c=cos(a),s=sin(a);
+float br=sre[bot],bi=sim[bot],tr=br*c-bi*s,ti=br*s+bi*c,ar=sre[top],ai=sim[top];
+sre[top]=ar+tr;sim[top]=ai+ti;sre[bot]=ar-tr;sim[bot]=ai-ti;}
+memoryBarrierShared();barrier();}
+float scale=inverse!=0u?1.0/float(n):1.0;
+for(uint i=lid;i<n;i+=256u){outputReal[base+i]=sre[i]*scale;outputImag[base+i]=sim[i]*scale;}}";
 
     public static string SplitDft2D => Header + @"
 layout(set=0,binding=0) readonly buffer InputReal { float inputReal[]; };
