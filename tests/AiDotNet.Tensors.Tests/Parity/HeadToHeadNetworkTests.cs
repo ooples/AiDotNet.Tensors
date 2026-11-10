@@ -73,7 +73,12 @@ public abstract class HeadToHeadTestBase
 
     private static void AssertLossesAgree(HeadToHeadNetworkHarness.CaseResult r)
     {
-        string? mismatch = HeadToHeadNetworkHarness.LossMismatch(r.Tensors.Losses, r.Torch.Losses);
+        // The spec's own bounds: FP16 autocast cases agree to FP16 rounding, not FP32 (#1549).
+        string root = PyTorchParityInventory.FindRepositoryRoot()
+            ?? throw new InvalidOperationException("parity/ is missing from this checkout.");
+        using var spec = JsonDocument.Parse(File.ReadAllText(Path.Combine(root, "parity", "networks", r.Network + ".json")));
+        var (first, later) = HeadToHeadNetworkHarness.LossTolerance(spec.RootElement);
+        string? mismatch = HeadToHeadNetworkHarness.LossMismatch(r.Tensors.Losses, r.Torch.Losses, first, later);
         Assert.True(mismatch is null,
             $"{r.Network}: {mismatch} (ours against torch). The two sides are not training the same network, so " +
             "their timings are not comparable.");
@@ -224,5 +229,31 @@ public sealed class HeadToHeadGpuNetworkTests : HeadToHeadTestBase
     [SkippableFact]
     [Trait("Category", "PyTorchParityGpuTarget")]
     public void Resnet18_Cuda_IsAsFastAsPyTorch() => AssertParity(RunCase("resnet18", "cuda"));
+
+    // #1549: the same networks with the forward and loss under FP16 autocast on both sides (AMP training), where the
+    // FP16-accumulate GEMM, conv and flash-attention routes apply. Same ratchet and target as the FP32 cases.
+    [SkippableFact]
+    [Trait("Category", "PyTorchParityGpu")]
+    public void CnnFp16_Cuda_DoesNotRegress() => AssertRatchet(RunCase("cnn-fp16", "cuda"));
+
+    [SkippableFact]
+    [Trait("Category", "PyTorchParityGpuTarget")]
+    public void CnnFp16_Cuda_IsAsFastAsPyTorch() => AssertParity(RunCase("cnn-fp16", "cuda"));
+
+    [SkippableFact]
+    [Trait("Category", "PyTorchParityGpu")]
+    public void TransformerFp16_Cuda_DoesNotRegress() => AssertRatchet(RunCase("transformer-fp16", "cuda"));
+
+    [SkippableFact]
+    [Trait("Category", "PyTorchParityGpuTarget")]
+    public void TransformerFp16_Cuda_IsAsFastAsPyTorch() => AssertParity(RunCase("transformer-fp16", "cuda"));
+
+    [SkippableFact]
+    [Trait("Category", "PyTorchParityGpu")]
+    public void Resnet18Fp16_Cuda_DoesNotRegress() => AssertRatchet(RunCase("resnet18-fp16", "cuda"));
+
+    [SkippableFact]
+    [Trait("Category", "PyTorchParityGpuTarget")]
+    public void Resnet18Fp16_Cuda_IsAsFastAsPyTorch() => AssertParity(RunCase("resnet18-fp16", "cuda"));
 }
 #endif

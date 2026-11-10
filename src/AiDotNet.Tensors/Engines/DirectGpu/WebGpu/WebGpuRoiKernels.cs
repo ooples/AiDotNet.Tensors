@@ -57,10 +57,9 @@ fn bilinear_sample(planeBase: i32, y_in: f32, x_in: f32) -> f32 {
     var roiH = select(max(y2 - y1, 1.0), y2 - y1, p.aligned != 0);
     let binH = roiH / f32(p.outH);
     let binW = roiW / f32(p.outW);
-    var ry = select(i32(ceil(roiH / f32(p.outH))), p.samplingRatio, p.samplingRatio > 0);
-    var rx = select(i32(ceil(roiW / f32(p.outW))), p.samplingRatio, p.samplingRatio > 0);
-    if (ry < 1) { ry = 1; }
-    if (rx < 1) { rx = 1; }
+    let ry = select(i32(ceil(roiH / f32(p.outH))), p.samplingRatio, p.samplingRatio > 0);
+    let rx = select(i32(ceil(roiW / f32(p.outW))), p.samplingRatio, p.samplingRatio > 0);
+    // torchvision: an aligned RoI of zero or negative size has an empty sampling grid and averages to 0.
     let planeBase = (n * p.C + c) * p.H * p.W;
     var acc : f32 = 0.0;
     for (var iy : i32 = 0; iy < ry; iy = iy + 1) {
@@ -70,7 +69,7 @@ fn bilinear_sample(planeBase: i32, y_in: f32, x_in: f32) -> f32 {
             acc = acc + bilinear_sample(planeBase, sy, sx);
         }
     }
-    output_[gid] = acc / f32(ry * rx);
+    output_[gid] = acc / f32(max(ry * rx, 1));
 }
 ";
 

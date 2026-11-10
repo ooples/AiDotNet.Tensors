@@ -140,7 +140,8 @@ internal static class RebindablePlanCache<T>
         TapeEntryArena<T> currentEntries,
         Tensor<T> loss,
         IReadOnlyList<Tensor<T>>? sources,
-        IEngine engine)
+        IEngine engine,
+        IReadOnlyCollection<Tensor<T>>? retainedTensors = null)
     {
         if (_cachedReverseTopoIndices is null) return null;
         if (_cachedPatternHash != patternHash) return null;
@@ -189,8 +190,22 @@ internal static class RebindablePlanCache<T>
         var inputsBuffer3 = s_inputsBuffer3 ??= new Tensor<T>[3];
         bool timing = BackwardTiming.Enabled;
         var indices = _cachedReverseTopoIndices;
+        // On the CPU, the buffers backward rents go back to the step's arena once no gradient references them.
+        var recycler = BackwardRecycler<T>.Begin(engine, loss, sources, retainedTensors);
         try
         {
+            // Inside the try, so End runs (and the thread's recycler guard and arena issue log close) if this throws.
+            if (recycler is not null)
+                for (int i = 0; i < indices.Length; i++)
+                {
+                    int noted = indices[i];
+                    if (noted < 0 || noted >= currentEntries.Count) continue;
+                    ref var entry = ref currentEntries[noted];
+                    recycler.NoteOutput(entry.Output);
+                    if (recycler.TracksForward)
+                        recycler.NoteStep(i, entry.Output, entry.Input0, entry.Input1, entry.Input2,
+                            entry.InputsOverflow, entry.SavedState, entry.Backward);
+                }
             for (int i = 0; i < indices.Length; i++)
             {
                 int idx = indices[i];
@@ -204,9 +219,15 @@ internal static class RebindablePlanCache<T>
                 ref var entry = ref currentEntries[idx];
 
                 if (!DifferentiableOps.IsGradientRequired(entry.Output))
+                {
+                    recycler?.AfterStep(grads, entry.Output, i);
                     continue;
+                }
                 if (!grads.TryGetValue(entry.Output, out var gradOutput))
+                {
+                    recycler?.AfterStep(grads, entry.Output, i);
                     continue;
+                }
 
                 long start = timing ? Stopwatch.GetTimestamp() : 0;
                 var previousAccumulatorOwners = DifferentiableOps.BeginBackwardStep<T>();
@@ -229,10 +250,12 @@ internal static class RebindablePlanCache<T>
                     long ticks = Stopwatch.GetTimestamp() - start;
                     BackwardTiming.Record(entry.Backward.Method.Name, ticks);
                 }
+                recycler?.AfterStep(grads, entry.Output, i);
             }
         }
         finally
         {
+            recycler?.End();
             // Clear every per-arity buffer's references so a forward
             // intermediate that just rode through here (as an Input
             // field of some entry) doesn't get pinned in the thread-

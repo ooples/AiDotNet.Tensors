@@ -9,6 +9,13 @@ internal static class HipNeuralNetKernels
     {
         // Note: hiprtc provides device intrinsics built-in, no includes needed
         return @"
+// 1 - beta^t without cancellation (see CudaOptimizerKernels.bias_correction).
+__device__ __forceinline__ float hip_nn_bias_correction(float beta, float t)
+{
+    // beta = 0 (a valid Adam setting): 1 - 0^t = 1 for t >= 1, without relying on log(0) = -inf.
+    if (beta <= 0.0f) return 1.0f;
+    return -expm1f(t * log1pf(-(1.0f - beta)));
+}
 // HIP RTC Compatibility - no includes needed, device intrinsics are built-in
 #ifndef INFINITY
 #define INFINITY __builtin_huge_valf()
@@ -814,8 +821,8 @@ extern ""C"" __global__ __launch_bounds__(256) void adam_step(
 
     // Guard against t==0 which causes division by zero
     int safe_t = t < 1 ? 1 : t;
-    float mHat = mVal / (1.0f - powf(beta1, (float)safe_t));
-    float vHat = vVal / (1.0f - powf(beta2, (float)safe_t));
+    float mHat = mVal / (hip_nn_bias_correction(beta1, (float)safe_t));
+    float vHat = vVal / (hip_nn_bias_correction(beta2, (float)safe_t));
 
     param[idx] -= learningRate * mHat / (sqrtf(vHat) + epsilon);
 }
@@ -837,8 +844,8 @@ extern ""C"" __global__ __launch_bounds__(256) void adamw_step(
 
     // Guard against t==0 which causes division by zero
     int safe_t = t < 1 ? 1 : t;
-    float mHat = mVal / (1.0f - powf(beta1, (float)safe_t));
-    float vHat = vVal / (1.0f - powf(beta2, (float)safe_t));
+    float mHat = mVal / (hip_nn_bias_correction(beta1, (float)safe_t));
+    float vHat = vVal / (hip_nn_bias_correction(beta2, (float)safe_t));
 
     // AdamW: decoupled weight decay
     param[idx] -= learningRate * (mHat / (sqrtf(vHat) + epsilon) + weightDecay * param[idx]);
@@ -963,8 +970,8 @@ extern ""C"" __global__ __launch_bounds__(256) void lamb_step(
     // Bias correction
     // Guard against t==0 which causes division by zero
     int safe_t = t < 1 ? 1 : t;
-    float mHat = mVal / (1.0f - powf(beta1, (float)safe_t));
-    float vHat = vVal / (1.0f - powf(beta2, (float)safe_t));
+    float mHat = mVal / (hip_nn_bias_correction(beta1, (float)safe_t));
+    float vHat = vVal / (hip_nn_bias_correction(beta2, (float)safe_t));
 
     // LAMB: Adam update direction with weight decay
     float adamUpdate = mHat / (sqrtf(vHat) + epsilon);
@@ -1041,10 +1048,10 @@ extern ""C"" __global__ __launch_bounds__(256) void amsgrad_update(
     float vMaxVal = fmaxf(vMax[idx], vVal);
     vMax[idx] = vMaxVal;
 
-    float beta1Pow = powf(beta1, (float)safe_step);
-    float beta2Pow = powf(beta2, (float)safe_step);
-    float mHat = mVal / (1.0f - beta1Pow);
-    float vMaxHat = vMaxVal / (1.0f - beta2Pow);
+    float beta1PowBc = hip_nn_bias_correction(beta1, (float)safe_step);
+    float beta2PowBc = hip_nn_bias_correction(beta2, (float)safe_step);
+    float mHat = mVal / beta1PowBc;
+    float vMaxHat = vMaxVal / beta2PowBc;
 
     param[idx] -= learningRate * mHat / (sqrtf(vMaxHat) + epsilon);
 }
@@ -1072,7 +1079,7 @@ extern ""C"" __global__ __launch_bounds__(256) void adamax_update(
     float uVal = fmaxf(beta2 * u[idx], fabsf(grad));
     u[idx] = uVal;
 
-    float biasCorrection = 1.0f - powf(beta1, (float)safe_step);
+    float biasCorrection = hip_nn_bias_correction(beta1, (float)safe_step);
 
     param[idx] -= (learningRate / biasCorrection) * mVal / (uVal + epsilon);
 }
@@ -1123,15 +1130,15 @@ extern ""C"" __global__ __launch_bounds__(256) void nadam_update(
     float vVal = beta2 * v[idx] + (1.0f - beta2) * grad * grad;
     v[idx] = vVal;
 
-    float beta1Pow = powf(beta1, (float)safe_step);
-    float beta1PowNext = powf(beta1, (float)(safe_step + 1));
-    float beta2Pow = powf(beta2, (float)safe_step);
-    float vHat = vVal / (1.0f - beta2Pow);
+    float beta1PowBc = hip_nn_bias_correction(beta1, (float)safe_step);
+    float beta1PowNextBc = hip_nn_bias_correction(beta1, (float)(safe_step + 1));
+    float beta2PowBc = hip_nn_bias_correction(beta2, (float)safe_step);
+    float vHat = vVal / beta2PowBc;
 
     // Nadam (Dozat 2016, Alg. 2, constant mu = beta1): the momentum look-ahead uses the NEXT step's bias
     // correction (1 - beta1^(t+1)), the current gradient this step's (1 - beta1^t). Matches PyTorch NAdam at
     // constant momentum and FusedOptimizer.NadamUpdateSimd.
-    float mNesterov = beta1 * mVal / (1.0f - beta1PowNext) + (1.0f - beta1) * grad / (1.0f - beta1Pow);
+    float mNesterov = beta1 * mVal / beta1PowNextBc + (1.0f - beta1) * grad / beta1PowBc;
 
     param[idx] -= learningRate * mNesterov / (sqrtf(vHat) + epsilon);
 }

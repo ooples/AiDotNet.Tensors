@@ -808,6 +808,15 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 _clockRateKHz = clockKHz;
             }
 
+            // PCI address: matches this device to the driver's own GPU list for the read-only issue-rate query
+            // (#1549, NvRmIssueRateQuery).
+            if (CuBlasNative.cuDeviceGetAttribute(out int pciDomain, (int)CudaDeviceAttribute.PciDomainId, device) == CudaResult.Success
+                && CuBlasNative.cuDeviceGetAttribute(out int pciBus, (int)CudaDeviceAttribute.PciBusId, device) == CudaResult.Success
+                && CuBlasNative.cuDeviceGetAttribute(out int pciDevice, (int)CudaDeviceAttribute.PciDeviceId, device) == CudaResult.Success)
+            {
+                _pciAddress = (pciDomain, pciBus, pciDevice);
+            }
+
             // Compute theoretical peak FP32 GFLOPS from hardware specs
             TheoreticalGflops = ComputeTheoreticalGflops(_ccMajor, _ccMinor, _multiProcessorCount, _clockRateKHz);
 

@@ -1,0 +1,287 @@
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
+
+using System;
+using System.Linq;
+using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Helpers;
+using AiDotNet.Tensors.LinearAlgebra;
+using Xunit;
+
+namespace AiDotNet.Tensors.Tests.Engines.RoiAudio;
+
+/// <summary>
+/// RoIAlign forward and backward run from precomputed bilinear taps, in parallel. These tests compare them with a
+/// direct per-sample rendering of torchvision's roi_align on several images, channels and overlapping RoIs, for both
+/// <c>aligned</c> settings and both sampling-ratio rules.
+/// </summary>
+public class RoIAlignPlanTests
+{
+    private const int N = 2, C = 3, H = 7, W = 9, OutH = 3, OutW = 2;
+
+    // [batch, x1, y1, x2, y2]: overlapping boxes on image 0, one on image 1, one past the right and bottom edges, one
+    // smaller than a pixel, one of zero width and one inverted (x2 < x1, y2 < y1). Aligned, the last two have an empty
+    // sampling grid when the ratio is adaptive.
+    private static readonly double[] Boxes =
+    {
+        0, 0.5, 0.25, 6.0, 5.5,
+        0, 2.0, 1.0, 7.5, 6.0,
+        1, 1.25, 0.75, 4.0, 3.5,
+        1, 5.0, 4.0, 11.0, 9.5,
+        0, 3.1, 2.2, 3.4, 2.6,
+        1, 4.0, 3.0, 4.0, 5.0,
+        0, 6.0, 2.0, 5.5, 1.5,
+    };
+
+    private static double[] Image() =>
+        Enumerable.Range(0, N * C * H * W).Select(i => Math.Sin(i * 0.37) + (i % 11) * 0.05).ToArray();
+
+    private static double Sample(double[] x, int plane, double y, double xx)
+    {
+        if (y < -1.0 || y > H || xx < -1.0 || xx > W) return 0;
+        if (y <= 0) y = 0;
+        if (xx <= 0) xx = 0;
+        int y0 = (int)y, x0 = (int)xx, y1, x1;
+        if (y0 >= H - 1) { y0 = y1 = H - 1; y = y0; } else y1 = y0 + 1;
+        if (x0 >= W - 1) { x0 = x1 = W - 1; xx = x0; } else x1 = x0 + 1;
+        double ly = y - y0, lx = xx - x0;
+        return (1 - ly) * (1 - lx) * x[plane + (y0 * W) + x0] + (1 - ly) * lx * x[plane + (y0 * W) + x1]
+            + ly * (1 - lx) * x[plane + (y1 * W) + x0] + ly * lx * x[plane + (y1 * W) + x1];
+    }
+
+    // torchvision's roi_align, one output at a time. The weights of the samples are what the backward scatters, so the
+    // reference gradient of sum(output * g) is read off the same rule by linearity (see ReferenceGradient).
+    private static double[] Reference(double[] x, float scale, int ratio, bool aligned)
+    {
+        int k = Boxes.Length / 5;
+        var output = new double[k * C * OutH * OutW];
+        double shift = aligned ? 0.5 : 0;
+        for (int r = 0; r < k; r++)
+        {
+            int n = (int)Boxes[r * 5];
+            double x1 = Boxes[(r * 5) + 1] * scale - shift, y1 = Boxes[(r * 5) + 2] * scale - shift;
+            double x2 = Boxes[(r * 5) + 3] * scale - shift, y2 = Boxes[(r * 5) + 4] * scale - shift;
+            double rw = aligned ? x2 - x1 : Math.Max(x2 - x1, 1), rh = aligned ? y2 - y1 : Math.Max(y2 - y1, 1);
+            double bh = rh / OutH, bw = rw / OutW;
+            // torchvision's count = max(grid_h * grid_w, 1): an empty grid averages to 0.
+            int gy = ratio > 0 ? ratio : (int)Math.Ceiling(rh / OutH);
+            int gx = ratio > 0 ? ratio : (int)Math.Ceiling(rw / OutW);
+            for (int c = 0; c < C; c++)
+            for (int ph = 0; ph < OutH; ph++)
+            for (int pw = 0; pw < OutW; pw++)
+            {
+                double sum = 0;
+                for (int iy = 0; iy < gy; iy++)
+                for (int ix = 0; ix < gx; ix++)
+                    sum += Sample(x, (n * C + c) * H * W, y1 + ph * bh + (iy + 0.5) * bh / gy, x1 + pw * bw + (ix + 0.5) * bw / gx);
+                output[(((r * C) + c) * OutH + ph) * OutW + pw] = sum / Math.Max(gy * gx, 1);
+            }
+        }
+
+        return output;
+    }
+
+    // RoIAlign is linear in its input, so d/dx_i sum(output * g) = sum(Reference(e_i) * g).
+    private static double[] ReferenceGradient(double[] g, float scale, int ratio, bool aligned)
+    {
+        var gradient = new double[N * C * H * W];
+        var basis = new double[gradient.Length];
+        for (int i = 0; i < gradient.Length; i++)
+        {
+            basis[i] = 1;
+            var output = Reference(basis, scale, ratio, aligned);
+            double sum = 0;
+            for (int j = 0; j < output.Length; j++) sum += output[j] * g[j];
+            gradient[i] = sum;
+            basis[i] = 0;
+        }
+
+        return gradient;
+    }
+
+    [Theory]
+    [InlineData(false, 2, 1.0f)]
+    [InlineData(false, 0, 1.0f)]
+    [InlineData(true, 2, 1.0f)]
+    [InlineData(true, 0, 0.75f)]
+    public void Forward_matches_the_per_sample_rule(bool aligned, int ratio, float scale)
+    {
+        var image = Image();
+        var input = new Tensor<double>(image, new[] { N, C, H, W });
+        var boxes = new Tensor<double>(Boxes, new[] { Boxes.Length / 5, 5 });
+        var actual = new CpuEngine().RoIAlign(input, boxes, OutH, OutW, scale, ratio, aligned).ToArray();
+        var expected = Reference(image, scale, ratio, aligned);
+        Assert.Equal(expected.Length, actual.Length);
+        for (int i = 0; i < expected.Length; i++)
+            Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-12, $"[{i}] reference {expected[i]} vs {actual[i]}");
+    }
+
+    [Fact]
+    public void Aligned_degenerate_rois_average_to_zero_as_torchvision()
+    {
+        // torchvision.ops.roi_align(aligned=True, sampling_ratio=-1) on a zero-width box: ceil(0 / out) = 0 samples,
+        // count = max(0, 1) = 1, so every bin is 0. Sampling the box edge instead gave the image's values there.
+        var input = new Tensor<double>(Image(), new[] { N, C, H, W });
+        var boxes = new Tensor<double>(new double[] { 1, 4.0, 3.0, 4.0, 5.0, 0, 6.0, 2.0, 5.5, 1.5 }, new[] { 2, 5 });
+        var output = new CpuEngine().RoIAlign(input, boxes, OutH, OutW, 1.0f, 0, true).ToArray();
+        Assert.All(output, v => Assert.Equal(0.0, v));
+    }
+
+    [Fact]
+    public void Float_forward_matches_the_per_sample_rule()
+    {
+        var image = Image();
+        var input = new Tensor<float>(image.Select(v => (float)v).ToArray(), new[] { N, C, H, W });
+        var boxes = new Tensor<float>(Boxes.Select(v => (float)v).ToArray(), new[] { Boxes.Length / 5, 5 });
+        var actual = new CpuEngine().RoIAlign(input, boxes, OutH, OutW, 1.0f, 2, false).ToArray();
+        var expected = Reference(image.Select(v => (double)(float)v).ToArray(), 1.0f, 2, false);
+        for (int i = 0; i < expected.Length; i++)
+            Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-5 * (1 + Math.Abs(expected[i])), $"[{i}] reference {expected[i]} vs {actual[i]}");
+    }
+
+    [Theory]
+    [InlineData(false, 2, 1.0f)]
+    [InlineData(true, 0, 0.75f)]
+    public void Backward_matches_the_adjoint_of_the_per_sample_rule(bool aligned, int ratio, float scale)
+    {
+        var engine = new CpuEngine();
+        var input = new Tensor<double>(Image(), new[] { N, C, H, W });
+        var boxes = new Tensor<double>(Boxes, new[] { Boxes.Length / 5, 5 });
+        int outputs = Boxes.Length / 5 * C * OutH * OutW;
+        var g = Enumerable.Range(0, outputs).Select(i => Math.Cos(i * 0.21)).ToArray();
+        var weights = new Tensor<double>(g, new[] { Boxes.Length / 5, C, OutH, OutW });
+
+        double[] actual;
+        using (var tape = new GradientTape<double>())
+        {
+            var output = engine.RoIAlign(input, boxes, OutH, OutW, scale, ratio, aligned);
+            var loss = engine.ReduceSum(engine.TensorMultiply(output, weights), new[] { 0, 1, 2, 3 }, keepDims: false);
+            var grads = tape.ComputeGradients(loss, new[] { input });
+            actual = grads[input].ToArray();
+        }
+
+        var expected = ReferenceGradient(g, scale, ratio, aligned);
+        Assert.Equal(expected.Length, actual.Length);
+        for (int i = 0; i < expected.Length; i++)
+            Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-12, $"[{i}] reference {expected[i]} vs {actual[i]}");
+    }
+
+    // Adaptive sampling grows a RoI's taps with its area, so the taps are built one budgeted run of RoIs at a time.
+    // 150 RoIs of 120x120 at 18x18 samples per bin need about 9.5 million taps, over two budgets: the runs must each
+    // fit the budget, and together give what each RoI gives alone, forward and (summed) backward.
+    [Fact]
+    public void Large_adaptive_rois_run_in_budgeted_plans_that_match_each_roi_alone()
+    {
+        const int images = 1, channels = 2, height = 128, width = 128, outH = 7, outW = 7, rois = 150;
+        var rng = RandomHelper.CreateSeededRandom(5);
+        var input = Enumerable.Range(0, images * channels * height * width).Select(_ => rng.NextDouble() - 0.5).ToArray();
+        var boxes = new double[rois * 5];
+        for (int r = 0; r < rois; r++)
+        {
+            double x = rng.NextDouble() * 6, y = rng.NextDouble() * 6;
+            boxes[(r * 5) + 1] = x;
+            boxes[(r * 5) + 2] = y;
+            boxes[(r * 5) + 3] = x + 120;
+            boxes[(r * 5) + 4] = y + 120;
+        }
+
+        var plans = RoIAlignPlan.Plans(boxes, images, height, width, outH, outW, 1.0f, 0, false).ToList();
+        Assert.True(plans.Count > 1, $"{plans.Count} plan(s)");
+        Assert.Equal(rois, plans.Sum(p => p.Rois));
+        Assert.All(plans, p => Assert.True(p.Offsets.Length <= RoIAlignPlan.TapBudget, $"{p.Offsets.Length} taps"));
+
+        var forward = RoIAlignPlan.Forward(boxes, images, height, width, outH, outW, 1.0f, 0, false, input, channels);
+        var gradOutput = Enumerable.Range(0, forward.Length).Select(i => Math.Sin(i * 0.37)).ToArray();
+        var backward = RoIAlignPlan.Backward(boxes, images, height, width, outH, outW, 1.0f, 0, false, gradOutput, channels);
+        int perRoi = channels * outH * outW;
+        var summed = new double[backward.Length];
+        for (int r = 0; r < rois; r++)
+        {
+            var one = boxes.Skip(r * 5).Take(5).ToArray();
+            var alone = RoIAlignPlan.Forward(one, images, height, width, outH, outW, 1.0f, 0, false, input, channels);
+            for (int i = 0; i < perRoi; i++)
+                Assert.Equal(alone[i], forward[(r * perRoi) + i]);
+            var gradAlone = RoIAlignPlan.Backward(one, images, height, width, outH, outW, 1.0f, 0, false,
+                gradOutput.Skip(r * perRoi).Take(perRoi).ToArray(), channels);
+            for (int i = 0; i < summed.Length; i++) summed[i] += gradAlone[i];
+        }
+
+        for (int i = 0; i < summed.Length; i++)
+            Assert.True(Math.Abs(summed[i] - backward[i]) <= 1e-9 * (1 + Math.Abs(summed[i])), $"[{i}] {summed[i]} vs {backward[i]}");
+    }
+
+    // One RoI whose taps alone pass the budget (1,400 px square, 200x200 samples per bin, ~7.8M taps) has no table: it
+    // is sampled on the fly. It must give what a table gives (an unlimited budget builds one), bit for bit forward, and
+    // to rounding backward, where the table plan and the direct plan group the same sums differently.
+    [Fact]
+    public void A_roi_over_the_budget_is_sampled_without_a_table_and_matches_the_table()
+    {
+        const int images = 2, channels = 2, height = 64, width = 64, outH = 7, outW = 7;
+        var rng = RandomHelper.CreateSeededRandom(11);
+        var input = Enumerable.Range(0, images * channels * height * width).Select(_ => rng.NextDouble() - 0.5).ToArray();
+        double[] boxes = { 1, -700, -650, 700, 750, 0, 3, 4, 40, 50 };
+
+        var plans = RoIAlignPlan.Plans(boxes, images, height, width, outH, outW, 1.0f, 0, false).ToList();
+        Assert.Equal(2, plans.Count);
+        Assert.True(plans[0].IsDirect);
+        Assert.Empty(plans[0].Offsets);
+        Assert.False(plans[1].IsDirect);
+
+        var forward = RoIAlignPlan.Forward(boxes, images, height, width, outH, outW, 1.0f, 0, false, input, channels);
+        var table = RoIAlignPlan.Forward(boxes, images, height, width, outH, outW, 1.0f, 0, false, input, channels,
+            tapBudget: long.MaxValue);
+        Assert.Equal(table, forward);
+        Assert.Contains(forward, v => v != 0);
+
+        var gradOutput = Enumerable.Range(0, forward.Length).Select(i => Math.Cos(i * 0.29)).ToArray();
+        var backward = RoIAlignPlan.Backward(boxes, images, height, width, outH, outW, 1.0f, 0, false, gradOutput, channels);
+        var tableBackward = RoIAlignPlan.Backward(boxes, images, height, width, outH, outW, 1.0f, 0, false, gradOutput,
+            channels, tapBudget: long.MaxValue);
+        for (int i = 0; i < backward.Length; i++)
+            Assert.True(Math.Abs(tableBackward[i] - backward[i]) <= 1e-12 * (1 + Math.Abs(tableBackward[i])),
+                $"[{i}] {tableBackward[i]} vs {backward[i]}");
+    }
+
+    [Theory]
+    [InlineData(2)]
+    [InlineData(-1)]
+    public void A_batch_index_outside_the_input_is_rejected(double image)
+    {
+        var input = new Tensor<double>(Image(), new[] { N, C, H, W });
+        var boxes = new Tensor<double>(new[] { 0, 0.5, 0.25, 6.0, 5.5, image, 1.0, 1.0, 4.0, 4.0 }, new[] { 2, 5 });
+        var error = Assert.Throws<ArgumentException>(() => new CpuEngine().RoIAlign(input, boxes, OutH, OutW, 1.0f, 2, false));
+        Assert.Contains("out of range", error.Message);
+    }
+
+    // Element types other than float and double go through a double copy; decimal holds every double input exactly
+    // enough that forward and backward must equal the double path's to rounding.
+    [Fact]
+    public void Decimal_forward_and_backward_match_the_double_path()
+    {
+        var engine = new CpuEngine();
+        var image = Image();
+        int outputs = Boxes.Length / 5 * C * OutH * OutW;
+        var g = Enumerable.Range(0, outputs).Select(i => Math.Cos(i * 0.21)).ToArray();
+
+        var expected = Reference(image, 1.0f, 2, false);
+        var expectedGradient = ReferenceGradient(g, 1.0f, 2, false);
+
+        var input = new Tensor<decimal>(image.Select(v => (decimal)v).ToArray(), new[] { N, C, H, W });
+        var boxes = new Tensor<decimal>(Boxes.Select(v => (decimal)v).ToArray(), new[] { Boxes.Length / 5, 5 });
+        var weights = new Tensor<decimal>(g.Select(v => (decimal)v).ToArray(), new[] { Boxes.Length / 5, C, OutH, OutW });
+        decimal[] actual, actualGradient;
+        using (var tape = new GradientTape<decimal>())
+        {
+            var output = engine.RoIAlign(input, boxes, OutH, OutW, 1.0f, 2, false);
+            actual = output.ToArray();
+            var loss = engine.ReduceSum(engine.TensorMultiply(output, weights), new[] { 0, 1, 2, 3 }, keepDims: false);
+            actualGradient = tape.ComputeGradients(loss, new[] { input })[input].ToArray();
+        }
+
+        for (int i = 0; i < expected.Length; i++)
+            Assert.True(Math.Abs(expected[i] - (double)actual[i]) <= 1e-12, $"[{i}] reference {expected[i]} vs {actual[i]}");
+        for (int i = 0; i < expectedGradient.Length; i++)
+            Assert.True(Math.Abs(expectedGradient[i] - (double)actualGradient[i]) <= 1e-12,
+                $"[{i}] reference {expectedGradient[i]} vs {actualGradient[i]}");
+    }
+}

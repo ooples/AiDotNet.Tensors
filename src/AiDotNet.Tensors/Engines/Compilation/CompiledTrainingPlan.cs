@@ -605,10 +605,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // Every other pre-allocated gradient is an intermediate the next backward recomputes; landing all of them
         // downloaded ~800 MB of activation gradients per plan when N-BEATS finished training on the GPU (966 tensors,
         // ~0.35 s a plan, two plans a Train call: the largest fixed cost of a GPU Train, AiDotNet#1804).
-        var parameterGradients = new HashSet<Tensor<T>>(_gradients, ReferenceEqualityComparer<Tensor<T>>.Instance);
-        if (_liveGradientMap is { } liveGradients)
-            foreach (var parameter in _parameters)
-                if (liveGradients.TryGetValue(parameter, out var current)) parameterGradients.Add(current);
+        // Requested input-leaf gradients (AIDOTNET_COMPILED_INPUT_GRADS) are read through .Grad like the parameters'.
+        var parameterGradients = ResultGradients();
         // Parameter and intermediate gradients share pooled backing arrays, and unbinding drops the array's pending
         // download. In _preAllocatedGrads order an intermediate could drop it before a later parameter gradient landed,
         // leaving that gradient's stale host values. So: take the intermediates out of their arrays' groups, land the
@@ -710,6 +708,18 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             "[PING-PONG] " + message + System.Environment.NewLine); } catch { }
     }
 
+    /// <summary>
+    /// True when <c>AIDOTNET_COMPILED_INPUT_GRADS=1</c>: compiled training plans then also compute the gradient into
+    /// the graph's external leaves (the network input) and set <c>.Grad</c> on them. Off by default, because training
+    /// never reads it and the first layer's input gradient is a whole extra convolution or GEMM. Read at compile time.
+    /// </summary>
+    internal static bool CompiledInputGradientsRequested
+        => CompiledInputGradientsForTests ?? Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_INPUT_GRADS") == "1";
+
+    /// <summary>Tests: overrides <c>AIDOTNET_COMPILED_INPUT_GRADS</c> for plans compiled on this thread (null: the variable).
+    /// Thread-local, so a test that turns it on cannot leak input gradients into another test's plan.</summary>
+    [ThreadStatic] internal static bool? CompiledInputGradientsForTests;
+
     private void RecordGraphCaptureFailure(string reason)
     {
         GraphCaptureFailureReason = reason;
@@ -719,6 +729,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     /// <summary>Keeps THIS plan's captured SGD update in place (one step graph): the oracle for the ping-pong update.</summary>
     internal void DisablePingPongForTesting() => _pingPongRejected = true;
+
+    /// <summary>
+    /// The node counts of this plan's captured step graph, read when it was captured; null while the plan has none (no
+    /// capture ran, it failed, or the backend has no device graphs).
+    /// </summary>
+    internal Engines.DirectGpu.GraphNodeCounts? StepGraphNodeCounts { get; private set; }
 
     /// <summary>True while the plan replays a graph per replay parity.</summary>
     internal bool ReplaysParityGraphs => _stepGraphExecOdd != IntPtr.Zero;
@@ -1263,18 +1279,18 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (_engine is not Engines.DirectGpuTensorEngine gte
             || gte.GetBackend() is not Engines.DirectGpu.IGpuGraphCapture { ContextIsLive: true })
             return;
-        var gradients = Gradients;
+        // Parameter gradients and requested input-leaf gradients: both are read after the plan retires.
+        var landed = ResultGradients();
         // The intermediate gradients share pooled backing arrays with these, and a host read of an array downloads
         // every resident member on it: landing N-BEATS's parameter gradients downloaded all 966 of the plan's gradient
         // buffers (~800 MB) at the end of every GPU Train. The intermediates' device values are discarded with the
         // plan, so take them out of their groups first (AiDotNet#1804).
-        var landed = new HashSet<Tensor<T>>(gradients.Where(g => g is not null)!, ReferenceEqualityComparer<Tensor<T>>.Instance);
         foreach (var buffer in _preAllocatedGrads)
             if (buffer is not null && !landed.Contains(buffer))
                 Helpers.ResidentHostMirror.Detach(buffer);
-        foreach (var gradient in gradients)
+        foreach (var gradient in landed)
         {
-            if (gradient is null || TryHandGradientToTensorLifetime(gradient)) continue;
+            if (TryHandGradientToTensorLifetime(gradient)) continue;
             if (gradient.GetBackingArrayForCacheLookupUnsafe() is not { } backing) continue;
             try { Helpers.HostSync.TryMaterialize(backing); }
             catch (InvalidOperationException) { /* released without a host copy: nothing left to preserve */ }
@@ -1351,6 +1367,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
         bool hadGraph = _stepGraphExec != IntPtr.Zero;
         _stepGraphExec = IntPtr.Zero;
+        StepGraphNodeCounts = null;
         _stepGraphExecOdd = IntPtr.Zero;
         _graphStepCalls = 0;
         DisposeStepIo();   // before the rollback below, which may read the loss
@@ -1503,6 +1520,33 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     private Dictionary<Tensor<T>, Tensor<T>>? _liveGradientMap;
 
+    // The external leaves whose gradients AIDOTNET_COMPILED_INPUT_GRADS asked for. Their .Grad is read after the
+    // step like a parameter's, so retiring the plan must keep it. The compile-time set is thread-static and cleared
+    // when Compile returns, so the plan keeps its own copy.
+    private Tensor<T>[] _requestedInputGradientLeaves = Array.Empty<Tensor<T>>();
+
+    /// <summary>
+    /// The gradients a reader can still ask for once the plan retires: every parameter's (<see cref="Gradients"/>)
+    /// and every requested input leaf's, as the live gradient map and the leaf's <c>.Grad</c> hold them. Everything
+    /// else the plan pre-allocated is an intermediate the next backward recomputes.
+    /// </summary>
+    private HashSet<Tensor<T>> ResultGradients()
+    {
+        var results = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        foreach (var gradient in _gradients)
+            if (gradient is not null) results.Add(gradient);
+        var live = _liveGradientMap;
+        if (live is not null)
+            foreach (var parameter in _parameters)
+                if (live.TryGetValue(parameter, out var current)) results.Add(current);
+        foreach (var leaf in _requestedInputGradientLeaves)
+        {
+            if (live is not null && live.TryGetValue(leaf, out var mapped)) results.Add(mapped);
+            if (leaf.Grad is { } published) results.Add(published);
+        }
+        return results;
+    }
+
     // Reshape-view gradients (AliasReshapeViewGradients) and the gradient buffer each views. They share host storage
     // but not a device binding, so the GPU step binds each view to its target's device buffer.
     private (Tensor<T> View, Tensor<T> Target)[]? _aliasedGradViews;
@@ -1584,6 +1628,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var persistent = new bool[tensorCount];
             foreach (var p in parameters)
                 if (idOf.TryGetValue(p, out var pid)) persistent[pid] = true;
+            // Requested input gradients (AIDOTNET_COMPILED_INPUT_GRADS) are read through .Grad after the step, like the
+            // parameters', so a leaf's buffer must not be shared with another same-shaped gradient.
+            foreach (var leaf in RequestedInputGradientLeaves(forwardSteps))
+                if (idOf.TryGetValue(leaf, out var leafId)) persistent[leafId] = true;
             if (forwardSteps.Count > 0 &&
                 idOf.TryGetValue(forwardSteps[forwardSteps.Count - 1].OutputBuffer, out var lossId))
                 persistent[lossId] = true;
@@ -1707,6 +1755,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         bool device = engine.SupportsGpu || engine is Engines.DirectGpuTensorEngine;
         HashSet<CompiledStep<T>>? aliased = null;
         var parameterSet = new HashSet<Tensor<T>>(parameters, ReferenceEqualityComparer<Tensor<T>>.Instance);
+        // With AIDOTNET_COMPILED_INPUT_GRADS the external leaves publish .Grad from the backward that writes them. An
+        // aliased leaf's gradient is a view written by no backward (the add's is skipped), so its .Grad would never be
+        // set: keep the leaves out of the aliasing, like the parameters.
+        parameterSet.UnionWith(RequestedInputGradientLeaves(forwardSteps));
         var dropped = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
         for (int i = forwardSteps.Count - 1; i >= 0; i--)
         {
@@ -1928,6 +1980,27 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     }
 
 
+    // The graph's external leaves (inputs no step produces) when AIDOTNET_COMPILED_INPUT_GRADS asks for their gradients;
+    // empty otherwise.
+    // Computed once per compile (the flag read once, so every pass sees the same set) and cleared by Compile.
+    [ThreadStatic] private static HashSet<Tensor<T>>? t_requestedInputGradientLeaves;
+    [ThreadStatic] private static IReadOnlyList<CompiledStep<T>>? t_requestedInputGradientSteps;
+
+    private static IEnumerable<Tensor<T>> RequestedInputGradientLeaves(IReadOnlyList<CompiledStep<T>> forwardSteps)
+    {
+        if (t_requestedInputGradientLeaves is { } cached && ReferenceEquals(t_requestedInputGradientSteps, forwardSteps))
+            return cached;
+        t_requestedInputGradientSteps = forwardSteps;
+        if (!CompiledInputGradientsRequested) return t_requestedInputGradientLeaves = new HashSet<Tensor<T>>();
+        var produced = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        foreach (var fwdStep in forwardSteps) produced.Add(fwdStep.OutputBuffer);
+        var leaves = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        foreach (var fwdStep in forwardSteps)
+            foreach (var leaf in fwdStep.Inputs.OfType<Tensor<T>>().Where(input => !produced.Contains(input)))
+                leaves.Add(leaf);
+        return t_requestedInputGradientLeaves = leaves;
+    }
+
     private static int[][] BuildPooledGradMap(
         System.Collections.Generic.HashSet<Tensor<T>> allTensors,
         System.Collections.Generic.List<CompiledStep<T>> forwardSteps,
@@ -2017,6 +2090,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var persistent = new bool[tc];
         foreach (var p in parameters)
             if (idOf.TryGetValue(p, out var pid)) persistent[pid] = true;
+        // Requested input gradients (AIDOTNET_COMPILED_INPUT_GRADS) are read through .Grad after the step, like the
+        // parameters', so a leaf's buffer must not be shared with another same-shaped gradient.
+        foreach (var leaf in RequestedInputGradientLeaves(forwardSteps))
+            if (idOf.TryGetValue(leaf, out var leafId)) persistent[leafId] = true;
         if (forwardSteps.Count > 0 &&
             idOf.TryGetValue(forwardSteps[forwardSteps.Count - 1].OutputBuffer, out var lossId))
             persistent[lossId] = true;
@@ -3857,6 +3934,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         // cortex on the launch-bound eager path. The scope dumps the offending call sites on exit.
                         using (AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.BeginCapture("StepGraphCapture"))
                             exec = cb.CaptureGraph(() => CaptureStepGraphBody(cb, parity: 0));
+                        StepGraphNodeCounts = exec != IntPtr.Zero ? cb.LastCaptureNodeCounts : null;
                     }
                     catch (Exception captureFailure)
                     {
@@ -3883,8 +3961,14 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     }
                     if (exec == IntPtr.Zero)
                     {
-                        RecordGraphCaptureFailure("the captured stream produced no graph (an op in the step body is not "
-                            + "capturable: a host read, a synchronous copy or an allocation; AIDOTNET_GRAPH_CAPTURE_DEBUG=1 names it)");
+                        // The backend ends a capture cleanly when the body throws or the driver invalidates it, and
+                        // returns a zero handle; its diagnostics say which, so the reason is not lost (#1096 F4).
+                        string? backendReason = cb.LastCaptureFailure;
+                        RecordGraphCaptureFailure(backendReason is not null
+                            ? "the captured stream produced no graph: " + backendReason
+                                + " (AIDOTNET_GRAPH_CAPTURE_DEBUG=1 traces the step body)"
+                            : "the captured stream produced no graph (an op in the step body is not capturable: a host "
+                                + "read, a synchronous copy or an allocation; AIDOTNET_GRAPH_CAPTURE_DEBUG=1 names it)");
                         // Capture failed → the graph is permanently abandoned for this plan. Resume the
                         // eviction suspension we took above right now: StepEager doesn't need stable device
                         // pointers, and leaving it suspended for the plan's whole lifetime pins every offload
@@ -8929,6 +9013,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         finally
         {
             t_gradPlaceholders = null;
+            t_requestedInputGradientLeaves = null;
+            t_requestedInputGradientSteps = null;
         }
     }
 
@@ -9259,10 +9345,16 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // (see DetectConvBiasActivationFusion). Off under grad pooling, whose re-zero schedule is planned per
         // backward action of the unfused stream, and on GPU engines, which keep the capturable generic path.
         // The tensors whose gradient can matter: the parameters and everything computed from one. A tensor outside
-        // this set (the network input, a constant) feeds no parameter's gradient, and the plan exposes only the
-        // parameters' gradients, so a backward may skip computing the gradient INTO it. Used by the Conv2D
-        // backwards below, where the input gradient of the first layer is a whole extra convolution.
+        // this set (the network input, a constant) feeds no parameter's gradient, so a backward may skip computing the
+        // gradient INTO it. Used by the Conv2D backwards below, where the input gradient of the first layer is a whole
+        // extra convolution. With AIDOTNET_COMPILED_INPUT_GRADS=1 the plan also exposes the external leaves' gradients,
+        // so they join the set; every pass that reads it (the shortcut pair, the conv-epilogue fusion's needInputGrad,
+        // the gradRequired pruning) then treats them like parameter-derived tensors, which is what makes .Grad appear.
         var requiresGradTensors = new HashSet<Tensor<T>>(parameters);
+        // AIDOTNET_COMPILED_INPUT_GRADS=1 (#1096 follow-up): also treat the graph's external leaves (the network input,
+        // labels, masks) as gradient sources, so the compiled step sets .Grad on them the way the eager tape does.
+        // Saliency maps and adversarial examples need the input gradient; training does not, so it stays off.
+        requiresGradTensors.UnionWith(RequestedInputGradientLeaves(forwardSteps));
         foreach (var fwdStep in forwardSteps)
             foreach (var fwdInput in fwdStep.Inputs)
                 if (fwdInput is not null && requiresGradTensors.Contains(fwdInput))
@@ -9280,9 +9372,23 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             && engine is CpuEngine && !engine.SupportsGpu
             && Environment.GetEnvironmentVariable("AIDOTNET_CONV_EPILOGUE_FUSION") != "0")
         {
+            var claimedElsewhere = new HashSet<int>(fusedStepIndices);
+            claimedElsewhere.UnionWith(consumedBySlicePrefix);
+            claimedElsewhere.UnionWith(analyticBackwardSpecs.Keys);
+            claimedElsewhere.UnionWith(analyticForwardSpecs.Keys);
+            claimedElsewhere.UnionWith(slicePrefixForwardSpecs.Keys);
+            claimedElsewhere.UnionWith(slicePrefixBackwardSpecs.Keys);
+            claimedElsewhere.UnionWith(skippableReduceSumIndices);
+            claimedElsewhere.UnionWith(skippableReduceSumForwardIndices);
+            // The backward loop skips reshape-aliased steps before it reaches the chain backwards, so a chain step that
+            // were also aliased would run the fused forward and silently drop the chain backward. No chain op is a
+            // Reshape and the GPU channel-bias alias never meets this CPU-only pass, but exclude them for a hard guarantee.
+            if (aliasedReshapeSteps is not null)
+                for (int stepIndex = 0; stepIndex < forwardSteps.Count; stepIndex++)
+                    if (aliasedReshapeSteps.Contains(forwardSteps[stepIndex])) claimedElsewhere.Add(stepIndex);
             DetectConvBiasActivationFusion(forwardSteps, consumerCount, gradMap, requiresGradTensors,
                 convEpilogueForwardSpecs, convEpilogueBackwardSpecs, consumedByConvEpilogue, convEpilogueChains,
-                convEpilogueDeadInternals);
+                convEpilogueDeadInternals, claimedElsewhere);
         }
 
         // Forward-only outputs (no backward reads them) share arrays by forward liveness; see PoolForwardOnlyOutputs.
@@ -9929,6 +10035,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 storageLeases);
             storageLeases = null;
             plan._liveGradientMap = gradMap;
+            plan._requestedInputGradientLeaves = RequestedInputGradientLeaves(forwardSteps).ToArray();
             plan._aliasedGradViews = aliasedGradViews?.ToArray();
             plan._eagerFirstWriteCandidates = eagerFirstWriteCandidates;
             plan._pooledGradients = pooledGradients;
@@ -10155,6 +10262,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             }
             var excluded = new HashSet<Tensor<T>>(parameters.Select(p => gradMap.TryGetValue(p, out var pg) ? pg : null).OfType<Tensor<T>>());
             if (gradMap.TryGetValue(lossOutput, out var lossGrad)) excluded.Add(lossGrad);
+            // Requested input gradients are read through .Grad after the step: each keeps an array of its own.
+            foreach (var leaf in RequestedInputGradientLeaves(forwardSteps))
+                if (gradMap.TryGetValue(leaf, out var leafGrad)) excluded.Add(leafGrad);
 
             var tenants = new List<int>();
             for (int g = 0; g < count; g++)
@@ -15021,9 +15131,14 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         Dictionary<int, Action<IEngine>> backwardSpecs,
         HashSet<int> consumed,
         Dictionary<int, int[]>? chainSteps = null,
-        List<Tensor<T>>? deadInternals = null)
+        List<Tensor<T>>? deadInternals = null,
+        HashSet<int>? excluded = null)
     {
         if (typeof(T) != typeof(float)) return;
+        // A step another fusion already owns (fused groups, analytic or slice-prefix specs, skipped reduce-sums) must
+        // not join a chain: the backward loop checks those owners before the chain's spec, so a shared index would run
+        // the fused forward and silently drop the chain's backward (#1096 follow-up).
+        bool Taken(int i) => consumed.Contains(i) || (excluded is not null && excluded.Contains(i));
         // AIDOTNET_CONV_POOL_BACKWARD_FUSION=0 keeps a following max pool's backward separate (A/B and tests).
         bool poolBackwardFusion = Environment.GetEnvironmentVariable("AIDOTNET_CONV_POOL_BACKWARD_FUSION") != "0";
 
@@ -15037,7 +15152,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         for (int convIdx = 0; convIdx < steps.Count; convIdx++)
         {
             var conv = steps[convIdx];
-            if (conv.OpType != OpType.Conv2D || conv.Inputs.Length != 2 || conv.BackwardFn == null) continue;
+            if (conv.OpType != OpType.Conv2D || conv.Inputs.Length != 2 || conv.BackwardFn == null || Taken(convIdx)) continue;
             if (conv.SavedState is not { Length: >= 3 } convState
                 || convState[0] is not int[] stride || convState[1] is not int[] padding
                 || convState[2] is not int[] dilation) continue;
@@ -15046,7 +15161,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var convOut = conv.OutputBuffer;
             if (x.Rank != 4 || kernel.Rank != 4 || convOut.Rank != 4
                 || !x.IsContiguous || !kernel.IsContiguous || !convOut.IsContiguous) continue;
-            if (!soleConsumer.TryGetValue(convOut, out int biasIdx) || biasIdx <= convIdx || consumed.Contains(biasIdx)) continue;
+            if (!soleConsumer.TryGetValue(convOut, out int biasIdx) || biasIdx <= convIdx || Taken(biasIdx)) continue;
 
             var biasStep = steps[biasIdx];
             if (biasStep.OpName != "TensorChannelBiasAdd" || biasStep.Inputs.Length != 2
@@ -15059,7 +15174,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // Extend through a ReLU when the bias-add output feeds only that ReLU.
             int last = biasIdx;
             bool relu = false;
-            if (soleConsumer.TryGetValue(biasOut, out int reluIdx) && reluIdx > biasIdx && !consumed.Contains(reluIdx))
+            if (soleConsumer.TryGetValue(biasOut, out int reluIdx) && reluIdx > biasIdx && !Taken(reluIdx))
             {
                 var reluStep = steps[reluIdx];
                 if (reluStep.OpType == OpType.ReLU && reluStep.Inputs.Length == 1
@@ -15089,7 +15204,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             Tensor<float>? gradPoolOutF = null;
             if (relu && poolBackwardFusion && y.Rank == 4 && y.IsContiguous
                 && soleConsumer.TryGetValue(y, out int candidatePool) && candidatePool > last
-                && !consumed.Contains(candidatePool))
+                && !Taken(candidatePool))
             {
                 var pool = steps[candidatePool];
                 if (pool.OpName == "AdaptiveAvgPool2D" && pool.Inputs.Length == 1 && ReferenceEquals(pool.Inputs[0], y)

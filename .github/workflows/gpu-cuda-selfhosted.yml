@@ -217,7 +217,15 @@ jobs:
         }
         $cuda = & $py -I -c 'import torch; print(torch.cuda.is_available())'
         if ($cuda -ne 'True') { Write-Output "::error::The CUDA build of torch cannot reach a device here (is_available: $cuda)."; exit 1 }
-        "PARITY_PYTHON=$py", "AIDOTNET_TORCH_PYTHON=$py", 'AIDOTNET_REQUIRE_TORCH_CUDA=1' |
+        # torch.compile's default cache is under the service account's temp folder
+        # (C:\WINDOWS\ServiceProfiles\NetworkService\AppData\Local\Temp\torchinductor_<user>), and a Triton kernel's
+        # files nest a 52-character hash, a temp folder and the fused kernel's name below it: past MAX_PATH, so every
+        # compile mode failed with FileNotFoundError and the ratchets deferred (run 42876141146). A short root on the
+        # work drive keeps them inside the limit, and persists the compiled kernels across runs.
+        $compileCache = "$(Split-Path -Qualifier $env:RUNNER_TEMP)\ti"
+        New-Item -ItemType Directory -Force -Path "$compileCache\triton" | Out-Null
+        "PARITY_PYTHON=$py", "AIDOTNET_TORCH_PYTHON=$py", 'AIDOTNET_REQUIRE_TORCH_CUDA=1',
+          "TORCHINDUCTOR_CACHE_DIR=$compileCache", "TRITON_CACHE_DIR=$compileCache\triton" |
           Out-File -Append -Encoding utf8 -FilePath $env:GITHUB_ENV
         "Python packages (python, numpy, torch, cuda): $(& $py -I -c 'import sys, numpy, torch; print(sys.version.split()[0], numpy.__version__, torch.__version__, torch.version.cuda)')" |
           Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
@@ -583,8 +591,12 @@ jobs:
           Write-Output "::error::torch.compile needs MSVC (Visual Studio 2022 or Build Tools with the C++ x64 tools and a Windows SDK); this runner has none."
           exit 1
         }
+        # Skip Platform: vcvars64 sets Platform=x64, MSBuild reads it as the Platform property, and dotnet test
+        # --no-build then looks for bin\x64\Release while the build step wrote bin\Release ("test source file not found").
         foreach ($line in (cmd /c "`"$vcvars`" >nul && set")) {
-          if ($line -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process') }
+          if ($line -match '^([^=]+)=(.*)$' -and $Matches[1] -ne 'Platform') {
+            [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process')
+          }
         }
         if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) { Write-Output "::error::vcvars64.bat ran but cl.exe is not on PATH."; exit 1 }
         Write-Output "MSVC: $vs"

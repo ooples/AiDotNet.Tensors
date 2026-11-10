@@ -8,6 +8,10 @@ public sealed partial class MetalBackend : IGpuGraphCapture
 
     bool IGpuGraphCapture.ContextIsLive => IsAvailable;
 
+    string? IGpuGraphCapture.LastCaptureFailure => null;
+
+    GraphNodeCounts? IGpuGraphCapture.LastCaptureNodeCounts => null;
+
     bool IGpuGraphCapture.IsStreamCapturing() => false;
 
     int IGpuGraphCapture.StreamCaptureStatusRaw() => 0;

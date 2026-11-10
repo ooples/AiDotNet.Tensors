@@ -14215,7 +14215,10 @@ public partial class CpuEngine : ITensorLevelEngine
             // treats it as Kᵀ-major and contracts over K).
             // Large products take the parallel packed BLAS first: a tied LM head's logits [1024,512]·[49152,512]ᵀ ran
             // 592 ms through SimdGemm vs PyTorch's 207 ms (3990X).
-            if ((long)M * N * K >= MatMulTransposedBlasMinWork)
+            // A few rows against a tall B stay on SimdGemm's skinny A·Bᵀ kernel (one dot product per output): the packed
+            // BLAS ran one whisper-tiny row against its [51865, 384] table in 51 ms against 4 ms for A·B pre-transposed.
+            if ((long)M * N * K >= MatMulTransposedBlasMinWork
+                && !AiDotNet.Tensors.Engines.Simd.SimdGemm.QualifiesForSkinnyTransB(false, true, M, K, N))
                 BlasProvider.GemmEx(M, N, K, aRaw, aOff, K, false, bRaw, bOff, K, true, rRaw, rOff, N);
             else
             AiDotNet.Tensors.Engines.Simd.SimdGemm.Sgemm(
@@ -21638,6 +21641,9 @@ public partial class CpuEngine : ITensorLevelEngine
         var gradInput = AutoTensorCache.RentOrAllocate<T>(inputShape);
         using var gradInputDataLease = gradInput.LeaseArray();
         var gradInputData = gradInputDataLease.Array;
+        // The scatter below accumulates, and RentOrAllocate can hand back a reused buffer (an earlier
+        // call's result or one a backward recycled), so start from zero as the grouped overload does.
+        Array.Clear(gradInputData, 0, (int)gradInput.Length);
         using var gradOutputDataLease = gradOutput.LeaseArray();
         var gradOutputData = gradOutputDataLease.Array;
         using var kernelDataLease = kernel.LeaseArray();
@@ -21923,6 +21929,9 @@ public partial class CpuEngine : ITensorLevelEngine
         var gradKernel = AutoTensorCache.RentOrAllocate<T>(kernelShape);
         using var gradKernelDataLease = gradKernel.LeaseArray();
         var gradKernelData = gradKernelDataLease.Array;
+        // The scatter below accumulates, and RentOrAllocate can hand back a reused buffer (an earlier
+        // call's result or one a backward recycled), so start from zero as the grouped overload does.
+        Array.Clear(gradKernelData, 0, (int)gradKernel.Length);
         using var gradOutputDataLease = gradOutput.LeaseArray();
         var gradOutputData = gradOutputDataLease.Array;
         using var inputDataLease = input.LeaseArray();
@@ -39027,22 +39036,52 @@ public partial class CpuEngine : ITensorLevelEngine
         // index that overflows int32 (>2 billion) fails with a meaningful
         // ArgumentOutOfRangeException instead of an OverflowException buried
         // inside Convert.ToInt32.
-        for (int i = 0; i < numIndices; i++)
+        if (typeof(TIndex) == typeof(int))
         {
-            long tokenIdxLong = Convert.ToInt64(idxData[i]);
-
-            if (tokenIdxLong < 0 || tokenIdxLong >= vocabSize)
-                throw new ArgumentOutOfRangeException(nameof(indices),
-                    $"Index {tokenIdxLong} at position {i} is out of bounds for vocabulary size {vocabSize}.");
-
-            int tokenIdx = (int)tokenIdxLong;
-            int srcOffset = i * embeddingDim;
-            int dstOffset = tokenIdx * embeddingDim;
-
-            // Accumulate gradient for this embedding row - direct array access
-            for (int d = 0; d < embeddingDim; d++)
+            var intIdx = (int[])(object)idxData;
+            for (int i = 0; i < numIndices; i++)
             {
-                gradEmbData[dstOffset + d] = numOps.Add(gradEmbData[dstOffset + d], gradData[srcOffset + d]);
+                int tokenIdx = intIdx[i];
+                if ((uint)tokenIdx >= (uint)vocabSize)
+                    throw new ArgumentOutOfRangeException(nameof(indices),
+                        $"Index {tokenIdx} at position {i} is out of bounds for vocabulary size {vocabSize}.");
+                int srcOffset = i * embeddingDim;
+                int dstOffset = tokenIdx * embeddingDim;
+                var dstSlice = gradEmbData.AsSpan(dstOffset, embeddingDim);
+                numOps.Add(dstSlice, gradData.AsSpan(srcOffset, embeddingDim), dstSlice);
+            }
+        }
+        else if (typeof(TIndex) == typeof(long))
+        {
+            var longIdx = (long[])(object)idxData;
+            for (int i = 0; i < numIndices; i++)
+            {
+                long tokenIdxLong = longIdx[i];
+                if (tokenIdxLong < 0 || tokenIdxLong >= vocabSize)
+                    throw new ArgumentOutOfRangeException(nameof(indices),
+                        $"Index {tokenIdxLong} at position {i} is out of bounds for vocabulary size {vocabSize}.");
+                int tokenIdx = (int)tokenIdxLong;
+                int srcOffset = i * embeddingDim;
+                int dstOffset = tokenIdx * embeddingDim;
+                var dstSlice = gradEmbData.AsSpan(dstOffset, embeddingDim);
+                numOps.Add(dstSlice, gradData.AsSpan(srcOffset, embeddingDim), dstSlice);
+            }
+        }
+        else
+        {
+            for (int i = 0; i < numIndices; i++)
+            {
+                long tokenIdxLong = Convert.ToInt64(idxData[i]);
+
+                if (tokenIdxLong < 0 || tokenIdxLong >= vocabSize)
+                    throw new ArgumentOutOfRangeException(nameof(indices),
+                        $"Index {tokenIdxLong} at position {i} is out of bounds for vocabulary size {vocabSize}.");
+
+                int tokenIdx = (int)tokenIdxLong;
+                int srcOffset = i * embeddingDim;
+                int dstOffset = tokenIdx * embeddingDim;
+                var dstSlice = gradEmbData.AsSpan(dstOffset, embeddingDim);
+                numOps.Add(dstSlice, gradData.AsSpan(srcOffset, embeddingDim), dstSlice);
             }
         }
 

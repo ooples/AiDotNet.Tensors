@@ -50,62 +50,11 @@ public partial class CpuEngine
         if (input.Rank != 4) throw new ArgumentException("RoIAlign input must be [N, C, H, W].");
         if (boxes.Rank != 2 || boxes._shape[1] != 5)
             throw new ArgumentException("RoIAlign boxes must be [K, 5] = (batch_idx, x1, y1, x2, y2).");
-        int N = input._shape[0], C = input._shape[1], H = input._shape[2], W = input._shape[3];
         int K = boxes._shape[0];
-        var output = new Tensor<T>(new[] { K, C, outputHeight, outputWidth });
-        if (K == 0) return output;
+        if (K == 0) return new Tensor<T>(new[] { K, input._shape[1], outputHeight, outputWidth });
 
-        var ops = MathHelper.GetNumericOperations<T>();
-        using var srcLease = input.Lease();
-        var src = srcLease.Span;
-        using var bLease = boxes.Lease();
-        var b = bLease.Span;
-        using var dstLease = output.LeaseWritable();
-        var dst = dstLease.Span;
-        double offset = aligned ? 0.5 : 0.0;
-
-        for (int k = 0; k < K; k++)
-        {
-            int n = (int)ops.ToDouble(b[k * 5]);
-            if (n < 0 || n >= N) throw new ArgumentException($"RoIAlign batch idx {n} out of range [0, {N}).");
-            double x1 = ops.ToDouble(b[k * 5 + 1]) * spatialScale - offset;
-            double y1 = ops.ToDouble(b[k * 5 + 2]) * spatialScale - offset;
-            double x2 = ops.ToDouble(b[k * 5 + 3]) * spatialScale - offset;
-            double y2 = ops.ToDouble(b[k * 5 + 4]) * spatialScale - offset;
-
-            double roiW = aligned ? (x2 - x1) : Math.Max(x2 - x1, 1.0);
-            double roiH = aligned ? (y2 - y1) : Math.Max(y2 - y1, 1.0);
-            double binH = roiH / outputHeight;
-            double binW = roiW / outputWidth;
-
-            int ry = samplingRatio > 0 ? samplingRatio : (int)Math.Ceiling(roiH / outputHeight);
-            int rx = samplingRatio > 0 ? samplingRatio : (int)Math.Ceiling(roiW / outputWidth);
-            if (ry < 1) ry = 1;
-            if (rx < 1) rx = 1;
-            double gridArea = ry * rx;
-
-            for (int c = 0; c < C; c++)
-            {
-                int planeBase = (n * C + c) * H * W;
-                for (int ph = 0; ph < outputHeight; ph++)
-                for (int pw = 0; pw < outputWidth; pw++)
-                {
-                    double acc = 0;
-                    for (int iy = 0; iy < ry; iy++)
-                    {
-                        double sy = y1 + ph * binH + (iy + 0.5) * binH / ry;
-                        for (int ix = 0; ix < rx; ix++)
-                        {
-                            double sx = x1 + pw * binW + (ix + 0.5) * binW / rx;
-                            acc += BilinearSample(src, planeBase, sy, sx, H, W, ops);
-                        }
-                    }
-                    dst[((k * C + c) * outputHeight + ph) * outputWidth + pw] =
-                        ops.FromDouble(acc / gridArea);
-                }
-            }
-        }
-        return output;
+        // Taps once per (RoI, bin), then a parallel gather over (RoI, channel); see RoIAlignPlan.
+        return RoIAlignPlan.Forward(input, boxes, outputHeight, outputWidth, spatialScale, samplingRatio, aligned);
     }
 
     /// <summary>Bilinear sample with zero-padding (RoIAlign convention).</summary>

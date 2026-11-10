@@ -685,6 +685,136 @@ public sealed class CompressedMomentGpuOptimizerTests :
         }
     }
 
+    // 1 - beta^t near beta = 1 (#1703 review). With zero moments every Adam variant's update at step t is
+    // lr * ((1 - b1) g / c1(t)) / (sqrt((1 - b2) g^2 / c2(t)) + eps), so one call at step t isolates the corrections. The
+    // naive 1 - pow(beta, t) loses ~3e-4 relative at beta = 0.9999, t = 2 (pow's rounding, divided by 1 - beta^t ~ 2e-4);
+    // the cancellation-free form holds a few ulps. The name carries "Metal" so the macOS lane's filter selects it; the
+    // Vulkan rows exercise beta2 = 0.999 at step one on whatever driver the machine has.
+    [SkippableTheory]
+    [MemberData(nameof(Backends))]
+    public void BiasCorrectionNearBetaOne_MatchesDoubleReference_OnMetalVulkanAndCuda(BackendKind kind)
+    {
+        var acquired = _backends.Get(kind);
+        var backend = RequireReady(kind, acquired, requiresGlslCompiler: true);
+        var compressed = backend as ICompressedMomentGpuOptimizerBackend;
+
+        const int length = 37;
+        const float lr = 0.01f;
+        const float eps = 1e-10f;
+        const double relativeTolerance = 2e-5;
+        var grad = Gradient(length);
+        // 0.5 is the series' edge (|s| = 1/3) and 0.45 takes the library-log branch; t = 3, 4 at beta 0.9 and t = 35 at
+        // beta 0.99 put x = t log(beta) on either side of the -0.35 switch from Taylor to 1 - exp(x).
+        float[] betas = { 0.45f, 0.5f, 0.9f, 0.99f, 0.999f, 0.9999f };
+        int[] steps = { 1, 2, 3, 4, 10, 35, 1000 };
+        foreach (float beta1 in betas)
+        foreach (float beta2 in betas)
+        foreach (int step in steps)
+        {
+            double c1 = 1 - Math.Pow(beta1, step), c2 = 1 - Math.Pow(beta2, step);
+            var expected = new double[length];
+            for (int i = 0; i < length; i++)
+            {
+                double m = (1.0 - beta1) * grad[i], v = (1.0 - beta2) * grad[i] * (double)grad[i];
+                expected[i] = -lr * (m / c1) / (Math.Sqrt(v / c2) + eps);
+            }
+
+            using var param = backend.AllocateBuffer(new float[length]);
+            using var g = backend.AllocateBuffer(grad);
+            using var m32 = backend.AllocateBuffer(new float[length]);
+            using var v32 = backend.AllocateBuffer(new float[length]);
+            backend.AdamUpdate(param, g, m32, v32, lr, beta1, beta2, eps, 0f, step, length);
+            AssertRelative(expected, backend.DownloadBuffer(param), relativeTolerance, $"{kind} fp32 Adam b1={beta1} b2={beta2} t={step}");
+
+            if (compressed is null) continue;
+            using var paramBf16 = backend.AllocateBuffer(new float[length]);
+            using var mBf16 = backend.AllocateByteBuffer(length * sizeof(ushort));
+            using var vBf16 = backend.AllocateByteBuffer(length * sizeof(ushort));
+            // A byte buffer is not zeroed on allocation, and the kernel reads the stored moments after step one.
+            backend.UploadByteBuffer(mBf16, new byte[length * sizeof(ushort)]);
+            backend.UploadByteBuffer(vBf16, new byte[length * sizeof(ushort)]);
+            compressed.AdamUpdateBf16(paramBf16, g, mBf16, vBf16, lr, beta1, beta2, eps, 0f, step, length);
+            AssertRelative(expected, backend.DownloadBuffer(paramBf16), relativeTolerance, $"{kind} bf16 Adam b1={beta1} b2={beta2} t={step}");
+        }
+    }
+
+    // The same isolation for the other kernels the cancellation-free correction changed: AMSGrad (its running max of v
+    // is v itself from zero state), Nadam (whose look-ahead also corrects with step + 1) and the sparse Adam scatter
+    // (every index present, so it is the dense update). beta1 = 0 is a valid Adam setting whose correction is exactly 1:
+    // GLSL and WGSL leave log(0) undefined, so the helpers return 1 for it before taking the log.
+    [SkippableTheory]
+    [MemberData(nameof(Backends))]
+    public void BiasCorrectionNearBetaOne_HoldsForAmsgradNadamAndSparseAdam_OnMetalVulkanAndCuda(BackendKind kind)
+    {
+        var acquired = _backends.Get(kind);
+        var backend = RequireReady(kind, acquired, requiresGlslCompiler: true);
+
+        const int length = 37;
+        const float lr = 0.01f;
+        const float eps = 1e-10f;
+        const double relativeTolerance = 2e-5;
+        var grad = Gradient(length);
+        var indices = Enumerable.Range(0, length).Select(i => (float)i).ToArray();
+        float[] betas1 = { 0f, 0.5f, 0.9f, 0.999f, 0.9999f };
+        float[] betas2 = { 0.5f, 0.9f, 0.999f, 0.9999f };
+        int[] steps = { 1, 2, 35, 1000 };
+        foreach (float beta1 in betas1)
+        foreach (float beta2 in betas2)
+        foreach (int step in steps)
+        {
+            double c1 = 1 - Math.Pow(beta1, step), c1Next = 1 - Math.Pow(beta1, step + 1), c2 = 1 - Math.Pow(beta2, step);
+            var adam = new double[length];
+            var nadam = new double[length];
+            for (int i = 0; i < length; i++)
+            {
+                double m = (1.0 - beta1) * grad[i], v = (1.0 - beta2) * grad[i] * (double)grad[i];
+                double denominator = Math.Sqrt(v / c2) + eps;
+                adam[i] = -lr * (m / c1) / denominator;
+                nadam[i] = -lr * ((beta1 * m / c1Next) + ((1.0 - beta1) * grad[i] / c1)) / denominator;
+            }
+
+            string at = $"b1={beta1} b2={beta2} t={step}";
+            using (var param = backend.AllocateBuffer(new float[length]))
+            using (var g = backend.AllocateBuffer(grad))
+            using (var m = backend.AllocateBuffer(new float[length]))
+            using (var v = backend.AllocateBuffer(new float[length]))
+            using (var vMax = backend.AllocateBuffer(new float[length]))
+            {
+                backend.AmsgradUpdate(param, g, m, v, vMax, lr, beta1, beta2, eps, 0f, step, length);
+                AssertRelative(adam, backend.DownloadBuffer(param), relativeTolerance, $"{kind} AMSGrad {at}");
+            }
+
+            using (var param = backend.AllocateBuffer(new float[length]))
+            using (var g = backend.AllocateBuffer(grad))
+            using (var m = backend.AllocateBuffer(new float[length]))
+            using (var v = backend.AllocateBuffer(new float[length]))
+            {
+                backend.NadamUpdate(param, g, m, v, lr, beta1, beta2, eps, 0f, step, length);
+                AssertRelative(nadam, backend.DownloadBuffer(param), relativeTolerance, $"{kind} Nadam {at}");
+            }
+
+            using (var param = backend.AllocateBuffer(new float[length]))
+            using (var m = backend.AllocateBuffer(new float[length]))
+            using (var v = backend.AllocateBuffer(new float[length]))
+            using (var sparseIndices = backend.AllocateBuffer(indices))
+            using (var sparseValues = backend.AllocateBuffer(grad))
+            {
+                backend.SparseAdamUpdate(param, m, v, sparseIndices, sparseValues, length, lr, beta1, beta2, eps, 0f, step);
+                AssertRelative(adam, backend.DownloadBuffer(param), relativeTolerance, $"{kind} sparse Adam {at}");
+            }
+        }
+    }
+
+    private static void AssertRelative(double[] expected, float[] actual, double tolerance, string label)
+    {
+        for (int i = 0; i < expected.Length; i++)
+        {
+            double error = Math.Abs(actual[i] - expected[i]);
+            Assert.True(error <= tolerance * Math.Abs(expected[i]) + 1e-12,
+                $"{label}: element {i} is {actual[i]:G9}, expected {expected[i]:G9} (relative error {error / Math.Max(Math.Abs(expected[i]), 1e-30):E2}).");
+        }
+    }
+
     private static IDirectGpuBackend RequireReady(
         BackendKind kind,
         AcquiredBackend acquired,

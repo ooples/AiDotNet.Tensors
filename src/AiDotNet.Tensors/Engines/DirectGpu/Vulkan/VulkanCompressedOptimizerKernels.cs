@@ -49,13 +49,14 @@ layout(push_constant) uniform PC {
     float weightDecay;
 } pc;
 " + Bf16Helpers + @"
+" + VulkanBiasCorrection.Glsl + @"
 void main() {
     uint w = gl_GlobalInvocationID.x;
     uint base = w * 2u;
     if (base >= pc.size) { return; }
 
-    float bc1 = 1.0 - pow(pc.beta1, float(pc.step));
-    float bc2 = 1.0 - pow(pc.beta2, float(pc.step));
+    float bc1 = vk_bias_correction(pc.beta1, float(pc.step));
+    float bc2 = vk_bias_correction(pc.beta2, float(pc.step));
     bool firstStep = pc.step <= 1u;
 
     uint mword = m_bits[w];

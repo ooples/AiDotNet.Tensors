@@ -1,6 +1,26 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
 namespace AiDotNet.Tensors.Engines.DirectGpu;
 
+/// <summary>A captured graph's kernel, memcpy and memset nodes (see <see cref="IGpuGraphCapture.LastCaptureNodeCounts"/>).</summary>
+internal readonly struct GraphNodeCounts
+{
+    internal GraphNodeCounts(int kernel, int memcpy, int memset)
+    {
+        Kernel = kernel;
+        Memcpy = memcpy;
+        Memset = memset;
+    }
+
+    /// <summary>Kernel launch nodes.</summary>
+    internal int Kernel { get; }
+
+    /// <summary>Memory copy nodes.</summary>
+    internal int Memcpy { get; }
+
+    /// <summary>Memory set nodes.</summary>
+    internal int Memset { get; }
+}
+
 /// <summary>
 /// Recording the launches of a delegate into a replayable device graph (#1154). A backend without device graphs
 /// reports <see cref="SupportsGraphCapture"/> false and returns <see cref="System.IntPtr.Zero"/> from
@@ -22,6 +42,21 @@ internal interface IGpuGraphCapture : IDirectGpuBackend
 
     /// <summary>Records <paramref name="launch"/>'s device work; a handle to replay, or zero when it cannot.</summary>
     System.IntPtr CaptureGraph(System.Action launch);
+
+    /// <summary>
+    /// Why the calling thread's most recent <see cref="CaptureGraph"/> returned zero (#1096 F4): the exception the captured
+    /// body threw, or the driver call that failed. A backend ends a capture cleanly when its body throws and returns a
+    /// zero handle, so without this the caller knows only that capture failed, not why. Null after a capture that
+    /// succeeded, before any capture on this thread, or on a backend without graph capture.
+    /// </summary>
+    string? LastCaptureFailure { get; }
+
+    /// <summary>
+    /// The node counts of the graph the calling thread's most recent <see cref="CaptureGraph"/> returned: what a
+    /// captured step costs in launches and copies (#1096 P0.7). Null after a capture that returned zero, before any
+    /// capture on this thread, or on a backend without graph capture.
+    /// </summary>
+    GraphNodeCounts? LastCaptureNodeCounts { get; }
 
     /// <summary>Replays a graph <see cref="CaptureGraph"/> returned.</summary>
     void LaunchCapturedGraph(System.IntPtr graphExec);

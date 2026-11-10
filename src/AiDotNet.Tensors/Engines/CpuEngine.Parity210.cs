@@ -3662,10 +3662,55 @@ public partial class CpuEngine
         int s = sortedSequence._shape[rank - 1], v = values._shape[rank - 1], rows = values.Length / Math.Max(1, v);
         var seq = sortedSequence.GetFlattenedData();
         var vals = values.GetFlattenedData();
-        var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<int>(values._shape);
         var dst = result.GetDataArrayUnmarked();
         // torch's comparisons on every row (the count kernels disagree with them when a NaN is involved).
+        if (seq is float[] seqF && vals is float[] valsF) SearchSortedRows(seqF, valsF, dst, rows, s, v, right);
+        else if (seq is double[] seqD && vals is double[] valsD) SearchSortedRows(seqD, valsD, dst, rows, s, v, right);
+        else SearchSortedRowsGeneric(seq, vals, dst, rows, s, v, right);
+        return result;
+    }
+
+    // The rank-one search's comparisons: right = false splits at x <= seq, right = true at x < seq. Both are false for
+    // NaN, so a NaN value lands after every element, as it does at rank one.
+    private static void SearchSortedRows(float[] seq, float[] vals, int[] dst, int rows, int s, int v, bool right)
+    {
+        for (int r = 0; r < rows; r++)
+            for (int j = 0; j < v; j++)
+            {
+                float x = vals[r * v + j];
+                int lo = 0, hi = s;
+                while (lo < hi)
+                {
+                    int mid = lo + ((hi - lo) >> 1);
+                    float e = seq[r * s + mid];
+                    if (right ? x < e : x <= e) hi = mid; else lo = mid + 1;
+                }
+                dst[r * v + j] = lo;
+            }
+    }
+
+    private static void SearchSortedRows(double[] seq, double[] vals, int[] dst, int rows, int s, int v, bool right)
+    {
+        for (int r = 0; r < rows; r++)
+            for (int j = 0; j < v; j++)
+            {
+                double x = vals[r * v + j];
+                int lo = 0, hi = s;
+                while (lo < hi)
+                {
+                    int mid = lo + ((hi - lo) >> 1);
+                    double e = seq[r * s + mid];
+                    if (right ? x < e : x <= e) hi = mid; else lo = mid + 1;
+                }
+                dst[r * v + j] = lo;
+            }
+    }
+
+    [ScalarKernel("A binary search compares one element per step; element types other than float and double have no typed comparison.")]
+    private static void SearchSortedRowsGeneric<T>(T[] seq, T[] vals, int[] dst, int rows, int s, int v, bool right)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
         for (int r = 0; r < rows; r++)
             for (int j = 0; j < v; j++)
             {
@@ -3675,14 +3720,11 @@ public partial class CpuEngine
                 {
                     int mid = lo + ((hi - lo) >> 1);
                     var e = seq[r * s + mid];
-                    // The rank-one search's comparisons: right = false splits at x <= seq, right = true at x < seq. Both
-                    // are false for NaN, so a NaN value lands after every element, as it does at rank one.
                     bool beforeMid = right ? numOps.LessThan(x, e) : numOps.LessThanOrEquals(x, e);
                     if (beforeMid) hi = mid; else lo = mid + 1;
                 }
                 dst[r * v + j] = lo;
             }
-        return result;
     }
 
     private static bool SequenceHasNaN(ReadOnlySpan<float> sequence)

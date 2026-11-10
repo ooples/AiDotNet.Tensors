@@ -169,6 +169,19 @@ public sealed class BatchedCDistSearchSortedTests
             eng.TensorSearchSorted(eng.Reshape(sf, new[] { 1, 3 }), eng.Reshape(vf, new[] { 1, 2 }), right).ToArray());
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Nd_searchsorted_on_an_integer_type_searches_each_row(bool right)
+    {
+        // Neither float nor double, so the generic comparison path. torch.searchsorted(seq, vals, right=right).
+        var eng = new CpuEngine();
+        var seq = new Tensor<int>(new[] { 2, 4 }, new Vector<int>(new[] { 1, 3, 3, 7, 0, 2, 4, 6 }));
+        var vals = new Tensor<int>(new[] { 2, 3 }, new Vector<int>(new[] { 3, 8, 0, 4, -1, 6 }));
+        int[] expected = right ? new[] { 3, 4, 0, 3, 0, 4 } : new[] { 1, 4, 0, 2, 0, 3 };
+        Assert.Equal(expected, eng.TensorSearchSorted(seq, vals, right).ToArray());
+    }
+
     [Fact]
     public void Cdist_and_pdist_take_torch_special_norm_orders()
     {

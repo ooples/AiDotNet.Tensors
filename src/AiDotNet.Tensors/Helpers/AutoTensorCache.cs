@@ -40,8 +40,107 @@ internal static class AutoTensorCache
     [ThreadStatic]
     private static Dictionary<long, int>? _poolCounts;
 
+    // Bytes all threads' pools hold, against MaxPooledBytes. Process-wide: the pools are per thread, and a parallel
+    // kernel's workers each filled their own, so a per-thread budget multiplied by the worker count.
+    private static long s_pooledBytes;
+
+    // Clear() empties every thread's pools but can only reset the calling thread's shape counts; a thread whose epoch
+    // is behind resets its own on its next rent or return, instead of refusing buffers against counts of emptied pools.
+    private static int s_clearEpoch;
+    [ThreadStatic]
+    private static int _seenClearEpoch;
+
+    /// <summary>
+    /// Most bytes the cache holds across all shapes and threads (default 64 MB; <c>AIDOTNET_AUTOTENSORCACHE_MAX_BYTES</c>).
+    /// </summary>
+    /// <remarks>
+    /// The per-shape copy limits bounded each shape, not the total: every distinct shape a model ever produced kept
+    /// its copies for the life of the thread, so the total grew with the number of distinct shapes outside an arena
+    /// (inside one, arena buffers are refused and this cache stays nearly empty). Large results already recycle through ResultBufferTracker, whose free list has the
+    /// same 64 MB cap.
+    /// </remarks>
+    internal static long MaxPooledBytes { get; set; } =
+        long.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_AUTOTENSORCACHE_MAX_BYTES"),
+            System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var maxBytes)
+            && maxBytes >= 0 ? maxBytes : DefaultMaxPooledBytes;
+
+    /// <summary>Bytes all threads' pools hold now, against <see cref="MaxPooledBytes"/>. Diagnostic.</summary>
+    internal static long PooledBytes => System.Threading.Interlocked.Read(ref s_pooledBytes);
+
+    /// <summary>The default of <see cref="MaxPooledBytes"/>: 64 MB, the same cap as ResultBufferTracker's free list.</summary>
+    internal const long DefaultMaxPooledBytes = 64L << 20;
+
+    private static void SyncClearEpoch()
+    {
+        int epoch = System.Threading.Volatile.Read(ref s_clearEpoch);
+        if (_seenClearEpoch == epoch) return;
+        _seenClearEpoch = epoch;
+        _poolCounts?.Clear();
+    }
+
     // Track all thread-local pools so Clear() can flush all threads, not just the caller's
-    private static readonly List<WeakReference<ConcurrentDictionary<long, ConcurrentQueue<object>>>> _allPools = new();
+    private static readonly List<PoolRegistration> _allPools = new();
+
+    // This thread's entry in _allPools.
+    [ThreadStatic]
+    private static PoolRegistration? _registration;
+
+    /// <summary>
+    /// A thread's pools, held weakly so they die with the thread, and the bytes they hold, held strongly: a dead
+    /// thread's tensors are unreachable, so its bytes leave the shared budget when its entry is reaped, or the budget
+    /// would shrink by them for the life of the process.
+    /// </summary>
+    private sealed class PoolRegistration
+    {
+        public PoolRegistration(ConcurrentDictionary<long, ConcurrentQueue<object>> pools)
+            => Pools = new WeakReference<ConcurrentDictionary<long, ConcurrentQueue<object>>>(pools);
+
+        public WeakReference<ConcurrentDictionary<long, ConcurrentQueue<object>>> Pools { get; }
+
+        public long Bytes;
+    }
+
+    // This thread's pools, created and registered on first use.
+    private static ConcurrentDictionary<long, ConcurrentQueue<object>> ThreadPools(out PoolRegistration registration)
+    {
+        var pools = _pools;
+        if (pools is not null && _registration is { } existing)
+        {
+            registration = existing;
+            return pools;
+        }
+
+        pools = new ConcurrentDictionary<long, ConcurrentQueue<object>>();
+        registration = new PoolRegistration(pools);
+        _pools = pools;
+        _registration = registration;
+        lock (_allPools)
+        {
+            ReapDeadPools();
+            _allPools.Add(registration);
+        }
+
+        return pools;
+    }
+
+    // Under the _allPools lock: drops the entries of threads that have exited, giving their bytes back to the budget.
+    private static void ReapDeadPools()
+    {
+        for (int i = _allPools.Count - 1; i >= 0; i--)
+        {
+            var registration = _allPools[i];
+            if (registration.Pools.TryGetTarget(out _)) continue;
+            System.Threading.Interlocked.Add(ref s_pooledBytes, -System.Threading.Interlocked.Exchange(ref registration.Bytes, 0));
+            _allPools.RemoveAt(i);
+        }
+    }
+
+    // Moves bytes in or out of the shared budget and the owning thread's share of it.
+    private static void AddPooledBytes(PoolRegistration registration, long bytes)
+    {
+        System.Threading.Interlocked.Add(ref s_pooledBytes, bytes);
+        System.Threading.Interlocked.Add(ref registration.Bytes, bytes);
+    }
 
     // ═══ Hardware-detected cache hierarchy ═══
     // These are computed once at startup from actual CPU cache sizes.
@@ -165,18 +264,14 @@ internal static class AutoTensorCache
         if (!Enabled)
             return TensorAllocator.RentUninitialized<T>(shape);
 
-        var pools = _pools;
-        if (pools is null)
-        {
-            pools = new ConcurrentDictionary<long, ConcurrentQueue<object>>();
-            _pools = pools;
-            lock (_allPools) { _allPools.Add(new WeakReference<ConcurrentDictionary<long, ConcurrentQueue<object>>>(pools)); }
-        }
+        var pools = ThreadPools(out var registration);
         long key = ComputeKey<T>(shape);
+        SyncClearEpoch();
 
         if (pools.TryGetValue(key, out var pool) && pool.TryDequeue(out var obj))
         {
             var tensor = (Tensor<T>)obj;
+            AddPooledBytes(registration, -(long)tensor.Length * System.Runtime.CompilerServices.Unsafe.SizeOf<T>());
             // Decrement O(1) counter
             var counts = _poolCounts;
             if (counts is not null && counts.TryGetValue(key, out var cnt) && cnt > 0)
@@ -188,9 +283,12 @@ internal static class AutoTensorCache
                 tensor.Grad = null;
                 tensor.LazySource = null;
                 tensor.GradFn = null;
+                // A uniform-fill tag describes the previous owner's contents; the new owner writes its own.
+                tensor.UniformFillValue = null;
                 return tensor;
             }
             pool.Enqueue(obj);
+            AddPooledBytes(registration, (long)tensor.Length * System.Runtime.CompilerServices.Unsafe.SizeOf<T>());
             if (counts is not null)
                 counts[key] = (counts.TryGetValue(key, out var _cv) ? _cv : 0) + 1;
         }
@@ -230,48 +328,108 @@ internal static class AutoTensorCache
         // long test process. TensorPool refuses these tensors for the same reason (PR #638).
         if (tensor._gpuBuffer is not null || tensor._device != TensorDevice.CPU) return;
         if (tensor.GetBackingArrayForCacheLookupUnsafe() is { } backing && HostSync.IsPending(backing)) return;
+        // Arena memory belongs to the arena, which reissues it after every step boundary (and, with
+        // Engines.Autodiff.BackwardRecycler, within a step once nothing reads it), while this cache outlives the step.
+        // Keeping it here put one buffer behind two owners: Conv2DBackwardInputInto's flipped kernel came back from
+        // this cache in a later conv backward while the arena had handed it to another, corrupting FasterRCNN's
+        // gradients. TensorPool refuses arena buffers for the same reason.
+        if (tensor.GetBackingArrayForCacheLookupUnsafe() is { } owned && TensorArena.IsArenaIssued(owned)) return;
 
         long elements = tensor.Length;
         if (elements > MaxElementsPerTensor)
             return;
 
-        var pools = _pools;
-        if (pools is null)
-        {
-            pools = new ConcurrentDictionary<long, ConcurrentQueue<object>>();
-            _pools = pools;
-            lock (_allPools) { _allPools.Add(new WeakReference<ConcurrentDictionary<long, ConcurrentQueue<object>>>(pools)); }
-        }
+        var pools = ThreadPools(out var registration);
         long key = ComputeKey<T>(tensor._shape);
         var pool = pools.GetOrAdd(key, _ => new ConcurrentQueue<object>());
 
         // Use O(1) counter instead of O(n) pool.Count
+        SyncClearEpoch();
         var counts = _poolCounts ??= new Dictionary<long, int>();
         int currentCount = (counts.TryGetValue(key, out var _cv) ? _cv : 0);
         int maxCopies = GetMaxPerShape(elements);
-        if (currentCount < maxCopies)
+        long bytes = elements * System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
+        if (currentCount >= maxCopies) return;
+        // Reserve the bytes first, so concurrent returns from parallel workers cannot all pass the check together.
+        if (System.Threading.Interlocked.Add(ref s_pooledBytes, bytes) > MaxPooledBytes)
         {
-            pool.Enqueue(tensor);
-            counts[key] = currentCount + 1;
+            System.Threading.Interlocked.Add(ref s_pooledBytes, -bytes);
+            return;
         }
+        System.Threading.Interlocked.Add(ref registration.Bytes, bytes);
+        pool.Enqueue(tensor);
+        counts[key] = currentCount + 1;
     }
 
     /// <summary>Clears all cached tensors across all threads, releasing memory immediately.</summary>
+    /// <remarks>
+    /// Each tensor's bytes leave the budget as it leaves its pool, the way a rent's do. Zeroing the total instead raced
+    /// the pools' other users, which take no lock: a return counted after the zeroing then dropped by the emptying left
+    /// bytes counted with no tensor, and a rent subtracting after the zeroing drove the total below zero.
+    /// </remarks>
     internal static void Clear()
     {
-        _pools?.Clear();
         _poolCounts?.Clear(); // Reset O(1) counters so Return() accepts buffers again
+        System.Threading.Interlocked.Increment(ref s_clearEpoch);
         lock (_allPools)
         {
-            for (int i = _allPools.Count - 1; i >= 0; i--)
-            {
-                if (_allPools[i].TryGetTarget(out var pool))
-                    pool.Clear();
-                else
-                    _allPools.RemoveAt(i); // Remove GC'd references
-            }
+            ReapDeadPools();
+            foreach (var registration in _allPools)
+                if (registration.Pools.TryGetTarget(out var pools))
+                    Drain(registration, pools);
         }
     }
+
+    /// <summary>
+    /// The bytes every thread's pools hold, counted tensor by tensor. Diagnostic: with no rent or return running it
+    /// equals <see cref="PooledBytes"/>.
+    /// </summary>
+    internal static long CountPooledBytes()
+    {
+        long total = 0;
+        lock (_allPools)
+        {
+            foreach (var registration in _allPools)
+                if (registration.Pools.TryGetTarget(out var pools))
+                    foreach (var queue in pools.Values)
+                        foreach (var pooled in queue)
+                            total += BytesOf(pooled);
+        }
+
+        return total;
+    }
+
+    // Empties every queue but keeps the queues: removing one could drop a tensor a concurrent return just counted.
+    private static void Drain(PoolRegistration registration, ConcurrentDictionary<long, ConcurrentQueue<object>> pools)
+    {
+        foreach (var queue in pools.Values)
+            while (queue.TryDequeue(out var pooled))
+                AddPooledBytes(registration, -BytesOf(pooled));
+    }
+
+    // The bytes a pooled tensor holds against the budget, as Return counted them: Length * sizeof(T). Clear-only, so
+    // the per-element-type delegate is built by reflection once and cached.
+    private static readonly ConcurrentDictionary<Type, Func<object, long>> s_bytesOf = new();
+
+    private static long BytesOf(object pooled) => s_bytesOf.GetOrAdd(pooled.GetType(), type =>
+    {
+        for (var t = type; t is not null; t = t.BaseType)
+        {
+            if (t.IsGenericType && t.GetGenericTypeDefinition() == typeof(Tensor<>))
+            {
+                var method = typeof(AutoTensorCache).GetMethod(nameof(TensorBytes),
+                    System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+                if (method is not null)
+                    return (Func<object, long>)method.MakeGenericMethod(t.GetGenericArguments()[0])
+                        .CreateDelegate(typeof(Func<object, long>));
+            }
+        }
+
+        return _ => 0;
+    })(pooled);
+
+    private static long TensorBytes<T>(object tensor) =>
+        (long)((Tensor<T>)tensor).Length * System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
 
     /// <summary>Compute a fast hash key from shape + type.</summary>
     private static long ComputeKey<T>(int[] shape)

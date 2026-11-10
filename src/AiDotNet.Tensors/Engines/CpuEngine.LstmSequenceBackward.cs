@@ -235,7 +235,27 @@ public partial class CpuEngine
     /// workspace per call, a compiled-plan node one workspace it reuses every step. Requires seqLen &gt; 0.
     /// </summary>
     [MethodImpl(Hot)]
-    private static unsafe void LstmTrainForwardCoreFloat(
+    internal static unsafe void LstmTrainForwardCoreFloat(
+        float[] inArr, float[] wIhArr, float[] wHhArr,
+        float[]? bIhArr, float[]? bHhArr, float[]? h0Arr, float[]? c0Arr,
+        bool returnSequences, LstmTrainWorkspace ws, Span<float> outSpan)
+    {
+        ws.BeginForward();
+        bool completed = false;
+        try
+        {
+            LstmTrainForwardCoreFloatUnguarded(inArr, wIhArr, wHhArr, bIhArr, bHhArr, h0Arr, c0Arr, returnSequences, ws, outSpan);
+            completed = true;
+        }
+        finally
+        {
+            if (completed) ws.EndForward();
+            else ws.AbortForward();
+        }
+    }
+
+    [MethodImpl(Hot)]
+    private static unsafe void LstmTrainForwardCoreFloatUnguarded(
         float[] inArr, float[] wIhArr, float[] wHhArr,
         float[]? bIhArr, float[]? bHhArr, float[]? h0Arr, float[]? c0Arr,
         bool returnSequences, LstmTrainWorkspace ws, Span<float> outSpan)
@@ -522,7 +542,7 @@ public partial class CpuEngine
     /// The per-chunk backward scratch (<see cref="LstmBackwardScratch"/>) is allocated on the first backward, so a
     /// forward-only use never pays for it.
     /// </summary>
-    private sealed class LstmTrainWorkspace
+    internal sealed class LstmTrainWorkspace
     {
         public LstmTrainWorkspace(int batch, int seqLen, int inFeatures, int hidden)
         {
@@ -563,6 +583,61 @@ public partial class CpuEngine
             => _backward ??= new LstmBackwardScratch(Chunks, MaxChunkRows, SeqLen, InFeatures, Hidden);
 
         private LstmBackwardScratch? _backward;
+
+        // Order contract (#1096 follow-up). The saved state belongs to the most recent COMPLETED forward. A backward
+        // reads it, and only overwrites Wx, which it uses as scratch; so repeated backwards of one forward are exact,
+        // and a re-run forward on the same inputs (recompute) rewrites identical state. What breaks the state is
+        // overlap: a forward writing the gates/cells/hiddens while a backward reads them, two forwards at once, or a
+        // backward before a forward has completely filled the state (none yet, or the last one threw part-way). Those
+        // throw instead of silently backpropagating garbage.
+        private const int Idle = 0, InForward = 1, InBackward = 2;
+        private int _phase;
+        private int _completedForwards;
+        private bool _stateValid;
+
+        /// <summary>Number of forwards that finished writing this workspace (test hook).</summary>
+        public int CompletedForwards => System.Threading.Volatile.Read(ref _completedForwards);
+
+        public void BeginForward()
+        {
+            Enter(InForward, "forward");
+            _stateValid = false; // the forward is about to overwrite the saved state
+        }
+
+        public void EndForward()
+        {
+            _stateValid = true;
+            System.Threading.Interlocked.Increment(ref _completedForwards);
+            System.Threading.Volatile.Write(ref _phase, Idle);
+        }
+
+        /// <summary>Back to idle after a forward that threw; its partial state is not backpropagated.</summary>
+        public void AbortForward() => System.Threading.Volatile.Write(ref _phase, Idle);
+
+        public void BeginBackward()
+        {
+            Enter(InBackward, "backward");
+            if (!_stateValid)
+            {
+                System.Threading.Volatile.Write(ref _phase, Idle);
+                throw new InvalidOperationException(
+                    "LstmSequenceTrain backward ran without a completed forward: the fused LSTM node's saved state was "
+                    + (_completedForwards == 0 ? "never filled" : "left partial by a forward that threw")
+                    + ". Its forward must complete before its backward.");
+            }
+        }
+
+        public void EndBackward() => System.Threading.Volatile.Write(ref _phase, Idle);
+
+        private void Enter(int phase, string what)
+        {
+            int was = System.Threading.Interlocked.CompareExchange(ref _phase, phase, Idle);
+            if (was != Idle)
+                throw new InvalidOperationException(
+                    "LstmSequenceTrain " + what + " started while its " + (was == InForward ? "forward" : "backward")
+                    + " was still running on the same workspace. The fused LSTM node owns one workspace and is not "
+                    + "re-entrant: run a node's forward and backward one at a time.");
+        }
     }
 
     /// <summary>
@@ -571,7 +646,7 @@ public partial class CpuEngine
     /// weight and bias [G] gradients a single chunk forms. Several chunks form the weight gradients after the recurrence
     /// over every row at once, so the previous hiddens and the weight partials are allocated only for a single chunk.
     /// </summary>
-    private sealed class LstmBackwardScratch
+    internal sealed class LstmBackwardScratch
     {
         public LstmBackwardScratch(int chunks, int rows, int seqLen, int inFeatures, int hidden)
         {
@@ -674,13 +749,29 @@ public partial class CpuEngine
     /// A gradient the active relevance filter says nothing reads (the data input's, typically) is not computed. Runs
     /// with tape recording suppressed (standard backward context), so the internal GEMMs are plain compute.
     /// </summary>
-    [MethodImpl(Hot)]
-    private static unsafe void LstmSequenceBackwardFloat(
+    private static void LstmSequenceBackwardFloat(
         Tensor<float> gradOutput, Tensor<float>[] inp, Tensor<float> output,
         object[] savedState, IEngine engine, System.Collections.Generic.Dictionary<Tensor<float>, Tensor<float>> grads)
     {
-        var meta = (int[])savedState[3];
         var ws = (LstmTrainWorkspace)savedState[5];
+        ws.BeginBackward();
+        try
+        {
+            LstmSequenceBackwardFloatCore(gradOutput, inp, savedState, ws, engine, grads);
+        }
+        finally
+        {
+            ws.EndBackward();
+        }
+    }
+
+    [MethodImpl(Hot)]
+    private static unsafe void LstmSequenceBackwardFloatCore(
+        Tensor<float> gradOutput, Tensor<float>[] inp,
+        object[] savedState, LstmTrainWorkspace ws, IEngine engine,
+        System.Collections.Generic.Dictionary<Tensor<float>, Tensor<float>> grads)
+    {
+        var meta = (int[])savedState[3];
         int batch = meta[0], seqLen = meta[1], inFeatures = meta[2], hidden = meta[3];
         bool returnSequences = meta[4] != 0;
         int idxBIh = meta[5], idxBHh = meta[6], idxH0 = meta[7], idxC0 = meta[8];

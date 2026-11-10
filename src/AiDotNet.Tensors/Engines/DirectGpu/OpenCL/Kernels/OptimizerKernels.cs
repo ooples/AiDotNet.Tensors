@@ -24,6 +24,15 @@ internal static class OptimizerKernels
 // gradient-based optimization algorithms. Each kernel operates on individual
 // parameter elements in parallel.
 
+// 1 - beta^t without cancellation (see CudaOptimizerKernels.bias_correction): pow's relative error, subtracted from 1,
+// grows by 1/(1 - beta), 1000x for beta2 = 0.999 at step 1.
+static inline float ocl_opt_bias_correction(float beta, float t)
+{
+    // beta = 0 (a valid Adam setting): 1 - 0^t = 1 for t >= 1, without relying on log(0) = -inf.
+    if (beta <= 0.0f) return 1.0f;
+    return -expm1(t * log1p(-(1.0f - beta)));
+}
+
 static inline float bf16_to_float(ushort x)
 {
     return as_float(((uint)x) << 16);
@@ -143,8 +152,8 @@ inline void adam_body(__global float* param, __global const float* gradient, __g
     // Bias correction - guard against step==0 which causes division by zero
     // Step should always be >= 1; if step==0, use step==1 to avoid NaN/Inf
     int safe_step = step < 1 ? 1 : step;
-    float m_hat = m_new / (1.0f - pow(beta1, (float)safe_step));
-    float v_hat = v_new / (1.0f - pow(beta2, (float)safe_step));
+    float m_hat = m_new / (ocl_opt_bias_correction(beta1, (float)safe_step));
+    float v_hat = v_new / (ocl_opt_bias_correction(beta2, (float)safe_step));
 
     // Update parameters
     param[idx] -= learningRate * m_hat / (sqrt(v_hat) + epsilon);
@@ -213,8 +222,8 @@ inline void adamw_body(__global float* param, __global const float* gradient, __
 
     // Bias correction - guard against step==0 which causes division by zero
     int safe_step = step < 1 ? 1 : step;
-    float m_hat = m_new / (1.0f - pow(beta1, (float)safe_step));
-    float v_hat = v_new / (1.0f - pow(beta2, (float)safe_step));
+    float m_hat = m_new / (ocl_opt_bias_correction(beta1, (float)safe_step));
+    float v_hat = v_new / (ocl_opt_bias_correction(beta2, (float)safe_step));
 
     // Update parameters
     param[idx] -= learningRate * m_hat / (sqrt(v_hat) + epsilon);
@@ -289,8 +298,8 @@ __kernel void adam_bf16_update(
     v[idx] = float_to_bf16_rne(v_new);
 
     int safe_step = step < 1 ? 1 : step;
-    float m_hat = m_new / (1.0f - pow(beta1, (float)safe_step));
-    float v_hat = v_new / (1.0f - pow(beta2, (float)safe_step));
+    float m_hat = m_new / (ocl_opt_bias_correction(beta1, (float)safe_step));
+    float v_hat = v_new / (ocl_opt_bias_correction(beta2, (float)safe_step));
 
     param[idx] -= learningRate * m_hat / (sqrt(v_hat) + epsilon);
 }
@@ -327,8 +336,8 @@ __kernel void adamw_bf16_update(
     v[idx] = float_to_bf16_rne(v_new);
 
     int safe_step = step < 1 ? 1 : step;
-    float m_hat = m_new / (1.0f - pow(beta1, (float)safe_step));
-    float v_hat = v_new / (1.0f - pow(beta2, (float)safe_step));
+    float m_hat = m_new / (ocl_opt_bias_correction(beta1, (float)safe_step));
+    float v_hat = v_new / (ocl_opt_bias_correction(beta2, (float)safe_step));
 
     param[idx] -= learningRate * m_hat / (sqrt(v_hat) + epsilon);
 }
@@ -584,8 +593,8 @@ __kernel void lamb_update(
 
     // Bias correction - guard against step==0 which causes division by zero
     int safe_step = step < 1 ? 1 : step;
-    float mHat = mVal / (1.0f - pow(beta1, (float)safe_step));
-    float vHat = vVal / (1.0f - pow(beta2, (float)safe_step));
+    float mHat = mVal / (ocl_opt_bias_correction(beta1, (float)safe_step));
+    float vHat = vVal / (ocl_opt_bias_correction(beta2, (float)safe_step));
 
     // LAMB: Adam update direction with weight decay
     float adamUpdate = mHat / (sqrt(vHat) + epsilon);
@@ -682,8 +691,8 @@ __kernel void amsgrad_update(
     // Bias correction.
     // Guard against step==0 which causes division by zero
     int safe_step = step < 1 ? 1 : step;
-    float mHat = mVal / (1.0f - pow(beta1, (float)safe_step));
-    float vMaxHat = vMaxVal / (1.0f - pow(beta2, (float)safe_step));
+    float mHat = mVal / (ocl_opt_bias_correction(beta1, (float)safe_step));
+    float vMaxHat = vMaxVal / (ocl_opt_bias_correction(beta2, (float)safe_step));
 
     // Update parameters using v_max instead of v
     param[idx] -= learningRate * mHat / (sqrt(vMaxHat) + epsilon);
@@ -727,7 +736,7 @@ __kernel void adamax_update(
 
     // Bias correction for learning rate - guard against step==0 which causes division by zero
     int safe_step = step < 1 ? 1 : step;
-    float biasCorrection = 1.0f - pow(beta1, (float)safe_step);
+    float biasCorrection = ocl_opt_bias_correction(beta1, (float)safe_step);
 
     // Update parameters
     param[idx] -= (learningRate / biasCorrection) * mVal / (uVal + epsilon);
@@ -806,15 +815,15 @@ __kernel void nadam_update(
 
     // Bias corrections - guard against step==0 which causes division by zero
     int safe_step = step < 1 ? 1 : step;
-    float beta1Pow = pow(beta1, (float)safe_step);
-    float beta1PowNext = pow(beta1, (float)(safe_step + 1));
-    float beta2Pow = pow(beta2, (float)safe_step);
-    float vHat = vVal / (1.0f - beta2Pow);
+    float beta1PowBc = ocl_opt_bias_correction(beta1, (float)safe_step);
+    float beta1PowNextBc = ocl_opt_bias_correction(beta1, (float)(safe_step + 1));
+    float beta2PowBc = ocl_opt_bias_correction(beta2, (float)safe_step);
+    float vHat = vVal / beta2PowBc;
 
     // Nadam (Dozat 2016, Alg. 2, constant mu = beta1): the momentum look-ahead uses the NEXT step's bias
     // correction (1 - beta1^(t+1)), the current gradient this step's (1 - beta1^t). Matches PyTorch NAdam at
     // constant momentum and FusedOptimizer.NadamUpdateSimd.
-    float mNesterov = beta1 * mVal / (1.0f - beta1PowNext) + (1.0f - beta1) * grad / (1.0f - beta1Pow);
+    float mNesterov = beta1 * mVal / beta1PowNextBc + (1.0f - beta1) * grad / beta1PowBc;
 
     // Update parameters
     param[idx] -= learningRate * mNesterov / (sqrt(vHat) + epsilon);
@@ -944,8 +953,8 @@ __kernel void sparse_adam_update(
     float vVal = beta2 * v[i] + (1.0f - beta2) * grad * grad;
     m[i] = mVal;
     v[i] = vVal;
-    float mHat = mVal / (1.0f - pow(beta1, (float)step));
-    float vHat = vVal / (1.0f - pow(beta2, (float)step));
+    float mHat = mVal / (ocl_opt_bias_correction(beta1, (float)step));
+    float vHat = vVal / (ocl_opt_bias_correction(beta2, (float)step));
     param[i] -= learningRate * mHat / (sqrt(vHat) + epsilon);
 }
 
@@ -965,8 +974,8 @@ __kernel void sparse_adamw_update(
     float vVal = beta2 * v[i] + (1.0f - beta2) * grad * grad;
     m[i] = mVal;
     v[i] = vVal;
-    float mHat = mVal / (1.0f - pow(beta1, (float)step));
-    float vHat = vVal / (1.0f - pow(beta2, (float)step));
+    float mHat = mVal / (ocl_opt_bias_correction(beta1, (float)step));
+    float vHat = vVal / (ocl_opt_bias_correction(beta2, (float)step));
     param[i] = p - learningRate * mHat / (sqrt(vHat) + epsilon);
 }
 
@@ -1051,8 +1060,8 @@ __kernel void sparse_amsgrad_update(
     v[i] = vVal;
     float vMaxNew = fmax(vMax[i], vVal);
     vMax[i] = vMaxNew;
-    float mHat = mVal / (1.0f - pow(beta1, (float)step));
-    float vHat = vMaxNew / (1.0f - pow(beta2, (float)step));
+    float mHat = mVal / (ocl_opt_bias_correction(beta1, (float)step));
+    float vHat = vMaxNew / (ocl_opt_bias_correction(beta2, (float)step));
     param[i] -= learningRate * mHat / (sqrt(vHat) + epsilon);
 }
 
@@ -1071,7 +1080,7 @@ __kernel void sparse_adamax_update(
     float uVal = fmax(beta2 * u[i], fabs(grad));
     m[i] = mVal;
     u[i] = uVal;
-    float lrAdj = learningRate / (1.0f - pow(beta1, (float)step));
+    float lrAdj = learningRate / (ocl_opt_bias_correction(beta1, (float)step));
     param[i] -= lrAdj * mVal / (uVal + epsilon);
 }
 
@@ -1106,9 +1115,9 @@ __kernel void sparse_nadam_update(
     float vVal = beta2 * v[i] + (1.0f - beta2) * grad * grad;
     m[i] = mVal;
     v[i] = vVal;
-    float bc1 = 1.0f - pow(beta1, (float)step);
-    float bc1Next = 1.0f - pow(beta1, (float)(step + 1));
-    float bc2 = 1.0f - pow(beta2, (float)step);
+    float bc1 = ocl_opt_bias_correction(beta1, (float)step);
+    float bc1Next = ocl_opt_bias_correction(beta1, (float)(step + 1));
+    float bc2 = ocl_opt_bias_correction(beta2, (float)step);
     float mHat = beta1 * (mVal / bc1Next) + (1.0f - beta1) * grad / bc1;   // Dozat 2016 Alg. 2; see nadam_update
     float vHat = vVal / bc2;
     param[i] -= learningRate * mHat / (sqrt(vHat) + epsilon);
