@@ -9535,6 +9535,29 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("HIP backend not available");
 
+        // One launch when a row fits in shared memory (2*n floats, 32 KB at n = 4096): batched_fft_smem
+        // bit-reverses on load, runs every stage on chip and writes once. Same kernel as CUDA's.
+        if (batch > 0 && n >= 2 && n <= 4096 && (n & (n - 1)) == 0
+            && _kernelCache.TryGetValue("batched_fft_smem", out var smemFftKernel))
+        {
+            IntPtr inRe = inputReal.Handle, inIm = inputImag.Handle, outRe = outputReal.Handle, outIm = outputImag.Handle;
+            int lg = (int)Math.Round(Math.Log(n, 2));
+            int invFlag = inverse ? 1 : 0;
+            float scale = inverse ? 1.0f / n : 1.0f;
+            void** smemArgs = stackalloc void*[8];
+            smemArgs[0] = &inRe;
+            smemArgs[1] = &inIm;
+            smemArgs[2] = &outRe;
+            smemArgs[3] = &outIm;
+            smemArgs[4] = &n;
+            smemArgs[5] = &lg;
+            smemArgs[6] = &invFlag;
+            smemArgs[7] = &scale;
+            LaunchKernelWithSharedMem(smemFftKernel, (uint)batch, (uint)Math.Min(n / 2, 512),
+                (uint)(2 * n * sizeof(float)), smemArgs);
+            return;
+        }
+
         IntPtr bitRevKernel = GetRequiredFftKernel("batched_bit_reverse");
         IntPtr butterflyKernel = GetRequiredFftKernel("batched_fft_butterfly");
         IntPtr scaleKernel = inverse ? GetRequiredFftKernel("scale_inverse") : IntPtr.Zero;

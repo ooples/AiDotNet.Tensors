@@ -16331,12 +16331,39 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         }
     }
 
+    /// <summary>Longest power-of-two row <see cref="BatchedFFT"/> transforms in one shared-memory launch.</summary>
+    internal const int SharedMemoryFftMaxLength = 4096;
+
     /// <inheritdoc/>
     public unsafe void BatchedFFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag, int batch, int n, bool inverse)
     {
         if (!IsAvailable) throw new GpuCapabilityUnavailableException("CUDA backend not available");
 
         using var _ = PushContext();
+
+        // One launch per call when a row fits in shared memory (2*n floats, 32 KB at n = 4096, inside the
+        // 48 KB every CUDA device grants without opt-in): batched_fft_smem bit-reverses on load, runs all
+        // stages on chip and writes once. The multi-launch path below is kept for longer rows.
+        if (batch > 0 && n >= 2 && n <= SharedMemoryFftMaxLength && (n & (n - 1)) == 0
+            && _kernelCache.TryGetValue("batched_fft_smem", out var smemFftKernel))
+        {
+            IntPtr inRe = inputReal.Handle, inIm = inputImag.Handle, outRe = outputReal.Handle, outIm = outputImag.Handle;
+            int lg = (int)MathHelper.Log2(n);
+            int invFlag = inverse ? 1 : 0;
+            float scale = inverse ? 1.0f / n : 1.0f;
+            void** smemArgs = stackalloc void*[8];
+            smemArgs[0] = &inRe;
+            smemArgs[1] = &inIm;
+            smemArgs[2] = &outRe;
+            smemArgs[3] = &outIm;
+            smemArgs[4] = &n;
+            smemArgs[5] = &lg;
+            smemArgs[6] = &invFlag;
+            smemArgs[7] = &scale;
+            LaunchKernelWithSharedMem(smemFftKernel, (uint)batch, (uint)Math.Min(n / 2, 512),
+                (uint)(2 * n * sizeof(float)), smemArgs);
+            return;
+        }
 
         // Copy input to output for in-place FFT
         CudaCopyBuffer(inputReal, outputReal, batch * n);

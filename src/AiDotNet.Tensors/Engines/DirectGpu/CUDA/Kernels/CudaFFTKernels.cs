@@ -399,6 +399,63 @@ extern ""C"" __global__ __launch_bounds__(256) void batched_bit_reverse(
     dstImag[baseOffset + idx] = srcImag[baseOffset + reversed];
 }
 
+// Whole batched transform in ONE launch: one block per row, the row held in shared memory.
+// The input is read once in natural order (coalesced) and scattered into shared memory at its
+// bit-reversed position, every radix-2 DIT stage runs in shared memory, and the result (times
+// `scale`, 1/n for an inverse) is written once. The multi-launch path below makes
+// 2*log2(n)+6 full passes over global memory per transform. Each block reads its whole row
+// before writing any of it, so input and output may alias.
+// Twiddles use sincospif(-+2w/stride): the argument is exact (stride is a power of two), so
+// the twiddle is correctly rounded rather than cosf of a rounded 2*pi*w/stride.
+// Shared memory: 2*n floats, sized at launch. n must be a power of two with 2 <= n.
+extern ""C"" __global__ __launch_bounds__(512) void batched_fft_smem(
+    const float* inRe, const float* inIm, float* outRe, float* outIm,
+    int n, int log2n, int inverse, float scale)
+{
+    extern __shared__ float fftSmem[];
+    float* re = fftSmem;
+    float* im = fftSmem + n;
+    long long base = (long long)blockIdx.x * n;
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+    {
+        int r = (int)(__brev((unsigned int)i) >> (32 - log2n));
+        re[r] = inRe[base + i];
+        im[r] = inIm[base + i];
+    }
+    __syncthreads();
+
+    float sign = inverse ? 2.0f : -2.0f;
+    int halfN = n >> 1;
+    for (int lgHalf = 0; lgHalf < log2n; lgHalf++)
+    {
+        int hs = 1 << lgHalf;
+        int stride = hs << 1;
+        for (int k = threadIdx.x; k < halfN; k += blockDim.x)
+        {
+            int w = k & (hs - 1);
+            int top = ((k >> lgHalf) << (lgHalf + 1)) + w;
+            int bot = top + hs;
+            float s, c;
+            sincospif(sign * (float)w / (float)stride, &s, &c);
+            float br = re[bot], bi = im[bot];
+            float tr = br * c - bi * s;
+            float ti = br * s + bi * c;
+            float ar = re[top], ai = im[top];
+            re[top] = ar + tr;
+            im[top] = ai + ti;
+            re[bot] = ar - tr;
+            im[bot] = ai - ti;
+        }
+        __syncthreads();
+    }
+
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+    {
+        outRe[base + i] = re[i] * scale;
+        outIm[base + i] = im[i] * scale;
+    }
+}
+
 // Batched FFT butterfly
 extern ""C"" __global__ __launch_bounds__(256) void batched_fft_butterfly(
     float* real, float* imag, int batch, int n, int stride, int inverse)
@@ -462,7 +519,8 @@ extern ""C"" __global__ __launch_bounds__(256) void batched_fft_butterfly(
             "strided_dft",
             "scale_inverse",
             "batched_bit_reverse",
-            "batched_fft_butterfly"
+            "batched_fft_butterfly",
+            "batched_fft_smem"
         };
     }
 }
