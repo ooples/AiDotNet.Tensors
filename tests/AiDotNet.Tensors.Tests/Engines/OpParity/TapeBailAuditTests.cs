@@ -121,6 +121,9 @@ public class TapeBailAuditTests
         // call and broke ResidentIndices_WriteOperationsStayOnDeviceAndPreserveOrdering.
         "TensorPut",
         "TensorScatterReduce",
+        // The kernel runs either way; under a tape it also snapshots the indices on the device (SnapshotIndices), so a
+        // caller editing its index tensor afterwards cannot change the gradient. Inference makes no copy.
+        "TensorScatter",
         // Encodes the bool condition as the byte[] 0/1 WhereBackward reads. The kernel runs and the node is
         // recorded either way; only that host copy is skipped when nothing will consume it.
         "TensorWhere",

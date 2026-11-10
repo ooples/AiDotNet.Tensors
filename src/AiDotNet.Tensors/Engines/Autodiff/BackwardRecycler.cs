@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -80,8 +81,8 @@ internal sealed class BackwardRecycler<T>
             return null;
         var recycler = new BackwardRecycler<T>(arena, StressOverride ?? s_stress);
         recycler._keep.Add(loss);
-        foreach (var source in sources)
-            if (source is not null) recycler._keep.Add(source);
+        foreach (var source in sources.Where(s => s is not null))
+            recycler._keep.Add(source);
         if (retained is not null)
             foreach (var tensor in retained) recycler._keep.Add(tensor);
         t_active = true;
@@ -109,7 +110,6 @@ internal sealed class BackwardRecycler<T>
         _live.Clear();
         foreach (var gradient in grads.Values)
         {
-            if (gradient is null) continue;
             if (gradient.LazySource is not null
                 || !gradient._storage.TryGetBackingArrayIdentity(out var array, out _) || array is null)
             {
@@ -158,9 +158,16 @@ internal sealed class BackwardRecycler<T>
             };
             if (!intact)
                 throw new InvalidOperationException(
-                    $"BackwardRecycler stress: a {array.Length}-element {array.GetType().GetElementType()!.Name} buffer was "
+                    $"BackwardRecycler stress: a {array.Length}-element {(array.GetType().GetElementType() ?? array.GetType()).Name} buffer was "
                     + "written after backward proved it dead; another owner still holds it.");
         }
+    }
+
+    // The per-thread pass state lives in [ThreadStatic] fields: one pass per thread at a time, by design.
+    private static void FinishPass(int returned)
+    {
+        t_active = false;
+        LastPassReturned = returned;
     }
 
     /// <summary>Ends the pass. Buffers still referenced by gradients stay issued until the step boundary.</summary>
@@ -168,8 +175,7 @@ internal sealed class BackwardRecycler<T>
     {
         _arena.CloseIssueLog();
         _issued.Clear();
-        t_active = false;
-        LastPassReturned = ReturnedCount;
+        FinishPass(ReturnedCount);
         if (_poisoned is not null) ThrowIfPoisonOverwritten(_poisoned);
     }
 }

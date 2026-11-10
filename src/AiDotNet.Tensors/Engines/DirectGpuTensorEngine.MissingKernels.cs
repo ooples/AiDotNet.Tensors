@@ -2294,6 +2294,8 @@ public partial class DirectGpuTensorEngine
 
         // This overload has exactly index_add semantics: clone input, then add each values slice
         // into the destination slice named by the one-dimensional indices tensor.
+        if (normalizedAxis >= 0 && normalizedAxis < input.Rank)
+            CpuEngine.ValidateIndexedValuesShape("ScatterAdd", input._shape, indices.Length, values._shape, normalizedAxis);
         if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
             return base.ScatterAdd(input, indices, values, axis);
         try
@@ -2422,7 +2424,6 @@ public partial class DirectGpuTensorEngine
             int batchSize = x1.Length / axisLen;
             var outShape = new int[rank - 1];
             for (int i = 0; i < rank - 1; i++) outShape[i] = x1._shape[i];
-            if (outShape.Length == 0) outShape = new[] { 1 };
 
             using var a = GetOrAllocateBuffer(backend, x1);
             using var b = GetOrAllocateBuffer(backend, x2);
@@ -3951,10 +3952,11 @@ public partial class DirectGpuTensorEngine
 
     Tensor<T> IEngine.SparsemaxBackward<T>(Tensor<T> gradOutput, Tensor<T> output, int axis)
     {
-        using var __gpuOp = EnterGpuOp();
         if (gradOutput is null) throw new ArgumentNullException(nameof(gradOutput));
         if (output is null) throw new ArgumentNullException(nameof(output));
-        if (!output.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        ValidateSameShapePair("SparsemaxBackward", gradOutput, output);
+        using var __gpuOp = EnterGpuOp();
+        if (!output.IsContiguous) output = output.Contiguous();
         int normalizedAxis = axis < 0 ? axis + output.Rank : axis;
         if (typeof(T) != typeof(float) || normalizedAxis != output.Rank - 1
             || gradOutput.Length != output.Length || !gradOutput.IsContiguous
@@ -4637,6 +4639,54 @@ public partial class DirectGpuTensorEngine
         return ConvertNumericIndicesToInt32(backend, numericIndices.Buffer, indices.Length);
     }
 
+    /// <summary>
+    /// A copy of <paramref name="indices"/> for a tape entry, so a caller editing its tensor after the forward does not
+    /// change the gradient: on the device (numeric floats, the resident index form) for device-resident indices, a host
+    /// array otherwise.
+    /// </summary>
+    internal Tensor<int> SnapshotIndices(IDirectGpuBackend backend, Tensor<int> indices)
+    {
+        var shape = (int[])indices._shape.Clone();
+        if (indices.Length == 0 || !HasResidentIndexStorage(indices))
+            return new Tensor<int>(indices.ToArray(), shape);
+        if (indices._gpuBufferContainsRawInt32)
+        {
+            // Raw int32 storage is copied as it is: converting to floats would round an index past 2^24.
+            using var raw = GetOrAllocateInt32IndexBuffer(backend, indices);
+            // Until the snapshot owns it, a failed copy must not leave the buffer held; disposal after
+            // RelinquishOwnership is a no-op.
+            using var rawCopy = AllocateOutputBuffer(backend, indices.Length);
+            backend.Copy(raw.Buffer, rawCopy.Buffer, indices.Length);
+            var rawSnapshot = Tensor<int>.FromGpuBuffer(backend, rawCopy.Buffer, shape, Gpu.GpuTensorRole.Intermediate,
+                ownsBuffer: true, bufferContainsRawInt32: true);
+            rawCopy.RelinquishOwnership();
+            return rawSnapshot;
+        }
+        using var numeric = GetOrAllocateNumericIndexBuffer(backend, indices);
+        // Until the snapshot owns it, a failed copy must not leave the buffer held; disposal after
+        // RelinquishOwnership is a no-op.
+        using var copy = AllocateOutputBuffer(backend, indices.Length);
+        backend.Copy(numeric.Buffer, copy.Buffer, indices.Length);
+        var snapshot = DeferTensorResult<int>(backend, copy.Buffer, indices.Length, shape);
+        copy.RelinquishOwnership();
+        return snapshot;
+    }
+
+    /// <summary>
+    /// The indices as numeric floats, the form the float-indexed kernels (take-along-dim) read. Device-resident indices
+    /// stored as raw int32 (argmax indices) are converted on the device; their raw bits read as floats would be
+    /// denormals that truncate to 0.
+    /// </summary>
+    private OwnedBuffer GetOrAllocateNumericIndexBuffer(IDirectGpuBackend backend, Tensor<int> indices)
+    {
+        if (!indices._gpuBufferContainsRawInt32 || !HasResidentIndexStorage(indices))
+            return GetOrAllocateBuffer(backend, indices);
+        using var raw = GetOrAllocateBuffer(backend, indices);
+        var numeric = AllocateOutputBuffer(backend, Math.Max(1, indices.Length));
+        backend.Int32ToFloat(raw.Buffer, numeric.Buffer, indices.Length);
+        return numeric;
+    }
+
     private static bool HasResidentIndexStorage(Tensor<int> indices)
     {
         if (indices.IsGpuResident) return true;
@@ -4873,7 +4923,10 @@ public partial class DirectGpuTensorEngine
                     indicesHandedOff = true;
                     if (tournament) Interlocked.Increment(ref _topKTournamentsCompleted);
                     indices = new Tensor<int>(indexData, new[] { rows, selected });
-                    return new Tensor<T>(valueData, new[] { rows, selected });
+                    var topValues = new Tensor<T>(valueData, new[] { rows, selected });
+                    Autodiff.DifferentiableOps.RecordUnary("TopK", topValues, tensor,
+                        Autodiff.BackwardFunctions<T>.TopKBackward, new object[] { TapeIndexCopy<T>(indices), 1 });
+                    return topValues;
                 }
                 finally
                 {
@@ -5010,6 +5063,8 @@ public partial class DirectGpuTensorEngine
         for (int k = 0; k < rank; k++)
             if (k != d && indices._shape[k] != tensor._shape[k])
                 return base.TensorTakeAlongDim(tensor, indices, dim);
+        // No indices gather nothing; a backend may reject the zero-sized index buffer.
+        if (indices.Length == 0) return new Tensor<T>((int[])indices._shape.Clone());
 
         // Gather along axis d on the device with the new TakeAlongDim kernel: view as
         // [outer, axisIn, inner] / [outer, axisOut, inner]. Indices upload as an int buffer.
@@ -5026,7 +5081,11 @@ public partial class DirectGpuTensorEngine
             using var bufIn = GetOrAllocateBuffer(backend, ct);
             // Indices ride as a FLOAT buffer (int values, cast in-kernel) so a RESIDENT int-index tensor
             // (e.g. from Argsort) is reused in place instead of re-uploaded — the int-residency chain.
-            using var bufIdx = GetOrAllocateBuffer(backend, ci);
+            // The kernel reads indices as floats, exact only up to 2^24: a longer axis could select the wrong slot.
+            if (axisIn > MaxExactScatterPositions)
+                throw new NotSupportedException(
+                    $"TensorTakeAlongDim along an axis of {axisIn} exceeds the {MaxExactScatterPositions} indices a float holds exactly.");
+            using var bufIdx = GetOrAllocateNumericIndexBuffer(backend, ci);
             var bufOut = AllocateOutputBuffer(backend, outN);
             backend.TakeAlongDim(bufIn.Buffer, bufIdx.Buffer, bufOut.Buffer, outerSize, axisOut, innerSize, axisIn);
             var arr = FinishGpuOp<T>(backend, bufOut, outN);
@@ -5263,11 +5322,26 @@ public partial class DirectGpuTensorEngine
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorHistc", capabilityGap); return base.TensorHistc(input, bins, min, max); }
     }
 
+    /// <summary>
+    /// The p the cdist/pdist kernels take: +inf travels as -1, because finite-math compiler flags may assume a float
+    /// is never infinite; 0 (count of differing coordinates) passes through. A finite positive p keeps the p-norm
+    /// branch even where float cannot hold it: one that underflows becomes the smallest positive float rather than the
+    /// count, and one that overflows the largest float rather than the max-norm.
+    /// </summary>
+    internal static float KernelNormOrder(double p)
+    {
+        if (double.IsPositiveInfinity(p)) return -1f;
+        float f = (float)p;
+        if (p > 0 && f < float.Epsilon) return float.Epsilon;   // underflowed to 0: f is never negative here
+        return float.IsPositiveInfinity(f) ? float.MaxValue : f;
+    }
+
     /// <inheritdoc/>
     public override Tensor<T> TensorPDist<T>(Tensor<T> input, double p = 2.0)
     {
         using var __gpuOp = EnterGpuOp();
         if (input is null) throw new ArgumentNullException(nameof(input));
+        CpuEngine.ValidateNormOrder(p);
         if (typeof(T) != typeof(float) || input.Rank != 2 || input._shape[0] < 2 || !TryGetBackend(out var backend))
             return base.TensorPDist(input, p);
         try
@@ -5277,7 +5351,7 @@ public partial class DirectGpuTensorEngine
             int outN = n * (n - 1) / 2;
             using var bufIn = GetOrAllocateBuffer(backend, c);
             var bufOut = AllocateOutputBuffer(backend, outN);
-            backend.PDist(bufIn.Buffer, bufOut.Buffer, n, d, (float)p);
+            backend.PDist(bufIn.Buffer, bufOut.Buffer, n, d, KernelNormOrder(p));
             var arr = FinishGpuOp<T>(backend, bufOut, outN);
             var res = new Tensor<T>(arr, new[] { outN });
             // Record against the ORIGINAL input, not the Contiguous() copy, and with the same
@@ -5297,31 +5371,76 @@ public partial class DirectGpuTensorEngine
         using var __gpuOp = EnterGpuOp();
         if (x1 is null) throw new ArgumentNullException(nameof(x1));
         if (x2 is null) throw new ArgumentNullException(nameof(x2));
-        if (typeof(T) != typeof(float) || x1.Rank != 2 || x2.Rank != 2
-            || x1._shape[1] != x2._shape[1] || !TryGetBackend(out var backend))
+        CpuEngine.ValidateNormOrder(p);
+        // Shapes the host rejects go there for its descriptive error; every float [..., P, M] x [..., R, M] runs here.
+        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive || x1.Rank < 2 || x2.Rank < 2
+            || x1._shape[x1.Rank - 1] != x2._shape[x2.Rank - 1] || !TryGetBackend(out var backend))
             return base.TensorCDist(x1, x2, p);
+        // torch.cdist: the leading batch dims broadcast; each output batch reads one matrix of each input.
+        var batchShape = CpuEngine.CDistBatchLayout(x1._shape, x2._shape, out var base1, out var base2);
+        int m = x1._shape[x1.Rank - 2], n = x2._shape[x2.Rank - 2], d = x1._shape[x1.Rank - 1];
+        var outShape = new int[batchShape.Length + 2];
+        Array.Copy(batchShape, outShape, batchShape.Length);
+        outShape[batchShape.Length] = m;
+        outShape[batchShape.Length + 1] = n;
+        // An overflowing size throws here, before any buffer is allocated. The copy offsets base * matrix stay inside
+        // an input's Length, and bi * pairs inside total, so they cannot overflow once these do not.
+        int batches = base1.Length, pairs = checked(m * n), total = checked(batches * pairs);
+        int matrix1 = checked(m * d), matrix2 = checked(n * d);
+        var leases = new List<OwnedBuffer>();
         try
         {
-            // CPU reference (CpuEngine.Parity210.PNormCross) accumulates in `double`
-            // and only narrows on the final cast. The CUDA `parity210_cdist` kernel
-            // does the same (sum is `double`, narrowed on output) so this override
-            // is GPU/CPU bit-equivalent within fp32 sqrt rounding.
-            var c1 = x1.IsContiguous ? x1 : (Tensor<T>)x1.Contiguous();
-            var c2 = x2.IsContiguous ? x2 : (Tensor<T>)x2.Contiguous();
-            int m = x1._shape[0], n = x2._shape[0], d = x1._shape[1];
-            int outN = m * n;
-            using var buf1 = GetOrAllocateBuffer(backend, c1);
-            using var buf2 = GetOrAllocateBuffer(backend, c2);
-            var bufOut = AllocateOutputBuffer(backend, outN);
-            backend.CDist(buf1.Buffer, buf2.Buffer, bufOut.Buffer, m, n, d, (float)p);
-            var arr = FinishGpuOp<T>(backend, bufOut, outN);
-            var res = new Tensor<T>(arr, new[] { m, n });
+            Tensor<T> res;
+            if (total == 0 || d == 0)
+            {
+                // No pairs, or pairs of empty vectors (every distance 0): nothing for the kernel to read.
+                res = new Tensor<T>(outShape);
+            }
+            else
+            {
+                // CPU reference (CpuEngine.Parity210.PNormCross) accumulates in float, as the kernels do.
+                var c1 = x1.IsContiguous ? x1 : x1.Contiguous();
+                var c2 = x2.IsContiguous ? x2 : x2.Contiguous();
+                using var buf1 = GetOrAllocateBuffer(backend, c1);
+                using var buf2 = GetOrAllocateBuffer(backend, c2);
+                float kernelP = KernelNormOrder(p);
+                bool single = batches == 1 && base1[0] == 0 && base2[0] == 0;
+                IGpuBuffer Scratch(int size) => RentOpScratch(backend, size, leases);
+                var a = single ? buf1.Buffer : Scratch(matrix1);
+                var b = single ? buf2.Buffer : Scratch(matrix2);
+                var pairOut = single ? null : Scratch(pairs);
+                res = DispatchDeferredGpuOp<T>(backend, total, outShape, output =>
+                {
+                    if (pairOut is null)
+                    {
+                        backend.CDist(a, b, output, m, n, d, kernelP);
+                        return;
+                    }
+                    // One kernel per output batch over the two matrices it reads; every copy stays on the device.
+                    for (int bi = 0; bi < batches; bi++)
+                    {
+                        backend.Copy(buf1.Buffer, base1[bi] * matrix1, a, 0, matrix1);
+                        backend.Copy(buf2.Buffer, base2[bi] * matrix2, b, 0, matrix2);
+                        backend.CDist(a, b, pairOut, m, n, d, kernelP);
+                        backend.Copy(pairOut, 0, output, bi * pairs, pairs);
+                    }
+                });
+            }
             // Record against the ORIGINAL operands, not the Contiguous() copies.
             DifferentiableOps.RecordBinary("TensorCDist", res, x1, x2,
                 BackwardFunctions<T>.CDistBackward, savedState: new object[] { p });
             return res;
         }
-        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorCDist", capabilityGap); return base.TensorCDist(x1, x2, p); }
+        catch (NotSupportedException capabilityGap)
+        {
+            GpuLaunchProbe.OnFallback("TensorCDist", capabilityGap);
+            if (ThrowOnGpuKernelFallback) throw;
+            return base.TensorCDist(x1, x2, p);
+        }
+        finally
+        {
+            foreach (var lease in leases) lease.DisposeAfterQueuedUse(backend);
+        }
     }
 
     /// <inheritdoc/>
@@ -9283,7 +9402,7 @@ public partial class DirectGpuTensorEngine
         try
         {
             var contiguousInput = input.IsContiguous ? input : (Tensor<T>)input.Contiguous();
-            var contiguousIndices = indices.IsContiguous ? indices : (Tensor<int>)indices.Contiguous();
+            var contiguousIndices = indices.IsContiguous ? indices : indices.Contiguous();
             int axisSize = input.Shape._dims[normalizedAxis];
             int outerSize = 1;
             for (int i = 0; i < normalizedAxis; i++) outerSize *= input.Shape._dims[i];
@@ -9327,6 +9446,8 @@ public partial class DirectGpuTensorEngine
         // d/d(values) gathers the upstream gradient at them. An earlier recording got d(input) wrong by 3.14e-01;
         // this one saves the NORMALISED axis the backward indexes with and runs the same device helpers as
         // index_copy, and GpuTapeGradientParityTests proves BOTH operands against the CPU.
+        if (normalizedAxis >= 0 && normalizedAxis < input.Rank)
+            CpuEngine.ValidateIndexedValuesShape("Scatter", input._shape, indices.Length, values._shape, normalizedAxis);
         if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || normalizedAxis < 0 || normalizedAxis >= input.Rank || !TryGetBackend(out var backend))
             return base.Scatter(input, indices, values, axis);
@@ -9339,7 +9460,7 @@ public partial class DirectGpuTensorEngine
             for (int i = normalizedAxis + 1; i < input.Rank; i++) innerSize *= input.Shape._dims[i];
             if (values.Length != outerSize * indices.Length * innerSize)
                 return base.Scatter(input, indices, values, axis);
-            var contiguousIndices = indices.IsContiguous ? indices : (Tensor<int>)indices.Contiguous();
+            var contiguousIndices = indices.IsContiguous ? indices : indices.Contiguous();
             if (!HasResidentIndexStorage(contiguousIndices)
                 && Autodiff.BackwardFunctions<T>.OverwrittenIndexPositions(contiguousIndices.GetDataArray()).Length > 0)
                 return base.Scatter(input, indices, values, axis);   // duplicates: see TensorIndexCopy
@@ -9383,57 +9504,190 @@ public partial class DirectGpuTensorEngine
         if (destination is null) throw new ArgumentNullException(nameof(destination));
         if (indices is null) throw new ArgumentNullException(nameof(indices));
         if (source is null) throw new ArgumentNullException(nameof(source));
-        int normalizedAxis = axis < 0 ? axis + destination.Rank : axis;
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
-            || destination.Rank != 2 || normalizedAxis != 1 || indices.Rank != 2
-            || source.Rank != 2 || indices.Shape._dims[0] != destination.Shape._dims[0]
-            || !ShapesEqual(indices._shape, source._shape) || !TryGetBackend(out var backend))
+        int rank = destination.Rank;
+        int d = axis < 0 ? axis + rank : axis;
+        // Graph capture records its node in the host implementation (the node replays through this engine). Shapes the
+        // host rejects go there for its descriptive error. Every other float call runs on the device, training included.
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || d < 0 || d >= rank
+            || indices.Rank != rank || !ShapesEqual(indices._shape, source._shape) || !TryGetBackend(out var backend))
             return base.TensorScatter(destination, indices, source, axis);
+        for (int k = 0; k < rank; k++)
+            if (k != d && indices._shape[k] != destination._shape[k])
+                return base.TensorScatter(destination, indices, source, axis);
+
+        int dstDim = destination._shape[d], srcDim = indices._shape[d];
+        int outer = 1; for (int k = 0; k < d; k++) outer *= destination._shape[k];
+        int inner = 1; for (int k = d + 1; k < rank; k++) inner *= destination._shape[k];
+        int n = destination.Length, m = indices.Length;
+        var ci = indices.IsContiguous ? indices : indices.Contiguous();
+        if (!HasResidentIndexStorage(ci))
+        {
+            // Host indices are validated here, as the host implementation does; device-resident ones are not read
+            // back, and the kernels skip an out-of-range entry.
+            using var indexLease = ci.LeaseArray();
+            var indexData = indexLease.Array;
+            for (int i = 0; i < m; i++)
+                if ((uint)indexData[i] >= (uint)dstDim)
+                    throw new IndexOutOfRangeException($"Index {indexData[i]} is out of bounds for axis size {dstDim}");
+        }
+
+        var leases = new List<OwnedBuffer>();
         try
         {
-            int batch = destination.Shape._dims[0];
-            int columns = destination.Shape._dims[1];
-            int updatesPerRow = indices.Shape._dims[1];
-            if (destination.Length > 1 << 24)
-                return base.TensorScatter(destination, indices, source, axis);
-            var contiguousIndices = indices.IsContiguous ? indices : (Tensor<int>)indices.Contiguous();
-            if (!HasResidentIndexStorage(contiguousIndices))
+            var cd = destination.IsContiguous ? destination : destination.Contiguous();
+            Tensor<T> result;
+            if (m == 0 || n == 0)
             {
-                using var indexDataLease = contiguousIndices.LeaseArray();
-                var indexData = indexDataLease.Array;
-                for (int i = 0; i < contiguousIndices.Length; i++)
-                    if (indexData[i] < 0 || indexData[i] >= columns)
-                        throw new IndexOutOfRangeException(
-                            $"Index {indexData[i]} is out of bounds for axis size {columns}");
+                // Nothing is written: the result is the destination. The empty source and indices are never given a
+                // buffer (a backend may reject a zero-sized one).
+                if (n == 0)
+                {
+                    result = new Tensor<T>((int[])destination._shape.Clone());
+                }
+                else
+                {
+                    using var emptyScatterDestination = GetOrAllocateBuffer(backend, cd);
+                    result = DispatchDeferredGpuOp<T>(backend, n, (int[])destination._shape.Clone(),
+                        output => backend.Copy(emptyScatterDestination.Buffer, output, n));
+                }
+                if (IsTapeActive<T>())
+                    Autodiff.DifferentiableOps.RecordBinary("TensorScatter", result, destination, source,
+                        Autodiff.BackwardFunctions<T>.TensorScatterBackward,
+                        new object[] { new Tensor<int>((int[])ci._shape.Clone()), d });
+                return result;
             }
+            // The last-write test compares float positions along the axis and gathers through float indices; past
+            // 2^24 + 1 two positions (or two destination slots) share a float.
+            if (Math.Max(srcDim, dstDim) > MaxExactScatterPositions)
+                throw new NotSupportedException(
+                    $"TensorScatter of {srcDim} writes into an axis of {dstDim} exceeds the {MaxExactScatterPositions} positions a float holds exactly.");
+            var cs = source.IsContiguous ? source : source.Contiguous();
+            using var destinationBuffer = GetOrAllocateBuffer(backend, cd);
+            using var sourceBuffer = GetOrAllocateBuffer(backend, cs);
+            using var int32Index = GetOrAllocateInt32IndexBuffer(backend, ci);
+            using var floatIndex = GetOrAllocateNumericIndexBuffer(backend, ci);
+            IGpuBuffer Scratch(int size) => RentOpScratch(backend, size, leases);
+            var claims = Scratch(n);
+            var winners = Scratch(m);
+            var positions = Scratch(m);
+            var zeros = Scratch(m);
+            var winningSource = Scratch(m);
+            var scattered = Scratch(n);
+            var unwritten = Scratch(n);
+            var minusOne = Scratch(n);
 
-            var contiguousDestination = destination.IsContiguous ? destination : (Tensor<T>)destination.Contiguous();
-            var contiguousSource = source.IsContiguous ? source : (Tensor<T>)source.Contiguous();
-            using var destinationBuffer = GetOrAllocateBuffer(backend, contiguousDestination);
-            using var sourceBuffer = GetOrAllocateBuffer(backend, contiguousSource);
-            using var numericIndexBuffer = GetOrAllocateBuffer(backend, contiguousIndices);
-            var rowOffsets = new float[indices.Length];
-            for (int row = 0; row < batch; row++)
-                for (int update = 0; update < updatesPerRow; update++)
-                    rowOffsets[row * updatesPerRow + update] = row * columns;
-            using var rowOffsetBuffer = backend.AllocateBuffer(rowOffsets);
-            using var flatPositionBuffer = AllocateOutputBuffer(backend, indices.Length);
-            backend.Add(numericIndexBuffer.Buffer, rowOffsetBuffer,
-                flatPositionBuffer.Buffer, indices.Length);
-            using var nativePositionBuffer = ConvertNumericIndicesToInt32(
-                backend, flatPositionBuffer.Buffer, indices.Length);
-            return DispatchDeferredGpuOp<T>(backend, destination.Length, destination.Shape.ToArray(), output =>
+            result = DispatchDeferredGpuOp<T>(backend, n, (int[])destination._shape.Clone(), output =>
             {
-                backend.Copy(destinationBuffer.Buffer, output, destination.Length);
-                backend.IndexWrite(output, nativePositionBuffer.Buffer, sourceBuffer.Buffer,
-                    0f, mode: 0, outerSize: 1, idxAxis: indices.Length,
-                    innerSize: 1, dstAxis: destination.Length);
+                ScatterLastWritesOnDevice(backend, int32Index.Buffer, floatIndex.Buffer, positions, claims, winners,
+                    outer, srcDim, dstDim, inner);
+                // torch.scatter keeps the last write to a slot. Only the winning writes carry their source value into
+                // a zeroed buffer, so each written slot receives exactly one non-zero term and the atomic sum is exact.
+                backend.Fill(zeros, 0f, m);
+                backend.Where(winners, sourceBuffer.Buffer, zeros, winningSource, m);
+                backend.Fill(scattered, 0f, n);
+                backend.ScatterReduce(scattered, winningSource, int32Index.Buffer, outer, srcDim, dstDim, inner, 0);
+                // Slots nothing writes keep the destination.
+                backend.Fill(minusOne, -1f, n);
+                backend.Equal(claims, minusOne, unwritten, n);
+                backend.Where(unwritten, destinationBuffer.Buffer, scattered, output, n);
             });
+            if (IsTapeActive<T>())
+            {
+                // The backward reads the indices this forward used: a caller editing its tensor afterwards must not
+                // change the gradient, so the tape keeps a copy.
+                var savedIndices = SnapshotIndices(backend, ci);
+                Autodiff.DifferentiableOps.RecordBinary("TensorScatter", result, destination, source,
+                    Autodiff.BackwardFunctions<T>.TensorScatterBackward, new object[] { savedIndices, d });
+            }
+            return result;
         }
-        catch
+        catch (NotSupportedException capabilityGap)
         {
+            GpuLaunchProbe.OnFallback("TensorScatter", capabilityGap);
             if (ThrowOnGpuKernelFallback) throw;
             return base.TensorScatter(destination, indices, source, axis);
+        }
+        finally
+        {
+            foreach (var lease in leases) lease.DisposeAfterQueuedUse(backend);
+        }
+    }
+
+    /// <summary>
+    /// Scratch an op's kernels fill completely and drop when the op returns. Inside a compiled step it is a stable
+    /// buffer from the step's transient arena, so a captured graph allocates nothing; elsewhere it is an owned buffer
+    /// the caller releases after the work queued on it (<see cref="OwnedBuffer.DisposeAfterQueuedUse"/>). Each call
+    /// gets a distinct buffer.
+    /// </summary>
+    private static IGpuBuffer RentOpScratch(IDirectGpuBackend backend, int size, List<OwnedBuffer> leases)
+    {
+        var lease = AllocateTransientScratch(backend, size, fullyWritten: true);
+        leases.Add(lease);
+        return lease.Buffer;
+    }
+
+    /// <summary>
+    /// The largest scatter axis whose write positions (0 .. srcDim - 1) are all distinct floats: every integer up to
+    /// 2^24 is exact, so 2^24 + 1 positions.
+    /// </summary>
+    private const int MaxExactScatterPositions = (1 << 24) + 1;
+
+    /// <summary>
+    /// For a scatter of [outer, srcDim, inner] writes into [outer, dstDim, inner]: <paramref name="claims"/> gets, per
+    /// destination slot, the position j of the last write to it (-1 where nothing writes), and <paramref name="winners"/>
+    /// gets, per write, 1 when it is that last write and 0 when a later write in its fibre overwrites it. All on the
+    /// device: an amax scatter of the positions, then a gather of the claims back along the same indices.
+    /// </summary>
+    private static void ScatterLastWritesOnDevice(IDirectGpuBackend backend, IGpuBuffer int32Index, IGpuBuffer floatIndex,
+        IGpuBuffer positions, IGpuBuffer claims, IGpuBuffer winners, int outer, int srcDim, int dstDim, int inner)
+    {
+        int n = outer * dstDim * inner, m = outer * srcDim * inner;
+        // Each write's position j along the axis, generated on the device (no host upload, so graph capture holds).
+        backend.ScatterPositions(positions, srcDim, inner, m);
+        backend.Fill(claims, -1f, n);
+        backend.ScatterReduce(claims, positions, int32Index, outer, srcDim, dstDim, inner, 2);
+        backend.TakeAlongDim(claims, floatIndex, winners, outer, srcDim, inner, dstDim);
+        backend.Equal(winners, positions, winners, m);
+    }
+
+    /// <summary>
+    /// The scatter backward's last-write mask (1 for a write that survives, 0 for one a later write overwrote) computed
+    /// on the device, shaped like <paramref name="indices"/>. Null when the device cannot compute it.
+    /// </summary>
+    internal Tensor<T>? TryScatterLastWriteMask<T>(Tensor<int> indices, int axis, int[] destinationShape)
+    {
+        using var __gpuOp = EnterGpuOp();
+        int rank = destinationShape.Length;
+        if (typeof(T) != typeof(float) || indices.Rank != rank || axis < 0 || axis >= rank || !TryGetBackend(out var backend))
+            return null;
+        int dstDim = destinationShape[axis], srcDim = indices._shape[axis];
+        int outer = 1; for (int k = 0; k < axis; k++) outer *= destinationShape[k];
+        int inner = 1; for (int k = axis + 1; k < rank; k++) inner *= destinationShape[k];
+        int n = outer * dstDim * inner, m = indices.Length;
+        if (m == 0) return new Tensor<T>((int[])indices._shape.Clone());
+        // Positions or indices past a float's exact range would merge; the host mask is exact.
+        if (Math.Max(srcDim, dstDim) > MaxExactScatterPositions) return null;
+        var ci = indices.IsContiguous ? indices : indices.Contiguous();
+        var leases = new List<OwnedBuffer>();
+        try
+        {
+            using var int32Index = GetOrAllocateInt32IndexBuffer(backend, ci);
+            using var floatIndex = GetOrAllocateNumericIndexBuffer(backend, ci);
+            var claims = RentOpScratch(backend, n, leases);
+            var positions = RentOpScratch(backend, m, leases);
+            return DispatchDeferredGpuOp<T>(backend, m, (int[])indices._shape.Clone(), winners =>
+                ScatterLastWritesOnDevice(backend, int32Index.Buffer, floatIndex.Buffer, positions, claims, winners,
+                    outer, srcDim, dstDim, inner));
+        }
+        catch (NotSupportedException capabilityGap)
+        {
+            GpuLaunchProbe.OnFallback("TensorScatterBackward", capabilityGap);
+            if (ThrowOnGpuKernelFallback) throw;
+            return null;
+        }
+        finally
+        {
+            foreach (var lease in leases) lease.DisposeAfterQueuedUse(backend);
         }
     }
 
@@ -9458,7 +9712,7 @@ public partial class DirectGpuTensorEngine
         try
         {
             var contiguousPacked = packed.IsContiguous ? packed : (Tensor<byte>)packed.Contiguous();
-            var contiguousIndices = indices.IsContiguous ? indices : (Tensor<int>)indices.Contiguous();
+            var contiguousIndices = indices.IsContiguous ? indices : indices.Contiguous();
             int sourceAxis = packed.Shape._dims[normalizedAxis];
             if (!HasResidentIndexStorage(contiguousIndices))
             {
@@ -9513,7 +9767,7 @@ public partial class DirectGpuTensorEngine
         {
             var contiguousPacked = packed.IsContiguous ? packed : (Tensor<byte>)packed.Contiguous();
             var contiguousSource = source.IsContiguous ? source : (Tensor<byte>)source.Contiguous();
-            var contiguousIndices = indices.IsContiguous ? indices : (Tensor<int>)indices.Contiguous();
+            var contiguousIndices = indices.IsContiguous ? indices : indices.Contiguous();
             int destinationAxis = packed.Shape._dims[normalizedAxis];
             int sourceAxis = source.Shape._dims[normalizedAxis];
             if (sourceAxis != indices.Length)

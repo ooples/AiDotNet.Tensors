@@ -183,6 +183,7 @@ public sealed partial class MetalBackend
     }
     public void CDist(IGpuBuffer x1, IGpuBuffer x2, IGpuBuffer output, int m, int n, int d, float p)
     {
+        p = AiDotNet.Tensors.Engines.DirectGpuTensorEngine.KernelNormOrder(p);
         ThrowIfDisposed();
         var pipeline = GetParity210Pipeline("parity210_cdist");
         int __total = m*n; if (__total <= 0) return;
@@ -200,6 +201,7 @@ public sealed partial class MetalBackend
     }
     public void PDist(IGpuBuffer input, IGpuBuffer output, int n, int d, float p)
     {
+        p = AiDotNet.Tensors.Engines.DirectGpuTensorEngine.KernelNormOrder(p);
         ThrowIfDisposed();
         var pipeline = GetParity210Pipeline("parity210_pdist");
         int __total = n*n; if (__total <= 0) return;
@@ -260,6 +262,33 @@ public sealed partial class MetalBackend
         encoder.SetBytes(dstRowLen, 3);
         encoder.SetBytes(numRows, 4);
         encoder.SetBytes(copyLen, 5);
+        encoder.DispatchThreadgroups(tgr, tpg);
+    }
+    public void Int32ToFloat(IGpuBuffer raw, IGpuBuffer output, int n)
+    {
+        ThrowIfDisposed();
+        var pipeline = GetParity210Pipeline("parity210_int32_to_float");
+        if (GpuBufferCapacity.IsEmptyLaunch(n)) return; GpuBufferCapacity.Require(raw, n, nameof(raw)); GpuBufferCapacity.Require(output, n, nameof(output));
+        var (tgr, tpg) = pipeline.Calculate1DDispatch(n);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer((MetalGpuBuffer)raw, 0);
+        encoder.SetBuffer((MetalGpuBuffer)output, 1);
+        encoder.SetBytes(n, 2);
+        encoder.DispatchThreadgroups(tgr, tpg);
+    }
+    public void ScatterPositions(IGpuBuffer output, int srcDim, int inner, int n)
+    {
+        ThrowIfDisposed();
+        var pipeline = GetParity210Pipeline("parity210_scatter_positions");
+        if (GpuBufferCapacity.IsEmptyLaunch(n)) return; GpuBufferCapacity.RequirePositions(output, srcDim, inner, n);
+        var (tgr, tpg) = pipeline.Calculate1DDispatch(n);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer((MetalGpuBuffer)output, 0);
+        encoder.SetBytes(srcDim, 1);
+        encoder.SetBytes(inner, 2);
+        encoder.SetBytes(n, 3);
         encoder.DispatchThreadgroups(tgr, tpg);
     }
     public void IotaPad(IGpuBuffer idx, int l, int p, int numRows)

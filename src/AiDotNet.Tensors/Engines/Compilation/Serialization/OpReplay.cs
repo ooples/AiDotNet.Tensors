@@ -121,10 +121,24 @@ internal static class OpReplay
             // ── Loss ────────────────────────────────────────────────
             OpType.CrossEntropyLoss => engine.TensorCrossEntropyLoss(inputs[0], inputs[1]),
 
+            // ── Indexed ops: savedState is { indices, axis } ────────
+            OpType.TensorScatter => engine.TensorScatter(inputs[0], SavedIndices(savedState, opName), inputs[1],
+                SavedAxis(savedState, opName)),
+            OpType.TensorIndexSelect => engine.TensorIndexSelect(inputs[0], SavedIndices(savedState, opName),
+                SavedAxis(savedState, opName)),
+
             _ => throw new NotSupportedException(
                 $"OpType {opType} ('{opName}') is not supported for training plan replay."),
         };
     }
+
+    private static Tensor<int> SavedIndices(object[]? savedState, string opName) =>
+        savedState is { Length: > 1 } && savedState[0] is Tensor<int> indices ? indices
+        : throw new System.IO.InvalidDataException($"Training plan op '{opName}' has no saved index tensor. The plan file is corrupt.");
+
+    private static int SavedAxis(object[]? savedState, string opName) =>
+        savedState is { Length: > 1 } && savedState[1] is int axis ? axis
+        : throw new System.IO.InvalidDataException($"Training plan op '{opName}' has no saved axis. The plan file is corrupt.");
 
     private static Tensor<T> ReplayLeakyReLU<T>(IEngine engine, Tensor<T> input, object[]? savedState)
     {

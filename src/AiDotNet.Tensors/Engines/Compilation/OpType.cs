@@ -108,6 +108,8 @@ internal enum OpType : byte
     TensorPermute,
     TensorMultiplyScalar,
     GroupedQueryAttention,
+    TensorScatter,
+    TensorIndexSelect,
 }
 
 internal static class OpTypeParser
@@ -187,6 +189,8 @@ internal static class OpTypeParser
         "TensorPermute" => OpType.TensorPermute,
         "TensorMultiplyScalar" => OpType.TensorMultiplyScalar,
         "GroupedQueryAttention" => OpType.GroupedQueryAttention,
+        "TensorScatter" => OpType.TensorScatter,
+        "TensorIndexSelect" => OpType.TensorIndexSelect,
         _ => OpType.Unknown,
     };
 }

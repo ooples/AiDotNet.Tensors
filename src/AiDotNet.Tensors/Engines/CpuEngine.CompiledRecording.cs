@@ -57,7 +57,7 @@ public partial class CpuEngine
         try
         {
             using (new NoGradScope<T>())
-                traced = forward(this).Clone();
+                traced = OwnedOutput(forward(this));
         }
         finally
         {
@@ -70,6 +70,14 @@ public partial class CpuEngine
         if (replaysHostState && result.LazySource is LazyNode<T> node) node.ReplaysHostState = true;
         return true;
     }
+
+    // The node's output buffer must own its storage. Clone() is a copy-on-write share of the trace-time eager result
+    // (a pooled tensor), so the plan's buffer for this node - and the views consumers took of it while tracing, such as
+    // the Reshape a Flatten records - stayed tied to storage the plan does not own. Measured (#1705): a compiled
+    // Conv/MaxPool/Flatten/Dense CPU step whose loss was 1.5e13 or 2.3e35 (ln 10 = 2.3026, all-zero logits, on a fresh
+    // process) where the eager step's was 3.1733, with two identical compiled steps disagreeing; with an owned copy the
+    // compiled loss is 3.1733 and the step matches eager to 3e-8.
+    private static Tensor<T> OwnedOutput<T>(Tensor<T> eager) => (Tensor<T>)eager.CloneDeepCopy();
 
     // The recording scope of a training trace that binds this engine, and the distinct non-null operands in order;
     // null when the op runs eagerly (no trace, an inference trace, another engine's trace, or no tensor operand).
@@ -126,7 +134,7 @@ public partial class CpuEngine
             using (new NoGradScope<T>())
             {
                 var (r, a) = forward(this);
-                traced = r.Clone();
+                traced = OwnedOutput(r);
                 tracedAux = a;
             }
         }

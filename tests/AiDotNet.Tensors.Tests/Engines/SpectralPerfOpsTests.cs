@@ -368,4 +368,18 @@ public class SpectralPerfOpsTests
         for (int c = 0; c < cols; c++)
             Assert.Equal(r1[c], r2[c], 10);
     }
+
+    [Fact]
+    public void NativeNormalizeRows_InPlace_OnAnOffsetRowSlice_WritesThroughTheView()
+    {
+        // Rows 1..2 of a [4, 2] tensor: contiguous, but at storage offset 2.
+        var parent = new Tensor<decimal>(new[] { 4, 2 }, new Vector<decimal>(new[] { 9m, 9m, 3m, 4m, 0m, 2m, 7m, 7m }));
+        var rows = parent.Slice(0, 1, 3);
+
+        var result = _engine.NativeNormalizeRows(rows, inPlace: true);
+
+        Assert.Same(rows, result);
+        // The slice's rows are unit-norm; the rows outside it are untouched.
+        Assert.Equal(new[] { 9m, 9m, 0.6m, 0.8m, 0m, 1m, 7m, 7m }, parent.ToArray());
+    }
 }
