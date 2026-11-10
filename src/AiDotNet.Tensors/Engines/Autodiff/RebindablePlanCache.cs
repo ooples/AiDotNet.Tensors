@@ -193,8 +193,16 @@ internal static class RebindablePlanCache<T>
         // On the CPU, the buffers backward rents go back to the step's arena once no gradient references them.
         var recycler = BackwardRecycler<T>.Begin(engine, loss, sources, retainedTensors);
         if (recycler is not null)
-            foreach (int noted in indices)
-                if (noted >= 0 && noted < currentEntries.Count) recycler.NoteOutput(currentEntries[noted].Output);
+            for (int i = 0; i < indices.Length; i++)
+            {
+                int noted = indices[i];
+                if (noted < 0 || noted >= currentEntries.Count) continue;
+                ref var entry = ref currentEntries[noted];
+                recycler.NoteOutput(entry.Output);
+                if (recycler.TracksForward)
+                    recycler.NoteStep(i, entry.Output, entry.Input0, entry.Input1, entry.Input2, entry.InputsOverflow,
+                        entry.SavedState, entry.Backward);
+            }
         try
         {
             for (int i = 0; i < indices.Length; i++)
@@ -210,9 +218,15 @@ internal static class RebindablePlanCache<T>
                 ref var entry = ref currentEntries[idx];
 
                 if (!DifferentiableOps.IsGradientRequired(entry.Output))
+                {
+                    recycler?.AfterStep(grads, entry.Output, i);
                     continue;
+                }
                 if (!grads.TryGetValue(entry.Output, out var gradOutput))
+                {
+                    recycler?.AfterStep(grads, entry.Output, i);
                     continue;
+                }
 
                 long start = timing ? Stopwatch.GetTimestamp() : 0;
                 var previousAccumulatorOwners = DifferentiableOps.BeginBackwardStep<T>();
@@ -235,7 +249,7 @@ internal static class RebindablePlanCache<T>
                     long ticks = Stopwatch.GetTimestamp() - start;
                     BackwardTiming.Record(entry.Backward.Method.Name, ticks);
                 }
-                recycler?.AfterStep(grads, entry.Output);
+                recycler?.AfterStep(grads, entry.Output, i);
             }
         }
         finally

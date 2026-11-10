@@ -122,3 +122,7 @@ override AiDotNet.Tensors.Engines.Gpu.RecordingGpuBackend.CDist(AiDotNet.Tensors
 override AiDotNet.Tensors.Engines.Gpu.RecordingGpuBackend.Int32ToFloat(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! raw, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int n) -> void
 override AiDotNet.Tensors.Engines.Gpu.RecordingGpuBackend.PDist(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! input, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int n, int d, float p) -> void
 override AiDotNet.Tensors.Engines.Gpu.RecordingGpuBackend.ScatterPositions(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int srcDim, int inner, int n) -> void
+AiDotNet.Tensors.Engines.Autodiff.GradientTapeOptions.ReleaseActivationsDuringBackward.get -> bool
+AiDotNet.Tensors.Engines.Autodiff.GradientTapeOptions.ReleaseActivationsDuringBackward.init -> void
+AiDotNet.Tensors.Engines.Autodiff.GradientTapeOptions.ReleaseResultsAtDispose.get -> bool
+AiDotNet.Tensors.Engines.Autodiff.GradientTapeOptions.ReleaseResultsAtDispose.init -> void

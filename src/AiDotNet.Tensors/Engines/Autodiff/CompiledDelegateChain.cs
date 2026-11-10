@@ -234,7 +234,13 @@ internal sealed class CompiledDelegateChain<T>
         // On the CPU, the buffers backward rents go back to the step's arena once no gradient references them.
         var recycler = BackwardRecycler<T>.Begin(engine, loss, sources, retainedTensors);
         if (recycler is not null)
-            for (int i = 0; i < _count; i++) recycler.NoteOutput(_steps[i].Output);
+            for (int i = 0; i < _count; i++)
+            {
+                ref var noted = ref _steps[i];
+                recycler.NoteOutput(noted.Output);
+                if (recycler.TracksForward)
+                    recycler.NoteStep(i, noted.Output, null, null, null, noted.Inputs, noted.SavedState, noted.Backward);
+            }
         try
         {
             for (int i = 0; i < _count; i++)
@@ -242,12 +248,14 @@ internal sealed class CompiledDelegateChain<T>
                 ref var step = ref _steps[i];
                 if (!DifferentiableOps.IsGradientRequired(step.Output))
                 {
+                    recycler?.AfterStep(grads, step.Output, i);
                     if (gpuEngine is not null)
                         _storageReleasePlan?.ReleaseAfterStep(i, gpuEngine, protectedStorages!);
                     continue;
                 }
                 if (!grads.TryGetValue(step.Output, out var gradOutput))
                 {
+                    recycler?.AfterStep(grads, step.Output, i);
                     if (gpuEngine is not null)
                         _storageReleasePlan?.ReleaseAfterStep(i, gpuEngine, protectedStorages!);
                     continue;
@@ -270,7 +278,7 @@ internal sealed class CompiledDelegateChain<T>
                     BackwardTiming.Record(step.Backward.Method.Name, ticks);
                 }
 
-                recycler?.AfterStep(grads, step.Output);
+                recycler?.AfterStep(grads, step.Output, i);
                 if (gpuEngine is not null)
                     _storageReleasePlan?.ReleaseAfterStep(i, gpuEngine, protectedStorages!);
             }

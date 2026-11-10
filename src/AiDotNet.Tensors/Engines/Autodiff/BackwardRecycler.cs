@@ -54,17 +54,46 @@ internal sealed class BackwardRecycler<T>
     private readonly List<Array>? _poisoned;
     private bool _stopped;
 
+    // Forward activations (GradientTapeOptions.ReleaseActivationsDuringBackward): the forward's rentals, the last step
+    // that reads each backing array, and the arrays the caller keeps.
+    private readonly TensorArena.ForwardActivationLog? _forward;
+    private readonly Dictionary<Array, int>? _lastUse;
+    private readonly HashSet<Array>? _kept;
+    private readonly HashSet<object>? _visited;
+    private List<TensorArena.IssuedBuffer>?[]? _forwardReleases;
+    private bool _forwardBlind;
+    private int _stepCount;
+
     /// <summary>Buffers returned to the arena (or poisoned) by this pass. Diagnostic.</summary>
     internal int ReturnedCount { get; private set; }
+
+    /// <summary>Forward activations this pass returned to the arena (or poisoned). Diagnostic.</summary>
+    internal int ForwardReturnedCount { get; private set; }
+
+    /// <summary>Forward activations the last finished pass on this thread returned (or poisoned).</summary>
+    [ThreadStatic] internal static int LastPassForwardReturned;
+
+    /// <summary>
+    /// True when this pass also hands back forward activations: call <see cref="NoteStep"/> for every step, in walk
+    /// order, before the walk.
+    /// </summary>
+    internal bool TracksForward => _forward is not null;
 
     /// <summary>Buffers the last finished pass on this thread returned (or poisoned), so tests can see it engaged.</summary>
     [ThreadStatic] internal static int LastPassReturned;
 
-    private BackwardRecycler(TensorArena arena, bool stress)
+    private BackwardRecycler(TensorArena arena, bool stress, TensorArena.ForwardActivationLog? forward)
     {
         _arena = arena;
         _stress = stress;
         if (stress) _poisoned = new List<Array>();
+        if (forward is { Buffers.Count: > 0 })
+        {
+            _forward = forward;
+            _lastUse = new Dictionary<Array, int>(ReferenceEqualityComparer<Array>.Instance);
+            _kept = new HashSet<Array>(ReferenceEqualityComparer<Array>.Instance);
+            _visited = new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
+        }
     }
 
     /// <summary>
@@ -79,12 +108,15 @@ internal sealed class BackwardRecycler<T>
             || DifferentiableOps._isBackwardCreateGraph || DifferentiableOps._indexedGrads is not null
             || TensorArena.Current is not { } arena)
             return null;
-        var recycler = new BackwardRecycler<T>(arena, StressOverride ?? s_stress);
+        var recycler = new BackwardRecycler<T>(arena, StressOverride ?? s_stress, arena.TakeForwardActivationLog());
         recycler._keep.Add(loss);
         foreach (var source in sources.Where(s => s is not null))
             recycler._keep.Add(source);
         if (retained is not null)
             foreach (var tensor in retained) recycler._keep.Add(tensor);
+        if (recycler._kept is { } kept)
+            foreach (var tensor in recycler._keep)
+                if (tensor.GetBackingArrayForCacheLookupUnsafe() is { } array) kept.Add(array);
         t_active = true;
         arena.OpenIssueLog(recycler._issued);
         return recycler;
@@ -99,13 +131,113 @@ internal sealed class BackwardRecycler<T>
         if (!_seen.Add(output)) _repeated.Add(output);
     }
 
-    /// <summary>Drops the consumed output's gradient and returns every backward buffer no gradient still references.</summary>
-    internal void AfterStep(Dictionary<Tensor<T>, Tensor<T>> grads, Tensor<T> consumed)
+    /// <summary>
+    /// Records what step <paramref name="step"/> of the walk reads: its output, inputs, saved state and whatever its
+    /// backward delegate captured. Only when <see cref="TracksForward"/>.
+    /// </summary>
+    internal void NoteStep(int step, Tensor<T>? output, Tensor<T>? input0, Tensor<T>? input1, Tensor<T>? input2,
+        Tensor<T>[]? inputs, object[]? savedState, Delegate? backward)
+    {
+        if (_lastUse is null || _forwardBlind) return;
+        if (step >= _stepCount) _stepCount = step + 1;
+        _visited!.Clear();
+        NoteUse(output, step, 0);
+        NoteUse(input0, step, 0);
+        NoteUse(input1, step, 0);
+        NoteUse(input2, step, 0);
+        NoteUse(inputs, step, 0);
+        NoteUse(savedState, step, 0);
+        NoteUse(backward?.Target, step, 0);
+    }
+
+    // Marks every array a step can reach as read at that step. Saved state and closures are walked a few levels deep,
+    // through tensors of any element type, arrays, saved-state containers and the fields of other objects, so a
+    // backward that reads a forward buffer through a captured layer or a raw mask array still counts as a use. A
+    // tensor whose value is still deferred could read buffers this cannot name: the pass then keeps every activation.
+    private void NoteUse(object? value, int step, int depth)
+    {
+        if (value is null || _forwardBlind || value is string || value is Type || value is IEngine
+            || value is TensorArena || value is System.Reflection.MemberInfo || !_visited!.Add(value))
+            return;
+        if (value is IBackingArraySource tensor)
+        {
+            if (!tensor.TryGetBackingArray(out var backing)) { _forwardBlind = true; return; }
+            if (backing is not null) _lastUse![backing] = step;
+            return;
+        }
+        if (value is Array array)
+        {
+            var element = array.GetType().GetElementType();
+            if (element is not null && element.IsValueType) { _lastUse![array] = step; return; }
+            if (depth < MaxUseDepth)
+                foreach (var item in array) NoteUse(item, step, depth + 1);
+            return;
+        }
+        if (depth >= MaxUseDepth) return;
+        if (value is ISavedStateTensorContainer container)
+        {
+            foreach (var item in container.SavedStateValues) NoteUse(item, step, depth + 1);
+            return;
+        }
+        if (value is Delegate del)
+        {
+            NoteUse(del.Target, step, depth + 1);
+            return;
+        }
+        var type = value.GetType();
+        if (type.IsPrimitive || type.IsEnum) return;
+        foreach (var field in ReferenceFields(type))
+            NoteUse(field.GetValue(value), step, depth + 1);
+    }
+
+    private const int MaxUseDepth = 3;
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<Type, System.Reflection.FieldInfo[]> s_referenceFields = new();
+
+    // Instance fields that can hold a reference, through the base types.
+    private static System.Reflection.FieldInfo[] ReferenceFields(Type type) => s_referenceFields.GetOrAdd(type, static t =>
+    {
+        var fields = new List<System.Reflection.FieldInfo>();
+        for (var current = t; current is not null && current != typeof(object); current = current.BaseType)
+            foreach (var field in current.GetFields(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public
+                | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.DeclaredOnly))
+                if (!field.FieldType.IsPrimitive && !field.FieldType.IsEnum && !field.FieldType.IsPointer)
+                    fields.Add(field);
+        return fields.ToArray();
+    });
+
+    // Groups the forward's buffers by the walk step after which nothing reads them. A buffer no step reads is left
+    // alone: it may be a forward output the caller holds, or scratch some other owner manages.
+    private void PlanForwardReleases()
+    {
+        _forwardReleases = new List<TensorArena.IssuedBuffer>?[_stepCount];
+        if (!_forwardBlind)
+        {
+            var planned = new HashSet<Array>(ReferenceEqualityComparer<Array>.Instance);
+            foreach (var buffer in _forward!.Buffers)
+            {
+                if (!planned.Add(buffer.Array) || _kept!.Contains(buffer.Array)) continue;
+                if (!_lastUse!.TryGetValue(buffer.Array, out int last)) continue;
+                (_forwardReleases[last] ??= new List<TensorArena.IssuedBuffer>()).Add(buffer);
+            }
+        }
+        _lastUse!.Clear();
+        _visited!.Clear();
+    }
+
+    /// <summary>
+    /// Drops the consumed output's gradient and returns every backward buffer no gradient still references, then the
+    /// forward activations step <paramref name="step"/> was the last to read. Call it for every step of the walk,
+    /// including the ones that had no gradient to propagate.
+    /// </summary>
+    internal void AfterStep(Dictionary<Tensor<T>, Tensor<T>> grads, Tensor<T> consumed, int step)
     {
         if (_stopped) return;
         if (!_keep.Contains(consumed) && !_repeated.Contains(consumed) && grads.Remove(consumed))
             consumed.Grad = null;
-        if (_issued.Count == 0) return;
+        if (_forward is not null && _forwardReleases is null) PlanForwardReleases();
+        var forwardDead = _forwardReleases is { } releases && (uint)step < (uint)releases.Length ? releases[step] : null;
+        if (_issued.Count == 0 && forwardDead is null) return;
 
         _live.Clear();
         foreach (var gradient in grads.Values)
@@ -123,17 +255,32 @@ internal sealed class BackwardRecycler<T>
         {
             var buffer = _issued[i];
             if (_live.Contains(buffer.Array)) continue;
-            if (_poisoned is not null)
-            {
-                ResultBufferTracker.Poison(buffer.Array);
-                _poisoned.Add(buffer.Array);
-            }
-            else _arena.ReturnIssued(buffer);
+            Release(buffer);
             ReturnedCount++;
             int last = _issued.Count - 1;
             _issued[i] = _issued[last];
             _issued.RemoveAt(last);
         }
+
+        if (forwardDead is null) return;
+        foreach (var buffer in forwardDead)
+        {
+            // A backward that wrote a gradient into an activation's buffer made it a gradient: it stays.
+            if (_live.Contains(buffer.Array)) continue;
+            Release(buffer);
+            ForwardReturnedCount++;
+            _forward!.Released = true;
+        }
+    }
+
+    private void Release(in TensorArena.IssuedBuffer buffer)
+    {
+        if (_poisoned is not null)
+        {
+            ResultBufferTracker.Poison(buffer.Array);
+            _poisoned.Add(buffer.Array);
+        }
+        else _arena.ReturnIssued(buffer);
     }
 
     // Stops returning buffers for the rest of the pass; those already returned were proven dead.
@@ -164,10 +311,11 @@ internal sealed class BackwardRecycler<T>
     }
 
     // The per-thread pass state lives in [ThreadStatic] fields: one pass per thread at a time, by design.
-    private static void FinishPass(int returned)
+    private static void FinishPass(int returned, int forwardReturned)
     {
         t_active = false;
         LastPassReturned = returned;
+        LastPassForwardReturned = forwardReturned;
     }
 
     /// <summary>Ends the pass. Buffers still referenced by gradients stay issued until the step boundary.</summary>
@@ -175,7 +323,7 @@ internal sealed class BackwardRecycler<T>
     {
         _arena.CloseIssueLog();
         _issued.Clear();
-        FinishPass(ReturnedCount);
+        FinishPass(ReturnedCount, ForwardReturnedCount);
         if (_poisoned is not null) ThrowIfPoisonOverwritten(_poisoned);
     }
 }

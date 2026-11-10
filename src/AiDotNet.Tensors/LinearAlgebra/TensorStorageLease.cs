@@ -4,6 +4,18 @@ using System.Threading;
 namespace AiDotNet.Tensors.LinearAlgebra;
 
 /// <summary>
+/// The CPU array behind a tensor of any element type, for proving when a step's last reader of it has run.
+/// </summary>
+internal interface IBackingArraySource
+{
+    /// <summary>
+    /// The backing array (null when the data is not array-backed). False while the tensor is a deferred value whose
+    /// realization would read other buffers, which this cannot name.
+    /// </summary>
+    bool TryGetBackingArray(out Array? array);
+}
+
+/// <summary>
 /// Type-erased source for a reference-counted tensor-storage lease. Lazy graphs use this
 /// contract to retain mixed-element-type operands without reflection or element-type strings.
 /// </summary>
