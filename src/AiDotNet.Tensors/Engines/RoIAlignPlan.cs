@@ -18,7 +18,8 @@ namespace AiDotNet.Tensors.Engines;
 /// <para>
 /// The sampling rule is torchvision's exactly: samples at <c>(i + 0.5) / ratio</c> of each bin, a sample outside
 /// <c>[-1, size]</c> contributes zero but still counts in the average, coordinates in <c>(-1, 0]</c> clamp to 0, and the
-/// last row and column clamp in place. <c>aligned</c> shifts by half a pixel and drops the minimum RoI size of 1.
+/// last row and column clamp in place. <c>aligned</c> shifts by half a pixel and drops the minimum RoI size of 1, so a
+/// degenerate aligned RoI has an empty sampling grid and outputs 0.
 /// </para>
 /// </remarks>
 internal sealed class RoIAlignPlan
@@ -72,9 +73,11 @@ internal sealed class RoIAlignPlan
             double roiW = aligned ? (x2 - x1) : Math.Max(x2 - x1, 1.0);
             double roiH = aligned ? (y2 - y1) : Math.Max(y2 - y1, 1.0);
             double binH = roiH / outputHeight, binW = roiW / outputWidth;
-            int ry = Math.Max(1, samplingRatio > 0 ? samplingRatio : (int)Math.Ceiling(roiH / outputHeight));
-            int rx = Math.Max(1, samplingRatio > 0 ? samplingRatio : (int)Math.Ceiling(roiW / outputWidth));
-            double average = 1.0 / ((double)ry * rx);
+            // As torchvision: an aligned RoI of zero or negative size has an empty grid (no taps), and its bins
+            // average to 0 rather than sampling the box edge.
+            int ry = samplingRatio > 0 ? samplingRatio : (int)Math.Ceiling(roiH / outputHeight);
+            int rx = samplingRatio > 0 ? samplingRatio : (int)Math.Ceiling(roiW / outputWidth);
+            double average = 1.0 / Math.Max((long)ry * rx, 1);
 
             for (int ph = 0; ph < outputHeight; ph++)
             {

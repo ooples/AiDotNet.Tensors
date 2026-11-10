@@ -9,8 +9,11 @@ internal static partial class SimdGemm
     /// <summary>The most rows of A the skinny A·Bᵀ kernel takes. Measured against a [51865, 384] B: 1 row 3.7 ms (BLAS 51), 16 rows 13 ms (BLAS 42), 64 rows 65 ms (BLAS 39).</summary>
     internal const int SkinnyTransBMaxM = 16;
 
-    /// <summary>B rows per parallel work item in the skinny A·Bᵀ kernel.</summary>
+    /// <summary>The most B rows per parallel work item in the skinny A·Bᵀ kernel.</summary>
     private const int SkinnyTransBChunk = 256;
+
+    /// <summary>The fewest B rows per parallel work item: below this the per-item dispatch outweighs the dots.</summary>
+    private const int SkinnyTransBMinChunk = 32;
 
     /// <summary>
     /// Whether C += A·Bᵀ should take <see cref="SgemmSkinnyTransB"/>: a few rows of A against a B stored [n, k].
@@ -37,15 +40,20 @@ internal static partial class SimdGemm
             var aPointer = (IntPtr)pa;
             var bPointer = (IntPtr)pb;
             var cPointer = (IntPtr)pc;
-            int chunks = (n + SkinnyTransBChunk - 1) / SkinnyTransBChunk;
+            // Enough work items for every core: a fixed 256-row chunk left [16, 1024]·[1024, 1024]ᵀ four items and ran
+            // it 4x slower than the packed BLAS. Each output is still one dot product, so the result does not depend
+            // on the split.
+            int perCore = (n + (2 * Environment.ProcessorCount) - 1) / (2 * Environment.ProcessorCount);
+            int rowsPerChunk = Math.Max(SkinnyTransBMinChunk, Math.Min(SkinnyTransBChunk, perCore));
+            int chunks = (n + rowsPerChunk - 1) / rowsPerChunk;
 
             void Chunk(int chunk)
             {
                 var aBase = (float*)aPointer;
                 var bBase = (float*)bPointer;
                 var cBase = (float*)cPointer;
-                int end = Math.Min(n, (chunk + 1) * SkinnyTransBChunk);
-                for (int j = chunk * SkinnyTransBChunk; j < end; j++)
+                int end = Math.Min(n, (chunk + 1) * rowsPerChunk);
+                for (int j = chunk * rowsPerChunk; j < end; j++)
                 {
                     float* bRow = bBase + ((long)j * ldb);
                     for (int i = 0; i < m; i++)
