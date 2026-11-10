@@ -78,7 +78,51 @@ public sealed class CausalDepthwiseConv1DTests
         { new[] { 1, 2, 3 }, 4 },        // more taps than steps
         { new[] { 2, 9, 4 }, 1 },        // one tap: a per-channel scale
         { new[] { 5, 3 }, 2 },           // rank 2: one sequence
+        { new[] { 2, 6, 37 }, 3 },       // channels past the SIMD width with a scalar tail
+        { new[] { 2, 5, 300 }, 3 },      // channels past one kernel-gradient channel block (256)
     };
+
+    // The double path against the definitions of the three sums, in double: y, the input gradient and the kernel
+    // gradient of a loss sum(y * r).
+    [Theory]
+    [MemberData(nameof(Shapes))]
+    public void DoublePath_MatchesDefinitions(int[] shape, int taps)
+    {
+        var e = new CpuEngine();
+        int channels = shape[^1], seqLen = shape[^2], rows = shape.Aggregate(1, (a, b) => a * b) / (seqLen * channels);
+        var rng = new Random(7);
+        var x = new Tensor<double>(shape);
+        var g = new Tensor<double>(shape);
+        var w = new Tensor<double>(new[] { taps, channels });
+        for (int i = 0; i < x.Length; i++) { x[i] = rng.NextDouble() - 0.5; g[i] = rng.NextDouble() - 0.5; }
+        for (int i = 0; i < w.Length; i++) w[i] = rng.NextDouble() - 0.5;
+
+        var y = e.CausalDepthwiseConv1D(x, w).ToArray();
+        var dx = e.CausalDepthwiseConv1DBackwardInput(g, w).ToArray();
+        var dw = e.CausalDepthwiseConv1DBackwardKernel(g, x, taps).ToArray();
+        var xs = x.ToArray(); var gs = g.ToArray(); var ws = w.ToArray();
+        var dwExpected = new double[taps * channels];
+        for (int r = 0; r < rows; r++)
+            for (int t = 0; t < seqLen; t++)
+                for (int c = 0; c < channels; c++)
+                {
+                    int at = (r * seqLen + t) * channels + c;
+                    double yExpected = 0, dxExpected = 0;
+                    for (int j = 0; j < taps; j++)
+                    {
+                        if (t - j >= 0)
+                        {
+                            yExpected += ws[j * channels + c] * xs[at - j * channels];
+                            dwExpected[j * channels + c] += gs[at] * xs[at - j * channels];
+                        }
+                        if (t + j < seqLen) dxExpected += ws[j * channels + c] * gs[at + j * channels];
+                    }
+                    Assert.True(Math.Abs(yExpected - y[at]) <= 1e-12, $"y[{at}]: expected {yExpected}, got {y[at]}");
+                    Assert.True(Math.Abs(dxExpected - dx[at]) <= 1e-12, $"dx[{at}]: expected {dxExpected}, got {dx[at]}");
+                }
+        for (int i = 0; i < dwExpected.Length; i++)
+            Assert.True(Math.Abs(dwExpected[i] - dw[i]) <= 1e-12, $"dw[{i}]: expected {dwExpected[i]}, got {dw[i]}");
+    }
 
     [Theory]
     [MemberData(nameof(Shapes))]

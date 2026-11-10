@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
@@ -131,8 +130,134 @@ public partial class CpuEngine
     private static void CausalConvForwardHost<T>(T[] x, int xOff, T[] w, int wOff, T[] y,
         int rows, int seqLen, int channels, int taps)
     {
+        if (x is float[] xF && w is float[] wF && y is float[] yF)
+            CausalConvForwardHostFloat(xF, xOff, wF, wOff, yF, rows, seqLen, channels, taps);
+        else if (x is double[] xD && w is double[] wD && y is double[] yD)
+            CausalConvForwardHostDouble(xD, xOff, wD, wOff, yD, rows, seqLen, channels, taps);
+        else
+            CausalConvForwardHostGeneric(x, xOff, w, wOff, y, rows, seqLen, channels, taps);
+    }
+
+    // Channel run per kernel-gradient work item: a multiple of every SIMD width, small enough to spread a few taps.
+    private const int CausalConvChannelBlock = 256;
+
+    private static void CausalConvForwardHostFloat(float[] x, int xOff, float[] w, int wOff, float[] y,
+        int rows, int seqLen, int channels, int taps)
+    {
+        // Channels innermost: each tap adds one contiguous weight row times one input row into the output row. Every
+        // element still sums its taps in ascending order from zero, so the result matches the scalar loop exactly.
+        CpuParallelSettings.ParallelForOrSerial(0, rows * seqLen, (long)rows * seqLen * channels * taps, rt =>
+        {
+            int t = rt % seqLen, outBase = rt * channels;
+            int maxJ = Math.Min(taps - 1, t);
+            Array.Clear(y, outBase, channels);
+            for (int j = 0; j <= maxJ; j++)
+                MultiplyAccumulate(y, outBase, w, wOff + j * channels, x, xOff + outBase - j * channels, channels);
+        }, deterministicSafe: true);
+    }
+
+    private static void CausalConvBackwardInputHostFloat(float[] g, int gOff, float[] w, int wOff, float[] dx,
+        int rows, int seqLen, int channels, int taps)
+    {
+        CpuParallelSettings.ParallelForOrSerial(0, rows * seqLen, (long)rows * seqLen * channels * taps, rt =>
+        {
+            int t = rt % seqLen, rowBase = rt * channels;
+            int maxJ = Math.Min(taps - 1, seqLen - 1 - t);
+            Array.Clear(dx, rowBase, channels);
+            for (int j = 0; j <= maxJ; j++)
+                MultiplyAccumulate(dx, rowBase, w, wOff + j * channels, g, gOff + rowBase + j * channels, channels);
+        }, deterministicSafe: true);
+    }
+
+    // One (tap, channel block) per work item; each element sums rows then steps in ascending order: deterministic.
+    private static void CausalConvBackwardKernelHostFloat(float[] g, int gOff, float[] x, int xOff, float[] dw,
+        int rows, int seqLen, int channels, int taps)
+    {
+        int blocks = (channels + CausalConvChannelBlock - 1) / CausalConvChannelBlock;
+        CpuParallelSettings.ParallelForOrSerial(0, taps * blocks, (long)rows * seqLen * channels * taps, item =>
+        {
+            int j = item / blocks, c0 = (item % blocks) * CausalConvChannelBlock;
+            int len = Math.Min(CausalConvChannelBlock, channels - c0), dst = j * channels + c0;
+            Array.Clear(dw, dst, len);
+            for (int r = 0; r < rows; r++)
+            {
+                int rowBase = r * seqLen * channels + c0;
+                for (int t = j; t < seqLen; t++)
+                    MultiplyAccumulate(dw, dst, g, gOff + rowBase + t * channels, x, xOff + rowBase + (t - j) * channels, len);
+            }
+        }, deterministicSafe: true);
+    }
+
+    /// <summary>acc[accOff..+n] += a[aOff..+n] * b[bOff..+n], a multiply then an add per element (no fused rounding).</summary>
+    private static void MultiplyAccumulate(float[] acc, int accOff, float[] a, int aOff, float[] b, int bOff, int n)
+    {
+        int width = System.Numerics.Vector<float>.Count, i = 0;
+        for (; i <= n - width; i += width)
+            (new System.Numerics.Vector<float>(acc, accOff + i)
+                + new System.Numerics.Vector<float>(a, aOff + i) * new System.Numerics.Vector<float>(b, bOff + i)).CopyTo(acc, accOff + i);
+        for (; i < n; i++) acc[accOff + i] += a[aOff + i] * b[bOff + i];
+    }
+
+    private static void CausalConvForwardHostDouble(double[] x, int xOff, double[] w, int wOff, double[] y,
+        int rows, int seqLen, int channels, int taps)
+    {
+        CpuParallelSettings.ParallelForOrSerial(0, rows * seqLen, (long)rows * seqLen * channels * taps, rt =>
+        {
+            int t = rt % seqLen, outBase = rt * channels;
+            int maxJ = Math.Min(taps - 1, t);
+            Array.Clear(y, outBase, channels);
+            for (int j = 0; j <= maxJ; j++)
+                MultiplyAccumulate(y, outBase, w, wOff + j * channels, x, xOff + outBase - j * channels, channels);
+        }, deterministicSafe: true);
+    }
+
+    private static void CausalConvBackwardInputHostDouble(double[] g, int gOff, double[] w, int wOff, double[] dx,
+        int rows, int seqLen, int channels, int taps)
+    {
+        CpuParallelSettings.ParallelForOrSerial(0, rows * seqLen, (long)rows * seqLen * channels * taps, rt =>
+        {
+            int t = rt % seqLen, rowBase = rt * channels;
+            int maxJ = Math.Min(taps - 1, seqLen - 1 - t);
+            Array.Clear(dx, rowBase, channels);
+            for (int j = 0; j <= maxJ; j++)
+                MultiplyAccumulate(dx, rowBase, w, wOff + j * channels, g, gOff + rowBase + j * channels, channels);
+        }, deterministicSafe: true);
+    }
+
+    private static void CausalConvBackwardKernelHostDouble(double[] g, int gOff, double[] x, int xOff, double[] dw,
+        int rows, int seqLen, int channels, int taps)
+    {
+        int blocks = (channels + CausalConvChannelBlock - 1) / CausalConvChannelBlock;
+        CpuParallelSettings.ParallelForOrSerial(0, taps * blocks, (long)rows * seqLen * channels * taps, item =>
+        {
+            int j = item / blocks, c0 = (item % blocks) * CausalConvChannelBlock;
+            int len = Math.Min(CausalConvChannelBlock, channels - c0), dst = j * channels + c0;
+            Array.Clear(dw, dst, len);
+            for (int r = 0; r < rows; r++)
+            {
+                int rowBase = r * seqLen * channels + c0;
+                for (int t = j; t < seqLen; t++)
+                    MultiplyAccumulate(dw, dst, g, gOff + rowBase + t * channels, x, xOff + rowBase + (t - j) * channels, len);
+            }
+        }, deterministicSafe: true);
+    }
+
+    /// <summary>acc[accOff..+n] += a[aOff..+n] * b[bOff..+n], a multiply then an add per element (no fused rounding).</summary>
+    private static void MultiplyAccumulate(double[] acc, int accOff, double[] a, int aOff, double[] b, int bOff, int n)
+    {
+        int width = System.Numerics.Vector<double>.Count, i = 0;
+        for (; i <= n - width; i += width)
+            (new System.Numerics.Vector<double>(acc, accOff + i)
+                + new System.Numerics.Vector<double>(a, aOff + i) * new System.Numerics.Vector<double>(b, bOff + i)).CopyTo(acc, accOff + i);
+        for (; i < n; i++) acc[accOff + i] += a[aOff + i] * b[bOff + i];
+    }
+
+    [ScalarKernel("Element types other than float and double have no typed arithmetic; float and double take the typed loops above.")]
+    private static void CausalConvForwardHostGeneric<T>(T[] x, int xOff, T[] w, int wOff, T[] y,
+        int rows, int seqLen, int channels, int taps)
+    {
         var ops = MathHelper.GetNumericOperations<T>();
-        Parallel.For(0, rows * seqLen, rt =>
+        CpuParallelSettings.ParallelForOrSerial(0, rows * seqLen, (long)rows * seqLen * channels * taps, rt =>
         {
             int t = rt % seqLen, outBase = rt * channels;
             int maxJ = Math.Min(taps - 1, t);
@@ -143,14 +268,26 @@ public partial class CpuEngine
                     acc = ops.Add(acc, ops.Multiply(w[wOff + j * channels + c], x[xOff + outBase - j * channels + c]));
                 y[outBase + c] = acc;
             }
-        });
+        }, deterministicSafe: true);
     }
 
     private static void CausalConvBackwardInputHost<T>(T[] g, int gOff, T[] w, int wOff, T[] dx,
         int rows, int seqLen, int channels, int taps)
     {
+        if (g is float[] gF && w is float[] wF && dx is float[] dxF)
+            CausalConvBackwardInputHostFloat(gF, gOff, wF, wOff, dxF, rows, seqLen, channels, taps);
+        else if (g is double[] gD && w is double[] wD && dx is double[] dxD)
+            CausalConvBackwardInputHostDouble(gD, gOff, wD, wOff, dxD, rows, seqLen, channels, taps);
+        else
+            CausalConvBackwardInputHostGeneric(g, gOff, w, wOff, dx, rows, seqLen, channels, taps);
+    }
+
+    [ScalarKernel("Element types other than float and double have no typed arithmetic; float and double take the typed loops above.")]
+    private static void CausalConvBackwardInputHostGeneric<T>(T[] g, int gOff, T[] w, int wOff, T[] dx,
+        int rows, int seqLen, int channels, int taps)
+    {
         var ops = MathHelper.GetNumericOperations<T>();
-        Parallel.For(0, rows * seqLen, rt =>
+        CpuParallelSettings.ParallelForOrSerial(0, rows * seqLen, (long)rows * seqLen * channels * taps, rt =>
         {
             int t = rt % seqLen, rowBase = rt * channels;
             int maxJ = Math.Min(taps - 1, seqLen - 1 - t);
@@ -161,15 +298,27 @@ public partial class CpuEngine
                     acc = ops.Add(acc, ops.Multiply(w[wOff + j * channels + c], g[gOff + rowBase + j * channels + c]));
                 dx[rowBase + c] = acc;
             }
-        });
+        }, deterministicSafe: true);
     }
 
     // One (tap, channel) cell per work item, summed over rows then steps in ascending order: deterministic.
     private static void CausalConvBackwardKernelHost<T>(T[] g, int gOff, T[] x, int xOff, T[] dw,
         int rows, int seqLen, int channels, int taps)
     {
+        if (g is float[] gF && x is float[] xF && dw is float[] dwF)
+            CausalConvBackwardKernelHostFloat(gF, gOff, xF, xOff, dwF, rows, seqLen, channels, taps);
+        else if (g is double[] gD && x is double[] xD && dw is double[] dwD)
+            CausalConvBackwardKernelHostDouble(gD, gOff, xD, xOff, dwD, rows, seqLen, channels, taps);
+        else
+            CausalConvBackwardKernelHostGeneric(g, gOff, x, xOff, dw, rows, seqLen, channels, taps);
+    }
+
+    [ScalarKernel("Element types other than float and double have no typed arithmetic; float and double take the typed loops above.")]
+    private static void CausalConvBackwardKernelHostGeneric<T>(T[] g, int gOff, T[] x, int xOff, T[] dw,
+        int rows, int seqLen, int channels, int taps)
+    {
         var ops = MathHelper.GetNumericOperations<T>();
-        Parallel.For(0, taps * channels, jc =>
+        CpuParallelSettings.ParallelForOrSerial(0, taps * channels, (long)rows * seqLen * channels * taps, jc =>
         {
             int j = jc / channels, c = jc % channels;
             T acc = ops.Zero;
@@ -180,6 +329,6 @@ public partial class CpuEngine
                     acc = ops.Add(acc, ops.Multiply(g[gOff + rowBase + t * channels + c], x[xOff + rowBase + (t - j) * channels + c]));
             }
             dw[jc] = acc;
-        });
+        }, deterministicSafe: true);
     }
 }
